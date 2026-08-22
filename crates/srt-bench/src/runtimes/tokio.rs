@@ -54,7 +54,9 @@ async fn drive(cfg: LossConfig) {
 }
 
 async fn sender_task(cfg: LossConfig, endpoint: std::net::SocketAddr, start: Instant) -> ConnStats {
-    let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await.expect("bind");
+    let socket = tokio::net::UdpSocket::bind("0.0.0.0:0")
+        .await
+        .expect("bind");
     socket.connect(endpoint).await.expect("connect");
 
     let options = ConnectionOptions {
@@ -78,7 +80,10 @@ async fn sender_task(cfg: LossConfig, endpoint: std::net::SocketAddr, start: Ins
 
     loop {
         if !stats.connected && Instant::now() >= connect_deadline {
-            eprintln!("[bench-tokio] connect timed out, state={:?}", driver.conn.state());
+            eprintln!(
+                "[bench-tokio] connect timed out, state={:?}",
+                driver.conn.state()
+            );
             break;
         }
         if let Some(d) = stream_deadline
@@ -165,10 +170,9 @@ async fn sender_task(cfg: LossConfig, endpoint: std::net::SocketAddr, start: Ins
 async fn receiver_task(cfg: LossConfig, listen_port: u16, start: Instant) -> ConnStats {
     use std::net::SocketAddr;
 
-    let socket =
-        tokio::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], listen_port)))
-            .await
-            .expect("bind");
+    let socket = tokio::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], listen_port)))
+        .await
+        .expect("bind");
 
     let options = ConnectionOptions {
         socket_id: std::process::id(),
@@ -186,7 +190,10 @@ async fn receiver_task(cfg: LossConfig, listen_port: u16, start: Instant) -> Con
 
     loop {
         if !stats.connected && Instant::now() >= connect_deadline {
-            eprintln!("[bench-tokio] connect timed out, state={:?}", driver.conn.state());
+            eprintln!(
+                "[bench-tokio] connect timed out, state={:?}",
+                driver.conn.state()
+            );
             break;
         }
         if let Some(d) = stream_deadline

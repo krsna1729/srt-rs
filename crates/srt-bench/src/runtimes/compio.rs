@@ -60,7 +60,9 @@ async fn drive(cfg: LossConfig) {
 }
 
 async fn sender_task(cfg: LossConfig, endpoint: SocketAddr, start: Instant) -> ConnStats {
-    let socket = compio::net::UdpSocket::bind("0.0.0.0:0").await.expect("bind");
+    let socket = compio::net::UdpSocket::bind("0.0.0.0:0")
+        .await
+        .expect("bind");
     socket.connect(endpoint).await.expect("connect");
 
     let options = ConnectionOptions {
@@ -99,7 +101,10 @@ async fn sender_task(cfg: LossConfig, endpoint: SocketAddr, start: Instant) -> C
 
     loop {
         if !stats.connected && Instant::now() >= connect_deadline {
-            eprintln!("[bench-compio] connect timed out, state={:?}", driver.conn.state());
+            eprintln!(
+                "[bench-compio] connect timed out, state={:?}",
+                driver.conn.state()
+            );
             break;
         }
         if let Some(d) = stream_deadline
@@ -169,10 +174,9 @@ async fn sender_task(cfg: LossConfig, endpoint: SocketAddr, start: Instant) -> C
 }
 
 async fn receiver_task(cfg: LossConfig, listen_port: u16, start: Instant) -> ConnStats {
-    let socket =
-        compio::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], listen_port)))
-            .await
-            .expect("bind");
+    let socket = compio::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], listen_port)))
+        .await
+        .expect("bind");
 
     let options = ConnectionOptions {
         socket_id: std::process::id(),
@@ -190,8 +194,7 @@ async fn receiver_task(cfg: LossConfig, listen_port: u16, start: Instant) -> Con
     let _reader = compio::runtime::spawn(async move {
         let mut first = true;
         loop {
-            let BufResult(result, buffer) =
-                received_socket.recv_from(vec![0u8; 2048]).await;
+            let BufResult(result, buffer) = received_socket.recv_from(vec![0u8; 2048]).await;
             let Ok((size, addr)) = result else {
                 break;
             };
@@ -211,7 +214,10 @@ async fn receiver_task(cfg: LossConfig, listen_port: u16, start: Instant) -> Con
 
     loop {
         if !stats.connected && Instant::now() >= connect_deadline {
-            eprintln!("[bench-compio] connect timed out, state={:?}", driver.conn.state());
+            eprintln!(
+                "[bench-compio] connect timed out, state={:?}",
+                driver.conn.state()
+            );
             break;
         }
         if let Some(d) = stream_deadline

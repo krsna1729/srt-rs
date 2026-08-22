@@ -78,7 +78,10 @@ async fn sender_task(cfg: LossConfig, endpoint: SocketAddr, start: Instant) -> C
 
     loop {
         if !stats.connected && Instant::now() >= connect_deadline {
-            eprintln!("[bench-smol] connect timed out, state={:?}", driver.conn.state());
+            eprintln!(
+                "[bench-smol] connect timed out, state={:?}",
+                driver.conn.state()
+            );
             break;
         }
         if let Some(d) = stream_deadline
@@ -175,7 +178,10 @@ async fn receiver_task(cfg: LossConfig, listen_port: u16, start: Instant) -> Con
 
     loop {
         if !stats.connected && Instant::now() >= connect_deadline {
-            eprintln!("[bench-smol] connect timed out, state={:?}", driver.conn.state());
+            eprintln!(
+                "[bench-smol] connect timed out, state={:?}",
+                driver.conn.state()
+            );
             break;
         }
         if let Some(d) = stream_deadline
