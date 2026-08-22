@@ -13,26 +13,57 @@
 //! | glommio | thread-per-core      | 1 core : N tasks, shared submission ring | `glommio::timer` wheel          |
 //! | compio  | thread-per-core      | 1 thread : 2N tasks (protocol task + never-cancelled reader task/channel) | `compio::time::sleep` |
 //!
-//! # Measured scaling knee (loopback bakeoff, 8 Mbps/conn)
+//! # Measured findings (6-core shared-tenant EPYC VPS, load avg 2-5)
 //!
-//! - **<= 300 conns**: task-per-connection models win — best latency
-//!   isolation, zero retransmits for tokio/smol/monoio/compio; mio close
-//!   behind after its buffer-sizing/timer-gating fixes.
-//! - **600 conns**: **mio's flat epoll loop is the only architecture that
-//!   sustains full line-rate (4,547,686 sent = received, zero loss)**.
-//!   Per-task framework wakeup cost dominates at this density; the
-//!   hierarchy inverts. Task-per-conn runtimes hit flow-window stalls
-//!   (sender buffers ~8192 pkts x 1316 B x N when ACK turnaround lags --
-//!   the source of their GB-scale RSS at 600).
+//! Baselines are `REPS=3 ./bench.sh baseline 300 8` medians; syscall
+//! attribution is `./bench.sh sysprof <rt> 300 8` (perf tracepoints:
+//! recvfrom/sendto/sendmsg/recvmsg/epoll_wait + io_uring_submit_req).
+//! Rankings only valid within one measurement window -- this box is
+//! shared-tenant, so re-run before comparing.
 //!
-//! Pushing the knee further (per-runtime leads):
-//! - tokio/smol: listener drains one datagram per wake; batching extra
-//!   ready reads per wake (readiness APIs allow non-blocking re-reads)
-//!   would cut wakeups ~10x at high pps.
-//! - monoio/compio RSS at 600: sender buffers grow to the flow window when
-//!   ACK turnaround lags; faster ACK drain (reader priority) shrinks it.
-//! - glommio: SQ-ring saturation suspected; see its module header for the
-//!   io_memory/poll_once plan.
+//! ## @300 conns, 8 Mbps/conn (2026-08-22 window)
+//!
+//! | runtime | sent | recv | retx | caller elapsed_s | verdict |
+//! |---|---|---|---|---|---|
+//! | mio     | 830k  | 757k | 0      | 8.2 on-time | delivery trails into listener grace under load |
+//! | tokio   | 2463k | 363k | 1.03M  | 18.6-21.4   | pacing-starved; listener sees 15% |
+//! | smol    | 2447k | 238k | 1.81M  | ~21         | same shape as tokio |
+//! | monoio  | 2458k | 1104k| 10k    | 28.5        | rtt=100.00 timer artifact |
+//! | glommio | 2425k | 253k | 1.56M  | 18.7        | worst ops/pkt of all six |
+//! | compio  | 2458k | 965k | 0      | 30.2        | integrity intact, pacing starved |
+//!
+//! Every task-per-conn runtime is PACING-STARVED: callers push 8 s of
+//! traffic in 19-30 s wall clock. Not packet loss -- scheduling delay.
+//!
+//! ## Syscall attribution @300 (listener side, per 10k delivered pkts)
+//!
+//! | runtime | rx syscalls | wakes (epoll) or SQEs | datagrams/wake | delivery |
+//! |---|---|---|---|---|
+//! | tokio   | 10.7k recvfrom | 831 epoll_waits | 11  | 19% |
+//! | mio     | 10.9k recvfrom | 565 epoll_waits | 34  | ~100% |
+//! | monoio  | --             | 16.9k SQEs      | --  | 42% |
+//! | compio  | --             | 11.5k SQEs      | --  | 38% |
+//! | glommio | 10.1k recvmsg + 6.1k SQE | --    | --  | 12% |
+//!
+//! tokio issues the SAME rx-syscalls-per-packet as mio; the difference is
+//! wakeup batching (mio drains 34 datagrams per return). The bottleneck
+//! is per-task wake scheduling, not syscall count.
+//!
+//! ## Knee sweep on this box: NOT REPRODUCIBLE
+//!
+//! Delivery vs N at fixed rate: 300->98%, 600->92%, 900->72%, 925->91%,
+//! 950->86%, 975->71%. Non-monotonic => tenant noise dominates. The
+//! WSL-era "mio perfect to 900" knee cannot be pinned here; sweeps need
+//! taskset pinning or a quiet window to mean anything.
+//!
+//! ## Next lever: ingress pooling (per-task wakeup cost)
+//!
+//! Per-task-per-socket wakeup is the measured bottleneck (11 vs 34
+//! datagrams/wake). The fix is cross-socket batching inside ONE task --
+//! pool K UDP sockets demuxed by destination port into M>K connections,
+//! so K readiness events serve M connections. This is handoff dimension
+//! E (`--ingress pool`); it requires listener-side demux by port, which
+//! no adapter expresses today.
 
 pub mod compio;
 #[cfg(target_os = "linux")]
