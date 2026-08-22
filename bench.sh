@@ -89,21 +89,35 @@ pick_port() {
 
 # run_pair RUNTIME PORT N SECONDS HEAD_START OUT_PREFIX
 # Spawns receiver+sender for one cell; echoes both STATS lines to stdout.
+#
+# Env knobs (both apply to receiver AND sender -- the sender needs to know
+# the ingress topology too, since a pooled sender dials the single shared
+# port instead of one port per connection):
+#   INGRESS=pool=K    multi-acceptor SO_REUSEPORT listener, K threads
+#   BOND_GROUPS=G     connections 2g/2g+1 share a bond group, for g in 0..G
 run_pair() {
   local runtime=$1 port=$2 n=$3 secs=$4 head_start=$5 out=$6
   LISTENER_OUT="$SCRATCH_DIR/${out}_listener.out"
   CALLER_OUT="$SCRATCH_DIR/${out}_caller.out"
 
+  local extra_args=()
+  if [[ -n "${INGRESS:-}" ]]; then
+    extra_args+=(--ingress="$INGRESS")
+  fi
+  if [[ -n "${BOND_GROUPS:-}" ]]; then
+    extra_args+=(--bond-groups="$BOND_GROUPS")
+  fi
+
   # shellcheck disable=SC2086  # intentional word split of arithmetic
   "$BIN" runtime="$runtime" mode=receiver "$port" $((secs + 5)) "$LATENCY_MS" \
-    --connections "$n" >"$LISTENER_OUT" 2>&1 &
+    --connections "$n" "${extra_args[@]}" >"$LISTENER_OUT" 2>&1 &
   LISTENER_PID=$!
 
   sleep "$head_start"
 
   set +e
   "$BIN" runtime="$runtime" mode=sender 127.0.0.1 "$port" "$secs" "$LATENCY_MS" \
-    --connections "$n" >"$CALLER_OUT" 2>&1
+    --connections "$n" "${extra_args[@]}" >"$CALLER_OUT" 2>&1
   CALLER_RC=$?
   set -e
 
