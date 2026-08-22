@@ -104,5 +104,49 @@ fn bench_lossy_receive(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_lossy_receive);
+/// Burst regime: one contiguous run of `burst_len` packets is lost, then
+/// `post_burst` in-order packets arrive while the burst is still missing.
+/// This is the overload shape the 2026-08-21 8 Mbps x 1200-connection
+/// flamegraphs showed: a lagging connection accumulates large gaps, and
+/// the old per-sequence walk paid O(gap) on every subsequent packet --
+/// positive-feedback collapse. The scattered cases above never exercise
+/// this (every gap there is 1 packet).
+fn run_burst_receive_scenario(burst_len: u32, post_burst: u32) {
+    let mut buf = ReceiverBuffer::new(0, 120, ts(0), 0);
+    buf.set_tsbpd_enabled(false);
+    let mut now_us = 0u64;
+    let total = burst_len + post_burst;
+    // Post-burst packets arrive first (burst is in flight, lost).
+    // Then the burst is delivered as late retransmission.
+    for seq in burst_len..total {
+        now_us += 1_000;
+        let _ = buf.receive(black_box(make_packet(seq, now_us as u32)), ts(now_us));
+        while black_box(buf.pop_ready(ts(now_us))).is_some() {}
+    }
+    for seq in 0..burst_len {
+        now_us += 1_000;
+        let _ = buf.receive(black_box(make_packet(seq, now_us as u32)), ts(now_us));
+        while black_box(buf.pop_ready(ts(now_us))).is_some() {}
+    }
+}
+
+fn bench_burst_receive(c: &mut Criterion) {
+    let mut group = c.benchmark_group("receiver_loss_scan");
+    group.sample_size(30);
+    // 100-packet burst with 500 post-burst packets: old walk re-scanned
+    // ~100 entries per post-burst packet (50k probes); new walk discovers
+    // the burst once.
+    for &(burst_len, post_burst) in &[(100u32, 500u32), (1000u32, 2000u32)] {
+        group.throughput(Throughput::Elements((burst_len + post_burst) as u64));
+        group.bench_function(
+            format!("burst_loss/burst{burst_len}_post{post_burst}"),
+            |b| {
+                b.iter(|| run_burst_receive_scenario(burst_len, post_burst));
+            },
+        );
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_lossy_receive, bench_burst_receive);
 criterion_main!(benches);

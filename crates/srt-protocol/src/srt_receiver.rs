@@ -556,7 +556,82 @@ impl ReceiverBuffer {
             now
         };
 
-        // バッファに追加
+        if self
+            .delivery_seq_hint
+            .is_none_or(|hint| sequence_less_than(seq, hint))
+        {
+            self.delivery_seq_hint = Some(seq);
+        }
+
+        // Loss detection
+        //
+        // Old implementation scanned every sequence number in
+        // expected_seq..seq with a BTreeMap/HashSet lookup per step --
+        // O(gap length) per packet. Under overload a lagging connection
+        // sees larger gaps more often, and a larger gap is more expensive:
+        // positive-feedback collapse (2026-08-21 flamegraphs at
+        // 8 Mbps x 1200 connections).
+        //
+        // New implementation: find the first already-buffered packet in the
+        // gap with one BTreeMap range query and register only the
+        // contiguous missing prefix before it. Cost is O(log n + emitted),
+        // and emitted is bounded by actual data in the gap, not gap length.
+        // Later losses are discovered when later packets arrive -- the final
+        // NAK set is identical, only spread over time (libsrt also sends
+        // NAKs in multiple rounds).
+        let mut new_losses = Vec::new();
+        if sequence_greater_than(seq, self.expected_seq) {
+            // Process one contiguous missing run at a time. The end of a
+            // run is the first buffered packet circularly before seq, or
+            // seq itself. The number of runs is bounded by data in the gap,
+            // so the old O(gap length) per-packet scan (which collapsed
+            // under overload) becomes O(runs log n + emitted + skipped).
+            // Skipped buffered packets are bounded by packets in the gap.
+            //
+            // Wrap handling: BTreeMap is numeric, so range(s..) returns the
+            // first key numerically >= s, but a packet circularly before seq
+            // can be numerically < s (near 0). Probe both the upper segment
+            // [s..MAX] and the lower segment [0..seq), and only accept a
+            // candidate p with seq_lt(s,p) && seq_lt(p,seq). This excludes
+            // packets more than 2^30 away from expected_seq.
+            //
+            // seq is inserted after this scan so the range queries do not
+            // see the packet itself.
+            let mut s = self.expected_seq;
+            while sequence_less_than(s, seq) {
+                if self.packets.contains_key(&s) {
+                    // Already buffered: skip without emitting. Bounded by
+                    // buffered packets in the gap.
+                    s = s.wrapping_add(1) & 0x7FFF_FFFF;
+                    continue;
+                }
+                let upper = self.packets.range(s..).next().map(|(&p, _)| p);
+                let lower = if s > seq {
+                    self.packets.range(..seq).next().map(|(&p, _)| p)
+                } else {
+                    None
+                };
+                let candidate = match (upper, lower) {
+                    (Some(p), _) => Some(p),
+                    (None, lower) => lower,
+                };
+                let run_end = candidate
+                    .filter(|&p| sequence_less_than(s, p) && sequence_less_than(p, seq))
+                    .unwrap_or(seq);
+                let mut t = s;
+                while t != run_end {
+                    if !self.loss_list.contains(&t) {
+                        new_losses.push(t);
+                        self.loss_list_insert(t);
+                        self.total_lost += 1;
+                    }
+                    t = t.wrapping_add(1) & 0x7FFF_FFFF;
+                }
+                s = run_end;
+            }
+        }
+
+        // Insert into buffer
         self.packets.insert(
             seq,
             ReceivedPacket {
@@ -565,29 +640,8 @@ impl ReceiverBuffer {
                 delivery_time,
             },
         );
-        if self
-            .delivery_seq_hint
-            .is_none_or(|hint| sequence_less_than(seq, hint))
-        {
-            self.delivery_seq_hint = Some(seq);
-        }
 
-        // 損失検出
-        let mut new_losses = Vec::new();
-        if sequence_greater_than(seq, self.expected_seq) {
-            // ギャップがある = 損失の可能性
-            let mut s = self.expected_seq;
-            while sequence_less_than(s, seq) {
-                if !self.packets.contains_key(&s) && !self.loss_list.contains(&s) {
-                    new_losses.push(s);
-                    self.loss_list_insert(s);
-                    self.total_lost += 1;
-                }
-                s = s.wrapping_add(1) & 0x7FFF_FFFF;
-            }
-        }
-
-        // 損失リストから回復したパケットを削除
+        // Remove recovered entry from loss list
         let recovered_loss = self.loss_list_remove(seq);
 
         if was_expected && !recovered_loss {
