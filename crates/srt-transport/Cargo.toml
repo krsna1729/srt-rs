@@ -1,0 +1,27 @@
+[package]
+name = "srt-transport"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Shared adapter plumbing between srt-protocol (sans-I/O) and runtime-specific I/O. Per-runtime Conn structs behind feature flags."
+
+[dependencies]
+shiguredo_srt = { path = "../srt-protocol" }
+
+# Runtime-specific dependencies (optional, feature-gated)
+mio = { version = "1", features = ["net"], optional = true }
+tokio = { version = "1", features = ["net", "time"], optional = true }
+smol = { version = "2", optional = true }
+futures-lite = { version = "2", optional = true }
+monoio = { version = "0.2", features = ["sync"], optional = true }
+glommio = { version = "0.9", optional = true }
+compio = { version = "0.19", features = ["io", "io-uring", "net", "runtime", "time"], optional = true }
+
+[features]
+default = ["mio"]
+mio = ["dep:mio"]
+tokio = ["dep:tokio"]
+smol = ["dep:smol", "dep:futures-lite"]
+monoio = ["dep:monoio"]
+glommio = ["dep:glommio", "dep:futures-lite"]
+compio = ["dep:compio"]

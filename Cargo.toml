@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/srt-protocol",
+    "crates/srt-protocol/pbt",
+    "crates/srt-transport",
+    "crates/srt-lifecycle",
+    "crates/srt-bench",
+]
+exclude = ["crates/srt-protocol/fuzz"]

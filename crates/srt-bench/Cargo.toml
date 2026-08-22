@@ -1,0 +1,43 @@
+[package]
+name = "srt-bench"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Standalone caller/listener binaries over srt-protocol + std, for interop tests without linking an application crate or libsrt. See docs/srt-pure-rust-plan.md."
+
+[dependencies]
+shiguredo_srt = { path = "../srt-protocol" }
+srt-transport = { path = "../srt-transport", features = ["mio", "tokio", "smol", "monoio", "glommio", "compio"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# cpu_stats.rs: framework-agnostic CPU accounting via getrusage(), shared by
+# every loss-caller/loss-listener backend below.
+libc = "0.2"
+
+# --- Driver framework bake-off (docs/srt-pure-rust-plan.md Phase 4) ---
+# Six backends for the sustained-throughput loss-caller/loss-listener
+# binaries, sharing an external CLI/STATS-line contract (same args, same
+# output schema -- see mio_driver.rs's doc comment) but each free to use its
+# own idiomatic high-performance I/O primitives internally. A single Rust
+# trait spanning readiness-based (mio/smol), task-based (tokio/smol), and
+# completion-based (monoio/glommio/compio) execution models would force a
+# lowest-common-denominator API that defeats the point of comparing them on
+# their own terms -- "swappable" here means swappable via binary/CLI
+# selection (the orchestration script's IMPLS values), not a shared trait
+# object.
+mio = { version = "1", features = ["os-poll", "net"] }
+tokio = { version = "1", features = ["net", "time", "rt", "rt-multi-thread", "macros"] }
+smol = "2"
+futures-lite = "2"
+# Task-per-connection executor for the smol scale modes: smol's own
+# block_on executor requires Send futures, but Conn holds !Send native
+# timers. async_executor::LocalExecutor spawns !Send tasks -- it is also
+# what powers smol's internal executor, so this is smol's designed
+# primitive for many concurrent tasks on one thread.
+async-executor = "1"
+monoio = { version = "0.2", features = ["sync"] }
+# Linux-only, requires a modern io_uring-capable kernel -- guarded with
+# #[cfg(target_os = "linux")] in glommio_*.rs's main(), see there.
+glommio = "0.9"
+compio = { version = "0.19", features = ["io", "io-uring", "net", "runtime", "time", "macros"] }
+

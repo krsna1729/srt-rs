@@ -1,0 +1,34 @@
+[package]
+name = "fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# local patch (crates/srt-protocol/VENDOR.md): the root Cargo.toml
+# now excludes this path from its own [workspace], but that alone doesn't
+# fully detach a nested crate -- it also needs its own empty [workspace]
+# table, or cargo-fuzz's build errors with "current package believes it's
+# in a workspace when it's not". Matches cargo-fuzz's own generated
+# template for exactly this reason.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[[bin]]
+bench = false
+doc = false
+name = "fuzz_packet_decode"
+path = "fuzz_targets/fuzz_packet_decode.rs"
+test = false
+
+[[bin]]
+bench = false
+doc = false
+name = "fuzz_handshake_decode"
+path = "fuzz_targets/fuzz_handshake_decode.rs"
+test = false
+
+[dependencies]
+libfuzzer-sys = "0.4"
+shiguredo_srt = { path = ".." }

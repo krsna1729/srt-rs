@@ -1,0 +1,10 @@
+# Cap parallel rustc jobs so concurrent builds don't OOM.
+# Override with: CARGO_BUILD_JOBS=N cargo build
+[build]
+jobs = 8
+
+# mold is ~10× faster than ld for linking. All profiles benefit.
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold", "-C", "link-arg=-Wl,-z,relro,-z,now"]
+

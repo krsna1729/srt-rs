@@ -1,0 +1,51 @@
+[package]
+name = "shiguredo_srt"
+version = "2026.1.0-canary.1"
+edition = "2024"
+rust-version = "1.93"
+description = "SRT (Secure Reliable Transport) library"
+readme = "README.md"
+homepage = "https://github.com/shiguredo/srt-rs"
+repository = "https://github.com/shiguredo/srt-rs"
+license = "Apache-2.0"
+include = ["/src/**", "LICENSE", "README.md"]
+
+[dependencies]
+# local patch (crates/srt-protocol/VENDOR.md): replaced aws-lc-rs
+# (pulls in aws-lc-sys, a cmake+C-compiler native build step -- exactly the
+# kind of native toolchain dependency this whole migration exists to move
+# away from) with a pure-Rust RustCrypto stack. All audited crates, no
+# hand-rolled AES-CTR or AES Key Wrap -- see crypto.rs's module doc comment
+# for the exact primitive-to-crate mapping.
+aes = "0.9"
+cipher = "0.5"
+ctr = "0.10"
+aes-kw = "0.3"
+hmac = "0.13"
+sha1 = "0.11"
+pbkdf2 = "0.13"
+# ログ出力 (デバッグ出力を tracing-subscriber 側で制御する)
+tracing = "0.1"
+
+[dev-dependencies]
+# local patch (crates/srt-protocol/VENDOR.md): Core-only benchmark
+# for docs/srt-pure-rust-plan.md Phase 4's kill-switch criterion (is the
+# Rust Core cheaper per packet than libsrt, measured with no I/O in the
+# way). Same criterion version this repo's root Cargo.toml pins.
+criterion = "0.8"
+
+[[bench]]
+name = "core_packet_loop"
+harness = false
+
+[[bench]]
+name = "core_packet_loop_io"
+harness = false
+
+[[bench]]
+name = "receiver_loss_scan"
+harness = false
+
+[[bench]]
+name = "receiver_tsbpd_scan"
+harness = false
