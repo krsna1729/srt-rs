@@ -178,6 +178,52 @@ unsafe fn sockaddr_to_addr(storage: &libc::sockaddr_storage) -> Option<std::net:
     )))
 }
 
+/// Drain one socket for admission, calling `on_datagram(peer, data)` for
+/// each queued datagram -- either batched (`recvmmsg`, one syscall for up
+/// to `admit_bufs.len()` datagrams) or one `recv_from` syscall per
+/// datagram, per `LossConfig::batching`. This is the axis `Batching`
+/// exists to let a run select: isolating whatever win (or lack of one)
+/// batched admission gives at a given fan-in level from every other
+/// variable. Shared by every ingress strategy that has a socket serving
+/// more than one peer at once (`SharedPool`, `ReuseportMulti`,
+/// `ReuseportSingle`) -- `PerPort` never shares a socket, so batching
+/// doesn't apply there.
+#[allow(clippy::too_many_arguments)]
+fn drain_admission(
+    listener: &UdpSocket,
+    batching: crate::Batching,
+    admit_bufs: &mut [Vec<u8>],
+    admit_sizes: &mut [usize],
+    admit_addrs: &mut [Option<SocketAddr>],
+    buf: &mut [u8],
+    mut on_datagram: impl FnMut(SocketAddr, &[u8]),
+) {
+    match batching {
+        crate::Batching::On => loop {
+            let fd = listener.as_raw_fd();
+            let received = recvmsg_batch(fd, admit_bufs, admit_sizes, admit_addrs);
+            if received == 0 {
+                break;
+            }
+            for i in 0..received {
+                if let Some(peer) = admit_addrs[i] {
+                    on_datagram(peer, &admit_bufs[i][..admit_sizes[i]]);
+                }
+            }
+            if received < admit_bufs.len() {
+                break;
+            }
+        },
+        crate::Batching::Off => loop {
+            match listener.recv_from(buf) {
+                Ok((n, peer)) => on_datagram(peer, &buf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        },
+    }
+}
+
 pub fn run(cfg: LossConfig) {
     let start = Instant::now();
     if cfg.mode == crate::Mode::Receiver {
@@ -570,6 +616,9 @@ fn run_shared_pool(cfg: LossConfig, k: usize) {
     let stream_len = Duration::from_secs_f64(cfg.duration_secs);
     let run_deadline = Instant::now() + stream_len + IDLE_GRACE + Duration::from_secs(30);
     let mut buf = [0u8; 2048];
+    let mut admit_bufs: Vec<Vec<u8>> = (0..32).map(|_| vec![0u8; 2048]).collect();
+    let mut admit_sizes = [0usize; 32];
+    let mut admit_addrs: [Option<SocketAddr>; 32] = [None; 32];
 
     loop {
         let now = Instant::now();
@@ -590,32 +639,34 @@ fn run_shared_pool(cfg: LossConfig, k: usize) {
             let Some(socket) = sockets.get(socket_idx) else {
                 continue;
             };
-            loop {
-                match socket.recv_from(&mut buf) {
-                    Ok((n, peer)) => {
-                        let t = crate::now_ts(start);
-                        let entry = conns.entry(peer).or_insert_with(|| SharedConn {
-                            conn: SrtConnection::new_listener(ConnectionOptions {
-                                socket_id: std::process::id(),
-                                tsbpd_delay: cfg.latency_ms,
-                                ..Default::default()
-                            }),
-                            timers: srt_transport::ManualTimerStore::new(),
-                            connected: false,
-                            data_events: 0,
-                            peer,
-                            socket_idx,
-                            stream_deadline: None,
-                            last_data_at: Instant::now(),
-                        });
-                        let _ = entry.conn.feed_recv_buf(&buf[..n], t);
-                        entry.data_events += 1;
-                        entry.last_data_at = Instant::now();
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(_) => break,
-                }
-            }
+            let t = crate::now_ts(start);
+            drain_admission(
+                socket,
+                cfg.batching,
+                &mut admit_bufs,
+                &mut admit_sizes,
+                &mut admit_addrs,
+                &mut buf,
+                |peer, data| {
+                    let entry = conns.entry(peer).or_insert_with(|| SharedConn {
+                        conn: SrtConnection::new_listener(ConnectionOptions {
+                            socket_id: std::process::id(),
+                            tsbpd_delay: cfg.latency_ms,
+                            ..Default::default()
+                        }),
+                        timers: srt_transport::ManualTimerStore::new(),
+                        connected: false,
+                        data_events: 0,
+                        peer,
+                        socket_idx,
+                        stream_deadline: None,
+                        last_data_at: Instant::now(),
+                    });
+                    let _ = entry.conn.feed_recv_buf(data, t);
+                    entry.data_events += 1;
+                    entry.last_data_at = Instant::now();
+                },
+            );
         }
 
         let t = crate::now_ts(start);
@@ -959,19 +1010,17 @@ fn run_pool_acceptor(
         for event in events.iter() {
             match event.token().0 {
                 0 => {
-                    // Admission path: recvmmsg batch on the shared listener.
-                    loop {
-                        let fd = listener.as_raw_fd();
-                        let received =
-                            recvmsg_batch(fd, &mut admit_bufs, &mut admit_sizes, &mut admit_addrs);
-                        if received == 0 {
-                            break;
-                        }
-                        for i in 0..received {
-                            let Some(peer) = admit_addrs[i] else {
-                                continue;
-                            };
-                            let t = crate::now_ts(start);
+                    // Admission path: batched (recvmmsg) or per-datagram
+                    // per LossConfig::batching -- see drain_admission.
+                    let t = crate::now_ts(start);
+                    drain_admission(
+                        &listener,
+                        cfg.batching,
+                        &mut admit_bufs,
+                        &mut admit_sizes,
+                        &mut admit_addrs,
+                        &mut buf,
+                        |peer, data| {
                             let entry = pending.entry(peer).or_insert_with(|| Pending {
                                 conn: SrtConnection::new_listener(ConnectionOptions {
                                     socket_id: std::process::id(),
@@ -982,14 +1031,9 @@ fn run_pool_acceptor(
                                 connected: false,
                                 created_at: Instant::now(),
                             });
-                            let _ = entry
-                                .conn
-                                .feed_recv_buf(&admit_bufs[i][..admit_sizes[i]], t);
-                        }
-                        if received < 32 {
-                            break;
-                        }
-                    }
+                            let _ = entry.conn.feed_recv_buf(data, t);
+                        },
+                    );
                 }
                 idx => service_slot_event(&mut slots, Token(idx), &mut buf, start),
             }
@@ -1310,6 +1354,7 @@ fn run_single_acceptor(
     let mut admit_bufs: Vec<Vec<u8>> = (0..32).map(|_| vec![0u8; 2048]).collect();
     let mut admit_sizes = [0usize; 32];
     let mut admit_addrs: [Option<SocketAddr>; 32] = [None; 32];
+    let mut buf = [0u8; 2048];
     let mut per_worker_count = vec![0usize; senders.len()];
 
     loop {
@@ -1323,18 +1368,15 @@ fn run_single_acceptor(
             if event.token() != Token(0) {
                 continue;
             }
-            loop {
-                let fd = listener.as_raw_fd();
-                let received =
-                    recvmsg_batch(fd, &mut admit_bufs, &mut admit_sizes, &mut admit_addrs);
-                if received == 0 {
-                    break;
-                }
-                for i in 0..received {
-                    let Some(peer) = admit_addrs[i] else {
-                        continue;
-                    };
-                    let t = crate::now_ts(start);
+            let t = crate::now_ts(start);
+            drain_admission(
+                &listener,
+                cfg.batching,
+                &mut admit_bufs,
+                &mut admit_sizes,
+                &mut admit_addrs,
+                &mut buf,
+                |peer, data| {
                     let entry = pending.entry(peer).or_insert_with(|| Pending {
                         conn: SrtConnection::new_listener(ConnectionOptions {
                             socket_id: std::process::id(),
@@ -1345,14 +1387,9 @@ fn run_single_acceptor(
                         connected: false,
                         created_at: Instant::now(),
                     });
-                    let _ = entry
-                        .conn
-                        .feed_recv_buf(&admit_bufs[i][..admit_sizes[i]], t);
-                }
-                if received < 32 {
-                    break;
-                }
-            }
+                    let _ = entry.conn.feed_recv_buf(data, t);
+                },
+            );
         }
 
         // Drive pending handshakes toward Connected, then route -- same

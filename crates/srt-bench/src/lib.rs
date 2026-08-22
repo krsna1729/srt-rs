@@ -172,6 +172,22 @@ pub struct LossConfig {
     /// beyond `2*bond_pairs` are ordinary, unbonded connections.
     pub bond_mode: BondMode,
     pub bond_pairs: usize,
+    /// Receiver only, and only meaningful where a socket serves more than
+    /// one peer at once (a `SharedPool`/`ReuseportMulti`/`ReuseportSingle`
+    /// admission listener -- `PerPort` never shares a socket, so this is
+    /// a no-op there). `On`: batch multiple queued datagrams into one
+    /// syscall/op where the runtime supports it (`recvmmsg` for mio).
+    /// `Off`: always one syscall/op per datagram, even where batching is
+    /// available -- the baseline `On` should be measured against. See
+    /// `Batching` for which runtimes actually have a batched path today.
+    pub batching: Batching,
+}
+
+/// See [`LossConfig::batching`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Batching {
+    On,
+    Off,
 }
 
 /// Listener ingress topology. See [`LossConfig::ingress`].
@@ -363,7 +379,7 @@ pub fn bench_config_from_args() -> LossConfig {
              mode=<sender|receiver> <host?> <port> <duration_secs> <latency_ms> \
              [bitrate_bps] [--connections N] \
              [--ingress per-port|shared-pool=K|reuseport-multi=K|reuseport-single=W] \
-             [--bond broadcast:G|backup:G|none]"
+             [--bond broadcast:G|backup:G|none] [--batch on|off]"
         );
         std::process::exit(2)
     }
@@ -458,6 +474,15 @@ pub fn bench_config_from_args() -> LossConfig {
         }
     };
 
+    let batching = match cli.flags.get("batch").map(String::as_str) {
+        None | Some("on") => Batching::On,
+        Some("off") => Batching::Off,
+        Some(other) => {
+            eprintln!("error: unknown --batch '{other}' (want on|off)");
+            usage()
+        }
+    };
+
     LossConfig {
         runtime,
         mode,
@@ -470,5 +495,6 @@ pub fn bench_config_from_args() -> LossConfig {
         ingress,
         bond_mode,
         bond_pairs,
+        batching,
     }
 }
