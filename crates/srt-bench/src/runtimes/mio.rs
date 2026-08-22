@@ -3,7 +3,7 @@
 //! `ManualTimerStore` inside Conn). Connection i lives on port + i, each
 //! registered with Token(i).
 
-use crate::{Aggregate, BondMode, ConnStats, GroupRegistry, LossConfig};
+use crate::{Aggregate, BondMode, ConnStats, LossConfig};
 use mio::net::UdpSocket;
 use mio::{Events, Interest, Poll, Token};
 use shiguredo_srt::{
@@ -80,9 +80,8 @@ pub fn run(cfg: LossConfig) {
     // production-like case (one SRT listener port, many callers) where a
     // single acceptor saturates at ~1200 concurrent handshakes.
     // ReuseportMulti(K) creates K acceptor sockets on the base port, each
-    // in its own thread, with a shared GroupRegistry for bond affinity
-    // (first leg to promote claims the group; later legs hand off via
-    // mpsc once, never per-packet).
+    // in its own thread. See run_pool_receiver's doc for why only bonded
+    // legs that need to relocate ever get a second socket.
     if cfg.mode == crate::Mode::Receiver && cfg.connections > 1 {
         match cfg.ingress {
             crate::Ingress::ReuseportMulti(k) if k > 1 => {
@@ -445,17 +444,14 @@ fn run_shared_pool(cfg: LossConfig, k: usize) {
     }
 
     fn is_terminal(c: &SharedConn, now: Instant, connect_deadline: Instant) -> bool {
-        match c.stream_deadline {
-            Some(deadline) => {
-                !c.connected
-                    || now >= deadline
-                    || now.saturating_duration_since(c.last_data_at) >= IDLE_GRACE
-            }
-            // Never connected: keep waiting until the shared connect
-            // window closes, exactly like an unresolved pending
-            // handshake elsewhere in this file.
-            None => now >= connect_deadline,
-        }
+        srt_lifecycle::is_terminal(
+            c.connected,
+            c.stream_deadline,
+            c.last_data_at,
+            now,
+            connect_deadline,
+            IDLE_GRACE,
+        )
     }
 
     let mut conns: HashMap<SocketAddr, SharedConn> = HashMap::new();
@@ -602,11 +598,19 @@ struct PoolSlot {
 
 /// A slot is done -- either it disconnected, ran its full duration, or went
 /// idle past `IDLE_GRACE` -- and the acceptor no longer needs to service it
-/// to make progress.
+/// to make progress. A slot is only ever created post-`Connected` (there's
+/// no "never connected" state to represent), so `connect_deadline` is
+/// unused -- `srt_lifecycle::is_terminal` only consults it when
+/// `stream_deadline` is `None`, which never happens here.
 fn slot_is_terminal(slot: &PoolSlot, now: Instant) -> bool {
-    !slot.connected
-        || now >= slot.stream_deadline
-        || now.saturating_duration_since(slot.last_data_at) >= IDLE_GRACE
+    srt_lifecycle::is_terminal(
+        slot.connected,
+        Some(slot.stream_deadline),
+        slot.last_data_at,
+        now,
+        now,
+        IDLE_GRACE,
+    )
 }
 
 /// How long a connected slot may go without a datagram from its peer
@@ -669,26 +673,43 @@ fn drain_conn_outputs(
     refused
 }
 
-/// Multi-acceptor single-port receiver (`--ingress pool=K`, K>1): K
-/// SO_REUSEPORT acceptor threads share the base port; the kernel hashes
-/// each flow's source tuple to one of them. Each acceptor completes the
-/// handshake for every flow routed to it, then promotes the session:
-/// creates a dedicated socket bound with SO_REUSEPORT on the same port and
-/// connect()ed to the peer so kernel demux follows the exact 4-tuple.
+/// Multi-acceptor single-port receiver (`--ingress reuseport-multi=K`,
+/// K>1): K SO_REUSEPORT acceptor threads share the base port; the kernel
+/// hashes each flow's source tuple to one of them. Each acceptor
+/// completes the handshake for every flow routed to it, then decides
+/// whether that connection needs to physically move to a different
+/// thread at all.
 ///
-/// Bond affinity: a shared GroupRegistry records which acceptor first
-/// promoted each group id (from the peer's handshake group extension).
-/// A leg landing on a non-owner thread is still promoted there, then the
-/// registered slot ships to the owner over a one-shot mpsc channel. The
-/// channel is admission-time only: steady-state packets flow
-/// kernel -> socket -> owner poll directly, never through the channel.
-/// Non-bonded connections skip the registry entirely.
+/// The common case -- an unbonded connection, or a bonded one whose
+/// kernel-hash landing already matches its group's owner -- needs no new
+/// socket: it's serviced straight off this thread's existing listener
+/// socket, dispatched by peer address, exactly like `SharedPool`. Only a
+/// bonded leg that actually needs to relocate to a different owner gets
+/// promoted to a dedicated connected socket and shipped once over a
+/// one-shot mpsc channel.
+///
+/// This matters beyond neatness: every *new* socket bound into this
+/// port's reuseport group perturbs Linux's default (non-eBPF) hash,
+/// which factors in current group size -- so it can reroute some other,
+/// still-pending flow's next datagram to a different acceptor mid-
+/// handshake, forcing a retry (measured: ~5-6x listener CPU-sys time at
+/// 150 connections when every connection was promoted, regardless of
+/// bonding). Not promoting the common case means the group stays fixed
+/// at its initial K members for an all-unbonded workload, however large
+/// or long-running -- no assumption about total connection count needed,
+/// since nothing is pre-sized to it.
+///
+/// Ownership for the connections that *do* need to move is decided via
+/// `srt_lifecycle::WorkerRouter`, consulted only for bonded legs (an
+/// unbonded connection never touches it, exactly like the registry this
+/// replaced).
 fn run_pool_receiver(cfg: LossConfig, k: usize) {
     use std::sync::mpsc;
 
     let worker_count = k.min(cfg.connections);
     let start = Instant::now();
-    let group_registry: GroupRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let router: crate::SharedWorkerRouter =
+        Arc::new(Mutex::new(srt_lifecycle::WorkerRouter::new(worker_count)));
 
     // All channels must exist before any thread is spawned: promote_slot
     // indexes `senders` by owner worker index, so every thread needs the
@@ -702,15 +723,13 @@ fn run_pool_receiver(cfg: LossConfig, k: usize) {
 
     let mut handles = Vec::with_capacity(worker_count);
     for (worker_index, rx) in receivers.into_iter().enumerate() {
-        let registry = group_registry.clone();
+        let router = router.clone();
         let all_senders = senders.clone();
         let cfg = cfg.clone();
         handles.push(
             std::thread::Builder::new()
                 .name(format!("srt-acceptor-{worker_index}"))
-                .spawn(move || {
-                    run_pool_acceptor(cfg, worker_index, start, registry, all_senders, rx)
-                })
+                .spawn(move || run_pool_acceptor(cfg, worker_index, start, router, all_senders, rx))
                 .expect("spawn acceptor"),
         );
     }
@@ -739,7 +758,7 @@ fn run_pool_acceptor(
     cfg: LossConfig,
     worker_index: usize,
     start: Instant,
-    group_registry: GroupRegistry,
+    router: crate::SharedWorkerRouter,
     senders: Vec<mpsc::Sender<WorkerMessage>>,
     handoffs: mpsc::Receiver<WorkerMessage>,
 ) -> Vec<ConnStats> {
@@ -756,32 +775,34 @@ fn run_pool_acceptor(
         .register(&mut listener, Token(0), Interest::READABLE)
         .expect("register listener");
 
-    struct Pending {
+    struct Peer {
         conn: SrtConnection,
         timers: srt_transport::ManualTimerStore,
+        /// Live connected state, feeding `srt_lifecycle::is_terminal`.
         connected: bool,
-        /// When this handshake attempt was first admitted. A pending
-        /// entry can be orphaned -- e.g. Linux's default (non-eBPF)
-        /// SO_REUSEPORT hash factors in current group size, and every
-        /// promotion adds the new per-connection socket to this port's
-        /// reuseport group, which can reroute a still-pending (not yet
-        /// promoted) flow's *next* datagram to a different acceptor
-        /// mid-handshake, stranding this entry with no peer traffic ever
-        /// arriving again. Bounding pending lifetime by `connect_deadline`
-        /// (below) means one orphan can't wedge this acceptor's exit
-        /// condition until the absolute safety net.
-        created_at: Instant,
+        /// `None` until this peer's first `Connected` event; doubles as
+        /// "has this ever connected" (see `SharedPool`'s identical field).
+        stream_deadline: Option<Instant>,
+        data_events: u64,
+        last_data_at: Instant,
     }
 
-    // Pending handshakes keyed by peer tuple; established slots appended
-    // after promotion, each with its own token.
-    let mut pending: HashMap<SocketAddr, Pending> = HashMap::new();
+    // Every connection this acceptor admits and keeps servicing locally
+    // (the common case: unbonded, or bonded but already on its group's
+    // owner thread) lives here for its whole life -- dispatched by peer
+    // address off the *same* listener socket used for admission, exactly
+    // like `SharedPool`. No dedicated socket, no reuseport-group growth.
+    // `slots` (below) holds only the rare opposite case: a bonded leg
+    // that had to relocate here from another acceptor via handoff, which
+    // genuinely needs its own connected socket since it physically moved
+    // event loops.
+    let mut peers: HashMap<SocketAddr, Peer> = HashMap::new();
     let mut slots: Vec<PoolSlot> = Vec::new();
     let mut next_token: usize = 1;
     let connect_deadline = Instant::now() + crate::INTEROP_CONNECT_TIMEOUT;
     let stream_len = Duration::from_secs_f64(cfg.duration_secs);
     // Absolute safety net so a hung peer or a stuck protocol state can
-    // never wedge this thread forever, no matter what `slot_is_terminal`
+    // never wedge this thread forever, no matter what `is_terminal`
     // and `connect_deadline` decide. Sized off the run's own duration
     // (plus idle grace and margin) rather than a fixed constant so it
     // never truncates a legitimate long soak run.
@@ -800,16 +821,25 @@ fn run_pool_acceptor(
         if now >= run_deadline {
             break;
         }
-        // Vacuously true while no slot exists yet, so an acceptor that
-        // never admits anything still exits once the connect window closes
-        // instead of hanging on an empty `slots` guard.
-        let all_terminal = slots.iter().all(|s| slot_is_terminal(s, now));
-        if now >= connect_deadline && pending.is_empty() && all_terminal {
+        // Vacuously true while nothing exists yet, so an acceptor that
+        // never admits anything still exits once the connect window
+        // closes instead of hanging on an empty guard.
+        let all_terminal = peers.values().all(|p| {
+            srt_lifecycle::is_terminal(
+                p.connected,
+                p.stream_deadline,
+                p.last_data_at,
+                now,
+                connect_deadline,
+                IDLE_GRACE,
+            )
+        }) && slots.iter().all(|s| slot_is_terminal(s, now));
+        if now >= connect_deadline && all_terminal {
             break;
         }
         poll.poll(&mut events, Some(TIMER_TICK)).ok();
 
-        // Accept bond legs promoted on other acceptors that belong here.
+        // Accept bond legs relocated here from another acceptor.
         // `Finished` is #3-only (see WorkerMessage) and never sent on this
         // channel; using `match` rather than a `while let Ok(Handoff(_))`
         // pattern means one would just be skipped, not stop the drain and
@@ -858,7 +888,7 @@ fn run_pool_acceptor(
                         &mut admit_addrs,
                         &mut buf,
                         |peer, data| {
-                            let entry = pending.entry(peer).or_insert_with(|| Pending {
+                            let entry = peers.entry(peer).or_insert_with(|| Peer {
                                 conn: SrtConnection::new_listener(ConnectionOptions {
                                     socket_id: std::process::id(),
                                     tsbpd_delay: cfg.latency_ms,
@@ -866,7 +896,9 @@ fn run_pool_acceptor(
                                 }),
                                 timers: srt_transport::ManualTimerStore::new(),
                                 connected: false,
-                                created_at: Instant::now(),
+                                stream_deadline: None,
+                                data_events: 0,
+                                last_data_at: Instant::now(),
                             });
                             let _ = entry.conn.feed_recv_buf(data, t);
                         },
@@ -876,67 +908,134 @@ fn run_pool_acceptor(
             }
         }
 
-        // Drive pending handshakes toward Connected, then promote. A
-        // connected peer stays in `pending` here (`retain` keeps returning
-        // true for it) -- only the promotion loop below actually removes
-        // it, via `pending.remove`, which is what hands ownership of its
-        // `SrtConnection` over to `promote_slot`. Dropping it early inside
-        // `retain` would destroy the handshake-completed connection before
-        // it's ever promoted: the peer would see its own handshake
-        // conclusion (already sent) and believe it's connected, while the
-        // acceptor silently admits nothing.
+        // Drive every tracked peer: fire timers, drain outputs (always
+        // via the shared listener's unconnected `send_to` -- a peer here
+        // never gets its own socket, connected or not), and react to
+        // protocol events. On a peer's *first* Connected, decide once
+        // whether it needs to relocate -- see this function's module doc.
         let t = crate::now_ts(start);
-        let mut promote = Vec::new();
-        pending.retain(|peer, p| {
-            // Give up on a handshake that never completed within the
-            // connect window: whatever the cause (peer gave up, packet
-            // loss, or an orphaned entry -- see `Pending::created_at`),
-            // an attempt this stale is never going to promote, and must
-            // not block this acceptor's exit condition forever.
-            if p.created_at.elapsed() >= crate::INTEROP_CONNECT_TIMEOUT {
-                return false;
-            }
+        let mut relocate: Vec<(SocketAddr, GroupExtensionData)> = Vec::new();
+        for (peer, p) in peers.iter_mut() {
             p.timers.fire_expired(t, &mut p.conn);
-            let refused = drain_conn_outputs(&mut p.conn, &mut p.timers, &listener, *peer, t);
-            if refused {
-                return false;
-            }
+            let _ = drain_conn_outputs(&mut p.conn, &mut p.timers, &listener, *peer, t);
+            let mut newly_connected = false;
             while let Some(ev) = p.conn.poll_event() {
-                if matches!(ev, ConnectionEvent::Connected) {
-                    p.connected = true;
+                match ev {
+                    ConnectionEvent::Connected => {
+                        if p.stream_deadline.is_none() {
+                            newly_connected = true;
+                        }
+                        p.connected = true;
+                    }
+                    ConnectionEvent::DataReceived { .. } => {
+                        p.data_events += 1;
+                        p.last_data_at = Instant::now();
+                    }
+                    ConnectionEvent::Disconnected { .. } => {
+                        p.connected = false;
+                    }
+                    _ => {}
                 }
             }
-            if p.connected {
-                promote.push(*peer);
+            if newly_connected {
+                p.stream_deadline = Some(Instant::now() + stream_len);
+                if let Some(extension) = p.conn.peer_group_extension() {
+                    relocate.push((*peer, extension));
+                }
             }
-            true
-        });
-        for peer in promote {
-            let Some(p) = pending.remove(&peer) else {
-                continue;
+        }
+        for (peer, extension) in relocate {
+            let group = srt_lifecycle::GroupAffinity {
+                group_id: extension.group_id,
+                stream_id: None,
+                extension,
             };
-            // Bond affinity key: the peer's handshake group extension, if
-            // any. None for plain callers -- they never touch the registry.
-            let group_id = p.conn.peer_group_extension().map(|g| g.group_id);
-            promote_slot(
-                &mut poll,
-                &mut slots,
-                &mut next_token,
-                cfg.port,
-                stream_len,
-                peer,
-                p.conn,
-                group_id,
-                &group_registry,
-                worker_index,
-                &senders,
-            );
+            let owner = {
+                let mut router = match router.lock() {
+                    Ok(r) => r,
+                    Err(_) => continue, // poisoned: leave the leg where it landed
+                };
+                router.assign(peer, Some(group), srt_lifecycle::RoutingMode::LeastTuples)
+            };
+            if owner != worker_index {
+                let Some(p) = peers.remove(&peer) else {
+                    continue;
+                };
+                relocate_to_owner(cfg.port, peer, p.conn, owner, &senders);
+            }
         }
 
         maintain_slots(&mut slots, start);
     }
 
-    slots_to_stats(slots)
+    let mut stats: Vec<ConnStats> = peers
+        .into_iter()
+        .map(|(peer, p)| {
+            // Free this tuple's (and, if it was the last member, its
+            // group's) router bookkeeping now that the connection is
+            // fully done -- a no-op if this peer never touched the
+            // router (unbonded). Without this a long-running listener
+            // would leak router state forever; a short bench run doesn't
+            // strictly need it, but this is meant to read like ordinary
+            // application code, not a one-shot script.
+            if let Ok(mut router) = router.lock() {
+                router.release(&peer);
+            }
+            let mut s = ConnStats {
+                // stream_deadline is Some as soon as Connected has ever
+                // fired -- see the struct doc. A session that streamed
+                // everything and then legitimately tripped SRT's own
+                // peer-idle timeout is still a success, not "never
+                // connected".
+                connected: p.stream_deadline.is_some(),
+                data_events: p.data_events,
+                ..Default::default()
+            };
+            if let Some(st) = p.conn.receiver_stats() {
+                s.has_stats = true;
+                s.core_total = st.total_received;
+                s.secondary_a = st.total_lost;
+                s.secondary_b = st.total_duplicates;
+                s.rtt_us = st.rtt as u64;
+            }
+            s
+        })
+        .collect();
+    stats.extend(slots_to_stats(slots));
+    stats
+}
+
+/// Relocate a connection that must move to a different worker: bind a
+/// fresh dedicated socket (unavoidable here -- this is the one case that
+/// genuinely needs to move to a different thread's event loop), connect
+/// it to the peer, and ship it once over the owner's channel.
+fn relocate_to_owner(
+    port: u16,
+    peer: SocketAddr,
+    pending_conn: SrtConnection,
+    owner: usize,
+    senders: &[mpsc::Sender<WorkerMessage>],
+) {
+    let socket = match bind_reuseport(port) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[bench-mio] relocate {peer}: bind {e}");
+            return;
+        }
+    };
+    if socket.connect(peer).is_err() {
+        eprintln!("[bench-mio] relocate {peer}: connect failed");
+        return;
+    }
+    let message = WorkerMessage::Handoff(Box::new(Handoff {
+        socket,
+        conn: pending_conn,
+    }));
+    if senders[owner].send(message).is_err() {
+        eprintln!("[bench-mio] relocate {peer}: owner {owner} channel closed");
+    } else {
+        HANDOFF_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Service one readiness event against an established slot by token:
@@ -1012,81 +1111,6 @@ fn slots_to_stats(slots: Vec<PoolSlot>) -> Vec<ConnStats> {
             s
         })
         .collect()
-}
-
-#[allow(clippy::too_many_arguments)]
-fn promote_slot(
-    poll: &mut Poll,
-    slots: &mut Vec<PoolSlot>,
-    next_token: &mut usize,
-    base_port: u16,
-    stream_len: Duration,
-    peer: SocketAddr,
-    pending_conn: SrtConnection,
-    group_id: Option<u32>,
-    group_registry: &GroupRegistry,
-    worker_index: usize,
-    senders: &[mpsc::Sender<WorkerMessage>],
-) {
-    let mut socket = match bind_reuseport(base_port) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("[bench-mio] promote {peer}: bind {e}");
-            return;
-        }
-    };
-    if socket.connect(peer).is_err() {
-        eprintln!("[bench-mio] promote {peer}: connect failed");
-        return;
-    }
-
-    // Bond affinity: first acceptor to promote a group owns it. A leg that
-    // landed here but belongs to another owner is promoted anyway (so the
-    // kernel 4-tuple demux is correct), then shipped once. Not registered
-    // on this thread's poll -- the owner registers it on its own poll when
-    // the handoff arrives, so registering it here would be pure waste.
-    if let Some(group_id) = group_id {
-        let owner = {
-            let mut registry = match group_registry.lock() {
-                Ok(r) => r,
-                Err(_) => return, // poisoned: drop the leg rather than corrupt ownership
-            };
-            *registry.entry(group_id).or_insert(worker_index)
-        };
-        if owner != worker_index {
-            let message = WorkerMessage::Handoff(Box::new(Handoff {
-                socket,
-                conn: pending_conn,
-            }));
-            if senders[owner].send(message).is_err() {
-                eprintln!("[bench-mio] promote {peer}: owner {owner} channel closed");
-            } else {
-                HANDOFF_COUNT.fetch_add(1, Ordering::Relaxed);
-            }
-            return;
-        }
-    }
-
-    let token = Token(*next_token);
-    *next_token += 1;
-    if poll
-        .registry()
-        .register(&mut socket, token, Interest::READABLE)
-        .is_err()
-    {
-        return;
-    }
-    let now = Instant::now();
-    slots.push(PoolSlot {
-        conn: Conn::new(pending_conn, socket),
-        connected: true,
-        ever_connected: true,
-        data_events: 0,
-        poisoned: false,
-        token,
-        stream_deadline: now + stream_len,
-        last_data_at: now,
-    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1418,8 +1442,16 @@ fn run_worker(
 #[cfg(test)]
 mod bond_affinity_tests {
     use super::*;
+    use crate::GroupRegistry;
 
     // ---- Registry semantics (pure, no threads) -------------------------
+    //
+    // `run_pool_acceptor` itself no longer uses `GroupRegistry` directly
+    // (it consults `srt_lifecycle::WorkerRouter` instead, only for legs
+    // that need to relocate) -- these tests exercise the generic
+    // claim/lookup/independence semantics of the
+    // `Arc<Mutex<HashMap<group_id, owner>>>` pattern itself, which
+    // `tokio.rs`'s `ReuseportMulti` still uses directly.
 
     fn registry() -> GroupRegistry {
         Arc::new(Mutex::new(HashMap::new()))
