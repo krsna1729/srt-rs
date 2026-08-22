@@ -132,6 +132,148 @@ impl Default for ManualTimerStore {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shiguredo_srt::{ConnectionOptions, SrtConnection};
+
+    #[test]
+    fn due_timers_returns_only_expired_and_removes_them() {
+        let mut store = ManualTimerStore::new();
+        let t0 = Timestamp::from_micros(0);
+        store.apply_output(
+            &ConnectionOutput::SetTimer {
+                id: TimerId::Ack,
+                duration_micros: 10_000,
+            },
+            t0,
+        );
+        store.apply_output(
+            &ConnectionOutput::SetTimer {
+                id: TimerId::Nak,
+                duration_micros: 50_000,
+            },
+            t0,
+        );
+
+        // Before Ack's deadline: nothing due.
+        assert!(store.due_timers(Timestamp::from_micros(5_000)).is_empty());
+
+        // At/after Ack's deadline, before Nak's: only Ack fires, exactly
+        // once (removed from the store on the first call).
+        let due = store.due_timers(Timestamp::from_micros(10_000));
+        assert_eq!(due, vec![TimerId::Ack]);
+        assert!(store.due_timers(Timestamp::from_micros(10_000)).is_empty());
+
+        // Nak still pending.
+        let due = store.due_timers(Timestamp::from_micros(50_000));
+        assert_eq!(due, vec![TimerId::Nak]);
+    }
+
+    #[test]
+    fn clear_timer_removes_before_it_fires() {
+        let mut store = ManualTimerStore::new();
+        let t0 = Timestamp::from_micros(0);
+        store.apply_output(
+            &ConnectionOutput::SetTimer {
+                id: TimerId::Retransmit,
+                duration_micros: 1_000,
+            },
+            t0,
+        );
+        store.apply_output(
+            &ConnectionOutput::ClearTimer {
+                id: TimerId::Retransmit,
+            },
+            t0,
+        );
+
+        assert!(store.due_timers(Timestamp::from_micros(1_000)).is_empty());
+    }
+
+    #[test]
+    fn set_timer_replaces_existing_deadline_for_same_id() {
+        let mut store = ManualTimerStore::new();
+        let t0 = Timestamp::from_micros(0);
+        store.apply_output(
+            &ConnectionOutput::SetTimer {
+                id: TimerId::Keepalive,
+                duration_micros: 1_000,
+            },
+            t0,
+        );
+        // Re-arm the same id further out -- this is what a real
+        // SetTimer-on-every-tick pattern does (e.g. resetting Keepalive
+        // on any inbound traffic).
+        store.apply_output(
+            &ConnectionOutput::SetTimer {
+                id: TimerId::Keepalive,
+                duration_micros: 5_000,
+            },
+            t0,
+        );
+
+        assert!(store.due_timers(Timestamp::from_micros(1_000)).is_empty());
+        assert_eq!(
+            store.due_timers(Timestamp::from_micros(5_000)),
+            vec![TimerId::Keepalive]
+        );
+    }
+
+    #[test]
+    fn time_until_earliest_tracks_the_soonest_deadline() {
+        let mut store = ManualTimerStore::new();
+        let t0 = Timestamp::from_micros(1_000);
+        // No timers armed: falls back to the caller-supplied default.
+        assert_eq!(store.time_until_earliest(t0, 42), 42);
+
+        store.apply_output(
+            &ConnectionOutput::SetTimer {
+                id: TimerId::Nak,
+                duration_micros: 20_000,
+            },
+            t0,
+        );
+        store.apply_output(
+            &ConnectionOutput::SetTimer {
+                id: TimerId::Ack,
+                duration_micros: 5_000,
+            },
+            t0,
+        );
+
+        // Soonest deadline is Ack's (t0 + 5_000 = 6_000).
+        assert_eq!(store.time_until_earliest(t0, 42), 5_000);
+        // Past the deadline: saturates to 0, never underflows/panics.
+        assert_eq!(
+            store.time_until_earliest(Timestamp::from_micros(50_000), 42),
+            0
+        );
+    }
+
+    #[test]
+    fn fire_expired_drains_due_timers_without_panicking() {
+        let mut store = ManualTimerStore::new();
+        let mut conn = SrtConnection::new_listener(ConnectionOptions::default());
+        let t0 = Timestamp::from_micros(0);
+        store.apply_output(
+            &ConnectionOutput::SetTimer {
+                id: TimerId::Handshake,
+                duration_micros: 1_000,
+            },
+            t0,
+        );
+
+        store.fire_expired(Timestamp::from_micros(1_000), &mut conn);
+
+        // Fired timer is gone; nothing left to time out on.
+        assert_eq!(
+            store.time_until_earliest(Timestamp::from_micros(1_000), 99),
+            99
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Per-runtime Conn structs
 // ---------------------------------------------------------------------------
@@ -198,7 +340,7 @@ pub mod mio_transport {
             use std::cell::RefCell;
             thread_local! {
                 static SCRATCH: RefCell<(Vec<libc::mmsghdr>, Vec<libc::iovec>)> =
-                    RefCell::new((Vec::new(), Vec::new()));
+                    const { RefCell::new((Vec::new(), Vec::new())) };
             }
             if batch.is_empty() {
                 return false;
