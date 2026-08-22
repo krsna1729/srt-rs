@@ -662,6 +662,17 @@ fn run_pool_acceptor(
         conn: SrtConnection,
         timers: srt_transport::ManualTimerStore,
         connected: bool,
+        /// When this handshake attempt was first admitted. A pending
+        /// entry can be orphaned -- e.g. Linux's default (non-eBPF)
+        /// SO_REUSEPORT hash factors in current group size, and every
+        /// promotion adds the new per-connection socket to this port's
+        /// reuseport group, which can reroute a still-pending (not yet
+        /// promoted) flow's *next* datagram to a different acceptor
+        /// mid-handshake, stranding this entry with no peer traffic ever
+        /// arriving again. Bounding pending lifetime by `connect_deadline`
+        /// (below) means one orphan can't wedge this acceptor's exit
+        /// condition until the absolute safety net.
+        created_at: Instant,
     }
 
     // Pending handshakes keyed by peer tuple; established slots appended
@@ -752,6 +763,7 @@ fn run_pool_acceptor(
                                 }),
                                 timers: srt_transport::ManualTimerStore::new(),
                                 connected: false,
+                                created_at: Instant::now(),
                             });
                             let _ = entry
                                 .conn
@@ -798,6 +810,14 @@ fn run_pool_acceptor(
         let t = crate::now_ts(start);
         let mut promote = Vec::new();
         pending.retain(|peer, p| {
+            // Give up on a handshake that never completed within the
+            // connect window: whatever the cause (peer gave up, packet
+            // loss, or an orphaned entry -- see `Pending::created_at`),
+            // an attempt this stale is never going to promote, and must
+            // not block this acceptor's exit condition forever.
+            if p.created_at.elapsed() >= crate::INTEROP_CONNECT_TIMEOUT {
+                return false;
+            }
             p.timers.fire_expired(t, &mut p.conn);
             let refused = drain_conn_outputs(&mut p.conn, &mut p.timers, &listener, *peer, t);
             if refused {
