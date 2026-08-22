@@ -20,10 +20,11 @@ const MAX_POLL_WAIT: Duration = Duration::from_millis(20);
 /// are serviced on schedule without busy-polling.
 const TIMER_TICK: Duration = Duration::from_millis(10);
 
-/// Kernel socket buffers: defaults (~212KB rx) overflow during the serial
-/// loop's round-trip across hundreds of sockets, and the resulting kernel
-/// drops trigger NAK/retrans storms. 4MB absorbs multi-ms loop pauses.
-const SOCK_BUF_BYTES: usize = 4 << 20;
+/// Target 16 MB per socket. The protocol stack sets SO_RCVBUF/SO_SNDBUF
+/// explicitly on every socket it owns (never via sysctl) and reads back
+/// the effective value -- Linux doubles the request and clamps to
+/// net.core.rmem_max, so the granted size can be smaller than asked.
+const SOCK_BUF_BYTES: usize = 16 << 20;
 
 fn set_sock_bufs(fd: i32) -> std::io::Result<()> {
     let v = SOCK_BUF_BYTES as libc::c_int;
@@ -48,6 +49,22 @@ fn set_sock_bufs(fd: i32) -> std::io::Result<()> {
         );
         if r != 0 {
             return Err(std::io::Error::last_os_error());
+        }
+        // Verify effective value (Linux doubles and clamps).
+        let mut got: libc::c_int = 0;
+        let mut got_len = std::mem::size_of_val(&got) as libc::socklen_t;
+        let r = libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &mut got as *mut _ as *mut libc::c_void,
+            &mut got_len,
+        );
+        if r == 0 && (got as usize) < SOCK_BUF_BYTES {
+            eprintln!(
+                "SO_RCVBUF clamped by host to {} (requested {})",
+                got, SOCK_BUF_BYTES
+            );
         }
     }
     Ok(())
@@ -151,9 +168,7 @@ pub fn run(cfg: LossConfig) {
             let min_wait = drivers
                 .iter()
                 .filter(|d| d.connected)
-                .map(|d| {
-                    Duration::from_micros(d.conn.conn.time_until_send(t)).min(MAX_POLL_WAIT)
-                })
+                .map(|d| Duration::from_micros(d.conn.conn.time_until_send(t)).min(MAX_POLL_WAIT))
                 .min()
                 .unwrap_or(MAX_POLL_WAIT);
             poll_wait = poll_wait.min(min_wait);
@@ -169,38 +184,38 @@ pub fn run(cfg: LossConfig) {
             }
             touched[idx] = true;
             let d = &mut drivers[idx];
-                if d.peer.is_none() && cfg.mode == crate::Mode::Receiver {
-                    // Unconnected phase: first datagram reveals the caller.
-                    // Connect before anything else -- drain_outputs uses
-                    // connected send(), which fails silently otherwise.
-                    match d.conn.socket.recv_from(&mut buf) {
-                        Ok((n, addr)) => {
-                            if d.conn.socket.connect(addr).is_ok() {
-                                d.peer = Some(addr);
-                                let t = crate::now_ts(start);
-                                let _ = d.conn.conn.feed_recv_buf(&buf[..n], t);
-                            }
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                        Err(e) => {
-                            eprintln!("[bench-mio] recv error: {e}");
+            if d.peer.is_none() && cfg.mode == crate::Mode::Receiver {
+                // Unconnected phase: first datagram reveals the caller.
+                // Connect before anything else -- drain_outputs uses
+                // connected send(), which fails silently otherwise.
+                match d.conn.socket.recv_from(&mut buf) {
+                    Ok((n, addr)) => {
+                        if d.conn.socket.connect(addr).is_ok() {
+                            d.peer = Some(addr);
+                            let t = crate::now_ts(start);
+                            let _ = d.conn.conn.feed_recv_buf(&buf[..n], t);
                         }
                     }
-                } else {
-                    loop {
-                        match d.conn.socket.recv(&mut buf) {
-                            Ok(n) => {
-                                let t = crate::now_ts(start);
-                                let _ = d.conn.conn.feed_recv_buf(&buf[..n], t);
-                            }
-                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                            Err(e) => {
-                                eprintln!("[bench-mio] recv error conn {}: {e}", idx);
-                                break;
-                            }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(e) => {
+                        eprintln!("[bench-mio] recv error: {e}");
+                    }
+                }
+            } else {
+                loop {
+                    match d.conn.socket.recv(&mut buf) {
+                        Ok(n) => {
+                            let t = crate::now_ts(start);
+                            let _ = d.conn.conn.feed_recv_buf(&buf[..n], t);
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(e) => {
+                            eprintln!("[bench-mio] recv error conn {}: {e}", idx);
+                            break;
                         }
                     }
                 }
+            }
         }
 
         // Protocol maintenance. Timer scans are O(armed timers) per driver,
