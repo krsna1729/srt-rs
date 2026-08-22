@@ -116,24 +116,6 @@ impl ManualTimerStore {
         }
     }
 
-    /// Drain all pending outputs, applying timers and sending packets.
-    /// The `send` closure is called once per `SendPacket` output.
-    pub fn drain_outputs<F>(
-        conn: &mut SrtConnection,
-        timers: &mut Self,
-        now: Timestamp,
-        mut send: F,
-    ) where
-        F: FnMut(Vec<u8>),
-    {
-        while let Some(out) = conn.poll_output() {
-            match out {
-                ConnectionOutput::SendPacket(bytes) => send(bytes),
-                output => timers.apply_output(&output, now),
-            }
-        }
-    }
-
     /// Microseconds until the next timer fires.
     pub fn time_until_earliest(&self, now: Timestamp, default_us: u64) -> u64 {
         self.timers
@@ -184,8 +166,9 @@ pub mod mio_transport {
 
         /// Drain all pending outputs: send packets, manage manual timers.
         /// Batches `SendPacket`s via `sendmmsg` (one syscall for up to 32
-        /// datagrams). Returns true if any batch failed with
-        /// `ConnectionRefused` (poisoned socket).
+        /// datagrams). Returns true if the peer actually refused the
+        /// connection (`ECONNREFUSED` on a connected UDP socket) -- the
+        /// caller should reconnect.
         pub fn drain_outputs(&mut self, now: Timestamp) -> bool {
             let mut batch: Vec<Vec<u8>> = Vec::with_capacity(32);
             let mut refused = false;
@@ -206,40 +189,71 @@ pub mod mio_transport {
             refused
         }
 
+        /// mmsghdr/iovec scratch, reused across calls on this thread
+        /// (hot path: `drain_outputs` runs every event-loop tick per
+        /// connection). Capacity stabilizes at the batch cap (32) after
+        /// the first few calls, giving zero-allocation steady state --
+        /// mirrors `recvmsg_batch`'s scratch in srt-bench.
         fn flush_batch(socket: &mio::net::UdpSocket, batch: &mut Vec<Vec<u8>>) -> bool {
+            use std::cell::RefCell;
+            thread_local! {
+                static SCRATCH: RefCell<(Vec<libc::mmsghdr>, Vec<libc::iovec>)> =
+                    RefCell::new((Vec::new(), Vec::new()));
+            }
             if batch.is_empty() {
                 return false;
             }
-            let mut msgs: Vec<libc::mmsghdr> = Vec::with_capacity(batch.len());
-            let mut iovs: Vec<libc::iovec> = Vec::with_capacity(batch.len());
-            for buf in batch.iter() {
-                iovs.push(libc::iovec {
-                    iov_base: buf.as_ptr() as *mut _,
-                    iov_len: buf.len(),
-                });
-                msgs.push(libc::mmsghdr {
-                    msg_hdr: unsafe { std::mem::zeroed() },
-                    msg_len: 0,
-                });
-            }
-            for (msg, iov) in msgs.iter_mut().zip(iovs.iter()) {
-                msg.msg_hdr.msg_iov = iov as *const _ as *mut _;
-                msg.msg_hdr.msg_iovlen = 1;
-            }
-            let fd = {
-                use std::os::fd::AsRawFd;
-                socket.as_raw_fd()
-            };
-            let sent = unsafe {
-                libc::sendmmsg(
-                    fd,
-                    msgs.as_mut_ptr(),
-                    batch.len() as u32,
-                    libc::MSG_DONTWAIT,
-                )
-            };
-            batch.clear();
-            sent < 0
+            SCRATCH.with(|scratch| {
+                let (msgs, iovs) = &mut *scratch.borrow_mut();
+                msgs.clear();
+                iovs.clear();
+                for buf in batch.iter() {
+                    iovs.push(libc::iovec {
+                        iov_base: buf.as_ptr() as *mut _,
+                        iov_len: buf.len(),
+                    });
+                    msgs.push(libc::mmsghdr {
+                        msg_hdr: unsafe { std::mem::zeroed() },
+                        msg_len: 0,
+                    });
+                }
+                for (msg, iov) in msgs.iter_mut().zip(iovs.iter()) {
+                    msg.msg_hdr.msg_iov = iov as *const _ as *mut _;
+                    msg.msg_hdr.msg_iovlen = 1;
+                }
+                let fd = {
+                    use std::os::fd::AsRawFd;
+                    socket.as_raw_fd()
+                };
+                let sent = unsafe {
+                    libc::sendmmsg(
+                        fd,
+                        msgs.as_mut_ptr(),
+                        batch.len() as u32,
+                        libc::MSG_DONTWAIT,
+                    )
+                };
+                let refused = if sent < 0 {
+                    // Only a genuine ECONNREFUSED (ICMP port-unreachable
+                    // surfaced on a connected UDP socket) means the peer
+                    // is gone. Any other errno (EINTR, ENOBUFS, EAGAIN on
+                    // the very first message, ...) is transient and
+                    // shouldn't force a reconnect cycle.
+                    std::io::Error::last_os_error().kind() == std::io::ErrorKind::ConnectionRefused
+                } else {
+                    // sendmmsg returns the count actually sent, which can
+                    // be less than the batch once the send buffer fills
+                    // mid-call -- per sendmmsg(2), the error for the
+                    // unsent tail is lost. Fall back to individual sends
+                    // for whatever didn't go out rather than dropping it.
+                    for buf in &batch[sent as usize..] {
+                        let _ = socket.send(buf);
+                    }
+                    false
+                };
+                batch.clear();
+                refused
+            })
         }
 
         /// Compute poll timeout from next timer deadline.
