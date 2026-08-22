@@ -25,6 +25,11 @@ smol = { version = "2", optional = true }
 futures-lite = { version = "2", optional = true }
 monoio = { version = "0.2", features = ["sync"], optional = true }
 glommio = { version = "0.9", optional = true }
+# glommio 0.9 takes `From<socket2::Socket>` at its own pinned 0.4.x, not the
+# 0.6 used above -- Cargo allows both as distinct deps via this rename, so
+# glommio_transport's socket conversions build against the version glommio
+# itself actually expects.
+socket2_glommio = { package = "socket2", version = "0.4", optional = true }
 compio = { version = "0.19", features = ["io", "io-uring", "net", "runtime", "time"], optional = true }
 
 [features]
@@ -32,5 +37,5 @@ mio = ["dep:mio"]
 tokio = ["dep:tokio"]
 smol = ["dep:smol", "dep:futures-lite"]
 monoio = ["dep:monoio"]
-glommio = ["dep:glommio", "dep:futures-lite"]
+glommio = ["dep:glommio", "dep:futures-lite", "dep:socket2_glommio"]
 compio = ["dep:compio"]

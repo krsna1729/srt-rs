@@ -2056,6 +2056,7 @@ dependencies = [
  "monoio",
  "shiguredo_srt",
  "smol",
+ "socket2 0.4.10",
  "socket2 0.6.4",
  "tokio",
 ]

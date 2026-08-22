@@ -907,7 +907,27 @@ pub mod monoio_transport {
 pub mod glommio_transport {
     use super::{NativeTimer, is_ready};
     use shiguredo_srt::{ConnectionEvent, ConnectionOutput, SrtConnection, Timestamp};
+    use std::io;
     use std::time::Duration;
+
+    /// `super::bind_reuseport` plus registration with the *current*
+    /// glommio executor's reactor -- must be called from inside a running
+    /// `LocalExecutor` (glommio's `From<socket2::Socket>` conversion looks
+    /// up the thread-local executor). Kept here rather than in bench code
+    /// so the `socket2` conversion detail doesn't need its own dependency
+    /// in srt-bench.
+    pub fn bind_reuseport(port: u16) -> io::Result<glommio::net::UdpSocket> {
+        from_std(super::bind_reuseport(port)?)
+    }
+
+    /// Register an already-bound (and, for a handoff, already-connected)
+    /// `std::net::UdpSocket` with the *current* glommio executor's
+    /// reactor. Same executor-context requirement as `bind_reuseport`.
+    pub fn from_std(socket: std::net::UdpSocket) -> io::Result<glommio::net::UdpSocket> {
+        Ok(glommio::net::UdpSocket::from(
+            socket2_glommio::Socket::from(socket),
+        ))
+    }
 
     /// Per-connection state for glommio: protocol + borrowed-buffer socket + native timer.
     pub struct Conn {
