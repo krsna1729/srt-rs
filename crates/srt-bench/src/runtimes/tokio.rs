@@ -716,6 +716,15 @@ fn promote(
 /// a socket that admission already connected instead of discovering the
 /// peer itself.
 async fn established_conn_task(mut driver: Conn, cfg: LossConfig, start: Instant) -> ConnStats {
+    // `connected` is live state, used only for the loop-exit check below
+    // (it flips false on Disconnected). The task is only ever spawned
+    // post-promotion (Connected has already fired), so it was *always*
+    // connected at some point -- reported unconditionally as `true` in
+    // the final ConnStats, not this live flag: a session that streamed
+    // everything and then legitimately tripped SRT's own peer-idle
+    // timeout is still a success, and reporting the live flag alone
+    // would misreport perfect delivery as a failed connection the moment
+    // it flips.
     let mut connected = true;
     let mut data_events = 0u64;
     let stream_deadline = Instant::now() + Duration::from_secs_f64(cfg.duration_secs);
@@ -771,7 +780,7 @@ async fn established_conn_task(mut driver: Conn, cfg: LossConfig, start: Instant
     }
 
     let mut stats = ConnStats {
-        connected,
+        connected: true,
         data_events,
         ..Default::default()
     };

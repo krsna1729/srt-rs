@@ -9,6 +9,10 @@ description = "Standalone caller/listener binaries over srt-protocol + std, for 
 [dependencies]
 shiguredo_srt = { path = "../srt-protocol" }
 srt-transport = { path = "../srt-transport", features = ["mio", "tokio", "smol", "monoio", "glommio", "compio"] }
+# Bond-affinity/worker-routing policy (WorkerRouter): shared canonical
+# implementation for every runtime's reuseport acceptor(s), instead of each
+# one hand-rolling its own group->owner map.
+srt-lifecycle = { path = "../srt-lifecycle" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # cpu_stats.rs: framework-agnostic CPU accounting via getrusage(), shared by

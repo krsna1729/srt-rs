@@ -198,6 +198,9 @@ pub fn run(cfg: LossConfig) {
             crate::Ingress::SharedPool(k) if k > 1 => {
                 return run_shared_pool(cfg, k);
             }
+            crate::Ingress::ReuseportSingle { workers } if workers >= 1 => {
+                return run_reuseport_single(cfg, workers);
+            }
             _ => {}
         }
     }
@@ -206,6 +209,12 @@ pub fn run(cfg: LossConfig) {
             crate::Ingress::ReuseportMulti(k) if cfg.mode == crate::Mode::Sender && k > 1 => {
                 eprintln!(
                     "[bench-mio] scale: single port {} (reuseport-multi={k})",
+                    cfg.port
+                );
+            }
+            crate::Ingress::ReuseportSingle { workers } if cfg.mode == crate::Mode::Sender => {
+                eprintln!(
+                    "[bench-mio] scale: single port {} (reuseport-single, {workers} workers)",
                     cfg.port
                 );
             }
@@ -639,7 +648,11 @@ fn run_shared_pool(cfg: LossConfig, k: usize) {
     let mut agg = Aggregate::new(cfg.clone());
     for conn in conns.into_values() {
         let mut s = ConnStats {
-            connected: conn.connected,
+            // stream_deadline is Some as soon as Connected has ever fired
+            // (see the struct doc) -- a session that streamed everything
+            // and then tripped SRT's own peer-idle timeout is still a
+            // success, not "never connected".
+            connected: conn.stream_deadline.is_some(),
             data_events: conn.data_events,
             ..Default::default()
         };
@@ -663,7 +676,18 @@ fn run_shared_pool(cfg: LossConfig, k: usize) {
 /// connected to the peer's exact tuple + protocol state.
 struct PoolSlot {
     conn: Conn,
+    /// Live connected state: flips false on `Disconnected`, feeding
+    /// `slot_is_terminal` so a dropped connection is promptly recognized
+    /// as done. Always starts true (a slot only exists post-promotion,
+    /// i.e. after `Connected` already fired).
     connected: bool,
+    /// Never reset once true: a session that finished streaming and then
+    /// legitimately tripped SRT's own peer-idle timeout (normal once the
+    /// sender stops -- it can happen well before this loop notices and
+    /// exits) is still a *successful* connection for reporting purposes.
+    /// `connected` alone would misreport perfect delivery as "admitted
+    /// no connections" the moment the live flag flips.
+    ever_connected: bool,
     data_events: u64,
     poisoned: bool,
     token: Token,
@@ -706,6 +730,16 @@ struct Handoff {
 
 enum WorkerMessage {
     Handoff(Box<Handoff>),
+    /// #3 (`ReuseportSingle`) only: the one acceptor has stopped
+    /// admitting and tells each worker exactly how many connections it
+    /// will ever receive, so a worker can tell "no more are coming" apart
+    /// from "none have arrived yet" instead of relying on a wall-clock
+    /// guess. #4 (`ReuseportMulti`) never sends this -- every acceptor
+    /// there is also a worker, so there's no separate admission-done
+    /// signal to send.
+    Finished {
+        total: usize,
+    },
 }
 
 fn bind_reuseport(port: u16) -> std::io::Result<UdpSocket> {
@@ -888,8 +922,14 @@ fn run_pool_acceptor(
         poll.poll(&mut events, Some(TIMER_TICK)).ok();
 
         // Accept bond legs promoted on other acceptors that belong here.
+        // `Finished` is #3-only (see WorkerMessage) and never sent on this
+        // channel; using `match` rather than a `while let Ok(Handoff(_))`
+        // pattern means one would just be skipped, not stop the drain and
+        // strand whatever Handoffs are queued behind it.
         while let Ok(message) = handoffs.try_recv() {
-            let WorkerMessage::Handoff(handoff) = message;
+            let WorkerMessage::Handoff(handoff) = message else {
+                continue;
+            };
             let mut socket = handoff.socket;
             let token = Token(next_token);
             next_token += 1;
@@ -907,6 +947,7 @@ fn run_pool_acceptor(
             slots.push(PoolSlot {
                 conn,
                 connected: true,
+                ever_connected: true,
                 data_events: 0,
                 poisoned: false,
                 token,
@@ -950,27 +991,7 @@ fn run_pool_acceptor(
                         }
                     }
                 }
-                idx => {
-                    let Some(slot) = slots.iter_mut().find(|s| s.token.0 == idx) else {
-                        continue;
-                    };
-                    let t = crate::now_ts(start);
-                    loop {
-                        match slot.conn.socket.recv(&mut buf) {
-                            Ok(n) => {
-                                let _ = slot.conn.conn.feed_recv_buf(&buf[..n], t);
-                                slot.data_events += 1;
-                                slot.last_data_at = Instant::now();
-                            }
-                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-                                slot.poisoned = true;
-                                break;
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                }
+                idx => service_slot_event(&mut slots, Token(idx), &mut buf, start),
             }
         }
 
@@ -1031,33 +1052,72 @@ fn run_pool_acceptor(
             );
         }
 
-        // Maintenance for established slots.
-        let t = crate::now_ts(start);
-        for slot in slots.iter_mut() {
-            slot.conn.fire_expired(t);
-            if slot.conn.drain_outputs(t) {
+        maintain_slots(&mut slots, start);
+    }
+
+    slots_to_stats(slots)
+}
+
+/// Service one readiness event against an established slot by token:
+/// drain queued datagrams, feed them to the protocol, track data/idle
+/// bookkeeping. Shared between `ReuseportMulti`'s merged acceptor/worker
+/// loop and `ReuseportSingle`'s pure worker loop -- both drive an
+/// identical `Vec<PoolSlot>` to completion once a connection is
+/// promoted; they only differ in how slots *arrive* (promoted locally
+/// plus occasional handoff-in, vs handoff-in only).
+fn service_slot_event(slots: &mut [PoolSlot], token: Token, buf: &mut [u8], start: Instant) {
+    let idx = token.0;
+    let Some(slot) = slots.iter_mut().find(|s| s.token.0 == idx) else {
+        return;
+    };
+    let t = crate::now_ts(start);
+    loop {
+        match slot.conn.socket.recv(buf) {
+            Ok(n) => {
+                let _ = slot.conn.conn.feed_recv_buf(&buf[..n], t);
+                slot.data_events += 1;
+                slot.last_data_at = Instant::now();
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
                 slot.poisoned = true;
+                break;
             }
-            while let Some(ev) = slot.conn.conn.poll_event() {
-                if matches!(ev, ConnectionEvent::Disconnected { .. }) {
-                    slot.connected = false;
-                }
+            Err(_) => break,
+        }
+    }
+}
+
+/// Per-tick maintenance across every established slot: fire timers,
+/// drain outputs, react to Disconnected, recover from poison.
+fn maintain_slots(slots: &mut [PoolSlot], start: Instant) {
+    let t = crate::now_ts(start);
+    for slot in slots.iter_mut() {
+        slot.conn.fire_expired(t);
+        if slot.conn.drain_outputs(t) {
+            slot.poisoned = true;
+        }
+        while let Some(ev) = slot.conn.conn.poll_event() {
+            if matches!(ev, ConnectionEvent::Disconnected { .. }) {
+                slot.connected = false;
             }
-            if slot.poisoned {
-                // Reconnect clears ECONNREFUSED poison on connected UDP.
-                if let Ok(peer) = slot.conn.socket.peer_addr() {
-                    let _ = slot.conn.socket.connect(peer);
-                    slot.poisoned = false;
-                }
+        }
+        if slot.poisoned {
+            // Reconnect clears ECONNREFUSED poison on connected UDP.
+            if let Ok(peer) = slot.conn.socket.peer_addr() {
+                let _ = slot.conn.socket.connect(peer);
+                slot.poisoned = false;
             }
         }
     }
+}
 
+fn slots_to_stats(slots: Vec<PoolSlot>) -> Vec<ConnStats> {
     slots
         .into_iter()
         .map(|slot| {
             let mut s = ConnStats {
-                connected: slot.connected,
+                connected: slot.ever_connected,
                 data_events: slot.data_events,
                 ..Default::default()
             };
@@ -1139,6 +1199,7 @@ fn promote_slot(
     slots.push(PoolSlot {
         conn: Conn::new(pending_conn, socket),
         connected: true,
+        ever_connected: true,
         data_events: 0,
         poisoned: false,
         token,
@@ -1147,14 +1208,339 @@ fn promote_slot(
     });
 }
 
-/// Bond-affinity registry and handoff-channel semantics. The upstream
-/// restream port this was adapted from (`688f2083`) also carried a
-/// `WorkerMessage::Finished` variant and a matching drain-tolerance test
-/// for a second, unported strategy (`run_connected`, whole-listener
-/// admission -> worker-thread routing). This port only implements the
-/// single-tier reuseport strategy (`run_pool_acceptor`), whose
-/// `WorkerMessage` has no `Finished` variant, so that test has no
-/// equivalent here.
+// ---------------------------------------------------------------------------
+// #3: ReuseportSingle -- one acceptor, W dedicated worker threads, every
+// promoted connection (bonded or not) routed via
+// srt_lifecycle::WorkerRouter. Unlike #4 (ReuseportMulti), admission and
+// steady-state service are always on different threads, even in the
+// common non-bonded case.
+// ---------------------------------------------------------------------------
+
+fn run_reuseport_single(cfg: LossConfig, workers: usize) {
+    let worker_count = workers.min(cfg.connections).max(1);
+    let start = Instant::now();
+    let router: crate::SharedWorkerRouter =
+        Arc::new(Mutex::new(srt_lifecycle::WorkerRouter::new(worker_count)));
+
+    let (senders, receivers): (Vec<_>, Vec<_>) = (0..worker_count)
+        .map(|_| mpsc::channel::<WorkerMessage>())
+        .unzip();
+
+    let mut handles = Vec::with_capacity(worker_count);
+    for (worker_index, rx) in receivers.into_iter().enumerate() {
+        let cfg = cfg.clone();
+        handles.push(
+            std::thread::Builder::new()
+                .name(format!("srt-worker-{worker_index}"))
+                .spawn(move || run_worker(cfg, worker_index, start, rx))
+                .expect("spawn worker"),
+        );
+    }
+
+    run_single_acceptor(&cfg, start, &router, &senders);
+
+    // Proves routing (and, when bonds are in play, group affinity)
+    // actually engaged in this run rather than sitting dead -- every
+    // connection goes through the router here (unlike #4's registry,
+    // consulted only for bonded legs), so a nonzero tuple count on its
+    // own only proves routing fired; the group count is what proves
+    // bonds specifically were exercised.
+    if cfg.bond_mode != BondMode::None
+        && let Ok(router) = router.lock()
+    {
+        eprintln!(
+            "[bench-mio] reuseport-single: routed {} tuples into {} bond groups",
+            router.active_tuple_count(),
+            router.active_group_count()
+        );
+    }
+
+    let mut agg = Aggregate::new(cfg.clone());
+    for handle in handles {
+        for stats in handle.join().expect("worker panicked") {
+            agg.add(stats);
+        }
+    }
+    agg.print(start);
+    if !agg.any_connected {
+        eprintln!("[bench-mio] reuseport-single admitted no connections");
+        std::process::exit(1);
+    }
+}
+
+/// The one acceptor: admits every flow on the shared reuseport port,
+/// drives handshakes to Connected, and routes each promotion -- bonded
+/// or not -- to a worker via `SharedWorkerRouter`. Unlike
+/// `run_pool_acceptor`, this never services steady-state traffic itself;
+/// once a connection is routed, it is entirely a worker's problem. Tells
+/// every worker exactly how many connections it will ever receive once
+/// admission winds down, so a worker can distinguish "no more are coming"
+/// from "none have arrived yet" instead of guessing off a wall clock.
+fn run_single_acceptor(
+    cfg: &LossConfig,
+    start: Instant,
+    router: &crate::SharedWorkerRouter,
+    senders: &[mpsc::Sender<WorkerMessage>],
+) {
+    let mut poll = Poll::new().expect("mio Poll::new");
+    let mut events = Events::with_capacity(1024);
+    let mut listener = match bind_reuseport(cfg.port) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("[bench-mio] acceptor: bind {e}");
+            for sender in senders {
+                let _ = sender.send(WorkerMessage::Finished { total: 0 });
+            }
+            return;
+        }
+    };
+    poll.registry()
+        .register(&mut listener, Token(0), Interest::READABLE)
+        .expect("register listener");
+
+    struct Pending {
+        conn: SrtConnection,
+        timers: srt_transport::ManualTimerStore,
+        connected: bool,
+        created_at: Instant,
+    }
+
+    let mut pending: HashMap<SocketAddr, Pending> = HashMap::new();
+    let connect_deadline = Instant::now() + crate::INTEROP_CONNECT_TIMEOUT;
+    let mut admit_bufs: Vec<Vec<u8>> = (0..32).map(|_| vec![0u8; 2048]).collect();
+    let mut admit_sizes = [0usize; 32];
+    let mut admit_addrs: [Option<SocketAddr>; 32] = [None; 32];
+    let mut per_worker_count = vec![0usize; senders.len()];
+
+    loop {
+        let now = Instant::now();
+        if now >= connect_deadline && pending.is_empty() {
+            break;
+        }
+        poll.poll(&mut events, Some(TIMER_TICK)).ok();
+
+        for event in events.iter() {
+            if event.token() != Token(0) {
+                continue;
+            }
+            loop {
+                let fd = listener.as_raw_fd();
+                let received =
+                    recvmsg_batch(fd, &mut admit_bufs, &mut admit_sizes, &mut admit_addrs);
+                if received == 0 {
+                    break;
+                }
+                for i in 0..received {
+                    let Some(peer) = admit_addrs[i] else {
+                        continue;
+                    };
+                    let t = crate::now_ts(start);
+                    let entry = pending.entry(peer).or_insert_with(|| Pending {
+                        conn: SrtConnection::new_listener(ConnectionOptions {
+                            socket_id: std::process::id(),
+                            tsbpd_delay: cfg.latency_ms,
+                            ..Default::default()
+                        }),
+                        timers: srt_transport::ManualTimerStore::new(),
+                        connected: false,
+                        created_at: Instant::now(),
+                    });
+                    let _ = entry
+                        .conn
+                        .feed_recv_buf(&admit_bufs[i][..admit_sizes[i]], t);
+                }
+                if received < 32 {
+                    break;
+                }
+            }
+        }
+
+        // Drive pending handshakes toward Connected, then route -- same
+        // retain/promote split as run_pool_acceptor, and the same reason:
+        // a connected entry must stay in `pending` until the routing loop
+        // below reclaims it via `remove`, not get dropped inside `retain`.
+        let t = crate::now_ts(start);
+        let mut promote = Vec::new();
+        let mut stale = Vec::new();
+        for (peer, p) in pending.iter_mut() {
+            if p.created_at.elapsed() >= crate::INTEROP_CONNECT_TIMEOUT {
+                stale.push(*peer);
+                continue;
+            }
+            p.timers.fire_expired(t, &mut p.conn);
+            let refused = drain_conn_outputs(&mut p.conn, &mut p.timers, &listener, *peer, t);
+            if refused {
+                stale.push(*peer);
+                continue;
+            }
+            while let Some(ev) = p.conn.poll_event() {
+                if matches!(ev, ConnectionEvent::Connected) {
+                    p.connected = true;
+                }
+            }
+            if p.connected {
+                promote.push(*peer);
+            }
+        }
+        for peer in stale {
+            pending.remove(&peer);
+        }
+        for peer in promote {
+            let Some(p) = pending.remove(&peer) else {
+                continue;
+            };
+            route_to_worker(
+                cfg.port,
+                peer,
+                p.conn,
+                router,
+                senders,
+                &mut per_worker_count,
+            );
+        }
+    }
+
+    for (worker_index, sender) in senders.iter().enumerate() {
+        let _ = sender.send(WorkerMessage::Finished {
+            total: per_worker_count[worker_index],
+        });
+    }
+}
+
+/// Bind+connect the dedicated socket for a just-promoted connection, then
+/// route it -- bonded or not -- to a worker via `WorkerRouter::assign`
+/// and ship it once over that worker's channel. Every connection goes
+/// through the router here (unlike #4's registry, which only bonded
+/// connections consult): routing every promotion to a worker is this
+/// strategy's whole point.
+fn route_to_worker(
+    port: u16,
+    peer: SocketAddr,
+    pending_conn: SrtConnection,
+    router: &crate::SharedWorkerRouter,
+    senders: &[mpsc::Sender<WorkerMessage>],
+    per_worker_count: &mut [usize],
+) {
+    let socket = match bind_reuseport(port) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[bench-mio] route {peer}: bind {e}");
+            return;
+        }
+    };
+    if socket.connect(peer).is_err() {
+        eprintln!("[bench-mio] route {peer}: connect failed");
+        return;
+    }
+
+    let group = pending_conn
+        .peer_group_extension()
+        .map(|extension| srt_lifecycle::GroupAffinity {
+            group_id: extension.group_id,
+            stream_id: None,
+            extension,
+        });
+    let worker = {
+        let mut router = match router.lock() {
+            Ok(r) => r,
+            Err(_) => return, // poisoned: drop the leg rather than corrupt routing state
+        };
+        router.assign(peer, group, srt_lifecycle::RoutingMode::LeastTuples)
+    };
+    per_worker_count[worker] += 1;
+
+    let message = WorkerMessage::Handoff(Box::new(Handoff {
+        socket,
+        conn: pending_conn,
+    }));
+    if senders[worker].send(message).is_err() {
+        eprintln!("[bench-mio] route {peer}: worker {worker} channel closed");
+    }
+}
+
+/// One worker thread: pure steady-state service for whatever connections
+/// the acceptor routes to it. No admission logic at all -- that's fully
+/// the acceptor's job in this strategy, unlike `ReuseportMulti` where
+/// acceptor and worker are the same thread.
+fn run_worker(
+    cfg: LossConfig,
+    worker_index: usize,
+    start: Instant,
+    handoffs: mpsc::Receiver<WorkerMessage>,
+) -> Vec<ConnStats> {
+    let mut poll = match Poll::new() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[bench-mio] worker {worker_index}: Poll::new {e}");
+            return Vec::new();
+        }
+    };
+    let mut events = Events::with_capacity(1024);
+    let mut slots: Vec<PoolSlot> = Vec::new();
+    let mut next_token: usize = 0;
+    let stream_len = Duration::from_secs_f64(cfg.duration_secs);
+    // No admission here, so no connect_deadline of its own to wait on --
+    // just a generous absolute safety net plus the acceptor's own
+    // `Finished` signal telling it precisely when no more are coming.
+    let run_deadline = Instant::now()
+        + crate::INTEROP_CONNECT_TIMEOUT
+        + stream_len
+        + IDLE_GRACE
+        + Duration::from_secs(30);
+    let mut expected: Option<usize> = None;
+    let mut buf = [0u8; 2048];
+
+    loop {
+        let now = Instant::now();
+        if now >= run_deadline {
+            break;
+        }
+        if expected == Some(slots.len()) && slots.iter().all(|s| slot_is_terminal(s, now)) {
+            break;
+        }
+        poll.poll(&mut events, Some(TIMER_TICK)).ok();
+
+        while let Ok(message) = handoffs.try_recv() {
+            match message {
+                WorkerMessage::Finished { total } => expected = Some(total),
+                WorkerMessage::Handoff(handoff) => {
+                    let mut socket = handoff.socket;
+                    let token = Token(next_token);
+                    next_token += 1;
+                    if poll
+                        .registry()
+                        .register(&mut socket, token, Interest::READABLE)
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    let mut conn = Conn::new(handoff.conn, socket);
+                    conn.fire_expired(crate::now_ts(start));
+                    conn.drain_outputs(crate::now_ts(start));
+                    let now = Instant::now();
+                    slots.push(PoolSlot {
+                        conn,
+                        connected: true,
+                        ever_connected: true,
+                        data_events: 0,
+                        poisoned: false,
+                        token,
+                        stream_deadline: now + stream_len,
+                        last_data_at: now,
+                    });
+                }
+            }
+        }
+
+        for event in events.iter() {
+            service_slot_event(&mut slots, event.token(), &mut buf, start);
+        }
+        maintain_slots(&mut slots, start);
+    }
+
+    slots_to_stats(slots)
+}
+
 #[cfg(test)]
 mod bond_affinity_tests {
     use super::*;
@@ -1271,8 +1657,28 @@ mod bond_affinity_tests {
         tx.send(WorkerMessage::Handoff(Box::new(Handoff { socket, conn })))
             .expect("send");
 
-        let WorkerMessage::Handoff(handoff) = rx.try_recv().expect("message");
+        let WorkerMessage::Handoff(handoff) = rx.try_recv().expect("message") else {
+            panic!("expected Handoff");
+        };
         assert_eq!(handoff.socket.peer_addr().unwrap(), expected_peer);
         assert!(handoff.conn.peer_group_extension().is_none());
+    }
+
+    /// Regression: `WorkerMessage` grew a `Finished` variant for #3
+    /// (`ReuseportSingle`); a stray one arriving on #4's handoff channel
+    /// (which never sends it, but the type is shared) must not panic or
+    /// be mistaken for a Handoff.
+    #[test]
+    fn finished_message_does_not_panic_drain() {
+        let (tx, rx) = mpsc::channel::<WorkerMessage>();
+        tx.send(WorkerMessage::Finished { total: 3 }).expect("send");
+        drop(tx);
+        let mut saw_finished = false;
+        while let Ok(message) = rx.try_recv() {
+            if matches!(message, WorkerMessage::Finished { total: 3 }) {
+                saw_finished = true;
+            }
+        }
+        assert!(saw_finished);
     }
 }

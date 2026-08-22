@@ -2030,6 +2030,7 @@ dependencies = [
  "shiguredo_srt",
  "smol",
  "socket2 0.6.4",
+ "srt-lifecycle",
  "srt-transport",
  "tokio",
  "tracing",
