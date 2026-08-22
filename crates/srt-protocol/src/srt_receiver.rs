@@ -687,27 +687,24 @@ impl ReceiverBuffer {
         Some(entry.packet)
     }
 
-    /// 配信可能なシーケンス番号を検索
+    /// Find the deliverable sequence number.
     ///
-    /// `packets` の BTreeMap は u32 の数値順でイテレートするが、31-bit シーケンス番号の
-    /// 循環順 (`sequence_less_than`) とラップアラウンド境界 (0x7FFF_FFFF -> 0) で食い違う。
-    /// SRT 仕様 (draft-sharabayko-srt.md の Live Streaming セクション) は TSBPD 配信を
-    /// 「deliver packets in order, but based on the timestamps」と定めており、配送順は
-    /// 数値順ではなく循環順に従う必要がある (節構成・行番号は将来変更される可能性がある)。
-    /// 数値順で最初に見つけた候補を返すと境界をまたぐ連続パケットの配送順序が逆転するため、
-    /// 配信候補の中から循環順で最小の seq を選ぶ。
+    /// BTreeMap iterates in numeric order, but 31-bit sequence numbers use
+    /// circular order with wrap at 0x7FFF_FFFF. SRT spec says TSBPD delivers
+    /// "in order, but based on timestamps" -- delivery must follow circular
+    /// order, not numeric. Returning the first numeric candidate would
+    /// invert order across the wrap, so pick the circular minimum.
     ///
-    /// 循環順最小のパケットが配信可能なら、そのパケットを直接返す。最小パケットがまだ
-    /// 配信時刻に達していない場合は、既存の全候補走査に戻して out-of-order timestamp を
-    /// 保持する。
+    /// If the circular minimum packet is deliverable, return it directly.
+    /// If the minimum packet's delivery time hasn't arrived, fall back to
+    /// a full candidate scan to preserve out-of-order timestamp handling.
     ///
-    /// `has_gap` 自体は `loss_list_min` (循環順最小値キャッシュ、
-    /// upstream shiguredo/srt-rs issue 0073) により O(1) -- 「seq より循環順で
-    /// 前にある loss_list の要素が存在するか」は「loss_list の循環順最小値が
-    /// seq より前か」と等価なので、候補ごとに loss_list 全体を走査する必要が
-    /// ない。これにより全体の計算量は O(packets × loss_list) から
-    /// O(packets) に下がる。
+    /// `has_gap` is O(1) via `loss_list_min` (circular minimum cache,
+    /// upstream issue 0073) -- "is there a loss before seq" is equivalent
+    /// to "is the circular minimum before seq", so no per-candidate scan.
+    /// Reduces from O(packets x loss_list) to O(packets).
     fn find_deliverable_seq(&self, now: Timestamp) -> Option<u32> {
+        // Fast path 1: hint is deliverable right now (no gap before it).
         if let Some(seq) = self.delivery_seq_hint
             && let Some(entry) = self.packets.get(&seq)
             && (!self.tsbpd_enabled || entry.delivery_time <= now)
@@ -716,6 +713,41 @@ impl ReceiverBuffer {
                 .is_some_and(|min| sequence_less_than(min, seq))
         {
             return Some(seq);
+        }
+
+        // Fast path 2 (loss-recovery steady state): the loss list is
+        // non-empty but its circular minimum is not before the oldest
+        // buffered packet -- the hole has been recovered or dropped, and
+        // every buffered packet at/after the oldest is deliverable. The
+        // answer is then the circularly-oldest buffered packet: O(log n)
+        // via BTreeMap first key instead of a full O(packets) scan.
+        //
+        // Old implementation always scanned all packets even in this state
+        // (O(packets) per pop), and pop_ready is called multiple times per
+        // receive under overload, so this was the top cost (2026-08-21
+        // flamegraphs). Now we only fall through to the full scan when the
+        // hole is genuinely before the oldest packet (true out-of-order
+        // with unrecovered loss). Wrap-around cases break circular total
+        // order (sequence_less_than is a partial order), so we fall back
+        // to the full scan there as well.
+        if let (Some(min), Some(&oldest)) = (self.loss_list_min, self.packets.keys().next())
+            && !sequence_less_than(oldest, min)
+            // Numeric BTreeMap first key is not circularly oldest when
+            // the buffer spans the 0 boundary (e.g. expected=FFFE,
+            // buffered={FFFF,0} -> first key is 0). This can also happen
+            // with wrapping_period_active, so additionally require oldest
+            // is numerically >= expected_seq (which is always circularly
+            // oldest undelivered).
+            && oldest >= self.expected_seq
+        {
+            let entry = &self.packets[&oldest];
+            if !self.tsbpd_enabled || entry.delivery_time <= now {
+                return Some(oldest);
+            }
+            // Oldest exists but its TSBPD time hasn't arrived. Later
+            // packets have later timestamps, so nothing else can be ready
+            // when delivery order follows timestamp order.
+            return None;
         }
 
         #[cfg(test)]
@@ -729,7 +761,7 @@ impl ReceiverBuffer {
                 .loss_list_min
                 .is_some_and(|min| sequence_less_than(min, seq));
             if time_ok && !has_gap {
-                // 既存 best が seq より循環順で前なら保持、そうでなければ seq に更新する
+                // Keep the circularly earlier of best and seq.
                 best = match best {
                     Some(b) if sequence_less_than(b, seq) => Some(b),
                     _ => Some(seq),
