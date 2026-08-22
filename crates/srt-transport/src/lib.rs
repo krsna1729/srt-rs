@@ -59,6 +59,191 @@ pub fn is_ready(pin: &mut NativeTimer) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Reuseport admission plumbing — raw fd/libc mechanics, no runtime
+// dependency. Any adapter's "K sockets share one SO_REUSEPORT port, admit
+// many peers on one socket" ingress strategy needs this; previously
+// duplicated per-adapter (byte-identical in two, a simplified subset in a
+// third) before every one of them actually needed it.
+// ---------------------------------------------------------------------------
+
+/// Target 16 MB per socket. Adapters set this explicitly on every socket
+/// they own (never via sysctl) and read back the effective value --
+/// Linux doubles the request and clamps to `net.core.rmem_max`, so the
+/// granted size can be smaller than asked.
+const SOCK_BUF_BYTES: usize = 16 << 20;
+
+/// Set 16 MB SO_RCVBUF/SO_SNDBUF on a raw fd, warning once if the host
+/// clamped the request smaller.
+pub fn set_sock_bufs(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    let v = SOCK_BUF_BYTES as libc::c_int;
+    let len = std::mem::size_of_val(&v) as libc::socklen_t;
+    unsafe {
+        let r = libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &v as *const _ as *const libc::c_void,
+            len,
+        );
+        if r != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let r = libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            &v as *const _ as *const libc::c_void,
+            len,
+        );
+        if r != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // Verify effective value (Linux doubles and clamps).
+        let mut got: libc::c_int = 0;
+        let mut got_len = std::mem::size_of_val(&got) as libc::socklen_t;
+        let r = libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &mut got as *mut _ as *mut libc::c_void,
+            &mut got_len,
+        );
+        if r == 0 && (got as usize) < SOCK_BUF_BYTES {
+            eprintln!(
+                "SO_RCVBUF clamped by host to {} (requested {})",
+                got, SOCK_BUF_BYTES
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Bind a UDP socket with SO_REUSEPORT set, 16 MB send/recv buffers, and
+/// non-blocking mode. Returns a plain `std::net::UdpSocket`; each adapter
+/// converts that to its own native socket type (mio's own `UdpSocket`
+/// wraps it directly; tokio's needs no conversion at all -- it already
+/// takes a std socket).
+pub fn bind_reuseport(port: u16) -> std::io::Result<std::net::UdpSocket> {
+    use std::os::fd::AsRawFd;
+    let sock = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    sock.set_reuse_port(true)?;
+    sock.set_nonblocking(true)?;
+    let addr = std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, port);
+    sock.bind(&addr.into())?;
+    let _ = set_sock_bufs(sock.as_raw_fd());
+    Ok(sock.into())
+}
+
+/// Batched receive for a bound UDP socket: up to `bufs.len()` datagrams in
+/// one `recvmmsg` syscall. Returns count received; `addrs[i]` holds each
+/// sender, `sizes[i]` the length. Buffers are hoisted by the caller and
+/// reused -- zero per-call allocation. One syscall for up to `bufs.len()`
+/// datagrams vs one per datagram with a plain `recv_from` loop.
+pub fn recvmsg_batch(
+    fd: std::os::fd::RawFd,
+    bufs: &mut [Vec<u8>],
+    sizes: &mut [usize],
+    addrs: &mut [Option<std::net::SocketAddr>],
+) -> usize {
+    use std::cell::RefCell;
+    thread_local! {
+        static SCRATCH: RefCell<BatchScratch> = RefCell::new(BatchScratch::new(64));
+    }
+    struct BatchScratch {
+        msgs: Vec<libc::mmsghdr>,
+        iovs: Vec<libc::iovec>,
+        addrs: Vec<libc::sockaddr_storage>,
+    }
+    impl BatchScratch {
+        fn new(n: usize) -> Self {
+            Self {
+                msgs: (0..n)
+                    .map(|_| libc::mmsghdr {
+                        msg_hdr: unsafe { std::mem::zeroed() },
+                        msg_len: 0,
+                    })
+                    .collect(),
+                iovs: (0..n)
+                    .map(|_| libc::iovec {
+                        iov_base: std::ptr::null_mut(),
+                        iov_len: 0,
+                    })
+                    .collect(),
+                addrs: (0..n).map(|_| unsafe { std::mem::zeroed() }).collect(),
+            }
+        }
+    }
+    let count = bufs.len();
+    SCRATCH.with(|scratch| {
+        let BatchScratch {
+            msgs,
+            iovs,
+            addrs: storage_addrs,
+        } = &mut *scratch.borrow_mut();
+        for (((iov, msg), storage), (buf, size)) in iovs
+            .iter_mut()
+            .zip(msgs.iter_mut())
+            .zip(storage_addrs.iter_mut())
+            .zip(bufs.iter_mut().zip(sizes.iter_mut()))
+        {
+            buf.resize(buf.capacity(), 0);
+            *size = 0;
+            *iov = libc::iovec {
+                iov_base: buf.as_mut_ptr().cast(),
+                iov_len: buf.capacity(),
+            };
+            msg.msg_hdr.msg_iov = iov;
+            msg.msg_hdr.msg_iovlen = 1;
+            msg.msg_hdr.msg_name = (storage as *mut libc::sockaddr_storage).cast();
+            msg.msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as u32;
+            msg.msg_len = 0;
+        }
+        let received = unsafe {
+            libc::recvmmsg(
+                fd,
+                msgs.as_mut_ptr(),
+                count as u32,
+                libc::MSG_DONTWAIT,
+                std::ptr::null_mut(),
+            )
+        };
+        if received < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::WouldBlock {
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static LOGGED: AtomicBool = AtomicBool::new(false);
+                if !LOGGED.swap(true, Ordering::Relaxed) {
+                    eprintln!("recvmmsg failed once: {err} (fd={fd}, count={count})");
+                }
+            }
+            return 0;
+        }
+        for i in 0..received as usize {
+            addrs[i] = unsafe { sockaddr_to_addr(&storage_addrs[i]) };
+            sizes[i] = msgs[i].msg_len as usize;
+        }
+        received as usize
+    })
+}
+
+/// SAFETY: `storage` must have been filled by `recvmmsg` with a valid
+/// address (IPv4-only, matching this workspace's bench harness).
+unsafe fn sockaddr_to_addr(storage: &libc::sockaddr_storage) -> Option<std::net::SocketAddr> {
+    if storage.ss_family != libc::AF_INET as u16 {
+        return None;
+    }
+    let addr = unsafe { &*(storage as *const libc::sockaddr_storage as *const libc::sockaddr_in) };
+    Some(std::net::SocketAddr::from((
+        std::net::Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr)),
+        u16::from_be(addr.sin_port),
+    )))
+}
+
+// ---------------------------------------------------------------------------
 // ManualTimerStore — correct for mio, fallback for others
 // ---------------------------------------------------------------------------
 

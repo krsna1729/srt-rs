@@ -26,7 +26,6 @@ use shiguredo_srt::{
 use srt_transport::tokio_transport::Conn;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
@@ -362,49 +361,6 @@ enum WorkerMessage {
     Handoff(Box<Handoff>),
 }
 
-fn set_sock_bufs(fd: i32) -> std::io::Result<()> {
-    const SOCK_BUF_BYTES: usize = 16 << 20;
-    let v = SOCK_BUF_BYTES as libc::c_int;
-    let len = std::mem::size_of_val(&v) as libc::socklen_t;
-    unsafe {
-        let r = libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_RCVBUF,
-            &v as *const _ as *const libc::c_void,
-            len,
-        );
-        if r != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let r = libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_SNDBUF,
-            &v as *const _ as *const libc::c_void,
-            len,
-        );
-        if r != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-    }
-    Ok(())
-}
-
-fn bind_reuseport(port: u16) -> std::io::Result<std::net::UdpSocket> {
-    let sock = socket2::Socket::new(
-        socket2::Domain::IPV4,
-        socket2::Type::DGRAM,
-        Some(socket2::Protocol::UDP),
-    )?;
-    sock.set_reuse_port(true)?;
-    sock.set_nonblocking(true)?;
-    let addr = std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, port);
-    sock.bind(&addr.into())?;
-    let _ = set_sock_bufs(sock.as_raw_fd());
-    Ok(sock.into())
-}
-
 fn run_reuseport_multi(cfg: LossConfig, k: usize) {
     let worker_count = k.min(cfg.connections);
     let start = Instant::now();
@@ -478,7 +434,7 @@ async fn run_acceptor(
     senders: Vec<mpsc::Sender<WorkerMessage>>,
     handoffs: mpsc::Receiver<WorkerMessage>,
 ) -> Vec<ConnStats> {
-    let std_listener = match bind_reuseport(cfg.port) {
+    let std_listener = match srt_transport::bind_reuseport(cfg.port) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[bench-tokio] acceptor {worker_index}: bind {e}");
@@ -662,7 +618,7 @@ fn promote(
     cfg: &LossConfig,
     start: Instant,
 ) {
-    let std_socket = match bind_reuseport(port) {
+    let std_socket = match srt_transport::bind_reuseport(port) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[bench-tokio] promote {peer}: bind {e}");

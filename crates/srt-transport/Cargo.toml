@@ -8,6 +8,15 @@ description = "Shared adapter plumbing between srt-protocol (sans-I/O) and runti
 
 [dependencies]
 shiguredo_srt = { path = "../srt-protocol" }
+# Unconditional: `bind_reuseport`/`set_sock_bufs`/`recvmsg_batch` in the
+# shared-utilities section are raw fd/libc mechanics with no runtime
+# dependency, usable by any adapter's ingress strategy (batched admission,
+# SO_REUSEPORT sharing) -- not gated behind any one runtime's feature.
+libc = "0.2"
+# "all" gates set_reuse_port -- explicit here rather than relying on
+# transitive feature unification from a runtime dependency that happens
+# to also pull in socket2/all (e.g. mio).
+socket2 = { version = "0.6", features = ["all"] }
 
 # Runtime-specific dependencies (optional, feature-gated)
 mio = { version = "1", features = ["net"], optional = true }
@@ -17,10 +26,9 @@ futures-lite = { version = "2", optional = true }
 monoio = { version = "0.2", features = ["sync"], optional = true }
 glommio = { version = "0.9", optional = true }
 compio = { version = "0.19", features = ["io", "io-uring", "net", "runtime", "time"], optional = true }
-libc = { version = "0.2", optional = true }
 
 [features]
-mio = ["dep:mio", "dep:libc"]
+mio = ["dep:mio"]
 tokio = ["dep:tokio"]
 smol = ["dep:smol", "dep:futures-lite"]
 monoio = ["dep:monoio"]
