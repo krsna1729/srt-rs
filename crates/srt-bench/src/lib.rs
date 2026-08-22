@@ -192,6 +192,13 @@ pub enum BondMode {
     Backup,
 }
 
+/// Shared bond-affinity map: group_id -> owning acceptor thread/worker.
+/// First leg to promote a group claims it; later legs hand off. Lock is
+/// taken once per connection, never per packet. Shared across runtime
+/// adapters (mio, tokio, ...) that implement `Ingress::ReuseportMulti` /
+/// `ReuseportSingle`, so every acceptor topology agrees on one owner.
+pub type GroupRegistry = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u32, usize>>>;
+
 impl LossConfig {
     /// Destination/bind address for connection i.
     pub fn addr_for(&self, i: usize) -> std::net::SocketAddr {

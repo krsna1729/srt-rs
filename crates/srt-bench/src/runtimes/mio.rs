@@ -3,7 +3,7 @@
 //! `ManualTimerStore` inside Conn). Connection i lives on port + i, each
 //! registered with Token(i).
 
-use crate::{Aggregate, ConnStats, LossConfig};
+use crate::{Aggregate, BondMode, ConnStats, GroupRegistry, LossConfig};
 use mio::net::UdpSocket;
 use mio::{Events, Interest, Poll, Token};
 use shiguredo_srt::{
@@ -16,11 +16,6 @@ use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
-
-/// Shared bond-affinity map: group_id -> owning acceptor thread.
-/// First leg to promote a group claims it; later legs hand off. Lock is
-/// taken once per connection, never per packet.
-pub(crate) type GroupRegistry = Arc<Mutex<HashMap<u32, usize>>>;
 
 /// Upper bound on the poll timeout so the loop still notices deadlines
 /// promptly when idle.
@@ -265,13 +260,13 @@ pub fn run(cfg: LossConfig) {
         // Sender-only -- the listener learns the group (and its type)
         // from the caller's handshake extension (`peer_group_extension`).
         let group_extension = if cfg.mode == crate::Mode::Sender
-            && cfg.bond_mode != crate::BondMode::None
+            && cfg.bond_mode != BondMode::None
             && i < cfg.bond_pairs * 2
         {
             let group_type = match cfg.bond_mode {
-                crate::BondMode::Broadcast => GroupType::Broadcast,
-                crate::BondMode::Backup => GroupType::Backup,
-                crate::BondMode::None => unreachable!("checked above"),
+                BondMode::Broadcast => GroupType::Broadcast,
+                BondMode::Backup => GroupType::Backup,
+                BondMode::None => unreachable!("checked above"),
             };
             Some(GroupExtensionData {
                 group_id: SRTGROUP_MASK | ((i / 2) as u32 + 1),
