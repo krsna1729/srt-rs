@@ -35,8 +35,9 @@ srt-bench runtime=<mio|tokio|smol|monoio|glommio|compio> \
 ### Orchestration scripts
 
 ```sh
-./bakeoff.sh N_CONNECTIONS SECONDS   # all six runtimes back-to-back
-./knee-sweep.sh 100 300 600 ...      # mio-only connection-count sweep
+./bench.sh bakeoff 300 8            # all six runtimes back-to-back
+./bench.sh knee 100 300 600         # mio-only connection-count sweep
+REPS=3 ./bench.sh baseline 300 8    # 3 reps per runtime, median table
 ```
 
 ## Output contract
@@ -103,11 +104,13 @@ RUST_LOG=debug ./target/release/srt-bench …   # tracing to stderr
 
 ## Script behavior
 
-`bakeoff.sh` / `knee-sweep.sh` run with `set -euo pipefail`, validate
-arguments, probe for a free port before binding (bakeoff), and install a
-cleanup trap that kills an orphaned receiver if the sender dies mid-run.
-Raw per-process output lands under `./scratch/` (gitignored); caller exit
-codes are surfaced — `rc=1` means never connected.
+`bench.sh` runs with `set -euo pipefail`, validates arguments, probes for
+a free port before binding, and installs a cleanup trap that kills an
+orphaned receiver if the sender dies mid-run. Raw per-process output
+lands under `./scratch/` (gitignored); caller exit codes are surfaced —
+`rc=1` means never connected. Baseline mode aggregates STATS lines into
+a median table (sent/recv/retx/loss/rtt/cpu/rss) per the method rule:
+same-window comparisons only, >=3 reps.
 
 glommio requires an io_uring-capable Linux kernel; selecting it elsewhere
 exits 2 with a message.

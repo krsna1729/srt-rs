@@ -54,19 +54,12 @@ for why there is deliberately no lowest-common-denominator abstraction.
 ## Quick start
 
 ```sh
-# Build everything (mold linker configured in .cargo/config.toml)
-cargo build --release -p srt-bench
+# Unified harness: three modes
+./bench.sh bakeoff 300 8      # all six runtimes at one density
+./bench.sh knee 100 300 600   # mio-only connection-count sweep
+REPS=3 ./bench.sh baseline 300 8   # 3 reps, median table (same-window rule)
 
-# Full six-runtime bake-off: N connections, T seconds, 8 Mbps each
-./bakeoff.sh 300 8
-
-# mio-only connection-count sweep to locate the scaling knee
-./knee-sweep.sh 100 300 600 900
-```
-
-Direct invocation (one process per role; connection *i* lives on port+i):
-
-```sh
+# Direct invocation (one process per role; connection *i* lives on port+i):
 srt-bench runtime=mio mode=receiver 12000 13 120 --connections 4
 srt-bench runtime=tokio mode=sender 127.0.0.1 12000 8 120 --connections 4
 ```
