@@ -507,6 +507,20 @@ impl ReceiverBuffer {
             return None;
         }
 
+        // Reject a packet whose sequence number is further ahead of
+        // expected_seq than the negotiated flow window. A conforming
+        // sender never has more than the flow window's worth of
+        // unacknowledged packets in flight, so a larger gap means a
+        // corrupted or malicious packet -- not a legitimate loss. Without
+        // this bound, the loss-detection scan below registers one entry
+        // per sequence number in the gap (up to just under 2^30, since
+        // that's the boundary `sequence_less_than` treats as "ahead"),
+        // so one crafted packet could force a multi-GB allocation and a
+        // long synchronous scan: a remote single-packet DoS.
+        if seq.wrapping_sub(self.expected_seq) & 0x7FFF_FFFF > self.max_buffer_size {
+            return None;
+        }
+
         self.total_received += 1;
         self.packets_since_ack += 1;
 
@@ -731,7 +745,7 @@ impl ReceiverBuffer {
         // order (sequence_less_than is a partial order), so we fall back
         // to the full scan there as well.
         if let (Some(min), Some(&oldest)) = (self.loss_list_min, self.packets.keys().next())
-            && !sequence_less_than(oldest, min)
+            && !sequence_less_than(min, oldest)
             // Numeric BTreeMap first key is not circularly oldest when
             // the buffer spans the 0 boundary (e.g. expected=FFFE,
             // buffered={FFFF,0} -> first key is 0). This can also happen
@@ -1084,6 +1098,64 @@ mod tests {
         assert!(losses.is_some());
         let lost = losses.expect("欠落パケットは Some になる想定");
         assert_eq!(lost, vec![1001]);
+    }
+
+    /// A single packet whose sequence number is far beyond the flow
+    /// window must be rejected outright, not treated as evidence of a
+    /// huge loss run -- otherwise one crafted packet forces the
+    /// loss-detection scan to register (and allocate for) one entry per
+    /// sequence number in the gap, up to ~2^30 entries. This is a DoS
+    /// regression test, not a throughput one: it only needs to finish
+    /// quickly and leave no bogus loss entries behind.
+    #[test]
+    fn test_receiver_buffer_rejects_packet_beyond_flow_window() {
+        let start = Timestamp::from_micros(0);
+        let mut buf = ReceiverBuffer::with_buffer_size(1000, 120, start, 0, 16);
+        buf.set_tsbpd_enabled(false);
+        let now = Timestamp::from_micros(1000);
+
+        // Just inside the window: accepted, registers bounded losses.
+        let losses = buf.receive(make_packet(1010, 100), now);
+        assert_eq!(losses, Some((1000..1010).collect()));
+
+        // Far beyond any plausible flow window: must be dropped, not
+        // turned into ~2^30 loss-list entries.
+        let losses = buf.receive(make_packet(1000u32.wrapping_add(1 << 20), 100), now);
+        assert!(losses.is_none());
+        assert_eq!(
+            buf.stats().total_lost,
+            10,
+            "the rejected far-future packet must not add loss entries"
+        );
+        assert_eq!(buf.expected_sequence(), 1000);
+    }
+
+    /// Regression for the `find_deliverable_seq` "fast path 2" argument
+    /// order: the loss-list-recovered check compared `(oldest, min)`
+    /// instead of `(min, oldest)`, so a buffered packet right after an
+    /// *unresolved* loss (the loss list's circular minimum still before
+    /// it) was delivered immediately instead of waiting for the gap to be
+    /// recovered or TLPKTDROP'd. 1000 never arrives here; 1001 must not
+    /// be handed to the application while it's still missing.
+    #[test]
+    fn test_receiver_buffer_unresolved_loss_blocks_fast_path() {
+        let start = Timestamp::from_micros(0);
+        let mut buf = ReceiverBuffer::new(1000, 120, start, 0);
+        buf.set_tsbpd_enabled(false);
+
+        let now = Timestamp::from_micros(1000);
+
+        // 1002 arrives first: registers 1000 and 1001 as lost.
+        buf.receive(make_packet(1002, 300), now);
+        // 1001 arrives, recovering it from the loss list -- but 1000 is
+        // still missing and still the loss list's circular minimum.
+        buf.receive(make_packet(1001, 200), now);
+
+        assert_eq!(
+            buf.pop_ready(now),
+            None,
+            "1001 must not be delivered while 1000 is still an unresolved loss"
+        );
     }
 
     #[test]
