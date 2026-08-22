@@ -728,13 +728,20 @@ async fn established_conn_task(mut driver: Conn, cfg: LossConfig, start: Instant
     let stream_deadline = Instant::now() + Duration::from_secs_f64(cfg.duration_secs);
     let mut last_data_at = Instant::now();
     let mut buf = [0u8; 2048];
+    // This task is only ever spawned post-Connected, so `connect_deadline`
+    // (srt_lifecycle::is_terminal's other exit path, for "never
+    // connected") never applies -- pass `now` for it so it's inert.
 
     loop {
         let now = Instant::now();
-        if !connected
-            || now >= stream_deadline
-            || now.saturating_duration_since(last_data_at) >= IDLE_GRACE
-        {
+        if srt_lifecycle::is_terminal(
+            connected,
+            Some(stream_deadline),
+            last_data_at,
+            now,
+            now,
+            IDLE_GRACE,
+        ) {
             break;
         }
 

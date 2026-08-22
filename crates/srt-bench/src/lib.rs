@@ -208,27 +208,13 @@ pub enum BondMode {
     Backup,
 }
 
-/// Shared bond-affinity map: group_id -> owning acceptor thread/worker.
-/// First leg to promote a group claims it; later legs hand off. Lock is
-/// taken once per connection, never per packet. Used by
-/// `Ingress::ReuseportMulti`, where only bonded connections ever consult
-/// it -- a plain connection stays wherever the kernel hashed it, no
-/// routing decision needed.
-///
-/// `Ingress::ReuseportSingle` uses [`SharedWorkerRouter`] instead: it
-/// routes *every* connection (bonded or not) to a worker, which is
-/// `srt_lifecycle::WorkerRouter`'s exact designed purpose, not just a
-/// group->owner lookup. Reconciling these two into one mechanism is
-/// tracked as a follow-up rather than done speculatively ahead of having
-/// both implementations to compare.
-pub type GroupRegistry = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u32, usize>>>;
-
-/// Full connection-routing policy for `Ingress::ReuseportSingle` (#3):
-/// the one acceptor routes every promoted connection -- bonded or not --
-/// to one of its worker threads via `srt_lifecycle::WorkerRouter`, which
-/// already implements round-robin/least-tuples selection plus group
-/// affinity. `K` is the runtime's peer-tuple key (`SocketAddr` for every
-/// adapter so far).
+/// Shared connection-routing policy: `srt_lifecycle::WorkerRouter` wrapped
+/// for cross-thread use. `Ingress::ReuseportMulti` consults it only for
+/// bonded legs (an unbonded connection stays wherever the kernel hashed
+/// it, no routing decision or lock needed); `Ingress::ReuseportSingle`
+/// routes *every* connection through it, bonded or not, which is
+/// `WorkerRouter`'s exact designed purpose. `K` is the runtime's
+/// peer-tuple key (`SocketAddr` for every adapter so far).
 pub type SharedWorkerRouter =
     std::sync::Arc<std::sync::Mutex<srt_lifecycle::WorkerRouter<std::net::SocketAddr>>>;
 

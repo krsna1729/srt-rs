@@ -1442,107 +1442,16 @@ fn run_worker(
 #[cfg(test)]
 mod bond_affinity_tests {
     use super::*;
-    use crate::GroupRegistry;
 
-    // ---- Registry semantics (pure, no threads) -------------------------
-    //
-    // `run_pool_acceptor` itself no longer uses `GroupRegistry` directly
-    // (it consults `srt_lifecycle::WorkerRouter` instead, only for legs
-    // that need to relocate) -- these tests exercise the generic
-    // claim/lookup/independence semantics of the
-    // `Arc<Mutex<HashMap<group_id, owner>>>` pattern itself, which
-    // `tokio.rs`'s `ReuseportMulti` still uses directly.
-
-    fn registry() -> GroupRegistry {
-        Arc::new(Mutex::new(HashMap::new()))
-    }
-
-    /// First leg to promote a group claims it: owner recorded = claimer.
-    #[test]
-    fn first_leg_claims_group() {
-        let reg = registry();
-        let mut map = reg.lock().unwrap();
-        assert_eq!(*map.entry(42).or_insert(2), 2);
-    }
-
-    /// Second leg sees the existing owner, not its own index.
-    #[test]
-    fn second_leg_sees_existing_owner() {
-        let reg = registry();
-        {
-            let mut map = reg.lock().unwrap();
-            assert_eq!(*map.entry(42).or_insert(0), 0);
-        }
-        let map = reg.lock().unwrap();
-        assert_eq!(map.get(&42), Some(&0));
-        assert_ne!(map.get(&42), Some(&1));
-    }
-
-    /// Distinct groups are independent (a leg of group A must not inherit
-    /// ownership state from group B).
-    #[test]
-    fn groups_are_independent() {
-        let reg = registry();
-        {
-            let mut map = reg.lock().unwrap();
-            assert_eq!(*map.entry(7).or_insert(1), 1);
-            assert_eq!(*map.entry(8).or_insert(3), 3);
-        }
-        let map = reg.lock().unwrap();
-        assert_eq!(map.get(&7), Some(&1));
-        assert_eq!(map.get(&8), Some(&3));
-    }
-
-    /// Same-thread short-circuit: when the leg already landed on the owner
-    /// thread, no handoff is sent (owner == worker_index).
-    #[test]
-    fn same_thread_leg_skips_handoff_decision() {
-        let reg = registry();
-        let worker_index = 3usize;
-        let owner = {
-            let mut map = reg.lock().unwrap();
-            *map.entry(99).or_insert(worker_index)
-        };
-        assert_eq!(owner, worker_index);
-    }
-
-    /// Misplaced leg resolves to a different owner.
-    #[test]
-    fn misplaced_leg_resolves_to_foreign_owner() {
-        let reg = registry();
-        {
-            let mut map = reg.lock().unwrap();
-            map.insert(5, 0);
-        }
-        let map = reg.lock().unwrap();
-        let owner = *map.get(&5).unwrap();
-        assert_ne!(owner, 2);
-    }
-
-    /// Concurrent claims from many "threads": exactly one winner per group,
-    /// and every thread observes that same winner. This is the property
-    /// the mpsc handoff correctness depends on.
-    #[test]
-    fn concurrent_claims_elect_single_owner() {
-        let reg = registry();
-        let mut handles = Vec::new();
-        for thread_index in 0..8 {
-            let reg = reg.clone();
-            handles.push(std::thread::spawn(move || {
-                let mut map = reg.lock().unwrap();
-                *map.entry(1234).or_insert(thread_index)
-            }));
-        }
-        let mut winners = std::collections::HashSet::new();
-        for handle in handles {
-            winners.insert(handle.join().unwrap());
-        }
-        let map = reg.lock().unwrap();
-        assert_eq!(winners.len(), 1, "exactly one thread won the race");
-        assert_eq!(map.get(&1234), winners.iter().next());
-    }
-
-    // ---- Handoff message round-trip through a real channel -------------
+    // Claim/lookup/independence/concurrent-claims semantics for the
+    // group-affinity registry pattern used to live here as standalone
+    // tests against the ad-hoc `GroupRegistry` HashMap. Both mio's
+    // `run_pool_acceptor` and tokio's `run_acceptor` now consult
+    // `srt_lifecycle::WorkerRouter` instead (see `run_pool_receiver`'s
+    // module doc) -- that exact set of properties is covered by
+    // `srt_lifecycle`'s own `worker_router_upholds_invariants` property
+    // test, which exercises the real type these `Handoff`/`WorkerMessage`
+    // tests below feed into, rather than a since-unused HashMap.
 
     /// A Handoff carries socket+conn intact through the mpsc channel -- the
     /// exact transport promote_slot uses for a misplaced bond leg. Uses a
