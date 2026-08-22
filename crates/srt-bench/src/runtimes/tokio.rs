@@ -1,6 +1,7 @@
 //! tokio adapter: task-per-connection via `tokio::task::spawn_local` on a
-//! `current_thread` runtime + `LocalSet` (Conn's native timers are !Send).
-//! Native `tokio::time::Sleep` timers live inside `srt_transport`'s Conn.
+//! `current_thread` runtime + `LocalSet` (Conn's native timers are !Send)
+//! for `Ingress::PerPort`. Native `tokio::time::Sleep` timers live inside
+//! `srt_transport`'s Conn.
 //!
 //! `Ingress::ReuseportMulti(K)` (#4) balances two needs that would
 //! otherwise fight tokio's idiom if forced into one shape: bond affinity
@@ -12,14 +13,23 @@
 //! each running its own `current_thread` runtime (a standard, supported
 //! tokio pattern -- thread-per-core servers do exactly this), gives
 //! `worker_index` real, stable thread identity for the registry/handoff
-//! mechanism. *Within* each acceptor thread, though, steady-state I/O for
-//! every promoted connection is an ordinary `spawn_local` task, exactly
-//! like the `PerPort` path below -- letting tokio's own scheduler and
-//! wakers drive concurrent connections is tokio's designed idiom, not
-//! something to route around. Only *admission* is deterministic; per-
-//! connection steady state is not.
+//! mechanism.
+//!
+//! *Within* each acceptor thread, though, a connection only ever gets its
+//! own `spawn_local` task -- and its own socket -- if it actually has to
+//! relocate to a different acceptor's owner thread for bond affinity. The
+//! common case (unbonded, or bonded but already on its owner) is serviced
+//! straight off the shared listener socket, dispatched by peer address,
+//! same as `SharedPool`. This isn't optional style: promoting *every*
+//! connection to its own `bind_reuseport`+`connect` socket, even ones that
+//! never move, was measured to cost 5-6x listener CPU-sys time and
+//! nonzero retransmits at 150 connections, because every new socket
+//! joining the reuseport group can reroute some other still-pending
+//! flow's next datagram to a different acceptor mid-handshake. See
+//! `run_acceptor`'s doc for the full explanation -- it's the identical
+//! fix and identical reasoning as mio's `run_pool_acceptor`.
 
-use crate::{Aggregate, BondMode, ConnStats, GroupRegistry, LossConfig};
+use crate::{Aggregate, BondMode, ConnStats, LossConfig};
 use shiguredo_srt::{
     ConnectionEvent, ConnectionOptions, GroupExtensionData, GroupType, SRTGROUP_MASK, SrtConnection,
 };
@@ -365,7 +375,8 @@ fn run_reuseport_multi(cfg: LossConfig, k: usize) {
     let worker_count = k.min(cfg.connections);
     let start = Instant::now();
     println!("LISTENING");
-    let group_registry: GroupRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let router: crate::SharedWorkerRouter =
+        Arc::new(Mutex::new(srt_lifecycle::WorkerRouter::new(worker_count)));
 
     // All channels exist before any thread spawns -- see the identical
     // mio bug this avoids: cloning a partially-built `Vec<Sender>` mid-loop
@@ -378,7 +389,7 @@ fn run_reuseport_multi(cfg: LossConfig, k: usize) {
     let mut handles = Vec::with_capacity(worker_count);
     for (worker_index, rx) in receivers.into_iter().enumerate() {
         let cfg = cfg.clone();
-        let registry = group_registry.clone();
+        let router = router.clone();
         let all_senders = senders.clone();
         handles.push(
             std::thread::Builder::new()
@@ -392,7 +403,7 @@ fn run_reuseport_multi(cfg: LossConfig, k: usize) {
                         cfg,
                         worker_index,
                         start,
-                        registry,
+                        router,
                         all_senders,
                         rx,
                     )))
@@ -419,18 +430,27 @@ fn run_reuseport_multi(cfg: LossConfig, k: usize) {
 }
 
 /// One acceptor thread's whole life: admits handshakes on its reuseport
-/// listener socket, drives them to `Connected`, promotes each to a
-/// dedicated connected socket, and either spawns a local steady-state
-/// task for it (owns the group, or unbonded) or ships it once to the
-/// thread that does. Once admission winds down (no pending handshakes
-/// past the connect window), it just awaits every task it spawned or
-/// received and returns their stats -- steady state is no longer this
-/// function's concern once a task exists for it.
+/// listener socket, drives every tracked peer to completion, and only
+/// ever creates a *second* socket for the rare case where a bonded leg
+/// must physically relocate to a different acceptor's owner thread.
+///
+/// The common case -- unbonded, or bonded but already on its group's
+/// owner thread -- is serviced straight off this thread's existing
+/// listener socket, dispatched by peer address, never spawning a task or
+/// binding anything new: this is the same fix as mio's `run_pool_acceptor`
+/// (see its module doc for why -- every *new* socket bound into this
+/// port's reuseport group can reroute some other pending flow's next
+/// datagram to a different acceptor, measured at 5-6x listener CPU-sys
+/// time and non-zero retransmits when every connection got promoted).
+/// Only a leg that actually needs to relocate gets `spawn_local`'d as its
+/// own task, via a handoff -- tokio's ordinary task-per-connection idiom
+/// stays exactly right for that genuinely-independent case, just not for
+/// the common one anymore.
 async fn run_acceptor(
     cfg: LossConfig,
     worker_index: usize,
     start: Instant,
-    group_registry: GroupRegistry,
+    router: crate::SharedWorkerRouter,
     senders: Vec<mpsc::Sender<WorkerMessage>>,
     handoffs: mpsc::Receiver<WorkerMessage>,
 ) -> Vec<ConnStats> {
@@ -443,14 +463,11 @@ async fn run_acceptor(
     };
     let listener = tokio::net::UdpSocket::from_std(std_listener).expect("register listener");
 
-    let mut pending: HashMap<SocketAddr, PendingEntry> = HashMap::new();
+    let mut peers: HashMap<SocketAddr, PeerEntry> = HashMap::new();
     let mut tasks: Vec<tokio::task::JoinHandle<ConnStats>> = Vec::new();
     let connect_deadline = Instant::now() + crate::INTEROP_CONNECT_TIMEOUT;
-    // Admission-phase safety net only -- once a connection is promoted it
-    // becomes an independent task with its own lifetime, not this loop's
-    // problem. Pending entries are individually bounded below, so this
-    // should never actually fire; kept as cheap insurance.
-    let run_deadline = Instant::now() + crate::INTEROP_CONNECT_TIMEOUT + Duration::from_secs(30);
+    let stream_len = Duration::from_secs_f64(cfg.duration_secs);
+    let run_deadline = Instant::now() + stream_len + IDLE_GRACE + Duration::from_secs(30);
     let mut tick = tokio::time::interval(TIMER_TICK);
     let mut buf = [0u8; 2048];
 
@@ -459,17 +476,30 @@ async fn run_acceptor(
         if now >= run_deadline {
             break;
         }
-        if now >= connect_deadline && pending.is_empty() {
+        // Vacuously true while nothing exists yet, so an acceptor that
+        // never admits anything still exits once the connect window
+        // closes instead of hanging on an empty guard.
+        let all_terminal = peers.values().all(|p| {
+            srt_lifecycle::is_terminal(
+                p.connected,
+                p.stream_deadline,
+                p.last_data_at,
+                now,
+                connect_deadline,
+                IDLE_GRACE,
+            )
+        });
+        if now >= connect_deadline && all_terminal {
             break;
         }
 
         tokio::select! {
             res = listener.recv_from(&mut buf) => {
                 if let Ok((n, peer)) = res {
-                    admit(&mut pending, &cfg, peer, &buf[..n], start);
+                    admit(&mut peers, &cfg, peer, &buf[..n], start);
                     loop {
                         match listener.try_recv_from(&mut buf) {
-                            Ok((n, peer)) => admit(&mut pending, &cfg, peer, &buf[..n], start),
+                            Ok((n, peer)) => admit(&mut peers, &cfg, peer, &buf[..n], start),
                             Err(_) => break,
                         }
                     }
@@ -478,57 +508,64 @@ async fn run_acceptor(
             _ = tick.tick() => {}
         }
 
-        // Drive pending handshakes toward Connected, then promote. A
-        // handshake stale past the connect window is dropped -- whatever
-        // the cause, it's never going to promote and must not block this
-        // acceptor's exit condition forever.
+        // Drive every tracked peer: fire timers, drain outputs (always
+        // via the shared listener's unconnected `send_to` -- a peer here
+        // never gets its own socket), and react to protocol events. On a
+        // peer's *first* Connected, decide once whether it needs to
+        // relocate.
         let t = crate::now_ts(start);
-        let mut promote_list = Vec::new();
-        let mut stale = Vec::new();
-        for (peer, p) in pending.iter_mut() {
-            if p.created_at.elapsed() >= crate::INTEROP_CONNECT_TIMEOUT {
-                stale.push(*peer);
-                continue;
-            }
+        let mut relocate: Vec<(SocketAddr, GroupExtensionData)> = Vec::new();
+        for (peer, p) in peers.iter_mut() {
             p.timers.fire_expired(t, &mut p.conn);
-            let refused =
-                drain_pending_outputs(&mut p.conn, &mut p.timers, &listener, *peer, t).await;
-            if refused {
-                stale.push(*peer);
-                continue;
-            }
+            let _ = drain_pending_outputs(&mut p.conn, &mut p.timers, &listener, *peer, t).await;
+            let mut newly_connected = false;
             while let Some(ev) = p.conn.poll_event() {
-                if matches!(ev, ConnectionEvent::Connected) {
-                    p.connected = true;
+                match ev {
+                    ConnectionEvent::Connected => {
+                        if p.stream_deadline.is_none() {
+                            newly_connected = true;
+                        }
+                        p.connected = true;
+                    }
+                    ConnectionEvent::DataReceived { .. } => {
+                        p.data_events += 1;
+                        p.last_data_at = Instant::now();
+                    }
+                    ConnectionEvent::Disconnected { .. } => {
+                        p.connected = false;
+                    }
+                    _ => {}
                 }
             }
-            if p.connected {
-                promote_list.push(*peer);
+            if newly_connected {
+                p.stream_deadline = Some(Instant::now() + stream_len);
+                if let Some(extension) = p.conn.peer_group_extension() {
+                    relocate.push((*peer, extension));
+                }
             }
         }
-        for peer in stale {
-            pending.remove(&peer);
-        }
-        for peer in promote_list {
-            let Some(p) = pending.remove(&peer) else {
-                continue;
+        for (peer, extension) in relocate {
+            let group = srt_lifecycle::GroupAffinity {
+                group_id: extension.group_id,
+                stream_id: None,
+                extension,
             };
-            let group_id = p.conn.peer_group_extension().map(|g| g.group_id);
-            promote(
-                cfg.port,
-                peer,
-                p.conn,
-                group_id,
-                &group_registry,
-                worker_index,
-                &senders,
-                &mut tasks,
-                &cfg,
-                start,
-            );
+            let owner = {
+                let mut router = match router.lock() {
+                    Ok(r) => r,
+                    Err(_) => continue, // poisoned: leave the leg where it landed
+                };
+                router.assign(peer, Some(group), srt_lifecycle::RoutingMode::LeastTuples)
+            };
+            if owner != worker_index {
+                let Some(p) = peers.remove(&peer) else {
+                    continue;
+                };
+                relocate_to_owner(cfg.port, peer, p.conn, owner, &senders);
+            }
         }
 
-        // Bond legs promoted on other acceptors that belong here.
+        // Bond legs relocated here from another acceptor.
         while let Ok(WorkerMessage::Handoff(handoff)) = handoffs.try_recv() {
             match tokio::net::UdpSocket::from_std(handoff.socket) {
                 Ok(tokio_socket) => {
@@ -543,24 +580,48 @@ async fn run_acceptor(
         }
     }
 
-    let mut results = Vec::with_capacity(tasks.len());
+    let mut stats: Vec<ConnStats> = peers
+        .into_iter()
+        .map(|(peer, p)| {
+            // Free this tuple's (and, if it was the last member, its
+            // group's) router bookkeeping now that the connection is
+            // fully done -- a no-op if this peer never touched the
+            // router (unbonded).
+            if let Ok(mut router) = router.lock() {
+                router.release(&peer);
+            }
+            let mut s = ConnStats {
+                connected: p.stream_deadline.is_some(),
+                data_events: p.data_events,
+                ..Default::default()
+            };
+            if let Some(st) = p.conn.receiver_stats() {
+                s.has_stats = true;
+                s.core_total = st.total_received;
+                s.secondary_a = st.total_lost;
+                s.secondary_b = st.total_duplicates;
+                s.rtt_us = st.rtt as u64;
+            }
+            s
+        })
+        .collect();
     for task in tasks {
-        if let Ok(stats) = task.await {
-            results.push(stats);
+        if let Ok(s) = task.await {
+            stats.push(s);
         }
     }
-    results
+    stats
 }
 
 fn admit(
-    pending: &mut HashMap<SocketAddr, PendingEntry>,
+    peers: &mut HashMap<SocketAddr, PeerEntry>,
     cfg: &LossConfig,
     peer: SocketAddr,
     data: &[u8],
     start: Instant,
 ) {
     let t = crate::now_ts(start);
-    let entry = pending.entry(peer).or_insert_with(|| PendingEntry {
+    let entry = peers.entry(peer).or_insert_with(|| PeerEntry {
         conn: SrtConnection::new_listener(ConnectionOptions {
             socket_id: std::process::id(),
             tsbpd_delay: cfg.latency_ms,
@@ -568,19 +629,28 @@ fn admit(
         }),
         timers: srt_transport::ManualTimerStore::new(),
         connected: false,
-        created_at: Instant::now(),
+        stream_deadline: None,
+        data_events: 0,
+        last_data_at: Instant::now(),
     });
     let _ = entry.conn.feed_recv_buf(data, t);
 }
 
-/// One in-flight handshake, keyed by peer tuple in `run_acceptor`'s
-/// `pending` map. Module-scoped (not local to `run_acceptor`) only
-/// because `admit` needs to name the type in its signature.
-struct PendingEntry {
+/// One tracked peer -- pending handshake or fully established, serviced
+/// off the shared listener socket for its whole life unless it relocates
+/// -- keyed by peer tuple in `run_acceptor`'s `peers` map. Module-scoped
+/// (not local to `run_acceptor`) only because `admit` needs to name the
+/// type in its signature.
+struct PeerEntry {
     conn: SrtConnection,
     timers: srt_transport::ManualTimerStore,
+    /// Live connected state, feeding `srt_lifecycle::is_terminal`.
     connected: bool,
-    created_at: Instant,
+    /// `None` until this peer's first `Connected` event; doubles as "has
+    /// this ever connected" (see mio's identical pattern).
+    stream_deadline: Option<Instant>,
+    data_events: u64,
+    last_data_at: Instant,
 }
 
 async fn drain_pending_outputs(
@@ -605,65 +675,37 @@ async fn drain_pending_outputs(
     refused
 }
 
-#[allow(clippy::too_many_arguments)]
-fn promote(
+/// Relocate a connection that must move to a different worker: bind a
+/// fresh dedicated socket (unavoidable here -- this is the one case that
+/// genuinely needs to move to a different thread's event loop), connect
+/// it to the peer, and ship it once over the owner's channel.
+fn relocate_to_owner(
     port: u16,
     peer: SocketAddr,
     pending_conn: SrtConnection,
-    group_id: Option<u32>,
-    group_registry: &GroupRegistry,
-    worker_index: usize,
+    owner: usize,
     senders: &[mpsc::Sender<WorkerMessage>],
-    tasks: &mut Vec<tokio::task::JoinHandle<ConnStats>>,
-    cfg: &LossConfig,
-    start: Instant,
 ) {
     let std_socket = match srt_transport::bind_reuseport(port) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("[bench-tokio] promote {peer}: bind {e}");
+            eprintln!("[bench-tokio] relocate {peer}: bind {e}");
             return;
         }
     };
     if std_socket.connect(peer).is_err() {
-        eprintln!("[bench-tokio] promote {peer}: connect failed");
+        eprintln!("[bench-tokio] relocate {peer}: connect failed");
         return;
     }
-
-    // Bond affinity: first acceptor to promote a group owns it. A leg
-    // that landed here but belongs to another owner is promoted anyway
-    // (so the kernel 4-tuple demux is correct), then shipped once.
-    if let Some(group_id) = group_id {
-        let owner = {
-            let mut registry = match group_registry.lock() {
-                Ok(r) => r,
-                Err(_) => return,
-            };
-            *registry.entry(group_id).or_insert(worker_index)
-        };
-        if owner != worker_index {
-            let message = WorkerMessage::Handoff(Box::new(Handoff {
-                socket: std_socket,
-                conn: pending_conn,
-            }));
-            if senders[owner].send(message).is_err() {
-                eprintln!("[bench-tokio] promote {peer}: owner {owner} channel closed");
-            } else {
-                HANDOFF_COUNT.fetch_add(1, Ordering::Relaxed);
-            }
-            return;
-        }
-    }
-
-    let Ok(tokio_socket) = tokio::net::UdpSocket::from_std(std_socket) else {
-        eprintln!("[bench-tokio] promote {peer}: register failed");
-        return;
-    };
-    let driver = Conn::new(pending_conn, tokio_socket);
-    let cfg = cfg.clone();
-    tasks.push(tokio::task::spawn_local(async move {
-        established_conn_task(driver, cfg, start).await
+    let message = WorkerMessage::Handoff(Box::new(Handoff {
+        socket: std_socket,
+        conn: pending_conn,
     }));
+    if senders[owner].send(message).is_err() {
+        eprintln!("[bench-tokio] relocate {peer}: owner {owner} channel closed");
+    } else {
+        HANDOFF_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Steady-state loop for one promoted (already-connected) connection,
