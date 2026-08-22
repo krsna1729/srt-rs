@@ -2,16 +2,21 @@
 # Unified SRT benchmark harness. One tool, three modes:
 #
 #   ./bench.sh bakeoff [N] [SECONDS]        all six runtimes at one density
-#   ./bench.sh knee N [N...]                mio-only connection-count sweep
+#   ./bench.sh knee N [N...]                all six runtimes swept over N
 #   ./bench.sh baseline [N] [SECONDS]       all six runtimes, REPS reps,
 #                                           median table (same-window rule)
+#   ./bench.sh sysprof RUNTIME [N] [SECS]   perf-tracepoint attribution for
+#                                           one runtime: socket syscalls +
+#                                           io_uring SQEs per 10k packets
 #
 # Common knobs via env:
 #   REPS=3      repetitions for baseline mode (>=3 per method rules)
-#   TAG=name    output file prefix tag (default: mode name)
+#   TAG=name    output file prefix tag for baseline mode
 #
-# Every run: receiver/sender pair on port+i per connection, one STATS line
-# each in ./scratch/<TAG>_*.out, STATS echoed to stdout.
+# Every mode is symmetric: all six runtimes (mio tokio smol monoio glommio
+# compio) get identical treatment. Each run: receiver/sender pair on port+i
+# per connection, one STATS line each in ./scratch/, STATS echoed to stdout.
+#
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -133,8 +138,12 @@ mode_knee() {
   ensure_binary
   for n in "$@"; do
     echo "=== N=$n ==="
-    # Deterministic port per N keeps repeat runs of the same sweep comparable.
-    run_pair mio $((9700 + n)) "$n" 8 2 "knee_sweep_${n}"
+    for runtime in "${RUNTIMES[@]}"; do
+      local port
+      # Deterministic port per (N, runtime) keeps repeat sweeps comparable.
+      port=$(pick_port $((9700 + n)) 50) || { echo "error: no free port" >&2; exit 1; }
+      run_pair "$runtime" "$port" "$n" 8 2 "knee_sweep_${runtime}_${n}"
+    done
   done
   echo KNEESWEEP_DONE
 }
@@ -204,6 +213,80 @@ mode_baseline() {
   print_medians "$tag" "$reps" "$n" "$secs"
 }
 
+mode_sysprof() {
+  local runtime=${1:?runtime required}
+  local n=${2:-300} secs=${3:-8} tag=${TAG:-sysprof}
+  case "$runtime" in mio|tokio|smol|monoio|glommio|compio) ;;
+    *) echo "error: unknown runtime '$runtime'" >&2; usage ;;
+  esac
+  require_positive_int N "$n"
+  require_positive_int SECS "$secs"
+  ensure_binary
+
+  # Socket syscalls cover the readiness backends; io_uring backends never
+  # issue socket syscalls -- every op is a submission queue entry, so the
+  # SQE tracepoint is what makes them visible at all.
+  readonly EVENTS="syscalls:sys_enter_recvfrom,syscalls:sys_enter_sendto,\
+syscalls:sys_enter_sendmsg,syscalls:sys_enter_recvmsg,\
+syscalls:sys_enter_epoll_wait,io_uring:io_uring_submit_req"
+
+  local port
+  port=$(pick_port 25000 2000) || { echo "error: no free port" >&2; exit 1; }
+  local lp_out="$SCRATCH_DIR/${tag}_${runtime}_listener"
+  local cp_out="$SCRATCH_DIR/${tag}_${runtime}_caller"
+  rm -f "$lp_out.out" "$lp_out.perf" "$cp_out.out" "$cp_out.perf"
+
+  perf stat -e "$EVENTS" -x, -o "$lp_out.perf" \
+    "$BIN" runtime="$runtime" mode=receiver "$port" $((secs + 5)) "$LATENCY_MS" \
+    --connections "$n" >"$lp_out.out" 2>&1 &
+  LISTENER_PID=$!
+  sleep 1
+  perf stat -e "$EVENTS" -x, -o "$cp_out.perf" \
+    "$BIN" runtime="$runtime" mode=sender 127.0.0.1 "$port" "$secs" "$LATENCY_MS" \
+    --connections "$n" >"$cp_out.out" 2>&1 || true
+  wait "$LISTENER_PID"
+  LISTENER_PID=""
+
+  python3 - "$tag" "$runtime" "$SCRATCH_DIR" <<'PYEOF'
+import sys, re
+
+tag, runtime, scratch = sys.argv[1], sys.argv[2], sys.argv[3]
+
+def load(side):
+    counts = {}
+    with open(f"{scratch}/{tag}_{runtime}_{side}.perf") as f:
+        for line in f:
+            parts = line.strip().split(",")
+            if len(parts) >= 3 and ":" in parts[2]:
+                counts[parts[2].split(":", 1)[1]] = int(float(parts[0]))
+    stats = {}
+    m = re.search(r"STATS .*", open(f"{scratch}/{tag}_{runtime}_{side}.out").read())
+    if m:
+        for kv in m.group(0).split()[1:]:
+            k, _, v = kv.partition("=")
+            stats[k] = v
+    return counts, stats
+
+print(f"=== syscall attribution: {runtime} ===")
+for side, label in (("caller", "caller"), ("listener", "listener")):
+    counts, st = load(side)
+    pkts = int(st.get("core_total", 0)) or int(st.get("pkt_sent", 0))
+    cpu_user = float(st.get("cpu_user_ms", 0))
+    cpu_sys = float(st.get("cpu_sys_ms", 0))
+    rx = counts.get("sys_enter_recvfrom", 0) + counts.get("sys_enter_recvmsg", 0)
+    tx = counts.get("sys_enter_sendto", 0) + counts.get("sys_enter_sendmsg", 0)
+    ep = counts.get("sys_enter_epoll_wait", 0)
+    sqe = counts.get("io_uring_submit_req", 0)
+    total_ops = rx + tx + ep + sqe
+    print(f"{label:9s} pkts={pkts:>9d} rx={rx:>9d} tx={tx:>9d} epoll={ep:>9d} "
+          f"io_sqe={sqe:>9d} | cpu_user={cpu_user:>8.0f}ms cpu_sys={cpu_sys:>8.0f}ms")
+    if pkts:
+        k = 10000.0 / pkts
+        print(f"{'':9s} ops-per-10k-pkt: rx={k*rx:8.1f} tx={k*tx:8.1f} "
+              f"epoll={k*ep:8.1f} sqe={k*sqe:8.1f} total={k*total_ops:8.1f}")
+PYEOF
+}
+
 mkdir -p "$SCRATCH_DIR"
 MODE=${1:-}
 shift || true
@@ -211,5 +294,6 @@ case $MODE in
   bakeoff)  mode_bakeoff "$@" ;;
   knee)     mode_knee "$@" ;;
   baseline) mode_baseline "$@" ;;
+  sysprof)  mode_sysprof "$@" ;;
   *)        usage ;;
 esac
