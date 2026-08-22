@@ -4,14 +4,23 @@
 //! registered with Token(i).
 
 use crate::{Aggregate, ConnStats, LossConfig};
-use libc;
 use mio::net::UdpSocket;
 use mio::{Events, Interest, Poll, Token};
-use shiguredo_srt::{ConnectionEvent, ConnectionOptions, ConnectionOutput, SrtConnection};
+use shiguredo_srt::{
+    ConnectionEvent, ConnectionOptions, GroupExtensionData, GroupType, SRTGROUP_MASK, SrtConnection,
+};
 use srt_transport::mio_transport::Conn;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
+
+/// Shared bond-affinity map: group_id -> owning acceptor thread.
+/// First leg to promote a group claims it; later legs hand off. Lock is
+/// taken once per connection, never per packet.
+pub(crate) type GroupRegistry = Arc<Mutex<HashMap<u32, usize>>>;
 
 /// Upper bound on the poll timeout so the loop still notices deadlines
 /// promptly when idle.
@@ -70,8 +79,9 @@ fn set_sock_bufs(fd: i32) -> std::io::Result<()> {
     }
     Ok(())
 }
-/// Batched receive for a bound UDP socket: up to `bufs.len()` datagrams
-/// in one `recvmmsg` syscall. Returns count received; `addrs[i]` holds
+
+/// Batched receive for a bound UDP socket: up to `bufs.len()` datagrams in
+/// one `recvmmsg` syscall. Returns count received; `addrs[i]` holds
 /// each sender, `sizes[i]` the length. Buffers are hoisted by the caller
 /// and reused -- zero per-call allocation. One syscall for up to 32
 /// datagrams vs one per datagram before.
@@ -85,7 +95,6 @@ fn recvmsg_batch(
     thread_local! {
         static SCRATCH: RefCell<BatchScratch> = RefCell::new(BatchScratch::new(64));
     }
-    const BATCH_MAX: usize = 64;
     struct BatchScratch {
         msgs: Vec<libc::mmsghdr>,
         iovs: Vec<libc::iovec>,
@@ -179,12 +188,32 @@ pub fn run(cfg: LossConfig) {
     if cfg.mode == crate::Mode::Receiver {
         println!("LISTENING");
     }
+    // Single-port fan-in via SO_REUSEPORT + kernel sharding. This is the
+    // production-like case (one SRT listener port, many callers) where a
+    // single acceptor saturates at ~1200 concurrent handshakes. Pool(K)
+    // creates K acceptor sockets on the base port, each in its own thread,
+    // with a shared GroupRegistry for bond affinity (first leg to promote
+    // claims the group; later legs hand off via mpsc once, never per-packet).
+    if cfg.mode == crate::Mode::Receiver {
+        if let crate::Ingress::Pool(k) = cfg.ingress {
+            if k > 1 && cfg.connections > 1 {
+                return run_pool_receiver(cfg, k);
+            }
+        }
+    }
     if cfg.connections > 1 {
-        eprintln!(
-            "[bench-mio] scale: ports {}-{}",
-            cfg.port,
-            cfg.port + cfg.connections as u16 - 1
-        );
+        match cfg.ingress {
+            crate::Ingress::Pool(k) if cfg.mode == crate::Mode::Sender && k > 1 => {
+                eprintln!("[bench-mio] scale: single port {} (pool={k})", cfg.port);
+            }
+            _ => {
+                eprintln!(
+                    "[bench-mio] scale: ports {}-{}",
+                    cfg.port,
+                    cfg.port + cfg.connections as u16 - 1
+                );
+            }
+        }
     }
 
     let mut poll = Poll::new().expect("mio Poll::new");
@@ -215,6 +244,22 @@ pub fn run(cfg: LossConfig) {
             .register(&mut socket, Token(i), Interest::READABLE)
             .expect("register socket");
 
+        // Bond exercise: connections 2g/2g+1 (for g in 0..bond_groups) share
+        // a group id, proving the pool receiver's registry/handoff path
+        // actually fires in a run instead of sitting dead. Sender-only --
+        // the listener learns the group from the caller's handshake
+        // extension (`peer_group_extension`).
+        let group_extension =
+            if cfg.mode == crate::Mode::Sender && cfg.bond_groups > 0 && i < cfg.bond_groups * 2 {
+                Some(GroupExtensionData {
+                    group_id: SRTGROUP_MASK | ((i / 2) as u32 + 1),
+                    group_type: GroupType::Broadcast,
+                    flags: 0,
+                    weight: 0,
+                })
+            } else {
+                None
+            };
         let options = ConnectionOptions {
             socket_id: std::process::id(),
             tsbpd_delay: cfg.latency_ms,
@@ -222,6 +267,7 @@ pub fn run(cfg: LossConfig) {
                 crate::Mode::Sender => Some(cfg.bitrate_bps / 8),
                 crate::Mode::Receiver => None,
             },
+            group_extension,
             ..Default::default()
         };
         let conn = match cfg.mode {
@@ -435,5 +481,602 @@ pub fn run(cfg: LossConfig) {
 
     if !agg.any_connected {
         std::process::exit(1);
+    }
+}
+
+/// One accepted connection on an acceptor thread: dedicated socket
+/// connected to the peer's exact tuple + protocol state.
+struct PoolSlot {
+    conn: Conn,
+    connected: bool,
+    data_events: u64,
+    poisoned: bool,
+    token: Token,
+    /// Wall-clock deadline for this connection's stream, set once at slot
+    /// creation (promotion only happens after the handshake completes, so
+    /// every slot starts connected).
+    stream_deadline: Instant,
+    /// Wall-clock time of the last datagram received from the peer, used
+    /// to detect a genuinely stalled connection (see `slot_is_terminal`)
+    /// instead of stopping on a fixed wall-clock window that can drift out
+    /// of sync with the peer's own window under load.
+    last_data_at: Instant,
+}
+
+/// A slot is done -- either it disconnected, ran its full duration, or went
+/// idle past `IDLE_GRACE` -- and the acceptor no longer needs to service it
+/// to make progress.
+fn slot_is_terminal(slot: &PoolSlot, now: Instant) -> bool {
+    !slot.connected
+        || now >= slot.stream_deadline
+        || now.saturating_duration_since(slot.last_data_at) >= IDLE_GRACE
+}
+
+/// How long a connected slot may go without a datagram from its peer
+/// before it's retired as stalled, even if the protocol layer hasn't
+/// itself noticed a disconnect.
+const IDLE_GRACE: Duration = Duration::from_secs(10);
+
+/// Diagnostic counter: bond legs actually shipped cross-thread via the
+/// handoff channel. Proves the registry/handoff path fired in a given run
+/// instead of sitting dead -- see `run_pool_receiver`'s shutdown log.
+static HANDOFF_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Bond-affinity handoff payload: a fully promoted slot shipped from the
+/// acceptor that completed its handshake to the thread that owns the group.
+struct Handoff {
+    socket: UdpSocket,
+    conn: SrtConnection,
+}
+
+enum WorkerMessage {
+    Handoff(Box<Handoff>),
+}
+
+fn bind_reuseport(port: u16) -> std::io::Result<UdpSocket> {
+    let sock = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    sock.set_reuse_port(true)?;
+    sock.set_nonblocking(true)?;
+    let addr = std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, port);
+    sock.bind(&addr.into())?;
+    let _ = set_sock_bufs(sock.as_raw_fd());
+    Ok(UdpSocket::from_std(sock.into()))
+}
+
+/// Drain outputs for an unconnected (handshake-phase) connection: sends go
+/// via send_to to the peer; timers apply to the manual store. Returns true
+/// when a send failed (treat the pending handshake as dead).
+fn drain_conn_outputs(
+    conn: &mut SrtConnection,
+    timers: &mut srt_transport::ManualTimerStore,
+    socket: &UdpSocket,
+    destination: SocketAddr,
+    now: shiguredo_srt::Timestamp,
+) -> bool {
+    use shiguredo_srt::ConnectionOutput;
+    let mut refused = false;
+    while let Some(out) = conn.poll_output() {
+        match out {
+            ConnectionOutput::SendPacket(bytes) => {
+                if socket.send_to(&bytes, destination).is_err() {
+                    refused = true;
+                }
+            }
+            other => timers.apply_output(&other, now),
+        }
+    }
+    refused
+}
+
+/// Multi-acceptor single-port receiver (`--ingress pool=K`, K>1): K
+/// SO_REUSEPORT acceptor threads share the base port; the kernel hashes
+/// each flow's source tuple to one of them. Each acceptor completes the
+/// handshake for every flow routed to it, then promotes the session:
+/// creates a dedicated socket bound with SO_REUSEPORT on the same port and
+/// connect()ed to the peer so kernel demux follows the exact 4-tuple.
+///
+/// Bond affinity: a shared GroupRegistry records which acceptor first
+/// promoted each group id (from the peer's handshake group extension).
+/// A leg landing on a non-owner thread is still promoted there, then the
+/// registered slot ships to the owner over a one-shot mpsc channel. The
+/// channel is admission-time only: steady-state packets flow
+/// kernel -> socket -> owner poll directly, never through the channel.
+/// Non-bonded connections skip the registry entirely.
+fn run_pool_receiver(cfg: LossConfig, k: usize) {
+    use std::sync::mpsc;
+
+    let worker_count = k.min(cfg.connections);
+    let start = Instant::now();
+    let group_registry: GroupRegistry = Arc::new(Mutex::new(HashMap::new()));
+
+    // All channels must exist before any thread is spawned: promote_slot
+    // indexes `senders` by owner worker index, so every thread needs the
+    // full, final-length vector -- not a partial one containing only the
+    // channels created so far. Cloning `senders` mid-loop (as it grows one
+    // element per iteration) would hand worker 0 a 1-element slice and
+    // panic the first time a handoff resolves to any later worker.
+    let (senders, receivers): (Vec<_>, Vec<_>) = (0..worker_count)
+        .map(|_| mpsc::channel::<WorkerMessage>())
+        .unzip();
+
+    let mut handles = Vec::with_capacity(worker_count);
+    for (worker_index, rx) in receivers.into_iter().enumerate() {
+        let registry = group_registry.clone();
+        let all_senders = senders.clone();
+        let cfg = cfg.clone();
+        handles.push(
+            std::thread::Builder::new()
+                .name(format!("srt-acceptor-{worker_index}"))
+                .spawn(move || {
+                    run_pool_acceptor(cfg, worker_index, start, registry, all_senders, rx)
+                })
+                .expect("spawn acceptor"),
+        );
+    }
+
+    let mut agg = Aggregate::new(cfg.clone());
+    for handle in handles {
+        for stats in handle.join().expect("acceptor panicked") {
+            agg.add(stats);
+        }
+    }
+    if cfg.bond_groups > 0 {
+        eprintln!(
+            "[bench-mio] pool receiver: {} bond handoffs",
+            HANDOFF_COUNT.load(Ordering::Relaxed)
+        );
+    }
+    agg.print(start);
+    if !agg.any_connected {
+        eprintln!("[bench-mio] pool receiver admitted no connections");
+        std::process::exit(1);
+    }
+}
+
+fn run_pool_acceptor(
+    cfg: LossConfig,
+    worker_index: usize,
+    start: Instant,
+    group_registry: GroupRegistry,
+    senders: Vec<mpsc::Sender<WorkerMessage>>,
+    handoffs: mpsc::Receiver<WorkerMessage>,
+) -> Vec<ConnStats> {
+    let mut poll = Poll::new().expect("mio Poll::new");
+    let mut events = Events::with_capacity(1024);
+    let mut listener = match bind_reuseport(cfg.port) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("[bench-mio] acceptor {worker_index}: bind {e}");
+            return Vec::new();
+        }
+    };
+    poll.registry()
+        .register(&mut listener, Token(0), Interest::READABLE)
+        .expect("register listener");
+
+    struct Pending {
+        conn: SrtConnection,
+        timers: srt_transport::ManualTimerStore,
+        connected: bool,
+    }
+
+    // Pending handshakes keyed by peer tuple; established slots appended
+    // after promotion, each with its own token.
+    let mut pending: HashMap<SocketAddr, Pending> = HashMap::new();
+    let mut slots: Vec<PoolSlot> = Vec::new();
+    let mut next_token: usize = 1;
+    let connect_deadline = Instant::now() + crate::INTEROP_CONNECT_TIMEOUT;
+    let stream_len = Duration::from_secs_f64(cfg.duration_secs);
+    // Absolute safety net so a hung peer or a stuck protocol state can
+    // never wedge this thread forever, no matter what `slot_is_terminal`
+    // and `connect_deadline` decide. Sized off the run's own duration
+    // (plus idle grace and margin) rather than a fixed constant so it
+    // never truncates a legitimate long soak run.
+    let run_deadline = Instant::now() + stream_len + IDLE_GRACE + Duration::from_secs(30);
+
+    // Hoisted admission batch buffers: one allocation for the acceptor's
+    // whole life, reused every readability event instead of once per event
+    // (hot-path rule).
+    let mut admit_bufs: Vec<Vec<u8>> = (0..32).map(|_| vec![0u8; 2048]).collect();
+    let mut admit_sizes = [0usize; 32];
+    let mut admit_addrs: [Option<SocketAddr>; 32] = [None; 32];
+    let mut buf = [0u8; 2048];
+
+    loop {
+        let now = Instant::now();
+        if now >= run_deadline {
+            break;
+        }
+        // Vacuously true while no slot exists yet, so an acceptor that
+        // never admits anything still exits once the connect window closes
+        // instead of hanging on an empty `slots` guard.
+        let all_terminal = slots.iter().all(|s| slot_is_terminal(s, now));
+        if now >= connect_deadline && pending.is_empty() && all_terminal {
+            break;
+        }
+        poll.poll(&mut events, Some(TIMER_TICK)).ok();
+
+        // Accept bond legs promoted on other acceptors that belong here.
+        while let Ok(message) = handoffs.try_recv() {
+            let WorkerMessage::Handoff(handoff) = message;
+            let mut socket = handoff.socket;
+            let token = Token(next_token);
+            next_token += 1;
+            if poll
+                .registry()
+                .register(&mut socket, token, Interest::READABLE)
+                .is_err()
+            {
+                continue;
+            }
+            let mut conn = Conn::new(handoff.conn, socket);
+            conn.fire_expired(crate::now_ts(start));
+            conn.drain_outputs(crate::now_ts(start));
+            let now = Instant::now();
+            slots.push(PoolSlot {
+                conn,
+                connected: true,
+                data_events: 0,
+                poisoned: false,
+                token,
+                stream_deadline: now + stream_len,
+                last_data_at: now,
+            });
+        }
+
+        for event in events.iter() {
+            match event.token().0 {
+                0 => {
+                    // Admission path: recvmmsg batch on the shared listener.
+                    loop {
+                        let fd = listener.as_raw_fd();
+                        let received =
+                            recvmsg_batch(fd, &mut admit_bufs, &mut admit_sizes, &mut admit_addrs);
+                        if received == 0 {
+                            break;
+                        }
+                        for i in 0..received {
+                            let Some(peer) = admit_addrs[i] else {
+                                continue;
+                            };
+                            let t = crate::now_ts(start);
+                            let entry = pending.entry(peer).or_insert_with(|| Pending {
+                                conn: SrtConnection::new_listener(ConnectionOptions {
+                                    socket_id: std::process::id(),
+                                    tsbpd_delay: cfg.latency_ms,
+                                    ..Default::default()
+                                }),
+                                timers: srt_transport::ManualTimerStore::new(),
+                                connected: false,
+                            });
+                            let _ = entry
+                                .conn
+                                .feed_recv_buf(&admit_bufs[i][..admit_sizes[i]], t);
+                        }
+                        if received < 32 {
+                            break;
+                        }
+                    }
+                }
+                idx => {
+                    let Some(slot) = slots.iter_mut().find(|s| s.token.0 == idx) else {
+                        continue;
+                    };
+                    let t = crate::now_ts(start);
+                    loop {
+                        match slot.conn.socket.recv(&mut buf) {
+                            Ok(n) => {
+                                let _ = slot.conn.conn.feed_recv_buf(&buf[..n], t);
+                                slot.data_events += 1;
+                                slot.last_data_at = Instant::now();
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                                slot.poisoned = true;
+                                break;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+            }
+        }
+
+        // Drive pending handshakes toward Connected, then promote. A
+        // connected peer stays in `pending` here (`retain` keeps returning
+        // true for it) -- only the promotion loop below actually removes
+        // it, via `pending.remove`, which is what hands ownership of its
+        // `SrtConnection` over to `promote_slot`. Dropping it early inside
+        // `retain` would destroy the handshake-completed connection before
+        // it's ever promoted: the peer would see its own handshake
+        // conclusion (already sent) and believe it's connected, while the
+        // acceptor silently admits nothing.
+        let t = crate::now_ts(start);
+        let mut promote = Vec::new();
+        pending.retain(|peer, p| {
+            p.timers.fire_expired(t, &mut p.conn);
+            let refused = drain_conn_outputs(&mut p.conn, &mut p.timers, &listener, *peer, t);
+            if refused {
+                return false;
+            }
+            while let Some(ev) = p.conn.poll_event() {
+                if matches!(ev, ConnectionEvent::Connected) {
+                    p.connected = true;
+                }
+            }
+            if p.connected {
+                promote.push(*peer);
+            }
+            true
+        });
+        for peer in promote {
+            let Some(p) = pending.remove(&peer) else {
+                continue;
+            };
+            // Bond affinity key: the peer's handshake group extension, if
+            // any. None for plain callers -- they never touch the registry.
+            let group_id = p.conn.peer_group_extension().map(|g| g.group_id);
+            promote_slot(
+                &mut poll,
+                &mut slots,
+                &mut next_token,
+                cfg.port,
+                stream_len,
+                peer,
+                p.conn,
+                group_id,
+                &group_registry,
+                worker_index,
+                &senders,
+            );
+        }
+
+        // Maintenance for established slots.
+        let t = crate::now_ts(start);
+        for slot in slots.iter_mut() {
+            slot.conn.fire_expired(t);
+            if slot.conn.drain_outputs(t) {
+                slot.poisoned = true;
+            }
+            while let Some(ev) = slot.conn.conn.poll_event() {
+                if matches!(ev, ConnectionEvent::Disconnected { .. }) {
+                    slot.connected = false;
+                }
+            }
+            if slot.poisoned {
+                // Reconnect clears ECONNREFUSED poison on connected UDP.
+                if let Ok(peer) = slot.conn.socket.peer_addr() {
+                    let _ = slot.conn.socket.connect(peer);
+                    slot.poisoned = false;
+                }
+            }
+        }
+    }
+
+    slots
+        .into_iter()
+        .map(|slot| {
+            let mut s = ConnStats {
+                connected: slot.connected,
+                data_events: slot.data_events,
+                ..Default::default()
+            };
+            if let Some(st) = slot.conn.conn.receiver_stats() {
+                s.has_stats = true;
+                s.core_total = st.total_received;
+                s.secondary_a = st.total_lost;
+                s.secondary_b = st.total_duplicates;
+                s.rtt_us = st.rtt as u64;
+            }
+            s
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn promote_slot(
+    poll: &mut Poll,
+    slots: &mut Vec<PoolSlot>,
+    next_token: &mut usize,
+    base_port: u16,
+    stream_len: Duration,
+    peer: SocketAddr,
+    pending_conn: SrtConnection,
+    group_id: Option<u32>,
+    group_registry: &GroupRegistry,
+    worker_index: usize,
+    senders: &[mpsc::Sender<WorkerMessage>],
+) {
+    let mut socket = match bind_reuseport(base_port) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[bench-mio] promote {peer}: bind {e}");
+            return;
+        }
+    };
+    if socket.connect(peer).is_err() {
+        eprintln!("[bench-mio] promote {peer}: connect failed");
+        return;
+    }
+
+    // Bond affinity: first acceptor to promote a group owns it. A leg that
+    // landed here but belongs to another owner is promoted anyway (so the
+    // kernel 4-tuple demux is correct), then shipped once. Not registered
+    // on this thread's poll -- the owner registers it on its own poll when
+    // the handoff arrives, so registering it here would be pure waste.
+    if let Some(group_id) = group_id {
+        let owner = {
+            let mut registry = match group_registry.lock() {
+                Ok(r) => r,
+                Err(_) => return, // poisoned: drop the leg rather than corrupt ownership
+            };
+            *registry.entry(group_id).or_insert(worker_index)
+        };
+        if owner != worker_index {
+            let message = WorkerMessage::Handoff(Box::new(Handoff {
+                socket,
+                conn: pending_conn,
+            }));
+            if senders[owner].send(message).is_err() {
+                eprintln!("[bench-mio] promote {peer}: owner {owner} channel closed");
+            } else {
+                HANDOFF_COUNT.fetch_add(1, Ordering::Relaxed);
+            }
+            return;
+        }
+    }
+
+    let token = Token(*next_token);
+    *next_token += 1;
+    if poll
+        .registry()
+        .register(&mut socket, token, Interest::READABLE)
+        .is_err()
+    {
+        return;
+    }
+    let now = Instant::now();
+    slots.push(PoolSlot {
+        conn: Conn::new(pending_conn, socket),
+        connected: true,
+        data_events: 0,
+        poisoned: false,
+        token,
+        stream_deadline: now + stream_len,
+        last_data_at: now,
+    });
+}
+
+/// Bond-affinity registry and handoff-channel semantics. The upstream
+/// restream port this was adapted from (`688f2083`) also carried a
+/// `WorkerMessage::Finished` variant and a matching drain-tolerance test
+/// for a second, unported strategy (`run_connected`, whole-listener
+/// admission -> worker-thread routing). This port only implements the
+/// single-tier reuseport strategy (`run_pool_acceptor`), whose
+/// `WorkerMessage` has no `Finished` variant, so that test has no
+/// equivalent here.
+#[cfg(test)]
+mod bond_affinity_tests {
+    use super::*;
+
+    // ---- Registry semantics (pure, no threads) -------------------------
+
+    fn registry() -> GroupRegistry {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    /// First leg to promote a group claims it: owner recorded = claimer.
+    #[test]
+    fn first_leg_claims_group() {
+        let reg = registry();
+        let mut map = reg.lock().unwrap();
+        assert_eq!(*map.entry(42).or_insert(2), 2);
+    }
+
+    /// Second leg sees the existing owner, not its own index.
+    #[test]
+    fn second_leg_sees_existing_owner() {
+        let reg = registry();
+        {
+            let mut map = reg.lock().unwrap();
+            assert_eq!(*map.entry(42).or_insert(0), 0);
+        }
+        let map = reg.lock().unwrap();
+        assert_eq!(map.get(&42), Some(&0));
+        assert_ne!(map.get(&42), Some(&1));
+    }
+
+    /// Distinct groups are independent (a leg of group A must not inherit
+    /// ownership state from group B).
+    #[test]
+    fn groups_are_independent() {
+        let reg = registry();
+        {
+            let mut map = reg.lock().unwrap();
+            assert_eq!(*map.entry(7).or_insert(1), 1);
+            assert_eq!(*map.entry(8).or_insert(3), 3);
+        }
+        let map = reg.lock().unwrap();
+        assert_eq!(map.get(&7), Some(&1));
+        assert_eq!(map.get(&8), Some(&3));
+    }
+
+    /// Same-thread short-circuit: when the leg already landed on the owner
+    /// thread, no handoff is sent (owner == worker_index).
+    #[test]
+    fn same_thread_leg_skips_handoff_decision() {
+        let reg = registry();
+        let worker_index = 3usize;
+        let owner = {
+            let mut map = reg.lock().unwrap();
+            *map.entry(99).or_insert(worker_index)
+        };
+        assert_eq!(owner, worker_index);
+    }
+
+    /// Misplaced leg resolves to a different owner.
+    #[test]
+    fn misplaced_leg_resolves_to_foreign_owner() {
+        let reg = registry();
+        {
+            let mut map = reg.lock().unwrap();
+            map.insert(5, 0);
+        }
+        let map = reg.lock().unwrap();
+        let owner = *map.get(&5).unwrap();
+        assert_ne!(owner, 2);
+    }
+
+    /// Concurrent claims from many "threads": exactly one winner per group,
+    /// and every thread observes that same winner. This is the property
+    /// the mpsc handoff correctness depends on.
+    #[test]
+    fn concurrent_claims_elect_single_owner() {
+        let reg = registry();
+        let mut handles = Vec::new();
+        for thread_index in 0..8 {
+            let reg = reg.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut map = reg.lock().unwrap();
+                *map.entry(1234).or_insert(thread_index)
+            }));
+        }
+        let mut winners = std::collections::HashSet::new();
+        for handle in handles {
+            winners.insert(handle.join().unwrap());
+        }
+        let map = reg.lock().unwrap();
+        assert_eq!(winners.len(), 1, "exactly one thread won the race");
+        assert_eq!(map.get(&1234), winners.iter().next());
+    }
+
+    // ---- Handoff message round-trip through a real channel -------------
+
+    /// A Handoff carries socket+conn intact through the mpsc channel -- the
+    /// exact transport promote_slot uses for a misplaced bond leg. Uses a
+    /// real bound+connected socket to prove the kernel accepts the
+    /// bind_reuseport -> connect sequence used at promotion time.
+    #[test]
+    fn handoff_round_trips_through_channel() {
+        let socket = {
+            let s = bind_reuseport(0).expect("bind ephemeral reuseport");
+            s.connect("127.0.0.1:1".parse::<SocketAddr>().unwrap())
+                .expect("connect");
+            s
+        };
+        let expected_peer = socket.peer_addr().expect("peer_addr");
+        let conn = SrtConnection::new_listener(ConnectionOptions::default());
+
+        let (tx, rx) = mpsc::channel::<WorkerMessage>();
+        tx.send(WorkerMessage::Handoff(Box::new(Handoff { socket, conn })))
+            .expect("send");
+
+        let WorkerMessage::Handoff(handoff) = rx.try_recv().expect("message");
+        assert_eq!(handoff.socket.peer_addr().unwrap(), expected_peer);
+        assert!(handoff.conn.peer_group_extension().is_none());
     }
 }

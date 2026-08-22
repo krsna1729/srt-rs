@@ -149,6 +149,13 @@ pub struct LossConfig {
     ///   M>K connections multiplexed across them. One readiness event on
     ///   a pooled socket serves every connection whose peer sends to it.
     pub ingress: Ingress,
+    /// Sender only: number of bonded groups to form. Connections
+    /// `2*g`/`2*g+1` for `g` in `0..bond_groups` share a group id and are
+    /// sent with a libsrt-compatible group extension (`GroupType::
+    /// Broadcast`), exercising the pool receiver's bond-affinity handoff
+    /// path. `0` disables bonding; connections beyond `2*bond_groups`
+    /// are ordinary, non-bonded connections.
+    pub bond_groups: usize,
 }
 
 /// Listener ingress topology. See [`LossConfig::ingress`].
@@ -174,6 +181,11 @@ impl LossConfig {
             // Pooled listener: connection i's port is pool socket
             // (i % K)'s bind port, so senders land on a shared socket.
             Ingress::Pool(k) if self.mode == Mode::Receiver => self.port + (i % k) as u16,
+            // Pooled sender: all K acceptors share one SO_REUSEPORT port on
+            // the receiver side, so every sender dials the same base port
+            // regardless of connection index -- there is only one port to
+            // reach, never K distinct ones.
+            Ingress::Pool(k) if self.mode == Mode::Sender && k > 1 => self.port,
             _ => self.port + i as u16,
         };
         SocketAddr::new(ip, port)
@@ -359,6 +371,8 @@ pub fn bench_config_from_args() -> LossConfig {
         },
     };
 
+    let bond_groups: usize = cli.flag_or("bond-groups", 0usize);
+
     LossConfig {
         runtime,
         mode,
@@ -369,5 +383,6 @@ pub fn bench_config_from_args() -> LossConfig {
         bitrate_bps,
         connections: cli.connections(),
         ingress,
+        bond_groups,
     }
 }
