@@ -1583,9 +1583,28 @@ impl SrtConnection {
     }
 
     fn arm_handshake_timer(&mut self) {
+        // Nominal 250 ms interval (libsrt compatible), but under massive
+        // fan-in all connections' retry timers align (thundering herd) and
+        // the listener saturates, causing handshakes to miss (seen at 1200
+        // conns, 2026-08-21). Spread each retry by +-20% to desynchronize.
+        // Total timeout (12 x 250 ms ~= 3 s) stays compatible with libsrt's
+        // SRTO_CONNTIMEO default.
+        let jitter = {
+            use std::hash::{BuildHasher, Hasher};
+            // Not cryptographic: per-connection nondeterministic PRNG via
+            // RandomState (&mut self cannot hold state).
+            let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+            hasher.write_u32(self.options.socket_id);
+            hasher.write_u32(self.handshake_retries.into());
+            hasher.write_u64(self.initial_seq.into());
+            hasher.finish()
+        };
+        let spread = (HANDSHAKE_RETRY_INTERVAL_MICROS / 5) as i64; // +-20%
+        let offset = (jitter % (2 * spread as u64 + 1)) as i64 - spread;
+        let interval = (HANDSHAKE_RETRY_INTERVAL_MICROS as i64 + offset).max(50_000) as u64;
         self.output_queue.push_back(ConnectionOutput::SetTimer {
             id: TimerId::Handshake,
-            duration_micros: HANDSHAKE_RETRY_INTERVAL_MICROS,
+            duration_micros: interval,
         });
     }
 
