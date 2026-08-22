@@ -29,6 +29,13 @@ name = "fuzz_handshake_decode"
 path = "fuzz_targets/fuzz_handshake_decode.rs"
 test = false
 
+[[bin]]
+bench = false
+doc = false
+name = "fuzz_connection_feed"
+path = "fuzz_targets/fuzz_connection_feed.rs"
+test = false
+
 [dependencies]
 libfuzzer-sys = "0.4"
 shiguredo_srt = { path = ".." }
