@@ -182,11 +182,20 @@ pub mod mio_transport {
         }
 
         /// Drain all pending outputs: send packets, manage manual timers.
-        pub fn drain_outputs(&mut self, now: Timestamp) {
+        /// Returns true if any send failed with `ConnectionRefused` (poisoned
+        /// connected socket -- Linux keeps returning the error until
+        /// reconnect).
+        pub fn drain_outputs(&mut self, now: Timestamp) -> bool {
             let socket = &self.socket;
+            let mut refused = false;
             ManualTimerStore::drain_outputs(&mut self.conn, &mut self.timers, now, |bytes| {
-                let _ = socket.send(&bytes);
+                if let Err(e) = socket.send(&bytes) {
+                    if e.kind() == std::io::ErrorKind::ConnectionRefused {
+                        refused = true;
+                    }
+                }
             });
+            refused
         }
 
         /// Compute poll timeout from next timer deadline.
@@ -201,7 +210,7 @@ pub mod mio_transport {
 
 #[cfg(feature = "tokio")]
 pub mod tokio_transport {
-    use super::{is_ready, NativeTimer};
+    use super::{NativeTimer, is_ready};
     use shiguredo_srt::{ConnectionEvent, ConnectionOutput, SrtConnection, Timestamp};
     use std::time::{Duration, Instant};
     use tokio::net::UdpSocket;
@@ -242,11 +251,8 @@ pub mod tokio_transport {
                         id: _,
                         duration_micros,
                     } => {
-                        let deadline =
-                            Instant::now() + Duration::from_micros(duration_micros);
-                        self.timer = Some(Box::pin(tokio::time::sleep_until(
-                            deadline.into(),
-                        )));
+                        let deadline = Instant::now() + Duration::from_micros(duration_micros);
+                        self.timer = Some(Box::pin(tokio::time::sleep_until(deadline.into())));
                     }
                     ConnectionOutput::ClearTimer { id: _ } => {
                         self.timer = None;
@@ -278,12 +284,7 @@ pub mod tokio_transport {
         }
 
         /// Full event-loop tick: fire timers, recv, drain, send paced.
-        pub async fn tick(
-            &mut self,
-            buf: &mut [u8],
-            payload: &[u8],
-            now: Timestamp,
-        ) -> TickResult {
+        pub async fn tick(&mut self, buf: &mut [u8], payload: &[u8], now: Timestamp) -> TickResult {
             self.fire_expired();
             self.recv_with_timeout(buf, Duration::from_micros(100), now)
                 .await;
@@ -311,7 +312,7 @@ pub mod tokio_transport {
 
 #[cfg(feature = "smol")]
 pub mod smol_transport {
-    use super::{is_ready, NativeTimer};
+    use super::{NativeTimer, is_ready};
     use shiguredo_srt::{ConnectionEvent, ConnectionOutput, SrtConnection, Timestamp};
     use std::time::Duration;
 
@@ -352,8 +353,9 @@ pub mod smol_transport {
                         duration_micros,
                     } => {
                         let d = Duration::from_micros(duration_micros);
-                        self.timer =
-                            Some(Box::pin(async move { smol::Timer::after(d).await; }));
+                        self.timer = Some(Box::pin(async move {
+                            smol::Timer::after(d).await;
+                        }));
                     }
                     ConnectionOutput::ClearTimer { id: _ } => {
                         self.timer = None;
@@ -395,12 +397,7 @@ pub mod smol_transport {
             Ok(())
         }
 
-        pub async fn tick(
-            &mut self,
-            buf: &mut [u8],
-            payload: &[u8],
-            now: Timestamp,
-        ) -> TickResult {
+        pub async fn tick(&mut self, buf: &mut [u8], payload: &[u8], now: Timestamp) -> TickResult {
             self.fire_expired();
             self.recv_with_timeout(buf, Duration::from_micros(100), now)
                 .await;
@@ -428,7 +425,7 @@ pub mod smol_transport {
 
 #[cfg(feature = "monoio")]
 pub mod monoio_transport {
-    use super::{is_ready, NativeTimer};
+    use super::{NativeTimer, is_ready};
     use shiguredo_srt::{ConnectionEvent, ConnectionOutput, SrtConnection, Timestamp};
     use std::time::Duration;
 
@@ -523,7 +520,7 @@ pub mod monoio_transport {
 
 #[cfg(feature = "glommio")]
 pub mod glommio_transport {
-    use super::{is_ready, NativeTimer};
+    use super::{NativeTimer, is_ready};
     use shiguredo_srt::{ConnectionEvent, ConnectionOutput, SrtConnection, Timestamp};
     use std::time::Duration;
 
@@ -589,8 +586,10 @@ pub mod glommio_transport {
             }
         }
 
-        pub fn try_recv(&self, buf: &mut [u8]) -> Option<std::io::Result<(usize, std::net::SocketAddr)>>
-        {
+        pub fn try_recv(
+            &self,
+            buf: &mut [u8],
+        ) -> Option<std::io::Result<(usize, std::net::SocketAddr)>> {
             match futures_lite::future::block_on(futures_lite::future::poll_once(
                 self.sock.recv_from(buf),
             )) {
@@ -609,12 +608,7 @@ pub mod glommio_transport {
             Ok(())
         }
 
-        pub async fn tick(
-            &mut self,
-            buf: &mut [u8],
-            payload: &[u8],
-            now: Timestamp,
-        ) -> TickResult {
+        pub async fn tick(&mut self, buf: &mut [u8], payload: &[u8], now: Timestamp) -> TickResult {
             self.fire_expired();
             self.recv_with_timeout(buf, Duration::from_micros(100), now)
                 .await;
@@ -642,7 +636,7 @@ pub mod glommio_transport {
 
 #[cfg(feature = "compio")]
 pub mod compio_transport {
-    use super::{is_ready, NativeTimer};
+    use super::{NativeTimer, is_ready};
     use shiguredo_srt::{ConnectionEvent, ConnectionOutput, SrtConnection, Timestamp};
     use std::time::Duration;
 

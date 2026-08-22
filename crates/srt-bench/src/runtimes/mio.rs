@@ -92,6 +92,7 @@ pub fn run(cfg: LossConfig) {
         stream_deadline: Option<Instant>,
         data_events: u64,
         peer: Option<SocketAddr>,
+        poisoned: bool,
     }
 
     let mut drivers: Vec<Driver> = Vec::with_capacity(cfg.connections);
@@ -129,13 +130,14 @@ pub fn run(cfg: LossConfig) {
             crate::Mode::Receiver => SrtConnection::new_listener(options),
         };
         let mut driver = Conn::new(conn, socket);
-        driver.drain_outputs(crate::now_ts(start));
+        let refused = driver.drain_outputs(crate::now_ts(start));
         drivers.push(Driver {
             conn: driver,
             connected: false,
             stream_deadline: None,
             data_events: 0,
             peer: None,
+            poisoned: refused,
         });
     }
 
@@ -209,12 +211,34 @@ pub fn run(cfg: LossConfig) {
                             let _ = d.conn.conn.feed_recv_buf(&buf[..n], t);
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                            d.poisoned = true;
+                            break;
+                        }
                         Err(e) => {
                             eprintln!("[bench-mio] recv error conn {}: {e}", idx);
                             break;
                         }
                     }
                 }
+            }
+        }
+        // Proactive poison clear: a connected UDP socket stays poisoned
+        // for both send and recv until reconnect. Scan all drivers every
+        // iteration (not just due ones) so handshake retransmits don't
+        // stall. The existing handshake timer (250 ms) will fire soon
+        // after reconnect and retransmit.
+        for (idx, d) in drivers.iter_mut().enumerate() {
+            if d.poisoned {
+                let dst = if let Some(peer) = d.peer {
+                    peer
+                } else if cfg.mode == crate::Mode::Sender {
+                    cfg.addr_for(idx)
+                } else {
+                    continue;
+                };
+                let _ = d.conn.socket.connect(dst);
+                d.poisoned = false;
             }
         }
 
@@ -224,16 +248,12 @@ pub fn run(cfg: LossConfig) {
         // happens at least once per TIMER_TICK, keeping 10ms timers honest).
         let t = crate::now_ts(start);
         for (idx, d) in drivers.iter_mut().enumerate() {
-            if let Some(dl) = d.stream_deadline
-                && Instant::now() >= dl
-            {
-                continue;
-            }
-
             if woke_from_timeout || touched.get(idx).copied().unwrap_or(false) {
                 d.conn.fire_expired(t);
             }
-            d.conn.drain_outputs(t);
+            if d.conn.drain_outputs(t) {
+                d.poisoned = true;
+            }
 
             while let Some(ev) = d.conn.conn.poll_event() {
                 match ev {
@@ -271,7 +291,9 @@ pub fn run(cfg: LossConfig) {
                         break;
                     }
                     d.data_events += 1;
-                    d.conn.drain_outputs(t);
+                    if d.conn.drain_outputs(t) {
+                        d.poisoned = true;
+                    }
                 }
             }
         }
