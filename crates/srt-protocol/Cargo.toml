@@ -24,7 +24,10 @@ aes-kw = "0.3"
 hmac = "0.13"
 sha1 = "0.11"
 pbkdf2 = "0.13"
-# ログ出力 (デバッグ出力を tracing-subscriber 側で制御する)
+# Hot-path hash for loss_list: SipHash is DoS-resistant but costly for
+# small integer keys; FxHash is non-cryptographic and faster (tokio
+# profile showed hash_one as #2 at 1200 conns).
+rustc-hash = "2.1"
 tracing = "0.1"
 
 [dev-dependencies]

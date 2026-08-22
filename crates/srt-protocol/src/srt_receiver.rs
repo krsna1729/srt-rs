@@ -11,7 +11,8 @@
 //! - TSBPD (Time-based Packet Delivery)
 //! - 受信レート / リンク容量の推定
 
-use std::collections::{BTreeMap, HashSet};
+use rustc_hash::FxHashSet;
+use std::collections::BTreeMap;
 
 #[cfg(test)]
 use std::cell::Cell;
@@ -291,24 +292,24 @@ pub struct ReceiverBuffer {
     /// 次に期待するシーケンス番号
     expected_seq: u32,
 
-    /// 損失リスト (検出した損失パケット)。`contains`/`insert`/`remove` は
-    /// 受信ごとのホットパスで O(1) が必要なため `HashSet` を使う (upstream
-    /// shiguredo/srt-rs issue 0055: 元々は `Vec<u32>` で `contains`/`retain`
-    /// が O(n) だった)。
-    loss_list: HashSet<u32>,
+    /// Loss list (detected missing packets). `contains`/`insert`/`remove`
+    /// are on the per-packet hot path and must be O(1), so we use
+    /// `FxHashSet` (upstream issue 0055 was Vec with O(n) retains).
+    /// SipHash DoS resistance is unnecessary cost for small integer keys;
+    /// FxHash is faster (tokio profile showed hash_one as #2 at 1200 conns).
+    loss_list: FxHashSet<u32>,
 
-    /// `loss_list` の循環順最小値のキャッシュ (upstream issue 0073)。
-    /// `find_deliverable_seq` の `has_gap` 判定は「loss_list の循環順最小値
-    /// が seq より前か」と等価なので、この値があれば全走査が要らない。
-    /// 挿入時は O(1) で更新する。削除時に削除対象がこの最小値自身だった
-    /// 場合のみ O(loss_list) で再計算する (通常は稀な遅延パケット回復時
-    /// のみ発生)。`loss_list` の要素が相互に 2^30 以上離れることはない
-    /// 前提 (`sequence_less_than` の定義上、それを超えると循環順の概念が
-    /// 破綻する -- 実運用では loss_list は常に expected_seq 付近に集中
-    /// するため問題にならない)。
+    /// Circular-order minimum cache for `loss_list` (upstream issue 0073).
+    /// `find_deliverable_seq`'s `has_gap` check ("is there a loss before
+    /// seq?") is equivalent to "is the circular minimum before seq?", so
+    /// this cache avoids a full scan. Updated O(1) on insert; recomputed
+    /// O(loss_list) only when the removed entry was the cached minimum
+    /// (rare, only on late recovery). Elements are assumed within 2^30 of
+    /// each other (otherwise circular order breaks -- in practice the list
+    // stays near expected_seq).
     loss_list_min: Option<u32>,
 
-    /// 最後に ACK 送信した時刻
+    /// Last ACK send time
     last_ack_time: Timestamp,
 
     /// 最後に ACK 送信したシーケンス番号
@@ -403,7 +404,7 @@ impl ReceiverBuffer {
             packets: BTreeMap::new(),
             delivery_seq_hint: None,
             expected_seq: initial_seq,
-            loss_list: HashSet::new(),
+            loss_list: FxHashSet::default(),
             loss_list_min: None,
             last_ack_time: start_time,
             last_ack_seq: initial_seq,
@@ -917,7 +918,7 @@ impl ReceiverBuffer {
         }
 
         if !dropped.is_empty() {
-            let dropped_set: HashSet<u32> = dropped.iter().copied().collect();
+            let dropped_set: FxHashSet<u32> = dropped.iter().copied().collect();
             while self.packets.contains_key(&self.expected_seq)
                 || dropped_set.contains(&self.expected_seq)
             {
@@ -1504,7 +1505,7 @@ mod tests {
         // 1001 を受信して 1000 が損失として登録される
         buf.receive(make_packet(1001, 200_000), now);
 
-        assert_eq!(buf.loss_list, HashSet::from([1000]));
+        assert_eq!(buf.loss_list, FxHashSet::from_iter([1000]));
 
         // TLPKTDROP = max(1.25 * 120_000, 1_000_000) = 1_000_000μs
         // 次側パケット seq 1001 の delivery_time = 500_000 + 200_000 + 120_000 = 820_000
@@ -1575,7 +1576,7 @@ mod tests {
         // now = 2_400_000: 両方超過 → 1001 が削除される
         let dropped = buf.drop_too_late(Timestamp::from_micros(2_400_000));
         assert_eq!(dropped, vec![1001]);
-        assert_eq!(buf.loss_list, HashSet::new());
+        assert_eq!(buf.loss_list, FxHashSet::default());
     }
 
     #[test]
