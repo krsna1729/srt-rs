@@ -18,7 +18,7 @@ async fn drive(cfg: LossConfig) {
         println!("LISTENING");
         if cfg.connections > 1 {
             eprintln!(
-                "[loss-smol] scale: ports {}-{}",
+                "[bench-smol] scale: ports {}-{}",
                 cfg.port,
                 cfg.port + cfg.connections as u16 - 1
             );
@@ -78,7 +78,7 @@ async fn sender_task(cfg: LossConfig, endpoint: SocketAddr, start: Instant) -> C
 
     loop {
         if !stats.connected && Instant::now() >= connect_deadline {
-            eprintln!("[loss-smol] connect timed out, state={:?}", driver.conn.state());
+            eprintln!("[bench-smol] connect timed out, state={:?}", driver.conn.state());
             break;
         }
         if let Some(d) = stream_deadline
@@ -125,11 +125,11 @@ async fn sender_task(cfg: LossConfig, endpoint: SocketAddr, start: Instant) -> C
                         Some(Instant::now() + Duration::from_secs_f64(cfg.duration_secs));
                 }
                 ConnectionEvent::Disconnected { reason } => {
-                    eprintln!("[loss-smol] disconnected: {reason}");
+                    eprintln!("[bench-smol] disconnected: {reason}");
                     stream_deadline = Some(Instant::now());
                 }
                 ConnectionEvent::Error(msg) => {
-                    eprintln!("[loss-smol] error: {msg}");
+                    eprintln!("[bench-smol] error: {msg}");
                 }
                 _ => {}
             }
@@ -175,7 +175,7 @@ async fn receiver_task(cfg: LossConfig, listen_port: u16, start: Instant) -> Con
 
     loop {
         if !stats.connected && Instant::now() >= connect_deadline {
-            eprintln!("[loss-smol] connect timed out, state={:?}", driver.conn.state());
+            eprintln!("[bench-smol] connect timed out, state={:?}", driver.conn.state());
             break;
         }
         if let Some(d) = stream_deadline
@@ -194,7 +194,7 @@ async fn receiver_task(cfg: LossConfig, listen_port: u16, start: Instant) -> Con
             };
             if let Some((n, addr)) = futures_lite::future::or(recv_fut, timer_fut).await {
                 if driver.sock.get_ref().connect(addr).is_err() {
-                    eprintln!("[loss-smol] connect to peer failed");
+                    eprintln!("[bench-smol] connect to peer failed");
                     continue;
                 }
                 peer = Some(addr);
@@ -236,11 +236,11 @@ async fn receiver_task(cfg: LossConfig, listen_port: u16, start: Instant) -> Con
                     stats.data_events += 1;
                 }
                 ConnectionEvent::Disconnected { reason } => {
-                    eprintln!("[loss-smol] disconnected: {reason}");
+                    eprintln!("[bench-smol] disconnected: {reason}");
                     stream_deadline = Some(Instant::now());
                 }
                 ConnectionEvent::Error(msg) => {
-                    eprintln!("[loss-smol] error: {msg}");
+                    eprintln!("[bench-smol] error: {msg}");
                 }
                 _ => {}
             }

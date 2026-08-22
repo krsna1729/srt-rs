@@ -27,7 +27,7 @@ async fn drive(cfg: LossConfig) {
         println!("LISTENING");
         if cfg.connections > 1 {
             eprintln!(
-                "[loss-compio] scale: ports {}-{}",
+                "[bench-compio] scale: ports {}-{}",
                 cfg.port,
                 cfg.port + cfg.connections as u16 - 1
             );
@@ -99,7 +99,7 @@ async fn sender_task(cfg: LossConfig, endpoint: SocketAddr, start: Instant) -> C
 
     loop {
         if !stats.connected && Instant::now() >= connect_deadline {
-            eprintln!("[loss-compio] connect timed out, state={:?}", driver.conn.state());
+            eprintln!("[bench-compio] connect timed out, state={:?}", driver.conn.state());
             break;
         }
         if let Some(d) = stream_deadline
@@ -138,11 +138,11 @@ async fn sender_task(cfg: LossConfig, endpoint: SocketAddr, start: Instant) -> C
                         Some(Instant::now() + Duration::from_secs_f64(cfg.duration_secs));
                 }
                 ConnectionEvent::Disconnected { reason } => {
-                    eprintln!("[loss-compio] disconnected: {reason}");
+                    eprintln!("[bench-compio] disconnected: {reason}");
                     stream_deadline = Some(Instant::now());
                 }
                 ConnectionEvent::Error(msg) => {
-                    eprintln!("[loss-compio] error: {msg}");
+                    eprintln!("[bench-compio] error: {msg}");
                 }
                 _ => {}
             }
@@ -211,7 +211,7 @@ async fn receiver_task(cfg: LossConfig, listen_port: u16, start: Instant) -> Con
 
     loop {
         if !stats.connected && Instant::now() >= connect_deadline {
-            eprintln!("[loss-compio] connect timed out, state={:?}", driver.conn.state());
+            eprintln!("[bench-compio] connect timed out, state={:?}", driver.conn.state());
             break;
         }
         if let Some(d) = stream_deadline
@@ -247,11 +247,11 @@ async fn receiver_task(cfg: LossConfig, listen_port: u16, start: Instant) -> Con
                     stats.data_events += 1;
                 }
                 ConnectionEvent::Disconnected { reason } => {
-                    eprintln!("[loss-compio] disconnected: {reason}");
+                    eprintln!("[bench-compio] disconnected: {reason}");
                     stream_deadline = Some(Instant::now());
                 }
                 ConnectionEvent::Error(msg) => {
-                    eprintln!("[loss-compio] error: {msg}");
+                    eprintln!("[bench-compio] error: {msg}");
                 }
                 _ => {}
             }

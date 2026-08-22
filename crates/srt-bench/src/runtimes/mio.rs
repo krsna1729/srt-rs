@@ -60,7 +60,7 @@ pub fn run(cfg: LossConfig) {
     }
     if cfg.connections > 1 {
         eprintln!(
-            "[loss-mio] scale: ports {}-{}",
+            "[bench-mio] scale: ports {}-{}",
             cfg.port,
             cfg.port + cfg.connections as u16 - 1
         );
@@ -129,7 +129,7 @@ pub fn run(cfg: LossConfig) {
 
     loop {
         if !drivers.iter().any(|d| d.connected) && Instant::now() >= connect_deadline {
-            eprintln!("[loss-mio] connect timed out");
+            eprintln!("[bench-mio] connect timed out");
             break;
         }
         let all_done = drivers.iter().all(|d| d.connected)
@@ -183,7 +183,7 @@ pub fn run(cfg: LossConfig) {
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                         Err(e) => {
-                            eprintln!("[loss-mio] recv error: {e}");
+                            eprintln!("[bench-mio] recv error: {e}");
                         }
                     }
                 } else {
@@ -195,7 +195,7 @@ pub fn run(cfg: LossConfig) {
                             }
                             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                             Err(e) => {
-                                eprintln!("[loss-mio] recv error conn {}: {e}", idx);
+                                eprintln!("[bench-mio] recv error conn {}: {e}", idx);
                                 break;
                             }
                         }
@@ -229,18 +229,18 @@ pub fn run(cfg: LossConfig) {
                         if cfg.verbose() {
                             println!("CONNECTED");
                         } else {
-                            eprintln!("[loss-mio] scale conn {idx} CONNECTED");
+                            eprintln!("[bench-mio] scale conn {idx} CONNECTED");
                         }
                     }
                     ConnectionEvent::DataReceived { .. } => {
                         d.data_events += 1;
                     }
                     ConnectionEvent::Disconnected { reason } => {
-                        eprintln!("[loss-mio] disconnected: {reason}");
+                        eprintln!("[bench-mio] disconnected: {reason}");
                         d.stream_deadline = Some(Instant::now());
                     }
                     ConnectionEvent::Error(msg) => {
-                        eprintln!("[loss-mio] error: {msg}");
+                        eprintln!("[bench-mio] error: {msg}");
                     }
                     _ => {}
                 }

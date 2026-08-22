@@ -1,4 +1,4 @@
-//! Unified loss/scale driver: one shared orchestration layer, one adapter
+//! Unified bench/scale driver: one shared orchestration layer, one adapter
 //! file per runtime. Loss mode and scale mode are the SAME code everywhere:
 //! loss runs one connection, scale runs N. Only the STATS schema differs.
 //!

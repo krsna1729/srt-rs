@@ -45,7 +45,7 @@ async fn drive(cfg: LossConfig) -> bool {
         println!("LISTENING");
         if cfg.connections > 1 {
             eprintln!(
-                "[loss-glommio] scale: ports {}-{}",
+                "[bench-glommio] scale: ports {}-{}",
                 cfg.port,
                 cfg.port + cfg.connections as u16 - 1
             );
@@ -99,7 +99,7 @@ async fn sender_task(cfg: LossConfig, endpoint: SocketAddr, start: Instant) -> C
 
     loop {
         if !stats.connected && Instant::now() >= connect_deadline {
-            eprintln!("[loss-glommio] connect timed out, state={:?}", driver.conn.state());
+            eprintln!("[bench-glommio] connect timed out, state={:?}", driver.conn.state());
             break;
         }
         if let Some(d) = stream_deadline
@@ -137,11 +137,11 @@ async fn sender_task(cfg: LossConfig, endpoint: SocketAddr, start: Instant) -> C
                         Some(Instant::now() + Duration::from_secs_f64(cfg.duration_secs));
                 }
                 ConnectionEvent::Disconnected { reason } => {
-                    eprintln!("[loss-glommio] disconnected: {reason}");
+                    eprintln!("[bench-glommio] disconnected: {reason}");
                     stream_deadline = Some(Instant::now());
                 }
                 ConnectionEvent::Error(msg) => {
-                    eprintln!("[loss-glommio] error: {msg}");
+                    eprintln!("[bench-glommio] error: {msg}");
                 }
                 _ => {}
             }
@@ -188,7 +188,7 @@ async fn receiver_task(cfg: LossConfig, listen_port: u16, start: Instant) -> Con
 
     loop {
         if !stats.connected && Instant::now() >= connect_deadline {
-            eprintln!("[loss-glommio] connect timed out, state={:?}", driver.conn.state());
+            eprintln!("[bench-glommio] connect timed out, state={:?}", driver.conn.state());
             break;
         }
         if let Some(d) = stream_deadline
@@ -208,7 +208,7 @@ async fn receiver_task(cfg: LossConfig, listen_port: u16, start: Instant) -> Con
         };
         if let Some((n, addr)) = futures_lite::future::or(recv_fut, timer_fut).await {
             if !handshook && driver.sock.connect(addr).await.is_err() {
-                eprintln!("[loss-glommio] connect to peer failed");
+                eprintln!("[bench-glommio] connect to peer failed");
                 continue;
             }
             handshook = true;
@@ -234,11 +234,11 @@ async fn receiver_task(cfg: LossConfig, listen_port: u16, start: Instant) -> Con
                     stats.data_events += 1;
                 }
                 ConnectionEvent::Disconnected { reason } => {
-                    eprintln!("[loss-glommio] disconnected: {reason}");
+                    eprintln!("[bench-glommio] disconnected: {reason}");
                     stream_deadline = Some(Instant::now());
                 }
                 ConnectionEvent::Error(msg) => {
-                    eprintln!("[loss-glommio] error: {msg}");
+                    eprintln!("[bench-glommio] error: {msg}");
                 }
                 _ => {}
             }

@@ -1,5 +1,5 @@
 //! Framework-agnostic process CPU/memory accounting, shared by every
-//! loss-caller/loss-listener backend (mio/tokio/smol/monoio/glommio/compio)
+//! bench-caller/bench-listener backend (mio/tokio/smol/monoio/glommio/compio)
 //! so their STATS lines are directly comparable on resource cost, not just
 //! throughput/RTT -- the docs/srt-pure-rust-plan.md Phase 4
 //! driver-framework bake-off is judged on latency introduced, throughput,

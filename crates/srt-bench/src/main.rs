@@ -1,4 +1,4 @@
-//! Unified loss/scale driver over the pure-Rust SRT Core.
+//! Unified bench/scale driver over the pure-Rust SRT Core.
 //!
 //! One binary for all six runtime backends and both roles. Loss mode
 //! (connections=1) and scale mode (connections=N) are the same code path
@@ -15,6 +15,6 @@ fn main() {
         .with_writer(std::io::stderr)
         .init();
 
-    let cfg = srt_bench::loss_config_from_args();
+    let cfg = srt_bench::bench_config_from_args();
     srt_bench::runtimes::run(cfg);
 }

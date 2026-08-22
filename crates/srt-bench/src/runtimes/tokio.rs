@@ -21,7 +21,7 @@ async fn drive(cfg: LossConfig) {
         println!("LISTENING");
         if cfg.connections > 1 {
             eprintln!(
-                "[loss-tokio] scale: ports {}-{}",
+                "[bench-tokio] scale: ports {}-{}",
                 cfg.port,
                 cfg.port + cfg.connections as u16 - 1
             );
@@ -78,7 +78,7 @@ async fn sender_task(cfg: LossConfig, endpoint: std::net::SocketAddr, start: Ins
 
     loop {
         if !stats.connected && Instant::now() >= connect_deadline {
-            eprintln!("[loss-tokio] connect timed out, state={:?}", driver.conn.state());
+            eprintln!("[bench-tokio] connect timed out, state={:?}", driver.conn.state());
             break;
         }
         if let Some(d) = stream_deadline
@@ -132,11 +132,11 @@ async fn sender_task(cfg: LossConfig, endpoint: std::net::SocketAddr, start: Ins
                         Some(Instant::now() + Duration::from_secs_f64(cfg.duration_secs));
                 }
                 ConnectionEvent::Disconnected { reason } => {
-                    eprintln!("[loss-tokio] disconnected: {reason}");
+                    eprintln!("[bench-tokio] disconnected: {reason}");
                     stream_deadline = Some(Instant::now());
                 }
                 ConnectionEvent::Error(msg) => {
-                    eprintln!("[loss-tokio] error: {msg}");
+                    eprintln!("[bench-tokio] error: {msg}");
                 }
                 _ => {}
             }
@@ -186,7 +186,7 @@ async fn receiver_task(cfg: LossConfig, listen_port: u16, start: Instant) -> Con
 
     loop {
         if !stats.connected && Instant::now() >= connect_deadline {
-            eprintln!("[loss-tokio] connect timed out, state={:?}", driver.conn.state());
+            eprintln!("[bench-tokio] connect timed out, state={:?}", driver.conn.state());
             break;
         }
         if let Some(d) = stream_deadline
@@ -202,7 +202,7 @@ async fn receiver_task(cfg: LossConfig, listen_port: u16, start: Instant) -> Con
                 tokio::time::timeout(crate::MAX_WAIT, driver.sock.recv_from(&mut buf)).await
             {
                 if let Err(e) = driver.sock.connect(addr).await {
-                    eprintln!("[loss-tokio] connect to peer failed: {e}");
+                    eprintln!("[bench-tokio] connect to peer failed: {e}");
                     continue;
                 }
                 peer = Some(addr);
@@ -249,11 +249,11 @@ async fn receiver_task(cfg: LossConfig, listen_port: u16, start: Instant) -> Con
                     stats.data_events += 1;
                 }
                 ConnectionEvent::Disconnected { reason } => {
-                    eprintln!("[loss-tokio] disconnected: {reason}");
+                    eprintln!("[bench-tokio] disconnected: {reason}");
                     stream_deadline = Some(Instant::now());
                 }
                 ConnectionEvent::Error(msg) => {
-                    eprintln!("[loss-tokio] error: {msg}");
+                    eprintln!("[bench-tokio] error: {msg}");
                 }
                 _ => {}
             }

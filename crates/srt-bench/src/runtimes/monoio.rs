@@ -27,7 +27,7 @@ async fn drive(cfg: LossConfig) {
         println!("LISTENING");
         if cfg.connections > 1 {
             eprintln!(
-                "[loss-monoio] scale: ports {}-{}",
+                "[bench-monoio] scale: ports {}-{}",
                 cfg.port,
                 cfg.port + cfg.connections as u16 - 1
             );
@@ -82,7 +82,7 @@ async fn sender_task(cfg: LossConfig, endpoint: SocketAddr, start: Instant) -> C
 
     loop {
         if !stats.connected && Instant::now() >= connect_deadline {
-            eprintln!("[loss-monoio] connect timed out, state={:?}", driver.conn.state());
+            eprintln!("[bench-monoio] connect timed out, state={:?}", driver.conn.state());
             break;
         }
         if let Some(d) = stream_deadline
@@ -123,11 +123,11 @@ async fn sender_task(cfg: LossConfig, endpoint: SocketAddr, start: Instant) -> C
                         Some(Instant::now() + Duration::from_secs_f64(cfg.duration_secs));
                 }
                 ConnectionEvent::Disconnected { reason } => {
-                    eprintln!("[loss-monoio] disconnected: {reason}");
+                    eprintln!("[bench-monoio] disconnected: {reason}");
                     stream_deadline = Some(Instant::now());
                 }
                 ConnectionEvent::Error(msg) => {
-                    eprintln!("[loss-monoio] error: {msg}");
+                    eprintln!("[bench-monoio] error: {msg}");
                 }
                 _ => {}
             }
@@ -172,7 +172,7 @@ async fn receiver_task(cfg: LossConfig, listen_port: u16, start: Instant) -> Con
 
     loop {
         if !stats.connected && Instant::now() >= connect_deadline {
-            eprintln!("[loss-monoio] connect timed out, state={:?}", driver.conn.state());
+            eprintln!("[bench-monoio] connect timed out, state={:?}", driver.conn.state());
             break;
         }
         if let Some(d) = stream_deadline
@@ -190,7 +190,7 @@ async fn receiver_task(cfg: LossConfig, listen_port: u16, start: Instant) -> Con
         {
             if peer.is_none() {
                 if let Err(e) = driver.sock.connect(addr).await {
-                    eprintln!("[loss-monoio] connect to peer failed: {e}");
+                    eprintln!("[bench-monoio] connect to peer failed: {e}");
                 } else {
                     peer = Some(addr);
                 }
@@ -217,11 +217,11 @@ async fn receiver_task(cfg: LossConfig, listen_port: u16, start: Instant) -> Con
                     stats.data_events += 1;
                 }
                 ConnectionEvent::Disconnected { reason } => {
-                    eprintln!("[loss-monoio] disconnected: {reason}");
+                    eprintln!("[bench-monoio] disconnected: {reason}");
                     stream_deadline = Some(Instant::now());
                 }
                 ConnectionEvent::Error(msg) => {
-                    eprintln!("[loss-monoio] error: {msg}");
+                    eprintln!("[bench-monoio] error: {msg}");
                 }
                 _ => {}
             }

@@ -1,4 +1,4 @@
-//! Shared helpers for the srt-bench loss-caller/loss-listener binaries.
+//! Shared helpers for the srt-bench bench-caller/bench-listener binaries.
 
 pub mod cpu_stats;
 pub mod driver;
@@ -6,7 +6,7 @@ pub mod runtimes;
 
 pub const INTEROP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-// --- Shared constants across all loss-caller/loss-listener binaries ---
+// --- Shared constants across all bench-caller/bench-listener binaries ---
 
 pub const PAYLOAD_SIZE: usize = 1316;
 pub const DEFAULT_BITRATE_BPS: u64 = 8_000_000;
@@ -83,7 +83,7 @@ impl Cli {
 }
 
 // ---------------------------------------------------------------------------
-// Unified loss/scale driver configuration + stats (shared by all runtimes)
+// Unified bench/scale driver configuration + stats (shared by all runtimes)
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -127,7 +127,7 @@ pub enum Mode {
     Receiver,
 }
 
-/// Fully-parsed configuration for one loss/scale process invocation.
+/// Fully-parsed configuration for one bench process invocation.
 #[derive(Clone, Debug)]
 pub struct LossConfig {
     pub runtime: Runtime,
@@ -141,6 +141,21 @@ pub struct LossConfig {
     pub latency_ms: u16,
     pub bitrate_bps: u64,
     pub connections: usize,
+    /// Listener ingress topology (receiver only).
+    ///
+    /// - `per-port`: today's default -- each connection owns a UDP socket
+    ///   on its own port; N sockets, N wakeups.
+    /// - `pool K`: K UDP sockets, round-robin over connection ports;
+    ///   M>K connections multiplexed across them. One readiness event on
+    ///   a pooled socket serves every connection whose peer sends to it.
+    pub ingress: Ingress,
+}
+
+/// Listener ingress topology. See [`LossConfig::ingress`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ingress {
+    PerPort,
+    Pool(usize),
 }
 
 impl LossConfig {
@@ -155,11 +170,17 @@ impl LossConfig {
             }),
             Mode::Receiver => IpAddr::from([0, 0, 0, 0]),
         };
-        SocketAddr::new(ip, self.port + i as u16)
+        let port = match self.ingress {
+            // Pooled listener: connection i's port is pool socket
+            // (i % K)'s bind port, so senders land on a shared socket.
+            Ingress::Pool(k) if self.mode == Mode::Receiver => self.port + (i % k) as u16,
+            _ => self.port + i as u16,
+        };
+        SocketAddr::new(ip, port)
     }
 
     pub fn verbose(&self) -> bool {
-        self.connections == 1
+        self.connections == 1 && self.ingress == Ingress::PerPort
     }
 }
 
@@ -274,7 +295,7 @@ impl Aggregate {
 }
 
 /// Parse the unified CLI into a LossConfig, exiting on bad usage.
-pub fn loss_config_from_args() -> LossConfig {
+pub fn bench_config_from_args() -> LossConfig {
     fn usage() -> ! {
         eprintln!(
             "usage: srt-bench runtime=<mio|tokio|smol|monoio|glommio|compio> \
@@ -325,6 +346,19 @@ pub fn loss_config_from_args() -> LossConfig {
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_BITRATE_BPS);
 
+    let ingress = match cli.flags.get("ingress").map(String::as_str) {
+        None | Some("per-port") => Ingress::PerPort,
+        Some(pool) => match pool.strip_prefix("pool=").unwrap_or("").parse::<usize>() {
+            Ok(0) | Err(_) => {
+                eprintln!("error: pool size must be a positive integer (got '{pool}')");
+                usage()
+            }
+            // Cap pool size at the connection count; more sockets than
+            // connections is just per-port with extra bookkeeping.
+            Ok(k) => Ingress::Pool(k.min(4096)),
+        },
+    };
+
     LossConfig {
         runtime,
         mode,
@@ -334,5 +368,6 @@ pub fn loss_config_from_args() -> LossConfig {
         latency_ms,
         bitrate_bps,
         connections: cli.connections(),
+        ingress,
     }
 }

@@ -125,7 +125,7 @@ pub fn run(
     }
 }
 
-/// Exposed so long-running drivers (e.g. the loss-caller/loss-listener
+/// Exposed so long-running drivers (e.g. the bench-caller/bench-listener
 /// sustained-throughput binaries) can reuse the same output-pumping logic
 /// instead of duplicating it.
 pub fn drain_outputs(
