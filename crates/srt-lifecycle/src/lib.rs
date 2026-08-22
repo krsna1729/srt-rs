@@ -295,3 +295,145 @@ mod tests {
         assert!(identity.group.is_none());
     }
 }
+
+/// `WorkerRouter` invariants, checked against random sequences of
+/// assign/release ops rather than fixed scenarios. The property under test
+/// throughout is the crate's whole reason to exist: once a logical group
+/// has an owner, every physical leg of that group must land on the same
+/// worker, no matter the interleaving of assigns and releases across other
+/// keys and groups.
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+    use shiguredo_srt::GroupType;
+    use std::collections::{HashMap, HashSet};
+
+    fn affinity(group_id: u8) -> GroupAffinity {
+        GroupAffinity {
+            group_id: group_id as u32,
+            stream_id: None,
+            extension: GroupExtensionData {
+                group_id: group_id as u32,
+                group_type: GroupType::Broadcast,
+                flags: 0,
+                weight: 0,
+            },
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    enum Op {
+        Assign {
+            key: u8,
+            group_id: Option<u8>,
+            round_robin: bool,
+        },
+        Release {
+            key: u8,
+        },
+    }
+
+    fn op_strategy() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            (0u8..6, proptest::option::of(0u8..3), any::<bool>()).prop_map(
+                |(key, group_id, round_robin)| Op::Assign {
+                    key,
+                    group_id,
+                    round_robin,
+                }
+            ),
+            (0u8..6).prop_map(|key| Op::Release { key }),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn worker_router_upholds_invariants(
+            ops in proptest::collection::vec(op_strategy(), 1..200),
+            worker_count in 1usize..5,
+        ) {
+            let mut router: WorkerRouter<u8> = WorkerRouter::new(worker_count);
+            // Shadow model, checked against the router's own counters at
+            // the end and used to compute the expected outcome of each op
+            // as we go.
+            let mut tuple_worker: HashMap<u8, usize> = HashMap::new();
+            let mut tuple_group: HashMap<u8, u8> = HashMap::new();
+            let mut group_worker: HashMap<u8, usize> = HashMap::new();
+            let mut group_members: HashMap<u8, HashSet<u8>> = HashMap::new();
+
+            for op in ops {
+                match op {
+                    Op::Assign { key, group_id, round_robin } => {
+                        let mode = if round_robin {
+                            RoutingMode::RoundRobin
+                        } else {
+                            RoutingMode::LeastTuples
+                        };
+                        let worker = router.assign(key, group_id.map(affinity), mode);
+                        prop_assert!(worker < worker_count);
+
+                        let is_new_tuple = !tuple_worker.contains_key(&key);
+                        if is_new_tuple {
+                            // New tuple joining an already-owned group must
+                            // land on that group's existing owner, never a
+                            // freshly scheduled worker.
+                            if let Some(gid) = group_id
+                                && let Some(&owner) = group_worker.get(&gid)
+                            {
+                                prop_assert_eq!(worker, owner);
+                            }
+                            tuple_worker.insert(key, worker);
+                        } else {
+                            // An already-owned tuple's worker never moves,
+                            // regardless of what group (if any) is passed
+                            // on a later assign for the same key.
+                            prop_assert_eq!(worker, tuple_worker[&key]);
+                        }
+
+                        // First time this key is associated with a group
+                        // (mirrors `register_group`'s own idempotency
+                        // guard): record it.
+                        if let Some(gid) = group_id
+                            && !tuple_group.contains_key(&key)
+                        {
+                            group_worker.entry(gid).or_insert(worker);
+                            tuple_group.insert(key, gid);
+                            group_members.entry(gid).or_default().insert(key);
+                        }
+                    }
+                    Op::Release { key } => {
+                        let existed = tuple_worker.remove(&key).is_some();
+                        let released_group = router.release(&key);
+
+                        if !existed {
+                            prop_assert_eq!(released_group, None);
+                            continue;
+                        }
+                        match tuple_group.remove(&key) {
+                            None => prop_assert_eq!(released_group, None),
+                            Some(gid) => {
+                                let now_empty = {
+                                    let members =
+                                        group_members.get_mut(&gid).expect("group was tracked");
+                                    members.remove(&key);
+                                    members.is_empty()
+                                };
+                                if now_empty {
+                                    group_members.remove(&gid);
+                                    group_worker.remove(&gid);
+                                    prop_assert!(released_group.is_some());
+                                } else {
+                                    prop_assert_eq!(released_group, None);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            prop_assert_eq!(router.active_tuple_count(), tuple_worker.len());
+            prop_assert_eq!(router.active_group_count(), group_worker.len());
+        }
+    }
+}

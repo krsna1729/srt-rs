@@ -10,5 +10,8 @@ description = "Runtime-neutral SRT admission, affinity, and ownership policy"
 [dependencies]
 shiguredo_srt = { path = "../srt-protocol" }
 
+[dev-dependencies]
+proptest = "1.11"
+
 [lints.rust]
 unsafe_code = "forbid"
