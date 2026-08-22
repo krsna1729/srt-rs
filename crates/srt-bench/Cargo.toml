@@ -3,6 +3,7 @@ name = "srt-bench"
 version = "0.0.0"
 edition = "2024"
 publish = false
+license = "Apache-2.0"
 description = "Standalone caller/listener binaries over srt-protocol + std, for interop tests without linking an application crate or libsrt. See docs/srt-pure-rust-plan.md."
 
 [dependencies]
