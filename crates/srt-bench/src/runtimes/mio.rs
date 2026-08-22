@@ -190,21 +190,36 @@ pub fn run(cfg: LossConfig) {
     }
     // Single-port fan-in via SO_REUSEPORT + kernel sharding. This is the
     // production-like case (one SRT listener port, many callers) where a
-    // single acceptor saturates at ~1200 concurrent handshakes. Pool(K)
-    // creates K acceptor sockets on the base port, each in its own thread,
-    // with a shared GroupRegistry for bond affinity (first leg to promote
-    // claims the group; later legs hand off via mpsc once, never per-packet).
-    if cfg.mode == crate::Mode::Receiver {
-        if let crate::Ingress::Pool(k) = cfg.ingress {
-            if k > 1 && cfg.connections > 1 {
+    // single acceptor saturates at ~1200 concurrent handshakes.
+    // ReuseportMulti(K) creates K acceptor sockets on the base port, each
+    // in its own thread, with a shared GroupRegistry for bond affinity
+    // (first leg to promote claims the group; later legs hand off via
+    // mpsc once, never per-packet).
+    if cfg.mode == crate::Mode::Receiver && cfg.connections > 1 {
+        match cfg.ingress {
+            crate::Ingress::ReuseportMulti(k) if k > 1 => {
                 return run_pool_receiver(cfg, k);
             }
+            crate::Ingress::SharedPool(k) if k > 1 => {
+                return run_shared_pool(cfg, k);
+            }
+            _ => {}
         }
     }
     if cfg.connections > 1 {
         match cfg.ingress {
-            crate::Ingress::Pool(k) if cfg.mode == crate::Mode::Sender && k > 1 => {
-                eprintln!("[bench-mio] scale: single port {} (pool={k})", cfg.port);
+            crate::Ingress::ReuseportMulti(k) if cfg.mode == crate::Mode::Sender && k > 1 => {
+                eprintln!(
+                    "[bench-mio] scale: single port {} (reuseport-multi={k})",
+                    cfg.port
+                );
+            }
+            crate::Ingress::SharedPool(k) if cfg.mode == crate::Mode::Sender && k > 1 => {
+                eprintln!(
+                    "[bench-mio] scale: shared-pool ports {}-{}",
+                    cfg.port,
+                    cfg.port + k as u16 - 1
+                );
             }
             _ => {
                 eprintln!(
@@ -244,22 +259,29 @@ pub fn run(cfg: LossConfig) {
             .register(&mut socket, Token(i), Interest::READABLE)
             .expect("register socket");
 
-        // Bond exercise: connections 2g/2g+1 (for g in 0..bond_groups) share
-        // a group id, proving the pool receiver's registry/handoff path
-        // actually fires in a run instead of sitting dead. Sender-only --
-        // the listener learns the group from the caller's handshake
-        // extension (`peer_group_extension`).
-        let group_extension =
-            if cfg.mode == crate::Mode::Sender && cfg.bond_groups > 0 && i < cfg.bond_groups * 2 {
-                Some(GroupExtensionData {
-                    group_id: SRTGROUP_MASK | ((i / 2) as u32 + 1),
-                    group_type: GroupType::Broadcast,
-                    flags: 0,
-                    weight: 0,
-                })
-            } else {
-                None
+        // Bond exercise: connections 2g/2g+1 (for g in 0..bond_pairs) share
+        // a group id, proving the reuseport receiver's registry/handoff
+        // path actually fires in a run instead of sitting dead.
+        // Sender-only -- the listener learns the group (and its type)
+        // from the caller's handshake extension (`peer_group_extension`).
+        let group_extension = if cfg.mode == crate::Mode::Sender
+            && cfg.bond_mode != crate::BondMode::None
+            && i < cfg.bond_pairs * 2
+        {
+            let group_type = match cfg.bond_mode {
+                crate::BondMode::Broadcast => GroupType::Broadcast,
+                crate::BondMode::Backup => GroupType::Backup,
+                crate::BondMode::None => unreachable!("checked above"),
             };
+            Some(GroupExtensionData {
+                group_id: SRTGROUP_MASK | ((i / 2) as u32 + 1),
+                group_type,
+                flags: 0,
+                weight: 0,
+            })
+        } else {
+            None
+        };
         let options = ConnectionOptions {
             socket_id: std::process::id(),
             tsbpd_delay: cfg.latency_ms,
@@ -484,6 +506,164 @@ pub fn run(cfg: LossConfig) {
     }
 }
 
+/// #2 -- shared pool, no promotion: K real, distinct, plainly-bound
+/// listener ports (no SO_REUSEPORT). Every one stays unconnected for its
+/// whole life; connections `i` and `i+K`, `i+2K`, ... share socket `i % K`
+/// and are distinguished purely by peer address (`recv_from` + a
+/// `SocketAddr -> connection` lookup, `send_to` for output). Single
+/// thread, no promotion step -- this isolates "fewer wakeups from fewer
+/// sockets" from `ReuseportMulti`'s "kernel-level demux after a one-time
+/// promotion cost." Receiver-only: a sender just dials the port
+/// `addr_for` already computes for it and otherwise behaves exactly like
+/// `PerPort` (own local socket per connection, connected to one peer).
+fn run_shared_pool(cfg: LossConfig, k: usize) {
+    let start = Instant::now();
+    let mut poll = Poll::new().expect("mio Poll::new");
+    let mut events = Events::with_capacity(1024);
+
+    let mut sockets: Vec<UdpSocket> = Vec::with_capacity(k);
+    for s in 0..k {
+        let addr = SocketAddr::new(std::net::IpAddr::from([0, 0, 0, 0]), cfg.port + s as u16);
+        let mut socket = UdpSocket::bind(addr).expect("bind shared-pool socket");
+        let _ = set_sock_bufs(socket.as_raw_fd());
+        poll.registry()
+            .register(&mut socket, Token(s), Interest::READABLE)
+            .expect("register shared-pool socket");
+        sockets.push(socket);
+    }
+
+    struct SharedConn {
+        conn: SrtConnection,
+        timers: srt_transport::ManualTimerStore,
+        connected: bool,
+        data_events: u64,
+        peer: SocketAddr,
+        socket_idx: usize,
+        /// `None` until the first `Connected` event; doubles as "has this
+        /// ever connected" so a still-handshaking entry (which is not
+        /// terminal) is distinguishable from a disconnected one (which
+        /// is), without a separate pending/established split.
+        stream_deadline: Option<Instant>,
+        last_data_at: Instant,
+    }
+
+    fn is_terminal(c: &SharedConn, now: Instant, connect_deadline: Instant) -> bool {
+        match c.stream_deadline {
+            Some(deadline) => {
+                !c.connected
+                    || now >= deadline
+                    || now.saturating_duration_since(c.last_data_at) >= IDLE_GRACE
+            }
+            // Never connected: keep waiting until the shared connect
+            // window closes, exactly like an unresolved pending
+            // handshake elsewhere in this file.
+            None => now >= connect_deadline,
+        }
+    }
+
+    let mut conns: HashMap<SocketAddr, SharedConn> = HashMap::new();
+    let connect_deadline = Instant::now() + crate::INTEROP_CONNECT_TIMEOUT;
+    let stream_len = Duration::from_secs_f64(cfg.duration_secs);
+    let run_deadline = Instant::now() + stream_len + IDLE_GRACE + Duration::from_secs(30);
+    let mut buf = [0u8; 2048];
+
+    loop {
+        let now = Instant::now();
+        if now >= run_deadline {
+            break;
+        }
+        if now >= connect_deadline
+            && conns
+                .values()
+                .all(|c| is_terminal(c, now, connect_deadline))
+        {
+            break;
+        }
+        poll.poll(&mut events, Some(TIMER_TICK)).ok();
+
+        for event in events.iter() {
+            let socket_idx = event.token().0;
+            let Some(socket) = sockets.get(socket_idx) else {
+                continue;
+            };
+            loop {
+                match socket.recv_from(&mut buf) {
+                    Ok((n, peer)) => {
+                        let t = crate::now_ts(start);
+                        let entry = conns.entry(peer).or_insert_with(|| SharedConn {
+                            conn: SrtConnection::new_listener(ConnectionOptions {
+                                socket_id: std::process::id(),
+                                tsbpd_delay: cfg.latency_ms,
+                                ..Default::default()
+                            }),
+                            timers: srt_transport::ManualTimerStore::new(),
+                            connected: false,
+                            data_events: 0,
+                            peer,
+                            socket_idx,
+                            stream_deadline: None,
+                            last_data_at: Instant::now(),
+                        });
+                        let _ = entry.conn.feed_recv_buf(&buf[..n], t);
+                        entry.data_events += 1;
+                        entry.last_data_at = Instant::now();
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+        }
+
+        let t = crate::now_ts(start);
+        for conn in conns.values_mut() {
+            conn.timers.fire_expired(t, &mut conn.conn);
+            let socket = &sockets[conn.socket_idx];
+            while let Some(out) = conn.conn.poll_output() {
+                match out {
+                    shiguredo_srt::ConnectionOutput::SendPacket(bytes) => {
+                        let _ = socket.send_to(&bytes, conn.peer);
+                    }
+                    other => conn.timers.apply_output(&other, t),
+                }
+            }
+            while let Some(ev) = conn.conn.poll_event() {
+                match ev {
+                    ConnectionEvent::Connected => {
+                        conn.connected = true;
+                        conn.stream_deadline = Some(Instant::now() + stream_len);
+                    }
+                    ConnectionEvent::Disconnected { .. } => {
+                        conn.connected = false;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let mut agg = Aggregate::new(cfg.clone());
+    for conn in conns.into_values() {
+        let mut s = ConnStats {
+            connected: conn.connected,
+            data_events: conn.data_events,
+            ..Default::default()
+        };
+        if let Some(st) = conn.conn.receiver_stats() {
+            s.has_stats = true;
+            s.core_total = st.total_received;
+            s.secondary_a = st.total_lost;
+            s.secondary_b = st.total_duplicates;
+            s.rtt_us = st.rtt as u64;
+        }
+        agg.add(s);
+    }
+    agg.print(start);
+    if !agg.any_connected {
+        eprintln!("[bench-mio] shared pool admitted no connections");
+        std::process::exit(1);
+    }
+}
+
 /// One accepted connection on an acceptor thread: dedicated socket
 /// connected to the peer's exact tuple + protocol state.
 struct PoolSlot {
@@ -624,11 +804,12 @@ fn run_pool_receiver(cfg: LossConfig, k: usize) {
             agg.add(stats);
         }
     }
-    if cfg.bond_groups > 0 {
-        eprintln!(
-            "[bench-mio] pool receiver: {} bond handoffs",
-            HANDOFF_COUNT.load(Ordering::Relaxed)
-        );
+    // Always report, not gated on the receiver's own --bond (bonding is a
+    // sender-side choice; the receiver learns it from the handshake) --
+    // a nonzero count is the proof the handoff path fired at all.
+    let handoffs = HANDOFF_COUNT.load(Ordering::Relaxed);
+    if handoffs > 0 {
+        eprintln!("[bench-mio] pool receiver: {handoffs} bond handoffs");
     }
     agg.print(start);
     if !agg.any_connected {

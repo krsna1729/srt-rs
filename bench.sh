@@ -91,10 +91,13 @@ pick_port() {
 # Spawns receiver+sender for one cell; echoes both STATS lines to stdout.
 #
 # Env knobs (both apply to receiver AND sender -- the sender needs to know
-# the ingress topology too, since a pooled sender dials the single shared
-# port instead of one port per connection):
-#   INGRESS=pool=K    multi-acceptor SO_REUSEPORT listener, K threads
-#   BOND_GROUPS=G     connections 2g/2g+1 share a bond group, for g in 0..G
+# the ingress topology too, since a pooled/reuseport sender dials the
+# shared port(s) instead of one port per connection):
+#   INGRESS=shared-pool=K       #2: K real ports, no promotion
+#   INGRESS=reuseport-multi=K  #4: K acceptor threads share one port
+#   INGRESS=reuseport-single=W #3: 1 acceptor, W dedicated worker threads
+#   BOND=broadcast:G | backup:G   connections 2g/2g+1 share a bond group,
+#                                  for g in 0..G, of the given group type
 run_pair() {
   local runtime=$1 port=$2 n=$3 secs=$4 head_start=$5 out=$6
   LISTENER_OUT="$SCRATCH_DIR/${out}_listener.out"
@@ -104,8 +107,8 @@ run_pair() {
   if [[ -n "${INGRESS:-}" ]]; then
     extra_args+=(--ingress="$INGRESS")
   fi
-  if [[ -n "${BOND_GROUPS:-}" ]]; then
-    extra_args+=(--bond-groups="$BOND_GROUPS")
+  if [[ -n "${BOND:-}" ]]; then
+    extra_args+=(--bond="$BOND")
   fi
 
   # shellcheck disable=SC2086  # intentional word split of arithmetic

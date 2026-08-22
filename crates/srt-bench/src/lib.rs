@@ -141,28 +141,55 @@ pub struct LossConfig {
     pub latency_ms: u16,
     pub bitrate_bps: u64,
     pub connections: usize,
-    /// Listener ingress topology (receiver only).
+    /// Listener ingress topology.
     ///
-    /// - `per-port`: today's default -- each connection owns a UDP socket
+    /// - `PerPort`: today's default -- each connection owns a UDP socket
     ///   on its own port; N sockets, N wakeups.
-    /// - `pool K`: K UDP sockets, round-robin over connection ports;
-    ///   M>K connections multiplexed across them. One readiness event on
-    ///   a pooled socket serves every connection whose peer sends to it.
+    /// - `SharedPool(K)`: K real, distinct, plainly-bound ports; each
+    ///   socket stays unconnected and serves multiple peers for their
+    ///   entire connection lifetime via `recv_from` + a peer-address
+    ///   lookup. No SO_REUSEPORT, no promotion -- isolates the benefit of
+    ///   fewer wakeups from the benefit of kernel-level demux (that's
+    ///   `ReuseportMulti`'s job). Single-threaded.
+    /// - `ReuseportMulti(K)`: one shared port via SO_REUSEPORT. K acceptor
+    ///   threads each admit their kernel-hash-routed share of flows in
+    ///   parallel, then promote each connection to its own connected
+    ///   socket (kernel demux follows the exact 4-tuple thereafter).
+    ///   Acceptor and steady-state worker are the same thread; a bonded
+    ///   leg landing on a non-owner thread is shipped once via MPSC.
+    /// - `ReuseportSingle { workers }`: one shared port via SO_REUSEPORT,
+    ///   but only ONE acceptor thread, which admits and promotes every
+    ///   connection then routes it once to one of `workers` dedicated
+    ///   steady-state threads via SPSC. Unlike `ReuseportMulti`, admission
+    ///   and steady-state work are on different threads even in the
+    ///   common (non-bonded) case.
     pub ingress: Ingress,
-    /// Sender only: number of bonded groups to form. Connections
-    /// `2*g`/`2*g+1` for `g` in `0..bond_groups` share a group id and are
-    /// sent with a libsrt-compatible group extension (`GroupType::
-    /// Broadcast`), exercising the pool receiver's bond-affinity handoff
-    /// path. `0` disables bonding; connections beyond `2*bond_groups`
-    /// are ordinary, non-bonded connections.
-    pub bond_groups: usize,
+    /// Sender only. `BondMode::None`: no bonding, every connection is
+    /// independent. Otherwise: connections `2*g`/`2*g+1` for `g` in
+    /// `0..bond_pairs` share a group id and are sent with a
+    /// libsrt-compatible group extension of this type, exercising a
+    /// reuseport receiver's bond-affinity handoff path. Connections at or
+    /// beyond `2*bond_pairs` are ordinary, unbonded connections.
+    pub bond_mode: BondMode,
+    pub bond_pairs: usize,
 }
 
 /// Listener ingress topology. See [`LossConfig::ingress`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ingress {
     PerPort,
-    Pool(usize),
+    SharedPool(usize),
+    ReuseportMulti(usize),
+    ReuseportSingle { workers: usize },
+}
+
+/// Bond group type to advertise in the sender's handshake extension. See
+/// [`LossConfig::bond_mode`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BondMode {
+    None,
+    Broadcast,
+    Backup,
 }
 
 impl LossConfig {
@@ -170,22 +197,20 @@ impl LossConfig {
     pub fn addr_for(&self, i: usize) -> std::net::SocketAddr {
         use std::net::{IpAddr, SocketAddr};
         let ip: IpAddr = match self.mode {
-            Mode::Sender => self.host.parse().unwrap_or_else(|_| {
-                format!("{host}", host = self.host)
-                    .parse()
-                    .unwrap_or(IpAddr::from([127, 0, 0, 1]))
-            }),
+            Mode::Sender => self.host.parse().unwrap_or(IpAddr::from([127, 0, 0, 1])),
             Mode::Receiver => IpAddr::from([0, 0, 0, 0]),
         };
         let port = match self.ingress {
-            // Pooled listener: connection i's port is pool socket
-            // (i % K)'s bind port, so senders land on a shared socket.
-            Ingress::Pool(k) if self.mode == Mode::Receiver => self.port + (i % k) as u16,
-            // Pooled sender: all K acceptors share one SO_REUSEPORT port on
-            // the receiver side, so every sender dials the same base port
-            // regardless of connection index -- there is only one port to
-            // reach, never K distinct ones.
-            Ingress::Pool(k) if self.mode == Mode::Sender && k > 1 => self.port,
+            // K distinct ports: the same formula on both sides, since
+            // sender and receiver must independently compute the same
+            // port for connection i to ever meet.
+            Ingress::SharedPool(k) if k > 1 => self.port + (i % k) as u16,
+            // One shared port: every connection, sender or receiver,
+            // reaches/binds the single base port -- SO_REUSEPORT plus the
+            // kernel hash fan the flows out on the receiver side, not the
+            // address.
+            Ingress::ReuseportMulti(k) if k > 1 => self.port,
+            Ingress::ReuseportSingle { .. } => self.port,
             _ => self.port + i as u16,
         };
         SocketAddr::new(ip, port)
@@ -312,7 +337,9 @@ pub fn bench_config_from_args() -> LossConfig {
         eprintln!(
             "usage: srt-bench runtime=<mio|tokio|smol|monoio|glommio|compio> \
              mode=<sender|receiver> <host?> <port> <duration_secs> <latency_ms> \
-             [bitrate_bps] [--connections N]"
+             [bitrate_bps] [--connections N] \
+             [--ingress per-port|shared-pool=K|reuseport-multi=K|reuseport-single=W] \
+             [--bond broadcast:G|backup:G|none]"
         );
         std::process::exit(2)
     }
@@ -358,20 +385,54 @@ pub fn bench_config_from_args() -> LossConfig {
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_BITRATE_BPS);
 
-    let ingress = match cli.flags.get("ingress").map(String::as_str) {
-        None | Some("per-port") => Ingress::PerPort,
-        Some(pool) => match pool.strip_prefix("pool=").unwrap_or("").parse::<usize>() {
+    fn parse_positive(label: &str, raw: &str) -> usize {
+        match raw.parse::<usize>() {
             Ok(0) | Err(_) => {
-                eprintln!("error: pool size must be a positive integer (got '{pool}')");
+                eprintln!("error: {label} must be a positive integer (got '{raw}')");
                 usage()
             }
-            // Cap pool size at the connection count; more sockets than
-            // connections is just per-port with extra bookkeeping.
-            Ok(k) => Ingress::Pool(k.min(4096)),
-        },
+            // Cap at a sane ceiling; more sockets/threads than
+            // connections is just extra bookkeeping with no benefit.
+            Ok(n) => n.min(4096),
+        }
+    }
+
+    let ingress = match cli.flags.get("ingress").map(String::as_str) {
+        None | Some("per-port") => Ingress::PerPort,
+        Some(spec) => {
+            if let Some(k) = spec.strip_prefix("shared-pool=") {
+                Ingress::SharedPool(parse_positive("shared-pool size", k))
+            } else if let Some(k) = spec.strip_prefix("reuseport-multi=") {
+                Ingress::ReuseportMulti(parse_positive("reuseport-multi acceptor count", k))
+            } else if let Some(w) = spec.strip_prefix("reuseport-single=") {
+                Ingress::ReuseportSingle {
+                    workers: parse_positive("reuseport-single worker count", w),
+                }
+            } else {
+                eprintln!(
+                    "error: unknown --ingress '{spec}' (want per-port | shared-pool=K | \
+                     reuseport-multi=K | reuseport-single=W)"
+                );
+                usage()
+            }
+        }
     };
 
-    let bond_groups: usize = cli.flag_or("bond-groups", 0usize);
+    let (bond_mode, bond_pairs) = match cli.flags.get("bond").map(String::as_str) {
+        None | Some("none") => (BondMode::None, 0),
+        Some(spec) => {
+            let (kind, count) = spec.split_once(':').unwrap_or((spec, ""));
+            let mode = match kind {
+                "broadcast" => BondMode::Broadcast,
+                "backup" => BondMode::Backup,
+                _ => {
+                    eprintln!("error: unknown --bond mode '{kind}' (want broadcast|backup|none)");
+                    usage()
+                }
+            };
+            (mode, parse_positive("bond pair count", count))
+        }
+    };
 
     LossConfig {
         runtime,
@@ -383,6 +444,7 @@ pub fn bench_config_from_args() -> LossConfig {
         bitrate_bps,
         connections: cli.connections(),
         ingress,
-        bond_groups,
+        bond_mode,
+        bond_pairs,
     }
 }
