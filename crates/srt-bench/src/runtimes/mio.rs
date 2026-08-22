@@ -4,9 +4,10 @@
 //! registered with Token(i).
 
 use crate::{Aggregate, ConnStats, LossConfig};
+use libc;
 use mio::net::UdpSocket;
 use mio::{Events, Interest, Poll, Token};
-use shiguredo_srt::{ConnectionEvent, ConnectionOptions, SrtConnection};
+use shiguredo_srt::{ConnectionEvent, ConnectionOptions, ConnectionOutput, SrtConnection};
 use srt_transport::mio_transport::Conn;
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
@@ -68,6 +69,109 @@ fn set_sock_bufs(fd: i32) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+/// Batched receive for a bound UDP socket: up to `bufs.len()` datagrams
+/// in one `recvmmsg` syscall. Returns count received; `addrs[i]` holds
+/// each sender, `sizes[i]` the length. Buffers are hoisted by the caller
+/// and reused -- zero per-call allocation. One syscall for up to 32
+/// datagrams vs one per datagram before.
+fn recvmsg_batch(
+    fd: std::os::fd::RawFd,
+    bufs: &mut [Vec<u8>],
+    sizes: &mut [usize],
+    addrs: &mut [Option<std::net::SocketAddr>],
+) -> usize {
+    use std::cell::RefCell;
+    thread_local! {
+        static SCRATCH: RefCell<BatchScratch> = RefCell::new(BatchScratch::new(64));
+    }
+    const BATCH_MAX: usize = 64;
+    struct BatchScratch {
+        msgs: Vec<libc::mmsghdr>,
+        iovs: Vec<libc::iovec>,
+        addrs: Vec<libc::sockaddr_storage>,
+    }
+    impl BatchScratch {
+        fn new(n: usize) -> Self {
+            Self {
+                msgs: (0..n)
+                    .map(|_| libc::mmsghdr {
+                        msg_hdr: unsafe { std::mem::zeroed() },
+                        msg_len: 0,
+                    })
+                    .collect(),
+                iovs: (0..n)
+                    .map(|_| libc::iovec {
+                        iov_base: std::ptr::null_mut(),
+                        iov_len: 0,
+                    })
+                    .collect(),
+                addrs: (0..n).map(|_| unsafe { std::mem::zeroed() }).collect(),
+            }
+        }
+    }
+    let count = bufs.len();
+    SCRATCH.with(|scratch| {
+        let BatchScratch {
+            msgs,
+            iovs,
+            addrs: storage_addrs,
+        } = &mut *scratch.borrow_mut();
+        for (((iov, msg), storage), (buf, size)) in iovs
+            .iter_mut()
+            .zip(msgs.iter_mut())
+            .zip(storage_addrs.iter_mut())
+            .zip(bufs.iter_mut().zip(sizes.iter_mut()))
+        {
+            buf.resize(buf.capacity(), 0);
+            *size = 0;
+            *iov = libc::iovec {
+                iov_base: buf.as_mut_ptr().cast(),
+                iov_len: buf.capacity(),
+            };
+            msg.msg_hdr.msg_iov = iov;
+            msg.msg_hdr.msg_iovlen = 1;
+            msg.msg_hdr.msg_name = (storage as *mut libc::sockaddr_storage).cast();
+            msg.msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as u32;
+            msg.msg_len = 0;
+        }
+        let received = unsafe {
+            libc::recvmmsg(
+                fd,
+                msgs.as_mut_ptr(),
+                count as u32,
+                libc::MSG_DONTWAIT,
+                std::ptr::null_mut(),
+            )
+        };
+        if received < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::WouldBlock {
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static LOGGED: AtomicBool = AtomicBool::new(false);
+                if !LOGGED.swap(true, Ordering::Relaxed) {
+                    eprintln!("recvmmsg failed once: {err} (fd={fd}, count={count})");
+                }
+            }
+            return 0;
+        }
+        for i in 0..received as usize {
+            addrs[i] = unsafe { sockaddr_to_addr(&storage_addrs[i]) };
+            sizes[i] = msgs[i].msg_len as usize;
+        }
+        received as usize
+    })
+}
+
+unsafe fn sockaddr_to_addr(storage: &libc::sockaddr_storage) -> Option<std::net::SocketAddr> {
+    if storage.ss_family != libc::AF_INET as u16 {
+        return None;
+    }
+    let addr = unsafe { &*(storage as *const libc::sockaddr_storage as *const libc::sockaddr_in) };
+    Some(std::net::SocketAddr::from((
+        std::net::Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr)),
+        u16::from_be(addr.sin_port),
+    )))
 }
 
 pub fn run(cfg: LossConfig) {

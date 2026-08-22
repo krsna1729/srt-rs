@@ -17,10 +17,10 @@ futures-lite = { version = "2", optional = true }
 monoio = { version = "0.2", features = ["sync"], optional = true }
 glommio = { version = "0.9", optional = true }
 compio = { version = "0.19", features = ["io", "io-uring", "net", "runtime", "time"], optional = true }
+libc = { version = "0.2", optional = true }
 
 [features]
-default = ["mio"]
-mio = ["dep:mio"]
+mio = ["dep:mio", "dep:libc"]
 tokio = ["dep:tokio"]
 smol = ["dep:smol", "dep:futures-lite"]
 monoio = ["dep:monoio"]

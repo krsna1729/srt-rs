@@ -157,7 +157,8 @@ impl Default for ManualTimerStore {
 #[cfg(feature = "mio")]
 pub mod mio_transport {
     use super::ManualTimerStore;
-    use shiguredo_srt::{SrtConnection, Timestamp};
+    use libc;
+    use shiguredo_srt::{ConnectionOutput, SrtConnection, Timestamp};
     use std::time::Duration;
 
     /// Per-connection state for mio: protocol + owned socket + manual timers.
@@ -182,20 +183,63 @@ pub mod mio_transport {
         }
 
         /// Drain all pending outputs: send packets, manage manual timers.
-        /// Returns true if any send failed with `ConnectionRefused` (poisoned
-        /// connected socket -- Linux keeps returning the error until
-        /// reconnect).
+        /// Batches `SendPacket`s via `sendmmsg` (one syscall for up to 32
+        /// datagrams). Returns true if any batch failed with
+        /// `ConnectionRefused` (poisoned socket).
         pub fn drain_outputs(&mut self, now: Timestamp) -> bool {
-            let socket = &self.socket;
+            let mut batch: Vec<Vec<u8>> = Vec::with_capacity(32);
             let mut refused = false;
-            ManualTimerStore::drain_outputs(&mut self.conn, &mut self.timers, now, |bytes| {
-                if let Err(e) = socket.send(&bytes) {
-                    if e.kind() == std::io::ErrorKind::ConnectionRefused {
-                        refused = true;
+            while let Some(out) = self.conn.poll_output() {
+                match out {
+                    ConnectionOutput::SendPacket(bytes) => {
+                        batch.push(bytes);
+                        if batch.len() == 32 {
+                            refused |= Self::flush_batch(&self.socket, &mut batch);
+                        }
+                    }
+                    ConnectionOutput::SetTimer { .. } | ConnectionOutput::ClearTimer { .. } => {
+                        self.timers.apply_output(&out, now);
                     }
                 }
-            });
+            }
+            refused |= Self::flush_batch(&self.socket, &mut batch);
             refused
+        }
+
+        fn flush_batch(socket: &mio::net::UdpSocket, batch: &mut Vec<Vec<u8>>) -> bool {
+            if batch.is_empty() {
+                return false;
+            }
+            let mut msgs: Vec<libc::mmsghdr> = Vec::with_capacity(batch.len());
+            let mut iovs: Vec<libc::iovec> = Vec::with_capacity(batch.len());
+            for buf in batch.iter() {
+                iovs.push(libc::iovec {
+                    iov_base: buf.as_ptr() as *mut _,
+                    iov_len: buf.len(),
+                });
+                msgs.push(libc::mmsghdr {
+                    msg_hdr: unsafe { std::mem::zeroed() },
+                    msg_len: 0,
+                });
+            }
+            for (msg, iov) in msgs.iter_mut().zip(iovs.iter()) {
+                msg.msg_hdr.msg_iov = iov as *const _ as *mut _;
+                msg.msg_hdr.msg_iovlen = 1;
+            }
+            let fd = {
+                use std::os::fd::AsRawFd;
+                socket.as_raw_fd()
+            };
+            let sent = unsafe {
+                libc::sendmmsg(
+                    fd,
+                    msgs.as_mut_ptr(),
+                    batch.len() as u32,
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            batch.clear();
+            sent < 0
         }
 
         /// Compute poll timeout from next timer deadline.
