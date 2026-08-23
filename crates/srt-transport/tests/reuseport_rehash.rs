@@ -39,7 +39,7 @@ const FLOWS: usize = 48;
 /// Bind one member of the group. Port 0 asks the kernel to pick; every
 /// subsequent member must pass the resulting port explicitly.
 fn bind_member(port: u16) -> io::Result<UdpSocket> {
-    srt_transport::bind_reuseport(port)
+    srt_transport::bind_reuseport(port, srt_transport::SOCK_BUF_BYTES)
 }
 
 /// Throw away anything queued on every listener so a later probe can't

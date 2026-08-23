@@ -105,7 +105,7 @@ fn spawn_driver(cfg: &LossConfig, poll: &mut Poll, start: Instant, i: usize) -> 
         }
         crate::Mode::Receiver => UdpSocket::bind(addr).expect("bind"),
     };
-    let _ = srt_transport::set_sock_bufs(socket.as_raw_fd());
+    let _ = srt_transport::set_sock_bufs(socket.as_raw_fd(), cfg.sock_buf_bytes);
     poll.registry()
         .register(&mut socket, Token(i), Interest::READABLE)
         .expect("register socket");
@@ -486,7 +486,7 @@ fn run_shared_pool(cfg: LossConfig, k: usize) {
     for s in 0..k {
         let addr = SocketAddr::new(std::net::IpAddr::from([0, 0, 0, 0]), cfg.port + s as u16);
         let mut socket = UdpSocket::bind(addr).expect("bind shared-pool socket");
-        let _ = srt_transport::set_sock_bufs(socket.as_raw_fd());
+        let _ = srt_transport::set_sock_bufs(socket.as_raw_fd(), cfg.sock_buf_bytes);
         poll.registry()
             .register(&mut socket, Token(s), Interest::READABLE)
             .expect("register shared-pool socket");
@@ -753,8 +753,11 @@ fn peer_hash(peer: SocketAddr) -> u32 {
     hasher.finish() as u32
 }
 
-fn bind_reuseport(port: u16) -> std::io::Result<UdpSocket> {
-    Ok(UdpSocket::from_std(srt_transport::bind_reuseport(port)?))
+fn bind_reuseport(port: u16, sock_buf_bytes: usize) -> std::io::Result<UdpSocket> {
+    Ok(UdpSocket::from_std(srt_transport::bind_reuseport(
+        port,
+        sock_buf_bytes,
+    )?))
 }
 
 /// Drain outputs for an unconnected (handshake-phase) connection: sends go
@@ -903,7 +906,7 @@ fn run_pool_acceptor(
 ) -> Vec<ConnStats> {
     let mut poll = Poll::new().expect("mio Poll::new");
     let mut events = Events::with_capacity(1024);
-    let mut listener = match bind_reuseport(cfg.port) {
+    let mut listener = match bind_reuseport(cfg.port, cfg.sock_buf_bytes) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("[bench-mio] acceptor {worker_index}: bind {e}");
@@ -1219,7 +1222,7 @@ fn run_pool_acceptor(
                     let Some(p) = peers.remove(&peer) else {
                         continue;
                     };
-                    relocate_to_owner(cfg.port, peer, p.conn, owner, &senders);
+                    relocate_to_owner(cfg.port, cfg.sock_buf_bytes, peer, p.conn, owner, &senders);
                 }
                 srt_lifecycle::PromotionDecision::PromoteHere => {
                     let Some(p) = peers.remove(&peer) else {
@@ -1229,6 +1232,7 @@ fn run_pool_acceptor(
                         &mut poll,
                         &mut next_token,
                         cfg.port,
+                        cfg.sock_buf_bytes,
                         peer,
                         p.conn,
                         start,
@@ -1286,12 +1290,13 @@ fn run_pool_acceptor(
 /// it to the peer, and ship it once over the owner's channel.
 fn relocate_to_owner(
     port: u16,
+    sock_buf_bytes: usize,
     peer: SocketAddr,
     pending_conn: SrtConnection,
     owner: usize,
     senders: &[mpsc::Sender<WorkerMessage>],
 ) {
-    let socket = match bind_reuseport(port) {
+    let socket = match bind_reuseport(port, sock_buf_bytes) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[bench-mio] relocate {peer}: bind {e}");
@@ -1323,6 +1328,7 @@ fn promote_locally(
     poll: &mut Poll,
     next_token: &mut usize,
     port: u16,
+    sock_buf_bytes: usize,
     peer: SocketAddr,
     pending_conn: SrtConnection,
     start: Instant,
@@ -1330,7 +1336,7 @@ fn promote_locally(
     slots: &mut Vec<PoolSlot>,
     token_index: &mut HashMap<usize, usize>,
 ) {
-    let mut socket = match bind_reuseport(port) {
+    let mut socket = match bind_reuseport(port, sock_buf_bytes) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[bench-mio] promote {peer}: bind {e}");
@@ -1532,7 +1538,7 @@ fn run_single_acceptor(
 ) {
     let mut poll = Poll::new().expect("mio Poll::new");
     let mut events = Events::with_capacity(1024);
-    let mut listener = match bind_reuseport(cfg.port) {
+    let mut listener = match bind_reuseport(cfg.port, cfg.sock_buf_bytes) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("[bench-mio] acceptor: bind {e}");
@@ -1632,6 +1638,7 @@ fn run_single_acceptor(
             };
             route_to_worker(
                 cfg.port,
+                cfg.sock_buf_bytes,
                 peer,
                 p.conn,
                 router,
@@ -1656,13 +1663,14 @@ fn run_single_acceptor(
 /// strategy's whole point.
 fn route_to_worker(
     port: u16,
+    sock_buf_bytes: usize,
     peer: SocketAddr,
     pending_conn: SrtConnection,
     router: &crate::SharedWorkerRouter,
     senders: &[mpsc::Sender<WorkerMessage>],
     per_worker_count: &mut [usize],
 ) {
-    let socket = match bind_reuseport(port) {
+    let socket = match bind_reuseport(port, sock_buf_bytes) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[bench-mio] route {peer}: bind {e}");
@@ -1806,7 +1814,8 @@ mod bond_affinity_tests {
     #[test]
     fn handoff_round_trips_through_channel() {
         let socket = {
-            let s = bind_reuseport(0).expect("bind ephemeral reuseport");
+            let s =
+                bind_reuseport(0, srt_transport::SOCK_BUF_BYTES).expect("bind ephemeral reuseport");
             s.connect("127.0.0.1:1".parse::<SocketAddr>().unwrap())
                 .expect("connect");
             s

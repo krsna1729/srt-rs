@@ -558,7 +558,7 @@ pub fn bench_config_from_args() -> LossConfig {
     };
 
     let sock_buf_bytes = match cli.flags.get("sock-buf").map(String::as_str) {
-        None => 16 << 20,
+        None => srt_transport::SOCK_BUF_BYTES,
         Some("default") | Some("0") => 0,
         Some(raw) => {
             let (digits, scale) = match raw.strip_suffix(['m', 'M']) {
@@ -575,7 +575,6 @@ pub fn bench_config_from_args() -> LossConfig {
             }
         }
     };
-    srt_transport::set_sock_buf_bytes(sock_buf_bytes);
 
     LossConfig {
         runtime,

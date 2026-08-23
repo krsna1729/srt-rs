@@ -115,8 +115,13 @@ fn peer_hash(peer: SocketAddr) -> u32 {
 /// matches its packets by exact 4-tuple and an independent task can drive
 /// it instead of the shared per-peer maintenance loop. `None` if the
 /// socket could not be created.
-fn promote_locally(port: u16, peer: SocketAddr, conn: SrtConnection) -> Option<Conn> {
-    let std_socket = srt_transport::bind_reuseport(port).ok()?;
+fn promote_locally(
+    port: u16,
+    sock_buf_bytes: usize,
+    peer: SocketAddr,
+    conn: SrtConnection,
+) -> Option<Conn> {
+    let std_socket = srt_transport::bind_reuseport(port, sock_buf_bytes).ok()?;
     std_socket.connect(peer).ok()?;
     let sock = compio::net::UdpSocket::from_std(std_socket).ok()?;
     Some(Conn::new(conn, sock))
@@ -528,7 +533,7 @@ async fn run_acceptor(
     senders: Vec<mpsc::Sender<WorkerMessage>>,
     handoffs: mpsc::Receiver<WorkerMessage>,
 ) -> Vec<ConnStats> {
-    let std_listener = match srt_transport::bind_reuseport(cfg.port) {
+    let std_listener = match srt_transport::bind_reuseport(cfg.port, cfg.sock_buf_bytes) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[bench-compio] acceptor {worker_index}: bind {e}");
@@ -662,13 +667,13 @@ async fn run_acceptor(
                     let Some(p) = peers.remove(&peer) else {
                         continue;
                     };
-                    relocate_to_owner(cfg.port, peer, p.conn, owner, &senders);
+                    relocate_to_owner(cfg.port, cfg.sock_buf_bytes, peer, p.conn, owner, &senders);
                 }
                 srt_lifecycle::PromotionDecision::PromoteHere => {
                     let Some(p) = peers.remove(&peer) else {
                         continue;
                     };
-                    match promote_locally(cfg.port, peer, p.conn) {
+                    match promote_locally(cfg.port, cfg.sock_buf_bytes, peer, p.conn) {
                         Some(driver) => {
                             let cfg2 = cfg.clone();
                             tasks.push(compio::runtime::spawn(async move {
@@ -858,12 +863,13 @@ async fn drain_pending_outputs(
 /// it to the peer, and ship it once over the owner's channel.
 fn relocate_to_owner(
     port: u16,
+    sock_buf_bytes: usize,
     peer: SocketAddr,
     pending_conn: SrtConnection,
     owner: usize,
     senders: &[mpsc::Sender<WorkerMessage>],
 ) {
-    let std_socket = match srt_transport::bind_reuseport(port) {
+    let std_socket = match srt_transport::bind_reuseport(port, sock_buf_bytes) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[bench-compio] relocate {peer}: bind {e}");

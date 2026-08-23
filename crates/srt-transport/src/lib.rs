@@ -70,37 +70,19 @@ pub fn is_ready(pin: &mut NativeTimer) -> bool {
 /// they own (never via sysctl) and read back the effective value --
 /// Linux doubles the request and clamps to `net.core.rmem_max`, so the
 /// granted size can be smaller than asked.
-const SOCK_BUF_BYTES: usize = 16 << 20;
+pub const SOCK_BUF_BYTES: usize = 16 << 20;
 
-/// Effective socket-buffer request, overridable once at startup by a
-/// harness that wants to measure buffer sizing as a variable rather than
-/// bake in [`SOCK_BUF_BYTES`]. `0` means "leave the OS default alone".
+/// Set SO_RCVBUF/SO_SNDBUF on a raw fd to `bytes`, warning once if the
+/// host clamped the request smaller. `0` leaves the OS default in place
+/// and does nothing.
 ///
-/// A process-wide value rather than a per-call parameter because every
-/// socket in a run should be sized the same way, and threading it through
-/// every `bind_reuseport`/promotion call site would add an argument to a
-/// dozen signatures to express one global experimental knob.
-static SOCK_BUF_REQUEST: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(SOCK_BUF_BYTES);
-
-/// Override the socket-buffer request for every subsequently created
-/// socket. `0` leaves the OS default untouched. Call once, before any
-/// socket is bound.
-pub fn set_sock_buf_bytes(bytes: usize) {
-    SOCK_BUF_REQUEST.store(bytes, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// The socket-buffer request currently in effect.
-#[must_use]
-pub fn sock_buf_bytes() -> usize {
-    SOCK_BUF_REQUEST.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Set SO_RCVBUF/SO_SNDBUF on a raw fd to [`sock_buf_bytes`], warning
-/// once if the host clamped the request smaller. A request of `0` leaves
-/// the OS default in place and does nothing.
-pub fn set_sock_bufs(fd: std::os::fd::RawFd) -> std::io::Result<()> {
-    let requested = sock_buf_bytes();
+/// The size is a parameter rather than a crate-level setting on purpose:
+/// a library has no business holding process-global mutable
+/// configuration, and threading it explicitly keeps the choice with the
+/// application that actually made it. [`SOCK_BUF_BYTES`] is the value
+/// callers usually want.
+pub fn set_sock_bufs(fd: std::os::fd::RawFd, bytes: usize) -> std::io::Result<()> {
+    let requested = bytes;
     if requested == 0 {
         return Ok(());
     }
@@ -148,8 +130,9 @@ pub fn set_sock_bufs(fd: std::os::fd::RawFd) -> std::io::Result<()> {
 /// non-blocking mode. Returns a plain `std::net::UdpSocket`; each adapter
 /// converts that to its own native socket type (mio's own `UdpSocket`
 /// wraps it directly; tokio's needs no conversion at all -- it already
-/// takes a std socket).
-pub fn bind_reuseport(port: u16) -> std::io::Result<std::net::UdpSocket> {
+/// takes a std socket). `sock_buf_bytes` is passed to [`set_sock_bufs`];
+/// `0` leaves the OS default.
+pub fn bind_reuseport(port: u16, sock_buf_bytes: usize) -> std::io::Result<std::net::UdpSocket> {
     use std::os::fd::AsRawFd;
     let sock = socket2::Socket::new(
         socket2::Domain::IPV4,
@@ -160,7 +143,7 @@ pub fn bind_reuseport(port: u16) -> std::io::Result<std::net::UdpSocket> {
     sock.set_nonblocking(true)?;
     let addr = std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, port);
     sock.bind(&addr.into())?;
-    let _ = set_sock_bufs(sock.as_raw_fd());
+    let _ = set_sock_bufs(sock.as_raw_fd(), sock_buf_bytes);
     Ok(sock.into())
 }
 
@@ -942,8 +925,8 @@ pub mod glommio_transport {
     /// up the thread-local executor). Kept here rather than in bench code
     /// so the `socket2` conversion detail doesn't need its own dependency
     /// in srt-bench.
-    pub fn bind_reuseport(port: u16) -> io::Result<glommio::net::UdpSocket> {
-        from_std(super::bind_reuseport(port)?)
+    pub fn bind_reuseport(port: u16, sock_buf_bytes: usize) -> io::Result<glommio::net::UdpSocket> {
+        from_std(super::bind_reuseport(port, sock_buf_bytes)?)
     }
 
     /// Register an already-bound (and, for a handoff, already-connected)
