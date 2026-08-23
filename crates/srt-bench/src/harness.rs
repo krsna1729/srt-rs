@@ -174,6 +174,53 @@ pub fn read_results(path: &Path) -> std::io::Result<Vec<Record>> {
         .collect())
 }
 
+/// Median, and the range it was drawn from.
+///
+/// A median alone cannot answer "is A better than B or is this noise?".
+/// Reporting the spread lets a reader see overlap directly, which is the
+/// honest form for n in the single digits -- too few samples for a
+/// meaningful significance test, more than enough to see when two ranges
+/// sit on top of each other.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Spread {
+    pub n: usize,
+    pub median: f64,
+    pub min: f64,
+    pub max: f64,
+}
+
+impl Spread {
+    #[must_use]
+    pub fn of(mut values: Vec<f64>) -> Self {
+        if values.is_empty() {
+            return Self::default();
+        }
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        Self {
+            n: values.len(),
+            median: median(values.clone()),
+            min: values[0],
+            max: values[values.len() - 1],
+        }
+    }
+
+    /// Do these two ranges overlap? If so, the difference between their
+    /// medians is not supported by the samples taken.
+    #[must_use]
+    pub fn overlaps(self, other: Self) -> bool {
+        self.min <= other.max && other.min <= self.max
+    }
+
+    /// Spread as a percentage of the median -- how noisy this cell was.
+    #[must_use]
+    pub fn rel_spread_pct(self) -> f64 {
+        if self.median.abs() < f64::EPSILON {
+            return 0.0;
+        }
+        100.0 * (self.max - self.min) / self.median
+    }
+}
+
 fn median(mut values: Vec<f64>) -> f64 {
     if values.is_empty() {
         return 0.0;
@@ -185,6 +232,37 @@ fn median(mut values: Vec<f64>) -> f64 {
     } else {
         values[mid]
     }
+}
+
+/// Per-group dispersion for one column, for callers that need to reason
+/// about overlap rather than read a table.
+#[must_use]
+pub fn spread_by(results: &[Record], group_by: &[String], column: &str) -> Vec<(String, Spread)> {
+    let key_of = |r: &Record| -> String {
+        group_by
+            .iter()
+            .map(|k| r.get(k).unwrap_or("-").to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let mut keys: Vec<String> = Vec::new();
+    for r in results {
+        let k = key_of(r);
+        if !keys.contains(&k) {
+            keys.push(k);
+        }
+    }
+    keys.sort();
+    keys.into_iter()
+        .map(|key| {
+            let values: Vec<f64> = results
+                .iter()
+                .filter(|r| key_of(r) == key)
+                .filter_map(|r| r.number(column))
+                .collect();
+            (key, Spread::of(values))
+        })
+        .collect()
 }
 
 /// Print a median table over `results`, one row per distinct combination
