@@ -837,7 +837,15 @@ fn netem_args(spec: &str) -> Result<Vec<String>, String> {
     let mut limit = "100000".to_string();
     let mut rest: Vec<(String, String)> = Vec::new();
 
-    for field in spec.split(',').map(str::trim).filter(|f| !f.is_empty()) {
+    // `+` as well as `,`: the sweep axes are themselves comma-separated,
+    // so a multi-field spec used as an axis value must join its fields
+    // with something else. `--netem=none,delay=25ms+loss=2%` is two cells;
+    // written with a comma it would silently be three.
+    for field in spec
+        .split(['+', ','])
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+    {
         let (key, value) = field
             .split_once('=')
             .ok_or_else(|| format!("netem: '{field}' is not key=value"))?;
@@ -1156,8 +1164,18 @@ mod netem_tests {
     #[test]
     fn builds_tc_arguments_in_netem_order() {
         assert_eq!(
-            netem_args("delay=25ms,jitter=5ms,loss=1%").unwrap(),
+            netem_args("delay=25ms+jitter=5ms+loss=1%").unwrap(),
             ["limit", "100000", "delay", "25ms", "5ms", "loss", "1%"]
+        );
+    }
+
+    #[test]
+    fn plus_and_comma_are_both_field_separators() {
+        // A sweep axis is comma-separated, so a multi-field spec has to
+        // be joinable with `+`; a single run may still use commas.
+        assert_eq!(
+            netem_args("delay=25ms,loss=1%").unwrap(),
+            netem_args("delay=25ms+loss=1%").unwrap()
         );
     }
 
@@ -1167,7 +1185,7 @@ mod netem_tests {
         // bottleneck at these packet rates and look like protocol loss.
         assert_eq!(netem_args("loss=1%").unwrap()[..2], ["limit", "100000"]);
         assert_eq!(
-            netem_args("loss=1%,limit=64").unwrap()[..2],
+            netem_args("loss=1%+limit=64").unwrap()[..2],
             ["limit", "64"]
         );
     }

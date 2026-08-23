@@ -474,7 +474,7 @@ pub fn bench_config_from_args() -> LossConfig {
              [bitrate_bps] [--connections N] \
              [--ingress per-port|shared-pool=K|reuseport-multi=K|reuseport-single=W] \
              [--bond broadcast:G|backup:G|none] [--batch on|off] \
-             [--connect-concurrency N] [--promotion never|relocate|bonded|all] [--cookie-routing on|off] [--sock-buf N|Nk|Nm|default] [--out FILE] [--cpus 0-3|0,2,4] [--pin on|off] [--netem=delay=25ms,jitter=5ms,loss=1%,rate=100mbit]"
+             [--connect-concurrency N] [--promotion never|relocate|bonded|all] [--cookie-routing on|off] [--sock-buf N|Nk|Nm|default] [--out FILE] [--cpus 0-3|0,2,4] [--pin on|off] [--netem=delay=25ms+jitter=5ms+loss=1%+rate=100mbit]"
         );
         std::process::exit(2)
     }
