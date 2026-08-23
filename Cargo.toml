@@ -25,3 +25,20 @@ codegen-units = 1
 # Line tables only: `bench.sh sysprof` runs perf against this binary and
 # needs symbols to attribute anything. No runtime cost.
 debug = 1
+
+# Fast-iteration profile: `cargo build --profile quick`, binary at
+# target/quick/. Same optimisation level as release so the code is still
+# fast enough to drive real traffic (a dev build cannot keep up with even
+# a modest connection count), but without the two settings that dominate
+# release link time -- LTO and codegen-units=1. Roughly a 10x faster
+# build, at the cost of leaving cross-crate calls on the per-packet hot
+# path unoptimised.
+#
+# Use it for "does this compile, connect, and behave", never for recorded
+# measurements: that missing cross-crate inlining is exactly what the
+# per-packet path is made of. bench.sh warns if pointed at it.
+[profile.quick]
+inherits = "release"
+lto = false
+codegen-units = 16
+debug = 0

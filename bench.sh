@@ -12,6 +12,10 @@
 # Common knobs via env:
 #   REPS=3      repetitions for baseline mode (>=3 per method rules)
 #   TAG=name    output file prefix tag for baseline mode
+#   PROFILE=quick   build/run the fast-iteration profile instead of
+#                   release. Builds ~10x faster; NOT valid for recorded
+#                   measurements (no LTO, so the cross-crate per-packet
+#                   path is unoptimised).
 #
 # Every mode is symmetric: all six runtimes (mio tokio smol monoio glommio
 # compio) get identical treatment. Each run: receiver/sender pair on port+i
@@ -21,7 +25,11 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-readonly BIN=./target/release/srt-bench
+# PROFILE=quick selects the fast-iteration build (see Cargo.toml). The
+# default stays `release`, which is the only profile whose numbers should
+# ever be recorded.
+readonly PROFILE="${PROFILE:-release}"
+readonly BIN="./target/${PROFILE}/srt-bench"
 readonly SCRATCH_DIR=./scratch
 readonly RUNTIMES=(mio tokio smol monoio glommio compio)
 
@@ -63,7 +71,7 @@ ensure_binary() {
     # `env -u RUSTFLAGS` ignores an ambient RUSTFLAGS without setting one:
     # setting it (even to "") would replace .cargo/config.toml's rustflags
     # entirely, silently dropping target-cpu and the mold linker.
-    env -u RUSTFLAGS cargo build -p srt-bench --release --bin srt-bench \
+    env -u RUSTFLAGS cargo build -p srt-bench --profile "$PROFILE" --bin srt-bench \
       >"$SCRATCH_DIR/build.log" 2>&1 || {
         echo "BUILD_FAIL — see $SCRATCH_DIR/build.log" >&2
         tail -5 "$SCRATCH_DIR/build.log" >&2
@@ -99,8 +107,12 @@ pick_port() {
 #   INGRESS=shared-pool=K       #2: K real ports, no promotion
 #   INGRESS=reuseport-multi=K  #4: K acceptor threads share one port
 #   INGRESS=reuseport-single=W #3: 1 acceptor, W dedicated worker threads
-#   BOND=broadcast:G | backup:G   connections 2g/2g+1 share a bond group,
-#                                  for g in 0..G, of the given group type
+  #   PROMOTION=never|relocate|bonded|all
+  #                              which connections get their own connected
+  #                              socket (+ task) at first Connected;
+  #                              default relocate (see LossConfig::promotion)
+  #   BOND=broadcast:G | backup:G   connections 2g/2g+1 share a bond group,
+  #                                  for g in 0..G, of the given group type
 run_pair() {
   local runtime=$1 port=$2 n=$3 secs=$4 head_start=$5 out=$6
   LISTENER_OUT="$SCRATCH_DIR/${out}_listener.out"
@@ -112,6 +124,9 @@ run_pair() {
   fi
   if [[ -n "${BOND:-}" ]]; then
     extra_args+=(--bond="$BOND")
+  fi
+  if [[ -n "${PROMOTION:-}" ]]; then
+    extra_args+=(--promotion="$PROMOTION")
   fi
 
   # shellcheck disable=SC2086  # intentional word split of arithmetic
@@ -315,6 +330,9 @@ PYEOF
 }
 
 mkdir -p "$SCRATCH_DIR"
+if [[ "$PROFILE" != "release" ]]; then
+  echo "WARNING: PROFILE=$PROFILE -- fast-iteration build, results are NOT measurement-grade" >&2
+fi
 MODE=${1:-}
 shift || true
 case $MODE in
