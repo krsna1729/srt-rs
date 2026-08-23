@@ -18,8 +18,8 @@
 //!
 //! Three layers:
 //!
-//! 1. **Shared utilities** (always compiled, no runtime deps): `is_ready`,
-//!    `NativeTimer` type alias, `ManualTimerStore`, `bind_reuseport`,
+//! 1. **Shared utilities** (always compiled, no runtime deps):
+//!    `ManualTimerStore`, `bind_reuseport`,
 //!    `recvmsg_batch`. Protocol-level primitives that all runtimes need.
 //!
 //! 2. **Admission machinery** (always compiled, runtime-neutral, performs
@@ -38,49 +38,25 @@
 //!
 //! # Design principle: no lowest common denominator
 //!
-//! Each runtime's `Conn` uses native primitives directly:
-//! - mio: `ManualTimerStore` (no native timer wheel)
-//! - tokio: `Pin<Box<tokio::time::Sleep>>` per connection
-//! - smol: `Pin<Box<dyn Future>>` wrapping `smol::Timer`
-//! - monoio: `Pin<Box<dyn Future>>` wrapping `monoio::time::sleep`
-//! - glommio: `Pin<Box<dyn Future>>` wrapping `glommio::timer::sleep`
-//! - compio: `Pin<Box<dyn Future>>` wrapping `compio::time::sleep`
+//! Each runtime's `Conn` uses its own socket and its own I/O primitives
+//! directly -- no shared trait flattens them, because the completion
+//! runtimes need owned buffers and the readiness runtimes do not.
 //!
-//! The `is_ready` noop-waker poll pattern is shared because it's genuinely
-//! identical across all 5 async runtimes.
+//! Timers are the one place where sharing is correct rather than
+//! lowest-common-denominator. SRT arms four independent timers
+//! (`Keepalive`, `Ack`, `Nak`, `Inactivity`) and dispatches on the
+//! `TimerId` when each fires, so a `Conn` needs a *map* of deadlines, not
+//! one sleep future. Every adapter already drives its loop off socket
+//! readiness with a short poll timeout, which means the deadline check is
+//! a comparison against `now` -- there is no native primitive being given
+//! up. `ManualTimerStore` is that map, and it is what calls
+//! `SrtConnection::handle_timer`.
+//!
 
 use shiguredo_srt::{ConnectionOptions, ConnectionOutput, SrtConnection, TimerId, Timestamp};
 use std::collections::HashMap;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::task::{Context, Poll, RawWaker, RawWakerVTable};
 use std::time::{Duration, Instant};
-
-// ---------------------------------------------------------------------------
-// Shared utilities — always compiled, no runtime deps
-// ---------------------------------------------------------------------------
-
-/// Type alias for native timers across all async runtimes.
-///
-/// All async runtimes store their per-connection timer as
-/// `Pin<Box<dyn Future<Output = ()>>>`. The concrete future type differs
-/// per runtime, but they all coerce to this trait object.
-pub type NativeTimer = Pin<Box<dyn std::future::Future<Output = ()>>>;
-
-/// Check if a pinned future is ready by polling with a noop waker.
-///
-/// This is the core primitive for native timer expiry detection across all
-/// async runtimes. The noop waker ensures the poll has no side effects.
-pub fn is_ready(pin: &mut NativeTimer) -> bool {
-    fn no_op(_: *const ()) {}
-    fn clone(_: *const ()) -> RawWaker {
-        RawWaker::new(std::ptr::null(), &VTABLE)
-    }
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, no_op, no_op, no_op);
-    let waker = unsafe { std::task::Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
-    let mut cx = Context::from_waker(&waker);
-    pin.as_mut().poll(&mut cx) == Poll::Ready(())
-}
 
 // ---------------------------------------------------------------------------
 // Reuseport admission plumbing — raw fd/libc mechanics, no runtime
@@ -1149,16 +1125,15 @@ pub mod mio_transport {
 
 #[cfg(feature = "tokio")]
 pub mod tokio_transport {
-    use super::{NativeTimer, is_ready};
     use shiguredo_srt::{ConnectionEvent, ConnectionOutput, SrtConnection, Timestamp};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
     use tokio::net::UdpSocket;
 
-    /// Per-connection state for tokio: protocol + async socket + native timer.
+    /// Per-connection state for tokio: protocol + async socket + timer deadlines.
     pub struct Conn {
         pub conn: SrtConnection,
         pub sock: UdpSocket,
-        timer: Option<NativeTimer>,
+        timers: crate::ManualTimerStore,
     }
 
     impl Conn {
@@ -1166,36 +1141,26 @@ pub mod tokio_transport {
             Self {
                 conn,
                 sock,
-                timer: None,
+                timers: crate::ManualTimerStore::new(),
             }
         }
 
-        /// Poll the native timer to see if it has fired.
-        pub fn fire_expired(&mut self) {
-            if let Some(ref mut timer) = self.timer {
-                if is_ready(timer) {
-                    self.timer = None;
-                }
-            }
+        /// Fire every timer whose deadline has passed, invoking the protocol.
+        ///
+        /// Outputs queued by `handle_timer` are drained by the caller's
+        /// following `drain_outputs`.
+        pub fn fire_expired(&mut self, now: Timestamp) {
+            self.timers.fire_expired(now, &mut self.conn);
         }
 
         /// Drain all protocol outputs with native tokio timer management.
-        pub async fn drain_outputs(&mut self, _now: Timestamp) {
+        pub async fn drain_outputs(&mut self, now: Timestamp) {
             while let Some(out) = self.conn.poll_output() {
                 match out {
                     ConnectionOutput::SendPacket(bytes) => {
                         let _ = self.sock.send(&bytes).await;
                     }
-                    ConnectionOutput::SetTimer {
-                        id: _,
-                        duration_micros,
-                    } => {
-                        let deadline = Instant::now() + Duration::from_micros(duration_micros);
-                        self.timer = Some(Box::pin(tokio::time::sleep_until(deadline.into())));
-                    }
-                    ConnectionOutput::ClearTimer { id: _ } => {
-                        self.timer = None;
-                    }
+                    other => self.timers.apply_output(&other, now),
                 }
             }
         }
@@ -1224,7 +1189,7 @@ pub mod tokio_transport {
 
         /// Full event-loop tick: fire timers, recv, drain, send paced.
         pub async fn tick(&mut self, buf: &mut [u8], payload: &[u8], now: Timestamp) -> TickResult {
-            self.fire_expired();
+            self.fire_expired(now);
             self.recv_with_timeout(buf, Duration::from_micros(100), now)
                 .await;
             self.drain_outputs(now).await;
@@ -1251,17 +1216,16 @@ pub mod tokio_transport {
 
 #[cfg(feature = "smol")]
 pub mod smol_transport {
-    use super::{NativeTimer, is_ready};
     use shiguredo_srt::{ConnectionEvent, ConnectionOutput, SrtConnection, Timestamp};
     use std::time::Duration;
 
     pub type UdpSocket = smol::Async<std::net::UdpSocket>;
 
-    /// Per-connection state for smol: protocol + async socket + native timer.
+    /// Per-connection state for smol: protocol + async socket + timer deadlines.
     pub struct Conn {
         pub conn: SrtConnection,
         pub sock: UdpSocket,
-        timer: Option<NativeTimer>,
+        timers: crate::ManualTimerStore,
     }
 
     impl Conn {
@@ -1269,36 +1233,25 @@ pub mod smol_transport {
             Self {
                 conn,
                 sock,
-                timer: None,
+                timers: crate::ManualTimerStore::new(),
             }
         }
 
-        pub fn fire_expired(&mut self) {
-            if let Some(ref mut timer) = self.timer {
-                if is_ready(timer) {
-                    self.timer = None;
-                }
-            }
+        /// Fire every timer whose deadline has passed, invoking the protocol.
+        ///
+        /// Outputs queued by `handle_timer` are drained by the caller's
+        /// following `drain_outputs`.
+        pub fn fire_expired(&mut self, now: Timestamp) {
+            self.timers.fire_expired(now, &mut self.conn);
         }
 
-        pub async fn drain_outputs(&mut self, _now: Timestamp) {
+        pub async fn drain_outputs(&mut self, now: Timestamp) {
             while let Some(out) = self.conn.poll_output() {
                 match out {
                     ConnectionOutput::SendPacket(bytes) => {
                         let _ = self.sock.write_with(|inner| inner.send(&bytes)).await;
                     }
-                    ConnectionOutput::SetTimer {
-                        id: _,
-                        duration_micros,
-                    } => {
-                        let d = Duration::from_micros(duration_micros);
-                        self.timer = Some(Box::pin(async move {
-                            smol::Timer::after(d).await;
-                        }));
-                    }
-                    ConnectionOutput::ClearTimer { id: _ } => {
-                        self.timer = None;
-                    }
+                    other => self.timers.apply_output(&other, now),
                 }
             }
         }
@@ -1337,7 +1290,7 @@ pub mod smol_transport {
         }
 
         pub async fn tick(&mut self, buf: &mut [u8], payload: &[u8], now: Timestamp) -> TickResult {
-            self.fire_expired();
+            self.fire_expired(now);
             self.recv_with_timeout(buf, Duration::from_micros(100), now)
                 .await;
             self.drain_outputs(now).await;
@@ -1364,15 +1317,14 @@ pub mod smol_transport {
 
 #[cfg(feature = "monoio")]
 pub mod monoio_transport {
-    use super::{NativeTimer, is_ready};
     use shiguredo_srt::{ConnectionEvent, ConnectionOutput, SrtConnection, Timestamp};
     use std::time::Duration;
 
-    /// Per-connection state for monoio: protocol + owned-buffer socket + native timer.
+    /// Per-connection state for monoio: protocol + owned-buffer socket + timer deadlines.
     pub struct Conn {
         pub conn: SrtConnection,
         pub sock: monoio::net::udp::UdpSocket,
-        timer: Option<NativeTimer>,
+        timers: crate::ManualTimerStore,
     }
 
     impl Conn {
@@ -1380,36 +1332,25 @@ pub mod monoio_transport {
             Self {
                 conn,
                 sock,
-                timer: None,
+                timers: crate::ManualTimerStore::new(),
             }
         }
 
-        pub fn fire_expired(&mut self) {
-            if let Some(ref mut timer) = self.timer {
-                if is_ready(timer) {
-                    self.timer = None;
-                }
-            }
+        /// Fire every timer whose deadline has passed, invoking the protocol.
+        ///
+        /// Outputs queued by `handle_timer` are drained by the caller's
+        /// following `drain_outputs`.
+        pub fn fire_expired(&mut self, now: Timestamp) {
+            self.timers.fire_expired(now, &mut self.conn);
         }
 
-        pub async fn drain_outputs(&mut self, _now: Timestamp) {
+        pub async fn drain_outputs(&mut self, now: Timestamp) {
             while let Some(out) = self.conn.poll_output() {
                 match out {
                     ConnectionOutput::SendPacket(bytes) => {
                         let (_res, _buf) = self.sock.send(bytes).await;
                     }
-                    ConnectionOutput::SetTimer {
-                        id: _,
-                        duration_micros,
-                    } => {
-                        let d = Duration::from_micros(duration_micros);
-                        self.timer = Some(Box::pin(async move {
-                            monoio::time::sleep(d).await;
-                        }));
-                    }
-                    ConnectionOutput::ClearTimer { id: _ } => {
-                        self.timer = None;
-                    }
+                    other => self.timers.apply_output(&other, now),
                 }
             }
         }
@@ -1432,7 +1373,7 @@ pub mod monoio_transport {
         }
 
         pub async fn tick(&mut self, payload: &[u8], now: Timestamp) -> TickResult {
-            self.fire_expired();
+            self.fire_expired(now);
             self.recv_with_timeout(Duration::from_micros(100), now)
                 .await;
             self.drain_outputs(now).await;
@@ -1459,7 +1400,6 @@ pub mod monoio_transport {
 
 #[cfg(feature = "glommio")]
 pub mod glommio_transport {
-    use super::{NativeTimer, is_ready};
     use shiguredo_srt::{ConnectionEvent, ConnectionOutput, SrtConnection, Timestamp};
     use std::io;
     use std::time::Duration;
@@ -1483,11 +1423,11 @@ pub mod glommio_transport {
         ))
     }
 
-    /// Per-connection state for glommio: protocol + borrowed-buffer socket + native timer.
+    /// Per-connection state for glommio: protocol + borrowed-buffer socket + timer deadlines.
     pub struct Conn {
         pub conn: SrtConnection,
         pub sock: glommio::net::UdpSocket,
-        timer: Option<NativeTimer>,
+        timers: crate::ManualTimerStore,
     }
 
     impl Conn {
@@ -1495,36 +1435,25 @@ pub mod glommio_transport {
             Self {
                 conn,
                 sock,
-                timer: None,
+                timers: crate::ManualTimerStore::new(),
             }
         }
 
-        pub fn fire_expired(&mut self) {
-            if let Some(ref mut timer) = self.timer {
-                if is_ready(timer) {
-                    self.timer = None;
-                }
-            }
+        /// Fire every timer whose deadline has passed, invoking the protocol.
+        ///
+        /// Outputs queued by `handle_timer` are drained by the caller's
+        /// following `drain_outputs`.
+        pub fn fire_expired(&mut self, now: Timestamp) {
+            self.timers.fire_expired(now, &mut self.conn);
         }
 
-        pub async fn drain_outputs(&mut self, _now: Timestamp) {
+        pub async fn drain_outputs(&mut self, now: Timestamp) {
             while let Some(out) = self.conn.poll_output() {
                 match out {
                     ConnectionOutput::SendPacket(bytes) => {
                         let _ = self.sock.send(&bytes).await;
                     }
-                    ConnectionOutput::SetTimer {
-                        id: _,
-                        duration_micros,
-                    } => {
-                        let d = Duration::from_micros(duration_micros);
-                        self.timer = Some(Box::pin(async move {
-                            glommio::timer::sleep(d).await;
-                        }));
-                    }
-                    ConnectionOutput::ClearTimer { id: _ } => {
-                        self.timer = None;
-                    }
+                    other => self.timers.apply_output(&other, now),
                 }
             }
         }
@@ -1568,7 +1497,7 @@ pub mod glommio_transport {
         }
 
         pub async fn tick(&mut self, buf: &mut [u8], payload: &[u8], now: Timestamp) -> TickResult {
-            self.fire_expired();
+            self.fire_expired(now);
             self.recv_with_timeout(buf, Duration::from_micros(100), now)
                 .await;
             self.drain_outputs(now).await;
@@ -1595,15 +1524,13 @@ pub mod glommio_transport {
 
 #[cfg(feature = "compio")]
 pub mod compio_transport {
-    use super::{NativeTimer, is_ready};
     use shiguredo_srt::{ConnectionEvent, ConnectionOutput, SrtConnection, Timestamp};
-    use std::time::Duration;
 
-    /// Per-connection state for compio: protocol + owned-buffer socket + native timer.
+    /// Per-connection state for compio: protocol + owned-buffer socket + timer deadlines.
     pub struct Conn {
         pub conn: SrtConnection,
         pub sock: compio::net::UdpSocket,
-        timer: Option<NativeTimer>,
+        timers: crate::ManualTimerStore,
     }
 
     impl Conn {
@@ -1611,36 +1538,25 @@ pub mod compio_transport {
             Self {
                 conn,
                 sock,
-                timer: None,
+                timers: crate::ManualTimerStore::new(),
             }
         }
 
-        pub fn fire_expired(&mut self) {
-            if let Some(ref mut timer) = self.timer {
-                if is_ready(timer) {
-                    self.timer = None;
-                }
-            }
+        /// Fire every timer whose deadline has passed, invoking the protocol.
+        ///
+        /// Outputs queued by `handle_timer` are drained by the caller's
+        /// following `drain_outputs`.
+        pub fn fire_expired(&mut self, now: Timestamp) {
+            self.timers.fire_expired(now, &mut self.conn);
         }
 
-        pub async fn drain_outputs(&mut self, _now: Timestamp) {
+        pub async fn drain_outputs(&mut self, now: Timestamp) {
             while let Some(out) = self.conn.poll_output() {
                 match out {
                     ConnectionOutput::SendPacket(bytes) => {
                         let _ = self.sock.send(bytes).await;
                     }
-                    ConnectionOutput::SetTimer {
-                        id: _,
-                        duration_micros,
-                    } => {
-                        let d = Duration::from_micros(duration_micros);
-                        self.timer = Some(Box::pin(async move {
-                            compio::time::sleep(d).await;
-                        }));
-                    }
-                    ConnectionOutput::ClearTimer { id: _ } => {
-                        self.timer = None;
-                    }
+                    other => self.timers.apply_output(&other, now),
                 }
             }
         }
@@ -1655,7 +1571,7 @@ pub mod compio_transport {
         }
 
         pub async fn tick(&mut self, payload: &[u8], now: Timestamp) -> TickResult {
-            self.fire_expired();
+            self.fire_expired(now);
             self.drain_outputs(now).await;
 
             let mut sent = 0u64;
