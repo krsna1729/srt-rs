@@ -52,6 +52,10 @@ pub const COLUMNS: &[&str] = &[
     "cpu_user_ms",
     "cpu_sys_ms",
     "peak_rss_kb",
+    "secs",
+    "udp_rcvbuf_err",
+    "udp_in_err",
+    "udp_no_ports",
 ];
 
 /// The dimensions a run was configured with, rendered for the result
@@ -129,6 +133,10 @@ pub fn append_result(
         writeln!(file, "{}", COLUMNS.join("\t"))?;
     }
     let p = crate::cpu_stats::process_stats();
+    // Kernel-side drops for this process's lifetime: the only thing that
+    // distinguishes "the protocol lost it" from "the kernel dropped it
+    // before the protocol saw it".
+    let udp = crate::cpu_stats::udp_counters().since(crate::cpu_stats::udp_baseline());
     let mut row = String::new();
     let values: Vec<String> = vec![
         cfg.runtime.name().to_string(),
@@ -170,6 +178,10 @@ pub fn append_result(
         format!("{:.1}", p.cpu_user_ms),
         format!("{:.1}", p.cpu_sys_ms),
         p.peak_rss_kb.to_string(),
+        format!("{:.0}", cfg.duration_secs),
+        udp.rcvbuf_errors.to_string(),
+        udp.in_errors.to_string(),
+        udp.no_ports.to_string(),
     ];
     debug_assert_eq!(values.len(), COLUMNS.len(), "row/header width mismatch");
     let _ = write!(row, "{}", values.join("\t"));

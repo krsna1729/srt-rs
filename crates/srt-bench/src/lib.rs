@@ -566,6 +566,10 @@ pub fn bench_config_from_args() -> LossConfig {
         std::process::exit(2)
     }
 
+    // Capture kernel UDP counters before any socket exists, so every
+    // later read is a delta for this run alone.
+    let _ = crate::cpu_stats::udp_baseline();
+
     let args: Vec<String> = std::env::args().collect();
     let cli = Cli::parse(&args);
 

@@ -138,8 +138,9 @@ pub fn run(cfg: LossConfig) {
 
     let stats = crate::run_workers(&cfg, move |cfg, mine| {
         let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+            .enable_timer()
             .build()
-            .expect("monoio runtime");
+            .expect("monoio io_uring runtime");
         rt.block_on(drive(cfg, mine, start))
     });
 

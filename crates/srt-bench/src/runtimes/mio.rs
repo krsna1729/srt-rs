@@ -258,8 +258,8 @@ fn drive(cfg: LossConfig, mine: Vec<usize>, start: Instant) -> Vec<ConnStats> {
         crate::Mode::Receiver => mine.len(),
         crate::Mode::Sender => cfg.connect_concurrency.min(mine.len()),
     };
-    for i in 0..priming {
-        drivers.push(spawn_driver(&cfg, &mut poll, start, mine[i], i));
+    for (token, &conn) in mine.iter().take(priming).enumerate() {
+        drivers.push(spawn_driver(&cfg, &mut poll, start, conn, token));
     }
     let mut next_to_start = priming;
 
