@@ -30,6 +30,7 @@
 use shiguredo_srt::{ConnectionOutput, SrtConnection, TimerId, Timestamp};
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable};
 
 // ---------------------------------------------------------------------------
@@ -250,6 +251,85 @@ unsafe fn sockaddr_to_addr(storage: &libc::sockaddr_storage) -> Option<std::net:
         std::net::Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr)),
         u16::from_be(addr.sin_port),
     )))
+}
+
+// ---------------------------------------------------------------------------
+// Ingress telemetry — one definition, shared by every runtime adapter
+// ---------------------------------------------------------------------------
+
+/// Counters for one reuseport listener's admission path.
+///
+/// Every acceptor thread shares one of these, so the fields are atomics
+/// and `&self` is enough to record. Each runtime adapter used to declare
+/// its own five file-local statics; six copies of "the same" counters is
+/// exactly how their meanings drifted apart unnoticed (one backend
+/// counted relocations as promotions while five counted only local ones,
+/// so identical-looking log lines meant different things). One
+/// definition, one `report` line, one meaning.
+#[derive(Debug, Default)]
+pub struct IngressTelemetry {
+    /// Connections given a private socket on the acceptor that admitted
+    /// them. Disjoint from [`Self::handoffs`] -- the two never count the
+    /// same connection, so total promotions is their sum.
+    pub local_promotions: AtomicU64,
+    /// Connections relocated to a different worker for bond affinity.
+    pub handoffs: AtomicU64,
+    /// CONCLUSION datagrams that reached an acceptor holding no state for
+    /// the peer and carried no usable routing information -- flows the
+    /// kernel rehashed mid-handshake that could not be rescued.
+    pub stranded_conclusions: AtomicU64,
+    /// CONCLUSION datagrams routed to their owning acceptor by SYN
+    /// cookie. Each would otherwise have been stranded.
+    pub cookie_routed: AtomicU64,
+    /// Late or duplicate CONCLUSIONs for a connection this acceptor had
+    /// already promoted (so its peer entry was gone). Harmless, but
+    /// indistinguishable from a stranded handshake without checking the
+    /// cookie -- counted apart so the two are never conflated again.
+    pub promoted_duplicates: AtomicU64,
+}
+
+impl IngressTelemetry {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[inline]
+    fn bump(counter: &AtomicU64) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_local_promotion(&self) {
+        Self::bump(&self.local_promotions);
+    }
+    pub fn record_handoff(&self) {
+        Self::bump(&self.handoffs);
+    }
+    pub fn record_stranded_conclusion(&self) {
+        Self::bump(&self.stranded_conclusions);
+    }
+    pub fn record_cookie_routed(&self) {
+        Self::bump(&self.cookie_routed);
+    }
+    pub fn record_promoted_duplicate(&self) {
+        Self::bump(&self.promoted_duplicates);
+    }
+
+    /// One-line shutdown summary, identical in shape for every runtime so
+    /// two backends' output can be compared directly.
+    #[must_use]
+    pub fn report(&self, backend: &str) -> String {
+        let get = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        format!(
+            "[bench-{backend}] pool receiver: {} local promotions, {} bond handoffs, \
+             {} stranded CONCLUSIONs, {} cookie-routed, {} post-promotion dups",
+            get(&self.local_promotions),
+            get(&self.handoffs),
+            get(&self.stranded_conclusions),
+            get(&self.cookie_routed),
+            get(&self.promoted_duplicates),
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------

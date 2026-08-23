@@ -64,32 +64,6 @@ use std::time::{Duration, Instant};
 const IDLE_GRACE: Duration = Duration::from_secs(10);
 const TIMER_TICK: Duration = Duration::from_millis(10);
 
-/// Diagnostic counter: bond legs actually shipped cross-thread via the
-/// handoff channel. See `run_reuseport_multi`'s shutdown log.
-static HANDOFF_COUNT: AtomicU64 = AtomicU64::new(0);
-
-/// Diagnostic counter: connections promoted to their own socket + task on
-/// this same acceptor thread (`--promote-all`). Distinct from
-/// `HANDOFF_COUNT`, which counts only cross-thread bond relocations.
-static PROMOTION_COUNT: AtomicU64 = AtomicU64::new(0);
-
-/// Diagnostic counter: handshake datagrams rescued by cookie routing.
-/// Each one would otherwise have been an orphaned CONCLUSION -- a
-/// handshake stranded on an acceptor with no state for it.
-static COOKIE_FORWARD_COUNT: AtomicU64 = AtomicU64::new(0);
-
-/// Diagnostic counter: CONCLUSION packets arriving at an acceptor with no
-/// state for that peer -- flows the kernel rehashed between the two
-/// caller->listener handshake packets. Cookie routing exists to drive
-/// this to zero; comparing it with and without is how that is verified.
-static ORPHAN_CONCLUSION_COUNT: AtomicU64 = AtomicU64::new(0);
-
-/// Diagnostic counter: late or duplicate CONCLUSIONs for a flow this
-/// acceptor already promoted (so its peer entry is gone). Harmless, but
-/// indistinguishable from a stranded handshake without checking the
-/// cookie -- which is why they are counted apart.
-static PROMOTED_DUP_COUNT: AtomicU64 = AtomicU64::new(0);
-
 /// Stable per-peer entropy for a cookie's upper bits, so cookies differ
 /// per connection instead of being one constant per worker.
 fn peer_hash(peer: SocketAddr) -> u32 {
@@ -439,6 +413,9 @@ fn run_reuseport_multi(cfg: LossConfig, k: usize) {
     println!("LISTENING");
     let router: crate::SharedWorkerRouter =
         Arc::new(Mutex::new(srt_lifecycle::WorkerRouter::new(worker_count)));
+    // One set of counters for every acceptor thread; see
+    // `srt_transport::IngressTelemetry`.
+    let telemetry = Arc::new(srt_transport::IngressTelemetry::new());
 
     // All channels exist before any thread spawns -- see the identical
     // mio/tokio bug this avoids: cloning a partially-built `Vec<Sender>`
@@ -453,6 +430,7 @@ fn run_reuseport_multi(cfg: LossConfig, k: usize) {
     for (worker_index, rx) in receivers.into_iter().enumerate() {
         let cfg = cfg.clone();
         let router = router.clone();
+        let telemetry = telemetry.clone();
         let all_senders = senders.clone();
         handles.push(
             std::thread::Builder::new()
@@ -466,6 +444,7 @@ fn run_reuseport_multi(cfg: LossConfig, k: usize) {
                         router,
                         all_senders,
                         rx,
+                        telemetry,
                         &ex,
                     )))
                 })
@@ -479,15 +458,7 @@ fn run_reuseport_multi(cfg: LossConfig, k: usize) {
             agg.add(stats);
         }
     }
-    let handoffs = HANDOFF_COUNT.load(Ordering::Relaxed);
-    let promotions = PROMOTION_COUNT.load(Ordering::Relaxed);
-    let orphans = ORPHAN_CONCLUSION_COUNT.load(Ordering::Relaxed);
-    let forwarded = COOKIE_FORWARD_COUNT.load(Ordering::Relaxed);
-    let dups = PROMOTED_DUP_COUNT.load(Ordering::Relaxed);
-    eprintln!(
-        "[bench-smol] pool receiver: {promotions} local promotions, {handoffs} bond handoffs, \
-         {orphans} stranded CONCLUSIONs, {forwarded} cookie-routed, {dups} post-promotion dups"
-    );
+    eprintln!("{}", telemetry.report("smol"));
     agg.print(start);
     if !agg.any_connected {
         eprintln!("[bench-smol] pool receiver admitted no connections");
@@ -514,6 +485,7 @@ async fn run_acceptor(
     router: crate::SharedWorkerRouter,
     senders: Vec<mpsc::Sender<WorkerMessage>>,
     handoffs: mpsc::Receiver<WorkerMessage>,
+    telemetry: Arc<srt_transport::IngressTelemetry>,
     ex: &async_executor::LocalExecutor<'_>,
 ) -> Vec<ConnStats> {
     let std_listener = match srt_transport::bind_reuseport(cfg.port, cfg.sock_buf_bytes) {
@@ -572,6 +544,7 @@ async fn run_acceptor(
                 &cfg,
                 worker_index,
                 &senders,
+                &telemetry,
                 peer,
                 &buf[..n],
                 start,
@@ -583,6 +556,7 @@ async fn run_acceptor(
                         &cfg,
                         worker_index,
                         &senders,
+                        &telemetry,
                         peer,
                         &buf[..n],
                         start,
@@ -657,7 +631,15 @@ async fn run_acceptor(
                     let Some(p) = peers.remove(&peer) else {
                         continue;
                     };
-                    relocate_to_owner(cfg.port, cfg.sock_buf_bytes, peer, p.conn, owner, &senders);
+                    relocate_to_owner(
+                        cfg.port,
+                        cfg.sock_buf_bytes,
+                        peer,
+                        p.conn,
+                        owner,
+                        &senders,
+                        &telemetry,
+                    );
                 }
                 srt_lifecycle::PromotionDecision::PromoteHere => {
                     let Some(p) = peers.remove(&peer) else {
@@ -669,7 +651,7 @@ async fn run_acceptor(
                             tasks.push(ex.spawn(async move {
                                 established_conn_task(driver, cfg2, start).await
                             }));
-                            PROMOTION_COUNT.fetch_add(1, Ordering::Relaxed);
+                            telemetry.record_local_promotion();
                         }
                         None => eprintln!("[bench-smol] promote {peer}: failed"),
                     }
@@ -684,7 +666,16 @@ async fn run_acceptor(
                 // A handshake datagram routed here by its cookie: feed it
                 // to the peer state that owns it.
                 WorkerMessage::Handshake { peer, data } => {
-                    admit(&mut peers, &cfg, worker_index, &senders, peer, &data, start);
+                    admit(
+                        &mut peers,
+                        &cfg,
+                        worker_index,
+                        &senders,
+                        &telemetry,
+                        peer,
+                        &data,
+                        start,
+                    );
                     continue;
                 }
             };
@@ -737,6 +728,7 @@ fn admit(
     cfg: &LossConfig,
     worker_index: usize,
     senders: &[mpsc::Sender<WorkerMessage>],
+    telemetry: &srt_transport::IngressTelemetry,
     peer: SocketAddr,
     data: &[u8],
     start: Instant,
@@ -756,7 +748,7 @@ fn admit(
             data: data.to_vec(),
         };
         if senders[owner].send(message).is_ok() {
-            COOKIE_FORWARD_COUNT.fetch_add(1, Ordering::Relaxed);
+            telemetry.record_cookie_routed();
             return;
         }
         // Owner is gone; handle it here rather than dropping it.
@@ -776,10 +768,10 @@ fn admit(
     {
         match srt_lifecycle::worker_from_cookie(identity.syn_cookie, senders.len()) {
             Some(owner) if owner == worker_index => {
-                PROMOTED_DUP_COUNT.fetch_add(1, Ordering::Relaxed);
+                telemetry.record_promoted_duplicate();
             }
             _ => {
-                ORPHAN_CONCLUSION_COUNT.fetch_add(1, Ordering::Relaxed);
+                telemetry.record_stranded_conclusion();
             }
         }
     }
@@ -855,6 +847,7 @@ fn relocate_to_owner(
     pending_conn: SrtConnection,
     owner: usize,
     senders: &[mpsc::Sender<WorkerMessage>],
+    telemetry: &srt_transport::IngressTelemetry,
 ) {
     let std_socket = match srt_transport::bind_reuseport(port, sock_buf_bytes) {
         Ok(s) => s,
@@ -874,7 +867,7 @@ fn relocate_to_owner(
     if senders[owner].send(message).is_err() {
         eprintln!("[bench-smol] relocate {peer}: owner {owner} channel closed");
     } else {
-        HANDOFF_COUNT.fetch_add(1, Ordering::Relaxed);
+        telemetry.record_handoff();
     }
 }
 

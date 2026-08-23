@@ -682,37 +682,6 @@ fn slot_is_terminal(slot: &PoolSlot, now: Instant) -> bool {
 /// itself noticed a disconnect.
 const IDLE_GRACE: Duration = Duration::from_secs(10);
 
-/// Diagnostic counter: bond legs actually shipped cross-thread via the
-/// handoff channel. Proves the registry/handoff path fired in a given run
-/// instead of sitting dead -- see `run_pool_receiver`'s shutdown log.
-static HANDOFF_COUNT: AtomicU64 = AtomicU64::new(0);
-
-/// Diagnostic counter: connections promoted to their own socket on this
-/// same acceptor thread. Disjoint from `HANDOFF_COUNT`, which counts
-/// cross-thread bond relocations -- the two never count the same
-/// connection, so a run's total promotions is their sum.
-static PROMOTION_COUNT: AtomicU64 = AtomicU64::new(0);
-
-/// Diagnostic counter: CONCLUSION handshake packets that arrived at an
-/// acceptor holding no state for that peer -- i.e. flows the kernel
-/// rehashed *between* the two caller->listener handshake packets. This is
-/// the direct measure of whether #4's N-acceptor topology needs a
-/// cookie-keyed mpsc handoff to survive mid-handshake reroutes, or
-/// whether the case is rare enough not to matter. See the admission
-/// closure in `run_pool_acceptor`.
-static ORPHAN_CONCLUSION_COUNT: AtomicU64 = AtomicU64::new(0);
-
-/// Diagnostic counter: handshake datagrams rescued by cookie routing --
-/// received by an acceptor that did not own them and forwarded to the one
-/// that did. Every one of these would otherwise have been an orphaned
-/// CONCLUSION.
-static COOKIE_FORWARD_COUNT: AtomicU64 = AtomicU64::new(0);
-
-/// Diagnostic counter: late or duplicate CONCLUSIONs for a flow this
-/// acceptor already promoted. Harmless, but indistinguishable from a
-/// stranded handshake without checking the cookie.
-static PROMOTED_DUP_COUNT: AtomicU64 = AtomicU64::new(0);
-
 /// Bond-affinity handoff payload: a fully promoted slot shipped from the
 /// acceptor that completed its handshake to the thread that owns the group.
 struct Handoff {
@@ -844,6 +813,9 @@ fn run_pool_receiver(cfg: LossConfig, k: usize) {
     let start = Instant::now();
     let router: crate::SharedWorkerRouter =
         Arc::new(Mutex::new(srt_lifecycle::WorkerRouter::new(worker_count)));
+    // One set of counters for every acceptor thread; see
+    // `srt_transport::IngressTelemetry`.
+    let telemetry = Arc::new(srt_transport::IngressTelemetry::new());
 
     // All channels must exist before any thread is spawned: promote_slot
     // indexes `senders` by owner worker index, so every thread needs the
@@ -858,12 +830,15 @@ fn run_pool_receiver(cfg: LossConfig, k: usize) {
     let mut handles = Vec::with_capacity(worker_count);
     for (worker_index, rx) in receivers.into_iter().enumerate() {
         let router = router.clone();
+        let telemetry = telemetry.clone();
         let all_senders = senders.clone();
         let cfg = cfg.clone();
         handles.push(
             std::thread::Builder::new()
                 .name(format!("srt-acceptor-{worker_index}"))
-                .spawn(move || run_pool_acceptor(cfg, worker_index, start, router, all_senders, rx))
+                .spawn(move || {
+                    run_pool_acceptor(cfg, worker_index, start, router, all_senders, rx, telemetry)
+                })
                 .expect("spawn acceptor"),
         );
     }
@@ -875,20 +850,9 @@ fn run_pool_receiver(cfg: LossConfig, k: usize) {
         }
     }
     // Always report, not gated on the receiver's own --bond (bonding is a
-    // sender-side choice; the receiver learns it from the handshake).
-    // `promotions` counts connections given a dedicated socket here;
-    // `handoffs` counts those relocated to another worker instead. They
-    // are disjoint, so total promotions is their sum, and a nonzero
-    // handoff count is the proof the bond-affinity path fired.
-    let promotions = PROMOTION_COUNT.load(Ordering::Relaxed);
-    let handoffs = HANDOFF_COUNT.load(Ordering::Relaxed);
-    let orphans = ORPHAN_CONCLUSION_COUNT.load(Ordering::Relaxed);
-    let forwarded = COOKIE_FORWARD_COUNT.load(Ordering::Relaxed);
-    let dups = PROMOTED_DUP_COUNT.load(Ordering::Relaxed);
-    eprintln!(
-        "[bench-mio] pool receiver: {promotions} local promotions, {handoffs} bond handoffs, \
-         {orphans} stranded CONCLUSIONs, {forwarded} cookie-routed, {dups} post-promotion dups"
-    );
+    // sender-side choice; the receiver learns it from the handshake); a
+    // nonzero handoff count is the proof the bond-affinity path fired.
+    eprintln!("{}", telemetry.report("mio"));
     agg.print(start);
     if !agg.any_connected {
         eprintln!("[bench-mio] pool receiver admitted no connections");
@@ -903,6 +867,7 @@ fn run_pool_acceptor(
     router: crate::SharedWorkerRouter,
     senders: Vec<mpsc::Sender<WorkerMessage>>,
     handoffs: mpsc::Receiver<WorkerMessage>,
+    telemetry: Arc<srt_transport::IngressTelemetry>,
 ) -> Vec<ConnStats> {
     let mut poll = Poll::new().expect("mio Poll::new");
     let mut events = Events::with_capacity(1024);
@@ -1079,7 +1044,7 @@ fn run_pool_acceptor(
                                     data: data.to_vec(),
                                 };
                                 if senders[owner].send(message).is_ok() {
-                                    COOKIE_FORWARD_COUNT.fetch_add(1, Ordering::Relaxed);
+                                    telemetry.record_cookie_routed();
                                     return;
                                 }
                                 // Owner is gone; fall through and handle it
@@ -1116,11 +1081,10 @@ fn run_pool_acceptor(
                                             senders.len(),
                                         ) {
                                             Some(owner) if owner == worker_index => {
-                                                PROMOTED_DUP_COUNT.fetch_add(1, Ordering::Relaxed);
+                                                telemetry.record_promoted_duplicate();
                                             }
                                             _ => {
-                                                ORPHAN_CONCLUSION_COUNT
-                                                    .fetch_add(1, Ordering::Relaxed);
+                                                telemetry.record_stranded_conclusion();
                                             }
                                         }
                                     }
@@ -1222,7 +1186,15 @@ fn run_pool_acceptor(
                     let Some(p) = peers.remove(&peer) else {
                         continue;
                     };
-                    relocate_to_owner(cfg.port, cfg.sock_buf_bytes, peer, p.conn, owner, &senders);
+                    relocate_to_owner(
+                        cfg.port,
+                        cfg.sock_buf_bytes,
+                        peer,
+                        p.conn,
+                        owner,
+                        &senders,
+                        &telemetry,
+                    );
                 }
                 srt_lifecycle::PromotionDecision::PromoteHere => {
                     let Some(p) = peers.remove(&peer) else {
@@ -1239,6 +1211,7 @@ fn run_pool_acceptor(
                         stream_len,
                         &mut slots,
                         &mut token_index,
+                        &telemetry,
                     );
                 }
             }
@@ -1295,6 +1268,7 @@ fn relocate_to_owner(
     pending_conn: SrtConnection,
     owner: usize,
     senders: &[mpsc::Sender<WorkerMessage>],
+    telemetry: &srt_transport::IngressTelemetry,
 ) {
     let socket = match bind_reuseport(port, sock_buf_bytes) {
         Ok(s) => s,
@@ -1314,7 +1288,7 @@ fn relocate_to_owner(
     if senders[owner].send(message).is_err() {
         eprintln!("[bench-mio] relocate {peer}: owner {owner} channel closed");
     } else {
-        HANDOFF_COUNT.fetch_add(1, Ordering::Relaxed);
+        telemetry.record_handoff();
     }
 }
 
@@ -1335,6 +1309,7 @@ fn promote_locally(
     stream_len: Duration,
     slots: &mut Vec<PoolSlot>,
     token_index: &mut HashMap<usize, usize>,
+    telemetry: &srt_transport::IngressTelemetry,
 ) {
     let mut socket = match bind_reuseport(port, sock_buf_bytes) {
         Ok(s) => s,
@@ -1371,7 +1346,7 @@ fn promote_locally(
         stream_deadline: now + stream_len,
         last_data_at: now,
     });
-    PROMOTION_COUNT.fetch_add(1, Ordering::Relaxed);
+    telemetry.record_local_promotion();
 }
 
 /// Service one readiness event against an established slot by token:
