@@ -87,6 +87,13 @@ pub fn run(cfg: LossConfig) {
     {
         return run_reuseport_multi(cfg, k);
     }
+    if cfg.mode == crate::Mode::Receiver
+        && cfg.connections > 1
+        && let crate::Ingress::SharedPool(k) = cfg.ingress
+        && k > 1
+    {
+        return run_shared_pool(cfg, k);
+    }
     smol::block_on(drive(cfg));
 }
 
@@ -820,4 +827,146 @@ async fn established_conn_task(mut driver: Conn, cfg: LossConfig, start: Instant
         stats.rtt_us = s.rtt as u64;
     }
     stats
+}
+
+// ---------------------------------------------------------------------------
+// #2: SharedPool -- K plainly-bound ports, no SO_REUSEPORT, no promotion
+// ---------------------------------------------------------------------------
+
+/// K real ports, each socket serving many peers by peer-address dispatch
+/// for their whole life. The control the reuseport strategies are
+/// measured against: it isolates "fewer sockets and wakeups" from
+/// "kernel-level demux", which is `ReuseportMulti`'s job. Single-threaded
+/// by design, so any win here is not just extra cores.
+fn run_shared_pool(cfg: LossConfig, k: usize) {
+    let start = Instant::now();
+    println!("LISTENING");
+    let agg_cfg = cfg.clone();
+    let ex = async_executor::LocalExecutor::new();
+    let stats = smol::block_on(ex.run(async {
+        let mut tasks = Vec::new();
+        for index in 0..k {
+            let cfg = cfg.clone();
+            tasks.push(ex.spawn(async move { serve_pool_socket(cfg, index, start).await }));
+        }
+        let mut all = Vec::new();
+        for t in tasks {
+            all.extend(t.await);
+        }
+        all
+    }));
+
+    let mut agg = Aggregate::new(agg_cfg);
+    for s in stats {
+        agg.add(s);
+    }
+    agg.print(start);
+    if !agg.any_connected {
+        eprintln!("[bench-smol] shared pool admitted no connections");
+        std::process::exit(1);
+    }
+}
+
+/// One pool socket, from bind to the last peer going terminal.
+async fn serve_pool_socket(cfg: LossConfig, index: usize, start: Instant) -> Vec<ConnStats> {
+    let addr = SocketAddr::new(
+        std::net::IpAddr::from([0, 0, 0, 0]),
+        cfg.port + index as u16,
+    );
+    let std_socket = std::net::UdpSocket::bind(addr).expect("bind shared-pool socket");
+    std_socket
+        .set_nonblocking(true)
+        .expect("nonblocking shared-pool socket");
+    {
+        use std::os::fd::AsRawFd;
+        let _ = srt_transport::set_sock_bufs(std_socket.as_raw_fd(), cfg.sock_buf_bytes);
+    }
+    let sock = UdpSocket::new(std_socket).expect("register pool socket");
+
+    let mut peers = srt_transport::PeerTable::new();
+    // No SO_REUSEPORT group here, so nothing can rehash and there is
+    // nowhere to forward to: one worker, cookie routing inert.
+    let admission = srt_transport::AdmissionOptions {
+        socket_id: std::process::id(),
+        tsbpd_delay: cfg.latency_ms,
+        cookie_routing: false,
+    };
+    let connect_deadline = Instant::now() + crate::INTEROP_CONNECT_TIMEOUT;
+    let stream_len = Duration::from_secs_f64(cfg.duration_secs);
+    let run_deadline = Instant::now() + stream_len + IDLE_GRACE + Duration::from_secs(30);
+    let mut buf = [0u8; 2048];
+    let mut outbound: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
+    let mut connected: Vec<SocketAddr> = Vec::new();
+    let _ = &mut buf;
+
+    loop {
+        let now = Instant::now();
+        if now >= run_deadline {
+            break;
+        }
+        if now >= connect_deadline && peers.all_terminal(now, connect_deadline, IDLE_GRACE) {
+            break;
+        }
+
+        let recv_fut = async { sock.recv_from(&mut buf).await.ok() };
+        let tick = async {
+            smol::Timer::after(TIMER_TICK).await;
+            None
+        };
+        if let Some((n, peer)) = futures_lite::future::or(recv_fut, tick).await {
+            admit_one(&mut peers, &admission, peer, &buf[..n], start);
+            while let Ok((n, peer)) = sock.get_ref().recv_from(&mut buf) {
+                admit_one(&mut peers, &admission, peer, &buf[..n], start);
+            }
+        }
+
+        let t = crate::now_ts(start);
+        peers.poll_outbound(t, &mut outbound);
+        for (peer, bytes) in outbound.drain(..) {
+            let _ = sock.send_to(&bytes, peer).await;
+        }
+        // SharedPool never promotes, so a first Connected only starts the
+        // stream clock -- which drain_events already did.
+        peers.drain_events(stream_len, &mut connected);
+    }
+
+    peers
+        .into_iter()
+        .map(|(_peer, p)| {
+            let mut s = ConnStats {
+                connected: p.stream_deadline.is_some(),
+                data_events: p.data_events,
+                ..Default::default()
+            };
+            if let Some(st) = p.conn.receiver_stats() {
+                s.has_stats = true;
+                s.core_total = st.total_received;
+                s.secondary_a = st.total_lost;
+                s.secondary_b = st.total_duplicates;
+                s.rtt_us = st.rtt as u64;
+            }
+            s
+        })
+        .collect()
+}
+
+/// Admit one datagram. No reuseport group means no cookie forwarding, so
+/// this is the table's admit with a single-worker view.
+fn admit_one(
+    peers: &mut srt_transport::PeerTable,
+    admission: &srt_transport::AdmissionOptions,
+    peer: SocketAddr,
+    data: &[u8],
+    start: Instant,
+) {
+    let telemetry = srt_transport::IngressTelemetry::new();
+    let _ = peers.admit(
+        peer,
+        data,
+        crate::now_ts(start),
+        admission,
+        0,
+        1,
+        &telemetry,
+    );
 }

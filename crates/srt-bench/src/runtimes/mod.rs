@@ -76,7 +76,42 @@ pub mod tokio;
 use crate::{LossConfig, Runtime};
 
 /// Dispatch to the selected runtime's driver.
+/// Exit code for "this runtime does not implement that ingress
+/// strategy". Distinct from a real failure so a sweep can tell a gap in
+/// coverage from a bug.
+pub const EXIT_UNSUPPORTED: i32 = 3;
+
+/// Does `runtime` actually implement `ingress` on the receiving side?
+///
+/// Only mio has all four. Asking a runtime for one it lacks used to fall
+/// through to the per-port path, where every connection computes the same
+/// handful of ports and they collide on bind -- surfacing as a pile of
+/// EADDRINUSE panics rather than "not implemented", which is alarming and
+/// hard to tell from a real port-allocation bug. Checked up front instead.
+#[must_use]
+pub fn ingress_supported(runtime: Runtime, ingress: crate::Ingress) -> bool {
+    match ingress {
+        crate::Ingress::PerPort
+        | crate::Ingress::ReuseportMulti(_)
+        | crate::Ingress::SharedPool(_) => true,
+        crate::Ingress::ReuseportSingle { .. } => matches!(runtime, Runtime::Mio),
+    }
+}
+
 pub fn run(cfg: LossConfig) {
+    // Receivers are what bind; a sender just dials whatever the topology
+    // says, so it needs no capability of its own.
+    if cfg.mode == crate::Mode::Receiver
+        && cfg.connections > 1
+        && !ingress_supported(cfg.runtime, cfg.ingress)
+    {
+        eprintln!(
+            "srt-bench: {} does not implement --ingress {} (only mio does)",
+            cfg.runtime.name(),
+            crate::harness::describe_ingress(cfg.ingress),
+        );
+        std::process::exit(EXIT_UNSUPPORTED);
+    }
     match cfg.runtime {
         Runtime::Mio => mio::run(cfg),
         Runtime::Tokio => tokio::run(cfg),

@@ -293,13 +293,46 @@ pub fn report(results: &[Record], group_by: &[String]) -> String {
 /// One axis of the sweep: a name and the values to try.
 type Axis = (&'static str, Vec<String>);
 
-/// Bind an ephemeral UDP port, then release it, to find one that is free.
+/// Find `count` consecutive free UDP ports and return the base.
 ///
-/// Racy in principle, but each cell runs to completion before the next
-/// starts, so there is exactly one candidate in flight at a time.
-fn free_port() -> std::io::Result<u16> {
-    let sock = std::net::UdpSocket::bind("127.0.0.1:0")?;
-    Ok(sock.local_addr()?.port())
+/// A cell may need a whole range, not one port: `per-port` binds
+/// `base..base+connections`, and `shared-pool:K` binds `base..base+K`.
+/// Reserving a single port and assuming the rest of the range is free is
+/// how a sweep ends up with half its tokio cells dying on EADDRINUSE.
+///
+/// Candidates come from below the ephemeral range
+/// (`/proc/sys/net/ipv4/ip_local_port_range`, 32768+ on this host)
+/// because the kernel hands those out to unrelated sockets while the
+/// sweep runs, so a port that probes free can be taken moments later.
+fn free_port_range(count: usize) -> std::io::Result<u16> {
+    const LOW: u16 = 20_000;
+    const HIGH: u16 = 31_000;
+    let span = u32::from(HIGH - LOW) - count as u32;
+    for attempt in 0..200u32 {
+        // Cheap spread without pulling in a RNG: the clock's low bits,
+        // walked forward on each retry.
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let base = LOW
+            + ((seed
+                .wrapping_mul(2_654_435_761)
+                .wrapping_add(attempt * 7_919))
+                % span) as u16;
+        // Hold every port at once: binding them one at a time would let
+        // the range be interleaved with someone else's socket.
+        let held: Vec<std::net::UdpSocket> = (0..count)
+            .map_while(|i| std::net::UdpSocket::bind(("127.0.0.1", base + i as u16)).ok())
+            .collect();
+        if held.len() == count {
+            return Ok(base);
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AddrInUse,
+        format!("no run of {count} free ports in {LOW}..{HIGH}"),
+    ))
 }
 
 fn axis_values(cli: &crate::Cli, flag: &str, default: &str) -> Vec<String> {
@@ -365,25 +398,49 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
         out.display()
     );
 
+    let mut skipped = 0usize;
     for (index, cell) in cells.iter().enumerate() {
         let label: Vec<String> = cell.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        let value = |name: &str| -> Option<String> {
+            cell.iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| v.clone())
+        };
+        let ingress = value("ingress").unwrap_or_else(|| "per-port".into());
+        let conns_in_cell: usize = value("connections")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        let bitrate = value("bitrate").unwrap_or_else(|| "8000000".into());
+        let runtime = value("runtime").unwrap_or_else(|| "mio".into());
+        // per-port needs one port per connection; the pooled and
+        // reuseport strategies need at most K. Ask for the worst case
+        // this cell could use.
+        let ports_needed = if ingress == "per-port" {
+            conns_in_cell
+        } else {
+            ingress
+                .split_once(':')
+                .and_then(|(_, k)| k.parse().ok())
+                .unwrap_or(1)
+        };
+        // Skip combinations the runtime does not implement rather than
+        // running them and recording the wreckage: an unsupported cell
+        // produces bind collisions that look exactly like a harness bug.
+        if !crate::runtimes::ingress_supported(
+            crate::Runtime::parse(&runtime).unwrap_or(crate::Runtime::Mio),
+            parse_ingress_spec(&ingress),
+        ) {
+            skipped += 1;
+            eprintln!("[skip] {} (unsupported)", label.join(" "));
+            continue;
+        }
         for rep in 1..=reps {
-            let port = free_port()?;
+            let port = free_port_range(ports_needed)?;
             let flags: Vec<String> = cell
                 .iter()
                 .filter(|(k, _)| *k != "bitrate")
                 .map(|(k, v)| format!("--{k}={v}"))
                 .collect();
-            let bitrate = cell
-                .iter()
-                .find(|(k, _)| *k == "bitrate")
-                .map(|(_, v)| v.clone())
-                .unwrap_or_else(|| "8000000".into());
-            let runtime = cell
-                .iter()
-                .find(|(k, _)| *k == "runtime")
-                .map(|(_, v)| v.clone())
-                .unwrap_or_else(|| "mio".into());
             let common: Vec<String> = flags
                 .iter()
                 .filter(|f| !f.starts_with("--runtime="))
@@ -437,7 +494,22 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
             );
         }
     }
+    if skipped > 0 {
+        eprintln!("matrix: skipped {skipped} unsupported cells");
+    }
     Ok(())
+}
+
+/// Re-parse an ingress spec as recorded in a result file (`:` separated).
+fn parse_ingress_spec(spec: &str) -> crate::Ingress {
+    match spec.split_once(':') {
+        Some(("shared-pool", k)) => crate::Ingress::SharedPool(k.parse().unwrap_or(1)),
+        Some(("reuseport-multi", k)) => crate::Ingress::ReuseportMulti(k.parse().unwrap_or(1)),
+        Some(("reuseport-single", w)) => crate::Ingress::ReuseportSingle {
+            workers: w.parse().unwrap_or(1),
+        },
+        _ => crate::Ingress::PerPort,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -493,7 +565,7 @@ pub fn run_sysprof(cli: &crate::Cli) -> std::io::Result<()> {
             .unwrap_or_else(|| "scratch".to_string()),
     );
     std::fs::create_dir_all(&dir)?;
-    let port = free_port()?;
+    let port = free_port_range(1)?;
 
     let results = dir.join(format!("sysprof_{runtime}.tsv"));
     let _ = std::fs::remove_file(&results);

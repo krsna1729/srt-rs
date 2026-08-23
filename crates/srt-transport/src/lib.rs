@@ -440,6 +440,67 @@ impl PeerTable {
         }
     }
 
+    /// Fire every peer's due timers and collect what they want to send.
+    ///
+    /// Timer outputs are applied to the peer's own store; only packets
+    /// come back, because sending is the one part of the maintenance tick
+    /// that is genuinely per-runtime. `out` is reused across ticks rather
+    /// than reallocated -- this runs once per tick per acceptor.
+    pub fn poll_outbound(
+        &mut self,
+        now: Timestamp,
+        out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
+    ) {
+        out.clear();
+        for (peer, entry) in &mut self.peers {
+            entry.timers.fire_expired(now, &mut entry.conn);
+            while let Some(output) = entry.conn.poll_output() {
+                match output {
+                    ConnectionOutput::SendPacket(bytes) => out.push((*peer, bytes)),
+                    other => entry.timers.apply_output(&other, now),
+                }
+            }
+        }
+    }
+
+    /// Drain protocol events into per-peer bookkeeping.
+    ///
+    /// Returns, in `newly_connected`, the peers whose *first* `Connected`
+    /// fired on this tick -- the moment a promotion decision is due.
+    /// `stream_len` sets each one's stream deadline from now.
+    pub fn drain_events(
+        &mut self,
+        stream_len: Duration,
+        newly_connected: &mut Vec<std::net::SocketAddr>,
+    ) {
+        newly_connected.clear();
+        for (peer, entry) in &mut self.peers {
+            let mut first_connect = false;
+            while let Some(event) = entry.conn.poll_event() {
+                match event {
+                    shiguredo_srt::ConnectionEvent::Connected => {
+                        if entry.stream_deadline.is_none() {
+                            first_connect = true;
+                        }
+                        entry.connected = true;
+                    }
+                    shiguredo_srt::ConnectionEvent::DataReceived { .. } => {
+                        entry.data_events += 1;
+                        entry.last_data_at = Instant::now();
+                    }
+                    shiguredo_srt::ConnectionEvent::Disconnected { .. } => {
+                        entry.connected = false;
+                    }
+                    _ => {}
+                }
+            }
+            if first_connect {
+                entry.stream_deadline = Some(Instant::now() + stream_len);
+                newly_connected.push(*peer);
+            }
+        }
+    }
+
     #[must_use]
     pub fn contains(&self, peer: &std::net::SocketAddr) -> bool {
         self.peers.contains_key(peer)
