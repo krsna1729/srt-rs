@@ -10,10 +10,10 @@ use shiguredo_srt::{
     ConnectionEvent, ConnectionOptions, GroupExtensionData, GroupType, SRTGROUP_MASK, SrtConnection,
 };
 use srt_transport::mio_transport::Conn;
+use srt_transport::{Handoff, WorkerMessage};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
@@ -682,37 +682,6 @@ fn slot_is_terminal(slot: &PoolSlot, now: Instant) -> bool {
 /// itself noticed a disconnect.
 const IDLE_GRACE: Duration = Duration::from_secs(10);
 
-/// Bond-affinity handoff payload: a fully promoted slot shipped from the
-/// acceptor that completed its handshake to the thread that owns the group.
-struct Handoff {
-    socket: UdpSocket,
-    conn: SrtConnection,
-}
-
-enum WorkerMessage {
-    Handoff(Box<Handoff>),
-    /// A handshake datagram that the kernel delivered to the wrong
-    /// acceptor. The cookie it carries names the acceptor that owns the
-    /// half-open handshake, so the receiving acceptor forwards it there
-    /// rather than answering it (which would fail cookie validation) or
-    /// dropping it (which costs a handshake retry). See
-    /// `srt_lifecycle::cookie_for_worker`.
-    Handshake {
-        peer: SocketAddr,
-        data: Vec<u8>,
-    },
-    /// #3 (`ReuseportSingle`) only: the one acceptor has stopped
-    /// admitting and tells each worker exactly how many connections it
-    /// will ever receive, so a worker can tell "no more are coming" apart
-    /// from "none have arrived yet" instead of relying on a wall-clock
-    /// guess. #4 (`ReuseportMulti`) never sends this -- every acceptor
-    /// there is also a worker, so there's no separate admission-done
-    /// signal to send.
-    Finished {
-        total: usize,
-    },
-}
-
 /// Stable per-peer entropy for the upper bits of a SYN cookie, so cookies
 /// differ per connection instead of being one constant per worker.
 fn peer_hash(peer: SocketAddr) -> u32 {
@@ -983,7 +952,7 @@ fn run_pool_acceptor(
                 }
                 WorkerMessage::Finished { .. } => continue,
             };
-            let mut socket = handoff.socket;
+            let mut socket = UdpSocket::from_std(handoff.socket);
             let token = Token(next_token);
             next_token += 1;
             if poll
@@ -1270,7 +1239,7 @@ fn relocate_to_owner(
     senders: &[mpsc::Sender<WorkerMessage>],
     telemetry: &srt_transport::IngressTelemetry,
 ) {
-    let socket = match bind_reuseport(port, sock_buf_bytes) {
+    let socket = match srt_transport::bind_reuseport(port, sock_buf_bytes) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[bench-mio] relocate {peer}: bind {e}");
@@ -1645,7 +1614,7 @@ fn route_to_worker(
     senders: &[mpsc::Sender<WorkerMessage>],
     per_worker_count: &mut [usize],
 ) {
-    let socket = match bind_reuseport(port, sock_buf_bytes) {
+    let socket = match srt_transport::bind_reuseport(port, sock_buf_bytes) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[bench-mio] route {peer}: bind {e}");
@@ -1731,7 +1700,7 @@ fn run_worker(
                 // #3 has a single acceptor, so nothing is ever forwarded.
                 WorkerMessage::Handshake { .. } => continue,
                 WorkerMessage::Handoff(handoff) => {
-                    let mut socket = handoff.socket;
+                    let mut socket = UdpSocket::from_std(handoff.socket);
                     let token = Token(next_token);
                     next_token += 1;
                     if poll
@@ -1788,9 +1757,12 @@ mod bond_affinity_tests {
     /// bind_reuseport -> connect sequence used at promotion time.
     #[test]
     fn handoff_round_trips_through_channel() {
+        // A Handoff carries the plain std socket, not a mio one: the
+        // type only accepts `Send` parts, which is what makes the
+        // cross-thread move sound.
         let socket = {
-            let s =
-                bind_reuseport(0, srt_transport::SOCK_BUF_BYTES).expect("bind ephemeral reuseport");
+            let s = srt_transport::bind_reuseport(0, srt_transport::SOCK_BUF_BYTES)
+                .expect("bind ephemeral reuseport");
             s.connect("127.0.0.1:1".parse::<SocketAddr>().unwrap())
                 .expect("connect");
             s

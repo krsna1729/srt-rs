@@ -70,11 +70,11 @@ use shiguredo_srt::{
     ConnectionEvent, ConnectionOptions, GroupExtensionData, GroupType, SRTGROUP_MASK, SrtConnection,
 };
 use srt_transport::glommio_transport::Conn;
+use srt_transport::{Handoff, WorkerMessage};
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
@@ -388,31 +388,6 @@ async fn receiver_task(cfg: LossConfig, listen_port: u16, start: Instant) -> Con
 // tasks for steady state.
 // ---------------------------------------------------------------------------
 
-/// A connected socket + protocol state shipped from the acceptor that
-/// completed its handshake to the thread that owns its bond group. Ships
-/// the raw `std::net::UdpSocket` (plain, `Send`) rather than a
-/// `glommio_transport::Conn` (whose native timer future is `!Send`, and
-/// whose socket is bound to a specific executor's reactor) -- the
-/// receiving thread reconstructs `Conn` locally after re-registering the
-/// socket with its own executor's reactor.
-struct Handoff {
-    socket: std::net::UdpSocket,
-    conn: SrtConnection,
-}
-
-enum WorkerMessage {
-    Handoff(Box<Handoff>),
-    /// A handshake datagram the kernel delivered to the wrong acceptor.
-    /// Its SYN cookie names the acceptor that owns the half-open
-    /// handshake, so it is forwarded there rather than answered here
-    /// (which would fail cookie validation) or dropped (which costs a
-    /// handshake retry). See `srt_lifecycle::cookie_for_worker`.
-    Handshake {
-        peer: SocketAddr,
-        data: Vec<u8>,
-    },
-}
-
 /// Datagrams handed from the reader task to the maintenance loop; see
 /// `run_acceptor`'s `inbox`.
 type Inbox = Rc<RefCell<VecDeque<(SocketAddr, Vec<u8>)>>>;
@@ -669,6 +644,11 @@ async fn run_acceptor(
                 WorkerMessage::Handoff(handoff) => handoff,
                 // A handshake datagram routed here by its cookie: feed it
                 // to the peer state that owns it.
+                // Only the single-acceptor strategy sends this, and it
+                // never targets a ReuseportMulti acceptor. Named rather
+                // than caught by `_` so a new variant still has to be
+                // considered here.
+                WorkerMessage::Finished { .. } => continue,
                 WorkerMessage::Handshake { peer, data } => {
                     admit(
                         &mut peers,
