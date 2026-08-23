@@ -235,6 +235,17 @@ pub struct LossConfig {
     /// Repetition index, recorded so a report can take medians across
     /// repeats of the same cell.
     pub rep: usize,
+    /// Logical CPUs this process is restricted to. `0` leaves the
+    /// inherited affinity alone.
+    ///
+    /// Recorded in results because a benchmark that does not state its
+    /// CPU budget cannot be compared against one from another machine.
+    pub cpus: usize,
+    /// Pin each executor to its own CPU where the runtime supports it
+    /// (glommio's `Placement::Fixed`). Off by default, because pinning is
+    /// a real variable: glommio and monoio are thread-per-core designs
+    /// that assume it, while the others do not.
+    pub pin: bool,
 }
 
 /// See [`LossConfig::batching`].
@@ -454,7 +465,7 @@ pub fn bench_config_from_args() -> LossConfig {
              [bitrate_bps] [--connections N] \
              [--ingress per-port|shared-pool=K|reuseport-multi=K|reuseport-single=W] \
              [--bond broadcast:G|backup:G|none] [--batch on|off] \
-             [--connect-concurrency N] [--promotion never|relocate|bonded|all] [--cookie-routing on|off] [--sock-buf N|Nk|Nm|default] [--out FILE]"
+             [--connect-concurrency N] [--promotion never|relocate|bonded|all] [--cookie-routing on|off] [--sock-buf N|Nk|Nm|default] [--out FILE] [--cpus N] [--pin on|off]"
         );
         std::process::exit(2)
     }
@@ -609,6 +620,17 @@ pub fn bench_config_from_args() -> LossConfig {
         }
     };
 
+    let cpus = cli.flag_or("cpus", 0usize);
+    if cpus > 0
+        && let Err(e) = srt_transport::restrict_to_cpus(cpus)
+    {
+        eprintln!("warning: could not restrict to {cpus} CPUs: {e}");
+    }
+    let pin = matches!(
+        cli.flags.get("pin").map(String::as_str),
+        Some("") | Some("on")
+    );
+
     let out = cli
         .flags
         .get("out")
@@ -635,5 +657,7 @@ pub fn bench_config_from_args() -> LossConfig {
         sock_buf_bytes,
         out,
         rep,
+        cpus,
+        pin,
     }
 }

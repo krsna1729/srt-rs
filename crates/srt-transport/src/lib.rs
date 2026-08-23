@@ -277,6 +277,54 @@ unsafe fn sockaddr_to_addr(storage: &libc::sockaddr_storage) -> Option<std::net:
 }
 
 // ---------------------------------------------------------------------------
+// CPU budget
+// ---------------------------------------------------------------------------
+
+/// Restrict this process to the first `cpus` logical CPUs.
+///
+/// Benchmarks that do not say how much CPU they were given are not
+/// reproducible: the same binary on a 6-core and a 64-core host is two
+/// different experiments. Setting an explicit affinity mask makes the
+/// budget a controlled, recorded variable rather than a property of
+/// whatever machine happened to run it.
+///
+/// `0` means "leave the inherited mask alone" (free-running).
+pub fn restrict_to_cpus(cpus: usize) -> std::io::Result<()> {
+    if cpus == 0 {
+        return Ok(());
+    }
+    // SAFETY: `set` is a correctly sized, zeroed cpu_set_t, and the
+    // syscall only reads it.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        for cpu in 0..cpus {
+            libc::CPU_SET(cpu, &mut set);
+        }
+        if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// How many logical CPUs this process may currently run on.
+#[must_use]
+pub fn available_cpus() -> usize {
+    // SAFETY: `set` is a correctly sized cpu_set_t the syscall fills in.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
+            return std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        }
+        (0..libc::CPU_SETSIZE as usize)
+            .filter(|cpu| libc::CPU_ISSET(*cpu, &set))
+            .count()
+            .max(1)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Admission peer table — shared by every reuseport ingress strategy
 // ---------------------------------------------------------------------------
 

@@ -99,6 +99,24 @@ fn promote_locally(
     Some(Conn::new(conn, sock))
 }
 
+/// glommio is a thread-per-core design: it assumes its executor owns a
+/// CPU and keeps its io_uring and caches local to it. Running it
+/// `Unbound` -- which is what `LocalExecutorBuilder::default()` does --
+/// lets the scheduler migrate it, which is testing it outside the model
+/// it was built for.
+///
+/// `--pin=on` gives each executor a fixed CPU, round-robined over the
+/// CPUs this process is actually allowed to use. Off by default so it
+/// stays a declared variable rather than a hidden one.
+fn executor_builder(cfg: &LossConfig, index: usize) -> glommio::LocalExecutorBuilder {
+    let placement = if cfg.pin {
+        glommio::Placement::Fixed(index % srt_transport::available_cpus())
+    } else {
+        glommio::Placement::Unbound
+    };
+    glommio::LocalExecutorBuilder::new(placement).io_memory(4096)
+}
+
 pub fn run(cfg: LossConfig) {
     if cfg.mode == crate::Mode::Receiver
         && cfg.connections > 1
@@ -127,8 +145,7 @@ pub fn run(cfg: LossConfig) {
     // submitting a fresh recv SQE per datagram at 455k pps aggregate
     // saturates it. io_memory() sizes the SQ/CQ rings via glommio's public
     // builder API (no source modification).
-    let any_connected = glommio::LocalExecutorBuilder::default()
-        .io_memory(4096)
+    let any_connected = executor_builder(&cfg, 0)
         .spawn(move || async move { drive(c2).await })
         .expect("failed to spawn glommio LocalExecutor")
         .join()
@@ -423,8 +440,7 @@ fn run_reuseport_multi(cfg: LossConfig, k: usize) {
         let telemetry = telemetry.clone();
         let all_senders = senders.clone();
         handles.push(
-            glommio::LocalExecutorBuilder::default()
-                .io_memory(4096)
+            executor_builder(&cfg, worker_index)
                 .name(&format!("srt-acceptor-{worker_index}"))
                 .spawn(move || async move {
                     run_acceptor(cfg, worker_index, start, router, all_senders, rx, telemetry).await
@@ -850,8 +866,7 @@ fn run_shared_pool(cfg: LossConfig, k: usize) {
     let start = Instant::now();
     println!("LISTENING");
     let agg_cfg = cfg.clone();
-    let stats = glommio::LocalExecutorBuilder::default()
-        .io_memory(4096)
+    let stats = executor_builder(&cfg, 0)
         .spawn(move || async move {
             let mut tasks = Vec::new();
             for index in 0..k {
@@ -1013,8 +1028,7 @@ fn run_reuseport_single(cfg: LossConfig, workers: usize) {
             std::thread::Builder::new()
                 .name(format!("srt-worker-{worker_index}"))
                 .spawn(move || {
-                    glommio::LocalExecutorBuilder::default()
-                        .io_memory(4096)
+                    executor_builder(&cfg, worker_index)
                         .spawn(move || async move { run_pool_worker(cfg, start, rx).await })
                         .expect("spawn glommio worker")
                         .join()
@@ -1028,8 +1042,7 @@ fn run_reuseport_single(cfg: LossConfig, workers: usize) {
     {
         let router = router.clone();
         let senders = senders.clone();
-        glommio::LocalExecutorBuilder::default()
-            .io_memory(4096)
+        executor_builder(&cfg, 0)
             .spawn(move || async move {
                 run_single_acceptor(&cfg, start, &router, &senders).await;
             })

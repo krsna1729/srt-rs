@@ -149,10 +149,14 @@ downstream tool re-parses stdout. Field meanings:
   16% on shared-pool; glommio fails at *low* N and recovers as N rises,
   which identifies its limit as packet rate rather than connection count.
 
-- [`docs/runtime-selection-for-restream.md`](docs/runtime-selection-for-restream.md)
-  — picks a runtime for a real consumer (`/home/dev/restream`) from its
-  actual workload: one public ingest port, bonded, 512 connections.
-  **tokio**, on CPU-per-delivered-packet with dispersion over 7 reps.
+- [`docs/runtime-selection.md`](docs/runtime-selection.md) — a worked
+  *method* for choosing a runtime for your own workload, applied to one
+  profile (single ingest port, bonded, 512 connections). srt-rs does not
+  name a global winner: which runtime wins depends on the workload, and
+  the constraints usually eliminate options before any measurement.
+- [`docs/cpu-budget.md`](docs/cpu-budget.md) — how much CPU the
+  benchmarks are given, why it matters, and what the numbers are
+  measuring when nothing is compute-bound.
 
 Raw TSVs sit beside each report. Rankings hold only within one
 measurement window on a shared-tenant box.
