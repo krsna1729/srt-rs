@@ -35,6 +35,20 @@
 //! `.await`s `recv_from` in a genuine (non-blocking-executor) loop,
 //! decoupled from the maintenance tick, handing datagrams to the main
 //! loop through a local `Rc<RefCell<VecDeque>>` queue.
+//!
+//! KNOWN LIMITATION (measured), same character as the PerPort one above
+//! but with a much lower threshold: at bench.sh's default 8Mbps/conn, #4
+//! degrades badly (listener under-delivers, well below what the caller
+//! sent) starting at just N=25 (~200Mbps aggregate) despite `sec_a=0
+//! sec_b=0` -- SRT's own loss tracking never fires, so affected
+//! connections are stalling under an overwhelmed shared listener rather
+//! than losing-and-recovering. mio and tokio stay perfectly clean up to
+//! N=150 (~1.2Gbps aggregate) under the identical architecture. This is
+//! NOT a connection-count/density effect (ruled out: at 500kbps/conn --
+//! 16x lower per-conn rate -- N=6 delivers perfectly, repeated 3x). Not
+//! chased further this session -- a real fix (concurrent/batched peer
+//! dispatch instead of sequential per-tick awaits, or profiling the
+//! actual hot path) is a substantial task on its own.
 
 use crate::{Aggregate, BondMode, ConnStats, LossConfig};
 use shiguredo_srt::{

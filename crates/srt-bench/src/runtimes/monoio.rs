@@ -37,6 +37,25 @@
 //! 5-6x listener CPU-sys time and nonzero retransmits: every new socket
 //! joining the reuseport group can reroute some other still-pending
 //! flow's next datagram to a different acceptor mid-handshake.
+//!
+//! KNOWN LIMITATION (measured), on top of the one above: at bench.sh's
+//! default 8Mbps/conn, #4 degrades badly (listener under-delivers, well
+//! below what the caller sent) starting at just N=25 (~200Mbps aggregate)
+//! despite `sec_a=0 sec_b=0` -- SRT's own loss tracking never fires, so
+//! affected connections are stalling under an overwhelmed shared listener
+//! rather than losing-and-recovering. mio and tokio stay perfectly clean
+//! up to N=150 (~1.2Gbps aggregate) under the identical architecture. This
+//! is NOT a connection-count/density effect (ruled out: at 500kbps/conn --
+//! 16x lower per-conn rate -- N=6 delivers perfectly, repeated 3x). It's a
+//! raw per-packet-operation-overhead ceiling: owned-buffer io_uring
+//! completion round-trips cost measurably more per recv/send than mio's
+//! raw non-blocking syscalls or tokio's reactor at this packet rate, and
+//! #4 concentrates that cost onto only K threads. Same character of issue
+//! as glommio.rs's own `PerPort`-specific "KNOWN LIMITATION" (measured
+//! N>=300 there), just with a lower threshold here. Not chased further
+//! this session -- a real fix (concurrent/batched peer dispatch instead of
+//! sequential per-tick awaits, or profiling the actual hot path) is a
+//! substantial task on its own.
 
 use crate::{Aggregate, BondMode, ConnStats, LossConfig};
 use shiguredo_srt::{
