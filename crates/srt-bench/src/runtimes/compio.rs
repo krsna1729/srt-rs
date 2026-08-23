@@ -113,15 +113,9 @@ pub fn run(cfg: LossConfig) {
     {
         return run_reuseport_single(cfg, workers);
     }
-    let rt = compio::runtime::Runtime::builder()
-        .build()
-        .expect("compio runtime");
-    rt.block_on(drive(cfg));
-}
-
-async fn drive(cfg: LossConfig) {
     let start = Instant::now();
     if cfg.mode == crate::Mode::Receiver {
+        // Before any worker starts: the harness waits on this line.
         println!("LISTENING");
         if cfg.connections > 1 {
             eprintln!(
@@ -132,8 +126,27 @@ async fn drive(cfg: LossConfig) {
         }
     }
 
-    let mut handles = Vec::with_capacity(cfg.connections);
-    for i in 0..cfg.connections {
+    let stats = crate::run_workers(&cfg, move |cfg, mine| {
+        compio::runtime::Runtime::builder()
+            .build()
+            .expect("compio runtime")
+            .block_on(drive(cfg, mine, start))
+    });
+
+    let mut agg = Aggregate::new(cfg);
+    for s in stats {
+        agg.add(s);
+    }
+    agg.print(start);
+    if !agg.any_connected {
+        std::process::exit(1);
+    }
+}
+
+/// Drive one worker's share of the connections on this thread's runtime.
+async fn drive(cfg: LossConfig, mine: Vec<usize>, start: Instant) -> Vec<crate::ConnStats> {
+    let mut handles = Vec::with_capacity(mine.len());
+    for i in mine {
         let endpoint = cfg.addr_for(i);
         let c2 = cfg.clone();
         handles.push(compio::runtime::spawn(async move {
@@ -143,18 +156,13 @@ async fn drive(cfg: LossConfig) {
             }
         }));
     }
-
-    let mut agg = Aggregate::new(cfg.clone());
+    let mut out = Vec::with_capacity(handles.len());
     for h in handles {
         if let Ok(stats) = h.await {
-            agg.add(stats);
+            out.push(stats);
         }
     }
-    agg.print(start);
-
-    if !agg.any_connected {
-        std::process::exit(1);
-    }
+    out
 }
 
 /// Bond exercise: connections 2g/2g+1 (for g in 0..bond_pairs) share a

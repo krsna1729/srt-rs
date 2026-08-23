@@ -95,7 +95,17 @@ struct Driver {
 /// one at a time as `connect_concurrency` allows -- see
 /// `LossConfig::connect_concurrency`'s doc for why senders don't just
 /// create everything upfront.
-fn spawn_driver(cfg: &LossConfig, poll: &mut Poll, start: Instant, i: usize) -> Driver {
+/// `i` identifies the *connection* (its port, its bond group); `token`
+/// is its slot in this worker's `drivers` vec. They differ once
+/// `--workers` shards connections across threads, and conflating them
+/// would dispatch a readiness event to the wrong driver.
+fn spawn_driver(
+    cfg: &LossConfig,
+    poll: &mut Poll,
+    start: Instant,
+    i: usize,
+    token: usize,
+) -> Driver {
     let addr = cfg.addr_for(i);
     let mut socket = match cfg.mode {
         crate::Mode::Sender => {
@@ -107,7 +117,7 @@ fn spawn_driver(cfg: &LossConfig, poll: &mut Poll, start: Instant, i: usize) -> 
     };
     let _ = srt_transport::set_sock_bufs(socket.as_raw_fd(), cfg.sock_buf_bytes);
     poll.registry()
-        .register(&mut socket, Token(i), Interest::READABLE)
+        .register(&mut socket, Token(token), Interest::READABLE)
         .expect("register socket");
 
     // Bond exercise: connections 2g/2g+1 (for g in 0..bond_pairs) share a
@@ -221,21 +231,35 @@ pub fn run(cfg: LossConfig) {
         }
     }
 
+    let stats = crate::run_workers(&cfg, move |cfg, mine| drive(cfg, mine, start));
+
+    let mut agg = Aggregate::new(cfg);
+    for s in stats {
+        agg.add(s);
+    }
+    agg.print(start);
+    if !agg.any_connected {
+        std::process::exit(1);
+    }
+}
+
+/// Drive one worker's share of the connections on its own `Poll`.
+fn drive(cfg: LossConfig, mine: Vec<usize>, start: Instant) -> Vec<ConnStats> {
     let mut poll = Poll::new().expect("mio Poll::new");
     let mut events = Events::with_capacity(4096);
 
-    let mut drivers: Vec<Driver> = Vec::with_capacity(cfg.connections);
+    let mut drivers: Vec<Driver> = Vec::with_capacity(mine.len());
     // Receivers: no storm risk (each binds its own dedicated port, and the
     // socket must exist before its sender's first packet can arrive), so
     // create all of them upfront. Senders: prime up to `connect_concurrency`
     // and let the main loop below backfill the rest as earlier connections
     // finish handshaking -- see `LossConfig::connect_concurrency`'s doc.
     let priming = match cfg.mode {
-        crate::Mode::Receiver => cfg.connections,
-        crate::Mode::Sender => cfg.connect_concurrency.min(cfg.connections),
+        crate::Mode::Receiver => mine.len(),
+        crate::Mode::Sender => cfg.connect_concurrency.min(mine.len()),
     };
     for i in 0..priming {
-        drivers.push(spawn_driver(&cfg, &mut poll, start, i));
+        drivers.push(spawn_driver(&cfg, &mut poll, start, mine[i], i));
     }
     let mut next_to_start = priming;
 
@@ -255,7 +279,7 @@ pub fn run(cfg: LossConfig) {
         // `connected`) is what keeps one dead peer from hanging the whole
         // run -- the loop used to wait on it forever, since its
         // `stream_deadline` stays `None`.
-        let all_done = next_to_start >= cfg.connections
+        let all_done = next_to_start >= mine.len()
             && drivers.iter().all(|d| {
                 if d.connected {
                     d.stream_deadline
@@ -282,7 +306,7 @@ pub fn run(cfg: LossConfig) {
         // with `connect_concurrency=1` that is a total deadlock, and it
         // was observed as exactly that (a run that started 9 connections,
         // had 1 hang, and never started the other 141).
-        while next_to_start < cfg.connections {
+        while next_to_start < mine.len() {
             let in_flight = drivers
                 .iter()
                 .filter(|d| !d.connected && d.started_at.elapsed() < crate::INTEROP_CONNECT_TIMEOUT)
@@ -290,7 +314,13 @@ pub fn run(cfg: LossConfig) {
             if in_flight >= cfg.connect_concurrency {
                 break;
             }
-            drivers.push(spawn_driver(&cfg, &mut poll, start, next_to_start));
+            drivers.push(spawn_driver(
+                &cfg,
+                &mut poll,
+                start,
+                mine[next_to_start],
+                next_to_start,
+            ));
             next_to_start += 1;
         }
 
@@ -366,7 +396,7 @@ pub fn run(cfg: LossConfig) {
                 let dst = if let Some(peer) = d.peer {
                     peer
                 } else if cfg.mode == crate::Mode::Sender {
-                    cfg.addr_for(idx)
+                    cfg.addr_for(mine[idx])
                 } else {
                     continue;
                 };
@@ -397,7 +427,7 @@ pub fn run(cfg: LossConfig) {
                         if cfg.verbose() {
                             println!("CONNECTED");
                         } else {
-                            eprintln!("[bench-mio] scale conn {idx} CONNECTED");
+                            eprintln!("[bench-mio] scale conn {} CONNECTED", mine[idx]);
                         }
                     }
                     ConnectionEvent::DataReceived { .. } => {
@@ -441,7 +471,7 @@ pub fn run(cfg: LossConfig) {
         }
     }
 
-    let mut agg = Aggregate::new(cfg.clone());
+    let mut out = Vec::with_capacity(drivers.len());
     for d in drivers {
         let mut s = ConnStats {
             connected: d.connected,
@@ -467,14 +497,11 @@ pub fn run(cfg: LossConfig) {
                 }
             }
         }
-        agg.add(s);
+        out.push(s);
     }
-    agg.print(start);
-
-    if !agg.any_connected {
-        std::process::exit(1);
-    }
+    out
 }
+
 
 /// #2 -- shared pool, no promotion: K real, distinct, plainly-bound
 /// listener ports (no SO_REUSEPORT). Every one stays unconnected for its

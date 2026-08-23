@@ -28,7 +28,15 @@ pub const COLUMNS: &[&str] = &[
     "sock_buf",
     "cpus",
     "pin",
-    "netem",
+    "link_delay",
+    "link_jitter",
+    "link_loss",
+    "link_rate",
+    "link_reorder",
+    "link_duplicate",
+    "link_corrupt",
+    "link_limit",
+    "workers",
     "conns",
     "connect_cc",
     "bond",
@@ -138,7 +146,15 @@ pub fn append_result(
         cfg.sock_buf_bytes.to_string(),
         srt_transport::available_cpus().to_string(),
         if cfg.pin { "on" } else { "off" }.into(),
-        cfg.netem.clone(),
+        cfg.link.get("delay").to_string(),
+        cfg.link.get("jitter").to_string(),
+        cfg.link.get("loss").to_string(),
+        cfg.link.get("rate").to_string(),
+        cfg.link.get("reorder").to_string(),
+        cfg.link.get("duplicate").to_string(),
+        cfg.link.get("corrupt").to_string(),
+        cfg.link.get("limit").to_string(),
+        cfg.workers.to_string(),
         cfg.connections.to_string(),
         cfg.connect_concurrency.to_string(),
         describe_bond(cfg),
@@ -450,11 +466,16 @@ fn recorded_as(axis: &str, value: &str) -> (&'static str, String) {
                 }
             },
         ),
+        "workers" => ("workers", value.to_string()),
         "connections" => ("conns", value.to_string()),
         "connect-concurrency" => ("connect_cc", value.to_string()),
         "bond" => ("bond", value.to_string()),
         "bitrate" => ("bitrate", value.to_string()),
         "pin" => ("pin", value.to_string()),
+        link if link.starts_with("link-") => (
+            Box::leak(link.replace('-', "_").into_boxed_str()),
+            value.to_string(),
+        ),
         other => (
             Box::leak(other.to_string().into_boxed_str()),
             value.to_string(),
@@ -584,7 +605,15 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
         axis("batch", "batch", "on"),
         axis("sock-buf", "sock-buf", "16m"),
         axis("pin", "pin", "off"),
-        axis("netem", "netem", "none"),
+        axis("link-delay", "link-delay", "off"),
+        axis("link-jitter", "link-jitter", "off"),
+        axis("link-loss", "link-loss", "off"),
+        axis("link-rate", "link-rate", "off"),
+        axis("link-reorder", "link-reorder", "off"),
+        axis("link-duplicate", "link-duplicate", "off"),
+        axis("link-corrupt", "link-corrupt", "off"),
+        axis("link-limit", "link-limit", "off"),
+        axis("workers", "workers", "1"),
         axis("connections", "connections", "25"),
         axis("connect-concurrency", "connect-concurrency", "1"),
         axis("bond", "bond", "none"),
@@ -637,22 +666,26 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
     // `netem=none` ones: a namespace's loopback is not identical to the
     // host's, so mixing the two would confound the comparison the sweep
     // exists to make.
-    let netns = if cells
-        .iter()
-        .any(|cell| cell.iter().any(|(a, v)| *a == "netem" && v != "none"))
-    {
-        // Fail before the first cell rather than midway through a sweep.
-        for cell in &cells {
-            for (axis, value) in cell {
-                if *axis == "netem" && value != "none" {
-                    netem_args(value).map_err(std::io::Error::other)?;
-                }
-            }
+    let cell_link = |cell: &[(&str, String)], flag: &str| -> Option<String> {
+        cell.iter()
+            .find(|(a, _)| *a == flag)
+            .map(|(_, v)| v.clone())
+    };
+    // Fail before the first cell rather than midway through a sweep.
+    let mut any_link = false;
+    for cell in &cells {
+        if netem_args(|f| cell_link(cell, f))
+            .map_err(std::io::Error::other)?
+            .is_some()
+        {
+            any_link = true;
         }
+    }
+    let netns = if any_link {
         let p = Priv::detect()
             .ok_or_else(|| std::io::Error::other(netem_privilege_help()))?;
         netns_up(p)?;
-        eprintln!("matrix: running roles inside netns '{NETNS}' (netem active)");
+        eprintln!("matrix: running roles inside netns '{NETNS}' (link emulation active)");
         Some(p)
     } else {
         None
@@ -699,12 +732,7 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
                 continue;
             }
             if let Some(p) = netns {
-                netem_apply(
-                    p,
-                    cell.iter()
-                        .find(|(a, _)| *a == "netem")
-                        .map_or("none", |(_, v)| v.as_str()),
-                )?;
+                netem_apply(p, netem_args(|f| cell_link(cell, f)).map_err(std::io::Error::other)?)?;
             }
             let port = free_port_range(ports_needed)?;
             let flags: Vec<String> = cell
@@ -792,104 +820,96 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
 /// `--netem` spec is active.
 const NETNS: &str = "srtbench";
 
-/// Translate a `key=value,...` spec into `tc qdisc ... netem` arguments.
+/// The link-condition flags, in the order `tc` wants them.
 ///
-/// Deliberately a strict whitelist rather than a pass-through: these
-/// arguments are handed to `sudo`, so an unrecognised key or a value that
-/// is not a bare number with a known unit is rejected instead of
-/// forwarded. Recognised keys mirror the netem options that matter for a
-/// live streaming protocol:
-///
-/// - `delay` / `jitter` -- one-way latency and its variation. Loopback
-///   RTT is ~0, so nothing that depends on RTT estimation, on the ACK
-///   cadence, or on TLPKTDROP's deadline is otherwise under test.
-/// - `loss` -- what the whole retransmission path exists for.
-/// - `rate` -- a hard bottleneck, to produce genuine queueing rather
-///   than the CPU-bound saturation loopback gives.
-/// - `reorder` / `duplicate` -- the receiver's sequencing edge cases.
-/// - `limit` -- netem's own backlog, in packets. Defaults to 1000, which
-///   at these packet rates would silently make netem the bottleneck and
-///   attribute its drops to the protocol; we raise it unless asked
-///   otherwise.
-fn netem_args(spec: &str) -> Result<Vec<String>, String> {
-    /// A value is valid if some accepted unit suffix leaves a parseable
-    /// number behind. Testing every unit rather than the first that
-    /// strips matters: "100mbit" ends with "bit", and stopping there
-    /// would leave "100m".
-    fn valid(value: &str, units: &[&str]) -> bool {
-        units.iter().any(|unit| {
-            if unit.is_empty() {
-                return value.parse::<u64>().is_ok();
-            }
-            value
-                .strip_suffix(unit)
-                .is_some_and(|d| !d.is_empty() && d.parse::<f64>().is_ok())
-        })
+/// One flat flag per knob (`--link-delay=25ms --link-loss=1%`) rather
+/// than one nested spec: a nested value has to carry its own separator,
+/// and the sweep axes are already comma-separated, so the two collided.
+/// Flat flags also make each knob sweepable on its own, which is the
+/// whole point of an axis.
+pub const LINK_FLAGS: &[&str] = &[
+    "link-delay",
+    "link-jitter",
+    "link-loss",
+    "link-rate",
+    "link-reorder",
+    "link-duplicate",
+    "link-corrupt",
+    "link-limit",
+];
+
+/// Accepted unit suffixes per knob. Empty string means a bare integer.
+fn link_units(flag: &str) -> &'static [&'static str] {
+    match flag {
+        "link-delay" | "link-jitter" => &["ms", "us", "s"],
+        "link-loss" | "link-reorder" | "link-duplicate" | "link-corrupt" => &["%"],
+        "link-rate" => &["bit", "kbit", "mbit", "gbit"],
+        _ => &[""],
     }
+}
 
-    const TIME: &[&str] = &["ms", "us", "s"];
-    const PCT: &[&str] = &["%"];
-    const RATE: &[&str] = &["bit", "kbit", "mbit", "gbit"];
-    const PLAIN: &[&str] = &[""];
+/// A value is valid if some accepted unit suffix leaves a parseable
+/// number behind. Testing every unit rather than the first that strips
+/// matters: "100mbit" ends with "bit", and stopping there would leave
+/// "100m".
+fn link_value_ok(value: &str, units: &[&str]) -> bool {
+    units.iter().any(|unit| {
+        if unit.is_empty() {
+            return value.parse::<u64>().is_ok();
+        }
+        value
+            .strip_suffix(unit)
+            .is_some_and(|d| !d.is_empty() && d.parse::<f64>().is_ok())
+    })
+}
 
-    let mut delay: Option<String> = None;
-    let mut jitter: Option<String> = None;
-    let mut limit = "100000".to_string();
-    let mut rest: Vec<(String, String)> = Vec::new();
-
-    // `+` as well as `,`: the sweep axes are themselves comma-separated,
-    // so a multi-field spec used as an axis value must join its fields
-    // with something else. `--netem=none,delay=25ms+loss=2%` is two cells;
-    // written with a comma it would silently be three.
-    for field in spec
-        .split(['+', ','])
-        .map(str::trim)
-        .filter(|f| !f.is_empty())
-    {
-        let (key, value) = field
-            .split_once('=')
-            .ok_or_else(|| format!("netem: '{field}' is not key=value"))?;
-        let (key, value) = (key.trim(), value.trim());
-        let units: &[&str] = match key {
-            "delay" | "jitter" => TIME,
-            "loss" | "reorder" | "duplicate" | "corrupt" => PCT,
-            "rate" => RATE,
-            "limit" => PLAIN,
-            other => {
-                return Err(format!(
-                    "netem: unknown key '{other}' (delay, jitter, loss, rate, \
-                     reorder, duplicate, corrupt, limit)"
-                ));
-            }
+/// Render the link settings of one cell as `tc qdisc ... netem` arguments.
+///
+/// Values are validated rather than forwarded: these reach a privileged
+/// command, so anything that is not a bare number with a known unit is
+/// rejected. Returns `None` when the cell asks for no emulation at all.
+///
+/// `limit` is netem's own backlog in packets. Its default of 1000 would
+/// quietly become the bottleneck at these packet rates and charge its
+/// drops to the protocol, so it is raised unless set explicitly.
+fn netem_args(get: impl Fn(&str) -> Option<String>) -> Result<Option<Vec<String>>, String> {
+    let mut set: Vec<(&str, String)> = Vec::new();
+    for flag in LINK_FLAGS {
+        let Some(value) = get(flag).filter(|v| !v.is_empty() && v != "off") else {
+            continue;
         };
-        if !valid(value, units) {
-            return Err(format!("netem: bad value '{value}' for '{key}'"));
+        if !link_value_ok(&value, link_units(flag)) {
+            return Err(format!("--{flag}: bad value '{value}'"));
         }
-        match key {
-            "delay" => delay = Some(value.to_string()),
-            "jitter" => jitter = Some(value.to_string()),
-            "limit" => limit = value.to_string(),
-            _ => rest.push((key.to_string(), value.to_string())),
-        }
+        set.push((flag.trim_start_matches("link-"), value));
+    }
+    if set.is_empty() || set.iter().all(|(k, _)| *k == "limit") {
+        return Ok(None);
     }
 
-    if jitter.is_some() && delay.is_none() {
-        return Err("netem: jitter= requires delay=".to_string());
-    }
-
-    let mut args = vec!["limit".to_string(), limit];
-    if let Some(d) = delay {
+    let find = |k: &str| set.iter().find(|(n, _)| *n == k).map(|(_, v)| v.clone());
+    let mut args = vec![
+        "limit".to_string(),
+        find("limit").unwrap_or_else(|| "100000".to_string()),
+    ];
+    // netem wants jitter as a bare second argument to delay.
+    if let Some(delay) = find("delay") {
         args.push("delay".to_string());
-        args.push(d);
-        if let Some(j) = jitter {
-            args.push(j);
+        args.push(delay);
+        if let Some(jitter) = find("jitter") {
+            args.push(jitter);
         }
+    } else if find("jitter").is_some() {
+        return Err("--link-jitter needs --link-delay".to_string());
     }
-    for (k, v) in rest {
-        args.push(k);
-        args.push(v);
+    for (key, value) in &set {
+        if matches!(*key, "delay" | "jitter" | "limit") {
+            continue;
+        }
+        args.push((*key).to_string());
+        args.push(value.clone());
     }
-    Ok(args)
+    Ok(Some(args))
 }
 
 /// How this process can reach the privileged operations netem needs
@@ -984,16 +1004,16 @@ fn netns_down(p: Priv) {
 }
 
 /// Apply (or clear) the emulated conditions on the namespace's loopback.
-fn netem_apply(p: Priv, spec: &str) -> std::io::Result<()> {
+/// `None` clears them.
+fn netem_apply(p: Priv, netem: Option<Vec<String>>) -> std::io::Result<()> {
     let base = ["ip", "netns", "exec", NETNS, "tc", "qdisc"];
-    if spec == "none" {
+    let Some(netem) = netem else {
         let mut args: Vec<&str> = base.to_vec();
         args.extend(["del", "dev", "lo", "root"]);
         // Nothing to delete on the first cell; that is not a failure.
         let _ = privileged(p, &args);
         return Ok(());
-    }
-    let netem = netem_args(spec).map_err(std::io::Error::other)?;
+    };
     let mut args: Vec<&str> = base.to_vec();
     args.extend(["replace", "dev", "lo", "root", "netem"]);
     let owned: Vec<&str> = netem.iter().map(String::as_str).collect();
@@ -1161,31 +1181,41 @@ pub fn run_sysprof(cli: &crate::Cli) -> std::io::Result<()> {
 mod netem_tests {
     use super::netem_args;
 
+    /// Build the arg list from a `--link-*` flag map, the way a cell does.
+    fn args(pairs: &[(&str, &str)]) -> Result<Option<Vec<String>>, String> {
+        netem_args(|flag| {
+            pairs
+                .iter()
+                .find(|(k, _)| format!("link-{k}") == flag)
+                .map(|(_, v)| (*v).to_string())
+        })
+    }
+
     #[test]
     fn builds_tc_arguments_in_netem_order() {
         assert_eq!(
-            netem_args("delay=25ms+jitter=5ms+loss=1%").unwrap(),
+            args(&[("delay", "25ms"), ("jitter", "5ms"), ("loss", "1%")])
+                .unwrap()
+                .unwrap(),
             ["limit", "100000", "delay", "25ms", "5ms", "loss", "1%"]
         );
     }
 
     #[test]
-    fn plus_and_comma_are_both_field_separators() {
-        // A sweep axis is comma-separated, so a multi-field spec has to
-        // be joinable with `+`; a single run may still use commas.
-        assert_eq!(
-            netem_args("delay=25ms,loss=1%").unwrap(),
-            netem_args("delay=25ms+loss=1%").unwrap()
-        );
+    fn no_link_flags_means_no_emulation() {
+        assert_eq!(args(&[]).unwrap(), None);
+        assert_eq!(args(&[("delay", "off")]).unwrap(), None);
+        // A backlog alone is not a condition worth a qdisc.
+        assert_eq!(args(&[("limit", "64")]).unwrap(), None);
     }
 
     #[test]
     fn raises_the_backlog_unless_told_otherwise() {
         // netem's default limit of 1000 packets would silently become the
         // bottleneck at these packet rates and look like protocol loss.
-        assert_eq!(netem_args("loss=1%").unwrap()[..2], ["limit", "100000"]);
+        assert_eq!(args(&[("loss", "1%")]).unwrap().unwrap()[..2], ["limit", "100000"]);
         assert_eq!(
-            netem_args("loss=1%+limit=64").unwrap()[..2],
+            args(&[("loss", "1%"), ("limit", "64")]).unwrap().unwrap()[..2],
             ["limit", "64"]
         );
     }
@@ -1193,33 +1223,28 @@ mod netem_tests {
     #[test]
     fn accepts_every_rate_unit() {
         for rate in ["1000bit", "100kbit", "100mbit", "1gbit"] {
-            assert!(
-                netem_args(&format!("rate={rate}")).is_ok(),
-                "rejected rate={rate}"
-            );
+            assert!(args(&[("rate", rate)]).is_ok(), "rejected {rate}");
         }
     }
 
     #[test]
     fn rejects_anything_it_would_have_to_forward_blindly() {
-        // These arguments are handed to a privileged command, so an
-        // unknown key or a non-numeric value must not pass through.
-        for spec in [
-            "loss=1%; rm -rf /",
-            "delay=$(whoami)",
-            "script=evil",
-            "loss=abc",
-            "delay=25",   // unit required
-            "loss=1",     // unit required
-            "rate=100mb", // not a netem unit
-            "delay",      // not key=value
+        // These arguments are handed to a privileged command, so a
+        // non-numeric or wrongly-united value must not pass through.
+        for (flag, value) in [
+            ("loss", "1%; rm -rf /"),
+            ("delay", "$(whoami)"),
+            ("loss", "abc"),
+            ("delay", "25"),   // unit required
+            ("loss", "1"),     // unit required
+            ("rate", "100mb"), // not a netem unit
         ] {
-            assert!(netem_args(spec).is_err(), "accepted {spec:?}");
+            assert!(args(&[(flag, value)]).is_err(), "accepted {flag}={value}");
         }
     }
 
     #[test]
     fn jitter_without_delay_is_meaningless() {
-        assert!(netem_args("jitter=5ms").is_err());
+        assert!(args(&[("jitter", "5ms")]).is_err());
     }
 }

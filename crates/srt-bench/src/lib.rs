@@ -246,15 +246,69 @@ pub struct LossConfig {
     /// a real variable: glommio and monoio are thread-per-core designs
     /// that assume it, while the others do not.
     pub pin: bool,
-    /// Emulated network conditions, as a `tc-netem` spec (`"none"` when
-    /// unset). Must be given as `--netem=SPEC`, not `--netem SPEC`: the
-    /// value contains `=`, and a separate token containing `=` is parsed
-    /// as its own flag. Loopback has no loss and ~0 RTT, so the protocol's
-    /// loss-recovery and TLPKTDROP paths are barely exercised without
-    /// this. Applied by the matrix harness inside a private network
-    /// namespace -- an individual bench process only records the value,
-    /// it never touches the host's networking.
-    pub netem: String,
+    /// How many OS threads the task-per-connection driver uses, each
+    /// with its own executor, connections dealt round-robin between them.
+    ///
+    /// This exists because the load generator used to be single-threaded
+    /// at every connection count, while a `reuseport-multi:4` listener
+    /// got four threads. A cell that read as "the listener cannot keep
+    /// up" could equally have been "the sender could not offer the load",
+    /// and nothing in the results distinguished them. Applies to the
+    /// sender always, and to a `PerPort` receiver -- the shared-socket
+    /// ingress strategies get their parallelism from their own K instead.
+    pub workers: usize,
+    /// Emulated network conditions. Recorded by every process; only the
+    /// matrix harness acts on them, and only inside a private network
+    /// namespace -- an individual bench process never touches the host's
+    /// networking.
+    pub link: Link,
+}
+
+/// Link conditions to emulate, one field per `--link-*` flag. Empty means
+/// "leave it alone".
+///
+/// Flat, one flag per knob, rather than one nested spec string: a nested
+/// value needs its own separator, and the sweep axes are already
+/// comma-separated, so the two collide. Flat also means each knob is
+/// independently sweepable, which is the point of an axis.
+#[derive(Clone, Debug, Default)]
+pub struct Link {
+    /// One-way latency, e.g. `25ms`. Loopback RTT is ~0, so nothing that
+    /// depends on RTT estimation or on a TLPKTDROP deadline is otherwise
+    /// under test.
+    pub delay: String,
+    /// Variation around `delay`; requires it.
+    pub jitter: String,
+    /// e.g. `1%`. What the whole retransmission path exists for.
+    pub loss: String,
+    /// A hard bottleneck, e.g. `100mbit`, to produce real queueing rather
+    /// than the CPU-bound saturation loopback gives.
+    pub rate: String,
+    pub reorder: String,
+    pub duplicate: String,
+    pub corrupt: String,
+    /// netem's own backlog in packets. Defaults to 100000 rather than
+    /// netem's 1000, which at these packet rates would silently make
+    /// netem the bottleneck and charge its drops to the protocol.
+    pub limit: String,
+}
+
+impl Link {
+    /// Value for one `--link-*` flag name, as the harness records it.
+    #[must_use]
+    pub fn get(&self, flag: &str) -> &str {
+        match flag.trim_start_matches("link-") {
+            "delay" => &self.delay,
+            "jitter" => &self.jitter,
+            "loss" => &self.loss,
+            "rate" => &self.rate,
+            "reorder" => &self.reorder,
+            "duplicate" => &self.duplicate,
+            "corrupt" => &self.corrupt,
+            "limit" => &self.limit,
+            _ => "",
+        }
+    }
 }
 
 /// See [`LossConfig::batching`].
@@ -339,6 +393,39 @@ pub struct ConnStats {
 }
 
 /// Accumulates ConnStats across connections and renders the STATS line.
+/// Spread `cfg.connections` across `cfg.workers` OS threads, each running
+/// `body` with the connection indices it owns, and collect every
+/// connection's stats.
+///
+/// Round-robin (`w, w+W, w+2W, ...`) rather than contiguous blocks, so a
+/// workload whose cost varies with connection index spreads evenly.
+/// `workers == 1` runs inline, which keeps the single-threaded case free
+/// of an extra thread and its join.
+pub fn run_workers<F>(cfg: &LossConfig, body: F) -> Vec<ConnStats>
+where
+    F: Fn(LossConfig, Vec<usize>) -> Vec<ConnStats> + Send + Sync + 'static,
+{
+    let workers = cfg.workers.clamp(1, cfg.connections.max(1));
+    let indices = |w: usize| -> Vec<usize> { (w..cfg.connections).step_by(workers).collect() };
+    if workers == 1 {
+        return body(cfg.clone(), indices(0));
+    }
+    let body = std::sync::Arc::new(body);
+    let handles: Vec<_> = (0..workers)
+        .map(|w| {
+            let (cfg, body, mine) = (cfg.clone(), std::sync::Arc::clone(&body), indices(w));
+            std::thread::Builder::new()
+                .name(format!("bench-w{w}"))
+                .spawn(move || body(cfg, mine))
+                .expect("spawn bench worker")
+        })
+        .collect();
+    handles
+        .into_iter()
+        .flat_map(|h| h.join().unwrap_or_default())
+        .collect()
+}
+
 pub struct Aggregate {
     pub config: LossConfig,
     pub data_events: u64,
@@ -474,7 +561,7 @@ pub fn bench_config_from_args() -> LossConfig {
              [bitrate_bps] [--connections N] \
              [--ingress per-port|shared-pool=K|reuseport-multi=K|reuseport-single=W] \
              [--bond broadcast:G|backup:G|none] [--batch on|off] \
-             [--connect-concurrency N] [--promotion never|relocate|bonded|all] [--cookie-routing on|off] [--sock-buf N|Nk|Nm|default] [--out FILE] [--cpus 0-3|0,2,4] [--pin on|off] [--netem=delay=25ms+jitter=5ms+loss=1%+rate=100mbit]"
+             [--connect-concurrency N] [--promotion never|relocate|bonded|all] [--cookie-routing on|off] [--sock-buf N|Nk|Nm|default] [--out FILE] [--cpus 0-3|0,2,4] [--pin on|off] [--workers N] [--link-delay 25ms] [--link-jitter 5ms] [--link-loss 1%] [--link-rate 100mbit]"
         );
         std::process::exit(2)
     }
@@ -645,12 +732,25 @@ pub fn bench_config_from_args() -> LossConfig {
         Some("") | Some("on")
     );
 
-    let netem = cli
-        .flags
-        .get("netem")
-        .filter(|v| !v.is_empty())
-        .cloned()
-        .unwrap_or_else(|| "none".to_string());
+    let workers = cli.flag_or("workers", 1usize).max(1);
+
+    let link_flag = |name: &str| -> String {
+        cli.flags
+            .get(name)
+            .filter(|v| !v.is_empty() && v.as_str() != "off")
+            .cloned()
+            .unwrap_or_default()
+    };
+    let link = Link {
+        delay: link_flag("link-delay"),
+        jitter: link_flag("link-jitter"),
+        loss: link_flag("link-loss"),
+        rate: link_flag("link-rate"),
+        reorder: link_flag("link-reorder"),
+        duplicate: link_flag("link-duplicate"),
+        corrupt: link_flag("link-corrupt"),
+        limit: link_flag("link-limit"),
+    };
 
     let out = cli
         .flags
@@ -680,6 +780,7 @@ pub fn bench_config_from_args() -> LossConfig {
         rep,
         cpus,
         pin,
-        netem,
+        workers,
+        link,
     }
 }
