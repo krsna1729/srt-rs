@@ -707,6 +707,11 @@ static ORPHAN_CONCLUSION_COUNT: AtomicU64 = AtomicU64::new(0);
 /// CONCLUSION.
 static COOKIE_FORWARD_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// Diagnostic counter: late or duplicate CONCLUSIONs for a flow this
+/// acceptor already promoted. Harmless, but indistinguishable from a
+/// stranded handshake without checking the cookie.
+static PROMOTED_DUP_COUNT: AtomicU64 = AtomicU64::new(0);
+
 /// Where a connection's promotion (see `run_pool_acceptor`'s module doc)
 /// lands: on this same thread, or shipped to a specific remote owner.
 enum PromotionTarget {
@@ -884,9 +889,10 @@ fn run_pool_receiver(cfg: LossConfig, k: usize) {
     let handoffs = HANDOFF_COUNT.load(Ordering::Relaxed);
     let orphans = ORPHAN_CONCLUSION_COUNT.load(Ordering::Relaxed);
     let forwarded = COOKIE_FORWARD_COUNT.load(Ordering::Relaxed);
+    let dups = PROMOTED_DUP_COUNT.load(Ordering::Relaxed);
     eprintln!(
         "[bench-mio] pool receiver: {promotions} promotions ({handoffs} cross-thread handoffs), \
-         {orphans} orphaned CONCLUSIONs, {forwarded} cookie-routed handshakes"
+         {orphans} stranded CONCLUSIONs, {forwarded} cookie-routed, {dups} post-promotion dups"
     );
     agg.print(start);
     if !agg.any_connected {
@@ -1111,11 +1117,29 @@ fn run_pool_acceptor(
                                     // here (no cookie state), and is exactly the
                                     // case an mpsc handoff keyed on the cookie
                                     // would have to rescue.
-                                    if let Some((is_conclusion, _)) =
-                                        srt_lifecycle::handshake_route(data)
-                                        && is_conclusion
+                                    // Two different things look alike here: a
+                                    // cookie naming *this* acceptor means the
+                                    // flow was already promoted (its peer entry
+                                    // removed), so it is a late or duplicate
+                                    // CONCLUSION rather than a stranded
+                                    // handshake. Counting them together makes
+                                    // the cookie-routing measurement
+                                    // meaningless.
+                                    if let Some(identity) = srt_lifecycle::handshake_identity(data)
+                                        && identity.is_conclusion
                                     {
-                                        ORPHAN_CONCLUSION_COUNT.fetch_add(1, Ordering::Relaxed);
+                                        match srt_lifecycle::worker_from_cookie(
+                                            identity.syn_cookie,
+                                            senders.len(),
+                                        ) {
+                                            Some(owner) if owner == worker_index => {
+                                                PROMOTED_DUP_COUNT.fetch_add(1, Ordering::Relaxed);
+                                            }
+                                            _ => {
+                                                ORPHAN_CONCLUSION_COUNT
+                                                    .fetch_add(1, Ordering::Relaxed);
+                                            }
+                                        }
                                     }
                                     vacant.insert(Peer {
                                         conn: SrtConnection::new_listener(ConnectionOptions {

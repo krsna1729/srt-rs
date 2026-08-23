@@ -54,6 +54,32 @@ static HANDOFF_COUNT: AtomicU64 = AtomicU64::new(0);
 /// `HANDOFF_COUNT`, which counts only cross-thread bond relocations.
 static PROMOTION_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// Diagnostic counter: handshake datagrams rescued by cookie routing.
+/// Each one would otherwise have been an orphaned CONCLUSION -- a
+/// handshake stranded on an acceptor with no state for it.
+static COOKIE_FORWARD_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Diagnostic counter: CONCLUSION packets arriving at an acceptor with no
+/// state for that peer -- flows the kernel rehashed between the two
+/// caller->listener handshake packets. Cookie routing exists to drive
+/// this to zero; comparing it with and without is how that is verified.
+static ORPHAN_CONCLUSION_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Diagnostic counter: late or duplicate CONCLUSIONs for a flow this
+/// acceptor already promoted (so its peer entry is gone). Harmless, but
+/// indistinguishable from a stranded handshake without checking the
+/// cookie -- which is why they are counted apart.
+static PROMOTED_DUP_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Stable per-peer entropy for a cookie's upper bits, so cookies differ
+/// per connection instead of being one constant per worker.
+fn peer_hash(peer: SocketAddr) -> u32 {
+    use std::hash::{BuildHasher, Hash, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    peer.hash(&mut hasher);
+    hasher.finish() as u32
+}
+
 /// Give one established connection its own connected socket, so the kernel
 /// matches its packets by exact 4-tuple and an independent task can drive
 /// it instead of the shared per-peer maintenance loop. `None` if the
@@ -385,6 +411,15 @@ struct Handoff {
 
 enum WorkerMessage {
     Handoff(Box<Handoff>),
+    /// A handshake datagram the kernel delivered to the wrong acceptor.
+    /// Its SYN cookie names the acceptor that owns the half-open
+    /// handshake, so it is forwarded there rather than answered here
+    /// (which would fail cookie validation) or dropped (which costs a
+    /// handshake retry). See `srt_lifecycle::cookie_for_worker`.
+    Handshake {
+        peer: SocketAddr,
+        data: Vec<u8>,
+    },
 }
 
 fn run_reuseport_multi(cfg: LossConfig, k: usize) {
@@ -436,8 +471,12 @@ fn run_reuseport_multi(cfg: LossConfig, k: usize) {
     }
     let handoffs = HANDOFF_COUNT.load(Ordering::Relaxed);
     let promotions = PROMOTION_COUNT.load(Ordering::Relaxed);
+    let orphans = ORPHAN_CONCLUSION_COUNT.load(Ordering::Relaxed);
+    let forwarded = COOKIE_FORWARD_COUNT.load(Ordering::Relaxed);
+    let dups = PROMOTED_DUP_COUNT.load(Ordering::Relaxed);
     eprintln!(
-        "[bench-tokio] pool receiver: {promotions} local promotions, {handoffs} bond handoffs"
+        "[bench-tokio] pool receiver: {promotions} local promotions, {handoffs} bond handoffs, \
+         {orphans} stranded CONCLUSIONs, {forwarded} cookie-routed, {dups} post-promotion dups"
     );
     agg.print(start);
     if !agg.any_connected {
@@ -514,10 +553,10 @@ async fn run_acceptor(
         tokio::select! {
             res = listener.recv_from(&mut buf) => {
                 if let Ok((n, peer)) = res {
-                    admit(&mut peers, &cfg, peer, &buf[..n], start);
+                    admit(&mut peers, &cfg, worker_index, &senders, peer, &buf[..n], start);
                     loop {
                         match listener.try_recv_from(&mut buf) {
-                            Ok((n, peer)) => admit(&mut peers, &cfg, peer, &buf[..n], start),
+                            Ok((n, peer)) => admit(&mut peers, &cfg, worker_index, &senders, peer, &buf[..n], start),
                             Err(_) => break,
                         }
                     }
@@ -609,7 +648,16 @@ async fn run_acceptor(
         }
 
         // Bond legs relocated here from another acceptor.
-        while let Ok(WorkerMessage::Handoff(handoff)) = handoffs.try_recv() {
+        while let Ok(message) = handoffs.try_recv() {
+            let handoff = match message {
+                WorkerMessage::Handoff(handoff) => handoff,
+                // A handshake datagram routed here by its cookie: feed it
+                // to the peer state that owns it.
+                WorkerMessage::Handshake { peer, data } => {
+                    admit(&mut peers, &cfg, worker_index, &senders, peer, &data, start);
+                    continue;
+                }
+            };
             match tokio::net::UdpSocket::from_std(handoff.socket) {
                 Ok(tokio_socket) => {
                     let driver = Conn::new(handoff.conn, tokio_socket);
@@ -659,15 +707,65 @@ async fn run_acceptor(
 fn admit(
     peers: &mut HashMap<SocketAddr, PeerEntry>,
     cfg: &LossConfig,
+    worker_index: usize,
+    senders: &[mpsc::Sender<WorkerMessage>],
     peer: SocketAddr,
     data: &[u8],
     start: Instant,
 ) {
+    // Route by cookie before touching local state: a handshake datagram
+    // whose cookie names another acceptor belongs to that acceptor's
+    // half-open connection, wherever the kernel happened to deliver it.
+    if cfg.cookie_routing
+        && !peers.contains_key(&peer)
+        && let Some(identity) = srt_lifecycle::handshake_identity(data)
+        && identity.is_conclusion
+        && let Some(owner) = srt_lifecycle::worker_from_cookie(identity.syn_cookie, senders.len())
+        && owner != worker_index
+    {
+        let message = WorkerMessage::Handshake {
+            peer,
+            data: data.to_vec(),
+        };
+        if senders[owner].send(message).is_ok() {
+            COOKIE_FORWARD_COUNT.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        // Owner is gone; handle it here rather than dropping it.
+    }
+    // A CONCLUSION is never a flow's first packet, so one arriving for an
+    // unknown peer needs explaining. Two very different things look
+    // identical here, and conflating them makes the cookie-routing
+    // measurement meaningless:
+    //   - the cookie names *this* acceptor: the flow was already promoted
+    //     off the shared listener and its peer entry removed, so this is a
+    //     late or duplicate CONCLUSION, not a rehash victim;
+    //   - anything else: no usable routing information, a genuinely
+    //     stranded handshake.
+    if !peers.contains_key(&peer)
+        && let Some(identity) = srt_lifecycle::handshake_identity(data)
+        && identity.is_conclusion
+    {
+        match srt_lifecycle::worker_from_cookie(identity.syn_cookie, senders.len()) {
+            Some(owner) if owner == worker_index => {
+                PROMOTED_DUP_COUNT.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {
+                ORPHAN_CONCLUSION_COUNT.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
     let t = crate::now_ts(start);
     let entry = peers.entry(peer).or_insert_with(|| PeerEntry {
         conn: SrtConnection::new_listener(ConnectionOptions {
             socket_id: std::process::id(),
             tsbpd_delay: cfg.latency_ms,
+            // Encode who owns this handshake, so a CONCLUSION rehashed to
+            // another acceptor can be routed back here.
+            syn_cookie: Some(srt_lifecycle::cookie_for_worker(
+                worker_index,
+                peer_hash(peer),
+            )),
             ..Default::default()
         }),
         timers: srt_transport::ManualTimerStore::new(),
