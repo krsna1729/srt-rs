@@ -417,6 +417,104 @@ fn free_port_range(count: usize) -> std::io::Result<u16> {
     ))
 }
 
+/// Map an axis name/value to the (column, value) it will be *recorded*
+/// as, so a resumed sweep can tell which cells are already done.
+///
+/// Most axes round-trip unchanged. `sock-buf` does not: the axis takes
+/// `16m` while the row records `16777216`, and comparing those as strings
+/// would re-run every cell forever.
+fn recorded_as(axis: &str, value: &str) -> (&'static str, String) {
+    match axis {
+        "runtime" => ("runtime", value.to_string()),
+        "ingress" => ("ingress", value.to_string()),
+        "promotion" => ("promotion", value.to_string()),
+        "cookie-routing" => ("cookie", value.to_string()),
+        "batch" => ("batch", value.to_string()),
+        "sock-buf" => (
+            "sock_buf",
+            match value {
+                "default" | "0" => "0".to_string(),
+                v => {
+                    let (digits, scale) = match v.strip_suffix(['m', 'M']) {
+                        Some(d) => (d, 1usize << 20),
+                        None => match v.strip_suffix(['k', 'K']) {
+                            Some(d) => (d, 1usize << 10),
+                            None => (v, 1),
+                        },
+                    };
+                    digits
+                        .parse::<usize>()
+                        .map_or_else(|_| v.to_string(), |n| (n * scale).to_string())
+                }
+            },
+        ),
+        "connections" => ("conns", value.to_string()),
+        "connect-concurrency" => ("connect_cc", value.to_string()),
+        "bond" => ("bond", value.to_string()),
+        "bitrate" => ("bitrate", value.to_string()),
+        "pin" => ("pin", value.to_string()),
+        other => (
+            Box::leak(other.to_string().into_boxed_str()),
+            value.to_string(),
+        ),
+    }
+}
+
+/// Identity of one (cell, rep) as it appears in a result file.
+fn cell_key(cell: &[(&str, String)], rep: usize) -> String {
+    let mut parts: Vec<String> = cell
+        .iter()
+        .map(|(axis, value)| {
+            let (col, v) = recorded_as(axis, value);
+            format!("{col}={v}")
+        })
+        .collect();
+    parts.sort();
+    parts.push(format!("rep={rep}"));
+    parts.join(" ")
+}
+
+/// The same identity, read back off a recorded row.
+fn record_key(record: &Record, cell: &[(&str, String)], rep: usize) -> Option<String> {
+    let mut parts: Vec<String> = Vec::with_capacity(cell.len());
+    for (axis, _) in cell {
+        let (col, _) = recorded_as(axis, "");
+        parts.push(format!("{col}={}", record.get(col)?));
+    }
+    parts.sort();
+    parts.push(format!("rep={rep}"));
+    Some(parts.join(" "))
+}
+
+/// Read a declarative sweep plan: `axis = v1,v2,v3` per line, `#` for
+/// comments. Values merge with (and override) any given on the CLI.
+///
+/// A plan in a file rather than a shell loop because a comprehensive
+/// sweep is hundreds of runs over hours: it needs to be reviewable before
+/// it starts, reproducible afterwards, and identical across re-runs.
+fn read_plan(path: &Path) -> std::io::Result<Vec<(String, Vec<String>)>> {
+    let text = std::fs::read_to_string(path)?;
+    let mut axes = Vec::new();
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((name, values)) = line.split_once('=') {
+            axes.push((
+                name.trim().to_string(),
+                values
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+            ));
+        }
+    }
+    Ok(axes)
+}
+
 fn axis_values(cli: &crate::Cli, flag: &str, default: &str) -> Vec<String> {
     cli.flags.get(flag).filter(|v| !v.is_empty()).map_or_else(
         || vec![default.to_string()],
@@ -458,21 +556,36 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
     let secs: u64 = cli.flag_or("secs", 8);
     let latency: u16 = cli.flag_or("latency", 120);
 
-    let axes: Vec<Axis> = vec![
-        ("runtime", axis_values(cli, "runtimes", "mio")),
-        ("ingress", axis_values(cli, "ingress", "per-port")),
-        ("promotion", axis_values(cli, "promotion", "relocate")),
-        ("cookie-routing", axis_values(cli, "cookie-routing", "on")),
-        ("batch", axis_values(cli, "batch", "on")),
-        ("sock-buf", axis_values(cli, "sock-buf", "16m")),
-        ("pin", axis_values(cli, "pin", "off")),
-        ("connections", axis_values(cli, "connections", "25")),
+    // A plan file, when given, supplies axis values; anything it omits
+    // falls back to the CLI flag and then the built-in default.
+    let plan: Vec<(String, Vec<String>)> = match cli.flags.get("plan") {
+        Some(path) if !path.is_empty() => read_plan(Path::new(path))?,
+        _ => Vec::new(),
+    };
+    let from_plan = |name: &str| -> Option<Vec<String>> {
+        plan.iter()
+            .find(|(axis, _)| axis == name)
+            .map(|(_, values)| values.clone())
+    };
+    let axis = |name: &'static str, flag: &str, default: &str| -> Axis {
         (
-            "connect-concurrency",
-            axis_values(cli, "connect-concurrency", "1"),
-        ),
-        ("bond", axis_values(cli, "bond", "none")),
-        ("bitrate", axis_values(cli, "bitrate", "8000000")),
+            name,
+            from_plan(name).unwrap_or_else(|| axis_values(cli, flag, default)),
+        )
+    };
+
+    let axes: Vec<Axis> = vec![
+        axis("runtime", "runtimes", "mio"),
+        axis("ingress", "ingress", "per-port"),
+        axis("promotion", "promotion", "relocate"),
+        axis("cookie-routing", "cookie-routing", "on"),
+        axis("batch", "batch", "on"),
+        axis("sock-buf", "sock-buf", "16m"),
+        axis("pin", "pin", "off"),
+        axis("connections", "connections", "25"),
+        axis("connect-concurrency", "connect-concurrency", "1"),
+        axis("bond", "bond", "none"),
+        axis("bitrate", "bitrate", "8000000"),
     ];
 
     // Cartesian product, expanded eagerly: the whole point is to know how
@@ -491,10 +604,29 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
     }
 
     let total = cells.len() * reps;
+    // Resume: a sweep of this size will be interrupted at some point, and
+    // re-running completed cells wastes hours and mixes measurement
+    // windows. Anything already in the output file is skipped.
+    let done: std::collections::HashSet<String> = read_results(&out)
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.get("role") == Some("listener"))
+        .filter_map(|r| {
+            let rep: usize = r.number("rep")? as usize;
+            cells
+                .iter()
+                .find_map(|cell| record_key(r, cell, rep).filter(|k| *k == cell_key(cell, rep)))
+        })
+        .collect();
     eprintln!(
-        "matrix: {} cells x {reps} reps = {total} runs -> {}",
+        "matrix: {} cells x {reps} reps = {total} runs -> {}{}",
         cells.len(),
-        out.display()
+        out.display(),
+        if done.is_empty() {
+            String::new()
+        } else {
+            format!(" ({} already done, resuming)", done.len())
+        }
     );
 
     let mut skipped = 0usize;
@@ -534,6 +666,9 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
             continue;
         }
         for rep in 1..=reps {
+            if done.contains(&cell_key(cell, rep)) {
+                continue;
+            }
             let port = free_port_range(ports_needed)?;
             let flags: Vec<String> = cell
                 .iter()
