@@ -181,6 +181,16 @@ pub struct LossConfig {
     /// available -- the baseline `On` should be measured against. See
     /// `Batching` for which runtimes actually have a batched path today.
     pub batching: Batching,
+    /// Sender only: how many connections may be simultaneously mid-
+    /// handshake (started but not yet `Connected`) at once. `1` opens
+    /// them strictly sequentially -- the safe default, since a real
+    /// client population doesn't arrive in the same instant, and firing
+    /// every connection's INDUCTION packet back-to-back was exactly what
+    /// produced an artificial "connection storm" against a reuseport
+    /// listener (see mio.rs's `run_pool_acceptor` module doc). Set higher
+    /// to deliberately reproduce concurrent-arrival admission behavior,
+    /// including the storm pathology itself, for targeted testing.
+    pub connect_concurrency: usize,
 }
 
 /// See [`LossConfig::batching`].
@@ -335,13 +345,23 @@ impl Aggregate {
                 p.peak_rss_kb,
             );
         } else {
+            // `connections` is what was *asked for*; `established` is how
+            // many actually reported protocol stats. They are usually
+            // equal, and when they aren't that gap is the single most
+            // important number on the line -- a listener that only ever
+            // admitted half the callers looks exactly like one that
+            // admitted all of them and dropped half the packets, unless
+            // this is printed. (It was tracked but not shown for a long
+            // time, which is precisely how a partial-admission bug got
+            // misread as a throughput ceiling.)
             println!(
-                "STATS role={} backend={} connections={} pkt_sent={} core_total={} sec_a={} \
-                 sec_b={} rtt_ms={:.3} elapsed_s={:.3} throughput_pps={:.0} cpu_user_ms={:.1} \
-                 cpu_sys_ms={:.1} peak_rss_kb={}",
+                "STATS role={} backend={} connections={} established={} pkt_sent={} \
+                 core_total={} sec_a={} sec_b={} rtt_ms={:.3} elapsed_s={:.3} \
+                 throughput_pps={:.0} cpu_user_ms={:.1} cpu_sys_ms={:.1} peak_rss_kb={}",
                 role,
                 c.runtime.name(),
                 c.connections,
+                self.stats_count,
                 self.data_events,
                 self.core_total,
                 self.secondary_a,
@@ -365,7 +385,8 @@ pub fn bench_config_from_args() -> LossConfig {
              mode=<sender|receiver> <host?> <port> <duration_secs> <latency_ms> \
              [bitrate_bps] [--connections N] \
              [--ingress per-port|shared-pool=K|reuseport-multi=K|reuseport-single=W] \
-             [--bond broadcast:G|backup:G|none] [--batch on|off]"
+             [--bond broadcast:G|backup:G|none] [--batch on|off] \
+             [--connect-concurrency N]"
         );
         std::process::exit(2)
     }
@@ -469,6 +490,11 @@ pub fn bench_config_from_args() -> LossConfig {
         }
     };
 
+    let connect_concurrency = match cli.flags.get("connect-concurrency") {
+        None => 1,
+        Some(raw) => parse_positive("connect-concurrency", raw),
+    };
+
     LossConfig {
         runtime,
         mode,
@@ -482,5 +508,6 @@ pub fn bench_config_from_args() -> LossConfig {
         bond_mode,
         bond_pairs,
         batching,
+        connect_concurrency,
     }
 }

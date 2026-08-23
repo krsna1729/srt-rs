@@ -172,12 +172,18 @@ print_medians() {
 import re, sys, statistics
 scratch, tag, reps, n, secs = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4], sys.argv[5]
 runtimes = sys.argv[6:]
-pat = re.compile(r"STATS role=(\w+) backend=\w+ connections=\d+ pkt_sent=(\d+) "
+# `established=` is optional here only so this harness can still read STATS
+# lines from an older binary; current builds always emit it.
+pat = re.compile(r"STATS role=(\w+) backend=\w+ connections=\d+ (?:established=(\d+) )?"
+                 r"pkt_sent=(\d+) "
                  r"core_total=(\d+) sec_a=(\d+) sec_b=(\d+) rtt_ms=([\d.]+) "
                  r"elapsed_s=([\d.]+) throughput_pps=[\d.]+ cpu_user_ms=([\d.]+) "
                  r"cpu_sys_ms=([\d.]+) peak_rss_kb=(\d+)")
 print(f"=== medians over {reps} reps, N={n}, T={secs}s ===")
-print(f"{'runtime':8s} {'sent':>12s} {'recv':>12s} {'retx':>10s} {'loss':>10s} "
+# `estab` is the listener's established-connection count. Watch it against
+# N: a shortfall there means the listener never admitted some callers,
+# which reads identically to packet loss in the recv column unless shown.
+print(f"{'runtime':8s} {'estab':>7s} {'sent':>12s} {'recv':>12s} {'retx':>10s} {'loss':>10s} "
       f"{'rtt_ms':>9s} {'cpu_s':>9s} {'rss_kb':>9s}")
 for rt in runtimes:
     rows = []
@@ -191,8 +197,9 @@ for rt in runtimes:
             m = pat.search(txt)
             if not m:
                 continue
-            role, sent, total, sec_a, sec_b, rtt, _, uu, us, rss = m.groups()
-            d = dict(sent=int(sent), total=int(total), sec_a=int(sec_a),
+            role, estab, sent, total, sec_a, sec_b, rtt, _, uu, us, rss = m.groups()
+            d = dict(estab=int(estab) if estab else -1,
+                     sent=int(sent), total=int(total), sec_a=int(sec_a),
                      sec_b=int(sec_b), rtt=float(rtt), uu=float(uu), us=float(us),
                      rss=int(rss))
             if role == "caller":
@@ -200,14 +207,14 @@ for rt in runtimes:
             else:
                 l = d
         if c and l:
-            rows.append((c["sent"], l["total"], c["sec_a"] + l["sec_a"], l["sec_b"],
+            rows.append((l["estab"], c["sent"], l["total"], c["sec_a"] + l["sec_a"], l["sec_b"],
                          l["rtt"],
                          (c["uu"] + c["us"] + l["uu"] + l["us"]) / 1000,
                          max(c["rss"], l["rss"])))
     if rows:
         med = lambda i: statistics.median(r[i] for r in rows)
-        print(f"{rt:8s} {med(0):12.0f} {med(1):12.0f} {med(2):10.0f} {med(3):10.0f} "
-              f"{med(4):9.2f} {med(5):9.1f} {med(6):9.0f}")
+        print(f"{rt:8s} {med(0):7.0f} {med(1):12.0f} {med(2):12.0f} {med(3):10.0f} {med(4):10.0f} "
+              f"{med(5):9.2f} {med(6):9.1f} {med(7):9.0f}")
     else:
         print(f"{rt:8s} {'NO-DATA':>12s}")
 PYEOF
