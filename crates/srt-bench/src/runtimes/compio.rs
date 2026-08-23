@@ -632,49 +632,39 @@ async fn run_acceptor(
             }
         }
         for (peer, extension) in relocate {
-            // Which connections promote at Connected is `LossConfig::
-            // promotion`. A bonded leg whose owner is a *different*
-            // worker always relocates; everything else promotes only
-            // when the mode says so. In Never mode the router is never
-            // consulted: legs stay where the kernel hashed them.
-            let owner = match extension {
-                Some(extension) if promotion != crate::Promotion::Never => Some({
-                    // A bonded leg asks the router where its group lives.
-                    let group = srt_lifecycle::GroupAffinity {
-                        group_id: extension.group_id,
-                        stream_id: None,
-                        extension,
-                    };
-                    match router.lock() {
-                        Ok(mut router) => router.assign(
-                            peer,
-                            Some(group),
-                            srt_lifecycle::RoutingMode::LeastTuples,
-                        ),
-                        Err(_) => worker_index, // poisoned: leave it here
-                    }
-                }),
-                _ => None, // unbonded (or Never): no affinity to honor
+            // The ladder itself is shared policy -- see
+            // `srt_lifecycle::decide_promotion`. Only the actions below
+            // are this runtime's business.
+            let decision = {
+                let group = extension.map(|extension| srt_lifecycle::GroupAffinity {
+                    group_id: extension.group_id,
+                    stream_id: None,
+                    extension,
+                });
+                match router.lock() {
+                    Ok(mut router) => srt_lifecycle::decide_promotion(
+                        promotion,
+                        peer,
+                        group,
+                        worker_index,
+                        &mut router,
+                        srt_lifecycle::RoutingMode::LeastTuples,
+                    ),
+                    // Poisoned: leave the connection where it is rather
+                    // than stall admission on a dead lock.
+                    Err(_) => srt_lifecycle::PromotionDecision::StayOnListener,
+                }
             };
 
-            let promote_here = match owner {
-                Some(o) => {
-                    o == worker_index
-                        && matches!(promotion, crate::Promotion::Bonded | crate::Promotion::All)
-                }
-                None => promotion == crate::Promotion::All,
-            };
-            match owner {
-                Some(o) if o != worker_index => {
+            match decision {
+                srt_lifecycle::PromotionDecision::StayOnListener => {}
+                srt_lifecycle::PromotionDecision::RelocateTo(owner) => {
                     let Some(p) = peers.remove(&peer) else {
                         continue;
                     };
-                    relocate_to_owner(cfg.port, peer, p.conn, o, &senders);
+                    relocate_to_owner(cfg.port, peer, p.conn, owner, &senders);
                 }
-                _ if promote_here => {
-                    // See `LossConfig::promotion`: give this connection
-                    // its own socket and task so the runtime's scheduler
-                    // drives it independently of the shared per-peer loop.
+                srt_lifecycle::PromotionDecision::PromoteHere => {
                     let Some(p) = peers.remove(&peer) else {
                         continue;
                     };
@@ -689,7 +679,6 @@ async fn run_acceptor(
                         None => eprintln!("[bench-compio] promote {peer}: failed"),
                     }
                 }
-                _ => {} // stays serviced off the shared listener
             }
         }
 

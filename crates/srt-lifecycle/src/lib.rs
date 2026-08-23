@@ -231,6 +231,104 @@ pub fn normalize_stream_id(stream_id: Option<String>) -> Option<String> {
     })
 }
 
+/// Which connections get their own connected socket (and, on a runtime
+/// with a task scheduler, their own task) at their first `Connected`.
+///
+/// The modes nest: `Never` ⊂ `Relocate` ⊂ `Bonded` ⊂ `All`, each adding
+/// one population to the set that gets promoted. They exist as a knob
+/// rather than a decision because the tradeoff is genuinely
+/// runtime-dependent -- promotion buys independent scheduling, which only
+/// helps a runtime that has a scheduler to exploit, and costs socket
+/// churn plus SO_REUSEPORT group perturbation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Promotion {
+    /// Nothing ever promotes, and group affinity is abandoned: bonded
+    /// legs stay wherever the kernel hashed them. The diagnostic control
+    /// that says what affinity plus relocation actually buy.
+    Never,
+    /// Only a bonded leg whose group owner is a *different* worker.
+    /// Irreducible: moving a connection between reactors requires an fd
+    /// the destination can register.
+    Relocate,
+    /// Every bonded leg, including ones already on their owner.
+    Bonded,
+    /// Every connection.
+    All,
+}
+
+/// What should happen to a connection that has just reached `Connected`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromotionDecision {
+    /// Keep servicing it off the shared listener by peer-address
+    /// dispatch. No new socket, so the reuseport group is undisturbed.
+    StayOnListener,
+    /// Give it a private connected socket on this same worker.
+    PromoteHere,
+    /// Hand it to another worker, which requires a private connected
+    /// socket to send across. The index is never this worker's own.
+    RelocateTo(usize),
+}
+
+impl PromotionDecision {
+    /// Whether this decision creates a private socket, and so perturbs
+    /// the SO_REUSEPORT group. The thing every cost model here keys on.
+    #[must_use]
+    pub fn promotes(self) -> bool {
+        !matches!(self, Self::StayOnListener)
+    }
+}
+
+/// Decide a just-connected transport key's fate under `mode`.
+///
+/// This is the whole admission promotion ladder, in one place. It used to
+/// live as six hand-copies inside the per-runtime acceptors, which is
+/// exactly how their telemetry drifted apart unnoticed (one backend
+/// counted relocations as promotions, five did not, so identical-looking
+/// log lines meant different things). The I/O differs per runtime; this
+/// decision does not.
+///
+/// `group` is the peer's handshake GROUP extension, if any. It is
+/// consulted -- and the router touched -- only when `mode` is something
+/// other than [`Promotion::Never`]; under `Never` the router is
+/// deliberately never asked, so affinity state stays empty and legs stay
+/// where the kernel put them.
+pub fn decide_promotion<K>(
+    mode: Promotion,
+    key: K,
+    group: Option<GroupAffinity>,
+    worker_index: usize,
+    router: &mut WorkerRouter<K>,
+    routing: RoutingMode,
+) -> PromotionDecision
+where
+    K: Eq + Hash + Clone,
+{
+    // A bonded leg asks the router where its group already lives.
+    // Unbonded connections, and everything under `Never`, have no
+    // affinity to honour and so no owner.
+    let owner = match group {
+        Some(group) if mode != Promotion::Never => Some(router.assign(key, Some(group), routing)),
+        _ => None,
+    };
+
+    match owner {
+        // Physically elsewhere: relocate regardless of mode, because the
+        // affinity cannot be satisfied where the connection currently is.
+        Some(owner) if owner != worker_index => PromotionDecision::RelocateTo(owner),
+        // Bonded and already on its owner: the affinity is satisfied
+        // right here, so promoting is optional and mode decides.
+        Some(_) => match mode {
+            Promotion::Bonded | Promotion::All => PromotionDecision::PromoteHere,
+            _ => PromotionDecision::StayOnListener,
+        },
+        // Unbonded (or `Never`): only `All` promotes.
+        None => match mode {
+            Promotion::All => PromotionDecision::PromoteHere,
+            _ => PromotionDecision::StayOnListener,
+        },
+    }
+}
+
 /// Most workers whose index can be carried in a SYN cookie.
 ///
 /// The index occupies the low byte, so a deployment with more acceptor
@@ -313,6 +411,155 @@ pub fn group_extension_from_packet(packet: &[u8]) -> Option<(GroupExtensionData,
     let (_, affinity) = handshake_route(packet)?;
     let affinity = affinity?;
     Some((affinity.extension, affinity.stream_id))
+}
+
+#[cfg(test)]
+mod promotion_tests {
+    use super::*;
+
+    const MODES: [Promotion; 4] = [
+        Promotion::Never,
+        Promotion::Relocate,
+        Promotion::Bonded,
+        Promotion::All,
+    ];
+
+    fn affinity(group_id: u32) -> GroupAffinity {
+        GroupAffinity {
+            group_id,
+            stream_id: None,
+            extension: GroupExtensionData {
+                group_id,
+                group_type: shiguredo_srt::GroupType::Broadcast,
+                flags: 0,
+                weight: 0,
+            },
+        }
+    }
+
+    /// Run one decision against a router in a known state: `seed_owner`
+    /// pre-assigns the group to a chosen worker, so the bonded case is
+    /// deterministic instead of depending on selection order.
+    fn decide(
+        mode: Promotion,
+        group: Option<GroupAffinity>,
+        worker_index: usize,
+        seed_owner: Option<usize>,
+    ) -> PromotionDecision {
+        let mut router: WorkerRouter<u32> = WorkerRouter::new(4);
+        if let (Some(group), Some(owner)) = (group.clone(), seed_owner) {
+            // Anchor the group on `owner`. Round-robin hands out workers
+            // in order, so walk it forward with unbonded keys until the
+            // next pick is `owner`, then register the group with a real
+            // tuple. Re-assigning one key would just return its existing
+            // worker and never move the group anywhere.
+            for i in 0..owner {
+                router.assign(8_000 + i as u32, None, RoutingMode::RoundRobin);
+            }
+            router.assign(9_000, Some(group), RoutingMode::RoundRobin);
+        }
+        decide_promotion(
+            mode,
+            1u32,
+            group,
+            worker_index,
+            &mut router,
+            RoutingMode::LeastTuples,
+        )
+    }
+
+    #[test]
+    fn never_promotes_nothing_bonded_or_not() {
+        for group in [None, Some(affinity(7))] {
+            for worker in 0..4 {
+                assert_eq!(
+                    decide(Promotion::Never, group.clone(), worker, Some(2)),
+                    PromotionDecision::StayOnListener,
+                    "Never must not promote (group={group:?}, worker={worker})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unbonded_promotes_only_under_all() {
+        for mode in MODES {
+            let decision = decide(mode, None, 0, None);
+            let expected = if mode == Promotion::All {
+                PromotionDecision::PromoteHere
+            } else {
+                PromotionDecision::StayOnListener
+            };
+            assert_eq!(decision, expected, "unbonded under {mode:?}");
+        }
+    }
+
+    #[test]
+    fn a_leg_on_another_worker_always_relocates_except_under_never() {
+        // Seed the group onto worker 3, then decide as worker 0.
+        for mode in [Promotion::Relocate, Promotion::Bonded, Promotion::All] {
+            assert_eq!(
+                decide(mode, Some(affinity(11)), 0, Some(3)),
+                PromotionDecision::RelocateTo(3),
+                "off-owner leg under {mode:?} must relocate"
+            );
+        }
+    }
+
+    #[test]
+    fn a_leg_already_on_its_owner_promotes_only_under_bonded_or_all() {
+        // Seed the group onto worker 0 and decide as worker 0.
+        for mode in MODES {
+            let decision = decide(mode, Some(affinity(12)), 0, Some(0));
+            let expected = match mode {
+                Promotion::Bonded | Promotion::All => PromotionDecision::PromoteHere,
+                _ => PromotionDecision::StayOnListener,
+            };
+            assert_eq!(decision, expected, "on-owner leg under {mode:?}");
+        }
+    }
+
+    #[test]
+    fn relocation_never_targets_the_deciding_worker() {
+        for worker in 0..4 {
+            for owner in 0..4 {
+                for mode in MODES {
+                    if let PromotionDecision::RelocateTo(target) =
+                        decide(mode, Some(affinity(20 + owner as u32)), worker, Some(owner))
+                    {
+                        assert_ne!(
+                            target, worker,
+                            "relocating to self is a no-op that would drop the connection"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The contract the six hand-written copies were each supposed to
+    /// uphold and which nothing could check across all of them: the set
+    /// of promoted connections only grows as the mode widens.
+    #[test]
+    fn promotion_sets_nest_monotonically() {
+        for group in [None, Some(affinity(31))] {
+            for worker in 0..4 {
+                for owner in 0..4 {
+                    let seed = group.as_ref().map(|_| owner);
+                    let promoted: Vec<bool> = MODES
+                        .iter()
+                        .map(|&m| decide(m, group.clone(), worker, seed).promotes())
+                        .collect();
+                    for window in promoted.windows(2) {
+                        assert!(
+                            !window[0] || window[1],
+                            "promotion is not monotonic across modes                              (group={group:?}, worker={worker}, owner={owner}): {promoted:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

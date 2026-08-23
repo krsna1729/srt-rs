@@ -245,21 +245,10 @@ pub enum Ingress {
     ReuseportSingle { workers: usize },
 }
 
-/// See [`LossConfig::promotion`]. The modes nest:
-/// `Never` ⊂ `Relocate` ⊂ `Bonded` ⊂ `All` -- each adds one population of
-/// connections that get a private connected socket at first `Connected`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Promotion {
-    /// Nothing ever promotes; bonded affinity is abandoned (legs stay
-    /// wherever the kernel hashed them). Diagnostic control.
-    Never,
-    /// Only bonded legs whose owner is a different worker thread.
-    Relocate,
-    /// All bonded legs (relocating ones still relocate).
-    Bonded,
-    /// Every connection.
-    All,
-}
+/// The promotion ladder is admission policy, so it lives beside
+/// `WorkerRouter` in srt-lifecycle rather than here; re-exported so
+/// `LossConfig` and the runtime adapters can name it unqualified.
+pub use srt_lifecycle::{Promotion, PromotionDecision};
 
 /// Bond group type to advertise in the sender's handshake extension. See
 /// [`LossConfig::bond_mode`].
