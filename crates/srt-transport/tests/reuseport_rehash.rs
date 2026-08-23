@@ -247,6 +247,60 @@ fn repeated_promotions_compound_the_disruption() {
     );
 }
 
+/// Is a promotion's disruption transient or permanent?
+///
+/// If `connect()` detaches the promoted socket from the group, then a
+/// completed promotion takes the group 4 -> 5 -> 4, and flows displaced by
+/// the bind should land back where they started once the connect lands.
+/// That would make the damage a narrow *window* (packets arriving between
+/// the two syscalls) rather than a lasting reshuffle -- a completely
+/// different engineering problem, and the difference between "keep the
+/// window short" and "never grow the group at all".
+#[test]
+fn a_completed_promotion_restores_original_flow_placement() {
+    let (mut listeners, flows, port) = setup();
+
+    let before = map_homes(&flows, &listeners);
+
+    let promoted = bind_member(port).expect("bind promoted socket");
+    listeners.push(promoted);
+    let during = map_homes(&flows, &listeners);
+
+    let unrelated = UdpSocket::bind("127.0.0.1:0").expect("bind unrelated peer");
+    let unrelated_addr = unrelated.local_addr().expect("local_addr");
+    listeners
+        .last()
+        .expect("promoted socket")
+        .connect(unrelated_addr)
+        .expect("connect promoted socket");
+    let after = map_homes(&flows, &listeners);
+
+    let (moved_by_bind, _) = count_moves(&before, &during);
+    let (moved_by_connect, _) = count_moves(&during, &after);
+    let (net_moved, net_lost) = count_moves(&before, &after);
+
+    eprintln!(
+        "[reuseport] promotion window: bind moved {moved_by_bind}/{FLOWS}, \
+         connect moved {moved_by_connect}/{FLOWS}, NET vs original: \
+         {net_moved} moved / {net_lost} lost"
+    );
+
+    // Reported, not asserted in either direction: this is the measurement
+    // that tells a future reader whether shortening the bind->connect
+    // window is a viable mitigation at all.
+    if net_moved == 0 {
+        eprintln!(
+            "[reuseport] => disruption is TRANSIENT: only datagrams arriving \
+             inside the bind->connect window are misrouted"
+        );
+    } else {
+        eprintln!(
+            "[reuseport] => disruption is PERSISTENT: {net_moved}/{FLOWS} flows \
+             remain on a different member after the promotion completes"
+        );
+    }
+}
+
 /// The positive control, and the reason the tests above are worth having
 /// rather than just concluding "SO_REUSEPORT is unusable at scale".
 ///

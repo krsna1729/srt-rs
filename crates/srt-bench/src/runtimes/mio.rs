@@ -10,7 +10,7 @@ use shiguredo_srt::{
     ConnectionEvent, ConnectionOptions, GroupExtensionData, GroupType, SRTGROUP_MASK, SrtConnection,
 };
 use srt_transport::mio_transport::Conn;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -68,6 +68,100 @@ fn drain_admission(
                 Err(_) => break,
             }
         },
+    }
+}
+
+/// One `PerPort` connection's live state -- module-scoped (not local to
+/// `run`) so `spawn_driver` can name it.
+struct Driver {
+    conn: Conn,
+    connected: bool,
+    stream_deadline: Option<Instant>,
+    data_events: u64,
+    peer: Option<SocketAddr>,
+    poisoned: bool,
+    /// When this connection was started. Only meaningful while
+    /// `!connected`: it bounds how long a handshake may stay "in flight"
+    /// before the admission pipeline stops waiting on it. Without this, a
+    /// single handshake that never completes pins `connect_concurrency`'s
+    /// in-flight count forever and no further connection is ever started
+    /// -- a deadlock, not just a slowdown.
+    started_at: Instant,
+}
+
+/// Create connection `i`'s socket and protocol state and register it with
+/// `poll` under `Token(i)`. Split out from `run`'s setup loop so it can be
+/// called both to prime the initial batch and, for senders, to backfill
+/// one at a time as `connect_concurrency` allows -- see
+/// `LossConfig::connect_concurrency`'s doc for why senders don't just
+/// create everything upfront.
+fn spawn_driver(cfg: &LossConfig, poll: &mut Poll, start: Instant, i: usize) -> Driver {
+    let addr = cfg.addr_for(i);
+    let mut socket = match cfg.mode {
+        crate::Mode::Sender => {
+            let s = UdpSocket::bind("0.0.0.0:0".parse().unwrap()).expect("bind");
+            s.connect(addr).expect("connect");
+            s
+        }
+        crate::Mode::Receiver => UdpSocket::bind(addr).expect("bind"),
+    };
+    let _ = srt_transport::set_sock_bufs(socket.as_raw_fd());
+    poll.registry()
+        .register(&mut socket, Token(i), Interest::READABLE)
+        .expect("register socket");
+
+    // Bond exercise: connections 2g/2g+1 (for g in 0..bond_pairs) share a
+    // group id, proving the reuseport receiver's registry/handoff path
+    // actually fires in a run instead of sitting dead. Sender-only -- the
+    // listener learns the group (and its type) from the caller's
+    // handshake extension (`peer_group_extension`).
+    let group_extension = if cfg.mode == crate::Mode::Sender
+        && cfg.bond_mode != BondMode::None
+        && i < cfg.bond_pairs * 2
+    {
+        let group_type = match cfg.bond_mode {
+            BondMode::Broadcast => GroupType::Broadcast,
+            BondMode::Backup => GroupType::Backup,
+            BondMode::None => unreachable!("checked above"),
+        };
+        Some(GroupExtensionData {
+            group_id: SRTGROUP_MASK | ((i / 2) as u32 + 1),
+            group_type,
+            flags: 0,
+            weight: 0,
+        })
+    } else {
+        None
+    };
+    let options = ConnectionOptions {
+        socket_id: std::process::id(),
+        tsbpd_delay: cfg.latency_ms,
+        max_bandwidth_bytes_per_sec: match cfg.mode {
+            crate::Mode::Sender => Some(cfg.bitrate_bps / 8),
+            crate::Mode::Receiver => None,
+        },
+        group_extension,
+        ..Default::default()
+    };
+    let conn = match cfg.mode {
+        crate::Mode::Sender => {
+            let mut c = SrtConnection::new_caller(options);
+            c.connect(crate::now_ts(start))
+                .expect("connect() should queue INDUCTION");
+            c
+        }
+        crate::Mode::Receiver => SrtConnection::new_listener(options),
+    };
+    let mut driver = Conn::new(conn, socket);
+    let refused = driver.drain_outputs(crate::now_ts(start));
+    Driver {
+        conn: driver,
+        connected: false,
+        stream_deadline: None,
+        data_events: 0,
+        peer: None,
+        poisoned: refused,
+        started_at: Instant::now(),
     }
 }
 
@@ -130,84 +224,20 @@ pub fn run(cfg: LossConfig) {
     let mut poll = Poll::new().expect("mio Poll::new");
     let mut events = Events::with_capacity(4096);
 
-    struct Driver {
-        conn: Conn,
-        connected: bool,
-        stream_deadline: Option<Instant>,
-        data_events: u64,
-        peer: Option<SocketAddr>,
-        poisoned: bool,
-    }
-
     let mut drivers: Vec<Driver> = Vec::with_capacity(cfg.connections);
-    for i in 0..cfg.connections {
-        let addr = cfg.addr_for(i);
-        let mut socket = match cfg.mode {
-            crate::Mode::Sender => {
-                let s = UdpSocket::bind("0.0.0.0:0".parse().unwrap()).expect("bind");
-                s.connect(addr).expect("connect");
-                s
-            }
-            crate::Mode::Receiver => UdpSocket::bind(addr).expect("bind"),
-        };
-        let _ = srt_transport::set_sock_bufs(socket.as_raw_fd());
-        poll.registry()
-            .register(&mut socket, Token(i), Interest::READABLE)
-            .expect("register socket");
-
-        // Bond exercise: connections 2g/2g+1 (for g in 0..bond_pairs) share
-        // a group id, proving the reuseport receiver's registry/handoff
-        // path actually fires in a run instead of sitting dead.
-        // Sender-only -- the listener learns the group (and its type)
-        // from the caller's handshake extension (`peer_group_extension`).
-        let group_extension = if cfg.mode == crate::Mode::Sender
-            && cfg.bond_mode != BondMode::None
-            && i < cfg.bond_pairs * 2
-        {
-            let group_type = match cfg.bond_mode {
-                BondMode::Broadcast => GroupType::Broadcast,
-                BondMode::Backup => GroupType::Backup,
-                BondMode::None => unreachable!("checked above"),
-            };
-            Some(GroupExtensionData {
-                group_id: SRTGROUP_MASK | ((i / 2) as u32 + 1),
-                group_type,
-                flags: 0,
-                weight: 0,
-            })
-        } else {
-            None
-        };
-        let options = ConnectionOptions {
-            socket_id: std::process::id(),
-            tsbpd_delay: cfg.latency_ms,
-            max_bandwidth_bytes_per_sec: match cfg.mode {
-                crate::Mode::Sender => Some(cfg.bitrate_bps / 8),
-                crate::Mode::Receiver => None,
-            },
-            group_extension,
-            ..Default::default()
-        };
-        let conn = match cfg.mode {
-            crate::Mode::Sender => {
-                let mut c = SrtConnection::new_caller(options);
-                c.connect(crate::now_ts(start))
-                    .expect("connect() should queue INDUCTION");
-                c
-            }
-            crate::Mode::Receiver => SrtConnection::new_listener(options),
-        };
-        let mut driver = Conn::new(conn, socket);
-        let refused = driver.drain_outputs(crate::now_ts(start));
-        drivers.push(Driver {
-            conn: driver,
-            connected: false,
-            stream_deadline: None,
-            data_events: 0,
-            peer: None,
-            poisoned: refused,
-        });
+    // Receivers: no storm risk (each binds its own dedicated port, and the
+    // socket must exist before its sender's first packet can arrive), so
+    // create all of them upfront. Senders: prime up to `connect_concurrency`
+    // and let the main loop below backfill the rest as earlier connections
+    // finish handshaking -- see `LossConfig::connect_concurrency`'s doc.
+    let priming = match cfg.mode {
+        crate::Mode::Receiver => cfg.connections,
+        crate::Mode::Sender => cfg.connect_concurrency.min(cfg.connections),
+    };
+    for i in 0..priming {
+        drivers.push(spawn_driver(&cfg, &mut poll, start, i));
     }
+    let mut next_to_start = priming;
 
     // Senders stream at the target bitrate once connected.
     let payload = vec![0x42u8; crate::PAYLOAD_SIZE];
@@ -219,14 +249,49 @@ pub fn run(cfg: LossConfig) {
             eprintln!("[bench-mio] connect timed out");
             break;
         }
-        let all_done = drivers.iter().all(|d| d.connected)
+        // A connection is settled once it has either finished streaming or
+        // given up on connecting. Treating a never-connecting handshake as
+        // settled (rather than requiring every driver to reach
+        // `connected`) is what keeps one dead peer from hanging the whole
+        // run -- the loop used to wait on it forever, since its
+        // `stream_deadline` stays `None`.
+        let all_done = next_to_start >= cfg.connections
             && drivers.iter().all(|d| {
-                d.stream_deadline
-                    .map(|dl| Instant::now() >= dl)
-                    .unwrap_or(false)
+                if d.connected {
+                    d.stream_deadline
+                        .map(|dl| Instant::now() >= dl)
+                        .unwrap_or(false)
+                } else {
+                    d.started_at.elapsed() >= crate::INTEROP_CONNECT_TIMEOUT
+                }
             });
         if all_done {
             break;
+        }
+
+        // Backfill: start the next connection(s) once earlier ones have
+        // connected and freed up room under `connect_concurrency` -- see
+        // `LossConfig::connect_concurrency`'s doc. No-op for receivers
+        // (primed with everything upfront) and once every connection has
+        // been started.
+        //
+        // Only handshakes still *within* their connect window count as
+        // occupying a slot. A handshake that has blown past
+        // INTEROP_CONNECT_TIMEOUT is never going to complete, and holding
+        // a slot for it stalls every remaining connection behind it --
+        // with `connect_concurrency=1` that is a total deadlock, and it
+        // was observed as exactly that (a run that started 9 connections,
+        // had 1 hang, and never started the other 141).
+        while next_to_start < cfg.connections {
+            let in_flight = drivers
+                .iter()
+                .filter(|d| !d.connected && d.started_at.elapsed() < crate::INTEROP_CONNECT_TIMEOUT)
+                .count();
+            if in_flight >= cfg.connect_concurrency {
+                break;
+            }
+            drivers.push(spawn_driver(&cfg, &mut poll, start, next_to_start));
+            next_to_start += 1;
         }
 
         let mut poll_wait = TIMER_TICK;
@@ -584,7 +649,6 @@ struct PoolSlot {
     ever_connected: bool,
     data_events: u64,
     poisoned: bool,
-    token: Token,
     /// Wall-clock deadline for this connection's stream, set once at slot
     /// creation (promotion only happens after the handshake completes, so
     /// every slot starts connected).
@@ -622,6 +686,25 @@ const IDLE_GRACE: Duration = Duration::from_secs(10);
 /// handoff channel. Proves the registry/handoff path fired in a given run
 /// instead of sitting dead -- see `run_pool_receiver`'s shutdown log.
 static HANDOFF_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Diagnostic counter: every connection promoted to a dedicated socket,
+/// local or remote (a superset of `HANDOFF_COUNT`) -- see
+/// `run_pool_receiver`'s shutdown log.
+static PROMOTION_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Where a connection's promotion (see `run_pool_acceptor`'s module doc)
+/// lands: on this same thread, or shipped to a specific remote owner.
+enum PromotionTarget {
+    Local,
+    Remote(usize),
+}
+
+/// Max new reuseport-group members one tick may create once draining is
+/// allowed at all -- see `pending_promotions`'s doc in
+/// `run_pool_acceptor`. Deliberately small: this bounds a connection
+/// storm's rehashing hazard, not steady-state throughput (a connection
+/// promotes exactly once, in its lifetime).
+const MAX_PROMOTIONS_PER_TICK: usize = 4;
 
 /// Bond-affinity handoff payload: a fully promoted slot shipped from the
 /// acceptor that completed its handshake to the thread that owns the group.
@@ -676,33 +759,50 @@ fn drain_conn_outputs(
 /// Multi-acceptor single-port receiver (`--ingress reuseport-multi=K`,
 /// K>1): K SO_REUSEPORT acceptor threads share the base port; the kernel
 /// hashes each flow's source tuple to one of them. Each acceptor
-/// completes the handshake for every flow routed to it, then decides
-/// whether that connection needs to physically move to a different
-/// thread at all.
+/// completes the handshake for every flow routed to it, then -- once, and
+/// only once, that flow reaches `Connected` -- promotes it to a dedicated
+/// connected socket and its own slot. Before `Connected`, every flow is
+/// serviced off this thread's shared listener socket, dispatched by peer
+/// address, exactly like `SharedPool`; a still-handshaking flow never gets
+/// its own socket.
 ///
-/// The common case -- an unbonded connection, or a bonded one whose
-/// kernel-hash landing already matches its group's owner -- needs no new
-/// socket: it's serviced straight off this thread's existing listener
-/// socket, dispatched by peer address, exactly like `SharedPool`. Only a
-/// bonded leg that actually needs to relocate to a different owner gets
-/// promoted to a dedicated connected socket and shipped once over a
-/// one-shot mpsc channel.
+/// The kernel always prefers an exact-4-tuple connected-socket match over
+/// the reuseport hash, so once a flow is `Connected`, giving it a private
+/// socket is safe *for that flow* regardless of group size -- the whole
+/// reuseport-hash hazard below is specifically about *other, still-
+/// unconnected* flows losing their footing when a new member joins the
+/// group. That's why promotion is gated on `Connected` and nothing else:
+/// an unbonded connection promotes to a *local* slot on the same thread
+/// that admitted it (no `WorkerRouter` consultation needed -- there's no
+/// group affinity constraint to honor); a bonded leg consults
+/// `srt_lifecycle::WorkerRouter` once, at that same moment, to learn its
+/// group's owner, and only differs in *where* the private socket ends up:
+/// a local slot if this thread already owns the group, or a one-shot
+/// handoff to the owner's thread if not.
 ///
-/// This matters beyond neatness: every *new* socket bound into this
-/// port's reuseport group perturbs Linux's default (non-eBPF) hash,
-/// which factors in current group size -- so it can reroute some other,
-/// still-pending flow's next datagram to a different acceptor mid-
-/// handshake, forcing a retry (measured: ~5-6x listener CPU-sys time at
-/// 150 connections when every connection was promoted, regardless of
-/// bonding). Not promoting the common case means the group stays fixed
-/// at its initial K members for an all-unbonded workload, however large
-/// or long-running -- no assumption about total connection count needed,
-/// since nothing is pre-sized to it.
+/// Promoting *every* connection (not just relocating bond legs) is the
+/// point, not a compromise: task-per-connection steady-state service,
+/// same idiom `PerPort` already uses successfully, replaces the earlier
+/// design's shared per-worker maintenance loop iterating every live peer
+/// sequentially every tick -- which measurably bottlenecks several other
+/// runtimes' backends at real throughput (see their module docs' "KNOWN
+/// LIMITATION" notes). mio's own per-operation cost is cheap enough that
+/// this bottleneck was never visible here, but the fix is the same shape
+/// for every runtime, and mio is the reference implementation for it.
 ///
-/// Ownership for the connections that *do* need to move is decided via
-/// `srt_lifecycle::WorkerRouter`, consulted only for bonded legs (an
-/// unbonded connection never touches it, exactly like the registry this
-/// replaced).
+/// The residual hazard -- every *new* socket bound into this port's
+/// reuseport group perturbs Linux's default (non-eBPF) hash, which
+/// factors in current group size, so it can reroute some other still-
+/// pending flow's next datagram to a different acceptor mid-handshake,
+/// forcing a retry -- is now bounded to a *connection storm* (many flows
+/// completing their handshake in the same tight window), not sustained
+/// for a connection's whole life the way promoting at admission time
+/// would be. `MAX_PROMOTIONS_PER_TICK` paces how many new sockets any one
+/// tick may create, spreading a storm's promotions across several ticks
+/// instead of growing the group by dozens of members at once -- see
+/// `pending_promotions` below. A connection queued for promotion is not
+/// removed from `peers` (and so stays fully serviced, no gap) until the
+/// tick it's actually promoted.
 fn run_pool_receiver(cfg: LossConfig, k: usize) {
     use std::sync::mpsc;
 
@@ -741,12 +841,16 @@ fn run_pool_receiver(cfg: LossConfig, k: usize) {
         }
     }
     // Always report, not gated on the receiver's own --bond (bonding is a
-    // sender-side choice; the receiver learns it from the handshake) --
-    // a nonzero count is the proof the handoff path fired at all.
+    // sender-side choice; the receiver learns it from the handshake).
+    // `promotions` is every connection that ever got a dedicated socket
+    // (should track admitted connections closely); `handoffs` is the
+    // subset of those that needed to move to a different worker -- a
+    // nonzero handoff count is the proof the bond-affinity path fired.
+    let promotions = PROMOTION_COUNT.load(Ordering::Relaxed);
     let handoffs = HANDOFF_COUNT.load(Ordering::Relaxed);
-    if handoffs > 0 {
-        eprintln!("[bench-mio] pool receiver: {handoffs} bond handoffs");
-    }
+    eprintln!(
+        "[bench-mio] pool receiver: {promotions} promotions ({handoffs} cross-thread handoffs)"
+    );
     agg.print(start);
     if !agg.any_connected {
         eprintln!("[bench-mio] pool receiver admitted no connections");
@@ -787,17 +891,32 @@ fn run_pool_acceptor(
         last_data_at: Instant,
     }
 
-    // Every connection this acceptor admits and keeps servicing locally
-    // (the common case: unbonded, or bonded but already on its group's
-    // owner thread) lives here for its whole life -- dispatched by peer
-    // address off the *same* listener socket used for admission, exactly
-    // like `SharedPool`. No dedicated socket, no reuseport-group growth.
-    // `slots` (below) holds only the rare opposite case: a bonded leg
-    // that had to relocate here from another acceptor via handoff, which
-    // genuinely needs its own connected socket since it physically moved
-    // event loops.
+    // Every flow lives here from admission through `Connected` -- dispatched
+    // by peer address off the *same* listener socket used for admission,
+    // exactly like `SharedPool`. A flow leaves `peers` the instant its
+    // queued promotion actually executes (see `pending_promotions`), never
+    // before -- so it's always either mid-handshake here, or fully
+    // promoted into `slots`, never in between.
     let mut peers: HashMap<SocketAddr, Peer> = HashMap::new();
+    // Promoted connections -- local or handed off in from another
+    // acceptor -- each with a dedicated connected socket and mio token,
+    // driven by `service_slot_event`/`maintain_slots` like any other
+    // established connection.
     let mut slots: Vec<PoolSlot> = Vec::new();
+    // token.0 -> index in `slots`, maintained alongside every push below --
+    // see `service_slot_event`'s doc for why this matters at #4's scale.
+    let mut token_index: HashMap<usize, usize> = HashMap::new();
+    // Flows that reached `Connected` and had their destination decided
+    // (local vs. a specific remote owner) but haven't been promoted yet.
+    // Drained at `MAX_PROMOTIONS_PER_TICK` per tick -- see the drain site
+    // below and `LossConfig::connect_concurrency`'s doc for the full
+    // reasoning (a fixed rate alone doesn't fully absorb a true
+    // connection storm, but the sender no longer produces one under
+    // ordinary use; this remains as a second line of defense). FIFO
+    // order (push back, pop front) keeps
+    // promotion latency roughly equal across a storm instead of starving
+    // whoever connected first.
+    let mut pending_promotions: VecDeque<(SocketAddr, PromotionTarget)> = VecDeque::new();
     let mut next_token: usize = 1;
     let connect_deadline = Instant::now() + crate::INTEROP_CONNECT_TIMEOUT;
     let stream_len = Duration::from_secs_f64(cfg.duration_secs);
@@ -862,13 +981,13 @@ fn run_pool_acceptor(
             conn.fire_expired(crate::now_ts(start));
             conn.drain_outputs(crate::now_ts(start));
             let now = Instant::now();
+            token_index.insert(token.0, slots.len());
             slots.push(PoolSlot {
                 conn,
                 connected: true,
                 ever_connected: true,
                 data_events: 0,
                 poisoned: false,
-                token,
                 stream_deadline: now + stream_len,
                 last_data_at: now,
             });
@@ -904,26 +1023,28 @@ fn run_pool_acceptor(
                         },
                     );
                 }
-                idx => service_slot_event(&mut slots, Token(idx), &mut buf, start),
+                idx => service_slot_event(&mut slots, &token_index, Token(idx), &mut buf, start),
             }
         }
 
         // Drive every tracked peer: fire timers, drain outputs (always
         // via the shared listener's unconnected `send_to` -- a peer here
-        // never gets its own socket, connected or not), and react to
-        // protocol events. On a peer's *first* Connected, decide once
-        // whether it needs to relocate -- see this function's module doc.
+        // never gets its own socket until it's actually promoted below),
+        // and react to protocol events. On a peer's *first* Connected,
+        // decide its promotion destination once -- see this function's
+        // module doc -- and queue it; the peer stays in `peers`, fully
+        // serviced, until `pending_promotions` actually pops it.
         let t = crate::now_ts(start);
-        let mut relocate: Vec<(SocketAddr, GroupExtensionData)> = Vec::new();
+        let mut newly_connected: Vec<SocketAddr> = Vec::new();
         for (peer, p) in peers.iter_mut() {
             p.timers.fire_expired(t, &mut p.conn);
             let _ = drain_conn_outputs(&mut p.conn, &mut p.timers, &listener, *peer, t);
-            let mut newly_connected = false;
+            let mut just_connected = false;
             while let Some(ev) = p.conn.poll_event() {
                 match ev {
                     ConnectionEvent::Connected => {
                         if p.stream_deadline.is_none() {
-                            newly_connected = true;
+                            just_connected = true;
                         }
                         p.connected = true;
                     }
@@ -937,31 +1058,77 @@ fn run_pool_acceptor(
                     _ => {}
                 }
             }
-            if newly_connected {
+            if just_connected {
                 p.stream_deadline = Some(Instant::now() + stream_len);
-                if let Some(extension) = p.conn.peer_group_extension() {
-                    relocate.push((*peer, extension));
-                }
+                newly_connected.push(*peer);
             }
         }
-        for (peer, extension) in relocate {
-            let group = srt_lifecycle::GroupAffinity {
-                group_id: extension.group_id,
-                stream_id: None,
-                extension,
+        for peer in newly_connected {
+            // Every connection promotes once Connected -- unbonded ones
+            // locally (no router needed: there's no group affinity
+            // constraint to honor), bonded ones to wherever
+            // `WorkerRouter` says their group already lives.
+            let target = match peers.get(&peer).and_then(|p| p.conn.peer_group_extension()) {
+                Some(extension) => {
+                    let group = srt_lifecycle::GroupAffinity {
+                        group_id: extension.group_id,
+                        stream_id: None,
+                        extension,
+                    };
+                    let owner = match router.lock() {
+                        Ok(mut router) => router.assign(
+                            peer,
+                            Some(group),
+                            srt_lifecycle::RoutingMode::LeastTuples,
+                        ),
+                        Err(_) => worker_index, // poisoned: promote locally rather than stall
+                    };
+                    if owner == worker_index {
+                        PromotionTarget::Local
+                    } else {
+                        PromotionTarget::Remote(owner)
+                    }
+                }
+                None => PromotionTarget::Local,
             };
-            let owner = {
-                let mut router = match router.lock() {
-                    Ok(r) => r,
-                    Err(_) => continue, // poisoned: leave the leg where it landed
-                };
-                router.assign(peer, Some(group), srt_lifecycle::RoutingMode::LeastTuples)
+            pending_promotions.push_back((peer, target));
+        }
+
+        // Pace how many new reuseport-group members this tick may create.
+        // A quiet-gate variant (defer while any peer is still mid-
+        // handshake, with a bypass once a promotion has waited too long)
+        // was tried and measured *worse* than this plain fixed rate: once
+        // many connections queue for promotion around the same time (a
+        // storm's defining trait), their bypass deadlines cluster too,
+        // producing a coordinated burst that undoes the pacing. A steady,
+        // low, unconditional trickle spreads the group's growth out
+        // evenly instead.
+        let mut promoted_this_tick = 0;
+        while promoted_this_tick < MAX_PROMOTIONS_PER_TICK {
+            let Some((peer, target)) = pending_promotions.pop_front() else {
+                break;
             };
-            if owner != worker_index {
-                let Some(p) = peers.remove(&peer) else {
-                    continue;
-                };
-                relocate_to_owner(cfg.port, peer, p.conn, owner, &senders);
+            let Some(p) = peers.remove(&peer) else {
+                continue; // already gone (e.g. idled out) before its turn
+            };
+            promoted_this_tick += 1;
+            match target {
+                PromotionTarget::Local => {
+                    promote_locally(
+                        &mut poll,
+                        &mut next_token,
+                        cfg.port,
+                        peer,
+                        p.conn,
+                        start,
+                        stream_len,
+                        &mut slots,
+                        &mut token_index,
+                    );
+                }
+                PromotionTarget::Remote(owner) => {
+                    relocate_to_owner(cfg.port, peer, p.conn, owner, &senders);
+                }
             }
         }
 
@@ -1035,7 +1202,63 @@ fn relocate_to_owner(
         eprintln!("[bench-mio] relocate {peer}: owner {owner} channel closed");
     } else {
         HANDOFF_COUNT.fetch_add(1, Ordering::Relaxed);
+        PROMOTION_COUNT.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// Promote a connection to a dedicated connected socket on *this* thread:
+/// bind a fresh reuseport socket, connect it to the peer, register it
+/// with `poll` under a new token, and push it into `slots` -- the same
+/// shape as a handoff arrival, just executed synchronously instead of
+/// over a channel, since the destination thread is this one.
+#[allow(clippy::too_many_arguments)]
+fn promote_locally(
+    poll: &mut Poll,
+    next_token: &mut usize,
+    port: u16,
+    peer: SocketAddr,
+    pending_conn: SrtConnection,
+    start: Instant,
+    stream_len: Duration,
+    slots: &mut Vec<PoolSlot>,
+    token_index: &mut HashMap<usize, usize>,
+) {
+    let mut socket = match bind_reuseport(port) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[bench-mio] promote {peer}: bind {e}");
+            return;
+        }
+    };
+    if socket.connect(peer).is_err() {
+        eprintln!("[bench-mio] promote {peer}: connect failed");
+        return;
+    }
+    let token = Token(*next_token);
+    *next_token += 1;
+    if poll
+        .registry()
+        .register(&mut socket, token, Interest::READABLE)
+        .is_err()
+    {
+        eprintln!("[bench-mio] promote {peer}: register failed");
+        return;
+    }
+    let mut conn = Conn::new(pending_conn, socket);
+    conn.fire_expired(crate::now_ts(start));
+    conn.drain_outputs(crate::now_ts(start));
+    let now = Instant::now();
+    token_index.insert(token.0, slots.len());
+    slots.push(PoolSlot {
+        conn,
+        connected: true,
+        ever_connected: true,
+        data_events: 0,
+        poisoned: false,
+        stream_deadline: now + stream_len,
+        last_data_at: now,
+    });
+    PROMOTION_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Service one readiness event against an established slot by token:
@@ -1045,9 +1268,22 @@ fn relocate_to_owner(
 /// identical `Vec<PoolSlot>` to completion once a connection is
 /// promoted; they only differ in how slots *arrive* (promoted locally
 /// plus occasional handoff-in, vs handoff-in only).
-fn service_slot_event(slots: &mut [PoolSlot], token: Token, buf: &mut [u8], start: Instant) {
-    let idx = token.0;
-    let Some(slot) = slots.iter_mut().find(|s| s.token.0 == idx) else {
+///
+/// `token_index` maps a token to its position in `slots` -- an O(1)
+/// lookup, not a linear scan. That distinction used to be free when
+/// `slots` only ever held rare cross-thread bond handoffs (a handful of
+/// entries at most), but #4 now promotes *every* connection through this
+/// same path once it's `Connected` (see `run_pool_acceptor`'s module
+/// doc), so `slots` can hold every connection a worker owns -- a scan
+/// per incoming datagram at that size is real, avoidable overhead.
+fn service_slot_event(
+    slots: &mut [PoolSlot],
+    token_index: &HashMap<usize, usize>,
+    token: Token,
+    buf: &mut [u8],
+    start: Instant,
+) {
+    let Some(slot) = token_index.get(&token.0).and_then(|&i| slots.get_mut(i)) else {
         return;
     };
     let t = crate::now_ts(start);
@@ -1375,6 +1611,7 @@ fn run_worker(
     };
     let mut events = Events::with_capacity(1024);
     let mut slots: Vec<PoolSlot> = Vec::new();
+    let mut token_index: HashMap<usize, usize> = HashMap::new();
     let mut next_token: usize = 0;
     let stream_len = Duration::from_secs_f64(cfg.duration_secs);
     // No admission here, so no connect_deadline of its own to wait on --
@@ -1416,13 +1653,13 @@ fn run_worker(
                     conn.fire_expired(crate::now_ts(start));
                     conn.drain_outputs(crate::now_ts(start));
                     let now = Instant::now();
+                    token_index.insert(token.0, slots.len());
                     slots.push(PoolSlot {
                         conn,
                         connected: true,
                         ever_connected: true,
                         data_events: 0,
                         poisoned: false,
-                        token,
                         stream_deadline: now + stream_len,
                         last_data_at: now,
                     });
@@ -1431,7 +1668,7 @@ fn run_worker(
         }
 
         for event in events.iter() {
-            service_slot_event(&mut slots, event.token(), &mut buf, start);
+            service_slot_event(&mut slots, &token_index, event.token(), &mut buf, start);
         }
         maintain_slots(&mut slots, start);
     }
