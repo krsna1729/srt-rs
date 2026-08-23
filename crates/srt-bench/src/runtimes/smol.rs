@@ -16,24 +16,37 @@
 //! can reroute some other still-pending flow's next datagram to a
 //! different acceptor mid-handshake.
 //!
-//! KNOWN LIMITATION (measured): at bench.sh's default 8Mbps/conn, #4
-//! degrades badly (listener under-delivers, well below what the caller
-//! sent) starting at just N=25 (~200Mbps aggregate) despite `sec_a=0
-//! sec_b=0` -- SRT's own loss tracking never fires, so affected
-//! connections are stalling under an overwhelmed shared listener rather
-//! than losing-and-recovering. mio and tokio stay perfectly clean up to
-//! N=150 (~1.2Gbps aggregate) under the identical architecture. This is
-//! NOT a connection-count/density effect (ruled out: at 500kbps/conn --
-//! 16x lower per-conn rate -- N=6 delivers perfectly, repeated 3x). It's a
-//! raw per-packet-operation-overhead ceiling: `async-io`'s wrapping around
-//! each recv/send call costs measurably more than mio's raw non-blocking
-//! syscalls or tokio's reactor at this packet rate, and #4 concentrates
-//! that cost onto only K threads. Same character of issue as the
-//! `PerPort`-specific "KNOWN LIMITATION" already documented in glommio.rs
-//! (measured N>=300 there), just with a lower threshold here. Not chased
-//! further this session -- a real fix (concurrent/batched peer dispatch
-//! instead of sequential per-tick awaits, or profiling the actual hot
-//! path) is a substantial task on its own.
+//! THROUGHPUT AND `--promote-all` (measured; supersedes an earlier,
+//! wrong "KNOWN LIMITATION" note here).
+//!
+//! With the default bond-only promotion, #4 under-delivers badly at
+//! bench.sh's 8Mbps/conn: at N=25 the listener received 75433 of 152450
+//! packets sent (~50%), and at N=150, 359651 of 969994 (~37%, RTT 419ms).
+//! That was previously attributed to `async-io`'s per-packet overhead and
+//! to #4 concentrating load on K threads. Both explanations were wrong:
+//! raising K changes nothing (K=2..25 measured identical), and smol's own
+//! `PerPort` path is flawless at the same load.
+//!
+//! The actual cause is this file's shared-listener design: every live
+//! peer is serviced from one worker's sequential per-tick maintenance
+//! loop, so the executor never gets to interleave them. Giving each
+//! connection its own connected socket and its own task
+//! (`--promote-all=on`) removes the bottleneck outright:
+//!
+//!   N=25:  ~50% -> 99.99% delivered (151648/151662), RTT 1.1 -> 1.4ms
+//!   N=150: ~37% -> 96.8% delivered (882614/912147),  RTT 419 -> 68ms
+//!
+//! So promotion is not a uniform cost to be avoided -- on a runtime with
+//! a real task scheduler it is the whole point, and it is worth roughly
+//! 2x here. (On mio, which is a flat epoll loop with no task model, the
+//! same change measures neutral-to-negative. The right default is
+//! therefore runtime-dependent, which is why it is a flag.)
+//!
+//! Residual cost at N=150 with promotion on: sec_a=58 retransmits, from
+//! reuseport-group churn rerouting flows mid-handshake. See
+//! crates/srt-transport/tests/reuseport_rehash.rs and mio.rs's
+//! ORPHAN_CONCLUSION_COUNT -- cookie-keyed handshake routing is the fix
+//! for that, and is not implemented yet.
 
 use crate::{Aggregate, BondMode, ConnStats, LossConfig};
 use shiguredo_srt::{
@@ -54,6 +67,22 @@ const TIMER_TICK: Duration = Duration::from_millis(10);
 /// Diagnostic counter: bond legs actually shipped cross-thread via the
 /// handoff channel. See `run_reuseport_multi`'s shutdown log.
 static HANDOFF_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Diagnostic counter: connections promoted to their own socket + task on
+/// this same acceptor thread (`--promote-all`). Distinct from
+/// `HANDOFF_COUNT`, which counts only cross-thread bond relocations.
+static PROMOTION_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Give one established connection its own connected socket, so the
+/// kernel matches its packets by exact 4-tuple and it can be driven by an
+/// independent task instead of the shared per-peer maintenance loop.
+/// Returns `None` if the socket could not be created.
+fn promote_locally(port: u16, peer: SocketAddr, conn: SrtConnection) -> Option<Conn> {
+    let std_socket = srt_transport::bind_reuseport(port).ok()?;
+    std_socket.connect(peer).ok()?;
+    let sock = UdpSocket::new(std_socket).ok()?;
+    Some(Conn::new(conn, sock))
+}
 
 pub fn run(cfg: LossConfig) {
     if cfg.mode == crate::Mode::Receiver
@@ -411,9 +440,10 @@ fn run_reuseport_multi(cfg: LossConfig, k: usize) {
         }
     }
     let handoffs = HANDOFF_COUNT.load(Ordering::Relaxed);
-    if handoffs > 0 {
-        eprintln!("[bench-smol] pool receiver: {handoffs} bond handoffs");
-    }
+    let promotions = PROMOTION_COUNT.load(Ordering::Relaxed);
+    eprintln!(
+        "[bench-smol] pool receiver: {promotions} local promotions, {handoffs} bond handoffs"
+    );
     agg.print(start);
     if !agg.any_connected {
         eprintln!("[bench-smol] pool receiver admitted no connections");
@@ -457,6 +487,7 @@ async fn run_acceptor(
         }
     };
 
+    let promote_everyone = cfg.promote_all;
     let mut peers: HashMap<SocketAddr, PeerEntry> = HashMap::new();
     let mut tasks: Vec<async_executor::Task<ConnStats>> = Vec::new();
     let connect_deadline = Instant::now() + crate::INTEROP_CONNECT_TIMEOUT;
@@ -507,7 +538,7 @@ async fn run_acceptor(
         // peer's *first* Connected, decide once whether it needs to
         // relocate.
         let t = crate::now_ts(start);
-        let mut relocate: Vec<(SocketAddr, GroupExtensionData)> = Vec::new();
+        let mut relocate: Vec<(SocketAddr, Option<GroupExtensionData>)> = Vec::new();
         for (peer, p) in peers.iter_mut() {
             p.timers.fire_expired(t, &mut p.conn);
             let _ = drain_pending_outputs(&mut p.conn, &mut p.timers, &listener, *peer).await;
@@ -532,29 +563,61 @@ async fn run_acceptor(
             }
             if newly_connected {
                 p.stream_deadline = Some(Instant::now() + stream_len);
-                if let Some(extension) = p.conn.peer_group_extension() {
-                    relocate.push((*peer, extension));
-                }
+                relocate.push((*peer, p.conn.peer_group_extension()));
             }
         }
         for (peer, extension) in relocate {
-            let group = srt_lifecycle::GroupAffinity {
-                group_id: extension.group_id,
-                stream_id: None,
-                extension,
+            // Owner selection. An unbonded connection has no group
+            // affinity to honor, so it stays on whichever acceptor the
+            // kernel gave it; a bonded leg asks the router where its
+            // group already lives.
+            let owner = match extension {
+                Some(extension) => {
+                    let group = srt_lifecycle::GroupAffinity {
+                        group_id: extension.group_id,
+                        stream_id: None,
+                        extension,
+                    };
+                    match router.lock() {
+                        Ok(mut router) => router.assign(
+                            peer,
+                            Some(group),
+                            srt_lifecycle::RoutingMode::LeastTuples,
+                        ),
+                        Err(_) => worker_index, // poisoned: leave it here
+                    }
+                }
+                None => worker_index,
             };
-            let owner = {
-                let mut router = match router.lock() {
-                    Ok(r) => r,
-                    Err(_) => continue, // poisoned: leave the leg where it landed
-                };
-                router.assign(peer, Some(group), srt_lifecycle::RoutingMode::LeastTuples)
-            };
+
             if owner != worker_index {
                 let Some(p) = peers.remove(&peer) else {
                     continue;
                 };
                 relocate_to_owner(cfg.port, peer, p.conn, owner, &senders);
+            } else if promote_everyone {
+                // The task-per-connection hypothesis under test: give this
+                // connection its own connected socket and its own task, so
+                // smol's executor schedules it independently instead of it
+                // sharing one worker's sequential per-tick peer loop. See
+                // `LossConfig::promote_all`.
+                let Some(p) = peers.remove(&peer) else {
+                    continue;
+                };
+                match promote_locally(cfg.port, peer, p.conn) {
+                    Some(driver) => {
+                        let cfg2 = cfg.clone();
+                        tasks.push(ex.spawn(async move {
+                            established_conn_task(driver, cfg2, start).await
+                        }));
+                        PROMOTION_COUNT.fetch_add(1, Ordering::Relaxed);
+                    }
+                    None => {
+                        // Bind/connect failed: nothing to fall back to,
+                        // the peer state has already been removed.
+                        eprintln!("[bench-smol] promote {peer}: failed");
+                    }
+                }
             }
         }
 

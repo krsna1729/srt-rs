@@ -191,6 +191,21 @@ pub struct LossConfig {
     /// to deliberately reproduce concurrent-arrival admission behavior,
     /// including the storm pathology itself, for targeted testing.
     pub connect_concurrency: usize,
+    /// Receiver only, `ReuseportMulti` only. When true, every connection
+    /// is promoted to its own connected socket (and, on task-based
+    /// runtimes, its own task) at its first `Connected` event. When false
+    /// (the default), only a bonded leg that must relocate to another
+    /// worker is ever promoted, and everything else is serviced off the
+    /// shared listener by peer-address dispatch.
+    ///
+    /// This exists as a switch rather than a decision because the two
+    /// designs trade off against each other and the balance is
+    /// runtime-dependent: promoting buys independent scheduling (which
+    /// only helps runtimes that actually have a task scheduler), and
+    /// costs socket churn plus SO_REUSEPORT group perturbation (see
+    /// crates/srt-transport/tests/reuseport_rehash.rs). Measure per
+    /// runtime; do not assume.
+    pub promote_all: bool,
 }
 
 /// See [`LossConfig::batching`].
@@ -386,7 +401,7 @@ pub fn bench_config_from_args() -> LossConfig {
              [bitrate_bps] [--connections N] \
              [--ingress per-port|shared-pool=K|reuseport-multi=K|reuseport-single=W] \
              [--bond broadcast:G|backup:G|none] [--batch on|off] \
-             [--connect-concurrency N]"
+             [--connect-concurrency N] [--promote-all on|off]"
         );
         std::process::exit(2)
     }
@@ -495,6 +510,16 @@ pub fn bench_config_from_args() -> LossConfig {
         Some(raw) => parse_positive("connect-concurrency", raw),
     };
 
+    let promote_all = match cli.flags.get("promote-all").map(String::as_str) {
+        None | Some("off") => false,
+        // Bare `--promote-all` parses to an empty value.
+        Some("") | Some("on") => true,
+        Some(other) => {
+            eprintln!("error: unknown --promote-all '{other}' (want on|off)");
+            usage()
+        }
+    };
+
     LossConfig {
         runtime,
         mode,
@@ -509,5 +534,6 @@ pub fn bench_config_from_args() -> LossConfig {
         bond_pairs,
         batching,
         connect_concurrency,
+        promote_all,
     }
 }
