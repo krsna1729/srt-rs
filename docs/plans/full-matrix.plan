@@ -1,0 +1,34 @@
+# Comprehensive sweep: connection count AND bandwidth varied independently.
+#
+# Earlier ladders held one of the two fixed:
+#   scaling-ladder  constant ~300 Mbps aggregate, N varied  -> isolates per-connection cost
+#   bw-ladder       constant 2 Mbps/conn, N varied          -> aggregate rises with N
+# Neither can separate "many connections" from "many bytes", because in
+# both the two move together. Varying them independently does, at the
+# cost of 4x the cells.
+#
+# 6 runtimes x 4 ingress x 4 N x 4 bitrate = 384 cells.
+# Top-right corner (1200 conns x 8 Mbps = 9.6 Gbps) is far beyond this
+# host and is expected to fail. That is the point: the failure surface is
+# the result, and where it starts tells us which resource ran out.
+#
+# Run with:
+#   srt-bench matrix --plan docs/plans/full-matrix.plan \
+#     --secs 10 --reps 1 --out scratch/full.tsv
+#
+# Resumable: re-running skips cells already present in the output file,
+# so an interrupted sweep continues rather than restarting.
+
+runtime             = mio,tokio,smol,monoio,glommio,compio
+ingress             = per-port,shared-pool:4,reuseport-multi:4,reuseport-single:4
+connections         = 50,200,600,1200
+bitrate             = 250000,1000000,4000000,8000000
+
+# Held fixed so the four axes above are the only variables.
+promotion           = all
+cookie-routing      = on
+batch               = on
+sock-buf            = 16m
+bond                = none
+connect-concurrency = 50
+pin                 = off
