@@ -36,19 +36,34 @@
 //! decoupled from the maintenance tick, handing datagrams to the main
 //! loop through a local `Rc<RefCell<VecDeque>>` queue.
 //!
-//! KNOWN LIMITATION (measured), same character as the PerPort one above
-//! but with a much lower threshold: at bench.sh's default 8Mbps/conn, #4
-//! degrades badly (listener under-delivers, well below what the caller
-//! sent) starting at just N=25 (~200Mbps aggregate) despite `sec_a=0
-//! sec_b=0` -- SRT's own loss tracking never fires, so affected
-//! connections are stalling under an overwhelmed shared listener rather
-//! than losing-and-recovering. mio and tokio stay perfectly clean up to
-//! N=150 (~1.2Gbps aggregate) under the identical architecture. This is
-//! NOT a connection-count/density effect (ruled out: at 500kbps/conn --
-//! 16x lower per-conn rate -- N=6 delivers perfectly, repeated 3x). Not
-//! chased further this session -- a real fix (concurrent/batched peer
-//! dispatch instead of sequential per-tick awaits, or profiling the
-//! actual hot path) is a substantial task on its own.
+//! THROUGHPUT AND `--promote-all` (measured; supersedes an earlier,
+//! wrong "KNOWN LIMITATION" note here).
+//!
+//! With the default bond-only promotion, #4 under-delivers badly at
+//! bench.sh's 8Mbps/conn -- at N=25 the listener took only 49.4% of what
+//! the caller sent. That was blamed here on per-datagram io_uring submissions
+//! being intrinsically too costly per packet. That explanation was wrong.
+//! Raising K changes nothing (measured identical for K=2..25), and this
+//! runtime's own `PerPort` path is clean at the same load.
+//!
+//! The real cause is this file's shared-listener design: every live peer
+//! is serviced from one worker's sequential per-tick maintenance loop, so
+//! the runtime's scheduler never gets to interleave them. Giving each
+//! connection its own connected socket and its own task
+//! (`--promote-all=on`) removes the bottleneck:
+//!
+//!   N=25, K=4, 8Mbps/conn:  49.4% -> 95.6% delivered, RTT 13.0ms -> 17.9ms
+//!
+//! Promotion is therefore not a uniform cost to be avoided: on a runtime
+//! with a real task scheduler it is the point. (On mio -- a flat epoll
+//! loop with no task model -- the same change measures
+//! neutral-to-negative, which is why this is a flag and not a default.)
+//!
+//! Residual cost with promotion on: sec_a=103 retransmits, from
+//! SO_REUSEPORT group churn rerouting flows mid-handshake. See
+//! crates/srt-transport/tests/reuseport_rehash.rs and mio.rs's
+//! ORPHAN_CONCLUSION_COUNT; cookie-keyed handshake routing is the
+//! outstanding fix for that.
 
 use crate::{Aggregate, BondMode, ConnStats, LossConfig};
 use shiguredo_srt::{
@@ -71,6 +86,22 @@ const TIMER_TICK: Duration = Duration::from_millis(10);
 /// Diagnostic counter: bond legs actually shipped cross-thread via the
 /// handoff channel. See `run_reuseport_multi`'s shutdown log.
 static HANDOFF_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Diagnostic counter: connections promoted to their own socket + task on
+/// this same acceptor thread (`--promote-all`). Distinct from
+/// `HANDOFF_COUNT`, which counts only cross-thread bond relocations.
+static PROMOTION_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Give one established connection its own connected socket, so the kernel
+/// matches its packets by exact 4-tuple and an independent task can drive
+/// it instead of the shared per-peer maintenance loop. `None` if the
+/// socket could not be created.
+fn promote_locally(port: u16, peer: SocketAddr, conn: SrtConnection) -> Option<Conn> {
+    let std_socket = srt_transport::bind_reuseport(port).ok()?;
+    std_socket.connect(peer).ok()?;
+    let sock = srt_transport::glommio_transport::from_std(std_socket).ok()?;
+    Some(Conn::new(conn, sock))
+}
 
 pub fn run(cfg: LossConfig) {
     if cfg.mode == crate::Mode::Receiver
@@ -411,9 +442,10 @@ fn run_reuseport_multi(cfg: LossConfig, k: usize) {
         }
     }
     let handoffs = HANDOFF_COUNT.load(Ordering::Relaxed);
-    if handoffs > 0 {
-        eprintln!("[bench-glommio] pool receiver: {handoffs} bond handoffs");
-    }
+    let promotions = PROMOTION_COUNT.load(Ordering::Relaxed);
+    eprintln!(
+        "[bench-glommio] pool receiver: {promotions} local promotions, {handoffs} bond handoffs"
+    );
     agg.print(start);
     if !agg.any_connected {
         eprintln!("[bench-glommio] pool receiver admitted no connections");
@@ -479,6 +511,7 @@ async fn run_acceptor(
         }
     });
 
+    let promote_everyone = cfg.promote_all;
     let mut peers: HashMap<SocketAddr, PeerEntry> = HashMap::new();
     let mut tasks: Vec<glommio::Task<ConnStats>> = Vec::new();
     let connect_deadline = Instant::now() + crate::INTEROP_CONNECT_TIMEOUT;
@@ -518,7 +551,7 @@ async fn run_acceptor(
         // peer's *first* Connected, decide once whether it needs to
         // relocate.
         let t = crate::now_ts(start);
-        let mut relocate: Vec<(SocketAddr, GroupExtensionData)> = Vec::new();
+        let mut relocate: Vec<(SocketAddr, Option<GroupExtensionData>)> = Vec::new();
         for (peer, p) in peers.iter_mut() {
             p.timers.fire_expired(t, &mut p.conn);
             let _ = drain_pending_outputs(&mut p.conn, &mut p.timers, &listener, *peer).await;
@@ -543,29 +576,54 @@ async fn run_acceptor(
             }
             if newly_connected {
                 p.stream_deadline = Some(Instant::now() + stream_len);
-                if let Some(extension) = p.conn.peer_group_extension() {
-                    relocate.push((*peer, extension));
-                }
+                relocate.push((*peer, p.conn.peer_group_extension()));
             }
         }
         for (peer, extension) in relocate {
-            let group = srt_lifecycle::GroupAffinity {
-                group_id: extension.group_id,
-                stream_id: None,
-                extension,
+            // An unbonded connection has no group affinity to honor, so it
+            // stays on whichever acceptor the kernel gave it; a bonded leg
+            // asks the router where its group already lives.
+            let owner = match extension {
+                Some(extension) => {
+                    let group = srt_lifecycle::GroupAffinity {
+                        group_id: extension.group_id,
+                        stream_id: None,
+                        extension,
+                    };
+                    match router.lock() {
+                        Ok(mut router) => router.assign(
+                            peer,
+                            Some(group),
+                            srt_lifecycle::RoutingMode::LeastTuples,
+                        ),
+                        Err(_) => worker_index, // poisoned: leave it here
+                    }
+                }
+                None => worker_index,
             };
-            let owner = {
-                let mut router = match router.lock() {
-                    Ok(r) => r,
-                    Err(_) => continue, // poisoned: leave the leg where it landed
-                };
-                router.assign(peer, Some(group), srt_lifecycle::RoutingMode::LeastTuples)
-            };
+
             if owner != worker_index {
                 let Some(p) = peers.remove(&peer) else {
                     continue;
                 };
                 relocate_to_owner(cfg.port, peer, p.conn, owner, &senders);
+            } else if promote_everyone {
+                // See `LossConfig::promote_all`: give this connection its
+                // own socket and task so the runtime's scheduler drives it
+                // independently of the shared per-peer loop.
+                let Some(p) = peers.remove(&peer) else {
+                    continue;
+                };
+                match promote_locally(cfg.port, peer, p.conn) {
+                    Some(driver) => {
+                        let cfg2 = cfg.clone();
+                        tasks.push(glommio::spawn_local(async move {
+                            established_conn_task(driver, cfg2, start).await
+                        }));
+                        PROMOTION_COUNT.fetch_add(1, Ordering::Relaxed);
+                    }
+                    None => eprintln!("[bench-glommio] promote {peer}: failed"),
+                }
             }
         }
 

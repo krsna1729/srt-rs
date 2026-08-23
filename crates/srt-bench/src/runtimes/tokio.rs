@@ -49,6 +49,22 @@ const TIMER_TICK: Duration = Duration::from_millis(10);
 /// handoff channel. See `run_reuseport_multi`'s shutdown log.
 static HANDOFF_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// Diagnostic counter: connections promoted to their own socket + task on
+/// this same acceptor thread (`--promote-all`). Distinct from
+/// `HANDOFF_COUNT`, which counts only cross-thread bond relocations.
+static PROMOTION_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Give one established connection its own connected socket, so the kernel
+/// matches its packets by exact 4-tuple and an independent task can drive
+/// it instead of the shared per-peer maintenance loop. `None` if the
+/// socket could not be created.
+fn promote_locally(port: u16, peer: SocketAddr, conn: SrtConnection) -> Option<Conn> {
+    let std_socket = srt_transport::bind_reuseport(port).ok()?;
+    std_socket.connect(peer).ok()?;
+    let sock = tokio::net::UdpSocket::from_std(std_socket).ok()?;
+    Some(Conn::new(conn, sock))
+}
+
 pub fn run(cfg: LossConfig) {
     if cfg.mode == crate::Mode::Receiver
         && cfg.connections > 1
@@ -419,9 +435,10 @@ fn run_reuseport_multi(cfg: LossConfig, k: usize) {
         }
     }
     let handoffs = HANDOFF_COUNT.load(Ordering::Relaxed);
-    if handoffs > 0 {
-        eprintln!("[bench-tokio] pool receiver: {handoffs} bond handoffs");
-    }
+    let promotions = PROMOTION_COUNT.load(Ordering::Relaxed);
+    eprintln!(
+        "[bench-tokio] pool receiver: {promotions} local promotions, {handoffs} bond handoffs"
+    );
     agg.print(start);
     if !agg.any_connected {
         eprintln!("[bench-tokio] pool receiver admitted no connections");
@@ -463,6 +480,7 @@ async fn run_acceptor(
     };
     let listener = tokio::net::UdpSocket::from_std(std_listener).expect("register listener");
 
+    let promote_everyone = cfg.promote_all;
     let mut peers: HashMap<SocketAddr, PeerEntry> = HashMap::new();
     let mut tasks: Vec<tokio::task::JoinHandle<ConnStats>> = Vec::new();
     let connect_deadline = Instant::now() + crate::INTEROP_CONNECT_TIMEOUT;
@@ -514,7 +532,7 @@ async fn run_acceptor(
         // peer's *first* Connected, decide once whether it needs to
         // relocate.
         let t = crate::now_ts(start);
-        let mut relocate: Vec<(SocketAddr, GroupExtensionData)> = Vec::new();
+        let mut relocate: Vec<(SocketAddr, Option<GroupExtensionData>)> = Vec::new();
         for (peer, p) in peers.iter_mut() {
             p.timers.fire_expired(t, &mut p.conn);
             let _ = drain_pending_outputs(&mut p.conn, &mut p.timers, &listener, *peer, t).await;
@@ -539,29 +557,54 @@ async fn run_acceptor(
             }
             if newly_connected {
                 p.stream_deadline = Some(Instant::now() + stream_len);
-                if let Some(extension) = p.conn.peer_group_extension() {
-                    relocate.push((*peer, extension));
-                }
+                relocate.push((*peer, p.conn.peer_group_extension()));
             }
         }
         for (peer, extension) in relocate {
-            let group = srt_lifecycle::GroupAffinity {
-                group_id: extension.group_id,
-                stream_id: None,
-                extension,
+            // An unbonded connection has no group affinity to honor, so it
+            // stays on whichever acceptor the kernel gave it; a bonded leg
+            // asks the router where its group already lives.
+            let owner = match extension {
+                Some(extension) => {
+                    let group = srt_lifecycle::GroupAffinity {
+                        group_id: extension.group_id,
+                        stream_id: None,
+                        extension,
+                    };
+                    match router.lock() {
+                        Ok(mut router) => router.assign(
+                            peer,
+                            Some(group),
+                            srt_lifecycle::RoutingMode::LeastTuples,
+                        ),
+                        Err(_) => worker_index, // poisoned: leave it here
+                    }
+                }
+                None => worker_index,
             };
-            let owner = {
-                let mut router = match router.lock() {
-                    Ok(r) => r,
-                    Err(_) => continue, // poisoned: leave the leg where it landed
-                };
-                router.assign(peer, Some(group), srt_lifecycle::RoutingMode::LeastTuples)
-            };
+
             if owner != worker_index {
                 let Some(p) = peers.remove(&peer) else {
                     continue;
                 };
                 relocate_to_owner(cfg.port, peer, p.conn, owner, &senders);
+            } else if promote_everyone {
+                // See `LossConfig::promote_all`: give this connection its
+                // own socket and task so the runtime's scheduler drives it
+                // independently of the shared per-peer loop.
+                let Some(p) = peers.remove(&peer) else {
+                    continue;
+                };
+                match promote_locally(cfg.port, peer, p.conn) {
+                    Some(driver) => {
+                        let cfg2 = cfg.clone();
+                        tasks.push(tokio::task::spawn_local(async move {
+                            established_conn_task(driver, cfg2, start).await
+                        }));
+                        PROMOTION_COUNT.fetch_add(1, Ordering::Relaxed);
+                    }
+                    None => eprintln!("[bench-tokio] promote {peer}: failed"),
+                }
             }
         }
 
