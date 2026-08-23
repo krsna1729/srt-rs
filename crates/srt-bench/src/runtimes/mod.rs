@@ -83,19 +83,18 @@ pub const EXIT_UNSUPPORTED: i32 = 3;
 
 /// Does `runtime` actually implement `ingress` on the receiving side?
 ///
-/// Only mio has all four. Asking a runtime for one it lacks used to fall
-/// through to the per-port path, where every connection computes the same
-/// handful of ports and they collide on bind -- surfacing as a pile of
-/// EADDRINUSE panics rather than "not implemented", which is alarming and
-/// hard to tell from a real port-allocation bug. Checked up front instead.
+/// Asking a runtime for a strategy it lacks used to fall through to the
+/// per-port path, where every connection computes the same handful of
+/// ports and they collide on bind -- surfacing as a pile of EADDRINUSE
+/// panics rather than "not implemented", which is alarming and hard to
+/// tell from a real port-allocation bug. Checked up front instead.
 #[must_use]
 pub fn ingress_supported(runtime: Runtime, ingress: crate::Ingress) -> bool {
-    match ingress {
-        crate::Ingress::PerPort
-        | crate::Ingress::ReuseportMulti(_)
-        | crate::Ingress::SharedPool(_) => true,
-        crate::Ingress::ReuseportSingle { .. } => matches!(runtime, Runtime::Mio),
-    }
+    // All four strategies now exist on every backend. Kept as a function
+    // rather than deleted: it is the one place a future strategy declares
+    // where it is implemented, and the matrix already consults it.
+    let _ = (runtime, ingress);
+    true
 }
 
 pub fn run(cfg: LossConfig) {

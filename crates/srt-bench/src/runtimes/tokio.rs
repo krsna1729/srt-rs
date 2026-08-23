@@ -75,6 +75,13 @@ pub fn run(cfg: LossConfig) {
     {
         return run_shared_pool(cfg, k);
     }
+    if cfg.mode == crate::Mode::Receiver
+        && cfg.connections > 1
+        && let crate::Ingress::ReuseportSingle { workers } = cfg.ingress
+        && workers >= 1
+    {
+        return run_reuseport_single(cfg, workers);
+    }
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -969,4 +976,240 @@ fn admit_one(
         1,
         &telemetry,
     );
+}
+
+// ---------------------------------------------------------------------------
+// #3: ReuseportSingle -- one acceptor, W dedicated worker threads
+// ---------------------------------------------------------------------------
+
+/// One acceptor owns the listening socket and every half-open handshake;
+/// workers only ever receive connections that are already established.
+///
+/// Because a single thread holds all handshake state, no reuseport rehash
+/// can separate a datagram from the state it belongs to -- the
+/// mid-handshake stranding that `ReuseportMulti` needs cookie routing to
+/// survive cannot arise here. The cost is that every connection has to
+/// move, so every one is promoted, which is the tradeoff being measured.
+fn run_reuseport_single(cfg: LossConfig, workers: usize) {
+    let worker_count = workers.min(cfg.connections).max(1);
+    let start = Instant::now();
+    println!("LISTENING");
+    let router: crate::SharedWorkerRouter =
+        Arc::new(Mutex::new(srt_lifecycle::WorkerRouter::new(worker_count)));
+
+    let (senders, receivers): (Vec<_>, Vec<_>) = (0..worker_count)
+        .map(|_| mpsc::channel::<WorkerMessage>())
+        .unzip();
+
+    let mut handles = Vec::with_capacity(worker_count);
+    for (worker_index, rx) in receivers.into_iter().enumerate() {
+        let cfg = cfg.clone();
+        handles.push(
+            std::thread::Builder::new()
+                .name(format!("srt-worker-{worker_index}"))
+                .spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("tokio current_thread runtime");
+                    rt.block_on(
+                        tokio::task::LocalSet::new().run_until(run_pool_worker(cfg, start, rx)),
+                    )
+                })
+                .expect("spawn worker"),
+        );
+    }
+
+    let agg_cfg = cfg.clone();
+    {
+        let router = router.clone();
+        let senders = senders.clone();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio current_thread runtime");
+        rt.block_on(
+            tokio::task::LocalSet::new()
+                .run_until(run_single_acceptor(&cfg, start, &router, &senders)),
+        );
+    }
+    // Workers stop when their tally is met; dropping the last senders
+    // also unblocks any that never received one.
+    drop(senders);
+
+    let mut agg = Aggregate::new(agg_cfg);
+    for handle in handles {
+        for s in handle.join().expect("worker panicked") {
+            agg.add(s);
+        }
+    }
+    agg.print(start);
+    if !agg.any_connected {
+        eprintln!("[bench-tokio] reuseport-single admitted no connections");
+        std::process::exit(1);
+    }
+}
+
+/// The single acceptor: admit every flow, route each to a worker as soon
+/// as it is established.
+async fn run_single_acceptor(
+    cfg: &LossConfig,
+    start: Instant,
+    router: &crate::SharedWorkerRouter,
+    senders: &[mpsc::Sender<WorkerMessage>],
+) {
+    let Ok(std_socket) = srt_transport::bind_reuseport(cfg.port, cfg.sock_buf_bytes) else {
+        eprintln!("[bench-tokio] reuseport-single: bind failed");
+        return;
+    };
+    let Some(listener) = tokio::net::UdpSocket::from_std(std_socket).ok() else {
+        eprintln!("[bench-tokio] reuseport-single: register failed");
+        return;
+    };
+
+    let mut peers = srt_transport::PeerTable::new();
+    // One acceptor means one owner for every handshake, so there is
+    // nobody a stray CONCLUSION could need forwarding to.
+    let admission = srt_transport::AdmissionOptions {
+        socket_id: std::process::id(),
+        tsbpd_delay: cfg.latency_ms,
+        cookie_routing: false,
+    };
+    let telemetry = srt_transport::IngressTelemetry::new();
+    let connect_deadline = Instant::now() + crate::INTEROP_CONNECT_TIMEOUT;
+    let stream_len = Duration::from_secs_f64(cfg.duration_secs);
+    let mut routed = 0usize;
+    let mut buf = [0u8; 2048];
+    let mut outbound: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
+    let mut connected: Vec<SocketAddr> = Vec::new();
+    let _ = &mut buf;
+
+    // Admission ends with the connect window: anything not established by
+    // then never will be.
+    while Instant::now() < connect_deadline && routed < cfg.connections {
+        tokio::select! {
+            res = listener.recv_from(&mut buf) => {
+                if let Ok((n, peer)) = res {
+                    admit_one(&mut peers, &admission, peer, &buf[..n], start);
+                    while let Ok((n, peer)) = listener.try_recv_from(&mut buf) {
+                        admit_one(&mut peers, &admission, peer, &buf[..n], start);
+                    }
+                }
+            }
+            _ = tokio::time::sleep(TIMER_TICK) => {}
+        }
+
+        let t = crate::now_ts(start);
+        peers.poll_outbound(t, &mut outbound);
+        for (peer, bytes) in outbound.drain(..) {
+            let _ = listener.send_to(&bytes, peer).await;
+        }
+        peers.drain_events(stream_len, &mut connected);
+
+        let newly: Vec<SocketAddr> = connected.drain(..).collect();
+        for peer in newly {
+            let Some(entry) = peers.remove(&peer) else {
+                continue;
+            };
+            let group =
+                entry
+                    .conn
+                    .peer_group_extension()
+                    .map(|extension| srt_lifecycle::GroupAffinity {
+                        group_id: extension.group_id,
+                        stream_id: None,
+                        extension,
+                    });
+            // Unlike #4, the router is consulted for *every* connection:
+            // routing each one to a worker is the whole strategy, not a
+            // bond-affinity special case.
+            let owner = match router.lock() {
+                Ok(mut router) => {
+                    router.assign(peer, group, srt_lifecycle::RoutingMode::LeastTuples)
+                }
+                Err(_) => 0,
+            };
+            let Ok(socket) = srt_transport::bind_reuseport(cfg.port, cfg.sock_buf_bytes) else {
+                continue;
+            };
+            if socket.connect(peer).is_err() {
+                continue;
+            }
+            let message = WorkerMessage::Handoff(Box::new(srt_transport::Handoff {
+                socket,
+                conn: entry.conn,
+            }));
+            if senders[owner].send(message).is_ok() {
+                telemetry.record_handoff();
+                routed += 1;
+            }
+        }
+    }
+
+    // Tell each worker its final tally so it can stop waiting rather than
+    // guess from a clock.
+    for sender in senders {
+        let _ = sender.send(WorkerMessage::Finished { total: routed });
+    }
+    if cfg.bond_mode != BondMode::None
+        && let Ok(router) = router.lock()
+    {
+        eprintln!(
+            "[bench-tokio] reuseport-single: routed {} tuples into {} bond groups",
+            router.active_tuple_count(),
+            router.active_group_count()
+        );
+    }
+}
+
+/// One worker: drive whatever the acceptor hands it, to completion.
+async fn run_pool_worker(
+    cfg: LossConfig,
+    start: Instant,
+    handoffs: mpsc::Receiver<WorkerMessage>,
+) -> Vec<ConnStats> {
+    let mut tasks = Vec::new();
+    let mut stats: Vec<ConnStats> = Vec::new();
+    let mut expected: Option<usize> = None;
+    let mut received = 0usize;
+    let deadline = Instant::now()
+        + crate::INTEROP_CONNECT_TIMEOUT
+        + Duration::from_secs_f64(cfg.duration_secs)
+        + IDLE_GRACE
+        + Duration::from_secs(30);
+
+    // Stop once the acceptor's tally is in and all of them have arrived;
+    // the deadline is only a backstop against a wedged acceptor.
+    while Instant::now() < deadline {
+        while let Ok(message) = handoffs.try_recv() {
+            match message {
+                WorkerMessage::Finished { total } => expected = Some(total),
+                // Only ReuseportMulti forwards handshakes, and never here.
+                WorkerMessage::Handshake { .. } => {}
+                WorkerMessage::Handoff(handoff) => {
+                    let std_socket = handoff.socket;
+                    let Some(sock) = tokio::net::UdpSocket::from_std(std_socket).ok() else {
+                        continue;
+                    };
+                    let driver = Conn::new(handoff.conn, sock);
+                    let cfg2 = cfg.clone();
+                    tasks.push(tokio::task::spawn_local(async move {
+                        established_conn_task(driver, cfg2, start).await
+                    }));
+                    received += 1;
+                }
+            }
+        }
+        if expected.is_some_and(|total| received >= total) {
+            break;
+        }
+        tokio::time::sleep(TIMER_TICK).await;
+    }
+
+    for task in tasks {
+        if let Ok(s) = task.await {
+            stats.push(s);
+        }
+    }
+    stats
 }
