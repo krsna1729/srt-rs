@@ -232,9 +232,7 @@ async fn sender_task(
             );
             break;
         }
-        if let Some(d) = stream_deadline
-            && Instant::now() >= d
-        {
+        if crate::shutdown::past(stream_deadline) {
             break;
         }
 
@@ -334,9 +332,7 @@ async fn receiver_task(cfg: LossConfig, listen_port: u16, start: Instant) -> Con
             );
             break;
         }
-        if let Some(d) = stream_deadline
-            && Instant::now() >= d
-        {
+        if crate::shutdown::past(stream_deadline) {
             break;
         }
 
@@ -566,7 +562,7 @@ async fn run_acceptor(
         // never admits anything still exits once the connect window
         // closes instead of hanging on an empty guard.
         let all_terminal = peers.all_terminal(now, connect_deadline, IDLE_GRACE);
-        if now >= connect_deadline && all_terminal {
+        if crate::shutdown::requested() || (now >= connect_deadline && all_terminal) {
             break;
         }
 
@@ -956,7 +952,10 @@ async fn serve_pool_socket(cfg: LossConfig, index: usize, start: Instant) -> Vec
         if now >= run_deadline {
             break;
         }
-        if now >= connect_deadline && peers.all_terminal(now, connect_deadline, IDLE_GRACE) {
+        if crate::shutdown::requested()
+            || (now >= connect_deadline
+                && peers.all_terminal(now, connect_deadline, IDLE_GRACE))
+        {
             break;
         }
 

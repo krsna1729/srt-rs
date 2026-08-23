@@ -3,6 +3,7 @@
 pub mod cpu_stats;
 pub mod driver;
 pub mod harness;
+pub mod shutdown;
 pub mod runtimes;
 
 pub const INTEROP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -565,6 +566,10 @@ pub fn bench_config_from_args() -> LossConfig {
         );
         std::process::exit(2)
     }
+
+    // The harness signals a clean stop once the sender is done; without
+    // this the listener would still be stopping on its own timer.
+    crate::shutdown::install();
 
     // Capture kernel UDP counters before any socket exists, so every
     // later read is a delta for this run alone.

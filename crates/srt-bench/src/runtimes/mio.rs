@@ -279,7 +279,8 @@ fn drive(cfg: LossConfig, mine: Vec<usize>, start: Instant) -> Vec<ConnStats> {
         // `connected`) is what keeps one dead peer from hanging the whole
         // run -- the loop used to wait on it forever, since its
         // `stream_deadline` stays `None`.
-        let all_done = next_to_start >= mine.len()
+        let all_done = crate::shutdown::requested()
+            || next_to_start >= mine.len()
             && drivers.iter().all(|d| {
                 if d.connected {
                     d.stream_deadline
@@ -925,7 +926,7 @@ fn run_pool_acceptor(
         // closes instead of hanging on an empty guard.
         let all_terminal = peers.all_terminal(now, connect_deadline, IDLE_GRACE)
             && slots.iter().all(|s| slot_is_terminal(s, now));
-        if now >= connect_deadline && all_terminal {
+        if crate::shutdown::requested() || (now >= connect_deadline && all_terminal) {
             break;
         }
         poll.poll(&mut events, Some(TIMER_TICK)).ok();

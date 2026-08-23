@@ -329,7 +329,8 @@ pub fn report(results: &[Record], group_by: &[String]) -> String {
         .cloned()
         .chain(
             [
-                "estab", "sent", "recv", "deliv%", "lost", "rtt_ms", "cpu_s", "rss_kb",
+                "estab", "sent", "recv", "offer%", "good%", "deliv%", "lost", "rcvbuf_drop",
+                "rtt_ms", "cpu_s", "rss_kb",
             ]
             .iter()
             .map(|s| (*s).to_string()),
@@ -356,6 +357,28 @@ pub fn report(results: &[Record], group_by: &[String]) -> String {
         let recv = med(&listeners, "core_total");
         let sent = med(&callers, "core_total");
         let deliv = if sent > 0.0 { 100.0 * recv / sent } else { 0.0 };
+
+        // `deliv%` is recv/sent -- a ratio against whatever the sender
+        // happened to emit, which says nothing when the sender itself was
+        // the constraint. These two are measured against the load that was
+        // *asked for*, so a load generator that could not keep up shows up
+        // as a low `offer%` instead of silently deflating the listener's
+        // score. `--` on results recorded before `secs` was a column.
+        let target = |r: &&Record| -> Option<f64> {
+            let (conns, bitrate, secs) = (r.number("conns")?, r.number("bitrate")?, r.number("secs")?);
+            let pkts = conns * bitrate * secs / (8.0 * crate::PAYLOAD_SIZE as f64);
+            (pkts > 0.0).then_some(pkts)
+        };
+        let target_pkts = median(callers.iter().filter_map(|r| target(r)).collect());
+        let pct = |n: f64| -> String {
+            if target_pkts > 0.0 {
+                format!("{:.1}", 100.0 * n / target_pkts)
+            } else {
+                "--".to_string()
+            }
+        };
+        // Retransmits are not offered load; they are the same bytes again.
+        let offered = (sent - med(&callers, "sec_a")).max(0.0);
         // CPU is the whole pipeline's cost, so both sides count.
         let cpu = (med(&listeners, "cpu_user_ms")
             + med(&listeners, "cpu_sys_ms")
@@ -366,8 +389,11 @@ pub fn report(results: &[Record], group_by: &[String]) -> String {
         row.push(format!("{:.0}", med(&listeners, "established")));
         row.push(format!("{sent:.0}"));
         row.push(format!("{recv:.0}"));
+        row.push(pct(offered));
+        row.push(pct(recv));
         row.push(format!("{deliv:.1}"));
         row.push(format!("{:.0}", med(&listeners, "sec_a")));
+        row.push(format!("{:.0}", med(&listeners, "udp_rcvbuf_err")));
         row.push(format!("{:.2}", med(&listeners, "rtt_ms")));
         row.push(format!("{cpu:.1}"));
         row.push(format!(
@@ -768,7 +794,11 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
                 .arg(format!("runtime={runtime}"))
                 .arg("mode=receiver")
                 .arg(port.to_string())
-                .arg((secs + 5).to_string())
+                // Backstop only: the harness signals the real stop once
+                // the sender finishes. Generous, because a sender under
+                // overload can run well past its nominal duration and the
+                // listener must still be there when it does.
+                .arg((secs + 60).to_string())
                 .arg(latency.to_string())
                 // The receiver ignores this functionally, but both rows
                 // must record the same configured bitrate or a report
@@ -778,10 +808,12 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
                 .arg(format!("--rep={rep}"))
                 .arg(format!("--cpus={recv_cpus}"))
                 .arg(format!("--out={}", out.display()))
-                .stdout(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
                 .spawn()?;
 
-            std::thread::sleep(std::time::Duration::from_millis(700));
+            if !wait_for_listening(&mut recv, std::time::Duration::from_secs(60)) {
+                eprintln!("[warn] listener never reported LISTENING: {}", label.join(" "));
+            }
 
             let send = if let Some(p) = netns {
                 in_netns(p, &exe)
@@ -802,6 +834,11 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
                 .stdout(std::process::Stdio::null())
                 .status()?;
 
+            // Ordered teardown: the sender is done, so the listener has
+            // nothing left to receive. Signalling now (rather than letting
+            // it time out) is what keeps the sender from spending its last
+            // seconds transmitting into a closed port.
+            request_stop(&recv);
             let recv_status = recv.wait()?;
             eprintln!(
                 "[{:>4}/{total}] rep {rep} {}{}",
@@ -1058,6 +1095,41 @@ fn in_netns(p: Priv, exe: &std::path::Path) -> std::process::Command {
     }
     cmd.arg(exe);
     cmd
+}
+
+/// Block until the listener says it is bound, or give up.
+///
+/// It prints `LISTENING` before binding anything the sender will target.
+/// The old code slept 700 ms instead, which is a race in both directions:
+/// too short under load (the sender's first INDUCTION packets hit a closed
+/// port), and pure waste when the listener was ready immediately.
+fn wait_for_listening(child: &mut std::process::Child, timeout: std::time::Duration) -> bool {
+    use std::io::{BufRead, BufReader};
+    let Some(stdout) = child.stdout.take() else {
+        return false;
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut announced = false;
+        // Drain to EOF rather than stopping at the marker. Dropping the
+        // read end early closes the pipe, and the listener then dies with
+        // EPIPE on its next print -- which is its STATS line, so the run
+        // would produce no result row at all.
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if !announced && line.contains("LISTENING") {
+                announced = true;
+                let _ = tx.send(());
+            }
+        }
+    });
+    rx.recv_timeout(timeout).is_ok()
+}
+
+/// Ask a child to stop cleanly. It finishes draining, writes its result
+/// row, and exits; see `crate::shutdown` for why this replaced a timer.
+fn request_stop(child: &std::process::Child) {
+    // Safe: the child is still owned here, so its pid has not been reaped.
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
 }
 
 /// Re-parse an ingress spec as recorded in a result file (`:` separated).
