@@ -190,7 +190,7 @@ pub fn append_result(
         format!("{:.1}", p.cpu_user_ms),
         format!("{:.1}", p.cpu_sys_ms),
         p.peak_rss_kb.to_string(),
-        format!("{:.0}", cfg.duration_secs),
+        format!("{:.0}", cfg.stream_secs),
         udp.rcvbuf_errors.to_string(),
         udp.in_errors.to_string(),
         udp.no_ports.to_string(),
@@ -911,8 +911,11 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
                 }
                 out
             };
-            let recv_argv = argv_for(Scope::Recv);
+            let mut recv_argv = argv_for(Scope::Recv);
             let send_argv = argv_for(Scope::Send);
+            // The listener runs to a long backstop, but the cell's stream
+            // length is what any rate is computed against.
+            recv_argv.push(format!("--stream-secs={secs}"));
 
             // Receiver outlives the sender so it is still listening when
             // the last packets arrive; +5s mirrors the old harness.

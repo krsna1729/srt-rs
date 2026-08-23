@@ -262,6 +262,13 @@ pub struct LossConfig {
     /// sender always, and to a `PerPort` receiver -- the shared-socket
     /// ingress strategies get their parallelism from their own K instead.
     pub workers: usize,
+    /// The stream length the cell asked for, in seconds, as opposed to
+    /// `duration_secs`, which for a listener is the generous backstop it
+    /// runs to if the harness's stop signal never arrives. Recording the
+    /// backstop made a listener row say `secs=70` against the caller's
+    /// `secs=10`, so anything computing a rate from a listener row got an
+    /// answer 7x too small.
+    pub stream_secs: f64,
     /// The role-scoped topology of the cell this process is part of,
     /// recorded (not acted on) so that one result row states the whole
     /// experiment. Empty unless the harness split that axis by role.
@@ -796,6 +803,11 @@ pub fn bench_config_from_args() -> LossConfig {
     );
 
     let workers = cli.flag_or("workers", 1usize).max(1);
+    let stream_secs = cli
+        .flags
+        .get("stream-secs")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(duration_secs);
 
     let scoped = |name: &str| -> String {
         cli.flags.get(name).cloned().unwrap_or_default()
@@ -862,6 +874,7 @@ pub fn bench_config_from_args() -> LossConfig {
         cpus,
         pin,
         workers,
+        stream_secs,
         peer_topology,
         link,
     }
