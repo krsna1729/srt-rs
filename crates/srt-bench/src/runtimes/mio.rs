@@ -692,6 +692,15 @@ static HANDOFF_COUNT: AtomicU64 = AtomicU64::new(0);
 /// `run_pool_receiver`'s shutdown log.
 static PROMOTION_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// Diagnostic counter: CONCLUSION handshake packets that arrived at an
+/// acceptor holding no state for that peer -- i.e. flows the kernel
+/// rehashed *between* the two caller->listener handshake packets. This is
+/// the direct measure of whether #4's N-acceptor topology needs a
+/// cookie-keyed mpsc handoff to survive mid-handshake reroutes, or
+/// whether the case is rare enough not to matter. See the admission
+/// closure in `run_pool_acceptor`.
+static ORPHAN_CONCLUSION_COUNT: AtomicU64 = AtomicU64::new(0);
+
 /// Where a connection's promotion (see `run_pool_acceptor`'s module doc)
 /// lands: on this same thread, or shipped to a specific remote owner.
 enum PromotionTarget {
@@ -848,8 +857,10 @@ fn run_pool_receiver(cfg: LossConfig, k: usize) {
     // nonzero handoff count is the proof the bond-affinity path fired.
     let promotions = PROMOTION_COUNT.load(Ordering::Relaxed);
     let handoffs = HANDOFF_COUNT.load(Ordering::Relaxed);
+    let orphans = ORPHAN_CONCLUSION_COUNT.load(Ordering::Relaxed);
     eprintln!(
-        "[bench-mio] pool receiver: {promotions} promotions ({handoffs} cross-thread handoffs)"
+        "[bench-mio] pool receiver: {promotions} promotions ({handoffs} cross-thread handoffs), \
+         {orphans} orphaned CONCLUSIONs (mid-handshake rehash)"
     );
     agg.print(start);
     if !agg.any_connected {
@@ -1007,18 +1018,42 @@ fn run_pool_acceptor(
                         &mut admit_addrs,
                         &mut buf,
                         |peer, data| {
-                            let entry = peers.entry(peer).or_insert_with(|| Peer {
-                                conn: SrtConnection::new_listener(ConnectionOptions {
-                                    socket_id: std::process::id(),
-                                    tsbpd_delay: cfg.latency_ms,
-                                    ..Default::default()
-                                }),
-                                timers: srt_transport::ManualTimerStore::new(),
-                                connected: false,
-                                stream_deadline: None,
-                                data_events: 0,
-                                last_data_at: Instant::now(),
-                            });
+                            use std::collections::hash_map::Entry;
+                            let entry = match peers.entry(peer) {
+                                Entry::Occupied(occupied) => occupied.into_mut(),
+                                Entry::Vacant(vacant) => {
+                                    // Diagnostic for the mid-handshake rehash
+                                    // question. SRT's handshake is INDUCTION ->
+                                    // response -> CONCLUSION -> response, so a
+                                    // CONCLUSION is never the first packet of a
+                                    // flow. Seeing one for a peer this acceptor
+                                    // has no state for means the kernel moved the
+                                    // flow *between* its two caller->listener
+                                    // packets: its INDUCTION went to a different
+                                    // acceptor. That connection cannot complete
+                                    // here (no cookie state), and is exactly the
+                                    // case an mpsc handoff keyed on the cookie
+                                    // would have to rescue.
+                                    if let Some((is_conclusion, _)) =
+                                        srt_lifecycle::handshake_route(data)
+                                        && is_conclusion
+                                    {
+                                        ORPHAN_CONCLUSION_COUNT.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    vacant.insert(Peer {
+                                        conn: SrtConnection::new_listener(ConnectionOptions {
+                                            socket_id: std::process::id(),
+                                            tsbpd_delay: cfg.latency_ms,
+                                            ..Default::default()
+                                        }),
+                                        timers: srt_transport::ManualTimerStore::new(),
+                                        connected: false,
+                                        stream_deadline: None,
+                                        data_events: 0,
+                                        last_data_at: Instant::now(),
+                                    })
+                                }
+                            };
                             let _ = entry.conn.feed_recv_buf(data, t);
                         },
                     );
