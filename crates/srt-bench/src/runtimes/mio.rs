@@ -701,6 +701,12 @@ static PROMOTION_COUNT: AtomicU64 = AtomicU64::new(0);
 /// closure in `run_pool_acceptor`.
 static ORPHAN_CONCLUSION_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// Diagnostic counter: handshake datagrams rescued by cookie routing --
+/// received by an acceptor that did not own them and forwarded to the one
+/// that did. Every one of these would otherwise have been an orphaned
+/// CONCLUSION.
+static COOKIE_FORWARD_COUNT: AtomicU64 = AtomicU64::new(0);
+
 /// Where a connection's promotion (see `run_pool_acceptor`'s module doc)
 /// lands: on this same thread, or shipped to a specific remote owner.
 enum PromotionTarget {
@@ -724,6 +730,16 @@ struct Handoff {
 
 enum WorkerMessage {
     Handoff(Box<Handoff>),
+    /// A handshake datagram that the kernel delivered to the wrong
+    /// acceptor. The cookie it carries names the acceptor that owns the
+    /// half-open handshake, so the receiving acceptor forwards it there
+    /// rather than answering it (which would fail cookie validation) or
+    /// dropping it (which costs a handshake retry). See
+    /// `srt_lifecycle::cookie_for_worker`.
+    Handshake {
+        peer: SocketAddr,
+        data: Vec<u8>,
+    },
     /// #3 (`ReuseportSingle`) only: the one acceptor has stopped
     /// admitting and tells each worker exactly how many connections it
     /// will ever receive, so a worker can tell "no more are coming" apart
@@ -734,6 +750,15 @@ enum WorkerMessage {
     Finished {
         total: usize,
     },
+}
+
+/// Stable per-peer entropy for the upper bits of a SYN cookie, so cookies
+/// differ per connection instead of being one constant per worker.
+fn peer_hash(peer: SocketAddr) -> u32 {
+    use std::hash::{BuildHasher, Hash, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    peer.hash(&mut hasher);
+    hasher.finish() as u32
 }
 
 fn bind_reuseport(port: u16) -> std::io::Result<UdpSocket> {
@@ -858,9 +883,10 @@ fn run_pool_receiver(cfg: LossConfig, k: usize) {
     let promotions = PROMOTION_COUNT.load(Ordering::Relaxed);
     let handoffs = HANDOFF_COUNT.load(Ordering::Relaxed);
     let orphans = ORPHAN_CONCLUSION_COUNT.load(Ordering::Relaxed);
+    let forwarded = COOKIE_FORWARD_COUNT.load(Ordering::Relaxed);
     eprintln!(
         "[bench-mio] pool receiver: {promotions} promotions ({handoffs} cross-thread handoffs), \
-         {orphans} orphaned CONCLUSIONs (mid-handshake rehash)"
+         {orphans} orphaned CONCLUSIONs, {forwarded} cookie-routed handshakes"
     );
     agg.print(start);
     if !agg.any_connected {
@@ -975,8 +1001,33 @@ fn run_pool_acceptor(
         // pattern means one would just be skipped, not stop the drain and
         // strand whatever Handoffs are queued behind it.
         while let Ok(message) = handoffs.try_recv() {
-            let WorkerMessage::Handoff(handoff) = message else {
-                continue;
+            let handoff = match message {
+                WorkerMessage::Handoff(handoff) => handoff,
+                // A handshake datagram routed here by its cookie. Feed it
+                // to the peer state that owns it, creating that state if
+                // this is somehow the first we've seen of the flow.
+                WorkerMessage::Handshake { peer, data } => {
+                    let t = crate::now_ts(start);
+                    let entry = peers.entry(peer).or_insert_with(|| Peer {
+                        conn: SrtConnection::new_listener(ConnectionOptions {
+                            socket_id: std::process::id(),
+                            tsbpd_delay: cfg.latency_ms,
+                            syn_cookie: Some(srt_lifecycle::cookie_for_worker(
+                                worker_index,
+                                peer_hash(peer),
+                            )),
+                            ..Default::default()
+                        }),
+                        timers: srt_transport::ManualTimerStore::new(),
+                        connected: false,
+                        stream_deadline: None,
+                        data_events: 0,
+                        last_data_at: Instant::now(),
+                    });
+                    let _ = entry.conn.feed_recv_buf(&data, t);
+                    continue;
+                }
+                WorkerMessage::Finished { .. } => continue,
             };
             let mut socket = handoff.socket;
             let token = Token(next_token);
@@ -1019,6 +1070,32 @@ fn run_pool_acceptor(
                         &mut buf,
                         |peer, data| {
                             use std::collections::hash_map::Entry;
+                            // Route by cookie before touching local state: a
+                            // handshake datagram whose cookie names another
+                            // acceptor belongs to that acceptor's half-open
+                            // connection, wherever the kernel happened to
+                            // deliver it.
+                            if cfg.cookie_routing
+                                && !peers.contains_key(&peer)
+                                && let Some(identity) = srt_lifecycle::handshake_identity(data)
+                                && identity.is_conclusion
+                                && let Some(owner) = srt_lifecycle::worker_from_cookie(
+                                    identity.syn_cookie,
+                                    senders.len(),
+                                )
+                                && owner != worker_index
+                            {
+                                let message = WorkerMessage::Handshake {
+                                    peer,
+                                    data: data.to_vec(),
+                                };
+                                if senders[owner].send(message).is_ok() {
+                                    COOKIE_FORWARD_COUNT.fetch_add(1, Ordering::Relaxed);
+                                    return;
+                                }
+                                // Owner is gone; fall through and handle it
+                                // here rather than dropping the datagram.
+                            }
                             let entry = match peers.entry(peer) {
                                 Entry::Occupied(occupied) => occupied.into_mut(),
                                 Entry::Vacant(vacant) => {
@@ -1044,6 +1121,13 @@ fn run_pool_acceptor(
                                         conn: SrtConnection::new_listener(ConnectionOptions {
                                             socket_id: std::process::id(),
                                             tsbpd_delay: cfg.latency_ms,
+                                            // Encode who owns this handshake, so a
+                                            // CONCLUSION rehashed to another acceptor
+                                            // can be routed back here.
+                                            syn_cookie: Some(srt_lifecycle::cookie_for_worker(
+                                                worker_index,
+                                                peer_hash(peer),
+                                            )),
                                             ..Default::default()
                                         }),
                                         timers: srt_transport::ManualTimerStore::new(),
@@ -1673,6 +1757,8 @@ fn run_worker(
         while let Ok(message) = handoffs.try_recv() {
             match message {
                 WorkerMessage::Finished { total } => expected = Some(total),
+                // #3 has a single acceptor, so nothing is ever forwarded.
+                WorkerMessage::Handshake { .. } => continue,
                 WorkerMessage::Handoff(handoff) => {
                     let mut socket = handoff.socket;
                     let token = Token(next_token);

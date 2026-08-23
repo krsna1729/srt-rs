@@ -25,6 +25,12 @@ pub struct HandshakeIdentity {
     pub is_conclusion: bool,
     pub stream_id: Option<String>,
     pub group: Option<GroupAffinity>,
+    /// The SYN cookie carried by this datagram. On a CONCLUSION this is
+    /// the value the listener issued during INDUCTION and the caller
+    /// echoed back, which makes it the one field on the wire that can
+    /// carry listener-chosen routing information through the handshake.
+    /// See [`cookie_for_worker`].
+    pub syn_cookie: u32,
 }
 
 impl GroupAffinity {
@@ -225,6 +231,51 @@ pub fn normalize_stream_id(stream_id: Option<String>) -> Option<String> {
     })
 }
 
+/// Most workers whose index can be carried in a SYN cookie.
+///
+/// The index occupies the low byte, so a deployment with more acceptor
+/// threads than this cannot use cookie routing and must fall back to
+/// leaving flows wherever the kernel put them.
+pub const MAX_COOKIE_WORKERS: usize = 256;
+
+/// Build the SYN cookie a listener should issue for a peer, with the
+/// owning worker's index encoded in its low byte.
+///
+/// SRT's handshake is INDUCTION -> response -> CONCLUSION -> response.
+/// The listener chooses the cookie in the INDUCTION response and the
+/// caller echoes it in CONCLUSION, so with several acceptors sharing one
+/// SO_REUSEPORT port, the cookie is what lets whichever acceptor the
+/// kernel happens to hand the CONCLUSION to discover who owns the
+/// half-open handshake and forward it there. Without it, a group change
+/// between the two caller packets (which promoting a connection causes --
+/// see crates/srt-transport/tests/reuseport_rehash.rs) strands the
+/// handshake on an acceptor holding no state for it.
+///
+/// `peer_hash` supplies the upper 24 bits so cookies still differ per
+/// peer rather than being a constant per worker. This is routing
+/// metadata, not a security boundary: the cookie remains as guessable as
+/// whatever `peer_hash` provides.
+#[must_use]
+pub fn cookie_for_worker(worker: usize, peer_hash: u32) -> u32 {
+    (peer_hash & 0xFFFF_FF00) | ((worker as u32) & 0xFF)
+}
+
+/// Recover the owning worker index from a cookie seen on the wire.
+///
+/// Returns `None` when the encoded index is not a valid worker for this
+/// listener, which covers both a cookie this listener never issued and a
+/// `worker_count` beyond [`MAX_COOKIE_WORKERS`]. Callers should treat
+/// `None` as "no routing information" and handle the datagram locally
+/// rather than dropping it.
+#[must_use]
+pub fn worker_from_cookie(cookie: u32, worker_count: usize) -> Option<usize> {
+    if worker_count == 0 || worker_count > MAX_COOKIE_WORKERS {
+        return None;
+    }
+    let worker = (cookie & 0xFF) as usize;
+    (worker < worker_count).then_some(worker)
+}
+
 /// Extract the handshake phase and optional GROUP affinity from one datagram.
 #[must_use]
 pub fn handshake_route(packet: &[u8]) -> Option<(bool, Option<GroupAffinity>)> {
@@ -252,6 +303,7 @@ pub fn handshake_identity(packet: &[u8]) -> Option<HandshakeIdentity> {
         is_conclusion,
         stream_id,
         group,
+        syn_cookie: handshake.syn_cookie,
     })
 }
 
@@ -261,6 +313,55 @@ pub fn group_extension_from_packet(packet: &[u8]) -> Option<(GroupExtensionData,
     let (_, affinity) = handshake_route(packet)?;
     let affinity = affinity?;
     Some((affinity.extension, affinity.stream_id))
+}
+
+#[cfg(test)]
+mod cookie_tests {
+    use super::*;
+
+    #[test]
+    fn cookie_round_trips_the_owning_worker() {
+        for workers in [1usize, 2, 4, 17, 64, 256] {
+            for worker in 0..workers {
+                let cookie = cookie_for_worker(worker, 0xDEAD_BE00);
+                assert_eq!(
+                    worker_from_cookie(cookie, workers),
+                    Some(worker),
+                    "worker {worker} of {workers} did not survive the cookie round trip"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cookie_keeps_peer_entropy_outside_the_index_byte() {
+        // Two peers on the same worker must still get distinct cookies,
+        // or the cookie stops being per-connection at all.
+        let a = cookie_for_worker(3, 0x1111_1100);
+        let b = cookie_for_worker(3, 0x2222_2200);
+        assert_ne!(a, b);
+        assert_eq!(a & 0xFF, 3);
+        assert_eq!(b & 0xFF, 3);
+    }
+
+    #[test]
+    fn cookie_index_beyond_worker_count_is_not_routable() {
+        // A cookie this listener never issued (or one from a previous
+        // run with more workers) must not route to a nonexistent worker.
+        let cookie = cookie_for_worker(9, 0);
+        assert_eq!(worker_from_cookie(cookie, 4), None);
+    }
+
+    #[test]
+    fn cookie_routing_is_declined_for_unsupported_worker_counts() {
+        assert_eq!(worker_from_cookie(0, 0), None);
+        assert_eq!(worker_from_cookie(0, MAX_COOKIE_WORKERS + 1), None);
+        // Exactly at the limit is still fine.
+        assert_eq!(
+            worker_from_cookie(cookie_for_worker(255, 0), 256),
+            Some(255)
+        );
+    }
 }
 
 #[cfg(test)]

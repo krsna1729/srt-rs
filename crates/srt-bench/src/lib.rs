@@ -206,6 +206,12 @@ pub struct LossConfig {
     /// crates/srt-transport/tests/reuseport_rehash.rs). Measure per
     /// runtime; do not assume.
     pub promote_all: bool,
+    /// Receiver only, `ReuseportMulti` only. Route a handshake datagram
+    /// to the acceptor named by its SYN cookie when the kernel delivers
+    /// it to the wrong one (see `srt_lifecycle::cookie_for_worker`).
+    /// Defaults on; the switch exists so the rescue can be measured
+    /// against not having it.
+    pub cookie_routing: bool,
 }
 
 /// See [`LossConfig::batching`].
@@ -401,7 +407,7 @@ pub fn bench_config_from_args() -> LossConfig {
              [bitrate_bps] [--connections N] \
              [--ingress per-port|shared-pool=K|reuseport-multi=K|reuseport-single=W] \
              [--bond broadcast:G|backup:G|none] [--batch on|off] \
-             [--connect-concurrency N] [--promote-all on|off]"
+             [--connect-concurrency N] [--promote-all on|off] [--cookie-routing on|off]"
         );
         std::process::exit(2)
     }
@@ -520,6 +526,15 @@ pub fn bench_config_from_args() -> LossConfig {
         }
     };
 
+    let cookie_routing = match cli.flags.get("cookie-routing").map(String::as_str) {
+        None | Some("") | Some("on") => true,
+        Some("off") => false,
+        Some(other) => {
+            eprintln!("error: unknown --cookie-routing '{other}' (want on|off)");
+            usage()
+        }
+    };
+
     LossConfig {
         runtime,
         mode,
@@ -535,5 +550,6 @@ pub fn bench_config_from_args() -> LossConfig {
         batching,
         connect_concurrency,
         promote_all,
+        cookie_routing,
     }
 }
