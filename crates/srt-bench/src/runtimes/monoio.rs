@@ -74,7 +74,7 @@ use shiguredo_srt::{
 use srt_transport::monoio_transport::Conn;
 use srt_transport::{Handoff, WorkerMessage};
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, mpsc};
@@ -84,15 +84,6 @@ use std::time::{Duration, Instant};
 /// before it's retired as stalled. Mirrors mio's/tokio's/smol's `IDLE_GRACE`.
 const IDLE_GRACE: Duration = Duration::from_secs(10);
 const TIMER_TICK: Duration = Duration::from_millis(10);
-
-/// Stable per-peer entropy for a cookie's upper bits, so cookies differ
-/// per connection instead of being one constant per worker.
-fn peer_hash(peer: SocketAddr) -> u32 {
-    use std::hash::{BuildHasher, Hash, Hasher};
-    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
-    peer.hash(&mut hasher);
-    hasher.finish() as u32
-}
 
 /// Give one established connection its own connected socket, so the kernel
 /// matches its packets by exact 4-tuple and an independent task can drive
@@ -524,7 +515,12 @@ async fn run_acceptor(
     });
 
     let promotion = cfg.promotion;
-    let mut peers: HashMap<SocketAddr, PeerEntry> = HashMap::new();
+    let mut peers = srt_transport::PeerTable::new();
+    let admission = srt_transport::AdmissionOptions {
+        socket_id: std::process::id(),
+        tsbpd_delay: cfg.latency_ms,
+        cookie_routing: cfg.cookie_routing,
+    };
     let mut tasks: Vec<monoio::task::JoinHandle<ConnStats>> = Vec::new();
     let connect_deadline = Instant::now() + crate::INTEROP_CONNECT_TIMEOUT;
     let stream_len = Duration::from_secs_f64(cfg.duration_secs);
@@ -538,31 +534,21 @@ async fn run_acceptor(
         // Vacuously true while nothing exists yet, so an acceptor that
         // never admits anything still exits once the connect window
         // closes instead of hanging on an empty guard.
-        let all_terminal = peers.values().all(|p| {
-            srt_lifecycle::is_terminal(
-                p.connected,
-                p.stream_deadline,
-                p.last_data_at,
-                now,
-                connect_deadline,
-                IDLE_GRACE,
-            )
-        });
+        let all_terminal = peers.all_terminal(now, connect_deadline, IDLE_GRACE);
         if now >= connect_deadline && all_terminal {
             break;
         }
 
         monoio::time::sleep(TIMER_TICK).await;
         while let Some((peer, data)) = inbox.borrow_mut().pop_front() {
-            admit(
-                &mut peers,
-                &cfg,
+            peers.admit_and_forward(
+                peer,
+                &data,
+                crate::now_ts(start),
+                &admission,
                 worker_index,
                 &senders,
                 &telemetry,
-                peer,
-                &data,
-                start,
             );
         }
 
@@ -671,15 +657,14 @@ async fn run_acceptor(
                 // considered here.
                 WorkerMessage::Finished { .. } => continue,
                 WorkerMessage::Handshake { peer, data } => {
-                    admit(
-                        &mut peers,
-                        &cfg,
+                    peers.admit_and_forward(
+                        peer,
+                        &data,
+                        crate::now_ts(start),
+                        &admission,
                         worker_index,
                         &senders,
                         &telemetry,
-                        peer,
-                        &data,
-                        start,
                     );
                     continue;
                 }
@@ -726,97 +711,6 @@ async fn run_acceptor(
         stats.push(task.await);
     }
     stats
-}
-
-fn admit(
-    peers: &mut HashMap<SocketAddr, PeerEntry>,
-    cfg: &LossConfig,
-    worker_index: usize,
-    senders: &[mpsc::Sender<WorkerMessage>],
-    telemetry: &srt_transport::IngressTelemetry,
-    peer: SocketAddr,
-    data: &[u8],
-    start: Instant,
-) {
-    // Route by cookie before touching local state: a handshake datagram
-    // whose cookie names another acceptor belongs to that acceptor's
-    // half-open connection, wherever the kernel happened to deliver it.
-    if cfg.cookie_routing
-        && !peers.contains_key(&peer)
-        && let Some(identity) = srt_lifecycle::handshake_identity(data)
-        && identity.is_conclusion
-        && let Some(owner) = srt_lifecycle::worker_from_cookie(identity.syn_cookie, senders.len())
-        && owner != worker_index
-    {
-        let message = WorkerMessage::Handshake {
-            peer,
-            data: data.to_vec(),
-        };
-        if senders[owner].send(message).is_ok() {
-            telemetry.record_cookie_routed();
-            return;
-        }
-        // Owner is gone; handle it here rather than dropping it.
-    }
-    // A CONCLUSION is never a flow's first packet, so one arriving for an
-    // unknown peer needs explaining. Two very different things look
-    // identical here, and conflating them makes the cookie-routing
-    // measurement meaningless:
-    //   - the cookie names *this* acceptor: the flow was already promoted
-    //     off the shared listener and its peer entry removed, so this is a
-    //     late or duplicate CONCLUSION, not a rehash victim;
-    //   - anything else: no usable routing information, a genuinely
-    //     stranded handshake.
-    if !peers.contains_key(&peer)
-        && let Some(identity) = srt_lifecycle::handshake_identity(data)
-        && identity.is_conclusion
-    {
-        match srt_lifecycle::worker_from_cookie(identity.syn_cookie, senders.len()) {
-            Some(owner) if owner == worker_index => {
-                telemetry.record_promoted_duplicate();
-            }
-            _ => {
-                telemetry.record_stranded_conclusion();
-            }
-        }
-    }
-    let t = crate::now_ts(start);
-    let entry = peers.entry(peer).or_insert_with(|| PeerEntry {
-        conn: SrtConnection::new_listener(ConnectionOptions {
-            socket_id: std::process::id(),
-            tsbpd_delay: cfg.latency_ms,
-            // Encode who owns this handshake, so a CONCLUSION rehashed to
-            // another acceptor can be routed back here.
-            syn_cookie: Some(srt_lifecycle::cookie_for_worker(
-                worker_index,
-                peer_hash(peer),
-            )),
-            ..Default::default()
-        }),
-        timers: srt_transport::ManualTimerStore::new(),
-        connected: false,
-        stream_deadline: None,
-        data_events: 0,
-        last_data_at: Instant::now(),
-    });
-    let _ = entry.conn.feed_recv_buf(data, t);
-}
-
-/// One tracked peer -- pending handshake or fully established, serviced
-/// off the shared listener socket for its whole life unless it relocates
-/// -- keyed by peer tuple in `run_acceptor`'s `peers` map. Module-scoped
-/// (not local to `run_acceptor`) only because `admit` needs to name the
-/// type in its signature.
-struct PeerEntry {
-    conn: SrtConnection,
-    timers: srt_transport::ManualTimerStore,
-    /// Live connected state, feeding `srt_lifecycle::is_terminal`.
-    connected: bool,
-    /// `None` until this peer's first `Connected` event; doubles as "has
-    /// this ever connected" (see mio's/tokio's/smol's identical pattern).
-    stream_deadline: Option<Instant>,
-    data_events: u64,
-    last_data_at: Instant,
 }
 
 async fn drain_pending_outputs(

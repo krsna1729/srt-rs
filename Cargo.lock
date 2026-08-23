@@ -2058,6 +2058,7 @@ dependencies = [
  "smol",
  "socket2 0.4.10",
  "socket2 0.6.4",
+ "srt-lifecycle",
  "tokio",
 ]
 

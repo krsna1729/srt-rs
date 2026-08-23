@@ -27,11 +27,12 @@
 //! The `is_ready` noop-waker poll pattern is shared because it's genuinely
 //! identical across all 5 async runtimes.
 
-use shiguredo_srt::{ConnectionOutput, SrtConnection, TimerId, Timestamp};
+use shiguredo_srt::{ConnectionOptions, ConnectionOutput, SrtConnection, TimerId, Timestamp};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable};
+use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
 // Shared utilities — always compiled, no runtime deps
@@ -251,6 +252,262 @@ unsafe fn sockaddr_to_addr(storage: &libc::sockaddr_storage) -> Option<std::net:
         std::net::Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr)),
         u16::from_be(addr.sin_port),
     )))
+}
+
+// ---------------------------------------------------------------------------
+// Admission peer table — shared by every reuseport ingress strategy
+// ---------------------------------------------------------------------------
+
+/// One connection tracked from admission until it is promoted, relocated,
+/// or retired -- serviced off the shared listener socket by peer-address
+/// dispatch the whole time.
+pub struct AdmissionPeer {
+    pub conn: SrtConnection,
+    pub timers: ManualTimerStore,
+    /// Live connected state, feeding `srt_lifecycle::is_terminal`. Goes
+    /// false again on `Disconnected`.
+    pub connected: bool,
+    /// `None` until this peer's first `Connected`, which also makes it
+    /// the "has this ever connected" flag. Final success reporting should
+    /// use this rather than `connected`: a session that streamed
+    /// everything and then tripped the peer-idle timeout is still a
+    /// success.
+    pub stream_deadline: Option<Instant>,
+    pub data_events: u64,
+    pub last_data_at: Instant,
+}
+
+/// Per-listener settings the table needs to mint new connections and to
+/// decide cookie routing.
+#[derive(Clone, Copy, Debug)]
+pub struct AdmissionOptions {
+    pub socket_id: u32,
+    pub tsbpd_delay: u16,
+    /// Forward a handshake datagram to the acceptor its SYN cookie names.
+    /// Off makes a rehashed CONCLUSION strand instead, which is only
+    /// useful for measuring what the routing is worth.
+    pub cookie_routing: bool,
+}
+
+/// What [`PeerTable::admit`] did with a datagram.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Admit {
+    /// Fed to the peer's connection, creating it if this is its first
+    /// packet.
+    Fed,
+    /// Belongs to another acceptor's half-open handshake; the caller
+    /// should send it there as [`WorkerMessage::Handshake`].
+    ForwardTo(usize),
+}
+
+/// The peers one acceptor is servicing off its shared listener.
+///
+/// This is the admission session state machine, minus I/O: it owns the
+/// protocol objects and their timers, decides cookie routing, and records
+/// telemetry, but never touches a socket. The caller drives the sending.
+/// It lives here rather than in srt-lifecycle because it owns clocks and
+/// live protocol state, which that crate deliberately does not.
+#[derive(Default)]
+pub struct PeerTable {
+    peers: HashMap<std::net::SocketAddr, AdmissionPeer>,
+}
+
+impl PeerTable {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Take one datagram for `peer`.
+    ///
+    /// `worker_index`/`worker_count` identify this acceptor within the
+    /// reuseport group so a CONCLUSION carrying someone else's cookie can
+    /// be routed home rather than answered here (cookie validation would
+    /// reject it) or dropped (a handshake retry).
+    pub fn admit(
+        &mut self,
+        peer: std::net::SocketAddr,
+        data: &[u8],
+        now: Timestamp,
+        options: &AdmissionOptions,
+        worker_index: usize,
+        worker_count: usize,
+        telemetry: &IngressTelemetry,
+    ) -> Admit {
+        let known = self.peers.contains_key(&peer);
+        // Only a handshake datagram for a peer we do not track can be
+        // misrouted; anything else is ours by definition.
+        let conclusion = (!known)
+            .then(|| srt_lifecycle::handshake_identity(data))
+            .flatten()
+            .filter(|identity| identity.is_conclusion);
+
+        if let Some(identity) = &conclusion {
+            let owner = srt_lifecycle::worker_from_cookie(identity.syn_cookie, worker_count);
+            match owner {
+                Some(owner) if owner != worker_index => {
+                    if options.cookie_routing {
+                        telemetry.record_cookie_routed();
+                        return Admit::ForwardTo(owner);
+                    }
+                    // Routing disabled: it will be answered here and fail
+                    // cookie validation, which is the cost being measured.
+                    telemetry.record_stranded_conclusion();
+                }
+                // The cookie names this acceptor, but the peer is gone --
+                // it was already promoted off the shared listener, so
+                // this is a late or duplicate CONCLUSION rather than a
+                // stranded handshake. Conflating the two makes the
+                // routing measurement meaningless.
+                Some(_) => telemetry.record_promoted_duplicate(),
+                None => telemetry.record_stranded_conclusion(),
+            }
+        }
+
+        let entry = self.peers.entry(peer).or_insert_with(|| AdmissionPeer {
+            conn: SrtConnection::new_listener(ConnectionOptions {
+                socket_id: options.socket_id,
+                tsbpd_delay: options.tsbpd_delay,
+                // Encode who owns this handshake, so a CONCLUSION the
+                // kernel rehashes elsewhere can be routed back here.
+                syn_cookie: Some(srt_lifecycle::cookie_for_worker(
+                    worker_index,
+                    peer_entropy(peer),
+                )),
+                ..Default::default()
+            }),
+            timers: ManualTimerStore::new(),
+            connected: false,
+            stream_deadline: None,
+            data_events: 0,
+            last_data_at: Instant::now(),
+        });
+        let _ = entry.conn.feed_recv_buf(data, now);
+        Admit::Fed
+    }
+
+    /// [`Self::admit`] plus the send it implies: forward the datagram to
+    /// the acceptor its cookie names, or keep it here if that channel is
+    /// gone. Dropping it instead would cost a handshake retry.
+    ///
+    /// The send lives here rather than in each adapter because every one
+    /// of them did exactly this, and the routing decision is worthless
+    /// without the delivery that follows it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn admit_and_forward(
+        &mut self,
+        peer: std::net::SocketAddr,
+        data: &[u8],
+        now: Timestamp,
+        options: &AdmissionOptions,
+        worker_index: usize,
+        senders: &[std::sync::mpsc::Sender<WorkerMessage>],
+        telemetry: &IngressTelemetry,
+    ) {
+        match self.admit(
+            peer,
+            data,
+            now,
+            options,
+            worker_index,
+            senders.len(),
+            telemetry,
+        ) {
+            Admit::Fed => {}
+            Admit::ForwardTo(owner) => {
+                let message = WorkerMessage::Handshake {
+                    peer,
+                    data: data.to_vec(),
+                };
+                if senders[owner].send(message).is_err() {
+                    // Owner is gone. Take it locally with routing off, so
+                    // the retry path is not entered again for this one.
+                    let local = AdmissionOptions {
+                        cookie_routing: false,
+                        ..*options
+                    };
+                    let _ = self.admit(
+                        peer,
+                        data,
+                        now,
+                        &local,
+                        worker_index,
+                        senders.len(),
+                        telemetry,
+                    );
+                }
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn contains(&self, peer: &std::net::SocketAddr) -> bool {
+        self.peers.contains_key(peer)
+    }
+
+    #[must_use]
+    pub fn get(&self, peer: &std::net::SocketAddr) -> Option<&AdmissionPeer> {
+        self.peers.get(peer)
+    }
+
+    pub fn remove(&mut self, peer: &std::net::SocketAddr) -> Option<AdmissionPeer> {
+        self.peers.remove(peer)
+    }
+
+    pub fn iter_mut(
+        &mut self,
+    ) -> impl Iterator<Item = (&std::net::SocketAddr, &mut AdmissionPeer)> {
+        self.peers.iter_mut()
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.peers.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.peers.is_empty()
+    }
+
+    /// Whether every tracked peer is done, so the acceptor can stop.
+    /// Vacuously true when empty, so an acceptor that never admitted
+    /// anything still exits once its connect window closes.
+    #[must_use]
+    pub fn all_terminal(
+        &self,
+        now: Instant,
+        connect_deadline: Instant,
+        idle_grace: Duration,
+    ) -> bool {
+        self.peers.values().all(|p| {
+            srt_lifecycle::is_terminal(
+                p.connected,
+                p.stream_deadline,
+                p.last_data_at,
+                now,
+                connect_deadline,
+                idle_grace,
+            )
+        })
+    }
+}
+
+impl IntoIterator for PeerTable {
+    type Item = (std::net::SocketAddr, AdmissionPeer);
+    type IntoIter = std::collections::hash_map::IntoIter<std::net::SocketAddr, AdmissionPeer>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.peers.into_iter()
+    }
+}
+
+/// Per-peer entropy for the upper bits of a SYN cookie, so cookies differ
+/// per connection instead of being one constant per worker.
+fn peer_entropy(peer: std::net::SocketAddr) -> u32 {
+    use std::hash::{BuildHasher, Hash, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    peer.hash(&mut hasher);
+    hasher.finish() as u32
 }
 
 // ---------------------------------------------------------------------------

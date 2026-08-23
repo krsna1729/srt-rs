@@ -682,15 +682,6 @@ fn slot_is_terminal(slot: &PoolSlot, now: Instant) -> bool {
 /// itself noticed a disconnect.
 const IDLE_GRACE: Duration = Duration::from_secs(10);
 
-/// Stable per-peer entropy for the upper bits of a SYN cookie, so cookies
-/// differ per connection instead of being one constant per worker.
-fn peer_hash(peer: SocketAddr) -> u32 {
-    use std::hash::{BuildHasher, Hash, Hasher};
-    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
-    peer.hash(&mut hasher);
-    hasher.finish() as u32
-}
-
 fn bind_reuseport(port: u16, sock_buf_bytes: usize) -> std::io::Result<UdpSocket> {
     Ok(UdpSocket::from_std(srt_transport::bind_reuseport(
         port,
@@ -851,24 +842,17 @@ fn run_pool_acceptor(
         .register(&mut listener, Token(0), Interest::READABLE)
         .expect("register listener");
 
-    struct Peer {
-        conn: SrtConnection,
-        timers: srt_transport::ManualTimerStore,
-        /// Live connected state, feeding `srt_lifecycle::is_terminal`.
-        connected: bool,
-        /// `None` until this peer's first `Connected` event; doubles as
-        /// "has this ever connected" (see `SharedPool`'s identical field).
-        stream_deadline: Option<Instant>,
-        data_events: u64,
-        last_data_at: Instant,
-    }
-
     // Every flow lives here from admission through `Connected` -- dispatched
     // by peer address off the *same* listener socket used for admission,
     // exactly like `SharedPool`. A flow leaves `peers` only when it is
     // promoted or relocated -- so it is always either mid-handshake here,
     // or fully promoted into `slots`, never in between.
-    let mut peers: HashMap<SocketAddr, Peer> = HashMap::new();
+    let mut peers = srt_transport::PeerTable::new();
+    let admission = srt_transport::AdmissionOptions {
+        socket_id: std::process::id(),
+        tsbpd_delay: cfg.latency_ms,
+        cookie_routing: cfg.cookie_routing,
+    };
     // Promoted connections -- local or handed off in from another
     // acceptor -- each with a dedicated connected socket and mio token,
     // driven by `service_slot_event`/`maintain_slots` like any other
@@ -903,16 +887,8 @@ fn run_pool_acceptor(
         // Vacuously true while nothing exists yet, so an acceptor that
         // never admits anything still exits once the connect window
         // closes instead of hanging on an empty guard.
-        let all_terminal = peers.values().all(|p| {
-            srt_lifecycle::is_terminal(
-                p.connected,
-                p.stream_deadline,
-                p.last_data_at,
-                now,
-                connect_deadline,
-                IDLE_GRACE,
-            )
-        }) && slots.iter().all(|s| slot_is_terminal(s, now));
+        let all_terminal = peers.all_terminal(now, connect_deadline, IDLE_GRACE)
+            && slots.iter().all(|s| slot_is_terminal(s, now));
         if now >= connect_deadline && all_terminal {
             break;
         }
@@ -930,24 +906,15 @@ fn run_pool_acceptor(
                 // to the peer state that owns it, creating that state if
                 // this is somehow the first we've seen of the flow.
                 WorkerMessage::Handshake { peer, data } => {
-                    let t = crate::now_ts(start);
-                    let entry = peers.entry(peer).or_insert_with(|| Peer {
-                        conn: SrtConnection::new_listener(ConnectionOptions {
-                            socket_id: std::process::id(),
-                            tsbpd_delay: cfg.latency_ms,
-                            syn_cookie: Some(srt_lifecycle::cookie_for_worker(
-                                worker_index,
-                                peer_hash(peer),
-                            )),
-                            ..Default::default()
-                        }),
-                        timers: srt_transport::ManualTimerStore::new(),
-                        connected: false,
-                        stream_deadline: None,
-                        data_events: 0,
-                        last_data_at: Instant::now(),
-                    });
-                    let _ = entry.conn.feed_recv_buf(&data, t);
+                    peers.admit_and_forward(
+                        peer,
+                        &data,
+                        crate::now_ts(start),
+                        &admission,
+                        worker_index,
+                        &senders,
+                        &telemetry,
+                    );
                     continue;
                 }
                 WorkerMessage::Finished { .. } => continue,
@@ -983,7 +950,6 @@ fn run_pool_acceptor(
                 0 => {
                     // Admission path: batched (recvmmsg) or per-datagram
                     // per LossConfig::batching -- see drain_admission.
-                    let t = crate::now_ts(start);
                     drain_admission(
                         &listener,
                         cfg.batching,
@@ -992,93 +958,15 @@ fn run_pool_acceptor(
                         &mut admit_addrs,
                         &mut buf,
                         |peer, data| {
-                            use std::collections::hash_map::Entry;
-                            // Route by cookie before touching local state: a
-                            // handshake datagram whose cookie names another
-                            // acceptor belongs to that acceptor's half-open
-                            // connection, wherever the kernel happened to
-                            // deliver it.
-                            if cfg.cookie_routing
-                                && !peers.contains_key(&peer)
-                                && let Some(identity) = srt_lifecycle::handshake_identity(data)
-                                && identity.is_conclusion
-                                && let Some(owner) = srt_lifecycle::worker_from_cookie(
-                                    identity.syn_cookie,
-                                    senders.len(),
-                                )
-                                && owner != worker_index
-                            {
-                                let message = WorkerMessage::Handshake {
-                                    peer,
-                                    data: data.to_vec(),
-                                };
-                                if senders[owner].send(message).is_ok() {
-                                    telemetry.record_cookie_routed();
-                                    return;
-                                }
-                                // Owner is gone; fall through and handle it
-                                // here rather than dropping the datagram.
-                            }
-                            let entry = match peers.entry(peer) {
-                                Entry::Occupied(occupied) => occupied.into_mut(),
-                                Entry::Vacant(vacant) => {
-                                    // Diagnostic for the mid-handshake rehash
-                                    // question. SRT's handshake is INDUCTION ->
-                                    // response -> CONCLUSION -> response, so a
-                                    // CONCLUSION is never the first packet of a
-                                    // flow. Seeing one for a peer this acceptor
-                                    // has no state for means the kernel moved the
-                                    // flow *between* its two caller->listener
-                                    // packets: its INDUCTION went to a different
-                                    // acceptor. That connection cannot complete
-                                    // here (no cookie state), and is exactly the
-                                    // case an mpsc handoff keyed on the cookie
-                                    // would have to rescue.
-                                    // Two different things look alike here: a
-                                    // cookie naming *this* acceptor means the
-                                    // flow was already promoted (its peer entry
-                                    // removed), so it is a late or duplicate
-                                    // CONCLUSION rather than a stranded
-                                    // handshake. Counting them together makes
-                                    // the cookie-routing measurement
-                                    // meaningless.
-                                    if let Some(identity) = srt_lifecycle::handshake_identity(data)
-                                        && identity.is_conclusion
-                                    {
-                                        match srt_lifecycle::worker_from_cookie(
-                                            identity.syn_cookie,
-                                            senders.len(),
-                                        ) {
-                                            Some(owner) if owner == worker_index => {
-                                                telemetry.record_promoted_duplicate();
-                                            }
-                                            _ => {
-                                                telemetry.record_stranded_conclusion();
-                                            }
-                                        }
-                                    }
-                                    vacant.insert(Peer {
-                                        conn: SrtConnection::new_listener(ConnectionOptions {
-                                            socket_id: std::process::id(),
-                                            tsbpd_delay: cfg.latency_ms,
-                                            // Encode who owns this handshake, so a
-                                            // CONCLUSION rehashed to another acceptor
-                                            // can be routed back here.
-                                            syn_cookie: Some(srt_lifecycle::cookie_for_worker(
-                                                worker_index,
-                                                peer_hash(peer),
-                                            )),
-                                            ..Default::default()
-                                        }),
-                                        timers: srt_transport::ManualTimerStore::new(),
-                                        connected: false,
-                                        stream_deadline: None,
-                                        data_events: 0,
-                                        last_data_at: Instant::now(),
-                                    })
-                                }
-                            };
-                            let _ = entry.conn.feed_recv_buf(data, t);
+                            peers.admit_and_forward(
+                                peer,
+                                data,
+                                crate::now_ts(start),
+                                &admission,
+                                worker_index,
+                                &senders,
+                                &telemetry,
+                            );
                         },
                     );
                 }

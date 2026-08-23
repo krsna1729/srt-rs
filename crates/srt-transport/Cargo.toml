@@ -8,6 +8,10 @@ description = "Shared adapter plumbing between srt-protocol (sans-I/O) and runti
 
 [dependencies]
 shiguredo_srt = { path = "../srt-protocol" }
+# The admission table applies admission policy (cookie routing, terminal
+# checks), so mechanism depends on policy. Acyclic: lifecycle depends only
+# on the protocol crate and never on this one.
+srt-lifecycle = { path = "../srt-lifecycle" }
 # Unconditional: `bind_reuseport`/`set_sock_bufs`/`recvmsg_batch` in the
 # shared-utilities section are raw fd/libc mechanics with no runtime
 # dependency, usable by any adapter's ingress strategy (batched admission,
