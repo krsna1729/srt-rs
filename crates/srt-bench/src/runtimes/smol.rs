@@ -526,7 +526,7 @@ async fn run_acceptor(
         }
     };
 
-    let promote_everyone = cfg.promote_all;
+    let promotion = cfg.promotion;
     let mut peers: HashMap<SocketAddr, PeerEntry> = HashMap::new();
     let mut tasks: Vec<async_executor::Task<ConnStats>> = Vec::new();
     let connect_deadline = Instant::now() + crate::INTEROP_CONNECT_TIMEOUT;
@@ -622,12 +622,14 @@ async fn run_acceptor(
             }
         }
         for (peer, extension) in relocate {
-            // Owner selection. An unbonded connection has no group
-            // affinity to honor, so it stays on whichever acceptor the
-            // kernel gave it; a bonded leg asks the router where its
-            // group already lives.
+            // Which connections promote at Connected is `LossConfig::
+            // promotion`. A bonded leg whose owner is a *different*
+            // worker always relocates; everything else promotes only
+            // when the mode says so. In Never mode the router is never
+            // consulted: legs stay where the kernel hashed them.
             let owner = match extension {
-                Some(extension) => {
+                Some(extension) if promotion != crate::Promotion::Never => Some({
+                    // A bonded leg asks the router where its group lives.
                     let group = srt_lifecycle::GroupAffinity {
                         group_id: extension.group_id,
                         stream_id: None,
@@ -641,38 +643,49 @@ async fn run_acceptor(
                         ),
                         Err(_) => worker_index, // poisoned: leave it here
                     }
-                }
-                None => worker_index,
+                }),
+                _ => None, // unbonded (or Never): no affinity to honor
             };
 
-            if owner != worker_index {
-                let Some(p) = peers.remove(&peer) else {
-                    continue;
-                };
-                relocate_to_owner(cfg.port, peer, p.conn, owner, &senders);
-            } else if promote_everyone {
-                // The task-per-connection hypothesis under test: give this
-                // connection its own connected socket and its own task, so
-                // smol's executor schedules it independently instead of it
-                // sharing one worker's sequential per-tick peer loop. See
-                // `LossConfig::promote_all`.
-                let Some(p) = peers.remove(&peer) else {
-                    continue;
-                };
-                match promote_locally(cfg.port, peer, p.conn) {
-                    Some(driver) => {
-                        let cfg2 = cfg.clone();
-                        tasks.push(ex.spawn(async move {
-                            established_conn_task(driver, cfg2, start).await
-                        }));
-                        PROMOTION_COUNT.fetch_add(1, Ordering::Relaxed);
-                    }
-                    None => {
-                        // Bind/connect failed: nothing to fall back to,
-                        // the peer state has already been removed.
-                        eprintln!("[bench-smol] promote {peer}: failed");
+            let promote_here = match owner {
+                Some(o) => {
+                    o == worker_index
+                        && matches!(promotion, crate::Promotion::Bonded | crate::Promotion::All)
+                }
+                None => promotion == crate::Promotion::All,
+            };
+            match owner {
+                Some(o) if o != worker_index => {
+                    let Some(p) = peers.remove(&peer) else {
+                        continue;
+                    };
+                    relocate_to_owner(cfg.port, peer, p.conn, o, &senders);
+                }
+                _ if promote_here => {
+                    // The task-per-connection hypothesis under test: give
+                    // this connection its own connected socket and its own
+                    // task, so smol's executor schedules it independently
+                    // instead of it sharing one worker's sequential
+                    // per-tick peer loop. See `LossConfig::promotion`.
+                    let Some(p) = peers.remove(&peer) else {
+                        continue;
+                    };
+                    match promote_locally(cfg.port, peer, p.conn) {
+                        Some(driver) => {
+                            let cfg2 = cfg.clone();
+                            tasks.push(ex.spawn(async move {
+                                established_conn_task(driver, cfg2, start).await
+                            }));
+                            PROMOTION_COUNT.fetch_add(1, Ordering::Relaxed);
+                        }
+                        None => {
+                            // Bind/connect failed: nothing to fall back to,
+                            // the peer state has already been removed.
+                            eprintln!("[bench-smol] promote {peer}: failed");
+                        }
                     }
                 }
+                _ => {} // stays serviced off the shared listener
             }
         }
 

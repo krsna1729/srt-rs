@@ -10,7 +10,7 @@ use shiguredo_srt::{
     ConnectionEvent, ConnectionOptions, GroupExtensionData, GroupType, SRTGROUP_MASK, SrtConnection,
 };
 use srt_transport::mio_transport::Conn;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -687,9 +687,10 @@ const IDLE_GRACE: Duration = Duration::from_secs(10);
 /// instead of sitting dead -- see `run_pool_receiver`'s shutdown log.
 static HANDOFF_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// Diagnostic counter: every connection promoted to a dedicated socket,
-/// local or remote (a superset of `HANDOFF_COUNT`) -- see
-/// `run_pool_receiver`'s shutdown log.
+/// Diagnostic counter: connections promoted to their own socket on this
+/// same acceptor thread. Disjoint from `HANDOFF_COUNT`, which counts
+/// cross-thread bond relocations -- the two never count the same
+/// connection, so a run's total promotions is their sum.
 static PROMOTION_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Diagnostic counter: CONCLUSION handshake packets that arrived at an
@@ -711,20 +712,6 @@ static COOKIE_FORWARD_COUNT: AtomicU64 = AtomicU64::new(0);
 /// acceptor already promoted. Harmless, but indistinguishable from a
 /// stranded handshake without checking the cookie.
 static PROMOTED_DUP_COUNT: AtomicU64 = AtomicU64::new(0);
-
-/// Where a connection's promotion (see `run_pool_acceptor`'s module doc)
-/// lands: on this same thread, or shipped to a specific remote owner.
-enum PromotionTarget {
-    Local,
-    Remote(usize),
-}
-
-/// Max new reuseport-group members one tick may create once draining is
-/// allowed at all -- see `pending_promotions`'s doc in
-/// `run_pool_acceptor`. Deliberately small: this bounds a connection
-/// storm's rehashing hazard, not steady-state throughput (a connection
-/// promotes exactly once, in its lifetime).
-const MAX_PROMOTIONS_PER_TICK: usize = 4;
 
 /// Bond-affinity handoff payload: a fully promoted slot shipped from the
 /// acceptor that completed its handshake to the thread that owns the group.
@@ -830,18 +817,23 @@ fn drain_conn_outputs(
 /// for every runtime, and mio is the reference implementation for it.
 ///
 /// The residual hazard -- every *new* socket bound into this port's
-/// reuseport group perturbs Linux's default (non-eBPF) hash, which
-/// factors in current group size, so it can reroute some other still-
-/// pending flow's next datagram to a different acceptor mid-handshake,
-/// forcing a retry -- is now bounded to a *connection storm* (many flows
-/// completing their handshake in the same tight window), not sustained
-/// for a connection's whole life the way promoting at admission time
-/// would be. `MAX_PROMOTIONS_PER_TICK` paces how many new sockets any one
-/// tick may create, spreading a storm's promotions across several ticks
-/// instead of growing the group by dozens of members at once -- see
-/// `pending_promotions` below. A connection queued for promotion is not
-/// removed from `peers` (and so stays fully serviced, no gap) until the
-/// tick it's actually promoted.
+/// reuseport group perturbs Linux's default (non-eBPF) hash, which can
+/// reroute some other still-pending flow's next datagram to a different
+/// acceptor mid-handshake -- is real but transient: `connect()` removes
+/// the socket from the group again, so the group returns to K and the
+/// displaced flows return with it (measured net zero; see
+/// crates/srt-transport/tests/reuseport_rehash.rs). The exposure is the
+/// few microseconds between the two syscalls, and a CONCLUSION landing
+/// inside that window is recovered by cookie routing rather than lost.
+///
+/// A fixed per-tick promotion budget used to live here to spread that
+/// churn out. It was removed once storm loss was traced to arrival
+/// concurrency instead: sweeping `--connect-concurrency` at N=150 moved
+/// listener loss 11 -> 35 -> 105 -> 113 for 1/10/50/150, while the
+/// promotion A/B at that point was indistinguishable (off 91/98/91, on
+/// 58/159/106). It was pacing something that was not the cause, and it
+/// left this backend as the only one whose promotion timing differed
+/// from the other five.
 fn run_pool_receiver(cfg: LossConfig, k: usize) {
     use std::sync::mpsc;
 
@@ -881,17 +873,17 @@ fn run_pool_receiver(cfg: LossConfig, k: usize) {
     }
     // Always report, not gated on the receiver's own --bond (bonding is a
     // sender-side choice; the receiver learns it from the handshake).
-    // `promotions` is every connection that ever got a dedicated socket
-    // (should track admitted connections closely); `handoffs` is the
-    // subset of those that needed to move to a different worker -- a
-    // nonzero handoff count is the proof the bond-affinity path fired.
+    // `promotions` counts connections given a dedicated socket here;
+    // `handoffs` counts those relocated to another worker instead. They
+    // are disjoint, so total promotions is their sum, and a nonzero
+    // handoff count is the proof the bond-affinity path fired.
     let promotions = PROMOTION_COUNT.load(Ordering::Relaxed);
     let handoffs = HANDOFF_COUNT.load(Ordering::Relaxed);
     let orphans = ORPHAN_CONCLUSION_COUNT.load(Ordering::Relaxed);
     let forwarded = COOKIE_FORWARD_COUNT.load(Ordering::Relaxed);
     let dups = PROMOTED_DUP_COUNT.load(Ordering::Relaxed);
     eprintln!(
-        "[bench-mio] pool receiver: {promotions} promotions ({handoffs} cross-thread handoffs), \
+        "[bench-mio] pool receiver: {promotions} local promotions, {handoffs} bond handoffs, \
          {orphans} stranded CONCLUSIONs, {forwarded} cookie-routed, {dups} post-promotion dups"
     );
     agg.print(start);
@@ -936,10 +928,9 @@ fn run_pool_acceptor(
 
     // Every flow lives here from admission through `Connected` -- dispatched
     // by peer address off the *same* listener socket used for admission,
-    // exactly like `SharedPool`. A flow leaves `peers` the instant its
-    // queued promotion actually executes (see `pending_promotions`), never
-    // before -- so it's always either mid-handshake here, or fully
-    // promoted into `slots`, never in between.
+    // exactly like `SharedPool`. A flow leaves `peers` only when it is
+    // promoted or relocated -- so it is always either mid-handshake here,
+    // or fully promoted into `slots`, never in between.
     let mut peers: HashMap<SocketAddr, Peer> = HashMap::new();
     // Promoted connections -- local or handed off in from another
     // acceptor -- each with a dedicated connected socket and mio token,
@@ -949,17 +940,6 @@ fn run_pool_acceptor(
     // token.0 -> index in `slots`, maintained alongside every push below --
     // see `service_slot_event`'s doc for why this matters at #4's scale.
     let mut token_index: HashMap<usize, usize> = HashMap::new();
-    // Flows that reached `Connected` and had their destination decided
-    // (local vs. a specific remote owner) but haven't been promoted yet.
-    // Drained at `MAX_PROMOTIONS_PER_TICK` per tick -- see the drain site
-    // below and `LossConfig::connect_concurrency`'s doc for the full
-    // reasoning (a fixed rate alone doesn't fully absorb a true
-    // connection storm, but the sender no longer produces one under
-    // ordinary use; this remains as a second line of defense). FIFO
-    // order (push back, pop front) keeps
-    // promotion latency roughly equal across a storm instead of starving
-    // whoever connected first.
-    let mut pending_promotions: VecDeque<(SocketAddr, PromotionTarget)> = VecDeque::new();
     let mut next_token: usize = 1;
     let connect_deadline = Instant::now() + crate::INTEROP_CONNECT_TIMEOUT;
     let stream_len = Duration::from_secs_f64(cfg.duration_secs);
@@ -1174,9 +1154,7 @@ fn run_pool_acceptor(
         // via the shared listener's unconnected `send_to` -- a peer here
         // never gets its own socket until it's actually promoted below),
         // and react to protocol events. On a peer's *first* Connected,
-        // decide its promotion destination once -- see this function's
-        // module doc -- and queue it; the peer stays in `peers`, fully
-        // serviced, until `pending_promotions` actually pops it.
+        // decide its fate once, below -- see this function's module doc.
         let t = crate::now_ts(start);
         let mut newly_connected: Vec<SocketAddr> = Vec::new();
         for (peer, p) in peers.iter_mut() {
@@ -1207,56 +1185,57 @@ fn run_pool_acceptor(
             }
         }
         for peer in newly_connected {
-            // Every connection promotes once Connected -- unbonded ones
-            // locally (no router needed: there's no group affinity
-            // constraint to honor), bonded ones to wherever
-            // `WorkerRouter` says their group already lives.
-            let target = match peers.get(&peer).and_then(|p| p.conn.peer_group_extension()) {
-                Some(extension) => {
+            // Which connections promote at Connected is `LossConfig::
+            // promotion`. A bonded leg whose owner is a *different*
+            // worker always relocates; everything else promotes only
+            // when the mode says so. In Never mode the router is never
+            // consulted: legs stay where the kernel hashed them.
+            let extension = peers.get(&peer).and_then(|p| p.conn.peer_group_extension());
+            let owner = match extension {
+                Some(extension) if cfg.promotion != crate::Promotion::Never => Some({
+                    // A bonded leg asks the router where its group lives.
                     let group = srt_lifecycle::GroupAffinity {
                         group_id: extension.group_id,
                         stream_id: None,
                         extension,
                     };
-                    let owner = match router.lock() {
+                    match router.lock() {
                         Ok(mut router) => router.assign(
                             peer,
                             Some(group),
                             srt_lifecycle::RoutingMode::LeastTuples,
                         ),
-                        Err(_) => worker_index, // poisoned: promote locally rather than stall
-                    };
-                    if owner == worker_index {
-                        PromotionTarget::Local
-                    } else {
-                        PromotionTarget::Remote(owner)
+                        Err(_) => worker_index, // poisoned: leave it here
                     }
-                }
-                None => PromotionTarget::Local,
+                }),
+                _ => None, // unbonded (or Never): no affinity to honor
             };
-            pending_promotions.push_back((peer, target));
-        }
 
-        // Pace how many new reuseport-group members this tick may create.
-        // A quiet-gate variant (defer while any peer is still mid-
-        // handshake, with a bypass once a promotion has waited too long)
-        // was tried and measured *worse* than this plain fixed rate: once
-        // many connections queue for promotion around the same time (a
-        // storm's defining trait), their bypass deadlines cluster too,
-        // producing a coordinated burst that undoes the pacing. A steady,
-        // low, unconditional trickle spreads the group's growth out
-        // evenly instead.
-        let mut promoted_this_tick = 0;
-        while promoted_this_tick < MAX_PROMOTIONS_PER_TICK {
-            let Some((peer, target)) = pending_promotions.pop_front() else {
-                break;
+            let promote_here = match owner {
+                Some(o) => {
+                    o == worker_index
+                        && matches!(
+                            cfg.promotion,
+                            crate::Promotion::Bonded | crate::Promotion::All
+                        )
+                }
+                None => cfg.promotion == crate::Promotion::All,
             };
-            let Some(p) = peers.remove(&peer) else {
-                continue; // already gone (e.g. idled out) before its turn
-            };
-            promoted_this_tick += 1;
-            match target {
-                PromotionTarget::Local => {
+            match owner {
+                Some(o) if o != worker_index => {
+                    let Some(p) = peers.remove(&peer) else {
+                        continue;
+                    };
+                    relocate_to_owner(cfg.port, peer, p.conn, o, &senders);
+                }
+                _ if promote_here => {
+                    // Unlike the task-based backends there is no scheduler
+                    // to hand this to: mio registers the new socket with
+                    // this same poll and services it from the same flat
+                    // loop. See `LossConfig::promotion`.
+                    let Some(p) = peers.remove(&peer) else {
+                        continue;
+                    };
                     promote_locally(
                         &mut poll,
                         &mut next_token,
@@ -1269,9 +1248,7 @@ fn run_pool_acceptor(
                         &mut token_index,
                     );
                 }
-                PromotionTarget::Remote(owner) => {
-                    relocate_to_owner(cfg.port, peer, p.conn, owner, &senders);
-                }
+                _ => {} // stays serviced off the shared listener
             }
         }
 
@@ -1345,7 +1322,6 @@ fn relocate_to_owner(
         eprintln!("[bench-mio] relocate {peer}: owner {owner} channel closed");
     } else {
         HANDOFF_COUNT.fetch_add(1, Ordering::Relaxed);
-        PROMOTION_COUNT.fetch_add(1, Ordering::Relaxed);
     }
 }
 

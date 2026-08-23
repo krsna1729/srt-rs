@@ -191,21 +191,27 @@ pub struct LossConfig {
     /// to deliberately reproduce concurrent-arrival admission behavior,
     /// including the storm pathology itself, for targeted testing.
     pub connect_concurrency: usize,
-    /// Receiver only, `ReuseportMulti` only. When true, every connection
-    /// is promoted to its own connected socket (and, on task-based
-    /// runtimes, its own task) at its first `Connected` event. When false
-    /// (the default), only a bonded leg that must relocate to another
-    /// worker is ever promoted, and everything else is serviced off the
-    /// shared listener by peer-address dispatch.
+    /// Receiver only, `ReuseportMulti` only. Which connections get their
+    /// own connected socket (and, on task-based runtimes, their own task)
+    /// at their first `Connected` event. The modes nest:
     ///
-    /// This exists as a switch rather than a decision because the two
-    /// designs trade off against each other and the balance is
-    /// runtime-dependent: promoting buys independent scheduling (which
-    /// only helps runtimes that actually have a task scheduler), and
-    /// costs socket churn plus SO_REUSEPORT group perturbation (see
-    /// crates/srt-transport/tests/reuseport_rehash.rs). Measure per
-    /// runtime; do not assume.
-    pub promote_all: bool,
+    /// - `Never`: nothing is ever promoted; every connection is serviced
+    ///   off the shared listener by peer-address dispatch, and bonded
+    ///   legs stay wherever the kernel hashed them (affinity abandoned).
+    ///   Diagnostic control: measures what affinity + relocation buy.
+    /// - `Relocate` (the default): only a bonded leg whose group owner is
+    ///   a *different* worker thread gets promoted, because physically
+    ///   moving between reactors requires an fd the destination can
+    ///   register. The reuseport group stays frozen at K otherwise.
+    /// - `Bonded`: same as `Relocate`, plus bonded legs that already
+    ///   landed on their owner are promoted locally too. Needs high
+    ///   bond density to have statistical power.
+    /// - `All`: everything promotes. Buys per-connection independent
+    ///   scheduling -- which only helps runtimes that actually have a
+    ///   task scheduler -- and costs socket churn plus SO_REUSEPORT
+    ///   group perturbation (see crates/srt-transport/tests/
+    ///   reuseport_rehash.rs). Measure per runtime; do not assume.
+    pub promotion: Promotion,
     /// Receiver only, `ReuseportMulti` only. Route a handshake datagram
     /// to the acceptor named by its SYN cookie when the kernel delivers
     /// it to the wrong one (see `srt_lifecycle::cookie_for_worker`).
@@ -237,6 +243,22 @@ pub enum Ingress {
     SharedPool(usize),
     ReuseportMulti(usize),
     ReuseportSingle { workers: usize },
+}
+
+/// See [`LossConfig::promotion`]. The modes nest:
+/// `Never` ⊂ `Relocate` ⊂ `Bonded` ⊂ `All` -- each adds one population of
+/// connections that get a private connected socket at first `Connected`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Promotion {
+    /// Nothing ever promotes; bonded affinity is abandoned (legs stay
+    /// wherever the kernel hashed them). Diagnostic control.
+    Never,
+    /// Only bonded legs whose owner is a different worker thread.
+    Relocate,
+    /// All bonded legs (relocating ones still relocate).
+    Bonded,
+    /// Every connection.
+    All,
 }
 
 /// Bond group type to advertise in the sender's handshake extension. See
@@ -416,7 +438,7 @@ pub fn bench_config_from_args() -> LossConfig {
              [bitrate_bps] [--connections N] \
              [--ingress per-port|shared-pool=K|reuseport-multi=K|reuseport-single=W] \
              [--bond broadcast:G|backup:G|none] [--batch on|off] \
-             [--connect-concurrency N] [--promote-all on|off] [--cookie-routing on|off] [--sock-buf N|Nk|Nm|default]"
+             [--connect-concurrency N] [--promotion never|relocate|bonded|all] [--cookie-routing on|off] [--sock-buf N|Nk|Nm|default]"
         );
         std::process::exit(2)
     }
@@ -525,12 +547,14 @@ pub fn bench_config_from_args() -> LossConfig {
         Some(raw) => parse_positive("connect-concurrency", raw),
     };
 
-    let promote_all = match cli.flags.get("promote-all").map(String::as_str) {
-        None | Some("off") => false,
-        // Bare `--promote-all` parses to an empty value.
-        Some("") | Some("on") => true,
+    let promotion = match cli.flags.get("promotion").map(String::as_str) {
+        // Bare `--promotion` parses to an empty value.
+        None | Some("") | Some("relocate") => Promotion::Relocate,
+        Some("never") => Promotion::Never,
+        Some("bonded") => Promotion::Bonded,
+        Some("all") => Promotion::All,
         Some(other) => {
-            eprintln!("error: unknown --promote-all '{other}' (want on|off)");
+            eprintln!("error: unknown --promotion '{other}' (want never|relocate|bonded|all)");
             usage()
         }
     };
@@ -578,7 +602,7 @@ pub fn bench_config_from_args() -> LossConfig {
         bond_pairs,
         batching,
         connect_concurrency,
-        promote_all,
+        promotion,
         cookie_routing,
         sock_buf_bytes,
     }
