@@ -72,10 +72,39 @@ pub fn is_ready(pin: &mut NativeTimer) -> bool {
 /// granted size can be smaller than asked.
 const SOCK_BUF_BYTES: usize = 16 << 20;
 
-/// Set 16 MB SO_RCVBUF/SO_SNDBUF on a raw fd, warning once if the host
-/// clamped the request smaller.
+/// Effective socket-buffer request, overridable once at startup by a
+/// harness that wants to measure buffer sizing as a variable rather than
+/// bake in [`SOCK_BUF_BYTES`]. `0` means "leave the OS default alone".
+///
+/// A process-wide value rather than a per-call parameter because every
+/// socket in a run should be sized the same way, and threading it through
+/// every `bind_reuseport`/promotion call site would add an argument to a
+/// dozen signatures to express one global experimental knob.
+static SOCK_BUF_REQUEST: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(SOCK_BUF_BYTES);
+
+/// Override the socket-buffer request for every subsequently created
+/// socket. `0` leaves the OS default untouched. Call once, before any
+/// socket is bound.
+pub fn set_sock_buf_bytes(bytes: usize) {
+    SOCK_BUF_REQUEST.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The socket-buffer request currently in effect.
+#[must_use]
+pub fn sock_buf_bytes() -> usize {
+    SOCK_BUF_REQUEST.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set SO_RCVBUF/SO_SNDBUF on a raw fd to [`sock_buf_bytes`], warning
+/// once if the host clamped the request smaller. A request of `0` leaves
+/// the OS default in place and does nothing.
 pub fn set_sock_bufs(fd: std::os::fd::RawFd) -> std::io::Result<()> {
-    let v = SOCK_BUF_BYTES as libc::c_int;
+    let requested = sock_buf_bytes();
+    if requested == 0 {
+        return Ok(());
+    }
+    let v = requested as libc::c_int;
     let len = std::mem::size_of_val(&v) as libc::socklen_t;
     unsafe {
         let r = libc::setsockopt(
@@ -108,11 +137,8 @@ pub fn set_sock_bufs(fd: std::os::fd::RawFd) -> std::io::Result<()> {
             &mut got as *mut _ as *mut libc::c_void,
             &mut got_len,
         );
-        if r == 0 && (got as usize) < SOCK_BUF_BYTES {
-            eprintln!(
-                "SO_RCVBUF clamped by host to {} (requested {})",
-                got, SOCK_BUF_BYTES
-            );
+        if r == 0 && (got as usize) < requested {
+            eprintln!("SO_RCVBUF clamped by host to {got} (requested {requested})");
         }
     }
     Ok(())

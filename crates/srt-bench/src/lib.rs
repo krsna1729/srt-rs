@@ -212,6 +212,15 @@ pub struct LossConfig {
     /// Defaults on; the switch exists so the rescue can be measured
     /// against not having it.
     pub cookie_routing: bool,
+    /// SO_RCVBUF/SO_SNDBUF request for every socket, in bytes. `0` leaves
+    /// the OS default alone.
+    ///
+    /// Exists to test a specific claim: once connections are promoted to
+    /// their own sockets, the shared listener carries only handshake
+    /// traffic, so its buffer should stop needing to be large. If that
+    /// holds, the big buffer is load-bearing only for the non-promoting
+    /// designs, and this stops being a tuning knob for the others.
+    pub sock_buf_bytes: usize,
 }
 
 /// See [`LossConfig::batching`].
@@ -407,7 +416,7 @@ pub fn bench_config_from_args() -> LossConfig {
              [bitrate_bps] [--connections N] \
              [--ingress per-port|shared-pool=K|reuseport-multi=K|reuseport-single=W] \
              [--bond broadcast:G|backup:G|none] [--batch on|off] \
-             [--connect-concurrency N] [--promote-all on|off] [--cookie-routing on|off]"
+             [--connect-concurrency N] [--promote-all on|off] [--cookie-routing on|off] [--sock-buf N|Nk|Nm|default]"
         );
         std::process::exit(2)
     }
@@ -535,6 +544,26 @@ pub fn bench_config_from_args() -> LossConfig {
         }
     };
 
+    let sock_buf_bytes = match cli.flags.get("sock-buf").map(String::as_str) {
+        None => 16 << 20,
+        Some("default") | Some("0") => 0,
+        Some(raw) => {
+            let (digits, scale) = match raw.strip_suffix(['m', 'M']) {
+                Some(d) => (d, 1 << 20),
+                None => (raw.strip_suffix(['k', 'K']).unwrap_or(raw), 1),
+            };
+            let scale = if digits.len() == raw.len() { 1 } else { scale };
+            match digits.parse::<usize>() {
+                Ok(n) => n * scale,
+                Err(_) => {
+                    eprintln!("error: --sock-buf wants bytes, <N>k, <N>m, or 'default'");
+                    usage()
+                }
+            }
+        }
+    };
+    srt_transport::set_sock_buf_bytes(sock_buf_bytes);
+
     LossConfig {
         runtime,
         mode,
@@ -551,5 +580,6 @@ pub fn bench_config_from_args() -> LossConfig {
         connect_concurrency,
         promote_all,
         cookie_routing,
+        sock_buf_bytes,
     }
 }
