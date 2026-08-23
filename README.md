@@ -137,13 +137,20 @@ downstream tool re-parses stdout. Field meanings:
 
 ## Measured baselines
 
-[`docs/baseline-2026-08-23.md`](docs/baseline-2026-08-23.md) — ingress
-strategy × runtime at 25 connections, with the raw TSV beside it. Short
-version: at this scale `shared-pool` wins on delivery, CPU and memory
-across all six runtimes; `reuseport-multi` needs `--promotion=all` before
-four of the six deliver at all; and the reuseport strategies have not yet
-justified their cost at this fan-in. Rankings hold only within that
-measurement window.
+- [`docs/baseline-2026-08-23.md`](docs/baseline-2026-08-23.md) — ingress
+  strategy × runtime at 25 connections. `shared-pool` wins on delivery,
+  CPU and memory across all six; `reuseport-multi` needs
+  `--promotion=all` before four of the six deliver at all.
+- [`docs/scaling-ladder-2026-08-23.md`](docs/scaling-ladder-2026-08-23.md)
+  — the same matrix pushed to 1200 connections at constant aggregate
+  bandwidth, to find where each runtime breaks. tokio, smol and mio reach
+  1200 intact; compio collapses into multi-second latency on the
+  reuseport strategies; monoio stops accepting (851/1200) and drops to
+  16% on shared-pool; glommio fails at *low* N and recovers as N rises,
+  which identifies its limit as packet rate rather than connection count.
+
+Raw TSVs sit beside each report. Rankings hold only within one
+measurement window on a shared-tenant box.
 
 ## Testing
 
