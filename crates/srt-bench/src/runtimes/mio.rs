@@ -508,24 +508,57 @@ fn drive(cfg: LossConfig, mine: Vec<usize>, start: Instant) -> Vec<ConnStats> {
 /// listener ports (no SO_REUSEPORT). Every one stays unconnected for its
 /// whole life; connections `i` and `i+K`, `i+2K`, ... share socket `i % K`
 /// and are distinguished purely by peer address (`recv_from` + a
-/// `SocketAddr -> connection` lookup, `send_to` for output). Single
-/// thread, no promotion step -- this isolates "fewer wakeups from fewer
+/// `SocketAddr -> connection` lookup, `send_to` for output). One thread
+/// by default (`--workers`), no promotion step -- this isolates "fewer wakeups from fewer
 /// sockets" from `ReuseportMulti`'s "kernel-level demux after a one-time
 /// promotion cost." Receiver-only: a sender just dials the port
 /// `addr_for` already computes for it and otherwise behaves exactly like
 /// `PerPort` (own local socket per connection, connected to one peer).
 fn run_shared_pool(cfg: LossConfig, k: usize) {
     let start = Instant::now();
+    let agg_cfg = cfg.clone();
+    // K pool sockets across `--workers` OS threads, each with its own
+    // `Poll`. `workers = 1` (the default) keeps every socket on one
+    // thread, preserving this strategy's role as the single-threaded
+    // control. Above 1 it scales, which a strong sender needs: measured
+    // at 400 conns x 8 Mbps, one listener thread delivers 13% with 1.6M
+    // kernel rcvbuf drops while two deliver 99.9% with none.
+    let threads = cfg.workers.clamp(1, k);
+    let stats = crate::run_shards(threads, k, move |mine| {
+        let cfg = cfg.clone();
+        run_shared_pool_shard(&cfg, &mine, start)
+    });
+
+    let mut agg = Aggregate::new(agg_cfg);
+    for s in stats {
+        agg.add(s);
+    }
+    agg.print(start);
+    if !agg.any_connected {
+        eprintln!("[bench-mio] shared pool admitted no connections");
+        std::process::exit(1);
+    }
+}
+
+/// One worker's share of the pool sockets, on its own `Poll`.
+///
+/// `mine` names the *pool* sockets this worker owns; inside, sockets are
+/// addressed by their position in `sockets`, which is what the poll token
+/// carries. The two only coincide when there is a single worker.
+fn run_shared_pool_shard(cfg: &LossConfig, mine: &[usize], start: Instant) -> Vec<ConnStats> {
     let mut poll = Poll::new().expect("mio Poll::new");
     let mut events = Events::with_capacity(1024);
 
-    let mut sockets: Vec<UdpSocket> = Vec::with_capacity(k);
-    for s in 0..k {
-        let addr = SocketAddr::new(std::net::IpAddr::from([0, 0, 0, 0]), cfg.port + s as u16);
+    let mut sockets: Vec<UdpSocket> = Vec::with_capacity(mine.len());
+    for (token, &pool_index) in mine.iter().enumerate() {
+        let addr = SocketAddr::new(
+            std::net::IpAddr::from([0, 0, 0, 0]),
+            cfg.port + pool_index as u16,
+        );
         let mut socket = UdpSocket::bind(addr).expect("bind shared-pool socket");
         let _ = srt_transport::set_sock_bufs(socket.as_raw_fd(), cfg.sock_buf_bytes);
         poll.registry()
-            .register(&mut socket, Token(s), Interest::READABLE)
+            .register(&mut socket, Token(token), Interest::READABLE)
             .expect("register shared-pool socket");
         sockets.push(socket);
     }
@@ -641,7 +674,7 @@ fn run_shared_pool(cfg: LossConfig, k: usize) {
         }
     }
 
-    let mut agg = Aggregate::new(cfg.clone());
+    let mut out = Vec::with_capacity(conns.len());
     for conn in conns.into_values() {
         let mut s = ConnStats {
             // stream_deadline is Some as soon as Connected has ever fired
@@ -659,13 +692,9 @@ fn run_shared_pool(cfg: LossConfig, k: usize) {
             s.secondary_b = st.total_duplicates;
             s.rtt_us = st.rtt as u64;
         }
-        agg.add(s);
+        out.push(s);
     }
-    agg.print(start);
-    if !agg.any_connected {
-        eprintln!("[bench-mio] shared pool admitted no connections");
-        std::process::exit(1);
-    }
+    out
 }
 
 /// One accepted connection on an acceptor thread: dedicated socket

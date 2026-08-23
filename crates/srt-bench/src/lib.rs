@@ -152,7 +152,11 @@ pub struct LossConfig {
     ///   entire connection lifetime via `recv_from` + a peer-address
     ///   lookup. No SO_REUSEPORT, no promotion -- isolates the benefit of
     ///   fewer wakeups from the benefit of kernel-level demux (that's
-    ///   `ReuseportMulti`'s job). Single-threaded.
+    ///   `ReuseportMulti`'s job). Single-threaded at the default
+    ///   `--workers 1`, which is what makes it that control; above 1 the
+    ///   K sockets are dealt across that many OS threads, because one
+    ///   thread is a hard throughput ceiling and a sender strong enough
+    ///   to cross it produces a collapse rather than a legible limit.
     /// - `ReuseportMulti(K)`: one shared port via SO_REUSEPORT. K acceptor
     ///   threads each admit their kernel-hash-routed share of flows in
     ///   parallel, then promote each connection to its own connected
@@ -258,11 +262,30 @@ pub struct LossConfig {
     /// sender always, and to a `PerPort` receiver -- the shared-socket
     /// ingress strategies get their parallelism from their own K instead.
     pub workers: usize,
+    /// The role-scoped topology of the cell this process is part of,
+    /// recorded (not acted on) so that one result row states the whole
+    /// experiment. Empty unless the harness split that axis by role.
+    ///
+    /// Without this a listener row could not distinguish two cells that
+    /// differ only in how the *sender* was configured, and resume would
+    /// treat them as the same cell and skip one.
+    pub peer_topology: PeerTopology,
     /// Emulated network conditions. Recorded by every process; only the
     /// matrix harness acts on them, and only inside a private network
     /// namespace -- an individual bench process never touches the host's
     /// networking.
     pub link: Link,
+}
+
+/// Role-scoped values for axes the harness split, as recorded in results.
+#[derive(Clone, Debug, Default)]
+pub struct PeerTopology {
+    pub recv_runtime: String,
+    pub send_runtime: String,
+    pub recv_ingress: String,
+    pub send_ingress: String,
+    pub recv_workers: String,
+    pub send_workers: String,
 }
 
 /// Link conditions to emulate, one field per `--link-*` flag. Empty means
@@ -394,6 +417,37 @@ pub struct ConnStats {
 }
 
 /// Accumulates ConnStats across connections and renders the STATS line.
+/// Spread `count` indices across `threads` OS threads, round-robin, and
+/// collect what each returns.
+///
+/// The socket-side twin of [`run_workers`], which shards *connections*.
+/// A pooled listener shards its *sockets*, so it needs the same dealing
+/// but over a different set.
+pub fn run_shards<F>(threads: usize, count: usize, body: F) -> Vec<ConnStats>
+where
+    F: Fn(Vec<usize>) -> Vec<ConnStats> + Send + Sync + 'static,
+{
+    let threads = threads.clamp(1, count.max(1));
+    let indices = |w: usize| -> Vec<usize> { (w..count).step_by(threads).collect() };
+    if threads == 1 {
+        return body(indices(0));
+    }
+    let body = std::sync::Arc::new(body);
+    let handles: Vec<_> = (0..threads)
+        .map(|w| {
+            let (body, mine) = (std::sync::Arc::clone(&body), indices(w));
+            std::thread::Builder::new()
+                .name(format!("bench-pool{w}"))
+                .spawn(move || body(mine))
+                .expect("spawn pool shard")
+        })
+        .collect();
+    handles
+        .into_iter()
+        .flat_map(|h| h.join().unwrap_or_default())
+        .collect()
+}
+
 /// Spread `cfg.connections` across `cfg.workers` OS threads, each running
 /// `body` with the connection indices it owns, and collect every
 /// connection's stats.
@@ -743,6 +797,24 @@ pub fn bench_config_from_args() -> LossConfig {
 
     let workers = cli.flag_or("workers", 1usize).max(1);
 
+    let scoped = |name: &str| -> String {
+        cli.flags.get(name).cloned().unwrap_or_default()
+    };
+    // The harness records under the axis name (`runtime`); a human types
+    // the plural flag (`--recv-runtimes`, matching `--runtimes`).
+    let scoped_runtime = |name: &str, plural: &str| -> String {
+        let v = scoped(name);
+        if v.is_empty() { scoped(plural) } else { v }
+    };
+    let peer_topology = PeerTopology {
+        recv_runtime: scoped_runtime("recv-runtime", "recv-runtimes"),
+        send_runtime: scoped_runtime("send-runtime", "send-runtimes"),
+        recv_ingress: scoped("recv-ingress"),
+        send_ingress: scoped("send-ingress"),
+        recv_workers: scoped("recv-workers"),
+        send_workers: scoped("send-workers"),
+    };
+
     let link_flag = |name: &str| -> String {
         cli.flags
             .get(name)
@@ -790,6 +862,7 @@ pub fn bench_config_from_args() -> LossConfig {
         cpus,
         pin,
         workers,
+        peer_topology,
         link,
     }
 }

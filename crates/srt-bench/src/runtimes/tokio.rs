@@ -856,26 +856,42 @@ fn run_shared_pool(cfg: LossConfig, k: usize) {
     let start = Instant::now();
     println!("LISTENING");
     let agg_cfg = cfg.clone();
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio current_thread runtime");
-    let stats = rt.block_on(tokio::task::LocalSet::new().run_until(async move {
-        let mut tasks = Vec::new();
-        for index in 0..k {
-            let cfg = cfg.clone();
-            tasks.push(tokio::task::spawn_local(async move {
-                serve_pool_socket(cfg, index, start).await
-            }));
-        }
-        let mut all = Vec::new();
-        for t in tasks {
-            if let Ok(s) = t.await {
-                all.extend(s);
+    // K pool sockets across `--workers` OS threads. `workers = 1` (the
+    // default) keeps every socket on one thread, which is what makes this
+    // strategy the single-threaded control it was designed to be: it
+    // isolates "fewer wakeups" from "kernel-level demux", which is
+    // ReuseportMulti's job.
+    //
+    // But one thread is also a hard ceiling, and a sender strong enough to
+    // exceed it does not look like a ceiling in the results -- it looks
+    // like a collapse. Measured at 400 conns x 8 Mbps with the listener on
+    // its own cores: 2 sender workers deliver 94% with zero rcvbuf drops,
+    // 3 deliver 13% with 1.7M drops. Nothing about that reads as "one core
+    // was the limit" unless the knob to add a second one exists.
+    let threads = cfg.workers.clamp(1, k);
+    let stats = crate::run_shards(threads, k, move |mine| {
+        let cfg = cfg.clone();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio current_thread runtime");
+        rt.block_on(tokio::task::LocalSet::new().run_until(async move {
+            let mut tasks = Vec::new();
+            for index in mine {
+                let cfg = cfg.clone();
+                tasks.push(tokio::task::spawn_local(async move {
+                    serve_pool_socket(cfg, index, start).await
+                }));
             }
-        }
-        all
-    }));
+            let mut all = Vec::new();
+            for t in tasks {
+                if let Ok(s) = t.await {
+                    all.extend(s);
+                }
+            }
+            all
+        }))
+    });
 
     let mut agg = Aggregate::new(agg_cfg);
     for s in stats {

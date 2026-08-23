@@ -37,6 +37,12 @@ pub const COLUMNS: &[&str] = &[
     "link_corrupt",
     "link_limit",
     "workers",
+    "recv_runtime",
+    "send_runtime",
+    "recv_ingress",
+    "send_ingress",
+    "recv_workers",
+    "send_workers",
     "conns",
     "connect_cc",
     "bond",
@@ -163,6 +169,12 @@ pub fn append_result(
         cfg.link.get("corrupt").to_string(),
         cfg.link.get("limit").to_string(),
         cfg.workers.to_string(),
+        cfg.peer_topology.recv_runtime.clone(),
+        cfg.peer_topology.send_runtime.clone(),
+        cfg.peer_topology.recv_ingress.clone(),
+        cfg.peer_topology.send_ingress.clone(),
+        cfg.peer_topology.recv_workers.clone(),
+        cfg.peer_topology.send_workers.clone(),
         cfg.connections.to_string(),
         cfg.connect_concurrency.to_string(),
         describe_bond(cfg),
@@ -429,7 +441,41 @@ pub fn report(results: &[Record], group_by: &[String]) -> String {
 // ---------------------------------------------------------------------------
 
 /// One axis of the sweep: a name and the values to try.
-type Axis = (&'static str, Vec<String>);
+/// Which role an axis value applies to.
+///
+/// `Both` is the default and keeps the two ends in lockstep, which is
+/// what you want while looking for a ceiling: one number to move. `Recv`
+/// and `Send` appear only once a knob has been given a role-prefixed
+/// value, and then the two sides are genuinely independent axes -- the
+/// production shape, where ingest and egress are configured separately.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Scope {
+    Both,
+    Recv,
+    Send,
+}
+
+impl Scope {
+    /// Does a value with this scope reach the given role's process?
+    fn applies_to(self, role: Scope) -> bool {
+        self == Scope::Both || self == role
+    }
+
+    /// Column prefix used to record this scope's value.
+    fn prefix(self) -> &'static str {
+        match self {
+            Scope::Both => "",
+            Scope::Recv => "recv_",
+            Scope::Send => "send_",
+        }
+    }
+}
+
+type Axis = (&'static str, Scope, Vec<String>);
+
+/// One point in the sweep: every axis resolved to a value, with the role
+/// it applies to.
+type Cell<'a> = Vec<(&'a str, Scope, String)>;
 
 /// Find `count` consecutive free UDP ports and return the base.
 ///
@@ -522,12 +568,12 @@ fn recorded_as(axis: &str, value: &str) -> (&'static str, String) {
 }
 
 /// Identity of one (cell, rep) as it appears in a result file.
-fn cell_key(cell: &[(&str, String)], rep: usize) -> String {
+fn cell_key(cell: &[(&str, Scope, String)], rep: usize) -> String {
     let mut parts: Vec<String> = cell
         .iter()
-        .map(|(axis, value)| {
+        .map(|(axis, scope, value)| {
             let (col, v) = recorded_as(axis, value);
-            format!("{col}={v}")
+            format!("{}{col}={v}", scope.prefix())
         })
         .collect();
     parts.sort();
@@ -536,11 +582,12 @@ fn cell_key(cell: &[(&str, String)], rep: usize) -> String {
 }
 
 /// The same identity, read back off a recorded row.
-fn record_key(record: &Record, cell: &[(&str, String)], rep: usize) -> Option<String> {
+fn record_key(record: &Record, cell: &[(&str, Scope, String)], rep: usize) -> Option<String> {
     let mut parts: Vec<String> = Vec::with_capacity(cell.len());
-    for (axis, _) in cell {
+    for (axis, scope, _) in cell {
         let (col, _) = recorded_as(axis, "");
-        parts.push(format!("{col}={}", record.get(col)?));
+        let col = format!("{}{col}", scope.prefix());
+        parts.push(format!("{col}={}", record.get(&col)?));
     }
     parts.sort();
     parts.push(format!("rep={rep}"));
@@ -556,14 +603,27 @@ fn record_key(record: &Record, cell: &[(&str, String)], rep: usize) -> Option<St
 fn read_plan(path: &Path) -> std::io::Result<Vec<(String, Vec<String>)>> {
     let text = std::fs::read_to_string(path)?;
     let mut axes = Vec::new();
+    // `[recv]` / `[send]` scope the keys under them to one role, which is
+    // how a plan expresses an asymmetric topology -- a pooled listener
+    // against a sharded sender, say. Keys outside any section apply to
+    // both roles and move in lockstep.
+    let mut scope = String::new();
     for line in text.lines() {
         let line = line.split('#').next().unwrap_or("").trim();
         if line.is_empty() {
             continue;
         }
+        if let Some(section) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            scope = match section.trim() {
+                "recv" | "receiver" | "listener" => "recv-".to_string(),
+                "send" | "sender" | "caller" => "send-".to_string(),
+                _ => String::new(),
+            };
+            continue;
+        }
         if let Some((name, values)) = line.split_once('=') {
             axes.push((
-                name.trim().to_string(),
+                format!("{scope}{}", name.trim()),
                 values
                     .split(',')
                     .map(str::trim)
@@ -600,19 +660,6 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
     // Per-role CPU sets. Disjoint sets let the compute-bound side be
     // given cores without the other taking them back; see
     // docs/cpu-budget.md. Empty leaves the inherited mask alone.
-    let recv_cpus = cli
-        .flags
-        .get("recv-cpus")
-        .cloned()
-        .unwrap_or_else(|| cli.flags.get("cpus").cloned().unwrap_or_default());
-    let send_cpus = cli
-        .flags
-        .get("send-cpus")
-        .cloned()
-        .unwrap_or_else(|| cli.flags.get("cpus").cloned().unwrap_or_default());
-    if !recv_cpus.is_empty() || !send_cpus.is_empty() {
-        eprintln!("matrix: receiver CPUs [{recv_cpus}], sender CPUs [{send_cpus}]");
-    }
     let reps: usize = cli.flag_or("reps", 3);
     let secs: u64 = cli.flag_or("secs", 8);
     let latency: u16 = cli.flag_or("latency", 120);
@@ -628,16 +675,69 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
             .find(|(axis, _)| axis == name)
             .map(|(_, values)| values.clone())
     };
+
+    // CPU sets are a single value per role rather than an axis, but they
+    // must still be settable from a plan: a config key that is silently
+    // ignored is worse than one that fails.
+    let cpu_set = |role: &str| -> String {
+        from_plan(&format!("{role}-cpus"))
+            .or_else(|| from_plan("cpus"))
+            .and_then(|v| v.first().cloned())
+            .or_else(|| cli.flags.get(&format!("{role}-cpus")).cloned())
+            .or_else(|| cli.flags.get("cpus").cloned())
+            .unwrap_or_default()
+    };
+    let recv_cpus = cpu_set("recv");
+    let send_cpus = cpu_set("send");
+    if !recv_cpus.is_empty() || !send_cpus.is_empty() {
+        eprintln!("matrix: receiver CPUs [{recv_cpus}], sender CPUs [{send_cpus}]");
+    }
     let axis = |name: &'static str, flag: &str, default: &str| -> Axis {
         (
             name,
+            Scope::Both,
             from_plan(name).unwrap_or_else(|| axis_values(cli, flag, default)),
         )
     };
 
-    let axes: Vec<Axis> = vec![
-        axis("runtime", "runtimes", "mio"),
-        axis("ingress", "ingress", "per-port"),
+    // Topology knobs that mean different things to each end. Given
+    // unprefixed they stay ONE axis applied to both roles, so the two move
+    // in lockstep and the cell count does not change. Given `--recv-x` or
+    // `--send-x` (or a `[recv]`/`[send]` plan section) they split into two
+    // independent axes -- which is a genuine cartesian product, and is the
+    // only way to express "pooled listener, sharded sender".
+    //
+    // Splitting matters because these knobs are not symmetric in the first
+    // place: `ingress` is a listener concept the sender only mirrors, and
+    // `workers` reaches the listener's loop on `per-port` but not on the
+    // pooled strategies. Holding them equal conflates the two ends and
+    // hides whichever one is the constraint.
+    let mut split_axes: Vec<Axis> = Vec::new();
+    let role_axis = |name: &'static str, flag: &str, default: &str, out: &mut Vec<Axis>| {
+        let per_role = |prefix: &str| -> Option<Vec<String>> {
+            from_plan(&format!("{prefix}{name}"))
+                .or_else(|| cli.flags.get(&format!("{prefix}{flag}")).filter(|v| !v.is_empty())
+                    .map(|v| v.split(',').map(str::trim).map(str::to_string).collect()))
+        };
+        let (recv, send) = (per_role("recv-"), per_role("send-"));
+        if recv.is_none() && send.is_none() {
+            out.push((
+                name,
+                Scope::Both,
+                from_plan(name).unwrap_or_else(|| axis_values(cli, flag, default)),
+            ));
+            return;
+        }
+        let shared = from_plan(name).unwrap_or_else(|| axis_values(cli, flag, default));
+        out.push((name, Scope::Recv, recv.unwrap_or_else(|| shared.clone())));
+        out.push((name, Scope::Send, send.unwrap_or(shared)));
+    };
+    role_axis("runtime", "runtimes", "mio", &mut split_axes);
+    role_axis("ingress", "ingress", "per-port", &mut split_axes);
+    role_axis("workers", "workers", "1", &mut split_axes);
+
+    let mut axes: Vec<Axis> = split_axes;
+    axes.extend([
         axis("promotion", "promotion", "relocate"),
         axis("cookie-routing", "cookie-routing", "on"),
         axis("batch", "batch", "on"),
@@ -651,22 +751,21 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
         axis("link-duplicate", "link-duplicate", "off"),
         axis("link-corrupt", "link-corrupt", "off"),
         axis("link-limit", "link-limit", "off"),
-        axis("workers", "workers", "1"),
         axis("connections", "connections", "25"),
         axis("connect-concurrency", "connect-concurrency", "1"),
         axis("bond", "bond", "none"),
         axis("bitrate", "bitrate", "8000000"),
-    ];
+    ]);
 
     // Cartesian product, expanded eagerly: the whole point is to know how
     // many cells there are before starting a long sweep.
-    let mut cells: Vec<Vec<(&str, String)>> = vec![Vec::new()];
-    for (name, values) in &axes {
+    let mut cells: Vec<Cell> = vec![Vec::new()];
+    for (name, scope, values) in &axes {
         let mut next = Vec::new();
         for base in &cells {
             for v in values {
                 let mut row = base.clone();
-                row.push((name, v.clone()));
+                row.push((name, *scope, v.clone()));
                 next.push(row);
             }
         }
@@ -704,10 +803,10 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
     // `netem=none` ones: a namespace's loopback is not identical to the
     // host's, so mixing the two would confound the comparison the sweep
     // exists to make.
-    let cell_link = |cell: &[(&str, String)], flag: &str| -> Option<String> {
+    let cell_link = |cell: &[(&str, Scope, String)], flag: &str| -> Option<String> {
         cell.iter()
-            .find(|(a, _)| *a == flag)
-            .map(|(_, v)| v.clone())
+            .find(|(a, _, _)| *a == flag)
+            .map(|(_, _, v)| v.clone())
     };
     // Fail before the first cell rather than midway through a sweep.
     let mut any_link = false;
@@ -731,18 +830,35 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
 
     let mut skipped = 0usize;
     for (index, cell) in cells.iter().enumerate() {
-        let label: Vec<String> = cell.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        let label: Vec<String> = cell
+            .iter()
+            .map(|(k, scope, v)| format!("{}{k}={v}", scope.prefix().replace('_', "-")))
+            .collect();
+        // Resolve one axis for one role: its role-scoped value if the axis
+        // was split, otherwise the shared one.
+        let for_role = |name: &str, role: Scope, default: &str| -> String {
+            cell.iter()
+                .find(|(k, scope, _)| *k == name && *scope == role)
+                .or_else(|| cell.iter().find(|(k, scope, _)| *k == name && *scope == Scope::Both))
+                .map_or_else(|| default.to_string(), |(_, _, v)| v.clone())
+        };
         let value = |name: &str| -> Option<String> {
             cell.iter()
-                .find(|(k, _)| *k == name)
-                .map(|(_, v)| v.clone())
+                .find(|(k, _, _)| *k == name)
+                .map(|(_, _, v)| v.clone())
         };
-        let ingress = value("ingress").unwrap_or_else(|| "per-port".into());
+        let recv_ingress = for_role("ingress", Scope::Recv, "per-port");
+        let send_ingress = for_role("ingress", Scope::Send, "per-port");
+        let recv_runtime = for_role("runtime", Scope::Recv, "mio");
+        let send_runtime = for_role("runtime", Scope::Send, "mio");
         let conns_in_cell: usize = value("connections")
             .and_then(|v| v.parse().ok())
             .unwrap_or(1);
         let bitrate = value("bitrate").unwrap_or_else(|| "8000000".into());
-        let runtime = value("runtime").unwrap_or_else(|| "mio".into());
+        // Port budget and support checks follow the LISTENER: it is the
+        // side that binds.
+        let ingress = recv_ingress.clone();
+        let runtime = recv_runtime.clone();
         // per-port needs one port per connection; the pooled and
         // reuseport strategies need at most K. Ask for the worst case
         // this cell could use.
@@ -760,6 +876,9 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
         if !crate::runtimes::ingress_supported(
             crate::Runtime::parse(&runtime).unwrap_or(crate::Runtime::Mio),
             parse_ingress_spec(&ingress),
+        ) || !crate::runtimes::ingress_supported(
+            crate::Runtime::parse(&send_runtime).unwrap_or(crate::Runtime::Mio),
+            parse_ingress_spec(&send_ingress),
         ) {
             skipped += 1;
             eprintln!("[skip] {} (unsupported)", label.join(" "));
@@ -773,16 +892,27 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
                 netem_apply(p, netem_args(|f| cell_link(cell, f)).map_err(std::io::Error::other)?)?;
             }
             let port = free_port_range(ports_needed)?;
-            let flags: Vec<String> = cell
-                .iter()
-                .filter(|(k, _)| *k != "bitrate")
-                .map(|(k, v)| format!("--{k}={v}"))
-                .collect();
-            let common: Vec<String> = flags
-                .iter()
-                .filter(|f| !f.starts_with("--runtime="))
-                .cloned()
-                .collect();
+            // Each role gets the axes scoped to it plus the shared ones.
+            // Both roles additionally get every split axis's *other* side
+            // as a record-only `--recv-*`/`--send-*` flag, so a single row
+            // states the whole cell -- without which two cells differing
+            // only on the far side would be indistinguishable, and resume
+            // would skip one of them.
+            let argv_for = |role: Scope| -> Vec<String> {
+                let mut out: Vec<String> = cell
+                    .iter()
+                    .filter(|(k, scope, _)| *k != "bitrate" && *k != "runtime" && scope.applies_to(role))
+                    .map(|(k, _, v)| format!("--{k}={v}"))
+                    .collect();
+                for (k, scope, v) in cell {
+                    if *scope != Scope::Both {
+                        out.push(format!("--{}{k}={v}", scope.prefix().replace('_', "-")));
+                    }
+                }
+                out
+            };
+            let recv_argv = argv_for(Scope::Recv);
+            let send_argv = argv_for(Scope::Send);
 
             // Receiver outlives the sender so it is still listening when
             // the last packets arrive; +5s mirrors the old harness.
@@ -791,7 +921,7 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
             } else {
                 std::process::Command::new(&exe)
             }
-                .arg(format!("runtime={runtime}"))
+                .arg(format!("runtime={recv_runtime}"))
                 .arg("mode=receiver")
                 .arg(port.to_string())
                 // Backstop only: the harness signals the real stop once
@@ -804,7 +934,7 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
                 // must record the same configured bitrate or a report
                 // grouping on it would split the pair and lose delivery%.
                 .arg(&bitrate)
-                .args(&common)
+                .args(&recv_argv)
                 .arg(format!("--rep={rep}"))
                 .arg(format!("--cpus={recv_cpus}"))
                 .arg(format!("--out={}", out.display()))
@@ -820,14 +950,14 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
             } else {
                 std::process::Command::new(&exe)
             }
-                .arg(format!("runtime={runtime}"))
+                .arg(format!("runtime={send_runtime}"))
                 .arg("mode=sender")
                 .arg("127.0.0.1")
                 .arg(port.to_string())
                 .arg(secs.to_string())
                 .arg(latency.to_string())
                 .arg(&bitrate)
-                .args(&common)
+                .args(&send_argv)
                 .arg(format!("--rep={rep}"))
                 .arg(format!("--cpus={send_cpus}"))
                 .arg(format!("--out={}", out.display()))

@@ -1,0 +1,36 @@
+# Ingest and egress are not the same shape.
+#
+# A real deployment configures them separately: a restreamer's ingest is a
+# few high-bitrate contributors onto pooled listener sockets, while its
+# egress fans out to many subscribers. Holding the two ends equal -- which
+# is all the CLI could express until now -- conflates them and hides
+# whichever one is the constraint.
+#
+# Keys outside any section apply to BOTH roles and move in lockstep, so
+# the cell count is unchanged. Keys under [recv] / [send] make that axis
+# independent for that role, which is a genuine cartesian product.
+#
+#   srt-bench matrix --plan docs/plans/asymmetric-roles.plan --secs 10 --out scratch/roles.tsv
+
+runtime             = tokio
+connections         = 400
+bitrate             = 8000000
+promotion           = all
+connect-concurrency = 50
+sock-buf            = 16m
+
+# The listener: pooled sockets, swept over how many threads serve them.
+# 1 is the historical single-threaded control; it is also a hard ceiling.
+[recv]
+ingress             = shared-pool:4
+workers             = 1,2,3
+cpus                = 0-2
+
+# The load generator: held at a level already shown to saturate a
+# single-threaded listener, so what moves is the listener's capacity and
+# not the offered load. Disjoint CPUs so the two ends cannot take cores
+# from each other.
+[send]
+ingress             = shared-pool:4
+workers             = 3
+cpus                = 3-5

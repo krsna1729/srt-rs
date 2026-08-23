@@ -897,24 +897,34 @@ fn run_shared_pool(cfg: LossConfig, k: usize) {
     let start = Instant::now();
     println!("LISTENING");
     let agg_cfg = cfg.clone();
-    let rt = compio::runtime::Runtime::builder()
-        .build()
-        .expect("compio runtime");
-    let stats = rt.block_on(async move {
-        let mut tasks = Vec::new();
-        for index in 0..k {
-            let cfg = cfg.clone();
-            tasks.push(compio::runtime::spawn(async move {
-                serve_pool_socket(cfg, index, start).await
-            }));
-        }
-        let mut all = Vec::new();
-        for t in tasks {
-            if let Ok(s) = t.await {
-                all.extend(s);
-            }
-        }
-        all
+    // K pool sockets across `--workers` OS threads. `workers = 1` (the
+    // default) keeps every socket on one thread, preserving this
+    // strategy's role as the single-threaded control. Above 1 it scales,
+    // which a strong sender needs: measured at 400 conns x 8 Mbps, one
+    // listener thread delivers 13% with 1.6M kernel rcvbuf drops while two
+    // deliver 99.9% with none.
+    let threads = cfg.workers.clamp(1, k);
+    let stats = crate::run_shards(threads, k, move |mine| {
+        let cfg = cfg.clone();
+        compio::runtime::Runtime::builder()
+            .build()
+            .expect("compio runtime")
+            .block_on(async move {
+                let mut tasks = Vec::new();
+                for index in mine {
+                    let cfg = cfg.clone();
+                    tasks.push(compio::runtime::spawn(async move {
+                        serve_pool_socket(cfg, index, start).await
+                    }));
+                }
+                let mut all = Vec::new();
+                for t in tasks {
+                    if let Ok(s) = t.await {
+                        all.extend(s);
+                    }
+                }
+                all
+            })
     });
 
     let mut agg = Aggregate::new(agg_cfg);
