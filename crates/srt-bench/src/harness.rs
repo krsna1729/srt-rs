@@ -28,6 +28,7 @@ pub const COLUMNS: &[&str] = &[
     "sock_buf",
     "cpus",
     "pin",
+    "netem",
     "conns",
     "connect_cc",
     "bond",
@@ -137,6 +138,7 @@ pub fn append_result(
         cfg.sock_buf_bytes.to_string(),
         srt_transport::available_cpus().to_string(),
         if cfg.pin { "on" } else { "off" }.into(),
+        cfg.netem.clone(),
         cfg.connections.to_string(),
         cfg.connect_concurrency.to_string(),
         describe_bond(cfg),
@@ -582,6 +584,7 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
         axis("batch", "batch", "on"),
         axis("sock-buf", "sock-buf", "16m"),
         axis("pin", "pin", "off"),
+        axis("netem", "netem", "none"),
         axis("connections", "connections", "25"),
         axis("connect-concurrency", "connect-concurrency", "1"),
         axis("bond", "bond", "none"),
@@ -629,6 +632,32 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
         }
     );
 
+
+    // Every cell of a netem sweep runs inside the namespace, including the
+    // `netem=none` ones: a namespace's loopback is not identical to the
+    // host's, so mixing the two would confound the comparison the sweep
+    // exists to make.
+    let netns = if cells
+        .iter()
+        .any(|cell| cell.iter().any(|(a, v)| *a == "netem" && v != "none"))
+    {
+        // Fail before the first cell rather than midway through a sweep.
+        for cell in &cells {
+            for (axis, value) in cell {
+                if *axis == "netem" && value != "none" {
+                    netem_args(value).map_err(std::io::Error::other)?;
+                }
+            }
+        }
+        let p = Priv::detect()
+            .ok_or_else(|| std::io::Error::other(netem_privilege_help()))?;
+        netns_up(p)?;
+        eprintln!("matrix: running roles inside netns '{NETNS}' (netem active)");
+        Some(p)
+    } else {
+        None
+    };
+
     let mut skipped = 0usize;
     for (index, cell) in cells.iter().enumerate() {
         let label: Vec<String> = cell.iter().map(|(k, v)| format!("{k}={v}")).collect();
@@ -669,6 +698,14 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
             if done.contains(&cell_key(cell, rep)) {
                 continue;
             }
+            if let Some(p) = netns {
+                netem_apply(
+                    p,
+                    cell.iter()
+                        .find(|(a, _)| *a == "netem")
+                        .map_or("none", |(_, v)| v.as_str()),
+                )?;
+            }
             let port = free_port_range(ports_needed)?;
             let flags: Vec<String> = cell
                 .iter()
@@ -683,7 +720,11 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
 
             // Receiver outlives the sender so it is still listening when
             // the last packets arrive; +5s mirrors the old harness.
-            let mut recv = std::process::Command::new(&exe)
+            let mut recv = if let Some(p) = netns {
+                in_netns(p, &exe)
+            } else {
+                std::process::Command::new(&exe)
+            }
                 .arg(format!("runtime={runtime}"))
                 .arg("mode=receiver")
                 .arg(port.to_string())
@@ -702,7 +743,11 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
 
             std::thread::sleep(std::time::Duration::from_millis(700));
 
-            let send = std::process::Command::new(&exe)
+            let send = if let Some(p) = netns {
+                in_netns(p, &exe)
+            } else {
+                std::process::Command::new(&exe)
+            }
                 .arg(format!("runtime={runtime}"))
                 .arg("mode=sender")
                 .arg("127.0.0.1")
@@ -730,10 +775,249 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
             );
         }
     }
+    if let Some(p) = netns {
+        netns_down(p);
+    }
     if skipped > 0 {
         eprintln!("matrix: skipped {skipped} unsupported cells");
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Emulated network conditions
+// ---------------------------------------------------------------------------
+
+/// Name of the private network namespace the harness runs roles in when a
+/// `--netem` spec is active.
+const NETNS: &str = "srtbench";
+
+/// Translate a `key=value,...` spec into `tc qdisc ... netem` arguments.
+///
+/// Deliberately a strict whitelist rather than a pass-through: these
+/// arguments are handed to `sudo`, so an unrecognised key or a value that
+/// is not a bare number with a known unit is rejected instead of
+/// forwarded. Recognised keys mirror the netem options that matter for a
+/// live streaming protocol:
+///
+/// - `delay` / `jitter` -- one-way latency and its variation. Loopback
+///   RTT is ~0, so nothing that depends on RTT estimation, on the ACK
+///   cadence, or on TLPKTDROP's deadline is otherwise under test.
+/// - `loss` -- what the whole retransmission path exists for.
+/// - `rate` -- a hard bottleneck, to produce genuine queueing rather
+///   than the CPU-bound saturation loopback gives.
+/// - `reorder` / `duplicate` -- the receiver's sequencing edge cases.
+/// - `limit` -- netem's own backlog, in packets. Defaults to 1000, which
+///   at these packet rates would silently make netem the bottleneck and
+///   attribute its drops to the protocol; we raise it unless asked
+///   otherwise.
+fn netem_args(spec: &str) -> Result<Vec<String>, String> {
+    /// A value is valid if some accepted unit suffix leaves a parseable
+    /// number behind. Testing every unit rather than the first that
+    /// strips matters: "100mbit" ends with "bit", and stopping there
+    /// would leave "100m".
+    fn valid(value: &str, units: &[&str]) -> bool {
+        units.iter().any(|unit| {
+            if unit.is_empty() {
+                return value.parse::<u64>().is_ok();
+            }
+            value
+                .strip_suffix(unit)
+                .is_some_and(|d| !d.is_empty() && d.parse::<f64>().is_ok())
+        })
+    }
+
+    const TIME: &[&str] = &["ms", "us", "s"];
+    const PCT: &[&str] = &["%"];
+    const RATE: &[&str] = &["bit", "kbit", "mbit", "gbit"];
+    const PLAIN: &[&str] = &[""];
+
+    let mut delay: Option<String> = None;
+    let mut jitter: Option<String> = None;
+    let mut limit = "100000".to_string();
+    let mut rest: Vec<(String, String)> = Vec::new();
+
+    for field in spec.split(',').map(str::trim).filter(|f| !f.is_empty()) {
+        let (key, value) = field
+            .split_once('=')
+            .ok_or_else(|| format!("netem: '{field}' is not key=value"))?;
+        let (key, value) = (key.trim(), value.trim());
+        let units: &[&str] = match key {
+            "delay" | "jitter" => TIME,
+            "loss" | "reorder" | "duplicate" | "corrupt" => PCT,
+            "rate" => RATE,
+            "limit" => PLAIN,
+            other => {
+                return Err(format!(
+                    "netem: unknown key '{other}' (delay, jitter, loss, rate, \
+                     reorder, duplicate, corrupt, limit)"
+                ));
+            }
+        };
+        if !valid(value, units) {
+            return Err(format!("netem: bad value '{value}' for '{key}'"));
+        }
+        match key {
+            "delay" => delay = Some(value.to_string()),
+            "jitter" => jitter = Some(value.to_string()),
+            "limit" => limit = value.to_string(),
+            _ => rest.push((key.to_string(), value.to_string())),
+        }
+    }
+
+    if jitter.is_some() && delay.is_none() {
+        return Err("netem: jitter= requires delay=".to_string());
+    }
+
+    let mut args = vec!["limit".to_string(), limit];
+    if let Some(d) = delay {
+        args.push("delay".to_string());
+        args.push(d);
+        if let Some(j) = jitter {
+            args.push(j);
+        }
+    }
+    for (k, v) in rest {
+        args.push(k);
+        args.push(v);
+    }
+    Ok(args)
+}
+
+/// How this process can reach the privileged operations netem needs
+/// (`ip netns`, `tc`). Resolved once per sweep.
+///
+/// Deliberately *not* solved with file capabilities on the binary:
+/// entering a namespace needs `CAP_SYS_ADMIN`, `cargo build` replaces the
+/// executable and silently drops any `setcap` grant, and a standing
+/// `CAP_SYS_ADMIN` on a benchmark that spawns child processes is a far
+/// wider grant than running one wrapper under sudo.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Priv {
+    /// Already running as root -- typically because the whole sweep was
+    /// started under `sudo ip netns exec`. Run the tools directly.
+    Root,
+    /// Not root, but `sudo -n` works. Prefix each privileged step.
+    Sudo,
+}
+
+impl Priv {
+    fn detect() -> Option<Self> {
+        if unsafe { libc::geteuid() } == 0 {
+            return Some(Self::Root);
+        }
+        std::process::Command::new("sudo")
+            .args(["-n", "true"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok()
+            .filter(std::process::ExitStatus::success)
+            .map(|_| Self::Sudo)
+    }
+
+    fn command(self, program: &str) -> std::process::Command {
+        match self {
+            Self::Root => std::process::Command::new(program),
+            Self::Sudo => {
+                let mut c = std::process::Command::new("sudo");
+                c.arg("-n").arg(program);
+                c
+            }
+        }
+    }
+}
+
+/// What to tell the user when neither route is available.
+fn netem_privilege_help() -> String {
+    let exe = std::env::args().next().unwrap_or_else(|| "srt-bench".into());
+    format!(
+        "--netem needs to create a private network namespace, which is a \
+         privileged operation.\n\
+         \n\
+         Either allow passwordless sudo, or set the namespace up once and \
+         run the sweep inside it:\n\
+         \n    sudo ip netns add {NETNS}\n\
+           sudo ip netns exec {NETNS} ip link set lo up\n\
+           sudo ip netns exec {NETNS} {exe} matrix ...\n\
+         \n\
+         Started that way the harness is already root, applies netem \
+         itself, and drops back to your uid for the bench processes so \
+         the result file stays yours."
+    )
+}
+
+/// Run one privileged setup step, returning a readable error on failure.
+fn privileged(p: Priv, args: &[&str]) -> std::io::Result<()> {
+    let (program, rest) = args.split_first().expect("non-empty command");
+    let out = p.command(program).args(rest).output()?;
+    if out.status.success() {
+        return Ok(());
+    }
+    Err(std::io::Error::other(format!(
+        "`{}` failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&out.stderr).trim()
+    )))
+}
+
+/// Create the namespace and bring its loopback up. Idempotent.
+fn netns_up(p: Priv) -> std::io::Result<()> {
+    // A leftover namespace from an interrupted run is reused, not an error.
+    let _ = privileged(p, &["ip", "netns", "add", NETNS]);
+    privileged(
+        p,
+        &["ip", "netns", "exec", NETNS, "ip", "link", "set", "lo", "up"],
+    )
+}
+
+fn netns_down(p: Priv) {
+    let _ = privileged(p, &["ip", "netns", "del", NETNS]);
+}
+
+/// Apply (or clear) the emulated conditions on the namespace's loopback.
+fn netem_apply(p: Priv, spec: &str) -> std::io::Result<()> {
+    let base = ["ip", "netns", "exec", NETNS, "tc", "qdisc"];
+    if spec == "none" {
+        let mut args: Vec<&str> = base.to_vec();
+        args.extend(["del", "dev", "lo", "root"]);
+        // Nothing to delete on the first cell; that is not a failure.
+        let _ = privileged(p, &args);
+        return Ok(());
+    }
+    let netem = netem_args(spec).map_err(std::io::Error::other)?;
+    let mut args: Vec<&str> = base.to_vec();
+    args.extend(["replace", "dev", "lo", "root", "netem"]);
+    let owned: Vec<&str> = netem.iter().map(String::as_str).collect();
+    args.extend(owned);
+    privileged(p, &args)
+}
+
+/// Wrap a role invocation so it runs inside the namespace, as the calling
+/// user rather than as root -- the child appends to the result file, and
+/// a root-owned result file would break every later run.
+fn in_netns(p: Priv, exe: &std::path::Path) -> std::process::Command {
+    // When the sweep itself was started under sudo, `SUDO_UID` names the
+    // human who ran it; otherwise we are already that user.
+    let uid = std::env::var("SUDO_UID")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or_else(|| unsafe { libc::getuid() });
+    let gid = std::env::var("SUDO_GID")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or_else(|| unsafe { libc::getgid() });
+
+    let mut cmd = p.command("ip");
+    cmd.args(["netns", "exec", NETNS]);
+    if uid != 0 {
+        cmd.arg("setpriv")
+            .arg(format!("--reuid={uid}"))
+            .arg(format!("--regid={gid}"))
+            .arg("--clear-groups");
+    }
+    cmd.arg(exe);
+    cmd
 }
 
 /// Re-parse an ingress spec as recorded in a result file (`:` separated).
@@ -862,4 +1146,62 @@ pub fn run_sysprof(cli: &crate::Cli) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+
+#[cfg(test)]
+mod netem_tests {
+    use super::netem_args;
+
+    #[test]
+    fn builds_tc_arguments_in_netem_order() {
+        assert_eq!(
+            netem_args("delay=25ms,jitter=5ms,loss=1%").unwrap(),
+            ["limit", "100000", "delay", "25ms", "5ms", "loss", "1%"]
+        );
+    }
+
+    #[test]
+    fn raises_the_backlog_unless_told_otherwise() {
+        // netem's default limit of 1000 packets would silently become the
+        // bottleneck at these packet rates and look like protocol loss.
+        assert_eq!(netem_args("loss=1%").unwrap()[..2], ["limit", "100000"]);
+        assert_eq!(
+            netem_args("loss=1%,limit=64").unwrap()[..2],
+            ["limit", "64"]
+        );
+    }
+
+    #[test]
+    fn accepts_every_rate_unit() {
+        for rate in ["1000bit", "100kbit", "100mbit", "1gbit"] {
+            assert!(
+                netem_args(&format!("rate={rate}")).is_ok(),
+                "rejected rate={rate}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_anything_it_would_have_to_forward_blindly() {
+        // These arguments are handed to a privileged command, so an
+        // unknown key or a non-numeric value must not pass through.
+        for spec in [
+            "loss=1%; rm -rf /",
+            "delay=$(whoami)",
+            "script=evil",
+            "loss=abc",
+            "delay=25",   // unit required
+            "loss=1",     // unit required
+            "rate=100mb", // not a netem unit
+            "delay",      // not key=value
+        ] {
+            assert!(netem_args(spec).is_err(), "accepted {spec:?}");
+        }
+    }
+
+    #[test]
+    fn jitter_without_delay_is_meaningless() {
+        assert!(netem_args("jitter=5ms").is_err());
+    }
 }

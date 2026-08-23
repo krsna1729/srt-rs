@@ -246,6 +246,15 @@ pub struct LossConfig {
     /// a real variable: glommio and monoio are thread-per-core designs
     /// that assume it, while the others do not.
     pub pin: bool,
+    /// Emulated network conditions, as a `tc-netem` spec (`"none"` when
+    /// unset). Must be given as `--netem=SPEC`, not `--netem SPEC`: the
+    /// value contains `=`, and a separate token containing `=` is parsed
+    /// as its own flag. Loopback has no loss and ~0 RTT, so the protocol's
+    /// loss-recovery and TLPKTDROP paths are barely exercised without
+    /// this. Applied by the matrix harness inside a private network
+    /// namespace -- an individual bench process only records the value,
+    /// it never touches the host's networking.
+    pub netem: String,
 }
 
 /// See [`LossConfig::batching`].
@@ -465,7 +474,7 @@ pub fn bench_config_from_args() -> LossConfig {
              [bitrate_bps] [--connections N] \
              [--ingress per-port|shared-pool=K|reuseport-multi=K|reuseport-single=W] \
              [--bond broadcast:G|backup:G|none] [--batch on|off] \
-             [--connect-concurrency N] [--promotion never|relocate|bonded|all] [--cookie-routing on|off] [--sock-buf N|Nk|Nm|default] [--out FILE] [--cpus 0-3|0,2,4] [--pin on|off]"
+             [--connect-concurrency N] [--promotion never|relocate|bonded|all] [--cookie-routing on|off] [--sock-buf N|Nk|Nm|default] [--out FILE] [--cpus 0-3|0,2,4] [--pin on|off] [--netem=delay=25ms,jitter=5ms,loss=1%,rate=100mbit]"
         );
         std::process::exit(2)
     }
@@ -636,6 +645,13 @@ pub fn bench_config_from_args() -> LossConfig {
         Some("") | Some("on")
     );
 
+    let netem = cli
+        .flags
+        .get("netem")
+        .filter(|v| !v.is_empty())
+        .cloned()
+        .unwrap_or_else(|| "none".to_string());
+
     let out = cli
         .flags
         .get("out")
@@ -664,5 +680,6 @@ pub fn bench_config_from_args() -> LossConfig {
         rep,
         cpus,
         pin,
+        netem,
     }
 }
