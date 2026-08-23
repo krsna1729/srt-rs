@@ -3,13 +3,35 @@
 //!
 //! # Architecture
 //!
-//! Two layers:
+//! This crate owns *things*; `srt-lifecycle` owns *decisions*. That is
+//! the dividing line, not subject matter -- both deal with admission.
+//! Live `SrtConnection`s, their timers, and file descriptors live here,
+//! which is why the admission peer table does too even though the
+//! promotion rule it consults lives in lifecycle. Mechanism depends on
+//! policy; policy never depends back.
+//!
+//! ```text
+//!   srt-bench ──► srt-transport ──► srt-lifecycle ──► srt-protocol
+//!                      │                                   ▲
+//!                      └───────────────────────────────────┘
+//! ```
+//!
+//! Three layers:
 //!
 //! 1. **Shared utilities** (always compiled, no runtime deps): `is_ready`,
-//!    `NativeTimer` type alias, `ManualTimerStore`. Protocol-level primitives
-//!    that all runtimes need.
+//!    `NativeTimer` type alias, `ManualTimerStore`, `bind_reuseport`,
+//!    `recvmsg_batch`. Protocol-level primitives that all runtimes need.
 //!
-//! 2. **Per-runtime `Conn` structs** (feature-gated): each wraps
+//! 2. **Admission machinery** (always compiled, runtime-neutral, performs
+//!    no I/O itself -- the caller does every send): `PeerTable` and
+//!    `AdmissionPeer` track peers from first datagram until promotion or
+//!    retirement; `poll_outbound`/`drain_events` are the maintenance tick
+//!    with only the datagrams handed back; `Handoff`/`WorkerMessage` are
+//!    the acceptor-to-worker protocol, carrying `Send`-safe parts so a
+//!    cross-thread move is correct by construction; `IngressTelemetry`
+//!    defines the counters and the report line once.
+//!
+//! 3. **Per-runtime `Conn` structs** (feature-gated): each wraps
 //!    `SrtConnection` + runtime-specific socket + runtime-specific timer.
 //!    Provides `fire_expired`, `drain_outputs`, `send_paced`,
 //!    `recv_with_timeout`.

@@ -40,7 +40,7 @@
 //! wrong "KNOWN LIMITATION" note here).
 //!
 //! With the default bond-only promotion, #4 under-delivers badly at
-//! bench.sh's 8Mbps/conn -- at N=25 the listener took only 49.4% of what
+//! the default 8Mbps/conn -- at N=25 the listener took only 49.4% of what
 //! the caller sent. That was blamed here on per-datagram io_uring submissions
 //! being intrinsically too costly per packet. That explanation was wrong.
 //! Raising K changes nothing (measured identical for K=2..25), and this

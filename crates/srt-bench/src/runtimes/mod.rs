@@ -2,6 +2,40 @@
 //! file per runtime. Loss mode and scale mode are the SAME code everywhere:
 //! loss runs one connection, scale runs N. Only the STATS schema differs.
 //!
+//! # Ingress strategies (all four, on all six runtimes)
+//!
+//! How a listener fans many callers across sockets and threads. Selected
+//! with `--ingress`; every combination is implemented everywhere, so a
+//! sweep compares strategies rather than coverage.
+//!
+//! ```text
+//!  per-port          shared-pool:K       reuseport-multi:K    reuseport-single:W
+//!  ────────          ─────────────       ─────────────────    ──────────────────
+//!  N sockets         K sockets           1 port, K sockets    1 port, K sockets
+//!  N ports           K ports             SO_REUSEPORT         SO_REUSEPORT
+//!  1 conn each       many conns each     kernel hashes flows  1 acceptor thread
+//!                    no SO_REUSEPORT     acceptor == worker   + W worker threads
+//!
+//!  :12345 ─ c0       :12345 ┬ c0 c4      :12345 ┬ [acc0] ─┐   :12345 ─ [acceptor]
+//!  :12346 ─ c1       :12346 ┼ c1 c5             ├ [acc1] ─┤            │ promotes
+//!  :12347 ─ c2       :12347 ┼ c2 c6             ├ [acc2] ─┼─ peers     │ every conn
+//!  :…     ─ …        :12348 ┴ c3 c7             └ [acc3] ─┘            ▼
+//!                                                                [w0] [w1] [w2]
+//! ```
+//!
+//! `--promotion` then decides which connections get a private connected
+//! socket at their first `Connected`. The modes nest, and that nesting is
+//! a property test in `srt-lifecycle`, not a convention:
+//!
+//! ```text
+//!   Never  ⊂  Relocate  ⊂  Bonded  ⊂  All
+//! ```
+//!
+//! Promotion buys independent scheduling and costs socket churn plus
+//! SO_REUSEPORT group perturbation. Which way that trades is
+//! runtime-dependent -- a runtime with a real task scheduler gains from
+//! it, mio (a flat epoll loop with no task model) does not.
+//!
 //! # Scaling architecture (core/thread/worker model per runtime)
 //!
 //! | Runtime | Threads/workers      | Connection mapping            | Timers                          |
@@ -15,11 +49,15 @@
 //!
 //! # Measured findings (6-core shared-tenant EPYC VPS, load avg 2-5)
 //!
-//! Baselines are `REPS=3 ./bench.sh baseline 300 8` medians; syscall
-//! attribution is `./bench.sh sysprof <rt> 300 8` (perf tracepoints:
-//! recvfrom/sendto/sendmsg/recvmsg/epoll_wait + io_uring_submit_req).
-//! Rankings only valid within one measurement window -- this box is
-//! shared-tenant, so re-run before comparing.
+//! Baselines come from `srt-bench matrix … --reps 3` plus `srt-bench
+//! report`; syscall attribution from `srt-bench sysprof <rt>` (perf
+//! tracepoints: recvfrom/sendto/sendmsg/recvmsg/epoll_wait +
+//! io_uring_submit_req). Rankings are only valid within one measurement
+//! window -- this box is shared-tenant, so re-run before comparing.
+//!
+//! The numbers below predate the x86-64-v3 + LTO release profile and the
+//! shared admission machinery, and were taken with the former shell
+//! harness. Treat them as order-of-magnitude until re-measured.
 //!
 //! ## @300 conns, 8 Mbps/conn (2026-08-22 window)
 //!

@@ -20,7 +20,7 @@
 //! wrong "KNOWN LIMITATION" note here).
 //!
 //! With the default bond-only promotion, #4 under-delivers badly at
-//! bench.sh's 8Mbps/conn: at N=25 the listener received 75433 of 152450
+//! the default 8Mbps/conn: at N=25 the listener received 75433 of 152450
 //! packets sent (~50%), and at N=150, 359651 of 969994 (~37%, RTT 419ms).
 //! That was previously attributed to `async-io`'s per-packet overhead and
 //! to #4 concentrating load on K threads. Both explanations were wrong:

@@ -5,9 +5,29 @@ Shared adapter plumbing between [`srt-protocol`](../srt-protocol)
 feature flags; `publish = false` — workspace-internal glue, not a
 standalone product.
 
+## Charter: this crate owns *things*
+
+The dividing line against [`srt-lifecycle`](../srt-lifecycle) is
+ownership, not subject matter. Both crates deal with admission:
+
+* **lifecycle takes values and returns decisions.** No sockets, no
+  clocks, no protocol objects; time is passed in.
+* **transport owns things.** Live `SrtConnection`s, their timers, file
+  descriptors, counters.
+
+So the admission peer table lives here, even though the promotion rule it
+consults lives there. This crate depends on lifecycle (mechanism uses
+policy); lifecycle never depends on this one.
+
+```
+   srt-bench ──► srt-transport ──► srt-lifecycle ──► srt-protocol
+                      │                                   ▲
+                      └───────────────────────────────────┘
+```
+
 ## What's inside
 
-Two layers:
+Three layers:
 
 1. **Shared utilities** (always compiled, no runtime deps)
    - `NativeTimer` — `Pin<Box<dyn Future<Output = ()>>>`, the common shape
@@ -18,7 +38,27 @@ Two layers:
      fire. The correct primitive for mio (no timer wheel) and the explicit
      fallback elsewhere.
 
-2. **Per-runtime `Conn`** (feature-gated): wraps an `SrtConnection`
+2. **Admission machinery** (always compiled, runtime-neutral, does no I/O
+   of its own — the caller performs every send)
+   - `PeerTable` / `AdmissionPeer` — the peers one acceptor is servicing
+     off its shared listener socket, from first datagram until the
+     connection is promoted, relocated, or retired. Mints each
+     connection's SYN cookie, applies cookie routing, and answers
+     `all_terminal()`.
+   - `poll_outbound()` / `drain_events()` — the maintenance tick. Timers
+     fire and protocol events fold into bookkeeping inside the table;
+     only the datagrams come back, because sending is the one genuinely
+     per-runtime part.
+   - `Handoff` / `WorkerMessage` — the acceptor-to-worker protocol. A
+     `Handoff` carries a plain `std::net::UdpSocket` plus a bare
+     `SrtConnection` because both are `Send`, whereas every runtime's own
+     `Conn` holds a `!Send` timer future. The cross-thread move is
+     correct *by construction*: the type has no field a `!Send` timer
+     could occupy.
+   - `IngressTelemetry` — the five admission counters and the `report()`
+     line, defined once so two backends' output means the same thing.
+
+3. **Per-runtime `Conn`** (feature-gated): wraps an `SrtConnection`
    + that runtime's UDP socket + its native timer. Each exposes the same
    small verb set: `fire_expired`, `drain_outputs`, `send_paced`,
    `recv_with_timeout` (async runtimes also get a combined `tick`).

@@ -19,10 +19,15 @@ One binary, **six runtime backends**, two roles:
 
 ## Usage
 
+One binary, four subcommands: run a role, sweep a matrix of them, report
+on the results, or profile one pair.
+
 ```
 srt-bench runtime=<mio|tokio|smol|monoio|glommio|compio> \
   mode=<sender|receiver> <host?> <port> <duration_secs> <latency_ms> \
-  [bitrate_bps] [--connections N]
+  [bitrate_bps] [--connections N] [--ingress …] [--promotion …]
+  [--cookie-routing on|off] [--batch on|off] [--sock-buf …]
+  [--connect-concurrency N] [--bond …] [--out FILE]
 ```
 
 - Sender takes `<host>`; receiver doesn't. Defaults: bitrate 8 Mbps,
@@ -32,13 +37,30 @@ srt-bench runtime=<mio|tokio|smol|monoio|glommio|compio> \
   one connection, scale runs N; only the STATS schema differs.
 - Receiver prints `LISTENING` when its sockets are bound.
 
-### Orchestration scripts
+### Sweeping, reporting, profiling
 
 ```sh
-./bench.sh bakeoff 300 8            # all six runtimes back-to-back
-./bench.sh knee 100 300 600         # mio-only connection-count sweep
-REPS=3 ./bench.sh baseline 300 8    # 3 reps per runtime, median table
+# Cartesian product of the axes; one child process per role per cell.
+srt-bench matrix --runtimes mio,tokio,smol,monoio,glommio,compio \
+  --ingress per-port,shared-pool:4,reuseport-multi:4,reuseport-single:4 \
+  --promotion never,all --connections 25,150 --reps 3 --out scratch/base.tsv
+
+# Median table over a result file, grouped however the question demands.
+srt-bench report scratch/base.tsv --by ingress,runtime
+
+# Syscall / io_uring attribution for one pair (external dep: `perf`).
+srt-bench sysprof --runtime glommio --connections 150
 ```
+
+Every axis is a comma-separated list; unspecified axes take one default
+value. A cell a runtime does not implement is skipped and counted, so a
+gap in coverage reads as a gap rather than as a failure.
+
+This replaced a 344-line `bench.sh` that wrapped 86 lines of inline
+Python whose only job was re-parsing this binary's own stdout. The
+schema then lived in two places and drifted — adding a column silently
+broke the median table. Now the process that has the numbers writes them
+and the process that reports them reads the same columns back.
 
 ## Output contract
 
@@ -102,15 +124,30 @@ cargo build --release -p srt-bench   # links all six transports
 RUST_LOG=debug ./target/release/srt-bench …   # tracing to stderr
 ```
 
-## Script behavior
+## Result files
 
-`bench.sh` runs with `set -euo pipefail`, validates arguments, probes for
-a free port before binding, and installs a cleanup trap that kills an
-orphaned receiver if the sender dies mid-run. Raw per-process output
-lands under `./scratch/` (gitignored); caller exit codes are surfaced —
-`rc=1` means never connected. Baseline mode aggregates STATS lines into
-a median table (sent/recv/retx/loss/rtt/cpu/rss) per the method rule:
-same-window comparisons only, >=3 reps.
+With `--out FILE`, a run appends one TSV row per role. Columns are
+defined once in `harness::COLUMNS` and cover both the configuration (every
+axis) and the measurements, so `report` can group by any subset:
+
+```
+runtime  role  ingress  promotion  cookie  batch  sock_buf  conns  connect_cc
+bond  bitrate  rep  established  pkt_sent  core_total  sec_a  sec_b  rtt_ms
+elapsed_s  cpu_user_ms  cpu_sys_ms  peak_rss_kb
+```
+
+TSV rather than JSON: no dependency to read or write, greppable, and it
+opens in a spreadsheet. Files are appended to, because a sweep is many
+independent processes with no knowledge of their siblings. Raw output
+lands under `./scratch/` (gitignored).
+
+Roles are separate child processes rather than threads on purpose: CPU is
+measured with `getrusage`, which is per-process, so running both in one
+would bill the sender's cost to the listener.
+
+Method rule for anything recorded: same measurement window only, >=3
+reps, and the `--release` profile — `--profile quick` omits LTO and is
+not measurement-grade.
 
 glommio requires an io_uring-capable Linux kernel; selecting it elsewhere
 exits 2 with a message.

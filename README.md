@@ -13,8 +13,8 @@ No C toolchain, no libsrt linkage — the entire stack is Rust
 | Crate | Path | Role |
 |---|---|---|
 | [`shiguredo_srt`](crates/srt-protocol) | `crates/srt-protocol` | Sans-I/O SRT protocol core: handshake (v4/v5), encryption, ACK/NAK/TSBPD, bonding groups, StreamID access control |
-| [`srt-transport`](crates/srt-transport) | `crates/srt-transport` | Per-runtime UDP adapter `Conn` structs (feature-gated: mio/tokio/smol/monoio/glommio/compio) |
-| [`srt-lifecycle`](crates/srt-lifecycle) | `crates/srt-lifecycle` | Runtime-neutral admission, group affinity, and worker routing policy |
+| [`srt-transport`](crates/srt-transport) | `crates/srt-transport` | Mechanism: per-runtime UDP adapter `Conn` structs (feature-gated), plus the runtime-neutral admission peer table, handoff message types, socket helpers, and ingress telemetry |
+| [`srt-lifecycle`](crates/srt-lifecycle) | `crates/srt-lifecycle` | Policy: worker routing, group affinity, promotion ladder, SYN-cookie codec, terminal-state rule |
 | [`srt-bench`](crates/srt-bench) | `crates/srt-bench` | Caller/listener binaries + bake-off harness across all six runtimes |
 
 Inside `crates/srt-protocol`: [`pbt/`](crates/srt-protocol/pbt)
@@ -24,21 +24,42 @@ from the workspace; needs `cargo-fuzz` + nightly).
 
 ## Architecture
 
+Four crates, layered so that dependencies only ever point downward:
+
 ```
-                 ┌──────────────────────────────────────────┐
-   UDP sockets   │  srt-bench / your application            │
- ──────────────► │  runtime event loop                      │
- ◄────────────── │  (mio epoll · tokio · smol · monoio ·    │
-                 │   glommio · compio io_uring)             │
-                 └───────────────┬──────────────────────────┘
-                                 │ srt-transport: per-runtime Conn
-                                 │ fire_expired / drain_outputs / send_paced
-                 ┌───────────────▼──────────────────────────┐
-                 │  srt-protocol (shiguredo_srt)            │
-                 │  SrtConnection: sans-I/O state machine   │
-                 │  feed_recv_buf() → poll_event/poll_output│
-                 └──────────────────────────────────────────┘
+  ┌──────────────────────────────────────────────────────────────┐
+  │ srt-bench          event loops · recv/send primitives ·      │
+  │ (application)      task spawning · CLI · matrix & reporting  │
+  └───────────┬──────────────────────────────────┬───────────────┘
+              │                                  │
+  ┌───────────▼──────────────────┐   ┌───────────▼───────────────┐
+  │ srt-transport  (MECHANISM)   │──►│ srt-lifecycle  (POLICY)   │
+  │                              │   │                           │
+  │ owns things:                 │   │ owns no state:            │
+  │  · PeerTable / AdmissionPeer │   │  · WorkerRouter           │
+  │  · ManualTimerStore          │   │  · decide_promotion()     │
+  │  · Handoff / WorkerMessage   │   │  · cookie_for_worker()    │
+  │  · IngressTelemetry          │   │  · is_terminal()          │
+  │  · bind_reuseport, recvmmsg  │   │  · handshake identity     │
+  │  · per-runtime Conn (feature)│   │                           │
+  └───────────┬──────────────────┘   └───────────┬───────────────┘
+              │                                  │
+  ┌───────────▼──────────────────────────────────▼───────────────┐
+  │ srt-protocol (shiguredo_srt)        sans-I/O state machine   │
+  │ SrtConnection · feed_recv_buf() → poll_output()/poll_event() │
+  │ handshake · encryption · ACK/NAK/TSBPD · bonding · StreamID  │
+  └──────────────────────────────────────────────────────────────┘
 ```
+
+The split between the middle two crates is the load-bearing one:
+
+* **srt-lifecycle takes values and returns decisions.** It owns no
+  sockets, no clocks, and no protocol objects — time is passed *in*
+  (`is_terminal(now, …)`), which is why its rules are testable without
+  any I/O at all.
+* **srt-transport owns things.** Live `SrtConnection`s, their timers, the
+  fds. That is why the admission peer table lives there and not beside
+  the policy it calls.
 
 The protocol core performs **zero I/O**: callers feed datagrams in
 (`feed_recv_buf`) and drain packets/events out (`poll_output`,
@@ -47,25 +68,71 @@ This makes the core testable without sockets and lets every runtime drive
 it with its own native primitives — see `crates/srt-transport/README.md`
 for why there is deliberately no lowest-common-denominator abstraction.
 
-`srt-lifecycle` sits beside the data plane: listeners use it to decide
-*which worker owns which incoming tuple* before any protocol state exists
-(StreamID/GROUP decoding straight off the wire datagram).
+### Listener ingress strategies
+
+A listener can accept many callers four different ways. All four are
+implemented on all six runtimes, so a sweep compares *strategies* rather
+than reporting where coverage happens to exist.
+
+```
+  per-port              shared-pool:K          reuseport-multi:K      reuseport-single:W
+  ────────              ─────────────          ─────────────────      ──────────────────
+  N sockets             K sockets              1 port, K sockets      1 port, K sockets
+  N ports               K ports                SO_REUSEPORT           SO_REUSEPORT
+  1 conn each           many conns each        kernel hashes flows    1 acceptor thread
+                        no SO_REUSEPORT        acceptor == worker     + W worker threads
+
+  :12345 ─ c0           :12345 ┬ c0 c4 c8      :12345 ┬ [acc0] ─┐     :12345 ─ [acceptor]
+  :12346 ─ c1           :12346 ┼ c1 c5 c9             ├ [acc1] ─┤              │ promotes
+  :12347 ─ c2           :12347 ┼ c2 c6 …              ├ [acc2] ─┼─ peers       │ every conn
+  :…     ─ …            :12348 ┴ c3 c7                └ [acc3] ─┘              ▼
+                                                                         [w0] [w1] [w2]
+```
+
+`--promotion` then decides which connections get their own connected
+socket once they reach `Connected`. The modes nest:
+
+```
+  Never  ⊂  Relocate  ⊂  Bonded  ⊂  All
+  │         │            │          │
+  │         │            │          └─ every connection
+  │         │            └───────────── every bonded leg
+  │         └────────────────────────── only bonded legs whose group
+  │                                     owner is another worker
+  └──────────────────────────────────── nothing; affinity abandoned
+```
+
+Promotion buys independent scheduling and costs socket churn plus
+SO_REUSEPORT group perturbation. Which way that trades is
+**runtime-dependent** — measured, not assumed — which is the entire
+reason `srt-bench` exists.
 
 ## Quick start
 
-```sh
-# Unified harness: three modes
-./bench.sh bakeoff 300 8      # all six runtimes at one density
-./bench.sh knee 100 300 600   # mio-only connection-count sweep
-REPS=3 ./bench.sh baseline 300 8   # 3 reps, median table (same-window rule)
+`srt-bench` is one binary: it runs a role, orchestrates a sweep of them,
+and reports on the results. There is no shell harness to keep in sync.
 
-# Direct invocation (one process per role; connection *i* lives on port+i):
+```sh
+# Sweep a matrix. One child process per role per cell; results append to TSV.
+srt-bench matrix --runtimes mio,tokio,smol,monoio,glommio,compio \
+  --ingress per-port,shared-pool:4,reuseport-multi:4,reuseport-single:4 \
+  --connections 25 --reps 3 --out scratch/base.tsv
+
+# Median table, grouped by whichever dimensions answer your question.
+srt-bench report scratch/base.tsv --by ingress,runtime
+
+# Syscall / io_uring attribution for one pair (needs `perf`).
+srt-bench sysprof --runtime glommio --connections 150
+
+# A single run, either role (connection *i* lives on port+i for per-port):
 srt-bench runtime=mio mode=receiver 12000 13 120 --connections 4
 srt-bench runtime=tokio mode=sender 127.0.0.1 12000 8 120 --connections 4
 ```
 
-Each side prints exactly one `STATS role=… backend=… …` line; the sender
-exits 1 if it never connected. Field-by-field meaning:
+Each side prints one `STATS role=… backend=… …` line, and with `--out`
+also appends a row to a TSV whose columns are defined once in
+`harness::COLUMNS` — the process that has the numbers writes them, so no
+downstream tool re-parses stdout. Field meanings:
 [`crates/srt-bench/README.md`](crates/srt-bench/README.md).
 
 ## Testing
@@ -96,15 +163,22 @@ directory). Third-party dependency licenses are audited in
 every registry package in `Cargo.lock` resolves to a permitted permissive
 term.
 
-Benchmark scripts write all raw output under `scratch/` (gitignored) —
-never `/tmp` — so concurrent runs on shared machines don't clobber each
-other or leak artifacts outside the repo.
+Benchmarks write all raw output under `scratch/` (gitignored) — never
+`/tmp` — so concurrent runs on shared machines don't clobber each other
+or leak artifacts outside the repo.
 
 ## Notes
 
 - `.cargo/config.toml` caps parallel rustc jobs at 8 (OOM guard on shared
-  machines) and selects the `mold` linker. Override jobs with
-  `CARGO_BUILD_JOBS=N`.
+  machines), selects the `mold` linker, and sets
+  `-C target-cpu=x86-64-v3` so measurements exercise the instruction set
+  the host actually has. Override jobs with `CARGO_BUILD_JOBS=N`. Never
+  set `RUSTFLAGS` when building for measurement: a set value — even an
+  empty one — *replaces* that list rather than merging with it.
+- `--release` is the measurement profile (LTO, `codegen-units=1`, debug
+  line tables for `perf`). `cargo build --profile quick` is the same
+  optimisation level without LTO for a ~4x faster edit-compile loop; it
+  is **not** valid for recorded numbers.
 - `crates/srt-protocol/VENDOR.md` documents provenance (git-subtree import
   of [shiguredo/srt-rs](https://github.com/shiguredo/srt-rs)), every local
   patch applied on top, and how to pull future upstream commits.

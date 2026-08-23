@@ -4,6 +4,27 @@
 //! logical identity and assignment invariants that must be shared by a
 //! listener and its workers, but it does not own sockets, clocks, threads,
 //! event loops, media delivery, or authorization.
+//!
+//! The rule, as a test for anything proposed for this crate:
+//!
+//! > **It takes values and returns decisions. It never owns things.**
+//!
+//! Time arrives as a parameter ([`is_terminal`]), never read from a
+//! clock. Wire bytes are decoded by `shiguredo_srt::peek_handshake` and
+//! only *interpreted* here. Anything holding a live `SrtConnection`, a
+//! timer store, or a file descriptor belongs in `srt-transport` --
+//! which is where the admission peer table lives, calling back into the
+//! policy defined here.
+//!
+//! ```text
+//!   decisions (this crate)        things (srt-transport)
+//!   ──────────────────────        ──────────────────────
+//!   WorkerRouter                  PeerTable / AdmissionPeer
+//!   decide_promotion()            ManualTimerStore
+//!   cookie_for_worker()           Handoff / WorkerMessage
+//!   is_terminal()                 IngressTelemetry
+//!   handshake_identity()          per-runtime Conn
+//! ```
 
 use std::collections::HashMap;
 use std::hash::Hash;
