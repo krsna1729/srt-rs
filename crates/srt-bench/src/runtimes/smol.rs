@@ -233,7 +233,7 @@ async fn sender_task(
         }
 
         let t = crate::now_ts(start);
-        driver.fire_expired();
+        driver.fire_expired(t);
         driver.drain_outputs(t).await;
 
         while let Some(ev) = driver.conn.poll_event() {
@@ -258,8 +258,17 @@ async fn sender_task(
         }
 
         if stats.connected {
+            // Sample the clock ONCE: this loop must drain only what pacing
+            // says is due at instant `t`. Re-reading it per iteration makes
+            // the condition self-fulfilling -- each `send_paced` awaits a
+            // socket write that costs roughly one pacing interval, so `t`
+            // advances far enough to permit the next packet and the loop
+            // never exits. The task then never returns to the outer loop,
+            // so it stops firing timers (no TLPKTDROP) and stops draining
+            // received ACKs, and the send buffer grows to the full flow
+            // window. That was ~12 MB per connection under overload.
+            let t = crate::now_ts(start);
             loop {
-                let t = crate::now_ts(start);
                 if driver.send_paced(&payload, t).await.is_err() {
                     break;
                 }
@@ -343,7 +352,7 @@ async fn receiver_task(cfg: LossConfig, listen_port: u16, start: Instant) -> Con
             }
 
             let t = crate::now_ts(start);
-            driver.fire_expired();
+            driver.fire_expired(t);
             driver.drain_outputs(t).await;
         }
 
@@ -802,7 +811,7 @@ async fn established_conn_task(mut driver: Conn, cfg: LossConfig, start: Instant
         }
 
         let t = crate::now_ts(start);
-        driver.fire_expired();
+        driver.fire_expired(t);
         driver.drain_outputs(t).await;
 
         while let Some(ev) = driver.conn.poll_event() {

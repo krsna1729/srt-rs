@@ -744,6 +744,50 @@ mod tests {
         assert_eq!(buf.packets_in_flight(), 1);
     }
 
+    /// A sender whose peer has stopped ACKing must not grow without bound.
+    ///
+    /// This is the shape that produced 12 MB of resident memory *per
+    /// connection* in the 600-connection bandwidth ladder: the receiver
+    /// falls behind, ACKs dry up, `oldest_unacked` stops advancing, and the
+    /// send buffer fills to the full flow window. TLPKTDROP is what is
+    /// supposed to bound it -- the buffer should settle at roughly one
+    /// drop-threshold worth of data (1 s floor), not at `flow_window`.
+    #[test]
+    fn buffer_stays_bounded_when_peer_stops_acking() {
+        const BPS: u64 = 4_000_000;
+        const PAYLOAD: usize = 1316;
+        const FLOW_WINDOW: u32 = 8192;
+
+        let mut buf = SenderBuffer::new(0, FLOW_WINDOW, 120);
+        buf.set_max_bandwidth(BPS / 8);
+
+        let mut high_water = 0u32;
+        // 30 s of virtual time in 1 ms steps, never delivering an ACK.
+        for ms in 0..30_000u64 {
+            let now = Timestamp::from_micros(ms * 1000);
+            while buf.can_send_with_pacing(now) {
+                if buf.push(vec![0u8; PAYLOAD], ms as u32, 1, now).is_none() {
+                    break;
+                }
+                buf.record_send_time(now);
+            }
+            // The ACK timer runs every 10 ms and is what drives TLPKTDROP.
+            if ms % 10 == 0 {
+                let _ = buf.drop_expired(now);
+            }
+            high_water = high_water.max(buf.packets_in_flight());
+        }
+
+        // One second of 4 Mbps is ~380 packets. Allow generous slack for the
+        // 1.25x threshold and burst granularity, but nothing close to the
+        // 8192-packet flow window.
+        assert!(
+            high_water < 2000,
+            "send buffer reached {high_water} packets (flow window {FLOW_WINDOW}); \
+             TLPKTDROP is not bounding it"
+        );
+    }
+
     #[test]
     fn test_drop_expired_threshold_1s_floor() {
         // latency_ms = 10 (10ms) の場合、1.25 * 10_000 = 12_500 < 1_000_000 なので

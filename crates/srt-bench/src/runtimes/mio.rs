@@ -415,8 +415,17 @@ pub fn run(cfg: LossConfig) {
             }
 
             if d.connected && cfg.mode == crate::Mode::Sender {
+                // Sample the clock ONCE: this loop must drain only what pacing
+                // says is due at instant `t`. Re-reading it per iteration makes
+                // the condition self-fulfilling -- each `send_paced` awaits a
+                // socket write that costs roughly one pacing interval, so `t`
+                // advances far enough to permit the next packet and the loop
+                // never exits. The task then never returns to the outer loop,
+                // so it stops firing timers (no TLPKTDROP) and stops draining
+                // received ACKs, and the send buffer grows to the full flow
+                // window. That was ~12 MB per connection under overload.
+                let t = crate::now_ts(start);
                 loop {
-                    let t = crate::now_ts(start);
                     if !d.conn.conn.can_send_with_pacing(t) {
                         break;
                     }
