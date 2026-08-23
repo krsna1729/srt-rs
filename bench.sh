@@ -60,7 +60,10 @@ ensure_binary() {
   if [[ ! -x "$BIN" ]]; then
     echo "info: $BIN not found; building..." >&2
     mkdir -p "$SCRATCH_DIR"
-    RUSTFLAGS="" cargo build -p srt-bench --release --bin srt-bench \
+    # `env -u RUSTFLAGS` ignores an ambient RUSTFLAGS without setting one:
+    # setting it (even to "") would replace .cargo/config.toml's rustflags
+    # entirely, silently dropping target-cpu and the mold linker.
+    env -u RUSTFLAGS cargo build -p srt-bench --release --bin srt-bench \
       >"$SCRATCH_DIR/build.log" 2>&1 || {
         echo "BUILD_FAIL — see $SCRATCH_DIR/build.log" >&2
         tail -5 "$SCRATCH_DIR/build.log" >&2

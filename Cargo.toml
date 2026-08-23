@@ -8,3 +8,20 @@ members = [
     "crates/srt-bench",
 ]
 exclude = ["crates/srt-protocol/fuzz"]
+
+# Benchmark-grade release settings. srt-bench's whole purpose is
+# measuring runtime and strategy differences, so the numbers have to come
+# from a build that is actually optimised -- cargo's defaults for
+# `--release` leave LTO off and codegen-units at 16, which lets
+# cross-crate calls (srt-bench -> srt-transport -> shiguredo_srt, all on
+# the per-packet hot path) stay unoptimised across boundaries.
+#
+# Cost: release builds are noticeably slower. That is the right trade for
+# a harness whose output is performance data.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+# Line tables only: `bench.sh sysprof` runs perf against this binary and
+# needs symbols to attribute anything. No runtime cost.
+debug = 1

@@ -6,5 +6,19 @@ jobs = 8
 # mold is ~10× faster than ld for linking. All profiles benefit.
 [target.x86_64-unknown-linux-gnu]
 linker = "clang"
-rustflags = ["-C", "link-arg=-fuse-ld=mold", "-C", "link-arg=-Wl,-z,relro,-z,now"]
+# target-cpu: benchmarks should exercise the instruction set the host
+# actually has. x86-64-v3 (AVX2/BMI2/FMA, Haswell-era and later) rather
+# than `native` so a binary stays reproducible across similar machines
+# instead of silently differing per builder. Scoped to this triple, so
+# non-x86 targets are unaffected.
+#
+# NOTE: a set RUSTFLAGS environment variable -- even an empty one --
+# replaces this list wholesale rather than merging with it. Anything
+# building for measurement must not set RUSTFLAGS; use `env -u RUSTFLAGS`
+# to ignore an ambient value instead of clobbering these.
+rustflags = [
+    "-C", "link-arg=-fuse-ld=mold",
+    "-C", "link-arg=-Wl,-z,relro,-z,now",
+    "-C", "target-cpu=x86-64-v3",
+]
 
