@@ -235,8 +235,8 @@ pub struct LossConfig {
     /// Repetition index, recorded so a report can take medians across
     /// repeats of the same cell.
     pub rep: usize,
-    /// Logical CPUs this process is restricted to. `0` leaves the
-    /// inherited affinity alone.
+    /// How many logical CPUs this process ended up restricted to. `0`
+    /// means the inherited affinity was left alone.
     ///
     /// Recorded in results because a benchmark that does not state its
     /// CPU budget cannot be compared against one from another machine.
@@ -465,7 +465,7 @@ pub fn bench_config_from_args() -> LossConfig {
              [bitrate_bps] [--connections N] \
              [--ingress per-port|shared-pool=K|reuseport-multi=K|reuseport-single=W] \
              [--bond broadcast:G|backup:G|none] [--batch on|off] \
-             [--connect-concurrency N] [--promotion never|relocate|bonded|all] [--cookie-routing on|off] [--sock-buf N|Nk|Nm|default] [--out FILE] [--cpus N] [--pin on|off]"
+             [--connect-concurrency N] [--promotion never|relocate|bonded|all] [--cookie-routing on|off] [--sock-buf N|Nk|Nm|default] [--out FILE] [--cpus 0-3|0,2,4] [--pin on|off]"
         );
         std::process::exit(2)
     }
@@ -620,12 +620,17 @@ pub fn bench_config_from_args() -> LossConfig {
         }
     };
 
-    let cpus = cli.flag_or("cpus", 0usize);
-    if cpus > 0
-        && let Err(e) = srt_transport::restrict_to_cpus(cpus)
+    // A CPU *set*, not a count: the two roles need disjoint cores, so
+    // that giving the compute-bound side more does not hand them back to
+    // the other. See docs/cpu-budget.md.
+    let cpu_list =
+        srt_transport::parse_cpu_spec(cli.flags.get("cpus").map(String::as_str).unwrap_or(""));
+    if !cpu_list.is_empty()
+        && let Err(e) = srt_transport::restrict_to_cpu_list(&cpu_list)
     {
-        eprintln!("warning: could not restrict to {cpus} CPUs: {e}");
+        eprintln!("warning: could not restrict to CPUs {cpu_list:?}: {e}");
     }
+    let cpus = cpu_list.len();
     let pin = matches!(
         cli.flags.get("pin").map(String::as_str),
         Some("") | Some("on")

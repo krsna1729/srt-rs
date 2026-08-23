@@ -438,6 +438,22 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
             .cloned()
             .unwrap_or_else(|| "scratch/results.tsv".to_string()),
     );
+    // Per-role CPU sets. Disjoint sets let the compute-bound side be
+    // given cores without the other taking them back; see
+    // docs/cpu-budget.md. Empty leaves the inherited mask alone.
+    let recv_cpus = cli
+        .flags
+        .get("recv-cpus")
+        .cloned()
+        .unwrap_or_else(|| cli.flags.get("cpus").cloned().unwrap_or_default());
+    let send_cpus = cli
+        .flags
+        .get("send-cpus")
+        .cloned()
+        .unwrap_or_else(|| cli.flags.get("cpus").cloned().unwrap_or_default());
+    if !recv_cpus.is_empty() || !send_cpus.is_empty() {
+        eprintln!("matrix: receiver CPUs [{recv_cpus}], sender CPUs [{send_cpus}]");
+    }
     let reps: usize = cli.flag_or("reps", 3);
     let secs: u64 = cli.flag_or("secs", 8);
     let latency: u16 = cli.flag_or("latency", 120);
@@ -449,7 +465,6 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
         ("cookie-routing", axis_values(cli, "cookie-routing", "on")),
         ("batch", axis_values(cli, "batch", "on")),
         ("sock-buf", axis_values(cli, "sock-buf", "16m")),
-        ("cpus", axis_values(cli, "cpus", "0")),
         ("pin", axis_values(cli, "pin", "off")),
         ("connections", axis_values(cli, "connections", "25")),
         (
@@ -545,6 +560,7 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
                 .arg(&bitrate)
                 .args(&common)
                 .arg(format!("--rep={rep}"))
+                .arg(format!("--cpus={recv_cpus}"))
                 .arg(format!("--out={}", out.display()))
                 .stdout(std::process::Stdio::null())
                 .spawn()?;
@@ -561,6 +577,7 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
                 .arg(&bitrate)
                 .args(&common)
                 .arg(format!("--rep={rep}"))
+                .arg(format!("--cpus={send_cpus}"))
                 .arg(format!("--out={}", out.display()))
                 .stdout(std::process::Stdio::null())
                 .status()?;

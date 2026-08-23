@@ -80,16 +80,29 @@ being run in a mode that is not how it is usually deployed.
 Both are now expressible rather than assumed:
 
 ```sh
-# Give the process a fixed CPU budget, recorded in results.
-srt-bench matrix --cpus 4 ...
+# Same CPU set for both roles.
+srt-bench matrix --cpus 0-3 ...
+
+# Disjoint sets: give the listener four cores, the load generator two,
+# so they cannot take cores back from each other.
+srt-bench matrix --recv-cpus 0-3 --send-cpus 4-5 ...
 
 # Let thread-per-core runtimes own their CPUs (glommio Placement::Fixed).
 srt-bench matrix --pin on ...
 ```
 
-`--cpus 0` (default) leaves the inherited affinity alone; `--pin off`
-(default) leaves placement unbound. Both appear as columns in the result
-TSV, so a run states its own budget.
+The spec is a **set**, not a count: `0-3`, `0,2,4`, `0-1,4-5`. A count
+would be worse than useless here — "give each side 4 CPUs" starting from
+zero places both on the same cores and has them fight. Empty (the
+default) leaves the inherited mask alone; `--pin off` (default) leaves
+placement unbound. The resulting CPU count and the pin setting are
+columns in the result TSV, so a run states its own budget.
+
+Per-role sets matter because the two roles are not symmetric. Only one
+side is usually the bottleneck, and giving it more cores is pointless if
+the load generator simply expands to use them. Isolating them also
+removes the largest remaining source of run-to-run variance once
+utilisation is high.
 
 ## 4. Recommendation
 
@@ -101,15 +114,16 @@ TSV, so a run states its own budget.
 - **Treat `--pin` as an axis, not a default.** Pinning helps
   thread-per-core designs and can hurt others; sweeping it is the way to
   find out rather than picking a side.
-- **Sender and receiver still share the host.** They are separate
-  processes and are not isolated from each other. At <30% utilisation
-  this is minor, but at saturation it would not be — pinning them to
-  disjoint CPU sets is the next refinement if a sweep ever runs hot.
+- **Isolate the roles when running hot.** `--recv-cpus` / `--send-cpus`
+  put them on disjoint cores. At <30% utilisation the contention is
+  minor; at saturation it is the dominant confound, because the load
+  generator and the thing under test are competing for the same cores.
 
 ## 5. What is still not controlled
 
-- **Sender/receiver co-residency.** Both run on the same host and
-  compete. Only relevant once utilisation is high.
+- **Sender/receiver co-residency**, unless `--recv-cpus`/`--send-cpus`
+  are set. They still share memory bandwidth and last-level cache even
+  when pinned apart.
 - **Shared tenancy.** The host is a shared VPS; other tenants are noise
   that `--cpus` does not remove.
 - **NUMA.** Single-socket here, so not a factor; it would be on a bigger
