@@ -2,6 +2,7 @@
 
 pub mod cpu_stats;
 pub mod driver;
+pub mod harness;
 pub mod runtimes;
 
 pub const INTEROP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -227,6 +228,13 @@ pub struct LossConfig {
     /// holds, the big buffer is load-bearing only for the non-promoting
     /// designs, and this stops being a tuning knob for the others.
     pub sock_buf_bytes: usize,
+    /// Append this run's result row here as well as printing STATS. The
+    /// process that has the numbers writes them, so no downstream tool
+    /// has to re-parse stdout.
+    pub out: Option<std::path::PathBuf>,
+    /// Repetition index, recorded so a report can take medians across
+    /// repeats of the same cell.
+    pub rep: usize,
 }
 
 /// See [`LossConfig::batching`].
@@ -415,6 +423,25 @@ impl Aggregate {
                 p.peak_rss_kb,
             );
         }
+        if let Some(path) = &c.out
+            && let Err(e) = crate::harness::append_result(
+                path,
+                c,
+                c.rep,
+                self.stats_count,
+                self.data_events,
+                self.core_total,
+                self.secondary_a,
+                self.secondary_b,
+                rtt,
+                elapsed_s,
+            )
+        {
+            eprintln!(
+                "warning: could not append result to {}: {e}",
+                path.display()
+            );
+        }
     }
 }
 
@@ -427,7 +454,7 @@ pub fn bench_config_from_args() -> LossConfig {
              [bitrate_bps] [--connections N] \
              [--ingress per-port|shared-pool=K|reuseport-multi=K|reuseport-single=W] \
              [--bond broadcast:G|backup:G|none] [--batch on|off] \
-             [--connect-concurrency N] [--promotion never|relocate|bonded|all] [--cookie-routing on|off] [--sock-buf N|Nk|Nm|default]"
+             [--connect-concurrency N] [--promotion never|relocate|bonded|all] [--cookie-routing on|off] [--sock-buf N|Nk|Nm|default] [--out FILE]"
         );
         std::process::exit(2)
     }
@@ -488,6 +515,12 @@ pub fn bench_config_from_args() -> LossConfig {
     let ingress = match cli.flags.get("ingress").map(String::as_str) {
         None | Some("per-port") => Ingress::PerPort,
         Some(spec) => {
+            // Accept both `shared-pool=4` and `shared-pool:4`. The colon
+            // form is what result files record (an `=` inside a value
+            // would collide with the key=value flag syntax), so it has to
+            // parse back in for a recorded run to be reproducible.
+            let spec = &spec.replacen(':', "=", 1);
+            let spec = spec.as_str();
             if let Some(k) = spec.strip_prefix("shared-pool=") {
                 Ingress::SharedPool(parse_positive("shared-pool size", k))
             } else if let Some(k) = spec.strip_prefix("reuseport-multi=") {
@@ -576,6 +609,13 @@ pub fn bench_config_from_args() -> LossConfig {
         }
     };
 
+    let out = cli
+        .flags
+        .get("out")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from);
+    let rep = cli.flag_or("rep", 1usize);
+
     LossConfig {
         runtime,
         mode,
@@ -593,5 +633,7 @@ pub fn bench_config_from_args() -> LossConfig {
         promotion,
         cookie_routing,
         sock_buf_bytes,
+        out,
+        rep,
     }
 }
