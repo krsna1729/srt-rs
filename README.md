@@ -135,6 +135,16 @@ also appends a row to a TSV whose columns are defined once in
 downstream tool re-parses stdout. Field meanings:
 [`crates/srt-bench/README.md`](crates/srt-bench/README.md).
 
+## Measured baselines
+
+[`docs/baseline-2026-08-23.md`](docs/baseline-2026-08-23.md) — ingress
+strategy × runtime at 25 connections, with the raw TSV beside it. Short
+version: at this scale `shared-pool` wins on delivery, CPU and memory
+across all six runtimes; `reuseport-multi` needs `--promotion=all` before
+four of the six deliver at all; and the reuseport strategies have not yet
+justified their cost at this fan-in. Rankings hold only within that
+measurement window.
+
 ## Testing
 
 ```sh
