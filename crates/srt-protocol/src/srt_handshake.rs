@@ -1488,3 +1488,20 @@ mod tests {
         );
     }
 }
+
+/// Decode a datagram straight into a [`HandshakePacket`], or `None` if it
+/// is not one.
+///
+/// A listener has to inspect a datagram *before* it has any connection to
+/// feed it to -- to route it, or to decide whether to create state at
+/// all. Doing that meant reaching for `SrtPacket::decode` and
+/// `HandshakePacket::decode` in sequence and knowing that a handshake is
+/// always a control packet, which is codec knowledge that belongs here
+/// rather than in whatever crate happens to be doing admission.
+#[must_use]
+pub fn peek_handshake(datagram: &[u8]) -> Option<HandshakePacket> {
+    let crate::SrtPacket::Control(control) = crate::SrtPacket::decode(datagram).ok()? else {
+        return None;
+    };
+    HandshakePacket::decode(&control).ok()
+}

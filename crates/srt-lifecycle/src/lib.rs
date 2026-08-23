@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::time::{Duration, Instant};
 
-use shiguredo_srt::{GroupExtensionData, HandshakePacket, HandshakeType, SrtPacket};
+use shiguredo_srt::{GroupExtensionData, HandshakeType};
 
 /// Group metadata observed during handshake admission.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -384,10 +384,9 @@ pub fn handshake_route(packet: &[u8]) -> Option<(bool, Option<GroupAffinity>)> {
 /// Decode the StreamID and GROUP identity from a handshake datagram.
 #[must_use]
 pub fn handshake_identity(packet: &[u8]) -> Option<HandshakeIdentity> {
-    let SrtPacket::Control(control) = SrtPacket::decode(packet).ok()? else {
-        return None;
-    };
-    let handshake = HandshakePacket::decode(&control).ok()?;
+    // Decoding is the codec crate's job; this function's business is
+    // turning a handshake into routing identity.
+    let handshake = shiguredo_srt::peek_handshake(packet)?;
     let is_conclusion = matches!(handshake.handshake_type, HandshakeType::Conclusion);
     let stream_id = handshake.get_sid_extension();
     let group = handshake
@@ -761,7 +760,8 @@ mod tests {
 
     #[test]
     fn conclusion_identity_exposes_stream_without_group_metadata() {
-        let mut handshake = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
+        let mut handshake =
+            shiguredo_srt::HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
         handshake.add_sid_extension("publish:camera");
         let mut packet = Vec::new();
         handshake.encode(0, 0).encode(&mut packet);

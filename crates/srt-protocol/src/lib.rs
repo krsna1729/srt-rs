@@ -21,6 +21,7 @@ pub use srt_connection::{
     SrtConnection, TimerId,
 };
 pub use srt_group::{GroupMemberState, GroupMode, GroupPacket, SrtGroup, SrtGroupMember};
+pub use srt_handshake::peek_handshake;
 pub use srt_handshake::{
     DEFAULT_FLOW_WINDOW, DEFAULT_MTU, ExtensionType, GFLAG_SYNCONMSG, GroupExtensionData,
     GroupType, HS_VERSION_4, HS_VERSION_5, HandshakeExtension, HandshakePacket, HandshakeState,
