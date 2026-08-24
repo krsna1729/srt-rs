@@ -4027,6 +4027,10 @@ pub mod smol_transport {
                                 prepend_outputs(&mut self.pending_outputs, work.into_iter());
                                 self.pending_outputs
                                     .push_front(ConnectionOutput::SendPacket(bytes));
+                                if error.kind() == io::ErrorKind::WouldBlock {
+                                    report.status = OutputDrainStatus::Backpressured;
+                                    return Ok(report);
+                                }
                                 return Err(error);
                             }
                         }

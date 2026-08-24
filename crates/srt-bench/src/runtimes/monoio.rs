@@ -186,13 +186,14 @@ async fn sender_task(
     let socket = monoio::net::udp::UdpSocket::bind("0.0.0.0:0").expect("bind");
     socket.connect(endpoint).await.expect("connect");
 
-    let options = ConnectionOptions {
+    let mut options = ConnectionOptions {
         socket_id: std::process::id(),
         tsbpd_delay: cfg.latency_ms,
         max_bandwidth_bytes_per_sec: Some(cfg.bitrate_bps / 8),
         group_extension: bond_extension_for(&cfg, index),
         ..Default::default()
     };
+    cfg.encryption.apply_to(&mut options);
     let mut conn = SrtConnection::new_caller(options);
     conn.connect(crate::now_ts(start))
         .expect("connect() should queue INDUCTION");
@@ -312,11 +313,12 @@ async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> Co
     let socket = monoio::net::udp::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], listen_port)))
         .expect("bind");
 
-    let options = ConnectionOptions {
+    let mut options = ConnectionOptions {
         socket_id: std::process::id(),
         tsbpd_delay: cfg.latency_ms,
         ..Default::default()
     };
+    cfg.encryption.apply_to(&mut options);
     let conn = SrtConnection::new_listener(options);
     let mut driver = Conn::new(conn, socket);
 

@@ -153,7 +153,7 @@ fn spawn_driver(
     } else {
         None
     };
-    let options = ConnectionOptions {
+    let mut options = ConnectionOptions {
         socket_id: std::process::id(),
         tsbpd_delay: cfg.latency_ms,
         max_bandwidth_bytes_per_sec: match cfg.mode {
@@ -163,6 +163,7 @@ fn spawn_driver(
         group_extension,
         ..Default::default()
     };
+    cfg.encryption.apply_to(&mut options);
     let conn = match cfg.mode {
         crate::Mode::Sender => {
             let mut c = SrtConnection::new_caller(options);
@@ -661,10 +662,14 @@ fn run_shared_pool_shard(cfg: &BenchConfig, mine: &[usize], start: Instant) -> V
                 |peer, data| {
                     let entry = conns.entry(peer).or_insert_with(|| SharedConn {
                         torn_down: false,
-                        conn: SrtConnection::new_listener(ConnectionOptions {
-                            socket_id: std::process::id(),
-                            tsbpd_delay: cfg.latency_ms,
-                            ..Default::default()
+                        conn: SrtConnection::new_listener({
+                            let mut options = ConnectionOptions {
+                                socket_id: std::process::id(),
+                                tsbpd_delay: cfg.latency_ms,
+                                ..Default::default()
+                            };
+                            cfg.encryption.apply_to(&mut options);
+                            options
                         }),
                         timers: srt_transport::ManualTimerStore::new(),
                         connected: false,
@@ -1512,10 +1517,14 @@ fn run_single_acceptor(
                 &mut buf,
                 |peer, data| {
                     let entry = pending.entry(peer).or_insert_with(|| Pending {
-                        conn: SrtConnection::new_listener(ConnectionOptions {
-                            socket_id: std::process::id(),
-                            tsbpd_delay: cfg.latency_ms,
-                            ..Default::default()
+                        conn: SrtConnection::new_listener({
+                            let mut options = ConnectionOptions {
+                                socket_id: std::process::id(),
+                                tsbpd_delay: cfg.latency_ms,
+                                ..Default::default()
+                            };
+                            cfg.encryption.apply_to(&mut options);
+                            options
                         }),
                         timers: srt_transport::ManualTimerStore::new(),
                         connected: false,

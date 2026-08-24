@@ -14,7 +14,8 @@
 //!
 //! A sweep, one child process per role per cell:
 //!   srt-bench matrix --runtimes mio,tokio --ingress reuseport-multi:4 \
-//!     --promotion never,all --connections 25,150 --reps 3 --out results.tsv
+//!     --encryption plain,128,192,256 --promotion never,all \
+//!     --connections 25,150 --reps 3 --out results.tsv
 //!
 //! Median table over a result file, grouped however you like:
 //!   srt-bench report results.tsv --by runtime,promotion

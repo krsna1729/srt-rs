@@ -16,9 +16,10 @@ instead of a hunch.
 
 ### Configuration (identical on both rows)
 
-`runtime ingress promotion cookie batch sock_buf cpus pin link_* workers
+`runtime encryption ingress promotion cookie batch sock_buf cpus pin link_* workers
 recv_* send_* conns connect_cc bond bitrate rep secs` — the axes the cell
-was run at. `secs` is the stream length both roles agree on; it is not
+was run at. `encryption` is `plain`, `128`, `192`, or `256`. `secs` is the
+stream length both roles agree on; it is not
 `elapsed_s` (see below).
 
 ### What actually happened, protocol level

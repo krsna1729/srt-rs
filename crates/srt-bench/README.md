@@ -25,7 +25,8 @@ on the results, or profile one pair.
 ```
 srt-bench runtime=<mio|tokio|smol|monoio|glommio|compio> \
   mode=<sender|receiver> <host?> <port> <duration_secs> <latency_ms> \
-  [bitrate_bps] [--connections N] [--ingress …] [--promotion …]
+  [bitrate_bps] [--connections N] [--encryption plain|128|192|256]
+  [--ingress …] [--promotion …]
   [--cookie-routing on|off] [--batch on|off] [--sock-buf …]
   [--connect-concurrency N] [--bond …] [--out FILE]
 ```
@@ -43,7 +44,8 @@ srt-bench runtime=<mio|tokio|smol|monoio|glommio|compio> \
 # Cartesian product of the axes; one child process per role per cell.
 srt-bench matrix --runtimes mio,tokio,smol,monoio,glommio,compio \
   --ingress per-port,shared-pool:4,reuseport-multi:4,reuseport-single:4 \
-  --promotion never,all --connections 25,150 --reps 3 --out scratch/base.tsv
+  --encryption plain,128,192,256 --promotion never,all \
+  --connections 25,150 --reps 3 --out scratch/base.tsv
 
 # Median table over a result file, grouped however the question demands.
 srt-bench report scratch/base.tsv --by ingress,runtime
@@ -53,8 +55,9 @@ srt-bench sysprof --runtime glommio --connections 150
 ```
 
 Every axis is a comma-separated list; unspecified axes take one default
-value. A cell a runtime does not implement is skipped and counted, so a
-gap in coverage reads as a gap rather than as a failure.
+value. `encryption` selects plaintext or AES-128/AES-192/AES-256 using a
+shared benchmark passphrase. A cell a runtime does not implement is skipped
+and counted, so a gap in coverage reads as a gap rather than as a failure.
 
 This replaced a 344-line `bench.sh` that wrapped 86 lines of inline
 Python whose only job was re-parsing this binary's own stdout. The
@@ -131,7 +134,7 @@ defined once in `harness::COLUMNS` and cover both the configuration (every
 axis) and the measurements, so `report` can group by any subset:
 
 ```
-runtime  role  ingress  promotion  cookie  batch  sock_buf  conns  connect_cc
+runtime  encryption  role  ingress  promotion  cookie  batch  sock_buf  conns  connect_cc
 bond  bitrate  rep  established  pkt_sent  core_total  sec_a  sec_b  rtt_ms
 elapsed_s  cpu_user_ms  cpu_sys_ms  peak_rss_kb
 ```

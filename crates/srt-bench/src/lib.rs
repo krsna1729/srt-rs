@@ -131,11 +131,63 @@ pub enum Mode {
     Receiver,
 }
 
+/// Encryption mode used by one benchmark cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Encryption {
+    Plain,
+    Aes128,
+    Aes192,
+    Aes256,
+}
+
+impl Encryption {
+    /// Parse the spelling used by the single-run CLI and matrix axis.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "plain" => Some(Self::Plain),
+            "128" => Some(Self::Aes128),
+            "192" => Some(Self::Aes192),
+            "256" => Some(Self::Aes256),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Plain => "plain",
+            Self::Aes128 => "128",
+            Self::Aes192 => "192",
+            Self::Aes256 => "256",
+        }
+    }
+
+    /// Apply the benchmark's shared passphrase and selected AES key length.
+    pub fn apply_to(self, options: &mut shiguredo_srt::ConnectionOptions) {
+        let key_length = match self {
+            Self::Plain => {
+                options.passphrase = None;
+                options.crypto_salt = None;
+                options.crypto_sek = None;
+                options.key_length = shiguredo_srt::KeyLength::Aes128;
+                return;
+            }
+            Self::Aes128 => shiguredo_srt::KeyLength::Aes128,
+            Self::Aes192 => shiguredo_srt::KeyLength::Aes192,
+            Self::Aes256 => shiguredo_srt::KeyLength::Aes256,
+        };
+        options.passphrase = Some("srt-bench-encryption".to_string());
+        options.key_length = key_length;
+    }
+}
+
 /// Fully-parsed configuration for one bench process invocation.
 #[derive(Clone, Debug)]
 pub struct BenchConfig {
     pub runtime: Runtime,
     pub mode: Mode,
+    pub encryption: Encryption,
     /// Sender only: destination host.
     pub host: String,
     /// Base port. Sender connects to port+i, receiver binds port+i,
@@ -695,6 +747,7 @@ pub fn bench_config_from_args() -> BenchConfig {
              mode=<sender|receiver> <host?> <port> <duration_secs> <latency_ms> \
              [bitrate_bps] [--connections N] \
              [--ingress per-port|shared-pool=K|reuseport-multi=K|reuseport-single=W] \
+             [--encryption plain|128|192|256] \
              [--bond broadcast:G|backup:G|none] [--batch on|off] \
              [--connect-concurrency N] [--promotion never|relocate|bonded|all] [--cookie-routing on|off] [--sock-buf N|Nk|Nm|default] [--out FILE] [--cpus 0-3|0,2,4] [--pin on|off] [--workers N] [--link-delay 25ms] [--link-jitter 5ms] [--link-loss 1%] [--link-rate 100mbit]"
         );
@@ -727,6 +780,17 @@ pub fn bench_config_from_args() -> BenchConfig {
             eprintln!("missing or unknown mode=<sender|receiver>");
             usage()
         }
+    };
+
+    let encryption = match cli.flags.get("encryption").map(String::as_str) {
+        None | Some("") | Some("plain") => Encryption::Plain,
+        Some(value) => match Encryption::parse(value) {
+            Some(mode) => mode,
+            None => {
+                eprintln!("error: unknown --encryption '{value}' (want plain|128|192|256)");
+                usage()
+            }
+        },
     };
 
     let needed = match mode {
@@ -926,6 +990,7 @@ pub fn bench_config_from_args() -> BenchConfig {
     BenchConfig {
         runtime,
         mode,
+        encryption,
         host,
         port,
         duration_secs,
@@ -948,5 +1013,45 @@ pub fn bench_config_from_args() -> BenchConfig {
         stream_secs,
         peer_topology,
         link,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Encryption;
+    use shiguredo_srt::{ConnectionOptions, KeyLength};
+
+    #[test]
+    fn encryption_axis_values_round_trip() {
+        for (value, expected) in [
+            ("plain", Encryption::Plain),
+            ("128", Encryption::Aes128),
+            ("192", Encryption::Aes192),
+            ("256", Encryption::Aes256),
+        ] {
+            assert_eq!(Encryption::parse(value), Some(expected));
+            assert_eq!(expected.name(), value);
+        }
+        assert_eq!(Encryption::parse("512"), None);
+    }
+
+    #[test]
+    fn encryption_configures_connection_options() {
+        for (mode, key_length) in [
+            (Encryption::Aes128, KeyLength::Aes128),
+            (Encryption::Aes192, KeyLength::Aes192),
+            (Encryption::Aes256, KeyLength::Aes256),
+        ] {
+            let mut options = ConnectionOptions::default();
+            mode.apply_to(&mut options);
+            assert_eq!(options.passphrase.as_deref(), Some("srt-bench-encryption"));
+            assert_eq!(options.key_length, key_length);
+        }
+
+        let mut options = ConnectionOptions::default();
+        Encryption::Aes256.apply_to(&mut options);
+        Encryption::Plain.apply_to(&mut options);
+        assert_eq!(options.passphrase, None);
+        assert_eq!(options.key_length, KeyLength::Aes128);
     }
 }

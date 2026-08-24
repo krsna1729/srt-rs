@@ -20,6 +20,7 @@ use std::path::Path;
 /// Columns, in order. One place; both the writer and the reader use it.
 pub const COLUMNS: &[&str] = &[
     "runtime",
+    "encryption",
     "role",
     "ingress",
     "promotion",
@@ -152,6 +153,7 @@ pub fn append_result(
     let mut row = String::new();
     let values: Vec<String> = vec![
         cfg.runtime.name().to_string(),
+        cfg.encryption.name().to_string(),
         match cfg.mode {
             Mode::Sender => "caller".into(),
             Mode::Receiver => "listener".into(),
@@ -580,6 +582,7 @@ fn free_port_range(count: usize) -> std::io::Result<u16> {
 fn recorded_as(axis: &str, value: &str) -> (&'static str, String) {
     match axis {
         "runtime" => ("runtime", value.to_string()),
+        "encryption" => ("encryption", value.to_string()),
         "ingress" => ("ingress", value.to_string()),
         "promotion" => ("promotion", value.to_string()),
         "cookie-routing" => ("cookie", value.to_string()),
@@ -814,6 +817,7 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
     let mut axes: Vec<Axis> = split_axes;
     axes.extend([
         axis("ingress", "ingress", "per-port"),
+        axis("encryption", "encryption", "plain"),
         axis("promotion", "promotion", "relocate"),
         axis("cookie-routing", "cookie-routing", "on"),
         axis("batch", "batch", "on"),

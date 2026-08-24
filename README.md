@@ -156,7 +156,8 @@ and reports on the results. There is no shell harness to keep in sync.
 # Sweep a matrix. One child process per role per cell; results append to TSV.
 srt-bench matrix --runtimes mio,tokio,smol,monoio,glommio,compio \
   --ingress per-port,shared-pool:4,reuseport-multi:4,reuseport-single:4 \
-  --connections 25 --reps 3 --out scratch/base.tsv
+  --encryption plain,128,192,256 --connections 25 --reps 3 \
+  --out scratch/base.tsv
 
 # Median table, grouped by whichever dimensions answer your question.
 srt-bench report scratch/base.tsv --by ingress,runtime
