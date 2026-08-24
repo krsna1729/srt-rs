@@ -485,6 +485,34 @@ impl BenchConfig {
     pub fn verbose(&self) -> bool {
         self.connections == 1 && self.ingress == Ingress::PerPort
     }
+
+    /// Admission must use the same complete connection template as a
+    /// per-port listener. In particular, a shared listener otherwise silently
+    /// falls back to plaintext when it creates a peer after the handshake.
+    pub fn admission_options(
+        &self,
+        socket_id: u32,
+        cookie_routing: bool,
+    ) -> srt_transport::AdmissionOptions {
+        let mut template = shiguredo_srt::ConnectionOptions {
+            socket_id,
+            tsbpd_delay: self.latency_ms,
+            ..Default::default()
+        };
+        self.encryption.apply_to(&mut template);
+        srt_transport::AdmissionOptions {
+            socket_id,
+            tsbpd_delay: self.latency_ms,
+            cookie_routing,
+            connection_template: Some(template),
+            handshake_retry_interval: std::time::Duration::from_micros(
+                shiguredo_srt::DEFAULT_HANDSHAKE_RETRY_INTERVAL_MICROS,
+            ),
+            handshake_timeout: std::time::Duration::from_micros(
+                shiguredo_srt::DEFAULT_HANDSHAKE_TIMEOUT_MICROS,
+            ),
+        }
+    }
 }
 
 /// Per-connection outcome, widened to u64 so aggregation never overflows.
@@ -1040,7 +1068,10 @@ pub fn bench_config_from_args() -> BenchConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Encryption};
+    use super::{
+        Batching, BenchConfig, BondMode, Cli, Encryption, Ingress, Link, Mode, PeerTopology,
+        Promotion, Runtime,
+    };
     use shiguredo_srt::{ConnectionOptions, KeyLength};
 
     #[test]
@@ -1075,6 +1106,45 @@ mod tests {
         Encryption::Plain.apply_to(&mut options);
         assert_eq!(options.passphrase, None);
         assert_eq!(options.key_length, KeyLength::Aes128);
+    }
+
+    #[test]
+    fn shared_admission_carries_the_encryption_template() {
+        let cfg = BenchConfig {
+            runtime: Runtime::Mio,
+            mode: Mode::Receiver,
+            encryption: Encryption::Aes256,
+            host: "127.0.0.1".to_owned(),
+            port: 0,
+            duration_secs: 1.0,
+            latency_ms: 120,
+            bitrate_bps: 1_000_000,
+            connections: 1,
+            ingress: Ingress::SharedPool(4),
+            bond_mode: BondMode::None,
+            bond_pairs: 0,
+            batching: Batching::On,
+            connect_concurrency: 1,
+            promotion: Promotion::Never,
+            cookie_routing: true,
+            sock_buf_bytes: 0,
+            out: None,
+            rep: 1,
+            cpus: 0,
+            pin: false,
+            workers: 1,
+            stream_secs: 1.0,
+            peer_topology: PeerTopology::default(),
+            link: Link::default(),
+        };
+        let admission = cfg.admission_options(0x1234, true);
+        let template = admission
+            .connection_template
+            .as_ref()
+            .expect("session template");
+        assert_eq!(template.socket_id, 0x1234);
+        assert_eq!(template.passphrase.as_deref(), Some("srt-bench-encryption"));
+        assert_eq!(template.key_length, KeyLength::Aes256);
     }
 
     #[test]

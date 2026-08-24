@@ -181,6 +181,12 @@ pub struct ConnectionOptions {
     pub flow_window_packets: u32,
     /// Local receive-buffer capacity, in packets.
     pub receive_buffer_packets: u32,
+    /// Maximum number of delivered DATA events retained for the application.
+    ///
+    /// Delivered-but-unread packets consume receive-window capacity just like
+    /// packets still held by the protocol receiver. This prevents an
+    /// application that stops polling events from creating an unbounded queue.
+    pub delivery_queue_packets: u32,
 }
 
 impl fmt::Debug for ConnectionOptions {
@@ -209,6 +215,7 @@ impl fmt::Debug for ConnectionOptions {
             )
             .field("flow_window_packets", &self.flow_window_packets)
             .field("receive_buffer_packets", &self.receive_buffer_packets)
+            .field("delivery_queue_packets", &self.delivery_queue_packets)
             .finish()
     }
 }
@@ -230,6 +237,7 @@ impl Default for ConnectionOptions {
             max_bandwidth_bytes_per_sec: None,
             flow_window_packets: DEFAULT_FLOW_WINDOW,
             receive_buffer_packets: DEFAULT_FLOW_WINDOW,
+            delivery_queue_packets: DEFAULT_FLOW_WINDOW,
         }
     }
 }
@@ -263,6 +271,9 @@ pub struct SrtConnection {
 
     /// イベントキュー
     event_queue: VecDeque<ConnectionEvent>,
+    /// DATA events waiting for application consumption. Control/state events
+    /// are state-machine bounded; DATA is the unbounded-rate class.
+    pending_data_events: u32,
     /// 出力キュー
     output_queue: VecDeque<ConnectionOutput>,
 
@@ -300,6 +311,10 @@ fn normalize_buffer_options(mut options: ConnectionOptions) -> ConnectionOptions
         .receive_buffer_packets
         .max(MIN_FLOW_WINDOW_PACKETS)
         .min(options.flow_window_packets);
+    options.delivery_queue_packets = options
+        .delivery_queue_packets
+        .max(1)
+        .min(options.receive_buffer_packets);
     options
 }
 
@@ -358,6 +373,7 @@ impl SrtConnection {
             sender: None,
             receiver: None,
             event_queue: VecDeque::new(),
+            pending_data_events: 0,
             output_queue: VecDeque::new(),
             start_time: None,
             last_ack_time: None,
@@ -390,6 +406,7 @@ impl SrtConnection {
             sender: None,
             receiver: None,
             event_queue: VecDeque::new(),
+            pending_data_events: 0,
             output_queue: VecDeque::new(),
             start_time: None,
             last_ack_time: None,
@@ -562,6 +579,11 @@ impl SrtConnection {
         self.options.receive_buffer_packets = receive_buffer_packets
             .max(MIN_FLOW_WINDOW_PACKETS)
             .min(self.options.flow_window_packets);
+        self.options.delivery_queue_packets = self
+            .options
+            .delivery_queue_packets
+            .max(1)
+            .min(self.options.receive_buffer_packets);
     }
 
     /// Set listener-side GROUP metadata before processing the conclusion.
@@ -753,8 +775,6 @@ impl SrtConnection {
             TimerId::Ack => {
                 // 定期 ACK 送信
                 if self.state == ConnectionState::Connected {
-                    self.send_ack(now);
-
                     // TLPKTDROP: 期限切れパケットを削除
                     if let Some(receiver) = self.receiver.as_mut() {
                         for seq in receiver.drop_too_late(now) {
@@ -762,15 +782,9 @@ impl SrtConnection {
                                 sender.discard_acked(seq);
                             }
                         }
-                        while let Some(ready_pkt) = receiver.pop_ready(now) {
-                            self.event_queue.push_back(ConnectionEvent::DataReceived {
-                                payload: ready_pkt.payload,
-                                sequence_number: ready_pkt.sequence_number,
-                                message_number: ready_pkt.message_number,
-                                timestamp: ready_pkt.timestamp,
-                            });
-                        }
                     }
+                    self.enqueue_ready_data(now);
+                    self.send_ack(now);
 
                     if let Some(sender) = self.sender.as_mut() {
                         let _ = sender.drop_expired(now);
@@ -916,14 +930,7 @@ impl SrtConnection {
             return;
         };
         receiver.advance_expected_sequence(sequence_number);
-        while let Some(ready_packet) = receiver.pop_ready(now) {
-            self.event_queue.push_back(ConnectionEvent::DataReceived {
-                payload: ready_packet.payload,
-                sequence_number: ready_packet.sequence_number,
-                message_number: ready_packet.message_number,
-                timestamp: ready_packet.timestamp,
-            });
-        }
+        self.enqueue_ready_data(now);
     }
 
     pub fn synchronize_send_sequence(&mut self, sequence_number: u32) -> Result<(), Error> {
@@ -966,7 +973,12 @@ impl SrtConnection {
 
     /// イベントを取得
     pub fn poll_event(&mut self) -> Option<ConnectionEvent> {
-        self.event_queue.pop_front()
+        let event = self.event_queue.pop_front()?;
+        if matches!(event, ConnectionEvent::DataReceived { .. }) {
+            self.pending_data_events = self.pending_data_events.saturating_sub(1);
+            self.sync_application_backlog();
+        }
+        Some(event)
     }
 
     /// 出力を取得
@@ -1044,6 +1056,50 @@ impl SrtConnection {
             .map_or(0, |s| now.as_micros().saturating_sub(s.as_micros())) as u32
     }
 
+    /// Move at most the configured amount of protocol-ready DATA into the
+    /// application queue. Packets that do not fit deliberately remain in the
+    /// receiver, where they continue to consume SRT receive-window capacity.
+    fn enqueue_ready_data(&mut self, now: Timestamp) {
+        let available = self
+            .options
+            .delivery_queue_packets
+            .saturating_sub(self.pending_data_events) as usize;
+        if available == 0 {
+            return;
+        }
+
+        let ready_packets = {
+            let Some(receiver) = self.receiver.as_mut() else {
+                return;
+            };
+            let mut ready_packets = Vec::with_capacity(available);
+            for _ in 0..available {
+                let Some(packet) = receiver.pop_ready(now) else {
+                    break;
+                };
+                ready_packets.push(packet);
+            }
+            ready_packets
+        };
+
+        for packet in ready_packets {
+            self.event_queue.push_back(ConnectionEvent::DataReceived {
+                payload: packet.payload,
+                sequence_number: packet.sequence_number,
+                message_number: packet.message_number,
+                timestamp: packet.timestamp,
+            });
+            self.pending_data_events = self.pending_data_events.saturating_add(1);
+        }
+        self.sync_application_backlog();
+    }
+
+    fn sync_application_backlog(&mut self) {
+        if let Some(receiver) = self.receiver.as_mut() {
+            receiver.set_application_backlog_packets(self.pending_data_events);
+        }
+    }
+
     fn handle_data_packet(&mut self, pkt: DataPacket, now: Timestamp) -> Result<(), Error> {
         if self.state != ConnectionState::Connected {
             return Ok(()); // 接続前のデータは無視
@@ -1088,8 +1144,10 @@ impl SrtConnection {
             }
         }
 
-        // 受信バッファに追加し、損失と配信可能パケットを取得
-        let (losses, should_ack, ready_packets) = {
+        // Receive before delivery. Ready packets are moved into the bounded
+        // application queue below, so unread application data remains part of
+        // the advertised receive window instead of accumulating without bound.
+        let (losses, should_ack) = {
             let receiver = match self.receiver.as_mut() {
                 Some(r) => r,
                 None => return Ok(()),
@@ -1101,13 +1159,7 @@ impl SrtConnection {
             let losses = receiver.receive(decrypted_pkt, now);
             let should_ack = receiver.should_send_ack(now);
 
-            // 配信可能なパケットを収集
-            let mut ready_packets = Vec::new();
-            while let Some(ready_pkt) = receiver.pop_ready(now) {
-                ready_packets.push(ready_pkt);
-            }
-
-            (losses, should_ack, ready_packets)
+            (losses, should_ack)
         };
 
         // 損失が検出された場合、NAK を送信
@@ -1117,19 +1169,12 @@ impl SrtConnection {
             self.send_nak(&loss_list, now);
         }
 
-        // Light ACK チェック
+        self.enqueue_ready_data(now);
+
+        // Light ACK チェック. This runs after delivery admission so the ACK's
+        // available-buffer field includes application backlog.
         if should_ack {
             self.send_ack(now);
-        }
-
-        // 配信可能なパケットをイベントキューに追加
-        for ready_pkt in ready_packets {
-            self.event_queue.push_back(ConnectionEvent::DataReceived {
-                payload: ready_pkt.payload,
-                sequence_number: ready_pkt.sequence_number,
-                message_number: ready_pkt.message_number,
-                timestamp: ready_pkt.timestamp,
-            });
         }
 
         Ok(())
@@ -1523,15 +1568,8 @@ impl SrtConnection {
         // 切断前に受信バッファをフラッシュ (TSBPD を無視して即時配信)
         if let Some(receiver) = self.receiver.as_mut() {
             receiver.set_tsbpd_enabled(false);
-            while let Some(ready_pkt) = receiver.pop_ready(now) {
-                self.event_queue.push_back(ConnectionEvent::DataReceived {
-                    payload: ready_pkt.payload,
-                    sequence_number: ready_pkt.sequence_number,
-                    message_number: ready_pkt.message_number,
-                    timestamp: ready_pkt.timestamp,
-                });
-            }
         }
+        self.enqueue_ready_data(now);
 
         self.set_state(ConnectionState::Disconnected);
         self.event_queue.push_back(ConnectionEvent::Disconnected {
@@ -2265,6 +2303,55 @@ mod tests {
         };
         let handshake = HandshakePacket::decode(&control).expect("valid handshake");
         assert_eq!(handshake.flow_window, 8_548);
+    }
+
+    #[test]
+    fn unread_data_events_are_bounded_and_consume_receive_window() {
+        let mut conn = SrtConnection::new_listener(ConnectionOptions {
+            tsbpd_delay: 0,
+            flow_window_packets: 3,
+            receive_buffer_packets: 3,
+            delivery_queue_packets: 2,
+            ..ConnectionOptions::default()
+        });
+        conn.set_state(ConnectionState::Connected);
+        let _ = conn.poll_event();
+        let now = Timestamp::from_micros(0);
+        conn.init_buffers(now, 0, 0);
+        conn.receiver
+            .as_mut()
+            .expect("connected listener has a receiver")
+            .set_tsbpd_enabled(false);
+
+        // The protocol enforces a minimum 32-packet SRT flow window; fill it
+        // while keeping only two payloads in the application queue.
+        for sequence_number in 0..32 {
+            conn.handle_data_packet(
+                DataPacket::new(sequence_number, sequence_number, 0, 0, vec![1]),
+                now,
+            )
+            .expect("data is accepted");
+        }
+
+        assert_eq!(conn.pending_data_events, 2);
+        let stats = conn.receiver_stats().expect("receiver stats");
+        assert_eq!(stats.packets_in_buffer, 30);
+        assert_eq!(stats.available_buffer_packets, 0);
+
+        assert!(matches!(
+            conn.poll_event(),
+            Some(ConnectionEvent::DataReceived { .. })
+        ));
+        assert_eq!(conn.pending_data_events, 1);
+        conn.handle_timer(TimerId::Ack, Timestamp::from_micros(10_000))
+            .expect("ACK timer drains newly admitted delivery");
+        assert_eq!(conn.pending_data_events, 2);
+        assert_eq!(
+            conn.receiver_stats()
+                .expect("receiver stats")
+                .available_buffer_packets,
+            1
+        );
     }
 
     #[test]

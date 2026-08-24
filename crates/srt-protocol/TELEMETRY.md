@@ -49,8 +49,11 @@ but produces no rate.
 - Receiver `total_lost` counts newly detected missing sequence numbers.
   `total_dropped` is the subset later abandoned by TLPKTDROP.
 - `payload_bytes_in_buffer` is exact. Available buffer capacity is exact in
-  packets. `available_buffer_bytes` is `None` because this core configures
-  packet capacity, so inventing a byte capacity would be misleading.
+  packets and includes DATA already delivered into the bounded application
+  event queue but not yet polled. Thus a stalled application reduces the
+  advertised SRT receive window instead of growing an unbounded payload queue.
+  `available_buffer_bytes` is `None` because this core configures packet
+  capacity, so inventing a byte capacity would be misleading.
 - Peer measurements are `None` until a full ACK has been received. Peer link
   capacity in bytes per second is derived from its packet-capacity estimate
   and measured wire bytes per packet.

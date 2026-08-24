@@ -342,6 +342,11 @@ pub struct ReceiverBuffer {
     /// バッファ最大サイズ
     max_buffer_size: u32,
 
+    /// Packets delivered to, but not yet consumed from, the application's
+    /// bounded delivery queue. They remain part of advertised receive-window
+    /// occupancy.
+    application_backlog_packets: u32,
+
     /// 受信パケット総数 (統計用)
     total_received: u64,
 
@@ -438,6 +443,7 @@ impl ReceiverBuffer {
             rtt: 100_000, // 初期 RTT: 100ms
             rtt_var: 50_000,
             max_buffer_size,
+            application_backlog_packets: 0,
             total_received: 0,
             total_data_packets_received: 0,
             total_lost: 0,
@@ -887,12 +893,24 @@ impl ReceiverBuffer {
             ack_seq: self.expected_seq,
             rtt: self.rtt,
             rtt_var: self.rtt_var,
-            available_buffer: (self.max_buffer_size - self.packets.len() as u32),
+            available_buffer: self.available_buffer_packets(),
             receiving_rate,
             link_capacity,
             recv_rate,
             is_light,
         }
+    }
+
+    /// Update application-owned receive occupancy maintained by the owning
+    /// connection as it queues and polls `DataReceived` events.
+    pub(crate) fn set_application_backlog_packets(&mut self, packets: u32) {
+        self.application_backlog_packets = packets.min(self.max_buffer_size);
+    }
+
+    fn available_buffer_packets(&self) -> u32 {
+        self.max_buffer_size
+            .saturating_sub(self.packets.len() as u32)
+            .saturating_sub(self.application_backlog_packets)
     }
 
     /// Periodic NAK を生成
@@ -1075,9 +1093,7 @@ impl ReceiverBuffer {
             packets_in_buffer: self.packets.len() as u32,
             payload_bytes_in_buffer,
             packets_in_loss_list: self.loss_list.len() as u32,
-            available_buffer_packets: self
-                .max_buffer_size
-                .saturating_sub(self.packets.len() as u32),
+            available_buffer_packets: self.available_buffer_packets(),
             available_buffer_bytes: None,
             max_buffer_packets: self.max_buffer_size,
             buffer_span_micros,

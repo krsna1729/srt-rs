@@ -984,6 +984,7 @@ fn make_opts(socket_id: u32) -> ConnectionOptions {
         max_bandwidth_bytes_per_sec: None,
         flow_window_packets: 8192,
         receive_buffer_packets: 8192,
+        delivery_queue_packets: 8192,
     }
 }
 
@@ -1004,6 +1005,7 @@ fn make_opts_with_stream_id(socket_id: u32, stream_id: String) -> ConnectionOpti
         max_bandwidth_bytes_per_sec: None,
         flow_window_packets: 8192,
         receive_buffer_packets: 8192,
+        delivery_queue_packets: 8192,
     }
 }
 

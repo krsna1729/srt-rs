@@ -59,6 +59,7 @@ use shiguredo_srt::{
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::hash_map::Entry as HashEntry;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::fmt;
 use std::hash::Hash;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -3406,6 +3407,544 @@ mod tests {
             store.time_until_earliest(Timestamp::from_micros(1_000), 99),
             99
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bonded/group caller transport
+// ---------------------------------------------------------------------------
+
+/// One outbound leg supplied when constructing a [`GroupConn`]. The socket
+/// must be connected and nonblocking; [`GroupConn::caller`] constructs such
+/// legs from [`CallerConfig`] when an application does not need custom I/O.
+pub struct GroupConnectionLeg {
+    pub member_id: u32,
+    pub weight: u16,
+    pub connection: SrtConnection,
+    pub socket: std::net::UdpSocket,
+}
+
+/// Configuration for one outbound leg of a bonded caller.
+#[derive(Clone, Debug)]
+pub struct GroupCallerLeg {
+    pub member_id: u32,
+    pub weight: u16,
+    pub caller: CallerConfig,
+}
+
+impl GroupCallerLeg {
+    #[must_use]
+    pub fn new(member_id: u32, weight: u16, caller: CallerConfig) -> Self {
+        Self {
+            member_id,
+            weight,
+            caller,
+        }
+    }
+}
+
+/// Failure while constructing a bonded caller.
+#[derive(Debug)]
+pub enum GroupBuildError {
+    Config(ConfigError),
+    Io(std::io::Error),
+    Protocol(shiguredo_srt::Error),
+    InvalidGroupType,
+}
+
+impl fmt::Display for GroupBuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Config(error) => error.fmt(f),
+            Self::Io(error) => error.fmt(f),
+            Self::Protocol(error) => error.fmt(f),
+            Self::InvalidGroupType => write!(f, "bond group type must be Broadcast or Backup"),
+        }
+    }
+}
+
+impl std::error::Error for GroupBuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Config(error) => Some(error),
+            Self::Io(error) => Some(error),
+            Self::Protocol(error) => Some(error),
+            Self::InvalidGroupType => None,
+        }
+    }
+}
+
+impl From<ConfigError> for GroupBuildError {
+    fn from(value: ConfigError) -> Self {
+        Self::Config(value)
+    }
+}
+
+impl From<std::io::Error> for GroupBuildError {
+    fn from(value: std::io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+impl From<shiguredo_srt::Error> for GroupBuildError {
+    fn from(value: shiguredo_srt::Error) -> Self {
+        Self::Protocol(value)
+    }
+}
+
+struct GroupLegIo {
+    member_id: u32,
+    socket: std::net::UdpSocket,
+    timers: ManualTimerStore,
+    pending_outputs: VecDeque<ConnectionOutput>,
+}
+
+/// Per-leg I/O work completed by one [`GroupConn::drive`] call.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GroupLegDriveReport {
+    pub member_id: u32,
+    pub received_datagrams: usize,
+    pub output: OutputDrainReport,
+}
+
+/// Work completed by one bounded bonded-transport maintenance call.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GroupDriveReport {
+    pub legs: Vec<GroupLegDriveReport>,
+}
+
+impl GroupDriveReport {
+    #[must_use]
+    pub fn received_datagrams(&self) -> usize {
+        self.legs.iter().map(|leg| leg.received_datagrams).sum()
+    }
+}
+
+/// Snapshot for one physical bonded leg. Connection counters retain their
+/// normal single-SRT meaning and are never deduplicated.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupLegStats {
+    pub member_id: u32,
+    pub weight: u16,
+    pub state: shiguredo_srt::GroupMemberState,
+    pub local_addr: Option<std::net::SocketAddr>,
+    pub peer_addr: Option<std::net::SocketAddr>,
+    pub connection: shiguredo_srt::ConnectionStats,
+}
+
+/// Group-level telemetry with explicitly separate logical and wire views.
+///
+/// `logical_*` counts one payload once at the group API boundary. `wire_*`
+/// sums all legs, so Broadcast correctly reports duplicated media delivery
+/// and retransmissions rather than disguising their network cost.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GroupAggregateStats {
+    pub active_legs: usize,
+    pub standby_legs: usize,
+    pub pending_legs: usize,
+    pub broken_legs: usize,
+    pub logical_payloads_sent: u64,
+    pub logical_payload_bytes_sent: u64,
+    pub logical_payloads_received: u64,
+    pub logical_payload_bytes_received: u64,
+    pub wire_unique_packets_sent: u64,
+    pub wire_packets_sent: u64,
+    pub wire_payload_bytes_sent: u64,
+    pub wire_srt_bytes_sent: u64,
+    pub wire_packets_retransmitted: u64,
+    /// Sum of sender-side loss occurrences reported by peers through NAKs.
+    pub wire_sender_packets_lost: u64,
+    pub wire_packets_received: u64,
+    pub wire_unique_packets_received: u64,
+    pub wire_srt_bytes_received: u64,
+    /// Sum of receiver-side missing sequence numbers detected on all legs.
+    pub wire_receiver_packets_lost: u64,
+    pub wire_packets_undecryptable: u64,
+}
+
+/// Complete bonded-connection telemetry: one snapshot per leg plus a clearly
+/// named aggregate that is safe for dashboards and alerting.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupConnectionStats {
+    pub group_id: u32,
+    pub mode: shiguredo_srt::GroupMode,
+    pub aggregate: GroupAggregateStats,
+    pub legs: Vec<GroupLegStats>,
+}
+
+/// Runtime-neutral multi-socket driver for an SRT Broadcast or Backup group.
+///
+/// This is intentionally synchronous and nonblocking. Tokio, smol, mio, and
+/// other runtimes can register the exposed leg sockets in their own reactors,
+/// then call [`Self::drive`] when any leg is readable or a timer is due. That
+/// keeps group semantics in one implementation instead of copying subtly
+/// different versions into every runtime adapter.
+pub struct GroupConn {
+    group: shiguredo_srt::SrtGroup,
+    legs: Vec<GroupLegIo>,
+    logical_payloads_sent: u64,
+    logical_payload_bytes_sent: u64,
+    logical_payloads_received: u64,
+    logical_payload_bytes_received: u64,
+}
+
+impl GroupConn {
+    /// Build a group around caller configurations, binding one connected UDP
+    /// socket and initiating one SRT handshake for every supplied leg.
+    pub fn caller(
+        group: GroupConfig,
+        legs: impl IntoIterator<Item = GroupCallerLeg>,
+        runtime: RuntimeFlavor,
+        now: Timestamp,
+    ) -> Result<Self, GroupBuildError> {
+        let mut raw_legs = Vec::new();
+        for leg in legs {
+            let mut caller = leg.caller;
+            caller.session.set_group(Some(GroupConfig {
+                group_id: group.group_id,
+                group_type: group.group_type,
+                flags: group.flags,
+                weight: leg.weight,
+            }));
+            let prepared = caller.prepare(runtime)?;
+            raw_legs.push(GroupConnectionLeg {
+                member_id: leg.member_id,
+                weight: leg.weight,
+                connection: prepared.connection(now)?,
+                socket: prepared.bind_socket()?,
+            });
+        }
+        let mode = shiguredo_srt::GroupMode::from_group_type(group.group_type)
+            .ok_or(GroupBuildError::InvalidGroupType)?;
+        Ok(Self::new(group.group_id, mode, raw_legs)?)
+    }
+
+    /// Assemble a group from application-owned protocol cores and connected,
+    /// nonblocking sockets. This is the integration point for custom runtimes
+    /// and for applications that own their own socket provisioning.
+    pub fn new(
+        group_id: u32,
+        mode: shiguredo_srt::GroupMode,
+        legs: impl IntoIterator<Item = GroupConnectionLeg>,
+    ) -> Result<Self, shiguredo_srt::Error> {
+        let mut group = shiguredo_srt::SrtGroup::new(group_id, mode)?;
+        let mut io_legs = Vec::new();
+        for leg in legs {
+            group.add_member(leg.member_id, leg.weight, leg.connection)?;
+            io_legs.push(GroupLegIo {
+                member_id: leg.member_id,
+                socket: leg.socket,
+                timers: ManualTimerStore::new(),
+                pending_outputs: VecDeque::new(),
+            });
+        }
+        Ok(Self {
+            group,
+            legs: io_legs,
+            logical_payloads_sent: 0,
+            logical_payload_bytes_sent: 0,
+            logical_payloads_received: 0,
+            logical_payload_bytes_received: 0,
+        })
+    }
+
+    #[must_use]
+    pub fn group(&self) -> &shiguredo_srt::SrtGroup {
+        &self.group
+    }
+
+    /// Physical sockets to register with an application's runtime reactor.
+    /// Call [`Self::drive`] after readability or at the next timer deadline.
+    pub fn leg_sockets(&self) -> impl ExactSizeIterator<Item = (u32, &std::net::UdpSocket)> {
+        self.legs.iter().map(|leg| (leg.member_id, &leg.socket))
+    }
+
+    /// Microseconds until the earliest leg timer, falling back to
+    /// `default_micros` when no timer is armed.
+    #[must_use]
+    pub fn time_until_next_deadline(&self, now: Timestamp, default_micros: u64) -> u64 {
+        self.legs
+            .iter()
+            .map(|leg| leg.timers.time_until_earliest(now, default_micros))
+            .min()
+            .unwrap_or(default_micros)
+    }
+
+    /// Send one logical payload according to the group's Broadcast or Backup
+    /// policy. The return value is the number of physical legs selected.
+    pub fn send(&mut self, payload: &[u8], now: Timestamp) -> Result<usize, shiguredo_srt::Error> {
+        let legs = self.group.send(payload, now)?;
+        self.logical_payloads_sent = self.logical_payloads_sent.saturating_add(1);
+        self.logical_payload_bytes_sent = self
+            .logical_payload_bytes_sent
+            .saturating_add(payload.len() as u64);
+        Ok(legs)
+    }
+
+    /// Return the next deduplicated, sequence-aligned group payload.
+    pub fn poll_data(&mut self, now: Timestamp) -> Option<shiguredo_srt::GroupPacket> {
+        let packet = self.group.poll_data(now)?;
+        self.logical_payloads_received = self.logical_payloads_received.saturating_add(1);
+        self.logical_payload_bytes_received = self
+            .logical_payload_bytes_received
+            .saturating_add(packet.payload.len() as u64);
+        Some(packet)
+    }
+
+    /// Drive timers, nonblocking UDP input, and a bounded output pump for
+    /// every leg once. A readable leg may contain up to 64 datagrams per call
+    /// to avoid one busy path starving the rest of the group.
+    pub fn drive(
+        &mut self,
+        now: Timestamp,
+        output_budget: OutputDrainBudget,
+    ) -> std::io::Result<GroupDriveReport> {
+        let mut report = GroupDriveReport {
+            legs: Vec::with_capacity(self.legs.len()),
+        };
+        let (group, legs) = (&mut self.group, &mut self.legs);
+        for leg in legs {
+            let member = group
+                .member_mut(leg.member_id)
+                .expect("group and I/O legs are built together");
+            let conn = member.connection_mut();
+            leg.timers.fire_expired(now, conn);
+
+            let mut received_datagrams = 0;
+            let mut buffer = [0_u8; 65_536];
+            for _ in 0..64 {
+                match leg.socket.recv(&mut buffer) {
+                    Ok(size) => {
+                        received_datagrams += 1;
+                        conn.feed_recv_buf(&buffer[..size], now).map_err(|error| {
+                            std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                        })?;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) => return Err(error),
+                }
+            }
+
+            let output = drain_group_leg_outputs(conn, leg, now, output_budget)?;
+            report.legs.push(GroupLegDriveReport {
+                member_id: leg.member_id,
+                received_datagrams,
+                output,
+            });
+        }
+        Ok(report)
+    }
+
+    /// Snapshot both physical-leg and logical-group telemetry. Do not replace
+    /// the per-leg rows with the aggregate: loss, RTT, key failures, and path
+    /// health are inherently leg-specific.
+    #[must_use]
+    pub fn stats(&self) -> GroupConnectionStats {
+        let mut aggregate = GroupAggregateStats {
+            logical_payloads_sent: self.logical_payloads_sent,
+            logical_payload_bytes_sent: self.logical_payload_bytes_sent,
+            logical_payloads_received: self.logical_payloads_received,
+            logical_payload_bytes_received: self.logical_payload_bytes_received,
+            ..GroupAggregateStats::default()
+        };
+        let mut legs = Vec::with_capacity(self.legs.len());
+        for member in self.group.members() {
+            let io = self
+                .legs
+                .iter()
+                .find(|leg| leg.member_id == member.id())
+                .expect("group and I/O legs are built together");
+            match member.state() {
+                shiguredo_srt::GroupMemberState::Active => aggregate.active_legs += 1,
+                shiguredo_srt::GroupMemberState::Standby => aggregate.standby_legs += 1,
+                shiguredo_srt::GroupMemberState::Pending => aggregate.pending_legs += 1,
+                shiguredo_srt::GroupMemberState::Broken => aggregate.broken_legs += 1,
+            }
+            let connection = member.connection().stats();
+            if let Some(sender) = connection.sender {
+                aggregate.wire_unique_packets_sent = aggregate
+                    .wire_unique_packets_sent
+                    .saturating_add(sender.total_sent);
+                aggregate.wire_packets_sent = aggregate
+                    .wire_packets_sent
+                    .saturating_add(sender.total_data_packets_sent);
+                aggregate.wire_payload_bytes_sent = aggregate
+                    .wire_payload_bytes_sent
+                    .saturating_add(sender.total_bytes_sent);
+                aggregate.wire_srt_bytes_sent = aggregate
+                    .wire_srt_bytes_sent
+                    .saturating_add(sender.total_srt_bytes_sent);
+                aggregate.wire_packets_retransmitted = aggregate
+                    .wire_packets_retransmitted
+                    .saturating_add(sender.total_retransmits);
+                aggregate.wire_sender_packets_lost = aggregate
+                    .wire_sender_packets_lost
+                    .saturating_add(sender.total_lost);
+            }
+            if let Some(receiver) = connection.receiver {
+                aggregate.wire_packets_received = aggregate
+                    .wire_packets_received
+                    .saturating_add(receiver.total_data_packets_received);
+                aggregate.wire_unique_packets_received = aggregate
+                    .wire_unique_packets_received
+                    .saturating_add(receiver.total_received);
+                aggregate.wire_srt_bytes_received = aggregate
+                    .wire_srt_bytes_received
+                    .saturating_add(receiver.total_srt_bytes_received);
+                aggregate.wire_receiver_packets_lost = aggregate
+                    .wire_receiver_packets_lost
+                    .saturating_add(receiver.total_lost);
+                aggregate.wire_packets_undecryptable = aggregate
+                    .wire_packets_undecryptable
+                    .saturating_add(receiver.total_undecryptable);
+            }
+            legs.push(GroupLegStats {
+                member_id: member.id(),
+                weight: member.weight(),
+                state: member.state(),
+                local_addr: io.socket.local_addr().ok(),
+                peer_addr: io.socket.peer_addr().ok(),
+                connection,
+            });
+        }
+        GroupConnectionStats {
+            group_id: self.group.group_id(),
+            mode: self.group.mode(),
+            aggregate,
+            legs,
+        }
+    }
+}
+
+fn drain_group_leg_outputs(
+    conn: &mut SrtConnection,
+    leg: &mut GroupLegIo,
+    now: Timestamp,
+    budget: OutputDrainBudget,
+) -> std::io::Result<OutputDrainReport> {
+    let (mut work, budget_exhausted) = collect_output_work(conn, &mut leg.pending_outputs, budget);
+    let mut report = OutputDrainReport {
+        status: if budget_exhausted {
+            OutputDrainStatus::BudgetExhausted
+        } else {
+            OutputDrainStatus::Drained
+        },
+        ..OutputDrainReport::default()
+    };
+    while let Some(output) = work.pop_front() {
+        match output {
+            ConnectionOutput::SendPacket(packet) => match leg.socket.send(&packet) {
+                Ok(sent) if sent == packet.len() => {
+                    report.actions += 1;
+                    report.packets += 1;
+                    report.bytes += sent;
+                }
+                Ok(_) => {
+                    prepend_outputs(&mut leg.pending_outputs, work.into_iter());
+                    leg.pending_outputs
+                        .push_front(ConnectionOutput::SendPacket(packet));
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "UDP socket reported a partial datagram send",
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    prepend_outputs(&mut leg.pending_outputs, work.into_iter());
+                    leg.pending_outputs
+                        .push_front(ConnectionOutput::SendPacket(packet));
+                    report.status = OutputDrainStatus::Backpressured;
+                    return Ok(report);
+                }
+                Err(error) => {
+                    prepend_outputs(&mut leg.pending_outputs, work.into_iter());
+                    leg.pending_outputs
+                        .push_front(ConnectionOutput::SendPacket(packet));
+                    return Err(error);
+                }
+            },
+            timer => {
+                leg.timers.apply_output(&timer, now);
+                report.actions += 1;
+            }
+        }
+    }
+    Ok(report)
+}
+
+#[cfg(test)]
+mod group_conn_tests {
+    use super::*;
+
+    #[test]
+    fn caller_drives_every_leg_and_exposes_per_leg_telemetry() {
+        let first_peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("first peer binds");
+        let second_peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("second peer binds");
+        first_peer
+            .set_nonblocking(true)
+            .expect("first peer is nonblocking");
+        second_peer
+            .set_nonblocking(true)
+            .expect("second peer is nonblocking");
+
+        let group = GroupConfig::new(42, shiguredo_srt::GroupType::Broadcast);
+        let mut conn = GroupConn::caller(
+            group,
+            [
+                GroupCallerLeg::new(
+                    1,
+                    10,
+                    CallerConfig::builder(first_peer.local_addr().expect("first address"))
+                        .build()
+                        .expect("first caller config"),
+                ),
+                GroupCallerLeg::new(
+                    2,
+                    20,
+                    CallerConfig::builder(second_peer.local_addr().expect("second address"))
+                        .build()
+                        .expect("second caller config"),
+                ),
+            ],
+            RuntimeFlavor::Mio,
+            Timestamp::from_micros(0),
+        )
+        .expect("bonded caller builds");
+
+        let report = conn
+            .drive(Timestamp::from_micros(0), OutputDrainBudget::default())
+            .expect("all induction packets are sent");
+        assert_eq!(report.legs.len(), 2);
+        assert_eq!(
+            report
+                .legs
+                .iter()
+                .map(|leg| leg.output.packets)
+                .sum::<usize>(),
+            2
+        );
+
+        let mut buf = [0_u8; 1500];
+        for peer in [&first_peer, &second_peer] {
+            let size = peer.recv(&mut buf).expect("each peer receives induction");
+            let shiguredo_srt::SrtPacket::Control(packet) =
+                shiguredo_srt::SrtPacket::decode(&buf[..size]).expect("valid SRT handshake")
+            else {
+                panic!("induction is a control packet");
+            };
+            let handshake = shiguredo_srt::HandshakePacket::decode(&packet).expect("handshake");
+            assert_eq!(
+                handshake
+                    .get_group_extension()
+                    .map(|extension| extension.group_id),
+                Some(group.group_id)
+            );
+        }
+
+        let stats = conn.stats();
+        assert_eq!(stats.group_id, group.group_id);
+        assert_eq!(stats.legs.len(), 2);
+        assert_eq!(stats.aggregate.pending_legs, 2);
+        assert!(stats.legs.iter().all(|leg| leg.peer_addr.is_some()));
     }
 }
 

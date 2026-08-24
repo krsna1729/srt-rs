@@ -74,7 +74,17 @@ Three layers:
      plain exporter-friendly `IngressTelemetrySnapshot`; `report()` is only
      the human-readable view.
 
-3. **Per-runtime `Conn`** (feature-gated): wraps an `SrtConnection`
+3. **Bonded caller transport** (always compiled, runtime-neutral)
+   - `GroupConn` owns a real UDP socket, timer store, output queue, and
+     `SrtConnection` for every Broadcast or Backup leg. `drive()` is
+     synchronous/nonblocking so an application registers `leg_sockets()` in
+     its existing reactor rather than paying for a hidden second runtime.
+   - `GroupConnectionStats` exposes both **per-leg** connection snapshots and
+     a group aggregate. `logical_*` counts media once at the group API;
+     `wire_*` sums physical legs, so Broadcast's duplicate egress and each
+     path's retransmit/loss remain visible instead of being averaged away.
+
+4. **Per-runtime `Conn`** (feature-gated): wraps an `SrtConnection`
    + that runtime's UDP socket + its native timer. Each exposes the same
    small verb set: `fire_expired`, `drain_outputs`, `send_paced`,
    `recv_with_timeout` (async runtimes also get a combined `tick`).

@@ -656,6 +656,19 @@ impl SessionConfig {
     pub fn set_flow_control(&mut self, flow: FlowControlConfig) -> &mut Self {
         self.connection.flow_window_packets = flow.window_packets.get();
         self.connection.receive_buffer_packets = flow.receive_buffer_packets.get();
+        self.connection.delivery_queue_packets = self
+            .connection
+            .delivery_queue_packets
+            .min(flow.receive_buffer_packets.get())
+            .max(1);
+        self
+    }
+
+    /// Bound DATA events retained for the application. Unread events consume
+    /// receive-window capacity, so this is both a memory limit and the
+    /// portable replacement for a receiver that stops calling `recv`.
+    pub fn set_delivery_queue_packets(&mut self, capacity: NonZeroU32) -> &mut Self {
+        self.connection.delivery_queue_packets = capacity.get();
         self
     }
 
@@ -707,6 +720,18 @@ impl SessionConfig {
             return Err(ConfigError::new(
                 "session.receive_buffer_packets",
                 "must not exceed the flow-control window",
+            ));
+        }
+        if self.connection.delivery_queue_packets == 0 {
+            return Err(ConfigError::new(
+                "session.delivery_queue_packets",
+                "must be non-zero",
+            ));
+        }
+        if self.connection.delivery_queue_packets > self.connection.receive_buffer_packets {
+            return Err(ConfigError::new(
+                "session.delivery_queue_packets",
+                "must not exceed the receive buffer",
             ));
         }
         if self

@@ -13,7 +13,7 @@ No C toolchain, no libsrt linkage — the entire stack is Rust
 | Crate | Path | Role |
 |---|---|---|
 | [`shiguredo_srt`](crates/srt-protocol) | `crates/srt-protocol` | Sans-I/O SRT protocol core: handshake (v4/v5), encryption, ACK/NAK/TSBPD, bonding groups, StreamID access control |
-| [`srt-transport`](crates/srt-transport) | `crates/srt-transport` | Mechanism: per-runtime UDP adapter `Conn` structs (feature-gated), plus the runtime-neutral admission peer table, handoff message types, socket helpers, and ingress telemetry |
+| [`srt-transport`](crates/srt-transport) | `crates/srt-transport` | Mechanism: per-runtime UDP adapters, a runtime-neutral bonded `GroupConn`, admission peer table, handoff message types, socket helpers, and ingress telemetry |
 | [`srt-lifecycle`](crates/srt-lifecycle) | `crates/srt-lifecycle` | Policy: worker routing, group affinity, promotion ladder, SYN-cookie codec, terminal-state rule |
 | [`srt-bench`](crates/srt-bench) | `crates/srt-bench` | Caller/listener binaries + bake-off harness across all six runtimes |
 
