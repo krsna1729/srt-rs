@@ -12,10 +12,20 @@
 # both the two move together. Varying them independently does, at the
 # cost of 4x the cells.
 #
-# 6 runtimes x 4 ingress x 4 encryption x 4 connections x 4 bitrate
+# Raw product: 6 runtimes x 4 ingress x 4 encryption x 4 connections x 4 bitrate
 # x 3 workers x 4 promotion x 2 cookie-routing x 2 batch x 2 sock-buf
 # x 2 connect-concurrency x 3 bond x 2 pin = 1,769,472 cells.
-# This is intentionally exhaustive, not a default smoke test.
+#
+# The harness applies capability filtering after expansion. It retains one
+# representative for inert axes, keeps promotion/cookie controls only where
+# reuseport admission can observe them, keeps batching only where mio has a
+# shared-socket batched path, keeps pinning only where glommio applies it, and
+# removes bond groups larger than half the connection population. Within
+# reuseport-multi with no bond group, relocate and bonded collapse to never,
+# so only never/all are retained. With the values below that leaves 142,464
+# executable, non-duplicate cells.
+# This is intentionally exhaustive across meaningful behavior, not a default
+# smoke test.
 #
 # Run with:
 #   srt-bench matrix --plan docs/plans/full-matrix.plan \

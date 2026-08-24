@@ -6,7 +6,9 @@ for wire-level interop testing and the six-runtime driver-framework
 bake-off — without linking an application crate or libsrt.
 `publish = false`.
 
-One binary, **six runtime backends**, two roles:
+One binary, **six runtime backends**, two roles. At startup it raises the
+soft `RLIMIT_NOFILE` to the hard limit when permitted; `matrix` also prints a
+host-capacity diagnostic, and `system-info` prints the same report on demand.
 
 | Backend | Execution model | Notes |
 |---|---|---|
@@ -19,8 +21,8 @@ One binary, **six runtime backends**, two roles:
 
 ## Usage
 
-One binary, four subcommands: run a role, sweep a matrix of them, report
-on the results, or profile one pair.
+One binary, five subcommands: run a role, sweep a matrix of them, report on
+the results, profile one pair, or inspect host capacity.
 
 ```
 srt-bench runtime=<mio|tokio|smol|monoio|glommio|compio> \
@@ -52,12 +54,28 @@ srt-bench report scratch/base.tsv --by ingress,runtime
 
 # Syscall / io_uring attribution for one pair (external dep: `perf`).
 srt-bench sysprof --runtime glommio --connections 150
+
+# Print the host settings that bound benchmark capacity.
+srt-bench system-info
 ```
 
 Every axis is a comma-separated list; unspecified axes take one default
 value. `encryption` selects plaintext or AES-128/AES-192/AES-256 using a
 shared benchmark passphrase. A cell a runtime does not implement is skipped
 and counted, so a gap in coverage reads as a gap rather than as a failure.
+
+The exhaustive matrix is filtered after its raw cartesian product is built.
+This removes combinations that cannot change behavior: promotion and cookie
+routing outside `reuseport-multi`, batching outside mio's shared-socket
+paths, and pinning outside glommio. It also removes bond-group requests larger
+than half the connection population. One representative value is retained for
+an inert axis, so a one-value custom plan remains runnable. The filter summary
+is printed before the run and the reported cell count is the filtered count.
+
+For the checked-in `full-matrix.plan`, the raw product is 1,769,472 cells and
+the capability-aware product is 142,464 cells. The omitted combinations are
+not protocol experiments: they either repeat an identical runtime behavior or
+request more bond pairs than the cell can contain.
 
 This replaced a 344-line `bench.sh` that wrapped 86 lines of inline
 Python whose only job was re-parsing this binary's own stdout. The

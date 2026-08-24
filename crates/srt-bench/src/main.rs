@@ -17,6 +17,9 @@
 //!     --encryption plain,128,192,256 --promotion never,all \
 //!     --connections 25,150 --reps 3 --out results.tsv
 //!
+//! Host capacity diagnostics:
+//!   srt-bench system-info
+//!
 //! Median table over a result file, grouped however you like:
 //!   srt-bench report results.tsv --by runtime,promotion
 //!
@@ -30,12 +33,31 @@
 //! and the process that reports them reads the same columns back.
 
 fn main() {
+    // Raise the soft descriptor limit before either a matrix parent or a
+    // runtime child starts opening sockets. Children inherit this limit.
+    srt_bench::system::raise_nofile_limit();
+
     // Subcommands come before the runtime=/mode= form so that reporting
     // and orchestration live in the same binary as the thing being
     // measured -- there is no second tool to keep in sync with the
     // result schema.
     let args: Vec<String> = std::env::args().collect();
+    let context = match args.get(1).map(String::as_str) {
+        Some("report") => None,
+        Some("system-info") => Some("system-info"),
+        Some("matrix") => Some("matrix"),
+        Some("sysprof") => Some("sysprof"),
+        _ => Some("runtime"),
+    };
+    if std::env::var_os("SRT_BENCH_CHILD").is_none()
+        && let Some(context) = context
+    {
+        srt_bench::system::print_startup_diagnostics(context);
+    }
     match args.get(1).map(String::as_str) {
+        Some("system-info") => {
+            return;
+        }
         Some("report") => return report(&args),
         Some("sysprof") => {
             let cli = srt_bench::Cli::parse(&args[1..]);

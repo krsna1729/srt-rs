@@ -531,6 +531,155 @@ type Axis = (&'static str, Scope, Vec<String>);
 /// it applies to.
 type Cell<'a> = Vec<(&'a str, Scope, String)>;
 
+#[derive(Default)]
+struct MatrixFilterSummary {
+    by_reason: std::collections::BTreeMap<&'static str, usize>,
+}
+
+impl MatrixFilterSummary {
+    fn record(&mut self, reason: &'static str) {
+        *self.by_reason.entry(reason).or_default() += 1;
+    }
+
+    fn total(&self) -> usize {
+        self.by_reason.values().sum()
+    }
+}
+
+fn matrix_axis_values<'a>(axes: &'a [Axis], name: &str) -> &'a [String] {
+    axes.iter()
+        .find(|(axis, _, _)| *axis == name)
+        .map_or(&[], |(_, _, values)| values.as_slice())
+}
+
+fn axis_has(axes: &[Axis], name: &str, value: &str) -> bool {
+    matrix_axis_values(axes, name)
+        .iter()
+        .any(|candidate| candidate == value)
+}
+
+fn representative<'a>(axes: &'a [Axis], name: &str, preferred: &str) -> Option<&'a str> {
+    let values = matrix_axis_values(axes, name);
+    values
+        .iter()
+        .find(|candidate| candidate.as_str() == preferred)
+        .or_else(|| values.first())
+        .map(String::as_str)
+}
+
+fn cell_value<'a>(cell: &'a Cell<'_>, name: &str, scope: Option<Scope>) -> Option<&'a str> {
+    cell.iter()
+        .find(|(axis, cell_scope, _)| {
+            *axis == name && scope.is_none_or(|wanted| *cell_scope == wanted)
+        })
+        .map(|(_, _, value)| value.as_str())
+}
+
+fn role_value<'a>(cell: &'a Cell<'_>, name: &str, role: Scope) -> Option<&'a str> {
+    cell_value(cell, name, Some(role)).or_else(|| cell_value(cell, name, Some(Scope::Both)))
+}
+
+fn bond_pairs(value: &str) -> Option<usize> {
+    value
+        .split_once(':')
+        .and_then(|(_, pairs)| pairs.parse().ok())
+}
+
+/// Return why a cell is redundant or invalid, if it should not be run.
+///
+/// The matrix remains a cartesian product at the plan level, but this removes
+/// combinations where the selected runtime/topology cannot observe an axis.
+/// A representative value is retained when an axis is inert so a user-supplied
+/// one-value plan still runs as written.
+fn filter_reason(cell: &Cell<'_>, axes: &[Axis]) -> Option<&'static str> {
+    let ingress = role_value(cell, "ingress", Scope::Recv).unwrap_or("per-port");
+    let runtime_recv = role_value(cell, "runtime", Scope::Recv).unwrap_or("mio");
+    let runtime_send = role_value(cell, "runtime", Scope::Send).unwrap_or(runtime_recv);
+    let promotion = cell_value(cell, "promotion", Some(Scope::Both));
+    let cookie = cell_value(cell, "cookie-routing", Some(Scope::Both));
+    let batch = cell_value(cell, "batch", Some(Scope::Both));
+    let pin = cell_value(cell, "pin", Some(Scope::Both));
+    let bond = cell_value(cell, "bond", Some(Scope::Both));
+    let connections = cell_value(cell, "connections", Some(Scope::Both))
+        .and_then(|value| value.parse::<usize>().ok());
+
+    if let (Some(pairs), Some(connections)) = (bond.and_then(bond_pairs), connections)
+        && pairs > connections / 2
+    {
+        return Some("bond-capacity");
+    }
+
+    let is_multi = ingress.starts_with("reuseport-multi:");
+    let is_single = ingress.starts_with("reuseport-single:");
+    let is_per_port = ingress == "per-port";
+
+    if let Some(promotion) = promotion {
+        if is_single || !is_multi {
+            if let Some(keep) = representative(axes, "promotion", "all")
+                && promotion != keep
+            {
+                return Some("promotion-inert");
+            }
+        } else if bond == Some("none") {
+            let keep_never = axis_has(axes, "promotion", "never");
+            let keep_all = axis_has(axes, "promotion", "all");
+            if (keep_never && promotion == "relocate")
+                || (keep_never && promotion == "bonded")
+                || (!keep_never && keep_all && promotion != "all")
+            {
+                return Some("promotion-inert");
+            }
+        }
+    }
+
+    if !is_multi
+        && let Some(cookie) = cookie
+        && let Some(keep) = representative(axes, "cookie-routing", "on")
+        && cookie != keep
+    {
+        return Some("cookie-routing-inert");
+    }
+
+    let batching_is_meaningful = runtime_recv == "mio" && !is_per_port;
+    if !batching_is_meaningful
+        && let Some(batch) = batch
+        && let Some(keep) = representative(axes, "batch", "on")
+        && batch != keep
+    {
+        return Some("batch-inert");
+    }
+
+    let pin_is_meaningful = runtime_recv == "glommio" || runtime_send == "glommio";
+    if !pin_is_meaningful
+        && let Some(pin) = pin
+        && let Some(keep) = representative(axes, "pin", "off")
+        && pin != keep
+    {
+        return Some("pin-inert");
+    }
+
+    None
+}
+
+fn filter_matrix_cells<'a>(
+    cells: Vec<Cell<'a>>,
+    axes: &[Axis],
+) -> (Vec<Cell<'a>>, MatrixFilterSummary) {
+    let mut summary = MatrixFilterSummary::default();
+    let cells = cells
+        .into_iter()
+        .filter(|cell| {
+            if let Some(reason) = filter_reason(cell, axes) {
+                summary.record(reason);
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+    (cells, summary)
+}
+
 /// Find `count` consecutive free UDP ports and return the base.
 ///
 /// A cell may need a whole range, not one port: `per-port` binds
@@ -865,6 +1014,22 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
         cells = next;
     }
 
+    let raw_cells = cells.len();
+    let (filtered_cells, filter_summary) = filter_matrix_cells(cells, &axes);
+    cells = filtered_cells;
+    if filter_summary.total() > 0 {
+        let reasons = filter_summary
+            .by_reason
+            .iter()
+            .map(|(reason, count)| format!("{reason}={count}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!(
+            "matrix: filtered {} of {} cells ({reasons})",
+            filter_summary.total(),
+            raw_cells
+        );
+    }
     let total = cells.len() * reps;
     // Resume: a sweep of this size will be interrupted at some point, and
     // re-running completed cells wastes hours and mixes measurement
@@ -1057,6 +1222,7 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
             // listener must still be there when it does.
             .arg((secs + 60).to_string())
             .arg(latency.to_string())
+            .env("SRT_BENCH_CHILD", "1")
             // The receiver ignores this functionally, but both rows
             // must record the same configured bitrate or a report
             // grouping on it would split the pair and lose delivery%.
@@ -1087,6 +1253,7 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
             .arg(secs.to_string())
             .arg(latency.to_string())
             .arg(&bitrate)
+            .env("SRT_BENCH_CHILD", "1")
             .args(&send_argv)
             .arg(format!("--rep={rep}"))
             .arg(format!("--cpus={send_cpus}"))
@@ -1357,7 +1524,9 @@ fn in_netns(p: Priv, exe: &std::path::Path) -> std::process::Command {
             .arg(format!("--regid={gid}"))
             .arg("--clear-groups");
     }
-    cmd.arg(exe);
+    // Put the marker inside the namespace command. Setting it on the outer
+    // `sudo ip` process is not reliable because sudo may sanitize it.
+    cmd.arg("env").arg("SRT_BENCH_CHILD=1").arg(exe);
     cmd
 }
 
@@ -1522,6 +1691,200 @@ pub fn run_sysprof(cli: &crate::Cli) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod matrix_filter_tests {
+    use super::{Axis, Cell, Scope, filter_matrix_cells, filter_reason};
+
+    fn axes() -> Vec<Axis> {
+        vec![
+            (
+                "promotion",
+                Scope::Both,
+                ["never", "relocate", "bonded", "all"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            ),
+            (
+                "cookie-routing",
+                Scope::Both,
+                ["on", "off"].into_iter().map(str::to_string).collect(),
+            ),
+            (
+                "batch",
+                Scope::Both,
+                ["on", "off"].into_iter().map(str::to_string).collect(),
+            ),
+            (
+                "pin",
+                Scope::Both,
+                ["off", "on"].into_iter().map(str::to_string).collect(),
+            ),
+        ]
+    }
+
+    fn cell(values: &[(&'static str, &'static str)]) -> Cell<'static> {
+        values
+            .iter()
+            .map(|(name, value)| (*name, Scope::Both, (*value).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn filters_non_multi_promotion_and_cookie_variants() {
+        let axes = axes();
+        assert_eq!(
+            filter_reason(
+                &cell(&[
+                    ("ingress", "shared-pool:4"),
+                    ("promotion", "all"),
+                    ("cookie-routing", "on"),
+                    ("batch", "on"),
+                    ("pin", "off"),
+                    ("runtime", "mio"),
+                    ("connections", "200"),
+                    ("bond", "none"),
+                ]),
+                &axes
+            ),
+            None
+        );
+        assert_eq!(
+            filter_reason(
+                &cell(&[
+                    ("ingress", "shared-pool:4"),
+                    ("promotion", "all"),
+                    ("cookie-routing", "off"),
+                    ("batch", "on"),
+                    ("pin", "off"),
+                    ("runtime", "mio"),
+                    ("connections", "200"),
+                    ("bond", "none"),
+                ]),
+                &axes
+            ),
+            Some("cookie-routing-inert")
+        );
+    }
+
+    #[test]
+    fn retains_multi_promotion_controls_when_bonded() {
+        let axes = axes();
+        let bonded = cell(&[
+            ("ingress", "reuseport-multi:4"),
+            ("promotion", "bonded"),
+            ("cookie-routing", "on"),
+            ("batch", "on"),
+            ("pin", "off"),
+            ("runtime", "mio"),
+            ("connections", "200"),
+            ("bond", "broadcast:64"),
+        ]);
+        assert_eq!(filter_reason(&bonded, &axes), None);
+
+        let unbonded = cell(&[
+            ("ingress", "reuseport-multi:4"),
+            ("promotion", "relocate"),
+            ("cookie-routing", "on"),
+            ("batch", "on"),
+            ("pin", "off"),
+            ("runtime", "mio"),
+            ("connections", "200"),
+            ("bond", "none"),
+        ]);
+        assert_eq!(filter_reason(&unbonded, &axes), Some("promotion-inert"));
+    }
+
+    #[test]
+    fn rejects_bond_groups_larger_than_the_connection_population() {
+        let axes = axes();
+        let cell = cell(&[
+            ("ingress", "reuseport-multi:4"),
+            ("promotion", "all"),
+            ("cookie-routing", "on"),
+            ("batch", "on"),
+            ("pin", "off"),
+            ("runtime", "mio"),
+            ("connections", "50"),
+            ("bond", "broadcast:64"),
+        ]);
+        assert_eq!(filter_reason(&cell, &axes), Some("bond-capacity"));
+    }
+
+    #[test]
+    fn filters_batch_and_pin_only_where_the_backend_ignores_them() {
+        let axes = axes();
+        let batch_non_mio = [
+            ("ingress", "shared-pool:4"),
+            ("promotion", "all"),
+            ("cookie-routing", "on"),
+            ("batch", "off"),
+            ("pin", "off"),
+            ("connections", "200"),
+            ("bond", "none"),
+        ];
+        let non_mio = batch_non_mio
+            .iter()
+            .copied()
+            .chain([("runtime", "tokio")])
+            .collect::<Vec<_>>();
+        assert_eq!(filter_reason(&cell(&non_mio), &axes), Some("batch-inert"));
+
+        let pin_base = [
+            ("ingress", "shared-pool:4"),
+            ("promotion", "all"),
+            ("cookie-routing", "on"),
+            ("batch", "on"),
+            ("pin", "on"),
+            ("connections", "200"),
+            ("bond", "none"),
+        ];
+        let mio = pin_base
+            .iter()
+            .copied()
+            .chain([("runtime", "mio")])
+            .collect::<Vec<_>>();
+        assert_eq!(filter_reason(&cell(&mio), &axes), Some("pin-inert"));
+
+        let glommio = pin_base
+            .iter()
+            .copied()
+            .chain([("runtime", "glommio")])
+            .collect::<Vec<_>>();
+        assert_eq!(filter_reason(&cell(&glommio), &axes), None);
+    }
+
+    #[test]
+    fn filter_summary_counts_each_removed_cell_once() {
+        let axes = axes();
+        let cells = vec![
+            cell(&[
+                ("ingress", "shared-pool:4"),
+                ("promotion", "relocate"),
+                ("cookie-routing", "on"),
+                ("batch", "on"),
+                ("pin", "off"),
+                ("runtime", "mio"),
+                ("connections", "200"),
+                ("bond", "none"),
+            ]),
+            cell(&[
+                ("ingress", "reuseport-multi:4"),
+                ("promotion", "all"),
+                ("cookie-routing", "on"),
+                ("batch", "on"),
+                ("pin", "off"),
+                ("runtime", "mio"),
+                ("connections", "50"),
+                ("bond", "backup:64"),
+            ]),
+        ];
+        let (kept, summary) = filter_matrix_cells(cells, &axes);
+        assert!(kept.is_empty());
+        assert_eq!(summary.total(), 2);
+    }
 }
 
 #[cfg(test)]

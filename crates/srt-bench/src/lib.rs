@@ -4,6 +4,7 @@ pub mod cpu_stats;
 pub mod driver;
 pub mod harness;
 pub mod shutdown;
+pub mod system;
 
 pub use srt_transport::is_ordered_close;
 pub mod runtimes;
