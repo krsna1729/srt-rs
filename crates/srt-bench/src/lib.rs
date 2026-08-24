@@ -500,6 +500,9 @@ where
 pub struct Aggregate {
     pub config: LossConfig,
     pub data_events: u64,
+    /// Connections that ended mid-stream rather than by the sender's
+    /// ordered close -- see [`ConnStats::torn_down`].
+    pub torn_down: u64,
     pub core_total: u64,
     pub secondary_a: u64,
     pub secondary_b: u64,
@@ -513,6 +516,7 @@ impl Aggregate {
         Self {
             config,
             data_events: 0,
+            torn_down: 0,
             core_total: 0,
             secondary_a: 0,
             secondary_b: 0,
@@ -524,6 +528,7 @@ impl Aggregate {
 
     pub fn add(&mut self, s: ConnStats) {
         self.data_events += s.data_events;
+        self.torn_down += u64::from(s.torn_down);
         if s.connected {
             self.any_connected = true;
         }
@@ -607,6 +612,7 @@ impl Aggregate {
                 c,
                 c.rep,
                 self.stats_count,
+                self.torn_down,
                 self.data_events,
                 self.core_total,
                 self.secondary_a,

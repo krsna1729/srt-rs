@@ -49,6 +49,7 @@ pub const COLUMNS: &[&str] = &[
     "bitrate",
     "rep",
     "established",
+    "torn_down",
     "pkt_sent",
     "core_total",
     "sec_a",
@@ -117,6 +118,7 @@ pub fn append_result(
     cfg: &LossConfig,
     rep: usize,
     established: u64,
+    torn_down: u64,
     pkt_sent: u64,
     core_total: u64,
     sec_a: u64,
@@ -181,6 +183,7 @@ pub fn append_result(
         cfg.bitrate_bps.to_string(),
         rep.to_string(),
         established.to_string(),
+        torn_down.to_string(),
         pkt_sent.to_string(),
         core_total.to_string(),
         sec_a.to_string(),
@@ -342,7 +345,7 @@ pub fn report(results: &[Record], group_by: &[String]) -> String {
         .chain(
             [
                 "estab", "sent", "recv", "offer%", "good%", "deliv%", "lost", "rcvbuf_drop",
-                "rtt_ms", "cpu_s", "rss_kb",
+                "torn_c", "torn_l", "rtt_ms", "cpu_s", "rss_kb",
             ]
             .iter()
             .map(|s| (*s).to_string()),
@@ -427,6 +430,13 @@ pub fn report(results: &[Record], group_by: &[String]) -> String {
         row.push(format!("{deliv:.1}"));
         row.push(format!("{:.0}", med(&listeners, "sec_a")));
         row.push(format!("{:.0}", med(&listeners, "udp_rcvbuf_err")));
+        // Caller and listener are two independent observers of the same
+        // connections, and they do not always agree on which ones broke
+        // -- the investigation this column exists for found every
+        // instance on the caller side and none on the listener. Reporting
+        // both, rather than a combined count, is what makes that visible.
+        row.push(format!("{:.0}", med(&callers, "torn_down")));
+        row.push(format!("{:.0}", med(&listeners, "torn_down")));
         row.push(format!("{:.2}", med(&listeners, "rtt_ms")));
         row.push(format!("{cpu:.1}"));
         row.push(format!(
