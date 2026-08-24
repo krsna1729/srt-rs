@@ -169,6 +169,18 @@ pub fn run(cfg: BenchConfig) {
 }
 
 /// Destination address of a sender connection i.
+/// Report a failed output drain, tagged with the adapter that owns it.
+///
+/// Each adapter's `drain_outputs` differs only in the label it prints, so
+/// the reporting lives here rather than being copied per runtime. The
+/// differing `Conn` types never enter the signature -- callers pass the
+/// already-awaited result -- so this needs no trait or generic.
+pub fn report_drain_error<T, E: std::fmt::Display>(label: &str, result: Result<T, E>) {
+    if let Err(error) = result {
+        eprintln!("[bench-{label}] output send failed: {error}");
+    }
+}
+
 pub fn sender_endpoint(cfg: &BenchConfig, i: usize) -> std::net::SocketAddr {
     cfg.addr_for(i)
 }

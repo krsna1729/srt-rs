@@ -612,7 +612,13 @@ impl SenderBuffer {
         let mut retransmits_once = 0u32;
         let mut retransmits_twice = 0u32;
         let mut retransmits_many = 0u32;
+        // Accumulated in the histogram's own pass. The buffer runs to the
+        // flow window (8192 packets by default) and this is sampled
+        // periodically per connection, so a second walk of the same map is
+        // a whole extra traversal per sample for one `sum()`.
+        let mut payload_bytes_in_buffer = 0u64;
         for entry in self.packets.values() {
+            payload_bytes_in_buffer += entry.packet.payload.len() as u64;
             match entry.retransmit_count {
                 1 => retransmits_once += 1,
                 2 => retransmits_twice += 1,
@@ -620,12 +626,6 @@ impl SenderBuffer {
                 _ => {}
             }
         }
-
-        let payload_bytes_in_buffer = self
-            .packets
-            .values()
-            .map(|entry| entry.packet.payload.len() as u64)
-            .sum();
         let buffer_span_micros = self
             .packets
             .values()

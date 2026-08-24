@@ -309,6 +309,24 @@ impl SrtConnection {
             .map_err(|error| Error::crypto_error(format!("failed to generate {label}: {error}")))
     }
 
+    /// Put the handshake into its terminal failed state.
+    ///
+    /// Every path that abandons a handshake -- rejection, KM failure,
+    /// caller-side failure, timeout -- has to do the same four things, and
+    /// they were written out four times. The copies had already diverged:
+    /// the timeout path did not clear the configured secrets, so a
+    /// handshake that timed out left its passphrase, salt, and SEK in
+    /// memory while a rejected one did not.
+    fn terminate_handshake(&mut self) {
+        self.handshake_started_at = None;
+        self.handshake_state = HandshakeState::Failed;
+        self.set_state(ConnectionState::Disconnected);
+        self.output_queue.push_back(ConnectionOutput::ClearTimer {
+            id: TimerId::Handshake,
+        });
+        self.clear_config_secrets();
+    }
+
     fn clear_config_secrets(&mut self) {
         if let Some(passphrase) = self.options.passphrase.as_mut() {
             passphrase.zeroize();
@@ -596,13 +614,7 @@ impl SrtConnection {
         let mut bytes = Vec::new();
         packet.encode(&mut bytes);
         self.queue_handshake_packet(bytes);
-        self.handshake_started_at = None;
-        self.handshake_state = HandshakeState::Failed;
-        self.set_state(ConnectionState::Disconnected);
-        self.output_queue.push_back(ConnectionOutput::ClearTimer {
-            id: TimerId::Handshake,
-        });
-        self.clear_config_secrets();
+        self.terminate_handshake();
         Ok(())
     }
 
@@ -1037,8 +1049,10 @@ impl SrtConnection {
             return Ok(()); // 接続前のデータは無視
         }
 
-        let mut payload = pkt.payload.clone();
-
+        // Checked before the payload clone below: this is the path a
+        // misconfigured or hostile peer drives hardest, and the guard reads
+        // only the header, so there is no reason to copy ~1.3 KB first.
+        //
         // A secured SRT connection must reject plaintext DATA just as it
         // rejects packets whose advertised key cannot be used. This is both a
         // security boundary and the source transition for undecrypt telemetry.
@@ -1050,6 +1064,8 @@ impl SrtConnection {
                 "unencrypted DATA packet on encrypted connection",
             ));
         }
+
+        let mut payload = pkt.payload.clone();
 
         // 復号化
         if pkt.encryption_flag != 0 {
@@ -1922,24 +1938,12 @@ impl SrtConnection {
         let mut bytes = Vec::new();
         packet.encode(&mut bytes);
         self.queue_handshake_packet(bytes);
-        self.handshake_started_at = None;
-        self.handshake_state = HandshakeState::Failed;
-        self.set_state(ConnectionState::Disconnected);
-        self.output_queue.push_back(ConnectionOutput::ClearTimer {
-            id: TimerId::Handshake,
-        });
-        self.clear_config_secrets();
+        self.terminate_handshake();
         Error::handshake_rejected(reason)
     }
 
     fn fail_caller_handshake(&mut self, reason: &str) -> Error {
-        self.handshake_started_at = None;
-        self.handshake_state = HandshakeState::Failed;
-        self.set_state(ConnectionState::Disconnected);
-        self.output_queue.push_back(ConnectionOutput::ClearTimer {
-            id: TimerId::Handshake,
-        });
-        self.clear_config_secrets();
+        self.terminate_handshake();
         Error::handshake_rejected(reason)
     }
 
@@ -1967,12 +1971,7 @@ impl SrtConnection {
         }
         self.event_queue
             .push_back(ConnectionEvent::Error("handshake timeout".to_string()));
-        self.set_state(ConnectionState::Disconnected);
-        self.handshake_state = HandshakeState::Failed;
-        self.handshake_started_at = None;
-        self.output_queue.push_back(ConnectionOutput::ClearTimer {
-            id: TimerId::Handshake,
-        });
+        self.terminate_handshake();
     }
 
     fn arm_handshake_timer(&mut self, now: Timestamp) {

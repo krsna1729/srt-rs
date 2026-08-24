@@ -1049,22 +1049,26 @@ impl ReceiverBuffer {
         let loss_rate_percent_x100 =
             (self.total_lost * 10000).checked_div(total).unwrap_or(0) as u32;
 
-        let payload_bytes_in_buffer = self
-            .packets
-            .values()
-            .map(|entry| entry.packet.payload.len() as u64)
-            .sum();
-        let buffer_span_micros = self
-            .packets
-            .values()
-            .map(|entry| entry.delivery_time.as_micros())
-            .min()
-            .zip(
-                self.packets
-                    .values()
-                    .map(|entry| entry.delivery_time.as_micros())
-                    .max(),
-            )
+        // One pass for all three. The buffer runs to `max_buffer_size`
+        // (8192 packets by default) and this is sampled periodically per
+        // connection, so walking it three times costs two extra full
+        // traversals of a BTreeMap per sample.
+        //
+        // The span cannot use `next()`/`next_back()` the way the sender's
+        // does: this map is keyed by sequence number, and `delivery_time`
+        // is not monotonic in that order once packets are reordered or
+        // retransmitted.
+        let mut payload_bytes_in_buffer = 0u64;
+        let mut oldest_delivery: Option<u64> = None;
+        let mut newest_delivery: Option<u64> = None;
+        for entry in self.packets.values() {
+            payload_bytes_in_buffer += entry.packet.payload.len() as u64;
+            let delivery = entry.delivery_time.as_micros();
+            oldest_delivery = Some(oldest_delivery.map_or(delivery, |old: u64| old.min(delivery)));
+            newest_delivery = Some(newest_delivery.map_or(delivery, |new: u64| new.max(delivery)));
+        }
+        let buffer_span_micros = oldest_delivery
+            .zip(newest_delivery)
             .map_or(0, |(oldest, newest)| newest.saturating_sub(oldest));
 
         ReceiverStats {

@@ -1090,11 +1090,11 @@ impl TransportConfig {
             }
             BatchingPolicy::MaxDatagrams(count) => Some(count),
         };
+        // Explicit `All` stays valid on a runtime without a task scheduler
+        // (mio): promotion still yields connected sockets there, so it is
+        // deliberately not rejected. Previously written as an `if` with an
+        // empty body, which reads like an unfinished branch.
         let promotion = self.promotion.resolve(topology);
-        if !capabilities.task_scheduler && promotion == srt_lifecycle::Promotion::All {
-            // Explicit `All` remains valid for mio: it may still be useful to
-            // obtain connected sockets. This is intentionally not rejected.
-        }
         let socket_buffer_bytes = match self.socket_buffers {
             SocketBufferConfig::SystemDefault => 0,
             SocketBufferConfig::Bytes(bytes) => bytes.get(),
@@ -1711,7 +1711,7 @@ fn check_socket_memory_budget(
     Ok(())
 }
 
-fn validate_output_budget(budget: OutputDrainBudget) -> Result<(), ConfigError> {
+pub(crate) fn validate_output_budget(budget: OutputDrainBudget) -> Result<(), ConfigError> {
     if budget.max_actions == 0 || budget.max_packets == 0 || budget.max_bytes == 0 {
         return Err(ConfigError::new(
             "transport.output_drain",

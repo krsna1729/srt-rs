@@ -128,38 +128,33 @@ impl Default for SrtStackConfig {
 
 impl SrtStackConfig {
     /// Validate resource bounds before opening sockets or allocating peers.
+    ///
+    /// Delegates to the same validators the richer config types use rather
+    /// than restating their rules. Restating them had already drifted: this
+    /// type accepted `max_half_open_peers > max_peers` (and the two sibling
+    /// cross-field bounds), which `AdmissionConfig::validate` rejects.
+    ///
+    /// The `io::Error` return is kept because it is this type's published
+    /// signature; `ConfigError` carries the offending field name, so it is
+    /// rendered into the message rather than discarded.
     pub fn validate(&self) -> std::io::Result<()> {
-        let invalid = |message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message);
-        if self.connection.flow_window_packets == 0 {
-            return Err(invalid("flow_window_packets must be non-zero"));
+        let invalid =
+            |message: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, message);
+        let from_config = |error: ConfigError| invalid(error.to_string());
+
+        SessionConfig::from_connection_options(self.connection.clone())
+            .validate()
+            .map_err(from_config)?;
+        AdmissionConfig {
+            limits: self.admission,
+            ..AdmissionConfig::default()
         }
-        if self.connection.receive_buffer_packets == 0 {
-            return Err(invalid("receive_buffer_packets must be non-zero"));
-        }
-        if self.admission.max_peers == 0 {
-            return Err(invalid("admission.max_peers must be non-zero"));
-        }
-        if self.admission.max_half_open_peers == 0 {
-            return Err(invalid("admission.max_half_open_peers must be non-zero"));
-        }
-        if self.admission.max_established_peers == 0 {
-            return Err(invalid("admission.max_established_peers must be non-zero"));
-        }
-        if self.admission.max_peers_per_ip == 0 {
-            return Err(invalid("admission.max_peers_per_ip must be non-zero"));
-        }
-        if self.admission.half_open_timeout.is_zero() {
-            return Err(invalid("admission.half_open_timeout must be non-zero"));
-        }
-        if self.output_drain.max_actions == 0
-            || self.output_drain.max_packets == 0
-            || self.output_drain.max_bytes == 0
-        {
-            return Err(invalid("all output_drain limits must be non-zero"));
-        }
+        .validate()
+        .map_err(from_config)?;
+        validate_output_budget(self.output_drain).map_err(from_config)?;
         if self.socket_buffer_bytes > libc::c_int::MAX as usize {
             return Err(invalid(
-                "socket_buffer_bytes exceeds the OS socket option range",
+                "socket_buffer_bytes exceeds the OS socket option range".to_string(),
             ));
         }
         Ok(())
@@ -1174,7 +1169,16 @@ impl PeerTable {
         let expired = self.prune_half_open(now);
         telemetry.record_expired_half_open(expired);
         let known = self.peers.contains_key(&peer);
-        let handshake = shiguredo_srt::peek_handshake(data);
+        // Only a CONTROL packet can be a handshake (SRT's F bit, the top bit
+        // of the first word). Checking it here keeps `peek_handshake` -- a
+        // full `SrtPacket::decode`, which ends in `payload.to_vec()` -- off
+        // the DATA path, which is every packet of a live stream. Without the
+        // guard each datagram is decoded twice, once here and once in
+        // `feed_recv_buf`, and the first decode's ~1.3 KB payload copy is
+        // discarded on the next line.
+        let handshake = is_control_datagram(data)
+            .then(|| shiguredo_srt::peek_handshake(data))
+            .flatten();
         let identity = handshake
             .as_ref()
             .map(srt_lifecycle::handshake_identity_from_handshake);
@@ -1733,6 +1737,17 @@ impl IntoIterator for PeerTable {
 
 /// Per-peer entropy for the upper bits of a SYN cookie, so cookies differ
 /// per connection instead of being one constant per worker.
+/// Is this datagram a CONTROL packet?
+///
+/// SRT's first header word carries the packet type in its top bit: 1 for
+/// CONTROL, 0 for DATA (`PacketType::from_first_word`). Only a CONTROL
+/// packet can be a handshake, so this is the cheap pre-filter that keeps a
+/// full decode off the DATA path. A datagram too short to hold a header is
+/// not a handshake either.
+fn is_control_datagram(data: &[u8]) -> bool {
+    data.first().is_some_and(|byte| byte & 0x80 != 0)
+}
+
 fn peer_entropy(peer: std::net::SocketAddr) -> u32 {
     use std::hash::BuildHasher;
     std::collections::hash_map::RandomState::new().hash_one(peer) as u32
@@ -1955,6 +1970,13 @@ impl IngressTelemetry {
         Self::bump(&self.credential_failures);
     }
     pub fn record_expired_half_open(&self, count: usize) {
+        // Called per datagram, where nothing has expired almost every time.
+        // This counter is shared by every acceptor thread, so an
+        // unconditional RMW bounces its cacheline between cores on each
+        // packet for no recorded change.
+        if count == 0 {
+            return;
+        }
         self.expired_half_open
             .fetch_add(u64::try_from(count).unwrap_or(u64::MAX), Ordering::Relaxed);
     }
@@ -2268,6 +2290,38 @@ mod tests {
             recvmsg_batch(-1, &mut [], &mut [], &mut []).expect("empty batch is a no-op"),
             0
         );
+    }
+
+    /// The compat type restated the richer validators' rules instead of
+    /// calling them, and had already fallen behind: the three cross-field
+    /// peer bounds were enforced by `AdmissionConfig::validate` and not
+    /// here, so this config accepted limits the real one rejects.
+    #[test]
+    fn stack_config_enforces_the_same_cross_field_bounds_as_admission_config() {
+        for (label, mutate) in [
+            (
+                "max_half_open_peers",
+                (|limits: &mut PeerTableConfig| {
+                    limits.max_half_open_peers = limits.max_peers + 1;
+                }) as fn(&mut PeerTableConfig),
+            ),
+            ("max_established_peers", |limits| {
+                limits.max_established_peers = limits.max_peers + 1;
+            }),
+            ("max_peers_per_ip", |limits| {
+                limits.max_peers_per_ip = limits.max_peers + 1;
+            }),
+        ] {
+            let mut config = SrtStackConfig::default();
+            mutate(&mut config.admission);
+            let error = config
+                .validate()
+                .expect_err("a sub-limit above max_peers must be rejected");
+            assert!(
+                error.to_string().contains(label),
+                "{label}: error should name the offending field, got {error}"
+            );
+        }
     }
 
     #[test]
