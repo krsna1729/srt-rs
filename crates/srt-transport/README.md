@@ -41,7 +41,10 @@ Three layers:
      own many connections. Per-connection timer maps stay small; the index
      prevents a separate O(peers) scan just to find which maps are due.
    - `OutputDrainBudget` / `OutputDrainReport` — explicit per-tick action,
-     packet, and byte limits for the stable mio and Tokio output pumps.
+     packet, and byte limits shared by all six output pumps. Send failures
+     are returned and unsent datagrams remain queued in protocol order.
+   - `SrtStackConfig` — validated protocol, admission, output-drain, cookie
+     routing, and socket-buffer defaults for consuming applications.
 
 2. **Admission machinery** (always compiled, runtime-neutral, does no I/O
    of its own — the caller performs every send)
@@ -62,8 +65,9 @@ Three layers:
      `Conn` holds a `!Send` timer future. The cross-thread move is
      correct *by construction*: the type has no field a `!Send` timer
      could occupy.
-   - `IngressTelemetry` — the five admission counters and the `report()`
-     line, defined once so two backends' output means the same thing.
+   - `IngressTelemetry` — promotion/routing plus invalid-input, cookie,
+     capacity, authorization, and half-open-expiry counters, defined once
+     so two backends' output means the same thing.
 
 3. **Per-runtime `Conn`** (feature-gated): wraps an `SrtConnection`
    + that runtime's UDP socket + its native timer. Each exposes the same
@@ -74,7 +78,7 @@ Three layers:
 
 | Feature | Runtime | Timer inside Conn | I/O model |
 |---|---|---|---|
-| `mio` (default) | raw epoll, no task model | `ManualTimerStore` + `poll_timeout()` | readiness |
+| `mio` | raw epoll, no task model | `ManualTimerStore` + `poll_timeout()` | readiness |
 | `tokio` | current-thread + tasks | native `Pin<Box<Sleep>>` | readiness |
 | `smol` | async-executor tasks | `smol::Timer` future | readiness |
 | `monoio` | thread-per-core | io_uring kernel timeouts | completion (owned buffers) |
@@ -114,7 +118,37 @@ conn.fire_expired(now);                        // service due timers
 
 Async runtimes instead offer `Conn::tick(&mut buf, &payload, now)` —
 one event-loop iteration: fire timers → recv → drain outputs → send all
-paced packets → return `TickResult { sent, events }`.
+paced packets → return `io::Result<TickResult>`. Every adapter also exposes
+`drain_outputs_bounded`; a budget or backpressure yield retains the tail.
+
+## Application configuration
+
+```rust
+use std::time::Duration;
+use srt_transport::{OutputDrainBudget, SrtStackConfig};
+
+let mut stack = SrtStackConfig::default();
+stack.connection.socket_id = 0x1000_0001;
+stack.connection.tsbpd_delay = 200;
+stack.connection.max_bandwidth_bytes_per_sec = Some(25_000_000);
+stack.connection.flow_window_packets = 16_384;
+stack.connection.receive_buffer_packets = 16_384;
+stack.admission.max_peers = 8_192;
+stack.admission.half_open_timeout = Duration::from_secs(5);
+stack.output_drain = OutputDrainBudget::new(128, 64, 512 * 1024);
+
+stack.validate()?;
+let caller = stack.caller()?;
+let peers = stack.peer_table()?;
+let admission = stack.admission_options();
+let socket = stack.bind_reuseport(9000)?;
+# Ok::<(), std::io::Error>(())
+```
+
+The benchmark's runtime, ingress topology, worker count, CPU pinning,
+promotion mode, connect concurrency, bonding workload, and network impairment
+knobs are intentionally excluded: those choose deployment architecture or
+generate a workload; they are not properties of an SRT connection stack.
 
 ## Consumers
 

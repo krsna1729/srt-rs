@@ -36,6 +36,14 @@ glommio = { version = "0.9", optional = true }
 socket2_glommio = { package = "socket2", version = "0.4", optional = true }
 compio = { version = "0.19", features = ["io", "io-uring", "net", "runtime", "time"], optional = true }
 
+[dev-dependencies]
+criterion = "0.8"
+proptest = "1.11"
+
+[[bench]]
+name = "admission_hardening"
+harness = false
+
 [features]
 mio = ["dep:mio"]
 tokio = ["dep:tokio"]
@@ -43,3 +51,6 @@ smol = ["dep:smol", "dep:futures-lite"]
 monoio = ["dep:monoio"]
 glommio = ["dep:glommio", "dep:futures-lite", "dep:socket2_glommio"]
 compio = ["dep:compio"]
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

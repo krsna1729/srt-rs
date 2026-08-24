@@ -11,7 +11,7 @@
 use proptest::prelude::*;
 use shiguredo_srt::{
     ConnectionEvent, ConnectionOptions, ConnectionOutput, ConnectionState, KeyLength,
-    SrtConnection, TimerId, Timestamp,
+    SrtConnection, SrtPacket, TimerId, Timestamp,
 };
 
 // ============================================================================
@@ -546,6 +546,36 @@ proptest! {
 
         // パニックしないことを確認
         let _ = conn.feed_recv_buf(&data, now);
+    }
+
+    /// A valid packet addressed to another socket must neither be delivered
+    /// nor perturb the connection's state.
+    #[test]
+    fn prop_wrong_destination_socket_is_ignored(
+        payload in prop::collection::vec(any::<u8>(), 1..512),
+        wrong_socket in any::<u32>().prop_filter("must differ from listener", |id| *id != 2),
+    ) {
+        let mut now = Timestamp::from_micros(0);
+        let mut caller = SrtConnection::new_caller(make_opts(1));
+        let mut listener = SrtConnection::new_listener(make_opts(2));
+        establish_connection(&mut caller, &mut listener, &mut now);
+
+        caller.send(&payload, now).expect("send");
+        let mut packet = match SrtPacket::decode(&drain_packets(&mut caller)[0]).expect("decode") {
+            SrtPacket::Data(packet) => packet,
+            SrtPacket::Control(_) => unreachable!("send emits data"),
+        };
+        packet.dest_socket_id = wrong_socket;
+        let mut bytes = Vec::new();
+        SrtPacket::Data(packet).encode(&mut bytes);
+
+        let rejected = listener.feed_recv_buf(&bytes, now);
+        prop_assert!(rejected.is_err());
+        prop_assert_eq!(listener.state(), ConnectionState::Connected);
+        let delivered_data = drain_events(&mut listener).into_iter().any(|event| {
+            matches!(event, ConnectionEvent::DataReceived { .. })
+        });
+        prop_assert!(!delivered_data);
     }
 }
 

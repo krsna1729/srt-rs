@@ -16,9 +16,13 @@ proptest! {
     fn test_add_micros(a in 0u64..=u64::MAX, b in 0u64..1_000_000u64) {
         let ts = Timestamp::from_micros(a);
         let result = ts.add_micros(b);
-        if a.checked_add(b).is_some() {
-            prop_assert_eq!(result.as_micros(), a + b);
-        }
+        prop_assert_eq!(result.as_micros(), a.saturating_add(b));
+    }
+
+    #[test]
+    fn test_add_millis_saturates_both_operations(a in any::<u64>(), b in any::<u64>()) {
+        let result = Timestamp::from_micros(a).add_millis(b);
+        prop_assert_eq!(result.as_micros(), a.saturating_add(b.saturating_mul(1000)));
     }
 
     #[test]

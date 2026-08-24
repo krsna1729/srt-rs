@@ -32,6 +32,7 @@ use cipher::{KeyInit, KeyIvInit, StreamCipher};
 use ctr::Ctr128BE;
 use pbkdf2::pbkdf2_hmac;
 use sha1::Sha1;
+use zeroize::Zeroize;
 
 use crate::error::Error;
 
@@ -183,9 +184,9 @@ impl fmt::Debug for CryptoContext {
 // abnormal connection teardown).
 impl Drop for CryptoContext {
     fn drop(&mut self) {
-        self.kek.fill(0);
-        self.sek_even.fill(0);
-        self.sek_odd.fill(0);
+        self.kek.zeroize();
+        self.sek_even.zeroize();
+        self.sek_odd.zeroize();
     }
 }
 
@@ -207,6 +208,9 @@ impl CryptoContext {
     ) -> Result<Self, Error> {
         if sek.len() != key_length.len() {
             return Err(Error::crypto_error("invalid SEK length"));
+        }
+        if sek.iter().all(|byte| *byte == 0) {
+            return Err(Error::crypto_error("SEK must not be all zero"));
         }
 
         // KEK を PBKDF2 で導出
@@ -244,10 +248,13 @@ impl CryptoContext {
 
         // SEK をアンラップ
         let sek = unwrap_sek(&kek, wrapped_sek, key_length)?;
+        if sek.iter().all(|byte| *byte == 0) {
+            return Err(Error::crypto_error("unwrapped SEK must not be all zero"));
+        }
 
         let (sek_even, sek_odd) = match key_flag {
-            KeyFlag::Even => (sek.clone(), vec![0u8; key_length.len()]),
-            KeyFlag::Odd => (vec![0u8; key_length.len()], sek.clone()),
+            KeyFlag::Even => (sek, vec![0u8; key_length.len()]),
+            KeyFlag::Odd => (vec![0u8; key_length.len()], sek),
         };
 
         Ok(Self {
@@ -347,13 +354,19 @@ impl CryptoContext {
         if new_sek.len() != self.key_length.len() {
             return Err(Error::crypto_error("invalid SEK length"));
         }
+        if new_sek.iter().all(|byte| *byte == 0) {
+            return Err(Error::crypto_error("SEK must not be all zero"));
+        }
 
         let new_key_flag = self.current_key.other();
 
-        match new_key_flag {
-            KeyFlag::Even => self.sek_even = new_sek.to_vec(),
-            KeyFlag::Odd => self.sek_odd = new_sek.to_vec(),
-        }
+        let target = match new_key_flag {
+            KeyFlag::Even => &mut self.sek_even,
+            KeyFlag::Odd => &mut self.sek_odd,
+        };
+        target.zeroize();
+        target.clear();
+        target.extend_from_slice(new_sek);
 
         self.next_key = Some(new_key_flag);
         self.km_refresh_state = KmRefreshState::PreAnnounce;
@@ -385,11 +398,16 @@ impl CryptoContext {
     /// 受信した KM メッセージから SEK を更新
     pub fn update_sek(&mut self, wrapped_sek: &[u8], key_flag: KeyFlag) -> Result<(), Error> {
         let sek = unwrap_sek(&self.kek, wrapped_sek, self.key_length)?;
-
-        match key_flag {
-            KeyFlag::Even => self.sek_even = sek,
-            KeyFlag::Odd => self.sek_odd = sek,
+        if sek.iter().all(|byte| *byte == 0) {
+            return Err(Error::crypto_error("unwrapped SEK must not be all zero"));
         }
+
+        let target = match key_flag {
+            KeyFlag::Even => &mut self.sek_even,
+            KeyFlag::Odd => &mut self.sek_odd,
+        };
+        target.zeroize();
+        *target = sek;
 
         self.current_key = key_flag;
         Ok(())
@@ -684,5 +702,18 @@ mod tests {
 
         assert!(unwrap_sek(&kek, &[], KeyLength::Aes128).is_err());
         assert!(unwrap_sek(&kek, &[0; 7], KeyLength::Aes128).is_err());
+    }
+
+    #[test]
+    fn all_zero_stream_keys_are_rejected() {
+        let error =
+            CryptoContext::new_sender("passphrase", KeyLength::Aes128, [0x42; 16], &[0; 16])
+                .expect_err("known zero SEK must not be accepted");
+        assert!(error.reason.contains("all zero"));
+
+        let mut crypto =
+            CryptoContext::new_sender("passphrase", KeyLength::Aes128, [0x42; 16], &[0x24; 16])
+                .expect("valid SEK");
+        assert!(crypto.start_pre_announce(&[0; 16]).is_err());
     }
 }

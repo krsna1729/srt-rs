@@ -76,6 +76,14 @@ loop {
 }
 ```
 
+When `passphrase` is set on a caller, a fresh salt and stream encryption key
+are generated from the operating system CSPRNG unless the application supplies
+them explicitly. Explicit keys consisting entirely of zero bytes are rejected.
+Do not log or persist `ConnectionOptions`: its `Debug` implementation redacts
+the passphrase and SEK, and the connection zeroizes its owned copies after the
+handshake and on drop. See [SECURITY.md](SECURITY.md) for the protocol threat
+model, including SRT's lack of payload authentication.
+
 Sending: `can_send_with_pacing(now)` / `time_until_send(now)` gate
 `send(payload, now)`; `send_with_sequence` pins an explicit sequence
 number; `set_packet_send_period` caps rate. Listeners may apply policy
@@ -115,7 +123,7 @@ count stays **bounded and flat** (not zero — `BTreeMap` storage is a
 deliberate, measured tradeoff documented in that file's header).
 
 Fuzz targets under [`fuzz/`](fuzz/) (`cargo-fuzz`, nightly): decode paths
-must never panic on attacker input. Run record and the panic they already
+and stateful connection input must never panic on attacker input. Run record and the panic they already
 caught: [VENDOR.md § Fuzzing](VENDOR.md#fuzzing).
 
 ## Local patches on the vendored code

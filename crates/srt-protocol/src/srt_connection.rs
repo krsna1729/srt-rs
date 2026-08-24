@@ -4,6 +4,9 @@
 //! I/O は外部で行い、この構造体はバッファ駆動型で動作する。
 
 use std::collections::VecDeque;
+use std::fmt;
+
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::buf::write_u32;
 use crate::crypto::{CryptoContext, KeyFlag, KeyLength};
@@ -146,7 +149,7 @@ pub enum ConnectionOutput {
 }
 
 /// 接続オプション
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ConnectionOptions {
     /// ローカルソケット ID
     pub socket_id: u32,
@@ -178,6 +181,36 @@ pub struct ConnectionOptions {
     pub flow_window_packets: u32,
     /// Local receive-buffer capacity, in packets.
     pub receive_buffer_packets: u32,
+}
+
+impl fmt::Debug for ConnectionOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConnectionOptions")
+            .field("socket_id", &self.socket_id)
+            .field("initial_seq", &self.initial_seq)
+            .field("syn_cookie", &self.syn_cookie)
+            .field(
+                "passphrase",
+                &self.passphrase.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("crypto_salt", &self.crypto_salt)
+            .field(
+                "crypto_sek",
+                &self.crypto_sek.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("key_length", &self.key_length)
+            .field("tsbpd_delay", &self.tsbpd_delay)
+            .field("srt_version", &self.srt_version)
+            .field("stream_id", &self.stream_id)
+            .field("group_extension", &self.group_extension)
+            .field(
+                "max_bandwidth_bytes_per_sec",
+                &self.max_bandwidth_bytes_per_sec,
+            )
+            .field("flow_window_packets", &self.flow_window_packets)
+            .field("receive_buffer_packets", &self.receive_buffer_packets)
+            .finish()
+    }
 }
 
 impl Default for ConnectionOptions {
@@ -255,6 +288,12 @@ pub struct SrtConnection {
     handshake_timeout_micros: u64,
 }
 
+impl Drop for SrtConnection {
+    fn drop(&mut self) {
+        self.clear_config_secrets();
+    }
+}
+
 fn normalize_buffer_options(mut options: ConnectionOptions) -> ConnectionOptions {
     options.flow_window_packets = options.flow_window_packets.max(MIN_FLOW_WINDOW_PACKETS);
     options.receive_buffer_packets = options
@@ -265,6 +304,22 @@ fn normalize_buffer_options(mut options: ConnectionOptions) -> ConnectionOptions
 }
 
 impl SrtConnection {
+    fn random_bytes(bytes: &mut [u8], label: &str) -> Result<(), Error> {
+        getrandom::fill(bytes)
+            .map_err(|error| Error::crypto_error(format!("failed to generate {label}: {error}")))
+    }
+
+    fn clear_config_secrets(&mut self) {
+        if let Some(passphrase) = self.options.passphrase.as_mut() {
+            passphrase.zeroize();
+        }
+        self.options.passphrase = None;
+        if let Some(sek) = self.options.crypto_sek.as_mut() {
+            sek.zeroize();
+        }
+        self.options.crypto_sek = None;
+    }
+
     /// Caller として新しい接続を作成
     pub fn new_caller(options: ConnectionOptions) -> Self {
         let options = normalize_buffer_options(options);
@@ -341,6 +396,12 @@ impl SrtConnection {
     /// multiple legs over one UDP tuple can use it to preserve leg identity.
     pub fn socket_id(&self) -> u32 {
         self.options.socket_id
+    }
+
+    /// Listener-issued SYN cookie currently expected from the peer.
+    #[must_use]
+    pub fn syn_cookie(&self) -> u32 {
+        self.syn_cookie
     }
 
     /// ピアから受信した Stream ID を取得 (Listener 用)
@@ -427,6 +488,31 @@ impl SrtConnection {
         Ok(())
     }
 
+    /// Reject the pending listener handshake with an SRT rejection response.
+    pub fn reject(&mut self, reason: i32, now: Timestamp) -> Result<(), Error> {
+        if self.role != ConnectionRole::Listener
+            || self.handshake_state != HandshakeState::InductionReceived
+        {
+            return Err(Error::invalid_state(
+                "only a listener awaiting conclusion can reject a handshake",
+            ));
+        }
+        let handshake =
+            HandshakePacket::new_rejection(self.options.socket_id, self.syn_cookie, reason);
+        let packet = handshake.encode(self.relative_timestamp(now), self.peer_socket_id);
+        let mut bytes = Vec::new();
+        packet.encode(&mut bytes);
+        self.queue_handshake_packet(bytes);
+        self.handshake_started_at = None;
+        self.handshake_state = HandshakeState::Failed;
+        self.set_state(ConnectionState::Disconnected);
+        self.output_queue.push_back(ConnectionOutput::ClearTimer {
+            id: TimerId::Handshake,
+        });
+        self.clear_config_secrets();
+        Ok(())
+    }
+
     /// 送信/受信バッファを初期化
     fn init_buffers(&mut self, now: Timestamp, peer_initial_seq: u32, tsbpd_time_base: u64) {
         let mut sender = SenderBuffer::new(
@@ -463,17 +549,37 @@ impl SrtConnection {
             return Err(Error::insufficient_buffer());
         }
 
-        // パケット受信時刻を更新 (非活性タイムアウト検出用)
+        let packet = SrtPacket::decode(buf)?;
+        let (dest_socket_id, is_handshake) = match &packet {
+            SrtPacket::Data(packet) => (packet.dest_socket_id, false),
+            SrtPacket::Control(packet) => (
+                packet.dest_socket_id,
+                packet.control_type == ControlType::Handshake,
+            ),
+        };
+        if self.options.socket_id != 0
+            && dest_socket_id != self.options.socket_id
+            && !(is_handshake
+                && dest_socket_id == 0
+                && !matches!(
+                    self.state,
+                    ConnectionState::Connected | ConnectionState::Closing
+                ))
+        {
+            return Err(Error::invalid_data(format!(
+                "destination socket ID mismatch: expected {:#x}, got {:#x}",
+                self.options.socket_id, dest_socket_id
+            )));
+        }
+
+        // Only a valid packet for this connection proves peer activity.
         if self.state == ConnectionState::Connected {
             self.last_recv_time = Some(now);
-            // 非活性タイマーをリセット
             self.output_queue.push_back(ConnectionOutput::SetTimer {
                 id: TimerId::Inactivity,
                 duration_micros: INACTIVITY_TIMEOUT_MICROS,
             });
         }
-
-        let packet = SrtPacket::decode(buf)?;
 
         match packet {
             SrtPacket::Data(data_pkt) => {
@@ -980,20 +1086,26 @@ impl SrtConnection {
                     && let Some(ref passphrase) = self.options.passphrase
                 {
                     let key_length = hs.key_length().unwrap_or(self.options.key_length);
-                    // local patch (crates/srt-protocol/VENDOR.md,
-                    // upstream issue 0052, open/unfixed at vendor commit
-                    // 6779cdd): an all-zero salt default made PBKDF2 derive
-                    // the same KEK from the same passphrase every time,
-                    // defeating rainbow-table resistance. Salt must be
-                    // caller-supplied random bytes; error instead of
-                    // silently defaulting.
-                    let salt = self.options.crypto_salt.ok_or_else(|| {
-                        Error::crypto_error(
-                            "crypto_salt is required when passphrase is set (caller must supply random salt; no implicit default)",
-                        )
-                    })?;
-                    let default_sek = vec![0u8; key_length.len()];
-                    let sek = self.options.crypto_sek.as_deref().unwrap_or(&default_sek);
+                    let salt = match self.options.crypto_salt {
+                        Some(salt) => salt,
+                        None => {
+                            let mut salt = [0u8; 16];
+                            Self::random_bytes(&mut salt, "crypto salt")?;
+                            salt
+                        }
+                    };
+                    let generated_sek;
+                    let sek = match self.options.crypto_sek.as_deref() {
+                        Some(sek) => sek,
+                        None => {
+                            generated_sek = Zeroizing::new({
+                                let mut sek = vec![0u8; key_length.len()];
+                                Self::random_bytes(&mut sek, "stream encryption key")?;
+                                sek
+                            });
+                            generated_sek.as_slice()
+                        }
+                    };
                     self.crypto = Some(CryptoContext::new_sender(
                         passphrase, key_length, salt, sek,
                     )?);
@@ -1069,6 +1181,8 @@ impl SrtConnection {
                 // タイマー設定
                 self.setup_connection_timers();
 
+                self.clear_config_secrets();
+
                 self.event_queue.push_back(ConnectionEvent::Connected);
             }
             // local patch (crates/srt-protocol/VENDOR.md): the
@@ -1099,6 +1213,12 @@ impl SrtConnection {
         hsreq_timestamp: u32,
         now: Timestamp,
     ) -> Result<(), Error> {
+        // Rejection and timeout are terminal for this connection object.
+        // A new attempt must get fresh listener state rather than reviving
+        // policy-rejected or expired handshake material.
+        if self.handshake_state == HandshakeState::Failed {
+            return Ok(());
+        }
         match hs.handshake_type {
             HandshakeType::Induction => {
                 // INDUCTION リクエスト受信
@@ -1183,6 +1303,8 @@ impl SrtConnection {
                 // タイマー設定
                 self.setup_connection_timers();
 
+                self.clear_config_secrets();
+
                 self.event_queue.push_back(ConnectionEvent::Connected);
             }
             _ => {}
@@ -1248,7 +1370,10 @@ impl SrtConnection {
 
     fn handle_nak(&mut self, pkt: ControlPacket, now: Timestamp) -> Result<(), Error> {
         // NAK パケットから損失リストをパース
-        let loss_list = parse_loss_list(&pkt.control_info);
+        let loss_list = parse_loss_list(
+            &pkt.control_info,
+            usize::try_from(self.flight_capacity_packets()).unwrap_or(usize::MAX),
+        )?;
 
         // 送信バッファに損失を通知
         if let Some(ref mut sender) = self.sender {
@@ -1775,41 +1900,50 @@ impl SrtConnection {
 }
 
 /// 損失リストをパース (NAK パケットの control_info から)
-fn parse_loss_list(data: &[u8]) -> Vec<u32> {
-    let mut result = Vec::new();
+fn parse_loss_list(data: &[u8], max_entries: usize) -> Result<Vec<u32>, Error> {
+    if !data.len().is_multiple_of(4) {
+        return Err(Error::invalid_data(
+            "NAK loss list length is not a multiple of four",
+        ));
+    }
+    let mut result = Vec::with_capacity((data.len() / 4).min(max_entries));
     let mut slice = data;
 
-    while slice.len() >= 4 {
-        let word = match crate::buf::read_u32(&mut slice) {
-            Ok(w) => w,
-            Err(_) => break,
-        };
+    let push = |result: &mut Vec<u32>, sequence: u32| -> Result<(), Error> {
+        if result.len() >= max_entries {
+            return Err(Error::invalid_data(format!(
+                "NAK loss list exceeds negotiated limit of {max_entries} entries"
+            )));
+        }
+        result.push(sequence);
+        Ok(())
+    };
+
+    while !slice.is_empty() {
+        let word = crate::buf::read_u32(&mut slice)?;
 
         if word & 0x8000_0000 != 0 {
             // Range: [word & 0x7FFF_FFFF, next_word]
-            if slice.len() >= 4 {
-                let start = word & 0x7FFF_FFFF;
-                let end = match crate::buf::read_u32(&mut slice) {
-                    Ok(w) => w & 0x7FFF_FFFF,
-                    Err(_) => break,
-                };
-                let mut seq = start;
-                while seq != end.wrapping_add(1) & 0x7FFF_FFFF {
-                    result.push(seq);
-                    seq = seq.wrapping_add(1) & 0x7FFF_FFFF;
-                    // 安全のため上限を設ける
-                    if result.len() > 1000 {
-                        break;
-                    }
+            if slice.len() < 4 {
+                return Err(Error::invalid_data("NAK range is missing its end"));
+            }
+            let start = word & 0x7FFF_FFFF;
+            let end = crate::buf::read_u32(&mut slice)? & 0x7FFF_FFFF;
+            let mut seq = start;
+            loop {
+                push(&mut result, seq)?;
+                if seq == end {
+                    break;
                 }
+                seq = seq.wrapping_add(1) & 0x7FFF_FFFF;
             }
         } else {
             // Single sequence number
-            result.push(word);
+            push(&mut result, word)?;
         }
     }
 
-    result
+    Ok(result)
 }
 
 /// 損失リストをエンコード (NAK パケットの control_info 用)
@@ -2012,7 +2146,7 @@ mod tests {
         // 単一のシーケンス番号
         let loss_list = vec![100, 200, 300];
         let encoded = encode_loss_list(&loss_list);
-        let decoded = parse_loss_list(&encoded);
+        let decoded = parse_loss_list(&encoded, loss_list.len()).expect("valid loss list");
         assert_eq!(decoded, loss_list);
     }
 
@@ -2021,7 +2155,7 @@ mod tests {
         // 連続するシーケンス番号は範囲としてエンコードされる
         let loss_list = vec![100, 101, 102, 103, 200, 201];
         let encoded = encode_loss_list(&loss_list);
-        let decoded = parse_loss_list(&encoded);
+        let decoded = parse_loss_list(&encoded, loss_list.len()).expect("valid loss list");
         assert_eq!(decoded, loss_list);
         // 範囲エンコードにより元の 6*4=24 バイトが 3*4=12 バイトに圧縮
         // (100-103 が 8 バイト、200-201 が 8 バイト = 16 バイト)
@@ -2033,7 +2167,7 @@ mod tests {
         // 単一と連続の混合
         let loss_list = vec![50, 100, 101, 102, 200];
         let encoded = encode_loss_list(&loss_list);
-        let decoded = parse_loss_list(&encoded);
+        let decoded = parse_loss_list(&encoded, loss_list.len()).expect("valid loss list");
         assert_eq!(decoded, loss_list);
     }
 
@@ -2042,5 +2176,25 @@ mod tests {
         let loss_list: Vec<u32> = vec![];
         let encoded = encode_loss_list(&loss_list);
         assert!(encoded.is_empty());
+    }
+
+    #[test]
+    fn loss_list_limit_is_global_across_ranges_and_singles() {
+        let mut encoded = Vec::new();
+        write_u32(&mut encoded, 0x8000_0001);
+        write_u32(&mut encoded, 3);
+        write_u32(&mut encoded, 10);
+        write_u32(&mut encoded, 11);
+
+        let error = parse_loss_list(&encoded, 4).expect_err("fifth entry must exceed the cap");
+        assert_eq!(error.kind, crate::ErrorKind::InvalidData);
+        assert!(error.reason.contains("exceeds negotiated limit"));
+    }
+
+    #[test]
+    fn loss_list_rejects_a_truncated_range() {
+        let encoded = 0x8000_0001u32.to_be_bytes();
+        let error = parse_loss_list(&encoded, 8).expect_err("range end is required");
+        assert_eq!(error.kind, crate::ErrorKind::InvalidData);
     }
 }

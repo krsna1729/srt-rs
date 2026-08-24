@@ -48,7 +48,14 @@ fn drain_admission(
     match batching {
         crate::Batching::On => loop {
             let fd = listener.as_raw_fd();
-            let received = srt_transport::recvmsg_batch(fd, admit_bufs, admit_sizes, admit_addrs);
+            let received =
+                match srt_transport::recvmsg_batch(fd, admit_bufs, admit_sizes, admit_addrs) {
+                    Ok(received) => received,
+                    Err(error) => {
+                        eprintln!("[bench-mio] recvmmsg failed: {error}");
+                        break;
+                    }
+                };
             if received == 0 {
                 break;
             }

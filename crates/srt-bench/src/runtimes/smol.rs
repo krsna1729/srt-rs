@@ -63,6 +63,12 @@ use std::time::{Duration, Instant};
 const IDLE_GRACE: Duration = Duration::from_secs(10);
 const TIMER_TICK: Duration = Duration::from_millis(10);
 
+async fn drain_outputs(driver: &mut Conn, now: shiguredo_srt::Timestamp) {
+    if let Err(error) = driver.drain_outputs(now).await {
+        eprintln!("[bench-smol] output send failed: {error}");
+    }
+}
+
 /// Give one established connection its own connected socket, so the
 /// kernel matches its packets by exact 4-tuple and it can be driven by an
 /// independent task instead of the shared per-peer maintenance loop.
@@ -173,7 +179,7 @@ async fn sender_task(
         .expect("connect() should queue INDUCTION");
 
     let mut driver = Conn::new(conn, socket);
-    driver.drain_outputs(crate::now_ts(start)).await;
+    drain_outputs(&mut driver, crate::now_ts(start)).await;
 
     let payload = vec![0x42u8; crate::PAYLOAD_SIZE];
     let mut stats = ConnStats::default();
@@ -218,7 +224,7 @@ async fn sender_task(
 
         let t = crate::now_ts(start);
         driver.fire_expired(t);
-        driver.drain_outputs(t).await;
+        drain_outputs(&mut driver, t).await;
 
         while let Some(ev) = driver.conn.poll_event() {
             match ev {
@@ -280,7 +286,7 @@ async fn sender_task(
     // ended instead of inferring it from five seconds of silence.
     let t = crate::now_ts(start);
     driver.conn.disconnect(t);
-    driver.drain_outputs(t).await;
+    drain_outputs(&mut driver, t).await;
     if let Some(s) = driver.conn.sender_stats() {
         stats.has_stats = true;
         stats.core_total = s.total_sent;
@@ -300,7 +306,7 @@ async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> Co
     };
     let conn = SrtConnection::new_listener(options);
     let mut driver = Conn::new(conn, socket);
-    driver.drain_outputs(crate::now_ts(start)).await;
+    drain_outputs(&mut driver, crate::now_ts(start)).await;
 
     let mut stats = ConnStats::default();
     let mut stream_deadline: Option<Instant> = None;
@@ -355,7 +361,7 @@ async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> Co
 
             let t = crate::now_ts(start);
             driver.fire_expired(t);
-            driver.drain_outputs(t).await;
+            drain_outputs(&mut driver, t).await;
         }
 
         while let Some(ev) = driver.conn.poll_event() {
@@ -816,7 +822,7 @@ async fn established_conn_task(mut driver: Conn, cfg: BenchConfig, start: Instan
 
         let t = crate::now_ts(start);
         driver.fire_expired(t);
-        driver.drain_outputs(t).await;
+        drain_outputs(&mut driver, t).await;
 
         while let Some(ev) = driver.conn.poll_event() {
             match ev {

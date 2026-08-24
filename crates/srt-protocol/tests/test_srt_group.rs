@@ -199,3 +199,97 @@ fn data_sequence(packet: &[u8]) -> u32 {
         SrtPacket::Control(_) => panic!("expected data packet"),
     }
 }
+
+#[test]
+fn group_rejects_invalid_and_duplicate_ids() {
+    assert!(SrtGroup::new(1, GroupMode::Broadcast).is_err());
+    let (caller_a, _) = establish_pair();
+    let (caller_b, _) = establish_pair();
+    let mut group = SrtGroup::new(0x4000_0010, GroupMode::Broadcast).unwrap();
+    group.add_member(7, 1, caller_a).unwrap();
+    assert!(group.add_member(7, 2, caller_b).is_err());
+    assert_eq!(group.members().len(), 1);
+}
+
+#[test]
+fn backup_removal_promotes_highest_weight_with_stable_tie_break() {
+    let (primary, _) = establish_pair();
+    let (standby_high_id, _) = establish_pair();
+    let (standby_low_id, _) = establish_pair();
+    let mut group = SrtGroup::new(0x4000_0011, GroupMode::Backup).unwrap();
+    group.add_member(9, 1, primary).unwrap();
+    group.add_member(5, 100, standby_high_id).unwrap();
+    group.add_member(3, 100, standby_low_id).unwrap();
+
+    assert!(group.remove_member(9));
+    assert!(!group.remove_member(9));
+    assert_eq!(group.send(b"failover", ts(100_000)).unwrap(), 1);
+    assert_eq!(group.member(3).unwrap().state(), GroupMemberState::Active);
+    assert_eq!(group.member(5).unwrap().state(), GroupMemberState::Standby);
+}
+
+#[test]
+fn group_with_no_healthy_members_fails_without_panicking() {
+    let (member, _) = establish_pair();
+    let mut group = SrtGroup::new(0x4000_0012, GroupMode::Backup).unwrap();
+    group.add_member(1, 1, member).unwrap();
+    assert!(group.mark_member_broken(1));
+    assert!(!group.mark_member_broken(99));
+    assert!(group.send(b"unroutable", ts(100_000)).is_err());
+}
+
+#[test]
+fn group_send_sequence_wraps_at_srt_sequence_boundary() {
+    let (mut member, _) = establish_pair();
+    member.synchronize_send_sequence(0x7fff_ffff).unwrap();
+    let mut group = SrtGroup::new(0x4000_0013, GroupMode::Backup).unwrap();
+    group.add_member(1, 1, member).unwrap();
+
+    group.send(b"last", ts(100_000)).unwrap();
+    let last = packets_from(group.member_mut(1).unwrap().connection_mut())
+        .pop()
+        .unwrap();
+    group.send(b"wrapped", ts(101_000)).unwrap();
+    let wrapped = packets_from(group.member_mut(1).unwrap().connection_mut())
+        .pop()
+        .unwrap();
+    assert_eq!(data_sequence(&last), 0x7fff_ffff);
+    assert_eq!(data_sequence(&wrapped), 0);
+}
+
+#[test]
+fn pending_member_becomes_active_after_handshake() {
+    let mut caller = SrtConnection::new_caller(ConnectionOptions {
+        tsbpd_delay: 0,
+        ..Default::default()
+    });
+    let listener = SrtConnection::new_listener(ConnectionOptions {
+        tsbpd_delay: 0,
+        ..Default::default()
+    });
+    let mut group = SrtGroup::new(0x4000_0014, GroupMode::Broadcast).unwrap();
+    group.add_member(1, 1, listener).unwrap();
+    assert_eq!(group.member(1).unwrap().state(), GroupMemberState::Pending);
+
+    caller.connect(ts(0)).unwrap();
+    for round in 0..10 {
+        let now = ts(round * 10_000);
+        transfer(
+            &mut caller,
+            group.member_mut(1).unwrap().connection_mut(),
+            now,
+        );
+        while let Some(output) = group.member_mut(1).unwrap().connection_mut().poll_output() {
+            if let ConnectionOutput::SendPacket(packet) = output {
+                caller.feed_recv_buf(&packet, now).unwrap();
+            }
+        }
+        if caller.state() == ConnectionState::Connected
+            && group.member(1).unwrap().connection().state() == ConnectionState::Connected
+        {
+            break;
+        }
+    }
+    group.send(b"activated", ts(100_000)).unwrap();
+    assert_eq!(group.member(1).unwrap().state(), GroupMemberState::Active);
+}

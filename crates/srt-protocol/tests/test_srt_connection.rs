@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use shiguredo_srt::{
     ConnectionEvent, ConnectionOptions, ConnectionOutput, ConnectionState, ConnectionStats,
-    DataPacket, GroupExtensionData, GroupType, KeyLength, PacketPosition, SrtConnection, TimerId,
-    Timestamp,
+    DataPacket, ErrorKind, GroupExtensionData, GroupType, KeyLength, PacketPosition, SrtConnection,
+    SrtPacket, TimerId, Timestamp,
 };
 
 /// テスト用のデフォルトオプション (TSBPD 遅延を 0 にして即時配信)
@@ -100,6 +100,19 @@ fn public_connection_and_telemetry_are_send_sync() {
     assert_send_sync::<ConnectionStats>();
 }
 
+#[test]
+fn connection_options_debug_redacts_secret_material() {
+    let options = ConnectionOptions {
+        passphrase: Some("do-not-log-this-passphrase".to_string()),
+        crypto_sek: Some(vec![0xA7; 16]),
+        ..Default::default()
+    };
+    let debug = format!("{options:?}");
+    assert!(!debug.contains("do-not-log-this-passphrase"));
+    assert!(!debug.contains("167, 167"));
+    assert_eq!(debug.matches("[REDACTED]").count(), 2);
+}
+
 /// イベントから受信データを収集
 fn collect_received_data(conn: &mut SrtConnection) -> Vec<Vec<u8>> {
     let mut data = Vec::new();
@@ -128,6 +141,76 @@ fn test_handshake_without_encryption() {
     // Connected イベントが発火していることを確認
     assert!(find_connected_event(&mut caller));
     assert!(find_connected_event(&mut listener));
+}
+
+#[test]
+fn connected_connection_rejects_packets_for_another_socket_id() {
+    let mut caller = SrtConnection::new_caller(ConnectionOptions {
+        socket_id: 0x1111,
+        tsbpd_delay: 0,
+        ..Default::default()
+    });
+    let mut listener = SrtConnection::new_listener(ConnectionOptions {
+        socket_id: 0x2222,
+        tsbpd_delay: 0,
+        ..Default::default()
+    });
+    establish_connection(&mut caller, &mut listener).expect("connected pair");
+    while caller.poll_output().is_some() {}
+    while listener.poll_output().is_some() {}
+
+    caller.send(b"wrong destination", ts(20_000)).expect("send");
+    let packet = loop {
+        let output = caller.poll_output().expect("data packet");
+        if let ConnectionOutput::SendPacket(bytes) = output {
+            break bytes;
+        }
+    };
+    let SrtPacket::Data(mut data) = SrtPacket::decode(&packet).expect("decode data") else {
+        panic!("expected data packet");
+    };
+    data.dest_socket_id = 0x3333;
+    let mut misrouted = Vec::new();
+    data.encode(&mut misrouted);
+
+    let error = listener
+        .feed_recv_buf(&misrouted, ts(20_001))
+        .expect_err("wrong destination must be rejected");
+    assert_eq!(error.kind, ErrorKind::InvalidData);
+    assert!(collect_received_data(&mut listener).is_empty());
+}
+
+#[test]
+fn connected_connection_rejects_zero_destination_handshake() {
+    let mut caller = SrtConnection::new_caller(ConnectionOptions {
+        socket_id: 0x1111,
+        tsbpd_delay: 0,
+        ..Default::default()
+    });
+    let mut listener = SrtConnection::new_listener(ConnectionOptions {
+        socket_id: 0x2222,
+        tsbpd_delay: 0,
+        ..Default::default()
+    });
+    establish_connection(&mut caller, &mut listener).expect("connected pair");
+
+    let mut attacker = SrtConnection::new_caller(ConnectionOptions {
+        socket_id: 0x3333,
+        ..Default::default()
+    });
+    attacker.connect(ts(20_000)).expect("attacker starts");
+    let induction = loop {
+        let output = attacker.poll_output().expect("induction output");
+        if let ConnectionOutput::SendPacket(bytes) = output {
+            break bytes;
+        }
+    };
+
+    let error = listener
+        .feed_recv_buf(&induction, ts(20_001))
+        .expect_err("zero-destination handshake must not reach connected state");
+    assert_eq!(error.kind, ErrorKind::InvalidData);
+    assert_eq!(listener.state(), ConnectionState::Connected);
 }
 
 #[test]
@@ -188,6 +271,60 @@ fn test_handshake_with_encryption() {
 
     assert_eq!(caller.state(), ConnectionState::Connected);
     assert_eq!(listener.state(), ConnectionState::Connected);
+}
+
+#[test]
+fn encrypted_connections_generate_fresh_default_key_material() {
+    fn conclusion_packet() -> Vec<u8> {
+        let mut caller = SrtConnection::new_caller(ConnectionOptions {
+            socket_id: 0x1111,
+            passphrase: Some("random-key-material".to_string()),
+            key_length: KeyLength::Aes128,
+            ..Default::default()
+        });
+        let mut listener = SrtConnection::new_listener(ConnectionOptions {
+            socket_id: 0x2222,
+            ..Default::default()
+        });
+        caller.connect(ts(0)).expect("start caller");
+        transfer_caller_to_listener(&mut caller, &mut listener, ts(0));
+        transfer_listener_to_caller(&mut listener, &mut caller, ts(1));
+        while let Some(output) = caller.poll_output() {
+            if let ConnectionOutput::SendPacket(bytes) = output {
+                return bytes;
+            }
+        }
+        panic!("caller did not emit conclusion");
+    }
+
+    assert_ne!(conclusion_packet(), conclusion_packet());
+}
+
+#[test]
+fn encrypted_connection_rejects_an_explicit_all_zero_sek() {
+    let mut caller = SrtConnection::new_caller(ConnectionOptions {
+        socket_id: 0x1111,
+        passphrase: Some("zero-key-must-fail".to_string()),
+        crypto_salt: Some([0x42; 16]),
+        crypto_sek: Some(vec![0; 16]),
+        ..Default::default()
+    });
+    let mut listener = SrtConnection::new_listener(ConnectionOptions {
+        socket_id: 0x2222,
+        ..Default::default()
+    });
+    caller.connect(ts(0)).expect("start caller");
+    transfer_caller_to_listener(&mut caller, &mut listener, ts(0));
+
+    let mut error = None;
+    while let Some(output) = listener.poll_output() {
+        if let ConnectionOutput::SendPacket(bytes) = output {
+            error = caller.feed_recv_buf(&bytes, ts(1)).err();
+        }
+    }
+    let error = error.expect("zero SEK must fail during induction response handling");
+    assert_eq!(error.kind, shiguredo_srt::ErrorKind::CryptoError);
+    assert!(error.reason.contains("all zero"));
 }
 
 #[test]

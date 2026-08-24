@@ -92,6 +92,96 @@ impl Default for OutputDrainBudget {
     }
 }
 
+/// Coherent application-facing defaults for one SRT stack instance.
+///
+/// These are the benchmark knobs that describe protocol/resource policy and
+/// therefore belong in reusable library configuration. Runtime choice,
+/// executor thread count, ingress topology, CPU pinning, promotion strategy,
+/// connection-arrival concurrency, and link impairment remain deployment or
+/// experiment concerns and are intentionally not folded into this type.
+#[derive(Clone, Debug)]
+pub struct SrtStackConfig {
+    pub connection: ConnectionOptions,
+    pub admission: PeerTableConfig,
+    pub output_drain: OutputDrainBudget,
+    /// Requested SO_RCVBUF/SO_SNDBUF bytes. Zero preserves OS defaults.
+    pub socket_buffer_bytes: usize,
+    /// Recover rehashed CONCLUSION packets using the listener-issued cookie.
+    pub cookie_routing: bool,
+}
+
+impl Default for SrtStackConfig {
+    fn default() -> Self {
+        Self {
+            connection: ConnectionOptions::default(),
+            admission: PeerTableConfig::default(),
+            output_drain: OutputDrainBudget::default(),
+            socket_buffer_bytes: SOCK_BUF_BYTES,
+            cookie_routing: true,
+        }
+    }
+}
+
+impl SrtStackConfig {
+    /// Validate resource bounds before opening sockets or allocating peers.
+    pub fn validate(&self) -> std::io::Result<()> {
+        let invalid = |message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message);
+        if self.connection.flow_window_packets == 0 {
+            return Err(invalid("flow_window_packets must be non-zero"));
+        }
+        if self.connection.receive_buffer_packets == 0 {
+            return Err(invalid("receive_buffer_packets must be non-zero"));
+        }
+        if self.admission.max_peers == 0 {
+            return Err(invalid("admission.max_peers must be non-zero"));
+        }
+        if self.admission.half_open_timeout.is_zero() {
+            return Err(invalid("admission.half_open_timeout must be non-zero"));
+        }
+        if self.output_drain.max_actions == 0
+            || self.output_drain.max_packets == 0
+            || self.output_drain.max_bytes == 0
+        {
+            return Err(invalid("all output_drain limits must be non-zero"));
+        }
+        if self.socket_buffer_bytes > libc::c_int::MAX as usize {
+            return Err(invalid(
+                "socket_buffer_bytes exceeds the OS socket option range",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn caller(&self) -> std::io::Result<SrtConnection> {
+        self.validate()?;
+        Ok(SrtConnection::new_caller(self.connection.clone()))
+    }
+
+    pub fn listener(&self) -> std::io::Result<SrtConnection> {
+        self.validate()?;
+        Ok(SrtConnection::new_listener(self.connection.clone()))
+    }
+
+    pub fn peer_table(&self) -> std::io::Result<PeerTable> {
+        self.validate()?;
+        Ok(PeerTable::with_config(self.admission))
+    }
+
+    #[must_use]
+    pub fn admission_options(&self) -> AdmissionOptions {
+        AdmissionOptions {
+            socket_id: self.connection.socket_id,
+            tsbpd_delay: self.connection.tsbpd_delay,
+            cookie_routing: self.cookie_routing,
+        }
+    }
+
+    pub fn bind_reuseport(&self, port: u16) -> std::io::Result<std::net::UdpSocket> {
+        self.validate()?;
+        bind_reuseport(port, self.socket_buffer_bytes)
+    }
+}
+
 /// Why a bounded output-pump invocation yielded to its caller.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum OutputDrainStatus {
@@ -241,8 +331,18 @@ pub fn set_sock_bufs(fd: std::os::fd::RawFd, bytes: usize) -> std::io::Result<()
     if requested == 0 {
         return Ok(());
     }
+    if requested > libc::c_int::MAX as usize {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "socket buffer request exceeds c_int",
+        ));
+    }
     let v = requested as libc::c_int;
     let len = std::mem::size_of_val(&v) as libc::socklen_t;
+    // SAFETY: each option call receives a live caller-owned fd, a pointer to
+    // an initialized `c_int`, and its exact size. The kernel does not retain
+    // these pointers after the syscall returns; an invalid fd is reported as
+    // an ordinary OS error.
     unsafe {
         let r = libc::setsockopt(
             fd,
@@ -274,7 +374,7 @@ pub fn set_sock_bufs(fd: std::os::fd::RawFd, bytes: usize) -> std::io::Result<()
             &mut got as *mut _ as *mut libc::c_void,
             &mut got_len,
         );
-        if r == 0 && (got as usize) < requested {
+        if r == 0 && got >= 0 && (got as usize) < requested {
             eprintln!("SO_RCVBUF clamped by host to {got} (requested {requested})");
         }
     }
@@ -298,7 +398,7 @@ pub fn bind_reuseport(port: u16, sock_buf_bytes: usize) -> std::io::Result<std::
     sock.set_nonblocking(true)?;
     let addr = std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, port);
     sock.bind(&addr.into())?;
-    let _ = set_sock_bufs(sock.as_raw_fd(), sock_buf_bytes);
+    set_sock_bufs(sock.as_raw_fd(), sock_buf_bytes)?;
     Ok(sock.into())
 }
 
@@ -312,7 +412,7 @@ pub fn recvmsg_batch(
     bufs: &mut [Vec<u8>],
     sizes: &mut [usize],
     addrs: &mut [Option<std::net::SocketAddr>],
-) -> usize {
+) -> std::io::Result<usize> {
     use std::cell::RefCell;
     thread_local! {
         static SCRATCH: RefCell<BatchScratch> = RefCell::new(BatchScratch::new(64));
@@ -327,6 +427,7 @@ pub fn recvmsg_batch(
             Self {
                 msgs: (0..n)
                     .map(|_| libc::mmsghdr {
+                        // SAFETY: all-zero is a valid empty `msghdr`.
                         msg_hdr: unsafe { std::mem::zeroed() },
                         msg_len: 0,
                     })
@@ -337,21 +438,71 @@ pub fn recvmsg_batch(
                         iov_len: 0,
                     })
                     .collect(),
-                addrs: (0..n).map(|_| unsafe { std::mem::zeroed() }).collect(),
+                addrs: (0..n)
+                    .map(|_| {
+                        // SAFETY: `sockaddr_storage` is plain C storage and
+                        // all-zero is a valid uninitialized-address state.
+                        unsafe { std::mem::zeroed() }
+                    })
+                    .collect(),
             }
         }
+
+        fn ensure_len(&mut self, n: usize) {
+            if self.msgs.len() >= n {
+                return;
+            }
+            self.msgs.resize_with(n, || libc::mmsghdr {
+                // SAFETY: all-zero is a valid empty `msghdr`.
+                msg_hdr: unsafe { std::mem::zeroed() },
+                msg_len: 0,
+            });
+            self.iovs.resize_with(n, || libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 0,
+            });
+            self.addrs.resize_with(n, || {
+                // SAFETY: see `BatchScratch::new`; the kernel fills this
+                // storage before it is interpreted.
+                unsafe { std::mem::zeroed() }
+            });
+        }
+    }
+    if bufs.len() != sizes.len() || bufs.len() != addrs.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "recvmsg_batch slice lengths differ: bufs={}, sizes={}, addrs={}",
+                bufs.len(),
+                sizes.len(),
+                addrs.len()
+            ),
+        ));
     }
     let count = bufs.len();
+    if count == 0 {
+        return Ok(0);
+    }
+    let count_u32 = u32::try_from(count).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "recvmsg_batch exceeds recvmmsg count range",
+        )
+    })?;
     SCRATCH.with(|scratch| {
+        let mut scratch = scratch.borrow_mut();
+        scratch.ensure_len(count);
         let BatchScratch {
             msgs,
             iovs,
             addrs: storage_addrs,
-        } = &mut *scratch.borrow_mut();
+        } = &mut *scratch;
+        addrs.fill(None);
         for (((iov, msg), storage), (buf, size)) in iovs
             .iter_mut()
-            .zip(msgs.iter_mut())
-            .zip(storage_addrs.iter_mut())
+            .take(count)
+            .zip(msgs.iter_mut().take(count))
+            .zip(storage_addrs.iter_mut().take(count))
             .zip(bufs.iter_mut().zip(sizes.iter_mut()))
         {
             buf.resize(buf.capacity(), 0);
@@ -360,46 +511,64 @@ pub fn recvmsg_batch(
                 iov_base: buf.as_mut_ptr().cast(),
                 iov_len: buf.capacity(),
             };
+            // SAFETY: zeroed sockaddr storage is valid and is filled by the
+            // kernel before any family-specific interpretation.
+            *storage = unsafe { std::mem::zeroed() };
+            *msg = libc::mmsghdr {
+                // SAFETY: all-zero is a valid empty `msghdr`; fields needed
+                // by `recvmmsg` are assigned immediately below.
+                msg_hdr: unsafe { std::mem::zeroed() },
+                msg_len: 0,
+            };
             msg.msg_hdr.msg_iov = iov;
             msg.msg_hdr.msg_iovlen = 1;
             msg.msg_hdr.msg_name = (storage as *mut libc::sockaddr_storage).cast();
             msg.msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as u32;
-            msg.msg_len = 0;
         }
+        // SAFETY: the three scratch arrays contain at least `count` elements;
+        // every message points at its corresponding live iovec, address
+        // storage, and initialized writable Vec allocation for the duration
+        // of this synchronous syscall. `count_u32` was checked above.
         let received = unsafe {
             libc::recvmmsg(
                 fd,
                 msgs.as_mut_ptr(),
-                count as u32,
+                count_u32,
                 libc::MSG_DONTWAIT,
                 std::ptr::null_mut(),
             )
         };
         if received < 0 {
             let err = std::io::Error::last_os_error();
-            if err.kind() != std::io::ErrorKind::WouldBlock {
-                use std::sync::atomic::{AtomicBool, Ordering};
-                static LOGGED: AtomicBool = AtomicBool::new(false);
-                if !LOGGED.swap(true, Ordering::Relaxed) {
-                    eprintln!("recvmmsg failed once: {err} (fd={fd}, count={count})");
-                }
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                return Ok(0);
             }
-            return 0;
+            return Err(err);
         }
         for i in 0..received as usize {
-            addrs[i] = unsafe { sockaddr_to_addr(&storage_addrs[i]) };
+            // SAFETY: this entry was filled for a successfully received
+            // datagram. The helper also validates family and returned length.
+            addrs[i] = unsafe { sockaddr_to_addr(&storage_addrs[i], msgs[i].msg_hdr.msg_namelen) };
             sizes[i] = msgs[i].msg_len as usize;
         }
-        received as usize
+        Ok(received as usize)
     })
 }
 
 /// SAFETY: `storage` must have been filled by `recvmmsg` with a valid
 /// address (IPv4-only, matching this workspace's bench harness).
-unsafe fn sockaddr_to_addr(storage: &libc::sockaddr_storage) -> Option<std::net::SocketAddr> {
-    if storage.ss_family != libc::AF_INET as u16 {
+unsafe fn sockaddr_to_addr(
+    storage: &libc::sockaddr_storage,
+    name_len: libc::socklen_t,
+) -> Option<std::net::SocketAddr> {
+    if storage.ss_family != libc::AF_INET as u16
+        || (name_len as usize) < std::mem::size_of::<libc::sockaddr_in>()
+    {
         return None;
     }
+    // SAFETY: the caller guarantees kernel-filled storage; the checks above
+    // establish the IPv4 family and sufficient initialized byte length. The
+    // storage type provides alignment suitable for every sockaddr variant.
     let addr = unsafe { &*(storage as *const libc::sockaddr_storage as *const libc::sockaddr_in) };
     Some(std::net::SocketAddr::from((
         std::net::Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr)),
@@ -455,8 +624,9 @@ pub fn restrict_to_cpu_list(cpus: &[usize]) -> std::io::Result<()> {
     if cpus.is_empty() {
         return Ok(());
     }
-    // SAFETY: `set` is a correctly sized, zeroed cpu_set_t, and the
-    // syscall only reads it.
+    // SAFETY: `set` has the exact libc type and is initialized before use;
+    // indices are checked against `CPU_SETSIZE`, and the syscall only reads
+    // the set during the call.
     unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
         libc::CPU_ZERO(&mut set);
@@ -475,7 +645,8 @@ pub fn restrict_to_cpu_list(cpus: &[usize]) -> std::io::Result<()> {
 /// How many logical CPUs this process may currently run on.
 #[must_use]
 pub fn available_cpus() -> usize {
-    // SAFETY: `set` is a correctly sized cpu_set_t the syscall fills in.
+    // SAFETY: `set` is valid writable storage of the exact size supplied to
+    // the syscall. On success CPU_ISSET reads only the initialized result.
     unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
         if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
@@ -526,6 +697,12 @@ pub struct AdmissionPeer {
     /// also goes false on a clean shutdown, and from `stream_deadline`,
     /// which records only that it once connected.
     pub torn_down: bool,
+    /// A policy rejection is queued for transmission and this entry must
+    /// never accept more input. It is retired after `poll_outbound` drains
+    /// the rejection packet.
+    rejected: bool,
+    admitted_at: Timestamp,
+    last_datagram_at: Timestamp,
 }
 
 impl AdmissionPeer {
@@ -564,7 +741,7 @@ impl AdmissionPeer {
 
 /// Per-listener settings the table needs to mint new connections and to
 /// decide cookie routing.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AdmissionOptions {
     pub socket_id: u32,
     pub tsbpd_delay: u16,
@@ -572,6 +749,39 @@ pub struct AdmissionOptions {
     /// Off makes a rehashed CONCLUSION strand instead, which is only
     /// useful for measuring what the routing is worth.
     pub cookie_routing: bool,
+}
+
+/// Resource limits for one shared-listener admission table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PeerTableConfig {
+    pub max_peers: usize,
+    pub half_open_timeout: Duration,
+}
+
+impl Default for PeerTableConfig {
+    fn default() -> Self {
+        Self {
+            max_peers: 4096,
+            half_open_timeout: Duration::from_secs(10),
+        }
+    }
+}
+
+/// Application authorization result for an authenticated handshake identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdmissionDecision {
+    Accept,
+    Reject { reason: i32 },
+}
+
+/// Why an admission datagram was discarded without creating connection state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdmissionDropReason {
+    InvalidPacket,
+    InvalidCookie,
+    StaleConclusion,
+    RejectedPeer,
+    Capacity,
 }
 
 /// What [`PeerTable::admit`] did with a datagram.
@@ -583,6 +793,10 @@ pub enum Admit {
     /// Belongs to another acceptor's half-open handshake; the caller
     /// should send it there as [`WorkerMessage::Handshake`].
     ForwardTo(usize),
+    /// The application rejected the conclusion before it became connected.
+    Rejected,
+    /// The datagram was invalid, stale, or exceeded the configured bound.
+    Dropped(AdmissionDropReason),
 }
 
 /// One unmodified protocol event emitted by an admitted peer.
@@ -604,7 +818,6 @@ pub struct AdmissionEvent {
 /// telemetry, but never touches a socket. The caller drives the sending.
 /// It lives here rather than in srt-lifecycle because it owns clocks and
 /// live protocol state, which that crate deliberately does not.
-#[derive(Default)]
 pub struct PeerTable {
     peers: HashMap<std::net::SocketAddr, AdmissionPeer>,
     deadlines: DueIndex<std::net::SocketAddr>,
@@ -612,12 +825,33 @@ pub struct PeerTable {
     ready_set: HashSet<std::net::SocketAddr>,
     event_ready: VecDeque<std::net::SocketAddr>,
     event_ready_set: HashSet<std::net::SocketAddr>,
+    config: PeerTableConfig,
+}
+
+impl Default for PeerTable {
+    fn default() -> Self {
+        Self::with_config(PeerTableConfig::default())
+    }
 }
 
 impl PeerTable {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[must_use]
+    pub fn with_config(mut config: PeerTableConfig) -> Self {
+        config.max_peers = config.max_peers.max(1);
+        Self {
+            peers: HashMap::new(),
+            deadlines: DueIndex::default(),
+            ready: VecDeque::new(),
+            ready_set: HashSet::new(),
+            event_ready: VecDeque::new(),
+            event_ready_set: HashSet::new(),
+            config,
+        }
     }
 
     /// Take one datagram for `peer`.
@@ -637,15 +871,42 @@ impl PeerTable {
         worker_count: usize,
         telemetry: &IngressTelemetry,
     ) -> Admit {
-        let known = self.peers.contains_key(&peer);
-        // Only a handshake datagram for a peer we do not track can be
-        // misrouted; anything else is ours by definition.
-        let conclusion = (!known)
-            .then(|| srt_lifecycle::handshake_identity(data))
-            .flatten()
-            .filter(|identity| identity.is_conclusion);
+        self.admit_with_authorizer(
+            peer,
+            data,
+            now,
+            options,
+            worker_index,
+            worker_count,
+            telemetry,
+            |_| AdmissionDecision::Accept,
+        )
+    }
 
-        if let Some(identity) = &conclusion {
+    /// Admit a datagram, authorizing a valid CONCLUSION before it is fed to
+    /// the protocol core and can transition to `Connected`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn admit_with_authorizer<F>(
+        &mut self,
+        peer: std::net::SocketAddr,
+        data: &[u8],
+        now: Timestamp,
+        options: &AdmissionOptions,
+        worker_index: usize,
+        worker_count: usize,
+        telemetry: &IngressTelemetry,
+        authorize: F,
+    ) -> Admit
+    where
+        F: FnOnce(&srt_lifecycle::HandshakeIdentity) -> AdmissionDecision,
+    {
+        let expired = self.prune_half_open(now);
+        telemetry.record_expired_half_open(expired);
+        let known = self.peers.contains_key(&peer);
+        let handshake = srt_lifecycle::handshake_identity(data);
+        let conclusion = handshake.as_ref().filter(|identity| identity.is_conclusion);
+
+        if !known && let Some(identity) = conclusion {
             let owner = srt_lifecycle::worker_from_cookie(identity.syn_cookie, worker_count);
             match owner {
                 Some(owner) if owner != worker_index => {
@@ -665,9 +926,47 @@ impl PeerTable {
                 Some(_) => telemetry.record_promoted_duplicate(),
                 None => telemetry.record_stranded_conclusion(),
             }
+            return Admit::Dropped(AdmissionDropReason::StaleConclusion);
         }
 
-        {
+        if !known {
+            let Some(packet) = shiguredo_srt::peek_handshake(data) else {
+                telemetry.record_invalid_datagram();
+                return Admit::Dropped(AdmissionDropReason::InvalidPacket);
+            };
+            if packet.handshake_type != shiguredo_srt::HandshakeType::Induction {
+                telemetry.record_invalid_datagram();
+                return Admit::Dropped(AdmissionDropReason::InvalidPacket);
+            }
+            if self.peers.len() >= self.config.max_peers {
+                telemetry.record_admission_capacity_drop();
+                return Admit::Dropped(AdmissionDropReason::Capacity);
+            }
+        } else if let Some(identity) = conclusion {
+            let Some(entry) = self.peers.get_mut(&peer) else {
+                return Admit::Dropped(AdmissionDropReason::StaleConclusion);
+            };
+            if entry.rejected {
+                return Admit::Dropped(AdmissionDropReason::RejectedPeer);
+            }
+            if identity.syn_cookie != entry.conn.syn_cookie() {
+                telemetry.record_invalid_cookie();
+                return Admit::Dropped(AdmissionDropReason::InvalidCookie);
+            }
+            if let AdmissionDecision::Reject { reason } = authorize(identity) {
+                if entry.conn.reject(reason, now).is_err() {
+                    telemetry.record_invalid_datagram();
+                    return Admit::Dropped(AdmissionDropReason::InvalidPacket);
+                }
+                telemetry.record_policy_rejection();
+                entry.rejected = true;
+                entry.last_datagram_at = now;
+                self.mark_ready(peer);
+                return Admit::Rejected;
+            }
+        }
+
+        let fed = {
             let entry = self.peers.entry(peer).or_insert_with(|| AdmissionPeer {
                 conn: SrtConnection::new_listener(ConnectionOptions {
                     socket_id: options.socket_id,
@@ -686,11 +985,45 @@ impl PeerTable {
                 data_events: 0,
                 last_data_at: Instant::now(),
                 torn_down: false,
+                rejected: false,
+                admitted_at: now,
+                last_datagram_at: now,
             });
-            let _ = entry.conn.feed_recv_buf(data, now);
+            entry.last_datagram_at = now;
+            entry.conn.feed_recv_buf(data, now).is_ok()
+        };
+        if !fed {
+            telemetry.record_invalid_datagram();
+            if !known {
+                let _ = self.remove(&peer);
+            }
+            return Admit::Dropped(AdmissionDropReason::InvalidPacket);
         }
         self.mark_ready(peer);
         Admit::Fed
+    }
+
+    /// Remove incomplete handshakes that have stopped making progress.
+    pub fn prune_half_open(&mut self, now: Timestamp) -> usize {
+        let timeout_micros =
+            u64::try_from(self.config.half_open_timeout.as_micros()).unwrap_or(u64::MAX);
+        let stale: Vec<_> = self
+            .peers
+            .iter()
+            .filter_map(|(peer, entry)| {
+                let incomplete = entry.conn.state() != shiguredo_srt::ConnectionState::Connected
+                    && entry.stream_deadline.is_none();
+                (incomplete
+                    && now.saturating_sub(entry.last_datagram_at) >= timeout_micros
+                    && now.saturating_sub(entry.admitted_at) >= timeout_micros)
+                    .then_some(*peer)
+            })
+            .collect();
+        let count = stale.len();
+        for peer in stale {
+            let _ = self.remove(&peer);
+        }
+        count
     }
 
     /// [`Self::admit`] plus the send it implies: forward the datagram to
@@ -744,6 +1077,7 @@ impl PeerTable {
                     );
                 }
             }
+            Admit::Rejected | Admit::Dropped(_) => {}
         }
     }
 
@@ -759,6 +1093,7 @@ impl PeerTable {
         out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
     ) {
         out.clear();
+        let mut rejected = Vec::new();
         let mut due = Vec::new();
         self.deadlines.pop_due(now, &mut due);
         for peer in due {
@@ -777,11 +1112,18 @@ impl PeerTable {
                     other => entry.timers.apply_output(&other, now),
                 }
             }
+            if entry.rejected {
+                rejected.push(peer);
+                continue;
+            }
             if let Some(deadline) = entry.timers.next_deadline() {
                 self.deadlines.set(peer, deadline);
             } else {
                 self.deadlines.remove(&peer);
             }
+        }
+        for peer in rejected {
+            let _ = self.remove(&peer);
         }
     }
 
@@ -992,6 +1334,16 @@ pub struct IngressTelemetry {
     /// indistinguishable from a stranded handshake without checking the
     /// cookie -- counted apart so the two are never conflated again.
     pub promoted_duplicates: AtomicU64,
+    /// Malformed or out-of-state datagrams rejected before protocol work.
+    pub invalid_datagrams: AtomicU64,
+    /// CONCLUSIONs whose cookie did not match the retained half-open peer.
+    pub invalid_cookies: AtomicU64,
+    /// Valid new inductions refused because the half-open table was full.
+    pub admission_capacity_drops: AtomicU64,
+    /// Authenticated handshake identities rejected by application policy.
+    pub policy_rejections: AtomicU64,
+    /// Incomplete handshakes evicted after the configured inactivity bound.
+    pub expired_half_open: AtomicU64,
 }
 
 impl IngressTelemetry {
@@ -1020,6 +1372,22 @@ impl IngressTelemetry {
     pub fn record_promoted_duplicate(&self) {
         Self::bump(&self.promoted_duplicates);
     }
+    pub fn record_invalid_datagram(&self) {
+        Self::bump(&self.invalid_datagrams);
+    }
+    pub fn record_invalid_cookie(&self) {
+        Self::bump(&self.invalid_cookies);
+    }
+    pub fn record_admission_capacity_drop(&self) {
+        Self::bump(&self.admission_capacity_drops);
+    }
+    pub fn record_policy_rejection(&self) {
+        Self::bump(&self.policy_rejections);
+    }
+    pub fn record_expired_half_open(&self, count: usize) {
+        self.expired_half_open
+            .fetch_add(u64::try_from(count).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
 
     /// One-line shutdown summary, identical in shape for every runtime so
     /// two backends' output can be compared directly.
@@ -1028,12 +1396,19 @@ impl IngressTelemetry {
         let get = |c: &AtomicU64| c.load(Ordering::Relaxed);
         format!(
             "[bench-{backend}] pool receiver: {} local promotions, {} bond handoffs, \
-             {} stranded CONCLUSIONs, {} cookie-routed, {} post-promotion dups",
+             {} stranded CONCLUSIONs, {} cookie-routed, {} post-promotion dups, \
+             {} invalid datagrams, {} invalid cookies, {} capacity drops, \
+             {} policy rejections, {} expired half-open",
             get(&self.local_promotions),
             get(&self.handoffs),
             get(&self.stranded_conclusions),
             get(&self.cookie_routed),
             get(&self.promoted_duplicates),
+            get(&self.invalid_datagrams),
+            get(&self.invalid_cookies),
+            get(&self.admission_capacity_drops),
+            get(&self.policy_rejections),
+            get(&self.expired_half_open),
         )
     }
 }
@@ -1118,6 +1493,17 @@ impl Default for ManualTimerStore {
     }
 }
 
+#[cfg_attr(
+    not(any(
+        feature = "mio",
+        feature = "tokio",
+        feature = "smol",
+        feature = "monoio",
+        feature = "glommio",
+        feature = "compio"
+    )),
+    allow(dead_code)
+)]
 fn prepend_outputs(
     pending: &mut VecDeque<ConnectionOutput>,
     outputs: impl DoubleEndedIterator<Item = ConnectionOutput>,
@@ -1127,6 +1513,17 @@ fn prepend_outputs(
     }
 }
 
+#[cfg_attr(
+    not(any(
+        feature = "mio",
+        feature = "tokio",
+        feature = "smol",
+        feature = "monoio",
+        feature = "glommio",
+        feature = "compio"
+    )),
+    allow(dead_code)
+)]
 fn collect_output_work(
     conn: &mut SrtConnection,
     pending: &mut VecDeque<ConnectionOutput>,
@@ -1162,7 +1559,378 @@ fn collect_output_work(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shiguredo_srt::{ConnectionOptions, SrtConnection};
+    use proptest::prelude::*;
+    use shiguredo_srt::{
+        ConnectionOptions, ConnectionOutput, ErrorKind, HandshakePacket, SrtConnection, SrtPacket,
+    };
+
+    fn induction(socket_id: u32) -> Vec<u8> {
+        let packet = HandshakePacket::new_induction_request(socket_id).encode(0, 0);
+        let mut bytes = Vec::new();
+        packet.encode(&mut bytes);
+        bytes
+    }
+
+    fn next_packet(conn: &mut SrtConnection) -> Vec<u8> {
+        loop {
+            match conn.poll_output().expect("connection output") {
+                ConnectionOutput::SendPacket(bytes) => return bytes,
+                ConnectionOutput::SetTimer { .. } | ConnectionOutput::ClearTimer { .. } => {}
+            }
+        }
+    }
+
+    #[test]
+    fn recvmsg_batch_rejects_mismatched_slices() {
+        let mut bufs = (0..2).map(|_| Vec::with_capacity(64)).collect::<Vec<_>>();
+        let mut sizes = vec![0; 1];
+        let mut addrs = vec![None; 2];
+        let error = recvmsg_batch(-1, &mut bufs, &mut sizes, &mut addrs)
+            .expect_err("mismatched slices must be rejected before the syscall");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+
+        let mut sizes = vec![0; 2];
+        let mut addrs = vec![None; 1];
+        let error = recvmsg_batch(-1, &mut bufs, &mut sizes, &mut addrs)
+            .expect_err("mismatched address slice must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn recvmsg_batch_accepts_an_empty_batch_without_touching_the_fd() {
+        assert_eq!(
+            recvmsg_batch(-1, &mut [], &mut [], &mut []).expect("empty batch is a no-op"),
+            0
+        );
+    }
+
+    #[test]
+    fn stack_config_builds_coherent_caller_listener_and_admission_defaults() {
+        let mut config = SrtStackConfig::default();
+        config.connection.socket_id = 0x1234;
+        config.connection.tsbpd_delay = 250;
+        let caller = config.caller().expect("valid caller config");
+        let listener = config.listener().expect("valid listener config");
+        assert_eq!(caller.state(), shiguredo_srt::ConnectionState::Disconnected);
+        assert_eq!(listener.state(), shiguredo_srt::ConnectionState::Listening);
+        assert!(
+            config
+                .peer_table()
+                .expect("valid admission config")
+                .is_empty()
+        );
+        assert_eq!(
+            config.admission_options(),
+            AdmissionOptions {
+                socket_id: 0x1234,
+                tsbpd_delay: 250,
+                cookie_routing: true,
+            }
+        );
+    }
+
+    #[test]
+    fn stack_config_rejects_zero_or_os_truncating_resource_limits() {
+        let mut config = SrtStackConfig::default();
+        config.connection.flow_window_packets = 0;
+        assert_eq!(
+            config.validate().unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        config.connection.flow_window_packets = 1;
+        config.output_drain.max_packets = 0;
+        assert_eq!(
+            config.validate().unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        config.output_drain.max_packets = 1;
+        config.socket_buffer_bytes = libc::c_int::MAX as usize + 1;
+        assert_eq!(
+            config.validate().unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn ingress_telemetry_is_exact_under_concurrent_recording() {
+        let telemetry = std::sync::Arc::new(IngressTelemetry::new());
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let telemetry = std::sync::Arc::clone(&telemetry);
+                std::thread::spawn(move || {
+                    for _ in 0..10_000 {
+                        telemetry.record_local_promotion();
+                        telemetry.record_invalid_datagram();
+                        telemetry.record_expired_half_open(2);
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().expect("telemetry worker");
+        }
+        assert_eq!(telemetry.local_promotions.load(Ordering::Relaxed), 80_000);
+        assert_eq!(telemetry.invalid_datagrams.load(Ordering::Relaxed), 80_000);
+        assert_eq!(telemetry.expired_half_open.load(Ordering::Relaxed), 160_000);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recvmsg_batch_handles_boundaries_through_sixty_five_datagrams() {
+        use std::os::fd::AsRawFd;
+        use std::time::{Duration, Instant};
+
+        for count in [1usize, 32, 64, 65] {
+            let receiver = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind receiver");
+            receiver.set_nonblocking(true).expect("set nonblocking");
+            let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind sender");
+            let destination = receiver.local_addr().expect("receiver address");
+            for index in 0..count {
+                sender
+                    .send_to(&(index as u32).to_be_bytes(), destination)
+                    .expect("send datagram");
+            }
+
+            let mut bufs: Vec<Vec<u8>> = (0..count).map(|_| Vec::with_capacity(64)).collect();
+            let mut sizes = vec![0usize; count];
+            let mut addrs = vec![None; count];
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut received = 0usize;
+            while received < count && Instant::now() < deadline {
+                match recvmsg_batch(
+                    receiver.as_raw_fd(),
+                    &mut bufs[received..],
+                    &mut sizes[received..],
+                    &mut addrs[received..],
+                ) {
+                    Ok(0) => std::thread::yield_now(),
+                    Ok(n) => received += n,
+                    Err(error) => panic!("recvmmsg failed: {error}"),
+                }
+            }
+            assert_eq!(received, count, "batch size {count}");
+            for index in 0..count {
+                assert_eq!(sizes[index], 4);
+                assert_eq!(&bufs[index][..sizes[index]], &(index as u32).to_be_bytes());
+                assert_eq!(
+                    addrs[index],
+                    Some(sender.local_addr().expect("sender address"))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_unknown_datagrams_do_not_allocate_admission_state() {
+        let mut table = PeerTable::new();
+        let options = AdmissionOptions {
+            socket_id: 7,
+            tsbpd_delay: 0,
+            cookie_routing: true,
+        };
+        let result = table.admit(
+            "127.0.0.1:10000".parse().expect("address"),
+            &[0; 16],
+            Timestamp::from_micros(0),
+            &options,
+            0,
+            1,
+            &IngressTelemetry::new(),
+        );
+        assert_eq!(result, Admit::Dropped(AdmissionDropReason::InvalidPacket));
+        assert!(table.is_empty());
+    }
+
+    #[test]
+    fn admission_capacity_and_half_open_timeout_bound_state() {
+        let mut table = PeerTable::with_config(PeerTableConfig {
+            max_peers: 2,
+            half_open_timeout: Duration::from_micros(100),
+        });
+        let options = AdmissionOptions {
+            socket_id: 7,
+            tsbpd_delay: 0,
+            cookie_routing: true,
+        };
+        let telemetry = IngressTelemetry::new();
+        let peers = [
+            "127.0.0.1:10000".parse().expect("address"),
+            "127.0.0.1:10001".parse().expect("address"),
+            "127.0.0.1:10002".parse().expect("address"),
+        ];
+        assert_eq!(
+            table.admit(
+                peers[0],
+                &induction(1),
+                Timestamp::from_micros(0),
+                &options,
+                0,
+                1,
+                &telemetry,
+            ),
+            Admit::Fed
+        );
+        assert_eq!(
+            table.admit(
+                peers[1],
+                &induction(2),
+                Timestamp::from_micros(1),
+                &options,
+                0,
+                1,
+                &telemetry,
+            ),
+            Admit::Fed
+        );
+        assert_eq!(
+            table.admit(
+                peers[2],
+                &induction(3),
+                Timestamp::from_micros(2),
+                &options,
+                0,
+                1,
+                &telemetry,
+            ),
+            Admit::Dropped(AdmissionDropReason::Capacity)
+        );
+        assert_eq!(table.len(), 2);
+        assert_eq!(
+            telemetry.admission_capacity_drops.load(Ordering::Relaxed),
+            1
+        );
+
+        assert_eq!(
+            table.admit(
+                peers[2],
+                &induction(3),
+                Timestamp::from_micros(101),
+                &options,
+                0,
+                1,
+                &telemetry,
+            ),
+            Admit::Fed
+        );
+        assert_eq!(table.len(), 1);
+        assert_eq!(telemetry.expired_half_open.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn stream_authorizer_rejects_before_connection_is_established() {
+        let peer = "127.0.0.1:10000".parse().expect("address");
+        let options = AdmissionOptions {
+            socket_id: 0x2222,
+            tsbpd_delay: 0,
+            cookie_routing: true,
+        };
+        let telemetry = IngressTelemetry::new();
+        let mut table = PeerTable::new();
+        let mut caller = SrtConnection::new_caller(ConnectionOptions {
+            socket_id: 0x1111,
+            stream_id: Some("publish:forbidden".to_string()),
+            ..Default::default()
+        });
+        caller
+            .connect(Timestamp::from_micros(0))
+            .expect("start caller");
+        let induction = next_packet(&mut caller);
+        assert_eq!(
+            table.admit(
+                peer,
+                &induction,
+                Timestamp::from_micros(0),
+                &options,
+                0,
+                1,
+                &telemetry,
+            ),
+            Admit::Fed
+        );
+        let mut outbound = Vec::new();
+        table.poll_outbound(Timestamp::from_micros(0), &mut outbound);
+        for (_, bytes) in outbound.drain(..) {
+            caller
+                .feed_recv_buf(&bytes, Timestamp::from_micros(1))
+                .expect("induction response");
+        }
+        let conclusion = next_packet(&mut caller);
+        let result = table.admit_with_authorizer(
+            peer,
+            &conclusion,
+            Timestamp::from_micros(2),
+            &options,
+            0,
+            1,
+            &telemetry,
+            |identity| {
+                assert_eq!(identity.stream_id.as_deref(), Some("publish:forbidden"));
+                AdmissionDecision::Reject { reason: 1401 }
+            },
+        );
+        assert_eq!(result, Admit::Rejected);
+        assert_eq!(telemetry.policy_rejections.load(Ordering::Relaxed), 1);
+        assert_ne!(
+            table
+                .get(&peer)
+                .expect("peer retained to send rejection")
+                .conn
+                .state(),
+            shiguredo_srt::ConnectionState::Connected
+        );
+        assert_eq!(
+            table.admit(
+                peer,
+                &conclusion,
+                Timestamp::from_micros(2),
+                &options,
+                0,
+                1,
+                &telemetry,
+            ),
+            Admit::Dropped(AdmissionDropReason::RejectedPeer)
+        );
+        assert_ne!(
+            table.get(&peer).expect("rejected peer").conn.state(),
+            shiguredo_srt::ConnectionState::Connected
+        );
+
+        table.poll_outbound(Timestamp::from_micros(2), &mut outbound);
+        let rejection = outbound
+            .into_iter()
+            .map(|(_, bytes)| bytes)
+            .find(|bytes| {
+                matches!(
+                    SrtPacket::decode(bytes),
+                    Ok(SrtPacket::Control(ref control))
+                        if HandshakePacket::decode(control)
+                            .is_ok_and(|handshake| handshake.reject_reason == Some(1401))
+                )
+            })
+            .expect("wire rejection");
+        let error = caller
+            .feed_recv_buf(&rejection, Timestamp::from_micros(3))
+            .expect_err("caller receives rejection");
+        assert_eq!(error.kind, ErrorKind::HandshakeRejected);
+
+        // The rejected connection is retired after its response is drained,
+        // and replaying the authenticated conclusion cannot bypass policy via
+        // the allow-all `admit` convenience path.
+        assert!(!table.contains(&peer));
+        assert_eq!(
+            table.admit(
+                peer,
+                &conclusion,
+                Timestamp::from_micros(4),
+                &options,
+                0,
+                1,
+                &telemetry,
+            ),
+            Admit::Dropped(AdmissionDropReason::StaleConclusion)
+        );
+        assert!(!table.contains(&peer));
+    }
 
     #[test]
     fn due_index_replaces_deadlines_and_ignores_stale_entries() {
@@ -1187,6 +1955,65 @@ mod tests {
         index.remove(&7);
         assert_eq!(index.peek_min_deadline(), None);
         assert!(index.is_empty());
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn due_index_matches_last_write_wins_model(
+            writes in prop::collection::vec((0u8..32, any::<u16>()), 0..256),
+            now in any::<u16>(),
+        ) {
+            let mut index = DueIndex::default();
+            let mut model = HashMap::new();
+            for (key, deadline) in writes {
+                index.set(key, Timestamp::from_micros(u64::from(deadline)));
+                model.insert(key, deadline);
+            }
+
+            let mut actual = Vec::new();
+            index.pop_due(Timestamp::from_micros(u64::from(now)), &mut actual);
+            actual.sort_unstable();
+            let mut expected: Vec<_> = model
+                .into_iter()
+                .filter_map(|(key, deadline)| (deadline <= now).then_some(key))
+                .collect();
+            expected.sort_unstable();
+            prop_assert_eq!(actual, expected);
+        }
+
+        #[test]
+        fn admission_table_never_exceeds_configured_capacity(
+            requested in 1usize..64,
+            max_peers in 1usize..16,
+        ) {
+            let mut table = PeerTable::with_config(PeerTableConfig {
+                max_peers,
+                half_open_timeout: Duration::from_secs(60),
+            });
+            let options = AdmissionOptions {
+                socket_id: 7,
+                tsbpd_delay: 0,
+                cookie_routing: true,
+            };
+            let telemetry = IngressTelemetry::new();
+            for index in 0..requested {
+                let peer = std::net::SocketAddr::from(([127, 0, 0, 1], 10_000 + index as u16));
+                let result = table.admit(
+                    peer,
+                    &induction(index as u32 + 1),
+                    Timestamp::from_micros(index as u64),
+                    &options,
+                    0,
+                    1,
+                    &telemetry,
+                );
+                prop_assert!(matches!(result, Admit::Fed | Admit::Dropped(AdmissionDropReason::Capacity)));
+                prop_assert!(table.len() <= max_peers);
+            }
+            prop_assert_eq!(table.len(), requested.min(max_peers));
+        }
     }
 
     #[test]
@@ -1419,6 +2246,8 @@ pub mod mio_transport {
                         iov_len: buf.len(),
                     });
                     msgs.push(libc::mmsghdr {
+                        // SAFETY: all-zero is a valid empty `msghdr`; the
+                        // iovec pointer and count are assigned below.
                         msg_hdr: unsafe { std::mem::zeroed() },
                         msg_len: 0,
                     });
@@ -1431,14 +2260,15 @@ pub mod mio_transport {
                     use std::os::fd::AsRawFd;
                     socket.as_raw_fd()
                 };
-                let sent = unsafe {
-                    libc::sendmmsg(
-                        fd,
-                        msgs.as_mut_ptr(),
-                        batch.len() as u32,
-                        libc::MSG_DONTWAIT,
-                    )
-                };
+                let count = u32::try_from(batch.len()).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "send batch exceeds u32")
+                })?;
+                // SAFETY: `msgs` and `iovs` have exactly `batch.len()` live
+                // elements. Each iovec points into an immutable packet Vec
+                // that outlives this synchronous syscall; pointers are set
+                // only after both scratch vectors finish growing.
+                let sent =
+                    unsafe { libc::sendmmsg(fd, msgs.as_mut_ptr(), count, libc::MSG_DONTWAIT) };
                 if sent < 0 {
                     Err(io::Error::last_os_error())
                 } else {
@@ -1687,10 +2517,9 @@ pub mod tokio_transport {
         }
 
         /// Compatibility wrapper using [`OutputDrainBudget::default`].
-        pub async fn drain_outputs(&mut self, now: Timestamp) {
-            let _ = self
-                .drain_outputs_bounded(now, OutputDrainBudget::default())
-                .await;
+        pub async fn drain_outputs(&mut self, now: Timestamp) -> io::Result<OutputDrainReport> {
+            self.drain_outputs_bounded(now, OutputDrainBudget::default())
+                .await
         }
 
         /// Drain a bounded amount of output. A failed datagram and every
@@ -1768,24 +2597,33 @@ pub mod tokio_transport {
 
         /// Send one paced packet.
         pub async fn send_paced(&mut self, payload: &[u8], now: Timestamp) -> Result<(), ()> {
-            if !self.conn.can_send_with_pacing(now) {
+            if self.has_pending_outputs() || !self.conn.can_send_with_pacing(now) {
                 return Err(());
             }
             self.conn.send(payload, now).map_err(|_| ())?;
-            self.drain_outputs(now).await;
-            Ok(())
+            let report = self.drain_outputs(now).await.map_err(|_| ())?;
+            (report.status == OutputDrainStatus::Drained)
+                .then_some(())
+                .ok_or(())
         }
 
         /// Full event-loop tick: fire timers, recv, drain, send paced.
-        pub async fn tick(&mut self, buf: &mut [u8], payload: &[u8], now: Timestamp) -> TickResult {
+        pub async fn tick(
+            &mut self,
+            buf: &mut [u8],
+            payload: &[u8],
+            now: Timestamp,
+        ) -> io::Result<TickResult> {
             self.fire_expired(now);
             self.recv_with_timeout(buf, Duration::from_micros(100), now)
                 .await;
-            self.drain_outputs(now).await;
+            let drained = self.drain_outputs(now).await?;
 
             let mut sent = 0u64;
-            while self.send_paced(payload, now).await.is_ok() {
-                sent += 1;
+            if drained.status == OutputDrainStatus::Drained {
+                while self.send_paced(payload, now).await.is_ok() {
+                    sent += 1;
+                }
             }
 
             let mut events = Vec::new();
@@ -1793,7 +2631,7 @@ pub mod tokio_transport {
                 events.push(ev);
             }
 
-            TickResult { sent, events }
+            Ok(TickResult { sent, events })
         }
     }
 
@@ -1805,7 +2643,13 @@ pub mod tokio_transport {
 
 #[cfg(feature = "smol")]
 pub mod smol_transport {
+    use crate::{
+        OutputDrainBudget, OutputDrainReport, OutputDrainStatus, collect_output_work,
+        prepend_outputs,
+    };
     use shiguredo_srt::{ConnectionEvent, ConnectionOutput, SrtConnection, Timestamp};
+    use std::collections::VecDeque;
+    use std::io;
     use std::time::Duration;
 
     pub type UdpSocket = smol::Async<std::net::UdpSocket>;
@@ -1815,6 +2659,7 @@ pub mod smol_transport {
         pub conn: SrtConnection,
         pub sock: UdpSocket,
         timers: crate::ManualTimerStore,
+        pending_outputs: VecDeque<ConnectionOutput>,
     }
 
     impl Conn {
@@ -1823,6 +2668,7 @@ pub mod smol_transport {
                 conn,
                 sock,
                 timers: crate::ManualTimerStore::new(),
+                pending_outputs: VecDeque::new(),
             }
         }
 
@@ -1834,15 +2680,64 @@ pub mod smol_transport {
             self.timers.fire_expired(now, &mut self.conn);
         }
 
-        pub async fn drain_outputs(&mut self, now: Timestamp) {
-            while let Some(out) = self.conn.poll_output() {
+        pub async fn drain_outputs(&mut self, now: Timestamp) -> io::Result<OutputDrainReport> {
+            self.drain_outputs_bounded(now, OutputDrainBudget::default())
+                .await
+        }
+
+        pub async fn drain_outputs_bounded(
+            &mut self,
+            now: Timestamp,
+            budget: OutputDrainBudget,
+        ) -> io::Result<OutputDrainReport> {
+            let (mut work, exhausted) =
+                collect_output_work(&mut self.conn, &mut self.pending_outputs, budget);
+            let mut report = OutputDrainReport {
+                status: if exhausted {
+                    OutputDrainStatus::BudgetExhausted
+                } else {
+                    OutputDrainStatus::Drained
+                },
+                ..Default::default()
+            };
+            while let Some(out) = work.pop_front() {
                 match out {
                     ConnectionOutput::SendPacket(bytes) => {
-                        let _ = self.sock.write_with(|inner| inner.send(&bytes)).await;
+                        match self.sock.write_with(|inner| inner.send(&bytes)).await {
+                            Ok(sent) if sent == bytes.len() => {
+                                report.actions += 1;
+                                report.packets += 1;
+                                report.bytes += sent;
+                            }
+                            Ok(_) => {
+                                prepend_outputs(&mut self.pending_outputs, work.into_iter());
+                                self.pending_outputs
+                                    .push_front(ConnectionOutput::SendPacket(bytes));
+                                return Err(io::Error::new(
+                                    io::ErrorKind::WriteZero,
+                                    "UDP send completed with a partial datagram",
+                                ));
+                            }
+                            Err(error) => {
+                                prepend_outputs(&mut self.pending_outputs, work.into_iter());
+                                self.pending_outputs
+                                    .push_front(ConnectionOutput::SendPacket(bytes));
+                                return Err(error);
+                            }
+                        }
                     }
-                    other => self.timers.apply_output(&other, now),
+                    other => {
+                        self.timers.apply_output(&other, now);
+                        report.actions += 1;
+                    }
                 }
             }
+            Ok(report)
+        }
+
+        #[must_use]
+        pub fn has_pending_outputs(&self) -> bool {
+            !self.pending_outputs.is_empty()
         }
 
         pub async fn recv_with_timeout(
@@ -1870,23 +2765,32 @@ pub mod smol_transport {
         }
 
         pub async fn send_paced(&mut self, payload: &[u8], now: Timestamp) -> Result<(), ()> {
-            if !self.conn.can_send_with_pacing(now) {
+            if self.has_pending_outputs() || !self.conn.can_send_with_pacing(now) {
                 return Err(());
             }
             self.conn.send(payload, now).map_err(|_| ())?;
-            self.drain_outputs(now).await;
-            Ok(())
+            let report = self.drain_outputs(now).await.map_err(|_| ())?;
+            (report.status == OutputDrainStatus::Drained)
+                .then_some(())
+                .ok_or(())
         }
 
-        pub async fn tick(&mut self, buf: &mut [u8], payload: &[u8], now: Timestamp) -> TickResult {
+        pub async fn tick(
+            &mut self,
+            buf: &mut [u8],
+            payload: &[u8],
+            now: Timestamp,
+        ) -> io::Result<TickResult> {
             self.fire_expired(now);
             self.recv_with_timeout(buf, Duration::from_micros(100), now)
                 .await;
-            self.drain_outputs(now).await;
+            let drained = self.drain_outputs(now).await?;
 
             let mut sent = 0u64;
-            while self.send_paced(payload, now).await.is_ok() {
-                sent += 1;
+            if drained.status == OutputDrainStatus::Drained {
+                while self.send_paced(payload, now).await.is_ok() {
+                    sent += 1;
+                }
             }
 
             let mut events = Vec::new();
@@ -1894,7 +2798,7 @@ pub mod smol_transport {
                 events.push(ev);
             }
 
-            TickResult { sent, events }
+            Ok(TickResult { sent, events })
         }
     }
 
@@ -1906,7 +2810,13 @@ pub mod smol_transport {
 
 #[cfg(feature = "monoio")]
 pub mod monoio_transport {
+    use crate::{
+        OutputDrainBudget, OutputDrainReport, OutputDrainStatus, collect_output_work,
+        prepend_outputs,
+    };
     use shiguredo_srt::{ConnectionEvent, ConnectionOutput, SrtConnection, Timestamp};
+    use std::collections::VecDeque;
+    use std::io;
     use std::time::Duration;
 
     /// Per-connection state for monoio: protocol + owned-buffer socket + timer deadlines.
@@ -1914,6 +2824,7 @@ pub mod monoio_transport {
         pub conn: SrtConnection,
         pub sock: monoio::net::udp::UdpSocket,
         timers: crate::ManualTimerStore,
+        pending_outputs: VecDeque<ConnectionOutput>,
     }
 
     impl Conn {
@@ -1922,6 +2833,7 @@ pub mod monoio_transport {
                 conn,
                 sock,
                 timers: crate::ManualTimerStore::new(),
+                pending_outputs: VecDeque::new(),
             }
         }
 
@@ -1933,15 +2845,66 @@ pub mod monoio_transport {
             self.timers.fire_expired(now, &mut self.conn);
         }
 
-        pub async fn drain_outputs(&mut self, now: Timestamp) {
-            while let Some(out) = self.conn.poll_output() {
+        pub async fn drain_outputs(&mut self, now: Timestamp) -> io::Result<OutputDrainReport> {
+            self.drain_outputs_bounded(now, OutputDrainBudget::default())
+                .await
+        }
+
+        pub async fn drain_outputs_bounded(
+            &mut self,
+            now: Timestamp,
+            budget: OutputDrainBudget,
+        ) -> io::Result<OutputDrainReport> {
+            let (mut work, exhausted) =
+                collect_output_work(&mut self.conn, &mut self.pending_outputs, budget);
+            let mut report = OutputDrainReport {
+                status: if exhausted {
+                    OutputDrainStatus::BudgetExhausted
+                } else {
+                    OutputDrainStatus::Drained
+                },
+                ..Default::default()
+            };
+            while let Some(out) = work.pop_front() {
                 match out {
                     ConnectionOutput::SendPacket(bytes) => {
-                        let (_res, _buf) = self.sock.send(bytes).await;
+                        let expected = bytes.len();
+                        let (result, bytes) = self.sock.send(bytes).await;
+                        match result {
+                            Ok(sent) if sent == expected => {
+                                report.actions += 1;
+                                report.packets += 1;
+                                report.bytes += sent;
+                            }
+                            Ok(_) => {
+                                prepend_outputs(&mut self.pending_outputs, work.into_iter());
+                                self.pending_outputs
+                                    .push_front(ConnectionOutput::SendPacket(bytes));
+                                return Err(io::Error::new(
+                                    io::ErrorKind::WriteZero,
+                                    "UDP send completed with a partial datagram",
+                                ));
+                            }
+                            Err(error) => {
+                                prepend_outputs(&mut self.pending_outputs, work.into_iter());
+                                self.pending_outputs
+                                    .push_front(ConnectionOutput::SendPacket(bytes));
+                                return Err(error);
+                            }
+                        }
                     }
-                    other => self.timers.apply_output(&other, now),
+                    other => {
+                        self.timers.apply_output(&other, now);
+                        report.actions += 1;
+                    }
                 }
             }
+            Ok(report)
+        }
+
+        #[must_use]
+        pub fn has_pending_outputs(&self) -> bool {
+            !self.pending_outputs.is_empty()
         }
 
         pub async fn recv_with_timeout(&mut self, timeout: Duration, now: Timestamp) {
@@ -1953,23 +2916,27 @@ pub mod monoio_transport {
         }
 
         pub async fn send_paced(&mut self, payload: &[u8], now: Timestamp) -> Result<(), ()> {
-            if !self.conn.can_send_with_pacing(now) {
+            if self.has_pending_outputs() || !self.conn.can_send_with_pacing(now) {
                 return Err(());
             }
             self.conn.send(payload, now).map_err(|_| ())?;
-            self.drain_outputs(now).await;
-            Ok(())
+            let report = self.drain_outputs(now).await.map_err(|_| ())?;
+            (report.status == OutputDrainStatus::Drained)
+                .then_some(())
+                .ok_or(())
         }
 
-        pub async fn tick(&mut self, payload: &[u8], now: Timestamp) -> TickResult {
+        pub async fn tick(&mut self, payload: &[u8], now: Timestamp) -> io::Result<TickResult> {
             self.fire_expired(now);
             self.recv_with_timeout(Duration::from_micros(100), now)
                 .await;
-            self.drain_outputs(now).await;
+            let drained = self.drain_outputs(now).await?;
 
             let mut sent = 0u64;
-            while self.send_paced(payload, now).await.is_ok() {
-                sent += 1;
+            if drained.status == OutputDrainStatus::Drained {
+                while self.send_paced(payload, now).await.is_ok() {
+                    sent += 1;
+                }
             }
 
             let mut events = Vec::new();
@@ -1977,7 +2944,7 @@ pub mod monoio_transport {
                 events.push(ev);
             }
 
-            TickResult { sent, events }
+            Ok(TickResult { sent, events })
         }
     }
 
@@ -1989,7 +2956,12 @@ pub mod monoio_transport {
 
 #[cfg(feature = "glommio")]
 pub mod glommio_transport {
+    use crate::{
+        OutputDrainBudget, OutputDrainReport, OutputDrainStatus, collect_output_work,
+        prepend_outputs,
+    };
     use shiguredo_srt::{ConnectionEvent, ConnectionOutput, SrtConnection, Timestamp};
+    use std::collections::VecDeque;
     use std::io;
     use std::time::Duration;
 
@@ -2017,6 +2989,7 @@ pub mod glommio_transport {
         pub conn: SrtConnection,
         pub sock: glommio::net::UdpSocket,
         timers: crate::ManualTimerStore,
+        pending_outputs: VecDeque<ConnectionOutput>,
     }
 
     impl Conn {
@@ -2025,6 +2998,7 @@ pub mod glommio_transport {
                 conn,
                 sock,
                 timers: crate::ManualTimerStore::new(),
+                pending_outputs: VecDeque::new(),
             }
         }
 
@@ -2036,15 +3010,62 @@ pub mod glommio_transport {
             self.timers.fire_expired(now, &mut self.conn);
         }
 
-        pub async fn drain_outputs(&mut self, now: Timestamp) {
-            while let Some(out) = self.conn.poll_output() {
+        pub async fn drain_outputs(&mut self, now: Timestamp) -> io::Result<OutputDrainReport> {
+            self.drain_outputs_bounded(now, OutputDrainBudget::default())
+                .await
+        }
+
+        pub async fn drain_outputs_bounded(
+            &mut self,
+            now: Timestamp,
+            budget: OutputDrainBudget,
+        ) -> io::Result<OutputDrainReport> {
+            let (mut work, exhausted) =
+                collect_output_work(&mut self.conn, &mut self.pending_outputs, budget);
+            let mut report = OutputDrainReport {
+                status: if exhausted {
+                    OutputDrainStatus::BudgetExhausted
+                } else {
+                    OutputDrainStatus::Drained
+                },
+                ..Default::default()
+            };
+            while let Some(out) = work.pop_front() {
                 match out {
-                    ConnectionOutput::SendPacket(bytes) => {
-                        let _ = self.sock.send(&bytes).await;
+                    ConnectionOutput::SendPacket(bytes) => match self.sock.send(&bytes).await {
+                        Ok(sent) if sent == bytes.len() => {
+                            report.actions += 1;
+                            report.packets += 1;
+                            report.bytes += sent;
+                        }
+                        Ok(_) => {
+                            prepend_outputs(&mut self.pending_outputs, work.into_iter());
+                            self.pending_outputs
+                                .push_front(ConnectionOutput::SendPacket(bytes));
+                            return Err(io::Error::new(
+                                io::ErrorKind::WriteZero,
+                                "UDP send completed with a partial datagram",
+                            ));
+                        }
+                        Err(error) => {
+                            prepend_outputs(&mut self.pending_outputs, work.into_iter());
+                            self.pending_outputs
+                                .push_front(ConnectionOutput::SendPacket(bytes));
+                            return Err(io::Error::other(error.to_string()));
+                        }
+                    },
+                    other => {
+                        self.timers.apply_output(&other, now);
+                        report.actions += 1;
                     }
-                    other => self.timers.apply_output(&other, now),
                 }
             }
+            Ok(report)
+        }
+
+        #[must_use]
+        pub fn has_pending_outputs(&self) -> bool {
+            !self.pending_outputs.is_empty()
         }
 
         pub async fn recv_with_timeout(
@@ -2077,23 +3098,32 @@ pub mod glommio_transport {
         }
 
         pub async fn send_paced(&mut self, payload: &[u8], now: Timestamp) -> Result<(), ()> {
-            if !self.conn.can_send_with_pacing(now) {
+            if self.has_pending_outputs() || !self.conn.can_send_with_pacing(now) {
                 return Err(());
             }
             self.conn.send(payload, now).map_err(|_| ())?;
-            self.drain_outputs(now).await;
-            Ok(())
+            let report = self.drain_outputs(now).await.map_err(|_| ())?;
+            (report.status == OutputDrainStatus::Drained)
+                .then_some(())
+                .ok_or(())
         }
 
-        pub async fn tick(&mut self, buf: &mut [u8], payload: &[u8], now: Timestamp) -> TickResult {
+        pub async fn tick(
+            &mut self,
+            buf: &mut [u8],
+            payload: &[u8],
+            now: Timestamp,
+        ) -> io::Result<TickResult> {
             self.fire_expired(now);
             self.recv_with_timeout(buf, Duration::from_micros(100), now)
                 .await;
-            self.drain_outputs(now).await;
+            let drained = self.drain_outputs(now).await?;
 
             let mut sent = 0u64;
-            while self.send_paced(payload, now).await.is_ok() {
-                sent += 1;
+            if drained.status == OutputDrainStatus::Drained {
+                while self.send_paced(payload, now).await.is_ok() {
+                    sent += 1;
+                }
             }
 
             let mut events = Vec::new();
@@ -2101,7 +3131,7 @@ pub mod glommio_transport {
                 events.push(ev);
             }
 
-            TickResult { sent, events }
+            Ok(TickResult { sent, events })
         }
     }
 
@@ -2113,13 +3143,21 @@ pub mod glommio_transport {
 
 #[cfg(feature = "compio")]
 pub mod compio_transport {
+    use crate::{
+        OutputDrainBudget, OutputDrainReport, OutputDrainStatus, collect_output_work,
+        prepend_outputs,
+    };
+    use compio::buf::BufResult;
     use shiguredo_srt::{ConnectionEvent, ConnectionOutput, SrtConnection, Timestamp};
+    use std::collections::VecDeque;
+    use std::io;
 
     /// Per-connection state for compio: protocol + owned-buffer socket + timer deadlines.
     pub struct Conn {
         pub conn: SrtConnection,
         pub sock: compio::net::UdpSocket,
         timers: crate::ManualTimerStore,
+        pending_outputs: VecDeque<ConnectionOutput>,
     }
 
     impl Conn {
@@ -2128,6 +3166,7 @@ pub mod compio_transport {
                 conn,
                 sock,
                 timers: crate::ManualTimerStore::new(),
+                pending_outputs: VecDeque::new(),
             }
         }
 
@@ -2139,33 +3178,88 @@ pub mod compio_transport {
             self.timers.fire_expired(now, &mut self.conn);
         }
 
-        pub async fn drain_outputs(&mut self, now: Timestamp) {
-            while let Some(out) = self.conn.poll_output() {
+        pub async fn drain_outputs(&mut self, now: Timestamp) -> io::Result<OutputDrainReport> {
+            self.drain_outputs_bounded(now, OutputDrainBudget::default())
+                .await
+        }
+
+        pub async fn drain_outputs_bounded(
+            &mut self,
+            now: Timestamp,
+            budget: OutputDrainBudget,
+        ) -> io::Result<OutputDrainReport> {
+            let (mut work, exhausted) =
+                collect_output_work(&mut self.conn, &mut self.pending_outputs, budget);
+            let mut report = OutputDrainReport {
+                status: if exhausted {
+                    OutputDrainStatus::BudgetExhausted
+                } else {
+                    OutputDrainStatus::Drained
+                },
+                ..Default::default()
+            };
+            while let Some(out) = work.pop_front() {
                 match out {
                     ConnectionOutput::SendPacket(bytes) => {
-                        let _ = self.sock.send(bytes).await;
+                        let expected = bytes.len();
+                        let BufResult(result, bytes) = self.sock.send(bytes).await;
+                        match result {
+                            Ok(sent) if sent == expected => {
+                                report.actions += 1;
+                                report.packets += 1;
+                                report.bytes += sent;
+                            }
+                            Ok(_) => {
+                                prepend_outputs(&mut self.pending_outputs, work.into_iter());
+                                self.pending_outputs
+                                    .push_front(ConnectionOutput::SendPacket(bytes));
+                                return Err(io::Error::new(
+                                    io::ErrorKind::WriteZero,
+                                    "UDP send completed with a partial datagram",
+                                ));
+                            }
+                            Err(error) => {
+                                prepend_outputs(&mut self.pending_outputs, work.into_iter());
+                                self.pending_outputs
+                                    .push_front(ConnectionOutput::SendPacket(bytes));
+                                return Err(error);
+                            }
+                        }
                     }
-                    other => self.timers.apply_output(&other, now),
+                    other => {
+                        self.timers.apply_output(&other, now);
+                        report.actions += 1;
+                    }
                 }
             }
+            Ok(report)
+        }
+
+        #[must_use]
+        pub fn has_pending_outputs(&self) -> bool {
+            !self.pending_outputs.is_empty()
         }
 
         pub async fn send_paced(&mut self, payload: &[u8], now: Timestamp) -> Result<(), ()> {
-            if !self.conn.can_send_with_pacing(now) {
+            if self.has_pending_outputs() || !self.conn.can_send_with_pacing(now) {
                 return Err(());
             }
             self.conn.send(payload, now).map_err(|_| ())?;
-            self.drain_outputs(now).await;
-            Ok(())
+            let report = self.drain_outputs(now).await.map_err(|_| ())?;
+            (report.status == OutputDrainStatus::Drained)
+                .then_some(())
+                .ok_or(())
         }
 
-        pub async fn tick(&mut self, payload: &[u8], now: Timestamp) -> TickResult {
+        pub async fn tick(&mut self, payload: &[u8], now: Timestamp) -> io::Result<TickResult> {
             self.fire_expired(now);
-            self.drain_outputs(now).await;
+            let drained = self.drain_outputs(now).await?;
 
             let mut sent = 0u64;
-            while self.send_paced(payload, now).await.is_ok() {
-                sent += 1;
+            if drained.status == OutputDrainStatus::Drained {
+                while self.send_paced(payload, now).await.is_ok() {
+                    sent += 1;
+                }
             }
 
             let mut events = Vec::new();
@@ -2173,7 +3267,7 @@ pub mod compio_transport {
                 events.push(ev);
             }
 
-            TickResult { sent, events }
+            Ok(TickResult { sent, events })
         }
     }
 

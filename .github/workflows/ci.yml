@@ -1,0 +1,126 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  quality:
+    name: Test, lint, docs, package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - run: rustup component add rustfmt clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace --all-features
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
+      - run: cargo package -p shiguredo_srt --locked
+
+  msrv:
+    name: Protocol MSRV 1.93
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - run: rustup toolchain install 1.93.0 --profile minimal
+      - run: cargo +1.93.0 check -p shiguredo_srt --all-targets --locked
+
+  dependency-policy:
+    name: Dependencies and licenses
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - run: cargo install cargo-deny --version 0.20.2 --locked
+      - name: Published crate (no exceptions)
+        run: cargo deny --manifest-path crates/srt-protocol/Cargo.toml --exclude-dev --config deny-published.toml check advisories bans licenses sources
+      - name: Complete workspace (review-dated runtime exceptions)
+        run: cargo deny check advisories bans licenses sources
+
+  secrets:
+    name: Secret history scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version: stable
+      - run: go run github.com/zricethezav/gitleaks/v8@v8.30.1 git --no-banner --redact .
+
+  miri:
+    name: Miri ownership smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - run: rustup toolchain install nightly --profile minimal --component miri,rust-src
+      - run: cargo +nightly miri setup
+      - run: cargo +nightly miri test -p shiguredo_srt srt_connection::tests
+        env:
+          MIRIFLAGS: -Zmiri-tree-borrows
+
+  fuzz-smoke:
+    name: Fuzz build and smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - run: rustup toolchain install nightly --profile minimal
+      - run: cargo install cargo-fuzz --locked
+      - working-directory: crates/srt-protocol/fuzz
+        run: cargo +nightly fuzz build
+      - working-directory: crates/srt-protocol/fuzz
+        run: cargo +nightly fuzz run fuzz_packet_decode -- -max_total_time=20 -timeout=5 -dict=fuzz.dict
+      - working-directory: crates/srt-protocol/fuzz
+        run: cargo +nightly fuzz run fuzz_handshake_decode -- -max_total_time=20 -timeout=5 -dict=fuzz.dict
+      - working-directory: crates/srt-protocol/fuzz
+        run: cargo +nightly fuzz run fuzz_connection_feed -- -max_total_time=20 -timeout=5 -dict=fuzz.dict
+
+  sanitizer:
+    name: Address sanitizer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - run: rustup toolchain install nightly --profile minimal --component rust-src
+      - run: cargo +nightly test -p shiguredo_srt --all-targets --target x86_64-unknown-linux-gnu
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+          RUSTDOCFLAGS: -Zsanitizer=address
+
+  coverage:
+    name: Coverage floors
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - run: rustup component add llvm-tools-preview
+      - run: cargo install cargo-llvm-cov --locked
+      - name: Protocol and lifecycle (80% lines)
+        run: cargo llvm-cov -p shiguredo_srt -p pbt -p srt-lifecycle --all-features --fail-under-lines 80 --lcov --output-path protocol-lifecycle.lcov
+      - run: cargo llvm-cov clean --workspace
+      - name: All-feature runtime adapters (50% lines)
+        run: cargo llvm-cov -p srt-transport --all-features --ignore-filename-regex 'srt-protocol|srt-lifecycle' --fail-under-lines 50 --lcov --output-path transport.lcov
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: lcov
+          path: |
+            protocol-lifecycle.lcov
+            transport.lcov
+          if-no-files-found: error
+          retention-days: 14

@@ -386,6 +386,13 @@ impl SenderBuffer {
         dest_socket_id: u32,
         now: Timestamp,
     ) -> Vec<DataPacket> {
+        // `slice::chunks(0)` panics. This is a public, application-supplied
+        // sizing knob, so an invalid value must fail closed rather than take
+        // down the process. Returning no packets matches the existing
+        // backpressure behaviour of this convenience API.
+        if max_payload_size == 0 {
+            return Vec::new();
+        }
         let mut packets = Vec::new();
         let chunks: Vec<&[u8]> = payload.chunks(max_payload_size).collect();
         let total_chunks = chunks.len();
@@ -1101,6 +1108,14 @@ mod tests {
         assert_eq!(stats.total_dropped, 1);
         assert_eq!(stats.total_bytes_dropped, 4);
         assert_eq!(stats.payload_bytes_in_buffer, 0);
+    }
+
+    #[test]
+    fn push_message_with_zero_payload_limit_fails_closed() {
+        let mut buf = SenderBuffer::new(0, 32, 10);
+        let packets = buf.push_message(b"application supplied data", 0, 0, 1, Timestamp::default());
+        assert!(packets.is_empty());
+        assert!(buf.is_empty());
     }
 
     #[test]

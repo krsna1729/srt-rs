@@ -33,7 +33,7 @@ impl Timestamp {
 
     /// タイムスタンプにミリ秒を加算する
     pub fn add_millis(&self, millis: u64) -> Self {
-        self.add_micros(millis * 1000)
+        self.add_micros(millis.saturating_mul(1000))
     }
 }
 
@@ -50,5 +50,22 @@ impl std::ops::Sub for Timestamp {
 
     fn sub(self, rhs: Self) -> Self::Output {
         self.0.saturating_sub(rhs.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Timestamp;
+
+    #[test]
+    fn add_millis_saturates_without_intermediate_overflow() {
+        assert_eq!(
+            Timestamp::default().add_millis(u64::MAX),
+            Timestamp(u64::MAX)
+        );
+        assert_eq!(
+            Timestamp::from_micros(u64::MAX - 500).add_millis(1),
+            Timestamp(u64::MAX)
+        );
     }
 }

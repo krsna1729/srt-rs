@@ -67,6 +67,12 @@ The protocol core performs **zero I/O**: callers feed datagrams in
 This makes the core testable without sockets and lets every runtime drive
 it with its own native primitives — see `crates/srt-transport/README.md`
 for why there is deliberately no lowest-common-denominator abstraction.
+Consuming applications can start from `srt_transport::SrtStackConfig`, which
+validates and groups the reusable connection, admission, half-open, cookie
+routing, socket-buffer, and output-drain knobs discovered by the benchmark.
+Executor/runtime, ingress topology, worker/pinning, promotion, connection-storm,
+bonding-workload, and link-emulation knobs remain deployment choices rather
+than being baked into the protocol library.
 
 ### Listener ingress strategies
 
@@ -177,7 +183,13 @@ caught one real overflow, see `crates/srt-protocol/VENDOR.md`):
 cd crates/srt-protocol/fuzz
 cargo +nightly fuzz run fuzz_packet_decode    -- -max_total_time=60
 cargo +nightly fuzz run fuzz_handshake_decode -- -max_total_time=60
+cargo +nightly fuzz run fuzz_connection_feed  -- -max_total_time=60
 ```
+
+The third target first establishes a valid caller/listener pair and then drives
+structured packet, timer, send, and drain action sequences. `fuzz.dict` seeds
+SRT control/handshake fields; minimized corpora are retained under each target's
+`fuzz/corpus/` directory for release runs.
 
 
 ## Licensing
