@@ -1,17 +1,22 @@
 [package]
 name = "srt-transport"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
+rust-version = "1.96"
 publish = false
 license = "Apache-2.0"
-description = "Shared adapter plumbing between srt-protocol (sans-I/O) and runtime-specific I/O. Per-runtime Conn structs behind feature flags."
+description = "Layered SRT session, admission, and runtime-specific UDP transport adapters"
+readme = "README.md"
+homepage = "https://github.com/shiguredo/srt-rs"
+repository = "https://github.com/shiguredo/srt-rs"
+include = ["/src/**", "/tests/**", "/benches/**", "LICENSE", "README.md"]
 
 [dependencies]
-shiguredo_srt = { path = "../srt-protocol" }
+shiguredo_srt = { version = "=2026.1.0-canary.1", path = "../srt-protocol" }
 # The admission table applies admission policy (cookie routing, terminal
 # checks), so mechanism depends on policy. Acyclic: lifecycle depends only
 # on the protocol crate and never on this one.
-srt-lifecycle = { path = "../srt-lifecycle" }
+srt-lifecycle = { version = "=0.1.0", path = "../srt-lifecycle" }
 # Unconditional: `bind_reuseport`/`set_sock_bufs`/`recvmsg_batch` in the
 # shared-utilities section are raw fd/libc mechanics with no runtime
 # dependency, usable by any adapter's ingress strategy (batched admission,
@@ -21,6 +26,8 @@ libc = "0.2"
 # transitive feature unification from a runtime dependency that happens
 # to also pull in socket2/all (e.g. mio).
 socket2 = { version = "0.6", features = ["all"] }
+getrandom = "0.3"
+zeroize = "1.8"
 
 # Runtime-specific dependencies (optional, feature-gated)
 mio = { version = "1", features = ["net"], optional = true }

@@ -20,10 +20,11 @@ after a fix is available.
 `shiguredo_srt` parses attacker-controlled UDP datagrams. Applications must
 assume that source addresses can be spoofed and that packets may be duplicated,
 reordered, truncated, replayed, or intentionally malformed. The transport
-admission layer bounds half-open state and rejects malformed traffic before
-allocating a peer; consumers should retain those defaults, apply per-source
-network rate limits, and authorize the authenticated StreamID before accepting
-a connection.
+admission layer rejects malformed traffic before allocating a peer and
+independently bounds total, half-open, established, and per-source-IP state.
+Consumers should retain or tighten those defaults, add network-level packet-
+rate limits for volumetric attacks, and authorize the StreamID/group identity
+before accepting a connection.
 
 SRT's standard passphrase mode provides confidentiality using AES-CTR and key
 exchange compatibility with libsrt. It does **not** provide cryptographic
@@ -33,16 +34,22 @@ the surrounding network where integrity matters, and put an authenticated
 protocol inside the SRT payload when tamper detection or endpoint identity is
 required. Never reuse an explicitly supplied salt/SEK pair across sessions.
 Callers that omit them use fresh operating-system randomness.
+The layered transport facade likewise generates nonzero socket IDs and initial
+sequence numbers unless raw `ConnectionOptions` explicitly override them.
 
-Secrets are redacted from `ConnectionOptions` debug output and connection-owned
-passphrase/SEK buffers are zeroized after handshake use and on drop. Rust and
-the allocator can still copy application-owned strings before transfer; avoid
-logging, cloning, swapping, or crash-dumping secret-bearing process memory.
+Secrets are redacted from configuration debug output. Connection-owned
+passphrase/SEK buffers are zeroized after handshake use and on drop; layered
+`SessionConfig` and shared-listener admission templates also zeroize their
+owned passphrase/salt/SEK storage on replacement or drop. Rust and the allocator
+can still copy application-owned strings before transfer; avoid logging,
+cloning, swapping, or crash-dumping secret-bearing process memory.
 
 The sans-I/O core is single-owner: mutating operations require `&mut self`.
 Runtime adapters may move a connection between workers, but must not drive one
 connection concurrently from multiple tasks. Treat all configured resource
-limits as security controls, not throughput hints.
+limits and the aggregate listener socket-memory budget as security controls,
+not throughput hints. An explicit unsupported transport mechanism fails
+validation rather than silently weakening the requested policy.
 
 ## Security checks
 

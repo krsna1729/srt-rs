@@ -67,12 +67,13 @@ The protocol core performs **zero I/O**: callers feed datagrams in
 This makes the core testable without sockets and lets every runtime drive
 it with its own native primitives — see `crates/srt-transport/README.md`
 for why there is deliberately no lowest-common-denominator abstraction.
-Consuming applications can start from `srt_transport::SrtStackConfig`, which
-validates and groups the reusable connection, admission, half-open, cookie
-routing, socket-buffer, and output-drain knobs discovered by the benchmark.
-Executor/runtime, ingress topology, worker/pinning, promotion, connection-storm,
-bonding-workload, and link-emulation knobs remain deployment choices rather
-than being baked into the protocol library.
+Consuming applications start from the layered `SessionConfig`,
+`TransportConfig`, `AdmissionConfig`, `ListenerConfig`, and `CallerConfig`
+surfaces. They include capability-resolved topology, batching, worker,
+promotion, caller-pool, socket-budget, and cookie-routing policy alongside the
+protocol settings. Presets remain freely overrideable, and raw
+`ConnectionOptions`, prepared standard sockets, `PeerTable`, lifecycle policy,
+and each runtime-native `Conn` stay public as supported escape hatches.
 
 ### Listener ingress strategies
 
@@ -113,7 +114,35 @@ SO_REUSEPORT group perturbation. Which way that trades is
 **runtime-dependent** — measured, not assumed — which is the entire
 reason `srt-bench` exists.
 
-## Quick start
+## Library quick start
+
+Pin an audited repository revision and enable only the runtime used by the
+application:
+
+```toml
+[dependencies]
+srt-transport = { git = "https://github.com/shiguredo/srt-rs", rev = "<commit>", features = ["tokio"] }
+```
+
+```rust
+use std::time::Duration;
+use srt_transport::{ListenerConfig, TransportProfile};
+
+let listener = ListenerConfig::builder("0.0.0.0:9000".parse()?)
+    .latency(Duration::from_millis(120))?
+    .profile(TransportProfile::HighDensity)
+    .build()?;
+
+// Call inside the selected runtime. The prepared policy, sockets, PeerTable,
+// raw ConnectionOptions, and Conn constructors remain available for custom
+// event loops or ownership models.
+let listener = srt_transport::tokio_transport::bind_listener(&listener)?;
+```
+
+See [`crates/srt-transport/README.md`](crates/srt-transport/README.md) for
+layering, profiles, capability resolution, admission limits, and escape hatches.
+
+## Benchmark quick start
 
 `srt-bench` is one binary: it runs a role, orchestrates a sweep of them,
 and reports on the results. There is no shell harness to keep in sync.
@@ -173,7 +202,9 @@ measurement window on a shared-tenant box.
 cargo test -p shiguredo_srt      # unit + integration + doctests
 cargo test -p pbt                # property-based tests (proptest)
 cargo test -p srt-lifecycle
+cargo test -p srt-transport --all-features
 cargo bench -p shiguredo_srt     # criterion: core packet loop, loss/tsbpd scans
+cargo bench -p srt-transport     # admission limits and deadline/index tradeoffs
 ```
 
 Fuzzing (decode paths must never panic on attacker input — they already
@@ -184,12 +215,15 @@ cd crates/srt-protocol/fuzz
 cargo +nightly fuzz run fuzz_packet_decode    -- -max_total_time=60
 cargo +nightly fuzz run fuzz_handshake_decode -- -max_total_time=60
 cargo +nightly fuzz run fuzz_connection_feed  -- -max_total_time=60
+cargo +nightly fuzz run fuzz_admission         -- -max_total_time=60
 ```
 
-The third target first establishes a valid caller/listener pair and then drives
+The stateful targets first establish a valid caller/listener pair and then drive
 structured packet, timer, send, and drain action sequences. `fuzz.dict` seeds
-SRT control/handshake fields; minimized corpora are retained under each target's
-`fuzz/corpus/` directory for release runs.
+SRT control/handshake fields; `fuzz_admission` additionally varies source
+populations, capacity, routing, authorization, expiry, and malformed traffic.
+Minimized corpora are retained under each target's `fuzz/corpus/` directory for
+release runs.
 
 
 ## Licensing

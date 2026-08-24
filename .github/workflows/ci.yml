@@ -90,6 +90,8 @@ jobs:
         run: cargo +nightly fuzz run fuzz_handshake_decode -- -max_total_time=20 -timeout=5 -dict=fuzz.dict
       - working-directory: crates/srt-protocol/fuzz
         run: cargo +nightly fuzz run fuzz_connection_feed -- -max_total_time=20 -timeout=5 -dict=fuzz.dict
+      - working-directory: crates/srt-protocol/fuzz
+        run: cargo +nightly fuzz run fuzz_admission -- -max_total_time=20 -timeout=5 -dict=fuzz.dict
 
   sanitizer:
     name: Address sanitizer
@@ -99,6 +101,10 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - run: rustup toolchain install nightly --profile minimal --component rust-src
       - run: cargo +nightly test -p shiguredo_srt --all-targets --target x86_64-unknown-linux-gnu
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+          RUSTDOCFLAGS: -Zsanitizer=address
+      - run: cargo +nightly test -p srt-transport --all-features --target x86_64-unknown-linux-gnu
         env:
           RUSTFLAGS: -Zsanitizer=address
           RUSTDOCFLAGS: -Zsanitizer=address

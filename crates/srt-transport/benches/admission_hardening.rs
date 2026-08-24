@@ -14,11 +14,7 @@ fn induction(socket_id: u32) -> Vec<u8> {
 }
 
 fn bench_invalid_admission(c: &mut Criterion) {
-    let options = AdmissionOptions {
-        socket_id: 7,
-        tsbpd_delay: 120,
-        cookie_routing: true,
-    };
+    let options = AdmissionOptions::basic(7, 120, true);
     let telemetry = IngressTelemetry::new();
     let peer = SocketAddr::from(([127, 0, 0, 1], 10_000));
     let mut group = c.benchmark_group("admission_hardening");
@@ -45,11 +41,7 @@ fn bench_invalid_admission(c: &mut Criterion) {
 }
 
 fn bench_bounded_capacity(c: &mut Criterion) {
-    let options = AdmissionOptions {
-        socket_id: 7,
-        tsbpd_delay: 120,
-        cookie_routing: true,
-    };
+    let options = AdmissionOptions::basic(7, 120, true);
     let telemetry = IngressTelemetry::new();
     let packet = induction(1);
     c.bench_function("admission_capacity_rejection", |b| {
@@ -58,6 +50,7 @@ fn bench_bounded_capacity(c: &mut Criterion) {
                 let mut table = PeerTable::with_config(PeerTableConfig {
                     max_peers: 1,
                     half_open_timeout: Duration::from_secs(10),
+                    ..PeerTableConfig::default()
                 });
                 let _ = table.admit(
                     SocketAddr::from(([127, 0, 0, 1], 10_000)),
@@ -102,10 +95,51 @@ fn bench_due_index_churn(c: &mut Criterion) {
     });
 }
 
+fn bench_per_source_capacity(c: &mut Criterion) {
+    let options = AdmissionOptions::basic(7, 120, true);
+    let telemetry = IngressTelemetry::new();
+    let packet = induction(1);
+    let mut table = PeerTable::with_config(PeerTableConfig {
+        max_peers: 4_097,
+        max_half_open_peers: 4_097,
+        max_established_peers: 4_097,
+        max_peers_per_ip: 1,
+        half_open_timeout: Duration::from_secs(10),
+    });
+    for index in 0..4_096_u16 {
+        let third = (index / 250) as u8;
+        let fourth = (index % 250 + 1) as u8;
+        let _ = table.admit(
+            SocketAddr::from(([10, 0, third, fourth], 10_000)),
+            &packet,
+            Timestamp::default(),
+            &options,
+            0,
+            1,
+            &telemetry,
+        );
+    }
+    c.bench_function("admission_per_source_rejection_4096_peers", |b| {
+        b.iter(|| {
+            black_box(table.admit(
+                SocketAddr::from(([10, 0, 0, 1], 10_001)),
+                &packet,
+                Timestamp::from_micros(1),
+                &options,
+                0,
+                1,
+                &telemetry,
+            ));
+            assert_eq!(table.len(), 4_096);
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_invalid_admission,
     bench_bounded_capacity,
-    bench_due_index_churn
+    bench_due_index_churn,
+    bench_per_source_capacity
 );
 criterion_main!(benches);

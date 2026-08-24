@@ -187,6 +187,17 @@ impl SenderBuffer {
         in_flight < self.flow_window && in_flight < self.congestion_window
     }
 
+    /// Whether an entire multi-packet message fits in the current windows.
+    /// Partial messages are never admitted because their missing `Last`
+    /// packet cannot be repaired by a later API call.
+    pub fn can_send_message(&self, packet_count: usize) -> bool {
+        let available = self
+            .flow_window
+            .min(self.congestion_window)
+            .saturating_sub(self.packets_in_flight());
+        u32::try_from(packet_count).is_ok_and(|count| count <= available)
+    }
+
     /// 送信可能かどうか (パケットペーシングを含む)
     pub fn can_send_with_pacing(&self, now: Timestamp) -> bool {
         if !self.can_send() {
@@ -393,15 +404,14 @@ impl SenderBuffer {
         if max_payload_size == 0 {
             return Vec::new();
         }
-        let mut packets = Vec::new();
         let chunks: Vec<&[u8]> = payload.chunks(max_payload_size).collect();
         let total_chunks = chunks.len();
+        if !self.can_send_message(total_chunks) {
+            return Vec::new();
+        }
+        let mut packets = Vec::with_capacity(total_chunks);
 
         for (i, chunk) in chunks.into_iter().enumerate() {
-            if !self.can_send() {
-                break;
-            }
-
             let position = match (i, total_chunks) {
                 (0, 1) => PacketPosition::Single,
                 (0, _) => PacketPosition::First,
@@ -774,6 +784,20 @@ mod tests {
         assert_eq!(pkt.sequence_number, 1000);
         assert_eq!(buf.next_sequence_number(), 1001);
         assert_eq!(buf.packets_in_flight(), 1);
+    }
+
+    #[test]
+    fn fragmented_message_is_all_or_nothing_at_window_boundary() {
+        let mut buf = SenderBuffer::new(1000, 2, 120);
+        buf.set_congestion_window(2);
+        let now = Timestamp::default();
+        let before_sequence = buf.next_sequence_number();
+        let before_message = buf.next_message_number();
+        let packets = buf.push_message(&[7; 9], 4, 100, 1, now);
+        assert!(packets.is_empty());
+        assert_eq!(buf.packets_in_flight(), 0);
+        assert_eq!(buf.next_sequence_number(), before_sequence);
+        assert_eq!(buf.next_message_number(), before_message);
     }
 
     #[test]

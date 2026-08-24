@@ -497,11 +497,11 @@ async fn run_acceptor(
 
     let promotion = cfg.promotion;
     let mut peers = srt_transport::PeerTable::new();
-    let admission = srt_transport::AdmissionOptions {
-        socket_id: std::process::id(),
-        tsbpd_delay: cfg.latency_ms,
-        cookie_routing: cfg.cookie_routing,
-    };
+    let admission = srt_transport::AdmissionOptions::basic(
+        std::process::id(),
+        cfg.latency_ms,
+        cfg.cookie_routing,
+    );
     let mut tasks: Vec<tokio::task::JoinHandle<ConnStats>> = Vec::new();
     let connect_deadline = Instant::now() + crate::INTEROP_CONNECT_TIMEOUT;
     let stream_len = Duration::from_secs_f64(cfg.duration_secs);
@@ -916,11 +916,8 @@ async fn serve_pool_socket(cfg: BenchConfig, index: usize, start: Instant) -> Ve
     let mut peers = srt_transport::PeerTable::new();
     // No SO_REUSEPORT group here, so nothing can rehash and there is
     // nowhere to forward to: one worker, cookie routing inert.
-    let admission = srt_transport::AdmissionOptions {
-        socket_id: std::process::id(),
-        tsbpd_delay: cfg.latency_ms,
-        cookie_routing: false,
-    };
+    let admission =
+        srt_transport::AdmissionOptions::basic(std::process::id(), cfg.latency_ms, false);
     let connect_deadline = Instant::now() + crate::INTEROP_CONNECT_TIMEOUT;
     let stream_len = Duration::from_secs_f64(cfg.duration_secs);
     let run_deadline = Instant::now() + stream_len + IDLE_GRACE + Duration::from_secs(30);
@@ -1096,11 +1093,8 @@ async fn run_single_acceptor(
     let mut peers = srt_transport::PeerTable::new();
     // One acceptor means one owner for every handshake, so there is
     // nobody a stray CONCLUSION could need forwarding to.
-    let admission = srt_transport::AdmissionOptions {
-        socket_id: std::process::id(),
-        tsbpd_delay: cfg.latency_ms,
-        cookie_routing: false,
-    };
+    let admission =
+        srt_transport::AdmissionOptions::basic(std::process::id(), cfg.latency_ms, false);
     let telemetry = srt_transport::IngressTelemetry::new();
     let connect_deadline = Instant::now() + crate::INTEROP_CONNECT_TIMEOUT;
     let stream_len = Duration::from_secs_f64(cfg.duration_secs);

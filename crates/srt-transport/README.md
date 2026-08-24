@@ -1,9 +1,9 @@
 # srt-transport
 
-Shared adapter plumbing between [`srt-protocol`](../srt-protocol)
-(sans-I/O) and runtime-specific I/O. Per-runtime `Conn` structs behind
-feature flags; `publish = false` — workspace-internal glue, not a
-standalone product.
+Application-facing configuration and adapter plumbing between
+[`srt-protocol`](../srt-protocol) (sans-I/O) and runtime-specific I/O.
+Per-runtime `Conn` structs are feature-gated; the configuration, admission,
+socket preparation, and lifecycle surfaces are runtime-neutral.
 
 ## Charter: this crate owns *things*
 
@@ -43,8 +43,11 @@ Three layers:
    - `OutputDrainBudget` / `OutputDrainReport` — explicit per-tick action,
      packet, and byte limits shared by all six output pumps. Send failures
      are returned and unsent datagrams remain queued in protocol order.
-   - `SrtStackConfig` — validated protocol, admission, output-drain, cookie
-     routing, and socket-buffer defaults for consuming applications.
+   - `SessionConfig`, `TransportConfig`, `AdmissionConfig`, `CallerConfig`,
+     and `ListenerConfig` — layered application configuration with capability-
+     checked `Auto` policies, profiles, typed units, and raw escape hatches.
+   - `SrtStackConfig` — retained low-level compatibility surface for existing
+     consumers; new applications should use the layered types above.
 
 2. **Admission machinery** (always compiled, runtime-neutral, does no I/O
    of its own — the caller performs every send)
@@ -67,7 +70,9 @@ Three layers:
      could occupy.
    - `IngressTelemetry` — promotion/routing plus invalid-input, cookie,
      capacity, authorization, and half-open-expiry counters, defined once
-     so two backends' output means the same thing.
+     so two backends' output means the same thing. `snapshot()` returns a
+     plain exporter-friendly `IngressTelemetrySnapshot`; `report()` is only
+     the human-readable view.
 
 3. **Per-runtime `Conn`** (feature-gated): wraps an `SrtConnection`
    + that runtime's UDP socket + its native timer. Each exposes the same
@@ -89,8 +94,11 @@ Features are additive: enable exactly the ones your binary links.
 
 ```toml
 [dependencies]
-srt-transport = { path = "crates/srt-transport", features = ["tokio"] }
+srt-transport = { git = "https://github.com/shiguredo/srt-rs", rev = "<audited-commit>", features = ["tokio"] }
 ```
+
+Use a pinned revision until the runtime crates pass the separate crates.io
+publication gate. Path dependencies are equivalent for workspace consumers.
 
 ## Design: deliberately no lowest-common-denominator trait
 
@@ -124,31 +132,60 @@ paced packets → return `io::Result<TickResult>`. Every adapter also exposes
 ## Application configuration
 
 ```rust
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::time::Duration;
-use srt_transport::{OutputDrainBudget, SrtStackConfig};
+use srt_transport::{
+    Bandwidth, BatchingPolicy, EncryptionConfig, ListenerConfig,
+    PromotionPolicy, SessionConfig, TransportProfile,
+};
 
-let mut stack = SrtStackConfig::default();
-stack.connection.socket_id = 0x1000_0001;
-stack.connection.tsbpd_delay = 200;
-stack.connection.max_bandwidth_bytes_per_sec = Some(25_000_000);
-stack.connection.flow_window_packets = 16_384;
-stack.connection.receive_buffer_packets = 16_384;
-stack.admission.max_peers = 8_192;
-stack.admission.half_open_timeout = Duration::from_secs(5);
-stack.output_drain = OutputDrainBudget::new(128, 64, 512 * 1024);
+let mut session = SessionConfig::default();
+session.set_latency(Duration::from_millis(120))?;
+session.set_bandwidth(Bandwidth::BitsPerSecond(
+    NonZeroU64::new(100_000_000).unwrap(),
+));
+session.set_encryption(Some(EncryptionConfig::new("production secret")));
+session.set_stream_id(Some("publish/live".to_owned()));
 
-stack.validate()?;
-let caller = stack.caller()?;
-let peers = stack.peer_table()?;
-let admission = stack.admission_options();
-let socket = stack.bind_reuseport(9000)?;
-# Ok::<(), std::io::Error>(())
+let listener = ListenerConfig::builder("0.0.0.0:9000".parse()?)
+    .session(session)
+    .profile(TransportProfile::HighDensity)
+    .configure_transport(|transport| {
+        // Presets are ordinary configs: override any decision.
+        transport.promotion = PromotionPolicy::Bonded;
+        transport.batching = BatchingPolicy::MaxDatagrams(
+            NonZeroUsize::new(32).unwrap(),
+        );
+    })
+    .configure_admission(|admission| {
+        admission.limits.max_peers = 8_192;
+        admission.limits.max_half_open_peers = 1_024;
+        admission.limits.max_peers_per_ip = 256;
+    })
+    .build()?;
+
+// Inside a Tokio runtime. The returned prepared policy owns no event loop:
+// use the supplied sockets/PeerTable directly or compose your own workers.
+let runtime_listener = srt_transport::tokio_transport::bind_listener(&listener)?;
+let peers = runtime_listener.prepared.peer_table();
+let admission = runtime_listener.prepared.admission_options();
 ```
 
-The benchmark's runtime, ingress topology, worker count, CPU pinning,
-promotion mode, connect concurrency, bonding workload, and network impairment
-knobs are intentionally excluded: those choose deployment architecture or
-generate a workload; they are not properties of an SRT connection stack.
+The ten reusable benchmark controls are represented: latency, bandwidth,
+group/bond metadata, promotion, cookie routing, socket buffers, ingress
+topology, receive batching, workers, and caller-pool concurrency. The 15-second
+attempt deadline and bounded output drain are advanced controls. CPU affinity,
+connection count/workload generation, link impairment, run duration,
+repetitions, and result paths remain application/deployment concerns.
+
+`Auto` is resolved against `RuntimeFlavor`/`TransportCapabilities` and the
+result is exposed as `ResolvedTransportConfig`; an explicitly requested
+unsupported mechanism is an error, never a silent no-op. Applications with a
+custom executor can pass `RuntimeFlavor::Custom`. Consumers that need more
+control can mutate the complete raw `ConnectionOptions`, use the returned
+`std::net::UdpSocket`s, instantiate any runtime `Conn` directly, or bypass the
+builders entirely. Those are supported composition points, not private
+implementation details.
 
 ## Consumers
 

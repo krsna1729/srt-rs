@@ -952,11 +952,11 @@ fn run_pool_acceptor(
     // promoted or relocated -- so it is always either mid-handshake here,
     // or fully promoted into `slots`, never in between.
     let mut peers = srt_transport::PeerTable::new();
-    let admission = srt_transport::AdmissionOptions {
-        socket_id: std::process::id(),
-        tsbpd_delay: cfg.latency_ms,
-        cookie_routing: cfg.cookie_routing,
-    };
+    let admission = srt_transport::AdmissionOptions::basic(
+        std::process::id(),
+        cfg.latency_ms,
+        cfg.cookie_routing,
+    );
     // Promoted connections -- local or handed off in from another
     // acceptor -- each with a dedicated connected socket and mio token,
     // driven by `service_slot_event`/`maintain_slots` like any other

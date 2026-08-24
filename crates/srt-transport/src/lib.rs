@@ -62,6 +62,11 @@ use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use zeroize::Zeroize;
+
+mod config;
+
+pub use config::*;
 
 /// Per-tick limits for moving protocol outputs into a runtime socket.
 ///
@@ -92,13 +97,12 @@ impl Default for OutputDrainBudget {
     }
 }
 
-/// Coherent application-facing defaults for one SRT stack instance.
+/// Compatibility configuration for existing low-level consumers.
 ///
-/// These are the benchmark knobs that describe protocol/resource policy and
-/// therefore belong in reusable library configuration. Runtime choice,
-/// executor thread count, ingress topology, CPU pinning, promotion strategy,
-/// connection-arrival concurrency, and link impairment remain deployment or
-/// experiment concerns and are intentionally not folded into this type.
+/// New applications should prefer [`SessionConfig`], [`TransportConfig`],
+/// [`AdmissionConfig`], [`ListenerConfig`], and [`CallerConfig`]. This compact
+/// type remains supported when an application already owns topology, workers,
+/// promotion, and runtime socket construction itself.
 #[derive(Clone, Debug)]
 pub struct SrtStackConfig {
     pub connection: ConnectionOptions,
@@ -134,6 +138,15 @@ impl SrtStackConfig {
         }
         if self.admission.max_peers == 0 {
             return Err(invalid("admission.max_peers must be non-zero"));
+        }
+        if self.admission.max_half_open_peers == 0 {
+            return Err(invalid("admission.max_half_open_peers must be non-zero"));
+        }
+        if self.admission.max_established_peers == 0 {
+            return Err(invalid("admission.max_established_peers must be non-zero"));
+        }
+        if self.admission.max_peers_per_ip == 0 {
+            return Err(invalid("admission.max_peers_per_ip must be non-zero"));
         }
         if self.admission.half_open_timeout.is_zero() {
             return Err(invalid("admission.half_open_timeout must be non-zero"));
@@ -173,6 +186,13 @@ impl SrtStackConfig {
             socket_id: self.connection.socket_id,
             tsbpd_delay: self.connection.tsbpd_delay,
             cookie_routing: self.cookie_routing,
+            connection_template: Some(self.connection.clone()),
+            handshake_retry_interval: Duration::from_micros(
+                shiguredo_srt::DEFAULT_HANDSHAKE_RETRY_INTERVAL_MICROS,
+            ),
+            handshake_timeout: Duration::from_micros(
+                shiguredo_srt::DEFAULT_HANDSHAKE_TIMEOUT_MICROS,
+            ),
         }
     }
 
@@ -701,7 +721,7 @@ pub struct AdmissionPeer {
     /// never accept more input. It is retired after `poll_outbound` drains
     /// the rejection packet.
     rejected: bool,
-    admitted_at: Timestamp,
+    admission_established: bool,
     last_datagram_at: Timestamp,
 }
 
@@ -741,7 +761,7 @@ impl AdmissionPeer {
 
 /// Per-listener settings the table needs to mint new connections and to
 /// decide cookie routing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct AdmissionOptions {
     pub socket_id: u32,
     pub tsbpd_delay: u16,
@@ -749,12 +769,61 @@ pub struct AdmissionOptions {
     /// Off makes a rehashed CONCLUSION strand instead, which is only
     /// useful for measuring what the routing is worth.
     pub cookie_routing: bool,
+    /// Complete session template for peers created on a shared listener.
+    /// `None` preserves the legacy socket-id/latency-only construction.
+    pub connection_template: Option<ConnectionOptions>,
+    pub handshake_retry_interval: Duration,
+    pub handshake_timeout: Duration,
+}
+
+impl AdmissionOptions {
+    /// Compatibility constructor for applications that configure the protocol
+    /// connection separately.
+    #[must_use]
+    pub fn basic(socket_id: u32, tsbpd_delay: u16, cookie_routing: bool) -> Self {
+        Self {
+            socket_id,
+            tsbpd_delay,
+            cookie_routing,
+            connection_template: None,
+            handshake_retry_interval: Duration::from_micros(
+                shiguredo_srt::DEFAULT_HANDSHAKE_RETRY_INTERVAL_MICROS,
+            ),
+            handshake_timeout: Duration::from_micros(
+                shiguredo_srt::DEFAULT_HANDSHAKE_TIMEOUT_MICROS,
+            ),
+        }
+    }
+}
+
+impl Drop for AdmissionOptions {
+    fn drop(&mut self) {
+        let Some(template) = self.connection_template.as_mut() else {
+            return;
+        };
+        if let Some(passphrase) = template.passphrase.as_mut() {
+            passphrase.zeroize();
+        }
+        if let Some(salt) = template.crypto_salt.as_mut() {
+            salt.zeroize();
+        }
+        if let Some(sek) = template.crypto_sek.as_mut() {
+            sek.zeroize();
+        }
+    }
 }
 
 /// Resource limits for one shared-listener admission table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PeerTableConfig {
+    /// Total half-open plus established peers retained by this table.
     pub max_peers: usize,
+    /// Incomplete handshakes retained concurrently.
+    pub max_half_open_peers: usize,
+    /// Fully established peers retained concurrently.
+    pub max_established_peers: usize,
+    /// Total peers from one source IP (ports do not bypass this bound).
+    pub max_peers_per_ip: usize,
     pub half_open_timeout: Duration,
 }
 
@@ -762,6 +831,12 @@ impl Default for PeerTableConfig {
     fn default() -> Self {
         Self {
             max_peers: 4096,
+            max_half_open_peers: 1024,
+            max_established_peers: 4096,
+            // Safe compatibility default: the per-source mechanism is active
+            // but no tighter than the table-wide bound until an application
+            // chooses a tenant/source policy.
+            max_peers_per_ip: 4096,
             half_open_timeout: Duration::from_secs(10),
         }
     }
@@ -781,7 +856,14 @@ pub enum AdmissionDropReason {
     InvalidCookie,
     StaleConclusion,
     RejectedPeer,
+    /// Total peer-table capacity was reached.
     Capacity,
+    /// Incomplete-handshake capacity was reached.
+    HalfOpenCapacity,
+    /// Established-peer capacity was reached.
+    EstablishedCapacity,
+    /// One source IP reached its configured share.
+    SourceCapacity,
 }
 
 /// What [`PeerTable::admit`] did with a datagram.
@@ -820,6 +902,10 @@ pub struct AdmissionEvent {
 /// live protocol state, which that crate deliberately does not.
 pub struct PeerTable {
     peers: HashMap<std::net::SocketAddr, AdmissionPeer>,
+    source_counts: HashMap<std::net::IpAddr, usize>,
+    half_open_peers: usize,
+    established_peers: usize,
+    half_open_deadlines: DueIndex<std::net::SocketAddr>,
     deadlines: DueIndex<std::net::SocketAddr>,
     ready: VecDeque<std::net::SocketAddr>,
     ready_set: HashSet<std::net::SocketAddr>,
@@ -843,8 +929,15 @@ impl PeerTable {
     #[must_use]
     pub fn with_config(mut config: PeerTableConfig) -> Self {
         config.max_peers = config.max_peers.max(1);
+        config.max_half_open_peers = config.max_half_open_peers.max(1).min(config.max_peers);
+        config.max_established_peers = config.max_established_peers.max(1).min(config.max_peers);
+        config.max_peers_per_ip = config.max_peers_per_ip.max(1).min(config.max_peers);
         Self {
             peers: HashMap::new(),
+            source_counts: HashMap::new(),
+            half_open_peers: 0,
+            established_peers: 0,
+            half_open_deadlines: DueIndex::default(),
             deadlines: DueIndex::default(),
             ready: VecDeque::new(),
             ready_set: HashSet::new(),
@@ -942,7 +1035,24 @@ impl PeerTable {
                 telemetry.record_admission_capacity_drop();
                 return Admit::Dropped(AdmissionDropReason::Capacity);
             }
+            if self.half_open_count() >= self.config.max_half_open_peers {
+                telemetry.record_half_open_capacity_drop();
+                return Admit::Dropped(AdmissionDropReason::HalfOpenCapacity);
+            }
+            if self.peers_for_ip(peer.ip()) >= self.config.max_peers_per_ip {
+                telemetry.record_source_capacity_drop();
+                return Admit::Dropped(AdmissionDropReason::SourceCapacity);
+            }
         } else if let Some(identity) = conclusion {
+            if self
+                .peers
+                .get(&peer)
+                .is_some_and(|entry| !entry.admission_established)
+                && self.established_count() >= self.config.max_established_peers
+            {
+                telemetry.record_established_capacity_drop();
+                return Admit::Dropped(AdmissionDropReason::EstablishedCapacity);
+            }
             let Some(entry) = self.peers.get_mut(&peer) else {
                 return Admit::Dropped(AdmissionDropReason::StaleConclusion);
             };
@@ -966,32 +1076,54 @@ impl PeerTable {
             }
         }
 
-        let fed = {
-            let entry = self.peers.entry(peer).or_insert_with(|| AdmissionPeer {
-                conn: SrtConnection::new_listener(ConnectionOptions {
-                    socket_id: options.socket_id,
-                    tsbpd_delay: options.tsbpd_delay,
-                    // Encode who owns this handshake, so a CONCLUSION the
-                    // kernel rehashes elsewhere can be routed back here.
-                    syn_cookie: Some(srt_lifecycle::cookie_for_worker(
-                        worker_index,
-                        peer_entropy(peer),
-                    )),
-                    ..Default::default()
-                }),
-                timers: ManualTimerStore::new(),
-                connected: false,
-                stream_deadline: None,
-                data_events: 0,
-                last_data_at: Instant::now(),
-                torn_down: false,
-                rejected: false,
-                admitted_at: now,
-                last_datagram_at: now,
+        let (fed, inserted, became_established) = {
+            let mut inserted = false;
+            let entry = self.peers.entry(peer).or_insert_with(|| {
+                inserted = true;
+                let mut connection_options =
+                    options.connection_template.clone().unwrap_or_default();
+                connection_options.socket_id = options.socket_id;
+                connection_options.tsbpd_delay = options.tsbpd_delay;
+                // Encode who owns this handshake, so a CONCLUSION the kernel
+                // rehashes elsewhere can be routed back here.
+                connection_options.syn_cookie = Some(srt_lifecycle::cookie_for_worker(
+                    worker_index,
+                    peer_entropy(peer),
+                ));
+                let mut conn = SrtConnection::new_listener(connection_options);
+                conn.set_handshake_timing(
+                    u64::try_from(options.handshake_retry_interval.as_micros()).unwrap_or(u64::MAX),
+                    u64::try_from(options.handshake_timeout.as_micros()).unwrap_or(u64::MAX),
+                );
+                AdmissionPeer {
+                    conn,
+                    timers: ManualTimerStore::new(),
+                    connected: false,
+                    stream_deadline: None,
+                    data_events: 0,
+                    last_data_at: Instant::now(),
+                    torn_down: false,
+                    rejected: false,
+                    admission_established: false,
+                    last_datagram_at: now,
+                }
             });
-            entry.last_datagram_at = now;
-            entry.conn.feed_recv_buf(data, now).is_ok()
+            let fed = entry.conn.feed_recv_buf(data, now).is_ok();
+            if fed {
+                entry.last_datagram_at = now;
+            }
+            let became_established = fed
+                && !entry.admission_established
+                && entry.conn.state() == shiguredo_srt::ConnectionState::Connected;
+            if became_established {
+                entry.admission_established = true;
+            }
+            (fed, inserted, became_established)
         };
+        if inserted {
+            *self.source_counts.entry(peer.ip()).or_default() += 1;
+            self.half_open_peers += 1;
+        }
         if !fed {
             telemetry.record_invalid_datagram();
             if !known {
@@ -999,29 +1131,40 @@ impl PeerTable {
             }
             return Admit::Dropped(AdmissionDropReason::InvalidPacket);
         }
+        if became_established {
+            self.half_open_peers = self.half_open_peers.saturating_sub(1);
+            self.established_peers += 1;
+            self.half_open_deadlines.remove(&peer);
+        } else if !self
+            .peers
+            .get(&peer)
+            .is_some_and(|entry| entry.admission_established)
+        {
+            self.half_open_deadlines.set(
+                peer,
+                now.add_micros(half_open_timeout_micros(self.config.half_open_timeout)),
+            );
+        }
         self.mark_ready(peer);
         Admit::Fed
     }
 
     /// Remove incomplete handshakes that have stopped making progress.
     pub fn prune_half_open(&mut self, now: Timestamp) -> usize {
-        let timeout_micros =
-            u64::try_from(self.config.half_open_timeout.as_micros()).unwrap_or(u64::MAX);
-        let stale: Vec<_> = self
-            .peers
-            .iter()
-            .filter_map(|(peer, entry)| {
-                let incomplete = entry.conn.state() != shiguredo_srt::ConnectionState::Connected
-                    && entry.stream_deadline.is_none();
-                (incomplete
+        let mut due = Vec::new();
+        self.half_open_deadlines.pop_due(now, &mut due);
+        let timeout_micros = half_open_timeout_micros(self.config.half_open_timeout);
+        let mut count = 0;
+        for peer in due {
+            let stale = self.peers.get(&peer).is_some_and(|entry| {
+                !entry.admission_established
                     && now.saturating_sub(entry.last_datagram_at) >= timeout_micros
-                    && now.saturating_sub(entry.admitted_at) >= timeout_micros)
-                    .then_some(*peer)
-            })
-            .collect();
-        let count = stale.len();
-        for peer in stale {
+            });
+            if !stale {
+                continue;
+            }
             let _ = self.remove(&peer);
+            count += 1;
         }
         count
     }
@@ -1062,10 +1205,8 @@ impl PeerTable {
                 if senders[owner].send(message).is_err() {
                     // Owner is gone. Take it locally with routing off, so
                     // the retry path is not entered again for this one.
-                    let local = AdmissionOptions {
-                        cookie_routing: false,
-                        ..*options
-                    };
+                    let mut local = options.clone();
+                    local.cookie_routing = false;
                     let _ = self.admit(
                         peer,
                         data,
@@ -1130,6 +1271,7 @@ impl PeerTable {
     /// Mark a peer whose protocol state was changed through [`Self::iter_mut`]
     /// as ready for the next indexed maintenance pass.
     pub fn mark_ready(&mut self, peer: std::net::SocketAddr) {
+        self.reconcile_established(peer);
         if self.peers.contains_key(&peer) {
             if self.ready_set.insert(peer) {
                 self.ready.push_back(peer);
@@ -1198,9 +1340,27 @@ impl PeerTable {
 
     pub fn remove(&mut self, peer: &std::net::SocketAddr) -> Option<AdmissionPeer> {
         self.deadlines.remove(peer);
+        self.half_open_deadlines.remove(peer);
         self.ready_set.remove(peer);
         self.event_ready_set.remove(peer);
-        self.peers.remove(peer)
+        let removed = self.peers.remove(peer);
+        if let Some(entry) = &removed {
+            if entry.admission_established {
+                self.established_peers = self.established_peers.saturating_sub(1);
+            } else {
+                self.half_open_peers = self.half_open_peers.saturating_sub(1);
+            }
+        }
+        if removed.is_some()
+            && let HashEntry::Occupied(mut entry) = self.source_counts.entry(peer.ip())
+        {
+            let count = entry.get_mut();
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                entry.remove();
+            }
+        }
+        removed
     }
 
     pub fn iter_mut(
@@ -1217,6 +1377,39 @@ impl PeerTable {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.peers.is_empty()
+    }
+
+    #[must_use]
+    pub fn half_open_count(&self) -> usize {
+        self.half_open_peers
+    }
+
+    #[must_use]
+    pub fn established_count(&self) -> usize {
+        self.established_peers
+    }
+
+    #[must_use]
+    pub fn peers_for_ip(&self, ip: std::net::IpAddr) -> usize {
+        self.source_counts.get(&ip).copied().unwrap_or_default()
+    }
+
+    fn reconcile_established(&mut self, peer: std::net::SocketAddr) {
+        let became_established = self.peers.get_mut(&peer).is_some_and(|entry| {
+            if !entry.admission_established
+                && entry.conn.state() == shiguredo_srt::ConnectionState::Connected
+            {
+                entry.admission_established = true;
+                true
+            } else {
+                false
+            }
+        });
+        if became_established {
+            self.half_open_peers = self.half_open_peers.saturating_sub(1);
+            self.established_peers += 1;
+            self.half_open_deadlines.remove(&peer);
+        }
     }
 
     /// Whether every tracked peer is done, so the acceptor can stop.
@@ -1255,6 +1448,10 @@ impl IntoIterator for PeerTable {
 fn peer_entropy(peer: std::net::SocketAddr) -> u32 {
     use std::hash::BuildHasher;
     std::collections::hash_map::RandomState::new().hash_one(peer) as u32
+}
+
+fn half_open_timeout_micros(timeout: Duration) -> u64 {
+    u64::try_from(timeout.as_micros()).unwrap_or(u64::MAX)
 }
 
 // ---------------------------------------------------------------------------
@@ -1340,10 +1537,49 @@ pub struct IngressTelemetry {
     pub invalid_cookies: AtomicU64,
     /// Valid new inductions refused because the half-open table was full.
     pub admission_capacity_drops: AtomicU64,
+    /// Valid inductions refused by the incomplete-handshake sub-limit.
+    pub half_open_capacity_drops: AtomicU64,
+    /// Valid conclusions refused by the established-peer sub-limit.
+    pub established_capacity_drops: AtomicU64,
+    /// Valid inductions refused by the per-source-IP limit.
+    pub source_capacity_drops: AtomicU64,
     /// Authenticated handshake identities rejected by application policy.
     pub policy_rejections: AtomicU64,
     /// Incomplete handshakes evicted after the configured inactivity bound.
     pub expired_half_open: AtomicU64,
+}
+
+/// Point-in-time, serialization-friendly admission/ingress counters.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IngressTelemetrySnapshot {
+    pub local_promotions: u64,
+    pub handoffs: u64,
+    pub stranded_conclusions: u64,
+    pub cookie_routed: u64,
+    pub promoted_duplicates: u64,
+    pub invalid_datagrams: u64,
+    pub invalid_cookies: u64,
+    pub admission_capacity_drops: u64,
+    pub half_open_capacity_drops: u64,
+    pub established_capacity_drops: u64,
+    pub source_capacity_drops: u64,
+    pub policy_rejections: u64,
+    pub expired_half_open: u64,
+}
+
+impl IngressTelemetrySnapshot {
+    #[must_use]
+    pub fn total_promotions(self) -> u64 {
+        self.local_promotions.saturating_add(self.handoffs)
+    }
+
+    #[must_use]
+    pub fn total_capacity_drops(self) -> u64 {
+        self.admission_capacity_drops
+            .saturating_add(self.half_open_capacity_drops)
+            .saturating_add(self.established_capacity_drops)
+            .saturating_add(self.source_capacity_drops)
+    }
 }
 
 impl IngressTelemetry {
@@ -1381,6 +1617,15 @@ impl IngressTelemetry {
     pub fn record_admission_capacity_drop(&self) {
         Self::bump(&self.admission_capacity_drops);
     }
+    pub fn record_half_open_capacity_drop(&self) {
+        Self::bump(&self.half_open_capacity_drops);
+    }
+    pub fn record_established_capacity_drop(&self) {
+        Self::bump(&self.established_capacity_drops);
+    }
+    pub fn record_source_capacity_drop(&self) {
+        Self::bump(&self.source_capacity_drops);
+    }
     pub fn record_policy_rejection(&self) {
         Self::bump(&self.policy_rejections);
     }
@@ -1389,26 +1634,53 @@ impl IngressTelemetry {
             .fetch_add(u64::try_from(count).unwrap_or(u64::MAX), Ordering::Relaxed);
     }
 
+    /// Read every counter into a plain value suitable for metrics exporters,
+    /// structured logs, or control-plane decisions. Individual relaxed loads
+    /// intentionally do not imply a cross-counter transaction.
+    #[must_use]
+    pub fn snapshot(&self) -> IngressTelemetrySnapshot {
+        let get = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        IngressTelemetrySnapshot {
+            local_promotions: get(&self.local_promotions),
+            handoffs: get(&self.handoffs),
+            stranded_conclusions: get(&self.stranded_conclusions),
+            cookie_routed: get(&self.cookie_routed),
+            promoted_duplicates: get(&self.promoted_duplicates),
+            invalid_datagrams: get(&self.invalid_datagrams),
+            invalid_cookies: get(&self.invalid_cookies),
+            admission_capacity_drops: get(&self.admission_capacity_drops),
+            half_open_capacity_drops: get(&self.half_open_capacity_drops),
+            established_capacity_drops: get(&self.established_capacity_drops),
+            source_capacity_drops: get(&self.source_capacity_drops),
+            policy_rejections: get(&self.policy_rejections),
+            expired_half_open: get(&self.expired_half_open),
+        }
+    }
+
     /// One-line shutdown summary, identical in shape for every runtime so
     /// two backends' output can be compared directly.
     #[must_use]
     pub fn report(&self, backend: &str) -> String {
-        let get = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        let snapshot = self.snapshot();
         format!(
             "[bench-{backend}] pool receiver: {} local promotions, {} bond handoffs, \
              {} stranded CONCLUSIONs, {} cookie-routed, {} post-promotion dups, \
-             {} invalid datagrams, {} invalid cookies, {} capacity drops, \
-             {} policy rejections, {} expired half-open",
-            get(&self.local_promotions),
-            get(&self.handoffs),
-            get(&self.stranded_conclusions),
-            get(&self.cookie_routed),
-            get(&self.promoted_duplicates),
-            get(&self.invalid_datagrams),
-            get(&self.invalid_cookies),
-            get(&self.admission_capacity_drops),
-            get(&self.policy_rejections),
-            get(&self.expired_half_open),
+             {} invalid datagrams, {} invalid cookies, {} total-capacity drops, \
+             {} half-open-capacity drops, {} established-capacity drops, \
+             {} source-capacity drops, {} policy rejections, {} expired half-open",
+            snapshot.local_promotions,
+            snapshot.handoffs,
+            snapshot.stranded_conclusions,
+            snapshot.cookie_routed,
+            snapshot.promoted_duplicates,
+            snapshot.invalid_datagrams,
+            snapshot.invalid_cookies,
+            snapshot.admission_capacity_drops,
+            snapshot.half_open_capacity_drops,
+            snapshot.established_capacity_drops,
+            snapshot.source_capacity_drops,
+            snapshot.policy_rejections,
+            snapshot.expired_half_open,
         )
     }
 }
@@ -1580,6 +1852,42 @@ mod tests {
         }
     }
 
+    fn prepare_conclusion(
+        table: &mut PeerTable,
+        peer: std::net::SocketAddr,
+        socket_id: u32,
+        options: &AdmissionOptions,
+        telemetry: &IngressTelemetry,
+    ) -> Vec<u8> {
+        let mut caller = SrtConnection::new_caller(ConnectionOptions {
+            socket_id,
+            ..ConnectionOptions::default()
+        });
+        caller.connect(Timestamp::default()).expect("start caller");
+        assert_eq!(
+            table.admit(
+                peer,
+                &next_packet(&mut caller),
+                Timestamp::default(),
+                options,
+                0,
+                1,
+                telemetry,
+            ),
+            Admit::Fed
+        );
+        let mut outbound = Vec::new();
+        table.poll_outbound(Timestamp::default(), &mut outbound);
+        for (outbound_peer, packet) in outbound {
+            if outbound_peer == peer {
+                caller
+                    .feed_recv_buf(&packet, Timestamp::from_micros(1))
+                    .expect("induction response");
+            }
+        }
+        next_packet(&mut caller)
+    }
+
     #[test]
     fn recvmsg_batch_rejects_mismatched_slices() {
         let mut bufs = (0..2).map(|_| Vec::with_capacity(64)).collect::<Vec<_>>();
@@ -1619,13 +1927,17 @@ mod tests {
                 .expect("valid admission config")
                 .is_empty()
         );
+        let admission = config.admission_options();
+        assert_eq!(admission.socket_id, 0x1234);
+        assert_eq!(admission.tsbpd_delay, 250);
+        assert!(admission.cookie_routing);
         assert_eq!(
-            config.admission_options(),
-            AdmissionOptions {
-                socket_id: 0x1234,
-                tsbpd_delay: 250,
-                cookie_routing: true,
-            }
+            admission
+                .connection_template
+                .as_ref()
+                .expect("connection template")
+                .socket_id,
+            0x1234
         );
     }
 
@@ -1723,11 +2035,7 @@ mod tests {
     #[test]
     fn invalid_unknown_datagrams_do_not_allocate_admission_state() {
         let mut table = PeerTable::new();
-        let options = AdmissionOptions {
-            socket_id: 7,
-            tsbpd_delay: 0,
-            cookie_routing: true,
-        };
+        let options = AdmissionOptions::basic(7, 0, true);
         let result = table.admit(
             "127.0.0.1:10000".parse().expect("address"),
             &[0; 16],
@@ -1746,12 +2054,9 @@ mod tests {
         let mut table = PeerTable::with_config(PeerTableConfig {
             max_peers: 2,
             half_open_timeout: Duration::from_micros(100),
+            ..PeerTableConfig::default()
         });
-        let options = AdmissionOptions {
-            socket_id: 7,
-            tsbpd_delay: 0,
-            cookie_routing: true,
-        };
+        let options = AdmissionOptions::basic(7, 0, true);
         let telemetry = IngressTelemetry::new();
         let peers = [
             "127.0.0.1:10000".parse().expect("address"),
@@ -1817,13 +2122,133 @@ mod tests {
     }
 
     #[test]
+    fn admission_enforces_half_open_and_per_source_limits_separately() {
+        let options = AdmissionOptions::basic(7, 0, true);
+        let telemetry = IngressTelemetry::new();
+        let mut half_open = PeerTable::with_config(PeerTableConfig {
+            max_peers: 8,
+            max_half_open_peers: 1,
+            max_established_peers: 8,
+            max_peers_per_ip: 8,
+            half_open_timeout: Duration::from_secs(60),
+        });
+        assert_eq!(
+            half_open.admit(
+                "127.0.0.1:10000".parse().expect("address"),
+                &induction(1),
+                Timestamp::default(),
+                &options,
+                0,
+                1,
+                &telemetry,
+            ),
+            Admit::Fed
+        );
+        assert_eq!(
+            half_open.admit(
+                "127.0.0.2:10000".parse().expect("address"),
+                &induction(2),
+                Timestamp::default(),
+                &options,
+                0,
+                1,
+                &telemetry,
+            ),
+            Admit::Dropped(AdmissionDropReason::HalfOpenCapacity)
+        );
+
+        let mut per_source = PeerTable::with_config(PeerTableConfig {
+            max_peers: 8,
+            max_half_open_peers: 8,
+            max_established_peers: 8,
+            max_peers_per_ip: 1,
+            half_open_timeout: Duration::from_secs(60),
+        });
+        assert_eq!(
+            per_source.admit(
+                "127.0.0.1:10000".parse().expect("address"),
+                &induction(1),
+                Timestamp::default(),
+                &options,
+                0,
+                1,
+                &telemetry,
+            ),
+            Admit::Fed
+        );
+        assert_eq!(
+            per_source.admit(
+                "127.0.0.1:10001".parse().expect("address"),
+                &induction(2),
+                Timestamp::default(),
+                &options,
+                0,
+                1,
+                &telemetry,
+            ),
+            Admit::Dropped(AdmissionDropReason::SourceCapacity)
+        );
+        assert_eq!(
+            telemetry.half_open_capacity_drops.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(telemetry.source_capacity_drops.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn admission_enforces_established_limit_before_state_transition() {
+        let options = AdmissionOptions::basic(7, 0, true);
+        let telemetry = IngressTelemetry::new();
+        let mut table = PeerTable::with_config(PeerTableConfig {
+            max_peers: 4,
+            max_half_open_peers: 4,
+            max_established_peers: 1,
+            max_peers_per_ip: 4,
+            half_open_timeout: Duration::from_secs(60),
+        });
+        let first = "127.0.0.1:10000".parse().expect("address");
+        let first_conclusion =
+            prepare_conclusion(&mut table, first, 0x1000_0001, &options, &telemetry);
+        assert_eq!(
+            table.admit(
+                first,
+                &first_conclusion,
+                Timestamp::from_micros(2),
+                &options,
+                0,
+                1,
+                &telemetry,
+            ),
+            Admit::Fed
+        );
+        assert_eq!(table.established_count(), 1);
+
+        let second = "127.0.0.2:10000".parse().expect("address");
+        let second_conclusion =
+            prepare_conclusion(&mut table, second, 0x1000_0002, &options, &telemetry);
+        assert_eq!(
+            table.admit(
+                second,
+                &second_conclusion,
+                Timestamp::from_micros(2),
+                &options,
+                0,
+                1,
+                &telemetry,
+            ),
+            Admit::Dropped(AdmissionDropReason::EstablishedCapacity)
+        );
+        assert_eq!(table.established_count(), 1);
+        assert_eq!(
+            telemetry.established_capacity_drops.load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
     fn stream_authorizer_rejects_before_connection_is_established() {
         let peer = "127.0.0.1:10000".parse().expect("address");
-        let options = AdmissionOptions {
-            socket_id: 0x2222,
-            tsbpd_delay: 0,
-            cookie_routing: true,
-        };
+        let options = AdmissionOptions::basic(0x2222, 0, true);
         let telemetry = IngressTelemetry::new();
         let mut table = PeerTable::new();
         let mut caller = SrtConnection::new_caller(ConnectionOptions {
@@ -1991,12 +2416,9 @@ mod tests {
             let mut table = PeerTable::with_config(PeerTableConfig {
                 max_peers,
                 half_open_timeout: Duration::from_secs(60),
+                ..PeerTableConfig::default()
             });
-            let options = AdmissionOptions {
-                socket_id: 7,
-                tsbpd_delay: 0,
-                cookie_routing: true,
-            };
+            let options = AdmissionOptions::basic(7, 0, true);
             let telemetry = IngressTelemetry::new();
             for index in 0..requested {
                 let peer = std::net::SocketAddr::from(([127, 0, 0, 1], 10_000 + index as u16));
@@ -2013,6 +2435,37 @@ mod tests {
                 prop_assert!(table.len() <= max_peers);
             }
             prop_assert_eq!(table.len(), requested.min(max_peers));
+        }
+
+        #[test]
+        fn admission_table_never_exceeds_per_source_capacity(
+            requested in 1usize..64,
+            max_per_ip in 1usize..16,
+        ) {
+            let mut table = PeerTable::with_config(PeerTableConfig {
+                max_peers: 64,
+                max_half_open_peers: 64,
+                max_established_peers: 64,
+                max_peers_per_ip: max_per_ip,
+                half_open_timeout: Duration::from_secs(60),
+            });
+            let options = AdmissionOptions::basic(7, 0, true);
+            let telemetry = IngressTelemetry::new();
+            let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+            for index in 0..requested {
+                let peer = std::net::SocketAddr::new(ip, 10_000 + index as u16);
+                let _ = table.admit(
+                    peer,
+                    &induction(index as u32 + 1),
+                    Timestamp::from_micros(index as u64),
+                    &options,
+                    0,
+                    1,
+                    &telemetry,
+                );
+                prop_assert!(table.peers_for_ip(ip) <= max_per_ip);
+            }
+            prop_assert_eq!(table.peers_for_ip(ip), requested.min(max_per_ip));
         }
     }
 
@@ -2284,6 +2737,31 @@ pub mod mio_transport {
                     .time_until_earliest(now, default.as_micros() as u64),
             )
         }
+    }
+
+    /// Resolve, bind, and convert a complete listener configuration to mio
+    /// sockets. Applications retain the prepared policy and may drive their
+    /// own poll/worker architecture around it.
+    pub fn bind_listener(
+        config: &crate::ListenerConfig,
+    ) -> Result<crate::RuntimeListener<mio::net::UdpSocket>, crate::RuntimeBuildError> {
+        let prepared = config.prepare(crate::RuntimeFlavor::Mio)?;
+        let sockets = prepared
+            .bind_sockets()?
+            .into_iter()
+            .map(mio::net::UdpSocket::from_std)
+            .collect();
+        Ok(crate::RuntimeListener { prepared, sockets })
+    }
+
+    /// Build one configured caller connection and connected mio socket.
+    pub fn caller(
+        config: &crate::CallerConfig,
+        now: Timestamp,
+    ) -> Result<Conn, crate::RuntimeBuildError> {
+        let prepared = config.prepare(crate::RuntimeFlavor::Mio)?;
+        let socket = mio::net::UdpSocket::from_std(prepared.bind_socket()?);
+        Ok(Conn::new(prepared.connection(now)?, socket))
     }
 
     fn drain_outputs_with<F>(
@@ -2635,6 +3113,30 @@ pub mod tokio_transport {
         }
     }
 
+    /// Resolve and bind a listener using Tokio-native UDP sockets. Must be
+    /// called from a Tokio runtime context.
+    pub fn bind_listener(
+        config: &crate::ListenerConfig,
+    ) -> Result<crate::RuntimeListener<UdpSocket>, crate::RuntimeBuildError> {
+        let prepared = config.prepare(crate::RuntimeFlavor::Tokio)?;
+        let sockets = prepared
+            .bind_sockets()?
+            .into_iter()
+            .map(UdpSocket::from_std)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(crate::RuntimeListener { prepared, sockets })
+    }
+
+    /// Build one configured caller connection and connected Tokio socket.
+    pub fn caller(
+        config: &crate::CallerConfig,
+        now: Timestamp,
+    ) -> Result<Conn, crate::RuntimeBuildError> {
+        let prepared = config.prepare(crate::RuntimeFlavor::Tokio)?;
+        let socket = UdpSocket::from_std(prepared.bind_socket()?)?;
+        Ok(Conn::new(prepared.connection(now)?, socket))
+    }
+
     pub struct TickResult {
         pub sent: u64,
         pub events: Vec<ConnectionEvent>,
@@ -2802,6 +3304,29 @@ pub mod smol_transport {
         }
     }
 
+    /// Resolve and bind a listener using smol-native async sockets.
+    pub fn bind_listener(
+        config: &crate::ListenerConfig,
+    ) -> Result<crate::RuntimeListener<UdpSocket>, crate::RuntimeBuildError> {
+        let prepared = config.prepare(crate::RuntimeFlavor::Smol)?;
+        let sockets = prepared
+            .bind_sockets()?
+            .into_iter()
+            .map(smol::Async::new)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(crate::RuntimeListener { prepared, sockets })
+    }
+
+    /// Build one configured caller connection and connected smol socket.
+    pub fn caller(
+        config: &crate::CallerConfig,
+        now: Timestamp,
+    ) -> Result<Conn, crate::RuntimeBuildError> {
+        let prepared = config.prepare(crate::RuntimeFlavor::Smol)?;
+        let socket = smol::Async::new(prepared.bind_socket()?)?;
+        Ok(Conn::new(prepared.connection(now)?, socket))
+    }
+
     pub struct TickResult {
         pub sent: u64,
         pub events: Vec<ConnectionEvent>,
@@ -2946,6 +3471,30 @@ pub mod monoio_transport {
 
             Ok(TickResult { sent, events })
         }
+    }
+
+    /// Resolve and bind a listener using Monoio-native UDP sockets. Call from
+    /// the executor thread that will own them.
+    pub fn bind_listener(
+        config: &crate::ListenerConfig,
+    ) -> Result<crate::RuntimeListener<monoio::net::udp::UdpSocket>, crate::RuntimeBuildError> {
+        let prepared = config.prepare(crate::RuntimeFlavor::Monoio)?;
+        let sockets = prepared
+            .bind_sockets()?
+            .into_iter()
+            .map(monoio::net::udp::UdpSocket::from_std)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(crate::RuntimeListener { prepared, sockets })
+    }
+
+    /// Build one configured caller connection and connected Monoio socket.
+    pub fn caller(
+        config: &crate::CallerConfig,
+        now: Timestamp,
+    ) -> Result<Conn, crate::RuntimeBuildError> {
+        let prepared = config.prepare(crate::RuntimeFlavor::Monoio)?;
+        let socket = monoio::net::udp::UdpSocket::from_std(prepared.bind_socket()?)?;
+        Ok(Conn::new(prepared.connection(now)?, socket))
     }
 
     pub struct TickResult {
@@ -3135,6 +3684,29 @@ pub mod glommio_transport {
         }
     }
 
+    /// Resolve and bind a listener on the current Glommio executor.
+    pub fn bind_listener(
+        config: &crate::ListenerConfig,
+    ) -> Result<crate::RuntimeListener<glommio::net::UdpSocket>, crate::RuntimeBuildError> {
+        let prepared = config.prepare(crate::RuntimeFlavor::Glommio)?;
+        let sockets = prepared
+            .bind_sockets()?
+            .into_iter()
+            .map(from_std)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(crate::RuntimeListener { prepared, sockets })
+    }
+
+    /// Build one configured caller connection on the current Glommio executor.
+    pub fn caller(
+        config: &crate::CallerConfig,
+        now: Timestamp,
+    ) -> Result<Conn, crate::RuntimeBuildError> {
+        let prepared = config.prepare(crate::RuntimeFlavor::Glommio)?;
+        let socket = from_std(prepared.bind_socket()?)?;
+        Ok(Conn::new(prepared.connection(now)?, socket))
+    }
+
     pub struct TickResult {
         pub sent: u64,
         pub events: Vec<ConnectionEvent>,
@@ -3269,6 +3841,30 @@ pub mod compio_transport {
 
             Ok(TickResult { sent, events })
         }
+    }
+
+    /// Resolve and bind a listener using Compio-native UDP sockets. Call from
+    /// the runtime thread that will own them.
+    pub fn bind_listener(
+        config: &crate::ListenerConfig,
+    ) -> Result<crate::RuntimeListener<compio::net::UdpSocket>, crate::RuntimeBuildError> {
+        let prepared = config.prepare(crate::RuntimeFlavor::Compio)?;
+        let sockets = prepared
+            .bind_sockets()?
+            .into_iter()
+            .map(compio::net::UdpSocket::from_std)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(crate::RuntimeListener { prepared, sockets })
+    }
+
+    /// Build one configured caller connection and connected Compio socket.
+    pub fn caller(
+        config: &crate::CallerConfig,
+        now: Timestamp,
+    ) -> Result<Conn, crate::RuntimeBuildError> {
+        let prepared = config.prepare(crate::RuntimeFlavor::Compio)?;
+        let socket = compio::net::UdpSocket::from_std(prepared.bind_socket()?)?;
+        Ok(Conn::new(prepared.connection(now)?, socket))
     }
 
     pub struct TickResult {

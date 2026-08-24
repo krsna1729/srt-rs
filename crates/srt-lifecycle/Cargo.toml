@@ -4,11 +4,15 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.96"
 publish = false
-license = "MIT"
+license = "Apache-2.0"
 description = "Runtime-neutral SRT admission, affinity, and ownership policy"
+readme = "README.md"
+homepage = "https://github.com/shiguredo/srt-rs"
+repository = "https://github.com/shiguredo/srt-rs"
+include = ["/src/**", "LICENSE", "README.md"]
 
 [dependencies]
-shiguredo_srt = { path = "../srt-protocol" }
+shiguredo_srt = { version = "=2026.1.0-canary.1", path = "../srt-protocol" }
 
 [dev-dependencies]
 proptest = "1.11"

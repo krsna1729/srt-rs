@@ -36,6 +36,14 @@ name = "fuzz_connection_feed"
 path = "fuzz_targets/fuzz_connection_feed.rs"
 test = false
 
+[[bin]]
+bench = false
+doc = false
+name = "fuzz_admission"
+path = "fuzz_targets/fuzz_admission.rs"
+test = false
+
 [dependencies]
 libfuzzer-sys = "0.4"
 shiguredo_srt = { path = ".." }
+srt-transport = { path = "../../srt-transport" }
