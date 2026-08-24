@@ -365,6 +365,69 @@ fn listener_can_apply_stream_policy_before_encrypted_conclusion() {
 }
 
 #[test]
+fn listener_encryption_mismatches_fail_closed_with_km_errors() {
+    let cases = [
+        (
+            Some("caller-only-secret".to_owned()),
+            None,
+            ErrorKind::HandshakeRejected,
+            "peer is unsecured",
+        ),
+        (
+            None,
+            Some("listener-only-secret".to_owned()),
+            ErrorKind::HandshakeRejected,
+            "peer has no secret",
+        ),
+        (
+            Some("caller-wrong-secret".to_owned()),
+            Some("listener-right-secret".to_owned()),
+            ErrorKind::CryptoError,
+            "peer has wrong secret",
+        ),
+    ];
+
+    for (caller_secret, listener_secret, listener_error_kind, caller_reason) in cases {
+        let mut caller = SrtConnection::new_caller(ConnectionOptions {
+            passphrase: caller_secret,
+            tsbpd_delay: 0,
+            ..ConnectionOptions::default()
+        });
+        let mut listener = SrtConnection::new_listener(ConnectionOptions {
+            passphrase: listener_secret,
+            tsbpd_delay: 0,
+            ..ConnectionOptions::default()
+        });
+        caller.connect(ts(0)).expect("start caller");
+        transfer_caller_to_listener(&mut caller, &mut listener, ts(0));
+        transfer_listener_to_caller(&mut listener, &mut caller, ts(1));
+
+        let conclusion = loop {
+            if let Some(ConnectionOutput::SendPacket(packet)) = caller.poll_output() {
+                break packet;
+            }
+        };
+        let listener_error = listener
+            .feed_recv_buf(&conclusion, ts(2))
+            .expect_err("encryption mismatch must fail");
+        assert_eq!(listener_error.kind, listener_error_kind);
+        assert_eq!(listener.state(), ConnectionState::Disconnected);
+
+        let caller_error = loop {
+            let output = listener.poll_output().expect("KM error response");
+            if let ConnectionOutput::SendPacket(packet) = output
+                && let Err(error) = caller.feed_recv_buf(&packet, ts(3))
+            {
+                break error;
+            }
+        };
+        assert_eq!(caller_error.kind, ErrorKind::HandshakeRejected);
+        assert!(caller_error.reason.contains(caller_reason));
+        assert_eq!(caller.state(), ConnectionState::Disconnected);
+    }
+}
+
+#[test]
 fn test_handshake_with_aes256() {
     let passphrase = "test-passphrase-256".to_string();
 

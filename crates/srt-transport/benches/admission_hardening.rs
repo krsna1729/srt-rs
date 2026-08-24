@@ -3,14 +3,58 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
-use shiguredo_srt::{HandshakePacket, Timestamp};
-use srt_transport::{AdmissionOptions, DueIndex, IngressTelemetry, PeerTable, PeerTableConfig};
+use shiguredo_srt::{
+    ConnectionOptions, ConnectionOutput, HandshakePacket, SrtConnection, Timestamp,
+};
+use srt_transport::{
+    AdmissionOptions, AdmissionResolution, DueIndex, IngressTelemetry, ListenerPeerPolicy,
+    PeerTable, PeerTableConfig, PolicyOverride,
+};
 
 fn induction(socket_id: u32) -> Vec<u8> {
     let packet = HandshakePacket::new_induction_request(socket_id).encode(0, 0);
     let mut bytes = Vec::new();
     packet.encode(&mut bytes);
     bytes
+}
+
+fn next_packet(connection: &mut SrtConnection) -> Vec<u8> {
+    loop {
+        if let Some(ConnectionOutput::SendPacket(packet)) = connection.poll_output() {
+            return packet;
+        }
+    }
+}
+
+fn pending_conclusion(
+    peer: SocketAddr,
+    options: &AdmissionOptions,
+    telemetry: &IngressTelemetry,
+) -> (PeerTable, Vec<u8>) {
+    let mut table = PeerTable::new();
+    let mut caller = SrtConnection::new_caller(ConnectionOptions {
+        socket_id: 11,
+        stream_id: Some("#!::u=bench,r=live".to_owned()),
+        ..ConnectionOptions::default()
+    });
+    caller.connect(Timestamp::default()).expect("start caller");
+    let _ = table.admit(
+        peer,
+        &next_packet(&mut caller),
+        Timestamp::default(),
+        options,
+        0,
+        1,
+        telemetry,
+    );
+    let mut outbound = Vec::new();
+    table.poll_outbound(Timestamp::default(), &mut outbound);
+    for (_, packet) in outbound {
+        caller
+            .feed_recv_buf(&packet, Timestamp::from_micros(1))
+            .expect("induction response");
+    }
+    (table, next_packet(&mut caller))
 }
 
 fn bench_invalid_admission(c: &mut Criterion) {
@@ -135,11 +179,45 @@ fn bench_per_source_capacity(c: &mut Criterion) {
     });
 }
 
+fn bench_cached_policy_resolution(c: &mut Criterion) {
+    let options = AdmissionOptions::basic(7, 120, true);
+    let telemetry = IngressTelemetry::new();
+    let peer = SocketAddr::from(([127, 0, 0, 1], 10_000));
+    let mut group = c.benchmark_group("admission_policy");
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("cached_streamid_configuration", |b| {
+        b.iter_batched(
+            || pending_conclusion(peer, &options, &telemetry),
+            |(mut table, conclusion)| {
+                black_box(table.admit_with_resolver(
+                    peer,
+                    &conclusion,
+                    Timestamp::from_micros(2),
+                    &options,
+                    0,
+                    1,
+                    &telemetry,
+                    |request| {
+                        black_box(&request.access_control);
+                        AdmissionResolution::Configure(ListenerPeerPolicy {
+                            latency: PolicyOverride::Set(Duration::from_millis(120)),
+                            ..ListenerPeerPolicy::default()
+                        })
+                    },
+                ));
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_invalid_admission,
     bench_bounded_capacity,
     bench_due_index_churn,
-    bench_per_source_capacity
+    bench_per_source_capacity,
+    bench_cached_policy_resolution
 );
 criterion_main!(benches);

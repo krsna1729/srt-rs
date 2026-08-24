@@ -314,6 +314,10 @@ impl SrtConnection {
             passphrase.zeroize();
         }
         self.options.passphrase = None;
+        if let Some(salt) = self.options.crypto_salt.as_mut() {
+            salt.zeroize();
+        }
+        self.options.crypto_salt = None;
         if let Some(sek) = self.options.crypto_sek.as_mut() {
             sek.zeroize();
         }
@@ -432,25 +436,114 @@ impl SrtConnection {
     /// have not been processed yet.
     pub fn set_listener_policy(
         &mut self,
-        passphrase: Option<String>,
+        mut passphrase: Option<String>,
         key_length: KeyLength,
         tsbpd_delay: u16,
         flow_window_packets: u32,
         receive_buffer_packets: u32,
     ) -> Result<(), Error> {
+        if let Err(error) = self.ensure_listener_policy_window() {
+            if let Some(secret) = passphrase.as_mut() {
+                secret.zeroize();
+            }
+            return Err(error);
+        }
+        self.replace_listener_encryption(passphrase, key_length);
+        self.options.tsbpd_delay = tsbpd_delay;
+        self.set_listener_flow_control_unchecked(flow_window_packets, receive_buffer_packets);
+        Ok(())
+    }
+
+    /// Select listener encryption after reading the caller's StreamID and
+    /// before processing its KM request. Replacing a policy zeroizes the old
+    /// secret and clears any caller-side deterministic key material.
+    pub fn set_listener_encryption(
+        &mut self,
+        mut passphrase: Option<String>,
+        key_length: KeyLength,
+    ) -> Result<(), Error> {
+        if let Err(error) = self.ensure_listener_policy_window() {
+            if let Some(secret) = passphrase.as_mut() {
+                secret.zeroize();
+            }
+            return Err(error);
+        }
+        self.replace_listener_encryption(passphrase, key_length);
+        Ok(())
+    }
+
+    /// Override listener latency during the pre-CONCLUSION policy window.
+    pub fn set_listener_latency(&mut self, tsbpd_delay: u16) -> Result<(), Error> {
+        self.ensure_listener_policy_window()?;
+        self.options.tsbpd_delay = tsbpd_delay;
+        Ok(())
+    }
+
+    /// Override listener flow-control and receive windows before CONCLUSION.
+    pub fn set_listener_flow_control(
+        &mut self,
+        flow_window_packets: u32,
+        receive_buffer_packets: u32,
+    ) -> Result<(), Error> {
+        self.ensure_listener_policy_window()?;
+        self.set_listener_flow_control_unchecked(flow_window_packets, receive_buffer_packets);
+        Ok(())
+    }
+
+    /// Override listener pacing bandwidth before CONCLUSION.
+    pub fn set_listener_bandwidth(
+        &mut self,
+        max_bandwidth_bytes_per_sec: Option<u64>,
+    ) -> Result<(), Error> {
+        self.ensure_listener_policy_window()?;
+        self.options.max_bandwidth_bytes_per_sec = max_bandwidth_bytes_per_sec;
+        Ok(())
+    }
+
+    /// Set or clear listener-side GROUP metadata before CONCLUSION.
+    pub fn set_listener_group_extension(
+        &mut self,
+        group: Option<GroupExtensionData>,
+    ) -> Result<(), Error> {
+        self.ensure_listener_policy_window()?;
+        self.options.group_extension = group;
+        Ok(())
+    }
+
+    fn ensure_listener_policy_window(&self) -> Result<(), Error> {
         if self.role != ConnectionRole::Listener || self.state != ConnectionState::Listening {
             return Err(Error::invalid_state(
                 "listener policy can only change before conclusion",
             ));
         }
+        Ok(())
+    }
+
+    fn replace_listener_encryption(&mut self, passphrase: Option<String>, key_length: KeyLength) {
+        if let Some(old) = self.options.passphrase.as_mut() {
+            old.zeroize();
+        }
+        if let Some(salt) = self.options.crypto_salt.as_mut() {
+            salt.zeroize();
+        }
+        if let Some(sek) = self.options.crypto_sek.as_mut() {
+            sek.zeroize();
+        }
         self.options.passphrase = passphrase;
+        self.options.crypto_salt = None;
+        self.options.crypto_sek = None;
         self.options.key_length = key_length;
-        self.options.tsbpd_delay = tsbpd_delay;
+    }
+
+    fn set_listener_flow_control_unchecked(
+        &mut self,
+        flow_window_packets: u32,
+        receive_buffer_packets: u32,
+    ) {
         self.options.flow_window_packets = flow_window_packets.max(MIN_FLOW_WINDOW_PACKETS);
         self.options.receive_buffer_packets = receive_buffer_packets
             .max(MIN_FLOW_WINDOW_PACKETS)
             .min(self.options.flow_window_packets);
-        Ok(())
     }
 
     /// Set listener-side GROUP metadata before processing the conclusion.
@@ -1137,29 +1230,29 @@ impl SrtConnection {
                     hs.socket_id
                 );
 
-                // KMRSP を検証
-                if self.crypto.is_some() {
-                    match hs.get_km_response() {
-                        Ok(Some(_km)) => {
-                            // KM レスポンス受信成功 (ピアが鍵を受け入れた)
-                        }
-                        Ok(None) => {
-                            // 暗号化が有効だが KMRSP がない
-                            return Err(Error::handshake_rejected(
-                                "encryption enabled but no KMRSP",
-                            ));
-                        }
-                        Err(km_error) => {
-                            // KM エラー
-                            let reason = match km_error {
-                                KmError::Unsecured => "peer is unsecured",
-                                KmError::NoSecret => "peer has no secret",
-                                KmError::BadSecret => "peer has wrong secret",
-                                KmError::BadCryptoMode => "incompatible crypto mode",
-                            };
-                            return Err(Error::handshake_rejected(reason));
-                        }
+                // KMRSP errors are authoritative even for an unsecured caller:
+                // otherwise a listener requiring encryption can fail while the
+                // caller incorrectly transitions to Connected.
+                match (self.crypto.is_some(), hs.get_km_response()) {
+                    (true, Ok(Some(_))) => {}
+                    (true, Ok(None)) => {
+                        return Err(self.fail_caller_handshake("encryption enabled but no KMRSP"));
                     }
+                    (false, Ok(Some(_))) => {
+                        return Err(self.fail_caller_handshake(
+                            "peer requires encryption but caller is unsecured",
+                        ));
+                    }
+                    (_, Err(km_error)) => {
+                        let reason = match km_error {
+                            KmError::Unsecured => "peer is unsecured",
+                            KmError::NoSecret => "peer has no secret",
+                            KmError::BadSecret => "peer has wrong secret",
+                            KmError::BadCryptoMode => "incompatible crypto mode",
+                        };
+                        return Err(self.fail_caller_handshake(reason));
+                    }
+                    (false, Ok(None)) => {}
                 }
 
                 self.handshake_state = HandshakeState::Completed;
@@ -1196,7 +1289,7 @@ impl SrtConnection {
             // libsrt listener configured to require a passphrase while
             // this caller connects without one (SRT_REJ_UNSECURE).
             HandshakeType::Rejected => {
-                return Err(Error::handshake_rejected(format!(
+                return Err(self.fail_caller_handshake(&format!(
                     "connection rejected by peer, reason={}",
                     hs.reject_reason.unwrap_or(-1)
                 )));
@@ -1265,22 +1358,35 @@ impl SrtConnection {
 
                 // KMREQ を処理して CryptoContext を作成
                 if let Some(ref passphrase) = self.options.passphrase {
-                    if let Some(km_result) = hs.get_km_request() {
-                        let km = km_result?;
-                        self.crypto = Some(CryptoContext::new_receiver(
-                            passphrase,
-                            km.salt,
-                            &km.wrapped_key,
-                            km.key_flag,
-                            km.key_length,
-                        )?);
-                        self.received_km = Some(km);
-                    } else {
-                        // 暗号化が要求されているが KMREQ がない
-                        return Err(Error::handshake_rejected(
+                    let Some(km_result) = hs.get_km_request() else {
+                        return Err(self.fail_listener_km(
+                            now,
+                            KmError::NoSecret,
                             "encryption required but no KMREQ",
                         ));
-                    }
+                    };
+                    let km = km_result?;
+                    let crypto = match CryptoContext::new_receiver(
+                        passphrase,
+                        km.salt,
+                        &km.wrapped_key,
+                        km.key_flag,
+                        km.key_length,
+                    ) {
+                        Ok(crypto) => crypto,
+                        Err(error) => {
+                            self.fail_listener_km(now, KmError::BadSecret, &error.reason);
+                            return Err(error);
+                        }
+                    };
+                    self.crypto = Some(crypto);
+                    self.received_km = Some(km);
+                } else if hs.get_km_request().is_some() {
+                    return Err(self.fail_listener_km(
+                        now,
+                        KmError::Unsecured,
+                        "caller requested encryption but listener is unsecured",
+                    ));
                 }
 
                 // CONCLUSION レスポンス送信
@@ -1789,6 +1895,54 @@ impl SrtConnection {
         self.queue_handshake_packet(buf);
     }
 
+    /// Queue a protocol-level KM failure and make the listener attempt
+    /// terminal. The caller receives the precise encryption mismatch instead
+    /// of timing out or observing an unencrypted downgrade.
+    fn fail_listener_km(&mut self, now: Timestamp, error: KmError, reason: &str) -> Error {
+        let mut hs = HandshakePacket::new_conclusion_response(
+            self.options.socket_id,
+            self.syn_cookie,
+            self.initial_seq,
+            0,
+            true,
+        );
+        hs.flow_window = self.flight_capacity_packets();
+        let flags = srt_flags::TSBPDSND
+            | srt_flags::TSBPDRCV
+            | srt_flags::CRYPT
+            | srt_flags::TLPKTDROP
+            | srt_flags::PERIODICNAK
+            | srt_flags::REXMITFLG;
+        hs.add_hs_response(self.options.srt_version, flags, self.options.tsbpd_delay);
+        hs.add_km_error(error);
+        if let Some(group) = self.options.group_extension {
+            hs.add_group_extension(group);
+        }
+        let packet = hs.encode(self.relative_timestamp(now), self.peer_socket_id);
+        let mut bytes = Vec::new();
+        packet.encode(&mut bytes);
+        self.queue_handshake_packet(bytes);
+        self.handshake_started_at = None;
+        self.handshake_state = HandshakeState::Failed;
+        self.set_state(ConnectionState::Disconnected);
+        self.output_queue.push_back(ConnectionOutput::ClearTimer {
+            id: TimerId::Handshake,
+        });
+        self.clear_config_secrets();
+        Error::handshake_rejected(reason)
+    }
+
+    fn fail_caller_handshake(&mut self, reason: &str) -> Error {
+        self.handshake_started_at = None;
+        self.handshake_state = HandshakeState::Failed;
+        self.set_state(ConnectionState::Disconnected);
+        self.output_queue.push_back(ConnectionOutput::ClearTimer {
+            id: TimerId::Handshake,
+        });
+        self.clear_config_secrets();
+        Error::handshake_rejected(reason)
+    }
+
     fn queue_handshake_packet(&mut self, packet: Vec<u8>) {
         self.last_handshake_packet = Some(packet.clone());
         self.output_queue
@@ -2112,6 +2266,33 @@ mod tests {
         };
         let handshake = HandshakePacket::decode(&control).expect("valid handshake");
         assert_eq!(handshake.flow_window, 8_548);
+    }
+
+    #[test]
+    fn listener_encryption_replacement_clears_inapplicable_key_material() {
+        let mut listener = SrtConnection::new_listener(ConnectionOptions {
+            passphrase: Some("old-secret-123".to_owned()),
+            crypto_salt: Some([7; 16]),
+            crypto_sek: Some(vec![9; 16]),
+            ..ConnectionOptions::default()
+        });
+        listener
+            .set_listener_encryption(Some("tenant-secret-123".to_owned()), KeyLength::Aes256)
+            .expect("listener policy window");
+
+        assert_eq!(
+            listener.options.passphrase.as_deref(),
+            Some("tenant-secret-123")
+        );
+        assert_eq!(listener.options.key_length, KeyLength::Aes256);
+        assert!(listener.options.crypto_salt.is_none());
+        assert!(listener.options.crypto_sek.is_none());
+
+        listener.set_state(ConnectionState::Connected);
+        let error = listener
+            .set_listener_bandwidth(Some(1_000_000))
+            .expect_err("live policy mutation must be rejected");
+        assert_eq!(error.kind, crate::ErrorKind::InvalidState);
     }
 
     #[test]

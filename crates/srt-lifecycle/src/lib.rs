@@ -40,7 +40,9 @@ pub struct GroupAffinity {
     pub extension: GroupExtensionData,
 }
 
-/// Handshake identity available before the protocol Core processes conclusion.
+/// Caller-claimed handshake identity available before the protocol core
+/// processes CONCLUSION. These fields are routing/admission input, not proof of
+/// peer identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HandshakeIdentity {
     pub is_conclusion: bool,
@@ -408,6 +410,17 @@ pub fn handshake_identity(packet: &[u8]) -> Option<HandshakeIdentity> {
     // Decoding is the codec crate's job; this function's business is
     // turning a handshake into routing identity.
     let handshake = shiguredo_srt::peek_handshake(packet)?;
+    Some(handshake_identity_from_handshake(&handshake))
+}
+
+/// Extract routing identity from an already decoded handshake.
+///
+/// Admission code uses this form so the same untrusted datagram is decoded
+/// once before cookie validation, policy resolution, and protocol processing.
+#[must_use]
+pub fn handshake_identity_from_handshake(
+    handshake: &shiguredo_srt::HandshakePacket,
+) -> HandshakeIdentity {
     let is_conclusion = matches!(handshake.handshake_type, HandshakeType::Conclusion);
     let stream_id = handshake.get_sid_extension();
     let group = handshake
@@ -417,12 +430,12 @@ pub fn handshake_identity(packet: &[u8]) -> Option<HandshakeIdentity> {
             stream_id: stream_id.clone(),
             extension,
         });
-    Some(HandshakeIdentity {
+    HandshakeIdentity {
         is_conclusion,
         stream_id,
         group,
         syn_cookie: handshake.syn_cookie,
-    })
+    }
 }
 
 /// Convenience for callers that only need GROUP metadata from a datagram.

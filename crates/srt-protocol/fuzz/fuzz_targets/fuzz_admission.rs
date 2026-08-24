@@ -6,7 +6,8 @@ use std::time::Duration;
 use libfuzzer_sys::fuzz_target;
 use shiguredo_srt::{ConnectionOptions, ConnectionOutput, SrtConnection, Timestamp};
 use srt_transport::{
-    AdmissionDecision, AdmissionOptions, IngressTelemetry, PeerTable, PeerTableConfig,
+    AdmissionOptions, AdmissionResolution, IngressTelemetry, ListenerPeerPolicy, PeerTable,
+    PeerTableConfig, PolicyOverride, RejectionReason,
 };
 
 fn next_packet(connection: &mut SrtConnection) -> Option<Vec<u8>> {
@@ -60,7 +61,7 @@ fuzz_target!(|data: &[u8]| {
             let _ = caller.feed_recv_buf(&packet, Timestamp::from_micros(1));
         }
         if let Some(conclusion) = next_packet(&mut caller) {
-            let _ = table.admit_with_authorizer(
+            let _ = table.admit_with_resolver(
                 peer,
                 &conclusion,
                 Timestamp::from_micros(2),
@@ -68,12 +69,16 @@ fuzz_target!(|data: &[u8]| {
                 0,
                 2,
                 &telemetry,
-                |_| {
-                    if selector & 2 == 0 {
-                        AdmissionDecision::Accept
-                    } else {
-                        AdmissionDecision::Reject { reason: 1401 }
-                    }
+                |_| match (selector >> 1) & 3 {
+                    0 => AdmissionResolution::Accept,
+                    1 => AdmissionResolution::Reject {
+                        reason: RejectionReason::UNAUTHORIZED,
+                    },
+                    2 => AdmissionResolution::Configure(ListenerPeerPolicy {
+                        latency: PolicyOverride::Set(Duration::from_millis(u64::from(selector))),
+                        ..ListenerPeerPolicy::default()
+                    }),
+                    _ => AdmissionResolution::Defer,
                 },
             );
         }

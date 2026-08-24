@@ -171,6 +171,63 @@ let peers = runtime_listener.prepared.peer_table();
 let admission = runtime_listener.prepared.admission_options();
 ```
 
+### Per-StreamID listener policy
+
+The listener sees the caller's claimed StreamID in CONCLUSION, after cookie
+validation but before KM processing. A cached resolver can select a tenant
+passphrase and other handshake policy atomically:
+
+```rust
+use shiguredo_srt::KeyLength;
+use srt_transport::{
+    AdmissionResolution, ListenerEncryptionConfig, ListenerPeerPolicy,
+    PolicyOverride, RejectionReason,
+};
+
+let outcome = peers.admit_with_resolver(
+    peer,
+    datagram,
+    now,
+    &admission,
+    worker_index,
+    worker_count,
+    &telemetry,
+    |request| {
+        let Some(user) = request
+            .access_control
+            .as_ref()
+            .and_then(|access| access.user_name())
+        else {
+            return AdmissionResolution::Reject {
+                reason: RejectionReason::BAD_REQUEST,
+            };
+        };
+        let Some(passphrase) = cached_tenant_passphrase(user) else {
+            return AdmissionResolution::Defer;
+        };
+        AdmissionResolution::Configure(ListenerPeerPolicy {
+            encryption: PolicyOverride::Set(Some(
+                ListenerEncryptionConfig::new(passphrase, KeyLength::Aes128)
+                    .expect("validated secret store entry"),
+            )),
+            ..ListenerPeerPolicy::default()
+        })
+    },
+);
+```
+
+StreamID and access-control fields remain application claims; successful KM
+proves possession of the selected shared credential, not general identity.
+Resolvers run synchronously and should perform only bounded cached work.
+`Defer` leaves the peer's original hard TTL unchanged. Multiple policy sources
+can compose with `ListenerPeerPolicy::overlay`; `Inherit` never erases a
+lower-priority decision. `admit_with_connection_hook` exposes
+`&mut SrtConnection` in the same guarded window for future or
+application-specific protocol controls;
+`admit_with_authorizer` remains the raw rejection-code compatibility API.
+Reuseport loops can use `admit_and_forward_with_resolver` so only the worker
+that owns the half-open peer performs credential resolution.
+
 The ten reusable benchmark controls are represented: latency, bandwidth,
 group/bond metadata, promotion, cookie routing, socket buffers, ingress
 topology, receive batching, workers, and caller-pool concurrency. The 15-second

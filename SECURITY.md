@@ -23,8 +23,12 @@ reordered, truncated, replayed, or intentionally malformed. The transport
 admission layer rejects malformed traffic before allocating a peer and
 independently bounds total, half-open, established, and per-source-IP state.
 Consumers should retain or tighten those defaults, add network-level packet-
-rate limits for volumetric attacks, and authorize the StreamID/group identity
-before accepting a connection.
+rate limits for volumetric attacks, and resolve policy from the StreamID/group
+identity before accepting a connection. StreamID is a caller-controlled claim,
+not authenticated identity. A per-StreamID passphrase can validate possession
+of that tenant credential during KM, but authorization decisions should be
+confirmed or bound to an authenticated protocol inside the SRT payload when
+identity matters.
 
 SRT's standard passphrase mode provides confidentiality using AES-CTR and key
 exchange compatibility with libsrt. It does **not** provide cryptographic
@@ -43,6 +47,19 @@ passphrase/SEK buffers are zeroized after handshake use and on drop; layered
 owned passphrase/salt/SEK storage on replacement or drop. Rust and the allocator
 can still copy application-owned strings before transfer; avoid logging,
 cloning, swapping, or crash-dumping secret-bearing process memory.
+
+Listener admission resolvers execute in the CONCLUSION packet path. Use a
+bounded local/cache lookup and populate remote credential data asynchronously
+outside the resolver. `AdmissionResolution::Defer` deliberately does not
+refresh the original half-open deadline; retain a tight capacity/TTL policy so
+cache misses and hostile StreamIDs cannot retain state indefinitely. Avoid
+revealing whether a tenant, resource, or credential exists through overly
+specific rejection codes or timing differences.
+
+Encryption negotiation is fail-closed: an encrypted caller cannot establish an
+unencrypted listener session, and a listener requiring encryption cannot accept
+a CONCLUSION without KMREQ. The listener returns a protocol KM error and retires
+the terminal half-open peer after the response is drained.
 
 The sans-I/O core is single-owner: mutating operations require `&mut self`.
 Runtime adapters may move a connection between workers, but must not drive one

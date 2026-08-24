@@ -266,6 +266,193 @@ impl EncryptionConfig {
     }
 }
 
+/// Whether a per-peer listener policy inherits the prepared listener value or
+/// deliberately replaces it. `Set(None)` is meaningful for optional values:
+/// it explicitly disables the inherited feature.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum PolicyOverride<T> {
+    #[default]
+    Inherit,
+    Set(T),
+}
+
+impl<T> PolicyOverride<T> {
+    /// Replace this value only when `higher_priority` makes an explicit
+    /// decision. This is the primitive used to compose independent policy
+    /// layers without one layer resetting another to listener defaults.
+    pub fn overlay(&mut self, higher_priority: Self) {
+        if let Self::Set(value) = higher_priority {
+            *self = Self::Set(value);
+        }
+    }
+}
+
+/// Secret selected by a listener admission resolver for one peer.
+///
+/// The value is redacted from diagnostics and zeroized on drop. Unlike
+/// [`EncryptionConfig`], it intentionally has no explicit salt/SEK escape
+/// hatch: a listener derives session keys from the caller's KM request.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ListenerEncryptionConfig {
+    passphrase: String,
+    pub key_length: KeyLength,
+}
+
+impl ListenerEncryptionConfig {
+    pub fn new(passphrase: impl Into<String>, key_length: KeyLength) -> Result<Self, ConfigError> {
+        let value = Self {
+            passphrase: passphrase.into(),
+            key_length,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        if !(10..=79).contains(&self.passphrase.len()) {
+            return Err(ConfigError::new(
+                "listener.policy.encryption.passphrase",
+                "must be 10 through 79 bytes for libsrt interoperability",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for ListenerEncryptionConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ListenerEncryptionConfig")
+            .field("passphrase", &"[REDACTED]")
+            .field("key_length", &self.key_length)
+            .finish()
+    }
+}
+
+impl Drop for ListenerEncryptionConfig {
+    fn drop(&mut self) {
+        self.passphrase.zeroize();
+    }
+}
+
+/// Typed overrides selected for a single listener peer after StreamID
+/// extraction and cookie validation, but before the CONCLUSION is processed.
+///
+/// Every field defaults to `Inherit`, so independent policy components can
+/// compose by changing only the values they own. For protocol features not
+/// represented here, use `PeerTable::admit_with_connection_hook` and the
+/// guarded pre-CONCLUSION setters on [`SrtConnection`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ListenerPeerPolicy {
+    pub encryption: PolicyOverride<Option<ListenerEncryptionConfig>>,
+    pub latency: PolicyOverride<Duration>,
+    pub bandwidth: PolicyOverride<Bandwidth>,
+    pub flow_control: PolicyOverride<FlowControlConfig>,
+    pub group: PolicyOverride<Option<GroupConfig>>,
+}
+
+impl ListenerPeerPolicy {
+    /// Overlay explicit decisions from a higher-priority policy layer.
+    /// `Inherit` never erases an earlier decision.
+    pub fn overlay(&mut self, higher_priority: Self) -> &mut Self {
+        self.encryption.overlay(higher_priority.encryption);
+        self.latency.overlay(higher_priority.latency);
+        self.bandwidth.overlay(higher_priority.bandwidth);
+        self.flow_control.overlay(higher_priority.flow_control);
+        self.group.overlay(higher_priority.group);
+        self
+    }
+
+    #[must_use]
+    pub fn with_overlay(mut self, higher_priority: Self) -> Self {
+        self.overlay(higher_priority);
+        self
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if let PolicyOverride::Set(Some(encryption)) = &self.encryption {
+            encryption.validate()?;
+        }
+        if let PolicyOverride::Set(latency) = &self.latency {
+            duration_millis_u16("listener.policy.latency", *latency)?;
+        }
+        if let PolicyOverride::Set(flow) = &self.flow_control
+            && flow.receive_buffer_packets > flow.window_packets
+        {
+            return Err(ConfigError::new(
+                "listener.policy.flow_control.receive_buffer_packets",
+                "must not exceed the flow-control window",
+            ));
+        }
+        if let PolicyOverride::Set(Some(group)) = &self.group {
+            if group.group_id & SRTGROUP_MASK == 0 {
+                return Err(ConfigError::new(
+                    "listener.policy.group.group_id",
+                    "must contain the SRT group marker; use GroupConfig::new",
+                ));
+            }
+            if group.group_type == GroupType::Undefined {
+                return Err(ConfigError::new(
+                    "listener.policy.group.group_type",
+                    "must be Broadcast or Backup",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply all selected overrides atomically with respect to protocol input.
+    /// This consumes the policy so its passphrase is moved directly into the
+    /// connection and is not retained in resolver output.
+    pub fn apply_to(mut self, connection: &mut SrtConnection) -> Result<(), ConfigError> {
+        self.validate()?;
+        if let PolicyOverride::Set(encryption) = &mut self.encryption {
+            let (passphrase, key_length) = match encryption {
+                Some(value) => {
+                    value.validate()?;
+                    (
+                        Some(std::mem::take(&mut value.passphrase)),
+                        value.key_length,
+                    )
+                }
+                None => (None, KeyLength::Aes128),
+            };
+            connection
+                .set_listener_encryption(passphrase, key_length)
+                .map_err(|error| {
+                    ConfigError::new("listener.policy.encryption", error.to_string())
+                })?;
+        }
+        if let PolicyOverride::Set(latency) = self.latency {
+            connection
+                .set_listener_latency(duration_millis_u16("listener.policy.latency", latency)?)
+                .map_err(|error| ConfigError::new("listener.policy.latency", error.to_string()))?;
+        }
+        if let PolicyOverride::Set(bandwidth) = self.bandwidth {
+            connection
+                .set_listener_bandwidth(bandwidth.as_connection_value())
+                .map_err(|error| {
+                    ConfigError::new("listener.policy.bandwidth", error.to_string())
+                })?;
+        }
+        if let PolicyOverride::Set(flow) = self.flow_control {
+            connection
+                .set_listener_flow_control(
+                    flow.window_packets.get(),
+                    flow.receive_buffer_packets.get(),
+                )
+                .map_err(|error| {
+                    ConfigError::new("listener.policy.flow_control", error.to_string())
+                })?;
+        }
+        if let PolicyOverride::Set(group) = self.group {
+            connection
+                .set_listener_group_extension(group.map(Into::into))
+                .map_err(|error| ConfigError::new("listener.policy.group", error.to_string()))?;
+        }
+        Ok(())
+    }
+}
+
 /// Flow-control and receive-buffer windows, in packets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FlowControlConfig {
@@ -1723,5 +1910,30 @@ mod tests {
             socket.peer_addr().expect("peer"),
             receiver.local_addr().expect("receiver")
         );
+    }
+
+    #[test]
+    fn listener_policy_layers_overlay_only_explicit_decisions() {
+        let base = ListenerPeerPolicy {
+            latency: PolicyOverride::Set(Duration::from_millis(120)),
+            bandwidth: PolicyOverride::Set(Bandwidth::BytesPerSecond(
+                NonZeroU64::new(10_000_000).expect("bandwidth"),
+            )),
+            ..ListenerPeerPolicy::default()
+        };
+        let tenant = ListenerPeerPolicy {
+            latency: PolicyOverride::Set(Duration::from_millis(40)),
+            ..ListenerPeerPolicy::default()
+        };
+        let combined = base.with_overlay(tenant);
+
+        assert_eq!(
+            combined.latency,
+            PolicyOverride::Set(Duration::from_millis(40))
+        );
+        assert!(matches!(
+            combined.bandwidth,
+            PolicyOverride::Set(Bandwidth::BytesPerSecond(_))
+        ));
     }
 }

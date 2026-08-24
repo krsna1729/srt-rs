@@ -842,11 +842,93 @@ impl Default for PeerTableConfig {
     }
 }
 
-/// Application authorization result for an authenticated handshake identity.
+/// Application authorization result for a claimed, not-yet-authenticated
+/// handshake identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdmissionDecision {
     Accept,
     Reject { reason: i32 },
+}
+
+/// A libsrt-compatible application rejection code.
+///
+/// The 1000-1999 range is reserved for predefined meanings and 2000-2999 for
+/// application-specific reasons. The legacy [`AdmissionDecision`] API remains
+/// available when exact wire compatibility requires an unchecked raw value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RejectionReason(i32);
+
+impl RejectionReason {
+    pub const BAD_REQUEST: Self = Self(1400);
+    pub const UNAUTHORIZED: Self = Self(1401);
+    pub const OVERLOAD: Self = Self(1402);
+    pub const FORBIDDEN: Self = Self(1403);
+    pub const NOT_FOUND: Self = Self(1404);
+    pub const BAD_MODE: Self = Self(1405);
+    pub const UNACCEPTABLE: Self = Self(1406);
+    pub const INTERNAL_ERROR: Self = Self(1500);
+
+    /// Construct an application-owned rejection in libsrt's 2000-2999 range.
+    #[must_use]
+    pub const fn application(code: u16) -> Option<Self> {
+        if code <= 999 {
+            Some(Self(2000 + code as i32))
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub const fn get(self) -> i32 {
+        self.0
+    }
+}
+
+/// Context made available after cookie validation and before the protocol core
+/// processes a caller's CONCLUSION or KM request.
+///
+/// Every caller-controlled field is untrusted at this point. In particular,
+/// StreamID and parsed access-control values are merely credential-validated
+/// claims after a selected passphrase successfully validates the KM exchange;
+/// SRT passphrase mode is not general peer authentication.
+#[derive(Clone, Debug)]
+pub struct AdmissionRequest {
+    pub peer: std::net::SocketAddr,
+    pub claimed_identity: srt_lifecycle::HandshakeIdentity,
+    pub handshake: shiguredo_srt::HandshakePacket,
+    pub access_control: Option<shiguredo_srt::stream_id::AccessControl>,
+}
+
+/// Result of resolving policy for one valid CONCLUSION.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum AdmissionResolution {
+    #[default]
+    Accept,
+    Configure(ListenerPeerPolicy),
+    Reject {
+        reason: RejectionReason,
+    },
+    /// Leave the half-open peer untouched. A retransmitted CONCLUSION may be
+    /// resolved later, but the original hard half-open expiry is not extended.
+    Defer,
+}
+
+enum AdmissionHookResult {
+    Accept,
+    Configure(ListenerPeerPolicy),
+    Reject(i32),
+    Defer,
+}
+
+impl From<AdmissionResolution> for AdmissionHookResult {
+    fn from(value: AdmissionResolution) -> Self {
+        match value {
+            AdmissionResolution::Accept => Self::Accept,
+            AdmissionResolution::Configure(policy) => Self::Configure(policy),
+            AdmissionResolution::Reject { reason } => Self::Reject(reason.get()),
+            AdmissionResolution::Defer => Self::Defer,
+        }
+    }
 }
 
 /// Why an admission datagram was discarded without creating connection state.
@@ -877,6 +959,9 @@ pub enum Admit {
     ForwardTo(usize),
     /// The application rejected the conclusion before it became connected.
     Rejected,
+    /// Policy resolution intentionally retained the half-open peer without
+    /// feeding or extending the CONCLUSION.
+    Deferred,
     /// The datagram was invalid, stale, or exceeded the configured bound.
     Dropped(AdmissionDropReason),
 }
@@ -993,11 +1078,107 @@ impl PeerTable {
     where
         F: FnOnce(&srt_lifecycle::HandshakeIdentity) -> AdmissionDecision,
     {
+        self.admit_with_policy_hook(
+            peer,
+            data,
+            now,
+            options,
+            worker_index,
+            worker_count,
+            telemetry,
+            |request, _connection| match authorize(&request.claimed_identity) {
+                AdmissionDecision::Accept => AdmissionHookResult::Accept,
+                AdmissionDecision::Reject { reason } => AdmissionHookResult::Reject(reason),
+            },
+        )
+    }
+
+    /// Resolve typed per-peer policy from the caller's claimed identity and
+    /// raw handshake context. The resolver runs synchronously in the packet
+    /// path and should use bounded, cached work.
+    #[allow(clippy::too_many_arguments)]
+    pub fn admit_with_resolver<F>(
+        &mut self,
+        peer: std::net::SocketAddr,
+        data: &[u8],
+        now: Timestamp,
+        options: &AdmissionOptions,
+        worker_index: usize,
+        worker_count: usize,
+        telemetry: &IngressTelemetry,
+        resolve: F,
+    ) -> Admit
+    where
+        F: FnOnce(&AdmissionRequest) -> AdmissionResolution,
+    {
+        self.admit_with_policy_hook(
+            peer,
+            data,
+            now,
+            options,
+            worker_index,
+            worker_count,
+            telemetry,
+            |request, _connection| resolve(request).into(),
+        )
+    }
+
+    /// Expert pre-CONCLUSION escape hatch.
+    ///
+    /// This exposes the guarded [`SrtConnection`] setters for protocol options
+    /// not modeled by [`ListenerPeerPolicy`]. The hook is invoked only after
+    /// capacity and cookie checks and immediately before protocol input. It
+    /// must not retain the connection reference or perform unbounded I/O.
+    #[allow(clippy::too_many_arguments)]
+    pub fn admit_with_connection_hook<F>(
+        &mut self,
+        peer: std::net::SocketAddr,
+        data: &[u8],
+        now: Timestamp,
+        options: &AdmissionOptions,
+        worker_index: usize,
+        worker_count: usize,
+        telemetry: &IngressTelemetry,
+        hook: F,
+    ) -> Admit
+    where
+        F: FnOnce(&AdmissionRequest, &mut SrtConnection) -> AdmissionResolution,
+    {
+        self.admit_with_policy_hook(
+            peer,
+            data,
+            now,
+            options,
+            worker_index,
+            worker_count,
+            telemetry,
+            |request, connection| hook(request, connection).into(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn admit_with_policy_hook<F>(
+        &mut self,
+        peer: std::net::SocketAddr,
+        data: &[u8],
+        now: Timestamp,
+        options: &AdmissionOptions,
+        worker_index: usize,
+        worker_count: usize,
+        telemetry: &IngressTelemetry,
+        hook: F,
+    ) -> Admit
+    where
+        F: FnOnce(&AdmissionRequest, &mut SrtConnection) -> AdmissionHookResult,
+    {
         let expired = self.prune_half_open(now);
         telemetry.record_expired_half_open(expired);
         let known = self.peers.contains_key(&peer);
-        let handshake = srt_lifecycle::handshake_identity(data);
-        let conclusion = handshake.as_ref().filter(|identity| identity.is_conclusion);
+        let handshake = shiguredo_srt::peek_handshake(data);
+        let identity = handshake
+            .as_ref()
+            .map(srt_lifecycle::handshake_identity_from_handshake);
+        let conclusion = identity.as_ref().filter(|identity| identity.is_conclusion);
 
         if !known && let Some(identity) = conclusion {
             let owner = srt_lifecycle::worker_from_cookie(identity.syn_cookie, worker_count);
@@ -1023,7 +1204,7 @@ impl PeerTable {
         }
 
         if !known {
-            let Some(packet) = shiguredo_srt::peek_handshake(data) else {
+            let Some(packet) = handshake.as_ref() else {
                 telemetry.record_invalid_datagram();
                 return Admit::Dropped(AdmissionDropReason::InvalidPacket);
             };
@@ -1063,20 +1244,57 @@ impl PeerTable {
                 telemetry.record_invalid_cookie();
                 return Admit::Dropped(AdmissionDropReason::InvalidCookie);
             }
-            if let AdmissionDecision::Reject { reason } = authorize(identity) {
-                if entry.conn.reject(reason, now).is_err() {
-                    telemetry.record_invalid_datagram();
-                    return Admit::Dropped(AdmissionDropReason::InvalidPacket);
+            let packet = handshake
+                .as_ref()
+                .expect("a conclusion identity came from a decoded handshake");
+            let request = AdmissionRequest {
+                peer,
+                claimed_identity: identity.clone(),
+                handshake: packet.clone(),
+                access_control: identity
+                    .stream_id
+                    .as_deref()
+                    .and_then(shiguredo_srt::stream_id::AccessControl::parse),
+            };
+            telemetry.record_policy_request();
+            match hook(&request, &mut entry.conn) {
+                AdmissionHookResult::Accept => {}
+                AdmissionHookResult::Configure(policy) => {
+                    if policy.apply_to(&mut entry.conn).is_err() {
+                        telemetry.record_policy_error();
+                        if entry
+                            .conn
+                            .reject(RejectionReason::INTERNAL_ERROR.get(), now)
+                            .is_err()
+                        {
+                            telemetry.record_invalid_datagram();
+                            return Admit::Dropped(AdmissionDropReason::InvalidPacket);
+                        }
+                        entry.rejected = true;
+                        self.mark_ready(peer);
+                        return Admit::Rejected;
+                    }
+                    telemetry.record_policy_configuration();
                 }
-                telemetry.record_policy_rejection();
-                entry.rejected = true;
-                entry.last_datagram_at = now;
-                self.mark_ready(peer);
-                return Admit::Rejected;
+                AdmissionHookResult::Reject(reason) => {
+                    if entry.conn.reject(reason, now).is_err() {
+                        telemetry.record_invalid_datagram();
+                        return Admit::Dropped(AdmissionDropReason::InvalidPacket);
+                    }
+                    telemetry.record_policy_rejection();
+                    entry.rejected = true;
+                    entry.last_datagram_at = now;
+                    self.mark_ready(peer);
+                    return Admit::Rejected;
+                }
+                AdmissionHookResult::Defer => {
+                    telemetry.record_policy_deferred();
+                    return Admit::Deferred;
+                }
             }
         }
 
-        let (fed, inserted, became_established) = {
+        let (fed, feed_error_kind, inserted, became_established, became_terminal) = {
             let mut inserted = false;
             let entry = self.peers.entry(peer).or_insert_with(|| {
                 inserted = true;
@@ -1108,7 +1326,9 @@ impl PeerTable {
                     last_datagram_at: now,
                 }
             });
-            let fed = entry.conn.feed_recv_buf(data, now).is_ok();
+            let feed_result = entry.conn.feed_recv_buf(data, now);
+            let feed_error_kind = feed_result.as_ref().err().map(|error| error.kind);
+            let fed = feed_result.is_ok();
             if fed {
                 entry.last_datagram_at = now;
             }
@@ -1118,16 +1338,40 @@ impl PeerTable {
             if became_established {
                 entry.admission_established = true;
             }
-            (fed, inserted, became_established)
+            let became_terminal =
+                !fed && entry.conn.state() == shiguredo_srt::ConnectionState::Disconnected;
+            if became_terminal {
+                entry.rejected = true;
+            }
+            (
+                fed,
+                feed_error_kind,
+                inserted,
+                became_established,
+                became_terminal,
+            )
         };
         if inserted {
             *self.source_counts.entry(peer.ip()).or_default() += 1;
             self.half_open_peers += 1;
         }
         if !fed {
+            if conclusion.is_some()
+                && matches!(
+                    feed_error_kind,
+                    Some(
+                        shiguredo_srt::ErrorKind::CryptoError
+                            | shiguredo_srt::ErrorKind::HandshakeRejected
+                    )
+                )
+            {
+                telemetry.record_credential_failure();
+            }
             telemetry.record_invalid_datagram();
             if !known {
                 let _ = self.remove(&peer);
+            } else if became_terminal {
+                self.mark_ready(peer);
             }
             return Admit::Dropped(AdmissionDropReason::InvalidPacket);
         }
@@ -1203,23 +1447,58 @@ impl PeerTable {
                     data: data.to_vec(),
                 };
                 if senders[owner].send(message).is_err() {
-                    // Owner is gone. Take it locally with routing off, so
-                    // the retry path is not entered again for this one.
-                    let mut local = options.clone();
-                    local.cookie_routing = false;
-                    let _ = self.admit(
-                        peer,
-                        data,
-                        now,
-                        &local,
-                        worker_index,
-                        senders.len(),
-                        telemetry,
-                    );
+                    telemetry.record_cookie_route_failure();
+                    // The half-open state existed only on the closed owner;
+                    // another acceptor cannot safely synthesize it from a
+                    // CONCLUSION. The caller's next handshake attempt starts
+                    // with a fresh INDUCTION and cookie.
                 }
             }
-            Admit::Rejected | Admit::Dropped(_) => {}
+            Admit::Rejected | Admit::Deferred | Admit::Dropped(_) => {}
         }
+    }
+
+    /// Resolver-enabled form of [`Self::admit_and_forward`].
+    ///
+    /// The resolver is called only on the acceptor that owns the retained
+    /// half-open state. A datagram forwarded to another acceptor is resolved
+    /// there, so policy and credentials never need to cross worker channels.
+    #[allow(clippy::too_many_arguments)]
+    pub fn admit_and_forward_with_resolver<F>(
+        &mut self,
+        peer: std::net::SocketAddr,
+        data: &[u8],
+        now: Timestamp,
+        options: &AdmissionOptions,
+        worker_index: usize,
+        senders: &[std::sync::mpsc::Sender<WorkerMessage>],
+        telemetry: &IngressTelemetry,
+        resolve: F,
+    ) -> Admit
+    where
+        F: FnOnce(&AdmissionRequest) -> AdmissionResolution,
+    {
+        let result = self.admit_with_resolver(
+            peer,
+            data,
+            now,
+            options,
+            worker_index,
+            senders.len(),
+            telemetry,
+            resolve,
+        );
+        if let Admit::ForwardTo(owner) = &result {
+            let message = WorkerMessage::Handshake {
+                peer,
+                data: data.to_vec(),
+            };
+            if senders[*owner].send(message).is_err() {
+                telemetry.record_cookie_route_failure();
+                return Admit::Dropped(AdmissionDropReason::StaleConclusion);
+            }
+        }
+        result
     }
 
     /// Fire due peers' timers and collect what ready peers want to send.
@@ -1336,6 +1615,15 @@ impl PeerTable {
     #[must_use]
     pub fn get(&self, peer: &std::net::SocketAddr) -> Option<&AdmissionPeer> {
         self.peers.get(peer)
+    }
+
+    /// Mutable peer access for advanced integrations that need to inspect or
+    /// drive protocol state beyond the standard admission helpers.
+    ///
+    /// If external work queues new output, call [`Self::mark_ready`] so the
+    /// next maintenance pass observes it promptly.
+    pub fn get_mut(&mut self, peer: &std::net::SocketAddr) -> Option<&mut AdmissionPeer> {
+        self.peers.get_mut(peer)
     }
 
     pub fn remove(&mut self, peer: &std::net::SocketAddr) -> Option<AdmissionPeer> {
@@ -1523,9 +1811,11 @@ pub struct IngressTelemetry {
     /// the peer and carried no usable routing information -- flows the
     /// kernel rehashed mid-handshake that could not be rescued.
     pub stranded_conclusions: AtomicU64,
-    /// CONCLUSION datagrams routed to their owning acceptor by SYN
-    /// cookie. Each would otherwise have been stranded.
+    /// CONCLUSION datagrams assigned to their owning acceptor by SYN cookie.
+    /// Closed-channel delivery failures are counted separately.
     pub cookie_routed: AtomicU64,
+    /// Cookie-routed CONCLUSIONs whose owning worker channel was closed.
+    pub cookie_route_failures: AtomicU64,
     /// Late or duplicate CONCLUSIONs for a connection this acceptor had
     /// already promoted (so its peer entry was gone). Harmless, but
     /// indistinguishable from a stranded handshake without checking the
@@ -1543,8 +1833,19 @@ pub struct IngressTelemetry {
     pub established_capacity_drops: AtomicU64,
     /// Valid inductions refused by the per-source-IP limit.
     pub source_capacity_drops: AtomicU64,
-    /// Authenticated handshake identities rejected by application policy.
+    /// Valid-cookie CONCLUSIONs presented to application policy. Identity is
+    /// still only claimed until KM succeeds.
+    pub policy_requests: AtomicU64,
+    /// Per-peer typed policy configurations successfully applied.
+    pub policy_configurations: AtomicU64,
+    /// Policy decisions deferred without extending half-open lifetime.
+    pub policy_deferred: AtomicU64,
+    /// Invalid or out-of-state policy configurations rejected internally.
+    pub policy_errors: AtomicU64,
+    /// Claimed handshake identities rejected by application policy.
     pub policy_rejections: AtomicU64,
+    /// CONCLUSIONs that failed KM validation after credential selection.
+    pub credential_failures: AtomicU64,
     /// Incomplete handshakes evicted after the configured inactivity bound.
     pub expired_half_open: AtomicU64,
 }
@@ -1556,6 +1857,7 @@ pub struct IngressTelemetrySnapshot {
     pub handoffs: u64,
     pub stranded_conclusions: u64,
     pub cookie_routed: u64,
+    pub cookie_route_failures: u64,
     pub promoted_duplicates: u64,
     pub invalid_datagrams: u64,
     pub invalid_cookies: u64,
@@ -1563,7 +1865,12 @@ pub struct IngressTelemetrySnapshot {
     pub half_open_capacity_drops: u64,
     pub established_capacity_drops: u64,
     pub source_capacity_drops: u64,
+    pub policy_requests: u64,
+    pub policy_configurations: u64,
+    pub policy_deferred: u64,
+    pub policy_errors: u64,
     pub policy_rejections: u64,
+    pub credential_failures: u64,
     pub expired_half_open: u64,
 }
 
@@ -1605,6 +1912,9 @@ impl IngressTelemetry {
     pub fn record_cookie_routed(&self) {
         Self::bump(&self.cookie_routed);
     }
+    pub fn record_cookie_route_failure(&self) {
+        Self::bump(&self.cookie_route_failures);
+    }
     pub fn record_promoted_duplicate(&self) {
         Self::bump(&self.promoted_duplicates);
     }
@@ -1629,6 +1939,21 @@ impl IngressTelemetry {
     pub fn record_policy_rejection(&self) {
         Self::bump(&self.policy_rejections);
     }
+    pub fn record_policy_request(&self) {
+        Self::bump(&self.policy_requests);
+    }
+    pub fn record_policy_configuration(&self) {
+        Self::bump(&self.policy_configurations);
+    }
+    pub fn record_policy_deferred(&self) {
+        Self::bump(&self.policy_deferred);
+    }
+    pub fn record_policy_error(&self) {
+        Self::bump(&self.policy_errors);
+    }
+    pub fn record_credential_failure(&self) {
+        Self::bump(&self.credential_failures);
+    }
     pub fn record_expired_half_open(&self, count: usize) {
         self.expired_half_open
             .fetch_add(u64::try_from(count).unwrap_or(u64::MAX), Ordering::Relaxed);
@@ -1645,6 +1970,7 @@ impl IngressTelemetry {
             handoffs: get(&self.handoffs),
             stranded_conclusions: get(&self.stranded_conclusions),
             cookie_routed: get(&self.cookie_routed),
+            cookie_route_failures: get(&self.cookie_route_failures),
             promoted_duplicates: get(&self.promoted_duplicates),
             invalid_datagrams: get(&self.invalid_datagrams),
             invalid_cookies: get(&self.invalid_cookies),
@@ -1652,7 +1978,12 @@ impl IngressTelemetry {
             half_open_capacity_drops: get(&self.half_open_capacity_drops),
             established_capacity_drops: get(&self.established_capacity_drops),
             source_capacity_drops: get(&self.source_capacity_drops),
+            policy_requests: get(&self.policy_requests),
+            policy_configurations: get(&self.policy_configurations),
+            policy_deferred: get(&self.policy_deferred),
+            policy_errors: get(&self.policy_errors),
             policy_rejections: get(&self.policy_rejections),
+            credential_failures: get(&self.credential_failures),
             expired_half_open: get(&self.expired_half_open),
         }
     }
@@ -1664,14 +1995,18 @@ impl IngressTelemetry {
         let snapshot = self.snapshot();
         format!(
             "[bench-{backend}] pool receiver: {} local promotions, {} bond handoffs, \
-             {} stranded CONCLUSIONs, {} cookie-routed, {} post-promotion dups, \
+             {} stranded CONCLUSIONs, {} cookie-routed, {} cookie-route failures, \
+             {} post-promotion dups, \
              {} invalid datagrams, {} invalid cookies, {} total-capacity drops, \
              {} half-open-capacity drops, {} established-capacity drops, \
-             {} source-capacity drops, {} policy rejections, {} expired half-open",
+             {} source-capacity drops, {} policy requests, {} policy configurations, \
+             {} policy deferrals, {} policy errors, {} policy rejections, \
+             {} credential failures, {} expired half-open",
             snapshot.local_promotions,
             snapshot.handoffs,
             snapshot.stranded_conclusions,
             snapshot.cookie_routed,
+            snapshot.cookie_route_failures,
             snapshot.promoted_duplicates,
             snapshot.invalid_datagrams,
             snapshot.invalid_cookies,
@@ -1679,7 +2014,12 @@ impl IngressTelemetry {
             snapshot.half_open_capacity_drops,
             snapshot.established_capacity_drops,
             snapshot.source_capacity_drops,
+            snapshot.policy_requests,
+            snapshot.policy_configurations,
+            snapshot.policy_deferred,
+            snapshot.policy_errors,
             snapshot.policy_rejections,
+            snapshot.credential_failures,
             snapshot.expired_half_open,
         )
     }
@@ -1859,10 +2199,27 @@ mod tests {
         options: &AdmissionOptions,
         telemetry: &IngressTelemetry,
     ) -> Vec<u8> {
-        let mut caller = SrtConnection::new_caller(ConnectionOptions {
-            socket_id,
-            ..ConnectionOptions::default()
-        });
+        prepare_conclusion_with_options(
+            table,
+            peer,
+            ConnectionOptions {
+                socket_id,
+                ..ConnectionOptions::default()
+            },
+            options,
+            telemetry,
+        )
+        .1
+    }
+
+    fn prepare_conclusion_with_options(
+        table: &mut PeerTable,
+        peer: std::net::SocketAddr,
+        caller_options: ConnectionOptions,
+        options: &AdmissionOptions,
+        telemetry: &IngressTelemetry,
+    ) -> (SrtConnection, Vec<u8>) {
+        let mut caller = SrtConnection::new_caller(caller_options);
         caller.connect(Timestamp::default()).expect("start caller");
         assert_eq!(
             table.admit(
@@ -1885,7 +2242,8 @@ mod tests {
                     .expect("induction response");
             }
         }
-        next_packet(&mut caller)
+        let conclusion = next_packet(&mut caller);
+        (caller, conclusion)
     }
 
     #[test]
@@ -1973,6 +2331,13 @@ mod tests {
                     for _ in 0..10_000 {
                         telemetry.record_local_promotion();
                         telemetry.record_invalid_datagram();
+                        telemetry.record_cookie_route_failure();
+                        telemetry.record_policy_request();
+                        telemetry.record_policy_configuration();
+                        telemetry.record_policy_deferred();
+                        telemetry.record_policy_error();
+                        telemetry.record_policy_rejection();
+                        telemetry.record_credential_failure();
                         telemetry.record_expired_half_open(2);
                     }
                 })
@@ -1983,6 +2348,14 @@ mod tests {
         }
         assert_eq!(telemetry.local_promotions.load(Ordering::Relaxed), 80_000);
         assert_eq!(telemetry.invalid_datagrams.load(Ordering::Relaxed), 80_000);
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.cookie_route_failures, 80_000);
+        assert_eq!(snapshot.policy_requests, 80_000);
+        assert_eq!(snapshot.policy_configurations, 80_000);
+        assert_eq!(snapshot.policy_deferred, 80_000);
+        assert_eq!(snapshot.policy_errors, 80_000);
+        assert_eq!(snapshot.policy_rejections, 80_000);
+        assert_eq!(snapshot.credential_failures, 80_000);
         assert_eq!(telemetry.expired_half_open.load(Ordering::Relaxed), 160_000);
     }
 
@@ -2355,6 +2728,382 @@ mod tests {
             Admit::Dropped(AdmissionDropReason::StaleConclusion)
         );
         assert!(!table.contains(&peer));
+    }
+
+    #[test]
+    fn resolver_selects_stream_password_before_km_processing() {
+        let peer = "127.0.0.1:10010".parse().expect("address");
+        let options = AdmissionOptions::basic(0x2222, 0, true);
+        let telemetry = IngressTelemetry::new();
+        let mut table = PeerTable::new();
+        let passphrase = "tenant-secret-123";
+        let (mut caller, conclusion) = prepare_conclusion_with_options(
+            &mut table,
+            peer,
+            ConnectionOptions {
+                socket_id: 0x1111,
+                stream_id: Some("#!::u=alice,r=live/camera,m=publish".to_string()),
+                passphrase: Some(passphrase.to_string()),
+                ..Default::default()
+            },
+            &options,
+            &telemetry,
+        );
+
+        let result = table.admit_with_resolver(
+            peer,
+            &conclusion,
+            Timestamp::from_micros(2),
+            &options,
+            0,
+            1,
+            &telemetry,
+            |request| {
+                assert_eq!(request.peer, peer);
+                assert_eq!(
+                    request.claimed_identity.stream_id.as_deref(),
+                    Some("#!::u=alice,r=live/camera,m=publish")
+                );
+                let access = request
+                    .access_control
+                    .as_ref()
+                    .expect("parsed access control");
+                assert_eq!(access.user_name(), Some("alice"));
+                assert_eq!(access.resource_name(), Some("live/camera"));
+                AdmissionResolution::Configure(ListenerPeerPolicy {
+                    encryption: PolicyOverride::Set(Some(
+                        ListenerEncryptionConfig::new(passphrase, shiguredo_srt::KeyLength::Aes128)
+                            .expect("valid listener secret"),
+                    )),
+                    ..Default::default()
+                })
+            },
+        );
+        assert_eq!(result, Admit::Fed);
+        assert_eq!(
+            table.get(&peer).expect("listener peer").conn.state(),
+            shiguredo_srt::ConnectionState::Connected
+        );
+
+        let mut outbound = Vec::new();
+        table.poll_outbound(Timestamp::from_micros(2), &mut outbound);
+        for (_, packet) in outbound {
+            caller
+                .feed_recv_buf(&packet, Timestamp::from_micros(3))
+                .expect("caller accepts KM response");
+        }
+        assert_eq!(caller.state(), shiguredo_srt::ConnectionState::Connected);
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.policy_requests, 1);
+        assert_eq!(snapshot.policy_configurations, 1);
+        assert_eq!(snapshot.credential_failures, 0);
+    }
+
+    #[test]
+    fn wrong_resolved_password_is_observable_and_never_establishes() {
+        let peer = "127.0.0.1:10011".parse().expect("address");
+        let options = AdmissionOptions::basic(0x2222, 0, true);
+        let telemetry = IngressTelemetry::new();
+        let mut table = PeerTable::new();
+        let (_, conclusion) = prepare_conclusion_with_options(
+            &mut table,
+            peer,
+            ConnectionOptions {
+                socket_id: 0x1111,
+                stream_id: Some("tenant-a".to_string()),
+                passphrase: Some("correct-secret-123".to_string()),
+                ..Default::default()
+            },
+            &options,
+            &telemetry,
+        );
+        let result = table.admit_with_resolver(
+            peer,
+            &conclusion,
+            Timestamp::from_micros(2),
+            &options,
+            0,
+            1,
+            &telemetry,
+            |_| {
+                AdmissionResolution::Configure(ListenerPeerPolicy {
+                    encryption: PolicyOverride::Set(Some(
+                        ListenerEncryptionConfig::new(
+                            "incorrect-secret-123",
+                            shiguredo_srt::KeyLength::Aes128,
+                        )
+                        .expect("valid listener secret"),
+                    )),
+                    ..Default::default()
+                })
+            },
+        );
+        assert_eq!(result, Admit::Dropped(AdmissionDropReason::InvalidPacket));
+        assert_ne!(
+            table.get(&peer).expect("half-open peer").conn.state(),
+            shiguredo_srt::ConnectionState::Connected
+        );
+        assert_eq!(telemetry.snapshot().credential_failures, 1);
+    }
+
+    #[test]
+    fn encrypted_caller_cannot_downgrade_an_unsecured_listener() {
+        let peer = "127.0.0.1:10017".parse().expect("address");
+        let options = AdmissionOptions::basic(0x2222, 0, true);
+        let telemetry = IngressTelemetry::new();
+        let mut table = PeerTable::new();
+        let (mut caller, conclusion) = prepare_conclusion_with_options(
+            &mut table,
+            peer,
+            ConnectionOptions {
+                socket_id: 0x1111,
+                passphrase: Some("caller-secret-123".to_owned()),
+                ..ConnectionOptions::default()
+            },
+            &options,
+            &telemetry,
+        );
+        assert_eq!(
+            table.admit_with_resolver(
+                peer,
+                &conclusion,
+                Timestamp::from_micros(2),
+                &options,
+                0,
+                1,
+                &telemetry,
+                |_| AdmissionResolution::Accept,
+            ),
+            Admit::Dropped(AdmissionDropReason::InvalidPacket)
+        );
+        assert_eq!(
+            table.get(&peer).expect("terminal peer").conn.state(),
+            shiguredo_srt::ConnectionState::Disconnected
+        );
+        assert_eq!(telemetry.snapshot().credential_failures, 1);
+
+        let mut outbound = Vec::new();
+        table.poll_outbound(Timestamp::from_micros(2), &mut outbound);
+        let error = outbound
+            .into_iter()
+            .find_map(|(_, packet)| {
+                caller
+                    .feed_recv_buf(&packet, Timestamp::from_micros(3))
+                    .err()
+            })
+            .expect("caller receives KM mismatch");
+        assert_eq!(error.kind, shiguredo_srt::ErrorKind::HandshakeRejected);
+        assert!(
+            !table.contains(&peer),
+            "terminal peer retires after response"
+        );
+    }
+
+    #[test]
+    fn deferred_policy_does_not_extend_the_half_open_deadline() {
+        let peer = "127.0.0.1:10012".parse().expect("address");
+        let options = AdmissionOptions::basic(0x2222, 0, true);
+        let telemetry = IngressTelemetry::new();
+        let mut table = PeerTable::with_config(PeerTableConfig {
+            half_open_timeout: Duration::from_micros(100),
+            ..PeerTableConfig::default()
+        });
+        let conclusion = prepare_conclusion(&mut table, peer, 0x1111, &options, &telemetry);
+        assert_eq!(
+            table.admit_with_resolver(
+                peer,
+                &conclusion,
+                Timestamp::from_micros(90),
+                &options,
+                0,
+                1,
+                &telemetry,
+                |_| AdmissionResolution::Defer,
+            ),
+            Admit::Deferred
+        );
+        assert!(table.contains(&peer));
+        assert_eq!(table.prune_half_open(Timestamp::from_micros(101)), 1);
+        assert!(!table.contains(&peer));
+        assert_eq!(telemetry.snapshot().policy_deferred, 1);
+    }
+
+    #[test]
+    fn connection_hook_is_a_guarded_escape_hatch() {
+        let peer = "127.0.0.1:10013".parse().expect("address");
+        let options = AdmissionOptions::basic(0x2222, 0, true);
+        let telemetry = IngressTelemetry::new();
+        let mut table = PeerTable::new();
+        let conclusion = prepare_conclusion(&mut table, peer, 0x1111, &options, &telemetry);
+        assert_eq!(
+            table.admit_with_connection_hook(
+                peer,
+                &conclusion,
+                Timestamp::from_micros(2),
+                &options,
+                0,
+                1,
+                &telemetry,
+                |_request, connection| {
+                    connection
+                        .set_listener_bandwidth(Some(42_000_000))
+                        .expect("inside pre-conclusion window");
+                    AdmissionResolution::Accept
+                },
+            ),
+            Admit::Fed
+        );
+    }
+
+    #[test]
+    fn invalid_resolved_policy_is_rejected_and_counted() {
+        let peer = "127.0.0.1:10014".parse().expect("address");
+        let options = AdmissionOptions::basic(0x2222, 0, true);
+        let telemetry = IngressTelemetry::new();
+        let mut table = PeerTable::new();
+        let conclusion = prepare_conclusion(&mut table, peer, 0x1111, &options, &telemetry);
+        assert_eq!(
+            table.admit_with_resolver(
+                peer,
+                &conclusion,
+                Timestamp::from_micros(2),
+                &options,
+                0,
+                1,
+                &telemetry,
+                |_| AdmissionResolution::Configure(ListenerPeerPolicy {
+                    latency: PolicyOverride::Set(Duration::from_secs(u64::from(u16::MAX) + 1)),
+                    ..ListenerPeerPolicy::default()
+                }),
+            ),
+            Admit::Rejected
+        );
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.policy_requests, 1);
+        assert_eq!(snapshot.policy_errors, 1);
+        assert_eq!(snapshot.policy_configurations, 0);
+    }
+
+    #[test]
+    fn forwarded_conclusion_is_resolved_only_by_its_owner() {
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+        let peer = "127.0.0.1:10015".parse().expect("address");
+        let options = AdmissionOptions::basic(0x2222, 0, true);
+        let telemetry = IngressTelemetry::new();
+        let mut owner = PeerTable::new();
+        let mut caller = SrtConnection::new_caller(ConnectionOptions {
+            socket_id: 0x1111,
+            stream_id: Some("tenant-a".to_owned()),
+            ..ConnectionOptions::default()
+        });
+        caller.connect(Timestamp::default()).expect("start caller");
+        assert_eq!(
+            owner.admit(
+                peer,
+                &next_packet(&mut caller),
+                Timestamp::default(),
+                &options,
+                0,
+                2,
+                &telemetry,
+            ),
+            Admit::Fed
+        );
+        let mut outbound = Vec::new();
+        owner.poll_outbound(Timestamp::default(), &mut outbound);
+        for (_, packet) in outbound {
+            caller
+                .feed_recv_buf(&packet, Timestamp::from_micros(1))
+                .expect("induction response");
+        }
+        let conclusion = next_packet(&mut caller);
+        let (owner_tx, owner_rx) = std::sync::mpsc::channel();
+        let (foreign_tx, _foreign_rx) = std::sync::mpsc::channel();
+        let called = AtomicBool::new(false);
+        let mut foreign = PeerTable::new();
+        assert_eq!(
+            foreign.admit_and_forward_with_resolver(
+                peer,
+                &conclusion,
+                Timestamp::from_micros(2),
+                &options,
+                1,
+                &[owner_tx, foreign_tx],
+                &telemetry,
+                |_| {
+                    called.store(true, AtomicOrdering::Relaxed);
+                    AdmissionResolution::Accept
+                },
+            ),
+            Admit::ForwardTo(0)
+        );
+        assert!(!called.load(AtomicOrdering::Relaxed));
+        assert!(matches!(
+            owner_rx.recv().expect("forwarded handshake"),
+            WorkerMessage::Handshake { peer: message_peer, .. } if message_peer == peer
+        ));
+    }
+
+    #[test]
+    fn failed_cookie_route_delivery_is_observable() {
+        let peer = "127.0.0.1:10016".parse().expect("address");
+        let options = AdmissionOptions::basic(0x2222, 0, true);
+        let telemetry = IngressTelemetry::new();
+        let mut owner = PeerTable::new();
+        let mut caller = SrtConnection::new_caller(ConnectionOptions {
+            socket_id: 0x1111,
+            ..ConnectionOptions::default()
+        });
+        caller.connect(Timestamp::default()).expect("start caller");
+        let _ = owner.admit(
+            peer,
+            &next_packet(&mut caller),
+            Timestamp::default(),
+            &options,
+            0,
+            2,
+            &telemetry,
+        );
+        let mut outbound = Vec::new();
+        owner.poll_outbound(Timestamp::default(), &mut outbound);
+        for (_, packet) in outbound {
+            caller
+                .feed_recv_buf(&packet, Timestamp::from_micros(1))
+                .expect("induction response");
+        }
+        let conclusion = next_packet(&mut caller);
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+        drop(closed_rx);
+        let (foreign_tx, _foreign_rx) = std::sync::mpsc::channel();
+        let mut foreign = PeerTable::new();
+        assert_eq!(
+            foreign.admit_and_forward_with_resolver(
+                peer,
+                &conclusion,
+                Timestamp::from_micros(2),
+                &options,
+                1,
+                &[closed_tx, foreign_tx],
+                &telemetry,
+                |_| AdmissionResolution::Accept,
+            ),
+            Admit::Dropped(AdmissionDropReason::StaleConclusion)
+        );
+        assert_eq!(telemetry.snapshot().cookie_route_failures, 1);
+    }
+
+    #[test]
+    fn rejection_reason_reserves_a_bounded_application_range() {
+        assert_eq!(
+            RejectionReason::application(0).map(RejectionReason::get),
+            Some(2000)
+        );
+        assert_eq!(
+            RejectionReason::application(999).map(RejectionReason::get),
+            Some(2999)
+        );
+        assert_eq!(RejectionReason::application(1000), None);
     }
 
     #[test]
