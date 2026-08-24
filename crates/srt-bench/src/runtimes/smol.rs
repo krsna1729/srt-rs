@@ -48,7 +48,7 @@
 //! ORPHAN_CONCLUSION_COUNT -- cookie-keyed handshake routing is the fix
 //! for that, and is not implemented yet.
 
-use crate::{Aggregate, BondMode, ConnStats, LossConfig};
+use crate::{Aggregate, BenchConfig, BondMode, ConnStats};
 use shiguredo_srt::{
     ConnectionEvent, ConnectionOptions, GroupExtensionData, GroupType, SRTGROUP_MASK, SrtConnection,
 };
@@ -79,40 +79,17 @@ fn promote_locally(
     Some(Conn::new(conn, sock))
 }
 
-pub fn run(cfg: LossConfig) {
-    if cfg.mode == crate::Mode::Receiver
-        && cfg.connections > 1
-        && let crate::Ingress::ReuseportMulti(k) = cfg.ingress
-        && k > 1
-    {
-        return run_reuseport_multi(cfg, k);
-    }
-    if cfg.mode == crate::Mode::Receiver
-        && cfg.connections > 1
-        && let crate::Ingress::SharedPool(k) = cfg.ingress
-        && k > 1
-    {
-        return run_shared_pool(cfg, k);
-    }
-    if cfg.mode == crate::Mode::Receiver
-        && cfg.connections > 1
-        && let crate::Ingress::ReuseportSingle { workers } = cfg.ingress
-        && workers >= 1
-    {
-        return run_reuseport_single(cfg, workers);
+pub fn run(cfg: BenchConfig) {
+    if crate::dispatch_ingress(
+        &cfg,
+        "smol",
+        run_reuseport_multi,
+        run_shared_pool,
+        run_reuseport_single,
+    ) {
+        return;
     }
     let start = Instant::now();
-    if cfg.mode == crate::Mode::Receiver {
-        // Before any worker starts: the harness waits on this line.
-        println!("LISTENING");
-        if cfg.connections > 1 {
-            eprintln!(
-                "[bench-smol] scale: ports {}-{}",
-                cfg.port,
-                cfg.port + cfg.connections as u16 - 1
-            );
-        }
-    }
 
     let stats = crate::run_workers(&cfg, move |cfg, mine| smol::block_on(drive(cfg, mine, start)));
 
@@ -127,7 +104,7 @@ pub fn run(cfg: LossConfig) {
 }
 
 /// Drive one worker's share of the connections on this thread's runtime.
-async fn drive(cfg: LossConfig, mine: Vec<usize>, start: Instant) -> Vec<crate::ConnStats> {
+async fn drive(cfg: BenchConfig, mine: Vec<usize>, start: Instant) -> Vec<crate::ConnStats> {
     let ex = async_executor::LocalExecutor::new();
     let mut handles = Vec::with_capacity(mine.len());
     for i in mine {
@@ -156,7 +133,7 @@ async fn drive(cfg: LossConfig, mine: Vec<usize>, start: Instant) -> Vec<crate::
 /// group id, so a run can prove the reuseport receiver's registry/handoff
 /// path actually fires. Sender-only -- the listener learns the group (and
 /// its type) from the caller's handshake extension.
-fn bond_extension_for(cfg: &LossConfig, i: usize) -> Option<GroupExtensionData> {
+fn bond_extension_for(cfg: &BenchConfig, i: usize) -> Option<GroupExtensionData> {
     if cfg.bond_mode == BondMode::None || i >= cfg.bond_pairs * 2 {
         return None;
     }
@@ -174,7 +151,7 @@ fn bond_extension_for(cfg: &LossConfig, i: usize) -> Option<GroupExtensionData> 
 }
 
 async fn sender_task(
-    cfg: LossConfig,
+    cfg: BenchConfig,
     index: usize,
     endpoint: SocketAddr,
     start: Instant,
@@ -311,7 +288,7 @@ async fn sender_task(
     stats
 }
 
-async fn receiver_task(cfg: LossConfig, listen_port: u16, start: Instant) -> ConnStats {
+async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> ConnStats {
     let socket = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], listen_port))).expect("bind");
 
     let options = ConnectionOptions {
@@ -426,7 +403,7 @@ async fn receiver_task(cfg: LossConfig, listen_port: u16, start: Instant) -> Con
 // tasks for steady state.
 // ---------------------------------------------------------------------------
 
-fn run_reuseport_multi(cfg: LossConfig, k: usize) {
+fn run_reuseport_multi(cfg: BenchConfig, k: usize) {
     let worker_count = k.min(cfg.connections);
     let start = Instant::now();
     println!("LISTENING");
@@ -498,7 +475,7 @@ fn run_reuseport_multi(cfg: LossConfig, k: usize) {
 /// explanation). Only a leg that actually needs to relocate gets spawned
 /// as its own task on the owner's executor, via a handoff.
 async fn run_acceptor(
-    cfg: LossConfig,
+    cfg: BenchConfig,
     worker_index: usize,
     start: Instant,
     router: crate::SharedWorkerRouter,
@@ -787,7 +764,7 @@ fn relocate_to_owner(
 /// running as its own task on the owner's executor -- same as the
 /// `PerPort` path above, just fed a socket that admission already
 /// connected instead of discovering the peer itself.
-async fn established_conn_task(mut driver: Conn, cfg: LossConfig, start: Instant) -> ConnStats {
+async fn established_conn_task(mut driver: Conn, cfg: BenchConfig, start: Instant) -> ConnStats {
     // `connected` is live state, used only for the loop-exit check below
     // (it flips false on Disconnected). The task is only ever spawned
     // post-promotion (Connected has already fired), so it was *always*
@@ -873,7 +850,7 @@ async fn established_conn_task(mut driver: Conn, cfg: LossConfig, start: Instant
 /// measured against: it isolates "fewer sockets and wakeups" from
 /// "kernel-level demux", which is `ReuseportMulti`'s job. Single-threaded
 /// by design, so any win here is not just extra cores.
-fn run_shared_pool(cfg: LossConfig, k: usize) {
+fn run_shared_pool(cfg: BenchConfig, k: usize) {
     let start = Instant::now();
     println!("LISTENING");
     let agg_cfg = cfg.clone();
@@ -913,7 +890,7 @@ fn run_shared_pool(cfg: LossConfig, k: usize) {
 }
 
 /// One pool socket, from bind to the last peer going terminal.
-async fn serve_pool_socket(cfg: LossConfig, index: usize, start: Instant) -> Vec<ConnStats> {
+async fn serve_pool_socket(cfg: BenchConfig, index: usize, start: Instant) -> Vec<ConnStats> {
     let addr = SocketAddr::new(
         std::net::IpAddr::from([0, 0, 0, 0]),
         cfg.port + index as u16,
@@ -1032,7 +1009,7 @@ fn admit_one(
 /// mid-handshake stranding that `ReuseportMulti` needs cookie routing to
 /// survive cannot arise here. The cost is that every connection has to
 /// move, so every one is promoted, which is the tradeoff being measured.
-fn run_reuseport_single(cfg: LossConfig, workers: usize) {
+fn run_reuseport_single(cfg: BenchConfig, workers: usize) {
     let worker_count = workers.min(cfg.connections).max(1);
     let start = Instant::now();
     println!("LISTENING");
@@ -1084,7 +1061,7 @@ fn run_reuseport_single(cfg: LossConfig, workers: usize) {
 /// The single acceptor: admit every flow, route each to a worker as soon
 /// as it is established.
 async fn run_single_acceptor(
-    cfg: &LossConfig,
+    cfg: &BenchConfig,
     start: Instant,
     router: &crate::SharedWorkerRouter,
     senders: &[mpsc::Sender<WorkerMessage>],
@@ -1195,7 +1172,7 @@ async fn run_single_acceptor(
 
 /// One worker: drive whatever the acceptor hands it, to completion.
 async fn run_pool_worker(
-    cfg: LossConfig,
+    cfg: BenchConfig,
     start: Instant,
     handoffs: mpsc::Receiver<WorkerMessage>,
     ex: &async_executor::LocalExecutor<'_>,

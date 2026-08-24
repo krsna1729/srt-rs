@@ -133,7 +133,7 @@ pub enum Mode {
 
 /// Fully-parsed configuration for one bench process invocation.
 #[derive(Clone, Debug)]
-pub struct LossConfig {
+pub struct BenchConfig {
     pub runtime: Runtime,
     pub mode: Mode,
     /// Sender only: destination host.
@@ -344,14 +344,14 @@ impl Link {
     }
 }
 
-/// See [`LossConfig::batching`].
+/// See [`BenchConfig::batching`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Batching {
     On,
     Off,
 }
 
-/// Listener ingress topology. See [`LossConfig::ingress`].
+/// Listener ingress topology. See [`BenchConfig::ingress`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ingress {
     PerPort,
@@ -362,11 +362,11 @@ pub enum Ingress {
 
 /// The promotion ladder is admission policy, so it lives beside
 /// `WorkerRouter` in srt-lifecycle rather than here; re-exported so
-/// `LossConfig` and the runtime adapters can name it unqualified.
+/// `BenchConfig` and the runtime adapters can name it unqualified.
 pub use srt_lifecycle::{Promotion, PromotionDecision};
 
 /// Bond group type to advertise in the sender's handshake extension. See
-/// [`LossConfig::bond_mode`].
+/// [`BenchConfig::bond_mode`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BondMode {
     None,
@@ -384,7 +384,7 @@ pub enum BondMode {
 pub type SharedWorkerRouter =
     std::sync::Arc<std::sync::Mutex<srt_lifecycle::WorkerRouter<std::net::SocketAddr>>>;
 
-impl LossConfig {
+impl BenchConfig {
     /// Destination/bind address for connection i.
     pub fn addr_for(&self, i: usize) -> std::net::SocketAddr {
         use std::net::{IpAddr, SocketAddr};
@@ -464,6 +464,64 @@ where
         .collect()
 }
 
+/// Dispatch a receiver's ingress strategy before falling through to the
+/// PerPort path, and announce readiness once it is known that PerPort is
+/// the path being taken.
+///
+/// All five async runtime adapters need exactly this: decide among
+/// SharedPool / ReuseportMulti / ReuseportSingle, and otherwise print
+/// `LISTENING` (plus the port range on stderr) before starting PerPort.
+/// Only the three strategy functions differ, and they differ only because
+/// each owns its own socket/executor type -- the decision itself is pure
+/// `BenchConfig` inspection with nothing runtime-specific in it, so this
+/// was a byte-identical 32-line block copied into all five. (mio is not
+/// among them: its dispatch is shaped differently -- a `match` rather
+/// than chained `if let`, with its own per-strategy sender-side
+/// `eprintln!`s -- consistent with it being a different I/O model
+/// throughout, not an oversight.)
+///
+/// Each strategy function prints its own `LISTENING` once it actually
+/// starts listening, so this only prints it on the `false` (PerPort)
+/// return -- the caller's cue to continue past this call rather than
+/// return immediately.
+pub fn dispatch_ingress(
+    cfg: &BenchConfig,
+    tag: &str,
+    reuseport_multi: impl FnOnce(BenchConfig, usize),
+    shared_pool: impl FnOnce(BenchConfig, usize),
+    reuseport_single: impl FnOnce(BenchConfig, usize),
+) -> bool {
+    if cfg.mode == Mode::Receiver && cfg.connections > 1 {
+        match cfg.ingress {
+            Ingress::ReuseportMulti(k) if k > 1 => {
+                reuseport_multi(cfg.clone(), k);
+                return true;
+            }
+            Ingress::SharedPool(k) if k > 1 => {
+                shared_pool(cfg.clone(), k);
+                return true;
+            }
+            Ingress::ReuseportSingle { workers } if workers >= 1 => {
+                reuseport_single(cfg.clone(), workers);
+                return true;
+            }
+            _ => {}
+        }
+    }
+    if cfg.mode == Mode::Receiver {
+        // Before any worker starts: the harness waits on this line.
+        println!("LISTENING");
+        if cfg.connections > 1 {
+            eprintln!(
+                "[bench-{tag}] scale: ports {}-{}",
+                cfg.port,
+                cfg.port + cfg.connections as u16 - 1
+            );
+        }
+    }
+    false
+}
+
 /// Spread `cfg.connections` across `cfg.workers` OS threads, each running
 /// `body` with the connection indices it owns, and collect every
 /// connection's stats.
@@ -472,9 +530,9 @@ where
 /// workload whose cost varies with connection index spreads evenly.
 /// `workers == 1` runs inline, which keeps the single-threaded case free
 /// of an extra thread and its join.
-pub fn run_workers<F>(cfg: &LossConfig, body: F) -> Vec<ConnStats>
+pub fn run_workers<F>(cfg: &BenchConfig, body: F) -> Vec<ConnStats>
 where
-    F: Fn(LossConfig, Vec<usize>) -> Vec<ConnStats> + Send + Sync + 'static,
+    F: Fn(BenchConfig, Vec<usize>) -> Vec<ConnStats> + Send + Sync + 'static,
 {
     let workers = cfg.workers.clamp(1, cfg.connections.max(1));
     let indices = |w: usize| -> Vec<usize> { (w..cfg.connections).step_by(workers).collect() };
@@ -498,7 +556,7 @@ where
 }
 
 pub struct Aggregate {
-    pub config: LossConfig,
+    pub config: BenchConfig,
     pub data_events: u64,
     /// Connections that ended mid-stream rather than by the sender's
     /// ordered close -- see [`ConnStats::torn_down`].
@@ -512,7 +570,7 @@ pub struct Aggregate {
 }
 
 impl Aggregate {
-    pub fn new(config: LossConfig) -> Self {
+    pub fn new(config: BenchConfig) -> Self {
         Self {
             config,
             data_events: 0,
@@ -629,8 +687,8 @@ impl Aggregate {
     }
 }
 
-/// Parse the unified CLI into a LossConfig, exiting on bad usage.
-pub fn bench_config_from_args() -> LossConfig {
+/// Parse the unified CLI into a BenchConfig, exiting on bad usage.
+pub fn bench_config_from_args() -> BenchConfig {
     fn usage() -> ! {
         eprintln!(
             "usage: srt-bench runtime=<mio|tokio|smol|monoio|glommio|compio> \
@@ -867,7 +925,7 @@ pub fn bench_config_from_args() -> LossConfig {
         .map(std::path::PathBuf::from);
     let rep = cli.flag_or("rep", 1usize);
 
-    LossConfig {
+    BenchConfig {
         runtime,
         mode,
         host,

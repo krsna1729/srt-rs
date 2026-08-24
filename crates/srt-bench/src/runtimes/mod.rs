@@ -111,7 +111,7 @@ pub mod monoio;
 pub mod smol;
 pub mod tokio;
 
-use crate::{LossConfig, Runtime};
+use crate::{BenchConfig, Runtime};
 
 /// Dispatch to the selected runtime's driver.
 /// Exit code for "this runtime does not implement that ingress
@@ -135,7 +135,7 @@ pub fn ingress_supported(runtime: Runtime, ingress: crate::Ingress) -> bool {
     true
 }
 
-pub fn run(cfg: LossConfig) {
+pub fn run(cfg: BenchConfig) {
     // Receivers are what bind; a sender just dials whatever the topology
     // says, so it needs no capability of its own.
     if cfg.mode == crate::Mode::Receiver
@@ -169,6 +169,6 @@ pub fn run(cfg: LossConfig) {
 }
 
 /// Destination address of a sender connection i.
-pub fn sender_endpoint(cfg: &LossConfig, i: usize) -> std::net::SocketAddr {
+pub fn sender_endpoint(cfg: &BenchConfig, i: usize) -> std::net::SocketAddr {
     cfg.addr_for(i)
 }

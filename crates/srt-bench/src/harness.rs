@@ -12,7 +12,7 @@
 //! straight into `cut`/`sort`/a spreadsheet when someone wants to look at
 //! it by hand.
 
-use crate::{Batching, Ingress, LossConfig, Mode};
+use crate::{Batching, BenchConfig, Ingress, Mode};
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::Path;
@@ -79,7 +79,7 @@ pub fn describe_ingress(ingress: Ingress) -> String {
 }
 
 #[must_use]
-fn describe_bond(cfg: &LossConfig) -> String {
+fn describe_bond(cfg: &BenchConfig) -> String {
     match cfg.bond_mode {
         crate::BondMode::None => "none".to_string(),
         crate::BondMode::Broadcast => format!("broadcast:{}", cfg.bond_pairs),
@@ -115,7 +115,7 @@ impl Record {
 /// invocation with no knowledge of its siblings.
 pub fn append_result(
     path: &Path,
-    cfg: &LossConfig,
+    cfg: &BenchConfig,
     rep: usize,
     established: u64,
     torn_down: u64,

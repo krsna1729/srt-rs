@@ -3,7 +3,7 @@
 //! `ManualTimerStore` inside Conn). Connection i lives on port + i, each
 //! registered with Token(i).
 
-use crate::{Aggregate, BondMode, ConnStats, LossConfig};
+use crate::{Aggregate, BenchConfig, BondMode, ConnStats};
 use mio::net::UdpSocket;
 use mio::{Events, Interest, Poll, Token};
 use shiguredo_srt::{
@@ -28,7 +28,7 @@ const TIMER_TICK: Duration = Duration::from_millis(10);
 /// Drain one socket for admission, calling `on_datagram(peer, data)` for
 /// each queued datagram -- either batched (`recvmmsg`, one syscall for up
 /// to `admit_bufs.len()` datagrams) or one `recv_from` syscall per
-/// datagram, per `LossConfig::batching`. This is the axis `Batching`
+/// datagram, per `BenchConfig::batching`. This is the axis `Batching`
 /// exists to let a run select: isolating whatever win (or lack of one)
 /// batched admission gives at a given fan-in level from every other
 /// variable. Shared by every ingress strategy that has a socket serving
@@ -96,14 +96,14 @@ struct Driver {
 /// `poll` under `Token(i)`. Split out from `run`'s setup loop so it can be
 /// called both to prime the initial batch and, for senders, to backfill
 /// one at a time as `connect_concurrency` allows -- see
-/// `LossConfig::connect_concurrency`'s doc for why senders don't just
+/// `BenchConfig::connect_concurrency`'s doc for why senders don't just
 /// create everything upfront.
 /// `i` identifies the *connection* (its port, its bond group); `token`
 /// is its slot in this worker's `drivers` vec. They differ once
 /// `--workers` shards connections across threads, and conflating them
 /// would dispatch a readiness event to the wrong driver.
 fn spawn_driver(
-    cfg: &LossConfig,
+    cfg: &BenchConfig,
     poll: &mut Poll,
     start: Instant,
     i: usize,
@@ -179,7 +179,7 @@ fn spawn_driver(
     }
 }
 
-pub fn run(cfg: LossConfig) {
+pub fn run(cfg: BenchConfig) {
     let start = Instant::now();
     if cfg.mode == crate::Mode::Receiver {
         println!("LISTENING");
@@ -248,7 +248,7 @@ pub fn run(cfg: LossConfig) {
 }
 
 /// Drive one worker's share of the connections on its own `Poll`.
-fn drive(cfg: LossConfig, mine: Vec<usize>, start: Instant) -> Vec<ConnStats> {
+fn drive(cfg: BenchConfig, mine: Vec<usize>, start: Instant) -> Vec<ConnStats> {
     let mut poll = Poll::new().expect("mio Poll::new");
     let mut events = Events::with_capacity(4096);
 
@@ -257,7 +257,7 @@ fn drive(cfg: LossConfig, mine: Vec<usize>, start: Instant) -> Vec<ConnStats> {
     // socket must exist before its sender's first packet can arrive), so
     // create all of them upfront. Senders: prime up to `connect_concurrency`
     // and let the main loop below backfill the rest as earlier connections
-    // finish handshaking -- see `LossConfig::connect_concurrency`'s doc.
+    // finish handshaking -- see `BenchConfig::connect_concurrency`'s doc.
     let priming = match cfg.mode {
         crate::Mode::Receiver => mine.len(),
         crate::Mode::Sender => cfg.connect_concurrency.min(mine.len()),
@@ -300,7 +300,7 @@ fn drive(cfg: LossConfig, mine: Vec<usize>, start: Instant) -> Vec<ConnStats> {
 
         // Backfill: start the next connection(s) once earlier ones have
         // connected and freed up room under `connect_concurrency` -- see
-        // `LossConfig::connect_concurrency`'s doc. No-op for receivers
+        // `BenchConfig::connect_concurrency`'s doc. No-op for receivers
         // (primed with everything upfront) and once every connection has
         // been started.
         //
@@ -542,7 +542,7 @@ fn drive(cfg: LossConfig, mine: Vec<usize>, start: Instant) -> Vec<ConnStats> {
 /// promotion cost." Receiver-only: a sender just dials the port
 /// `addr_for` already computes for it and otherwise behaves exactly like
 /// `PerPort` (own local socket per connection, connected to one peer).
-fn run_shared_pool(cfg: LossConfig, k: usize) {
+fn run_shared_pool(cfg: BenchConfig, k: usize) {
     let start = Instant::now();
     let agg_cfg = cfg.clone();
     // K pool sockets across `--workers` OS threads, each with its own
@@ -573,7 +573,7 @@ fn run_shared_pool(cfg: LossConfig, k: usize) {
 /// `mine` names the *pool* sockets this worker owns; inside, sockets are
 /// addressed by their position in `sockets`, which is what the poll token
 /// carries. The two only coincide when there is a single worker.
-fn run_shared_pool_shard(cfg: &LossConfig, mine: &[usize], start: Instant) -> Vec<ConnStats> {
+fn run_shared_pool_shard(cfg: &BenchConfig, mine: &[usize], start: Instant) -> Vec<ConnStats> {
     let mut poll = Poll::new().expect("mio Poll::new");
     let mut events = Events::with_capacity(1024);
 
@@ -866,7 +866,7 @@ fn drain_conn_outputs(
 /// 58/159/106). It was pacing something that was not the cause, and it
 /// left this backend as the only one whose promotion timing differed
 /// from the other five.
-fn run_pool_receiver(cfg: LossConfig, k: usize) {
+fn run_pool_receiver(cfg: BenchConfig, k: usize) {
     use std::sync::mpsc;
 
     let worker_count = k.min(cfg.connections);
@@ -921,7 +921,7 @@ fn run_pool_receiver(cfg: LossConfig, k: usize) {
 }
 
 fn run_pool_acceptor(
-    cfg: LossConfig,
+    cfg: BenchConfig,
     worker_index: usize,
     start: Instant,
     router: crate::SharedWorkerRouter,
@@ -1050,7 +1050,7 @@ fn run_pool_acceptor(
             match event.token().0 {
                 0 => {
                     // Admission path: batched (recvmmsg) or per-datagram
-                    // per LossConfig::batching -- see drain_admission.
+                    // per BenchConfig::batching -- see drain_admission.
                     drain_admission(
                         &listener,
                         cfg.batching,
@@ -1390,7 +1390,7 @@ fn slots_to_stats(slots: Vec<PoolSlot>) -> Vec<ConnStats> {
 // common non-bonded case.
 // ---------------------------------------------------------------------------
 
-fn run_reuseport_single(cfg: LossConfig, workers: usize) {
+fn run_reuseport_single(cfg: BenchConfig, workers: usize) {
     let worker_count = workers.min(cfg.connections).max(1);
     let start = Instant::now();
     let router: crate::SharedWorkerRouter =
@@ -1451,7 +1451,7 @@ fn run_reuseport_single(cfg: LossConfig, workers: usize) {
 /// admission winds down, so a worker can distinguish "no more are coming"
 /// from "none have arrived yet" instead of guessing off a wall clock.
 fn run_single_acceptor(
-    cfg: &LossConfig,
+    cfg: &BenchConfig,
     start: Instant,
     router: &crate::SharedWorkerRouter,
     senders: &[mpsc::Sender<WorkerMessage>],
@@ -1632,7 +1632,7 @@ fn route_to_worker(
 /// the acceptor's job in this strategy, unlike `ReuseportMulti` where
 /// acceptor and worker are the same thread.
 fn run_worker(
-    cfg: LossConfig,
+    cfg: BenchConfig,
     worker_index: usize,
     start: Instant,
     handoffs: mpsc::Receiver<WorkerMessage>,
