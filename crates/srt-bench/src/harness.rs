@@ -998,7 +998,22 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
                     netem_args(|f| cell_link(cell, f)).map_err(std::io::Error::other)?,
                 )?;
             }
-            let port = free_port_range(ports_needed)?;
+            // A per-port cell at the top of the sweep can legitimately ask
+            // for more descriptors than this process may hold while probing
+            // the range (the full plan reaches 1200 connections). Treat that
+            // as an unavailable resource cell and continue the sweep so one
+            // impossible topology does not hide every pooled result after it.
+            let port = match free_port_range(ports_needed) {
+                Ok(port) => port,
+                Err(error) => {
+                    skipped += 1;
+                    eprintln!(
+                        "[skip] {} (port allocation failed: {error})",
+                        label.join(" ")
+                    );
+                    continue;
+                }
+            };
             // Each role gets the axes scoped to it plus the shared ones.
             // Both roles additionally get every split axis's *other* side
             // as a record-only `--recv-*`/`--send-*` flag, so a single row
