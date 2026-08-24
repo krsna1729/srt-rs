@@ -808,14 +808,21 @@ async fn established_conn_task(mut driver: Conn, cfg: BenchConfig, start: Instan
 
     loop {
         let now = Instant::now();
-        if srt_lifecycle::is_terminal(
-            connected,
-            Some(stream_deadline),
-            last_data_at,
-            now,
-            now,
-            IDLE_GRACE,
-        ) {
+        // Also honour the harness's stop signal directly, not just via
+        // `!connected` from a received Disconnected -- the sender's
+        // ordered close should reach this task through the protocol, but
+        // if it doesn't (or races), this task should not be the reason a
+        // whole cell hangs well past its backstop.
+        if crate::shutdown::requested()
+            || srt_lifecycle::is_terminal(
+                connected,
+                Some(stream_deadline),
+                last_data_at,
+                now,
+                now,
+                IDLE_GRACE,
+            )
+        {
             break;
         }
 
@@ -1217,7 +1224,7 @@ async fn run_pool_worker(
 
     // Stop once the acceptor's tally is in and all of them have arrived;
     // the deadline is only a backstop against a wedged acceptor.
-    while Instant::now() < deadline {
+    while Instant::now() < deadline && !crate::shutdown::requested() {
         while let Ok(message) = handoffs.try_recv() {
             match message {
                 WorkerMessage::Finished { total } => expected = Some(total),
