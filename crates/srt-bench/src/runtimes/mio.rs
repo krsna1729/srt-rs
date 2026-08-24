@@ -423,8 +423,12 @@ fn drive(cfg: LossConfig, mine: Vec<usize>, start: Instant) -> Vec<ConnStats> {
                 match ev {
                     ConnectionEvent::Connected => {
                         d.connected = true;
-                        d.stream_deadline =
-                            Some(Instant::now() + Duration::from_secs_f64(cfg.duration_secs));
+                        // Set once; see the async adapters for why a
+                        // duplicate `Connected` must not extend it.
+                        if d.stream_deadline.is_none() {
+                            d.stream_deadline =
+                                Some(Instant::now() + Duration::from_secs_f64(cfg.duration_secs));
+                        }
                         if cfg.verbose() {
                             println!("CONNECTED");
                         } else {
@@ -445,7 +449,14 @@ fn drive(cfg: LossConfig, mine: Vec<usize>, start: Instant) -> Vec<ConnStats> {
                 }
             }
 
-            if d.connected && cfg.mode == crate::Mode::Sender {
+            // Gate on THIS connection's deadline. Without it a driver
+            // keeps streaming until every other driver is done too --
+            // and with staggered connects that is seconds of extra load,
+            // recorded as the sender offering more than was configured.
+            let past_deadline = d
+                .stream_deadline
+                .is_some_and(|dl| Instant::now() >= dl);
+            if d.connected && cfg.mode == crate::Mode::Sender && !past_deadline {
                 // Sample the clock ONCE: this loop must drain only what pacing
                 // says is due at instant `t`. Re-reading it per iteration makes
                 // the condition self-fulfilling -- each `send_paced` awaits a
@@ -469,6 +480,17 @@ fn drive(cfg: LossConfig, mine: Vec<usize>, start: Instant) -> Vec<ConnStats> {
                     }
                 }
             }
+        }
+    }
+
+    // Ordered close at the protocol level: an SRT SHUTDOWN tells the
+    // listener the stream ended (and makes it flush its receive buffer
+    // ignoring TSBPD) instead of leaving it to infer silence.
+    if cfg.mode == crate::Mode::Sender {
+        let t = crate::now_ts(start);
+        for d in &mut drivers {
+            d.conn.conn.disconnect(t);
+            let _ = d.conn.drain_outputs(t);
         }
     }
 

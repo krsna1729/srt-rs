@@ -248,8 +248,14 @@ async fn sender_task(
                     if cfg.verbose() {
                         println!("CONNECTED");
                     }
-                    stream_deadline =
-                        Some(Instant::now() + Duration::from_secs_f64(cfg.duration_secs));
+                    // Set once. A duplicate `Connected` -- a re-completed
+                    // handshake under load -- would otherwise push the
+                    // deadline out another full duration, and the run
+                    // would quietly offer more than the configured load.
+                    if stream_deadline.is_none() {
+                        stream_deadline =
+                            Some(Instant::now() + Duration::from_secs_f64(cfg.duration_secs));
+                    }
                 }
                 ConnectionEvent::Disconnected { reason } => {
                     eprintln!("[bench-smol] disconnected: {reason}");
@@ -262,7 +268,11 @@ async fn sender_task(
             }
         }
 
-        if stats.connected {
+        // The top-of-loop deadline check passed some work ago; time has
+        // moved since. Re-check at the send site or the connection keeps
+        // streaming past its window, which shows up as offering more load
+        // than was configured.
+        if stats.connected && !crate::shutdown::past(stream_deadline) {
             // Sample the clock ONCE: this loop must drain only what pacing
             // says is due at instant `t`. Re-reading it per iteration makes
             // the condition self-fulfilling -- each `send_paced` awaits a
@@ -282,6 +292,15 @@ async fn sender_task(
         }
     }
 
+    // Ordered close at the protocol level: tell the peer we are done
+    // instead of just vanishing. `disconnect` emits an SRT SHUTDOWN,
+    // which on the listener flushes its receive buffer *ignoring TSBPD*
+    // and raises `Disconnected { peer shutdown }` -- so pending data is
+    // delivered rather than aged out, and the listener learns the stream
+    // ended instead of inferring it from five seconds of silence.
+    let t = crate::now_ts(start);
+    driver.conn.disconnect(t);
+    driver.drain_outputs(t).await;
     if let Some(s) = driver.conn.sender_stats() {
         stats.has_stats = true;
         stats.core_total = s.total_sent;
@@ -366,8 +385,14 @@ async fn receiver_task(cfg: LossConfig, listen_port: u16, start: Instant) -> Con
                     if cfg.verbose() {
                         println!("CONNECTED");
                     }
-                    stream_deadline =
-                        Some(Instant::now() + Duration::from_secs_f64(cfg.duration_secs));
+                    // Set once. A duplicate `Connected` -- a re-completed
+                    // handshake under load -- would otherwise push the
+                    // deadline out another full duration, and the run
+                    // would quietly offer more than the configured load.
+                    if stream_deadline.is_none() {
+                        stream_deadline =
+                            Some(Instant::now() + Duration::from_secs_f64(cfg.duration_secs));
+                    }
                 }
                 ConnectionEvent::DataReceived { .. } => {
                     stats.data_events += 1;

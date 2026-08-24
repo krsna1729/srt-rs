@@ -352,18 +352,34 @@ pub fn report(results: &[Record], group_by: &[String]) -> String {
 
     for key in keys {
         let cells: Vec<&Record> = results.iter().filter(|r| key_of(r) == key).collect();
-        let listeners: Vec<&&Record> = cells
-            .iter()
-            .filter(|r| r.get("role") == Some("listener"))
-            .collect();
-        let callers: Vec<&&Record> = cells
-            .iter()
-            .filter(|r| r.get("role") == Some("caller"))
-            .collect();
+
+        // Pair the two roles per rep instead of averaging each side
+        // independently. A run interrupted mid-cell leaves a caller row
+        // with no listener row, and resume only counts listener rows, so
+        // re-running appends a *second* caller row. Medianing the two
+        // sides separately then divides a complete listener figure by the
+        // median of one complete and one truncated caller -- which is how
+        // a delivery rate of 139% appeared. Later rows win, the file
+        // being append-only, and a rep missing either side is dropped.
+        let mut paired: std::collections::BTreeMap<String, (Option<&Record>, Option<&Record>)> =
+            std::collections::BTreeMap::new();
+        for r in &cells {
+            let rep = r.get("rep").unwrap_or("1").to_string();
+            let slot = paired.entry(rep).or_default();
+            match r.get("role") {
+                Some("caller") => slot.0 = Some(r),
+                Some("listener") => slot.1 = Some(r),
+                _ => {}
+            }
+        }
+        let (callers, listeners): (Vec<&Record>, Vec<&Record>) = paired
+            .values()
+            .filter_map(|(c, l)| Some((*c.as_ref()?, *l.as_ref()?)))
+            .unzip();
         if listeners.is_empty() {
             continue;
         }
-        let med = |rs: &[&&Record], col: &str| -> f64 {
+        let med = |rs: &[&Record], col: &str| -> f64 {
             median(rs.iter().filter_map(|r| r.number(col)).collect())
         };
         let recv = med(&listeners, "core_total");
@@ -389,8 +405,13 @@ pub fn report(results: &[Record], group_by: &[String]) -> String {
                 "--".to_string()
             }
         };
-        // Retransmits are not offered load; they are the same bytes again.
-        let offered = (sent - med(&callers, "sec_a")).max(0.0);
+        // `sent` is `SenderBuffer::total_sent`, which counts a packet when
+        // it is first queued and is NOT incremented by `pop_retransmit`.
+        // Retransmits are already excluded, so subtracting them again
+        // double-counts -- and where loss was heavy enough that retransmits
+        // exceeded originals it floored the figure at zero, reporting a
+        // sender that offered nothing while it sent two million packets.
+        let offered = sent;
         // CPU is the whole pipeline's cost, so both sides count.
         let cpu = (med(&listeners, "cpu_user_ms")
             + med(&listeners, "cpu_sys_ms")
@@ -556,9 +577,17 @@ fn recorded_as(axis: &str, value: &str) -> (&'static str, String) {
         "bond" => ("bond", value.to_string()),
         "bitrate" => ("bitrate", value.to_string()),
         "pin" => ("pin", value.to_string()),
+        // `off` is how a plan or CLI spells "no emulation"; the process
+        // records that as an empty cell. Normalise here so a cell's key
+        // and its recorded row agree -- they did not, which silently
+        // disabled resume for every sweep once link axes existed.
         link if link.starts_with("link-") => (
             Box::leak(link.replace('-', "_").into_boxed_str()),
-            value.to_string(),
+            if value == "off" {
+                String::new()
+            } else {
+                value.to_string()
+            },
         ),
         other => (
             Box::leak(other.to_string().into_boxed_str()),
@@ -776,17 +805,27 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
     // Resume: a sweep of this size will be interrupted at some point, and
     // re-running completed cells wastes hours and mixes measurement
     // windows. Anything already in the output file is skipped.
-    let done: std::collections::HashSet<String> = read_results(&out)
-        .unwrap_or_default()
-        .iter()
-        .filter(|r| r.get("role") == Some("listener"))
-        .filter_map(|r| {
-            let rep: usize = r.number("rep")? as usize;
-            cells
-                .iter()
-                .find_map(|cell| record_key(r, cell, rep).filter(|k| *k == cell_key(cell, rep)))
-        })
-        .collect();
+    // A cell counts as done only when BOTH roles recorded a row. Keying
+    // on the listener alone meant a run interrupted mid-cell left an
+    // orphan caller row, was re-run, and appended a second caller row for
+    // the same cell -- two senders, one listener, and any statistic over
+    // them silently wrong.
+    let recorded = read_results(&out).unwrap_or_default();
+    let keys_for = |role: &str| -> std::collections::HashSet<String> {
+        recorded
+            .iter()
+            .filter(|r| r.get("role") == Some(role))
+            .filter_map(|r| {
+                let rep: usize = r.number("rep")? as usize;
+                cells
+                    .iter()
+                    .find_map(|cell| record_key(r, cell, rep).filter(|k| *k == cell_key(cell, rep)))
+            })
+            .collect()
+    };
+    let (listener_keys, caller_keys) = (keys_for("listener"), keys_for("caller"));
+    let done: std::collections::HashSet<String> =
+        listener_keys.intersection(&caller_keys).cloned().collect();
     eprintln!(
         "matrix: {} cells x {reps} reps = {total} runs -> {}{}",
         cells.len(),
@@ -1463,5 +1502,94 @@ mod netem_tests {
     #[test]
     fn jitter_without_delay_is_meaningless() {
         assert!(args(&[("jitter", "5ms")]).is_err());
+    }
+}
+
+
+#[cfg(test)]
+mod report_tests {
+    use super::{Record, recorded_as, report};
+
+    fn rec(pairs: &[(&str, &str)]) -> Record {
+        Record {
+            fields: pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        }
+    }
+
+    /// Base row: one runtime, one cell, everything a report reads.
+    fn row(role: &str, rep: &str, sent: &str, retx: &str) -> Record {
+        rec(&[
+            ("runtime", "smol"),
+            ("role", role),
+            ("rep", rep),
+            ("conns", "400"),
+            ("bitrate", "8000000"),
+            ("secs", "10"),
+            ("established", "400"),
+            ("core_total", sent),
+            ("sec_a", retx),
+            ("rtt_ms", "1"),
+            ("cpu_user_ms", "0"),
+            ("cpu_sys_ms", "0"),
+            ("peak_rss_kb", "0"),
+            ("udp_rcvbuf_err", "0"),
+        ])
+    }
+
+    fn field(out: &str, name: &str) -> String {
+        let mut lines = out.lines();
+        let headers: Vec<&str> = lines.next().unwrap().split_whitespace().collect();
+        let values: Vec<&str> = lines.next().unwrap().split_whitespace().collect();
+        let i = headers.iter().position(|h| *h == name).expect("column");
+        values[i].to_string()
+    }
+
+    /// An interrupted run leaves a caller row with no listener row. Resume
+    /// keyed only on listener rows, so the cell re-ran and appended a
+    /// SECOND caller row -- and averaging each side independently then
+    /// divided a complete listener figure by the median of one complete
+    /// and one truncated caller. That is how a 139% delivery rate
+    /// appeared in a real sweep.
+    #[test]
+    fn an_orphaned_caller_row_does_not_corrupt_delivery() {
+        let rows = vec![
+            row("caller", "1", "1336760", "0"), // truncated, no listener
+            row("caller", "1", "3045575", "0"), // the completed re-run
+            row("listener", "1", "3045575", "0"),
+        ];
+        let out = report(&rows, &["runtime".to_string()]);
+        assert_eq!(field(&out, "deliv%"), "100.0", "got:\n{out}");
+    }
+
+    /// `SenderBuffer::total_sent` counts a packet when it is first queued
+    /// and is never incremented by `pop_retransmit`, so retransmits are
+    /// already excluded. Subtracting them again floored the figure at zero
+    /// under heavy loss: a sender that pushed two million packets was
+    /// reported as having offered nothing.
+    #[test]
+    fn offered_load_does_not_subtract_retransmits_twice() {
+        let rows = vec![
+            row("caller", "1", "2029411", "2048059"),
+            row("listener", "1", "731424", "0"),
+        ];
+        let out = report(&rows, &["runtime".to_string()]);
+        assert_ne!(field(&out, "offer%"), "0.0", "floored at zero:\n{out}");
+        // 2029411 / (400 * 8e6 * 10 / (8 * 1316)) = 66.8%
+        assert_eq!(field(&out, "offer%"), "66.8", "got:\n{out}");
+    }
+
+    /// A cell says `link-delay=off`; the process records that as an empty
+    /// column. If the two disagree no cell ever matches its own recorded
+    /// row, and resume silently re-runs an entire completed sweep.
+    #[test]
+    fn link_off_keys_the_same_as_it_records() {
+        assert_eq!(recorded_as("link-delay", "off"), ("link_delay", String::new()));
+        assert_eq!(
+            recorded_as("link-loss", "1%"),
+            ("link_loss", "1%".to_string())
+        );
     }
 }
