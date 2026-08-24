@@ -76,6 +76,9 @@ fn drain_admission(
 struct Driver {
     conn: Conn,
     connected: bool,
+    /// Ended mid-stream rather than by the ordered close. See
+    /// `crate::is_ordered_close`.
+    torn_down: bool,
     stream_deadline: Option<Instant>,
     data_events: u64,
     peer: Option<SocketAddr>,
@@ -165,6 +168,7 @@ fn spawn_driver(
     let mut driver = Conn::new(conn, socket);
     let refused = driver.drain_outputs(crate::now_ts(start));
     Driver {
+        torn_down: false,
         conn: driver,
         connected: false,
         stream_deadline: None,
@@ -440,6 +444,7 @@ fn drive(cfg: LossConfig, mine: Vec<usize>, start: Instant) -> Vec<ConnStats> {
                     }
                     ConnectionEvent::Disconnected { reason } => {
                         eprintln!("[bench-mio] disconnected: {reason}");
+                        d.torn_down |= !crate::is_ordered_close(&reason);
                         d.stream_deadline = Some(Instant::now());
                     }
                     ConnectionEvent::Error(msg) => {
@@ -498,6 +503,7 @@ fn drive(cfg: LossConfig, mine: Vec<usize>, start: Instant) -> Vec<ConnStats> {
     for d in drivers {
         let mut s = ConnStats {
             connected: d.connected,
+            torn_down: d.torn_down,
             data_events: d.data_events,
             ..Default::default()
         };
@@ -589,6 +595,7 @@ fn run_shared_pool_shard(cfg: &LossConfig, mine: &[usize], start: Instant) -> Ve
         conn: SrtConnection,
         timers: srt_transport::ManualTimerStore,
         connected: bool,
+        torn_down: bool,
         data_events: u64,
         peer: SocketAddr,
         socket_idx: usize,
@@ -649,6 +656,7 @@ fn run_shared_pool_shard(cfg: &LossConfig, mine: &[usize], start: Instant) -> Ve
                 &mut buf,
                 |peer, data| {
                     let entry = conns.entry(peer).or_insert_with(|| SharedConn {
+                        torn_down: false,
                         conn: SrtConnection::new_listener(ConnectionOptions {
                             socket_id: std::process::id(),
                             tsbpd_delay: cfg.latency_ms,
@@ -687,7 +695,8 @@ fn run_shared_pool_shard(cfg: &LossConfig, mine: &[usize], start: Instant) -> Ve
                         conn.connected = true;
                         conn.stream_deadline = Some(Instant::now() + stream_len);
                     }
-                    ConnectionEvent::Disconnected { .. } => {
+                    ConnectionEvent::Disconnected { reason } => {
+                        conn.torn_down |= !crate::is_ordered_close(&reason);
                         conn.connected = false;
                     }
                     _ => {}
@@ -704,6 +713,7 @@ fn run_shared_pool_shard(cfg: &LossConfig, mine: &[usize], start: Instant) -> Ve
             // and then tripped SRT's own peer-idle timeout is still a
             // success, not "never connected".
             connected: conn.stream_deadline.is_some(),
+            torn_down: conn.torn_down,
             data_events: conn.data_events,
             ..Default::default()
         };
@@ -722,6 +732,8 @@ fn run_shared_pool_shard(cfg: &LossConfig, mine: &[usize], start: Instant) -> Ve
 /// One accepted connection on an acceptor thread: dedicated socket
 /// connected to the peer's exact tuple + protocol state.
 struct PoolSlot {
+    /// Ended mid-stream rather than by the ordered close.
+    torn_down: bool,
     conn: Conn,
     /// Live connected state: flips false on `Disconnected`, feeding
     /// `slot_is_terminal` so a dropped connection is promptly recognized
@@ -1023,6 +1035,7 @@ fn run_pool_acceptor(
             let now = Instant::now();
             token_index.insert(token.0, slots.len());
             slots.push(PoolSlot {
+                torn_down: false,
                 conn,
                 connected: true,
                 ever_connected: true,
@@ -1074,22 +1087,7 @@ fn run_pool_acceptor(
             let _ = drain_conn_outputs(&mut p.conn, &mut p.timers, &listener, *peer, t);
             let mut just_connected = false;
             while let Some(ev) = p.conn.poll_event() {
-                match ev {
-                    ConnectionEvent::Connected => {
-                        if p.stream_deadline.is_none() {
-                            just_connected = true;
-                        }
-                        p.connected = true;
-                    }
-                    ConnectionEvent::DataReceived { .. } => {
-                        p.data_events += 1;
-                        p.last_data_at = Instant::now();
-                    }
-                    ConnectionEvent::Disconnected { .. } => {
-                        p.connected = false;
-                    }
-                    _ => {}
-                }
+                just_connected |= p.apply_event(ev);
             }
             if just_connected {
                 p.stream_deadline = Some(Instant::now() + stream_len);
@@ -1283,6 +1281,7 @@ fn promote_locally(
     let now = Instant::now();
     token_index.insert(token.0, slots.len());
     slots.push(PoolSlot {
+                torn_down: false,
         conn,
         connected: true,
         ever_connected: true,
@@ -1347,7 +1346,8 @@ fn maintain_slots(slots: &mut [PoolSlot], start: Instant) {
             slot.poisoned = true;
         }
         while let Some(ev) = slot.conn.conn.poll_event() {
-            if matches!(ev, ConnectionEvent::Disconnected { .. }) {
+            if let ConnectionEvent::Disconnected { reason } = &ev {
+                slot.torn_down |= !crate::is_ordered_close(reason);
                 slot.connected = false;
             }
         }
@@ -1692,6 +1692,7 @@ fn run_worker(
                     let now = Instant::now();
                     token_index.insert(token.0, slots.len());
                     slots.push(PoolSlot {
+                torn_down: false,
                         conn,
                         connected: true,
                         ever_connected: true,

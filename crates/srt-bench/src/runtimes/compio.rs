@@ -281,6 +281,7 @@ async fn sender_task(
                 }
                 ConnectionEvent::Disconnected { reason } => {
                     eprintln!("[bench-compio] disconnected: {reason}");
+                    stats.torn_down |= !crate::is_ordered_close(&reason);
                     stream_deadline = Some(Instant::now());
                 }
                 ConnectionEvent::Error(msg) => {
@@ -418,6 +419,7 @@ async fn receiver_task(cfg: LossConfig, listen_port: u16, start: Instant) -> Con
                 }
                 ConnectionEvent::Disconnected { reason } => {
                     eprintln!("[bench-compio] disconnected: {reason}");
+                    stats.torn_down |= !crate::is_ordered_close(&reason);
                     stream_deadline = Some(Instant::now());
                 }
                 ConnectionEvent::Error(msg) => {
@@ -609,22 +611,7 @@ async fn run_acceptor(
             let _ = drain_pending_outputs(&mut p.conn, &mut p.timers, &listener, *peer).await;
             let mut newly_connected = false;
             while let Some(ev) = p.conn.poll_event() {
-                match ev {
-                    ConnectionEvent::Connected => {
-                        if p.stream_deadline.is_none() {
-                            newly_connected = true;
-                        }
-                        p.connected = true;
-                    }
-                    ConnectionEvent::DataReceived { .. } => {
-                        p.data_events += 1;
-                        p.last_data_at = Instant::now();
-                    }
-                    ConnectionEvent::Disconnected { .. } => {
-                        p.connected = false;
-                    }
-                    _ => {}
-                }
+                newly_connected |= p.apply_event(ev);
             }
             if newly_connected {
                 p.stream_deadline = Some(Instant::now() + stream_len);
@@ -739,6 +726,7 @@ async fn run_acceptor(
             }
             let mut s = ConnStats {
                 connected: p.stream_deadline.is_some(),
+                torn_down: p.torn_down,
                 data_events: p.data_events,
                 ..Default::default()
             };
@@ -833,6 +821,7 @@ async fn established_conn_task(mut driver: Conn, cfg: LossConfig, start: Instant
     // the final ConnStats, not this live flag (see tokio's identical
     // comment for the full reasoning).
     let mut connected = true;
+    let mut torn_down = false;
     let mut data_events = 0u64;
     let stream_deadline = Instant::now() + Duration::from_secs_f64(cfg.duration_secs);
     let mut last_data_at = Instant::now();
@@ -886,6 +875,7 @@ async fn established_conn_task(mut driver: Conn, cfg: LossConfig, start: Instant
                 }
                 ConnectionEvent::Disconnected { reason } => {
                     eprintln!("[bench-compio] disconnected: {reason}");
+                    torn_down |= !crate::is_ordered_close(&reason);
                     connected = false;
                 }
                 ConnectionEvent::Error(msg) => eprintln!("[bench-compio] error: {msg}"),
@@ -896,6 +886,7 @@ async fn established_conn_task(mut driver: Conn, cfg: LossConfig, start: Instant
 
     let mut stats = ConnStats {
         connected: true,
+        torn_down,
         data_events,
         ..Default::default()
     };
@@ -1042,6 +1033,7 @@ async fn serve_pool_socket(cfg: LossConfig, index: usize, start: Instant) -> Vec
         .map(|(_peer, p)| {
             let mut s = ConnStats {
                 connected: p.stream_deadline.is_some(),
+                torn_down: p.torn_down,
                 data_events: p.data_events,
                 ..Default::default()
             };

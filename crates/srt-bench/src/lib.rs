@@ -4,6 +4,8 @@ pub mod cpu_stats;
 pub mod driver;
 pub mod harness;
 pub mod shutdown;
+
+pub use srt_transport::is_ordered_close;
 pub mod runtimes;
 
 pub const INTEROP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -415,6 +417,13 @@ impl LossConfig {
 #[derive(Clone, Copy, Default)]
 pub struct ConnStats {
     pub connected: bool,
+    /// Ended mid-stream rather than by the sender's ordered close.
+    ///
+    /// A connection reaped this way still counts as `established` -- it
+    /// did connect -- so without this a cell can report 400/400 while a
+    /// quarter of its connections were torn down while streaming, and the
+    /// only trace is a line on stderr.
+    pub torn_down: bool,
     pub data_events: u64,
     pub core_total: u64,
     pub secondary_a: u64,

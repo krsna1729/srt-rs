@@ -340,6 +340,18 @@ pub fn available_cpus() -> usize {
 /// One connection tracked from admission until it is promoted, relocated,
 /// or retired -- serviced off the shared listener socket by peer-address
 /// dispatch the whole time.
+/// Did this `Disconnected` reason mean the ordered close, or something
+/// going wrong?
+///
+/// The sender ends a run by calling `SrtConnection::disconnect`, which
+/// emits an SRT SHUTDOWN; the peer reports that as `peer shutdown`. The
+/// sender itself gets no event for its own close, so on that side every
+/// `Disconnected` is by definition unplanned.
+#[must_use]
+pub fn is_ordered_close(reason: &str) -> bool {
+    reason == "peer shutdown"
+}
+
 pub struct AdmissionPeer {
     pub conn: SrtConnection,
     pub timers: ManualTimerStore,
@@ -354,6 +366,45 @@ pub struct AdmissionPeer {
     pub stream_deadline: Option<Instant>,
     pub data_events: u64,
     pub last_data_at: Instant,
+    /// This peer went away for a reason other than the ordered close --
+    /// an idle timeout, or an error. Distinct from `connected`, which
+    /// also goes false on a clean shutdown, and from `stream_deadline`,
+    /// which records only that it once connected.
+    pub torn_down: bool,
+}
+
+impl AdmissionPeer {
+    /// Apply one protocol event to this peer's bookkeeping. Returns
+    /// `true` exactly once per peer: on the event that is its first-ever
+    /// `Connected`, which is the caller's cue to arm `stream_deadline` and
+    /// treat the peer as newly admitted (relocation, `--promotion`, etc).
+    ///
+    /// The single implementation of "what a Connected/DataReceived/
+    /// Disconnected event means for one admitted peer" -- previously
+    /// hand-copied identically into each of the six runtime adapters'
+    /// per-tick admission loops, plus a seventh, slightly different copy
+    /// inside `PeerTable::drain_events`.
+    pub fn apply_event(&mut self, event: shiguredo_srt::ConnectionEvent) -> bool {
+        use shiguredo_srt::ConnectionEvent;
+        match event {
+            ConnectionEvent::Connected => {
+                let first_connect = self.stream_deadline.is_none();
+                self.connected = true;
+                first_connect
+            }
+            ConnectionEvent::DataReceived { .. } => {
+                self.data_events += 1;
+                self.last_data_at = Instant::now();
+                false
+            }
+            ConnectionEvent::Disconnected { reason } => {
+                self.torn_down |= !is_ordered_close(&reason);
+                self.connected = false;
+                false
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Per-listener settings the table needs to mint new connections and to
@@ -460,6 +511,7 @@ impl PeerTable {
             stream_deadline: None,
             data_events: 0,
             last_data_at: Instant::now(),
+            torn_down: false,
         });
         let _ = entry.conn.feed_recv_buf(data, now);
         Admit::Fed
@@ -556,22 +608,7 @@ impl PeerTable {
         for (peer, entry) in &mut self.peers {
             let mut first_connect = false;
             while let Some(event) = entry.conn.poll_event() {
-                match event {
-                    shiguredo_srt::ConnectionEvent::Connected => {
-                        if entry.stream_deadline.is_none() {
-                            first_connect = true;
-                        }
-                        entry.connected = true;
-                    }
-                    shiguredo_srt::ConnectionEvent::DataReceived { .. } => {
-                        entry.data_events += 1;
-                        entry.last_data_at = Instant::now();
-                    }
-                    shiguredo_srt::ConnectionEvent::Disconnected { .. } => {
-                        entry.connected = false;
-                    }
-                    _ => {}
-                }
+                first_connect |= entry.apply_event(event);
             }
             if first_connect {
                 entry.stream_deadline = Some(Instant::now() + stream_len);
