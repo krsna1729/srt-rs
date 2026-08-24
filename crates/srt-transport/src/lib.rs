@@ -1287,15 +1287,21 @@ impl PeerTable {
         let Some(group) = identity.group.as_ref() else {
             return true;
         };
+        let Some(mode) = shiguredo_srt::GroupMode::from_group_type(group.extension.group_type)
+        else {
+            return false;
+        };
         if options.bonded_inputs != BondedInputPolicy::Accept
             || group.group_id & shiguredo_srt::SRTGROUP_MASK == 0
-            || shiguredo_srt::GroupMode::from_group_type(group.extension.group_type).is_none()
         {
             return false;
         }
         self.groups
             .get(&group.logical_key())
-            .is_none_or(|existing| existing.group.member(handshake.socket_id).is_none())
+            .is_none_or(|existing| {
+                existing.group.mode() == mode
+                    && existing.group.member(handshake.socket_id).is_none()
+            })
     }
 
     fn adopt_bonded_peer(&mut self, peer: std::net::SocketAddr) {
@@ -3084,6 +3090,68 @@ mod tests {
             2,
             "an orderly logical close shuts down every group leg"
         );
+    }
+
+    #[test]
+    fn bonded_inputs_reject_a_conflicting_group_mode() {
+        let first = "127.0.0.1:10000".parse().expect("address");
+        let second = "127.0.0.1:10001".parse().expect("address");
+        let mut options = AdmissionOptions::basic(0x2222, 0, true);
+        options.bonded_inputs = BondedInputPolicy::Accept;
+        let telemetry = IngressTelemetry::new();
+        let mut table = PeerTable::new();
+        let group_id = shiguredo_srt::SRTGROUP_MASK | 42;
+        let caller_options = |socket_id, group_type| ConnectionOptions {
+            socket_id,
+            stream_id: Some("publish:bonded".to_string()),
+            group_extension: Some(shiguredo_srt::GroupExtensionData {
+                group_id,
+                group_type,
+                flags: 0,
+                weight: 1,
+            }),
+            ..ConnectionOptions::default()
+        };
+        let (mut first_caller, first_conclusion) = prepare_conclusion_with_options(
+            &mut table,
+            first,
+            caller_options(0x1111, shiguredo_srt::GroupType::Broadcast),
+            &options,
+            &telemetry,
+        );
+        finish_conclusion(
+            &mut table,
+            first,
+            &mut first_caller,
+            &first_conclusion,
+            &options,
+            &telemetry,
+        );
+        let (_, second_conclusion) = prepare_conclusion_with_options(
+            &mut table,
+            second,
+            caller_options(0x2222, shiguredo_srt::GroupType::Backup),
+            &options,
+            &telemetry,
+        );
+
+        assert_eq!(
+            table.admit(
+                second,
+                &second_conclusion,
+                Timestamp::from_micros(2),
+                &options,
+                0,
+                1,
+                &telemetry,
+            ),
+            Admit::Rejected
+        );
+        assert_eq!(
+            table.bonded_stats()[0].connection.mode,
+            shiguredo_srt::GroupMode::Broadcast
+        );
+        assert_eq!(table.bonded_stats()[0].connection.legs.len(), 1);
     }
 
     #[test]
