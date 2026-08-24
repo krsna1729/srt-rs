@@ -53,10 +53,165 @@
 //! `SrtConnection::handle_timer`.
 //!
 
-use shiguredo_srt::{ConnectionOptions, ConnectionOutput, SrtConnection, TimerId, Timestamp};
-use std::collections::HashMap;
+use shiguredo_srt::{
+    ConnectionEvent, ConnectionOptions, ConnectionOutput, SrtConnection, TimerId, Timestamp,
+};
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::hash_map::Entry as HashEntry;
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::hash::Hash;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+/// Per-tick limits for moving protocol outputs into a runtime socket.
+///
+/// The bounds are deliberately expressed in actions, packets, and bytes:
+/// timer churn cannot bypass the action cap, while a burst of large UDP
+/// datagrams cannot monopolize a readiness-loop iteration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OutputDrainBudget {
+    pub max_actions: usize,
+    pub max_packets: usize,
+    pub max_bytes: usize,
+}
+
+impl OutputDrainBudget {
+    #[must_use]
+    pub const fn new(max_actions: usize, max_packets: usize, max_bytes: usize) -> Self {
+        Self {
+            max_actions,
+            max_packets,
+            max_bytes,
+        }
+    }
+}
+
+impl Default for OutputDrainBudget {
+    fn default() -> Self {
+        Self::new(64, 32, 256 * 1024)
+    }
+}
+
+/// Why a bounded output-pump invocation yielded to its caller.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OutputDrainStatus {
+    #[default]
+    Drained,
+    BudgetExhausted,
+    Backpressured,
+}
+
+/// Work completed by one bounded output-pump invocation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OutputDrainReport {
+    pub actions: usize,
+    pub packets: usize,
+    pub bytes: usize,
+    pub status: OutputDrainStatus,
+}
+
+#[derive(Debug)]
+struct DueEntry<K> {
+    deadline_micros: u64,
+    key: K,
+}
+
+impl<K> PartialEq for DueEntry<K> {
+    fn eq(&self, other: &Self) -> bool {
+        self.deadline_micros == other.deadline_micros
+    }
+}
+
+impl<K> Eq for DueEntry<K> {}
+
+impl<K> PartialOrd for DueEntry<K> {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<K> Ord for DueEntry<K> {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        self.deadline_micros.cmp(&other.deadline_micros)
+    }
+}
+
+/// Indexes the next deadline of many timer owners without scanning every
+/// owner on each shared-loop iteration. Replaced/removed heap entries are
+/// discarded lazily.
+#[derive(Debug)]
+pub struct DueIndex<K> {
+    current: HashMap<K, u64>,
+    heap: BinaryHeap<std::cmp::Reverse<DueEntry<K>>>,
+}
+
+impl<K> Default for DueIndex<K> {
+    fn default() -> Self {
+        Self {
+            current: HashMap::new(),
+            heap: BinaryHeap::new(),
+        }
+    }
+}
+
+impl<K> DueIndex<K>
+where
+    K: Clone + Eq + Hash,
+{
+    pub fn set(&mut self, key: K, deadline: Timestamp) {
+        let deadline_micros = deadline.as_micros();
+        self.current.insert(key.clone(), deadline_micros);
+        self.heap.push(std::cmp::Reverse(DueEntry {
+            deadline_micros,
+            key,
+        }));
+    }
+
+    pub fn remove(&mut self, key: &K) {
+        self.current.remove(key);
+    }
+
+    pub fn pop_due(&mut self, now: Timestamp, out: &mut Vec<K>) {
+        out.clear();
+        while let Some(std::cmp::Reverse(top)) = self.heap.peek()
+            && top.deadline_micros <= now.as_micros()
+        {
+            let std::cmp::Reverse(entry) = self.heap.pop().expect("peeked entry exists");
+            match self.current.entry(entry.key.clone()) {
+                HashEntry::Occupied(slot) if *slot.get() == entry.deadline_micros => {
+                    slot.remove();
+                    out.push(entry.key);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Earliest live deadline, cleaning stale heap entries as necessary.
+    pub fn peek_min_deadline(&mut self) -> Option<Timestamp> {
+        loop {
+            let std::cmp::Reverse(entry) = self.heap.pop()?;
+            match self.current.get(&entry.key) {
+                Some(&deadline) if deadline == entry.deadline_micros => {
+                    let result = Timestamp::from_micros(deadline);
+                    self.heap.push(std::cmp::Reverse(entry));
+                    return Some(result);
+                }
+                _ => continue,
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.current.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.current.is_empty()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Reuseport admission plumbing — raw fd/libc mechanics, no runtime
@@ -430,6 +585,18 @@ pub enum Admit {
     ForwardTo(usize),
 }
 
+/// One unmodified protocol event emitted by an admitted peer.
+///
+/// Production consumers should use [`PeerTable::poll_events`] so received
+/// payloads and disconnect reasons leave the transport layer intact. The
+/// benchmark-only [`PeerTable::drain_events`] adapter remains for its legacy
+/// counters and promotion timing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionEvent {
+    pub peer: std::net::SocketAddr,
+    pub event: ConnectionEvent,
+}
+
 /// The peers one acceptor is servicing off its shared listener.
 ///
 /// This is the admission session state machine, minus I/O: it owns the
@@ -440,6 +607,11 @@ pub enum Admit {
 #[derive(Default)]
 pub struct PeerTable {
     peers: HashMap<std::net::SocketAddr, AdmissionPeer>,
+    deadlines: DueIndex<std::net::SocketAddr>,
+    ready: VecDeque<std::net::SocketAddr>,
+    ready_set: HashSet<std::net::SocketAddr>,
+    event_ready: VecDeque<std::net::SocketAddr>,
+    event_ready_set: HashSet<std::net::SocketAddr>,
 }
 
 impl PeerTable {
@@ -454,6 +626,7 @@ impl PeerTable {
     /// reuseport group so a CONCLUSION carrying someone else's cookie can
     /// be routed home rather than answered here (cookie validation would
     /// reject it) or dropped (a handshake retry).
+    #[allow(clippy::too_many_arguments)]
     pub fn admit(
         &mut self,
         peer: std::net::SocketAddr,
@@ -494,26 +667,29 @@ impl PeerTable {
             }
         }
 
-        let entry = self.peers.entry(peer).or_insert_with(|| AdmissionPeer {
-            conn: SrtConnection::new_listener(ConnectionOptions {
-                socket_id: options.socket_id,
-                tsbpd_delay: options.tsbpd_delay,
-                // Encode who owns this handshake, so a CONCLUSION the
-                // kernel rehashes elsewhere can be routed back here.
-                syn_cookie: Some(srt_lifecycle::cookie_for_worker(
-                    worker_index,
-                    peer_entropy(peer),
-                )),
-                ..Default::default()
-            }),
-            timers: ManualTimerStore::new(),
-            connected: false,
-            stream_deadline: None,
-            data_events: 0,
-            last_data_at: Instant::now(),
-            torn_down: false,
-        });
-        let _ = entry.conn.feed_recv_buf(data, now);
+        {
+            let entry = self.peers.entry(peer).or_insert_with(|| AdmissionPeer {
+                conn: SrtConnection::new_listener(ConnectionOptions {
+                    socket_id: options.socket_id,
+                    tsbpd_delay: options.tsbpd_delay,
+                    // Encode who owns this handshake, so a CONCLUSION the
+                    // kernel rehashes elsewhere can be routed back here.
+                    syn_cookie: Some(srt_lifecycle::cookie_for_worker(
+                        worker_index,
+                        peer_entropy(peer),
+                    )),
+                    ..Default::default()
+                }),
+                timers: ManualTimerStore::new(),
+                connected: false,
+                stream_deadline: None,
+                data_events: 0,
+                last_data_at: Instant::now(),
+                torn_down: false,
+            });
+            let _ = entry.conn.feed_recv_buf(data, now);
+        }
+        self.mark_ready(peer);
         Admit::Fed
     }
 
@@ -571,7 +747,7 @@ impl PeerTable {
         }
     }
 
-    /// Fire every peer's due timers and collect what they want to send.
+    /// Fire due peers' timers and collect what ready peers want to send.
     ///
     /// Timer outputs are applied to the peer's own store; only packets
     /// come back, because sending is the one part of the maintenance tick
@@ -583,13 +759,63 @@ impl PeerTable {
         out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
     ) {
         out.clear();
-        for (peer, entry) in &mut self.peers {
+        let mut due = Vec::new();
+        self.deadlines.pop_due(now, &mut due);
+        for peer in due {
+            self.mark_ready(peer);
+        }
+
+        while let Some(peer) = self.ready.pop_front() {
+            self.ready_set.remove(&peer);
+            let Some(entry) = self.peers.get_mut(&peer) else {
+                continue;
+            };
             entry.timers.fire_expired(now, &mut entry.conn);
             while let Some(output) = entry.conn.poll_output() {
                 match output {
-                    ConnectionOutput::SendPacket(bytes) => out.push((*peer, bytes)),
+                    ConnectionOutput::SendPacket(bytes) => out.push((peer, bytes)),
                     other => entry.timers.apply_output(&other, now),
                 }
+            }
+            if let Some(deadline) = entry.timers.next_deadline() {
+                self.deadlines.set(peer, deadline);
+            } else {
+                self.deadlines.remove(&peer);
+            }
+        }
+    }
+
+    /// Mark a peer whose protocol state was changed through [`Self::iter_mut`]
+    /// as ready for the next indexed maintenance pass.
+    pub fn mark_ready(&mut self, peer: std::net::SocketAddr) {
+        if self.peers.contains_key(&peer) {
+            if self.ready_set.insert(peer) {
+                self.ready.push_back(peer);
+            }
+            if self.event_ready_set.insert(peer) {
+                self.event_ready.push_back(peer);
+            }
+        }
+    }
+
+    /// Microseconds until any tracked peer's next timer deadline.
+    pub fn time_until_next_deadline(&mut self, now: Timestamp, default_us: u64) -> u64 {
+        self.deadlines
+            .peek_min_deadline()
+            .map(|deadline| deadline.saturating_sub(now))
+            .unwrap_or(default_us)
+    }
+
+    /// Drain unmodified protocol events for production consumers.
+    pub fn poll_events(&mut self, out: &mut Vec<AdmissionEvent>) {
+        out.clear();
+        while let Some(peer) = self.event_ready.pop_front() {
+            self.event_ready_set.remove(&peer);
+            let Some(entry) = self.peers.get_mut(&peer) else {
+                continue;
+            };
+            while let Some(event) = entry.conn.poll_event() {
+                out.push(AdmissionEvent { peer, event });
             }
         }
     }
@@ -605,14 +831,15 @@ impl PeerTable {
         newly_connected: &mut Vec<std::net::SocketAddr>,
     ) {
         newly_connected.clear();
-        for (peer, entry) in &mut self.peers {
-            let mut first_connect = false;
-            while let Some(event) = entry.conn.poll_event() {
-                first_connect |= entry.apply_event(event);
-            }
-            if first_connect {
-                entry.stream_deadline = Some(Instant::now() + stream_len);
-                newly_connected.push(*peer);
+        let mut events = Vec::new();
+        self.poll_events(&mut events);
+        let deadline = Instant::now() + stream_len;
+        for admission_event in events {
+            if let Some(entry) = self.peers.get_mut(&admission_event.peer)
+                && entry.apply_event(admission_event.event)
+            {
+                entry.stream_deadline = Some(deadline);
+                newly_connected.push(admission_event.peer);
             }
         }
     }
@@ -628,6 +855,9 @@ impl PeerTable {
     }
 
     pub fn remove(&mut self, peer: &std::net::SocketAddr) -> Option<AdmissionPeer> {
+        self.deadlines.remove(peer);
+        self.ready_set.remove(peer);
+        self.event_ready_set.remove(peer);
         self.peers.remove(peer)
     }
 
@@ -681,10 +911,8 @@ impl IntoIterator for PeerTable {
 /// Per-peer entropy for the upper bits of a SYN cookie, so cookies differ
 /// per connection instead of being one constant per worker.
 fn peer_entropy(peer: std::net::SocketAddr) -> u32 {
-    use std::hash::{BuildHasher, Hash, Hasher};
-    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
-    peer.hash(&mut hasher);
-    hasher.finish() as u32
+    use std::hash::BuildHasher;
+    std::collections::hash_map::RandomState::new().hash_one(peer) as u32
 }
 
 // ---------------------------------------------------------------------------
@@ -876,6 +1104,12 @@ impl ManualTimerStore {
             .min()
             .unwrap_or(default_us)
     }
+
+    /// Absolute deadline of this connection's next armed timer.
+    #[must_use]
+    pub fn next_deadline(&self) -> Option<Timestamp> {
+        self.timers.values().copied().min()
+    }
 }
 
 impl Default for ManualTimerStore {
@@ -884,10 +1118,76 @@ impl Default for ManualTimerStore {
     }
 }
 
+fn prepend_outputs(
+    pending: &mut VecDeque<ConnectionOutput>,
+    outputs: impl DoubleEndedIterator<Item = ConnectionOutput>,
+) {
+    for output in outputs.rev() {
+        pending.push_front(output);
+    }
+}
+
+fn collect_output_work(
+    conn: &mut SrtConnection,
+    pending: &mut VecDeque<ConnectionOutput>,
+    budget: OutputDrainBudget,
+) -> (VecDeque<ConnectionOutput>, bool) {
+    let max_actions = budget.max_actions.max(1);
+    let max_packets = budget.max_packets.max(1);
+    let max_bytes = budget.max_bytes.max(1);
+    let mut work = VecDeque::new();
+    let mut packets = 0usize;
+    let mut bytes = 0usize;
+
+    while work.len() < max_actions {
+        let Some(output) = pending.pop_front().or_else(|| conn.poll_output()) else {
+            return (work, false);
+        };
+        if let ConnectionOutput::SendPacket(packet) = &output {
+            let exceeds_packet_cap = packets >= max_packets;
+            let exceeds_byte_cap = packets > 0 && bytes.saturating_add(packet.len()) > max_bytes;
+            if exceeds_packet_cap || exceeds_byte_cap {
+                pending.push_front(output);
+                return (work, true);
+            }
+            packets += 1;
+            bytes = bytes.saturating_add(packet.len());
+        }
+        work.push_back(output);
+    }
+
+    (work, true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use shiguredo_srt::{ConnectionOptions, SrtConnection};
+
+    #[test]
+    fn due_index_replaces_deadlines_and_ignores_stale_entries() {
+        let mut index = DueIndex::default();
+        index.set("a", Timestamp::from_micros(100));
+        index.set("b", Timestamp::from_micros(200));
+        index.set("a", Timestamp::from_micros(300));
+
+        assert_eq!(index.peek_min_deadline(), Some(Timestamp::from_micros(200)));
+        let mut due = Vec::new();
+        index.pop_due(Timestamp::from_micros(200), &mut due);
+        assert_eq!(due, vec!["b"]);
+        index.pop_due(Timestamp::from_micros(300), &mut due);
+        assert_eq!(due, vec!["a"]);
+        assert!(index.is_empty());
+    }
+
+    #[test]
+    fn due_index_remove_lazily_discards_heap_entry() {
+        let mut index = DueIndex::default();
+        index.set(7, Timestamp::from_micros(100));
+        index.remove(&7);
+        assert_eq!(index.peek_min_deadline(), None);
+        assert!(index.is_empty());
+    }
 
     #[test]
     fn due_timers_returns_only_expired_and_removes_them() {
@@ -1032,9 +1332,14 @@ mod tests {
 
 #[cfg(feature = "mio")]
 pub mod mio_transport {
-    use super::ManualTimerStore;
+    use super::{
+        ManualTimerStore, OutputDrainBudget, OutputDrainReport, OutputDrainStatus,
+        collect_output_work, prepend_outputs,
+    };
     use libc;
     use shiguredo_srt::{ConnectionOutput, SrtConnection, Timestamp};
+    use std::collections::VecDeque;
+    use std::io;
     use std::time::Duration;
 
     /// Per-connection state for mio: protocol + owned socket + manual timers.
@@ -1042,6 +1347,7 @@ pub mod mio_transport {
         pub conn: SrtConnection,
         pub socket: mio::net::UdpSocket,
         pub timers: ManualTimerStore,
+        pending_outputs: VecDeque<ConnectionOutput>,
     }
 
     impl Conn {
@@ -1050,6 +1356,7 @@ pub mod mio_transport {
                 conn,
                 socket,
                 timers: ManualTimerStore::new(),
+                pending_outputs: VecDeque::new(),
             }
         }
 
@@ -1058,29 +1365,34 @@ pub mod mio_transport {
             self.timers.fire_expired(now, &mut self.conn);
         }
 
-        /// Drain all pending outputs: send packets, manage manual timers.
-        /// Batches `SendPacket`s via `sendmmsg` (one syscall for up to 32
-        /// datagrams). Returns true if the peer actually refused the
-        /// connection (`ECONNREFUSED` on a connected UDP socket) -- the
-        /// caller should reconnect.
+        /// Compatibility wrapper using [`OutputDrainBudget::default`].
+        /// Returns true only for `ECONNREFUSED`; transient failures remain
+        /// queued for the next tick.
         pub fn drain_outputs(&mut self, now: Timestamp) -> bool {
-            let mut batch: Vec<Vec<u8>> = Vec::with_capacity(32);
-            let mut refused = false;
-            while let Some(out) = self.conn.poll_output() {
-                match out {
-                    ConnectionOutput::SendPacket(bytes) => {
-                        batch.push(bytes);
-                        if batch.len() == 32 {
-                            refused |= Self::flush_batch(&self.socket, &mut batch);
-                        }
-                    }
-                    ConnectionOutput::SetTimer { .. } | ConnectionOutput::ClearTimer { .. } => {
-                        self.timers.apply_output(&out, now);
-                    }
-                }
-            }
-            refused |= Self::flush_batch(&self.socket, &mut batch);
-            refused
+            self.drain_outputs_bounded(now, OutputDrainBudget::default())
+                .is_err_and(|error| error.kind() == io::ErrorKind::ConnectionRefused)
+        }
+
+        /// Drain a bounded amount of output, retaining every unsent datagram
+        /// in protocol order on `WouldBlock`, partial `sendmmsg`, or error.
+        pub fn drain_outputs_bounded(
+            &mut self,
+            now: Timestamp,
+            budget: OutputDrainBudget,
+        ) -> io::Result<OutputDrainReport> {
+            drain_outputs_with(
+                &mut self.conn,
+                &mut self.timers,
+                &mut self.pending_outputs,
+                now,
+                budget,
+                |batch| Self::send_batch(&self.socket, batch),
+            )
+        }
+
+        #[must_use]
+        pub fn has_pending_outputs(&self) -> bool {
+            !self.pending_outputs.is_empty()
         }
 
         /// mmsghdr/iovec scratch, reused across calls on this thread
@@ -1088,14 +1400,14 @@ pub mod mio_transport {
         /// connection). Capacity stabilizes at the batch cap (32) after
         /// the first few calls, giving zero-allocation steady state --
         /// mirrors `recvmsg_batch`'s scratch in srt-bench.
-        fn flush_batch(socket: &mio::net::UdpSocket, batch: &mut Vec<Vec<u8>>) -> bool {
+        fn send_batch(socket: &mio::net::UdpSocket, batch: &[Vec<u8>]) -> io::Result<usize> {
             use std::cell::RefCell;
             thread_local! {
                 static SCRATCH: RefCell<(Vec<libc::mmsghdr>, Vec<libc::iovec>)> =
                     const { RefCell::new((Vec::new(), Vec::new())) };
             }
             if batch.is_empty() {
-                return false;
+                return Ok(0);
             }
             SCRATCH.with(|scratch| {
                 let (msgs, iovs) = &mut *scratch.borrow_mut();
@@ -1127,26 +1439,11 @@ pub mod mio_transport {
                         libc::MSG_DONTWAIT,
                     )
                 };
-                let refused = if sent < 0 {
-                    // Only a genuine ECONNREFUSED (ICMP port-unreachable
-                    // surfaced on a connected UDP socket) means the peer
-                    // is gone. Any other errno (EINTR, ENOBUFS, EAGAIN on
-                    // the very first message, ...) is transient and
-                    // shouldn't force a reconnect cycle.
-                    std::io::Error::last_os_error().kind() == std::io::ErrorKind::ConnectionRefused
+                if sent < 0 {
+                    Err(io::Error::last_os_error())
                 } else {
-                    // sendmmsg returns the count actually sent, which can
-                    // be less than the batch once the send buffer fills
-                    // mid-call -- per sendmmsg(2), the error for the
-                    // unsent tail is lost. Fall back to individual sends
-                    // for whatever didn't go out rather than dropping it.
-                    for buf in &batch[sent as usize..] {
-                        let _ = socket.send(buf);
-                    }
-                    false
-                };
-                batch.clear();
-                refused
+                    Ok(sent as usize)
+                }
             })
         }
 
@@ -1158,11 +1455,208 @@ pub mod mio_transport {
             )
         }
     }
+
+    fn drain_outputs_with<F>(
+        conn: &mut SrtConnection,
+        timers: &mut ManualTimerStore,
+        pending: &mut VecDeque<ConnectionOutput>,
+        now: Timestamp,
+        budget: OutputDrainBudget,
+        mut send_batch: F,
+    ) -> io::Result<OutputDrainReport>
+    where
+        F: FnMut(&[Vec<u8>]) -> io::Result<usize>,
+    {
+        let (mut work, budget_exhausted) = collect_output_work(conn, pending, budget);
+        let mut report = OutputDrainReport {
+            status: if budget_exhausted {
+                OutputDrainStatus::BudgetExhausted
+            } else {
+                OutputDrainStatus::Drained
+            },
+            ..OutputDrainReport::default()
+        };
+
+        while let Some(output) = work.pop_front() {
+            match output {
+                ConnectionOutput::SendPacket(packet) => {
+                    let mut batch = vec![packet];
+                    while matches!(work.front(), Some(ConnectionOutput::SendPacket(_))) {
+                        let Some(ConnectionOutput::SendPacket(packet)) = work.pop_front() else {
+                            unreachable!();
+                        };
+                        batch.push(packet);
+                    }
+
+                    match send_batch(&batch) {
+                        Ok(sent) if sent <= batch.len() => {
+                            report.actions += sent;
+                            report.packets += sent;
+                            report.bytes += batch[..sent].iter().map(Vec::len).sum::<usize>();
+                            if sent < batch.len() {
+                                prepend_outputs(pending, work.into_iter());
+                                prepend_outputs(
+                                    pending,
+                                    batch
+                                        .into_iter()
+                                        .skip(sent)
+                                        .map(ConnectionOutput::SendPacket),
+                                );
+                                report.status = OutputDrainStatus::Backpressured;
+                                return Ok(report);
+                            }
+                        }
+                        Ok(_) => {
+                            prepend_outputs(pending, work.into_iter());
+                            prepend_outputs(
+                                pending,
+                                batch.into_iter().map(ConnectionOutput::SendPacket),
+                            );
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "sendmmsg reported more datagrams than supplied",
+                            ));
+                        }
+                        Err(error) => {
+                            prepend_outputs(pending, work.into_iter());
+                            prepend_outputs(
+                                pending,
+                                batch.into_iter().map(ConnectionOutput::SendPacket),
+                            );
+                            if error.kind() == io::ErrorKind::WouldBlock {
+                                report.status = OutputDrainStatus::Backpressured;
+                                return Ok(report);
+                            }
+                            return Err(error);
+                        }
+                    }
+                }
+                timer => {
+                    timers.apply_output(&timer, now);
+                    report.actions += 1;
+                }
+            }
+        }
+
+        Ok(report)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use shiguredo_srt::ConnectionOptions;
+
+        fn caller_with_output() -> SrtConnection {
+            let mut conn = SrtConnection::new_caller(ConnectionOptions::default());
+            conn.connect(Timestamp::from_micros(0))
+                .expect("connect starts");
+            conn
+        }
+
+        #[test]
+        fn would_block_retains_packet_and_following_timer() {
+            let mut conn = caller_with_output();
+            let mut timers = ManualTimerStore::new();
+            let mut pending = VecDeque::new();
+            let mut attempts = 0;
+            let report = drain_outputs_with(
+                &mut conn,
+                &mut timers,
+                &mut pending,
+                Timestamp::from_micros(0),
+                OutputDrainBudget::default(),
+                |_| {
+                    attempts += 1;
+                    Err(io::Error::from(io::ErrorKind::WouldBlock))
+                },
+            )
+            .expect("WouldBlock is a yield, not packet loss");
+            assert_eq!(report.status, OutputDrainStatus::Backpressured);
+            assert_eq!(attempts, 1);
+            assert_eq!(pending.len(), 2);
+
+            let report = drain_outputs_with(
+                &mut conn,
+                &mut timers,
+                &mut pending,
+                Timestamp::from_micros(1),
+                OutputDrainBudget::default(),
+                |batch| Ok(batch.len()),
+            )
+            .expect("retry succeeds");
+            assert_eq!(report.status, OutputDrainStatus::Drained);
+            assert_eq!(report.packets, 1);
+            assert!(pending.is_empty());
+            assert_ne!(timers.time_until_earliest(Timestamp::from_micros(1), 0), 0);
+        }
+
+        #[test]
+        fn partial_send_retains_unsent_tail_in_order() {
+            let mut conn = SrtConnection::new_caller(ConnectionOptions::default());
+            let mut timers = ManualTimerStore::new();
+            let mut pending = VecDeque::from([
+                ConnectionOutput::SendPacket(vec![1]),
+                ConnectionOutput::SendPacket(vec![2]),
+                ConnectionOutput::SendPacket(vec![3]),
+            ]);
+            let report = drain_outputs_with(
+                &mut conn,
+                &mut timers,
+                &mut pending,
+                Timestamp::default(),
+                OutputDrainBudget::default(),
+                |_| Ok(1),
+            )
+            .expect("partial send yields");
+            assert_eq!(report.packets, 1);
+            assert_eq!(report.status, OutputDrainStatus::Backpressured);
+            assert_eq!(
+                pending.into_iter().collect::<Vec<_>>(),
+                vec![
+                    ConnectionOutput::SendPacket(vec![2]),
+                    ConnectionOutput::SendPacket(vec![3]),
+                ]
+            );
+        }
+
+        #[test]
+        fn packet_and_byte_budget_yields_with_tail_queued() {
+            let mut conn = SrtConnection::new_caller(ConnectionOptions::default());
+            let mut timers = ManualTimerStore::new();
+            let mut pending = VecDeque::from([
+                ConnectionOutput::SendPacket(vec![1, 1]),
+                ConnectionOutput::SendPacket(vec![2, 2]),
+            ]);
+            let report = drain_outputs_with(
+                &mut conn,
+                &mut timers,
+                &mut pending,
+                Timestamp::default(),
+                OutputDrainBudget::new(8, 8, 2),
+                |batch| Ok(batch.len()),
+            )
+            .expect("bounded send succeeds");
+
+            assert_eq!(report.status, OutputDrainStatus::BudgetExhausted);
+            assert_eq!(report.packets, 1);
+            assert_eq!(report.bytes, 2);
+            assert_eq!(
+                pending,
+                VecDeque::from([ConnectionOutput::SendPacket(vec![2, 2])])
+            );
+        }
+    }
 }
 
 #[cfg(feature = "tokio")]
 pub mod tokio_transport {
+    use crate::{
+        OutputDrainBudget, OutputDrainReport, OutputDrainStatus, collect_output_work,
+        prepend_outputs,
+    };
     use shiguredo_srt::{ConnectionEvent, ConnectionOutput, SrtConnection, Timestamp};
+    use std::collections::VecDeque;
+    use std::io;
     use std::time::Duration;
     use tokio::net::UdpSocket;
 
@@ -1171,6 +1665,7 @@ pub mod tokio_transport {
         pub conn: SrtConnection,
         pub sock: UdpSocket,
         timers: crate::ManualTimerStore,
+        pending_outputs: VecDeque<ConnectionOutput>,
     }
 
     impl Conn {
@@ -1179,6 +1674,7 @@ pub mod tokio_transport {
                 conn,
                 sock,
                 timers: crate::ManualTimerStore::new(),
+                pending_outputs: VecDeque::new(),
             }
         }
 
@@ -1190,16 +1686,72 @@ pub mod tokio_transport {
             self.timers.fire_expired(now, &mut self.conn);
         }
 
-        /// Drain all protocol outputs with native tokio timer management.
+        /// Compatibility wrapper using [`OutputDrainBudget::default`].
         pub async fn drain_outputs(&mut self, now: Timestamp) {
-            while let Some(out) = self.conn.poll_output() {
-                match out {
-                    ConnectionOutput::SendPacket(bytes) => {
-                        let _ = self.sock.send(&bytes).await;
+            let _ = self
+                .drain_outputs_bounded(now, OutputDrainBudget::default())
+                .await;
+        }
+
+        /// Drain a bounded amount of output. A failed datagram and every
+        /// action after it remain queued in protocol order for the next tick.
+        pub async fn drain_outputs_bounded(
+            &mut self,
+            now: Timestamp,
+            budget: OutputDrainBudget,
+        ) -> io::Result<OutputDrainReport> {
+            let (mut work, budget_exhausted) =
+                collect_output_work(&mut self.conn, &mut self.pending_outputs, budget);
+            let mut report = OutputDrainReport {
+                status: if budget_exhausted {
+                    OutputDrainStatus::BudgetExhausted
+                } else {
+                    OutputDrainStatus::Drained
+                },
+                ..OutputDrainReport::default()
+            };
+
+            while let Some(output) = work.pop_front() {
+                match output {
+                    ConnectionOutput::SendPacket(bytes) => match self.sock.send(&bytes).await {
+                        Ok(sent) if sent == bytes.len() => {
+                            report.actions += 1;
+                            report.packets += 1;
+                            report.bytes += sent;
+                        }
+                        Ok(_) => {
+                            prepend_outputs(&mut self.pending_outputs, work.into_iter());
+                            self.pending_outputs
+                                .push_front(ConnectionOutput::SendPacket(bytes));
+                            return Err(io::Error::new(
+                                io::ErrorKind::WriteZero,
+                                "UDP send completed with a partial datagram",
+                            ));
+                        }
+                        Err(error) => {
+                            prepend_outputs(&mut self.pending_outputs, work.into_iter());
+                            self.pending_outputs
+                                .push_front(ConnectionOutput::SendPacket(bytes));
+                            if error.kind() == io::ErrorKind::WouldBlock {
+                                report.status = OutputDrainStatus::Backpressured;
+                                return Ok(report);
+                            }
+                            return Err(error);
+                        }
+                    },
+                    timer => {
+                        self.timers.apply_output(&timer, now);
+                        report.actions += 1;
                     }
-                    other => self.timers.apply_output(&other, now),
                 }
             }
+
+            Ok(report)
+        }
+
+        #[must_use]
+        pub fn has_pending_outputs(&self) -> bool {
+            !self.pending_outputs.is_empty()
         }
 
         /// Recv with timeout, feed to protocol.

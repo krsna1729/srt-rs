@@ -140,10 +140,10 @@ fn test_handshake_retransmits_after_packet_loss() {
     while caller.poll_output().is_some() {}
 
     caller
-        .handle_timer(TimerId::Handshake, ts(3_000_000))
+        .handle_timer(TimerId::Handshake, ts(2_750_000))
         .expect("caller conclusion retry");
-    transfer_caller_to_listener(&mut caller, &mut listener, ts(3_000_000));
-    transfer_listener_to_caller(&mut listener, &mut caller, ts(3_000_000));
+    transfer_caller_to_listener(&mut caller, &mut listener, ts(2_750_000));
+    transfer_listener_to_caller(&mut listener, &mut caller, ts(2_750_000));
 
     assert_eq!(caller.state(), ConnectionState::Connected);
     assert_eq!(listener.state(), ConnectionState::Connected);

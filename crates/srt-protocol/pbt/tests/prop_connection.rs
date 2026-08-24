@@ -77,8 +77,8 @@ proptest! {
 
     /// プロパティ: ハンドシェイク再試行上限後は必ず Disconnected 状態になる
     #[test]
-    fn prop_handshake_retry_ceiling_always_disconnects(
-        timeout_time in 0u64..u64::MAX / 2,
+    fn prop_handshake_deadline_always_disconnects(
+        _case in 0u8..1u8,
     ) {
         let mut conn = SrtConnection::new_caller(make_opts(1));
         let now = Timestamp::from_micros(0);
@@ -86,10 +86,8 @@ proptest! {
         conn.connect(now).expect("接続は成功する想定");
         drain_packets(&mut conn);
 
-        for _ in 0..=5 {
-            conn.handle_timer(TimerId::Handshake, Timestamp::from_micros(timeout_time))
-                .expect("タイマー処理は成功する想定");
-        }
+        conn.handle_timer(TimerId::Handshake, Timestamp::from_micros(3_000_000))
+            .expect("タイマー処理は成功する想定");
 
         prop_assert_eq!(conn.state(), ConnectionState::Disconnected);
     }

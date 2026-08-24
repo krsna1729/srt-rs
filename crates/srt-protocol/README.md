@@ -26,6 +26,12 @@ protocol testable, benchmarkable, and fuzzable with zero sockets.
 | `stream_id` | StreamID + `#!::k=v,…` access-control parsing (`AccessControl`, `StreamType`, `StreamMode`) |
 | `buf`, `error`, `time` | Checked big-endian read/write cursor helpers, `Error`/`ErrorKind` with backtrace capture, `Timestamp` (µs, injected) |
 
+Handshake attempts default to libsrt-compatible 250 ms request spacing
+with non-early jitter and a 3 s deadline for the complete induction plus
+conclusion exchange. Applications needing different bounds can call
+`SrtConnection::set_handshake_timing(retry_interval_micros,
+timeout_micros)` before starting or admitting a connection.
+
 ## Core API
 
 ```rust

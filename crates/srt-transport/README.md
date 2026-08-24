@@ -37,6 +37,11 @@ Three layers:
    - `ManualTimerStore` — `HashMap<TimerId, Timestamp>` with O(n) scan on
      fire. The correct primitive for mio (no timer wheel) and the explicit
      fallback elsewhere.
+   - `DueIndex<K>` — a lazy-deletion deadline heap for shared loops that
+     own many connections. Per-connection timer maps stay small; the index
+     prevents a separate O(peers) scan just to find which maps are due.
+   - `OutputDrainBudget` / `OutputDrainReport` — explicit per-tick action,
+     packet, and byte limits for the stable mio and Tokio output pumps.
 
 2. **Admission machinery** (always compiled, runtime-neutral, does no I/O
    of its own — the caller performs every send)
@@ -45,10 +50,12 @@ Three layers:
      connection is promoted, relocated, or retired. Mints each
      connection's SYN cookie, applies cookie routing, and answers
      `all_terminal()`.
-   - `poll_outbound()` / `drain_events()` — the maintenance tick. Timers
-     fire and protocol events fold into bookkeeping inside the table;
-     only the datagrams come back, because sending is the one genuinely
-     per-runtime part.
+   - `poll_outbound()` uses a ready queue plus `DueIndex` to service only
+     peers with input/output work or a due timer.
+   - `poll_events()` returns unmodified `AdmissionEvent`s (including data
+     payloads) for production consumers. `drain_events()` is the legacy
+     benchmark adapter that folds those events into counters and promotion
+     timing.
    - `Handoff` / `WorkerMessage` — the acceptor-to-worker protocol. A
      `Handoff` carries a plain `std::net::UdpSocket` plus a bare
      `SrtConnection` because both are `Send`, whereas every runtime's own
@@ -97,7 +104,9 @@ backend by argument, not by trait object. Same rationale as
 use srt_transport::mio_transport::Conn;
 
 let mut conn = Conn::new(srt_connection, mio_socket);
-conn.drain_outputs(now);                       // flush pending packets + timers
+let report = conn.drain_outputs_bounded(now, Default::default())?;
+// A BudgetExhausted/Backpressured report means yield and service it again;
+// unsent datagrams remain queued in order.
 let timeout = conn.poll_timeout(Duration::from_millis(20), now);
 // poll.poll(&mut events, Some(timeout)); ... feed datagrams to conn.conn
 conn.fire_expired(now);                        // service due timers

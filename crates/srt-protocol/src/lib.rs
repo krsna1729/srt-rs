@@ -18,7 +18,8 @@ pub use crypto::{CryptoContext, KeyFlag, KeyLength, KmRefreshState};
 pub use error::{Error, ErrorKind};
 pub use srt_connection::{
     ConnectionEvent, ConnectionOptions, ConnectionOutput, ConnectionRole, ConnectionState,
-    SrtConnection, TimerId,
+    DEFAULT_HANDSHAKE_RETRY_INTERVAL_MICROS, DEFAULT_HANDSHAKE_TIMEOUT_MICROS, SrtConnection,
+    TimerId,
 };
 pub use srt_group::{GroupMemberState, GroupMode, GroupPacket, SrtGroup, SrtGroupMember};
 pub use srt_handshake::peek_handshake;

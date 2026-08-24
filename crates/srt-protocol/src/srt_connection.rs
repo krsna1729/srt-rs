@@ -64,8 +64,14 @@ pub enum TimerId {
 /// 非活性タイムアウト時間 (マイクロ秒)
 /// SRT 仕様では通常 5 秒
 const INACTIVITY_TIMEOUT_MICROS: u64 = 5_000_000;
-const HANDSHAKE_RETRY_INTERVAL_MICROS: u64 = 1_000_000;
-const HANDSHAKE_MAX_RETRIES: u8 = 5;
+// local patch (crates/srt-protocol/VENDOR.md, not upstream-tracked): use
+// libsrt's request cadence with one whole-attempt deadline rather than a
+// retry-count approximation that resets between handshake phases.
+/// Default minimum spacing between handshake requests. libsrt sends at most
+/// one request per 250 ms while a connection attempt is in progress.
+pub const DEFAULT_HANDSHAKE_RETRY_INTERVAL_MICROS: u64 = 250_000;
+/// Default deadline for the complete induction + conclusion exchange.
+pub const DEFAULT_HANDSHAKE_TIMEOUT_MICROS: u64 = 3_000_000;
 const MIN_FLOW_WINDOW_PACKETS: u32 = 32;
 
 /// libsrt 互換ゼロパディング (4 バイト)
@@ -242,7 +248,10 @@ pub struct SrtConnection {
     /// Peer bonding group metadata.
     peer_group_extension: Option<GroupExtensionData>,
     last_handshake_packet: Option<Vec<u8>>,
-    handshake_retries: u8,
+    handshake_retry_sequence: u32,
+    handshake_started_at: Option<Timestamp>,
+    handshake_retry_interval_micros: u64,
+    handshake_timeout_micros: u64,
 }
 
 fn normalize_buffer_options(mut options: ConnectionOptions) -> ConnectionOptions {
@@ -280,7 +289,10 @@ impl SrtConnection {
             peer_stream_id: None,
             peer_group_extension: None,
             last_handshake_packet: None,
-            handshake_retries: 0,
+            handshake_retry_sequence: 0,
+            handshake_started_at: None,
+            handshake_retry_interval_micros: DEFAULT_HANDSHAKE_RETRY_INTERVAL_MICROS,
+            handshake_timeout_micros: DEFAULT_HANDSHAKE_TIMEOUT_MICROS,
         }
     }
 
@@ -309,7 +321,10 @@ impl SrtConnection {
             peer_stream_id: None,
             peer_group_extension: None,
             last_handshake_packet: None,
-            handshake_retries: 0,
+            handshake_retry_sequence: 0,
+            handshake_started_at: None,
+            handshake_retry_interval_micros: DEFAULT_HANDSHAKE_RETRY_INTERVAL_MICROS,
+            handshake_timeout_micros: DEFAULT_HANDSHAKE_TIMEOUT_MICROS,
         }
     }
 
@@ -381,6 +396,19 @@ impl SrtConnection {
         self.options.group_extension = Some(group);
     }
 
+    /// Configure retry spacing and the deadline for the whole handshake.
+    ///
+    /// Jitter is added only after `retry_interval_micros`, so a retry is
+    /// never scheduled earlier than the requested cadence. Both values are
+    /// clamped to at least one microsecond and the whole-attempt timeout is
+    /// clamped to at least the retry interval.
+    pub fn set_handshake_timing(&mut self, retry_interval_micros: u64, timeout_micros: u64) {
+        self.handshake_retry_interval_micros = retry_interval_micros.max(1);
+        self.handshake_timeout_micros = timeout_micros
+            .max(1)
+            .max(self.handshake_retry_interval_micros);
+    }
+
     /// 接続を開始 (Caller のみ)
     pub fn connect(&mut self, now: Timestamp) -> Result<(), Error> {
         if self.role != ConnectionRole::Caller {
@@ -388,11 +416,12 @@ impl SrtConnection {
         }
 
         self.start_time = Some(now);
-        self.handshake_retries = 0;
+        self.handshake_started_at = Some(now);
+        self.handshake_retry_sequence = 0;
         self.send_induction_request(now);
         self.set_state(ConnectionState::Induction);
         self.handshake_state = HandshakeState::InductionSent;
-        self.arm_handshake_timer();
+        self.arm_handshake_timer(now);
 
         Ok(())
     }
@@ -489,15 +518,13 @@ impl SrtConnection {
         match timer_id {
             TimerId::Handshake => {
                 if self.state != ConnectionState::Connected {
-                    if self.handshake_retries >= HANDSHAKE_MAX_RETRIES {
-                        self.event_queue
-                            .push_back(ConnectionEvent::Error("handshake timeout".to_string()));
-                        self.set_state(ConnectionState::Disconnected);
-                        self.handshake_state = HandshakeState::Failed;
+                    if self.handshake_timed_out(now) {
+                        self.fail_handshake_timeout();
                     } else {
-                        self.handshake_retries = self.handshake_retries.saturating_add(1);
+                        self.handshake_retry_sequence =
+                            self.handshake_retry_sequence.saturating_add(1);
                         self.retransmit_handshake();
-                        self.arm_handshake_timer();
+                        self.arm_handshake_timer(now);
                     }
                 }
             }
@@ -879,6 +906,10 @@ impl SrtConnection {
     }
 
     fn handle_handshake(&mut self, pkt: ControlPacket, now: Timestamp) -> Result<(), Error> {
+        if self.handshake_timed_out(now) {
+            self.fail_handshake_timeout();
+            return Ok(());
+        }
         let hs = HandshakePacket::decode(&pkt)?;
 
         match self.role {
@@ -938,8 +969,7 @@ impl SrtConnection {
                 // CONCLUSION を送信
                 self.send_conclusion_request(now);
                 self.handshake_state = HandshakeState::ConclusionSent;
-                self.handshake_retries = 0;
-                self.arm_handshake_timer();
+                self.arm_handshake_timer(now);
             }
             HandshakeType::Conclusion => {
                 // CONCLUSION レスポンス受信 → 接続完了
@@ -988,7 +1018,7 @@ impl SrtConnection {
                 }
 
                 self.handshake_state = HandshakeState::Completed;
-                self.handshake_retries = 0;
+                self.handshake_started_at = None;
                 self.set_state(ConnectionState::Connected);
                 self.start_time = Some(now);
 
@@ -1045,12 +1075,15 @@ impl SrtConnection {
                 }
                 self.peer_socket_id = hs.socket_id;
                 self.syn_cookie = self.options.syn_cookie.unwrap_or(0);
+                if self.handshake_started_at.is_none() {
+                    self.handshake_started_at = Some(now);
+                    self.handshake_retry_sequence = 0;
+                }
 
                 // INDUCTION レスポンス送信
                 self.send_induction_response(now);
                 self.handshake_state = HandshakeState::InductionReceived;
-                self.handshake_retries = 0;
-                self.arm_handshake_timer();
+                self.arm_handshake_timer(now);
             }
             HandshakeType::Conclusion => {
                 // CONCLUSION リクエスト受信
@@ -1100,7 +1133,7 @@ impl SrtConnection {
                 // CONCLUSION レスポンス送信
                 self.send_conclusion_response(now);
                 self.handshake_state = HandshakeState::Completed;
-                self.handshake_retries = 0;
+                self.handshake_started_at = None;
                 self.set_state(ConnectionState::Connected);
                 self.start_time = Some(now);
 
@@ -1109,6 +1142,10 @@ impl SrtConnection {
 
                 // バッファ初期化
                 self.init_buffers(now, hs.initial_packet_seq, tsbpd_time_base);
+
+                self.output_queue.push_back(ConnectionOutput::ClearTimer {
+                    id: TimerId::Handshake,
+                });
 
                 // タイマー設定
                 self.setup_connection_timers();
@@ -1582,28 +1619,54 @@ impl SrtConnection {
         }
     }
 
-    fn arm_handshake_timer(&mut self) {
-        // Nominal 1 s interval, but under massive fan-in all connections'
-        // retry timers align (thundering herd) and the listener saturates,
-        // causing handshakes to miss (seen at 1200 conns, 2026-08-21).
-        // Spread each retry by +-20% to desynchronize. Total timeout
-        // (HANDSHAKE_MAX_RETRIES=5 x ~1 s ~= 5 s) is the connect deadline.
+    fn handshake_timed_out(&self, now: Timestamp) -> bool {
+        self.handshake_started_at
+            .is_some_and(|started| now.saturating_sub(started) >= self.handshake_timeout_micros)
+    }
+
+    fn fail_handshake_timeout(&mut self) {
+        if self.handshake_state == HandshakeState::Failed {
+            return;
+        }
+        self.event_queue
+            .push_back(ConnectionEvent::Error("handshake timeout".to_string()));
+        self.set_state(ConnectionState::Disconnected);
+        self.handshake_state = HandshakeState::Failed;
+        self.handshake_started_at = None;
+        self.output_queue.push_back(ConnectionOutput::ClearTimer {
+            id: TimerId::Handshake,
+        });
+    }
+
+    fn arm_handshake_timer(&mut self, now: Timestamp) {
+        // Spread retries later by up to 20% to desynchronize fan-in without
+        // violating libsrt's "at most one request per interval" cadence.
         let jitter = {
             use std::hash::{BuildHasher, Hasher};
             // Not cryptographic: per-connection nondeterministic PRNG via
             // RandomState (&mut self cannot hold state).
             let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
             hasher.write_u32(self.options.socket_id);
-            hasher.write_u32(self.handshake_retries.into());
+            hasher.write_u32(self.handshake_retry_sequence);
             hasher.write_u64(self.initial_seq.into());
             hasher.finish()
         };
-        let spread = (HANDSHAKE_RETRY_INTERVAL_MICROS / 5) as i64; // +-20%
-        let offset = (jitter % (2 * spread as u64 + 1)) as i64 - spread;
-        let interval = (HANDSHAKE_RETRY_INTERVAL_MICROS as i64 + offset).max(50_000) as u64;
+        let spread = self.handshake_retry_interval_micros / 5;
+        let interval = self
+            .handshake_retry_interval_micros
+            .saturating_add(jitter % spread.saturating_add(1));
+        // The final timer is a deadline wake-up, not another early retry.
+        let remaining = self
+            .handshake_started_at
+            .map(|started| {
+                started
+                    .add_micros(self.handshake_timeout_micros)
+                    .saturating_sub(now)
+            })
+            .unwrap_or(self.handshake_timeout_micros);
         self.output_queue.push_back(ConnectionOutput::SetTimer {
             id: TimerId::Handshake,
-            duration_micros: interval,
+            duration_micros: interval.min(remaining),
         });
     }
 
@@ -1756,6 +1819,70 @@ mod tests {
         let conn = SrtConnection::new_caller(ConnectionOptions::default());
         assert_eq!(conn.state(), ConnectionState::Disconnected);
         assert_eq!(conn.role, ConnectionRole::Caller);
+    }
+
+    #[test]
+    fn handshake_retry_is_not_armed_early() {
+        let mut conn = SrtConnection::new_caller(ConnectionOptions::default());
+        conn.connect(Timestamp::from_micros(0))
+            .expect("caller connection starts");
+
+        assert!(matches!(
+            conn.poll_output(),
+            Some(ConnectionOutput::SendPacket(_))
+        ));
+        let Some(ConnectionOutput::SetTimer {
+            id: TimerId::Handshake,
+            duration_micros,
+        }) = conn.poll_output()
+        else {
+            panic!("caller arms its handshake retry");
+        };
+        assert!(duration_micros >= DEFAULT_HANDSHAKE_RETRY_INTERVAL_MICROS);
+        assert!(duration_micros <= DEFAULT_HANDSHAKE_RETRY_INTERVAL_MICROS * 6 / 5);
+    }
+
+    #[test]
+    fn handshake_deadline_covers_all_phases() {
+        let mut conn = SrtConnection::new_caller(ConnectionOptions::default());
+        conn.connect(Timestamp::from_micros(0))
+            .expect("caller connection starts");
+        while conn.poll_output().is_some() {}
+
+        conn.handle_timer(
+            TimerId::Handshake,
+            Timestamp::from_micros(DEFAULT_HANDSHAKE_TIMEOUT_MICROS),
+        )
+        .expect("deadline processing succeeds");
+
+        assert_eq!(conn.state(), ConnectionState::Disconnected);
+        assert!(matches!(
+            conn.poll_event(),
+            Some(ConnectionEvent::StateChanged(ConnectionState::Induction))
+        ));
+        assert!(
+            matches!(conn.poll_event(), Some(ConnectionEvent::Error(message)) if message == "handshake timeout")
+        );
+    }
+
+    #[test]
+    fn custom_handshake_timing_is_honored() {
+        let mut conn = SrtConnection::new_caller(ConnectionOptions::default());
+        conn.set_handshake_timing(400_000, 900_000);
+        conn.connect(Timestamp::from_micros(100_000))
+            .expect("caller connection starts");
+        let _ = conn.poll_output();
+        let Some(ConnectionOutput::SetTimer {
+            duration_micros, ..
+        }) = conn.poll_output()
+        else {
+            panic!("caller arms its handshake retry");
+        };
+        assert!((400_000..=480_000).contains(&duration_micros));
+
+        conn.handle_timer(TimerId::Handshake, Timestamp::from_micros(1_000_000))
+            .expect("deadline processing succeeds");
+        assert_eq!(conn.state(), ConnectionState::Disconnected);
     }
 
     #[test]
