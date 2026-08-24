@@ -504,7 +504,7 @@ impl BenchConfig {
             flags: 0,
             // Give backup legs an unambiguous active/standby ordering. A
             // broadcast group deliberately gives both legs equal weight.
-            weight: if self.bond_mode == BondMode::Backup && index % 2 != 0 {
+            weight: if self.bond_mode == BondMode::Backup && !index.is_multiple_of(2) {
                 0
             } else {
                 1

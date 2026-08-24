@@ -65,8 +65,15 @@ Three layers:
    - Bonded input is an explicit `BondedInputPolicy`: `Reject` is the default,
      preventing silent degradation into unrelated single-leg publishers.
      With `Accept`, `PeerTable` validates each leg normally, groups matching
-     `(group_id, normalized StreamID)` legs, and still emits one ordinary
-     logical `AdmissionEvent` stream under a stable representative peer.
+     `(group_id, normalized StreamID)` legs, and emits one ordinary logical
+     `AdmissionEvent` stream. Consumers retain `event.logical_peer` for
+     steady-state operations; its group identity stays valid if the first
+     physical leg disappears. `event.peer` is only that first leg's routing
+     address, retained for compatibility.
+   - `logical_peer()` / `logical_peer_mut()` give direct and bonded sessions
+     the same StreamID, send, orderly-close, and stats surface. Group stats
+     retain both the aggregate and every physical leg rather than flattening
+     a path failure into a single number.
    - `Handoff` / `WorkerMessage` — the acceptor-to-worker protocol. A
      `Handoff` carries a plain `std::net::UdpSocket` plus a bare
      `SrtConnection` because both are `Send`, whereas every runtime's own
@@ -84,6 +91,16 @@ Three layers:
      `SrtConnection` for every Broadcast or Backup leg. `drive()` is
      synchronous/nonblocking so an application registers `leg_sockets()` in
      its existing reactor rather than paying for a hidden second runtime.
+     `tokio_transport::GroupConn` is the equivalent Tokio-native driver and
+     owns `tokio::net::UdpSocket`s directly.
+   - Broadcast attempts every active leg with the same sequence number, but
+     succeeds when at least one accepts the payload. A full sender window
+     makes that leg `Unstable`, not broken: once its in-flight packets drain,
+     the shared group core aligns its sequence and restores it automatically.
+     The remaining legs keep the logical stream moving. Backup promotes a
+     standby leg while an unstable leg requalifies. This matches libsrt's
+     nonblocking group behavior: report backpressure only when no active
+     member accepts the payload.
    - `GroupConnectionStats` exposes both **per-leg** connection snapshots and
      a group aggregate. `logical_*` counts media once at the group API;
      `wire_*` sums physical legs, so Broadcast's duplicate egress and each

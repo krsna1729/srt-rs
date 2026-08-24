@@ -67,3 +67,7 @@ harness = false
 [[bench]]
 name = "collection_tradeoffs"
 harness = false
+
+[[bench]]
+name = "group_requalification"
+harness = false

@@ -1,6 +1,6 @@
 use shiguredo_srt::{
     ConnectionOptions, ConnectionOutput, ConnectionState, ControlType, GroupMemberState, GroupMode,
-    SrtConnection, SrtGroup, SrtPacket, Timestamp,
+    SrtConnection, SrtGroup, SrtPacket, TimerId, Timestamp,
 };
 
 fn ts(micros: u64) -> Timestamp {
@@ -18,13 +18,20 @@ fn transfer(caller: &mut SrtConnection, listener: &mut SrtConnection, now: Times
 }
 
 fn establish_pair() -> (SrtConnection, SrtConnection) {
-    let mut caller = SrtConnection::new_caller(ConnectionOptions {
+    establish_pair_with_options(ConnectionOptions {
         tsbpd_delay: 0,
         ..Default::default()
+    })
+}
+
+fn establish_pair_with_options(options: ConnectionOptions) -> (SrtConnection, SrtConnection) {
+    let mut caller = SrtConnection::new_caller(ConnectionOptions {
+        tsbpd_delay: 0,
+        ..options.clone()
     });
     let mut listener = SrtConnection::new_listener(ConnectionOptions {
         tsbpd_delay: 0,
-        ..Default::default()
+        ..options
     });
     caller.connect(ts(0)).expect("caller should connect");
     for round in 0..10 {
@@ -57,8 +64,10 @@ fn packets_from(connection: &mut SrtConnection) -> Vec<Vec<u8>> {
 
 #[test]
 fn broadcast_sends_one_sequence_to_every_active_member() {
-    let (caller_a, mut listener_a) = establish_pair();
-    let (caller_b, mut listener_b) = establish_pair();
+    let (mut caller_a, mut listener_a) = establish_pair();
+    let (mut caller_b, mut listener_b) = establish_pair();
+    caller_a.synchronize_send_sequence(100).unwrap();
+    caller_b.synchronize_send_sequence(200).unwrap();
     let mut group = SrtGroup::new(0x4000_0001, GroupMode::Broadcast).unwrap();
     group.add_member(1, 100, caller_a).unwrap();
     group.add_member(2, 100, caller_b).unwrap();
@@ -84,6 +93,47 @@ fn broadcast_sends_one_sequence_to_every_active_member() {
     listener_b
         .feed_recv_buf(&packets_b[0], ts(100_000))
         .unwrap();
+}
+
+#[test]
+fn broadcast_backpressure_requalifies_the_recovered_leg() {
+    let constrained = ConnectionOptions {
+        flow_window_packets: 3,
+        ..Default::default()
+    };
+    let (caller_a, mut listener_a) = establish_pair_with_options(constrained);
+    let (caller_b, _) = establish_pair();
+    let mut group = SrtGroup::new(0x4000_0015, GroupMode::Broadcast).unwrap();
+    group.add_member(1, 1, caller_a).unwrap();
+    group.add_member(2, 1, caller_b).unwrap();
+
+    let mut stalled_packets = Vec::new();
+    while group.member(1).unwrap().connection().can_send() {
+        assert_eq!(group.send(b"fill", ts(100_000)).unwrap(), 2);
+        stalled_packets.extend(packets_from(group.member_mut(1).unwrap().connection_mut()));
+        let _ = packets_from(group.member_mut(2).unwrap().connection_mut());
+    }
+
+    assert!(group.member(2).unwrap().connection().can_send());
+    assert!(group.can_send());
+    assert_eq!(group.send(b"continue", ts(101_000)).unwrap(), 1);
+    assert_eq!(group.member(1).unwrap().state(), GroupMemberState::Unstable);
+    assert_eq!(group.member(2).unwrap().state(), GroupMemberState::Active);
+
+    for packet in stalled_packets {
+        listener_a.feed_recv_buf(&packet, ts(102_000)).unwrap();
+        while listener_a.poll_event().is_some() {}
+    }
+    listener_a.handle_timer(TimerId::Ack, ts(103_000)).unwrap();
+    transfer(
+        &mut listener_a,
+        group.member_mut(1).unwrap().connection_mut(),
+        ts(103_000),
+    );
+
+    assert!(group.can_send());
+    assert_eq!(group.member(1).unwrap().state(), GroupMemberState::Active);
+    assert_eq!(group.send(b"rejoined", ts(104_000)).unwrap(), 2);
 }
 
 #[test]
@@ -141,6 +191,29 @@ fn backup_promotion_preserves_group_sequence() {
         .pop()
         .unwrap();
     assert_eq!(data_sequence(&backup_packet), 1);
+    assert_eq!(group.member(2).unwrap().state(), GroupMemberState::Active);
+}
+
+#[test]
+fn backup_backpressure_promotes_a_standby_leg() {
+    let options = ConnectionOptions {
+        flow_window_packets: 3,
+        ..Default::default()
+    };
+    let (primary, _) = establish_pair_with_options(options.clone());
+    let (backup, _) = establish_pair_with_options(options);
+    let mut group = SrtGroup::new(0x4000_0016, GroupMode::Backup).unwrap();
+    group.add_member(1, 100, primary).unwrap();
+    group.add_member(2, 1, backup).unwrap();
+
+    while group.member(1).unwrap().connection().can_send() {
+        assert_eq!(group.send(b"fill", ts(100_000)).unwrap(), 1);
+        let _ = packets_from(group.member_mut(1).unwrap().connection_mut());
+    }
+
+    assert!(!group.can_send());
+    assert_eq!(group.send(b"fail over", ts(101_000)).unwrap(), 1);
+    assert_eq!(group.member(1).unwrap().state(), GroupMemberState::Unstable);
     assert_eq!(group.member(2).unwrap().state(), GroupMemberState::Active);
 }
 

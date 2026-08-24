@@ -61,6 +61,7 @@ use std::collections::hash_map::Entry as HashEntry;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::hash::Hash;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use zeroize::Zeroize;
@@ -977,10 +978,199 @@ pub enum Admit {
     Dropped(AdmissionDropReason),
 }
 
+/// Stable application-facing identity for one admitted SRT publisher.
+///
+/// A direct connection keeps its socket address. A bonded publisher uses its
+/// wire group ID plus normalized StreamID, which remains stable if its first
+/// physical leg disappears while another is still carrying media.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum LogicalPeerId {
+    Direct(std::net::SocketAddr),
+    Group(Arc<srt_lifecycle::LogicalGroupKey>),
+}
+
+impl LogicalPeerId {
+    #[must_use]
+    pub const fn direct(peer: std::net::SocketAddr) -> Self {
+        Self::Direct(peer)
+    }
+
+    #[must_use]
+    pub fn group(key: srt_lifecycle::LogicalGroupKey) -> Self {
+        Self::Group(Arc::new(key))
+    }
+}
+
+/// Snapshot of a direct or bonded logical peer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LogicalPeerStats {
+    Direct(Box<shiguredo_srt::ConnectionStats>),
+    Group(Box<GroupConnectionStats>),
+}
+
+/// Borrowed steady-state view of an admitted SRT publisher.
+///
+/// It deliberately hides whether the peer is one socket or a bonded group:
+/// callers use the same StreamID and telemetry operations for both. Physical
+/// leg details remain available inside [`LogicalPeerStats::Group`].
+pub struct LogicalPeer<'a> {
+    table: &'a PeerTable,
+    id: LogicalPeerId,
+}
+
+impl LogicalPeer<'_> {
+    #[must_use]
+    pub fn id(&self) -> &LogicalPeerId {
+        &self.id
+    }
+
+    #[must_use]
+    pub fn stream_id(&self) -> Option<&str> {
+        match &self.id {
+            LogicalPeerId::Direct(peer) => self
+                .table
+                .peers
+                .get(peer)
+                .and_then(|entry| entry.conn.peer_stream_id()),
+            LogicalPeerId::Group(key) => key.stream_id.as_deref(),
+        }
+    }
+
+    #[must_use]
+    pub fn stats(&self) -> Option<LogicalPeerStats> {
+        match &self.id {
+            LogicalPeerId::Direct(peer) => self
+                .table
+                .peers
+                .get(peer)
+                .map(|entry| LogicalPeerStats::Direct(Box::new(entry.conn.stats()))),
+            LogicalPeerId::Group(key) => self.table.groups.get(key.as_ref()).map(|group| {
+                LogicalPeerStats::Group(Box::new(group_connection_stats(
+                    &group.group,
+                    GroupLogicalCounters {
+                        payloads_sent: group.logical_payloads_sent,
+                        payload_bytes_sent: group.logical_payload_bytes_sent,
+                        payloads_received: group.logical_payloads_received,
+                        payload_bytes_received: group.logical_payload_bytes_received,
+                    },
+                    |member_id| {
+                        let peer_addr = group.legs.get(&member_id).map(|leg| leg.peer);
+                        (None, peer_addr)
+                    },
+                )))
+            }),
+        }
+    }
+}
+
+/// Mutable steady-state view of an admitted SRT publisher.
+///
+/// [`Self::send`] and [`Self::disconnect`] arrange the table's maintenance
+/// work, so callers do not need separate direct-peer and group-peer paths.
+pub struct LogicalPeerMut<'a> {
+    table: &'a mut PeerTable,
+    id: LogicalPeerId,
+}
+
+impl LogicalPeerMut<'_> {
+    #[must_use]
+    pub fn id(&self) -> &LogicalPeerId {
+        &self.id
+    }
+
+    #[must_use]
+    pub fn stream_id(&self) -> Option<&str> {
+        match &self.id {
+            LogicalPeerId::Direct(peer) => self
+                .table
+                .peers
+                .get(peer)
+                .and_then(|entry| entry.conn.peer_stream_id()),
+            LogicalPeerId::Group(key) => key.stream_id.as_deref(),
+        }
+    }
+
+    #[must_use]
+    pub fn stats(&self) -> Option<LogicalPeerStats> {
+        self.table
+            .logical_peer(&self.id)
+            .and_then(|peer| peer.stats())
+    }
+
+    /// Whether a send can be accepted without violating the group's
+    /// Broadcast or Backup semantics.
+    pub fn can_send(&mut self) -> bool {
+        match &self.id {
+            LogicalPeerId::Direct(peer) => self
+                .table
+                .peers
+                .get(peer)
+                .is_some_and(|entry| entry.conn.can_send()),
+            LogicalPeerId::Group(key) => self
+                .table
+                .groups
+                .get_mut(key.as_ref())
+                .is_some_and(|group| group.group.can_send()),
+        }
+    }
+
+    /// Send one logical payload. Broadcast returns one successful physical
+    /// leg per healthy active member; Backup returns one selected leg.
+    pub fn send(&mut self, payload: &[u8], now: Timestamp) -> Result<usize, shiguredo_srt::Error> {
+        match &self.id {
+            LogicalPeerId::Direct(peer) => {
+                let entry = self.table.peers.get_mut(peer).ok_or_else(|| {
+                    shiguredo_srt::Error::with_reason(
+                        shiguredo_srt::ErrorKind::InvalidState,
+                        "logical peer no longer exists",
+                    )
+                })?;
+                entry.conn.send(payload, now)?;
+                self.table.mark_ready(*peer);
+                Ok(1)
+            }
+            LogicalPeerId::Group(key) => {
+                let group = self.table.groups.get_mut(key.as_ref()).ok_or_else(|| {
+                    shiguredo_srt::Error::with_reason(
+                        shiguredo_srt::ErrorKind::InvalidState,
+                        "logical peer no longer exists",
+                    )
+                })?;
+                let legs = group.group.send(payload, now)?;
+                group.logical_payloads_sent = group.logical_payloads_sent.saturating_add(1);
+                group.logical_payload_bytes_sent = group
+                    .logical_payload_bytes_sent
+                    .saturating_add(payload.len() as u64);
+                Ok(legs)
+            }
+        }
+    }
+
+    /// Start an orderly close. A bonded peer closes every leg but remains in
+    /// the table until the usual transport lifecycle reaches its terminal
+    /// state.
+    pub fn disconnect(&mut self, now: Timestamp) {
+        match &self.id {
+            LogicalPeerId::Direct(peer) => {
+                if let Some(entry) = self.table.peers.get_mut(peer) {
+                    entry.conn.disconnect(now);
+                    self.table.mark_ready(*peer);
+                }
+            }
+            LogicalPeerId::Group(key) => {
+                if let Some(group) = self.table.groups.get_mut(key.as_ref()) {
+                    group.group.disconnect(now);
+                }
+            }
+        }
+    }
+}
+
 /// One logical ingress event emitted by an admitted peer or bonded group.
 ///
-/// For an opted-in bonded publisher, `peer` is the stable first admitted leg
-/// and `DataReceived` has already been ordered and deduplicated across legs.
+/// For an opted-in bonded publisher, `peer` is its first admitted leg and
+/// `logical_peer` is the stable session identity. `DataReceived` has already
+/// been ordered and deduplicated across legs.
 /// Otherwise this is the unmodified protocol event. Production consumers
 /// should use [`PeerTable::poll_events`]; the benchmark-only
 /// [`PeerTable::drain_events`] adapter remains for its legacy counters and
@@ -988,6 +1178,7 @@ pub enum Admit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdmissionEvent {
     pub peer: std::net::SocketAddr,
+    pub logical_peer: LogicalPeerId,
     pub event: ConnectionEvent,
 }
 
@@ -1001,6 +1192,7 @@ struct InboundGroup {
     group: shiguredo_srt::SrtGroup,
     legs: HashMap<u32, InboundGroupLeg>,
     representative_peer: std::net::SocketAddr,
+    logical_peer: LogicalPeerId,
     connected: bool,
     stream_deadline: Option<Instant>,
     data_events: u64,
@@ -1008,6 +1200,8 @@ struct InboundGroup {
     torn_down: bool,
     logical_payloads_received: u64,
     logical_payload_bytes_received: u64,
+    logical_payloads_sent: u64,
+    logical_payload_bytes_sent: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -1132,6 +1326,7 @@ impl PeerTable {
                     group,
                     legs: HashMap::new(),
                     representative_peer: peer,
+                    logical_peer: LogicalPeerId::group(key.clone()),
                     connected: false,
                     stream_deadline: None,
                     data_events: 0,
@@ -1139,6 +1334,8 @@ impl PeerTable {
                     torn_down: false,
                     logical_payloads_received: 0,
                     logical_payload_bytes_received: 0,
+                    logical_payloads_sent: 0,
+                    logical_payload_bytes_sent: 0,
                 },
             );
         }
@@ -1396,7 +1593,7 @@ impl PeerTable {
             let packet = handshake
                 .as_ref()
                 .expect("a conclusion identity came from a decoded handshake");
-            let group_admission_allowed = self.group_admission_allowed(&identity, packet, options);
+            let group_admission_allowed = self.group_admission_allowed(identity, packet, options);
             if self
                 .peers
                 .get(&peer)
@@ -1788,7 +1985,11 @@ impl PeerTable {
                 continue;
             };
             while let Some(event) = entry.conn.poll_event() {
-                out.push(AdmissionEvent { peer, event });
+                out.push(AdmissionEvent {
+                    peer,
+                    logical_peer: LogicalPeerId::Direct(peer),
+                    event,
+                });
             }
         }
         for group in self.groups.values_mut() {
@@ -1799,6 +2000,7 @@ impl PeerTable {
                             group.connected = true;
                             out.push(AdmissionEvent {
                                 peer: group.representative_peer,
+                                logical_peer: group.logical_peer.clone(),
                                 event: ConnectionEvent::Connected,
                             });
                         }
@@ -1813,6 +2015,7 @@ impl PeerTable {
                             .saturating_add(packet.payload.len() as u64);
                         out.push(AdmissionEvent {
                             peer: group.representative_peer,
+                            logical_peer: group.logical_peer.clone(),
                             event: ConnectionEvent::DataReceived {
                                 payload: packet.payload,
                                 sequence_number: packet.sequence_number,
@@ -1833,6 +2036,7 @@ impl PeerTable {
                         group.torn_down |= !is_ordered_close(&error);
                         out.push(AdmissionEvent {
                             peer: group.representative_peer,
+                            logical_peer: group.logical_peer.clone(),
                             event: ConnectionEvent::Disconnected { reason: error },
                         });
                     }
@@ -1897,6 +2101,37 @@ impl PeerTable {
     /// next maintenance pass observes it promptly.
     pub fn get_mut(&mut self, peer: &std::net::SocketAddr) -> Option<&mut AdmissionPeer> {
         self.peers.get_mut(peer)
+    }
+
+    /// Return the steady-state view for either an ordinary connection or an
+    /// opted-in bonded group. New consumers should retain this identity from
+    /// [`AdmissionEvent::logical_peer`] rather than using a bonded group's
+    /// representative socket address as a session key.
+    #[must_use]
+    pub fn logical_peer(&self, id: &LogicalPeerId) -> Option<LogicalPeer<'_>> {
+        match id {
+            LogicalPeerId::Direct(peer) if self.peers.contains_key(peer) => Some(LogicalPeer {
+                table: self,
+                id: id.clone(),
+            }),
+            LogicalPeerId::Group(key) if self.groups.contains_key(key.as_ref()) => {
+                Some(LogicalPeer {
+                    table: self,
+                    id: id.clone(),
+                })
+            }
+            LogicalPeerId::Direct(_) | LogicalPeerId::Group(_) => None,
+        }
+    }
+
+    /// Return the mutable steady-state view for either an ordinary connection
+    /// or an opted-in bonded group.
+    pub fn logical_peer_mut(&mut self, id: &LogicalPeerId) -> Option<LogicalPeerMut<'_>> {
+        self.logical_peer(id)?;
+        Some(LogicalPeerMut {
+            table: self,
+            id: id.clone(),
+        })
     }
 
     pub fn remove(&mut self, peer: &std::net::SocketAddr) -> Option<AdmissionPeer> {
@@ -1999,9 +2234,10 @@ impl PeerTable {
                 connection: group_connection_stats(
                     &group.group,
                     GroupLogicalCounters {
+                        payloads_sent: group.logical_payloads_sent,
+                        payload_bytes_sent: group.logical_payload_bytes_sent,
                         payloads_received: group.logical_payloads_received,
                         payload_bytes_received: group.logical_payload_bytes_received,
-                        ..GroupLogicalCounters::default()
                     },
                     |member_id| {
                         let peer_addr = group.legs.get(&member_id).map(|leg| leg.peer);
@@ -2736,10 +2972,56 @@ mod tests {
             events,
             vec![AdmissionEvent {
                 peer: first,
+                logical_peer: LogicalPeerId::group(srt_lifecycle::LogicalGroupKey {
+                    group_id,
+                    stream_id: Some("publish:bonded".to_string()),
+                }),
                 event: ConnectionEvent::Connected
             }]
         );
+        let logical_peer = events[0].logical_peer.clone();
+        assert_eq!(
+            table
+                .logical_peer(&logical_peer)
+                .expect("logical group exists")
+                .stream_id(),
+            Some("publish:bonded")
+        );
         assert_eq!(table.bonded_stats()[0].connection.legs.len(), 2);
+
+        let mut group = table
+            .logical_peer_mut(&logical_peer)
+            .expect("logical group exists");
+        assert!(group.can_send());
+        assert_eq!(
+            group
+                .send(b"one logical reply", Timestamp::from_micros(3))
+                .expect("group sends on every active Broadcast leg"),
+            2
+        );
+        let group_stats = group.stats().expect("group stats remain available");
+        assert!(matches!(
+            group_stats,
+            LogicalPeerStats::Group(stats)
+                if stats.aggregate.logical_payloads_sent == 1
+                    && stats.aggregate.logical_payload_bytes_sent == 17
+                    && stats.legs.len() == 2
+        ));
+        drop(group);
+
+        let mut outbound = Vec::new();
+        table.poll_outbound(Timestamp::from_micros(3), &mut outbound);
+        assert_eq!(
+            outbound
+                .iter()
+                .filter(|(_, packet)| matches!(
+                    shiguredo_srt::SrtPacket::decode(packet),
+                    Ok(shiguredo_srt::SrtPacket::Data(_))
+                ))
+                .count(),
+            2,
+            "one Broadcast logical send is emitted on both physical legs"
+        );
 
         first_caller
             .send(b"one logical payload", Timestamp::from_micros(4))
@@ -2788,6 +3070,81 @@ mod tests {
         );
         assert_eq!(stats[0].connection.legs.len(), 2);
         assert_eq!(stats[0].connection.aggregate.wire_packets_received, 2);
+
+        table
+            .logical_peer_mut(&logical_peer)
+            .expect("logical group remains until normal teardown")
+            .disconnect(Timestamp::from_micros(6));
+        table.poll_outbound(Timestamp::from_micros(6), &mut outbound);
+        assert_eq!(
+            outbound
+                .iter()
+                .filter(|(_, packet)| matches!(shiguredo_srt::SrtPacket::decode(packet), Ok(shiguredo_srt::SrtPacket::Control(control)) if control.control_type == shiguredo_srt::ControlType::Shutdown))
+                .count(),
+            2,
+            "an orderly logical close shuts down every group leg"
+        );
+    }
+
+    #[test]
+    fn logical_peer_api_has_the_same_steady_state_for_direct_inputs() {
+        let peer = "127.0.0.1:10000".parse().expect("address");
+        let options = AdmissionOptions::basic(0x2222, 0, true);
+        let telemetry = IngressTelemetry::new();
+        let mut table = PeerTable::new();
+        let (mut caller, conclusion) = prepare_conclusion_with_options(
+            &mut table,
+            peer,
+            ConnectionOptions {
+                stream_id: Some("publish:direct".to_string()),
+                ..ConnectionOptions::default()
+            },
+            &options,
+            &telemetry,
+        );
+        finish_conclusion(
+            &mut table,
+            peer,
+            &mut caller,
+            &conclusion,
+            &options,
+            &telemetry,
+        );
+
+        let mut events = Vec::new();
+        table.poll_events(&mut events);
+        let logical_peer = LogicalPeerId::Direct(peer);
+        assert!(events.iter().any(|event| {
+            event.peer == peer
+                && event.logical_peer == logical_peer
+                && matches!(event.event, ConnectionEvent::Connected)
+        }));
+        let mut direct = table
+            .logical_peer_mut(&logical_peer)
+            .expect("direct logical peer exists");
+        assert_eq!(direct.stream_id(), Some("publish:direct"));
+        assert!(direct.can_send());
+        assert_eq!(
+            direct
+                .send(b"direct reply", Timestamp::from_micros(3))
+                .expect("direct logical send"),
+            1
+        );
+        assert!(matches!(direct.stats(), Some(LogicalPeerStats::Direct(_))));
+        direct.disconnect(Timestamp::from_micros(4));
+        drop(direct);
+
+        let mut outbound = Vec::new();
+        table.poll_outbound(Timestamp::from_micros(4), &mut outbound);
+        assert!(outbound.iter().any(|(_, packet)| matches!(
+            shiguredo_srt::SrtPacket::decode(packet),
+            Ok(shiguredo_srt::SrtPacket::Data(_))
+        )));
+        assert!(outbound.iter().any(|(_, packet)| matches!(
+            shiguredo_srt::SrtPacket::decode(packet),
+            Ok(shiguredo_srt::SrtPacket::Control(control))
+                if control.control_type == shiguredo_srt::ControlType::Shutdown
+        )));
     }
 
     proptest! {
@@ -2834,7 +3191,14 @@ mod tests {
             table.poll_events(&mut events);
             prop_assert_eq!(
                 events,
-                vec![AdmissionEvent { peer: first, event: ConnectionEvent::Connected }]
+                vec![AdmissionEvent {
+                    peer: first,
+                    logical_peer: LogicalPeerId::group(srt_lifecycle::LogicalGroupKey {
+                        group_id,
+                        stream_id: Some("publish:property-group".to_string()),
+                    }),
+                    event: ConnectionEvent::Connected,
+                }]
             );
             let stats = table.bonded_stats();
             prop_assert_eq!(stats.len(), 1);
@@ -4116,6 +4480,7 @@ pub struct GroupAggregateStats {
     pub active_legs: usize,
     pub standby_legs: usize,
     pub pending_legs: usize,
+    pub unstable_legs: usize,
     pub broken_legs: usize,
     pub logical_payloads_sent: u64,
     pub logical_payload_bytes_sent: u64,
@@ -4184,6 +4549,7 @@ fn group_connection_stats(
             shiguredo_srt::GroupMemberState::Active => aggregate.active_legs += 1,
             shiguredo_srt::GroupMemberState::Standby => aggregate.standby_legs += 1,
             shiguredo_srt::GroupMemberState::Pending => aggregate.pending_legs += 1,
+            shiguredo_srt::GroupMemberState::Unstable => aggregate.unstable_legs += 1,
             shiguredo_srt::GroupMemberState::Broken => aggregate.broken_legs += 1,
         }
         let connection = member.connection().stats();
@@ -4351,6 +4717,17 @@ impl GroupConn {
         Ok(legs)
     }
 
+    /// Whether the next logical payload can be accepted without weakening the
+    /// selected Broadcast or Backup delivery contract.
+    pub fn can_send(&mut self) -> bool {
+        self.group.can_send()
+    }
+
+    /// Start an orderly close of every physical group leg.
+    pub fn disconnect(&mut self, now: Timestamp) {
+        self.group.disconnect(now);
+    }
+
     /// Return the next deduplicated, sequence-aligned group payload.
     pub fn poll_data(&mut self, now: Timestamp) -> Option<shiguredo_srt::GroupPacket> {
         let packet = self.group.poll_data(now)?;
@@ -4489,76 +4866,137 @@ fn drain_group_leg_outputs(
 mod group_conn_tests {
     use super::*;
 
-    #[test]
-    fn caller_drives_every_leg_and_exposes_per_leg_telemetry() {
-        let first_peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("first peer binds");
-        let second_peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("second peer binds");
-        first_peer
-            .set_nonblocking(true)
-            .expect("first peer is nonblocking");
-        second_peer
-            .set_nonblocking(true)
-            .expect("second peer is nonblocking");
+    struct Peer {
+        socket: std::net::UdpSocket,
+        connection: SrtConnection,
+        caller: Option<std::net::SocketAddr>,
+    }
 
-        let group = GroupConfig::new(42, shiguredo_srt::GroupType::Broadcast);
-        let mut conn = GroupConn::caller(
-            group,
-            [
-                GroupCallerLeg::new(
-                    1,
-                    10,
-                    CallerConfig::builder(first_peer.local_addr().expect("first address"))
-                        .build()
-                        .expect("first caller config"),
-                ),
-                GroupCallerLeg::new(
-                    2,
-                    20,
-                    CallerConfig::builder(second_peer.local_addr().expect("second address"))
-                        .build()
-                        .expect("second caller config"),
-                ),
-            ],
-            RuntimeFlavor::Mio,
-            Timestamp::from_micros(0),
-        )
-        .expect("bonded caller builds");
-
-        let report = conn
-            .drive(Timestamp::from_micros(0), OutputDrainBudget::default())
-            .expect("all induction packets are sent");
-        assert_eq!(report.legs.len(), 2);
-        assert_eq!(
-            report
-                .legs
-                .iter()
-                .map(|leg| leg.output.packets)
-                .sum::<usize>(),
-            2
-        );
-
-        let mut buf = [0_u8; 1500];
-        for peer in [&first_peer, &second_peer] {
-            let size = peer.recv(&mut buf).expect("each peer receives induction");
-            let shiguredo_srt::SrtPacket::Control(packet) =
-                shiguredo_srt::SrtPacket::decode(&buf[..size]).expect("valid SRT handshake")
-            else {
-                panic!("induction is a control packet");
-            };
-            let handshake = shiguredo_srt::HandshakePacket::decode(&packet).expect("handshake");
-            assert_eq!(
-                handshake
-                    .get_group_extension()
-                    .map(|extension| extension.group_id),
-                Some(group.group_id)
-            );
+    impl Peer {
+        fn new() -> Self {
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("peer binds");
+            socket.set_nonblocking(true).expect("peer is nonblocking");
+            Self {
+                socket,
+                connection: SrtConnection::new_listener(shiguredo_srt::ConnectionOptions {
+                    tsbpd_delay: 0,
+                    ..Default::default()
+                }),
+                caller: None,
+            }
         }
 
-        let stats = conn.stats();
-        assert_eq!(stats.group_id, group.group_id);
-        assert_eq!(stats.legs.len(), 2);
-        assert_eq!(stats.aggregate.pending_legs, 2);
-        assert!(stats.legs.iter().all(|leg| leg.peer_addr.is_some()));
+        fn drive(&mut self, now: Timestamp) {
+            let mut buffer = [0_u8; 65_536];
+            loop {
+                match self.socket.recv_from(&mut buffer) {
+                    Ok((size, caller)) => {
+                        self.caller = Some(caller);
+                        self.connection
+                            .feed_recv_buf(&buffer[..size], now)
+                            .expect("group packet decodes");
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) => panic!("peer receive failed: {error}"),
+                }
+            }
+            let Some(caller) = self.caller else {
+                return;
+            };
+            while let Some(output) = self.connection.poll_output() {
+                if let ConnectionOutput::SendPacket(packet) = output {
+                    self.socket
+                        .send_to(&packet, caller)
+                        .expect("peer sends protocol response");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bonded_egress_drives_every_leg_on_every_runtime_flavor() {
+        for runtime in [
+            RuntimeFlavor::Mio,
+            RuntimeFlavor::Tokio,
+            RuntimeFlavor::Smol,
+            RuntimeFlavor::Monoio,
+            RuntimeFlavor::Glommio,
+            RuntimeFlavor::Compio,
+        ] {
+            let mut first_peer = Peer::new();
+            let mut second_peer = Peer::new();
+            let group = GroupConfig::new(42, shiguredo_srt::GroupType::Broadcast);
+            let mut conn = GroupConn::caller(
+                group,
+                [
+                    GroupCallerLeg::new(
+                        1,
+                        10,
+                        CallerConfig::builder(
+                            first_peer.socket.local_addr().expect("first address"),
+                        )
+                        .build()
+                        .expect("first caller config"),
+                    ),
+                    GroupCallerLeg::new(
+                        2,
+                        20,
+                        CallerConfig::builder(
+                            second_peer.socket.local_addr().expect("second address"),
+                        )
+                        .build()
+                        .expect("second caller config"),
+                    ),
+                ],
+                runtime,
+                Timestamp::from_micros(0),
+            )
+            .expect("bonded caller builds");
+
+            for round in 0..20 {
+                let now = Timestamp::from_micros(round * 10_000);
+                conn.drive(now, OutputDrainBudget::default())
+                    .expect("group sends protocol output");
+                first_peer.drive(now);
+                second_peer.drive(now);
+                conn.drive(now, OutputDrainBudget::default())
+                    .expect("group receives protocol output");
+                if conn.group().members().iter().all(|member| {
+                    member.connection().state() == shiguredo_srt::ConnectionState::Connected
+                }) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(
+                conn.group()
+                    .members()
+                    .iter()
+                    .all(|member| member.connection().state()
+                        == shiguredo_srt::ConnectionState::Connected),
+                "{runtime:?} group did not connect"
+            );
+
+            assert_eq!(
+                conn.send(b"bonded egress", Timestamp::from_micros(300_000))
+                    .unwrap(),
+                2
+            );
+            conn.drive(
+                Timestamp::from_micros(300_000),
+                OutputDrainBudget::default(),
+            )
+            .expect("group sends Broadcast payload");
+            first_peer.drive(Timestamp::from_micros(300_000));
+            second_peer.drive(Timestamp::from_micros(300_000));
+
+            let stats = conn.stats();
+            assert_eq!(stats.group_id, group.group_id);
+            assert_eq!(stats.legs.len(), 2);
+            assert_eq!(stats.aggregate.active_legs, 2);
+            assert_eq!(stats.aggregate.logical_payloads_sent, 1);
+            assert_eq!(stats.aggregate.wire_unique_packets_sent, 2);
+        }
     }
 }
 
@@ -4915,10 +5353,12 @@ pub mod mio_transport {
 #[cfg(feature = "tokio")]
 pub mod tokio_transport {
     use crate::{
+        GroupBuildError, GroupCallerLeg, GroupConnectionLeg, GroupConnectionStats,
+        GroupDriveReport, GroupLegDriveReport, GroupLogicalCounters, ManualTimerStore,
         OutputDrainBudget, OutputDrainReport, OutputDrainStatus, collect_output_work,
-        prepend_outputs,
+        group_connection_stats, prepend_outputs,
     };
-    use shiguredo_srt::{ConnectionEvent, ConnectionOutput, SrtConnection, Timestamp};
+    use shiguredo_srt::{ConnectionEvent, ConnectionOutput, GroupMode, SrtConnection, Timestamp};
     use std::collections::VecDeque;
     use std::io;
     use std::time::Duration;
@@ -5093,9 +5533,335 @@ pub mod tokio_transport {
         Ok(Conn::new(prepared.connection(now)?, socket))
     }
 
+    struct GroupLeg {
+        member_id: u32,
+        socket: UdpSocket,
+        timers: ManualTimerStore,
+        pending_outputs: VecDeque<ConnectionOutput>,
+    }
+
+    /// Tokio-native multi-socket driver for an SRT Broadcast or Backup group.
+    ///
+    /// This owns Tokio sockets, not a synchronous [`crate::GroupConn`] wrapped
+    /// in a task. Group sequencing, selection, and telemetry remain in the
+    /// shared protocol core; this type supplies Tokio's nonblocking socket
+    /// operations and exposes every leg for readiness registration.
+    pub struct GroupConn {
+        group: shiguredo_srt::SrtGroup,
+        legs: Vec<GroupLeg>,
+        logical_payloads_sent: u64,
+        logical_payload_bytes_sent: u64,
+        logical_payloads_received: u64,
+        logical_payload_bytes_received: u64,
+    }
+
+    impl GroupConn {
+        /// Build a Tokio-native group from application-owned protocol cores
+        /// and connected standard UDP sockets.
+        pub fn new(
+            group_id: u32,
+            mode: GroupMode,
+            legs: impl IntoIterator<Item = GroupConnectionLeg>,
+        ) -> Result<Self, GroupBuildError> {
+            let mut group = shiguredo_srt::SrtGroup::new(group_id, mode)?;
+            let mut io_legs = Vec::new();
+            for leg in legs {
+                group.add_member(leg.member_id, leg.weight, leg.connection)?;
+                io_legs.push(GroupLeg {
+                    member_id: leg.member_id,
+                    socket: UdpSocket::from_std(leg.socket)?,
+                    timers: ManualTimerStore::new(),
+                    pending_outputs: VecDeque::new(),
+                });
+            }
+            Ok(Self {
+                group,
+                legs: io_legs,
+                logical_payloads_sent: 0,
+                logical_payload_bytes_sent: 0,
+                logical_payloads_received: 0,
+                logical_payload_bytes_received: 0,
+            })
+        }
+
+        /// Build a Tokio-native caller with one connected socket per group
+        /// leg and begin every SRT handshake.
+        pub fn caller(
+            group: crate::GroupConfig,
+            legs: impl IntoIterator<Item = GroupCallerLeg>,
+            now: Timestamp,
+        ) -> Result<Self, GroupBuildError> {
+            let mut raw_legs = Vec::new();
+            for leg in legs {
+                let mut caller = leg.caller;
+                caller.session.set_group(Some(crate::GroupConfig {
+                    group_id: group.group_id,
+                    group_type: group.group_type,
+                    flags: group.flags,
+                    weight: leg.weight,
+                }));
+                let prepared = caller.prepare(crate::RuntimeFlavor::Tokio)?;
+                raw_legs.push(GroupConnectionLeg {
+                    member_id: leg.member_id,
+                    weight: leg.weight,
+                    connection: prepared.connection(now)?,
+                    socket: prepared.bind_socket()?,
+                });
+            }
+            let mode = GroupMode::from_group_type(group.group_type)
+                .ok_or(GroupBuildError::InvalidGroupType)?;
+            Self::new(group.group_id, mode, raw_legs)
+        }
+
+        #[must_use]
+        pub fn group(&self) -> &shiguredo_srt::SrtGroup {
+            &self.group
+        }
+
+        /// Tokio sockets to include in the application's readiness set.
+        #[must_use]
+        pub fn leg_sockets(&self) -> impl ExactSizeIterator<Item = (u32, &UdpSocket)> {
+            self.legs.iter().map(|leg| (leg.member_id, &leg.socket))
+        }
+
+        #[must_use]
+        pub fn time_until_next_deadline(&self, now: Timestamp, default_micros: u64) -> u64 {
+            self.legs
+                .iter()
+                .map(|leg| leg.timers.time_until_earliest(now, default_micros))
+                .min()
+                .unwrap_or(default_micros)
+        }
+
+        pub fn can_send(&mut self) -> bool {
+            self.group.can_send()
+        }
+
+        pub fn send(
+            &mut self,
+            payload: &[u8],
+            now: Timestamp,
+        ) -> Result<usize, shiguredo_srt::Error> {
+            let legs = self.group.send(payload, now)?;
+            self.logical_payloads_sent = self.logical_payloads_sent.saturating_add(1);
+            self.logical_payload_bytes_sent = self
+                .logical_payload_bytes_sent
+                .saturating_add(payload.len() as u64);
+            Ok(legs)
+        }
+
+        pub fn disconnect(&mut self, now: Timestamp) {
+            self.group.disconnect(now);
+        }
+
+        pub fn poll_data(&mut self, now: Timestamp) -> Option<shiguredo_srt::GroupPacket> {
+            let packet = self.group.poll_data(now)?;
+            self.logical_payloads_received = self.logical_payloads_received.saturating_add(1);
+            self.logical_payload_bytes_received = self
+                .logical_payload_bytes_received
+                .saturating_add(packet.payload.len() as u64);
+            Some(packet)
+        }
+
+        /// Perform bounded, nonblocking work for every leg. Call after a
+        /// Tokio readiness notification or when the next timer is due; this
+        /// never blocks one leg waiting for another.
+        pub fn drive(
+            &mut self,
+            now: Timestamp,
+            output_budget: OutputDrainBudget,
+        ) -> io::Result<GroupDriveReport> {
+            let mut report = GroupDriveReport {
+                legs: Vec::with_capacity(self.legs.len()),
+            };
+            let (group, legs) = (&mut self.group, &mut self.legs);
+            for leg in legs {
+                let member = group
+                    .member_mut(leg.member_id)
+                    .expect("group and I/O legs are built together");
+                let conn = member.connection_mut();
+                leg.timers.fire_expired(now, conn);
+
+                let mut received_datagrams = 0;
+                let mut buffer = [0_u8; 65_536];
+                for _ in 0..64 {
+                    match leg.socket.try_recv(&mut buffer) {
+                        Ok(size) => {
+                            received_datagrams += 1;
+                            conn.feed_recv_buf(&buffer[..size], now).map_err(|error| {
+                                io::Error::new(io::ErrorKind::InvalidData, error)
+                            })?;
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(error) => return Err(error),
+                    }
+                }
+
+                let output = drain_group_leg_outputs(conn, leg, now, output_budget)?;
+                report.legs.push(GroupLegDriveReport {
+                    member_id: leg.member_id,
+                    received_datagrams,
+                    output,
+                });
+            }
+            Ok(report)
+        }
+
+        #[must_use]
+        pub fn stats(&self) -> GroupConnectionStats {
+            group_connection_stats(
+                &self.group,
+                GroupLogicalCounters {
+                    payloads_sent: self.logical_payloads_sent,
+                    payload_bytes_sent: self.logical_payload_bytes_sent,
+                    payloads_received: self.logical_payloads_received,
+                    payload_bytes_received: self.logical_payload_bytes_received,
+                },
+                |member_id| {
+                    let io = self
+                        .legs
+                        .iter()
+                        .find(|leg| leg.member_id == member_id)
+                        .expect("group and I/O legs are built together");
+                    (io.socket.local_addr().ok(), io.socket.peer_addr().ok())
+                },
+            )
+        }
+    }
+
+    fn drain_group_leg_outputs(
+        conn: &mut SrtConnection,
+        leg: &mut GroupLeg,
+        now: Timestamp,
+        budget: OutputDrainBudget,
+    ) -> io::Result<OutputDrainReport> {
+        let (mut work, budget_exhausted) =
+            collect_output_work(conn, &mut leg.pending_outputs, budget);
+        let mut report = OutputDrainReport {
+            status: if budget_exhausted {
+                OutputDrainStatus::BudgetExhausted
+            } else {
+                OutputDrainStatus::Drained
+            },
+            ..OutputDrainReport::default()
+        };
+        while let Some(output) = work.pop_front() {
+            match output {
+                ConnectionOutput::SendPacket(packet) => match leg.socket.try_send(&packet) {
+                    Ok(sent) if sent == packet.len() => {
+                        report.actions += 1;
+                        report.packets += 1;
+                        report.bytes += sent;
+                    }
+                    Ok(_) => {
+                        prepend_outputs(&mut leg.pending_outputs, work.into_iter());
+                        leg.pending_outputs
+                            .push_front(ConnectionOutput::SendPacket(packet));
+                        return Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "UDP socket reported a partial datagram send",
+                        ));
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        prepend_outputs(&mut leg.pending_outputs, work.into_iter());
+                        leg.pending_outputs
+                            .push_front(ConnectionOutput::SendPacket(packet));
+                        report.status = OutputDrainStatus::Backpressured;
+                        return Ok(report);
+                    }
+                    Err(error) => {
+                        prepend_outputs(&mut leg.pending_outputs, work.into_iter());
+                        leg.pending_outputs
+                            .push_front(ConnectionOutput::SendPacket(packet));
+                        return Err(error);
+                    }
+                },
+                timer => {
+                    leg.timers.apply_output(&timer, now);
+                    report.actions += 1;
+                }
+            }
+        }
+        Ok(report)
+    }
+
     pub struct TickResult {
         pub sent: u64,
         pub events: Vec<ConnectionEvent>,
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn group_caller_uses_tokio_sockets_and_drives_every_leg() {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .build()
+                .expect("Tokio runtime builds");
+            runtime.block_on(async {
+                let first_peer =
+                    std::net::UdpSocket::bind("127.0.0.1:0").expect("first peer binds");
+                let second_peer =
+                    std::net::UdpSocket::bind("127.0.0.1:0").expect("second peer binds");
+                first_peer
+                    .set_nonblocking(true)
+                    .expect("first peer is nonblocking");
+                second_peer
+                    .set_nonblocking(true)
+                    .expect("second peer is nonblocking");
+
+                let group = crate::GroupConfig::new(42, shiguredo_srt::GroupType::Broadcast);
+                let mut conn = GroupConn::caller(
+                    group,
+                    [
+                        GroupCallerLeg::new(
+                            1,
+                            10,
+                            crate::CallerConfig::builder(
+                                first_peer.local_addr().expect("first address"),
+                            )
+                            .build()
+                            .expect("first caller config"),
+                        ),
+                        GroupCallerLeg::new(
+                            2,
+                            20,
+                            crate::CallerConfig::builder(
+                                second_peer.local_addr().expect("second address"),
+                            )
+                            .build()
+                            .expect("second caller config"),
+                        ),
+                    ],
+                    Timestamp::from_micros(0),
+                )
+                .expect("bonded Tokio caller builds");
+
+                assert_eq!(conn.leg_sockets().len(), 2);
+                for (_, socket) in conn.leg_sockets() {
+                    socket.writable().await.expect("leg becomes writable");
+                }
+                let report = conn
+                    .drive(Timestamp::from_micros(0), OutputDrainBudget::default())
+                    .expect("all induction packets are sent");
+                assert_eq!(report.legs.len(), 2);
+                assert_eq!(
+                    report
+                        .legs
+                        .iter()
+                        .map(|leg| leg.output.packets)
+                        .sum::<usize>(),
+                    2
+                );
+
+                let stats = conn.stats();
+                assert_eq!(stats.group_id, group.group_id);
+                assert_eq!(stats.legs.len(), 2);
+                assert!(stats.legs.iter().all(|leg| leg.peer_addr.is_some()));
+            });
+        }
     }
 }
 

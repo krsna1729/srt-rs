@@ -191,6 +191,9 @@ pub fn run(cfg: BenchConfig) {
             crate::Ingress::ReuseportMulti(k) if k > 1 => {
                 return run_pool_receiver(cfg, k);
             }
+            crate::Ingress::SharedPool(1) if cfg.bond_mode != BondMode::None => {
+                return run_bonded_shared_pool(cfg);
+            }
             crate::Ingress::SharedPool(k) if k > 1 => {
                 return run_shared_pool(cfg, k);
             }
@@ -557,6 +560,82 @@ fn run_shared_pool(cfg: BenchConfig, k: usize) {
     agg.print(start);
     if !agg.any_connected {
         eprintln!("[bench-mio] shared pool admitted no connections");
+        std::process::exit(1);
+    }
+}
+
+/// The ordinary mio shared-pool loop predates group-aware admission and owns
+/// one `SrtConnection` per address. Bonded input needs the shared
+/// [`srt_transport::PeerTable`] so both legs become one logical stream.
+/// This one-socket path is the only viable bonded shared-pool topology, and
+/// keeps mio aligned with every completion/runtime adapter without changing
+/// its unbonded benchmark path.
+fn run_bonded_shared_pool(cfg: BenchConfig) {
+    let start = Instant::now();
+    println!("LISTENING");
+    let mut poll = Poll::new().expect("mio Poll::new");
+    let mut events = Events::with_capacity(1024);
+    let addr = SocketAddr::new(std::net::IpAddr::from([0, 0, 0, 0]), cfg.port);
+    let mut socket = UdpSocket::bind(addr).expect("bind bonded shared-pool socket");
+    let _ = srt_transport::set_sock_bufs(socket.as_raw_fd(), cfg.sock_buf_bytes);
+    poll.registry()
+        .register(&mut socket, Token(0), Interest::READABLE)
+        .expect("register bonded shared-pool socket");
+
+    let mut peers = srt_transport::PeerTable::new();
+    let admission = cfg.admission_options(std::process::id(), false);
+    let telemetry = srt_transport::IngressTelemetry::new();
+    let connect_deadline = Instant::now() + crate::INTEROP_CONNECT_TIMEOUT;
+    let stream_len = Duration::from_secs_f64(cfg.duration_secs);
+    let run_deadline = Instant::now() + stream_len + IDLE_GRACE + Duration::from_secs(30);
+    let mut buf = [0u8; 2048];
+    let mut admit_bufs: Vec<Vec<u8>> = (0..32).map(|_| vec![0u8; 2048]).collect();
+    let mut admit_sizes = [0usize; 32];
+    let mut admit_addrs: [Option<SocketAddr>; 32] = [None; 32];
+    let mut outbound = Vec::new();
+    let mut connected = Vec::new();
+
+    loop {
+        let now = Instant::now();
+        if now >= run_deadline
+            || (now >= connect_deadline && peers.all_terminal(now, connect_deadline, IDLE_GRACE))
+        {
+            break;
+        }
+        poll.poll(&mut events, Some(TIMER_TICK)).ok();
+        for event in events.iter() {
+            if event.token() != Token(0) {
+                continue;
+            }
+            let timestamp = crate::now_ts(start);
+            drain_admission(
+                &socket,
+                cfg.batching,
+                &mut admit_bufs,
+                &mut admit_sizes,
+                &mut admit_addrs,
+                &mut buf,
+                |peer, data| {
+                    let _ = peers.admit(peer, data, timestamp, &admission, 0, 1, &telemetry);
+                },
+            );
+        }
+
+        let timestamp = crate::now_ts(start);
+        peers.poll_outbound(timestamp, &mut outbound);
+        for (peer, packet) in outbound.drain(..) {
+            let _ = socket.send_to(&packet, peer);
+        }
+        peers.drain_events(stream_len, &mut connected);
+    }
+
+    let mut aggregate = Aggregate::new(cfg);
+    for stats in crate::collect_listener_stats(peers) {
+        aggregate.add(stats);
+    }
+    aggregate.print(start);
+    if !aggregate.any_connected {
+        eprintln!("[bench-mio] bonded shared pool admitted no connections");
         std::process::exit(1);
     }
 }

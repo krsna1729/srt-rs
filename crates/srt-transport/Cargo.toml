@@ -31,7 +31,7 @@ zeroize = "1.8"
 
 # Runtime-specific dependencies (optional, feature-gated)
 mio = { version = "1", features = ["net"], optional = true }
-tokio = { version = "1", features = ["net", "time"], optional = true }
+tokio = { version = "1", features = ["net", "time", "rt"], optional = true }
 smol = { version = "2", optional = true }
 futures-lite = { version = "2", optional = true }
 monoio = { version = "0.2", features = ["sync"], optional = true }

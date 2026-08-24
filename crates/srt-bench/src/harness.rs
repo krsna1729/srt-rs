@@ -48,7 +48,7 @@ impl AppendLock {
             if result != 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            return Ok(Self { fd });
+            Ok(Self { fd })
         }
         #[cfg(not(unix))]
         {
@@ -694,13 +694,10 @@ fn filter_reason(cell: &Cell<'_>, axes: &[Axis]) -> Option<&'static str> {
     let is_per_port = ingress == "per-port";
 
     // A bonded publisher is one logical ingress stream, so its legs must
-    // reach the same group-aware PeerTable. Today only the shared-pool
-    // adapters (other than mio's separate legacy pool loop) drive that
-    // abstraction. Keep unsupported topologies out of the matrix instead of
-    // silently measuring independent group-labelled callers.
-    if bond.is_some_and(|mode| mode != "none")
-        && (ingress != "shared-pool:1" || runtime_recv == "mio")
-    {
+    // reach the same group-aware PeerTable. Every runtime provides that on
+    // the one-socket shared pool; keep unsupported topologies out of the
+    // matrix instead of silently measuring independent group-labelled callers.
+    if bond.is_some_and(|mode| mode != "none") && ingress != "shared-pool:1" {
         return Some("bonded-ingress-unsupported");
     }
 
@@ -714,8 +711,7 @@ fn filter_reason(cell: &Cell<'_>, axes: &[Axis]) -> Option<&'static str> {
         } else if bond == Some("none") {
             let keep_never = axis_has(axes, "promotion", "never");
             let keep_all = axis_has(axes, "promotion", "all");
-            if (keep_never && promotion == "relocate")
-                || (keep_never && promotion == "bonded")
+            if (promotion == "relocate" || promotion == "bonded") && keep_never
                 || (!keep_never && keep_all && promotion != "all")
             {
                 return Some("promotion-inert");
@@ -2140,17 +2136,19 @@ mod matrix_filter_tests {
             Some("bonded-ingress-unsupported")
         );
 
-        let supported = cell(&[
-            ("ingress", "shared-pool:1"),
-            ("promotion", "all"),
-            ("cookie-routing", "on"),
-            ("batch", "on"),
-            ("pin", "off"),
-            ("runtime", "tokio"),
-            ("connections", "200"),
-            ("bond", "broadcast:64"),
-        ]);
-        assert_eq!(filter_reason(&supported, &axes), None);
+        for runtime in ["mio", "tokio", "smol", "monoio", "glommio", "compio"] {
+            let supported = cell(&[
+                ("ingress", "shared-pool:1"),
+                ("promotion", "all"),
+                ("cookie-routing", "on"),
+                ("batch", "on"),
+                ("pin", "off"),
+                ("runtime", runtime),
+                ("connections", "200"),
+                ("bond", "broadcast:64"),
+            ]);
+            assert_eq!(filter_reason(&supported, &axes), None, "{runtime}");
+        }
 
         let unbonded = cell(&[
             ("ingress", "reuseport-multi:4"),

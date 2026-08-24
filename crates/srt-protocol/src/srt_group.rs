@@ -27,6 +27,10 @@ pub enum GroupMemberState {
     Pending,
     Active,
     Standby,
+    /// Temporarily excluded after a send-buffer backpressure event. A
+    /// connected leg is requalified once its in-flight packets drain and its
+    /// send sequence can be aligned with the group again.
+    Unstable,
     Broken,
 }
 
@@ -199,6 +203,34 @@ impl SrtGroup {
         }
     }
 
+    /// Whether at least one active member can accept the next logical send.
+    ///
+    /// Broadcast attempts every active leg, but its logical send succeeds as
+    /// soon as any member accepts the payload. A member whose sender window
+    /// is full becomes temporarily unstable; once its in-flight packets drain
+    /// it is sequence-aligned and automatically rejoins the active set. Backup
+    /// promotes a standby member while an unstable leg requalifies.
+    pub fn can_send(&mut self) -> bool {
+        self.refresh_states();
+        let active = self.active_indices();
+        match self.mode {
+            GroupMode::Broadcast => active
+                .iter()
+                .any(|&index| self.members[index].connection.can_send()),
+            GroupMode::Backup => active
+                .first()
+                .is_some_and(|&index| self.members[index].connection.can_send()),
+        }
+    }
+
+    /// Begin an orderly close of every physical member while retaining the
+    /// logical group until normal transport teardown completes.
+    pub fn disconnect(&mut self, now: Timestamp) {
+        for member in &mut self.members {
+            member.connection.disconnect(now);
+        }
+    }
+
     pub fn poll_data(&mut self, now: Timestamp) -> Option<GroupPacket> {
         loop {
             match self.poll_event(now)? {
@@ -245,23 +277,17 @@ impl SrtGroup {
             return Err(Error::invalid_state("no active Broadcast group members"));
         }
         let sequence_number = self.sequence_for_send(&active)?;
-        if active
-            .iter()
-            .any(|&index| !self.members[index].connection.can_send())
-        {
-            return Err(Error::invalid_state("Broadcast group send buffer is full"));
-        }
-
         let mut sent = 0;
         for index in active {
-            if self.members[index]
-                .connection
-                .send_with_sequence(payload, sequence_number, now)
-                .is_ok()
-            {
+            let sent_on_member = self.members[index].connection.can_send()
+                && self.members[index]
+                    .connection
+                    .send_with_sequence(payload, sequence_number, now)
+                    .is_ok();
+            if sent_on_member {
                 sent += 1;
             } else {
-                self.members[index].state = GroupMemberState::Broken;
+                self.mark_send_failure(index);
             }
         }
         if sent == 0 {
@@ -292,7 +318,7 @@ impl SrtGroup {
                 .send_with_sequence(payload, sequence_number, now)
                 .is_err()
         {
-            self.members[index].state = GroupMemberState::Broken;
+            self.mark_send_failure(index);
             self.promote_backup_member();
             let Some(index) = self.active_indices().into_iter().next() else {
                 return Err(Error::invalid_state("all Backup group members failed"));
@@ -389,22 +415,32 @@ impl SrtGroup {
                 member.state = GroupMemberState::Broken;
             }
         }
+        self.requalify_unstable_members();
         if self.mode == GroupMode::Backup && !self.has_active_member() {
             self.promote_backup_member();
         }
     }
 
     fn refresh_pending_states(&mut self) {
-        for member in &mut self.members {
-            if member.state == GroupMemberState::Pending
-                && member.connection.state() == ConnectionState::Connected
-            {
-                member.state = if self.mode == GroupMode::Broadcast {
-                    GroupMemberState::Active
-                } else {
-                    GroupMemberState::Standby
-                };
+        for index in 0..self.members.len() {
+            let ready = {
+                let member = &self.members[index];
+                member.state == GroupMemberState::Pending
+                    && member.connection.state() == ConnectionState::Connected
+            };
+            if !ready {
+                continue;
             }
+
+            let member_id = self.members[index].id;
+            if self.align_member_sequence(member_id).is_err() {
+                continue;
+            }
+            self.members[index].state = if self.mode == GroupMode::Broadcast {
+                GroupMemberState::Active
+            } else {
+                GroupMemberState::Standby
+            };
         }
         if self.mode == GroupMode::Backup && !self.has_active_member() {
             self.promote_backup_member();
@@ -412,7 +448,16 @@ impl SrtGroup {
     }
 
     fn align_member_sequence(&mut self, member_id: u32) -> Result<(), Error> {
-        let Some(sequence_number) = self.next_send_sequence else {
+        let sequence_number = self.next_send_sequence.or_else(|| {
+            self.members
+                .iter()
+                .filter(|member| {
+                    member.id != member_id
+                        && member.connection.state() == ConnectionState::Connected
+                })
+                .find_map(|member| member.connection.next_sequence_number())
+        });
+        let Some(sequence_number) = sequence_number else {
             return Ok(());
         };
         let Some(member) = self.member_mut(member_id) else {
@@ -424,6 +469,37 @@ impl SrtGroup {
                 .synchronize_send_sequence(sequence_number)?;
         }
         Ok(())
+    }
+
+    fn mark_send_failure(&mut self, index: usize) {
+        let member = &mut self.members[index];
+        member.state = if member.connection.state() == ConnectionState::Connected
+            && !member.connection.can_send()
+        {
+            GroupMemberState::Unstable
+        } else {
+            GroupMemberState::Broken
+        };
+    }
+
+    fn requalify_unstable_members(&mut self) {
+        for index in 0..self.members.len() {
+            if self.members[index].state != GroupMemberState::Unstable
+                || self.members[index].connection.state() != ConnectionState::Connected
+            {
+                continue;
+            }
+
+            let member_id = self.members[index].id;
+            if self.align_member_sequence(member_id).is_ok() {
+                self.members[index].state =
+                    if self.mode == GroupMode::Broadcast || !self.has_active_member() {
+                        GroupMemberState::Active
+                    } else {
+                        GroupMemberState::Standby
+                    };
+            }
+        }
     }
 
     fn active_indices(&self) -> Vec<usize> {

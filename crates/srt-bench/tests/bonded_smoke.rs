@@ -19,12 +19,12 @@ fn stats(output: &[u8]) -> &str {
         .expect("final STATS line")
 }
 
-fn smoke(mode: &str, encryption: &str) {
+fn smoke(runtime: &str, mode: &str, encryption: &str) {
     let bin = std::env::var_os("CARGO_BIN_EXE_srt-bench").expect("bench binary path");
     let port = free_port().to_string();
     let receiver = Command::new(&bin)
         .args([
-            "runtime=tokio",
+            &format!("runtime={runtime}"),
             "mode=receiver",
             &port,
             "1",
@@ -43,7 +43,7 @@ fn smoke(mode: &str, encryption: &str) {
     thread::sleep(Duration::from_millis(300));
     let sender = Command::new(&bin)
         .args([
-            "runtime=tokio",
+            &format!("runtime={runtime}"),
             "mode=sender",
             "127.0.0.1",
             &port,
@@ -88,10 +88,14 @@ fn smoke(mode: &str, encryption: &str) {
 
 #[test]
 fn bond_axis_forms_one_logical_broadcast_stream() {
-    smoke("broadcast", "plain");
+    for runtime in ["mio", "tokio", "smol", "monoio", "glommio", "compio"] {
+        smoke(runtime, "broadcast", "plain");
+    }
 }
 
 #[test]
 fn bond_axis_forms_one_logical_encrypted_backup_stream() {
-    smoke("backup", "256");
+    for runtime in ["mio", "tokio", "smol", "monoio", "glommio", "compio"] {
+        smoke(runtime, "backup", "256");
+    }
 }
