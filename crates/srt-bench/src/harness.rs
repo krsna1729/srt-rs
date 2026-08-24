@@ -693,6 +693,17 @@ fn filter_reason(cell: &Cell<'_>, axes: &[Axis]) -> Option<&'static str> {
     let is_single = ingress.starts_with("reuseport-single:");
     let is_per_port = ingress == "per-port";
 
+    // A bonded publisher is one logical ingress stream, so its legs must
+    // reach the same group-aware PeerTable. Today only the shared-pool
+    // adapters (other than mio's separate legacy pool loop) drive that
+    // abstraction. Keep unsupported topologies out of the matrix instead of
+    // silently measuring independent group-labelled callers.
+    if bond.is_some_and(|mode| mode != "none")
+        && (ingress != "shared-pool:1" || runtime_recv == "mio")
+    {
+        return Some("bonded-ingress-unsupported");
+    }
+
     if let Some(promotion) = promotion {
         if is_single || !is_multi {
             if let Some(keep) = representative(axes, "promotion", "all")
@@ -2112,7 +2123,7 @@ mod matrix_filter_tests {
     }
 
     #[test]
-    fn retains_multi_promotion_controls_when_bonded() {
+    fn rejects_bonded_ingress_without_one_group_aware_listener() {
         let axes = axes();
         let bonded = cell(&[
             ("ingress", "reuseport-multi:4"),
@@ -2124,7 +2135,22 @@ mod matrix_filter_tests {
             ("connections", "200"),
             ("bond", "broadcast:64"),
         ]);
-        assert_eq!(filter_reason(&bonded, &axes), None);
+        assert_eq!(
+            filter_reason(&bonded, &axes),
+            Some("bonded-ingress-unsupported")
+        );
+
+        let supported = cell(&[
+            ("ingress", "shared-pool:1"),
+            ("promotion", "all"),
+            ("cookie-routing", "on"),
+            ("batch", "on"),
+            ("pin", "off"),
+            ("runtime", "tokio"),
+            ("connections", "200"),
+            ("bond", "broadcast:64"),
+        ]);
+        assert_eq!(filter_reason(&supported, &axes), None);
 
         let unbonded = cell(&[
             ("ingress", "reuseport-multi:4"),

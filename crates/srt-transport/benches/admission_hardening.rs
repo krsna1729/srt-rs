@@ -4,11 +4,12 @@ use std::time::Duration;
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use shiguredo_srt::{
-    ConnectionOptions, ConnectionOutput, HandshakePacket, SrtConnection, Timestamp,
+    ConnectionOptions, ConnectionOutput, GroupExtensionData, GroupType, HandshakePacket,
+    SRTGROUP_MASK, SrtConnection, Timestamp,
 };
 use srt_transport::{
-    AdmissionOptions, AdmissionResolution, DueIndex, IngressTelemetry, ListenerPeerPolicy,
-    PeerTable, PeerTableConfig, PolicyOverride,
+    AdmissionOptions, AdmissionResolution, BondedInputPolicy, DueIndex, IngressTelemetry,
+    ListenerPeerPolicy, PeerTable, PeerTableConfig, PolicyOverride,
 };
 
 fn induction(socket_id: u32) -> Vec<u8> {
@@ -212,12 +213,116 @@ fn bench_cached_policy_resolution(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_bonded_second_leg_admission(c: &mut Criterion) {
+    let first = SocketAddr::from(([127, 0, 0, 1], 10_000));
+    let second = SocketAddr::from(([127, 0, 0, 1], 10_001));
+    let caller_options = |socket_id| ConnectionOptions {
+        socket_id,
+        initial_seq: Some(1234),
+        stream_id: Some("bench:bonded".to_owned()),
+        group_extension: Some(GroupExtensionData {
+            group_id: SRTGROUP_MASK | 1,
+            group_type: GroupType::Broadcast,
+            flags: 0,
+            weight: 1,
+        }),
+        ..ConnectionOptions::default()
+    };
+    c.bench_function("bonded_second_leg_admission", |b| {
+        b.iter_batched(
+            || {
+                let mut options = AdmissionOptions::basic(7, 120, true);
+                options.bonded_inputs = BondedInputPolicy::Accept;
+                let telemetry = IngressTelemetry::new();
+                let mut table = PeerTable::new();
+                let mut first_caller = SrtConnection::new_caller(caller_options(11));
+                first_caller
+                    .connect(Timestamp::default())
+                    .expect("start first caller");
+                let _ = table.admit(
+                    first,
+                    &next_packet(&mut first_caller),
+                    Timestamp::default(),
+                    &options,
+                    0,
+                    1,
+                    &telemetry,
+                );
+                let mut outbound = Vec::new();
+                table.poll_outbound(Timestamp::default(), &mut outbound);
+                for (_, packet) in outbound {
+                    first_caller
+                        .feed_recv_buf(&packet, Timestamp::from_micros(1))
+                        .expect("first induction response");
+                }
+                let first_conclusion = next_packet(&mut first_caller);
+                let _ = table.admit(
+                    first,
+                    &first_conclusion,
+                    Timestamp::from_micros(2),
+                    &options,
+                    0,
+                    1,
+                    &telemetry,
+                );
+                let mut outbound = Vec::new();
+                table.poll_outbound(Timestamp::from_micros(2), &mut outbound);
+                for (peer, packet) in outbound {
+                    if peer == first {
+                        first_caller
+                            .feed_recv_buf(&packet, Timestamp::from_micros(3))
+                            .expect("first conclusion response");
+                    }
+                }
+
+                let mut second_caller = SrtConnection::new_caller(caller_options(12));
+                second_caller
+                    .connect(Timestamp::default())
+                    .expect("start second caller");
+                let _ = table.admit(
+                    second,
+                    &next_packet(&mut second_caller),
+                    Timestamp::from_micros(3),
+                    &options,
+                    0,
+                    1,
+                    &telemetry,
+                );
+                let mut outbound = Vec::new();
+                table.poll_outbound(Timestamp::from_micros(3), &mut outbound);
+                for (peer, packet) in outbound {
+                    if peer == second {
+                        second_caller
+                            .feed_recv_buf(&packet, Timestamp::from_micros(4))
+                            .expect("second induction response");
+                    }
+                }
+                (table, next_packet(&mut second_caller), options, telemetry)
+            },
+            |(mut table, conclusion, options, telemetry)| {
+                black_box(table.admit(
+                    second,
+                    black_box(&conclusion),
+                    Timestamp::from_micros(5),
+                    &options,
+                    0,
+                    1,
+                    &telemetry,
+                ));
+                assert_eq!(table.bonded_stats()[0].connection.legs.len(), 2);
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
 criterion_group!(
     benches,
     bench_invalid_admission,
     bench_bounded_capacity,
     bench_due_index_churn,
     bench_per_source_capacity,
-    bench_cached_policy_resolution
+    bench_cached_policy_resolution,
+    bench_bonded_second_leg_admission
 );
 criterion_main!(benches);

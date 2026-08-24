@@ -1,0 +1,10 @@
+# Semantic bonded-ingress sweep. Each cell creates two physical SRT legs that
+# must be accepted as one logical, deduplicated receiver stream. This is
+# intentionally separate from the full topology bake-off: today only one
+# shared, group-aware PeerTable can realize inbound group association.
+
+runtime    = tokio,smol,monoio,glommio,compio
+ingress    = shared-pool:1
+encryption = plain,128,192,256
+connections = 2
+bond       = broadcast:1,backup:1

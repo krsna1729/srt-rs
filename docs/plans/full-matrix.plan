@@ -41,7 +41,7 @@
 # so an interrupted sweep continues rather than restarting.
 
 runtime             = mio,tokio,smol,monoio,glommio,compio
-ingress             = per-port,shared-pool:4,reuseport-multi:4,reuseport-single:4
+ingress             = per-port,shared-pool:1,shared-pool:4,reuseport-multi:4,reuseport-single:4
 encryption          = plain,128,192,256
 connections         = 50,200,600,1200
 bitrate             = 250000,1000000,4000000,8000000

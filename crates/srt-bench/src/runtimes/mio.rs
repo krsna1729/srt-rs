@@ -6,9 +6,7 @@
 use crate::{Aggregate, BenchConfig, BondMode, ConnStats};
 use mio::net::UdpSocket;
 use mio::{Events, Interest, Poll, Token};
-use shiguredo_srt::{
-    ConnectionEvent, ConnectionOptions, GroupExtensionData, GroupType, SRTGROUP_MASK, SrtConnection,
-};
+use shiguredo_srt::{ConnectionEvent, ConnectionOptions, SrtConnection};
 use srt_transport::mio_transport::Conn;
 use srt_transport::{Handoff, WorkerMessage};
 use std::collections::HashMap;
@@ -130,37 +128,27 @@ fn spawn_driver(
         .register(&mut socket, Token(token), Interest::READABLE)
         .expect("register socket");
 
-    // Bond exercise: connections 2g/2g+1 (for g in 0..bond_pairs) share a
-    // group id, proving the reuseport receiver's registry/handoff path
-    // actually fires in a run instead of sitting dead. Sender-only -- the
-    // listener learns the group (and its type) from the caller's
-    // handshake extension (`peer_group_extension`).
-    let group_extension = if cfg.mode == crate::Mode::Sender
-        && cfg.bond_mode != BondMode::None
-        && i < cfg.bond_pairs * 2
-    {
-        let group_type = match cfg.bond_mode {
-            BondMode::Broadcast => GroupType::Broadcast,
-            BondMode::Backup => GroupType::Backup,
-            BondMode::None => unreachable!("checked above"),
-        };
-        Some(GroupExtensionData {
-            group_id: SRTGROUP_MASK | ((i / 2) as u32 + 1),
-            group_type,
-            flags: 0,
-            weight: 0,
-        })
-    } else {
-        None
-    };
+    let group_extension = (cfg.mode == crate::Mode::Sender)
+        .then(|| cfg.bond_extension_for(i))
+        .flatten();
     let mut options = ConnectionOptions {
-        socket_id: std::process::id(),
+        socket_id: if cfg.mode == crate::Mode::Sender {
+            cfg.caller_socket_id_for(i)
+        } else {
+            std::process::id()
+        },
         tsbpd_delay: cfg.latency_ms,
         max_bandwidth_bytes_per_sec: match cfg.mode {
             crate::Mode::Sender => Some(cfg.bitrate_bps / 8),
             crate::Mode::Receiver => None,
         },
         group_extension,
+        initial_seq: (cfg.mode == crate::Mode::Sender)
+            .then(|| cfg.bond_initial_seq_for(i))
+            .flatten(),
+        stream_id: (cfg.mode == crate::Mode::Sender)
+            .then(|| cfg.bond_stream_id_for(i))
+            .flatten(),
         ..Default::default()
     };
     cfg.encryption.apply_to(&mut options);

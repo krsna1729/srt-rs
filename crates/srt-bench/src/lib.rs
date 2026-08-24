@@ -61,12 +61,12 @@ impl Cli {
                         cli.flags.insert(f.to_string(), v.to_string());
                     }
                 } else {
-                    // Value = next token unless it's another flag/kv pair.
+                    // A flag owns its following non-flag token. In
+                    // particular, `--ingress shared-pool=1` is documented
+                    // and the value's `=` must not turn it into a separate
+                    // key/value argument.
                     let value = match args.get(i + 1) {
-                        Some(next)
-                            if !next.starts_with("--")
-                                && (flag == "axis" || !next.contains('=')) =>
-                        {
+                        Some(next) if !next.starts_with("--") => {
                             i += 1;
                             next.clone()
                         }
@@ -247,11 +247,11 @@ pub struct BenchConfig {
     ///   common (non-bonded) case.
     pub ingress: Ingress,
     /// Sender only. `BondMode::None`: no bonding, every connection is
-    /// independent. Otherwise: connections `2*g`/`2*g+1` for `g` in
-    /// `0..bond_pairs` share a group id and are sent with a
-    /// libsrt-compatible group extension of this type, exercising a
-    /// reuseport receiver's bond-affinity handoff path. Connections at or
-    /// beyond `2*bond_pairs` are ordinary, unbonded connections.
+    /// independent. Otherwise connections `2*g`/`2*g+1` share group and
+    /// stream identity, initial sequence, and distinct leg socket IDs.
+    /// The group-aware shared listener then admits them as one logical,
+    /// deduplicated ingress stream. Connections beyond `2*bond_pairs` stay
+    /// ordinary and unbonded.
     pub bond_mode: BondMode,
     pub bond_pairs: usize,
     /// Receiver only, and only meaningful where a socket serves more than
@@ -470,7 +470,7 @@ impl BenchConfig {
             // K distinct ports: the same formula on both sides, since
             // sender and receiver must independently compute the same
             // port for connection i to ever meet.
-            Ingress::SharedPool(k) if k > 1 => self.port + (i % k) as u16,
+            Ingress::SharedPool(k) => self.port + (i % k) as u16,
             // One shared port: every connection, sender or receiver,
             // reaches/binds the single base port -- SO_REUSEPORT plus the
             // kernel hash fan the flows out on the receiver side, not the
@@ -484,6 +484,52 @@ impl BenchConfig {
 
     pub fn verbose(&self) -> bool {
         self.connections == 1 && self.ingress == Ingress::PerPort
+    }
+
+    /// Handshake group metadata for one physical leg. Two adjacent legs form
+    /// one group so the listener can exercise actual grouped ingress rather
+    /// than merely parse an otherwise-unused extension.
+    pub fn bond_extension_for(&self, index: usize) -> Option<shiguredo_srt::GroupExtensionData> {
+        if self.bond_mode == BondMode::None || index >= self.bond_pairs * 2 {
+            return None;
+        }
+        let group_type = match self.bond_mode {
+            BondMode::Broadcast => shiguredo_srt::GroupType::Broadcast,
+            BondMode::Backup => shiguredo_srt::GroupType::Backup,
+            BondMode::None => unreachable!("checked above"),
+        };
+        Some(shiguredo_srt::GroupExtensionData {
+            group_id: shiguredo_srt::SRTGROUP_MASK | ((index / 2) as u32 + 1),
+            group_type,
+            flags: 0,
+            // Give backup legs an unambiguous active/standby ordering. A
+            // broadcast group deliberately gives both legs equal weight.
+            weight: if self.bond_mode == BondMode::Backup && index % 2 != 0 {
+                0
+            } else {
+                1
+            },
+        })
+    }
+
+    /// Grouped legs need the same initial sequence and stream identity for
+    /// receiver-side deduplication, while each leg keeps a distinct SRT socket
+    /// ID. Non-grouped connections retain their independently generated state.
+    pub fn bond_initial_seq_for(&self, index: usize) -> Option<u32> {
+        self.bond_extension_for(index)
+            .map(|_| 0x0100_0000 | (index / 2) as u32)
+    }
+
+    pub fn bond_stream_id_for(&self, index: usize) -> Option<String> {
+        self.bond_extension_for(index)
+            .map(|_| format!("srt-bench-group-{}", index / 2))
+    }
+
+    pub fn caller_socket_id_for(&self, index: usize) -> u32 {
+        std::process::id()
+            .wrapping_add(index as u32)
+            .wrapping_add(1)
+            .max(1)
     }
 
     /// Admission must use the same complete connection template as a
@@ -504,7 +550,11 @@ impl BenchConfig {
             socket_id,
             tsbpd_delay: self.latency_ms,
             cookie_routing,
-            bonded_inputs: srt_transport::BondedInputPolicy::Reject,
+            bonded_inputs: if self.bond_mode == BondMode::None {
+                srt_transport::BondedInputPolicy::Reject
+            } else {
+                srt_transport::BondedInputPolicy::Accept
+            },
             connection_template: Some(template),
             handshake_retry_interval: std::time::Duration::from_micros(
                 shiguredo_srt::DEFAULT_HANDSHAKE_RETRY_INTERVAL_MICROS,
@@ -533,6 +583,53 @@ pub struct ConnStats {
     pub secondary_b: u64,
     pub rtt_us: u64,
     pub has_stats: bool,
+}
+
+/// Convert a shared-listener table into benchmark rows. A bonded publisher is
+/// one logical receiver row, with logical delivery counters and aggregated
+/// wire telemetry; ordinary peers retain their physical-connection rows.
+pub fn collect_listener_stats(peers: srt_transport::PeerTable) -> Vec<ConnStats> {
+    let mut stats = peers
+        .bonded_stats()
+        .into_iter()
+        .map(|group| {
+            let aggregate = group.connection.aggregate;
+            let duplicates = group
+                .connection
+                .legs
+                .iter()
+                .filter_map(|leg| leg.connection.receiver.as_ref())
+                .map(|receiver| receiver.total_duplicates)
+                .sum();
+            ConnStats {
+                connected: group.ever_connected,
+                torn_down: group.torn_down,
+                data_events: aggregate.logical_payloads_received,
+                has_stats: !group.connection.legs.is_empty(),
+                core_total: aggregate.wire_unique_packets_received,
+                secondary_a: aggregate.wire_receiver_packets_lost,
+                secondary_b: duplicates,
+                ..Default::default()
+            }
+        })
+        .collect::<Vec<_>>();
+    stats.extend(peers.into_iter().map(|(_peer, p)| {
+        let mut s = ConnStats {
+            connected: p.stream_deadline.is_some(),
+            torn_down: p.torn_down,
+            data_events: p.data_events,
+            ..Default::default()
+        };
+        if let Some(st) = p.conn.receiver_stats() {
+            s.has_stats = true;
+            s.core_total = st.total_received;
+            s.secondary_a = st.total_lost;
+            s.secondary_b = st.total_duplicates;
+            s.rtt_us = st.rtt as u64;
+        }
+        s
+    }));
+    stats
 }
 
 /// Accumulates ConnStats across connections and renders the STATS line.
@@ -600,7 +697,7 @@ pub fn dispatch_ingress(
                 reuseport_multi(cfg.clone(), k);
                 return true;
             }
-            Ingress::SharedPool(k) if k > 1 => {
+            Ingress::SharedPool(k) if k >= 1 => {
                 shared_pool(cfg.clone(), k);
                 return true;
             }
@@ -1111,7 +1208,7 @@ mod tests {
 
     #[test]
     fn shared_admission_carries_the_encryption_template() {
-        let cfg = BenchConfig {
+        let mut cfg = BenchConfig {
             runtime: Runtime::Mio,
             mode: Mode::Receiver,
             encryption: Encryption::Aes256,
@@ -1146,6 +1243,25 @@ mod tests {
         assert_eq!(template.socket_id, 0x1234);
         assert_eq!(template.passphrase.as_deref(), Some("srt-bench-encryption"));
         assert_eq!(template.key_length, KeyLength::Aes256);
+        assert_eq!(
+            admission.bonded_inputs,
+            srt_transport::BondedInputPolicy::Reject
+        );
+        cfg.bond_mode = BondMode::Backup;
+        cfg.bond_pairs = 1;
+        let first = cfg.bond_extension_for(0).expect("first group leg");
+        let second = cfg.bond_extension_for(1).expect("second group leg");
+        assert_eq!(first.group_id, second.group_id);
+        assert_eq!(first.group_type, second.group_type);
+        assert_eq!(first.weight, 1);
+        assert_eq!(second.weight, 0);
+        assert_eq!(cfg.bond_initial_seq_for(0), cfg.bond_initial_seq_for(1));
+        assert_eq!(cfg.bond_stream_id_for(0), cfg.bond_stream_id_for(1));
+        assert_ne!(cfg.caller_socket_id_for(0), cfg.caller_socket_id_for(1));
+        assert_eq!(
+            cfg.admission_options(17, false).bonded_inputs,
+            srt_transport::BondedInputPolicy::Accept
+        );
     }
 
     #[test]
@@ -1169,5 +1285,15 @@ mod tests {
             ])
         );
         assert_eq!(cli.positional, ["matrix"]);
+    }
+
+    #[test]
+    fn flag_values_can_contain_an_equals_sign() {
+        let args = ["srt-bench", "--ingress", "shared-pool=1"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let cli = Cli::parse(&args);
+        assert_eq!(cli.flags.get("ingress"), Some(&"shared-pool=1".to_string()));
     }
 }

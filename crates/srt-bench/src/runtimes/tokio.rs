@@ -30,9 +30,7 @@
 //! fix and identical reasoning as mio's `run_pool_acceptor`.
 
 use crate::{Aggregate, BenchConfig, BondMode, ConnStats};
-use shiguredo_srt::{
-    ConnectionEvent, ConnectionOptions, GroupExtensionData, GroupType, SRTGROUP_MASK, SrtConnection,
-};
+use shiguredo_srt::{ConnectionEvent, ConnectionOptions, GroupExtensionData, SrtConnection};
 use srt_transport::tokio_transport::Conn;
 use srt_transport::{Handoff, WorkerMessage};
 use std::net::SocketAddr;
@@ -117,27 +115,6 @@ async fn drive(cfg: BenchConfig, mine: Vec<usize>, start: Instant) -> Vec<crate:
     out
 }
 
-/// Bond exercise: connections 2g/2g+1 (for g in 0..bond_pairs) share a
-/// group id, so a run can prove the reuseport receiver's registry/handoff
-/// path actually fires. Sender-only -- the listener learns the group (and
-/// its type) from the caller's handshake extension.
-fn bond_extension_for(cfg: &BenchConfig, i: usize) -> Option<GroupExtensionData> {
-    if cfg.bond_mode == BondMode::None || i >= cfg.bond_pairs * 2 {
-        return None;
-    }
-    let group_type = match cfg.bond_mode {
-        BondMode::Broadcast => GroupType::Broadcast,
-        BondMode::Backup => GroupType::Backup,
-        BondMode::None => unreachable!("checked above"),
-    };
-    Some(GroupExtensionData {
-        group_id: SRTGROUP_MASK | ((i / 2) as u32 + 1),
-        group_type,
-        flags: 0,
-        weight: 0,
-    })
-}
-
 async fn sender_task(
     cfg: BenchConfig,
     index: usize,
@@ -150,10 +127,12 @@ async fn sender_task(
     socket.connect(endpoint).await.expect("connect");
 
     let mut options = ConnectionOptions {
-        socket_id: std::process::id(),
+        socket_id: cfg.caller_socket_id_for(index),
         tsbpd_delay: cfg.latency_ms,
         max_bandwidth_bytes_per_sec: Some(cfg.bitrate_bps / 8),
-        group_extension: bond_extension_for(&cfg, index),
+        group_extension: cfg.bond_extension_for(index),
+        initial_seq: cfg.bond_initial_seq_for(index),
+        stream_id: cfg.bond_stream_id_for(index),
         ..Default::default()
     };
     cfg.encryption.apply_to(&mut options);
@@ -927,7 +906,8 @@ async fn serve_pool_socket(cfg: BenchConfig, index: usize, start: Instant) -> Ve
             break;
         }
         if crate::shutdown::requested()
-            || (now >= connect_deadline && peers.all_terminal(now, connect_deadline, IDLE_GRACE))
+            || ((!peers.is_empty() || now >= connect_deadline)
+                && peers.all_terminal(now, connect_deadline, IDLE_GRACE))
         {
             break;
         }
@@ -954,25 +934,7 @@ async fn serve_pool_socket(cfg: BenchConfig, index: usize, start: Instant) -> Ve
         peers.drain_events(stream_len, &mut connected);
     }
 
-    peers
-        .into_iter()
-        .map(|(_peer, p)| {
-            let mut s = ConnStats {
-                connected: p.stream_deadline.is_some(),
-                torn_down: p.torn_down,
-                data_events: p.data_events,
-                ..Default::default()
-            };
-            if let Some(st) = p.conn.receiver_stats() {
-                s.has_stats = true;
-                s.core_total = st.total_received;
-                s.secondary_a = st.total_lost;
-                s.secondary_b = st.total_duplicates;
-                s.rtt_us = st.rtt as u64;
-            }
-            s
-        })
-        .collect()
+    crate::collect_listener_stats(peers)
 }
 
 /// Admit one datagram. No reuseport group means no cookie forwarding, so

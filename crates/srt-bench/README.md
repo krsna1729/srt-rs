@@ -35,7 +35,8 @@ srt-bench runtime=<mio|tokio|smol|monoio|glommio|compio> \
 
 - Sender takes `<host>`; receiver doesn't. Defaults: bitrate 8 Mbps,
   connections 1.
-- Connection *i* uses port+i on both sides.
+- `per-port` uses port+i; `shared-pool:K` maps connection *i* to
+  `port + i % K`; reuseport topologies share the base port.
 - Loss mode and scale mode are the same code path per runtime — loss runs
   one connection, scale runs N; only the STATS schema differs.
 - Receiver prints `LISTENING` when its sockets are bound.
@@ -76,15 +77,23 @@ The exhaustive matrix is filtered as its raw cartesian product is enumerated,
 without retaining all raw cells in memory. This removes combinations that
 cannot change behavior: promotion and cookie routing outside `reuseport-multi`,
 batching outside mio's shared-socket paths, and pinning outside glommio. It
-also removes bond-group requests larger than half the connection population.
-One representative value is retained for an inert axis, so a one-value custom
-plan remains runnable. The filter summary is printed before the run and the
+also removes bond-group requests larger than half the connection population and
+bonded ingress outside the one group-aware `shared-pool:1` listener (the mio
+pool and reuseport handoff paths do not yet own a logical group). One
+representative value is retained for an inert axis, so a one-value custom plan
+remains runnable. The filter summary is printed before the run and the
 reported cell count is the filtered count.
 
-For the checked-in `full-matrix.plan`, the raw product is 1,769,472 cells and
-the capability-aware product is 142,464 cells. The omitted combinations are
-not protocol experiments: they either repeat an identical runtime behavior or
-request more bond pairs than the cell can contain.
+For the checked-in `full-matrix.plan`, the raw product is 2,211,840 cells and
+the capability-aware product is 55,296 cells. The omitted combinations are
+either no-op repetitions, over-capacity bond requests, or topologies that
+cannot yet realize one logical bonded ingress stream.
+
+`docs/plans/bonded-ingress.plan` is the focused semantic sweep: it runs a
+two-leg Broadcast and Backup publisher through the supported shared listener,
+including every encryption mode. The receiver reports one established logical
+stream, while its aggregate telemetry retains per-leg wire counters; the
+caller still reports two physical legs.
 
 When a plan is present, ordinary flags such as `--encryption` are fallback
 values for axes omitted by the plan. Use repeatable `--axis NAME=VALUE[,VALUE...]`

@@ -1994,6 +1994,8 @@ impl PeerTable {
             .iter()
             .map(|(key, group)| InboundGroupStats {
                 key: key.clone(),
+                ever_connected: group.stream_deadline.is_some(),
+                torn_down: group.torn_down,
                 connection: group_connection_stats(
                     &group.group,
                     GroupLogicalCounters {
@@ -2786,6 +2788,59 @@ mod tests {
         );
         assert_eq!(stats[0].connection.legs.len(), 2);
         assert_eq!(stats[0].connection.aggregate.wire_packets_received, 2);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(16))]
+
+        #[test]
+        fn bonded_admission_keeps_matching_legs_in_one_logical_group(
+            group_suffix in 1_u32..0x000f_ffff,
+            initial_seq in any::<u32>(),
+        ) {
+            let first = "127.0.0.1:10000".parse().expect("address");
+            let second = "127.0.0.1:10001".parse().expect("address");
+            let mut options = AdmissionOptions::basic(0x2222, 0, true);
+            options.bonded_inputs = BondedInputPolicy::Accept;
+            let telemetry = IngressTelemetry::new();
+            let mut table = PeerTable::new();
+            let group_id = shiguredo_srt::SRTGROUP_MASK | group_suffix;
+            let caller_options = |socket_id| ConnectionOptions {
+                socket_id,
+                initial_seq: Some(initial_seq),
+                stream_id: Some("publish:property-group".to_string()),
+                group_extension: Some(shiguredo_srt::GroupExtensionData {
+                    group_id,
+                    group_type: shiguredo_srt::GroupType::Broadcast,
+                    flags: 0,
+                    weight: 1,
+                }),
+                ..ConnectionOptions::default()
+            };
+            let (mut first_caller, first_conclusion) = prepare_conclusion_with_options(
+                &mut table, first, caller_options(0x1111), &options, &telemetry,
+            );
+            finish_conclusion(
+                &mut table, first, &mut first_caller, &first_conclusion, &options, &telemetry,
+            );
+            let (mut second_caller, second_conclusion) = prepare_conclusion_with_options(
+                &mut table, second, caller_options(0x2222), &options, &telemetry,
+            );
+            finish_conclusion(
+                &mut table, second, &mut second_caller, &second_conclusion, &options, &telemetry,
+            );
+
+            let mut events = Vec::new();
+            table.poll_events(&mut events);
+            prop_assert_eq!(
+                events,
+                vec![AdmissionEvent { peer: first, event: ConnectionEvent::Connected }]
+            );
+            let stats = table.bonded_stats();
+            prop_assert_eq!(stats.len(), 1);
+            prop_assert_eq!(stats[0].connection.group_id, group_id);
+            prop_assert_eq!(stats[0].connection.legs.len(), 2);
+        }
     }
 
     #[test]
@@ -4096,6 +4151,10 @@ pub struct GroupConnectionStats {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InboundGroupStats {
     pub key: srt_lifecycle::LogicalGroupKey,
+    /// Whether the logical group completed an SRT connection at least once.
+    pub ever_connected: bool,
+    /// Whether every leg ended unexpectedly after the group had connected.
+    pub torn_down: bool,
     pub connection: GroupConnectionStats,
 }
 
