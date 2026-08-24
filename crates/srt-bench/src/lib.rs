@@ -882,9 +882,7 @@ pub fn bench_config_from_args() -> BenchConfig {
         .and_then(|v| v.parse().ok())
         .unwrap_or(duration_secs);
 
-    let scoped = |name: &str| -> String {
-        cli.flags.get(name).cloned().unwrap_or_default()
-    };
+    let scoped = |name: &str| -> String { cli.flags.get(name).cloned().unwrap_or_default() };
     // The harness records under the axis name (`runtime`); a human types
     // the plural flag (`--recv-runtimes`, matching `--runtimes`).
     let scoped_runtime = |name: &str, plural: &str| -> String {

@@ -2,9 +2,12 @@
 //!
 //! sansio パターンを活用して、実ソケットなしで Caller/Listener の相互接続をテストする。
 
+use std::time::Duration;
+
 use shiguredo_srt::{
-    ConnectionEvent, ConnectionOptions, ConnectionOutput, ConnectionState, GroupExtensionData,
-    GroupType, KeyLength, SrtConnection, TimerId, Timestamp,
+    ConnectionEvent, ConnectionOptions, ConnectionOutput, ConnectionState, ConnectionStats,
+    DataPacket, GroupExtensionData, GroupType, KeyLength, PacketPosition, SrtConnection, TimerId,
+    Timestamp,
 };
 
 /// テスト用のデフォルトオプション (TSBPD 遅延を 0 にして即時配信)
@@ -87,6 +90,14 @@ fn find_connected_event(conn: &mut SrtConnection) -> bool {
         }
     }
     false
+}
+
+#[test]
+fn public_connection_and_telemetry_are_send_sync() {
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    assert_send_sync::<SrtConnection>();
+    assert_send_sync::<ConnectionStats>();
 }
 
 /// イベントから受信データを収集
@@ -667,6 +678,125 @@ fn test_receiver_stats() {
     assert_eq!(stats.total_received, 1);
 }
 
+#[test]
+fn connection_stats_cover_restream_quality_inputs() {
+    let mut caller = SrtConnection::new_caller(test_options());
+    let mut listener = SrtConnection::new_listener(test_options());
+
+    assert!(caller.stats().sender.is_none());
+    assert!(caller.stats().receiver.is_none());
+    establish_connection(&mut caller, &mut listener).expect("connection should be established");
+
+    let baseline = caller.stats();
+    caller.send(b"one", ts(100_000)).expect("first send");
+    transfer_caller_to_listener(&mut caller, &mut listener, ts(100_000));
+    caller.send(b"three", ts(110_000)).expect("second send");
+    transfer_caller_to_listener(&mut caller, &mut listener, ts(110_000));
+
+    let queued = caller.stats().sender.expect("sender snapshot");
+    assert_eq!(queued.packets_in_flight, 2);
+    assert_eq!(queued.payload_bytes_in_buffer, 8);
+    assert_eq!(queued.buffer_span_micros, 10_000);
+    assert_eq!(queued.available_buffer_bytes, None);
+
+    listener
+        .handle_timer(TimerId::Ack, ts(120_000))
+        .expect("full ACK");
+    transfer_listener_to_caller(&mut listener, &mut caller, ts(120_000));
+
+    let current = caller.stats();
+    let sender = current.sender.expect("sender snapshot");
+    assert_eq!(sender.total_sent, 2);
+    assert_eq!(sender.total_bytes_sent, 8);
+    assert_eq!(sender.total_srt_bytes_sent, 40);
+    assert_eq!(sender.total_data_packets_sent, 2);
+    // Each receive crossed the 10 ms ACK cadence, then the explicit timer
+    // emitted a third full ACK.
+    assert_eq!(sender.total_acks_received, 3);
+    assert_eq!(sender.packets_in_flight, 0);
+    assert!(sender.peer_rtt_micros.is_some());
+    assert!(sender.peer_receiving_rate_bytes_per_second.is_some());
+    assert!(sender.peer_link_capacity_bytes_per_second.is_some());
+    assert_eq!(sender.flow_window_packets, sender.congestion_window_packets);
+
+    let receiving = listener.stats().receiver.expect("receiver snapshot");
+    assert_eq!(receiving.total_received, 2);
+    assert_eq!(receiving.total_bytes_received, 40);
+    assert_eq!(receiving.total_acks_sent, 3);
+    assert!(receiving.receiving_rate_packets_per_second > 0);
+    assert!(receiving.receiving_rate_bytes_per_second > 0);
+    assert!(receiving.link_capacity_bytes_per_second.is_some());
+    assert_eq!(receiving.tsbpd_delay_micros, 0);
+    assert_eq!(receiving.available_buffer_bytes, None);
+
+    // This is the one-second sampling contract used by Restream: cumulative
+    // snapshots stay intact and the adapter derives interval rates itself.
+    let interval = current.interval_since(&baseline, Duration::from_secs(1));
+    let sending = interval.sender.expect("sending interval");
+    assert_eq!(sending.packets_sent.count, Some(2));
+    assert_eq!(sending.srt_bytes_sent.per_second, Some(40.0));
+
+    // Undecryptable input is counted at the rejection transition even when
+    // the connection has no crypto context and returns an error to its owner.
+    let undecryptable = DataPacket {
+        sequence_number: 2,
+        position: PacketPosition::Single,
+        order_flag: false,
+        encryption_flag: 0b01,
+        retransmitted: false,
+        message_number: 3,
+        timestamp: 130_000,
+        dest_socket_id: listener.socket_id(),
+        payload: vec![1, 2, 3],
+    };
+    let mut encoded = Vec::new();
+    undecryptable.encode(&mut encoded);
+    assert!(listener.feed_recv_buf(&encoded, ts(130_000)).is_err());
+    assert_eq!(
+        listener
+            .stats()
+            .receiver
+            .expect("receiver snapshot")
+            .total_undecryptable,
+        1
+    );
+}
+
+#[test]
+fn encrypted_connection_counts_and_rejects_plaintext_data() {
+    let mut caller = SrtConnection::new_caller(ConnectionOptions {
+        passphrase: Some("telemetry-passphrase".to_string()),
+        crypto_salt: Some([0x24; 16]),
+        tsbpd_delay: 0,
+        ..Default::default()
+    });
+    let mut listener = SrtConnection::new_listener(ConnectionOptions {
+        passphrase: Some("telemetry-passphrase".to_string()),
+        tsbpd_delay: 0,
+        ..Default::default()
+    });
+    establish_connection(&mut caller, &mut listener).expect("encrypted connection");
+
+    let plaintext = DataPacket {
+        sequence_number: 0,
+        position: PacketPosition::Single,
+        order_flag: false,
+        encryption_flag: 0,
+        retransmitted: false,
+        message_number: 1,
+        timestamp: 100_000,
+        dest_socket_id: listener.socket_id(),
+        payload: b"must be encrypted".to_vec(),
+    };
+    let mut encoded = Vec::new();
+    plaintext.encode(&mut encoded);
+
+    assert!(listener.feed_recv_buf(&encoded, ts(100_000)).is_err());
+    let receiver = listener.stats().receiver.expect("receiver telemetry");
+    assert_eq!(receiver.total_undecryptable, 1);
+    assert_eq!(receiver.total_data_packets_received, 0);
+}
+
 // ============================================================================
 // パケットペーシングテスト
 // ============================================================================
@@ -984,4 +1114,14 @@ fn test_dropped_packet_triggers_nak_then_retransmit() {
         stats.total_retransmits > 0,
         "caller should have retransmitted the lost packet after receiving the NAK"
     );
+    // Gap detection emits an immediate NAK and the timer emits a periodic
+    // retry. The first retransmission was already dequeued when the second
+    // report arrived, so both loss occurrences are observable.
+    assert_eq!(stats.total_naks_received, 2);
+    assert_eq!(stats.total_lost, 2);
+    assert!(stats.total_retransmitted_srt_bytes > 0);
+
+    let receiver = listener.receiver_stats().expect("receiver stats");
+    assert_eq!(receiver.total_naks_sent, 2);
+    assert_eq!(receiver.total_lost, 1);
 }

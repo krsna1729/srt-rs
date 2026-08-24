@@ -8,7 +8,15 @@ readme = "README.md"
 homepage = "https://github.com/shiguredo/srt-rs"
 repository = "https://github.com/shiguredo/srt-rs"
 license = "Apache-2.0"
-include = ["/src/**", "LICENSE", "README.md"]
+include = [
+    "/src/**",
+    "/tests/**",
+    "/benches/**",
+    "LICENSE",
+    "README.md",
+    "TELEMETRY.md",
+    "VENDOR.md",
+]
 
 [dependencies]
 # local patch (crates/srt-protocol/VENDOR.md): replaced aws-lc-rs
@@ -51,4 +59,8 @@ harness = false
 
 [[bench]]
 name = "receiver_tsbpd_scan"
+harness = false
+
+[[bench]]
+name = "collection_tradeoffs"
 harness = false

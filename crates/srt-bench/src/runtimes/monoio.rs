@@ -298,7 +298,7 @@ async fn sender_task(
     if let Some(s) = driver.conn.sender_stats() {
         stats.has_stats = true;
         stats.core_total = s.total_sent;
-        stats.secondary_a = s.total_retransmits as u64;
+        stats.secondary_a = s.total_retransmits;
         stats.secondary_b = s.packets_in_loss_list as u64;
     }
     stats
@@ -963,8 +963,7 @@ async fn serve_pool_socket(cfg: BenchConfig, index: usize, start: Instant) -> Ve
             break;
         }
         if crate::shutdown::requested()
-            || (now >= connect_deadline
-                && peers.all_terminal(now, connect_deadline, IDLE_GRACE))
+            || (now >= connect_deadline && peers.all_terminal(now, connect_deadline, IDLE_GRACE))
         {
             break;
         }
@@ -1146,7 +1145,7 @@ async fn run_single_acceptor(
         }
         peers.drain_events(stream_len, &mut connected);
 
-        let newly: Vec<SocketAddr> = connected.drain(..).collect();
+        let newly: Vec<SocketAddr> = std::mem::take(&mut connected);
         for peer in newly {
             let Some(entry) = peers.remove(&peer) else {
                 continue;

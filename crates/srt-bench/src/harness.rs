@@ -113,6 +113,10 @@ impl Record {
 /// Appending (rather than truncating) is deliberate: a sweep is many
 /// processes writing to one file, and each is a separate `srt-bench`
 /// invocation with no knowledge of its siblings.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the append-only TSV row keeps each recorded benchmark field explicit"
+)]
 pub fn append_result(
     path: &Path,
     cfg: &BenchConfig,
@@ -276,7 +280,7 @@ fn median(mut values: Vec<f64>) -> f64 {
     }
     values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let mid = values.len() / 2;
-    if values.len() % 2 == 0 {
+    if values.len().is_multiple_of(2) {
         (values[mid - 1] + values[mid]) / 2.0
     } else {
         values[mid]
@@ -344,8 +348,20 @@ pub fn report(results: &[Record], group_by: &[String]) -> String {
         .cloned()
         .chain(
             [
-                "estab", "sent", "recv", "offer%", "good%", "deliv%", "lost", "rcvbuf_drop",
-                "torn_c", "torn_l", "rtt_ms", "cpu_s", "rss_kb",
+                "pairs",
+                "estab",
+                "sent",
+                "recv",
+                "offer%",
+                "good%",
+                "deliv%",
+                "lost",
+                "rcvbuf_drop",
+                "torn_c",
+                "torn_l",
+                "rtt_ms",
+                "cpu_s",
+                "rss_kb",
             ]
             .iter()
             .map(|s| (*s).to_string()),
@@ -396,7 +412,8 @@ pub fn report(results: &[Record], group_by: &[String]) -> String {
         // as a low `offer%` instead of silently deflating the listener's
         // score. `--` on results recorded before `secs` was a column.
         let target = |r: &&Record| -> Option<f64> {
-            let (conns, bitrate, secs) = (r.number("conns")?, r.number("bitrate")?, r.number("secs")?);
+            let (conns, bitrate, secs) =
+                (r.number("conns")?, r.number("bitrate")?, r.number("secs")?);
             let pkts = conns * bitrate * secs / (8.0 * crate::PAYLOAD_SIZE as f64);
             (pkts > 0.0).then_some(pkts)
         };
@@ -422,6 +439,10 @@ pub fn report(results: &[Record], group_by: &[String]) -> String {
             + med(&callers, "cpu_sys_ms"))
             / 1000.0;
         let mut row: Vec<String> = key.split('\t').map(str::to_string).collect();
+        // All reported medians below are based on these complete caller /
+        // listener pairs. Expose their count so a human or downstream tool
+        // never mistakes one recovered sample for a stable comparison.
+        row.push(listeners.len().to_string());
         row.push(format!("{:.0}", med(&listeners, "established")));
         row.push(format!("{sent:.0}"));
         row.push(format!("{recv:.0}"));
@@ -767,9 +788,12 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
     let mut split_axes: Vec<Axis> = Vec::new();
     let role_axis = |name: &'static str, flag: &str, default: &str, out: &mut Vec<Axis>| {
         let per_role = |prefix: &str| -> Option<Vec<String>> {
-            from_plan(&format!("{prefix}{name}"))
-                .or_else(|| cli.flags.get(&format!("{prefix}{flag}")).filter(|v| !v.is_empty())
-                    .map(|v| v.split(',').map(str::trim).map(str::to_string).collect()))
+            from_plan(&format!("{prefix}{name}")).or_else(|| {
+                cli.flags
+                    .get(&format!("{prefix}{flag}"))
+                    .filter(|v| !v.is_empty())
+                    .map(|v| v.split(',').map(str::trim).map(str::to_string).collect())
+            })
         };
         let (recv, send) = (per_role("recv-"), per_role("send-"));
         if recv.is_none() && send.is_none() {
@@ -822,7 +846,6 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
         )));
     }
 
-
     // Cartesian product, expanded eagerly: the whole point is to know how
     // many cells there are before starting a long sweep.
     let mut cells: Vec<Cell> = vec![Vec::new()];
@@ -874,7 +897,6 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
         }
     );
 
-
     // Every cell of a netem sweep runs inside the namespace, including the
     // `netem=none` ones: a namespace's loopback is not identical to the
     // host's, so mixing the two would confound the comparison the sweep
@@ -895,8 +917,7 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
         }
     }
     let netns = if any_link {
-        let p = Priv::detect()
-            .ok_or_else(|| std::io::Error::other(netem_privilege_help()))?;
+        let p = Priv::detect().ok_or_else(|| std::io::Error::other(netem_privilege_help()))?;
         netns_up(p)?;
         eprintln!("matrix: running roles inside netns '{NETNS}' (link emulation active)");
         Some(p)
@@ -915,7 +936,10 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
         let for_role = |name: &str, role: Scope, default: &str| -> String {
             cell.iter()
                 .find(|(k, scope, _)| *k == name && *scope == role)
-                .or_else(|| cell.iter().find(|(k, scope, _)| *k == name && *scope == Scope::Both))
+                .or_else(|| {
+                    cell.iter()
+                        .find(|(k, scope, _)| *k == name && *scope == Scope::Both)
+                })
                 .map_or_else(|| default.to_string(), |(_, _, v)| v.clone())
         };
         let value = |name: &str| -> Option<String> {
@@ -965,7 +989,10 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
                 continue;
             }
             if let Some(p) = netns {
-                netem_apply(p, netem_args(|f| cell_link(cell, f)).map_err(std::io::Error::other)?)?;
+                netem_apply(
+                    p,
+                    netem_args(|f| cell_link(cell, f)).map_err(std::io::Error::other)?,
+                )?;
             }
             let port = free_port_range(ports_needed)?;
             // Each role gets the axes scoped to it plus the shared ones.
@@ -977,7 +1004,9 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
             let argv_for = |role: Scope| -> Vec<String> {
                 let mut out: Vec<String> = cell
                     .iter()
-                    .filter(|(k, scope, _)| *k != "bitrate" && *k != "runtime" && scope.applies_to(role))
+                    .filter(|(k, scope, _)| {
+                        *k != "bitrate" && *k != "runtime" && scope.applies_to(role)
+                    })
                     .map(|(k, _, v)| format!("--{k}={v}"))
                     .collect();
                 for (k, scope, v) in cell {
@@ -1000,28 +1029,31 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
             } else {
                 std::process::Command::new(&exe)
             }
-                .arg(format!("runtime={recv_runtime}"))
-                .arg("mode=receiver")
-                .arg(port.to_string())
-                // Backstop only: the harness signals the real stop once
-                // the sender finishes. Generous, because a sender under
-                // overload can run well past its nominal duration and the
-                // listener must still be there when it does.
-                .arg((secs + 60).to_string())
-                .arg(latency.to_string())
-                // The receiver ignores this functionally, but both rows
-                // must record the same configured bitrate or a report
-                // grouping on it would split the pair and lose delivery%.
-                .arg(&bitrate)
-                .args(&recv_argv)
-                .arg(format!("--rep={rep}"))
-                .arg(format!("--cpus={recv_cpus}"))
-                .arg(format!("--out={}", out.display()))
-                .stdout(std::process::Stdio::piped())
-                .spawn()?;
+            .arg(format!("runtime={recv_runtime}"))
+            .arg("mode=receiver")
+            .arg(port.to_string())
+            // Backstop only: the harness signals the real stop once
+            // the sender finishes. Generous, because a sender under
+            // overload can run well past its nominal duration and the
+            // listener must still be there when it does.
+            .arg((secs + 60).to_string())
+            .arg(latency.to_string())
+            // The receiver ignores this functionally, but both rows
+            // must record the same configured bitrate or a report
+            // grouping on it would split the pair and lose delivery%.
+            .arg(&bitrate)
+            .args(&recv_argv)
+            .arg(format!("--rep={rep}"))
+            .arg(format!("--cpus={recv_cpus}"))
+            .arg(format!("--out={}", out.display()))
+            .stdout(std::process::Stdio::piped())
+            .spawn()?;
 
             if !wait_for_listening(&mut recv, std::time::Duration::from_secs(60)) {
-                eprintln!("[warn] listener never reported LISTENING: {}", label.join(" "));
+                eprintln!(
+                    "[warn] listener never reported LISTENING: {}",
+                    label.join(" ")
+                );
             }
 
             let send = if let Some(p) = netns {
@@ -1029,19 +1061,19 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
             } else {
                 std::process::Command::new(&exe)
             }
-                .arg(format!("runtime={send_runtime}"))
-                .arg("mode=sender")
-                .arg("127.0.0.1")
-                .arg(port.to_string())
-                .arg(secs.to_string())
-                .arg(latency.to_string())
-                .arg(&bitrate)
-                .args(&send_argv)
-                .arg(format!("--rep={rep}"))
-                .arg(format!("--cpus={send_cpus}"))
-                .arg(format!("--out={}", out.display()))
-                .stdout(std::process::Stdio::null())
-                .status()?;
+            .arg(format!("runtime={send_runtime}"))
+            .arg("mode=sender")
+            .arg("127.0.0.1")
+            .arg(port.to_string())
+            .arg(secs.to_string())
+            .arg(latency.to_string())
+            .arg(&bitrate)
+            .args(&send_argv)
+            .arg(format!("--rep={rep}"))
+            .arg(format!("--cpus={send_cpus}"))
+            .arg(format!("--out={}", out.display()))
+            .stdout(std::process::Stdio::null())
+            .status()?;
 
             // Ordered teardown: the sender is done, so the listener has
             // nothing left to receive. Signalling now (rather than letting
@@ -1216,7 +1248,9 @@ impl Priv {
 
 /// What to tell the user when neither route is available.
 fn netem_privilege_help() -> String {
-    let exe = std::env::args().next().unwrap_or_else(|| "srt-bench".into());
+    let exe = std::env::args()
+        .next()
+        .unwrap_or_else(|| "srt-bench".into());
     format!(
         "--netem needs to create a private network namespace, which is a \
          privileged operation.\n\
@@ -1253,7 +1287,9 @@ fn netns_up(p: Priv) -> std::io::Result<()> {
     let _ = privileged(p, &["ip", "netns", "add", NETNS]);
     privileged(
         p,
-        &["ip", "netns", "exec", NETNS, "ip", "link", "set", "lo", "up"],
+        &[
+            "ip", "netns", "exec", NETNS, "ip", "link", "set", "lo", "up",
+        ],
     )
 }
 
@@ -1469,7 +1505,6 @@ pub fn run_sysprof(cli: &crate::Cli) -> std::io::Result<()> {
     Ok(())
 }
 
-
 #[cfg(test)]
 mod netem_tests {
     use super::netem_args;
@@ -1506,7 +1541,10 @@ mod netem_tests {
     fn raises_the_backlog_unless_told_otherwise() {
         // netem's default limit of 1000 packets would silently become the
         // bottleneck at these packet rates and look like protocol loss.
-        assert_eq!(args(&[("loss", "1%")]).unwrap().unwrap()[..2], ["limit", "100000"]);
+        assert_eq!(
+            args(&[("loss", "1%")]).unwrap().unwrap()[..2],
+            ["limit", "100000"]
+        );
         assert_eq!(
             args(&[("loss", "1%"), ("limit", "64")]).unwrap().unwrap()[..2],
             ["limit", "64"]
@@ -1541,7 +1579,6 @@ mod netem_tests {
         assert!(args(&[("jitter", "5ms")]).is_err());
     }
 }
-
 
 #[cfg(test)]
 mod report_tests {
@@ -1599,6 +1636,7 @@ mod report_tests {
         ];
         let out = report(&rows, &["runtime".to_string()]);
         assert_eq!(field(&out, "deliv%"), "100.0", "got:\n{out}");
+        assert_eq!(field(&out, "pairs"), "1", "got:\n{out}");
     }
 
     /// `SenderBuffer::total_sent` counts a packet when it is first queued
@@ -1623,7 +1661,10 @@ mod report_tests {
     /// row, and resume silently re-runs an entire completed sweep.
     #[test]
     fn link_off_keys_the_same_as_it_records() {
-        assert_eq!(recorded_as("link-delay", "off"), ("link_delay", String::new()));
+        assert_eq!(
+            recorded_as("link-delay", "off"),
+            ("link_delay", String::new())
+        );
         assert_eq!(
             recorded_as("link-loss", "1%"),
             ("link_loss", "1%".to_string())

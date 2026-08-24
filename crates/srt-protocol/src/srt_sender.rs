@@ -11,7 +11,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use crate::srt_packet::{DataPacket, PacketPosition, sequence_less_than};
+use crate::srt_packet::{DataPacket, PacketPosition, SRT_HEADER_SIZE, sequence_less_than};
 use crate::time::Timestamp;
 
 /// "No configured limit" default max bandwidth, matching libsrt's own
@@ -82,6 +82,10 @@ pub struct SenderBuffer {
     total_sent: u64,
     /// 送信バイト総数
     total_bytes_sent: u64,
+    /// SRT datagram bytes emitted, including SRT headers and retransmissions.
+    total_srt_bytes_sent: u64,
+    /// Retransmitted SRT datagram bytes, including SRT headers.
+    total_retransmitted_srt_bytes: u64,
     /// 送信ペイロードサイズの移動平均 (バイト、ペーシング計算用)
     avg_payload_size: f64,
     /// 最大帯域幅 (バイト/秒、`SRTO_MAXBW` 相当、ペーシング計算用)
@@ -94,6 +98,28 @@ pub struct SenderBuffer {
     /// total_retransmits はほぼ 0" という誤った統計になる -- 実際に
     /// docs/srt-pure-rust-plan.md Phase 4 の差分テストで踏んだ)。
     total_retransmits: u64,
+    /// Packets declared lost by peer NAKs (cumulative).
+    total_lost: u64,
+    /// Locally discarded packets that exceeded the TLPKTDROP deadline.
+    total_dropped: u64,
+    /// Payload bytes in locally discarded TLPKTDROP packets.
+    total_bytes_dropped: u64,
+    /// Valid ACK control packets received from the peer.
+    total_acks_received: u64,
+    /// NAK control packets received from the peer.
+    total_naks_received: u64,
+    /// Most recent measurements advertised by a full peer ACK.
+    peer_feedback: Option<PeerFeedback>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PeerFeedback {
+    rtt_micros: u32,
+    rtt_variance_micros: u32,
+    available_buffer_packets: u32,
+    receiving_rate_packets_per_second: u32,
+    link_capacity_packets_per_second: u32,
+    receiving_rate_bytes_per_second: u32,
 }
 
 impl SenderBuffer {
@@ -120,9 +146,17 @@ impl SenderBuffer {
             packet_send_period_overridden: false,
             total_sent: 0,
             total_bytes_sent: 0,
+            total_srt_bytes_sent: 0,
+            total_retransmitted_srt_bytes: 0,
             avg_payload_size: INITIAL_AVG_PAYLOAD_SIZE_BYTES,
             max_bandwidth_bytes_per_sec: DEFAULT_MAX_BANDWIDTH_BYTES_PER_SEC,
             total_retransmits: 0,
+            total_lost: 0,
+            total_dropped: 0,
+            total_bytes_dropped: 0,
+            total_acks_received: 0,
+            total_naks_received: 0,
+            peer_feedback: None,
         };
         buf.recompute_packet_send_period();
         buf
@@ -246,7 +280,7 @@ impl SenderBuffer {
     /// 最大帯域幅を設定 (`SRTO_MAXBW` 相当、バイト/秒)。ペーシング間隔を
     /// 即座に再計算する (libsrt `LiveCC::setMaxBW` -> `updatePktSndPeriod`
     /// に相当、`srtcore/congctl.cpp`)。`bytes_per_sec` が 0 の場合は
-    /// libsrt 同様 [`DEFAULT_MAX_BANDWIDTH_BYTES_PER_SEC`] にフォールバック
+    /// libsrt 同様 `DEFAULT_MAX_BANDWIDTH_BYTES_PER_SEC` にフォールバック
     /// する。
     pub fn set_max_bandwidth(&mut self, bytes_per_sec: u64) {
         self.max_bandwidth_bytes_per_sec = if bytes_per_sec == 0 {
@@ -331,6 +365,9 @@ impl SenderBuffer {
         // 統計を更新
         self.total_sent += 1;
         self.total_bytes_sent += packet.payload.len() as u64;
+        self.total_srt_bytes_sent = self
+            .total_srt_bytes_sent
+            .saturating_add((packet.payload.len() + SRT_HEADER_SIZE) as u64);
         self.record_sent_payload_size(packet.payload.len());
 
         // シーケンス番号とメッセージ番号を進める
@@ -389,6 +426,9 @@ impl SenderBuffer {
             // 統計を更新
             self.total_sent += 1;
             self.total_bytes_sent += packet.payload.len() as u64;
+            self.total_srt_bytes_sent = self
+                .total_srt_bytes_sent
+                .saturating_add((packet.payload.len() + SRT_HEADER_SIZE) as u64);
             self.record_sent_payload_size(packet.payload.len());
 
             self.next_seq = self.next_seq.wrapping_add(1) & 0x7FFF_FFFF;
@@ -418,6 +458,11 @@ impl SenderBuffer {
             if let Some(entry) = self.packets.get_mut(&seq) {
                 entry.retransmit_count += 1;
                 self.total_retransmits += 1;
+                let wire_bytes = (entry.packet.payload.len() + SRT_HEADER_SIZE) as u64;
+                self.total_srt_bytes_sent = self.total_srt_bytes_sent.saturating_add(wire_bytes);
+                self.total_retransmitted_srt_bytes = self
+                    .total_retransmitted_srt_bytes
+                    .saturating_add(wire_bytes);
 
                 let mut packet = entry.packet.clone();
                 packet.retransmitted = true;
@@ -432,6 +477,13 @@ impl SenderBuffer {
     ///
     /// `ack_seq` は次に期待するシーケンス番号 (この番号未満は全て ACK)
     pub fn handle_ack(&mut self, ack_seq: u32) {
+        self.total_acks_received = self.total_acks_received.saturating_add(1);
+        self.discard_acked(ack_seq);
+    }
+
+    /// Discard acknowledged packets without recording a peer ACK. This is
+    /// used by local sequence reconciliation paths.
+    pub(crate) fn discard_acked(&mut self, ack_seq: u32) {
         // ack_seq より小さいシーケンス番号のパケットを全て削除。
         // BTreeMap::retain は削除対象キーを一時 Vec に集める必要がなく、
         // その場で不要エントリを取り除ける (毎 ACK ごとの割り当てを回避)。
@@ -450,12 +502,34 @@ impl SenderBuffer {
 
     /// NAK を処理して損失リストに追加
     pub fn handle_nak(&mut self, lost_sequences: &[u32]) {
+        self.total_naks_received = self.total_naks_received.saturating_add(1);
         for &seq in lost_sequences {
             // バッファに存在するパケットのみ追加
             if self.packets.contains_key(&seq) && !self.loss_list.contains(&seq) {
                 self.loss_list.push_back(seq);
+                self.total_lost = self.total_lost.saturating_add(1);
             }
         }
+    }
+
+    /// Retain measurements carried by the most recent full ACK.
+    pub(crate) fn record_peer_feedback(
+        &mut self,
+        rtt_micros: u32,
+        rtt_variance_micros: u32,
+        available_buffer_packets: u32,
+        receiving_rate_packets_per_second: u32,
+        link_capacity_packets_per_second: u32,
+        receiving_rate_bytes_per_second: u32,
+    ) {
+        self.peer_feedback = Some(PeerFeedback {
+            rtt_micros,
+            rtt_variance_micros,
+            available_buffer_packets,
+            receiving_rate_packets_per_second,
+            link_capacity_packets_per_second,
+            receiving_rate_bytes_per_second,
+        });
     }
 
     /// 期限切れパケットを削除 (TLPKTDROP)
@@ -483,8 +557,13 @@ impl SenderBuffer {
                     if elapsed <= threshold {
                         break;
                     }
-                    self.packets.remove(&seq);
-                    dropped.push(seq);
+                    if let Some(entry) = self.packets.remove(&seq) {
+                        self.total_dropped = self.total_dropped.saturating_add(1);
+                        self.total_bytes_dropped = self
+                            .total_bytes_dropped
+                            .saturating_add(entry.packet.payload.len() as u64);
+                        dropped.push(seq);
+                    }
                 }
                 None => {
                     // 既に ACK 済みで存在しない -- 走査を継続する
@@ -510,12 +589,6 @@ impl SenderBuffer {
 
     /// 統計情報を取得
     pub fn stats(&self) -> SenderStats {
-        // 累積カウンタ (libsrt pktRetransTotal 相当)。`packets` に現存する
-        // エントリだけを合算するライブスキャン方式は、ACK 済みで
-        // `packets` から削除された後にその再送実績が消えてしまうバグ
-        // だった (self.total_retransmits のフィールドコメント参照)。
-        let total_retransmits: u32 = self.total_retransmits.min(u32::MAX as u64) as u32;
-
         // 再送回数別カウント (こちらは意図的に現存パケットのみのライブ
         // スナップショット -- 「今バッファにあるパケットのうち何回再送
         // されたか」の分布であり、累積合計とは別の指標)
@@ -531,12 +604,65 @@ impl SenderBuffer {
             }
         }
 
+        let payload_bytes_in_buffer = self
+            .packets
+            .values()
+            .map(|entry| entry.packet.payload.len() as u64)
+            .sum();
+        let buffer_span_micros = self
+            .packets
+            .values()
+            .next()
+            .zip(self.packets.values().next_back())
+            .map_or(0, |(oldest, newest)| {
+                newest
+                    .sent_time
+                    .as_micros()
+                    .saturating_sub(oldest.sent_time.as_micros())
+            });
+        let peer = self.peer_feedback;
+
         SenderStats {
             packets_in_buffer: self.packets.len() as u32,
+            payload_bytes_in_buffer,
             packets_in_loss_list: self.loss_list.len() as u32,
-            total_retransmits,
+            available_buffer_packets: self.flow_window.saturating_sub(self.packets.len() as u32),
+            available_buffer_bytes: None,
+            flow_window_packets: self.flow_window,
+            congestion_window_packets: self.congestion_window,
+            packets_in_flight: self.packets_in_flight(),
+            buffer_span_micros,
+            tsbpd_delay_micros: self.latency_us,
+            packet_send_period_micros: self.packet_send_period,
+            max_bandwidth_bytes_per_second: self.max_bandwidth_bytes_per_sec,
+            peer_rtt_micros: peer.map(|feedback| feedback.rtt_micros),
+            peer_rtt_variance_micros: peer.map(|feedback| feedback.rtt_variance_micros),
+            peer_available_buffer_packets: peer.map(|feedback| feedback.available_buffer_packets),
+            peer_receiving_rate_packets_per_second: peer
+                .map(|feedback| feedback.receiving_rate_packets_per_second),
+            peer_link_capacity_packets_per_second: peer
+                .map(|feedback| feedback.link_capacity_packets_per_second),
+            peer_link_capacity_bytes_per_second: peer.and_then(|feedback| {
+                let packet_rate = u64::from(feedback.receiving_rate_packets_per_second);
+                (packet_rate > 0).then(|| {
+                    u64::from(feedback.link_capacity_packets_per_second)
+                        .saturating_mul(u64::from(feedback.receiving_rate_bytes_per_second))
+                        / packet_rate
+                })
+            }),
+            peer_receiving_rate_bytes_per_second: peer
+                .map(|feedback| feedback.receiving_rate_bytes_per_second),
+            total_retransmits: self.total_retransmits,
             total_sent: self.total_sent,
+            total_data_packets_sent: self.total_sent.saturating_add(self.total_retransmits),
             total_bytes_sent: self.total_bytes_sent,
+            total_srt_bytes_sent: self.total_srt_bytes_sent,
+            total_retransmitted_srt_bytes: self.total_retransmitted_srt_bytes,
+            total_lost: self.total_lost,
+            total_dropped: self.total_dropped,
+            total_bytes_dropped: self.total_bytes_dropped,
+            total_acks_received: self.total_acks_received,
+            total_naks_received: self.total_naks_received,
             retransmits_once,
             retransmits_twice,
             retransmits_many,
@@ -545,18 +671,71 @@ impl SenderBuffer {
 }
 
 /// 送信統計
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SenderStats {
     /// バッファ内のパケット数
     pub packets_in_buffer: u32,
+    /// Exact payload-byte occupancy of the local send buffer.
+    pub payload_bytes_in_buffer: u64,
     /// 損失リストのパケット数
     pub packets_in_loss_list: u32,
+    /// Remaining local flow-window capacity, in packets.
+    pub available_buffer_packets: u32,
+    /// Byte capacity is unavailable because the send-buffer limit is packets.
+    pub available_buffer_bytes: Option<u64>,
+    /// Negotiated local flow window, in packets.
+    pub flow_window_packets: u32,
+    /// Current local congestion window, in packets.
+    pub congestion_window_packets: u32,
+    /// Packets sent but not yet cumulatively acknowledged.
+    pub packets_in_flight: u32,
+    /// Time span between oldest and newest buffered packets.
+    pub buffer_span_micros: u64,
+    /// Configured sender TSBPD delay.
+    pub tsbpd_delay_micros: u64,
+    /// Current pacing period between original packet sends.
+    pub packet_send_period_micros: u64,
+    /// Configured maximum pacing bandwidth.
+    pub max_bandwidth_bytes_per_second: u64,
+    /// RTT advertised by the peer's most recent full ACK.
+    pub peer_rtt_micros: Option<u32>,
+    /// RTT variance advertised by the peer's most recent full ACK.
+    pub peer_rtt_variance_micros: Option<u32>,
+    /// Peer receive-buffer availability from the most recent full ACK.
+    pub peer_available_buffer_packets: Option<u32>,
+    /// Peer receive rate from the most recent full ACK.
+    pub peer_receiving_rate_packets_per_second: Option<u32>,
+    /// Peer link-capacity estimate from the most recent full ACK.
+    pub peer_link_capacity_packets_per_second: Option<u32>,
+    /// Peer link-capacity estimate converted using its measured wire bytes per packet.
+    pub peer_link_capacity_bytes_per_second: Option<u64>,
+    /// Peer byte receive rate from the most recent full ACK.
+    pub peer_receiving_rate_bytes_per_second: Option<u32>,
     /// 再送回数の合計
-    pub total_retransmits: u32,
-    /// 送信パケット総数
+    pub total_retransmits: u64,
+    /// Unique original DATA packets emitted.
     pub total_sent: u64,
-    /// 送信バイト総数
+    /// All emitted DATA packets, including retransmissions.
+    pub total_data_packets_sent: u64,
+    /// Payload bytes in unique original DATA packets.
     pub total_bytes_sent: u64,
+    /// All emitted SRT datagram bytes, including SRT headers and retransmissions.
+    ///
+    /// This deliberately excludes IP and UDP headers, which belong to the
+    /// caller-owned transport and vary between IPv4 and IPv6.
+    pub total_srt_bytes_sent: u64,
+    /// Retransmitted SRT datagram bytes, including SRT headers.
+    pub total_retransmitted_srt_bytes: u64,
+    /// Packets declared lost by peer NAKs.
+    pub total_lost: u64,
+    /// Packets locally discarded after their TLPKTDROP deadline.
+    pub total_dropped: u64,
+    /// Payload bytes in locally discarded packets.
+    pub total_bytes_dropped: u64,
+    /// Valid ACK control packets received.
+    pub total_acks_received: u64,
+    /// NAK control packets received.
+    pub total_naks_received: u64,
     /// 1 回再送されたパケット数
     pub retransmits_once: u32,
     /// 2 回再送されたパケット数
@@ -895,5 +1074,43 @@ mod tests {
         buf.handle_ack(3);
         assert_eq!(buf.packets_in_flight(), 0);
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn telemetry_counts_loss_retransmit_and_exact_srt_bytes() {
+        let mut buf = SenderBuffer::new(10, 32, 10);
+        buf.push(vec![1, 2, 3, 4], 0, 1, Timestamp::from_micros(0));
+
+        buf.handle_nak(&[10]);
+        buf.handle_nak(&[10]);
+        let stats = buf.stats();
+        assert_eq!(stats.total_naks_received, 2);
+        assert_eq!(stats.total_lost, 1, "a queued loss is not counted twice");
+        assert_eq!(stats.total_srt_bytes_sent, 20);
+
+        assert!(buf.pop_retransmit().is_some());
+        let stats = buf.stats();
+        assert_eq!(stats.total_retransmits, 1);
+        assert_eq!(stats.total_retransmitted_srt_bytes, 20);
+        assert_eq!(stats.total_srt_bytes_sent, 40);
+        assert_eq!(stats.total_data_packets_sent, 2);
+
+        let dropped = buf.drop_expired(Timestamp::from_micros(1_000_001));
+        assert_eq!(dropped, vec![10]);
+        let stats = buf.stats();
+        assert_eq!(stats.total_dropped, 1);
+        assert_eq!(stats.total_bytes_dropped, 4);
+        assert_eq!(stats.payload_bytes_in_buffer, 0);
+    }
+
+    #[test]
+    fn telemetry_retains_latest_full_ack_feedback() {
+        let mut buf = SenderBuffer::new(0, 64, 120);
+        buf.record_peer_feedback(5_000, 500, 60, 1_000, 2_000, 1_500_000);
+
+        let stats = buf.stats();
+        assert_eq!(stats.peer_rtt_micros, Some(5_000));
+        assert_eq!(stats.peer_available_buffer_packets, Some(60));
+        assert_eq!(stats.peer_link_capacity_bytes_per_second, Some(3_000_000));
     }
 }

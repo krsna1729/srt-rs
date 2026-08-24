@@ -91,7 +91,9 @@ pub fn run(cfg: BenchConfig) {
     }
     let start = Instant::now();
 
-    let stats = crate::run_workers(&cfg, move |cfg, mine| smol::block_on(drive(cfg, mine, start)));
+    let stats = crate::run_workers(&cfg, move |cfg, mine| {
+        smol::block_on(drive(cfg, mine, start))
+    });
 
     let mut agg = Aggregate::new(cfg);
     for s in stats {
@@ -282,7 +284,7 @@ async fn sender_task(
     if let Some(s) = driver.conn.sender_stats() {
         stats.has_stats = true;
         stats.core_total = s.total_sent;
-        stats.secondary_a = s.total_retransmits as u64;
+        stats.secondary_a = s.total_retransmits;
         stats.secondary_b = s.packets_in_loss_list as u64;
     }
     stats
@@ -474,6 +476,10 @@ fn run_reuseport_multi(cfg: BenchConfig, k: usize) {
 /// and tokio's `run_acceptor` (see their doc comments for the full
 /// explanation). Only a leg that actually needs to relocate gets spawned
 /// as its own task on the owner's executor, via a handoff.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "acceptor ownership inputs remain explicit across runtime adapters"
+)]
 async fn run_acceptor(
     cfg: BenchConfig,
     worker_index: usize,
@@ -540,19 +546,16 @@ async fn run_acceptor(
                 &senders,
                 &telemetry,
             );
-            loop {
-                match listener.get_ref().recv_from(&mut buf) {
-                    Ok((n, peer)) => peers.admit_and_forward(
-                        peer,
-                        &buf[..n],
-                        crate::now_ts(start),
-                        &admission,
-                        worker_index,
-                        &senders,
-                        &telemetry,
-                    ),
-                    Err(_) => break,
-                }
+            while let Ok((n, peer)) = listener.get_ref().recv_from(&mut buf) {
+                peers.admit_and_forward(
+                    peer,
+                    &buf[..n],
+                    crate::now_ts(start),
+                    &admission,
+                    worker_index,
+                    &senders,
+                    &telemetry,
+                );
             }
         }
 
@@ -934,8 +937,7 @@ async fn serve_pool_socket(cfg: BenchConfig, index: usize, start: Instant) -> Ve
             break;
         }
         if crate::shutdown::requested()
-            || (now >= connect_deadline
-                && peers.all_terminal(now, connect_deadline, IDLE_GRACE))
+            || (now >= connect_deadline && peers.all_terminal(now, connect_deadline, IDLE_GRACE))
         {
             break;
         }
@@ -1121,7 +1123,7 @@ async fn run_single_acceptor(
         }
         peers.drain_events(stream_len, &mut connected);
 
-        let newly: Vec<SocketAddr> = connected.drain(..).collect();
+        let newly: Vec<SocketAddr> = std::mem::take(&mut connected);
         for peer in newly {
             let Some(entry) = peers.remove(&peer) else {
                 continue;

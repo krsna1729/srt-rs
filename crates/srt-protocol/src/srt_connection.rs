@@ -15,6 +15,7 @@ use crate::srt_handshake::{
 use crate::srt_packet::{ControlPacket, ControlType, DataPacket, SRT_HEADER_SIZE, SrtPacket};
 use crate::srt_receiver::ReceiverBuffer;
 use crate::srt_sender::SenderBuffer;
+use crate::stats::ConnectionStats;
 use crate::time::Timestamp;
 
 /// 接続の役割
@@ -171,7 +172,7 @@ pub struct ConnectionOptions {
     pub group_extension: Option<GroupExtensionData>,
     /// 最大帯域幅 (`SRTO_MAXBW` 相当、バイト/秒)。`None` の場合は libsrt の
     /// `BW_INFINITE` (1 Gbps) 相当のデフォルトを使う
-    /// ([`crate::srt_sender`] のペーシング計算を参照)。
+    /// (`srt_sender` のペーシング計算を参照)。
     pub max_bandwidth_bytes_per_sec: Option<u64>,
     /// Flow-control window advertised in the handshake, in packets.
     pub flow_window_packets: u32,
@@ -547,7 +548,7 @@ impl SrtConnection {
                     if let Some(receiver) = self.receiver.as_mut() {
                         for seq in receiver.drop_too_late(now) {
                             if let Some(sender) = self.sender.as_mut() {
-                                sender.handle_ack(seq);
+                                sender.discard_acked(seq);
                             }
                         }
                         while let Some(ready_pkt) = receiver.pop_ready(now) {
@@ -780,6 +781,18 @@ impl SrtConnection {
         self.receiver.as_ref().map(|r| r.stats())
     }
 
+    /// Return a non-clearing snapshot of cumulative and instantaneous
+    /// connection telemetry.
+    ///
+    /// Interval counts and rates can be derived without giving this sans-I/O
+    /// core a clock via [`ConnectionStats::interval_since`].
+    pub fn stats(&self) -> ConnectionStats {
+        ConnectionStats {
+            sender: self.sender_stats(),
+            receiver: self.receiver_stats(),
+        }
+    }
+
     /// 新しい SEK を提供してキーリフレッシュを開始
     ///
     /// `KeyRefreshNeeded` イベントを受信した後に呼び出す。
@@ -827,16 +840,36 @@ impl SrtConnection {
 
         let mut payload = pkt.payload.clone();
 
+        // A secured SRT connection must reject plaintext DATA just as it
+        // rejects packets whose advertised key cannot be used. This is both a
+        // security boundary and the source transition for undecrypt telemetry.
+        if pkt.encryption_flag == 0 && self.crypto.is_some() {
+            if let Some(receiver) = self.receiver.as_mut() {
+                receiver.record_undecryptable();
+            }
+            return Err(Error::crypto_error(
+                "unencrypted DATA packet on encrypted connection",
+            ));
+        }
+
         // 復号化
         if pkt.encryption_flag != 0 {
-            if let Some(ref crypto) = self.crypto {
-                let key_flag = KeyFlag::from_kk_field(pkt.encryption_flag)
-                    .ok_or_else(|| Error::crypto_error("invalid KK flag"))?;
-                crypto.decrypt(pkt.sequence_number, key_flag, &mut payload)?;
+            let decrypt_result = if let Some(ref crypto) = self.crypto {
+                KeyFlag::from_kk_field(pkt.encryption_flag)
+                    .ok_or_else(|| Error::crypto_error("invalid KK flag"))
+                    .and_then(|key_flag| {
+                        crypto.decrypt(pkt.sequence_number, key_flag, &mut payload)
+                    })
             } else {
-                return Err(Error::crypto_error(
+                Err(Error::crypto_error(
                     "encrypted packet but no crypto context",
-                ));
+                ))
+            };
+            if let Err(error) = decrypt_result {
+                if let Some(receiver) = self.receiver.as_mut() {
+                    receiver.record_undecryptable();
+                }
+                return Err(error);
             }
         }
 
@@ -1181,6 +1214,29 @@ impl SrtConnection {
             tracing::debug!("sender buffer: {} -> {} packets", before, after);
         }
 
+        // A full ACK carries receiver-side instantaneous measurements. Keep
+        // the latest complete set so sender-only applications do not need to
+        // parse control packets themselves.
+        if pkt.control_info.len() >= 28 {
+            let mut feedback = &pkt.control_info[4..];
+            let rtt_micros = crate::buf::read_u32(&mut feedback)?;
+            let rtt_variance_micros = crate::buf::read_u32(&mut feedback)?;
+            let available_buffer_packets = crate::buf::read_u32(&mut feedback)?;
+            let receiving_rate_packets_per_second = crate::buf::read_u32(&mut feedback)?;
+            let link_capacity_packets_per_second = crate::buf::read_u32(&mut feedback)?;
+            let receiving_rate_bytes_per_second = crate::buf::read_u32(&mut feedback)?;
+            if let Some(sender) = self.sender.as_mut() {
+                sender.record_peer_feedback(
+                    rtt_micros,
+                    rtt_variance_micros,
+                    available_buffer_packets,
+                    receiving_rate_packets_per_second,
+                    link_capacity_packets_per_second,
+                    receiving_rate_bytes_per_second,
+                );
+            }
+        }
+
         // Full ACK の場合、ACKACK を送信
         if pkt.control_info.len() >= 16 {
             // Full ACK (RTT, RTTVar, Buffer Size, Rate を含む)
@@ -1371,6 +1427,8 @@ impl SrtConnection {
         };
 
         let ack_info = receiver.generate_ack(now);
+        let ack_number = receiver.ack_number();
+        receiver.record_ack_sent();
         self.last_ack_time = Some(now);
 
         let mut control_info = Vec::new();
@@ -1389,11 +1447,7 @@ impl SrtConnection {
         let pkt = ControlPacket {
             control_type: ControlType::Ack,
             subtype: 0,
-            type_specific_info: if ack_info.is_light {
-                0
-            } else {
-                receiver.ack_number()
-            },
+            type_specific_info: if ack_info.is_light { 0 } else { ack_number },
             timestamp: self.relative_timestamp(now),
             dest_socket_id: self.peer_socket_id,
             control_info,
@@ -1409,6 +1463,10 @@ impl SrtConnection {
     fn send_nak(&mut self, loss_list: &[u32], now: Timestamp) {
         if loss_list.is_empty() {
             return;
+        }
+
+        if let Some(receiver) = self.receiver.as_mut() {
+            receiver.record_nak_sent();
         }
 
         let control_info = encode_loss_list(loss_list);

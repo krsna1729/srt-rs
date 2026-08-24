@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use std::cell::Cell;
 
 use crate::srt_handshake::DEFAULT_FLOW_WINDOW;
-use crate::srt_packet::{DataPacket, sequence_greater_than, sequence_less_than};
+use crate::srt_packet::{DataPacket, SRT_HEADER_SIZE, sequence_greater_than, sequence_less_than};
 use crate::time::Timestamp;
 
 /// Light ACK 送信間隔 (パケット数)
@@ -345,14 +345,35 @@ pub struct ReceiverBuffer {
     /// 受信パケット総数 (統計用)
     total_received: u64,
 
+    /// All decrypted DATA packets presented to the receive buffer.
+    total_data_packets_received: u64,
+
     /// 損失パケット総数 (統計用)
     total_lost: u64,
 
     /// 重複パケット総数 (統計用)
     total_duplicates: u64,
 
+    /// Valid packets received with the retransmission bit set.
+    total_retransmitted: u64,
+
+    /// Missing packets abandoned by TLPKTDROP.
+    total_dropped: u64,
+
+    /// Encrypted packets the connection could not decrypt.
+    total_undecryptable: u64,
+
+    /// ACK control packets emitted by the owning connection.
+    total_acks_sent: u64,
+
+    /// NAK control packets emitted by the owning connection.
+    total_naks_sent: u64,
+
     /// 受信バイト総数 (統計用)
     total_bytes_received: u64,
+
+    /// SRT datagram bytes for all decrypted DATA packets, including duplicates.
+    total_srt_bytes_received: u64,
 
     /// ジッター (マイクロ秒) - RFC 3550 方式で計算
     jitter: u32,
@@ -418,9 +439,16 @@ impl ReceiverBuffer {
             rtt_var: 50_000,
             max_buffer_size,
             total_received: 0,
+            total_data_packets_received: 0,
             total_lost: 0,
             total_duplicates: 0,
+            total_retransmitted: 0,
+            total_dropped: 0,
+            total_undecryptable: 0,
+            total_acks_sent: 0,
+            total_naks_sent: 0,
             total_bytes_received: 0,
+            total_srt_bytes_received: 0,
             jitter: 0,
             last_transit: None,
             ack_timestamps: AckTimestampTracker::new(),
@@ -495,6 +523,14 @@ impl ReceiverBuffer {
     pub fn receive(&mut self, packet: DataPacket, now: Timestamp) -> Option<Vec<u32>> {
         let seq = packet.sequence_number;
         let was_expected = seq == self.expected_seq;
+        let packet_size = packet.payload.len() + SRT_HEADER_SIZE;
+        self.total_data_packets_received = self.total_data_packets_received.saturating_add(1);
+        self.total_srt_bytes_received = self
+            .total_srt_bytes_received
+            .saturating_add(packet_size as u64);
+        if packet.retransmitted {
+            self.total_retransmitted = self.total_retransmitted.saturating_add(1);
+        }
 
         // 重複チェック
         if self.packets.contains_key(&seq) {
@@ -504,6 +540,7 @@ impl ReceiverBuffer {
 
         // 古すぎるパケットは無視
         if sequence_less_than(seq, self.expected_seq) {
+            self.total_duplicates = self.total_duplicates.saturating_add(1);
             return None;
         }
 
@@ -525,7 +562,6 @@ impl ReceiverBuffer {
         self.packets_since_ack += 1;
 
         // 帯域推定のためにパケット到着を記録
-        let packet_size = packet.payload.len() + 16; // SRT ヘッダサイズを加算
         self.total_bytes_received += packet_size as u64;
         self.rate_estimator.on_packet_received(now, packet_size);
         self.link_capacity_estimator.on_packet_received(now);
@@ -963,6 +999,8 @@ impl ReceiverBuffer {
             dropped.push(seq);
         }
 
+        self.total_dropped = self.total_dropped.saturating_add(dropped.len() as u64);
+
         if !dropped.is_empty() {
             let dropped_set: FxHashSet<u32> = dropped.iter().copied().collect();
             while self.packets.contains_key(&self.expected_seq)
@@ -990,6 +1028,18 @@ impl ReceiverBuffer {
         self.rtt_var
     }
 
+    pub(crate) fn record_ack_sent(&mut self) {
+        self.total_acks_sent = self.total_acks_sent.saturating_add(1);
+    }
+
+    pub(crate) fn record_nak_sent(&mut self) {
+        self.total_naks_sent = self.total_naks_sent.saturating_add(1);
+    }
+
+    pub(crate) fn record_undecryptable(&mut self) {
+        self.total_undecryptable = self.total_undecryptable.saturating_add(1);
+    }
+
     /// 統計情報を取得
     pub fn stats(&self) -> ReceiverStats {
         // パケットロス率を計算 (パーセント * 100)
@@ -999,44 +1049,124 @@ impl ReceiverBuffer {
         let loss_rate_percent_x100 =
             (self.total_lost * 10000).checked_div(total).unwrap_or(0) as u32;
 
+        let payload_bytes_in_buffer = self
+            .packets
+            .values()
+            .map(|entry| entry.packet.payload.len() as u64)
+            .sum();
+        let buffer_span_micros = self
+            .packets
+            .values()
+            .map(|entry| entry.delivery_time.as_micros())
+            .min()
+            .zip(
+                self.packets
+                    .values()
+                    .map(|entry| entry.delivery_time.as_micros())
+                    .max(),
+            )
+            .map_or(0, |(oldest, newest)| newest.saturating_sub(oldest));
+
         ReceiverStats {
             packets_in_buffer: self.packets.len() as u32,
+            payload_bytes_in_buffer,
             packets_in_loss_list: self.loss_list.len() as u32,
+            available_buffer_packets: self
+                .max_buffer_size
+                .saturating_sub(self.packets.len() as u32),
+            available_buffer_bytes: None,
+            max_buffer_packets: self.max_buffer_size,
+            buffer_span_micros,
             total_received: self.total_received,
+            total_data_packets_received: self.total_data_packets_received,
             total_lost: self.total_lost,
             total_duplicates: self.total_duplicates,
+            total_retransmitted: self.total_retransmitted,
+            total_dropped: self.total_dropped,
+            total_undecryptable: self.total_undecryptable,
+            total_acks_sent: self.total_acks_sent,
+            total_naks_sent: self.total_naks_sent,
             rtt: self.rtt,
             rtt_var: self.rtt_var,
             total_bytes_received: self.total_bytes_received,
+            total_srt_bytes_received: self.total_srt_bytes_received,
             loss_rate_percent_x100,
             jitter: self.jitter,
+            receiving_rate_packets_per_second: self.rate_estimator.estimated_packet_rate,
+            receiving_rate_bytes_per_second: self.rate_estimator.estimated_byte_rate,
+            link_capacity_packets_per_second: self.link_capacity_estimator.estimated_capacity,
+            link_capacity_bytes_per_second: {
+                let packet_rate = u64::from(self.rate_estimator.estimated_packet_rate);
+                (packet_rate > 0).then(|| {
+                    u64::from(self.link_capacity_estimator.estimated_capacity)
+                        .saturating_mul(u64::from(self.rate_estimator.estimated_byte_rate))
+                        / packet_rate
+                })
+            },
+            tsbpd_delay_micros: self.tsbpd_delay_us,
         }
     }
 }
 
 /// 受信統計
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReceiverStats {
     /// バッファ内のパケット数
     pub packets_in_buffer: u32,
+    /// Exact payload-byte occupancy of the local receive buffer.
+    pub payload_bytes_in_buffer: u64,
     /// 損失リストのパケット数
     pub packets_in_loss_list: u32,
-    /// 受信パケット総数
+    /// Remaining receive-buffer capacity, in packets.
+    pub available_buffer_packets: u32,
+    /// Byte capacity is unavailable because the receive-buffer limit is packets.
+    pub available_buffer_bytes: Option<u64>,
+    /// Configured receive-buffer capacity, in packets.
+    pub max_buffer_packets: u32,
+    /// Timestamp span represented by packets currently buffered.
+    pub buffer_span_micros: u64,
+    /// Unique DATA packets accepted for delivery.
     pub total_received: u64,
+    /// All decrypted DATA packets received, including retransmissions and duplicates.
+    pub total_data_packets_received: u64,
     /// 損失パケット総数
     pub total_lost: u64,
     /// 重複パケット総数
     pub total_duplicates: u64,
+    /// Accepted packets carrying the retransmission bit.
+    pub total_retransmitted: u64,
+    /// Missing packets abandoned by TLPKTDROP.
+    pub total_dropped: u64,
+    /// Encrypted packets rejected because they could not be decrypted.
+    pub total_undecryptable: u64,
+    /// ACK control packets sent.
+    pub total_acks_sent: u64,
+    /// NAK control packets sent.
+    pub total_naks_sent: u64,
     /// RTT (マイクロ秒)
     pub rtt: u32,
     /// RTT Variance (マイクロ秒)
     pub rtt_var: u32,
-    /// 受信バイト総数
+    /// SRT datagram bytes in unique DATA packets accepted for delivery.
     pub total_bytes_received: u64,
+    /// SRT datagram bytes received, including retransmissions and duplicates.
+    ///
+    /// This excludes caller-owned IP and UDP headers.
+    pub total_srt_bytes_received: u64,
     /// パケットロス率 (パーセント * 100、例: 123 = 1.23%)
     pub loss_rate_percent_x100: u32,
     /// ジッター (マイクロ秒)
     pub jitter: u32,
+    /// Smoothed local receive rate in packets per second.
+    pub receiving_rate_packets_per_second: u32,
+    /// Smoothed local wire receive rate in bytes per second.
+    pub receiving_rate_bytes_per_second: u32,
+    /// Packet-pair link-capacity estimate in packets per second.
+    pub link_capacity_packets_per_second: u32,
+    /// Link-capacity estimate converted using measured wire bytes per packet.
+    pub link_capacity_bytes_per_second: Option<u64>,
+    /// Configured receiver TSBPD delay.
+    pub tsbpd_delay_micros: u64,
 }
 
 #[cfg(test)]
@@ -1982,6 +2112,30 @@ mod tests {
         assert!(
             buf.wrapping_period_active,
             "TSBPD 無効時は終了窗口パケットでも終了判定が発火しないはず"
+        );
+    }
+
+    #[test]
+    fn telemetry_counts_retransmit_control_and_undecrypt_transitions() {
+        let start = Timestamp::from_micros(0);
+        let mut buf = ReceiverBuffer::new(100, 120, start, 0);
+        let mut packet = make_packet(100, 1_000);
+        packet.retransmitted = true;
+        buf.receive(packet, Timestamp::from_micros(1_000));
+        buf.record_ack_sent();
+        buf.record_nak_sent();
+        buf.record_undecryptable();
+
+        let stats = buf.stats();
+        assert_eq!(stats.total_retransmitted, 1);
+        assert_eq!(stats.total_acks_sent, 1);
+        assert_eq!(stats.total_naks_sent, 1);
+        assert_eq!(stats.total_undecryptable, 1);
+        assert_eq!(stats.payload_bytes_in_buffer, 3);
+        assert_eq!(stats.max_buffer_packets, DEFAULT_FLOW_WINDOW);
+        assert_eq!(
+            stats.available_buffer_packets,
+            DEFAULT_FLOW_WINDOW.saturating_sub(1)
         );
     }
 }

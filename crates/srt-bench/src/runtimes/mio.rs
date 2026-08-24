@@ -285,15 +285,15 @@ fn drive(cfg: BenchConfig, mine: Vec<usize>, start: Instant) -> Vec<ConnStats> {
         // `stream_deadline` stays `None`.
         let all_done = crate::shutdown::requested()
             || next_to_start >= mine.len()
-            && drivers.iter().all(|d| {
-                if d.connected {
-                    d.stream_deadline
-                        .map(|dl| Instant::now() >= dl)
-                        .unwrap_or(false)
-                } else {
-                    d.started_at.elapsed() >= crate::INTEROP_CONNECT_TIMEOUT
-                }
-            });
+                && drivers.iter().all(|d| {
+                    if d.connected {
+                        d.stream_deadline
+                            .map(|dl| Instant::now() >= dl)
+                            .unwrap_or(false)
+                    } else {
+                        d.started_at.elapsed() >= crate::INTEROP_CONNECT_TIMEOUT
+                    }
+                });
         if all_done {
             break;
         }
@@ -458,9 +458,7 @@ fn drive(cfg: BenchConfig, mine: Vec<usize>, start: Instant) -> Vec<ConnStats> {
             // keeps streaming until every other driver is done too --
             // and with staggered connects that is seconds of extra load,
             // recorded as the sender offering more than was configured.
-            let past_deadline = d
-                .stream_deadline
-                .is_some_and(|dl| Instant::now() >= dl);
+            let past_deadline = d.stream_deadline.is_some_and(|dl| Instant::now() >= dl);
             if d.connected && cfg.mode == crate::Mode::Sender && !past_deadline {
                 // Sample the clock ONCE: this loop must drain only what pacing
                 // says is due at instant `t`. Re-reading it per iteration makes
@@ -512,7 +510,7 @@ fn drive(cfg: BenchConfig, mine: Vec<usize>, start: Instant) -> Vec<ConnStats> {
                 if let Some(st) = d.conn.conn.sender_stats() {
                     s.has_stats = true;
                     s.core_total = st.total_sent;
-                    s.secondary_a = st.total_retransmits as u64;
+                    s.secondary_a = st.total_retransmits;
                     s.secondary_b = st.packets_in_loss_list as u64;
                 }
             }
@@ -530,7 +528,6 @@ fn drive(cfg: BenchConfig, mine: Vec<usize>, start: Instant) -> Vec<ConnStats> {
     }
     out
 }
-
 
 /// #2 -- shared pool, no promotion: K real, distinct, plainly-bound
 /// listener ports (no SO_REUSEPORT). Every one stays unconnected for its
@@ -1281,7 +1278,7 @@ fn promote_locally(
     let now = Instant::now();
     token_index.insert(token.0, slots.len());
     slots.push(PoolSlot {
-                torn_down: false,
+        torn_down: false,
         conn,
         connected: true,
         ever_connected: true,
@@ -1692,7 +1689,7 @@ fn run_worker(
                     let now = Instant::now();
                     token_index.insert(token.0, slots.len());
                     slots.push(PoolSlot {
-                torn_down: false,
+                        torn_down: false,
                         conn,
                         connected: true,
                         ever_connected: true,

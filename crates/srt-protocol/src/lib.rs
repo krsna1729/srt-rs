@@ -7,6 +7,7 @@ mod srt_handshake;
 mod srt_packet;
 mod srt_receiver;
 mod srt_sender;
+mod stats;
 pub mod stream_id;
 mod time;
 
@@ -33,4 +34,8 @@ pub use srt_packet::{
 };
 pub use srt_receiver::{AckPacket, NakPacket, ReceiverBuffer, ReceiverStats};
 pub use srt_sender::{SenderBuffer, SenderStats};
+pub use stats::{
+    ConnectionStats, ConnectionStatsInterval, CounterDelta, ReceiverStatsInterval,
+    SenderStatsInterval,
+};
 pub use time::Timestamp;

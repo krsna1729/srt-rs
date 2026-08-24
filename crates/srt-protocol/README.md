@@ -81,8 +81,14 @@ Sending: `can_send_with_pacing(now)` / `time_until_send(now)` gate
 number; `set_packet_send_period` caps rate. Listeners may apply policy
 mid-handshake via `set_listener_policy(passphrase, key_length,
 tsbpd_delay, flow_window, rcvbuf)` — mirrors libsrt's accept hook.
-Stats: `sender_stats()` / `receiver_stats()` return totals for sent /
-retransmits / lost / duplicates / RTT.
+Telemetry: `stats()` returns a non-clearing, direction-aware connection
+snapshot with cumulative loss/retransmit/drop/undecrypt and ACK/NAK counters,
+instantaneous rates, RTT, capacity, pacing, and exact queue occupancy.
+`ConnectionStats::interval_since` derives interval counts and rates using the
+caller's elapsed duration, keeping the sans-I/O core independent of a wall
+clock. The older `sender_stats()` / `receiver_stats()` accessors remain
+available. Field semantics and the Restream/libSRT mapping are documented in
+[TELEMETRY.md](TELEMETRY.md).
 
 ## Interop status
 
