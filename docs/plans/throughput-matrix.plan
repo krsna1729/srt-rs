@@ -1,0 +1,24 @@
+# Focused throughput sweep: vary connection count, bitrate, runtime,
+# ingress, and encryption while holding the other configuration knobs at a
+# reproducible baseline. This is the former `full-matrix.plan` experiment.
+#
+# 6 runtimes x 4 ingress x 4 encryption x 4 connections x 4 bitrates
+# = 1536 cells.
+#
+#   srt-bench matrix --plan docs/plans/throughput-matrix.plan \
+#     --secs 10 --reps 1 --out scratch/throughput.tsv
+
+runtime             = mio,tokio,smol,monoio,glommio,compio
+ingress             = per-port,shared-pool:4,reuseport-multi:4,reuseport-single:4
+encryption          = plain,128,192,256
+connections         = 50,200,600,1200
+bitrate             = 250000,1000000,4000000,8000000
+
+# Baseline controls: these are intentionally fixed for this experiment.
+promotion           = all
+cookie-routing      = on
+batch               = on
+sock-buf            = 16m
+bond                = none
+connect-concurrency = 50
+pin                 = off

@@ -1,4 +1,9 @@
-# Comprehensive sweep: connection count AND bandwidth varied independently.
+# Broad configuration sweep: every software/configuration axis varies.
+#
+# Use `throughput-matrix.plan` when only connection count, bitrate, runtime,
+# ingress, and encryption should move. This file is deliberately much larger:
+# it exposes interactions among topology, pacing, encryption, workers,
+# promotion, socket buffers, bonding, and CPU pinning.
 #
 # Earlier ladders held one of the two fixed:
 #   scaling-ladder  constant ~300 Mbps aggregate, N varied  -> isolates per-connection cost
@@ -7,28 +12,28 @@
 # both the two move together. Varying them independently does, at the
 # cost of 4x the cells.
 #
-# 6 runtimes x 4 ingress x 4 N x 4 bitrate = 384 cells.
-# Top-right corner (1200 conns x 8 Mbps = 9.6 Gbps) is far beyond this
-# host and is expected to fail. That is the point: the failure surface is
-# the result, and where it starts tells us which resource ran out.
+# 6 runtimes x 4 ingress x 4 encryption x 4 connections x 4 bitrate
+# x 3 workers x 4 promotion x 2 cookie-routing x 2 batch x 2 sock-buf
+# x 2 connect-concurrency x 3 bond x 2 pin = 1,769,472 cells.
+# This is intentionally exhaustive, not a default smoke test.
 #
 # Run with:
 #   srt-bench matrix --plan docs/plans/full-matrix.plan \
-#     --secs 10 --reps 1 --out scratch/full.tsv
+#     --secs 10 --reps 1 --out scratch/full-all.tsv
 #
 # Resumable: re-running skips cells already present in the output file,
 # so an interrupted sweep continues rather than restarting.
 
 runtime             = mio,tokio,smol,monoio,glommio,compio
 ingress             = per-port,shared-pool:4,reuseport-multi:4,reuseport-single:4
+encryption          = plain,128,192,256
 connections         = 50,200,600,1200
 bitrate             = 250000,1000000,4000000,8000000
-
-# Held fixed so the four axes above are the only variables.
-promotion           = all
-cookie-routing      = on
-batch               = on
-sock-buf            = 16m
-bond                = none
-connect-concurrency = 50
-pin                 = off
+workers             = 1,2,3
+promotion           = never,relocate,bonded,all
+cookie-routing      = on,off
+batch               = on,off
+sock-buf            = default,16m
+connect-concurrency = 1,50
+bond                = none,broadcast:64,backup:64
+pin                 = off,on
