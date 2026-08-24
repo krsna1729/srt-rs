@@ -39,6 +39,19 @@ pub struct GroupPacket {
     pub payload: Vec<u8>,
 }
 
+/// One physical-leg event observed while driving an SRT group.
+///
+/// Applications normally consume [`SrtGroup::poll_data`] for the logical,
+/// deduplicated stream. Transport adapters use this lower-level view to map
+/// member lifecycle onto one logical connection lifecycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupEvent {
+    MemberConnected { member_id: u32 },
+    DataReceived(GroupPacket),
+    MemberError { member_id: u32, error: String },
+    MemberDisconnected { member_id: u32, reason: String },
+}
+
 pub struct SrtGroupMember {
     id: u32,
     weight: u16,
@@ -75,6 +88,7 @@ pub struct SrtGroup {
     next_send_sequence: Option<u32>,
     next_receive_sequence: Option<u32>,
     pending: BTreeMap<u32, GroupPacket>,
+    events: std::collections::VecDeque<GroupEvent>,
 }
 
 impl SrtGroup {
@@ -89,6 +103,7 @@ impl SrtGroup {
             next_send_sequence: None,
             next_receive_sequence: None,
             pending: BTreeMap::new(),
+            events: std::collections::VecDeque::new(),
         })
     }
 
@@ -166,6 +181,16 @@ impl SrtGroup {
         true
     }
 
+    /// Remove a member and return its protocol core to the transport that
+    /// owns the socket and timers for that leg.
+    pub fn remove_member_connection(&mut self, member_id: u32) -> Option<SrtConnection> {
+        let index = self
+            .members
+            .iter()
+            .position(|member| member.id == member_id)?;
+        Some(self.members.remove(index).connection)
+    }
+
     pub fn send(&mut self, payload: &[u8], now: Timestamp) -> Result<usize, Error> {
         self.refresh_states();
         match self.mode {
@@ -175,9 +200,25 @@ impl SrtGroup {
     }
 
     pub fn poll_data(&mut self, now: Timestamp) -> Option<GroupPacket> {
+        loop {
+            match self.poll_event(now)? {
+                GroupEvent::DataReceived(packet) => return Some(packet),
+                GroupEvent::MemberConnected { .. }
+                | GroupEvent::MemberError { .. }
+                | GroupEvent::MemberDisconnected { .. } => {}
+            }
+        }
+    }
+
+    /// Return the next member-lifecycle event or deduplicated group payload.
+    pub fn poll_event(&mut self, now: Timestamp) -> Option<GroupEvent> {
         self.refresh_pending_states();
         self.collect_events();
         self.refresh_states();
+
+        if let Some(event) = self.events.pop_front() {
+            return Some(event);
+        }
 
         let next = self.next_receive_sequence.or_else(|| {
             self.pending.keys().copied().reduce(|left, right| {
@@ -195,7 +236,7 @@ impl SrtGroup {
         for member in &mut self.members {
             member.connection.advance_receive_sequence(following, now);
         }
-        Some(packet)
+        Some(GroupEvent::DataReceived(packet))
     }
 
     fn send_broadcast(&mut self, payload: &[u8], now: Timestamp) -> Result<usize, Error> {
@@ -295,6 +336,10 @@ impl SrtGroup {
                     .map(|event| (member.id, accept_data, event))
             } {
                 match event {
+                    ConnectionEvent::Connected => {
+                        self.events
+                            .push_back(GroupEvent::MemberConnected { member_id });
+                    }
                     ConnectionEvent::DataReceived {
                         sequence_number,
                         message_number,
@@ -313,7 +358,17 @@ impl SrtGroup {
                             payload,
                         });
                     }
-                    ConnectionEvent::Disconnected { .. } | ConnectionEvent::Error(_) => {
+                    ConnectionEvent::Error(error) => {
+                        self.events
+                            .push_back(GroupEvent::MemberError { member_id, error });
+                        self.members[index].state = GroupMemberState::Broken;
+                        if self.mode == GroupMode::Backup {
+                            self.promote_backup_member();
+                        }
+                    }
+                    ConnectionEvent::Disconnected { reason } => {
+                        self.events
+                            .push_back(GroupEvent::MemberDisconnected { member_id, reason });
                         self.members[index].state = GroupMemberState::Broken;
                         if self.mode == GroupMode::Backup {
                             self.promote_backup_member();

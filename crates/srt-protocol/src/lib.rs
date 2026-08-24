@@ -22,7 +22,9 @@ pub use srt_connection::{
     DEFAULT_HANDSHAKE_RETRY_INTERVAL_MICROS, DEFAULT_HANDSHAKE_TIMEOUT_MICROS, SrtConnection,
     TimerId,
 };
-pub use srt_group::{GroupMemberState, GroupMode, GroupPacket, SrtGroup, SrtGroupMember};
+pub use srt_group::{
+    GroupEvent, GroupMemberState, GroupMode, GroupPacket, SrtGroup, SrtGroupMember,
+};
 pub use srt_handshake::peek_handshake;
 pub use srt_handshake::{
     DEFAULT_FLOW_WINDOW, DEFAULT_MTU, ExtensionType, GFLAG_SYNCONMSG, GroupExtensionData,

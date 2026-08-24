@@ -182,6 +182,7 @@ impl SrtStackConfig {
             socket_id: self.connection.socket_id,
             tsbpd_delay: self.connection.tsbpd_delay,
             cookie_routing: self.cookie_routing,
+            bonded_inputs: BondedInputPolicy::Reject,
             connection_template: Some(self.connection.clone()),
             handshake_retry_interval: Duration::from_micros(
                 shiguredo_srt::DEFAULT_HANDSHAKE_RETRY_INTERVAL_MICROS,
@@ -757,6 +758,17 @@ impl AdmissionPeer {
 
 /// Per-listener settings the table needs to mint new connections and to
 /// decide cookie routing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BondedInputPolicy {
+    /// Reject GROUP handshakes. This is the safe default: accepting the legs
+    /// independently would silently lose the publisher's redundancy contract.
+    #[default]
+    Reject,
+    /// Authenticate and admit GROUP handshakes, then automatically associate
+    /// matching legs into one logical ingress stream.
+    Accept,
+}
+
 #[derive(Clone, Debug)]
 pub struct AdmissionOptions {
     pub socket_id: u32,
@@ -765,6 +777,8 @@ pub struct AdmissionOptions {
     /// Off makes a rehashed CONCLUSION strand instead, which is only
     /// useful for measuring what the routing is worth.
     pub cookie_routing: bool,
+    /// Whether this listener explicitly accepts bonded SRT publishers.
+    pub bonded_inputs: BondedInputPolicy,
     /// Complete session template for peers created on a shared listener.
     /// `None` preserves the legacy socket-id/latency-only construction.
     pub connection_template: Option<ConnectionOptions>,
@@ -781,6 +795,7 @@ impl AdmissionOptions {
             socket_id,
             tsbpd_delay,
             cookie_routing,
+            bonded_inputs: BondedInputPolicy::Reject,
             connection_template: None,
             handshake_retry_interval: Duration::from_micros(
                 shiguredo_srt::DEFAULT_HANDSHAKE_RETRY_INTERVAL_MICROS,
@@ -962,16 +977,43 @@ pub enum Admit {
     Dropped(AdmissionDropReason),
 }
 
-/// One unmodified protocol event emitted by an admitted peer.
+/// One logical ingress event emitted by an admitted peer or bonded group.
 ///
-/// Production consumers should use [`PeerTable::poll_events`] so received
-/// payloads and disconnect reasons leave the transport layer intact. The
-/// benchmark-only [`PeerTable::drain_events`] adapter remains for its legacy
-/// counters and promotion timing.
+/// For an opted-in bonded publisher, `peer` is the stable first admitted leg
+/// and `DataReceived` has already been ordered and deduplicated across legs.
+/// Otherwise this is the unmodified protocol event. Production consumers
+/// should use [`PeerTable::poll_events`]; the benchmark-only
+/// [`PeerTable::drain_events`] adapter remains for its legacy counters and
+/// promotion timing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdmissionEvent {
     pub peer: std::net::SocketAddr,
     pub event: ConnectionEvent,
+}
+
+struct InboundGroupLeg {
+    member_id: u32,
+    peer: std::net::SocketAddr,
+    timers: ManualTimerStore,
+}
+
+struct InboundGroup {
+    group: shiguredo_srt::SrtGroup,
+    legs: HashMap<u32, InboundGroupLeg>,
+    representative_peer: std::net::SocketAddr,
+    connected: bool,
+    stream_deadline: Option<Instant>,
+    data_events: u64,
+    last_data_at: Instant,
+    torn_down: bool,
+    logical_payloads_received: u64,
+    logical_payload_bytes_received: u64,
+}
+
+#[derive(Clone, Debug)]
+struct GroupMemberHandle {
+    key: srt_lifecycle::LogicalGroupKey,
+    member_id: u32,
 }
 
 /// The peers one acceptor is servicing off its shared listener.
@@ -992,6 +1034,9 @@ pub struct PeerTable {
     ready_set: HashSet<std::net::SocketAddr>,
     event_ready: VecDeque<std::net::SocketAddr>,
     event_ready_set: HashSet<std::net::SocketAddr>,
+    groups: HashMap<srt_lifecycle::LogicalGroupKey, InboundGroup>,
+    group_peers: HashMap<std::net::SocketAddr, GroupMemberHandle>,
+    last_now: Timestamp,
     config: PeerTableConfig,
 }
 
@@ -1024,7 +1069,121 @@ impl PeerTable {
             ready_set: HashSet::new(),
             event_ready: VecDeque::new(),
             event_ready_set: HashSet::new(),
+            groups: HashMap::new(),
+            group_peers: HashMap::new(),
+            last_now: Timestamp::default(),
             config,
+        }
+    }
+
+    fn detach_peer_for_group(&mut self, peer: &std::net::SocketAddr) -> Option<AdmissionPeer> {
+        self.deadlines.remove(peer);
+        self.half_open_deadlines.remove(peer);
+        self.ready_set.remove(peer);
+        self.event_ready_set.remove(peer);
+        self.peers.remove(peer)
+    }
+
+    fn group_admission_allowed(
+        &self,
+        identity: &srt_lifecycle::HandshakeIdentity,
+        handshake: &shiguredo_srt::HandshakePacket,
+        options: &AdmissionOptions,
+    ) -> bool {
+        let Some(group) = identity.group.as_ref() else {
+            return true;
+        };
+        if options.bonded_inputs != BondedInputPolicy::Accept
+            || group.group_id & shiguredo_srt::SRTGROUP_MASK == 0
+            || shiguredo_srt::GroupMode::from_group_type(group.extension.group_type).is_none()
+        {
+            return false;
+        }
+        self.groups
+            .get(&group.logical_key())
+            .is_none_or(|existing| existing.group.member(handshake.socket_id).is_none())
+    }
+
+    fn adopt_bonded_peer(&mut self, peer: std::net::SocketAddr) {
+        let Some(entry) = self.peers.get(&peer) else {
+            return;
+        };
+        let Some(extension) = entry.conn.peer_group_extension() else {
+            return;
+        };
+        let Some(mode) = shiguredo_srt::GroupMode::from_group_type(extension.group_type) else {
+            return;
+        };
+        let affinity = srt_lifecycle::GroupAffinity {
+            group_id: extension.group_id,
+            stream_id: entry.conn.peer_stream_id().map(str::to_owned),
+            extension,
+        };
+        let key = affinity.logical_key();
+        let member_id = entry.conn.peer_socket_id();
+        let weight = extension.weight;
+
+        if !self.groups.contains_key(&key) {
+            let group = shiguredo_srt::SrtGroup::new(extension.group_id, mode)
+                .expect("GROUP handshakes are validated before connection admission");
+            self.groups.insert(
+                key.clone(),
+                InboundGroup {
+                    group,
+                    legs: HashMap::new(),
+                    representative_peer: peer,
+                    connected: false,
+                    stream_deadline: None,
+                    data_events: 0,
+                    last_data_at: Instant::now(),
+                    torn_down: false,
+                    logical_payloads_received: 0,
+                    logical_payload_bytes_received: 0,
+                },
+            );
+        }
+
+        let entry = self
+            .detach_peer_for_group(&peer)
+            .expect("connected GROUP peer remains in the ordinary peer table until adoption");
+        let group = self
+            .groups
+            .get_mut(&key)
+            .expect("group was inserted or already existed");
+        group
+            .group
+            .add_member(member_id, weight, entry.conn)
+            .expect("duplicate GROUP member IDs are rejected before admission");
+        group.legs.insert(
+            member_id,
+            InboundGroupLeg {
+                member_id,
+                peer,
+                timers: entry.timers,
+            },
+        );
+        self.group_peers
+            .insert(peer, GroupMemberHandle { key, member_id });
+    }
+
+    fn admit_group_leg(
+        &mut self,
+        peer: std::net::SocketAddr,
+        data: &[u8],
+        now: Timestamp,
+    ) -> Admit {
+        let Some(handle) = self.group_peers.get(&peer).cloned() else {
+            return Admit::Dropped(AdmissionDropReason::StaleConclusion);
+        };
+        let Some(group) = self.groups.get_mut(&handle.key) else {
+            return Admit::Dropped(AdmissionDropReason::StaleConclusion);
+        };
+        let Some(member) = group.group.member_mut(handle.member_id) else {
+            return Admit::Dropped(AdmissionDropReason::StaleConclusion);
+        };
+        match member.connection_mut().feed_recv_buf(data, now) {
+            Ok(()) => Admit::Fed,
+            Err(_) => Admit::Dropped(AdmissionDropReason::InvalidPacket),
         }
     }
 
@@ -1167,6 +1326,10 @@ impl PeerTable {
     where
         F: FnOnce(&AdmissionRequest, &mut SrtConnection) -> AdmissionHookResult,
     {
+        self.last_now = now;
+        if self.group_peers.contains_key(&peer) {
+            return self.admit_group_leg(peer, data, now);
+        }
         let expired = self.prune_half_open(now);
         telemetry.record_expired_half_open(expired);
         let known = self.peers.contains_key(&peer);
@@ -1230,6 +1393,10 @@ impl PeerTable {
                 return Admit::Dropped(AdmissionDropReason::SourceCapacity);
             }
         } else if let Some(identity) = conclusion {
+            let packet = handshake
+                .as_ref()
+                .expect("a conclusion identity came from a decoded handshake");
+            let group_admission_allowed = self.group_admission_allowed(&identity, packet, options);
             if self
                 .peers
                 .get(&peer)
@@ -1249,9 +1416,6 @@ impl PeerTable {
                 telemetry.record_invalid_cookie();
                 return Admit::Dropped(AdmissionDropReason::InvalidCookie);
             }
-            let packet = handshake
-                .as_ref()
-                .expect("a conclusion identity came from a decoded handshake");
             let request = AdmissionRequest {
                 peer,
                 claimed_identity: identity.clone(),
@@ -1262,6 +1426,21 @@ impl PeerTable {
                     .and_then(shiguredo_srt::stream_id::AccessControl::parse),
             };
             telemetry.record_policy_request();
+            if !group_admission_allowed {
+                if entry
+                    .conn
+                    .reject(RejectionReason::BAD_MODE.get(), now)
+                    .is_err()
+                {
+                    telemetry.record_invalid_datagram();
+                    return Admit::Dropped(AdmissionDropReason::InvalidPacket);
+                }
+                telemetry.record_policy_rejection();
+                entry.rejected = true;
+                entry.last_datagram_at = now;
+                self.mark_ready(peer);
+                return Admit::Rejected;
+            }
             match hook(&request, &mut entry.conn) {
                 AdmissionHookResult::Accept => {}
                 AdmissionHookResult::Configure(policy) => {
@@ -1384,6 +1563,7 @@ impl PeerTable {
             self.half_open_peers = self.half_open_peers.saturating_sub(1);
             self.established_peers += 1;
             self.half_open_deadlines.remove(&peer);
+            self.adopt_bonded_peer(peer);
         } else if !self
             .peers
             .get(&peer)
@@ -1517,6 +1697,7 @@ impl PeerTable {
         now: Timestamp,
         out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
     ) {
+        self.last_now = now;
         out.clear();
         let mut rejected = Vec::new();
         let mut due = Vec::new();
@@ -1550,6 +1731,21 @@ impl PeerTable {
         for peer in rejected {
             let _ = self.remove(&peer);
         }
+        for group in self.groups.values_mut() {
+            let (core, legs) = (&mut group.group, &mut group.legs);
+            for leg in legs.values_mut() {
+                let member = core
+                    .member_mut(leg.member_id)
+                    .expect("group I/O legs are built with matching members");
+                leg.timers.fire_expired(now, member.connection_mut());
+                while let Some(output) = member.connection_mut().poll_output() {
+                    match output {
+                        ConnectionOutput::SendPacket(bytes) => out.push((leg.peer, bytes)),
+                        other => leg.timers.apply_output(&other, now),
+                    }
+                }
+            }
+        }
     }
 
     /// Mark a peer whose protocol state was changed through [`Self::iter_mut`]
@@ -1568,13 +1764,22 @@ impl PeerTable {
 
     /// Microseconds until any tracked peer's next timer deadline.
     pub fn time_until_next_deadline(&mut self, now: Timestamp, default_us: u64) -> u64 {
-        self.deadlines
+        self.last_now = now;
+        let peer_deadline = self
+            .deadlines
             .peek_min_deadline()
             .map(|deadline| deadline.saturating_sub(now))
-            .unwrap_or(default_us)
+            .unwrap_or(default_us);
+        self.groups
+            .values()
+            .flat_map(|group| group.legs.values())
+            .filter_map(|leg| leg.timers.next_deadline())
+            .map(|deadline| deadline.saturating_sub(now))
+            .min()
+            .unwrap_or(peer_deadline)
     }
 
-    /// Drain unmodified protocol events for production consumers.
+    /// Drain logical ingress events for production consumers.
     pub fn poll_events(&mut self, out: &mut Vec<AdmissionEvent>) {
         out.clear();
         while let Some(peer) = self.event_ready.pop_front() {
@@ -1584,6 +1789,56 @@ impl PeerTable {
             };
             while let Some(event) = entry.conn.poll_event() {
                 out.push(AdmissionEvent { peer, event });
+            }
+        }
+        for group in self.groups.values_mut() {
+            while let Some(event) = group.group.poll_event(self.last_now) {
+                match event {
+                    shiguredo_srt::GroupEvent::MemberConnected { .. } => {
+                        if !group.connected {
+                            group.connected = true;
+                            out.push(AdmissionEvent {
+                                peer: group.representative_peer,
+                                event: ConnectionEvent::Connected,
+                            });
+                        }
+                    }
+                    shiguredo_srt::GroupEvent::DataReceived(packet) => {
+                        group.logical_payloads_received =
+                            group.logical_payloads_received.saturating_add(1);
+                        group.data_events = group.data_events.saturating_add(1);
+                        group.last_data_at = Instant::now();
+                        group.logical_payload_bytes_received = group
+                            .logical_payload_bytes_received
+                            .saturating_add(packet.payload.len() as u64);
+                        out.push(AdmissionEvent {
+                            peer: group.representative_peer,
+                            event: ConnectionEvent::DataReceived {
+                                payload: packet.payload,
+                                sequence_number: packet.sequence_number,
+                                message_number: packet.message_number,
+                                timestamp: packet.timestamp,
+                            },
+                        });
+                    }
+                    shiguredo_srt::GroupEvent::MemberError { error, .. }
+                    | shiguredo_srt::GroupEvent::MemberDisconnected { reason: error, .. }
+                        if group.connected
+                            && !group.group.members().iter().any(|member| {
+                                member.connection().state()
+                                    == shiguredo_srt::ConnectionState::Connected
+                            }) =>
+                    {
+                        group.connected = false;
+                        group.torn_down |= !is_ordered_close(&error);
+                        out.push(AdmissionEvent {
+                            peer: group.representative_peer,
+                            event: ConnectionEvent::Disconnected { reason: error },
+                        });
+                    }
+                    shiguredo_srt::GroupEvent::MemberError { .. }
+                    | shiguredo_srt::GroupEvent::MemberDisconnected { .. } => {}
+                }
             }
         }
     }
@@ -1603,18 +1858,31 @@ impl PeerTable {
         self.poll_events(&mut events);
         let deadline = Instant::now() + stream_len;
         for admission_event in events {
-            if let Some(entry) = self.peers.get_mut(&admission_event.peer)
-                && entry.apply_event(admission_event.event)
+            let peer = admission_event.peer;
+            let connected = matches!(&admission_event.event, ConnectionEvent::Connected);
+            if let Some(entry) = self.peers.get_mut(&peer) {
+                if entry.apply_event(admission_event.event) {
+                    entry.stream_deadline = Some(deadline);
+                    newly_connected.push(peer);
+                }
+                continue;
+            }
+            if let Some(group) = self
+                .groups
+                .values_mut()
+                .find(|group| group.representative_peer == peer)
+                && connected
+                && group.stream_deadline.is_none()
             {
-                entry.stream_deadline = Some(deadline);
-                newly_connected.push(admission_event.peer);
+                group.stream_deadline = Some(deadline);
+                newly_connected.push(peer);
             }
         }
     }
 
     #[must_use]
     pub fn contains(&self, peer: &std::net::SocketAddr) -> bool {
-        self.peers.contains_key(peer)
+        self.peers.contains_key(peer) || self.group_peers.contains_key(peer)
     }
 
     #[must_use]
@@ -1632,6 +1900,40 @@ impl PeerTable {
     }
 
     pub fn remove(&mut self, peer: &std::net::SocketAddr) -> Option<AdmissionPeer> {
+        if let Some(handle) = self.group_peers.get(peer).cloned() {
+            let mut group = self.groups.remove(&handle.key)?;
+            let mut returned = None;
+            for (member_id, leg) in std::mem::take(&mut group.legs) {
+                let conn = group
+                    .group
+                    .remove_member_connection(member_id)
+                    .expect("group I/O legs are built with matching members");
+                self.group_peers.remove(&leg.peer);
+                self.established_peers = self.established_peers.saturating_sub(1);
+                if let HashEntry::Occupied(mut entry) = self.source_counts.entry(leg.peer.ip()) {
+                    let count = entry.get_mut();
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        entry.remove();
+                    }
+                }
+                if leg.peer == *peer {
+                    returned = Some(AdmissionPeer {
+                        conn,
+                        timers: leg.timers,
+                        connected: group.connected,
+                        stream_deadline: group.stream_deadline,
+                        data_events: group.data_events,
+                        last_data_at: group.last_data_at,
+                        torn_down: group.torn_down,
+                        rejected: false,
+                        admission_established: true,
+                        last_datagram_at: self.last_now,
+                    });
+                }
+            }
+            return returned;
+        }
         self.deadlines.remove(peer);
         self.half_open_deadlines.remove(peer);
         self.ready_set.remove(peer);
@@ -1664,12 +1966,12 @@ impl PeerTable {
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.peers.len()
+        self.peers.len() + self.group_peers.len()
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.peers.is_empty()
+        self.peers.is_empty() && self.group_peers.is_empty()
     }
 
     #[must_use]
@@ -1680,6 +1982,32 @@ impl PeerTable {
     #[must_use]
     pub fn established_count(&self) -> usize {
         self.established_peers
+    }
+
+    /// Snapshot every active bonded ingress with both logical delivery and
+    /// per-leg wire telemetry. Ordinary unbonded peers are intentionally not
+    /// included: their existing [`AdmissionPeer`] stats retain the normal
+    /// single-connection meaning.
+    #[must_use]
+    pub fn bonded_stats(&self) -> Vec<InboundGroupStats> {
+        self.groups
+            .iter()
+            .map(|(key, group)| InboundGroupStats {
+                key: key.clone(),
+                connection: group_connection_stats(
+                    &group.group,
+                    GroupLogicalCounters {
+                        payloads_received: group.logical_payloads_received,
+                        payload_bytes_received: group.logical_payload_bytes_received,
+                        ..GroupLogicalCounters::default()
+                    },
+                    |member_id| {
+                        let peer_addr = group.legs.get(&member_id).map(|leg| leg.peer);
+                        (None, peer_addr)
+                    },
+                ),
+            })
+            .collect()
     }
 
     #[must_use]
@@ -1720,6 +2048,15 @@ impl PeerTable {
                 p.connected,
                 p.stream_deadline,
                 p.last_data_at,
+                now,
+                connect_deadline,
+                idle_grace,
+            )
+        }) && self.groups.values().all(|group| {
+            srt_lifecycle::is_terminal(
+                group.connected,
+                group.stream_deadline,
+                group.last_data_at,
                 now,
                 connect_deadline,
                 idle_grace,
@@ -2267,6 +2604,188 @@ mod tests {
         }
         let conclusion = next_packet(&mut caller);
         (caller, conclusion)
+    }
+
+    fn finish_conclusion(
+        table: &mut PeerTable,
+        peer: std::net::SocketAddr,
+        caller: &mut SrtConnection,
+        conclusion: &[u8],
+        options: &AdmissionOptions,
+        telemetry: &IngressTelemetry,
+    ) {
+        assert_eq!(
+            table.admit(
+                peer,
+                conclusion,
+                Timestamp::from_micros(2),
+                options,
+                0,
+                1,
+                telemetry,
+            ),
+            Admit::Fed
+        );
+        let mut outbound = Vec::new();
+        table.poll_outbound(Timestamp::from_micros(2), &mut outbound);
+        for (outbound_peer, packet) in outbound {
+            if outbound_peer == peer {
+                caller
+                    .feed_recv_buf(&packet, Timestamp::from_micros(3))
+                    .expect("conclusion response");
+            }
+        }
+    }
+
+    #[test]
+    fn bonded_inputs_require_explicit_listener_opt_in() {
+        let peer = "127.0.0.1:10000".parse().expect("address");
+        let options = AdmissionOptions::basic(0x2222, 0, true);
+        let telemetry = IngressTelemetry::new();
+        let mut table = PeerTable::new();
+        let (_, conclusion) = prepare_conclusion_with_options(
+            &mut table,
+            peer,
+            ConnectionOptions {
+                socket_id: 0x1111,
+                stream_id: Some("publish:bonded".to_string()),
+                group_extension: Some(shiguredo_srt::GroupExtensionData {
+                    group_id: shiguredo_srt::SRTGROUP_MASK | 42,
+                    group_type: shiguredo_srt::GroupType::Broadcast,
+                    flags: 0,
+                    weight: 1,
+                }),
+                ..ConnectionOptions::default()
+            },
+            &options,
+            &telemetry,
+        );
+
+        assert_eq!(
+            table.admit(
+                peer,
+                &conclusion,
+                Timestamp::from_micros(2),
+                &options,
+                0,
+                1,
+                &telemetry,
+            ),
+            Admit::Rejected
+        );
+        assert!(table.bonded_stats().is_empty());
+    }
+
+    #[test]
+    fn opted_in_bonded_inputs_share_one_logical_event_stream_and_telemetry() {
+        let first = "127.0.0.1:10000".parse().expect("address");
+        let second = "127.0.0.1:10001".parse().expect("address");
+        let mut options = AdmissionOptions::basic(0x2222, 0, true);
+        options.bonded_inputs = BondedInputPolicy::Accept;
+        let telemetry = IngressTelemetry::new();
+        let mut table = PeerTable::new();
+        let group_id = shiguredo_srt::SRTGROUP_MASK | 42;
+        let caller_options = |socket_id, weight| ConnectionOptions {
+            socket_id,
+            initial_seq: Some(1234),
+            stream_id: Some("publish:bonded".to_string()),
+            group_extension: Some(shiguredo_srt::GroupExtensionData {
+                group_id,
+                group_type: shiguredo_srt::GroupType::Broadcast,
+                flags: 0,
+                weight,
+            }),
+            ..ConnectionOptions::default()
+        };
+        let (mut first_caller, first_conclusion) = prepare_conclusion_with_options(
+            &mut table,
+            first,
+            caller_options(0x1111, 10),
+            &options,
+            &telemetry,
+        );
+        finish_conclusion(
+            &mut table,
+            first,
+            &mut first_caller,
+            &first_conclusion,
+            &options,
+            &telemetry,
+        );
+        let (mut second_caller, second_conclusion) = prepare_conclusion_with_options(
+            &mut table,
+            second,
+            caller_options(0x2222, 20),
+            &options,
+            &telemetry,
+        );
+        finish_conclusion(
+            &mut table,
+            second,
+            &mut second_caller,
+            &second_conclusion,
+            &options,
+            &telemetry,
+        );
+
+        let mut events = Vec::new();
+        table.poll_events(&mut events);
+        assert_eq!(
+            events,
+            vec![AdmissionEvent {
+                peer: first,
+                event: ConnectionEvent::Connected
+            }]
+        );
+        assert_eq!(table.bonded_stats()[0].connection.legs.len(), 2);
+
+        first_caller
+            .send(b"one logical payload", Timestamp::from_micros(4))
+            .expect("first caller sends");
+        second_caller
+            .send(b"one logical payload", Timestamp::from_micros(4))
+            .expect("second caller sends");
+        assert_eq!(
+            table.admit(
+                first,
+                &next_packet(&mut first_caller),
+                Timestamp::from_micros(5),
+                &options,
+                0,
+                1,
+                &telemetry,
+            ),
+            Admit::Fed
+        );
+        assert_eq!(
+            table.admit(
+                second,
+                &next_packet(&mut second_caller),
+                Timestamp::from_micros(5),
+                &options,
+                0,
+                1,
+                &telemetry,
+            ),
+            Admit::Fed
+        );
+
+        table.poll_events(&mut events);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].peer, first);
+        assert!(matches!(
+            &events[0].event,
+            ConnectionEvent::DataReceived { payload, .. } if payload == b"one logical payload"
+        ));
+        let stats = table.bonded_stats();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].connection.aggregate.logical_payloads_received, 1);
+        assert_eq!(
+            stats[0].connection.aggregate.logical_payload_bytes_received,
+            19
+        );
+        assert_eq!(stats[0].connection.legs.len(), 2);
+        assert_eq!(stats[0].connection.aggregate.wire_packets_received, 2);
     }
 
     #[test]
@@ -3572,6 +4091,98 @@ pub struct GroupConnectionStats {
     pub legs: Vec<GroupLegStats>,
 }
 
+/// Ingress-facing bonded telemetry. The logical key disambiguates publishers
+/// that happen to reuse a wire group ID.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InboundGroupStats {
+    pub key: srt_lifecycle::LogicalGroupKey,
+    pub connection: GroupConnectionStats,
+}
+
+#[derive(Clone, Copy, Default)]
+struct GroupLogicalCounters {
+    payloads_sent: u64,
+    payload_bytes_sent: u64,
+    payloads_received: u64,
+    payload_bytes_received: u64,
+}
+
+fn group_connection_stats(
+    group: &shiguredo_srt::SrtGroup,
+    logical: GroupLogicalCounters,
+    mut addresses: impl FnMut(u32) -> (Option<std::net::SocketAddr>, Option<std::net::SocketAddr>),
+) -> GroupConnectionStats {
+    let mut aggregate = GroupAggregateStats {
+        logical_payloads_sent: logical.payloads_sent,
+        logical_payload_bytes_sent: logical.payload_bytes_sent,
+        logical_payloads_received: logical.payloads_received,
+        logical_payload_bytes_received: logical.payload_bytes_received,
+        ..GroupAggregateStats::default()
+    };
+    let mut legs = Vec::with_capacity(group.members().len());
+    for member in group.members() {
+        match member.state() {
+            shiguredo_srt::GroupMemberState::Active => aggregate.active_legs += 1,
+            shiguredo_srt::GroupMemberState::Standby => aggregate.standby_legs += 1,
+            shiguredo_srt::GroupMemberState::Pending => aggregate.pending_legs += 1,
+            shiguredo_srt::GroupMemberState::Broken => aggregate.broken_legs += 1,
+        }
+        let connection = member.connection().stats();
+        if let Some(sender) = connection.sender {
+            aggregate.wire_unique_packets_sent = aggregate
+                .wire_unique_packets_sent
+                .saturating_add(sender.total_sent);
+            aggregate.wire_packets_sent = aggregate
+                .wire_packets_sent
+                .saturating_add(sender.total_data_packets_sent);
+            aggregate.wire_payload_bytes_sent = aggregate
+                .wire_payload_bytes_sent
+                .saturating_add(sender.total_bytes_sent);
+            aggregate.wire_srt_bytes_sent = aggregate
+                .wire_srt_bytes_sent
+                .saturating_add(sender.total_srt_bytes_sent);
+            aggregate.wire_packets_retransmitted = aggregate
+                .wire_packets_retransmitted
+                .saturating_add(sender.total_retransmits);
+            aggregate.wire_sender_packets_lost = aggregate
+                .wire_sender_packets_lost
+                .saturating_add(sender.total_lost);
+        }
+        if let Some(receiver) = connection.receiver {
+            aggregate.wire_packets_received = aggregate
+                .wire_packets_received
+                .saturating_add(receiver.total_data_packets_received);
+            aggregate.wire_unique_packets_received = aggregate
+                .wire_unique_packets_received
+                .saturating_add(receiver.total_received);
+            aggregate.wire_srt_bytes_received = aggregate
+                .wire_srt_bytes_received
+                .saturating_add(receiver.total_srt_bytes_received);
+            aggregate.wire_receiver_packets_lost = aggregate
+                .wire_receiver_packets_lost
+                .saturating_add(receiver.total_lost);
+            aggregate.wire_packets_undecryptable = aggregate
+                .wire_packets_undecryptable
+                .saturating_add(receiver.total_undecryptable);
+        }
+        let (local_addr, peer_addr) = addresses(member.id());
+        legs.push(GroupLegStats {
+            member_id: member.id(),
+            weight: member.weight(),
+            state: member.state(),
+            local_addr,
+            peer_addr,
+            connection,
+        });
+    }
+    GroupConnectionStats {
+        group_id: group.group_id(),
+        mode: group.mode(),
+        aggregate,
+        legs,
+    }
+}
+
 /// Runtime-neutral multi-socket driver for an SRT Broadcast or Backup group.
 ///
 /// This is intentionally synchronous and nonblocking. Tokio, smol, mio, and
@@ -3740,79 +4351,23 @@ impl GroupConn {
     /// health are inherently leg-specific.
     #[must_use]
     pub fn stats(&self) -> GroupConnectionStats {
-        let mut aggregate = GroupAggregateStats {
-            logical_payloads_sent: self.logical_payloads_sent,
-            logical_payload_bytes_sent: self.logical_payload_bytes_sent,
-            logical_payloads_received: self.logical_payloads_received,
-            logical_payload_bytes_received: self.logical_payload_bytes_received,
-            ..GroupAggregateStats::default()
-        };
-        let mut legs = Vec::with_capacity(self.legs.len());
-        for member in self.group.members() {
-            let io = self
-                .legs
-                .iter()
-                .find(|leg| leg.member_id == member.id())
-                .expect("group and I/O legs are built together");
-            match member.state() {
-                shiguredo_srt::GroupMemberState::Active => aggregate.active_legs += 1,
-                shiguredo_srt::GroupMemberState::Standby => aggregate.standby_legs += 1,
-                shiguredo_srt::GroupMemberState::Pending => aggregate.pending_legs += 1,
-                shiguredo_srt::GroupMemberState::Broken => aggregate.broken_legs += 1,
-            }
-            let connection = member.connection().stats();
-            if let Some(sender) = connection.sender {
-                aggregate.wire_unique_packets_sent = aggregate
-                    .wire_unique_packets_sent
-                    .saturating_add(sender.total_sent);
-                aggregate.wire_packets_sent = aggregate
-                    .wire_packets_sent
-                    .saturating_add(sender.total_data_packets_sent);
-                aggregate.wire_payload_bytes_sent = aggregate
-                    .wire_payload_bytes_sent
-                    .saturating_add(sender.total_bytes_sent);
-                aggregate.wire_srt_bytes_sent = aggregate
-                    .wire_srt_bytes_sent
-                    .saturating_add(sender.total_srt_bytes_sent);
-                aggregate.wire_packets_retransmitted = aggregate
-                    .wire_packets_retransmitted
-                    .saturating_add(sender.total_retransmits);
-                aggregate.wire_sender_packets_lost = aggregate
-                    .wire_sender_packets_lost
-                    .saturating_add(sender.total_lost);
-            }
-            if let Some(receiver) = connection.receiver {
-                aggregate.wire_packets_received = aggregate
-                    .wire_packets_received
-                    .saturating_add(receiver.total_data_packets_received);
-                aggregate.wire_unique_packets_received = aggregate
-                    .wire_unique_packets_received
-                    .saturating_add(receiver.total_received);
-                aggregate.wire_srt_bytes_received = aggregate
-                    .wire_srt_bytes_received
-                    .saturating_add(receiver.total_srt_bytes_received);
-                aggregate.wire_receiver_packets_lost = aggregate
-                    .wire_receiver_packets_lost
-                    .saturating_add(receiver.total_lost);
-                aggregate.wire_packets_undecryptable = aggregate
-                    .wire_packets_undecryptable
-                    .saturating_add(receiver.total_undecryptable);
-            }
-            legs.push(GroupLegStats {
-                member_id: member.id(),
-                weight: member.weight(),
-                state: member.state(),
-                local_addr: io.socket.local_addr().ok(),
-                peer_addr: io.socket.peer_addr().ok(),
-                connection,
-            });
-        }
-        GroupConnectionStats {
-            group_id: self.group.group_id(),
-            mode: self.group.mode(),
-            aggregate,
-            legs,
-        }
+        group_connection_stats(
+            &self.group,
+            GroupLogicalCounters {
+                payloads_sent: self.logical_payloads_sent,
+                payload_bytes_sent: self.logical_payload_bytes_sent,
+                payloads_received: self.logical_payloads_received,
+                payload_bytes_received: self.logical_payload_bytes_received,
+            },
+            |member_id| {
+                let io = self
+                    .legs
+                    .iter()
+                    .find(|leg| leg.member_id == member_id)
+                    .expect("group and I/O legs are built together");
+                (io.socket.local_addr().ok(), io.socket.peer_addr().ok())
+            },
+        )
     }
 }
 

@@ -80,3 +80,13 @@ ingest and egress quality collectors:
 Unlike `srt_bistats(clear = 1)`, sampling cannot mutate transport state. This
 makes independent metrics consumers safe: each can retain its own previous
 snapshot and sampling interval.
+
+## Bonded transport
+
+`srt_transport::GroupConnectionStats` and ingress
+`PeerTable::bonded_stats()` expose both views needed for a bonded session:
+`logical_*` is the ordered, deduplicated media stream, while `wire_*` is the
+sum across physical legs. Do not replace either with the other: logical
+delivery measures publisher health, while wire counters, leg state, RTT, loss,
+and retransmits diagnose a failing path. Sender-side and receiver-side loss
+remain separate fields because they measure different observations.

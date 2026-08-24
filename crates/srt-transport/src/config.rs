@@ -18,7 +18,8 @@ use shiguredo_srt::{
 use zeroize::Zeroize;
 
 use crate::{
-    AdmissionOptions, OutputDrainBudget, PeerTable, PeerTableConfig, SOCK_BUF_BYTES, set_sock_bufs,
+    AdmissionOptions, BondedInputPolicy, OutputDrainBudget, PeerTable, PeerTableConfig,
+    SOCK_BUF_BYTES, set_sock_bufs,
 };
 
 const DEFAULT_MESSAGE_PAYLOAD: usize = 1_316;
@@ -1186,6 +1187,8 @@ pub struct ResolvedTransportConfig {
 pub struct AdmissionConfig {
     pub limits: PeerTableConfig,
     pub cookie_routing: CookieRoutingPolicy,
+    /// Bonded publishers are rejected unless the listener explicitly opts in.
+    pub bonded_inputs: BondedInputPolicy,
     pub idle_timeout: Duration,
     /// Aggregate requested socket-buffer memory budget. `None` leaves resource
     /// accounting to the application/container.
@@ -1197,6 +1200,7 @@ impl Default for AdmissionConfig {
         Self {
             limits: PeerTableConfig::default(),
             cookie_routing: CookieRoutingPolicy::Auto,
+            bonded_inputs: BondedInputPolicy::Reject,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             socket_memory_budget: None,
         }
@@ -1347,6 +1351,13 @@ impl ListenerBuilder {
     #[must_use]
     pub fn group(mut self, group: GroupConfig) -> Self {
         self.config.session.set_group(Some(group));
+        self
+    }
+
+    /// Explicitly choose whether this listener accepts bonded publishers.
+    #[must_use]
+    pub fn bonded_inputs(mut self, policy: BondedInputPolicy) -> Self {
+        self.config.admission.bonded_inputs = policy;
         self
     }
 
@@ -1604,6 +1615,7 @@ impl PreparedListener {
             socket_id: options.socket_id,
             tsbpd_delay: options.tsbpd_delay,
             cookie_routing: self.cookie_routing,
+            bonded_inputs: self.admission.bonded_inputs,
             connection_template: Some(options.clone()),
             handshake_retry_interval: self.session.handshake.retry_interval,
             handshake_timeout: self.session.handshake.timeout,
@@ -1886,6 +1898,20 @@ mod tests {
         assert_eq!(template.passphrase.as_deref(), Some("ten-characters"));
         assert_eq!(template.stream_id.as_deref(), Some("publish/live"));
         assert_ne!(template.socket_id, 0);
+        assert_eq!(admission.bonded_inputs, BondedInputPolicy::Reject);
+    }
+
+    #[test]
+    fn listener_requires_an_explicit_bonded_input_opt_in() {
+        let config = ListenerConfig::builder(address(0))
+            .bonded_inputs(BondedInputPolicy::Accept)
+            .build()
+            .expect("listener config");
+        let prepared = config.prepare(RuntimeFlavor::Mio).expect("prepared");
+        assert_eq!(
+            prepared.admission_options().bonded_inputs,
+            BondedInputPolicy::Accept
+        );
     }
 
     #[test]

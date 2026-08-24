@@ -504,6 +504,7 @@ impl BenchConfig {
             socket_id,
             tsbpd_delay: self.latency_ms,
             cookie_routing,
+            bonded_inputs: srt_transport::BondedInputPolicy::Reject,
             connection_template: Some(template),
             handshake_retry_interval: std::time::Duration::from_micros(
                 shiguredo_srt::DEFAULT_HANDSHAKE_RETRY_INTERVAL_MICROS,

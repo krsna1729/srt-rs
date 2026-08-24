@@ -62,6 +62,11 @@ Three layers:
      payloads) for production consumers. `drain_events()` is the legacy
      benchmark adapter that folds those events into counters and promotion
      timing.
+   - Bonded input is an explicit `BondedInputPolicy`: `Reject` is the default,
+     preventing silent degradation into unrelated single-leg publishers.
+     With `Accept`, `PeerTable` validates each leg normally, groups matching
+     `(group_id, normalized StreamID)` legs, and still emits one ordinary
+     logical `AdmissionEvent` stream under a stable representative peer.
    - `Handoff` / `WorkerMessage` — the acceptor-to-worker protocol. A
      `Handoff` carries a plain `std::net::UdpSocket` plus a bare
      `SrtConnection` because both are `Send`, whereas every runtime's own
@@ -74,7 +79,7 @@ Three layers:
      plain exporter-friendly `IngressTelemetrySnapshot`; `report()` is only
      the human-readable view.
 
-3. **Bonded caller transport** (always compiled, runtime-neutral)
+3. **Bonded transport** (always compiled, runtime-neutral)
    - `GroupConn` owns a real UDP socket, timer store, output queue, and
      `SrtConnection` for every Broadcast or Backup leg. `drive()` is
      synchronous/nonblocking so an application registers `leg_sockets()` in
@@ -83,6 +88,10 @@ Three layers:
      a group aggregate. `logical_*` counts media once at the group API;
      `wire_*` sums physical legs, so Broadcast's duplicate egress and each
      path's retransmit/loss remain visible instead of being averaged away.
+     `PeerTable::bonded_stats()` returns the same view for admitted ingress
+     groups, paired with their logical `(group_id, StreamID)` key. Listener
+     sockets are shared, so inbound per-leg `local_addr` is intentionally
+     `None`; the listening socket itself owns that address.
 
 4. **Per-runtime `Conn`** (feature-gated): wraps an `SrtConnection`
    + that runtime's UDP socket + its native timer. Each exposes the same
