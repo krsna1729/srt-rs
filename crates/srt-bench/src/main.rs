@@ -16,6 +16,8 @@
 //!   srt-bench matrix --runtimes mio,tokio --ingress reuseport-multi:4 \
 //!     --encryption plain,128,192,256 --promotion never,all \
 //!     --connections 25,150 --reps 3 --out results.tsv
+//!   srt-bench matrix --plan docs/plans/full-matrix.plan \
+//!     --axis encryption=plain,128 --order interleaved --seed 0
 //!
 //! Host capacity diagnostics:
 //!   srt-bench system-info

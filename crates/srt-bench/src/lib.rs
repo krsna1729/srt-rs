@@ -33,6 +33,10 @@ pub fn now_ts(start: std::time::Instant) -> shiguredo_srt::Timestamp {
 pub struct Cli {
     pub positional: Vec<String>,
     pub flags: std::collections::HashMap<String, String>,
+    /// Values for flags that are intentionally repeatable, such as
+    /// `--axis name=value`. Ordinary flags retain their last-value-wins
+    /// behavior in `flags`.
+    pub repeated: std::collections::HashMap<String, Vec<String>>,
 }
 
 impl Cli {
@@ -48,17 +52,34 @@ impl Cli {
             let tok = &args[i];
             if let Some(flag) = tok.strip_prefix("--") {
                 if let Some((f, v)) = flag.split_once('=') {
-                    cli.flags.insert(f.to_string(), v.to_string());
+                    if f == "axis" {
+                        cli.repeated
+                            .entry(f.to_string())
+                            .or_default()
+                            .push(v.to_string());
+                    } else {
+                        cli.flags.insert(f.to_string(), v.to_string());
+                    }
                 } else {
                     // Value = next token unless it's another flag/kv pair.
                     let value = match args.get(i + 1) {
-                        Some(next) if !next.starts_with("--") && !next.contains('=') => {
+                        Some(next)
+                            if !next.starts_with("--")
+                                && (flag == "axis" || !next.contains('=')) =>
+                        {
                             i += 1;
                             next.clone()
                         }
                         _ => String::new(),
                     };
-                    cli.flags.insert(flag.to_string(), value);
+                    if flag == "axis" {
+                        cli.repeated
+                            .entry(flag.to_string())
+                            .or_default()
+                            .push(value);
+                    } else {
+                        cli.flags.insert(flag.to_string(), value);
+                    }
                 }
             } else if let Some((f, v)) = tok.split_once('=') {
                 cli.flags.insert(f.to_string(), v.to_string());
@@ -1019,7 +1040,7 @@ pub fn bench_config_from_args() -> BenchConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::Encryption;
+    use super::{Cli, Encryption};
     use shiguredo_srt::{ConnectionOptions, KeyLength};
 
     #[test]
@@ -1054,5 +1075,28 @@ mod tests {
         Encryption::Plain.apply_to(&mut options);
         assert_eq!(options.passphrase, None);
         assert_eq!(options.key_length, KeyLength::Aes128);
+    }
+
+    #[test]
+    fn axis_flags_are_repeatable_and_consume_key_value_specs() {
+        let args = [
+            "srt-bench",
+            "matrix",
+            "--axis",
+            "encryption=plain,128",
+            "--axis=connections=50,600",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        let cli = Cli::parse(&args);
+        assert_eq!(
+            cli.repeated.get("axis"),
+            Some(&vec![
+                "encryption=plain,128".to_string(),
+                "connections=50,600".to_string()
+            ])
+        );
+        assert_eq!(cli.positional, ["matrix"]);
     }
 }

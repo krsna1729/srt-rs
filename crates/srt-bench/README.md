@@ -57,6 +57,14 @@ srt-bench sysprof --runtime glommio --connections 150
 
 # Print the host settings that bound benchmark capacity.
 srt-bench system-info
+
+# Explicitly override axes from a plan; repeat --axis for more axes.
+srt-bench matrix --plan docs/plans/full-matrix.plan \
+  --axis encryption=plain,128 --axis connections=50,600
+
+# Broad early coverage, deterministic across runs.
+srt-bench matrix --plan docs/plans/full-matrix.plan \
+  --order interleaved --seed 0
 ```
 
 Every axis is a comma-separated list; unspecified axes take one default
@@ -64,18 +72,34 @@ value. `encryption` selects plaintext or AES-128/AES-192/AES-256 using a
 shared benchmark passphrase. A cell a runtime does not implement is skipped
 and counted, so a gap in coverage reads as a gap rather than as a failure.
 
-The exhaustive matrix is filtered after its raw cartesian product is built.
-This removes combinations that cannot change behavior: promotion and cookie
-routing outside `reuseport-multi`, batching outside mio's shared-socket
-paths, and pinning outside glommio. It also removes bond-group requests larger
-than half the connection population. One representative value is retained for
-an inert axis, so a one-value custom plan remains runnable. The filter summary
-is printed before the run and the reported cell count is the filtered count.
+The exhaustive matrix is filtered as its raw cartesian product is enumerated,
+without retaining all raw cells in memory. This removes combinations that
+cannot change behavior: promotion and cookie routing outside `reuseport-multi`,
+batching outside mio's shared-socket paths, and pinning outside glommio. It
+also removes bond-group requests larger than half the connection population.
+One representative value is retained for an inert axis, so a one-value custom
+plan remains runnable. The filter summary is printed before the run and the
+reported cell count is the filtered count.
 
 For the checked-in `full-matrix.plan`, the raw product is 1,769,472 cells and
 the capability-aware product is 142,464 cells. The omitted combinations are
 not protocol experiments: they either repeat an identical runtime behavior or
 request more bond pairs than the cell can contain.
+
+When a plan is present, ordinary flags such as `--encryption` are fallback
+values for axes omitted by the plan. Use repeatable `--axis NAME=VALUE[,VALUE...]`
+to intentionally override a plan; names use the canonical plan spelling
+(`runtime`, `recv-runtime`, `connect-concurrency`, and so on). Duplicate or
+unknown override names are rejected. The effective override and execution
+order are printed at startup.
+
+Execution order defaults to the historical Cartesian order. `--order
+interleaved` round-robins the outer axes and schedules repetitions in rounds,
+which gives a broad picture early and reduces time/order confounding.
+`--order random --seed N` applies a deterministic seeded shuffle; keep the
+startup log with the result file because it records the order and seed. Both
+non-default modes spread repeated cells across the run rather than executing
+all repetitions adjacent.
 
 This replaced a 344-line `bench.sh` that wrapped 86 lines of inline
 Python whose only job was re-parsing this binary's own stdout. The
@@ -161,6 +185,12 @@ TSV rather than JSON: no dependency to read or write, greppable, and it
 opens in a spreadsheet. Files are appended to, because a sweep is many
 independent processes with no knowledge of their siblings. Raw output
 lands under `./scratch/` (gitignored).
+
+Appends are protected by an inter-process file lock. The header check and the
+complete row write happen under that lock, so concurrent listener/caller
+children cannot concatenate headers or rows. Readers reject malformed or
+wrong-width files instead of silently truncating them and allowing a bad
+resume/report.
 
 Roles are separate child processes rather than threads on purpose: CPU is
 measured with `getrusage`, which is per-process, so running both in one

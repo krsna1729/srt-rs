@@ -14,8 +14,59 @@
 
 use crate::{Batching, BenchConfig, Ingress, Mode};
 use std::fmt::Write as _;
+use std::io::Read as _;
 use std::io::Write as _;
 use std::path::Path;
+
+/// Advisory lock held while a complete header/row record is appended.
+///
+/// Matrix roles are separate processes, so a Rust mutex cannot protect the
+/// shared result file. `flock` also covers the fresh-file check, which is the
+/// part that previously allowed two children to both write a header.
+struct AppendLock {
+    #[cfg(unix)]
+    fd: std::os::fd::RawFd,
+    #[cfg(not(unix))]
+    _marker: std::marker::PhantomData<*const std::fs::File>,
+}
+
+impl AppendLock {
+    fn acquire(file: &std::fs::File) -> std::io::Result<Self> {
+        Self::acquire_mode(file, libc::LOCK_EX)
+    }
+
+    fn shared(file: &std::fs::File) -> std::io::Result<Self> {
+        Self::acquire_mode(file, libc::LOCK_SH)
+    }
+
+    fn acquire_mode(file: &std::fs::File, mode: libc::c_int) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let fd = file.as_raw_fd();
+            let result = unsafe { libc::flock(fd, mode) };
+            if result != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            return Ok(Self { fd });
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {
+                _marker: std::marker::PhantomData,
+            })
+        }
+    }
+}
+
+impl Drop for AppendLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            let _ = unsafe { libc::flock(self.fd, libc::LOCK_UN) };
+        }
+    }
+}
 
 /// Columns, in order. One place; both the writer and the reader use it.
 pub const COLUMNS: &[&str] = &[
@@ -134,14 +185,12 @@ pub fn append_result(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let fresh = !path.exists()
-        || std::fs::metadata(path)
-            .map(|m| m.len() == 0)
-            .unwrap_or(true);
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)?;
+    let _lock = AppendLock::acquire(&file)?;
+    let fresh = file.metadata()?.len() == 0;
     if fresh {
         writeln!(file, "{}", COLUMNS.join("\t"))?;
     }
@@ -211,22 +260,53 @@ pub fn append_result(
 
 /// Read every record from a TSV result file.
 pub fn read_results(path: &Path) -> std::io::Result<Vec<Record>> {
-    let text = std::fs::read_to_string(path)?;
+    let mut file = std::fs::File::open(path)?;
+    let _lock = AppendLock::shared(&file)?;
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
     let mut lines = text.lines();
     let Some(header) = lines.next() else {
         return Ok(Vec::new());
     };
     let keys: Vec<&str> = header.split('\t').collect();
-    Ok(lines
-        .filter(|l| !l.trim().is_empty())
-        .map(|line| Record {
+    if keys != COLUMNS {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "{}: unexpected TSV header (expected {} columns, got {})",
+                path.display(),
+                COLUMNS.len(),
+                keys.len()
+            ),
+        ));
+    }
+    let mut records = Vec::new();
+    for (line_number, line) in lines.enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let values: Vec<&str> = line.split('\t').collect();
+        if values.len() != keys.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "{}:{}: malformed TSV row (expected {} columns, got {})",
+                    path.display(),
+                    line_number + 2,
+                    keys.len(),
+                    values.len()
+                ),
+            ));
+        }
+        records.push(Record {
             fields: keys
                 .iter()
-                .zip(line.split('\t'))
+                .zip(values)
                 .map(|(k, v)| ((*k).to_string(), v.to_string()))
                 .collect(),
-        })
-        .collect())
+        });
+    }
+    Ok(records)
 }
 
 /// Median, and the range it was drawn from.
@@ -661,6 +741,7 @@ fn filter_reason(cell: &Cell<'_>, axes: &[Axis]) -> Option<&'static str> {
     None
 }
 
+#[cfg(test)]
 fn filter_matrix_cells<'a>(
     cells: Vec<Cell<'a>>,
     axes: &[Axis],
@@ -678,6 +759,49 @@ fn filter_matrix_cells<'a>(
         })
         .collect();
     (cells, summary)
+}
+
+/// Expand and filter one Cartesian point at a time.
+///
+/// Materializing the raw product first made the full plan's 1,769,472 cells
+/// consume several GiB before capability filtering could discard the inert
+/// combinations. The matrix parent then passed that peak RSS through
+/// fork/exec to every child, contaminating the per-role memory measurement.
+fn filtered_cartesian_cells(
+    axes: &[Axis],
+) -> std::io::Result<(Vec<Cell<'_>>, usize, MatrixFilterSummary)> {
+    let raw_cells = axes.iter().try_fold(1usize, |total, (_, _, values)| {
+        total.checked_mul(values.len()).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "matrix Cartesian product overflows usize",
+            )
+        })
+    })?;
+    let mut kept = Vec::new();
+    let mut summary = MatrixFilterSummary::default();
+    let mut indices = vec![0usize; axes.len()];
+    for _ in 0..raw_cells {
+        let cell: Cell<'_> = axes
+            .iter()
+            .zip(&indices)
+            .map(|((name, scope, values), index)| (*name, *scope, values[*index].clone()))
+            .collect();
+        if let Some(reason) = filter_reason(&cell, axes) {
+            summary.record(reason);
+        } else {
+            kept.push(cell);
+        }
+
+        for axis in (0..indices.len()).rev() {
+            indices[axis] += 1;
+            if indices[axis] < axes[axis].2.len() {
+                break;
+            }
+            indices[axis] = 0;
+        }
+    }
+    Ok((kept, raw_cells, summary))
 }
 
 /// Find `count` consecutive free UDP ports and return the base.
@@ -807,7 +931,7 @@ fn record_key(record: &Record, cell: &[(&str, Scope, String)], rep: usize) -> Op
 }
 
 /// Read a declarative sweep plan: `axis = v1,v2,v3` per line, `#` for
-/// comments. Values merge with (and override) any given on the CLI.
+/// comments. Explicit `--axis name=value` overrides are applied later.
 ///
 /// A plan in a file rather than a shell loop because a comprehensive
 /// sweep is hundreds of runs over hours: it needs to be reviewable before
@@ -840,8 +964,15 @@ fn read_plan(path: &Path) -> std::io::Result<Vec<(String, Vec<String>)>> {
             continue;
         }
         if let Some((name, values)) = line.split_once('=') {
+            let name = format!("{scope}{}", name.trim());
+            if axes.iter().any(|(axis, _)| *axis == name) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{path:?}: duplicate axis '{name}'"),
+                ));
+            }
             axes.push((
-                format!("{scope}{}", name.trim()),
+                name,
                 values
                     .split(',')
                     .map(str::trim)
@@ -859,6 +990,179 @@ fn axis_values(cli: &crate::Cli, flag: &str, default: &str) -> Vec<String> {
         || vec![default.to_string()],
         |v| v.split(',').map(str::trim).map(str::to_string).collect(),
     )
+}
+
+fn canonical_axis_name(name: &str) -> Option<&'static str> {
+    Some(match name.trim() {
+        "runtime" | "runtimes" => "runtime",
+        "recv-runtime" | "recv-runtimes" => "recv-runtime",
+        "send-runtime" | "send-runtimes" => "send-runtime",
+        "workers" => "workers",
+        "recv-workers" => "recv-workers",
+        "send-workers" => "send-workers",
+        "ingress" => "ingress",
+        "encryption" => "encryption",
+        "promotion" => "promotion",
+        "cookie-routing" => "cookie-routing",
+        "batch" => "batch",
+        "sock-buf" => "sock-buf",
+        "pin" => "pin",
+        "connections" => "connections",
+        "connect-concurrency" => "connect-concurrency",
+        "bond" => "bond",
+        "bitrate" => "bitrate",
+        "link-delay" => "link-delay",
+        "link-jitter" => "link-jitter",
+        "link-loss" => "link-loss",
+        "link-rate" => "link-rate",
+        "link-reorder" => "link-reorder",
+        "link-duplicate" => "link-duplicate",
+        "link-corrupt" => "link-corrupt",
+        "link-limit" => "link-limit",
+        _ => return None,
+    })
+}
+
+fn axis_overrides(
+    cli: &crate::Cli,
+) -> std::io::Result<std::collections::HashMap<String, Vec<String>>> {
+    let mut overrides = std::collections::HashMap::new();
+    for spec in cli.repeated.get("axis").into_iter().flatten() {
+        let Some((name, values)) = spec.split_once('=') else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("--axis requires NAME=VALUE[,VALUE...] (got '{spec}')"),
+            ));
+        };
+        let Some(name) = canonical_axis_name(name) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("--axis: unknown matrix axis '{name}'"),
+            ));
+        };
+        let values: Vec<String> = values
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect();
+        if values.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("--axis {name}=... must contain at least one value"),
+            ));
+        }
+        if overrides.insert(name.to_string(), values).is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("--axis '{name}' was specified more than once"),
+            ));
+        }
+    }
+    Ok(overrides)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MatrixOrder {
+    Default,
+    Interleaved,
+    Random,
+}
+
+fn matrix_order(cli: &crate::Cli) -> std::io::Result<(MatrixOrder, u64)> {
+    let order = cli
+        .flags
+        .get("order")
+        .map(String::as_str)
+        .unwrap_or("default");
+    let order = match order {
+        "default" => MatrixOrder::Default,
+        "interleaved" => MatrixOrder::Interleaved,
+        "random" | "randomized" => MatrixOrder::Random,
+        other => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("--order: unknown value '{other}' (want default|interleaved|random)"),
+            ));
+        }
+    };
+    let seed = cli
+        .flags
+        .get("seed")
+        .map(|value| {
+            value.parse::<u64>().map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("--seed: invalid integer '{value}'"),
+                )
+            })
+        })
+        .transpose()?
+        .unwrap_or(0);
+    Ok((order, seed))
+}
+
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+fn shuffle<T>(items: &mut [T], seed: u64) {
+    let mut state = seed;
+    for i in (1..items.len()).rev() {
+        let j = (splitmix64(&mut state) % (i as u64 + 1)) as usize;
+        items.swap(i, j);
+    }
+}
+
+/// Round-robin each Cartesian level so runtime, ingress, encryption, and
+/// subsequent axes are spread through the run instead of appearing in one
+/// long block. This remains deterministic and preserves each axis's plan
+/// value order within its round-robin lanes.
+fn interleave_indices(cells: &[Cell<'_>], axes: &[Axis]) -> Vec<usize> {
+    fn visit(cells: &[Cell<'_>], axes: &[Axis], depth: usize, indices: Vec<usize>) -> Vec<usize> {
+        if depth == axes.len() || indices.len() < 2 {
+            return indices;
+        }
+        let (name, scope, values) = &axes[depth];
+        let mut groups: Vec<Vec<usize>> = values
+            .iter()
+            .map(|value| {
+                indices
+                    .iter()
+                    .copied()
+                    .filter(|index| {
+                        cells[*index].iter().any(|(axis, cell_scope, cell_value)| {
+                            axis == name && cell_scope == scope && cell_value == value
+                        })
+                    })
+                    .collect()
+            })
+            .filter(|group: &Vec<usize>| !group.is_empty())
+            .collect();
+        if groups.len() < 2 {
+            return visit(cells, axes, depth + 1, indices);
+        }
+        for group in &mut groups {
+            let replacement = visit(cells, axes, depth + 1, std::mem::take(group));
+            *group = replacement;
+        }
+        let mut out = Vec::with_capacity(indices.len());
+        let longest = groups.iter().map(Vec::len).max().unwrap_or(0);
+        for offset in 0..longest {
+            for group in &groups {
+                if let Some(index) = group.get(offset) {
+                    out.push(*index);
+                }
+            }
+        }
+        out
+    }
+
+    visit(cells, axes, 0, (0..cells.len()).collect())
 }
 
 /// Run the cartesian product of the requested axes, one receiver/sender
@@ -883,11 +1187,17 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
     let latency: u16 = cli.flag_or("latency", 120);
 
     // A plan file, when given, supplies axis values; anything it omits
-    // falls back to the CLI flag and then the built-in default.
+    // falls back to the CLI flag and then the built-in default. Explicit
+    // `--axis name=value` entries are the only CLI inputs that override a
+    // plan value.
     let plan: Vec<(String, Vec<String>)> = match cli.flags.get("plan") {
         Some(path) if !path.is_empty() => read_plan(Path::new(path))?,
         _ => Vec::new(),
     };
+    let overrides = axis_overrides(cli)?;
+    for (name, values) in &overrides {
+        eprintln!("matrix: axis override {name}={}", values.join(","));
+    }
     // Track every plan key actually looked up, so a key nobody queries
     // -- a typo, or (as happened) an axis that stopped being role-
     // splittable after `ingress` was pulled back to Both-only because
@@ -899,6 +1209,14 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
         plan.iter()
             .find(|(axis, _)| axis == name)
             .map(|(_, values)| values.clone())
+    };
+    let resolved_axis = |name: &str, flag: &str, default: &str| -> Vec<String> {
+        let plan_value = from_plan(name);
+        overrides
+            .get(name)
+            .cloned()
+            .or(plan_value)
+            .unwrap_or_else(|| axis_values(cli, flag, default))
     };
 
     // CPU sets are a single value per role rather than an axis, but they
@@ -918,11 +1236,7 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
         eprintln!("matrix: receiver CPUs [{recv_cpus}], sender CPUs [{send_cpus}]");
     }
     let axis = |name: &'static str, flag: &str, default: &str| -> Axis {
-        (
-            name,
-            Scope::Both,
-            from_plan(name).unwrap_or_else(|| axis_values(cli, flag, default)),
-        )
+        (name, Scope::Both, resolved_axis(name, flag, default))
     };
 
     // Topology knobs that mean different things to each end. Given
@@ -940,23 +1254,25 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
     let mut split_axes: Vec<Axis> = Vec::new();
     let role_axis = |name: &'static str, flag: &str, default: &str, out: &mut Vec<Axis>| {
         let per_role = |prefix: &str| -> Option<Vec<String>> {
-            from_plan(&format!("{prefix}{name}")).or_else(|| {
-                cli.flags
-                    .get(&format!("{prefix}{flag}"))
-                    .filter(|v| !v.is_empty())
-                    .map(|v| v.split(',').map(str::trim).map(str::to_string).collect())
-            })
+            let scoped_name = format!("{prefix}{name}");
+            let plan_value = from_plan(&scoped_name);
+            overrides
+                .get(&scoped_name)
+                .cloned()
+                .or(plan_value)
+                .or_else(|| {
+                    cli.flags
+                        .get(&format!("{prefix}{flag}"))
+                        .filter(|v| !v.is_empty())
+                        .map(|v| v.split(',').map(str::trim).map(str::to_string).collect())
+                })
         };
         let (recv, send) = (per_role("recv-"), per_role("send-"));
         if recv.is_none() && send.is_none() {
-            out.push((
-                name,
-                Scope::Both,
-                from_plan(name).unwrap_or_else(|| axis_values(cli, flag, default)),
-            ));
+            out.push((name, Scope::Both, resolved_axis(name, flag, default)));
             return;
         }
-        let shared = from_plan(name).unwrap_or_else(|| axis_values(cli, flag, default));
+        let shared = resolved_axis(name, flag, default);
         out.push((name, Scope::Recv, recv.unwrap_or_else(|| shared.clone())));
         out.push((name, Scope::Send, send.unwrap_or(shared)));
     };
@@ -999,24 +1315,10 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
         )));
     }
 
-    // Cartesian product, expanded eagerly: the whole point is to know how
-    // many cells there are before starting a long sweep.
-    let mut cells: Vec<Cell> = vec![Vec::new()];
-    for (name, scope, values) in &axes {
-        let mut next = Vec::new();
-        for base in &cells {
-            for v in values {
-                let mut row = base.clone();
-                row.push((name, *scope, v.clone()));
-                next.push(row);
-            }
-        }
-        cells = next;
-    }
-
-    let raw_cells = cells.len();
-    let (filtered_cells, filter_summary) = filter_matrix_cells(cells, &axes);
-    cells = filtered_cells;
+    // Cartesian product, filtered one point at a time: the whole point is
+    // to know how many cells there are before starting a long sweep without
+    // holding the raw 1.7-million-cell product in memory.
+    let (cells, raw_cells, filter_summary) = filtered_cartesian_cells(&axes)?;
     if filter_summary.total() > 0 {
         let reasons = filter_summary
             .by_reason
@@ -1031,6 +1333,28 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
         );
     }
     let total = cells.len() * reps;
+    let (order, seed) = matrix_order(cli)?;
+    let mut cell_order: Vec<usize> = match order {
+        MatrixOrder::Default | MatrixOrder::Random => (0..cells.len()).collect(),
+        MatrixOrder::Interleaved => interleave_indices(&cells, &axes),
+    };
+    if order == MatrixOrder::Random {
+        shuffle(&mut cell_order, seed);
+    }
+    let schedule: Vec<(usize, usize)> = match order {
+        MatrixOrder::Default => cell_order
+            .iter()
+            .flat_map(|cell| (1..=reps).map(move |rep| (*cell, rep)))
+            .collect(),
+        MatrixOrder::Interleaved | MatrixOrder::Random => (1..=reps)
+            .flat_map(|rep| cell_order.iter().map(move |cell| (*cell, rep)))
+            .collect(),
+    };
+    eprintln!(
+        "matrix: order={:?} seed={seed} scheduled_runs={}",
+        order,
+        schedule.len()
+    );
     // Resume: a sweep of this size will be interrupted at some point, and
     // re-running completed cells wastes hours and mixes measurement
     // windows. Anything already in the output file is skipped.
@@ -1039,7 +1363,11 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
     // orphan caller row, was re-run, and appended a second caller row for
     // the same cell -- two senders, one listener, and any statistic over
     // them silently wrong.
-    let recorded = read_results(&out).unwrap_or_default();
+    let recorded = if out.exists() {
+        read_results(&out)?
+    } else {
+        Vec::new()
+    };
     let keys_for = |role: &str| -> std::collections::HashSet<String> {
         recorded
             .iter()
@@ -1094,8 +1422,10 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
         None
     };
 
-    let mut skipped = 0usize;
-    for (index, cell) in cells.iter().enumerate() {
+    let mut skipped_runs = 0usize;
+    let mut unsupported_cells = std::collections::HashSet::new();
+    for (run_index, (cell_index, rep)) in schedule.iter().copied().enumerate() {
+        let cell = &cells[cell_index];
         let label: Vec<String> = cell
             .iter()
             .map(|(k, scope, v)| format!("{}{k}={v}", scope.prefix().replace('_', "-")))
@@ -1149,141 +1479,141 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
             crate::Runtime::parse(&send_runtime).unwrap_or(crate::Runtime::Mio),
             parse_ingress_spec(&send_ingress),
         ) {
-            skipped += 1;
-            eprintln!("[skip] {} (unsupported)", label.join(" "));
+            if unsupported_cells.insert(cell_index) {
+                skipped_runs += reps;
+                eprintln!("[skip] {} (unsupported)", label.join(" "));
+            }
             continue;
         }
-        for rep in 1..=reps {
-            if done.contains(&cell_key(cell, rep)) {
-                continue;
-            }
-            if let Some(p) = netns {
-                netem_apply(
-                    p,
-                    netem_args(|f| cell_link(cell, f)).map_err(std::io::Error::other)?,
-                )?;
-            }
-            // A per-port cell at the top of the sweep can legitimately ask
-            // for more descriptors than this process may hold while probing
-            // the range (the full plan reaches 1200 connections). Treat that
-            // as an unavailable resource cell and continue the sweep so one
-            // impossible topology does not hide every pooled result after it.
-            let port = match free_port_range(ports_needed) {
-                Ok(port) => port,
-                Err(error) => {
-                    skipped += 1;
-                    eprintln!(
-                        "[skip] {} (port allocation failed: {error})",
-                        label.join(" ")
-                    );
-                    continue;
-                }
-            };
-            // Each role gets the axes scoped to it plus the shared ones.
-            // Both roles additionally get every split axis's *other* side
-            // as a record-only `--recv-*`/`--send-*` flag, so a single row
-            // states the whole cell -- without which two cells differing
-            // only on the far side would be indistinguishable, and resume
-            // would skip one of them.
-            let argv_for = |role: Scope| -> Vec<String> {
-                let mut out: Vec<String> = cell
-                    .iter()
-                    .filter(|(k, scope, _)| {
-                        *k != "bitrate" && *k != "runtime" && scope.applies_to(role)
-                    })
-                    .map(|(k, _, v)| format!("--{k}={v}"))
-                    .collect();
-                for (k, scope, v) in cell {
-                    if *scope != Scope::Both {
-                        out.push(format!("--{}{k}={v}", scope.prefix().replace('_', "-")));
-                    }
-                }
-                out
-            };
-            let mut recv_argv = argv_for(Scope::Recv);
-            let send_argv = argv_for(Scope::Send);
-            // The listener runs to a long backstop, but the cell's stream
-            // length is what any rate is computed against.
-            recv_argv.push(format!("--stream-secs={secs}"));
-
-            // Receiver outlives the sender so it is still listening when
-            // the last packets arrive; +5s mirrors the old harness.
-            let mut recv = if let Some(p) = netns {
-                in_netns(p, &exe)
-            } else {
-                std::process::Command::new(&exe)
-            }
-            .arg(format!("runtime={recv_runtime}"))
-            .arg("mode=receiver")
-            .arg(port.to_string())
-            // Backstop only: the harness signals the real stop once
-            // the sender finishes. Generous, because a sender under
-            // overload can run well past its nominal duration and the
-            // listener must still be there when it does.
-            .arg((secs + 60).to_string())
-            .arg(latency.to_string())
-            .env("SRT_BENCH_CHILD", "1")
-            // The receiver ignores this functionally, but both rows
-            // must record the same configured bitrate or a report
-            // grouping on it would split the pair and lose delivery%.
-            .arg(&bitrate)
-            .args(&recv_argv)
-            .arg(format!("--rep={rep}"))
-            .arg(format!("--cpus={recv_cpus}"))
-            .arg(format!("--out={}", out.display()))
-            .stdout(std::process::Stdio::piped())
-            .spawn()?;
-
-            if !wait_for_listening(&mut recv, std::time::Duration::from_secs(60)) {
+        if done.contains(&cell_key(cell, rep)) {
+            continue;
+        }
+        if let Some(p) = netns {
+            netem_apply(
+                p,
+                netem_args(|f| cell_link(cell, f)).map_err(std::io::Error::other)?,
+            )?;
+        }
+        // A per-port cell at the top of the sweep can legitimately ask
+        // for more descriptors than this process may hold while probing
+        // the range (the full plan reaches 1200 connections). Treat that
+        // as an unavailable resource cell and continue the sweep so one
+        // impossible topology does not hide every pooled result after it.
+        let port = match free_port_range(ports_needed) {
+            Ok(port) => port,
+            Err(error) => {
+                skipped_runs += 1;
                 eprintln!(
-                    "[warn] listener never reported LISTENING: {}",
+                    "[skip] {} (port allocation failed: {error})",
                     label.join(" ")
                 );
+                continue;
             }
-
-            let send = if let Some(p) = netns {
-                in_netns(p, &exe)
-            } else {
-                std::process::Command::new(&exe)
-            }
-            .arg(format!("runtime={send_runtime}"))
-            .arg("mode=sender")
-            .arg("127.0.0.1")
-            .arg(port.to_string())
-            .arg(secs.to_string())
-            .arg(latency.to_string())
-            .arg(&bitrate)
-            .env("SRT_BENCH_CHILD", "1")
-            .args(&send_argv)
-            .arg(format!("--rep={rep}"))
-            .arg(format!("--cpus={send_cpus}"))
-            .arg(format!("--out={}", out.display()))
-            .stdout(std::process::Stdio::null())
-            .status()?;
-
-            // Ordered teardown: the sender is done, so the listener has
-            // nothing left to receive. Signalling now (rather than letting
-            // it time out) is what keeps the sender from spending its last
-            // seconds transmitting into a closed port.
-            request_stop(&recv);
-            let recv_status = recv.wait()?;
-            eprintln!(
-                "[{:>4}/{total}] rep {rep} {}{}",
-                index * reps + rep,
-                label.join(" "),
-                if send.success() && recv_status.success() {
-                    String::new()
-                } else {
-                    format!(" (sender={send} receiver={recv_status})")
+        };
+        // Each role gets the axes scoped to it plus the shared ones.
+        // Both roles additionally get every split axis's *other* side
+        // as a record-only `--recv-*`/`--send-*` flag, so a single row
+        // states the whole cell -- without which two cells differing
+        // only on the far side would be indistinguishable, and resume
+        // would skip one of them.
+        let argv_for = |role: Scope| -> Vec<String> {
+            let mut out: Vec<String> = cell
+                .iter()
+                .filter(|(k, scope, _)| {
+                    *k != "bitrate" && *k != "runtime" && scope.applies_to(role)
+                })
+                .map(|(k, _, v)| format!("--{k}={v}"))
+                .collect();
+            for (k, scope, v) in cell {
+                if *scope != Scope::Both {
+                    out.push(format!("--{}{k}={v}", scope.prefix().replace('_', "-")));
                 }
+            }
+            out
+        };
+        let mut recv_argv = argv_for(Scope::Recv);
+        let send_argv = argv_for(Scope::Send);
+        // The listener runs to a long backstop, but the cell's stream
+        // length is what any rate is computed against.
+        recv_argv.push(format!("--stream-secs={secs}"));
+
+        // Receiver outlives the sender so it is still listening when
+        // the last packets arrive; +5s mirrors the old harness.
+        let mut recv = if let Some(p) = netns {
+            in_netns(p, &exe)
+        } else {
+            std::process::Command::new(&exe)
+        }
+        .arg(format!("runtime={recv_runtime}"))
+        .arg("mode=receiver")
+        .arg(port.to_string())
+        // Backstop only: the harness signals the real stop once
+        // the sender finishes. Generous, because a sender under
+        // overload can run well past its nominal duration and the
+        // listener must still be there when it does.
+        .arg((secs + 60).to_string())
+        .arg(latency.to_string())
+        .env("SRT_BENCH_CHILD", "1")
+        // The receiver ignores this functionally, but both rows
+        // must record the same configured bitrate or a report
+        // grouping on it would split the pair and lose delivery%.
+        .arg(&bitrate)
+        .args(&recv_argv)
+        .arg(format!("--rep={rep}"))
+        .arg(format!("--cpus={recv_cpus}"))
+        .arg(format!("--out={}", out.display()))
+        .stdout(std::process::Stdio::piped())
+        .spawn()?;
+
+        if !wait_for_listening(&mut recv, std::time::Duration::from_secs(60)) {
+            eprintln!(
+                "[warn] listener never reported LISTENING: {}",
+                label.join(" ")
             );
         }
+
+        let send = if let Some(p) = netns {
+            in_netns(p, &exe)
+        } else {
+            std::process::Command::new(&exe)
+        }
+        .arg(format!("runtime={send_runtime}"))
+        .arg("mode=sender")
+        .arg("127.0.0.1")
+        .arg(port.to_string())
+        .arg(secs.to_string())
+        .arg(latency.to_string())
+        .arg(&bitrate)
+        .env("SRT_BENCH_CHILD", "1")
+        .args(&send_argv)
+        .arg(format!("--rep={rep}"))
+        .arg(format!("--cpus={send_cpus}"))
+        .arg(format!("--out={}", out.display()))
+        .stdout(std::process::Stdio::null())
+        .status()?;
+
+        // Ordered teardown: the sender is done, so the listener has
+        // nothing left to receive. Signalling now (rather than letting
+        // it time out) is what keeps the sender from spending its last
+        // seconds transmitting into a closed port.
+        request_stop(&recv);
+        let recv_status = recv.wait()?;
+        eprintln!(
+            "[{:>4}/{total}] rep {rep} {}{}",
+            run_index + 1,
+            label.join(" "),
+            if send.success() && recv_status.success() {
+                String::new()
+            } else {
+                format!(" (sender={send} receiver={recv_status})")
+            }
+        );
     }
     if let Some(p) = netns {
         netns_down(p);
     }
-    if skipped > 0 {
-        eprintln!("matrix: skipped {skipped} unsupported cells");
+    if skipped_runs > 0 {
+        eprintln!("matrix: skipped {skipped_runs} scheduled runs");
     }
     Ok(())
 }
@@ -1666,7 +1996,7 @@ pub fn run_sysprof(cli: &crate::Cli) -> std::io::Result<()> {
         .status()?;
     recv.wait()?;
 
-    let records = read_results(&results).unwrap_or_default();
+    let records = read_results(&results)?;
     println!("=== syscall attribution: {runtime}, {conns} connections ===");
     for role in ["caller", "listener"] {
         let counts = std::fs::read_to_string(side(role))
@@ -1695,7 +2025,19 @@ pub fn run_sysprof(cli: &crate::Cli) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod matrix_filter_tests {
-    use super::{Axis, Cell, Scope, filter_matrix_cells, filter_reason};
+    use super::{
+        Axis, Cell, Scope, axis_overrides, filter_matrix_cells, filter_reason,
+        filtered_cartesian_cells, interleave_indices, read_results, shuffle,
+    };
+    use crate::Cli;
+
+    fn cli(args: &[&str]) -> Cli {
+        let args = std::iter::once("srt-bench")
+            .chain(args.iter().copied())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        Cli::parse(&args)
+    }
 
     fn axes() -> Vec<Axis> {
         vec![
@@ -1884,6 +2226,121 @@ mod matrix_filter_tests {
         let (kept, summary) = filter_matrix_cells(cells, &axes);
         assert!(kept.is_empty());
         assert_eq!(summary.total(), 2);
+    }
+
+    #[test]
+    fn filtered_cartesian_expansion_keeps_only_capable_cells() {
+        let axes: Vec<Axis> = vec![
+            (
+                "runtime",
+                Scope::Both,
+                ["mio", "tokio"].into_iter().map(str::to_string).collect(),
+            ),
+            (
+                "ingress",
+                Scope::Both,
+                ["per-port", "shared-pool:4"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            ),
+            (
+                "batch",
+                Scope::Both,
+                ["on", "off"].into_iter().map(str::to_string).collect(),
+            ),
+        ];
+        let (cells, raw, summary) = filtered_cartesian_cells(&axes).unwrap();
+        assert_eq!(raw, 8);
+        assert_eq!(cells.len(), 5);
+        assert_eq!(summary.total(), 3);
+    }
+
+    #[test]
+    fn axis_overrides_use_canonical_names_and_reject_duplicates() {
+        let parsed = axis_overrides(&cli(&[
+            "--axis",
+            "encryption=plain,128",
+            "--axis=recv-runtimes=mio,tokio",
+        ]))
+        .unwrap();
+        assert_eq!(parsed["encryption"], ["plain", "128"]);
+        assert_eq!(parsed["recv-runtime"], ["mio", "tokio"]);
+
+        let error = axis_overrides(&cli(&[
+            "--axis",
+            "encryption=plain",
+            "--axis",
+            "encryption=128",
+        ]))
+        .unwrap_err();
+        assert!(error.to_string().contains("specified more than once"));
+
+        let error = axis_overrides(&cli(&["--axis", "not-an-axis=on"])).unwrap_err();
+        assert!(error.to_string().contains("unknown matrix axis"));
+    }
+
+    #[test]
+    fn interleaved_order_rotates_the_outer_axis() {
+        let axes: Vec<Axis> = vec![
+            (
+                "runtime",
+                Scope::Both,
+                ["mio", "tokio"].into_iter().map(str::to_string).collect(),
+            ),
+            (
+                "encryption",
+                Scope::Both,
+                ["plain", "128"].into_iter().map(str::to_string).collect(),
+            ),
+        ];
+        let cells: Vec<Cell<'_>> = vec![
+            vec![
+                ("runtime", Scope::Both, "mio".into()),
+                ("encryption", Scope::Both, "plain".into()),
+            ],
+            vec![
+                ("runtime", Scope::Both, "mio".into()),
+                ("encryption", Scope::Both, "128".into()),
+            ],
+            vec![
+                ("runtime", Scope::Both, "tokio".into()),
+                ("encryption", Scope::Both, "plain".into()),
+            ],
+            vec![
+                ("runtime", Scope::Both, "tokio".into()),
+                ("encryption", Scope::Both, "128".into()),
+            ],
+        ];
+        assert_eq!(interleave_indices(&cells, &axes), [0, 2, 1, 3]);
+    }
+
+    #[test]
+    fn shuffle_is_reproducible_and_seed_sensitive() {
+        let mut first = [0, 1, 2, 3, 4, 5];
+        let mut second = first;
+        let mut third = first;
+        shuffle(&mut first, 42);
+        shuffle(&mut second, 42);
+        shuffle(&mut third, 43);
+        assert_eq!(first, second);
+        assert_ne!(first, third);
+    }
+
+    #[test]
+    fn malformed_result_files_are_rejected() {
+        let path = std::env::temp_dir().join(format!(
+            "srt-bench-malformed-{}-{}.tsv",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, format!("{}\nshort\n", super::COLUMNS.join("\t"))).unwrap();
+        let error = read_results(&path).unwrap_err();
+        std::fs::remove_file(&path).unwrap();
+        assert!(error.to_string().contains("malformed TSV row"));
     }
 }
 

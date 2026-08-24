@@ -5,20 +5,17 @@
 //! driver-framework bake-off is judged on latency introduced, throughput,
 //! *and* CPU/memory.
 //!
-//! `getrusage(RUSAGE_SELF, ...)` rather than reading `/proc/self/stat`:
-//! portable within the libc crate already in the dependency graph, no
-//! string parsing, and reports microsecond-resolution CPU time plus peak
-//! RSS directly in one syscall.
+//! CPU time comes from `getrusage(RUSAGE_SELF, ...)`. On Linux, peak RSS is
+//! read from `/proc/self/status`'s `VmHWM`: unlike `ru_maxrss`, it resets at
+//! `exec`, so a matrix child's memory does not include the matrix parent's
+//! Cartesian-product allocation.
 
 pub struct ProcessStats {
     /// User-mode CPU time consumed so far, in milliseconds.
     pub cpu_user_ms: f64,
     /// Kernel-mode CPU time consumed so far, in milliseconds.
     pub cpu_sys_ms: f64,
-    /// Peak resident set size so far, in KiB (`ru_maxrss` is already
-    /// KiB on Linux -- unlike macOS/BSD, where it's bytes; this crate only
-    /// targets Linux, see Cargo.toml's doc comment on the io_uring
-    /// backends).
+    /// Peak resident set size so far, in KiB.
     pub peak_rss_kb: u64,
 }
 
@@ -32,10 +29,21 @@ pub fn process_stats() -> ProcessStats {
             peak_rss_kb: 0,
         };
     }
+    let peak_rss_kb = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                (name == "VmHWM")
+                    .then(|| value.split_whitespace().next()?.parse::<u64>().ok())
+                    .flatten()
+            })
+        })
+        .unwrap_or_else(|| usage.ru_maxrss.max(0) as u64);
     ProcessStats {
         cpu_user_ms: usage.ru_utime.tv_sec as f64 * 1000.0 + usage.ru_utime.tv_usec as f64 / 1000.0,
         cpu_sys_ms: usage.ru_stime.tv_sec as f64 * 1000.0 + usage.ru_stime.tv_usec as f64 / 1000.0,
-        peak_rss_kb: usage.ru_maxrss.max(0) as u64,
+        peak_rss_kb,
     }
 }
 
