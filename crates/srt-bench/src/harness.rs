@@ -397,7 +397,7 @@ pub fn report(results: &[Record], group_by: &[String]) -> String {
             let pkts = conns * bitrate * secs / (8.0 * crate::PAYLOAD_SIZE as f64);
             (pkts > 0.0).then_some(pkts)
         };
-        let target_pkts = median(callers.iter().filter_map(|r| target(r)).collect());
+        let target_pkts = median(callers.iter().filter_map(target).collect());
         let pct = |n: f64| -> String {
             if target_pkts > 0.0 {
                 format!("{:.1}", 100.0 * n / target_pkts)
