@@ -31,17 +31,22 @@ admission peer table lives, calling back into the policy defined here.
 
 ## Problem it solves
 
-An SRT listener fronting a multi-worker service must answer, from the
-*first handshake datagram alone*, two questions before any protocol state
-exists:
+An SRT listener fronting a multi-worker service makes two related decisions at
+different points in the two-stage handshake:
 
-1. **Which logical publisher is this?** A bonding group arrives as N
-   independent physical legs; they must be recognized as one publisher.
-2. **Which worker owns this leg?** All legs of one group must land on the
-   same worker, or bonded failover/broadcast breaks.
+1. **Which worker owns this physical handshake?** INDUCTION creates bounded
+   half-open protocol state. The listener encodes its chosen owner in the SYN
+   cookie so a rehashed CONCLUSION can be routed back to that state.
+2. **Which logical publisher is this?** CONCLUSION carries StreamID and GROUP
+   extensions. A bonding group arrives as N independent physical legs; the
+   decoded affinity keeps them on one logical owner.
 
-Both answers are decodable straight off the wire (handshake CONCLUSION +
-StreamID + GROUP extension), which is exactly what this crate does.
+The relevant fields are decodable straight off the wire without advancing the
+protocol state, which is exactly what this crate does. Their values remain
+untrusted application claims; transport validates the cookie and owns the
+stateful admission window. See the
+[`listener admission guide`](../../docs/listener-admission-policy.md) for
+per-StreamID authorization and credential selection.
 
 ## API
 

@@ -167,7 +167,7 @@ let listener = ListenerConfig::builder("0.0.0.0:9000".parse()?)
 // Inside a Tokio runtime. The returned prepared policy owns no event loop:
 // use the supplied sockets/PeerTable directly or compose your own workers.
 let runtime_listener = srt_transport::tokio_transport::bind_listener(&listener)?;
-let peers = runtime_listener.prepared.peer_table();
+let mut peers = runtime_listener.prepared.peer_table();
 let admission = runtime_listener.prepared.admission_options();
 ```
 
@@ -175,7 +175,12 @@ let admission = runtime_listener.prepared.admission_options();
 
 The listener sees the caller's claimed StreamID in CONCLUSION, after cookie
 validation but before KM processing. A cached resolver can select a tenant
-passphrase and other handshake policy atomically:
+passphrase and other handshake policy atomically. The complete contract,
+including handshake ordering, composition, resolver outcomes, reuseport,
+telemetry, security, and escape hatches, is in the workspace
+[`listener admission guide`](../../docs/listener-admission-policy.md).
+
+The core resolver shape is:
 
 ```rust
 use shiguredo_srt::KeyLength;

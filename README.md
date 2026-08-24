@@ -141,6 +141,11 @@ let listener = srt_transport::tokio_transport::bind_listener(&listener)?;
 
 See [`crates/srt-transport/README.md`](crates/srt-transport/README.md) for
 layering, profiles, capability resolution, admission limits, and escape hatches.
+Listeners that select credentials, authorization, or GROUP policy from an
+incoming StreamID should start with
+[`docs/listener-admission-policy.md`](docs/listener-admission-policy.md). It
+documents the exact pre-CONCLUSION hook window, composable typed overrides,
+reuseport ownership, deferral, rejection, telemetry, and raw escape hatches.
 
 ## Benchmark quick start
 

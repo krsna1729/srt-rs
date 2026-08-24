@@ -88,7 +88,13 @@ Sending: `can_send_with_pacing(now)` / `time_until_send(now)` gate
 `send(payload, now)`; `send_with_sequence` pins an explicit sequence
 number; `set_packet_send_period` caps rate. Listeners may apply policy
 mid-handshake via `set_listener_policy(passphrase, key_length,
-tsbpd_delay, flow_window, rcvbuf)` — mirrors libsrt's accept hook.
+tsbpd_delay, flow_window, rcvbuf)` — mirrors libsrt's accept hook. The guarded
+listener setters work only after INDUCTION has created a listening connection
+and before CONCLUSION is processed. Full-stack applications should normally
+enter that window through `srt_transport::PeerTable::admit_with_resolver`,
+which preserves cookie validation, rejection delivery, deferral bounds, and
+admission telemetry; see the
+[`listener admission guide`](../../docs/listener-admission-policy.md).
 Telemetry: `stats()` returns a non-clearing, direction-aware connection
 snapshot with cumulative loss/retransmit/drop/undecrypt and ACK/NAK counters,
 instantaneous rates, RTT, capacity, pacing, and exact queue occupancy.

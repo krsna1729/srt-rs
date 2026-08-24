@@ -54,7 +54,10 @@ outside the resolver. `AdmissionResolution::Defer` deliberately does not
 refresh the original half-open deadline; retain a tight capacity/TTL policy so
 cache misses and hostile StreamIDs cannot retain state indefinitely. Avoid
 revealing whether a tenant, resource, or credential exists through overly
-specific rejection codes or timing differences.
+specific rejection codes or timing differences. Export resolver and credential
+outcomes from `IngressTelemetrySnapshot`, but do not use untrusted StreamID as
+an unbounded metric label. The complete integration contract is in
+[`docs/listener-admission-policy.md`](docs/listener-admission-policy.md).
 
 Encryption negotiation is fail-closed: an encrypted caller cannot establish an
 unencrypted listener session, and a listener requiring encryption cannot accept
