@@ -76,9 +76,7 @@ const IDLE_GRACE: Duration = Duration::from_secs(10);
 const TIMER_TICK: Duration = Duration::from_millis(10);
 
 async fn drain_outputs(driver: &mut Conn, now: shiguredo_srt::Timestamp) {
-    if let Err(error) = driver.drain_outputs(now).await {
-        eprintln!("[bench-compio] output send failed: {error}");
-    }
+    super::report_drain_error("compio", driver.drain_outputs(now).await);
 }
 
 /// Give one established connection its own connected socket, so the kernel
