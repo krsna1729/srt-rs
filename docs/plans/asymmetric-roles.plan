@@ -10,6 +10,11 @@
 # the cell count is unchanged. Keys under [recv] / [send] make that axis
 # independent for that role, which is a genuine cartesian product.
 #
+# `ingress` is deliberately NOT split here (and the harness will now
+# hard-error if you try): the caller uses it only to compute which port
+# to dial, so it must match whatever the listener actually bound, or
+# connections just fail. Set it once, unscoped.
+#
 #   srt-bench matrix --plan docs/plans/asymmetric-roles.plan --secs 10 --out scratch/roles.tsv
 
 runtime             = tokio
@@ -18,11 +23,11 @@ bitrate             = 8000000
 promotion           = all
 connect-concurrency = 50
 sock-buf            = 16m
+ingress             = shared-pool:4
 
 # The listener: pooled sockets, swept over how many threads serve them.
 # 1 is the historical single-threaded control; it is also a hard ceiling.
 [recv]
-ingress             = shared-pool:4
 workers             = 1,2,3
 cpus                = 0-2
 
@@ -31,6 +36,5 @@ cpus                = 0-2
 # not the offered load. Disjoint CPUs so the two ends cannot take cores
 # from each other.
 [send]
-ingress             = shared-pool:4
 workers             = 3
 cpus                = 3-5

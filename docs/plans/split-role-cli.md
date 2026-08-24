@@ -7,11 +7,29 @@ for the record; the correction below matters more than the plan did.
 
 Every topology axis can be scoped to a role:
 
-- Unprefixed (`--ingress`, `--workers`) applies to both roles and keeps
-  them in lockstep. Cell count unchanged, backward compatible.
+- Unprefixed (e.g. `--workers`) applies to both roles and keeps them in
+  lockstep. Cell count unchanged, backward compatible.
 - `--recv-x` / `--send-x`, or a `[recv]` / `[send]` section in a plan
   file, makes that axis independent for that role — a real cartesian
   product between the two sides.
+- **`--ingress` is not one of these**, and the harness now hard-errors on
+  `--recv-ingress`/`--send-ingress` or a scoped `ingress =` plan line
+  rather than silently ignoring it. It was splittable in the first
+  version of this feature, and that was a real, silent bug: the caller
+  uses `cfg.ingress` for exactly one thing, computing which port to dial
+  (`addr_for`), and nothing else in the sender path reads it. Split it
+  and the sender dials a scheme the listener never bound to — every
+  connection just fails to find its peer, which looks like "handshake
+  timeout" and "connect timed out" in the log and reads like a capacity
+  ceiling rather than the misconfiguration it actually is. Caught by
+  exactly that: a ceiling-push sweep whose plan set `[recv] ingress =
+  shared-pool:3` without a matching `[send]` line measured its own
+  connectivity failure at every connection count, not a real limit. Fixed
+  at the root (pulled `ingress` back to a Both-only axis) rather than by
+  remembering to always set both sides to the same value, and backed by a
+  general check: any plan-declared axis nothing ever reads is now a hard
+  error, so the next axis that stops being splittable fails loud instead
+  of silently measuring nothing.
 - Plan files also set `cpus` per role. They parsed before and were
   silently ignored.
 - Result rows record both roles' values, so one row states the whole cell

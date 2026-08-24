@@ -646,6 +646,12 @@ fn read_plan(path: &Path) -> std::io::Result<Vec<(String, Vec<String>)>> {
     // how a plan expresses an asymmetric topology -- a pooled listener
     // against a sharded sender, say. Keys outside any section apply to
     // both roles and move in lockstep.
+    //
+    // There is no "end section" marker: a key after `[recv]`/`[send]`
+    // stays scoped to it even if it looks like it should be global again.
+    // Put unscoped keys before the first section, or reset explicitly
+    // with any other bracketed header (`[all]` reads best) -- it falls
+    // through to the unscoped case below.
     let mut scope = String::new();
     for line in text.lines() {
         let line = line.split('#').next().unwrap_or("").trim();
@@ -709,7 +715,14 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
         Some(path) if !path.is_empty() => read_plan(Path::new(path))?,
         _ => Vec::new(),
     };
+    // Track every plan key actually looked up, so a key nobody queries
+    // -- a typo, or (as happened) an axis that stopped being role-
+    // splittable after `ingress` was pulled back to Both-only because
+    // splitting it silently broke connectivity -- is a hard error
+    // instead of a silently-ignored line in the plan file.
+    let queried = std::cell::RefCell::new(std::collections::HashSet::new());
     let from_plan = |name: &str| -> Option<Vec<String>> {
+        queried.borrow_mut().insert(name.to_string());
         plan.iter()
             .find(|(axis, _)| axis == name)
             .map(|(_, values)| values.clone())
@@ -772,11 +785,11 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
         out.push((name, Scope::Send, send.unwrap_or(shared)));
     };
     role_axis("runtime", "runtimes", "mio", &mut split_axes);
-    role_axis("ingress", "ingress", "per-port", &mut split_axes);
     role_axis("workers", "workers", "1", &mut split_axes);
 
     let mut axes: Vec<Axis> = split_axes;
     axes.extend([
+        axis("ingress", "ingress", "per-port"),
         axis("promotion", "promotion", "relocate"),
         axis("cookie-routing", "cookie-routing", "on"),
         axis("batch", "batch", "on"),
@@ -795,6 +808,20 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
         axis("bond", "bond", "none"),
         axis("bitrate", "bitrate", "8000000"),
     ]);
+
+    let unused: Vec<&str> = plan
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .filter(|name| !queried.borrow().contains(*name))
+        .collect();
+    if !unused.is_empty() {
+        return Err(std::io::Error::other(format!(
+            "plan declares axes nothing reads: {} -- check for a typo, or an \
+             axis that isn't (or is no longer) role-splittable",
+            unused.join(", ")
+        )));
+    }
+
 
     // Cartesian product, expanded eagerly: the whole point is to know how
     // many cells there are before starting a long sweep.

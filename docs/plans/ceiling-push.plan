@@ -1,0 +1,40 @@
+# Push toward the Gbps ceiling: connection count varied, ingress capacity
+# held 1:1 with worker threads on each side so no thread ever multiplexes
+# more than one pool socket (an earlier ad-hoc sweep showed 85% vs 97%
+# offer between neighboring configs purely from uneven socket-to-thread
+# dealing under shared-pool:6 with only 2-3 threads).
+#
+# 6-core host, split 3 recv / 3 send via disjoint CPU sets so the two
+# roles cannot take cores from each other.
+#
+# `ingress` is NOT role-splittable: the caller uses it only to compute
+# which port to dial (`addr_for`), so it must match whatever the
+# listener actually bound, or connections simply fail to find their
+# peer's port. Set unscoped; the harness now hard-errors rather than
+# silently ignoring a `[recv]`/`[send]`-scoped `ingress` line (found the
+# hard way -- an earlier version of this plan set it per-role and every
+# cell measured a self-inflicted connectivity failure, not a real limit).
+#
+#   srt-bench matrix --plan docs/plans/ceiling-push.plan --secs 10 --reps 1 \
+#     --out scratch/ceiling2.tsv
+#
+# NOTE: unscoped (global) keys must appear before any [recv]/[send]
+# section -- the parser has no "end section" marker, so a key after a
+# section header inherits that section's scope even if written outside
+# any braces.
+
+runtime             = tokio
+bitrate             = 8000000
+promotion           = all
+connect-concurrency = 50
+sock-buf            = 16m
+connections         = 200,400,600,800,1000,1200,1600
+ingress             = shared-pool:3
+
+[recv]
+workers = 3
+cpus    = 0-2
+
+[send]
+workers = 3
+cpus    = 3-5
