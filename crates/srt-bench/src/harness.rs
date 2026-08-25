@@ -575,6 +575,80 @@ pub fn report(results: &[Record], group_by: &[String]) -> String {
     out
 }
 
+/// Render the listener-side throughput series expected by
+/// benchmark-action's `customBiggerIsBetter` tool.
+///
+/// Keep this beside `report`: both consumers read the same validated TSV
+/// records, and the runtime order remains the first-seen order from the
+/// result file so chart updates stay stable.
+pub fn github_benchmark_json(results: &[Record]) -> String {
+    let mut series: Vec<(String, f64, f64)> = Vec::new();
+    for record in results {
+        if record.get("role") != Some("listener") {
+            continue;
+        }
+        let Some(runtime) = record.get("runtime") else {
+            continue;
+        };
+        let sent = record
+            .number("pkt_sent")
+            .filter(|value| value.is_finite())
+            .unwrap_or(0.0);
+        let elapsed = record
+            .number("elapsed_s")
+            .filter(|value| value.is_finite())
+            .unwrap_or(0.0);
+        if let Some((_, total_sent, total_elapsed)) =
+            series.iter_mut().find(|(name, _, _)| name == runtime)
+        {
+            *total_sent += sent;
+            *total_elapsed += elapsed;
+        } else {
+            series.push((runtime.to_string(), sent, elapsed));
+        }
+    }
+
+    let mut out = String::from("[");
+    let mut emitted = false;
+    for (runtime, sent, elapsed) in series {
+        if elapsed <= 0.0 {
+            continue;
+        }
+        if emitted {
+            out.push(',');
+        }
+        let value = sent / elapsed;
+        let _ = write!(
+            out,
+            "\n  {{\"name\": {}, \"unit\": \"pkt/s\", \"value\": {value:.1}}}",
+            json_string(&runtime)
+        );
+        emitted = true;
+    }
+    out.push_str("\n]\n");
+    out
+}
+
+fn json_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if ch.is_control() => {
+                let _ = write!(out, "\\u{:04x}", ch as u32);
+            }
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Matrix orchestration
 // ---------------------------------------------------------------------------
@@ -2590,7 +2664,7 @@ mod netem_tests {
 
 #[cfg(test)]
 mod report_tests {
-    use super::{Record, recorded_as, report};
+    use super::{Record, github_benchmark_json, recorded_as, report};
 
     fn rec(pairs: &[(&str, &str)]) -> Record {
         Record {
@@ -2676,6 +2750,46 @@ mod report_tests {
         assert_eq!(
             recorded_as("link-loss", "1%"),
             ("link_loss", "1%".to_string())
+        );
+    }
+
+    #[test]
+    fn github_benchmark_json_aggregates_listener_throughput_in_first_seen_order() {
+        let rows = vec![
+            rec(&[
+                ("runtime", "mio"),
+                ("role", "listener"),
+                ("pkt_sent", "10"),
+                ("elapsed_s", "2"),
+            ]),
+            rec(&[
+                ("runtime", "tokio"),
+                ("role", "caller"),
+                ("pkt_sent", "999"),
+                ("elapsed_s", "1"),
+            ]),
+            rec(&[
+                ("runtime", "mio"),
+                ("role", "listener"),
+                ("pkt_sent", "5"),
+                ("elapsed_s", "1"),
+            ]),
+            rec(&[
+                ("runtime", "tokio"),
+                ("role", "listener"),
+                ("pkt_sent", "6"),
+                ("elapsed_s", "3"),
+            ]),
+            rec(&[
+                ("runtime", "empty"),
+                ("role", "listener"),
+                ("pkt_sent", "4"),
+                ("elapsed_s", "0"),
+            ]),
+        ];
+        assert_eq!(
+            github_benchmark_json(&rows),
+            "[\n  {\"name\": \"mio\", \"unit\": \"pkt/s\", \"value\": 5.0},\n  {\"name\": \"tokio\", \"unit\": \"pkt/s\", \"value\": 2.0}\n]\n"
         );
     }
 }

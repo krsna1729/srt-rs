@@ -21,8 +21,9 @@ host-capacity diagnostic, and `system-info` prints the same report on demand.
 
 ## Usage
 
-One binary, five subcommands: run a role, sweep a matrix of them, report on
-the results, profile one pair, or inspect host capacity.
+One binary, six subcommands: run a role, sweep a matrix of them, report on
+the results, profile one pair, inspect host capacity, or watch a running
+benchmark.
 
 ```
 srt-bench runtime=<mio|tokio|smol|monoio|glommio|compio> \
@@ -58,6 +59,9 @@ srt-bench sysprof --runtime glommio --connections 150
 
 # Print the host settings that bound benchmark capacity.
 srt-bench system-info
+
+# Watch host pressure and kernel UDP drops while a benchmark runs.
+srt-bench watch 5 12
 
 # Explicitly override axes from a plan; repeat --axis for more axes.
 srt-bench matrix --plan docs/plans/full-matrix.plan \
@@ -139,11 +143,10 @@ startup log with the result file because it records the order and seed. Both
 non-default modes spread repeated cells across the run rather than executing
 all repetitions adjacent.
 
-This replaced a 344-line `bench.sh` that wrapped 86 lines of inline
-Python whose only job was re-parsing this binary's own stdout. The
-schema then lived in two places and drifted — adding a column silently
-broke the median table. Now the process that has the numbers writes them
-and the process that reports them reads the same columns back.
+The process that has the numbers writes them and the process that reports
+them reads the same columns back. `report --format github-benchmark` also
+produces the JSON consumed by benchmark-action, so result conversion does
+not require a second parser.
 
 ## Output contract
 

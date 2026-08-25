@@ -87,7 +87,7 @@ jobs:
       # comparing like with like.
       - name: Convert to benchmark-action JSON
         if: always()
-        run: scripts/bench-tsv-to-benchmark-json.sh throughput.tsv | tee weekly-benchmark.json
+        run: ./target/release/srt-bench report throughput.tsv --format github-benchmark --out weekly-benchmark.json
       - name: Update GitHub Pages trend chart
         if: always()
         uses: benchmark-action/github-action-benchmark@v1.22.1

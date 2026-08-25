@@ -95,7 +95,7 @@ jobs:
           ' nightly.tsv
       - name: Convert to benchmark-action JSON
         if: always()
-        run: scripts/bench-tsv-to-benchmark-json.sh nightly.tsv | tee nightly-benchmark.json
+        run: ./target/release/srt-bench report nightly.tsv --format github-benchmark --out nightly-benchmark.json
       - name: Update GitHub Pages trend chart
         if: always()
         uses: benchmark-action/github-action-benchmark@v1.22.1

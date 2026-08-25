@@ -5,6 +5,7 @@ pub mod driver;
 pub mod harness;
 pub mod shutdown;
 pub mod system;
+pub mod watch;
 
 use std::time::{Duration, Instant};
 

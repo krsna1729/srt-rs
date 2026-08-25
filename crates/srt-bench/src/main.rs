@@ -25,15 +25,16 @@
 //!
 //! Median table over a result file, grouped however you like:
 //!   srt-bench report results.tsv --by runtime,promotion
+//!   srt-bench report results.tsv --format github-benchmark --out benchmark.json
 //!
 //! Syscall/io_uring attribution for one pair (needs `perf`):
 //!   srt-bench sysprof --runtime glommio --connections 150
 //!
-//! These replace the former bench.sh. It had grown to 344 lines of shell
-//! wrapping 86 lines of inline Python whose only job was re-parsing this
-//! binary's own stdout -- so the result schema lived in two places and
-//! silently drifted. The process that has the numbers now writes them,
-//! and the process that reports them reads the same columns back.
+//! Live host watch while a benchmark runs:
+//!   srt-bench watch [interval_secs] [heartbeat_every_n_samples]
+//!
+//! Reporting and host watching live here with the benchmark process, so the
+//! result schema and diagnostic sampling do not depend on separate scripts.
 
 fn main() {
     // Raise the soft descriptor limit before either a matrix parent or a
@@ -46,7 +47,7 @@ fn main() {
     // result schema.
     let args: Vec<String> = std::env::args().collect();
     let context = match args.get(1).map(String::as_str) {
-        Some("report") => None,
+        Some("report" | "watch") => None,
         Some("system-info") => Some("system-info"),
         Some("matrix") => Some("matrix"),
         Some("sysprof") => Some("sysprof"),
@@ -62,6 +63,14 @@ fn main() {
             return;
         }
         Some("report") => return report(&args),
+        Some("watch") => {
+            let cli = srt_bench::Cli::parse(&args[1..]);
+            if let Err(e) = srt_bench::watch::run(&cli) {
+                eprintln!("watch: {e}");
+                std::process::exit(1);
+            }
+            return;
+        }
         Some("sysprof") => {
             let cli = srt_bench::Cli::parse(&args[1..]);
             if let Err(e) = srt_bench::harness::run_sysprof(&cli) {
@@ -90,13 +99,15 @@ fn main() {
     srt_bench::runtimes::run(cfg);
 }
 
-/// `srt-bench report FILE [--by col,col,...]` -- median table over a
-/// result file, grouped by whichever dimensions matter for the question
-/// being asked.
+/// `srt-bench report FILE [--by col,col,...]` -- median table over a result
+/// file, or `--format github-benchmark` for benchmark-action trend data.
 fn report(args: &[String]) {
     let cli = srt_bench::Cli::parse(&args[1..]);
     let path = cli.positional.first().cloned().unwrap_or_else(|| {
-        eprintln!("usage: srt-bench report FILE [--by runtime,ingress,promotion,...]");
+        eprintln!(
+            "usage: srt-bench report FILE [--by runtime,ingress,promotion,...] \
+             [--format table|github-benchmark] [--out FILE]"
+        );
         std::process::exit(2)
     });
     let records = match srt_bench::harness::read_results(std::path::Path::new(&path)) {
@@ -110,9 +121,32 @@ fn report(args: &[String]) {
         eprintln!("report: {path} has no rows");
         std::process::exit(1);
     }
-    let by: Vec<String> = cli.flags.get("by").filter(|v| !v.is_empty()).map_or_else(
-        || vec!["runtime".to_string()],
-        |v| v.split(',').map(str::trim).map(str::to_string).collect(),
-    );
-    print!("{}", srt_bench::harness::report(&records, &by));
+    let format = cli
+        .flags
+        .get("format")
+        .filter(|value| !value.is_empty())
+        .map(String::as_str)
+        .unwrap_or("table");
+    let output = match format {
+        "table" => {
+            let by: Vec<String> = cli.flags.get("by").filter(|v| !v.is_empty()).map_or_else(
+                || vec!["runtime".to_string()],
+                |v| v.split(',').map(str::trim).map(str::to_string).collect(),
+            );
+            srt_bench::harness::report(&records, &by)
+        }
+        "github-benchmark" => srt_bench::harness::github_benchmark_json(&records),
+        other => {
+            eprintln!("report: unknown format {other:?} (expected table or github-benchmark)");
+            std::process::exit(2)
+        }
+    };
+    if let Some(destination) = cli.flags.get("out").filter(|value| !value.is_empty()) {
+        if let Err(e) = std::fs::write(destination, output) {
+            eprintln!("report: {destination}: {e}");
+            std::process::exit(1);
+        }
+    } else {
+        print!("{output}");
+    }
 }

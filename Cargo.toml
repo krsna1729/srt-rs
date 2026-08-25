@@ -22,7 +22,7 @@ exclude = ["crates/srt-protocol/fuzz"]
 opt-level = 3
 lto = "thin"
 codegen-units = 1
-# Line tables only: `bench.sh sysprof` runs perf against this binary and
+# Line tables only: `srt-bench sysprof` runs perf against this binary and
 # needs symbols to attribute anything. No runtime cost.
 debug = 1
 
@@ -36,7 +36,7 @@ debug = 1
 #
 # Use it for "does this compile, connect, and behave", never for recorded
 # measurements: that missing cross-crate inlining is exactly what the
-# per-packet path is made of. bench.sh warns if pointed at it.
+# per-packet path is made of. srt-bench documents this distinction.
 [profile.quick]
 inherits = "release"
 lto = false
