@@ -14,7 +14,7 @@ use std::time::Duration;
 pub fn run(cli: &crate::Cli) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
-        return run_linux(cli);
+        run_linux(cli)
     }
     #[cfg(not(target_os = "linux"))]
     {
