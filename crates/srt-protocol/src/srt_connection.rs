@@ -1901,9 +1901,6 @@ impl SrtConnection {
     fn send_induction_request(&mut self, now: Timestamp) {
         let mut hs = HandshakePacket::new_induction_request(self.options.socket_id);
         hs.flow_window = self.flight_capacity_packets();
-        if let Some(group) = self.options.group_extension {
-            hs.add_group_extension(group);
-        }
         let pkt = hs.encode(self.relative_timestamp(now), 0);
         let mut buf = Vec::new();
         pkt.encode(&mut buf);
@@ -1972,9 +1969,6 @@ impl SrtConnection {
             encryption_field,
         );
         hs.flow_window = self.flight_capacity_packets();
-        if let Some(group) = self.options.group_extension {
-            hs.add_group_extension(group);
-        }
         let pkt = hs.encode(self.relative_timestamp(now), self.peer_socket_id);
         let mut buf = Vec::new();
         pkt.encode(&mut buf);
@@ -2628,7 +2622,7 @@ mod tests {
     }
 
     #[test]
-    fn caller_advertises_group_on_induction() {
+    fn group_extension_is_only_sent_in_conclusion() {
         let group = GroupExtensionData {
             group_id: SRTGROUP_MASK | 0x1234,
             group_type: GroupType::Backup,
@@ -2649,6 +2643,23 @@ mod tests {
         let SrtPacket::Control(control) = SrtPacket::decode(&packet).expect("valid SRT packet")
         else {
             panic!("induction must be a control packet");
+        };
+        let handshake = HandshakePacket::decode(&control).expect("valid handshake");
+        assert_eq!(handshake.get_group_extension(), None);
+
+        conn.syn_cookie = 9;
+        conn.send_conclusion_request(Timestamp::from_micros(1))
+            .expect("caller emits conclusion");
+        let packet = loop {
+            match conn.poll_output() {
+                Some(ConnectionOutput::SendPacket(packet)) => break packet,
+                Some(_) => {}
+                None => panic!("caller must emit a conclusion packet"),
+            }
+        };
+        let SrtPacket::Control(control) = SrtPacket::decode(&packet).expect("valid SRT packet")
+        else {
+            panic!("conclusion must be a control packet");
         };
         let handshake = HandshakePacket::decode(&control).expect("valid handshake");
         assert_eq!(handshake.get_group_extension(), Some(group));
