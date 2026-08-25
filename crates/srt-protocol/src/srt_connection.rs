@@ -12,8 +12,8 @@ use crate::buf::write_u32;
 use crate::crypto::{CryptoContext, KeyFlag, KeyLength};
 use crate::error::Error;
 use crate::srt_handshake::{
-    DEFAULT_FLOW_WINDOW, GroupExtensionData, HandshakePacket, HandshakeState, HandshakeType,
-    KmError, KmMessage, srt_flags,
+    DEFAULT_FLOW_WINDOW, GroupExtensionData, HS_VERSION_5, HandshakePacket, HandshakeState,
+    HandshakeType, KmError, KmMessage, SRT_MAGIC_CODE, srt_flags,
 };
 use crate::srt_packet::{ControlPacket, ControlType, DataPacket, SRT_HEADER_SIZE, SrtPacket};
 use crate::srt_receiver::ReceiverBuffer;
@@ -1267,6 +1267,20 @@ impl SrtConnection {
                     return Ok(());
                 }
 
+                // An induction response is the caller's proof that it is
+                // speaking SRT v5 rather than legacy UDT (or a rogue peer).
+                // Do this before accepting any peer identity or cookie.
+                if hs.extension_field != SRT_MAGIC_CODE {
+                    return Err(
+                        self.fail_caller_handshake("invalid SRT magic in induction response")
+                    );
+                }
+                if hs.version != HS_VERSION_5 {
+                    return Err(
+                        self.fail_caller_handshake("unsupported SRT version in induction response")
+                    );
+                }
+
                 self.syn_cookie = hs.syn_cookie;
                 self.peer_socket_id = hs.socket_id;
                 tracing::debug!(
@@ -2349,6 +2363,44 @@ mod tests {
         conn.handle_timer(TimerId::Handshake, Timestamp::from_micros(1_000_000))
             .expect("deadline processing succeeds");
         assert_eq!(conn.state(), ConnectionState::Disconnected);
+    }
+
+    #[test]
+    fn caller_rejects_induction_response_without_srt_magic() {
+        let mut caller = SrtConnection::new_caller(ConnectionOptions::default());
+        caller
+            .connect(Timestamp::from_micros(0))
+            .expect("caller starts induction");
+        let mut response = HandshakePacket::new_induction_response(42, 99, 0);
+        response.extension_field = 0;
+
+        let error = caller
+            .handle_handshake_caller(response, 0, Timestamp::from_micros(1))
+            .expect_err("rogue induction response is rejected");
+
+        assert_eq!(error.kind, crate::ErrorKind::HandshakeRejected);
+        assert!(error.reason.contains("magic"));
+        assert_eq!(caller.state(), ConnectionState::Disconnected);
+        assert_eq!(caller.peer_socket_id(), 0);
+    }
+
+    #[test]
+    fn caller_rejects_legacy_induction_response() {
+        let mut caller = SrtConnection::new_caller(ConnectionOptions::default());
+        caller
+            .connect(Timestamp::from_micros(0))
+            .expect("caller starts induction");
+        let mut response = HandshakePacket::new_induction_response(42, 99, 0);
+        response.version = 4;
+
+        let error = caller
+            .handle_handshake_caller(response, 0, Timestamp::from_micros(1))
+            .expect_err("legacy induction response is rejected");
+
+        assert_eq!(error.kind, crate::ErrorKind::HandshakeRejected);
+        assert!(error.reason.contains("version"));
+        assert_eq!(caller.state(), ConnectionState::Disconnected);
+        assert_eq!(caller.peer_socket_id(), 0);
     }
 
     #[test]
