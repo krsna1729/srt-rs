@@ -33,7 +33,7 @@ aes-kw = "0.3"
 hmac = "0.13"
 sha1 = "0.11"
 pbkdf2 = "0.13"
-getrandom = "0.3"
+getrandom = "0.4"
 zeroize = "1.8"
 # Hot-path hash for loss_list: SipHash is DoS-resistant but costly for
 # small integer keys; FxHash is non-cryptographic and faster (tokio
