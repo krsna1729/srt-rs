@@ -314,12 +314,12 @@ impl SenderBuffer {
         }
     }
 
-    /// Compute the packet send interval from the average payload size and
+    /// Compute the packet send interval from the average wire packet size and
     /// maximum bandwidth (equivalent to libsrt's
     /// `LiveCC::updatePktSndPeriod`, `srtcore/congctl.cpp`).
     fn recompute_packet_send_period(&mut self) {
-        let period_us =
-            1_000_000.0 * self.avg_payload_size / self.max_bandwidth_bytes_per_sec as f64;
+        let wire_packet_size = self.avg_payload_size + SRT_HEADER_SIZE as f64;
+        let period_us = 1_000_000.0 * wire_packet_size / self.max_bandwidth_bytes_per_sec as f64;
         self.packet_send_period = period_us.round() as u64;
     }
 
@@ -922,13 +922,13 @@ mod tests {
     }
 
     #[test]
-    fn test_packet_pacing_uses_payload_bandwidth() {
+    fn test_packet_pacing_includes_srt_header_bytes() {
         let mut buf = SenderBuffer::new(1000, 8192, 120);
         buf.set_max_bandwidth(2_000_000);
         buf.record_send_time(Timestamp::from_micros(0));
 
-        assert!(buf.time_until_send(Timestamp::from_micros(727)) > 0);
-        assert_eq!(buf.time_until_send(Timestamp::from_micros(728)), 0);
+        assert!(buf.time_until_send(Timestamp::from_micros(735)) > 0);
+        assert_eq!(buf.time_until_send(Timestamp::from_micros(736)), 0);
     }
 
     #[test]
