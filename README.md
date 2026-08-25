@@ -1,8 +1,6 @@
 # srt-rs
 
 [![CI](https://github.com/krsna1729/srt-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/krsna1729/srt-rs/actions/workflows/ci.yml)
-[![crates.io](https://img.shields.io/crates/v/shiguredo_srt.svg)](https://crates.io/crates/shiguredo_srt)
-[![docs.rs](https://docs.rs/shiguredo_srt/badge.svg)](https://docs.rs/shiguredo_srt)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 Pure-Rust SRT (Secure Reliable Transport) workspace: a sans-I/O protocol
