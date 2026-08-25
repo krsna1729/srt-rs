@@ -65,6 +65,19 @@ impl SrtPacket {
     }
 }
 
+/// Read the destination SRT Socket ID from a complete SRT header.
+///
+/// Applications multiplexing SRT connections over a shared UDP socket use
+/// this field to select the receiving physical leg before passing the packet
+/// to that leg's protocol state machine. This only inspects the fixed header;
+/// it does not decode or copy a payload.
+pub fn peek_destination_socket_id(buf: &[u8]) -> Result<u32, Error> {
+    Error::check_buffer_size(SRT_HEADER_SIZE, buf)?;
+    Ok(u32::from_be_bytes(
+        buf[12..16].try_into().expect("fixed header slice"),
+    ))
+}
+
 /// パケット位置フラグ (PP)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PacketPosition {
@@ -390,6 +403,25 @@ mod tests {
         };
 
         assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn peek_destination_socket_id_reads_the_fixed_header_only() {
+        let packet = ControlPacket {
+            control_type: ControlType::Ack,
+            subtype: 0,
+            type_specific_info: 0,
+            timestamp: 0,
+            dest_socket_id: 0xABCD_1234,
+            control_info: vec![0; 1500],
+        };
+        let mut bytes = Vec::new();
+        packet.encode(&mut bytes);
+        assert_eq!(
+            peek_destination_socket_id(&bytes).expect("complete header"),
+            0xABCD_1234
+        );
+        assert!(peek_destination_socket_id(&bytes[..15]).is_err());
     }
 
     #[test]

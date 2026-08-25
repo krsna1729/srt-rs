@@ -61,7 +61,6 @@ use std::collections::hash_map::Entry as HashEntry;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::hash::Hash;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use zeroize::Zeroize;
@@ -697,6 +696,7 @@ pub fn is_ordered_close(reason: &str) -> bool {
 }
 
 pub struct AdmissionPeer {
+    logical_peer: LogicalPeerId,
     pub conn: SrtConnection,
     pub timers: ManualTimerStore,
     /// Live connected state, feeding `srt_lifecycle::is_terminal`. Goes
@@ -978,27 +978,19 @@ pub enum Admit {
     Dropped(AdmissionDropReason),
 }
 
-/// Stable application-facing identity for one admitted SRT publisher.
+/// Stable, process-local application handle for one logical SRT connection.
 ///
-/// A direct connection keeps its socket address. A bonded publisher uses its
-/// wire group ID plus normalized StreamID, which remains stable if its first
-/// physical leg disappears while another is still carrying media.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum LogicalPeerId {
+/// It deliberately does not expose a UDP address, a physical SRT Socket ID,
+/// a wire group ID, or the caller-provided StreamID. One direct connection and
+/// one bonded group are both represented by exactly one handle. Retain this
+/// value from [`AdmissionEvent::logical_peer`] for steady-state operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LogicalPeerId(u64);
+
+#[derive(Clone)]
+enum LogicalPeerTarget {
     Direct(std::net::SocketAddr),
-    Group(Arc<srt_lifecycle::LogicalGroupKey>),
-}
-
-impl LogicalPeerId {
-    #[must_use]
-    pub const fn direct(peer: std::net::SocketAddr) -> Self {
-        Self::Direct(peer)
-    }
-
-    #[must_use]
-    pub fn group(key: srt_lifecycle::LogicalGroupKey) -> Self {
-        Self::Group(Arc::new(key))
-    }
+    Group(srt_lifecycle::LogicalGroupKey),
 }
 
 /// Snapshot of a direct or bonded logical peer.
@@ -1026,25 +1018,25 @@ impl LogicalPeer<'_> {
 
     #[must_use]
     pub fn stream_id(&self) -> Option<&str> {
-        match &self.id {
-            LogicalPeerId::Direct(peer) => self
+        match self.table.logical_peers.get(&self.id)? {
+            LogicalPeerTarget::Direct(peer) => self
                 .table
                 .peers
                 .get(peer)
                 .and_then(|entry| entry.conn.peer_stream_id()),
-            LogicalPeerId::Group(key) => key.stream_id.as_deref(),
+            LogicalPeerTarget::Group(key) => key.stream_id.as_deref(),
         }
     }
 
     #[must_use]
     pub fn stats(&self) -> Option<LogicalPeerStats> {
-        match &self.id {
-            LogicalPeerId::Direct(peer) => self
+        match self.table.logical_peers.get(&self.id)? {
+            LogicalPeerTarget::Direct(peer) => self
                 .table
                 .peers
                 .get(peer)
                 .map(|entry| LogicalPeerStats::Direct(Box::new(entry.conn.stats()))),
-            LogicalPeerId::Group(key) => self.table.groups.get(key.as_ref()).map(|group| {
+            LogicalPeerTarget::Group(key) => self.table.groups.get(key).map(|group| {
                 LogicalPeerStats::Group(Box::new(group_connection_stats(
                     &group.group,
                     GroupLogicalCounters {
@@ -1080,13 +1072,13 @@ impl LogicalPeerMut<'_> {
 
     #[must_use]
     pub fn stream_id(&self) -> Option<&str> {
-        match &self.id {
-            LogicalPeerId::Direct(peer) => self
+        match self.table.logical_peers.get(&self.id)? {
+            LogicalPeerTarget::Direct(peer) => self
                 .table
                 .peers
                 .get(peer)
                 .and_then(|entry| entry.conn.peer_stream_id()),
-            LogicalPeerId::Group(key) => key.stream_id.as_deref(),
+            LogicalPeerTarget::Group(key) => key.stream_id.as_deref(),
         }
     }
 
@@ -1100,37 +1092,38 @@ impl LogicalPeerMut<'_> {
     /// Whether a send can be accepted without violating the group's
     /// Broadcast or Backup semantics.
     pub fn can_send(&mut self) -> bool {
-        match &self.id {
-            LogicalPeerId::Direct(peer) => self
+        match self.table.logical_peers.get(&self.id) {
+            Some(LogicalPeerTarget::Direct(peer)) => self
                 .table
                 .peers
                 .get(peer)
                 .is_some_and(|entry| entry.conn.can_send()),
-            LogicalPeerId::Group(key) => self
+            Some(LogicalPeerTarget::Group(key)) => self
                 .table
                 .groups
-                .get_mut(key.as_ref())
+                .get_mut(key)
                 .is_some_and(|group| group.group.can_send()),
+            None => false,
         }
     }
 
     /// Send one logical payload. Broadcast returns one successful physical
     /// leg per healthy active member; Backup returns one selected leg.
     pub fn send(&mut self, payload: &[u8], now: Timestamp) -> Result<usize, shiguredo_srt::Error> {
-        match &self.id {
-            LogicalPeerId::Direct(peer) => {
-                let entry = self.table.peers.get_mut(peer).ok_or_else(|| {
+        match self.table.logical_peers.get(&self.id).cloned() {
+            Some(LogicalPeerTarget::Direct(peer)) => {
+                let entry = self.table.peers.get_mut(&peer).ok_or_else(|| {
                     shiguredo_srt::Error::with_reason(
                         shiguredo_srt::ErrorKind::InvalidState,
                         "logical peer no longer exists",
                     )
                 })?;
                 entry.conn.send(payload, now)?;
-                self.table.mark_ready(*peer);
+                self.table.mark_ready(peer);
                 Ok(1)
             }
-            LogicalPeerId::Group(key) => {
-                let group = self.table.groups.get_mut(key.as_ref()).ok_or_else(|| {
+            Some(LogicalPeerTarget::Group(key)) => {
+                let group = self.table.groups.get_mut(&key).ok_or_else(|| {
                     shiguredo_srt::Error::with_reason(
                         shiguredo_srt::ErrorKind::InvalidState,
                         "logical peer no longer exists",
@@ -1143,6 +1136,10 @@ impl LogicalPeerMut<'_> {
                     .saturating_add(payload.len() as u64);
                 Ok(legs)
             }
+            None => Err(shiguredo_srt::Error::with_reason(
+                shiguredo_srt::ErrorKind::InvalidState,
+                "logical peer no longer exists",
+            )),
         }
     }
 
@@ -1150,26 +1147,27 @@ impl LogicalPeerMut<'_> {
     /// the table until the usual transport lifecycle reaches its terminal
     /// state.
     pub fn disconnect(&mut self, now: Timestamp) {
-        match &self.id {
-            LogicalPeerId::Direct(peer) => {
-                if let Some(entry) = self.table.peers.get_mut(peer) {
+        match self.table.logical_peers.get(&self.id).cloned() {
+            Some(LogicalPeerTarget::Direct(peer)) => {
+                if let Some(entry) = self.table.peers.get_mut(&peer) {
                     entry.conn.disconnect(now);
-                    self.table.mark_ready(*peer);
+                    self.table.mark_ready(peer);
                 }
             }
-            LogicalPeerId::Group(key) => {
-                if let Some(group) = self.table.groups.get_mut(key.as_ref()) {
+            Some(LogicalPeerTarget::Group(key)) => {
+                if let Some(group) = self.table.groups.get_mut(&key) {
                     group.group.disconnect(now);
                 }
             }
+            None => {}
         }
     }
 }
 
 /// One logical ingress event emitted by an admitted peer or bonded group.
 ///
-/// For an opted-in bonded publisher, `peer` is its first admitted leg and
-/// `logical_peer` is the stable session identity. `DataReceived` has already
+/// For an opted-in bonded publisher, `representative_peer` is its first
+/// admitted leg and `logical_peer` is the stable session identity. `DataReceived` has already
 /// been ordered and deduplicated across legs.
 /// Otherwise this is the unmodified protocol event. Production consumers
 /// should use [`PeerTable::poll_events`]; the benchmark-only
@@ -1177,7 +1175,8 @@ impl LogicalPeerMut<'_> {
 /// promotion timing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdmissionEvent {
-    pub peer: std::net::SocketAddr,
+    /// Wire diagnostic only; never use this as an application session key.
+    pub representative_peer: std::net::SocketAddr,
     pub logical_peer: LogicalPeerId,
     pub event: ConnectionEvent,
 }
@@ -1219,6 +1218,8 @@ struct GroupMemberHandle {
 /// live protocol state, which that crate deliberately does not.
 pub struct PeerTable {
     peers: HashMap<std::net::SocketAddr, AdmissionPeer>,
+    logical_peers: HashMap<LogicalPeerId, LogicalPeerTarget>,
+    next_logical_peer: u64,
     source_counts: HashMap<std::net::IpAddr, usize>,
     half_open_peers: usize,
     established_peers: usize,
@@ -1254,6 +1255,8 @@ impl PeerTable {
         config.max_peers_per_ip = config.max_peers_per_ip.max(1).min(config.max_peers);
         Self {
             peers: HashMap::new(),
+            logical_peers: HashMap::new(),
+            next_logical_peer: 1,
             source_counts: HashMap::new(),
             half_open_peers: 0,
             established_peers: 0,
@@ -1268,6 +1271,13 @@ impl PeerTable {
             last_now: Timestamp::default(),
             config,
         }
+    }
+
+    fn allocate_logical_peer(&mut self, target: LogicalPeerTarget) -> LogicalPeerId {
+        let id = LogicalPeerId(self.next_logical_peer);
+        self.next_logical_peer = self.next_logical_peer.wrapping_add(1).max(1);
+        self.logical_peers.insert(id, target);
+        id
     }
 
     fn detach_peer_for_group(&mut self, peer: &std::net::SocketAddr) -> Option<AdmissionPeer> {
@@ -1322,6 +1332,7 @@ impl PeerTable {
         let key = affinity.logical_key();
         let member_id = entry.conn.peer_socket_id();
         let weight = extension.weight;
+        let logical_peer = entry.logical_peer;
 
         if !self.groups.contains_key(&key) {
             let group = shiguredo_srt::SrtGroup::new(extension.group_id, mode)
@@ -1332,7 +1343,7 @@ impl PeerTable {
                     group,
                     legs: HashMap::new(),
                     representative_peer: peer,
-                    logical_peer: LogicalPeerId::group(key.clone()),
+                    logical_peer,
                     connected: false,
                     stream_deadline: None,
                     data_events: 0,
@@ -1344,6 +1355,13 @@ impl PeerTable {
                     logical_payload_bytes_sent: 0,
                 },
             );
+            self.logical_peers
+                .insert(logical_peer, LogicalPeerTarget::Group(key.clone()));
+        } else {
+            // This physical leg was briefly a direct peer only while its
+            // handshake completed. The existing group's handle remains the
+            // sole application-visible logical identity.
+            self.logical_peers.remove(&logical_peer);
         }
 
         let entry = self
@@ -1681,6 +1699,8 @@ impl PeerTable {
             }
         }
 
+        let new_logical_peer =
+            (!known).then(|| self.allocate_logical_peer(LogicalPeerTarget::Direct(peer)));
         let (fed, feed_error_kind, inserted, became_established, became_terminal) = {
             let mut inserted = false;
             let entry = self.peers.entry(peer).or_insert_with(|| {
@@ -1701,6 +1721,8 @@ impl PeerTable {
                     u64::try_from(options.handshake_timeout.as_micros()).unwrap_or(u64::MAX),
                 );
                 AdmissionPeer {
+                    logical_peer: new_logical_peer
+                        .expect("only an unknown peer can allocate an admission entry"),
                     conn,
                     timers: ManualTimerStore::new(),
                     connected: false,
@@ -1992,8 +2014,8 @@ impl PeerTable {
             };
             while let Some(event) = entry.conn.poll_event() {
                 out.push(AdmissionEvent {
-                    peer,
-                    logical_peer: LogicalPeerId::Direct(peer),
+                    representative_peer: peer,
+                    logical_peer: entry.logical_peer,
                     event,
                 });
             }
@@ -2005,8 +2027,8 @@ impl PeerTable {
                         if !group.connected {
                             group.connected = true;
                             out.push(AdmissionEvent {
-                                peer: group.representative_peer,
-                                logical_peer: group.logical_peer.clone(),
+                                representative_peer: group.representative_peer,
+                                logical_peer: group.logical_peer,
                                 event: ConnectionEvent::Connected,
                             });
                         }
@@ -2020,8 +2042,8 @@ impl PeerTable {
                             .logical_payload_bytes_received
                             .saturating_add(packet.payload.len() as u64);
                         out.push(AdmissionEvent {
-                            peer: group.representative_peer,
-                            logical_peer: group.logical_peer.clone(),
+                            representative_peer: group.representative_peer,
+                            logical_peer: group.logical_peer,
                             event: ConnectionEvent::DataReceived {
                                 payload: packet.payload,
                                 sequence_number: packet.sequence_number,
@@ -2041,8 +2063,8 @@ impl PeerTable {
                         group.connected = false;
                         group.torn_down |= !is_ordered_close(&error);
                         out.push(AdmissionEvent {
-                            peer: group.representative_peer,
-                            logical_peer: group.logical_peer.clone(),
+                            representative_peer: group.representative_peer,
+                            logical_peer: group.logical_peer,
                             event: ConnectionEvent::Disconnected { reason: error },
                         });
                     }
@@ -2068,7 +2090,7 @@ impl PeerTable {
         self.poll_events(&mut events);
         let deadline = Instant::now() + stream_len;
         for admission_event in events {
-            let peer = admission_event.peer;
+            let peer = admission_event.representative_peer;
             let connected = matches!(&admission_event.event, ConnectionEvent::Connected);
             if let Some(entry) = self.peers.get_mut(&peer) {
                 if entry.apply_event(admission_event.event) {
@@ -2115,18 +2137,16 @@ impl PeerTable {
     /// representative socket address as a session key.
     #[must_use]
     pub fn logical_peer(&self, id: &LogicalPeerId) -> Option<LogicalPeer<'_>> {
-        match id {
-            LogicalPeerId::Direct(peer) if self.peers.contains_key(peer) => Some(LogicalPeer {
+        match self.logical_peers.get(id)? {
+            LogicalPeerTarget::Direct(peer) if self.peers.contains_key(peer) => Some(LogicalPeer {
                 table: self,
-                id: id.clone(),
+                id: *id,
             }),
-            LogicalPeerId::Group(key) if self.groups.contains_key(key.as_ref()) => {
-                Some(LogicalPeer {
-                    table: self,
-                    id: id.clone(),
-                })
-            }
-            LogicalPeerId::Direct(_) | LogicalPeerId::Group(_) => None,
+            LogicalPeerTarget::Group(key) if self.groups.contains_key(key) => Some(LogicalPeer {
+                table: self,
+                id: *id,
+            }),
+            LogicalPeerTarget::Direct(_) | LogicalPeerTarget::Group(_) => None,
         }
     }
 
@@ -2136,13 +2156,14 @@ impl PeerTable {
         self.logical_peer(id)?;
         Some(LogicalPeerMut {
             table: self,
-            id: id.clone(),
+            id: *id,
         })
     }
 
     pub fn remove(&mut self, peer: &std::net::SocketAddr) -> Option<AdmissionPeer> {
         if let Some(handle) = self.group_peers.get(peer).cloned() {
             let mut group = self.groups.remove(&handle.key)?;
+            self.logical_peers.remove(&group.logical_peer);
             let mut returned = None;
             for (member_id, leg) in std::mem::take(&mut group.legs) {
                 let conn = group
@@ -2160,6 +2181,7 @@ impl PeerTable {
                 }
                 if leg.peer == *peer {
                     returned = Some(AdmissionPeer {
+                        logical_peer: group.logical_peer,
                         conn,
                         timers: leg.timers,
                         connected: group.connected,
@@ -2181,6 +2203,7 @@ impl PeerTable {
         self.event_ready_set.remove(peer);
         let removed = self.peers.remove(peer);
         if let Some(entry) = &removed {
+            self.logical_peers.remove(&entry.logical_peer);
             if entry.admission_established {
                 self.established_peers = self.established_peers.saturating_sub(1);
             } else {
@@ -2974,18 +2997,10 @@ mod tests {
 
         let mut events = Vec::new();
         table.poll_events(&mut events);
-        assert_eq!(
-            events,
-            vec![AdmissionEvent {
-                peer: first,
-                logical_peer: LogicalPeerId::group(srt_lifecycle::LogicalGroupKey {
-                    group_id,
-                    stream_id: Some("publish:bonded".to_string()),
-                }),
-                event: ConnectionEvent::Connected
-            }]
-        );
-        let logical_peer = events[0].logical_peer.clone();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].representative_peer, first);
+        assert!(matches!(events[0].event, ConnectionEvent::Connected));
+        let logical_peer = events[0].logical_peer;
         assert_eq!(
             table
                 .logical_peer(&logical_peer)
@@ -3062,7 +3077,7 @@ mod tests {
 
         table.poll_events(&mut events);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].peer, first);
+        assert_eq!(events[0].representative_peer, first);
         assert!(matches!(
             &events[0].event,
             ConnectionEvent::DataReceived { payload, .. } if payload == b"one logical payload"
@@ -3181,12 +3196,14 @@ mod tests {
 
         let mut events = Vec::new();
         table.poll_events(&mut events);
-        let logical_peer = LogicalPeerId::Direct(peer);
-        assert!(events.iter().any(|event| {
-            event.peer == peer
-                && event.logical_peer == logical_peer
-                && matches!(event.event, ConnectionEvent::Connected)
-        }));
+        let logical_peer = events
+            .iter()
+            .find(|event| {
+                event.representative_peer == peer
+                    && matches!(event.event, ConnectionEvent::Connected)
+            })
+            .expect("direct connected event")
+            .logical_peer;
         let mut direct = table
             .logical_peer_mut(&logical_peer)
             .expect("direct logical peer exists");
@@ -3257,17 +3274,9 @@ mod tests {
 
             let mut events = Vec::new();
             table.poll_events(&mut events);
-            prop_assert_eq!(
-                events,
-                vec![AdmissionEvent {
-                    peer: first,
-                    logical_peer: LogicalPeerId::group(srt_lifecycle::LogicalGroupKey {
-                        group_id,
-                        stream_id: Some("publish:property-group".to_string()),
-                    }),
-                    event: ConnectionEvent::Connected,
-                }]
-            );
+            prop_assert_eq!(events.len(), 1);
+            prop_assert_eq!(events[0].representative_peer, first);
+            prop_assert!(matches!(events[0].event, ConnectionEvent::Connected));
             let stats = table.bonded_stats();
             prop_assert_eq!(stats.len(), 1);
             prop_assert_eq!(stats[0].connection.group_id, group_id);
