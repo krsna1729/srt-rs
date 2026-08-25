@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 pub use srt_transport::is_ordered_close;
 pub mod runtimes;
 
-pub const INTEROP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 // --- Shared constants across all bench-caller/bench-listener binaries ---
 
@@ -699,7 +699,7 @@ impl SharedSender {
             slots,
             payload: vec![0x42; PAYLOAD_SIZE],
             start,
-            connect_deadline: start + INTEROP_CONNECT_TIMEOUT,
+            connect_deadline: start + CONNECT_TIMEOUT,
         }
     }
 

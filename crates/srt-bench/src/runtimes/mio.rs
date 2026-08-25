@@ -349,7 +349,7 @@ fn drive(cfg: BenchConfig, mine: Vec<usize>, start: Instant) -> Vec<ConnStats> {
 
     // Senders stream at the target bitrate once connected.
     let payload = vec![0x42u8; crate::PAYLOAD_SIZE];
-    let connect_deadline = Instant::now() + crate::INTEROP_CONNECT_TIMEOUT;
+    let connect_deadline = Instant::now() + crate::CONNECT_TIMEOUT;
     let mut buf = [0u8; 2048];
 
     loop {
@@ -371,7 +371,7 @@ fn drive(cfg: BenchConfig, mine: Vec<usize>, start: Instant) -> Vec<ConnStats> {
                             .map(|dl| Instant::now() >= dl)
                             .unwrap_or(false)
                     } else {
-                        d.started_at.elapsed() >= crate::INTEROP_CONNECT_TIMEOUT
+                        d.started_at.elapsed() >= crate::CONNECT_TIMEOUT
                     }
                 });
         if all_done {
@@ -386,7 +386,7 @@ fn drive(cfg: BenchConfig, mine: Vec<usize>, start: Instant) -> Vec<ConnStats> {
         //
         // Only handshakes still *within* their connect window count as
         // occupying a slot. A handshake that has blown past
-        // INTEROP_CONNECT_TIMEOUT is never going to complete, and holding
+        // CONNECT_TIMEOUT is never going to complete, and holding
         // a slot for it stalls every remaining connection behind it --
         // with `connect_concurrency=1` that is a total deadlock, and it
         // was observed as exactly that (a run that started 9 connections,
@@ -394,7 +394,7 @@ fn drive(cfg: BenchConfig, mine: Vec<usize>, start: Instant) -> Vec<ConnStats> {
         while next_to_start < mine.len() {
             let in_flight = drivers
                 .iter()
-                .filter(|d| !d.connected && d.started_at.elapsed() < crate::INTEROP_CONNECT_TIMEOUT)
+                .filter(|d| !d.connected && d.started_at.elapsed() < crate::CONNECT_TIMEOUT)
                 .count();
             if in_flight >= cfg.connect_concurrency {
                 break;
@@ -666,7 +666,7 @@ fn run_bonded_shared_pool(cfg: BenchConfig) {
     let mut peers = srt_transport::PeerTable::new();
     let admission = cfg.admission_options(std::process::id(), false);
     let telemetry = srt_transport::IngressTelemetry::new();
-    let connect_deadline = Instant::now() + crate::INTEROP_CONNECT_TIMEOUT;
+    let connect_deadline = Instant::now() + crate::CONNECT_TIMEOUT;
     let stream_len = Duration::from_secs_f64(cfg.duration_secs);
     let run_deadline = Instant::now() + stream_len + IDLE_GRACE + Duration::from_secs(30);
     let mut buf = [0u8; 2048];
@@ -776,7 +776,7 @@ fn run_shared_pool_shard(
     let expected_connections = (0..cfg.connections)
         .filter(|connection| mine.contains(&(connection % pool_sockets)))
         .count();
-    let connect_deadline = Instant::now() + crate::INTEROP_CONNECT_TIMEOUT;
+    let connect_deadline = Instant::now() + crate::CONNECT_TIMEOUT;
     let stream_len = Duration::from_secs_f64(cfg.duration_secs);
     let run_deadline = Instant::now() + stream_len + IDLE_GRACE + Duration::from_secs(30);
     let mut buf = [0u8; 2048];
@@ -1128,7 +1128,7 @@ fn run_pool_acceptor(
     // see `service_slot_event`'s doc for why this matters at #4's scale.
     let mut token_index: HashMap<usize, usize> = HashMap::new();
     let mut next_token: usize = 1;
-    let connect_deadline = Instant::now() + crate::INTEROP_CONNECT_TIMEOUT;
+    let connect_deadline = Instant::now() + crate::CONNECT_TIMEOUT;
     let stream_len = Duration::from_secs_f64(cfg.duration_secs);
     // Absolute safety net so a hung peer or a stuck protocol state can
     // never wedge this thread forever, no matter what `is_terminal`
@@ -1644,7 +1644,7 @@ fn run_single_acceptor(
     }
 
     let mut pending: HashMap<SocketAddr, Pending> = HashMap::new();
-    let connect_deadline = Instant::now() + crate::INTEROP_CONNECT_TIMEOUT;
+    let connect_deadline = Instant::now() + crate::CONNECT_TIMEOUT;
     let mut admit_batch = RecvBatch::new();
     let mut buf = [0u8; 2048];
     let mut per_worker_count = vec![0usize; senders.len()];
@@ -1694,7 +1694,7 @@ fn run_single_acceptor(
         let mut promote = Vec::new();
         let mut stale = Vec::new();
         for (peer, p) in pending.iter_mut() {
-            if p.created_at.elapsed() >= crate::INTEROP_CONNECT_TIMEOUT {
+            if p.created_at.elapsed() >= crate::CONNECT_TIMEOUT {
                 stale.push(*peer);
                 continue;
             }
@@ -1816,11 +1816,8 @@ fn run_worker(
     // No admission here, so no connect_deadline of its own to wait on --
     // just a generous absolute safety net plus the acceptor's own
     // `Finished` signal telling it precisely when no more are coming.
-    let run_deadline = Instant::now()
-        + crate::INTEROP_CONNECT_TIMEOUT
-        + stream_len
-        + IDLE_GRACE
-        + Duration::from_secs(30);
+    let run_deadline =
+        Instant::now() + crate::CONNECT_TIMEOUT + stream_len + IDLE_GRACE + Duration::from_secs(30);
     let mut expected: Option<usize> = None;
     let mut buf = [0u8; 2048];
 

@@ -40,7 +40,7 @@ fn ts(micros: u64) -> Timestamp {
 /// a `while let Some(ConnectionOutput::SendPacket(data)) = conn.poll_output()`
 /// filter silently drops (and stops the loop at) the first `SetTimer`/
 /// `ClearTimer` entry it meets -- orphaning any `SendPacket`s still queued
-/// behind it. Matches the drain pattern `crates/srt-interop/src/driver.rs`
+/// behind it. Matches the drain pattern `crates/srt-bench/src/driver.rs`
 /// already uses for exactly this reason.
 fn drain_sent(conn: &mut SrtConnection) -> Vec<Vec<u8>> {
     let mut sent = Vec::new();

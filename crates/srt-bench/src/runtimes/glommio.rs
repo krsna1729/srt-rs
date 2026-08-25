@@ -259,7 +259,7 @@ async fn sender_task(
     let payload = vec![0x42u8; crate::PAYLOAD_SIZE];
     let mut stats = ConnStats::default();
     let mut stream_deadline: Option<Instant> = None;
-    let connect_deadline = start + crate::INTEROP_CONNECT_TIMEOUT;
+    let connect_deadline = start + crate::CONNECT_TIMEOUT;
     let mut buf = [0u8; 2048];
 
     loop {
@@ -379,7 +379,7 @@ async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> Co
 
     let mut stats = ConnStats::default();
     let mut stream_deadline: Option<Instant> = None;
-    let connect_deadline = Instant::now() + crate::INTEROP_CONNECT_TIMEOUT;
+    let connect_deadline = Instant::now() + crate::CONNECT_TIMEOUT;
     let mut handshook = false;
     let mut buf = [0u8; 2048];
 
@@ -577,7 +577,7 @@ async fn run_acceptor(
     let mut peers = srt_transport::PeerTable::new();
     let admission = cfg.admission_options(std::process::id(), cfg.cookie_routing);
     let mut tasks: Vec<glommio::Task<ConnStats>> = Vec::new();
-    let connect_deadline = Instant::now() + crate::INTEROP_CONNECT_TIMEOUT;
+    let connect_deadline = Instant::now() + crate::CONNECT_TIMEOUT;
     let stream_len = Duration::from_secs_f64(cfg.duration_secs);
     let run_deadline = Instant::now() + stream_len + IDLE_GRACE + Duration::from_secs(30);
 
@@ -971,7 +971,7 @@ async fn serve_pool_socket(cfg: BenchConfig, index: usize, start: Instant) -> Ve
     // No SO_REUSEPORT group here, so nothing can rehash and there is
     // nowhere to forward to: one worker, cookie routing inert.
     let admission = cfg.admission_options(std::process::id(), false);
-    let connect_deadline = Instant::now() + crate::INTEROP_CONNECT_TIMEOUT;
+    let connect_deadline = Instant::now() + crate::CONNECT_TIMEOUT;
     let stream_len = Duration::from_secs_f64(cfg.duration_secs);
     let run_deadline = Instant::now() + stream_len + IDLE_GRACE + Duration::from_secs(30);
     let mut buf = [0u8; 2048];
@@ -1139,7 +1139,7 @@ async fn run_single_acceptor(
     // nobody a stray CONCLUSION could need forwarding to.
     let admission = cfg.admission_options(std::process::id(), false);
     let telemetry = srt_transport::IngressTelemetry::new();
-    let connect_deadline = Instant::now() + crate::INTEROP_CONNECT_TIMEOUT;
+    let connect_deadline = Instant::now() + crate::CONNECT_TIMEOUT;
     let stream_len = Duration::from_secs_f64(cfg.duration_secs);
     let mut routed = 0usize;
     let mut buf = [0u8; 2048];
@@ -1230,7 +1230,7 @@ async fn run_pool_worker(
     let mut expected: Option<usize> = None;
     let mut received = 0usize;
     let deadline = Instant::now()
-        + crate::INTEROP_CONNECT_TIMEOUT
+        + crate::CONNECT_TIMEOUT
         + Duration::from_secs_f64(cfg.duration_secs)
         + IDLE_GRACE
         + Duration::from_secs(30);
