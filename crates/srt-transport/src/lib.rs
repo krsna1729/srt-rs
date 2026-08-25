@@ -2476,6 +2476,19 @@ impl PeerTable {
     }
 }
 
+impl IntoIterator for PeerTable {
+    type Item = (std::net::SocketAddr, AdmissionPeer);
+    type IntoIter = std::vec::IntoIter<Self::Item>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.peers
+            .into_iter()
+            .map(|(physical, peer)| (physical.address, peer))
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+}
+
 /// Per-peer entropy for the upper bits of a SYN cookie, so cookies differ
 /// per connection instead of being one constant per worker.
 /// Is this datagram a CONTROL packet?
@@ -2961,8 +2974,22 @@ impl SharedCallerPool {
     }
 
     #[must_use]
+    pub fn time_until_next_deadline(&self, now: Timestamp, default_micros: u64) -> u64 {
+        self.legs
+            .values()
+            .map(|leg| leg.timers.time_until_earliest(now, default_micros))
+            .min()
+            .unwrap_or(default_micros)
+    }
+
+    #[must_use]
     pub fn len(&self) -> usize {
         self.legs.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.legs.is_empty()
     }
 }
 
@@ -3244,25 +3271,26 @@ mod tests {
         );
         assert_eq!(table.bonded_stats()[0].connection.legs.len(), 2);
 
-        let mut group = table
-            .logical_peer_mut(&logical_peer)
-            .expect("logical group exists");
-        assert!(group.can_send());
-        assert_eq!(
-            group
-                .send(b"one logical reply", Timestamp::from_micros(3))
-                .expect("group sends on every active Broadcast leg"),
-            2
-        );
-        let group_stats = group.stats().expect("group stats remain available");
-        assert!(matches!(
-            group_stats,
-            LogicalPeerStats::Group(stats)
-                if stats.aggregate.logical_payloads_sent == 1
-                    && stats.aggregate.logical_payload_bytes_sent == 17
-                    && stats.legs.len() == 2
-        ));
-        drop(group);
+        {
+            let mut group = table
+                .logical_peer_mut(&logical_peer)
+                .expect("logical group exists");
+            assert!(group.can_send());
+            assert_eq!(
+                group
+                    .send(b"one logical reply", Timestamp::from_micros(3))
+                    .expect("group sends on every active Broadcast leg"),
+                2
+            );
+            let group_stats = group.stats().expect("group stats remain available");
+            assert!(matches!(
+                group_stats,
+                LogicalPeerStats::Group(stats)
+                    if stats.aggregate.logical_payloads_sent == 1
+                        && stats.aggregate.logical_payload_bytes_sent == 17
+                        && stats.legs.len() == 2
+            ));
+        }
 
         let mut outbound = Vec::new();
         table.poll_outbound(Timestamp::from_micros(3), &mut outbound);
@@ -3438,20 +3466,21 @@ mod tests {
             })
             .expect("direct connected event")
             .logical_peer;
-        let mut direct = table
-            .logical_peer_mut(&logical_peer)
-            .expect("direct logical peer exists");
-        assert_eq!(direct.stream_id(), Some("publish:direct"));
-        assert!(direct.can_send());
-        assert_eq!(
-            direct
-                .send(b"direct reply", Timestamp::from_micros(3))
-                .expect("direct logical send"),
-            1
-        );
-        assert!(matches!(direct.stats(), Some(LogicalPeerStats::Direct(_))));
-        direct.disconnect(Timestamp::from_micros(4));
-        drop(direct);
+        {
+            let mut direct = table
+                .logical_peer_mut(&logical_peer)
+                .expect("direct logical peer exists");
+            assert_eq!(direct.stream_id(), Some("publish:direct"));
+            assert!(direct.can_send());
+            assert_eq!(
+                direct
+                    .send(b"direct reply", Timestamp::from_micros(3))
+                    .expect("direct logical send"),
+                1
+            );
+            assert!(matches!(direct.stats(), Some(LogicalPeerStats::Direct(_))));
+            direct.disconnect(Timestamp::from_micros(4));
+        }
 
         let mut outbound = Vec::new();
         table.poll_outbound(Timestamp::from_micros(4), &mut outbound);

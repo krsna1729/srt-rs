@@ -14,6 +14,7 @@
 //!
 //! A sweep, one child process per role per cell:
 //!   srt-bench matrix --runtimes mio,tokio --ingress reuseport-multi:4 \
+//!     --egress per-connection,shared-socket \
 //!     --encryption plain,128,192,256 --promotion never,all \
 //!     --connections 25,150 --reps 3 --out results.tsv
 //!   srt-bench matrix --plan docs/plans/full-matrix.plan \

@@ -74,6 +74,7 @@ pub const COLUMNS: &[&str] = &[
     "encryption",
     "role",
     "ingress",
+    "egress",
     "promotion",
     "cookie",
     "batch",
@@ -208,6 +209,10 @@ pub fn append_result(
             Mode::Receiver => "listener".into(),
         },
         describe_ingress(cfg.ingress),
+        match cfg.egress {
+            crate::Egress::PerConnection => "per-connection".into(),
+            crate::Egress::SharedSocket => "shared-socket".into(),
+        },
         format!("{:?}", cfg.promotion).to_lowercase(),
         if cfg.cookie_routing { "on" } else { "off" }.into(),
         match cfg.batching {
@@ -647,6 +652,24 @@ fn representative<'a>(axes: &'a [Axis], name: &str, preferred: &str) -> Option<&
         .map(String::as_str)
 }
 
+fn representative_for_role<'a>(
+    axes: &'a [Axis],
+    name: &str,
+    role: Scope,
+    preferred: &str,
+) -> Option<&'a str> {
+    let values = axes
+        .iter()
+        .find(|(axis, scope, _)| *axis == name && (*scope == role || *scope == Scope::Both))
+        .map(|(_, _, values)| values.as_slice())
+        .unwrap_or_default();
+    values
+        .iter()
+        .find(|candidate| candidate.as_str() == preferred)
+        .or_else(|| values.first())
+        .map(String::as_str)
+}
+
 fn cell_value<'a>(cell: &'a Cell<'_>, name: &str, scope: Option<Scope>) -> Option<&'a str> {
     cell.iter()
         .find(|(axis, cell_scope, _)| {
@@ -673,6 +696,7 @@ fn bond_pairs(value: &str) -> Option<usize> {
 /// one-value plan still runs as written.
 fn filter_reason(cell: &Cell<'_>, axes: &[Axis]) -> Option<&'static str> {
     let ingress = role_value(cell, "ingress", Scope::Recv).unwrap_or("per-port");
+    let egress = role_value(cell, "egress", Scope::Send).unwrap_or("per-connection");
     let runtime_recv = role_value(cell, "runtime", Scope::Recv).unwrap_or("mio");
     let runtime_send = role_value(cell, "runtime", Scope::Send).unwrap_or(runtime_recv);
     let promotion = cell_value(cell, "promotion", Some(Scope::Both));
@@ -682,6 +706,29 @@ fn filter_reason(cell: &Cell<'_>, axes: &[Axis]) -> Option<&'static str> {
     let bond = cell_value(cell, "bond", Some(Scope::Both));
     let connections = cell_value(cell, "connections", Some(Scope::Both))
         .and_then(|value| value.parse::<usize>().ok());
+    let connect_concurrency = cell_value(cell, "connect-concurrency", Some(Scope::Both));
+    let send_workers = role_value(cell, "workers", Scope::Send);
+
+    // A shared caller socket drives all handshakes from one readiness loop;
+    // per-connection launch concurrency cannot alter that implementation.
+    if egress == "shared-socket"
+        && let Some(value) = connect_concurrency
+        && let Some(keep) = representative(axes, "connect-concurrency", "1")
+        && value != keep
+    {
+        return Some("connect-concurrency-inert");
+    }
+
+    // One shared UDP socket has one owning runtime loop. Extra sender workers
+    // cannot alter it; receiver workers remain independently variable when a
+    // plan splits the axis by role.
+    if egress == "shared-socket"
+        && let Some(value) = send_workers
+        && let Some(keep) = representative_for_role(axes, "workers", Scope::Send, "1")
+        && value != keep
+    {
+        return Some("shared-egress-workers-inert");
+    }
 
     if let (Some(pairs), Some(connections)) = (bond.and_then(bond_pairs), connections)
         && pairs > connections / 2
@@ -864,6 +911,7 @@ fn recorded_as(axis: &str, value: &str) -> (&'static str, String) {
         "runtime" => ("runtime", value.to_string()),
         "encryption" => ("encryption", value.to_string()),
         "ingress" => ("ingress", value.to_string()),
+        "egress" => ("egress", value.to_string()),
         "promotion" => ("promotion", value.to_string()),
         "cookie-routing" => ("cookie", value.to_string()),
         "batch" => ("batch", value.to_string()),
@@ -1008,6 +1056,7 @@ fn canonical_axis_name(name: &str) -> Option<&'static str> {
         "recv-workers" => "recv-workers",
         "send-workers" => "send-workers",
         "ingress" => "ingress",
+        "egress" => "egress",
         "encryption" => "encryption",
         "promotion" => "promotion",
         "cookie-routing" => "cookie-routing",
@@ -1289,6 +1338,7 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
     let mut axes: Vec<Axis> = split_axes;
     axes.extend([
         axis("ingress", "ingress", "per-port"),
+        axis("egress", "egress", "per-connection"),
         axis("encryption", "encryption", "plain"),
         axis("promotion", "promotion", "relocate"),
         axis("cookie-routing", "cookie-routing", "on"),
@@ -1599,12 +1649,19 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
         .stdout(std::process::Stdio::null())
         .status()?;
 
-        // Ordered teardown: the sender is done, so the listener has
-        // nothing left to receive. Signalling now (rather than letting
-        // it time out) is what keeps the sender from spending its last
-        // seconds transmitting into a closed port.
-        request_stop(&recv);
-        let recv_status = recv.wait()?;
+        // Let the ordered SRT SHUTDOWN reach the listener and flush its
+        // receive/event queues. Signalling immediately here raced the final
+        // runtime tick and under-counted delivery even though wire telemetry
+        // had received the packets. Most listeners exit naturally within a
+        // few milliseconds; SIGTERM remains the bounded fallback.
+        let recv_status =
+            match wait_for_natural_exit(&mut recv, std::time::Duration::from_millis(500))? {
+                Some(status) => status,
+                None => {
+                    request_stop(&recv);
+                    recv.wait()?
+                }
+            };
         eprintln!(
             "[{:>4}/{total}] rep {rep} {}{}",
             run_index + 1,
@@ -1902,6 +1959,22 @@ fn request_stop(child: &std::process::Child) {
     unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
 }
 
+fn wait_for_natural_exit(
+    child: &mut std::process::Child,
+    timeout: std::time::Duration,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
 /// Re-parse an ingress spec as recorded in a result file (`:` separated).
 fn parse_ingress_spec(spec: &str) -> crate::Ingress {
     match spec.split_once(':') {
@@ -2119,6 +2192,75 @@ mod matrix_filter_tests {
     }
 
     #[test]
+    fn shared_egress_filters_per_connection_launch_concurrency() {
+        let axes = vec![
+            (
+                "connect-concurrency",
+                Scope::Both,
+                ["1", "50"].into_iter().map(str::to_string).collect(),
+            ),
+            (
+                "egress",
+                Scope::Both,
+                ["per-connection", "shared-socket"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            ),
+        ];
+        assert_eq!(
+            filter_reason(
+                &cell(&[("egress", "shared-socket"), ("connect-concurrency", "50"),]),
+                &axes,
+            ),
+            Some("connect-concurrency-inert")
+        );
+        assert_eq!(
+            filter_reason(
+                &cell(&[("egress", "per-connection"), ("connect-concurrency", "50"),]),
+                &axes,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn shared_egress_filters_only_sender_workers() {
+        let axes = vec![
+            (
+                "workers",
+                Scope::Send,
+                ["1", "3"].into_iter().map(str::to_string).collect(),
+            ),
+            (
+                "workers",
+                Scope::Recv,
+                ["1", "2"].into_iter().map(str::to_string).collect(),
+            ),
+            (
+                "egress",
+                Scope::Send,
+                ["per-connection", "shared-socket"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            ),
+        ];
+        let cell = |send_workers: &str, recv_workers: &str| {
+            vec![
+                ("egress", Scope::Send, "shared-socket".to_string()),
+                ("workers", Scope::Send, send_workers.to_string()),
+                ("workers", Scope::Recv, recv_workers.to_string()),
+            ]
+        };
+        assert_eq!(
+            filter_reason(&cell("3", "1"), &axes),
+            Some("shared-egress-workers-inert")
+        );
+        assert_eq!(filter_reason(&cell("1", "2"), &axes), None);
+    }
+
+    #[test]
     fn rejects_bonded_ingress_without_one_group_aware_listener() {
         let axes = axes();
         let bonded = cell(&[
@@ -2286,10 +2428,12 @@ mod matrix_filter_tests {
             "--axis",
             "encryption=plain,128",
             "--axis=recv-runtimes=mio,tokio",
+            "--axis=egress=per-connection,shared-socket",
         ]))
         .unwrap();
         assert_eq!(parsed["encryption"], ["plain", "128"]);
         assert_eq!(parsed["recv-runtime"], ["mio", "tokio"]);
+        assert_eq!(parsed["egress"], ["per-connection", "shared-socket"]);
 
         let error = axis_overrides(&cli(&[
             "--axis",

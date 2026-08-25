@@ -12,18 +12,23 @@
 # both the two move together. Varying them independently does, at the
 # cost of 4x the cells.
 #
-# Raw product: 6 runtimes x 4 ingress x 4 encryption x 4 connections x 4 bitrate
+# Raw product: 6 runtimes x 5 ingress x 2 egress x 4 encryption x 4 connections x 4 bitrate
 # x 3 workers x 4 promotion x 2 cookie-routing x 2 batch x 2 sock-buf
-# x 2 connect-concurrency x 3 bond x 2 pin = 1,769,472 cells.
+# x 2 connect-concurrency x 3 bond x 2 pin = 4,423,680 cells.
 #
 # The harness enumerates the raw product and applies capability filtering
 # without retaining all raw cells. It retains one
 # representative for inert axes, keeps promotion/cookie controls only where
 # reuseport admission can observe them, keeps batching only where mio has a
-# shared-socket batched path, keeps pinning only where glommio applies it, and
-# removes bond groups larger than half the connection population. Within
+# shared-socket batched path, keeps pinning only where glommio applies it,
+# keeps one sender-worker and connect-concurrency representative for shared
+# egress (one socket has one owning runtime loop), and removes bond groups
+# larger than half the connection population. Identical-four-tuple bonded
+# cells remain valid protocol/group exercises because SRT Socket IDs demux the
+# legs, but they do not provide independent network paths and therefore must
+# not be interpreted as a path-diversity/failover benchmark. Within
 # reuseport-multi with no bond group, relocate and bonded collapse to never,
-# so only never/all are retained. With the values below that leaves 142,464
+# so only never/all are retained. With the values below that leaves 67,200
 # executable, non-duplicate cells.
 # This is intentionally exhaustive across meaningful behavior, not a default
 # smoke test.
@@ -42,6 +47,7 @@
 
 runtime             = mio,tokio,smol,monoio,glommio,compio
 ingress             = per-port,shared-pool:1,shared-pool:4,reuseport-multi:4,reuseport-single:4
+egress              = per-connection,shared-socket
 encryption          = plain,128,192,256
 connections         = 50,200,600,1200
 bitrate             = 250000,1000000,4000000,8000000

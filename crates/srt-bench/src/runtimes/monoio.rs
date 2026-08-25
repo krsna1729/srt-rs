@@ -104,6 +104,23 @@ fn promote_locally(
 }
 
 pub fn run(cfg: BenchConfig) {
+    if cfg.mode == crate::Mode::Sender && cfg.egress == crate::Egress::SharedSocket {
+        let start = Instant::now();
+        let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+            .enable_timer()
+            .build()
+            .expect("monoio io_uring runtime");
+        let stats = rt.block_on(run_shared_sender(&cfg, start));
+        let mut agg = Aggregate::new(cfg);
+        for stat in stats {
+            agg.add(stat);
+        }
+        agg.print(start);
+        if !agg.any_connected {
+            std::process::exit(1);
+        }
+        return;
+    }
     if crate::dispatch_ingress(
         &cfg,
         "monoio",
@@ -131,6 +148,33 @@ pub fn run(cfg: BenchConfig) {
     if !agg.any_connected {
         std::process::exit(1);
     }
+}
+
+async fn run_shared_sender(cfg: &BenchConfig, start: Instant) -> Vec<ConnStats> {
+    let socket = monoio::net::udp::UdpSocket::from_std(
+        crate::bind_shared_sender_socket(cfg.sock_buf_bytes).expect("bind shared sender socket"),
+    )
+    .expect("register shared sender socket");
+    let indices = (0..cfg.connections).collect::<Vec<_>>();
+    let mut sender = crate::SharedSender::new(cfg, &indices, start);
+    let mut outbound = Vec::new();
+    loop {
+        sender.tick(cfg, &mut outbound);
+        for (peer, packet) in outbound.drain(..) {
+            let (result, _) = socket.send_to(packet, peer).await;
+            result.expect("shared send_to");
+        }
+        if sender.done() {
+            break;
+        }
+        if let Ok((result, buffer)) =
+            monoio::time::timeout(sender.next_wait(), socket.recv_from(vec![0_u8; 65_536])).await
+            && let Ok((size, peer)) = result
+        {
+            sender.feed(peer, &buffer[..size]);
+        }
+    }
+    sender.finish()
 }
 
 /// Drive one worker's share of the connections on this thread's runtime.

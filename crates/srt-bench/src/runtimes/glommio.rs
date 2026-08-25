@@ -120,6 +120,24 @@ fn executor_builder(cfg: &BenchConfig, index: usize) -> glommio::LocalExecutorBu
 }
 
 pub fn run(cfg: BenchConfig) {
+    if cfg.mode == crate::Mode::Sender && cfg.egress == crate::Egress::SharedSocket {
+        let start = Instant::now();
+        let run_cfg = cfg.clone();
+        let stats = executor_builder(&cfg, 0)
+            .spawn(move || async move { run_shared_sender(&run_cfg, start).await })
+            .expect("failed to spawn glommio shared sender")
+            .join()
+            .expect("glommio shared sender panicked");
+        let mut agg = Aggregate::new(cfg);
+        for stat in stats {
+            agg.add(stat);
+        }
+        agg.print(start);
+        if !agg.any_connected {
+            std::process::exit(1);
+        }
+        return;
+    }
     if crate::dispatch_ingress(
         &cfg,
         "glommio",
@@ -155,6 +173,36 @@ pub fn run(cfg: BenchConfig) {
     if !agg.any_connected {
         std::process::exit(1);
     }
+}
+
+async fn run_shared_sender(cfg: &BenchConfig, start: Instant) -> Vec<ConnStats> {
+    let socket = srt_transport::glommio_transport::from_std(
+        crate::bind_shared_sender_socket(cfg.sock_buf_bytes).expect("bind shared sender socket"),
+    )
+    .expect("register shared sender socket");
+    let indices = (0..cfg.connections).collect::<Vec<_>>();
+    let mut sender = crate::SharedSender::new(cfg, &indices, start);
+    let mut outbound = Vec::new();
+    let mut buffer = [0_u8; 65_536];
+    loop {
+        sender.tick(cfg, &mut outbound);
+        for (peer, packet) in outbound.drain(..) {
+            socket.send_to(&packet, peer).await.expect("shared send_to");
+        }
+        if sender.done() {
+            break;
+        }
+        let received =
+            futures_lite::future::race(async { socket.recv_from(&mut buffer).await.ok() }, async {
+                glommio::timer::sleep(sender.next_wait()).await;
+                None
+            })
+            .await;
+        if let Some((size, peer)) = received {
+            sender.feed(peer, &buffer[..size]);
+        }
+    }
+    sender.finish()
 }
 
 /// Drive one worker's share of the connections on this thread's executor.

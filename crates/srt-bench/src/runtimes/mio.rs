@@ -9,7 +9,7 @@ use mio::{Events, Interest, Poll, Token};
 use shiguredo_srt::{ConnectionEvent, ConnectionOptions, SrtConnection};
 use srt_transport::mio_transport::Conn;
 use srt_transport::{Handoff, WorkerMessage};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex, mpsc};
@@ -177,6 +177,18 @@ fn spawn_driver(
 
 pub fn run(cfg: BenchConfig) {
     let start = Instant::now();
+    if cfg.mode == crate::Mode::Sender && cfg.egress == crate::Egress::SharedSocket {
+        let stats = run_shared_sender(&cfg, start);
+        let mut agg = Aggregate::new(cfg);
+        for stat in stats {
+            agg.add(stat);
+        }
+        agg.print(start);
+        if !agg.any_connected {
+            std::process::exit(1);
+        }
+        return;
+    }
     if cfg.mode == crate::Mode::Receiver {
         println!("LISTENING");
     }
@@ -191,7 +203,7 @@ pub fn run(cfg: BenchConfig) {
             crate::Ingress::ReuseportMulti(k) if k > 1 => {
                 return run_pool_receiver(cfg, k);
             }
-            crate::Ingress::SharedPool(1) if cfg.bond_mode != BondMode::None => {
+            crate::Ingress::SharedPool(1) => {
                 return run_bonded_shared_pool(cfg);
             }
             crate::Ingress::SharedPool(k) if k > 1 => {
@@ -244,6 +256,52 @@ pub fn run(cfg: BenchConfig) {
     if !agg.any_connected {
         std::process::exit(1);
     }
+}
+
+fn run_shared_sender(cfg: &BenchConfig, start: Instant) -> Vec<ConnStats> {
+    let std_socket =
+        crate::bind_shared_sender_socket(cfg.sock_buf_bytes).expect("bind shared sender socket");
+    let mut socket = UdpSocket::from_std(std_socket);
+    let mut poll = Poll::new().expect("mio Poll::new");
+    poll.registry()
+        .register(
+            &mut socket,
+            Token(0),
+            Interest::READABLE | Interest::WRITABLE,
+        )
+        .expect("register shared socket");
+    let mut events = Events::with_capacity(32);
+    let indices = (0..cfg.connections).collect::<Vec<_>>();
+    let mut sender = crate::SharedSender::new(cfg, &indices, start);
+    let mut generated = Vec::new();
+    let mut pending = VecDeque::new();
+    let mut buffer = [0_u8; 65_536];
+    loop {
+        sender.tick(cfg, &mut generated);
+        pending.extend(generated.drain(..));
+        while let Some((peer, packet)) = pending.front() {
+            match socket.send_to(packet, *peer) {
+                Ok(_) => {
+                    pending.pop_front();
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("shared send_to: {error}"),
+            }
+        }
+        if sender.done() && pending.is_empty() {
+            break;
+        }
+        poll.poll(&mut events, Some(sender.next_wait()))
+            .expect("mio poll");
+        loop {
+            match socket.recv_from(&mut buffer) {
+                Ok((size, peer)) => sender.feed(peer, &buffer[..size]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("shared recv_from: {error}"),
+            }
+        }
+    }
+    sender.finish()
 }
 
 /// Drive one worker's share of the connections on its own `Poll`.

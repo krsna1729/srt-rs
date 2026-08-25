@@ -63,6 +63,23 @@ fn promote_locally(
 }
 
 pub fn run(cfg: BenchConfig) {
+    if cfg.mode == crate::Mode::Sender && cfg.egress == crate::Egress::SharedSocket {
+        let start = Instant::now();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let stats = rt.block_on(run_shared_sender(&cfg, start));
+        let mut agg = Aggregate::new(cfg);
+        for stat in stats {
+            agg.add(stat);
+        }
+        agg.print(start);
+        if !agg.any_connected {
+            std::process::exit(1);
+        }
+        return;
+    }
     if crate::dispatch_ingress(
         &cfg,
         "tokio",
@@ -90,6 +107,35 @@ pub fn run(cfg: BenchConfig) {
     if !agg.any_connected {
         std::process::exit(1);
     }
+}
+
+async fn run_shared_sender(cfg: &BenchConfig, start: Instant) -> Vec<ConnStats> {
+    let socket = tokio::net::UdpSocket::from_std(
+        crate::bind_shared_sender_socket(cfg.sock_buf_bytes).expect("bind shared sender socket"),
+    )
+    .expect("register shared sender socket");
+    let indices = (0..cfg.connections).collect::<Vec<_>>();
+    let mut sender = crate::SharedSender::new(cfg, &indices, start);
+    let mut outbound = Vec::new();
+    let mut buffer = [0_u8; 65_536];
+    loop {
+        sender.tick(cfg, &mut outbound);
+        for (peer, packet) in outbound.drain(..) {
+            socket.send_to(&packet, peer).await.expect("shared send_to");
+        }
+        if sender.done() {
+            break;
+        }
+        tokio::select! {
+            received = socket.recv_from(&mut buffer) => {
+                if let Ok((size, peer)) = received {
+                    sender.feed(peer, &buffer[..size]);
+                }
+            }
+            _ = tokio::time::sleep(sender.next_wait()) => {}
+        }
+    }
+    sender.finish()
 }
 
 /// Drive one worker's share of the connections on this thread's runtime.

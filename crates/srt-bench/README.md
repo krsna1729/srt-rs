@@ -28,7 +28,7 @@ the results, profile one pair, or inspect host capacity.
 srt-bench runtime=<mio|tokio|smol|monoio|glommio|compio> \
   mode=<sender|receiver> <host?> <port> <duration_secs> <latency_ms> \
   [bitrate_bps] [--connections N] [--encryption plain|128|192|256]
-  [--ingress …] [--promotion …]
+  [--ingress …] [--egress per-connection|shared-socket] [--promotion …]
   [--cookie-routing on|off] [--batch on|off] [--sock-buf …]
   [--connect-concurrency N] [--bond …] [--out FILE]
 ```
@@ -69,9 +69,17 @@ srt-bench matrix --plan docs/plans/full-matrix.plan \
 ```
 
 Every axis is a comma-separated list; unspecified axes take one default
-value. `encryption` selects plaintext or AES-128/AES-192/AES-256 using a
-shared benchmark passphrase. A cell a runtime does not implement is skipped
-and counted, so a gap in coverage reads as a gap rather than as a failure.
+value. `egress=per-connection|shared-socket` controls whether callers use
+distinct ephemeral UDP ports or one application-owned socket. Combined with
+`ingress`, it can produce distinct-local/same-remote, same-local/distinct-
+remote, or identical-four-tuple sessions. `encryption` selects plaintext or
+AES-128/AES-192/AES-256 using a shared benchmark passphrase. A cell a runtime
+does not implement is skipped and counted, so a gap in coverage reads as a
+gap rather than as a failure.
+For shared egress, `sock-buf` configures the shared socket itself. Matrix
+filtering retains one sender `workers` and `connect-concurrency` value because
+one shared socket has one owning runtime loop; independently scoped receiver
+workers and every per-connection egress worker value remain variable.
 
 The exhaustive matrix is filtered as its raw cartesian product is enumerated,
 without retaining all raw cells in memory. This removes combinations that
@@ -84,10 +92,25 @@ representative value is retained for an inert axis, so a one-value custom plan
 remains runnable. The filter summary is printed before the run and the
 reported cell count is the filtered count.
 
-For the checked-in `full-matrix.plan`, the raw product is 2,211,840 cells and
-the capability-aware product is 55,296 cells. The omitted combinations are
-either no-op repetitions, over-capacity bond requests, or topologies that
-cannot yet realize one logical bonded ingress stream.
+Bonded cells with `egress=shared-socket` and `ingress=shared-pool:1` remain in
+the matrix. SRT's shared UDP binding and Destination Socket IDs make those
+identical-four-tuple legs valid protocol/group exercises. They do not provide
+the independent network paths recommended for real redundancy, so their
+results must not be interpreted as a path-diversity/failover measurement; see
+[SRT bonding](https://github.com/Haivision/srt/blob/master/docs/features/bonding-intro.md).
+In `srt-test-live`'s group syntax the equivalent shape is conceptually
+`srt://*?type=broadcast&adapter=127.0.0.1&port=4000 127.0.0.1:5000 127.0.0.1:5000`:
+the repeated nodes select the same remote endpoint and the inherited caller
+bind options select one local endpoint. At the API level the unambiguous form
+is two prepared group endpoints using that same source and destination; URI
+parsing is an application convention, not part of the SRT wire protocol.
+
+For the checked-in `full-matrix.plan`, the raw product is 4,423,680 cells and
+the current capability-aware product is 67,200 cells. The harness recalculates
+and prints both values, so this documentation cannot hide a future filtering
+change. The omitted combinations are either no-op repetitions, over-capacity
+bond requests, or topologies that cannot yet realize one logical bonded
+ingress stream.
 
 `docs/plans/bonded-ingress.plan` is the focused semantic sweep: it runs a
 two-leg Broadcast and Backup publisher through the supported shared listener,

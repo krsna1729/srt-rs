@@ -1,0 +1,29 @@
+# Small semantic sweep for caller/listener UDP socket topology.
+#
+# The Cartesian product includes the three multiplexing cases plus the useful
+# distinct-local/distinct-remote baseline:
+#   per-connection + shared-pool:1 = different caller ports, one listener port
+#   shared-socket  + per-port      = one caller port, different listener ports
+#   shared-socket  + shared-pool:1 = identical UDP four-tuple
+#   per-connection + per-port      = different ports on both sides (baseline)
+#
+# Broadcast and Backup are included to cross the egress knob with group
+# admission. The harness filters their per-port listener cells because those
+# legs cannot converge on one logical group there. Identical-four-tuple group
+# cells remain: Socket IDs make them protocol-valid, though they do not model
+# independent network paths.
+
+runtime             = mio,tokio,smol,monoio,glommio,compio
+ingress             = per-port,shared-pool:1
+egress              = per-connection,shared-socket
+encryption          = plain,256
+connections         = 8
+bitrate             = 1000000
+workers             = 1
+promotion           = all
+cookie-routing      = on
+batch               = on
+sock-buf            = 16m
+bond                = none,broadcast:4,backup:4
+connect-concurrency = 1
+pin                 = off
