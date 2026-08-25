@@ -346,7 +346,7 @@ proptest! {
         // ACKACK 受信 (RTT が計算される)
         let ackack_time = Timestamp::from_micros(2000 + rtt_sample);
         let _old_rtt = buf.rtt();
-        buf.handle_ackack(ack_number, ackack_time);
+        buf.handle_ackack(ack_number, 0, ackack_time);
         let new_rtt = buf.rtt();
 
         // RTT が更新される (EWMA なので必ずしも等しくない)
