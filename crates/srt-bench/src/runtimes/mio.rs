@@ -33,36 +33,59 @@ const TIMER_TICK: Duration = Duration::from_millis(10);
 /// more than one peer at once (`SharedPool`, `ReuseportMulti`,
 /// `ReuseportSingle`) -- `PerPort` never shares a socket, so batching
 /// doesn't apply there.
-#[allow(clippy::too_many_arguments)]
+/// Scratch space for one batched-receive admission drain: fixed-capacity
+/// slots reused across every readiness event instead of reallocated per
+/// event (hot-path rule). `CAPACITY` is how many datagrams `recvmsg_batch`
+/// is willing to fill in one syscall.
+struct RecvBatch {
+    bufs: Vec<Vec<u8>>,
+    sizes: [usize; Self::CAPACITY],
+    addrs: [Option<SocketAddr>; Self::CAPACITY],
+}
+
+impl RecvBatch {
+    const CAPACITY: usize = 32;
+
+    fn new() -> Self {
+        Self {
+            bufs: (0..Self::CAPACITY).map(|_| vec![0u8; 2048]).collect(),
+            sizes: [0usize; Self::CAPACITY],
+            addrs: [None; Self::CAPACITY],
+        }
+    }
+}
+
 fn drain_admission(
     listener: &UdpSocket,
     batching: crate::Batching,
-    admit_bufs: &mut [Vec<u8>],
-    admit_sizes: &mut [usize],
-    admit_addrs: &mut [Option<SocketAddr>],
+    batch: &mut RecvBatch,
     buf: &mut [u8],
     mut on_datagram: impl FnMut(SocketAddr, &[u8]),
 ) {
     match batching {
         crate::Batching::On => loop {
             let fd = listener.as_raw_fd();
-            let received =
-                match srt_transport::recvmsg_batch(fd, admit_bufs, admit_sizes, admit_addrs) {
-                    Ok(received) => received,
-                    Err(error) => {
-                        eprintln!("[bench-mio] recvmmsg failed: {error}");
-                        break;
-                    }
-                };
+            let received = match srt_transport::recvmsg_batch(
+                fd,
+                &mut batch.bufs,
+                &mut batch.sizes,
+                &mut batch.addrs,
+            ) {
+                Ok(received) => received,
+                Err(error) => {
+                    eprintln!("[bench-mio] recvmmsg failed: {error}");
+                    break;
+                }
+            };
             if received == 0 {
                 break;
             }
             for i in 0..received {
-                if let Some(peer) = admit_addrs[i] {
-                    on_datagram(peer, &admit_bufs[i][..admit_sizes[i]]);
+                if let Some(peer) = batch.addrs[i] {
+                    on_datagram(peer, &batch.bufs[i][..batch.sizes[i]]);
                 }
             }
-            if received < admit_bufs.len() {
+            if received < batch.bufs.len() {
                 break;
             }
         },
@@ -647,9 +670,7 @@ fn run_bonded_shared_pool(cfg: BenchConfig) {
     let stream_len = Duration::from_secs_f64(cfg.duration_secs);
     let run_deadline = Instant::now() + stream_len + IDLE_GRACE + Duration::from_secs(30);
     let mut buf = [0u8; 2048];
-    let mut admit_bufs: Vec<Vec<u8>> = (0..32).map(|_| vec![0u8; 2048]).collect();
-    let mut admit_sizes = [0usize; 32];
-    let mut admit_addrs: [Option<SocketAddr>; 32] = [None; 32];
+    let mut admit_batch = RecvBatch::new();
     let mut outbound = Vec::new();
     let mut connected = Vec::new();
 
@@ -669,9 +690,7 @@ fn run_bonded_shared_pool(cfg: BenchConfig) {
             drain_admission(
                 &socket,
                 cfg.batching,
-                &mut admit_bufs,
-                &mut admit_sizes,
-                &mut admit_addrs,
+                &mut admit_batch,
                 &mut buf,
                 |peer, data| {
                     let _ = peers.admit(peer, data, timestamp, &admission, 0, 1, &telemetry);
@@ -761,9 +780,7 @@ fn run_shared_pool_shard(
     let stream_len = Duration::from_secs_f64(cfg.duration_secs);
     let run_deadline = Instant::now() + stream_len + IDLE_GRACE + Duration::from_secs(30);
     let mut buf = [0u8; 2048];
-    let mut admit_bufs: Vec<Vec<u8>> = (0..32).map(|_| vec![0u8; 2048]).collect();
-    let mut admit_sizes = [0usize; 32];
-    let mut admit_addrs: [Option<SocketAddr>; 32] = [None; 32];
+    let mut admit_batch = RecvBatch::new();
 
     loop {
         let now = Instant::now();
@@ -792,9 +809,7 @@ fn run_shared_pool_shard(
             drain_admission(
                 socket,
                 cfg.batching,
-                &mut admit_bufs,
-                &mut admit_sizes,
-                &mut admit_addrs,
+                &mut admit_batch,
                 &mut buf,
                 |peer, data| {
                     let entry = conns.entry(peer).or_insert_with(|| SharedConn {
@@ -1125,9 +1140,7 @@ fn run_pool_acceptor(
     // Hoisted admission batch buffers: one allocation for the acceptor's
     // whole life, reused every readability event instead of once per event
     // (hot-path rule).
-    let mut admit_bufs: Vec<Vec<u8>> = (0..32).map(|_| vec![0u8; 2048]).collect();
-    let mut admit_sizes = [0usize; 32];
-    let mut admit_addrs: [Option<SocketAddr>; 32] = [None; 32];
+    let mut admit_batch = RecvBatch::new();
     let mut buf = [0u8; 2048];
 
     loop {
@@ -1205,9 +1218,7 @@ fn run_pool_acceptor(
                     drain_admission(
                         &listener,
                         cfg.batching,
-                        &mut admit_bufs,
-                        &mut admit_sizes,
-                        &mut admit_addrs,
+                        &mut admit_batch,
                         &mut buf,
                         |peer, data| {
                             peers.admit_and_forward(
@@ -1634,9 +1645,7 @@ fn run_single_acceptor(
 
     let mut pending: HashMap<SocketAddr, Pending> = HashMap::new();
     let connect_deadline = Instant::now() + crate::INTEROP_CONNECT_TIMEOUT;
-    let mut admit_bufs: Vec<Vec<u8>> = (0..32).map(|_| vec![0u8; 2048]).collect();
-    let mut admit_sizes = [0usize; 32];
-    let mut admit_addrs: [Option<SocketAddr>; 32] = [None; 32];
+    let mut admit_batch = RecvBatch::new();
     let mut buf = [0u8; 2048];
     let mut per_worker_count = vec![0usize; senders.len()];
 
@@ -1655,9 +1664,7 @@ fn run_single_acceptor(
             drain_admission(
                 &listener,
                 cfg.batching,
-                &mut admit_bufs,
-                &mut admit_sizes,
-                &mut admit_addrs,
+                &mut admit_batch,
                 &mut buf,
                 |peer, data| {
                     let entry = pending.entry(peer).or_insert_with(|| Pending {
