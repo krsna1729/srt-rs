@@ -994,7 +994,7 @@ pub struct LogicalPeerId(u64);
 /// longer owns any Socket-ID route, timer, admission slot, or event queue for
 /// this session.
 pub enum RemovedLogicalPeer {
-    Direct(RemovedPeerLeg),
+    Direct(Box<RemovedPeerLeg>),
     Group(Vec<RemovedPeerLeg>),
 }
 
@@ -2370,10 +2370,10 @@ impl PeerTable {
     pub fn remove(&mut self, id: LogicalPeerId) -> Option<RemovedLogicalPeer> {
         match self.logical_peers.get(&id).cloned()? {
             LogicalPeerTarget::Direct(peer) => self.remove_direct(peer).map(|entry| {
-                RemovedLogicalPeer::Direct(RemovedPeerLeg {
+                RemovedLogicalPeer::Direct(Box::new(RemovedPeerLeg {
                     peer: peer.address,
                     connection: entry.conn,
-                })
+                }))
             }),
             LogicalPeerTarget::Group(key) => self.remove_group(key),
         }
@@ -3116,7 +3116,7 @@ pub enum LogicalCallerStats {
 /// A logical caller atomically removed from a [`CallerTable`]. Its routes,
 /// timers, and pending outputs were removed from the table with it.
 pub enum RemovedLogicalCaller {
-    Direct(RemovedCallerLeg),
+    Direct(Box<RemovedCallerLeg>),
     Group(Vec<RemovedCallerLeg>),
 }
 
@@ -3254,7 +3254,18 @@ struct CallerGroupState {
 
 enum CallerSession {
     Direct(Box<CallerLegState>),
-    Group(CallerGroupState),
+    Group(Box<CallerGroupState>),
+}
+
+/// The budget, progress report, and output accumulator threaded unchanged
+/// through one bounded drain pass, from [`CallerTable::poll_outbound_bounded`]
+/// down to the single-output-item helpers. Bundled because the three always
+/// travel together; `budget` is read-only for the pass, `report` and `out`
+/// accumulate across every leg it visits.
+struct DrainSink<'a> {
+    budget: OutputDrainBudget,
+    report: &'a mut OutputDrainReport,
+    out: &'a mut Vec<(std::net::SocketAddr, Vec<u8>)>,
 }
 
 impl CallerSession {
@@ -3342,15 +3353,9 @@ impl CallerSession {
         }
     }
 
-    fn drain_one(
-        &mut self,
-        now: Timestamp,
-        budget: OutputDrainBudget,
-        report: &mut OutputDrainReport,
-        out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
-    ) -> DrainOne {
+    fn drain_one(&mut self, now: Timestamp, sink: &mut DrainSink) -> DrainOne {
         match self {
-            Self::Direct(leg) => drain_one_caller_leg(leg, now, budget, report, out),
+            Self::Direct(leg) => drain_one_caller_leg(leg, now, sink),
             Self::Group(group) => {
                 for _ in 0..group.leg_order.len() {
                     let member_id = group.leg_order[group.next_leg];
@@ -3370,9 +3375,7 @@ impl CallerSession {
                         &mut leg.timers,
                         &mut leg.pending,
                         connection,
-                        budget,
-                        report,
-                        out,
+                        sink,
                     ) {
                         DrainOne::Empty => {}
                         result => return result,
@@ -3493,13 +3496,13 @@ impl CallerTable {
         }
         self.sessions.insert(
             id,
-            CallerSession::Group(CallerGroupState {
+            CallerSession::Group(Box::new(CallerGroupState {
                 group,
                 legs: caller_legs,
                 leg_order,
                 next_leg: 0,
                 logical: GroupLogicalCounters::default(),
-            }),
+            })),
         );
         self.round_robin.push_back(id);
         Ok(id)
@@ -3619,17 +3622,22 @@ impl CallerTable {
         }
 
         let mut report = OutputDrainReport::default();
+        let mut sink = DrainSink {
+            budget,
+            report: &mut report,
+            out,
+        };
         let mut idle_turns = 0usize;
         while !self.round_robin.is_empty()
             && idle_turns < self.round_robin.len()
-            && report.actions < budget.max_actions
+            && sink.report.actions < sink.budget.max_actions
         {
             let id = self.round_robin.pop_front().expect("checked non-empty");
             self.round_robin.push_back(id);
             let Some(session) = self.sessions.get_mut(&id) else {
                 continue;
             };
-            match session.drain_one(now, budget, &mut report, out) {
+            match session.drain_one(now, &mut sink) {
                 DrainOne::Drained => idle_turns = 0,
                 DrainOne::Empty | DrainOne::Blocked => idle_turns += 1,
             }
@@ -3651,10 +3659,12 @@ impl CallerTable {
         });
         self.round_robin.retain(|caller| *caller != id);
         Some(match session {
-            CallerSession::Direct(leg) => RemovedLogicalCaller::Direct(RemovedCallerLeg {
-                peer: leg.peer,
-                connection: leg.connection,
-            }),
+            CallerSession::Direct(leg) => {
+                RemovedLogicalCaller::Direct(Box::new(RemovedCallerLeg {
+                    peer: leg.peer,
+                    connection: leg.connection,
+                }))
+            }
             CallerSession::Group(mut group) => {
                 let legs = std::mem::take(&mut group.legs)
                     .into_iter()
@@ -3739,9 +3749,7 @@ fn drain_caller_leg(
 fn drain_one_caller_leg(
     leg: &mut CallerLegState,
     now: Timestamp,
-    budget: OutputDrainBudget,
-    report: &mut OutputDrainReport,
-    out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
+    sink: &mut DrainSink,
 ) -> DrainOne {
     drain_one_caller_leg_parts(
         leg.peer,
@@ -3749,9 +3757,7 @@ fn drain_one_caller_leg(
         &mut leg.timers,
         &mut leg.pending,
         &mut leg.connection,
-        budget,
-        report,
-        out,
+        sink,
     )
 }
 
@@ -3761,33 +3767,31 @@ fn drain_one_caller_leg_parts(
     timers: &mut ManualTimerStore,
     pending: &mut VecDeque<ConnectionOutput>,
     connection: &mut SrtConnection,
-    budget: OutputDrainBudget,
-    report: &mut OutputDrainReport,
-    out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
+    sink: &mut DrainSink,
 ) -> DrainOne {
     let Some(output) = pending.pop_front().or_else(|| connection.poll_output()) else {
         return DrainOne::Empty;
     };
-    if report.actions >= budget.max_actions {
+    if sink.report.actions >= sink.budget.max_actions {
         pending.push_front(output);
         return DrainOne::Blocked;
     }
     match output {
         ConnectionOutput::SendPacket(packet) => {
-            let exceeds_packets = report.packets >= budget.max_packets;
-            let exceeds_bytes =
-                report.packets > 0 && report.bytes.saturating_add(packet.len()) > budget.max_bytes;
+            let exceeds_packets = sink.report.packets >= sink.budget.max_packets;
+            let exceeds_bytes = sink.report.packets > 0
+                && sink.report.bytes.saturating_add(packet.len()) > sink.budget.max_bytes;
             if exceeds_packets || exceeds_bytes {
                 pending.push_front(ConnectionOutput::SendPacket(packet));
                 return DrainOne::Blocked;
             }
-            report.actions += 1;
-            report.packets += 1;
-            report.bytes = report.bytes.saturating_add(packet.len());
-            out.push((peer, packet));
+            sink.report.actions += 1;
+            sink.report.packets += 1;
+            sink.report.bytes = sink.report.bytes.saturating_add(packet.len());
+            sink.out.push((peer, packet));
         }
         other => {
-            report.actions += 1;
+            sink.report.actions += 1;
             timers.apply_output(&other, now);
         }
     }
