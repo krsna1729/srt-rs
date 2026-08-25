@@ -29,13 +29,14 @@ fn connected_pair() -> Option<(SrtConnection, SrtConnection)> {
 }
 
 fn timer(selector: u8) -> TimerId {
-    match selector % 6 {
+    match selector % 7 {
         0 => TimerId::Handshake,
         1 => TimerId::Keepalive,
         2 => TimerId::Ack,
         3 => TimerId::Nak,
         4 => TimerId::Retransmit,
-        _ => TimerId::Inactivity,
+        5 => TimerId::Inactivity,
+        _ => TimerId::Shutdown,
     }
 }
 
