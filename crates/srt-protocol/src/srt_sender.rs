@@ -1,13 +1,13 @@
-//! SRT 送信バッファ
+//! SRT send buffer.
 //!
-//! 送信パケットの保持と再送を管理する。
+//! Manages holding sent packets and retransmitting them.
 //!
-//! ## 機能
+//! ## Features
 //!
-//! - 送信パケットのバッファリング (ACK 受信まで保持)
-//! - NAK による再送キュー管理
-//! - ACK によるバッファ解放
-//! - 送信ウィンドウ管理
+//! - Buffering sent packets (retained until ACKed)
+//! - Retransmit queue management via NAK
+//! - Buffer release via ACK
+//! - Send window management
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -32,70 +32,71 @@ const INITIAL_AVG_PAYLOAD_SIZE_BYTES: f64 = 1456.0;
 /// `srtcore/utilities.h`): `avg = (avg * (LEN - 1) + new) / LEN`.
 const AVG_PAYLOAD_SIZE_IIR_LEN: f64 = 128.0;
 
-/// 送信パケットエントリ
+/// A sent packet entry.
 #[derive(Debug, Clone)]
 struct SentPacket {
-    /// パケットデータ
+    /// Packet data.
     packet: DataPacket,
-    /// 送信時刻
+    /// Send time.
     sent_time: Timestamp,
-    /// 再送回数
+    /// Retransmit count.
     retransmit_count: u32,
 }
 
-/// 送信バッファ
+/// Send buffer.
 #[derive(Debug)]
 pub struct SenderBuffer {
-    /// 送信済みパケット (sequence_number -> SentPacket)
+    /// Sent packets (sequence_number -> SentPacket).
     packets: BTreeMap<u32, SentPacket>,
 
-    /// 損失リスト (NAK で報告されたパケット)
+    /// Loss list (packets reported via NAK).
     loss_list: VecDeque<u32>,
 
-    /// 最古の未 ACK シーケンス番号
+    /// The oldest un-ACKed sequence number.
     oldest_unacked: u32,
 
-    /// 次の送信シーケンス番号
+    /// The next send sequence number.
     next_seq: u32,
 
-    /// 次のメッセージ番号
+    /// The next message number.
     next_msg: u32,
 
-    /// フローウィンドウサイズ
+    /// Flow window size.
     flow_window: u32,
 
-    /// 輻輳ウィンドウサイズ
+    /// Congestion window size.
     congestion_window: u32,
 
-    /// バッファ最大サイズ (パケット数)
+    /// Maximum buffer size (packets).
     #[expect(dead_code)]
     max_buffer_size: u32,
 
-    /// レイテンシ (マイクロ秒)
+    /// Latency (microseconds).
     latency_us: u64,
-    /// パケット送信間隔 (マイクロ秒)
+    /// Packet send interval (microseconds).
     packet_send_period: u64,
-    /// 最後のパケット送信時刻
+    /// Last packet send time.
     last_send_time: Option<Timestamp>,
     packet_send_period_overridden: bool,
-    /// 送信パケット総数
+    /// Total packets sent.
     total_sent: u64,
-    /// 送信バイト総数
+    /// Total bytes sent.
     total_bytes_sent: u64,
     /// SRT datagram bytes emitted, including SRT headers and retransmissions.
     total_srt_bytes_sent: u64,
     /// Retransmitted SRT datagram bytes, including SRT headers.
     total_retransmitted_srt_bytes: u64,
-    /// 送信ペイロードサイズの移動平均 (バイト、ペーシング計算用)
+    /// Moving average of the sent payload size (bytes, for pacing calculation).
     avg_payload_size: f64,
-    /// 最大帯域幅 (バイト/秒、`SRTO_MAXBW` 相当、ペーシング計算用)
+    /// Maximum bandwidth (bytes/sec, equivalent to `SRTO_MAXBW`, for pacing calculation).
     max_bandwidth_bytes_per_sec: u64,
-    /// 再送総数 (累積、libsrt `pktRetransTotal` 相当)。`packets` に現存する
-    /// エントリの `retransmit_count` 合計とは別に持つ -- ACK で購入済み
-    /// パケットが `packets` から削除された後も、それが再送されていたという
-    /// 事実自体は失われてはならない (低 RTT 環境では再送からごく短時間で
-    /// ACK が届くため、ライブスキャン方式だと "再送は成功したのに
-    /// total_retransmits はほぼ 0" という誤った統計になる)。
+    /// Total retransmits (cumulative, equivalent to libsrt's `pktRetransTotal`).
+    /// Kept separately from the sum of `retransmit_count` across entries
+    /// currently in `packets` -- once an ACKed packet is removed from
+    /// `packets`, the fact that it was retransmitted must not be lost (in a
+    /// low-RTT environment the ACK arrives very shortly after a
+    /// retransmission, so a live-scan approach would wrongly report
+    /// "retransmission succeeded, but total_retransmits is nearly 0").
     total_retransmits: u64,
     /// Packets declared lost by peer NAKs (cumulative).
     total_lost: u64,
@@ -122,13 +123,13 @@ struct PeerFeedback {
 }
 
 impl SenderBuffer {
-    /// 新しい送信バッファを作成
+    /// Create a new send buffer.
     ///
-    /// LIVE モードでは輻輳ウィンドウはフローウィンドウに追従させる (TCP 風の
-    /// AIMD 成長はしない) -- 実 libsrt の `LiveCC` も `m_dMaxCWndSize =
-    /// flowWindowSize()`, `m_dCWndSize = m_dMaxCWndSize` としており、実際の
-    /// 送信制御はペーシング (`packet_send_period`) が担う
-    /// (`srtcore/congctl.cpp`)。
+    /// In LIVE mode, the congestion window tracks the flow window (no
+    /// TCP-style AIMD growth) -- real libsrt's `LiveCC` does the same, with
+    /// `m_dMaxCWndSize = flowWindowSize()`, `m_dCWndSize = m_dMaxCWndSize`;
+    /// actual send control is handled by pacing (`packet_send_period`)
+    /// instead (`srtcore/congctl.cpp`).
     pub fn new(initial_seq: u32, flow_window: u32, latency_ms: u16) -> Self {
         let mut buf = Self {
             packets: BTreeMap::new(),
@@ -161,7 +162,7 @@ impl SenderBuffer {
         buf
     }
 
-    /// 次のシーケンス番号を取得
+    /// Get the next sequence number.
     pub fn next_sequence_number(&self) -> u32 {
         self.next_seq
     }
@@ -175,12 +176,12 @@ impl SenderBuffer {
         true
     }
 
-    /// 次のメッセージ番号を取得
+    /// Get the next message number.
     pub fn next_message_number(&self) -> u32 {
         self.next_msg
     }
 
-    /// 送信可能かどうか (ウィンドウサイズのみチェック)
+    /// Whether sending is possible (checks window size only).
     pub fn can_send(&self) -> bool {
         let in_flight = self.packets_in_flight();
         in_flight < self.flow_window && in_flight < self.congestion_window
@@ -197,13 +198,13 @@ impl SenderBuffer {
         u32::try_from(packet_count).is_ok_and(|count| count <= available)
     }
 
-    /// 送信可能かどうか (パケットペーシングを含む)
+    /// Whether sending is possible, including packet pacing.
     pub fn can_send_with_pacing(&self, now: Timestamp) -> bool {
         if !self.can_send() {
             return false;
         }
 
-        // パケットペーシングチェック
+        // Check packet pacing.
         if self.packet_send_period > 0
             && let Some(last_time) = self.last_send_time
             && now.as_micros() < last_time.as_micros()
@@ -214,12 +215,12 @@ impl SenderBuffer {
         true
     }
 
-    /// 次の送信可能時刻までの待機時間 (マイクロ秒)
+    /// Time to wait until the next send is possible (microseconds).
     ///
-    /// 即座に送信可能な場合は 0 を返す
+    /// Returns 0 if sending is possible right now.
     pub fn time_until_send(&self, now: Timestamp) -> u64 {
         if !self.can_send() {
-            // バッファが満杯の場合は長めの待機時間を返す
+            // Return a longer wait time when the buffer is full.
             return 100_000; // 100ms
         }
 
@@ -236,13 +237,13 @@ impl SenderBuffer {
         0
     }
 
-    /// パケット送信間隔を設定 (マイクロ秒)
+    /// Set the packet send interval (microseconds).
     pub fn set_packet_send_period(&mut self, period: u64) {
         self.packet_send_period = period;
         self.packet_send_period_overridden = true;
     }
 
-    /// 送信時刻を記録
+    /// Record the send time.
     pub fn record_send_time(&mut self, now: Timestamp) {
         self.last_send_time = Some(match (self.last_send_time, self.packet_send_period) {
             (Some(last_time), period) if period > 0 => {
@@ -255,43 +256,43 @@ impl SenderBuffer {
         });
     }
 
-    /// 送信中のパケット数
+    /// Number of packets in flight.
     pub fn packets_in_flight(&self) -> u32 {
         self.packets.len() as u32
     }
 
-    /// バッファ内のパケット数
+    /// Number of packets in the buffer.
     pub fn packets_in_buffer(&self) -> usize {
         self.packets_in_flight() as usize
     }
 
-    /// バッファが空かどうか
+    /// Whether the buffer is empty.
     pub fn is_empty(&self) -> bool {
         self.packets.is_empty()
     }
 
-    /// 再送が必要なパケットがあるか
+    /// Whether there are packets needing retransmission.
     pub fn has_retransmit(&self) -> bool {
         !self.loss_list.is_empty()
     }
 
-    /// 輻輳ウィンドウを設定
+    /// Set the congestion window.
     pub fn set_congestion_window(&mut self, cwnd: u32) {
         self.congestion_window = cwnd;
     }
 
-    /// フローウィンドウを設定 (輻輳ウィンドウも追従させる、LIVE モードの
-    /// 挙動は [`Self::new`] のコメント参照)
+    /// Set the flow window (the congestion window tracks it too; see the
+    /// comment on [`Self::new`] for LIVE mode's behavior).
     pub fn set_flow_window(&mut self, flow_window: u32) {
         self.flow_window = flow_window;
         self.congestion_window = flow_window;
     }
 
-    /// 最大帯域幅を設定 (`SRTO_MAXBW` 相当、バイト/秒)。ペーシング間隔を
-    /// 即座に再計算する (libsrt `LiveCC::setMaxBW` -> `updatePktSndPeriod`
-    /// に相当、`srtcore/congctl.cpp`)。`bytes_per_sec` が 0 の場合は
-    /// libsrt 同様 `DEFAULT_MAX_BANDWIDTH_BYTES_PER_SEC` にフォールバック
-    /// する。
+    /// Set the maximum bandwidth (equivalent to `SRTO_MAXBW`, bytes/sec).
+    /// Immediately recomputes the pacing interval (equivalent to libsrt's
+    /// `LiveCC::setMaxBW` -> `updatePktSndPeriod`, `srtcore/congctl.cpp`).
+    /// If `bytes_per_sec` is 0, falls back to
+    /// `DEFAULT_MAX_BANDWIDTH_BYTES_PER_SEC`, matching libsrt.
     pub fn set_max_bandwidth(&mut self, bytes_per_sec: u64) {
         self.max_bandwidth_bytes_per_sec = if bytes_per_sec == 0 {
             DEFAULT_MAX_BANDWIDTH_BYTES_PER_SEC
@@ -302,9 +303,8 @@ impl SenderBuffer {
         self.recompute_packet_send_period();
     }
 
-    /// 送信ペイロードサイズの移動平均を更新する (libsrt
-    /// `LiveCC::updatePayloadSize` に相当、実送信のたびに呼ぶ)。
-    ///
+    /// Update the moving average of the sent payload size (equivalent to
+    /// libsrt's `LiveCC::updatePayloadSize`; called on every real send).
     fn record_sent_payload_size(&mut self, size: usize) {
         self.avg_payload_size = (self.avg_payload_size * (AVG_PAYLOAD_SIZE_IIR_LEN - 1.0)
             + size as f64)
@@ -314,15 +314,16 @@ impl SenderBuffer {
         }
     }
 
-    /// 平均ペイロードサイズと最大帯域幅からパケット送信間隔を計算する
-    /// (libsrt `LiveCC::updatePktSndPeriod` に相当、`srtcore/congctl.cpp`)。
+    /// Compute the packet send interval from the average payload size and
+    /// maximum bandwidth (equivalent to libsrt's
+    /// `LiveCC::updatePktSndPeriod`, `srtcore/congctl.cpp`).
     fn recompute_packet_send_period(&mut self) {
         let period_us =
             1_000_000.0 * self.avg_payload_size / self.max_bandwidth_bytes_per_sec as f64;
         self.packet_send_period = period_us.round() as u64;
     }
 
-    /// ペイロードをバッファに追加して送信パケットを生成
+    /// Add a payload to the buffer and produce a send packet.
     pub fn push(
         &mut self,
         payload: Vec<u8>,
@@ -362,7 +363,7 @@ impl SenderBuffer {
             payload,
         };
 
-        // バッファに保存
+        // Store in the buffer.
         self.packets.insert(
             sequence_number,
             SentPacket {
@@ -372,7 +373,7 @@ impl SenderBuffer {
             },
         );
 
-        // 統計を更新
+        // Update statistics.
         self.total_sent += 1;
         self.total_bytes_sent += packet.payload.len() as u64;
         self.total_srt_bytes_sent = self
@@ -380,14 +381,14 @@ impl SenderBuffer {
             .saturating_add((packet.payload.len() + SRT_HEADER_SIZE) as u64);
         self.record_sent_payload_size(packet.payload.len());
 
-        // シーケンス番号とメッセージ番号を進める
+        // Advance the sequence number and message number.
         self.next_seq = self.next_seq.wrapping_add(1) & 0x7FFF_FFFF;
         self.next_msg = self.next_msg.wrapping_add(1) & 0x03FF_FFFF;
 
         Some(packet)
     }
 
-    /// 大きなメッセージを分割して送信
+    /// Split a large message and send it.
     pub fn push_message(
         &mut self,
         payload: &[u8],
@@ -421,7 +422,7 @@ impl SenderBuffer {
             let packet = DataPacket {
                 sequence_number: self.next_seq,
                 position,
-                order_flag: true, // 順序付きメッセージ
+                order_flag: true, // Ordered message.
                 encryption_flag: 0,
                 retransmitted: false,
                 message_number: self.next_msg,
@@ -439,7 +440,7 @@ impl SenderBuffer {
                 },
             );
 
-            // 統計を更新
+            // Update statistics.
             self.total_sent += 1;
             self.total_bytes_sent += packet.payload.len() as u64;
             self.total_srt_bytes_sent = self
@@ -451,7 +452,7 @@ impl SenderBuffer {
             packets.push(packet);
         }
 
-        // メッセージ番号は次のメッセージで進める
+        // Advance the message number once, for the next message.
         if !packets.is_empty() {
             self.next_msg = self.next_msg.wrapping_add(1) & 0x03FF_FFFF;
         }
@@ -459,16 +460,17 @@ impl SenderBuffer {
         packets
     }
 
-    /// 再送パケットを取得
+    /// Get a packet to retransmit.
     ///
-    /// `entry.sent_time` は元の送信時刻のまま更新しない (libsrt
-    /// `CSndBuffer::Block::m_tsOriginTime` と同じ意図 --
-    /// `srtcore/buffer_snd.h`/`.cpp` 参照。再送のたびにここを今の時刻へ
-    /// 書き換えると、TLPKTDROP がシーケンス順に単調でなくなる: 再送された
-    /// 古いパケットが「若返り」、一度も再送されていない新しいパケットより
-    /// 後に期限切れ扱いになりかねない。それは TLPKTDROP の目的
-    /// (配信期限を過ぎたら潔く諦めてレイテンシを抑える) にも反する --
-    /// 再送を繰り返す限り永遠に期限切れにならなくなってしまう)。
+    /// `entry.sent_time` is left at its original send time and never
+    /// updated (the same intent as libsrt's `CSndBuffer::Block::m_tsOriginTime`
+    /// -- see `srtcore/buffer_snd.h`/`.cpp`. Rewriting it to the current time
+    /// on every retransmit would make TLPKTDROP non-monotonic in sequence
+    /// order: a retransmitted old packet would be "rejuvenated" and could end
+    /// up expiring after a newer packet that was never retransmitted. That
+    /// also defeats TLPKTDROP's purpose -- cleanly giving up once the
+    /// delivery deadline passes, to bound latency -- since a packet
+    /// retransmitted repeatedly would then never expire.)
     pub fn pop_retransmit(&mut self) -> Option<DataPacket> {
         while let Some(seq) = self.loss_list.pop_front() {
             if let Some(entry) = self.packets.get_mut(&seq) {
@@ -484,14 +486,14 @@ impl SenderBuffer {
                 packet.retransmitted = true;
                 return Some(packet);
             }
-            // パケットが既に ACK されている場合はスキップ
+            // Skip if the packet was already ACKed.
         }
         None
     }
 
-    /// ACK を処理してバッファを解放
+    /// Process an ACK and release the buffer.
     ///
-    /// `ack_seq` は次に期待するシーケンス番号 (この番号未満は全て ACK)
+    /// `ack_seq` is the next expected sequence number (everything below it is ACKed).
     pub fn handle_ack(&mut self, ack_seq: u32) {
         self.total_acks_received = self.total_acks_received.saturating_add(1);
         self.discard_acked(ack_seq);
@@ -500,27 +502,28 @@ impl SenderBuffer {
     /// Discard acknowledged packets without recording a peer ACK. This is
     /// used by local sequence reconciliation paths.
     pub(crate) fn discard_acked(&mut self, ack_seq: u32) {
-        // ack_seq より小さいシーケンス番号のパケットを全て削除。
-        // BTreeMap::retain は削除対象キーを一時 Vec に集める必要がなく、
-        // その場で不要エントリを取り除ける (毎 ACK ごとの割り当てを回避)。
+        // Remove every packet with a sequence number less than ack_seq.
+        // BTreeMap::retain doesn't need to collect the keys to remove into a
+        // temporary Vec first -- it drops unneeded entries in place (avoiding
+        // an allocation on every ACK).
         self.packets
             .retain(|&seq, _| !sequence_less_than(seq, ack_seq));
 
-        // 損失リストからも削除
+        // Also remove from the loss list.
         self.loss_list
             .retain(|&seq| !sequence_less_than(seq, ack_seq));
 
-        // oldest_unacked を更新
+        // Update oldest_unacked.
         if sequence_less_than(self.oldest_unacked, ack_seq) {
             self.oldest_unacked = ack_seq;
         }
     }
 
-    /// NAK を処理して損失リストに追加
+    /// Process a NAK and add to the loss list.
     pub fn handle_nak(&mut self, lost_sequences: &[u32]) {
         self.total_naks_received = self.total_naks_received.saturating_add(1);
         for &seq in lost_sequences {
-            // バッファに存在するパケットのみ追加
+            // Only add packets that are still in the buffer.
             if self.packets.contains_key(&seq) && !self.loss_list.contains(&seq) {
                 self.loss_list.push_back(seq);
                 self.total_lost = self.total_lost.saturating_add(1);
@@ -548,20 +551,22 @@ impl SenderBuffer {
         });
     }
 
-    /// 期限切れパケットを削除 (TLPKTDROP)
+    /// Remove expired packets (TLPKTDROP).
     ///
-    /// `oldest_unacked` から `next_seq` に向かってシーケンス順に走査し、
-    /// 最初に期限切れでないパケットに達したら打ち切る -- libsrt
-    /// `CSndBuffer::dropLateData` と同じ単調前方走査 (`srtcore/buffer_snd.cpp`)。
-    /// `pop_retransmit` がもう `sent_time` を更新しないため (理由は
-    /// そちらのドキュメント参照)、`sent_time` は送信順 = シーケンス順の
-    /// まま単調に増加し続ける -- この走査の正しさの前提。`handle_ack` と
-    /// 同じく `oldest_unacked` を更新するので、両者は「まだ生きている
-    /// 先頭パケット」という同じ境界を共有し続け、パケット集合に穴が
-    /// 生じない。
+    /// Scans in sequence order from `oldest_unacked` toward `next_seq`,
+    /// stopping at the first packet that isn't expired yet -- the same
+    /// monotonic forward scan as libsrt's `CSndBuffer::dropLateData`
+    /// (`srtcore/buffer_snd.cpp`). Since `pop_retransmit` no longer updates
+    /// `sent_time` (see its doc comment for why), `sent_time` keeps
+    /// increasing monotonically in send order = sequence order -- the
+    /// precondition for this scan's correctness. Like `handle_ack`, this
+    /// also updates `oldest_unacked`, so the two keep sharing the same
+    /// boundary for "the oldest packet still alive," and no hole opens up in
+    /// the packet set.
     pub fn drop_expired(&mut self, now: Timestamp) -> Vec<u32> {
-        // TLPKTDROP 閾値: SRT latency の 1.25 倍、最低 1 秒
-        // 仕様 (draft-sharabayko-srt.md の #too-late-packet-drop 節) の推奨値に従う。
+        // TLPKTDROP threshold: 1.25x the SRT latency, minimum 1 second.
+        // Follows the recommended value from the spec (draft-sharabayko-srt.md,
+        // #too-late-packet-drop section).
         let threshold = (self.latency_us * 125 / 100).max(1_000_000);
 
         let mut dropped = Vec::new();
@@ -582,7 +587,7 @@ impl SenderBuffer {
                     }
                 }
                 None => {
-                    // 既に ACK 済みで存在しない -- 走査を継続する
+                    // Already ACKed and gone -- keep scanning.
                 }
             }
             seq = seq.wrapping_add(1) & 0x7FFF_FFFF;
@@ -592,22 +597,23 @@ impl SenderBuffer {
             self.oldest_unacked = seq;
         }
 
-        // 損失リストからも削除
+        // Also remove from the loss list.
         self.loss_list.retain(|s| !dropped.contains(s));
 
         dropped
     }
 
-    /// バッファ内の最古のパケット送信時刻を取得
+    /// Get the send time of the oldest packet in the buffer.
     pub fn oldest_packet_time(&self) -> Option<Timestamp> {
         self.packets.values().next().map(|e| e.sent_time)
     }
 
-    /// 統計情報を取得
+    /// Get statistics.
     pub fn stats(&self) -> SenderStats {
-        // 再送回数別カウント (こちらは意図的に現存パケットのみのライブ
-        // スナップショット -- 「今バッファにあるパケットのうち何回再送
-        // されたか」の分布であり、累積合計とは別の指標)
+        // Count by retransmit count. This is deliberately a live snapshot of
+        // only packets currently in the buffer -- the distribution of "how
+        // many times has each packet currently in the buffer been
+        // retransmitted," a different metric from the cumulative total.
         let mut retransmits_once = 0u32;
         let mut retransmits_twice = 0u32;
         let mut retransmits_many = 0u32;
@@ -686,14 +692,14 @@ impl SenderBuffer {
     }
 }
 
-/// 送信統計
+/// Sender statistics.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SenderStats {
-    /// バッファ内のパケット数
+    /// Number of packets in the buffer.
     pub packets_in_buffer: u32,
     /// Exact payload-byte occupancy of the local send buffer.
     pub payload_bytes_in_buffer: u64,
-    /// 損失リストのパケット数
+    /// Number of packets in the loss list.
     pub packets_in_loss_list: u32,
     /// Remaining local flow-window capacity, in packets.
     pub available_buffer_packets: u32,
@@ -727,7 +733,7 @@ pub struct SenderStats {
     pub peer_link_capacity_bytes_per_second: Option<u64>,
     /// Peer byte receive rate from the most recent full ACK.
     pub peer_receiving_rate_bytes_per_second: Option<u32>,
-    /// 再送回数の合計
+    /// Total retransmit count.
     pub total_retransmits: u64,
     /// Unique original DATA packets emitted.
     pub total_sent: u64,
@@ -752,11 +758,11 @@ pub struct SenderStats {
     pub total_acks_received: u64,
     /// NAK control packets received.
     pub total_naks_received: u64,
-    /// 1 回再送されたパケット数
+    /// Packets retransmitted once.
     pub retransmits_once: u32,
-    /// 2 回再送されたパケット数
+    /// Packets retransmitted twice.
     pub retransmits_twice: u32,
-    /// 3 回以上再送されたパケット数
+    /// Packets retransmitted 3 or more times.
     pub retransmits_many: u32,
 }
 

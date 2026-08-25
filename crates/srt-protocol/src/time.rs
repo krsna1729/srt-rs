@@ -1,37 +1,37 @@
-/// sansio パターンで時間を外部から与えるためのタイムスタンプ型
+/// A timestamp type for supplying time from outside, per the sans-I/O pattern.
 ///
-/// マイクロ秒単位の時刻を表す。SRT プロトコルでは接続確立からの
-/// 相対時刻をマイクロ秒単位で扱う。
+/// Represents a moment in microseconds. The SRT protocol tracks time relative
+/// to connection establishment, in microseconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Timestamp(pub u64);
 
 impl Timestamp {
-    /// マイクロ秒からタイムスタンプを生成する
+    /// Build a timestamp from microseconds.
     pub fn from_micros(micros: u64) -> Self {
         Self(micros)
     }
 
-    /// タイムスタンプをマイクロ秒として取得する
+    /// Get the timestamp as microseconds.
     pub fn as_micros(&self) -> u64 {
         self.0
     }
 
-    /// タイムスタンプをミリ秒として取得する
+    /// Get the timestamp as milliseconds.
     pub fn as_millis(&self) -> u64 {
         self.0 / 1000
     }
 
-    /// 2 つのタイムスタンプの差分をマイクロ秒で取得する
+    /// Get the difference between two timestamps, in microseconds.
     pub fn saturating_sub(&self, other: Self) -> u64 {
         self.0.saturating_sub(other.0)
     }
 
-    /// タイムスタンプにマイクロ秒を加算する
+    /// Add microseconds to the timestamp.
     pub fn add_micros(&self, micros: u64) -> Self {
         Self(self.0.saturating_add(micros))
     }
 
-    /// タイムスタンプにミリ秒を加算する
+    /// Add milliseconds to the timestamp.
     pub fn add_millis(&self, millis: u64) -> Self {
         self.add_micros(millis.saturating_mul(1000))
     }

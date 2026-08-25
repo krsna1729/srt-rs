@@ -134,13 +134,17 @@ caught: [VENDOR.md § Fuzzing](VENDOR.md#fuzzing).
 
 ## Local patches on the vendored code
 
-Every deviation from upstream is tagged `// local patch
+Every behavioral deviation from upstream is tagged `// local patch
 (crates/srt-protocol/VENDOR.md, …)` at the call site. Highlights: crypto
 key redaction/zeroization (upstream 0049/0050), no default-zero crypto
 salt (0052), CONFIG-bit set for SID/congestion extensions (found by live
 capture vs. libsrt), handshake reject-reason decoding (was silently
 swallowing rejections), i32 overflow panic found by fuzzing. Full table +
-upstream-pull workflow: [VENDOR.md](VENDOR.md).
+upstream-pull workflow: [VENDOR.md](VENDOR.md). Public rustdoc was also
+translated from Japanese to English throughout — recorded separately in
+[VENDOR.md § Documentation language](VENDOR.md#documentation-language)
+since it isn't a behavioral patch and touches too many lines per file to
+tag individually.
 
 ## Licensing
 

@@ -14,6 +14,7 @@ root [README](../../README.md) and [SECURITY.md](../../SECURITY.md).
 - [Provenance](#provenance)
 - [What was trimmed from the upstream tree](#what-was-trimmed-from-the-upstream-tree)
 - [Local patches](#local-patches)
+- [Documentation language](#documentation-language)
 - [Crypto backend: pure-Rust RustCrypto stack, not aws-lc-rs](#crypto-backend-pure-rust-rustcrypto-stack-not-aws-lc-rs)
 - [Fuzzing](#fuzzing)
 - [Pulling future upstream commits](#pulling-future-upstream-commits)
@@ -114,6 +115,33 @@ already states the precise design direction) — the cost of patching now is
 low and the cost of shipping with an open, self-identified Critical crypto
 bug is not a tradeoff worth making for the sake of staying byte-identical
 to upstream.
+
+## Documentation language
+
+Upstream's public rustdoc (`///`/`//!`) was written primarily in Japanese —
+consistent with Shiguredo's own origin, but not with the rest of this
+workspace (`srt-transport`/`srt-lifecycle`, written fresh here, are English
+throughout) and not readable by most of the crates.io/docs.rs audience this
+crate is being published to. Translated to English ahead of the open-source
+release: `buf.rs`, `crypto.rs`, `error.rs`, `srt_connection.rs`,
+`srt_handshake.rs`, `srt_packet.rs`, `srt_receiver.rs`, `srt_sender.rs`,
+`stream_id.rs`, `time.rs` (`srt_group.rs` was already English — it just
+lacked doc comments on 22 public items, also added). Every public item now
+has an English doc comment; `cargo doc` output is 100% English.
+
+This is not tagged with the per-line `// local patch (...)` marker the table
+above uses — it touches doc comments pervasively throughout each file rather
+than a handful of call sites, so a line-by-line marker isn't practical.
+Recorded here instead, at the file level.
+
+**Implication for `subtree pull`:** a future pull will likely surface merge
+conflicts on any doc comment upstream also touches (most commonly if
+upstream itself edits that Japanese text). Resolve by re-translating
+upstream's updated text to English rather than reverting to Japanese, to
+keep the crate's public docs consistently English. Internal (non-doc, `//`)
+implementation comments were deliberately left as-is in the larger files and
+may still contain Japanese — out of scope for this pass, since they don't
+appear in rustdoc output; revisit if that inconsistency matters later.
 
 ## Crypto backend: pure-Rust RustCrypto stack, not aws-lc-rs
 

@@ -1,24 +1,26 @@
-//! SRT Stream ID と Access Control
+//! SRT Stream ID and Access Control.
 //!
-//! Stream ID は SRT ハンドシェイク時に Caller から Listener に送信される識別子。
-//! Access Control 構文を使用することで、認証やリソース指定などの情報を構造化して送信できる。
+//! The Stream ID is an identifier sent from the Caller to the Listener during
+//! the SRT handshake. Using the Access Control syntax lets structured
+//! information -- authentication, resource selection, and so on -- ride along
+//! in it.
 //!
-//! ## Access Control 構文
+//! ## Access Control syntax
 //!
 //! ```text
 //! #!::key1=value1,key2=value2,...
 //! ```
 //!
-//! ## 標準キー
+//! ## Standard keys
 //!
-//! - `u`: User Name (認証名)
-//! - `r`: Resource Name (リソース名)
-//! - `h`: Host Name (ホスト名)
-//! - `s`: Session ID (セッション ID)
+//! - `u`: User Name
+//! - `r`: Resource Name
+//! - `h`: Host Name
+//! - `s`: Session ID
 //! - `t`: Type (stream, file, auth)
 //! - `m`: Mode (request, publish, bidirectional)
 //!
-//! ## 例
+//! ## Example
 //!
 //! ```
 //! use shiguredo_srt::stream_id::{AccessControl, StreamMode, StreamType};
@@ -30,23 +32,23 @@
 
 use std::collections::HashMap;
 
-/// Access Control 構文のプレフィックス
+/// The Access Control syntax's prefix.
 const ACCESS_CONTROL_PREFIX: &str = "#!::";
 
-/// ストリームタイプ
+/// Stream type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StreamType {
-    /// ストリーム (デフォルト)
+    /// Stream (default).
     #[default]
     Stream,
-    /// ファイル転送
+    /// File transfer.
     File,
-    /// 認証
+    /// Authentication.
     Auth,
 }
 
 impl StreamType {
-    /// 文字列から変換
+    /// Convert from a string.
     #[expect(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
@@ -57,7 +59,7 @@ impl StreamType {
         }
     }
 
-    /// 文字列に変換
+    /// Convert to a string.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Stream => "stream",
@@ -67,20 +69,20 @@ impl StreamType {
     }
 }
 
-/// ストリームモード
+/// Stream mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StreamMode {
-    /// リクエスト (デフォルト): Caller がデータを受信
+    /// Request (default): the Caller receives data.
     #[default]
     Request,
-    /// パブリッシュ: Caller がデータを送信
+    /// Publish: the Caller sends data.
     Publish,
-    /// 双方向
+    /// Bidirectional.
     Bidirectional,
 }
 
 impl StreamMode {
-    /// 文字列から変換
+    /// Convert from a string.
     #[expect(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
@@ -91,7 +93,7 @@ impl StreamMode {
         }
     }
 
-    /// 文字列に変換
+    /// Convert to a string.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Request => "request",
@@ -101,36 +103,37 @@ impl StreamMode {
     }
 }
 
-/// Access Control パース結果
+/// The result of parsing an Access Control Stream ID.
 #[derive(Debug, Clone, Default)]
 pub struct AccessControl {
-    /// ユーザー名 (u)
+    /// User name (u).
     user_name: Option<String>,
-    /// リソース名 (r)
+    /// Resource name (r).
     resource_name: Option<String>,
-    /// ホスト名 (h)
+    /// Host name (h).
     host_name: Option<String>,
-    /// セッション ID (s)
+    /// Session ID (s).
     session_id: Option<String>,
-    /// タイプ (t)
+    /// Type (t).
     stream_type: StreamType,
-    /// モード (m)
+    /// Mode (m).
     stream_mode: StreamMode,
-    /// カスタムキー
+    /// Custom keys.
     custom: HashMap<String, String>,
 }
 
 impl AccessControl {
-    /// Access Control 構文をパース
+    /// Parse the Access Control syntax.
     ///
-    /// `#!::` プレフィックスがない場合や、フリーフォームの Stream ID の場合は None を返す。
+    /// Returns `None` if the `#!::` prefix is absent, i.e. for a free-form
+    /// Stream ID.
     pub fn parse(stream_id: &str) -> Option<Self> {
-        // プレフィックスをチェック
+        // Check the prefix.
         let content = stream_id.strip_prefix(ACCESS_CONTROL_PREFIX)?;
 
         let mut ac = AccessControl::default();
 
-        // カンマ区切りのキー・バリューペアをパース
+        // Parse comma-separated key/value pairs.
         for pair in content.split(',') {
             if let Some((key, value)) = pair.split_once('=') {
                 let key = key.trim();
@@ -152,7 +155,7 @@ impl AccessControl {
                         }
                     }
                     _ => {
-                        // カスタムキー
+                        // Custom key.
                         ac.custom.insert(key.to_string(), value.to_string());
                     }
                 }
@@ -162,7 +165,7 @@ impl AccessControl {
         Some(ac)
     }
 
-    /// Access Control 構文を生成
+    /// Produce the Access Control syntax.
     pub fn encode(&self) -> String {
         let mut parts = Vec::new();
 
@@ -191,102 +194,102 @@ impl AccessControl {
         format!("{ACCESS_CONTROL_PREFIX}{}", parts.join(","))
     }
 
-    /// ユーザー名を取得
+    /// Get the user name.
     pub fn user_name(&self) -> Option<&str> {
         self.user_name.as_deref()
     }
 
-    /// リソース名を取得
+    /// Get the resource name.
     pub fn resource_name(&self) -> Option<&str> {
         self.resource_name.as_deref()
     }
 
-    /// ホスト名を取得
+    /// Get the host name.
     pub fn host_name(&self) -> Option<&str> {
         self.host_name.as_deref()
     }
 
-    /// セッション ID を取得
+    /// Get the session ID.
     pub fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
     }
 
-    /// ストリームタイプを取得
+    /// Get the stream type.
     pub fn stream_type(&self) -> StreamType {
         self.stream_type
     }
 
-    /// ストリームモードを取得
+    /// Get the stream mode.
     pub fn stream_mode(&self) -> StreamMode {
         self.stream_mode
     }
 
-    /// カスタムキーを取得
+    /// Get a custom key's value.
     pub fn custom(&self, key: &str) -> Option<&str> {
         self.custom.get(key).map(|s| s.as_str())
     }
 }
 
-/// Access Control ビルダー
+/// A builder for [`AccessControl`].
 #[derive(Debug, Clone, Default)]
 pub struct AccessControlBuilder {
     ac: AccessControl,
 }
 
 impl AccessControlBuilder {
-    /// 新しいビルダーを作成
+    /// Create a new builder.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// ユーザー名を設定
+    /// Set the user name.
     pub fn user_name(mut self, name: impl Into<String>) -> Self {
         self.ac.user_name = Some(name.into());
         self
     }
 
-    /// リソース名を設定
+    /// Set the resource name.
     pub fn resource_name(mut self, name: impl Into<String>) -> Self {
         self.ac.resource_name = Some(name.into());
         self
     }
 
-    /// ホスト名を設定
+    /// Set the host name.
     pub fn host_name(mut self, name: impl Into<String>) -> Self {
         self.ac.host_name = Some(name.into());
         self
     }
 
-    /// セッション ID を設定
+    /// Set the session ID.
     pub fn session_id(mut self, id: impl Into<String>) -> Self {
         self.ac.session_id = Some(id.into());
         self
     }
 
-    /// ストリームタイプを設定
+    /// Set the stream type.
     pub fn stream_type(mut self, t: StreamType) -> Self {
         self.ac.stream_type = t;
         self
     }
 
-    /// ストリームモードを設定
+    /// Set the stream mode.
     pub fn stream_mode(mut self, m: StreamMode) -> Self {
         self.ac.stream_mode = m;
         self
     }
 
-    /// カスタムキーを設定
+    /// Set a custom key.
     pub fn custom(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.ac.custom.insert(key.into(), value.into());
         self
     }
 
-    /// AccessControl を構築
+    /// Build the [`AccessControl`].
     pub fn build(self) -> AccessControl {
         self.ac
     }
 
-    /// Stream ID 文字列を構築
+    /// Build the Stream ID string.
     pub fn build_stream_id(self) -> String {
         self.ac.encode()
     }
@@ -299,7 +302,7 @@ mod tests {
     #[test]
     fn test_parse_basic() {
         let ac = AccessControl::parse("#!::u=admin,r=bluesbrothers1_hi")
-            .expect("有効なストリーム ID のパースは成功する想定");
+            .expect("parsing a valid stream ID should succeed");
         assert_eq!(ac.user_name(), Some("admin"));
         assert_eq!(ac.resource_name(), Some("bluesbrothers1_hi"));
         assert_eq!(ac.stream_type(), StreamType::Stream);
@@ -309,7 +312,7 @@ mod tests {
     #[test]
     fn test_parse_with_type_and_mode() {
         let ac = AccessControl::parse("#!::u=johnny,t=file,m=publish,r=results.csv")
-            .expect("有効なストリーム ID のパースは成功する想定");
+            .expect("parsing a valid stream ID should succeed");
         assert_eq!(ac.user_name(), Some("johnny"));
         assert_eq!(ac.resource_name(), Some("results.csv"));
         assert_eq!(ac.stream_type(), StreamType::File);
@@ -319,7 +322,7 @@ mod tests {
     #[test]
     fn test_parse_with_host() {
         let ac = AccessControl::parse("#!::h=example.com,r=live/stream1")
-            .expect("有効なストリーム ID のパースは成功する想定");
+            .expect("parsing a valid stream ID should succeed");
         assert_eq!(ac.host_name(), Some("example.com"));
         assert_eq!(ac.resource_name(), Some("live/stream1"));
     }
@@ -327,7 +330,7 @@ mod tests {
     #[test]
     fn test_parse_with_session() {
         let ac = AccessControl::parse("#!::s=abc123,r=temp")
-            .expect("有効なストリーム ID のパースは成功する想定");
+            .expect("parsing a valid stream ID should succeed");
         assert_eq!(ac.session_id(), Some("abc123"));
         assert_eq!(ac.resource_name(), Some("temp"));
     }
@@ -335,7 +338,7 @@ mod tests {
     #[test]
     fn test_parse_with_custom() {
         let ac = AccessControl::parse("#!::u=test,myapp_key=value123")
-            .expect("有効なストリーム ID のパースは成功する想定");
+            .expect("parsing a valid stream ID should succeed");
         assert_eq!(ac.user_name(), Some("test"));
         assert_eq!(ac.custom("myapp_key"), Some("value123"));
     }
@@ -384,8 +387,8 @@ mod tests {
             .build();
 
         let encoded = original.encode();
-        let parsed = AccessControl::parse(&encoded)
-            .expect("エンコード済みストリーム ID のパースは成功する想定");
+        let parsed =
+            AccessControl::parse(&encoded).expect("parsing an encoded stream ID should succeed");
 
         assert_eq!(parsed.user_name(), original.user_name());
         assert_eq!(parsed.resource_name(), original.resource_name());

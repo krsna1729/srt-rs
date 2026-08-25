@@ -1,25 +1,25 @@
-//! SRT パケット共通構造
+//! Common SRT packet structures.
 //!
-//! SRT パケットは UDP ペイロードとして送信される。
-//! F ビット (最上位ビット) でデータパケット (0) と制御パケット (1) を区別する。
+//! SRT packets are sent as UDP payloads. The F bit (the top bit) distinguishes
+//! data packets (0) from control packets (1).
 
 use crate::buf::{read_u32, write_bytes, write_u32};
 use crate::error::Error;
 
-/// SRT パケットの最小ヘッダサイズ (16 bytes)
+/// The minimum SRT packet header size (16 bytes).
 pub const SRT_HEADER_SIZE: usize = 16;
 
-/// パケットタイプ
+/// Packet type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PacketType {
-    /// データパケット (F=0)
+    /// Data packet (F=0).
     Data,
-    /// 制御パケット (F=1)
+    /// Control packet (F=1).
     Control,
 }
 
 impl PacketType {
-    /// 最初の 32 ビットからパケットタイプを判定
+    /// Determine the packet type from the first 32 bits.
     pub fn from_first_word(word: u32) -> Self {
         if word & 0x8000_0000 != 0 {
             PacketType::Control
@@ -29,17 +29,17 @@ impl PacketType {
     }
 }
 
-/// SRT パケット (データまたは制御)
+/// An SRT packet (data or control).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SrtPacket {
-    /// データパケット
+    /// A data packet.
     Data(DataPacket),
-    /// 制御パケット
+    /// A control packet.
     Control(ControlPacket),
 }
 
 impl SrtPacket {
-    /// バイト列からデコード
+    /// Decode from a byte slice.
     #[track_caller]
     pub fn decode(buf: &[u8]) -> Result<Self, Error> {
         Error::check_buffer_size(SRT_HEADER_SIZE, buf)?;
@@ -48,15 +48,15 @@ impl SrtPacket {
         let first_word = read_u32(&mut slice)?;
 
         if PacketType::from_first_word(first_word) == PacketType::Data {
-            // データパケットとしてデコード
+            // Decode as a data packet.
             DataPacket::decode_with_first_word(first_word, buf).map(SrtPacket::Data)
         } else {
-            // 制御パケットとしてデコード
+            // Decode as a control packet.
             ControlPacket::decode_with_first_word(first_word, buf).map(SrtPacket::Control)
         }
     }
 
-    /// バイト列にエンコード
+    /// Encode to a byte buffer.
     pub fn encode(&self, buf: &mut Vec<u8>) {
         match self {
             SrtPacket::Data(pkt) => pkt.encode(buf),
@@ -78,22 +78,22 @@ pub fn peek_destination_socket_id(buf: &[u8]) -> Result<u32, Error> {
     ))
 }
 
-/// パケット位置フラグ (PP)
+/// Packet position flag (PP).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PacketPosition {
-    /// メッセージの最初のパケット (10b)
+    /// The first packet of a message (10b).
     First = 0b10,
-    /// メッセージの中間パケット (00b)
+    /// A middle packet of a message (00b).
     Middle = 0b00,
-    /// メッセージの最後のパケット (01b)
+    /// The last packet of a message (01b).
     Last = 0b01,
-    /// 単一パケットでメッセージ全体 (11b)
+    /// The whole message in a single packet (11b).
     #[default]
     Single = 0b11,
 }
 
 impl PacketPosition {
-    /// PP フィールド値から取得
+    /// Get the value from a PP field.
     pub fn from_bits(bits: u8) -> Self {
         match bits & 0b11 {
             0b10 => Self::First,
@@ -104,38 +104,38 @@ impl PacketPosition {
         }
     }
 
-    /// PP フィールド値へ変換
+    /// Convert to a PP field value.
     pub fn to_bits(self) -> u8 {
         self as u8
     }
 }
 
-/// データパケット
+/// A data packet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DataPacket {
-    /// パケットシーケンス番号 (31 bits)
+    /// Packet sequence number (31 bits).
     pub sequence_number: u32,
-    /// パケット位置フラグ (PP, 2 bits)
+    /// Packet position flag (PP, 2 bits).
     pub position: PacketPosition,
-    /// 順序フラグ (O, 1 bit)
+    /// Order flag (O, 1 bit).
     pub order_flag: bool,
-    /// 暗号化キーフラグ (KK, 2 bits)
-    /// 00b: 暗号化なし, 01b: 偶数キー, 10b: 奇数キー
+    /// Encryption key flag (KK, 2 bits).
+    /// 00b: unencrypted, 01b: even key, 10b: odd key.
     pub encryption_flag: u8,
-    /// 再送信フラグ (R, 1 bit)
+    /// Retransmitted flag (R, 1 bit).
     pub retransmitted: bool,
-    /// メッセージ番号 (26 bits)
+    /// Message number (26 bits).
     pub message_number: u32,
-    /// タイムスタンプ (マイクロ秒)
+    /// Timestamp (microseconds).
     pub timestamp: u32,
-    /// 宛先ソケット ID
+    /// Destination socket ID.
     pub dest_socket_id: u32,
-    /// ペイロード
+    /// Payload.
     pub payload: Vec<u8>,
 }
 
 impl DataPacket {
-    /// 新しいデータパケットを作成
+    /// Create a new data packet.
     pub fn new(
         sequence_number: u32,
         message_number: u32,
@@ -156,12 +156,12 @@ impl DataPacket {
         }
     }
 
-    /// バイト列からデコード (最初の 32 ビットは既に読み込み済み)
+    /// Decode from a byte slice, given the already-read first 32 bits.
     #[track_caller]
     fn decode_with_first_word(first_word: u32, buf: &[u8]) -> Result<Self, Error> {
         Error::check_buffer_size(SRT_HEADER_SIZE, buf)?;
 
-        let mut slice = &buf[4..]; // 最初の 4 バイトはスキップ
+        let mut slice = &buf[4..]; // Skip the first 4 bytes.
 
         let sequence_number = first_word & 0x7FFF_FFFF;
 
@@ -190,7 +190,7 @@ impl DataPacket {
         })
     }
 
-    /// バイト列にエンコード
+    /// Encode to a byte buffer.
     pub fn encode(&self, buf: &mut Vec<u8>) {
         // First word: F=0, sequence_number
         let first_word = self.sequence_number & 0x7FFF_FFFF;
@@ -209,40 +209,40 @@ impl DataPacket {
         write_bytes(buf, &self.payload);
     }
 
-    /// エンコード後のサイズを取得
+    /// Get the encoded size.
     pub fn encoded_size(&self) -> usize {
         SRT_HEADER_SIZE + self.payload.len()
     }
 }
 
-/// 制御パケットタイプ
+/// Control packet type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub enum ControlType {
-    /// ハンドシェイク
+    /// Handshake.
     Handshake = 0x0000,
-    /// キープアライブ
+    /// Keepalive.
     Keepalive = 0x0001,
-    /// ACK (確認応答)
+    /// ACK (acknowledgment).
     Ack = 0x0002,
-    /// NAK (損失報告)
+    /// NAK (loss report).
     Nak = 0x0003,
-    /// 輻輳警告
+    /// Congestion warning.
     CongestionWarning = 0x0004,
-    /// シャットダウン
+    /// Shutdown.
     Shutdown = 0x0005,
-    /// ACKACK
+    /// ACKACK.
     AckAck = 0x0006,
-    /// ドロップ要求
+    /// Drop request.
     DropReq = 0x0007,
-    /// ピアエラー
+    /// Peer error.
     PeerError = 0x0008,
-    /// ユーザー定義
+    /// User-defined.
     UserDefined = 0x7FFF,
 }
 
 impl ControlType {
-    /// 値から ControlType を取得
+    /// Get the `ControlType` for a value.
     pub fn from_u16(value: u16) -> Option<Self> {
         match value {
             0x0000 => Some(Self::Handshake),
@@ -260,25 +260,25 @@ impl ControlType {
     }
 }
 
-/// 制御パケット
+/// A control packet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlPacket {
-    /// 制御タイプ (15 bits)
+    /// Control type (15 bits).
     pub control_type: ControlType,
-    /// サブタイプ (16 bits)
+    /// Subtype (16 bits).
     pub subtype: u16,
-    /// タイプ固有情報 (32 bits)
+    /// Type-specific information (32 bits).
     pub type_specific_info: u32,
-    /// タイムスタンプ (マイクロ秒)
+    /// Timestamp (microseconds).
     pub timestamp: u32,
-    /// 宛先ソケット ID
+    /// Destination socket ID.
     pub dest_socket_id: u32,
-    /// 制御情報フィールド (CIF)
+    /// Control Information Field (CIF).
     pub control_info: Vec<u8>,
 }
 
 impl ControlPacket {
-    /// 新しい制御パケットを作成
+    /// Create a new control packet.
     pub fn new(control_type: ControlType, timestamp: u32, dest_socket_id: u32) -> Self {
         Self {
             control_type,
@@ -290,12 +290,12 @@ impl ControlPacket {
         }
     }
 
-    /// バイト列からデコード (最初の 32 ビットは既に読み込み済み)
+    /// Decode from a byte slice, given the already-read first 32 bits.
     #[track_caller]
     fn decode_with_first_word(first_word: u32, buf: &[u8]) -> Result<Self, Error> {
         Error::check_buffer_size(SRT_HEADER_SIZE, buf)?;
 
-        let mut slice = &buf[4..]; // 最初の 4 バイトはスキップ
+        let mut slice = &buf[4..]; // Skip the first 4 bytes.
 
         let control_type_raw = ((first_word >> 16) & 0x7FFF) as u16;
         let control_type = ControlType::from_u16(control_type_raw).ok_or_else(|| {
@@ -319,7 +319,7 @@ impl ControlPacket {
         })
     }
 
-    /// バイト列にエンコード
+    /// Encode to a byte buffer.
     pub fn encode(&self, buf: &mut Vec<u8>) {
         // First word: F=1, control_type, subtype
         let first_word = 0x8000_0000
@@ -333,19 +333,19 @@ impl ControlPacket {
         write_bytes(buf, &self.control_info);
     }
 
-    /// エンコード後のサイズを取得
+    /// Get the encoded size.
     pub fn encoded_size(&self) -> usize {
         SRT_HEADER_SIZE + self.control_info.len()
     }
 }
 
-/// シーケンス番号の比較 (ラップアラウンド対応, 31-bit)
+/// Compare sequence numbers, wraparound-aware (31-bit).
 pub(crate) fn sequence_less_than(a: u32, b: u32) -> bool {
     let diff = b.wrapping_sub(a) & 0x7FFF_FFFF;
     diff > 0 && diff < 0x4000_0000
 }
 
-/// シーケンス番号の比較 (ラップアラウンド対応, 31-bit)
+/// Compare sequence numbers, wraparound-aware (31-bit).
 pub(crate) fn sequence_greater_than(a: u32, b: u32) -> bool {
     sequence_less_than(b, a)
 }
@@ -371,12 +371,11 @@ mod tests {
         let mut buf = Vec::new();
         original.encode(&mut buf);
 
-        let decoded = match SrtPacket::decode(&buf)
-            .expect("エンコード済みパケットのデコードは成功する想定")
-        {
-            SrtPacket::Data(pkt) => pkt,
-            _ => panic!("expected data packet"),
-        };
+        let decoded =
+            match SrtPacket::decode(&buf).expect("decoding an encoded packet should succeed") {
+                SrtPacket::Data(pkt) => pkt,
+                _ => panic!("expected data packet"),
+            };
 
         assert_eq!(original, decoded);
     }
@@ -395,12 +394,11 @@ mod tests {
         let mut buf = Vec::new();
         original.encode(&mut buf);
 
-        let decoded = match SrtPacket::decode(&buf)
-            .expect("エンコード済みパケットのデコードは成功する想定")
-        {
-            SrtPacket::Control(pkt) => pkt,
-            _ => panic!("expected control packet"),
-        };
+        let decoded =
+            match SrtPacket::decode(&buf).expect("decoding an encoded packet should succeed") {
+                SrtPacket::Control(pkt) => pkt,
+                _ => panic!("expected control packet"),
+            };
 
         assert_eq!(original, decoded);
     }

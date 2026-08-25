@@ -1,9 +1,9 @@
-//! SRT 暗号化モジュール
+//! SRT encryption module.
 //!
-//! SRT は AES-CTR で暗号化を行う。
-//! - KEK (Key Encrypting Key): パスフレーズから PBKDF2 で導出
-//! - SEK (Stream Encrypting Key): ランダム生成、KEK で AES Key Wrap
-//! - AES-CTR でデータ暗号化
+//! SRT encrypts payloads with AES-CTR.
+//! - KEK (Key Encrypting Key): derived from the passphrase via PBKDF2
+//! - SEK (Stream Encrypting Key): generated randomly, wrapped with the KEK via AES Key Wrap
+//! - Payload data is encrypted with AES-CTR
 //!
 //! local patch (crates/srt-protocol/VENDOR.md): originally
 //! `aws-lc-rs`, which pulls in `aws-lc-sys` -- a cmake+C-compiler native
@@ -36,10 +36,10 @@ use zeroize::Zeroize;
 
 use crate::error::Error;
 
-/// PBKDF2 のイテレーション回数 (SRT 仕様)
+/// Number of PBKDF2 iterations (per the SRT specification).
 const PBKDF2_ITERATIONS: u32 = 2048;
 
-/// 鍵長
+/// Key length.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum KeyLength {
     /// AES-128 (16 bytes)
@@ -52,13 +52,13 @@ pub enum KeyLength {
 }
 
 impl KeyLength {
-    /// バイト長を取得
+    /// Get the length in bytes.
     #[expect(clippy::len_without_is_empty)]
     pub fn len(self) -> usize {
         self as usize
     }
 
-    /// バイト長から KeyLength を取得
+    /// Get the `KeyLength` for a length in bytes.
     pub fn from_len(len: usize) -> Option<Self> {
         match len {
             16 => Some(Self::Aes128),
@@ -68,7 +68,7 @@ impl KeyLength {
         }
     }
 
-    /// ハンドシェイクの Encryption Field 値から取得
+    /// Get the `KeyLength` from a handshake Encryption Field value.
     pub fn from_encryption_field(value: u16) -> Option<Self> {
         match value {
             2 => Some(Self::Aes128),
@@ -78,7 +78,7 @@ impl KeyLength {
         }
     }
 
-    /// ハンドシェイクの Encryption Field 値へ変換
+    /// Convert to a handshake Encryption Field value.
     pub fn to_encryption_field(self) -> u16 {
         match self {
             Self::Aes128 => 2,
@@ -88,18 +88,18 @@ impl KeyLength {
     }
 }
 
-/// 鍵フラグ (奇数/偶数)
+/// Key flag (odd/even).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum KeyFlag {
-    /// 偶数鍵
+    /// Even key.
     #[default]
     Even = 0b01,
-    /// 奇数鍵
+    /// Odd key.
     Odd = 0b10,
 }
 
 impl KeyFlag {
-    /// KK フィールド値から取得
+    /// Get the flag from a KK field value.
     pub fn from_kk_field(value: u8) -> Option<Self> {
         match value & 0b11 {
             0b01 => Some(Self::Even),
@@ -108,12 +108,12 @@ impl KeyFlag {
         }
     }
 
-    /// KK フィールド値へ変換
+    /// Convert to a KK field value.
     pub fn to_kk_field(self) -> u8 {
         self as u8
     }
 
-    /// 反対の鍵フラグを取得
+    /// Get the opposite key flag.
     pub fn other(self) -> Self {
         match self {
             Self::Even => Self::Odd,
@@ -122,37 +122,37 @@ impl KeyFlag {
     }
 }
 
-/// KM Refresh 状態
+/// KM refresh state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum KmRefreshState {
-    /// アイドル状態 (リフレッシュ不要)
+    /// Idle; no refresh needed.
     #[default]
     Idle,
-    /// 事前通知中 (新キーを生成・送信済み、切り替え待ち)
+    /// Pre-announcing: a new key has been generated and sent, awaiting switchover.
     PreAnnounce,
-    /// 鍵切り替え完了、古いキーの廃棄待ち
+    /// Key switch complete, awaiting disposal of the old key.
     PostAnnounce,
 }
 
-/// 暗号化コンテキスト
+/// Encryption context.
 pub struct CryptoContext {
-    /// Key Encrypting Key (PBKDF2 で導出)
+    /// Key Encrypting Key (derived via PBKDF2).
     kek: Vec<u8>,
-    /// Stream Encrypting Key (偶数)
+    /// Stream Encrypting Key (even).
     sek_even: Vec<u8>,
-    /// Stream Encrypting Key (奇数)
+    /// Stream Encrypting Key (odd).
     sek_odd: Vec<u8>,
-    /// Salt (16 bytes)
+    /// Salt (16 bytes).
     salt: [u8; 16],
-    /// 現在使用中の鍵
+    /// The key currently in use.
     current_key: KeyFlag,
-    /// 鍵長
+    /// Key length.
     key_length: KeyLength,
-    /// 暗号化したパケット数
+    /// Number of packets encrypted so far.
     encrypted_packet_count: u64,
-    /// KM Refresh 状態
+    /// KM refresh state.
     km_refresh_state: KmRefreshState,
-    /// 次のキー (事前通知中に生成)
+    /// The next key (generated while pre-announcing).
     next_key: Option<KeyFlag>,
 }
 
@@ -191,15 +191,15 @@ impl Drop for CryptoContext {
 }
 
 impl CryptoContext {
-    /// KM リフレッシュ期間 (2^25 パケット)
+    /// KM refresh period (2^25 packets).
     pub const KM_REFRESH_PERIOD: u64 = 1 << 25;
 
-    /// KM 事前通知期間 (4000 パケット)
+    /// KM pre-announce period (4000 packets).
     pub const KM_PRE_ANNOUNCE_PERIOD: u64 = 4000;
 
-    /// パスフレーズから暗号化コンテキストを生成 (送信側)
+    /// Build an encryption context from a passphrase (sender side).
     ///
-    /// salt と sek は外部から乱数で生成して渡す。
+    /// `salt` and `sek` must be generated externally from a random source.
     pub fn new_sender(
         passphrase: &str,
         key_length: KeyLength,
@@ -233,9 +233,9 @@ impl CryptoContext {
         })
     }
 
-    /// パスフレーズとキーマテリアルから暗号化コンテキストを生成 (受信側)
+    /// Build an encryption context from a passphrase and key material (receiver side).
     ///
-    /// KEK で SEK をアンラップする。
+    /// Unwraps the SEK with the KEK.
     pub fn new_receiver(
         passphrase: &str,
         salt: [u8; 16],
@@ -270,22 +270,22 @@ impl CryptoContext {
         })
     }
 
-    /// Salt を取得
+    /// Get the salt.
     pub fn salt(&self) -> &[u8; 16] {
         &self.salt
     }
 
-    /// 現在の鍵フラグを取得
+    /// Get the current key flag.
     pub fn current_key(&self) -> KeyFlag {
         self.current_key
     }
 
-    /// 鍵長を取得
+    /// Get the key length.
     pub fn key_length(&self) -> KeyLength {
         self.key_length
     }
 
-    /// SEK をラップして取得 (KM メッセージ用)
+    /// Get the SEK, wrapped for a KM message.
     pub fn wrap_sek(&self, key_flag: KeyFlag) -> Result<Vec<u8>, Error> {
         let sek = match key_flag {
             KeyFlag::Even => &self.sek_even,
@@ -294,7 +294,7 @@ impl CryptoContext {
         wrap_sek(&self.kek, sek, self.key_length)
     }
 
-    /// データを暗号化する
+    /// Encrypt data.
     pub fn encrypt(&mut self, packet_index: u32, payload: &mut [u8]) -> Result<KeyFlag, Error> {
         let sek = match self.current_key {
             KeyFlag::Even => &self.sek_even,
@@ -307,7 +307,7 @@ impl CryptoContext {
         Ok(self.current_key)
     }
 
-    /// データを復号化する
+    /// Decrypt data.
     pub fn decrypt(
         &self,
         packet_index: u32,
@@ -319,37 +319,37 @@ impl CryptoContext {
             KeyFlag::Odd => &self.sek_odd,
         };
 
-        // AES-CTR は暗号化と復号化が同じ操作
+        // AES-CTR: encryption and decryption are the same operation.
         encrypt_payload(sek, &self.salt, packet_index, payload, self.key_length)
     }
 
-    /// KM Refresh 状態を取得
+    /// Get the KM refresh state.
     pub fn km_refresh_state(&self) -> KmRefreshState {
         self.km_refresh_state
     }
 
-    /// 事前通知が必要かどうか (2^25 - 4000 パケット)
+    /// Whether pre-announcing is needed (2^25 - 4000 packets).
     pub fn should_pre_announce(&self) -> bool {
         self.km_refresh_state == KmRefreshState::Idle
             && self.encrypted_packet_count >= Self::KM_REFRESH_PERIOD - Self::KM_PRE_ANNOUNCE_PERIOD
     }
 
-    /// 鍵切り替えが必要かどうか (2^25 パケット)
+    /// Whether a key switch is needed (2^25 packets).
     pub fn should_switch_key(&self) -> bool {
         self.km_refresh_state == KmRefreshState::PreAnnounce
             && self.encrypted_packet_count >= Self::KM_REFRESH_PERIOD
     }
 
-    /// 古い鍵の廃棄が必要かどうか (2^25 + 4000 パケット)
+    /// Whether the old key needs to be disposed of (2^25 + 4000 packets).
     pub fn should_decommission_old_key(&self) -> bool {
         self.km_refresh_state == KmRefreshState::PostAnnounce
             && self.encrypted_packet_count >= Self::KM_PRE_ANNOUNCE_PERIOD
     }
 
-    /// 新しい SEK で事前通知を開始
+    /// Begin pre-announcing a new SEK.
     ///
-    /// new_sek は外部から乱数で生成して渡す。
-    /// ラップされた SEK を返す。呼び出し側は KMREQ を送信する必要がある。
+    /// `new_sek` must be generated externally from a random source.
+    /// Returns the wrapped SEK; the caller must send a KMREQ.
     pub fn start_pre_announce(&mut self, new_sek: &[u8]) -> Result<(KeyFlag, Vec<u8>), Error> {
         if new_sek.len() != self.key_length.len() {
             return Err(Error::crypto_error("invalid SEK length"));
@@ -375,7 +375,7 @@ impl CryptoContext {
         Ok((new_key_flag, wrapped_sek))
     }
 
-    /// 鍵を切り替える (2^25 パケット到達時)
+    /// Switch keys (once 2^25 packets is reached).
     pub fn switch_key(&mut self) {
         if let Some(next_key) = self.next_key.take() {
             self.current_key = next_key;
@@ -384,9 +384,9 @@ impl CryptoContext {
         }
     }
 
-    /// 古い鍵を廃棄 (2^25 + 4000 パケット到達時)
+    /// Dispose of the old key (once 2^25 + 4000 packets is reached).
     pub fn decommission_old_key(&mut self) {
-        // 古い鍵をゼロクリア
+        // Zero the old key.
         let old_key = self.current_key.other();
         match old_key {
             KeyFlag::Even => self.sek_even.fill(0),
@@ -395,7 +395,7 @@ impl CryptoContext {
         self.km_refresh_state = KmRefreshState::Idle;
     }
 
-    /// 受信した KM メッセージから SEK を更新
+    /// Update the SEK from a received KM message.
     pub fn update_sek(&mut self, wrapped_sek: &[u8], key_flag: KeyFlag) -> Result<(), Error> {
         let sek = unwrap_sek(&self.kek, wrapped_sek, self.key_length)?;
         if sek.iter().all(|byte| *byte == 0) {
@@ -414,16 +414,16 @@ impl CryptoContext {
     }
 }
 
-/// PBKDF2 で KEK を導出
+/// Derive the KEK via PBKDF2.
 fn derive_kek(passphrase: &str, salt: &[u8; 16], key_length: KeyLength) -> Vec<u8> {
     let mut kek = vec![0u8; key_length.len()];
-    // Salt の下位 64 bits (8 bytes) を使用
+    // Use the salt's low 64 bits (8 bytes).
     let salt_lsb = &salt[8..16];
     pbkdf2_hmac::<Sha1>(passphrase.as_bytes(), salt_lsb, PBKDF2_ITERATIONS, &mut kek);
     kek
 }
 
-/// SEK を AES Key Wrap (RFC 3394) でラップ
+/// Wrap the SEK with AES Key Wrap (RFC 3394).
 fn wrap_sek(kek: &[u8], sek: &[u8], key_length: KeyLength) -> Result<Vec<u8>, Error> {
     let mut wrapped = vec![0u8; sek.len() + 8];
     match key_length {
@@ -449,7 +449,7 @@ fn wrap_sek(kek: &[u8], sek: &[u8], key_length: KeyLength) -> Result<Vec<u8>, Er
     Ok(wrapped)
 }
 
-/// SEK を AES Key Wrap (RFC 3394) でアンラップ
+/// Unwrap the SEK with AES Key Wrap (RFC 3394).
 fn unwrap_sek(kek: &[u8], wrapped: &[u8], key_length: KeyLength) -> Result<Vec<u8>, Error> {
     if wrapped.len() < 8 {
         return Err(Error::crypto_error("wrapped key too short"));
@@ -479,7 +479,7 @@ fn unwrap_sek(kek: &[u8], wrapped: &[u8], key_length: KeyLength) -> Result<Vec<u
     Ok(unwrapped)
 }
 
-/// AES-CTR でペイロードを暗号化/復号化
+/// Encrypt/decrypt a payload with AES-CTR.
 fn encrypt_payload(
     sek: &[u8],
     salt: &[u8; 16],
@@ -487,29 +487,29 @@ fn encrypt_payload(
     payload: &mut [u8],
     key_length: KeyLength,
 ) -> Result<(), Error> {
-    // カウンタブロック (AES-CTR の初期 IV) を構築する。
-    // 根拠資料: draft-sharabayko-srt.md「Encryption」セクション内「AES Counter」サブセクション。
-    // 128-bit のカウンタブロックをビッグエンディアンの 16 バイト配列とみなすと:
-    //   - bits 0-15 (bytes 14-15): block counter。各パケットの先頭ブロックでは 0。Salt とは XOR しない
+    // Build the counter block (the initial IV for AES-CTR).
+    // Reference: draft-sharabayko-srt.md, "Encryption" section, "AES Counter" subsection.
+    // Treating the 128-bit counter block as a big-endian 16-byte array:
+    //   - bits 0-15 (bytes 14-15): block counter. 0 for each packet's first block; not XORed with the salt.
     //   - bits 16-47 (bytes 10-13): packet index
-    //   - bits 48-127 (bytes 0-9): ゼロ
-    //   - 上位 112 bits (bytes 0-13) を IV = MSB(112, Salt) (= salt[0..14]) と XOR する
-    // この構造は libsrt の haicrypt 実装のカウンタブロックと一致する。
-    // 仕様の節構成・行番号・式表現は将来変更される可能性がある。
+    //   - bits 48-127 (bytes 0-9): zero
+    //   - the upper 112 bits (bytes 0-13) are XORed with IV = MSB(112, Salt) (= salt[0..14])
+    // This matches the counter block construction in libsrt's haicrypt implementation.
+    // The spec's section layout, line numbers, and notation may change in the future.
     let mut iv = [0u8; 16];
-    // 上位 112 bits (bytes 0-13) に IV = MSB(112, Salt) を置く。bytes 14-15 は 0 のまま。
+    // Place IV = MSB(112, Salt) in the upper 112 bits (bytes 0-13); bytes 14-15 stay 0.
     iv[..14].copy_from_slice(&salt[..14]);
 
-    // packet index を bytes 10-13 に XOR する (to_be_bytes は [MSB, .., LSB])。
+    // XOR the packet index into bytes 10-13 (to_be_bytes gives [MSB, .., LSB]).
     let pi_bytes = packet_index.to_be_bytes();
     iv[10] ^= pi_bytes[0];
     iv[11] ^= pi_bytes[1];
     iv[12] ^= pi_bytes[2];
     iv[13] ^= pi_bytes[3];
 
-    // CTR モードでは暗号化と復号化は同じ操作 (鍵ストリームとの XOR)。
-    // 128-bit カウンタブロック全体をビッグエンディアンのカウンタとして扱う
-    // Ctr128BE が libsrt の haicrypt 実装と一致する (上記コメント参照)。
+    // In CTR mode, encryption and decryption are the same operation (XOR with the keystream).
+    // Ctr128BE treats the whole 128-bit counter block as a big-endian counter, matching
+    // libsrt's haicrypt implementation (see the comment above).
     match key_length {
         KeyLength::Aes128 => {
             let mut cipher = Ctr128BE::<Aes128>::new_from_slices(sek, &iv)

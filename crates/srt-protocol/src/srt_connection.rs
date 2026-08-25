@@ -1,7 +1,7 @@
-//! SRT Connection (sansio パターン)
+//! SRT Connection (sans-I/O pattern).
 //!
-//! SRT 接続を管理する状態機械。
-//! I/O は外部で行い、この構造体はバッファ駆動型で動作する。
+//! A state machine that manages an SRT connection.
+//! I/O happens externally; this struct operates in a buffer-driven way.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -21,52 +21,52 @@ use crate::srt_sender::SenderBuffer;
 use crate::stats::ConnectionStats;
 use crate::time::Timestamp;
 
-/// 接続の役割
+/// A connection's role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionRole {
-    /// Caller (接続を開始する側)
+    /// Caller (initiates the connection).
     Caller,
-    /// Listener (接続を待ち受ける側)
+    /// Listener (waits for the connection).
     Listener,
 }
 
-/// 接続状態
+/// Connection state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConnectionState {
-    /// 切断状態
+    /// Disconnected.
     #[default]
     Disconnected,
-    /// INDUCTION フェーズ (Caller)
+    /// INDUCTION phase (Caller).
     Induction,
-    /// CONCLUSION フェーズ
+    /// CONCLUSION phase.
     Conclusion,
-    /// 待ち受け中 (Listener)
+    /// Listening (Listener).
     Listening,
-    /// 接続確立
+    /// Connected.
     Connected,
-    /// 切断中
+    /// Closing.
     Closing,
 }
 
-/// タイマー ID
+/// Timer ID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TimerId {
-    /// ACK 送信タイマー (10ms)
+    /// ACK send timer (10ms).
     Ack,
-    /// NAK 送信タイマー
+    /// NAK send timer.
     Nak,
-    /// キープアライブタイマー
+    /// Keepalive timer.
     Keepalive,
-    /// 再送タイムアウト
+    /// Retransmit timeout.
     Retransmit,
-    /// ハンドシェイクタイムアウト
+    /// Handshake timeout.
     Handshake,
-    /// 非活性タイムアウト (Keep-alive 未受信検出)
+    /// Inactivity timeout (detects missing keepalives).
     Inactivity,
 }
 
-/// 非活性タイムアウト時間 (マイクロ秒)
-/// SRT 仕様では通常 5 秒
+/// Inactivity timeout duration (microseconds).
+/// Usually 5 seconds per the SRT spec.
 const INACTIVITY_TIMEOUT_MICROS: u64 = 5_000_000;
 // local patch (crates/srt-protocol/VENDOR.md, not upstream-tracked): use
 // libsrt's request cadence with one whole-attempt deadline rather than a
@@ -78,21 +78,22 @@ pub const DEFAULT_HANDSHAKE_RETRY_INTERVAL_MICROS: u64 = 250_000;
 pub const DEFAULT_HANDSHAKE_TIMEOUT_MICROS: u64 = 3_000_000;
 const MIN_FLOW_WINDOW_PACKETS: u32 = 32;
 
-/// libsrt 互換ゼロパディング (4 バイト)
+/// libsrt-compatible zero padding (4 bytes).
 ///
-/// # 背景
+/// # Background
 ///
-/// SRT 仕様 (draft-sharabayko-srt) では、Keepalive、ACKACK、Shutdown などの制御パケットは
-/// データ部を持たない (0 バイト) と定義されている。
+/// The SRT spec (draft-sharabayko-srt) defines control packets like
+/// Keepalive, ACKACK, and Shutdown as carrying no data section (0 bytes).
 ///
-/// # libsrt の実装上の問題
+/// # An implementation quirk in libsrt
 ///
-/// libsrt は全パケットを「ヘッダ部 + データ部」の 2 つの iovec で writev 送信する設計だが、
-/// データ部が 0 バイトの場合 writev が正しく動作しない環境がある。
-/// そのため、データ部が 0 バイトのパケットに 4 バイトのゼロパディングを追加している。
+/// libsrt sends every packet as two iovecs, "header + data," via `writev`,
+/// but on some platforms `writev` doesn't behave correctly when the data
+/// section is 0 bytes. So it adds 4 bytes of zero padding to any packet
+/// whose data section would otherwise be 0 bytes.
 ///
 /// ```c
-/// // libsrt/srtcore/packet.cpp より
+/// // From libsrt/srtcore/packet.cpp
 /// case UMSG_KEEPALIVE:
 ///     // control info field should be none
 ///     // but "writev" does not allow this
@@ -100,82 +101,83 @@ const MIN_FLOW_WINDOW_PACKETS: u32 = 32;
 ///     break;
 /// ```
 ///
-/// # Wireshark との互換性
+/// # Wireshark compatibility
 ///
-/// Wireshark の SRT dissector も libsrt に合わせて実装されているため、
-/// 仕様通りの 16 バイトパケットを送ると "Malformed Packet" と表示される。
+/// Wireshark's SRT dissector is also implemented to match libsrt, so a
+/// spec-correct 16-byte packet shows up as "Malformed Packet."
 ///
-/// # このライブラリでの対応
+/// # This library's handling
 ///
-/// libsrt および Wireshark との相互運用性のため、同様の 4 バイトゼロパディングを追加する。
+/// For interoperability with libsrt and Wireshark, this library adds the
+/// same 4 bytes of zero padding.
 ///
-/// 対象パケット:
+/// Affected packets:
 /// - Keepalive (0x0001)
 /// - ACKACK (0x0006)
 /// - Shutdown (0x0005)
 const LIBSRT_COMPAT_PADDING: [u8; 4] = [0, 0, 0, 0];
 
-/// 接続イベント
+/// A connection event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionEvent {
-    /// 接続完了
+    /// Connection established.
     Connected,
-    /// データ受信
+    /// Data received.
     DataReceived {
         payload: Vec<u8>,
         sequence_number: u32,
         message_number: u32,
         timestamp: u32,
     },
-    /// 状態変化
+    /// State changed.
     StateChanged(ConnectionState),
-    /// エラー発生
+    /// An error occurred.
     Error(String),
-    /// 切断
+    /// Disconnected.
     Disconnected { reason: String },
-    /// キーリフレッシュが必要
+    /// A key refresh is needed.
     KeyRefreshNeeded { key_length: usize },
 }
 
-/// 接続出力アクション
+/// A connection output action.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionOutput {
-    /// パケット送信
+    /// Send a packet.
     SendPacket(Vec<u8>),
-    /// タイマー設定
+    /// Set a timer.
     SetTimer { id: TimerId, duration_micros: u64 },
-    /// タイマークリア
+    /// Clear a timer.
     ClearTimer { id: TimerId },
 }
 
-/// 接続オプション
+/// Connection options.
 #[derive(Clone)]
 pub struct ConnectionOptions {
-    /// ローカルソケット ID
+    /// Local socket ID.
     pub socket_id: u32,
-    /// 初期シーケンス番号
+    /// Initial sequence number.
     pub initial_seq: Option<u32>,
-    /// SYN Cookie (Listener 用)
+    /// SYN cookie (Listener only).
     pub syn_cookie: Option<u32>,
-    /// パスフレーズ (暗号化する場合)
+    /// Passphrase (for encryption).
     pub passphrase: Option<String>,
-    /// 暗号化用の Salt
+    /// Salt for encryption.
     pub crypto_salt: Option<[u8; 16]>,
-    /// 暗号化用の SEK
+    /// SEK for encryption.
     pub crypto_sek: Option<Vec<u8>>,
-    /// 鍵長
+    /// Key length.
     pub key_length: KeyLength,
-    /// TSBPD 遅延 (ms)
+    /// TSBPD delay (ms).
     pub tsbpd_delay: u16,
-    /// SRT バージョン
+    /// SRT version.
     pub srt_version: u32,
-    /// Stream ID (Caller が Listener に送信する識別子、最大 512 バイト)
+    /// Stream ID (the identifier the Caller sends to the Listener, up to 512 bytes).
     pub stream_id: Option<String>,
     /// Optional libsrt-compatible bonding group metadata.
     pub group_extension: Option<GroupExtensionData>,
-    /// 最大帯域幅 (`SRTO_MAXBW` 相当、バイト/秒)。`None` の場合は libsrt の
-    /// `BW_INFINITE` (1 Gbps) 相当のデフォルトを使う
-    /// (`srt_sender` のペーシング計算を参照)。
+    /// Maximum bandwidth (equivalent to `SRTO_MAXBW`, bytes/sec). If `None`,
+    /// uses a default equivalent to libsrt's `BW_INFINITE` (1 Gbps) (see
+    /// `srt_sender`'s pacing calculation).
     pub max_bandwidth_bytes_per_sec: Option<u64>,
     /// Flow-control window advertised in the handshake, in packets.
     pub flow_window_packets: u32,
@@ -242,53 +244,53 @@ impl Default for ConnectionOptions {
     }
 }
 
-/// SRT 接続
+/// An SRT connection.
 pub struct SrtConnection {
-    /// 役割
+    /// Role.
     role: ConnectionRole,
-    /// 状態
+    /// State.
     state: ConnectionState,
-    /// ハンドシェイク状態
+    /// Handshake state.
     handshake_state: HandshakeState,
-    /// オプション
+    /// Options.
     options: ConnectionOptions,
 
-    /// ピアソケット ID
+    /// Peer socket ID.
     peer_socket_id: u32,
-    /// SYN Cookie
+    /// SYN cookie.
     syn_cookie: u32,
 
-    /// 初期シーケンス番号
+    /// Initial sequence number.
     initial_seq: u32,
 
-    /// 暗号化コンテキスト
+    /// Encryption context.
     crypto: Option<CryptoContext>,
 
-    /// 送信バッファ
+    /// Send buffer.
     sender: Option<SenderBuffer>,
-    /// 受信バッファ
+    /// Receive buffer.
     receiver: Option<ReceiverBuffer>,
 
-    /// イベントキュー
+    /// Event queue.
     event_queue: VecDeque<ConnectionEvent>,
     /// DATA events waiting for application consumption. Control/state events
     /// are state-machine bounded; DATA is the unbounded-rate class.
     pending_data_events: u32,
-    /// 出力キュー
+    /// Output queue.
     output_queue: VecDeque<ConnectionOutput>,
 
-    /// 接続開始時刻
+    /// Connection start time.
     start_time: Option<Timestamp>,
 
-    /// 最後の ACK 送信時刻
+    /// Last ACK send time.
     last_ack_time: Option<Timestamp>,
-    /// 最後の NAK 送信時刻
+    /// Last NAK send time.
     last_nak_time: Option<Timestamp>,
-    /// 最後のパケット受信時刻 (非活性タイムアウト検出用)
+    /// Last packet receipt time (for inactivity-timeout detection).
     last_recv_time: Option<Timestamp>,
-    /// 受信した KM メッセージ (Listener 用)
+    /// Received KM message (Listener only).
     received_km: Option<KmMessage>,
-    /// ピアから受信した Stream ID (Listener 用)
+    /// Stream ID received from the peer (Listener only).
     peer_stream_id: Option<String>,
     /// Peer bonding group metadata.
     peer_group_extension: Option<GroupExtensionData>,
@@ -357,7 +359,7 @@ impl SrtConnection {
         self.options.crypto_sek = None;
     }
 
-    /// Caller として新しい接続を作成
+    /// Create a new connection as a Caller.
     pub fn new_caller(options: ConnectionOptions) -> Self {
         let options = normalize_buffer_options(options);
         let initial_seq = options.initial_seq.unwrap_or(0);
@@ -390,7 +392,7 @@ impl SrtConnection {
         }
     }
 
-    /// Listener として新しい接続を作成
+    /// Create a new connection as a Listener.
     pub fn new_listener(options: ConnectionOptions) -> Self {
         let options = normalize_buffer_options(options);
         let initial_seq = options.initial_seq.unwrap_or(0);
@@ -423,7 +425,7 @@ impl SrtConnection {
         }
     }
 
-    /// 現在の状態を取得
+    /// Get the current state.
     pub fn state(&self) -> ConnectionState {
         self.state
     }
@@ -443,7 +445,7 @@ impl SrtConnection {
         self.syn_cookie
     }
 
-    /// ピアから受信した Stream ID を取得 (Listener 用)
+    /// Get the Stream ID received from the peer (Listener only).
     pub fn peer_stream_id(&self) -> Option<&str> {
         self.peer_stream_id.as_deref()
     }
@@ -604,7 +606,7 @@ impl SrtConnection {
             .max(self.handshake_retry_interval_micros);
     }
 
-    /// 接続を開始 (Caller のみ)
+    /// Start the connection (Caller only).
     pub fn connect(&mut self, now: Timestamp) -> Result<(), Error> {
         if self.role != ConnectionRole::Caller {
             return Err(Error::invalid_state("only caller can initiate connection"));
@@ -640,7 +642,7 @@ impl SrtConnection {
         Ok(())
     }
 
-    /// 送信/受信バッファを初期化
+    /// Initialize the send/receive buffers.
     fn init_buffers(&mut self, now: Timestamp, peer_initial_seq: u32, tsbpd_time_base: u64) {
         let mut sender = SenderBuffer::new(
             self.initial_seq,
@@ -670,7 +672,7 @@ impl SrtConnection {
             .min(self.options.receive_buffer_packets)
     }
 
-    /// 受信データを処理
+    /// Process received data.
     pub fn feed_recv_buf(&mut self, buf: &[u8], now: Timestamp) -> Result<(), Error> {
         if buf.len() < SRT_HEADER_SIZE {
             return Err(Error::insufficient_buffer());
@@ -717,21 +719,21 @@ impl SrtConnection {
         }
     }
 
-    /// 再送が必要なパケットがあるか
+    /// Whether there are packets needing retransmission.
     pub fn has_retransmit(&self) -> bool {
         self.sender.as_ref().is_some_and(|s| s.has_retransmit())
     }
 
-    /// 再送パケットを取得して送信キューに追加
+    /// Get a packet to retransmit and add it to the send queue.
     ///
-    /// `now` はこの Core の他のメソッドとのシグネチャ一貫性のために残して
-    /// いる (このメソッド自体はもう使わない -- 再送パケットの
-    /// `sent_time` を更新しなくなった理由は
-    /// `SenderBuffer::pop_retransmit` のドキュメント参照)。
+    /// `now` is kept for signature consistency with this Core's other
+    /// methods (this method itself no longer uses it -- see
+    /// `SenderBuffer::pop_retransmit`'s doc comment for why retransmitted
+    /// packets' `sent_time` is no longer updated).
     pub fn process_retransmit(&mut self, _now: Timestamp) {
         if let Some(ref mut sender) = self.sender {
             while let Some(mut packet) = sender.pop_retransmit() {
-                // 暗号化
+                // Encrypt.
                 if let Some(ref mut crypto) = self.crypto
                     && let Ok(key_flag) =
                         crypto.encrypt(packet.sequence_number, &mut packet.payload)
@@ -747,7 +749,7 @@ impl SrtConnection {
         }
     }
 
-    /// タイマーイベントを処理
+    /// Process a timer event.
     pub fn handle_timer(&mut self, timer_id: TimerId, now: Timestamp) -> Result<(), Error> {
         match timer_id {
             TimerId::Handshake => {
@@ -765,17 +767,17 @@ impl SrtConnection {
             TimerId::Keepalive => {
                 if self.state == ConnectionState::Connected {
                     self.send_keepalive(now);
-                    // 次のキープアライブタイマー設定
+                    // Set the next keepalive timer.
                     self.output_queue.push_back(ConnectionOutput::SetTimer {
                         id: TimerId::Keepalive,
-                        duration_micros: 1_000_000, // 1秒
+                        duration_micros: 1_000_000, // 1 second.
                     });
                 }
             }
             TimerId::Ack => {
-                // 定期 ACK 送信
+                // Send a periodic ACK.
                 if self.state == ConnectionState::Connected {
-                    // TLPKTDROP: 期限切れパケットを削除
+                    // TLPKTDROP: remove expired packets.
                     if let Some(receiver) = self.receiver.as_mut() {
                         for seq in receiver.drop_too_late(now) {
                             if let Some(sender) = self.sender.as_mut() {
@@ -790,7 +792,7 @@ impl SrtConnection {
                         let _ = sender.drop_expired(now);
                     }
 
-                    // 次の ACK タイマー設定 (10ms)
+                    // Set the next ACK timer (10ms).
                     self.output_queue.push_back(ConnectionOutput::SetTimer {
                         id: TimerId::Ack,
                         duration_micros: 10_000,
@@ -798,10 +800,10 @@ impl SrtConnection {
                 }
             }
             TimerId::Nak => {
-                // Periodic NAK 送信
+                // Send a periodic NAK.
                 if self.state == ConnectionState::Connected {
                     self.send_periodic_nak(now);
-                    // 次の NAK タイマー設定
+                    // Set the next NAK timer.
                     let interval = self
                         .receiver
                         .as_ref()
@@ -814,13 +816,13 @@ impl SrtConnection {
                 }
             }
             TimerId::Retransmit => {
-                // 再送処理
+                // Retransmit processing.
                 if self.state == ConnectionState::Connected {
                     self.process_retransmit(now);
                 }
             }
             TimerId::Inactivity => {
-                // 非活性タイムアウト: ピアからのパケット受信がない場合に切断
+                // Inactivity timeout: disconnect if no packets have been received from the peer.
                 if self.state == ConnectionState::Connected {
                     self.event_queue.push_back(ConnectionEvent::Disconnected {
                         reason: "inactivity timeout".to_string(),
@@ -832,7 +834,7 @@ impl SrtConnection {
         Ok(())
     }
 
-    /// データを送信
+    /// Send data.
     pub fn send(&mut self, payload: &[u8], now: Timestamp) -> Result<(), Error> {
         self.send_internal(payload, None, now)
     }
@@ -897,7 +899,7 @@ impl SrtConnection {
                 packet.payload.len()
             );
 
-            // 暗号化
+            // Encrypt.
             if let Some(ref mut crypto) = self.crypto {
                 let key_flag = crypto.encrypt(packet.sequence_number, &mut packet.payload)?;
                 packet.encryption_flag = key_flag.to_kk_field();
@@ -908,13 +910,13 @@ impl SrtConnection {
             self.output_queue
                 .push_back(ConnectionOutput::SendPacket(buf));
 
-            // 送信時刻を記録 (パケットペーシング用)
+            // Record the send time (for packet pacing).
             if let Some(ref mut sender) = self.sender {
                 sender.record_send_time(now);
             }
         }
 
-        // KM Refresh チェック
+        // Check KM Refresh.
         self.check_km_refresh(now);
 
         Ok(())
@@ -925,6 +927,12 @@ impl SrtConnection {
         self.sender.as_ref().map(SenderBuffer::next_sequence_number)
     }
 
+    /// Advance the next expected receive sequence number, discarding any
+    /// buffered or in-flight-loss packets it leaves behind.
+    ///
+    /// Used to align a bonded group member's receive sequence with the
+    /// group's logical sequence when it joins or catches up; see
+    /// [`crate::SrtGroup::poll_event`].
     pub fn advance_receive_sequence(&mut self, sequence_number: u32, now: Timestamp) {
         let Some(receiver) = self.receiver.as_mut() else {
             return;
@@ -933,6 +941,12 @@ impl SrtConnection {
         self.enqueue_ready_data(now);
     }
 
+    /// Align this connection's next send sequence number with
+    /// `sequence_number`. Fails if packets are already in flight, since
+    /// their sequence numbers cannot be retroactively renumbered.
+    ///
+    /// Used to align a bonded group member's send sequence with the group's
+    /// logical sequence; see [`crate::SrtGroup::add_member`].
     pub fn synchronize_send_sequence(&mut self, sequence_number: u32) -> Result<(), Error> {
         let Some(sender) = self.sender.as_mut() else {
             return Err(Error::invalid_state("sender buffer not initialized"));
@@ -944,19 +958,19 @@ impl SrtConnection {
         }
     }
 
-    /// 送信可能かどうか (ウィンドウサイズのみ)
+    /// Whether sending is possible (checks window size only).
     pub fn can_send(&self) -> bool {
         self.sender.as_ref().is_some_and(|s| s.can_send())
     }
 
-    /// 送信可能かどうか (パケットペーシングを含む)
+    /// Whether sending is possible, including packet pacing.
     pub fn can_send_with_pacing(&self, now: Timestamp) -> bool {
         self.sender
             .as_ref()
             .is_some_and(|s| s.can_send_with_pacing(now))
     }
 
-    /// 次の送信可能時刻までの待機時間 (マイクロ秒)
+    /// Time to wait until the next send is possible (microseconds).
     pub fn time_until_send(&self, now: Timestamp) -> u64 {
         self.sender
             .as_ref()
@@ -964,14 +978,14 @@ impl SrtConnection {
             .unwrap_or(100_000)
     }
 
-    /// パケット送信間隔を設定 (マイクロ秒)
+    /// Set the packet send interval (microseconds).
     pub fn set_packet_send_period(&mut self, period: u64) {
         if let Some(ref mut sender) = self.sender {
             sender.set_packet_send_period(period);
         }
     }
 
-    /// イベントを取得
+    /// Get an event.
     pub fn poll_event(&mut self) -> Option<ConnectionEvent> {
         let event = self.event_queue.pop_front()?;
         if matches!(event, ConnectionEvent::DataReceived { .. }) {
@@ -981,12 +995,12 @@ impl SrtConnection {
         Some(event)
     }
 
-    /// 出力を取得
+    /// Get an output.
     pub fn poll_output(&mut self) -> Option<ConnectionOutput> {
         self.output_queue.pop_front()
     }
 
-    /// 切断
+    /// Disconnect.
     pub fn disconnect(&mut self, now: Timestamp) {
         if self.state == ConnectionState::Connected {
             self.send_shutdown(now);
@@ -994,12 +1008,12 @@ impl SrtConnection {
         }
     }
 
-    /// 送信側の統計情報を取得
+    /// Get the sender's statistics.
     pub fn sender_stats(&self) -> Option<crate::srt_sender::SenderStats> {
         self.sender.as_ref().map(|s| s.stats())
     }
 
-    /// 受信側の統計情報を取得
+    /// Get the receiver's statistics.
     pub fn receiver_stats(&self) -> Option<crate::srt_receiver::ReceiverStats> {
         self.receiver.as_ref().map(|r| r.stats())
     }
@@ -1016,9 +1030,9 @@ impl SrtConnection {
         }
     }
 
-    /// 新しい SEK を提供してキーリフレッシュを開始
+    /// Provide a new SEK and begin key refresh.
     ///
-    /// `KeyRefreshNeeded` イベントを受信した後に呼び出す。
+    /// Call this after receiving a `KeyRefreshNeeded` event.
     pub fn provide_new_sek(&mut self, new_sek: &[u8], now: Timestamp) -> Result<(), Error> {
         let Some(ref mut crypto) = self.crypto else {
             return Err(Error::with_reason(
@@ -1035,7 +1049,7 @@ impl SrtConnection {
     }
 
     // ========================================================================
-    // プライベートメソッド
+    // Private methods
     // ========================================================================
 
     fn set_state(&mut self, new_state: ConnectionState) {
@@ -1565,7 +1579,7 @@ impl SrtConnection {
     }
 
     fn handle_shutdown(&mut self, now: Timestamp) -> Result<(), Error> {
-        // 切断前に受信バッファをフラッシュ (TSBPD を無視して即時配信)
+        // Flush the receive buffer before disconnecting (ignore TSBPD, deliver immediately).
         if let Some(receiver) = self.receiver.as_mut() {
             receiver.set_tsbpd_enabled(false);
         }
@@ -1578,68 +1592,68 @@ impl SrtConnection {
         Ok(())
     }
 
-    /// UserDefined パケットを処理 (KM Refresh)
+    /// Process a UserDefined packet (KM Refresh).
     fn handle_user_defined(&mut self, pkt: ControlPacket, now: Timestamp) -> Result<(), Error> {
-        // Subtype で KMREQ/KMRSP を判別
+        // Determine KMREQ/KMRSP from the subtype.
         // SRT_CMD_KMREQ = 3, SRT_CMD_KMRSP = 4
         const SRT_CMD_KMREQ: u16 = 3;
         const SRT_CMD_KMRSP: u16 = 4;
 
         match pkt.subtype {
             SRT_CMD_KMREQ => {
-                // KM Refresh リクエストを受信 (受信側)
+                // Received a KM Refresh request (receiver side).
                 let km = KmMessage::decode(&pkt.control_info)?;
 
                 if let Some(ref mut crypto) = self.crypto {
-                    // 新しい SEK を更新
+                    // Update to the new SEK.
                     crypto.update_sek(&km.wrapped_key, km.key_flag)?;
 
-                    // KMRSP を送信
+                    // Send a KMRSP.
                     self.send_km_response(&km, now);
                 }
             }
             SRT_CMD_KMRSP => {
-                // KM Refresh レスポンスを受信 (送信側)
-                // 正常に受信できれば、相手が新しい鍵を受け入れた
-                // 特に処理は不要 (鍵切り替えは送信側のタイミングで行う)
+                // Received a KM Refresh response (sender side).
+                // A successful receipt means the peer accepted the new key.
+                // No further action needed here (the key switch happens on the sender's own timing).
             }
             _ => {
-                // 未知の UserDefined パケットは無視
+                // Ignore unknown UserDefined packets.
             }
         }
 
         Ok(())
     }
 
-    /// KM Refresh をチェックして必要な処理を行う
+    /// Check whether KM Refresh needs to happen and act accordingly.
     fn check_km_refresh(&mut self, _now: Timestamp) {
-        // 事前通知が必要かチェック
+        // Check whether pre-announcing is needed.
         let Some(ref crypto) = self.crypto else {
             return;
         };
 
         if crypto.should_pre_announce() {
-            // 外部に新しい SEK が必要なことを通知
+            // Notify the outside world that a new SEK is needed.
             self.event_queue
                 .push_back(ConnectionEvent::KeyRefreshNeeded {
                     key_length: crypto.key_length().len(),
                 });
         }
 
-        // 鍵切り替えが必要かチェック
+        // Check whether a key switch is needed.
         if let Some(ref mut crypto) = self.crypto {
             if crypto.should_switch_key() {
                 crypto.switch_key();
             }
 
-            // 古い鍵の廃棄が必要かチェック
+            // Check whether the old key needs to be disposed of.
             if crypto.should_decommission_old_key() {
                 crypto.decommission_old_key();
             }
         }
     }
 
-    /// KMREQ パケットを送信 (KM Refresh)
+    /// Send a KMREQ packet (KM Refresh).
     fn send_km_request(&mut self, km_message: &KmMessage, now: Timestamp) {
         const SRT_CMD_KMREQ: u16 = 3;
 
@@ -1658,7 +1672,7 @@ impl SrtConnection {
             .push_back(ConnectionOutput::SendPacket(buf));
     }
 
-    /// KMRSP パケットを送信 (KM Refresh)
+    /// Send a KMRSP packet (KM Refresh).
     fn send_km_response(&mut self, km_message: &KmMessage, now: Timestamp) {
         const SRT_CMD_KMRSP: u16 = 4;
 
@@ -1677,34 +1691,34 @@ impl SrtConnection {
             .push_back(ConnectionOutput::SendPacket(buf));
     }
 
-    /// 接続確立後のタイマーを設定
+    /// Set up timers after the connection is established.
     fn setup_connection_timers(&mut self) {
-        // キープアライブタイマー (1秒)
+        // Keepalive timer (1 second).
         self.output_queue.push_back(ConnectionOutput::SetTimer {
             id: TimerId::Keepalive,
             duration_micros: 1_000_000,
         });
 
-        // ACK タイマー (10ms)
+        // ACK timer (10ms).
         self.output_queue.push_back(ConnectionOutput::SetTimer {
             id: TimerId::Ack,
             duration_micros: 10_000,
         });
 
-        // NAK タイマー (初期値 20ms)
+        // NAK timer (initial value 20ms).
         self.output_queue.push_back(ConnectionOutput::SetTimer {
             id: TimerId::Nak,
             duration_micros: 20_000,
         });
 
-        // 非活性タイマー (5秒)
+        // Inactivity timer (5 seconds).
         self.output_queue.push_back(ConnectionOutput::SetTimer {
             id: TimerId::Inactivity,
             duration_micros: INACTIVITY_TIMEOUT_MICROS,
         });
     }
 
-    /// ACK パケットを送信
+    /// Send an ACK packet.
     fn send_ack(&mut self, now: Timestamp) {
         let receiver = match self.receiver.as_mut() {
             Some(r) => r,
@@ -1720,7 +1734,7 @@ impl SrtConnection {
         write_u32(&mut control_info, ack_info.ack_seq);
 
         if !ack_info.is_light {
-            // Full ACK (SRT 仕様に準拠)
+            // Full ACK (per the SRT spec).
             write_u32(&mut control_info, ack_info.rtt);
             write_u32(&mut control_info, ack_info.rtt_var);
             write_u32(&mut control_info, ack_info.available_buffer);
@@ -1744,7 +1758,7 @@ impl SrtConnection {
             .push_back(ConnectionOutput::SendPacket(buf));
     }
 
-    /// NAK パケットを送信
+    /// Send a NAK packet.
     fn send_nak(&mut self, loss_list: &[u32], now: Timestamp) {
         if loss_list.is_empty() {
             return;
@@ -1771,7 +1785,7 @@ impl SrtConnection {
             .push_back(ConnectionOutput::SendPacket(buf));
     }
 
-    /// Periodic NAK を送信
+    /// Send a periodic NAK.
     fn send_periodic_nak(&mut self, now: Timestamp) {
         let receiver = match self.receiver.as_mut() {
             Some(r) => r,
@@ -1784,12 +1798,12 @@ impl SrtConnection {
         self.last_nak_time = Some(now);
     }
 
-    /// ACKACK パケットを送信
+    /// Send an ACKACK packet.
     ///
-    /// ACKACK は ACK に対する確認応答で、RTT 計算に使用される。
-    /// SRT 仕様ではデータ部 0 バイトの 16 バイトパケットだが、
-    /// libsrt 互換のため 4 バイトゼロパディングを追加して 20 バイトで送信する。
-    /// 詳細は [`LIBSRT_COMPAT_PADDING`] を参照。
+    /// ACKACK is the acknowledgment for an ACK, used for RTT calculation.
+    /// Per the SRT spec it's a 16-byte packet with a 0-byte data section, but
+    /// for libsrt compatibility this sends 20 bytes with 4 bytes of zero
+    /// padding added. See [`LIBSRT_COMPAT_PADDING`] for details.
     fn send_ackack(&mut self, ack_number: u32, now: Timestamp) {
         let pkt = ControlPacket {
             control_type: ControlType::AckAck,
@@ -2044,13 +2058,14 @@ impl SrtConnection {
         });
     }
 
-    /// Keepalive パケットを送信
+    /// Send a Keepalive packet.
     ///
-    /// Keepalive は接続の生存確認に使用される。一定時間データの送受信がない場合に送信され、
-    /// 相手側は Keepalive を受信することで接続がまだ有効であることを確認できる。
-    /// SRT 仕様ではデータ部 0 バイトの 16 バイトパケットだが、
-    /// libsrt 互換のため 4 バイトゼロパディングを追加して 20 バイトで送信する。
-    /// 詳細は [`LIBSRT_COMPAT_PADDING`] を参照。
+    /// Keepalive confirms the connection is still alive. It's sent when no
+    /// data has been sent or received for a while, and receiving one lets the
+    /// peer confirm the connection is still valid. Per the SRT spec it's a
+    /// 16-byte packet with a 0-byte data section, but for libsrt
+    /// compatibility this sends 20 bytes with 4 bytes of zero padding added.
+    /// See [`LIBSRT_COMPAT_PADDING`] for details.
     fn send_keepalive(&mut self, now: Timestamp) {
         let pkt = ControlPacket {
             control_type: ControlType::Keepalive,
@@ -2058,7 +2073,7 @@ impl SrtConnection {
             type_specific_info: 0,
             timestamp: self.relative_timestamp(now),
             dest_socket_id: self.peer_socket_id,
-            // libsrt 互換: データ部 0 バイト → 4 バイトゼロパディング
+            // libsrt compatibility: 0-byte data section -> 4 bytes of zero padding.
             control_info: LIBSRT_COMPAT_PADDING.to_vec(),
         };
         let mut buf = Vec::new();
@@ -2067,12 +2082,13 @@ impl SrtConnection {
             .push_back(ConnectionOutput::SendPacket(buf));
     }
 
-    /// Shutdown パケットを送信
+    /// Send a Shutdown packet.
     ///
-    /// Shutdown は接続の正常終了を通知する。このパケットを送信後、接続は切断状態に遷移する。
-    /// SRT 仕様ではデータ部 0 バイトの 16 バイトパケットだが、
-    /// libsrt 互換のため 4 バイトゼロパディングを追加して 20 バイトで送信する。
-    /// 詳細は [`LIBSRT_COMPAT_PADDING`] を参照。
+    /// Shutdown announces an orderly connection close. After sending this
+    /// packet, the connection transitions to the disconnected state. Per the
+    /// SRT spec it's a 16-byte packet with a 0-byte data section, but for
+    /// libsrt compatibility this sends 20 bytes with 4 bytes of zero padding
+    /// added. See [`LIBSRT_COMPAT_PADDING`] for details.
     fn send_shutdown(&mut self, now: Timestamp) {
         let pkt = ControlPacket {
             control_type: ControlType::Shutdown,
@@ -2080,7 +2096,7 @@ impl SrtConnection {
             type_specific_info: 0,
             timestamp: self.relative_timestamp(now),
             dest_socket_id: self.peer_socket_id,
-            // libsrt 互換: データ部 0 バイト → 4 バイトゼロパディング
+            // libsrt compatibility: 0-byte data section -> 4 bytes of zero padding.
             control_info: LIBSRT_COMPAT_PADDING.to_vec(),
         };
         let mut buf = Vec::new();
@@ -2090,7 +2106,7 @@ impl SrtConnection {
     }
 }
 
-/// 損失リストをパース (NAK パケットの control_info から)
+/// Parse a loss list (from a NAK packet's control_info).
 fn parse_loss_list(data: &[u8], max_entries: usize) -> Result<Vec<u32>, Error> {
     if !data.len().is_multiple_of(4) {
         return Err(Error::invalid_data(
@@ -2137,8 +2153,8 @@ fn parse_loss_list(data: &[u8], max_entries: usize) -> Result<Vec<u32>, Error> {
     Ok(result)
 }
 
-/// 損失リストをエンコード (NAK パケットの control_info 用)
-/// 連続するシーケンス番号は範囲としてエンコードして圧縮する
+/// Encode a loss list (for a NAK packet's control_info).
+/// Consecutive sequence numbers are compressed by encoding them as a range.
 fn encode_loss_list(loss_list: &[u32]) -> Vec<u8> {
     let mut result = Vec::new();
 
@@ -2146,16 +2162,16 @@ fn encode_loss_list(loss_list: &[u32]) -> Vec<u8> {
         return result;
     }
 
-    // 連続するシーケンス番号を範囲として検出
+    // Detect consecutive sequence numbers as a range.
     let mut i = 0;
     while i < loss_list.len() {
         let start = loss_list[i];
         let mut end = start;
 
-        // 連続するシーケンス番号を探す
+        // Look for consecutive sequence numbers.
         while i + 1 < loss_list.len() {
             let next = loss_list[i + 1];
-            // シーケンス番号のラップアラウンドを考慮した連続判定
+            // Determine consecutiveness, accounting for sequence number wraparound.
             let expected_next = end.wrapping_add(1) & 0x7FFF_FFFF;
             if next == expected_next {
                 end = next;
@@ -2166,11 +2182,11 @@ fn encode_loss_list(loss_list: &[u32]) -> Vec<u8> {
         }
 
         if start == end {
-            // 単一のシーケンス番号
+            // A single sequence number.
             write_u32(&mut result, start & 0x7FFF_FFFF);
         } else {
-            // 範囲: 2つ以上連続する場合は範囲エンコード
-            // 最初の word は MSB を 1 に設定
+            // A range: encode as a range when two or more are consecutive.
+            // The first word has its MSB set to 1.
             write_u32(&mut result, (start & 0x7FFF_FFFF) | 0x8000_0000);
             write_u32(&mut result, end & 0x7FFF_FFFF);
         }

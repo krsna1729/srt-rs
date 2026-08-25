@@ -1,50 +1,51 @@
 use std::backtrace::{Backtrace, BacktraceStatus};
 use std::panic::Location;
 
-/// エンコード/デコード操作のエラーの種類
+/// The kind of error from an encode/decode operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ErrorKind {
-    /// データコンテンツが無効または破損している
+    /// The data content is invalid or corrupted.
     InvalidData,
 
-    /// 構造体などの内部状態が不正だったり、依頼された操作を実行可能ではない
+    /// Internal state (e.g. of a struct) is invalid, or the requested
+    /// operation cannot be performed.
     InvalidState,
 
-    /// 提供されたバッファがエンコード/デコード結果を保持するのに小さすぎる
+    /// The supplied buffer is too small to hold the encode/decode result.
     InsufficientBuffer,
 
-    /// 暗号化/復号化エラー
+    /// An encryption/decryption error.
     CryptoError,
 
-    /// ハンドシェイクが拒否された
+    /// The handshake was rejected.
     HandshakeRejected,
 }
 
-/// エラー型
+/// The error type.
 pub struct Error {
-    /// 発生したエラーの種類
+    /// The kind of error that occurred.
     pub kind: ErrorKind,
 
-    /// エラーが発生した理由
+    /// The reason the error occurred.
     pub reason: String,
 
-    /// エラーが作成されたソースコードの場所
+    /// The source location where the error was created.
     pub location: &'static Location<'static>,
 
-    /// エラー発生箇所を示すバックトレース
+    /// A backtrace pointing at where the error occurred.
     ///
-    /// バックトレースは `RUST_BACKTRACE` 環境変数が設定されていない場合には取得されない
+    /// Not captured unless the `RUST_BACKTRACE` environment variable is set.
     pub backtrace: Backtrace,
 }
 
 impl Error {
-    /// [`Error`] インスタンスを生成する
+    /// Create an [`Error`] instance.
     #[track_caller]
     pub fn new(kind: ErrorKind) -> Self {
         Self::with_reason(kind, String::new())
     }
 
-    /// エラー理由つきで [`Error`] インスタンスを生成する
+    /// Create an [`Error`] instance with a reason.
     #[track_caller]
     pub fn with_reason<T: Into<String>>(kind: ErrorKind, reason: T) -> Self {
         Self {

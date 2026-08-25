@@ -1,8 +1,8 @@
-//! SRT ハンドシェイク
+//! SRT handshake.
 //!
-//! Caller-Listener モードのハンドシェイクを実装する。
+//! Implements the Caller-Listener mode handshake.
 //!
-//! ## フロー
+//! ## Flow
 //!
 //! ```text
 //! Caller                              Listener
@@ -24,17 +24,18 @@ use crate::crypto::{KeyFlag, KeyLength};
 use crate::error::Error;
 use crate::srt_packet::{ControlPacket, ControlType};
 
-/// ハンドシェイクバージョン
+/// Handshake version.
 pub const HS_VERSION_4: u32 = 4;
+/// Handshake version.
 pub const HS_VERSION_5: u32 = 5;
 
-/// デフォルト MTU サイズ
+/// Default MTU size.
 pub const DEFAULT_MTU: u32 = 1500;
 
-/// デフォルトフローウィンドウサイズ
+/// Default flow window size.
 pub const DEFAULT_FLOW_WINDOW: u32 = 8192;
 
-/// ハンドシェイクタイプ
+/// Handshake type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum HandshakeType {
@@ -58,10 +59,10 @@ pub enum HandshakeType {
 }
 
 impl HandshakeType {
-    /// u32 から変換
+    /// Convert from a u32.
     ///
-    /// `>= 1000` は全て `Rejected` として扱う (実際の reject reason は
-    /// 呼び出し側で別途 `value - 1000` として計算する必要がある)。
+    /// Any value `>= 1000` is treated as `Rejected` (the caller must
+    /// separately compute the actual reject reason as `value - 1000`).
     pub fn from_u32(value: u32) -> Option<Self> {
         match value {
             0xFFFFFFFD => Some(Self::Done),
@@ -75,43 +76,43 @@ impl HandshakeType {
     }
 }
 
-/// SRT Magic Code (HSv5 確認用)
+/// SRT Magic Code (confirms HSv5).
 pub const SRT_MAGIC_CODE: u16 = 0x4A17;
 
-/// ハンドシェイク拡張フラグ
+/// Handshake extension flags.
 pub mod extension_flags {
-    /// HSREQ 拡張
+    /// HSREQ extension.
     pub const HSREQ: u16 = 0x0001;
-    /// KMREQ 拡張
+    /// KMREQ extension.
     pub const KMREQ: u16 = 0x0002;
-    /// CONFIG 拡張
+    /// CONFIG extension.
     pub const CONFIG: u16 = 0x0004;
 }
 
-/// ハンドシェイク拡張タイプ
+/// Handshake extension type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub enum ExtensionType {
-    /// ハンドシェイク拡張リクエスト
+    /// Handshake extension request.
     HsReq = 1,
-    /// ハンドシェイク拡張レスポンス
+    /// Handshake extension response.
     HsRsp = 2,
-    /// キーマテリアルリクエスト
+    /// Key material request.
     KmReq = 3,
-    /// キーマテリアルレスポンス
+    /// Key material response.
     KmRsp = 4,
-    /// ストリーム ID
+    /// Stream ID.
     Sid = 5,
-    /// 輻輳制御
+    /// Congestion control.
     Congestion = 6,
-    /// パケットフィルタ
+    /// Packet filter.
     Filter = 7,
-    /// グループ
+    /// Group.
     Group = 8,
 }
 
 impl ExtensionType {
-    /// u16 から変換
+    /// Convert from a u16.
     pub fn from_u16(value: u16) -> Option<Self> {
         match value {
             1 => Some(Self::HsReq),
@@ -172,61 +173,61 @@ pub const SRTGROUP_MASK: u32 = 1 << 30;
 /// Synchronize group data on message boundaries.
 pub const GFLAG_SYNCONMSG: u8 = 0x01;
 
-/// SRT フラグ
+/// SRT flags.
 pub mod srt_flags {
-    /// TSBPD 送信有効
+    /// TSBPD send enabled.
     pub const TSBPDSND: u32 = 0x00000001;
-    /// TSBPD 受信有効
+    /// TSBPD receive enabled.
     pub const TSBPDRCV: u32 = 0x00000002;
-    /// 暗号化対応
+    /// Encryption supported.
     pub const CRYPT: u32 = 0x00000004;
-    /// Too-late packet drop 有効
+    /// Too-late packet drop enabled.
     pub const TLPKTDROP: u32 = 0x00000008;
-    /// 定期 NAK 有効
+    /// Periodic NAK enabled.
     pub const PERIODICNAK: u32 = 0x00000010;
-    /// 再送フラグ対応
+    /// Retransmit flag supported.
     pub const REXMITFLG: u32 = 0x00000020;
-    /// ストリームモード
+    /// Stream mode.
     pub const STREAM: u32 = 0x00000040;
-    /// パケットフィルタ対応
+    /// Packet filter supported.
     pub const PACKET_FILTER: u32 = 0x00000080;
 }
 
-/// ハンドシェイクパケット
+/// Handshake packet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HandshakePacket {
-    /// ハンドシェイクバージョン
+    /// Handshake version.
     pub version: u32,
-    /// 暗号化フィールド
+    /// Encryption field.
     pub encryption_field: u16,
-    /// 拡張フィールド
+    /// Extension field.
     pub extension_field: u16,
-    /// 初期パケットシーケンス番号
+    /// Initial packet sequence number.
     pub initial_packet_seq: u32,
-    /// MTU サイズ
+    /// MTU size.
     pub mtu: u32,
-    /// フローウィンドウサイズ
+    /// Flow window size.
     pub flow_window: u32,
-    /// ハンドシェイクタイプ
+    /// Handshake type.
     pub handshake_type: HandshakeType,
-    /// SRT ソケット ID
+    /// SRT socket ID.
     pub socket_id: u32,
-    /// SYN Cookie
+    /// SYN cookie.
     pub syn_cookie: u32,
-    /// ピア IP アドレス
+    /// Peer IP address.
     pub peer_ip: IpAddr,
-    /// 拡張
+    /// Extensions.
     pub extensions: Vec<HandshakeExtension>,
-    /// Reject reason (`handshake_type == Rejected` の場合のみ `Some`)。
-    /// 実際の SRT_REJECT_REASON 値 (0-17 程度) か、libsrt の
-    /// `SRT_REJC_PREDEFINED`(1000)/`SRT_REJC_USERDEFINED`(2000) バケット
-    /// に基づくアプリケーション定義コード。ワイヤ上は
-    /// `1000 + reject_reason` としてエンコードされる。
+    /// Reject reason (`Some` only when `handshake_type == Rejected`).
+    /// Either an actual SRT_REJECT_REASON value (roughly 0-17), or an
+    /// application-defined code based on libsrt's
+    /// `SRT_REJC_PREDEFINED`(1000)/`SRT_REJC_USERDEFINED`(2000) buckets.
+    /// Encoded on the wire as `1000 + reject_reason`.
     pub reject_reason: Option<i32>,
 }
 
 impl HandshakePacket {
-    /// 新しい INDUCTION リクエストを作成 (Caller)
+    /// Create a new INDUCTION request (Caller).
     pub fn new_induction_request(socket_id: u32) -> Self {
         Self {
             version: HS_VERSION_4,
@@ -244,12 +245,12 @@ impl HandshakePacket {
         }
     }
 
-    /// 新しい INDUCTION レスポンスを作成 (Listener)
+    /// Create a new INDUCTION response (Listener).
     pub fn new_induction_response(socket_id: u32, syn_cookie: u32, encryption_field: u16) -> Self {
         Self {
             version: HS_VERSION_5,
             encryption_field,
-            extension_field: SRT_MAGIC_CODE, // HSv5 確認
+            extension_field: SRT_MAGIC_CODE, // Confirms HSv5.
             initial_packet_seq: 0,
             mtu: DEFAULT_MTU,
             flow_window: DEFAULT_FLOW_WINDOW,
@@ -262,7 +263,7 @@ impl HandshakePacket {
         }
     }
 
-    /// 新しい CONCLUSION リクエストを作成 (Caller)
+    /// Create a new CONCLUSION request (Caller).
     pub fn new_conclusion_request(
         socket_id: u32,
         syn_cookie: u32,
@@ -291,7 +292,7 @@ impl HandshakePacket {
         }
     }
 
-    /// 新しい CONCLUSION レスポンスを作成 (Listener)
+    /// Create a new CONCLUSION response (Listener).
     pub fn new_conclusion_response(
         socket_id: u32,
         syn_cookie: u32,
@@ -320,13 +321,14 @@ impl HandshakePacket {
         }
     }
 
-    /// 新しい REJECTION レスポンスを作成 (Listener)
+    /// Create a new REJECTION response (Listener).
     ///
-    /// `reason` は `SRT_REJECT_REASON` 値 (0-17 程度) か、libsrt の
-    /// `SRT_REJC_PREDEFINED`(1000)/`SRT_REJC_USERDEFINED`(2000) バケットに
-    /// 基づくアプリケーション定義コード (例: this repo 自身の
-    /// `SRT_REJX_UNAUTHORIZED = 1401`)。ワイヤ上は `1000 + reason` として
-    /// エンコードされる (`srtcore/handshake.h` の `URQFailure` と同じ式)。
+    /// `reason` is either an actual `SRT_REJECT_REASON` value (roughly
+    /// 0-17), or an application-defined code based on libsrt's
+    /// `SRT_REJC_PREDEFINED`(1000)/`SRT_REJC_USERDEFINED`(2000) buckets
+    /// (e.g. this repo's own `SRT_REJX_UNAUTHORIZED = 1401`). Encoded on the
+    /// wire as `1000 + reason` (the same formula as `srtcore/handshake.h`'s
+    /// `URQFailure`).
     pub fn new_rejection(socket_id: u32, syn_cookie: u32, reason: i32) -> Self {
         Self {
             version: HS_VERSION_5,
@@ -344,7 +346,7 @@ impl HandshakePacket {
         }
     }
 
-    /// 制御パケットからデコード
+    /// Decode from a control packet.
     #[track_caller]
     pub fn decode(packet: &ControlPacket) -> Result<Self, Error> {
         if packet.control_type != ControlType::Handshake {
@@ -352,7 +354,7 @@ impl HandshakePacket {
         }
 
         let mut buf = packet.control_info.as_slice();
-        Error::check_buffer_size(48, buf)?; // 最小サイズ
+        Error::check_buffer_size(48, buf)?; // Minimum size.
 
         let version = read_u32(&mut buf)?;
         let encryption_field = read_u16(&mut buf)?;
@@ -392,15 +394,15 @@ impl HandshakePacket {
         let socket_id = read_u32(&mut buf)?;
         let syn_cookie = read_u32(&mut buf)?;
 
-        // ピア IP (128 ビット = 16 バイト)
+        // Peer IP (128 bits = 16 bytes).
         let ip_bytes = read_bytes(&mut buf, 16)?;
         let peer_ip = parse_peer_ip(&ip_bytes);
 
-        // 拡張のパース
+        // Parse extensions.
         let mut extensions = Vec::new();
         while buf.len() >= 4 {
             let ext_type_raw = read_u16(&mut buf)?;
-            let ext_len = read_u16(&mut buf)? as usize * 4; // 4バイト単位
+            let ext_len = read_u16(&mut buf)? as usize * 4; // In 4-byte units.
 
             if buf.len() < ext_len {
                 break;
@@ -432,7 +434,7 @@ impl HandshakePacket {
         })
     }
 
-    /// 制御パケットにエンコード
+    /// Encode to a control packet.
     pub fn encode(&self, timestamp: u32, dest_socket_id: u32) -> ControlPacket {
         let mut control_info = Vec::new();
 
@@ -467,13 +469,13 @@ impl HandshakePacket {
         // Peer IP
         encode_peer_ip(&self.peer_ip, &mut control_info);
 
-        // 拡張
+        // Extensions.
         for ext in &self.extensions {
             write_u16(&mut control_info, ext.ext_type as u16);
             let len_in_words = ext.data.len().div_ceil(4);
             write_u16(&mut control_info, len_in_words as u16);
             write_bytes(&mut control_info, &ext.data);
-            // パディング
+            // Padding.
             let padding = len_in_words * 4 - ext.data.len();
             for _ in 0..padding {
                 write_u8(&mut control_info, 0);
@@ -490,7 +492,7 @@ impl HandshakePacket {
         }
     }
 
-    /// HSREQ 拡張を追加
+    /// Add an HSREQ extension.
     pub fn add_hs_extension(&mut self, srt_version: u32, srt_flags: u32, tsbpd_delay: u16) {
         let mut data = Vec::new();
         write_u32(&mut data, srt_version);
@@ -504,7 +506,7 @@ impl HandshakePacket {
         });
     }
 
-    /// HSRSP 拡張を追加
+    /// Add an HSRSP extension.
     pub fn add_hs_response(&mut self, srt_version: u32, srt_flags: u32, tsbpd_delay: u16) {
         let mut data = Vec::new();
         write_u32(&mut data, srt_version);
@@ -518,7 +520,7 @@ impl HandshakePacket {
         });
     }
 
-    /// HSREQ/HSRSP 拡張を取得
+    /// Get the HSREQ/HSRSP extension.
     pub fn get_hs_extension(&self) -> Option<HsExtensionData> {
         for ext in &self.extensions {
             if (ext.ext_type == ExtensionType::HsReq || ext.ext_type == ExtensionType::HsRsp)
@@ -580,12 +582,12 @@ impl HandshakePacket {
         None
     }
 
-    /// 鍵長を取得
+    /// Get the key length.
     pub fn key_length(&self) -> Option<KeyLength> {
         KeyLength::from_encryption_field(self.encryption_field)
     }
 
-    /// KMREQ 拡張を追加
+    /// Add a KMREQ extension.
     pub fn add_km_request(&mut self, km_message: &KmMessage) {
         self.extensions.push(HandshakeExtension {
             ext_type: ExtensionType::KmReq,
@@ -593,7 +595,7 @@ impl HandshakePacket {
         });
     }
 
-    /// KMRSP 拡張を追加 (成功時: 同じ KM メッセージを返す)
+    /// Add a KMRSP extension (success: returns the same KM message).
     pub fn add_km_response(&mut self, km_message: &KmMessage) {
         self.extensions.push(HandshakeExtension {
             ext_type: ExtensionType::KmRsp,
@@ -601,7 +603,7 @@ impl HandshakePacket {
         });
     }
 
-    /// KMRSP エラー拡張を追加 (失敗時)
+    /// Add a KMRSP error extension (failure).
     pub fn add_km_error(&mut self, error: KmError) {
         let mut data = Vec::new();
         write_u32(&mut data, error as u32);
@@ -611,7 +613,7 @@ impl HandshakePacket {
         });
     }
 
-    /// KMREQ 拡張を取得
+    /// Get the KMREQ extension.
     pub fn get_km_request(&self) -> Option<Result<KmMessage, Error>> {
         for ext in &self.extensions {
             if ext.ext_type == ExtensionType::KmReq {
@@ -621,14 +623,14 @@ impl HandshakePacket {
         None
     }
 
-    /// KMRSP 拡張を取得
+    /// Get the KMRSP extension.
     ///
-    /// 成功時は Ok(Some(KmMessage))、エラー時は Err(KmError) を返す。
-    /// KMRSP 拡張がない場合は Ok(None) を返す。
+    /// Returns `Ok(Some(KmMessage))` on success, `Err(KmError)` on failure,
+    /// and `Ok(None)` if there is no KMRSP extension.
     pub fn get_km_response(&self) -> Result<Option<KmMessage>, KmError> {
         for ext in &self.extensions {
             if ext.ext_type == ExtensionType::KmRsp {
-                // エラーレスポンスの場合は 4 バイト
+                // An error response is 4 bytes.
                 if ext.data.len() == 4 {
                     let error_code =
                         u32::from_be_bytes([ext.data[0], ext.data[1], ext.data[2], ext.data[3]]);
@@ -636,7 +638,7 @@ impl HandshakePacket {
                         return Err(km_error);
                     }
                 }
-                // 正常な KM メッセージ
+                // A normal KM message.
                 match KmMessage::decode(&ext.data) {
                     Ok(km) => return Ok(Some(km)),
                     Err(_) => continue,
@@ -646,10 +648,10 @@ impl HandshakePacket {
         Ok(None)
     }
 
-    /// Stream ID 拡張を追加
+    /// Add a Stream ID extension.
     ///
-    /// Stream ID は UTF-8 文字列で、最大 512 バイト。
-    /// 32-bit little endian words として格納される。
+    /// The Stream ID is a UTF-8 string, up to 512 bytes, stored as 32-bit
+    /// little-endian words.
     pub fn add_sid_extension(&mut self, stream_id: &str) {
         self.extensions.push(HandshakeExtension {
             ext_type: ExtensionType::Sid,
@@ -668,10 +670,10 @@ impl HandshakePacket {
         self.extension_field |= extension_flags::CONFIG;
     }
 
-    /// Stream ID 拡張を取得
+    /// Get the Stream ID extension.
     ///
-    /// Stream ID は 32-bit little endian words として格納されているため、
-    /// デコード時にバイト順を復元する。
+    /// The Stream ID is stored as 32-bit little-endian words, so byte order
+    /// is restored on decode.
     pub fn get_sid_extension(&self) -> Option<String> {
         for ext in &self.extensions {
             if ext.ext_type == ExtensionType::Sid {
@@ -681,12 +683,12 @@ impl HandshakePacket {
         None
     }
 
-    /// Congestion 拡張を追加
+    /// Add a Congestion extension.
     ///
-    /// 輻輳制御アルゴリズムを指定する。
-    /// ライブストリーミングでは "live" を使用する。
+    /// Specifies the congestion control algorithm. Live streaming uses
+    /// "live".
     ///
-    /// Stream ID と同様に 32-bit little endian words として格納される。
+    /// Stored as 32-bit little-endian words, the same as Stream ID.
     pub fn add_congestion_extension(&mut self, congestion_control: &str) {
         self.extensions.push(HandshakeExtension {
             ext_type: ExtensionType::Congestion,
@@ -698,10 +700,9 @@ impl HandshakePacket {
         self.extension_field |= extension_flags::CONFIG;
     }
 
-    /// Congestion 拡張を取得
+    /// Get the Congestion extension.
     ///
-    /// 輻輳制御アルゴリズム名を取得する。
-    /// 例: "live", "file"
+    /// Returns the congestion control algorithm name, e.g. "live", "file".
     pub fn get_congestion_extension(&self) -> Option<String> {
         for ext in &self.extensions {
             if ext.ext_type == ExtensionType::Congestion {
@@ -712,7 +713,7 @@ impl HandshakePacket {
     }
 }
 
-/// 文字列を 32-bit little endian words 形式にエンコードする
+/// Encode a string as 32-bit little-endian words.
 fn encode_le_words(s: &str, max_len: usize) -> Vec<u8> {
     let bytes = s.as_bytes();
     let len = bytes.len().min(max_len);
@@ -731,7 +732,7 @@ fn encode_le_words(s: &str, max_len: usize) -> Vec<u8> {
     data
 }
 
-/// 32-bit little endian words 形式から文字列をデコードする
+/// Decode a string from 32-bit little-endian words.
 fn decode_le_words(data: &[u8]) -> Option<String> {
     let mut bytes = Vec::new();
 
@@ -748,35 +749,35 @@ fn decode_le_words(data: &[u8]) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-/// ハンドシェイク拡張
+/// Handshake extension.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HandshakeExtension {
-    /// 拡張タイプ
+    /// Extension type.
     pub ext_type: ExtensionType,
-    /// 拡張データ
+    /// Extension data.
     pub data: Vec<u8>,
 }
 
-/// HS 拡張データ
+/// HS extension data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HsExtensionData {
-    /// SRT バージョン
+    /// SRT version.
     pub srt_version: u32,
-    /// SRT フラグ
+    /// SRT flags.
     pub srt_flags: u32,
-    /// 受信側 TSBPD 遅延 (ms)
+    /// Receiver TSBPD delay (ms).
     pub recv_tsbpd_delay: u16,
-    /// 送信側 TSBPD 遅延 (ms)
+    /// Sender TSBPD delay (ms).
     pub send_tsbpd_delay: u16,
 }
 
-/// Peer IP をパース
+/// Parse a peer IP.
 fn parse_peer_ip(bytes: &[u8]) -> IpAddr {
     if bytes.len() < 16 {
         return IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
     }
 
-    // IPv4 の場合: 最初の 4 バイトが IP、残りは 0
+    // IPv4 case: the first 4 bytes are the IP, the rest are 0.
     let is_ipv4 = bytes[4..16].iter().all(|&b| b == 0);
 
     if is_ipv4 {
@@ -790,12 +791,12 @@ fn parse_peer_ip(bytes: &[u8]) -> IpAddr {
     }
 }
 
-/// Peer IP をエンコード
+/// Encode a peer IP.
 fn encode_peer_ip(ip: &IpAddr, buf: &mut Vec<u8>) {
     match ip {
         IpAddr::V4(ipv4) => {
             write_bytes(buf, &ipv4.octets());
-            // 残り 12 バイトは 0
+            // The remaining 12 bytes are 0.
             for _ in 0..12 {
                 write_u8(buf, 0);
             }
@@ -806,78 +807,78 @@ fn encode_peer_ip(ip: &IpAddr, buf: &mut Vec<u8>) {
     }
 }
 
-/// ハンドシェイク状態
+/// Handshake state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HandshakeState {
-    /// 初期状態
+    /// Initial state.
     #[default]
     Initial,
-    /// INDUCTION 送信済み (Caller)
+    /// INDUCTION sent (Caller).
     InductionSent,
-    /// INDUCTION 受信済み (Listener)
+    /// INDUCTION received (Listener).
     InductionReceived,
-    /// CONCLUSION 送信済み
+    /// CONCLUSION sent.
     ConclusionSent,
-    /// 完了
+    /// Complete.
     Completed,
-    /// 失敗
+    /// Failed.
     Failed,
 }
 
-/// Key Material メッセージ
+/// Key Material message.
 ///
-/// SRT 仕様 §3.2.1 に基づく Key Material 構造体。
-/// ハンドシェイク拡張 (KMREQ/KMRSP) で使用される。
+/// The Key Material structure per SRT spec §3.2.1. Used in the KMREQ/KMRSP
+/// handshake extensions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KmMessage {
-    /// KM バージョン (V): 3 bits, 現在は 1
+    /// KM version (V): 3 bits, currently 1.
     pub version: u8,
-    /// パケットタイプ (PT): 4 bits, KMmsg = 2
+    /// Packet type (PT): 4 bits, KMmsg = 2.
     pub packet_type: u8,
-    /// 鍵フラグ (KK): 2 bits
+    /// Key flag (KK): 2 bits.
     pub key_flag: KeyFlag,
-    /// KEK インデックス: 通常 0 (デフォルトストリームキー)
+    /// KEK index: usually 0 (default stream key).
     pub keki: u32,
-    /// 暗号化方式 (Cipher): AES-CTR = 2, AES-GCM = 4
+    /// Cipher: AES-CTR = 2, AES-GCM = 4.
     pub cipher: u8,
-    /// 認証方式 (Auth): None = 0, AES-GCM = 1
+    /// Auth: None = 0, AES-GCM = 1.
     pub auth: u8,
-    /// ストリームカプセル化 (SE): MPEG-TS/SRT = 2
+    /// Stream encapsulation (SE): MPEG-TS/SRT = 2.
     pub stream_encapsulation: u8,
-    /// 鍵長
+    /// Key length.
     pub key_length: KeyLength,
-    /// Salt (16 bytes)
+    /// Salt (16 bytes).
     pub salt: [u8; 16],
-    /// ラップされた SEK
+    /// Wrapped SEK.
     pub wrapped_key: Vec<u8>,
 }
 
-/// KM メッセージ署名 ('HAI' = Haivision)
+/// KM message signature ('HAI' = Haivision).
 const KM_SIGNATURE: u16 = 0x2029;
 
-/// KM バージョン
+/// KM version.
 const KM_VERSION: u8 = 1;
 
-/// パケットタイプ: Key Material Message
+/// Packet type: Key Material Message.
 const KM_PACKET_TYPE: u8 = 2;
 
-/// 暗号化方式
+/// Cipher.
 #[expect(dead_code)]
 pub mod cipher_type {
     /// AES-CTR
     pub const AES_CTR: u8 = 2;
-    /// AES-GCM (v1.6.0 以降)
+    /// AES-GCM (v1.6.0 and later).
     pub const AES_GCM: u8 = 4;
 }
 
-/// ストリームカプセル化
+/// Stream encapsulation.
 pub mod stream_encapsulation {
     /// MPEG-TS/SRT
     pub const MPEG_TS_SRT: u8 = 2;
 }
 
 impl KmMessage {
-    /// 新しい KM メッセージを作成
+    /// Create a new KM message.
     pub fn new(
         key_flag: KeyFlag,
         key_length: KeyLength,
@@ -898,11 +899,11 @@ impl KmMessage {
         }
     }
 
-    /// バイト列にエンコード
+    /// Encode to a byte buffer.
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::new();
 
-        // 最初の 4 バイト: S(1) | V(3) | PT(4) | Sign(16) | Resv1(6) | KK(2)
+        // First 4 bytes: S(1) | V(3) | PT(4) | Sign(16) | Resv1(6) | KK(2)
         let first_byte = (self.version << 4) | self.packet_type;
         write_u8(&mut buf, first_byte);
         write_u16(&mut buf, KM_SIGNATURE);
@@ -932,7 +933,7 @@ impl KmMessage {
         buf
     }
 
-    /// バイト列からデコード
+    /// Decode from a byte slice.
     pub fn decode(data: &[u8]) -> Result<Self, Error> {
         if data.len() < 16 {
             return Err(Error::invalid_data("KM message too short"));
@@ -940,7 +941,7 @@ impl KmMessage {
 
         let mut buf = data;
 
-        // 最初の 4 バイト
+        // First 4 bytes.
         let first_byte = read_u8(&mut buf)?;
         let version = (first_byte >> 4) & 0x07;
         let packet_type = first_byte & 0x0F;
@@ -990,7 +991,7 @@ impl KmMessage {
         let mut salt = [0u8; 16];
         salt.copy_from_slice(&salt_bytes);
 
-        // Wrapped Key (残り全て)
+        // Wrapped Key (everything remaining).
         let wrapped_key = buf.to_vec();
 
         Ok(Self {
@@ -1008,22 +1009,22 @@ impl KmMessage {
     }
 }
 
-/// KM レスポンスエラー
+/// KM response error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum KmError {
-    /// 暗号化されていない (ピアは暗号化するが、エージェントは暗号化を宣言していない)
+    /// Unsecured (the peer encrypts, but the agent has not declared encryption).
     Unsecured = 0,
-    /// シークレットがない (ピアは復号化する鍵を持っていない)
+    /// No secret (the peer has no key to decrypt with).
     NoSecret = 3,
-    /// シークレットが間違っている (ピアは間違った鍵を持っている)
+    /// Bad secret (the peer has the wrong key).
     BadSecret = 4,
-    /// 暗号化モードが違う (ピアは異なる暗号化モードを期待している)
+    /// Bad crypto mode (the peer expects a different encryption mode).
     BadCryptoMode = 5,
 }
 
 impl KmError {
-    /// u32 から変換
+    /// Convert from a u32.
     pub fn from_u32(value: u32) -> Option<Self> {
         match value {
             0 => Some(Self::Unsecured),
@@ -1075,7 +1076,7 @@ mod tests {
 
         let packet = original.encode(1000, 0);
         let decoded = HandshakePacket::decode(&packet)
-            .expect("エンコード済みハンドシェイクパケットのデコードは成功する想定");
+            .expect("decoding an encoded handshake packet should succeed");
 
         assert_eq!(original.version, decoded.version);
         assert_eq!(original.encryption_field, decoded.encryption_field);
@@ -1095,11 +1096,11 @@ mod tests {
 
         let packet = hs.encode(1000, 0);
         let decoded = HandshakePacket::decode(&packet)
-            .expect("エンコード済みハンドシェイクパケットのデコードは成功する想定");
+            .expect("decoding an encoded handshake packet should succeed");
 
         let ext = decoded
             .get_hs_extension()
-            .expect("HS 拡張は Some になる想定");
+            .expect("the HS extension should be Some");
         assert_eq!(ext.srt_version, 0x010500);
         assert_eq!(ext.srt_flags, srt_flags::TSBPDSND | srt_flags::TSBPDRCV);
         assert_eq!(ext.recv_tsbpd_delay, 120);
@@ -1119,8 +1120,8 @@ mod tests {
         let original = KmMessage::new(KeyFlag::Even, KeyLength::Aes128, salt, wrapped_key.clone());
 
         let encoded = original.encode();
-        let decoded = KmMessage::decode(&encoded)
-            .expect("エンコード済み KM メッセージのデコードは成功する想定");
+        let decoded =
+            KmMessage::decode(&encoded).expect("decoding an encoded KM message should succeed");
 
         assert_eq!(decoded.version, 1);
         assert_eq!(decoded.packet_type, 2);
@@ -1144,14 +1145,14 @@ mod tests {
 
         let packet = hs.encode(1000, 0);
         let decoded = HandshakePacket::decode(&packet)
-            .expect("エンコード済みハンドシェイクパケットのデコードは成功する想定");
+            .expect("decoding an encoded handshake packet should succeed");
 
-        // KM リクエストを取得
+        // Get the KM request.
         let km_result = decoded.get_km_request();
         assert!(km_result.is_some());
         let km = km_result
-            .expect("KM リクエストは Some になる想定")
-            .expect("KM メッセージのデコードは成功する想定");
+            .expect("the KM request should be Some")
+            .expect("decoding the KM message should succeed");
         assert_eq!(km.key_flag, KeyFlag::Even);
         assert_eq!(km.key_length, KeyLength::Aes128);
     }
@@ -1163,7 +1164,7 @@ mod tests {
 
         let packet = hs.encode(1000, 0);
         let decoded = HandshakePacket::decode(&packet)
-            .expect("エンコード済みハンドシェイクパケットのデコードは成功する想定");
+            .expect("decoding an encoded handshake packet should succeed");
 
         let result = decoded.get_km_response();
         assert!(matches!(result, Err(KmError::BadSecret)));
@@ -1293,7 +1294,7 @@ mod tests {
 
         let packet = hs.encode(1000, 0);
         let decoded = HandshakePacket::decode(&packet)
-            .expect("エンコード済みハンドシェイクパケットのデコードは成功する想定");
+            .expect("decoding an encoded handshake packet should succeed");
 
         let sid = decoded.get_sid_extension();
         assert_eq!(sid, Some("test_stream".to_string()));
@@ -1343,7 +1344,7 @@ mod tests {
 
         let packet = hs.encode(1000, 0);
         let decoded = HandshakePacket::decode(&packet)
-            .expect("エンコード済みハンドシェイクパケットのデコードは成功する想定");
+            .expect("decoding an encoded handshake packet should succeed");
 
         let sid = decoded.get_sid_extension();
         assert_eq!(sid, Some("#!::u=admin,r=live/stream1".to_string()));
@@ -1351,13 +1352,13 @@ mod tests {
 
     #[test]
     fn test_sid_extension_with_padding() {
-        // 5 文字 → 8 バイトにパディング
+        // 5 characters -> padded to 8 bytes.
         let mut hs = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
         hs.add_sid_extension("hello");
 
         let packet = hs.encode(1000, 0);
         let decoded = HandshakePacket::decode(&packet)
-            .expect("エンコード済みハンドシェイクパケットのデコードは成功する想定");
+            .expect("decoding an encoded handshake packet should succeed");
 
         let sid = decoded.get_sid_extension();
         assert_eq!(sid, Some("hello".to_string()));
@@ -1365,13 +1366,13 @@ mod tests {
 
     #[test]
     fn test_sid_extension_exact_4_bytes() {
-        // 4 文字 → パディング不要
+        // 4 characters -> no padding needed.
         let mut hs = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
         hs.add_sid_extension("test");
 
         let packet = hs.encode(1000, 0);
         let decoded = HandshakePacket::decode(&packet)
-            .expect("エンコード済みハンドシェイクパケットのデコードは成功する想定");
+            .expect("decoding an encoded handshake packet should succeed");
 
         let sid = decoded.get_sid_extension();
         assert_eq!(sid, Some("test".to_string()));
@@ -1379,14 +1380,14 @@ mod tests {
 
     #[test]
     fn test_sid_extension_long_string() {
-        // 長い文字列
+        // A long string.
         let long_sid = "a".repeat(100);
         let mut hs = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
         hs.add_sid_extension(&long_sid);
 
         let packet = hs.encode(1000, 0);
         let decoded = HandshakePacket::decode(&packet)
-            .expect("エンコード済みハンドシェイクパケットのデコードは成功する想定");
+            .expect("decoding an encoded handshake packet should succeed");
 
         let sid = decoded.get_sid_extension();
         assert_eq!(sid, Some(long_sid));
@@ -1399,9 +1400,9 @@ mod tests {
 
         let packet = hs.encode(1000, 0);
         let decoded = HandshakePacket::decode(&packet)
-            .expect("エンコード済みハンドシェイクパケットのデコードは成功する想定");
+            .expect("decoding an encoded handshake packet should succeed");
 
-        // 空文字列の場合は None になる (すべてゼロパディング)
+        // An empty string decodes to `Some("")` (all zero padding).
         let sid = decoded.get_sid_extension();
         assert_eq!(sid, Some("".to_string()));
     }
@@ -1412,7 +1413,7 @@ mod tests {
 
         let packet = hs.encode(1000, 0);
         let decoded = HandshakePacket::decode(&packet)
-            .expect("エンコード済みハンドシェイクパケットのデコードは成功する想定");
+            .expect("decoding an encoded handshake packet should succeed");
 
         let sid = decoded.get_sid_extension();
         assert!(sid.is_none());
@@ -1425,7 +1426,7 @@ mod tests {
 
         let packet = hs.encode(1000, 0);
         let decoded = HandshakePacket::decode(&packet)
-            .expect("エンコード済みハンドシェイクパケットのデコードは成功する想定");
+            .expect("decoding an encoded handshake packet should succeed");
 
         let cc = decoded.get_congestion_extension();
         assert_eq!(cc, Some("live".to_string()));
@@ -1433,13 +1434,13 @@ mod tests {
 
     #[test]
     fn test_congestion_extension_file() {
-        // FileCC はサポートしないが、デコードはできる
+        // FileCC isn't supported, but it still decodes.
         let mut hs = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
         hs.add_congestion_extension("file");
 
         let packet = hs.encode(1000, 0);
         let decoded = HandshakePacket::decode(&packet)
-            .expect("エンコード済みハンドシェイクパケットのデコードは成功する想定");
+            .expect("decoding an encoded handshake packet should succeed");
 
         let cc = decoded.get_congestion_extension();
         assert_eq!(cc, Some("file".to_string()));
@@ -1451,7 +1452,7 @@ mod tests {
 
         let packet = hs.encode(1000, 0);
         let decoded = HandshakePacket::decode(&packet)
-            .expect("エンコード済みハンドシェイクパケットのデコードは成功する想定");
+            .expect("decoding an encoded handshake packet should succeed");
 
         let cc = decoded.get_congestion_extension();
         assert!(cc.is_none());
@@ -1459,14 +1460,14 @@ mod tests {
 
     #[test]
     fn test_congestion_extension_with_sid() {
-        // Congestion 拡張と SID 拡張を同時に使用
+        // Use the Congestion extension and the SID extension together.
         let mut hs = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
         hs.add_congestion_extension("live");
         hs.add_sid_extension("test_stream");
 
         let packet = hs.encode(1000, 0);
         let decoded = HandshakePacket::decode(&packet)
-            .expect("エンコード済みハンドシェイクパケットのデコードは成功する想定");
+            .expect("decoding an encoded handshake packet should succeed");
 
         let cc = decoded.get_congestion_extension();
         assert_eq!(cc, Some("live".to_string()));

@@ -6,13 +6,19 @@ use crate::srt_handshake::{GroupType, SRTGROUP_MASK};
 use crate::srt_packet::sequence_less_than;
 use crate::time::Timestamp;
 
+/// How an [`SrtGroup`] distributes payload across its members.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupMode {
+    /// Send every payload on every active member.
     Broadcast,
+    /// Send each payload on one active member at a time, promoting a standby
+    /// member if it fails.
     Backup,
 }
 
 impl GroupMode {
+    /// Map a handshake [`GroupType`] to a `GroupMode`, or `None` if the wire
+    /// type doesn't correspond to a mode this crate implements.
     pub fn from_group_type(group_type: GroupType) -> Option<Self> {
         match group_type {
             GroupType::Broadcast => Some(Self::Broadcast),
@@ -22,24 +28,37 @@ impl GroupMode {
     }
 }
 
+/// A group member's lifecycle state within its [`SrtGroup`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupMemberState {
+    /// Added to the group but not yet handshake-connected.
     Pending,
+    /// Connected and currently eligible to carry payload.
     Active,
+    /// Connected but held in reserve (Backup mode only), promoted to
+    /// [`Self::Active`] if the active member fails.
     Standby,
     /// Temporarily excluded after a send-buffer backpressure event. A
     /// connected leg is requalified once its in-flight packets drain and its
     /// send sequence can be aligned with the group again.
     Unstable,
+    /// Disconnected or failed; permanently excluded from the group.
     Broken,
 }
 
+/// One deduplicated payload delivered by [`SrtGroup::poll_data`], tagged with
+/// the member and sequence it arrived on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupPacket {
+    /// The member the payload was received on.
     pub member_id: u32,
+    /// The group-logical sequence number.
     pub sequence_number: u32,
+    /// The message number, for reassembling multi-packet messages.
     pub message_number: u32,
+    /// The sender's timestamp, in the units defined by the SRT wire format.
     pub timestamp: u32,
+    /// The payload bytes.
     pub payload: Vec<u8>,
 }
 
@@ -50,12 +69,32 @@ pub struct GroupPacket {
 /// member lifecycle onto one logical connection lifecycle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GroupEvent {
-    MemberConnected { member_id: u32 },
+    /// A member completed its handshake and became connected.
+    MemberConnected {
+        /// The member that connected.
+        member_id: u32,
+    },
+    /// A deduplicated, in-order payload is ready for the application.
     DataReceived(GroupPacket),
-    MemberError { member_id: u32, error: String },
-    MemberDisconnected { member_id: u32, reason: String },
+    /// A member's connection reported a protocol error and was marked
+    /// [`GroupMemberState::Broken`].
+    MemberError {
+        /// The member that errored.
+        member_id: u32,
+        /// The error, as reported by the member's [`SrtConnection`].
+        error: String,
+    },
+    /// A member disconnected and was marked [`GroupMemberState::Broken`].
+    MemberDisconnected {
+        /// The member that disconnected.
+        member_id: u32,
+        /// Why the member disconnected.
+        reason: String,
+    },
 }
 
+/// One physical leg of an [`SrtGroup`]: a socket-level [`SrtConnection`] plus
+/// its group membership metadata.
 pub struct SrtGroupMember {
     id: u32,
     weight: u16,
@@ -64,27 +103,39 @@ pub struct SrtGroupMember {
 }
 
 impl SrtGroupMember {
+    /// This member's group-member ID.
     pub fn id(&self) -> u32 {
         self.id
     }
 
+    /// This member's weight, used to break ties when [`GroupMode::Backup`]
+    /// promotes a standby member.
     pub fn weight(&self) -> u16 {
         self.weight
     }
 
+    /// This member's current lifecycle state.
     pub fn state(&self) -> GroupMemberState {
         self.state
     }
 
+    /// The member's underlying protocol connection.
     pub fn connection(&self) -> &SrtConnection {
         &self.connection
     }
 
+    /// The member's underlying protocol connection, mutably.
     pub fn connection_mut(&mut self) -> &mut SrtConnection {
         &mut self.connection
     }
 }
 
+/// A bonded SRT group: a set of physical [`SrtGroupMember`] connections
+/// driven as one logical, deduplicated stream.
+///
+/// Applications add members as their handshakes complete, then send and
+/// receive through the group rather than through individual members. See
+/// [`GroupMode`] for how payload is distributed/deduplicated across members.
 pub struct SrtGroup {
     group_id: u32,
     mode: GroupMode,
@@ -96,6 +147,8 @@ pub struct SrtGroup {
 }
 
 impl SrtGroup {
+    /// Create an empty group. `group_id` must carry [`SRTGROUP_MASK`], as it
+    /// does on the wire.
     pub fn new(group_id: u32, mode: GroupMode) -> Result<Self, Error> {
         if group_id & SRTGROUP_MASK == 0 {
             return Err(Error::invalid_state("group ID is missing SRTGROUP_MASK"));
@@ -111,28 +164,36 @@ impl SrtGroup {
         })
     }
 
+    /// This group's ID, as carried on the wire.
     pub fn group_id(&self) -> u32 {
         self.group_id
     }
 
+    /// This group's mode.
     pub fn mode(&self) -> GroupMode {
         self.mode
     }
 
+    /// This group's members, in the order they were added.
     pub fn members(&self) -> &[SrtGroupMember] {
         &self.members
     }
 
+    /// Look up one member by ID.
     pub fn member(&self, member_id: u32) -> Option<&SrtGroupMember> {
         self.members.iter().find(|member| member.id == member_id)
     }
 
+    /// Look up one member by ID, mutably.
     pub fn member_mut(&mut self, member_id: u32) -> Option<&mut SrtGroupMember> {
         self.members
             .iter_mut()
             .find(|member| member.id == member_id)
     }
 
+    /// Add a new physical leg to the group. Its initial state depends on
+    /// [`GroupMode`] and whether its connection is already established; a
+    /// not-yet-connected member starts [`GroupMemberState::Pending`].
     pub fn add_member(
         &mut self,
         member_id: u32,
@@ -165,6 +226,8 @@ impl SrtGroup {
         Ok(())
     }
 
+    /// Force one member to [`GroupMemberState::Broken`]. Returns `false` if
+    /// `member_id` isn't a member of this group.
     pub fn mark_member_broken(&mut self, member_id: u32) -> bool {
         let Some(member) = self.member_mut(member_id) else {
             return false;
@@ -173,6 +236,9 @@ impl SrtGroup {
         true
     }
 
+    /// Remove one member from the group without returning its connection.
+    /// Use [`Self::remove_member_connection`] when the caller still owns the
+    /// leg's socket/timers and needs the protocol core back.
     pub fn remove_member(&mut self, member_id: u32) -> bool {
         let Some(index) = self
             .members
@@ -195,6 +261,8 @@ impl SrtGroup {
         Some(self.members.remove(index).connection)
     }
 
+    /// Send one payload through the group per its [`GroupMode`]. Returns the
+    /// number of members it was actually sent on.
     pub fn send(&mut self, payload: &[u8], now: Timestamp) -> Result<usize, Error> {
         self.refresh_states();
         match self.mode {
@@ -231,6 +299,9 @@ impl SrtGroup {
         }
     }
 
+    /// Return the next deduplicated, in-order payload, discarding any
+    /// member-lifecycle events along the way. Applications that need those
+    /// events too should use [`Self::poll_event`] instead.
     pub fn poll_data(&mut self, now: Timestamp) -> Option<GroupPacket> {
         loop {
             match self.poll_event(now)? {
