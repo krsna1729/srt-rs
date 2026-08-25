@@ -33,6 +33,59 @@ const MAX_ACK_TIMESTAMPS: usize = 16;
 /// Number of samples used for Link Capacity estimation.
 const LINK_CAPACITY_SAMPLES: usize = 16;
 
+/// Number of ACKACK samples used to estimate TSBPD clock drift.
+///
+/// This matches libsrt's `TSBPD_DRIFT_MAX_SAMPLES`.
+const TSBPD_DRIFT_MAX_SAMPLES: u32 = 1_000;
+/// Maximum drift carried into the TSBPD time base per sample window.
+///
+/// This matches libsrt's `TSBPD_DRIFT_MAX_VALUE`.
+const TSBPD_DRIFT_MAX_US: i64 = 5_000;
+
+/// A bounded, windowed clock-drift estimator used by TSBPD.
+///
+/// After each sample window, excess drift is folded into the time base and
+/// the remainder stays as the current delivery-time offset. This is the same
+/// algorithm used by libsrt's `DriftTracer`.
+#[derive(Debug, Default)]
+struct TsbpdDriftTracer {
+    drift_us: i64,
+    overdrift_us: i64,
+    drift_sum_us: i64,
+    sample_count: u32,
+}
+
+impl TsbpdDriftTracer {
+    fn update(&mut self, sample_us: i64) -> bool {
+        self.drift_sum_us = self.drift_sum_us.saturating_add(sample_us);
+        self.sample_count = self.sample_count.saturating_add(1);
+        self.overdrift_us = 0;
+
+        if self.sample_count < TSBPD_DRIFT_MAX_SAMPLES {
+            return false;
+        }
+
+        self.drift_us = self.drift_sum_us / i64::from(self.sample_count);
+        self.drift_sum_us = 0;
+        self.sample_count = 0;
+
+        if self.drift_us.unsigned_abs() > TSBPD_DRIFT_MAX_US as u64 {
+            self.overdrift_us = self.drift_us.signum() * TSBPD_DRIFT_MAX_US;
+            self.drift_us -= self.overdrift_us;
+        }
+
+        true
+    }
+
+    fn drift_us(&self) -> i64 {
+        self.drift_us
+    }
+
+    fn overdrift_us(&self) -> i64 {
+        self.overdrift_us
+    }
+}
+
 /// Maximum timestamp value (32-bit).
 const MAX_TIMESTAMP: u64 = 0xFFFF_FFFF;
 
@@ -247,10 +300,7 @@ struct ReceivedPacket {
     /// Packet data.
     packet: DataPacket,
     /// Receipt time (for statistics/jitter calculation).
-    #[expect(dead_code)]
     recv_time: Timestamp,
-    /// Scheduled delivery time (TSBPD).
-    delivery_time: Timestamp,
 }
 
 /// ACK information.
@@ -329,6 +379,13 @@ pub struct ReceiverBuffer {
 
     /// TSBPD time base (TsbpdTimeBase = T_NOW - HSREQ_TIMESTAMP, microseconds).
     tsbpd_time_base: u64,
+
+    /// First RTT sample, used to compensate one-way-delay changes while
+    /// measuring TSBPD clock drift.
+    first_rtt_sample: Option<u32>,
+
+    /// Current TSBPD clock-drift estimate.
+    drift_tracer: TsbpdDriftTracer,
 
     /// Whether the TSBPD wraparound period is active.
     wrapping_period_active: bool,
@@ -441,6 +498,8 @@ impl ReceiverBuffer {
             tsbpd_delay_us: tsbpd_delay_ms as u64 * 1000,
             tsbpd_enabled: true,
             tsbpd_time_base,
+            first_rtt_sample: None,
+            drift_tracer: TsbpdDriftTracer::default(),
             wrapping_period_active: false,
             rtt: 100_000, // Initial RTT: 100ms
             rtt_var: 50_000,
@@ -610,25 +669,6 @@ impl ReceiverBuffer {
             }
         }
 
-        // Calculate the TSBPD delivery time.
-        let delivery_time = if self.tsbpd_enabled {
-            // A post-wrap packet's (wrapping_period_active and ts < WRAPPING_PERIOD_START)
-            // delivery time is corrected by adding MAX_TIMESTAMP + 1.
-            // A pre-wrap packet's ts is >= WRAPPING_PERIOD_START and so cannot collide.
-            let pkt_time = self.tsbpd_time_base
-                + packet.timestamp as u64
-                + if self.wrapping_period_active
-                    && (packet.timestamp as u64) < WRAPPING_PERIOD_START
-                {
-                    MAX_TIMESTAMP + 1
-                } else {
-                    0
-                };
-            Timestamp::from_micros(pkt_time + self.tsbpd_delay_us)
-        } else {
-            now
-        };
-
         if self
             .delivery_seq_hint
             .is_none_or(|hint| sequence_less_than(seq, hint))
@@ -710,7 +750,6 @@ impl ReceiverBuffer {
             ReceivedPacket {
                 packet,
                 recv_time: now,
-                delivery_time,
             },
         );
 
@@ -733,6 +772,29 @@ impl ReceiverBuffer {
         } else {
             Some(new_losses)
         }
+    }
+
+    fn packet_base_time(&self, timestamp: u32) -> u64 {
+        self.tsbpd_time_base
+            .saturating_add(timestamp as u64)
+            .saturating_add(
+                if self.wrapping_period_active && (timestamp as u64) < WRAPPING_PERIOD_START {
+                    MAX_TIMESTAMP + 1
+                } else {
+                    0
+                },
+            )
+    }
+
+    fn delivery_time(&self, entry: &ReceivedPacket) -> Timestamp {
+        if !self.tsbpd_enabled {
+            return entry.recv_time;
+        }
+
+        let base_and_delay = self
+            .packet_base_time(entry.packet.timestamp)
+            .saturating_add(self.tsbpd_delay_us);
+        Timestamp::from_micros(base_and_delay.saturating_add_signed(self.drift_tracer.drift_us()))
     }
 
     /// Get a deliverable packet (TSBPD).
@@ -779,7 +841,7 @@ impl ReceiverBuffer {
         // Fast path 1: hint is deliverable right now (no gap before it).
         if let Some(seq) = self.delivery_seq_hint
             && let Some(entry) = self.packets.get(&seq)
-            && (!self.tsbpd_enabled || entry.delivery_time <= now)
+            && (!self.tsbpd_enabled || self.delivery_time(entry) <= now)
             && !self
                 .loss_list_min
                 .is_some_and(|min| sequence_less_than(min, seq))
@@ -813,7 +875,7 @@ impl ReceiverBuffer {
             && oldest >= self.expected_seq
         {
             let entry = &self.packets[&oldest];
-            if !self.tsbpd_enabled || entry.delivery_time <= now {
+            if !self.tsbpd_enabled || self.delivery_time(entry) <= now {
                 return Some(oldest);
             }
             // Oldest exists but its TSBPD time hasn't arrived. Later
@@ -828,7 +890,7 @@ impl ReceiverBuffer {
 
         let mut best: Option<u32> = None;
         for (&seq, entry) in &self.packets {
-            let time_ok = !self.tsbpd_enabled || entry.delivery_time <= now;
+            let time_ok = !self.tsbpd_enabled || self.delivery_time(entry) <= now;
             let has_gap = self
                 .loss_list_min
                 .is_some_and(|min| sequence_less_than(min, seq));
@@ -958,27 +1020,40 @@ impl ReceiverBuffer {
     }
 
     /// Process an ACKACK and update RTT.
-    pub fn handle_ackack(&mut self, ack_number: u32, now: Timestamp) {
+    pub fn handle_ackack(&mut self, ack_number: u32, packet_timestamp: u32, now: Timestamp) {
         // Look up the ACK's send time.
-        let send_time = match self.ack_timestamps.get(ack_number) {
-            Some(t) => t,
-            None => return, // Ignore if no matching ACK is found.
-        };
+        let rtt_sample = self.ack_timestamps.get(ack_number).and_then(|send_time| {
+            let rtt = (now.as_micros().saturating_sub(send_time.as_micros())) as u32;
+            (rtt != 0 && rtt <= 30_000_000).then_some(rtt)
+        });
 
-        // Calculate RTT.
-        let rtt = (now.as_micros().saturating_sub(send_time.as_micros())) as u32;
+        if let Some(rtt) = rtt_sample {
+            // Smooth with EWMA: RTT = 7/8 * RTT + 1/8 * rtt
+            self.rtt = (self.rtt * 7 / 8) + (rtt / 8);
 
-        // Check that RTT is in a plausible range (1us - 30sec).
-        if rtt == 0 || rtt > 30_000_000 {
+            // RTTVar = 3/4 * RTTVar + 1/4 * |RTT - rtt|
+            let diff = self.rtt.abs_diff(rtt);
+            self.rtt_var = (self.rtt_var * 3 / 4) + (diff / 4);
+        }
+
+        if !self.tsbpd_enabled {
             return;
         }
 
-        // Smooth with EWMA: RTT = 7/8 * RTT + 1/8 * rtt
-        self.rtt = (self.rtt * 7 / 8) + (rtt / 8);
-
-        // RTTVar = 3/4 * RTTVar + 1/4 * |RTT - rtt|
-        let diff = self.rtt.abs_diff(rtt);
-        self.rtt_var = (self.rtt_var * 3 / 4) + (diff / 4);
+        if self.first_rtt_sample.is_none() {
+            self.first_rtt_sample = rtt_sample;
+        }
+        let rtt_delta = rtt_sample
+            .zip(self.first_rtt_sample)
+            .map_or(0, |(sample, first)| i64::from(sample) - i64::from(first))
+            / 2;
+        let drift_sample =
+            now.as_micros() as i64 - self.packet_base_time(packet_timestamp) as i64 - rtt_delta;
+        if self.drift_tracer.update(drift_sample) {
+            self.tsbpd_time_base = self
+                .tsbpd_time_base
+                .saturating_add_signed(self.drift_tracer.overdrift_us());
+        }
     }
 
     /// Remove expired packets (TLPKTDROP).
@@ -1005,7 +1080,7 @@ impl ReceiverBuffer {
                 let estimated_delivery = self
                     .packets
                     .get(&seq)
-                    .map(|p| p.delivery_time.as_micros())
+                    .map(|p| self.delivery_time(p).as_micros())
                     .unwrap_or_else(|| {
                         // Find the smallest received packet greater than seq
                         // in circular order: take the first element greater
@@ -1017,7 +1092,7 @@ impl ReceiverBuffer {
                             .next()
                             .or_else(|| self.packets.iter().next());
                         match next_seq {
-                            Some((_, entry)) => entry.delivery_time.as_micros(),
+                            Some((_, entry)) => self.delivery_time(entry).as_micros(),
                             // Fallback for when there is no next received packet.
                             // Adds MAX_TIMESTAMP + 1 while wrapping_period_active
                             // is set (inherited from the 0021 fix).
@@ -1104,7 +1179,7 @@ impl ReceiverBuffer {
         let mut newest_delivery: Option<u64> = None;
         for entry in self.packets.values() {
             payload_bytes_in_buffer += entry.packet.payload.len() as u64;
-            let delivery = entry.delivery_time.as_micros();
+            let delivery = self.delivery_time(entry).as_micros();
             oldest_delivery = Some(oldest_delivery.map_or(delivery, |old: u64| old.min(delivery)));
             newest_delivery = Some(newest_delivery.map_or(delivery, |new: u64| new.max(delivery)));
         }
@@ -1450,6 +1525,18 @@ mod tests {
     }
 
     #[test]
+    fn tsbpd_drift_tracer_moves_excess_into_time_base() {
+        let mut tracer = TsbpdDriftTracer::default();
+        for _ in 1..TSBPD_DRIFT_MAX_SAMPLES {
+            assert!(!tracer.update(7_000));
+        }
+        assert!(tracer.update(7_000));
+
+        assert_eq!(tracer.overdrift_us(), 5_000);
+        assert_eq!(tracer.drift_us(), 2_000);
+    }
+
+    #[test]
     fn test_receiving_rate_estimator() {
         let start = Timestamp::from_micros(0);
         let mut estimator = ReceivingRateEstimator::new(start);
@@ -1544,7 +1631,7 @@ mod tests {
 
         // ACKACK を受信 (RTT = 50ms)
         let ackack_time = Timestamp::from_micros(52000); // 50ms 後
-        buf.handle_ackack(ack_number, ackack_time);
+        buf.handle_ackack(ack_number, 0, ackack_time);
 
         // RTT が計算される (EWMA: 1/8 の重み)
         let stats = buf.stats();
@@ -1702,6 +1789,23 @@ mod tests {
                 .sequence_number,
             1000
         );
+    }
+
+    #[test]
+    fn tsbpd_drift_correction_updates_already_buffered_delivery_time() {
+        let mut buf = ReceiverBuffer::new(1000, 0, Timestamp::from_micros(0), 100_000);
+        buf.receive(make_packet(1000, 10), Timestamp::from_micros(0));
+
+        // libsrt averages 1,000 ACKACK samples. A 7ms average drift carries
+        // 5ms into the base and leaves a 2ms delivery offset.
+        for _ in 0..TSBPD_DRIFT_MAX_SAMPLES {
+            buf.handle_ackack(0, 0, Timestamp::from_micros(107_000));
+        }
+
+        assert_eq!(buf.tsbpd_time_base, 105_000);
+        assert_eq!(buf.drift_tracer.drift_us(), 2_000);
+        assert!(buf.pop_ready(Timestamp::from_micros(100_010)).is_none());
+        assert!(buf.pop_ready(Timestamp::from_micros(107_010)).is_some());
     }
 
     #[test]

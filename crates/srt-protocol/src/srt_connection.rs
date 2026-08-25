@@ -1693,7 +1693,7 @@ impl SrtConnection {
 
         // RTT を更新 (ACK 送信時刻はReceiverBuffer内で管理)
         if let Some(ref mut receiver) = self.receiver {
-            receiver.handle_ackack(ack_number, now);
+            receiver.handle_ackack(ack_number, pkt.timestamp, now);
         }
 
         Ok(())
