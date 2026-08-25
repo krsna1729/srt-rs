@@ -191,6 +191,10 @@ pub struct ConnectionOptions {
     pub delivery_queue_packets: u32,
 }
 
+// Manual Debug (redacting passphrase/crypto_sek) rather than #[derive(Debug)],
+// matching upstream shiguredo/srt-rs issue 0070 (not yet in the pulled
+// subtree, but already fixed here) -- the same class of leak as 0049's
+// CryptoContext::Debug, one layer up in the public ConnectionOptions API.
 impl fmt::Debug for ConnectionOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ConnectionOptions")
@@ -1279,8 +1283,8 @@ impl SrtConnection {
                     )?);
                 }
 
-                // CONCLUSION を送信
-                self.send_conclusion_request(now);
+                // Send the CONCLUSION.
+                self.send_conclusion_request(now)?;
                 self.handshake_state = HandshakeState::ConclusionSent;
                 self.arm_handshake_timer(now);
             }
@@ -1537,12 +1541,33 @@ impl SrtConnection {
                     link_capacity_packets_per_second,
                     receiving_rate_bytes_per_second,
                 );
+                // Receive-window flow control: cap in-flight packets at the
+                // peer's currently-advertised free buffer capacity, so a
+                // filling receive buffer actually throttles the sender
+                // instead of only being visible via telemetry. Clamped to
+                // the handshake-negotiated flow window rather than applied
+                // directly, so a buggy or adversarial peer advertising an
+                // inflated available_buffer can only ever shrink the
+                // sender's effective window, never grow it past what was
+                // already negotiated. (found via upstream shiguredo/srt-rs
+                // issue 0075, not yet in the pulled subtree)
+                sender.set_flow_window(
+                    available_buffer_packets.min(self.options.flow_window_packets),
+                );
             }
         }
 
-        // Full ACK の場合、ACKACK を送信
-        if pkt.control_info.len() >= 16 {
-            // Full ACK (RTT, RTTVar, Buffer Size, Rate を含む)
+        // ACKACK only acknowledges Full ACK receipt (draft-sharabayko-srt.md
+        // #ctrl-pkt-ack): "The sender only acknowledges the receipt of Full
+        // ACK packets." Full ACK's CIF is 28 bytes (7 fields x 4 bytes:
+        // ack_seq, RTT, RTTVar, Buffer Size, Packet Rate, Link Capacity, Recv
+        // Rate); Small ACK's CIF is 16 bytes (ack_seq through Buffer Size
+        // only). This implementation currently only ever produces 4-byte
+        // (Light ACK) or 28-byte (Full ACK) CIFs, so `>= 16` and `>= 28` are
+        // equivalent today -- but `>= 16` would send a spec-violating ACKACK
+        // for a future or peer-originated Small ACK. (found via upstream
+        // shiguredo/srt-rs issue 0054, not yet in the pulled subtree)
+        if pkt.control_info.len() >= 28 {
             self.send_ackack(pkt.type_specific_info, now);
         }
 
@@ -1855,7 +1880,7 @@ impl SrtConnection {
         self.queue_handshake_packet(buf);
     }
 
-    fn send_conclusion_request(&mut self, now: Timestamp) {
+    fn send_conclusion_request(&mut self, now: Timestamp) -> Result<(), Error> {
         let encryption_field = if self.options.passphrase.is_some() {
             self.options.key_length.to_encryption_field()
         } else {
@@ -1878,9 +1903,9 @@ impl SrtConnection {
         );
         hs.flow_window = self.flight_capacity_packets();
 
-        // SRT フラグ
-        // CRYPT と REXMITFLG は常に設定 (レガシー互換性フラグ)
-        // STREAM フラグは設定しない (Message モードを使用)
+        // SRT flags.
+        // CRYPT and REXMITFLG are always set (legacy compatibility flags).
+        // STREAM is not set (Message mode is used).
         let flags = srt_flags::TSBPDSND
             | srt_flags::TSBPDRCV
             | srt_flags::CRYPT
@@ -1890,10 +1915,18 @@ impl SrtConnection {
 
         hs.add_hs_extension(self.options.srt_version, flags, self.options.tsbpd_delay);
 
-        // 暗号化が有効な場合、KMREQ を追加
-        if let Some(ref crypto) = self.crypto
-            && let Ok(wrapped_key) = crypto.wrap_sek(crypto.current_key())
-        {
+        // Add a KMREQ extension if encryption is enabled.
+        //
+        // wrap_sek cannot actually fail on this path today (derive_kek
+        // always produces a key_length.len()-byte KEK, and
+        // CryptoContext::new_sender already validated the SEK's length), so
+        // this is defensive-only, not a live bug -- but propagate rather
+        // than silently drop it, matching the KM refresh path
+        // (provide_new_sek -> start_pre_announce), which already does.
+        // (found via upstream shiguredo/srt-rs issue 0056, not yet in the
+        // pulled subtree)
+        if let Some(ref crypto) = self.crypto {
+            let wrapped_key = crypto.wrap_sek(crypto.current_key())?;
             let km_message = KmMessage::new(
                 crypto.current_key(),
                 crypto.key_length(),
@@ -1903,7 +1936,7 @@ impl SrtConnection {
             hs.add_km_request(&km_message);
         }
 
-        // Stream ID が設定されている場合、SID 拡張を追加
+        // Add a SID extension if a Stream ID is set.
         if let Some(ref stream_id) = self.options.stream_id {
             hs.add_sid_extension(stream_id);
         }
@@ -1912,11 +1945,12 @@ impl SrtConnection {
             hs.add_group_extension(group);
         }
 
-        // CONCLUSION リクエストは dest_socket_id = 0 で送信 (libsrt 互換)
+        // A CONCLUSION request is sent with dest_socket_id = 0 (libsrt compatibility).
         let pkt = hs.encode(self.relative_timestamp(now), 0);
         let mut buf = Vec::new();
         pkt.encode(&mut buf);
         self.queue_handshake_packet(buf);
+        Ok(())
     }
 
     fn send_conclusion_response(&mut self, now: Timestamp) {

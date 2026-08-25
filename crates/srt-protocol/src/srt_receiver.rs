@@ -565,7 +565,10 @@ impl ReceiverBuffer {
         // per sequence number in the gap (up to just under 2^30, since
         // that's the boundary `sequence_less_than` treats as "ahead"),
         // so one crafted packet could force a multi-GB allocation and a
-        // long synchronous scan: a remote single-packet DoS.
+        // long synchronous scan: a remote single-packet DoS. Found
+        // independently via this repo's own fuzzing/pathology work; matches
+        // upstream shiguredo/srt-rs issue 0074 (documented there, not yet
+        // in the pulled subtree).
         if seq.wrapping_sub(self.expected_seq) & 0x7FFF_FFFF > self.max_buffer_size {
             return None;
         }

@@ -32,6 +32,10 @@ impl Timestamp {
     }
 
     /// Add milliseconds to the timestamp.
+    ///
+    /// Uses `saturating_mul` rather than a plain `*`, matching upstream
+    /// shiguredo/srt-rs issue 0058 (`millis * 1000` overflowing `u64`; not
+    /// yet in the pulled subtree, but already fixed here).
     pub fn add_millis(&self, millis: u64) -> Self {
         self.add_micros(millis.saturating_mul(1000))
     }

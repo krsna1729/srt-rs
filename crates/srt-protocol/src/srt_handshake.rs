@@ -714,10 +714,15 @@ impl HandshakePacket {
 }
 
 /// Encode a string as 32-bit little-endian words.
+///
+/// Truncation to `max_len` falls back to the nearest preceding UTF-8 char
+/// boundary rather than cutting at a raw byte offset: a mid-character cut
+/// produces invalid UTF-8, which then fails to decode back on the peer's
+/// `decode_le_words`, silently dropping the whole string. (found via
+/// upstream shiguredo/srt-rs issue 0057, not yet in the pulled subtree)
 fn encode_le_words(s: &str, max_len: usize) -> Vec<u8> {
-    let bytes = s.as_bytes();
-    let len = bytes.len().min(max_len);
-    let truncated = &bytes[..len];
+    let len = s.floor_char_boundary(max_len);
+    let truncated = &s.as_bytes()[..len];
 
     let padded_len = (len + 3) & !3;
     let mut data = vec![0u8; padded_len];
@@ -1391,6 +1396,31 @@ mod tests {
 
         let sid = decoded.get_sid_extension();
         assert_eq!(sid, Some(long_sid));
+    }
+
+    // Regression for upstream shiguredo/srt-rs issue 0057: "あ" is 3 bytes in
+    // UTF-8, so 171 of them is 513 bytes -- one over the 512-byte extension
+    // limit, with the 512-byte truncation point landing mid-character (byte
+    // 512 is the middle byte of the 171st "あ", which spans bytes 510..513).
+    // A raw-byte truncation at 512 emits an invalid UTF-8 tail, which then
+    // fails to round-trip through decode_le_words (returns None), silently
+    // losing the whole StreamID instead of just the one truncated character.
+    #[test]
+    fn test_sid_extension_truncates_on_a_utf8_char_boundary() {
+        let long_sid = "あ".repeat(171);
+        assert_eq!(long_sid.len(), 513);
+        let mut hs = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
+        hs.add_sid_extension(&long_sid);
+
+        let packet = hs.encode(1000, 0);
+        let decoded = HandshakePacket::decode(&packet)
+            .expect("decoding an encoded handshake packet should succeed");
+
+        let sid = decoded
+            .get_sid_extension()
+            .expect("truncation must land on a char boundary, not silently drop the StreamID");
+        assert!(long_sid.starts_with(&sid));
+        assert!(sid.len() <= 512);
     }
 
     #[test]
