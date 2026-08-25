@@ -310,6 +310,8 @@ pub struct SrtConnection {
     /// Congestion control mode name declared by the peer in the handshake
     /// extension, if any.
     peer_congestion_control: Option<String>,
+    /// SRT capability flags advertised by the peer's handshake extension.
+    peer_srt_flags: Option<u32>,
     /// Peer bonding group metadata.
     peer_group_extension: Option<GroupExtensionData>,
     last_handshake_packet: Option<Vec<u8>>,
@@ -402,6 +404,7 @@ impl SrtConnection {
             received_km: None,
             peer_stream_id: None,
             peer_congestion_control: None,
+            peer_srt_flags: None,
             peer_group_extension: None,
             last_handshake_packet: None,
             handshake_retry_sequence: 0,
@@ -436,6 +439,7 @@ impl SrtConnection {
             received_km: None,
             peer_stream_id: None,
             peer_congestion_control: None,
+            peer_srt_flags: None,
             peer_group_extension: None,
             last_handshake_packet: None,
             handshake_retry_sequence: 0,
@@ -679,7 +683,7 @@ impl SrtConnection {
             sender.set_max_bandwidth(max_bw);
         }
         self.sender = Some(sender);
-        self.receiver = Some(ReceiverBuffer::with_buffer_size(
+        let mut receiver = ReceiverBuffer::with_buffer_size(
             peer_initial_seq,
             self.options.tsbpd_delay,
             now,
@@ -687,7 +691,9 @@ impl SrtConnection {
             self.options
                 .receive_buffer_packets
                 .min(self.options.flow_window_packets),
-        ));
+        );
+        receiver.set_tsbpd_enabled(self.tsbpd_enabled());
+        self.receiver = Some(receiver);
         self.last_ack_time = Some(now);
         self.last_nak_time = Some(now);
     }
@@ -803,18 +809,22 @@ impl SrtConnection {
             TimerId::Ack => {
                 // Send a periodic ACK.
                 if self.state == ConnectionState::Connected {
-                    // TLPKTDROP: remove expired packets.
-                    if let Some(receiver) = self.receiver.as_mut() {
-                        for seq in receiver.drop_too_late(now) {
-                            if let Some(sender) = self.sender.as_mut() {
-                                sender.discard_acked(seq);
+                    if self.tlpktdrop_enabled() {
+                        // TLPKTDROP: remove expired packets.
+                        if let Some(receiver) = self.receiver.as_mut() {
+                            for seq in receiver.drop_too_late(now) {
+                                if let Some(sender) = self.sender.as_mut() {
+                                    sender.discard_acked(seq);
+                                }
                             }
                         }
                     }
                     self.enqueue_ready_data(now);
                     self.send_ack(now);
 
-                    if let Some(sender) = self.sender.as_mut() {
+                    if self.tlpktdrop_enabled()
+                        && let Some(sender) = self.sender.as_mut()
+                    {
                         let _ = sender.drop_expired(now);
                     }
 
@@ -827,7 +837,7 @@ impl SrtConnection {
             }
             TimerId::Nak => {
                 // Send a periodic NAK.
-                if self.state == ConnectionState::Connected {
+                if self.state == ConnectionState::Connected && self.periodic_nak_enabled() {
                     self.send_periodic_nak(now);
                     // Set the next NAK timer.
                     let interval = self
@@ -1339,6 +1349,7 @@ impl SrtConnection {
                 self.peer_socket_id = hs.socket_id;
                 self.peer_group_extension = hs.get_group_extension();
                 self.peer_congestion_control = hs.get_congestion_extension();
+                self.apply_peer_handshake_extension(&hs);
 
                 tracing::debug!(
                     "received CONCLUSION response, peer_initial_seq={}, peer_socket_id={:#x}",
@@ -1472,6 +1483,7 @@ impl SrtConnection {
                 }
                 self.peer_group_extension = hs.get_group_extension();
                 self.peer_congestion_control = hs.get_congestion_extension();
+                self.apply_peer_handshake_extension(&hs);
 
                 // KMREQ を処理して CryptoContext を作成
                 if let Some(ref passphrase) = self.options.passphrase {
@@ -1768,11 +1780,13 @@ impl SrtConnection {
             duration_micros: 10_000,
         });
 
-        // NAK timer (initial value 20ms).
-        self.output_queue.push_back(ConnectionOutput::SetTimer {
-            id: TimerId::Nak,
-            duration_micros: 20_000,
-        });
+        if self.periodic_nak_enabled() {
+            // NAK timer (initial value 20ms).
+            self.output_queue.push_back(ConnectionOutput::SetTimer {
+                id: TimerId::Nak,
+                duration_micros: 20_000,
+            });
+        }
 
         // Inactivity timer (5 seconds).
         self.output_queue.push_back(ConnectionOutput::SetTimer {
@@ -1916,6 +1930,33 @@ impl SrtConnection {
             flags |= srt_flags::STREAM;
         }
         flags
+    }
+
+    fn apply_peer_handshake_extension(&mut self, hs: &HandshakePacket) {
+        let Some(extension) = hs.get_hs_extension() else {
+            return;
+        };
+        self.options.tsbpd_delay = self.options.tsbpd_delay.max(extension.recv_tsbpd_delay);
+        self.peer_srt_flags = Some(extension.srt_flags);
+    }
+
+    fn negotiated_feature(&self, local_flag: u32, peer_flag: u32) -> bool {
+        self.negotiated_srt_flags() & local_flag != 0
+            && self
+                .peer_srt_flags
+                .is_some_and(|flags| flags & peer_flag != 0)
+    }
+
+    fn tsbpd_enabled(&self) -> bool {
+        self.negotiated_feature(srt_flags::TSBPDRCV, srt_flags::TSBPDSND)
+    }
+
+    fn tlpktdrop_enabled(&self) -> bool {
+        self.negotiated_feature(srt_flags::TLPKTDROP, srt_flags::TLPKTDROP)
+    }
+
+    fn periodic_nak_enabled(&self) -> bool {
+        self.negotiated_feature(srt_flags::PERIODICNAK, srt_flags::PERIODICNAK)
     }
 
     fn send_induction_response(&mut self, now: Timestamp) {
@@ -2401,6 +2442,76 @@ mod tests {
         assert!(error.reason.contains("version"));
         assert_eq!(caller.state(), ConnectionState::Disconnected);
         assert_eq!(caller.peer_socket_id(), 0);
+    }
+
+    #[test]
+    fn handshake_negotiates_the_larger_latency_for_both_peers() {
+        let mut caller = SrtConnection::new_caller(ConnectionOptions {
+            socket_id: 1,
+            tsbpd_delay: 500,
+            ..ConnectionOptions::default()
+        });
+        let mut listener = SrtConnection::new_listener(ConnectionOptions {
+            socket_id: 2,
+            tsbpd_delay: 120,
+            syn_cookie: Some(7),
+            ..ConnectionOptions::default()
+        });
+
+        caller
+            .connect(Timestamp::from_micros(0))
+            .expect("caller starts");
+        for round in 0..4 {
+            let now = Timestamp::from_micros(round * 10_000);
+            while let Some(ConnectionOutput::SendPacket(packet)) = caller.poll_output() {
+                listener
+                    .feed_recv_buf(&packet, now)
+                    .expect("listener accepts packet");
+            }
+            while let Some(ConnectionOutput::SendPacket(packet)) = listener.poll_output() {
+                caller
+                    .feed_recv_buf(&packet, now)
+                    .expect("caller accepts packet");
+            }
+            if caller.state() == ConnectionState::Connected
+                && listener.state() == ConnectionState::Connected
+            {
+                break;
+            }
+        }
+
+        assert_eq!(caller.state(), ConnectionState::Connected);
+        assert_eq!(listener.state(), ConnectionState::Connected);
+        assert_eq!(caller.options.tsbpd_delay, 500);
+        assert_eq!(listener.options.tsbpd_delay, 500);
+        assert!(
+            caller
+                .receiver
+                .as_ref()
+                .expect("caller receiver")
+                .tsbpd_enabled()
+        );
+        assert!(
+            listener
+                .receiver
+                .as_ref()
+                .expect("listener receiver")
+                .tsbpd_enabled()
+        );
+    }
+
+    #[test]
+    fn peer_capabilities_disable_optional_live_behaviour() {
+        let mut conn = SrtConnection::new_listener(ConnectionOptions::default());
+        let mut peer = HandshakePacket::new_conclusion_request(1, 0, 0, 0, false);
+        peer.add_hs_extension(0x010500, srt_flags::CRYPT | srt_flags::REXMITFLG, 120);
+        conn.apply_peer_handshake_extension(&peer);
+        conn.init_buffers(Timestamp::from_micros(0), 0, 0);
+
+        assert!(!conn.tsbpd_enabled());
+        assert!(!conn.tlpktdrop_enabled());
+        assert!(!conn.periodic_nak_enabled());
+        assert!(!conn.receiver.as_ref().expect("receiver").tsbpd_enabled());
     }
 
     #[test]

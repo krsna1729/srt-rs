@@ -472,6 +472,11 @@ impl ReceiverBuffer {
         self.tsbpd_enabled = enabled;
     }
 
+    #[cfg(test)]
+    pub(crate) fn tsbpd_enabled(&self) -> bool {
+        self.tsbpd_enabled
+    }
+
     /// Add an element to `loss_list`, updating the circular-order minimum
     /// cache in O(1).
     fn loss_list_insert(&mut self, seq: u32) {
