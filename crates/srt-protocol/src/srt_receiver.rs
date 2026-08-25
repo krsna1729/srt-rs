@@ -435,7 +435,9 @@ impl ReceiverBuffer {
             last_ack_time: start_time,
             last_ack_seq: initial_seq,
             packets_since_ack: 0,
-            ack_number: 1,
+            // The first Full ACK increments this to one, as required by the
+            // wire specification.
+            ack_number: 0,
             tsbpd_delay_us: tsbpd_delay_ms as u64 * 1000,
             tsbpd_enabled: true,
             tsbpd_time_base,
@@ -1893,6 +1895,7 @@ mod tests {
 
         // Full ACK では ack_number がインクリメントされる
         assert_eq!(buf.ack_number(), ack_number_before + 1);
+        assert_eq!(buf.ack_number(), 1);
     }
 
     #[test]
