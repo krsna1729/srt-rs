@@ -2232,14 +2232,12 @@ fn parse_loss_list(data: &[u8], max_entries: usize) -> Result<Vec<u32>, Error> {
     let mut result = Vec::with_capacity((data.len() / 4).min(max_entries));
     let mut slice = data;
 
-    let push = |result: &mut Vec<u32>, sequence: u32| -> Result<(), Error> {
+    let push = |result: &mut Vec<u32>, sequence: u32| {
         if result.len() >= max_entries {
-            return Err(Error::invalid_data(format!(
-                "NAK loss list exceeds negotiated limit of {max_entries} entries"
-            )));
+            return false;
         }
         result.push(sequence);
-        Ok(())
+        true
     };
 
     while !slice.is_empty() {
@@ -2254,7 +2252,9 @@ fn parse_loss_list(data: &[u8], max_entries: usize) -> Result<Vec<u32>, Error> {
             let end = crate::buf::read_u32(&mut slice)? & 0x7FFF_FFFF;
             let mut seq = start;
             loop {
-                push(&mut result, seq)?;
+                if !push(&mut result, seq) {
+                    return Ok(result);
+                }
                 if seq == end {
                     break;
                 }
@@ -2262,7 +2262,9 @@ fn parse_loss_list(data: &[u8], max_entries: usize) -> Result<Vec<u32>, Error> {
             }
         } else {
             // Single sequence number
-            push(&mut result, word)?;
+            if !push(&mut result, word) {
+                return Ok(result);
+            }
         }
     }
 
@@ -2703,16 +2705,17 @@ mod tests {
     }
 
     #[test]
-    fn loss_list_limit_is_global_across_ranges_and_singles() {
+    fn loss_list_limit_clamps_across_ranges_and_singles() {
         let mut encoded = Vec::new();
         write_u32(&mut encoded, 0x8000_0001);
         write_u32(&mut encoded, 3);
         write_u32(&mut encoded, 10);
         write_u32(&mut encoded, 11);
 
-        let error = parse_loss_list(&encoded, 4).expect_err("fifth entry must exceed the cap");
-        assert_eq!(error.kind, crate::ErrorKind::InvalidData);
-        assert!(error.reason.contains("exceeds negotiated limit"));
+        assert_eq!(
+            parse_loss_list(&encoded, 4).expect("loss report is safely clamped"),
+            vec![1, 2, 3, 10]
+        );
     }
 
     #[test]
