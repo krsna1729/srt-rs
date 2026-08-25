@@ -1771,7 +1771,7 @@ mod tests {
     /// TLPKTDROP で諦めたシーケンス (1000) が expected_seq に永久に張り付き、
     /// 以後届くパケットのたびに receive() のギャップ検出ループが同じ穴を
     /// 「新規損失」として際限なく再カウントし続けるバグの回帰テスト。
-    /// docs/srt-pure-rust-plan.md Phase 4 の差分テストで、10% loss + 100ms
+    /// 差分テストで、10% loss + 100ms
     /// delay + 高ビットレートのセルにおいて pkt_rcv_loss_total が受信
     /// パケット数の 1000 倍以上に達する形で発見された。
     #[test]

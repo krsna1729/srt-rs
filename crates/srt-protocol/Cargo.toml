@@ -5,8 +5,8 @@ edition = "2024"
 rust-version = "1.93"
 description = "SRT (Secure Reliable Transport) library"
 readme = "README.md"
-homepage = "https://github.com/shiguredo/srt-rs"
-repository = "https://github.com/shiguredo/srt-rs"
+homepage = "https://github.com/krsna1729/srt-rs"
+repository = "https://github.com/krsna1729/srt-rs"
 license = "Apache-2.0"
 include = [
     "/src/**",
@@ -42,10 +42,9 @@ rustc-hash = "2.1"
 tracing = "0.1"
 
 [dev-dependencies]
-# local patch (crates/srt-protocol/VENDOR.md): Core-only benchmark
-# for docs/srt-pure-rust-plan.md Phase 4's kill-switch criterion (is the
-# Rust Core cheaper per packet than libsrt, measured with no I/O in the
-# way). Same criterion version this repo's root Cargo.toml pins.
+# local patch (crates/srt-protocol/VENDOR.md): Core-only benchmark for
+# comparing Rust protocol cost with libsrt without I/O in the way. Same
+# criterion version this repo's root Cargo.toml pins.
 criterion = "0.8"
 
 [[bench]]

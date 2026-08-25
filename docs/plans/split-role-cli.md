@@ -81,13 +81,10 @@ limit, not this.
 
 ## Consequence for the published comparisons
 
-The [baseline](../baseline-2026-08-23.md) concluded that `shared-pool` was
-the strongest general choice and that the reuseport strategies "cost more
-CPU and deliver no better". That comparison was never CPU-fair:
-`shared-pool` was using **one** core while `reuseport-multi:K` used K. It
-survived only because the load generator was itself single-threaded and
-could not offer enough to expose the difference. Both halves of that
-finding need re-measuring now that either side can be scaled deliberately.
+Earlier comparisons treated `shared-pool` and `reuseport-multi:K` as if they
+had the same CPU budget. They do not: `shared-pool` uses **one** core while
+`reuseport-multi:K` uses K. Any comparison should allocate CPU deliberately
+and record the exact benchmark revision and host conditions.
 
 ## Still open
 

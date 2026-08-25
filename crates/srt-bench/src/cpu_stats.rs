@@ -1,9 +1,8 @@
 //! Framework-agnostic process CPU/memory accounting, shared by every
 //! bench-caller/bench-listener backend (mio/tokio/smol/monoio/glommio/compio)
 //! so their STATS lines are directly comparable on resource cost, not just
-//! throughput/RTT -- the docs/srt-pure-rust-plan.md Phase 4
-//! driver-framework bake-off is judged on latency introduced, throughput,
-//! *and* CPU/memory.
+//! throughput/RTT. The driver-framework bake-off is judged on latency
+//! introduced, throughput, *and* CPU/memory.
 //!
 //! CPU time comes from `getrusage(RUSAGE_SELF, ...)`. On Linux, peak RSS is
 //! read from `/proc/self/status`'s `VmHWM`: unlike `ru_maxrss`, it resets at

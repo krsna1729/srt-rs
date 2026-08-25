@@ -1,9 +1,8 @@
 //! Minimal, blocking, single-connection UDP driver for interop testing.
 //!
-//! Deliberately NOT the eventual Phase 6/7 production Driver (no epoll,
-//! no thread pool, no shard/poller reuse) -- this exists only to pump one
-//! `SrtConnection` against a real UDP socket long enough to prove wire-level
-//! interop against real libsrt. See docs/srt-pure-rust-plan.md Phase 3.
+//! Deliberately minimal (no epoll, thread pool, or shard/poller reuse): this
+//! exists only to pump one `SrtConnection` against a real UDP socket long
+//! enough to prove wire-level interop against real libsrt.
 
 use shiguredo_srt::{ConnectionEvent, ConnectionOutput, SrtConnection, TimerId, Timestamp};
 use std::collections::HashMap;

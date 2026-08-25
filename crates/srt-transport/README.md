@@ -142,7 +142,7 @@ Features are additive: enable exactly the ones your binary links.
 
 ```toml
 [dependencies]
-srt-transport = { git = "https://github.com/shiguredo/srt-rs", rev = "<audited-commit>", features = ["tokio"] }
+srt-transport = { git = "https://github.com/krsna1729/srt-rs", rev = "<audited-commit>", features = ["tokio"] }
 ```
 
 Use a pinned revision until the runtime crates pass the separate crates.io

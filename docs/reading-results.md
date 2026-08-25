@@ -6,9 +6,9 @@ is a reference, not a narrative — jump to the section you need.
 A cell in the sweep produces two rows, one per role (`caller`, `listener`),
 sharing every config column. The measurement columns tell two different
 stories depending which row you're reading, and conflating them is how
-several wrong conclusions got published earlier in this project (see
-[dead-timers-2026-08-23.md](dead-timers-2026-08-23.md) and
-[split-role-cli.md](plans/split-role-cli.md) for two worked postmortems).
+several wrong conclusions got published earlier in this project. The
+split-role analysis in [split-role-cli.md](plans/split-role-cli.md) is one
+worked example.
 This doc exists so the next anomaly gets chased with the right column
 instead of a hunch.
 

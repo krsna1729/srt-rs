@@ -7,7 +7,7 @@ merge rather than a manual re-copy. It was selected for its pure-Rust,
 sans-I/O protocol core and existing handshake, encryption, StreamID, and
 bonding support. Current compatibility and verification status is documented
 in this file, the crate [README](README.md), and the root
-[open-source readiness audit](../../docs/open-source-readiness-2026-08-24.md).
+root [README](../../README.md) and [SECURITY.md](../../SECURITY.md).
 
 ## Contents
 
@@ -236,7 +236,7 @@ concrete security implications identified at import. The original watch list
 also named 0051, 0056, 0059, and 0066. This paragraph is provenance, not the
 current project backlog: KM negotiation now fails closed, receive/flight
 windows are bounded and configurable, and current release status is maintained
-in the root [readiness audit](../../docs/open-source-readiness-2026-08-24.md).
+in the root [README](../../README.md) and [SECURITY.md](../../SECURITY.md).
 Re-check upstream `issues/closed/` and every local patch after any
 `subtree pull`; prefer an upstream fix and remove the local patch when the
 behavior and regression coverage are equivalent.

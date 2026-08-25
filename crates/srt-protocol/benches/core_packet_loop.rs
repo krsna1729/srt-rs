@@ -1,9 +1,9 @@
 //! Core-only per-packet CPU cost benchmark, no I/O in the way.
 //!
 //! This is the primary technical kill-switch benchmark for
-//! `docs/srt-pure-rust-plan.md` Phase 4: "is a clean-sheet Rust protocol
-//! layer cheaper per packet than libsrt's, in a pure micro-benchmark with
-//! no I/O in the way." Because `SrtConnection` is sans-I/O, this measures
+//! "is a clean-sheet Rust protocol layer cheaper per packet than libsrt's,
+//! in a pure micro-benchmark with no I/O in the way." Because
+//! `SrtConnection` is sans-I/O, this measures
 //! genuine protocol-layer cost (packetization, sequence/ACK bookkeeping,
 //! buffer management, and -- in the encrypted variant -- AES-CTR) with
 //! zero syscalls anywhere in the timed region: no sockets, no threads, no
@@ -19,8 +19,7 @@ use std::hint::black_box;
 
 /// SRT live-mode payload ceiling (`SRT_LIVE_MAX_PLSIZE` minus headers,
 /// matches this repo's `MAX_SRT_MESSAGE_PAYLOAD` in
-/// `src/media/srt/egress_engine.rs` -- see docs/srt-pure-rust-plan.md's
-/// Integration seams section).
+/// `src/media/srt/egress_engine.rs` in the application using this crate).
 const PAYLOAD_SIZE: usize = 1316;
 
 /// Batch sizes measured per run. 1 isolates true single-packet cost (no

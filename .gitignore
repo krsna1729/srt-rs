@@ -1,3 +1,6 @@
 /target
 /scratch/
 /graphify-out/
+/.codegraph/
+.DS_Store
+*.lcov

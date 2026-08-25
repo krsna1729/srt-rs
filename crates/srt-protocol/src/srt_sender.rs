@@ -95,8 +95,7 @@ pub struct SenderBuffer {
     /// パケットが `packets` から削除された後も、それが再送されていたという
     /// 事実自体は失われてはならない (低 RTT 環境では再送からごく短時間で
     /// ACK が届くため、ライブスキャン方式だと "再送は成功したのに
-    /// total_retransmits はほぼ 0" という誤った統計になる -- 実際に
-    /// docs/srt-pure-rust-plan.md Phase 4 の差分テストで踏んだ)。
+    /// total_retransmits はほぼ 0" という誤った統計になる)。
     total_retransmits: u64,
     /// Packets declared lost by peer NAKs (cumulative).
     total_lost: u64,
@@ -842,8 +841,7 @@ mod tests {
     /// retransmitted packet is later ACKed and purged from `packets` --
     /// it used to be computed by summing `retransmit_count` across
     /// currently-buffered packets only, so a fast ACK (as happens at low
-    /// RTT, where the live differential test matrix in
-    /// docs/srt-pure-rust-plan.md Phase 4 first caught this) made a
+    /// RTT) made a
     /// successfully-recovered retransmission disappear from the stat
     /// entirely once its packet left the buffer.
     #[test]

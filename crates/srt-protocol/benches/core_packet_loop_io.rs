@@ -117,7 +117,7 @@ fn setup_connected_pair_io(
 /// Background driver for the listener side: decodes inbound DATA packets,
 /// counts delivered payloads, and fires the ACK timer on a fixed cadence
 /// while idle -- the minimal stand-in for what a real Driver's timer wheel
-/// and recv loop would do (see docs/srt-pure-rust-plan.md Phase 6/7).
+/// and recv loop would do in a production application.
 fn run_listener_driver(
     mut listener: SrtConnection,
     listener_sock: UdpSocket,

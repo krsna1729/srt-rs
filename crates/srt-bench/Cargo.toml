@@ -4,7 +4,7 @@ version = "0.0.0"
 edition = "2024"
 publish = false
 license = "Apache-2.0"
-description = "Standalone caller/listener binaries over srt-protocol + std, for interop tests without linking an application crate or libsrt. See docs/srt-pure-rust-plan.md."
+description = "Standalone caller/listener binaries over srt-protocol + std, for interop tests without linking an application crate or libsrt."
 
 [dependencies]
 shiguredo_srt = { path = "../srt-protocol" }
@@ -19,7 +19,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # every loss-caller/loss-listener backend below.
 libc = "0.2"
 
-# --- Driver framework bake-off (docs/srt-pure-rust-plan.md Phase 4) ---
+# --- Driver framework bake-off ---
 # Six backends for the sustained-throughput loss-caller/loss-listener
 # binaries, sharing an external CLI/STATS-line contract (same args, same
 # output schema -- see mio_driver.rs's doc comment) but each free to use its

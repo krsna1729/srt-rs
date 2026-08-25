@@ -1,5 +1,4 @@
-//! Phase 4 kill-switch proof item: allocation-guard test
-//! (docs/srt-pure-rust-plan.md's Phase 4 Proof section).
+//! Allocation-guard regression test for the packet loop.
 //!
 //! The plan's original wording asks for "zero allocations in the
 //! steady-state packet loop." That is not what this crate does today, and
@@ -10,9 +9,9 @@
 //! around this file's introduction) confirmed a fixed-capacity ring buffer
 //! replacement has no measurable steady-state win and a severe regression
 //! at connection-setup time (eager full-flow-window allocation, ~700us vs
-//! BTreeMap's ~0). D6 (docs/srt-pure-rust-plan.md) already accepts this
+//! BTreeMap's ~0). The design accepts this
 //! kind of gap: the vendored Core is kept rebaseable against upstream
-//! rather than reshaped to hit `docs/srt-pure-rust-design.md`'s idealized
+//! rather than reshaped to hit an idealized
 //! three-allocation-points memory model.
 //!
 //! What this test actually guards, and why that's still meaningful:

@@ -1259,8 +1259,8 @@ fn test_multiple_sends_before_transfer() {
 /// existing `test_nak_timer`/`test_process_retransmit` tests fire the
 /// relevant timers but never simulate an actual gap), so this was an
 /// unverified path until this test -- added after a live netem differential
-/// run (docs/srt-pure-rust-plan.md Phase 4 tooling) needed to confirm the
-/// mechanism itself works before trusting its recovery-rate numbers.
+/// run needed to confirm the mechanism itself works before trusting its
+/// recovery-rate numbers.
 #[test]
 fn test_dropped_packet_triggers_nak_then_retransmit() {
     let mut caller = SrtConnection::new_caller(test_options());

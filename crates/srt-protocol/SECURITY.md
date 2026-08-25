@@ -18,4 +18,4 @@ published crate so consumers receive the important protocol constraints.
   `SrtConnection` from multiple tasks.
 
 Report vulnerabilities privately through GitHub's **Report a vulnerability**
-flow for <https://github.com/shiguredo/srt-rs>.
+flow for <https://github.com/krsna1729/srt-rs>.

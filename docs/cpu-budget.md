@@ -128,10 +128,6 @@ utilisation is high.
   that `--cpus` does not remove.
 - **NUMA.** Single-socket here, so not a factor; it would be on a bigger
   machine.
-- **All existing results predate this.** Everything in
-  [`baseline`](baseline-2026-08-23.md),
-  [`scaling ladder`](scaling-ladder-2026-08-23.md) and
-  [`runtime selection`](runtime-selection.md) was free-running and
-  unpinned on 6 cores. The rankings stand as measured; whether glommio
-  and monoio improve when pinned is an open question, and now a testable
-  one.
+- **Record the run conditions.** Keep raw output in the local, gitignored
+  `scratch/` directory and record the host, CPU allocation, runtime, and
+  benchmark revision alongside any result shared outside the checkout.

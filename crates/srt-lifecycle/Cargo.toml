@@ -7,8 +7,8 @@ publish = false
 license = "Apache-2.0"
 description = "Runtime-neutral SRT admission, affinity, and ownership policy"
 readme = "README.md"
-homepage = "https://github.com/shiguredo/srt-rs"
-repository = "https://github.com/shiguredo/srt-rs"
+homepage = "https://github.com/krsna1729/srt-rs"
+repository = "https://github.com/krsna1729/srt-rs"
 include = ["/src/**", "LICENSE", "README.md"]
 
 [dependencies]

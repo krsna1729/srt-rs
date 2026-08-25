@@ -5,9 +5,8 @@
 //! that budget, and then it is transmitting into a closed port: the run's
 //! last seconds are measured against a listener that is already gone, and
 //! the kernel books the difference as `NoPorts` rather than as anything
-//! the protocol did. Two of twenty-four cells in the timer-fix
-//! verification ended that way, and the live watcher saw 78k `no-ports`
-//! errors in three seconds during one of them.
+//! the protocol did. A prior run ended that way, and a live watcher saw a
+//! large burst of `no-ports` errors.
 //!
 //! So the harness now decides when the listener stops: it waits for the
 //! sender to finish, then signals. The timer stays as a backstop for a
