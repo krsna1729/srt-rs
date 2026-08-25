@@ -6,7 +6,7 @@
 //! `cargo test` runs on a machine without libsrt installed still pass. CI
 //! installs `srt-tools` explicitly before running this suite.
 
-use shiguredo_srt::{ConnectionOptions, SrtConnection, Timestamp};
+use shiguredo_srt::{ConnectionOptions, KeyLength, SrtConnection, Timestamp};
 use srt_bench::driver;
 use std::net::UdpSocket;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
@@ -163,7 +163,10 @@ fn receive_from_libsrt_caller(
 /// cannot reliably poll `file://con` in this environment, while its UDP
 /// source is a normal production input and gives this test a bounded EOF-free
 /// process lifetime through `-timeout`.
-fn receive_live_from_udp_source(payload: &[u8]) -> (driver::DriverResult, ExitStatus, String) {
+fn receive_live_from_udp_source(
+    payload: &[u8],
+    encryption: Option<(&str, KeyLength)>,
+) -> (driver::DriverResult, ExitStatus, String) {
     let port = free_port();
     let source_port = free_port();
     let socket = UdpSocket::bind(("127.0.0.1", port)).expect("bind listener socket");
@@ -171,10 +174,17 @@ fn receive_live_from_udp_source(payload: &[u8]) -> (driver::DriverResult, ExitSt
         .set_read_timeout(Some(Duration::from_millis(200)))
         .expect("set_read_timeout");
 
+    let output_uri = match encryption {
+        Some((passphrase, key_length)) => format!(
+            "srt://127.0.0.1:{port}?passphrase={passphrase}&pbkeylen={}",
+            key_length.len()
+        ),
+        None => format!("srt://127.0.0.1:{port}"),
+    };
     let child = Command::new("srt-live-transmit")
         .args(["-q", "-timeout:3"])
         .arg(format!("udp://127.0.0.1:{source_port}"))
-        .arg(format!("srt://127.0.0.1:{port}"))
+        .arg(output_uri)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -217,6 +227,8 @@ fn receive_live_from_udp_source(payload: &[u8]) -> (driver::DriverResult, ExitSt
     let mut conn = SrtConnection::new_listener(ConnectionOptions {
         socket_id: 0x2000_0001,
         congestion_control: "live".to_string(),
+        passphrase: encryption.map(|(passphrase, _)| passphrase.to_string()),
+        key_length: encryption.map_or(KeyLength::Aes128, |(_, key_length)| key_length),
         ..Default::default()
     });
     conn.feed_recv_buf(&buf[..n], Timestamp::from_micros(0))
@@ -241,11 +253,21 @@ fn receive_live_from_udp_source(payload: &[u8]) -> (driver::DriverResult, ExitSt
 /// Run a live libsrt listener and send it a byte stream from a Rust caller.
 /// The test uses the same live congestion control and a bounded process
 /// lifetime as the forward-direction live test.
-fn send_to_libsrt_listener(payload: &[u8]) -> (driver::DriverResult, Output) {
+fn send_to_libsrt_listener(
+    payload: &[u8],
+    encryption: Option<(&str, KeyLength)>,
+) -> (driver::DriverResult, Output) {
     let port = free_port();
+    let input_uri = match encryption {
+        Some((passphrase, key_length)) => format!(
+            "srt://:{port}?mode=listener&passphrase={passphrase}&pbkeylen={}",
+            key_length.len()
+        ),
+        None => format!("srt://:{port}?mode=listener"),
+    };
     let child = Command::new("srt-live-transmit")
         .args(["-q", "-timeout:3"])
-        .arg(format!("srt://:{port}?mode=listener"))
+        .arg(input_uri)
         .arg("file://con")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -263,6 +285,8 @@ fn send_to_libsrt_listener(payload: &[u8]) -> (driver::DriverResult, Output) {
     let mut conn = SrtConnection::new_caller(ConnectionOptions {
         socket_id: 0x2000_0002,
         congestion_control: "live".to_string(),
+        passphrase: encryption.map(|(passphrase, _)| passphrase.to_string()),
+        key_length: encryption.map_or(KeyLength::Aes128, |(_, key_length)| key_length),
         ..Default::default()
     });
     conn.connect(Timestamp::from_micros(0))
@@ -349,7 +373,7 @@ fn libsrt_live_transmit_caller_sends_udp_to_rust_listener() {
 
     let payload = test_payload();
 
-    let (result, status, stderr) = receive_live_from_udp_source(&payload);
+    let (result, status, stderr) = receive_live_from_udp_source(&payload, None);
 
     assert!(
         result.connected,
@@ -368,6 +392,58 @@ fn libsrt_live_transmit_caller_sends_udp_to_rust_listener() {
     );
 }
 
+#[test]
+fn libsrt_live_caller_aes128_to_rust_listener() {
+    if !command_available("srt-live-transmit") {
+        eprintln!(
+            "skipping libsrt_live_caller_aes128_to_rust_listener: srt-live-transmit not on PATH"
+        );
+        return;
+    }
+
+    let payload = test_payload();
+    let (result, status, stderr) =
+        receive_live_from_udp_source(&payload, Some(("interop-passphrase", KeyLength::Aes128)));
+    assert!(
+        result.connected,
+        "Rust listener never connected: {:?}",
+        result.events
+    );
+    assert!(status.success(), "libsrt caller failed: {stderr}");
+    let received: Vec<u8> = result.received_payloads.into_iter().flatten().collect();
+    assert_eq!(
+        received, payload,
+        "AES-128 payload mismatch: {:?}",
+        result.events
+    );
+}
+
+#[test]
+fn libsrt_live_caller_aes256_to_rust_listener() {
+    if !command_available("srt-live-transmit") {
+        eprintln!(
+            "skipping libsrt_live_caller_aes256_to_rust_listener: srt-live-transmit not on PATH"
+        );
+        return;
+    }
+
+    let payload = test_payload();
+    let (result, status, stderr) =
+        receive_live_from_udp_source(&payload, Some(("interop-passphrase", KeyLength::Aes256)));
+    assert!(
+        result.connected,
+        "Rust listener never connected: {:?}",
+        result.events
+    );
+    assert!(status.success(), "libsrt caller failed: {stderr}");
+    let received: Vec<u8> = result.received_payloads.into_iter().flatten().collect();
+    assert_eq!(
+        received, payload,
+        "AES-256 payload mismatch: {:?}",
+        result.events
+    );
+}
+
 /// A Rust live caller sends a byte-exact stream to a real libsrt live
 /// listener. This covers the inverse handshake and DATA direction from the
 /// UDP-source test above.
@@ -381,7 +457,7 @@ fn rust_live_caller_sends_stream_to_libsrt_listener() {
     }
 
     let payload = test_payload();
-    let (result, output) = send_to_libsrt_listener(&payload);
+    let (result, output) = send_to_libsrt_listener(&payload, None);
 
     assert!(
         result.connected,
@@ -397,6 +473,36 @@ fn rust_live_caller_sends_stream_to_libsrt_listener() {
     assert_eq!(
         output.stdout, payload,
         "libsrt listener output does not match Rust caller payload byte-for-byte; driver events: {:?}",
+        result.events
+    );
+}
+
+#[test]
+fn rust_live_caller_aes128_to_libsrt_listener() {
+    if !command_available("srt-live-transmit") {
+        eprintln!(
+            "skipping rust_live_caller_aes128_to_libsrt_listener: srt-live-transmit not on PATH"
+        );
+        return;
+    }
+
+    let payload = test_payload();
+    let (result, output) =
+        send_to_libsrt_listener(&payload, Some(("interop-passphrase", KeyLength::Aes128)));
+    assert!(
+        result.connected,
+        "Rust caller never connected: {:?}; libsrt stderr: {}",
+        result.events,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "libsrt listener failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout, payload,
+        "AES-128 payload mismatch: {:?}",
         result.events
     );
 }
