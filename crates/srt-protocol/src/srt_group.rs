@@ -23,7 +23,7 @@ impl GroupMode {
         match group_type {
             GroupType::Broadcast => Some(Self::Broadcast),
             GroupType::Backup => Some(Self::Backup),
-            GroupType::Undefined => None,
+            GroupType::Undefined | GroupType::Unknown(_) => None,
         }
     }
 }

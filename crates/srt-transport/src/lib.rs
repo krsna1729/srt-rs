@@ -4010,6 +4010,54 @@ mod tests {
     }
 
     #[test]
+    fn bonded_inputs_reject_unknown_group_type_with_bad_mode() {
+        let peer = "127.0.0.1:10000".parse().expect("address");
+        let mut options = AdmissionOptions::basic(0x2222, 0, true);
+        options.bonded_inputs = BondedInputPolicy::Accept;
+        let telemetry = IngressTelemetry::new();
+        let mut table = PeerTable::new();
+        let (mut caller, conclusion) = prepare_conclusion_with_options(
+            &mut table,
+            peer,
+            ConnectionOptions {
+                socket_id: 0x1111,
+                group_extension: Some(shiguredo_srt::GroupExtensionData {
+                    group_id: shiguredo_srt::SRTGROUP_MASK | 42,
+                    group_type: shiguredo_srt::GroupType::Unknown(3),
+                    flags: 0,
+                    weight: 1,
+                }),
+                ..ConnectionOptions::default()
+            },
+            &options,
+            &telemetry,
+        );
+
+        assert_eq!(
+            table.admit(
+                peer,
+                &conclusion,
+                Timestamp::from_micros(2),
+                &options,
+                0,
+                1,
+                &telemetry,
+            ),
+            Admit::Rejected
+        );
+        let mut outbound = Vec::new();
+        table.poll_outbound(Timestamp::from_micros(2), &mut outbound);
+        let (_, rejection) = outbound
+            .into_iter()
+            .find(|(address, _)| *address == peer)
+            .expect("listener emits rejection");
+        let error = caller
+            .feed_recv_buf(&rejection, Timestamp::from_micros(3))
+            .expect_err("caller observes rejection");
+        assert!(error.reason.contains("reason=1405"));
+    }
+
+    #[test]
     fn opted_in_bonded_inputs_share_one_logical_event_stream_and_telemetry() {
         let first = "127.0.0.1:10000".parse().expect("address");
         let second = "127.0.0.1:10001".parse().expect("address");

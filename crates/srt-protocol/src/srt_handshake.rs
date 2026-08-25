@@ -130,23 +130,34 @@ impl ExtensionType {
 
 /// SRT bonding group type carried by the GROUP handshake extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
 pub enum GroupType {
     /// No group type was selected.
-    Undefined = 0,
+    Undefined,
     /// Broadcast mode duplicates each message across all active links.
-    Broadcast = 1,
+    Broadcast,
     /// Backup mode activates one link and fails over to a standby link.
-    Backup = 2,
+    Backup,
+    /// A group mode this implementation does not schedule, preserved so the
+    /// admission layer can reject it explicitly rather than losing metadata.
+    Unknown(u8),
 }
 
 impl GroupType {
-    fn from_u8(value: u8) -> Option<Self> {
+    pub fn from_u8(value: u8) -> Self {
         match value {
-            0 => Some(Self::Undefined),
-            1 => Some(Self::Broadcast),
-            2 => Some(Self::Backup),
-            _ => None,
+            0 => Self::Undefined,
+            1 => Self::Broadcast,
+            2 => Self::Backup,
+            value => Self::Unknown(value),
+        }
+    }
+
+    pub const fn to_u8(self) -> u8 {
+        match self {
+            Self::Undefined => 0,
+            Self::Broadcast => 1,
+            Self::Backup => 2,
+            Self::Unknown(value) => value,
         }
     }
 }
@@ -546,7 +557,7 @@ impl HandshakePacket {
     pub fn add_group_extension(&mut self, group: GroupExtensionData) {
         let mut data = Vec::with_capacity(8);
         write_u32(&mut data, group.group_id);
-        let packed = (u32::from(group.group_type as u8) << 24)
+        let packed = (u32::from(group.group_type.to_u8()) << 24)
             | (u32::from(group.flags) << 16)
             | u32::from(group.weight);
         write_u32(&mut data, packed);
@@ -570,7 +581,7 @@ impl HandshakePacket {
             let mut data = extension.data.as_slice();
             let group_id = read_u32(&mut data).ok()?;
             let packed = read_u32(&mut data).ok()?;
-            let group_type = GroupType::from_u8((packed >> 24) as u8)?;
+            let group_type = GroupType::from_u8((packed >> 24) as u8);
 
             return Some(GroupExtensionData {
                 group_id,
@@ -1534,5 +1545,19 @@ mod tests {
                 .map(|extension| extension.data.as_slice()),
             Some(&[0x40, 0x00, 0x12, 0x34, 0x01, 0x00, 0x00, 0xC8][..])
         );
+    }
+
+    #[test]
+    fn unknown_group_type_round_trips_without_becoming_absent() {
+        let mut hs = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
+        let group = GroupExtensionData {
+            group_id: SRTGROUP_MASK | 9,
+            group_type: GroupType::Unknown(3),
+            flags: 0,
+            weight: 1,
+        };
+        hs.add_group_extension(group);
+
+        assert_eq!(hs.get_group_extension(), Some(group));
     }
 }
