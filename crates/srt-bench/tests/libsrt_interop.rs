@@ -9,7 +9,7 @@
 use shiguredo_srt::{ConnectionOptions, SrtConnection, Timestamp};
 use srt_bench::driver;
 use std::net::UdpSocket;
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 
 fn command_available(binary: &str) -> bool {
@@ -46,17 +46,14 @@ fn scratch_dir(label: &str) -> std::path::PathBuf {
     dir
 }
 
-fn wait_for_child(mut child: Child, binary: &str) -> (ExitStatus, String) {
+fn wait_for_child(mut child: Child, binary: &str) -> Output {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if child.try_wait().expect("poll libsrt process").is_some() {
             let output = child
                 .wait_with_output()
                 .unwrap_or_else(|e| panic!("collect {binary} output: {e}"));
-            return (
-                output.status,
-                String::from_utf8_lossy(&output.stderr).into_owned(),
-            );
+            return output;
         }
         if Instant::now() >= deadline {
             child
@@ -154,8 +151,12 @@ fn receive_from_libsrt_caller(
         |_, _, _| {},
     );
 
-    let (status, stderr) = wait_for_child(child, binary);
-    (result, status, stderr)
+    let output = wait_for_child(child, binary);
+    (
+        result,
+        output.status,
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
 }
 
 /// Run a live libsrt caller with a loopback UDP source. `srt-live-transmit`
@@ -229,8 +230,60 @@ fn receive_live_from_udp_source(payload: &[u8]) -> (driver::DriverResult, ExitSt
         |_, _, _| {},
     );
     source_sender.join().expect("UDP source sender panicked");
-    let (status, stderr) = wait_for_child(child, "srt-live-transmit");
-    (result, status, stderr)
+    let output = wait_for_child(child, "srt-live-transmit");
+    (
+        result,
+        output.status,
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// Run a live libsrt listener and send it a byte stream from a Rust caller.
+/// The test uses the same live congestion control and a bounded process
+/// lifetime as the forward-direction live test.
+fn send_to_libsrt_listener(payload: &[u8]) -> (driver::DriverResult, Output) {
+    let port = free_port();
+    let child = Command::new("srt-live-transmit")
+        .args(["-q", "-timeout:3"])
+        .arg(format!("srt://:{port}?mode=listener"))
+        .arg("file://con")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawn srt-live-transmit listener: {e}"));
+
+    // The listener's port is opened synchronously during its process startup,
+    // but UDP reports ICMP refusal if the caller wins that small race.
+    std::thread::sleep(Duration::from_millis(100));
+    let socket = UdpSocket::bind(("127.0.0.1", 0)).expect("bind Rust caller socket");
+    socket
+        .connect(("127.0.0.1", port))
+        .expect("connect Rust caller socket");
+    let start = Instant::now();
+    let mut conn = SrtConnection::new_caller(ConnectionOptions {
+        socket_id: 0x2000_0002,
+        congestion_control: "live".to_string(),
+        ..Default::default()
+    });
+    conn.connect(Timestamp::from_micros(0))
+        .expect("start Rust caller handshake");
+
+    let payload = payload.to_vec();
+    let result = driver::run(
+        &mut conn,
+        &socket,
+        start,
+        Duration::from_secs(10),
+        Duration::from_secs(2),
+        move |conn, _, now| {
+            for chunk in payload.chunks(1_000) {
+                conn.send(chunk, now)
+                    .expect("send payload from Rust caller");
+            }
+        },
+    );
+    let output = wait_for_child(child, "srt-live-transmit");
+    (result, output)
 }
 
 /// Real libsrt (`srt-file-transmit`, as caller) sends a file; this crate's
@@ -311,6 +364,39 @@ fn libsrt_live_transmit_caller_sends_udp_to_rust_listener() {
     assert_eq!(
         received, payload,
         "payload received from real libsrt does not match the file sent byte-for-byte; driver events: {:?}",
+        result.events
+    );
+}
+
+/// A Rust live caller sends a byte-exact stream to a real libsrt live
+/// listener. This covers the inverse handshake and DATA direction from the
+/// UDP-source test above.
+#[test]
+fn rust_live_caller_sends_stream_to_libsrt_listener() {
+    if !command_available("srt-live-transmit") {
+        eprintln!(
+            "skipping rust_live_caller_sends_stream_to_libsrt_listener: srt-live-transmit not on PATH"
+        );
+        return;
+    }
+
+    let payload = test_payload();
+    let (result, output) = send_to_libsrt_listener(&payload);
+
+    assert!(
+        result.connected,
+        "Rust caller never reached Connected: {:?}; libsrt stderr: {}",
+        result.events,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "srt-live-transmit listener exited with failure, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout, payload,
+        "libsrt listener output does not match Rust caller payload byte-for-byte; driver events: {:?}",
         result.events
     );
 }
