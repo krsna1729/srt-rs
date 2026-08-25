@@ -20,6 +20,10 @@ jobs:
   matrix:
     name: Nightly matrix
     runs-on: ubuntu-24.04
+    permissions:
+      # benchmark-action/github-action-benchmark pushes the updated chart
+      # data to the gh-pages branch; nothing else in this job needs write.
+      contents: write
     # 360 minutes is the hard ceiling for a GitHub-hosted job. The matrix
     # step below is itself `timeout`-wrapped well under that, so a sweep
     # that doesn't finish gets killed cleanly with time left for the
@@ -89,6 +93,19 @@ jobs:
             }
             END { if (!n) print "(none)" }
           ' nightly.tsv
+      - name: Convert to benchmark-action JSON
+        if: always()
+        run: scripts/bench-tsv-to-benchmark-json.sh nightly.tsv | tee nightly-benchmark.json
+      - name: Update GitHub Pages trend chart
+        if: always()
+        uses: benchmark-action/github-action-benchmark@v1.22.1
+        with:
+          tool: "customBiggerIsBetter"
+          output-file-path: nightly-benchmark.json
+          gh-pages-branch: gh-pages
+          benchmark-data-dir-path: dev/bench-nightly
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true
       - uses: actions/upload-artifact@v4
         if: always()
         with:

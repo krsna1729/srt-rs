@@ -17,6 +17,10 @@ jobs:
   matrix:
     name: Weekly matrix
     runs-on: ubuntu-24.04
+    permissions:
+      # benchmark-action/github-action-benchmark pushes the updated chart
+      # data to the gh-pages branch; nothing else in this job needs write.
+      contents: write
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
@@ -76,6 +80,24 @@ jobs:
               END { if (!n) print src ": (none)" }
             ' "$f"
           done
+      # throughput.tsv specifically -- same plan and reps every week, the
+      # one file here meant for week-over-week comparison. weekly.tsv and
+      # full-matrix-slice.tsv don't cover the same cells run to run
+      # (different reps / a rotating seed), so charting them wouldn't be
+      # comparing like with like.
+      - name: Convert to benchmark-action JSON
+        if: always()
+        run: scripts/bench-tsv-to-benchmark-json.sh throughput.tsv | tee weekly-benchmark.json
+      - name: Update GitHub Pages trend chart
+        if: always()
+        uses: benchmark-action/github-action-benchmark@v1.22.1
+        with:
+          tool: "customBiggerIsBetter"
+          output-file-path: weekly-benchmark.json
+          gh-pages-branch: gh-pages
+          benchmark-data-dir-path: dev/bench-weekly
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
