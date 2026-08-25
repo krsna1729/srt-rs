@@ -30,7 +30,7 @@
 //! fix and identical reasoning as mio's `run_pool_acceptor`.
 
 use crate::{Aggregate, BenchConfig, BondMode, ConnStats};
-use shiguredo_srt::{ConnectionEvent, ConnectionOptions, GroupExtensionData, SrtConnection};
+use shiguredo_srt::{ConnectionEvent, ConnectionOptions, SrtConnection};
 use srt_transport::tokio_transport::Conn;
 use srt_transport::{Handoff, WorkerMessage};
 use std::net::SocketAddr;
@@ -529,6 +529,7 @@ async fn run_acceptor(
     let run_deadline = Instant::now() + stream_len + IDLE_GRACE + Duration::from_secs(30);
     let mut tick = tokio::time::interval(TIMER_TICK);
     let mut buf = [0u8; 2048];
+    let mut outbound = Vec::new();
 
     loop {
         let now = Instant::now();
@@ -555,81 +556,64 @@ async fn run_acceptor(
             _ = tick.tick() => {}
         }
 
-        // Drive every tracked peer: fire timers, drain outputs (always
-        // via the shared listener's unconnected `send_to` -- a peer here
-        // never gets its own socket), and react to protocol events. On a
-        // peer's *first* Connected, decide once whether it needs to
-        // relocate.
         let t = crate::now_ts(start);
-        let mut relocate: Vec<(SocketAddr, Option<GroupExtensionData>)> = Vec::new();
-        for (peer, p) in peers.iter_mut() {
-            p.timers.fire_expired(t, &mut p.conn);
-            let _ = drain_pending_outputs(&mut p.conn, &mut p.timers, &listener, *peer, t).await;
-            let mut newly_connected = false;
-            while let Some(ev) = p.conn.poll_event() {
-                newly_connected |= p.apply_event(ev);
-            }
-            if newly_connected {
-                p.stream_deadline = Some(Instant::now() + stream_len);
-                relocate.push((*peer, p.conn.peer_group_extension()));
-            }
+        peers.poll_outbound(t, &mut outbound);
+        for (peer, bytes) in outbound.drain(..) {
+            let _ = listener.send_to(&bytes, peer).await;
         }
-        for (peer, extension) in relocate {
-            // The ladder itself is shared policy -- see
-            // `srt_lifecycle::decide_promotion`. Only the actions below
-            // are this runtime's business.
-            let decision = {
-                let group = extension.map(|extension| srt_lifecycle::GroupAffinity {
-                    group_id: extension.group_id,
-                    stream_id: None,
-                    extension,
-                });
-                match router.lock() {
-                    Ok(mut router) => srt_lifecycle::decide_promotion(
-                        promotion,
-                        peer,
-                        group,
-                        worker_index,
-                        &mut router,
-                        srt_lifecycle::RoutingMode::LeastTuples,
-                    ),
-                    // Poisoned: leave the connection where it is rather
-                    // than stall admission on a dead lock.
-                    Err(_) => srt_lifecycle::PromotionDecision::StayOnListener,
-                }
+        let mut connected = Vec::new();
+        peers.drain_events(stream_len, &mut connected);
+        for connected in connected {
+            let peer = connected.representative_peer;
+            if peers
+                .logical_peer(&connected.logical_peer)
+                .and_then(|logical| logical.group_affinity())
+                .is_some()
+            {
+                // Grouped ingress stays on the table-owned listener.
+                continue;
+            }
+            let decision = match router.lock() {
+                Ok(mut router) => srt_lifecycle::decide_promotion(
+                    promotion,
+                    peer,
+                    None,
+                    worker_index,
+                    &mut router,
+                    srt_lifecycle::RoutingMode::LeastTuples,
+                ),
+                Err(_) => srt_lifecycle::PromotionDecision::StayOnListener,
             };
-
+            if matches!(decision, srt_lifecycle::PromotionDecision::StayOnListener) {
+                continue;
+            }
+            let Some(srt_transport::RemovedLogicalPeer::Direct(p)) =
+                peers.remove(connected.logical_peer)
+            else {
+                continue;
+            };
             match decision {
-                srt_lifecycle::PromotionDecision::StayOnListener => {}
-                srt_lifecycle::PromotionDecision::RelocateTo(owner) => {
-                    let Some(p) = peers.remove(&peer) else {
-                        continue;
-                    };
-                    relocate_to_owner(
-                        cfg.port,
-                        cfg.sock_buf_bytes,
-                        peer,
-                        p.conn,
-                        owner,
-                        &senders,
-                        &telemetry,
-                    );
-                }
+                srt_lifecycle::PromotionDecision::RelocateTo(owner) => relocate_to_owner(
+                    cfg.port,
+                    cfg.sock_buf_bytes,
+                    peer,
+                    p.connection,
+                    owner,
+                    &senders,
+                    &telemetry,
+                ),
                 srt_lifecycle::PromotionDecision::PromoteHere => {
-                    let Some(p) = peers.remove(&peer) else {
-                        continue;
-                    };
-                    match promote_locally(cfg.port, cfg.sock_buf_bytes, peer, p.conn) {
-                        Some(driver) => {
-                            let cfg2 = cfg.clone();
-                            tasks.push(tokio::task::spawn_local(async move {
-                                established_conn_task(driver, cfg2, start).await
-                            }));
-                            telemetry.record_local_promotion();
-                        }
-                        None => eprintln!("[bench-tokio] promote {peer}: failed"),
+                    if let Some(driver) =
+                        promote_locally(cfg.port, cfg.sock_buf_bytes, peer, p.connection)
+                    {
+                        let cfg2 = cfg.clone();
+                        tasks.push(tokio::task::spawn_local(async move {
+                            established_conn_task(driver, cfg2, start).await
+                        }));
+                        telemetry.record_local_promotion();
                     }
                 }
+                srt_lifecycle::PromotionDecision::StayOnListener => {}
             }
         }
 
@@ -702,28 +686,6 @@ async fn run_acceptor(
         }
     }
     stats
-}
-
-async fn drain_pending_outputs(
-    conn: &mut SrtConnection,
-    timers: &mut srt_transport::ManualTimerStore,
-    listener: &tokio::net::UdpSocket,
-    destination: SocketAddr,
-    now: shiguredo_srt::Timestamp,
-) -> bool {
-    use shiguredo_srt::ConnectionOutput;
-    let mut refused = false;
-    while let Some(out) = conn.poll_output() {
-        match out {
-            ConnectionOutput::SendPacket(bytes) => {
-                if listener.send_to(&bytes, destination).await.is_err() {
-                    refused = true;
-                }
-            }
-            other => timers.apply_output(&other, now),
-        }
-    }
-    refused
 }
 
 /// Relocate a connection that must move to a different worker: bind a
@@ -943,12 +905,22 @@ async fn serve_pool_socket(cfg: BenchConfig, index: usize, start: Instant) -> Ve
     let run_deadline = Instant::now() + stream_len + IDLE_GRACE + Duration::from_secs(30);
     let mut buf = [0u8; 2048];
     let mut outbound: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
-    let mut connected: Vec<SocketAddr> = Vec::new();
+    let mut connected = Vec::new();
+    let mut connected_streams = 0usize;
+    let mut logical_run_deadline = None;
     let _ = &mut buf;
 
     loop {
         let now = Instant::now();
         if now >= run_deadline {
+            break;
+        }
+        if logical_run_deadline.is_none()
+            && peers.logical_started_count() >= cfg.logical_connection_count()
+        {
+            logical_run_deadline = Some(now + stream_len);
+        }
+        if logical_run_deadline.is_some_and(|deadline| now >= deadline) {
             break;
         }
         if crate::shutdown::requested()
@@ -978,6 +950,10 @@ async fn serve_pool_socket(cfg: BenchConfig, index: usize, start: Instant) -> Ve
         // SharedPool never promotes, so a first Connected only starts the
         // stream clock -- which drain_events already did.
         peers.drain_events(stream_len, &mut connected);
+        connected_streams = connected_streams.saturating_add(connected.len());
+        if connected_streams >= cfg.logical_connection_count() {
+            logical_run_deadline = Some(Instant::now() + stream_len);
+        }
     }
 
     crate::collect_listener_stats(peers)
@@ -1103,7 +1079,7 @@ async fn run_single_acceptor(
     let mut routed = 0usize;
     let mut buf = [0u8; 2048];
     let mut outbound: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
-    let mut connected: Vec<SocketAddr> = Vec::new();
+    let mut connected = Vec::new();
     let _ = &mut buf;
 
     // Admission ends with the connect window: anything not established by
@@ -1128,20 +1104,17 @@ async fn run_single_acceptor(
         }
         peers.drain_events(stream_len, &mut connected);
 
-        let newly: Vec<SocketAddr> = std::mem::take(&mut connected);
-        for peer in newly {
-            let Some(entry) = peers.remove(&peer) else {
+        let newly = std::mem::take(&mut connected);
+        for connected in newly {
+            let peer = connected.representative_peer;
+            let group = peers
+                .logical_peer(&connected.logical_peer)
+                .and_then(|logical| logical.group_affinity());
+            let Some(srt_transport::RemovedLogicalPeer::Direct(entry)) =
+                peers.remove(connected.logical_peer)
+            else {
                 continue;
             };
-            let group =
-                entry
-                    .conn
-                    .peer_group_extension()
-                    .map(|extension| srt_lifecycle::GroupAffinity {
-                        group_id: extension.group_id,
-                        stream_id: None,
-                        extension,
-                    });
             // Unlike #4, the router is consulted for *every* connection:
             // routing each one to a worker is the whole strategy, not a
             // bond-affinity special case.
@@ -1159,7 +1132,7 @@ async fn run_single_acceptor(
             }
             let message = WorkerMessage::Handoff(Box::new(srt_transport::Handoff {
                 socket,
-                conn: entry.conn,
+                conn: entry.connection,
             }));
             if senders[owner].send(message).is_ok() {
                 telemetry.record_handoff();

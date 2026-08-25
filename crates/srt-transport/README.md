@@ -87,12 +87,24 @@ Three layers:
      the human-readable view.
 
 3. **Bonded transport** (always compiled, runtime-neutral)
+   - `CallerTable` is the shared-socket counterpart to `PeerTable`. Add a
+     direct `CallerLeg` or a bonded set of `CallerGroupLeg`s, retain the
+     returned `LogicalCallerId`, then use `logical_caller_mut()` for the same
+     `can_send` / `send` / orderly-close / stats lifecycle as ingress. The
+     application performs `recv_from` and `send_to`; `feed()` routes replies
+     by SRT Socket ID and validates the configured source address, while
+     `poll_outbound()` advances every timer and returns datagrams to send.
+     A bonded group can therefore share exactly one application UDP socket
+     without leaking 4-tuples, Socket IDs, or leg selection into application
+     code.
    - `GroupConn` owns a real UDP socket, timer store, output queue, and
      `SrtConnection` for every Broadcast or Backup leg. `drive()` is
      synchronous/nonblocking so an application registers `leg_sockets()` in
      its existing reactor rather than paying for a hidden second runtime.
      `tokio_transport::GroupConn` is the equivalent Tokio-native driver and
-     owns `tokio::net::UdpSocket`s directly.
+     owns `tokio::net::UdpSocket`s directly. It remains useful when each group
+     intentionally owns its physical sockets; `CallerTable` is the shared-port
+     alternative for every runtime.
    - Broadcast attempts every active leg with the same sequence number, but
      succeeds when at least one accepts the payload. A full sender window
      makes that leg `Unstable`, not broken: once its in-flight packets drain,

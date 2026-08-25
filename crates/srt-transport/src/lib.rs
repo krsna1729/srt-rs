@@ -987,6 +987,31 @@ pub enum Admit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LogicalPeerId(u64);
 
+/// A logical peer which has been atomically retired from a [`PeerTable`].
+///
+/// The returned protocol cores let an application choose whether to drop them
+/// immediately or retain them for its own post-close accounting.  The table no
+/// longer owns any Socket-ID route, timer, admission slot, or event queue for
+/// this session.
+pub enum RemovedLogicalPeer {
+    Direct(RemovedPeerLeg),
+    Group(Vec<RemovedPeerLeg>),
+}
+
+/// One physical protocol core returned when retiring a logical peer.
+pub struct RemovedPeerLeg {
+    pub peer: std::net::SocketAddr,
+    pub connection: SrtConnection,
+}
+
+/// A newly connected logical peer. `representative_peer` is diagnostic-only;
+/// use [`Self::logical_peer`] for every lifecycle operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NewlyConnectedPeer {
+    pub logical_peer: LogicalPeerId,
+    pub representative_peer: std::net::SocketAddr,
+}
+
 #[derive(Clone)]
 enum LogicalPeerTarget {
     Direct(PhysicalPeerKey),
@@ -1037,6 +1062,40 @@ impl LogicalPeer<'_> {
                 .get(peer)
                 .and_then(|entry| entry.conn.peer_stream_id()),
             LogicalPeerTarget::Group(key) => key.stream_id.as_deref(),
+        }
+    }
+
+    /// GROUP metadata used by an application's worker-affinity policy. This
+    /// is descriptive only; the logical peer handle remains the session key.
+    #[must_use]
+    pub fn group_affinity(&self) -> Option<srt_lifecycle::GroupAffinity> {
+        match self.table.logical_peers.get(&self.id)? {
+            LogicalPeerTarget::Direct(peer) => self.table.peers.get(peer).and_then(|entry| {
+                entry
+                    .conn
+                    .peer_group_extension()
+                    .map(|extension| srt_lifecycle::GroupAffinity {
+                        group_id: extension.group_id,
+                        stream_id: entry.conn.peer_stream_id().map(str::to_owned),
+                        extension,
+                    })
+            }),
+            LogicalPeerTarget::Group(key) => {
+                self.table
+                    .groups
+                    .get(key)
+                    .map(|_| srt_lifecycle::GroupAffinity {
+                        group_id: key.group_id,
+                        stream_id: key.stream_id.clone(),
+                        extension: self
+                            .table
+                            .groups
+                            .get(key)
+                            .and_then(|group| group.group.members().first())
+                            .and_then(|member| member.connection().peer_group_extension())
+                            .expect("bonded group was admitted from GROUP handshakes"),
+                    })
+            }
         }
     }
 
@@ -1338,10 +1397,23 @@ impl PeerTable {
             });
         }
         let caller_socket_id = induction_socket_id?;
-        self.peers.iter().find_map(|(key, entry)| {
-            (key.address == address && entry.conn.peer_socket_id() == caller_socket_id)
-                .then_some(*key)
-        })
+        self.peers
+            .iter()
+            .find_map(|(key, entry)| {
+                (key.address == address && entry.conn.peer_socket_id() == caller_socket_id)
+                    .then_some(*key)
+            })
+            .or_else(|| {
+                self.group_peers.iter().find_map(|(key, handle)| {
+                    let member = self
+                        .groups
+                        .get(&handle.key)
+                        .and_then(|group| group.group.member(handle.member_id))?;
+                    (key.address == address
+                        && member.connection().peer_socket_id() == caller_socket_id)
+                        .then_some(*key)
+                })
+            })
     }
 
     fn physical_for_address(&self, address: std::net::SocketAddr) -> Option<PhysicalPeerKey> {
@@ -2207,7 +2279,7 @@ impl PeerTable {
     pub fn drain_events(
         &mut self,
         stream_len: Duration,
-        newly_connected: &mut Vec<std::net::SocketAddr>,
+        newly_connected: &mut Vec<NewlyConnectedPeer>,
     ) {
         newly_connected.clear();
         let mut events = Vec::new();
@@ -2226,7 +2298,10 @@ impl PeerTable {
                         && entry.apply_event(admission_event.event)
                     {
                         entry.stream_deadline = Some(deadline);
-                        newly_connected.push(peer);
+                        newly_connected.push(NewlyConnectedPeer {
+                            logical_peer: admission_event.logical_peer,
+                            representative_peer: peer,
+                        });
                     }
                 }
                 Some(LogicalPeerTarget::Group(key)) => {
@@ -2235,35 +2310,29 @@ impl PeerTable {
                         && group.stream_deadline.is_none()
                     {
                         group.stream_deadline = Some(deadline);
-                        newly_connected.push(peer);
+                        newly_connected.push(NewlyConnectedPeer {
+                            logical_peer: admission_event.logical_peer,
+                            representative_peer: peer,
+                        });
                     }
                 }
                 None => {}
             }
         }
-    }
-
-    #[must_use]
-    pub fn contains(&self, peer: &std::net::SocketAddr) -> bool {
-        self.physical_for_address(*peer).is_some()
-    }
-
-    #[must_use]
-    pub fn get(&self, peer: &std::net::SocketAddr) -> Option<&AdmissionPeer> {
-        self.physical_for_address(*peer)
-            .and_then(|physical| self.peers.get(&physical))
-    }
-
-    /// Mutable peer access for advanced integrations that need to inspect or
-    /// drive protocol state beyond the standard admission helpers.
-    ///
-    /// If external work queues new output, call [`Self::mark_ready`] so the
-    /// next maintenance pass observes it promptly. This address-only helper
-    /// is intentionally for non-multiplexed integrations; applications with
-    /// a shared four-tuple use the logical-peer API instead.
-    pub fn get_mut(&mut self, peer: &std::net::SocketAddr) -> Option<&mut AdmissionPeer> {
-        let physical = self.physical_for_address(*peer)?;
-        self.peers.get_mut(&physical)
+        // A group can become connected while its member event is drained by
+        // an earlier maintenance pass. Keep the stream clock tied to the
+        // persistent logical state as well as to this pass's event batch, so
+        // that case cannot leave a completed bonded stream waiting for the
+        // handshake deadline.
+        for group in self.groups.values_mut() {
+            if group.connected && group.stream_deadline.is_none() {
+                group.stream_deadline = Some(deadline);
+                newly_connected.push(NewlyConnectedPeer {
+                    logical_peer: group.logical_peer,
+                    representative_peer: group.representative_peer,
+                });
+            }
+        }
     }
 
     /// Return the steady-state view for either an ordinary connection or an
@@ -2295,54 +2364,59 @@ impl PeerTable {
         })
     }
 
-    pub fn remove(&mut self, peer: &std::net::SocketAddr) -> Option<AdmissionPeer> {
-        let physical = self.physical_for_address(*peer)?;
-        self.remove_physical(physical)
+    /// Atomically retire one logical stream. For a bonded publisher this
+    /// removes every physical leg; a late datagram for any returned Socket ID
+    /// is ignored and can never recreate the retired group.
+    pub fn remove(&mut self, id: LogicalPeerId) -> Option<RemovedLogicalPeer> {
+        match self.logical_peers.get(&id).cloned()? {
+            LogicalPeerTarget::Direct(peer) => self.remove_direct(peer).map(|entry| {
+                RemovedLogicalPeer::Direct(RemovedPeerLeg {
+                    peer: peer.address,
+                    connection: entry.conn,
+                })
+            }),
+            LogicalPeerTarget::Group(key) => self.remove_group(key),
+        }
+    }
+
+    /// Benchmark-only physical extraction for the legacy reuseport promotion
+    /// experiment. Production integrations use [`Self::remove`] with a
+    /// [`LogicalPeerId`].
+    #[cfg(feature = "bench-internals")]
+    pub fn remove_direct_for_bench(&mut self, peer: std::net::SocketAddr) -> Option<AdmissionPeer> {
+        self.physical_for_address(peer)
+            .and_then(|physical| self.remove_direct(physical))
+    }
+
+    /// Benchmark-only direct-peer iterator for the legacy reuseport
+    /// promotion experiment. It is deliberately absent from production builds.
+    #[cfg(feature = "bench-internals")]
+    pub fn iter_direct_for_bench(
+        &mut self,
+    ) -> impl Iterator<Item = (&std::net::SocketAddr, &mut AdmissionPeer)> {
+        self.peers
+            .iter_mut()
+            .map(|(physical, entry)| (&physical.address, entry))
+    }
+
+    /// Benchmark-only direct peer inspection for the legacy reuseport
+    /// promotion experiment. It is deliberately absent from production builds.
+    #[cfg(feature = "bench-internals")]
+    pub fn direct_for_bench(&self, peer: std::net::SocketAddr) -> Option<&AdmissionPeer> {
+        self.physical_for_address(peer)
+            .and_then(|physical| self.peers.get(&physical))
     }
 
     fn remove_physical(&mut self, peer: PhysicalPeerKey) -> Option<AdmissionPeer> {
         if let Some(handle) = self.group_peers.get(&peer).cloned() {
-            let mut group = self.groups.remove(&handle.key)?;
-            self.logical_peers.remove(&group.logical_peer);
-            let mut returned = None;
-            for (member_id, leg) in std::mem::take(&mut group.legs) {
-                let conn = group
-                    .group
-                    .remove_member_connection(member_id)
-                    .expect("group I/O legs are built with matching members");
-                self.group_peers.remove(&leg.physical);
-                self.established_peers = self.established_peers.saturating_sub(1);
-                if let HashEntry::Occupied(mut entry) =
-                    self.source_counts.entry(leg.physical.address.ip())
-                {
-                    let count = entry.get_mut();
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        entry.remove();
-                    }
-                }
-                if leg.physical == peer {
-                    returned = Some(AdmissionPeer {
-                        logical_peer: group.logical_peer,
-                        conn,
-                        timers: leg.timers,
-                        connected: group.connected,
-                        stream_deadline: group.stream_deadline,
-                        data_events: group.data_events,
-                        last_data_at: group.last_data_at,
-                        torn_down: group.torn_down,
-                        rejected: false,
-                        admission_established: true,
-                        last_datagram_at: self.last_now,
-                    });
-                }
-            }
-            return returned;
+            let _ = self.remove_group(handle.key)?;
+            return None;
         }
-        self.deadlines.remove(&peer);
-        self.half_open_deadlines.remove(&peer);
-        self.ready_set.remove(&peer);
-        self.event_ready_set.remove(&peer);
+        self.remove_direct(peer)
+    }
+
+    fn remove_direct(&mut self, peer: PhysicalPeerKey) -> Option<AdmissionPeer> {
+        self.purge_physical_indexes(peer);
         let removed = self.peers.remove(&peer);
         if let Some(entry) = &removed {
             self.logical_peers.remove(&entry.logical_peer);
@@ -2364,12 +2438,56 @@ impl PeerTable {
         removed
     }
 
-    pub fn iter_mut(
-        &mut self,
-    ) -> impl Iterator<Item = (&std::net::SocketAddr, &mut AdmissionPeer)> {
-        self.peers
-            .iter_mut()
-            .map(|(physical, entry)| (&physical.address, entry))
+    fn remove_group(&mut self, key: srt_lifecycle::LogicalGroupKey) -> Option<RemovedLogicalPeer> {
+        let mut group = self.groups.remove(&key)?;
+        self.logical_peers.remove(&group.logical_peer);
+        let mut removed = Vec::with_capacity(group.legs.len());
+        for (member_id, leg) in std::mem::take(&mut group.legs) {
+            let connection = group
+                .group
+                .remove_member_connection(member_id)
+                .expect("group I/O legs are built with matching members");
+            self.group_peers.remove(&leg.physical);
+            self.purge_physical_indexes(leg.physical);
+            self.peers.remove(&leg.physical);
+            self.established_peers = self.established_peers.saturating_sub(1);
+            self.decrement_source_count(leg.physical.address.ip());
+            removed.push(RemovedPeerLeg {
+                peer: leg.physical.address,
+                connection,
+            });
+        }
+        Some(RemovedLogicalPeer::Group(removed))
+    }
+
+    fn decrement_source_count(&mut self, ip: std::net::IpAddr) {
+        if let HashEntry::Occupied(mut entry) = self.source_counts.entry(ip) {
+            let count = entry.get_mut();
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                entry.remove();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn contains(&self, peer: &std::net::SocketAddr) -> bool {
+        self.physical_for_address(*peer).is_some()
+    }
+
+    #[cfg(test)]
+    fn get(&self, peer: &std::net::SocketAddr) -> Option<&AdmissionPeer> {
+        self.physical_for_address(*peer)
+            .and_then(|physical| self.peers.get(&physical))
+    }
+
+    fn purge_physical_indexes(&mut self, peer: PhysicalPeerKey) {
+        self.deadlines.remove(&peer);
+        self.half_open_deadlines.remove(&peer);
+        self.ready_set.remove(&peer);
+        self.ready.retain(|queued| *queued != peer);
+        self.event_ready_set.remove(&peer);
+        self.event_ready.retain(|queued| *queued != peer);
     }
 
     #[must_use]
@@ -2454,25 +2572,77 @@ impl PeerTable {
         connect_deadline: Instant,
         idle_grace: Duration,
     ) -> bool {
-        self.peers.values().all(|p| {
-            srt_lifecycle::is_terminal(
-                p.connected,
-                p.stream_deadline,
-                p.last_data_at,
-                now,
-                connect_deadline,
-                idle_grace,
-            )
-        }) && self.groups.values().all(|group| {
-            srt_lifecycle::is_terminal(
-                group.connected,
-                group.stream_deadline,
-                group.last_data_at,
-                now,
-                connect_deadline,
-                idle_grace,
-            )
-        })
+        self.peers
+            .iter()
+            // Bonded physical legs are represented by the one logical group
+            // below. Their `AdmissionPeer` bookkeeping deliberately never
+            // receives direct events, so counting them here would make a
+            // completed group wait for the handshake deadline.
+            .filter(|(peer, _)| !self.group_peers.contains_key(peer))
+            .all(|(_, p)| {
+                srt_lifecycle::is_terminal(
+                    p.connected,
+                    p.stream_deadline,
+                    p.last_data_at,
+                    now,
+                    connect_deadline,
+                    idle_grace,
+                )
+            })
+            && self.groups.values().all(|group| {
+                srt_lifecycle::is_terminal(
+                    group.connected,
+                    group.stream_deadline,
+                    group.last_data_at,
+                    now,
+                    connect_deadline,
+                    idle_grace,
+                )
+            })
+    }
+
+    /// Number of application-visible streams with at least one live SRT leg.
+    /// A bonded group contributes one even when several member connections
+    /// are established on the same UDP tuple.
+    #[must_use]
+    pub fn logical_connected_count(&self) -> usize {
+        let direct = self
+            .peers
+            .iter()
+            .filter(|(peer, entry)| {
+                !self.group_peers.contains_key(peer)
+                    && entry.conn.state() == shiguredo_srt::ConnectionState::Connected
+            })
+            .count();
+        let groups = self
+            .groups
+            .values()
+            .filter(|group| {
+                group.group.members().iter().any(|member| {
+                    member.connection().state() == shiguredo_srt::ConnectionState::Connected
+                })
+            })
+            .count();
+        direct + groups
+    }
+
+    /// Number of logical streams that have completed their initial SRT
+    /// handshake, even if an orderly close has already begun.
+    #[must_use]
+    pub fn logical_started_count(&self) -> usize {
+        let direct = self
+            .peers
+            .iter()
+            .filter(|(peer, entry)| {
+                !self.group_peers.contains_key(peer) && entry.stream_deadline.is_some()
+            })
+            .count();
+        let groups = self
+            .groups
+            .values()
+            .filter(|group| group.stream_deadline.is_some())
+            .count();
+        direct + groups
     }
 }
 
@@ -2881,58 +3051,479 @@ impl Default for ManualTimerStore {
     }
 }
 
-/// Runtime-neutral caller-side demultiplexer for many SRT connections sharing
-/// one application-owned UDP socket.
-///
-/// The runtime performs `recv_from`/`send_to`; this type owns only protocol
-/// cores, timers, and SRT Socket-ID routing. A received packet is accepted
-/// only from the remote address configured for its leg.
-pub struct SharedCallerPool {
-    legs: HashMap<u32, SharedCallerLegState>,
+/// Opaque application identity for one outbound SRT stream. A direct caller
+/// and a bonded Broadcast/Backup group have the same steady-state API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LogicalCallerId(u64);
+
+/// Coarse logical state of an outbound stream, independent of how many
+/// physical SRT legs currently carry it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogicalCallerState {
+    Connecting,
+    Connected,
+    Disconnected,
 }
 
-pub struct SharedCallerLeg {
+/// One physical caller leg for [`CallerTable::add_direct`]. The connection
+/// must already have begun its caller handshake.
+pub struct CallerLeg {
     pub peer: std::net::SocketAddr,
     pub connection: SrtConnection,
 }
 
-struct SharedCallerLegState {
+impl CallerLeg {
+    #[must_use]
+    pub fn new(peer: std::net::SocketAddr, connection: SrtConnection) -> Self {
+        Self { peer, connection }
+    }
+}
+
+/// One physical caller leg for [`CallerTable::add_group`]. `member_id` is the
+/// SRT group-member identity, while the connection Socket ID remains the
+/// per-leg wire demultiplexing key.
+pub struct CallerGroupLeg {
+    pub member_id: u32,
+    pub weight: u16,
+    pub peer: std::net::SocketAddr,
+    pub connection: SrtConnection,
+}
+
+impl CallerGroupLeg {
+    #[must_use]
+    pub fn new(
+        member_id: u32,
+        weight: u16,
+        peer: std::net::SocketAddr,
+        connection: SrtConnection,
+    ) -> Self {
+        Self {
+            member_id,
+            weight,
+            peer,
+            connection,
+        }
+    }
+}
+
+/// Telemetry for an outbound logical caller. Group snapshots contain both the
+/// aggregate logical/wire counters and the individual physical leg rows.
+pub enum LogicalCallerStats {
+    Direct(Box<shiguredo_srt::ConnectionStats>),
+    Group(Box<GroupConnectionStats>),
+}
+
+/// A logical caller atomically removed from a [`CallerTable`]. Its routes,
+/// timers, and pending outputs were removed from the table with it.
+pub enum RemovedLogicalCaller {
+    Direct(RemovedCallerLeg),
+    Group(Vec<RemovedCallerLeg>),
+}
+
+/// One physical protocol core returned when retiring a logical caller.
+pub struct RemovedCallerLeg {
+    pub peer: std::net::SocketAddr,
+    pub connection: SrtConnection,
+}
+
+/// Read-only steady-state view of one outbound logical stream.
+pub struct LogicalCaller<'a> {
+    table: &'a CallerTable,
+    id: LogicalCallerId,
+}
+
+impl LogicalCaller<'_> {
+    #[must_use]
+    pub const fn id(&self) -> LogicalCallerId {
+        self.id
+    }
+
+    #[must_use]
+    pub fn state(&self) -> Option<LogicalCallerState> {
+        self.table.sessions.get(&self.id).map(CallerSession::state)
+    }
+
+    #[must_use]
+    pub fn stats(&self) -> Option<LogicalCallerStats> {
+        self.table.sessions.get(&self.id).map(CallerSession::stats)
+    }
+}
+
+/// Mutable steady-state view of one outbound logical stream. This deliberately
+/// mirrors [`LogicalPeerMut`]: applications send, check capacity, close, and
+/// collect telemetry without handling socket IDs or bond legs.
+pub struct LogicalCallerMut<'a> {
+    table: &'a mut CallerTable,
+    id: LogicalCallerId,
+}
+
+impl LogicalCallerMut<'_> {
+    #[must_use]
+    pub const fn id(&self) -> LogicalCallerId {
+        self.id
+    }
+
+    #[must_use]
+    pub fn state(&self) -> Option<LogicalCallerState> {
+        self.table
+            .logical_caller(&self.id)
+            .and_then(|caller| caller.state())
+    }
+
+    #[must_use]
+    pub fn stats(&self) -> Option<LogicalCallerStats> {
+        self.table
+            .logical_caller(&self.id)
+            .and_then(|caller| caller.stats())
+    }
+
+    /// Whether the next logical payload can be accepted without weakening a
+    /// Broadcast or Backup delivery contract.
+    pub fn can_send(&mut self) -> bool {
+        self.table
+            .sessions
+            .get_mut(&self.id)
+            .is_some_and(CallerSession::can_send)
+    }
+
+    /// Send one logical payload. Direct callers return one; Broadcast returns
+    /// the successful active-leg count; Backup returns its selected leg.
+    pub fn send(&mut self, payload: &[u8], now: Timestamp) -> Result<usize, shiguredo_srt::Error> {
+        self.table
+            .sessions
+            .get_mut(&self.id)
+            .ok_or_else(|| {
+                shiguredo_srt::Error::with_reason(
+                    shiguredo_srt::ErrorKind::InvalidState,
+                    "logical caller no longer exists",
+                )
+            })?
+            .send(payload, now)
+    }
+
+    /// Begin an orderly close. A bonded caller closes every physical leg.
+    pub fn disconnect(&mut self, now: Timestamp) {
+        if let Some(caller) = self.table.sessions.get_mut(&self.id) {
+            caller.disconnect(now);
+        }
+    }
+}
+
+/// Runtime-neutral caller-side table for many direct or bonded SRT streams
+/// sharing one application-owned UDP socket.
+///
+/// The runtime performs `recv_from`/`send_to`; this table owns protocol cores,
+/// timers, source-address validation, and SRT Socket-ID routing. Group policy
+/// stays in the shared [`shiguredo_srt::SrtGroup`] core, so every runtime sees
+/// identical Broadcast and Backup behavior.
+pub struct CallerTable {
+    sessions: HashMap<LogicalCallerId, CallerSession>,
+    routes: HashMap<u32, CallerRoute>,
+    round_robin: VecDeque<LogicalCallerId>,
+    next_logical_caller: u64,
+}
+
+enum CallerRoute {
+    Direct(LogicalCallerId),
+    Group {
+        caller: LogicalCallerId,
+        member_id: u32,
+    },
+}
+
+struct CallerLegState {
     peer: std::net::SocketAddr,
     connection: SrtConnection,
     timers: ManualTimerStore,
+    pending: VecDeque<ConnectionOutput>,
 }
 
-impl SharedCallerPool {
-    /// Create a pool from already-initiated caller connections. Every leg
-    /// needs a non-zero, distinct local SRT Socket ID, as required to
-    /// demultiplex replies that share a UDP four-tuple.
-    pub fn new(
-        legs: impl IntoIterator<Item = SharedCallerLeg>,
-    ) -> Result<Self, shiguredo_srt::Error> {
-        let mut pool = Self {
-            legs: HashMap::new(),
-        };
+struct CallerGroupLegState {
+    peer: std::net::SocketAddr,
+    timers: ManualTimerStore,
+    pending: VecDeque<ConnectionOutput>,
+}
+
+struct CallerGroupState {
+    group: shiguredo_srt::SrtGroup,
+    legs: HashMap<u32, CallerGroupLegState>,
+    leg_order: Vec<u32>,
+    next_leg: usize,
+    logical: GroupLogicalCounters,
+}
+
+enum CallerSession {
+    Direct(Box<CallerLegState>),
+    Group(CallerGroupState),
+}
+
+impl CallerSession {
+    fn state(&self) -> LogicalCallerState {
+        match self {
+            Self::Direct(leg) => logical_state(&leg.connection),
+            Self::Group(group) => {
+                if group.group.members().iter().any(|member| {
+                    member.connection().state() == shiguredo_srt::ConnectionState::Connected
+                }) {
+                    LogicalCallerState::Connected
+                } else if group.group.members().iter().all(|member| {
+                    member.connection().state() == shiguredo_srt::ConnectionState::Disconnected
+                }) {
+                    LogicalCallerState::Disconnected
+                } else {
+                    LogicalCallerState::Connecting
+                }
+            }
+        }
+    }
+
+    fn stats(&self) -> LogicalCallerStats {
+        match self {
+            Self::Direct(leg) => LogicalCallerStats::Direct(Box::new(leg.connection.stats())),
+            Self::Group(group) => LogicalCallerStats::Group(Box::new(group_connection_stats(
+                &group.group,
+                group.logical,
+                |member_id| {
+                    let leg = group
+                        .legs
+                        .get(&member_id)
+                        .expect("group and caller legs are built together");
+                    (None, Some(leg.peer))
+                },
+            ))),
+        }
+    }
+
+    fn can_send(&mut self) -> bool {
+        match self {
+            Self::Direct(leg) => leg.connection.can_send(),
+            Self::Group(group) => group.group.can_send(),
+        }
+    }
+
+    fn send(&mut self, payload: &[u8], now: Timestamp) -> Result<usize, shiguredo_srt::Error> {
+        match self {
+            Self::Direct(leg) => {
+                leg.connection.send(payload, now)?;
+                Ok(1)
+            }
+            Self::Group(group) => {
+                let legs = group.group.send(payload, now)?;
+                group.logical.payloads_sent = group.logical.payloads_sent.saturating_add(1);
+                group.logical.payload_bytes_sent = group
+                    .logical
+                    .payload_bytes_sent
+                    .saturating_add(payload.len() as u64);
+                Ok(legs)
+            }
+        }
+    }
+
+    fn disconnect(&mut self, now: Timestamp) {
+        match self {
+            Self::Direct(leg) => leg.connection.disconnect(now),
+            Self::Group(group) => group.group.disconnect(now),
+        }
+    }
+
+    fn fire_timers(&mut self, now: Timestamp) {
+        match self {
+            Self::Direct(leg) => leg.timers.fire_expired(now, &mut leg.connection),
+            Self::Group(group) => {
+                let (core, legs) = (&mut group.group, &mut group.legs);
+                for (member_id, leg) in legs {
+                    let connection = core
+                        .member_mut(*member_id)
+                        .expect("group and caller legs are built together")
+                        .connection_mut();
+                    leg.timers.fire_expired(now, connection);
+                }
+            }
+        }
+    }
+
+    fn drain_one(
+        &mut self,
+        now: Timestamp,
+        budget: OutputDrainBudget,
+        report: &mut OutputDrainReport,
+        out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
+    ) -> DrainOne {
+        match self {
+            Self::Direct(leg) => drain_one_caller_leg(leg, now, budget, report, out),
+            Self::Group(group) => {
+                for _ in 0..group.leg_order.len() {
+                    let member_id = group.leg_order[group.next_leg];
+                    group.next_leg = (group.next_leg + 1) % group.leg_order.len();
+                    let leg = group
+                        .legs
+                        .get_mut(&member_id)
+                        .expect("group and caller legs are built together");
+                    let connection = group
+                        .group
+                        .member_mut(member_id)
+                        .expect("group and caller legs are built together")
+                        .connection_mut();
+                    match drain_one_caller_leg_parts(
+                        leg.peer,
+                        now,
+                        &mut leg.timers,
+                        &mut leg.pending,
+                        connection,
+                        budget,
+                        report,
+                        out,
+                    ) {
+                        DrainOne::Empty => {}
+                        result => return result,
+                    }
+                }
+                DrainOne::Empty
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DrainOne {
+    Drained,
+    Empty,
+    Blocked,
+}
+
+fn logical_state(connection: &SrtConnection) -> LogicalCallerState {
+    match connection.state() {
+        shiguredo_srt::ConnectionState::Connected => LogicalCallerState::Connected,
+        shiguredo_srt::ConnectionState::Disconnected => LogicalCallerState::Disconnected,
+        shiguredo_srt::ConnectionState::Induction
+        | shiguredo_srt::ConnectionState::Conclusion
+        | shiguredo_srt::ConnectionState::Listening
+        | shiguredo_srt::ConnectionState::Closing => LogicalCallerState::Connecting,
+    }
+}
+
+impl CallerTable {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            sessions: HashMap::new(),
+            routes: HashMap::new(),
+            round_robin: VecDeque::new(),
+            next_logical_caller: 1,
+        }
+    }
+
+    /// Add one direct caller. Its non-zero SRT Socket ID must be unique among
+    /// all physical legs in this shared UDP socket.
+    pub fn add_direct(&mut self, leg: CallerLeg) -> Result<LogicalCallerId, shiguredo_srt::Error> {
+        let socket_id = self.validate_socket_id(&leg.connection)?;
+        let id = self.allocate_logical_caller();
+        self.sessions.insert(
+            id,
+            CallerSession::Direct(Box::new(CallerLegState {
+                peer: leg.peer,
+                connection: leg.connection,
+                timers: ManualTimerStore::new(),
+                pending: VecDeque::new(),
+            })),
+        );
+        self.routes.insert(socket_id, CallerRoute::Direct(id));
+        self.round_robin.push_back(id);
+        Ok(id)
+    }
+
+    /// Add one logical Broadcast or Backup caller. Each member needs a
+    /// distinct non-zero SRT Socket ID, even when every member shares the same
+    /// UDP four-tuple; Socket IDs are the SRT-layer demultiplexing key.
+    pub fn add_group(
+        &mut self,
+        group_id: u32,
+        mode: shiguredo_srt::GroupMode,
+        legs: impl IntoIterator<Item = CallerGroupLeg>,
+    ) -> Result<LogicalCallerId, shiguredo_srt::Error> {
+        let mut group = shiguredo_srt::SrtGroup::new(group_id, mode)?;
+        let mut caller_legs = HashMap::new();
+        let mut socket_ids = HashSet::new();
+        let mut leg_order = Vec::new();
         for leg in legs {
-            let socket_id = leg.connection.socket_id();
-            if socket_id == 0 || pool.legs.contains_key(&socket_id) {
+            let socket_id = self.validate_socket_id(&leg.connection)?;
+            if !socket_ids.insert(socket_id) {
                 return Err(shiguredo_srt::Error::with_reason(
                     shiguredo_srt::ErrorKind::InvalidState,
-                    "shared caller sockets require distinct non-zero SRT socket IDs",
+                    "shared caller groups require distinct SRT socket IDs",
                 ));
             }
-            pool.legs.insert(
+            group.add_member(leg.member_id, leg.weight, leg.connection)?;
+            if caller_legs
+                .insert(
+                    leg.member_id,
+                    CallerGroupLegState {
+                        peer: leg.peer,
+                        timers: ManualTimerStore::new(),
+                        pending: VecDeque::new(),
+                    },
+                )
+                .is_some()
+            {
+                return Err(shiguredo_srt::Error::with_reason(
+                    shiguredo_srt::ErrorKind::InvalidState,
+                    "shared caller groups require distinct member IDs",
+                ));
+            }
+            leg_order.push(leg.member_id);
+        }
+
+        if leg_order.is_empty() {
+            return Err(shiguredo_srt::Error::with_reason(
+                shiguredo_srt::ErrorKind::InvalidState,
+                "shared caller groups require at least one member",
+            ));
+        }
+
+        let id = self.allocate_logical_caller();
+        for member in group.members() {
+            let socket_id = member.connection().socket_id();
+            self.routes.insert(
                 socket_id,
-                SharedCallerLegState {
-                    peer: leg.peer,
-                    connection: leg.connection,
-                    timers: ManualTimerStore::new(),
+                CallerRoute::Group {
+                    caller: id,
+                    member_id: member.id(),
                 },
             );
         }
-        Ok(pool)
+        self.sessions.insert(
+            id,
+            CallerSession::Group(CallerGroupState {
+                group,
+                legs: caller_legs,
+                leg_order,
+                next_leg: 0,
+                logical: GroupLogicalCounters::default(),
+            }),
+        );
+        self.round_robin.push_back(id);
+        Ok(id)
     }
 
-    /// Feed one datagram received from the shared UDP socket.
+    fn validate_socket_id(&self, connection: &SrtConnection) -> Result<u32, shiguredo_srt::Error> {
+        let socket_id = connection.socket_id();
+        if socket_id == 0 || self.routes.contains_key(&socket_id) {
+            return Err(shiguredo_srt::Error::with_reason(
+                shiguredo_srt::ErrorKind::InvalidState,
+                "shared caller sockets require distinct non-zero SRT socket IDs",
+            ));
+        }
+        Ok(socket_id)
+    }
+
+    fn allocate_logical_caller(&mut self) -> LogicalCallerId {
+        let id = LogicalCallerId(self.next_logical_caller);
+        self.next_logical_caller = self.next_logical_caller.wrapping_add(1).max(1);
+        id
+    }
+
+    /// Feed one datagram received from the application-owned UDP socket.
+    /// Unknown Socket IDs and unexpected source addresses are ignored.
     pub fn feed(
         &mut self,
         peer: std::net::SocketAddr,
@@ -2940,13 +3531,37 @@ impl SharedCallerPool {
         now: Timestamp,
     ) -> Result<bool, shiguredo_srt::Error> {
         let socket_id = shiguredo_srt::peek_destination_socket_id(data)?;
-        let Some(leg) = self.legs.get_mut(&socket_id) else {
+        let Some(route) = self.routes.get(&socket_id) else {
             return Ok(false);
         };
-        if leg.peer != peer {
-            return Ok(false);
+        match *route {
+            CallerRoute::Direct(id) => {
+                let Some(CallerSession::Direct(leg)) = self.sessions.get_mut(&id) else {
+                    return Ok(false);
+                };
+                if leg.peer != peer {
+                    return Ok(false);
+                }
+                leg.connection.feed_recv_buf(data, now)?;
+            }
+            CallerRoute::Group { caller, member_id } => {
+                let Some(CallerSession::Group(group)) = self.sessions.get_mut(&caller) else {
+                    return Ok(false);
+                };
+                let Some(leg) = group.legs.get(&member_id) else {
+                    return Ok(false);
+                };
+                if leg.peer != peer {
+                    return Ok(false);
+                }
+                group
+                    .group
+                    .member_mut(member_id)
+                    .expect("group and caller legs are built together")
+                    .connection_mut()
+                    .feed_recv_buf(data, now)?;
+            }
         }
-        leg.connection.feed_recv_buf(data, now)?;
         Ok(true)
     }
 
@@ -2958,39 +3573,225 @@ impl SharedCallerPool {
         out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
     ) {
         out.clear();
-        for leg in self.legs.values_mut() {
-            leg.timers.fire_expired(now, &mut leg.connection);
-            while let Some(output) = leg.connection.poll_output() {
-                match output {
-                    ConnectionOutput::SendPacket(packet) => out.push((leg.peer, packet)),
-                    other => leg.timers.apply_output(&other, now),
+        for session in self.sessions.values_mut() {
+            match session {
+                CallerSession::Direct(leg) => drain_caller_leg(leg, now, out),
+                CallerSession::Group(group) => {
+                    let (srt_group, legs) = (&mut group.group, &mut group.legs);
+                    for (member_id, leg) in legs {
+                        let connection = srt_group
+                            .member_mut(*member_id)
+                            .expect("group and caller legs are built together")
+                            .connection_mut();
+                        leg.timers.fire_expired(now, connection);
+                        while let Some(output) = connection.poll_output() {
+                            match output {
+                                ConnectionOutput::SendPacket(packet) => {
+                                    out.push((leg.peer, packet));
+                                }
+                                other => leg.timers.apply_output(&other, now),
+                            }
+                        }
+                    }
                 }
             }
         }
     }
 
-    pub fn get_mut(&mut self, socket_id: u32) -> Option<&mut SrtConnection> {
-        self.legs.get_mut(&socket_id).map(|leg| &mut leg.connection)
+    /// Fairly drain bounded work from all logical callers. Due timers are
+    /// fired for every leg before the budget is shared round-robin across
+    /// logical streams, so a busy caller cannot starve another caller's
+    /// retransmission or close timer.
+    pub fn poll_outbound_bounded(
+        &mut self,
+        now: Timestamp,
+        budget: OutputDrainBudget,
+        out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
+    ) -> OutputDrainReport {
+        out.clear();
+        let budget = OutputDrainBudget::new(
+            budget.max_actions.max(1),
+            budget.max_packets.max(1),
+            budget.max_bytes.max(1),
+        );
+        for session in self.sessions.values_mut() {
+            session.fire_timers(now);
+        }
+
+        let mut report = OutputDrainReport::default();
+        let mut idle_turns = 0usize;
+        while !self.round_robin.is_empty()
+            && idle_turns < self.round_robin.len()
+            && report.actions < budget.max_actions
+        {
+            let id = self.round_robin.pop_front().expect("checked non-empty");
+            self.round_robin.push_back(id);
+            let Some(session) = self.sessions.get_mut(&id) else {
+                continue;
+            };
+            match session.drain_one(now, budget, &mut report, out) {
+                DrainOne::Drained => idle_turns = 0,
+                DrainOne::Empty | DrainOne::Blocked => idle_turns += 1,
+            }
+        }
+        if report.actions >= budget.max_actions || report.packets >= budget.max_packets {
+            report.status = OutputDrainStatus::BudgetExhausted;
+        }
+        report
+    }
+
+    /// Atomically retire a direct caller or every leg of a bonded caller.
+    /// Applications normally call [`LogicalCallerMut::disconnect`] first,
+    /// then call this after their own close-drain deadline.
+    pub fn remove(&mut self, id: LogicalCallerId) -> Option<RemovedLogicalCaller> {
+        let session = self.sessions.remove(&id)?;
+        self.routes.retain(|_, route| match route {
+            CallerRoute::Direct(caller) => *caller != id,
+            CallerRoute::Group { caller, .. } => *caller != id,
+        });
+        self.round_robin.retain(|caller| *caller != id);
+        Some(match session {
+            CallerSession::Direct(leg) => RemovedLogicalCaller::Direct(RemovedCallerLeg {
+                peer: leg.peer,
+                connection: leg.connection,
+            }),
+            CallerSession::Group(mut group) => {
+                let legs = std::mem::take(&mut group.legs)
+                    .into_iter()
+                    .map(|(member_id, leg)| RemovedCallerLeg {
+                        peer: leg.peer,
+                        connection: group
+                            .group
+                            .remove_member_connection(member_id)
+                            .expect("group and caller legs are built together"),
+                    })
+                    .collect();
+                RemovedLogicalCaller::Group(legs)
+            }
+        })
+    }
+
+    #[must_use]
+    pub fn logical_caller(&self, id: &LogicalCallerId) -> Option<LogicalCaller<'_>> {
+        self.sessions.contains_key(id).then_some(LogicalCaller {
+            table: self,
+            id: *id,
+        })
+    }
+
+    pub fn logical_caller_mut(&mut self, id: &LogicalCallerId) -> Option<LogicalCallerMut<'_>> {
+        self.logical_caller(id)?;
+        Some(LogicalCallerMut {
+            table: self,
+            id: *id,
+        })
     }
 
     #[must_use]
     pub fn time_until_next_deadline(&self, now: Timestamp, default_micros: u64) -> u64 {
-        self.legs
-            .values()
-            .map(|leg| leg.timers.time_until_earliest(now, default_micros))
-            .min()
-            .unwrap_or(default_micros)
+        let mut deadline = default_micros;
+        for session in self.sessions.values() {
+            match session {
+                CallerSession::Direct(leg) => {
+                    deadline = deadline.min(leg.timers.time_until_earliest(now, deadline));
+                }
+                CallerSession::Group(group) => {
+                    for leg in group.legs.values() {
+                        deadline = deadline.min(leg.timers.time_until_earliest(now, deadline));
+                    }
+                }
+            }
+        }
+        deadline
     }
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.legs.len()
+        self.sessions.len()
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.legs.is_empty()
+        self.sessions.is_empty()
     }
+}
+
+impl Default for CallerTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn drain_caller_leg(
+    leg: &mut CallerLegState,
+    now: Timestamp,
+    out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
+) {
+    leg.timers.fire_expired(now, &mut leg.connection);
+    while let Some(output) = leg.connection.poll_output() {
+        match output {
+            ConnectionOutput::SendPacket(packet) => out.push((leg.peer, packet)),
+            other => leg.timers.apply_output(&other, now),
+        }
+    }
+}
+
+fn drain_one_caller_leg(
+    leg: &mut CallerLegState,
+    now: Timestamp,
+    budget: OutputDrainBudget,
+    report: &mut OutputDrainReport,
+    out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
+) -> DrainOne {
+    drain_one_caller_leg_parts(
+        leg.peer,
+        now,
+        &mut leg.timers,
+        &mut leg.pending,
+        &mut leg.connection,
+        budget,
+        report,
+        out,
+    )
+}
+
+fn drain_one_caller_leg_parts(
+    peer: std::net::SocketAddr,
+    now: Timestamp,
+    timers: &mut ManualTimerStore,
+    pending: &mut VecDeque<ConnectionOutput>,
+    connection: &mut SrtConnection,
+    budget: OutputDrainBudget,
+    report: &mut OutputDrainReport,
+    out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
+) -> DrainOne {
+    let Some(output) = pending.pop_front().or_else(|| connection.poll_output()) else {
+        return DrainOne::Empty;
+    };
+    if report.actions >= budget.max_actions {
+        pending.push_front(output);
+        return DrainOne::Blocked;
+    }
+    match output {
+        ConnectionOutput::SendPacket(packet) => {
+            let exceeds_packets = report.packets >= budget.max_packets;
+            let exceeds_bytes =
+                report.packets > 0 && report.bytes.saturating_add(packet.len()) > budget.max_bytes;
+            if exceeds_packets || exceeds_bytes {
+                pending.push_front(ConnectionOutput::SendPacket(packet));
+                return DrainOne::Blocked;
+            }
+            report.actions += 1;
+            report.packets += 1;
+            report.bytes = report.bytes.saturating_add(packet.len());
+            out.push((peer, packet));
+        }
+        other => {
+            report.actions += 1;
+            timers.apply_output(&other, now);
+        }
+    }
+    DrainOne::Drained
 }
 
 #[cfg_attr(
@@ -3493,6 +4294,206 @@ mod tests {
             Ok(shiguredo_srt::SrtPacket::Control(control))
                 if control.control_type == shiguredo_srt::ControlType::Shutdown
         )));
+    }
+
+    fn pump_caller_table(
+        callers: &mut CallerTable,
+        listeners: &mut PeerTable,
+        options: &AdmissionOptions,
+        telemetry: &IngressTelemetry,
+        now: Timestamp,
+    ) {
+        let mut outbound = Vec::new();
+        callers.poll_outbound(now, &mut outbound);
+        for (peer, packet) in outbound.drain(..) {
+            assert_eq!(
+                listeners.admit(peer, &packet, now, options, 0, 1, telemetry),
+                Admit::Fed
+            );
+        }
+        listeners.poll_outbound(now, &mut outbound);
+        for (peer, packet) in outbound {
+            assert!(
+                callers
+                    .feed(peer, &packet, now)
+                    .expect("caller packet decodes")
+            );
+        }
+    }
+
+    fn caller_connection(options: ConnectionOptions) -> SrtConnection {
+        let mut connection = SrtConnection::new_caller(options);
+        connection
+            .connect(Timestamp::default())
+            .expect("caller starts handshake");
+        connection
+    }
+
+    #[test]
+    fn caller_table_has_one_logical_api_for_direct_and_broadcast_callers() {
+        let direct_peer = "127.0.0.1:11000".parse().expect("address");
+        let first_peer = "127.0.0.1:11001".parse().expect("address");
+        let second_peer = first_peer;
+        let group_id = shiguredo_srt::SRTGROUP_MASK | 55;
+        let mut callers = CallerTable::new();
+        let direct = callers
+            .add_direct(CallerLeg::new(
+                direct_peer,
+                caller_connection(ConnectionOptions {
+                    socket_id: 101,
+                    ..ConnectionOptions::default()
+                }),
+            ))
+            .expect("direct caller is admitted");
+        let grouped = callers
+            .add_group(
+                group_id,
+                shiguredo_srt::GroupMode::Broadcast,
+                [
+                    CallerGroupLeg::new(
+                        1,
+                        1,
+                        first_peer,
+                        caller_connection(ConnectionOptions {
+                            socket_id: 102,
+                            initial_seq: Some(1234),
+                            group_extension: Some(shiguredo_srt::GroupExtensionData {
+                                group_id,
+                                group_type: shiguredo_srt::GroupType::Broadcast,
+                                flags: 0,
+                                weight: 1,
+                            }),
+                            ..ConnectionOptions::default()
+                        }),
+                    ),
+                    CallerGroupLeg::new(
+                        2,
+                        1,
+                        second_peer,
+                        caller_connection(ConnectionOptions {
+                            socket_id: 103,
+                            initial_seq: Some(1234),
+                            group_extension: Some(shiguredo_srt::GroupExtensionData {
+                                group_id,
+                                group_type: shiguredo_srt::GroupType::Broadcast,
+                                flags: 0,
+                                weight: 1,
+                            }),
+                            ..ConnectionOptions::default()
+                        }),
+                    ),
+                ],
+            )
+            .expect("grouped caller is admitted");
+
+        let mut listeners = PeerTable::new();
+        let mut options = AdmissionOptions::basic(900, 0, true);
+        options.bonded_inputs = BondedInputPolicy::Accept;
+        let telemetry = IngressTelemetry::new();
+        for round in 0..8 {
+            pump_caller_table(
+                &mut callers,
+                &mut listeners,
+                &options,
+                &telemetry,
+                Timestamp::from_micros(round * 10),
+            );
+        }
+        let leg_count = listeners.len();
+        let _ = listeners.admit(
+            first_peer,
+            &induction(102),
+            Timestamp::from_micros(90),
+            &options,
+            0,
+            1,
+            &telemetry,
+        );
+        assert_eq!(
+            listeners.len(),
+            leg_count,
+            "a group-leg induction retry must not allocate a rogue direct peer"
+        );
+
+        for id in [direct, grouped] {
+            let mut caller = callers
+                .logical_caller_mut(&id)
+                .expect("logical caller exists");
+            assert_eq!(caller.state(), Some(LogicalCallerState::Connected));
+            assert!(caller.can_send());
+        }
+        assert_eq!(
+            callers
+                .logical_caller_mut(&direct)
+                .expect("direct caller exists")
+                .send(b"direct", Timestamp::from_micros(100))
+                .expect("direct logical send"),
+            1
+        );
+        assert_eq!(
+            callers
+                .logical_caller_mut(&grouped)
+                .expect("grouped caller exists")
+                .send(b"broadcast", Timestamp::from_micros(100))
+                .expect("broadcast logical send"),
+            2
+        );
+
+        let mut outbound = Vec::new();
+        callers.poll_outbound(Timestamp::from_micros(100), &mut outbound);
+        assert_eq!(
+            outbound
+                .iter()
+                .filter(|(_, packet)| matches!(
+                    shiguredo_srt::SrtPacket::decode(packet),
+                    Ok(shiguredo_srt::SrtPacket::Data(_))
+                ))
+                .count(),
+            3,
+            "one direct and one Broadcast logical send use three physical legs"
+        );
+        assert!(matches!(
+            callers
+                .logical_caller(&grouped)
+                .and_then(|caller| caller.stats()),
+            Some(LogicalCallerStats::Group(stats))
+                if stats.aggregate.logical_payloads_sent == 1 && stats.legs.len() == 2
+        ));
+
+        let mut newly_connected = Vec::new();
+        listeners.drain_events(Duration::from_millis(1), &mut newly_connected);
+        assert_eq!(newly_connected.len(), 2, "one direct and one group session");
+        assert!(
+            listeners
+                .groups
+                .values()
+                .all(|group| group.stream_deadline.is_some()),
+            "a grouped Connected event starts the logical stream clock"
+        );
+        let check_now = Instant::now() + Duration::from_secs(1);
+        assert!(
+            listeners.all_terminal(
+                check_now,
+                check_now + Duration::from_secs(10),
+                Duration::ZERO,
+            ),
+            "bonded physical legs must not keep their finished logical group alive"
+        );
+        assert!(matches!(
+            callers.remove(direct),
+            Some(RemovedLogicalCaller::Direct(_))
+        ));
+        assert!(matches!(
+            callers.remove(grouped),
+            Some(RemovedLogicalCaller::Group(legs)) if legs.len() == 2
+        ));
+        assert!(callers.is_empty());
+        for connected in newly_connected {
+            assert!(listeners.remove(connected.logical_peer).is_some());
+        }
+        assert!(listeners.is_empty());
+        assert_eq!(listeners.established_count(), 0);
+        assert_eq!(listeners.half_open_count(), 0);
     }
 
     #[test]

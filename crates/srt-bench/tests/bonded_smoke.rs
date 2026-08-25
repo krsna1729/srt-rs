@@ -19,7 +19,7 @@ fn stats(output: &[u8]) -> &str {
         .expect("final STATS line")
 }
 
-fn smoke(runtime: &str, mode: &str, encryption: &str) {
+fn smoke(runtime: &str, mode: &str, encryption: &str, egress: &str) {
     let bin = std::env::var_os("CARGO_BIN_EXE_srt-bench").expect("bench binary path");
     let port = free_port().to_string();
     let receiver = Command::new(&bin)
@@ -33,6 +33,8 @@ fn smoke(runtime: &str, mode: &str, encryption: &str) {
             "--connections=2",
             "--ingress",
             "shared-pool=1",
+            "--egress",
+            egress,
             &format!("--bond={mode}:1"),
             &format!("--encryption={encryption}"),
         ])
@@ -53,6 +55,8 @@ fn smoke(runtime: &str, mode: &str, encryption: &str) {
             "--connections=2",
             "--ingress",
             "shared-pool=1",
+            "--egress",
+            egress,
             &format!("--bond={mode}:1"),
             &format!("--encryption={encryption}"),
         ])
@@ -89,13 +93,21 @@ fn smoke(runtime: &str, mode: &str, encryption: &str) {
 #[test]
 fn bond_axis_forms_one_logical_broadcast_stream() {
     for runtime in ["mio", "tokio", "smol", "monoio", "glommio", "compio"] {
-        smoke(runtime, "broadcast", "plain");
+        smoke(runtime, "broadcast", "plain", "per-connection");
     }
 }
 
 #[test]
 fn bond_axis_forms_one_logical_encrypted_backup_stream() {
     for runtime in ["mio", "tokio", "smol", "monoio", "glommio", "compio"] {
-        smoke(runtime, "backup", "256");
+        smoke(runtime, "backup", "256", "per-connection");
+    }
+}
+
+#[test]
+fn shared_egress_uses_logical_broadcast_and_backup_callers_on_every_runtime() {
+    for runtime in ["mio", "tokio", "smol", "monoio", "glommio", "compio"] {
+        smoke(runtime, "broadcast", "plain", "shared-socket");
+        smoke(runtime, "backup", "256", "shared-socket");
     }
 }

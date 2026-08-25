@@ -1,0 +1,15 @@
+# Fast sentinel: completion-driven runtime scheduling and pooled ingress.
+runtime             = compio
+ingress             = shared-pool:4
+egress              = per-connection
+encryption          = plain
+connections         = 600
+bitrate             = 1000000
+workers             = 1
+promotion           = all
+cookie-routing      = on
+batch               = on
+sock-buf            = 16m
+connect-concurrency = 50
+bond                = none
+pin                 = off

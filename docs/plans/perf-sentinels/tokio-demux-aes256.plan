@@ -1,0 +1,15 @@
+# Fast sentinel: AES-256 plus many SRT sessions over one UDP four-tuple.
+runtime             = tokio
+ingress             = shared-pool:1
+egress              = shared-socket
+encryption          = 256
+connections         = 600
+bitrate             = 1000000
+workers             = 1
+promotion           = all
+cookie-routing      = on
+batch               = on
+sock-buf            = 16m
+connect-concurrency = 1
+bond                = none
+pin                 = off

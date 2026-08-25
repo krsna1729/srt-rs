@@ -118,6 +118,12 @@ including every encryption mode. The receiver reports one established logical
 stream, while its aggregate telemetry retains per-leg wire counters; the
 caller still reports two physical legs.
 
+[`docs/performance-loop.md`](../../docs/performance-loop.md) defines the
+measurement gates and the small representative live plans used for iterative
+hot-path work. It is intentionally separate from the exhaustive matrix: a
+performance claim starts with a reproducible sentinel, then earns broader
+coverage.
+
 When a plan is present, ordinary flags such as `--encryption` are fallback
 values for axes omitted by the plan. Use repeatable `--axis NAME=VALUE[,VALUE...]`
 to intentionally override a plan; names use the canonical plan spelling

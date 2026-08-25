@@ -1,0 +1,17 @@
+# Fast sentinel: real shared-socket Broadcast scheduling plus inbound group
+# admission/deduplication. It uses one CallerTable UDP socket and one SrtGroup
+# per pair; identical tuples test protocol demux, not path diversity.
+runtime             = tokio
+ingress             = shared-pool:1
+egress              = shared-socket
+encryption          = plain
+connections         = 32
+bitrate             = 4000000
+workers             = 1
+promotion           = all
+cookie-routing      = on
+batch               = on
+sock-buf            = 16m
+connect-concurrency = 1
+bond                = broadcast:16
+pin                 = off

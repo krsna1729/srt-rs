@@ -742,8 +742,8 @@ fn filter_reason(cell: &Cell<'_>, axes: &[Axis]) -> Option<&'static str> {
 
     // A bonded publisher is one logical ingress stream, so its legs must
     // reach the same group-aware PeerTable. Every runtime provides that on
-    // the one-socket shared pool; keep unsupported topologies out of the
-    // matrix instead of silently measuring independent group-labelled callers.
+    // the one-socket shared pool. A shared sender socket is valid too: SRT
+    // Socket IDs, not UDP tuples, select each physical leg.
     if bond.is_some_and(|mode| mode != "none") && ingress != "shared-pool:1" {
         return Some("bonded-ingress-unsupported");
     }
@@ -2288,6 +2288,7 @@ mod matrix_filter_tests {
                 ("runtime", runtime),
                 ("connections", "200"),
                 ("bond", "broadcast:64"),
+                ("egress", "shared-socket"),
             ]);
             assert_eq!(filter_reason(&supported, &axes), None, "{runtime}");
         }

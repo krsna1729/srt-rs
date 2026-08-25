@@ -492,15 +492,15 @@ fn drive(cfg: BenchConfig, mine: Vec<usize>, start: Instant) -> Vec<ConnStats> {
                         }
                         if cfg.verbose() {
                             println!("CONNECTED");
-                        } else {
-                            eprintln!("[bench-mio] scale conn {} CONNECTED", mine[idx]);
                         }
                     }
                     ConnectionEvent::DataReceived { .. } => {
                         d.data_events += 1;
                     }
                     ConnectionEvent::Disconnected { reason } => {
-                        eprintln!("[bench-mio] disconnected: {reason}");
+                        if !crate::is_ordered_close(&reason) {
+                            eprintln!("[bench-mio] disconnected: {reason}");
+                        }
                         d.torn_down |= !crate::is_ordered_close(&reason);
                         d.stream_deadline = Some(Instant::now());
                     }
@@ -608,7 +608,7 @@ fn run_shared_pool(cfg: BenchConfig, k: usize) {
     let threads = cfg.workers.clamp(1, k);
     let stats = crate::run_shards(threads, k, move |mine| {
         let cfg = cfg.clone();
-        run_shared_pool_shard(&cfg, &mine, start)
+        run_shared_pool_shard(&cfg, &mine, k, start)
     });
 
     let mut agg = Aggregate::new(agg_cfg);
@@ -703,7 +703,12 @@ fn run_bonded_shared_pool(cfg: BenchConfig) {
 /// `mine` names the *pool* sockets this worker owns; inside, sockets are
 /// addressed by their position in `sockets`, which is what the poll token
 /// carries. The two only coincide when there is a single worker.
-fn run_shared_pool_shard(cfg: &BenchConfig, mine: &[usize], start: Instant) -> Vec<ConnStats> {
+fn run_shared_pool_shard(
+    cfg: &BenchConfig,
+    mine: &[usize],
+    pool_sockets: usize,
+    start: Instant,
+) -> Vec<ConnStats> {
     let mut poll = Poll::new().expect("mio Poll::new");
     let mut events = Events::with_capacity(1024);
 
@@ -749,6 +754,9 @@ fn run_shared_pool_shard(cfg: &BenchConfig, mine: &[usize], start: Instant) -> V
     }
 
     let mut conns: HashMap<SocketAddr, SharedConn> = HashMap::new();
+    let expected_connections = (0..cfg.connections)
+        .filter(|connection| mine.contains(&(connection % pool_sockets)))
+        .count();
     let connect_deadline = Instant::now() + crate::INTEROP_CONNECT_TIMEOUT;
     let stream_len = Duration::from_secs_f64(cfg.duration_secs);
     let run_deadline = Instant::now() + stream_len + IDLE_GRACE + Duration::from_secs(30);
@@ -762,11 +770,15 @@ fn run_shared_pool_shard(cfg: &BenchConfig, mine: &[usize], start: Instant) -> V
         if now >= run_deadline {
             break;
         }
-        if now >= connect_deadline
-            && conns
-                .values()
-                .all(|c| is_terminal(c, now, connect_deadline))
-        {
+        let all_terminal = conns
+            .values()
+            .all(|c| is_terminal(c, now, connect_deadline));
+        if shared_pool_can_stop(
+            conns.len(),
+            expected_connections,
+            all_terminal,
+            now >= connect_deadline,
+        ) {
             break;
         }
         poll.poll(&mut events, Some(TIMER_TICK)).ok();
@@ -861,6 +873,15 @@ fn run_shared_pool_shard(cfg: &BenchConfig, mine: &[usize], start: Instant) -> V
         out.push(s);
     }
     out
+}
+
+fn shared_pool_can_stop(
+    observed_connections: usize,
+    expected_connections: usize,
+    all_terminal: bool,
+    past_connect_deadline: bool,
+) -> bool {
+    all_terminal && (observed_connections == expected_connections || past_connect_deadline)
 }
 
 /// One accepted connection on an acceptor thread: dedicated socket
@@ -1212,7 +1233,7 @@ fn run_pool_acceptor(
         // decide its fate once, below -- see this function's module doc.
         let t = crate::now_ts(start);
         let mut newly_connected: Vec<SocketAddr> = Vec::new();
-        for (peer, p) in peers.iter_mut() {
+        for (peer, p) in peers.iter_direct_for_bench() {
             p.timers.fire_expired(t, &mut p.conn);
             let _ = drain_conn_outputs(&mut p.conn, &mut p.timers, &listener, *peer, t);
             let mut just_connected = false;
@@ -1231,7 +1252,9 @@ fn run_pool_acceptor(
             // backends there is no scheduler to hand a promotion to: mio
             // registers the new socket with this same poll and services
             // it from the same flat loop.
-            let extension = peers.get(&peer).and_then(|p| p.conn.peer_group_extension());
+            let extension = peers
+                .direct_for_bench(peer)
+                .and_then(|p| p.conn.peer_group_extension());
             let decision = {
                 let group = extension.map(|extension| srt_lifecycle::GroupAffinity {
                     group_id: extension.group_id,
@@ -1256,7 +1279,7 @@ fn run_pool_acceptor(
             match decision {
                 srt_lifecycle::PromotionDecision::StayOnListener => {}
                 srt_lifecycle::PromotionDecision::RelocateTo(owner) => {
-                    let Some(p) = peers.remove(&peer) else {
+                    let Some(p) = peers.remove_direct_for_bench(peer) else {
                         continue;
                     };
                     relocate_to_owner(
@@ -1270,7 +1293,7 @@ fn run_pool_acceptor(
                     );
                 }
                 srt_lifecycle::PromotionDecision::PromoteHere => {
-                    let Some(p) = peers.remove(&peer) else {
+                    let Some(p) = peers.remove_direct_for_bench(peer) else {
                         continue;
                     };
                     promote_locally(
@@ -1908,5 +1931,13 @@ mod bond_affinity_tests {
             }
         }
         assert!(saw_finished);
+    }
+
+    #[test]
+    fn shared_pool_waits_for_every_expected_connection_before_exiting() {
+        assert!(!shared_pool_can_stop(1, 2, true, false));
+        assert!(shared_pool_can_stop(2, 2, true, false));
+        assert!(shared_pool_can_stop(1, 2, true, true));
+        assert!(!shared_pool_can_stop(2, 2, false, true));
     }
 }

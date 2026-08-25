@@ -503,6 +503,19 @@ impl BenchConfig {
         self.connections == 1 && self.ingress == Ingress::PerPort
     }
 
+    /// Number of application-visible streams expected at the receiver. A
+    /// complete two-leg group replaces two physical connections with one
+    /// logical stream; ungrouped connections remain one-to-one.
+    #[must_use]
+    pub fn logical_connection_count(&self) -> usize {
+        if self.bond_mode == BondMode::None {
+            self.connections
+        } else {
+            self.connections
+                .saturating_sub(self.bond_pairs.min(self.connections / 2))
+        }
+    }
+
     /// Handshake group metadata for one physical leg. Two adjacent legs form
     /// one group so the listener can exercise actual grouped ingress rather
     /// than merely parse an otherwise-unused extension.
@@ -603,8 +616,8 @@ pub struct ConnStats {
 }
 
 struct SharedSenderSlot {
-    socket_id: u32,
-    stats: ConnStats,
+    caller: srt_transport::LogicalCallerId,
+    stats: Vec<ConnStats>,
     stream_deadline: Option<Instant>,
     closed: bool,
 }
@@ -612,7 +625,7 @@ struct SharedSenderSlot {
 /// Protocol/timer half of a shared-egress sender. Runtime adapters own one
 /// native UDP socket and only translate readiness into `feed`/`tick` calls.
 pub(crate) struct SharedSender {
-    pool: srt_transport::SharedCallerPool,
+    callers: srt_transport::CallerTable,
     slots: Vec<SharedSenderSlot>,
     payload: Vec<u8>,
     start: Instant,
@@ -622,37 +635,67 @@ pub(crate) struct SharedSender {
 impl SharedSender {
     pub(crate) fn new(cfg: &BenchConfig, mine: &[usize], start: Instant) -> Self {
         let mut slots = Vec::with_capacity(mine.len());
-        let mut legs = Vec::with_capacity(mine.len());
-        for &index in mine {
-            let socket_id = cfg.caller_socket_id_for(index);
-            let mut options = shiguredo_srt::ConnectionOptions {
-                socket_id,
-                tsbpd_delay: cfg.latency_ms,
-                max_bandwidth_bytes_per_sec: Some(cfg.bitrate_bps / 8),
-                group_extension: cfg.bond_extension_for(index),
-                initial_seq: cfg.bond_initial_seq_for(index),
-                stream_id: cfg.bond_stream_id_for(index),
-                ..Default::default()
-            };
-            cfg.encryption.apply_to(&mut options);
-            let mut connection = shiguredo_srt::SrtConnection::new_caller(options);
-            connection
-                .connect(now_ts(start))
-                .expect("shared caller connect queues INDUCTION");
-            legs.push(srt_transport::SharedCallerLeg {
-                peer: cfg.addr_for(index),
-                connection,
-            });
-            slots.push(SharedSenderSlot {
-                socket_id,
-                stats: ConnStats::default(),
-                stream_deadline: None,
-                closed: false,
-            });
+        let mut callers = srt_transport::CallerTable::new();
+        let mut position = 0;
+        while position < mine.len() {
+            let index = mine[position];
+            if cfg.bond_extension_for(index).is_some()
+                && index.is_multiple_of(2)
+                && mine.get(position + 1) == Some(&(index + 1))
+            {
+                let first = shared_caller_connection(cfg, index, start);
+                let second = shared_caller_connection(cfg, index + 1, start);
+                let group_id = shiguredo_srt::SRTGROUP_MASK | ((index / 2) as u32 + 1);
+                let mode = match cfg.bond_mode {
+                    BondMode::Broadcast => shiguredo_srt::GroupMode::Broadcast,
+                    BondMode::Backup => shiguredo_srt::GroupMode::Backup,
+                    BondMode::None => unreachable!("group extension requires a bond mode"),
+                };
+                let caller = callers
+                    .add_group(
+                        group_id,
+                        mode,
+                        [
+                            srt_transport::CallerGroupLeg::new(
+                                index as u32 + 1,
+                                cfg.bond_extension_for(index).expect("group leg").weight,
+                                cfg.addr_for(index),
+                                first,
+                            ),
+                            srt_transport::CallerGroupLeg::new(
+                                index as u32 + 2,
+                                cfg.bond_extension_for(index + 1).expect("group leg").weight,
+                                cfg.addr_for(index + 1),
+                                second,
+                            ),
+                        ],
+                    )
+                    .expect("bench caller group has distinct member and socket IDs");
+                slots.push(SharedSenderSlot {
+                    caller,
+                    stats: vec![ConnStats::default(), ConnStats::default()],
+                    stream_deadline: None,
+                    closed: false,
+                });
+                position += 2;
+            } else {
+                let caller = callers
+                    .add_direct(srt_transport::CallerLeg::new(
+                        cfg.addr_for(index),
+                        shared_caller_connection(cfg, index, start),
+                    ))
+                    .expect("bench caller socket IDs are unique and non-zero");
+                slots.push(SharedSenderSlot {
+                    caller,
+                    stats: vec![ConnStats::default()],
+                    stream_deadline: None,
+                    closed: false,
+                });
+                position += 1;
+            }
         }
         Self {
-            pool: srt_transport::SharedCallerPool::new(legs)
-                .expect("bench caller socket IDs are unique and non-zero"),
+            callers,
             slots,
             payload: vec![0x42; PAYLOAD_SIZE],
             start,
@@ -661,7 +704,7 @@ impl SharedSender {
     }
 
     pub(crate) fn feed(&mut self, peer: std::net::SocketAddr, data: &[u8]) {
-        let _ = self.pool.feed(peer, data, now_ts(self.start));
+        let _ = self.callers.feed(peer, data, now_ts(self.start));
     }
 
     pub(crate) fn tick(
@@ -672,54 +715,65 @@ impl SharedSender {
         let now_instant = Instant::now();
         let now = now_ts(self.start);
         for slot in &mut self.slots {
-            let conn = self
-                .pool
-                .get_mut(slot.socket_id)
-                .expect("slot and pool agree");
-            while let Some(event) = conn.poll_event() {
-                match event {
-                    shiguredo_srt::ConnectionEvent::Connected => {
-                        slot.stats.connected = true;
-                        slot.stream_deadline.get_or_insert(
-                            now_instant + Duration::from_secs_f64(cfg.duration_secs),
-                        );
-                    }
-                    shiguredo_srt::ConnectionEvent::Disconnected { reason } => {
-                        slot.stats.torn_down |= !is_ordered_close(&reason);
-                        slot.closed = true;
-                    }
-                    _ => {}
+            let state = self
+                .callers
+                .logical_caller(&slot.caller)
+                .and_then(|caller| caller.state())
+                .expect("slot and caller table agree");
+            if state == srt_transport::LogicalCallerState::Disconnected {
+                for stats in &mut slot.stats {
+                    stats.torn_down |= stats.connected;
                 }
-            }
-            if !slot.stats.connected && now_instant >= self.connect_deadline {
                 slot.closed = true;
                 continue;
             }
-            if slot.stats.connected
+            if state == srt_transport::LogicalCallerState::Connected {
+                for stats in &mut slot.stats {
+                    stats.connected = true;
+                }
+                slot.stream_deadline
+                    .get_or_insert(now_instant + Duration::from_secs_f64(cfg.duration_secs));
+            }
+            if state != srt_transport::LogicalCallerState::Connected
+                && now_instant >= self.connect_deadline
+            {
+                slot.closed = true;
+                continue;
+            }
+            if state == srt_transport::LogicalCallerState::Connected
                 && !slot.closed
                 && slot
                     .stream_deadline
                     .is_some_and(|deadline| now_instant < deadline)
             {
                 for _ in 0..64 {
-                    if conn.time_until_send(now) != 0 || !conn.can_send() {
+                    let mut caller = self
+                        .callers
+                        .logical_caller_mut(&slot.caller)
+                        .expect("slot and caller table agree");
+                    if !caller.can_send() {
                         break;
                     }
-                    if conn.send(&self.payload, now).is_err() {
+                    let Ok(selected_legs) = caller.send(&self.payload, now) else {
                         break;
+                    };
+                    for stats in slot.stats.iter_mut().take(selected_legs) {
+                        stats.data_events = stats.data_events.saturating_add(1);
                     }
-                    slot.stats.data_events = slot.stats.data_events.saturating_add(1);
                 }
             } else if !slot.closed
                 && slot
                     .stream_deadline
                     .is_some_and(|deadline| now_instant >= deadline)
             {
-                conn.disconnect(now);
+                self.callers
+                    .logical_caller_mut(&slot.caller)
+                    .expect("slot and caller table agree")
+                    .disconnect(now);
                 slot.closed = true;
             }
         }
-        self.pool.poll_outbound(now, out);
+        self.callers.poll_outbound(now, out);
     }
 
     pub(crate) fn done(&self) -> bool {
@@ -728,7 +782,7 @@ impl SharedSender {
 
     pub(crate) fn next_wait(&self) -> Duration {
         Duration::from_micros(
-            self.pool
+            self.callers
                 .time_until_next_deadline(now_ts(self.start), MAX_WAIT.as_micros() as u64),
         )
         .min(MAX_WAIT)
@@ -736,18 +790,60 @@ impl SharedSender {
 
     pub(crate) fn finish(mut self) -> Vec<ConnStats> {
         for slot in &mut self.slots {
-            if let Some(sender) = self
-                .pool
-                .get_mut(slot.socket_id)
-                .and_then(|conn| conn.sender_stats())
+            match self
+                .callers
+                .logical_caller(&slot.caller)
+                .and_then(|caller| caller.stats())
             {
-                slot.stats.has_stats = true;
-                slot.stats.core_total = sender.total_sent;
-                slot.stats.secondary_a = sender.total_retransmits;
-                slot.stats.secondary_b = sender.packets_in_loss_list as u64;
+                Some(srt_transport::LogicalCallerStats::Direct(stats)) => {
+                    apply_sender_stats(&mut slot.stats[0], &stats);
+                }
+                Some(srt_transport::LogicalCallerStats::Group(stats)) => {
+                    for (result, leg) in slot.stats.iter_mut().zip(stats.legs) {
+                        result.connected = matches!(
+                            leg.state,
+                            shiguredo_srt::GroupMemberState::Active
+                                | shiguredo_srt::GroupMemberState::Standby
+                                | shiguredo_srt::GroupMemberState::Unstable
+                        );
+                        apply_sender_stats(result, &leg.connection);
+                    }
+                }
+                None => {}
             }
         }
-        self.slots.into_iter().map(|slot| slot.stats).collect()
+        self.slots.into_iter().flat_map(|slot| slot.stats).collect()
+    }
+}
+
+fn shared_caller_connection(
+    cfg: &BenchConfig,
+    index: usize,
+    start: Instant,
+) -> shiguredo_srt::SrtConnection {
+    let mut options = shiguredo_srt::ConnectionOptions {
+        socket_id: cfg.caller_socket_id_for(index),
+        tsbpd_delay: cfg.latency_ms,
+        max_bandwidth_bytes_per_sec: Some(cfg.bitrate_bps / 8),
+        group_extension: cfg.bond_extension_for(index),
+        initial_seq: cfg.bond_initial_seq_for(index),
+        stream_id: cfg.bond_stream_id_for(index),
+        ..Default::default()
+    };
+    cfg.encryption.apply_to(&mut options);
+    let mut connection = shiguredo_srt::SrtConnection::new_caller(options);
+    connection
+        .connect(now_ts(start))
+        .expect("shared caller connect queues INDUCTION");
+    connection
+}
+
+fn apply_sender_stats(stats: &mut ConnStats, connection: &shiguredo_srt::ConnectionStats) {
+    if let Some(sender) = connection.sender {
+        stats.has_stats = true;
+        stats.core_total = sender.total_sent;
+        stats.secondary_a = sender.total_retransmits;
+        stats.secondary_b = sender.packets_in_loss_list as u64;
     }
 }
 
