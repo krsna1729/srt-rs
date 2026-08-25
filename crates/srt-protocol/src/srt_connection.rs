@@ -1043,6 +1043,12 @@ impl SrtConnection {
     /// Disconnect.
     pub fn disconnect(&mut self, now: Timestamp) {
         if self.state == ConnectionState::Connected {
+            // Match peer-initiated shutdown: locally requested close must not
+            // strand TSBPD-buffered payload if the peer never answers.
+            if let Some(receiver) = self.receiver.as_mut() {
+                receiver.set_tsbpd_enabled(false);
+            }
+            self.enqueue_ready_data(now);
             self.send_shutdown(now);
             self.set_state(ConnectionState::Closing);
         }
@@ -2535,6 +2541,33 @@ mod tests {
         assert!(std::iter::from_fn(|| conn.poll_output()).any(
             |output| matches!(output, ConnectionOutput::SendPacket(packet) if matches!(SrtPacket::decode(&packet), Ok(SrtPacket::Control(ControlPacket { control_type: ControlType::Keepalive, .. }))))
         ));
+    }
+
+    #[test]
+    fn local_disconnect_flushes_tsbpd_buffered_data() {
+        let mut conn = SrtConnection::new_listener(ConnectionOptions::default());
+        conn.set_state(ConnectionState::Connected);
+        conn.init_buffers(Timestamp::from_micros(0), 0, 0);
+        conn.receiver
+            .as_mut()
+            .expect("receiver")
+            .set_tsbpd_enabled(true);
+        while conn.poll_event().is_some() {}
+        while conn.poll_output().is_some() {}
+
+        conn.handle_data_packet(
+            DataPacket::new(0, 0, 0, 0, b"queued".to_vec()),
+            Timestamp::from_micros(1),
+        )
+        .expect("packet is buffered for TSBPD");
+        assert!(conn.poll_event().is_none());
+
+        conn.disconnect(Timestamp::from_micros(2));
+
+        assert!(std::iter::from_fn(|| conn.poll_event()).any(
+            |event| matches!(event, ConnectionEvent::DataReceived { payload, .. } if payload == b"queued")
+        ));
+        assert_eq!(conn.state(), ConnectionState::Closing);
     }
 
     #[test]
