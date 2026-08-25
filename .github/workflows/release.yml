@@ -23,6 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y mold
       - name: Verify release tag matches crate version
         if: startsWith(github.ref, 'refs/tags/v')
         run: |

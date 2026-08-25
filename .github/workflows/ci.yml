@@ -22,6 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y mold
       - run: rustup component add rustfmt clippy
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -36,6 +37,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y mold
       - run: rustup toolchain install 1.93.0 --profile minimal
       - run: cargo +1.93.0 check -p shiguredo_srt --all-targets --locked
 
@@ -74,6 +76,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y mold
       - run: rustup toolchain install nightly --profile minimal --component miri,rust-src
       - run: cargo +nightly miri setup
       - run: cargo +nightly miri test -p shiguredo_srt srt_connection::tests
@@ -89,6 +92,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: crates/srt-protocol/fuzz -> target
+      - run: sudo apt-get update && sudo apt-get install -y mold
       - run: rustup toolchain install nightly --profile minimal
       - run: cargo install cargo-fuzz --locked
       - working-directory: crates/srt-protocol/fuzz
@@ -109,6 +113,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y mold
       - run: rustup toolchain install nightly --profile minimal --component rust-src
       - run: cargo +nightly test -p shiguredo_srt --all-targets --target x86_64-unknown-linux-gnu
         env:
@@ -126,6 +131,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y mold
       - run: rustup component add llvm-tools-preview
       - uses: taiki-e/install-action@v2
         with:
