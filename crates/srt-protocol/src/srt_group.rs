@@ -423,29 +423,41 @@ impl SrtGroup {
 
     fn collect_events(&mut self) {
         for index in 0..self.members.len() {
-            while let Some((member_id, accept_data, event)) = {
+            while let Some((member_id, event)) = {
                 let member = &mut self.members[index];
-                let accept_data =
-                    self.mode == GroupMode::Broadcast || member.state == GroupMemberState::Active;
                 member
                     .connection
                     .poll_event()
-                    .map(|event| (member.id, accept_data, event))
+                    .map(|event| (member.id, event))
             } {
                 match event {
                     ConnectionEvent::Connected => {
                         self.events
                             .push_back(GroupEvent::MemberConnected { member_id });
                     }
+                    // Accept DataReceived regardless of this member's local
+                    // Active/Standby label. In Backup mode the sender only
+                    // ever transmits one logical sequence stream, aligned
+                    // across legs by align_member_sequence, so whichever
+                    // physical leg the peer actually chose as active is
+                    // correct data no matter what this side's own
+                    // (independently, racily computed) Active/Standby
+                    // choice currently says -- filtering by local state here
+                    // caused the two ends of a connection to disagree about
+                    // which leg is "active" (a real race when both legs
+                    // share one UDP socket and handshakes complete in a
+                    // different order on each side) and silently drop every
+                    // payload the peer actually sent. Dedup by sequence
+                    // number below is what makes this safe, exactly as it
+                    // already is for Broadcast.
                     ConnectionEvent::DataReceived {
                         sequence_number,
                         message_number,
                         timestamp,
                         payload,
-                    } if accept_data
-                        && self
-                            .next_receive_sequence
-                            .is_none_or(|next| !sequence_less_than(sequence_number, next)) =>
+                    } if self
+                        .next_receive_sequence
+                        .is_none_or(|next| !sequence_less_than(sequence_number, next)) =>
                     {
                         self.pending.entry(sequence_number).or_insert(GroupPacket {
                             member_id,

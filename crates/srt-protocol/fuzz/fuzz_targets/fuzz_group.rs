@@ -90,8 +90,12 @@ fuzz_target!(|data: &[u8]| {
     for (index, byte) in data.iter().take(64).enumerate() {
         let now = ts(100_000 + index as u64 * 1_000);
         let _ = group.send(&[*byte], now);
-        a_packets.extend(drain(group.member_mut(1).expect("first member").connection_mut()));
-        b_packets.extend(drain(group.member_mut(2).expect("second member").connection_mut()));
+        a_packets.extend(drain(
+            group.member_mut(1).expect("first member").connection_mut(),
+        ));
+        b_packets.extend(drain(
+            group.member_mut(2).expect("second member").connection_mut(),
+        ));
 
         if byte & 1 != 0 {
             acknowledge(

@@ -50,6 +50,13 @@ name = "fuzz_group"
 path = "fuzz_targets/fuzz_group.rs"
 test = false
 
+[[bin]]
+bench = false
+doc = false
+name = "fuzz_backup_group"
+path = "fuzz_targets/fuzz_backup_group.rs"
+test = false
+
 [dependencies]
 libfuzzer-sys = "0.4"
 shiguredo_srt = { path = ".." }

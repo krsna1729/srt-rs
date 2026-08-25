@@ -98,3 +98,62 @@ proptest! {
         prop_assert_eq!(group.send(&payload, ts(104_000)).expect("both legs rejoin"), 2);
     }
 }
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// Regression test for a real interop bug: the two ends of a 2-leg
+    /// Backup group can independently (and non-deterministically -- e.g.
+    /// depending on which leg's handshake happens to complete first over
+    /// the network) decide a different leg is "Active". collect_events
+    /// used to filter incoming DATA by the local Active/Standby label, so
+    /// whichever side's local choice disagreed with which physical leg the
+    /// sender actually used would silently drop every payload sent on it.
+    /// Regardless of the order legs are added to the receiving group
+    /// (simulating that race), every payload sent through the sending
+    /// group must still be delivered.
+    #[test]
+    fn backup_group_delivers_regardless_of_receiver_add_order(
+        reverse_receive_order in any::<bool>(),
+        weight_a in 1u16..200,
+        weight_b in 1u16..200,
+        payloads in prop::collection::vec(prop::collection::vec(any::<u8>(), 1..64), 1..6),
+    ) {
+        let (caller_a, listener_a) = establish_pair(ConnectionOptions::default());
+        let (caller_b, listener_b) = establish_pair(ConnectionOptions::default());
+
+        let mut sender = SrtGroup::new(0x4000_0030, GroupMode::Backup).expect("sender group");
+        sender.add_member(1, weight_a, caller_a).expect("leg 1");
+        sender.add_member(2, weight_b, caller_b).expect("leg 2");
+
+        let mut receiver = SrtGroup::new(0x4000_0031, GroupMode::Backup).expect("receiver group");
+        if reverse_receive_order {
+            receiver.add_member(2, weight_b, listener_b).expect("leg 2");
+            receiver.add_member(1, weight_a, listener_a).expect("leg 1");
+        } else {
+            receiver.add_member(1, weight_a, listener_a).expect("leg 1");
+            receiver.add_member(2, weight_b, listener_b).expect("leg 2");
+        }
+
+        for payload in &payloads {
+            sender.send(payload, ts(100_000)).expect("group sends");
+            for member_id in [1u32, 2u32] {
+                let packets = drain(
+                    sender
+                        .member_mut(member_id)
+                        .expect("sender member")
+                        .connection_mut(),
+                );
+                for packet in packets {
+                    let _ = receiver
+                        .member_mut(member_id)
+                        .expect("receiver member")
+                        .connection_mut()
+                        .feed_recv_buf(&packet, ts(100_000));
+                }
+            }
+            let delivered = receiver.poll_data(ts(100_000)).map(|packet| packet.payload);
+            prop_assert_eq!(delivered.as_deref(), Some(payload.as_slice()));
+        }
+    }
+}
