@@ -88,6 +88,16 @@ jobs:
         env:
           MIRIFLAGS: -Zmiri-tree-borrows
 
+  libsrt-interop:
+    name: libsrt live interop
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install --yes srt-tools
+      - run: cargo test -p srt-bench --test libsrt_interop
+
   fuzz-smoke:
     name: Fuzz build and smoke
     runs-on: ubuntu-24.04
