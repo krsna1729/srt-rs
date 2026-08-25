@@ -14,6 +14,7 @@ root [README](../../README.md) and [SECURITY.md](../../SECURITY.md).
 - [Provenance](#provenance)
 - [What was trimmed from the upstream tree](#what-was-trimmed-from-the-upstream-tree)
 - [Local patches](#local-patches)
+- [Intentional compatibility differences](#intentional-compatibility-differences)
 - [Documentation language](#documentation-language)
 - [Crypto backend: pure-Rust RustCrypto stack, not aws-lc-rs](#crypto-backend-pure-rust-rustcrypto-stack-not-aws-lc-rs)
 - [Fuzzing](#fuzzing)
@@ -152,6 +153,22 @@ already states the precise design direction) — the cost of patching now is
 low and the cost of shipping with an open, self-identified Critical crypto
 bug is not a tradeoff worth making for the sake of staying byte-identical
 to upstream.
+
+## Intentional compatibility differences
+
+### Key-material refresh cadence
+
+`KM_REFRESH_PERIOD` is `2^25` packets and `KM_PRE_ANNOUNCE_PERIOD` is 4,000
+packets. Those are the SRT draft §6.1.6 recommendation and are kept as the
+library defaults. libsrt instead ships operational defaults of `2^24` and
+4,096 respectively (`HAICRYPT_DEF_KM_REFRESH_RATE` and
+`HAICRYPT_DEF_KM_PRE_ANNOUNCE`).
+
+Key refresh is independently scheduled in each direction, so this difference
+does not change the wire format or prevent interoperation with libsrt. It does
+mean an operator comparing packet-count logs will see this implementation
+refresh half as often. Treat the constants as an intentional draft-aligned
+default, not a claim of byte-for-byte libsrt operational behavior.
 
 ## Documentation language
 
