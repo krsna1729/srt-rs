@@ -1,0 +1,84 @@
+name: Bench nightly
+
+on:
+  schedule:
+    # 05:00 UTC daily.
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # See ci.yml: mold isn't installed on shared runners, and matching it
+  # here wouldn't change the numbers anyway -- link speed doesn't affect
+  # a binary's runtime behavior. target-cpu is kept since it does.
+  RUSTFLAGS: "-C link-arg=-Wl,-z,relro,-z,now -C target-cpu=x86-64-v3"
+
+jobs:
+  matrix:
+    name: Nightly matrix
+    runs-on: ubuntu-24.04
+    # 360 minutes is the hard ceiling for a GitHub-hosted job. The matrix
+    # step below is itself `timeout`-wrapped well under that, so a sweep
+    # that doesn't finish gets killed cleanly with time left for the
+    # report/upload steps to run on whatever completed, rather than the
+    # whole job (and all its output) being killed by this ceiling.
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p srt-bench
+      # Small, cheap breadth checks first (seconds each): every runtime
+      # touches its ingress/egress/bond code paths at least once,
+      # independent of how far the throughput sweep below gets.
+      - name: Run small breadth plans
+        run: |
+          for plan in docs/plans/socket-topology-smoke.plan docs/plans/bonded-ingress.plan; do
+            echo "::group::$plan"
+            ./target/release/srt-bench matrix --plan "$plan" --reps 1 --out nightly.tsv
+            echo "::endgroup::"
+          done
+      # The real nightly sweep: full throughput-matrix.plan (1536 cells,
+      # documented), not axis-trimmed -- budgeted 5h leaving 1h margin in
+      # the 6h ceiling for setup and the report/upload steps. `|| true`
+      # because a `timeout` kill is an expected, not exceptional, outcome
+      # here: whatever's in nightly.tsv by then is still a real, useful
+      # partial data point, appended to (not overwritten by) the small
+      # plans above.
+      - name: Run throughput-matrix.plan (time-boxed)
+        run: |
+          timeout 5h ./target/release/srt-bench matrix --plan docs/plans/throughput-matrix.plan \
+            --reps 1 --out nightly.tsv || true
+      - name: Report
+        if: always()
+        run: |
+          echo "## rows so far: $(($(wc -l < nightly.tsv) - 1))"
+          echo
+          echo "## median by runtime"
+          ./target/release/srt-bench report nightly.tsv --by runtime
+          echo
+          echo "## median by ingress,egress"
+          ./target/release/srt-bench report nightly.tsv --by ingress,egress
+          echo
+          echo "## median by encryption"
+          ./target/release/srt-bench report nightly.tsv --by encryption
+          echo
+          echo "## cells that did not fully establish"
+          awk -F'\t' '
+            NR==1 { for (i=1;i<=NF;i++) h[$i]=i; next }
+            $h["established"] < $h["conns"] {
+              print $h["runtime"], $h["ingress"], $h["egress"], $h["encryption"], \
+                    $h["role"] ": " $h["established"] "/" $h["conns"]
+              n++
+            }
+            END { if (!n) print "(none)" }
+          ' nightly.tsv
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-nightly-tsv-${{ github.run_id }}
+          path: nightly.tsv
+          if-no-files-found: error
+          retention-days: 90

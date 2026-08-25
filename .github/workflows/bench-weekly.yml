@@ -1,0 +1,88 @@
+name: Bench weekly
+
+on:
+  schedule:
+    # 06:00 UTC Sunday.
+    - cron: "0 6 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-C link-arg=-Wl,-z,relro,-z,now -C target-cpu=x86-64-v3"
+
+jobs:
+  matrix:
+    name: Weekly matrix
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p srt-bench
+      - name: Run small breadth plans (3 reps, more statistical stability than nightly)
+        run: |
+          for plan in docs/plans/socket-topology-smoke.plan docs/plans/bonded-ingress.plan; do
+            echo "::group::$plan"
+            ./target/release/srt-bench matrix --plan "$plan" --reps 3 --out weekly.tsv
+            echo "::endgroup::"
+          done
+      # Same fixed plan, same reps, every week -> the one part of this
+      # workflow meant for trend comparison across weeks, not just this
+      # week's snapshot.
+      - name: Run throughput-matrix.plan in full (time-boxed, 3h budget)
+        run: |
+          timeout 3h ./target/release/srt-bench matrix --plan docs/plans/throughput-matrix.plan \
+            --reps 1 --out throughput.tsv || true
+      # full-matrix.plan is documented at 67,200 cells -- explicitly an
+      # exhaustive investigation tool, not something any realistic budget
+      # finishes in one pass. Given the remaining ~2h30m, treat it as a
+      # slowly-rotating exploration instead of a trend series: seed by ISO
+      # week number so consecutive weeks sample different regions
+      # (`--order interleaved` already rotates the broad axes within one
+      # run so even a partial slice stays broadly representative).
+      - name: Run full-matrix.plan slice (time-boxed, remaining budget)
+        run: |
+          week_seed=$(date +%V)
+          echo "seed=$week_seed"
+          timeout 2h30m ./target/release/srt-bench matrix --plan docs/plans/full-matrix.plan \
+            --order interleaved --seed "$week_seed" --reps 1 --out full-matrix-slice.tsv || true
+      - name: Report
+        if: always()
+        run: |
+          echo "## throughput-matrix.plan: median by runtime"
+          ./target/release/srt-bench report throughput.tsv --by runtime 2>/dev/null || echo "(no data)"
+          echo
+          echo "## throughput-matrix.plan: median by ingress,egress"
+          ./target/release/srt-bench report throughput.tsv --by ingress,egress 2>/dev/null || echo "(no data)"
+          echo
+          echo "## throughput-matrix.plan: median by encryption"
+          ./target/release/srt-bench report throughput.tsv --by encryption 2>/dev/null || echo "(no data)"
+          echo
+          echo "## full-matrix.plan slice: rows covered this week: $(($(wc -l < full-matrix-slice.tsv 2>/dev/null || echo 1) - 1))"
+          echo
+          echo "## cells that did not fully establish"
+          for f in weekly.tsv throughput.tsv full-matrix-slice.tsv; do
+            [ -f "$f" ] || continue
+            awk -F'\t' -v src="$f" '
+              NR==1 { for (i=1;i<=NF;i++) h[$i]=i; next }
+              $h["established"] < $h["conns"] {
+                print src ": " $h["runtime"], $h["ingress"], $h["egress"], $h["encryption"], \
+                      $h["role"] ": " $h["established"] "/" $h["conns"]
+                n++
+              }
+              END { if (!n) print src ": (none)" }
+            ' "$f"
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-weekly-tsv-${{ github.run_id }}
+          path: |
+            weekly.tsv
+            throughput.tsv
+            full-matrix-slice.tsv
+          if-no-files-found: warn
+          retention-days: 90

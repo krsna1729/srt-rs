@@ -151,3 +151,51 @@ jobs:
             transport.lcov
           if-no-files-found: error
           retention-days: 14
+
+  bench-sentinel:
+    name: Bench sentinel (perf-sentinels plans)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p srt-bench
+      # Reuses docs/plans/perf-sentinels/*.plan as-is (mio/compio pooled
+      # ingress, tokio shared-socket Broadcast group demux, tokio AES-256
+      # demux) rather than a hand-rolled cell -- each already targets a
+      # meaningfully distinct code path, and they're the plans this repo's
+      # own maintainers curated for exactly this "fast sentinel" purpose.
+      # One rep, default duration/connections: a gate needs to be reliably
+      # fast and non-flaky, not statistically rigorous -- that's what the
+      # scheduled matrices below are for.
+      - name: Run perf-sentinel plans
+        run: |
+          set -e
+          for plan in docs/plans/perf-sentinels/*.plan; do
+            echo "::group::$plan"
+            ./target/debug/srt-bench matrix --plan "$plan" --reps 1 --out sentinel.tsv
+            echo "::endgroup::"
+          done
+      - name: Verify every cell fully established
+        run: |
+          awk -F'\t' '
+            NR==1 { for (i=1;i<=NF;i++) h[$i]=i; next }
+            {
+              if ($h["established"] < $h["conns"]) {
+                print "FAIL: role=" $h["role"] " runtime=" $h["runtime"] \
+                      " established=" $h["established"] " < conns=" $h["conns"]
+                bad=1
+              } else {
+                print "OK: role=" $h["role"] " runtime=" $h["runtime"] \
+                      " established=" $h["established"] "/" $h["conns"]
+              }
+            }
+            END { if (bad) exit 1 }
+          ' sentinel.tsv
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-sentinel-tsv
+          path: sentinel.tsv
+          if-no-files-found: error
+          retention-days: 14
