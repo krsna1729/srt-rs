@@ -20,7 +20,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
       - run: rustup component add rustfmt clippy
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -33,7 +34,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
       - run: rustup toolchain install 1.93.0 --profile minimal
       - run: cargo +1.93.0 check -p shiguredo_srt --all-targets --locked
 
@@ -42,8 +44,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      - run: cargo install cargo-deny --version 0.20.2 --locked
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.20.2
       - name: Published crate (no exceptions)
         run: cargo deny --manifest-path crates/srt-protocol/Cargo.toml --exclude-dev --config deny-published.toml check advisories bans licenses sources
       - name: Complete workspace (review-dated runtime exceptions)
@@ -54,10 +59,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+      - uses: actions/setup-go@v5
         with:
           go-version: stable
       - run: go run github.com/zricethezav/gitleaks/v8@v8.30.1 git --no-banner --redact .
@@ -67,7 +72,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
       - run: rustup toolchain install nightly --profile minimal --component miri,rust-src
       - run: cargo +nightly miri setup
       - run: cargo +nightly miri test -p shiguredo_srt srt_connection::tests
@@ -79,7 +85,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/srt-protocol/fuzz -> target
       - run: rustup toolchain install nightly --profile minimal
       - run: cargo install cargo-fuzz --locked
       - working-directory: crates/srt-protocol/fuzz
@@ -98,7 +107,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
       - run: rustup toolchain install nightly --profile minimal --component rust-src
       - run: cargo +nightly test -p shiguredo_srt --all-targets --target x86_64-unknown-linux-gnu
         env:
@@ -114,15 +124,18 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
       - run: rustup component add llvm-tools-preview
-      - run: cargo install cargo-llvm-cov --locked
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
       - name: Protocol and lifecycle (80% lines)
         run: cargo llvm-cov -p shiguredo_srt -p pbt -p srt-lifecycle --all-features --fail-under-lines 80 --lcov --output-path protocol-lifecycle.lcov
       - run: cargo llvm-cov clean --workspace
       - name: All-feature runtime adapters (50% lines)
         run: cargo llvm-cov -p srt-transport --all-features --ignore-filename-regex 'srt-protocol|srt-lifecycle' --fail-under-lines 50 --lcov --output-path transport.lcov
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@v4
         with:
           name: lcov
           path: |

@@ -74,7 +74,7 @@ validation rather than silently weakening the requested policy.
 ## Security checks
 
 Root CI runs strict linting, the complete test/property suite, documentation and
-package checks, dependency policy, full-history secret scanning, Miri smoke
-tests, AddressSanitizer, coverage enforcement, and bounded fuzz smoke tests.
-Dependency-policy exceptions are documented in
+package checks, dependency policy, full-history secret scanning, CodeQL static
+analysis, Miri smoke tests, AddressSanitizer, coverage enforcement, and bounded
+fuzz smoke tests. Dependency-policy exceptions are documented in
 [`docs/dependency-exceptions.md`](docs/dependency-exceptions.md).
