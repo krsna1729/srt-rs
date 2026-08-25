@@ -303,6 +303,8 @@ pub struct SrtConnection {
     last_nak_time: Option<Timestamp>,
     /// Last packet receipt time (for inactivity-timeout detection).
     last_recv_time: Option<Timestamp>,
+    /// Last protocol packet queued for transmission.
+    last_send_time: Option<Timestamp>,
     /// Received KM message (Listener only).
     received_km: Option<KmMessage>,
     /// Stream ID received from the peer (Listener only).
@@ -401,6 +403,7 @@ impl SrtConnection {
             last_ack_time: None,
             last_nak_time: None,
             last_recv_time: None,
+            last_send_time: None,
             received_km: None,
             peer_stream_id: None,
             peer_congestion_control: None,
@@ -436,6 +439,7 @@ impl SrtConnection {
             last_ack_time: None,
             last_nak_time: None,
             last_recv_time: None,
+            last_send_time: None,
             received_km: None,
             peer_stream_id: None,
             peer_congestion_control: None,
@@ -762,22 +766,18 @@ impl SrtConnection {
     /// methods (this method itself no longer uses it -- see
     /// `SenderBuffer::pop_retransmit`'s doc comment for why retransmitted
     /// packets' `sent_time` is no longer updated).
-    pub fn process_retransmit(&mut self, _now: Timestamp) {
-        if let Some(ref mut sender) = self.sender {
-            while let Some(mut packet) = sender.pop_retransmit() {
-                // Encrypt.
-                if let Some(ref mut crypto) = self.crypto
-                    && let Ok(key_flag) =
-                        crypto.encrypt(packet.sequence_number, &mut packet.payload)
-                {
-                    packet.encryption_flag = key_flag.to_kk_field();
-                }
-
-                let mut buf = Vec::new();
-                packet.encode(&mut buf);
-                self.output_queue
-                    .push_back(ConnectionOutput::SendPacket(buf));
+    pub fn process_retransmit(&mut self, now: Timestamp) {
+        while let Some(mut packet) = self.sender.as_mut().and_then(SenderBuffer::pop_retransmit) {
+            // Encrypt.
+            if let Some(ref mut crypto) = self.crypto
+                && let Ok(key_flag) = crypto.encrypt(packet.sequence_number, &mut packet.payload)
+            {
+                packet.encryption_flag = key_flag.to_kk_field();
             }
+
+            let mut buf = Vec::new();
+            packet.encode(&mut buf);
+            self.queue_packet(buf, now);
         }
     }
 
@@ -798,7 +798,12 @@ impl SrtConnection {
             }
             TimerId::Keepalive => {
                 if self.state == ConnectionState::Connected {
-                    self.send_keepalive(now);
+                    if self
+                        .last_send_time
+                        .is_none_or(|last_send| now.saturating_sub(last_send) >= 1_000_000)
+                    {
+                        self.send_keepalive(now);
+                    }
                     // Set the next keepalive timer.
                     self.output_queue.push_back(ConnectionOutput::SetTimer {
                         id: TimerId::Keepalive,
@@ -943,8 +948,7 @@ impl SrtConnection {
 
             let mut buf = Vec::new();
             packet.encode(&mut buf);
-            self.output_queue
-                .push_back(ConnectionOutput::SendPacket(buf));
+            self.queue_packet(buf, now);
 
             // Record the send time (for packet pacing).
             if let Some(ref mut sender) = self.sender {
@@ -1743,8 +1747,7 @@ impl SrtConnection {
 
         let mut buf = Vec::new();
         pkt.encode(&mut buf);
-        self.output_queue
-            .push_back(ConnectionOutput::SendPacket(buf));
+        self.queue_packet(buf, now);
     }
 
     /// Send a KMRSP packet (KM Refresh).
@@ -1762,8 +1765,7 @@ impl SrtConnection {
 
         let mut buf = Vec::new();
         pkt.encode(&mut buf);
-        self.output_queue
-            .push_back(ConnectionOutput::SendPacket(buf));
+        self.queue_packet(buf, now);
     }
 
     /// Set up timers after the connection is established.
@@ -1831,8 +1833,7 @@ impl SrtConnection {
 
         let mut buf = Vec::new();
         pkt.encode(&mut buf);
-        self.output_queue
-            .push_back(ConnectionOutput::SendPacket(buf));
+        self.queue_packet(buf, now);
     }
 
     /// Send a NAK packet.
@@ -1858,8 +1859,7 @@ impl SrtConnection {
 
         let mut buf = Vec::new();
         pkt.encode(&mut buf);
-        self.output_queue
-            .push_back(ConnectionOutput::SendPacket(buf));
+        self.queue_packet(buf, now);
     }
 
     /// Send a periodic NAK.
@@ -1894,8 +1894,7 @@ impl SrtConnection {
 
         let mut buf = Vec::new();
         pkt.encode(&mut buf);
-        self.output_queue
-            .push_back(ConnectionOutput::SendPacket(buf));
+        self.queue_packet(buf, now);
     }
 
     fn send_induction_request(&mut self, now: Timestamp) {
@@ -2121,6 +2120,12 @@ impl SrtConnection {
             .push_back(ConnectionOutput::SendPacket(packet));
     }
 
+    fn queue_packet(&mut self, packet: Vec<u8>, now: Timestamp) {
+        self.last_send_time = Some(now);
+        self.output_queue
+            .push_back(ConnectionOutput::SendPacket(packet));
+    }
+
     fn retransmit_handshake(&mut self) {
         if let Some(packet) = self.last_handshake_packet.as_ref() {
             self.output_queue
@@ -2194,8 +2199,7 @@ impl SrtConnection {
         };
         let mut buf = Vec::new();
         pkt.encode(&mut buf);
-        self.output_queue
-            .push_back(ConnectionOutput::SendPacket(buf));
+        self.queue_packet(buf, now);
     }
 
     /// Send a Shutdown packet.
@@ -2217,8 +2221,7 @@ impl SrtConnection {
         };
         let mut buf = Vec::new();
         pkt.encode(&mut buf);
-        self.output_queue
-            .push_back(ConnectionOutput::SendPacket(buf));
+        self.queue_packet(buf, now);
     }
 }
 
@@ -2508,6 +2511,30 @@ mod tests {
         assert!(!conn.tlpktdrop_enabled());
         assert!(!conn.periodic_nak_enabled());
         assert!(!conn.receiver.as_ref().expect("receiver").tsbpd_enabled());
+    }
+
+    #[test]
+    fn keepalive_waits_for_one_second_of_outbound_idle_time() {
+        let mut conn = SrtConnection::new_listener(ConnectionOptions::default());
+        conn.set_state(ConnectionState::Connected);
+        conn.init_buffers(Timestamp::from_micros(0), 0, 0);
+        while conn.poll_output().is_some() {}
+
+        conn.send(b"data", Timestamp::from_micros(900_000))
+            .expect("connected sender queues data");
+        while conn.poll_output().is_some() {}
+
+        conn.handle_timer(TimerId::Keepalive, Timestamp::from_micros(1_500_000))
+            .expect("keepalive timer succeeds");
+        assert!(std::iter::from_fn(|| conn.poll_output()).all(
+            |output| !matches!(output, ConnectionOutput::SendPacket(packet) if matches!(SrtPacket::decode(&packet), Ok(SrtPacket::Control(ControlPacket { control_type: ControlType::Keepalive, .. }))))
+        ));
+
+        conn.handle_timer(TimerId::Keepalive, Timestamp::from_micros(1_900_000))
+            .expect("keepalive timer succeeds");
+        assert!(std::iter::from_fn(|| conn.poll_output()).any(
+            |output| matches!(output, ConnectionOutput::SendPacket(packet) if matches!(SrtPacket::decode(&packet), Ok(SrtPacket::Control(ControlPacket { control_type: ControlType::Keepalive, .. }))))
+        ));
     }
 
     #[test]
