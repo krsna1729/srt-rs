@@ -63,11 +63,15 @@ pub enum TimerId {
     Handshake,
     /// Inactivity timeout (detects missing keepalives).
     Inactivity,
+    /// Orderly-close retransmission timeout.
+    Shutdown,
 }
 
 /// Inactivity timeout duration (microseconds).
 /// Usually 5 seconds per the SRT spec.
 const INACTIVITY_TIMEOUT_MICROS: u64 = 5_000_000;
+const SHUTDOWN_RETRY_INTERVAL_MICROS: u64 = 1_000_000;
+const SHUTDOWN_TIMEOUT_MICROS: u64 = 5_000_000;
 // local patch (crates/srt-protocol/VENDOR.md, not upstream-tracked): use
 // libsrt's request cadence with one whole-attempt deadline rather than a
 // retry-count approximation that resets between handshake phases.
@@ -305,6 +309,8 @@ pub struct SrtConnection {
     last_recv_time: Option<Timestamp>,
     /// Last protocol packet queued for transmission.
     last_send_time: Option<Timestamp>,
+    /// Start of an orderly close attempt.
+    shutdown_started_at: Option<Timestamp>,
     /// Received KM message (Listener only).
     received_km: Option<KmMessage>,
     /// Stream ID received from the peer (Listener only).
@@ -404,6 +410,7 @@ impl SrtConnection {
             last_nak_time: None,
             last_recv_time: None,
             last_send_time: None,
+            shutdown_started_at: None,
             received_km: None,
             peer_stream_id: None,
             peer_congestion_control: None,
@@ -440,6 +447,7 @@ impl SrtConnection {
             last_nak_time: None,
             last_recv_time: None,
             last_send_time: None,
+            shutdown_started_at: None,
             received_km: None,
             peer_stream_id: None,
             peer_congestion_control: None,
@@ -871,6 +879,21 @@ impl SrtConnection {
                     self.set_state(ConnectionState::Disconnected);
                 }
             }
+            TimerId::Shutdown => {
+                if self.state == ConnectionState::Closing {
+                    if self.shutdown_started_at.is_some_and(|started| {
+                        now.saturating_sub(started) >= SHUTDOWN_TIMEOUT_MICROS
+                    }) {
+                        self.finish_local_close("shutdown timeout");
+                    } else {
+                        self.send_shutdown(now);
+                        self.output_queue.push_back(ConnectionOutput::SetTimer {
+                            id: TimerId::Shutdown,
+                            duration_micros: SHUTDOWN_RETRY_INTERVAL_MICROS,
+                        });
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -1050,6 +1073,11 @@ impl SrtConnection {
             }
             self.enqueue_ready_data(now);
             self.send_shutdown(now);
+            self.shutdown_started_at = Some(now);
+            self.output_queue.push_back(ConnectionOutput::SetTimer {
+                id: TimerId::Shutdown,
+                duration_micros: SHUTDOWN_RETRY_INTERVAL_MICROS,
+            });
             self.set_state(ConnectionState::Closing);
         }
     }
@@ -1161,6 +1189,10 @@ impl SrtConnection {
     }
 
     fn handle_data_packet(&mut self, pkt: DataPacket, now: Timestamp) -> Result<(), Error> {
+        if self.state == ConnectionState::Closing {
+            self.finish_local_close("peer activity after shutdown");
+            return Ok(());
+        }
         if self.state != ConnectionState::Connected {
             return Ok(()); // 接続前のデータは無視
         }
@@ -1246,6 +1278,10 @@ impl SrtConnection {
             pkt.control_type,
             pkt.control_info.len()
         );
+        if self.state == ConnectionState::Closing && pkt.control_type != ControlType::Shutdown {
+            self.finish_local_close("peer activity after shutdown");
+            return Ok(());
+        }
         match pkt.control_type {
             ControlType::Handshake => self.handle_handshake(pkt, now),
             ControlType::Keepalive => Ok(()), // キープアライブは特に処理不要
@@ -1670,11 +1706,26 @@ impl SrtConnection {
         }
         self.enqueue_ready_data(now);
 
+        self.shutdown_started_at = None;
+        self.output_queue.push_back(ConnectionOutput::ClearTimer {
+            id: TimerId::Shutdown,
+        });
         self.set_state(ConnectionState::Disconnected);
         self.event_queue.push_back(ConnectionEvent::Disconnected {
             reason: "peer shutdown".to_string(),
         });
         Ok(())
+    }
+
+    fn finish_local_close(&mut self, reason: &str) {
+        self.shutdown_started_at = None;
+        self.output_queue.push_back(ConnectionOutput::ClearTimer {
+            id: TimerId::Shutdown,
+        });
+        self.set_state(ConnectionState::Disconnected);
+        self.event_queue.push_back(ConnectionEvent::Disconnected {
+            reason: reason.to_owned(),
+        });
     }
 
     /// Process a UserDefined packet (KM Refresh).
@@ -2568,6 +2619,77 @@ mod tests {
             |event| matches!(event, ConnectionEvent::DataReceived { payload, .. } if payload == b"queued")
         ));
         assert_eq!(conn.state(), ConnectionState::Closing);
+    }
+
+    #[test]
+    fn closing_retries_shutdown_until_peer_activity() {
+        let mut conn = SrtConnection::new_listener(ConnectionOptions::default());
+        conn.set_state(ConnectionState::Connected);
+        conn.init_buffers(Timestamp::from_micros(0), 0, 0);
+        while conn.poll_event().is_some() {}
+        while conn.poll_output().is_some() {}
+
+        conn.disconnect(Timestamp::from_micros(0));
+        assert_eq!(conn.state(), ConnectionState::Closing);
+        assert!(
+            std::iter::from_fn(|| conn.poll_output()).any(|output| matches!(
+                output,
+                ConnectionOutput::SetTimer {
+                    id: TimerId::Shutdown,
+                    ..
+                }
+            ))
+        );
+
+        conn.handle_timer(TimerId::Shutdown, Timestamp::from_micros(1_000_000))
+            .expect("shutdown retry succeeds");
+        assert!(std::iter::from_fn(|| conn.poll_output()).any(
+            |output| matches!(output, ConnectionOutput::SendPacket(packet) if matches!(SrtPacket::decode(&packet), Ok(SrtPacket::Control(ControlPacket { control_type: ControlType::Shutdown, .. }))))
+        ));
+
+        conn.handle_control_packet(
+            ControlPacket {
+                control_type: ControlType::Keepalive,
+                subtype: 0,
+                type_specific_info: 0,
+                timestamp: 0,
+                dest_socket_id: 0,
+                control_info: Vec::new(),
+            },
+            Timestamp::from_micros(1_000_001),
+        )
+        .expect("peer activity completes close");
+        assert_eq!(conn.state(), ConnectionState::Disconnected);
+        assert!(
+            std::iter::from_fn(|| conn.poll_output()).any(|output| matches!(
+                output,
+                ConnectionOutput::ClearTimer {
+                    id: TimerId::Shutdown
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn closing_times_out_after_shutdown_retries() {
+        let mut conn = SrtConnection::new_listener(ConnectionOptions::default());
+        conn.set_state(ConnectionState::Connected);
+        conn.init_buffers(Timestamp::from_micros(0), 0, 0);
+        while conn.poll_event().is_some() {}
+        while conn.poll_output().is_some() {}
+        conn.disconnect(Timestamp::from_micros(0));
+        while conn.poll_output().is_some() {}
+
+        conn.handle_timer(
+            TimerId::Shutdown,
+            Timestamp::from_micros(SHUTDOWN_TIMEOUT_MICROS),
+        )
+        .expect("shutdown timeout succeeds");
+
+        assert_eq!(conn.state(), ConnectionState::Disconnected);
+        assert!(std::iter::from_fn(|| conn.poll_event()).any(
+            |event| matches!(event, ConnectionEvent::Disconnected { reason } if reason == "shutdown timeout")
+        ));
     }
 
     #[test]
