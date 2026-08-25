@@ -1,20 +1,33 @@
 version: 2
 
 updates:
+  # Actions are pinned to major-version tags, so a Dependabot bump only
+  # fires on a new major release anyway (rare, and worth its own PR to
+  # review individually) or an occasional out-of-band patch a maintainer
+  # pinned more tightly. Group only the routine minor/patch case; leave
+  # major bumps ungrouped so a breaking change isn't buried in a batch.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
     groups:
-      actions:
-        patterns:
-          - "*"
+      actions-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
 
+  # Same reasoning for cargo: batch the low-risk, semver-safe minor/patch
+  # updates into one PR a week instead of one per crate, but keep every
+  # major-version bump as its own isolated, individually bisectable PR --
+  # those are exactly the updates most likely to need a real code change
+  # or a revert, and batching them together would make it hard to tell
+  # which dependency broke CI.
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
       interval: "weekly"
     groups:
-      cargo:
-        patterns:
-          - "*"
+      cargo-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
