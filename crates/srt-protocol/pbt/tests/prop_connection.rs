@@ -965,6 +965,38 @@ proptest! {
     }
 }
 
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// プロパティ: ハンドシェイク完了後、双方が相手の宣言した
+    /// congestion_control 文字列 (add_congestion_extension/
+    /// get_congestion_extension 経由) を観測できる -- 独立に設定した
+    /// 任意の文字列同士でも、一致していなくても round-trip する。
+    /// (real libsrt との interop テストで見つかったバグの回帰テスト:
+    /// この宣言が抜けていると、congctl を宣言する real libsrt ピアは
+    /// 相手が何も宣言しないのを見て自らのモードとの不一致を疑い、
+    /// 送信を一切行わずに切断していた)
+    #[test]
+    fn prop_peer_congestion_control_round_trips_through_handshake(
+        caller_cc in "[a-zA-Z0-9_-]{0,32}",
+        listener_cc in "[a-zA-Z0-9_-]{0,32}",
+    ) {
+        let mut now = Timestamp::from_micros(0);
+        let mut caller = SrtConnection::new_caller(ConnectionOptions {
+            congestion_control: caller_cc.clone(),
+            ..make_opts(1)
+        });
+        let mut listener = SrtConnection::new_listener(ConnectionOptions {
+            congestion_control: listener_cc.clone(),
+            ..make_opts(2)
+        });
+        establish_connection(&mut caller, &mut listener, &mut now);
+
+        prop_assert_eq!(caller.peer_congestion_control(), Some(listener_cc.as_str()));
+        prop_assert_eq!(listener.peer_congestion_control(), Some(caller_cc.as_str()));
+    }
+}
+
 // ヘルパー関数（proptest マクロの外）
 
 /// テスト用の ConnectionOptions を生成
@@ -978,6 +1010,7 @@ fn make_opts(socket_id: u32) -> ConnectionOptions {
         tsbpd_delay: 120,
         srt_version: 0x010500,
         stream_id: None,
+        congestion_control: "live".to_string(),
         group_extension: None,
         crypto_salt: None,
         crypto_sek: None,
@@ -999,6 +1032,7 @@ fn make_opts_with_stream_id(socket_id: u32, stream_id: String) -> ConnectionOpti
         tsbpd_delay: 120,
         srt_version: 0x010500,
         stream_id: Some(stream_id),
+        congestion_control: "live".to_string(),
         group_extension: None,
         crypto_salt: None,
         crypto_sek: None,

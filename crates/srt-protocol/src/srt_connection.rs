@@ -173,6 +173,15 @@ pub struct ConnectionOptions {
     pub srt_version: u32,
     /// Stream ID (the identifier the Caller sends to the Listener, up to 512 bytes).
     pub stream_id: Option<String>,
+    /// Congestion control mode name declared in the handshake extension
+    /// (e.g. "live", "file"). A real libsrt peer that declares a mode
+    /// itself refuses to transmit if the other side declares nothing at
+    /// all, assuming a live/file mismatch (confirmed by interop testing
+    /// against `srt-file-transmit`, which logs "peer DID NOT DECLARE
+    /// congctl" and disconnects without sending data). This crate's
+    /// receive/delivery path does not itself branch on the mode -- this
+    /// field only controls what gets declared and compared on the wire.
+    pub congestion_control: String,
     /// Optional libsrt-compatible bonding group metadata.
     pub group_extension: Option<GroupExtensionData>,
     /// Maximum bandwidth (equivalent to `SRTO_MAXBW`, bytes/sec). If `None`,
@@ -214,6 +223,7 @@ impl fmt::Debug for ConnectionOptions {
             .field("tsbpd_delay", &self.tsbpd_delay)
             .field("srt_version", &self.srt_version)
             .field("stream_id", &self.stream_id)
+            .field("congestion_control", &self.congestion_control)
             .field("group_extension", &self.group_extension)
             .field(
                 "max_bandwidth_bytes_per_sec",
@@ -239,6 +249,7 @@ impl Default for ConnectionOptions {
             tsbpd_delay: 120,
             srt_version: 0x010500, // 1.5.0
             stream_id: None,
+            congestion_control: "live".to_string(),
             group_extension: None,
             max_bandwidth_bytes_per_sec: None,
             flow_window_packets: DEFAULT_FLOW_WINDOW,
@@ -296,6 +307,9 @@ pub struct SrtConnection {
     received_km: Option<KmMessage>,
     /// Stream ID received from the peer (Listener only).
     peer_stream_id: Option<String>,
+    /// Congestion control mode name declared by the peer in the handshake
+    /// extension, if any.
+    peer_congestion_control: Option<String>,
     /// Peer bonding group metadata.
     peer_group_extension: Option<GroupExtensionData>,
     last_handshake_packet: Option<Vec<u8>>,
@@ -387,6 +401,7 @@ impl SrtConnection {
             last_recv_time: None,
             received_km: None,
             peer_stream_id: None,
+            peer_congestion_control: None,
             peer_group_extension: None,
             last_handshake_packet: None,
             handshake_retry_sequence: 0,
@@ -420,6 +435,7 @@ impl SrtConnection {
             last_recv_time: None,
             received_km: None,
             peer_stream_id: None,
+            peer_congestion_control: None,
             peer_group_extension: None,
             last_handshake_packet: None,
             handshake_retry_sequence: 0,
@@ -452,6 +468,12 @@ impl SrtConnection {
     /// Get the Stream ID received from the peer (Listener only).
     pub fn peer_stream_id(&self) -> Option<&str> {
         self.peer_stream_id.as_deref()
+    }
+
+    /// Get the congestion control mode name declared by the peer in the
+    /// handshake extension, if any (e.g. "live", "file").
+    pub fn peer_congestion_control(&self) -> Option<&str> {
+        self.peer_congestion_control.as_deref()
     }
 
     /// Return the bonding group metadata advertised by the peer.
@@ -1302,6 +1324,7 @@ impl SrtConnection {
                 // (INDUCTION とは異なる値の場合がある)
                 self.peer_socket_id = hs.socket_id;
                 self.peer_group_extension = hs.get_group_extension();
+                self.peer_congestion_control = hs.get_congestion_extension();
 
                 tracing::debug!(
                     "received CONCLUSION response, peer_initial_seq={}, peer_socket_id={:#x}",
@@ -1434,6 +1457,7 @@ impl SrtConnection {
                     self.peer_stream_id = Some(stream_id);
                 }
                 self.peer_group_extension = hs.get_group_extension();
+                self.peer_congestion_control = hs.get_congestion_extension();
 
                 // KMREQ を処理して CryptoContext を作成
                 if let Some(ref passphrase) = self.options.passphrase {
@@ -1858,6 +1882,28 @@ impl SrtConnection {
         self.queue_handshake_packet(buf);
     }
 
+    /// SRT flags advertised in the CONCLUSION handshake extension.
+    ///
+    /// CRYPT, PERIODICNAK, and REXMITFLG are always set (legacy
+    /// compatibility flags this crate always supports). TSBPDSND/TSBPDRCV
+    /// and TLPKTDROP are live-streaming-only per spec: a real libsrt peer
+    /// running its Buffer/File API (declared via `congestion_control ==
+    /// "file"`) locally rejects a connection where TLPKTDROP is granted
+    /// ("SRTO_TLPKTDROP flag can only be used with message API"), found via
+    /// interop testing against `srt-file-transmit`. This crate's own
+    /// receive/delivery path does not itself branch on these flags -- they
+    /// only affect what's declared and checked by the peer.
+    fn negotiated_srt_flags(&self) -> u32 {
+        let live = self.options.congestion_control != "file";
+        let mut flags = srt_flags::CRYPT | srt_flags::PERIODICNAK | srt_flags::REXMITFLG;
+        if live {
+            flags |= srt_flags::TSBPDSND | srt_flags::TSBPDRCV | srt_flags::TLPKTDROP;
+        } else {
+            flags |= srt_flags::STREAM;
+        }
+        flags
+    }
+
     fn send_induction_response(&mut self, now: Timestamp) {
         let encryption_field = if self.options.passphrase.is_some() {
             self.options.key_length.to_encryption_field()
@@ -1903,17 +1949,14 @@ impl SrtConnection {
         );
         hs.flow_window = self.flight_capacity_packets();
 
-        // SRT flags.
-        // CRYPT and REXMITFLG are always set (legacy compatibility flags).
-        // STREAM is not set (Message mode is used).
-        let flags = srt_flags::TSBPDSND
-            | srt_flags::TSBPDRCV
-            | srt_flags::CRYPT
-            | srt_flags::TLPKTDROP
-            | srt_flags::PERIODICNAK
-            | srt_flags::REXMITFLG;
+        let flags = self.negotiated_srt_flags();
 
         hs.add_hs_extension(self.options.srt_version, flags, self.options.tsbpd_delay);
+
+        // Declare our congestion control mode. A real libsrt peer that
+        // declares its own mode refuses to transmit if we declare none at
+        // all, assuming a live/file mismatch (see ConnectionOptions::congestion_control).
+        hs.add_congestion_extension(&self.options.congestion_control);
 
         // Add a KMREQ extension if encryption is enabled.
         //
@@ -1970,17 +2013,12 @@ impl SrtConnection {
         );
         hs.flow_window = self.flight_capacity_packets();
 
-        // SRT フラグ
-        // CRYPT と REXMITFLG は常に設定 (レガシー互換性フラグ)
-        // STREAM フラグは設定しない (Message モードを使用)
-        let flags = srt_flags::TSBPDSND
-            | srt_flags::TSBPDRCV
-            | srt_flags::CRYPT
-            | srt_flags::TLPKTDROP
-            | srt_flags::PERIODICNAK
-            | srt_flags::REXMITFLG;
+        let flags = self.negotiated_srt_flags();
 
         hs.add_hs_response(self.options.srt_version, flags, self.options.tsbpd_delay);
+
+        // Declare our congestion control mode (see send_conclusion_request).
+        hs.add_congestion_extension(&self.options.congestion_control);
 
         // 受信した KMREQ をそのまま KMRSP として返す
         if let Some(ref km) = self.received_km {
@@ -2009,12 +2047,7 @@ impl SrtConnection {
             true,
         );
         hs.flow_window = self.flight_capacity_packets();
-        let flags = srt_flags::TSBPDSND
-            | srt_flags::TSBPDRCV
-            | srt_flags::CRYPT
-            | srt_flags::TLPKTDROP
-            | srt_flags::PERIODICNAK
-            | srt_flags::REXMITFLG;
+        let flags = self.negotiated_srt_flags();
         hs.add_hs_response(self.options.srt_version, flags, self.options.tsbpd_delay);
         hs.add_km_error(error);
         if let Some(group) = self.options.group_extension {
