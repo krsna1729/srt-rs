@@ -15,6 +15,12 @@ on:
 permissions:
   contents: read
 
+env:
+  # See ci.yml: mold isn't installed on stock runners, and this workflow
+  # doesn't benchmark, so there's no reason to match .cargo/config.toml's
+  # local-iteration-speed linker choice here.
+  RUSTFLAGS: "-C link-arg=-Wl,-z,relro,-z,now -C target-cpu=x86-64-v3"
+
 jobs:
   publish:
     runs-on: ubuntu-24.04
@@ -23,7 +29,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y mold
       - name: Verify release tag matches crate version
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
