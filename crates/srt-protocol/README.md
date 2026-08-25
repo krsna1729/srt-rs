@@ -112,6 +112,12 @@ details and evidence in [VENDOR.md](VENDOR.md#crypto-backend-pure-rust-rustcrypt
 Control packets carry libsrt's 4-byte zero padding so Wireshark's SRT
 dissector stays happy (`LIBSRT_COMPAT_PADDING` in `srt_connection.rs`).
 
+The supported connection topology is caller-to-listener. SRT rendezvous
+(simultaneous NAT-to-NAT dialing via WAVEAHAND and AGREEMENT) is not
+implemented: those handshake frame types decode for safe peer handling, but
+the state machine does not initiate or complete a rendezvous exchange. Use a
+reachable listener for every connection.
+
 ## Testing
 
 ```sh
