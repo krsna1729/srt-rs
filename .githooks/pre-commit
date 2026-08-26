@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Pre-commit gate: formatting, lint, and fast tests for the crates touched by
+# the commit. Keeps CI green (the "Test, lint, docs, package" workflow runs
+# the same three gates) without running the full workspace suite locally.
+#
+# Bypass with `git commit --no-verify` for WIP commits.
+
+set -euo pipefail
+
+root="$(git rev-parse --show-toplevel)"
+cd "$root"
+
+# Staged Rust files only; skip the hook entirely for non-Rust commits.
+files=$(git diff --cached --name-only --diff-filter=ACMR -- '*.rs' | tr '\n' ' ')
+if [[ -z "$files" ]]; then
+    exit 0
+fi
+
+echo "pre-commit: rustfmt"
+cargo fmt --all
+# Re-stage anything fmt rewrote so the commit contains formatted code.
+git add -- $files
+
+echo "pre-commit: clippy (stale-target fast path)"
+cargo clippy --workspace --all-targets --quiet -- -D warnings
+
+echo "pre-commit: protocol + property tests"
+cargo test -p shiguredo_srt --quiet
+cargo test -p pbt --quiet
+
+echo "pre-commit: OK"
