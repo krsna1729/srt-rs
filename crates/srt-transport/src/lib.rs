@@ -4190,6 +4190,12 @@ mod tests {
             Admit::Fed
         );
 
+        // DATA is held by the negotiated 120ms TSBPD latency. Drive the
+        // peer timers past that deadline before observing logical delivery;
+        // a fixed timestamp near receipt only happened to pass before TSBPD
+        // capability negotiation was made symmetric.
+        let mut outbound = Vec::new();
+        table.poll_outbound(Timestamp::from_micros(125_000), &mut outbound);
         table.poll_events(&mut events);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].representative_peer, first);
@@ -4615,6 +4621,10 @@ mod tests {
             );
         }
 
+        // As above, receiver delivery occurs on the periodic ACK timer after
+        // the negotiated TSBPD delay, not at DATA receipt time.
+        let mut outbound = Vec::new();
+        table.poll_outbound(Timestamp::from_micros(125_000), &mut outbound);
         let mut events = Vec::new();
         table.poll_events(&mut events);
         let payloads = events
