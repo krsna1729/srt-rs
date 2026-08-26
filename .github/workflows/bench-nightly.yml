@@ -31,7 +31,7 @@ jobs:
     # whole job (and all its output) being killed by this ceiling.
     timeout-minutes: 360
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release -p srt-bench
       # Small, cheap breadth checks first (seconds each): every runtime
