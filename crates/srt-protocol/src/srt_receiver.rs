@@ -98,11 +98,13 @@ const WRAPPING_PERIOD_END_MIN: u64 = 30_000_000;
 /// TSBPD wraparound period: the upper bound (exclusive) at which the timestamp ends the period.
 const WRAPPING_PERIOD_END_MAX: u64 = 60_000_000;
 
-/// Tracks ACK send times (for RTT calculation).
+/// Tracks ACK send times and acknowledged positions (for RTT calculation
+/// and ACK suppression).
 #[derive(Debug)]
 struct AckTimestampTracker {
-    /// Mapping from ACK number to send time.
-    timestamps: BTreeMap<u32, Timestamp>,
+    /// Mapping from ACK number to its send time and the sequence position
+    /// it acknowledged.
+    timestamps: BTreeMap<u32, (Timestamp, u32)>,
 }
 
 impl AckTimestampTracker {
@@ -112,9 +114,9 @@ impl AckTimestampTracker {
         }
     }
 
-    /// Record an ACK send time.
-    fn record(&mut self, ack_number: u32, send_time: Timestamp) {
-        self.timestamps.insert(ack_number, send_time);
+    /// Record an ACK send time and the sequence position it acknowledged.
+    fn record(&mut self, ack_number: u32, send_time: Timestamp, acked_seq: u32) {
+        self.timestamps.insert(ack_number, (send_time, acked_seq));
 
         // Remove old entries.
         while self.timestamps.len() > MAX_ACK_TIMESTAMPS {
@@ -125,8 +127,13 @@ impl AckTimestampTracker {
     }
 
     /// Get an ACK's send time.
-    fn get(&self, ack_number: u32) -> Option<Timestamp> {
-        self.timestamps.get(&ack_number).copied()
+    fn get_send_time(&self, ack_number: u32) -> Option<Timestamp> {
+        self.timestamps.get(&ack_number).map(|&(time, _)| time)
+    }
+
+    /// Get the sequence position an ACK acknowledged.
+    fn get_acked_seq(&self, ack_number: u32) -> Option<u32> {
+        self.timestamps.get(&ack_number).map(|&(_, seq)| seq)
     }
 }
 
@@ -371,6 +378,21 @@ pub struct ReceiverBuffer {
     /// ACK sequence number (the ACK packet's own number).
     ack_number: u32,
 
+    /// The sequence position the peer last confirmed via ACKACK. Periodic
+    /// ACK generation is suppressed while this is unchanged (spec §4.8.1),
+    /// except when buffer space has freed since the last full ACK.
+    last_ackacked_seq: Option<u32>,
+
+    /// The full-ACK number the peer last confirmed. An ACKACK for an older
+    /// full ACK cannot confirm a newer advertised receive window, even if
+    /// both ACKs carry the same sequence position.
+    last_ackacked_number: Option<u32>,
+
+    /// The available-buffer value advertised in the last ACK, so a
+    /// position-stale periodic ACK is still sent when buffer space has
+    /// freed (libsrt's `bNeedFullAck` exception).
+    last_advertised_buffer: u32,
+
     /// TSBPD delay (microseconds).
     tsbpd_delay_us: u64,
 
@@ -487,10 +509,13 @@ impl ReceiverBuffer {
             packets: BTreeMap::new(),
             delivery_seq_hint: None,
             expected_seq: initial_seq,
+            last_advertised_buffer: 0,
             loss_list: FxHashSet::default(),
             loss_list_min: None,
             last_ack_time: start_time,
             last_ack_seq: initial_seq,
+            last_ackacked_seq: None,
+            last_ackacked_number: None,
             packets_since_ack: 0,
             // The first Full ACK increments this to one, as required by the
             // wire specification.
@@ -932,9 +957,23 @@ impl ReceiverBuffer {
         self.receive_expected_sequence_scans.get()
     }
 
+    /// Whether the current ACK position was already confirmed by an ACKACK.
+    ///
+    /// Spec §4.8.1: "The ACKACK tells the receiver to stop sending the ACK
+    /// position because the sender already knows it. Otherwise, ACKs (with
+    /// outdated information) would continue to be sent regularly." Mirrors
+    /// libsrt's `m_iRcvLastAckAck == ack` suppression check
+    /// (`sendCtrl(UMSG_ACK)`, `core.cpp:8364`).
+    fn position_already_ackacked(&self) -> bool {
+        self.last_ackacked_number == Some(self.ack_number)
+            && self.last_ackacked_seq == Some(self.expected_seq)
+    }
+
     /// Check whether an ACK should be generated.
     pub fn should_send_ack(&self, now: Timestamp) -> bool {
-        // Light ACK: every 64 packets received.
+        // Light ACK: every 64 packets received. At high packet rates the
+        // acknowledged position advances between ACKACKs, so a light ACK is
+        // never stale.
         if self.packets_since_ack >= LIGHT_ACK_INTERVAL {
             return true;
         }
@@ -943,7 +982,18 @@ impl ReceiverBuffer {
         let elapsed = now
             .as_micros()
             .saturating_sub(self.last_ack_time.as_micros());
-        elapsed >= ACK_INTERVAL_US
+        if elapsed < ACK_INTERVAL_US {
+            return false;
+        }
+
+        // Suppress the periodic ACK while the acknowledged position is
+        // unchanged and the advertised buffer space has not changed either:
+        // available_buffer_packets only differs from the last full ACK when
+        // packets were delivered or dropped since, which is exactly the
+        // buffer-freed full-ACK exception libsrt keeps (`bNeedFullAck`,
+        // `core.cpp:8357`) so the sender's flow window reopens.
+        !(self.position_already_ackacked()
+            && self.available_buffer_packets() == self.last_advertised_buffer)
     }
 
     /// Generate an ACK.
@@ -960,8 +1010,10 @@ impl ReceiverBuffer {
 
         if !is_light {
             self.ack_number = self.ack_number.wrapping_add(1);
-            self.ack_timestamps.record(self.ack_number, now);
+            self.ack_timestamps
+                .record(self.ack_number, now, self.expected_seq);
         }
+        self.last_advertised_buffer = self.available_buffer_packets();
 
         // Calculate the receiving rate and link capacity.
         let (receiving_rate, recv_rate) = self.rate_estimator.calculate_rates(now);
@@ -1022,10 +1074,20 @@ impl ReceiverBuffer {
     /// Process an ACKACK and update RTT.
     pub fn handle_ackack(&mut self, ack_number: u32, packet_timestamp: u32, now: Timestamp) {
         // Look up the ACK's send time.
-        let rtt_sample = self.ack_timestamps.get(ack_number).and_then(|send_time| {
-            let rtt = (now.as_micros().saturating_sub(send_time.as_micros())) as u32;
-            (rtt != 0 && rtt <= 30_000_000).then_some(rtt)
-        });
+        let rtt_sample = self
+            .ack_timestamps
+            .get_send_time(ack_number)
+            .and_then(|send_time| {
+                let rtt = (now.as_micros().saturating_sub(send_time.as_micros())) as u32;
+                (rtt != 0 && rtt <= 30_000_000).then_some(rtt)
+            });
+
+        // The peer confirmed this ACK position; remember it so
+        // should_send_ack can suppress redundant periodic ACKs (§4.8.1).
+        if let Some(acked_seq) = self.ack_timestamps.get_acked_seq(ack_number) {
+            self.last_ackacked_number = Some(ack_number);
+            self.last_ackacked_seq = Some(acked_seq);
+        }
 
         if let Some(rtt) = rtt_sample {
             // Smooth with EWMA: RTT = 7/8 * RTT + 1/8 * rtt
@@ -1465,6 +1527,75 @@ mod tests {
         assert_eq!(ack.ack_seq, 1002);
     }
 
+    /// Spec §4.8.1: after an ACKACK confirms the current position, periodic
+    /// ACK generation is suppressed until the position or the advertised
+    /// buffer space changes. Mirrors libsrt's `m_iRcvLastAckAck == ack`
+    /// check with its `bNeedFullAck` exception.
+    #[test]
+    fn test_periodic_ack_suppressed_until_position_or_buffer_changes() {
+        let start = Timestamp::from_micros(0);
+        let mut buf = ReceiverBuffer::new(1000, 120, start, 0);
+
+        let t0 = Timestamp::from_micros(10_000); // one full ACK period
+        buf.receive(make_packet(1000, 100), t0);
+        assert!(buf.should_send_ack(t0));
+        let first = buf.generate_ack(t0);
+        assert_eq!(first.ack_seq, 1001);
+
+        // Peer confirms via ACKACK for the full ACK number.
+        let ackack_time = Timestamp::from_micros(11_000);
+        buf.handle_ackack(buf.ack_number(), 0, ackack_time);
+
+        // One ACK period later, nothing changed: suppressed.
+        let t1 = Timestamp::from_micros(20_000);
+        assert!(!buf.should_send_ack(t1));
+
+        // Buffer space changed since the last ACK (packet delivered past its
+        // TSBPD time): the buffer-freed exception applies.
+        let t_deliver = Timestamp::from_micros(131_000); // ts 100us + 120ms delay + slack
+        assert!(buf.pop_ready(t_deliver).is_some());
+        let ack = buf.generate_ack(t_deliver);
+        assert_ne!(
+            ack.available_buffer, first.available_buffer,
+            "buffer-freed exception must change the advertised space"
+        );
+
+        // New position acknowledged again -> suppression resumes.
+        buf.handle_ackack(buf.ack_number(), 0, Timestamp::from_micros(132_000));
+        let t2 = Timestamp::from_micros(141_000);
+        assert!(!buf.should_send_ack(t2));
+
+        // A new data packet advances the position: ACK allowed again.
+        buf.receive(make_packet(1001, 200), t2);
+        assert!(buf.should_send_ack(t2));
+    }
+
+    #[test]
+    fn stale_ackack_does_not_confirm_a_newer_full_ack() {
+        let start = Timestamp::from_micros(0);
+        let mut buf = ReceiverBuffer::new(1000, 120, start, 0);
+
+        buf.receive(make_packet(1000, 100), Timestamp::from_micros(10_000));
+        let first = buf.generate_ack(Timestamp::from_micros(10_000));
+        let first_number = buf.ack_number();
+
+        // Delivery frees space without advancing expected_seq, requiring a
+        // newer Full ACK that carries the same position but a new window.
+        assert!(buf.pop_ready(Timestamp::from_micros(131_000)).is_some());
+        let second = buf.generate_ack(Timestamp::from_micros(131_000));
+        let second_number = buf.ack_number();
+        assert_eq!(first.ack_seq, second.ack_seq);
+        assert_ne!(first_number, second_number);
+
+        // UDP can reorder ACKACK control packets. Confirmation of the first
+        // ACK must not suppress the newer window update.
+        buf.handle_ackack(first_number, 0, Timestamp::from_micros(132_000));
+        assert!(buf.should_send_ack(Timestamp::from_micros(141_000)));
+
+        buf.handle_ackack(second_number, 0, Timestamp::from_micros(142_000));
+        assert!(!buf.should_send_ack(Timestamp::from_micros(151_000)));
+    }
+
     #[test]
     fn test_receiver_buffer_nak_generation() {
         let start = Timestamp::from_micros(0);
@@ -1493,17 +1624,21 @@ mod tests {
         let t2 = Timestamp::from_micros(2000);
         let t3 = Timestamp::from_micros(3000);
 
-        tracker.record(1, t1);
-        tracker.record(2, t2);
-        tracker.record(3, t3);
+        tracker.record(1, t1, 100);
+        tracker.record(2, t2, 200);
+        tracker.record(3, t3, 300);
 
-        // 記録した時刻を取得できる
-        assert_eq!(tracker.get(1), Some(t1));
-        assert_eq!(tracker.get(2), Some(t2));
-        assert_eq!(tracker.get(3), Some(t3));
+        // 記録した時刻と ACK 位置を取得できる
+        assert_eq!(tracker.get_send_time(1), Some(t1));
+        assert_eq!(tracker.get_send_time(2), Some(t2));
+        assert_eq!(tracker.get_send_time(3), Some(t3));
+        assert_eq!(tracker.get_acked_seq(1), Some(100));
+        assert_eq!(tracker.get_acked_seq(2), Some(200));
+        assert_eq!(tracker.get_acked_seq(3), Some(300));
 
         // 存在しない ACK 番号は None
-        assert_eq!(tracker.get(99), None);
+        assert_eq!(tracker.get_send_time(99), None);
+        assert_eq!(tracker.get_acked_seq(99), None);
     }
 
     #[test]
@@ -1511,17 +1646,20 @@ mod tests {
         let mut tracker = AckTimestampTracker::new();
 
         // MAX_ENTRIES (16) を超えるエントリを追加
-        for i in 0..20 {
-            tracker.record(i, Timestamp::from_micros(i as u64 * 1000));
+        for i in 0..20u32 {
+            tracker.record(i, Timestamp::from_micros(i as u64 * 1000), i * 10);
         }
 
         // 古いエントリは削除される (0-3 が削除される)
-        assert_eq!(tracker.get(0), None);
-        assert_eq!(tracker.get(3), None);
+        assert_eq!(tracker.get_send_time(0), None);
+        assert_eq!(tracker.get_send_time(3), None);
+        assert_eq!(tracker.get_acked_seq(0), None);
+        assert_eq!(tracker.get_acked_seq(3), None);
 
         // 新しいエントリは残る
-        assert!(tracker.get(4).is_some());
-        assert!(tracker.get(19).is_some());
+        assert!(tracker.get_send_time(4).is_some());
+        assert!(tracker.get_send_time(19).is_some());
+        assert!(tracker.get_acked_seq(19).is_some());
     }
 
     #[test]
