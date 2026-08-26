@@ -195,6 +195,19 @@ cargo bench -p shiguredo_srt     # criterion: core packet loop, loss/tsbpd scans
 cargo bench -p srt-transport     # admission limits and deadline/index tradeoffs
 ```
 
+### Optional developer dependencies
+
+Rust 1.96.0 is pinned by `rust-toolchain.toml`; `cargo test` needs no C
+toolchain or libsrt. Install the distribution package `srt-tools` only when
+running real-libsrt interoperability tests locally (it provides
+`srt-file-transmit` and `srt-live-transmit`):
+
+```sh
+cargo test -p srt-bench --test libsrt_interop -- --nocapture
+```
+
+Fuzzing additionally needs nightly Rust and `cargo-fuzz`.
+
 Fuzzing (decode paths must never panic on attacker input — they already
 caught one real overflow, see `crates/srt-protocol/VENDOR.md`):
 
