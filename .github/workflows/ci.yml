@@ -2,13 +2,21 @@ name: CI
 
 on:
   push:
+    branches: ["main"]
   pull_request:
+    branches: ["main"]
   schedule:
     - cron: "17 4 * * 1"
   workflow_dispatch:
 
 permissions:
   contents: read
+
+# A new PR commit supersedes any still-running CI for that same PR. Keep main
+# independent so the post-merge verification is never cancelled by PR work.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -77,6 +85,7 @@ jobs:
 
   miri:
     name: Miri ownership smoke
+    needs: quality
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -89,17 +98,48 @@ jobs:
           MIRIFLAGS: -Zmiri-tree-borrows
 
   libsrt-interop:
-    name: libsrt live interop
+    name: libsrt live interop (Ubuntu)
+    needs: quality
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install --yes srt-tools
+      - name: Report libsrt tools version
+        run: |
+          srt-live-transmit -version
+          srt-file-transmit -version
+      - run: cargo test -p srt-bench --test libsrt_interop
+
+  libsrt-interop-sid:
+    name: libsrt live interop (Debian sid)
+    needs: quality
+    runs-on: ubuntu-24.04
+    container: debian:unstable
+    timeout-minutes: 20
+    env:
+      # See the matching image setting: Glommio's bundled liburing needs the
+      # Linux UAPI declaration explicitly included on Debian sid.
+      CFLAGS: -include linux/openat2.h
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies and srt-tools
+        run: |
+          apt-get update
+          apt-get install --yes ca-certificates curl git build-essential clang linux-libc-dev pkg-config srt-tools
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.96.0
+      - name: Report libsrt tools version
+        run: |
+          srt-live-transmit -version
+          srt-file-transmit -version
       - run: cargo test -p srt-bench --test libsrt_interop
 
   fuzz-smoke:
     name: Fuzz build and smoke
+    needs: quality
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -122,6 +162,7 @@ jobs:
 
   sanitizer:
     name: Address sanitizer
+    needs: quality
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
@@ -139,6 +180,7 @@ jobs:
 
   coverage:
     name: Coverage floors
+    needs: quality
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -164,6 +206,7 @@ jobs:
 
   bench-sentinel:
     name: Bench sentinel (perf-sentinels plans)
+    needs: quality
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
