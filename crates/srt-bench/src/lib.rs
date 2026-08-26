@@ -12,7 +12,15 @@ use std::time::{Duration, Instant};
 pub use srt_transport::is_ordered_close;
 pub mod runtimes;
 
-pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+// Real handshakes over real loopback sockets on a real (often shared, CI)
+// CPU -- 15s left too little headroom under host contention alone, with no
+// protocol issue involved (bonded_smoke.rs's own multi-runtime sweep hit
+// this: one leg fully established and exchanged traffic while its sibling
+// leg's handshake simply never got scheduled in time). Widening this is a
+// pure application-level wait-longer-before-giving-up knob -- it doesn't
+// change when a healthy connection actually finishes, only how long an
+// unhealthy one is given before being counted as failed.
+pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
 
 // --- Shared constants across all bench-caller/bench-listener binaries ---
 
