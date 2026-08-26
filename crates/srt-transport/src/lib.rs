@@ -5959,6 +5959,12 @@ pub struct GroupLegStats {
 /// and retransmissions rather than disguising their network cost.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GroupAggregateStats {
+    /// Physical legs that have completed their individual SRT handshakes and
+    /// are currently eligible for the group's delivery policy. Peers may
+    /// admit these asynchronously (notably a libsrt mirror group), so callers
+    /// that require a particular redundancy level should keep driving the
+    /// group and wait for this count rather than assuming construction makes
+    /// every leg ready.
     pub active_legs: usize,
     pub standby_legs: usize,
     pub pending_legs: usize,
@@ -6108,7 +6114,12 @@ pub struct GroupConn {
 
 impl GroupConn {
     /// Build a group around caller configurations, binding one connected UDP
-    /// socket and initiating one SRT handshake for every supplied leg.
+    /// socket and initiating one SRT handshake for every supplied leg. Every
+    /// leg uses one group-wide initial packet sequence, as required by bonded
+    /// peers such as libsrt. Construction initiates all handshakes but does
+    /// not make every leg active synchronously: keep calling [`Self::drive`]
+    /// and use [`GroupConnectionStats::aggregate`]'s `active_legs` count when
+    /// an application needs full Broadcast redundancy before sending media.
     pub fn caller(
         group: GroupConfig,
         legs: impl IntoIterator<Item = GroupCallerLeg>,
@@ -6116,8 +6127,18 @@ impl GroupConn {
         now: Timestamp,
     ) -> Result<Self, GroupBuildError> {
         let mut raw_legs = Vec::new();
+        let mut shared_initial_seq = None;
         for leg in legs {
             let mut caller = leg.caller;
+            let group_initial_seq = match shared_initial_seq {
+                Some(initial_seq) => initial_seq,
+                None => {
+                    let generated_initial_seq = caller.session.ensure_initial_seq()?;
+                    shared_initial_seq = Some(generated_initial_seq);
+                    generated_initial_seq
+                }
+            };
+            caller.session.connection_options_mut().initial_seq = Some(group_initial_seq);
             caller.session.set_group(Some(GroupConfig {
                 group_id: group.group_id,
                 group_type: group.group_type,
@@ -6264,9 +6285,10 @@ impl GroupConn {
         Ok(report)
     }
 
-    /// Snapshot both physical-leg and logical-group telemetry. Do not replace
-    /// the per-leg rows with the aggregate: loss, RTT, key failures, and path
-    /// health are inherently leg-specific.
+    /// Snapshot both physical-leg and logical-group telemetry. During setup,
+    /// use `aggregate.active_legs` to observe independently completed peer
+    /// handshakes. Do not replace the per-leg rows with the aggregate: loss,
+    /// RTT, key failures, and path health are inherently leg-specific.
     #[must_use]
     pub fn stats(&self) -> GroupConnectionStats {
         group_connection_stats(
@@ -7067,15 +7089,27 @@ pub mod tokio_transport {
         }
 
         /// Build a Tokio-native caller with one connected socket per group
-        /// leg and begin every SRT handshake.
+        /// leg and begin every SRT handshake. Every leg uses one group-wide
+        /// initial packet sequence, as required by bonded peers such as
+        /// libsrt.
         pub fn caller(
             group: crate::GroupConfig,
             legs: impl IntoIterator<Item = GroupCallerLeg>,
             now: Timestamp,
         ) -> Result<Self, GroupBuildError> {
             let mut raw_legs = Vec::new();
+            let mut shared_initial_seq = None;
             for leg in legs {
                 let mut caller = leg.caller;
+                let group_initial_seq = match shared_initial_seq {
+                    Some(initial_seq) => initial_seq,
+                    None => {
+                        let generated_initial_seq = caller.session.ensure_initial_seq()?;
+                        shared_initial_seq = Some(generated_initial_seq);
+                        generated_initial_seq
+                    }
+                };
+                caller.session.connection_options_mut().initial_seq = Some(group_initial_seq);
                 caller.session.set_group(Some(crate::GroupConfig {
                     group_id: group.group_id,
                     group_type: group.group_type,

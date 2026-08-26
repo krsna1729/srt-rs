@@ -795,6 +795,19 @@ impl SessionConfig {
         Ok(options)
     }
 
+    /// Materialize and retain the caller's initial sequence number. Bonded
+    /// callers use this once, then copy it to every physical leg so peers see
+    /// one group-wide sequence space from the handshake onward.
+    pub fn ensure_initial_seq(&mut self) -> Result<u32, ConfigError> {
+        if self.connection.initial_seq.is_none() {
+            self.connection.initial_seq = Some(random_u32("session.initial_seq")? & 0x7fff_ffff);
+        }
+        Ok(self
+            .connection
+            .initial_seq
+            .expect("initial sequence was set"))
+    }
+
     fn clear_owned_secrets(&mut self) {
         if let Some(passphrase) = self.connection.passphrase.as_mut() {
             passphrase.zeroize();
