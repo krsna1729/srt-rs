@@ -334,6 +334,11 @@ impl CryptoContext {
             && self.encrypted_packet_count >= Self::KM_REFRESH_PERIOD - Self::KM_PRE_ANNOUNCE_PERIOD
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_encrypted_packet_count_for_test(&mut self, count: u64) {
+        self.encrypted_packet_count = count;
+    }
+
     /// Whether a key switch is needed (2^25 packets).
     pub fn should_switch_key(&self) -> bool {
         self.km_refresh_state == KmRefreshState::PreAnnounce

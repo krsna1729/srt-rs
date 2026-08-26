@@ -244,12 +244,21 @@ impl SenderBuffer {
     }
 
     /// Record the send time.
+    ///
+    /// The next send is due one full pacing period after this one's actual
+    /// send time — matching libsrt, which stores the actual time at each
+    /// transmission (`m_tsLastSndTime.store(currtime)`, `core.cpp:1131`).
+    ///
+    /// This is the R8 burst fix: the previous slot-arithmetic version
+    /// (`stale_slot + period`) left `last_send_time` in the past after any
+    /// idle gap, so every subsequent call returned 0 and the whole paused
+    /// backlog burst out back-to-back instead of at MAX_BW. Spec §5.1.2
+    /// defines PKT_SND_PERIOD as the *minimum* allowed inter-packet
+    /// interval, which actual-send-time bookkeeping enforces by
+    /// construction.
     pub fn record_send_time(&mut self, now: Timestamp) {
         self.last_send_time = Some(match (self.last_send_time, self.packet_send_period) {
-            (Some(last_time), period) if period > 0 => {
-                Timestamp::from_micros(last_time.as_micros().saturating_add(period))
-            }
-            (None, period) if period > 0 => {
+            (_, period) if period > 0 => {
                 Timestamp::from_micros(now.as_micros().saturating_add(period))
             }
             _ => now,
@@ -909,16 +918,47 @@ mod tests {
     }
 
     #[test]
-    fn test_packet_pacing_catches_up_after_late_wakeup() {
+    fn test_packet_pacing_after_late_wakeup_reschedules_full_period() {
         let mut buf = SenderBuffer::new(1000, 8192, 120);
         buf.set_packet_send_period(1000);
         buf.record_send_time(Timestamp::from_micros(0));
 
+        // A late wakeup (500us past the slot) must not shorten the next
+        // interval: the next send is due a full period after `now`, not
+        // after the stale slot. This is the R8 burst fix - the old
+        // behavior (next slot at slot+period) allowed sub-period spacing
+        // after any gap and, over long idles, unbounded back-to-back
+        // bursts.
         assert!(buf.can_send_with_pacing(Timestamp::from_micros(1500)));
         buf.record_send_time(Timestamp::from_micros(1500));
-        assert!(!buf.can_send_with_pacing(Timestamp::from_micros(1999)));
-        assert_eq!(buf.time_until_send(Timestamp::from_micros(1999)), 1);
-        assert!(buf.can_send_with_pacing(Timestamp::from_micros(2000)));
+        assert!(!buf.can_send_with_pacing(Timestamp::from_micros(2499)));
+        assert_eq!(buf.time_until_send(Timestamp::from_micros(2499)), 1);
+        assert!(buf.can_send_with_pacing(Timestamp::from_micros(2500)));
+    }
+
+    /// Spec §5.1.2: PKT_SND_PERIOD is the minimum inter-packet interval,
+    /// so an idle gap must be repaid at paced rate, not as an instant
+    /// burst. After N periods of silence, exactly one packet may go
+    /// immediately; each further send waits a full period from `now`.
+    #[test]
+    fn test_pacing_no_catch_up_burst_after_idle_gap() {
+        let mut buf = SenderBuffer::new(1000, 8192, 120);
+        buf.set_packet_send_period(1000);
+
+        // Last send at t=0, then 10 periods of silence.
+        buf.record_send_time(Timestamp::from_micros(0));
+        let now = Timestamp::from_micros(10_000);
+
+        assert!(buf.can_send_with_pacing(now));
+        buf.record_send_time(now); // first resumed send
+
+        // The next nine sends are spaced a full period apart - no burst.
+        for expected in 1..=3u64 {
+            let due = 10_000 + expected * 1000;
+            assert!(!buf.can_send_with_pacing(Timestamp::from_micros(due - 1)));
+            assert!(buf.can_send_with_pacing(Timestamp::from_micros(due)));
+            buf.record_send_time(Timestamp::from_micros(due));
+        }
     }
 
     #[test]
