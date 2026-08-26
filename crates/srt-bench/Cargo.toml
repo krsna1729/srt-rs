@@ -7,7 +7,7 @@ license = "Apache-2.0"
 description = "Standalone caller/listener binaries over srt-protocol + std, for interop tests without linking an application crate or libsrt."
 
 [dependencies]
-shiguredo_srt = { path = "../srt-protocol" }
+shiguredo_srt = { path = "../srt-protocol", features = ["test-support"] }
 srt-transport = { path = "../srt-transport", features = ["mio", "tokio", "smol", "monoio", "glommio", "compio", "bench-internals"] }
 # Bond-affinity/worker-routing policy (WorkerRouter): shared canonical
 # implementation for every runtime's reuseport acceptor(s), instead of each

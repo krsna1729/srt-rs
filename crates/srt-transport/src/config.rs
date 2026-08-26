@@ -153,22 +153,57 @@ pub enum Bandwidth {
     ProtocolDefault,
     BytesPerSecond(NonZeroU64),
     BitsPerSecond(NonZeroU64),
+    /// `SRTO_INPUTBW` with `SRTO_OHEADBW`: pace at the known source rate plus
+    /// an allowance for retransmissions. `overhead_percent` must be 5..=100,
+    /// matching libsrt's accepted range.
+    InputBytesPerSecond {
+        input: NonZeroU64,
+        overhead_percent: u8,
+    },
 }
 
 impl Bandwidth {
-    fn as_connection_value(self) -> Option<u64> {
+    fn as_connection_values(self) -> (Option<u64>, Option<u64>, u8) {
         match self {
-            Self::ProtocolDefault => None,
-            Self::BytesPerSecond(value) => Some(value.get()),
-            Self::BitsPerSecond(value) => Some(value.get().div_ceil(8)),
+            Self::ProtocolDefault => (None, None, 25),
+            Self::BytesPerSecond(value) => (Some(value.get()), None, 25),
+            Self::BitsPerSecond(value) => (Some(value.get().div_ceil(8)), None, 25),
+            Self::InputBytesPerSecond {
+                input,
+                overhead_percent,
+            } => (None, Some(input.get()), overhead_percent),
         }
     }
 
-    fn from_connection_value(value: Option<u64>) -> Self {
-        value
+    fn from_connection_values(
+        max_bandwidth_bytes_per_sec: Option<u64>,
+        input_bandwidth_bytes_per_sec: Option<u64>,
+        overhead_bandwidth_percent: u8,
+    ) -> Self {
+        if let Some(value) = max_bandwidth_bytes_per_sec.and_then(NonZeroU64::new) {
+            return Self::BytesPerSecond(value);
+        }
+        input_bandwidth_bytes_per_sec
             .and_then(NonZeroU64::new)
-            .map(Self::BytesPerSecond)
+            .map(|input| Self::InputBytesPerSecond {
+                input,
+                overhead_percent: overhead_bandwidth_percent,
+            })
             .unwrap_or_default()
+    }
+
+    fn validate(self, field: &'static str) -> Result<(), ConfigError> {
+        if let Self::InputBytesPerSecond {
+            overhead_percent, ..
+        } = self
+            && !(5..=100).contains(&overhead_percent)
+        {
+            return Err(ConfigError::new(
+                field,
+                "overhead_percent must be 5 through 100 for libsrt interoperability",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -429,8 +464,11 @@ impl ListenerPeerPolicy {
                 .map_err(|error| ConfigError::new("listener.policy.latency", error.to_string()))?;
         }
         if let PolicyOverride::Set(bandwidth) = self.bandwidth {
+            bandwidth.validate("listener.policy.bandwidth")?;
+            let (max_bandwidth, input_bandwidth, overhead_percent) =
+                bandwidth.as_connection_values();
             connection
-                .set_listener_bandwidth(bandwidth.as_connection_value())
+                .set_listener_bandwidth_options(max_bandwidth, input_bandwidth, overhead_percent)
                 .map_err(|error| {
                     ConfigError::new("listener.policy.bandwidth", error.to_string())
                 })?;
@@ -636,11 +674,18 @@ impl SessionConfig {
 
     #[must_use]
     pub fn bandwidth(&self) -> Bandwidth {
-        Bandwidth::from_connection_value(self.connection.max_bandwidth_bytes_per_sec)
+        Bandwidth::from_connection_values(
+            self.connection.max_bandwidth_bytes_per_sec,
+            self.connection.input_bandwidth_bytes_per_sec,
+            self.connection.overhead_bandwidth_percent,
+        )
     }
 
     pub fn set_bandwidth(&mut self, bandwidth: Bandwidth) -> &mut Self {
-        self.connection.max_bandwidth_bytes_per_sec = bandwidth.as_connection_value();
+        let (max_bandwidth, input_bandwidth, overhead_percent) = bandwidth.as_connection_values();
+        self.connection.max_bandwidth_bytes_per_sec = max_bandwidth;
+        self.connection.input_bandwidth_bytes_per_sec = input_bandwidth;
+        self.connection.overhead_bandwidth_percent = overhead_percent;
         self
     }
 
@@ -705,6 +750,7 @@ impl SessionConfig {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.bandwidth().validate("session.bandwidth")?;
         if self.connection.flow_window_packets == 0 {
             return Err(ConfigError::new(
                 "session.flow_window_packets",
@@ -1999,5 +2045,34 @@ mod tests {
             combined.bandwidth,
             PolicyOverride::Set(Bandwidth::BytesPerSecond(_))
         ));
+    }
+
+    #[test]
+    fn input_bandwidth_materializes_as_source_rate_plus_overhead() {
+        let mut session = SessionConfig::default();
+        let input = NonZeroU64::new(1_000_000).expect("input bandwidth");
+        let configured = Bandwidth::InputBytesPerSecond {
+            input,
+            overhead_percent: 25,
+        };
+        session.set_bandwidth(configured);
+
+        assert_eq!(session.bandwidth(), configured);
+        let options = session.materialized_options().expect("session options");
+        assert_eq!(options.max_bandwidth_bytes_per_sec, None);
+        assert_eq!(options.input_bandwidth_bytes_per_sec, Some(input.get()));
+        assert_eq!(options.overhead_bandwidth_percent, 25);
+    }
+
+    #[test]
+    fn input_bandwidth_rejects_out_of_range_overhead() {
+        let mut session = SessionConfig::default();
+        session.set_bandwidth(Bandwidth::InputBytesPerSecond {
+            input: NonZeroU64::new(1).expect("input bandwidth"),
+            overhead_percent: 101,
+        });
+
+        let error = session.validate().expect_err("invalid overhead");
+        assert_eq!(error.field(), "session.bandwidth");
     }
 }

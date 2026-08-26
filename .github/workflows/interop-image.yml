@@ -6,11 +6,17 @@ on:
     paths:
       - ".github/containers/interop-sid.Dockerfile"
       - ".github/workflows/interop-image.yml"
+      - "crates/srt-bench/tests/**"
+      - "crates/srt-protocol/**"
+      - "crates/srt-transport/**"
   push:
     branches: ["main"]
     paths:
       - ".github/containers/interop-sid.Dockerfile"
       - ".github/workflows/interop-image.yml"
+      - "crates/srt-bench/tests/**"
+      - "crates/srt-protocol/**"
+      - "crates/srt-transport/**"
   schedule:
     # Keep the Debian sid package set current even when the repository is idle.
     - cron: "43 3 * * 1"
@@ -22,7 +28,6 @@ permissions:
 jobs:
   validate:
     name: Build and test image
-    if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -41,12 +46,14 @@ jobs:
           -v "$GITHUB_WORKSPACE:/workspace:ro"
           -w /workspace
           -e CARGO_TARGET_DIR=/tmp/target
+          -e SRT_REQUIRE_BONDING=1
           local/srt-rs-interop-sid:ci
           cargo test -p srt-bench --test libsrt_interop
 
   publish:
     name: Publish ghcr interop image
     if: github.event_name != 'pull_request'
+    needs: validate
     permissions:
       contents: read
       packages: write

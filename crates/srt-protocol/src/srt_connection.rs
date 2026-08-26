@@ -192,6 +192,13 @@ pub struct ConnectionOptions {
     /// uses a default equivalent to libsrt's `BW_INFINITE` (1 Gbps) (see
     /// `srt_sender`'s pacing calculation).
     pub max_bandwidth_bytes_per_sec: Option<u64>,
+    /// Input stream rate (equivalent to `SRTO_INPUTBW`, bytes/sec). When set
+    /// without `max_bandwidth_bytes_per_sec`, pacing includes the configured
+    /// retransmission overhead.
+    pub input_bandwidth_bytes_per_sec: Option<u64>,
+    /// Percentage above input bandwidth reserved for retransmissions
+    /// (equivalent to `SRTO_OHEADBW`; libsrt default: 25).
+    pub overhead_bandwidth_percent: u8,
     /// Flow-control window advertised in the handshake, in packets.
     pub flow_window_packets: u32,
     /// Local receive-buffer capacity, in packets.
@@ -233,6 +240,14 @@ impl fmt::Debug for ConnectionOptions {
                 "max_bandwidth_bytes_per_sec",
                 &self.max_bandwidth_bytes_per_sec,
             )
+            .field(
+                "input_bandwidth_bytes_per_sec",
+                &self.input_bandwidth_bytes_per_sec,
+            )
+            .field(
+                "overhead_bandwidth_percent",
+                &self.overhead_bandwidth_percent,
+            )
             .field("flow_window_packets", &self.flow_window_packets)
             .field("receive_buffer_packets", &self.receive_buffer_packets)
             .field("delivery_queue_packets", &self.delivery_queue_packets)
@@ -256,6 +271,8 @@ impl Default for ConnectionOptions {
             congestion_control: "live".to_string(),
             group_extension: None,
             max_bandwidth_bytes_per_sec: None,
+            input_bandwidth_bytes_per_sec: None,
+            overhead_bandwidth_percent: 25,
             flow_window_packets: DEFAULT_FLOW_WINDOW,
             receive_buffer_packets: DEFAULT_FLOW_WINDOW,
             delivery_queue_packets: DEFAULT_FLOW_WINDOW,
@@ -579,8 +596,29 @@ impl SrtConnection {
         &mut self,
         max_bandwidth_bytes_per_sec: Option<u64>,
     ) -> Result<(), Error> {
+        self.set_listener_bandwidth_options(max_bandwidth_bytes_per_sec, None, 25)
+    }
+
+    /// Override listener pacing from `SRTO_MAXBW`, `SRTO_INPUTBW`, and
+    /// `SRTO_OHEADBW` before CONCLUSION. An explicit maximum takes precedence
+    /// over input-relative pacing, matching libsrt.
+    pub fn set_listener_bandwidth_options(
+        &mut self,
+        max_bandwidth_bytes_per_sec: Option<u64>,
+        input_bandwidth_bytes_per_sec: Option<u64>,
+        overhead_bandwidth_percent: u8,
+    ) -> Result<(), Error> {
         self.ensure_listener_policy_window()?;
+        if input_bandwidth_bytes_per_sec.is_some()
+            && !(5..=100).contains(&overhead_bandwidth_percent)
+        {
+            return Err(Error::invalid_state(
+                "input bandwidth overhead must be 5 through 100 percent",
+            ));
+        }
         self.options.max_bandwidth_bytes_per_sec = max_bandwidth_bytes_per_sec;
+        self.options.input_bandwidth_bytes_per_sec = input_bandwidth_bytes_per_sec;
+        self.options.overhead_bandwidth_percent = overhead_bandwidth_percent;
         Ok(())
     }
 
@@ -698,6 +736,8 @@ impl SrtConnection {
         );
         if let Some(max_bw) = self.options.max_bandwidth_bytes_per_sec {
             sender.set_max_bandwidth(max_bw);
+        } else if let Some(input_bw) = self.options.input_bandwidth_bytes_per_sec {
+            sender.set_input_bandwidth(input_bw, self.options.overhead_bandwidth_percent);
         }
         self.sender = Some(sender);
         let mut receiver = ReceiverBuffer::with_buffer_size(
@@ -1125,6 +1165,22 @@ impl SrtConnection {
         let km_message = KmMessage::new(key_flag, crypto.key_length(), *crypto.salt(), wrapped_key);
         self.send_km_request(&km_message, now);
 
+        Ok(())
+    }
+
+    /// Seed the encrypted-packet count for an accelerated key-refresh test.
+    ///
+    /// This is available only with the opt-in `test-support` feature. It
+    /// permits a black-box peer test to cross the normal refresh boundary
+    /// without transmitting 2²⁵ packets; it does not change production
+    /// refresh timing.
+    #[cfg(feature = "test-support")]
+    pub fn seed_encrypted_packet_count_for_test(&mut self, count: u64) -> Result<(), Error> {
+        let crypto = self
+            .crypto
+            .as_mut()
+            .ok_or_else(|| Error::crypto_error("encryption not enabled"))?;
+        crypto.set_encrypted_packet_count_for_test(count);
         Ok(())
     }
 

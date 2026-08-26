@@ -21,7 +21,7 @@ chunked by srt-live-transmit at 1316 B (3,800 packets).
 | F | libsrt → Rust | live | plain | 2 % | **PASS** — full ARQ recovery, md5 identical (deployment-guide "good network" tier) |
 | G | libsrt → Rust | live | plain | 5 % | **PASS** — md5 identical at latency=500 ms |
 | H | Rust caller → libsrt listener, wrong passphrase | — | AES-128 mismatched | 0 % | **PASS** — libsrt rejects `1010 Incorrect passphrase` (BADSECRET); Rust caller surfaces `HandshakeRejected: reason=10`, does not hang, does not accept plaintext. Positive control with right passphrase connects. |
-| I | StreamID propagation | live | — | 0 % | **PASS** — a Rust caller with a StreamID completes the real-libsrt handshake. Application-level authorization was validated only with the manual listener harness; stock `srt-live-transmit` does not expose an allow-list policy. |
+| I | StreamID propagation and authorization | live | — | 0 % | **PASS** — StreamID completes the real-libsrt handshake; a real libsrt caller is also accepted and rejected by the Rust listener's policy. Stock `srt-live-transmit` does not expose an allow-list policy. |
 
 ### Partial recovery under extreme loss (expected behavior)
 
@@ -51,13 +51,15 @@ lossy single-socket proxy at ~0.9 Mbps input cannot provide.
 
 - Both handshake directions, KMREQ/KMRSP key exchange, AES-128/256 CTR
   payload encryption/decryption, ACK/NAK recovery under real loss, TSBPD
-  delivery ordering, TLPKTDROP bounds, reject-reason propagation, and
-  StreamID propagation all behave correctly against the reference
-  implementation. StreamID authorization remains an application policy and
-  needs a listener harness that exposes that policy.
-- Findings H1 (latency not negotiated to max), H2 (induction magic not
-  validated), M6 (pacing header term) remain valid but did not impede any
-  interop scenario above — both sides defaulted to equal latency here.
+  delivery ordering, TLPKTDROP bounds, reject-reason propagation, StreamID
+  propagation/authorization, and broadcast bonding behave correctly against
+  the reference implementation. StreamID authorization remains an application
+  policy; the interop suite supplies the policy-bearing Rust listener harness.
+- The historical compliance findings mentioned in the original manual notes
+  (latency negotiation, induction validation, and pacing) are fixed; see
+  [`VENDOR.md`](../crates/srt-protocol/VENDOR.md#protocol-compliance-remediation)
+  for their regression evidence. The matching defaults used here are therefore
+  a baseline rather than a limitation.
 
 ## Automation plan: capture these tests in `crates/srt-bench/tests/libsrt_interop.rs`
 
@@ -69,7 +71,7 @@ machines, while CI installs `srt-tools` and runs the suite in its dedicated
 Implemented and verified against the installed libsrt 1.5.3 package:
 
 - libsrt live caller → Rust listener: plain, AES-128, AES-256, byte exact.
-- Rust live caller → libsrt listener: plain and AES-128, byte exact.
+- Rust live caller → libsrt listener: plain, AES-128, and AES-256, byte exact.
 - libsrt file caller → Rust listener: retained as a separate FileCC wire
   check. Debian sid's libsrt 1.5.6 can return non-zero after printing `File
   sent` and `Buffers flushed` when this bounded test listener closes; the test
@@ -86,10 +88,13 @@ Implemented and verified against the installed libsrt 1.5.3 package:
 | A. libsrt→Rust plain live (byte-exact) | ✔ `libsrt_live_transmit_caller_sends_udp_to_rust_listener` | automated |
 | B. Rust caller → libsrt listener | ✔ `rust_live_caller_sends_stream_to_libsrt_listener` | automated |
 | C/D. AES-128 both directions | ✔ two live tests | automated |
-| E. AES-256 forward | ✔ `libsrt_live_caller_aes256_to_rust_listener` | automated |
-| F/G. ARQ recovery under 5 % loss | ✔ `libsrt_caller_recovers_payload_under_5pct_loss` | automated, ignored by default |
+| E. AES-256 both directions | ✔ two live tests | automated |
+| F/G. ARQ recovery under 5 % loss | ✔ `libsrt_caller_recovers_payload_under_5pct_loss` and `rust_caller_recovers_payload_under_5pct_loss` | automated in normal CI, both directions |
+| J. KM refresh | ✔ `rust_live_caller_refreshes_key_with_libsrt_listener` and `libsrt_live_caller_refreshes_key_with_rust_listener` | automated in both directions; each crosses a real new-SEK boundary without a 2²⁵-packet transfer |
 | H. Wrong-passphrase rejection + reason propagation | ✔ `rust_live_caller_wrong_passphrase_is_rejected_by_libsrt_listener` | automated (positive control is the AES-128 reverse-direction test) |
-| I. StreamID propagation | ✔ `rust_live_caller_with_stream_id_connects_to_libsrt_listener` | automated; `srt-live-transmit` has no listener-side authorization hook |
+| I. StreamID propagation and authorization | ✔ propagation plus `libsrt_caller_obeys_rust_stream_id_policy` | automated; real libsrt caller is both accepted and rejected by the Rust listener policy |
+| K. Broadcast bonding | ✔ `libsrt_broadcast_group_interoperates_with_rust_listener` and `rust_broadcast_group_interoperates_with_libsrt_listener` | automated in the bonding-enabled Debian sid image; both group-caller directions establish two physical legs and deliver one logical payload |
+| L. INPUTBW/OHEADBW | ✔ `rust_input_bandwidth_caller_sends_stream_to_libsrt_listener` and `libsrt_input_bandwidth_caller_sends_stream_to_rust_listener` | automated byte-exact live delivery in both directions; the exact source-rate plus overhead pacing calculation is unit-tested |
 
 ### Helper status
 
@@ -101,10 +106,24 @@ Implemented and verified against the installed libsrt 1.5.3 package:
 2. `lossy_udp_proxy_thread` is a std-only, fixed-forward A→B and learned-return
    B→A proxy. It deterministically drops every twentieth DATA packet while
    preserving control traffic, so handshake and NAK behavior stay observable.
-3. `test_payload_bytes(n)` sizes the loss case at 120 KB (120 source packets),
-   enough to exercise several retransmissions without a long runtime.
+3. The loss cases use several 1 KB packets and a trailing marker after the
+   last intentionally dropped packet, so that final loss is observable as a
+   NAK rather than an ambiguous end-of-stream gap.
 4. Binary discovery stays `command_available` on PATH — no build-directory
    probing.
+5. `libsrt_bonded_caller.c` and `libsrt_bonded_listener.c` are intentionally
+   small C fixtures over libsrt's public group API. `srt-live-transmit` exposes `groupconnect`, but its
+   single-client listener closes its accept socket after the first connection,
+   so it cannot serve as the independent two-leg group peer this test needs.
+   Its group-aware listener accepts the mirror group once, after which libsrt
+   attaches later physical legs in the background and the fixture reads the
+   logical stream with `srt_recvmsg2(group_id, ...)`. Its 15-second bounded
+   delivery window accommodates that asynchronous attachment on loaded CI
+   runners. The accepted group is switched to nonblocking receive before
+   polling: libsrt's blocking group receive holds the group lock and would
+   otherwise delay background attachment of the second leg. The fixture then
+   confirms two mirror members before reading; the Rust caller primes once a
+   leg is live and separately proves its two-leg broadcast selection.
 
 ### Loss-recovery gate
 
@@ -114,20 +133,71 @@ byte-exact assertion style, driver-event context in assert messages.
 | Test name | Asserts |
 |---|---|
 | `libsrt_caller_recovers_payload_under_5pct_loss` | proxy at 0.05, negotiated 500 ms latency, byte equality after recovery (F/G) |
+| `rust_caller_recovers_payload_under_5pct_loss` | same proxy and latency in the inverse topology; trailing packet makes the final forced loss NAK-observable |
 
 ### Gating and runtime budget
 
 - The completed negative-encryption and StreamID-propagation cases use the
   same auto-skip gating as the existing tests; each is bounded and the suite
   stays green on machines without libsrt on PATH.
-- The loss test is timing-sensitive under CI load, so it is marked `#[ignore]` with the
-  invocation documented in place
-  (`cargo test -p srt-bench --test libsrt_interop -- --ignored`), keeping
-  standard cargo semantics instead of custom env parsing.
-- Out of scope, recorded here rather than attempted: KM-refresh live check
-  (needs 2²⁵ packets), bonding-group interop (the sample apps expose no
-  usable group-caller mode), and the FileCC direction (`transtype=file`
-  congctl mismatch against this live-only core; see tooling notes above).
+- The loss test uses a deterministic every-twentieth-DATA-packet proxy and is
+  part of the normal interop suite. Its bounded 15-second driver deadline
+  makes a failed recovery diagnostic rather than an unbounded CI delay.
+- The KM-refresh tests exercise both implementations as the refresher: Rust
+  seeds its test-only counter immediately before the normal 2²⁵-packet
+  boundary, while libsrt uses its documented tiny test cadence. Both send real
+  encrypted packets through the peer without changing production timing.
+- Distro `srt-tools` packages expose the group declarations but compile
+  bonding out. The cached Debian sid image rebuilds the current sid source
+  with `ENABLE_BONDING=ON`; its native image-validation workflow sets
+  `SRT_REQUIRE_BONDING=1`, making the group test a required gate rather than
+  a local-machine assumption.
+- A bonded Rust caller becomes media-ready only after a bounded transport
+  `drive` pass promotes completed handshakes into `active_legs`. The native
+  listener independently waits for two *connected* mirror members, then uses
+  the public `SRT_MSGCTRL` member-state array and an `SRT_LIVE_MAX_PLSIZE`
+  receive buffer required by libsrt's live-mode API.
+- FileCC remains out of scope (`transtype=file` congestion-control mismatch
+  against this live-only core; see tooling notes above).
+
+### Local bonding validation without containers
+
+Docker is a CI implementation detail, not a developer prerequisite. The
+shared test is always the same Cargo invocation:
+
+```sh
+cargo test -p srt-bench --test libsrt_interop \
+  broadcast_group_interoperates
+```
+
+With ordinary distro `srt-tools`, that one scenario reports a skip: Ubuntu
+and Debian sid ship the public group declarations but compile the feature out.
+All other interop scenarios remain runnable with the usual `srt-tools`
+installation.
+
+To exercise the bonding scenario locally, install a bonding-enabled libsrt in
+any user-writable prefix; no Docker daemon or root installation is required.
+The only requirements are a C compiler, CMake, the TLS development package
+used by libsrt, and libsrt built with `-DENABLE_BONDING=ON`. For example, from
+an unpacked libsrt source tree:
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -DENABLE_BONDING=ON -DENABLE_TESTING=OFF -DUSE_ENCLIB=openssl-evp
+cmake --build build
+cmake --install build --prefix "$HOME/.local"
+
+export PATH="$HOME/.local/bin:$PATH"
+export CPATH="$HOME/.local/include${CPATH:+:$CPATH}"
+export LIBRARY_PATH="$HOME/.local/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
+export LD_LIBRARY_PATH="$HOME/.local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+SRT_REQUIRE_BONDING=1 cargo test -p srt-bench --test libsrt_interop \
+  libsrt_broadcast_group_interoperates_with_rust_listener -- --exact
+```
+
+`SRT_REQUIRE_BONDING=1` turns the known capability skip into a failure. CI
+uses that same switch in the cached sid image; developers opt into it only
+when they have installed a capable library.
 
 ### Risks / decisions taken
 
@@ -136,14 +206,18 @@ byte-exact assertion style, driver-event context in assert messages.
    tests therefore use the `udp://`-source pattern proven in this session;
    do not reintroduce piped stdin for live sources.
 2. **StreamID authorization**: `srt-live-transmit` accepts any StreamID; its
-   `streamid=` URI option is not an allow-list. Keep authorization coverage in
-   an application-level listener harness rather than asserting a false
-   property of the stock tool.
-3. **Port collisions under parallel test threads**: `free_port()` retains a
-   narrow TOCTOU gap for the caller/listener helpers. The loss proxy itself
-   binds its ephemeral port directly; an allocation race elsewhere fails fast
-   rather than silently connecting the test to a wrong peer.
+   `streamid=` URI option is not an allow-list. The interop suite therefore
+   drives the public Rust `PeerTable` listener policy against a real libsrt
+   caller, verifying both allowed delivery and `UNAUTHORIZED` rejection before
+   `Connected`. The sample tool logs that rejection but exits zero, so the test
+   asserts the wire diagnostic and listener state rather than its exit code.
+3. **External-process scheduling**: Rust-owned endpoints bind `127.0.0.1:0`
+   and retain that socket; black-box listeners retry only an immediate
+   startup failure. Dynamic ports prevent cross-connection, but they do not
+   make libsrt's process-global initialization and teardown independent. The
+   interop binary therefore serializes only its real-libsrt cases; ordinary
+   unit, property, and loom tests remain parallel.
 
-Once implemented: verify both ways — binaries present (full pass) and
-absent (all skipped, zero failures) — then point this document's Results
-table at the automated suite as the reproducible form of the manual run.
+The automated suite is the reproducible form of the manual results. On a
+developer machine without the optional tools and development library, the
+corresponding scenarios skip; the CI image explicitly requires bonding.

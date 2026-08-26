@@ -116,7 +116,14 @@ jobs:
     name: libsrt live interop (Debian sid)
     needs: quality
     runs-on: ubuntu-24.04
-    container: debian:unstable
+    permissions:
+      contents: read
+      packages: read
+    container:
+      image: ghcr.io/${{ github.repository_owner }}/srt-rs-interop-sid:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     timeout-minutes: 20
     env:
       # See the matching image setting: Glommio's bundled liburing needs the
@@ -124,13 +131,6 @@ jobs:
       CFLAGS: -include linux/openat2.h
     steps:
       - uses: actions/checkout@v7
-      - name: Install system dependencies and srt-tools
-        run: |
-          apt-get update
-          apt-get install --yes ca-certificates curl git build-essential clang linux-libc-dev pkg-config srt-tools
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.96.0
       - name: Report libsrt tools version
         run: |
           srt-live-transmit -version

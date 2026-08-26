@@ -222,7 +222,12 @@ impl SrtGroup {
             state,
             connection,
         });
-        self.align_member_sequence(member_id)?;
+        // A pending leg has no sender buffer until its handshake completes.
+        // `refresh_pending_states` aligns it at that transition; attempting
+        // it here would reject a legitimate late-joining group member.
+        if connected {
+            self.align_member_sequence(member_id)?;
+        }
         Ok(())
     }
 
@@ -289,6 +294,17 @@ impl SrtGroup {
                 .first()
                 .is_some_and(|&index| self.members[index].connection.can_send()),
         }
+    }
+
+    /// Refresh member lifecycle labels after an owner has driven each
+    /// underlying connection. This makes completed handshakes visible as
+    /// `Active` or `Standby` without requiring an attempted payload send.
+    ///
+    /// Runtime adapters should call this at the end of each bounded I/O pass;
+    /// applications that drive member connections directly may call it before
+    /// inspecting [`Self::members`].
+    pub fn refresh_member_states(&mut self) {
+        self.refresh_states();
     }
 
     /// Begin an orderly close of every physical member while retaining the
