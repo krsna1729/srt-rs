@@ -195,7 +195,7 @@ jobs:
       - run: cargo llvm-cov clean --workspace
       - name: All-feature runtime adapters (50% lines)
         run: cargo llvm-cov -p srt-transport --all-features --ignore-filename-regex 'srt-protocol|srt-lifecycle' --fail-under-lines 50 --lcov --output-path transport.lcov
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: lcov
           path: |
@@ -248,7 +248,7 @@ jobs:
             }
             END { if (bad) exit 1 }
           ' sentinel.tsv
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: bench-sentinel-tsv
