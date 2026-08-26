@@ -292,6 +292,9 @@ pub struct SrtConnection {
 
     /// Event queue.
     event_queue: VecDeque<ConnectionEvent>,
+    /// Whether the application has already been asked for a new SEK in the
+    /// current refresh cycle. Reset after `provide_new_sek` starts that cycle.
+    key_refresh_notified: bool,
     /// DATA events waiting for application consumption. Control/state events
     /// are state-machine bounded; DATA is the unbounded-rate class.
     pending_data_events: u32,
@@ -403,6 +406,7 @@ impl SrtConnection {
             sender: None,
             receiver: None,
             event_queue: VecDeque::new(),
+            key_refresh_notified: false,
             pending_data_events: 0,
             output_queue: VecDeque::new(),
             start_time: None,
@@ -440,6 +444,7 @@ impl SrtConnection {
             sender: None,
             receiver: None,
             event_queue: VecDeque::new(),
+            key_refresh_notified: false,
             pending_data_events: 0,
             output_queue: VecDeque::new(),
             start_time: None,
@@ -1116,6 +1121,7 @@ impl SrtConnection {
         };
 
         let (key_flag, wrapped_key) = crypto.start_pre_announce(new_sek)?;
+        self.key_refresh_notified = false;
         let km_message = KmMessage::new(key_flag, crypto.key_length(), *crypto.salt(), wrapped_key);
         self.send_km_request(&km_message, now);
 
@@ -1135,11 +1141,12 @@ impl SrtConnection {
     }
 
     fn relative_timestamp(&self, now: Timestamp) -> u32 {
-        // start_time が未設定の場合は明示的に 0 を返す。
-        // ハンドシェイク中の Listener 側では start_time が未設定のまま呼ばれる。
-        // ハンドシェイクパケットのタイムスタンプは INDUCTION リクエストの
-        // hsreq_timestamp から TSBPD 時刻基準を計算するため、レスポンス側の
-        // タイムスタンプが 0 でも TSBPD の動作に影響しない。
+        // Returns 0 only when the session clock has not been stamped yet.
+        // Both handshake roles stamp start_time before sending any response
+        // (see handle_handshake_listener), so responses always carry a real
+        // timestamp: a zero stamp would make the caller's TSBPD time base
+        // (T_NOW − response timestamp) span its entire handshake instead of
+        // ≈RTT_0/2 per spec §4.5.1.1.
         self.start_time
             .map_or(0, |s| now.as_micros().saturating_sub(s.as_micros())) as u32
     }
@@ -1290,7 +1297,15 @@ impl SrtConnection {
             ControlType::Shutdown => self.handle_shutdown(now),
             ControlType::AckAck => self.handle_ackack(pkt, now),
             ControlType::UserDefined => self.handle_user_defined(pkt, now),
-            _ => Ok(()), // その他は無視
+            // This is a live-only core. PEERERROR is FileCC-only and
+            // CongestionWarning is reserved by the specification. DROPREQ
+            // requires TTL-driven multi-packet message delivery, which this
+            // API intentionally does not expose yet. Keep them decoded for
+            // wire compatibility, but do not give the false impression that
+            // they affect live delivery.
+            ControlType::CongestionWarning | ControlType::DropReq | ControlType::PeerError => {
+                Ok(())
+            }
         }
     }
 
@@ -1499,7 +1514,13 @@ impl SrtConnection {
                     self.handshake_retry_sequence = 0;
                 }
 
-                // INDUCTION レスポンス送信
+                // Stamp the session clock before responding so the
+                // INDUCTION response carries a real timestamp (see the
+                // CONCLUSION arm for why a zero stamp breaks the caller's
+                // TSBPD time base).
+                if self.start_time.is_none() {
+                    self.start_time = Some(now);
+                }
                 self.send_induction_response(now);
                 self.handshake_state = HandshakeState::InductionReceived;
                 self.arm_handshake_timer(now);
@@ -1564,12 +1585,18 @@ impl SrtConnection {
                     ));
                 }
 
-                // CONCLUSION レスポンス送信
+                // The session clock was stamped at INDUCTION (first
+                // contact); the CONCLUSION response therefore carries the
+                // listener's true session-relative timestamp. The caller
+                // computes its TSBPD time base from this packet's timestamp
+                // (spec §4.5.1.1: TsbpdTimeBase = T_NOW − HSREQ_TIMESTAMP,
+                // ≈ RTT_0/2). Overwriting start_time here would zero the
+                // stamp again and inflate the caller's time base to its
+                // entire handshake duration.
                 self.send_conclusion_response(now);
                 self.handshake_state = HandshakeState::Completed;
                 self.handshake_started_at = None;
                 self.set_state(ConnectionState::Connected);
-                self.start_time = Some(now);
 
                 // TSBPD 時刻基準を計算
                 let tsbpd_time_base = now.as_micros().saturating_sub(hsreq_timestamp as u64);
@@ -1746,6 +1773,11 @@ impl SrtConnection {
 
                     // Send a KMRSP.
                     self.send_km_response(&km, now);
+                } else {
+                    // A refresh KMREQ on an unencrypted connection cannot
+                    // succeed. Reply immediately rather than leaving the
+                    // peer to wait for its own timeout (spec §3.2.1.2).
+                    self.send_km_error_response(KmError::NoSecret, now);
                 }
             }
             SRT_CMD_KMRSP => {
@@ -1768,12 +1800,13 @@ impl SrtConnection {
             return;
         };
 
-        if crypto.should_pre_announce() {
+        if crypto.should_pre_announce() && !self.key_refresh_notified {
             // Notify the outside world that a new SEK is needed.
             self.event_queue
                 .push_back(ConnectionEvent::KeyRefreshNeeded {
                     key_length: crypto.key_length().len(),
                 });
+            self.key_refresh_notified = true;
         }
 
         // Check whether a key switch is needed.
@@ -1820,6 +1853,24 @@ impl SrtConnection {
             control_info: km_message.encode(),
         };
 
+        let mut buf = Vec::new();
+        pkt.encode(&mut buf);
+        self.queue_packet(buf, now);
+    }
+
+    /// Send a KM refresh error response (KMRSP with its four-byte state).
+    fn send_km_error_response(&mut self, error: KmError, now: Timestamp) {
+        const SRT_CMD_KMRSP: u16 = 4;
+        let mut control_info = Vec::with_capacity(4);
+        write_u32(&mut control_info, error as u32);
+        let pkt = ControlPacket {
+            control_type: ControlType::UserDefined,
+            subtype: SRT_CMD_KMRSP,
+            type_specific_info: 0,
+            timestamp: self.relative_timestamp(now),
+            dest_socket_id: self.peer_socket_id,
+            control_info,
+        };
         let mut buf = Vec::new();
         pkt.encode(&mut buf);
         self.queue_packet(buf, now);
@@ -2380,6 +2431,11 @@ mod tests {
     use super::*;
     use crate::{GroupType, SRTGROUP_MASK};
 
+    /// Deterministic, non-secret KM salt for protocol test fixtures.
+    fn test_km_salt() -> [u8; 16] {
+        std::array::from_fn(|index| index as u8)
+    }
+
     #[test]
     fn test_connection_options_default() {
         let opts = ConnectionOptions::default();
@@ -2396,6 +2452,80 @@ mod tests {
         let conn = SrtConnection::new_caller(ConnectionOptions::default());
         assert_eq!(conn.state(), ConnectionState::Disconnected);
         assert_eq!(conn.role, ConnectionRole::Caller);
+    }
+
+    #[test]
+    fn key_refresh_needed_is_emitted_once_until_sek_is_provided() {
+        let mut conn = SrtConnection::new_caller(ConnectionOptions::default());
+        let mut crypto = CryptoContext::new_sender(
+            "test passphrase",
+            KeyLength::Aes128,
+            test_km_salt(),
+            &[0x24; 16],
+        )
+        .expect("valid sender crypto");
+        crypto.set_encrypted_packet_count_for_test(
+            CryptoContext::KM_REFRESH_PERIOD - CryptoContext::KM_PRE_ANNOUNCE_PERIOD,
+        );
+        conn.crypto = Some(crypto);
+
+        conn.check_km_refresh(Timestamp::from_micros(1));
+        conn.check_km_refresh(Timestamp::from_micros(2));
+        assert_eq!(
+            conn.event_queue
+                .iter()
+                .filter(|event| matches!(event, ConnectionEvent::KeyRefreshNeeded { .. }))
+                .count(),
+            1,
+            "the threshold must notify the application once, not once per send"
+        );
+
+        conn.provide_new_sek(&[0x25; 16], Timestamp::from_micros(3))
+            .expect("application supplies the requested SEK");
+        assert!(
+            !conn.key_refresh_notified,
+            "starting the refresh cycle releases the latch for the next cycle"
+        );
+    }
+
+    #[test]
+    fn refresh_kmreq_without_crypto_gets_nosecret_response() {
+        let mut conn = SrtConnection::new_caller(ConnectionOptions::default());
+        conn.peer_socket_id = 0x2000_0002;
+        let request = KmMessage::new(
+            KeyFlag::Even,
+            KeyLength::Aes128,
+            test_km_salt(),
+            vec![0x24; 24],
+        );
+
+        conn.handle_user_defined(
+            ControlPacket {
+                control_type: ControlType::UserDefined,
+                subtype: 3,
+                type_specific_info: 0,
+                timestamp: 0,
+                dest_socket_id: 0,
+                control_info: request.encode(),
+            },
+            Timestamp::from_micros(1),
+        )
+        .expect("unsecured refresh KMREQ is answered");
+
+        let Some(ConnectionOutput::SendPacket(bytes)) = conn.poll_output() else {
+            panic!("KMRSP NOSECRET is queued");
+        };
+        let SrtPacket::Control(response) = SrtPacket::decode(&bytes).expect("valid response")
+        else {
+            panic!("response is a control packet");
+        };
+        assert_eq!(response.control_type, ControlType::UserDefined);
+        assert_eq!(response.subtype, 4, "KMRSP subtype");
+        assert_eq!(response.dest_socket_id, 0x2000_0002);
+        assert_eq!(
+            response.control_info,
+            (KmError::NoSecret as u32).to_be_bytes()
+        );
     }
 
     #[test]

@@ -95,7 +95,8 @@ const WRAPPING_PERIOD_START: u64 = MAX_TIMESTAMP - 30_000_000;
 /// TSBPD wraparound period: ends once the timestamp is within this range.
 const WRAPPING_PERIOD_END_MIN: u64 = 30_000_000;
 
-/// TSBPD wraparound period: the upper bound (exclusive) at which the timestamp ends the period.
+/// TSBPD wraparound period: the inclusive upper bound at which the timestamp
+/// ends the period, matching libsrt's `CTsbpdTime::updateBaseTime`.
 const WRAPPING_PERIOD_END_MAX: u64 = 60_000_000;
 
 /// Tracks ACK send times and acknowledged positions (for RTT calculation
@@ -834,10 +835,12 @@ impl ReceiverBuffer {
 
         // Detect the end of the TSBPD wraparound period.
         // Per spec (draft-sharabayko-srt.md, #tsbpd-time-base section):
-        // "ends once the packet with timestamp within (30, 60) seconds interval is delivered"
+        // "ends once the packet with timestamp within (30, 60) seconds interval is delivered".
+        // libsrt treats the upper endpoint as inclusive, which we mirror for
+        // trace-level compatibility.
         if self.tsbpd_enabled && self.wrapping_period_active {
             let ts = entry.packet.timestamp as u64;
-            if (WRAPPING_PERIOD_END_MIN..WRAPPING_PERIOD_END_MAX).contains(&ts) {
+            if (WRAPPING_PERIOD_END_MIN..=WRAPPING_PERIOD_END_MAX).contains(&ts) {
                 self.tsbpd_time_base += MAX_TIMESTAMP + 1;
                 self.wrapping_period_active = false;
             }
@@ -2359,6 +2362,31 @@ mod tests {
         assert!(
             !buf.wrapping_period_active,
             "終了判定が発火し wrapping_period_active が false になるはず"
+        );
+    }
+
+    #[test]
+    fn wrapping_period_ends_at_libsrt_inclusive_upper_boundary() {
+        let start = Timestamp::from_micros(0);
+        let mut buf = ReceiverBuffer::new(1000, 120, start, 0);
+        let now = Timestamp::from_micros(1_000_000);
+        buf.receive(make_packet(1000, WRAPPING_PERIOD_START as u32), now);
+        buf.receive(make_packet(1001, WRAPPING_PERIOD_END_MAX as u32), now);
+
+        // The wrapped 60-second packet is deliverable after its adjusted
+        // timestamp plus the configured TSBPD delay.
+        let late = Timestamp::from_micros(MAX_TIMESTAMP + 1 + WRAPPING_PERIOD_END_MAX + 120_000);
+        assert_eq!(
+            buf.pop_ready(late).map(|packet| packet.sequence_number),
+            Some(1000)
+        );
+        assert_eq!(
+            buf.pop_ready(late).map(|packet| packet.sequence_number),
+            Some(1001)
+        );
+        assert!(
+            !buf.wrapping_period_active,
+            "the 60-second endpoint closes the wrapping period"
         );
     }
 
