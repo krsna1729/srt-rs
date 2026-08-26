@@ -21,7 +21,7 @@ chunked by srt-live-transmit at 1316 B (3,800 packets).
 | F | libsrt → Rust | live | plain | 2 % | **PASS** — full ARQ recovery, md5 identical (deployment-guide "good network" tier) |
 | G | libsrt → Rust | live | plain | 5 % | **PASS** — md5 identical at latency=500 ms |
 | H | Rust caller → libsrt listener, wrong passphrase | — | AES-128 mismatched | 0 % | **PASS** — libsrt rejects `1010 Incorrect passphrase` (BADSECRET); Rust caller surfaces `HandshakeRejected: reason=10`, does not hang, does not accept plaintext. Positive control with right passphrase connects. |
-| I | StreamID access control: libsrt listener requires `streamid=mypass/stream1` | — | — | 0 % | **PASS** — correct SID connects; wrong SID never completes (libsrt ignores unknown-SID callers) |
+| I | StreamID propagation | live | — | 0 % | **PASS** — a Rust caller with a StreamID completes the real-libsrt handshake. Application-level authorization was validated only with the manual listener harness; stock `srt-live-transmit` does not expose an allow-list policy. |
 
 ### Partial recovery under extreme loss (expected behavior)
 
@@ -52,8 +52,9 @@ lossy single-socket proxy at ~0.9 Mbps input cannot provide.
 - Both handshake directions, KMREQ/KMRSP key exchange, AES-128/256 CTR
   payload encryption/decryption, ACK/NAK recovery under real loss, TSBPD
   delivery ordering, TLPKTDROP bounds, reject-reason propagation, and
-  StreamID-based admission all behave correctly against the reference
-  implementation.
+  StreamID propagation all behave correctly against the reference
+  implementation. StreamID authorization remains an application policy and
+  needs a listener harness that exposes that policy.
 - Findings H1 (latency not negotiated to max), H2 (induction magic not
   validated), M6 (pacing header term) remain valid but did not impede any
   interop scenario above — both sides defaulted to equal latency here.
@@ -70,7 +71,10 @@ Implemented and verified against the installed libsrt 1.5.3 package:
 - libsrt live caller → Rust listener: plain, AES-128, AES-256, byte exact.
 - Rust live caller → libsrt listener: plain and AES-128, byte exact.
 - libsrt file caller → Rust listener: retained as a separate FileCC wire
-  check.
+  check. Debian sid's libsrt 1.5.6 can return non-zero after printing `File
+  sent` and `Buffers flushed` when this bounded test listener closes; the test
+  therefore requires byte-exact received data and those completion markers
+  before accepting that version-specific exit status.
 - The live caller uses a loopback UDP source rather than `file://con`:
   `srt-live-transmit` cannot reliably poll piped stdin in this environment.
   Each child has an explicit timeout plus a bounded reaping path.
@@ -83,49 +87,40 @@ Implemented and verified against the installed libsrt 1.5.3 package:
 | B. Rust caller → libsrt listener | ✔ `rust_live_caller_sends_stream_to_libsrt_listener` | automated |
 | C/D. AES-128 both directions | ✔ two live tests | automated |
 | E. AES-256 forward | ✔ `libsrt_live_caller_aes256_to_rust_listener` | automated |
-| F/G. ARQ recovery under 2 %/5 % loss | ✖ | new (proxy) |
-| H. Wrong-passphrase rejection + reason propagation | ✖ | new (+positive control) |
-| I. StreamID accept / wrong-SID | ✖ | new ×2 |
+| F/G. ARQ recovery under 5 % loss | ✔ `libsrt_caller_recovers_payload_under_5pct_loss` | automated, ignored by default |
+| H. Wrong-passphrase rejection + reason propagation | ✔ `rust_live_caller_wrong_passphrase_is_rejected_by_libsrt_listener` | automated (positive control is the AES-128 reverse-direction test) |
+| I. StreamID propagation | ✔ `rust_live_caller_with_stream_id_connects_to_libsrt_listener` | automated; `srt-live-transmit` has no listener-side authorization hook |
 
-### Shared-helper extensions
+### Helper status
 
-1. **Generalize `receive_from_libsrt_caller`**: add optional
-   `ConnectionOptions` overrides — `passphrase`, `key_length` — appended to
-   the caller URI as `&passphrase=…&pbkeylen=16|24|32`. Existing two call
-   sites unchanged (new params defaulted).
-2. **New helper `send_to_libsrt_listener`** (mirror image): spawns
-   `srt-live-transmit -q "srt://:<port>?mode=listener[&passphrase=…]"
-   file://con > out_file`, drives a Rust *caller* through a caller-side loop
-   (connect → paced sends → collect events). `driver::run` cannot pace sends
-   from `on_connect` without blocking its recv loop, so this is a ~60-line
-   sibling modeled on the probe-caller used in the manual session. Returns
-   `(connected, libsrt_stdout_bytes, stderr)`.
-3. **New helper `lossy_udp_proxy_thread(listen, forward_to, loss_rate)`**:
-   std-only thread, two bound sockets, fixed-forward A→B and learned-return
-   B→A, seeded PRNG for determinism. Replaces the ad-hoc python proxy; no
-   tokio needed.
-4. **Payload sizing**: add `test_payload_bytes(n)`; loss tests use ~400 KB
-   (≈300 packets) so recovery is exercised without 30-second runtimes.
-5. Binary discovery stays `command_available` on PATH — no build-directory
+1. `send_to_libsrt_listener` is the mirror-image helper: it starts a real
+   `srt-live-transmit` listener and drives a Rust caller through
+   `srt_bench::driver`. Independent caller/listener encryption options make
+   the wrong-passphrase assertion possible; the caller also accepts a
+   StreamID.
+2. `lossy_udp_proxy_thread` is a std-only, fixed-forward A→B and learned-return
+   B→A proxy. It deterministically drops every twentieth DATA packet while
+   preserving control traffic, so handshake and NAK behavior stay observable.
+3. `test_payload_bytes(n)` sizes the loss case at 120 KB (120 source packets),
+   enough to exercise several retransmissions without a long runtime.
+4. Binary discovery stays `command_available` on PATH — no build-directory
    probing.
 
-### Remaining tests (4)
+### Loss-recovery gate
 
 All follow existing conventions: skip-with-note when prereqs are missing,
 byte-exact assertion style, driver-event context in assert messages.
 
-| # | Test name | Asserts |
-|---|---|---|
-| 1 | `rust_caller_wrong_passphrase_rejected_with_reason` | driver event contains `reason=10` (BADSECRET), `connected == false`; plus positive-control right-passphrase connect in the same test (H) |
-| 2 | `rust_caller_stream_id_accepted_by_libsrt_listener` | connected with matching `streamid` (I-accept) |
-| 3 | `rust_caller_wrong_stream_id_never_connects` | `!connected` within bounded deadline, no panic (I-reject) |
-| 4 | `libsrt_caller_recovers_payload_under_5pct_loss` | proxy at 0.05, latency=250 ms, byte equality after recovery (F/G) |
+| Test name | Asserts |
+|---|---|
+| `libsrt_caller_recovers_payload_under_5pct_loss` | proxy at 0.05, negotiated 500 ms latency, byte equality after recovery (F/G) |
 
 ### Gating and runtime budget
 
-- Tests 1–3: same auto-skip gating as existing; each ≤ ~15 s. The suite
+- The completed negative-encryption and StreamID-propagation cases use the
+  same auto-skip gating as the existing tests; each is bounded and the suite
   stays green on machines without libsrt on PATH.
-- Test 8 (loss): timing-sensitive under CI load — mark `#[ignore]` with the
+- The loss test is timing-sensitive under CI load, so it is marked `#[ignore]` with the
   invocation documented in place
   (`cargo test -p srt-bench --test libsrt_interop -- --ignored`), keeping
   standard cargo semantics instead of custom env parsing.
@@ -140,11 +135,14 @@ byte-exact assertion style, driver-event context in assert messages.
    poll" when piping stdin to `srt-live-transmit`. The implemented forward
    tests therefore use the `udp://`-source pattern proven in this session;
    do not reintroduce piped stdin for live sources.
-2. **Negative-timeout asserts** (wrong-SID "never connects") stay short
-   (≤10 s) so skip-laden local runs stay fast.
-3. **Port collisions under parallel test threads**: `free_port()` has a
-   TOCTOU gap; the loss test binds three ports up-front and passes handles
-   into the proxy thread to close the race.
+2. **StreamID authorization**: `srt-live-transmit` accepts any StreamID; its
+   `streamid=` URI option is not an allow-list. Keep authorization coverage in
+   an application-level listener harness rather than asserting a false
+   property of the stock tool.
+3. **Port collisions under parallel test threads**: `free_port()` retains a
+   narrow TOCTOU gap for the caller/listener helpers. The loss proxy itself
+   binds its ephemeral port directly; an allocation race elsewhere fails fast
+   rather than silently connecting the test to a wrong peer.
 
 Once implemented: verify both ways — binaries present (full pass) and
 absent (all skipped, zero failures) — then point this document's Results
