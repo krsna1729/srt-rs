@@ -14,6 +14,7 @@ root [README](../../README.md) and [SECURITY.md](../../SECURITY.md).
 - [Provenance](#provenance)
 - [What was trimmed from the upstream tree](#what-was-trimmed-from-the-upstream-tree)
 - [Local patches](#local-patches)
+- [Protocol compliance remediation](#protocol-compliance-remediation)
 - [Intentional compatibility differences](#intentional-compatibility-differences)
 - [Documentation language](#documentation-language)
 - [Crypto backend: pure-Rust RustCrypto stack, not aws-lc-rs](#crypto-backend-pure-rust-rustcrypto-stack-not-aws-lc-rs)
@@ -145,6 +146,28 @@ encrypted callers emit different handshake material, explicit zero SEKs are
 rejected, and secret-bearing configuration is redacted. All tests across the crate (unit +
 integration + property-based + doctests) pass after these patches —
 verified via `cargo test -p shiguredo_srt` and `cargo test -p pbt`.
+
+## Protocol compliance remediation
+
+The completed line-by-line protocol review is summarized here as durable local
+patch guidance. The executable cross-implementation scenarios are in
+[`docs/live-interop-validation.md`](../../docs/live-interop-validation.md).
+
+| Area | Local behavior and regression evidence |
+|---|---|
+| Handshake negotiation and admission | Conclusion handling takes the maximum local/peer TSBPD proposal and gates optional live features on mutually advertised flags. A caller rejects a non-SRT-magic or non-v5 induction response. GROUP is emitted only in CONCLUSION; unknown group types round-trip to policy instead of being erased. Covered by `handshake_negotiates_the_larger_latency_for_both_peers`, `caller_rejects_induction_response_without_srt_magic`, `caller_rejects_legacy_induction_response`, and handshake wire tests. |
+| TSBPD timing | The receiver has a libsrt-style drift tracer; a listener stamps its session clock before handshake responses, so the caller derives the correct time base. The 60-second wrap endpoint follows libsrt's inclusive boundary. Covered by drift, `listener_conclusion_response_carries_session_timestamp`, and `wrapping_period_ends_at_libsrt_inclusive_upper_boundary` tests. |
+| ACK/NAK and shutdown lifecycle | Full ACK numbers start at one. An ACKACK suppresses periodic ACKs only after confirming the latest Full ACK, including reordered ACKACK protection; the receiver still reports a reopened buffer window. Oversized loss reports are clamped, local disconnect flushes ready TSBPD data, and Closing retransmits SHUTDOWN within its bounded timeout. Covered by receiver, close-state, parser, and property tests. |
+| Sender pacing and idle traffic | Packet pacing accounts for the 16-byte SRT header and schedules the next send from the actual send time, preventing an idle backlog from bursting. `INPUTBW` plus `OHEADBW` support maps a known source rate and 5–100% retransmission allowance to the effective pacing ceiling; explicit `MAXBW` retains libsrt precedence. Keepalives require outbound idleness. Covered by `test_packet_pacing_includes_srt_header_bytes`, `test_pacing_no_catch_up_burst_after_idle_gap`, `input_bandwidth_reserves_configured_overhead_for_retransmission`, and real-libsrt live interop. |
+| Key refresh | `KeyRefreshNeeded` is emitted once per refresh cycle and rearmed only after `provide_new_sek` begins pre-announcement. A refresh KMREQ without a local crypto context receives `KMRSP(NOSECRET)` immediately. Covered by `key_refresh_needed_is_emitted_once_until_sek_is_provided` and `refresh_kmreq_without_crypto_gets_nosecret_response`. The draft-vs-libsrt refresh cadence remains the intentional difference documented below. |
+| Bonded group admission | A pending group leg is retained until its handshake creates the sender buffer, then aligned when it becomes active; adding a late caller leg to an already active group no longer fails prematurely. Covered by `late_pending_member_waits_for_handshake_before_sequence_alignment` and two-way real-libsrt broadcast interop in `libsrt_broadcast_group_interoperates_with_rust_listener` and `rust_broadcast_group_interoperates_with_libsrt_listener`. |
+| Explicit live-only scope | `DROPREQ`, `PEERERROR`, and congestion warnings decode but do not affect the live-only API: TTL-driven, multi-packet message delivery and FileCC are not exposed. Rendezvous remains unsupported; caller/listener is the supported topology. This is deliberate scope, not silent packet-decoding loss. |
+
+Future changes in these areas require the focused protocol suite, property
+suite, transport/lifecycle suites where applicable, and the dedicated libsrt
+interop suite. If an upstream subtree pull supplies equivalent behavior,
+retain the regression tests and replace the local implementation rather than
+silently dropping the compatibility guarantee.
 
 **Why patch locally instead of waiting for upstream:** this code carries real
 stream encryption. All three are

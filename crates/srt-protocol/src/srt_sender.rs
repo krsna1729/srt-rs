@@ -312,6 +312,16 @@ impl SenderBuffer {
         self.recompute_packet_send_period();
     }
 
+    /// Set source-relative pacing from `SRTO_INPUTBW` and `SRTO_OHEADBW`.
+    /// The explicit maximum-bandwidth mode takes precedence at connection
+    /// setup; this method is used only when no maximum is configured.
+    pub fn set_input_bandwidth(&mut self, input_bytes_per_sec: u64, overhead_percent: u8) {
+        self.max_bandwidth_bytes_per_sec =
+            input_bytes_per_sec.saturating_mul(100 + u64::from(overhead_percent)) / 100;
+        self.packet_send_period_overridden = false;
+        self.recompute_packet_send_period();
+    }
+
     /// Update the moving average of the sent payload size (equivalent to
     /// libsrt's `LiveCC::updatePayloadSize`; called on every real send).
     fn record_sent_payload_size(&mut self, size: usize) {
@@ -969,6 +979,17 @@ mod tests {
 
         assert!(buf.time_until_send(Timestamp::from_micros(735)) > 0);
         assert_eq!(buf.time_until_send(Timestamp::from_micros(736)), 0);
+    }
+
+    #[test]
+    fn input_bandwidth_reserves_configured_overhead_for_retransmission() {
+        let mut buf = SenderBuffer::new(1000, 8192, 120);
+        buf.set_input_bandwidth(1_000_000, 25);
+
+        assert_eq!(buf.stats().max_bandwidth_bytes_per_second, 1_250_000);
+        buf.record_send_time(Timestamp::from_micros(0));
+        assert!(buf.time_until_send(Timestamp::from_micros(1177)) > 0);
+        assert_eq!(buf.time_until_send(Timestamp::from_micros(1178)), 0);
     }
 
     #[test]

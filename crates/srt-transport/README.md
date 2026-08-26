@@ -192,6 +192,12 @@ session.set_latency(Duration::from_millis(120))?;
 session.set_bandwidth(Bandwidth::BitsPerSecond(
     NonZeroU64::new(100_000_000).unwrap(),
 ));
+// For a source with a known production rate, replace the fixed ceiling above
+// with input-relative pacing (libsrt's INPUTBW plus OHEADBW):
+// session.set_bandwidth(Bandwidth::InputBytesPerSecond {
+//     input: NonZeroU64::new(8_000_000).unwrap(),
+//     overhead_percent: 25,
+// });
 session.set_encryption(Some(EncryptionConfig::new("production secret")));
 session.set_stream_id(Some("publish/live".to_owned()));
 
@@ -218,6 +224,9 @@ let runtime_listener = srt_transport::tokio_transport::bind_listener(&listener)?
 let mut peers = runtime_listener.prepared.peer_table();
 let admission = runtime_listener.prepared.admission_options();
 ```
+
+Input-relative overhead must be 5 through 100 percent. `ProtocolDefault` and
+the `BytesPerSecond`/`BitsPerSecond` variants retain fixed `MAXBW` behavior.
 
 ### Per-StreamID listener policy
 

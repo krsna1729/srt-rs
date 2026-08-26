@@ -366,3 +366,20 @@ fn pending_member_becomes_active_after_handshake() {
     group.send(b"activated", ts(100_000)).unwrap();
     assert_eq!(group.member(1).unwrap().state(), GroupMemberState::Active);
 }
+
+#[test]
+fn late_pending_member_waits_for_handshake_before_sequence_alignment() {
+    let (active, _) = establish_pair();
+    let pending = SrtConnection::new_caller(ConnectionOptions {
+        tsbpd_delay: 0,
+        ..Default::default()
+    });
+    let mut group = SrtGroup::new(0x4000_0017, GroupMode::Broadcast).unwrap();
+    group.add_member(1, 1, active).unwrap();
+
+    // A newly added caller has no sender buffer until its handshake completes.
+    // Adding it to an already active group must retain it as Pending rather
+    // than attempting sequence alignment against that absent buffer.
+    group.add_member(2, 1, pending).unwrap();
+    assert_eq!(group.member(2).unwrap().state(), GroupMemberState::Pending);
+}

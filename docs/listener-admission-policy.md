@@ -214,7 +214,8 @@ typed `AdmissionResolution`; it must not feed the datagram itself, retain the
 connection reference, or perform unbounded work.
 
 At the protocol layer, `set_listener_encryption`, `set_listener_latency`,
-`set_listener_bandwidth`, `set_listener_flow_control`,
+`set_listener_bandwidth` (or `set_listener_bandwidth_options` for
+input-relative pacing), `set_listener_flow_control`,
 `set_listener_group_extension`, and the combined `set_listener_policy` are the
 supported raw controls. Applications are not forced through the facade, but
 the facade remains the safer default because it validates typed units,

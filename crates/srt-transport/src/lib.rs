@@ -6252,36 +6252,39 @@ impl GroupConn {
         let mut report = GroupDriveReport {
             legs: Vec::with_capacity(self.legs.len()),
         };
-        let (group, legs) = (&mut self.group, &mut self.legs);
-        for leg in legs {
-            let member = group
-                .member_mut(leg.member_id)
-                .expect("group and I/O legs are built together");
-            let conn = member.connection_mut();
-            leg.timers.fire_expired(now, conn);
+        {
+            let (group, legs) = (&mut self.group, &mut self.legs);
+            for leg in legs {
+                let member = group
+                    .member_mut(leg.member_id)
+                    .expect("group and I/O legs are built together");
+                let conn = member.connection_mut();
+                leg.timers.fire_expired(now, conn);
 
-            let mut received_datagrams = 0;
-            let mut buffer = [0_u8; 65_536];
-            for _ in 0..64 {
-                match leg.socket.recv(&mut buffer) {
-                    Ok(size) => {
-                        received_datagrams += 1;
-                        conn.feed_recv_buf(&buffer[..size], now).map_err(|error| {
-                            std::io::Error::new(std::io::ErrorKind::InvalidData, error)
-                        })?;
+                let mut received_datagrams = 0;
+                let mut buffer = [0_u8; 65_536];
+                for _ in 0..64 {
+                    match leg.socket.recv(&mut buffer) {
+                        Ok(size) => {
+                            received_datagrams += 1;
+                            conn.feed_recv_buf(&buffer[..size], now).map_err(|error| {
+                                std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                            })?;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(error) => return Err(error),
                     }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(error) => return Err(error),
                 }
-            }
 
-            let output = drain_group_leg_outputs(conn, leg, now, output_budget)?;
-            report.legs.push(GroupLegDriveReport {
-                member_id: leg.member_id,
-                received_datagrams,
-                output,
-            });
+                let output = drain_group_leg_outputs(conn, leg, now, output_budget)?;
+                report.legs.push(GroupLegDriveReport {
+                    member_id: leg.member_id,
+                    received_datagrams,
+                    output,
+                });
+            }
         }
+        self.group.refresh_member_states();
         Ok(report)
     }
 
@@ -6479,6 +6482,11 @@ mod group_conn_tests {
                     .all(|member| member.connection().state()
                         == shiguredo_srt::ConnectionState::Connected),
                 "{runtime:?} group did not connect"
+            );
+            assert_eq!(
+                conn.stats().aggregate.active_legs,
+                2,
+                "{runtime:?} group driver did not promote connected legs"
             );
 
             assert_eq!(
@@ -7190,36 +7198,39 @@ pub mod tokio_transport {
             let mut report = GroupDriveReport {
                 legs: Vec::with_capacity(self.legs.len()),
             };
-            let (group, legs) = (&mut self.group, &mut self.legs);
-            for leg in legs {
-                let member = group
-                    .member_mut(leg.member_id)
-                    .expect("group and I/O legs are built together");
-                let conn = member.connection_mut();
-                leg.timers.fire_expired(now, conn);
+            {
+                let (group, legs) = (&mut self.group, &mut self.legs);
+                for leg in legs {
+                    let member = group
+                        .member_mut(leg.member_id)
+                        .expect("group and I/O legs are built together");
+                    let conn = member.connection_mut();
+                    leg.timers.fire_expired(now, conn);
 
-                let mut received_datagrams = 0;
-                let mut buffer = [0_u8; 65_536];
-                for _ in 0..64 {
-                    match leg.socket.try_recv(&mut buffer) {
-                        Ok(size) => {
-                            received_datagrams += 1;
-                            conn.feed_recv_buf(&buffer[..size], now).map_err(|error| {
-                                io::Error::new(io::ErrorKind::InvalidData, error)
-                            })?;
+                    let mut received_datagrams = 0;
+                    let mut buffer = [0_u8; 65_536];
+                    for _ in 0..64 {
+                        match leg.socket.try_recv(&mut buffer) {
+                            Ok(size) => {
+                                received_datagrams += 1;
+                                conn.feed_recv_buf(&buffer[..size], now).map_err(|error| {
+                                    io::Error::new(io::ErrorKind::InvalidData, error)
+                                })?;
+                            }
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                            Err(error) => return Err(error),
                         }
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                        Err(error) => return Err(error),
                     }
-                }
 
-                let output = drain_group_leg_outputs(conn, leg, now, output_budget)?;
-                report.legs.push(GroupLegDriveReport {
-                    member_id: leg.member_id,
-                    received_datagrams,
-                    output,
-                });
+                    let output = drain_group_leg_outputs(conn, leg, now, output_budget)?;
+                    report.legs.push(GroupLegDriveReport {
+                        member_id: leg.member_id,
+                        received_datagrams,
+                        output,
+                    });
+                }
             }
+            self.group.refresh_member_states();
             Ok(report)
         }
 
