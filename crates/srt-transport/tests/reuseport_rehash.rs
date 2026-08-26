@@ -51,31 +51,38 @@ fn drain_all(listeners: &[UdpSocket]) {
     }
 }
 
-/// Send one datagram on `flow` and report which listener the kernel
-/// delivered it to. `None` means nobody got it (dropped, or still in
-/// flight past our patience).
-fn probe(flow: &UdpSocket, listeners: &[UdpSocket]) -> Option<usize> {
-    if flow.send(b"probe").is_err() {
-        return None;
-    }
-    // Loopback delivery is essentially immediate, but the sockets are
-    // non-blocking, so poll briefly rather than assuming it has landed.
-    for _ in 0..50 {
-        let mut buf = [0u8; 128];
-        for (index, listener) in listeners.iter().enumerate() {
-            if listener.recv_from(&mut buf).is_ok() {
-                return Some(index);
-            }
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    None
-}
-
 /// Establish where each flow currently lands.
 fn map_homes(flows: &[UdpSocket], listeners: &[UdpSocket]) -> Vec<Option<usize>> {
     drain_all(listeners);
-    flows.iter().map(|f| probe(f, listeners)).collect()
+    for (flow_id, flow) in flows.iter().enumerate() {
+        flow.send(&(flow_id as u64).to_le_bytes())
+            .expect("send flow probe");
+    }
+
+    // Collect the complete batch instead of attributing the next arriving
+    // datagram to whichever probe happens to be in progress. Under a loaded
+    // runner, a delayed probe from flow N can otherwise be mistaken for the
+    // just-sent probe for flow N+1, manufacturing a kernel "reroute".
+    let mut homes = vec![None; flows.len()];
+    for _ in 0..50 {
+        let mut buf = [0u8; 128];
+        for (listener_id, listener) in listeners.iter().enumerate() {
+            while let Ok((length, _)) = listener.recv_from(&mut buf) {
+                if length != std::mem::size_of::<u64>() {
+                    continue;
+                }
+                let flow_id = u64::from_le_bytes(buf[..8].try_into().expect("probe length"));
+                if let Some(home) = homes.get_mut(flow_id as usize) {
+                    *home = Some(listener_id);
+                }
+            }
+        }
+        if homes.iter().all(Option::is_some) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    homes
 }
 
 /// Count how many flows land somewhere other than where they used to.
