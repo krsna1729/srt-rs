@@ -1327,3 +1327,37 @@ fn test_dropped_packet_triggers_nak_then_retransmit() {
     assert_eq!(receiver.total_naks_sent, 2);
     assert_eq!(receiver.total_lost, 1);
 }
+
+#[test]
+fn default_socket_id_zero_is_auto_assigned_nonzero() {
+    let options = ConnectionOptions::default();
+    assert_eq!(
+        options.socket_id, 0,
+        "default should be zero before normalization"
+    );
+
+    let caller = SrtConnection::new_caller(ConnectionOptions::default());
+    let listener = SrtConnection::new_listener(ConnectionOptions::default());
+
+    assert_ne!(caller.socket_id(), 0, "caller socket_id must be nonzero");
+    assert_ne!(
+        listener.socket_id(),
+        0,
+        "listener socket_id must be nonzero"
+    );
+    assert_ne!(
+        caller.socket_id(),
+        listener.socket_id(),
+        "independently created connections should get distinct socket IDs"
+    );
+}
+
+#[test]
+fn explicit_socket_id_is_preserved() {
+    let options = ConnectionOptions {
+        socket_id: 0x42,
+        ..Default::default()
+    };
+    let caller = SrtConnection::new_caller(options);
+    assert_eq!(caller.socket_id(), 0x42);
+}
