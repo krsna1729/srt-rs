@@ -20,7 +20,7 @@ chunked by srt-live-transmit at 1316 B (3,800 packets).
 | E | libsrt → Rust | live | AES-256 | 0 % | **PASS** — md5 identical |
 | F | libsrt → Rust | live | plain | 2 % | **PASS** — full ARQ recovery, md5 identical (deployment-guide "good network" tier) |
 | G | libsrt → Rust | live | plain | 5 % | **PASS** — md5 identical at latency=500 ms |
-| H | Rust caller → libsrt listener, wrong passphrase | — | AES-128 mismatched | 0 % | **PASS** — libsrt rejects `1010 Incorrect passphrase` (BADSECRET); Rust caller surfaces `HandshakeRejected: reason=10`, does not hang, does not accept plaintext. Positive control with right passphrase connects. |
+| H | Wrong passphrase, both caller/listener directions | — | AES-128 mismatched | 0 % | **PASS** — each listener rejects BADSECRET before application data; the Rust caller surfaces libsrt's reason 10 and the libsrt caller decodes the Rust KMRSP as `BADSECRET`. Positive controls with the right passphrase connect. |
 | I | StreamID propagation and authorization | live | — | 0 % | **PASS** — StreamID completes the real-libsrt handshake; a real libsrt caller is also accepted and rejected by the Rust listener's policy. Stock `srt-live-transmit` does not expose an allow-list policy. |
 
 ### Partial recovery under extreme loss (expected behavior)
@@ -91,7 +91,7 @@ Implemented and verified against the installed libsrt 1.5.3 package:
 | E. AES-256 both directions | ✔ two live tests | automated |
 | F/G. ARQ recovery under 5 % loss | ✔ `libsrt_caller_recovers_payload_under_5pct_loss` and `rust_caller_recovers_payload_under_5pct_loss` | automated in normal CI, both directions |
 | J. KM refresh | ✔ `rust_live_caller_refreshes_key_with_libsrt_listener` and `libsrt_live_caller_refreshes_key_with_rust_listener` | automated in both directions; each crosses a real new-SEK boundary without a 2²⁵-packet transfer |
-| H. Wrong-passphrase rejection + reason propagation | ✔ `rust_live_caller_wrong_passphrase_is_rejected_by_libsrt_listener` | automated (positive control is the AES-128 reverse-direction test) |
+| H. Wrong-passphrase rejection + reason propagation | ✔ `rust_live_caller_wrong_passphrase_is_rejected_by_libsrt_listener` and `libsrt_live_caller_wrong_passphrase_is_rejected_by_rust_listener` | automated in both directions (matching-passphrase AES-128 tests are the positive controls) |
 | I. StreamID propagation and authorization | ✔ propagation plus `libsrt_caller_obeys_rust_stream_id_policy` | automated; real libsrt caller is both accepted and rejected by the Rust listener policy |
 | K. Broadcast bonding | ✔ `libsrt_broadcast_group_interoperates_with_rust_listener` and `rust_broadcast_group_interoperates_with_libsrt_listener` | automated in the bonding-enabled Debian sid image; both group-caller directions establish two physical legs and deliver one logical payload |
 | L. INPUTBW/OHEADBW | ✔ `rust_input_bandwidth_caller_sends_stream_to_libsrt_listener` and `libsrt_input_bandwidth_caller_sends_stream_to_rust_listener` | automated byte-exact live delivery in both directions; the exact source-rate plus overhead pacing calculation is unit-tested |

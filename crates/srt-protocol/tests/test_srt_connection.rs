@@ -382,7 +382,7 @@ fn listener_encryption_mismatches_fail_closed_with_km_errors() {
         (
             Some("caller-wrong-secret".to_owned()),
             Some("listener-right-secret".to_owned()),
-            ErrorKind::CryptoError,
+            ErrorKind::HandshakeRejected,
             "peer has wrong secret",
         ),
     ];
