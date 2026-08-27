@@ -151,9 +151,6 @@ fn spawn_driver(
         .register(&mut socket, Token(token), Interest::READABLE)
         .expect("register socket");
 
-    let group_extension = (cfg.mode == crate::Mode::Sender)
-        .then(|| cfg.bond_extension_for(i))
-        .flatten();
     let mut options = ConnectionOptions {
         socket_id: if cfg.mode == crate::Mode::Sender {
             cfg.caller_socket_id_for(i)
@@ -165,13 +162,6 @@ fn spawn_driver(
             crate::Mode::Sender => Some(cfg.bitrate_bps / 8),
             crate::Mode::Receiver => None,
         },
-        group_extension,
-        initial_seq: (cfg.mode == crate::Mode::Sender)
-            .then(|| cfg.bond_initial_seq_for(i))
-            .flatten(),
-        stream_id: (cfg.mode == crate::Mode::Sender)
-            .then(|| cfg.bond_stream_id_for(i))
-            .flatten(),
         ..Default::default()
     };
     cfg.encryption.apply_to(&mut options);

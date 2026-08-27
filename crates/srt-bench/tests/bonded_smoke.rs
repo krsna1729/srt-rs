@@ -130,7 +130,7 @@ fn smoke_once(runtime: &str, mode: &str, encryption: &str, egress: &str) -> Resu
 fn bond_axis_forms_one_logical_broadcast_stream() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     for runtime in ["mio", "tokio", "smol", "monoio", "glommio", "compio"] {
-        smoke(runtime, "broadcast", "plain", "per-connection");
+        smoke(runtime, "broadcast", "plain", "shared-socket");
     }
 }
 
@@ -138,15 +138,6 @@ fn bond_axis_forms_one_logical_broadcast_stream() {
 fn bond_axis_forms_one_logical_encrypted_backup_stream() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     for runtime in ["mio", "tokio", "smol", "monoio", "glommio", "compio"] {
-        smoke(runtime, "backup", "256", "per-connection");
-    }
-}
-
-#[test]
-fn shared_egress_uses_logical_broadcast_and_backup_callers_on_every_runtime() {
-    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    for runtime in ["mio", "tokio", "smol", "monoio", "glommio", "compio"] {
-        smoke(runtime, "broadcast", "plain", "shared-socket");
         smoke(runtime, "backup", "256", "shared-socket");
     }
 }

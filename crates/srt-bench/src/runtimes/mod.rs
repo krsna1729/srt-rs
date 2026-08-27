@@ -136,6 +136,10 @@ pub fn ingress_supported(runtime: Runtime, ingress: crate::Ingress) -> bool {
 }
 
 pub fn run(cfg: BenchConfig) {
+    if let Err(error) = cfg.validate_bond_topology() {
+        eprintln!("srt-bench: {error}");
+        std::process::exit(2);
+    }
     // Receivers are what bind; a sender just dials whatever the topology
     // says, so it needs no capability of its own.
     if cfg.mode == crate::Mode::Receiver
