@@ -1,5 +1,5 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
     "crates/srt-protocol",
     "crates/srt-protocol/pbt",
@@ -8,6 +8,15 @@ members = [
     "crates/srt-bench",
 ]
 exclude = ["crates/srt-protocol/fuzz"]
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+cognitive_complexity = "warn"
+undocumented_unsafe_blocks = "deny"
 
 # Benchmark-grade release settings. srt-bench's whole purpose is
 # measuring runtime and strategy differences, so the numbers have to come

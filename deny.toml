@@ -14,6 +14,8 @@ targets = [
 ]
 
 [advisories]
+# Catch any new unsoundness advisory in the dependency graph immediately.
+unsound = "all"
 # These two advisories are confined to optional runtime adapters in the
 # unpublished benchmark/transport crates. Neither is reachable from the
 # published `shiguredo_srt` crate. There is no compatible fixed release:
@@ -21,8 +23,14 @@ targets = [
 # current monoio release. Review dates and replacement criteria are tracked in
 # docs/dependency-exceptions.md; CI still fails on every other advisory.
 ignore = [
-    "RUSTSEC-2026-0247", # bitmaps via glommio 0.9
-    "RUSTSEC-2025-0057", # fxhash via monoio 0.2.4
+    # UNSOUND: bitmaps 3.2 TryFrom<&[u8]> creates invalid bool (UB in safe
+    # code). Crate archived, no patched version. Transitive via glommio 0.9
+    # internal allocator; community fork still carries it.
+    "RUSTSEC-2025-0167",
+    # UNMAINTAINED: bitmaps (same crate, separate unmaintained notice).
+    "RUSTSEC-2026-0247",
+    # UNMAINTAINED: fxhash via monoio 0.2.4. No memory-safety defect.
+    "RUSTSEC-2025-0057",
 ]
 
 [licenses]

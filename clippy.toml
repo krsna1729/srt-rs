@@ -1,0 +1,11 @@
+cognitive-complexity-threshold = 15
+
+doc-valid-idents = [
+    "GitHub",
+    "RustSec",
+    "SRT",
+    "StreamID",
+    "TSBPD",
+    "TLPKTDROP",
+    "ACKACK",
+]

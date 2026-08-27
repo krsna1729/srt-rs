@@ -45,3 +45,6 @@ monoio = { version = "0.2", features = ["sync"] }
 # #[cfg(target_os = "linux")] in glommio_*.rs's main(), see there.
 glommio = "0.9"
 compio = { version = "0.19", features = ["io", "io-uring", "net", "runtime", "time", "macros"] }
+
+[lints]
+workspace = true

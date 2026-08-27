@@ -75,3 +75,6 @@ harness = false
 [[bench]]
 name = "group_requalification"
 harness = false
+
+[lints]
+workspace = true

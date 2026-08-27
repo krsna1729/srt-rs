@@ -60,5 +60,5 @@ glommio = ["dep:glommio", "dep:futures-lite", "dep:socket2_glommio"]
 compio = ["dep:compio"]
 bench-internals = []
 
-[lints.clippy]
-undocumented_unsafe_blocks = "deny"
+[lints]
+workspace = true
