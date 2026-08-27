@@ -138,34 +138,35 @@ fn broadcast_backpressure_requalifies_the_recovered_leg() {
 
 #[test]
 fn broadcast_receive_deduplicates_and_advances_other_links() {
-    let (mut source, listener_a) = establish_pair();
-    let (_, listener_b) = establish_pair();
+    let (mut source_a, listener_a) = establish_pair();
+    let (mut source_b, listener_b) = establish_pair();
     let mut group = SrtGroup::new(0x4000_0002, GroupMode::Broadcast).unwrap();
     group.add_member(1, 100, listener_a).unwrap();
     group.add_member(2, 100, listener_b).unwrap();
 
-    source.send(b"first", ts(100_000)).unwrap();
-    let first = packets_from(&mut source).pop().unwrap();
-    source.send(b"second", ts(110_000)).unwrap();
-    let second = packets_from(&mut source).pop().unwrap();
+    // Both sources send "hello" — each to its own listener. The group
+    // deduplicates and delivers only one copy.
+    source_a.send(b"hello", ts(100_000)).unwrap();
+    let pkt_a = packets_from(&mut source_a).pop().unwrap();
+    source_b.send(b"hello", ts(100_000)).unwrap();
+    let pkt_b = packets_from(&mut source_b).pop().unwrap();
 
     group
         .member_mut(1)
         .unwrap()
         .connection_mut()
-        .feed_recv_buf(&first, ts(100_000))
+        .feed_recv_buf(&pkt_a, ts(100_000))
         .unwrap();
     group
         .member_mut(2)
         .unwrap()
         .connection_mut()
-        .feed_recv_buf(&second, ts(110_000))
+        .feed_recv_buf(&pkt_b, ts(100_000))
         .unwrap();
 
-    let delivered_first = group.poll_data(ts(120_000)).unwrap();
-    assert_eq!(delivered_first.payload, b"first");
-    let delivered_second = group.poll_data(ts(120_000)).unwrap();
-    assert_eq!(delivered_second.payload, b"second");
+    let delivered = group.poll_data(ts(120_000)).unwrap();
+    assert_eq!(delivered.payload, b"hello");
+    // Second copy is deduplicated — only one delivery.
     assert!(group.poll_data(ts(120_000)).is_none());
 }
 

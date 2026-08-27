@@ -157,7 +157,7 @@ pub enum ConnectionOutput {
 /// Connection options.
 #[derive(Clone)]
 pub struct ConnectionOptions {
-    /// Local socket ID.
+    /// Local socket ID. Zero means auto-assign a random nonzero value.
     pub socket_id: u32,
     /// Initial sequence number.
     pub initial_seq: Option<u32>,
@@ -355,7 +355,21 @@ impl Drop for SrtConnection {
     }
 }
 
+fn random_nonzero_socket_id() -> u32 {
+    let mut buf = [0u8; 4];
+    if getrandom::fill(&mut buf).is_ok() {
+        let id = u32::from_ne_bytes(buf);
+        if id != 0 {
+            return id;
+        }
+    }
+    std::process::id() | 1
+}
+
 fn normalize_buffer_options(mut options: ConnectionOptions) -> ConnectionOptions {
+    if options.socket_id == 0 {
+        options.socket_id = random_nonzero_socket_id();
+    }
     options.flow_window_packets = options.flow_window_packets.max(MIN_FLOW_WINDOW_PACKETS);
     options.receive_buffer_packets = options
         .receive_buffer_packets
