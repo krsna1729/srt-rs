@@ -2031,3 +2031,180 @@ fn peer_entropy(peer: std::net::SocketAddr) -> u32 {
 fn half_open_timeout_micros(timeout: Duration) -> u64 {
     u64::try_from(timeout.as_micros()).unwrap_or(u64::MAX)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn induction_packet(socket_id: u32) -> Vec<u8> {
+        let packet = shiguredo_srt::HandshakePacket::new_induction_request(socket_id).encode(0, 0);
+        let mut bytes = Vec::new();
+        packet.encode(&mut bytes);
+        bytes
+    }
+
+    fn default_options() -> AdmissionOptions {
+        AdmissionOptions::basic(1, 120, false)
+    }
+
+    proptest! {
+        #[test]
+        fn capacity_limits_never_exceeded(
+            max_peers in 2..16usize,
+            max_half_open in 1..8usize,
+            peer_count in 1..32u16,
+        ) {
+            let config = PeerTableConfig {
+                max_peers,
+                max_half_open_peers: max_half_open,
+                max_established_peers: max_peers,
+                max_peers_per_ip: max_peers,
+                half_open_timeout: Duration::from_secs(60),
+            };
+            let mut table = PeerTable::with_config(config);
+            let telemetry = IngressTelemetry::new();
+            let options = default_options();
+
+            for i in 0..peer_count {
+                let peer = std::net::SocketAddr::from(([10, 0, (i >> 8) as u8, i as u8], 5000));
+                let packet = induction_packet(100 + u32::from(i));
+                table.admit(
+                    peer,
+                    &packet,
+                    Timestamp::from_micros(u64::from(i) * 1000),
+                    &options,
+                    0,
+                    1,
+                    &telemetry,
+                );
+
+                let effective_max = config.max_peers.max(1);
+                let effective_half_open = config.max_half_open_peers.max(1).min(effective_max);
+                prop_assert!(
+                    table.len() <= effective_max,
+                    "total peers {} > max {}",
+                    table.len(),
+                    effective_max,
+                );
+                prop_assert!(
+                    table.half_open_count() <= effective_half_open,
+                    "half-open {} > max {}",
+                    table.half_open_count(),
+                    effective_half_open,
+                );
+            }
+        }
+
+        #[test]
+        fn per_ip_limit_enforced(
+            max_per_ip in 1..4usize,
+            attempts in 1..16u16,
+        ) {
+            let config = PeerTableConfig {
+                max_peers: 64,
+                max_half_open_peers: 64,
+                max_established_peers: 64,
+                max_peers_per_ip: max_per_ip,
+                half_open_timeout: Duration::from_secs(60),
+            };
+            let mut table = PeerTable::with_config(config);
+            let telemetry = IngressTelemetry::new();
+            let options = default_options();
+
+            let mut admitted = 0usize;
+            for i in 0..attempts {
+                let peer = std::net::SocketAddr::from(([127, 0, 0, 1], 5000 + i));
+                let packet = induction_packet(200 + u32::from(i));
+                let result = table.admit(
+                    peer,
+                    &packet,
+                    Timestamp::from_micros(u64::from(i) * 1000),
+                    &options,
+                    0,
+                    1,
+                    &telemetry,
+                );
+                if !matches!(result, Admit::Dropped(_)) {
+                    admitted += 1;
+                }
+            }
+            let effective_limit = max_per_ip.max(1);
+            prop_assert!(
+                admitted <= effective_limit,
+                "admitted {} from one IP > limit {}",
+                admitted,
+                effective_limit,
+            );
+        }
+    }
+
+    #[test]
+    fn half_open_expiry_frees_slots() {
+        let config = PeerTableConfig {
+            max_peers: 4,
+            max_half_open_peers: 2,
+            max_established_peers: 4,
+            max_peers_per_ip: 4,
+            half_open_timeout: Duration::from_millis(100),
+        };
+        let mut table = PeerTable::with_config(config);
+        let telemetry = IngressTelemetry::new();
+        let options = default_options();
+
+        let peer_a = "10.0.0.1:5000".parse().unwrap();
+        let peer_b = "10.0.0.2:5000".parse().unwrap();
+        let peer_c = "10.0.0.3:5000".parse().unwrap();
+
+        table.admit(
+            peer_a,
+            &induction_packet(1),
+            Timestamp::from_micros(0),
+            &options,
+            0,
+            1,
+            &telemetry,
+        );
+        table.admit(
+            peer_b,
+            &induction_packet(2),
+            Timestamp::from_micros(0),
+            &options,
+            0,
+            1,
+            &telemetry,
+        );
+        assert_eq!(table.half_open_count(), 2);
+
+        let result = table.admit(
+            peer_c,
+            &induction_packet(3),
+            Timestamp::from_micros(0),
+            &options,
+            0,
+            1,
+            &telemetry,
+        );
+        assert!(matches!(
+            result,
+            Admit::Dropped(AdmissionDropReason::HalfOpenCapacity)
+        ));
+
+        let result = table.admit(
+            peer_c,
+            &induction_packet(3),
+            Timestamp::from_micros(200_000),
+            &options,
+            0,
+            1,
+            &telemetry,
+        );
+        assert!(
+            !matches!(
+                result,
+                Admit::Dropped(AdmissionDropReason::HalfOpenCapacity)
+            ),
+            "after expiry, peer_c should be admitted"
+        );
+    }
+}
