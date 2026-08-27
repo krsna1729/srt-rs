@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! Runtime-neutral SRT admission and worker-affinity policy.
 //!
 //! This crate deliberately stops at the lifecycle boundary. It owns the

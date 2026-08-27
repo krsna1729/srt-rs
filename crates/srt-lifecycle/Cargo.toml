@@ -17,5 +17,5 @@ shiguredo_srt = { version = "=2026.1.0-canary.1", path = "../srt-protocol" }
 [dev-dependencies]
 proptest = "1.11"
 
-[lints.rust]
-unsafe_code = "forbid"
+[lints]
+workspace = true
