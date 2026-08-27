@@ -264,3 +264,86 @@ unsafe fn sockaddr_to_addr(
         u16::from_be(addr.sin_port),
     )))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recvmsg_batch_empty_is_noop() {
+        assert_eq!(recvmsg_batch(-1, &mut [], &mut [], &mut []).unwrap(), 0);
+    }
+
+    #[test]
+    fn recvmsg_batch_rejects_mismatched_lengths() {
+        let mut bufs = vec![vec![0u8; 64]];
+        let mut sizes = [0usize; 2];
+        let mut addrs = [None; 1];
+        let err = recvmsg_batch(-1, &mut bufs, &mut sizes, &mut addrs).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn sockaddr_to_addr_rejects_wrong_family() {
+        // SAFETY: all-zero is a valid uninitialized sockaddr_storage.
+        let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        storage.ss_family = libc::AF_INET6 as u16;
+        // SAFETY: storage is initialized with a known family; testing the
+        // rejection path.
+        let result =
+            unsafe { sockaddr_to_addr(&storage, std::mem::size_of::<libc::sockaddr_in>() as u32) };
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn sockaddr_to_addr_rejects_short_len() {
+        // SAFETY: all-zero is a valid uninitialized sockaddr_storage.
+        let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        storage.ss_family = libc::AF_INET as u16;
+        // SAFETY: storage is initialized; testing the short-length rejection.
+        let result = unsafe { sockaddr_to_addr(&storage, 2) };
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn sockaddr_to_addr_parses_valid_ipv4() {
+        // SAFETY: all-zero is a valid uninitialized sockaddr_storage.
+        let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        // SAFETY: sockaddr_storage is layout-compatible with sockaddr_in when
+        // the family is AF_INET; we fill every field before reading.
+        let addr = unsafe {
+            &mut *(&mut storage as *mut libc::sockaddr_storage as *mut libc::sockaddr_in)
+        };
+        addr.sin_family = libc::AF_INET as u16;
+        addr.sin_port = 8080u16.to_be();
+        addr.sin_addr.s_addr = u32::from(net::Ipv4Addr::new(192, 168, 1, 42)).to_be();
+        // SAFETY: storage was filled as a valid AF_INET sockaddr_in above.
+        let result =
+            unsafe { sockaddr_to_addr(&storage, std::mem::size_of::<libc::sockaddr_in>() as u32) };
+        assert_eq!(
+            result,
+            Some(net::SocketAddr::from(([192, 168, 1, 42], 8080)))
+        );
+    }
+
+    #[test]
+    fn set_sock_bufs_zero_is_noop() {
+        assert!(set_sock_bufs(-1, 0).is_ok());
+    }
+
+    #[test]
+    fn set_sock_bufs_rejects_oversized() {
+        let err = set_sock_bufs(-1, usize::MAX).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn bind_reuseport_returns_nonblocking_socket() {
+        let sock = bind_reuseport(0, 0).expect("bind to ephemeral port");
+        assert!(sock.local_addr().is_ok());
+        assert!(
+            sock.set_nonblocking(true).is_ok(),
+            "socket should already be nonblocking"
+        );
+    }
+}
