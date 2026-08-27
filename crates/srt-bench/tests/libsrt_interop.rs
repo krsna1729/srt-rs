@@ -296,7 +296,8 @@ fn lossy_udp_proxy_thread(
 
 fn receive_live_from_udp_source(
     payload: &[u8],
-    encryption: Option<(&str, KeyLength)>,
+    caller_encryption: Option<(&str, KeyLength)>,
+    listener_encryption: Option<(&str, KeyLength)>,
     drop_every: Option<u32>,
     output_options: Option<&str>,
 ) -> (driver::DriverResult, ExitStatus, String) {
@@ -319,7 +320,7 @@ fn receive_live_from_udp_source(
     });
     let output_port = proxy.as_ref().map_or(port, |(addr, _)| addr.port());
     let loss_recovery = proxy.is_some();
-    let mut output_uri = match encryption {
+    let mut output_uri = match caller_encryption {
         Some((passphrase, key_length)) => format!(
             "srt://127.0.0.1:{output_port}?passphrase={passphrase}&pbkeylen={}",
             key_length.len()
@@ -398,8 +399,8 @@ fn receive_live_from_udp_source(
     let mut conn = SrtConnection::new_listener(ConnectionOptions {
         socket_id: 0x2000_0001,
         congestion_control: "live".to_string(),
-        passphrase: encryption.map(|(passphrase, _)| passphrase.to_string()),
-        key_length: encryption.map_or(KeyLength::Aes128, |(_, key_length)| key_length),
+        passphrase: listener_encryption.map(|(passphrase, _)| passphrase.to_string()),
+        key_length: listener_encryption.map_or(KeyLength::Aes128, |(_, key_length)| key_length),
         tsbpd_delay: if loss_recovery { 500 } else { 120 },
         ..Default::default()
     });
@@ -766,7 +767,7 @@ fn libsrt_live_transmit_caller_sends_udp_to_rust_listener() {
 
     let payload = test_payload();
 
-    let (result, status, stderr) = receive_live_from_udp_source(&payload, None, None, None);
+    let (result, status, stderr) = receive_live_from_udp_source(&payload, None, None, None, None);
 
     assert!(
         result.connected,
@@ -804,6 +805,7 @@ fn libsrt_input_bandwidth_caller_sends_stream_to_rust_listener() {
         &payload,
         None,
         None,
+        None,
         Some("maxbw=0&inputbw=1000000&oheadbw=25"),
     );
     assert!(
@@ -832,6 +834,7 @@ fn libsrt_live_caller_refreshes_key_with_rust_listener() {
     let payload = test_payload_bytes(4_000);
     let (result, status, stderr) = receive_live_from_udp_source(
         &payload,
+        Some(("interop-passphrase", KeyLength::Aes128)),
         Some(("interop-passphrase", KeyLength::Aes128)),
         None,
         Some("kmrefreshrate=8&kmpreannounce=3"),
@@ -866,7 +869,8 @@ fn libsrt_caller_recovers_payload_under_5pct_loss() {
     }
 
     let payload = test_payload_bytes(120_000);
-    let (result, status, stderr) = receive_live_from_udp_source(&payload, None, Some(20), None);
+    let (result, status, stderr) =
+        receive_live_from_udp_source(&payload, None, None, Some(20), None);
     assert!(
         result.connected,
         "Rust listener never reached Connected through the lossy proxy: {:?}",
@@ -897,6 +901,7 @@ fn libsrt_live_caller_aes128_to_rust_listener() {
     let payload = test_payload();
     let (result, status, stderr) = receive_live_from_udp_source(
         &payload,
+        Some(("interop-passphrase", KeyLength::Aes128)),
         Some(("interop-passphrase", KeyLength::Aes128)),
         None,
         None,
@@ -929,6 +934,7 @@ fn libsrt_live_caller_aes256_to_rust_listener() {
     let (result, status, stderr) = receive_live_from_udp_source(
         &payload,
         Some(("interop-passphrase", KeyLength::Aes256)),
+        Some(("interop-passphrase", KeyLength::Aes256)),
         None,
         None,
     );
@@ -943,6 +949,49 @@ fn libsrt_live_caller_aes256_to_rust_listener() {
         received, payload,
         "AES-256 payload mismatch: {:?}",
         result.events
+    );
+}
+
+/// The inverse wrong-passphrase path: a real libsrt caller must receive the
+/// Rust listener's BADSECRET response and no application data may be admitted.
+#[test]
+fn libsrt_live_caller_wrong_passphrase_is_rejected_by_rust_listener() {
+    let _guard = interop_test_lock();
+    if !command_available("srt-live-transmit") {
+        eprintln!(
+            "skipping libsrt_live_caller_wrong_passphrase_is_rejected_by_rust_listener: srt-live-transmit not on PATH"
+        );
+        return;
+    }
+
+    let (result, _status, stderr) = receive_live_from_udp_source(
+        b"must never be delivered",
+        Some(("wrong-interop-passphrase", KeyLength::Aes128)),
+        Some(("interop-passphrase", KeyLength::Aes128)),
+        None,
+        None,
+    );
+
+    assert!(
+        !result.connected,
+        "libsrt caller unexpectedly connected with a wrong passphrase: {:?}; libsrt stderr: {stderr}",
+        result.events
+    );
+    assert!(
+        result.received_payloads.is_empty(),
+        "Rust listener admitted data after rejecting the passphrase"
+    );
+    assert!(
+        result
+            .events
+            .iter()
+            .any(|event| event.contains("incorrect passphrase")),
+        "Rust listener did not report the passphrase rejection: {:?}; libsrt stderr: {stderr}",
+        result.events
+    );
+    assert!(
+        stderr.contains("BADSECRET") || stderr.contains("Incorrect passphrase"),
+        "libsrt did not decode the Rust KMRSP as BADSECRET: {stderr}"
     );
 }
 

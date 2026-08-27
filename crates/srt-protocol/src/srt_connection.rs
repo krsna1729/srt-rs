@@ -1626,9 +1626,12 @@ impl SrtConnection {
                         km.key_length,
                     ) {
                         Ok(crypto) => crypto,
-                        Err(error) => {
-                            self.fail_listener_km(now, KmError::BadSecret, &error.reason);
-                            return Err(error);
+                        Err(_) => {
+                            return Err(self.fail_listener_km(
+                                now,
+                                KmError::BadSecret,
+                                "incorrect passphrase or invalid key material",
+                            ));
                         }
                     };
                     self.crypto = Some(crypto);

@@ -616,11 +616,12 @@ impl HandshakePacket {
 
     /// Add a KMRSP error extension (failure).
     pub fn add_km_error(&mut self, error: KmError) {
-        let mut data = Vec::new();
-        write_u32(&mut data, error as u32);
         self.extensions.push(HandshakeExtension {
             ext_type: ExtensionType::KmRsp,
-            data,
+            // libsrt copies SRT_KM_STATE into the KM payload as a native
+            // 32-bit word before the handshake codec performs its own word
+            // swapping. The resulting extension bytes are little-endian.
+            data: (error as u32).to_le_bytes().to_vec(),
         });
     }
 
@@ -644,7 +645,7 @@ impl HandshakePacket {
                 // An error response is 4 bytes.
                 if ext.data.len() == 4 {
                     let error_code =
-                        u32::from_be_bytes([ext.data[0], ext.data[1], ext.data[2], ext.data[3]]);
+                        u32::from_le_bytes([ext.data[0], ext.data[1], ext.data[2], ext.data[3]]);
                     if let Some(km_error) = KmError::from_u32(error_code) {
                         return Err(km_error);
                     }
@@ -1177,6 +1178,15 @@ mod tests {
     fn test_km_error_response() {
         let mut hs = HandshakePacket::new_conclusion_response(1, 2, 3, 0, true);
         hs.add_km_error(KmError::BadSecret);
+        assert_eq!(
+            hs.extensions
+                .iter()
+                .find(|extension| extension.ext_type == ExtensionType::KmRsp)
+                .expect("KMRSP extension")
+                .data,
+            [4, 0, 0, 0],
+            "libsrt copies the status as a little-endian KM payload word"
+        );
 
         let packet = hs.encode(1000, 0);
         let decoded = HandshakePacket::decode(&packet)
