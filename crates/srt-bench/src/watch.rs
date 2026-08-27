@@ -211,7 +211,9 @@ fn top_processes() -> String {
     else {
         return String::new();
     };
+    // SAFETY: sysconf() with valid constants is always safe; returns -1 on error.
     let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    // SAFETY: same as above — read-only kernel query.
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if ticks <= 0 || page_size <= 0 {
         return String::new();

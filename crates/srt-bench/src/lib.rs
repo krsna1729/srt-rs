@@ -1193,6 +1193,7 @@ impl Aggregate {
 }
 
 /// Parse the unified CLI into a BenchConfig, exiting on bad usage.
+#[expect(clippy::cognitive_complexity)]
 pub fn bench_config_from_args() -> BenchConfig {
     fn usage() -> ! {
         eprintln!(

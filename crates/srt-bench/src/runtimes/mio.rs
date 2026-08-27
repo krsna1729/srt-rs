@@ -318,6 +318,7 @@ fn run_shared_sender(cfg: &BenchConfig, start: Instant) -> Vec<ConnStats> {
 }
 
 /// Drive one worker's share of the connections on its own `Poll`.
+#[expect(clippy::cognitive_complexity)]
 fn drive(cfg: BenchConfig, mine: Vec<usize>, start: Instant) -> Vec<ConnStats> {
     let mut poll = Poll::new().expect("mio Poll::new");
     let mut events = Events::with_capacity(4096);
@@ -1604,6 +1605,7 @@ fn run_reuseport_single(cfg: BenchConfig, workers: usize) {
 /// every worker exactly how many connections it will ever receive once
 /// admission winds down, so a worker can distinguish "no more are coming"
 /// from "none have arrived yet" instead of guessing off a wall clock.
+#[expect(clippy::cognitive_complexity)]
 fn run_single_acceptor(
     cfg: &BenchConfig,
     start: Instant,

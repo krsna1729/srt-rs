@@ -44,6 +44,7 @@ impl AppendLock {
         {
             use std::os::fd::AsRawFd;
             let fd = file.as_raw_fd();
+            // SAFETY: `fd` is a valid open file descriptor owned by `file`.
             let result = unsafe { libc::flock(fd, mode) };
             if result != 0 {
                 return Err(std::io::Error::last_os_error());
@@ -63,6 +64,7 @@ impl Drop for AppendLock {
     fn drop(&mut self) {
         #[cfg(unix)]
         {
+            // SAFETY: `self.fd` was a valid fd at construction and is released here.
             let _ = unsafe { libc::flock(self.fd, libc::LOCK_UN) };
         }
     }
@@ -1309,6 +1311,7 @@ fn interleave_indices(cells: &[Cell<'_>], axes: &[Axis]) -> Vec<usize> {
 /// Each side is a fresh child process rather than a thread: CPU is
 /// measured with `getrusage`, which is per-process, so running both roles
 /// in one process would attribute the sender's cost to the listener.
+#[expect(clippy::cognitive_complexity)]
 pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
     let exe = std::env::current_exe()?;
     let out = std::path::PathBuf::from(
@@ -1883,6 +1886,7 @@ enum Priv {
 
 impl Priv {
     fn detect() -> Option<Self> {
+        // SAFETY: geteuid() is always safe to call and has no preconditions.
         if unsafe { libc::geteuid() } == 0 {
             return Some(Self::Root);
         }
@@ -1986,10 +1990,12 @@ fn in_netns(p: Priv, exe: &std::path::Path) -> std::process::Command {
     let uid = std::env::var("SUDO_UID")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
+        // SAFETY: getuid() is always safe to call.
         .unwrap_or_else(|| unsafe { libc::getuid() });
     let gid = std::env::var("SUDO_GID")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
+        // SAFETY: getgid() is always safe to call.
         .unwrap_or_else(|| unsafe { libc::getgid() });
 
     let mut cmd = p.command("ip");
@@ -2037,7 +2043,7 @@ fn wait_for_listening(child: &mut std::process::Child, timeout: std::time::Durat
 /// Ask a child to stop cleanly. It finishes draining, writes its result
 /// row, and exits; see `crate::shutdown` for why this replaced a timer.
 fn request_stop(child: &std::process::Child) {
-    // Safe: the child is still owned here, so its pid has not been reaped.
+    // SAFETY: the child is still owned here, so its pid has not been reaped.
     unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
 }
 

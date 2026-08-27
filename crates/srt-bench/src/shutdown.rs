@@ -30,6 +30,7 @@ extern "C" fn on_signal(_: libc::c_int) {
 
 /// Ask for a clean stop when the harness signals. Idempotent.
 pub fn install() {
+    // SAFETY: zeroed sigaction is valid; handler is an extern "C" fn with correct signature.
     unsafe {
         let mut action: libc::sigaction = std::mem::zeroed();
         action.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as usize;

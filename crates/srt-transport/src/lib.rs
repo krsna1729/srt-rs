@@ -1664,6 +1664,7 @@ impl PeerTable {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::cognitive_complexity)]
     fn admit_with_policy_hook<F>(
         &mut self,
         peer: std::net::SocketAddr,
@@ -4058,6 +4059,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::cognitive_complexity)]
     fn opted_in_bonded_inputs_share_one_logical_event_stream_and_telemetry() {
         let first = "127.0.0.1:10000".parse().expect("address");
         let second = "127.0.0.1:10001".parse().expect("address");
@@ -4388,6 +4390,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::cognitive_complexity)]
     fn caller_table_has_one_logical_api_for_direct_and_broadcast_callers() {
         let direct_peer = "127.0.0.1:11000".parse().expect("address");
         let first_peer = "127.0.0.1:11001".parse().expect("address");

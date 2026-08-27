@@ -835,6 +835,7 @@ impl SrtConnection {
     }
 
     /// Process a timer event.
+    #[expect(clippy::cognitive_complexity)]
     pub fn handle_timer(&mut self, timer_id: TimerId, now: Timestamp) -> Result<(), Error> {
         match timer_id {
             TimerId::Handshake => {

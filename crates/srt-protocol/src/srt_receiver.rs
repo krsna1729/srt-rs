@@ -624,6 +624,7 @@ impl ReceiverBuffer {
     /// Receive a packet.
     ///
     /// Returns the loss list if loss was detected.
+    #[expect(clippy::cognitive_complexity)]
     pub fn receive(&mut self, packet: DataPacket, now: Timestamp) -> Option<Vec<u32>> {
         let seq = packet.sequence_number;
         let was_expected = seq == self.expected_seq;

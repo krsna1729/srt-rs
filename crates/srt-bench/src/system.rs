@@ -9,6 +9,7 @@
 /// it. The result is inherited by matrix children.
 pub fn raise_nofile_limit() {
     #[cfg(unix)]
+    // SAFETY: `rlimit` is initialized by getrlimit before use; setrlimit receives valid storage.
     unsafe {
         let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
         if libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) != 0 {
@@ -107,6 +108,7 @@ fn print_proc_line(name: &str, path: &str, prefix: &str) {
 
 fn print_rlimit_files() {
     #[cfg(unix)]
+    // SAFETY: `rlimit` is initialized by getrlimit; read-only query with no side effects.
     unsafe {
         let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
         if libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) == 0 {

@@ -19,7 +19,9 @@ pub struct ProcessStats {
 }
 
 pub fn process_stats() -> ProcessStats {
+    // SAFETY: all-zero is valid for `rusage`.
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: `usage` is valid writable storage; RUSAGE_SELF is always valid.
     let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
     if rc != 0 {
         return ProcessStats {
