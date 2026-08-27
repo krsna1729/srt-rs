@@ -76,3 +76,132 @@ impl Default for ManualTimerStore {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ts(micros: u64) -> Timestamp {
+        Timestamp::from_micros(micros)
+    }
+
+    #[test]
+    fn apply_set_then_due() {
+        let mut store = ManualTimerStore::new();
+        store.apply_output(
+            &ConnectionOutput::SetTimer {
+                id: TimerId::Keepalive,
+                duration_micros: 100,
+            },
+            ts(0),
+        );
+        assert!(store.due_timers(ts(50)).is_empty());
+        let due = store.due_timers(ts(100));
+        assert_eq!(due, vec![TimerId::Keepalive]);
+    }
+
+    #[test]
+    fn apply_clear_removes_timer() {
+        let mut store = ManualTimerStore::new();
+        store.apply_output(
+            &ConnectionOutput::SetTimer {
+                id: TimerId::Ack,
+                duration_micros: 100,
+            },
+            ts(0),
+        );
+        store.apply_output(&ConnectionOutput::ClearTimer { id: TimerId::Ack }, ts(50));
+        assert!(store.due_timers(ts(200)).is_empty());
+    }
+
+    #[test]
+    fn overwrite_timer_uses_latest_deadline() {
+        let mut store = ManualTimerStore::new();
+        store.apply_output(
+            &ConnectionOutput::SetTimer {
+                id: TimerId::Nak,
+                duration_micros: 100,
+            },
+            ts(0),
+        );
+        store.apply_output(
+            &ConnectionOutput::SetTimer {
+                id: TimerId::Nak,
+                duration_micros: 200,
+            },
+            ts(50),
+        );
+        assert!(store.due_timers(ts(100)).is_empty());
+        assert_eq!(store.due_timers(ts(250)), vec![TimerId::Nak]);
+    }
+
+    #[test]
+    fn time_until_earliest_returns_default_when_empty() {
+        let store = ManualTimerStore::new();
+        assert_eq!(store.time_until_earliest(ts(0), 999), 999);
+    }
+
+    #[test]
+    fn time_until_earliest_saturates_at_zero() {
+        let mut store = ManualTimerStore::new();
+        store.apply_output(
+            &ConnectionOutput::SetTimer {
+                id: TimerId::Keepalive,
+                duration_micros: 100,
+            },
+            ts(0),
+        );
+        assert_eq!(store.time_until_earliest(ts(200), 999), 0);
+    }
+
+    #[test]
+    fn next_deadline_tracks_minimum() {
+        let mut store = ManualTimerStore::new();
+        assert_eq!(store.next_deadline(), None);
+        store.apply_output(
+            &ConnectionOutput::SetTimer {
+                id: TimerId::Keepalive,
+                duration_micros: 300,
+            },
+            ts(0),
+        );
+        store.apply_output(
+            &ConnectionOutput::SetTimer {
+                id: TimerId::Ack,
+                duration_micros: 100,
+            },
+            ts(0),
+        );
+        assert_eq!(store.next_deadline(), Some(ts(100)));
+    }
+
+    #[test]
+    fn multiple_timers_fire_independently() {
+        let mut store = ManualTimerStore::new();
+        store.apply_output(
+            &ConnectionOutput::SetTimer {
+                id: TimerId::Keepalive,
+                duration_micros: 100,
+            },
+            ts(0),
+        );
+        store.apply_output(
+            &ConnectionOutput::SetTimer {
+                id: TimerId::Ack,
+                duration_micros: 200,
+            },
+            ts(0),
+        );
+        let due = store.due_timers(ts(150));
+        assert_eq!(due, vec![TimerId::Keepalive]);
+        let due = store.due_timers(ts(250));
+        assert_eq!(due, vec![TimerId::Ack]);
+    }
+
+    #[test]
+    fn send_packet_output_is_ignored() {
+        let mut store = ManualTimerStore::new();
+        store.apply_output(&ConnectionOutput::SendPacket(vec![1, 2, 3]), ts(0));
+        assert!(store.next_deadline().is_none());
+    }
+}
