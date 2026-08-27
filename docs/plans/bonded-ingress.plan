@@ -3,8 +3,9 @@
 # intentionally separate from the full topology bake-off: today only one
 # shared, group-aware PeerTable can realize inbound group association.
 
-runtime    = tokio,smol,monoio,glommio,compio
+runtime    = mio,tokio,smol,monoio,glommio,compio
 ingress    = shared-pool:1
+egress     = shared-socket
 encryption = plain,128,192,256
 connections = 2
 bond       = broadcast:1,backup:1

@@ -226,10 +226,6 @@ async fn drive(cfg: BenchConfig, mine: Vec<usize>, start: Instant) -> Vec<crate:
     out
 }
 
-/// Bond exercise: connections 2g/2g+1 (for g in 0..bond_pairs) share a
-/// group id, so a run can prove the reuseport receiver's registry/handoff
-/// path actually fires. Sender-only -- the listener learns the group (and
-/// its type) from the caller's handshake extension.
 async fn sender_task(
     cfg: BenchConfig,
     index: usize,
@@ -243,9 +239,6 @@ async fn sender_task(
         socket_id: cfg.caller_socket_id_for(index),
         tsbpd_delay: cfg.latency_ms,
         max_bandwidth_bytes_per_sec: Some(cfg.bitrate_bps / 8),
-        group_extension: cfg.bond_extension_for(index),
-        initial_seq: cfg.bond_initial_seq_for(index),
-        stream_id: cfg.bond_stream_id_for(index),
         ..Default::default()
     };
     cfg.encryption.apply_to(&mut options);

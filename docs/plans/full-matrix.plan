@@ -22,7 +22,8 @@
 # reuseport admission can observe them, keeps batching only where mio has a
 # shared-socket batched path, keeps pinning only where glommio applies it,
 # keeps one sender-worker and connect-concurrency representative for shared
-# egress (one socket has one owning runtime loop), and removes bond groups
+# egress (one socket has one owning runtime loop), keeps bonded cells only on
+# the shared logical-group egress and listener paths, and removes bond groups
 # larger than half the connection population. Identical-four-tuple bonded
 # cells remain valid protocol/group exercises because SRT Socket IDs demux the
 # legs, but they do not provide independent network paths and therefore must

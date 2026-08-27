@@ -90,8 +90,9 @@ without retaining all raw cells in memory. This removes combinations that
 cannot change behavior: promotion and cookie routing outside `reuseport-multi`,
 batching outside mio's shared-socket paths, and pinning outside glommio. It
 also removes bond-group requests larger than half the connection population and
-bonded ingress outside the one group-aware `shared-pool:1` listener (the mio
-pool and reuseport handoff paths do not yet own a logical group). One
+bonded cells outside the shared `CallerTable` egress and the one group-aware
+`shared-pool:1` listener (the per-connection sender and reuseport handoff paths
+do not own a logical group). One
 representative value is retained for an inert axis, so a one-value custom plan
 remains runnable. The filter summary is printed before the run and the
 reported cell count is the filtered count.
@@ -118,9 +119,12 @@ ingress stream.
 
 `docs/plans/bonded-ingress.plan` is the focused semantic sweep: it runs a
 two-leg Broadcast and Backup publisher through the supported shared listener,
-including every encryption mode. The receiver reports one established logical
-stream, while its aggregate telemetry retains per-leg wire counters; the
-caller still reports two physical legs.
+on all six runtime adapters and every encryption mode. The receiver reports one
+established logical stream, while its aggregate telemetry retains per-leg wire
+counters; the caller still reports two physical legs. Direct runs reject
+`--bond` unless sender egress is `shared-socket` and ingress is
+`shared-pool:1`, so a configuration cannot advertise group metadata while
+silently scheduling each leg as an independent stream.
 
 [`docs/performance-loop.md`](../../docs/performance-loop.md) defines the
 measurement gates and the small representative live plans used for iterative

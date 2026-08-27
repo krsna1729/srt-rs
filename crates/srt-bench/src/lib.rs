@@ -485,6 +485,24 @@ pub type SharedWorkerRouter =
     std::sync::Arc<std::sync::Mutex<srt_lifecycle::WorkerRouter<std::net::SocketAddr>>>;
 
 impl BenchConfig {
+    /// Reject benchmark topologies that advertise a bond without actually
+    /// driving its legs as one logical caller and listener group.
+    pub fn validate_bond_topology(&self) -> Result<(), &'static str> {
+        if self.bond_mode == BondMode::None {
+            return Ok(());
+        }
+        if self.bond_pairs > self.connections / 2 {
+            return Err("bond pair count exceeds half of --connections");
+        }
+        if self.ingress != Ingress::SharedPool(1) {
+            return Err("--bond requires --ingress shared-pool=1");
+        }
+        if self.mode == Mode::Sender && self.egress != Egress::SharedSocket {
+            return Err("--bond requires --egress shared-socket for sender group scheduling");
+        }
+        Ok(())
+    }
+
     /// Destination/bind address for connection i.
     pub fn addr_for(&self, i: usize) -> std::net::SocketAddr {
         use std::net::{IpAddr, SocketAddr};
@@ -1432,7 +1450,7 @@ pub fn bench_config_from_args() -> BenchConfig {
         .map(std::path::PathBuf::from);
     let rep = cli.flag_or("rep", 1usize);
 
-    BenchConfig {
+    let config = BenchConfig {
         runtime,
         mode,
         encryption,
@@ -1459,14 +1477,19 @@ pub fn bench_config_from_args() -> BenchConfig {
         stream_secs,
         peer_topology,
         link,
+    };
+    if let Err(error) = config.validate_bond_topology() {
+        eprintln!("error: {error}");
+        usage()
     }
+    config
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        Batching, BenchConfig, BondMode, Cli, Encryption, Ingress, Link, Mode, PeerTopology,
-        Promotion, Runtime,
+        Batching, BenchConfig, BondMode, Cli, Egress, Encryption, Ingress, Link, Mode,
+        PeerTopology, Promotion, Runtime,
     };
     use shiguredo_srt::{ConnectionOptions, KeyLength};
 
@@ -1504,9 +1527,8 @@ mod tests {
         assert_eq!(options.key_length, KeyLength::Aes128);
     }
 
-    #[test]
-    fn shared_admission_carries_the_encryption_template() {
-        let mut cfg = BenchConfig {
+    fn config() -> BenchConfig {
+        BenchConfig {
             runtime: Runtime::Mio,
             mode: Mode::Receiver,
             encryption: Encryption::Aes256,
@@ -1516,7 +1538,7 @@ mod tests {
             latency_ms: 120,
             bitrate_bps: 1_000_000,
             connections: 1,
-            egress: crate::Egress::PerConnection,
+            egress: Egress::PerConnection,
             ingress: Ingress::SharedPool(4),
             bond_mode: BondMode::None,
             bond_pairs: 0,
@@ -1533,7 +1555,12 @@ mod tests {
             stream_secs: 1.0,
             peer_topology: PeerTopology::default(),
             link: Link::default(),
-        };
+        }
+    }
+
+    #[test]
+    fn shared_admission_carries_the_encryption_template() {
+        let mut cfg = config();
         let admission = cfg.admission_options(0x1234, true);
         let template = admission
             .connection_template
@@ -1561,6 +1588,52 @@ mod tests {
             cfg.admission_options(17, false).bonded_inputs,
             srt_transport::BondedInputPolicy::Accept
         );
+    }
+
+    #[test]
+    fn bonding_requires_the_shared_group_driver_on_every_runtime() {
+        let mut cfg = config();
+        cfg.mode = Mode::Sender;
+        cfg.connections = 2;
+        cfg.bond_mode = BondMode::Broadcast;
+        cfg.bond_pairs = 1;
+        cfg.ingress = Ingress::SharedPool(1);
+        cfg.egress = Egress::SharedSocket;
+
+        for runtime in [
+            Runtime::Mio,
+            Runtime::Tokio,
+            Runtime::Smol,
+            Runtime::Monoio,
+            Runtime::Glommio,
+            Runtime::Compio,
+        ] {
+            cfg.runtime = runtime;
+            assert_eq!(cfg.validate_bond_topology(), Ok(()), "{runtime:?}");
+        }
+
+        cfg.egress = Egress::PerConnection;
+        assert_eq!(
+            cfg.validate_bond_topology(),
+            Err("--bond requires --egress shared-socket for sender group scheduling")
+        );
+        cfg.egress = Egress::SharedSocket;
+        cfg.ingress = Ingress::PerPort;
+        assert_eq!(
+            cfg.validate_bond_topology(),
+            Err("--bond requires --ingress shared-pool=1")
+        );
+        cfg.ingress = Ingress::SharedPool(1);
+        cfg.bond_pairs = 2;
+        assert_eq!(
+            cfg.validate_bond_topology(),
+            Err("bond pair count exceeds half of --connections")
+        );
+
+        cfg.mode = Mode::Receiver;
+        cfg.bond_pairs = 1;
+        cfg.egress = Egress::PerConnection;
+        assert_eq!(cfg.validate_bond_topology(), Ok(()));
     }
 
     #[test]

@@ -782,6 +782,7 @@ fn filter_reason(cell: &Cell<'_>, axes: &[Axis]) -> Option<&'static str> {
         .and_then(|value| value.parse::<usize>().ok());
     let connect_concurrency = cell_value(cell, "connect-concurrency", Some(Scope::Both));
     let send_workers = role_value(cell, "workers", Scope::Send);
+    let bonded = bond.is_some_and(|mode| mode != "none");
 
     // A shared caller socket drives all handshakes from one readiness loop;
     // per-connection launch concurrency cannot alter that implementation.
@@ -804,6 +805,13 @@ fn filter_reason(cell: &Cell<'_>, axes: &[Axis]) -> Option<&'static str> {
         return Some("shared-egress-workers-inert");
     }
 
+    // Per-connection sender tasks advertise compatible group metadata but do
+    // not share one logical SrtGroup scheduler. Keep bonded measurements on
+    // the SharedSender/CallerTable path implemented by every runtime.
+    if bonded && egress != "shared-socket" {
+        return Some("bonded-egress-unsupported");
+    }
+
     if let (Some(pairs), Some(connections)) = (bond.and_then(bond_pairs), connections)
         && pairs > connections / 2
     {
@@ -818,7 +826,7 @@ fn filter_reason(cell: &Cell<'_>, axes: &[Axis]) -> Option<&'static str> {
     // reach the same group-aware PeerTable. Every runtime provides that on
     // the one-socket shared pool. A shared sender socket is valid too: SRT
     // Socket IDs, not UDP tuples, select each physical leg.
-    if bond.is_some_and(|mode| mode != "none") && ingress != "shared-pool:1" {
+    if bonded && ingress != "shared-pool:1" {
         return Some("bonded-ingress-unsupported");
     }
 
@@ -2339,6 +2347,7 @@ mod matrix_filter_tests {
         let axes = axes();
         let bonded = cell(&[
             ("ingress", "reuseport-multi:4"),
+            ("egress", "shared-socket"),
             ("promotion", "bonded"),
             ("cookie-routing", "on"),
             ("batch", "on"),
@@ -2350,6 +2359,22 @@ mod matrix_filter_tests {
         assert_eq!(
             filter_reason(&bonded, &axes),
             Some("bonded-ingress-unsupported")
+        );
+
+        let unsupported_egress = cell(&[
+            ("ingress", "shared-pool:1"),
+            ("egress", "per-connection"),
+            ("promotion", "all"),
+            ("cookie-routing", "on"),
+            ("batch", "on"),
+            ("pin", "off"),
+            ("runtime", "mio"),
+            ("connections", "2"),
+            ("bond", "broadcast:1"),
+        ]);
+        assert_eq!(
+            filter_reason(&unsupported_egress, &axes),
+            Some("bonded-egress-unsupported")
         );
 
         for runtime in ["mio", "tokio", "smol", "monoio", "glommio", "compio"] {
@@ -2385,6 +2410,7 @@ mod matrix_filter_tests {
         let axes = axes();
         let cell = cell(&[
             ("ingress", "reuseport-multi:4"),
+            ("egress", "shared-socket"),
             ("promotion", "all"),
             ("cookie-routing", "on"),
             ("batch", "on"),
