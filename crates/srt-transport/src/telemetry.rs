@@ -241,3 +241,96 @@ impl IngressTelemetry {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn snapshot_starts_at_zero() {
+        let t = IngressTelemetry::new();
+        let s = t.snapshot();
+        assert_eq!(s, IngressTelemetrySnapshot::default());
+        assert_eq!(s.total_promotions(), 0);
+        assert_eq!(s.total_capacity_drops(), 0);
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn each_recorder_increments_its_counter() {
+        let t = IngressTelemetry::new();
+        t.record_local_promotion();
+        t.record_handoff();
+        t.record_stranded_conclusion();
+        t.record_cookie_routed();
+        t.record_cookie_route_failure();
+        t.record_promoted_duplicate();
+        t.record_invalid_datagram();
+        t.record_invalid_cookie();
+        t.record_admission_capacity_drop();
+        t.record_half_open_capacity_drop();
+        t.record_established_capacity_drop();
+        t.record_source_capacity_drop();
+        t.record_policy_request();
+        t.record_policy_configuration();
+        t.record_policy_deferred();
+        t.record_policy_error();
+        t.record_policy_rejection();
+        t.record_credential_failure();
+        t.record_expired_half_open(5);
+        let s = t.snapshot();
+        assert_eq!(s.local_promotions, 1);
+        assert_eq!(s.handoffs, 1);
+        assert_eq!(s.stranded_conclusions, 1);
+        assert_eq!(s.cookie_routed, 1);
+        assert_eq!(s.cookie_route_failures, 1);
+        assert_eq!(s.promoted_duplicates, 1);
+        assert_eq!(s.invalid_datagrams, 1);
+        assert_eq!(s.invalid_cookies, 1);
+        assert_eq!(s.admission_capacity_drops, 1);
+        assert_eq!(s.half_open_capacity_drops, 1);
+        assert_eq!(s.established_capacity_drops, 1);
+        assert_eq!(s.source_capacity_drops, 1);
+        assert_eq!(s.policy_requests, 1);
+        assert_eq!(s.policy_configurations, 1);
+        assert_eq!(s.policy_deferred, 1);
+        assert_eq!(s.policy_errors, 1);
+        assert_eq!(s.policy_rejections, 1);
+        assert_eq!(s.credential_failures, 1);
+        assert_eq!(s.expired_half_open, 5);
+        assert_eq!(s.total_promotions(), 2);
+        assert_eq!(s.total_capacity_drops(), 4);
+    }
+
+    #[test]
+    fn expired_half_open_zero_is_free() {
+        let t = IngressTelemetry::new();
+        t.record_expired_half_open(0);
+        assert_eq!(t.snapshot().expired_half_open, 0);
+    }
+
+    #[test]
+    fn concurrent_increments_are_not_lost() {
+        let t = Arc::new(IngressTelemetry::new());
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let t = Arc::clone(&t);
+                std::thread::spawn(move || {
+                    for _ in 0..1000 {
+                        t.record_local_promotion();
+                        t.record_invalid_datagram();
+                        t.record_expired_half_open(1);
+                    }
+                })
+            })
+            .collect();
+        for handle in threads {
+            handle.join().expect("thread");
+        }
+        let s = t.snapshot();
+        assert_eq!(s.local_promotions, 4000);
+        assert_eq!(s.invalid_datagrams, 4000);
+        assert_eq!(s.expired_half_open, 4000);
+    }
+}
