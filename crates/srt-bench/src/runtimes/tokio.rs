@@ -161,6 +161,7 @@ async fn drive(cfg: BenchConfig, mine: Vec<usize>, start: Instant) -> Vec<crate:
     out
 }
 
+#[expect(clippy::cognitive_complexity)]
 async fn sender_task(
     cfg: BenchConfig,
     index: usize,
@@ -308,6 +309,7 @@ async fn sender_task(
     stats
 }
 
+#[expect(clippy::cognitive_complexity)]
 async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> ConnStats {
     let socket = tokio::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], listen_port)))
         .await
@@ -499,6 +501,7 @@ fn run_reuseport_multi(cfg: BenchConfig, k: usize) {
 /// own task, via a handoff -- tokio's ordinary task-per-connection idiom
 /// stays exactly right for that genuinely-independent case, just not for
 /// the common one anymore.
+#[expect(clippy::cognitive_complexity)]
 async fn run_acceptor(
     cfg: BenchConfig,
     worker_index: usize,

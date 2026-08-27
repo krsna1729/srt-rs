@@ -198,6 +198,7 @@ async fn drive(cfg: BenchConfig, mine: Vec<usize>, start: Instant) -> Vec<crate:
     out
 }
 
+#[expect(clippy::cognitive_complexity)]
 async fn sender_task(
     cfg: BenchConfig,
     index: usize,
@@ -511,6 +512,7 @@ fn run_reuseport_multi(cfg: BenchConfig, k: usize) {
 /// each tick attempts at most one `recv_from`, bounded by `TIMER_TICK` so
 /// peer maintenance (timers, relocation checks, terminal-state checks)
 /// still runs promptly even when nothing arrives.
+#[expect(clippy::cognitive_complexity)]
 async fn run_acceptor(
     cfg: BenchConfig,
     worker_index: usize,

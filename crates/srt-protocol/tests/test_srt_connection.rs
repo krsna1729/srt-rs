@@ -879,6 +879,7 @@ fn test_receiver_stats() {
 }
 
 #[test]
+#[expect(clippy::cognitive_complexity)]
 fn connection_stats_cover_restream_quality_inputs() {
     let mut caller = SrtConnection::new_caller(test_options());
     let mut listener = SrtConnection::new_listener(test_options());
@@ -1262,6 +1263,7 @@ fn test_multiple_sends_before_transfer() {
 /// run needed to confirm the mechanism itself works before trusting its
 /// recovery-rate numbers.
 #[test]
+#[expect(clippy::cognitive_complexity)]
 fn test_dropped_packet_triggers_nak_then_retransmit() {
     let mut caller = SrtConnection::new_caller(test_options());
     let mut listener = SrtConnection::new_listener(test_options());

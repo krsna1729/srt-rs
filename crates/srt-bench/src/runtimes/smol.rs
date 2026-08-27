@@ -177,6 +177,7 @@ async fn drive(cfg: BenchConfig, mine: Vec<usize>, start: Instant) -> Vec<crate:
     out
 }
 
+#[expect(clippy::cognitive_complexity)]
 async fn sender_task(
     cfg: BenchConfig,
     index: usize,
@@ -315,6 +316,7 @@ async fn sender_task(
     stats
 }
 
+#[expect(clippy::cognitive_complexity)]
 async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> ConnStats {
     let socket = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], listen_port))).expect("bind");
 
@@ -502,6 +504,7 @@ fn run_reuseport_multi(cfg: BenchConfig, k: usize) {
 /// and tokio's `run_acceptor` (see their doc comments for the full
 /// explanation). Only a leg that actually needs to relocate gets spawned
 /// as its own task on the owner's executor, via a handoff.
+#[expect(clippy::cognitive_complexity)]
 #[expect(
     clippy::too_many_arguments,
     reason = "acceptor ownership inputs remain explicit across runtime adapters"

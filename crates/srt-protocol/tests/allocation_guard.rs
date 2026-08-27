@@ -40,12 +40,15 @@ struct CountingAllocator;
 
 static ALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
 
+// SAFETY: delegates to `System` for all allocation; only adds an atomic counter.
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: layout is caller-guaranteed valid; forwarded to the system allocator.
         unsafe { System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: ptr/layout are caller-guaranteed valid; forwarded to the system allocator.
         unsafe { System.dealloc(ptr, layout) }
     }
 }

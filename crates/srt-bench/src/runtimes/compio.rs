@@ -196,6 +196,7 @@ async fn drive(cfg: BenchConfig, mine: Vec<usize>, start: Instant) -> Vec<crate:
     out
 }
 
+#[expect(clippy::cognitive_complexity)]
 async fn sender_task(
     cfg: BenchConfig,
     index: usize,
@@ -527,6 +528,7 @@ fn run_reuseport_multi(cfg: BenchConfig, k: usize) {
 /// `run_acceptor`/`run_pool_acceptor`. Only a leg that actually needs to
 /// relocate gets `compio::runtime::spawn`'d as its own task, via a
 /// handoff.
+#[expect(clippy::cognitive_complexity)]
 async fn run_acceptor(
     cfg: BenchConfig,
     worker_index: usize,
