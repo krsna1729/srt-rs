@@ -1793,3 +1793,86 @@ fn libsrt_gcm_caller_sends_to_rust_listener() {
         "Rust listener did not decrypt libsrt GCM caller's payload"
     );
 }
+
+/// Rust caller sends multiple messages via `send_message()` that collectively
+/// total 8 KB. Each message fits within `srt-live-transmit`'s 1456-byte
+/// receive buffer (`SRT_LIVE_MAX_PLSIZE`), so this tests the `send_message()`
+/// API path end-to-end without hitting the tool's per-read ceiling.
+#[test]
+fn rust_caller_sends_messages_via_send_message_to_libsrt_listener() {
+    let _guard = interop_test_lock();
+    if !command_available("srt-live-transmit") {
+        eprintln!(
+            "skipping rust_caller_sends_messages_via_send_message_to_libsrt_listener: srt-live-transmit not on PATH"
+        );
+        return;
+    }
+
+    let payload = test_payload_bytes(8_192);
+    let payload_clone = payload.clone();
+    let (result, output) = send_to_libsrt_listener_with_on_connect(
+        LiveOptions::default(),
+        LiveOptions::default(),
+        Duration::from_secs(10),
+        move |conn, now| {
+            for chunk in payload_clone.chunks(1_000) {
+                conn.send_message(chunk, now)
+                    .expect("send message from Rust caller");
+            }
+        },
+    );
+    assert!(
+        result.connected,
+        "Rust caller never reached Connected: {:?}; libsrt stderr: {}",
+        result.events,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "srt-live-transmit listener exited with failure, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout, payload,
+        "libsrt did not receive the Rust send_message() data; driver events: {:?}",
+        result.events
+    );
+}
+
+/// A real libsrt caller sends a 1316-byte (`SRT_LIVE_DEF_PLSIZE`) payload —
+/// the largest message `srt-live-transmit` accepts from its UDP source —
+/// and the Rust listener receives it via the `MessageAssembler` passthrough
+/// path. Multi-fragment reassembly cannot be exercised through
+/// `srt-live-transmit` because it caps both its UDP `recvfrom` buffer and
+/// its `srt_recvmsg2` buffer at `SRT_LIVE_MAX_PLSIZE` (1456 bytes);
+/// multi-fragment coverage lives in `test_srt_connection.rs` and
+/// `pbt/tests/prop_message.rs`.
+#[test]
+fn libsrt_live_transmit_max_payload_received_by_rust_listener() {
+    let _guard = interop_test_lock();
+    if !command_available("srt-live-transmit") {
+        eprintln!(
+            "skipping libsrt_live_transmit_max_payload_received_by_rust_listener: srt-live-transmit not on PATH"
+        );
+        return;
+    }
+
+    let payload = test_payload_bytes(1_316);
+
+    let (result, status, stderr) = receive_live_from_udp_source(&payload, None, None, None, None);
+    assert!(
+        result.connected,
+        "Rust listener never reached Connected: {:?}",
+        result.events
+    );
+    assert!(
+        status.success(),
+        "srt-live-transmit caller exited with failure, stderr: {stderr}"
+    );
+    let received: Vec<u8> = result.received_payloads.into_iter().flatten().collect();
+    assert_eq!(
+        received, payload,
+        "Rust listener did not receive the max-size libsrt message; driver events: {:?}",
+        result.events
+    );
+}
