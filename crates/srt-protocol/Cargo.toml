@@ -77,5 +77,9 @@ harness = false
 name = "group_requalification"
 harness = false
 
+[[bench]]
+name = "message_reassembly"
+harness = false
+
 [lints]
 workspace = true

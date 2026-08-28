@@ -60,7 +60,7 @@ fuzz_target!(|data: &[u8]| {
         now_us = now_us.saturating_add(u64::from(action).saturating_mul(100).max(1));
         let now = Timestamp::from_micros(now_us);
 
-        match action % 8 {
+        match action % 10 {
             0 => {
                 let _ = caller.feed_recv_buf(payload, now);
             }
@@ -86,8 +86,18 @@ fuzz_target!(|data: &[u8]| {
             6 => {
                 transfer(&mut caller, &mut listener, now);
             }
-            _ => {
+            7 => {
                 transfer(&mut listener, &mut caller, now);
+            }
+            8 => {
+                if caller.send_message(payload, now).is_ok() {
+                    transfer(&mut caller, &mut listener, now);
+                }
+            }
+            _ => {
+                if listener.send_message(payload, now).is_ok() {
+                    transfer(&mut listener, &mut caller, now);
+                }
             }
         }
         while caller.poll_event().is_some() {}

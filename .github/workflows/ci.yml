@@ -145,6 +145,8 @@ jobs:
         run: cargo +nightly fuzz run fuzz_admission -- -max_total_time=20 -timeout=5 -dict=fuzz.dict
       - working-directory: crates/srt-protocol/fuzz
         run: cargo +nightly fuzz run fuzz_gcm_decrypt -- -max_total_time=20 -timeout=5 -dict=fuzz.dict
+      - working-directory: crates/srt-protocol/fuzz
+        run: cargo +nightly fuzz run fuzz_message_reassembly -- -max_total_time=20 -timeout=5 -dict=fuzz.dict
 
   sanitizer:
     name: Address sanitizer
