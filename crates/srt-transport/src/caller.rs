@@ -2652,12 +2652,18 @@ mod tests {
 
         // At/after Ack's deadline, before Nak's: only Ack fires, exactly
         // once (removed from the store on the first call).
-        let due = store.due_timers(Timestamp::from_micros(10_000));
+        let due: Vec<_> = store
+            .due_timers(Timestamp::from_micros(10_000))
+            .into_iter()
+            .collect();
         assert_eq!(due, vec![TimerId::Ack]);
         assert!(store.due_timers(Timestamp::from_micros(10_000)).is_empty());
 
         // Nak still pending.
-        let due = store.due_timers(Timestamp::from_micros(50_000));
+        let due: Vec<_> = store
+            .due_timers(Timestamp::from_micros(50_000))
+            .into_iter()
+            .collect();
         assert_eq!(due, vec![TimerId::Nak]);
     }
 
@@ -2705,10 +2711,11 @@ mod tests {
         );
 
         assert!(store.due_timers(Timestamp::from_micros(1_000)).is_empty());
-        assert_eq!(
-            store.due_timers(Timestamp::from_micros(5_000)),
-            vec![TimerId::Keepalive]
-        );
+        let due: Vec<_> = store
+            .due_timers(Timestamp::from_micros(5_000))
+            .into_iter()
+            .collect();
+        assert_eq!(due, vec![TimerId::Keepalive]);
     }
 
     #[test]
