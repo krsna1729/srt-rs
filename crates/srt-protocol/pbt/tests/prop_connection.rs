@@ -10,7 +10,7 @@
 
 use proptest::prelude::*;
 use shiguredo_srt::{
-    ConnectionEvent, ConnectionOptions, ConnectionOutput, ConnectionState, KeyLength,
+    CipherMode, ConnectionEvent, ConnectionOptions, ConnectionOutput, ConnectionState, KeyLength,
     SrtConnection, SrtPacket, TimerId, Timestamp,
 };
 
@@ -1005,6 +1005,7 @@ fn make_opts(socket_id: u32) -> ConnectionOptions {
         socket_id,
         passphrase: None,
         key_length: KeyLength::Aes128,
+        cipher_mode: CipherMode::Ctr,
         initial_seq: None,
         syn_cookie: None,
         tsbpd_delay: 120,
@@ -1029,6 +1030,7 @@ fn make_opts_with_stream_id(socket_id: u32, stream_id: String) -> ConnectionOpti
         socket_id,
         passphrase: None,
         key_length: KeyLength::Aes128,
+        cipher_mode: CipherMode::Ctr,
         initial_seq: None,
         syn_cookie: None,
         tsbpd_delay: 120,

@@ -125,6 +125,16 @@ const PACKAGE: Step = Step {
     informational: false,
 };
 
+const FUZZ_BUILD: Step = Step {
+    name: "fuzz-build",
+    cmd: "cargo",
+    args: &["+nightly", "fuzz", "build"],
+    env: &[],
+    tool: Some(("cargo-fuzz", "cargo-fuzz")),
+    cwd: Some("crates/srt-protocol"),
+    informational: true,
+};
+
 const GEIGER_PROTOCOL: Step = Step {
     name: "geiger-protocol",
     cmd: "cargo",
@@ -165,6 +175,7 @@ const CI: &[&Step] = &[
     &DENY_PUBLISHED,
     &DENY_WORKSPACE,
     &PACKAGE,
+    &FUZZ_BUILD,
 ];
 
 fn main() -> ExitCode {
@@ -177,6 +188,7 @@ fn main() -> ExitCode {
         "test" => run_one(&TEST),
         "deny" => run_group(&[&DENY_PUBLISHED, &DENY_WORKSPACE]),
         "package" => run_one(&PACKAGE),
+        "fuzz-build" => run_one(&FUZZ_BUILD),
         "geiger" => run_group(&[&GEIGER_PROTOCOL, &GEIGER_TRANSPORT, &GEIGER_LIFECYCLE]),
         "precommit" => run_group(PRECOMMIT),
         "ci" | "check-all" => run_group(CI),
@@ -192,6 +204,7 @@ fn main() -> ExitCode {
             eprintln!("  test           workspace tests");
             eprintln!("  deny           advisory and license audit (needs cargo-deny)");
             eprintln!("  package        dry-run package of shiguredo_srt");
+            eprintln!("  fuzz-build     compile fuzz targets (needs cargo-fuzz + nightly)");
             eprintln!("  geiger         unsafe surface inventory (needs cargo-geiger)");
             eprintln!("  precommit      fast gate: fmt + clippy + doc + typos");
             eprintln!("  ci             full gate: all checks + report card");

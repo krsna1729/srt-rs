@@ -25,7 +25,7 @@
 
 use cipher::{KeyIvInit, StreamCipher};
 use ctr::Ctr128BE;
-use shiguredo_srt::{CryptoContext, KeyLength};
+use shiguredo_srt::{CipherMode, CryptoContext, KeyLength};
 
 /// SRT 仕様の byte 配置に従ってカウンタブロック (AES-CTR の初期 IV) を構築する。
 ///
@@ -99,8 +99,9 @@ fn assert_kat(
     let mut expected = plaintext.to_vec();
     aes_ctr_apply(sek, &spec_counter_block(&salt, packet_index), &mut expected);
 
-    let mut ctx = CryptoContext::new_sender("test_passphrase", key_length, salt, sek)
-        .expect("sender should be created");
+    let mut ctx =
+        CryptoContext::new_sender("test_passphrase", key_length, salt, sek, CipherMode::Ctr)
+            .expect("sender should be created");
     let mut actual = plaintext.to_vec();
     ctx.encrypt(packet_index, &mut actual)
         .expect("encrypt should succeed");

@@ -9,7 +9,7 @@ use std::fmt;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::buf::write_u32;
-use crate::crypto::{CryptoContext, KeyFlag, KeyLength};
+use crate::crypto::{CipherMode, CryptoContext, KeyFlag, KeyLength};
 use crate::error::Error;
 use crate::srt_handshake::{
     DEFAULT_FLOW_WINDOW, GroupExtensionData, HS_VERSION_5, HandshakePacket, HandshakeState,
@@ -171,6 +171,8 @@ pub struct ConnectionOptions {
     pub crypto_sek: Option<Vec<u8>>,
     /// Key length.
     pub key_length: KeyLength,
+    /// Cipher mode (CTR or GCM).
+    pub cipher_mode: CipherMode,
     /// TSBPD delay (ms).
     pub tsbpd_delay: u16,
     /// SRT version.
@@ -231,6 +233,7 @@ impl fmt::Debug for ConnectionOptions {
                 &self.crypto_sek.as_ref().map(|_| "[REDACTED]"),
             )
             .field("key_length", &self.key_length)
+            .field("cipher_mode", &self.cipher_mode)
             .field("tsbpd_delay", &self.tsbpd_delay)
             .field("srt_version", &self.srt_version)
             .field("stream_id", &self.stream_id)
@@ -265,6 +268,7 @@ impl Default for ConnectionOptions {
             crypto_salt: None,
             crypto_sek: None,
             key_length: KeyLength::Aes128,
+            cipher_mode: CipherMode::Ctr,
             tsbpd_delay: 120,
             srt_version: 0x010500, // 1.5.0
             stream_id: None,
@@ -841,12 +845,7 @@ impl SrtConnection {
     /// packets' `sent_time` is no longer updated).
     pub fn process_retransmit(&mut self, now: Timestamp) {
         while let Some(mut packet) = self.sender.as_mut().and_then(SenderBuffer::pop_retransmit) {
-            // Encrypt.
-            if let Some(ref mut crypto) = self.crypto
-                && let Ok(key_flag) = crypto.encrypt(packet.sequence_number, &mut packet.payload)
-            {
-                packet.encryption_flag = key_flag.to_kk_field();
-            }
+            let _ = self.encrypt_packet(&mut packet);
 
             let mut buf = Vec::new();
             packet.encode(&mut buf);
@@ -1031,11 +1030,7 @@ impl SrtConnection {
                 packet.payload.len()
             );
 
-            // Encrypt.
-            if let Some(ref mut crypto) = self.crypto {
-                let key_flag = crypto.encrypt(packet.sequence_number, &mut packet.payload)?;
-                packet.encryption_flag = key_flag.to_kk_field();
-            }
+            self.encrypt_packet(&mut packet)?;
 
             let mut buf = Vec::new();
             packet.encode(&mut buf);
@@ -1185,7 +1180,13 @@ impl SrtConnection {
 
         let (key_flag, wrapped_key) = crypto.start_pre_announce(new_sek)?;
         self.key_refresh_notified = false;
-        let km_message = KmMessage::new(key_flag, crypto.key_length(), *crypto.salt(), wrapped_key);
+        let km_message = KmMessage::new(
+            key_flag,
+            crypto.key_length(),
+            *crypto.salt(),
+            wrapped_key,
+            crypto.cipher_mode(),
+        );
         self.send_km_request(&km_message, now);
 
         Ok(())
@@ -1268,6 +1269,28 @@ impl SrtConnection {
         self.sync_application_backlog();
     }
 
+    fn encrypt_packet(&mut self, packet: &mut DataPacket) -> Result<(), Error> {
+        let Some(ref mut crypto) = self.crypto else {
+            return Ok(());
+        };
+        match crypto.cipher_mode() {
+            CipherMode::Ctr => {
+                let key_flag = crypto.encrypt(packet.sequence_number, &mut packet.payload)?;
+                packet.encryption_flag = key_flag.to_kk_field();
+            }
+            CipherMode::Gcm => {
+                // KK must be set before computing AAD — the receiver sees
+                // the on-wire header with KK set and uses that as its AAD.
+                packet.encryption_flag = crypto.current_key().to_kk_field();
+                let aad = packet.gcm_aad();
+                let (_, ciphertext) =
+                    crypto.encrypt_gcm(packet.sequence_number, &aad, &packet.payload)?;
+                packet.payload = ciphertext;
+            }
+        }
+        Ok(())
+    }
+
     fn sync_application_backlog(&mut self) {
         if let Some(receiver) = self.receiver.as_mut() {
             receiver.set_application_backlog_packets(self.pending_data_events);
@@ -1299,28 +1322,38 @@ impl SrtConnection {
             ));
         }
 
-        let mut payload = pkt.payload.clone();
-
-        // 復号化
-        if pkt.encryption_flag != 0 {
+        let payload = if pkt.encryption_flag != 0 {
             let decrypt_result = if let Some(ref crypto) = self.crypto {
-                KeyFlag::from_kk_field(pkt.encryption_flag)
-                    .ok_or_else(|| Error::crypto_error("invalid KK flag"))
-                    .and_then(|key_flag| {
-                        crypto.decrypt(pkt.sequence_number, key_flag, &mut payload)
-                    })
+                let key_flag = KeyFlag::from_kk_field(pkt.encryption_flag)
+                    .ok_or_else(|| Error::crypto_error("invalid KK flag"))?;
+                match crypto.cipher_mode() {
+                    CipherMode::Ctr => {
+                        let mut payload = pkt.payload.clone();
+                        crypto.decrypt(pkt.sequence_number, key_flag, &mut payload)?;
+                        Ok(payload)
+                    }
+                    CipherMode::Gcm => {
+                        let aad = pkt.gcm_aad();
+                        crypto.decrypt_gcm(pkt.sequence_number, key_flag, &aad, &pkt.payload)
+                    }
+                }
             } else {
                 Err(Error::crypto_error(
                     "encrypted packet but no crypto context",
                 ))
             };
-            if let Err(error) = decrypt_result {
-                if let Some(receiver) = self.receiver.as_mut() {
-                    receiver.record_undecryptable();
+            match decrypt_result {
+                Ok(payload) => payload,
+                Err(error) => {
+                    if let Some(receiver) = self.receiver.as_mut() {
+                        receiver.record_undecryptable();
+                    }
+                    return Err(error);
                 }
-                return Err(error);
             }
-        }
+        } else {
+            pkt.payload.clone()
+        };
 
         // Receive before delivery. Ready packets are moved into the bounded
         // application queue below, so unread application data remains part of
@@ -1484,6 +1517,7 @@ impl SrtConnection {
             key_length,
             salt,
             sek,
+            self.options.cipher_mode,
         )?);
         Ok(())
     }
@@ -1625,12 +1659,20 @@ impl SrtConnection {
                         ));
                     };
                     let km = km_result?;
+                    let Some(cipher_mode) = CipherMode::from_km(&km) else {
+                        return Err(self.fail_listener_km(
+                            now,
+                            KmError::BadSecret,
+                            "inconsistent cipher/auth fields in KMREQ",
+                        ));
+                    };
                     let crypto = match CryptoContext::new_receiver(
                         passphrase,
                         km.salt,
                         &km.wrapped_key,
                         km.key_flag,
                         km.key_length,
+                        cipher_mode,
                     ) {
                         Ok(crypto) => crypto,
                         Err(_) => {
@@ -2197,6 +2239,7 @@ impl SrtConnection {
                 crypto.key_length(),
                 *crypto.salt(),
                 wrapped_key,
+                crypto.cipher_mode(),
             );
             hs.add_km_request(&km_message);
         }
@@ -2528,6 +2571,7 @@ mod tests {
             KeyLength::Aes128,
             test_km_salt(),
             &[0x24; 16],
+            CipherMode::Ctr,
         )
         .expect("valid sender crypto");
         crypto.set_encrypted_packet_count_for_test(
@@ -2563,6 +2607,7 @@ mod tests {
             KeyLength::Aes128,
             test_km_salt(),
             vec![0x24; 24],
+            CipherMode::Ctr,
         );
 
         conn.handle_user_defined(
@@ -3057,8 +3102,14 @@ mod tests {
         });
         conn.connect(Timestamp::from_micros(0)).unwrap();
         conn.crypto = Some(
-            CryptoContext::new_sender("test_passphrase", KeyLength::Aes128, test_km_salt(), &sek)
-                .unwrap(),
+            CryptoContext::new_sender(
+                "test_passphrase",
+                KeyLength::Aes128,
+                test_km_salt(),
+                &sek,
+                CipherMode::Ctr,
+            )
+            .unwrap(),
         );
 
         // A CONCLUSION with no KMRSP should fail for an encrypted caller.

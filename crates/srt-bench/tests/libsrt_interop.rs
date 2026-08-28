@@ -6,7 +6,7 @@
 //! `cargo test` runs on a machine without libsrt installed still pass. CI
 //! installs `srt-tools` explicitly before running this suite.
 
-use shiguredo_srt::{ConnectionOptions, KeyLength, SrtConnection, Timestamp};
+use shiguredo_srt::{CipherMode, ConnectionOptions, KeyLength, SrtConnection, Timestamp};
 use srt_bench::driver;
 use srt_transport::{
     AdmissionOptions, AdmissionResolution, CallerConfig, GroupCallerLeg, GroupConfig, GroupConn,
@@ -37,6 +37,36 @@ fn command_available(binary: &str) -> bool {
         .stderr(Stdio::null())
         .status()
         .is_ok()
+}
+
+/// AES-GCM (AEAD) is a preview feature in libsrt 1.5.x, gated behind the
+/// `ENABLE_AEAD_API_PREVIEW` build flag and requiring the OpenSSL-EVP or Botan
+/// crypto backend (not GnuTLS). Most distro packages lack it.
+fn libsrt_supports_gcm() -> bool {
+    // Check the crypto backend via ldd: GCM requires OpenSSL-EVP or Botan.
+    let path = Command::new("which")
+        .arg("srt-live-transmit")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_owned());
+    let Some(slt) = path else { return false };
+    let ldd = Command::new("ldd")
+        .arg(&slt)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+    match ldd {
+        Ok(out) => {
+            let libs = String::from_utf8_lossy(&out.stdout);
+            // GCM requires OpenSSL-EVP or Botan; GnuTLS backend cannot do AEAD.
+            (libs.contains("libssl") || libs.contains("libcrypto") || libs.contains("libbotan"))
+                && !libs.contains("libgnutls")
+        }
+        Err(_) => false,
+    }
 }
 
 fn free_port() -> u16 {
@@ -83,6 +113,7 @@ fn test_payload_bytes(len: usize) -> Vec<u8> {
 #[derive(Clone, Copy, Default)]
 struct LiveOptions<'a> {
     encryption: Option<(&'a str, KeyLength)>,
+    cipher_mode: CipherMode,
     stream_id: Option<&'a str>,
     input_bandwidth: Option<(u64, u8)>,
 }
@@ -583,6 +614,9 @@ fn send_to_libsrt_listener_with_on_connect(
                 key_length.len()
             ));
         }
+        if listener.cipher_mode == CipherMode::Gcm {
+            input_uri.push_str("&cryptomode=aes-gcm");
+        }
         if let Some(stream_id) = listener.stream_id {
             input_uri.push_str(&format!("&streamid={stream_id}"));
         }
@@ -613,6 +647,7 @@ fn send_to_libsrt_listener_with_on_connect(
         key_length: caller
             .encryption
             .map_or(KeyLength::Aes128, |(_, key_length)| key_length),
+        cipher_mode: caller.cipher_mode,
         stream_id: caller.stream_id.map(str::to_owned),
         input_bandwidth_bytes_per_sec: caller.input_bandwidth.map(|(input, _)| input),
         overhead_bandwidth_percent: caller.input_bandwidth.map_or(25, |(_, overhead)| overhead),
@@ -1670,5 +1705,90 @@ fn rust_broadcast_group_interoperates_with_libsrt_listener() {
     assert_eq!(
         output.stdout, payload,
         "libsrt did not receive Rust broadcast payload"
+    );
+}
+
+/// AES-GCM interop: Rust caller encrypts with GCM, libsrt listener decrypts.
+/// Skips when libsrt lacks AEAD support (GnuTLS backend or missing preview flag).
+#[test]
+fn rust_gcm_caller_sends_to_libsrt_listener() {
+    let _guard = interop_test_lock();
+    if !command_available("srt-live-transmit") {
+        eprintln!(
+            "skipping rust_gcm_caller_sends_to_libsrt_listener: srt-live-transmit not on PATH"
+        );
+        return;
+    }
+    if !libsrt_supports_gcm() {
+        eprintln!(
+            "skipping rust_gcm_caller_sends_to_libsrt_listener: libsrt not built with ENABLE_AEAD_API_PREVIEW"
+        );
+        return;
+    }
+
+    let payload = test_payload();
+    let gcm_caller = LiveOptions {
+        encryption: Some(("interop-passphrase", KeyLength::Aes128)),
+        cipher_mode: CipherMode::Gcm,
+        ..Default::default()
+    };
+    let gcm_listener = LiveOptions {
+        encryption: Some(("interop-passphrase", KeyLength::Aes128)),
+        ..Default::default()
+    };
+    let (result, output) =
+        send_to_libsrt_listener(&payload, gcm_caller, gcm_listener, Duration::from_secs(10));
+    assert!(
+        result.connected,
+        "Rust GCM caller never reached Connected: {:?}",
+        result.events
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "libsrt GCM listener failed: {stderr}"
+    );
+    assert_eq!(
+        output.stdout, payload,
+        "libsrt did not decrypt Rust GCM caller's payload"
+    );
+}
+
+/// AES-GCM interop (reverse): libsrt caller encrypts with GCM, Rust listener decrypts.
+/// Skips when libsrt lacks AEAD support (GnuTLS backend or missing preview flag).
+#[test]
+fn libsrt_gcm_caller_sends_to_rust_listener() {
+    let _guard = interop_test_lock();
+    if !command_available("srt-live-transmit") {
+        eprintln!(
+            "skipping libsrt_gcm_caller_sends_to_rust_listener: srt-live-transmit not on PATH"
+        );
+        return;
+    }
+    if !libsrt_supports_gcm() {
+        eprintln!(
+            "skipping libsrt_gcm_caller_sends_to_rust_listener: libsrt not built with ENABLE_AEAD_API_PREVIEW"
+        );
+        return;
+    }
+
+    let payload = test_payload();
+    let (result, status, stderr) = receive_live_from_udp_source(
+        &payload,
+        Some(("interop-passphrase", KeyLength::Aes128)),
+        Some(("interop-passphrase", KeyLength::Aes128)),
+        None,
+        Some("cryptomode=aes-gcm"),
+    );
+    assert!(
+        result.connected,
+        "Rust listener never connected: {:?}",
+        result.events
+    );
+    assert!(status.success(), "libsrt GCM caller failed: {stderr}");
+    let received: Vec<u8> = result.received_payloads.into_iter().flatten().collect();
+    assert_eq!(
+        received, payload,
+        "Rust listener did not decrypt libsrt GCM caller's payload"
     );
 }

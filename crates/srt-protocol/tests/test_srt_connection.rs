@@ -5,9 +5,9 @@
 use std::time::Duration;
 
 use shiguredo_srt::{
-    ConnectionEvent, ConnectionOptions, ConnectionOutput, ConnectionState, ConnectionStats,
-    DataPacket, ErrorKind, GroupExtensionData, GroupType, KeyLength, PacketPosition, SrtConnection,
-    SrtPacket, TimerId, Timestamp,
+    CipherMode, ConnectionEvent, ConnectionOptions, ConnectionOutput, ConnectionState,
+    ConnectionStats, DataPacket, ErrorKind, GroupExtensionData, GroupType, KeyLength,
+    PacketPosition, SrtConnection, SrtPacket, TimerId, Timestamp,
 };
 
 /// テスト用のデフォルトオプション (TSBPD 遅延を 0 にして即時配信)
@@ -1360,4 +1360,103 @@ fn explicit_socket_id_is_preserved() {
     };
     let caller = SrtConnection::new_caller(options);
     assert_eq!(caller.socket_id(), 0x42);
+}
+
+#[test]
+fn test_handshake_with_aes_gcm() {
+    let passphrase = "gcm-test-passphrase".to_string();
+    let caller_opts = ConnectionOptions {
+        passphrase: Some(passphrase.clone()),
+        crypto_salt: Some([0x42; 16]),
+        key_length: KeyLength::Aes128,
+        cipher_mode: CipherMode::Gcm,
+        tsbpd_delay: 0,
+        ..Default::default()
+    };
+    let listener_opts = ConnectionOptions {
+        passphrase: Some(passphrase),
+        key_length: KeyLength::Aes128,
+        tsbpd_delay: 0,
+        ..Default::default()
+    };
+    let mut caller = SrtConnection::new_caller(caller_opts);
+    let mut listener = SrtConnection::new_listener(listener_opts);
+
+    establish_connection(&mut caller, &mut listener).expect("GCM handshake should succeed");
+    assert_eq!(caller.state(), ConnectionState::Connected);
+    assert_eq!(listener.state(), ConnectionState::Connected);
+}
+
+#[test]
+fn test_data_transfer_with_aes_gcm() {
+    let passphrase = "gcm-data-test".to_string();
+    let caller_opts = ConnectionOptions {
+        passphrase: Some(passphrase.clone()),
+        crypto_salt: Some([0x42; 16]),
+        key_length: KeyLength::Aes128,
+        cipher_mode: CipherMode::Gcm,
+        tsbpd_delay: 0,
+        ..Default::default()
+    };
+    let listener_opts = ConnectionOptions {
+        passphrase: Some(passphrase),
+        key_length: KeyLength::Aes128,
+        tsbpd_delay: 0,
+        ..Default::default()
+    };
+    let mut caller = SrtConnection::new_caller(caller_opts);
+    let mut listener = SrtConnection::new_listener(listener_opts);
+
+    establish_connection(&mut caller, &mut listener).expect("GCM handshake should succeed");
+    while caller.poll_event().is_some() {}
+    while listener.poll_event().is_some() {}
+
+    let test_data = b"Authenticated + encrypted via AES-GCM!";
+    let now = ts(100_000);
+    caller.send(test_data, now).expect("send should succeed");
+    transfer_caller_to_listener(&mut caller, &mut listener, now);
+    listener
+        .handle_timer(TimerId::Ack, now)
+        .expect("timer should succeed");
+
+    let received = collect_received_data(&mut listener);
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0], test_data);
+}
+
+#[test]
+fn test_data_transfer_with_aes256_gcm() {
+    let passphrase = "gcm-256-data-test".to_string();
+    let caller_opts = ConnectionOptions {
+        passphrase: Some(passphrase.clone()),
+        crypto_salt: Some([0x42; 16]),
+        key_length: KeyLength::Aes256,
+        cipher_mode: CipherMode::Gcm,
+        tsbpd_delay: 0,
+        ..Default::default()
+    };
+    let listener_opts = ConnectionOptions {
+        passphrase: Some(passphrase),
+        key_length: KeyLength::Aes256,
+        tsbpd_delay: 0,
+        ..Default::default()
+    };
+    let mut caller = SrtConnection::new_caller(caller_opts);
+    let mut listener = SrtConnection::new_listener(listener_opts);
+
+    establish_connection(&mut caller, &mut listener).expect("GCM-256 handshake should succeed");
+    while caller.poll_event().is_some() {}
+    while listener.poll_event().is_some() {}
+
+    let test_data = b"AES-256-GCM encrypted data transfer";
+    let now = ts(100_000);
+    caller.send(test_data, now).expect("send should succeed");
+    transfer_caller_to_listener(&mut caller, &mut listener, now);
+    listener
+        .handle_timer(TimerId::Ack, now)
+        .expect("timer should succeed");
+
+    let received = collect_received_data(&mut listener);
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0], test_data);
 }
