@@ -753,7 +753,7 @@ impl SrtConnection {
         let handshake =
             HandshakePacket::new_rejection(self.options.socket_id, self.syn_cookie, reason);
         let packet = handshake.encode(self.relative_timestamp(now), self.peer_socket_id);
-        let mut bytes = Vec::new();
+        let mut bytes = Vec::with_capacity(packet.encoded_size());
         packet.encode(&mut bytes);
         self.queue_handshake_packet(bytes);
         self.terminate_handshake();
@@ -856,7 +856,7 @@ impl SrtConnection {
         while let Some(mut packet) = self.sender.as_mut().and_then(SenderBuffer::pop_retransmit) {
             let _ = self.encrypt_packet(&mut packet);
 
-            let mut buf = Vec::new();
+            let mut buf = Vec::with_capacity(packet.encoded_size());
             packet.encode(&mut buf);
             self.queue_packet(buf, now);
         }
@@ -1022,7 +1022,7 @@ impl SrtConnection {
 
         for mut packet in packets {
             self.encrypt_packet(&mut packet)?;
-            let mut buf = Vec::new();
+            let mut buf = Vec::with_capacity(packet.encoded_size());
             packet.encode(&mut buf);
             self.queue_packet(buf, now);
         }
@@ -1087,7 +1087,7 @@ impl SrtConnection {
 
             self.encrypt_packet(&mut packet)?;
 
-            let mut buf = Vec::new();
+            let mut buf = Vec::with_capacity(packet.encoded_size());
             packet.encode(&mut buf);
             self.queue_packet(buf, now);
 
@@ -1944,7 +1944,7 @@ impl SrtConnection {
         write_u32(&mut cif, first_seq);
         write_u32(&mut cif, last_seq);
         pkt.control_info = cif;
-        let mut buf = Vec::new();
+        let mut buf = Vec::with_capacity(pkt.encoded_size());
         pkt.encode(&mut buf);
         self.queue_packet(buf, now);
     }
@@ -2029,7 +2029,7 @@ impl SrtConnection {
             control_info: km_message.encode(),
         };
 
-        let mut buf = Vec::new();
+        let mut buf = Vec::with_capacity(pkt.encoded_size());
         pkt.encode(&mut buf);
         self.queue_packet(buf, now);
     }
@@ -2047,7 +2047,7 @@ impl SrtConnection {
             control_info: km_message.encode(),
         };
 
-        let mut buf = Vec::new();
+        let mut buf = Vec::with_capacity(pkt.encoded_size());
         pkt.encode(&mut buf);
         self.queue_packet(buf, now);
     }
@@ -2065,7 +2065,7 @@ impl SrtConnection {
             dest_socket_id: self.peer_socket_id,
             control_info,
         };
-        let mut buf = Vec::new();
+        let mut buf = Vec::with_capacity(pkt.encoded_size());
         pkt.encode(&mut buf);
         self.queue_packet(buf, now);
     }
@@ -2133,7 +2133,7 @@ impl SrtConnection {
             control_info,
         };
 
-        let mut buf = Vec::new();
+        let mut buf = Vec::with_capacity(pkt.encoded_size());
         pkt.encode(&mut buf);
         self.queue_packet(buf, now);
     }
@@ -2159,7 +2159,7 @@ impl SrtConnection {
             control_info,
         };
 
-        let mut buf = Vec::new();
+        let mut buf = Vec::with_capacity(pkt.encoded_size());
         pkt.encode(&mut buf);
         self.queue_packet(buf, now);
     }
@@ -2194,7 +2194,7 @@ impl SrtConnection {
             control_info: LIBSRT_COMPAT_PADDING.to_vec(),
         };
 
-        let mut buf = Vec::new();
+        let mut buf = Vec::with_capacity(pkt.encoded_size());
         pkt.encode(&mut buf);
         self.queue_packet(buf, now);
     }
@@ -2203,7 +2203,7 @@ impl SrtConnection {
         let mut hs = HandshakePacket::new_induction_request(self.options.socket_id);
         hs.flow_window = self.flight_capacity_packets();
         let pkt = hs.encode(self.relative_timestamp(now), 0);
-        let mut buf = Vec::new();
+        let mut buf = Vec::with_capacity(pkt.encoded_size());
         pkt.encode(&mut buf);
         self.queue_handshake_packet(buf);
     }
@@ -2271,7 +2271,7 @@ impl SrtConnection {
         );
         hs.flow_window = self.flight_capacity_packets();
         let pkt = hs.encode(self.relative_timestamp(now), self.peer_socket_id);
-        let mut buf = Vec::new();
+        let mut buf = Vec::with_capacity(pkt.encoded_size());
         pkt.encode(&mut buf);
         self.queue_handshake_packet(buf);
     }
@@ -2341,7 +2341,7 @@ impl SrtConnection {
 
         // A CONCLUSION request is sent with dest_socket_id = 0 (libsrt compatibility).
         let pkt = hs.encode(self.relative_timestamp(now), 0);
-        let mut buf = Vec::new();
+        let mut buf = Vec::with_capacity(pkt.encoded_size());
         pkt.encode(&mut buf);
         self.queue_handshake_packet(buf);
         Ok(())
@@ -2381,7 +2381,7 @@ impl SrtConnection {
         }
 
         let pkt = hs.encode(self.relative_timestamp(now), self.peer_socket_id);
-        let mut buf = Vec::new();
+        let mut buf = Vec::with_capacity(pkt.encoded_size());
         pkt.encode(&mut buf);
         self.queue_handshake_packet(buf);
     }
@@ -2405,7 +2405,7 @@ impl SrtConnection {
             hs.add_group_extension(group);
         }
         let packet = hs.encode(self.relative_timestamp(now), self.peer_socket_id);
-        let mut bytes = Vec::new();
+        let mut bytes = Vec::with_capacity(packet.encoded_size());
         packet.encode(&mut bytes);
         self.queue_handshake_packet(bytes);
         self.terminate_handshake();
@@ -2500,7 +2500,7 @@ impl SrtConnection {
             // libsrt compatibility: 0-byte data section -> 4 bytes of zero padding.
             control_info: LIBSRT_COMPAT_PADDING.to_vec(),
         };
-        let mut buf = Vec::new();
+        let mut buf = Vec::with_capacity(pkt.encoded_size());
         pkt.encode(&mut buf);
         self.queue_packet(buf, now);
     }
@@ -2522,7 +2522,7 @@ impl SrtConnection {
             // libsrt compatibility: 0-byte data section -> 4 bytes of zero padding.
             control_info: LIBSRT_COMPAT_PADDING.to_vec(),
         };
-        let mut buf = Vec::new();
+        let mut buf = Vec::with_capacity(pkt.encoded_size());
         pkt.encode(&mut buf);
         self.queue_packet(buf, now);
     }
