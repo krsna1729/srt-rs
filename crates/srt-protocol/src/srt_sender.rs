@@ -44,7 +44,7 @@ struct SentPacket {
     order_flag: bool,
     message_number: u32,
     timestamp: u32,
-    payload: Vec<u8>,
+    payload: Box<[u8]>,
     sent_time: Timestamp,
     retransmit_count: u32,
 }
@@ -395,7 +395,7 @@ impl SenderBuffer {
                 order_flag: false,
                 message_number,
                 timestamp,
-                payload: payload.clone(),
+                payload: payload.clone().into_boxed_slice(),
                 sent_time: now,
                 retransmit_count: 0,
             },
@@ -469,7 +469,7 @@ impl SenderBuffer {
                     order_flag: true,
                     message_number: self.next_msg,
                     timestamp,
-                    payload: chunk_payload.clone(),
+                    payload: chunk_payload.clone().into_boxed_slice(),
                     sent_time: now,
                     retransmit_count: 0,
                 },
@@ -537,7 +537,7 @@ impl SenderBuffer {
                     message_number: entry.message_number,
                     timestamp: entry.timestamp,
                     dest_socket_id,
-                    payload: entry.payload.clone(),
+                    payload: entry.payload.to_vec(),
                 });
             }
         }
