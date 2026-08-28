@@ -1354,7 +1354,7 @@ impl SrtConnection {
         }
     }
 
-    fn handle_data_packet(&mut self, pkt: DataPacket, now: Timestamp) -> Result<(), Error> {
+    fn handle_data_packet(&mut self, mut pkt: DataPacket, now: Timestamp) -> Result<(), Error> {
         if self.state == ConnectionState::Closing {
             self.finish_local_close("peer activity after shutdown");
             return Ok(());
@@ -1379,19 +1379,24 @@ impl SrtConnection {
             ));
         }
 
-        let payload = if pkt.encryption_flag != 0 {
-            let decrypt_result = if let Some(ref crypto) = self.crypto {
+        if pkt.encryption_flag != 0 {
+            let result = if let Some(ref crypto) = self.crypto {
                 let key_flag = KeyFlag::from_kk_field(pkt.encryption_flag)
                     .ok_or_else(|| Error::crypto_error("invalid KK flag"))?;
                 match crypto.cipher_mode() {
                     CipherMode::Ctr => {
-                        let mut payload = pkt.payload.clone();
-                        crypto.decrypt(pkt.sequence_number, key_flag, &mut payload)?;
-                        Ok(payload)
+                        crypto.decrypt(pkt.sequence_number, key_flag, &mut pkt.payload)?;
+                        Ok(())
                     }
                     CipherMode::Gcm => {
                         let aad = pkt.gcm_aad();
-                        crypto.decrypt_gcm(pkt.sequence_number, key_flag, &aad, &pkt.payload)
+                        pkt.payload = crypto.decrypt_gcm(
+                            pkt.sequence_number,
+                            key_flag,
+                            &aad,
+                            &pkt.payload,
+                        )?;
+                        Ok(())
                     }
                 }
             } else {
@@ -1399,18 +1404,13 @@ impl SrtConnection {
                     "encrypted packet but no crypto context",
                 ))
             };
-            match decrypt_result {
-                Ok(payload) => payload,
-                Err(error) => {
-                    if let Some(receiver) = self.receiver.as_mut() {
-                        receiver.record_undecryptable();
-                    }
-                    return Err(error);
+            if let Err(error) = result {
+                if let Some(receiver) = self.receiver.as_mut() {
+                    receiver.record_undecryptable();
                 }
+                return Err(error);
             }
-        } else {
-            pkt.payload.clone()
-        };
+        }
 
         // Receive before delivery. Ready packets are moved into the bounded
         // application queue below, so unread application data remains part of
@@ -1421,10 +1421,7 @@ impl SrtConnection {
                 None => return Ok(()),
             };
 
-            let mut decrypted_pkt = pkt;
-            decrypted_pkt.payload = payload;
-
-            let losses = receiver.receive(decrypted_pkt, now);
+            let losses = receiver.receive(pkt, now);
             let should_ack = receiver.should_send_ack(now);
 
             (losses, should_ack)
