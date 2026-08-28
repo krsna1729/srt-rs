@@ -30,7 +30,7 @@ const PAYLOAD_SIZE: usize = 1316;
 /// steady-state batch. All stay well under `DEFAULT_FLOW_WINDOW` (8192) --
 /// each batch starts from a freshly (but realistically) established
 /// connection with zero packets in flight.
-const BATCH_SIZES: &[u64] = &[1, 8, 64];
+const BATCH_SIZES: &[u64] = &[1, 8, 16, 24, 32, 64];
 
 fn ts(micros: u64) -> Timestamp {
     Timestamp::from_micros(micros)
