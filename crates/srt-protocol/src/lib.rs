@@ -1,6 +1,7 @@
 mod buf;
 mod crypto;
 mod error;
+mod message_assembler;
 mod srt_connection;
 mod srt_group;
 mod srt_handshake;

@@ -1166,6 +1166,28 @@ impl ReceiverBuffer {
         dropped
     }
 
+    /// Drop all packets in the sequence range `[first_seq, last_seq]`
+    /// from both the packet buffer and the loss list (DROPREQ path).
+    pub fn drop_range(&mut self, first_seq: u32, last_seq: u32) -> Vec<u32> {
+        let mut dropped = Vec::new();
+        let mut seq = first_seq;
+        loop {
+            self.packets.remove(&seq);
+            self.loss_list_remove(seq);
+            dropped.push(seq);
+            if seq == last_seq {
+                break;
+            }
+            seq = seq.wrapping_add(1) & 0x7FFF_FFFF;
+        }
+        self.total_dropped = self.total_dropped.saturating_add(dropped.len() as u64);
+        while self.packets.contains_key(&self.expected_seq) || dropped.contains(&self.expected_seq)
+        {
+            self.expected_seq = self.expected_seq.wrapping_add(1) & 0x7FFF_FFFF;
+        }
+        dropped
+    }
+
     /// Get the current ACK sequence number.
     pub fn ack_number(&self) -> u32 {
         self.ack_number
@@ -2490,5 +2512,24 @@ mod tests {
             stats.available_buffer_packets,
             DEFAULT_FLOW_WINDOW.saturating_sub(1)
         );
+    }
+
+    #[test]
+    fn drop_range_removes_packets_and_losses() {
+        let start = Timestamp::from_micros(0);
+        let mut buf = ReceiverBuffer::new(100, 120, start, 0);
+
+        buf.receive(make_packet(100, 1_000), Timestamp::from_micros(1_000));
+        // Skip 101 so it enters the loss list.
+        buf.receive(make_packet(102, 3_000), Timestamp::from_micros(3_000));
+
+        let dropped = buf.drop_range(100, 102);
+        assert_eq!(dropped, vec![100, 101, 102]);
+
+        // Packets gone — nothing ready even well past TSBPD.
+        assert!(buf.pop_ready(Timestamp::from_micros(10_000_000)).is_none());
+
+        // expected_seq advanced past dropped range.
+        assert!(buf.expected_sequence() > 102);
     }
 }
