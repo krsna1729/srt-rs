@@ -1460,3 +1460,145 @@ fn test_data_transfer_with_aes256_gcm() {
     assert_eq!(received.len(), 1);
     assert_eq!(received[0], test_data);
 }
+
+// ============================================================================
+// Message reassembly tests
+// ============================================================================
+
+#[test]
+fn send_message_fragments_and_reassembles() {
+    let mut caller = SrtConnection::new_caller(test_options());
+    let mut listener = SrtConnection::new_listener(test_options());
+    establish_connection(&mut caller, &mut listener).expect("connected");
+    while caller.poll_event().is_some() {}
+    while listener.poll_event().is_some() {}
+
+    let payload: Vec<u8> = (0..4000u32).map(|i| (i % 256) as u8).collect();
+    let now = ts(100_000);
+    caller
+        .send_message(&payload, now)
+        .expect("send_message should succeed");
+    transfer_caller_to_listener(&mut caller, &mut listener, now);
+
+    let received = collect_received_data(&mut listener);
+    assert_eq!(
+        received.len(),
+        1,
+        "multi-packet message should be reassembled into one event"
+    );
+    assert_eq!(received[0], payload);
+}
+
+#[test]
+fn send_message_single_packet_passthrough() {
+    let mut caller = SrtConnection::new_caller(test_options());
+    let mut listener = SrtConnection::new_listener(test_options());
+    establish_connection(&mut caller, &mut listener).expect("connected");
+    while caller.poll_event().is_some() {}
+    while listener.poll_event().is_some() {}
+
+    let payload = b"small payload";
+    let now = ts(100_000);
+    caller
+        .send_message(payload, now)
+        .expect("send_message should succeed");
+    transfer_caller_to_listener(&mut caller, &mut listener, now);
+
+    let received = collect_received_data(&mut listener);
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0], payload);
+}
+
+#[test]
+fn multiple_messages_reassemble_independently() {
+    let mut caller = SrtConnection::new_caller(test_options());
+    let mut listener = SrtConnection::new_listener(test_options());
+    establish_connection(&mut caller, &mut listener).expect("connected");
+    while caller.poll_event().is_some() {}
+    while listener.poll_event().is_some() {}
+
+    let payload1: Vec<u8> = vec![0xAA; 3000];
+    let payload2: Vec<u8> = vec![0xBB; 2000];
+    let now = ts(100_000);
+
+    caller.send_message(&payload1, now).expect("msg1");
+    caller.send_message(&payload2, now).expect("msg2");
+    transfer_caller_to_listener(&mut caller, &mut listener, now);
+
+    let received = collect_received_data(&mut listener);
+    assert_eq!(received.len(), 2);
+    assert_eq!(received[0], payload1);
+    assert_eq!(received[1], payload2);
+}
+
+#[test]
+fn dropreq_drops_receiver_message() {
+    let mut caller = SrtConnection::new_caller(test_options());
+    let mut listener = SrtConnection::new_listener(test_options());
+    establish_connection(&mut caller, &mut listener).expect("connected");
+    while caller.poll_event().is_some() {}
+    while listener.poll_event().is_some() {}
+
+    let payload: Vec<u8> = vec![0xCC; 4000];
+    let now = ts(100_000);
+    caller.send_message(&payload, now).expect("send");
+
+    // Collect all output packets from caller.
+    let mut packets = Vec::new();
+    while let Some(output) = caller.poll_output() {
+        if let ConnectionOutput::SendPacket(data) = output {
+            packets.push(data);
+        }
+    }
+    assert!(
+        packets.len() >= 3,
+        "should have at least 3 data packets, got {}",
+        packets.len()
+    );
+
+    // Feed only first packet — partial message, not delivered.
+    listener
+        .feed_recv_buf(&packets[0], now)
+        .expect("feed first");
+    let received = collect_received_data(&mut listener);
+    assert!(
+        received.is_empty(),
+        "partial message should not be delivered"
+    );
+
+    // Construct and feed a DROPREQ covering the whole message.
+    let first_pkt = SrtPacket::decode(&packets[0]).expect("decode");
+    let data_pkt = match first_pkt {
+        SrtPacket::Data(d) => d,
+        _ => panic!("expected data packet"),
+    };
+    let msg_num = data_pkt.message_number;
+    let first_seq = data_pkt.sequence_number;
+    let last_data = SrtPacket::decode(packets.last().unwrap()).expect("decode last");
+    let last_seq = match last_data {
+        SrtPacket::Data(d) => d.sequence_number,
+        _ => panic!("expected data packet"),
+    };
+
+    let mut dropreq = shiguredo_srt::ControlPacket::new(
+        shiguredo_srt::ControlType::DropReq,
+        100,
+        listener.socket_id(),
+    );
+    dropreq.type_specific_info = msg_num & 0x03FF_FFFF;
+    let mut cif = Vec::new();
+    shiguredo_srt::write_u32(&mut cif, first_seq);
+    shiguredo_srt::write_u32(&mut cif, last_seq);
+    dropreq.control_info = cif;
+    let mut buf = Vec::new();
+    dropreq.encode(&mut buf);
+
+    listener.feed_recv_buf(&buf, now).expect("feed dropreq");
+
+    // After DROPREQ, remaining fragments should not produce a message.
+    for pkt in &packets[1..] {
+        let _ = listener.feed_recv_buf(pkt, now);
+    }
+    let received = collect_received_data(&mut listener);
+    assert!(received.is_empty(), "dropped message should not reassemble");
+}
