@@ -403,6 +403,82 @@ proptest! {
         prop_assert_eq!(stats.jitter, 0);
     }
 
+    /// Loss detection under random out-of-order arrival never produces
+    /// duplicates and accounts for every missing sequence number.
+    #[test]
+    fn detect_losses_total_equals_gap_minus_received(
+        initial_seq in 0u32..0x7FFF_FF00u32,
+        gap in 2u32..20u32,
+        drop_indices in proptest::collection::hash_set(0usize..19usize, 1..10),
+    ) {
+        let start = Timestamp::from_micros(0);
+        let mut buf = ReceiverBuffer::new(initial_seq, 120, start, 0);
+        buf.set_tsbpd_enabled(false);
+        let now = Timestamp::from_micros(1_000);
+
+        let end_seq = (initial_seq + gap) & 0x7FFF_FFFF;
+        let seqs: Vec<u32> = (0..gap)
+            .map(|i| (initial_seq + i) & 0x7FFF_FFFF)
+            .collect();
+        let dropped: Vec<u32> = drop_indices
+            .iter()
+            .filter(|&&i| i < seqs.len())
+            .map(|&i| seqs[i])
+            .collect();
+
+        for &seq in &seqs {
+            if !dropped.contains(&seq) {
+                buf.receive(make_packet(seq, 100), now);
+            }
+        }
+        // Trigger loss detection with the packet after the gap.
+        buf.receive(make_packet(end_seq, 200), now);
+
+        let stats = buf.stats();
+        prop_assert_eq!(
+            stats.total_lost,
+            dropped.len() as u64,
+            "total_lost must equal the number of dropped packets"
+        );
+    }
+
+    /// Loss detection across the sequence-number wrap boundary
+    /// (0x7FFF_FFFF -> 0) produces the correct loss count.
+    #[test]
+    fn detect_losses_across_wrap_boundary(
+        before in 1u32..5u32,
+        after in 1u32..5u32,
+        drop_count in 1usize..4usize,
+    ) {
+        let total = before + after;
+        let start_seq = 0x7FFF_FFFFu32.wrapping_sub(before - 1);
+        let start = Timestamp::from_micros(0);
+        let mut buf = ReceiverBuffer::new(start_seq, 120, start, 0);
+        buf.set_tsbpd_enabled(false);
+        let now = Timestamp::from_micros(1_000);
+
+        let seqs: Vec<u32> = (0..total)
+            .map(|i| start_seq.wrapping_add(i) & 0x7FFF_FFFF)
+            .collect();
+        let actual_drops = drop_count.min(seqs.len().saturating_sub(1));
+        let dropped: std::collections::HashSet<u32> =
+            seqs[..actual_drops].iter().copied().collect();
+
+        for &seq in &seqs {
+            if !dropped.contains(&seq) {
+                buf.receive(make_packet(seq, 100), now);
+            }
+        }
+        let end_seq = start_seq.wrapping_add(total) & 0x7FFF_FFFF;
+        buf.receive(make_packet(end_seq, 200), now);
+
+        prop_assert_eq!(
+            buf.stats().total_lost,
+            dropped.len() as u64,
+            "wrap-boundary losses must be detected correctly"
+        );
+    }
+
     #[test]
     fn test_pop_ready_wrap_around_delivery_order(
         (seqs, recv_order) in wrap_around_run(),
