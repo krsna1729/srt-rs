@@ -104,7 +104,7 @@ impl LogicalCaller<'_> {
 }
 
 /// Mutable steady-state view of one outbound logical stream. This deliberately
-/// mirrors [`LogicalPeerMut`]: applications send, check capacity, close, and
+/// mirrors [`crate::LogicalPeerMut`]: applications send, check capacity, close, and
 /// collect telemetry without handling socket IDs or bond legs.
 pub struct LogicalCallerMut<'a> {
     table: &'a mut CallerTable,
