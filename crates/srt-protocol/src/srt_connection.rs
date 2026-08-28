@@ -68,6 +68,24 @@ pub enum TimerId {
     Shutdown,
 }
 
+impl TimerId {
+    pub const COUNT: usize = 7;
+
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    pub const ALL: [TimerId; 7] = [
+        TimerId::Ack,
+        TimerId::Nak,
+        TimerId::Keepalive,
+        TimerId::Retransmit,
+        TimerId::Handshake,
+        TimerId::Inactivity,
+        TimerId::Shutdown,
+    ];
+}
+
 /// Inactivity timeout duration (microseconds).
 /// Usually 5 seconds per the SRT spec.
 const INACTIVITY_TIMEOUT_MICROS: u64 = 5_000_000;
