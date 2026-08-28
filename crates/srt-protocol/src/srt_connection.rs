@@ -388,6 +388,12 @@ impl SrtConnection {
             .map_err(|error| Error::crypto_error(format!("failed to generate {label}: {error}")))
     }
 
+    fn random_array<const N: usize>(label: &str) -> Result<[u8; N], Error> {
+        let mut buf = [0u8; N];
+        Self::random_bytes(&mut buf, label)?;
+        Ok(buf)
+    }
+
     /// Put the handshake into its terminal failed state.
     ///
     /// Every path that abandons a handshake -- rejection, KM failure,
@@ -1459,11 +1465,7 @@ impl SrtConnection {
         let key_length = hs.key_length().unwrap_or(self.options.key_length);
         let salt = match self.options.crypto_salt {
             Some(salt) => salt,
-            None => {
-                let mut salt = [0u8; 16];
-                Self::random_bytes(&mut salt, "crypto salt")?;
-                salt
-            }
+            None => Self::random_array("crypto salt")?,
         };
         let generated_sek;
         let sek = match self.options.crypto_sek.as_deref() {

@@ -158,15 +158,14 @@ pub struct CryptoContext {
 
 // local patch (crates/srt-protocol/VENDOR.md, upstream issues
 // 0049/0050, open/unfixed at vendor commit 6779cdd): #[derive(Debug)] would
-// print raw kek/sek_even/sek_odd key bytes via {:?}/dbg!(). Redact them
-// explicitly; the remaining fields carry no secret material.
+// print raw key bytes and salt via {:?}/dbg!(). Redact all keying material.
 impl fmt::Debug for CryptoContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CryptoContext")
             .field("kek", &"[REDACTED]")
             .field("sek_even", &"[REDACTED]")
             .field("sek_odd", &"[REDACTED]")
-            .field("salt", &self.salt)
+            .field("salt", &"[REDACTED]")
             .field("current_key", &self.current_key)
             .field("key_length", &self.key_length)
             .field("encrypted_packet_count", &self.encrypted_packet_count)
@@ -187,6 +186,7 @@ impl Drop for CryptoContext {
         self.kek.zeroize();
         self.sek_even.zeroize();
         self.sek_odd.zeroize();
+        self.salt.zeroize();
     }
 }
 
