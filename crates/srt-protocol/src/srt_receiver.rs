@@ -315,7 +315,7 @@ struct ReceivedPacket {
     order_flag: bool,
     message_number: u32,
     timestamp: u32,
-    payload: Vec<u8>,
+    payload: Box<[u8]>,
     recv_time: Timestamp,
 }
 
@@ -687,7 +687,7 @@ impl ReceiverBuffer {
                 order_flag: packet.order_flag,
                 message_number: packet.message_number,
                 timestamp: packet.timestamp,
-                payload: packet.payload,
+                payload: packet.payload.into_boxed_slice(),
                 recv_time: now,
             },
         );
@@ -839,7 +839,7 @@ impl ReceiverBuffer {
             message_number: entry.message_number,
             timestamp: entry.timestamp,
             dest_socket_id: 0,
-            payload: entry.payload,
+            payload: entry.payload.into_vec(),
         })
     }
 
