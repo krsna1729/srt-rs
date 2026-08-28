@@ -13,7 +13,8 @@
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use shiguredo_srt::{
-    ConnectionOptions, ConnectionOutput, ConnectionState, SrtConnection, TimerId, Timestamp,
+    CipherMode, ConnectionOptions, ConnectionOutput, ConnectionState, SrtConnection, TimerId,
+    Timestamp,
 };
 use std::hint::black_box;
 
@@ -52,14 +53,22 @@ fn drain_sent(conn: &mut SrtConnection) -> Vec<Vec<u8>> {
     sent
 }
 
-fn connection_options(passphrase: Option<&str>) -> ConnectionOptions {
+fn connection_options_with_mode(
+    passphrase: Option<&str>,
+    cipher_mode: CipherMode,
+) -> ConnectionOptions {
     ConnectionOptions {
         tsbpd_delay: 0,
         passphrase: passphrase.map(str::to_string),
         crypto_salt: passphrase.map(|_| [0x11u8; 16]),
         crypto_sek: passphrase.map(|_| vec![0x22u8; 16]),
+        cipher_mode,
         ..Default::default()
     }
+}
+
+fn connection_options(passphrase: Option<&str>) -> ConnectionOptions {
+    connection_options_with_mode(passphrase, CipherMode::Ctr)
 }
 
 /// Establish a connected caller/listener pair via the sans-I/O handshake
@@ -178,5 +187,53 @@ fn bench_encrypted(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_plain, bench_encrypted);
+fn setup_connected_pair_gcm(passphrase: Option<&str>) -> (SrtConnection, SrtConnection) {
+    let caller_opts = connection_options_with_mode(passphrase, CipherMode::Gcm);
+    let listener_opts = connection_options_with_mode(passphrase, CipherMode::Gcm);
+    let mut caller = SrtConnection::new_caller(caller_opts);
+    let mut listener = SrtConnection::new_listener(listener_opts);
+
+    caller.connect(ts(0)).expect("connect() should succeed");
+
+    for i in 0..10u64 {
+        let now = ts(i * 10_000);
+        for data in drain_sent(&mut caller) {
+            let _ = listener.feed_recv_buf(&data, now);
+        }
+        for data in drain_sent(&mut listener) {
+            let _ = caller.feed_recv_buf(&data, now);
+        }
+        if caller.state() == ConnectionState::Connected
+            && listener.state() == ConnectionState::Connected
+        {
+            return (caller, listener);
+        }
+    }
+    panic!(
+        "GCM connection not established: caller={:?} listener={:?}",
+        caller.state(),
+        listener.state()
+    );
+}
+
+fn bench_encrypted_gcm(c: &mut Criterion) {
+    let mut group = c.benchmark_group("core_packet_loop");
+    for &batch_size in BATCH_SIZES {
+        group.throughput(Throughput::Elements(batch_size));
+        group.bench_with_input(
+            BenchmarkId::new("aes128_gcm_send_recv", batch_size),
+            &batch_size,
+            |b, &batch_size| {
+                b.iter_batched(
+                    || setup_connected_pair_gcm(Some("bench-passphrase")),
+                    |(mut caller, mut listener)| run_batch(&mut caller, &mut listener, batch_size),
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_plain, bench_encrypted, bench_encrypted_gcm);
 criterion_main!(benches);

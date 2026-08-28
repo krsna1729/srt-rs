@@ -1,9 +1,15 @@
 //! SRT encryption module.
 //!
-//! SRT encrypts payloads with AES-CTR.
+//! SRT encrypts payloads with AES-CTR or AES-GCM (authenticated encryption).
 //! - KEK (Key Encrypting Key): derived from the passphrase via PBKDF2
 //! - SEK (Stream Encrypting Key): generated randomly, wrapped with the KEK via AES Key Wrap
-//! - Payload data is encrypted with AES-CTR
+//! - Payload data is encrypted with AES-CTR or AES-GCM
+//!
+//! AES-GCM (added in libsrt 1.6.0) provides authenticated encryption: each
+//! encrypted data packet carries a 16-byte authentication tag appended after
+//! the ciphertext, and the 16-byte SRT packet header is used as additional
+//! authenticated data (AAD). The retransmit flag (R) is zeroed in the AAD
+//! because it can change between original and retransmitted copies.
 //!
 //! local patch (crates/srt-protocol/VENDOR.md): originally
 //! `aws-lc-rs`, which pulls in `aws-lc-sys` -- a cmake+C-compiler native
@@ -13,22 +19,21 @@
 //! - PBKDF2-HMAC-SHA1 (KEK derivation): `pbkdf2` + `sha1`
 //! - AES Key Wrap / RFC 3394 (SEK wrap/unwrap): `aes-kw`
 //! - AES-CTR (payload encryption): `ctr` + `aes`, `cipher` traits
+//! - AES-GCM (authenticated payload encryption): `aes-gcm`
 //!
-//! `ctr`/`aes-kw` and `hmac`/`sha1`/`pbkdf2` must be pinned to versions
-//! that agree on the same `cipher`/`aes` generation (currently `cipher
-//! 0.5`/`aes 0.9`) -- pinning older `hmac`/`sha1`/`pbkdf2` alongside
-//! current `ctr`/`aes-kw` pulls in two incompatible generations
-//! simultaneously and still compiles (Cargo allows this across separate
-//! parts of the dependency graph), which is a real trap: it's what made
-//! hand-rolling AES-CTR/AES-KW look necessary in an earlier draft of this
-//! patch. Verified clean (single generation, no duplicate `aes`/`cipher`
-//! versions) at the versions pinned in `Cargo.toml`.
+//! `ctr`/`aes-kw`/`aes-gcm` and `hmac`/`sha1`/`pbkdf2` must be pinned to
+//! versions that agree on the same `cipher`/`aes` generation (currently
+//! `cipher 0.5`/`aes 0.9`). Verified clean (single generation, no
+//! duplicate `aes`/`cipher` versions) at the versions pinned in
+//! `Cargo.toml`.
 
 use std::fmt;
 
 use aes::{Aes128, Aes192, Aes256};
+use aes_gcm::aead::AeadInOut;
+use aes_gcm::{Aes128Gcm, Aes256Gcm, KeyInit as GcmKeyInit, Nonce};
 use aes_kw::{KwAes128, KwAes192, KwAes256};
-use cipher::{KeyInit, KeyIvInit, StreamCipher};
+use cipher::{KeyIvInit, StreamCipher};
 use ctr::Ctr128BE;
 use pbkdf2::pbkdf2_hmac;
 use sha1::Sha1;
@@ -38,6 +43,37 @@ use crate::error::Error;
 
 /// Number of PBKDF2 iterations (per the SRT specification).
 const PBKDF2_ITERATIONS: u32 = 2048;
+
+/// AES-GCM authentication tag length (bytes).
+pub const GCM_TAG_LEN: usize = 16;
+
+/// AES-GCM IV/nonce length (bytes).
+const GCM_IV_LEN: usize = 12;
+
+/// Cipher mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CipherMode {
+    /// AES-CTR (counter mode, no authentication).
+    #[default]
+    Ctr,
+    /// AES-GCM (Galois/Counter Mode, authenticated encryption).
+    Gcm,
+}
+
+impl CipherMode {
+    /// Determine cipher mode from a decoded KM message.
+    ///
+    /// Returns `None` if the cipher/auth fields are inconsistent (e.g.
+    /// cipher=AES_GCM but auth!=AES_GCM).
+    pub fn from_km(km: &crate::srt_handshake::KmMessage) -> Option<Self> {
+        use crate::srt_handshake::{auth_type, cipher_type};
+        match (km.cipher, km.auth) {
+            (cipher_type::AES_CTR, auth_type::NONE) => Some(Self::Ctr),
+            (cipher_type::AES_GCM, auth_type::AES_GCM) => Some(Self::Gcm),
+            _ => None,
+        }
+    }
+}
 
 /// Key length.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -148,6 +184,8 @@ pub struct CryptoContext {
     current_key: KeyFlag,
     /// Key length.
     key_length: KeyLength,
+    /// Cipher mode (CTR or GCM).
+    cipher_mode: CipherMode,
     /// Number of packets encrypted so far.
     encrypted_packet_count: u64,
     /// KM refresh state.
@@ -168,6 +206,7 @@ impl fmt::Debug for CryptoContext {
             .field("salt", &"[REDACTED]")
             .field("current_key", &self.current_key)
             .field("key_length", &self.key_length)
+            .field("cipher_mode", &self.cipher_mode)
             .field("encrypted_packet_count", &self.encrypted_packet_count)
             .field("km_refresh_state", &self.km_refresh_state)
             .field("next_key", &self.next_key)
@@ -205,6 +244,7 @@ impl CryptoContext {
         key_length: KeyLength,
         salt: [u8; 16],
         sek: &[u8],
+        cipher_mode: CipherMode,
     ) -> Result<Self, Error> {
         if sek.len() != key_length.len() {
             return Err(Error::crypto_error("invalid SEK length"));
@@ -212,11 +252,14 @@ impl CryptoContext {
         if sek.iter().all(|byte| *byte == 0) {
             return Err(Error::crypto_error("SEK must not be all zero"));
         }
+        if cipher_mode == CipherMode::Gcm && key_length == KeyLength::Aes192 {
+            return Err(Error::crypto_error(
+                "AES-192 is not supported with GCM mode",
+            ));
+        }
 
-        // KEK を PBKDF2 で導出
         let kek = derive_kek(passphrase, &salt, key_length);
 
-        // SEK (初期は偶数キーのみ)
         let sek_even = sek.to_vec();
         let sek_odd = vec![0u8; key_length.len()];
 
@@ -227,6 +270,7 @@ impl CryptoContext {
             salt,
             current_key: KeyFlag::Even,
             key_length,
+            cipher_mode,
             encrypted_packet_count: 0,
             km_refresh_state: KmRefreshState::Idle,
             next_key: None,
@@ -242,11 +286,16 @@ impl CryptoContext {
         wrapped_sek: &[u8],
         key_flag: KeyFlag,
         key_length: KeyLength,
+        cipher_mode: CipherMode,
     ) -> Result<Self, Error> {
-        // KEK を PBKDF2 で導出
+        if cipher_mode == CipherMode::Gcm && key_length == KeyLength::Aes192 {
+            return Err(Error::crypto_error(
+                "AES-192 is not supported with GCM mode",
+            ));
+        }
+
         let kek = derive_kek(passphrase, &salt, key_length);
 
-        // SEK をアンラップ
         let sek = unwrap_sek(&kek, wrapped_sek, key_length)?;
         if sek.iter().all(|byte| *byte == 0) {
             return Err(Error::crypto_error("unwrapped SEK must not be all zero"));
@@ -264,6 +313,7 @@ impl CryptoContext {
             salt,
             current_key: key_flag,
             key_length,
+            cipher_mode,
             encrypted_packet_count: 0,
             km_refresh_state: KmRefreshState::Idle,
             next_key: None,
@@ -285,6 +335,11 @@ impl CryptoContext {
         self.key_length
     }
 
+    /// Get the cipher mode.
+    pub fn cipher_mode(&self) -> CipherMode {
+        self.cipher_mode
+    }
+
     /// Get the SEK, wrapped for a KM message.
     pub fn wrap_sek(&self, key_flag: KeyFlag) -> Result<Vec<u8>, Error> {
         let sek = match key_flag {
@@ -294,20 +349,48 @@ impl CryptoContext {
         wrap_sek(&self.kek, sek, self.key_length)
     }
 
-    /// Encrypt data.
+    /// Encrypt data in place (CTR mode).
     pub fn encrypt(&mut self, packet_index: u32, payload: &mut [u8]) -> Result<KeyFlag, Error> {
         let sek = match self.current_key {
             KeyFlag::Even => &self.sek_even,
             KeyFlag::Odd => &self.sek_odd,
         };
 
-        encrypt_payload(sek, &self.salt, packet_index, payload, self.key_length)?;
+        encrypt_payload_ctr(sek, &self.salt, packet_index, payload, self.key_length)?;
         self.encrypted_packet_count += 1;
 
         Ok(self.current_key)
     }
 
-    /// Decrypt data.
+    /// Encrypt data with GCM, returning ciphertext + 16-byte auth tag.
+    ///
+    /// `header` is the 16-byte SRT data packet header used as AAD; the
+    /// retransmit flag must already be zeroed by the caller.
+    pub fn encrypt_gcm(
+        &mut self,
+        packet_index: u32,
+        header: &[u8; 16],
+        payload: &[u8],
+    ) -> Result<(KeyFlag, Vec<u8>), Error> {
+        let sek = match self.current_key {
+            KeyFlag::Even => &self.sek_even,
+            KeyFlag::Odd => &self.sek_odd,
+        };
+
+        let out = encrypt_payload_gcm(
+            sek,
+            &self.salt,
+            packet_index,
+            header,
+            payload,
+            self.key_length,
+        )?;
+        self.encrypted_packet_count += 1;
+
+        Ok((self.current_key, out))
+    }
+
+    /// Decrypt data in place (CTR mode).
     pub fn decrypt(
         &self,
         packet_index: u32,
@@ -319,8 +402,33 @@ impl CryptoContext {
             KeyFlag::Odd => &self.sek_odd,
         };
 
-        // AES-CTR: encryption and decryption are the same operation.
-        encrypt_payload(sek, &self.salt, packet_index, payload, self.key_length)
+        encrypt_payload_ctr(sek, &self.salt, packet_index, payload, self.key_length)
+    }
+
+    /// Decrypt data with GCM, verifying the auth tag.
+    ///
+    /// `payload` contains ciphertext + 16-byte tag (appended by sender).
+    /// Returns the plaintext (tag stripped).
+    pub fn decrypt_gcm(
+        &self,
+        packet_index: u32,
+        key_flag: KeyFlag,
+        header: &[u8; 16],
+        payload: &[u8],
+    ) -> Result<Vec<u8>, Error> {
+        let sek = match key_flag {
+            KeyFlag::Even => &self.sek_even,
+            KeyFlag::Odd => &self.sek_odd,
+        };
+
+        decrypt_payload_gcm(
+            sek,
+            &self.salt,
+            packet_index,
+            header,
+            payload,
+            self.key_length,
+        )
     }
 
     /// Get the KM refresh state.
@@ -484,8 +592,8 @@ fn unwrap_sek(kek: &[u8], wrapped: &[u8], key_length: KeyLength) -> Result<Vec<u
     Ok(unwrapped)
 }
 
-/// Encrypt/decrypt a payload with AES-CTR.
-fn encrypt_payload(
+/// Encrypt/decrypt a payload in place with AES-CTR.
+fn encrypt_payload_ctr(
     sek: &[u8],
     salt: &[u8; 16],
     packet_index: u32,
@@ -534,6 +642,107 @@ fn encrypt_payload(
     }
 
     Ok(())
+}
+
+/// Build the 12-byte GCM IV from salt and packet index.
+///
+/// Layout (96 bits): zero 12 bytes, place PKI at bytes 8-11 (big-endian),
+/// XOR with MSB(96, salt). This matches libsrt's `hcrypt_SetGcmIV`.
+fn build_gcm_iv(salt: &[u8; 16], packet_index: u32) -> [u8; GCM_IV_LEN] {
+    let mut iv = [0u8; GCM_IV_LEN];
+    let pi_bytes = packet_index.to_be_bytes();
+    iv[8] = pi_bytes[0];
+    iv[9] = pi_bytes[1];
+    iv[10] = pi_bytes[2];
+    iv[11] = pi_bytes[3];
+    for i in 0..GCM_IV_LEN {
+        iv[i] ^= salt[i];
+    }
+    iv
+}
+
+/// Encrypt a payload with AES-GCM, returning ciphertext + 16-byte tag.
+fn encrypt_payload_gcm(
+    sek: &[u8],
+    salt: &[u8; 16],
+    packet_index: u32,
+    header: &[u8; 16],
+    plaintext: &[u8],
+    key_length: KeyLength,
+) -> Result<Vec<u8>, Error> {
+    let iv = build_gcm_iv(salt, packet_index);
+    let nonce = Nonce::try_from(iv.as_slice())
+        .map_err(|e| Error::crypto_error(format!("invalid GCM nonce: {e}")))?;
+    let mut buffer = plaintext.to_vec();
+
+    match key_length {
+        KeyLength::Aes128 => {
+            let cipher = Aes128Gcm::new_from_slice(sek)
+                .map_err(|e| Error::crypto_error(format!("invalid SEK: {e}")))?;
+            cipher
+                .encrypt_in_place(&nonce, header, &mut buffer)
+                .map_err(|e| Error::crypto_error(format!("AES-GCM encrypt failed: {e}")))?;
+        }
+        KeyLength::Aes192 => {
+            return Err(Error::crypto_error(
+                "AES-192 is not supported with GCM mode",
+            ));
+        }
+        KeyLength::Aes256 => {
+            let cipher = Aes256Gcm::new_from_slice(sek)
+                .map_err(|e| Error::crypto_error(format!("invalid SEK: {e}")))?;
+            cipher
+                .encrypt_in_place(&nonce, header, &mut buffer)
+                .map_err(|e| Error::crypto_error(format!("AES-GCM encrypt failed: {e}")))?;
+        }
+    }
+
+    Ok(buffer)
+}
+
+/// Decrypt a payload with AES-GCM, verifying the auth tag.
+///
+/// `ciphertext_and_tag` contains the ciphertext followed by a 16-byte tag.
+fn decrypt_payload_gcm(
+    sek: &[u8],
+    salt: &[u8; 16],
+    packet_index: u32,
+    header: &[u8; 16],
+    ciphertext_and_tag: &[u8],
+    key_length: KeyLength,
+) -> Result<Vec<u8>, Error> {
+    if ciphertext_and_tag.len() < GCM_TAG_LEN {
+        return Err(Error::crypto_error("GCM payload too short for auth tag"));
+    }
+
+    let iv = build_gcm_iv(salt, packet_index);
+    let nonce = Nonce::try_from(iv.as_slice())
+        .map_err(|e| Error::crypto_error(format!("invalid GCM nonce: {e}")))?;
+    let mut buffer = ciphertext_and_tag.to_vec();
+
+    match key_length {
+        KeyLength::Aes128 => {
+            let cipher = Aes128Gcm::new_from_slice(sek)
+                .map_err(|e| Error::crypto_error(format!("invalid SEK: {e}")))?;
+            cipher
+                .decrypt_in_place(&nonce, header, &mut buffer)
+                .map_err(|_| Error::crypto_error("AES-GCM authentication failed"))?;
+        }
+        KeyLength::Aes192 => {
+            return Err(Error::crypto_error(
+                "AES-192 is not supported with GCM mode",
+            ));
+        }
+        KeyLength::Aes256 => {
+            let cipher = Aes256Gcm::new_from_slice(sek)
+                .map_err(|e| Error::crypto_error(format!("invalid SEK: {e}")))?;
+            cipher
+                .decrypt_in_place(&nonce, header, &mut buffer)
+                .map_err(|_| Error::crypto_error("AES-GCM authentication failed"))?;
+        }
+    }
+
+    Ok(buffer)
 }
 
 #[cfg(test)]
@@ -588,14 +797,14 @@ mod tests {
         let original = b"Hello, SRT!".to_vec();
 
         let mut encrypted = original.clone();
-        encrypt_payload(&sek, &salt, packet_index, &mut encrypted, KeyLength::Aes128)
+        encrypt_payload_ctr(&sek, &salt, packet_index, &mut encrypted, KeyLength::Aes128)
             .expect("暗号化は有効な入力では成功する想定");
 
         // 暗号化されていることを確認
         assert_ne!(original, encrypted);
 
         // 復号化
-        encrypt_payload(&sek, &salt, packet_index, &mut encrypted, KeyLength::Aes128)
+        encrypt_payload_ctr(&sek, &salt, packet_index, &mut encrypted, KeyLength::Aes128)
             .expect("復号化は有効な入力では成功する想定");
 
         // 元に戻っていることを確認
@@ -606,8 +815,9 @@ mod tests {
     fn test_km_refresh_state_transitions() {
         let salt = [0u8; 16];
         let sek = vec![0x42u8; 16];
-        let mut crypto = CryptoContext::new_sender("passphrase", KeyLength::Aes128, salt, &sek)
-            .expect("Sender コンテキストの生成は成功する想定");
+        let mut crypto =
+            CryptoContext::new_sender("passphrase", KeyLength::Aes128, salt, &sek, CipherMode::Ctr)
+                .expect("Sender コンテキストの生成は成功する想定");
 
         // 初期状態
         assert_eq!(crypto.km_refresh_state(), KmRefreshState::Idle);
@@ -636,8 +846,9 @@ mod tests {
     fn test_km_refresh_should_pre_announce() {
         let salt = [0u8; 16];
         let sek = vec![0x42u8; 16];
-        let mut crypto = CryptoContext::new_sender("passphrase", KeyLength::Aes128, salt, &sek)
-            .expect("Sender コンテキストの生成は成功する想定");
+        let mut crypto =
+            CryptoContext::new_sender("passphrase", KeyLength::Aes128, salt, &sek, CipherMode::Ctr)
+                .expect("Sender コンテキストの生成は成功する想定");
 
         // 初期状態では事前通知不要
         assert!(!crypto.should_pre_announce());
@@ -667,8 +878,9 @@ mod tests {
     fn test_km_refresh_encrypt_with_key_switch() {
         let salt = [0u8; 16];
         let sek = vec![0x42u8; 16];
-        let mut crypto = CryptoContext::new_sender("passphrase", KeyLength::Aes128, salt, &sek)
-            .expect("Sender コンテキストの生成は成功する想定");
+        let mut crypto =
+            CryptoContext::new_sender("passphrase", KeyLength::Aes128, salt, &sek, CipherMode::Ctr)
+                .expect("Sender コンテキストの生成は成功する想定");
         let mut payload1 = b"test data 1".to_vec();
         let mut payload2 = b"test data 2".to_vec();
 
@@ -711,14 +923,223 @@ mod tests {
 
     #[test]
     fn all_zero_stream_keys_are_rejected() {
-        let error =
-            CryptoContext::new_sender("passphrase", KeyLength::Aes128, [0x42; 16], &[0; 16])
-                .expect_err("known zero SEK must not be accepted");
+        let error = CryptoContext::new_sender(
+            "passphrase",
+            KeyLength::Aes128,
+            [0x42; 16],
+            &[0; 16],
+            CipherMode::Ctr,
+        )
+        .expect_err("known zero SEK must not be accepted");
         assert!(error.reason.contains("all zero"));
 
-        let mut crypto =
-            CryptoContext::new_sender("passphrase", KeyLength::Aes128, [0x42; 16], &[0x24; 16])
-                .expect("valid SEK");
+        let mut crypto = CryptoContext::new_sender(
+            "passphrase",
+            KeyLength::Aes128,
+            [0x42; 16],
+            &[0x24; 16],
+            CipherMode::Ctr,
+        )
+        .expect("valid SEK");
         assert!(crypto.start_pre_announce(&[0; 16]).is_err());
+    }
+
+    #[test]
+    fn gcm_encrypt_decrypt_roundtrip() {
+        let sek = vec![0x42u8; 16];
+        let salt = [0xABu8; 16];
+        let header = [0u8; 16];
+        let packet_index = 42u32;
+        let original = b"Hello, AES-GCM SRT!";
+
+        let encrypted = encrypt_payload_gcm(
+            &sek,
+            &salt,
+            packet_index,
+            &header,
+            original,
+            KeyLength::Aes128,
+        )
+        .unwrap();
+
+        assert_eq!(encrypted.len(), original.len() + GCM_TAG_LEN);
+        assert_ne!(&encrypted[..original.len()], original.as_slice());
+
+        let decrypted = decrypt_payload_gcm(
+            &sek,
+            &salt,
+            packet_index,
+            &header,
+            &encrypted,
+            KeyLength::Aes128,
+        )
+        .unwrap();
+
+        assert_eq!(decrypted, original);
+    }
+
+    #[test]
+    fn gcm_rejects_tampered_ciphertext() {
+        let sek = vec![0x42u8; 16];
+        let salt = [0xABu8; 16];
+        let header = [0u8; 16];
+        let packet_index = 1u32;
+        let original = b"authenticated data";
+
+        let mut encrypted = encrypt_payload_gcm(
+            &sek,
+            &salt,
+            packet_index,
+            &header,
+            original,
+            KeyLength::Aes128,
+        )
+        .unwrap();
+
+        encrypted[0] ^= 0xFF;
+
+        let result = decrypt_payload_gcm(
+            &sek,
+            &salt,
+            packet_index,
+            &header,
+            &encrypted,
+            KeyLength::Aes128,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn gcm_rejects_tampered_header() {
+        let sek = vec![0x42u8; 16];
+        let salt = [0xABu8; 16];
+        let header = [0u8; 16];
+        let packet_index = 1u32;
+
+        let encrypted = encrypt_payload_gcm(
+            &sek,
+            &salt,
+            packet_index,
+            &header,
+            b"integrity check",
+            KeyLength::Aes128,
+        )
+        .unwrap();
+
+        let mut bad_header = header;
+        bad_header[0] = 0xFF;
+
+        let result = decrypt_payload_gcm(
+            &sek,
+            &salt,
+            packet_index,
+            &bad_header,
+            &encrypted,
+            KeyLength::Aes128,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn gcm_256_roundtrip() {
+        let sek = vec![0x42u8; 32];
+        let salt = [0xABu8; 16];
+        let header = [1u8; 16];
+        let packet_index = 999u32;
+        let original = b"AES-256-GCM test";
+
+        let encrypted = encrypt_payload_gcm(
+            &sek,
+            &salt,
+            packet_index,
+            &header,
+            original,
+            KeyLength::Aes256,
+        )
+        .unwrap();
+
+        let decrypted = decrypt_payload_gcm(
+            &sek,
+            &salt,
+            packet_index,
+            &header,
+            &encrypted,
+            KeyLength::Aes256,
+        )
+        .unwrap();
+
+        assert_eq!(decrypted, original);
+    }
+
+    #[test]
+    fn gcm_rejects_aes192() {
+        let result = CryptoContext::new_sender(
+            "passphrase",
+            KeyLength::Aes192,
+            [0x42; 16],
+            &[0x24; 24],
+            CipherMode::Gcm,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn gcm_context_encrypt_decrypt() {
+        let salt = [0xABu8; 16];
+        let sek = vec![0x42u8; 16];
+        let header = [0u8; 16];
+
+        let mut sender =
+            CryptoContext::new_sender("passphrase", KeyLength::Aes128, salt, &sek, CipherMode::Gcm)
+                .unwrap();
+
+        let wrapped = sender.wrap_sek(KeyFlag::Even).unwrap();
+        let receiver = CryptoContext::new_receiver(
+            "passphrase",
+            salt,
+            &wrapped,
+            KeyFlag::Even,
+            KeyLength::Aes128,
+            CipherMode::Gcm,
+        )
+        .unwrap();
+
+        let original = b"round-trip via context";
+        let (key_flag, encrypted) = sender.encrypt_gcm(1, &header, original).unwrap();
+
+        let decrypted = receiver
+            .decrypt_gcm(1, key_flag, &header, &encrypted)
+            .unwrap();
+
+        assert_eq!(decrypted, original);
+    }
+
+    #[test]
+    fn gcm_iv_differs_from_ctr_iv() {
+        let salt = [0xABu8; 16];
+        let pki = 42u32;
+
+        let gcm_iv = build_gcm_iv(&salt, pki);
+        assert_eq!(gcm_iv.len(), 12);
+
+        let mut ctr_iv = [0u8; 16];
+        ctr_iv[..14].copy_from_slice(&salt[..14]);
+        let pi_bytes = pki.to_be_bytes();
+        ctr_iv[10] ^= pi_bytes[0];
+        ctr_iv[11] ^= pi_bytes[1];
+        ctr_iv[12] ^= pi_bytes[2];
+        ctr_iv[13] ^= pi_bytes[3];
+
+        assert_ne!(gcm_iv[..], ctr_iv[..12]);
+    }
+
+    #[test]
+    fn gcm_short_payload_rejected() {
+        let sek = vec![0x42u8; 16];
+        let salt = [0xABu8; 16];
+        let header = [0u8; 16];
+
+        let result = decrypt_payload_gcm(&sek, &salt, 1, &header, &[0u8; 15], KeyLength::Aes128);
+        assert!(result.is_err());
     }
 }

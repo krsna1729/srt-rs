@@ -130,7 +130,15 @@ fn arb_km_message() -> impl Strategy<Value = KmMessage> {
         .prop_flat_map(|(key_flag, key_length, salt)| {
             let wrapped_key_len = key_length.len() + 8;
             prop::collection::vec(any::<u8>(), wrapped_key_len..=wrapped_key_len).prop_map(
-                move |wrapped_key| KmMessage::new(key_flag, key_length, salt, wrapped_key),
+                move |wrapped_key| {
+                    KmMessage::new(
+                        key_flag,
+                        key_length,
+                        salt,
+                        wrapped_key,
+                        shiguredo_srt::CipherMode::Ctr,
+                    )
+                },
             )
         })
 }

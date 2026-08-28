@@ -879,13 +879,20 @@ const KM_VERSION: u8 = 1;
 /// Packet type: Key Material Message.
 const KM_PACKET_TYPE: u8 = 2;
 
-/// Cipher.
-#[expect(dead_code)]
+/// Cipher type values in KM messages.
 pub mod cipher_type {
     /// AES-CTR
     pub const AES_CTR: u8 = 2;
     /// AES-GCM (v1.6.0 and later).
     pub const AES_GCM: u8 = 4;
+}
+
+/// Authentication type values in KM messages.
+pub mod auth_type {
+    /// No authentication.
+    pub const NONE: u8 = 0;
+    /// AES-GCM authentication.
+    pub const AES_GCM: u8 = 1;
 }
 
 /// Stream encapsulation.
@@ -901,14 +908,19 @@ impl KmMessage {
         key_length: KeyLength,
         salt: [u8; 16],
         wrapped_key: Vec<u8>,
+        cipher_mode: crate::crypto::CipherMode,
     ) -> Self {
+        let (cipher, auth) = match cipher_mode {
+            crate::crypto::CipherMode::Ctr => (cipher_type::AES_CTR, auth_type::NONE),
+            crate::crypto::CipherMode::Gcm => (cipher_type::AES_GCM, auth_type::AES_GCM),
+        };
         Self {
             version: KM_VERSION,
             packet_type: KM_PACKET_TYPE,
             key_flag,
             keki: 0,
-            cipher: cipher_type::AES_CTR,
-            auth: 0,
+            cipher,
+            auth,
             stream_encapsulation: stream_encapsulation::MPEG_TS_SRT,
             key_length,
             salt,
@@ -1134,7 +1146,13 @@ mod tests {
             0x99, 0x00, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22,
         ];
 
-        let original = KmMessage::new(KeyFlag::Even, KeyLength::Aes128, salt, wrapped_key.clone());
+        let original = KmMessage::new(
+            KeyFlag::Even,
+            KeyLength::Aes128,
+            salt,
+            wrapped_key.clone(),
+            crate::crypto::CipherMode::Ctr,
+        );
 
         let encoded = original.encode();
         let decoded =
@@ -1154,7 +1172,13 @@ mod tests {
         let salt = [0u8; 16];
         let wrapped_key = vec![0u8; 24]; // AES-128 wrapped = 16 + 8
 
-        let km_message = KmMessage::new(KeyFlag::Even, KeyLength::Aes128, salt, wrapped_key);
+        let km_message = KmMessage::new(
+            KeyFlag::Even,
+            KeyLength::Aes128,
+            salt,
+            wrapped_key,
+            crate::crypto::CipherMode::Ctr,
+        );
 
         let mut hs = HandshakePacket::new_conclusion_request(1, 2, 3, 2, true);
         hs.add_hs_extension(0x010500, srt_flags::TSBPDSND | srt_flags::CRYPT, 120);

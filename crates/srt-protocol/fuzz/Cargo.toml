@@ -57,6 +57,13 @@ name = "fuzz_backup_group"
 path = "fuzz_targets/fuzz_backup_group.rs"
 test = false
 
+[[bin]]
+bench = false
+doc = false
+name = "fuzz_gcm_decrypt"
+path = "fuzz_targets/fuzz_gcm_decrypt.rs"
+test = false
+
 [dependencies]
 libfuzzer-sys = "0.4"
 shiguredo_srt = { path = ".." }
