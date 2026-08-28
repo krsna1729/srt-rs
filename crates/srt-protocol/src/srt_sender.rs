@@ -32,14 +32,20 @@ const INITIAL_AVG_PAYLOAD_SIZE_BYTES: f64 = 1456.0;
 /// `srtcore/utilities.h`): `avg = (avg * (LEN - 1) + new) / LEN`.
 const AVG_PAYLOAD_SIZE_IIR_LEN: f64 = 128.0;
 
-/// A sent packet entry.
+/// Retained sent-packet entry.
+///
+/// Strips fields that are redundant with the BTreeMap key (`sequence_number`)
+/// or connection-wide state (`dest_socket_id`), and fields that are constant
+/// in the buffer (`encryption_flag` = 0, `retransmitted` = false).
+/// Saves 16 bytes per retained packet vs storing a full `DataPacket`.
 #[derive(Debug, Clone)]
 struct SentPacket {
-    /// Packet data.
-    packet: DataPacket,
-    /// Send time.
+    position: PacketPosition,
+    order_flag: bool,
+    message_number: u32,
+    timestamp: u32,
+    payload: Vec<u8>,
     sent_time: Timestamp,
-    /// Retransmit count.
     retransmit_count: u32,
 }
 
@@ -378,35 +384,42 @@ impl SenderBuffer {
             return None;
         }
 
+        let message_number = self.next_msg;
+        let payload_len = payload.len();
+
+        // Store stripped payload in the buffer (no seq/dest_socket_id/flags).
+        self.packets.insert(
+            sequence_number,
+            SentPacket {
+                position: PacketPosition::Single,
+                order_flag: false,
+                message_number,
+                timestamp,
+                payload: payload.clone(),
+                sent_time: now,
+                retransmit_count: 0,
+            },
+        );
+
         let packet = DataPacket {
             sequence_number,
             position: PacketPosition::Single,
             order_flag: false,
             encryption_flag: 0,
             retransmitted: false,
-            message_number: self.next_msg,
+            message_number,
             timestamp,
             dest_socket_id,
             payload,
         };
 
-        // Store in the buffer.
-        self.packets.insert(
-            sequence_number,
-            SentPacket {
-                packet: packet.clone(),
-                sent_time: now,
-                retransmit_count: 0,
-            },
-        );
-
         // Update statistics.
         self.total_sent += 1;
-        self.total_bytes_sent += packet.payload.len() as u64;
+        self.total_bytes_sent += payload_len as u64;
         self.total_srt_bytes_sent = self
             .total_srt_bytes_sent
-            .saturating_add((packet.payload.len() + SRT_HEADER_SIZE) as u64);
-        self.record_sent_payload_size(packet.payload.len());
+            .saturating_add((payload_len + SRT_HEADER_SIZE) as u64);
+        self.record_sent_payload_size(payload_len);
 
         // Advance the sequence number and message number.
         self.next_seq = self.next_seq.wrapping_add(1) & 0x7FFF_FFFF;
@@ -446,34 +459,40 @@ impl SenderBuffer {
                 _ => PacketPosition::Middle,
             };
 
-            let packet = DataPacket {
-                sequence_number: self.next_seq,
-                position,
-                order_flag: true, // Ordered message.
-                encryption_flag: 0,
-                retransmitted: false,
-                message_number: self.next_msg,
-                timestamp,
-                dest_socket_id,
-                payload: chunk.to_vec(),
-            };
+            let chunk_payload = chunk.to_vec();
+            let chunk_len = chunk_payload.len();
 
             self.packets.insert(
                 self.next_seq,
                 SentPacket {
-                    packet: packet.clone(),
+                    position,
+                    order_flag: true,
+                    message_number: self.next_msg,
+                    timestamp,
+                    payload: chunk_payload.clone(),
                     sent_time: now,
                     retransmit_count: 0,
                 },
             );
 
-            // Update statistics.
+            let packet = DataPacket {
+                sequence_number: self.next_seq,
+                position,
+                order_flag: true,
+                encryption_flag: 0,
+                retransmitted: false,
+                message_number: self.next_msg,
+                timestamp,
+                dest_socket_id,
+                payload: chunk_payload,
+            };
+
             self.total_sent += 1;
-            self.total_bytes_sent += packet.payload.len() as u64;
+            self.total_bytes_sent += chunk_len as u64;
             self.total_srt_bytes_sent = self
                 .total_srt_bytes_sent
-                .saturating_add((packet.payload.len() + SRT_HEADER_SIZE) as u64);
-            self.record_sent_payload_size(packet.payload.len());
+                .saturating_add((chunk_len + SRT_HEADER_SIZE) as u64);
+            self.record_sent_payload_size(chunk_len);
 
             self.next_seq = self.next_seq.wrapping_add(1) & 0x7FFF_FFFF;
             packets.push(packet);
@@ -498,22 +517,29 @@ impl SenderBuffer {
     /// also defeats TLPKTDROP's purpose -- cleanly giving up once the
     /// delivery deadline passes, to bound latency -- since a packet
     /// retransmitted repeatedly would then never expire.)
-    pub fn pop_retransmit(&mut self) -> Option<DataPacket> {
+    pub fn pop_retransmit(&mut self, dest_socket_id: u32) -> Option<DataPacket> {
         while let Some(seq) = self.loss_list.pop_front() {
             if let Some(entry) = self.packets.get_mut(&seq) {
                 entry.retransmit_count += 1;
                 self.total_retransmits += 1;
-                let wire_bytes = (entry.packet.payload.len() + SRT_HEADER_SIZE) as u64;
+                let wire_bytes = (entry.payload.len() + SRT_HEADER_SIZE) as u64;
                 self.total_srt_bytes_sent = self.total_srt_bytes_sent.saturating_add(wire_bytes);
                 self.total_retransmitted_srt_bytes = self
                     .total_retransmitted_srt_bytes
                     .saturating_add(wire_bytes);
 
-                let mut packet = entry.packet.clone();
-                packet.retransmitted = true;
-                return Some(packet);
+                return Some(DataPacket {
+                    sequence_number: seq,
+                    position: entry.position,
+                    order_flag: entry.order_flag,
+                    encryption_flag: 0,
+                    retransmitted: true,
+                    message_number: entry.message_number,
+                    timestamp: entry.timestamp,
+                    dest_socket_id,
+                    payload: entry.payload.clone(),
+                });
             }
-            // Skip if the packet was already ACKed.
         }
         None
     }
@@ -597,7 +623,7 @@ impl SenderBuffer {
                     if elapsed <= threshold {
                         break;
                     }
-                    let msg_num = entry.packet.message_number;
+                    let msg_num = entry.message_number;
                     let msg_first_seq = seq;
                     // Drop this packet and any remaining fragments of the same message.
                     let mut msg_last_seq = seq;
@@ -606,7 +632,7 @@ impl SenderBuffer {
                             self.total_dropped = self.total_dropped.saturating_add(1);
                             self.total_bytes_dropped = self
                                 .total_bytes_dropped
-                                .saturating_add(removed.packet.payload.len() as u64);
+                                .saturating_add(removed.payload.len() as u64);
                             dropped_seqs.push(seq);
                             msg_last_seq = seq;
                         }
@@ -616,7 +642,7 @@ impl SenderBuffer {
                             break;
                         }
                         match self.packets.get(&next) {
-                            Some(e) if e.packet.message_number == msg_num => {
+                            Some(e) if e.message_number == msg_num => {
                                 seq = next;
                             }
                             _ => {
@@ -666,7 +692,7 @@ impl SenderBuffer {
         // a whole extra traversal per sample for one `sum()`.
         let mut payload_bytes_in_buffer = 0u64;
         for entry in self.packets.values() {
-            payload_bytes_in_buffer += entry.packet.payload.len() as u64;
+            payload_bytes_in_buffer += entry.payload.len() as u64;
             match entry.retransmit_count {
                 1 => retransmits_once += 1,
                 2 => retransmits_twice += 1,
@@ -894,7 +920,7 @@ mod tests {
         assert!(buf.has_retransmit());
 
         // 再送パケットを取得
-        let retransmit = buf.pop_retransmit();
+        let retransmit = buf.pop_retransmit(1);
         assert!(retransmit.is_some());
         let pkt = retransmit.expect("再送パケットは Some になる想定");
         assert_eq!(pkt.sequence_number, 1001);
@@ -918,7 +944,7 @@ mod tests {
         buf.push(vec![3], 100, 1, now);
 
         buf.handle_nak(&[1001]);
-        let retransmit = buf.pop_retransmit();
+        let retransmit = buf.pop_retransmit(1);
         assert!(retransmit.is_some());
         assert_eq!(buf.stats().total_retransmits, 1);
 
@@ -1183,7 +1209,7 @@ mod tests {
 
         buf.handle_nak(&[0]);
         // 元の送信からほぼ 1 秒経った時点で再送を試みる。
-        let retransmitted = buf.pop_retransmit();
+        let retransmitted = buf.pop_retransmit(1);
         assert!(retransmitted.is_some());
 
         // 元の送信から 1_000_001us -- 再送直後からはまだ 100_001us しか
@@ -1235,7 +1261,7 @@ mod tests {
         assert_eq!(stats.total_lost, 1, "a queued loss is not counted twice");
         assert_eq!(stats.total_srt_bytes_sent, 20);
 
-        assert!(buf.pop_retransmit().is_some());
+        assert!(buf.pop_retransmit(1).is_some());
         let stats = buf.stats();
         assert_eq!(stats.total_retransmits, 1);
         assert_eq!(stats.total_retransmitted_srt_bytes, 20);
