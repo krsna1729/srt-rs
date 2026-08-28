@@ -6,6 +6,7 @@ members = [
     "crates/srt-transport",
     "crates/srt-lifecycle",
     "crates/srt-bench",
+    "crates/xtask",
 ]
 exclude = ["crates/srt-protocol/fuzz"]
 

@@ -1,3 +1,6 @@
+[alias]
+xtask = "run --package xtask --"
+
 # Cap parallel rustc jobs so concurrent builds don't OOM.
 # Override with: CARGO_BUILD_JOBS=N cargo build
 [build]
