@@ -849,89 +849,18 @@ impl SrtConnection {
     }
 
     /// Process a timer event.
-    #[expect(clippy::cognitive_complexity)]
     pub fn handle_timer(&mut self, timer_id: TimerId, now: Timestamp) -> Result<(), Error> {
         match timer_id {
-            TimerId::Handshake => {
-                if self.state != ConnectionState::Connected {
-                    if self.handshake_timed_out(now) {
-                        self.fail_handshake_timeout();
-                    } else {
-                        self.handshake_retry_sequence =
-                            self.handshake_retry_sequence.saturating_add(1);
-                        self.retransmit_handshake();
-                        self.arm_handshake_timer(now);
-                    }
-                }
-            }
-            TimerId::Keepalive => {
-                if self.state == ConnectionState::Connected {
-                    if self
-                        .last_send_time
-                        .is_none_or(|last_send| now.saturating_sub(last_send) >= 1_000_000)
-                    {
-                        self.send_keepalive(now);
-                    }
-                    // Set the next keepalive timer.
-                    self.output_queue.push_back(ConnectionOutput::SetTimer {
-                        id: TimerId::Keepalive,
-                        duration_micros: 1_000_000, // 1 second.
-                    });
-                }
-            }
-            TimerId::Ack => {
-                // Send a periodic ACK.
-                if self.state == ConnectionState::Connected {
-                    if self.tlpktdrop_enabled() {
-                        // TLPKTDROP: remove expired packets.
-                        if let Some(receiver) = self.receiver.as_mut() {
-                            for seq in receiver.drop_too_late(now) {
-                                if let Some(sender) = self.sender.as_mut() {
-                                    sender.discard_acked(seq);
-                                }
-                            }
-                        }
-                    }
-                    self.enqueue_ready_data(now);
-                    self.send_ack(now);
-
-                    if self.tlpktdrop_enabled()
-                        && let Some(sender) = self.sender.as_mut()
-                    {
-                        let _ = sender.drop_expired(now);
-                    }
-
-                    // Set the next ACK timer (10ms).
-                    self.output_queue.push_back(ConnectionOutput::SetTimer {
-                        id: TimerId::Ack,
-                        duration_micros: 10_000,
-                    });
-                }
-            }
-            TimerId::Nak => {
-                // Send a periodic NAK.
-                if self.state == ConnectionState::Connected && self.periodic_nak_enabled() {
-                    self.send_periodic_nak(now);
-                    // Set the next NAK timer.
-                    let interval = self
-                        .receiver
-                        .as_ref()
-                        .map(|r| r.nak_interval())
-                        .unwrap_or(20_000);
-                    self.output_queue.push_back(ConnectionOutput::SetTimer {
-                        id: TimerId::Nak,
-                        duration_micros: interval,
-                    });
-                }
-            }
+            TimerId::Handshake => self.handle_handshake_timer(now),
+            TimerId::Keepalive => self.handle_keepalive_timer(now),
+            TimerId::Ack => self.handle_ack_timer(now),
+            TimerId::Nak => self.handle_nak_timer(now),
             TimerId::Retransmit => {
-                // Retransmit processing.
                 if self.state == ConnectionState::Connected {
                     self.process_retransmit(now);
                 }
             }
             TimerId::Inactivity => {
-                // Inactivity timeout: disconnect if no packets have been received from the peer.
                 if self.state == ConnectionState::Connected {
                     self.event_queue.push_back(ConnectionEvent::Disconnected {
                         reason: "inactivity timeout".to_string(),
@@ -939,23 +868,96 @@ impl SrtConnection {
                     self.set_state(ConnectionState::Disconnected);
                 }
             }
-            TimerId::Shutdown => {
-                if self.state == ConnectionState::Closing {
-                    if self.shutdown_started_at.is_some_and(|started| {
-                        now.saturating_sub(started) >= SHUTDOWN_TIMEOUT_MICROS
-                    }) {
-                        self.finish_local_close("shutdown timeout");
-                    } else {
-                        self.send_shutdown(now);
-                        self.output_queue.push_back(ConnectionOutput::SetTimer {
-                            id: TimerId::Shutdown,
-                            duration_micros: SHUTDOWN_RETRY_INTERVAL_MICROS,
-                        });
-                    }
+            TimerId::Shutdown => self.handle_shutdown_timer(now),
+        }
+        Ok(())
+    }
+
+    fn handle_handshake_timer(&mut self, now: Timestamp) {
+        if self.state != ConnectionState::Connected {
+            if self.handshake_timed_out(now) {
+                self.fail_handshake_timeout();
+            } else {
+                self.handshake_retry_sequence = self.handshake_retry_sequence.saturating_add(1);
+                self.retransmit_handshake();
+                self.arm_handshake_timer(now);
+            }
+        }
+    }
+
+    fn handle_keepalive_timer(&mut self, now: Timestamp) {
+        if self.state == ConnectionState::Connected {
+            if self
+                .last_send_time
+                .is_none_or(|last_send| now.saturating_sub(last_send) >= 1_000_000)
+            {
+                self.send_keepalive(now);
+            }
+            self.output_queue.push_back(ConnectionOutput::SetTimer {
+                id: TimerId::Keepalive,
+                duration_micros: 1_000_000,
+            });
+        }
+    }
+
+    fn handle_ack_timer(&mut self, now: Timestamp) {
+        if self.state != ConnectionState::Connected {
+            return;
+        }
+        if self.tlpktdrop_enabled()
+            && let Some(receiver) = self.receiver.as_mut()
+        {
+            for seq in receiver.drop_too_late(now) {
+                if let Some(sender) = self.sender.as_mut() {
+                    sender.discard_acked(seq);
                 }
             }
         }
-        Ok(())
+        self.enqueue_ready_data(now);
+        self.send_ack(now);
+
+        if self.tlpktdrop_enabled()
+            && let Some(sender) = self.sender.as_mut()
+        {
+            let _ = sender.drop_expired(now);
+        }
+
+        self.output_queue.push_back(ConnectionOutput::SetTimer {
+            id: TimerId::Ack,
+            duration_micros: 10_000,
+        });
+    }
+
+    fn handle_nak_timer(&mut self, now: Timestamp) {
+        if self.state == ConnectionState::Connected && self.periodic_nak_enabled() {
+            self.send_periodic_nak(now);
+            let interval = self
+                .receiver
+                .as_ref()
+                .map(|r| r.nak_interval())
+                .unwrap_or(20_000);
+            self.output_queue.push_back(ConnectionOutput::SetTimer {
+                id: TimerId::Nak,
+                duration_micros: interval,
+            });
+        }
+    }
+
+    fn handle_shutdown_timer(&mut self, now: Timestamp) {
+        if self.state == ConnectionState::Closing {
+            if self
+                .shutdown_started_at
+                .is_some_and(|started| now.saturating_sub(started) >= SHUTDOWN_TIMEOUT_MICROS)
+            {
+                self.finish_local_close("shutdown timeout");
+            } else {
+                self.send_shutdown(now);
+                self.output_queue.push_back(ConnectionOutput::SetTimer {
+                    id: TimerId::Shutdown,
+                    duration_micros: SHUTDOWN_RETRY_INTERVAL_MICROS,
+                });
+            }
+        }
     }
 
     /// Send data.
@@ -1400,163 +1402,151 @@ impl SrtConnection {
         now: Timestamp,
     ) -> Result<(), Error> {
         match hs.handshake_type {
-            HandshakeType::Induction => {
-                // INDUCTION レスポンス受信
-                if !matches!(
-                    self.handshake_state,
-                    HandshakeState::InductionSent | HandshakeState::ConclusionSent
-                ) {
-                    return Ok(());
-                }
+            HandshakeType::Induction => self.handle_caller_induction(hs, now),
+            HandshakeType::Conclusion => self.handle_caller_conclusion(hs, hsreq_timestamp, now),
+            HandshakeType::Rejected => Err(self.fail_caller_handshake(&format!(
+                "connection rejected by peer, reason={}",
+                hs.reject_reason.unwrap_or(-1)
+            ))),
+            _ => Ok(()),
+        }
+    }
 
-                // An induction response is the caller's proof that it is
-                // speaking SRT v5 rather than legacy UDT (or a rogue peer).
-                // Do this before accepting any peer identity or cookie.
-                if hs.extension_field != SRT_MAGIC_CODE {
-                    return Err(
-                        self.fail_caller_handshake("invalid SRT magic in induction response")
-                    );
-                }
-                if hs.version != HS_VERSION_5 {
-                    return Err(
-                        self.fail_caller_handshake("unsupported SRT version in induction response")
-                    );
-                }
-
-                self.syn_cookie = hs.syn_cookie;
-                self.peer_socket_id = hs.socket_id;
-                tracing::debug!(
-                    "received INDUCTION response, peer_socket_id={:#x}, syn_cookie={:#x}",
-                    self.peer_socket_id,
-                    self.syn_cookie
-                );
-
-                // 暗号化コンテキスト生成
-                if self.handshake_state == HandshakeState::InductionSent
-                    && let Some(ref passphrase) = self.options.passphrase
-                {
-                    let key_length = hs.key_length().unwrap_or(self.options.key_length);
-                    let salt = match self.options.crypto_salt {
-                        Some(salt) => salt,
-                        None => {
-                            let mut salt = [0u8; 16];
-                            Self::random_bytes(&mut salt, "crypto salt")?;
-                            salt
-                        }
-                    };
-                    let generated_sek;
-                    let sek = match self.options.crypto_sek.as_deref() {
-                        Some(sek) => sek,
-                        None => {
-                            generated_sek = Zeroizing::new({
-                                let mut sek = vec![0u8; key_length.len()];
-                                Self::random_bytes(&mut sek, "stream encryption key")?;
-                                sek
-                            });
-                            generated_sek.as_slice()
-                        }
-                    };
-                    self.crypto = Some(CryptoContext::new_sender(
-                        passphrase, key_length, salt, sek,
-                    )?);
-                }
-
-                // Send the CONCLUSION.
-                self.send_conclusion_request(now)?;
-                self.handshake_state = HandshakeState::ConclusionSent;
-                self.arm_handshake_timer(now);
-            }
-            HandshakeType::Conclusion => {
-                // CONCLUSION レスポンス受信 → 接続完了
-                if self.handshake_state == HandshakeState::Completed {
-                    self.retransmit_handshake();
-                    return Ok(());
-                }
-                if self.handshake_state != HandshakeState::ConclusionSent {
-                    return Ok(());
-                }
-
-                // CONCLUSION レスポンスの socket_id で更新
-                // (INDUCTION とは異なる値の場合がある)
-                self.peer_socket_id = hs.socket_id;
-                self.peer_group_extension = hs.get_group_extension();
-                self.peer_congestion_control = hs.get_congestion_extension();
-                self.apply_peer_handshake_extension(&hs);
-
-                tracing::debug!(
-                    "received CONCLUSION response, peer_initial_seq={}, peer_socket_id={:#x}",
-                    hs.initial_packet_seq,
-                    hs.socket_id
-                );
-
-                // KMRSP errors are authoritative even for an unsecured caller:
-                // otherwise a listener requiring encryption can fail while the
-                // caller incorrectly transitions to Connected.
-                match (self.crypto.is_some(), hs.get_km_response()) {
-                    (true, Ok(Some(_))) => {}
-                    (true, Ok(None)) => {
-                        return Err(self.fail_caller_handshake("encryption enabled but no KMRSP"));
-                    }
-                    (false, Ok(Some(_))) => {
-                        return Err(self.fail_caller_handshake(
-                            "peer requires encryption but caller is unsecured",
-                        ));
-                    }
-                    (_, Err(km_error)) => {
-                        let reason = match km_error {
-                            KmError::Unsecured => "peer is unsecured",
-                            KmError::NoSecret => "peer has no secret",
-                            KmError::BadSecret => "peer has wrong secret",
-                            KmError::BadCryptoMode => "incompatible crypto mode",
-                        };
-                        return Err(self.fail_caller_handshake(reason));
-                    }
-                    (false, Ok(None)) => {}
-                }
-
-                self.handshake_state = HandshakeState::Completed;
-                self.handshake_started_at = None;
-                self.set_state(ConnectionState::Connected);
-                self.start_time = Some(now);
-
-                // TSBPD 時刻基準を計算
-                let tsbpd_time_base = now.as_micros().saturating_sub(hsreq_timestamp as u64);
-
-                // バッファ初期化
-                self.init_buffers(now, hs.initial_packet_seq, tsbpd_time_base);
-
-                // ハンドシェイクタイマークリア
-                self.output_queue.push_back(ConnectionOutput::ClearTimer {
-                    id: TimerId::Handshake,
-                });
-
-                // タイマー設定
-                self.setup_connection_timers();
-
-                self.clear_config_secrets();
-
-                self.event_queue.push_back(ConnectionEvent::Connected);
-            }
-            // local patch (crates/srt-protocol/VENDOR.md): the
-            // wire-format layer now correctly decodes a real libsrt
-            // rejection response (handshake_type >= 1000) instead of
-            // erroring on it, but nothing consumed `hs.reject_reason` --
-            // this arm was the previous silent `_ => {}` catch-all, so a
-            // rejected connection attempt would just hang until the
-            // caller's own handshake timeout fired, with no reason ever
-            // surfaced to the application. Live-verified against a real
-            // libsrt listener configured to require a passphrase while
-            // this caller connects without one (SRT_REJ_UNSECURE).
-            HandshakeType::Rejected => {
-                return Err(self.fail_caller_handshake(&format!(
-                    "connection rejected by peer, reason={}",
-                    hs.reject_reason.unwrap_or(-1)
-                )));
-            }
-            _ => {}
+    fn handle_caller_induction(
+        &mut self,
+        hs: HandshakePacket,
+        now: Timestamp,
+    ) -> Result<(), Error> {
+        if !matches!(
+            self.handshake_state,
+            HandshakeState::InductionSent | HandshakeState::ConclusionSent
+        ) {
+            return Ok(());
         }
 
+        if hs.extension_field != SRT_MAGIC_CODE {
+            return Err(self.fail_caller_handshake("invalid SRT magic in induction response"));
+        }
+        if hs.version != HS_VERSION_5 {
+            return Err(self.fail_caller_handshake("unsupported SRT version in induction response"));
+        }
+
+        self.syn_cookie = hs.syn_cookie;
+        self.peer_socket_id = hs.socket_id;
+        tracing::debug!(
+            "received INDUCTION response, peer_socket_id={:#x}, syn_cookie={:#x}",
+            self.peer_socket_id,
+            self.syn_cookie
+        );
+
+        if self.handshake_state == HandshakeState::InductionSent
+            && let Some(ref passphrase) = self.options.passphrase
+        {
+            self.init_caller_crypto(&hs, passphrase.clone())?;
+        }
+
+        self.send_conclusion_request(now)?;
+        self.handshake_state = HandshakeState::ConclusionSent;
+        self.arm_handshake_timer(now);
         Ok(())
+    }
+
+    fn init_caller_crypto(
+        &mut self,
+        hs: &HandshakePacket,
+        passphrase: String,
+    ) -> Result<(), Error> {
+        let key_length = hs.key_length().unwrap_or(self.options.key_length);
+        let salt = match self.options.crypto_salt {
+            Some(salt) => salt,
+            None => {
+                let mut salt = [0u8; 16];
+                Self::random_bytes(&mut salt, "crypto salt")?;
+                salt
+            }
+        };
+        let generated_sek;
+        let sek = match self.options.crypto_sek.as_deref() {
+            Some(sek) => sek,
+            None => {
+                generated_sek = Zeroizing::new({
+                    let mut sek = vec![0u8; key_length.len()];
+                    Self::random_bytes(&mut sek, "stream encryption key")?;
+                    sek
+                });
+                generated_sek.as_slice()
+            }
+        };
+        self.crypto = Some(CryptoContext::new_sender(
+            &passphrase,
+            key_length,
+            salt,
+            sek,
+        )?);
+        Ok(())
+    }
+
+    fn handle_caller_conclusion(
+        &mut self,
+        hs: HandshakePacket,
+        hsreq_timestamp: u32,
+        now: Timestamp,
+    ) -> Result<(), Error> {
+        if self.handshake_state == HandshakeState::Completed {
+            self.retransmit_handshake();
+            return Ok(());
+        }
+        if self.handshake_state != HandshakeState::ConclusionSent {
+            return Ok(());
+        }
+
+        self.peer_socket_id = hs.socket_id;
+        self.peer_group_extension = hs.get_group_extension();
+        self.peer_congestion_control = hs.get_congestion_extension();
+        self.apply_peer_handshake_extension(&hs);
+
+        tracing::debug!(
+            "received CONCLUSION response, peer_initial_seq={}, peer_socket_id={:#x}",
+            hs.initial_packet_seq,
+            hs.socket_id
+        );
+
+        self.validate_caller_kmrsp(&hs)?;
+
+        self.handshake_state = HandshakeState::Completed;
+        self.handshake_started_at = None;
+        self.set_state(ConnectionState::Connected);
+        self.start_time = Some(now);
+
+        let tsbpd_time_base = now.as_micros().saturating_sub(hsreq_timestamp as u64);
+        self.init_buffers(now, hs.initial_packet_seq, tsbpd_time_base);
+
+        self.output_queue.push_back(ConnectionOutput::ClearTimer {
+            id: TimerId::Handshake,
+        });
+        self.setup_connection_timers();
+        self.clear_config_secrets();
+        self.event_queue.push_back(ConnectionEvent::Connected);
+        Ok(())
+    }
+
+    fn validate_caller_kmrsp(&mut self, hs: &HandshakePacket) -> Result<(), Error> {
+        match (self.crypto.is_some(), hs.get_km_response()) {
+            (true, Ok(Some(_))) | (false, Ok(None)) => Ok(()),
+            (true, Ok(None)) => Err(self.fail_caller_handshake("encryption enabled but no KMRSP")),
+            (false, Ok(Some(_))) => {
+                Err(self.fail_caller_handshake("peer requires encryption but caller is unsecured"))
+            }
+            (_, Err(km_error)) => {
+                let reason = match km_error {
+                    KmError::Unsecured => "peer is unsecured",
+                    KmError::NoSecret => "peer has no secret",
+                    KmError::BadSecret => "peer has wrong secret",
+                    KmError::BadCryptoMode => "incompatible crypto mode",
+                };
+                Err(self.fail_caller_handshake(reason))
+            }
+        }
     }
 
     fn handle_handshake_listener(
@@ -3051,6 +3041,67 @@ mod tests {
         };
         let handshake = HandshakePacket::decode(&control).expect("valid handshake");
         assert_eq!(handshake.get_group_extension(), Some(group));
+    }
+
+    #[test]
+    fn validate_kmrsp_rejects_encrypted_caller_without_response() {
+        let sek: Vec<u8> = (1..=16).collect();
+        let mut conn = SrtConnection::new_caller(ConnectionOptions {
+            socket_id: 1,
+            passphrase: Some("test_passphrase".into()),
+            crypto_salt: Some(test_km_salt()),
+            crypto_sek: Some(sek.clone()),
+            ..Default::default()
+        });
+        conn.connect(Timestamp::from_micros(0)).unwrap();
+        conn.crypto = Some(
+            CryptoContext::new_sender("test_passphrase", KeyLength::Aes128, test_km_salt(), &sek)
+                .unwrap(),
+        );
+
+        // A CONCLUSION with no KMRSP should fail for an encrypted caller.
+        let hs = HandshakePacket {
+            version: HS_VERSION_5,
+            encryption_field: 0,
+            extension_field: 0,
+            initial_packet_seq: 0,
+            mtu: 1500,
+            flow_window: 8192,
+            handshake_type: HandshakeType::Conclusion,
+            socket_id: 2,
+            syn_cookie: 0,
+            peer_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            extensions: vec![],
+            reject_reason: None,
+        };
+        let result = conn.validate_caller_kmrsp(&hs);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_kmrsp_accepts_unencrypted_caller_without_response() {
+        let mut conn = SrtConnection::new_caller(ConnectionOptions {
+            socket_id: 1,
+            ..Default::default()
+        });
+        conn.connect(Timestamp::from_micros(0)).unwrap();
+
+        let hs = HandshakePacket {
+            version: HS_VERSION_5,
+            encryption_field: 0,
+            extension_field: 0,
+            initial_packet_seq: 0,
+            mtu: 1500,
+            flow_window: 8192,
+            handshake_type: HandshakeType::Conclusion,
+            socket_id: 2,
+            syn_cookie: 0,
+            peer_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            extensions: vec![],
+            reject_reason: None,
+        };
+        let result = conn.validate_caller_kmrsp(&hs);
+        assert!(result.is_ok());
     }
 
     #[test]

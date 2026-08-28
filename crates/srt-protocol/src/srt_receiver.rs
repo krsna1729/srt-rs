@@ -624,7 +624,9 @@ impl ReceiverBuffer {
     /// Receive a packet.
     ///
     /// Returns the loss list if loss was detected.
-    #[expect(clippy::cognitive_complexity)]
+    /// Receive a packet.
+    ///
+    /// Returns the loss list if loss was detected.
     pub fn receive(&mut self, packet: DataPacket, now: Timestamp) -> Option<Vec<u32>> {
         let seq = packet.sequence_number;
         let was_expected = seq == self.expected_seq;
@@ -637,31 +639,19 @@ impl ReceiverBuffer {
             self.total_retransmitted = self.total_retransmitted.saturating_add(1);
         }
 
-        // Check for duplicates.
         if self.packets.contains_key(&seq) {
             self.total_duplicates += 1;
             return None;
         }
 
-        // Ignore packets that are too old.
         if sequence_less_than(seq, self.expected_seq) {
             self.total_duplicates = self.total_duplicates.saturating_add(1);
             return None;
         }
 
-        // Reject a packet whose sequence number is further ahead of
-        // expected_seq than the negotiated flow window. A conforming
-        // sender never has more than the flow window's worth of
-        // unacknowledged packets in flight, so a larger gap means a
-        // corrupted or malicious packet -- not a legitimate loss. Without
-        // this bound, the loss-detection scan below registers one entry
-        // per sequence number in the gap (up to just under 2^30, since
-        // that's the boundary `sequence_less_than` treats as "ahead"),
-        // so one crafted packet could force a multi-GB allocation and a
-        // long synchronous scan: a remote single-packet DoS. Found
-        // independently via this repo's own fuzzing/pathology work; matches
-        // upstream shiguredo/srt-rs issue 0074 (documented there, not yet
-        // in the pulled subtree).
+        // Reject sequence numbers further than the flow window ahead of
+        // expected_seq — a conforming sender never exceeds this gap, so a
+        // larger one indicates a corrupted or malicious packet.
         if seq.wrapping_sub(self.expected_seq) & 0x7FFF_FFFF > self.max_buffer_size {
             return None;
         }
@@ -669,32 +659,9 @@ impl ReceiverBuffer {
         self.total_received += 1;
         self.packets_since_ack += 1;
 
-        // Record packet arrival for bandwidth estimation.
-        self.total_bytes_received += packet_size as u64;
-        self.rate_estimator.on_packet_received(now, packet_size);
-        self.link_capacity_estimator.on_packet_received(now);
-
-        // Jitter calculation (RFC 3550 method).
-        // transit = receipt time - packet timestamp
-        let transit = now.as_micros() as i64 - packet.timestamp as i64;
-        if let Some(last) = self.last_transit {
-            // d = |transit - last_transit|
-            let d = (transit - last).unsigned_abs() as u32;
-            // jitter = jitter + (d - jitter) / 16
-            self.jitter = self
-                .jitter
-                .saturating_add((d.saturating_sub(self.jitter)) / 16);
-        }
-        self.last_transit = Some(transit);
-
-        // Detect the start of the TSBPD wraparound period.
-        // The end is detected in pop_ready() instead (per spec: "is delivered (read from the buffer)").
-        if self.tsbpd_enabled {
-            let ts = packet.timestamp as u64;
-            if ts >= WRAPPING_PERIOD_START && !self.wrapping_period_active {
-                self.wrapping_period_active = true;
-            }
-        }
+        self.record_arrival(now, packet_size);
+        self.update_jitter(now, &packet);
+        self.check_tsbpd_wrap(&packet);
 
         if self
             .delivery_seq_hint
@@ -703,75 +670,8 @@ impl ReceiverBuffer {
             self.delivery_seq_hint = Some(seq);
         }
 
-        // Loss detection
-        //
-        // Old implementation scanned every sequence number in
-        // expected_seq..seq with a BTreeMap/HashSet lookup per step --
-        // O(gap length) per packet. Under overload a lagging connection
-        // sees larger gaps more often, and a larger gap is more expensive:
-        // positive-feedback collapse (2026-08-21 flamegraphs at
-        // 8 Mbps x 1200 connections).
-        //
-        // New implementation: find the first already-buffered packet in the
-        // gap with one BTreeMap range query and register only the
-        // contiguous missing prefix before it. Cost is O(log n + emitted),
-        // and emitted is bounded by actual data in the gap, not gap length.
-        // Later losses are discovered when later packets arrive -- the final
-        // NAK set is identical, only spread over time (libsrt also sends
-        // NAKs in multiple rounds).
-        let mut new_losses = Vec::new();
-        if sequence_greater_than(seq, self.expected_seq) {
-            // Process one contiguous missing run at a time. The end of a
-            // run is the first buffered packet circularly before seq, or
-            // seq itself. The number of runs is bounded by data in the gap,
-            // so the old O(gap length) per-packet scan (which collapsed
-            // under overload) becomes O(runs log n + emitted + skipped).
-            // Skipped buffered packets are bounded by packets in the gap.
-            //
-            // Wrap handling: BTreeMap is numeric, so range(s..) returns the
-            // first key numerically >= s, but a packet circularly before seq
-            // can be numerically < s (near 0). Probe both the upper segment
-            // [s..MAX] and the lower segment [0..seq), and only accept a
-            // candidate p with seq_lt(s,p) && seq_lt(p,seq). This excludes
-            // packets more than 2^30 away from expected_seq.
-            //
-            // seq is inserted after this scan so the range queries do not
-            // see the packet itself.
-            let mut s = self.expected_seq;
-            while sequence_less_than(s, seq) {
-                if self.packets.contains_key(&s) {
-                    // Already buffered: skip without emitting. Bounded by
-                    // buffered packets in the gap.
-                    s = s.wrapping_add(1) & 0x7FFF_FFFF;
-                    continue;
-                }
-                let upper = self.packets.range(s..).next().map(|(&p, _)| p);
-                let lower = if s > seq {
-                    self.packets.range(..seq).next().map(|(&p, _)| p)
-                } else {
-                    None
-                };
-                let candidate = match (upper, lower) {
-                    (Some(p), _) => Some(p),
-                    (None, lower) => lower,
-                };
-                let run_end = candidate
-                    .filter(|&p| sequence_less_than(s, p) && sequence_less_than(p, seq))
-                    .unwrap_or(seq);
-                let mut t = s;
-                while t != run_end {
-                    if !self.loss_list.contains(&t) {
-                        new_losses.push(t);
-                        self.loss_list_insert(t);
-                        self.total_lost += 1;
-                    }
-                    t = t.wrapping_add(1) & 0x7FFF_FFFF;
-                }
-                s = run_end;
-            }
-        }
+        let new_losses = self.detect_losses(seq);
 
-        // Insert into buffer
         self.packets.insert(
             seq,
             ReceivedPacket {
@@ -780,9 +680,86 @@ impl ReceiverBuffer {
             },
         );
 
-        // Remove recovered entry from loss list
         let recovered_loss = self.loss_list_remove(seq);
+        self.advance_expected_seq(was_expected, recovered_loss);
 
+        if new_losses.is_empty() {
+            None
+        } else {
+            Some(new_losses)
+        }
+    }
+
+    fn record_arrival(&mut self, now: Timestamp, packet_size: usize) {
+        self.total_bytes_received += packet_size as u64;
+        self.rate_estimator.on_packet_received(now, packet_size);
+        self.link_capacity_estimator.on_packet_received(now);
+    }
+
+    fn update_jitter(&mut self, now: Timestamp, packet: &DataPacket) {
+        let transit = now.as_micros() as i64 - packet.timestamp as i64;
+        if let Some(last) = self.last_transit {
+            let d = (transit - last).unsigned_abs() as u32;
+            self.jitter = self
+                .jitter
+                .saturating_add((d.saturating_sub(self.jitter)) / 16);
+        }
+        self.last_transit = Some(transit);
+    }
+
+    fn check_tsbpd_wrap(&mut self, packet: &DataPacket) {
+        if self.tsbpd_enabled {
+            let ts = packet.timestamp as u64;
+            if ts >= WRAPPING_PERIOD_START && !self.wrapping_period_active {
+                self.wrapping_period_active = true;
+            }
+        }
+    }
+
+    /// Detect losses in the gap between expected_seq and `seq`.
+    ///
+    /// Uses BTreeMap range queries to find contiguous missing runs in
+    /// O(runs * log n + emitted) rather than scanning every sequence number.
+    fn detect_losses(&mut self, seq: u32) -> Vec<u32> {
+        let mut new_losses = Vec::new();
+        if !sequence_greater_than(seq, self.expected_seq) {
+            return new_losses;
+        }
+
+        let mut s = self.expected_seq;
+        while sequence_less_than(s, seq) {
+            if self.packets.contains_key(&s) {
+                s = s.wrapping_add(1) & 0x7FFF_FFFF;
+                continue;
+            }
+            let upper = self.packets.range(s..).next().map(|(&p, _)| p);
+            let lower = if s > seq {
+                self.packets.range(..seq).next().map(|(&p, _)| p)
+            } else {
+                None
+            };
+            let candidate = match (upper, lower) {
+                (Some(p), _) => Some(p),
+                (None, lower) => lower,
+            };
+            let run_end = candidate
+                .filter(|&p| sequence_less_than(s, p) && sequence_less_than(p, seq))
+                .unwrap_or(seq);
+            let mut t = s;
+            while t != run_end {
+                if !self.loss_list.contains(&t) {
+                    new_losses.push(t);
+                    self.loss_list_insert(t);
+                    self.total_lost += 1;
+                }
+                t = t.wrapping_add(1) & 0x7FFF_FFFF;
+            }
+            s = run_end;
+        }
+        new_losses
+    }
+
+    fn advance_expected_seq(&mut self, was_expected: bool, recovered_loss: bool) {
         if was_expected && !recovered_loss {
             self.expected_seq = self.expected_seq.wrapping_add(1) & 0x7FFF_FFFF;
         } else if was_expected {
@@ -792,12 +769,6 @@ impl ReceiverBuffer {
             while self.packets.contains_key(&self.expected_seq) {
                 self.expected_seq = self.expected_seq.wrapping_add(1) & 0x7FFF_FFFF;
             }
-        }
-
-        if new_losses.is_empty() {
-            None
-        } else {
-            Some(new_losses)
         }
     }
 
@@ -2428,6 +2399,73 @@ mod tests {
             buf.wrapping_period_active,
             "TSBPD 無効時は終了窗口パケットでも終了判定が発火しないはず"
         );
+    }
+
+    #[test]
+    fn detect_losses_finds_contiguous_gaps() {
+        let start = Timestamp::from_micros(0);
+        let mut buf = ReceiverBuffer::new(100, 120, start, 0);
+        buf.set_tsbpd_enabled(false);
+        let now = Timestamp::from_micros(1_000);
+
+        buf.receive(make_packet(100, 100), now);
+        // 101-104 missing, 105 arrives
+        let losses = buf.receive(make_packet(105, 600), now);
+        assert_eq!(losses, Some(vec![101, 102, 103, 104]));
+    }
+
+    #[test]
+    fn detect_losses_with_partially_buffered_gap() {
+        let start = Timestamp::from_micros(0);
+        let mut buf = ReceiverBuffer::new(100, 120, start, 0);
+        buf.set_tsbpd_enabled(false);
+        let now = Timestamp::from_micros(1_000);
+
+        buf.receive(make_packet(100, 100), now);
+        // 102 arrives first (101 lost)
+        buf.receive(make_packet(102, 300), now);
+        // 104 arrives: gap is 103, but 102 is already buffered
+        let losses = buf.receive(make_packet(104, 500), now);
+        assert_eq!(losses, Some(vec![103]));
+    }
+
+    #[test]
+    fn jitter_accumulates_over_successive_packets() {
+        let start = Timestamp::from_micros(0);
+        let mut buf = ReceiverBuffer::new(100, 120, start, 0);
+        buf.set_tsbpd_enabled(false);
+
+        // First packet establishes the baseline transit time.
+        buf.receive(make_packet(100, 1_000), Timestamp::from_micros(2_000));
+        assert_eq!(buf.jitter, 0);
+
+        // Second packet with identical transit: d=0, jitter stays 0.
+        buf.receive(make_packet(101, 2_000), Timestamp::from_micros(3_000));
+        assert_eq!(buf.jitter, 0);
+
+        // Third packet with 160 µs transit change: jitter += (160 - 0)/16 = 10.
+        buf.receive(make_packet(102, 3_000), Timestamp::from_micros(4_160));
+        assert_eq!(buf.jitter, 10);
+    }
+
+    #[test]
+    fn advance_expected_seq_skips_buffered_after_recovery() {
+        let start = Timestamp::from_micros(0);
+        let mut buf = ReceiverBuffer::new(100, 120, start, 0);
+        buf.set_tsbpd_enabled(false);
+        let now = Timestamp::from_micros(1_000);
+
+        // 102 arrives first (100, 101 lost)
+        buf.receive(make_packet(102, 300), now);
+        assert_eq!(buf.expected_sequence(), 100);
+
+        // 101 arrives (still out of order, 100 missing)
+        buf.receive(make_packet(101, 200), now);
+        assert_eq!(buf.expected_sequence(), 100);
+
+        // 100 arrives: expected_seq should advance past buffered 101, 102 → 103
+        buf.receive(make_packet(100, 100), now);
+        assert_eq!(buf.expected_sequence(), 103);
     }
 
     #[test]
