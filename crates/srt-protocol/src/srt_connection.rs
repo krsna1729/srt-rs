@@ -8,12 +8,13 @@ use std::fmt;
 
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::buf::write_u32;
+use crate::buf::{read_u32, write_u32};
 use crate::crypto::{CipherMode, CryptoContext, KeyFlag, KeyLength};
 use crate::error::Error;
+use crate::message_assembler::MessageAssembler;
 use crate::srt_handshake::{
-    DEFAULT_FLOW_WINDOW, GroupExtensionData, HS_VERSION_5, HandshakePacket, HandshakeState,
-    HandshakeType, KmError, KmMessage, SRT_MAGIC_CODE, srt_flags,
+    DEFAULT_FLOW_WINDOW, DEFAULT_MTU, GroupExtensionData, HS_VERSION_5, HandshakePacket,
+    HandshakeState, HandshakeType, KmError, KmMessage, SRT_MAGIC_CODE, srt_flags,
 };
 use crate::srt_packet::{ControlPacket, ControlType, DataPacket, SRT_HEADER_SIZE, SrtPacket};
 use crate::srt_receiver::ReceiverBuffer;
@@ -310,6 +311,10 @@ pub struct SrtConnection {
     sender: Option<SenderBuffer>,
     /// Receive buffer.
     receiver: Option<ReceiverBuffer>,
+    /// Message reassembly.
+    assembler: MessageAssembler,
+    /// Maximum data payload per SRT packet (MTU minus header).
+    max_payload_size: usize,
 
     /// Event queue.
     event_queue: VecDeque<ConnectionEvent>,
@@ -446,6 +451,8 @@ impl SrtConnection {
             crypto: None,
             sender: None,
             receiver: None,
+            assembler: MessageAssembler::new(),
+            max_payload_size: DEFAULT_MTU as usize - SRT_HEADER_SIZE,
             event_queue: VecDeque::new(),
             key_refresh_notified: false,
             pending_data_events: 0,
@@ -484,6 +491,8 @@ impl SrtConnection {
             crypto: None,
             sender: None,
             receiver: None,
+            assembler: MessageAssembler::new(),
+            max_payload_size: DEFAULT_MTU as usize - SRT_HEADER_SIZE,
             event_queue: VecDeque::new(),
             key_refresh_notified: false,
             pending_data_events: 0,
@@ -924,7 +933,10 @@ impl SrtConnection {
         if self.tlpktdrop_enabled()
             && let Some(sender) = self.sender.as_mut()
         {
-            let _ = sender.drop_expired(now);
+            let dropped_messages = sender.drop_expired(now);
+            for msg in &dropped_messages {
+                self.send_drop_req(msg.message_number, msg.first_seq, msg.last_seq, now);
+            }
         }
 
         self.output_queue.push_back(ConnectionOutput::SetTimer {
@@ -978,6 +990,49 @@ impl SrtConnection {
         now: Timestamp,
     ) -> Result<(), Error> {
         self.send_internal(payload, Some(sequence_number), now)
+    }
+
+    /// Send a message that may be larger than one SRT packet.
+    ///
+    /// The payload is fragmented into multiple packets if it exceeds the
+    /// negotiated maximum payload size. The receiver reassembles the
+    /// fragments before delivering them as a single `DataReceived` event.
+    pub fn send_message(&mut self, payload: &[u8], now: Timestamp) -> Result<(), Error> {
+        if self.state != ConnectionState::Connected {
+            return Err(Error::invalid_state("not connected"));
+        }
+        if !self.can_send() {
+            return Err(Error::invalid_state("send buffer full"));
+        }
+        let timestamp = self.relative_timestamp(now);
+        let peer_socket_id = self.peer_socket_id;
+        let max_payload_size = self.max_payload_size;
+
+        let packets = {
+            let sender = self
+                .sender
+                .as_mut()
+                .ok_or_else(|| Error::invalid_state("sender buffer not initialized"))?;
+            sender.push_message(payload, max_payload_size, timestamp, peer_socket_id, now)
+        };
+
+        if packets.is_empty() {
+            return Err(Error::invalid_state("send buffer full"));
+        }
+
+        for mut packet in packets {
+            self.encrypt_packet(&mut packet)?;
+            let mut buf = Vec::new();
+            packet.encode(&mut buf);
+            self.queue_packet(buf, now);
+        }
+
+        if let Some(ref mut sender) = self.sender {
+            sender.record_send_time(now);
+        }
+
+        self.check_km_refresh(now);
+        Ok(())
     }
 
     fn send_internal(
@@ -1258,13 +1313,15 @@ impl SrtConnection {
         };
 
         for packet in ready_packets {
-            self.event_queue.push_back(ConnectionEvent::DataReceived {
-                payload: packet.payload,
-                sequence_number: packet.sequence_number,
-                message_number: packet.message_number,
-                timestamp: packet.timestamp,
-            });
-            self.pending_data_events = self.pending_data_events.saturating_add(1);
+            if let Some(msg) = self.assembler.feed(packet) {
+                self.event_queue.push_back(ConnectionEvent::DataReceived {
+                    payload: msg.payload,
+                    sequence_number: msg.first_sequence_number,
+                    message_number: msg.message_number,
+                    timestamp: msg.timestamp,
+                });
+                self.pending_data_events = self.pending_data_events.saturating_add(1);
+            }
         }
         self.sync_application_backlog();
     }
@@ -1409,15 +1466,8 @@ impl SrtConnection {
             ControlType::Shutdown => self.handle_shutdown(now),
             ControlType::AckAck => self.handle_ackack(pkt, now),
             ControlType::UserDefined => self.handle_user_defined(pkt, now),
-            // This is a live-only core. PEERERROR is FileCC-only and
-            // CongestionWarning is reserved by the specification. DROPREQ
-            // requires TTL-driven multi-packet message delivery, which this
-            // API intentionally does not expose yet. Keep them decoded for
-            // wire compatibility, but do not give the false impression that
-            // they affect live delivery.
-            ControlType::CongestionWarning | ControlType::DropReq | ControlType::PeerError => {
-                Ok(())
-            }
+            ControlType::DropReq => self.handle_drop_req(pkt, now),
+            ControlType::CongestionWarning | ControlType::PeerError => Ok(()),
         }
     }
 
@@ -1861,6 +1911,42 @@ impl SrtConnection {
         self.event_queue.push_back(ConnectionEvent::Disconnected {
             reason: reason.to_owned(),
         });
+    }
+
+    fn handle_drop_req(&mut self, pkt: ControlPacket, now: Timestamp) -> Result<(), Error> {
+        let message_number = pkt.type_specific_info & 0x03FF_FFFF;
+        if pkt.control_info.len() < 8 {
+            return Err(Error::invalid_data("DROPREQ CIF too short"));
+        }
+        let mut buf = &pkt.control_info[..];
+        let first_seq = read_u32(&mut buf)?;
+        let last_seq = read_u32(&mut buf)?;
+
+        if let Some(receiver) = self.receiver.as_mut() {
+            receiver.drop_range(first_seq, last_seq);
+        }
+        self.assembler.drop_message(message_number);
+        self.enqueue_ready_data(now);
+        Ok(())
+    }
+
+    fn send_drop_req(
+        &mut self,
+        message_number: u32,
+        first_seq: u32,
+        last_seq: u32,
+        now: Timestamp,
+    ) {
+        let timestamp = self.relative_timestamp(now);
+        let mut pkt = ControlPacket::new(ControlType::DropReq, timestamp, self.peer_socket_id);
+        pkt.type_specific_info = message_number & 0x03FF_FFFF;
+        let mut cif = Vec::with_capacity(8);
+        write_u32(&mut cif, first_seq);
+        write_u32(&mut cif, last_seq);
+        pkt.control_info = cif;
+        let mut buf = Vec::new();
+        pkt.encode(&mut buf);
+        self.queue_packet(buf, now);
     }
 
     /// Process a UserDefined packet (KM Refresh).

@@ -43,6 +43,14 @@ struct SentPacket {
     retransmit_count: u32,
 }
 
+/// A message dropped by sender-side TLPKTDROP.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DroppedMessage {
+    pub message_number: u32,
+    pub first_seq: u32,
+    pub last_seq: u32,
+}
+
 /// Send buffer.
 #[derive(Debug)]
 pub struct SenderBuffer {
@@ -570,25 +578,17 @@ impl SenderBuffer {
         });
     }
 
-    /// Remove expired packets (TLPKTDROP).
+    /// Remove expired packets (TLPKTDROP), dropping entire messages.
     ///
-    /// Scans in sequence order from `oldest_unacked` toward `next_seq`,
-    /// stopping at the first packet that isn't expired yet -- the same
-    /// monotonic forward scan as libsrt's `CSndBuffer::dropLateData`
-    /// (`srtcore/buffer_snd.cpp`). Since `pop_retransmit` no longer updates
-    /// `sent_time` (see its doc comment for why), `sent_time` keeps
-    /// increasing monotonically in send order = sequence order -- the
-    /// precondition for this scan's correctness. Like `handle_ack`, this
-    /// also updates `oldest_unacked`, so the two keep sharing the same
-    /// boundary for "the oldest packet still alive," and no hole opens up in
-    /// the packet set.
-    pub fn drop_expired(&mut self, now: Timestamp) -> Vec<u32> {
-        // TLPKTDROP threshold: 1.25x the SRT latency, minimum 1 second.
-        // Follows the recommended value from the spec (draft-sharabayko-srt.md,
-        // #too-late-packet-drop section).
+    /// Scans in sequence order from `oldest_unacked` toward `next_seq`.
+    /// When an expired packet is found, all packets sharing its
+    /// `message_number` are removed together (SRT spec: "the entire message
+    /// is dropped"). Returns one `DroppedMessage` per message removed.
+    pub fn drop_expired(&mut self, now: Timestamp) -> Vec<DroppedMessage> {
         let threshold = (self.latency_us * 125 / 100).max(1_000_000);
 
-        let mut dropped = Vec::new();
+        let mut dropped_seqs = Vec::new();
+        let mut messages = Vec::new();
         let mut seq = self.oldest_unacked;
         while sequence_less_than(seq, self.next_seq) {
             match self.packets.get(&seq) {
@@ -597,29 +597,53 @@ impl SenderBuffer {
                     if elapsed <= threshold {
                         break;
                     }
-                    if let Some(entry) = self.packets.remove(&seq) {
-                        self.total_dropped = self.total_dropped.saturating_add(1);
-                        self.total_bytes_dropped = self
-                            .total_bytes_dropped
-                            .saturating_add(entry.packet.payload.len() as u64);
-                        dropped.push(seq);
+                    let msg_num = entry.packet.message_number;
+                    let msg_first_seq = seq;
+                    // Drop this packet and any remaining fragments of the same message.
+                    let mut msg_last_seq = seq;
+                    loop {
+                        if let Some(removed) = self.packets.remove(&seq) {
+                            self.total_dropped = self.total_dropped.saturating_add(1);
+                            self.total_bytes_dropped = self
+                                .total_bytes_dropped
+                                .saturating_add(removed.packet.payload.len() as u64);
+                            dropped_seqs.push(seq);
+                            msg_last_seq = seq;
+                        }
+                        let next = seq.wrapping_add(1) & 0x7FFF_FFFF;
+                        if !sequence_less_than(next, self.next_seq) {
+                            seq = next;
+                            break;
+                        }
+                        match self.packets.get(&next) {
+                            Some(e) if e.packet.message_number == msg_num => {
+                                seq = next;
+                            }
+                            _ => {
+                                seq = next;
+                                break;
+                            }
+                        }
                     }
+                    messages.push(DroppedMessage {
+                        message_number: msg_num,
+                        first_seq: msg_first_seq,
+                        last_seq: msg_last_seq,
+                    });
                 }
                 None => {
-                    // Already ACKed and gone -- keep scanning.
+                    seq = seq.wrapping_add(1) & 0x7FFF_FFFF;
                 }
             }
-            seq = seq.wrapping_add(1) & 0x7FFF_FFFF;
         }
 
         if sequence_less_than(self.oldest_unacked, seq) {
             self.oldest_unacked = seq;
         }
 
-        // Also remove from the loss list.
-        self.loss_list.retain(|s| !dropped.contains(s));
+        self.loss_list.retain(|s| !dropped_seqs.contains(s));
 
-        dropped
+        messages
     }
 
     /// Get the send time of the oldest packet in the buffer.
@@ -788,6 +812,21 @@ pub struct SenderStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dropped_seqs(messages: &[DroppedMessage]) -> Vec<u32> {
+        let mut seqs = Vec::new();
+        for m in messages {
+            let mut s = m.first_seq;
+            loop {
+                seqs.push(s);
+                if s == m.last_seq {
+                    break;
+                }
+                s = s.wrapping_add(1) & 0x7FFF_FFFF;
+            }
+        }
+        seqs
+    }
 
     #[test]
     fn test_sender_buffer_new() {
@@ -1079,7 +1118,11 @@ mod tests {
         // elapsed = 1_000_001 は閾値を超えるので drop される
         let now = Timestamp::from_micros(1_000_001);
         let dropped = buf.drop_expired(now);
-        assert_eq!(dropped, vec![0], "閾値超過で drop されるはず");
+        assert_eq!(
+            dropped_seqs(&dropped),
+            vec![0],
+            "閾値超過で drop されるはず"
+        );
     }
 
     #[test]
@@ -1098,7 +1141,11 @@ mod tests {
         // elapsed = 1_250_001 は閾値を超えるので drop される
         let now = Timestamp::from_micros(1_250_001);
         let dropped = buf.drop_expired(now);
-        assert_eq!(dropped, vec![0], "閾値超過で drop されるはず");
+        assert_eq!(
+            dropped_seqs(&dropped),
+            vec![0],
+            "閾値超過で drop されるはず"
+        );
     }
 
     #[test]
@@ -1117,7 +1164,11 @@ mod tests {
         // elapsed = 1_000_001 は閾値を超えるので drop される
         let now = Timestamp::from_micros(1_000_001);
         let dropped = buf.drop_expired(now);
-        assert_eq!(dropped, vec![0], "境界値の超過で drop されるはず");
+        assert_eq!(
+            dropped_seqs(&dropped),
+            vec![0],
+            "境界値の超過で drop されるはず"
+        );
     }
 
     #[test]
@@ -1140,7 +1191,7 @@ mod tests {
         let now = Timestamp::from_micros(1_000_001);
         let dropped = buf.drop_expired(now);
         assert_eq!(
-            dropped,
+            dropped_seqs(&dropped),
             vec![0],
             "再送しても元の送信時刻基準の期限切れ判定は変わらないはず"
         );
@@ -1158,7 +1209,7 @@ mod tests {
 
         // 先頭 2 パケットだけ期限切れ、3 番目はまだ新しい。
         let dropped = buf.drop_expired(Timestamp::from_micros(1_000_001));
-        assert_eq!(dropped, vec![0, 1]);
+        assert_eq!(dropped_seqs(&dropped), vec![0, 1]);
         assert_eq!(buf.packets_in_flight(), 1);
 
         // ACK 2 は既に drop_expired で消えた分をカバーするだけの no-op に
@@ -1192,11 +1243,29 @@ mod tests {
         assert_eq!(stats.total_data_packets_sent, 2);
 
         let dropped = buf.drop_expired(Timestamp::from_micros(1_000_001));
-        assert_eq!(dropped, vec![10]);
+        assert_eq!(dropped_seqs(&dropped), vec![10]);
         let stats = buf.stats();
         assert_eq!(stats.total_dropped, 1);
         assert_eq!(stats.total_bytes_dropped, 4);
         assert_eq!(stats.payload_bytes_in_buffer, 0);
+    }
+
+    #[test]
+    fn drop_expired_drops_entire_message() {
+        let mut buf = SenderBuffer::new(0, 8192, 10);
+        let now = Timestamp::from_micros(0);
+        let packets = buf.push_message(&[0xAB; 3000], 1400, 100, 1, now);
+        assert_eq!(packets.len(), 3);
+
+        // A fresh packet that should survive.
+        buf.push(vec![99], 200, 1, Timestamp::from_micros(2_000_000));
+
+        let dropped = buf.drop_expired(Timestamp::from_micros(1_000_001));
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].message_number, 1);
+        assert_eq!(dropped[0].first_seq, 0);
+        assert_eq!(dropped[0].last_seq, 2);
+        assert_eq!(buf.packets_in_flight(), 1);
     }
 
     #[test]
