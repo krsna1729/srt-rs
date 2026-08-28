@@ -18,7 +18,9 @@ use std::collections::BTreeMap;
 use std::cell::Cell;
 
 use crate::srt_handshake::DEFAULT_FLOW_WINDOW;
-use crate::srt_packet::{DataPacket, SRT_HEADER_SIZE, sequence_greater_than, sequence_less_than};
+use crate::srt_packet::{
+    DataPacket, PacketPosition, SRT_HEADER_SIZE, sequence_greater_than, sequence_less_than,
+};
 use crate::time::Timestamp;
 
 /// Light ACK send interval (packets).
@@ -302,12 +304,18 @@ impl LinkCapacityEstimator {
     }
 }
 
-/// A received packet entry.
+/// Retained received-packet entry.
+///
+/// Strips fields redundant with the BTreeMap key (`sequence_number`) or
+/// already consumed before insertion (`dest_socket_id`, `encryption_flag`,
+/// `retransmitted`). Saves 16 bytes per retained packet.
 #[derive(Debug, Clone)]
 struct ReceivedPacket {
-    /// Packet data.
-    packet: DataPacket,
-    /// Receipt time (for statistics/jitter calculation).
+    position: PacketPosition,
+    order_flag: bool,
+    message_number: u32,
+    timestamp: u32,
+    payload: Vec<u8>,
     recv_time: Timestamp,
 }
 
@@ -660,8 +668,8 @@ impl ReceiverBuffer {
         self.packets_since_ack += 1;
 
         self.record_arrival(now, packet_size);
-        self.update_jitter(now, &packet);
-        self.check_tsbpd_wrap(&packet);
+        self.update_jitter(now, packet.timestamp);
+        self.check_tsbpd_wrap(packet.timestamp);
 
         if self
             .delivery_seq_hint
@@ -675,7 +683,11 @@ impl ReceiverBuffer {
         self.packets.insert(
             seq,
             ReceivedPacket {
-                packet,
+                position: packet.position,
+                order_flag: packet.order_flag,
+                message_number: packet.message_number,
+                timestamp: packet.timestamp,
+                payload: packet.payload,
                 recv_time: now,
             },
         );
@@ -696,8 +708,8 @@ impl ReceiverBuffer {
         self.link_capacity_estimator.on_packet_received(now);
     }
 
-    fn update_jitter(&mut self, now: Timestamp, packet: &DataPacket) {
-        let transit = now.as_micros() as i64 - packet.timestamp as i64;
+    fn update_jitter(&mut self, now: Timestamp, packet_timestamp: u32) {
+        let transit = now.as_micros() as i64 - packet_timestamp as i64;
         if let Some(last) = self.last_transit {
             let d = (transit - last).unsigned_abs() as u32;
             self.jitter = self
@@ -707,9 +719,9 @@ impl ReceiverBuffer {
         self.last_transit = Some(transit);
     }
 
-    fn check_tsbpd_wrap(&mut self, packet: &DataPacket) {
+    fn check_tsbpd_wrap(&mut self, packet_timestamp: u32) {
         if self.tsbpd_enabled {
-            let ts = packet.timestamp as u64;
+            let ts = packet_timestamp as u64;
             if ts >= WRAPPING_PERIOD_START && !self.wrapping_period_active {
                 self.wrapping_period_active = true;
             }
@@ -790,7 +802,7 @@ impl ReceiverBuffer {
         }
 
         let base_and_delay = self
-            .packet_base_time(entry.packet.timestamp)
+            .packet_base_time(entry.timestamp)
             .saturating_add(self.tsbpd_delay_us);
         Timestamp::from_micros(base_and_delay.saturating_add_signed(self.drift_tracer.drift_us()))
     }
@@ -811,14 +823,24 @@ impl ReceiverBuffer {
         // libsrt treats the upper endpoint as inclusive, which we mirror for
         // trace-level compatibility.
         if self.tsbpd_enabled && self.wrapping_period_active {
-            let ts = entry.packet.timestamp as u64;
+            let ts = entry.timestamp as u64;
             if (WRAPPING_PERIOD_END_MIN..=WRAPPING_PERIOD_END_MAX).contains(&ts) {
                 self.tsbpd_time_base += MAX_TIMESTAMP + 1;
                 self.wrapping_period_active = false;
             }
         }
 
-        Some(entry.packet)
+        Some(DataPacket {
+            sequence_number: delivery_seq,
+            position: entry.position,
+            order_flag: entry.order_flag,
+            encryption_flag: 0,
+            retransmitted: false,
+            message_number: entry.message_number,
+            timestamp: entry.timestamp,
+            dest_socket_id: 0,
+            payload: entry.payload,
+        })
     }
 
     /// Find the deliverable sequence number.
@@ -1237,7 +1259,7 @@ impl ReceiverBuffer {
         let mut oldest_delivery: Option<u64> = None;
         let mut newest_delivery: Option<u64> = None;
         for entry in self.packets.values() {
-            payload_bytes_in_buffer += entry.packet.payload.len() as u64;
+            payload_bytes_in_buffer += entry.payload.len() as u64;
             let delivery = self.delivery_time(entry).as_micros();
             oldest_delivery = Some(oldest_delivery.map_or(delivery, |old: u64| old.min(delivery)));
             newest_delivery = Some(newest_delivery.map_or(delivery, |new: u64| new.max(delivery)));

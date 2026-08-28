@@ -869,7 +869,12 @@ impl SrtConnection {
     /// `SenderBuffer::pop_retransmit`'s doc comment for why retransmitted
     /// packets' `sent_time` is no longer updated).
     pub fn process_retransmit(&mut self, now: Timestamp) {
-        while let Some(mut packet) = self.sender.as_mut().and_then(SenderBuffer::pop_retransmit) {
+        let dest_socket_id = self.peer_socket_id;
+        while let Some(mut packet) = self
+            .sender
+            .as_mut()
+            .and_then(|s| s.pop_retransmit(dest_socket_id))
+        {
             let _ = self.encrypt_packet(&mut packet);
 
             let mut buf = Vec::with_capacity(packet.encoded_size());
