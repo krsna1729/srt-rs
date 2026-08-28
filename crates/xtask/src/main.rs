@@ -224,10 +224,15 @@ fn run_one(step: &Step) -> ExitCode {
 }
 
 fn run_group(steps: &[&Step]) -> ExitCode {
-    if steps.iter().any(|s| !require_tool(s)) {
-        return ExitCode::FAILURE;
+    let mut runnable = Vec::new();
+    for s in steps {
+        if require_tool(s) {
+            runnable.push(*s);
+        } else if !s.informational {
+            return ExitCode::FAILURE;
+        }
     }
-    let results: Vec<_> = steps.iter().map(|s| execute(s)).collect();
+    let results: Vec<_> = runnable.iter().map(|s| execute(s)).collect();
     print_report(&results)
 }
 
