@@ -76,3 +76,54 @@ pub fn available_cpus() -> usize {
             .max(1)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_spec_yields_empty() {
+        assert!(parse_cpu_spec("").is_empty());
+        assert!(parse_cpu_spec("  ").is_empty());
+    }
+
+    #[test]
+    fn single_cpu() {
+        assert_eq!(parse_cpu_spec("3"), vec![3]);
+    }
+
+    #[test]
+    fn csv_list() {
+        assert_eq!(parse_cpu_spec("0,2,4"), vec![0, 2, 4]);
+    }
+
+    #[test]
+    fn range() {
+        assert_eq!(parse_cpu_spec("0-3"), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn mixed_range_and_scalar() {
+        assert_eq!(parse_cpu_spec("0-1,4-5"), vec![0, 1, 4, 5]);
+    }
+
+    #[test]
+    fn duplicates_removed_and_sorted() {
+        assert_eq!(parse_cpu_spec("3,1,3,0-2"), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn whitespace_tolerated() {
+        assert_eq!(parse_cpu_spec(" 1 , 3 - 5 "), vec![1, 3, 4, 5]);
+    }
+
+    #[test]
+    fn garbage_parts_skipped() {
+        assert_eq!(parse_cpu_spec("0,abc,2"), vec![0, 2]);
+    }
+
+    #[test]
+    fn available_cpus_is_nonzero() {
+        assert!(available_cpus() >= 1);
+    }
+}
