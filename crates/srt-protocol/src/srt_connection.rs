@@ -824,12 +824,10 @@ impl SrtConnection {
         }
 
         // Only a valid packet for this connection proves peer activity.
+        // The inactivity timer is armed once at connect and rearms itself on
+        // fire — no per-packet SetTimer output.
         if self.state == ConnectionState::Connected {
             self.last_recv_time = Some(now);
-            self.output_queue.push_back(ConnectionOutput::SetTimer {
-                id: TimerId::Inactivity,
-                duration_micros: INACTIVITY_TIMEOUT_MICROS,
-            });
         }
 
         match packet {
@@ -876,10 +874,20 @@ impl SrtConnection {
             }
             TimerId::Inactivity => {
                 if self.state == ConnectionState::Connected {
-                    self.event_queue.push_back(ConnectionEvent::Disconnected {
-                        reason: "inactivity timeout".to_string(),
+                    let elapsed = self.last_recv_time.map_or(INACTIVITY_TIMEOUT_MICROS, |t| {
+                        now.as_micros().saturating_sub(t.as_micros())
                     });
-                    self.set_state(ConnectionState::Disconnected);
+                    if elapsed >= INACTIVITY_TIMEOUT_MICROS {
+                        self.event_queue.push_back(ConnectionEvent::Disconnected {
+                            reason: "inactivity timeout".to_string(),
+                        });
+                        self.set_state(ConnectionState::Disconnected);
+                    } else {
+                        self.output_queue.push_back(ConnectionOutput::SetTimer {
+                            id: TimerId::Inactivity,
+                            duration_micros: INACTIVITY_TIMEOUT_MICROS - elapsed,
+                        });
+                    }
                 }
             }
             TimerId::Shutdown => self.handle_shutdown_timer(now),
