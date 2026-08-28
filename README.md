@@ -184,7 +184,51 @@ gitignored `scratch/` directory. See [`docs/performance-loop.md`](docs/performan
 [`docs/cpu-budget.md`](docs/cpu-budget.md), and [`docs/reading-results.md`](docs/reading-results.md)
 for reproducible runs and result interpretation.
 
-## Testing
+## Development
+
+### Quality gate
+
+All local quality checks are unified in `cargo xtask`. Install the git
+pre-commit hook once, and every commit runs the fast checks (fmt, clippy,
+rustdoc, typos) automatically:
+
+```sh
+cargo xtask install-hooks   # sets core.hooksPath to .githooks
+```
+
+The full CI suite and the fast pre-commit gate:
+
+```sh
+cargo xtask ci              # everything CI runs (fmt, clippy, doc, typos, test, deny, package)
+cargo xtask precommit       # fast gate only (fmt, clippy, doc, typos)
+```
+
+Individual checks:
+
+```sh
+cargo xtask fmt             # rustfmt --check
+cargo xtask lint            # clippy --workspace -D warnings
+cargo xtask doc             # rustdoc -D warnings
+cargo xtask typos           # spellcheck (needs typos-cli)
+cargo xtask test            # cargo test --workspace
+cargo xtask deny            # cargo-deny: published + workspace policy
+cargo xtask package         # dry-run crate package
+cargo xtask geiger          # unsafe surface inventory (needs cargo-geiger)
+```
+
+External tools (`typos-cli`, `cargo-deny`, `cargo-geiger`) are not
+auto-installed. If missing, xtask prints the exact `cargo install` command
+and fails.
+
+### Workspace lints
+
+Lint policy is centralized in the root `Cargo.toml` under
+`[workspace.lints]`. Cognitive complexity is gated at 15
+(`clippy.toml`); functions above threshold carry `#[expect(clippy::cognitive_complexity)]`
+which fires when the function is simplified below threshold, prompting
+annotation removal.
+
+### Testing
 
 ```sh
 cargo test -p shiguredo_srt      # unit + integration + doctests
