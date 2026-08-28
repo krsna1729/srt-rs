@@ -43,7 +43,10 @@ fn command_available(binary: &str) -> bool {
 /// `ENABLE_AEAD_API_PREVIEW` build flag and requiring the OpenSSL-EVP or Botan
 /// crypto backend (not GnuTLS). Most distro packages lack it.
 fn libsrt_supports_gcm() -> bool {
-    // Check the crypto backend via ldd: GCM requires OpenSSL-EVP or Botan.
+    // AEAD requires both: (1) OpenSSL-EVP or Botan backend (not GnuTLS), AND
+    // (2) ENABLE_AEAD_API_PREVIEW set at cmake time.  Check (2) by looking for
+    // the "cryptomode" URL-parameter string in the binary — it's only compiled
+    // in when the preview flag is on.
     let path = Command::new("which")
         .arg("srt-live-transmit")
         .stdout(Stdio::piped())
@@ -53,17 +56,15 @@ fn libsrt_supports_gcm() -> bool {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_owned());
     let Some(slt) = path else { return false };
-    let ldd = Command::new("ldd")
+    let strings = Command::new("strings")
         .arg(&slt)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output();
-    match ldd {
+    match strings {
         Ok(out) => {
-            let libs = String::from_utf8_lossy(&out.stdout);
-            // GCM requires OpenSSL-EVP or Botan; GnuTLS backend cannot do AEAD.
-            (libs.contains("libssl") || libs.contains("libcrypto") || libs.contains("libbotan"))
-                && !libs.contains("libgnutls")
+            let text = String::from_utf8_lossy(&out.stdout);
+            text.contains("cryptomode")
         }
         Err(_) => false,
     }

@@ -2,3 +2,4 @@ paths-ignore:
   - "**/tests"
   - "**/benches"
   - "**/pbt"
+  - "**/fuzz"
