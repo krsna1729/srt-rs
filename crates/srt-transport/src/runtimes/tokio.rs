@@ -4,7 +4,9 @@ use crate::{
     OutputDrainReport, OutputDrainStatus, collect_output_work, group_connection_stats,
     prepend_outputs,
 };
-use shiguredo_srt::{ConnectionEvent, ConnectionOutput, GroupMode, SrtConnection, Timestamp};
+use shiguredo_srt::{
+    Bytes, ConnectionEvent, ConnectionOutput, GroupMode, SrtConnection, Timestamp,
+};
 use std::collections::VecDeque;
 use std::io;
 use std::time::Duration;
@@ -116,6 +118,18 @@ impl Conn {
             return Err(());
         }
         self.conn.send(payload, now).map_err(|_| ())?;
+        let report = self.drain_outputs(now).await.map_err(|_| ())?;
+        (report.status == OutputDrainStatus::Drained)
+            .then_some(())
+            .ok_or(())
+    }
+
+    /// Send one paced shared-payload packet (fan-out path).
+    pub async fn send_shared_paced(&mut self, payload: Bytes, now: Timestamp) -> Result<(), ()> {
+        if self.has_pending_outputs() || !self.conn.can_send_with_pacing(now) {
+            return Err(());
+        }
+        self.conn.send_shared(payload, now).map_err(|_| ())?;
         let report = self.drain_outputs(now).await.map_err(|_| ())?;
         (report.status == OutputDrainStatus::Drained)
             .then_some(())
@@ -296,6 +310,18 @@ impl GroupConn {
         self.logical_payload_bytes_sent = self
             .logical_payload_bytes_sent
             .saturating_add(payload.len() as u64);
+        Ok(legs)
+    }
+
+    pub fn send_shared(
+        &mut self,
+        payload: Bytes,
+        now: Timestamp,
+    ) -> Result<usize, shiguredo_srt::Error> {
+        let len = payload.len() as u64;
+        let legs = self.group.send_shared(payload, now)?;
+        self.logical_payloads_sent = self.logical_payloads_sent.saturating_add(1);
+        self.logical_payload_bytes_sent = self.logical_payload_bytes_sent.saturating_add(len);
         Ok(legs)
     }
 

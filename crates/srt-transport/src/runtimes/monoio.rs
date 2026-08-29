@@ -1,7 +1,7 @@
 use crate::{
     OutputDrainBudget, OutputDrainReport, OutputDrainStatus, collect_output_work, prepend_outputs,
 };
-use shiguredo_srt::{ConnectionEvent, ConnectionOutput, SrtConnection, Timestamp};
+use shiguredo_srt::{Bytes, ConnectionEvent, ConnectionOutput, SrtConnection, Timestamp};
 use std::collections::VecDeque;
 use std::io;
 use std::time::Duration;
@@ -107,6 +107,17 @@ impl Conn {
             return Err(());
         }
         self.conn.send(payload, now).map_err(|_| ())?;
+        let report = self.drain_outputs(now).await.map_err(|_| ())?;
+        (report.status == OutputDrainStatus::Drained)
+            .then_some(())
+            .ok_or(())
+    }
+
+    pub async fn send_shared_paced(&mut self, payload: Bytes, now: Timestamp) -> Result<(), ()> {
+        if self.has_pending_outputs() || !self.conn.can_send_with_pacing(now) {
+            return Err(());
+        }
+        self.conn.send_shared(payload, now).map_err(|_| ())?;
         let report = self.drain_outputs(now).await.map_err(|_| ())?;
         (report.status == OutputDrainStatus::Drained)
             .then_some(())

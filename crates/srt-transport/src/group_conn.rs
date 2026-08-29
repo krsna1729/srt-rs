@@ -2,7 +2,7 @@ use crate::{
     CallerConfig, ConfigError, GroupConfig, ManualTimerStore, OutputDrainBudget, OutputDrainReport,
     OutputDrainStatus, RuntimeFlavor, collect_output_work, prepend_outputs,
 };
-use shiguredo_srt::{ConnectionOutput, SrtConnection, Timestamp};
+use shiguredo_srt::{Bytes, ConnectionOutput, SrtConnection, Timestamp};
 use std::collections::VecDeque;
 use std::fmt;
 
@@ -393,6 +393,20 @@ impl GroupConn {
         self.logical_payload_bytes_sent = self
             .logical_payload_bytes_sent
             .saturating_add(payload.len() as u64);
+        Ok(legs)
+    }
+
+    /// Send shared payload data. Uses reference-counted `Bytes` to avoid
+    /// deep-copying the payload for each group leg.
+    pub fn send_shared(
+        &mut self,
+        payload: Bytes,
+        now: Timestamp,
+    ) -> Result<usize, shiguredo_srt::Error> {
+        let len = payload.len() as u64;
+        let legs = self.group.send_shared(payload, now)?;
+        self.logical_payloads_sent = self.logical_payloads_sent.saturating_add(1);
+        self.logical_payload_bytes_sent = self.logical_payload_bytes_sent.saturating_add(len);
         Ok(legs)
     }
 

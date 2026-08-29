@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use bytes::Bytes;
+
 use crate::error::Error;
 use crate::srt_connection::{ConnectionEvent, ConnectionState, SrtConnection};
 use crate::srt_handshake::{GroupType, SRTGROUP_MASK};
@@ -269,6 +271,12 @@ impl SrtGroup {
     /// Send one payload through the group per its [`GroupMode`]. Returns the
     /// number of members it was actually sent on.
     pub fn send(&mut self, payload: &[u8], now: Timestamp) -> Result<usize, Error> {
+        self.send_shared(Bytes::copy_from_slice(payload), now)
+    }
+
+    /// Send shared payload data across group members. Uses reference-counted
+    /// `Bytes` to avoid deep-copying the payload for each leg.
+    pub fn send_shared(&mut self, payload: Bytes, now: Timestamp) -> Result<usize, Error> {
         self.refresh_states();
         match self.mode {
             GroupMode::Broadcast => self.send_broadcast(payload, now),
@@ -358,7 +366,7 @@ impl SrtGroup {
         Some(GroupEvent::DataReceived(packet))
     }
 
-    fn send_broadcast(&mut self, payload: &[u8], now: Timestamp) -> Result<usize, Error> {
+    fn send_broadcast(&mut self, payload: Bytes, now: Timestamp) -> Result<usize, Error> {
         let active = self.active_indices();
         if active.is_empty() {
             return Err(Error::invalid_state("no active Broadcast group members"));
@@ -369,7 +377,7 @@ impl SrtGroup {
             let sent_on_member = self.members[index].connection.can_send()
                 && self.members[index]
                     .connection
-                    .send_with_sequence(payload, sequence_number, now)
+                    .send_shared_with_sequence(payload.clone(), sequence_number, now)
                     .is_ok();
             if sent_on_member {
                 sent += 1;
@@ -384,7 +392,7 @@ impl SrtGroup {
         Ok(sent)
     }
 
-    fn send_backup(&mut self, payload: &[u8], now: Timestamp) -> Result<usize, Error> {
+    fn send_backup(&mut self, payload: Bytes, now: Timestamp) -> Result<usize, Error> {
         let mut active = self.active_indices().into_iter().next();
         if active.is_none() {
             self.promote_backup_member();
@@ -402,7 +410,7 @@ impl SrtGroup {
         if !self.members[index].connection.can_send()
             || self.members[index]
                 .connection
-                .send_with_sequence(payload, sequence_number, now)
+                .send_shared_with_sequence(payload.clone(), sequence_number, now)
                 .is_err()
         {
             self.mark_send_failure(index);
@@ -413,7 +421,7 @@ impl SrtGroup {
             self.align_member_sequence(self.members[index].id)?;
             self.members[index]
                 .connection
-                .send_with_sequence(payload, sequence_number, now)
+                .send_shared_with_sequence(payload, sequence_number, now)
                 .map_err(|_| Error::invalid_state("Backup promotion send failed"))?;
         }
         self.next_send_sequence = Some(sequence_number.wrapping_add(1) & 0x7FFF_FFFF);

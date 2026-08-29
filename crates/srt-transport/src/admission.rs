@@ -3,7 +3,7 @@ use crate::{
     ListenerPeerPolicy, ManualTimerStore, WorkerMessage, group_connection_stats,
 };
 use shiguredo_srt::{
-    ConnectionEvent, ConnectionOptions, ConnectionOutput, SrtConnection, Timestamp,
+    Bytes, ConnectionEvent, ConnectionOptions, ConnectionOutput, SrtConnection, Timestamp,
 };
 use std::collections::hash_map::Entry as HashEntry;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -539,6 +539,46 @@ impl LogicalPeerMut<'_> {
                 group.logical_payload_bytes_sent = group
                     .logical_payload_bytes_sent
                     .saturating_add(payload.len() as u64);
+                Ok(legs)
+            }
+            None => Err(shiguredo_srt::Error::with_reason(
+                shiguredo_srt::ErrorKind::InvalidState,
+                "logical peer no longer exists",
+            )),
+        }
+    }
+
+    /// Send shared payload data. Uses reference-counted `Bytes` to avoid
+    /// deep-copying the payload for each group leg — the fan-out path.
+    pub fn send_shared(
+        &mut self,
+        payload: Bytes,
+        now: Timestamp,
+    ) -> Result<usize, shiguredo_srt::Error> {
+        let len = payload.len() as u64;
+        match self.table.logical_peers.get(&self.id).cloned() {
+            Some(LogicalPeerTarget::Direct(peer)) => {
+                let entry = self.table.peers.get_mut(&peer).ok_or_else(|| {
+                    shiguredo_srt::Error::with_reason(
+                        shiguredo_srt::ErrorKind::InvalidState,
+                        "logical peer no longer exists",
+                    )
+                })?;
+                entry.conn.send_shared(payload, now)?;
+                self.table.mark_ready_physical(peer);
+                Ok(1)
+            }
+            Some(LogicalPeerTarget::Group(key)) => {
+                let group = self.table.groups.get_mut(&key).ok_or_else(|| {
+                    shiguredo_srt::Error::with_reason(
+                        shiguredo_srt::ErrorKind::InvalidState,
+                        "logical peer no longer exists",
+                    )
+                })?;
+                let legs = group.group.send_shared(payload, now)?;
+                group.logical_payloads_sent = group.logical_payloads_sent.saturating_add(1);
+                group.logical_payload_bytes_sent =
+                    group.logical_payload_bytes_sent.saturating_add(len);
                 Ok(legs)
             }
             None => Err(shiguredo_srt::Error::with_reason(
