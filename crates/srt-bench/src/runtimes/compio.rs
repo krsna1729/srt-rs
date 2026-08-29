@@ -6,6 +6,15 @@
 //! throughput at scale. Native `compio::time::sleep` timers live inside
 //! Conn.
 //!
+//! # Buffer lifecycle
+//!
+//! Receive buffers are allocated once and recycled across recv calls.
+//! The remaining per-packet copy is the `.to_vec()` into the channel
+//! (~1.3 KB/pkt); a return-channel buffer pool would eliminate it, but
+//! `feed_recv_buf` borrows `&[u8]` so the protocol layer's own
+//! `DataPacket::decode` does another `to_vec` anyway — fixing that
+//! requires a protocol-layer API change to accept owned buffers.
+//!
 //! `Ingress::ReuseportMulti(K)` (#4) uses the identical fix and reasoning
 //! as mio's `run_pool_acceptor`, tokio's `run_acceptor`, smol's
 //! `run_acceptor`, monoio's `run_acceptor`, and glommio's `run_acceptor`:
@@ -146,8 +155,10 @@ async fn run_shared_sender(cfg: &BenchConfig, start: Instant) -> Vec<ConnStats> 
     let (inbox_tx, inbox_rx) = mpsc::channel::<(SocketAddr, Vec<u8>)>();
     let reader = socket.clone();
     let _reader = compio::runtime::spawn(async move {
+        let mut buffer = vec![0_u8; 65_536];
         loop {
-            let BufResult(result, buffer) = reader.recv_from(vec![0_u8; 65_536]).await;
+            let BufResult(result, returned) = reader.recv_from(buffer).await;
+            buffer = returned;
             let Ok((size, peer)) = result else { break };
             if inbox_tx.send((peer, buffer[..size].to_vec())).is_err() {
                 break;
@@ -226,8 +237,10 @@ async fn sender_task(
     let (received_sender, received_receiver) = mpsc::channel();
     let received_socket = driver.sock.clone();
     let _reader = compio::runtime::spawn(async move {
+        let mut buffer = vec![0u8; 2048];
         loop {
-            let BufResult(result, buffer) = received_socket.recv(vec![0u8; 2048]).await;
+            let BufResult(result, returned) = received_socket.recv(buffer).await;
+            buffer = returned;
             let Ok(size) = result else {
                 break;
             };
@@ -365,8 +378,10 @@ async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> Co
     let received_socket = driver.sock.clone();
     let _reader = compio::runtime::spawn(async move {
         let mut first = true;
+        let mut buffer = vec![0u8; 2048];
         loop {
-            let BufResult(result, buffer) = received_socket.recv_from(vec![0u8; 2048]).await;
+            let BufResult(result, returned) = received_socket.recv_from(buffer).await;
+            buffer = returned;
             let Ok((size, addr)) = result else {
                 break;
             };
@@ -562,8 +577,10 @@ async fn run_acceptor(
     let (inbox_tx, inbox_rx) = mpsc::channel::<(SocketAddr, Vec<u8>)>();
     let reader_listener = listener.clone();
     let _reader = compio::runtime::spawn(async move {
+        let mut buffer = vec![0u8; 2048];
         loop {
-            let BufResult(result, buffer) = reader_listener.recv_from(vec![0u8; 2048]).await;
+            let BufResult(result, returned) = reader_listener.recv_from(buffer).await;
+            buffer = returned;
             let Ok((size, peer)) = result else {
                 break;
             };
@@ -840,8 +857,10 @@ async fn established_conn_task(mut driver: Conn, cfg: BenchConfig, start: Instan
     let (received_sender, received_receiver) = mpsc::channel();
     let received_socket = driver.sock.clone();
     let _reader = compio::runtime::spawn(async move {
+        let mut buffer = vec![0u8; 2048];
         loop {
-            let BufResult(result, buffer) = received_socket.recv(vec![0u8; 2048]).await;
+            let BufResult(result, returned) = received_socket.recv(buffer).await;
+            buffer = returned;
             let Ok(size) = result else {
                 break;
             };
@@ -991,8 +1010,10 @@ async fn serve_pool_socket(cfg: BenchConfig, index: usize, start: Instant) -> Ve
     let (inbox_tx, inbox_rx) = mpsc::channel::<(SocketAddr, Vec<u8>)>();
     let reader_sock = sock.clone();
     let _reader = compio::runtime::spawn(async move {
+        let mut b = vec![0u8; 2048];
         loop {
-            let BufResult(res, b) = reader_sock.recv_from(vec![0u8; 2048]).await;
+            let BufResult(res, returned) = reader_sock.recv_from(b).await;
+            b = returned;
             let Ok((n, peer)) = res else { break };
             if inbox_tx.send((peer, b[..n].to_vec())).is_err() {
                 break;
@@ -1162,8 +1183,10 @@ async fn run_single_acceptor(
     let (inbox_tx, inbox_rx) = mpsc::channel::<(SocketAddr, Vec<u8>)>();
     let reader_sock = listener.clone();
     let _reader = compio::runtime::spawn(async move {
+        let mut b = vec![0u8; 2048];
         loop {
-            let BufResult(res, b) = reader_sock.recv_from(vec![0u8; 2048]).await;
+            let BufResult(res, returned) = reader_sock.recv_from(b).await;
+            b = returned;
             let Ok((n, peer)) = res else { break };
             if inbox_tx.send((peer, b[..n].to_vec())).is_err() {
                 break;
