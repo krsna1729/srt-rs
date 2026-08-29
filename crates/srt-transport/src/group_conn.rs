@@ -416,6 +416,14 @@ impl GroupConn {
         self.group.can_send()
     }
 
+    pub fn can_send_with_pacing(&mut self, now: Timestamp) -> bool {
+        self.group.can_send_with_pacing(now)
+    }
+
+    pub fn time_until_send(&self, now: Timestamp) -> u64 {
+        self.group.time_until_send(now)
+    }
+
     /// Start an orderly close of every physical group leg.
     pub fn disconnect(&mut self, now: Timestamp) {
         self.group.disconnect(now);

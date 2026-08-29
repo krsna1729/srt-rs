@@ -304,6 +304,33 @@ impl SrtGroup {
         }
     }
 
+    pub fn can_send_with_pacing(&mut self, now: Timestamp) -> bool {
+        self.refresh_states();
+        let active = self.active_indices();
+        match self.mode {
+            GroupMode::Broadcast => active
+                .iter()
+                .any(|&index| self.members[index].connection.can_send_with_pacing(now)),
+            GroupMode::Backup => active
+                .first()
+                .is_some_and(|&index| self.members[index].connection.can_send_with_pacing(now)),
+        }
+    }
+
+    pub fn time_until_send(&self, now: Timestamp) -> u64 {
+        self.members
+            .iter()
+            .filter(|m| {
+                matches!(
+                    m.state,
+                    GroupMemberState::Active | GroupMemberState::Standby
+                )
+            })
+            .map(|m| m.connection.time_until_send(now))
+            .min()
+            .unwrap_or(100_000)
+    }
+
     /// Refresh member lifecycle labels after an owner has driven each
     /// underlying connection. This makes completed handshakes visible as
     /// `Active` or `Standby` without requiring an attempted payload send.
