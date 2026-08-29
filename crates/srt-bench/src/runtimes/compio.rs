@@ -8,12 +8,13 @@
 //!
 //! # Buffer lifecycle
 //!
-//! Receive buffers are allocated once and recycled across recv calls.
-//! The remaining per-packet copy is the `.to_vec()` into the channel
-//! (~1.3 KB/pkt); a return-channel buffer pool would eliminate it, but
-//! `feed_recv_buf` borrows `&[u8]` so the protocol layer's own
-//! `DataPacket::decode` does another `to_vec` anyway — fixing that
-//! requires a protocol-layer API change to accept owned buffers.
+//! Receive buffers are allocated once and recycled end-to-end: the reader
+//! task sends the buffer (with its valid length) through the data channel,
+//! the consumer borrows it for `feed_recv_buf`, then returns it via a
+//! recycle channel. The reader swaps in the recycled buffer for the next
+//! recv; only when the recycle channel is empty does it allocate a fresh
+//! one. The protocol layer's own `DataPacket::decode` still does a
+//! `to_vec` internally — fixing that requires a protocol-layer API change.
 //!
 //! `Ingress::ReuseportMulti(K)` (#4) uses the identical fix and reasoning
 //! as mio's `run_pool_acceptor`, tokio's `run_acceptor`, smol's
@@ -152,7 +153,8 @@ async fn run_shared_sender(cfg: &BenchConfig, start: Instant) -> Vec<ConnStats> 
         crate::bind_shared_sender_socket(cfg.sock_buf_bytes).expect("bind shared sender socket"),
     )
     .expect("register shared sender socket");
-    let (inbox_tx, inbox_rx) = mpsc::channel::<(SocketAddr, Vec<u8>)>();
+    let (inbox_tx, inbox_rx) = mpsc::channel::<(SocketAddr, Vec<u8>, usize)>();
+    let (recycle_tx, recycle_rx) = mpsc::channel::<Vec<u8>>();
     let reader = socket.clone();
     let _reader = compio::runtime::spawn(async move {
         let mut buffer = vec![0_u8; 65_536];
@@ -160,7 +162,11 @@ async fn run_shared_sender(cfg: &BenchConfig, start: Instant) -> Vec<ConnStats> 
             let BufResult(result, returned) = reader.recv_from(buffer).await;
             buffer = returned;
             let Ok((size, peer)) = result else { break };
-            if inbox_tx.send((peer, buffer[..size].to_vec())).is_err() {
+            let recycled = recycle_rx.try_recv().unwrap_or_else(|_| vec![0u8; 65_536]);
+            if inbox_tx
+                .send((peer, std::mem::replace(&mut buffer, recycled), size))
+                .is_err()
+            {
                 break;
             }
         }
@@ -169,8 +175,9 @@ async fn run_shared_sender(cfg: &BenchConfig, start: Instant) -> Vec<ConnStats> 
     let mut sender = crate::SharedSender::new(cfg, &indices, start);
     let mut outbound = Vec::new();
     loop {
-        while let Ok((peer, packet)) = inbox_rx.try_recv() {
-            sender.feed(peer, &packet);
+        while let Ok((peer, buf, size)) = inbox_rx.try_recv() {
+            sender.feed(peer, &buf[..size]);
+            let _ = recycle_tx.send(buf);
         }
         sender.tick(cfg, &mut outbound);
         for (peer, packet) in outbound.drain(..) {
@@ -232,9 +239,8 @@ async fn sender_task(
 
     let mut driver = Conn::new(conn, socket);
 
-    // Continuous reader: keeps one owned-buffer recv in flight at a time,
-    // never cancelled, forwarding payloads over the channel.
-    let (received_sender, received_receiver) = mpsc::channel();
+    let (received_sender, received_receiver) = mpsc::channel::<(Vec<u8>, usize)>();
+    let (recycle_tx, recycle_rx) = mpsc::channel::<Vec<u8>>();
     let received_socket = driver.sock.clone();
     let _reader = compio::runtime::spawn(async move {
         let mut buffer = vec![0u8; 2048];
@@ -244,7 +250,11 @@ async fn sender_task(
             let Ok(size) = result else {
                 break;
             };
-            if received_sender.send(buffer[..size].to_vec()).is_err() {
+            let recycled = recycle_rx.try_recv().unwrap_or_else(|_| vec![0u8; 2048]);
+            if received_sender
+                .send((std::mem::replace(&mut buffer, recycled), size))
+                .is_err()
+            {
                 break;
             }
         }
@@ -278,9 +288,10 @@ async fn sender_task(
         };
         compio::time::sleep(wait).await;
 
-        while let Ok(buf) = received_receiver.try_recv() {
+        while let Ok((buf, size)) = received_receiver.try_recv() {
             let t = crate::now_ts(start);
-            let _ = driver.conn.feed_recv_buf(&buf, t);
+            let _ = driver.conn.feed_recv_buf(&buf[..size], t);
+            let _ = recycle_tx.send(buf);
         }
 
         let t = crate::now_ts(start);
@@ -372,9 +383,8 @@ async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> Co
     let mut driver = Conn::new(conn, socket);
     drain_outputs(&mut driver, crate::now_ts(start)).await;
 
-    // Reader task: first packet discovers the peer and connects the socket
-    // (drain_outputs uses connected send), then forwards payloads.
-    let (received_sender, received_receiver) = mpsc::channel();
+    let (received_sender, received_receiver) = mpsc::channel::<(Vec<u8>, usize)>();
+    let (recycle_tx, recycle_rx) = mpsc::channel::<Vec<u8>>();
     let received_socket = driver.sock.clone();
     let _reader = compio::runtime::spawn(async move {
         let mut first = true;
@@ -389,7 +399,11 @@ async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> Co
                 break;
             }
             first = false;
-            if received_sender.send(buffer[..size].to_vec()).is_err() {
+            let recycled = recycle_rx.try_recv().unwrap_or_else(|_| vec![0u8; 2048]);
+            if received_sender
+                .send((std::mem::replace(&mut buffer, recycled), size))
+                .is_err()
+            {
                 break;
             }
         }
@@ -415,9 +429,10 @@ async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> Co
         // for protocol maintenance once per MAX_WAIT.
         compio::time::sleep(crate::MAX_WAIT).await;
 
-        while let Ok(packet) = received_receiver.try_recv() {
+        while let Ok((buf, size)) = received_receiver.try_recv() {
             let t = crate::now_ts(start);
-            let _ = driver.conn.feed_recv_buf(&packet, t);
+            let _ = driver.conn.feed_recv_buf(&buf[..size], t);
+            let _ = recycle_tx.send(buf);
         }
 
         let t = crate::now_ts(start);
@@ -574,7 +589,8 @@ async fn run_acceptor(
     // loop, decoupled from the maintenance tick, and hands datagrams to
     // the main loop through the channel. Never calls connect -- this
     // listener must stay unconnected to keep admitting every peer.
-    let (inbox_tx, inbox_rx) = mpsc::channel::<(SocketAddr, Vec<u8>)>();
+    let (inbox_tx, inbox_rx) = mpsc::channel::<(SocketAddr, Vec<u8>, usize)>();
+    let (recycle_tx, recycle_rx) = mpsc::channel::<Vec<u8>>();
     let reader_listener = listener.clone();
     let _reader = compio::runtime::spawn(async move {
         let mut buffer = vec![0u8; 2048];
@@ -584,7 +600,11 @@ async fn run_acceptor(
             let Ok((size, peer)) = result else {
                 break;
             };
-            if inbox_tx.send((peer, buffer[..size].to_vec())).is_err() {
+            let recycled = recycle_rx.try_recv().unwrap_or_else(|_| vec![0u8; 2048]);
+            if inbox_tx
+                .send((peer, std::mem::replace(&mut buffer, recycled), size))
+                .is_err()
+            {
                 break;
             }
         }
@@ -612,16 +632,17 @@ async fn run_acceptor(
         }
 
         compio::time::sleep(TIMER_TICK).await;
-        while let Ok((peer, data)) = inbox_rx.try_recv() {
+        while let Ok((peer, buf, size)) = inbox_rx.try_recv() {
             peers.admit_and_forward(
                 peer,
-                &data,
+                &buf[..size],
                 crate::now_ts(start),
                 &admission,
                 worker_index,
                 &senders,
                 &telemetry,
             );
+            let _ = recycle_tx.send(buf);
         }
 
         // Drive every tracked peer: fire timers, drain outputs (always
@@ -851,10 +872,8 @@ async fn established_conn_task(mut driver: Conn, cfg: BenchConfig, start: Instan
     let stream_deadline = Instant::now() + Duration::from_secs_f64(cfg.duration_secs);
     let mut last_data_at = Instant::now();
 
-    // Continuous reader: keeps one owned-buffer recv in flight at a time,
-    // never cancelled (see the module doc), forwarding payloads over the
-    // channel.
-    let (received_sender, received_receiver) = mpsc::channel();
+    let (received_sender, received_receiver) = mpsc::channel::<(Vec<u8>, usize)>();
+    let (recycle_tx, recycle_rx) = mpsc::channel::<Vec<u8>>();
     let received_socket = driver.sock.clone();
     let _reader = compio::runtime::spawn(async move {
         let mut buffer = vec![0u8; 2048];
@@ -864,7 +883,11 @@ async fn established_conn_task(mut driver: Conn, cfg: BenchConfig, start: Instan
             let Ok(size) = result else {
                 break;
             };
-            if received_sender.send(buffer[..size].to_vec()).is_err() {
+            let recycled = recycle_rx.try_recv().unwrap_or_else(|_| vec![0u8; 2048]);
+            if received_sender
+                .send((std::mem::replace(&mut buffer, recycled), size))
+                .is_err()
+            {
                 break;
             }
         }
@@ -892,9 +915,10 @@ async fn established_conn_task(mut driver: Conn, cfg: BenchConfig, start: Instan
 
         compio::time::sleep(crate::MAX_WAIT).await;
 
-        while let Ok(buf) = received_receiver.try_recv() {
+        while let Ok((buf, size)) = received_receiver.try_recv() {
             let t = crate::now_ts(start);
-            let _ = driver.conn.feed_recv_buf(&buf, t);
+            let _ = driver.conn.feed_recv_buf(&buf[..size], t);
+            let _ = recycle_tx.send(buf);
         }
 
         let t = crate::now_ts(start);
@@ -1007,7 +1031,8 @@ async fn serve_pool_socket(cfg: BenchConfig, index: usize, start: Instant) -> Ve
     // compio has no non-blocking recv, so a reader task keeps one
     // owned-buffer recv in flight and feeds the maintenance loop, exactly
     // as the PerPort path does.
-    let (inbox_tx, inbox_rx) = mpsc::channel::<(SocketAddr, Vec<u8>)>();
+    let (inbox_tx, inbox_rx) = mpsc::channel::<(SocketAddr, Vec<u8>, usize)>();
+    let (recycle_tx, recycle_rx) = mpsc::channel::<Vec<u8>>();
     let reader_sock = sock.clone();
     let _reader = compio::runtime::spawn(async move {
         let mut b = vec![0u8; 2048];
@@ -1015,7 +1040,11 @@ async fn serve_pool_socket(cfg: BenchConfig, index: usize, start: Instant) -> Ve
             let BufResult(res, returned) = reader_sock.recv_from(b).await;
             b = returned;
             let Ok((n, peer)) = res else { break };
-            if inbox_tx.send((peer, b[..n].to_vec())).is_err() {
+            let recycled = recycle_rx.try_recv().unwrap_or_else(|_| vec![0u8; 2048]);
+            if inbox_tx
+                .send((peer, std::mem::replace(&mut b, recycled), n))
+                .is_err()
+            {
                 break;
             }
         }
@@ -1028,12 +1057,10 @@ async fn serve_pool_socket(cfg: BenchConfig, index: usize, start: Instant) -> Ve
     let connect_deadline = Instant::now() + crate::CONNECT_TIMEOUT;
     let stream_len = Duration::from_secs_f64(cfg.duration_secs);
     let run_deadline = Instant::now() + stream_len + IDLE_GRACE + Duration::from_secs(30);
-    let mut buf = [0u8; 2048];
     let mut outbound: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
     let mut connected = Vec::new();
     let mut connected_streams = 0usize;
     let mut logical_run_deadline = None;
-    let _ = &mut buf;
 
     loop {
         let now = Instant::now();
@@ -1056,8 +1083,9 @@ async fn serve_pool_socket(cfg: BenchConfig, index: usize, start: Instant) -> Ve
         }
 
         compio::time::sleep(TIMER_TICK).await;
-        while let Ok((peer, packet)) = inbox_rx.try_recv() {
-            admit_one(&mut peers, &admission, peer, &packet, start);
+        while let Ok((peer, buf, size)) = inbox_rx.try_recv() {
+            admit_one(&mut peers, &admission, peer, &buf[..size], start);
+            let _ = recycle_tx.send(buf);
         }
 
         let t = crate::now_ts(start);
@@ -1180,7 +1208,8 @@ async fn run_single_acceptor(
         return;
     };
 
-    let (inbox_tx, inbox_rx) = mpsc::channel::<(SocketAddr, Vec<u8>)>();
+    let (inbox_tx, inbox_rx) = mpsc::channel::<(SocketAddr, Vec<u8>, usize)>();
+    let (recycle_tx, recycle_rx) = mpsc::channel::<Vec<u8>>();
     let reader_sock = listener.clone();
     let _reader = compio::runtime::spawn(async move {
         let mut b = vec![0u8; 2048];
@@ -1188,7 +1217,11 @@ async fn run_single_acceptor(
             let BufResult(res, returned) = reader_sock.recv_from(b).await;
             b = returned;
             let Ok((n, peer)) = res else { break };
-            if inbox_tx.send((peer, b[..n].to_vec())).is_err() {
+            let recycled = recycle_rx.try_recv().unwrap_or_else(|_| vec![0u8; 2048]);
+            if inbox_tx
+                .send((peer, std::mem::replace(&mut b, recycled), n))
+                .is_err()
+            {
                 break;
             }
         }
@@ -1202,17 +1235,16 @@ async fn run_single_acceptor(
     let connect_deadline = Instant::now() + crate::CONNECT_TIMEOUT;
     let stream_len = Duration::from_secs_f64(cfg.duration_secs);
     let mut routed = 0usize;
-    let mut buf = [0u8; 2048];
     let mut outbound: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
     let mut connected = Vec::new();
-    let _ = &mut buf;
 
     // Admission ends with the connect window: anything not established by
     // then never will be.
     while Instant::now() < connect_deadline && routed < cfg.connections {
         compio::time::sleep(TIMER_TICK).await;
-        while let Ok((peer, packet)) = inbox_rx.try_recv() {
-            admit_one(&mut peers, &admission, peer, &packet, start);
+        while let Ok((peer, buf, size)) = inbox_rx.try_recv() {
+            admit_one(&mut peers, &admission, peer, &buf[..size], start);
+            let _ = recycle_tx.send(buf);
         }
 
         let t = crate::now_ts(start);
