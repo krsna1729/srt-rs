@@ -28,5 +28,5 @@ fuzz_target!(|data: &[u8]| {
     .expect("receiver");
 
     // Should never panic — only Ok or Err
-    let _ = receiver.decrypt_gcm(0, sender.current_key(), &header, data);
+    let _ = receiver.decrypt_gcm(0, sender.current_key(), &header, data.to_vec());
 });

@@ -1371,8 +1371,8 @@ impl SrtConnection {
                 // the on-wire header with KK set and uses that as its AAD.
                 packet.encryption_flag = crypto.current_key().to_kk_field();
                 let aad = packet.gcm_aad();
-                let (_, ciphertext) =
-                    crypto.encrypt_gcm(packet.sequence_number, &aad, &packet.payload)?;
+                let payload = std::mem::take(&mut packet.payload);
+                let (_, ciphertext) = crypto.encrypt_gcm(packet.sequence_number, &aad, payload)?;
                 packet.payload = ciphertext;
             }
         }
@@ -1421,12 +1421,9 @@ impl SrtConnection {
                     }
                     CipherMode::Gcm => {
                         let aad = pkt.gcm_aad();
-                        pkt.payload = crypto.decrypt_gcm(
-                            pkt.sequence_number,
-                            key_flag,
-                            &aad,
-                            &pkt.payload,
-                        )?;
+                        let ciphertext = std::mem::take(&mut pkt.payload);
+                        pkt.payload =
+                            crypto.decrypt_gcm(pkt.sequence_number, key_flag, &aad, ciphertext)?;
                         Ok(())
                     }
                 }
