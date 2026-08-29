@@ -10,7 +10,9 @@
 //! Receive buffers are recycled when the recv completes (success or error).
 //! On timeout the buffer is consumed by the dropped io_uring future and a
 //! fresh one is allocated — but at steady state timeouts are rare, so the
-//! common path is zero-alloc per recv.
+//! common path is zero-alloc per recv. The `run_acceptor` reader task
+//! additionally recycles buffers through a local pool instead of copying
+//! with `.to_vec()` into the shared VecDeque.
 //!
 //! Known limitation, inherent to this shape rather than to any one ingress
 //! mode: at several concurrent connections' combined throughput, one
@@ -438,8 +440,10 @@ async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> Co
 // ---------------------------------------------------------------------------
 
 /// Datagrams handed from the reader task to the maintenance loop; see
-/// `run_acceptor`'s `inbox`.
-type Inbox = Rc<RefCell<VecDeque<(SocketAddr, Vec<u8>)>>>;
+/// `run_acceptor`'s `inbox`. The `usize` is the valid byte count; the
+/// `Vec<u8>` is the full recv buffer, recycled via the `Recycle` pool.
+type Inbox = Rc<RefCell<VecDeque<(SocketAddr, Vec<u8>, usize)>>>;
+type Recycle = Rc<RefCell<Vec<Vec<u8>>>>;
 
 fn run_reuseport_multi(cfg: BenchConfig, k: usize) {
     let worker_count = k.min(cfg.connections);
@@ -561,8 +565,10 @@ async fn run_acceptor(
     // reentrancy hazard between this task and the maintenance loop below
     // even though both run cooperatively on the same thread.
     let inbox: Inbox = Rc::new(RefCell::new(VecDeque::new()));
+    let recycle: Recycle = Rc::new(RefCell::new(Vec::new()));
     let reader_listener = listener.clone();
     let reader_inbox = inbox.clone();
+    let reader_recycle = recycle.clone();
     let _reader_task = monoio::spawn(async move {
         let mut buf = vec![0u8; 2048];
         loop {
@@ -570,10 +576,17 @@ async fn run_acceptor(
             buf = returned;
             match res {
                 Ok((n, peer)) => {
+                    let recycled = reader_recycle
+                        .borrow_mut()
+                        .pop()
+                        .unwrap_or_else(|| vec![0u8; 2048]);
+                    let owned = std::mem::replace(&mut buf, recycled);
                     let mut q = reader_inbox.borrow_mut();
-                    q.push_back((peer, buf[..n].to_vec()));
+                    q.push_back((peer, owned, n));
                     while q.len() > 4096 {
-                        q.pop_front();
+                        if let Some((_, dropped, _)) = q.pop_front() {
+                            reader_recycle.borrow_mut().push(dropped);
+                        }
                     }
                 }
                 Err(_) => break,
@@ -603,16 +616,17 @@ async fn run_acceptor(
         }
 
         monoio::time::sleep(TIMER_TICK).await;
-        while let Some((peer, data)) = inbox.borrow_mut().pop_front() {
+        while let Some((peer, buf, size)) = inbox.borrow_mut().pop_front() {
             peers.admit_and_forward(
                 peer,
-                &data,
+                &buf[..size],
                 crate::now_ts(start),
                 &admission,
                 worker_index,
                 &senders,
                 &telemetry,
             );
+            recycle.borrow_mut().push(buf);
         }
 
         // Drive every tracked peer: fire timers, drain outputs (always
