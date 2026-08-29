@@ -606,21 +606,22 @@ impl SenderBuffer {
     /// Discard acknowledged packets without recording a peer ACK. This is
     /// used by local sequence reconciliation paths.
     pub(crate) fn discard_acked(&mut self, ack_seq: u32) {
-        // Remove every packet with a sequence number less than ack_seq.
-        // BTreeMap::retain doesn't need to collect the keys to remove into a
-        // temporary Vec first -- it drops unneeded entries in place (avoiding
-        // an allocation on every ACK).
-        self.packets
-            .retain(|&seq, _| !sequence_less_than(seq, ack_seq));
+        if !sequence_less_than(self.oldest_unacked, ack_seq) {
+            return;
+        }
 
-        // Also remove from the loss list.
+        // Walk from oldest_unacked to ack_seq, removing each key.
+        // O(k log n) where k = newly acked, vs O(n) for retain.
+        let mut seq = self.oldest_unacked;
+        while seq != ack_seq {
+            self.packets.remove(&seq);
+            seq = seq.wrapping_add(1) & 0x7FFF_FFFF;
+        }
+
         self.loss_list
             .retain(|&seq| !sequence_less_than(seq, ack_seq));
 
-        // Update oldest_unacked.
-        if sequence_less_than(self.oldest_unacked, ack_seq) {
-            self.oldest_unacked = ack_seq;
-        }
+        self.oldest_unacked = ack_seq;
     }
 
     /// Process a NAK and add to the loss list.
