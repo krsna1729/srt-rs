@@ -213,13 +213,13 @@ pub fn run(cfg: BenchConfig) {
     // legs that need to relocate ever get a second socket.
     if cfg.mode == crate::Mode::Receiver && cfg.connections > 1 {
         match cfg.ingress {
-            crate::Ingress::ReuseportMulti(k) if k > 1 => {
+            crate::Ingress::ReuseportMulti(k) if k >= 1 => {
                 return run_pool_receiver(cfg, k);
             }
             crate::Ingress::SharedPool(1) => {
                 return run_bonded_shared_pool(cfg);
             }
-            crate::Ingress::SharedPool(k) if k > 1 => {
+            crate::Ingress::SharedPool(k) if k >= 1 => {
                 return run_shared_pool(cfg, k);
             }
             crate::Ingress::ReuseportSingle { workers } if workers >= 1 => {
@@ -230,7 +230,7 @@ pub fn run(cfg: BenchConfig) {
     }
     if cfg.connections > 1 {
         match cfg.ingress {
-            crate::Ingress::ReuseportMulti(k) if cfg.mode == crate::Mode::Sender && k > 1 => {
+            crate::Ingress::ReuseportMulti(k) if cfg.mode == crate::Mode::Sender && k >= 1 => {
                 eprintln!(
                     "[bench-mio] scale: single port {} (reuseport-multi={k})",
                     cfg.port
@@ -242,7 +242,7 @@ pub fn run(cfg: BenchConfig) {
                     cfg.port
                 );
             }
-            crate::Ingress::SharedPool(k) if cfg.mode == crate::Mode::Sender && k > 1 => {
+            crate::Ingress::SharedPool(k) if cfg.mode == crate::Mode::Sender && k >= 1 => {
                 eprintln!(
                     "[bench-mio] scale: shared-pool ports {}-{}",
                     cfg.port,

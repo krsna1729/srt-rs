@@ -519,7 +519,7 @@ impl BenchConfig {
             // reaches/binds the single base port -- SO_REUSEPORT plus the
             // kernel hash fan the flows out on the receiver side, not the
             // address.
-            Ingress::ReuseportMulti(k) if k > 1 => self.port,
+            Ingress::ReuseportMulti(_) => self.port,
             Ingress::ReuseportSingle { .. } => self.port,
             _ => self.port + i as u16,
         };
@@ -998,7 +998,7 @@ pub fn dispatch_ingress(
 ) -> bool {
     if cfg.mode == Mode::Receiver && cfg.connections > 1 {
         match cfg.ingress {
-            Ingress::ReuseportMulti(k) if k > 1 => {
+            Ingress::ReuseportMulti(k) if k >= 1 => {
                 reuseport_multi(cfg.clone(), k);
                 return true;
             }
