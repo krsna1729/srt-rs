@@ -42,6 +42,59 @@ use std::time::{Duration, Instant};
 const IDLE_GRACE: Duration = Duration::from_secs(10);
 const TIMER_TICK: Duration = Duration::from_millis(10);
 
+fn flush_outbound(fd: std::os::fd::RawFd, outbound: &mut Vec<(SocketAddr, Vec<u8>)>) {
+    if outbound.is_empty() {
+        return;
+    }
+    let refs: Vec<(SocketAddr, &[u8])> = outbound.iter().map(|(a, b)| (*a, b.as_slice())).collect();
+    let _ = srt_transport::sendmsg_batch(fd, &refs);
+    outbound.clear();
+}
+
+struct RecvBatch {
+    bufs: Vec<Vec<u8>>,
+    sizes: [usize; Self::CAPACITY],
+    addrs: [Option<SocketAddr>; Self::CAPACITY],
+}
+
+impl RecvBatch {
+    const CAPACITY: usize = 32;
+
+    fn new() -> Self {
+        Self {
+            bufs: (0..Self::CAPACITY).map(|_| vec![0u8; 2048]).collect(),
+            sizes: [0usize; Self::CAPACITY],
+            addrs: [None; Self::CAPACITY],
+        }
+    }
+}
+
+fn drain_recv(
+    fd: std::os::fd::RawFd,
+    batch: &mut RecvBatch,
+    mut on_datagram: impl FnMut(SocketAddr, &[u8]),
+) {
+    loop {
+        let received = match srt_transport::recvmsg_batch(
+            fd,
+            &mut batch.bufs,
+            &mut batch.sizes,
+            &mut batch.addrs,
+        ) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        for i in 0..received {
+            if let Some(peer) = batch.addrs[i] {
+                on_datagram(peer, &batch.bufs[i][..batch.sizes[i]]);
+            }
+        }
+        if received < batch.bufs.len() {
+            break;
+        }
+    }
+}
+
 async fn drain_outputs(driver: &mut Conn, now: shiguredo_srt::Timestamp) {
     super::report_drain_error("tokio", driver.drain_outputs(now).await);
 }
@@ -118,11 +171,13 @@ async fn run_shared_sender(cfg: &BenchConfig, start: Instant) -> Vec<ConnStats> 
     let mut sender = crate::SharedSender::new(cfg, &indices, start);
     let mut outbound = Vec::new();
     let mut buffer = [0_u8; 65_536];
+    let fd = {
+        use std::os::fd::AsRawFd;
+        socket.as_raw_fd()
+    };
     loop {
         sender.tick(cfg, &mut outbound);
-        for (peer, packet) in outbound.drain(..) {
-            socket.send_to(&packet, peer).await.expect("shared send_to");
-        }
+        flush_outbound(fd, &mut outbound);
         if sender.done() {
             break;
         }
@@ -519,6 +574,10 @@ async fn run_acceptor(
         }
     };
     let listener = tokio::net::UdpSocket::from_std(std_listener).expect("register listener");
+    let listener_fd = {
+        use std::os::fd::AsRawFd;
+        listener.as_raw_fd()
+    };
 
     let promotion = cfg.promotion;
     let mut peers = srt_transport::PeerTable::new();
@@ -528,7 +587,7 @@ async fn run_acceptor(
     let stream_len = Duration::from_secs_f64(cfg.duration_secs);
     let run_deadline = Instant::now() + stream_len + IDLE_GRACE + Duration::from_secs(30);
     let mut tick = tokio::time::interval(TIMER_TICK);
-    let mut buf = [0u8; 2048];
+    let mut recv_batch = RecvBatch::new();
     let mut outbound = Vec::new();
 
     loop {
@@ -545,22 +604,17 @@ async fn run_acceptor(
         }
 
         tokio::select! {
-            res = listener.recv_from(&mut buf) => {
-                if let Ok((n, peer)) = res {
-                    peers.admit_and_forward(peer, &buf[..n], crate::now_ts(start), &admission, worker_index, &senders, &telemetry);
-                    while let Ok((n, peer)) = listener.try_recv_from(&mut buf) {
-                        peers.admit_and_forward(peer, &buf[..n], crate::now_ts(start), &admission, worker_index, &senders, &telemetry);
-                    }
-                }
+            _ = listener.readable() => {
+                drain_recv(listener_fd, &mut recv_batch, |peer, data| {
+                    peers.admit_and_forward(peer, data, crate::now_ts(start), &admission, worker_index, &senders, &telemetry);
+                });
             }
             _ = tick.tick() => {}
         }
 
         let t = crate::now_ts(start);
         peers.poll_outbound(t, &mut outbound);
-        for (peer, bytes) in outbound.drain(..) {
-            let _ = listener.send_to(&bytes, peer).await;
-        }
+        flush_outbound(listener_fd, &mut outbound);
         let mut connected = Vec::new();
         peers.drain_events(stream_len, &mut connected);
         for connected in connected {
@@ -895,6 +949,10 @@ async fn serve_pool_socket(cfg: BenchConfig, index: usize, start: Instant) -> Ve
         let _ = srt_transport::set_sock_bufs(std_socket.as_raw_fd(), cfg.sock_buf_bytes);
     }
     let sock = tokio::net::UdpSocket::from_std(std_socket).expect("register pool socket");
+    let sock_fd = {
+        use std::os::fd::AsRawFd;
+        sock.as_raw_fd()
+    };
 
     let mut peers = srt_transport::PeerTable::new();
     // No SO_REUSEPORT group here, so nothing can rehash and there is
@@ -903,12 +961,11 @@ async fn serve_pool_socket(cfg: BenchConfig, index: usize, start: Instant) -> Ve
     let connect_deadline = Instant::now() + crate::CONNECT_TIMEOUT;
     let stream_len = Duration::from_secs_f64(cfg.duration_secs);
     let run_deadline = Instant::now() + stream_len + IDLE_GRACE + Duration::from_secs(30);
-    let mut buf = [0u8; 2048];
+    let mut recv_batch = RecvBatch::new();
     let mut outbound: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
     let mut connected = Vec::new();
     let mut connected_streams = 0usize;
     let mut logical_run_deadline = None;
-    let _ = &mut buf;
 
     loop {
         let now = Instant::now();
@@ -931,22 +988,17 @@ async fn serve_pool_socket(cfg: BenchConfig, index: usize, start: Instant) -> Ve
         }
 
         tokio::select! {
-            res = sock.recv_from(&mut buf) => {
-                if let Ok((n, peer)) = res {
-                    admit_one(&mut peers, &admission, peer, &buf[..n], start);
-                    while let Ok((n, peer)) = sock.try_recv_from(&mut buf) {
-                        admit_one(&mut peers, &admission, peer, &buf[..n], start);
-                    }
-                }
+            _ = sock.readable() => {
+                drain_recv(sock_fd, &mut recv_batch, |peer, data| {
+                    admit_one(&mut peers, &admission, peer, data, start);
+                });
             }
             _ = tokio::time::sleep(TIMER_TICK) => {}
         }
 
         let t = crate::now_ts(start);
         peers.poll_outbound(t, &mut outbound);
-        for (peer, bytes) in outbound.drain(..) {
-            let _ = sock.send_to(&bytes, peer).await;
-        }
+        flush_outbound(sock_fd, &mut outbound);
         // SharedPool never promotes, so a first Connected only starts the
         // stream clock -- which drain_events already did.
         peers.drain_events(stream_len, &mut connected);
@@ -1068,6 +1120,10 @@ async fn run_single_acceptor(
         eprintln!("[bench-tokio] reuseport-single: register failed");
         return;
     };
+    let listener_fd = {
+        use std::os::fd::AsRawFd;
+        listener.as_raw_fd()
+    };
 
     let mut peers = srt_transport::PeerTable::new();
     // One acceptor means one owner for every handshake, so there is
@@ -1077,31 +1133,25 @@ async fn run_single_acceptor(
     let connect_deadline = Instant::now() + crate::CONNECT_TIMEOUT;
     let stream_len = Duration::from_secs_f64(cfg.duration_secs);
     let mut routed = 0usize;
-    let mut buf = [0u8; 2048];
+    let mut recv_batch = RecvBatch::new();
     let mut outbound: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
     let mut connected = Vec::new();
-    let _ = &mut buf;
 
     // Admission ends with the connect window: anything not established by
     // then never will be.
     while Instant::now() < connect_deadline && routed < cfg.connections {
         tokio::select! {
-            res = listener.recv_from(&mut buf) => {
-                if let Ok((n, peer)) = res {
-                    admit_one(&mut peers, &admission, peer, &buf[..n], start);
-                    while let Ok((n, peer)) = listener.try_recv_from(&mut buf) {
-                        admit_one(&mut peers, &admission, peer, &buf[..n], start);
-                    }
-                }
+            _ = listener.readable() => {
+                drain_recv(listener_fd, &mut recv_batch, |peer, data| {
+                    admit_one(&mut peers, &admission, peer, data, start);
+                });
             }
             _ = tokio::time::sleep(TIMER_TICK) => {}
         }
 
         let t = crate::now_ts(start);
         peers.poll_outbound(t, &mut outbound);
-        for (peer, bytes) in outbound.drain(..) {
-            let _ = listener.send_to(&bytes, peer).await;
-        }
+        flush_outbound(listener_fd, &mut outbound);
         peers.drain_events(stream_len, &mut connected);
 
         let newly = std::mem::take(&mut connected);

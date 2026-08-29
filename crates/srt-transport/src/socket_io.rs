@@ -265,6 +265,107 @@ unsafe fn sockaddr_to_addr(
     )))
 }
 
+/// Send a batch of destination-addressed datagrams in a single `sendmmsg`
+/// syscall. Returns the number of datagrams accepted by the kernel (may be
+/// fewer than `batch.len()` under backpressure). Returns `Ok(0)` for an
+/// empty batch. `WouldBlock` from the kernel is returned as `Ok(0)` so
+/// callers can retry without special-casing the error.
+pub fn sendmsg_batch(
+    fd: std::os::fd::RawFd,
+    batch: &[(net::SocketAddr, &[u8])],
+) -> std::io::Result<usize> {
+    use std::cell::RefCell;
+    thread_local! {
+        static SCRATCH: RefCell<SendScratch> = RefCell::new(SendScratch::new(64));
+    }
+    struct SendScratch {
+        msgs: Vec<libc::mmsghdr>,
+        iovs: Vec<libc::iovec>,
+        addrs: Vec<libc::sockaddr_in>,
+    }
+    impl SendScratch {
+        fn new(n: usize) -> Self {
+            Self {
+                // SAFETY: all-zero is a valid empty mmsghdr/sockaddr_in.
+                msgs: vec![unsafe { std::mem::zeroed() }; n],
+                iovs: vec![
+                    libc::iovec {
+                        iov_base: std::ptr::null_mut(),
+                        iov_len: 0,
+                    };
+                    n
+                ],
+                // SAFETY: all-zero is a valid uninitialized sockaddr_in.
+                addrs: vec![unsafe { std::mem::zeroed() }; n],
+            }
+        }
+        fn ensure_len(&mut self, n: usize) {
+            if self.msgs.len() >= n {
+                return;
+            }
+            // SAFETY: all-zero is a valid empty mmsghdr.
+            self.msgs.resize_with(n, || unsafe { std::mem::zeroed() });
+            self.iovs.resize_with(n, || libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 0,
+            });
+            // SAFETY: all-zero is a valid uninitialized sockaddr_in.
+            self.addrs.resize_with(n, || unsafe { std::mem::zeroed() });
+        }
+    }
+    let count = batch.len();
+    if count == 0 {
+        return Ok(0);
+    }
+    let count_u32 = u32::try_from(count).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "sendmsg_batch exceeds sendmmsg count range",
+        )
+    })?;
+    SCRATCH.with(|scratch| {
+        let mut scratch = scratch.borrow_mut();
+        scratch.ensure_len(count);
+        let SendScratch { msgs, iovs, addrs } = &mut *scratch;
+        for (i, (dest, payload)) in batch.iter().enumerate() {
+            let net::SocketAddr::V4(v4) = dest else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "sendmsg_batch: only IPv4 is supported",
+                ));
+            };
+            // SAFETY: zeroed is valid for sockaddr_in; we fill every field.
+            addrs[i] = unsafe { std::mem::zeroed() };
+            addrs[i].sin_family = libc::AF_INET as u16;
+            addrs[i].sin_port = v4.port().to_be();
+            addrs[i].sin_addr.s_addr = u32::from(*v4.ip()).to_be();
+
+            iovs[i] = libc::iovec {
+                iov_base: payload.as_ptr() as *mut _,
+                iov_len: payload.len(),
+            };
+            // SAFETY: all-zero is a valid empty mmsghdr; fields are
+            // assigned immediately below.
+            msgs[i] = unsafe { std::mem::zeroed() };
+            msgs[i].msg_hdr.msg_iov = &mut iovs[i];
+            msgs[i].msg_hdr.msg_iovlen = 1;
+            msgs[i].msg_hdr.msg_name = (&mut addrs[i] as *mut libc::sockaddr_in).cast();
+            msgs[i].msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as u32;
+        }
+        // SAFETY: scratch arrays are `count` long, each msg points at its
+        // own iov/addr. All payload slices outlive this synchronous syscall.
+        let sent = unsafe { libc::sendmmsg(fd, msgs.as_mut_ptr(), count_u32, libc::MSG_DONTWAIT) };
+        if sent < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                return Ok(0);
+            }
+            return Err(err);
+        }
+        Ok(sent as usize)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,5 +446,34 @@ mod tests {
             sock.set_nonblocking(true).is_ok(),
             "socket should already be nonblocking"
         );
+    }
+
+    #[test]
+    fn sendmsg_batch_empty_is_noop() {
+        assert_eq!(sendmsg_batch(-1, &[]).unwrap(), 0);
+    }
+
+    #[test]
+    fn sendmsg_batch_delivers_to_loopback() {
+        use std::os::fd::AsRawFd;
+        let receiver = net::UdpSocket::bind("127.0.0.1:0").expect("bind receiver");
+        receiver
+            .set_nonblocking(true)
+            .expect("nonblocking receiver");
+        let dest = receiver.local_addr().expect("receiver addr");
+        let sender = net::UdpSocket::bind("127.0.0.1:0").expect("bind sender");
+        sender.set_nonblocking(true).expect("nonblocking sender");
+        let fd = sender.as_raw_fd();
+
+        let batch: Vec<(net::SocketAddr, &[u8])> =
+            vec![(dest, b"hello"), (dest, b"world"), (dest, b"!")];
+        let sent = sendmsg_batch(fd, &batch).expect("sendmsg_batch");
+        assert_eq!(sent, 3);
+
+        let mut buf = [0u8; 64];
+        for expected in [b"hello".as_slice(), b"world", b"!"] {
+            let n = receiver.recv(&mut buf).expect("recv");
+            assert_eq!(&buf[..n], expected);
+        }
     }
 }
