@@ -33,7 +33,7 @@ pub use srt_handshake::{
     HandshakeType, HsExtensionData, KmError, KmMessage, SRTGROUP_MASK, extension_flags, srt_flags,
 };
 pub use srt_packet::{
-    ControlPacket, ControlType, DataPacket, PacketPosition, SRT_HEADER_SIZE, SrtPacket,
+    ControlPacket, ControlType, DataHeader, DataPacket, PacketPosition, SRT_HEADER_SIZE, SrtPacket,
     peek_destination_socket_id,
 };
 pub use srt_receiver::{AckPacket, NakPacket, ReceiverBuffer, ReceiverStats};

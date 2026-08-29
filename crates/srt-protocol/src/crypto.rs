@@ -390,6 +390,30 @@ impl CryptoContext {
         Ok((self.current_key, out))
     }
 
+    /// Encrypt a payload slice with GCM in place, returning the 16-byte tag
+    /// separately so the caller can append it to the wire buffer.
+    pub fn encrypt_gcm_detached(
+        &mut self,
+        packet_index: u32,
+        header: &[u8; 16],
+        payload: &mut [u8],
+    ) -> Result<(KeyFlag, [u8; GCM_TAG_LEN]), Error> {
+        let sek = match self.current_key {
+            KeyFlag::Even => &self.sek_even,
+            KeyFlag::Odd => &self.sek_odd,
+        };
+        let tag = encrypt_payload_gcm_detached(
+            sek,
+            &self.salt,
+            packet_index,
+            header,
+            payload,
+            self.key_length,
+        )?;
+        self.encrypted_packet_count += 1;
+        Ok((self.current_key, tag))
+    }
+
     /// Decrypt data in place (CTR mode).
     pub fn decrypt(
         &self,
@@ -697,6 +721,46 @@ fn encrypt_payload_gcm(
     }
 
     Ok(buffer)
+}
+
+/// Encrypt a payload slice with AES-GCM in place, returning the 16-byte tag.
+fn encrypt_payload_gcm_detached(
+    sek: &[u8],
+    salt: &[u8; 16],
+    packet_index: u32,
+    header: &[u8; 16],
+    payload: &mut [u8],
+    key_length: KeyLength,
+) -> Result<[u8; GCM_TAG_LEN], Error> {
+    let iv = build_gcm_iv(salt, packet_index);
+    let nonce = Nonce::try_from(iv.as_slice())
+        .map_err(|e| Error::crypto_error(format!("invalid GCM nonce: {e}")))?;
+
+    let tag = match key_length {
+        KeyLength::Aes128 => {
+            let cipher = Aes128Gcm::new_from_slice(sek)
+                .map_err(|e| Error::crypto_error(format!("invalid SEK: {e}")))?;
+            cipher
+                .encrypt_inout_detached(&nonce, header, payload.into())
+                .map_err(|e| Error::crypto_error(format!("AES-GCM encrypt failed: {e}")))?
+        }
+        KeyLength::Aes192 => {
+            return Err(Error::crypto_error(
+                "AES-192 is not supported with GCM mode",
+            ));
+        }
+        KeyLength::Aes256 => {
+            let cipher = Aes256Gcm::new_from_slice(sek)
+                .map_err(|e| Error::crypto_error(format!("invalid SEK: {e}")))?;
+            cipher
+                .encrypt_inout_detached(&nonce, header, payload.into())
+                .map_err(|e| Error::crypto_error(format!("AES-GCM encrypt failed: {e}")))?
+        }
+    };
+
+    let mut out = [0u8; GCM_TAG_LEN];
+    out.copy_from_slice(tag.as_slice());
+    Ok(out)
 }
 
 /// Decrypt a payload with AES-GCM, verifying the auth tag.

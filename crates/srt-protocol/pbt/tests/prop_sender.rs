@@ -30,9 +30,9 @@ proptest! {
 
         let packet = buf.push(payload.clone(), 100, 12345, now);
         prop_assert!(packet.is_some());
-        let pkt = packet.expect("送信パケットは Some になる想定");
-        prop_assert_eq!(pkt.sequence_number, initial_seq);
-        prop_assert_eq!(pkt.payload.len(), payload_len);
+        let (hdr, payload_bytes) = packet.expect("送信パケットは Some になる想定");
+        prop_assert_eq!(hdr.sequence_number, initial_seq);
+        prop_assert_eq!(payload_bytes.len(), payload_len);
         prop_assert_eq!(buf.next_sequence_number(), (initial_seq + 1) & 0x7FFF_FFFF);
         prop_assert_eq!(buf.packets_in_flight(), 1);
     }
@@ -119,9 +119,9 @@ proptest! {
         // 再送パケットを取得
         let retransmit = buf.pop_retransmit(1);
         prop_assert!(retransmit.is_some());
-        let pkt = retransmit.expect("再送パケットは Some になる想定");
-        prop_assert_eq!(pkt.sequence_number, lost_seq);
-        prop_assert!(pkt.retransmitted);
+        let (hdr, _payload) = retransmit.expect("再送パケットは Some になる想定");
+        prop_assert_eq!(hdr.sequence_number, lost_seq);
+        prop_assert!(hdr.retransmitted);
 
         // 再送後は loss_list が空
         prop_assert!(!buf.has_retransmit());
@@ -246,7 +246,7 @@ proptest! {
         prop_assert_eq!(packets.len(), expected_count);
 
         // 全ペイロードが含まれているか確認
-        let total_bytes: usize = packets.iter().map(|p| p.payload.len()).sum();
+        let total_bytes: usize = packets.iter().map(|(_, b)| b.len()).sum();
         prop_assert_eq!(total_bytes, payload_size);
     }
 

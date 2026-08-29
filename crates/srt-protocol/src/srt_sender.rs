@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use bytes::Bytes;
 
-use crate::srt_packet::{DataPacket, PacketPosition, SRT_HEADER_SIZE, sequence_less_than};
+use crate::srt_packet::{DataHeader, PacketPosition, SRT_HEADER_SIZE, sequence_less_than};
 use crate::time::Timestamp;
 
 /// "No configured limit" default max bandwidth, matching libsrt's own
@@ -358,14 +358,14 @@ impl SenderBuffer {
         self.packet_send_period = period_us.round() as u64;
     }
 
-    /// Add a payload to the buffer and produce a send packet.
+    /// Add a payload to the buffer and produce header + payload for wire encoding.
     pub fn push(
         &mut self,
         payload: Vec<u8>,
         timestamp: u32,
         dest_socket_id: u32,
         now: Timestamp,
-    ) -> Option<DataPacket> {
+    ) -> Option<(DataHeader, Bytes)> {
         self.push_with_sequence(payload, timestamp, dest_socket_id, now, self.next_seq)
     }
 
@@ -377,10 +377,9 @@ impl SenderBuffer {
         dest_socket_id: u32,
         now: Timestamp,
         sequence_number: u32,
-    ) -> Option<DataPacket> {
+    ) -> Option<(DataHeader, Bytes)> {
         self.push_impl(
-            Bytes::from(payload.clone()),
-            payload,
+            Bytes::from(payload),
             timestamp,
             dest_socket_id,
             now,
@@ -395,7 +394,7 @@ impl SenderBuffer {
         timestamp: u32,
         dest_socket_id: u32,
         now: Timestamp,
-    ) -> Option<DataPacket> {
+    ) -> Option<(DataHeader, Bytes)> {
         self.push_shared_with_sequence(payload, timestamp, dest_socket_id, now, self.next_seq)
     }
 
@@ -407,37 +406,25 @@ impl SenderBuffer {
         dest_socket_id: u32,
         now: Timestamp,
         sequence_number: u32,
-    ) -> Option<DataPacket> {
-        let tx_payload = payload.to_vec();
-        self.push_impl(
-            payload,
-            tx_payload,
-            timestamp,
-            dest_socket_id,
-            now,
-            sequence_number,
-        )
+    ) -> Option<(DataHeader, Bytes)> {
+        self.push_impl(payload, timestamp, dest_socket_id, now, sequence_number)
     }
 
     fn push_impl(
         &mut self,
         retained: Bytes,
-        tx_payload: Vec<u8>,
         timestamp: u32,
         dest_socket_id: u32,
         now: Timestamp,
         sequence_number: u32,
-    ) -> Option<DataPacket> {
-        if !self.can_send() {
-            return None;
-        }
-
-        if sequence_number != self.next_seq {
+    ) -> Option<(DataHeader, Bytes)> {
+        if !self.can_send() || sequence_number != self.next_seq {
             return None;
         }
 
         let message_number = self.next_msg;
-        let payload_len = tx_payload.len();
+        let payload_len = retained.len();
+        let wire_payload = retained.clone();
 
         self.packets.insert(
             sequence_number,
@@ -452,19 +439,16 @@ impl SenderBuffer {
             },
         );
 
-        let packet = DataPacket {
+        let header = DataHeader {
             sequence_number,
             position: PacketPosition::Single,
             order_flag: false,
-            encryption_flag: 0,
             retransmitted: false,
             message_number,
             timestamp,
             dest_socket_id,
-            payload: tx_payload,
         };
 
-        // Update statistics.
         self.total_sent += 1;
         self.total_bytes_sent += payload_len as u64;
         self.total_srt_bytes_sent = self
@@ -472,11 +456,10 @@ impl SenderBuffer {
             .saturating_add((payload_len + SRT_HEADER_SIZE) as u64);
         self.record_sent_payload_size(payload_len);
 
-        // Advance the sequence number and message number.
         self.next_seq = self.next_seq.wrapping_add(1) & 0x7FFF_FFFF;
         self.next_msg = self.next_msg.wrapping_add(1) & 0x03FF_FFFF;
 
-        Some(packet)
+        Some((header, wire_payload))
     }
 
     /// Split a large message and send it.
@@ -487,11 +470,7 @@ impl SenderBuffer {
         timestamp: u32,
         dest_socket_id: u32,
         now: Timestamp,
-    ) -> Vec<DataPacket> {
-        // `slice::chunks(0)` panics. This is a public, application-supplied
-        // sizing knob, so an invalid value must fail closed rather than take
-        // down the process. Returning no packets matches the existing
-        // backpressure behaviour of this convenience API.
+    ) -> Vec<(DataHeader, Bytes)> {
         if max_payload_size == 0 {
             return Vec::new();
         }
@@ -500,7 +479,7 @@ impl SenderBuffer {
         if !self.can_send_message(total_chunks) {
             return Vec::new();
         }
-        let mut packets = Vec::with_capacity(total_chunks);
+        let mut results = Vec::with_capacity(total_chunks);
 
         for (i, chunk) in chunks.into_iter().enumerate() {
             let position = match (i, total_chunks) {
@@ -510,8 +489,9 @@ impl SenderBuffer {
                 _ => PacketPosition::Middle,
             };
 
-            let chunk_payload = chunk.to_vec();
-            let chunk_len = chunk_payload.len();
+            let retained = Bytes::copy_from_slice(chunk);
+            let chunk_len = retained.len();
+            let wire_payload = retained.clone();
 
             self.packets.insert(
                 self.next_seq,
@@ -520,22 +500,20 @@ impl SenderBuffer {
                     order_flag: true,
                     message_number: self.next_msg,
                     timestamp,
-                    payload: Bytes::from(chunk_payload.clone()),
+                    payload: retained,
                     sent_time: now,
                     retransmit_count: 0,
                 },
             );
 
-            let packet = DataPacket {
+            let header = DataHeader {
                 sequence_number: self.next_seq,
                 position,
                 order_flag: true,
-                encryption_flag: 0,
                 retransmitted: false,
                 message_number: self.next_msg,
                 timestamp,
                 dest_socket_id,
-                payload: chunk_payload,
             };
 
             self.total_sent += 1;
@@ -546,15 +524,14 @@ impl SenderBuffer {
             self.record_sent_payload_size(chunk_len);
 
             self.next_seq = self.next_seq.wrapping_add(1) & 0x7FFF_FFFF;
-            packets.push(packet);
+            results.push((header, wire_payload));
         }
 
-        // Advance the message number once, for the next message.
-        if !packets.is_empty() {
+        if !results.is_empty() {
             self.next_msg = self.next_msg.wrapping_add(1) & 0x03FF_FFFF;
         }
 
-        packets
+        results
     }
 
     /// Get a packet to retransmit.
@@ -568,7 +545,7 @@ impl SenderBuffer {
     /// also defeats TLPKTDROP's purpose -- cleanly giving up once the
     /// delivery deadline passes, to bound latency -- since a packet
     /// retransmitted repeatedly would then never expire.)
-    pub fn pop_retransmit(&mut self, dest_socket_id: u32) -> Option<DataPacket> {
+    pub fn pop_retransmit(&mut self, dest_socket_id: u32) -> Option<(DataHeader, Bytes)> {
         while let Some(seq) = self.loss_list.pop_front() {
             if let Some(entry) = self.packets.get_mut(&seq) {
                 entry.retransmit_count += 1;
@@ -579,17 +556,18 @@ impl SenderBuffer {
                     .total_retransmitted_srt_bytes
                     .saturating_add(wire_bytes);
 
-                return Some(DataPacket {
-                    sequence_number: seq,
-                    position: entry.position,
-                    order_flag: entry.order_flag,
-                    encryption_flag: 0,
-                    retransmitted: true,
-                    message_number: entry.message_number,
-                    timestamp: entry.timestamp,
-                    dest_socket_id,
-                    payload: entry.payload.to_vec(),
-                });
+                return Some((
+                    DataHeader {
+                        sequence_number: seq,
+                        position: entry.position,
+                        order_flag: entry.order_flag,
+                        retransmitted: true,
+                        message_number: entry.message_number,
+                        timestamp: entry.timestamp,
+                        dest_socket_id,
+                    },
+                    entry.payload.clone(),
+                ));
             }
         }
         None
@@ -921,8 +899,8 @@ mod tests {
 
         let packet = buf.push(vec![1, 2, 3], 100, 12345, now);
         assert!(packet.is_some());
-        let pkt = packet.expect("送信パケットは Some になる想定");
-        assert_eq!(pkt.sequence_number, 1000);
+        let (hdr, _) = packet.expect("送信パケットは Some になる想定");
+        assert_eq!(hdr.sequence_number, 1000);
         assert_eq!(buf.next_sequence_number(), 1001);
         assert_eq!(buf.packets_in_flight(), 1);
     }
@@ -974,9 +952,9 @@ mod tests {
         // 再送パケットを取得
         let retransmit = buf.pop_retransmit(1);
         assert!(retransmit.is_some());
-        let pkt = retransmit.expect("再送パケットは Some になる想定");
-        assert_eq!(pkt.sequence_number, 1001);
-        assert!(pkt.retransmitted);
+        let (hdr, _) = retransmit.expect("再送パケットは Some になる想定");
+        assert_eq!(hdr.sequence_number, 1001);
+        assert!(hdr.retransmitted);
     }
 
     /// `stats().total_retransmits` must stay accurate after the
