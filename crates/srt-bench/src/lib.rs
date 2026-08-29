@@ -773,16 +773,16 @@ impl SharedSender {
                     .stream_deadline
                     .is_some_and(|deadline| now_instant < deadline)
             {
-                for _ in 0..64 {
+                {
                     let mut caller = self
                         .callers
                         .logical_caller_mut(&slot.caller)
                         .expect("slot and caller table agree");
-                    if !caller.can_send() {
-                        break;
+                    if !caller.can_send_with_pacing(now) {
+                        continue;
                     }
                     let Ok(selected_legs) = caller.send(&self.payload, now) else {
-                        break;
+                        continue;
                     };
                     for stats in slot.stats.iter_mut().take(selected_legs) {
                         stats.data_events = stats.data_events.saturating_add(1);
@@ -808,11 +808,21 @@ impl SharedSender {
     }
 
     pub(crate) fn next_wait(&self) -> Duration {
-        Duration::from_micros(
-            self.callers
-                .time_until_next_deadline(now_ts(self.start), MAX_WAIT.as_micros() as u64),
-        )
-        .min(MAX_WAIT)
+        let now = now_ts(self.start);
+        let max_us = MAX_WAIT.as_micros() as u64;
+        let mut wait = self.callers.time_until_next_deadline(now, max_us);
+        for slot in &self.slots {
+            if !slot.closed {
+                let caller = self
+                    .callers
+                    .logical_caller(&slot.caller)
+                    .expect("slot and caller table agree");
+                if caller.state() == Some(srt_transport::LogicalCallerState::Connected) {
+                    wait = wait.min(caller.time_until_send(now));
+                }
+            }
+        }
+        Duration::from_micros(wait).min(MAX_WAIT)
     }
 
     pub(crate) fn finish(mut self) -> Vec<ConnStats> {

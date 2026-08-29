@@ -101,6 +101,14 @@ impl LogicalCaller<'_> {
     pub fn stats(&self) -> Option<LogicalCallerStats> {
         self.table.sessions.get(&self.id).map(CallerSession::stats)
     }
+
+    pub fn time_until_send(&self, now: Timestamp) -> u64 {
+        self.table
+            .sessions
+            .get(&self.id)
+            .map(|s| s.time_until_send(now))
+            .unwrap_or(100_000)
+    }
 }
 
 /// Mutable steady-state view of one outbound logical stream. This deliberately
@@ -138,6 +146,23 @@ impl LogicalCallerMut<'_> {
             .sessions
             .get_mut(&self.id)
             .is_some_and(CallerSession::can_send)
+    }
+
+    /// Whether the next logical payload can be accepted, including pacing.
+    pub fn can_send_with_pacing(&mut self, now: Timestamp) -> bool {
+        self.table
+            .sessions
+            .get_mut(&self.id)
+            .is_some_and(|s| s.can_send_with_pacing(now))
+    }
+
+    /// Microseconds until the next paced send is allowed (0 = now).
+    pub fn time_until_send(&self, now: Timestamp) -> u64 {
+        self.table
+            .sessions
+            .get(&self.id)
+            .map(|s| s.time_until_send(now))
+            .unwrap_or(100_000)
     }
 
     /// Send one logical payload. Direct callers return one; Broadcast returns
@@ -282,6 +307,20 @@ impl CallerSession {
         match self {
             Self::Direct(leg) => leg.connection.can_send(),
             Self::Group(group) => group.group.can_send(),
+        }
+    }
+
+    fn can_send_with_pacing(&mut self, now: Timestamp) -> bool {
+        match self {
+            Self::Direct(leg) => leg.connection.can_send_with_pacing(now),
+            Self::Group(group) => group.group.can_send_with_pacing(now),
+        }
+    }
+
+    fn time_until_send(&self, now: Timestamp) -> u64 {
+        match self {
+            Self::Direct(leg) => leg.connection.time_until_send(now),
+            Self::Group(group) => group.group.time_until_send(now),
         }
     }
 
