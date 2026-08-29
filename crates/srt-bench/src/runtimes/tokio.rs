@@ -42,13 +42,27 @@ use std::time::{Duration, Instant};
 const IDLE_GRACE: Duration = Duration::from_secs(10);
 const TIMER_TICK: Duration = Duration::from_millis(10);
 
+/// Send queued datagrams via `sendmmsg`.  Only the datagrams the kernel
+/// accepted are drained; unsent ones stay in `outbound` for retry.
+/// Non-retriable errors clear the buffer and are logged.
 fn flush_outbound(fd: std::os::fd::RawFd, outbound: &mut Vec<(SocketAddr, Vec<u8>)>) {
     if outbound.is_empty() {
         return;
     }
     let refs: Vec<(SocketAddr, &[u8])> = outbound.iter().map(|(a, b)| (*a, b.as_slice())).collect();
-    let _ = srt_transport::sendmsg_batch(fd, &refs);
-    outbound.clear();
+    match srt_transport::sendmsg_batch(fd, &refs) {
+        Ok(sent) => {
+            outbound.drain(..sent);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+        Err(e) => {
+            eprintln!(
+                "tokio flush_outbound: dropping {} datagrams: {e}",
+                outbound.len()
+            );
+            outbound.clear();
+        }
+    }
 }
 
 struct RecvBatch {
@@ -69,27 +83,38 @@ impl RecvBatch {
     }
 }
 
+/// Receive datagrams via `recvmmsg`, routing through Tokio's `try_io` so
+/// readiness is properly cleared when the socket has nothing left.
+/// Bounded to `MAX_RECV_ROUNDS` iterations so sustained ingress cannot
+/// starve timers and sibling tasks.
 fn drain_recv(
-    fd: std::os::fd::RawFd,
+    sock: &tokio::net::UdpSocket,
     batch: &mut RecvBatch,
     mut on_datagram: impl FnMut(SocketAddr, &[u8]),
 ) {
-    loop {
-        let received = match srt_transport::recvmsg_batch(
-            fd,
+    const MAX_RECV_ROUNDS: usize = 8;
+    use std::os::fd::AsRawFd;
+    let mut rounds = 0;
+    while let Ok(received) = sock.try_io(tokio::io::Interest::READABLE, || {
+        let n = srt_transport::recvmsg_batch(
+            sock.as_raw_fd(),
             &mut batch.bufs,
             &mut batch.sizes,
             &mut batch.addrs,
-        ) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => n,
-        };
+        )?;
+        if n == 0 {
+            Err(std::io::ErrorKind::WouldBlock.into())
+        } else {
+            Ok(n)
+        }
+    }) {
         for i in 0..received {
             if let Some(peer) = batch.addrs[i] {
                 on_datagram(peer, &batch.bufs[i][..batch.sizes[i]]);
             }
         }
-        if received < batch.bufs.len() {
+        rounds += 1;
+        if received < batch.bufs.len() || rounds >= MAX_RECV_ROUNDS {
             break;
         }
     }
@@ -605,7 +630,7 @@ async fn run_acceptor(
 
         tokio::select! {
             _ = listener.readable() => {
-                drain_recv(listener_fd, &mut recv_batch, |peer, data| {
+                drain_recv(&listener, &mut recv_batch, |peer, data| {
                     peers.admit_and_forward(peer, data, crate::now_ts(start), &admission, worker_index, &senders, &telemetry);
                 });
             }
@@ -989,7 +1014,7 @@ async fn serve_pool_socket(cfg: BenchConfig, index: usize, start: Instant) -> Ve
 
         tokio::select! {
             _ = sock.readable() => {
-                drain_recv(sock_fd, &mut recv_batch, |peer, data| {
+                drain_recv(&sock, &mut recv_batch, |peer, data| {
                     admit_one(&mut peers, &admission, peer, data, start);
                 });
             }
@@ -1142,7 +1167,7 @@ async fn run_single_acceptor(
     while Instant::now() < connect_deadline && routed < cfg.connections {
         tokio::select! {
             _ = listener.readable() => {
-                drain_recv(listener_fd, &mut recv_batch, |peer, data| {
+                drain_recv(&listener, &mut recv_batch, |peer, data| {
                     admit_one(&mut peers, &admission, peer, data, start);
                 });
             }
