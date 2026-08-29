@@ -7,6 +7,11 @@
 //! timeout-wrapped recv, protocol maintenance after each. Timeouts only
 //! ever fire when idle, so in-flight recvs are essentially never cancelled.
 //!
+//! Receive buffers are recycled when the recv completes (success or error).
+//! On timeout the buffer is consumed by the dropped io_uring future and a
+//! fresh one is allocated — but at steady state timeouts are rare, so the
+//! common path is zero-alloc per recv.
+//!
 //! Known limitation, inherent to this shape rather than to any one ingress
 //! mode: at several concurrent connections' combined throughput, one
 //! recv-then-maintain iteration per task/tick can't always keep pace, so
@@ -158,6 +163,7 @@ async fn run_shared_sender(cfg: &BenchConfig, start: Instant) -> Vec<ConnStats> 
     let indices = (0..cfg.connections).collect::<Vec<_>>();
     let mut sender = crate::SharedSender::new(cfg, &indices, start);
     let mut outbound = Vec::new();
+    let mut buffer = vec![0_u8; 65_536];
     loop {
         sender.tick(cfg, &mut outbound);
         for (peer, packet) in outbound.drain(..) {
@@ -167,11 +173,13 @@ async fn run_shared_sender(cfg: &BenchConfig, start: Instant) -> Vec<ConnStats> 
         if sender.done() {
             break;
         }
-        if let Ok((result, buffer)) =
-            monoio::time::timeout(sender.next_wait(), socket.recv_from(vec![0_u8; 65_536])).await
-            && let Ok((size, peer)) = result
-        {
-            sender.feed(peer, &buffer[..size]);
+        match monoio::time::timeout(sender.next_wait(), socket.recv_from(buffer)).await {
+            Ok((Ok((size, peer)), returned)) => {
+                buffer = returned;
+                sender.feed(peer, &buffer[..size]);
+            }
+            Ok((Err(_), returned)) => buffer = returned,
+            Err(_) => buffer = vec![0_u8; 65_536],
         }
     }
     sender.finish()
@@ -226,6 +234,7 @@ async fn sender_task(
     let mut stats = ConnStats::default();
     let mut stream_deadline: Option<Instant> = None;
     let connect_deadline = start + crate::CONNECT_TIMEOUT;
+    let mut recv_buf = vec![0u8; 2048];
 
     loop {
         if !stats.connected && Instant::now() >= connect_deadline {
@@ -239,21 +248,20 @@ async fn sender_task(
             break;
         }
 
-        // Block until the next paced send is due (bounded by MAX_WAIT).
-        // A fresh buffer per attempt -- io_uring ops can't be safely
-        // cancelled mid-flight, so a timed-out recv's buffer is simply
-        // abandoned rather than reused.
         let wait = if stats.connected {
             Duration::from_micros(driver.conn.time_until_send(crate::now_ts(start)))
                 .min(crate::MAX_WAIT)
         } else {
             crate::MAX_WAIT
         };
-        if let Ok((Ok(n), buf)) =
-            monoio::time::timeout(wait, driver.sock.recv(vec![0u8; 2048])).await
-        {
-            let t = crate::now_ts(start);
-            let _ = driver.conn.feed_recv_buf(&buf[..n], t);
+        match monoio::time::timeout(wait, driver.sock.recv(recv_buf)).await {
+            Ok((Ok(n), returned)) => {
+                recv_buf = returned;
+                let t = crate::now_ts(start);
+                let _ = driver.conn.feed_recv_buf(&recv_buf[..n], t);
+            }
+            Ok((Err(_), returned)) => recv_buf = returned,
+            Err(_) => recv_buf = vec![0u8; 2048],
         }
 
         let t = crate::now_ts(start);
@@ -347,6 +355,7 @@ async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> Co
     let mut stream_deadline: Option<Instant> = None;
     let connect_deadline = Instant::now() + crate::CONNECT_TIMEOUT;
     let mut peer: Option<SocketAddr> = None;
+    let mut recv_buf = vec![0u8; 2048];
 
     loop {
         if !stats.connected && Instant::now() >= connect_deadline {
@@ -360,22 +369,21 @@ async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> Co
             break;
         }
 
-        // One datagram per iteration: recv_from until the first packet
-        // reveals the peer, then connect the socket (drain_outputs uses
-        // connected send). Maintenance runs after every packet.
-        if let Ok((res, buf)) =
-            monoio::time::timeout(crate::MAX_WAIT, driver.sock.recv_from(vec![0u8; 2048])).await
-            && let Ok((n, addr)) = res
-        {
-            if peer.is_none() {
-                if let Err(e) = driver.sock.connect(addr).await {
-                    eprintln!("[bench-monoio] connect to peer failed: {e}");
-                } else {
-                    peer = Some(addr);
+        match monoio::time::timeout(crate::MAX_WAIT, driver.sock.recv_from(recv_buf)).await {
+            Ok((Ok((n, addr)), returned)) => {
+                recv_buf = returned;
+                if peer.is_none() {
+                    if let Err(e) = driver.sock.connect(addr).await {
+                        eprintln!("[bench-monoio] connect to peer failed: {e}");
+                    } else {
+                        peer = Some(addr);
+                    }
                 }
+                let t = crate::now_ts(start);
+                let _ = driver.conn.feed_recv_buf(&recv_buf[..n], t);
             }
-            let t = crate::now_ts(start);
-            let _ = driver.conn.feed_recv_buf(&buf[..n], t);
+            Ok((Err(_), returned)) => recv_buf = returned,
+            Err(_) => recv_buf = vec![0u8; 2048],
         }
 
         let t = crate::now_ts(start);
@@ -556,14 +564,14 @@ async fn run_acceptor(
     let reader_listener = listener.clone();
     let reader_inbox = inbox.clone();
     let _reader_task = monoio::spawn(async move {
+        let mut buf = vec![0u8; 2048];
         loop {
-            let (res, buf) = reader_listener.recv_from(vec![0u8; 2048]).await;
+            let (res, returned) = reader_listener.recv_from(buf).await;
+            buf = returned;
             match res {
                 Ok((n, peer)) => {
                     let mut q = reader_inbox.borrow_mut();
                     q.push_back((peer, buf[..n].to_vec()));
-                    // Safety net against unbounded growth if the main
-                    // loop ever falls behind; not expected in practice.
                     while q.len() > 4096 {
                         q.pop_front();
                     }
@@ -829,14 +837,10 @@ async fn established_conn_task(mut driver: Conn, cfg: BenchConfig, start: Instan
     let mut data_events = 0u64;
     let stream_deadline = Instant::now() + Duration::from_secs_f64(cfg.duration_secs);
     let mut last_data_at = Instant::now();
+    let mut recv_buf = vec![0u8; 2048];
 
     loop {
         let now = Instant::now();
-        // Also honour the harness's stop signal directly, not just via
-        // `!connected` from a received Disconnected -- the sender's
-        // ordered close should reach this task through the protocol, but
-        // if it doesn't (or races), this task should not be the reason a
-        // whole cell hangs well past its backstop.
         if crate::shutdown::requested()
             || srt_lifecycle::is_terminal(
                 connected,
@@ -850,13 +854,14 @@ async fn established_conn_task(mut driver: Conn, cfg: BenchConfig, start: Instan
             break;
         }
 
-        // Fresh buffer per attempt -- same reasoning as `sender_task`:
-        // io_uring ops can't be safely cancelled mid-flight.
-        if let Ok((Ok(n), buf)) =
-            monoio::time::timeout(crate::MAX_WAIT, driver.sock.recv(vec![0u8; 2048])).await
-        {
-            let t = crate::now_ts(start);
-            let _ = driver.conn.feed_recv_buf(&buf[..n], t);
+        match monoio::time::timeout(crate::MAX_WAIT, driver.sock.recv(recv_buf)).await {
+            Ok((Ok(n), returned)) => {
+                recv_buf = returned;
+                let t = crate::now_ts(start);
+                let _ = driver.conn.feed_recv_buf(&recv_buf[..n], t);
+            }
+            Ok((Err(_), returned)) => recv_buf = returned,
+            Err(_) => recv_buf = vec![0u8; 2048],
         }
 
         let t = crate::now_ts(start);
@@ -972,12 +977,11 @@ async fn serve_pool_socket(cfg: BenchConfig, index: usize, start: Instant) -> Ve
     let connect_deadline = Instant::now() + crate::CONNECT_TIMEOUT;
     let stream_len = Duration::from_secs_f64(cfg.duration_secs);
     let run_deadline = Instant::now() + stream_len + IDLE_GRACE + Duration::from_secs(30);
-    let mut buf = [0u8; 2048];
     let mut outbound: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
     let mut connected = Vec::new();
     let mut connected_streams = 0usize;
     let mut logical_run_deadline = None;
-    let _ = &mut buf;
+    let mut recv_buf = vec![0u8; 2048];
 
     loop {
         let now = Instant::now();
@@ -999,11 +1003,13 @@ async fn serve_pool_socket(cfg: BenchConfig, index: usize, start: Instant) -> Ve
             break;
         }
 
-        if let Ok((res, b)) =
-            monoio::time::timeout(TIMER_TICK, sock.recv_from(vec![0u8; 2048])).await
-            && let Ok((n, peer)) = res
-        {
-            admit_one(&mut peers, &admission, peer, &b[..n], start);
+        match monoio::time::timeout(TIMER_TICK, sock.recv_from(recv_buf)).await {
+            Ok((Ok((n, peer)), returned)) => {
+                recv_buf = returned;
+                admit_one(&mut peers, &admission, peer, &recv_buf[..n], start);
+            }
+            Ok((Err(_), returned)) => recv_buf = returned,
+            Err(_) => recv_buf = vec![0u8; 2048],
         }
 
         let t = crate::now_ts(start);
@@ -1011,8 +1017,6 @@ async fn serve_pool_socket(cfg: BenchConfig, index: usize, start: Instant) -> Ve
         for (peer, bytes) in outbound.drain(..) {
             let (_r, _b) = sock.send_to(bytes, peer).await;
         }
-        // SharedPool never promotes, so a first Connected only starts the
-        // stream clock -- which drain_events already did.
         peers.drain_events(stream_len, &mut connected);
         connected_streams = connected_streams.saturating_add(connected.len());
         if connected_streams >= cfg.logical_connection_count() {
@@ -1136,19 +1140,18 @@ async fn run_single_acceptor(
     let connect_deadline = Instant::now() + crate::CONNECT_TIMEOUT;
     let stream_len = Duration::from_secs_f64(cfg.duration_secs);
     let mut routed = 0usize;
-    let mut buf = [0u8; 2048];
     let mut outbound: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
     let mut connected = Vec::new();
-    let _ = &mut buf;
+    let mut recv_buf = vec![0u8; 2048];
 
-    // Admission ends with the connect window: anything not established by
-    // then never will be.
     while Instant::now() < connect_deadline && routed < cfg.connections {
-        if let Ok((res, b)) =
-            monoio::time::timeout(TIMER_TICK, listener.recv_from(vec![0u8; 2048])).await
-            && let Ok((n, peer)) = res
-        {
-            admit_one(&mut peers, &admission, peer, &b[..n], start);
+        match monoio::time::timeout(TIMER_TICK, listener.recv_from(recv_buf)).await {
+            Ok((Ok((n, peer)), returned)) => {
+                recv_buf = returned;
+                admit_one(&mut peers, &admission, peer, &recv_buf[..n], start);
+            }
+            Ok((Err(_), returned)) => recv_buf = returned,
+            Err(_) => recv_buf = vec![0u8; 2048],
         }
 
         let t = crate::now_ts(start);
