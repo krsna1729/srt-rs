@@ -45,6 +45,7 @@ zeroize = "1.8"
 # small integer keys; FxHash is non-cryptographic and faster (tokio
 # profile showed hash_one as #2 at 1200 conns).
 rustc-hash = "2.1"
+bytes = "1"
 tracing = "0.1"
 
 [dev-dependencies]

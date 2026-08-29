@@ -11,6 +11,8 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
+use bytes::Bytes;
+
 use crate::srt_packet::{DataPacket, PacketPosition, SRT_HEADER_SIZE, sequence_less_than};
 use crate::time::Timestamp;
 
@@ -44,7 +46,7 @@ struct SentPacket {
     order_flag: bool,
     message_number: u32,
     timestamp: u32,
-    payload: Box<[u8]>,
+    payload: Bytes,
     sent_time: Timestamp,
     retransmit_count: u32,
 }
@@ -376,6 +378,44 @@ impl SenderBuffer {
         now: Timestamp,
         sequence_number: u32,
     ) -> Option<DataPacket> {
+        self.push_impl(
+            Bytes::from(payload.clone()),
+            payload,
+            timestamp,
+            dest_socket_id,
+            now,
+            sequence_number,
+        )
+    }
+
+    /// Push with a shared payload — the fan-out path.
+    pub fn push_shared(
+        &mut self,
+        payload: Bytes,
+        timestamp: u32,
+        dest_socket_id: u32,
+        now: Timestamp,
+    ) -> Option<DataPacket> {
+        let tx_payload = payload.to_vec();
+        self.push_impl(
+            payload,
+            tx_payload,
+            timestamp,
+            dest_socket_id,
+            now,
+            self.next_seq,
+        )
+    }
+
+    fn push_impl(
+        &mut self,
+        retained: Bytes,
+        tx_payload: Vec<u8>,
+        timestamp: u32,
+        dest_socket_id: u32,
+        now: Timestamp,
+        sequence_number: u32,
+    ) -> Option<DataPacket> {
         if !self.can_send() {
             return None;
         }
@@ -385,9 +425,8 @@ impl SenderBuffer {
         }
 
         let message_number = self.next_msg;
-        let payload_len = payload.len();
+        let payload_len = tx_payload.len();
 
-        // Store stripped payload in the buffer (no seq/dest_socket_id/flags).
         self.packets.insert(
             sequence_number,
             SentPacket {
@@ -395,7 +434,7 @@ impl SenderBuffer {
                 order_flag: false,
                 message_number,
                 timestamp,
-                payload: payload.clone().into_boxed_slice(),
+                payload: retained,
                 sent_time: now,
                 retransmit_count: 0,
             },
@@ -410,7 +449,7 @@ impl SenderBuffer {
             message_number,
             timestamp,
             dest_socket_id,
-            payload,
+            payload: tx_payload,
         };
 
         // Update statistics.
@@ -469,7 +508,7 @@ impl SenderBuffer {
                     order_flag: true,
                     message_number: self.next_msg,
                     timestamp,
-                    payload: chunk_payload.clone().into_boxed_slice(),
+                    payload: Bytes::from(chunk_payload.clone()),
                     sent_time: now,
                     retransmit_count: 0,
                 },
