@@ -10,14 +10,16 @@ use bytes::Bytes;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::buf::{read_u32, write_u32};
-use crate::crypto::{CipherMode, CryptoContext, KeyFlag, KeyLength};
+use crate::crypto::{CipherMode, CryptoContext, GCM_TAG_LEN, KeyFlag, KeyLength};
 use crate::error::Error;
 use crate::message_assembler::MessageAssembler;
 use crate::srt_handshake::{
     DEFAULT_FLOW_WINDOW, DEFAULT_MTU, GroupExtensionData, HS_VERSION_5, HandshakePacket,
     HandshakeState, HandshakeType, KmError, KmMessage, SRT_MAGIC_CODE, srt_flags,
 };
-use crate::srt_packet::{ControlPacket, ControlType, DataPacket, SRT_HEADER_SIZE, SrtPacket};
+use crate::srt_packet::{
+    ControlPacket, ControlType, DataHeader, DataPacket, SRT_HEADER_SIZE, SrtPacket,
+};
 use crate::srt_receiver::ReceiverBuffer;
 use crate::srt_sender::SenderBuffer;
 use crate::stats::ConnectionStats;
@@ -871,16 +873,14 @@ impl SrtConnection {
     /// packets' `sent_time` is no longer updated).
     pub fn process_retransmit(&mut self, now: Timestamp) {
         let dest_socket_id = self.peer_socket_id;
-        while let Some(mut packet) = self
+        while let Some((header, payload)) = self
             .sender
             .as_mut()
             .and_then(|s| s.pop_retransmit(dest_socket_id))
         {
-            let _ = self.encrypt_packet(&mut packet);
-
-            let mut buf = Vec::with_capacity(packet.encoded_size());
-            packet.encode(&mut buf);
-            self.queue_packet(buf, now);
+            if let Ok(buf) = self.encrypt_to_wire(&header, &payload) {
+                self.queue_packet(buf, now);
+            }
         }
     }
 
@@ -1073,10 +1073,8 @@ impl SrtConnection {
             return Err(Error::invalid_state("send buffer full"));
         }
 
-        for mut packet in packets {
-            self.encrypt_packet(&mut packet)?;
-            let mut buf = Vec::with_capacity(packet.encoded_size());
-            packet.encode(&mut buf);
+        for (header, payload) in packets {
+            let buf = self.encrypt_to_wire(&header, &payload)?;
             self.queue_packet(buf, now);
         }
 
@@ -1128,29 +1126,24 @@ impl SrtConnection {
             }
         };
 
-        if let Some(mut packet) = packet {
+        if let Some((header, payload)) = packet {
             tracing::debug!(
                 "sending DATA packet, seq={}, msg={}, ts={}, dest_socket_id={:#x}, payload_len={}",
-                packet.sequence_number,
-                packet.message_number,
-                packet.timestamp,
-                packet.dest_socket_id,
-                packet.payload.len()
+                header.sequence_number,
+                header.message_number,
+                header.timestamp,
+                header.dest_socket_id,
+                payload.len()
             );
 
-            self.encrypt_packet(&mut packet)?;
-
-            let mut buf = Vec::with_capacity(packet.encoded_size());
-            packet.encode(&mut buf);
+            let buf = self.encrypt_to_wire(&header, &payload)?;
             self.queue_packet(buf, now);
 
-            // Record the send time (for packet pacing).
             if let Some(ref mut sender) = self.sender {
                 sender.record_send_time(now);
             }
         }
 
-        // Check KM Refresh.
         self.check_km_refresh(now);
 
         Ok(())
@@ -1185,10 +1178,8 @@ impl SrtConnection {
             }
         };
 
-        if let Some(mut packet) = packet {
-            self.encrypt_packet(&mut packet)?;
-            let mut buf = Vec::with_capacity(packet.encoded_size());
-            packet.encode(&mut buf);
+        if let Some((header, payload)) = packet {
+            let buf = self.encrypt_to_wire(&header, &payload)?;
             self.queue_packet(buf, now);
             if let Some(ref mut sender) = self.sender {
                 sender.record_send_time(now);
@@ -1422,26 +1413,49 @@ impl SrtConnection {
         self.sync_application_backlog();
     }
 
-    fn encrypt_packet(&mut self, packet: &mut DataPacket) -> Result<(), Error> {
+    /// Build a wire-ready buffer: header + encrypted payload (+ GCM tag).
+    ///
+    /// Copies the plaintext into the wire buffer exactly once and encrypts
+    /// in place, eliminating the intermediate `DataPacket.payload` copy
+    /// that the old `encrypt_packet` + `encode` path required.
+    fn encrypt_to_wire(&mut self, header: &DataHeader, payload: &[u8]) -> Result<Vec<u8>, Error> {
         let Some(ref mut crypto) = self.crypto else {
-            return Ok(());
+            let mut buf = Vec::with_capacity(SRT_HEADER_SIZE + payload.len());
+            let mut hdr = [0u8; SRT_HEADER_SIZE];
+            header.write_header(&mut hdr, 0);
+            buf.extend_from_slice(&hdr);
+            buf.extend_from_slice(payload);
+            return Ok(buf);
         };
         match crypto.cipher_mode() {
             CipherMode::Ctr => {
-                let key_flag = crypto.encrypt(packet.sequence_number, &mut packet.payload)?;
-                packet.encryption_flag = key_flag.to_kk_field();
+                let mut buf = Vec::with_capacity(SRT_HEADER_SIZE + payload.len());
+                buf.extend_from_slice(&[0u8; SRT_HEADER_SIZE]);
+                buf.extend_from_slice(payload);
+                let key_flag =
+                    crypto.encrypt(header.sequence_number, &mut buf[SRT_HEADER_SIZE..])?;
+                let mut hdr = [0u8; SRT_HEADER_SIZE];
+                header.write_header(&mut hdr, key_flag.to_kk_field());
+                buf[..SRT_HEADER_SIZE].copy_from_slice(&hdr);
+                Ok(buf)
             }
             CipherMode::Gcm => {
-                // KK must be set before computing AAD — the receiver sees
-                // the on-wire header with KK set and uses that as its AAD.
-                packet.encryption_flag = crypto.current_key().to_kk_field();
-                let aad = packet.gcm_aad();
-                let payload = std::mem::take(&mut packet.payload);
-                let (_, ciphertext) = crypto.encrypt_gcm(packet.sequence_number, &aad, payload)?;
-                packet.payload = ciphertext;
+                let enc_flag = crypto.current_key().to_kk_field();
+                let mut buf = Vec::with_capacity(SRT_HEADER_SIZE + payload.len() + GCM_TAG_LEN);
+                let mut hdr = [0u8; SRT_HEADER_SIZE];
+                header.write_header(&mut hdr, enc_flag);
+                buf.extend_from_slice(&hdr);
+                buf.extend_from_slice(payload);
+                let aad = header.gcm_aad(enc_flag);
+                let (_, tag) = crypto.encrypt_gcm_detached(
+                    header.sequence_number,
+                    &aad,
+                    &mut buf[SRT_HEADER_SIZE..],
+                )?;
+                buf.extend_from_slice(&tag);
+                Ok(buf)
             }
         }
-        Ok(())
     }
 
     fn sync_application_backlog(&mut self) {

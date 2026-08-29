@@ -235,6 +235,54 @@ impl DataPacket {
     }
 }
 
+/// Header metadata for a packet about to be encoded to wire format.
+///
+/// Carries every field the 16-byte SRT data header needs *except*
+/// `encryption_flag`, which is determined by the crypto layer after
+/// the header is created.  The payload travels separately as `Bytes`
+/// so the wire buffer can be built with a single payload copy.
+#[derive(Debug, Clone)]
+pub struct DataHeader {
+    pub sequence_number: u32,
+    pub position: PacketPosition,
+    pub order_flag: bool,
+    pub retransmitted: bool,
+    pub message_number: u32,
+    pub timestamp: u32,
+    pub dest_socket_id: u32,
+}
+
+impl DataHeader {
+    /// Write the 16-byte header into `buf`.
+    pub fn write_header(&self, buf: &mut [u8; SRT_HEADER_SIZE], encryption_flag: u8) {
+        let first_word = self.sequence_number & 0x7FFF_FFFF;
+        let second_word = ((self.position.to_bits() as u32) << 30)
+            | ((self.order_flag as u32) << 29)
+            | ((encryption_flag as u32 & 0b11) << 27)
+            | ((self.retransmitted as u32) << 26)
+            | (self.message_number & 0x03FF_FFFF);
+        buf[0..4].copy_from_slice(&first_word.to_be_bytes());
+        buf[4..8].copy_from_slice(&second_word.to_be_bytes());
+        buf[8..12].copy_from_slice(&self.timestamp.to_be_bytes());
+        buf[12..16].copy_from_slice(&self.dest_socket_id.to_be_bytes());
+    }
+
+    /// Build the 16-byte GCM AAD (R bit forced to 0).
+    pub fn gcm_aad(&self, encryption_flag: u8) -> [u8; 16] {
+        let first_word = self.sequence_number & 0x7FFF_FFFF;
+        let second_word = ((self.position.to_bits() as u32) << 30)
+            | ((self.order_flag as u32) << 29)
+            | ((encryption_flag as u32 & 0b11) << 27)
+            | (self.message_number & 0x03FF_FFFF);
+        let mut aad = [0u8; 16];
+        aad[0..4].copy_from_slice(&first_word.to_be_bytes());
+        aad[4..8].copy_from_slice(&second_word.to_be_bytes());
+        aad[8..12].copy_from_slice(&self.timestamp.to_be_bytes());
+        aad[12..16].copy_from_slice(&self.dest_socket_id.to_be_bytes());
+        aad
+    }
+}
+
 /// Control packet type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
