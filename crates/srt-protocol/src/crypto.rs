@@ -370,7 +370,7 @@ impl CryptoContext {
         &mut self,
         packet_index: u32,
         header: &[u8; 16],
-        payload: &[u8],
+        payload: Vec<u8>,
     ) -> Result<(KeyFlag, Vec<u8>), Error> {
         let sek = match self.current_key {
             KeyFlag::Even => &self.sek_even,
@@ -414,7 +414,7 @@ impl CryptoContext {
         packet_index: u32,
         key_flag: KeyFlag,
         header: &[u8; 16],
-        payload: &[u8],
+        payload: Vec<u8>,
     ) -> Result<Vec<u8>, Error> {
         let sek = match key_flag {
             KeyFlag::Even => &self.sek_even,
@@ -667,13 +667,12 @@ fn encrypt_payload_gcm(
     salt: &[u8; 16],
     packet_index: u32,
     header: &[u8; 16],
-    plaintext: &[u8],
+    mut buffer: Vec<u8>,
     key_length: KeyLength,
 ) -> Result<Vec<u8>, Error> {
     let iv = build_gcm_iv(salt, packet_index);
     let nonce = Nonce::try_from(iv.as_slice())
         .map_err(|e| Error::crypto_error(format!("invalid GCM nonce: {e}")))?;
-    let mut buffer = plaintext.to_vec();
 
     match key_length {
         KeyLength::Aes128 => {
@@ -708,17 +707,16 @@ fn decrypt_payload_gcm(
     salt: &[u8; 16],
     packet_index: u32,
     header: &[u8; 16],
-    ciphertext_and_tag: &[u8],
+    mut buffer: Vec<u8>,
     key_length: KeyLength,
 ) -> Result<Vec<u8>, Error> {
-    if ciphertext_and_tag.len() < GCM_TAG_LEN {
+    if buffer.len() < GCM_TAG_LEN {
         return Err(Error::crypto_error("GCM payload too short for auth tag"));
     }
 
     let iv = build_gcm_iv(salt, packet_index);
     let nonce = Nonce::try_from(iv.as_slice())
         .map_err(|e| Error::crypto_error(format!("invalid GCM nonce: {e}")))?;
-    let mut buffer = ciphertext_and_tag.to_vec();
 
     match key_length {
         KeyLength::Aes128 => {
@@ -957,7 +955,7 @@ mod tests {
             &salt,
             packet_index,
             &header,
-            original,
+            original.to_vec(),
             KeyLength::Aes128,
         )
         .unwrap();
@@ -970,7 +968,7 @@ mod tests {
             &salt,
             packet_index,
             &header,
-            &encrypted,
+            encrypted,
             KeyLength::Aes128,
         )
         .unwrap();
@@ -991,7 +989,7 @@ mod tests {
             &salt,
             packet_index,
             &header,
-            original,
+            original.to_vec(),
             KeyLength::Aes128,
         )
         .unwrap();
@@ -1003,7 +1001,7 @@ mod tests {
             &salt,
             packet_index,
             &header,
-            &encrypted,
+            encrypted,
             KeyLength::Aes128,
         );
         assert!(result.is_err());
@@ -1021,7 +1019,7 @@ mod tests {
             &salt,
             packet_index,
             &header,
-            b"integrity check",
+            b"integrity check".to_vec(),
             KeyLength::Aes128,
         )
         .unwrap();
@@ -1034,7 +1032,7 @@ mod tests {
             &salt,
             packet_index,
             &bad_header,
-            &encrypted,
+            encrypted,
             KeyLength::Aes128,
         );
         assert!(result.is_err());
@@ -1053,7 +1051,7 @@ mod tests {
             &salt,
             packet_index,
             &header,
-            original,
+            original.to_vec(),
             KeyLength::Aes256,
         )
         .unwrap();
@@ -1063,7 +1061,7 @@ mod tests {
             &salt,
             packet_index,
             &header,
-            &encrypted,
+            encrypted,
             KeyLength::Aes256,
         )
         .unwrap();
@@ -1105,10 +1103,10 @@ mod tests {
         .unwrap();
 
         let original = b"round-trip via context";
-        let (key_flag, encrypted) = sender.encrypt_gcm(1, &header, original).unwrap();
+        let (key_flag, encrypted) = sender.encrypt_gcm(1, &header, original.to_vec()).unwrap();
 
         let decrypted = receiver
-            .decrypt_gcm(1, key_flag, &header, &encrypted)
+            .decrypt_gcm(1, key_flag, &header, encrypted)
             .unwrap();
 
         assert_eq!(decrypted, original);
@@ -1139,7 +1137,7 @@ mod tests {
         let salt = [0xABu8; 16];
         let header = [0u8; 16];
 
-        let result = decrypt_payload_gcm(&sek, &salt, 1, &header, &[0u8; 15], KeyLength::Aes128);
+        let result = decrypt_payload_gcm(&sek, &salt, 1, &header, vec![0u8; 15], KeyLength::Aes128);
         assert!(result.is_err());
     }
 }

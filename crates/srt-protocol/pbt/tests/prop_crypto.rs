@@ -421,10 +421,11 @@ proptest! {
         let sek = generate_sek(key_length);
         let mut sender = CryptoContext::new_sender(&passphrase, key_length, salt_arr, &sek, CipherMode::Gcm).expect("sender creation should succeed");
 
-        let (key_flag, encrypted) = sender.encrypt_gcm(packet_index, &header_arr, &payload_data).expect("encrypt_gcm should succeed");
+        let payload_len = payload_data.len();
+        let (key_flag, encrypted) = sender.encrypt_gcm(packet_index, &header_arr, payload_data.clone()).expect("encrypt_gcm should succeed");
 
         // ciphertext + 16-byte tag
-        prop_assert_eq!(encrypted.len(), payload_data.len() + 16);
+        prop_assert_eq!(encrypted.len(), payload_len + 16);
 
         let wrapped_sek = sender.wrap_sek(key_flag).expect("wrap should succeed");
         let receiver = CryptoContext::new_receiver(
@@ -436,7 +437,7 @@ proptest! {
             CipherMode::Gcm,
         ).expect("receiver creation should succeed");
 
-        let decrypted = receiver.decrypt_gcm(packet_index, key_flag, &header_arr, &encrypted).expect("decrypt_gcm should succeed");
+        let decrypted = receiver.decrypt_gcm(packet_index, key_flag, &header_arr, encrypted).expect("decrypt_gcm should succeed");
         prop_assert_eq!(payload_data, decrypted);
     }
 
@@ -455,7 +456,7 @@ proptest! {
         let sek = generate_sek(key_length);
         let mut sender = CryptoContext::new_sender(&passphrase, key_length, salt_arr, &sek, CipherMode::Gcm).expect("sender creation should succeed");
 
-        let (key_flag, mut encrypted) = sender.encrypt_gcm(packet_index, &header_arr, &payload_data).expect("encrypt_gcm should succeed");
+        let (key_flag, mut encrypted) = sender.encrypt_gcm(packet_index, &header_arr, payload_data).expect("encrypt_gcm should succeed");
 
         let actual_flip = flip_pos % encrypted.len();
         encrypted[actual_flip] ^= 0xFF;
@@ -470,7 +471,7 @@ proptest! {
             CipherMode::Gcm,
         ).expect("receiver creation should succeed");
 
-        let result = receiver.decrypt_gcm(packet_index, key_flag, &header_arr, &encrypted);
+        let result = receiver.decrypt_gcm(packet_index, key_flag, &header_arr, encrypted);
         prop_assert!(result.is_err());
     }
 
@@ -489,7 +490,7 @@ proptest! {
         let sek = generate_sek(key_length);
         let mut sender = CryptoContext::new_sender(&passphrase, key_length, salt_arr, &sek, CipherMode::Gcm).expect("sender creation should succeed");
 
-        let (key_flag, encrypted) = sender.encrypt_gcm(packet_index, &header_arr, &payload_data).expect("encrypt_gcm should succeed");
+        let (key_flag, encrypted) = sender.encrypt_gcm(packet_index, &header_arr, payload_data).expect("encrypt_gcm should succeed");
 
         let mut bad_header = header_arr;
         bad_header[flip_pos] ^= 0xFF;
@@ -504,7 +505,7 @@ proptest! {
             CipherMode::Gcm,
         ).expect("receiver creation should succeed");
 
-        let result = receiver.decrypt_gcm(packet_index, key_flag, &bad_header, &encrypted);
+        let result = receiver.decrypt_gcm(packet_index, key_flag, &bad_header, encrypted);
         prop_assert!(result.is_err());
     }
 
@@ -523,8 +524,8 @@ proptest! {
         let sek = generate_sek(key_length);
         let mut ctx = CryptoContext::new_sender(&passphrase, key_length, salt_arr, &sek, CipherMode::Gcm).expect("creation should succeed");
 
-        let (_, encrypted1) = ctx.encrypt_gcm(packet_index1, &header_arr, &payload_data).expect("encrypt should succeed");
-        let (_, encrypted2) = ctx.encrypt_gcm(packet_index2, &header_arr, &payload_data).expect("encrypt should succeed");
+        let (_, encrypted1) = ctx.encrypt_gcm(packet_index1, &header_arr, payload_data.clone()).expect("encrypt should succeed");
+        let (_, encrypted2) = ctx.encrypt_gcm(packet_index2, &header_arr, payload_data).expect("encrypt should succeed");
 
         prop_assert_ne!(encrypted1, encrypted2);
     }
@@ -546,7 +547,7 @@ proptest! {
         let sek = generate_sek(key_length);
         let mut sender = CryptoContext::new_sender(&passphrase1, key_length, salt_arr, &sek, CipherMode::Gcm).expect("sender creation should succeed");
 
-        let (key_flag, _encrypted) = sender.encrypt_gcm(packet_index, &header_arr, &payload_data).expect("encrypt_gcm should succeed");
+        let (key_flag, _encrypted) = sender.encrypt_gcm(packet_index, &header_arr, payload_data).expect("encrypt_gcm should succeed");
 
         let wrapped_sek = sender.wrap_sek(key_flag).expect("wrap should succeed");
         let receiver_result = CryptoContext::new_receiver(
@@ -587,8 +588,8 @@ proptest! {
 
         let indices = [u32::MAX - 1, u32::MAX, 0, 1];
         for &idx in &indices {
-            let (kf, encrypted) = sender.encrypt_gcm(idx, &header_arr, &payload_data).expect("encrypt_gcm should succeed");
-            let decrypted = receiver.decrypt_gcm(idx, kf, &header_arr, &encrypted).expect("decrypt_gcm should succeed");
+            let (kf, encrypted) = sender.encrypt_gcm(idx, &header_arr, payload_data.clone()).expect("encrypt_gcm should succeed");
+            let decrypted = receiver.decrypt_gcm(idx, kf, &header_arr, encrypted).expect("decrypt_gcm should succeed");
             prop_assert_eq!(payload_data.clone(), decrypted);
         }
     }
