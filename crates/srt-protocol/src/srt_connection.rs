@@ -1022,7 +1022,17 @@ impl SrtConnection {
     /// Send shared payload data. Cheaply clones a reference-counted handle
     /// instead of deep-copying the payload — the fan-out path for proxies.
     pub fn send_shared(&mut self, payload: Bytes, now: Timestamp) -> Result<(), Error> {
-        self.send_shared_internal(payload, now)
+        self.send_shared_internal(payload, None, now)
+    }
+
+    /// Send shared payload with a caller-supplied SRT sequence number.
+    pub fn send_shared_with_sequence(
+        &mut self,
+        payload: Bytes,
+        sequence_number: u32,
+        now: Timestamp,
+    ) -> Result<(), Error> {
+        self.send_shared_internal(payload, Some(sequence_number), now)
     }
 
     /// Send one message with a caller-supplied SRT sequence number.
@@ -1146,7 +1156,12 @@ impl SrtConnection {
         Ok(())
     }
 
-    fn send_shared_internal(&mut self, payload: Bytes, now: Timestamp) -> Result<(), Error> {
+    fn send_shared_internal(
+        &mut self,
+        payload: Bytes,
+        sequence_number: Option<u32>,
+        now: Timestamp,
+    ) -> Result<(), Error> {
         if self.state != ConnectionState::Connected {
             return Err(Error::invalid_state("not connected"));
         }
@@ -1162,7 +1177,12 @@ impl SrtConnection {
                 .sender
                 .as_mut()
                 .ok_or_else(|| Error::invalid_state("sender buffer not initialized"))?;
-            sender.push_shared(payload, timestamp, peer_socket_id, now)
+            match sequence_number {
+                Some(seq) => {
+                    sender.push_shared_with_sequence(payload, timestamp, peer_socket_id, now, seq)
+                }
+                None => sender.push_shared(payload, timestamp, peer_socket_id, now),
+            }
         };
 
         if let Some(mut packet) = packet {

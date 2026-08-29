@@ -2,7 +2,7 @@ use crate::{
     GroupConnectionStats, GroupLogicalCounters, ManualTimerStore, OutputDrainBudget,
     OutputDrainReport, OutputDrainStatus, group_connection_stats,
 };
-use shiguredo_srt::{ConnectionOutput, SrtConnection, Timestamp};
+use shiguredo_srt::{Bytes, ConnectionOutput, SrtConnection, Timestamp};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Opaque application identity for one outbound SRT stream. A direct caller
@@ -155,6 +155,25 @@ impl LogicalCallerMut<'_> {
             .send(payload, now)
     }
 
+    /// Send shared payload data. Uses reference-counted `Bytes` to avoid
+    /// deep-copying the payload for each group leg — the fan-out path.
+    pub fn send_shared(
+        &mut self,
+        payload: Bytes,
+        now: Timestamp,
+    ) -> Result<usize, shiguredo_srt::Error> {
+        self.table
+            .sessions
+            .get_mut(&self.id)
+            .ok_or_else(|| {
+                shiguredo_srt::Error::with_reason(
+                    shiguredo_srt::ErrorKind::InvalidState,
+                    "logical caller no longer exists",
+                )
+            })?
+            .send_shared(payload, now)
+    }
+
     /// Begin an orderly close. A bonded caller closes every physical leg.
     pub fn disconnect(&mut self, now: Timestamp) {
         if let Some(caller) = self.table.sessions.get_mut(&self.id) {
@@ -279,6 +298,27 @@ impl CallerSession {
                     .logical
                     .payload_bytes_sent
                     .saturating_add(payload.len() as u64);
+                Ok(legs)
+            }
+        }
+    }
+
+    fn send_shared(
+        &mut self,
+        payload: Bytes,
+        now: Timestamp,
+    ) -> Result<usize, shiguredo_srt::Error> {
+        let len = payload.len() as u64;
+        match self {
+            Self::Direct(leg) => {
+                leg.connection.send_shared(payload, now)?;
+                Ok(1)
+            }
+            Self::Group(group) => {
+                let legs = group.group.send_shared(payload, now)?;
+                group.logical.payloads_sent = group.logical.payloads_sent.saturating_add(1);
+                group.logical.payload_bytes_sent =
+                    group.logical.payload_bytes_sent.saturating_add(len);
                 Ok(legs)
             }
         }

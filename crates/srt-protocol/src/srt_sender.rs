@@ -396,6 +396,18 @@ impl SenderBuffer {
         dest_socket_id: u32,
         now: Timestamp,
     ) -> Option<DataPacket> {
+        self.push_shared_with_sequence(payload, timestamp, dest_socket_id, now, self.next_seq)
+    }
+
+    /// Push shared payload with an externally coordinated sequence number.
+    pub fn push_shared_with_sequence(
+        &mut self,
+        payload: Bytes,
+        timestamp: u32,
+        dest_socket_id: u32,
+        now: Timestamp,
+        sequence_number: u32,
+    ) -> Option<DataPacket> {
         let tx_payload = payload.to_vec();
         self.push_impl(
             payload,
@@ -403,7 +415,7 @@ impl SenderBuffer {
             timestamp,
             dest_socket_id,
             now,
-            self.next_seq,
+            sequence_number,
         )
     }
 
