@@ -43,3 +43,5 @@ pub use stats::{
     SenderStatsInterval,
 };
 pub use time::Timestamp;
+
+pub use bytes::Bytes;

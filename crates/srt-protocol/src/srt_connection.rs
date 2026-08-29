@@ -6,6 +6,7 @@
 use std::collections::VecDeque;
 use std::fmt;
 
+use bytes::Bytes;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::buf::{read_u32, write_u32};
@@ -1010,7 +1011,18 @@ impl SrtConnection {
 
     /// Send data.
     pub fn send(&mut self, payload: &[u8], now: Timestamp) -> Result<(), Error> {
+        self.send_internal(payload.to_vec(), None, now)
+    }
+
+    /// Send data from an owned buffer, avoiding a copy.
+    pub fn send_owned(&mut self, payload: Vec<u8>, now: Timestamp) -> Result<(), Error> {
         self.send_internal(payload, None, now)
+    }
+
+    /// Send shared payload data. Cheaply clones a reference-counted handle
+    /// instead of deep-copying the payload — the fan-out path for proxies.
+    pub fn send_shared(&mut self, payload: Bytes, now: Timestamp) -> Result<(), Error> {
+        self.send_shared_internal(payload, now)
     }
 
     /// Send one message with a caller-supplied SRT sequence number.
@@ -1020,7 +1032,7 @@ impl SrtConnection {
         sequence_number: u32,
         now: Timestamp,
     ) -> Result<(), Error> {
-        self.send_internal(payload, Some(sequence_number), now)
+        self.send_internal(payload.to_vec(), Some(sequence_number), now)
     }
 
     /// Send a message that may be larger than one SRT packet.
@@ -1068,7 +1080,7 @@ impl SrtConnection {
 
     fn send_internal(
         &mut self,
-        payload: &[u8],
+        payload: Vec<u8>,
         sequence_number: Option<u32>,
         now: Timestamp,
     ) -> Result<(), Error> {
@@ -1096,13 +1108,13 @@ impl SrtConnection {
                 .ok_or_else(|| Error::invalid_state("sender buffer not initialized"))?;
             match sequence_number {
                 Some(sequence_number) => sender.push_with_sequence(
-                    payload.to_vec(),
+                    payload,
                     timestamp,
                     peer_socket_id,
                     now,
                     sequence_number,
                 ),
-                None => sender.push(payload.to_vec(), timestamp, peer_socket_id, now),
+                None => sender.push(payload, timestamp, peer_socket_id, now),
             }
         };
 
@@ -1131,6 +1143,39 @@ impl SrtConnection {
         // Check KM Refresh.
         self.check_km_refresh(now);
 
+        Ok(())
+    }
+
+    fn send_shared_internal(&mut self, payload: Bytes, now: Timestamp) -> Result<(), Error> {
+        if self.state != ConnectionState::Connected {
+            return Err(Error::invalid_state("not connected"));
+        }
+        if !self.can_send() {
+            return Err(Error::invalid_state("send buffer full"));
+        }
+
+        let timestamp = self.relative_timestamp(now);
+        let peer_socket_id = self.peer_socket_id;
+
+        let packet = {
+            let sender = self
+                .sender
+                .as_mut()
+                .ok_or_else(|| Error::invalid_state("sender buffer not initialized"))?;
+            sender.push_shared(payload, timestamp, peer_socket_id, now)
+        };
+
+        if let Some(mut packet) = packet {
+            self.encrypt_packet(&mut packet)?;
+            let mut buf = Vec::with_capacity(packet.encoded_size());
+            packet.encode(&mut buf);
+            self.queue_packet(buf, now);
+            if let Some(ref mut sender) = self.sender {
+                sender.record_send_time(now);
+            }
+        }
+
+        self.check_km_refresh(now);
         Ok(())
     }
 

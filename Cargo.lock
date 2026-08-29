@@ -1950,6 +1950,7 @@ dependencies = [
  "aes",
  "aes-gcm",
  "aes-kw",
+ "bytes",
  "cipher",
  "criterion",
  "ctr",
