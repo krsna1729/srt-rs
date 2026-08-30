@@ -164,6 +164,16 @@ fn receiver_with_mixed_state() -> ReceiverBuffer {
     receiver
 }
 
+fn receiver_with_future_tsbpd_packets(packet_count: u32) -> ReceiverBuffer {
+    let mut receiver = ReceiverBuffer::new(0, 120, ts(0), 0);
+    for seq in 0..packet_count {
+        let mut packet = make_packet(seq, 1_000_000_000 + seq);
+        packet.payload = Vec::new().into();
+        let _ = receiver.receive(packet, ts(1));
+    }
+    receiver
+}
+
 /// Maximum legal DROPREQ coverage. Setup is excluded so these cases isolate
 /// the in-place range mutation for empty, dense-loss, mixed, and wrapped state.
 fn bench_drop_range(c: &mut Criterion) {
@@ -202,10 +212,34 @@ fn bench_drop_range(c: &mut Criterion) {
     group.finish();
 }
 
+/// A tiny DROPREQ must not become slower in proportion to unrelated packets
+/// retained behind future TSBPD delivery times. Setup is excluded and empty
+/// payloads keep this focused on ordered-map removal and hint repair.
+fn bench_drop_range_locality(c: &mut Criterion) {
+    let mut group = c.benchmark_group("receiver_drop_range_locality");
+    group.throughput(Throughput::Elements(1));
+    group.sample_size(20);
+
+    for &packet_count in &[8192u32, 32_768u32] {
+        group.bench_function(format!("single_sequence/retained_{packet_count}"), |b| {
+            b.iter_batched(
+                || receiver_with_future_tsbpd_packets(packet_count),
+                |mut receiver| {
+                    black_box(receiver.drop_range(0, 0)).unwrap();
+                    receiver
+                },
+                BatchSize::LargeInput,
+            );
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_lossy_receive,
     bench_burst_receive,
-    bench_drop_range
+    bench_drop_range,
+    bench_drop_range_locality
 );
 criterion_main!(benches);
