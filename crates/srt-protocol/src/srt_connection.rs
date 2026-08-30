@@ -2028,15 +2028,10 @@ impl SrtConnection {
         let mut buf = &pkt.control_info[..];
         let first_seq = read_u32(&mut buf)?;
         let last_seq = read_u32(&mut buf)?;
-        if first_seq & !SEQUENCE_MASK != 0 || last_seq & !SEQUENCE_MASK != 0 {
-            return Err(Error::invalid_data("DROPREQ sequence has high bit set"));
-        }
-
-        if let Some(receiver) = self.receiver.as_ref() {
-            receiver.validate_drop_range(first_seq, last_seq)?;
-        }
         if let Some(receiver) = self.receiver.as_mut() {
             receiver.drop_range(first_seq, last_seq)?;
+        } else if first_seq & !SEQUENCE_MASK != 0 || last_seq & !SEQUENCE_MASK != 0 {
+            return Err(Error::invalid_data("DROPREQ sequence has high bit set"));
         }
         self.assembler.drop_message(message_number);
         self.enqueue_ready_data(now);

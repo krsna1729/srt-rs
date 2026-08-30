@@ -36,7 +36,7 @@ pub use srt_packet::{
     ControlPacket, ControlType, DataHeader, DataPacket, PacketPosition, SRT_HEADER_SIZE, SrtPacket,
     peek_destination_socket_id,
 };
-pub use srt_receiver::{AckPacket, NakPacket, ReceiverBuffer, ReceiverStats};
+pub use srt_receiver::{AckPacket, DropRangeSummary, NakPacket, ReceiverBuffer, ReceiverStats};
 pub use srt_sender::{SenderBuffer, SenderStats};
 pub use stats::{
     ConnectionStats, ConnectionStatsInterval, CounterDelta, ReceiverStatsInterval,

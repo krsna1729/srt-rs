@@ -12,7 +12,7 @@
 //! - Receiving rate / link capacity estimation
 
 use bytes::Bytes;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashSet;
 use std::collections::BTreeMap;
 
 #[cfg(test)]
@@ -347,13 +347,19 @@ pub struct NakPacket {
     pub loss_list: Vec<u32>,
 }
 
+/// Compact result of applying an inclusive DROPREQ sequence range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DropRangeSummary {
+    /// Number of sequence positions covered by the request.
+    pub sequence_count: u32,
+}
+
 /// Receive buffer.
 #[derive(Debug)]
 pub struct ReceiverBuffer {
-    /// Received packets (sequence_number -> ReceivedPacket). The common
-    /// in-order delivery path addresses `delivery_seq_hint` directly, so a
-    /// hash map avoids tree rebalancing for every receive/remove.
-    packets: FxHashMap<u32, ReceivedPacket>,
+    /// Received packets (sequence_number -> ReceivedPacket). Ordered storage
+    /// preserves efficient successor queries on loss/reorder paths.
+    packets: BTreeMap<u32, ReceivedPacket>,
 
     delivery_seq_hint: Option<u32>,
 
@@ -490,9 +496,6 @@ pub struct ReceiverBuffer {
 
     #[cfg(test)]
     receive_expected_sequence_scans: Cell<usize>,
-
-    #[cfg(test)]
-    successor_scan_calls: Cell<usize>,
 }
 
 impl ReceiverBuffer {
@@ -520,7 +523,7 @@ impl ReceiverBuffer {
         max_buffer_size: u32,
     ) -> Self {
         Self {
-            packets: FxHashMap::default(),
+            packets: BTreeMap::new(),
             delivery_seq_hint: None,
             expected_seq: initial_seq,
             last_advertised_buffer: 0,
@@ -564,8 +567,6 @@ impl ReceiverBuffer {
             delivery_scan_calls: Cell::new(0),
             #[cfg(test)]
             receive_expected_sequence_scans: Cell::new(0),
-            #[cfg(test)]
-            successor_scan_calls: Cell::new(0),
         }
     }
 
@@ -737,48 +738,53 @@ impl ReceiverBuffer {
 
     /// Detect losses in the gap between expected_seq and `seq`.
     ///
-    /// The packet map is unordered. A rare out-of-order gap finds its next
-    /// buffered packet by one circular-order map scan rather than walking
-    /// every sequence just to discover an existing packet. Emitting the
-    /// missing sequence numbers remains necessary because the wire NAK is an
-    /// explicit sequence list.
+    /// Uses ordered-map range queries to find contiguous missing runs in
+    /// O(runs * log n + emitted) rather than reconstructing and sorting the
+    /// whole packet order for every receive behind an unresolved loss.
     fn detect_losses(&mut self, seq: u32) -> Vec<u32> {
         let mut new_losses = Vec::new();
         if !sequence_greater_than(seq, self.expected_seq) {
             return new_losses;
         }
 
-        // Build the only circular successor view needed for this receive.
-        // Limiting it to the open gap keeps packets after `seq` from ending
-        // a missing run before the newly received packet does.
-        let gap_len = seq.wrapping_sub(self.expected_seq) & 0x7FFF_FFFF;
-        let buffered_in_gap: Vec<u32> = self
-            .packet_sequences_in_circular_order(self.expected_seq)
-            .into_iter()
-            .take_while(|&candidate| {
-                candidate.wrapping_sub(self.expected_seq) & 0x7FFF_FFFF < gap_len
-            })
-            .collect();
-
         let mut s = self.expected_seq;
-        for run_end in buffered_in_gap {
-            while s != run_end {
-                if !self.loss_list.contains(&s) {
-                    new_losses.push(s);
-                    self.loss_list_insert(s);
+        while sequence_less_than(s, seq) {
+            if self.packets.contains_key(&s) {
+                s = s.wrapping_add(1) & 0x7FFF_FFFF;
+                continue;
+            }
+            let upper = self
+                .packets
+                .range(s..)
+                .next()
+                .map(|(&packet_seq, _)| packet_seq);
+            let lower = if s > seq {
+                self.packets
+                    .range(..seq)
+                    .next()
+                    .map(|(&packet_seq, _)| packet_seq)
+            } else {
+                None
+            };
+            let candidate = match (upper, lower) {
+                (Some(packet_seq), _) => Some(packet_seq),
+                (None, lower) => lower,
+            };
+            let run_end = candidate
+                .filter(|&packet_seq| {
+                    sequence_less_than(s, packet_seq) && sequence_less_than(packet_seq, seq)
+                })
+                .unwrap_or(seq);
+            let mut missing = s;
+            while missing != run_end {
+                if !self.loss_list.contains(&missing) {
+                    new_losses.push(missing);
+                    self.loss_list_insert(missing);
                     self.total_lost += 1;
                 }
-                s = s.wrapping_add(1) & 0x7FFF_FFFF;
+                missing = missing.wrapping_add(1) & 0x7FFF_FFFF;
             }
-            s = s.wrapping_add(1) & 0x7FFF_FFFF;
-        }
-        while s != seq {
-            if !self.loss_list.contains(&s) {
-                new_losses.push(s);
-                self.loss_list_insert(s);
-                self.total_lost += 1;
-            }
-            s = s.wrapping_add(1) & 0x7FFF_FFFF;
+            s = run_end;
         }
         new_losses
     }
@@ -826,14 +832,7 @@ impl ReceiverBuffer {
 
         let entry = self.packets.remove(&delivery_seq)?;
         if self.delivery_seq_hint == Some(delivery_seq) {
-            let next = delivery_seq.wrapping_add(1) & 0x7FFF_FFFF;
-            self.delivery_seq_hint = if self.packets.contains_key(&next) {
-                Some(next)
-            } else if self.packets.is_empty() {
-                None
-            } else {
-                self.next_sequence_after(delivery_seq)
-            };
+            self.delivery_seq_hint = self.next_sequence_after(delivery_seq);
         }
 
         // Detect the end of the TSBPD wraparound period.
@@ -890,6 +889,20 @@ impl ReceiverBuffer {
             return Some(seq);
         }
 
+        // Ordered storage gives the loss-recovery steady state an O(log n)
+        // oldest-packet lookup. Across sequence wrap, fall back to the full
+        // circular comparison below.
+        if let (Some(min), Some(&oldest)) = (self.loss_list_min, self.packets.keys().next())
+            && !sequence_less_than(min, oldest)
+            && oldest >= self.expected_seq
+        {
+            let entry = &self.packets[&oldest];
+            if !self.tsbpd_enabled || self.delivery_time(entry) <= now {
+                return Some(oldest);
+            }
+            return None;
+        }
+
         #[cfg(test)]
         self.delivery_scan_calls
             .set(self.delivery_scan_calls.get().saturating_add(1));
@@ -911,26 +924,15 @@ impl ReceiverBuffer {
         best
     }
 
-    /// Return buffered sequence numbers in circular order from `anchor`.
-    ///
-    /// This is deliberately a temporary rare-path view: `packets` remains an
-    /// O(1) `FxHashMap` for normal in-order receive and delivery.
-    fn packet_sequences_in_circular_order(&self, anchor: u32) -> Vec<u32> {
-        #[cfg(test)]
-        self.successor_scan_calls
-            .set(self.successor_scan_calls.get().saturating_add(1));
-
-        let mut sequences: Vec<u32> = self.packets.keys().copied().collect();
-        sequences.sort_unstable_by_key(|&candidate| candidate.wrapping_sub(anchor) & 0x7FFF_FFFF);
-        sequences
-    }
-
     /// Return the nearest buffered sequence strictly after `sequence_number`
     /// in the 31-bit circular sequence space.
     fn next_sequence_after(&self, sequence_number: u32) -> Option<u32> {
-        self.packet_sequences_in_circular_order(sequence_number)
-            .into_iter()
-            .find(|&candidate| candidate != sequence_number)
+        let next = sequence_number.wrapping_add(1) & 0x7FFF_FFFF;
+        self.packets
+            .range(next..)
+            .next()
+            .map(|(&seq, _)| seq)
+            .or_else(|| self.packets.keys().next().copied())
     }
 
     fn refresh_delivery_seq_hint(&mut self) {
@@ -944,11 +946,6 @@ impl ReceiverBuffer {
     #[cfg(test)]
     fn delivery_scan_calls(&self) -> usize {
         self.delivery_scan_calls.get()
-    }
-
-    #[cfg(test)]
-    fn successor_scan_calls(&self) -> usize {
-        self.successor_scan_calls.get()
     }
 
     #[cfg(test)]
@@ -1123,50 +1120,37 @@ impl ReceiverBuffer {
             return Vec::new();
         }
 
-        // With no detected losses there is no successor to estimate, so keep
-        // the periodic TLPKTDROP check out of the packet-map rare path too.
-        if self.loss_list.is_empty() {
-            return Vec::new();
-        }
-
         let tlpktdrop_threshold = ((self.tsbpd_delay_us as u128 * 125 / 100) as u64).max(1_000_000); // Minimum 1 second.
 
         let mut dropped = Vec::new();
-
-        // Estimate each missing packet's delivery time. Construct one
-        // immutable successor/delivery-time view for this timer invocation;
-        // every loss below reuses it instead of scanning the packet map.
-        let delivery_view: Vec<(u32, u64)> = self
-            .packet_sequences_in_circular_order(0)
-            .into_iter()
-            .filter_map(|seq| {
-                self.packets
-                    .get(&seq)
-                    .map(|entry| (seq, self.delivery_time(entry).as_micros()))
-            })
-            .collect();
-        let fallback_delivery = {
-            let base = self.tsbpd_time_base + self.tsbpd_delay_us;
-            if self.wrapping_period_active {
-                base + MAX_TIMESTAMP + 1
-            } else {
-                base
-            }
-        };
 
         let expired: Vec<u32> = self
             .loss_list
             .iter()
             .copied()
             .filter(|&seq| {
-                let estimated_delivery =
-                    match delivery_view.binary_search_by_key(&seq, |&(seq, _)| seq) {
-                        Ok(index) => delivery_view[index].1,
-                        Err(index) => delivery_view
-                            .get(index)
-                            .or_else(|| delivery_view.first())
-                            .map_or(fallback_delivery, |&(_, delivery)| delivery),
-                    };
+                let estimated_delivery = self
+                    .packets
+                    .get(&seq)
+                    .map(|packet| self.delivery_time(packet).as_micros())
+                    .unwrap_or_else(|| {
+                        let next_packet = self
+                            .packets
+                            .range(seq.wrapping_add(1)..)
+                            .next()
+                            .or_else(|| self.packets.iter().next());
+                        next_packet.map_or_else(
+                            || {
+                                let base = self.tsbpd_time_base + self.tsbpd_delay_us;
+                                if self.wrapping_period_active {
+                                    base + MAX_TIMESTAMP + 1
+                                } else {
+                                    base
+                                }
+                            },
+                            |(_, entry)| self.delivery_time(entry).as_micros(),
+                        )
+                    });
                 now.as_micros() > estimated_delivery + tlpktdrop_threshold
             })
             .collect();
@@ -1214,27 +1198,26 @@ impl ReceiverBuffer {
     ///
     /// The inclusive range must fit within the negotiated receive window so
     /// this method cannot be used to force unbounded iteration or allocation.
-    pub fn drop_range(&mut self, first_seq: u32, last_seq: u32) -> Result<Vec<u32>, Error> {
+    pub fn drop_range(&mut self, first_seq: u32, last_seq: u32) -> Result<DropRangeSummary, Error> {
         const SEQUENCE_MASK: u32 = 0x7FFF_FFFF;
         let distance = self.validate_drop_range(first_seq, last_seq)?;
+        let sequence_count = distance + 1;
+        let in_range = |seq: u32| seq.wrapping_sub(first_seq) & SEQUENCE_MASK <= distance;
 
-        let mut dropped = Vec::with_capacity(distance as usize + 1);
-        let mut seq = first_seq;
-        loop {
-            self.packets.remove(&seq);
-            self.loss_list_remove(seq);
-            dropped.push(seq);
-            if seq == last_seq {
-                break;
-            }
-            seq = seq.wrapping_add(1) & SEQUENCE_MASK;
-        }
-        self.total_dropped = self.total_dropped.saturating_add(dropped.len() as u64);
-        while self.packets.contains_key(&self.expected_seq) || dropped.contains(&self.expected_seq)
-        {
+        self.packets.retain(|&seq, _| !in_range(seq));
+        self.loss_list.retain(|&seq| !in_range(seq));
+        self.loss_list_min = self
+            .loss_list
+            .iter()
+            .copied()
+            .reduce(|a, b| if sequence_less_than(a, b) { a } else { b });
+        self.refresh_delivery_seq_hint();
+
+        self.total_dropped = self.total_dropped.saturating_add(u64::from(sequence_count));
+        while self.packets.contains_key(&self.expected_seq) || in_range(self.expected_seq) {
             self.expected_seq = self.expected_seq.wrapping_add(1) & SEQUENCE_MASK;
         }
-        Ok(dropped)
+        Ok(DropRangeSummary { sequence_count })
     }
 
     /// Get the current ACK sequence number.
@@ -2056,7 +2039,7 @@ mod tests {
     }
 
     #[test]
-    fn loss_detection_builds_one_successor_view_per_reordered_receive() {
+    fn loss_detection_reports_only_new_gaps_behind_persistent_loss() {
         let mut buf = ReceiverBuffer::new(0, 120, Timestamp::from_micros(0), 0);
         buf.set_tsbpd_enabled(false);
         let now = Timestamp::from_micros(1_000);
@@ -2064,16 +2047,14 @@ mod tests {
         // Keep sequence zero missing and receive alternating packets. Every
         // later packet adds another missing run while the first hole remains.
         for (index, seq) in (1u32..128).step_by(2).enumerate() {
-            let scans_before = buf.successor_scan_calls();
             let losses = buf.receive(make_packet(seq, seq), now);
-            assert_eq!(buf.successor_scan_calls(), scans_before + 1);
             assert_eq!(losses, Some(vec![if index == 0 { 0 } else { seq - 1 }]));
         }
         assert!(buf.loss_list.contains(&0));
     }
 
     #[test]
-    fn loss_detection_reuses_one_successor_view_across_sequence_wrap() {
+    fn loss_detection_handles_sequence_wrap() {
         let mut buf = ReceiverBuffer::new(0x7FFF_FFFD, 120, Timestamp::from_micros(0), 0);
         buf.set_tsbpd_enabled(false);
         let now = Timestamp::from_micros(1_000);
@@ -2083,12 +2064,10 @@ mod tests {
             (0, vec![0x7FFF_FFFF]),
             (2, vec![1]),
         ] {
-            let scans_before = buf.successor_scan_calls();
             assert_eq!(
                 buf.receive(make_packet(seq, seq), now),
                 Some(expected_losses)
             );
-            assert_eq!(buf.successor_scan_calls(), scans_before + 1);
         }
 
         assert_eq!(
@@ -2098,9 +2077,9 @@ mod tests {
     }
 
     #[test]
-    fn receiver_packet_storage_is_fx_hash_map() {
+    fn receiver_packet_storage_is_ordered() {
         let buf = ReceiverBuffer::new(0, 120, Timestamp::from_micros(0), 0);
-        let _: &FxHashMap<u32, ReceivedPacket> = &buf.packets;
+        let _: &BTreeMap<u32, ReceivedPacket> = &buf.packets;
     }
 
     #[test]
@@ -2120,7 +2099,6 @@ mod tests {
         }
 
         assert_eq!(buf.delivery_scan_calls(), 0);
-        assert_eq!(buf.successor_scan_calls(), 0);
     }
 
     #[test]
@@ -2176,7 +2154,7 @@ mod tests {
     }
 
     #[test]
-    fn tlpktdrop_reuses_one_delivery_view_for_multiple_losses() {
+    fn tlpktdrop_handles_multiple_losses() {
         let start = Timestamp::from_micros(1_000_000);
         let mut buf = ReceiverBuffer::new(1000, 120, start, 500_000);
         let received_at = Timestamp::from_micros(1_000_000);
@@ -2191,10 +2169,8 @@ mod tests {
             FxHashSet::from_iter([1000, 1001, 1003, 1005])
         );
 
-        let scans_before = buf.successor_scan_calls();
         let dropped = buf.drop_too_late(Timestamp::from_micros(2_000_000));
 
-        assert_eq!(buf.successor_scan_calls(), scans_before + 1);
         assert_eq!(
             FxHashSet::from_iter(dropped),
             FxHashSet::from_iter([1000, 1001, 1003, 1005])
@@ -2204,16 +2180,14 @@ mod tests {
     }
 
     #[test]
-    fn tlpktdrop_without_losses_does_not_construct_delivery_view() {
+    fn tlpktdrop_without_losses_is_empty() {
         let mut buf = ReceiverBuffer::new(0, 120, Timestamp::from_micros(0), 0);
         buf.set_tsbpd_enabled(true);
 
-        let scans_before = buf.successor_scan_calls();
         assert!(
             buf.drop_too_late(Timestamp::from_micros(2_000_000))
                 .is_empty()
         );
-        assert_eq!(buf.successor_scan_calls(), scans_before);
     }
 
     /// TLPKTDROP で諦めたシーケンス (1000) が expected_seq に永久に張り付き、
@@ -2724,7 +2698,7 @@ mod tests {
         buf.receive(make_packet(102, 3_000), Timestamp::from_micros(3_000));
 
         let dropped = buf.drop_range(100, 102).expect("bounded range");
-        assert_eq!(dropped, vec![100, 101, 102]);
+        assert_eq!(dropped.sequence_count, 3);
 
         // Packets gone — nothing ready even well past TSBPD.
         assert!(buf.pop_ready(Timestamp::from_micros(10_000_000)).is_none());
@@ -2754,7 +2728,68 @@ mod tests {
         let dropped = buf
             .drop_range(0x7FFF_FFFE, 0)
             .expect("three wrapped packets fit the receive window");
-        assert_eq!(dropped, vec![0x7FFF_FFFE, 0x7FFF_FFFF, 0]);
+        assert_eq!(dropped.sequence_count, 3);
         assert_eq!(buf.expected_sequence(), 1);
+    }
+
+    #[test]
+    fn drop_range_repairs_deleted_delivery_hint() {
+        let now = Timestamp::from_micros(1_000);
+        let mut buf = ReceiverBuffer::new(100, 120, Timestamp::from_micros(0), 0);
+        buf.set_tsbpd_enabled(false);
+        for seq in 100..103 {
+            buf.receive(make_packet(seq, seq), now);
+        }
+        assert_eq!(buf.delivery_seq_hint, Some(100));
+
+        buf.drop_range(100, 100).expect("single-packet range");
+        assert_eq!(buf.delivery_seq_hint, Some(101));
+        let scans_before = buf.delivery_scan_calls();
+        assert_eq!(
+            buf.pop_ready(now).map(|packet| packet.sequence_number),
+            Some(101)
+        );
+        assert_eq!(
+            buf.pop_ready(now).map(|packet| packet.sequence_number),
+            Some(102)
+        );
+        assert_eq!(buf.delivery_scan_calls(), scans_before);
+    }
+
+    #[test]
+    fn drop_range_bulk_clears_dense_maximum_window() {
+        let now = Timestamp::from_micros(1_000);
+        let mut buf = ReceiverBuffer::new(0, 120, Timestamp::from_micros(0), 0);
+        buf.set_tsbpd_enabled(false);
+        buf.receive(make_packet(DEFAULT_FLOW_WINDOW - 1, 1), now);
+        assert_eq!(buf.loss_list.len(), (DEFAULT_FLOW_WINDOW - 1) as usize);
+
+        let summary = buf
+            .drop_range(0, DEFAULT_FLOW_WINDOW - 1)
+            .expect("maximum legal range");
+        assert_eq!(summary.sequence_count, DEFAULT_FLOW_WINDOW);
+        assert!(buf.loss_list.is_empty());
+        assert!(buf.packets.is_empty());
+        assert_eq!(buf.loss_list_min, None);
+        assert_eq!(buf.delivery_seq_hint, None);
+        assert_eq!(buf.expected_sequence(), DEFAULT_FLOW_WINDOW);
+    }
+
+    #[test]
+    fn drop_range_bulk_clears_mixed_packet_and_loss_state() {
+        let now = Timestamp::from_micros(1_000);
+        let mut buf = ReceiverBuffer::with_buffer_size(100, 120, Timestamp::from_micros(0), 0, 8);
+        buf.set_tsbpd_enabled(false);
+        for seq in [100, 102, 104] {
+            buf.receive(make_packet(seq, seq), now);
+        }
+
+        let summary = buf.drop_range(101, 103).expect("bounded mixed range");
+        assert_eq!(summary.sequence_count, 3);
+        assert!(!buf.packets.contains_key(&102));
+        assert!(buf.packets.contains_key(&104));
+        assert!(!buf.loss_list.contains(&101));
+        assert!(!buf.loss_list.contains(&103));
+        assert_eq!(buf.expected_sequence(), 105);
     }
 }
