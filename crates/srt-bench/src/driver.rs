@@ -4,6 +4,7 @@
 //! exists only to pump one `SrtConnection` against a real UDP socket long
 //! enough to prove wire-level interop against real libsrt.
 
+use bytes::Bytes;
 use shiguredo_srt::{ConnectionEvent, ConnectionOutput, SrtConnection, TimerId, Timestamp};
 use std::collections::HashMap;
 use std::net::UdpSocket;
@@ -12,7 +13,7 @@ use std::time::Instant;
 pub struct DriverResult {
     pub connected: bool,
     pub events: Vec<String>,
-    pub received_payloads: Vec<Vec<u8>>,
+    pub received_payloads: Vec<Bytes>,
 }
 
 /// Drive `conn` against `socket` until `Connected`, a fatal error/disconnect,
@@ -83,14 +84,14 @@ pub fn run(
         drain_outputs(conn, socket, &mut timers, t);
 
         while let Some(ev) = conn.poll_event() {
-            match &ev {
+            match ev {
                 ConnectionEvent::Connected => {
                     connected = true;
                     events.push("Connected".to_string());
                 }
                 ConnectionEvent::DataReceived { payload, .. } => {
                     events.push(format!("DataReceived({} bytes)", payload.len()));
-                    received_payloads.push(payload.clone());
+                    received_payloads.push(payload);
                 }
                 ConnectionEvent::Disconnected { reason } => {
                     events.push(format!("Disconnected: {reason}"));

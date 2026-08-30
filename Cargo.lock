@@ -2077,6 +2077,7 @@ name = "srt-bench"
 version = "0.0.0"
 dependencies = [
  "async-executor",
+ "bytes",
  "compio",
  "futures-lite 2.6.1",
  "glommio",
