@@ -93,6 +93,55 @@ fn find_connected_event(conn: &mut SrtConnection) -> bool {
 }
 
 #[test]
+fn received_bytes_fan_out_to_multiple_shared_sends() {
+    let mut upstream_caller = SrtConnection::new_caller(test_options());
+    let mut upstream_listener = SrtConnection::new_listener(test_options());
+    let mut downstream_a_caller = SrtConnection::new_caller(test_options());
+    let mut downstream_a_listener = SrtConnection::new_listener(test_options());
+    let mut downstream_b_caller = SrtConnection::new_caller(test_options());
+    let mut downstream_b_listener = SrtConnection::new_listener(test_options());
+
+    establish_connection(&mut upstream_caller, &mut upstream_listener).expect("upstream pair");
+    establish_connection(&mut downstream_a_caller, &mut downstream_a_listener)
+        .expect("first downstream pair");
+    establish_connection(&mut downstream_b_caller, &mut downstream_b_listener)
+        .expect("second downstream pair");
+
+    let now = ts(20_000);
+    upstream_caller
+        .send(b"fan-out payload", now)
+        .expect("upstream send");
+    transfer_caller_to_listener(&mut upstream_caller, &mut upstream_listener, now);
+    let payload = std::iter::from_fn(|| upstream_listener.poll_event())
+        .find_map(|event| match event {
+            ConnectionEvent::DataReceived { payload, .. } => Some(payload),
+            _ => None,
+        })
+        .expect("upstream delivery");
+    let original_ptr = payload.as_ptr();
+
+    downstream_a_caller
+        .send_shared(payload.clone(), now)
+        .expect("first shared send");
+    downstream_b_caller
+        .send_shared(payload.clone(), now)
+        .expect("second shared send");
+    assert_eq!(payload.as_ptr(), original_ptr);
+    assert_eq!(payload.as_ref(), b"fan-out payload");
+
+    transfer_caller_to_listener(&mut downstream_a_caller, &mut downstream_a_listener, now);
+    transfer_caller_to_listener(&mut downstream_b_caller, &mut downstream_b_listener, now);
+    assert_eq!(
+        collect_received_data(&mut downstream_a_listener),
+        vec![b"fan-out payload".to_vec()]
+    );
+    assert_eq!(
+        collect_received_data(&mut downstream_b_listener),
+        vec![b"fan-out payload".to_vec()]
+    );
+}
+
+#[test]
 fn public_connection_and_telemetry_are_send_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
 
@@ -118,7 +167,7 @@ fn collect_received_data(conn: &mut SrtConnection) -> Vec<Vec<u8>> {
     let mut data = Vec::new();
     while let Some(event) = conn.poll_event() {
         if let ConnectionEvent::DataReceived { payload, .. } = event {
-            data.push(payload);
+            data.push(payload.to_vec());
         }
     }
     data
@@ -948,7 +997,7 @@ fn connection_stats_cover_restream_quality_inputs() {
         message_number: 3,
         timestamp: 130_000,
         dest_socket_id: listener.socket_id(),
-        payload: vec![1, 2, 3],
+        payload: vec![1, 2, 3].into(),
     };
     let mut encoded = Vec::new();
     undecryptable.encode(&mut encoded);
@@ -987,7 +1036,7 @@ fn encrypted_connection_counts_and_rejects_plaintext_data() {
         message_number: 1,
         timestamp: 100_000,
         dest_socket_id: listener.socket_id(),
-        payload: b"must be encrypted".to_vec(),
+        payload: b"must be encrypted".to_vec().into(),
     };
     let mut encoded = Vec::new();
     plaintext.encode(&mut encoded);
@@ -1601,4 +1650,56 @@ fn dropreq_drops_receiver_message() {
     }
     let received = collect_received_data(&mut listener);
     assert!(received.is_empty(), "dropped message should not reassemble");
+}
+
+#[test]
+fn dropreq_rejects_high_bit_endpoints() {
+    for (first_seq, last_seq) in [(0x8000_0000, 0), (0, 0x8000_0000)] {
+        let mut caller = SrtConnection::new_caller(test_options());
+        let mut listener = SrtConnection::new_listener(test_options());
+        establish_connection(&mut caller, &mut listener).expect("connected");
+
+        let mut dropreq = shiguredo_srt::ControlPacket::new(
+            shiguredo_srt::ControlType::DropReq,
+            100,
+            listener.socket_id(),
+        );
+        let mut cif = Vec::with_capacity(8);
+        shiguredo_srt::write_u32(&mut cif, first_seq);
+        shiguredo_srt::write_u32(&mut cif, last_seq);
+        dropreq.control_info = cif;
+        let mut encoded = Vec::new();
+        dropreq.encode(&mut encoded);
+
+        let error = listener
+            .feed_recv_buf(&encoded, ts(100_000))
+            .expect_err("DROPREQ endpoints must be 31-bit sequence numbers");
+        assert_eq!(error.kind, ErrorKind::InvalidData);
+        assert_eq!(listener.state(), ConnectionState::Connected);
+    }
+}
+
+#[test]
+fn dropreq_rejects_range_larger_than_receive_window() {
+    let mut caller = SrtConnection::new_caller(test_options());
+    let mut listener = SrtConnection::new_listener(test_options());
+    establish_connection(&mut caller, &mut listener).expect("connected");
+
+    let mut dropreq = shiguredo_srt::ControlPacket::new(
+        shiguredo_srt::ControlType::DropReq,
+        100,
+        listener.socket_id(),
+    );
+    let mut cif = Vec::with_capacity(8);
+    shiguredo_srt::write_u32(&mut cif, 0);
+    shiguredo_srt::write_u32(&mut cif, 0x7FFF_FFFF);
+    dropreq.control_info = cif;
+    let mut encoded = Vec::new();
+    dropreq.encode(&mut encoded);
+
+    let error = listener
+        .feed_recv_buf(&encoded, ts(100_000))
+        .expect_err("DROPREQ range must fit the negotiated receive window");
+    assert_eq!(error.kind, ErrorKind::InvalidData);
+    assert_eq!(listener.state(), ConnectionState::Connected);
 }

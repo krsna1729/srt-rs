@@ -2,17 +2,10 @@
 //!
 //! The plan's original wording asks for "zero allocations in the
 //! steady-state packet loop." That is not what this crate does today, and
-//! is not what it commits to: `SenderBuffer`/`ReceiverBuffer` use
-//! `BTreeMap<u32, T>` for in-flight packet storage, inherited from the
-//! vendored shiguredo/srt-rs fork, and a Cargo-workspace-local investigation
-//! (three implemented, benchmarked, and reverted attempts -- see git log
-//! around this file's introduction) confirmed a fixed-capacity ring buffer
-//! replacement has no measurable steady-state win and a severe regression
-//! at connection-setup time (eager full-flow-window allocation, ~700us vs
-//! BTreeMap's ~0). The design accepts this
-//! kind of gap: the vendored Core is kept rebaseable against upstream
-//! rather than reshaped to hit an idealized
-//! three-allocation-points memory model.
+//! is not what it commits to: wire encoding, receive-buffer insertion, and
+//! application-event ownership still require bounded allocations. The hot
+//! path does preserve decoded payload ownership as `Bytes`, however, and it
+//! must not add intermediate per-packet collections or copies.
 //!
 //! What this test actually guards, and why that's still meaningful:
 //! per-packet allocation count in steady state must stay **bounded and
@@ -22,7 +15,7 @@
 //! quietly accumulating unbounded state and allocating more per packet the
 //! longer a connection lives.
 //!
-//! Measured **9 allocations/packet**, flat, crate-side only -- the
+//! Measured **5 allocations/packet**, flat, crate-side only -- the
 //! `forward_sent` helper below deliberately avoids collecting `poll_output()`
 //! results into an intermediate `Vec` (an earlier version of this test did,
 //! and that harness-side `Vec<Vec<u8>>` allocation was itself inflating the
@@ -148,15 +141,14 @@ fn steady_state_allocations_stay_bounded_and_flat() {
     eprintln!("per-packet allocations by window: {window_allocs:?}");
     eprintln!("first half avg: {first_half_avg}, second half avg: {second_half_avg}");
 
-    // Bounded: generous ceiling above the 9 allocations/packet measured
-    // crate-side (payload copy for buffering, encode buffers, receiver-side
-    // insert, ready-packet collection -- see this file's module doc) --
+    // Bounded: generous ceiling above the 5 allocations/packet measured
+    // crate-side (wire encode/decode and receiver/event storage) --
     // this is a regression guard, not a tight budget.
     for &allocs in &window_allocs {
         assert!(
-            allocs <= 20,
+            allocs <= 12,
             "per-packet allocation count grew unexpectedly: {window_allocs:?} \
-             (window value {allocs} exceeds the 20/packet ceiling)"
+             (window value {allocs} exceeds the 12/packet ceiling)"
         );
     }
 

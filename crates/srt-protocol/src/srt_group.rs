@@ -60,8 +60,8 @@ pub struct GroupPacket {
     pub message_number: u32,
     /// The sender's timestamp, in the units defined by the SRT wire format.
     pub timestamp: u32,
-    /// The payload bytes.
-    pub payload: Vec<u8>,
+    /// Reference-counted payload bytes.
+    pub payload: Bytes,
 }
 
 /// One physical-leg event observed while driving an SRT group.

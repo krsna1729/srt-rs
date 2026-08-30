@@ -89,7 +89,7 @@ fn ack_round_trips(rig: &mut FanoutRig, now: Timestamp) {
     }
 }
 
-fn upstream_recv(rig: &mut FanoutRig, now: Timestamp) -> Vec<u8> {
+fn upstream_recv(rig: &mut FanoutRig, now: Timestamp) -> Bytes {
     let payload = [0x42u8; PAYLOAD_SIZE];
     rig.upstream_caller
         .send(black_box(&payload), now)
@@ -142,7 +142,7 @@ fn run_fanout_send_shared(rig: &mut FanoutRig, batch_size: u64) {
     for i in 0..batch_size {
         let now = ts(now_us);
         let rx_payload = upstream_recv(rig, now);
-        let shared = Bytes::from(rx_payload);
+        let shared = rx_payload;
 
         for (caller, listener) in &mut rig.downstream {
             caller

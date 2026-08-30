@@ -46,7 +46,7 @@ fn make_packet(seq: u32, timestamp: u32) -> DataPacket {
         message_number: seq & 0x03FF_FFFF,
         timestamp,
         dest_socket_id: 1,
-        payload: vec![0x42u8; PAYLOAD_SIZE],
+        payload: vec![0x42u8; PAYLOAD_SIZE].into(),
     }
 }
 

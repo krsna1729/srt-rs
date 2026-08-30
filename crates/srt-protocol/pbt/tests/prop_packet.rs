@@ -44,7 +44,7 @@ fn arb_data_packet() -> impl Strategy<Value = DataPacket> {
                     message_number,
                     timestamp,
                     dest_socket_id,
-                    payload,
+                    payload: payload.into(),
                 }
             },
         )
@@ -151,7 +151,7 @@ proptest! {
         payload_len in 0usize..1000usize,
     ) {
         let payload = vec![0u8; payload_len];
-        let packet = DataPacket::new(seq, msg, ts, sock_id, payload.clone());
+        let packet = DataPacket::new(seq, msg, ts, sock_id, payload.clone().into());
 
         // sequence_number は 31 ビットにマスクされる
         prop_assert_eq!(packet.sequence_number, seq & 0x7FFF_FFFF);

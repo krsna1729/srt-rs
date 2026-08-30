@@ -1,7 +1,8 @@
 use crate::srt_packet::{DataPacket, PacketPosition};
+use bytes::Bytes;
 
 pub(crate) struct AssembledMessage {
-    pub payload: Vec<u8>,
+    pub payload: Bytes,
     pub message_number: u32,
     pub timestamp: u32,
     pub first_sequence_number: u32,
@@ -11,7 +12,7 @@ struct PartialMessage {
     message_number: u32,
     first_sequence_number: u32,
     next_expected_seq: u32,
-    fragments: Vec<Vec<u8>>,
+    fragments: Vec<Bytes>,
     timestamp: u32,
 }
 
@@ -70,13 +71,17 @@ impl MessageAssembler {
                 if matched {
                     let mut partial = self.pending.take().unwrap();
                     partial.fragments.push(packet.payload);
-                    let total_len: usize = partial.fragments.iter().map(|f| f.len()).sum();
+                    let total_len: usize = partial
+                        .fragments
+                        .iter()
+                        .map(|fragment| fragment.len())
+                        .sum();
                     let mut payload = Vec::with_capacity(total_len);
-                    for frag in partial.fragments {
-                        payload.extend_from_slice(&frag);
+                    for fragment in partial.fragments {
+                        payload.extend_from_slice(&fragment);
                     }
                     Some(AssembledMessage {
-                        payload,
+                        payload: payload.into(),
                         message_number: partial.message_number,
                         timestamp: partial.timestamp,
                         first_sequence_number: partial.first_sequence_number,
@@ -114,7 +119,7 @@ mod tests {
             message_number: msg,
             timestamp: 1000,
             dest_socket_id: 1,
-            payload,
+            payload: payload.into(),
         }
     }
 

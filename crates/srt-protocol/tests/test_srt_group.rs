@@ -165,7 +165,7 @@ fn broadcast_receive_deduplicates_and_advances_other_links() {
         .unwrap();
 
     let delivered = group.poll_data(ts(120_000)).unwrap();
-    assert_eq!(delivered.payload, b"hello");
+    assert_eq!(delivered.payload.as_ref(), b"hello");
     // Second copy is deduplicated — only one delivery.
     assert!(group.poll_data(ts(120_000)).is_none());
 }
@@ -262,8 +262,14 @@ fn backup_delivers_standby_payload_arriving_with_active_shutdown() {
         .feed_recv_buf(&backup_packet, ts(102_000))
         .unwrap();
 
-    assert_eq!(group.poll_data(ts(103_000)).unwrap().payload, b"primary");
-    assert_eq!(group.poll_data(ts(103_000)).unwrap().payload, b"backup");
+    assert_eq!(
+        group.poll_data(ts(103_000)).unwrap().payload.as_ref(),
+        b"primary"
+    );
+    assert_eq!(
+        group.poll_data(ts(103_000)).unwrap().payload.as_ref(),
+        b"backup"
+    );
     assert_eq!(group.member(2).unwrap().state(), GroupMemberState::Active);
 }
 

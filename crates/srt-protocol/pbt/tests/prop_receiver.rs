@@ -14,7 +14,7 @@ fn make_packet(seq: u32, timestamp: u32) -> DataPacket {
         message_number: 1,
         timestamp,
         dest_socket_id: 1,
-        payload: vec![1, 2, 3],
+        payload: vec![1, 2, 3].into(),
     }
 }
 
@@ -29,7 +29,7 @@ fn make_packet_with_payload(seq: u32, timestamp: u32, payload: Vec<u8>) -> DataP
         message_number: 1,
         timestamp,
         dest_socket_id: 1,
-        payload,
+        payload: payload.into(),
     }
 }
 
