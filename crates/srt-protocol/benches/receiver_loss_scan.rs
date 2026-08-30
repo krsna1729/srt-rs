@@ -22,7 +22,7 @@
 //! after every receive, matching how a real connection's message loop
 //! calls it.
 
-use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use shiguredo_srt::{DataPacket, PacketPosition, ReceiverBuffer, Timestamp};
 use std::hint::black_box;
 
@@ -148,5 +148,64 @@ fn bench_burst_receive(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_lossy_receive, bench_burst_receive);
+fn receiver_with_dense_loss(initial_seq: u32, last_seq: u32) -> ReceiverBuffer {
+    let mut receiver = ReceiverBuffer::new(initial_seq, 120, ts(0), 0);
+    receiver.set_tsbpd_enabled(false);
+    let _ = receiver.receive(make_packet(last_seq, 1), ts(1));
+    receiver
+}
+
+fn receiver_with_mixed_state() -> ReceiverBuffer {
+    let mut receiver = ReceiverBuffer::new(0, 120, ts(0), 0);
+    receiver.set_tsbpd_enabled(false);
+    for seq in (1..8192).step_by(2) {
+        let _ = receiver.receive(make_packet(seq, seq), ts(u64::from(seq) + 1));
+    }
+    receiver
+}
+
+/// Maximum legal DROPREQ coverage. Setup is excluded so these cases isolate
+/// the in-place range mutation for empty, dense-loss, mixed, and wrapped state.
+fn bench_drop_range(c: &mut Criterion) {
+    let mut group = c.benchmark_group("receiver_drop_range");
+    group.throughput(Throughput::Elements(8192));
+    group.sample_size(30);
+
+    group.bench_function("max_legal/empty", |b| {
+        b.iter_batched(
+            || ReceiverBuffer::new(0, 120, ts(0), 0),
+            |mut receiver| black_box(receiver.drop_range(0, 8191)).unwrap(),
+            BatchSize::SmallInput,
+        );
+    });
+    group.bench_function("max_legal/dense_loss", |b| {
+        b.iter_batched(
+            || receiver_with_dense_loss(0, 8191),
+            |mut receiver| black_box(receiver.drop_range(0, 8191)).unwrap(),
+            BatchSize::SmallInput,
+        );
+    });
+    group.bench_function("max_legal/mixed_packets_and_losses", |b| {
+        b.iter_batched(
+            receiver_with_mixed_state,
+            |mut receiver| black_box(receiver.drop_range(0, 8191)).unwrap(),
+            BatchSize::SmallInput,
+        );
+    });
+    group.bench_function("max_legal/wrap_crossing", |b| {
+        b.iter_batched(
+            || receiver_with_dense_loss(0x7FFF_F000, 0x0FFF),
+            |mut receiver| black_box(receiver.drop_range(0x7FFF_F000, 0x0FFF)).unwrap(),
+            BatchSize::SmallInput,
+        );
+    });
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_lossy_receive,
+    bench_burst_receive,
+    bench_drop_range
+);
 criterion_main!(benches);
