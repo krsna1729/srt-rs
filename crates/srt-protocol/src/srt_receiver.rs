@@ -352,6 +352,10 @@ pub struct NakPacket {
 pub struct DropRangeSummary {
     /// Number of sequence positions covered by the request.
     pub sequence_count: u32,
+    /// Number of buffered packets actually removed.
+    pub packets_removed: u32,
+    /// Number of recorded losses actually removed.
+    pub losses_removed: u32,
 }
 
 /// Receive buffer.
@@ -1203,21 +1207,65 @@ impl ReceiverBuffer {
         let distance = self.validate_drop_range(first_seq, last_seq)?;
         let sequence_count = distance + 1;
         let in_range = |seq: u32| seq.wrapping_sub(first_seq) & SEQUENCE_MASK <= distance;
+        let hint_was_dropped = self.delivery_seq_hint.is_some_and(in_range);
 
-        self.packets.retain(|&seq, _| !in_range(seq));
-        self.loss_list.retain(|&seq| !in_range(seq));
-        self.loss_list_min = self
-            .loss_list
-            .iter()
-            .copied()
-            .reduce(|a, b| if sequence_less_than(a, b) { a } else { b });
-        self.refresh_delivery_seq_hint();
+        // Remove only packet keys that lie in the requested numeric interval.
+        // A circular range has at most two such intervals. Repeating a range
+        // successor lookup after each removal is O(k log n), where k is the
+        // number of requested sequence positions (bounded by the negotiated
+        // receive window), independent of unrelated retained TSBPD packets.
+        let mut packets_removed = 0u32;
+        if first_seq <= last_seq {
+            while let Some(seq) = self
+                .packets
+                .range(first_seq..=last_seq)
+                .next()
+                .map(|(&seq, _)| seq)
+            {
+                self.packets.remove(&seq);
+                packets_removed += 1;
+            }
+        } else {
+            while let Some(seq) = self.packets.range(first_seq..).next().map(|(&seq, _)| seq) {
+                self.packets.remove(&seq);
+                packets_removed += 1;
+            }
+            while let Some(seq) = self.packets.range(..=last_seq).next().map(|(&seq, _)| seq) {
+                self.packets.remove(&seq);
+                packets_removed += 1;
+            }
+        }
+
+        let removed_loss_min = self.loss_list_min.is_some_and(in_range);
+        let mut losses_removed = 0u32;
+        let mut seq = first_seq;
+        for _ in 0..sequence_count {
+            if self.loss_list.remove(&seq) {
+                losses_removed += 1;
+            }
+            seq = seq.wrapping_add(1) & SEQUENCE_MASK;
+        }
+        if removed_loss_min {
+            self.loss_list_min = self
+                .loss_list
+                .iter()
+                .copied()
+                .reduce(|a, b| if sequence_less_than(a, b) { a } else { b });
+        }
+
+        if hint_was_dropped {
+            self.delivery_seq_hint = self.next_sequence_after(last_seq);
+        }
 
         self.total_dropped = self.total_dropped.saturating_add(u64::from(sequence_count));
         while self.packets.contains_key(&self.expected_seq) || in_range(self.expected_seq) {
             self.expected_seq = self.expected_seq.wrapping_add(1) & SEQUENCE_MASK;
         }
-        Ok(DropRangeSummary { sequence_count })
+        Ok(DropRangeSummary {
+            sequence_count,
+            packets_removed,
+            losses_removed,
+        })
     }
 
     /// Get the current ACK sequence number.
@@ -2699,6 +2747,8 @@ mod tests {
 
         let dropped = buf.drop_range(100, 102).expect("bounded range");
         assert_eq!(dropped.sequence_count, 3);
+        assert_eq!(dropped.packets_removed, 2);
+        assert_eq!(dropped.losses_removed, 1);
 
         // Packets gone — nothing ready even well past TSBPD.
         assert!(buf.pop_ready(Timestamp::from_micros(10_000_000)).is_none());
@@ -2754,6 +2804,82 @@ mod tests {
             Some(102)
         );
         assert_eq!(buf.delivery_scan_calls(), scans_before);
+    }
+
+    #[test]
+    fn wrapped_drop_range_repairs_hint_to_successor_after_range() {
+        const MAX_SEQUENCE: u32 = 0x7FFF_FFFF;
+        let now = Timestamp::from_micros(1_000);
+        let mut buf = ReceiverBuffer::new(MAX_SEQUENCE - 2, 120, Timestamp::from_micros(0), 0);
+        buf.set_tsbpd_enabled(false);
+        for seq in [MAX_SEQUENCE - 2, MAX_SEQUENCE - 1, MAX_SEQUENCE, 0, 1, 2] {
+            buf.receive(make_packet(seq, seq), now);
+        }
+        assert_eq!(buf.delivery_seq_hint, Some(MAX_SEQUENCE - 2));
+
+        let summary = buf
+            .drop_range(MAX_SEQUENCE - 2, 0)
+            .expect("bounded wrapped range");
+        assert_eq!(summary.sequence_count, 4);
+        assert_eq!(summary.packets_removed, 4);
+        assert_eq!(buf.delivery_seq_hint, Some(1));
+        let scans_before = buf.delivery_scan_calls();
+        assert_eq!(
+            buf.pop_ready(now).map(|packet| packet.sequence_number),
+            Some(1)
+        );
+        assert_eq!(
+            buf.pop_ready(now).map(|packet| packet.sequence_number),
+            Some(2)
+        );
+        assert_eq!(buf.delivery_scan_calls(), scans_before);
+    }
+
+    #[test]
+    fn tiny_drop_range_is_local_with_many_future_tsbpd_packets() {
+        const RETAINED_PACKETS: u32 = 32_768;
+        const DROPPED_SEQUENCE: u32 = RETAINED_PACKETS / 2;
+        let received_at = Timestamp::from_micros(1);
+        let mut buf = ReceiverBuffer::new(0, 120, Timestamp::from_micros(0), 0);
+
+        // In-order receive advances expected_seq even though future TSBPD
+        // timestamps keep every packet retained. This deliberately exceeds
+        // the negotiated flow window and exercises the state shape that made
+        // a whole-map DROPREQ scan unsafe.
+        for seq in 0..RETAINED_PACKETS {
+            buf.receive(make_packet(seq, 1_000_000_000 + seq), received_at);
+        }
+        assert_eq!(buf.packets.len(), RETAINED_PACKETS as usize);
+        assert!(buf.packets.len() > buf.max_buffer_size as usize);
+        assert_eq!(buf.delivery_seq_hint, Some(0));
+
+        let summary = buf
+            .drop_range(DROPPED_SEQUENCE, DROPPED_SEQUENCE)
+            .expect("single-sequence range");
+        assert_eq!(summary.sequence_count, 1);
+        assert_eq!(summary.packets_removed, 1);
+        assert_eq!(summary.losses_removed, 0);
+        assert_eq!(buf.packets.len(), RETAINED_PACKETS as usize - 1);
+        assert!(!buf.packets.contains_key(&DROPPED_SEQUENCE));
+        assert_eq!(buf.delivery_seq_hint, Some(0));
+    }
+
+    #[test]
+    fn drop_range_keeps_or_repairs_loss_min_as_needed() {
+        let now = Timestamp::from_micros(1_000);
+        let mut buf = ReceiverBuffer::new(100, 120, Timestamp::default(), 0);
+        buf.set_tsbpd_enabled(false);
+        buf.receive(make_packet(103, 1), now);
+        assert_eq!(buf.loss_list_min, Some(100));
+
+        let non_min = buf.drop_range(101, 101).expect("non-minimum loss");
+        assert_eq!(non_min.losses_removed, 1);
+        assert_eq!(buf.loss_list_min, Some(100));
+
+        let minimum = buf.drop_range(100, 100).expect("minimum loss");
+        assert_eq!(minimum.losses_removed, 1);
+        assert_eq!(buf.loss_list_min, Some(102));
+        assert_eq!(buf.generate_periodic_nak().unwrap().loss_list, vec![102]);
     }
 
     #[test]

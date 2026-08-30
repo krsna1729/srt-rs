@@ -1,7 +1,10 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use shiguredo_srt::{ConnectionOptions, ConnectionOutput, SrtConnection, TimerId, Timestamp};
+use shiguredo_srt::{
+    ConnectionOptions, ConnectionOutput, ControlPacket, ControlType, SrtConnection, TimerId,
+    Timestamp, write_u32,
+};
 
 fn transfer(from: &mut SrtConnection, to: &mut SrtConnection, now: Timestamp) {
     while let Some(output) = from.poll_output() {
@@ -40,6 +43,23 @@ fn timer(selector: u8) -> TimerId {
     }
 }
 
+fn feed_drop_req(target: &mut SrtConnection, input: &[u8], now: Timestamp) {
+    if input.len() < 6 {
+        return;
+    }
+    const SEQUENCE_MASK: u32 = 0x7FFF_FFFF;
+    let first_seq = u32::from_le_bytes(input[..4].try_into().unwrap()) & SEQUENCE_MASK;
+    let distance = u16::from_le_bytes(input[4..6].try_into().unwrap()) as u32 % 8_192;
+    let last_seq = first_seq.wrapping_add(distance) & SEQUENCE_MASK;
+    let mut packet = ControlPacket::new(ControlType::DropReq, 0, target.socket_id());
+    packet.type_specific_info = u32::from(input.get(6).copied().unwrap_or_default());
+    write_u32(&mut packet.control_info, first_seq);
+    write_u32(&mut packet.control_info, last_seq);
+    let mut encoded = Vec::new();
+    packet.encode(&mut encoded);
+    let _ = target.feed_recv_buf(&encoded, now);
+}
+
 // Start from a valid connected state, then interpret the input as a sequence
 // of structured actions. This reaches loss, ACK/NAK, timer, destination-ID,
 // delivery, and disconnect paths that a fresh listener fed only random bytes
@@ -60,7 +80,7 @@ fuzz_target!(|data: &[u8]| {
         now_us = now_us.saturating_add(u64::from(action).saturating_mul(100).max(1));
         let now = Timestamp::from_micros(now_us);
 
-        match action % 10 {
+        match action % 12 {
             0 => {
                 let _ = caller.feed_recv_buf(payload, now);
             }
@@ -94,11 +114,13 @@ fuzz_target!(|data: &[u8]| {
                     transfer(&mut caller, &mut listener, now);
                 }
             }
-            _ => {
+            9 => {
                 if listener.send_message(payload, now).is_ok() {
                     transfer(&mut listener, &mut caller, now);
                 }
             }
+            10 => feed_drop_req(&mut caller, payload, now),
+            _ => feed_drop_req(&mut listener, payload, now),
         }
         while caller.poll_event().is_some() {}
         while listener.poll_event().is_some() {}

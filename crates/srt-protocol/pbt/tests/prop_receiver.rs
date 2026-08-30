@@ -509,4 +509,45 @@ proptest! {
         // 欠損が無いため全パケットが循環順 (seqs) で配送される
         prop_assert_eq!(popped, seqs);
     }
+
+    /// DROPREQ removes exactly its circular interval, preserves every packet
+    /// outside it, and leaves delivery ordered across the sequence wrap.
+    #[test]
+    fn drop_range_preserves_outside_packets_and_order(
+        raw_start in any::<u32>(),
+        count in 1u32..64,
+        raw_drop_offset in any::<u32>(),
+        raw_drop_len in any::<u32>(),
+    ) {
+        const SEQUENCE_MASK: u32 = 0x7FFF_FFFF;
+        let start_seq = raw_start & SEQUENCE_MASK;
+        let drop_offset = raw_drop_offset % count;
+        let max_drop_len = count - drop_offset;
+        let drop_len = raw_drop_len % max_drop_len + 1;
+        let first_seq = start_seq.wrapping_add(drop_offset) & SEQUENCE_MASK;
+        let last_seq = first_seq.wrapping_add(drop_len - 1) & SEQUENCE_MASK;
+        let now = Timestamp::from_micros(1_000);
+        let mut buf = ReceiverBuffer::new(start_seq, 120, Timestamp::default(), 0);
+        buf.set_tsbpd_enabled(false);
+
+        for offset in 0..count {
+            let seq = start_seq.wrapping_add(offset) & SEQUENCE_MASK;
+            buf.receive(make_packet(seq, offset), now);
+        }
+
+        let summary = buf.drop_range(first_seq, last_seq)?;
+        prop_assert_eq!(summary.sequence_count, drop_len);
+        prop_assert_eq!(summary.packets_removed, drop_len);
+        prop_assert_eq!(summary.losses_removed, 0);
+
+        let mut delivered = Vec::new();
+        while let Some(packet) = buf.pop_ready(now) {
+            delivered.push(packet.sequence_number);
+        }
+        let expected: Vec<u32> = (0..count)
+            .filter(|&offset| offset < drop_offset || offset >= drop_offset + drop_len)
+            .map(|offset| start_seq.wrapping_add(offset) & SEQUENCE_MASK)
+            .collect();
+        prop_assert_eq!(delivered, expected);
+    }
 }
