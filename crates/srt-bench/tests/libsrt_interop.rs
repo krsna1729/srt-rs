@@ -30,6 +30,13 @@ fn interop_test_lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+fn received_payloads_match(received_payloads: &[bytes::Bytes], expected: &[u8]) -> bool {
+    received_payloads
+        .iter()
+        .flat_map(|payload| payload.iter())
+        .eq(expected.iter())
+}
+
 fn command_available(binary: &str) -> bool {
     Command::new(binary)
         .arg("-h")
@@ -769,9 +776,8 @@ fn libsrt_file_transmit_caller_sends_file_to_rust_listener() {
         "Rust listener never reached Connected: {:?}",
         result.events
     );
-    let received: Vec<u8> = result.received_payloads.into_iter().flatten().collect();
-    assert_eq!(
-        received, payload,
+    assert!(
+        received_payloads_match(&result.received_payloads, &payload),
         "payload received from real libsrt does not match the file sent byte-for-byte; driver events: {:?}",
         result.events
     );
@@ -814,9 +820,8 @@ fn libsrt_live_transmit_caller_sends_udp_to_rust_listener() {
         status.success(),
         "srt-live-transmit caller exited with failure, stderr: {stderr}"
     );
-    let received: Vec<u8> = result.received_payloads.into_iter().flatten().collect();
-    assert_eq!(
-        received, payload,
+    assert!(
+        received_payloads_match(&result.received_payloads, &payload),
         "payload received from real libsrt does not match the file sent byte-for-byte; driver events: {:?}",
         result.events
     );
@@ -850,8 +855,10 @@ fn libsrt_input_bandwidth_caller_sends_stream_to_rust_listener() {
         result.events
     );
     assert!(status.success(), "libsrt INPUTBW caller failed: {stderr}");
-    let received: Vec<u8> = result.received_payloads.into_iter().flatten().collect();
-    assert_eq!(received, payload, "libsrt INPUTBW payload mismatch");
+    assert!(
+        received_payloads_match(&result.received_payloads, &payload),
+        "libsrt INPUTBW payload mismatch"
+    );
 }
 
 /// Configure a tiny libsrt refresh cadence to prove its KMREQ and subsequent
@@ -884,9 +891,8 @@ fn libsrt_live_caller_refreshes_key_with_rust_listener() {
         status.success(),
         "libsrt key-refresh caller failed: {stderr}"
     );
-    let received: Vec<u8> = result.received_payloads.into_iter().flatten().collect();
-    assert_eq!(
-        received, payload,
+    assert!(
+        received_payloads_match(&result.received_payloads, &payload),
         "Rust listener did not decrypt through the libsrt key refresh"
     );
 }
@@ -916,9 +922,8 @@ fn libsrt_caller_recovers_payload_under_5pct_loss() {
         status.success(),
         "srt-live-transmit caller exited with failure through the lossy proxy, stderr: {stderr}"
     );
-    let received: Vec<u8> = result.received_payloads.into_iter().flatten().collect();
-    assert_eq!(
-        received, payload,
+    assert!(
+        received_payloads_match(&result.received_payloads, &payload),
         "libsrt payload did not recover byte-for-byte after deterministic 5% loss; driver events: {:?}",
         result.events
     );
@@ -948,9 +953,8 @@ fn libsrt_live_caller_aes128_to_rust_listener() {
         result.events
     );
     assert!(status.success(), "libsrt caller failed: {stderr}");
-    let received: Vec<u8> = result.received_payloads.into_iter().flatten().collect();
-    assert_eq!(
-        received, payload,
+    assert!(
+        received_payloads_match(&result.received_payloads, &payload),
         "AES-128 payload mismatch: {:?}",
         result.events
     );
@@ -980,9 +984,8 @@ fn libsrt_live_caller_aes256_to_rust_listener() {
         result.events
     );
     assert!(status.success(), "libsrt caller failed: {stderr}");
-    let received: Vec<u8> = result.received_payloads.into_iter().flatten().collect();
-    assert_eq!(
-        received, payload,
+    assert!(
+        received_payloads_match(&result.received_payloads, &payload),
         "AES-256 payload mismatch: {:?}",
         result.events
     );
@@ -1787,9 +1790,8 @@ fn libsrt_gcm_caller_sends_to_rust_listener() {
         result.events
     );
     assert!(status.success(), "libsrt GCM caller failed: {stderr}");
-    let received: Vec<u8> = result.received_payloads.into_iter().flatten().collect();
-    assert_eq!(
-        received, payload,
+    assert!(
+        received_payloads_match(&result.received_payloads, &payload),
         "Rust listener did not decrypt libsrt GCM caller's payload"
     );
 }
@@ -1869,9 +1871,8 @@ fn libsrt_live_transmit_max_payload_received_by_rust_listener() {
         status.success(),
         "srt-live-transmit caller exited with failure, stderr: {stderr}"
     );
-    let received: Vec<u8> = result.received_payloads.into_iter().flatten().collect();
-    assert_eq!(
-        received, payload,
+    assert!(
+        received_payloads_match(&result.received_payloads, &payload),
         "Rust listener did not receive the max-size libsrt message; driver events: {:?}",
         result.events
     );
