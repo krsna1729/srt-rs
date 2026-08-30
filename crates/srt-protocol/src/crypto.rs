@@ -27,6 +27,7 @@
 //! duplicate `aes`/`cipher` versions) at the versions pinned in
 //! `Cargo.toml`.
 
+use bytes::BytesMut;
 use std::fmt;
 
 use aes::{Aes128, Aes192, Aes256};
@@ -453,6 +454,58 @@ impl CryptoContext {
             payload,
             self.key_length,
         )
+    }
+
+    /// Decrypt a GCM payload in place, stripping its authentication tag.
+    ///
+    /// The mutable `BytesMut` preserves the decoded packet allocation for
+    /// delivery after authentication succeeds.
+    pub fn decrypt_gcm_detached(
+        &self,
+        packet_index: u32,
+        key_flag: KeyFlag,
+        header: &[u8; 16],
+        payload: &mut BytesMut,
+    ) -> Result<(), Error> {
+        if payload.len() < GCM_TAG_LEN {
+            return Err(Error::crypto_error("GCM payload too short for auth tag"));
+        }
+
+        let sek = match key_flag {
+            KeyFlag::Even => &self.sek_even,
+            KeyFlag::Odd => &self.sek_odd,
+        };
+        let tag_bytes = payload.split_off(payload.len() - GCM_TAG_LEN);
+        let tag: [u8; GCM_TAG_LEN] = tag_bytes
+            .as_ref()
+            .try_into()
+            .expect("GCM tag length was checked");
+        let iv = build_gcm_iv(&self.salt, packet_index);
+        let nonce = Nonce::try_from(iv.as_slice())
+            .map_err(|error| Error::crypto_error(format!("invalid GCM nonce: {error}")))?;
+
+        match self.key_length {
+            KeyLength::Aes128 => {
+                let cipher = Aes128Gcm::new_from_slice(sek)
+                    .map_err(|error| Error::crypto_error(format!("invalid SEK: {error}")))?;
+                cipher
+                    .decrypt_inout_detached(&nonce, header, payload.as_mut().into(), (&tag).into())
+                    .map_err(|_| Error::crypto_error("AES-GCM authentication failed"))?;
+            }
+            KeyLength::Aes192 => {
+                return Err(Error::crypto_error(
+                    "AES-192 is not supported with GCM mode",
+                ));
+            }
+            KeyLength::Aes256 => {
+                let cipher = Aes256Gcm::new_from_slice(sek)
+                    .map_err(|error| Error::crypto_error(format!("invalid SEK: {error}")))?;
+                cipher
+                    .decrypt_inout_detached(&nonce, header, payload.as_mut().into(), (&tag).into())
+                    .map_err(|_| Error::crypto_error("AES-GCM authentication failed"))?;
+            }
+        }
+        Ok(())
     }
 
     /// Get the KM refresh state.

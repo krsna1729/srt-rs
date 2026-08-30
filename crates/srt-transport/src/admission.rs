@@ -1058,11 +1058,10 @@ impl PeerTable {
         telemetry.record_expired_half_open(expired);
         // Only a CONTROL packet can be a handshake (SRT's F bit, the top bit
         // of the first word). Checking it here keeps `peek_handshake` -- a
-        // full `SrtPacket::decode`, which ends in `payload.to_vec()` -- off
+        // full `SrtPacket::decode`, which allocates a DATA payload -- off
         // the DATA path, which is every packet of a live stream. Without the
-        // guard each datagram is decoded twice, once here and once in
-        // `feed_recv_buf`, and the first decode's ~1.3 KB payload copy is
-        // discarded on the next line.
+        // guard each datagram is decoded twice and the first payload allocation
+        // is discarded on the next line.
         let handshake = is_control_datagram(data)
             .then(|| shiguredo_srt::peek_handshake(data))
             .flatten();

@@ -1217,7 +1217,7 @@ mod tests {
         assert_eq!(events[0].representative_peer, first);
         assert!(matches!(
             &events[0].event,
-            ConnectionEvent::DataReceived { payload, .. } if payload == b"one logical payload"
+            ConnectionEvent::DataReceived { payload, .. } if payload.as_ref() == b"one logical payload"
         ));
         let stats = table.bonded_stats();
         assert_eq!(stats.len(), 1);

@@ -6,7 +6,7 @@
 use std::collections::VecDeque;
 use std::fmt;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::buf::{read_u32, write_u32};
@@ -148,9 +148,10 @@ const LIBSRT_COMPAT_PADDING: [u8; 4] = [0, 0, 0, 0];
 pub enum ConnectionEvent {
     /// Connection established.
     Connected,
-    /// Data received.
+    /// Data received. The shared payload can be forwarded to
+    /// [`SrtConnection::send_shared`] without copying.
     DataReceived {
-        payload: Vec<u8>,
+        payload: Bytes,
         sequence_number: u32,
         message_number: u32,
         timestamp: u32,
@@ -1385,21 +1386,14 @@ impl SrtConnection {
             return;
         }
 
-        let ready_packets = {
-            let Some(receiver) = self.receiver.as_mut() else {
-                return;
+        for _ in 0..available {
+            let Some(packet) = self
+                .receiver
+                .as_mut()
+                .and_then(|receiver| receiver.pop_ready(now))
+            else {
+                break;
             };
-            let mut ready_packets = Vec::with_capacity(available);
-            for _ in 0..available {
-                let Some(packet) = receiver.pop_ready(now) else {
-                    break;
-                };
-                ready_packets.push(packet);
-            }
-            ready_packets
-        };
-
-        for packet in ready_packets {
             if let Some(msg) = self.assembler.feed(packet) {
                 self.event_queue.push_back(ConnectionEvent::DataReceived {
                     payload: msg.payload,
@@ -1495,14 +1489,21 @@ impl SrtConnection {
                     .ok_or_else(|| Error::crypto_error("invalid KK flag"))?;
                 match crypto.cipher_mode() {
                     CipherMode::Ctr => {
-                        crypto.decrypt(pkt.sequence_number, key_flag, &mut pkt.payload)?;
+                        let mut payload = pkt.payload.try_into_mut().unwrap_or_else(BytesMut::from);
+                        crypto.decrypt(pkt.sequence_number, key_flag, &mut payload)?;
+                        pkt.payload = payload.freeze();
                         Ok(())
                     }
                     CipherMode::Gcm => {
                         let aad = pkt.gcm_aad();
-                        let ciphertext = std::mem::take(&mut pkt.payload);
-                        pkt.payload =
-                            crypto.decrypt_gcm(pkt.sequence_number, key_flag, &aad, ciphertext)?;
+                        let mut payload = pkt.payload.try_into_mut().unwrap_or_else(BytesMut::from);
+                        crypto.decrypt_gcm_detached(
+                            pkt.sequence_number,
+                            key_flag,
+                            &aad,
+                            &mut payload,
+                        )?;
+                        pkt.payload = payload.freeze();
                         Ok(())
                     }
                 }
@@ -2018,6 +2019,8 @@ impl SrtConnection {
     }
 
     fn handle_drop_req(&mut self, pkt: ControlPacket, now: Timestamp) -> Result<(), Error> {
+        const SEQUENCE_MASK: u32 = 0x7FFF_FFFF;
+
         let message_number = pkt.type_specific_info & 0x03FF_FFFF;
         if pkt.control_info.len() < 8 {
             return Err(Error::invalid_data("DROPREQ CIF too short"));
@@ -2025,9 +2028,15 @@ impl SrtConnection {
         let mut buf = &pkt.control_info[..];
         let first_seq = read_u32(&mut buf)?;
         let last_seq = read_u32(&mut buf)?;
+        if first_seq & !SEQUENCE_MASK != 0 || last_seq & !SEQUENCE_MASK != 0 {
+            return Err(Error::invalid_data("DROPREQ sequence has high bit set"));
+        }
 
+        if let Some(receiver) = self.receiver.as_ref() {
+            receiver.validate_drop_range(first_seq, last_seq)?;
+        }
         if let Some(receiver) = self.receiver.as_mut() {
-            receiver.drop_range(first_seq, last_seq);
+            receiver.drop_range(first_seq, last_seq)?;
         }
         self.assembler.drop_message(message_number);
         self.enqueue_ready_data(now);
@@ -3038,7 +3047,7 @@ mod tests {
         while conn.poll_output().is_some() {}
 
         conn.handle_data_packet(
-            DataPacket::new(0, 0, 0, 0, b"queued".to_vec()),
+            DataPacket::new(0, 0, 0, 0, b"queued".to_vec().into()),
             Timestamp::from_micros(1),
         )
         .expect("packet is buffered for TSBPD");
@@ -3047,7 +3056,7 @@ mod tests {
         conn.disconnect(Timestamp::from_micros(2));
 
         assert!(std::iter::from_fn(|| conn.poll_event()).any(
-            |event| matches!(event, ConnectionEvent::DataReceived { payload, .. } if payload == b"queued")
+            |event| matches!(event, ConnectionEvent::DataReceived { payload, .. } if payload.as_ref() == b"queued")
         ));
         assert_eq!(conn.state(), ConnectionState::Closing);
     }
@@ -3182,7 +3191,7 @@ mod tests {
         // while keeping only two payloads in the application queue.
         for sequence_number in 0..32 {
             conn.handle_data_packet(
-                DataPacket::new(sequence_number, sequence_number, 0, 0, vec![1]),
+                DataPacket::new(sequence_number, sequence_number, 0, 0, vec![1].into()),
                 now,
             )
             .expect("data is accepted");

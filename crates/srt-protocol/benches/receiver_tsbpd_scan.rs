@@ -18,7 +18,7 @@ fn run_tsbpd(tsbpd_delay_ms: u16) {
             sequence_number,
             now_us as u32,
             1,
-            vec![0x42; PAYLOAD_SIZE],
+            vec![0x42; PAYLOAD_SIZE].into(),
         );
 
         black_box(receiver.receive(packet, Timestamp::from_micros(now_us)));

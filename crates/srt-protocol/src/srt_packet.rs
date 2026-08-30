@@ -5,6 +5,7 @@
 
 use crate::buf::{read_u32, write_bytes, write_u32};
 use crate::error::Error;
+use bytes::Bytes;
 
 /// The minimum SRT packet header size (16 bytes).
 pub const SRT_HEADER_SIZE: usize = 16;
@@ -130,8 +131,8 @@ pub struct DataPacket {
     pub timestamp: u32,
     /// Destination socket ID.
     pub dest_socket_id: u32,
-    /// Payload.
-    pub payload: Vec<u8>,
+    /// Reference-counted payload bytes.
+    pub payload: Bytes,
 }
 
 impl DataPacket {
@@ -141,7 +142,7 @@ impl DataPacket {
         message_number: u32,
         timestamp: u32,
         dest_socket_id: u32,
-        payload: Vec<u8>,
+        payload: Bytes,
     ) -> Self {
         Self {
             sequence_number: sequence_number & 0x7FFF_FFFF,
@@ -175,7 +176,7 @@ impl DataPacket {
         let timestamp = read_u32(&mut slice)?;
         let dest_socket_id = read_u32(&mut slice)?;
 
-        let payload = slice.to_vec();
+        let payload = Bytes::copy_from_slice(slice);
 
         Ok(Self {
             sequence_number,
@@ -433,7 +434,7 @@ mod tests {
             message_number: 100,
             timestamp: 1000000,
             dest_socket_id: 0x12345678,
-            payload: b"Hello, SRT!".to_vec(),
+            payload: b"Hello, SRT!".to_vec().into(),
         };
 
         let mut buf = Vec::new();
