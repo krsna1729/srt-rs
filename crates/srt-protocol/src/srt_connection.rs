@@ -2646,43 +2646,51 @@ fn parse_loss_list(data: &[u8], max_entries: usize) -> Result<Vec<u32>, Error> {
     let mut result = Vec::with_capacity((data.len() / 4).min(max_entries));
     let mut slice = data;
 
-    let push = |result: &mut Vec<u32>, sequence: u32| {
-        if result.len() >= max_entries {
-            return false;
-        }
-        result.push(sequence);
-        true
-    };
-
     while !slice.is_empty() {
         let word = crate::buf::read_u32(&mut slice)?;
 
         if word & 0x8000_0000 != 0 {
-            // Range: [word & 0x7FFF_FFFF, next_word]
-            if slice.len() < 4 {
-                return Err(Error::invalid_data("NAK range is missing its end"));
-            }
-            let start = word & 0x7FFF_FFFF;
-            let end = crate::buf::read_u32(&mut slice)? & 0x7FFF_FFFF;
-            let mut seq = start;
-            loop {
-                if !push(&mut result, seq) {
-                    return Ok(result);
-                }
-                if seq == end {
-                    break;
-                }
-                seq = seq.wrapping_add(1) & 0x7FFF_FFFF;
-            }
-        } else {
-            // Single sequence number
-            if !push(&mut result, word) {
+            if !append_loss_range(&mut result, &mut slice, word, max_entries)? {
                 return Ok(result);
             }
+        } else if !push_loss_entry(&mut result, word, max_entries) {
+            return Ok(result);
         }
     }
 
     Ok(result)
+}
+
+fn push_loss_entry(result: &mut Vec<u32>, sequence: u32, max_entries: usize) -> bool {
+    if result.len() >= max_entries {
+        return false;
+    }
+    result.push(sequence);
+    true
+}
+
+fn append_loss_range(
+    result: &mut Vec<u32>,
+    slice: &mut &[u8],
+    start_word: u32,
+    max_entries: usize,
+) -> Result<bool, Error> {
+    // A range is encoded as [start | 0x8000_0000, end].
+    if slice.len() < 4 {
+        return Err(Error::invalid_data("NAK range is missing its end"));
+    }
+    let start = start_word & 0x7FFF_FFFF;
+    let end = crate::buf::read_u32(slice)? & 0x7FFF_FFFF;
+    let mut sequence = start;
+    loop {
+        if !push_loss_entry(result, sequence, max_entries) {
+            return Ok(false);
+        }
+        if sequence == end {
+            return Ok(true);
+        }
+        sequence = sequence.wrapping_add(1) & 0x7FFF_FFFF;
+    }
 }
 
 /// Encode a loss list (for a NAK packet's control_info).
