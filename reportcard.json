@@ -1,20 +1,7 @@
 {
   "version": 2,
-  "tool": {
-    "name": "rust-code-analysis",
-    "version": "0.0.25"
-  },
-  "scope": "crates/*/src/**/*.rs",
   "enforce": {
     "max_cyclomatic": 20,
     "max_cognitive": 15
-  },
-  "snapshot": {
-    "files": 49,
-    "named_functions": 1702,
-    "closures": 694,
-    "sloc": 42006,
-    "total_cyclomatic": 5893,
-    "total_cognitive": 3044
   }
 }
