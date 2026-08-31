@@ -10,6 +10,10 @@ members = [
 ]
 exclude = ["crates/srt-protocol/fuzz"]
 
+[workspace.metadata.reportcard]
+max_cyclomatic = 20
+max_cognitive = 15
+
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 unused_must_use = "deny"

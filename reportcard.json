@@ -1,7 +1,0 @@
-{
-  "version": 2,
-  "enforce": {
-    "max_cyclomatic": 20,
-    "max_cognitive": 15
-  }
-}
