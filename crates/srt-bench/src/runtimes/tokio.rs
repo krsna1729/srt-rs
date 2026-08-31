@@ -581,7 +581,155 @@ fn run_reuseport_multi(cfg: BenchConfig, k: usize) {
 /// own task, via a handoff -- tokio's ordinary task-per-connection idiom
 /// stays exactly right for that genuinely-independent case, just not for
 /// the common one anymore.
-#[expect(clippy::cognitive_complexity)]
+struct AcceptorContext<'a> {
+    cfg: &'a BenchConfig,
+    worker_index: usize,
+    start: Instant,
+    admission: &'a srt_transport::AdmissionOptions,
+    router: &'a crate::SharedWorkerRouter,
+    senders: &'a [mpsc::Sender<WorkerMessage>],
+    telemetry: &'a srt_transport::IngressTelemetry,
+    tasks: &'a mut Vec<tokio::task::JoinHandle<ConnStats>>,
+}
+
+async fn wait_for_acceptor_input(
+    listener: &tokio::net::UdpSocket,
+    tick: &mut tokio::time::Interval,
+    recv_batch: &mut RecvBatch,
+    peers: &mut srt_transport::PeerTable,
+    context: &AcceptorContext<'_>,
+) {
+    tokio::select! {
+        _ = listener.readable() => {
+            drain_recv(listener, recv_batch, |peer, data| {
+                peers.admit_and_forward(
+                    peer,
+                    data,
+                    crate::now_ts(context.start),
+                    context.admission,
+                    context.worker_index,
+                    context.senders,
+                    context.telemetry,
+                );
+            });
+        }
+        _ = tick.tick() => {}
+    }
+}
+
+fn promotion_decision(
+    context: &AcceptorContext<'_>,
+    peer: SocketAddr,
+) -> srt_lifecycle::PromotionDecision {
+    match context.router.lock() {
+        Ok(mut router) => srt_lifecycle::decide_promotion(
+            context.cfg.promotion,
+            peer,
+            None,
+            context.worker_index,
+            &mut router,
+            srt_lifecycle::RoutingMode::LeastTuples,
+        ),
+        Err(_) => srt_lifecycle::PromotionDecision::StayOnListener,
+    }
+}
+
+fn promote_connected_peers(
+    context: &mut AcceptorContext<'_>,
+    peers: &mut srt_transport::PeerTable,
+    stream_len: Duration,
+) {
+    let mut connected = Vec::new();
+    peers.drain_events(stream_len, &mut connected);
+    for connected in connected {
+        let peer = connected.representative_peer;
+        if peers
+            .logical_peer(&connected.logical_peer)
+            .and_then(|logical| logical.group_affinity())
+            .is_some()
+        {
+            continue;
+        }
+        let decision = promotion_decision(context, peer);
+        if matches!(decision, srt_lifecycle::PromotionDecision::StayOnListener) {
+            continue;
+        }
+        let Some(srt_transport::RemovedLogicalPeer::Direct(p)) =
+            peers.remove(connected.logical_peer)
+        else {
+            continue;
+        };
+        match decision {
+            srt_lifecycle::PromotionDecision::RelocateTo(owner) => relocate_to_owner(
+                context.cfg.port,
+                context.cfg.sock_buf_bytes,
+                peer,
+                p.connection,
+                owner,
+                context.senders,
+                context.telemetry,
+            ),
+            srt_lifecycle::PromotionDecision::PromoteHere => {
+                if let Some(driver) = promote_locally(
+                    context.cfg.port,
+                    context.cfg.sock_buf_bytes,
+                    peer,
+                    p.connection,
+                ) {
+                    let cfg = context.cfg.clone();
+                    let start = context.start;
+                    context.tasks.push(tokio::task::spawn_local(async move {
+                        established_conn_task(driver, cfg, start).await
+                    }));
+                    context.telemetry.record_local_promotion();
+                }
+            }
+            srt_lifecycle::PromotionDecision::StayOnListener => {}
+        }
+    }
+}
+
+fn drain_acceptor_handoffs(
+    context: &mut AcceptorContext<'_>,
+    peers: &mut srt_transport::PeerTable,
+    handoffs: &mpsc::Receiver<WorkerMessage>,
+) {
+    while let Ok(message) = handoffs.try_recv() {
+        let handoff = match message {
+            WorkerMessage::Handoff(handoff) => handoff,
+            WorkerMessage::Finished { .. } => continue,
+            WorkerMessage::Handshake { peer, data } => {
+                peers.admit_and_forward(
+                    peer,
+                    &data,
+                    crate::now_ts(context.start),
+                    context.admission,
+                    context.worker_index,
+                    context.senders,
+                    context.telemetry,
+                );
+                continue;
+            }
+        };
+        let socket = match tokio::net::UdpSocket::from_std(handoff.socket) {
+            Ok(socket) => socket,
+            Err(error) => {
+                eprintln!(
+                    "[bench-tokio] acceptor {}: handoff register {error}",
+                    context.worker_index
+                );
+                continue;
+            }
+        };
+        let driver = Conn::new(handoff.conn, socket);
+        let cfg = context.cfg.clone();
+        let start = context.start;
+        context.tasks.push(tokio::task::spawn_local(async move {
+            established_conn_task(driver, cfg, start).await
+        }));
+    }
+}
+
 async fn run_acceptor(
     cfg: BenchConfig,
     worker_index: usize,
@@ -604,7 +752,6 @@ async fn run_acceptor(
         listener.as_raw_fd()
     };
 
-    let promotion = cfg.promotion;
     let mut peers = srt_transport::PeerTable::new();
     let admission = cfg.admission_options(std::process::id(), cfg.cookie_routing);
     let mut tasks: Vec<tokio::task::JoinHandle<ConnStats>> = Vec::new();
@@ -615,121 +762,39 @@ async fn run_acceptor(
     let mut recv_batch = RecvBatch::new();
     let mut outbound = Vec::new();
 
-    loop {
-        let now = Instant::now();
-        if now >= run_deadline {
-            break;
-        }
-        // Vacuously true while nothing exists yet, so an acceptor that
-        // never admits anything still exits once the connect window
-        // closes instead of hanging on an empty guard.
-        let all_terminal = peers.all_terminal(now, connect_deadline, IDLE_GRACE);
-        if crate::shutdown::requested() || (now >= connect_deadline && all_terminal) {
-            break;
-        }
+    {
+        let mut context = AcceptorContext {
+            cfg: &cfg,
+            worker_index,
+            start,
+            admission: &admission,
+            router: &router,
+            senders: &senders,
+            telemetry: &telemetry,
+            tasks: &mut tasks,
+        };
+        loop {
+            let now = Instant::now();
+            if now >= run_deadline {
+                break;
+            }
+            // Vacuously true while nothing exists yet, so an acceptor that
+            // never admits anything still exits once the connect window
+            // closes instead of hanging on an empty guard.
+            let all_terminal = peers.all_terminal(now, connect_deadline, IDLE_GRACE);
+            if crate::shutdown::requested() || (now >= connect_deadline && all_terminal) {
+                break;
+            }
 
-        tokio::select! {
-            _ = listener.readable() => {
-                drain_recv(&listener, &mut recv_batch, |peer, data| {
-                    peers.admit_and_forward(peer, data, crate::now_ts(start), &admission, worker_index, &senders, &telemetry);
-                });
-            }
-            _ = tick.tick() => {}
-        }
+            wait_for_acceptor_input(&listener, &mut tick, &mut recv_batch, &mut peers, &context)
+                .await;
 
-        let t = crate::now_ts(start);
-        peers.poll_outbound(t, &mut outbound);
-        flush_outbound(listener_fd, &mut outbound);
-        let mut connected = Vec::new();
-        peers.drain_events(stream_len, &mut connected);
-        for connected in connected {
-            let peer = connected.representative_peer;
-            if peers
-                .logical_peer(&connected.logical_peer)
-                .and_then(|logical| logical.group_affinity())
-                .is_some()
-            {
-                // Grouped ingress stays on the table-owned listener.
-                continue;
-            }
-            let decision = match router.lock() {
-                Ok(mut router) => srt_lifecycle::decide_promotion(
-                    promotion,
-                    peer,
-                    None,
-                    worker_index,
-                    &mut router,
-                    srt_lifecycle::RoutingMode::LeastTuples,
-                ),
-                Err(_) => srt_lifecycle::PromotionDecision::StayOnListener,
-            };
-            if matches!(decision, srt_lifecycle::PromotionDecision::StayOnListener) {
-                continue;
-            }
-            let Some(srt_transport::RemovedLogicalPeer::Direct(p)) =
-                peers.remove(connected.logical_peer)
-            else {
-                continue;
-            };
-            match decision {
-                srt_lifecycle::PromotionDecision::RelocateTo(owner) => relocate_to_owner(
-                    cfg.port,
-                    cfg.sock_buf_bytes,
-                    peer,
-                    p.connection,
-                    owner,
-                    &senders,
-                    &telemetry,
-                ),
-                srt_lifecycle::PromotionDecision::PromoteHere => {
-                    if let Some(driver) =
-                        promote_locally(cfg.port, cfg.sock_buf_bytes, peer, p.connection)
-                    {
-                        let cfg2 = cfg.clone();
-                        tasks.push(tokio::task::spawn_local(async move {
-                            established_conn_task(driver, cfg2, start).await
-                        }));
-                        telemetry.record_local_promotion();
-                    }
-                }
-                srt_lifecycle::PromotionDecision::StayOnListener => {}
-            }
-        }
+            let t = crate::now_ts(start);
+            peers.poll_outbound(t, &mut outbound);
+            flush_outbound(listener_fd, &mut outbound);
+            promote_connected_peers(&mut context, &mut peers, stream_len);
 
-        // Bond legs relocated here from another acceptor.
-        while let Ok(message) = handoffs.try_recv() {
-            let handoff = match message {
-                WorkerMessage::Handoff(handoff) => handoff,
-                // A handshake datagram routed here by its cookie: feed it
-                // to the peer state that owns it.
-                // Only the single-acceptor strategy sends this, and it
-                // never targets a ReuseportMulti acceptor. Named rather
-                // than caught by `_` so a new variant still has to be
-                // considered here.
-                WorkerMessage::Finished { .. } => continue,
-                WorkerMessage::Handshake { peer, data } => {
-                    peers.admit_and_forward(
-                        peer,
-                        &data,
-                        crate::now_ts(start),
-                        &admission,
-                        worker_index,
-                        &senders,
-                        &telemetry,
-                    );
-                    continue;
-                }
-            };
-            match tokio::net::UdpSocket::from_std(handoff.socket) {
-                Ok(tokio_socket) => {
-                    let driver = Conn::new(handoff.conn, tokio_socket);
-                    let cfg2 = cfg.clone();
-                    tasks.push(tokio::task::spawn_local(async move {
-                        established_conn_task(driver, cfg2, start).await
-                    }));
-                }
-                Err(e) => eprintln!("[bench-tokio] acceptor {worker_index}: handoff register {e}"),
-            }
+            drain_acceptor_handoffs(&mut context, &mut peers, &handoffs);
         }
     }
 
