@@ -1,7 +1,8 @@
-//! Allocation regression coverage for the receiver loss-scan benchmarks.
+//! Allocation regression coverage for receiver hot paths.
 
 use shiguredo_srt::{DataPacket, PacketPosition, ReceiverBuffer, Timestamp};
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -10,10 +11,18 @@ struct CountingAllocator;
 static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
 static ALLOCATION_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+thread_local! {
+    static COUNT_ALLOCATIONS: Cell<bool> = const { Cell::new(false) };
+}
+
 // SAFETY: allocation and deallocation are delegated unchanged to `System`.
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        COUNT_ALLOCATIONS.with(|enabled| {
+            if enabled.get() {
+                ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+            }
+        });
         // SAFETY: `layout` is supplied by the allocator caller.
         unsafe { System.alloc(layout) }
     }
@@ -102,7 +111,9 @@ fn persistent_old_hole(packet_count: u32) {
 
 fn count_allocations(run: impl FnOnce()) -> u64 {
     ALLOCATIONS.store(0, Ordering::Relaxed);
+    COUNT_ALLOCATIONS.with(|enabled| enabled.set(true));
     run();
+    COUNT_ALLOCATIONS.with(|enabled| enabled.set(false));
     ALLOCATIONS.load(Ordering::Relaxed)
 }
 
@@ -169,5 +180,27 @@ fn full_ack_tracker_allocates_once_then_stays_allocation_free() {
     eprintln!("first full ACK allocations: {warmup_allocations}");
     eprintln!("1,000 full ACK telemetry allocations: {allocations}");
     assert_eq!(warmup_allocations, 1);
+    assert_eq!(allocations, 0);
+}
+
+#[test]
+fn link_capacity_calculation_is_allocation_free_after_warmup() {
+    let _guard = ALLOCATION_TEST_LOCK.lock().expect("allocation test lock");
+    let mut receiver = ReceiverBuffer::new(0, 120, timestamp(0), 0);
+    receiver.set_tsbpd_enabled(false);
+    let mut arrival = 1u64;
+    let _ = receiver.receive(packet(0, 0), timestamp(arrival));
+    for sequence_number in 1..=16 {
+        arrival += u64::from(sequence_number * 7 + 1);
+        let _ = receiver.receive(packet(sequence_number, arrival as u32), timestamp(arrival));
+    }
+    std::hint::black_box(receiver.generate_ack(timestamp(arrival + 1)));
+
+    let allocations = count_allocations(|| {
+        for tick in 1..=1_000 {
+            std::hint::black_box(receiver.generate_ack(timestamp(10_000 + tick)));
+        }
+    });
+    eprintln!("1,000 full ACK link-capacity calculations: {allocations}");
     assert_eq!(allocations, 0);
 }

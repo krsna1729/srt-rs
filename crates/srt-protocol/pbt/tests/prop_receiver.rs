@@ -660,6 +660,31 @@ proptest! {
         prop_assert_eq!(buf.rtt() != rtt_before, target >= 4);
     }
 
+    #[test]
+    fn link_capacity_matches_latest_sixteen_valid_intervals(
+        intervals in prop::collection::vec(1u64..100_000, 1..40),
+    ) {
+        let mut buf = ReceiverBuffer::new(0, 120, Timestamp::default(), 0);
+        buf.set_tsbpd_enabled(false);
+        let _ = buf.receive(make_packet(0, 0), Timestamp::default());
+        let mut arrival = 0u64;
+        for (offset, &interval) in intervals.iter().enumerate() {
+            arrival += interval;
+            let _ = buf.receive(
+                make_packet(offset as u32 + 1, arrival as u32),
+                Timestamp::from_micros(arrival),
+            );
+        }
+
+        let retained = &intervals[intervals.len().saturating_sub(16)..];
+        let mut sorted = retained.to_vec();
+        sorted.sort_unstable();
+        let expected = (1_000_000 / sorted[sorted.len() / 4]) as u32;
+        let ack = buf.generate_ack(Timestamp::from_micros(arrival + 10_000));
+
+        prop_assert_eq!(ack.link_capacity, expected);
+    }
+
     /// Word-at-a-time DROPREQ clearing must match a per-sequence model for
     /// ranges large enough to cross several bitmap words and sequence wrap.
     #[test]
