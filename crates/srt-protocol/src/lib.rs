@@ -30,7 +30,8 @@ pub use srt_handshake::peek_handshake;
 pub use srt_handshake::{
     DEFAULT_FLOW_WINDOW, DEFAULT_MTU, ExtensionType, GFLAG_SYNCONMSG, GroupExtensionData,
     GroupType, HS_VERSION_4, HS_VERSION_5, HandshakeExtension, HandshakePacket, HandshakeState,
-    HandshakeType, HsExtensionData, KmError, KmMessage, SRTGROUP_MASK, extension_flags, srt_flags,
+    HandshakeType, HsExtensionData, KmError, KmMessage, MAX_FLOW_WINDOW, SRTGROUP_MASK,
+    extension_flags, srt_flags,
 };
 pub use srt_packet::{
     ControlPacket, ControlType, DataHeader, DataPacket, PacketPosition, SRT_HEADER_SIZE, SrtPacket,

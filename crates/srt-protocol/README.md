@@ -76,6 +76,10 @@ loop {
 }
 ```
 
+srt-rs currently supports flow-control and receive windows up to 65,536
+packets. This is an implementation and resource limit, not an SRT wire-protocol
+limit. See `MAX_FLOW_WINDOW` when validating application configuration.
+
 When `passphrase` is set on a caller, a fresh salt and stream encryption key
 are generated from the operating system CSPRNG unless the application supplies
 them explicitly. Explicit keys consisting entirely of zero bytes are rejected.

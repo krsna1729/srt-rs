@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use std::cell::Cell;
 
 use crate::error::Error;
-use crate::srt_handshake::DEFAULT_FLOW_WINDOW;
+use crate::srt_handshake::{DEFAULT_FLOW_WINDOW, MAX_FLOW_WINDOW};
 use crate::srt_packet::{
     DataPacket, PacketPosition, SRT_HEADER_SIZE, sequence_greater_than, sequence_less_than,
 };
@@ -51,6 +51,193 @@ const TSBPD_DRIFT_MAX_US: i64 = 5_000;
 
 fn sequence_in_range(first_seq: u32, distance: u32, sequence: u32) -> bool {
     sequence.wrapping_sub(first_seq) & SEQUENCE_MASK <= distance
+}
+
+/// Circular loss membership for one negotiated receive window.
+///
+/// Storage is allocated on the first loss. Data words are followed by a
+/// summary bitmap whose set bits identify nonzero data words.
+#[derive(Debug)]
+struct LossBitmap {
+    storage: Vec<u64>,
+    word_count: u32,
+    window_size: u32,
+    base_seq: u32,
+    len: u32,
+}
+
+impl LossBitmap {
+    fn new(base_seq: u32, window_size: u32) -> Self {
+        Self {
+            storage: Vec::new(),
+            word_count: 0,
+            window_size,
+            base_seq,
+            len: 0,
+        }
+    }
+
+    fn ensure_storage(&mut self) {
+        if !self.storage.is_empty() {
+            return;
+        }
+        let capacity = self
+            .window_size
+            .max(64)
+            .checked_next_power_of_two()
+            .expect("receive window must fit the 31-bit sequence comparison domain")
+            as usize;
+        self.word_count = (capacity / 64) as u32;
+        let word_count = self.word_count as usize;
+        self.storage.resize(word_count + word_count.div_ceil(64), 0);
+    }
+
+    fn capacity_mask(&self) -> usize {
+        self.word_count as usize * 64 - 1
+    }
+
+    fn offset(&self, seq: u32) -> Option<u32> {
+        let offset = seq.wrapping_sub(self.base_seq) & SEQUENCE_MASK;
+        (offset < self.window_size).then_some(offset)
+    }
+
+    fn bit_index(&self, seq: u32) -> usize {
+        seq as usize & self.capacity_mask()
+    }
+
+    fn insert(&mut self, seq: u32) -> bool {
+        if self.offset(seq).is_none() {
+            return false;
+        }
+        self.ensure_storage();
+        let index = self.bit_index(seq);
+        let word_index = index / 64;
+        let bit = 1u64 << (index % 64);
+        let old = self.storage[word_index];
+        if old & bit != 0 {
+            return false;
+        }
+        self.storage[word_index] = old | bit;
+        if old == 0 {
+            self.storage[self.word_count as usize + word_index / 64] |= 1u64 << (word_index % 64);
+        }
+        self.len += 1;
+        true
+    }
+
+    fn remove(&mut self, seq: u32) -> bool {
+        if self.storage.is_empty() || self.offset(seq).is_none() {
+            return false;
+        }
+        let index = self.bit_index(seq);
+        let word_index = index / 64;
+        let bit = 1u64 << (index % 64);
+        let old = self.storage[word_index];
+        if old & bit == 0 {
+            return false;
+        }
+        let new = old & !bit;
+        self.storage[word_index] = new;
+        if new == 0 {
+            self.storage[self.word_count as usize + word_index / 64] &=
+                !(1u64 << (word_index % 64));
+        }
+        self.len -= 1;
+        true
+    }
+
+    fn contains(&self, seq: &u32) -> bool {
+        if self.storage.is_empty() || self.offset(*seq).is_none() {
+            return false;
+        }
+        let index = self.bit_index(*seq);
+        self.storage[index / 64] & (1u64 << (index % 64)) != 0
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    fn set_base(&mut self, base_seq: u32) {
+        self.base_seq = base_seq;
+    }
+
+    fn iter(&self) -> impl Iterator<Item = u32> + '_ {
+        let base_seq = self.base_seq;
+        let window_size = self.window_size;
+        let word_count = self.word_count as usize;
+        let mask = word_count.saturating_mul(64).saturating_sub(1);
+        let base_index = base_seq as usize & mask;
+        self.storage[..word_count]
+            .iter()
+            .copied()
+            .enumerate()
+            .flat_map(move |(word_index, word)| {
+                std::iter::successors((word != 0).then_some(word), |word| {
+                    let next = *word & (*word - 1);
+                    (next != 0).then_some(next)
+                })
+                .map(move |word| word_index * 64 + word.trailing_zeros() as usize)
+            })
+            .filter_map(move |index| {
+                let offset = index.wrapping_sub(base_index) & mask;
+                (offset < window_size as usize)
+                    .then_some(base_seq.wrapping_add(offset as u32) & SEQUENCE_MASK)
+            })
+    }
+
+    fn next_nonzero_word(&self, start: usize, end: usize) -> Option<usize> {
+        if start >= end || self.storage.is_empty() {
+            return None;
+        }
+        let word_count = self.word_count as usize;
+        let summaries = &self.storage[word_count..];
+        let first_summary = start / 64;
+        for (summary_index, &summary) in summaries.iter().enumerate().skip(first_summary) {
+            if summary_index * 64 >= end {
+                break;
+            }
+            let bits = if summary_index == first_summary {
+                summary & (u64::MAX << (start % 64))
+            } else {
+                summary
+            };
+            if bits != 0 {
+                let word_index = summary_index * 64 + bits.trailing_zeros() as usize;
+                return (word_index < end).then_some(word_index);
+            }
+        }
+        None
+    }
+
+    fn first(&self) -> Option<u32> {
+        if self.is_empty() {
+            return None;
+        }
+        let mask = self.capacity_mask();
+        let start = self.base_seq as usize & mask;
+        let start_word = start / 64;
+        let start_bit = start % 64;
+        let suffix = self.storage[start_word] & (u64::MAX << start_bit);
+        let index = if suffix != 0 {
+            start_word * 64 + suffix.trailing_zeros() as usize
+        } else if let Some(word) = self.next_nonzero_word(start_word + 1, self.word_count as usize)
+        {
+            word * 64 + self.storage[word].trailing_zeros() as usize
+        } else if let Some(word) = self.next_nonzero_word(0, start_word) {
+            word * 64 + self.storage[word].trailing_zeros() as usize
+        } else {
+            let prefix_mask = (1u64 << start_bit).wrapping_sub(1);
+            let prefix = self.storage[start_word] & prefix_mask;
+            start_word * 64 + prefix.trailing_zeros() as usize
+        };
+        let offset = index.wrapping_sub(start) & mask;
+        Some(self.base_seq.wrapping_add(offset as u32) & SEQUENCE_MASK)
+    }
 }
 
 /// A bounded, windowed clock-drift estimator used by TSBPD.
@@ -385,22 +572,8 @@ pub struct ReceiverBuffer {
     /// already-accounted state.
     loss_detection_frontier: u32,
 
-    /// Loss list (detected missing packets). `contains`/`insert`/`remove`
-    /// are on the per-packet hot path and must be O(1), so we use
-    /// `FxHashSet` (upstream issue 0055 was Vec with O(n) retains).
-    /// SipHash DoS resistance is unnecessary cost for small integer keys;
-    /// FxHash is faster (tokio profile showed hash_one as #2 at 1200 conns).
-    loss_list: FxHashSet<u32>,
-
-    /// Circular-order minimum cache for `loss_list` (upstream issue 0073).
-    /// `find_deliverable_seq`'s `has_gap` check ("is there a loss before
-    /// seq?") is equivalent to "is the circular minimum before seq?", so
-    /// this cache avoids a full scan. Updated O(1) on insert; recomputed
-    /// O(loss_list) only when the removed entry was the cached minimum
-    /// (rare, only on late recovery). Elements are assumed within 2^30 of
-    /// each other (otherwise circular order breaks -- in practice the list
-    // stays near expected_seq).
-    loss_list_min: Option<u32>,
+    /// Detected missing packets in one lazily allocated circular bitmap.
+    loss_list: LossBitmap,
 
     /// Last ACK send time
     last_ack_time: Timestamp,
@@ -547,14 +720,14 @@ impl ReceiverBuffer {
         tsbpd_time_base: u64,
         max_buffer_size: u32,
     ) -> Self {
+        let max_buffer_size = max_buffer_size.min(MAX_FLOW_WINDOW);
         Self {
             packets: BTreeMap::new(),
             delivery_seq_hint: None,
             expected_seq: initial_seq,
             loss_detection_frontier: initial_seq.wrapping_sub(1) & 0x7FFF_FFFF,
             last_advertised_buffer: 0,
-            loss_list: FxHashSet::default(),
-            loss_list_min: None,
+            loss_list: LossBitmap::new(initial_seq, max_buffer_size),
             last_ack_time: start_time,
             last_ack_seq: initial_seq,
             last_ackacked_seq: None,
@@ -608,31 +781,6 @@ impl ReceiverBuffer {
         self.tsbpd_enabled
     }
 
-    /// Add an element to `loss_list`, updating the circular-order minimum
-    /// cache in O(1).
-    fn loss_list_insert(&mut self, seq: u32) {
-        self.loss_list.insert(seq);
-        match self.loss_list_min {
-            Some(min) if sequence_less_than(min, seq) => {}
-            _ => self.loss_list_min = Some(seq),
-        }
-    }
-
-    /// Remove an element from `loss_list`. Only recomputes the
-    /// circular-order minimum cache from the remaining elements (O(loss_list))
-    /// when the removed element was the cached minimum itself.
-    fn loss_list_remove(&mut self, seq: u32) -> bool {
-        let removed = self.loss_list.remove(&seq);
-        if removed && self.loss_list_min == Some(seq) {
-            self.loss_list_min = self
-                .loss_list
-                .iter()
-                .copied()
-                .reduce(|a, b| if sequence_less_than(a, b) { a } else { b });
-        }
-        removed
-    }
-
     /// Get the next expected sequence number.
     pub fn expected_sequence(&self) -> u32 {
         self.expected_seq
@@ -661,16 +809,16 @@ impl ReceiverBuffer {
         let stale_losses: Vec<u32> = self
             .loss_list
             .iter()
-            .copied()
             .filter(|&seq| sequence_less_than(seq, sequence_number))
             .collect();
         for seq in stale_losses {
-            self.loss_list_remove(seq);
+            self.loss_list.remove(seq);
         }
         self.expected_seq = sequence_number;
         while self.packets.contains_key(&self.expected_seq) {
             self.expected_seq = self.expected_seq.wrapping_add(1) & 0x7FFF_FFFF;
         }
+        self.loss_list.set_base(self.expected_seq);
     }
 
     /// Receive a packet.
@@ -736,7 +884,7 @@ impl ReceiverBuffer {
             },
         );
 
-        let recovered_loss = self.loss_list_remove(seq);
+        let recovered_loss = self.loss_list.remove(seq);
         self.advance_expected_seq(was_expected, recovered_loss);
 
         if new_losses.is_empty() {
@@ -789,8 +937,12 @@ impl ReceiverBuffer {
             self.loss_detection_steps
                 .set(self.loss_detection_steps.get().saturating_add(1));
             if !self.loss_list.contains(&missing) {
+                let inserted = self.loss_list.insert(missing);
+                debug_assert!(
+                    inserted,
+                    "newly classified loss must fit in the receiver loss bitmap"
+                );
                 new_losses.push(missing);
-                self.loss_list_insert(missing);
                 self.total_lost += 1;
             }
             missing = missing.wrapping_add(1) & 0x7FFF_FFFF;
@@ -810,6 +962,7 @@ impl ReceiverBuffer {
                 self.expected_seq = self.expected_seq.wrapping_add(1) & 0x7FFF_FFFF;
             }
         }
+        self.loss_list.set_base(self.expected_seq);
     }
 
     fn packet_base_time(&self, timestamp: u32) -> u64 {
@@ -883,18 +1036,16 @@ impl ReceiverBuffer {
     /// If the minimum packet's delivery time hasn't arrived, fall back to
     /// a full candidate scan to preserve out-of-order timestamp handling.
     ///
-    /// `has_gap` is O(1) via `loss_list_min` (circular minimum cache,
-    /// upstream issue 0073) -- "is there a loss before seq" is equivalent
-    /// to "is the circular minimum before seq", so no per-candidate scan.
-    /// Reduces from O(packets x loss_list) to O(packets).
+    /// `has_gap` uses the loss bitmap's bounded summary lookup -- "is there a
+    /// loss before seq" is equivalent to "is the circular minimum before
+    /// seq". This avoids scanning every loss for every packet candidate.
     fn find_deliverable_seq(&self, now: Timestamp) -> Option<u32> {
+        let loss_list_min = self.loss_list.first();
         // Fast path 1: hint is deliverable right now (no gap before it).
         if let Some(seq) = self.delivery_seq_hint
             && let Some(entry) = self.packets.get(&seq)
             && (!self.tsbpd_enabled || self.delivery_time(entry) <= now)
-            && !self
-                .loss_list_min
-                .is_some_and(|min| sequence_less_than(min, seq))
+            && !loss_list_min.is_some_and(|min| sequence_less_than(min, seq))
         {
             return Some(seq);
         }
@@ -902,7 +1053,7 @@ impl ReceiverBuffer {
         // Ordered storage gives the loss-recovery steady state an O(log n)
         // oldest-packet lookup. Across sequence wrap, fall back to the full
         // circular comparison below.
-        if let (Some(min), Some(&oldest)) = (self.loss_list_min, self.packets.keys().next())
+        if let (Some(min), Some(&oldest)) = (loss_list_min, self.packets.keys().next())
             && !sequence_less_than(min, oldest)
             && oldest >= self.expected_seq
         {
@@ -920,9 +1071,7 @@ impl ReceiverBuffer {
         let mut best: Option<u32> = None;
         for (&seq, entry) in &self.packets {
             let time_ok = !self.tsbpd_enabled || self.delivery_time(entry) <= now;
-            let has_gap = self
-                .loss_list_min
-                .is_some_and(|min| sequence_less_than(min, seq));
+            let has_gap = loss_list_min.is_some_and(|min| sequence_less_than(min, seq));
             if time_ok && !has_gap {
                 // Keep the circularly earlier of best and seq.
                 best = match best {
@@ -1070,7 +1219,7 @@ impl ReceiverBuffer {
         // the NAK by one extra range in the rare case, which is acceptable
         // (a circular-order sort can't be implemented safely, since
         // sequence_less_than is not a total order).
-        let mut loss_list: Vec<u32> = self.loss_list.iter().copied().collect();
+        let mut loss_list: Vec<u32> = self.loss_list.iter().collect();
         loss_list.sort_unstable();
 
         Some(NakPacket { loss_list })
@@ -1142,7 +1291,6 @@ impl ReceiverBuffer {
         let expired: Vec<u32> = self
             .loss_list
             .iter()
-            .copied()
             .filter(|&seq| {
                 let estimated_delivery = self
                     .packets
@@ -1171,7 +1319,7 @@ impl ReceiverBuffer {
             .collect();
 
         for seq in expired {
-            self.loss_list_remove(seq);
+            self.loss_list.remove(seq);
             dropped.push(seq);
         }
 
@@ -1184,6 +1332,7 @@ impl ReceiverBuffer {
             {
                 self.expected_seq = self.expected_seq.wrapping_add(1) & 0x7FFF_FFFF;
             }
+            self.loss_list.set_base(self.expected_seq);
         }
 
         dropped
@@ -1200,6 +1349,14 @@ impl ReceiverBuffer {
         if distance >= self.max_buffer_size {
             return Err(Error::invalid_data(
                 "DROPREQ range exceeds receive buffer window",
+            ));
+        }
+
+        if sequence_greater_than(first_seq, self.expected_seq)
+            && first_seq.wrapping_sub(self.expected_seq) & SEQUENCE_MASK > self.max_buffer_size
+        {
+            return Err(Error::invalid_data(
+                "DROPREQ begins beyond the expected receive window",
             ));
         }
 
@@ -1294,23 +1451,13 @@ impl ReceiverBuffer {
     }
 
     fn remove_drop_losses(&mut self, first_seq: u32, sequence_count: u32) -> u32 {
-        let removed_loss_min = self
-            .loss_list_min
-            .is_some_and(|seq| sequence_in_range(first_seq, sequence_count - 1, seq));
         let mut losses_removed = 0;
         let mut seq = first_seq;
         for _ in 0..sequence_count {
-            if self.loss_list.remove(&seq) {
+            if self.loss_list.remove(seq) {
                 losses_removed += 1;
             }
             seq = seq.wrapping_add(1) & SEQUENCE_MASK;
-        }
-        if removed_loss_min {
-            self.loss_list_min = self
-                .loss_list
-                .iter()
-                .copied()
-                .reduce(|a, b| if sequence_less_than(a, b) { a } else { b });
         }
         losses_removed
     }
@@ -1321,6 +1468,7 @@ impl ReceiverBuffer {
         {
             self.expected_seq = self.expected_seq.wrapping_add(1) & SEQUENCE_MASK;
         }
+        self.loss_list.set_base(self.expected_seq);
     }
 
     /// Get the current ACK sequence number.
@@ -1485,6 +1633,10 @@ pub struct ReceiverStats {
 mod tests {
     use super::*;
 
+    fn loss_set(buf: &ReceiverBuffer) -> FxHashSet<u32> {
+        buf.loss_list.iter().collect()
+    }
+
     fn make_packet(seq: u32, timestamp: u32) -> DataPacket {
         DataPacket {
             sequence_number: seq,
@@ -1497,6 +1649,106 @@ mod tests {
             dest_socket_id: 1,
             payload: vec![1, 2, 3].into(),
         }
+    }
+
+    #[test]
+    fn loss_bitmap_allocates_lazily_and_tracks_first_loss() {
+        let mut losses = LossBitmap::new(100, 128);
+        assert!(losses.storage.is_empty());
+        assert_eq!(losses.first(), None);
+
+        assert!(losses.insert(102));
+        assert!(losses.insert(100));
+        assert!(losses.insert(165));
+        assert!(!losses.insert(102));
+        assert_eq!(losses.len(), 3);
+        assert_eq!(losses.first(), Some(100));
+
+        assert!(losses.remove(100));
+        assert_eq!(losses.first(), Some(102));
+        assert_eq!(
+            losses.iter().collect::<FxHashSet<_>>(),
+            FxHashSet::from_iter([102, 165])
+        );
+    }
+
+    #[test]
+    fn default_loss_bitmap_heap_footprint_stays_bounded() {
+        let mut losses = LossBitmap::new(0, DEFAULT_FLOW_WINDOW);
+        assert_eq!(losses.storage.capacity(), 0);
+        assert!(losses.insert(0));
+        let bytes = losses.storage.capacity() * std::mem::size_of::<u64>();
+        eprintln!("default LossBitmap heap footprint: {bytes} bytes");
+        assert!(
+            bytes <= 1_100,
+            "default loss bitmap exceeded its heap budget: {bytes} bytes"
+        );
+    }
+
+    #[test]
+    fn maximum_loss_bitmap_heap_footprint_stays_bounded() {
+        let mut losses = LossBitmap::new(0, MAX_FLOW_WINDOW);
+        assert!(losses.insert(0));
+        let logical_bytes = losses.storage.len() * std::mem::size_of::<u64>();
+        eprintln!("maximum LossBitmap logical heap footprint: {logical_bytes} bytes");
+        assert_eq!(logical_bytes, 8_320);
+    }
+
+    #[test]
+    fn loss_bitmap_matches_set_for_non_power_of_two_windows() {
+        for window_size in [65, 100, 127, 129, 1_000, 8_191, 8_193] {
+            for base_seq in [61, SEQUENCE_MASK - 3] {
+                let mut losses = LossBitmap::new(base_seq, window_size);
+                let mut expected = FxHashSet::default();
+
+                for offset in (0..window_size).step_by(3) {
+                    let seq = base_seq.wrapping_add(offset) & SEQUENCE_MASK;
+                    assert_eq!(losses.insert(seq), expected.insert(seq));
+                }
+                for offset in (0..window_size).step_by(9) {
+                    let seq = base_seq.wrapping_add(offset) & SEQUENCE_MASK;
+                    assert_eq!(losses.remove(seq), expected.remove(&seq));
+                }
+
+                let advanced_base = base_seq.wrapping_add(window_size / 4) & SEQUENCE_MASK;
+                let stale: Vec<u32> = expected
+                    .iter()
+                    .copied()
+                    .filter(|&seq| seq.wrapping_sub(advanced_base) & SEQUENCE_MASK >= window_size)
+                    .collect();
+                for seq in stale {
+                    assert!(losses.remove(seq));
+                    expected.remove(&seq);
+                }
+                losses.set_base(advanced_base);
+                for offset in (0..window_size).rev().step_by(5) {
+                    let seq = advanced_base.wrapping_add(offset) & SEQUENCE_MASK;
+                    assert_eq!(losses.insert(seq), expected.insert(seq));
+                }
+
+                assert_eq!(losses.iter().collect::<FxHashSet<_>>(), expected);
+                let first = expected
+                    .iter()
+                    .copied()
+                    .min_by_key(|&seq| seq.wrapping_sub(advanced_base) & SEQUENCE_MASK);
+                assert_eq!(losses.first(), first);
+            }
+        }
+    }
+
+    #[test]
+    fn loss_bitmap_wraps_without_aliasing_old_sequences() {
+        let mut losses = LossBitmap::new(0x7FFF_FFFE, 64);
+        for seq in [0x7FFF_FFFE, 0x7FFF_FFFF, 0, 1] {
+            assert!(losses.insert(seq));
+        }
+        assert_eq!(losses.first(), Some(0x7FFF_FFFE));
+
+        assert!(losses.remove(0x7FFF_FFFE));
+        losses.set_base(0x7FFF_FFFF);
+        assert_eq!(losses.first(), Some(0x7FFF_FFFF));
+        assert!(!losses.remove(63));
+        assert!(losses.contains(&0x7FFF_FFFF));
     }
 
     #[test]
@@ -2174,7 +2426,7 @@ mod tests {
         }
 
         assert_eq!(
-            buf.loss_list,
+            loss_set(&buf),
             FxHashSet::from_iter([0x7FFF_FFFD, 0x7FFF_FFFF, 1])
         );
     }
@@ -2247,7 +2499,7 @@ mod tests {
         // 1001 を受信して 1000 が損失として登録される
         buf.receive(make_packet(1001, 200_000), now);
 
-        assert_eq!(buf.loss_list, FxHashSet::from_iter([1000]));
+        assert_eq!(loss_set(&buf), FxHashSet::from_iter([1000]));
 
         // TLPKTDROP = max(1.25 * 120_000, 1_000_000) = 1_000_000μs
         // 次側パケット seq 1001 の delivery_time = 500_000 + 200_000 + 120_000 = 820_000
@@ -2268,7 +2520,7 @@ mod tests {
             buf.receive(make_packet(seq, 200_000), received_at);
         }
         assert_eq!(
-            buf.loss_list,
+            loss_set(&buf),
             FxHashSet::from_iter([1000, 1001, 1003, 1005])
         );
 
@@ -2355,7 +2607,7 @@ mod tests {
         // now = 2_400_000: 両方超過 → 1001 が削除される
         let dropped = buf.drop_too_late(Timestamp::from_micros(2_400_000));
         assert_eq!(dropped, vec![1001]);
-        assert_eq!(buf.loss_list, FxHashSet::default());
+        assert!(buf.loss_list.is_empty());
     }
 
     #[test]
@@ -2452,12 +2704,9 @@ mod tests {
     }
 
     #[test]
-    fn test_loss_list_min_cache_recomputes_across_wrap_boundary_on_removal() {
-        // loss_list_min キャッシュ (upstream issue 0073) の再計算経路を検証する:
-        // キャッシュされた循環順最小値そのものが削除されたとき、残った要素の中から
-        // 正しい新しい最小値を O(loss_list) で再計算できること。ラップ境界をまたぐ
-        // 損失集合で検証することで、数値順最小値と循環順最小値の食い違いが
-        // 再計算後も正しく扱われることを確認する。
+    fn test_loss_bitmap_summary_tracks_first_across_wrap_boundary() {
+        // The bitmap summary must advance to the next circular loss when the
+        // oldest loss is recovered, including across sequence wrap.
         let start = Timestamp::from_micros(0);
         let mut buf = ReceiverBuffer::new(0x7FFF_FFFD, 120, start, 0);
         buf.set_tsbpd_enabled(false);
@@ -2465,7 +2714,7 @@ mod tests {
         let now = Timestamp::from_micros(1000);
 
         // 0x7FFF_FFFD, 0x7FFF_FFFE, 0x7FFF_FFFF, 0 を欠損させ、循環順で
-        // 最も新しい 1 のみ受信する。loss_list_min は循環順最古の
+        // 最も新しい 1 のみ受信する。循環順最古の
         // 0x7FFF_FFFD になるはず。
         buf.receive(make_packet(1, 100), now);
         assert!(buf.loss_list.contains(&0x7FFF_FFFD));
@@ -2473,8 +2722,7 @@ mod tests {
         assert!(buf.loss_list.contains(&0x7FFF_FFFF));
         assert!(buf.loss_list.contains(&0));
 
-        // 循環順最古の欠損 (0x7FFF_FFFD) が回復する -- キャッシュされた最小値
-        // 自身が削除されるので、O(loss_list) 再計算経路を通る。新しい最小値は
+        // 循環順最古の欠損 (0x7FFF_FFFD) が回復する。新しい最小値は
         // 残りの中で循環順最古の 0x7FFF_FFFE になるはず。
         buf.receive(make_packet(0x7FFF_FFFD, 100), now);
 
@@ -2484,9 +2732,9 @@ mod tests {
             Some(0x7FFF_FFFD)
         );
 
-        // loss_list_min が正しく 0x7FFF_FFFE に再計算されていれば、seq=1 (循環順で
+        // summary が正しく 0x7FFF_FFFE を指していれば、seq=1 (循環順で
         // 0x7FFF_FFFE より後ろ) はまだ穴によってブロックされ、配信されない。
-        // 再計算が壊れていて loss_list_min が誤って None のままだと、ここで
+        // summary が壊れていて最小値が誤って None だと、ここで
         // 1 が (誤って) 配信されてしまうはず。
         assert!(buf.pop_ready(now).is_none());
 
@@ -2929,6 +3177,28 @@ mod tests {
     }
 
     #[test]
+    fn drop_range_rejects_progress_beyond_expected_bitmap_window() {
+        let now = Timestamp::from_micros(1_000);
+        let mut buf = ReceiverBuffer::with_buffer_size(0, 120, Timestamp::default(), 0, 32);
+        buf.set_tsbpd_enabled(false);
+        assert_eq!(
+            buf.receive(make_packet(32, 1), now),
+            Some((0..32).collect())
+        );
+
+        let frontier = buf.loss_detection_frontier;
+        let error = buf
+            .drop_range(40, 40)
+            .expect_err("DROPREQ starts beyond the expected receive window");
+        assert_eq!(error.kind, crate::error::ErrorKind::InvalidData);
+        assert_eq!(buf.loss_detection_frontier, frontier);
+        assert_eq!(
+            buf.generate_periodic_nak().unwrap().loss_list,
+            (0..32).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn receiver_buffer_inline_footprint_stays_bounded() {
         let bytes = std::mem::size_of::<ReceiverBuffer>();
         eprintln!("ReceiverBuffer inline footprint: {bytes} bytes");
@@ -3033,20 +3303,20 @@ mod tests {
     }
 
     #[test]
-    fn drop_range_keeps_or_repairs_loss_min_as_needed() {
+    fn drop_range_keeps_or_advances_first_loss_as_needed() {
         let now = Timestamp::from_micros(1_000);
         let mut buf = ReceiverBuffer::new(100, 120, Timestamp::default(), 0);
         buf.set_tsbpd_enabled(false);
         buf.receive(make_packet(103, 1), now);
-        assert_eq!(buf.loss_list_min, Some(100));
+        assert_eq!(buf.loss_list.first(), Some(100));
 
         let non_min = buf.drop_range(101, 101).expect("non-minimum loss");
         assert_eq!(non_min.losses_removed, 1);
-        assert_eq!(buf.loss_list_min, Some(100));
+        assert_eq!(buf.loss_list.first(), Some(100));
 
         let minimum = buf.drop_range(100, 100).expect("minimum loss");
         assert_eq!(minimum.losses_removed, 1);
-        assert_eq!(buf.loss_list_min, Some(102));
+        assert_eq!(buf.loss_list.first(), Some(102));
         assert_eq!(buf.generate_periodic_nak().unwrap().loss_list, vec![102]);
     }
 
@@ -3064,7 +3334,7 @@ mod tests {
         assert_eq!(summary.sequence_count, DEFAULT_FLOW_WINDOW);
         assert!(buf.loss_list.is_empty());
         assert!(buf.packets.is_empty());
-        assert_eq!(buf.loss_list_min, None);
+        assert_eq!(buf.loss_list.first(), None);
         assert_eq!(buf.delivery_seq_hint, None);
         assert_eq!(buf.expected_sequence(), DEFAULT_FLOW_WINDOW);
     }

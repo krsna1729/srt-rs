@@ -35,6 +35,14 @@ pub const DEFAULT_MTU: u32 = 1500;
 /// Default flow window size.
 pub const DEFAULT_FLOW_WINDOW: u32 = 8192;
 
+/// Largest flow/receive window supported by the dense receiver loss bitmap.
+///
+/// This is an srt-rs implementation limit, not an SRT wire-protocol limit.
+///
+/// This remains well inside the 31-bit sequence half-range and bounds the
+/// bitmap allocation after first loss to 8,320 bytes per connection.
+pub const MAX_FLOW_WINDOW: u32 = 65_536;
+
 /// Handshake type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
