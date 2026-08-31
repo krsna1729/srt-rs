@@ -2,6 +2,8 @@ use std::env;
 use std::process::{Command, ExitCode, Stdio};
 use std::time::Instant;
 
+mod reportcard;
+
 struct Step {
     name: &'static str,
     cmd: &'static str,
@@ -63,6 +65,16 @@ const TYPOS: Step = Step {
     args: &[],
     env: &[],
     tool: Some(("typos", "typos-cli")),
+    cwd: None,
+    informational: false,
+};
+
+const REPORTCARD: Step = Step {
+    name: "reportcard",
+    cmd: "cargo",
+    args: &["xtask", "reportcard"],
+    env: &[],
+    tool: Some(("rust-code-analysis-cli", "rust-code-analysis-cli")),
     cwd: None,
     informational: false,
 };
@@ -165,10 +177,11 @@ const GEIGER_LIFECYCLE: Step = Step {
     informational: true,
 };
 
-const PRECOMMIT: &[&Step] = &[&FMT, &CLIPPY, &DOC, &TYPOS];
+const PRECOMMIT: &[&Step] = &[&FMT, &CLIPPY, &REPORTCARD, &DOC, &TYPOS];
 const CI: &[&Step] = &[
     &FMT,
     &CLIPPY,
+    &REPORTCARD,
     &DOC,
     &TYPOS,
     &TEST,
@@ -190,6 +203,7 @@ fn main() -> ExitCode {
         "package" => run_one(&PACKAGE),
         "fuzz-build" => run_one(&FUZZ_BUILD),
         "geiger" => run_group(&[&GEIGER_PROTOCOL, &GEIGER_TRANSPORT, &GEIGER_LIFECYCLE]),
+        "reportcard" => reportcard::run(&env::args().skip(2).collect::<Vec<_>>()),
         "precommit" => run_group(PRECOMMIT),
         "ci" | "check-all" => run_group(CI),
         "install-hooks" => install_hooks(),
@@ -206,7 +220,8 @@ fn main() -> ExitCode {
             eprintln!("  package        dry-run package of shiguredo_srt");
             eprintln!("  fuzz-build     compile fuzz targets (needs cargo-fuzz + nightly)");
             eprintln!("  geiger         unsafe surface inventory (needs cargo-geiger)");
-            eprintln!("  precommit      fast gate: fmt + clippy + doc + typos");
+            eprintln!("  reportcard     complexity and maintainability ratchet");
+            eprintln!("  precommit      fast gate: fmt + clippy + reportcard + doc + typos");
             eprintln!("  ci             full gate: all checks + report card");
             eprintln!("  check-all      alias for ci");
             eprintln!("  install-hooks  set core.hooksPath to .githooks");

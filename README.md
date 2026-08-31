@@ -190,7 +190,7 @@ for reproducible runs and result interpretation.
 
 All local quality checks are unified in `cargo xtask`. Install the git
 pre-commit hook once, and every commit runs the fast checks (fmt, clippy,
-rustdoc, typos) automatically:
+complexity, rustdoc, typos) automatically:
 
 ```sh
 cargo xtask install-hooks   # sets core.hooksPath to .githooks
@@ -199,8 +199,8 @@ cargo xtask install-hooks   # sets core.hooksPath to .githooks
 The full CI suite and the fast pre-commit gate:
 
 ```sh
-cargo xtask ci              # everything CI runs (fmt, clippy, doc, typos, test, deny, package)
-cargo xtask precommit       # fast gate only (fmt, clippy, doc, typos)
+cargo xtask ci              # everything CI runs (fmt, clippy, reportcard, doc, typos, test, deny, package)
+cargo xtask precommit       # fast gate only (fmt, clippy, reportcard, doc, typos)
 ```
 
 Individual checks:
@@ -208,6 +208,7 @@ Individual checks:
 ```sh
 cargo xtask fmt             # rustfmt --check
 cargo xtask lint            # clippy --workspace -D warnings
+cargo xtask reportcard      # complexity ratchet and report (needs rust-code-analysis-cli)
 cargo xtask doc             # rustdoc -D warnings
 cargo xtask typos           # spellcheck (needs typos-cli)
 cargo xtask test            # cargo test --workspace
@@ -216,9 +217,21 @@ cargo xtask package         # dry-run crate package
 cargo xtask geiger          # unsafe surface inventory (needs cargo-geiger)
 ```
 
-External tools (`typos-cli`, `cargo-deny`, `cargo-geiger`) are not
+External tools (`typos-cli`, `cargo-deny`, `rust-code-analysis-cli`,
+`cargo-geiger`) are not
 auto-installed. If missing, xtask prints the exact `cargo install` command
 and fails.
+
+The report card stores its per-function baseline in
+[`reportcard.json`](reportcard.json). New functions must be at most CC 20 and
+cognitive complexity 15. Existing functions may not regress, and the highest
+legacy values may not increase. Totals, averages, and percentiles are reported
+for trend tracking only, so adding ordinary functions does not fail the gate.
+After an intentional complexity improvement, refresh the snapshot with:
+
+```sh
+cargo xtask reportcard --write-baseline
+```
 
 ### Workspace lints
 
