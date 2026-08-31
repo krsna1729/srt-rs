@@ -337,7 +337,98 @@ async fn sender_task(
     stats
 }
 
-#[expect(clippy::cognitive_complexity)]
+async fn receive_receiver_packets(
+    driver: &mut Conn,
+    peer: &mut Option<SocketAddr>,
+    buffer: &mut [u8; 2048],
+    start: Instant,
+) -> bool {
+    if peer.is_none() {
+        // Unconnected phase: first datagram reveals the caller; connect
+        // before anything else because drain_outputs uses connected send.
+        let recv_fut = async { driver.sock.recv_from(buffer).await.ok() };
+        let timer_fut = async {
+            smol::Timer::after(crate::MAX_WAIT).await;
+            None
+        };
+        if let Some((size, addr)) = futures_lite::future::or(recv_fut, timer_fut).await {
+            if driver.sock.get_ref().connect(addr).is_err() {
+                eprintln!("[bench-smol] connect to peer failed");
+                return false;
+            }
+            *peer = Some(addr);
+            let now = crate::now_ts(start);
+            let _ = driver.conn.feed_recv_buf(&buffer[..size], now);
+        }
+    } else {
+        // Bounded wait keeps the task from busy-spinning when idle.
+        driver
+            .recv_with_timeout(buffer, crate::MAX_WAIT, crate::now_ts(start))
+            .await;
+        drain_receiver_packets(driver, buffer, start);
+        let now = crate::now_ts(start);
+        driver.fire_expired(now);
+        drain_outputs(driver, now).await;
+    }
+    true
+}
+
+fn drain_receiver_packets(driver: &mut Conn, buffer: &mut [u8; 2048], start: Instant) {
+    while let Some(result) = driver.try_recv(buffer) {
+        match result {
+            Ok(size) => {
+                let now = crate::now_ts(start);
+                let _ = driver.conn.feed_recv_buf(&buffer[..size], now);
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+fn handle_receiver_events(
+    cfg: &BenchConfig,
+    driver: &mut Conn,
+    stats: &mut ConnStats,
+    stream_deadline: &mut Option<Instant>,
+) {
+    while let Some(event) = driver.conn.poll_event() {
+        match event {
+            ConnectionEvent::Connected => {
+                stats.connected = true;
+                if cfg.verbose() {
+                    println!("CONNECTED");
+                }
+                if stream_deadline.is_none() {
+                    *stream_deadline =
+                        Some(Instant::now() + Duration::from_secs_f64(cfg.duration_secs));
+                }
+            }
+            ConnectionEvent::DataReceived { .. } => {
+                stats.data_events += 1;
+            }
+            ConnectionEvent::Disconnected { reason } => {
+                eprintln!("[bench-smol] disconnected: {reason}");
+                stats.torn_down |= !crate::is_ordered_close(&reason);
+                *stream_deadline = Some(Instant::now());
+            }
+            ConnectionEvent::Error(message) => {
+                eprintln!("[bench-smol] error: {message}");
+            }
+            _ => {}
+        }
+    }
+}
+
+fn record_receiver_stats(driver: &Conn, stats: &mut ConnStats) {
+    if let Some(receiver) = driver.conn.receiver_stats() {
+        stats.has_stats = true;
+        stats.core_total = receiver.total_received;
+        stats.secondary_a = receiver.total_lost;
+        stats.secondary_b = receiver.total_duplicates;
+        stats.rtt_us = receiver.rtt as u64;
+    }
+}
+
 async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> ConnStats {
     let socket = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], listen_port))).expect("bind");
 
@@ -369,83 +460,14 @@ async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> Co
             break;
         }
 
-        if peer.is_none() {
-            // Unconnected phase: first datagram reveals the caller; connect
-            // before anything else (drain_outputs uses connected send).
-            let recv_fut = async { driver.sock.recv_from(&mut buf).await.ok() };
-            let timer_fut = async {
-                smol::Timer::after(crate::MAX_WAIT).await;
-                None
-            };
-            if let Some((n, addr)) = futures_lite::future::or(recv_fut, timer_fut).await {
-                if driver.sock.get_ref().connect(addr).is_err() {
-                    eprintln!("[bench-smol] connect to peer failed");
-                    continue;
-                }
-                peer = Some(addr);
-                let t = crate::now_ts(start);
-                let _ = driver.conn.feed_recv_buf(&buf[..n], t);
-            }
-        } else {
-            // Bounded wait keeps the task from busy-spinning when idle.
-            driver
-                .recv_with_timeout(&mut buf, crate::MAX_WAIT, crate::now_ts(start))
-                .await;
-
-            while let Some(res) = driver.try_recv(&mut buf) {
-                match res {
-                    Ok(n) => {
-                        let t = crate::now_ts(start);
-                        let _ = driver.conn.feed_recv_buf(&buf[..n], t);
-                    }
-                    Err(_) => break,
-                }
-            }
-
-            let t = crate::now_ts(start);
-            driver.fire_expired(t);
-            drain_outputs(&mut driver, t).await;
+        if !receive_receiver_packets(&mut driver, &mut peer, &mut buf, start).await {
+            continue;
         }
 
-        while let Some(ev) = driver.conn.poll_event() {
-            match ev {
-                ConnectionEvent::Connected => {
-                    stats.connected = true;
-                    if cfg.verbose() {
-                        println!("CONNECTED");
-                    }
-                    // Set once. A duplicate `Connected` -- a re-completed
-                    // handshake under load -- would otherwise push the
-                    // deadline out another full duration, and the run
-                    // would quietly offer more than the configured load.
-                    if stream_deadline.is_none() {
-                        stream_deadline =
-                            Some(Instant::now() + Duration::from_secs_f64(cfg.duration_secs));
-                    }
-                }
-                ConnectionEvent::DataReceived { .. } => {
-                    stats.data_events += 1;
-                }
-                ConnectionEvent::Disconnected { reason } => {
-                    eprintln!("[bench-smol] disconnected: {reason}");
-                    stats.torn_down |= !crate::is_ordered_close(&reason);
-                    stream_deadline = Some(Instant::now());
-                }
-                ConnectionEvent::Error(msg) => {
-                    eprintln!("[bench-smol] error: {msg}");
-                }
-                _ => {}
-            }
-        }
+        handle_receiver_events(&cfg, &mut driver, &mut stats, &mut stream_deadline);
     }
 
-    if let Some(s) = driver.conn.receiver_stats() {
-        stats.has_stats = true;
-        stats.core_total = s.total_received;
-        stats.secondary_a = s.total_lost;
-        stats.secondary_b = s.total_duplicates;
-        stats.rtt_us = s.rtt as u64;
-    }
+    record_receiver_stats(&driver, &mut stats);
     stats
 }
 
