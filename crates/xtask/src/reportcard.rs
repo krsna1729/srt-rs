@@ -16,6 +16,7 @@ const DEFAULT_NEW_COGNITIVE: u64 = 15;
 #[derive(Clone, Debug)]
 struct FunctionMetric {
     key: String,
+    legacy_key: String,
     name: String,
     path: String,
     start_line: usize,
@@ -137,6 +138,20 @@ fn default_limits() -> Limits {
 }
 
 fn analyze_sources(root: &Path) -> io::Result<Summary> {
+    let raw_files = run_analyzer(root)?;
+    let mut summary = Summary::default();
+    for path in raw_files {
+        analyze_file(&path, &mut summary)?;
+    }
+    if summary.files == 0 || summary.units.is_empty() {
+        return Err(io::Error::other(
+            "no Rust source functions found under crates/*/src",
+        ));
+    }
+    Ok(summary)
+}
+
+fn run_analyzer(root: &Path) -> io::Result<Vec<PathBuf>> {
     ensure_analyzer()?;
     let raw_directory = root.join(REPORT_DIR).join("raw");
     if raw_directory.exists() {
@@ -162,28 +177,36 @@ fn analyze_sources(root: &Path) -> io::Result<Summary> {
     if raw_files.is_empty() {
         return Err(io::Error::other("analyzer produced no JSON files"));
     }
-    let mut summary = Summary::default();
-    for path in raw_files {
-        let value: Value = serde_json::from_str(&fs::read_to_string(&path)?)
-            .map_err(|error| io::Error::other(format!("invalid analyzer JSON: {error}")))?;
-        let relative = value
-            .get("name")
-            .and_then(Value::as_str)
-            .ok_or_else(|| io::Error::other("analyzer JSON is missing a file name"))?;
-        if !relative.split('/').any(|component| component == "src") {
-            continue;
+    Ok(raw_files)
+}
+
+fn analyze_file(path: &Path, summary: &mut Summary) -> io::Result<()> {
+    let value: Value = serde_json::from_str(&fs::read_to_string(path)?)
+        .map_err(|error| io::Error::other(format!("invalid analyzer JSON: {error}")))?;
+    let relative = value
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| io::Error::other("analyzer JSON is missing a file name"))?;
+    if !relative.split('/').any(|component| component == "src") {
+        return Ok(());
+    }
+    summary.files += 1;
+    summary.sloc += metric_value(&value, "loc", "sloc");
+    let mut scope_ordinals = HashMap::new();
+    let mut legacy_ordinals = HashMap::new();
+    if let Some(children) = value.get("spaces").and_then(Value::as_array) {
+        for child in children {
+            collect_functions(
+                child,
+                relative,
+                None,
+                &mut scope_ordinals,
+                &mut legacy_ordinals,
+                summary,
+            );
         }
-        summary.files += 1;
-        summary.sloc += metric_value(&value, "loc", "sloc");
-        let mut ordinals = HashMap::new();
-        collect_functions(&value, relative, &mut ordinals, &mut summary);
     }
-    if summary.files == 0 || summary.units.is_empty() {
-        return Err(io::Error::other(
-            "no Rust source functions found under crates/*/src",
-        ));
-    }
-    Ok(summary)
+    Ok(())
 }
 
 fn ensure_analyzer() -> io::Result<()> {
@@ -245,46 +268,104 @@ fn metric_value(value: &Value, group: &str, metric: &str) -> u64 {
 fn collect_functions(
     space: &Value,
     path: &str,
-    ordinals: &mut HashMap<String, usize>,
+    parent_key: Option<&str>,
+    scope_ordinals: &mut HashMap<String, usize>,
+    legacy_ordinals: &mut HashMap<String, usize>,
     summary: &mut Summary,
 ) {
-    if space.get("kind").and_then(Value::as_str) == Some("function") {
-        let name = space
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or("<unnamed>")
-            .to_string();
-        let ordinal = ordinals.entry(name.clone()).or_default();
-        let key = format!("{path}::{name}#{ordinal}");
-        *ordinal += 1;
-        let metric = FunctionMetric {
-            key,
-            name: name.clone(),
-            path: path.to_string(),
-            start_line: space
-                .get("start_line")
-                .and_then(Value::as_u64)
-                .unwrap_or_default() as usize,
-            end_line: space
-                .get("end_line")
-                .and_then(Value::as_u64)
-                .unwrap_or_default() as usize,
-            cyclomatic: own_metric(space, "cyclomatic"),
-            cognitive: own_metric(space, "cognitive"),
-        };
-        summary.cyclomatic += metric.cyclomatic;
-        summary.cognitive += metric.cognitive;
-        if name == "<anonymous>" {
-            summary.closures += 1;
-        } else {
-            summary.named_functions += 1;
-        }
-        summary.units.push(metric);
+    let key = build_function_metric(space, path, parent_key, scope_ordinals, legacy_ordinals).map(
+        |metric| {
+            let key = metric.key.clone();
+            record_function(summary, metric);
+            key
+        },
+    );
+    collect_children(
+        space,
+        path,
+        key.as_deref().or(parent_key),
+        legacy_ordinals,
+        summary,
+    );
+}
+
+fn build_function_metric(
+    space: &Value,
+    path: &str,
+    parent_key: Option<&str>,
+    scope_ordinals: &mut HashMap<String, usize>,
+    legacy_ordinals: &mut HashMap<String, usize>,
+) -> Option<FunctionMetric> {
+    if space.get("kind").and_then(Value::as_str) != Some("function") {
+        return None;
     }
-    if let Some(children) = space.get("spaces").and_then(Value::as_array) {
-        for child in children {
-            collect_functions(child, path, ordinals, summary);
-        }
+    let name = space
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("<unnamed>")
+        .to_string();
+    let ordinal = scope_ordinals.entry(name.clone()).or_default();
+    let legacy_ordinal = legacy_ordinals.entry(name.clone()).or_default();
+    let legacy_key = format!("{path}::{name}#{legacy_ordinal}");
+    let key = if name == "<anonymous>" {
+        parent_key.map_or_else(
+            || legacy_key.clone(),
+            |parent| format!("{parent}::<anonymous>#{ordinal}"),
+        )
+    } else {
+        legacy_key.clone()
+    };
+    *ordinal += 1;
+    *legacy_ordinal += 1;
+    Some(FunctionMetric {
+        key,
+        legacy_key,
+        name,
+        path: path.to_string(),
+        start_line: space
+            .get("start_line")
+            .and_then(Value::as_u64)
+            .unwrap_or_default() as usize,
+        end_line: space
+            .get("end_line")
+            .and_then(Value::as_u64)
+            .unwrap_or_default() as usize,
+        cyclomatic: own_metric(space, "cyclomatic"),
+        cognitive: own_metric(space, "cognitive"),
+    })
+}
+
+fn record_function(summary: &mut Summary, metric: FunctionMetric) {
+    summary.cyclomatic += metric.cyclomatic;
+    summary.cognitive += metric.cognitive;
+    if metric.name == "<anonymous>" {
+        summary.closures += 1;
+    } else {
+        summary.named_functions += 1;
+    }
+    summary.units.push(metric);
+}
+
+fn collect_children(
+    space: &Value,
+    path: &str,
+    parent_key: Option<&str>,
+    legacy_ordinals: &mut HashMap<String, usize>,
+    summary: &mut Summary,
+) {
+    let Some(children) = space.get("spaces").and_then(Value::as_array) else {
+        return;
+    };
+    let mut scope_ordinals = HashMap::new();
+    for child in children {
+        collect_functions(
+            child,
+            path,
+            parent_key,
+            &mut scope_ordinals,
+            legacy_ordinals,
+            summary,
+        );
     }
 }
 
@@ -421,7 +502,7 @@ fn write_baseline(root: &Path, limits: &Limits, summary: &Summary) -> io::Result
 fn check_limits(summary: &Summary, limits: &Limits) -> Vec<Violation> {
     let mut violations = Vec::new();
     for unit in &summary.units {
-        if let Some(baseline) = limits.functions.get(&unit.key) {
+        if let Some(baseline) = baseline_for(limits, unit) {
             check_metric(
                 &mut violations,
                 unit,
@@ -480,6 +561,15 @@ fn check_limits(summary: &Summary, limits: &Limits) -> Vec<Violation> {
         });
     }
     violations
+}
+
+fn baseline_for<'a>(limits: &'a Limits, unit: &FunctionMetric) -> Option<&'a BaselineMetric> {
+    let stable = limits.functions.get(&unit.key);
+    if unit.name == "<anonymous>" {
+        stable
+    } else {
+        stable.or_else(|| limits.functions.get(&unit.legacy_key))
+    }
 }
 
 fn check_metric(
@@ -641,7 +731,7 @@ fn new_max(summary: &Summary, limits: &Limits, cognitive: bool) -> String {
     let value = summary
         .units
         .iter()
-        .filter(|unit| !limits.functions.contains_key(&unit.key))
+        .filter(|unit| baseline_for(limits, unit).is_none())
         .map(|unit| {
             if cognitive {
                 unit.cognitive
@@ -657,7 +747,7 @@ fn gate_for_new(summary: &Summary, limits: &Limits, cognitive: bool) -> &'static
     let passed = summary
         .units
         .iter()
-        .filter(|unit| !limits.functions.contains_key(&unit.key))
+        .filter(|unit| baseline_for(limits, unit).is_none())
         .all(|unit| {
             if cognitive {
                 unit.cognitive <= limits.new_cognitive
