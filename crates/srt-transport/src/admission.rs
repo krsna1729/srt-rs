@@ -1675,12 +1675,26 @@ impl PeerTable {
         self.last_now = now;
         out.clear();
         let mut rejected = Vec::new();
+        self.mark_due_peers(now);
+        self.poll_direct_outbound(now, out, &mut rejected);
+        self.remove_rejected_peers(rejected);
+        self.poll_group_outbound(now, out);
+    }
+
+    fn mark_due_peers(&mut self, now: Timestamp) {
         let mut due = Vec::new();
         self.deadlines.pop_due(now, &mut due);
         for peer in due {
             self.mark_ready_physical(peer);
         }
+    }
 
+    fn poll_direct_outbound(
+        &mut self,
+        now: Timestamp,
+        out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
+        rejected: &mut Vec<PhysicalPeerKey>,
+    ) {
         while let Some(peer) = self.ready.pop_front() {
             self.ready_set.remove(&peer);
             let Some(entry) = self.peers.get_mut(&peer) else {
@@ -1703,9 +1717,19 @@ impl PeerTable {
                 self.deadlines.remove(&peer);
             }
         }
+    }
+
+    fn remove_rejected_peers(&mut self, rejected: Vec<PhysicalPeerKey>) {
         for peer in rejected {
             let _ = self.remove_physical(peer);
         }
+    }
+
+    fn poll_group_outbound(
+        &mut self,
+        now: Timestamp,
+        out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
+    ) {
         for group in self.groups.values_mut() {
             let (core, legs) = (&mut group.group, &mut group.legs);
             for leg in legs.values_mut() {
