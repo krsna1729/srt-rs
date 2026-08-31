@@ -71,6 +71,14 @@ name = "receiver_tsbpd_scan"
 harness = false
 
 [[bench]]
+name = "receiver_ack_tracker"
+harness = false
+
+[[bench]]
+name = "receiver_ackack_lookup"
+harness = false
+
+[[bench]]
 name = "collection_tradeoffs"
 harness = false
 
