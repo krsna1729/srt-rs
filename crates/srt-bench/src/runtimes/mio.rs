@@ -765,6 +765,145 @@ fn run_bonded_shared_pool(cfg: BenchConfig) {
 /// `mine` names the *pool* sockets this worker owns; inside, sockets are
 /// addressed by their position in `sockets`, which is what the poll token
 /// carries. The two only coincide when there is a single worker.
+struct SharedPoolConn {
+    conn: SrtConnection,
+    timers: srt_transport::ManualTimerStore,
+    connected: bool,
+    torn_down: bool,
+    data_events: u64,
+    peer: SocketAddr,
+    socket_idx: usize,
+    /// `None` until the first `Connected` event; doubles as "has this
+    /// ever connected" so a still-handshaking entry (which is not
+    /// terminal) is distinguishable from a disconnected one (which
+    /// is), without a separate pending/established split.
+    stream_deadline: Option<Instant>,
+    last_data_at: Instant,
+}
+
+fn new_shared_pool_conn(cfg: &BenchConfig, peer: SocketAddr, socket_idx: usize) -> SharedPoolConn {
+    SharedPoolConn {
+        torn_down: false,
+        conn: SrtConnection::new_listener({
+            let mut options = ConnectionOptions {
+                socket_id: std::process::id(),
+                tsbpd_delay: cfg.latency_ms,
+                ..Default::default()
+            };
+            cfg.encryption.apply_to(&mut options);
+            options
+        }),
+        timers: srt_transport::ManualTimerStore::new(),
+        connected: false,
+        data_events: 0,
+        peer,
+        socket_idx,
+        stream_deadline: None,
+        last_data_at: Instant::now(),
+    }
+}
+
+fn shared_pool_conn_is_terminal(
+    conn: &SharedPoolConn,
+    now: Instant,
+    connect_deadline: Instant,
+) -> bool {
+    srt_lifecycle::is_terminal(
+        conn.connected,
+        conn.stream_deadline,
+        conn.last_data_at,
+        now,
+        connect_deadline,
+        IDLE_GRACE,
+    )
+}
+
+fn admit_shared_pool_events(
+    events: &Events,
+    sockets: &[UdpSocket],
+    cfg: &BenchConfig,
+    batch: &mut RecvBatch,
+    buf: &mut [u8],
+    conns: &mut HashMap<SocketAddr, SharedPoolConn>,
+    start: Instant,
+) {
+    for event in events.iter() {
+        let socket_idx = event.token().0;
+        let Some(socket) = sockets.get(socket_idx) else {
+            continue;
+        };
+        let timestamp = crate::now_ts(start);
+        drain_admission(socket, cfg.batching, batch, buf, |peer, data| {
+            let entry = conns
+                .entry(peer)
+                .or_insert_with(|| new_shared_pool_conn(cfg, peer, socket_idx));
+            let _ = entry.conn.feed_recv_buf(data, timestamp);
+            entry.data_events += 1;
+            entry.last_data_at = Instant::now();
+        });
+    }
+}
+
+fn drive_shared_pool_connections(
+    conns: &mut HashMap<SocketAddr, SharedPoolConn>,
+    sockets: &[UdpSocket],
+    start: Instant,
+    stream_len: Duration,
+) {
+    let timestamp = crate::now_ts(start);
+    for conn in conns.values_mut() {
+        conn.timers.fire_expired(timestamp, &mut conn.conn);
+        let socket = &sockets[conn.socket_idx];
+        while let Some(output) = conn.conn.poll_output() {
+            match output {
+                shiguredo_srt::ConnectionOutput::SendPacket(bytes) => {
+                    let _ = socket.send_to(&bytes, conn.peer);
+                }
+                other => conn.timers.apply_output(&other, timestamp),
+            }
+        }
+        while let Some(event) = conn.conn.poll_event() {
+            match event {
+                ConnectionEvent::Connected => {
+                    conn.connected = true;
+                    conn.stream_deadline = Some(Instant::now() + stream_len);
+                }
+                ConnectionEvent::Disconnected { reason } => {
+                    conn.torn_down |= !crate::is_ordered_close(&reason);
+                    conn.connected = false;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn shared_pool_stats(conns: HashMap<SocketAddr, SharedPoolConn>) -> Vec<ConnStats> {
+    conns
+        .into_values()
+        .map(|conn| {
+            let mut stats = ConnStats {
+                // stream_deadline is Some as soon as Connected has fired
+                // (see the struct doc) -- a session that streamed everything
+                // and then tripped SRT's own peer-idle timeout is still a
+                // success, not "never connected".
+                connected: conn.stream_deadline.is_some(),
+                torn_down: conn.torn_down,
+                data_events: conn.data_events,
+                ..Default::default()
+            };
+            if let Some(receiver_stats) = conn.conn.receiver_stats() {
+                stats.has_stats = true;
+                stats.core_total = receiver_stats.total_received;
+                stats.secondary_a = receiver_stats.total_lost;
+                stats.secondary_b = receiver_stats.total_duplicates;
+                stats.rtt_us = receiver_stats.rtt as u64;
+            }
+            stats
+        })
+        .collect()
+}
+
 fn run_shared_pool_shard(
     cfg: &BenchConfig,
     mine: &[usize],
@@ -788,34 +927,7 @@ fn run_shared_pool_shard(
         sockets.push(socket);
     }
 
-    struct SharedConn {
-        conn: SrtConnection,
-        timers: srt_transport::ManualTimerStore,
-        connected: bool,
-        torn_down: bool,
-        data_events: u64,
-        peer: SocketAddr,
-        socket_idx: usize,
-        /// `None` until the first `Connected` event; doubles as "has this
-        /// ever connected" so a still-handshaking entry (which is not
-        /// terminal) is distinguishable from a disconnected one (which
-        /// is), without a separate pending/established split.
-        stream_deadline: Option<Instant>,
-        last_data_at: Instant,
-    }
-
-    fn is_terminal(c: &SharedConn, now: Instant, connect_deadline: Instant) -> bool {
-        srt_lifecycle::is_terminal(
-            c.connected,
-            c.stream_deadline,
-            c.last_data_at,
-            now,
-            connect_deadline,
-            IDLE_GRACE,
-        )
-    }
-
-    let mut conns: HashMap<SocketAddr, SharedConn> = HashMap::new();
+    let mut conns: HashMap<SocketAddr, SharedPoolConn> = HashMap::new();
     let expected_connections = (0..cfg.connections)
         .filter(|connection| mine.contains(&(connection % pool_sockets)))
         .count();
@@ -832,7 +944,7 @@ fn run_shared_pool_shard(
         }
         let all_terminal = conns
             .values()
-            .all(|c| is_terminal(c, now, connect_deadline));
+            .all(|conn| shared_pool_conn_is_terminal(conn, now, connect_deadline));
         if shared_pool_can_stop(
             conns.len(),
             expected_connections,
@@ -843,94 +955,19 @@ fn run_shared_pool_shard(
         }
         poll.poll(&mut events, Some(TIMER_TICK)).ok();
 
-        for event in events.iter() {
-            let socket_idx = event.token().0;
-            let Some(socket) = sockets.get(socket_idx) else {
-                continue;
-            };
-            let t = crate::now_ts(start);
-            drain_admission(
-                socket,
-                cfg.batching,
-                &mut admit_batch,
-                &mut buf,
-                |peer, data| {
-                    let entry = conns.entry(peer).or_insert_with(|| SharedConn {
-                        torn_down: false,
-                        conn: SrtConnection::new_listener({
-                            let mut options = ConnectionOptions {
-                                socket_id: std::process::id(),
-                                tsbpd_delay: cfg.latency_ms,
-                                ..Default::default()
-                            };
-                            cfg.encryption.apply_to(&mut options);
-                            options
-                        }),
-                        timers: srt_transport::ManualTimerStore::new(),
-                        connected: false,
-                        data_events: 0,
-                        peer,
-                        socket_idx,
-                        stream_deadline: None,
-                        last_data_at: Instant::now(),
-                    });
-                    let _ = entry.conn.feed_recv_buf(data, t);
-                    entry.data_events += 1;
-                    entry.last_data_at = Instant::now();
-                },
-            );
-        }
-
-        let t = crate::now_ts(start);
-        for conn in conns.values_mut() {
-            conn.timers.fire_expired(t, &mut conn.conn);
-            let socket = &sockets[conn.socket_idx];
-            while let Some(out) = conn.conn.poll_output() {
-                match out {
-                    shiguredo_srt::ConnectionOutput::SendPacket(bytes) => {
-                        let _ = socket.send_to(&bytes, conn.peer);
-                    }
-                    other => conn.timers.apply_output(&other, t),
-                }
-            }
-            while let Some(ev) = conn.conn.poll_event() {
-                match ev {
-                    ConnectionEvent::Connected => {
-                        conn.connected = true;
-                        conn.stream_deadline = Some(Instant::now() + stream_len);
-                    }
-                    ConnectionEvent::Disconnected { reason } => {
-                        conn.torn_down |= !crate::is_ordered_close(&reason);
-                        conn.connected = false;
-                    }
-                    _ => {}
-                }
-            }
-        }
+        admit_shared_pool_events(
+            &events,
+            &sockets,
+            cfg,
+            &mut admit_batch,
+            &mut buf,
+            &mut conns,
+            start,
+        );
+        drive_shared_pool_connections(&mut conns, &sockets, start, stream_len);
     }
 
-    let mut out = Vec::with_capacity(conns.len());
-    for conn in conns.into_values() {
-        let mut s = ConnStats {
-            // stream_deadline is Some as soon as Connected has ever fired
-            // (see the struct doc) -- a session that streamed everything
-            // and then tripped SRT's own peer-idle timeout is still a
-            // success, not "never connected".
-            connected: conn.stream_deadline.is_some(),
-            torn_down: conn.torn_down,
-            data_events: conn.data_events,
-            ..Default::default()
-        };
-        if let Some(st) = conn.conn.receiver_stats() {
-            s.has_stats = true;
-            s.core_total = st.total_received;
-            s.secondary_a = st.total_lost;
-            s.secondary_b = st.total_duplicates;
-            s.rtt_us = st.rtt as u64;
-        }
-        out.push(s);
-    }
-    out
+    shared_pool_stats(conns)
 }
 
 fn shared_pool_can_stop(
