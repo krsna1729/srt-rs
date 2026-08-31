@@ -413,26 +413,28 @@ pub fn spread_by(results: &[Record], group_by: &[String], column: &str) -> Vec<(
 /// Pairs each listener row with the caller rows sharing its configuration
 /// so delivery can be shown as received-over-sent; a listener count on its
 /// own cannot distinguish "dropped packets" from "the sender sent fewer".
-pub fn report(results: &[Record], group_by: &[String]) -> String {
-    let key_of = |r: &Record| -> String {
-        group_by
-            .iter()
-            .map(|k| r.get(k).unwrap_or("-").to_string())
-            .collect::<Vec<_>>()
-            .join("\t")
-    };
+fn report_key(record: &Record, group_by: &[String]) -> String {
+    group_by
+        .iter()
+        .map(|key| record.get(key).unwrap_or("-").to_string())
+        .collect::<Vec<_>>()
+        .join("\t")
+}
 
-    let mut keys: Vec<String> = Vec::new();
-    for r in results {
-        let k = key_of(r);
-        if !keys.contains(&k) {
-            keys.push(k);
+fn report_keys(results: &[Record], group_by: &[String]) -> Vec<String> {
+    let mut keys = Vec::new();
+    for record in results {
+        let key = report_key(record, group_by);
+        if !keys.contains(&key) {
+            keys.push(key);
         }
     }
     keys.sort();
+    keys
+}
 
-    let mut out = String::new();
-    let headers: Vec<String> = group_by
+fn report_headers(group_by: &[String]) -> Vec<String> {
+    group_by
         .iter()
         .cloned()
         .chain(
@@ -453,128 +455,155 @@ pub fn report(results: &[Record], group_by: &[String]) -> String {
                 "rss_kb",
             ]
             .iter()
-            .map(|s| (*s).to_string()),
+            .map(|name| (*name).to_string()),
         )
-        .collect();
-    let mut rows: Vec<Vec<String>> = vec![headers];
+        .collect()
+}
 
-    for key in keys {
-        let cells: Vec<&Record> = results.iter().filter(|r| key_of(r) == key).collect();
+fn report_median(records: &[&Record], column: &str) -> f64 {
+    median(
+        records
+            .iter()
+            .filter_map(|record| record.number(column))
+            .collect(),
+    )
+}
 
-        // Pair the two roles per rep instead of averaging each side
-        // independently. A run interrupted mid-cell leaves a caller row
-        // with no listener row, and resume only counts listener rows, so
-        // re-running appends a *second* caller row. Medianing the two
-        // sides separately then divides a complete listener figure by the
-        // median of one complete and one truncated caller -- which is how
-        // a delivery rate of 139% appeared. Later rows win, the file
-        // being append-only, and a rep missing either side is dropped.
-        let mut paired: std::collections::BTreeMap<String, (Option<&Record>, Option<&Record>)> =
-            std::collections::BTreeMap::new();
-        for r in &cells {
-            let rep = r.get("rep").unwrap_or("1").to_string();
-            let slot = paired.entry(rep).or_default();
-            match r.get("role") {
-                Some("caller") => slot.0 = Some(r),
-                Some("listener") => slot.1 = Some(r),
-                _ => {}
-            }
+fn report_target_packets(record: &Record) -> Option<f64> {
+    let (connections, bitrate, seconds) = (
+        record.number("conns")?,
+        record.number("bitrate")?,
+        record.number("secs")?,
+    );
+    let packets = connections * bitrate * seconds / (8.0 * crate::PAYLOAD_SIZE as f64);
+    (packets > 0.0).then_some(packets)
+}
+
+fn report_group_row(key: &str, cells: &[&Record]) -> Option<Vec<String>> {
+    // Pair the two roles per rep instead of averaging each side
+    // independently. A run interrupted mid-cell leaves a caller row
+    // with no listener row, and resume only counts listener rows, so
+    // re-running appends a *second* caller row. Medianing the two
+    // sides separately then divides a complete listener figure by the
+    // median of one complete and one truncated caller -- which is how
+    // a delivery rate of 139% appeared. Later rows win, the file
+    // being append-only, and a rep missing either side is dropped.
+    let mut paired: std::collections::BTreeMap<String, (Option<&Record>, Option<&Record>)> =
+        std::collections::BTreeMap::new();
+    for record in cells {
+        let rep = record.get("rep").unwrap_or("1").to_string();
+        let slot = paired.entry(rep).or_default();
+        match record.get("role") {
+            Some("caller") => slot.0 = Some(record),
+            Some("listener") => slot.1 = Some(record),
+            _ => {}
         }
-        let (callers, listeners): (Vec<&Record>, Vec<&Record>) = paired
-            .values()
-            .filter_map(|(c, l)| Some((*c.as_ref()?, *l.as_ref()?)))
-            .unzip();
-        if listeners.is_empty() {
-            continue;
-        }
-        let med = |rs: &[&Record], col: &str| -> f64 {
-            median(rs.iter().filter_map(|r| r.number(col)).collect())
-        };
-        let recv = med(&listeners, "core_total");
-        let sent = med(&callers, "core_total");
-        let deliv = if sent > 0.0 { 100.0 * recv / sent } else { 0.0 };
-
-        // `deliv%` is recv/sent -- a ratio against whatever the sender
-        // happened to emit, which says nothing when the sender itself was
-        // the constraint. These two are measured against the load that was
-        // *asked for*, so a load generator that could not keep up shows up
-        // as a low `offer%` instead of silently deflating the listener's
-        // score. `--` on results recorded before `secs` was a column.
-        let target = |r: &&Record| -> Option<f64> {
-            let (conns, bitrate, secs) =
-                (r.number("conns")?, r.number("bitrate")?, r.number("secs")?);
-            let pkts = conns * bitrate * secs / (8.0 * crate::PAYLOAD_SIZE as f64);
-            (pkts > 0.0).then_some(pkts)
-        };
-        let target_pkts = median(callers.iter().filter_map(target).collect());
-        let pct = |n: f64| -> String {
-            if target_pkts > 0.0 {
-                format!("{:.1}", 100.0 * n / target_pkts)
-            } else {
-                "--".to_string()
-            }
-        };
-        // `sent` is `SenderBuffer::total_sent`, which counts a packet when
-        // it is first queued and is NOT incremented by `pop_retransmit`.
-        // Retransmits are already excluded, so subtracting them again
-        // double-counts -- and where loss was heavy enough that retransmits
-        // exceeded originals it floored the figure at zero, reporting a
-        // sender that offered nothing while it sent two million packets.
-        let offered = sent;
-        // CPU is the whole pipeline's cost, so both sides count.
-        let cpu = (med(&listeners, "cpu_user_ms")
-            + med(&listeners, "cpu_sys_ms")
-            + med(&callers, "cpu_user_ms")
-            + med(&callers, "cpu_sys_ms"))
-            / 1000.0;
-        let mut row: Vec<String> = key.split('\t').map(str::to_string).collect();
-        // All reported medians below are based on these complete caller /
-        // listener pairs. Expose their count so a human or downstream tool
-        // never mistakes one recovered sample for a stable comparison.
-        row.push(listeners.len().to_string());
-        row.push(format!("{:.0}", med(&listeners, "established")));
-        row.push(format!("{sent:.0}"));
-        row.push(format!("{recv:.0}"));
-        row.push(pct(offered));
-        row.push(pct(recv));
-        row.push(format!("{deliv:.1}"));
-        row.push(format!("{:.0}", med(&listeners, "sec_a")));
-        row.push(format!("{:.0}", med(&listeners, "udp_rcvbuf_err")));
-        // Caller and listener are two independent observers of the same
-        // connections, and they do not always agree on which ones broke
-        // -- the investigation this column exists for found every
-        // instance on the caller side and none on the listener. Reporting
-        // both, rather than a combined count, is what makes that visible.
-        row.push(format!("{:.0}", med(&callers, "torn_down")));
-        row.push(format!("{:.0}", med(&listeners, "torn_down")));
-        row.push(format!("{:.2}", med(&listeners, "rtt_ms")));
-        row.push(format!("{cpu:.1}"));
-        row.push(format!(
-            "{:.0}",
-            med(&listeners, "peak_rss_kb").max(med(&callers, "peak_rss_kb"))
-        ));
-        rows.push(row);
+    }
+    let (callers, listeners): (Vec<&Record>, Vec<&Record>) = paired
+        .values()
+        .filter_map(|(caller, listener)| Some((*caller.as_ref()?, *listener.as_ref()?)))
+        .unzip();
+    if listeners.is_empty() {
+        return None;
     }
 
+    let recv = report_median(&listeners, "core_total");
+    let sent = report_median(&callers, "core_total");
+    let deliv = if sent > 0.0 { 100.0 * recv / sent } else { 0.0 };
+    let target_pkts = median(
+        callers
+            .iter()
+            .filter_map(|record| report_target_packets(record))
+            .collect(),
+    );
+    let pct = |value: f64| {
+        if target_pkts > 0.0 {
+            format!("{:.1}", 100.0 * value / target_pkts)
+        } else {
+            "--".to_string()
+        }
+    };
+    // `sent` is `SenderBuffer::total_sent`, which counts a packet when
+    // it is first queued and is NOT incremented by `pop_retransmit`.
+    // Retransmits are already excluded, so subtracting them again
+    // double-counts -- and where loss was heavy enough that retransmits
+    // exceeded originals it floored the figure at zero, reporting a
+    // sender that offered nothing while it sent two million packets.
+    let offered = sent;
+    // CPU is the whole pipeline's cost, so both sides count.
+    let cpu = (report_median(&listeners, "cpu_user_ms")
+        + report_median(&listeners, "cpu_sys_ms")
+        + report_median(&callers, "cpu_user_ms")
+        + report_median(&callers, "cpu_sys_ms"))
+        / 1000.0;
+    let mut row: Vec<String> = key.split('\t').map(str::to_string).collect();
+    // All reported medians below are based on these complete caller /
+    // listener pairs. Expose their count so a human or downstream tool
+    // never mistakes one recovered sample for a stable comparison.
+    row.push(listeners.len().to_string());
+    row.push(format!("{:.0}", report_median(&listeners, "established")));
+    row.push(format!("{sent:.0}"));
+    row.push(format!("{recv:.0}"));
+    row.push(pct(offered));
+    row.push(pct(recv));
+    row.push(format!("{deliv:.1}"));
+    row.push(format!("{:.0}", report_median(&listeners, "sec_a")));
+    row.push(format!(
+        "{:.0}",
+        report_median(&listeners, "udp_rcvbuf_err")
+    ));
+    // Caller and listener are two independent observers of the same
+    // connections, and they do not always agree on which ones broke
+    // -- the investigation this column exists for found every
+    // instance on the caller side and none on the listener. Reporting
+    // both, rather than a combined count, is what makes that visible.
+    row.push(format!("{:.0}", report_median(&callers, "torn_down")));
+    row.push(format!("{:.0}", report_median(&listeners, "torn_down")));
+    row.push(format!("{:.2}", report_median(&listeners, "rtt_ms")));
+    row.push(format!("{cpu:.1}"));
+    row.push(format!(
+        "{:.0}",
+        report_median(&listeners, "peak_rss_kb").max(report_median(&callers, "peak_rss_kb"))
+    ));
+    Some(row)
+}
+
+fn render_report_table(rows: &[Vec<String>], group_by_len: usize) -> String {
     let width = rows[0].len();
     let mut widths = vec![0usize; width];
-    for row in &rows {
-        for (i, cell) in row.iter().enumerate() {
-            widths[i] = widths[i].max(cell.len());
+    for row in rows {
+        for (index, cell) in row.iter().enumerate() {
+            widths[index] = widths[index].max(cell.len());
         }
     }
-    for row in &rows {
-        for (i, cell) in row.iter().enumerate() {
-            if i + 1 == width {
-                let _ = writeln!(out, "{cell:>w$}", w = widths[i]);
-            } else if i < group_by.len() {
-                let _ = write!(out, "{cell:<w$}  ", w = widths[i]);
+    let mut out = String::new();
+    for row in rows {
+        for (index, cell) in row.iter().enumerate() {
+            if index + 1 == width {
+                let _ = writeln!(out, "{cell:>w$}", w = widths[index]);
+            } else if index < group_by_len {
+                let _ = write!(out, "{cell:<w$}  ", w = widths[index]);
             } else {
-                let _ = write!(out, "{cell:>w$}  ", w = widths[i]);
+                let _ = write!(out, "{cell:>w$}  ", w = widths[index]);
             }
         }
     }
     out
+}
+
+pub fn report(results: &[Record], group_by: &[String]) -> String {
+    let keys = report_keys(results, group_by);
+    let mut rows = vec![report_headers(group_by)];
+    for key in keys {
+        let cells: Vec<&Record> = results
+            .iter()
+            .filter(|record| report_key(record, group_by) == key)
+            .collect();
+        if let Some(row) = report_group_row(&key, &cells) {
+            rows.push(row);
+        }
+    }
+    render_report_table(&rows, group_by.len())
 }
 
 /// Render the listener-side throughput series expected by
