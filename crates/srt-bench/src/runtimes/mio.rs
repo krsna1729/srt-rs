@@ -1716,7 +1716,111 @@ fn run_reuseport_single(cfg: BenchConfig, workers: usize) {
 /// every worker exactly how many connections it will ever receive once
 /// admission winds down, so a worker can distinguish "no more are coming"
 /// from "none have arrived yet" instead of guessing off a wall clock.
-#[expect(clippy::cognitive_complexity)]
+struct SinglePending {
+    conn: SrtConnection,
+    timers: srt_transport::ManualTimerStore,
+    connected: bool,
+    created_at: Instant,
+}
+
+fn new_single_pending(cfg: &BenchConfig) -> SinglePending {
+    SinglePending {
+        conn: SrtConnection::new_listener({
+            let mut options = ConnectionOptions {
+                socket_id: std::process::id(),
+                tsbpd_delay: cfg.latency_ms,
+                ..Default::default()
+            };
+            cfg.encryption.apply_to(&mut options);
+            options
+        }),
+        timers: srt_transport::ManualTimerStore::new(),
+        connected: false,
+        created_at: Instant::now(),
+    }
+}
+
+fn admit_single_events(
+    events: &Events,
+    listener: &UdpSocket,
+    cfg: &BenchConfig,
+    batch: &mut RecvBatch,
+    buf: &mut [u8],
+    pending: &mut HashMap<SocketAddr, SinglePending>,
+    start: Instant,
+) {
+    for event in events.iter() {
+        if event.token() != Token(0) {
+            continue;
+        }
+        let t = crate::now_ts(start);
+        drain_admission(listener, cfg.batching, batch, buf, |peer, data| {
+            let entry = pending
+                .entry(peer)
+                .or_insert_with(|| new_single_pending(cfg));
+            let _ = entry.conn.feed_recv_buf(data, t);
+        });
+    }
+}
+
+fn drive_single_pending(
+    listener: &UdpSocket,
+    pending: &mut HashMap<SocketAddr, SinglePending>,
+    start: Instant,
+) -> (Vec<SocketAddr>, Vec<SocketAddr>) {
+    let t = crate::now_ts(start);
+    let mut promote = Vec::new();
+    let mut stale = Vec::new();
+    for (peer, entry) in pending.iter_mut() {
+        if entry.created_at.elapsed() >= crate::CONNECT_TIMEOUT {
+            stale.push(*peer);
+            continue;
+        }
+        entry.timers.fire_expired(t, &mut entry.conn);
+        if drain_conn_outputs(&mut entry.conn, &mut entry.timers, listener, *peer, t) {
+            stale.push(*peer);
+            continue;
+        }
+        while let Some(event) = entry.conn.poll_event() {
+            if matches!(event, ConnectionEvent::Connected) {
+                entry.connected = true;
+            }
+        }
+        if entry.connected {
+            promote.push(*peer);
+        }
+    }
+    (stale, promote)
+}
+
+fn route_single_promotions(
+    cfg: &BenchConfig,
+    pending: &mut HashMap<SocketAddr, SinglePending>,
+    stale: Vec<SocketAddr>,
+    promote: Vec<SocketAddr>,
+    router: &crate::SharedWorkerRouter,
+    senders: &[mpsc::Sender<WorkerMessage>],
+    per_worker_count: &mut [usize],
+) {
+    for peer in stale {
+        pending.remove(&peer);
+    }
+    for peer in promote {
+        let Some(entry) = pending.remove(&peer) else {
+            continue;
+        };
+        route_to_worker(
+            cfg.port,
+            cfg.sock_buf_bytes,
+            peer,
+            entry.conn,
+            router,
+            senders,
+            per_worker_count,
+        );
+    }
+}
+
 fn run_single_acceptor(
     cfg: &BenchConfig,
     start: Instant,
@@ -1739,14 +1843,7 @@ fn run_single_acceptor(
         .register(&mut listener, Token(0), Interest::READABLE)
         .expect("register listener");
 
-    struct Pending {
-        conn: SrtConnection,
-        timers: srt_transport::ManualTimerStore,
-        connected: bool,
-        created_at: Instant,
-    }
-
-    let mut pending: HashMap<SocketAddr, Pending> = HashMap::new();
+    let mut pending: HashMap<SocketAddr, SinglePending> = HashMap::new();
     let connect_deadline = Instant::now() + crate::CONNECT_TIMEOUT;
     let mut admit_batch = RecvBatch::new();
     let mut buf = [0u8; 2048];
@@ -1759,80 +1856,30 @@ fn run_single_acceptor(
         }
         poll.poll(&mut events, Some(TIMER_TICK)).ok();
 
-        for event in events.iter() {
-            if event.token() != Token(0) {
-                continue;
-            }
-            let t = crate::now_ts(start);
-            drain_admission(
-                &listener,
-                cfg.batching,
-                &mut admit_batch,
-                &mut buf,
-                |peer, data| {
-                    let entry = pending.entry(peer).or_insert_with(|| Pending {
-                        conn: SrtConnection::new_listener({
-                            let mut options = ConnectionOptions {
-                                socket_id: std::process::id(),
-                                tsbpd_delay: cfg.latency_ms,
-                                ..Default::default()
-                            };
-                            cfg.encryption.apply_to(&mut options);
-                            options
-                        }),
-                        timers: srt_transport::ManualTimerStore::new(),
-                        connected: false,
-                        created_at: Instant::now(),
-                    });
-                    let _ = entry.conn.feed_recv_buf(data, t);
-                },
-            );
-        }
+        admit_single_events(
+            &events,
+            &listener,
+            cfg,
+            &mut admit_batch,
+            &mut buf,
+            &mut pending,
+            start,
+        );
 
         // Drive pending handshakes toward Connected, then route -- same
         // retain/promote split as run_pool_acceptor, and the same reason:
         // a connected entry must stay in `pending` until the routing loop
         // below reclaims it via `remove`, not get dropped inside `retain`.
-        let t = crate::now_ts(start);
-        let mut promote = Vec::new();
-        let mut stale = Vec::new();
-        for (peer, p) in pending.iter_mut() {
-            if p.created_at.elapsed() >= crate::CONNECT_TIMEOUT {
-                stale.push(*peer);
-                continue;
-            }
-            p.timers.fire_expired(t, &mut p.conn);
-            let refused = drain_conn_outputs(&mut p.conn, &mut p.timers, &listener, *peer, t);
-            if refused {
-                stale.push(*peer);
-                continue;
-            }
-            while let Some(ev) = p.conn.poll_event() {
-                if matches!(ev, ConnectionEvent::Connected) {
-                    p.connected = true;
-                }
-            }
-            if p.connected {
-                promote.push(*peer);
-            }
-        }
-        for peer in stale {
-            pending.remove(&peer);
-        }
-        for peer in promote {
-            let Some(p) = pending.remove(&peer) else {
-                continue;
-            };
-            route_to_worker(
-                cfg.port,
-                cfg.sock_buf_bytes,
-                peer,
-                p.conn,
-                router,
-                senders,
-                &mut per_worker_count,
-            );
-        }
+        let (stale, promote) = drive_single_pending(&listener, &mut pending, start);
+        route_single_promotions(
+            cfg,
+            &mut pending,
+            stale,
+            promote,
+            router,
+            senders,
+            &mut per_worker_count,
+        );
     }
 
     for (worker_index, sender) in senders.iter().enumerate() {
