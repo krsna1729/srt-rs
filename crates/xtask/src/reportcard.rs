@@ -8,7 +8,7 @@ use std::process::{Command, ExitCode};
 use serde_json::{Value, json};
 
 const ANALYZER_VERSION: &str = "0.0.25";
-const LIMITS_FILE: &str = "reportcard.json";
+const MANIFEST_FILE: &str = "Cargo.toml";
 const REPORT_DIR: &str = "target/reportcard";
 
 #[derive(Clone, Debug)]
@@ -68,7 +68,7 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
     };
     let limits = match load_limits(&root) {
         Ok(limits) => limits,
-        Err(error) => return fail("read reportcard.json", error),
+        Err(error) => return fail("read Cargo.toml reportcard metadata", error),
     };
 
     let violations = check_limits(&summary, &limits);
@@ -358,18 +358,27 @@ fn max_cognitive(summary: &Summary) -> u64 {
 }
 
 fn load_limits(root: &Path) -> io::Result<Limits> {
-    let path = root.join(LIMITS_FILE);
-    let value: Value = serde_json::from_str(&fs::read_to_string(path)?)
-        .map_err(|error| io::Error::other(format!("invalid reportcard JSON: {error}")))?;
-    let enforce = value
-        .get("enforce")
-        .and_then(Value::as_object)
-        .ok_or_else(|| io::Error::other("reportcard.json is missing an enforce object"))?;
+    let path = root.join(MANIFEST_FILE);
+    let value: toml::Value = toml::from_str(&fs::read_to_string(path)?)
+        .map_err(|error| io::Error::other(format!("invalid Cargo.toml: {error}")))?;
+    let reportcard = value
+        .get("workspace")
+        .and_then(toml::Value::as_table)
+        .and_then(|workspace| workspace.get("metadata"))
+        .and_then(toml::Value::as_table)
+        .and_then(|metadata| metadata.get("reportcard"))
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| io::Error::other("Cargo.toml is missing workspace.metadata.reportcard"))?;
     let required = |name: &str| {
-        enforce
+        reportcard
             .get(name)
-            .and_then(Value::as_u64)
-            .ok_or_else(|| io::Error::other(format!("enforce.{name} must be an integer")))
+            .and_then(toml::Value::as_integer)
+            .and_then(|value| u64::try_from(value).ok())
+            .ok_or_else(|| {
+                io::Error::other(format!(
+                    "workspace.metadata.reportcard.{name} must be a non-negative integer"
+                ))
+            })
     };
     Ok(Limits {
         max_cyclomatic: required("max_cyclomatic")?,

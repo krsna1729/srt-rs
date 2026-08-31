@@ -224,7 +224,8 @@ and fails.
 
 The report card applies the same absolute limit to every in-scope function:
 cyclomatic complexity 20 and cognitive complexity 15, configured in
-[`reportcard.json`](reportcard.json). Totals, averages, and percentiles are
+the `[workspace.metadata.reportcard]` section of [`Cargo.toml`](Cargo.toml).
+Totals, averages, and percentiles are
 informational trend data; adding ordinary functions is fine when each function
 stays within the limits.
 
