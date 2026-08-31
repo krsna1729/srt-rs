@@ -1037,54 +1037,68 @@ fn free_port_range(count: usize) -> std::io::Result<u16> {
 /// `16m` while the row records `16777216`, and comparing those as strings
 /// would re-run every cell forever.
 fn recorded_as(axis: &str, value: &str) -> (&'static str, String) {
-    match axis {
-        "runtime" => ("runtime", value.to_string()),
-        "encryption" => ("encryption", value.to_string()),
-        "ingress" => ("ingress", value.to_string()),
-        "egress" => ("egress", value.to_string()),
-        "promotion" => ("promotion", value.to_string()),
-        "cookie-routing" => ("cookie", value.to_string()),
-        "batch" => ("batch", value.to_string()),
-        "sock-buf" => (
-            "sock_buf",
-            match value {
-                "default" | "0" => "0".to_string(),
-                v => {
-                    let (digits, scale) = match v.strip_suffix(['m', 'M']) {
-                        Some(d) => (d, 1usize << 20),
-                        None => match v.strip_suffix(['k', 'K']) {
-                            Some(d) => (d, 1usize << 10),
-                            None => (v, 1),
-                        },
-                    };
-                    digits
-                        .parse::<usize>()
-                        .map_or_else(|_| v.to_string(), |n| (n * scale).to_string())
-                }
-            },
-        ),
-        "workers" => ("workers", value.to_string()),
-        "connections" => ("conns", value.to_string()),
-        "connect-concurrency" => ("connect_cc", value.to_string()),
-        "bond" => ("bond", value.to_string()),
-        "bitrate" => ("bitrate", value.to_string()),
-        "pin" => ("pin", value.to_string()),
-        // `off` is how a plan or CLI spells "no emulation"; the process
-        // records that as an empty cell. Normalise here so a cell's key
-        // and its recorded row agree -- they did not, which silently
-        // disabled resume for every sweep once link axes existed.
-        link if link.starts_with("link-") => (
-            Box::leak(link.replace('-', "_").into_boxed_str()),
-            if value == "off" {
-                String::new()
-            } else {
-                value.to_string()
-            },
-        ),
-        other => (
-            Box::leak(other.to_string().into_boxed_str()),
-            value.to_string(),
-        ),
+    if axis == "sock-buf" {
+        return ("sock_buf", recorded_socket_buffer(value));
+    }
+    if let Some(column) = recorded_column(axis) {
+        return (column, value.to_string());
+    }
+    if axis.starts_with("link-") {
+        return (
+            Box::leak(axis.replace('-', "_").into_boxed_str()),
+            recorded_link_value(value),
+        );
+    }
+    (
+        Box::leak(axis.to_string().into_boxed_str()),
+        value.to_string(),
+    )
+}
+
+fn recorded_column(axis: &str) -> Option<&'static str> {
+    Some(match axis {
+        "runtime" => "runtime",
+        "encryption" => "encryption",
+        "ingress" => "ingress",
+        "egress" => "egress",
+        "promotion" => "promotion",
+        "cookie-routing" => "cookie",
+        "batch" => "batch",
+        "workers" => "workers",
+        "connections" => "conns",
+        "connect-concurrency" => "connect_cc",
+        "bond" => "bond",
+        "bitrate" => "bitrate",
+        "pin" => "pin",
+        _ => return None,
+    })
+}
+
+fn recorded_socket_buffer(value: &str) -> String {
+    match value {
+        "default" | "0" => "0".to_string(),
+        value => {
+            let (digits, scale) = match value.strip_suffix(['m', 'M']) {
+                Some(digits) => (digits, 1usize << 20),
+                None => match value.strip_suffix(['k', 'K']) {
+                    Some(digits) => (digits, 1usize << 10),
+                    None => (value, 1),
+                },
+            };
+            digits
+                .parse::<usize>()
+                .map_or_else(|_| value.to_string(), |n| (n * scale).to_string())
+        }
+    }
+}
+
+// `off` is how a plan or CLI spells "no emulation"; the process records that
+// as an empty cell. Normalise here so a cell's key and its recorded row agree.
+fn recorded_link_value(value: &str) -> String {
+    if value == "off" {
+        String::new()
+    } else {
+        value.to_string()
     }
 }
 
@@ -1177,36 +1191,43 @@ fn axis_values(cli: &crate::Cli, flag: &str, default: &str) -> Vec<String> {
     )
 }
 
+const CANONICAL_AXIS_NAMES: &[(&str, &str)] = &[
+    ("runtime", "runtime"),
+    ("runtimes", "runtime"),
+    ("recv-runtime", "recv-runtime"),
+    ("recv-runtimes", "recv-runtime"),
+    ("send-runtime", "send-runtime"),
+    ("send-runtimes", "send-runtime"),
+    ("workers", "workers"),
+    ("recv-workers", "recv-workers"),
+    ("send-workers", "send-workers"),
+    ("ingress", "ingress"),
+    ("egress", "egress"),
+    ("encryption", "encryption"),
+    ("promotion", "promotion"),
+    ("cookie-routing", "cookie-routing"),
+    ("batch", "batch"),
+    ("sock-buf", "sock-buf"),
+    ("pin", "pin"),
+    ("connections", "connections"),
+    ("connect-concurrency", "connect-concurrency"),
+    ("bond", "bond"),
+    ("bitrate", "bitrate"),
+    ("link-delay", "link-delay"),
+    ("link-jitter", "link-jitter"),
+    ("link-loss", "link-loss"),
+    ("link-rate", "link-rate"),
+    ("link-reorder", "link-reorder"),
+    ("link-duplicate", "link-duplicate"),
+    ("link-corrupt", "link-corrupt"),
+    ("link-limit", "link-limit"),
+];
+
 fn canonical_axis_name(name: &str) -> Option<&'static str> {
-    Some(match name.trim() {
-        "runtime" | "runtimes" => "runtime",
-        "recv-runtime" | "recv-runtimes" => "recv-runtime",
-        "send-runtime" | "send-runtimes" => "send-runtime",
-        "workers" => "workers",
-        "recv-workers" => "recv-workers",
-        "send-workers" => "send-workers",
-        "ingress" => "ingress",
-        "egress" => "egress",
-        "encryption" => "encryption",
-        "promotion" => "promotion",
-        "cookie-routing" => "cookie-routing",
-        "batch" => "batch",
-        "sock-buf" => "sock-buf",
-        "pin" => "pin",
-        "connections" => "connections",
-        "connect-concurrency" => "connect-concurrency",
-        "bond" => "bond",
-        "bitrate" => "bitrate",
-        "link-delay" => "link-delay",
-        "link-jitter" => "link-jitter",
-        "link-loss" => "link-loss",
-        "link-rate" => "link-rate",
-        "link-reorder" => "link-reorder",
-        "link-duplicate" => "link-duplicate",
-        "link-corrupt" => "link-corrupt",
-        "link-limit" => "link-limit",
-        _ => return None,
-    })
+    CANONICAL_AXIS_NAMES
+        .iter()
+        .find(|(alias, _)| *alias == name.trim())
+        .map(|(_, canonical)| *canonical)
 }
 
 fn axis_overrides(
