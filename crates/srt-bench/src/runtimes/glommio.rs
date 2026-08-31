@@ -524,7 +524,164 @@ fn run_reuseport_multi(cfg: BenchConfig, k: usize) {
 /// tokio's `run_acceptor`, smol's `run_acceptor`, and monoio's
 /// `run_acceptor`. Only a leg that actually needs to relocate gets
 /// `glommio::spawn_local`'d as its own task, via a handoff.
-#[expect(clippy::cognitive_complexity)]
+struct AcceptorContext<'a> {
+    cfg: &'a BenchConfig,
+    worker_index: usize,
+    start: Instant,
+    admission: &'a srt_transport::AdmissionOptions,
+    router: &'a crate::SharedWorkerRouter,
+    senders: &'a [mpsc::Sender<WorkerMessage>],
+    telemetry: &'a srt_transport::IngressTelemetry,
+    tasks: &'a mut Vec<glommio::Task<ConnStats>>,
+}
+
+fn drain_acceptor_inbox(
+    inbox: &Inbox,
+    peers: &mut srt_transport::PeerTable,
+    context: &AcceptorContext<'_>,
+) {
+    while let Some((peer, data)) = inbox.borrow_mut().pop_front() {
+        peers.admit_and_forward(
+            peer,
+            &data,
+            crate::now_ts(context.start),
+            context.admission,
+            context.worker_index,
+            context.senders,
+            context.telemetry,
+        );
+    }
+}
+
+async fn maintain_acceptor_peers(
+    peers: &mut srt_transport::PeerTable,
+    listener: &glommio::net::UdpSocket,
+    start: Instant,
+    stream_len: Duration,
+) -> Vec<(SocketAddr, Option<GroupExtensionData>)> {
+    let now = crate::now_ts(start);
+    let mut relocate = Vec::new();
+    for (peer, p) in peers.iter_direct_for_bench() {
+        p.timers.fire_expired(now, &mut p.conn);
+        let _ = drain_pending_outputs(&mut p.conn, &mut p.timers, listener, *peer).await;
+        let mut newly_connected = false;
+        while let Some(event) = p.conn.poll_event() {
+            newly_connected |= p.apply_event(event);
+        }
+        if newly_connected {
+            p.stream_deadline = Some(Instant::now() + stream_len);
+            relocate.push((*peer, p.conn.peer_group_extension()));
+        }
+    }
+    relocate
+}
+
+fn promotion_decision(
+    context: &AcceptorContext<'_>,
+    peer: SocketAddr,
+    extension: Option<GroupExtensionData>,
+) -> srt_lifecycle::PromotionDecision {
+    let group = extension.map(|extension| srt_lifecycle::GroupAffinity {
+        group_id: extension.group_id,
+        stream_id: None,
+        extension,
+    });
+    match context.router.lock() {
+        Ok(mut router) => srt_lifecycle::decide_promotion(
+            context.cfg.promotion,
+            peer,
+            group,
+            context.worker_index,
+            &mut router,
+            srt_lifecycle::RoutingMode::LeastTuples,
+        ),
+        Err(_) => srt_lifecycle::PromotionDecision::StayOnListener,
+    }
+}
+
+fn apply_acceptor_promotions(
+    context: &mut AcceptorContext<'_>,
+    peers: &mut srt_transport::PeerTable,
+    relocations: Vec<(SocketAddr, Option<GroupExtensionData>)>,
+) {
+    for (peer, extension) in relocations {
+        match promotion_decision(context, peer, extension) {
+            srt_lifecycle::PromotionDecision::StayOnListener => {}
+            srt_lifecycle::PromotionDecision::RelocateTo(owner) => {
+                let Some(p) = peers.remove_direct_for_bench(peer) else {
+                    continue;
+                };
+                relocate_to_owner(
+                    context.cfg.port,
+                    context.cfg.sock_buf_bytes,
+                    peer,
+                    p.conn,
+                    owner,
+                    context.senders,
+                    context.telemetry,
+                );
+            }
+            srt_lifecycle::PromotionDecision::PromoteHere => {
+                let Some(p) = peers.remove_direct_for_bench(peer) else {
+                    continue;
+                };
+                match promote_locally(context.cfg.port, context.cfg.sock_buf_bytes, peer, p.conn) {
+                    Some(driver) => {
+                        let cfg = context.cfg.clone();
+                        let start = context.start;
+                        context.tasks.push(glommio::spawn_local(async move {
+                            established_conn_task(driver, cfg, start).await
+                        }));
+                        context.telemetry.record_local_promotion();
+                    }
+                    None => eprintln!("[bench-glommio] promote {peer}: failed"),
+                }
+            }
+        }
+    }
+}
+
+fn drain_acceptor_handoffs(
+    context: &mut AcceptorContext<'_>,
+    peers: &mut srt_transport::PeerTable,
+    handoffs: &mpsc::Receiver<WorkerMessage>,
+) {
+    while let Ok(message) = handoffs.try_recv() {
+        let handoff = match message {
+            WorkerMessage::Handoff(handoff) => handoff,
+            WorkerMessage::Finished { .. } => continue,
+            WorkerMessage::Handshake { peer, data } => {
+                peers.admit_and_forward(
+                    peer,
+                    &data,
+                    crate::now_ts(context.start),
+                    context.admission,
+                    context.worker_index,
+                    context.senders,
+                    context.telemetry,
+                );
+                continue;
+            }
+        };
+        let socket = match srt_transport::glommio_transport::from_std(handoff.socket) {
+            Ok(socket) => socket,
+            Err(error) => {
+                eprintln!(
+                    "[bench-glommio] acceptor {}: handoff register {error}",
+                    context.worker_index
+                );
+                continue;
+            }
+        };
+        let driver = Conn::new(handoff.conn, socket);
+        let cfg = context.cfg.clone();
+        let start = context.start;
+        context.tasks.push(glommio::spawn_local(async move {
+            established_conn_task(driver, cfg, start).await
+        }));
+    }
+}
+
 async fn run_acceptor(
     cfg: BenchConfig,
     worker_index: usize,
@@ -568,154 +725,45 @@ async fn run_acceptor(
         }
     });
 
-    let promotion = cfg.promotion;
     let mut peers = srt_transport::PeerTable::new();
     let admission = cfg.admission_options(std::process::id(), cfg.cookie_routing);
     let mut tasks: Vec<glommio::Task<ConnStats>> = Vec::new();
     let connect_deadline = Instant::now() + crate::CONNECT_TIMEOUT;
     let stream_len = Duration::from_secs_f64(cfg.duration_secs);
     let run_deadline = Instant::now() + stream_len + IDLE_GRACE + Duration::from_secs(30);
+    {
+        let mut context = AcceptorContext {
+            cfg: &cfg,
+            worker_index,
+            start,
+            admission: &admission,
+            router: &router,
+            senders: &senders,
+            telemetry: &telemetry,
+            tasks: &mut tasks,
+        };
 
-    loop {
-        let now = Instant::now();
-        if now >= run_deadline {
-            break;
-        }
-        // Vacuously true while nothing exists yet, so an acceptor that
-        // never admits anything still exits once the connect window
-        // closes instead of hanging on an empty guard.
-        let all_terminal = peers.all_terminal(now, connect_deadline, IDLE_GRACE);
-        if crate::shutdown::requested() || (now >= connect_deadline && all_terminal) {
-            break;
-        }
-
-        glommio::timer::sleep(TIMER_TICK).await;
-        while let Some((peer, data)) = inbox.borrow_mut().pop_front() {
-            peers.admit_and_forward(
-                peer,
-                &data,
-                crate::now_ts(start),
-                &admission,
-                worker_index,
-                &senders,
-                &telemetry,
-            );
-        }
-
-        // Drive every tracked peer: fire timers, drain outputs (always
-        // via the shared listener's unconnected `send_to` -- a peer here
-        // never gets its own socket), and react to protocol events. On a
-        // peer's *first* Connected, decide once whether it needs to
-        // relocate.
-        let t = crate::now_ts(start);
-        let mut relocate: Vec<(SocketAddr, Option<GroupExtensionData>)> = Vec::new();
-        for (peer, p) in peers.iter_direct_for_bench() {
-            p.timers.fire_expired(t, &mut p.conn);
-            let _ = drain_pending_outputs(&mut p.conn, &mut p.timers, &listener, *peer).await;
-            let mut newly_connected = false;
-            while let Some(ev) = p.conn.poll_event() {
-                newly_connected |= p.apply_event(ev);
+        loop {
+            let now = Instant::now();
+            if now >= run_deadline {
+                break;
             }
-            if newly_connected {
-                p.stream_deadline = Some(Instant::now() + stream_len);
-                relocate.push((*peer, p.conn.peer_group_extension()));
+            // Vacuously true while nothing exists yet, so an acceptor that
+            // never admits anything still exits once the connect window
+            // closes instead of hanging on an empty guard.
+            let all_terminal = peers.all_terminal(now, connect_deadline, IDLE_GRACE);
+            if crate::shutdown::requested() || (now >= connect_deadline && all_terminal) {
+                break;
             }
-        }
-        for (peer, extension) in relocate {
-            // The ladder itself is shared policy -- see
-            // `srt_lifecycle::decide_promotion`. Only the actions below
-            // are this runtime's business.
-            let decision = {
-                let group = extension.map(|extension| srt_lifecycle::GroupAffinity {
-                    group_id: extension.group_id,
-                    stream_id: None,
-                    extension,
-                });
-                match router.lock() {
-                    Ok(mut router) => srt_lifecycle::decide_promotion(
-                        promotion,
-                        peer,
-                        group,
-                        worker_index,
-                        &mut router,
-                        srt_lifecycle::RoutingMode::LeastTuples,
-                    ),
-                    // Poisoned: leave the connection where it is rather
-                    // than stall admission on a dead lock.
-                    Err(_) => srt_lifecycle::PromotionDecision::StayOnListener,
-                }
-            };
 
-            match decision {
-                srt_lifecycle::PromotionDecision::StayOnListener => {}
-                srt_lifecycle::PromotionDecision::RelocateTo(owner) => {
-                    let Some(p) = peers.remove_direct_for_bench(peer) else {
-                        continue;
-                    };
-                    relocate_to_owner(
-                        cfg.port,
-                        cfg.sock_buf_bytes,
-                        peer,
-                        p.conn,
-                        owner,
-                        &senders,
-                        &telemetry,
-                    );
-                }
-                srt_lifecycle::PromotionDecision::PromoteHere => {
-                    let Some(p) = peers.remove_direct_for_bench(peer) else {
-                        continue;
-                    };
-                    match promote_locally(cfg.port, cfg.sock_buf_bytes, peer, p.conn) {
-                        Some(driver) => {
-                            let cfg2 = cfg.clone();
-                            tasks.push(glommio::spawn_local(async move {
-                                established_conn_task(driver, cfg2, start).await
-                            }));
-                            telemetry.record_local_promotion();
-                        }
-                        None => eprintln!("[bench-glommio] promote {peer}: failed"),
-                    }
-                }
-            }
-        }
+            glommio::timer::sleep(TIMER_TICK).await;
+            drain_acceptor_inbox(&inbox, &mut peers, &context);
 
-        // Bond legs relocated here from another acceptor.
-        while let Ok(message) = handoffs.try_recv() {
-            let handoff = match message {
-                WorkerMessage::Handoff(handoff) => handoff,
-                // A handshake datagram routed here by its cookie: feed it
-                // to the peer state that owns it.
-                // Only the single-acceptor strategy sends this, and it
-                // never targets a ReuseportMulti acceptor. Named rather
-                // than caught by `_` so a new variant still has to be
-                // considered here.
-                WorkerMessage::Finished { .. } => continue,
-                WorkerMessage::Handshake { peer, data } => {
-                    peers.admit_and_forward(
-                        peer,
-                        &data,
-                        crate::now_ts(start),
-                        &admission,
-                        worker_index,
-                        &senders,
-                        &telemetry,
-                    );
-                    continue;
-                }
-            };
-            let sock = match srt_transport::glommio_transport::from_std(handoff.socket) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("[bench-glommio] acceptor {worker_index}: handoff register {e}");
-                    continue;
-                }
-            };
-            let driver = Conn::new(handoff.conn, sock);
-            let cfg2 = cfg.clone();
-            tasks.push(glommio::spawn_local(async move {
-                established_conn_task(driver, cfg2, start).await
-            }));
+            let relocations =
+                maintain_acceptor_peers(&mut peers, &listener, start, stream_len).await;
+            apply_acceptor_promotions(&mut context, &mut peers, relocations);
+
+            drain_acceptor_handoffs(&mut context, &mut peers, &handoffs);
         }
     }
 
