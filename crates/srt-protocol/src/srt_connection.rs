@@ -1752,135 +1752,138 @@ impl SrtConnection {
             return Ok(());
         }
         match hs.handshake_type {
-            HandshakeType::Induction => {
-                // INDUCTION リクエスト受信
-                if self.handshake_state == HandshakeState::Completed {
-                    self.retransmit_handshake();
-                    return Ok(());
-                }
-                self.peer_socket_id = hs.socket_id;
-                self.syn_cookie = self.options.syn_cookie.unwrap_or(0);
-                if self.handshake_started_at.is_none() {
-                    self.handshake_started_at = Some(now);
-                    self.handshake_retry_sequence = 0;
-                }
+            HandshakeType::Induction => self.handle_listener_induction(hs, now),
+            HandshakeType::Conclusion => self.handle_listener_conclusion(hs, hsreq_timestamp, now),
+            _ => Ok(()),
+        }
+    }
 
-                // Stamp the session clock before responding so the
-                // INDUCTION response carries a real timestamp (see the
-                // CONCLUSION arm for why a zero stamp breaks the caller's
-                // TSBPD time base).
-                if self.start_time.is_none() {
-                    self.start_time = Some(now);
-                }
-                self.send_induction_response(now);
-                self.handshake_state = HandshakeState::InductionReceived;
-                self.arm_handshake_timer(now);
-            }
-            HandshakeType::Conclusion => {
-                // CONCLUSION リクエスト受信
-                if self.handshake_state == HandshakeState::Completed {
-                    self.retransmit_handshake();
-                    return Ok(());
-                }
-                if self.handshake_state != HandshakeState::InductionReceived {
-                    return Ok(());
-                }
+    fn handle_listener_induction(
+        &mut self,
+        hs: HandshakePacket,
+        now: Timestamp,
+    ) -> Result<(), Error> {
+        if self.handshake_state == HandshakeState::Completed {
+            self.retransmit_handshake();
+            return Ok(());
+        }
+        self.peer_socket_id = hs.socket_id;
+        self.syn_cookie = self.options.syn_cookie.unwrap_or(0);
+        if self.handshake_started_at.is_none() {
+            self.handshake_started_at = Some(now);
+            self.handshake_retry_sequence = 0;
+        }
+        // Stamp the session clock before responding so the INDUCTION
+        // response carries a real timestamp for the caller's TSBPD base.
+        if self.start_time.is_none() {
+            self.start_time = Some(now);
+        }
+        self.send_induction_response(now);
+        self.handshake_state = HandshakeState::InductionReceived;
+        self.arm_handshake_timer(now);
+        Ok(())
+    }
 
-                // Cookie 検証
-                if hs.syn_cookie != self.syn_cookie {
-                    return Err(Error::handshake_rejected("invalid SYN cookie"));
-                }
-
-                // SRT 仕様 (Conclusion Response): Listener が Caller に優先権を持つのは
-                // Cipher Family と Block Size のみ。ISN は Caller の値を採用する。
-                self.initial_seq = hs.initial_packet_seq;
-
-                // Stream ID を取得・保存
-                if let Some(stream_id) = hs.get_sid_extension() {
-                    self.peer_stream_id = Some(stream_id);
-                }
-                self.peer_group_extension = hs.get_group_extension();
-                self.peer_congestion_control = hs.get_congestion_extension();
-                self.apply_peer_handshake_extension(&hs);
-
-                // KMREQ を処理して CryptoContext を作成
-                if let Some(ref passphrase) = self.options.passphrase {
-                    let Some(km_result) = hs.get_km_request() else {
-                        return Err(self.fail_listener_km(
-                            now,
-                            KmError::NoSecret,
-                            "encryption required but no KMREQ",
-                        ));
-                    };
-                    let km = km_result?;
-                    let Some(cipher_mode) = CipherMode::from_km(&km) else {
-                        return Err(self.fail_listener_km(
-                            now,
-                            KmError::BadSecret,
-                            "inconsistent cipher/auth fields in KMREQ",
-                        ));
-                    };
-                    let crypto = match CryptoContext::new_receiver(
-                        passphrase,
-                        km.salt,
-                        &km.wrapped_key,
-                        km.key_flag,
-                        km.key_length,
-                        cipher_mode,
-                    ) {
-                        Ok(crypto) => crypto,
-                        Err(_) => {
-                            return Err(self.fail_listener_km(
-                                now,
-                                KmError::BadSecret,
-                                "incorrect passphrase or invalid key material",
-                            ));
-                        }
-                    };
-                    self.crypto = Some(crypto);
-                    self.received_km = Some(km);
-                } else if hs.get_km_request().is_some() {
-                    return Err(self.fail_listener_km(
-                        now,
-                        KmError::Unsecured,
-                        "caller requested encryption but listener is unsecured",
-                    ));
-                }
-
-                // The session clock was stamped at INDUCTION (first
-                // contact); the CONCLUSION response therefore carries the
-                // listener's true session-relative timestamp. The caller
-                // computes its TSBPD time base from this packet's timestamp
-                // (spec §4.5.1.1: TsbpdTimeBase = T_NOW − HSREQ_TIMESTAMP,
-                // ≈ RTT_0/2). Overwriting start_time here would zero the
-                // stamp again and inflate the caller's time base to its
-                // entire handshake duration.
-                self.send_conclusion_response(now);
-                self.handshake_state = HandshakeState::Completed;
-                self.handshake_started_at = None;
-                self.set_state(ConnectionState::Connected);
-
-                // TSBPD 時刻基準を計算
-                let tsbpd_time_base = now.as_micros().saturating_sub(hsreq_timestamp as u64);
-
-                // バッファ初期化
-                self.init_buffers(now, hs.initial_packet_seq, tsbpd_time_base);
-
-                self.output_queue.push_back(ConnectionOutput::ClearTimer {
-                    id: TimerId::Handshake,
-                });
-
-                // タイマー設定
-                self.setup_connection_timers();
-
-                self.clear_config_secrets();
-
-                self.event_queue.push_back(ConnectionEvent::Connected);
-            }
-            _ => {}
+    fn handle_listener_conclusion(
+        &mut self,
+        hs: HandshakePacket,
+        hsreq_timestamp: u32,
+        now: Timestamp,
+    ) -> Result<(), Error> {
+        if self.handshake_state == HandshakeState::Completed {
+            self.retransmit_handshake();
+            return Ok(());
+        }
+        if self.handshake_state != HandshakeState::InductionReceived {
+            return Ok(());
+        }
+        if hs.syn_cookie != self.syn_cookie {
+            return Err(Error::handshake_rejected("invalid SYN cookie"));
         }
 
+        self.initial_seq = hs.initial_packet_seq;
+        if let Some(stream_id) = hs.get_sid_extension() {
+            self.peer_stream_id = Some(stream_id);
+        }
+        self.peer_group_extension = hs.get_group_extension();
+        self.peer_congestion_control = hs.get_congestion_extension();
+        self.apply_peer_handshake_extension(&hs);
+        self.configure_listener_crypto(&hs, now)?;
+        self.complete_listener_handshake(&hs, hsreq_timestamp, now);
         Ok(())
+    }
+
+    fn configure_listener_crypto(
+        &mut self,
+        hs: &HandshakePacket,
+        now: Timestamp,
+    ) -> Result<(), Error> {
+        if let Some(passphrase) = self.options.passphrase.clone() {
+            let Some(km_result) = hs.get_km_request() else {
+                return Err(self.fail_listener_km(
+                    now,
+                    KmError::NoSecret,
+                    "encryption required but no KMREQ",
+                ));
+            };
+            let km = km_result?;
+            let Some(cipher_mode) = CipherMode::from_km(&km) else {
+                return Err(self.fail_listener_km(
+                    now,
+                    KmError::BadSecret,
+                    "inconsistent cipher/auth fields in KMREQ",
+                ));
+            };
+            let crypto = match CryptoContext::new_receiver(
+                &passphrase,
+                km.salt,
+                &km.wrapped_key,
+                km.key_flag,
+                km.key_length,
+                cipher_mode,
+            ) {
+                Ok(crypto) => crypto,
+                Err(_) => {
+                    return Err(self.fail_listener_km(
+                        now,
+                        KmError::BadSecret,
+                        "incorrect passphrase or invalid key material",
+                    ));
+                }
+            };
+            self.crypto = Some(crypto);
+            self.received_km = Some(km);
+        } else if hs.get_km_request().is_some() {
+            return Err(self.fail_listener_km(
+                now,
+                KmError::Unsecured,
+                "caller requested encryption but listener is unsecured",
+            ));
+        }
+        Ok(())
+    }
+
+    fn complete_listener_handshake(
+        &mut self,
+        hs: &HandshakePacket,
+        hsreq_timestamp: u32,
+        now: Timestamp,
+    ) {
+        // The session clock was stamped at INDUCTION, so this response's
+        // timestamp lets the caller derive the initial TSBPD time base.
+        self.send_conclusion_response(now);
+        self.handshake_state = HandshakeState::Completed;
+        self.handshake_started_at = None;
+        self.set_state(ConnectionState::Connected);
+
+        let tsbpd_time_base = now.as_micros().saturating_sub(hsreq_timestamp as u64);
+        self.init_buffers(now, hs.initial_packet_seq, tsbpd_time_base);
+        self.output_queue.push_back(ConnectionOutput::ClearTimer {
+            id: TimerId::Handshake,
+        });
+        self.setup_connection_timers();
+        self.clear_config_secrets();
+        self.event_queue.push_back(ConnectionEvent::Connected);
     }
 
     fn handle_ack(&mut self, pkt: ControlPacket, now: Timestamp) -> Result<(), Error> {
