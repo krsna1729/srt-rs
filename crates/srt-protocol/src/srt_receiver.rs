@@ -40,6 +40,7 @@ const _: () = assert!(MAX_ACK_TIMESTAMPS.is_power_of_two());
 
 /// Number of samples used for Link Capacity estimation.
 const LINK_CAPACITY_SAMPLES: usize = 16;
+const _: () = assert!(LINK_CAPACITY_SAMPLES.is_power_of_two());
 
 /// Number of ACKACK samples used to estimate TSBPD clock drift.
 ///
@@ -587,8 +588,10 @@ impl ReceivingRateEstimator {
 struct LinkCapacityEstimator {
     /// Last packet arrival time.
     last_packet_time: Option<Timestamp>,
-    /// Packet Pair arrival interval samples.
-    intervals: Vec<u64>,
+    /// Packet Pair arrival intervals in oldest-overwrite order.
+    intervals: Option<Box<[u64; LINK_CAPACITY_SAMPLES]>>,
+    next_interval: u8,
+    interval_count: u8,
     /// Estimated link capacity (packets/sec).
     estimated_capacity: u32,
 }
@@ -597,7 +600,9 @@ impl LinkCapacityEstimator {
     fn new() -> Self {
         Self {
             last_packet_time: None,
-            intervals: Vec::with_capacity(LINK_CAPACITY_SAMPLES),
+            intervals: None,
+            next_interval: 0,
+            interval_count: 0,
             estimated_capacity: 0,
         }
     }
@@ -609,11 +614,15 @@ impl LinkCapacityEstimator {
 
             // Only record plausible intervals (1us - 100ms).
             if (1..100_000).contains(&interval) {
-                self.intervals.push(interval);
-                // Keep the most recent N samples.
-                if self.intervals.len() > LINK_CAPACITY_SAMPLES {
-                    self.intervals.remove(0);
-                }
+                let intervals = self
+                    .intervals
+                    .get_or_insert_with(|| Box::new([0; LINK_CAPACITY_SAMPLES]));
+                intervals[self.next_interval as usize] = interval;
+                self.next_interval = (self.next_interval + 1) & (LINK_CAPACITY_SAMPLES as u8 - 1);
+                self.interval_count = self
+                    .interval_count
+                    .saturating_add(1)
+                    .min(LINK_CAPACITY_SAMPLES as u8);
             }
         }
         self.last_packet_time = Some(now);
@@ -621,21 +630,17 @@ impl LinkCapacityEstimator {
 
     /// Calculate the link capacity.
     fn calculate_capacity(&mut self) -> u32 {
-        if self.intervals.is_empty() {
+        let Some(intervals) = self.intervals.as_ref() else {
             return self.estimated_capacity;
-        }
+        };
 
         // Get the minimum interval (Packet Pair Technique).
         // Use the median of the bottom 25% to reduce noise.
-        let mut sorted = self.intervals.clone();
-        sorted.sort();
-
-        let quartile_idx = sorted.len() / 4;
-        let min_interval = if quartile_idx > 0 {
-            sorted[quartile_idx]
-        } else {
-            sorted[0]
-        };
+        let mut sorted = **intervals;
+        let sample_count = self.interval_count as usize;
+        sorted[..sample_count].sort_unstable();
+        let quartile_idx = sample_count / 4;
+        let min_interval = sorted[quartile_idx];
 
         if let Some(capacity) = 1_000_000u64.checked_div(min_interval).map(|v| v as u32) {
             // Smooth with EWMA.
@@ -2417,6 +2422,41 @@ mod tests {
     }
 
     #[test]
+    fn link_capacity_estimator_uses_one_fixed_lazy_backing() {
+        let mut estimator = LinkCapacityEstimator::new();
+        assert!(estimator.intervals.is_none());
+
+        estimator.on_packet_received(Timestamp::from_micros(0));
+        estimator.on_packet_received(Timestamp::from_micros(0));
+        assert!(estimator.intervals.is_none());
+        estimator.on_packet_received(Timestamp::from_micros(100));
+
+        let bytes = std::mem::size_of_val(
+            estimator
+                .intervals
+                .as_deref()
+                .expect("the first valid interval allocates the fixed backing"),
+        );
+        assert_eq!(bytes, 128);
+        assert_eq!(estimator.interval_count, 1);
+    }
+
+    #[test]
+    fn link_capacity_estimator_retains_latest_sixteen_intervals() {
+        let mut estimator = LinkCapacityEstimator::new();
+        let mut arrival = 0;
+        estimator.on_packet_received(Timestamp::from_micros(arrival));
+        for interval in 1..=20 {
+            arrival += interval;
+            estimator.on_packet_received(Timestamp::from_micros(arrival));
+        }
+
+        assert_eq!(estimator.interval_count, 16);
+        // The retained intervals are 5..=20. Index 16 / 4 selects 9us.
+        assert_eq!(estimator.calculate_capacity(), 1_000_000 / 9);
+    }
+
+    #[test]
     fn test_rtt_calculation_with_ack_timestamps() {
         let start = Timestamp::from_micros(0);
         let mut buf = ReceiverBuffer::new(1000, 120, start, 0);
@@ -3478,13 +3518,16 @@ mod tests {
     fn receiver_buffer_inline_footprint_stays_bounded() {
         let bytes = std::mem::size_of::<ReceiverBuffer>();
         let ack_bytes = std::mem::size_of::<AckTimestampTracker>();
+        let link_capacity_bytes = std::mem::size_of::<LinkCapacityEstimator>();
         eprintln!("ReceiverBuffer inline footprint: {bytes} bytes");
         eprintln!("ACK timestamp ring inline footprint: {ack_bytes} bytes");
+        eprintln!("link-capacity ring inline footprint: {link_capacity_bytes} bytes");
         assert!(
             bytes <= 512,
             "inline receiver state grew beyond its resource budget: {bytes} bytes"
         );
         assert!(ack_bytes <= 16);
+        assert!(link_capacity_bytes <= 32);
     }
 
     #[test]
