@@ -1809,6 +1809,111 @@ fn run_matrix_processes(context: MatrixProcessContext<'_, '_>, port: u16) -> std
     Ok(())
 }
 
+fn detect_matrix_netns(cells: &[Cell<'_>]) -> std::io::Result<Option<Priv>> {
+    let mut any_link = false;
+    for cell in cells {
+        if netem_args(|flag| matrix_cell_link(cell, flag))
+            .map_err(std::io::Error::other)?
+            .is_some()
+        {
+            any_link = true;
+        }
+    }
+    if !any_link {
+        return Ok(None);
+    }
+
+    let privilege = Priv::detect().ok_or_else(|| std::io::Error::other(netem_privilege_help()))?;
+    netns_up(privilege)?;
+    eprintln!("matrix: running roles inside netns '{NETNS}' (link emulation active)");
+    Ok(Some(privilege))
+}
+
+struct MatrixScheduleContext<'a, 'cell> {
+    exe: &'a Path,
+    out: &'a Path,
+    cells: &'a [Cell<'cell>],
+    schedule: &'a MatrixSchedule,
+    reps: usize,
+    secs: u64,
+    latency: u16,
+    recv_cpus: &'a str,
+    send_cpus: &'a str,
+    netns: Option<Priv>,
+}
+
+fn run_matrix_schedule(context: MatrixScheduleContext<'_, '_>) -> std::io::Result<usize> {
+    let MatrixScheduleContext {
+        exe,
+        out,
+        cells,
+        schedule,
+        reps,
+        secs,
+        latency,
+        recv_cpus,
+        send_cpus,
+        netns,
+    } = context;
+    let mut skipped_runs = 0usize;
+    let mut unsupported_cells = std::collections::HashSet::new();
+    for (run_index, (cell_index, rep)) in schedule.runs.iter().copied().enumerate() {
+        let cell = &cells[cell_index];
+        let config = matrix_cell_config(cell);
+        // Skip combinations the runtime does not implement rather than
+        // running them and recording the wreckage: an unsupported cell
+        // produces bind collisions that look exactly like a harness bug.
+        if !matrix_cell_supported(&config) {
+            if unsupported_cells.insert(cell_index) {
+                skipped_runs += reps;
+                eprintln!("[skip] {} (unsupported)", config.label.join(" "));
+            }
+            continue;
+        }
+        if schedule.done.contains(&cell_key(cell, rep)) {
+            continue;
+        }
+        if let Some(privilege) = netns {
+            netem_apply(
+                privilege,
+                netem_args(|flag| matrix_cell_link(cell, flag)).map_err(std::io::Error::other)?,
+            )?;
+        }
+        // A per-port cell can ask for more descriptors than this process may
+        // hold while probing the range. Treat that as an unavailable cell and
+        // continue the sweep so pooled results are still visible.
+        let port = match free_port_range(config.ports_needed) {
+            Ok(port) => port,
+            Err(error) => {
+                skipped_runs += 1;
+                eprintln!(
+                    "[skip] {} (port allocation failed: {error})",
+                    config.label.join(" ")
+                );
+                continue;
+            }
+        };
+        run_matrix_processes(
+            MatrixProcessContext {
+                exe,
+                out,
+                cell,
+                config: &config,
+                rep,
+                secs,
+                latency,
+                recv_cpus,
+                send_cpus,
+                netns,
+                run_index,
+                total: schedule.total,
+            },
+            port,
+        )?;
+    }
+    Ok(skipped_runs)
+}
+
 /// Run the cartesian product of the requested axes, one receiver/sender
 /// pair per cell, appending both sides' results to `out`.
 ///
@@ -1854,93 +1959,27 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
         );
     }
     let (order, seed) = matrix_order(cli)?;
-    let MatrixSchedule {
-        runs: schedule,
-        done,
-        total,
-    } = build_matrix_schedule(&cells, &axes, reps, order, seed, &out)?;
+    let schedule = build_matrix_schedule(&cells, &axes, reps, order, seed, &out)?;
 
     // Every cell of a netem sweep runs inside the namespace, including the
     // `netem=none` ones: a namespace's loopback is not identical to the
     // host's, so mixing the two would confound the comparison the sweep
     // exists to make.
     // Fail before the first cell rather than midway through a sweep.
-    let mut any_link = false;
-    for cell in &cells {
-        if netem_args(|f| matrix_cell_link(cell, f))
-            .map_err(std::io::Error::other)?
-            .is_some()
-        {
-            any_link = true;
-        }
-    }
-    let netns = if any_link {
-        let p = Priv::detect().ok_or_else(|| std::io::Error::other(netem_privilege_help()))?;
-        netns_up(p)?;
-        eprintln!("matrix: running roles inside netns '{NETNS}' (link emulation active)");
-        Some(p)
-    } else {
-        None
-    };
+    let netns = detect_matrix_netns(&cells)?;
 
-    let mut skipped_runs = 0usize;
-    let mut unsupported_cells = std::collections::HashSet::new();
-    for (run_index, (cell_index, rep)) in schedule.iter().copied().enumerate() {
-        let cell = &cells[cell_index];
-        let config = matrix_cell_config(cell);
-        // Skip combinations the runtime does not implement rather than
-        // running them and recording the wreckage: an unsupported cell
-        // produces bind collisions that look exactly like a harness bug.
-        if !matrix_cell_supported(&config) {
-            if unsupported_cells.insert(cell_index) {
-                skipped_runs += reps;
-                eprintln!("[skip] {} (unsupported)", config.label.join(" "));
-            }
-            continue;
-        }
-        if done.contains(&cell_key(cell, rep)) {
-            continue;
-        }
-        if let Some(p) = netns {
-            netem_apply(
-                p,
-                netem_args(|f| matrix_cell_link(cell, f)).map_err(std::io::Error::other)?,
-            )?;
-        }
-        // A per-port cell at the top of the sweep can legitimately ask
-        // for more descriptors than this process may hold while probing
-        // the range (the full plan reaches 1200 connections). Treat that
-        // as an unavailable resource cell and continue the sweep so one
-        // impossible topology does not hide every pooled result after it.
-        let port = match free_port_range(config.ports_needed) {
-            Ok(port) => port,
-            Err(error) => {
-                skipped_runs += 1;
-                eprintln!(
-                    "[skip] {} (port allocation failed: {error})",
-                    config.label.join(" ")
-                );
-                continue;
-            }
-        };
-        run_matrix_processes(
-            MatrixProcessContext {
-                exe: &exe,
-                out: &out,
-                cell,
-                config: &config,
-                rep,
-                secs,
-                latency,
-                recv_cpus: &recv_cpus,
-                send_cpus: &send_cpus,
-                netns,
-                run_index,
-                total,
-            },
-            port,
-        )?;
-    }
+    let skipped_runs = run_matrix_schedule(MatrixScheduleContext {
+        exe: &exe,
+        out: &out,
+        cells: &cells,
+        schedule: &schedule,
+        reps,
+        secs,
+        latency,
+        recv_cpus: &recv_cpus,
+        send_cpus: &send_cpus,
+        netns,
+    })?;
     if let Some(p) = netns {
         netns_down(p);
     }
