@@ -370,6 +370,14 @@ pub struct ReceiverBuffer {
     /// The next expected sequence number.
     expected_seq: u32,
 
+    /// Highest sequence position whose receive/loss/drop state has already
+    /// been classified. Positions through this frontier form one contiguous
+    /// interval in 31-bit circular sequence order. A packet beyond it can
+    /// therefore expose only the interval immediately after the frontier;
+    /// packets at or behind it can only recover a known loss or duplicate
+    /// already-accounted state.
+    loss_detection_frontier: u32,
+
     /// Loss list (detected missing packets). `contains`/`insert`/`remove`
     /// are on the per-packet hot path and must be O(1), so we use
     /// `FxHashSet` (upstream issue 0055 was Vec with O(n) retains).
@@ -500,6 +508,12 @@ pub struct ReceiverBuffer {
 
     #[cfg(test)]
     receive_expected_sequence_scans: Cell<usize>,
+
+    /// Number of newly exposed missing positions inspected by loss detection.
+    /// This makes the persistent-old-hole complexity invariant testable
+    /// without putting instrumentation in production builds.
+    #[cfg(test)]
+    loss_detection_steps: Cell<usize>,
 }
 
 impl ReceiverBuffer {
@@ -530,6 +544,7 @@ impl ReceiverBuffer {
             packets: BTreeMap::new(),
             delivery_seq_hint: None,
             expected_seq: initial_seq,
+            loss_detection_frontier: initial_seq.wrapping_sub(1) & 0x7FFF_FFFF,
             last_advertised_buffer: 0,
             loss_list: FxHashSet::default(),
             loss_list_min: None,
@@ -571,6 +586,8 @@ impl ReceiverBuffer {
             delivery_scan_calls: Cell::new(0),
             #[cfg(test)]
             receive_expected_sequence_scans: Cell::new(0),
+            #[cfg(test)]
+            loss_detection_steps: Cell::new(0),
         }
     }
 
@@ -621,6 +638,14 @@ impl ReceiverBuffer {
     pub fn advance_expected_sequence(&mut self, sequence_number: u32) {
         if !sequence_greater_than(sequence_number, self.expected_seq) {
             return;
+        }
+
+        // A forced advance intentionally accounts for every skipped position
+        // without declaring it lost. Keep the classification interval
+        // contiguous so a later packet cannot rediscover the skipped range.
+        let skipped_through = sequence_number.wrapping_sub(1) & 0x7FFF_FFFF;
+        if sequence_greater_than(skipped_through, self.loss_detection_frontier) {
+            self.loss_detection_frontier = skipped_through;
         }
 
         self.packets
@@ -740,56 +765,30 @@ impl ReceiverBuffer {
         }
     }
 
-    /// Detect losses in the gap between expected_seq and `seq`.
+    /// Classify the newly exposed interval ending at received packet `seq`.
     ///
-    /// Uses ordered-map range queries to find contiguous missing runs in
-    /// O(runs * log n + emitted) rather than reconstructing and sorting the
-    /// whole packet order for every receive behind an unresolved loss.
+    /// The frontier makes the cost proportional to sequence positions exposed
+    /// for the first time. An old unresolved hole is never revisited merely
+    /// because later in-order packets continue to arrive.
     fn detect_losses(&mut self, seq: u32) -> Vec<u32> {
         let mut new_losses = Vec::new();
-        if !sequence_greater_than(seq, self.expected_seq) {
+        if !sequence_greater_than(seq, self.loss_detection_frontier) {
             return new_losses;
         }
 
-        let mut s = self.expected_seq;
-        while sequence_less_than(s, seq) {
-            if self.packets.contains_key(&s) {
-                s = s.wrapping_add(1) & 0x7FFF_FFFF;
-                continue;
+        let mut missing = self.loss_detection_frontier.wrapping_add(1) & 0x7FFF_FFFF;
+        while missing != seq {
+            #[cfg(test)]
+            self.loss_detection_steps
+                .set(self.loss_detection_steps.get().saturating_add(1));
+            if !self.loss_list.contains(&missing) {
+                new_losses.push(missing);
+                self.loss_list_insert(missing);
+                self.total_lost += 1;
             }
-            let upper = self
-                .packets
-                .range(s..)
-                .next()
-                .map(|(&packet_seq, _)| packet_seq);
-            let lower = if s > seq {
-                self.packets
-                    .range(..seq)
-                    .next()
-                    .map(|(&packet_seq, _)| packet_seq)
-            } else {
-                None
-            };
-            let candidate = match (upper, lower) {
-                (Some(packet_seq), _) => Some(packet_seq),
-                (None, lower) => lower,
-            };
-            let run_end = candidate
-                .filter(|&packet_seq| {
-                    sequence_less_than(s, packet_seq) && sequence_less_than(packet_seq, seq)
-                })
-                .unwrap_or(seq);
-            let mut missing = s;
-            while missing != run_end {
-                if !self.loss_list.contains(&missing) {
-                    new_losses.push(missing);
-                    self.loss_list_insert(missing);
-                    self.total_lost += 1;
-                }
-                missing = missing.wrapping_add(1) & 0x7FFF_FFFF;
-            }
-            s = run_end;
+            missing = missing.wrapping_add(1) & 0x7FFF_FFFF;
         }
+        self.loss_detection_frontier = seq;
         new_losses
     }
 
@@ -955,6 +954,11 @@ impl ReceiverBuffer {
     #[cfg(test)]
     fn receive_expected_sequence_scans(&self) -> usize {
         self.receive_expected_sequence_scans.get()
+    }
+
+    #[cfg(test)]
+    fn loss_detection_steps(&self) -> usize {
+        self.loss_detection_steps.get()
     }
 
     /// Whether the current ACK position was already confirmed by an ACKACK.
@@ -1194,6 +1198,20 @@ impl ReceiverBuffer {
             ));
         }
 
+        // A request beginning beyond the classified receive window is not a
+        // credible sender transition. Reject it before loss classification so
+        // an attacker cannot turn a short, valid-length DROPREQ into a walk of
+        // an arbitrarily large 31-bit sequence gap.
+        if sequence_greater_than(first_seq, self.loss_detection_frontier) {
+            let frontier_distance =
+                first_seq.wrapping_sub(self.loss_detection_frontier) & SEQUENCE_MASK;
+            if frontier_distance > self.max_buffer_size.saturating_add(1) {
+                return Err(Error::invalid_data(
+                    "DROPREQ begins beyond receive buffer window",
+                ));
+            }
+        }
+
         Ok(distance)
     }
 
@@ -1208,6 +1226,17 @@ impl ReceiverBuffer {
         let sequence_count = distance + 1;
         let in_range = |seq: u32| seq.wrapping_sub(first_seq) & SEQUENCE_MASK <= distance;
         let hint_was_dropped = self.delivery_seq_hint.is_some_and(in_range);
+
+        // A DROPREQ can be the first evidence of sequence progress beyond the
+        // classification frontier. Any intervening positions are genuine
+        // newly exposed losses; the requested interval itself is accounted as
+        // dropped and must never be rediscovered by a later packet.
+        if sequence_greater_than(last_seq, self.loss_detection_frontier) {
+            if sequence_greater_than(first_seq, self.loss_detection_frontier) {
+                let _ = self.detect_losses(first_seq);
+            }
+            self.loss_detection_frontier = last_seq;
+        }
 
         // Remove only packet keys that lie in the requested numeric interval.
         // A circular range has at most two such intervals. Repeating a range
@@ -2674,6 +2703,93 @@ mod tests {
     }
 
     #[test]
+    fn loss_frontier_does_not_revisit_a_persistent_old_hole() {
+        let mut buf = ReceiverBuffer::new(0, 120, Timestamp::from_micros(0), 0);
+        buf.set_tsbpd_enabled(false);
+        let now = Timestamp::from_micros(1_000);
+
+        assert_eq!(buf.receive(make_packet(1, 1), now), Some(vec![0]));
+        for seq in 2..DEFAULT_FLOW_WINDOW {
+            assert_eq!(buf.receive(make_packet(seq, seq), now), None);
+        }
+
+        assert_eq!(buf.loss_detection_frontier, DEFAULT_FLOW_WINDOW - 1);
+        assert_eq!(buf.loss_detection_steps(), 1);
+        assert_eq!(buf.stats().total_lost, 1);
+        assert_eq!(buf.generate_periodic_nak().unwrap().loss_list, vec![0]);
+    }
+
+    #[test]
+    fn loss_frontier_only_exposes_new_gap_after_late_recovery() {
+        let mut buf = ReceiverBuffer::new(100, 120, Timestamp::from_micros(0), 0);
+        buf.set_tsbpd_enabled(false);
+        let now = Timestamp::from_micros(1_000);
+
+        assert_eq!(buf.receive(make_packet(102, 1), now), Some(vec![100, 101]));
+        assert_eq!(buf.receive(make_packet(101, 2), now), None);
+        assert_eq!(buf.loss_detection_steps(), 2);
+        assert_eq!(buf.receive(make_packet(104, 3), now), Some(vec![103]));
+        assert_eq!(buf.loss_detection_steps(), 3);
+        assert_eq!(buf.loss_detection_frontier, 104);
+        assert_eq!(
+            buf.generate_periodic_nak().unwrap().loss_list,
+            vec![100, 103]
+        );
+    }
+
+    #[test]
+    fn loss_frontier_crosses_31_bit_wrap_once() {
+        let initial = 0x7FFF_FFFE;
+        let mut buf = ReceiverBuffer::new(initial, 120, Timestamp::from_micros(0), 0);
+        buf.set_tsbpd_enabled(false);
+        let now = Timestamp::from_micros(1_000);
+
+        assert_eq!(
+            buf.receive(make_packet(0, 1), now),
+            Some(vec![0x7FFF_FFFE, 0x7FFF_FFFF])
+        );
+        assert_eq!(buf.receive(make_packet(1, 2), now), None);
+        assert_eq!(buf.receive(make_packet(0x7FFF_FFFF, 3), now), None);
+        assert_eq!(buf.loss_detection_frontier, 1);
+        assert_eq!(buf.loss_detection_steps(), 2);
+        assert_eq!(
+            buf.generate_periodic_nak().unwrap().loss_list,
+            vec![0x7FFF_FFFE]
+        );
+    }
+
+    #[test]
+    fn drop_range_extends_frontier_without_resurrecting_dropped_positions() {
+        let mut buf = ReceiverBuffer::new(100, 120, Timestamp::from_micros(0), 0);
+        buf.set_tsbpd_enabled(false);
+        let now = Timestamp::from_micros(1_000);
+
+        assert_eq!(buf.receive(make_packet(100, 1), now), None);
+        let summary = buf.drop_range(103, 104).expect("valid forward drop");
+        assert_eq!(summary.sequence_count, 2);
+        assert_eq!(buf.loss_detection_frontier, 104);
+        assert_eq!(buf.receive(make_packet(105, 2), now), None);
+        assert_eq!(
+            buf.generate_periodic_nak().unwrap().loss_list,
+            vec![101, 102]
+        );
+        assert_eq!(buf.stats().total_lost, 2);
+    }
+
+    #[test]
+    fn forced_advance_accounts_for_skipped_positions_at_frontier() {
+        let mut buf = ReceiverBuffer::new(100, 120, Timestamp::from_micros(0), 0);
+        buf.set_tsbpd_enabled(false);
+        let now = Timestamp::from_micros(1_000);
+
+        buf.advance_expected_sequence(105);
+        assert_eq!(buf.loss_detection_frontier, 104);
+        assert_eq!(buf.receive(make_packet(106, 1), now), Some(vec![105]));
+        assert_eq!(buf.loss_detection_steps(), 1);
+        assert_eq!(buf.generate_periodic_nak().unwrap().loss_list, vec![105]);
+    }
+
+    #[test]
     fn jitter_accumulates_over_successive_packets() {
         let start = Timestamp::from_micros(0);
         let mut buf = ReceiverBuffer::new(100, 120, start, 0);
@@ -2768,6 +2884,32 @@ mod tests {
         assert_eq!(error.kind, crate::error::ErrorKind::InvalidData);
         assert_eq!(buf.expected_sequence(), 100);
         assert_eq!(buf.stats().total_dropped, 0);
+    }
+
+    #[test]
+    fn drop_range_rejects_far_future_start_before_classifying_gap() {
+        let start = Timestamp::from_micros(0);
+        let mut buf = ReceiverBuffer::with_buffer_size(100, 120, start, 0, 4);
+
+        let error = buf
+            .drop_range(105, 105)
+            .expect_err("the start lies beyond the four-packet receive window");
+        assert_eq!(error.kind, crate::error::ErrorKind::InvalidData);
+        assert_eq!(buf.expected_sequence(), 100);
+        assert_eq!(buf.loss_detection_frontier, 99);
+        assert_eq!(buf.loss_detection_steps(), 0);
+        assert_eq!(buf.stats().total_lost, 0);
+        assert_eq!(buf.stats().total_dropped, 0);
+    }
+
+    #[test]
+    fn receiver_buffer_inline_footprint_stays_bounded() {
+        let bytes = std::mem::size_of::<ReceiverBuffer>();
+        eprintln!("ReceiverBuffer inline footprint: {bytes} bytes");
+        assert!(
+            bytes <= 512,
+            "inline receiver state grew beyond its resource budget: {bytes} bytes"
+        );
     }
 
     #[test]

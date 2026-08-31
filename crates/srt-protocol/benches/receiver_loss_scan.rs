@@ -148,6 +148,43 @@ fn bench_burst_receive(c: &mut Criterion) {
     group.finish();
 }
 
+/// Adversarial steady state: one old hole remains unresolved while every
+/// later packet arrives in order. Loss discovery should classify the hole
+/// once, not rescan the growing buffered history for every new packet.
+fn run_persistent_old_hole(packet_count: u32) {
+    let mut buf = ReceiverBuffer::new(0, 120, ts(0), 0);
+    buf.set_tsbpd_enabled(false);
+
+    for seq in 1..packet_count {
+        let now = ts(u64::from(seq) + 1);
+        let losses = buf.receive(black_box(make_packet(seq, seq)), now);
+        if seq == 1 {
+            assert_eq!(losses, Some(vec![0]));
+        } else {
+            assert!(losses.is_none());
+        }
+        while black_box(buf.pop_ready(now)).is_some() {}
+    }
+    assert_eq!(
+        buf.generate_periodic_nak()
+            .expect("the persistent hole remains outstanding")
+            .loss_list,
+        vec![0]
+    );
+}
+
+fn bench_persistent_old_hole(c: &mut Criterion) {
+    let mut group = c.benchmark_group("receiver_loss_frontier");
+    group.sample_size(30);
+    for &packet_count in &[1_024u32, 4_096u32, 8_192u32] {
+        group.throughput(Throughput::Elements(u64::from(packet_count - 1)));
+        group.bench_function(format!("persistent_old_hole/{packet_count}_packets"), |b| {
+            b.iter(|| run_persistent_old_hole(packet_count));
+        });
+    }
+    group.finish();
+}
+
 fn receiver_with_dense_loss(initial_seq: u32, last_seq: u32) -> ReceiverBuffer {
     let mut receiver = ReceiverBuffer::new(initial_seq, 120, ts(0), 0);
     receiver.set_tsbpd_enabled(false);
@@ -239,6 +276,7 @@ criterion_group!(
     benches,
     bench_lossy_receive,
     bench_burst_receive,
+    bench_persistent_old_hole,
     bench_drop_range,
     bench_drop_range_locality
 );

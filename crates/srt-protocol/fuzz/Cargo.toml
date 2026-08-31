@@ -71,6 +71,13 @@ name = "fuzz_message_reassembly"
 path = "fuzz_targets/fuzz_message_reassembly.rs"
 test = false
 
+[[bin]]
+bench = false
+doc = false
+name = "fuzz_receiver_frontier"
+path = "fuzz_targets/fuzz_receiver_frontier.rs"
+test = false
+
 [dependencies]
 libfuzzer-sys = "0.4"
 shiguredo_srt = { path = ".." }

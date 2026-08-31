@@ -479,6 +479,85 @@ proptest! {
         );
     }
 
+    /// A sequence position is emitted as a new loss only when the receive
+    /// stream first extends beyond the classification frontier. Later
+    /// recovery, reordering, and duplication at or behind the frontier must
+    /// not rediscover any part of the old interval.
+    #[test]
+    fn loss_frontier_emits_each_newly_exposed_position_once(
+        raw_initial in any::<u32>(),
+        offsets in proptest::collection::vec(0u16..128, 1..256),
+    ) {
+        const SEQUENCE_MASK: u32 = 0x7FFF_FFFF;
+        let initial = raw_initial & SEQUENCE_MASK;
+        let now = Timestamp::from_micros(1_000);
+        let mut buf = ReceiverBuffer::new(initial, 120, Timestamp::default(), 0);
+        buf.set_tsbpd_enabled(false);
+        let mut frontier_offset = -1i32;
+
+        for offset in offsets {
+            let offset = i32::from(offset);
+            let seq = initial.wrapping_add(offset as u32) & SEQUENCE_MASK;
+            let actual = buf.receive(make_packet(seq, offset as u32), now);
+            let expected: Vec<u32> = if offset > frontier_offset {
+                ((frontier_offset + 1)..offset)
+                    .map(|missing| initial.wrapping_add(missing as u32) & SEQUENCE_MASK)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            prop_assert_eq!(actual.unwrap_or_default(), expected);
+            frontier_offset = frontier_offset.max(offset);
+        }
+    }
+
+    /// A forward DROPREQ classifies the gap before the request as loss and the
+    /// request itself as dropped. Extending receipt beyond it must expose only
+    /// the new suffix, including when either interval crosses sequence wrap.
+    #[test]
+    fn drop_range_and_loss_frontier_partition_new_sequence_space(
+        raw_initial in any::<u32>(),
+        gap_before_drop in 0u32..16,
+        drop_len in 1u32..16,
+        gap_after_drop in 0u32..16,
+    ) {
+        const SEQUENCE_MASK: u32 = 0x7FFF_FFFF;
+        let initial = raw_initial & SEQUENCE_MASK;
+        let first_drop = initial.wrapping_add(1 + gap_before_drop) & SEQUENCE_MASK;
+        let last_drop = first_drop.wrapping_add(drop_len - 1) & SEQUENCE_MASK;
+        let next_received = last_drop.wrapping_add(1 + gap_after_drop) & SEQUENCE_MASK;
+        let now = Timestamp::from_micros(1_000);
+        let mut buf = ReceiverBuffer::new(initial, 120, Timestamp::default(), 0);
+        buf.set_tsbpd_enabled(false);
+
+        prop_assert!(buf.receive(make_packet(initial, 0), now).is_none());
+        let summary = buf.drop_range(first_drop, last_drop)?;
+        prop_assert_eq!(summary.sequence_count, drop_len);
+
+        let suffix = buf.receive(make_packet(next_received, 1), now).unwrap_or_default();
+        let expected_suffix: Vec<u32> = (0..gap_after_drop)
+            .map(|offset| last_drop.wrapping_add(1 + offset) & SEQUENCE_MASK)
+            .collect();
+        prop_assert_eq!(suffix, expected_suffix);
+
+        let mut expected_losses: Vec<u32> = (0..gap_before_drop)
+            .map(|offset| initial.wrapping_add(1 + offset) & SEQUENCE_MASK)
+            .chain(
+                (0..gap_after_drop)
+                    .map(|offset| last_drop.wrapping_add(1 + offset) & SEQUENCE_MASK),
+            )
+            .collect();
+        expected_losses.sort_unstable();
+        let actual_losses = buf
+            .generate_periodic_nak()
+            .map_or_else(Vec::new, |nak| nak.loss_list);
+        prop_assert_eq!(actual_losses, expected_losses);
+        prop_assert_eq!(
+            buf.stats().total_lost,
+            u64::from(gap_before_drop + gap_after_drop)
+        );
+    }
+
     #[test]
     fn test_pop_ready_wrap_around_delivery_order(
         (seqs, recv_order) in wrap_around_run(),
