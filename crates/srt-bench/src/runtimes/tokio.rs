@@ -241,7 +241,109 @@ async fn drive(cfg: BenchConfig, mine: Vec<usize>, start: Instant) -> Vec<crate:
     out
 }
 
-#[expect(clippy::cognitive_complexity)]
+fn drain_sender_packets(driver: &mut Conn, buffer: &mut [u8; 2048], start: Instant) {
+    loop {
+        match driver.sock.try_recv(buffer) {
+            Ok(size) => {
+                let now = crate::now_ts(start);
+                let _ = driver.conn.feed_recv_buf(&buffer[..size], now);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(_) => break,
+        }
+    }
+}
+
+fn handle_sender_events(
+    cfg: &BenchConfig,
+    driver: &mut Conn,
+    stats: &mut ConnStats,
+    stream_deadline: &mut Option<Instant>,
+) {
+    while let Some(event) = driver.conn.poll_event() {
+        match event {
+            ConnectionEvent::Connected => {
+                stats.connected = true;
+                if cfg.verbose() {
+                    println!("CONNECTED");
+                }
+                if stream_deadline.is_none() {
+                    *stream_deadline =
+                        Some(Instant::now() + Duration::from_secs_f64(cfg.duration_secs));
+                }
+            }
+            ConnectionEvent::Disconnected { reason } => {
+                eprintln!("[bench-tokio] disconnected: {reason}");
+                stats.torn_down |= !crate::is_ordered_close(&reason);
+                *stream_deadline = Some(Instant::now());
+            }
+            ConnectionEvent::Error(message) => {
+                eprintln!("[bench-tokio] error: {message}");
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn send_paced_payload(
+    driver: &mut Conn,
+    payload: &[u8],
+    now: shiguredo_srt::Timestamp,
+    stats: &mut ConnStats,
+) {
+    while driver.send_paced(payload, now).await.is_ok() {
+        stats.data_events += 1;
+    }
+}
+
+async fn wait_for_sender(
+    driver: &mut Conn,
+    connected: bool,
+    buffer: &mut [u8; 2048],
+    start: Instant,
+) {
+    let wait = if connected {
+        Duration::from_micros(driver.conn.time_until_send(crate::now_ts(start)))
+            .min(crate::MAX_WAIT)
+    } else {
+        crate::MAX_WAIT
+    };
+    let block_for = wait.saturating_sub(crate::TAIL_SPIN);
+    if block_for > Duration::ZERO {
+        tokio::select! {
+            result = driver.sock.recv(buffer) => {
+                if let Ok(size) = result {
+                    let now = crate::now_ts(start);
+                    let _ = driver.conn.feed_recv_buf(&buffer[..size], now);
+                }
+            }
+            _ = tokio::time::sleep(block_for) => {}
+        }
+    }
+}
+
+async fn send_sender_payload_if_due(
+    driver: &mut Conn,
+    payload: &[u8],
+    stats: &mut ConnStats,
+    stream_deadline: Option<Instant>,
+    start: Instant,
+) {
+    if stats.connected && !crate::shutdown::past(stream_deadline) {
+        let now = crate::now_ts(start);
+        send_paced_payload(driver, payload, now, stats).await;
+    }
+}
+
+fn record_sender_stats(driver: &Conn, stats: &mut ConnStats) {
+    if let Some(sender) = driver.conn.sender_stats() {
+        stats.has_stats = true;
+        stats.core_total = sender.total_sent;
+        stats.secondary_a = sender.total_retransmits;
+        stats.secondary_b = sender.packets_in_loss_list as u64;
+    }
+}
+
 async fn sender_task(
     cfg: BenchConfig,
     index: usize,
@@ -285,90 +387,19 @@ async fn sender_task(
             break;
         }
 
-        let wait = if stats.connected {
-            Duration::from_micros(driver.conn.time_until_send(crate::now_ts(start)))
-                .min(crate::MAX_WAIT)
-        } else {
-            crate::MAX_WAIT
-        };
-        let block_for = wait.saturating_sub(crate::TAIL_SPIN);
-        if block_for > Duration::ZERO {
-            tokio::select! {
-                res = driver.sock.recv(&mut buf) => {
-                    if let Ok(n) = res {
-                        let t = crate::now_ts(start);
-                        let _ = driver.conn.feed_recv_buf(&buf[..n], t);
-                    }
-                }
-                _ = tokio::time::sleep(block_for) => {}
-            }
-        }
+        wait_for_sender(&mut driver, stats.connected, &mut buf, start).await;
 
-        loop {
-            match driver.sock.try_recv(&mut buf) {
-                Ok(n) => {
-                    let t = crate::now_ts(start);
-                    let _ = driver.conn.feed_recv_buf(&buf[..n], t);
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(_) => break,
-            }
-        }
+        drain_sender_packets(&mut driver, &mut buf, start);
 
         let t = crate::now_ts(start);
         driver.fire_expired(t);
         drain_outputs(&mut driver, t).await;
 
-        while let Some(ev) = driver.conn.poll_event() {
-            match ev {
-                ConnectionEvent::Connected => {
-                    stats.connected = true;
-                    if cfg.verbose() {
-                        println!("CONNECTED");
-                    }
-                    // Set once. A duplicate `Connected` -- a re-completed
-                    // handshake under load -- would otherwise push the
-                    // deadline out another full duration, and the run
-                    // would quietly offer more than the configured load.
-                    if stream_deadline.is_none() {
-                        stream_deadline =
-                            Some(Instant::now() + Duration::from_secs_f64(cfg.duration_secs));
-                    }
-                }
-                ConnectionEvent::Disconnected { reason } => {
-                    eprintln!("[bench-tokio] disconnected: {reason}");
-                    stats.torn_down |= !crate::is_ordered_close(&reason);
-                    stream_deadline = Some(Instant::now());
-                }
-                ConnectionEvent::Error(msg) => {
-                    eprintln!("[bench-tokio] error: {msg}");
-                }
-                _ => {}
-            }
-        }
+        handle_sender_events(&cfg, &mut driver, &mut stats, &mut stream_deadline);
 
-        // The top-of-loop deadline check passed some work ago; time has
-        // moved since. Re-check at the send site or the connection keeps
-        // streaming past its window, which shows up as offering more load
-        // than was configured.
-        if stats.connected && !crate::shutdown::past(stream_deadline) {
-            // Sample the clock ONCE: this loop must drain only what pacing
-            // says is due at instant `t`. Re-reading it per iteration makes
-            // the condition self-fulfilling -- each `send_paced` awaits a
-            // socket write that costs roughly one pacing interval, so `t`
-            // advances far enough to permit the next packet and the loop
-            // never exits. The task then never returns to the outer loop,
-            // so it stops firing timers (no TLPKTDROP) and stops draining
-            // received ACKs, and the send buffer grows to the full flow
-            // window. That was ~12 MB per connection under overload.
-            let t = crate::now_ts(start);
-            loop {
-                if driver.send_paced(&payload, t).await.is_err() {
-                    break;
-                }
-                stats.data_events += 1;
-            }
-        }
+        // The send helper samples the clock once so pacing cannot turn this
+        // loop into an unbounded busy section past the configured window.
+        send_sender_payload_if_due(&mut driver, &payload, &mut stats, stream_deadline, start).await;
     }
 
     // Ordered close at the protocol level: tell the peer we are done
@@ -380,12 +411,7 @@ async fn sender_task(
     let t = crate::now_ts(start);
     driver.conn.disconnect(t);
     drain_outputs(&mut driver, t).await;
-    if let Some(s) = driver.conn.sender_stats() {
-        stats.has_stats = true;
-        stats.core_total = s.total_sent;
-        stats.secondary_a = s.total_retransmits;
-        stats.secondary_b = s.packets_in_loss_list as u64;
-    }
+    record_sender_stats(&driver, &mut stats);
     stats
 }
 
