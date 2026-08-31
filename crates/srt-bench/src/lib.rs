@@ -1203,132 +1203,143 @@ impl Aggregate {
     }
 }
 
-/// Parse the unified CLI into a BenchConfig, exiting on bad usage.
-#[expect(clippy::cognitive_complexity)]
-pub fn bench_config_from_args() -> BenchConfig {
-    fn usage() -> ! {
-        eprintln!(
-            "usage: srt-bench runtime=<mio|tokio|smol|monoio|glommio|compio> \
-             mode=<sender|receiver> <host?> <port> <duration_secs> <latency_ms> \
-             [bitrate_bps] [--connections N] \
-             [--ingress per-port|shared-pool=K|reuseport-multi=K|reuseport-single=W] \
-             [--egress per-connection|shared-socket] \
-             [--encryption plain|128|192|256] \
-             [--bond broadcast:G|backup:G|none] [--batch on|off] \
-             [--connect-concurrency N] [--promotion never|relocate|bonded|all] [--cookie-routing on|off] [--sock-buf N|Nk|Nm|default] [--out FILE] [--cpus 0-3|0,2,4] [--pin on|off] [--workers N] [--link-delay 25ms] [--link-jitter 5ms] [--link-loss 1%] [--link-rate 100mbit]"
-        );
-        std::process::exit(2)
+fn usage() -> ! {
+    eprintln!(
+        "usage: srt-bench runtime=<mio|tokio|smol|monoio|glommio|compio> \
+         mode=<sender|receiver> <host?> <port> <duration_secs> <latency_ms> \
+         [bitrate_bps] [--connections N] \
+         [--ingress per-port|shared-pool=K|reuseport-multi=K|reuseport-single=W] \
+         [--egress per-connection|shared-socket] \
+         [--encryption plain|128|192|256] \
+         [--bond broadcast:G|backup:G|none] [--batch on|off] \
+         [--connect-concurrency N] [--promotion never|relocate|bonded|all] [--cookie-routing on|off] [--sock-buf N|Nk|Nm|default] [--out FILE] [--cpus 0-3|0,2,4] [--pin on|off] [--workers N] [--link-delay 25ms] [--link-jitter 5ms] [--link-loss 1%] [--link-rate 100mbit]"
+    );
+    std::process::exit(2)
+}
+
+fn parse_positive(label: &str, raw: &str) -> usize {
+    match raw.parse::<usize>() {
+        Ok(0) | Err(_) => {
+            eprintln!("error: {label} must be a positive integer (got '{raw}')");
+            usage()
+        }
+        // Cap at a sane ceiling; more sockets/threads than
+        // connections is just extra bookkeeping with no benefit.
+        Ok(n) => n.min(4096),
     }
+}
 
-    // The harness signals a clean stop once the sender is done; without
-    // this the listener would still be stopping on its own timer.
-    crate::shutdown::install();
-
-    // Capture kernel UDP counters before any socket exists, so every
-    // later read is a delta for this run alone.
-    let _ = crate::cpu_stats::udp_baseline();
-
-    let args: Vec<String> = std::env::args().collect();
-    let cli = Cli::parse(&args);
-
+fn parse_runtime(cli: &Cli) -> Runtime {
     let runtime_name = cli.flags.get("runtime").cloned().unwrap_or_default();
-    let runtime = match Runtime::parse(&runtime_name) {
-        Some(r) => r,
+    match Runtime::parse(&runtime_name) {
+        Some(runtime) => runtime,
         None => {
             eprintln!("missing or unknown runtime=<...>");
             usage()
         }
-    };
-    let mode = match cli.flags.get("mode").map(String::as_str) {
+    }
+}
+
+fn parse_mode(cli: &Cli) -> Mode {
+    match cli.flags.get("mode").map(String::as_str) {
         Some("sender") => Mode::Sender,
         Some("receiver") => Mode::Receiver,
         _ => {
             eprintln!("missing or unknown mode=<sender|receiver>");
             usage()
         }
-    };
+    }
+}
 
-    let encryption = match cli.flags.get("encryption").map(String::as_str) {
+fn parse_encryption(cli: &Cli) -> Encryption {
+    match cli.flags.get("encryption").map(String::as_str) {
         None | Some("") | Some("plain") => Encryption::Plain,
         Some(value) => match Encryption::parse(value) {
-            Some(mode) => mode,
+            Some(encryption) => encryption,
             None => {
                 eprintln!("error: unknown --encryption '{value}' (want plain|128|192|256)");
                 usage()
             }
         },
-    };
+    }
+}
 
-    let needed = match mode {
+fn parse_positional<T: std::str::FromStr>(cli: &Cli, index: usize) -> T {
+    cli.positional
+        .get(index)
+        .and_then(|value| value.parse::<T>().ok())
+        .unwrap_or_else(|| usage())
+}
+
+fn parse_required_positionals(cli: &Cli, mode: Mode) -> (String, u16, f64, u16, u64) {
+    let required = match mode {
         Mode::Sender => 4,
         Mode::Receiver => 3,
     };
-    if cli.positional.len() < needed {
-        usage()
+    if cli.positional.len() < required {
+        usage();
     }
-    let mut pos = cli.positional.iter();
-    let mut next_pos = || -> String { pos.next().cloned().unwrap_or_else(|| usage()) };
+
+    let offset = match mode {
+        Mode::Sender => 1,
+        Mode::Receiver => 0,
+    };
     let host = match mode {
-        Mode::Sender => next_pos(),
+        Mode::Sender => cli.positional[0].clone(),
         Mode::Receiver => String::new(),
     };
-    let port: u16 = next_pos().parse().unwrap_or_else(|_| usage());
-    let duration_secs: f64 = next_pos().parse().unwrap_or_else(|_| usage());
-    let latency_ms: u16 = next_pos().parse().unwrap_or_else(|_| usage());
-    let bitrate_bps: u64 = pos
-        .next()
-        .and_then(|s| s.parse().ok())
+    let port = parse_positional(cli, offset);
+    let duration_secs = parse_positional(cli, offset + 1);
+    let latency_ms = parse_positional(cli, offset + 2);
+    let bitrate_bps = cli
+        .positional
+        .get(offset + 3)
+        .and_then(|value| value.parse().ok())
         .unwrap_or(DEFAULT_BITRATE_BPS);
+    (host, port, duration_secs, latency_ms, bitrate_bps)
+}
 
-    fn parse_positive(label: &str, raw: &str) -> usize {
-        match raw.parse::<usize>() {
-            Ok(0) | Err(_) => {
-                eprintln!("error: {label} must be a positive integer (got '{raw}')");
-                usage()
-            }
-            // Cap at a sane ceiling; more sockets/threads than
-            // connections is just extra bookkeeping with no benefit.
-            Ok(n) => n.min(4096),
-        }
-    }
-
-    let ingress = match cli.flags.get("ingress").map(String::as_str) {
+fn parse_ingress(cli: &Cli) -> Ingress {
+    match cli.flags.get("ingress").map(String::as_str) {
         None | Some("per-port") => Ingress::PerPort,
-        Some(spec) => {
-            // Accept both `shared-pool=4` and `shared-pool:4`. The colon
-            // form is what result files record (an `=` inside a value
-            // would collide with the key=value flag syntax), so it has to
-            // parse back in for a recorded run to be reproducible.
-            let spec = &spec.replacen(':', "=", 1);
-            let spec = spec.as_str();
-            if let Some(k) = spec.strip_prefix("shared-pool=") {
-                Ingress::SharedPool(parse_positive("shared-pool size", k))
-            } else if let Some(k) = spec.strip_prefix("reuseport-multi=") {
-                Ingress::ReuseportMulti(parse_positive("reuseport-multi acceptor count", k))
-            } else if let Some(w) = spec.strip_prefix("reuseport-single=") {
-                Ingress::ReuseportSingle {
-                    workers: parse_positive("reuseport-single worker count", w),
-                }
-            } else {
-                eprintln!(
-                    "error: unknown --ingress '{spec}' (want per-port | shared-pool=K | \
-                     reuseport-multi=K | reuseport-single=W)"
-                );
-                usage()
-            }
-        }
-    };
+        Some(spec) => parse_ingress_spec(spec),
+    }
+}
 
-    let egress = match cli.flags.get("egress").map(String::as_str) {
+fn parse_ingress_spec(spec: &str) -> Ingress {
+    // Accept both `shared-pool=4` and `shared-pool:4`. The colon form is
+    // what result files record, so it has to parse back reproducibly.
+    let spec = spec.replacen(':', "=", 1);
+    if let Some(size) = spec.strip_prefix("shared-pool=") {
+        Ingress::SharedPool(parse_positive("shared-pool size", size))
+    } else if let Some(count) = spec.strip_prefix("reuseport-multi=") {
+        Ingress::ReuseportMulti(parse_positive("reuseport-multi acceptor count", count))
+    } else if let Some(workers) = spec.strip_prefix("reuseport-single=") {
+        Ingress::ReuseportSingle {
+            workers: parse_positive("reuseport-single worker count", workers),
+        }
+    } else {
+        eprintln!(
+            "error: unknown --ingress '{spec}' (want per-port | shared-pool=K | \
+             reuseport-multi=K | reuseport-single=W)"
+        );
+        usage()
+    }
+}
+
+fn parse_egress(cli: &Cli) -> Egress {
+    match cli.flags.get("egress").map(String::as_str) {
         None | Some("per-connection") => Egress::PerConnection,
         Some("shared-socket") => Egress::SharedSocket,
         Some(other) => {
             eprintln!("error: unknown --egress '{other}' (want per-connection|shared-socket)");
             usage()
         }
-    };
+    }
+}
 
-    let (bond_mode, bond_pairs) = match cli.flags.get("bond").map(String::as_str) {
+fn parse_bond(cli: &Cli) -> (BondMode, usize) {
+    match cli.flags.get("bond").map(String::as_str) {
         None | Some("none") => (BondMode::None, 0),
         Some(spec) => {
             let (kind, count) = spec.split_once(':').unwrap_or((spec, ""));
@@ -1342,23 +1353,22 @@ pub fn bench_config_from_args() -> BenchConfig {
             };
             (mode, parse_positive("bond pair count", count))
         }
-    };
+    }
+}
 
-    let batching = match cli.flags.get("batch").map(String::as_str) {
+fn parse_batching(cli: &Cli) -> Batching {
+    match cli.flags.get("batch").map(String::as_str) {
         None | Some("on") => Batching::On,
         Some("off") => Batching::Off,
         Some(other) => {
             eprintln!("error: unknown --batch '{other}' (want on|off)");
             usage()
         }
-    };
+    }
+}
 
-    let connect_concurrency = match cli.flags.get("connect-concurrency") {
-        None => 1,
-        Some(raw) => parse_positive("connect-concurrency", raw),
-    };
-
-    let promotion = match cli.flags.get("promotion").map(String::as_str) {
+fn parse_promotion(cli: &Cli) -> Promotion {
+    match cli.flags.get("promotion").map(String::as_str) {
         // Bare `--promotion` parses to an empty value.
         None | Some("") | Some("relocate") => Promotion::Relocate,
         Some("never") => Promotion::Never,
@@ -1368,92 +1378,140 @@ pub fn bench_config_from_args() -> BenchConfig {
             eprintln!("error: unknown --promotion '{other}' (want never|relocate|bonded|all)");
             usage()
         }
-    };
+    }
+}
 
-    let cookie_routing = match cli.flags.get("cookie-routing").map(String::as_str) {
+fn parse_cookie_routing(cli: &Cli) -> bool {
+    match cli.flags.get("cookie-routing").map(String::as_str) {
         None | Some("") | Some("on") => true,
         Some("off") => false,
         Some(other) => {
             eprintln!("error: unknown --cookie-routing '{other}' (want on|off)");
             usage()
         }
-    };
+    }
+}
 
-    let sock_buf_bytes = match cli.flags.get("sock-buf").map(String::as_str) {
+fn parse_sock_buf(cli: &Cli) -> usize {
+    match cli.flags.get("sock-buf").map(String::as_str) {
         None => srt_transport::SOCK_BUF_BYTES,
         Some("default") | Some("0") => 0,
         Some(raw) => {
             let (digits, scale) = match raw.strip_suffix(['m', 'M']) {
-                Some(d) => (d, 1 << 20),
+                Some(digits) => (digits, 1 << 20),
                 None => (raw.strip_suffix(['k', 'K']).unwrap_or(raw), 1),
             };
             let scale = if digits.len() == raw.len() { 1 } else { scale };
             match digits.parse::<usize>() {
-                Ok(n) => n * scale,
+                Ok(bytes) => bytes * scale,
                 Err(_) => {
                     eprintln!("error: --sock-buf wants bytes, <N>k, <N>m, or 'default'");
                     usage()
                 }
             }
         }
-    };
+    }
+}
 
-    // A CPU *set*, not a count: the two roles need disjoint cores, so
-    // that giving the compute-bound side more does not hand them back to
-    // the other. See docs/cpu-budget.md.
+fn parse_runtime_settings(cli: &Cli, duration_secs: f64) -> (usize, bool, usize, f64) {
+    // A CPU *set*, not a count: the two roles need disjoint cores.
     let cpu_list =
         srt_transport::parse_cpu_spec(cli.flags.get("cpus").map(String::as_str).unwrap_or(""));
     if !cpu_list.is_empty()
-        && let Err(e) = srt_transport::restrict_to_cpu_list(&cpu_list)
+        && let Err(error) = srt_transport::restrict_to_cpu_list(&cpu_list)
     {
-        eprintln!("warning: could not restrict to CPUs {cpu_list:?}: {e}");
+        eprintln!("warning: could not restrict to CPUs {cpu_list:?}: {error}");
     }
     let cpus = cpu_list.len();
     let pin = matches!(
         cli.flags.get("pin").map(String::as_str),
         Some("") | Some("on")
     );
-
     let workers = cli.flag_or("workers", 1usize).max(1);
     let stream_secs = cli
         .flags
         .get("stream-secs")
-        .and_then(|v| v.parse().ok())
+        .and_then(|value| value.parse().ok())
         .unwrap_or(duration_secs);
+    (cpus, pin, workers, stream_secs)
+}
 
-    let scoped = |name: &str| -> String { cli.flags.get(name).cloned().unwrap_or_default() };
-    // The harness records under the axis name (`runtime`); a human types
-    // the plural flag (`--recv-runtimes`, matching `--runtimes`).
-    let scoped_runtime = |name: &str, plural: &str| -> String {
-        let v = scoped(name);
-        if v.is_empty() { scoped(plural) } else { v }
-    };
-    let peer_topology = PeerTopology {
-        recv_runtime: scoped_runtime("recv-runtime", "recv-runtimes"),
-        send_runtime: scoped_runtime("send-runtime", "send-runtimes"),
-        recv_ingress: scoped("recv-ingress"),
-        send_ingress: scoped("send-ingress"),
-        recv_workers: scoped("recv-workers"),
-        send_workers: scoped("send-workers"),
-    };
+fn scoped_flag(cli: &Cli, name: &str) -> String {
+    cli.flags.get(name).cloned().unwrap_or_default()
+}
 
-    let link_flag = |name: &str| -> String {
-        cli.flags
-            .get(name)
-            .filter(|v| !v.is_empty() && v.as_str() != "off")
-            .cloned()
-            .unwrap_or_default()
-    };
-    let link = Link {
-        delay: link_flag("link-delay"),
-        jitter: link_flag("link-jitter"),
-        loss: link_flag("link-loss"),
-        rate: link_flag("link-rate"),
-        reorder: link_flag("link-reorder"),
-        duplicate: link_flag("link-duplicate"),
-        corrupt: link_flag("link-corrupt"),
-        limit: link_flag("link-limit"),
-    };
+fn scoped_runtime_flag(cli: &Cli, name: &str, plural: &str) -> String {
+    let value = scoped_flag(cli, name);
+    if value.is_empty() {
+        scoped_flag(cli, plural)
+    } else {
+        value
+    }
+}
+
+fn parse_peer_topology(cli: &Cli) -> PeerTopology {
+    PeerTopology {
+        recv_runtime: scoped_runtime_flag(cli, "recv-runtime", "recv-runtimes"),
+        send_runtime: scoped_runtime_flag(cli, "send-runtime", "send-runtimes"),
+        recv_ingress: scoped_flag(cli, "recv-ingress"),
+        send_ingress: scoped_flag(cli, "send-ingress"),
+        recv_workers: scoped_flag(cli, "recv-workers"),
+        send_workers: scoped_flag(cli, "send-workers"),
+    }
+}
+
+fn link_flag(cli: &Cli, name: &str) -> String {
+    cli.flags
+        .get(name)
+        .filter(|value| !value.is_empty() && value.as_str() != "off")
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn parse_link(cli: &Cli) -> Link {
+    Link {
+        delay: link_flag(cli, "link-delay"),
+        jitter: link_flag(cli, "link-jitter"),
+        loss: link_flag(cli, "link-loss"),
+        rate: link_flag(cli, "link-rate"),
+        reorder: link_flag(cli, "link-reorder"),
+        duplicate: link_flag(cli, "link-duplicate"),
+        corrupt: link_flag(cli, "link-corrupt"),
+        limit: link_flag(cli, "link-limit"),
+    }
+}
+
+/// Parse the unified CLI into a BenchConfig, exiting on bad usage.
+pub fn bench_config_from_args() -> BenchConfig {
+    // The harness signals a clean stop once the sender is done; without
+    // this the listener would still be stopping on its own timer.
+    crate::shutdown::install();
+
+    // Capture kernel UDP counters before any socket exists, so every
+    // later read is a delta for this run alone.
+    let _ = crate::cpu_stats::udp_baseline();
+
+    let args: Vec<String> = std::env::args().collect();
+    let cli = Cli::parse(&args);
+    let runtime = parse_runtime(&cli);
+    let mode = parse_mode(&cli);
+    let encryption = parse_encryption(&cli);
+    let (host, port, duration_secs, latency_ms, bitrate_bps) =
+        parse_required_positionals(&cli, mode);
+    let ingress = parse_ingress(&cli);
+    let egress = parse_egress(&cli);
+    let (bond_mode, bond_pairs) = parse_bond(&cli);
+    let batching = parse_batching(&cli);
+    let connect_concurrency = cli
+        .flags
+        .get("connect-concurrency")
+        .map_or(1, |raw| parse_positive("connect-concurrency", raw));
+    let promotion = parse_promotion(&cli);
+    let cookie_routing = parse_cookie_routing(&cli);
+    let sock_buf_bytes = parse_sock_buf(&cli);
+    let (cpus, pin, workers, stream_secs) = parse_runtime_settings(&cli, duration_secs);
+    let peer_topology = parse_peer_topology(&cli);
+    let link = parse_link(&cli);
 
     let out = cli
         .flags
@@ -1501,7 +1559,7 @@ pub fn bench_config_from_args() -> BenchConfig {
 mod tests {
     use super::{
         Batching, BenchConfig, BondMode, Cli, Egress, Encryption, Ingress, Link, Mode,
-        PeerTopology, Promotion, Runtime,
+        PeerTopology, Promotion, Runtime, parse_required_positionals,
     };
     use shiguredo_srt::{ConnectionOptions, KeyLength};
 
@@ -1679,5 +1737,37 @@ mod tests {
             .collect::<Vec<_>>();
         let cli = Cli::parse(&args);
         assert_eq!(cli.flags.get("ingress"), Some(&"shared-pool=1".to_string()));
+    }
+
+    #[test]
+    fn required_positionals_keep_sender_and_receiver_layouts() {
+        let sender = Cli::parse(
+            &[
+                "srt-bench",
+                "example.test",
+                "9000",
+                "10.5",
+                "120",
+                "4000000",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            parse_required_positionals(&sender, Mode::Sender),
+            ("example.test".to_string(), 9000, 10.5, 120, 4_000_000)
+        );
+
+        let receiver = Cli::parse(
+            &["srt-bench", "9001", "12.0", "80", "2000000"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            parse_required_positionals(&receiver, Mode::Receiver),
+            (String::new(), 9001, 12.0, 80, 2_000_000)
+        );
     }
 }
