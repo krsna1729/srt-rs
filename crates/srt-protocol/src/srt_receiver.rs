@@ -28,6 +28,9 @@ use crate::time::Timestamp;
 /// Light ACK send interval (packets).
 const LIGHT_ACK_INTERVAL: u32 = 64;
 
+/// Sequence numbers are carried in the low 31 bits of each wire word.
+const SEQUENCE_MASK: u32 = 0x7FFF_FFFF;
+
 /// Periodic ACK interval (microseconds).
 const ACK_INTERVAL_US: u64 = 10_000; // 10ms
 
@@ -45,6 +48,10 @@ const TSBPD_DRIFT_MAX_SAMPLES: u32 = 1_000;
 ///
 /// This matches libsrt's `TSBPD_DRIFT_MAX_VALUE`.
 const TSBPD_DRIFT_MAX_US: i64 = 5_000;
+
+fn sequence_in_range(first_seq: u32, distance: u32, sequence: u32) -> bool {
+    sequence.wrapping_sub(first_seq) & SEQUENCE_MASK <= distance
+}
 
 /// A bounded, windowed clock-drift estimator used by TSBPD.
 ///
@@ -1185,8 +1192,6 @@ impl ReceiverBuffer {
     /// Validate a 31-bit inclusive DROPREQ range against this receiver's
     /// negotiated window without allocating or iterating over the range.
     pub(crate) fn validate_drop_range(&self, first_seq: u32, last_seq: u32) -> Result<u32, Error> {
-        const SEQUENCE_MASK: u32 = 0x7FFF_FFFF;
-
         if first_seq & !SEQUENCE_MASK != 0 || last_seq & !SEQUENCE_MASK != 0 {
             return Err(Error::invalid_data("DROPREQ sequence has high bit set"));
         }
@@ -1221,29 +1226,50 @@ impl ReceiverBuffer {
     /// The inclusive range must fit within the negotiated receive window so
     /// this method cannot be used to force unbounded iteration or allocation.
     pub fn drop_range(&mut self, first_seq: u32, last_seq: u32) -> Result<DropRangeSummary, Error> {
-        const SEQUENCE_MASK: u32 = 0x7FFF_FFFF;
         let distance = self.validate_drop_range(first_seq, last_seq)?;
         let sequence_count = distance + 1;
-        let in_range = |seq: u32| seq.wrapping_sub(first_seq) & SEQUENCE_MASK <= distance;
-        let hint_was_dropped = self.delivery_seq_hint.is_some_and(in_range);
+        let hint_was_dropped = self
+            .delivery_seq_hint
+            .is_some_and(|seq| sequence_in_range(first_seq, distance, seq));
 
         // A DROPREQ can be the first evidence of sequence progress beyond the
         // classification frontier. Any intervening positions are genuine
         // newly exposed losses; the requested interval itself is accounted as
         // dropped and must never be rediscovered by a later packet.
-        if sequence_greater_than(last_seq, self.loss_detection_frontier) {
-            if sequence_greater_than(first_seq, self.loss_detection_frontier) {
-                let _ = self.detect_losses(first_seq);
-            }
-            self.loss_detection_frontier = last_seq;
-        }
+        self.advance_drop_frontier(first_seq, last_seq);
 
         // Remove only packet keys that lie in the requested numeric interval.
         // A circular range has at most two such intervals. Repeating a range
         // successor lookup after each removal is O(k log n), where k is the
         // number of requested sequence positions (bounded by the negotiated
         // receive window), independent of unrelated retained TSBPD packets.
-        let mut packets_removed = 0u32;
+        let packets_removed = self.remove_drop_packets(first_seq, last_seq);
+        let losses_removed = self.remove_drop_losses(first_seq, sequence_count);
+
+        if hint_was_dropped {
+            self.delivery_seq_hint = self.next_sequence_after(last_seq);
+        }
+
+        self.total_dropped = self.total_dropped.saturating_add(u64::from(sequence_count));
+        self.advance_expected_after_drop(first_seq, distance);
+        Ok(DropRangeSummary {
+            sequence_count,
+            packets_removed,
+            losses_removed,
+        })
+    }
+
+    fn advance_drop_frontier(&mut self, first_seq: u32, last_seq: u32) {
+        if sequence_greater_than(last_seq, self.loss_detection_frontier) {
+            if sequence_greater_than(first_seq, self.loss_detection_frontier) {
+                let _ = self.detect_losses(first_seq);
+            }
+            self.loss_detection_frontier = last_seq;
+        }
+    }
+
+    fn remove_drop_packets(&mut self, first_seq: u32, last_seq: u32) -> u32 {
+        let mut packets_removed = 0;
         if first_seq <= last_seq {
             while let Some(seq) = self
                 .packets
@@ -1264,9 +1290,14 @@ impl ReceiverBuffer {
                 packets_removed += 1;
             }
         }
+        packets_removed
+    }
 
-        let removed_loss_min = self.loss_list_min.is_some_and(in_range);
-        let mut losses_removed = 0u32;
+    fn remove_drop_losses(&mut self, first_seq: u32, sequence_count: u32) -> u32 {
+        let removed_loss_min = self
+            .loss_list_min
+            .is_some_and(|seq| sequence_in_range(first_seq, sequence_count - 1, seq));
+        let mut losses_removed = 0;
         let mut seq = first_seq;
         for _ in 0..sequence_count {
             if self.loss_list.remove(&seq) {
@@ -1281,20 +1312,15 @@ impl ReceiverBuffer {
                 .copied()
                 .reduce(|a, b| if sequence_less_than(a, b) { a } else { b });
         }
+        losses_removed
+    }
 
-        if hint_was_dropped {
-            self.delivery_seq_hint = self.next_sequence_after(last_seq);
-        }
-
-        self.total_dropped = self.total_dropped.saturating_add(u64::from(sequence_count));
-        while self.packets.contains_key(&self.expected_seq) || in_range(self.expected_seq) {
+    fn advance_expected_after_drop(&mut self, first_seq: u32, distance: u32) {
+        while self.packets.contains_key(&self.expected_seq)
+            || sequence_in_range(first_seq, distance, self.expected_seq)
+        {
             self.expected_seq = self.expected_seq.wrapping_add(1) & SEQUENCE_MASK;
         }
-        Ok(DropRangeSummary {
-            sequence_count,
-            packets_removed,
-            losses_removed,
-        })
     }
 
     /// Get the current ACK sequence number.
