@@ -317,28 +317,291 @@ fn run_shared_sender(cfg: &BenchConfig, start: Instant) -> Vec<ConnStats> {
     sender.finish()
 }
 
-/// Drive one worker's share of the connections on its own `Poll`.
-#[expect(clippy::cognitive_complexity)]
-fn drive(cfg: BenchConfig, mine: Vec<usize>, start: Instant) -> Vec<ConnStats> {
-    let mut poll = Poll::new().expect("mio Poll::new");
-    let mut events = Events::with_capacity(4096);
-
-    let mut drivers: Vec<Driver> = Vec::with_capacity(mine.len());
-    // Receivers: no storm risk (each binds its own dedicated port, and the
-    // socket must exist before its sender's first packet can arrive), so
-    // create all of them upfront. Senders: prime up to `connect_concurrency`
-    // and let the main loop below backfill the rest as earlier connections
-    // finish handshaking -- see `BenchConfig::connect_concurrency`'s doc.
+fn prime_drivers(
+    cfg: &BenchConfig,
+    poll: &mut Poll,
+    start: Instant,
+    mine: &[usize],
+) -> (Vec<Driver>, usize) {
+    // Receivers create every dedicated socket up front. Senders prime only
+    // their configured handshake window; `backfill_drivers` opens the rest
+    // as earlier connections settle.
     let priming = match cfg.mode {
         crate::Mode::Receiver => mine.len(),
         crate::Mode::Sender => cfg.connect_concurrency.min(mine.len()),
     };
+    let mut drivers = Vec::with_capacity(mine.len());
     for (token, &conn) in mine.iter().take(priming).enumerate() {
-        drivers.push(spawn_driver(&cfg, &mut poll, start, conn, token));
+        drivers.push(spawn_driver(cfg, poll, start, conn, token));
     }
-    let mut next_to_start = priming;
+    (drivers, priming)
+}
 
-    // Senders stream at the target bitrate once connected.
+fn all_drivers_done(drivers: &[Driver], next_to_start: usize, total: usize) -> bool {
+    crate::shutdown::requested()
+        || next_to_start >= total
+            && drivers.iter().all(|driver| {
+                if driver.connected {
+                    driver
+                        .stream_deadline
+                        .is_some_and(|deadline| Instant::now() >= deadline)
+                } else {
+                    driver.started_at.elapsed() >= crate::CONNECT_TIMEOUT
+                }
+            })
+}
+
+fn backfill_drivers(
+    cfg: &BenchConfig,
+    poll: &mut Poll,
+    start: Instant,
+    mine: &[usize],
+    drivers: &mut Vec<Driver>,
+    next_to_start: &mut usize,
+) {
+    // Only handshakes still within their connect window occupy a slot. An
+    // expired handshake must not block every connection behind it.
+    while *next_to_start < mine.len() {
+        let in_flight = drivers
+            .iter()
+            .filter(|driver| {
+                !driver.connected && driver.started_at.elapsed() < crate::CONNECT_TIMEOUT
+            })
+            .count();
+        if in_flight >= cfg.connect_concurrency {
+            break;
+        }
+        drivers.push(spawn_driver(
+            cfg,
+            poll,
+            start,
+            mine[*next_to_start],
+            *next_to_start,
+        ));
+        *next_to_start += 1;
+    }
+}
+
+fn next_poll_wait(cfg: &BenchConfig, drivers: &[Driver], start: Instant) -> Duration {
+    if cfg.mode != crate::Mode::Sender {
+        return TIMER_TICK;
+    }
+    // Senders know exactly when their next paced packet is due; receivers
+    // just ride the tick (ACK timer is 10ms).
+    let t = crate::now_ts(start);
+    let min_wait = drivers
+        .iter()
+        .filter(|driver| driver.connected)
+        .map(|driver| Duration::from_micros(driver.conn.conn.time_until_send(t)).min(MAX_POLL_WAIT))
+        .min()
+        .unwrap_or(MAX_POLL_WAIT);
+    TIMER_TICK.min(min_wait)
+}
+
+fn receive_ready(
+    cfg: &BenchConfig,
+    drivers: &mut [Driver],
+    events: &Events,
+    buf: &mut [u8],
+    start: Instant,
+) -> [bool; 4096] {
+    let mut touched = [false; 4096];
+    for event in events.iter() {
+        let idx = event.token().0;
+        if idx >= touched.len() {
+            continue;
+        }
+        let Some(driver) = drivers.get_mut(idx) else {
+            continue;
+        };
+        touched[idx] = true;
+        if driver.peer.is_none() && cfg.mode == crate::Mode::Receiver {
+            receive_first_datagram(driver, buf, start);
+        } else {
+            receive_connected_datagrams(driver, idx, buf, start);
+        }
+    }
+    touched
+}
+
+fn receive_first_datagram(driver: &mut Driver, buf: &mut [u8], start: Instant) {
+    // The first datagram reveals the caller. Connect before feeding it into
+    // the protocol because output draining uses connected `send()`.
+    match driver.conn.socket.recv_from(buf) {
+        Ok((n, addr)) => {
+            if driver.conn.socket.connect(addr).is_ok() {
+                driver.peer = Some(addr);
+                let t = crate::now_ts(start);
+                let _ = driver.conn.conn.feed_recv_buf(&buf[..n], t);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+        Err(error) => eprintln!("[bench-mio] recv error: {error}"),
+    }
+}
+
+fn receive_connected_datagrams(driver: &mut Driver, index: usize, buf: &mut [u8], start: Instant) {
+    loop {
+        match driver.conn.socket.recv(buf) {
+            Ok(n) => {
+                let t = crate::now_ts(start);
+                let _ = driver.conn.conn.feed_recv_buf(&buf[..n], t);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                driver.poisoned = true;
+                break;
+            }
+            Err(error) => {
+                eprintln!("[bench-mio] recv error conn {index}: {error}");
+                break;
+            }
+        }
+    }
+}
+
+fn reconnect_poisoned(cfg: &BenchConfig, mine: &[usize], drivers: &mut [Driver]) {
+    // A connected UDP socket stays poisoned for both send and recv until
+    // reconnect. Scan all drivers so handshake retransmits cannot stall.
+    for (index, driver) in drivers.iter_mut().enumerate() {
+        if !driver.poisoned {
+            continue;
+        }
+        let destination = driver
+            .peer
+            .or_else(|| (cfg.mode == crate::Mode::Sender).then(|| cfg.addr_for(mine[index])));
+        let Some(destination) = destination else {
+            continue;
+        };
+        let _ = driver.conn.socket.connect(destination);
+        driver.poisoned = false;
+    }
+}
+
+fn service_drivers(
+    cfg: &BenchConfig,
+    drivers: &mut [Driver],
+    touched: &[bool; 4096],
+    woke_from_timeout: bool,
+    payload: &[u8],
+    start: Instant,
+) {
+    // Timer scans are O(armed timers) per driver, so only sweep drivers that
+    // saw traffic -- plus a full sweep whenever poll went idle.
+    let t = crate::now_ts(start);
+    for (index, driver) in drivers.iter_mut().enumerate() {
+        if woke_from_timeout || touched.get(index).copied().unwrap_or(false) {
+            driver.conn.fire_expired(t);
+        }
+        if driver.conn.drain_outputs(t) {
+            driver.poisoned = true;
+        }
+        process_events(cfg, driver);
+        send_due_payload(cfg, driver, payload, start);
+    }
+}
+
+fn process_events(cfg: &BenchConfig, driver: &mut Driver) {
+    while let Some(event) = driver.conn.conn.poll_event() {
+        match event {
+            ConnectionEvent::Connected => {
+                driver.connected = true;
+                // Set once: a duplicate Connected must not extend the run.
+                if driver.stream_deadline.is_none() {
+                    driver.stream_deadline =
+                        Some(Instant::now() + Duration::from_secs_f64(cfg.duration_secs));
+                }
+                if cfg.verbose() {
+                    println!("CONNECTED");
+                }
+            }
+            ConnectionEvent::DataReceived { .. } => driver.data_events += 1,
+            ConnectionEvent::Disconnected { reason } => {
+                let ordered = crate::is_ordered_close(&reason);
+                if !ordered {
+                    eprintln!("[bench-mio] disconnected: {reason}");
+                }
+                driver.torn_down |= !ordered;
+                driver.stream_deadline = Some(Instant::now());
+            }
+            ConnectionEvent::Error(message) => eprintln!("[bench-mio] error: {message}"),
+            _ => {}
+        }
+    }
+}
+
+fn send_due_payload(cfg: &BenchConfig, driver: &mut Driver, payload: &[u8], start: Instant) {
+    // Gate on this connection's deadline. Sample the clock once so pacing
+    // cannot turn the send loop into an unbounded busy loop.
+    let past_deadline = driver
+        .stream_deadline
+        .is_some_and(|deadline| Instant::now() >= deadline);
+    if !driver.connected || cfg.mode != crate::Mode::Sender || past_deadline {
+        return;
+    }
+    let t = crate::now_ts(start);
+    loop {
+        if !driver.conn.conn.can_send_with_pacing(t) {
+            break;
+        }
+        if driver.conn.conn.send(payload, t).is_err() {
+            break;
+        }
+        driver.data_events += 1;
+        if driver.conn.drain_outputs(t) {
+            driver.poisoned = true;
+        }
+    }
+}
+
+fn close_drivers(cfg: &BenchConfig, drivers: &mut [Driver], start: Instant) {
+    if cfg.mode != crate::Mode::Sender {
+        return;
+    }
+    // Ordered close tells the listener to flush its receive buffer instead of
+    // inferring the end of the stream from silence.
+    let t = crate::now_ts(start);
+    for driver in drivers {
+        driver.conn.conn.disconnect(t);
+        let _ = driver.conn.drain_outputs(t);
+    }
+}
+
+fn driver_stats(cfg: &BenchConfig, driver: Driver) -> ConnStats {
+    let mut stats = ConnStats {
+        connected: driver.connected,
+        torn_down: driver.torn_down,
+        data_events: driver.data_events,
+        ..Default::default()
+    };
+    match cfg.mode {
+        crate::Mode::Sender => {
+            if let Some(protocol) = driver.conn.conn.sender_stats() {
+                stats.has_stats = true;
+                stats.core_total = protocol.total_sent;
+                stats.secondary_a = protocol.total_retransmits;
+                stats.secondary_b = protocol.packets_in_loss_list as u64;
+            }
+        }
+        crate::Mode::Receiver => {
+            if let Some(protocol) = driver.conn.conn.receiver_stats() {
+                stats.has_stats = true;
+                stats.core_total = protocol.total_received;
+                stats.secondary_a = protocol.total_lost;
+                stats.secondary_b = protocol.total_duplicates;
+                stats.rtt_us = protocol.rtt as u64;
+            }
+        }
+    }
+    stats
+}
+
+/// Drive one worker's share of the connections on its own `Poll`.
+fn drive(cfg: BenchConfig, mine: Vec<usize>, start: Instant) -> Vec<ConnStats> {
+    let mut poll = Poll::new().expect("mio Poll::new");
+    let mut events = Events::with_capacity(4096);
+
+    let (mut drivers, mut next_to_start) = prime_drivers(&cfg, &mut poll, start, &mine);
     let payload = vec![0x42u8; crate::PAYLOAD_SIZE];
     let connect_deadline = Instant::now() + crate::CONNECT_TIMEOUT;
     let mut buf = [0u8; 2048];
@@ -350,254 +613,43 @@ fn drive(cfg: BenchConfig, mine: Vec<usize>, start: Instant) -> Vec<ConnStats> {
         }
         // A connection is settled once it has either finished streaming or
         // given up on connecting. Treating a never-connecting handshake as
-        // settled (rather than requiring every driver to reach
-        // `connected`) is what keeps one dead peer from hanging the whole
-        // run -- the loop used to wait on it forever, since its
-        // `stream_deadline` stays `None`.
-        let all_done = crate::shutdown::requested()
-            || next_to_start >= mine.len()
-                && drivers.iter().all(|d| {
-                    if d.connected {
-                        d.stream_deadline
-                            .map(|dl| Instant::now() >= dl)
-                            .unwrap_or(false)
-                    } else {
-                        d.started_at.elapsed() >= crate::CONNECT_TIMEOUT
-                    }
-                });
-        if all_done {
+        // settled keeps one dead peer from hanging the whole run.
+        if all_drivers_done(&drivers, next_to_start, mine.len()) {
             break;
         }
 
-        // Backfill: start the next connection(s) once earlier ones have
-        // connected and freed up room under `connect_concurrency` -- see
-        // `BenchConfig::connect_concurrency`'s doc. No-op for receivers
-        // (primed with everything upfront) and once every connection has
-        // been started.
-        //
-        // Only handshakes still *within* their connect window count as
-        // occupying a slot. A handshake that has blown past
-        // CONNECT_TIMEOUT is never going to complete, and holding
-        // a slot for it stalls every remaining connection behind it --
-        // with `connect_concurrency=1` that is a total deadlock, and it
-        // was observed as exactly that (a run that started 9 connections,
-        // had 1 hang, and never started the other 141).
-        while next_to_start < mine.len() {
-            let in_flight = drivers
-                .iter()
-                .filter(|d| !d.connected && d.started_at.elapsed() < crate::CONNECT_TIMEOUT)
-                .count();
-            if in_flight >= cfg.connect_concurrency {
-                break;
-            }
-            drivers.push(spawn_driver(
-                &cfg,
-                &mut poll,
-                start,
-                mine[next_to_start],
-                next_to_start,
-            ));
-            next_to_start += 1;
-        }
+        // Backfill starts the next connection once earlier handshakes settle.
+        backfill_drivers(
+            &cfg,
+            &mut poll,
+            start,
+            &mine,
+            &mut drivers,
+            &mut next_to_start,
+        );
 
-        let mut poll_wait = TIMER_TICK;
-        // Senders know exactly when their next paced packet is due; use the
-        // tightest deadline across them so pacing doesn't quantize to the
-        // tick. Receivers just ride the tick (ACK timer is 10ms).
-        if cfg.mode == crate::Mode::Sender {
-            let t = crate::now_ts(start);
-            let min_wait = drivers
-                .iter()
-                .filter(|d| d.connected)
-                .map(|d| Duration::from_micros(d.conn.conn.time_until_send(t)).min(MAX_POLL_WAIT))
-                .min()
-                .unwrap_or(MAX_POLL_WAIT);
-            poll_wait = poll_wait.min(min_wait);
-        }
-        poll.poll(&mut events, Some(poll_wait)).ok();
+        poll.poll(&mut events, Some(next_poll_wait(&cfg, &drivers, start)))
+            .ok();
         let woke_from_timeout = events.is_empty();
 
-        let mut touched = [false; 4096];
-        for event in events.iter() {
-            let idx = event.token().0;
-            if idx >= touched.len() || drivers.get_mut(idx).is_none() {
-                continue;
-            }
-            touched[idx] = true;
-            let d = &mut drivers[idx];
-            if d.peer.is_none() && cfg.mode == crate::Mode::Receiver {
-                // Unconnected phase: first datagram reveals the caller.
-                // Connect before anything else -- drain_outputs uses
-                // connected send(), which fails silently otherwise.
-                match d.conn.socket.recv_from(&mut buf) {
-                    Ok((n, addr)) => {
-                        if d.conn.socket.connect(addr).is_ok() {
-                            d.peer = Some(addr);
-                            let t = crate::now_ts(start);
-                            let _ = d.conn.conn.feed_recv_buf(&buf[..n], t);
-                        }
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(e) => {
-                        eprintln!("[bench-mio] recv error: {e}");
-                    }
-                }
-            } else {
-                loop {
-                    match d.conn.socket.recv(&mut buf) {
-                        Ok(n) => {
-                            let t = crate::now_ts(start);
-                            let _ = d.conn.conn.feed_recv_buf(&buf[..n], t);
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-                            d.poisoned = true;
-                            break;
-                        }
-                        Err(e) => {
-                            eprintln!("[bench-mio] recv error conn {}: {e}", idx);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        // Proactive poison clear: a connected UDP socket stays poisoned
-        // for both send and recv until reconnect. Scan all drivers every
-        // iteration (not just due ones) so handshake retransmits don't
-        // stall. The existing handshake timer (250 ms) will fire soon
-        // after reconnect and retransmit.
-        for (idx, d) in drivers.iter_mut().enumerate() {
-            if d.poisoned {
-                let dst = if let Some(peer) = d.peer {
-                    peer
-                } else if cfg.mode == crate::Mode::Sender {
-                    cfg.addr_for(mine[idx])
-                } else {
-                    continue;
-                };
-                let _ = d.conn.socket.connect(dst);
-                d.poisoned = false;
-            }
-        }
+        let touched = receive_ready(&cfg, &mut drivers, &events, &mut buf, start);
+        reconnect_poisoned(&cfg, &mine, &mut drivers);
 
-        // Protocol maintenance. Timer scans are O(armed timers) per driver,
-        // so at hundreds of connections only sweep drivers that saw traffic
-        // this pass -- plus a full sweep whenever the poll went idle (which
-        // happens at least once per TIMER_TICK, keeping 10ms timers honest).
-        let t = crate::now_ts(start);
-        for (idx, d) in drivers.iter_mut().enumerate() {
-            if woke_from_timeout || touched.get(idx).copied().unwrap_or(false) {
-                d.conn.fire_expired(t);
-            }
-            if d.conn.drain_outputs(t) {
-                d.poisoned = true;
-            }
-
-            while let Some(ev) = d.conn.conn.poll_event() {
-                match ev {
-                    ConnectionEvent::Connected => {
-                        d.connected = true;
-                        // Set once; see the async adapters for why a
-                        // duplicate `Connected` must not extend it.
-                        if d.stream_deadline.is_none() {
-                            d.stream_deadline =
-                                Some(Instant::now() + Duration::from_secs_f64(cfg.duration_secs));
-                        }
-                        if cfg.verbose() {
-                            println!("CONNECTED");
-                        }
-                    }
-                    ConnectionEvent::DataReceived { .. } => {
-                        d.data_events += 1;
-                    }
-                    ConnectionEvent::Disconnected { reason } => {
-                        if !crate::is_ordered_close(&reason) {
-                            eprintln!("[bench-mio] disconnected: {reason}");
-                        }
-                        d.torn_down |= !crate::is_ordered_close(&reason);
-                        d.stream_deadline = Some(Instant::now());
-                    }
-                    ConnectionEvent::Error(msg) => {
-                        eprintln!("[bench-mio] error: {msg}");
-                    }
-                    _ => {}
-                }
-            }
-
-            // Gate on THIS connection's deadline. Without it a driver
-            // keeps streaming until every other driver is done too --
-            // and with staggered connects that is seconds of extra load,
-            // recorded as the sender offering more than was configured.
-            let past_deadline = d.stream_deadline.is_some_and(|dl| Instant::now() >= dl);
-            if d.connected && cfg.mode == crate::Mode::Sender && !past_deadline {
-                // Sample the clock ONCE: this loop must drain only what pacing
-                // says is due at instant `t`. Re-reading it per iteration makes
-                // the condition self-fulfilling -- each `send_paced` awaits a
-                // socket write that costs roughly one pacing interval, so `t`
-                // advances far enough to permit the next packet and the loop
-                // never exits. The task then never returns to the outer loop,
-                // so it stops firing timers (no TLPKTDROP) and stops draining
-                // received ACKs, and the send buffer grows to the full flow
-                // window. That was ~12 MB per connection under overload.
-                let t = crate::now_ts(start);
-                loop {
-                    if !d.conn.conn.can_send_with_pacing(t) {
-                        break;
-                    }
-                    if d.conn.conn.send(&payload, t).is_err() {
-                        break;
-                    }
-                    d.data_events += 1;
-                    if d.conn.drain_outputs(t) {
-                        d.poisoned = true;
-                    }
-                }
-            }
-        }
+        service_drivers(
+            &cfg,
+            &mut drivers,
+            &touched,
+            woke_from_timeout,
+            &payload,
+            start,
+        );
     }
 
-    // Ordered close at the protocol level: an SRT SHUTDOWN tells the
-    // listener the stream ended (and makes it flush its receive buffer
-    // ignoring TSBPD) instead of leaving it to infer silence.
-    if cfg.mode == crate::Mode::Sender {
-        let t = crate::now_ts(start);
-        for d in &mut drivers {
-            d.conn.conn.disconnect(t);
-            let _ = d.conn.drain_outputs(t);
-        }
-    }
-
-    let mut out = Vec::with_capacity(drivers.len());
-    for d in drivers {
-        let mut s = ConnStats {
-            connected: d.connected,
-            torn_down: d.torn_down,
-            data_events: d.data_events,
-            ..Default::default()
-        };
-        match cfg.mode {
-            crate::Mode::Sender => {
-                if let Some(st) = d.conn.conn.sender_stats() {
-                    s.has_stats = true;
-                    s.core_total = st.total_sent;
-                    s.secondary_a = st.total_retransmits;
-                    s.secondary_b = st.packets_in_loss_list as u64;
-                }
-            }
-            crate::Mode::Receiver => {
-                if let Some(st) = d.conn.conn.receiver_stats() {
-                    s.has_stats = true;
-                    s.core_total = st.total_received;
-                    s.secondary_a = st.total_lost;
-                    s.secondary_b = st.total_duplicates;
-                    s.rtt_us = st.rtt as u64;
-                }
-            }
-        }
-        out.push(s);
-    }
-    out
+    close_drivers(&cfg, &mut drivers, start);
+    drivers
+        .into_iter()
+        .map(|driver| driver_stats(&cfg, driver))
+        .collect()
 }
 
 /// #2 -- shared pool, no promotion: K real, distinct, plainly-bound
