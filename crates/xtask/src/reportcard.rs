@@ -147,7 +147,10 @@ fn analyze_file(path: &Path, summary: &mut Summary) -> io::Result<()> {
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| io::Error::other("analyzer JSON is missing a file name"))?;
-    if !relative.split('/').any(|component| component == "src") {
+    if !Path::new(relative)
+        .components()
+        .any(|component| component.as_os_str() == "src")
+    {
         return Ok(());
     }
     summary.files += 1;
