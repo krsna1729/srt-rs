@@ -188,87 +188,102 @@ fn spawn_driver(
     }
 }
 
-pub fn run(cfg: BenchConfig) {
-    let start = Instant::now();
-    if cfg.mode == crate::Mode::Sender && cfg.egress == crate::Egress::SharedSocket {
-        let stats = run_shared_sender(&cfg, start);
-        let mut agg = Aggregate::new(cfg);
-        for stat in stats {
-            agg.add(stat);
-        }
-        agg.print(start);
-        if !agg.any_connected {
-            std::process::exit(1);
-        }
-        return;
+fn finish_run(cfg: BenchConfig, start: Instant, stats: Vec<ConnStats>) {
+    let mut aggregate = Aggregate::new(cfg);
+    for stats in stats {
+        aggregate.add(stats);
     }
-    if cfg.mode == crate::Mode::Receiver {
-        println!("LISTENING");
+    aggregate.print(start);
+    if !aggregate.any_connected {
+        std::process::exit(1);
     }
+}
+
+fn run_shared_sender_mode(cfg: &BenchConfig, start: Instant) -> bool {
+    if cfg.mode != crate::Mode::Sender || cfg.egress != crate::Egress::SharedSocket {
+        return false;
+    }
+    finish_run(cfg.clone(), start, run_shared_sender(cfg, start));
+    true
+}
+
+fn run_receiver_ingress(cfg: BenchConfig) -> bool {
     // Single-port fan-in via SO_REUSEPORT + kernel sharding. This is the
     // production-like case (one SRT listener port, many callers) where a
     // single acceptor saturates at ~1200 concurrent handshakes.
     // ReuseportMulti(K) creates K acceptor sockets on the base port, each
     // in its own thread. See run_pool_receiver's doc for why only bonded
     // legs that need to relocate ever get a second socket.
-    if cfg.mode == crate::Mode::Receiver && cfg.connections > 1 {
-        match cfg.ingress {
-            crate::Ingress::ReuseportMulti(k) if k >= 1 => {
-                return run_pool_receiver(cfg, k);
-            }
-            crate::Ingress::SharedPool(1) => {
-                return run_bonded_shared_pool(cfg);
-            }
-            crate::Ingress::SharedPool(k) if k >= 1 => {
-                return run_shared_pool(cfg, k);
-            }
-            crate::Ingress::ReuseportSingle { workers } if workers >= 1 => {
-                return run_reuseport_single(cfg, workers);
-            }
-            _ => {}
+    if cfg.mode != crate::Mode::Receiver || cfg.connections <= 1 {
+        return false;
+    }
+    match cfg.ingress {
+        crate::Ingress::ReuseportMulti(k) if k >= 1 => {
+            run_pool_receiver(cfg, k);
+        }
+        crate::Ingress::SharedPool(1) => {
+            run_bonded_shared_pool(cfg);
+        }
+        crate::Ingress::SharedPool(k) if k >= 1 => {
+            run_shared_pool(cfg, k);
+        }
+        crate::Ingress::ReuseportSingle { workers } if workers >= 1 => {
+            run_reuseport_single(cfg, workers);
+        }
+        _ => return false,
+    }
+    true
+}
+
+fn report_scale(cfg: &BenchConfig) {
+    if cfg.connections <= 1 {
+        return;
+    }
+    match cfg.ingress {
+        crate::Ingress::ReuseportMulti(k) if cfg.mode == crate::Mode::Sender && k >= 1 => {
+            eprintln!(
+                "[bench-mio] scale: single port {} (reuseport-multi={k})",
+                cfg.port
+            );
+        }
+        crate::Ingress::ReuseportSingle { workers } if cfg.mode == crate::Mode::Sender => {
+            eprintln!(
+                "[bench-mio] scale: single port {} (reuseport-single, {workers} workers)",
+                cfg.port
+            );
+        }
+        crate::Ingress::SharedPool(k) if cfg.mode == crate::Mode::Sender && k >= 1 => {
+            eprintln!(
+                "[bench-mio] scale: shared-pool ports {}-{}",
+                cfg.port,
+                cfg.port + k as u16 - 1
+            );
+        }
+        _ => {
+            eprintln!(
+                "[bench-mio] scale: ports {}-{}",
+                cfg.port,
+                cfg.port + cfg.connections as u16 - 1
+            );
         }
     }
-    if cfg.connections > 1 {
-        match cfg.ingress {
-            crate::Ingress::ReuseportMulti(k) if cfg.mode == crate::Mode::Sender && k >= 1 => {
-                eprintln!(
-                    "[bench-mio] scale: single port {} (reuseport-multi={k})",
-                    cfg.port
-                );
-            }
-            crate::Ingress::ReuseportSingle { workers } if cfg.mode == crate::Mode::Sender => {
-                eprintln!(
-                    "[bench-mio] scale: single port {} (reuseport-single, {workers} workers)",
-                    cfg.port
-                );
-            }
-            crate::Ingress::SharedPool(k) if cfg.mode == crate::Mode::Sender && k >= 1 => {
-                eprintln!(
-                    "[bench-mio] scale: shared-pool ports {}-{}",
-                    cfg.port,
-                    cfg.port + k as u16 - 1
-                );
-            }
-            _ => {
-                eprintln!(
-                    "[bench-mio] scale: ports {}-{}",
-                    cfg.port,
-                    cfg.port + cfg.connections as u16 - 1
-                );
-            }
-        }
+}
+
+pub fn run(cfg: BenchConfig) {
+    let start = Instant::now();
+    if run_shared_sender_mode(&cfg, start) {
+        return;
     }
+    if cfg.mode == crate::Mode::Receiver {
+        println!("LISTENING");
+    }
+    if run_receiver_ingress(cfg.clone()) {
+        return;
+    }
+    report_scale(&cfg);
 
     let stats = crate::run_workers(&cfg, move |cfg, mine| drive(cfg, mine, start));
-
-    let mut agg = Aggregate::new(cfg);
-    for s in stats {
-        agg.add(s);
-    }
-    agg.print(start);
-    if !agg.any_connected {
-        std::process::exit(1);
-    }
+    finish_run(cfg, start, stats);
 }
 
 fn run_shared_sender(cfg: &BenchConfig, start: Instant) -> Vec<ConnStats> {
