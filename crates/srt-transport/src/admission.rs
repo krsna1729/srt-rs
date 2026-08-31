@@ -298,6 +298,7 @@ struct AdmissionFeedContext<'a> {
     new_logical_peer: Option<LogicalPeerId>,
 }
 
+#[inline]
 fn decode_admission_datagram(data: &[u8]) -> Result<DecodedAdmissionDatagram, ()> {
     // Only a CONTROL packet can be a handshake (SRT's F bit, the top bit
     // of the first word). Checking it here keeps `peek_handshake` -- a
@@ -807,6 +808,7 @@ impl PeerTable {
         }
     }
 
+    #[inline]
     fn resolve_conclusion_route(
         &self,
         peer: std::net::SocketAddr,
@@ -870,6 +872,7 @@ impl PeerTable {
         Admit::Dropped(AdmissionDropReason::StaleConclusion)
     }
 
+    #[inline]
     fn reject_new_peer(
         &self,
         peer: std::net::SocketAddr,
