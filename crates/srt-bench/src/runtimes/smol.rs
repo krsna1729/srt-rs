@@ -504,7 +504,178 @@ fn run_reuseport_multi(cfg: BenchConfig, k: usize) {
 /// and tokio's `run_acceptor` (see their doc comments for the full
 /// explanation). Only a leg that actually needs to relocate gets spawned
 /// as its own task on the owner's executor, via a handoff.
-#[expect(clippy::cognitive_complexity)]
+struct AcceptorContext<'a> {
+    cfg: &'a BenchConfig,
+    worker_index: usize,
+    start: Instant,
+    admission: &'a srt_transport::AdmissionOptions,
+    router: &'a crate::SharedWorkerRouter,
+    senders: &'a [mpsc::Sender<WorkerMessage>],
+    telemetry: &'a srt_transport::IngressTelemetry,
+    tasks: &'a mut Vec<async_executor::Task<ConnStats>>,
+}
+
+fn admit_acceptor_datagram(
+    peers: &mut srt_transport::PeerTable,
+    peer: SocketAddr,
+    data: &[u8],
+    context: &AcceptorContext<'_>,
+) {
+    peers.admit_and_forward(
+        peer,
+        data,
+        crate::now_ts(context.start),
+        context.admission,
+        context.worker_index,
+        context.senders,
+        context.telemetry,
+    );
+}
+
+async fn admit_until_tick(
+    listener: &UdpSocket,
+    buffer: &mut [u8; 2048],
+    peers: &mut srt_transport::PeerTable,
+    context: &AcceptorContext<'_>,
+) {
+    let recv_fut = async { listener.recv_from(buffer).await.ok() };
+    let timer_fut = async {
+        smol::Timer::after(TIMER_TICK).await;
+        None
+    };
+    if let Some((size, peer)) = futures_lite::future::or(recv_fut, timer_fut).await {
+        admit_acceptor_datagram(peers, peer, &buffer[..size], context);
+        while let Ok((size, peer)) = listener.get_ref().recv_from(buffer) {
+            admit_acceptor_datagram(peers, peer, &buffer[..size], context);
+        }
+    }
+}
+
+async fn maintain_acceptor_peers(
+    peers: &mut srt_transport::PeerTable,
+    listener: &UdpSocket,
+    start: Instant,
+    stream_len: Duration,
+) -> Vec<(SocketAddr, Option<GroupExtensionData>)> {
+    let now = crate::now_ts(start);
+    let mut relocate = Vec::new();
+    for (peer, p) in peers.iter_direct_for_bench() {
+        p.timers.fire_expired(now, &mut p.conn);
+        let _ = drain_pending_outputs(&mut p.conn, &mut p.timers, listener, *peer).await;
+        let mut newly_connected = false;
+        while let Some(event) = p.conn.poll_event() {
+            newly_connected |= p.apply_event(event);
+        }
+        if newly_connected {
+            p.stream_deadline = Some(Instant::now() + stream_len);
+            relocate.push((*peer, p.conn.peer_group_extension()));
+        }
+    }
+    relocate
+}
+
+fn promotion_decision(
+    context: &AcceptorContext<'_>,
+    peer: SocketAddr,
+    extension: Option<GroupExtensionData>,
+) -> srt_lifecycle::PromotionDecision {
+    let group = extension.map(|extension| srt_lifecycle::GroupAffinity {
+        group_id: extension.group_id,
+        stream_id: None,
+        extension,
+    });
+    match context.router.lock() {
+        Ok(mut router) => srt_lifecycle::decide_promotion(
+            context.cfg.promotion,
+            peer,
+            group,
+            context.worker_index,
+            &mut router,
+            srt_lifecycle::RoutingMode::LeastTuples,
+        ),
+        Err(_) => srt_lifecycle::PromotionDecision::StayOnListener,
+    }
+}
+
+fn apply_acceptor_promotions(
+    context: &mut AcceptorContext<'_>,
+    peers: &mut srt_transport::PeerTable,
+    relocations: Vec<(SocketAddr, Option<GroupExtensionData>)>,
+    ex: &async_executor::LocalExecutor<'_>,
+) {
+    for (peer, extension) in relocations {
+        match promotion_decision(context, peer, extension) {
+            srt_lifecycle::PromotionDecision::StayOnListener => {}
+            srt_lifecycle::PromotionDecision::RelocateTo(owner) => {
+                let Some(p) = peers.remove_direct_for_bench(peer) else {
+                    continue;
+                };
+                relocate_to_owner(
+                    context.cfg.port,
+                    context.cfg.sock_buf_bytes,
+                    peer,
+                    p.conn,
+                    owner,
+                    context.senders,
+                    context.telemetry,
+                );
+            }
+            srt_lifecycle::PromotionDecision::PromoteHere => {
+                let Some(p) = peers.remove_direct_for_bench(peer) else {
+                    continue;
+                };
+                match promote_locally(context.cfg.port, context.cfg.sock_buf_bytes, peer, p.conn) {
+                    Some(driver) => {
+                        let cfg = context.cfg.clone();
+                        let start = context.start;
+                        context.tasks.push(
+                            ex.spawn(
+                                async move { established_conn_task(driver, cfg, start).await },
+                            ),
+                        );
+                        context.telemetry.record_local_promotion();
+                    }
+                    None => eprintln!("[bench-smol] promote {peer}: failed"),
+                }
+            }
+        }
+    }
+}
+
+fn drain_acceptor_handoffs(
+    context: &mut AcceptorContext<'_>,
+    peers: &mut srt_transport::PeerTable,
+    handoffs: &mpsc::Receiver<WorkerMessage>,
+    ex: &async_executor::LocalExecutor<'_>,
+) {
+    while let Ok(message) = handoffs.try_recv() {
+        let handoff = match message {
+            WorkerMessage::Handoff(handoff) => handoff,
+            WorkerMessage::Finished { .. } => continue,
+            WorkerMessage::Handshake { peer, data } => {
+                admit_acceptor_datagram(peers, peer, &data, context);
+                continue;
+            }
+        };
+        let socket = match UdpSocket::new(handoff.socket) {
+            Ok(socket) => socket,
+            Err(error) => {
+                eprintln!(
+                    "[bench-smol] acceptor {}: handoff register {error}",
+                    context.worker_index
+                );
+                continue;
+            }
+        };
+        let driver = Conn::new(handoff.conn, socket);
+        let cfg = context.cfg.clone();
+        let start = context.start;
+        context
+            .tasks
+            .push(ex.spawn(async move { established_conn_task(driver, cfg, start).await }));
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "acceptor ownership inputs remain explicit across runtime adapters"
@@ -534,7 +705,6 @@ async fn run_acceptor(
         }
     };
 
-    let promotion = cfg.promotion;
     let mut peers = srt_transport::PeerTable::new();
     let admission = cfg.admission_options(std::process::id(), cfg.cookie_routing);
     let mut tasks: Vec<async_executor::Task<ConnStats>> = Vec::new();
@@ -543,159 +713,37 @@ async fn run_acceptor(
     let run_deadline = Instant::now() + stream_len + IDLE_GRACE + Duration::from_secs(30);
     let mut buf = [0u8; 2048];
 
-    loop {
-        let now = Instant::now();
-        if now >= run_deadline {
-            break;
-        }
-        // Vacuously true while nothing exists yet, so an acceptor that
-        // never admits anything still exits once the connect window
-        // closes instead of hanging on an empty guard.
-        let all_terminal = peers.all_terminal(now, connect_deadline, IDLE_GRACE);
-        if crate::shutdown::requested() || (now >= connect_deadline && all_terminal) {
-            break;
-        }
-
-        let recv_fut = async { listener.recv_from(&mut buf).await.ok() };
-        let timer_fut = async {
-            smol::Timer::after(TIMER_TICK).await;
-            None
+    {
+        let mut context = AcceptorContext {
+            cfg: &cfg,
+            worker_index,
+            start,
+            admission: &admission,
+            router: &router,
+            senders: &senders,
+            telemetry: &telemetry,
+            tasks: &mut tasks,
         };
-        if let Some((n, peer)) = futures_lite::future::or(recv_fut, timer_fut).await {
-            peers.admit_and_forward(
-                peer,
-                &buf[..n],
-                crate::now_ts(start),
-                &admission,
-                worker_index,
-                &senders,
-                &telemetry,
-            );
-            while let Ok((n, peer)) = listener.get_ref().recv_from(&mut buf) {
-                peers.admit_and_forward(
-                    peer,
-                    &buf[..n],
-                    crate::now_ts(start),
-                    &admission,
-                    worker_index,
-                    &senders,
-                    &telemetry,
-                );
+        loop {
+            let now = Instant::now();
+            if now >= run_deadline {
+                break;
             }
-        }
+            // Vacuously true while nothing exists yet, so an acceptor that
+            // never admits anything still exits once the connect window
+            // closes instead of hanging on an empty guard.
+            let all_terminal = peers.all_terminal(now, connect_deadline, IDLE_GRACE);
+            if crate::shutdown::requested() || (now >= connect_deadline && all_terminal) {
+                break;
+            }
 
-        // Drive every tracked peer: fire timers, drain outputs (always
-        // via the shared listener's unconnected `send_to` -- a peer here
-        // never gets its own socket), and react to protocol events. On a
-        // peer's *first* Connected, decide once whether it needs to
-        // relocate.
-        let t = crate::now_ts(start);
-        let mut relocate: Vec<(SocketAddr, Option<GroupExtensionData>)> = Vec::new();
-        for (peer, p) in peers.iter_direct_for_bench() {
-            p.timers.fire_expired(t, &mut p.conn);
-            let _ = drain_pending_outputs(&mut p.conn, &mut p.timers, &listener, *peer).await;
-            let mut newly_connected = false;
-            while let Some(ev) = p.conn.poll_event() {
-                newly_connected |= p.apply_event(ev);
-            }
-            if newly_connected {
-                p.stream_deadline = Some(Instant::now() + stream_len);
-                relocate.push((*peer, p.conn.peer_group_extension()));
-            }
-        }
-        for (peer, extension) in relocate {
-            // The ladder itself is shared policy -- see
-            // `srt_lifecycle::decide_promotion`. Only the actions below
-            // are this runtime's business.
-            let decision = {
-                let group = extension.map(|extension| srt_lifecycle::GroupAffinity {
-                    group_id: extension.group_id,
-                    stream_id: None,
-                    extension,
-                });
-                match router.lock() {
-                    Ok(mut router) => srt_lifecycle::decide_promotion(
-                        promotion,
-                        peer,
-                        group,
-                        worker_index,
-                        &mut router,
-                        srt_lifecycle::RoutingMode::LeastTuples,
-                    ),
-                    // Poisoned: leave the connection where it is rather
-                    // than stall admission on a dead lock.
-                    Err(_) => srt_lifecycle::PromotionDecision::StayOnListener,
-                }
-            };
+            admit_until_tick(&listener, &mut buf, &mut peers, &context).await;
 
-            match decision {
-                srt_lifecycle::PromotionDecision::StayOnListener => {}
-                srt_lifecycle::PromotionDecision::RelocateTo(owner) => {
-                    let Some(p) = peers.remove_direct_for_bench(peer) else {
-                        continue;
-                    };
-                    relocate_to_owner(
-                        cfg.port,
-                        cfg.sock_buf_bytes,
-                        peer,
-                        p.conn,
-                        owner,
-                        &senders,
-                        &telemetry,
-                    );
-                }
-                srt_lifecycle::PromotionDecision::PromoteHere => {
-                    let Some(p) = peers.remove_direct_for_bench(peer) else {
-                        continue;
-                    };
-                    match promote_locally(cfg.port, cfg.sock_buf_bytes, peer, p.conn) {
-                        Some(driver) => {
-                            let cfg2 = cfg.clone();
-                            tasks.push(ex.spawn(async move {
-                                established_conn_task(driver, cfg2, start).await
-                            }));
-                            telemetry.record_local_promotion();
-                        }
-                        None => eprintln!("[bench-smol] promote {peer}: failed"),
-                    }
-                }
-            }
-        }
+            let relocations =
+                maintain_acceptor_peers(&mut peers, &listener, start, stream_len).await;
+            apply_acceptor_promotions(&mut context, &mut peers, relocations, ex);
 
-        // Bond legs relocated here from another acceptor.
-        while let Ok(message) = handoffs.try_recv() {
-            let handoff = match message {
-                WorkerMessage::Handoff(handoff) => handoff,
-                // A handshake datagram routed here by its cookie: feed it
-                // to the peer state that owns it.
-                // Only the single-acceptor strategy sends this, and it
-                // never targets a ReuseportMulti acceptor. Named rather
-                // than caught by `_` so a new variant still has to be
-                // considered here.
-                WorkerMessage::Finished { .. } => continue,
-                WorkerMessage::Handshake { peer, data } => {
-                    peers.admit_and_forward(
-                        peer,
-                        &data,
-                        crate::now_ts(start),
-                        &admission,
-                        worker_index,
-                        &senders,
-                        &telemetry,
-                    );
-                    continue;
-                }
-            };
-            match UdpSocket::new(handoff.socket) {
-                Ok(sock) => {
-                    let driver = Conn::new(handoff.conn, sock);
-                    let cfg2 = cfg.clone();
-                    tasks.push(
-                        ex.spawn(async move { established_conn_task(driver, cfg2, start).await }),
-                    );
-                }
-                Err(e) => eprintln!("[bench-smol] acceptor {worker_index}: handoff register {e}"),
-            }
+            drain_acceptor_handoffs(&mut context, &mut peers, &handoffs, ex);
         }
     }
 
