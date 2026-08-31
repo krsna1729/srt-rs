@@ -88,6 +88,16 @@ fn burst_loss(burst_len: u32, post_burst: u32) {
     }
 }
 
+fn persistent_old_hole(packet_count: u32) {
+    let mut receiver = ReceiverBuffer::new(0, 120, timestamp(0), 0);
+    receiver.set_tsbpd_enabled(false);
+    for seq in 1..packet_count {
+        let now = timestamp(u64::from(seq) + 1);
+        let _ = receiver.receive(packet(seq, seq), now);
+        while receiver.pop_ready(now).is_some() {}
+    }
+}
+
 fn count_allocations(run: impl FnOnce()) -> u64 {
     ALLOCATIONS.store(0, Ordering::Relaxed);
     run();
@@ -121,5 +131,19 @@ fn loss_scenarios_do_not_allocate_a_packet_order_view_per_receive() {
     assert!(
         burst_1000_2000 < 7_000,
         "persistent loss rebuilt packet order: {burst_1000_2000} allocations"
+    );
+}
+
+#[test]
+fn persistent_old_hole_has_no_frontier_bookkeeping_allocations() {
+    let allocations = count_allocations(|| persistent_old_hole(8_192));
+    eprintln!("persistent old hole allocations: {allocations}");
+
+    // One payload and approximately one ordered-map node allocation per
+    // retained packet dominate this scenario. The frontier itself must remain
+    // inline state and add no per-arrival heap allocation.
+    assert!(
+        allocations < 17_000,
+        "frontier bookkeeping allocated per arrival: {allocations}"
     );
 }
