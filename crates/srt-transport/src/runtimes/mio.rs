@@ -257,9 +257,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::drain_outputs_with;
+    use super::{drain_outputs_with, send_packet_batch};
     use crate::*;
-    use shiguredo_srt::{ConnectionOptions, ConnectionOutput, Timestamp};
+    use shiguredo_srt::{ConnectionOptions, ConnectionOutput, TimerId, Timestamp};
     use std::collections::VecDeque;
     use std::io;
 
@@ -360,6 +360,56 @@ mod tests {
         assert_eq!(
             pending,
             VecDeque::from([ConnectionOutput::SendPacket(vec![2, 2])])
+        );
+    }
+
+    #[test]
+    fn invalid_batch_count_requeues_packets_before_following_work() {
+        let batch = vec![vec![1], vec![2]];
+        let mut work = VecDeque::from([ConnectionOutput::ClearTimer { id: TimerId::Ack }]);
+        let mut pending = VecDeque::from([ConnectionOutput::SendPacket(vec![3])]);
+        let mut report = OutputDrainReport::default();
+
+        let error =
+            send_packet_batch(batch, &mut work, &mut pending, &mut report, |_| Ok(3)).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(work.is_empty());
+        assert_eq!(report, OutputDrainReport::default());
+        assert_eq!(
+            pending,
+            VecDeque::from([
+                ConnectionOutput::SendPacket(vec![1]),
+                ConnectionOutput::SendPacket(vec![2]),
+                ConnectionOutput::ClearTimer { id: TimerId::Ack },
+                ConnectionOutput::SendPacket(vec![3]),
+            ])
+        );
+    }
+
+    #[test]
+    fn non_would_block_batch_error_requeues_packets_before_following_work() {
+        let batch = vec![vec![1], vec![2]];
+        let mut work = VecDeque::from([ConnectionOutput::ClearTimer { id: TimerId::Ack }]);
+        let mut pending = VecDeque::from([ConnectionOutput::SendPacket(vec![3])]);
+        let mut report = OutputDrainReport::default();
+
+        let error = send_packet_batch(batch, &mut work, &mut pending, &mut report, |_| {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        })
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert!(work.is_empty());
+        assert_eq!(report, OutputDrainReport::default());
+        assert_eq!(
+            pending,
+            VecDeque::from([
+                ConnectionOutput::SendPacket(vec![1]),
+                ConnectionOutput::SendPacket(vec![2]),
+                ConnectionOutput::ClearTimer { id: TimerId::Ack },
+                ConnectionOutput::SendPacket(vec![3]),
+            ])
         );
     }
 }
