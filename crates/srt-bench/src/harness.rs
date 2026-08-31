@@ -1571,13 +1571,229 @@ fn build_matrix_schedule(
     Ok(MatrixSchedule { runs, done, total })
 }
 
+struct MatrixCellConfig {
+    label: Vec<String>,
+    recv_ingress: String,
+    send_ingress: String,
+    recv_runtime: String,
+    send_runtime: String,
+    bitrate: String,
+    ports_needed: usize,
+}
+
+fn matrix_cell_value(cell: &Cell<'_>, name: &str) -> Option<String> {
+    cell.iter()
+        .find(|(axis, _, _)| *axis == name)
+        .map(|(_, _, value)| value.clone())
+}
+
+fn matrix_cell_config(cell: &Cell<'_>) -> MatrixCellConfig {
+    let label = cell
+        .iter()
+        .map(|(key, scope, value)| format!("{}{key}={value}", scope.prefix().replace('_', "-")))
+        .collect();
+    let for_role = |name: &str, role: Scope, default: &str| -> String {
+        cell.iter()
+            .find(|(key, scope, _)| *key == name && *scope == role)
+            .or_else(|| {
+                cell.iter()
+                    .find(|(key, scope, _)| *key == name && *scope == Scope::Both)
+            })
+            .map_or_else(|| default.to_string(), |(_, _, value)| value.clone())
+    };
+    let recv_ingress = for_role("ingress", Scope::Recv, "per-port");
+    let send_ingress = for_role("ingress", Scope::Send, "per-port");
+    let recv_runtime = for_role("runtime", Scope::Recv, "mio");
+    let send_runtime = for_role("runtime", Scope::Send, "mio");
+    let connections = matrix_cell_value(cell, "connections")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1);
+    let bitrate = matrix_cell_value(cell, "bitrate").unwrap_or_else(|| "8000000".into());
+    // per-port needs one port per connection; the pooled and reuseport
+    // strategies need at most K. Ask for the worst case this cell could use.
+    let ports_needed = if recv_ingress == "per-port" {
+        connections
+    } else {
+        recv_ingress
+            .split_once(':')
+            .and_then(|(_, count)| count.parse().ok())
+            .unwrap_or(1)
+    };
+    MatrixCellConfig {
+        label,
+        recv_ingress,
+        send_ingress,
+        recv_runtime,
+        send_runtime,
+        bitrate,
+        ports_needed,
+    }
+}
+
+fn matrix_cell_supported(config: &MatrixCellConfig) -> bool {
+    crate::runtimes::ingress_supported(
+        crate::Runtime::parse(&config.recv_runtime).unwrap_or(crate::Runtime::Mio),
+        parse_ingress_spec(&config.recv_ingress),
+    ) && crate::runtimes::ingress_supported(
+        crate::Runtime::parse(&config.send_runtime).unwrap_or(crate::Runtime::Mio),
+        parse_ingress_spec(&config.send_ingress),
+    )
+}
+
+fn matrix_cell_link(cell: &Cell<'_>, flag: &str) -> Option<String> {
+    cell.iter()
+        .find(|(axis, _, _)| *axis == flag)
+        .map(|(_, _, value)| value.clone())
+}
+
+fn matrix_cell_argv(cell: &Cell<'_>, role: Scope) -> Vec<String> {
+    let mut out: Vec<String> = cell
+        .iter()
+        .filter(|(axis, scope, _)| {
+            *axis != "bitrate" && *axis != "runtime" && scope.applies_to(role)
+        })
+        .map(|(axis, _, value)| format!("--{axis}={value}"))
+        .collect();
+    for (axis, scope, value) in cell {
+        if *scope != Scope::Both {
+            out.push(format!(
+                "--{}{axis}={value}",
+                scope.prefix().replace('_', "-")
+            ));
+        }
+    }
+    out
+}
+
+struct MatrixProcessContext<'a, 'cell> {
+    exe: &'a Path,
+    out: &'a Path,
+    cell: &'a Cell<'cell>,
+    config: &'a MatrixCellConfig,
+    rep: usize,
+    secs: u64,
+    latency: u16,
+    recv_cpus: &'a str,
+    send_cpus: &'a str,
+    netns: Option<Priv>,
+    run_index: usize,
+    total: usize,
+}
+
+fn run_matrix_processes(context: MatrixProcessContext<'_, '_>, port: u16) -> std::io::Result<()> {
+    let MatrixProcessContext {
+        exe,
+        out,
+        cell,
+        config,
+        rep,
+        secs,
+        latency,
+        recv_cpus,
+        send_cpus,
+        netns,
+        run_index,
+        total,
+    } = context;
+    // Each role gets the axes scoped to it plus the shared ones.
+    // Both roles additionally get every split axis's *other* side
+    // as a record-only `--recv-*`/`--send-*` flag, so a single row
+    // states the whole cell -- without which two cells differing
+    // only on the far side would be indistinguishable, and resume
+    // would skip one of them.
+    let mut recv_argv = matrix_cell_argv(cell, Scope::Recv);
+    let send_argv = matrix_cell_argv(cell, Scope::Send);
+    // The listener runs to a long backstop, but the cell's stream
+    // length is what any rate is computed against.
+    recv_argv.push(format!("--stream-secs={secs}"));
+
+    // Receiver outlives the sender so it is still listening when
+    // the last packets arrive; +5s mirrors the old harness.
+    let mut recv = if let Some(p) = netns {
+        in_netns(p, exe)
+    } else {
+        std::process::Command::new(exe)
+    }
+    .arg(format!("runtime={}", config.recv_runtime))
+    .arg("mode=receiver")
+    .arg(port.to_string())
+    // Backstop only: the harness signals the real stop once
+    // the sender finishes. Generous, because a sender under
+    // overload can run well past its nominal duration and the
+    // listener must still be there when it does.
+    .arg((secs + 60).to_string())
+    .arg(latency.to_string())
+    .env("SRT_BENCH_CHILD", "1")
+    // The receiver ignores this functionally, but both rows
+    // must record the same configured bitrate or a report
+    // grouping on it would split the pair and lose delivery%.
+    .arg(&config.bitrate)
+    .args(&recv_argv)
+    .arg(format!("--rep={rep}"))
+    .arg(format!("--cpus={recv_cpus}"))
+    .arg(format!("--out={}", out.display()))
+    .stdout(std::process::Stdio::piped())
+    .spawn()?;
+
+    if !wait_for_listening(&mut recv, std::time::Duration::from_secs(60)) {
+        eprintln!(
+            "[warn] listener never reported LISTENING: {}",
+            config.label.join(" ")
+        );
+    }
+
+    let send = if let Some(p) = netns {
+        in_netns(p, exe)
+    } else {
+        std::process::Command::new(exe)
+    }
+    .arg(format!("runtime={}", config.send_runtime))
+    .arg("mode=sender")
+    .arg("127.0.0.1")
+    .arg(port.to_string())
+    .arg(secs.to_string())
+    .arg(latency.to_string())
+    .arg(&config.bitrate)
+    .env("SRT_BENCH_CHILD", "1")
+    .args(&send_argv)
+    .arg(format!("--rep={rep}"))
+    .arg(format!("--cpus={send_cpus}"))
+    .arg(format!("--out={}", out.display()))
+    .stdout(std::process::Stdio::null())
+    .status()?;
+
+    // Let the ordered SRT SHUTDOWN reach the listener and flush its
+    // receive/event queues. Signalling immediately here raced the final
+    // runtime tick and under-counted delivery even though wire telemetry
+    // had received the packets. Most listeners exit naturally within a
+    // few milliseconds; SIGTERM remains the bounded fallback.
+    let recv_status = match wait_for_natural_exit(&mut recv, std::time::Duration::from_millis(500))?
+    {
+        Some(status) => status,
+        None => {
+            request_stop(&recv);
+            recv.wait()?
+        }
+    };
+    eprintln!(
+        "[{:>4}/{total}] rep {rep} {}{}",
+        run_index + 1,
+        config.label.join(" "),
+        if send.success() && recv_status.success() {
+            String::new()
+        } else {
+            format!(" (sender={send} receiver={recv_status})")
+        }
+    );
+    Ok(())
+}
+
 /// Run the cartesian product of the requested axes, one receiver/sender
 /// pair per cell, appending both sides' results to `out`.
 ///
 /// Each side is a fresh child process rather than a thread: CPU is
 /// measured with `getrusage`, which is per-process, so running both roles
 /// in one process would attribute the sender's cost to the listener.
-#[expect(clippy::cognitive_complexity)]
 pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
     let exe = std::env::current_exe()?;
     let out = std::path::PathBuf::from(
@@ -1627,15 +1843,10 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
     // `netem=none` ones: a namespace's loopback is not identical to the
     // host's, so mixing the two would confound the comparison the sweep
     // exists to make.
-    let cell_link = |cell: &[(&str, Scope, String)], flag: &str| -> Option<String> {
-        cell.iter()
-            .find(|(a, _, _)| *a == flag)
-            .map(|(_, _, v)| v.clone())
-    };
     // Fail before the first cell rather than midway through a sweep.
     let mut any_link = false;
     for cell in &cells {
-        if netem_args(|f| cell_link(cell, f))
+        if netem_args(|f| matrix_cell_link(cell, f))
             .map_err(std::io::Error::other)?
             .is_some()
         {
@@ -1655,62 +1866,14 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
     let mut unsupported_cells = std::collections::HashSet::new();
     for (run_index, (cell_index, rep)) in schedule.iter().copied().enumerate() {
         let cell = &cells[cell_index];
-        let label: Vec<String> = cell
-            .iter()
-            .map(|(k, scope, v)| format!("{}{k}={v}", scope.prefix().replace('_', "-")))
-            .collect();
-        // Resolve one axis for one role: its role-scoped value if the axis
-        // was split, otherwise the shared one.
-        let for_role = |name: &str, role: Scope, default: &str| -> String {
-            cell.iter()
-                .find(|(k, scope, _)| *k == name && *scope == role)
-                .or_else(|| {
-                    cell.iter()
-                        .find(|(k, scope, _)| *k == name && *scope == Scope::Both)
-                })
-                .map_or_else(|| default.to_string(), |(_, _, v)| v.clone())
-        };
-        let value = |name: &str| -> Option<String> {
-            cell.iter()
-                .find(|(k, _, _)| *k == name)
-                .map(|(_, _, v)| v.clone())
-        };
-        let recv_ingress = for_role("ingress", Scope::Recv, "per-port");
-        let send_ingress = for_role("ingress", Scope::Send, "per-port");
-        let recv_runtime = for_role("runtime", Scope::Recv, "mio");
-        let send_runtime = for_role("runtime", Scope::Send, "mio");
-        let conns_in_cell: usize = value("connections")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1);
-        let bitrate = value("bitrate").unwrap_or_else(|| "8000000".into());
-        // Port budget and support checks follow the LISTENER: it is the
-        // side that binds.
-        let ingress = recv_ingress.clone();
-        let runtime = recv_runtime.clone();
-        // per-port needs one port per connection; the pooled and
-        // reuseport strategies need at most K. Ask for the worst case
-        // this cell could use.
-        let ports_needed = if ingress == "per-port" {
-            conns_in_cell
-        } else {
-            ingress
-                .split_once(':')
-                .and_then(|(_, k)| k.parse().ok())
-                .unwrap_or(1)
-        };
+        let config = matrix_cell_config(cell);
         // Skip combinations the runtime does not implement rather than
         // running them and recording the wreckage: an unsupported cell
         // produces bind collisions that look exactly like a harness bug.
-        if !crate::runtimes::ingress_supported(
-            crate::Runtime::parse(&runtime).unwrap_or(crate::Runtime::Mio),
-            parse_ingress_spec(&ingress),
-        ) || !crate::runtimes::ingress_supported(
-            crate::Runtime::parse(&send_runtime).unwrap_or(crate::Runtime::Mio),
-            parse_ingress_spec(&send_ingress),
-        ) {
+        if !matrix_cell_supported(&config) {
             if unsupported_cells.insert(cell_index) {
                 skipped_runs += reps;
-                eprintln!("[skip] {} (unsupported)", label.join(" "));
+                eprintln!("[skip] {} (unsupported)", config.label.join(" "));
             }
             continue;
         }
@@ -1720,7 +1883,7 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
         if let Some(p) = netns {
             netem_apply(
                 p,
-                netem_args(|f| cell_link(cell, f)).map_err(std::io::Error::other)?,
+                netem_args(|f| matrix_cell_link(cell, f)).map_err(std::io::Error::other)?,
             )?;
         }
         // A per-port cell at the top of the sweep can legitimately ask
@@ -1728,122 +1891,34 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
         // the range (the full plan reaches 1200 connections). Treat that
         // as an unavailable resource cell and continue the sweep so one
         // impossible topology does not hide every pooled result after it.
-        let port = match free_port_range(ports_needed) {
+        let port = match free_port_range(config.ports_needed) {
             Ok(port) => port,
             Err(error) => {
                 skipped_runs += 1;
                 eprintln!(
                     "[skip] {} (port allocation failed: {error})",
-                    label.join(" ")
+                    config.label.join(" ")
                 );
                 continue;
             }
         };
-        // Each role gets the axes scoped to it plus the shared ones.
-        // Both roles additionally get every split axis's *other* side
-        // as a record-only `--recv-*`/`--send-*` flag, so a single row
-        // states the whole cell -- without which two cells differing
-        // only on the far side would be indistinguishable, and resume
-        // would skip one of them.
-        let argv_for = |role: Scope| -> Vec<String> {
-            let mut out: Vec<String> = cell
-                .iter()
-                .filter(|(k, scope, _)| {
-                    *k != "bitrate" && *k != "runtime" && scope.applies_to(role)
-                })
-                .map(|(k, _, v)| format!("--{k}={v}"))
-                .collect();
-            for (k, scope, v) in cell {
-                if *scope != Scope::Both {
-                    out.push(format!("--{}{k}={v}", scope.prefix().replace('_', "-")));
-                }
-            }
-            out
-        };
-        let mut recv_argv = argv_for(Scope::Recv);
-        let send_argv = argv_for(Scope::Send);
-        // The listener runs to a long backstop, but the cell's stream
-        // length is what any rate is computed against.
-        recv_argv.push(format!("--stream-secs={secs}"));
-
-        // Receiver outlives the sender so it is still listening when
-        // the last packets arrive; +5s mirrors the old harness.
-        let mut recv = if let Some(p) = netns {
-            in_netns(p, &exe)
-        } else {
-            std::process::Command::new(&exe)
-        }
-        .arg(format!("runtime={recv_runtime}"))
-        .arg("mode=receiver")
-        .arg(port.to_string())
-        // Backstop only: the harness signals the real stop once
-        // the sender finishes. Generous, because a sender under
-        // overload can run well past its nominal duration and the
-        // listener must still be there when it does.
-        .arg((secs + 60).to_string())
-        .arg(latency.to_string())
-        .env("SRT_BENCH_CHILD", "1")
-        // The receiver ignores this functionally, but both rows
-        // must record the same configured bitrate or a report
-        // grouping on it would split the pair and lose delivery%.
-        .arg(&bitrate)
-        .args(&recv_argv)
-        .arg(format!("--rep={rep}"))
-        .arg(format!("--cpus={recv_cpus}"))
-        .arg(format!("--out={}", out.display()))
-        .stdout(std::process::Stdio::piped())
-        .spawn()?;
-
-        if !wait_for_listening(&mut recv, std::time::Duration::from_secs(60)) {
-            eprintln!(
-                "[warn] listener never reported LISTENING: {}",
-                label.join(" ")
-            );
-        }
-
-        let send = if let Some(p) = netns {
-            in_netns(p, &exe)
-        } else {
-            std::process::Command::new(&exe)
-        }
-        .arg(format!("runtime={send_runtime}"))
-        .arg("mode=sender")
-        .arg("127.0.0.1")
-        .arg(port.to_string())
-        .arg(secs.to_string())
-        .arg(latency.to_string())
-        .arg(&bitrate)
-        .env("SRT_BENCH_CHILD", "1")
-        .args(&send_argv)
-        .arg(format!("--rep={rep}"))
-        .arg(format!("--cpus={send_cpus}"))
-        .arg(format!("--out={}", out.display()))
-        .stdout(std::process::Stdio::null())
-        .status()?;
-
-        // Let the ordered SRT SHUTDOWN reach the listener and flush its
-        // receive/event queues. Signalling immediately here raced the final
-        // runtime tick and under-counted delivery even though wire telemetry
-        // had received the packets. Most listeners exit naturally within a
-        // few milliseconds; SIGTERM remains the bounded fallback.
-        let recv_status =
-            match wait_for_natural_exit(&mut recv, std::time::Duration::from_millis(500))? {
-                Some(status) => status,
-                None => {
-                    request_stop(&recv);
-                    recv.wait()?
-                }
-            };
-        eprintln!(
-            "[{:>4}/{total}] rep {rep} {}{}",
-            run_index + 1,
-            label.join(" "),
-            if send.success() && recv_status.success() {
-                String::new()
-            } else {
-                format!(" (sender={send} receiver={recv_status})")
-            }
-        );
+        run_matrix_processes(
+            MatrixProcessContext {
+                exe: &exe,
+                out: &out,
+                cell,
+                config: &config,
+                rep,
+                secs,
+                latency,
+                recv_cpus: &recv_cpus,
+                send_cpus: &send_cpus,
+                netns,
+                run_index,
+                total,
+            },
+            port,
+        )?;
     }
     if let Some(p) = netns {
         netns_down(p);
