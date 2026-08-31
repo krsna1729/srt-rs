@@ -1304,75 +1304,13 @@ fn shuffle<T>(items: &mut [T], seed: u64) {
     }
 }
 
-/// Round-robin each Cartesian level so runtime, ingress, encryption, and
-/// subsequent axes are spread through the run instead of appearing in one
-/// long block. This remains deterministic and preserves each axis's plan
-/// value order within its round-robin lanes.
-fn interleave_indices(cells: &[Cell<'_>], axes: &[Axis]) -> Vec<usize> {
-    fn visit(cells: &[Cell<'_>], axes: &[Axis], depth: usize, indices: Vec<usize>) -> Vec<usize> {
-        if depth == axes.len() || indices.len() < 2 {
-            return indices;
-        }
-        let (name, scope, values) = &axes[depth];
-        let mut groups: Vec<Vec<usize>> = values
-            .iter()
-            .map(|value| {
-                indices
-                    .iter()
-                    .copied()
-                    .filter(|index| {
-                        cells[*index].iter().any(|(axis, cell_scope, cell_value)| {
-                            axis == name && cell_scope == scope && cell_value == value
-                        })
-                    })
-                    .collect()
-            })
-            .filter(|group: &Vec<usize>| !group.is_empty())
-            .collect();
-        if groups.len() < 2 {
-            return visit(cells, axes, depth + 1, indices);
-        }
-        for group in &mut groups {
-            let replacement = visit(cells, axes, depth + 1, std::mem::take(group));
-            *group = replacement;
-        }
-        let mut out = Vec::with_capacity(indices.len());
-        let longest = groups.iter().map(Vec::len).max().unwrap_or(0);
-        for offset in 0..longest {
-            for group in &groups {
-                if let Some(index) = group.get(offset) {
-                    out.push(*index);
-                }
-            }
-        }
-        out
-    }
-
-    visit(cells, axes, 0, (0..cells.len()).collect())
+struct MatrixAxisConfig {
+    axes: Vec<Axis>,
+    recv_cpus: String,
+    send_cpus: String,
 }
 
-/// Run the cartesian product of the requested axes, one receiver/sender
-/// pair per cell, appending both sides' results to `out`.
-///
-/// Each side is a fresh child process rather than a thread: CPU is
-/// measured with `getrusage`, which is per-process, so running both roles
-/// in one process would attribute the sender's cost to the listener.
-#[expect(clippy::cognitive_complexity)]
-pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
-    let exe = std::env::current_exe()?;
-    let out = std::path::PathBuf::from(
-        cli.flags
-            .get("out")
-            .cloned()
-            .unwrap_or_else(|| "scratch/results.tsv".to_string()),
-    );
-    // Per-role CPU sets. Disjoint sets let the compute-bound side be
-    // given cores without the other taking them back; see
-    // docs/cpu-budget.md. Empty leaves the inherited mask alone.
-    let reps: usize = cli.flag_or("reps", 3);
-    let secs: u64 = cli.flag_or("secs", 8);
-    let latency: u16 = cli.flag_or("latency", 120);
-
+fn resolve_matrix_axes(cli: &crate::Cli) -> std::io::Result<MatrixAxisConfig> {
     // A plan file, when given, supplies axis values; anything it omits
     // falls back to the CLI flag and then the built-in default. Explicit
     // `--axis name=value` entries are the only CLI inputs that override a
@@ -1502,6 +1440,87 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
             unused.join(", ")
         )));
     }
+    Ok(MatrixAxisConfig {
+        axes,
+        recv_cpus,
+        send_cpus,
+    })
+}
+
+/// Round-robin each Cartesian level so runtime, ingress, encryption, and
+/// subsequent axes are spread through the run instead of appearing in one
+/// long block. This remains deterministic and preserves each axis's plan
+/// value order within its round-robin lanes.
+fn interleave_indices(cells: &[Cell<'_>], axes: &[Axis]) -> Vec<usize> {
+    fn visit(cells: &[Cell<'_>], axes: &[Axis], depth: usize, indices: Vec<usize>) -> Vec<usize> {
+        if depth == axes.len() || indices.len() < 2 {
+            return indices;
+        }
+        let (name, scope, values) = &axes[depth];
+        let mut groups: Vec<Vec<usize>> = values
+            .iter()
+            .map(|value| {
+                indices
+                    .iter()
+                    .copied()
+                    .filter(|index| {
+                        cells[*index].iter().any(|(axis, cell_scope, cell_value)| {
+                            axis == name && cell_scope == scope && cell_value == value
+                        })
+                    })
+                    .collect()
+            })
+            .filter(|group: &Vec<usize>| !group.is_empty())
+            .collect();
+        if groups.len() < 2 {
+            return visit(cells, axes, depth + 1, indices);
+        }
+        for group in &mut groups {
+            let replacement = visit(cells, axes, depth + 1, std::mem::take(group));
+            *group = replacement;
+        }
+        let mut out = Vec::with_capacity(indices.len());
+        let longest = groups.iter().map(Vec::len).max().unwrap_or(0);
+        for offset in 0..longest {
+            for group in &groups {
+                if let Some(index) = group.get(offset) {
+                    out.push(*index);
+                }
+            }
+        }
+        out
+    }
+
+    visit(cells, axes, 0, (0..cells.len()).collect())
+}
+
+/// Run the cartesian product of the requested axes, one receiver/sender
+/// pair per cell, appending both sides' results to `out`.
+///
+/// Each side is a fresh child process rather than a thread: CPU is
+/// measured with `getrusage`, which is per-process, so running both roles
+/// in one process would attribute the sender's cost to the listener.
+#[expect(clippy::cognitive_complexity)]
+pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
+    let exe = std::env::current_exe()?;
+    let out = std::path::PathBuf::from(
+        cli.flags
+            .get("out")
+            .cloned()
+            .unwrap_or_else(|| "scratch/results.tsv".to_string()),
+    );
+    // Per-role CPU sets. Disjoint sets let the compute-bound side be
+    // given cores without the other taking them back; see
+    // docs/cpu-budget.md. Empty leaves the inherited mask alone.
+    let reps: usize = cli.flag_or("reps", 3);
+    let secs: u64 = cli.flag_or("secs", 8);
+    let latency: u16 = cli.flag_or("latency", 120);
+
+    let MatrixAxisConfig {
+        axes,
+        recv_cpus,
+        send_cpus,
+    } = resolve_matrix_axes(cli)?;
 
     // Cartesian product, filtered one point at a time: the whole point is
     // to know how many cells there are before starting a long sweep without
