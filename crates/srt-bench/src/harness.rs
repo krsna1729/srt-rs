@@ -1501,47 +1501,65 @@ fn resolve_matrix_axes(cli: &crate::Cli) -> std::io::Result<MatrixAxisConfig> {
 /// subsequent axes are spread through the run instead of appearing in one
 /// long block. This remains deterministic and preserves each axis's plan
 /// value order within its round-robin lanes.
-fn interleave_indices(cells: &[Cell<'_>], axes: &[Axis]) -> Vec<usize> {
-    fn visit(cells: &[Cell<'_>], axes: &[Axis], depth: usize, indices: Vec<usize>) -> Vec<usize> {
-        if depth == axes.len() || indices.len() < 2 {
-            return indices;
-        }
-        let (name, scope, values) = &axes[depth];
-        let mut groups: Vec<Vec<usize>> = values
-            .iter()
-            .map(|value| {
-                indices
-                    .iter()
-                    .copied()
-                    .filter(|index| {
-                        cells[*index].iter().any(|(axis, cell_scope, cell_value)| {
-                            axis == name && cell_scope == scope && cell_value == value
-                        })
+fn axis_groups(
+    cells: &[Cell<'_>],
+    name: &str,
+    scope: Scope,
+    values: &[String],
+    indices: &[usize],
+) -> Vec<Vec<usize>> {
+    values
+        .iter()
+        .map(|value| {
+            indices
+                .iter()
+                .copied()
+                .filter(|index| {
+                    cells[*index].iter().any(|(axis, cell_scope, cell_value)| {
+                        *axis == name && *cell_scope == scope && cell_value == value
                     })
-                    .collect()
-            })
-            .filter(|group: &Vec<usize>| !group.is_empty())
-            .collect();
-        if groups.len() < 2 {
-            return visit(cells, axes, depth + 1, indices);
-        }
-        for group in &mut groups {
-            let replacement = visit(cells, axes, depth + 1, std::mem::take(group));
-            *group = replacement;
-        }
-        let mut out = Vec::with_capacity(indices.len());
-        let longest = groups.iter().map(Vec::len).max().unwrap_or(0);
-        for offset in 0..longest {
-            for group in &groups {
-                if let Some(index) = group.get(offset) {
-                    out.push(*index);
-                }
+                })
+                .collect()
+        })
+        .filter(|group: &Vec<usize>| !group.is_empty())
+        .collect()
+}
+
+fn round_robin_groups(groups: &[Vec<usize>], capacity: usize) -> Vec<usize> {
+    let mut out = Vec::with_capacity(capacity);
+    let longest = groups.iter().map(Vec::len).max().unwrap_or(0);
+    for offset in 0..longest {
+        for group in groups {
+            if let Some(index) = group.get(offset) {
+                out.push(*index);
             }
         }
-        out
     }
+    out
+}
 
-    visit(cells, axes, 0, (0..cells.len()).collect())
+fn visit_interleaved(
+    cells: &[Cell<'_>],
+    axes: &[Axis],
+    depth: usize,
+    indices: Vec<usize>,
+) -> Vec<usize> {
+    if depth == axes.len() || indices.len() < 2 {
+        return indices;
+    }
+    let (name, scope, values) = &axes[depth];
+    let mut groups = axis_groups(cells, name, *scope, values, &indices);
+    if groups.len() < 2 {
+        return visit_interleaved(cells, axes, depth + 1, indices);
+    }
+    for group in &mut groups {
+        *group = visit_interleaved(cells, axes, depth + 1, std::mem::take(group));
+    }
+    round_robin_groups(&groups, indices.len())
+}
+
+fn interleave_indices(cells: &[Cell<'_>], axes: &[Axis]) -> Vec<usize> {
+    visit_interleaved(cells, axes, 0, (0..cells.len()).collect())
 }
 
 struct MatrixSchedule {
