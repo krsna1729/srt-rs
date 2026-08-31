@@ -1,7 +1,7 @@
 //! Property-based tests for SRT ReceiverBuffer
 
 use proptest::prelude::*;
-use shiguredo_srt::{DataPacket, PacketPosition, ReceiverBuffer, Timestamp};
+use shiguredo_srt::{DEFAULT_FLOW_WINDOW, DataPacket, PacketPosition, ReceiverBuffer, Timestamp};
 
 /// テスト用の DataPacket を生成
 fn make_packet(seq: u32, timestamp: u32) -> DataPacket {
@@ -511,6 +511,39 @@ proptest! {
         }
     }
 
+    /// The public NAK view remains equivalent to the set of exposed sequence
+    /// positions that have not subsequently arrived, including across wrap.
+    #[test]
+    fn loss_membership_matches_exposed_but_unreceived_positions(
+        raw_initial in any::<u32>(),
+        offsets in proptest::collection::vec(0u16..256, 1..512),
+    ) {
+        const SEQUENCE_MASK: u32 = 0x7FFF_FFFF;
+        let initial = raw_initial & SEQUENCE_MASK;
+        let now = Timestamp::from_micros(1_000);
+        let mut buf = ReceiverBuffer::new(initial, 120, Timestamp::default(), 0);
+        buf.set_tsbpd_enabled(false);
+        let mut received = std::collections::HashSet::new();
+        let mut frontier = 0u16;
+
+        for offset in offsets {
+            let seq = initial.wrapping_add(u32::from(offset)) & SEQUENCE_MASK;
+            let _ = buf.receive(make_packet(seq, u32::from(offset)), now);
+            received.insert(offset);
+            frontier = frontier.max(offset);
+
+            let mut expected: Vec<u32> = (0..frontier)
+                .filter(|position| !received.contains(position))
+                .map(|position| initial.wrapping_add(u32::from(position)) & SEQUENCE_MASK)
+                .collect();
+            expected.sort_unstable();
+            let actual = buf
+                .generate_periodic_nak()
+                .map_or_else(Vec::new, |nak| nak.loss_list);
+            prop_assert_eq!(actual, expected);
+        }
+    }
+
     /// A forward DROPREQ classifies the gap before the request as loss and the
     /// request itself as dropped. Extending receipt beyond it must expose only
     /// the new suffix, including when either interval crosses sequence wrap.
@@ -556,6 +589,34 @@ proptest! {
             buf.stats().total_lost,
             u64::from(gap_before_drop + gap_after_drop)
         );
+    }
+
+    #[test]
+    fn forward_drop_cannot_classify_losses_beyond_the_receive_window(
+        raw_initial in any::<u32>(),
+        beyond_window in 1u32..64,
+    ) {
+        const SEQUENCE_MASK: u32 = 0x7FFF_FFFF;
+        let initial = raw_initial & SEQUENCE_MASK;
+        let now = Timestamp::from_micros(1_000);
+        let mut buf = ReceiverBuffer::new(initial, 120, Timestamp::default(), 0);
+        buf.set_tsbpd_enabled(false);
+
+        let edge = initial.wrapping_add(DEFAULT_FLOW_WINDOW) & SEQUENCE_MASK;
+        prop_assert_eq!(
+            buf.receive(make_packet(edge, 0), now).unwrap().len(),
+            DEFAULT_FLOW_WINDOW as usize
+        );
+        let first_drop = edge.wrapping_add(beyond_window) & SEQUENCE_MASK;
+        prop_assert!(buf.drop_range(first_drop, first_drop).is_err());
+
+        let nak = buf.generate_periodic_nak().unwrap().loss_list;
+        prop_assert_eq!(nak.len(), DEFAULT_FLOW_WINDOW as usize);
+        let all_losses_fit = nak.iter().all(|&seq| {
+            seq.wrapping_sub(initial) & SEQUENCE_MASK < DEFAULT_FLOW_WINDOW
+        });
+        prop_assert!(all_losses_fit);
+        prop_assert_eq!(buf.stats().total_lost, u64::from(DEFAULT_FLOW_WINDOW));
     }
 
     #[test]

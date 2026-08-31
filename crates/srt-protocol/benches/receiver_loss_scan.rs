@@ -3,9 +3,10 @@
 //! `contains`/`retain` on the per-packet hot path, and
 //! `find_deliverable_seq`'s `has_gap` check did an O(loss_list) scan for
 //! *every* candidate packet on *every* `pop_ready()` call -- O(packets x
-//! loss_list) overall. Fixed by switching to `HashSet<u32>` plus an O(1)
-//! circular-order-minimum cache (`loss_list_min`), recomputed in
-//! O(loss_list) only on the rare case the cached minimum itself is removed.
+//! loss_list) overall. An intermediate fix used `HashSet<u32>` plus a
+//! circular-order-minimum cache. The current receiver uses a lazy circular
+//! bitmap and summary words, removing hash-node growth and the O(loss_list)
+//! minimum recomputation during oldest-loss recovery.
 //!
 //! Unlike `core_packet_loop.rs` (deliberately zero-loss, since it targets a
 //! different question), this benchmark exists specifically to exercise
@@ -185,6 +186,23 @@ fn bench_persistent_old_hole(c: &mut Criterion) {
     group.finish();
 }
 
+/// Periodic NAK materialization exercises sparse and dense bitmap-word/set-bit
+/// iteration separately from receive/recovery work.
+fn bench_periodic_nak(c: &mut Criterion) {
+    let sparse = receiver_with_dense_loss(0, 1);
+    let dense = receiver_with_dense_loss(0, 8_191);
+    let mut group = c.benchmark_group("receiver_periodic_nak");
+    group.sample_size(30);
+
+    group.bench_function("default_window/one_loss", |b| {
+        b.iter(|| black_box(sparse.generate_periodic_nak()).unwrap());
+    });
+    group.bench_function("default_window/dense_loss", |b| {
+        b.iter(|| black_box(dense.generate_periodic_nak()).unwrap());
+    });
+    group.finish();
+}
+
 fn receiver_with_dense_loss(initial_seq: u32, last_seq: u32) -> ReceiverBuffer {
     let mut receiver = ReceiverBuffer::new(initial_seq, 120, ts(0), 0);
     receiver.set_tsbpd_enabled(false);
@@ -277,6 +295,7 @@ criterion_group!(
     bench_lossy_receive,
     bench_burst_receive,
     bench_persistent_old_hole,
+    bench_periodic_nak,
     bench_drop_range,
     bench_drop_range_locality
 );

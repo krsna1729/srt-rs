@@ -48,6 +48,12 @@ fuzz_target!(|data: &[u8]| {
                 let _ = receiver.receive(packet(seq, now_us as u32, false), now);
             }
             1 => {
+                let drop_offset = if action[4] & 0x80 == 0 {
+                    offset
+                } else {
+                    8_192 + offset
+                };
+                let seq = initial.wrapping_add(drop_offset) & SEQUENCE_MASK;
                 let distance = u32::from(action[4]) % FUZZ_WINDOW;
                 let last = seq.wrapping_add(distance) & SEQUENCE_MASK;
                 let _ = receiver.drop_range(seq, last);
@@ -65,6 +71,9 @@ fuzz_target!(|data: &[u8]| {
                 if let Some(nak) = receiver.generate_periodic_nak() {
                     assert!(nak.loss_list.windows(2).all(|pair| pair[0] < pair[1]));
                     assert!(receiver.stats().total_lost >= nak.loss_list.len() as u64);
+                    assert!(nak.loss_list.iter().all(|&loss| {
+                        loss.wrapping_sub(receiver.expected_sequence()) & SEQUENCE_MASK < 8_192
+                    }));
                 }
             }
             _ => {

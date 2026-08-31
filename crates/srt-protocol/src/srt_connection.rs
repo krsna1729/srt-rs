@@ -15,7 +15,7 @@ use crate::error::Error;
 use crate::message_assembler::MessageAssembler;
 use crate::srt_handshake::{
     DEFAULT_FLOW_WINDOW, DEFAULT_MTU, GroupExtensionData, HS_VERSION_5, HandshakePacket,
-    HandshakeState, HandshakeType, KmError, KmMessage, SRT_MAGIC_CODE, srt_flags,
+    HandshakeState, HandshakeType, KmError, KmMessage, MAX_FLOW_WINDOW, SRT_MAGIC_CODE, srt_flags,
 };
 use crate::srt_packet::{
     ControlPacket, ControlType, DataHeader, DataPacket, SRT_HEADER_SIZE, SrtPacket,
@@ -224,9 +224,11 @@ pub struct ConnectionOptions {
     /// Percentage above input bandwidth reserved for retransmissions
     /// (equivalent to `SRTO_OHEADBW`; libsrt default: 25).
     pub overhead_bandwidth_percent: u8,
-    /// Flow-control window advertised in the handshake, in packets.
+    /// Flow-control window advertised in the handshake, in packets. Values
+    /// above [`crate::MAX_FLOW_WINDOW`] are clamped during construction.
     pub flow_window_packets: u32,
-    /// Local receive-buffer capacity, in packets.
+    /// Local receive-buffer capacity, in packets. Values above
+    /// [`crate::MAX_FLOW_WINDOW`] are clamped during construction.
     pub receive_buffer_packets: u32,
     /// Maximum number of delivered DATA events retained for the application.
     ///
@@ -401,7 +403,9 @@ fn normalize_buffer_options(mut options: ConnectionOptions) -> ConnectionOptions
     if options.socket_id == 0 {
         options.socket_id = random_nonzero_socket_id();
     }
-    options.flow_window_packets = options.flow_window_packets.max(MIN_FLOW_WINDOW_PACKETS);
+    options.flow_window_packets = options
+        .flow_window_packets
+        .clamp(MIN_FLOW_WINDOW_PACKETS, MAX_FLOW_WINDOW);
     options.receive_buffer_packets = options
         .receive_buffer_packets
         .max(MIN_FLOW_WINDOW_PACKETS)
@@ -604,6 +608,13 @@ impl SrtConnection {
             }
             return Err(error);
         }
+        if let Err(error) = Self::validate_flow_control(flow_window_packets, receive_buffer_packets)
+        {
+            if let Some(secret) = passphrase.as_mut() {
+                secret.zeroize();
+            }
+            return Err(error);
+        }
         self.replace_listener_encryption(passphrase, key_length);
         self.options.tsbpd_delay = tsbpd_delay;
         self.set_listener_flow_control_unchecked(flow_window_packets, receive_buffer_packets);
@@ -642,7 +653,20 @@ impl SrtConnection {
         receive_buffer_packets: u32,
     ) -> Result<(), Error> {
         self.ensure_listener_policy_window()?;
+        Self::validate_flow_control(flow_window_packets, receive_buffer_packets)?;
         self.set_listener_flow_control_unchecked(flow_window_packets, receive_buffer_packets);
+        Ok(())
+    }
+
+    fn validate_flow_control(
+        flow_window_packets: u32,
+        receive_buffer_packets: u32,
+    ) -> Result<(), Error> {
+        if flow_window_packets > MAX_FLOW_WINDOW || receive_buffer_packets > MAX_FLOW_WINDOW {
+            return Err(Error::invalid_state(format!(
+                "flow-control windows cannot exceed {MAX_FLOW_WINDOW} packets"
+            )));
+        }
         Ok(())
     }
 
@@ -717,7 +741,8 @@ impl SrtConnection {
         flow_window_packets: u32,
         receive_buffer_packets: u32,
     ) {
-        self.options.flow_window_packets = flow_window_packets.max(MIN_FLOW_WINDOW_PACKETS);
+        self.options.flow_window_packets =
+            flow_window_packets.clamp(MIN_FLOW_WINDOW_PACKETS, MAX_FLOW_WINDOW);
         self.options.receive_buffer_packets = receive_buffer_packets
             .max(MIN_FLOW_WINDOW_PACKETS)
             .min(self.options.flow_window_packets);
@@ -3172,6 +3197,56 @@ mod tests {
         };
         let handshake = HandshakePacket::decode(&control).expect("valid handshake");
         assert_eq!(handshake.flow_window, 8_548);
+    }
+
+    #[test]
+    fn connection_options_bound_receive_windows_before_first_loss() {
+        for requested in [MAX_FLOW_WINDOW, MAX_FLOW_WINDOW + 1, u32::MAX] {
+            let mut connection = SrtConnection::new_caller(ConnectionOptions {
+                flow_window_packets: requested,
+                receive_buffer_packets: requested,
+                ..ConnectionOptions::default()
+            });
+            let expected = requested.min(MAX_FLOW_WINDOW);
+            assert_eq!(connection.options.flow_window_packets, expected);
+            assert_eq!(connection.options.receive_buffer_packets, expected);
+
+            connection.init_buffers(Timestamp::default(), 0, 0);
+            let receiver = connection.receiver.as_mut().unwrap();
+            receiver.set_tsbpd_enabled(false);
+            assert_eq!(
+                receiver.receive(
+                    DataPacket::new(1, 1, 0, 0, Bytes::new()),
+                    Timestamp::from_micros(1)
+                ),
+                Some(vec![0])
+            );
+            assert_eq!(receiver.stats().max_buffer_packets, expected);
+        }
+    }
+
+    #[test]
+    fn listener_flow_control_rejects_windows_above_supported_maximum() {
+        let mut listener = SrtConnection::new_listener(ConnectionOptions::default());
+        listener
+            .set_listener_flow_control(MAX_FLOW_WINDOW, MAX_FLOW_WINDOW)
+            .expect("maximum supported windows are accepted");
+
+        for (flow_window, receive_window) in [
+            (MAX_FLOW_WINDOW + 1, MAX_FLOW_WINDOW),
+            (MAX_FLOW_WINDOW, MAX_FLOW_WINDOW + 1),
+            (u32::MAX, u32::MAX),
+        ] {
+            let error = listener
+                .set_listener_flow_control(flow_window, receive_window)
+                .expect_err("oversized listener windows are rejected");
+            assert_eq!(error.kind, crate::error::ErrorKind::InvalidState);
+        }
+
+        let error = listener
+            .set_listener_policy(None, KeyLength::Aes128, 120, u32::MAX, u32::MAX)
+            .expect_err("combined listener policy uses the same bound");
+        assert_eq!(error.kind, crate::error::ErrorKind::InvalidState);
     }
 
     #[test]
