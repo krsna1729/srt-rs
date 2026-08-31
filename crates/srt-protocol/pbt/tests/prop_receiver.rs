@@ -1,7 +1,21 @@
 //! Property-based tests for SRT ReceiverBuffer
 
 use proptest::prelude::*;
-use shiguredo_srt::{DEFAULT_FLOW_WINDOW, DataPacket, PacketPosition, ReceiverBuffer, Timestamp};
+use shiguredo_srt::{
+    DEFAULT_FLOW_WINDOW, DataPacket, LossRange, NakPacket, PacketPosition, ReceiverBuffer,
+    Timestamp,
+};
+
+fn expand_range(range: LossRange) -> Vec<u32> {
+    range.iter().collect()
+}
+
+fn expand_nak(nak: NakPacket) -> Vec<u32> {
+    nak.loss_ranges
+        .into_iter()
+        .flat_map(|range| range.iter())
+        .collect()
+}
 
 /// テスト用の DataPacket を生成
 fn make_packet(seq: u32, timestamp: u32) -> DataPacket {
@@ -105,7 +119,7 @@ proptest! {
 
         prop_assert!(losses.is_some());
         let lost = losses.expect("欠落パケットは Some になる想定");
-        prop_assert_eq!(lost.len(), gap as usize);
+        prop_assert_eq!(lost.sequence_count(), gap);
     }
 
     #[test]
@@ -216,9 +230,11 @@ proptest! {
         prop_assert!(nak.is_some());
         prop_assert_eq!(
             nak.expect("欠落パケットは NAK が生成される想定")
-                .loss_list
-                .len(),
-            gap as usize
+                .loss_ranges,
+            vec![LossRange {
+                first_seq: initial_seq.wrapping_add(1) & 0x7FFF_FFFF,
+                last_seq: initial_seq.wrapping_add(gap) & 0x7FFF_FFFF,
+            }]
         );
     }
 
@@ -376,9 +392,9 @@ proptest! {
         prop_assert!(nak2.is_some());
         prop_assert_eq!(
             nak1.expect("欠落パケットは NAK が生成される想定")
-                .loss_list,
+                .loss_ranges,
             nak2.expect("欠落パケットは NAK が生成される想定")
-                .loss_list
+                .loss_ranges
         );
     }
 
@@ -506,7 +522,7 @@ proptest! {
             } else {
                 Vec::new()
             };
-            prop_assert_eq!(actual.unwrap_or_default(), expected);
+            prop_assert_eq!(actual.map_or_else(Vec::new, expand_range), expected);
             frontier_offset = frontier_offset.max(offset);
         }
     }
@@ -539,7 +555,7 @@ proptest! {
             expected.sort_unstable();
             let actual = buf
                 .generate_periodic_nak()
-                .map_or_else(Vec::new, |nak| nak.loss_list);
+                .map_or_else(Vec::new, expand_nak);
             prop_assert_eq!(actual, expected);
         }
     }
@@ -567,7 +583,9 @@ proptest! {
         let summary = buf.drop_range(first_drop, last_drop)?;
         prop_assert_eq!(summary.sequence_count, drop_len);
 
-        let suffix = buf.receive(make_packet(next_received, 1), now).unwrap_or_default();
+        let suffix = buf
+            .receive(make_packet(next_received, 1), now)
+            .map_or_else(Vec::new, expand_range);
         let expected_suffix: Vec<u32> = (0..gap_after_drop)
             .map(|offset| last_drop.wrapping_add(1 + offset) & SEQUENCE_MASK)
             .collect();
@@ -583,7 +601,7 @@ proptest! {
         expected_losses.sort_unstable();
         let actual_losses = buf
             .generate_periodic_nak()
-            .map_or_else(Vec::new, |nak| nak.loss_list);
+            .map_or_else(Vec::new, expand_nak);
         prop_assert_eq!(actual_losses, expected_losses);
         prop_assert_eq!(
             buf.stats().total_lost,
@@ -604,19 +622,58 @@ proptest! {
 
         let edge = initial.wrapping_add(DEFAULT_FLOW_WINDOW) & SEQUENCE_MASK;
         prop_assert_eq!(
-            buf.receive(make_packet(edge, 0), now).unwrap().len(),
-            DEFAULT_FLOW_WINDOW as usize
+            buf.receive(make_packet(edge, 0), now)
+                .unwrap()
+                .sequence_count(),
+            DEFAULT_FLOW_WINDOW
         );
         let first_drop = edge.wrapping_add(beyond_window) & SEQUENCE_MASK;
         prop_assert!(buf.drop_range(first_drop, first_drop).is_err());
 
-        let nak = buf.generate_periodic_nak().unwrap().loss_list;
+        let nak = expand_nak(buf.generate_periodic_nak().unwrap());
         prop_assert_eq!(nak.len(), DEFAULT_FLOW_WINDOW as usize);
         let all_losses_fit = nak.iter().all(|&seq| {
             seq.wrapping_sub(initial) & SEQUENCE_MASK < DEFAULT_FLOW_WINDOW
         });
         prop_assert!(all_losses_fit);
         prop_assert_eq!(buf.stats().total_lost, u64::from(DEFAULT_FLOW_WINDOW));
+    }
+
+    /// Word-at-a-time DROPREQ clearing must match a per-sequence model for
+    /// ranges large enough to cross several bitmap words and sequence wrap.
+    #[test]
+    fn dense_drop_range_matches_loss_membership_model(
+        raw_initial in any::<u32>(),
+        gap in 65u32..512,
+        raw_drop_offset in any::<u32>(),
+        raw_drop_len in any::<u32>(),
+    ) {
+        const SEQUENCE_MASK: u32 = 0x7FFF_FFFF;
+        let initial = raw_initial & SEQUENCE_MASK;
+        let now = Timestamp::from_micros(1_000);
+        let mut buf = ReceiverBuffer::new(initial, 120, Timestamp::default(), 0);
+        buf.set_tsbpd_enabled(false);
+        let _ = buf.receive(
+            make_packet(initial.wrapping_add(gap) & SEQUENCE_MASK, 1),
+            now,
+        );
+
+        let drop_offset = raw_drop_offset % gap;
+        let drop_len = 1 + raw_drop_len % (gap - drop_offset);
+        let first = initial.wrapping_add(drop_offset) & SEQUENCE_MASK;
+        let last = first.wrapping_add(drop_len - 1) & SEQUENCE_MASK;
+        let summary = buf.drop_range(first, last)?;
+        prop_assert_eq!(summary.losses_removed, drop_len);
+
+        let mut expected: Vec<u32> = (0..gap)
+            .filter(|&offset| offset < drop_offset || offset >= drop_offset + drop_len)
+            .map(|offset| initial.wrapping_add(offset) & SEQUENCE_MASK)
+            .collect();
+        expected.sort_unstable();
+        let actual = buf
+            .generate_periodic_nak()
+            .map_or_else(Vec::new, expand_nak);
+        prop_assert_eq!(actual, expected);
     }
 
     #[test]

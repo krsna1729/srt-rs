@@ -69,10 +69,21 @@ fuzz_target!(|data: &[u8]| {
             }
             5 => {
                 if let Some(nak) = receiver.generate_periodic_nak() {
-                    assert!(nak.loss_list.windows(2).all(|pair| pair[0] < pair[1]));
-                    assert!(receiver.stats().total_lost >= nak.loss_list.len() as u64);
-                    assert!(nak.loss_list.iter().all(|&loss| {
-                        loss.wrapping_sub(receiver.expected_sequence()) & SEQUENCE_MASK < 8_192
+                    assert!(
+                        nak.loss_ranges
+                            .windows(2)
+                            .all(|pair| pair[0].last_seq < pair[1].first_seq)
+                    );
+                    let loss_count: u64 = nak
+                        .loss_ranges
+                        .iter()
+                        .map(|range| u64::from(range.sequence_count()))
+                        .sum();
+                    assert!(receiver.stats().total_lost >= loss_count);
+                    assert!(nak.loss_ranges.iter().all(|range| {
+                        range.iter().all(|loss| {
+                            loss.wrapping_sub(receiver.expected_sequence()) & SEQUENCE_MASK < 8_192
+                        })
                     }));
                 }
             }
