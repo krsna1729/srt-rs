@@ -409,25 +409,7 @@ impl HandshakePacket {
         let ip_bytes = read_bytes(&mut buf, 16)?;
         let peer_ip = parse_peer_ip(&ip_bytes);
 
-        // Parse extensions.
-        let mut extensions = Vec::new();
-        while buf.len() >= 4 {
-            let ext_type_raw = read_u16(&mut buf)?;
-            let ext_len = read_u16(&mut buf)? as usize * 4; // In 4-byte units.
-
-            if buf.len() < ext_len {
-                break;
-            }
-
-            let ext_data = read_bytes(&mut buf, ext_len)?;
-
-            if let Some(ext_type) = ExtensionType::from_u16(ext_type_raw) {
-                extensions.push(HandshakeExtension {
-                    ext_type,
-                    data: ext_data,
-                });
-            }
-        }
+        let extensions = decode_extensions(&mut buf)?;
 
         Ok(Self {
             version,
@@ -723,6 +705,27 @@ impl HandshakePacket {
         }
         None
     }
+}
+
+fn decode_extensions(buf: &mut &[u8]) -> Result<Vec<HandshakeExtension>, Error> {
+    let mut extensions = Vec::new();
+    while buf.len() >= 4 {
+        let ext_type_raw = read_u16(buf)?;
+        let ext_len = read_u16(buf)? as usize * 4; // In 4-byte units.
+
+        if buf.len() < ext_len {
+            break;
+        }
+
+        let ext_data = read_bytes(buf, ext_len)?;
+        if let Some(ext_type) = ExtensionType::from_u16(ext_type_raw) {
+            extensions.push(HandshakeExtension {
+                ext_type,
+                data: ext_data,
+            });
+        }
+    }
+    Ok(extensions)
 }
 
 /// Encode a string as 32-bit little-endian words.
