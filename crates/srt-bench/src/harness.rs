@@ -1494,6 +1494,83 @@ fn interleave_indices(cells: &[Cell<'_>], axes: &[Axis]) -> Vec<usize> {
     visit(cells, axes, 0, (0..cells.len()).collect())
 }
 
+struct MatrixSchedule {
+    runs: Vec<(usize, usize)>,
+    done: std::collections::HashSet<String>,
+    total: usize,
+}
+
+fn build_matrix_schedule(
+    cells: &[Cell<'_>],
+    axes: &[Axis],
+    reps: usize,
+    order: MatrixOrder,
+    seed: u64,
+    out: &Path,
+) -> std::io::Result<MatrixSchedule> {
+    let total = cells.len() * reps;
+    let mut cell_order: Vec<usize> = match order {
+        MatrixOrder::Default | MatrixOrder::Random => (0..cells.len()).collect(),
+        MatrixOrder::Interleaved => interleave_indices(cells, axes),
+    };
+    if order == MatrixOrder::Random {
+        shuffle(&mut cell_order, seed);
+    }
+    let runs: Vec<(usize, usize)> = match order {
+        MatrixOrder::Default => cell_order
+            .iter()
+            .flat_map(|cell| (1..=reps).map(move |rep| (*cell, rep)))
+            .collect(),
+        MatrixOrder::Interleaved | MatrixOrder::Random => (1..=reps)
+            .flat_map(|rep| cell_order.iter().map(move |cell| (*cell, rep)))
+            .collect(),
+    };
+    eprintln!(
+        "matrix: order={order:?} seed={seed} scheduled_runs={}",
+        runs.len()
+    );
+
+    // Resume: a sweep of this size will be interrupted at some point, and
+    // re-running completed cells wastes hours and mixes measurement
+    // windows. Anything already in the output file is skipped.
+    // A cell counts as done only when BOTH roles recorded a row. Keying
+    // on the listener alone meant a run interrupted mid-cell left an
+    // orphan caller row, was re-run, and appended a second caller row for
+    // the same cell -- two senders, one listener, and any statistic over
+    // them silently wrong.
+    let recorded = if out.exists() {
+        read_results(out)?
+    } else {
+        Vec::new()
+    };
+    let keys_for = |role: &str| -> std::collections::HashSet<String> {
+        recorded
+            .iter()
+            .filter(|r| r.get("role") == Some(role))
+            .filter_map(|r| {
+                let rep: usize = r.number("rep")? as usize;
+                cells
+                    .iter()
+                    .find_map(|cell| record_key(r, cell, rep).filter(|k| *k == cell_key(cell, rep)))
+            })
+            .collect()
+    };
+    let (listener_keys, caller_keys) = (keys_for("listener"), keys_for("caller"));
+    let done: std::collections::HashSet<String> =
+        listener_keys.intersection(&caller_keys).cloned().collect();
+    eprintln!(
+        "matrix: {} cells x {reps} reps = {total} runs -> {}{}",
+        cells.len(),
+        out.display(),
+        if done.is_empty() {
+            String::new()
+        } else {
+            format!(" ({} already done, resuming)", done.len())
+        }
+    );
+    Ok(MatrixSchedule { runs, done, total })
+}
+
 /// Run the cartesian product of the requested axes, one receiver/sender
 /// pair per cell, appending both sides' results to `out`.
 ///
@@ -1539,67 +1616,12 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
             raw_cells
         );
     }
-    let total = cells.len() * reps;
     let (order, seed) = matrix_order(cli)?;
-    let mut cell_order: Vec<usize> = match order {
-        MatrixOrder::Default | MatrixOrder::Random => (0..cells.len()).collect(),
-        MatrixOrder::Interleaved => interleave_indices(&cells, &axes),
-    };
-    if order == MatrixOrder::Random {
-        shuffle(&mut cell_order, seed);
-    }
-    let schedule: Vec<(usize, usize)> = match order {
-        MatrixOrder::Default => cell_order
-            .iter()
-            .flat_map(|cell| (1..=reps).map(move |rep| (*cell, rep)))
-            .collect(),
-        MatrixOrder::Interleaved | MatrixOrder::Random => (1..=reps)
-            .flat_map(|rep| cell_order.iter().map(move |cell| (*cell, rep)))
-            .collect(),
-    };
-    eprintln!(
-        "matrix: order={:?} seed={seed} scheduled_runs={}",
-        order,
-        schedule.len()
-    );
-    // Resume: a sweep of this size will be interrupted at some point, and
-    // re-running completed cells wastes hours and mixes measurement
-    // windows. Anything already in the output file is skipped.
-    // A cell counts as done only when BOTH roles recorded a row. Keying
-    // on the listener alone meant a run interrupted mid-cell left an
-    // orphan caller row, was re-run, and appended a second caller row for
-    // the same cell -- two senders, one listener, and any statistic over
-    // them silently wrong.
-    let recorded = if out.exists() {
-        read_results(&out)?
-    } else {
-        Vec::new()
-    };
-    let keys_for = |role: &str| -> std::collections::HashSet<String> {
-        recorded
-            .iter()
-            .filter(|r| r.get("role") == Some(role))
-            .filter_map(|r| {
-                let rep: usize = r.number("rep")? as usize;
-                cells
-                    .iter()
-                    .find_map(|cell| record_key(r, cell, rep).filter(|k| *k == cell_key(cell, rep)))
-            })
-            .collect()
-    };
-    let (listener_keys, caller_keys) = (keys_for("listener"), keys_for("caller"));
-    let done: std::collections::HashSet<String> =
-        listener_keys.intersection(&caller_keys).cloned().collect();
-    eprintln!(
-        "matrix: {} cells x {reps} reps = {total} runs -> {}{}",
-        cells.len(),
-        out.display(),
-        if done.is_empty() {
-            String::new()
-        } else {
-            format!(" ({} already done, resuming)", done.len())
-        }
-    );
+    let MatrixSchedule {
+        runs: schedule,
+        done,
+        total,
+    } = build_matrix_schedule(&cells, &axes, reps, order, seed, &out)?;
 
     // Every cell of a netem sweep runs inside the namespace, including the
     // `netem=none` ones: a namespace's loopback is not identical to the
