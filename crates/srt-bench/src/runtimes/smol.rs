@@ -177,7 +177,72 @@ async fn drive(cfg: BenchConfig, mine: Vec<usize>, start: Instant) -> Vec<crate:
     out
 }
 
-#[expect(clippy::cognitive_complexity)]
+fn drain_sender_packets(driver: &mut Conn, buffer: &mut [u8; 2048], start: Instant) {
+    while let Some(result) = driver.try_recv(buffer) {
+        match result {
+            Ok(size) => {
+                let now = crate::now_ts(start);
+                let _ = driver.conn.feed_recv_buf(&buffer[..size], now);
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+fn handle_sender_events(
+    cfg: &BenchConfig,
+    driver: &mut Conn,
+    stats: &mut ConnStats,
+    stream_deadline: &mut Option<Instant>,
+) {
+    while let Some(event) = driver.conn.poll_event() {
+        match event {
+            ConnectionEvent::Connected => {
+                stats.connected = true;
+                if cfg.verbose() {
+                    println!("CONNECTED");
+                }
+                // Set once. A duplicate `Connected` -- a re-completed
+                // handshake under load -- would otherwise push the
+                // deadline out another full duration.
+                if stream_deadline.is_none() {
+                    *stream_deadline =
+                        Some(Instant::now() + Duration::from_secs_f64(cfg.duration_secs));
+                }
+            }
+            ConnectionEvent::Disconnected { reason } => {
+                eprintln!("[bench-smol] disconnected: {reason}");
+                stats.torn_down |= !crate::is_ordered_close(&reason);
+                *stream_deadline = Some(Instant::now());
+            }
+            ConnectionEvent::Error(message) => {
+                eprintln!("[bench-smol] error: {message}");
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn send_paced_payload(
+    driver: &mut Conn,
+    payload: &[u8],
+    now: shiguredo_srt::Timestamp,
+    stats: &mut ConnStats,
+) {
+    while driver.send_paced(payload, now).await.is_ok() {
+        stats.data_events += 1;
+    }
+}
+
+fn record_sender_stats(driver: &Conn, stats: &mut ConnStats) {
+    if let Some(sender) = driver.conn.sender_stats() {
+        stats.has_stats = true;
+        stats.core_total = sender.total_sent;
+        stats.secondary_a = sender.total_retransmits;
+        stats.secondary_b = sender.packets_in_loss_list as u64;
+    }
+}
+
 async fn sender_task(
     cfg: BenchConfig,
     index: usize,
@@ -232,47 +297,13 @@ async fn sender_task(
                 .await;
         }
 
-        while let Some(res) = driver.try_recv(&mut buf) {
-            match res {
-                Ok(n) => {
-                    let t = crate::now_ts(start);
-                    let _ = driver.conn.feed_recv_buf(&buf[..n], t);
-                }
-                Err(_) => break,
-            }
-        }
+        drain_sender_packets(&mut driver, &mut buf, start);
 
         let t = crate::now_ts(start);
         driver.fire_expired(t);
         drain_outputs(&mut driver, t).await;
 
-        while let Some(ev) = driver.conn.poll_event() {
-            match ev {
-                ConnectionEvent::Connected => {
-                    stats.connected = true;
-                    if cfg.verbose() {
-                        println!("CONNECTED");
-                    }
-                    // Set once. A duplicate `Connected` -- a re-completed
-                    // handshake under load -- would otherwise push the
-                    // deadline out another full duration, and the run
-                    // would quietly offer more than the configured load.
-                    if stream_deadline.is_none() {
-                        stream_deadline =
-                            Some(Instant::now() + Duration::from_secs_f64(cfg.duration_secs));
-                    }
-                }
-                ConnectionEvent::Disconnected { reason } => {
-                    eprintln!("[bench-smol] disconnected: {reason}");
-                    stats.torn_down |= !crate::is_ordered_close(&reason);
-                    stream_deadline = Some(Instant::now());
-                }
-                ConnectionEvent::Error(msg) => {
-                    eprintln!("[bench-smol] error: {msg}");
-                }
-                _ => {}
-            }
-        }
+        handle_sender_events(&cfg, &mut driver, &mut stats, &mut stream_deadline);
 
         // The top-of-loop deadline check passed some work ago; time has
         // moved since. Re-check at the send site or the connection keeps
@@ -288,13 +319,8 @@ async fn sender_task(
             // so it stops firing timers (no TLPKTDROP) and stops draining
             // received ACKs, and the send buffer grows to the full flow
             // window. That was ~12 MB per connection under overload.
-            let t = crate::now_ts(start);
-            loop {
-                if driver.send_paced(&payload, t).await.is_err() {
-                    break;
-                }
-                stats.data_events += 1;
-            }
+            let now = crate::now_ts(start);
+            send_paced_payload(&mut driver, &payload, now, &mut stats).await;
         }
     }
 
@@ -307,12 +333,7 @@ async fn sender_task(
     let t = crate::now_ts(start);
     driver.conn.disconnect(t);
     drain_outputs(&mut driver, t).await;
-    if let Some(s) = driver.conn.sender_stats() {
-        stats.has_stats = true;
-        stats.core_total = s.total_sent;
-        stats.secondary_a = s.total_retransmits;
-        stats.secondary_b = s.packets_in_loss_list as u64;
-    }
+    record_sender_stats(&driver, &mut stats);
     stats
 }
 
