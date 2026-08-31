@@ -149,6 +149,73 @@ pub fn caller(
     Ok(Conn::new(prepared.connection(now)?, socket))
 }
 
+fn collect_packet_batch(work: &mut VecDeque<ConnectionOutput>, first: Vec<u8>) -> Vec<Vec<u8>> {
+    let mut batch = vec![first];
+    while matches!(work.front(), Some(ConnectionOutput::SendPacket(_))) {
+        let Some(ConnectionOutput::SendPacket(packet)) = work.pop_front() else {
+            unreachable!();
+        };
+        batch.push(packet);
+    }
+    batch
+}
+
+fn requeue_packet_work(
+    pending: &mut VecDeque<ConnectionOutput>,
+    work: VecDeque<ConnectionOutput>,
+    batch: Vec<Vec<u8>>,
+    sent: usize,
+) {
+    prepend_outputs(pending, work.into_iter());
+    prepend_outputs(
+        pending,
+        batch
+            .into_iter()
+            .skip(sent)
+            .map(ConnectionOutput::SendPacket),
+    );
+}
+
+fn send_packet_batch<F>(
+    batch: Vec<Vec<u8>>,
+    work: &mut VecDeque<ConnectionOutput>,
+    pending: &mut VecDeque<ConnectionOutput>,
+    report: &mut OutputDrainReport,
+    mut send_batch: F,
+) -> io::Result<bool>
+where
+    F: FnMut(&[Vec<u8>]) -> io::Result<usize>,
+{
+    match send_batch(&batch) {
+        Ok(sent) if sent <= batch.len() => {
+            report.actions += sent;
+            report.packets += sent;
+            report.bytes += batch[..sent].iter().map(Vec::len).sum::<usize>();
+            if sent < batch.len() {
+                requeue_packet_work(pending, std::mem::take(work), batch, sent);
+                report.status = OutputDrainStatus::Backpressured;
+                return Ok(false);
+            }
+        }
+        Ok(_) => {
+            requeue_packet_work(pending, std::mem::take(work), batch, 0);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "sendmmsg reported more datagrams than supplied",
+            ));
+        }
+        Err(error) => {
+            requeue_packet_work(pending, std::mem::take(work), batch, 0);
+            if error.kind() == io::ErrorKind::WouldBlock {
+                report.status = OutputDrainStatus::Backpressured;
+                return Ok(false);
+            }
+            return Err(error);
+        }
+    }
+    Ok(true)
+}
+
 fn drain_outputs_with<F>(
     conn: &mut SrtConnection,
     timers: &mut ManualTimerStore,
@@ -173,55 +240,9 @@ where
     while let Some(output) = work.pop_front() {
         match output {
             ConnectionOutput::SendPacket(packet) => {
-                let mut batch = vec![packet];
-                while matches!(work.front(), Some(ConnectionOutput::SendPacket(_))) {
-                    let Some(ConnectionOutput::SendPacket(packet)) = work.pop_front() else {
-                        unreachable!();
-                    };
-                    batch.push(packet);
-                }
-
-                match send_batch(&batch) {
-                    Ok(sent) if sent <= batch.len() => {
-                        report.actions += sent;
-                        report.packets += sent;
-                        report.bytes += batch[..sent].iter().map(Vec::len).sum::<usize>();
-                        if sent < batch.len() {
-                            prepend_outputs(pending, work.into_iter());
-                            prepend_outputs(
-                                pending,
-                                batch
-                                    .into_iter()
-                                    .skip(sent)
-                                    .map(ConnectionOutput::SendPacket),
-                            );
-                            report.status = OutputDrainStatus::Backpressured;
-                            return Ok(report);
-                        }
-                    }
-                    Ok(_) => {
-                        prepend_outputs(pending, work.into_iter());
-                        prepend_outputs(
-                            pending,
-                            batch.into_iter().map(ConnectionOutput::SendPacket),
-                        );
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "sendmmsg reported more datagrams than supplied",
-                        ));
-                    }
-                    Err(error) => {
-                        prepend_outputs(pending, work.into_iter());
-                        prepend_outputs(
-                            pending,
-                            batch.into_iter().map(ConnectionOutput::SendPacket),
-                        );
-                        if error.kind() == io::ErrorKind::WouldBlock {
-                            report.status = OutputDrainStatus::Backpressured;
-                            return Ok(report);
-                        }
-                        return Err(error);
-                    }
+                let batch = collect_packet_batch(&mut work, packet);
+                if !send_packet_batch(batch, &mut work, pending, &mut report, &mut send_batch)? {
+                    return Ok(report);
                 }
             }
             timer => {
