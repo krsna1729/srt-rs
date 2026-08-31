@@ -266,6 +266,55 @@ enum AdmissionHookResult {
     Defer,
 }
 
+struct DecodedAdmissionDatagram {
+    handshake: Option<shiguredo_srt::HandshakePacket>,
+    destination_socket_id: u32,
+}
+
+struct AdmissionFeedResult {
+    fed: bool,
+    feed_error_kind: Option<shiguredo_srt::ErrorKind>,
+    inserted: bool,
+    became_established: bool,
+    became_terminal: bool,
+}
+
+struct KnownConclusionContext<'a> {
+    peer: std::net::SocketAddr,
+    physical: Option<PhysicalPeerKey>,
+    handshake: Option<&'a shiguredo_srt::HandshakePacket>,
+    identity: Option<&'a srt_lifecycle::HandshakeIdentity>,
+    now: Timestamp,
+    options: &'a AdmissionOptions,
+    telemetry: &'a IngressTelemetry,
+}
+
+struct AdmissionFeedContext<'a> {
+    peer: std::net::SocketAddr,
+    data: &'a [u8],
+    now: Timestamp,
+    options: &'a AdmissionOptions,
+    worker_index: usize,
+    new_logical_peer: Option<LogicalPeerId>,
+}
+
+fn decode_admission_datagram(data: &[u8]) -> Result<DecodedAdmissionDatagram, ()> {
+    // Only a CONTROL packet can be a handshake (SRT's F bit, the top bit
+    // of the first word). Checking it here keeps `peek_handshake` -- a
+    // full `SrtPacket::decode`, which allocates a DATA payload -- off
+    // the DATA path, which is every packet of a live stream. Without the
+    // guard each datagram is decoded twice and the first payload allocation
+    // is discarded on the next line.
+    let handshake = is_control_datagram(data)
+        .then(|| shiguredo_srt::peek_handshake(data))
+        .flatten();
+    let destination_socket_id = shiguredo_srt::peek_destination_socket_id(data).map_err(|_| ())?;
+    Ok(DecodedAdmissionDatagram {
+        handshake,
+        destination_socket_id,
+    })
+}
+
 impl From<AdmissionResolution> for AdmissionHookResult {
     fn from(value: AdmissionResolution) -> Self {
         match value {
@@ -758,6 +807,98 @@ impl PeerTable {
         }
     }
 
+    fn resolve_conclusion_route(
+        &self,
+        peer: std::net::SocketAddr,
+        physical: Option<PhysicalPeerKey>,
+        conclusion: Option<&srt_lifecycle::HandshakeIdentity>,
+    ) -> Option<PhysicalPeerKey> {
+        if physical.is_some() {
+            return physical;
+        }
+        let identity = conclusion?;
+        // Some interoperable callers retain zero in the control header for a
+        // CONCLUSION. The cookie is the handshake-phase route in that case;
+        // it is not used for established DATA/CONTROL traffic, which remains
+        // strictly Destination-Socket-ID demultiplexed.
+        self.peers
+            .iter()
+            .find_map(|(key, entry)| {
+                (key.address == peer && entry.conn.syn_cookie() == identity.syn_cookie)
+                    .then_some(*key)
+            })
+            .or_else(|| {
+                // Legacy/raw callers that bypass `SessionConfig` can advertise
+                // socket ID zero during the whole handshake. Preserve that
+                // compatibility only when the UDP tuple identifies exactly one
+                // half-open leg; shared-four-tuple sessions must materialize a
+                // non-zero caller SRT Socket ID and are never guessed by address.
+                let mut candidates = self.peers.keys().filter(|key| key.address == peer);
+                candidates
+                    .next()
+                    .copied()
+                    .filter(|_| candidates.next().is_none())
+            })
+    }
+
+    fn stale_conclusion(
+        identity: &srt_lifecycle::HandshakeIdentity,
+        options: &AdmissionOptions,
+        worker_index: usize,
+        worker_count: usize,
+        telemetry: &IngressTelemetry,
+    ) -> Admit {
+        let owner = srt_lifecycle::worker_from_cookie(identity.syn_cookie, worker_count);
+        match owner {
+            Some(owner) if owner != worker_index => {
+                if options.cookie_routing {
+                    telemetry.record_cookie_routed();
+                    return Admit::ForwardTo(owner);
+                }
+                // Routing disabled: it will be answered here and fail
+                // cookie validation, which is the cost being measured.
+                telemetry.record_stranded_conclusion();
+            }
+            // The cookie names this acceptor, but the peer is gone --
+            // it was already promoted off the shared listener, so
+            // this is a late or duplicate CONCLUSION rather than a
+            // stranded handshake. Conflating the two makes the
+            // routing measurement meaningless.
+            Some(_) => telemetry.record_promoted_duplicate(),
+            None => telemetry.record_stranded_conclusion(),
+        }
+        Admit::Dropped(AdmissionDropReason::StaleConclusion)
+    }
+
+    fn reject_new_peer(
+        &self,
+        peer: std::net::SocketAddr,
+        handshake: Option<&shiguredo_srt::HandshakePacket>,
+        telemetry: &IngressTelemetry,
+    ) -> Option<Admit> {
+        let Some(packet) = handshake else {
+            telemetry.record_invalid_datagram();
+            return Some(Admit::Dropped(AdmissionDropReason::InvalidPacket));
+        };
+        if packet.handshake_type != shiguredo_srt::HandshakeType::Induction {
+            telemetry.record_invalid_datagram();
+            return Some(Admit::Dropped(AdmissionDropReason::InvalidPacket));
+        }
+        if self.peers.len() >= self.config.max_peers {
+            telemetry.record_admission_capacity_drop();
+            return Some(Admit::Dropped(AdmissionDropReason::Capacity));
+        }
+        if self.half_open_count() >= self.config.max_half_open_peers {
+            telemetry.record_half_open_capacity_drop();
+            return Some(Admit::Dropped(AdmissionDropReason::HalfOpenCapacity));
+        }
+        if self.peers_for_ip(peer.ip()) >= self.config.max_peers_per_ip {
+            telemetry.record_source_capacity_drop();
+            return Some(Admit::Dropped(AdmissionDropReason::SourceCapacity));
+        }
+        None
+    }
+
     fn physical_for_datagram(
         &self,
         address: std::net::SocketAddr,
@@ -822,6 +963,273 @@ impl PeerTable {
                 existing.group.mode() == mode
                     && existing.group.member(handshake.socket_id).is_none()
             })
+    }
+
+    fn apply_policy_hook<F>(
+        entry: &mut AdmissionPeer,
+        request: &AdmissionRequest,
+        now: Timestamp,
+        telemetry: &IngressTelemetry,
+        hook: F,
+    ) -> Result<(), Admit>
+    where
+        F: FnOnce(&AdmissionRequest, &mut SrtConnection) -> AdmissionHookResult,
+    {
+        match hook(request, &mut entry.conn) {
+            AdmissionHookResult::Accept => {}
+            AdmissionHookResult::Configure(policy) => {
+                if policy.apply_to(&mut entry.conn).is_err() {
+                    telemetry.record_policy_error();
+                    if entry
+                        .conn
+                        .reject(RejectionReason::INTERNAL_ERROR.get(), now)
+                        .is_err()
+                    {
+                        telemetry.record_invalid_datagram();
+                        return Err(Admit::Dropped(AdmissionDropReason::InvalidPacket));
+                    }
+                    entry.rejected = true;
+                    return Err(Admit::Rejected);
+                }
+                telemetry.record_policy_configuration();
+            }
+            AdmissionHookResult::Reject(reason) => {
+                if entry.conn.reject(reason, now).is_err() {
+                    telemetry.record_invalid_datagram();
+                    return Err(Admit::Dropped(AdmissionDropReason::InvalidPacket));
+                }
+                telemetry.record_policy_rejection();
+                entry.rejected = true;
+                entry.last_datagram_at = now;
+                return Err(Admit::Rejected);
+            }
+            AdmissionHookResult::Defer => {
+                telemetry.record_policy_deferred();
+                return Err(Admit::Deferred);
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_known_conclusion_policy<F>(
+        &mut self,
+        context: KnownConclusionContext<'_>,
+        hook: F,
+    ) -> Option<Admit>
+    where
+        F: FnOnce(&AdmissionRequest, &mut SrtConnection) -> AdmissionHookResult,
+    {
+        let KnownConclusionContext {
+            peer,
+            physical,
+            handshake,
+            identity,
+            now,
+            options,
+            telemetry,
+        } = context;
+        let identity = identity?;
+        // SEC-04: `known` guarantees `physical.is_some()` and
+        // `identity` is derived from `handshake`, so both must be
+        // `Some` here. Bind them once with defensive early returns
+        // instead of panicking on the network-facing hot path.
+        let Some(physical) = physical else {
+            debug_assert!(false, "known peer lost physical route");
+            return Some(Admit::Dropped(AdmissionDropReason::InvalidPacket));
+        };
+        let Some(packet) = handshake else {
+            debug_assert!(false, "conclusion identity without decoded handshake");
+            return Some(Admit::Dropped(AdmissionDropReason::InvalidPacket));
+        };
+        let group_admission_allowed = self.group_admission_allowed(identity, packet, options);
+        if self
+            .peers
+            .get(&physical)
+            .is_some_and(|entry| !entry.admission_established)
+            && self.established_count() >= self.config.max_established_peers
+        {
+            telemetry.record_established_capacity_drop();
+            return Some(Admit::Dropped(AdmissionDropReason::EstablishedCapacity));
+        }
+        let result = {
+            let Some(entry) = self.peers.get_mut(&physical) else {
+                return Some(Admit::Dropped(AdmissionDropReason::StaleConclusion));
+            };
+            if entry.rejected {
+                return Some(Admit::Dropped(AdmissionDropReason::RejectedPeer));
+            }
+            if identity.syn_cookie != entry.conn.syn_cookie() {
+                telemetry.record_invalid_cookie();
+                return Some(Admit::Dropped(AdmissionDropReason::InvalidCookie));
+            }
+            let request = AdmissionRequest {
+                peer,
+                claimed_identity: identity.clone(),
+                handshake: packet.clone(),
+                access_control: identity
+                    .stream_id
+                    .as_deref()
+                    .and_then(shiguredo_srt::stream_id::AccessControl::parse),
+            };
+            telemetry.record_policy_request();
+            if !group_admission_allowed {
+                if entry
+                    .conn
+                    .reject(RejectionReason::BAD_MODE.get(), now)
+                    .is_err()
+                {
+                    telemetry.record_invalid_datagram();
+                    return Some(Admit::Dropped(AdmissionDropReason::InvalidPacket));
+                }
+                telemetry.record_policy_rejection();
+                entry.rejected = true;
+                entry.last_datagram_at = now;
+                Some(Admit::Rejected)
+            } else {
+                Self::apply_policy_hook(entry, &request, now, telemetry, hook).err()
+            }
+        };
+        if matches!(result, Some(Admit::Rejected)) {
+            self.mark_ready_physical(physical);
+        }
+        result
+    }
+
+    fn new_admission_peer(
+        logical_peer: LogicalPeerId,
+        physical: PhysicalPeerKey,
+        peer: std::net::SocketAddr,
+        options: &AdmissionOptions,
+        worker_index: usize,
+        now: Timestamp,
+    ) -> AdmissionPeer {
+        let mut connection_options = options.connection_template.clone().unwrap_or_default();
+        connection_options.socket_id = physical.local_socket_id;
+        connection_options.tsbpd_delay = options.tsbpd_delay;
+        // Encode who owns this handshake, so a CONCLUSION the kernel
+        // rehashes elsewhere can be routed back here.
+        connection_options.syn_cookie = Some(srt_lifecycle::cookie_for_worker(
+            worker_index,
+            peer_entropy(peer),
+        ));
+        let mut conn = SrtConnection::new_listener(connection_options);
+        conn.set_handshake_timing(
+            u64::try_from(options.handshake_retry_interval.as_micros()).unwrap_or(u64::MAX),
+            u64::try_from(options.handshake_timeout.as_micros()).unwrap_or(u64::MAX),
+        );
+        AdmissionPeer {
+            logical_peer,
+            conn,
+            timers: ManualTimerStore::new(),
+            connected: false,
+            stream_deadline: None,
+            data_events: 0,
+            last_data_at: Instant::now(),
+            torn_down: false,
+            rejected: false,
+            admission_established: false,
+            last_datagram_at: now,
+        }
+    }
+
+    fn feed_admission_datagram(
+        &mut self,
+        physical: PhysicalPeerKey,
+        context: AdmissionFeedContext<'_>,
+    ) -> AdmissionFeedResult {
+        let AdmissionFeedContext {
+            peer,
+            data,
+            now,
+            options,
+            worker_index,
+            new_logical_peer,
+        } = context;
+        let mut inserted = false;
+        let entry = self.peers.entry(physical).or_insert_with(|| {
+            inserted = true;
+            let logical_peer = new_logical_peer.unwrap_or_else(|| {
+                unreachable!("or_insert_with runs only for new peers, which set new_logical_peer")
+            });
+            Self::new_admission_peer(logical_peer, physical, peer, options, worker_index, now)
+        });
+        let feed_result = entry.conn.feed_recv_buf(data, now);
+        let feed_error_kind = feed_result.as_ref().err().map(|error| error.kind);
+        let fed = feed_result.is_ok();
+        if fed {
+            entry.last_datagram_at = now;
+        }
+        let became_established = fed
+            && !entry.admission_established
+            && entry.conn.state() == shiguredo_srt::ConnectionState::Connected;
+        if became_established {
+            entry.admission_established = true;
+        }
+        let became_terminal =
+            !fed && entry.conn.state() == shiguredo_srt::ConnectionState::Disconnected;
+        if became_terminal {
+            entry.rejected = true;
+        }
+        AdmissionFeedResult {
+            fed,
+            feed_error_kind,
+            inserted,
+            became_established,
+            became_terminal,
+        }
+    }
+
+    fn finish_admission_failure(
+        &mut self,
+        physical: PhysicalPeerKey,
+        known: bool,
+        conclusion: Option<&srt_lifecycle::HandshakeIdentity>,
+        feed: AdmissionFeedResult,
+        telemetry: &IngressTelemetry,
+    ) -> Admit {
+        if conclusion.is_some()
+            && matches!(
+                feed.feed_error_kind,
+                Some(
+                    shiguredo_srt::ErrorKind::CryptoError
+                        | shiguredo_srt::ErrorKind::HandshakeRejected
+                )
+            )
+        {
+            telemetry.record_credential_failure();
+        }
+        telemetry.record_invalid_datagram();
+        if !known {
+            let _ = self.remove_physical(physical);
+        } else if feed.became_terminal {
+            self.mark_ready_physical(physical);
+        }
+        Admit::Dropped(AdmissionDropReason::InvalidPacket)
+    }
+
+    fn finish_admission_success(
+        &mut self,
+        physical: PhysicalPeerKey,
+        now: Timestamp,
+        became_established: bool,
+    ) -> Admit {
+        if became_established {
+            self.half_open_peers = self.half_open_peers.saturating_sub(1);
+            self.established_peers += 1;
+            self.half_open_deadlines.remove(&physical);
+            self.adopt_bonded_peer(physical);
+        } else if !self
+            .peers
+            .get(&physical)
+            .is_some_and(|entry| entry.admission_established)
+        {
+            self.half_open_deadlines.set(
+                physical,
+                now.add_micros(half_open_timeout_micros(self.config.half_open_timeout)),
+            );
+        }
+        self.mark_ready_physical(physical);
+        Admit::Fed
     }
 
     fn adopt_bonded_peer(&mut self, peer: PhysicalPeerKey) {
@@ -1038,7 +1446,6 @@ impl PeerTable {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[expect(clippy::cognitive_complexity)]
     fn admit_with_policy_hook<F>(
         &mut self,
         peer: std::net::SocketAddr,
@@ -1056,26 +1463,20 @@ impl PeerTable {
         self.last_now = now;
         let expired = self.prune_half_open(now);
         telemetry.record_expired_half_open(expired);
-        // Only a CONTROL packet can be a handshake (SRT's F bit, the top bit
-        // of the first word). Checking it here keeps `peek_handshake` -- a
-        // full `SrtPacket::decode`, which allocates a DATA payload -- off
-        // the DATA path, which is every packet of a live stream. Without the
-        // guard each datagram is decoded twice and the first payload allocation
-        // is discarded on the next line.
-        let handshake = is_control_datagram(data)
-            .then(|| shiguredo_srt::peek_handshake(data))
-            .flatten();
-        // RFC stream multiplexing routes established SRT sockets by the
-        // fixed-header Destination SRT Socket ID. INDUCTION is the sole
-        // exception: it targets socket ID zero and carries the caller's
-        // source SRT Socket ID in the handshake body.
-        let destination_socket_id = match shiguredo_srt::peek_destination_socket_id(data) {
-            Ok(socket_id) => socket_id,
+        let DecodedAdmissionDatagram {
+            handshake,
+            destination_socket_id,
+        } = match decode_admission_datagram(data) {
+            Ok(decoded) => decoded,
             Err(_) => {
                 telemetry.record_invalid_datagram();
                 return Admit::Dropped(AdmissionDropReason::InvalidPacket);
             }
         };
+        // RFC stream multiplexing routes established SRT sockets by the
+        // fixed-header Destination SRT Socket ID. INDUCTION is the sole
+        // exception: it targets socket ID zero and carries the caller's
+        // source SRT Socket ID in the handshake body.
         let mut physical = self.physical_for_datagram(
             peer,
             destination_socket_id,
@@ -1093,169 +1494,36 @@ impl PeerTable {
             .as_ref()
             .map(srt_lifecycle::handshake_identity_from_handshake);
         let conclusion = identity.as_ref().filter(|identity| identity.is_conclusion);
-        // Some interoperable callers retain zero in the control header for a
-        // CONCLUSION. The cookie is the handshake-phase route in that case;
-        // it is not used for established DATA/CONTROL traffic, which remains
-        // strictly Destination-Socket-ID demultiplexed.
-        if physical.is_none()
-            && let Some(identity) = conclusion
-        {
-            physical = self.peers.iter().find_map(|(key, entry)| {
-                (key.address == peer && entry.conn.syn_cookie() == identity.syn_cookie)
-                    .then_some(*key)
-            });
-            // Legacy/raw callers that bypass `SessionConfig` can advertise
-            // socket ID zero during the whole handshake. Preserve that
-            // compatibility only when the UDP tuple identifies exactly one
-            // half-open leg; shared-four-tuple sessions must materialize a
-            // non-zero caller SRT Socket ID and are never guessed by address.
-            if physical.is_none() {
-                let mut candidates = self.peers.keys().filter(|key| key.address == peer);
-                physical = candidates
-                    .next()
-                    .copied()
-                    .filter(|_| candidates.next().is_none());
-            }
-        }
+        physical = self.resolve_conclusion_route(peer, physical, conclusion);
         let known = physical.is_some_and(|physical| self.peers.contains_key(&physical));
 
         if !known && let Some(identity) = conclusion {
-            let owner = srt_lifecycle::worker_from_cookie(identity.syn_cookie, worker_count);
-            match owner {
-                Some(owner) if owner != worker_index => {
-                    if options.cookie_routing {
-                        telemetry.record_cookie_routed();
-                        return Admit::ForwardTo(owner);
-                    }
-                    // Routing disabled: it will be answered here and fail
-                    // cookie validation, which is the cost being measured.
-                    telemetry.record_stranded_conclusion();
-                }
-                // The cookie names this acceptor, but the peer is gone --
-                // it was already promoted off the shared listener, so
-                // this is a late or duplicate CONCLUSION rather than a
-                // stranded handshake. Conflating the two makes the
-                // routing measurement meaningless.
-                Some(_) => telemetry.record_promoted_duplicate(),
-                None => telemetry.record_stranded_conclusion(),
-            }
-            return Admit::Dropped(AdmissionDropReason::StaleConclusion);
+            return Self::stale_conclusion(
+                identity,
+                options,
+                worker_index,
+                worker_count,
+                telemetry,
+            );
         }
 
         if !known {
-            let Some(packet) = handshake.as_ref() else {
-                telemetry.record_invalid_datagram();
-                return Admit::Dropped(AdmissionDropReason::InvalidPacket);
-            };
-            if packet.handshake_type != shiguredo_srt::HandshakeType::Induction {
-                telemetry.record_invalid_datagram();
-                return Admit::Dropped(AdmissionDropReason::InvalidPacket);
+            if let Some(result) = self.reject_new_peer(peer, handshake.as_ref(), telemetry) {
+                return result;
             }
-            if self.peers.len() >= self.config.max_peers {
-                telemetry.record_admission_capacity_drop();
-                return Admit::Dropped(AdmissionDropReason::Capacity);
-            }
-            if self.half_open_count() >= self.config.max_half_open_peers {
-                telemetry.record_half_open_capacity_drop();
-                return Admit::Dropped(AdmissionDropReason::HalfOpenCapacity);
-            }
-            if self.peers_for_ip(peer.ip()) >= self.config.max_peers_per_ip {
-                telemetry.record_source_capacity_drop();
-                return Admit::Dropped(AdmissionDropReason::SourceCapacity);
-            }
-        } else if let Some(identity) = conclusion {
-            // SEC-04: `known` guarantees `physical.is_some()` and
-            // `conclusion` is derived from `handshake`, so both must be
-            // `Some` here. Bind them once with defensive early returns
-            // instead of panicking on the network-facing hot path.
-            let Some(physical) = physical else {
-                debug_assert!(false, "known peer lost physical route");
-                return Admit::Dropped(AdmissionDropReason::InvalidPacket);
-            };
-            let Some(packet) = handshake.as_ref() else {
-                debug_assert!(false, "conclusion identity without decoded handshake");
-                return Admit::Dropped(AdmissionDropReason::InvalidPacket);
-            };
-            let group_admission_allowed = self.group_admission_allowed(identity, packet, options);
-            if self
-                .peers
-                .get(&physical)
-                .is_some_and(|entry| !entry.admission_established)
-                && self.established_count() >= self.config.max_established_peers
-            {
-                telemetry.record_established_capacity_drop();
-                return Admit::Dropped(AdmissionDropReason::EstablishedCapacity);
-            }
-            let Some(entry) = self.peers.get_mut(&physical) else {
-                return Admit::Dropped(AdmissionDropReason::StaleConclusion);
-            };
-            if entry.rejected {
-                return Admit::Dropped(AdmissionDropReason::RejectedPeer);
-            }
-            if identity.syn_cookie != entry.conn.syn_cookie() {
-                telemetry.record_invalid_cookie();
-                return Admit::Dropped(AdmissionDropReason::InvalidCookie);
-            }
-            let request = AdmissionRequest {
+        } else if let Some(result) = self.apply_known_conclusion_policy(
+            KnownConclusionContext {
                 peer,
-                claimed_identity: identity.clone(),
-                handshake: packet.clone(),
-                access_control: identity
-                    .stream_id
-                    .as_deref()
-                    .and_then(shiguredo_srt::stream_id::AccessControl::parse),
-            };
-            telemetry.record_policy_request();
-            if !group_admission_allowed {
-                if entry
-                    .conn
-                    .reject(RejectionReason::BAD_MODE.get(), now)
-                    .is_err()
-                {
-                    telemetry.record_invalid_datagram();
-                    return Admit::Dropped(AdmissionDropReason::InvalidPacket);
-                }
-                telemetry.record_policy_rejection();
-                entry.rejected = true;
-                entry.last_datagram_at = now;
-                self.mark_ready_physical(physical);
-                return Admit::Rejected;
-            }
-            match hook(&request, &mut entry.conn) {
-                AdmissionHookResult::Accept => {}
-                AdmissionHookResult::Configure(policy) => {
-                    if policy.apply_to(&mut entry.conn).is_err() {
-                        telemetry.record_policy_error();
-                        if entry
-                            .conn
-                            .reject(RejectionReason::INTERNAL_ERROR.get(), now)
-                            .is_err()
-                        {
-                            telemetry.record_invalid_datagram();
-                            return Admit::Dropped(AdmissionDropReason::InvalidPacket);
-                        }
-                        entry.rejected = true;
-                        self.mark_ready_physical(physical);
-                        return Admit::Rejected;
-                    }
-                    telemetry.record_policy_configuration();
-                }
-                AdmissionHookResult::Reject(reason) => {
-                    if entry.conn.reject(reason, now).is_err() {
-                        telemetry.record_invalid_datagram();
-                        return Admit::Dropped(AdmissionDropReason::InvalidPacket);
-                    }
-                    telemetry.record_policy_rejection();
-                    entry.rejected = true;
-                    entry.last_datagram_at = now;
-                    self.mark_ready_physical(physical);
-                    return Admit::Rejected;
-                }
-                AdmissionHookResult::Defer => {
-                    telemetry.record_policy_deferred();
-                    return Admit::Deferred;
-                }
-            }
+                physical,
+                handshake: handshake.as_ref(),
+                identity: conclusion,
+                now,
+                options,
+                telemetry,
+            },
+            hook,
+        ) {
+            return result;
         }
 
         let physical = physical.unwrap_or_else(|| PhysicalPeerKey {
@@ -1264,111 +1532,25 @@ impl PeerTable {
         });
         let new_logical_peer =
             (!known).then(|| self.allocate_logical_peer(LogicalPeerTarget::Direct(physical)));
-        let (fed, feed_error_kind, inserted, became_established, became_terminal) = {
-            let mut inserted = false;
-            let entry = self.peers.entry(physical).or_insert_with(|| {
-                inserted = true;
-                let mut connection_options =
-                    options.connection_template.clone().unwrap_or_default();
-                connection_options.socket_id = physical.local_socket_id;
-                connection_options.tsbpd_delay = options.tsbpd_delay;
-                // Encode who owns this handshake, so a CONCLUSION the kernel
-                // rehashes elsewhere can be routed back here.
-                connection_options.syn_cookie = Some(srt_lifecycle::cookie_for_worker(
-                    worker_index,
-                    peer_entropy(peer),
-                ));
-                let mut conn = SrtConnection::new_listener(connection_options);
-                conn.set_handshake_timing(
-                    u64::try_from(options.handshake_retry_interval.as_micros()).unwrap_or(u64::MAX),
-                    u64::try_from(options.handshake_timeout.as_micros()).unwrap_or(u64::MAX),
-                );
-                AdmissionPeer {
-                    // `new_logical_peer` is `Some` iff `!known`, and `or_insert_with`
-                    // fires only when the entry is absent, i.e. `!known`.
-                    logical_peer: new_logical_peer.unwrap_or_else(|| {
-                        unreachable!(
-                            "or_insert_with runs only for new peers, which set new_logical_peer"
-                        )
-                    }),
-                    conn,
-                    timers: ManualTimerStore::new(),
-                    connected: false,
-                    stream_deadline: None,
-                    data_events: 0,
-                    last_data_at: Instant::now(),
-                    torn_down: false,
-                    rejected: false,
-                    admission_established: false,
-                    last_datagram_at: now,
-                }
-            });
-            let feed_result = entry.conn.feed_recv_buf(data, now);
-            let feed_error_kind = feed_result.as_ref().err().map(|error| error.kind);
-            let fed = feed_result.is_ok();
-            if fed {
-                entry.last_datagram_at = now;
-            }
-            let became_established = fed
-                && !entry.admission_established
-                && entry.conn.state() == shiguredo_srt::ConnectionState::Connected;
-            if became_established {
-                entry.admission_established = true;
-            }
-            let became_terminal =
-                !fed && entry.conn.state() == shiguredo_srt::ConnectionState::Disconnected;
-            if became_terminal {
-                entry.rejected = true;
-            }
-            (
-                fed,
-                feed_error_kind,
-                inserted,
-                became_established,
-                became_terminal,
-            )
-        };
-        if inserted {
+        let feed = self.feed_admission_datagram(
+            physical,
+            AdmissionFeedContext {
+                peer,
+                data,
+                now,
+                options,
+                worker_index,
+                new_logical_peer,
+            },
+        );
+        if feed.inserted {
             *self.source_counts.entry(peer.ip()).or_default() += 1;
             self.half_open_peers += 1;
         }
-        if !fed {
-            if conclusion.is_some()
-                && matches!(
-                    feed_error_kind,
-                    Some(
-                        shiguredo_srt::ErrorKind::CryptoError
-                            | shiguredo_srt::ErrorKind::HandshakeRejected
-                    )
-                )
-            {
-                telemetry.record_credential_failure();
-            }
-            telemetry.record_invalid_datagram();
-            if !known {
-                let _ = self.remove_physical(physical);
-            } else if became_terminal {
-                self.mark_ready_physical(physical);
-            }
-            return Admit::Dropped(AdmissionDropReason::InvalidPacket);
+        if !feed.fed {
+            return self.finish_admission_failure(physical, known, conclusion, feed, telemetry);
         }
-        if became_established {
-            self.half_open_peers = self.half_open_peers.saturating_sub(1);
-            self.established_peers += 1;
-            self.half_open_deadlines.remove(&physical);
-            self.adopt_bonded_peer(physical);
-        } else if !self
-            .peers
-            .get(&physical)
-            .is_some_and(|entry| entry.admission_established)
-        {
-            self.half_open_deadlines.set(
-                physical,
-                now.add_micros(half_open_timeout_micros(self.config.half_open_timeout)),
-            );
-        }
-        self.mark_ready_physical(physical);
-        Admit::Fed
+        self.finish_admission_success(physical, now, feed.became_established)
     }
 
     /// Remove incomplete handshakes that have stopped making progress.
