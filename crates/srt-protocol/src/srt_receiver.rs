@@ -105,26 +105,6 @@ impl LossBitmap {
         seq as usize & self.capacity_mask()
     }
 
-    fn insert(&mut self, seq: u32) -> bool {
-        if self.offset(seq).is_none() {
-            return false;
-        }
-        self.ensure_storage();
-        let index = self.bit_index(seq);
-        let word_index = index / 64;
-        let bit = 1u64 << (index % 64);
-        let old = self.storage[word_index];
-        if old & bit != 0 {
-            return false;
-        }
-        self.storage[word_index] = old | bit;
-        if old == 0 {
-            self.storage[self.word_count as usize + word_index / 64] |= 1u64 << (word_index % 64);
-        }
-        self.len += 1;
-        true
-    }
-
     fn remove(&mut self, seq: u32) -> bool {
         if self.storage.is_empty() || self.offset(seq).is_none() {
             return false;
@@ -146,6 +126,84 @@ impl LossBitmap {
         true
     }
 
+    fn mutate_contiguous_range(&mut self, mut seq: u32, mut count: u32, insert: bool) -> u32 {
+        let mut changed = 0;
+        while count != 0 {
+            let index = self.bit_index(seq);
+            let word_index = index / 64;
+            let bit_offset = index % 64;
+            let chunk = count.min((64 - bit_offset) as u32);
+            let mask = (u64::MAX >> (64 - chunk)) << bit_offset;
+            let old = self.storage[word_index];
+            let new = if insert { old | mask } else { old & !mask };
+            changed += if insert {
+                (!old & mask).count_ones()
+            } else {
+                (old & mask).count_ones()
+            };
+            self.storage[word_index] = new;
+            let summary = self.word_count as usize + word_index / 64;
+            let summary_bit = 1u64 << (word_index % 64);
+            if old == 0 && new != 0 {
+                self.storage[summary] |= summary_bit;
+            } else if old != 0 && new == 0 {
+                self.storage[summary] &= !summary_bit;
+            }
+            seq = seq.wrapping_add(chunk) & SEQUENCE_MASK;
+            count -= chunk;
+        }
+        if insert {
+            self.len += changed;
+        } else {
+            self.len -= changed;
+        }
+        changed
+    }
+
+    fn insert_range(&mut self, first_seq: u32, count: u32) -> u32 {
+        if count == 0 {
+            return 0;
+        }
+        let Some(offset) = self.offset(first_seq) else {
+            return 0;
+        };
+        if count > self.window_size - offset {
+            return 0;
+        }
+        self.ensure_storage();
+        self.mutate_contiguous_range(first_seq, count, true)
+    }
+
+    #[cfg(test)]
+    fn insert(&mut self, seq: u32) -> bool {
+        self.insert_range(seq, 1) == 1
+    }
+
+    fn remove_range(&mut self, first_seq: u32, count: u32) -> u32 {
+        if count == 0 || self.storage.is_empty() {
+            return 0;
+        }
+        let offset = first_seq.wrapping_sub(self.base_seq) & SEQUENCE_MASK;
+        if offset < self.window_size {
+            return self.mutate_contiguous_range(
+                first_seq,
+                count.min(self.window_size - offset),
+                false,
+            );
+        }
+
+        let until_base = SEQUENCE_MASK - offset + 1;
+        if count <= until_base {
+            return 0;
+        }
+        self.mutate_contiguous_range(
+            self.base_seq,
+            (count - until_base).min(self.window_size),
+            false,
+        )
+    }
+
+    #[cfg(test)]
     fn contains(&self, seq: &u32) -> bool {
         if self.storage.is_empty() || self.offset(*seq).is_none() {
             return false;
@@ -188,6 +246,82 @@ impl LossBitmap {
                 (offset < window_size as usize)
                     .then_some(base_seq.wrapping_add(offset as u32) & SEQUENCE_MASK)
             })
+    }
+
+    fn for_each_numeric_run(&self, mut emit: impl FnMut(u32, u32)) {
+        if self.is_empty() {
+            return;
+        }
+        // A fixed stack sort preserves the measured sparse-loss fast path;
+        // word-native run extraction wins once there are more than eight bits.
+        if self.len <= 8 {
+            let mut losses = [0; 8];
+            let len = self.len();
+            for (slot, loss) in losses.iter_mut().zip(self.iter()) {
+                *slot = loss;
+            }
+            losses[..len].sort_unstable();
+            let mut start = losses[0];
+            let mut end = start;
+            for &loss in &losses[1..len] {
+                if loss == end + 1 {
+                    end = loss;
+                } else {
+                    emit(start, end);
+                    start = loss;
+                    end = loss;
+                }
+            }
+            emit(start, end);
+            return;
+        }
+        const SEQUENCE_MODULUS: u64 = 1 << 31;
+        let numeric_end = u64::from(self.base_seq) + u64::from(self.window_size);
+        if numeric_end > SEQUENCE_MODULUS {
+            self.for_each_run_segment(0, (numeric_end - SEQUENCE_MODULUS) as u32, &mut emit);
+            self.for_each_run_segment(
+                self.base_seq,
+                (SEQUENCE_MODULUS - u64::from(self.base_seq)) as u32,
+                &mut emit,
+            );
+        } else {
+            self.for_each_run_segment(self.base_seq, self.window_size, &mut emit);
+        }
+    }
+
+    fn for_each_run_segment(&self, mut seq: u32, mut count: u32, emit: &mut impl FnMut(u32, u32)) {
+        let mut pending = None;
+        while count != 0 {
+            let index = self.bit_index(seq);
+            let word_index = index / 64;
+            let bit_offset = index % 64;
+            let chunk = count.min((64 - bit_offset) as u32);
+            let chunk_mask = (u64::MAX >> (64 - chunk)) << bit_offset;
+            let mut bits = self.storage[word_index] & chunk_mask;
+            while bits != 0 {
+                let run_bit = bits.trailing_zeros();
+                let run_len = (!(bits >> run_bit)).trailing_zeros();
+                let run_start = seq + (run_bit as usize - bit_offset) as u32;
+                let run_end = run_start + run_len - 1;
+                if let Some((pending_start, pending_end)) = pending {
+                    if pending_end + 1 == run_start {
+                        pending = Some((pending_start, run_end));
+                    } else {
+                        emit(pending_start, pending_end);
+                        pending = Some((run_start, run_end));
+                    }
+                } else {
+                    pending = Some((run_start, run_end));
+                }
+                let run_mask = (u64::MAX >> (64 - run_len)) << run_bit;
+                bits &= !run_mask;
+            }
+            seq += chunk;
+            count -= chunk;
+        }
+        if let Some((start, end)) = pending {
+            emit(start, end);
+        }
     }
 
     fn next_nonzero_word(&self, start: usize, end: usize) -> Option<usize> {
@@ -537,8 +671,36 @@ pub struct AckPacket {
 /// NAK information.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NakPacket {
-    /// List of lost sequence numbers.
-    pub loss_list: Vec<u32>,
+    /// Numerically ordered runs of lost sequence numbers.
+    pub loss_ranges: Vec<LossRange>,
+}
+
+/// Inclusive circular range of lost 31-bit packet sequence numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LossRange {
+    /// First lost sequence number.
+    pub first_seq: u32,
+    /// Last lost sequence number, which may be numerically smaller after wrap.
+    pub last_seq: u32,
+}
+
+impl LossRange {
+    /// Number of sequence positions in this inclusive circular range.
+    pub fn sequence_count(self) -> u32 {
+        (self.last_seq.wrapping_sub(self.first_seq) & SEQUENCE_MASK) + 1
+    }
+
+    /// Iterate the sequence positions in circular order.
+    pub fn iter(self) -> impl Iterator<Item = u32> {
+        let mut seq = self.first_seq;
+        let sequence_count = self.sequence_count();
+        std::iter::from_fn(move || {
+            let current = seq;
+            seq = seq.wrapping_add(1) & SEQUENCE_MASK;
+            Some(current)
+        })
+        .take(sequence_count as usize)
+    }
 }
 
 /// Compact result of applying an inclusive DROPREQ sequence range.
@@ -823,11 +985,8 @@ impl ReceiverBuffer {
 
     /// Receive a packet.
     ///
-    /// Returns the loss list if loss was detected.
-    /// Receive a packet.
-    ///
-    /// Returns the loss list if loss was detected.
-    pub fn receive(&mut self, packet: DataPacket, now: Timestamp) -> Option<Vec<u32>> {
+    /// Returns the newly exposed loss range, if any.
+    pub fn receive(&mut self, packet: DataPacket, now: Timestamp) -> Option<LossRange> {
         let seq = packet.sequence_number;
         let was_expected = seq == self.expected_seq;
         let packet_size = packet.payload.len() + SRT_HEADER_SIZE;
@@ -870,7 +1029,7 @@ impl ReceiverBuffer {
             self.delivery_seq_hint = Some(seq);
         }
 
-        let new_losses = self.detect_losses(seq);
+        let new_loss_range = self.detect_losses(seq);
 
         self.packets.insert(
             seq,
@@ -887,11 +1046,7 @@ impl ReceiverBuffer {
         let recovered_loss = self.loss_list.remove(seq);
         self.advance_expected_seq(was_expected, recovered_loss);
 
-        if new_losses.is_empty() {
-            None
-        } else {
-            Some(new_losses)
-        }
+        new_loss_range
     }
 
     fn record_arrival(&mut self, now: Timestamp, packet_size: usize) {
@@ -925,30 +1080,30 @@ impl ReceiverBuffer {
     /// The frontier makes the cost proportional to sequence positions exposed
     /// for the first time. An old unresolved hole is never revisited merely
     /// because later in-order packets continue to arrive.
-    fn detect_losses(&mut self, seq: u32) -> Vec<u32> {
-        let mut new_losses = Vec::new();
+    fn detect_losses(&mut self, seq: u32) -> Option<LossRange> {
         if !sequence_greater_than(seq, self.loss_detection_frontier) {
-            return new_losses;
+            return None;
         }
 
-        let mut missing = self.loss_detection_frontier.wrapping_add(1) & 0x7FFF_FFFF;
-        while missing != seq {
-            #[cfg(test)]
+        let first = self.loss_detection_frontier.wrapping_add(1) & SEQUENCE_MASK;
+        let count = seq.wrapping_sub(first) & SEQUENCE_MASK;
+        let inserted = self.loss_list.insert_range(first, count);
+        debug_assert_eq!(
+            inserted, count,
+            "newly classified losses must fit in the receiver loss bitmap"
+        );
+        #[cfg(test)]
+        self.loss_detection_steps.set(
             self.loss_detection_steps
-                .set(self.loss_detection_steps.get().saturating_add(1));
-            if !self.loss_list.contains(&missing) {
-                let inserted = self.loss_list.insert(missing);
-                debug_assert!(
-                    inserted,
-                    "newly classified loss must fit in the receiver loss bitmap"
-                );
-                new_losses.push(missing);
-                self.total_lost += 1;
-            }
-            missing = missing.wrapping_add(1) & 0x7FFF_FFFF;
-        }
+                .get()
+                .saturating_add(count as usize),
+        );
+        self.total_lost += u64::from(count);
         self.loss_detection_frontier = seq;
-        new_losses
+        (count != 0).then(|| LossRange {
+            first_seq: first,
+            last_seq: seq.wrapping_sub(1) & SEQUENCE_MASK,
+        })
     }
 
     fn advance_expected_seq(&mut self, was_expected: bool, recovered_loss: bool) {
@@ -1209,20 +1364,24 @@ impl ReceiverBuffer {
             return None;
         }
 
-        // NakPacket.loss_list is a Vec<u32> (wire format). It's sorted in
-        // ascending numeric order because srt_connection.rs's encode_loss_list
-        // compresses consecutive sequence numbers by encoding them as a range
-        // -- passed in unordered, that compression doesn't kick in and the
-        // NAK packet bloats (upstream shiguredo/srt-rs issue 0055). Ascending
-        // numeric sort does split compression of a consecutive range that
-        // crosses the wrap boundary (0x7FFF_FFFF -> 0), but that only bloats
-        // the NAK by one extra range in the rare case, which is acceptable
-        // (a circular-order sort can't be implemented safely, since
-        // sequence_less_than is not a total order).
-        let mut loss_list: Vec<u32> = self.loss_list.iter().collect();
-        loss_list.sort_unstable();
+        let mut loss_ranges = Vec::new();
+        self.loss_list.for_each_numeric_run(|start, end| {
+            loss_ranges.push(LossRange {
+                first_seq: start,
+                last_seq: end,
+            });
+        });
 
-        Some(NakPacket { loss_list })
+        Some(NakPacket { loss_ranges })
+    }
+
+    pub(crate) fn for_each_periodic_nak_range(&self, mut emit: impl FnMut(LossRange)) {
+        self.loss_list.for_each_numeric_run(|first_seq, last_seq| {
+            emit(LossRange {
+                first_seq,
+                last_seq,
+            });
+        });
     }
 
     /// Calculate the NAK send interval: (RTT + 4*RTTVar) / 2.
@@ -1451,15 +1610,7 @@ impl ReceiverBuffer {
     }
 
     fn remove_drop_losses(&mut self, first_seq: u32, sequence_count: u32) -> u32 {
-        let mut losses_removed = 0;
-        let mut seq = first_seq;
-        for _ in 0..sequence_count {
-            if self.loss_list.remove(seq) {
-                losses_removed += 1;
-            }
-            seq = seq.wrapping_add(1) & SEQUENCE_MASK;
-        }
-        losses_removed
+        self.loss_list.remove_range(first_seq, sequence_count)
     }
 
     fn advance_expected_after_drop(&mut self, first_seq: u32, distance: u32) {
@@ -1637,6 +1788,23 @@ mod tests {
         buf.loss_list.iter().collect()
     }
 
+    fn loss_range(first_seq: u32, last_seq: u32) -> LossRange {
+        LossRange {
+            first_seq,
+            last_seq,
+        }
+    }
+
+    #[test]
+    fn loss_range_iterates_in_circular_order() {
+        let range = loss_range(0x7FFF_FFFE, 1);
+        assert_eq!(range.sequence_count(), 4);
+        assert_eq!(
+            range.iter().collect::<Vec<_>>(),
+            vec![0x7FFF_FFFE, 0x7FFF_FFFF, 0, 1]
+        );
+    }
+
     fn make_packet(seq: u32, timestamp: u32) -> DataPacket {
         DataPacket {
             sequence_number: seq,
@@ -1692,6 +1860,38 @@ mod tests {
         let logical_bytes = losses.storage.len() * std::mem::size_of::<u64>();
         eprintln!("maximum LossBitmap logical heap footprint: {logical_bytes} bytes");
         assert_eq!(logical_bytes, 8_320);
+    }
+
+    #[test]
+    fn loss_bitmap_range_ops_and_runs_cross_words_and_sequence_wrap() {
+        let base = SEQUENCE_MASK - 100;
+        let mut losses = LossBitmap::new(base, 200);
+        let first = SEQUENCE_MASK - 90;
+
+        assert_eq!(losses.insert_range(first, 130), 130);
+        assert_eq!(losses.insert_range(first, 130), 0);
+        let mut runs = Vec::new();
+        losses.for_each_numeric_run(|start, end| runs.push((start, end)));
+        assert_eq!(runs, vec![(0, 38), (first, SEQUENCE_MASK)]);
+
+        assert_eq!(losses.remove_range(SEQUENCE_MASK - 20, 41), 41);
+        let mut runs = Vec::new();
+        losses.for_each_numeric_run(|start, end| runs.push((start, end)));
+        assert_eq!(
+            runs,
+            vec![(20, 38), (first, SEQUENCE_MASK - 21)],
+            "numeric NAK runs stay sorted while the logical window wraps"
+        );
+        assert_eq!(losses.len(), 89);
+    }
+
+    #[test]
+    fn loss_bitmap_range_removal_intersects_a_range_starting_before_base() {
+        let mut losses = LossBitmap::new(100, 100);
+        assert_eq!(losses.insert_range(100, 100), 100);
+        assert_eq!(losses.remove_range(95, 20), 15);
+        assert_eq!(losses.first(), Some(115));
+        assert_eq!(losses.len(), 85);
     }
 
     #[test]
@@ -1806,7 +2006,7 @@ mod tests {
 
         assert!(losses.is_some());
         let lost = losses.expect("欠落パケットは Some になる想定");
-        assert_eq!(lost, vec![1001]);
+        assert_eq!(lost, loss_range(1001, 1001));
     }
 
     /// A single packet whose sequence number is far beyond the flow
@@ -1825,7 +2025,7 @@ mod tests {
 
         // Just inside the window: accepted, registers bounded losses.
         let losses = buf.receive(make_packet(1010, 100), now);
-        assert_eq!(losses, Some((1000..1010).collect()));
+        assert_eq!(losses, Some(loss_range(1000, 1009)));
 
         // Far beyond any plausible flow window: must be dropped, not
         // turned into ~2^30 loss-list entries.
@@ -2009,8 +2209,9 @@ mod tests {
         let nak = buf.generate_periodic_nak();
         assert!(nak.is_some());
         assert_eq!(
-            nak.expect("欠落パケットは NAK が生成される想定").loss_list,
-            vec![1001]
+            nak.expect("欠落パケットは NAK が生成される想定")
+                .loss_ranges,
+            vec![loss_range(1001, 1001)]
         );
     }
 
@@ -2403,7 +2604,8 @@ mod tests {
         // later packet adds another missing run while the first hole remains.
         for (index, seq) in (1u32..128).step_by(2).enumerate() {
             let losses = buf.receive(make_packet(seq, seq), now);
-            assert_eq!(losses, Some(vec![if index == 0 { 0 } else { seq - 1 }]));
+            let loss = if index == 0 { 0 } else { seq - 1 };
+            assert_eq!(losses, Some(loss_range(loss, loss)));
         }
         assert!(buf.loss_list.contains(&0));
     }
@@ -2414,14 +2616,10 @@ mod tests {
         buf.set_tsbpd_enabled(false);
         let now = Timestamp::from_micros(1_000);
 
-        for (seq, expected_losses) in [
-            (0x7FFF_FFFE, vec![0x7FFF_FFFD]),
-            (0, vec![0x7FFF_FFFF]),
-            (2, vec![1]),
-        ] {
+        for (seq, expected_loss) in [(0x7FFF_FFFE, 0x7FFF_FFFD), (0, 0x7FFF_FFFF), (2, 1)] {
             assert_eq!(
                 buf.receive(make_packet(seq, seq), now),
-                Some(expected_losses)
+                Some(loss_range(expected_loss, expected_loss))
             );
         }
 
@@ -2943,9 +3141,8 @@ mod tests {
         let losses = buf
             .receive(make_packet(4_096, 1), now)
             .expect("the gap is reported as losses");
-        assert_eq!(losses.len(), 4_096);
-        assert_eq!(losses.first(), Some(&0));
-        assert_eq!(losses.last(), Some(&4_095));
+        assert_eq!(losses.sequence_count(), 4_096);
+        assert_eq!(losses, loss_range(0, 4_095));
     }
 
     #[test]
@@ -2958,7 +3155,7 @@ mod tests {
         buf.receive(make_packet(100, 100), now);
         // 101-104 missing, 105 arrives
         let losses = buf.receive(make_packet(105, 600), now);
-        assert_eq!(losses, Some(vec![101, 102, 103, 104]));
+        assert_eq!(losses, Some(loss_range(101, 104)));
     }
 
     #[test]
@@ -2973,7 +3170,7 @@ mod tests {
         buf.receive(make_packet(102, 300), now);
         // 104 arrives: gap is 103, but 102 is already buffered
         let losses = buf.receive(make_packet(104, 500), now);
-        assert_eq!(losses, Some(vec![103]));
+        assert_eq!(losses, Some(loss_range(103, 103)));
     }
 
     #[test]
@@ -2982,7 +3179,7 @@ mod tests {
         buf.set_tsbpd_enabled(false);
         let now = Timestamp::from_micros(1_000);
 
-        assert_eq!(buf.receive(make_packet(1, 1), now), Some(vec![0]));
+        assert_eq!(buf.receive(make_packet(1, 1), now), Some(loss_range(0, 0)));
         for seq in 2..DEFAULT_FLOW_WINDOW {
             assert_eq!(buf.receive(make_packet(seq, seq), now), None);
         }
@@ -2990,7 +3187,10 @@ mod tests {
         assert_eq!(buf.loss_detection_frontier, DEFAULT_FLOW_WINDOW - 1);
         assert_eq!(buf.loss_detection_steps(), 1);
         assert_eq!(buf.stats().total_lost, 1);
-        assert_eq!(buf.generate_periodic_nak().unwrap().loss_list, vec![0]);
+        assert_eq!(
+            buf.generate_periodic_nak().unwrap().loss_ranges,
+            vec![loss_range(0, 0)]
+        );
     }
 
     #[test]
@@ -2999,15 +3199,21 @@ mod tests {
         buf.set_tsbpd_enabled(false);
         let now = Timestamp::from_micros(1_000);
 
-        assert_eq!(buf.receive(make_packet(102, 1), now), Some(vec![100, 101]));
+        assert_eq!(
+            buf.receive(make_packet(102, 1), now),
+            Some(loss_range(100, 101))
+        );
         assert_eq!(buf.receive(make_packet(101, 2), now), None);
         assert_eq!(buf.loss_detection_steps(), 2);
-        assert_eq!(buf.receive(make_packet(104, 3), now), Some(vec![103]));
+        assert_eq!(
+            buf.receive(make_packet(104, 3), now),
+            Some(loss_range(103, 103))
+        );
         assert_eq!(buf.loss_detection_steps(), 3);
         assert_eq!(buf.loss_detection_frontier, 104);
         assert_eq!(
-            buf.generate_periodic_nak().unwrap().loss_list,
-            vec![100, 103]
+            buf.generate_periodic_nak().unwrap().loss_ranges,
+            vec![loss_range(100, 100), loss_range(103, 103)]
         );
     }
 
@@ -3020,15 +3226,15 @@ mod tests {
 
         assert_eq!(
             buf.receive(make_packet(0, 1), now),
-            Some(vec![0x7FFF_FFFE, 0x7FFF_FFFF])
+            Some(loss_range(0x7FFF_FFFE, 0x7FFF_FFFF))
         );
         assert_eq!(buf.receive(make_packet(1, 2), now), None);
         assert_eq!(buf.receive(make_packet(0x7FFF_FFFF, 3), now), None);
         assert_eq!(buf.loss_detection_frontier, 1);
         assert_eq!(buf.loss_detection_steps(), 2);
         assert_eq!(
-            buf.generate_periodic_nak().unwrap().loss_list,
-            vec![0x7FFF_FFFE]
+            buf.generate_periodic_nak().unwrap().loss_ranges,
+            vec![loss_range(0x7FFF_FFFE, 0x7FFF_FFFE)]
         );
     }
 
@@ -3044,8 +3250,8 @@ mod tests {
         assert_eq!(buf.loss_detection_frontier, 104);
         assert_eq!(buf.receive(make_packet(105, 2), now), None);
         assert_eq!(
-            buf.generate_periodic_nak().unwrap().loss_list,
-            vec![101, 102]
+            buf.generate_periodic_nak().unwrap().loss_ranges,
+            vec![loss_range(101, 102)]
         );
         assert_eq!(buf.stats().total_lost, 2);
     }
@@ -3058,9 +3264,15 @@ mod tests {
 
         buf.advance_expected_sequence(105);
         assert_eq!(buf.loss_detection_frontier, 104);
-        assert_eq!(buf.receive(make_packet(106, 1), now), Some(vec![105]));
+        assert_eq!(
+            buf.receive(make_packet(106, 1), now),
+            Some(loss_range(105, 105))
+        );
         assert_eq!(buf.loss_detection_steps(), 1);
-        assert_eq!(buf.generate_periodic_nak().unwrap().loss_list, vec![105]);
+        assert_eq!(
+            buf.generate_periodic_nak().unwrap().loss_ranges,
+            vec![loss_range(105, 105)]
+        );
     }
 
     #[test]
@@ -3183,7 +3395,7 @@ mod tests {
         buf.set_tsbpd_enabled(false);
         assert_eq!(
             buf.receive(make_packet(32, 1), now),
-            Some((0..32).collect())
+            Some(loss_range(0, 31))
         );
 
         let frontier = buf.loss_detection_frontier;
@@ -3193,8 +3405,8 @@ mod tests {
         assert_eq!(error.kind, crate::error::ErrorKind::InvalidData);
         assert_eq!(buf.loss_detection_frontier, frontier);
         assert_eq!(
-            buf.generate_periodic_nak().unwrap().loss_list,
-            (0..32).collect::<Vec<_>>()
+            buf.generate_periodic_nak().unwrap().loss_ranges,
+            vec![loss_range(0, 31)]
         );
     }
 
@@ -3317,7 +3529,10 @@ mod tests {
         let minimum = buf.drop_range(100, 100).expect("minimum loss");
         assert_eq!(minimum.losses_removed, 1);
         assert_eq!(buf.loss_list.first(), Some(102));
-        assert_eq!(buf.generate_periodic_nak().unwrap().loss_list, vec![102]);
+        assert_eq!(
+            buf.generate_periodic_nak().unwrap().loss_ranges,
+            vec![loss_range(102, 102)]
+        );
     }
 
     #[test]

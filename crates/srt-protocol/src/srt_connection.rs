@@ -1510,10 +1510,10 @@ impl SrtConnection {
         };
 
         // 損失が検出された場合、NAK を送信
-        if let Some(loss_list) = losses
-            && !loss_list.is_empty()
-        {
-            self.send_nak(&loss_list, now);
+        if let Some(loss) = losses {
+            let mut control_info = Vec::with_capacity(8);
+            encode_loss_range(&mut control_info, loss.first_seq, loss.last_seq);
+            self.send_encoded_nak(control_info, now);
         }
 
         self.enqueue_ready_data(now);
@@ -2246,7 +2246,7 @@ impl SrtConnection {
         receiver.record_ack_sent();
         self.last_ack_time = Some(now);
 
-        let mut control_info = Vec::new();
+        let mut control_info = Vec::with_capacity(8);
         write_u32(&mut control_info, ack_info.ack_seq);
 
         if !ack_info.is_light {
@@ -2273,17 +2273,14 @@ impl SrtConnection {
         self.queue_packet(buf, now);
     }
 
-    /// Send a NAK packet.
-    fn send_nak(&mut self, loss_list: &[u32], now: Timestamp) {
-        if loss_list.is_empty() {
+    fn send_encoded_nak(&mut self, control_info: Vec<u8>, now: Timestamp) {
+        if control_info.is_empty() {
             return;
         }
 
         if let Some(receiver) = self.receiver.as_mut() {
             receiver.record_nak_sent();
         }
-
-        let control_info = encode_loss_list(loss_list);
 
         let pkt = ControlPacket {
             control_type: ControlType::Nak,
@@ -2301,14 +2298,16 @@ impl SrtConnection {
 
     /// Send a periodic NAK.
     fn send_periodic_nak(&mut self, now: Timestamp) {
-        let receiver = match self.receiver.as_mut() {
+        let receiver = match self.receiver.as_ref() {
             Some(r) => r,
             None => return,
         };
 
-        if let Some(nak) = receiver.generate_periodic_nak() {
-            self.send_nak(&nak.loss_list, now);
-        }
+        let mut control_info = Vec::new();
+        receiver.for_each_periodic_nak_range(|loss| {
+            encode_loss_range(&mut control_info, loss.first_seq, loss.last_seq);
+        });
+        self.send_encoded_nak(control_info, now);
         self.last_nak_time = Some(now);
     }
 
@@ -2722,6 +2721,7 @@ fn append_loss_range(
 
 /// Encode a loss list (for a NAK packet's control_info).
 /// Consecutive sequence numbers are compressed by encoding them as a range.
+#[cfg(test)]
 fn encode_loss_list(loss_list: &[u32]) -> Vec<u8> {
     let mut result = Vec::new();
 
@@ -2748,20 +2748,21 @@ fn encode_loss_list(loss_list: &[u32]) -> Vec<u8> {
             }
         }
 
-        if start == end {
-            // A single sequence number.
-            write_u32(&mut result, start & 0x7FFF_FFFF);
-        } else {
-            // A range: encode as a range when two or more are consecutive.
-            // The first word has its MSB set to 1.
-            write_u32(&mut result, (start & 0x7FFF_FFFF) | 0x8000_0000);
-            write_u32(&mut result, end & 0x7FFF_FFFF);
-        }
+        encode_loss_range(&mut result, start, end);
 
         i += 1;
     }
 
     result
+}
+
+fn encode_loss_range(result: &mut Vec<u8>, start: u32, end: u32) {
+    if start == end {
+        write_u32(result, start & 0x7FFF_FFFF);
+    } else {
+        write_u32(result, (start & 0x7FFF_FFFF) | 0x8000_0000);
+        write_u32(result, end & 0x7FFF_FFFF);
+    }
 }
 
 #[cfg(test)]
@@ -3219,7 +3220,10 @@ mod tests {
                     DataPacket::new(1, 1, 0, 0, Bytes::new()),
                     Timestamp::from_micros(1)
                 ),
-                Some(vec![0])
+                Some(crate::srt_receiver::LossRange {
+                    first_seq: 0,
+                    last_seq: 0,
+                })
             );
             assert_eq!(receiver.stats().max_buffer_packets, expected);
         }
@@ -3471,6 +3475,77 @@ mod tests {
         let loss_list: Vec<u32> = vec![];
         let encoded = encode_loss_list(&loss_list);
         assert!(encoded.is_empty());
+    }
+
+    #[test]
+    fn immediate_and_periodic_naks_encode_dense_loss_as_one_range() {
+        let mut conn = SrtConnection::new_listener(ConnectionOptions::default());
+        conn.set_state(ConnectionState::Connected);
+        conn.init_buffers(Timestamp::default(), 0, 0);
+        while conn.poll_output().is_some() {}
+
+        conn.handle_data_packet(
+            DataPacket::new(8_191, 1, 1, 0, Vec::new().into()),
+            Timestamp::from_micros(1),
+        )
+        .expect("the gap is accepted");
+
+        let expected = [0x8000_0000u32.to_be_bytes(), 8_190u32.to_be_bytes()].concat();
+        let immediate = std::iter::from_fn(|| conn.poll_output()).find_map(|output| match output {
+            ConnectionOutput::SendPacket(bytes) => match SrtPacket::decode(&bytes) {
+                Ok(SrtPacket::Control(packet)) if packet.control_type == ControlType::Nak => {
+                    Some(packet.control_info)
+                }
+                _ => None,
+            },
+            _ => None,
+        });
+        assert_eq!(immediate.as_deref(), Some(expected.as_slice()));
+
+        conn.send_periodic_nak(Timestamp::from_micros(2));
+        let periodic = std::iter::from_fn(|| conn.poll_output()).find_map(|output| match output {
+            ConnectionOutput::SendPacket(bytes) => match SrtPacket::decode(&bytes) {
+                Ok(SrtPacket::Control(packet)) if packet.control_type == ControlType::Nak => {
+                    Some(packet.control_info)
+                }
+                _ => None,
+            },
+            _ => None,
+        });
+        assert_eq!(periodic.as_deref(), Some(expected.as_slice()));
+    }
+
+    #[test]
+    fn immediate_nak_encodes_loss_range_across_sequence_wrap() {
+        let mut conn = SrtConnection::new_listener(ConnectionOptions::default());
+        conn.set_state(ConnectionState::Connected);
+        conn.init_buffers(Timestamp::default(), 0x7FFF_FFFC, 0);
+
+        conn.handle_data_packet(
+            DataPacket::new(1, 1, 1, 0, Vec::new().into()),
+            Timestamp::from_micros(1),
+        )
+        .expect("the wrapped gap is accepted");
+
+        let control_info =
+            std::iter::from_fn(|| conn.poll_output()).find_map(|output| match output {
+                ConnectionOutput::SendPacket(bytes) => match SrtPacket::decode(&bytes) {
+                    Ok(SrtPacket::Control(packet)) if packet.control_type == ControlType::Nak => {
+                        Some(packet.control_info)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            });
+        let decoded = parse_loss_list(
+            &control_info.expect("an immediate NAK is emitted"),
+            usize::MAX,
+        )
+        .expect("the wrapped NAK range decodes");
+        assert_eq!(
+            decoded,
+            vec![0x7FFF_FFFC, 0x7FFF_FFFD, 0x7FFF_FFFE, 0x7FFF_FFFF, 0]
+        );
     }
 
     #[test]

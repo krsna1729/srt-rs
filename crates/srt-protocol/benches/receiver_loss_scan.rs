@@ -160,7 +160,10 @@ fn run_persistent_old_hole(packet_count: u32) {
         let now = ts(u64::from(seq) + 1);
         let losses = buf.receive(black_box(make_packet(seq, seq)), now);
         if seq == 1 {
-            assert_eq!(losses, Some(vec![0]));
+            assert_eq!(
+                losses.map(|range| (range.first_seq, range.last_seq)),
+                Some((0, 0))
+            );
         } else {
             assert!(losses.is_none());
         }
@@ -169,8 +172,11 @@ fn run_persistent_old_hole(packet_count: u32) {
     assert_eq!(
         buf.generate_periodic_nak()
             .expect("the persistent hole remains outstanding")
-            .loss_list,
-        vec![0]
+            .loss_ranges
+            .iter()
+            .map(|range| (range.first_seq, range.last_seq))
+            .collect::<Vec<_>>(),
+        vec![(0, 0)]
     );
 }
 
@@ -190,15 +196,27 @@ fn bench_persistent_old_hole(c: &mut Criterion) {
 /// iteration separately from receive/recovery work.
 fn bench_periodic_nak(c: &mut Criterion) {
     let sparse = receiver_with_dense_loss(0, 1);
+    let scattered = receiver_with_loss_stride(0, 1_024);
+    let alternating = receiver_with_loss_stride(0, 2);
     let dense = receiver_with_dense_loss(0, 8_191);
+    let wrapped = receiver_with_dense_loss(0x7FFF_F000, 0x0FFF);
     let mut group = c.benchmark_group("receiver_periodic_nak");
     group.sample_size(30);
 
     group.bench_function("default_window/one_loss", |b| {
         b.iter(|| black_box(sparse.generate_periodic_nak()).unwrap());
     });
+    group.bench_function("default_window/eight_scattered", |b| {
+        b.iter(|| black_box(scattered.generate_periodic_nak()).unwrap());
+    });
+    group.bench_function("default_window/alternating", |b| {
+        b.iter(|| black_box(alternating.generate_periodic_nak()).unwrap());
+    });
     group.bench_function("default_window/dense_loss", |b| {
         b.iter(|| black_box(dense.generate_periodic_nak()).unwrap());
+    });
+    group.bench_function("default_window/wrap_crossing_dense", |b| {
+        b.iter(|| black_box(wrapped.generate_periodic_nak()).unwrap());
     });
     group.finish();
 }
@@ -207,6 +225,17 @@ fn receiver_with_dense_loss(initial_seq: u32, last_seq: u32) -> ReceiverBuffer {
     let mut receiver = ReceiverBuffer::new(initial_seq, 120, ts(0), 0);
     receiver.set_tsbpd_enabled(false);
     let _ = receiver.receive(make_packet(last_seq, 1), ts(1));
+    receiver
+}
+
+fn receiver_with_loss_stride(initial_seq: u32, stride: u32) -> ReceiverBuffer {
+    let mut receiver = receiver_with_dense_loss(initial_seq, 8_191);
+    for offset in 0..8_191 {
+        if offset % stride != 0 {
+            let seq = initial_seq.wrapping_add(offset) & 0x7FFF_FFFF;
+            let _ = receiver.receive(make_packet(seq, offset), ts(u64::from(offset) + 2));
+        }
+    }
     receiver
 }
 
