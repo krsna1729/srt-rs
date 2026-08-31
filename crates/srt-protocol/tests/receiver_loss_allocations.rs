@@ -2,11 +2,13 @@
 
 use shiguredo_srt::{DataPacket, PacketPosition, ReceiverBuffer, Timestamp};
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 struct CountingAllocator;
 
 static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+static ALLOCATION_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 // SAFETY: allocation and deallocation are delegated unchanged to `System`.
 unsafe impl GlobalAlloc for CountingAllocator {
@@ -106,6 +108,7 @@ fn count_allocations(run: impl FnOnce()) -> u64 {
 
 #[test]
 fn loss_scenarios_do_not_allocate_a_packet_order_view_per_receive() {
+    let _guard = ALLOCATION_TEST_LOCK.lock().expect("allocation test lock");
     let scattered_50 = count_allocations(|| scattered_loss(50));
     let scattered_500 = count_allocations(|| scattered_loss(500));
     let burst_100_500 = count_allocations(|| burst_loss(100, 500));
@@ -136,6 +139,7 @@ fn loss_scenarios_do_not_allocate_a_packet_order_view_per_receive() {
 
 #[test]
 fn persistent_old_hole_has_no_frontier_bookkeeping_allocations() {
+    let _guard = ALLOCATION_TEST_LOCK.lock().expect("allocation test lock");
     let allocations = count_allocations(|| persistent_old_hole(8_192));
     eprintln!("persistent old hole allocations: {allocations}");
 
@@ -146,4 +150,24 @@ fn persistent_old_hole_has_no_frontier_bookkeeping_allocations() {
         allocations < 17_000,
         "frontier bookkeeping allocated per arrival: {allocations}"
     );
+}
+
+#[test]
+fn full_ack_tracker_allocates_once_then_stays_allocation_free() {
+    let _guard = ALLOCATION_TEST_LOCK.lock().expect("allocation test lock");
+    let mut receiver = ReceiverBuffer::new(0, 120, timestamp(0), 0);
+    receiver.set_tsbpd_enabled(false);
+    let warmup_allocations = count_allocations(|| {
+        std::hint::black_box(receiver.generate_ack(timestamp(1)));
+    });
+
+    let allocations = count_allocations(|| {
+        for tick in 1..=1_000 {
+            std::hint::black_box(receiver.generate_ack(timestamp(10_000 + tick)));
+        }
+    });
+    eprintln!("first full ACK allocations: {warmup_allocations}");
+    eprintln!("1,000 full ACK telemetry allocations: {allocations}");
+    assert_eq!(warmup_allocations, 1);
+    assert_eq!(allocations, 0);
 }

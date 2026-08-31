@@ -43,7 +43,7 @@ fuzz_target!(|data: &[u8]| {
         now_us = now_us.saturating_add(u64::from(action[3]) + 1);
         let now = Timestamp::from_micros(now_us);
 
-        match opcode % 7 {
+        match opcode % 9 {
             0 => {
                 let _ = receiver.receive(packet(seq, now_us as u32, false), now);
             }
@@ -87,12 +87,22 @@ fuzz_target!(|data: &[u8]| {
                     }));
                 }
             }
-            _ => {
+            6 => {
                 let retransmitted = action[4] & 1 != 0;
                 let packet = packet(seq, now_us as u32, retransmitted);
                 let _ = receiver.receive(packet.clone(), now);
                 let _ = receiver.receive(packet, now);
             }
+            7 => {
+                let ack = receiver.generate_ack(now);
+                assert!(ack.available_buffer <= 8_192);
+                assert!(ack.link_capacity <= 1_000_000);
+            }
+            _ => receiver.handle_ackack(
+                u32::from_le_bytes([action[1], action[2], action[3], action[4]]),
+                now_us as u32,
+                now,
+            ),
         }
     }
 });

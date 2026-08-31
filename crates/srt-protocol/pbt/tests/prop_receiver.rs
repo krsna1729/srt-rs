@@ -639,6 +639,27 @@ proptest! {
         prop_assert_eq!(buf.stats().total_lost, u64::from(DEFAULT_FLOW_WINDOW));
     }
 
+    #[test]
+    fn ack_timestamp_retention_matches_the_latest_sixteen_records(
+        target in 0usize..20,
+    ) {
+        let mut buf = ReceiverBuffer::new(0, 120, Timestamp::default(), 0);
+        buf.set_tsbpd_enabled(false);
+        let now = Timestamp::from_micros(1_000);
+        let _ = buf.receive(make_packet(0, 0), now);
+
+        let ack_numbers: Vec<u32> = (0..20)
+            .map(|offset| {
+                let _ = buf.generate_ack(now.add_micros(offset));
+                buf.ack_number()
+            })
+            .collect();
+        let rtt_before = buf.rtt();
+        buf.handle_ackack(ack_numbers[target], 0, now.add_micros(200_000));
+
+        prop_assert_eq!(buf.rtt() != rtt_before, target >= 4);
+    }
+
     /// Word-at-a-time DROPREQ clearing must match a per-sequence model for
     /// ranges large enough to cross several bitmap words and sequence wrap.
     #[test]

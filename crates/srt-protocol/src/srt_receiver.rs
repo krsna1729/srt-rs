@@ -36,6 +36,7 @@ const ACK_INTERVAL_US: u64 = 10_000; // 10ms
 
 /// Maximum number of entries kept for tracking ACK send times.
 const MAX_ACK_TIMESTAMPS: usize = 16;
+const _: () = assert!(MAX_ACK_TIMESTAMPS.is_power_of_two());
 
 /// Number of samples used for Link Capacity estimation.
 const LINK_CAPACITY_SAMPLES: usize = 16;
@@ -435,38 +436,54 @@ const WRAPPING_PERIOD_END_MAX: u64 = 60_000_000;
 /// and ACK suppression).
 #[derive(Debug)]
 struct AckTimestampTracker {
-    /// Mapping from ACK number to its send time and the sequence position
-    /// it acknowledged.
-    timestamps: BTreeMap<u32, (Timestamp, u32)>,
+    valid: u16,
+    entries: Option<Box<[AckTimestamp; MAX_ACK_TIMESTAMPS]>>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct AckTimestamp {
+    ack_number: u32,
+    acked_seq: u32,
+    send_time: Timestamp,
 }
 
 impl AckTimestampTracker {
     fn new() -> Self {
         Self {
-            timestamps: BTreeMap::new(),
+            valid: 0,
+            entries: None,
         }
     }
 
     /// Record an ACK send time and the sequence position it acknowledged.
     fn record(&mut self, ack_number: u32, send_time: Timestamp, acked_seq: u32) {
-        self.timestamps.insert(ack_number, (send_time, acked_seq));
+        let index = ack_number as usize & (MAX_ACK_TIMESTAMPS - 1);
+        let entries = self
+            .entries
+            .get_or_insert_with(|| Box::new([AckTimestamp::default(); MAX_ACK_TIMESTAMPS]));
+        entries[index] = AckTimestamp {
+            ack_number,
+            acked_seq,
+            send_time,
+        };
+        self.valid |= 1 << index;
+    }
 
-        // Remove old entries.
-        while self.timestamps.len() > MAX_ACK_TIMESTAMPS {
-            if let Some(&oldest) = self.timestamps.keys().next() {
-                self.timestamps.remove(&oldest);
-            }
-        }
+    fn get(&self, ack_number: u32) -> Option<&AckTimestamp> {
+        let index = ack_number as usize & (MAX_ACK_TIMESTAMPS - 1);
+        let entries = self.entries.as_ref()?;
+        ((self.valid & (1 << index)) != 0 && entries[index].ack_number == ack_number)
+            .then(|| &entries[index])
     }
 
     /// Get an ACK's send time.
     fn get_send_time(&self, ack_number: u32) -> Option<Timestamp> {
-        self.timestamps.get(&ack_number).map(|&(time, _)| time)
+        self.get(ack_number).map(|entry| entry.send_time)
     }
 
     /// Get the sequence position an ACK acknowledged.
     fn get_acked_seq(&self, ack_number: u32) -> Option<u32> {
-        self.timestamps.get(&ack_number).map(|&(_, seq)| seq)
+        self.get(ack_number).map(|entry| entry.acked_seq)
     }
 }
 
@@ -2239,6 +2256,11 @@ mod tests {
         // 存在しない ACK 番号は None
         assert_eq!(tracker.get_send_time(99), None);
         assert_eq!(tracker.get_acked_seq(99), None);
+
+        // Re-recording the same ACK replaces its metadata in place.
+        tracker.record(2, t3, 222);
+        assert_eq!(tracker.get_send_time(2), Some(t3));
+        assert_eq!(tracker.get_acked_seq(2), Some(222));
     }
 
     #[test]
@@ -2260,6 +2282,48 @@ mod tests {
         assert!(tracker.get_send_time(4).is_some());
         assert!(tracker.get_send_time(19).is_some());
         assert!(tracker.get_acked_seq(19).is_some());
+    }
+
+    #[test]
+    fn ack_timestamp_tracker_uses_one_fixed_lazy_backing() {
+        let mut tracker = AckTimestampTracker::new();
+        assert!(tracker.entries.is_none());
+
+        tracker.record(1, Timestamp::from_micros(1), 100);
+        let bytes = std::mem::size_of_val(
+            tracker
+                .entries
+                .as_deref()
+                .expect("the first ACK allocates the fixed backing"),
+        );
+        assert_eq!(bytes, 256);
+    }
+
+    #[test]
+    fn ack_timestamp_tracker_evicts_by_age_across_number_wrap() {
+        let mut tracker = AckTimestampTracker::new();
+        let first = u32::MAX - 7;
+
+        for offset in 0..20u32 {
+            let ack_number = first.wrapping_add(offset);
+            tracker.record(
+                ack_number,
+                Timestamp::from_micros(u64::from(offset)),
+                offset,
+            );
+        }
+
+        for offset in 0..4u32 {
+            assert_eq!(tracker.get_send_time(first.wrapping_add(offset)), None);
+        }
+        for offset in 4..20u32 {
+            let ack_number = first.wrapping_add(offset);
+            assert_eq!(
+                tracker.get_send_time(ack_number),
+                Some(Timestamp::from_micros(u64::from(offset)))
+            );
+            assert_eq!(tracker.get_acked_seq(ack_number), Some(offset));
+        }
     }
 
     #[test]
@@ -3413,11 +3477,14 @@ mod tests {
     #[test]
     fn receiver_buffer_inline_footprint_stays_bounded() {
         let bytes = std::mem::size_of::<ReceiverBuffer>();
+        let ack_bytes = std::mem::size_of::<AckTimestampTracker>();
         eprintln!("ReceiverBuffer inline footprint: {bytes} bytes");
+        eprintln!("ACK timestamp ring inline footprint: {ack_bytes} bytes");
         assert!(
             bytes <= 512,
             "inline receiver state grew beyond its resource budget: {bytes} bytes"
         );
+        assert!(ack_bytes <= 16);
     }
 
     #[test]
