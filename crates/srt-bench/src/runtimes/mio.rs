@@ -6,7 +6,7 @@
 use crate::{Aggregate, BenchConfig, BondMode, ConnStats};
 use mio::net::UdpSocket;
 use mio::{Events, Interest, Poll, Token};
-use shiguredo_srt::{ConnectionEvent, ConnectionOptions, SrtConnection};
+use shiguredo_srt::{ConnectionEvent, ConnectionOptions, GroupExtensionData, SrtConnection};
 use srt_transport::mio_transport::Conn;
 use srt_transport::{Handoff, WorkerMessage};
 use std::collections::{HashMap, VecDeque};
@@ -1133,6 +1133,203 @@ fn run_pool_receiver(cfg: BenchConfig, k: usize) {
     }
 }
 
+struct PoolAcceptorContext<'a> {
+    cfg: &'a BenchConfig,
+    worker_index: usize,
+    start: Instant,
+    admission: &'a srt_transport::AdmissionOptions,
+    router: &'a crate::SharedWorkerRouter,
+    senders: &'a [mpsc::Sender<WorkerMessage>],
+    telemetry: &'a srt_transport::IngressTelemetry,
+    poll: &'a mut Poll,
+    next_token: &'a mut usize,
+    slots: &'a mut Vec<PoolSlot>,
+    token_index: &'a mut HashMap<usize, usize>,
+}
+
+fn drain_pool_handoffs(
+    context: &mut PoolAcceptorContext<'_>,
+    peers: &mut srt_transport::PeerTable,
+    handoffs: &mpsc::Receiver<WorkerMessage>,
+    stream_len: Duration,
+) {
+    while let Ok(message) = handoffs.try_recv() {
+        let handoff = match message {
+            WorkerMessage::Handoff(handoff) => handoff,
+            WorkerMessage::Handshake { peer, data } => {
+                peers.admit_and_forward(
+                    peer,
+                    &data,
+                    crate::now_ts(context.start),
+                    context.admission,
+                    context.worker_index,
+                    context.senders,
+                    context.telemetry,
+                );
+                continue;
+            }
+            WorkerMessage::Finished { .. } => continue,
+        };
+        let mut socket = UdpSocket::from_std(handoff.socket);
+        let token = Token(*context.next_token);
+        *context.next_token += 1;
+        if context
+            .poll
+            .registry()
+            .register(&mut socket, token, Interest::READABLE)
+            .is_err()
+        {
+            continue;
+        }
+        let mut conn = Conn::new(handoff.conn, socket);
+        conn.fire_expired(crate::now_ts(context.start));
+        conn.drain_outputs(crate::now_ts(context.start));
+        let now = Instant::now();
+        context.token_index.insert(token.0, context.slots.len());
+        context.slots.push(PoolSlot {
+            torn_down: false,
+            conn,
+            connected: true,
+            ever_connected: true,
+            data_events: 0,
+            poisoned: false,
+            stream_deadline: now + stream_len,
+            last_data_at: now,
+        });
+    }
+}
+
+fn service_pool_events(
+    context: &mut PoolAcceptorContext<'_>,
+    peers: &mut srt_transport::PeerTable,
+    events: &Events,
+    listener: &UdpSocket,
+    admit_batch: &mut RecvBatch,
+    buf: &mut [u8; 2048],
+) {
+    let batching = context.cfg.batching;
+    let admission = context.admission;
+    let worker_index = context.worker_index;
+    let senders = context.senders;
+    let telemetry = context.telemetry;
+    for event in events.iter() {
+        match event.token().0 {
+            0 => drain_admission(listener, batching, admit_batch, buf, |peer, data| {
+                peers.admit_and_forward(
+                    peer,
+                    data,
+                    crate::now_ts(context.start),
+                    admission,
+                    worker_index,
+                    senders,
+                    telemetry,
+                );
+            }),
+            index => service_slot_event(
+                context.slots,
+                context.token_index,
+                Token(index),
+                buf,
+                context.start,
+            ),
+        }
+    }
+}
+
+fn maintain_pool_peers(
+    peers: &mut srt_transport::PeerTable,
+    listener: &UdpSocket,
+    start: Instant,
+    stream_len: Duration,
+) -> Vec<SocketAddr> {
+    let now = crate::now_ts(start);
+    let mut newly_connected = Vec::new();
+    for (peer, p) in peers.iter_direct_for_bench() {
+        p.timers.fire_expired(now, &mut p.conn);
+        let _ = drain_conn_outputs(&mut p.conn, &mut p.timers, listener, *peer, now);
+        let mut just_connected = false;
+        while let Some(event) = p.conn.poll_event() {
+            just_connected |= p.apply_event(event);
+        }
+        if just_connected {
+            p.stream_deadline = Some(Instant::now() + stream_len);
+            newly_connected.push(*peer);
+        }
+    }
+    newly_connected
+}
+
+fn promote_pool_peers(
+    context: &mut PoolAcceptorContext<'_>,
+    peers: &mut srt_transport::PeerTable,
+    newly_connected: Vec<SocketAddr>,
+) {
+    for peer in newly_connected {
+        let extension = peers
+            .direct_for_bench(peer)
+            .and_then(|p| p.conn.peer_group_extension());
+        let decision = pool_promotion_decision_with_extension(context, peer, extension);
+        match decision {
+            srt_lifecycle::PromotionDecision::StayOnListener => {}
+            srt_lifecycle::PromotionDecision::RelocateTo(owner) => {
+                let Some(p) = peers.remove_direct_for_bench(peer) else {
+                    continue;
+                };
+                relocate_to_owner(
+                    context.cfg.port,
+                    context.cfg.sock_buf_bytes,
+                    peer,
+                    p.conn,
+                    owner,
+                    context.senders,
+                    context.telemetry,
+                );
+            }
+            srt_lifecycle::PromotionDecision::PromoteHere => {
+                let Some(p) = peers.remove_direct_for_bench(peer) else {
+                    continue;
+                };
+                promote_locally(
+                    context.poll,
+                    context.next_token,
+                    context.cfg.port,
+                    context.cfg.sock_buf_bytes,
+                    peer,
+                    p.conn,
+                    context.start,
+                    Duration::from_secs_f64(context.cfg.duration_secs),
+                    context.slots,
+                    context.token_index,
+                    context.telemetry,
+                );
+            }
+        }
+    }
+}
+
+fn pool_promotion_decision_with_extension(
+    context: &PoolAcceptorContext<'_>,
+    peer: SocketAddr,
+    extension: Option<GroupExtensionData>,
+) -> srt_lifecycle::PromotionDecision {
+    let group = extension.map(|extension| srt_lifecycle::GroupAffinity {
+        group_id: extension.group_id,
+        stream_id: None,
+        extension,
+    });
+    match context.router.lock() {
+        Ok(mut router) => srt_lifecycle::decide_promotion(
+            context.cfg.promotion,
+            peer,
+            group,
+            context.worker_index,
+            &mut router,
+            srt_lifecycle::RoutingMode::LeastTuples,
+        ),
+        Err(_) => srt_lifecycle::PromotionDecision::StayOnListener,
+    }
+}
+
 fn run_pool_acceptor(
     cfg: BenchConfig,
     worker_index: usize,
@@ -1186,188 +1383,50 @@ fn run_pool_acceptor(
     let mut admit_batch = RecvBatch::new();
     let mut buf = [0u8; 2048];
 
-    loop {
-        let now = Instant::now();
-        if now >= run_deadline {
-            break;
-        }
-        // Vacuously true while nothing exists yet, so an acceptor that
-        // never admits anything still exits once the connect window
-        // closes instead of hanging on an empty guard.
-        let all_terminal = peers.all_terminal(now, connect_deadline, IDLE_GRACE)
-            && slots.iter().all(|s| slot_is_terminal(s, now));
-        if crate::shutdown::requested() || (now >= connect_deadline && all_terminal) {
-            break;
-        }
-        poll.poll(&mut events, Some(TIMER_TICK)).ok();
-
-        // Accept bond legs relocated here from another acceptor.
-        // `Finished` is #3-only (see WorkerMessage) and never sent on this
-        // channel; using `match` rather than a `while let Ok(Handoff(_))`
-        // pattern means one would just be skipped, not stop the drain and
-        // strand whatever Handoffs are queued behind it.
-        while let Ok(message) = handoffs.try_recv() {
-            let handoff = match message {
-                WorkerMessage::Handoff(handoff) => handoff,
-                // A handshake datagram routed here by its cookie. Feed it
-                // to the peer state that owns it, creating that state if
-                // this is somehow the first we've seen of the flow.
-                WorkerMessage::Handshake { peer, data } => {
-                    peers.admit_and_forward(
-                        peer,
-                        &data,
-                        crate::now_ts(start),
-                        &admission,
-                        worker_index,
-                        &senders,
-                        &telemetry,
-                    );
-                    continue;
-                }
-                WorkerMessage::Finished { .. } => continue,
-            };
-            let mut socket = UdpSocket::from_std(handoff.socket);
-            let token = Token(next_token);
-            next_token += 1;
-            if poll
-                .registry()
-                .register(&mut socket, token, Interest::READABLE)
-                .is_err()
-            {
-                continue;
-            }
-            let mut conn = Conn::new(handoff.conn, socket);
-            conn.fire_expired(crate::now_ts(start));
-            conn.drain_outputs(crate::now_ts(start));
+    {
+        let mut context = PoolAcceptorContext {
+            cfg: &cfg,
+            worker_index,
+            start,
+            admission: &admission,
+            router: &router,
+            senders: &senders,
+            telemetry: &telemetry,
+            poll: &mut poll,
+            next_token: &mut next_token,
+            slots: &mut slots,
+            token_index: &mut token_index,
+        };
+        loop {
             let now = Instant::now();
-            token_index.insert(token.0, slots.len());
-            slots.push(PoolSlot {
-                torn_down: false,
-                conn,
-                connected: true,
-                ever_connected: true,
-                data_events: 0,
-                poisoned: false,
-                stream_deadline: now + stream_len,
-                last_data_at: now,
-            });
-        }
-
-        for event in events.iter() {
-            match event.token().0 {
-                0 => {
-                    // Admission path: batched (recvmmsg) or per-datagram
-                    // per BenchConfig::batching -- see drain_admission.
-                    drain_admission(
-                        &listener,
-                        cfg.batching,
-                        &mut admit_batch,
-                        &mut buf,
-                        |peer, data| {
-                            peers.admit_and_forward(
-                                peer,
-                                data,
-                                crate::now_ts(start),
-                                &admission,
-                                worker_index,
-                                &senders,
-                                &telemetry,
-                            );
-                        },
-                    );
-                }
-                idx => service_slot_event(&mut slots, &token_index, Token(idx), &mut buf, start),
+            if now >= run_deadline {
+                break;
             }
-        }
-
-        // Drive every tracked peer: fire timers, drain outputs (always
-        // via the shared listener's unconnected `send_to` -- a peer here
-        // never gets its own socket until it's actually promoted below),
-        // and react to protocol events. On a peer's *first* Connected,
-        // decide its fate once, below -- see this function's module doc.
-        let t = crate::now_ts(start);
-        let mut newly_connected: Vec<SocketAddr> = Vec::new();
-        for (peer, p) in peers.iter_direct_for_bench() {
-            p.timers.fire_expired(t, &mut p.conn);
-            let _ = drain_conn_outputs(&mut p.conn, &mut p.timers, &listener, *peer, t);
-            let mut just_connected = false;
-            while let Some(ev) = p.conn.poll_event() {
-                just_connected |= p.apply_event(ev);
+            // Vacuously true while nothing exists yet, so an acceptor that
+            // never admits anything still exits once the connect window
+            // closes instead of hanging on an empty guard.
+            let all_terminal = peers.all_terminal(now, connect_deadline, IDLE_GRACE)
+                && context.slots.iter().all(|s| slot_is_terminal(s, now));
+            if crate::shutdown::requested() || (now >= connect_deadline && all_terminal) {
+                break;
             }
-            if just_connected {
-                p.stream_deadline = Some(Instant::now() + stream_len);
-                newly_connected.push(*peer);
-            }
-        }
-        for peer in newly_connected {
-            // The ladder itself is shared policy -- see
-            // `srt_lifecycle::decide_promotion`. Only the actions below
-            // are this runtime's business, and unlike the task-based
-            // backends there is no scheduler to hand a promotion to: mio
-            // registers the new socket with this same poll and services
-            // it from the same flat loop.
-            let extension = peers
-                .direct_for_bench(peer)
-                .and_then(|p| p.conn.peer_group_extension());
-            let decision = {
-                let group = extension.map(|extension| srt_lifecycle::GroupAffinity {
-                    group_id: extension.group_id,
-                    stream_id: None,
-                    extension,
-                });
-                match router.lock() {
-                    Ok(mut router) => srt_lifecycle::decide_promotion(
-                        cfg.promotion,
-                        peer,
-                        group,
-                        worker_index,
-                        &mut router,
-                        srt_lifecycle::RoutingMode::LeastTuples,
-                    ),
-                    // Poisoned: leave the connection where it is rather
-                    // than stall admission on a dead lock.
-                    Err(_) => srt_lifecycle::PromotionDecision::StayOnListener,
-                }
-            };
+            context.poll.poll(&mut events, Some(TIMER_TICK)).ok();
 
-            match decision {
-                srt_lifecycle::PromotionDecision::StayOnListener => {}
-                srt_lifecycle::PromotionDecision::RelocateTo(owner) => {
-                    let Some(p) = peers.remove_direct_for_bench(peer) else {
-                        continue;
-                    };
-                    relocate_to_owner(
-                        cfg.port,
-                        cfg.sock_buf_bytes,
-                        peer,
-                        p.conn,
-                        owner,
-                        &senders,
-                        &telemetry,
-                    );
-                }
-                srt_lifecycle::PromotionDecision::PromoteHere => {
-                    let Some(p) = peers.remove_direct_for_bench(peer) else {
-                        continue;
-                    };
-                    promote_locally(
-                        &mut poll,
-                        &mut next_token,
-                        cfg.port,
-                        cfg.sock_buf_bytes,
-                        peer,
-                        p.conn,
-                        start,
-                        stream_len,
-                        &mut slots,
-                        &mut token_index,
-                        &telemetry,
-                    );
-                }
-            }
-        }
+            drain_pool_handoffs(&mut context, &mut peers, &handoffs, stream_len);
 
-        maintain_slots(&mut slots, start);
+            service_pool_events(
+                &mut context,
+                &mut peers,
+                &events,
+                &listener,
+                &mut admit_batch,
+                &mut buf,
+            );
+
+            let newly_connected = maintain_pool_peers(&mut peers, &listener, start, stream_len);
+            promote_pool_peers(&mut context, &mut peers, newly_connected);
+            maintain_slots(context.slots, start);
+        }
     }
 
     let mut stats: Vec<ConnStats> = peers
