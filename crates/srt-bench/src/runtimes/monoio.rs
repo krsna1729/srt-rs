@@ -363,6 +363,79 @@ async fn sender_task(
     stats
 }
 
+async fn receive_receiver_packet(
+    driver: &mut Conn,
+    peer: &mut Option<SocketAddr>,
+    buffer: &mut Vec<u8>,
+    start: Instant,
+) {
+    match monoio::time::timeout(
+        crate::MAX_WAIT,
+        driver.sock.recv_from(std::mem::take(buffer)),
+    )
+    .await
+    {
+        Ok((Ok((size, addr)), returned)) => {
+            *buffer = returned;
+            if peer.is_none() {
+                if let Err(error) = driver.sock.connect(addr).await {
+                    eprintln!("[bench-monoio] connect to peer failed: {error}");
+                } else {
+                    *peer = Some(addr);
+                }
+            }
+            let now = crate::now_ts(start);
+            let _ = driver.conn.feed_recv_buf(&buffer[..size], now);
+        }
+        Ok((Err(_), returned)) => *buffer = returned,
+        Err(_) => *buffer = vec![0u8; 2048],
+    }
+}
+
+fn handle_receiver_events(
+    cfg: &BenchConfig,
+    driver: &mut Conn,
+    stats: &mut ConnStats,
+    stream_deadline: &mut Option<Instant>,
+) {
+    while let Some(event) = driver.conn.poll_event() {
+        match event {
+            ConnectionEvent::Connected => {
+                stats.connected = true;
+                if cfg.verbose() {
+                    println!("CONNECTED");
+                }
+                if stream_deadline.is_none() {
+                    *stream_deadline =
+                        Some(Instant::now() + Duration::from_secs_f64(cfg.duration_secs));
+                }
+            }
+            ConnectionEvent::DataReceived { .. } => {
+                stats.data_events += 1;
+            }
+            ConnectionEvent::Disconnected { reason } => {
+                eprintln!("[bench-monoio] disconnected: {reason}");
+                stats.torn_down |= !crate::is_ordered_close(&reason);
+                *stream_deadline = Some(Instant::now());
+            }
+            ConnectionEvent::Error(message) => {
+                eprintln!("[bench-monoio] error: {message}");
+            }
+            _ => {}
+        }
+    }
+}
+
+fn record_receiver_stats(driver: &Conn, stats: &mut ConnStats) {
+    if let Some(receiver) = driver.conn.receiver_stats() {
+        stats.has_stats = true;
+        stats.core_total = receiver.total_received;
+        stats.secondary_a = receiver.total_lost;
+        stats.secondary_b = receiver.total_duplicates;
+        stats.rtt_us = receiver.rtt as u64;
+    }
+}
+
 async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> ConnStats {
     let socket = monoio::net::udp::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], listen_port)))
         .expect("bind");
@@ -394,66 +467,16 @@ async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> Co
             break;
         }
 
-        match monoio::time::timeout(crate::MAX_WAIT, driver.sock.recv_from(recv_buf)).await {
-            Ok((Ok((n, addr)), returned)) => {
-                recv_buf = returned;
-                if peer.is_none() {
-                    if let Err(e) = driver.sock.connect(addr).await {
-                        eprintln!("[bench-monoio] connect to peer failed: {e}");
-                    } else {
-                        peer = Some(addr);
-                    }
-                }
-                let t = crate::now_ts(start);
-                let _ = driver.conn.feed_recv_buf(&recv_buf[..n], t);
-            }
-            Ok((Err(_), returned)) => recv_buf = returned,
-            Err(_) => recv_buf = vec![0u8; 2048],
-        }
+        receive_receiver_packet(&mut driver, &mut peer, &mut recv_buf, start).await;
 
         let t = crate::now_ts(start);
         driver.fire_expired(t);
         drain_outputs(&mut driver, t).await;
 
-        while let Some(ev) = driver.conn.poll_event() {
-            match ev {
-                ConnectionEvent::Connected => {
-                    stats.connected = true;
-                    if cfg.verbose() {
-                        println!("CONNECTED");
-                    }
-                    // Set once. A duplicate `Connected` -- a re-completed
-                    // handshake under load -- would otherwise push the
-                    // deadline out another full duration, and the run
-                    // would quietly offer more than the configured load.
-                    if stream_deadline.is_none() {
-                        stream_deadline =
-                            Some(Instant::now() + Duration::from_secs_f64(cfg.duration_secs));
-                    }
-                }
-                ConnectionEvent::DataReceived { .. } => {
-                    stats.data_events += 1;
-                }
-                ConnectionEvent::Disconnected { reason } => {
-                    eprintln!("[bench-monoio] disconnected: {reason}");
-                    stats.torn_down |= !crate::is_ordered_close(&reason);
-                    stream_deadline = Some(Instant::now());
-                }
-                ConnectionEvent::Error(msg) => {
-                    eprintln!("[bench-monoio] error: {msg}");
-                }
-                _ => {}
-            }
-        }
+        handle_receiver_events(&cfg, &mut driver, &mut stats, &mut stream_deadline);
     }
 
-    if let Some(s) = driver.conn.receiver_stats() {
-        stats.has_stats = true;
-        stats.core_total = s.total_received;
-        stats.secondary_a = s.total_lost;
-        stats.secondary_b = s.total_duplicates;
-        stats.rtt_us = s.rtt as u64;
-    }
+    record_receiver_stats(&driver, &mut stats);
     stats
 }
 
