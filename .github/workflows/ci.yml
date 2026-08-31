@@ -41,7 +41,7 @@ jobs:
       - run: rustup component add rustfmt clippy
       - uses: taiki-e/install-action@v2
         with:
-          tool: typos-cli,cargo-deny@0.20.2
+          tool: typos-cli,cargo-deny@0.20.2,rust-code-analysis-cli@0.0.25
       - run: cargo xtask ci
 
   msrv:
