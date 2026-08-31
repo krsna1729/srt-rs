@@ -391,6 +391,63 @@ async fn sender_task(
     stats
 }
 
+fn drain_receiver_packets(
+    driver: &mut Conn,
+    received: &mpsc::Receiver<(Vec<u8>, usize)>,
+    recycle: &mpsc::Sender<Vec<u8>>,
+    start: Instant,
+) {
+    while let Ok((buffer, size)) = received.try_recv() {
+        let now = crate::now_ts(start);
+        let _ = driver.conn.feed_recv_buf(&buffer[..size], now);
+        let _ = recycle.send(buffer);
+    }
+}
+
+fn handle_receiver_events(
+    cfg: &BenchConfig,
+    driver: &mut Conn,
+    stats: &mut ConnStats,
+    stream_deadline: &mut Option<Instant>,
+) {
+    while let Some(event) = driver.conn.poll_event() {
+        match event {
+            ConnectionEvent::Connected => {
+                stats.connected = true;
+                if cfg.verbose() {
+                    println!("CONNECTED");
+                }
+                if stream_deadline.is_none() {
+                    *stream_deadline =
+                        Some(Instant::now() + Duration::from_secs_f64(cfg.duration_secs));
+                }
+            }
+            ConnectionEvent::DataReceived { .. } => {
+                stats.data_events += 1;
+            }
+            ConnectionEvent::Disconnected { reason } => {
+                eprintln!("[bench-compio] disconnected: {reason}");
+                stats.torn_down |= !crate::is_ordered_close(&reason);
+                *stream_deadline = Some(Instant::now());
+            }
+            ConnectionEvent::Error(message) => {
+                eprintln!("[bench-compio] error: {message}");
+            }
+            _ => {}
+        }
+    }
+}
+
+fn record_receiver_stats(driver: &Conn, stats: &mut ConnStats) {
+    if let Some(receiver) = driver.conn.receiver_stats() {
+        stats.has_stats = true;
+        stats.core_total = receiver.total_received;
+        stats.secondary_a = receiver.total_lost;
+        stats.secondary_b = receiver.total_duplicates;
+        stats.rtt_us = receiver.rtt as u64;
+    }
+}
+
 async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> ConnStats {
     let socket = compio::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], listen_port)))
         .await
@@ -452,55 +509,16 @@ async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> Co
         // for protocol maintenance once per MAX_WAIT.
         compio::time::sleep(crate::MAX_WAIT).await;
 
-        while let Ok((buf, size)) = received_receiver.try_recv() {
-            let t = crate::now_ts(start);
-            let _ = driver.conn.feed_recv_buf(&buf[..size], t);
-            let _ = recycle_tx.send(buf);
-        }
+        drain_receiver_packets(&mut driver, &received_receiver, &recycle_tx, start);
 
         let t = crate::now_ts(start);
         driver.fire_expired(t);
         drain_outputs(&mut driver, t).await;
 
-        while let Some(ev) = driver.conn.poll_event() {
-            match ev {
-                ConnectionEvent::Connected => {
-                    stats.connected = true;
-                    if cfg.verbose() {
-                        println!("CONNECTED");
-                    }
-                    // Set once. A duplicate `Connected` -- a re-completed
-                    // handshake under load -- would otherwise push the
-                    // deadline out another full duration, and the run
-                    // would quietly offer more than the configured load.
-                    if stream_deadline.is_none() {
-                        stream_deadline =
-                            Some(Instant::now() + Duration::from_secs_f64(cfg.duration_secs));
-                    }
-                }
-                ConnectionEvent::DataReceived { .. } => {
-                    stats.data_events += 1;
-                }
-                ConnectionEvent::Disconnected { reason } => {
-                    eprintln!("[bench-compio] disconnected: {reason}");
-                    stats.torn_down |= !crate::is_ordered_close(&reason);
-                    stream_deadline = Some(Instant::now());
-                }
-                ConnectionEvent::Error(msg) => {
-                    eprintln!("[bench-compio] error: {msg}");
-                }
-                _ => {}
-            }
-        }
+        handle_receiver_events(&cfg, &mut driver, &mut stats, &mut stream_deadline);
     }
 
-    if let Some(s) = driver.conn.receiver_stats() {
-        stats.has_stats = true;
-        stats.core_total = s.total_received;
-        stats.secondary_a = s.total_lost;
-        stats.secondary_b = s.total_duplicates;
-        stats.rtt_us = s.rtt as u64;
-    }
+    record_receiver_stats(&driver, &mut stats);
     stats
 }
 
