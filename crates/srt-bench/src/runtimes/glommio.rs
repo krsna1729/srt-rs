@@ -373,6 +373,75 @@ async fn sender_task(
     stats
 }
 
+async fn receive_receiver_packet(
+    driver: &mut Conn,
+    handshook: &mut bool,
+    buffer: &mut [u8; 2048],
+    start: Instant,
+) -> bool {
+    let recv_fut = async { driver.sock.recv_from(buffer).await.ok() };
+    let timer_fut = async {
+        glommio::timer::sleep(crate::MAX_WAIT).await;
+        None
+    };
+    if let Some((size, addr)) = futures_lite::future::or(recv_fut, timer_fut).await {
+        if !*handshook {
+            if driver.sock.connect(addr).await.is_err() {
+                eprintln!("[bench-glommio] connect to peer failed");
+                return false;
+            }
+            *handshook = true;
+        }
+        let now = crate::now_ts(start);
+        let _ = driver.conn.feed_recv_buf(&buffer[..size], now);
+    }
+    true
+}
+
+fn handle_receiver_events(
+    cfg: &BenchConfig,
+    driver: &mut Conn,
+    stats: &mut ConnStats,
+    stream_deadline: &mut Option<Instant>,
+) {
+    while let Some(event) = driver.conn.poll_event() {
+        match event {
+            ConnectionEvent::Connected => {
+                stats.connected = true;
+                if cfg.verbose() {
+                    println!("CONNECTED");
+                }
+                if stream_deadline.is_none() {
+                    *stream_deadline =
+                        Some(Instant::now() + Duration::from_secs_f64(cfg.duration_secs));
+                }
+            }
+            ConnectionEvent::DataReceived { .. } => {
+                stats.data_events += 1;
+            }
+            ConnectionEvent::Disconnected { reason } => {
+                eprintln!("[bench-glommio] disconnected: {reason}");
+                stats.torn_down |= !crate::is_ordered_close(&reason);
+                *stream_deadline = Some(Instant::now());
+            }
+            ConnectionEvent::Error(message) => {
+                eprintln!("[bench-glommio] error: {message}");
+            }
+            _ => {}
+        }
+    }
+}
+
+fn record_receiver_stats(driver: &Conn, stats: &mut ConnStats) {
+    if let Some(receiver) = driver.conn.receiver_stats() {
+        stats.has_stats = true;
+        stats.core_total = receiver.total_received;
+        stats.secondary_a = receiver.total_lost;
+        stats.secondary_b = receiver.total_duplicates;
+        stats.rtt_us = receiver.rtt as u64;
+    }
+}
+
 async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> ConnStats {
     let socket =
         glommio::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], listen_port))).expect("bind");
@@ -405,68 +474,20 @@ async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> Co
             break;
         }
 
-        // One datagram per iteration. First datagram reveals the caller;
-        // connect before anything else (drain_outputs uses connected send).
-        // NOTE: never use Conn::try_recv here -- it parks the executor
-        // thread, starving every other task under load.
-        let recv_fut = async { driver.sock.recv_from(&mut buf).await.ok() };
-        let timer_fut = async {
-            glommio::timer::sleep(crate::MAX_WAIT).await;
-            None
-        };
-        if let Some((n, addr)) = futures_lite::future::or(recv_fut, timer_fut).await {
-            if !handshook && driver.sock.connect(addr).await.is_err() {
-                eprintln!("[bench-glommio] connect to peer failed");
-                continue;
-            }
-            handshook = true;
-            let t = crate::now_ts(start);
-            let _ = driver.conn.feed_recv_buf(&buf[..n], t);
+        // One datagram per iteration. The helper keeps the executor-side
+        // receive path async and connects only after the first peer is known.
+        if !receive_receiver_packet(&mut driver, &mut handshook, &mut buf, start).await {
+            continue;
         }
 
         let t = crate::now_ts(start);
         driver.fire_expired(t);
         drain_outputs(&mut driver, t).await;
 
-        while let Some(ev) = driver.conn.poll_event() {
-            match ev {
-                ConnectionEvent::Connected => {
-                    stats.connected = true;
-                    if cfg.verbose() {
-                        println!("CONNECTED");
-                    }
-                    // Set once. A duplicate `Connected` -- a re-completed
-                    // handshake under load -- would otherwise push the
-                    // deadline out another full duration, and the run
-                    // would quietly offer more than the configured load.
-                    if stream_deadline.is_none() {
-                        stream_deadline =
-                            Some(Instant::now() + Duration::from_secs_f64(cfg.duration_secs));
-                    }
-                }
-                ConnectionEvent::DataReceived { .. } => {
-                    stats.data_events += 1;
-                }
-                ConnectionEvent::Disconnected { reason } => {
-                    eprintln!("[bench-glommio] disconnected: {reason}");
-                    stats.torn_down |= !crate::is_ordered_close(&reason);
-                    stream_deadline = Some(Instant::now());
-                }
-                ConnectionEvent::Error(msg) => {
-                    eprintln!("[bench-glommio] error: {msg}");
-                }
-                _ => {}
-            }
-        }
+        handle_receiver_events(&cfg, &mut driver, &mut stats, &mut stream_deadline);
     }
 
-    if let Some(s) = driver.conn.receiver_stats() {
-        stats.has_stats = true;
-        stats.core_total = s.total_received;
-        stats.secondary_a = s.total_lost;
-        stats.secondary_b = s.total_duplicates;
-        stats.rtt_us = s.rtt as u64;
-    }
+    record_receiver_stats(&driver, &mut stats);
     stats
 }
 
