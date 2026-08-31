@@ -775,49 +775,18 @@ fn filter_reason(cell: &Cell<'_>, axes: &[Axis]) -> Option<&'static str> {
     let egress = role_value(cell, "egress", Scope::Send).unwrap_or("per-connection");
     let runtime_recv = role_value(cell, "runtime", Scope::Recv).unwrap_or("mio");
     let runtime_send = role_value(cell, "runtime", Scope::Send).unwrap_or(runtime_recv);
-    let promotion = cell_value(cell, "promotion", Some(Scope::Both));
-    let cookie = cell_value(cell, "cookie-routing", Some(Scope::Both));
-    let batch = cell_value(cell, "batch", Some(Scope::Both));
-    let pin = cell_value(cell, "pin", Some(Scope::Both));
     let bond = cell_value(cell, "bond", Some(Scope::Both));
-    let connections = cell_value(cell, "connections", Some(Scope::Both))
-        .and_then(|value| value.parse::<usize>().ok());
-    let connect_concurrency = cell_value(cell, "connect-concurrency", Some(Scope::Both));
     let send_workers = role_value(cell, "workers", Scope::Send);
     let bonded = bond.is_some_and(|mode| mode != "none");
 
-    // A shared caller socket drives all handshakes from one readiness loop;
-    // per-connection launch concurrency cannot alter that implementation.
-    if egress == "shared-socket"
-        && let Some(value) = connect_concurrency
-        && let Some(keep) = representative(axes, "connect-concurrency", "1")
-        && value != keep
-    {
-        return Some("connect-concurrency-inert");
+    if let Some(reason) = filter_shared_egress(cell, axes, egress, send_workers) {
+        return Some(reason);
     }
-
-    // One shared UDP socket has one owning runtime loop. Extra sender workers
-    // cannot alter it; receiver workers remain independently variable when a
-    // plan splits the axis by role.
-    if egress == "shared-socket"
-        && let Some(value) = send_workers
-        && let Some(keep) = representative_for_role(axes, "workers", Scope::Send, "1")
-        && value != keep
-    {
-        return Some("shared-egress-workers-inert");
-    }
-
-    // Per-connection sender tasks advertise compatible group metadata but do
-    // not share one logical SrtGroup scheduler. Keep bonded measurements on
-    // the SharedSender/CallerTable path implemented by every runtime.
     if bonded && egress != "shared-socket" {
         return Some("bonded-egress-unsupported");
     }
-
-    if let (Some(pairs), Some(connections)) = (bond.and_then(bond_pairs), connections)
-        && pairs > connections / 2
-    {
-        return Some("bond-capacity");
+    if let Some(reason) = filter_bond_capacity(cell, bond) {
+        return Some(reason);
     }
 
     let is_multi = ingress.starts_with("reuseport-multi:");
@@ -832,51 +801,128 @@ fn filter_reason(cell: &Cell<'_>, axes: &[Axis]) -> Option<&'static str> {
         return Some("bonded-ingress-unsupported");
     }
 
-    if let Some(promotion) = promotion {
-        if is_single || !is_multi {
-            if let Some(keep) = representative(axes, "promotion", "all")
-                && promotion != keep
-            {
-                return Some("promotion-inert");
-            }
-        } else if bond == Some("none") {
-            let keep_never = axis_has(axes, "promotion", "never");
-            let keep_all = axis_has(axes, "promotion", "all");
-            if (promotion == "relocate" || promotion == "bonded") && keep_never
-                || (!keep_never && keep_all && promotion != "all")
-            {
-                return Some("promotion-inert");
-            }
-        }
+    if let Some(reason) = filter_promotion(cell, axes, bond, is_multi, is_single) {
+        return Some(reason);
     }
 
-    if !is_multi
-        && let Some(cookie) = cookie
-        && let Some(keep) = representative(axes, "cookie-routing", "on")
-        && cookie != keep
-    {
-        return Some("cookie-routing-inert");
+    if let Some(reason) = filter_cookie_routing(cell, axes, is_multi) {
+        return Some(reason);
     }
 
-    let batching_is_meaningful = runtime_recv == "mio" && !is_per_port;
-    if !batching_is_meaningful
-        && let Some(batch) = batch
-        && let Some(keep) = representative(axes, "batch", "on")
-        && batch != keep
-    {
-        return Some("batch-inert");
+    if let Some(reason) = filter_batching(cell, axes, runtime_recv, is_per_port) {
+        return Some(reason);
     }
 
-    let pin_is_meaningful = runtime_recv == "glommio" || runtime_send == "glommio";
-    if !pin_is_meaningful
-        && let Some(pin) = pin
-        && let Some(keep) = representative(axes, "pin", "off")
-        && pin != keep
-    {
-        return Some("pin-inert");
+    if let Some(reason) = filter_pinning(cell, axes, runtime_recv, runtime_send) {
+        return Some(reason);
     }
 
     None
+}
+
+fn filter_shared_egress(
+    cell: &Cell<'_>,
+    axes: &[Axis],
+    egress: &str,
+    send_workers: Option<&str>,
+) -> Option<&'static str> {
+    if egress != "shared-socket" {
+        return None;
+    }
+    // A shared caller socket drives all handshakes from one readiness loop;
+    // per-connection launch concurrency cannot alter that implementation.
+    if let Some(value) = cell_value(cell, "connect-concurrency", Some(Scope::Both))
+        && let Some(keep) = representative(axes, "connect-concurrency", "1")
+        && value != keep
+    {
+        return Some("connect-concurrency-inert");
+    }
+    // One shared UDP socket has one owning runtime loop. Extra sender workers
+    // cannot alter it; receiver workers remain independently variable when a
+    // plan splits the axis by role.
+    if let Some(value) = send_workers
+        && let Some(keep) = representative_for_role(axes, "workers", Scope::Send, "1")
+        && value != keep
+    {
+        return Some("shared-egress-workers-inert");
+    }
+    None
+}
+
+fn filter_bond_capacity(cell: &Cell<'_>, bond: Option<&str>) -> Option<&'static str> {
+    let pairs = bond.and_then(bond_pairs);
+    let connections = cell_value(cell, "connections", Some(Scope::Both))
+        .and_then(|value| value.parse::<usize>().ok());
+    if let (Some(pairs), Some(connections)) = (pairs, connections)
+        && pairs > connections / 2
+    {
+        Some("bond-capacity")
+    } else {
+        None
+    }
+}
+
+fn filter_promotion(
+    cell: &Cell<'_>,
+    axes: &[Axis],
+    bond: Option<&str>,
+    is_multi: bool,
+    is_single: bool,
+) -> Option<&'static str> {
+    let promotion = cell_value(cell, "promotion", Some(Scope::Both))?;
+    if is_single || !is_multi {
+        return representative(axes, "promotion", "all")
+            .filter(|keep| promotion != *keep)
+            .map(|_| "promotion-inert");
+    }
+    if bond != Some("none") {
+        return None;
+    }
+    let keep_never = axis_has(axes, "promotion", "never");
+    let keep_all = axis_has(axes, "promotion", "all");
+    ((promotion == "relocate" || promotion == "bonded") && keep_never
+        || (!keep_never && keep_all && promotion != "all"))
+        .then_some("promotion-inert")
+}
+
+fn filter_cookie_routing(cell: &Cell<'_>, axes: &[Axis], is_multi: bool) -> Option<&'static str> {
+    if is_multi {
+        return None;
+    }
+    let cookie = cell_value(cell, "cookie-routing", Some(Scope::Both))?;
+    representative(axes, "cookie-routing", "on")
+        .filter(|keep| cookie != *keep)
+        .map(|_| "cookie-routing-inert")
+}
+
+fn filter_batching(
+    cell: &Cell<'_>,
+    axes: &[Axis],
+    runtime_recv: &str,
+    is_per_port: bool,
+) -> Option<&'static str> {
+    if runtime_recv == "mio" && !is_per_port {
+        return None;
+    }
+    let batch = cell_value(cell, "batch", Some(Scope::Both))?;
+    representative(axes, "batch", "on")
+        .filter(|keep| batch != *keep)
+        .map(|_| "batch-inert")
+}
+
+fn filter_pinning(
+    cell: &Cell<'_>,
+    axes: &[Axis],
+    runtime_recv: &str,
+    runtime_send: &str,
+) -> Option<&'static str> {
+    if runtime_recv == "glommio" || runtime_send == "glommio" {
+        return None;
+    }
+    let pin = cell_value(cell, "pin", Some(Scope::Both))?;
+    representative(axes, "pin", "off")
+        .filter(|keep| pin != *keep)
+        .map(|_| "pin-inert")
 }
 
 #[cfg(test)]
