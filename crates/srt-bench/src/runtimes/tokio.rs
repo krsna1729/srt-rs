@@ -415,7 +415,85 @@ async fn sender_task(
     stats
 }
 
-#[expect(clippy::cognitive_complexity)]
+async fn receive_receiver_packets(
+    driver: &mut Conn,
+    peer: &mut Option<SocketAddr>,
+    buffer: &mut [u8; 2048],
+    start: Instant,
+) -> bool {
+    if peer.is_none() {
+        let received = tokio::time::timeout(crate::MAX_WAIT, driver.sock.recv_from(buffer)).await;
+        if let Ok(Ok((size, addr))) = received {
+            if let Err(error) = driver.sock.connect(addr).await {
+                eprintln!("[bench-tokio] connect to peer failed: {error}");
+                return false;
+            }
+            *peer = Some(addr);
+            let now = crate::now_ts(start);
+            let _ = driver.conn.feed_recv_buf(&buffer[..size], now);
+        }
+    } else {
+        tokio::select! {
+            result = driver.sock.recv(buffer) => {
+                if let Ok(size) = result {
+                    let now = crate::now_ts(start);
+                    let _ = driver.conn.feed_recv_buf(&buffer[..size], now);
+                }
+            }
+            _ = tokio::time::sleep(crate::MAX_WAIT) => {}
+        }
+        while let Ok(size) = driver.sock.try_recv(buffer) {
+            let now = crate::now_ts(start);
+            let _ = driver.conn.feed_recv_buf(&buffer[..size], now);
+        }
+    }
+    true
+}
+
+fn handle_receiver_events(
+    cfg: &BenchConfig,
+    driver: &mut Conn,
+    stats: &mut ConnStats,
+    stream_deadline: &mut Option<Instant>,
+) {
+    while let Some(event) = driver.conn.poll_event() {
+        match event {
+            ConnectionEvent::Connected => {
+                stats.connected = true;
+                if cfg.verbose() {
+                    println!("CONNECTED");
+                }
+                if stream_deadline.is_none() {
+                    *stream_deadline =
+                        Some(Instant::now() + Duration::from_secs_f64(cfg.duration_secs));
+                }
+            }
+            ConnectionEvent::DataReceived { .. } => {
+                stats.data_events += 1;
+            }
+            ConnectionEvent::Disconnected { reason } => {
+                eprintln!("[bench-tokio] disconnected: {reason}");
+                stats.torn_down |= !crate::is_ordered_close(&reason);
+                *stream_deadline = Some(Instant::now());
+            }
+            ConnectionEvent::Error(message) => {
+                eprintln!("[bench-tokio] error: {message}");
+            }
+            _ => {}
+        }
+    }
+}
+
+fn record_receiver_stats(driver: &Conn, stats: &mut ConnStats) {
+    if let Some(receiver) = driver.conn.receiver_stats() {
+        stats.has_stats = true;
+        stats.core_total = receiver.total_received;
+        stats.secondary_a = receiver.total_lost;
+        stats.secondary_b = receiver.total_duplicates;
+        stats.rtt_us = receiver.rtt as u64;
+    }
+}
+
 async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> ConnStats {
     let socket = tokio::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], listen_port)))
         .await
@@ -448,80 +526,18 @@ async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> Co
             break;
         }
 
-        if peer.is_none() {
-            // Unconnected phase: first datagram reveals the caller; connect
-            // before anything else (drain_outputs uses connected send).
-            if let Ok(Ok((n, addr))) =
-                tokio::time::timeout(crate::MAX_WAIT, driver.sock.recv_from(&mut buf)).await
-            {
-                if let Err(e) = driver.sock.connect(addr).await {
-                    eprintln!("[bench-tokio] connect to peer failed: {e}");
-                    continue;
-                }
-                peer = Some(addr);
-                let t = crate::now_ts(start);
-                let _ = driver.conn.feed_recv_buf(&buf[..n], t);
-            }
-        } else {
-            tokio::select! {
-                res = driver.sock.recv(&mut buf) => {
-                    if let Ok(n) = res {
-                        let t = crate::now_ts(start);
-                        let _ = driver.conn.feed_recv_buf(&buf[..n], t);
-                    }
-                }
-                _ = tokio::time::sleep(crate::MAX_WAIT) => {}
-            }
-
-            while let Ok(n) = driver.sock.try_recv(&mut buf) {
-                let t = crate::now_ts(start);
-                let _ = driver.conn.feed_recv_buf(&buf[..n], t);
-            }
+        if !receive_receiver_packets(&mut driver, &mut peer, &mut buf, start).await {
+            continue;
         }
 
         let t = crate::now_ts(start);
         driver.fire_expired(t);
         drain_outputs(&mut driver, t).await;
 
-        while let Some(ev) = driver.conn.poll_event() {
-            match ev {
-                ConnectionEvent::Connected => {
-                    stats.connected = true;
-                    if cfg.verbose() {
-                        println!("CONNECTED");
-                    }
-                    // Set once. A duplicate `Connected` -- a re-completed
-                    // handshake under load -- would otherwise push the
-                    // deadline out another full duration, and the run
-                    // would quietly offer more than the configured load.
-                    if stream_deadline.is_none() {
-                        stream_deadline =
-                            Some(Instant::now() + Duration::from_secs_f64(cfg.duration_secs));
-                    }
-                }
-                ConnectionEvent::DataReceived { .. } => {
-                    stats.data_events += 1;
-                }
-                ConnectionEvent::Disconnected { reason } => {
-                    eprintln!("[bench-tokio] disconnected: {reason}");
-                    stats.torn_down |= !crate::is_ordered_close(&reason);
-                    stream_deadline = Some(Instant::now());
-                }
-                ConnectionEvent::Error(msg) => {
-                    eprintln!("[bench-tokio] error: {msg}");
-                }
-                _ => {}
-            }
-        }
+        handle_receiver_events(&cfg, &mut driver, &mut stats, &mut stream_deadline);
     }
 
-    if let Some(s) = driver.conn.receiver_stats() {
-        stats.has_stats = true;
-        stats.core_total = s.total_received;
-        stats.secondary_a = s.total_lost;
-        stats.secondary_b = s.total_duplicates;
-        stats.rtt_us = s.rtt as u64;
-    }
+    record_receiver_stats(&driver, &mut stats);
     stats
 }
 
