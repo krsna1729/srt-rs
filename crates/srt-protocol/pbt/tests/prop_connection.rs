@@ -10,8 +10,8 @@
 
 use proptest::prelude::*;
 use shiguredo_srt::{
-    CipherMode, ConnectionEvent, ConnectionOptions, ConnectionOutput, ConnectionState, KeyLength,
-    SrtConnection, SrtPacket, TimerId, Timestamp,
+    CipherMode, ConnectionEvent, ConnectionOptions, ConnectionOutput, ConnectionState, ControlType,
+    DEFAULT_MTU, KeyLength, SrtConnection, SrtPacket, TimerId, Timestamp,
 };
 
 // ============================================================================
@@ -716,6 +716,68 @@ proptest! {
         // パニックせず接続維持
         prop_assert_eq!(caller.state(), ConnectionState::Connected);
     }
+
+    /// Periodic NAK chunking must preserve the exact loss set while keeping
+    /// every emitted control packet within the negotiated datagram budget.
+    #[test]
+    fn prop_periodic_nak_chunks_preserve_random_loss_sets(
+        recovered in prop::collection::vec(any::<bool>(), 2..1024),
+    ) {
+        const SEQUENCE_MASK: u32 = 0x7FFF_FFFF;
+        let mut now = Timestamp::from_micros(0);
+        let mut caller = SrtConnection::new_caller(make_opts(1));
+        let mut listener = SrtConnection::new_listener(make_opts(2));
+        establish_connection(&mut caller, &mut listener, &mut now);
+
+        caller.send(&[], now).expect("send template packet");
+        let mut template = match SrtPacket::decode(&drain_packets(&mut caller)[0])
+            .expect("decode template packet")
+        {
+            SrtPacket::Data(packet) => packet,
+            SrtPacket::Control(_) => unreachable!("send emits data"),
+        };
+        let initial_seq = template.sequence_number;
+        let high_offset = recovered.len() as u32;
+        template.sequence_number = initial_seq.wrapping_add(high_offset) & SEQUENCE_MASK;
+        let mut bytes = Vec::new();
+        SrtPacket::Data(template.clone()).encode(&mut bytes);
+        listener.feed_recv_buf(&bytes, now).expect("expose loss window");
+
+        for (offset, was_recovered) in recovered.iter().copied().enumerate() {
+            if !was_recovered {
+                continue;
+            }
+            template.sequence_number = initial_seq.wrapping_add(offset as u32) & SEQUENCE_MASK;
+            bytes.clear();
+            SrtPacket::Data(template.clone()).encode(&mut bytes);
+            listener.feed_recv_buf(&bytes, now).expect("recover packet");
+        }
+
+        // Discard immediate NAK output; this property targets the periodic
+        // encoding of the receiver's complete outstanding loss set.
+        drain_packets(&mut listener);
+        now = Timestamp::from_micros(now.as_micros() + 20_000);
+        listener.handle_timer(TimerId::Nak, now).expect("NAK timer");
+
+        let mut decoded = Vec::new();
+        for bytes in drain_packets(&mut listener) {
+            let SrtPacket::Control(packet) = SrtPacket::decode(&bytes).expect("decode NAK") else {
+                continue;
+            };
+            if packet.control_type != ControlType::Nak {
+                continue;
+            }
+            prop_assert!(bytes.len() <= DEFAULT_MTU as usize);
+            decoded.extend(decode_nak_sequences(&packet.control_info));
+        }
+        let expected = recovered
+            .iter()
+            .enumerate()
+            .filter(|(_, was_recovered)| !**was_recovered)
+            .map(|(offset, _)| initial_seq.wrapping_add(offset as u32) & SEQUENCE_MASK)
+            .collect::<Vec<_>>();
+        prop_assert_eq!(decoded, expected);
+    }
 }
 
 // ============================================================================
@@ -1065,6 +1127,36 @@ fn drain_events(conn: &mut SrtConnection) -> Vec<ConnectionEvent> {
         events.push(event);
     }
     events
+}
+
+fn decode_nak_sequences(control_info: &[u8]) -> Vec<u32> {
+    const SEQUENCE_MASK: u32 = 0x7FFF_FFFF;
+    let words = control_info
+        .chunks_exact(4)
+        .map(|word| u32::from_be_bytes(word.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    let mut decoded = Vec::new();
+    let mut index = 0;
+    while index < words.len() {
+        let first = words[index];
+        index += 1;
+        if first & 0x8000_0000 == 0 {
+            decoded.push(first);
+            continue;
+        }
+        let start = first & SEQUENCE_MASK;
+        let end = words[index] & SEQUENCE_MASK;
+        index += 1;
+        let mut sequence = start;
+        loop {
+            decoded.push(sequence);
+            if sequence == end {
+                break;
+            }
+            sequence = sequence.wrapping_add(1) & SEQUENCE_MASK;
+        }
+    }
+    decoded
 }
 
 /// 受信データを抽出

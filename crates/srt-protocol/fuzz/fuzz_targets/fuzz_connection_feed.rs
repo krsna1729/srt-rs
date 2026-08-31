@@ -3,12 +3,13 @@
 use libfuzzer_sys::fuzz_target;
 use shiguredo_srt::{
     ConnectionOptions, ConnectionOutput, ControlPacket, ControlType, SrtConnection, TimerId,
-    Timestamp, write_u32,
+    Timestamp, DEFAULT_MTU, write_u32,
 };
 
 fn transfer(from: &mut SrtConnection, to: &mut SrtConnection, now: Timestamp) {
     while let Some(output) = from.poll_output() {
         if let ConnectionOutput::SendPacket(packet) = output {
+            assert!(packet.len() <= DEFAULT_MTU as usize);
             let _ = to.feed_recv_buf(&packet, now);
         }
     }

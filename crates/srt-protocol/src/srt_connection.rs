@@ -20,10 +20,14 @@ use crate::srt_handshake::{
 use crate::srt_packet::{
     ControlPacket, ControlType, DataHeader, DataPacket, SRT_HEADER_SIZE, SrtPacket,
 };
-use crate::srt_receiver::ReceiverBuffer;
+use crate::srt_receiver::{LossRange, ReceiverBuffer};
 use crate::srt_sender::SenderBuffer;
 use crate::stats::ConnectionStats;
 use crate::time::Timestamp;
+
+const MAX_NAK_RECORD_SIZE: usize = 8;
+const NAK_CHUNK_INITIAL_CAPACITY: usize = 32;
+const _: () = assert!(DEFAULT_MTU as usize - SRT_HEADER_SIZE >= MAX_NAK_RECORD_SIZE);
 
 /// A connection's role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2278,22 +2282,24 @@ impl SrtConnection {
             return;
         }
 
+        debug_assert!(control_info.len() <= self.max_control_info_size());
+
         if let Some(receiver) = self.receiver.as_mut() {
             receiver.record_nak_sent();
         }
 
-        let pkt = ControlPacket {
-            control_type: ControlType::Nak,
-            subtype: 0,
-            type_specific_info: 0,
-            timestamp: self.relative_timestamp(now),
-            dest_socket_id: self.peer_socket_id,
+        let packet = encode_nak_packet(
             control_info,
-        };
+            self.relative_timestamp(now),
+            self.peer_socket_id,
+        );
+        self.queue_packet(packet, now);
+    }
 
-        let mut buf = Vec::with_capacity(pkt.encoded_size());
-        pkt.encode(&mut buf);
-        self.queue_packet(buf, now);
+    /// Control packets and DATA packets share the configured SRT datagram
+    /// budget after their common 16-byte header.
+    fn max_control_info_size(&self) -> usize {
+        self.max_payload_size
     }
 
     /// Send a periodic NAK.
@@ -2303,11 +2309,38 @@ impl SrtConnection {
             None => return,
         };
 
-        let mut control_info = Vec::new();
+        let max_control_info_size = self.max_control_info_size();
+        debug_assert!(max_control_info_size >= MAX_NAK_RECORD_SIZE);
+        let timestamp = self.relative_timestamp(now);
+        let peer_socket_id = self.peer_socket_id;
+        let output_queue = &mut self.output_queue;
+        let mut chunks = NakChunkEncoder::new(max_control_info_size);
+        let mut packets_sent = 0u32;
         receiver.for_each_periodic_nak_range(|loss| {
-            encode_loss_range(&mut control_info, loss.first_seq, loss.last_seq);
+            if let Some(control_info) = chunks.push(loss) {
+                output_queue.push_back(ConnectionOutput::SendPacket(encode_nak_packet(
+                    control_info,
+                    timestamp,
+                    peer_socket_id,
+                )));
+                packets_sent += 1;
+            }
         });
-        self.send_encoded_nak(control_info, now);
+        if let Some(control_info) = chunks.finish() {
+            output_queue.push_back(ConnectionOutput::SendPacket(encode_nak_packet(
+                control_info,
+                timestamp,
+                peer_socket_id,
+            )));
+            packets_sent += 1;
+        }
+
+        if packets_sent != 0 {
+            self.last_send_time = Some(now);
+            if let Some(receiver) = self.receiver.as_mut() {
+                receiver.record_naks_sent(packets_sent);
+            }
+        }
         self.last_nak_time = Some(now);
     }
 
@@ -2763,6 +2796,63 @@ fn encode_loss_range(result: &mut Vec<u8>, start: u32, end: u32) {
         write_u32(result, (start & 0x7FFF_FFFF) | 0x8000_0000);
         write_u32(result, end & 0x7FFF_FFFF);
     }
+}
+
+struct NakChunkEncoder {
+    control_info: Vec<u8>,
+    max_control_info_size: usize,
+}
+
+impl NakChunkEncoder {
+    fn new(max_control_info_size: usize) -> Self {
+        assert!(
+            max_control_info_size >= MAX_NAK_RECORD_SIZE,
+            "SRT datagram budget must fit the largest NAK record"
+        );
+        Self {
+            control_info: Vec::with_capacity(max_control_info_size.min(NAK_CHUNK_INITIAL_CAPACITY)),
+            max_control_info_size,
+        }
+    }
+
+    fn push(&mut self, loss: LossRange) -> Option<Vec<u8>> {
+        let record_size = if loss.first_seq == loss.last_seq {
+            4
+        } else {
+            MAX_NAK_RECORD_SIZE
+        };
+        let full_chunk = (!self.control_info.is_empty()
+            && self.control_info.len() + record_size > self.max_control_info_size)
+            .then(|| {
+                std::mem::replace(
+                    &mut self.control_info,
+                    // Crossing the first chunk proves this is not the common
+                    // sparse case. Pre-size subsequent chunks to avoid
+                    // repeating geometric growth for every datagram.
+                    Vec::with_capacity(self.max_control_info_size),
+                )
+            });
+        encode_loss_range(&mut self.control_info, loss.first_seq, loss.last_seq);
+        full_chunk
+    }
+
+    fn finish(self) -> Option<Vec<u8>> {
+        (!self.control_info.is_empty()).then_some(self.control_info)
+    }
+}
+
+fn encode_nak_packet(control_info: Vec<u8>, timestamp: u32, peer_socket_id: u32) -> Vec<u8> {
+    let packet = ControlPacket {
+        control_type: ControlType::Nak,
+        subtype: 0,
+        type_specific_info: 0,
+        timestamp,
+        dest_socket_id: peer_socket_id,
+        control_info,
+    };
+    let mut encoded = Vec::with_capacity(packet.encoded_size());
+    packet.encode(&mut encoded);
+    encoded
 }
 
 #[cfg(test)]
@@ -3546,6 +3636,92 @@ mod tests {
             decoded,
             vec![0x7FFF_FFFC, 0x7FFF_FFFD, 0x7FFF_FFFE, 0x7FFF_FFFF, 0]
         );
+    }
+
+    #[test]
+    fn nak_chunk_encoder_honors_exact_budget_and_preserves_wrapped_ranges() {
+        let ranges = [
+            LossRange {
+                first_seq: 1,
+                last_seq: 1,
+            },
+            LossRange {
+                first_seq: 0x7FFF_FFFE,
+                last_seq: 1,
+            },
+            LossRange {
+                first_seq: 3,
+                last_seq: 3,
+            },
+        ];
+        let mut encoder = NakChunkEncoder::new(12);
+        let mut chunks = Vec::new();
+        for range in ranges {
+            if let Some(chunk) = encoder.push(range) {
+                chunks.push(chunk);
+            }
+        }
+        chunks.extend(encoder.finish());
+
+        assert_eq!(chunks.iter().map(Vec::len).collect::<Vec<_>>(), [12, 4]);
+        assert_eq!(
+            parse_loss_list(&chunks[0], usize::MAX).unwrap(),
+            [1, 0x7FFF_FFFE, 0x7FFF_FFFF, 0, 1,]
+        );
+        assert_eq!(parse_loss_list(&chunks[1], usize::MAX).unwrap(), [3]);
+    }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "maximum-window scale is covered normally; Miri runs exact chunk boundaries"
+    )]
+    fn periodic_nak_chunks_maximum_alternating_window_without_wire_loss() {
+        let options = ConnectionOptions {
+            flow_window_packets: MAX_FLOW_WINDOW,
+            receive_buffer_packets: MAX_FLOW_WINDOW,
+            ..ConnectionOptions::default()
+        };
+        let mut conn = SrtConnection::new_listener(options);
+        conn.set_state(ConnectionState::Connected);
+        conn.init_buffers(Timestamp::default(), 0, 0);
+        while conn.poll_output().is_some() {}
+
+        let now = Timestamp::from_micros(1);
+        let receiver = conn.receiver.as_mut().unwrap();
+        receiver.receive(
+            DataPacket::new(MAX_FLOW_WINDOW - 1, 1, 1, 0, Vec::new().into()),
+            now,
+        );
+        for sequence_number in (1..MAX_FLOW_WINDOW - 1).step_by(2) {
+            receiver.receive(
+                DataPacket::new(sequence_number, 1, 1, 0, Vec::new().into()),
+                now,
+            );
+        }
+
+        conn.send_periodic_nak(Timestamp::from_micros(2));
+        let mut decoded = Vec::new();
+        let mut wire_packets = 0u64;
+        while let Some(output) = conn.poll_output() {
+            let ConnectionOutput::SendPacket(bytes) = output else {
+                continue;
+            };
+            let SrtPacket::Control(packet) = SrtPacket::decode(&bytes).unwrap() else {
+                continue;
+            };
+            if packet.control_type != ControlType::Nak {
+                continue;
+            }
+            assert!(bytes.len() <= DEFAULT_MTU as usize);
+            decoded.extend(parse_loss_list(&packet.control_info, usize::MAX).unwrap());
+            wire_packets += 1;
+        }
+
+        let expected: Vec<u32> = (0..MAX_FLOW_WINDOW - 1).step_by(2).collect();
+        assert_eq!(decoded, expected);
+        assert_eq!(wire_packets, 89);
+        assert_eq!(conn.stats().receiver.unwrap().total_naks_sent, wire_packets);
     }
 
     #[test]
