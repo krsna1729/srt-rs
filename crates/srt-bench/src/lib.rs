@@ -742,66 +742,93 @@ impl SharedSender {
     ) {
         let now_instant = Instant::now();
         let now = now_ts(self.start);
-        for slot in &mut self.slots {
-            let state = self
-                .callers
-                .logical_caller(&slot.caller)
-                .and_then(|caller| caller.state())
-                .expect("slot and caller table agree");
-            if state == srt_transport::LogicalCallerState::Disconnected {
-                for stats in &mut slot.stats {
-                    stats.torn_down |= stats.connected;
-                }
-                slot.closed = true;
-                continue;
-            }
-            if state == srt_transport::LogicalCallerState::Connected {
-                for stats in &mut slot.stats {
-                    stats.connected = true;
-                }
-                slot.stream_deadline
-                    .get_or_insert(now_instant + Duration::from_secs_f64(cfg.duration_secs));
-            }
-            if state != srt_transport::LogicalCallerState::Connected
-                && now_instant >= self.connect_deadline
-            {
-                slot.closed = true;
-                continue;
-            }
-            if state == srt_transport::LogicalCallerState::Connected
-                && !slot.closed
-                && slot
-                    .stream_deadline
-                    .is_some_and(|deadline| now_instant < deadline)
-            {
-                {
-                    let mut caller = self
-                        .callers
-                        .logical_caller_mut(&slot.caller)
-                        .expect("slot and caller table agree");
-                    if !caller.can_send_with_pacing(now) {
-                        continue;
-                    }
-                    let Ok(selected_legs) = caller.send(&self.payload, now) else {
-                        continue;
-                    };
-                    for stats in slot.stats.iter_mut().take(selected_legs) {
-                        stats.data_events = stats.data_events.saturating_add(1);
-                    }
-                }
-            } else if !slot.closed
-                && slot
-                    .stream_deadline
-                    .is_some_and(|deadline| now_instant >= deadline)
-            {
-                self.callers
-                    .logical_caller_mut(&slot.caller)
-                    .expect("slot and caller table agree")
-                    .disconnect(now);
-                slot.closed = true;
-            }
+        for slot_index in 0..self.slots.len() {
+            self.tick_slot(cfg, slot_index, now_instant, now);
         }
         self.callers.poll_outbound(now, out);
+    }
+
+    fn tick_slot(
+        &mut self,
+        cfg: &BenchConfig,
+        index: usize,
+        now_instant: Instant,
+        now: shiguredo_srt::Timestamp,
+    ) {
+        let caller_id = self.slots[index].caller;
+        let state = self
+            .callers
+            .logical_caller(&caller_id)
+            .and_then(|caller| caller.state())
+            .expect("slot and caller table agree");
+        if state == srt_transport::LogicalCallerState::Disconnected {
+            self.mark_slot_disconnected(index);
+            return;
+        }
+        if state == srt_transport::LogicalCallerState::Connected {
+            self.mark_slot_connected(index, cfg, now_instant);
+        }
+        if state != srt_transport::LogicalCallerState::Connected
+            && now_instant >= self.connect_deadline
+        {
+            self.slots[index].closed = true;
+            return;
+        }
+        let closed = self.slots[index].closed;
+        let before_deadline = self.slots[index]
+            .stream_deadline
+            .is_some_and(|deadline| now_instant < deadline);
+        let after_deadline = self.slots[index]
+            .stream_deadline
+            .is_some_and(|deadline| now_instant >= deadline);
+        if state == srt_transport::LogicalCallerState::Connected && !closed && before_deadline {
+            self.send_slot(index, now);
+        } else if !closed && after_deadline {
+            self.close_slot(index, now);
+        }
+    }
+
+    fn mark_slot_disconnected(&mut self, index: usize) {
+        let slot = &mut self.slots[index];
+        for stats in &mut slot.stats {
+            stats.torn_down |= stats.connected;
+        }
+        slot.closed = true;
+    }
+
+    fn mark_slot_connected(&mut self, index: usize, cfg: &BenchConfig, now: Instant) {
+        let slot = &mut self.slots[index];
+        for stats in &mut slot.stats {
+            stats.connected = true;
+        }
+        slot.stream_deadline
+            .get_or_insert(now + Duration::from_secs_f64(cfg.duration_secs));
+    }
+
+    fn send_slot(&mut self, index: usize, now: shiguredo_srt::Timestamp) {
+        let caller_id = self.slots[index].caller;
+        let mut caller = self
+            .callers
+            .logical_caller_mut(&caller_id)
+            .expect("slot and caller table agree");
+        if !caller.can_send_with_pacing(now) {
+            return;
+        }
+        let Ok(selected_legs) = caller.send(&self.payload, now) else {
+            return;
+        };
+        for stats in self.slots[index].stats.iter_mut().take(selected_legs) {
+            stats.data_events = stats.data_events.saturating_add(1);
+        }
+    }
+
+    fn close_slot(&mut self, index: usize, now: shiguredo_srt::Timestamp) {
+        let caller_id = self.slots[index].caller;
+        self.callers
+            .logical_caller_mut(&caller_id)
+            .expect("slot and caller table agree")
+            .disconnect(now);
+        self.slots[index].closed = true;
     }
 
     pub(crate) fn done(&self) -> bool {
