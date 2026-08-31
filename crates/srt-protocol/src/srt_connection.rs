@@ -1467,58 +1467,7 @@ impl SrtConnection {
             return Ok(()); // 接続前のデータは無視
         }
 
-        // Checked before the payload clone below: this is the path a
-        // misconfigured or hostile peer drives hardest, and the guard reads
-        // only the header, so there is no reason to copy ~1.3 KB first.
-        //
-        // A secured SRT connection must reject plaintext DATA just as it
-        // rejects packets whose advertised key cannot be used. This is both a
-        // security boundary and the source transition for undecrypt telemetry.
-        if pkt.encryption_flag == 0 && self.crypto.is_some() {
-            if let Some(receiver) = self.receiver.as_mut() {
-                receiver.record_undecryptable();
-            }
-            return Err(Error::crypto_error(
-                "unencrypted DATA packet on encrypted connection",
-            ));
-        }
-
-        if pkt.encryption_flag != 0 {
-            let result = if let Some(ref crypto) = self.crypto {
-                let key_flag = KeyFlag::from_kk_field(pkt.encryption_flag)
-                    .ok_or_else(|| Error::crypto_error("invalid KK flag"))?;
-                match crypto.cipher_mode() {
-                    CipherMode::Ctr => {
-                        let mut payload = pkt.payload.try_into_mut().unwrap_or_else(BytesMut::from);
-                        crypto.decrypt(pkt.sequence_number, key_flag, &mut payload)?;
-                        pkt.payload = payload.freeze();
-                        Ok(())
-                    }
-                    CipherMode::Gcm => {
-                        let aad = pkt.gcm_aad();
-                        let mut payload = pkt.payload.try_into_mut().unwrap_or_else(BytesMut::from);
-                        crypto.decrypt_gcm_detached(
-                            pkt.sequence_number,
-                            key_flag,
-                            &aad,
-                            &mut payload,
-                        )?;
-                        pkt.payload = payload.freeze();
-                        Ok(())
-                    }
-                }
-            } else {
-                Err(Error::crypto_error(
-                    "encrypted packet but no crypto context",
-                ))
-            };
-            if let Err(error) = result {
-                if let Some(receiver) = self.receiver.as_mut() {
-                    receiver.record_undecryptable();
-                }
-                return Err(error);
-            }
-        }
+        self.decrypt_data_packet(&mut pkt)?;
 
         // Receive before delivery. Ready packets are moved into the bounded
         // application queue below, so unread application data remains part of
@@ -1551,6 +1500,56 @@ impl SrtConnection {
         }
 
         Ok(())
+    }
+
+    fn decrypt_data_packet(&mut self, pkt: &mut DataPacket) -> Result<(), Error> {
+        // Check the header before cloning the payload: hostile or
+        // misconfigured peers should not force an unnecessary allocation.
+        if pkt.encryption_flag == 0 {
+            if self.crypto.is_some() {
+                self.record_undecryptable();
+                return Err(Error::crypto_error(
+                    "unencrypted DATA packet on encrypted connection",
+                ));
+            }
+            return Ok(());
+        }
+
+        if let Err(error) = self.decrypt_encrypted_payload(pkt) {
+            self.record_undecryptable();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn decrypt_encrypted_payload(&self, pkt: &mut DataPacket) -> Result<(), Error> {
+        let Some(crypto) = self.crypto.as_ref() else {
+            return Err(Error::crypto_error(
+                "encrypted packet but no crypto context",
+            ));
+        };
+        let key_flag = KeyFlag::from_kk_field(pkt.encryption_flag)
+            .ok_or_else(|| Error::crypto_error("invalid KK flag"))?;
+        let mut payload = std::mem::take(&mut pkt.payload)
+            .try_into_mut()
+            .unwrap_or_else(BytesMut::from);
+        match crypto.cipher_mode() {
+            CipherMode::Ctr => {
+                crypto.decrypt(pkt.sequence_number, key_flag, &mut payload)?;
+            }
+            CipherMode::Gcm => {
+                let aad = pkt.gcm_aad();
+                crypto.decrypt_gcm_detached(pkt.sequence_number, key_flag, &aad, &mut payload)?;
+            }
+        }
+        pkt.payload = payload.freeze();
+        Ok(())
+    }
+
+    fn record_undecryptable(&mut self) {
+        if let Some(receiver) = self.receiver.as_mut() {
+            receiver.record_undecryptable();
+        }
     }
 
     fn handle_control_packet(&mut self, pkt: ControlPacket, now: Timestamp) -> Result<(), Error> {
