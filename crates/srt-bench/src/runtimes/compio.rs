@@ -1283,6 +1283,84 @@ fn run_reuseport_single(cfg: BenchConfig, workers: usize) {
 
 /// The single acceptor: admit every flow, route each to a worker as soon
 /// as it is established.
+fn drain_single_inbox(
+    inbox: &mpsc::Receiver<(SocketAddr, Vec<u8>, usize)>,
+    recycle: &mpsc::Sender<Vec<u8>>,
+    peers: &mut srt_transport::PeerTable,
+    admission: &srt_transport::AdmissionOptions,
+    start: Instant,
+) {
+    while let Ok((peer, buffer, size)) = inbox.try_recv() {
+        admit_one(peers, admission, peer, &buffer[..size], start);
+        let _ = recycle.send(buffer);
+    }
+}
+
+async fn flush_single_outbound(
+    listener: &compio::net::UdpSocket,
+    outbound: &mut Vec<(SocketAddr, Vec<u8>)>,
+) {
+    for (peer, bytes) in outbound.drain(..) {
+        let BufResult(_result, _returned) = listener.send_to(bytes, peer).await;
+    }
+}
+
+struct SingleAcceptorContext<'a> {
+    cfg: &'a BenchConfig,
+    router: &'a crate::SharedWorkerRouter,
+    senders: &'a [mpsc::Sender<WorkerMessage>],
+    telemetry: &'a srt_transport::IngressTelemetry,
+}
+
+fn route_one_connected_peer(
+    context: &SingleAcceptorContext<'_>,
+    peers: &mut srt_transport::PeerTable,
+    connected: srt_transport::NewlyConnectedPeer,
+    routed: &mut usize,
+) {
+    let peer = connected.representative_peer;
+    let group = peers
+        .logical_peer(&connected.logical_peer)
+        .and_then(|logical| logical.group_affinity());
+    let Some(srt_transport::RemovedLogicalPeer::Direct(entry)) =
+        peers.remove(connected.logical_peer)
+    else {
+        return;
+    };
+    let owner = match context.router.lock() {
+        Ok(mut router) => router.assign(peer, group, srt_lifecycle::RoutingMode::LeastTuples),
+        Err(_) => 0,
+    };
+    let Ok(socket) = srt_transport::bind_reuseport(context.cfg.port, context.cfg.sock_buf_bytes)
+    else {
+        return;
+    };
+    if socket.connect(peer).is_err() {
+        return;
+    }
+    let message = WorkerMessage::Handoff(Box::new(srt_transport::Handoff {
+        socket,
+        conn: entry.connection,
+    }));
+    if context.senders[owner].send(message).is_ok() {
+        context.telemetry.record_handoff();
+        *routed += 1;
+    }
+}
+
+fn route_connected_peers(
+    context: &SingleAcceptorContext<'_>,
+    stream_len: Duration,
+    peers: &mut srt_transport::PeerTable,
+    connected: &mut Vec<srt_transport::NewlyConnectedPeer>,
+    routed: &mut usize,
+) {
+    peers.drain_events(stream_len, connected);
+    for connected in std::mem::take(connected) {
+        route_one_connected_peer(context, peers, connected, routed);
+    }
+}
+
 async fn run_single_acceptor(
     cfg: &BenchConfig,
     start: Instant,
@@ -1327,58 +1405,29 @@ async fn run_single_acceptor(
     let mut routed = 0usize;
     let mut outbound: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
     let mut connected = Vec::new();
+    let context = SingleAcceptorContext {
+        cfg,
+        router,
+        senders,
+        telemetry: &telemetry,
+    };
 
     // Admission ends with the connect window: anything not established by
     // then never will be.
     while Instant::now() < connect_deadline && routed < cfg.connections {
         compio::time::sleep(TIMER_TICK).await;
-        while let Ok((peer, buf, size)) = inbox_rx.try_recv() {
-            admit_one(&mut peers, &admission, peer, &buf[..size], start);
-            let _ = recycle_tx.send(buf);
-        }
+        drain_single_inbox(&inbox_rx, &recycle_tx, &mut peers, &admission, start);
 
         let t = crate::now_ts(start);
         peers.poll_outbound(t, &mut outbound);
-        for (peer, bytes) in outbound.drain(..) {
-            let BufResult(_r, _b) = listener.send_to(bytes, peer).await;
-        }
-        peers.drain_events(stream_len, &mut connected);
-
-        let newly = std::mem::take(&mut connected);
-        for connected in newly {
-            let peer = connected.representative_peer;
-            let group = peers
-                .logical_peer(&connected.logical_peer)
-                .and_then(|logical| logical.group_affinity());
-            let Some(srt_transport::RemovedLogicalPeer::Direct(entry)) =
-                peers.remove(connected.logical_peer)
-            else {
-                continue;
-            };
-            // Unlike #4, the router is consulted for *every* connection:
-            // routing each one to a worker is the whole strategy, not a
-            // bond-affinity special case.
-            let owner = match router.lock() {
-                Ok(mut router) => {
-                    router.assign(peer, group, srt_lifecycle::RoutingMode::LeastTuples)
-                }
-                Err(_) => 0,
-            };
-            let Ok(socket) = srt_transport::bind_reuseport(cfg.port, cfg.sock_buf_bytes) else {
-                continue;
-            };
-            if socket.connect(peer).is_err() {
-                continue;
-            }
-            let message = WorkerMessage::Handoff(Box::new(srt_transport::Handoff {
-                socket,
-                conn: entry.connection,
-            }));
-            if senders[owner].send(message).is_ok() {
-                telemetry.record_handoff();
-                routed += 1;
-            }
-        }
+        flush_single_outbound(&listener, &mut outbound).await;
+        route_connected_peers(
+            &context,
+            stream_len,
+            &mut peers,
+            &mut connected,
+            &mut routed,
+        );
     }
 
     // Tell each worker its final tally so it can stop waiting rather than
