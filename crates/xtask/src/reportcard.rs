@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -8,15 +8,12 @@ use std::process::{Command, ExitCode};
 use serde_json::{Value, json};
 
 const ANALYZER_VERSION: &str = "0.0.25";
-const BASELINE_FILE: &str = "reportcard.json";
+const LIMITS_FILE: &str = "reportcard.json";
 const REPORT_DIR: &str = "target/reportcard";
-const DEFAULT_NEW_CYCLOMATIC: u64 = 20;
-const DEFAULT_NEW_COGNITIVE: u64 = 15;
 
 #[derive(Clone, Debug)]
 struct FunctionMetric {
     key: String,
-    legacy_key: String,
     name: String,
     path: String,
     start_line: usize,
@@ -36,19 +33,10 @@ struct Summary {
     units: Vec<FunctionMetric>,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct BaselineMetric {
-    cyclomatic: u64,
-    cognitive: u64,
-}
-
 #[derive(Clone, Debug)]
 struct Limits {
-    new_cyclomatic: u64,
-    new_cognitive: u64,
-    legacy_cyclomatic: u64,
-    legacy_cognitive: u64,
-    functions: BTreeMap<String, BaselineMetric>,
+    max_cyclomatic: u64,
+    max_cognitive: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -63,42 +51,28 @@ struct Violation {
 }
 
 pub(crate) fn run(args: &[String]) -> ExitCode {
-    let write_baseline_requested = match parse_args(args) {
-        Ok(value) => value,
-        Err(message) => {
-            eprintln!("reportcard: {message}");
-            eprintln!("usage: cargo xtask reportcard [--write-baseline]");
-            return ExitCode::FAILURE;
-        }
-    };
+    if let Err(message) = parse_args(args) {
+        eprintln!("reportcard: {message}");
+        eprintln!("usage: cargo xtask reportcard");
+        return ExitCode::FAILURE;
+    }
     let root = match env::current_dir() {
         Ok(path) => path,
         Err(error) => return fail("find repository root", error),
     };
     let summary = match analyze_sources(&root) {
         Ok(summary) => summary,
-        Err(error) => return fail("analyze Rust sources", error),
-    };
-    let mut limits = if write_baseline_requested {
-        load_limits(&root).unwrap_or_else(|_| default_limits())
-    } else {
-        match load_limits(&root) {
-            Ok(limits) => limits,
-            Err(error) => return fail("read reportcard.json", error),
+        Err(message) => {
+            return fail("analyze Rust sources", message);
         }
     };
-
-    if write_baseline_requested {
-        limits.legacy_cyclomatic = max_cyclomatic(&summary);
-        limits.legacy_cognitive = max_cognitive(&summary);
-        limits.functions = current_baseline(&summary);
-        if let Err(error) = write_baseline(&root, &limits, &summary) {
-            return fail("write reportcard.json", error);
-        }
-    }
+    let limits = match load_limits(&root) {
+        Ok(limits) => limits,
+        Err(error) => return fail("read reportcard.json", error),
+    };
 
     let violations = check_limits(&summary, &limits);
-    let markdown = render_markdown(&summary, &limits, &violations, write_baseline_requested);
+    let markdown = render_markdown(&summary, &limits, &violations);
     if let Err(error) = write_reports(&root, &summary, &limits, &violations, &markdown) {
         return fail("write reportcard artifacts", error);
     }
@@ -111,30 +85,16 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
     }
 }
 
-fn parse_args(args: &[String]) -> Result<bool, String> {
-    let mut write_baseline = false;
-    for arg in args {
-        match arg.as_str() {
-            "--write-baseline" => write_baseline = true,
-            other => return Err(format!("unknown argument {other:?}")),
-        }
+fn parse_args(args: &[String]) -> Result<(), String> {
+    if let Some(arg) = args.first() {
+        return Err(format!("unknown argument {arg:?}"));
     }
-    Ok(write_baseline)
+    Ok(())
 }
 
 fn fail(action: &str, error: impl std::fmt::Display) -> ExitCode {
     eprintln!("reportcard: could not {action}: {error}");
     ExitCode::FAILURE
-}
-
-fn default_limits() -> Limits {
-    Limits {
-        new_cyclomatic: DEFAULT_NEW_CYCLOMATIC,
-        new_cognitive: DEFAULT_NEW_COGNITIVE,
-        legacy_cyclomatic: 0,
-        legacy_cognitive: 0,
-        functions: BTreeMap::new(),
-    }
 }
 
 fn analyze_sources(root: &Path) -> io::Result<Summary> {
@@ -193,7 +153,7 @@ fn analyze_file(path: &Path, summary: &mut Summary) -> io::Result<()> {
     summary.files += 1;
     summary.sloc += metric_value(&value, "loc", "sloc");
     let mut scope_ordinals = HashMap::new();
-    let mut legacy_ordinals = HashMap::new();
+    let mut function_ordinals = HashMap::new();
     if let Some(children) = value.get("spaces").and_then(Value::as_array) {
         for child in children {
             collect_functions(
@@ -201,7 +161,7 @@ fn analyze_file(path: &Path, summary: &mut Summary) -> io::Result<()> {
                 relative,
                 None,
                 &mut scope_ordinals,
-                &mut legacy_ordinals,
+                &mut function_ordinals,
                 summary,
             );
         }
@@ -270,21 +230,20 @@ fn collect_functions(
     path: &str,
     parent_key: Option<&str>,
     scope_ordinals: &mut HashMap<String, usize>,
-    legacy_ordinals: &mut HashMap<String, usize>,
+    function_ordinals: &mut HashMap<String, usize>,
     summary: &mut Summary,
 ) {
-    let key = build_function_metric(space, path, parent_key, scope_ordinals, legacy_ordinals).map(
-        |metric| {
+    let key = build_function_metric(space, path, parent_key, scope_ordinals, function_ordinals)
+        .map(|metric| {
             let key = metric.key.clone();
             record_function(summary, metric);
             key
-        },
-    );
+        });
     collect_children(
         space,
         path,
         key.as_deref().or(parent_key),
-        legacy_ordinals,
+        function_ordinals,
         summary,
     );
 }
@@ -294,7 +253,7 @@ fn build_function_metric(
     path: &str,
     parent_key: Option<&str>,
     scope_ordinals: &mut HashMap<String, usize>,
-    legacy_ordinals: &mut HashMap<String, usize>,
+    function_ordinals: &mut HashMap<String, usize>,
 ) -> Option<FunctionMetric> {
     if space.get("kind").and_then(Value::as_str) != Some("function") {
         return None;
@@ -304,22 +263,21 @@ fn build_function_metric(
         .and_then(Value::as_str)
         .unwrap_or("<unnamed>")
         .to_string();
-    let ordinal = scope_ordinals.entry(name.clone()).or_default();
-    let legacy_ordinal = legacy_ordinals.entry(name.clone()).or_default();
-    let legacy_key = format!("{path}::{name}#{legacy_ordinal}");
+    let scope_ordinal = scope_ordinals.entry(name.clone()).or_default();
+    let function_ordinal = function_ordinals.entry(name.clone()).or_default();
+    let key = format!("{path}::{name}#{function_ordinal}");
     let key = if name == "<anonymous>" {
         parent_key.map_or_else(
-            || legacy_key.clone(),
-            |parent| format!("{parent}::<anonymous>#{ordinal}"),
+            || key.clone(),
+            |parent| format!("{parent}::<anonymous>#{scope_ordinal}"),
         )
     } else {
-        legacy_key.clone()
+        key
     };
-    *ordinal += 1;
-    *legacy_ordinal += 1;
+    *scope_ordinal += 1;
+    *function_ordinal += 1;
     Some(FunctionMetric {
         key,
-        legacy_key,
         name,
         path: path.to_string(),
         start_line: space
@@ -350,7 +308,7 @@ fn collect_children(
     space: &Value,
     path: &str,
     parent_key: Option<&str>,
-    legacy_ordinals: &mut HashMap<String, usize>,
+    function_ordinals: &mut HashMap<String, usize>,
     summary: &mut Summary,
 ) {
     let Some(children) = space.get("spaces").and_then(Value::as_array) else {
@@ -363,7 +321,7 @@ fn collect_children(
             path,
             parent_key,
             &mut scope_ordinals,
-            legacy_ordinals,
+            function_ordinals,
             summary,
         );
     }
@@ -399,24 +357,8 @@ fn max_cognitive(summary: &Summary) -> u64 {
         .unwrap_or_default()
 }
 
-fn current_baseline(summary: &Summary) -> BTreeMap<String, BaselineMetric> {
-    summary
-        .units
-        .iter()
-        .map(|unit| {
-            (
-                unit.key.clone(),
-                BaselineMetric {
-                    cyclomatic: unit.cyclomatic,
-                    cognitive: unit.cognitive,
-                },
-            )
-        })
-        .collect()
-}
-
 fn load_limits(root: &Path) -> io::Result<Limits> {
-    let path = root.join(BASELINE_FILE);
+    let path = root.join(LIMITS_FILE);
     let value: Value = serde_json::from_str(&fs::read_to_string(path)?)
         .map_err(|error| io::Error::other(format!("invalid reportcard JSON: {error}")))?;
     let enforce = value
@@ -429,147 +371,33 @@ fn load_limits(root: &Path) -> io::Result<Limits> {
             .and_then(Value::as_u64)
             .ok_or_else(|| io::Error::other(format!("enforce.{name} must be an integer")))
     };
-    let functions = value
-        .get("functions")
-        .and_then(Value::as_object)
-        .map(|entries| {
-            entries
-                .iter()
-                .filter_map(|(key, value)| {
-                    Some((
-                        key.clone(),
-                        BaselineMetric {
-                            cyclomatic: value.get("cyclomatic")?.as_u64()?,
-                            cognitive: value.get("cognitive")?.as_u64()?,
-                        },
-                    ))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
     Ok(Limits {
-        new_cyclomatic: required("new_function_max_cyclomatic")?,
-        new_cognitive: required("new_function_max_cognitive")?,
-        legacy_cyclomatic: required("legacy_max_cyclomatic")?,
-        legacy_cognitive: required("legacy_max_cognitive")?,
-        functions,
+        max_cyclomatic: required("max_cyclomatic")?,
+        max_cognitive: required("max_cognitive")?,
     })
-}
-
-fn write_baseline(root: &Path, limits: &Limits, summary: &Summary) -> io::Result<()> {
-    let functions = limits
-        .functions
-        .iter()
-        .map(|(key, metric)| {
-            (
-                key.clone(),
-                json!({
-                    "cyclomatic": metric.cyclomatic,
-                    "cognitive": metric.cognitive,
-                }),
-            )
-        })
-        .collect::<serde_json::Map<_, _>>();
-    let value = json!({
-        "version": 1,
-        "tool": {
-            "name": "rust-code-analysis",
-            "version": ANALYZER_VERSION,
-        },
-        "scope": "crates/*/src/**/*.rs",
-        "enforce": {
-            "new_function_max_cyclomatic": limits.new_cyclomatic,
-            "new_function_max_cognitive": limits.new_cognitive,
-            "legacy_max_cyclomatic": limits.legacy_cyclomatic,
-            "legacy_max_cognitive": limits.legacy_cognitive,
-        },
-        "baseline": {
-            "files": summary.files,
-            "named_functions": summary.named_functions,
-            "closures": summary.closures,
-            "sloc": summary.sloc,
-            "total_cyclomatic": summary.cyclomatic,
-            "total_cognitive": summary.cognitive,
-        },
-        "functions": functions,
-    });
-    fs::write(
-        root.join(BASELINE_FILE),
-        serde_json::to_vec_pretty(&value).expect("reportcard JSON is serializable"),
-    )
 }
 
 fn check_limits(summary: &Summary, limits: &Limits) -> Vec<Violation> {
     let mut violations = Vec::new();
     for unit in &summary.units {
-        if let Some(baseline) = baseline_for(limits, unit) {
-            check_metric(
-                &mut violations,
-                unit,
-                "cyclomatic",
-                unit.cyclomatic,
-                baseline.cyclomatic,
-                "legacy regression",
-            );
-            check_metric(
-                &mut violations,
-                unit,
-                "cognitive",
-                unit.cognitive,
-                baseline.cognitive,
-                "legacy regression",
-            );
-        } else {
-            check_metric(
-                &mut violations,
-                unit,
-                "cyclomatic",
-                unit.cyclomatic,
-                limits.new_cyclomatic,
-                "new function limit",
-            );
-            check_metric(
-                &mut violations,
-                unit,
-                "cognitive",
-                unit.cognitive,
-                limits.new_cognitive,
-                "new function limit",
-            );
-        }
-    }
-    if max_cyclomatic(summary) > limits.legacy_cyclomatic {
-        violations.push(Violation {
-            key: String::new(),
-            path: max_unit(summary, true).path.clone(),
-            line: max_unit(summary, true).start_line,
-            metric: "cyclomatic",
-            actual: max_cyclomatic(summary),
-            limit: limits.legacy_cyclomatic,
-            reason: "legacy maximum",
-        });
-    }
-    if max_cognitive(summary) > limits.legacy_cognitive {
-        violations.push(Violation {
-            key: String::new(),
-            path: max_unit(summary, false).path.clone(),
-            line: max_unit(summary, false).start_line,
-            metric: "cognitive",
-            actual: max_cognitive(summary),
-            limit: limits.legacy_cognitive,
-            reason: "legacy maximum",
-        });
+        check_metric(
+            &mut violations,
+            unit,
+            "cyclomatic",
+            unit.cyclomatic,
+            limits.max_cyclomatic,
+            "complexity limit",
+        );
+        check_metric(
+            &mut violations,
+            unit,
+            "cognitive",
+            unit.cognitive,
+            limits.max_cognitive,
+            "complexity limit",
+        );
     }
     violations
-}
-
-fn baseline_for<'a>(limits: &'a Limits, unit: &FunctionMetric) -> Option<&'a BaselineMetric> {
-    let stable = limits.functions.get(&unit.key);
-    if unit.name == "<anonymous>" {
-        stable
-    } else {
-        stable.or_else(|| limits.functions.get(&unit.legacy_key))
-    }
 }
 
 fn check_metric(
@@ -591,20 +419,6 @@ fn check_metric(
             reason,
         });
     }
-}
-
-fn max_unit(summary: &Summary, cyclomatic: bool) -> &FunctionMetric {
-    summary
-        .units
-        .iter()
-        .max_by_key(|unit| {
-            if cyclomatic {
-                unit.cyclomatic
-            } else {
-                unit.cognitive
-            }
-        })
-        .expect("analyzed source contains at least one function")
 }
 
 fn average(total: u64, count: usize) -> f64 {
@@ -632,59 +446,27 @@ fn percentile(summary: &Summary, cognitive: bool, percentile: f64) -> u64 {
     values[index]
 }
 
-fn render_markdown(
-    summary: &Summary,
-    limits: &Limits,
-    violations: &[Violation],
-    wrote_baseline: bool,
-) -> String {
+fn render_markdown(summary: &Summary, limits: &Limits, violations: &[Violation]) -> String {
     let units = summary.units.len();
     let status = if violations.is_empty() {
         "PASS"
     } else {
         "FAIL"
     };
-    let mut output = format!(
-        "# srt-rs report card\n\nStatus: **{status}**{}\n\n",
-        if wrote_baseline {
-            " (baseline updated)"
-        } else {
-            ""
-        }
-    );
+    let mut output = format!("# srt-rs report card\n\nStatus: **{status}**\n\n");
     output.push_str("Scope: `crates/*/src/**/*.rs` (inline test modules included)\n\n");
     output.push_str("| Gate | Current | Limit | Result |\n|---|---:|---:|:---:|\n");
     output.push_str(&format!(
-        "| New-function cyclomatic | {} | {} | {} |\n",
-        new_max(summary, limits, false),
-        limits.new_cyclomatic,
-        gate_for_new(summary, limits, false),
-    ));
-    output.push_str(&format!(
-        "| New-function cognitive | {} | {} | {} |\n",
-        new_max(summary, limits, true),
-        limits.new_cognitive,
-        gate_for_new(summary, limits, true),
-    ));
-    output.push_str(&format!(
-        "| Legacy cyclomatic maximum | {} | {} | {} |\n",
+        "| Cyclomatic complexity | {} | {} | {} |\n",
         max_cyclomatic(summary),
-        limits.legacy_cyclomatic,
-        if max_cyclomatic(summary) <= limits.legacy_cyclomatic {
-            "PASS"
-        } else {
-            "FAIL"
-        },
+        limits.max_cyclomatic,
+        gate_for(summary, limits, false),
     ));
     output.push_str(&format!(
-        "| Legacy cognitive maximum | {} | {} | {} |\n",
+        "| Cognitive complexity | {} | {} | {} |\n",
         max_cognitive(summary),
-        limits.legacy_cognitive,
-        if max_cognitive(summary) <= limits.legacy_cognitive {
-            "PASS"
-        } else {
-            "FAIL"
-        },
+        limits.max_cognitive,
+        gate_for(summary, limits, true),
     ));
     output.push_str(&format!(
         "\nFunctions: {} named + {} closures · SLOC: {}\n\n",
@@ -727,34 +509,14 @@ fn render_markdown(
     output
 }
 
-fn new_max(summary: &Summary, limits: &Limits, cognitive: bool) -> String {
-    let value = summary
-        .units
-        .iter()
-        .filter(|unit| baseline_for(limits, unit).is_none())
-        .map(|unit| {
-            if cognitive {
-                unit.cognitive
-            } else {
-                unit.cyclomatic
-            }
-        })
-        .max();
-    value.map_or_else(|| "n/a".to_string(), |value| value.to_string())
-}
-
-fn gate_for_new(summary: &Summary, limits: &Limits, cognitive: bool) -> &'static str {
-    let passed = summary
-        .units
-        .iter()
-        .filter(|unit| baseline_for(limits, unit).is_none())
-        .all(|unit| {
-            if cognitive {
-                unit.cognitive <= limits.new_cognitive
-            } else {
-                unit.cyclomatic <= limits.new_cyclomatic
-            }
-        });
+fn gate_for(summary: &Summary, limits: &Limits, cognitive: bool) -> &'static str {
+    let passed = summary.units.iter().all(|unit| {
+        if cognitive {
+            unit.cognitive <= limits.max_cognitive
+        } else {
+            unit.cyclomatic <= limits.max_cyclomatic
+        }
+    });
     if passed { "PASS" } else { "FAIL" }
 }
 
@@ -788,10 +550,8 @@ fn write_reports(
             "max": max_cognitive(summary),
         },
         "limits": {
-            "new_function_max_cyclomatic": limits.new_cyclomatic,
-            "new_function_max_cognitive": limits.new_cognitive,
-            "legacy_max_cyclomatic": limits.legacy_cyclomatic,
-            "legacy_max_cognitive": limits.legacy_cognitive,
+            "max_cyclomatic": limits.max_cyclomatic,
+            "max_cognitive": limits.max_cognitive,
         },
         "violations": violations.iter().map(|violation| json!({
             "key": violation.key,

@@ -222,24 +222,17 @@ External tools (`typos-cli`, `cargo-deny`, `rust-code-analysis-cli`,
 auto-installed. If missing, xtask prints the exact `cargo install` command
 and fails.
 
-The report card stores its per-function baseline in
-[`reportcard.json`](reportcard.json). New functions must be at most CC 20 and
-cognitive complexity 15. Existing functions may not regress, and the highest
-legacy values may not increase. Totals, averages, and percentiles are reported
-for trend tracking only, so adding ordinary functions does not fail the gate.
-After an intentional complexity improvement, refresh the snapshot with:
-
-```sh
-cargo xtask reportcard --write-baseline
-```
+The report card applies the same absolute limit to every in-scope function:
+cyclomatic complexity 20 and cognitive complexity 15, configured in
+[`reportcard.json`](reportcard.json). Totals, averages, and percentiles are
+informational trend data; adding ordinary functions is fine when each function
+stays within the limits.
 
 ### Workspace lints
 
 Lint policy is centralized in the root `Cargo.toml` under
-`[workspace.lints]`. Cognitive complexity is gated at 15
-(`clippy.toml`); functions above threshold carry `#[expect(clippy::cognitive_complexity)]`
-which fires when the function is simplified below threshold, prompting
-annotation removal.
+`[workspace.lints]`. Clippy's cognitive-complexity lint is configured at 15 in
+`clippy.toml`, matching the report-card gate.
 
 ### Testing
 
