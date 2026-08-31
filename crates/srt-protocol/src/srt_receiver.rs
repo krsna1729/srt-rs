@@ -1664,7 +1664,11 @@ impl ReceiverBuffer {
     }
 
     pub(crate) fn record_nak_sent(&mut self) {
-        self.total_naks_sent = self.total_naks_sent.saturating_add(1);
+        self.record_naks_sent(1);
+    }
+
+    pub(crate) fn record_naks_sent(&mut self, count: u32) {
+        self.total_naks_sent = self.total_naks_sent.saturating_add(u64::from(count));
     }
 
     pub(crate) fn record_undecryptable(&mut self) {

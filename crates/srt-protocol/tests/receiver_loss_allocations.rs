@@ -1,6 +1,9 @@
 //! Allocation regression coverage for receiver hot paths.
 
-use shiguredo_srt::{DataPacket, PacketPosition, ReceiverBuffer, Timestamp};
+use shiguredo_srt::{
+    ConnectionOptions, ConnectionOutput, ConnectionState, DataPacket, PacketPosition,
+    ReceiverBuffer, SrtConnection, SrtPacket, TimerId, Timestamp,
+};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::sync::Mutex;
@@ -9,6 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 struct CountingAllocator;
 
 static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+static ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
 static ALLOCATION_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 thread_local! {
@@ -21,6 +25,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
         COUNT_ALLOCATIONS.with(|enabled| {
             if enabled.get() {
                 ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+                ALLOCATED_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
             }
         });
         // SAFETY: `layout` is supplied by the allocator caller.
@@ -110,11 +115,19 @@ fn persistent_old_hole(packet_count: u32) {
 }
 
 fn count_allocations(run: impl FnOnce()) -> u64 {
+    count_allocation_footprint(run).0
+}
+
+fn count_allocation_footprint(run: impl FnOnce()) -> (u64, u64) {
     ALLOCATIONS.store(0, Ordering::Relaxed);
+    ALLOCATED_BYTES.store(0, Ordering::Relaxed);
     COUNT_ALLOCATIONS.with(|enabled| enabled.set(true));
     run();
     COUNT_ALLOCATIONS.with(|enabled| enabled.set(false));
-    ALLOCATIONS.load(Ordering::Relaxed)
+    (
+        ALLOCATIONS.load(Ordering::Relaxed),
+        ALLOCATED_BYTES.load(Ordering::Relaxed),
+    )
 }
 
 #[test]
@@ -203,4 +216,100 @@ fn link_capacity_calculation_is_allocation_free_after_warmup() {
     });
     eprintln!("1,000 full ACK link-capacity calculations: {allocations}");
     assert_eq!(allocations, 0);
+}
+
+fn drain_connection_packets(connection: &mut SrtConnection) -> Vec<Vec<u8>> {
+    let mut packets = Vec::new();
+    while let Some(output) = connection.poll_output() {
+        if let ConnectionOutput::SendPacket(packet) = output {
+            packets.push(packet);
+        }
+    }
+    packets
+}
+
+fn transfer_connection_packets(from: &mut SrtConnection, to: &mut SrtConnection, now: Timestamp) {
+    for packet in drain_connection_packets(from) {
+        to.feed_recv_buf(&packet, now).expect("handshake packet");
+    }
+}
+
+fn default_window_alternating_loss_connection() -> SrtConnection {
+    const WINDOW: u32 = 8_192;
+    let options = ConnectionOptions {
+        initial_seq: Some(0),
+        tsbpd_delay: 0,
+        flow_window_packets: WINDOW,
+        receive_buffer_packets: WINDOW,
+        ..ConnectionOptions::default()
+    };
+    let mut caller = SrtConnection::new_caller(options.clone());
+    let mut listener = SrtConnection::new_listener(options);
+    caller.connect(Timestamp::default()).expect("connect");
+    for round in 0..8 {
+        let now = timestamp(round * 1_000);
+        transfer_connection_packets(&mut caller, &mut listener, now);
+        transfer_connection_packets(&mut listener, &mut caller, now);
+        if caller.state() == ConnectionState::Connected
+            && listener.state() == ConnectionState::Connected
+        {
+            break;
+        }
+    }
+    assert_eq!(listener.state(), ConnectionState::Connected);
+
+    let now = timestamp(10_000);
+    caller.send(&[], now).expect("template send");
+    let mut packet = match SrtPacket::decode(&drain_connection_packets(&mut caller)[0])
+        .expect("template packet")
+    {
+        SrtPacket::Data(packet) => packet,
+        SrtPacket::Control(_) => unreachable!("send emits data"),
+    };
+    packet.sequence_number = WINDOW - 1;
+    let mut encoded = Vec::new();
+    SrtPacket::Data(packet.clone()).encode(&mut encoded);
+    listener
+        .feed_recv_buf(&encoded, now)
+        .expect("expose loss window");
+    for sequence_number in (1..WINDOW - 1).step_by(2) {
+        packet.sequence_number = sequence_number;
+        encoded.clear();
+        SrtPacket::Data(packet.clone()).encode(&mut encoded);
+        listener
+            .feed_recv_buf(&encoded, now)
+            .expect("recover odd packet");
+    }
+    drain_connection_packets(&mut listener);
+    listener
+}
+
+#[test]
+fn periodic_nak_chunking_has_bounded_temporary_allocations() {
+    let _guard = ALLOCATION_TEST_LOCK.lock().expect("allocation test lock");
+    let mut listener = default_window_alternating_loss_connection();
+    let mut wire_packets = 0;
+    let mut wire_bytes = 0;
+    let (allocations, allocated_bytes) = count_allocation_footprint(|| {
+        listener
+            .handle_timer(TimerId::Nak, timestamp(20_000))
+            .expect("NAK timer");
+        while let Some(output) = listener.poll_output() {
+            if let ConnectionOutput::SendPacket(packet) = output {
+                wire_packets += 1;
+                wire_bytes += packet.len();
+            }
+        }
+    });
+
+    eprintln!(
+        "default alternating NAK: {allocations} allocations, {allocated_bytes} allocated bytes, {wire_packets} packets, {wire_bytes} wire bytes"
+    );
+    assert_eq!(wire_packets, 12);
+    assert_eq!(wire_bytes, 16_576);
+    assert!(allocations <= 50, "temporary allocations: {allocations}");
+    assert!(
+        allocated_bytes <= 50_000,
+        "temporary allocated bytes: {allocated_bytes}"
+    );
 }

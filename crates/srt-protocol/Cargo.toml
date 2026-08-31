@@ -98,5 +98,9 @@ harness = false
 name = "sender_ack"
 harness = false
 
+[[bench]]
+name = "nak_chunking"
+harness = false
+
 [lints]
 workspace = true
