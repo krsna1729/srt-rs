@@ -62,36 +62,7 @@ impl Cli {
         while i < args.len() {
             let tok = &args[i];
             if let Some(flag) = tok.strip_prefix("--") {
-                if let Some((f, v)) = flag.split_once('=') {
-                    if f == "axis" {
-                        cli.repeated
-                            .entry(f.to_string())
-                            .or_default()
-                            .push(v.to_string());
-                    } else {
-                        cli.flags.insert(f.to_string(), v.to_string());
-                    }
-                } else {
-                    // A flag owns its following non-flag token. In
-                    // particular, `--ingress shared-pool=1` is documented
-                    // and the value's `=` must not turn it into a separate
-                    // key/value argument.
-                    let value = match args.get(i + 1) {
-                        Some(next) if !next.starts_with("--") => {
-                            i += 1;
-                            next.clone()
-                        }
-                        _ => String::new(),
-                    };
-                    if flag == "axis" {
-                        cli.repeated
-                            .entry(flag.to_string())
-                            .or_default()
-                            .push(value);
-                    } else {
-                        cli.flags.insert(flag.to_string(), value);
-                    }
-                }
+                Self::parse_long_flag(&mut cli, args, &mut i, flag);
             } else if let Some((f, v)) = tok.split_once('=') {
                 cli.flags.insert(f.to_string(), v.to_string());
             } else {
@@ -100,6 +71,36 @@ impl Cli {
             i += 1;
         }
         cli
+    }
+
+    fn parse_long_flag(cli: &mut Self, args: &[String], index: &mut usize, flag: &str) {
+        if let Some((name, value)) = flag.split_once('=') {
+            cli.insert_flag(name, value.to_string());
+            return;
+        }
+
+        // A flag owns its following non-flag token. In particular,
+        // `--ingress shared-pool=1` is documented and the value's `=` must
+        // not turn it into a separate key/value argument.
+        let value = match args.get(*index + 1) {
+            Some(next) if !next.starts_with("--") => {
+                *index += 1;
+                next.clone()
+            }
+            _ => String::new(),
+        };
+        cli.insert_flag(flag, value);
+    }
+
+    fn insert_flag(&mut self, flag: &str, value: String) {
+        if flag == "axis" {
+            self.repeated
+                .entry(flag.to_string())
+                .or_default()
+                .push(value);
+        } else {
+            self.flags.insert(flag.to_string(), value);
+        }
     }
 
     /// Value of `--connections N` (default 1).
