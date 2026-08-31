@@ -1121,17 +1121,39 @@ impl TransportConfig {
     ) -> Result<ResolvedTransportConfig, ConfigError> {
         validate_output_budget(self.output_drain)?;
         let workers = self.workers.resolve(capabilities.available_parallelism);
-        let topology = match self.topology {
+        let topology = self.resolve_topology(capabilities, workers)?;
+        let shared_listener = !matches!(topology, ResolvedListenerTopology::PerPort);
+        let batch_size = self.resolve_batch_size(shared_listener, capabilities)?;
+        let promotion = self.promotion.resolve(topology);
+        let socket_buffer_bytes = self.resolve_socket_buffer(shared_listener)?;
+        Ok(ResolvedTransportConfig {
+            topology,
+            workers,
+            batch_size,
+            promotion,
+            socket_buffer_bytes,
+            output_drain: self.output_drain,
+        })
+    }
+
+    fn resolve_topology(
+        &self,
+        capabilities: TransportCapabilities,
+        workers: NonZeroUsize,
+    ) -> Result<ResolvedListenerTopology, ConfigError> {
+        match self.topology {
             ListenerTopology::Auto if capabilities.reuse_port && workers.get() > 1 => {
-                ResolvedListenerTopology::ReusePortMulti { acceptors: workers }
+                Ok(ResolvedListenerTopology::ReusePortMulti { acceptors: workers })
             }
-            ListenerTopology::Auto => ResolvedListenerTopology::SharedPool {
+            ListenerTopology::Auto => Ok(ResolvedListenerTopology::SharedPool {
                 listeners: NonZeroUsize::MIN,
-            },
-            ListenerTopology::PerPort => ResolvedListenerTopology::PerPort,
-            ListenerTopology::SharedPool { listeners } => ResolvedListenerTopology::SharedPool {
-                listeners: listeners.resolve(capabilities.available_parallelism),
-            },
+            }),
+            ListenerTopology::PerPort => Ok(ResolvedListenerTopology::PerPort),
+            ListenerTopology::SharedPool { listeners } => {
+                Ok(ResolvedListenerTopology::SharedPool {
+                    listeners: listeners.resolve(capabilities.available_parallelism),
+                })
+            }
             ListenerTopology::ReusePortMulti { acceptors } => {
                 if !capabilities.reuse_port {
                     return Err(ConfigError::new(
@@ -1139,9 +1161,9 @@ impl TransportConfig {
                         "ReusePortMulti is unsupported by this adapter/platform",
                     ));
                 }
-                ResolvedListenerTopology::ReusePortMulti {
+                Ok(ResolvedListenerTopology::ReusePortMulti {
                     acceptors: acceptors.resolve(capabilities.available_parallelism),
-                }
+                })
             }
             ListenerTopology::ReusePortSingle { workers } => {
                 if !capabilities.reuse_port {
@@ -1150,36 +1172,41 @@ impl TransportConfig {
                         "ReusePortSingle is unsupported by this adapter/platform",
                     ));
                 }
-                ResolvedListenerTopology::ReusePortSingle {
+                Ok(ResolvedListenerTopology::ReusePortSingle {
                     workers: workers.resolve(capabilities.available_parallelism),
-                }
+                })
             }
-        };
-        let shared_listener = !matches!(topology, ResolvedListenerTopology::PerPort);
-        let batch_size = match self.batching {
+        }
+    }
+
+    fn resolve_batch_size(
+        &self,
+        shared_listener: bool,
+        capabilities: TransportCapabilities,
+    ) -> Result<Option<NonZeroUsize>, ConfigError> {
+        match self.batching {
             BatchingPolicy::Auto if shared_listener && capabilities.receive_batching => {
-                NonZeroUsize::new(DEFAULT_BATCH_SIZE)
+                Ok(NonZeroUsize::new(DEFAULT_BATCH_SIZE))
             }
-            BatchingPolicy::Auto | BatchingPolicy::Disabled => None,
-            BatchingPolicy::MaxDatagrams(_) if !shared_listener => {
-                return Err(ConfigError::new(
-                    "transport.batching",
-                    "receive batching requires a shared-listener topology",
-                ));
-            }
+            BatchingPolicy::Auto | BatchingPolicy::Disabled => Ok(None),
+            BatchingPolicy::MaxDatagrams(_) if !shared_listener => Err(ConfigError::new(
+                "transport.batching",
+                "receive batching requires a shared-listener topology",
+            )),
             BatchingPolicy::MaxDatagrams(_) if !capabilities.receive_batching => {
-                return Err(ConfigError::new(
+                Err(ConfigError::new(
                     "transport.batching",
                     "the selected runtime adapter has no batched receive implementation",
-                ));
+                ))
             }
-            BatchingPolicy::MaxDatagrams(count) => Some(count),
-        };
+            BatchingPolicy::MaxDatagrams(count) => Ok(Some(count)),
+        }
+    }
+
+    fn resolve_socket_buffer(&self, shared_listener: bool) -> Result<usize, ConfigError> {
         // Explicit `All` stays valid on a runtime without a task scheduler
         // (mio): promotion still yields connected sockets there, so it is
-        // deliberately not rejected. Previously written as an `if` with an
-        // empty body, which reads like an unfinished branch.
-        let promotion = self.promotion.resolve(topology);
+        // deliberately not rejected.
         let socket_buffer_bytes = match self.socket_buffers {
             SocketBufferConfig::SystemDefault => 0,
             SocketBufferConfig::Bytes(bytes) => bytes.get(),
@@ -1192,14 +1219,7 @@ impl TransportConfig {
                 "exceeds the OS socket-option range",
             ));
         }
-        Ok(ResolvedTransportConfig {
-            topology,
-            workers,
-            batch_size,
-            promotion,
-            socket_buffer_bytes,
-            output_drain: self.output_drain,
-        })
+        Ok(socket_buffer_bytes)
     }
 }
 
