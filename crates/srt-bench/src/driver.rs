@@ -16,6 +16,79 @@ pub struct DriverResult {
     pub received_payloads: Vec<Bytes>,
 }
 
+fn receive_packet(
+    conn: &mut SrtConnection,
+    socket: &UdpSocket,
+    buffer: &mut [u8; 2048],
+    timestamp: Timestamp,
+    events: &mut Vec<String>,
+) -> bool {
+    match socket.recv(buffer) {
+        Ok(size) => {
+            if let Err(error) = conn.feed_recv_buf(&buffer[..size], timestamp) {
+                events.push(format!("feed_recv_buf error: {error}"));
+            }
+            true
+        }
+        Err(error)
+            if error.kind() == std::io::ErrorKind::WouldBlock
+                || error.kind() == std::io::ErrorKind::TimedOut =>
+        {
+            true
+        }
+        Err(error) => {
+            events.push(format!("recv error: {error}"));
+            false
+        }
+    }
+}
+
+fn fire_due_timers(
+    conn: &mut SrtConnection,
+    socket_timers: &mut HashMap<TimerId, Timestamp>,
+    timestamp: Timestamp,
+    events: &mut Vec<String>,
+) {
+    let due: Vec<TimerId> = socket_timers
+        .iter()
+        .filter(|(_, deadline)| timestamp.as_micros() >= deadline.as_micros())
+        .map(|(id, _)| *id)
+        .collect();
+    for id in due {
+        socket_timers.remove(&id);
+        if let Err(error) = conn.handle_timer(id, timestamp) {
+            events.push(format!("handle_timer({id:?}) error: {error}"));
+        }
+    }
+}
+
+fn record_events(
+    conn: &mut SrtConnection,
+    connected: &mut bool,
+    events: &mut Vec<String>,
+    received_payloads: &mut Vec<Bytes>,
+) {
+    while let Some(event) = conn.poll_event() {
+        match event {
+            ConnectionEvent::Connected => {
+                *connected = true;
+                events.push("Connected".to_string());
+            }
+            ConnectionEvent::DataReceived { payload, .. } => {
+                events.push(format!("DataReceived({} bytes)", payload.len()));
+                received_payloads.push(payload);
+            }
+            ConnectionEvent::Disconnected { reason } => {
+                events.push(format!("Disconnected: {reason}"));
+            }
+            ConnectionEvent::Error(message) => {
+                events.push(format!("Error: {message}"));
+            }
+            other => events.push(format!("{other:?}")),
+        }
+    }
+}
+
 /// Drive `conn` against `socket` until `Connected`, a fatal error/disconnect,
 /// or `deadline` elapses. `on_connect`, if given, runs once right after
 /// entering `Connected` (e.g. to send a payload). After connecting, the
@@ -52,56 +125,15 @@ pub fn run(
             break;
         }
 
-        match socket.recv(&mut buf) {
-            Ok(n) => {
-                let t = now(start);
-                if let Err(e) = conn.feed_recv_buf(&buf[..n], t) {
-                    events.push(format!("feed_recv_buf error: {e}"));
-                }
-            }
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(e) => {
-                events.push(format!("recv error: {e}"));
-                break;
-            }
+        if !receive_packet(conn, socket, &mut buf, now(start), &mut events) {
+            break;
         }
 
         let t = now(start);
-        let due: Vec<TimerId> = timers
-            .iter()
-            .filter(|(_, deadline)| t.as_micros() >= deadline.as_micros())
-            .map(|(id, _)| *id)
-            .collect();
-        for id in due {
-            timers.remove(&id);
-            if let Err(e) = conn.handle_timer(id, t) {
-                events.push(format!("handle_timer({id:?}) error: {e}"));
-            }
-        }
+        fire_due_timers(conn, &mut timers, t, &mut events);
 
         drain_outputs(conn, socket, &mut timers, t);
-
-        while let Some(ev) = conn.poll_event() {
-            match ev {
-                ConnectionEvent::Connected => {
-                    connected = true;
-                    events.push("Connected".to_string());
-                }
-                ConnectionEvent::DataReceived { payload, .. } => {
-                    events.push(format!("DataReceived({} bytes)", payload.len()));
-                    received_payloads.push(payload);
-                }
-                ConnectionEvent::Disconnected { reason } => {
-                    events.push(format!("Disconnected: {reason}"));
-                }
-                ConnectionEvent::Error(msg) => {
-                    events.push(format!("Error: {msg}"));
-                }
-                other => events.push(format!("{other:?}")),
-            }
-        }
+        record_events(conn, &mut connected, &mut events, &mut received_payloads);
 
         if connected && !connect_action_done {
             connect_action_done = true;
