@@ -2463,10 +2463,13 @@ pub fn run_sysprof(cli: &crate::Cli) -> std::io::Result<()> {
 #[cfg(test)]
 mod matrix_filter_tests {
     use super::{
-        Axis, Cell, Scope, axis_overrides, filter_matrix_cells, filter_reason,
-        filtered_cartesian_cells, interleave_indices, read_results, shuffle,
+        Axis, COLUMNS, Cell, MatrixOrder, Record, Scope, axis_overrides, build_matrix_schedule,
+        cell_key, filter_matrix_cells, filter_reason, filtered_cartesian_cells, interleave_indices,
+        matrix_cell_argv, matrix_cell_config, read_results, record_key, recorded_as,
+        resolve_matrix_axes, shuffle,
     };
     use crate::Cli;
+    use std::path::PathBuf;
 
     fn cli(args: &[&str]) -> Cli {
         let args = std::iter::once("srt-bench")
@@ -2509,6 +2512,69 @@ mod matrix_filter_tests {
             .iter()
             .map(|(name, value)| (*name, Scope::Both, (*value).to_string()))
             .collect()
+    }
+
+    fn temp_tsv(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "srt-bench-{name}-{}-{}.tsv",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn set_field(fields: &mut [(String, String)], key: &str, value: impl Into<String>) {
+        let (_, slot) = fields
+            .iter_mut()
+            .find(|(field, _)| field == key)
+            .unwrap_or_else(|| panic!("unknown result column {key}"));
+        *slot = value.into();
+    }
+
+    fn record_for(cell: &Cell<'_>, role: &str, rep: usize) -> Record {
+        let mut fields = COLUMNS
+            .iter()
+            .map(|column| ((*column).to_string(), String::new()))
+            .collect::<Vec<_>>();
+        set_field(&mut fields, "role", role);
+        set_field(&mut fields, "rep", rep.to_string());
+        for (axis, scope, value) in cell {
+            let (column, value) = recorded_as(axis, value);
+            set_field(&mut fields, &format!("{}{column}", scope.prefix()), value);
+        }
+        Record { fields }
+    }
+
+    fn write_records(path: &std::path::Path, records: &[Record]) {
+        let mut text = format!("{}\n", COLUMNS.join("\t"));
+        for record in records {
+            text.push_str(
+                &COLUMNS
+                    .iter()
+                    .map(|column| record.get(column).unwrap_or_default())
+                    .collect::<Vec<_>>()
+                    .join("\t"),
+            );
+            text.push('\n');
+        }
+        std::fs::write(path, text).unwrap();
+    }
+
+    fn schedule_cells() -> Vec<Cell<'static>> {
+        vec![
+            cell(&[
+                ("runtime", "mio"),
+                ("connections", "1"),
+                ("link-delay", "off"),
+            ]),
+            cell(&[
+                ("runtime", "tokio"),
+                ("connections", "2"),
+                ("link-delay", "off"),
+            ]),
+        ]
     }
 
     #[test]
@@ -2885,6 +2951,140 @@ mod matrix_filter_tests {
         let error = read_results(&path).unwrap_err();
         std::fs::remove_file(&path).unwrap();
         assert!(error.to_string().contains("malformed TSV row"));
+    }
+
+    #[test]
+    fn matrix_schedule_covers_each_cell_and_rep_once() {
+        let cells = schedule_cells();
+        let path = temp_tsv("schedule");
+
+        let default =
+            build_matrix_schedule(&cells, &[], 2, MatrixOrder::Default, 0, &path).unwrap();
+        assert_eq!(default.total, 4);
+        assert_eq!(default.runs, [(0, 1), (0, 2), (1, 1), (1, 2)]);
+        assert!(default.done.is_empty());
+
+        let axes = vec![(
+            "runtime",
+            Scope::Both,
+            ["mio", "tokio"].into_iter().map(str::to_string).collect(),
+        )];
+        let interleaved =
+            build_matrix_schedule(&cells, &axes, 2, MatrixOrder::Interleaved, 0, &path).unwrap();
+        let expected = [(0, 1), (0, 2), (1, 1), (1, 2)]
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(interleaved.runs.len(), expected.len());
+        assert_eq!(
+            interleaved
+                .runs
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>(),
+            expected
+        );
+
+        let random_a =
+            build_matrix_schedule(&cells, &axes, 2, MatrixOrder::Random, 7, &path).unwrap();
+        let random_b =
+            build_matrix_schedule(&cells, &axes, 2, MatrixOrder::Random, 7, &path).unwrap();
+        assert_eq!(random_a.runs, random_b.runs);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn matrix_resume_requires_both_roles_and_round_trips_cell_identity() {
+        let cells = schedule_cells();
+        let path = temp_tsv("resume");
+        let listener = record_for(&cells[0], "listener", 1);
+        let caller = record_for(&cells[0], "caller", 1);
+        assert_eq!(
+            record_key(&listener, &cells[0], 1),
+            Some(cell_key(&cells[0], 1))
+        );
+        write_records(&path, &[listener, caller]);
+
+        let schedule =
+            build_matrix_schedule(&cells, &[], 2, MatrixOrder::Default, 0, &path).unwrap();
+        assert!(schedule.done.contains(&cell_key(&cells[0], 1)));
+        assert!(!schedule.done.contains(&cell_key(&cells[0], 2)));
+        assert!(!schedule.done.contains(&cell_key(&cells[1], 1)));
+
+        let orphan_path = temp_tsv("resume-orphan");
+        write_records(&orphan_path, &[record_for(&cells[0], "caller", 1)]);
+        let orphaned =
+            build_matrix_schedule(&cells, &[], 2, MatrixOrder::Default, 0, &orphan_path).unwrap();
+        assert!(orphaned.done.is_empty());
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(orphan_path);
+    }
+
+    #[test]
+    fn matrix_cell_config_and_argv_keep_role_split_explicit() {
+        let cell = vec![
+            ("runtime", Scope::Recv, "tokio".to_string()),
+            ("runtime", Scope::Send, "mio".to_string()),
+            ("ingress", Scope::Recv, "shared-pool:4".to_string()),
+            ("ingress", Scope::Send, "per-port".to_string()),
+            ("workers", Scope::Recv, "2".to_string()),
+            ("workers", Scope::Send, "3".to_string()),
+            ("connections", Scope::Both, "4".to_string()),
+            ("bitrate", Scope::Both, "1000000".to_string()),
+        ];
+        let config = matrix_cell_config(&cell);
+        assert_eq!(config.recv_ingress, "shared-pool:4");
+        assert_eq!(config.send_ingress, "per-port");
+        assert_eq!(config.recv_runtime, "tokio");
+        assert_eq!(config.send_runtime, "mio");
+        assert_eq!(config.bitrate, "1000000");
+        assert_eq!(config.ports_needed, 4);
+
+        assert_eq!(
+            matrix_cell_argv(&cell, Scope::Recv),
+            [
+                "--ingress=shared-pool:4",
+                "--workers=2",
+                "--connections=4",
+                "--recv-runtime=tokio",
+                "--send-runtime=mio",
+                "--recv-ingress=shared-pool:4",
+                "--send-ingress=per-port",
+                "--recv-workers=2",
+                "--send-workers=3",
+            ]
+        );
+    }
+
+    #[test]
+    fn matrix_plan_overrides_and_scopes_axes() {
+        let path = temp_tsv("plan");
+        std::fs::write(
+            &path,
+            "runtime=mio,tokio\n[recv]\nworkers=2,4\ncpus=0-1\n[send]\nworkers=3\ncpus=2-3\n",
+        )
+        .unwrap();
+        let plan_path = path.to_str().unwrap();
+        let config =
+            resolve_matrix_axes(&cli(&["--plan", plan_path, "--axis", "runtime=smol"])).unwrap();
+        assert_eq!(
+            config.axes[0],
+            ("runtime", Scope::Both, vec!["smol".to_string()])
+        );
+        assert_eq!(
+            config.axes[1],
+            (
+                "workers",
+                Scope::Recv,
+                vec!["2".to_string(), "4".to_string()]
+            )
+        );
+        assert_eq!(
+            config.axes[2],
+            ("workers", Scope::Send, vec!["3".to_string()])
+        );
+        assert_eq!(config.recv_cpus, "0-1");
+        assert_eq!(config.send_cpus, "2-3");
+        let _ = std::fs::remove_file(path);
     }
 }
 
