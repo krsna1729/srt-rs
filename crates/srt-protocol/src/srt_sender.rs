@@ -653,39 +653,7 @@ impl SenderBuffer {
                     if elapsed <= threshold {
                         break;
                     }
-                    let msg_num = entry.message_number;
-                    let msg_first_seq = seq;
-                    // Drop this packet and any remaining fragments of the same message.
-                    let mut msg_last_seq = seq;
-                    loop {
-                        if let Some(removed) = self.packets.remove(&seq) {
-                            self.total_dropped = self.total_dropped.saturating_add(1);
-                            self.total_bytes_dropped = self
-                                .total_bytes_dropped
-                                .saturating_add(removed.payload.len() as u64);
-                            dropped_seqs.push(seq);
-                            msg_last_seq = seq;
-                        }
-                        let next = seq.wrapping_add(1) & 0x7FFF_FFFF;
-                        if !sequence_less_than(next, self.next_seq) {
-                            seq = next;
-                            break;
-                        }
-                        match self.packets.get(&next) {
-                            Some(e) if e.message_number == msg_num => {
-                                seq = next;
-                            }
-                            _ => {
-                                seq = next;
-                                break;
-                            }
-                        }
-                    }
-                    messages.push(DroppedMessage {
-                        message_number: msg_num,
-                        first_seq: msg_first_seq,
-                        last_seq: msg_last_seq,
-                    });
+                    messages.push(self.drop_expired_message(&mut seq, &mut dropped_seqs));
                 }
                 None => {
                     seq = seq.wrapping_add(1) & 0x7FFF_FFFF;
@@ -700,6 +668,53 @@ impl SenderBuffer {
         self.loss_list.retain(|s| !dropped_seqs.contains(s));
 
         messages
+    }
+
+    fn drop_expired_message(
+        &mut self,
+        seq: &mut u32,
+        dropped_seqs: &mut Vec<u32>,
+    ) -> DroppedMessage {
+        let message_number = self
+            .packets
+            .get(seq)
+            .expect("expired message starts at a buffered packet")
+            .message_number;
+        let first_seq = *seq;
+        let mut last_seq = first_seq;
+
+        // Drop this packet and any remaining fragments of the same message.
+        loop {
+            if let Some(removed) = self.packets.remove(seq) {
+                self.total_dropped = self.total_dropped.saturating_add(1);
+                self.total_bytes_dropped = self
+                    .total_bytes_dropped
+                    .saturating_add(removed.payload.len() as u64);
+                dropped_seqs.push(*seq);
+                last_seq = *seq;
+            }
+            let next = seq.wrapping_add(1) & 0x7FFF_FFFF;
+            if !sequence_less_than(next, self.next_seq) {
+                *seq = next;
+                break;
+            }
+            if self
+                .packets
+                .get(&next)
+                .is_some_and(|entry| entry.message_number == message_number)
+            {
+                *seq = next;
+            } else {
+                *seq = next;
+                break;
+            }
+        }
+
+        DroppedMessage {
+            message_number,
+            first_seq,
+            last_seq,
+        }
     }
 
     /// Get the send time of the oldest packet in the buffer.
