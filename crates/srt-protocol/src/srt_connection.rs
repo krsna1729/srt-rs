@@ -1992,15 +1992,13 @@ impl SrtConnection {
     }
 
     fn handle_nak(&mut self, pkt: ControlPacket, now: Timestamp) -> Result<(), Error> {
-        // NAK パケットから損失リストをパース
-        let loss_list = parse_loss_list(
+        let loss_ranges = parse_loss_ranges(
             &pkt.control_info,
             usize::try_from(self.flight_capacity_packets()).unwrap_or(usize::MAX),
         )?;
 
-        // 送信バッファに損失を通知
         if let Some(ref mut sender) = self.sender {
-            sender.handle_nak(&loss_list);
+            sender.handle_nak_ranges(&loss_ranges);
         }
 
         // 即座に再送処理
@@ -2696,7 +2694,24 @@ impl SrtConnection {
 }
 
 /// Parse a loss list (from a NAK packet's control_info).
+#[cfg(test)]
 fn parse_loss_list(data: &[u8], max_entries: usize) -> Result<Vec<u32>, Error> {
+    let ranges = parse_loss_ranges(data, max_entries)?;
+    let mut result = Vec::with_capacity(max_entries.min(ranges.len()));
+    for range in ranges {
+        let mut sequence = range.first_seq;
+        loop {
+            result.push(sequence);
+            if sequence == range.last_seq {
+                break;
+            }
+            sequence = sequence.wrapping_add(1) & 0x7FFF_FFFF;
+        }
+    }
+    Ok(result)
+}
+
+fn parse_loss_ranges(data: &[u8], max_entries: usize) -> Result<Vec<LossRange>, Error> {
     if !data.len().is_multiple_of(4) {
         return Err(Error::invalid_data(
             "NAK loss list length is not a multiple of four",
@@ -2704,52 +2719,33 @@ fn parse_loss_list(data: &[u8], max_entries: usize) -> Result<Vec<u32>, Error> {
     }
     let mut result = Vec::with_capacity((data.len() / 4).min(max_entries));
     let mut slice = data;
+    let mut remaining = max_entries;
 
-    while !slice.is_empty() {
+    while !slice.is_empty() && remaining != 0 {
         let word = crate::buf::read_u32(&mut slice)?;
-
         if word & 0x8000_0000 != 0 {
-            if !append_loss_range(&mut result, &mut slice, word, max_entries)? {
-                return Ok(result);
+            if slice.len() < 4 {
+                return Err(Error::invalid_data("NAK range is missing its end"));
             }
-        } else if !push_loss_entry(&mut result, word, max_entries) {
-            return Ok(result);
+            let start = word & 0x7FFF_FFFF;
+            let end = crate::buf::read_u32(&mut slice)? & 0x7FFF_FFFF;
+            let positions = (end.wrapping_sub(start) & 0x7FFF_FFFF) as usize + 1;
+            let retained = positions.min(remaining);
+            result.push(LossRange {
+                first_seq: start,
+                last_seq: start.wrapping_add(retained as u32 - 1) & 0x7FFF_FFFF,
+            });
+            remaining -= retained;
+        } else {
+            result.push(LossRange {
+                first_seq: word,
+                last_seq: word,
+            });
+            remaining -= 1;
         }
     }
 
     Ok(result)
-}
-
-fn push_loss_entry(result: &mut Vec<u32>, sequence: u32, max_entries: usize) -> bool {
-    if result.len() >= max_entries {
-        return false;
-    }
-    result.push(sequence);
-    true
-}
-
-fn append_loss_range(
-    result: &mut Vec<u32>,
-    slice: &mut &[u8],
-    start_word: u32,
-    max_entries: usize,
-) -> Result<bool, Error> {
-    // A range is encoded as [start | 0x8000_0000, end].
-    if slice.len() < 4 {
-        return Err(Error::invalid_data("NAK range is missing its end"));
-    }
-    let start = start_word & 0x7FFF_FFFF;
-    let end = crate::buf::read_u32(slice)? & 0x7FFF_FFFF;
-    let mut sequence = start;
-    loop {
-        if !push_loss_entry(result, sequence, max_entries) {
-            return Ok(false);
-        }
-        if sequence == end {
-            return Ok(true);
-        }
-        sequence = sequence.wrapping_add(1) & 0x7FFF_FFFF;
-    }
 }
 
 /// Encode a loss list (for a NAK packet's control_info).
@@ -3735,6 +3731,28 @@ mod tests {
         assert_eq!(
             parse_loss_list(&encoded, 4).expect("loss report is safely clamped"),
             vec![1, 2, 3, 10]
+        );
+    }
+
+    #[test]
+    fn dense_loss_list_stays_compact_while_enforcing_position_limit() {
+        let mut encoded = Vec::new();
+        write_u32(&mut encoded, 0x8000_0000);
+        write_u32(&mut encoded, 65_535);
+
+        assert_eq!(
+            parse_loss_ranges(&encoded, 65_536).unwrap(),
+            [LossRange {
+                first_seq: 0,
+                last_seq: 65_535,
+            }]
+        );
+        assert_eq!(
+            parse_loss_ranges(&encoded, 32).unwrap(),
+            [LossRange {
+                first_seq: 0,
+                last_seq: 31,
+            }]
         );
     }
 

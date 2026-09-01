@@ -1,6 +1,6 @@
 use shiguredo_srt::{
-    ConnectionOptions, ConnectionOutput, ConnectionState, ControlType, GroupMemberState, GroupMode,
-    SrtConnection, SrtGroup, SrtPacket, TimerId, Timestamp,
+    ConnectionOptions, ConnectionOutput, ConnectionState, ControlPacket, ControlType,
+    GroupMemberState, GroupMode, SrtConnection, SrtGroup, SrtPacket, TimerId, Timestamp,
 };
 
 fn ts(micros: u64) -> Timestamp {
@@ -93,6 +93,43 @@ fn broadcast_sends_one_sequence_to_every_active_member() {
     listener_b
         .feed_recv_buf(&packets_b[0], ts(100_000))
         .unwrap();
+}
+
+#[test]
+fn aligned_group_member_retransmits_after_sequence_jump() {
+    let options = ConnectionOptions {
+        initial_seq: Some(0),
+        flow_window_packets: 32,
+        receive_buffer_packets: 32,
+        ..ConnectionOptions::default()
+    };
+    let (mut leader, _) = establish_pair_with_options(options.clone());
+    let (joining, _) = establish_pair_with_options(options);
+    leader.synchronize_send_sequence(1_000).unwrap();
+
+    let mut group = SrtGroup::new(0x4000_0018, GroupMode::Broadcast).unwrap();
+    group.add_member(1, 1, leader).unwrap();
+    group.add_member(2, 1, joining).unwrap();
+    group.send(b"aligned", ts(100_000)).unwrap();
+    packets_from(group.member_mut(1).unwrap().connection_mut());
+    let sent = packets_from(group.member_mut(2).unwrap().connection_mut());
+    assert_eq!(data_sequence(&sent[0]), 1_000);
+
+    let member = group.member_mut(2).unwrap().connection_mut();
+    let mut nak = ControlPacket::new(ControlType::Nak, 0, member.socket_id());
+    nak.control_info.extend_from_slice(&1_000u32.to_be_bytes());
+    let mut encoded = Vec::new();
+    nak.encode(&mut encoded);
+    member.feed_recv_buf(&encoded, ts(101_000)).unwrap();
+
+    let retransmitted = packets_from(member)
+        .into_iter()
+        .filter_map(|packet| SrtPacket::decode(&packet).ok())
+        .find_map(|packet| match packet {
+            SrtPacket::Data(packet) if packet.retransmitted => Some(packet.sequence_number),
+            _ => None,
+        });
+    assert_eq!(retransmitted, Some(1_000));
 }
 
 #[test]

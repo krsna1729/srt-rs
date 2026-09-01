@@ -13,8 +13,13 @@ use std::collections::{BTreeMap, VecDeque};
 
 use bytes::Bytes;
 
+use crate::srt_handshake::MAX_FLOW_WINDOW;
 use crate::srt_packet::{DataHeader, PacketPosition, SRT_HEADER_SIZE, sequence_less_than};
+use crate::srt_receiver::LossRange;
 use crate::time::Timestamp;
+
+const SEQUENCE_MASK: u32 = 0x7FFF_FFFF;
+const STALE_RETRANSMIT_COMPACT_THRESHOLD: usize = 1_024;
 
 /// "No configured limit" default max bandwidth, matching libsrt's own
 /// `BW_INFINITE` (`srtcore/common.h`): 1 Gbps expressed in bytes/sec. Live
@@ -51,6 +56,89 @@ struct SentPacket {
     retransmit_count: u32,
 }
 
+/// Circular membership for packets already present in `loss_list`.
+///
+/// Logical window checks prevent an old stale queue entry from aliasing a
+/// newly reused physical bit after the 31-bit sequence space advances.
+#[derive(Debug)]
+struct RetransmitQueueBitmap {
+    words: Vec<u64>,
+    base_seq: u32,
+    window_size: u32,
+    capacity_mask: u32,
+    len: u32,
+}
+
+impl RetransmitQueueBitmap {
+    fn new(base_seq: u32, window_size: u32) -> Self {
+        let logical_size = window_size.clamp(1, MAX_FLOW_WINDOW);
+        let capacity = logical_size.next_power_of_two();
+        Self {
+            words: Vec::new(),
+            base_seq: base_seq & SEQUENCE_MASK,
+            window_size: logical_size,
+            capacity_mask: capacity - 1,
+            len: 0,
+        }
+    }
+
+    fn contains(&self, sequence: u32) -> bool {
+        self.bit(sequence)
+            .is_some_and(|(word, mask)| self.words.get(word).is_some_and(|bits| bits & mask != 0))
+    }
+
+    fn insert(&mut self, sequence: u32) -> bool {
+        let Some((word, mask)) = self.bit(sequence) else {
+            return false;
+        };
+        if self.words.is_empty() {
+            self.words
+                .resize((self.capacity_mask as usize + 1).div_ceil(64), 0);
+        }
+        if self.words[word] & mask != 0 {
+            return false;
+        }
+        self.words[word] |= mask;
+        self.len += 1;
+        true
+    }
+
+    fn remove(&mut self, sequence: u32) -> bool {
+        let Some((word, mask)) = self.bit(sequence) else {
+            return false;
+        };
+        let Some(bits) = self.words.get_mut(word) else {
+            return false;
+        };
+        if *bits & mask == 0 {
+            return false;
+        }
+        *bits &= !mask;
+        self.len -= 1;
+        true
+    }
+
+    fn set_base(&mut self, base_seq: u32) {
+        self.base_seq = base_seq & SEQUENCE_MASK;
+    }
+
+    fn reset(&mut self, base_seq: u32) {
+        self.words.fill(0);
+        self.base_seq = base_seq & SEQUENCE_MASK;
+        self.len = 0;
+    }
+
+    fn bit(&self, sequence: u32) -> Option<(usize, u64)> {
+        let sequence = sequence & SEQUENCE_MASK;
+        let distance = sequence.wrapping_sub(self.base_seq) & SEQUENCE_MASK;
+        if distance >= self.window_size {
+            return None;
+        }
+        let index = (sequence & self.capacity_mask) as usize;
+        Some((index / 64, 1u64 << (index % 64)))
+    }
+}
+
 /// A message dropped by sender-side TLPKTDROP.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DroppedMessage {
@@ -67,6 +155,12 @@ pub struct SenderBuffer {
 
     /// Loss list (packets reported via NAK).
     loss_list: VecDeque<u32>,
+
+    /// Duplicate suppression for `loss_list` without a linear queue scan.
+    retransmit_queued: RetransmitQueueBitmap,
+
+    /// Queue entries invalidated by ACK/TLPKTDROP and awaiting lazy removal.
+    stale_retransmits: usize,
 
     /// The oldest un-ACKed sequence number.
     oldest_unacked: u32,
@@ -147,9 +241,12 @@ impl SenderBuffer {
     /// actual send control is handled by pacing (`packet_send_period`)
     /// instead (`srtcore/congctl.cpp`).
     pub fn new(initial_seq: u32, flow_window: u32, latency_ms: u16) -> Self {
+        let flow_window = flow_window.clamp(1, MAX_FLOW_WINDOW);
         let mut buf = Self {
             packets: BTreeMap::new(),
             loss_list: VecDeque::new(),
+            retransmit_queued: RetransmitQueueBitmap::new(initial_seq, flow_window),
+            stale_retransmits: 0,
             oldest_unacked: initial_seq,
             next_seq: initial_seq,
             next_msg: 1,
@@ -189,6 +286,9 @@ impl SenderBuffer {
         }
         self.next_seq = sequence_number & 0x7FFF_FFFF;
         self.oldest_unacked = self.next_seq;
+        self.loss_list.clear();
+        self.retransmit_queued.reset(self.next_seq);
+        self.stale_retransmits = 0;
         true
     }
 
@@ -298,7 +398,7 @@ impl SenderBuffer {
 
     /// Whether there are packets needing retransmission.
     pub fn has_retransmit(&self) -> bool {
-        !self.loss_list.is_empty()
+        self.retransmit_queued.len != 0
     }
 
     /// Set the congestion window.
@@ -306,11 +406,14 @@ impl SenderBuffer {
         self.congestion_window = cwnd;
     }
 
-    /// Set the flow window (the congestion window tracks it too; see the
-    /// comment on [`Self::new`] for LIVE mode's behavior).
+    /// Set the active flow window (the congestion window tracks it too; see
+    /// [`Self::new`] for LIVE mode's behavior). The constructor's window is
+    /// the permanent maximum, so peer feedback can shrink and reopen this
+    /// window without growing the retransmit bitmap.
     pub fn set_flow_window(&mut self, flow_window: u32) {
-        self.flow_window = flow_window;
-        self.congestion_window = flow_window;
+        let bounded = flow_window.min(self.retransmit_queued.window_size);
+        self.flow_window = bounded;
+        self.congestion_window = bounded;
     }
 
     /// Set the maximum bandwidth (equivalent to `SRTO_MAXBW`, bytes/sec).
@@ -547,6 +650,10 @@ impl SenderBuffer {
     /// retransmitted repeatedly would then never expire.)
     pub fn pop_retransmit(&mut self, dest_socket_id: u32) -> Option<(DataHeader, Bytes)> {
         while let Some(seq) = self.loss_list.pop_front() {
+            if !self.retransmit_queued.remove(seq) {
+                self.stale_retransmits = self.stale_retransmits.saturating_sub(1);
+                continue;
+            }
             if let Some(entry) = self.packets.get_mut(&seq) {
                 entry.retransmit_count += 1;
                 self.total_retransmits += 1;
@@ -593,25 +700,67 @@ impl SenderBuffer {
         let mut seq = self.oldest_unacked;
         while seq != ack_seq {
             self.packets.remove(&seq);
+            if self.retransmit_queued.remove(seq) {
+                self.stale_retransmits += 1;
+            }
             seq = seq.wrapping_add(1) & 0x7FFF_FFFF;
         }
 
-        self.loss_list
-            .retain(|&seq| !sequence_less_than(seq, ack_seq));
-
         self.oldest_unacked = ack_seq;
+        self.retransmit_queued.set_base(ack_seq);
+        self.compact_stale_retransmits();
     }
 
     /// Process a NAK and add to the loss list.
     pub fn handle_nak(&mut self, lost_sequences: &[u32]) {
         self.total_naks_received = self.total_naks_received.saturating_add(1);
-        for &seq in lost_sequences {
-            // Only add packets that are still in the buffer.
-            if self.packets.contains_key(&seq) && !self.loss_list.contains(&seq) {
-                self.loss_list.push_back(seq);
-                self.total_lost = self.total_lost.saturating_add(1);
+        self.queue_loss_ranges(lost_sequences.iter().map(|&sequence| LossRange {
+            first_seq: sequence,
+            last_seq: sequence,
+        }));
+    }
+
+    /// Queue retained packets intersecting compact peer loss ranges.
+    pub fn handle_nak_ranges(&mut self, loss_ranges: &[LossRange]) {
+        self.total_naks_received = self.total_naks_received.saturating_add(1);
+        self.queue_loss_ranges(loss_ranges.iter().copied());
+    }
+
+    fn queue_loss_ranges(&mut self, loss_ranges: impl IntoIterator<Item = LossRange>) {
+        let Self {
+            packets,
+            loss_list,
+            retransmit_queued,
+            total_lost,
+            ..
+        } = self;
+        for loss in loss_ranges {
+            let first_seq = loss.first_seq & SEQUENCE_MASK;
+            let last_seq = loss.last_seq & SEQUENCE_MASK;
+            let mut enqueue = |first_seq, last_seq| {
+                for (&sequence, _) in packets.range(first_seq..=last_seq) {
+                    if retransmit_queued.insert(sequence) {
+                        loss_list.push_back(sequence);
+                        *total_lost = total_lost.saturating_add(1);
+                    }
+                }
+            };
+            if first_seq <= last_seq {
+                enqueue(first_seq, last_seq);
+            } else {
+                enqueue(first_seq, SEQUENCE_MASK);
+                enqueue(0, last_seq);
             }
         }
+    }
+
+    fn compact_stale_retransmits(&mut self) {
+        if self.stale_retransmits <= STALE_RETRANSMIT_COMPACT_THRESHOLD {
+            return;
+        }
+        self.loss_list
+            .retain(|&sequence| self.retransmit_queued.contains(sequence));
+        self.stale_retransmits = 0;
     }
 
     /// Retain measurements carried by the most recent full ACK.
@@ -643,7 +792,6 @@ impl SenderBuffer {
     pub fn drop_expired(&mut self, now: Timestamp) -> Vec<DroppedMessage> {
         let threshold = (self.latency_us * 125 / 100).max(1_000_000);
 
-        let mut dropped_seqs = Vec::new();
         let mut messages = Vec::new();
         let mut seq = self.oldest_unacked;
         while sequence_less_than(seq, self.next_seq) {
@@ -653,7 +801,7 @@ impl SenderBuffer {
                     if elapsed <= threshold {
                         break;
                     }
-                    messages.push(self.drop_expired_message(&mut seq, &mut dropped_seqs));
+                    messages.push(self.drop_expired_message(&mut seq));
                 }
                 None => {
                     seq = seq.wrapping_add(1) & 0x7FFF_FFFF;
@@ -663,18 +811,14 @@ impl SenderBuffer {
 
         if sequence_less_than(self.oldest_unacked, seq) {
             self.oldest_unacked = seq;
+            self.retransmit_queued.set_base(seq);
         }
-
-        self.loss_list.retain(|s| !dropped_seqs.contains(s));
+        self.compact_stale_retransmits();
 
         messages
     }
 
-    fn drop_expired_message(
-        &mut self,
-        seq: &mut u32,
-        dropped_seqs: &mut Vec<u32>,
-    ) -> DroppedMessage {
+    fn drop_expired_message(&mut self, seq: &mut u32) -> DroppedMessage {
         let message_number = self
             .packets
             .get(seq)
@@ -690,7 +834,9 @@ impl SenderBuffer {
                 self.total_bytes_dropped = self
                     .total_bytes_dropped
                     .saturating_add(removed.payload.len() as u64);
-                dropped_seqs.push(*seq);
+                if self.retransmit_queued.remove(*seq) {
+                    self.stale_retransmits += 1;
+                }
                 last_seq = *seq;
             }
             let next = seq.wrapping_add(1) & 0x7FFF_FFFF;
@@ -761,7 +907,7 @@ impl SenderBuffer {
         SenderStats {
             packets_in_buffer: self.packets.len() as u32,
             payload_bytes_in_buffer,
-            packets_in_loss_list: self.loss_list.len() as u32,
+            packets_in_loss_list: self.retransmit_queued.len,
             available_buffer_packets: self.flow_window.saturating_sub(self.packets.len() as u32),
             available_buffer_bytes: None,
             flow_window_packets: self.flow_window,
@@ -970,6 +1116,129 @@ mod tests {
         let (hdr, _) = retransmit.expect("再送パケットは Some になる想定");
         assert_eq!(hdr.sequence_number, 1001);
         assert!(hdr.retransmitted);
+    }
+
+    #[test]
+    fn dense_and_wrapped_nak_ranges_queue_only_retained_packets() {
+        let now = Timestamp::default();
+        let mut dense = SenderBuffer::new(0, 8_192, 120);
+        for sequence in 0..8_192 {
+            assert!(dense.push(vec![sequence as u8], 1, 1, now).is_some());
+        }
+        dense.handle_nak_ranges(&[LossRange {
+            first_seq: 0,
+            last_seq: 8_191,
+        }]);
+        assert_eq!(dense.stats().packets_in_loss_list, 8_192);
+        for expected in 0..8_192 {
+            assert_eq!(dense.pop_retransmit(1).unwrap().0.sequence_number, expected);
+        }
+
+        let mut wrapped = SenderBuffer::new(0x7FFF_FFFD, 8, 120);
+        for _ in 0..6 {
+            assert!(wrapped.push(vec![1], 1, 1, now).is_some());
+        }
+        wrapped.handle_nak_ranges(&[LossRange {
+            first_seq: 0x7FFF_FFFE,
+            last_seq: 1,
+        }]);
+        let queued = std::iter::from_fn(|| wrapped.pop_retransmit(1))
+            .map(|(header, _)| header.sequence_number)
+            .collect::<Vec<_>>();
+        assert_eq!(queued, [0x7FFF_FFFE, 0x7FFF_FFFF, 0, 1]);
+    }
+
+    #[test]
+    fn acked_stale_queue_entries_do_not_retransmit_or_hide_live_entries() {
+        let mut buf = SenderBuffer::new(0, 32, 120);
+        let now = Timestamp::default();
+        for _ in 0..3 {
+            buf.push(vec![1], 1, 1, now);
+        }
+        buf.handle_nak(&[0, 1]);
+        buf.handle_ack(1);
+
+        assert_eq!(buf.stats().packets_in_loss_list, 1);
+        assert_eq!(buf.pop_retransmit(1).unwrap().0.sequence_number, 1);
+        assert!(buf.pop_retransmit(1).is_none());
+    }
+
+    #[test]
+    fn stale_slot_reuse_cannot_clear_a_new_retransmit() {
+        let mut buf = SenderBuffer::new(0, 32, 120);
+        let now = Timestamp::default();
+        buf.push(vec![0], 1, 1, now);
+        buf.handle_nak(&[0]);
+        buf.handle_ack(1);
+        for sequence in 1..=32 {
+            assert!(buf.push(vec![sequence as u8], 1, 1, now).is_some());
+        }
+        buf.handle_nak(&[32]);
+
+        assert_eq!(buf.pop_retransmit(1).unwrap().0.sequence_number, 32);
+        assert!(buf.pop_retransmit(1).is_none());
+    }
+
+    #[test]
+    fn sequence_synchronization_rebases_retransmit_membership() {
+        let mut buf = SenderBuffer::new(0, 32, 120);
+        buf.push(vec![0], 1, 1, Timestamp::default());
+        buf.handle_nak(&[0]);
+        buf.handle_ack(1);
+        assert!(buf.packets.is_empty());
+
+        assert!(buf.synchronize_next_sequence_number(1_000));
+        assert!(buf.loss_list.is_empty());
+        assert_eq!(buf.stale_retransmits, 0);
+        assert!(buf.push(vec![1], 1, 1, Timestamp::default()).is_some());
+        buf.handle_nak(&[1_000]);
+
+        assert_eq!(buf.pop_retransmit(1).unwrap().0.sequence_number, 1_000);
+    }
+
+    #[test]
+    fn tlpktdrop_clears_retransmit_membership() {
+        let mut buf = SenderBuffer::new(0, 32, 10);
+        buf.push(vec![1], 1, 1, Timestamp::default());
+        buf.handle_nak(&[0]);
+
+        assert_eq!(
+            dropped_seqs(&buf.drop_expired(Timestamp::from_micros(1_000_001))),
+            [0]
+        );
+        assert!(!buf.has_retransmit());
+        assert!(buf.pop_retransmit(1).is_none());
+    }
+
+    #[test]
+    fn retransmit_bitmap_is_lazy_and_bounded_at_maximum_window() {
+        let inline_bytes = size_of::<SenderBuffer>();
+        let mut bitmap = RetransmitQueueBitmap::new(0, 65_536);
+        assert!(bitmap.words.is_empty());
+        assert!(bitmap.insert(0));
+        eprintln!("SenderBuffer inline bytes: {inline_bytes}");
+        eprintln!(
+            "maximum retransmit bitmap bytes: {}",
+            bitmap.words.len() * size_of::<u64>()
+        );
+        assert!(inline_bytes <= 320);
+        assert_eq!(bitmap.words.len() * size_of::<u64>(), 8_192);
+        assert!(!bitmap.insert(0));
+        assert!(!bitmap.insert(65_536));
+    }
+
+    #[test]
+    fn stale_retransmit_queue_is_compacted_at_a_bounded_threshold() {
+        let mut buf = SenderBuffer::new(0, 2_048, 120);
+        for _ in 0..2_048 {
+            buf.push(vec![1], 1, 1, Timestamp::default());
+        }
+        buf.handle_nak(&(0..2_048).collect::<Vec<_>>());
+        buf.handle_ack(2_048);
+
+        assert!(buf.loss_list.is_empty());
+        assert_eq!(buf.stale_retransmits, 0);
+        assert!(!buf.has_retransmit());
     }
 
     /// `stats().total_retransmits` must stay accurate after the
