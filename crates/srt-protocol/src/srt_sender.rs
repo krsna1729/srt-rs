@@ -9,7 +9,9 @@
 //! - Buffer release via ACK
 //! - Send window management
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
+
+use crate::sender_packet_window::SenderPacketWindow;
 
 use bytes::Bytes;
 
@@ -56,89 +58,6 @@ struct SentPacket {
     retransmit_count: u32,
 }
 
-/// Circular membership for packets already present in `loss_list`.
-///
-/// Logical window checks prevent an old stale queue entry from aliasing a
-/// newly reused physical bit after the 31-bit sequence space advances.
-#[derive(Debug)]
-struct RetransmitQueueBitmap {
-    words: Vec<u64>,
-    base_seq: u32,
-    window_size: u32,
-    capacity_mask: u32,
-    len: u32,
-}
-
-impl RetransmitQueueBitmap {
-    fn new(base_seq: u32, window_size: u32) -> Self {
-        let logical_size = window_size.clamp(1, MAX_FLOW_WINDOW);
-        let capacity = logical_size.next_power_of_two();
-        Self {
-            words: Vec::new(),
-            base_seq: base_seq & SEQUENCE_MASK,
-            window_size: logical_size,
-            capacity_mask: capacity - 1,
-            len: 0,
-        }
-    }
-
-    fn contains(&self, sequence: u32) -> bool {
-        self.bit(sequence)
-            .is_some_and(|(word, mask)| self.words.get(word).is_some_and(|bits| bits & mask != 0))
-    }
-
-    fn insert(&mut self, sequence: u32) -> bool {
-        let Some((word, mask)) = self.bit(sequence) else {
-            return false;
-        };
-        if self.words.is_empty() {
-            self.words
-                .resize((self.capacity_mask as usize + 1).div_ceil(64), 0);
-        }
-        if self.words[word] & mask != 0 {
-            return false;
-        }
-        self.words[word] |= mask;
-        self.len += 1;
-        true
-    }
-
-    fn remove(&mut self, sequence: u32) -> bool {
-        let Some((word, mask)) = self.bit(sequence) else {
-            return false;
-        };
-        let Some(bits) = self.words.get_mut(word) else {
-            return false;
-        };
-        if *bits & mask == 0 {
-            return false;
-        }
-        *bits &= !mask;
-        self.len -= 1;
-        true
-    }
-
-    fn set_base(&mut self, base_seq: u32) {
-        self.base_seq = base_seq & SEQUENCE_MASK;
-    }
-
-    fn reset(&mut self, base_seq: u32) {
-        self.words.fill(0);
-        self.base_seq = base_seq & SEQUENCE_MASK;
-        self.len = 0;
-    }
-
-    fn bit(&self, sequence: u32) -> Option<(usize, u64)> {
-        let sequence = sequence & SEQUENCE_MASK;
-        let distance = sequence.wrapping_sub(self.base_seq) & SEQUENCE_MASK;
-        if distance >= self.window_size {
-            return None;
-        }
-        let index = (sequence & self.capacity_mask) as usize;
-        Some((index / 64, 1u64 << (index % 64)))
-    }
-}
-
 /// A message dropped by sender-side TLPKTDROP.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DroppedMessage {
@@ -150,14 +69,11 @@ pub struct DroppedMessage {
 /// Send buffer.
 #[derive(Debug)]
 pub struct SenderBuffer {
-    /// Sent packets (sequence_number -> SentPacket).
-    packets: BTreeMap<u32, SentPacket>,
+    /// Sent packets in a direct paged sequence window.
+    packets: SenderPacketWindow<SentPacket>,
 
     /// Loss list (packets reported via NAK).
     loss_list: VecDeque<u32>,
-
-    /// Duplicate suppression for `loss_list` without a linear queue scan.
-    retransmit_queued: RetransmitQueueBitmap,
 
     /// Queue entries invalidated by ACK/TLPKTDROP and awaiting lazy removal.
     stale_retransmits: usize,
@@ -243,9 +159,8 @@ impl SenderBuffer {
     pub fn new(initial_seq: u32, flow_window: u32, latency_ms: u16) -> Self {
         let flow_window = flow_window.clamp(1, MAX_FLOW_WINDOW);
         let mut buf = Self {
-            packets: BTreeMap::new(),
+            packets: SenderPacketWindow::new(flow_window),
             loss_list: VecDeque::new(),
-            retransmit_queued: RetransmitQueueBitmap::new(initial_seq, flow_window),
             stale_retransmits: 0,
             oldest_unacked: initial_seq,
             next_seq: initial_seq,
@@ -287,7 +202,7 @@ impl SenderBuffer {
         self.next_seq = sequence_number & 0x7FFF_FFFF;
         self.oldest_unacked = self.next_seq;
         self.loss_list.clear();
-        self.retransmit_queued.reset(self.next_seq);
+        self.packets.clear();
         self.stale_retransmits = 0;
         true
     }
@@ -398,7 +313,7 @@ impl SenderBuffer {
 
     /// Whether there are packets needing retransmission.
     pub fn has_retransmit(&self) -> bool {
-        self.retransmit_queued.len != 0
+        self.packets.has_retransmit_queued()
     }
 
     /// Set the congestion window.
@@ -411,7 +326,7 @@ impl SenderBuffer {
     /// the permanent maximum, so peer feedback can shrink and reopen this
     /// window without growing the retransmit bitmap.
     pub fn set_flow_window(&mut self, flow_window: u32) {
-        let bounded = flow_window.min(self.retransmit_queued.window_size);
+        let bounded = flow_window.min(self.packets.window_size());
         self.flow_window = bounded;
         self.congestion_window = bounded;
     }
@@ -529,18 +444,20 @@ impl SenderBuffer {
         let payload_len = retained.len();
         let wire_payload = retained.clone();
 
-        self.packets.insert(
-            sequence_number,
-            SentPacket {
-                position: PacketPosition::Single,
-                order_flag: false,
-                message_number,
-                timestamp,
-                payload: retained,
-                sent_time: now,
-                retransmit_count: 0,
-            },
-        );
+        self.packets
+            .insert(
+                sequence_number,
+                SentPacket {
+                    position: PacketPosition::Single,
+                    order_flag: false,
+                    message_number,
+                    timestamp,
+                    payload: retained,
+                    sent_time: now,
+                    retransmit_count: 0,
+                },
+            )
+            .expect("alias-free live span checked by can_send");
 
         let header = DataHeader {
             sequence_number,
@@ -596,18 +513,20 @@ impl SenderBuffer {
             let chunk_len = retained.len();
             let wire_payload = retained.clone();
 
-            self.packets.insert(
-                self.next_seq,
-                SentPacket {
-                    position,
-                    order_flag: true,
-                    message_number: self.next_msg,
-                    timestamp,
-                    payload: retained,
-                    sent_time: now,
-                    retransmit_count: 0,
-                },
-            );
+            self.packets
+                .insert(
+                    self.next_seq,
+                    SentPacket {
+                        position,
+                        order_flag: true,
+                        message_number: self.next_msg,
+                        timestamp,
+                        payload: retained,
+                        sent_time: now,
+                        retransmit_count: 0,
+                    },
+                )
+                .expect("alias-free live span checked by can_send");
 
             let header = DataHeader {
                 sequence_number: self.next_seq,
@@ -650,11 +569,7 @@ impl SenderBuffer {
     /// retransmitted repeatedly would then never expire.)
     pub fn pop_retransmit(&mut self, dest_socket_id: u32) -> Option<(DataHeader, Bytes)> {
         while let Some(seq) = self.loss_list.pop_front() {
-            if !self.retransmit_queued.remove(seq) {
-                self.stale_retransmits = self.stale_retransmits.saturating_sub(1);
-                continue;
-            }
-            if let Some(entry) = self.packets.get_mut(&seq) {
+            if let Some(entry) = self.packets.pop_retransmit_slot(seq) {
                 entry.retransmit_count += 1;
                 self.total_retransmits += 1;
                 let wire_bytes = (entry.payload.len() + SRT_HEADER_SIZE) as u64;
@@ -676,6 +591,7 @@ impl SenderBuffer {
                     entry.payload.clone(),
                 ));
             }
+            self.stale_retransmits = self.stale_retransmits.saturating_sub(1);
         }
         None
     }
@@ -691,23 +607,24 @@ impl SenderBuffer {
     /// Discard acknowledged packets without recording a peer ACK. This is
     /// used by local sequence reconciliation paths.
     pub(crate) fn discard_acked(&mut self, ack_seq: u32) {
-        if !sequence_less_than(self.oldest_unacked, ack_seq) {
+        if ack_seq & !SEQUENCE_MASK != 0 {
             return;
         }
 
-        // Walk from oldest_unacked to ack_seq, removing each key.
-        // O(k log n) where k = newly acked, vs O(n) for retain.
-        let mut seq = self.oldest_unacked;
-        while seq != ack_seq {
-            self.packets.remove(&seq);
-            if self.retransmit_queued.remove(seq) {
-                self.stale_retransmits += 1;
-            }
-            seq = seq.wrapping_add(1) & 0x7FFF_FFFF;
+        let ack_distance = ack_seq.wrapping_sub(self.oldest_unacked) & SEQUENCE_MASK;
+        let in_flight_span = self.next_seq.wrapping_sub(self.oldest_unacked) & SEQUENCE_MASK;
+        if ack_distance == 0 || ack_distance > in_flight_span {
+            return;
         }
 
+        let mut stale_count = 0;
+        self.packets
+            .discard_acked_prefix(self.oldest_unacked, ack_seq, || {
+                stale_count += 1;
+            });
+        self.stale_retransmits = self.stale_retransmits.saturating_add(stale_count);
+
         self.oldest_unacked = ack_seq;
-        self.retransmit_queued.set_base(ack_seq);
         self.compact_stale_retransmits();
     }
 
@@ -727,30 +644,16 @@ impl SenderBuffer {
     }
 
     fn queue_loss_ranges(&mut self, loss_ranges: impl IntoIterator<Item = LossRange>) {
-        let Self {
-            packets,
-            loss_list,
-            retransmit_queued,
-            total_lost,
-            ..
-        } = self;
+        let packets = &mut self.packets;
+        let loss_list = &mut self.loss_list;
+        let total_lost = &mut self.total_lost;
         for loss in loss_ranges {
             let first_seq = loss.first_seq & SEQUENCE_MASK;
             let last_seq = loss.last_seq & SEQUENCE_MASK;
-            let mut enqueue = |first_seq, last_seq| {
-                for (&sequence, _) in packets.range(first_seq..=last_seq) {
-                    if retransmit_queued.insert(sequence) {
-                        loss_list.push_back(sequence);
-                        *total_lost = total_lost.saturating_add(1);
-                    }
-                }
-            };
-            if first_seq <= last_seq {
-                enqueue(first_seq, last_seq);
-            } else {
-                enqueue(first_seq, SEQUENCE_MASK);
-                enqueue(0, last_seq);
-            }
+            packets.queue_loss_range(first_seq, last_seq, |sequence| {
+                loss_list.push_back(sequence);
+                *total_lost = total_lost.saturating_add(1);
+            });
         }
     }
 
@@ -758,8 +661,9 @@ impl SenderBuffer {
         if self.stale_retransmits <= STALE_RETRANSMIT_COMPACT_THRESHOLD {
             return;
         }
+        let packets = &self.packets;
         self.loss_list
-            .retain(|&sequence| self.retransmit_queued.contains(sequence));
+            .retain(|&sequence| packets.retransmit_queued_contains(sequence));
         self.stale_retransmits = 0;
     }
 
@@ -795,7 +699,7 @@ impl SenderBuffer {
         let mut messages = Vec::new();
         let mut seq = self.oldest_unacked;
         while sequence_less_than(seq, self.next_seq) {
-            match self.packets.get(&seq) {
+            match self.packets.get(seq) {
                 Some(entry) => {
                     let elapsed = now.as_micros().saturating_sub(entry.sent_time.as_micros());
                     if elapsed <= threshold {
@@ -811,7 +715,6 @@ impl SenderBuffer {
 
         if sequence_less_than(self.oldest_unacked, seq) {
             self.oldest_unacked = seq;
-            self.retransmit_queued.set_base(seq);
         }
         self.compact_stale_retransmits();
 
@@ -821,7 +724,7 @@ impl SenderBuffer {
     fn drop_expired_message(&mut self, seq: &mut u32) -> DroppedMessage {
         let message_number = self
             .packets
-            .get(seq)
+            .get(*seq)
             .expect("expired message starts at a buffered packet")
             .message_number;
         let first_seq = *seq;
@@ -829,12 +732,12 @@ impl SenderBuffer {
 
         // Drop this packet and any remaining fragments of the same message.
         loop {
-            if let Some(removed) = self.packets.remove(seq) {
+            if let Some(removed) = self.packets.remove(*seq) {
                 self.total_dropped = self.total_dropped.saturating_add(1);
                 self.total_bytes_dropped = self
                     .total_bytes_dropped
-                    .saturating_add(removed.payload.len() as u64);
-                if self.retransmit_queued.remove(*seq) {
+                    .saturating_add(removed.packet.payload.len() as u64);
+                if removed.was_retransmit_queued {
                     self.stale_retransmits += 1;
                 }
                 last_seq = *seq;
@@ -846,7 +749,7 @@ impl SenderBuffer {
             }
             if self
                 .packets
-                .get(&next)
+                .get(next)
                 .is_some_and(|entry| entry.message_number == message_number)
             {
                 *seq = next;
@@ -865,7 +768,19 @@ impl SenderBuffer {
 
     /// Get the send time of the oldest packet in the buffer.
     pub fn oldest_packet_time(&self) -> Option<Timestamp> {
-        self.packets.values().next().map(|e| e.sent_time)
+        self.packets
+            .first_occupied_from(self.oldest_unacked)
+            .map(|(_, e)| e.sent_time)
+    }
+
+    /// Number of pages currently allocated in the sender packet window.
+    pub fn allocated_pages(&self) -> usize {
+        self.packets.allocated_pages()
+    }
+
+    /// Total heap bytes owned by the sender packet window.
+    pub fn sender_window_heap_bytes(&self) -> usize {
+        self.packets.heap_bytes()
     }
 
     /// Get statistics.
@@ -891,23 +806,23 @@ impl SenderBuffer {
                 _ => {}
             }
         }
-        let buffer_span_micros = self
+        let oldest_time = self
             .packets
-            .values()
-            .next()
-            .zip(self.packets.values().next_back())
-            .map_or(0, |(oldest, newest)| {
-                newest
-                    .sent_time
-                    .as_micros()
-                    .saturating_sub(oldest.sent_time.as_micros())
-            });
+            .first_occupied_from(self.oldest_unacked)
+            .map(|(_, e)| e.sent_time);
+        let newest_time = self
+            .packets
+            .last_occupied_before(self.next_seq)
+            .map(|(_, e)| e.sent_time);
+        let buffer_span_micros = oldest_time.zip(newest_time).map_or(0, |(oldest, newest)| {
+            newest.as_micros().saturating_sub(oldest.as_micros())
+        });
         let peer = self.peer_feedback;
 
         SenderStats {
             packets_in_buffer: self.packets.len() as u32,
             payload_bytes_in_buffer,
-            packets_in_loss_list: self.retransmit_queued.len,
+            packets_in_loss_list: self.packets.retransmit_queued_count(),
             available_buffer_packets: self.flow_window.saturating_sub(self.packets.len() as u32),
             available_buffer_bytes: None,
             flow_window_packets: self.flow_window,
@@ -1211,20 +1126,17 @@ mod tests {
     }
 
     #[test]
-    fn retransmit_bitmap_is_lazy_and_bounded_at_maximum_window() {
+    fn sender_window_is_lazy_and_bounded_at_maximum_window() {
         let inline_bytes = size_of::<SenderBuffer>();
-        let mut bitmap = RetransmitQueueBitmap::new(0, 65_536);
-        assert!(bitmap.words.is_empty());
-        assert!(bitmap.insert(0));
+        let window = SenderPacketWindow::<SentPacket>::new(65_536);
+        assert_eq!(window.allocated_pages(), 0);
         eprintln!("SenderBuffer inline bytes: {inline_bytes}");
         eprintln!(
-            "maximum retransmit bitmap bytes: {}",
-            bitmap.words.len() * size_of::<u64>()
+            "maximum sender window directory bytes: {}",
+            window.heap_bytes()
         );
         assert!(inline_bytes <= 320);
-        assert_eq!(bitmap.words.len() * size_of::<u64>(), 8_192);
-        assert!(!bitmap.insert(0));
-        assert!(!bitmap.insert(65_536));
+        assert_eq!(window.heap_bytes(), 8_320);
     }
 
     #[test]
