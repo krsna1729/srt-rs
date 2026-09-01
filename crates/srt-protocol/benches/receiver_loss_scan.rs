@@ -249,7 +249,7 @@ fn receiver_with_mixed_state() -> ReceiverBuffer {
 }
 
 fn receiver_with_future_tsbpd_packets(packet_count: u32) -> ReceiverBuffer {
-    let mut receiver = ReceiverBuffer::new(0, 120, ts(0), 0);
+    let mut receiver = ReceiverBuffer::with_buffer_size(0, 120, ts(0), 0, packet_count);
     for seq in 0..packet_count {
         let mut packet = make_packet(seq, 1_000_000_000 + seq);
         packet.payload = Vec::new().into();
@@ -304,13 +304,12 @@ fn bench_drop_range_locality(c: &mut Criterion) {
     group.throughput(Throughput::Elements(1));
     group.sample_size(20);
 
-    for &packet_count in &[8192u32, 32_768u32] {
+    for &packet_count in &[1_024u32, 8_192u32, 32_768u32] {
         group.bench_function(format!("single_sequence/retained_{packet_count}"), |b| {
-            b.iter_batched(
+            b.iter_batched_ref(
                 || receiver_with_future_tsbpd_packets(packet_count),
-                |mut receiver| {
+                |receiver| {
                     black_box(receiver.drop_range(0, 0)).unwrap();
-                    receiver
                 },
                 BatchSize::LargeInput,
             );

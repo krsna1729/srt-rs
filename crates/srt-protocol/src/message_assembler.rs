@@ -1,4 +1,4 @@
-use crate::srt_packet::{DataPacket, PacketPosition};
+use crate::srt_packet::{DataPacket, PacketPosition, sequence_less_than};
 use bytes::Bytes;
 
 pub(crate) struct AssembledMessage {
@@ -6,6 +6,7 @@ pub(crate) struct AssembledMessage {
     pub message_number: u32,
     pub timestamp: u32,
     pub first_sequence_number: u32,
+    pub packet_count: u32,
 }
 
 struct PartialMessage {
@@ -34,6 +35,7 @@ impl MessageAssembler {
                     message_number: packet.message_number,
                     timestamp: packet.timestamp,
                     payload: packet.payload,
+                    packet_count: 1,
                 })
             }
             PacketPosition::First => {
@@ -76,6 +78,7 @@ impl MessageAssembler {
                         .iter()
                         .map(|fragment| fragment.len())
                         .sum();
+                    let packet_count = partial.fragments.len() as u32;
                     let mut payload = Vec::with_capacity(total_len);
                     for fragment in partial.fragments {
                         payload.extend_from_slice(&fragment);
@@ -85,6 +88,7 @@ impl MessageAssembler {
                         message_number: partial.message_number,
                         timestamp: partial.timestamp,
                         first_sequence_number: partial.first_sequence_number,
+                        packet_count,
                     })
                 } else {
                     self.pending = None;
@@ -100,6 +104,20 @@ impl MessageAssembler {
             .as_ref()
             .is_some_and(|p| p.message_number == message_number)
         {
+            self.pending = None;
+        }
+    }
+
+    pub fn pending_packet_count(&self) -> u32 {
+        self.pending
+            .as_ref()
+            .map_or(0, |partial| partial.fragments.len() as u32)
+    }
+
+    pub fn discard_before(&mut self, sequence_number: u32) {
+        if self.pending.as_ref().is_some_and(|partial| {
+            sequence_less_than(partial.first_sequence_number, sequence_number)
+        }) {
             self.pending = None;
         }
     }
@@ -131,6 +149,7 @@ mod tests {
         assert_eq!(msg.payload, vec![1, 2, 3]);
         assert_eq!(msg.message_number, 0);
         assert_eq!(msg.first_sequence_number, 0);
+        assert_eq!(msg.packet_count, 1);
     }
 
     #[test]
@@ -146,6 +165,7 @@ mod tests {
         assert_eq!(msg.payload, vec![1, 2, 3, 4]);
         assert_eq!(msg.message_number, 5);
         assert_eq!(msg.first_sequence_number, 10);
+        assert_eq!(msg.packet_count, 2);
     }
 
     #[test]
@@ -163,6 +183,7 @@ mod tests {
             .feed(data_packet(2, 1, PacketPosition::Last, vec![30]))
             .expect("Last completes");
         assert_eq!(msg.payload, vec![10, 20, 30]);
+        assert_eq!(msg.packet_count, 3);
     }
 
     #[test]
@@ -221,6 +242,21 @@ mod tests {
         );
         asm.drop_message(99);
         assert!(asm.pending.is_some());
+    }
+
+    #[test]
+    fn sequence_advance_discards_only_obsolete_partial_message() {
+        let mut asm = MessageAssembler::new();
+        assert!(
+            asm.feed(data_packet(0x7fff_fffe, 7, PacketPosition::First, vec![1]))
+                .is_none()
+        );
+
+        asm.discard_before(0x7fff_fffe);
+        assert_eq!(asm.pending_packet_count(), 1);
+
+        asm.discard_before(1);
+        assert_eq!(asm.pending_packet_count(), 0);
     }
 
     #[test]

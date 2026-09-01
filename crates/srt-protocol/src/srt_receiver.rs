@@ -205,12 +205,11 @@ impl LossBitmap {
         )
     }
 
-    #[cfg(test)]
-    fn contains(&self, seq: &u32) -> bool {
-        if self.storage.is_empty() || self.offset(*seq).is_none() {
+    fn contains(&self, seq: u32) -> bool {
+        if self.storage.is_empty() || self.offset(seq).is_none() {
             return false;
         }
-        let index = self.bit_index(*seq);
+        let index = self.bit_index(seq);
         self.storage[index / 64] & (1u64 << (index % 64)) != 0
     }
 
@@ -745,6 +744,11 @@ pub struct ReceiverBuffer {
 
     delivery_seq_hint: Option<u32>,
 
+    /// Circularly oldest packet still retained locally. Unlike
+    /// `expected_seq`, this does not advance until TSBPD delivery or an
+    /// explicit drop retires the packet, so it anchors alias-free live span.
+    oldest_retained_seq: Option<u32>,
+
     /// The next expected sequence number.
     expected_seq: u32,
 
@@ -897,7 +901,8 @@ impl ReceiverBuffer {
         )
     }
 
-    pub(crate) fn with_buffer_size(
+    /// Create a receive buffer with an explicit permanent packet-window limit.
+    pub fn with_buffer_size(
         initial_seq: u32,
         tsbpd_delay_ms: u16,
         start_time: Timestamp,
@@ -908,6 +913,7 @@ impl ReceiverBuffer {
         Self {
             packets: BTreeMap::new(),
             delivery_seq_hint: None,
+            oldest_retained_seq: None,
             expected_seq: initial_seq,
             loss_detection_frontier: initial_seq.wrapping_sub(1) & 0x7FFF_FFFF,
             last_advertised_buffer: 0,
@@ -989,7 +995,7 @@ impl ReceiverBuffer {
 
         self.packets
             .retain(|&seq, _| !sequence_less_than(seq, sequence_number));
-        self.refresh_delivery_seq_hint();
+        self.refresh_retained_hints();
         let stale_losses: Vec<u32> = self
             .loss_list
             .iter()
@@ -1030,10 +1036,11 @@ impl ReceiverBuffer {
             return None;
         }
 
-        // Reject sequence numbers further than the flow window ahead of
-        // expected_seq — a conforming sender never exceeds this gap, so a
-        // larger one indicates a corrupted or malicious packet.
-        if seq.wrapping_sub(self.expected_seq) & 0x7FFF_FFFF > self.max_buffer_size {
+        // libsrt's circular receiver accepts offsets strictly below its
+        // capacity. Anchor that span at the oldest retained TSBPD packet when
+        // it precedes expected_seq, so progress cannot alias live storage in a
+        // future direct-indexed packet window.
+        if !self.sequence_fits_live_span(seq) || !self.has_capacity_for_packet(seq) {
             return None;
         }
 
@@ -1044,16 +1051,9 @@ impl ReceiverBuffer {
         self.update_jitter(now, packet.timestamp);
         self.check_tsbpd_wrap(packet.timestamp);
 
-        if self
-            .delivery_seq_hint
-            .is_none_or(|hint| sequence_less_than(seq, hint))
-        {
-            self.delivery_seq_hint = Some(seq);
-        }
-
         let new_loss_range = self.detect_losses(seq);
 
-        self.packets.insert(
+        self.insert_retained_packet(
             seq,
             ReceivedPacket {
                 position: packet.position,
@@ -1128,6 +1128,71 @@ impl ReceiverBuffer {
         })
     }
 
+    fn newly_exposed_loss_count(&self, seq: u32) -> u32 {
+        if sequence_greater_than(seq, self.loss_detection_frontier) {
+            let first = self.loss_detection_frontier.wrapping_add(1) & SEQUENCE_MASK;
+            seq.wrapping_sub(first) & SEQUENCE_MASK
+        } else {
+            0
+        }
+    }
+
+    fn protocol_occupancy(&self) -> u32 {
+        (self.packets.len() as u32).saturating_add(self.loss_list.len)
+    }
+
+    fn receive_occupancy(&self) -> u32 {
+        self.protocol_occupancy()
+            .saturating_add(self.application_backlog_packets)
+    }
+
+    fn has_capacity_for_packet(&self, seq: u32) -> bool {
+        let recovery_credit = u32::from(self.loss_list.contains(seq));
+        let delta = 1u32
+            .saturating_add(self.newly_exposed_loss_count(seq))
+            .saturating_sub(recovery_credit);
+        self.receive_occupancy()
+            .checked_add(delta)
+            .is_some_and(|occupancy| occupancy <= self.max_buffer_size)
+    }
+
+    fn packet_window_base(&self) -> u32 {
+        self.oldest_retained_seq
+            .filter(|&seq| sequence_less_than(seq, self.expected_seq))
+            .unwrap_or(self.expected_seq)
+    }
+
+    fn sequence_fits_live_span(&self, seq: u32) -> bool {
+        seq.wrapping_sub(self.packet_window_base()) & SEQUENCE_MASK < self.max_buffer_size
+    }
+
+    fn insert_retained_packet(&mut self, seq: u32, packet: ReceivedPacket) {
+        let replaced = self.packets.insert(seq, packet);
+        debug_assert!(
+            replaced.is_none(),
+            "duplicate packet passed receive preflight"
+        );
+        debug_assert_eq!(self.oldest_retained_seq, self.delivery_seq_hint);
+        if self
+            .oldest_retained_seq
+            .is_none_or(|oldest| sequence_less_than(seq, oldest))
+        {
+            self.oldest_retained_seq = Some(seq);
+            self.delivery_seq_hint = Some(seq);
+        }
+    }
+
+    fn remove_retained_packet(&mut self, seq: u32) -> Option<ReceivedPacket> {
+        let packet = self.packets.remove(&seq)?;
+        debug_assert_eq!(self.oldest_retained_seq, self.delivery_seq_hint);
+        if self.oldest_retained_seq == Some(seq) {
+            let next = self.next_sequence_after(seq);
+            self.oldest_retained_seq = next;
+            self.delivery_seq_hint = next;
+        }
+        Some(packet)
+    }
+
     fn advance_expected_seq(&mut self, was_expected: bool, recovered_loss: bool) {
         if was_expected && !recovered_loss {
             self.expected_seq = self.expected_seq.wrapping_add(1) & 0x7FFF_FFFF;
@@ -1170,10 +1235,7 @@ impl ReceiverBuffer {
         // Find a deliverable sequence number.
         let delivery_seq = self.find_deliverable_seq(now)?;
 
-        let entry = self.packets.remove(&delivery_seq)?;
-        if self.delivery_seq_hint == Some(delivery_seq) {
-            self.delivery_seq_hint = self.next_sequence_after(delivery_seq);
-        }
+        let entry = self.remove_retained_packet(delivery_seq)?;
 
         // Detect the end of the TSBPD wraparound period.
         // Per spec (draft-sharabayko-srt.md, #tsbpd-time-base section):
@@ -1271,12 +1333,14 @@ impl ReceiverBuffer {
             .or_else(|| self.packets.keys().next().copied())
     }
 
-    fn refresh_delivery_seq_hint(&mut self) {
-        self.delivery_seq_hint = self
+    fn refresh_retained_hints(&mut self) {
+        let oldest = self
             .packets
             .keys()
             .copied()
             .reduce(|a, b| if sequence_less_than(a, b) { a } else { b });
+        self.delivery_seq_hint = oldest;
+        self.oldest_retained_seq = oldest;
     }
 
     #[cfg(test)]
@@ -1371,12 +1435,17 @@ impl ReceiverBuffer {
     /// Update application-owned receive occupancy maintained by the owning
     /// connection as it queues and polls `DataReceived` events.
     pub(crate) fn set_application_backlog_packets(&mut self, packets: u32) {
+        debug_assert!(
+            self.protocol_occupancy().saturating_add(packets) <= self.max_buffer_size,
+            "application backlog must transfer occupied packet positions from the receiver"
+        );
         self.application_backlog_packets = packets.min(self.max_buffer_size);
     }
 
     fn available_buffer_packets(&self) -> u32 {
         self.max_buffer_size
             .saturating_sub(self.packets.len() as u32)
+            .saturating_sub(self.loss_list.len)
             .saturating_sub(self.application_backlog_packets)
     }
 
@@ -1534,7 +1603,7 @@ impl ReceiverBuffer {
         }
 
         if sequence_greater_than(first_seq, self.expected_seq)
-            && first_seq.wrapping_sub(self.expected_seq) & SEQUENCE_MASK > self.max_buffer_size
+            && first_seq.wrapping_sub(self.expected_seq) & SEQUENCE_MASK >= self.max_buffer_size
         {
             return Err(Error::invalid_data(
                 "DROPREQ begins beyond the expected receive window",
@@ -1555,6 +1624,25 @@ impl ReceiverBuffer {
             }
         }
 
+        if sequence_greater_than(last_seq, self.packet_window_base())
+            && !self.sequence_fits_live_span(last_seq)
+        {
+            return Err(Error::invalid_data(
+                "DROPREQ ends beyond the live receive window",
+            ));
+        }
+
+        let new_losses = self.newly_exposed_loss_count(first_seq);
+        if self
+            .receive_occupancy()
+            .checked_add(new_losses)
+            .is_none_or(|occupancy| occupancy > self.max_buffer_size)
+        {
+            return Err(Error::invalid_data(
+                "DROPREQ would exceed receive buffer occupancy",
+            ));
+        }
+
         Ok(distance)
     }
 
@@ -1566,10 +1654,6 @@ impl ReceiverBuffer {
     pub fn drop_range(&mut self, first_seq: u32, last_seq: u32) -> Result<DropRangeSummary, Error> {
         let distance = self.validate_drop_range(first_seq, last_seq)?;
         let sequence_count = distance + 1;
-        let hint_was_dropped = self
-            .delivery_seq_hint
-            .is_some_and(|seq| sequence_in_range(first_seq, distance, seq));
-
         // A DROPREQ can be the first evidence of sequence progress beyond the
         // classification frontier. Any intervening positions are genuine
         // newly exposed losses; the requested interval itself is accounted as
@@ -1583,10 +1667,6 @@ impl ReceiverBuffer {
         // receive window), independent of unrelated retained TSBPD packets.
         let packets_removed = self.remove_drop_packets(first_seq, last_seq);
         let losses_removed = self.remove_drop_losses(first_seq, sequence_count);
-
-        if hint_was_dropped {
-            self.delivery_seq_hint = self.next_sequence_after(last_seq);
-        }
 
         self.total_dropped = self.total_dropped.saturating_add(u64::from(sequence_count));
         self.advance_expected_after_drop(first_seq, distance);
@@ -1607,6 +1687,10 @@ impl ReceiverBuffer {
     }
 
     fn remove_drop_packets(&mut self, first_seq: u32, last_seq: u32) -> u32 {
+        let distance = last_seq.wrapping_sub(first_seq) & SEQUENCE_MASK;
+        let oldest_was_dropped = self
+            .oldest_retained_seq
+            .is_some_and(|oldest| sequence_in_range(first_seq, distance, oldest));
         let mut packets_removed = 0;
         if first_seq <= last_seq {
             while let Some(seq) = self
@@ -1627,6 +1711,11 @@ impl ReceiverBuffer {
                 self.packets.remove(&seq);
                 packets_removed += 1;
             }
+        }
+        if oldest_was_dropped {
+            let next = self.next_sequence_after(last_seq);
+            self.oldest_retained_seq = next;
+            self.delivery_seq_hint = next;
         }
         packets_removed
     }
@@ -1974,7 +2063,7 @@ mod tests {
         losses.set_base(0x7FFF_FFFF);
         assert_eq!(losses.first(), Some(0x7FFF_FFFF));
         assert!(!losses.remove(63));
-        assert!(losses.contains(&0x7FFF_FFFF));
+        assert!(losses.contains(0x7FFF_FFFF));
     }
 
     #[test]
@@ -2063,6 +2152,147 @@ mod tests {
             "the rejected far-future packet must not add loss entries"
         );
         assert_eq!(buf.expected_sequence(), 1000);
+    }
+
+    #[test]
+    fn receiver_enforces_strict_flow_window_boundary_and_retained_capacity() {
+        const WINDOW: u32 = 32;
+        let now = Timestamp::from_micros(1);
+        let mut buf = ReceiverBuffer::with_buffer_size(0, 120, Timestamp::default(), 0, WINDOW);
+
+        // Future TSBPD timestamps retain every in-order packet even while the
+        // ACK position advances beyond them.
+        for seq in 0..WINDOW {
+            assert_eq!(
+                buf.receive(make_packet(seq, 1_000_000_000 + seq), now),
+                None
+            );
+        }
+        assert_eq!(buf.expected_sequence(), WINDOW);
+        assert_eq!(buf.packets.len(), WINDOW as usize);
+        assert_eq!(buf.oldest_retained_seq, Some(0));
+        assert_eq!(buf.receive_occupancy(), WINDOW);
+        assert_eq!(buf.available_buffer_packets(), 0);
+
+        // libsrt's ring boundary is offset < capacity: position 32 cannot
+        // coexist with retained position 0 in a 32-slot window.
+        assert_eq!(
+            buf.receive(make_packet(WINDOW, 1_000_000_000 + WINDOW), now),
+            None
+        );
+        assert_eq!(buf.stats().total_received, u64::from(WINDOW));
+        assert_eq!(buf.packets.len(), WINDOW as usize);
+        assert_eq!(buf.loss_detection_frontier, WINDOW - 1);
+    }
+
+    #[test]
+    fn loss_reservations_allow_recovery_at_zero_free_capacity() {
+        const WINDOW: u32 = 32;
+        let now = Timestamp::from_micros(1);
+        let mut buf = ReceiverBuffer::with_buffer_size(0, 120, Timestamp::default(), 0, WINDOW);
+
+        assert_eq!(
+            buf.receive(make_packet(WINDOW - 1, 1_000_000_000), now),
+            Some(loss_range(0, WINDOW - 2))
+        );
+        assert_eq!(buf.packets.len(), 1);
+        assert_eq!(buf.loss_list.len, WINDOW - 1);
+        assert_eq!(buf.receive_occupancy(), WINDOW);
+        assert_eq!(buf.available_buffer_packets(), 0);
+
+        // Replacing one reserved loss with its packet has zero occupancy
+        // delta and must remain admissible even at an advertised zero window.
+        assert_eq!(buf.receive(make_packet(0, 1_000_000_000), now), None);
+        assert!(buf.packets.contains_key(&0));
+        assert!(!buf.loss_list.contains(0));
+        assert_eq!(buf.packets.len(), 2);
+        assert_eq!(buf.loss_list.len, WINDOW - 2);
+        assert_eq!(buf.receive_occupancy(), WINDOW);
+        assert_eq!(buf.available_buffer_packets(), 0);
+    }
+
+    #[test]
+    fn retained_packet_anchors_drop_progress_across_sequence_wrap() {
+        const WINDOW: u32 = 32;
+        let now = Timestamp::from_micros(1);
+
+        for initial in [0, SEQUENCE_MASK - 15] {
+            let mut buf =
+                ReceiverBuffer::with_buffer_size(initial, 120, Timestamp::default(), 0, WINDOW);
+            assert_eq!(buf.receive(make_packet(initial, 1_000_000_000), now), None);
+
+            for offset in 1..WINDOW {
+                let seq = initial.wrapping_add(offset) & SEQUENCE_MASK;
+                buf.drop_range(seq, seq)
+                    .expect("drop remains inside retained packet span");
+            }
+            let outside = initial.wrapping_add(WINDOW) & SEQUENCE_MASK;
+            let error = buf
+                .drop_range(outside, outside)
+                .expect_err("retained packet prevents a second ring revolution");
+            assert_eq!(error.kind, crate::error::ErrorKind::InvalidData);
+            assert_eq!(buf.oldest_retained_seq, Some(initial));
+            assert_eq!(buf.packets.len(), 1);
+        }
+    }
+
+    #[test]
+    fn application_backlog_consumes_and_restores_receive_capacity() {
+        const WINDOW: u32 = 32;
+        let now = Timestamp::from_micros(1);
+        let mut buf = ReceiverBuffer::with_buffer_size(0, 120, Timestamp::default(), 0, WINDOW);
+        buf.set_tsbpd_enabled(false);
+
+        buf.set_application_backlog_packets(WINDOW);
+        assert_eq!(buf.available_buffer_packets(), 0);
+        assert_eq!(buf.receive(make_packet(0, 1), now), None);
+        assert_eq!(buf.stats().total_received, 0);
+
+        buf.set_application_backlog_packets(WINDOW - 1);
+        assert_eq!(buf.receive(make_packet(0, 1), now), None);
+        assert_eq!(buf.stats().total_received, 1);
+        assert_eq!(buf.receive_occupancy(), WINDOW);
+
+        buf.set_application_backlog_packets(0);
+        assert_eq!(buf.available_buffer_packets(), WINDOW - 1);
+    }
+
+    #[test]
+    fn application_backlog_bounds_forward_drop_loss_reservations() {
+        const WINDOW: u32 = 32;
+        let mut buf = ReceiverBuffer::with_buffer_size(0, 120, Timestamp::default(), 0, WINDOW);
+        buf.set_application_backlog_packets(WINDOW - 1);
+
+        let error = buf
+            .drop_range(2, 2)
+            .expect_err("two new losses do not fit beside 31 queued packets");
+        assert_eq!(error.kind, crate::error::ErrorKind::InvalidData);
+        assert_eq!(buf.loss_detection_frontier, SEQUENCE_MASK);
+        assert!(buf.loss_list.is_empty());
+
+        buf.set_application_backlog_packets(WINDOW - 2);
+        buf.drop_range(2, 2)
+            .expect("two reservations exactly fill the receive capacity");
+        assert_eq!(buf.loss_list.len, 2);
+        assert_eq!(buf.receive_occupancy(), WINDOW);
+        assert_eq!(buf.available_buffer_packets(), 0);
+    }
+
+    #[test]
+    fn forced_advance_retires_old_packets_before_rebasing_live_span() {
+        const WINDOW: u32 = 32;
+        let now = Timestamp::from_micros(1);
+        let mut buf = ReceiverBuffer::with_buffer_size(0, 120, Timestamp::default(), 0, WINDOW);
+        assert_eq!(buf.receive(make_packet(0, 1_000_000_000), now), None);
+        assert_eq!(buf.oldest_retained_seq, Some(0));
+
+        buf.advance_expected_sequence(WINDOW);
+        assert!(buf.packets.is_empty());
+        assert_eq!(buf.oldest_retained_seq, None);
+        assert_eq!(buf.expected_sequence(), WINDOW);
+
+        assert_eq!(buf.receive(make_packet(WINDOW, 1_000_000_000), now), None);
+        assert_eq!(buf.oldest_retained_seq, Some(WINDOW));
     }
 
     /// Regression for the `find_deliverable_seq` "fast path 2" argument
@@ -2715,7 +2945,7 @@ mod tests {
             let loss = if index == 0 { 0 } else { seq - 1 };
             assert_eq!(losses, Some(loss_range(loss, loss)));
         }
-        assert!(buf.loss_list.contains(&0));
+        assert!(buf.loss_list.contains(0));
     }
 
     #[test]
@@ -3023,10 +3253,10 @@ mod tests {
         // 最も新しい 1 のみ受信する。循環順最古の
         // 0x7FFF_FFFD になるはず。
         buf.receive(make_packet(1, 100), now);
-        assert!(buf.loss_list.contains(&0x7FFF_FFFD));
-        assert!(buf.loss_list.contains(&0x7FFF_FFFE));
-        assert!(buf.loss_list.contains(&0x7FFF_FFFF));
-        assert!(buf.loss_list.contains(&0));
+        assert!(buf.loss_list.contains(0x7FFF_FFFD));
+        assert!(buf.loss_list.contains(0x7FFF_FFFE));
+        assert!(buf.loss_list.contains(0x7FFF_FFFF));
+        assert!(buf.loss_list.contains(0));
 
         // 循環順最古の欠損 (0x7FFF_FFFD) が回復する。新しい最小値は
         // 残りの中で循環順最古の 0x7FFF_FFFE になるはず。
@@ -3116,7 +3346,7 @@ mod tests {
 
         // 1002 を受信して 1001 を損失として登録する。
         buf.receive(make_packet(1002, 200_000), now);
-        assert!(buf.loss_list.contains(&1001));
+        assert!(buf.loss_list.contains(1001));
 
         // wrapping_period_active が有効な場合、次側パケット seq 1002 の delivery_time が
         // 推定配信時刻として使用される。seq 1002 の delivery_time はラップ補正付きで
@@ -3502,8 +3732,8 @@ mod tests {
         let mut buf = ReceiverBuffer::with_buffer_size(0, 120, Timestamp::default(), 0, 32);
         buf.set_tsbpd_enabled(false);
         assert_eq!(
-            buf.receive(make_packet(32, 1), now),
-            Some(loss_range(0, 31))
+            buf.receive(make_packet(31, 1), now),
+            Some(loss_range(0, 30))
         );
 
         let frontier = buf.loss_detection_frontier;
@@ -3514,7 +3744,7 @@ mod tests {
         assert_eq!(buf.loss_detection_frontier, frontier);
         assert_eq!(
             buf.generate_periodic_nak().unwrap().loss_ranges,
-            vec![loss_range(0, 31)]
+            vec![loss_range(0, 30)]
         );
     }
 
@@ -3601,20 +3831,21 @@ mod tests {
 
     #[test]
     fn tiny_drop_range_is_local_with_many_future_tsbpd_packets() {
-        const RETAINED_PACKETS: u32 = 32_768;
+        const RETAINED_PACKETS: u32 = if cfg!(miri) { 256 } else { 32_768 };
         const DROPPED_SEQUENCE: u32 = RETAINED_PACKETS / 2;
         let received_at = Timestamp::from_micros(1);
-        let mut buf = ReceiverBuffer::new(0, 120, Timestamp::from_micros(0), 0);
+        let mut buf =
+            ReceiverBuffer::with_buffer_size(0, 120, Timestamp::from_micros(0), 0, MAX_FLOW_WINDOW);
 
         // In-order receive advances expected_seq even though future TSBPD
-        // timestamps keep every packet retained. This deliberately exceeds
-        // the negotiated flow window and exercises the state shape that made
-        // a whole-map DROPREQ scan unsafe.
+        // timestamps keep every packet retained. A maximum configured window
+        // preserves the large-map DROPREQ complexity case without violating
+        // the receiver's hard local occupancy bound.
         for seq in 0..RETAINED_PACKETS {
             buf.receive(make_packet(seq, 1_000_000_000 + seq), received_at);
         }
         assert_eq!(buf.packets.len(), RETAINED_PACKETS as usize);
-        assert!(buf.packets.len() > buf.max_buffer_size as usize);
+        assert!(buf.packets.len() < buf.max_buffer_size as usize);
         assert_eq!(buf.delivery_seq_hint, Some(0));
 
         let summary = buf
@@ -3681,8 +3912,8 @@ mod tests {
         assert_eq!(summary.sequence_count, 3);
         assert!(!buf.packets.contains_key(&102));
         assert!(buf.packets.contains_key(&104));
-        assert!(!buf.loss_list.contains(&101));
-        assert!(!buf.loss_list.contains(&103));
+        assert!(!buf.loss_list.contains(101));
+        assert!(!buf.loss_list.contains(103));
         assert_eq!(buf.expected_sequence(), 105);
     }
 }

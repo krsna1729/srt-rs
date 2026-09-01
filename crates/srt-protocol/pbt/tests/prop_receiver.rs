@@ -263,6 +263,47 @@ proptest! {
     }
 
     #[test]
+    fn receiver_state_machine_preserves_hard_occupancy(
+        initial_seq in any::<u32>(),
+        actions in prop::collection::vec((0u8..4, any::<u16>()), 1..160),
+    ) {
+        const SEQUENCE_MASK: u32 = 0x7FFF_FFFF;
+        let initial_seq = initial_seq & SEQUENCE_MASK;
+        let now = Timestamp::from_micros(1_000);
+        let mut buf = ReceiverBuffer::new(initial_seq, 120, Timestamp::default(), 0);
+        buf.set_tsbpd_enabled(false);
+
+        for (opcode, raw_offset) in actions {
+            let offset = u32::from(raw_offset) % 512;
+            let seq = initial_seq.wrapping_add(offset) & SEQUENCE_MASK;
+            match opcode {
+                0 => {
+                    let _ = buf.receive(make_packet(seq, offset), now);
+                }
+                1 => {
+                    let _ = buf.drop_range(seq, seq);
+                }
+                2 => buf.advance_expected_sequence(seq),
+                _ => {
+                    let _ = buf.pop_ready(now);
+                }
+            }
+
+            let stats = buf.stats();
+            let losses = buf
+                .generate_periodic_nak()
+                .map_or(0, |nak| expand_nak(nak).len() as u32);
+            prop_assert_eq!(
+                stats
+                    .packets_in_buffer
+                    .saturating_add(losses)
+                    .saturating_add(stats.available_buffer_packets),
+                stats.max_buffer_packets
+            );
+        }
+    }
+
+    #[test]
     fn test_receiver_buffer_stats(
         initial_seq in 0u32..0x7FFF_FF00u32,
         count in 1usize..20usize,
@@ -620,23 +661,26 @@ proptest! {
         let mut buf = ReceiverBuffer::new(initial, 120, Timestamp::default(), 0);
         buf.set_tsbpd_enabled(false);
 
-        let edge = initial.wrapping_add(DEFAULT_FLOW_WINDOW) & SEQUENCE_MASK;
+        let edge = initial.wrapping_add(DEFAULT_FLOW_WINDOW - 1) & SEQUENCE_MASK;
         prop_assert_eq!(
             buf.receive(make_packet(edge, 0), now)
                 .unwrap()
                 .sequence_count(),
-            DEFAULT_FLOW_WINDOW
+            DEFAULT_FLOW_WINDOW - 1
         );
         let first_drop = edge.wrapping_add(beyond_window) & SEQUENCE_MASK;
         prop_assert!(buf.drop_range(first_drop, first_drop).is_err());
 
         let nak = expand_nak(buf.generate_periodic_nak().unwrap());
-        prop_assert_eq!(nak.len(), DEFAULT_FLOW_WINDOW as usize);
+        prop_assert_eq!(nak.len(), DEFAULT_FLOW_WINDOW as usize - 1);
         let all_losses_fit = nak.iter().all(|&seq| {
             seq.wrapping_sub(initial) & SEQUENCE_MASK < DEFAULT_FLOW_WINDOW
         });
         prop_assert!(all_losses_fit);
-        prop_assert_eq!(buf.stats().total_lost, u64::from(DEFAULT_FLOW_WINDOW));
+        prop_assert_eq!(
+            buf.stats().total_lost,
+            u64::from(DEFAULT_FLOW_WINDOW - 1)
+        );
     }
 
     #[test]

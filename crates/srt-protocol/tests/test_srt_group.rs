@@ -62,6 +62,22 @@ fn packets_from(connection: &mut SrtConnection) -> Vec<Vec<u8>> {
     packets
 }
 
+fn transfer_to_group_member(
+    source: &mut SrtConnection,
+    group: &mut SrtGroup,
+    member_id: u32,
+    now: Timestamp,
+) {
+    for packet in packets_from(source) {
+        group
+            .member_mut(member_id)
+            .expect("group member")
+            .connection_mut()
+            .feed_recv_buf(&packet, now)
+            .expect("packet should decode");
+    }
+}
+
 #[test]
 fn broadcast_sends_one_sequence_to_every_active_member() {
     let (mut caller_a, mut listener_a) = establish_pair();
@@ -205,6 +221,230 @@ fn broadcast_receive_deduplicates_and_advances_other_links() {
     assert_eq!(delivered.payload.as_ref(), b"hello");
     // Second copy is deduplicated — only one delivery.
     assert!(group.poll_data(ts(120_000)).is_none());
+    assert_eq!(
+        group
+            .member(1)
+            .unwrap()
+            .connection()
+            .receiver_stats()
+            .unwrap()
+            .available_buffer_packets,
+        8_192
+    );
+    assert_eq!(
+        group
+            .member(2)
+            .unwrap()
+            .connection()
+            .receiver_stats()
+            .unwrap()
+            .available_buffer_packets,
+        8_192
+    );
+}
+
+#[test]
+fn fragmented_group_message_advances_by_every_reassembled_packet() {
+    const SEQUENCE_MASK: u32 = 0x7fff_ffff;
+
+    for initial_seq in [100, SEQUENCE_MASK - 1] {
+        let options = ConnectionOptions {
+            initial_seq: Some(initial_seq),
+            tsbpd_delay: 0,
+            ..ConnectionOptions::default()
+        };
+        let (mut source, listener) = establish_pair_with_options(options);
+        let mut group = SrtGroup::new(0x4000_0019, GroupMode::Backup).unwrap();
+        group.add_member(1, 1, listener).unwrap();
+
+        let fragmented = vec![0x5a; 3_000];
+        source.send_message(&fragmented, ts(100_000)).unwrap();
+        source.send(b"following", ts(100_001)).unwrap();
+        for packet in packets_from(&mut source) {
+            group
+                .member_mut(1)
+                .unwrap()
+                .connection_mut()
+                .feed_recv_buf(&packet, ts(110_000))
+                .unwrap();
+        }
+
+        let first = group.poll_data(ts(120_000)).unwrap();
+        assert_eq!(first.sequence_number, initial_seq);
+        assert_eq!(first.packet_count, 3);
+        assert_eq!(first.payload.as_ref(), fragmented);
+
+        let following = group.poll_data(ts(120_000)).unwrap();
+        assert_eq!(
+            following.sequence_number,
+            initial_seq.wrapping_add(3) & SEQUENCE_MASK
+        );
+        assert_eq!(following.packet_count, 1);
+        assert_eq!(following.payload.as_ref(), b"following");
+    }
+}
+
+#[test]
+fn group_pending_payloads_remain_charged_to_the_member_window() {
+    const WINDOW: u32 = 32;
+    let options = ConnectionOptions {
+        initial_seq: Some(0),
+        tsbpd_delay: 0,
+        flow_window_packets: WINDOW,
+        receive_buffer_packets: WINDOW,
+        delivery_queue_packets: WINDOW,
+        ..ConnectionOptions::default()
+    };
+    let (mut source, listener) = establish_pair_with_options(options);
+    let mut group = SrtGroup::new(0x4000_001a, GroupMode::Backup).unwrap();
+    group.add_member(1, 1, listener).unwrap();
+
+    for sequence_number in 0..WINDOW {
+        source.send(&[sequence_number as u8], ts(100_000)).unwrap();
+    }
+    for packet in packets_from(&mut source) {
+        group
+            .member_mut(1)
+            .unwrap()
+            .connection_mut()
+            .feed_recv_buf(&packet, ts(110_000))
+            .unwrap();
+    }
+
+    assert_eq!(group.poll_data(ts(120_000)).unwrap().sequence_number, 0);
+    assert_eq!(
+        group
+            .member(1)
+            .unwrap()
+            .connection()
+            .receiver_stats()
+            .unwrap()
+            .available_buffer_packets,
+        1
+    );
+
+    for expected in 1..WINDOW {
+        assert_eq!(
+            group.poll_data(ts(120_000)).unwrap().sequence_number,
+            expected
+        );
+    }
+    assert_eq!(
+        group
+            .member(1)
+            .unwrap()
+            .connection()
+            .receiver_stats()
+            .unwrap()
+            .available_buffer_packets,
+        WINDOW
+    );
+}
+
+#[test]
+fn group_catch_up_discards_obsolete_partial_member_message() {
+    const WINDOW: u32 = 32;
+    let options = ConnectionOptions {
+        initial_seq: Some(100),
+        tsbpd_delay: 0,
+        flow_window_packets: WINDOW,
+        receive_buffer_packets: WINDOW,
+        ..ConnectionOptions::default()
+    };
+    let (mut source_a, listener_a) = establish_pair_with_options(options.clone());
+    let (mut source_b, listener_b) = establish_pair_with_options(options);
+    let mut group = SrtGroup::new(0x4000_001b, GroupMode::Broadcast).unwrap();
+    group.add_member(1, 1, listener_a).unwrap();
+    group.add_member(2, 1, listener_b).unwrap();
+
+    let fragmented = vec![0x33; 3_000];
+    source_a.send_message(&fragmented, ts(100_000)).unwrap();
+    source_b.send_message(&fragmented, ts(100_000)).unwrap();
+    for packet in packets_from(&mut source_a) {
+        group
+            .member_mut(1)
+            .unwrap()
+            .connection_mut()
+            .feed_recv_buf(&packet, ts(110_000))
+            .unwrap();
+    }
+    let first_fragment = packets_from(&mut source_b).remove(0);
+    group
+        .member_mut(2)
+        .unwrap()
+        .connection_mut()
+        .feed_recv_buf(&first_fragment, ts(110_000))
+        .unwrap();
+
+    let delivered = group.poll_data(ts(120_000)).unwrap();
+    assert_eq!(delivered.packet_count, 3);
+    assert_eq!(delivered.payload.as_ref(), fragmented);
+    assert_eq!(
+        group
+            .member(2)
+            .unwrap()
+            .connection()
+            .receiver_stats()
+            .unwrap()
+            .available_buffer_packets,
+        WINDOW
+    );
+}
+
+#[test]
+fn fragmented_group_delivery_releases_already_pending_overlaps() {
+    const WINDOW: u32 = 32;
+    let options_a = ConnectionOptions {
+        initial_seq: Some(100),
+        tsbpd_delay: 0,
+        flow_window_packets: WINDOW,
+        receive_buffer_packets: WINDOW,
+        ..ConnectionOptions::default()
+    };
+    let options_b = ConnectionOptions {
+        initial_seq: Some(101),
+        ..options_a.clone()
+    };
+    let (mut source_a, listener_a) = establish_pair_with_options(options_a);
+    let (mut source_b, listener_b) = establish_pair_with_options(options_b);
+    let mut group = SrtGroup::new(0x4000_001c, GroupMode::Broadcast).unwrap();
+    group.add_member(1, 1, listener_a).unwrap();
+    group.add_member(2, 1, listener_b).unwrap();
+
+    source_a
+        .send_message(&vec![0x44; 3_000], ts(100_000))
+        .unwrap();
+    source_b.send(b"overlap-101", ts(100_000)).unwrap();
+    source_b.send(b"overlap-102", ts(100_001)).unwrap();
+    for packet in packets_from(&mut source_a) {
+        group
+            .member_mut(1)
+            .unwrap()
+            .connection_mut()
+            .feed_recv_buf(&packet, ts(110_000))
+            .unwrap();
+    }
+    for packet in packets_from(&mut source_b) {
+        group
+            .member_mut(2)
+            .unwrap()
+            .connection_mut()
+            .feed_recv_buf(&packet, ts(110_000))
+            .unwrap();
+    }
+
+    assert_eq!(group.poll_data(ts(120_000)).unwrap().packet_count, 3);
+    assert!(group.poll_data(ts(120_000)).is_none());
+    assert_eq!(
+        group
+            .member(2)
+            .unwrap()
+            .connection()
+            .receiver_stats()
+            .unwrap()
+            .available_buffer_packets,
+        WINDOW
+    );
 }
 
 #[test]
@@ -343,6 +583,86 @@ fn backup_removal_promotes_highest_weight_with_stable_tie_break() {
     assert_eq!(group.send(b"failover", ts(100_000)).unwrap(), 1);
     assert_eq!(group.member(3).unwrap().state(), GroupMemberState::Active);
     assert_eq!(group.member(5).unwrap().state(), GroupMemberState::Standby);
+}
+
+#[test]
+fn removed_pending_owner_cannot_alias_a_reused_member_id() {
+    const WINDOW: u32 = 32;
+    let options = |initial_seq| ConnectionOptions {
+        initial_seq: Some(initial_seq),
+        tsbpd_delay: 0,
+        flow_window_packets: WINDOW,
+        receive_buffer_packets: WINDOW,
+        ..ConnectionOptions::default()
+    };
+    let (mut gap_source, gap_member) = establish_pair_with_options(options(100));
+    let (mut old_source, old_member) = establish_pair_with_options(options(102));
+    let mut group = SrtGroup::new(0x4000_001d, GroupMode::Broadcast).unwrap();
+    group.add_member(1, 1, old_member).unwrap();
+    group.add_member(2, 1, gap_member).unwrap();
+
+    gap_source.send(b"start", ts(100_000)).unwrap();
+    transfer_to_group_member(&mut gap_source, &mut group, 2, ts(110_000));
+    assert_eq!(group.poll_data(ts(120_000)).unwrap().sequence_number, 100);
+
+    old_source.send(b"future", ts(120_001)).unwrap();
+    transfer_to_group_member(&mut old_source, &mut group, 1, ts(120_001));
+    assert!(group.poll_data(ts(120_001)).is_none());
+
+    let removed = group.remove_member_connection(1).unwrap();
+    assert_eq!(
+        removed.receiver_stats().unwrap().available_buffer_packets,
+        WINDOW
+    );
+    let (_replacement_source, replacement) = establish_pair_with_options(options(102));
+    group.add_member(1, 1, replacement).unwrap();
+
+    gap_source.send(b"close gap", ts(130_000)).unwrap();
+    transfer_to_group_member(&mut gap_source, &mut group, 2, ts(130_000));
+    assert_eq!(group.poll_data(ts(140_000)).unwrap().sequence_number, 101);
+    assert!(group.poll_data(ts(140_000)).is_none());
+    assert_eq!(
+        group
+            .member(1)
+            .unwrap()
+            .connection()
+            .receiver_stats()
+            .unwrap()
+            .available_buffer_packets,
+        WINDOW
+    );
+}
+
+#[test]
+fn member_churn_cannot_accumulate_uncharged_pending_payloads() {
+    let options = |initial_seq| ConnectionOptions {
+        initial_seq: Some(initial_seq),
+        tsbpd_delay: 0,
+        flow_window_packets: 32,
+        receive_buffer_packets: 32,
+        ..ConnectionOptions::default()
+    };
+    let (mut gap_source, gap_member) = establish_pair_with_options(options(100));
+    let mut group = SrtGroup::new(0x4000_001e, GroupMode::Broadcast).unwrap();
+    group.add_member(2, 1, gap_member).unwrap();
+
+    gap_source.send(b"start", ts(100_000)).unwrap();
+    transfer_to_group_member(&mut gap_source, &mut group, 2, ts(110_000));
+    assert_eq!(group.poll_data(ts(120_000)).unwrap().sequence_number, 100);
+
+    for iteration in 0..32 {
+        let (mut source, member) = establish_pair_with_options(options(102));
+        group.add_member(1, 1, member).unwrap();
+        source.send(&[iteration], ts(120_001)).unwrap();
+        transfer_to_group_member(&mut source, &mut group, 1, ts(120_001));
+        assert!(group.poll_data(ts(120_001)).is_none());
+        assert!(group.remove_member(1));
+    }
+
+    gap_source.send(b"close gap", ts(130_000)).unwrap();
+    transfer_to_group_member(&mut gap_source, &mut group, 2, ts(130_000));
+    assert_eq!(group.poll_data(ts(140_000)).unwrap().sequence_number, 101);
+    assert!(group.poll_data(ts(140_000)).is_none());
 }
 
 #[test]

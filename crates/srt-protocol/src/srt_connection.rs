@@ -159,6 +159,8 @@ pub enum ConnectionEvent {
         sequence_number: u32,
         message_number: u32,
         timestamp: u32,
+        /// Number of SRT DATA packets represented by this reassembled message.
+        packet_count: u32,
     },
     /// State changed.
     StateChanged(ConnectionState),
@@ -352,6 +354,9 @@ pub struct SrtConnection {
     /// DATA events waiting for application consumption. Control/state events
     /// are state-machine bounded; DATA is the unbounded-rate class.
     pending_data_events: u32,
+    /// DATA packet positions retained by queued application events. This is
+    /// distinct from the event count because one message can span many packets.
+    pending_data_packets: u32,
     /// Output queue.
     output_queue: VecDeque<ConnectionOutput>,
 
@@ -486,6 +491,7 @@ impl SrtConnection {
             event_queue: VecDeque::new(),
             key_refresh_notified: false,
             pending_data_events: 0,
+            pending_data_packets: 0,
             output_queue: VecDeque::new(),
             start_time: None,
             last_ack_time: None,
@@ -526,6 +532,7 @@ impl SrtConnection {
             event_queue: VecDeque::new(),
             key_refresh_notified: false,
             pending_data_events: 0,
+            pending_data_packets: 0,
             output_queue: VecDeque::new(),
             start_time: None,
             last_ack_time: None,
@@ -1235,7 +1242,9 @@ impl SrtConnection {
         let Some(receiver) = self.receiver.as_mut() else {
             return;
         };
+        self.assembler.discard_before(sequence_number);
         receiver.advance_expected_sequence(sequence_number);
+        self.sync_application_backlog();
         self.enqueue_ready_data(now);
     }
 
@@ -1285,12 +1294,28 @@ impl SrtConnection {
 
     /// Get an event.
     pub fn poll_event(&mut self) -> Option<ConnectionEvent> {
+        self.poll_event_inner(false)
+    }
+
+    pub(crate) fn poll_event_for_group(&mut self) -> Option<ConnectionEvent> {
+        self.poll_event_inner(true)
+    }
+
+    fn poll_event_inner(&mut self, retain_data_reservation: bool) -> Option<ConnectionEvent> {
         let event = self.event_queue.pop_front()?;
-        if matches!(event, ConnectionEvent::DataReceived { .. }) {
+        if let ConnectionEvent::DataReceived { packet_count, .. } = &event {
             self.pending_data_events = self.pending_data_events.saturating_sub(1);
-            self.sync_application_backlog();
+            if !retain_data_reservation {
+                self.release_data_reservation(*packet_count);
+            }
         }
         Some(event)
+    }
+
+    pub(crate) fn release_data_reservation(&mut self, packet_count: u32) {
+        debug_assert!(packet_count <= self.pending_data_packets);
+        self.pending_data_packets = self.pending_data_packets.saturating_sub(packet_count);
+        self.sync_application_backlog();
     }
 
     /// Get an output.
@@ -1429,8 +1454,11 @@ impl SrtConnection {
                     sequence_number: msg.first_sequence_number,
                     message_number: msg.message_number,
                     timestamp: msg.timestamp,
+                    packet_count: msg.packet_count,
                 });
                 self.pending_data_events = self.pending_data_events.saturating_add(1);
+                self.pending_data_packets =
+                    self.pending_data_packets.saturating_add(msg.packet_count);
             }
         }
         self.sync_application_backlog();
@@ -1483,7 +1511,10 @@ impl SrtConnection {
 
     fn sync_application_backlog(&mut self) {
         if let Some(receiver) = self.receiver.as_mut() {
-            receiver.set_application_backlog_packets(self.pending_data_events);
+            receiver.set_application_backlog_packets(
+                self.pending_data_packets
+                    .saturating_add(self.assembler.pending_packet_count()),
+            );
         }
     }
 
@@ -3386,6 +3417,81 @@ mod tests {
                 .available_buffer_packets,
             1
         );
+    }
+
+    #[test]
+    fn fragmented_application_message_retains_each_receive_position() {
+        const PACKETS: u32 = 32;
+        let mut conn = SrtConnection::new_listener(ConnectionOptions {
+            tsbpd_delay: 0,
+            flow_window_packets: PACKETS,
+            receive_buffer_packets: PACKETS,
+            delivery_queue_packets: 1,
+            ..ConnectionOptions::default()
+        });
+        conn.set_state(ConnectionState::Connected);
+        let _ = conn.poll_event();
+        let now = Timestamp::from_micros(0);
+        conn.init_buffers(now, 0, 0);
+        conn.receiver
+            .as_mut()
+            .expect("connected listener has a receiver")
+            .set_tsbpd_enabled(false);
+
+        for sequence_number in 0..PACKETS {
+            let position = match sequence_number {
+                0 => crate::srt_packet::PacketPosition::First,
+                n if n == PACKETS - 1 => crate::srt_packet::PacketPosition::Last,
+                _ => crate::srt_packet::PacketPosition::Middle,
+            };
+            let mut packet = DataPacket::new(sequence_number, 7, 0, 0, vec![1].into());
+            packet.position = position;
+            conn.handle_data_packet(packet, now)
+                .expect("fragment is processed");
+        }
+
+        assert_eq!(conn.pending_data_events, 1);
+        assert_eq!(conn.pending_data_packets, PACKETS);
+        let stats = conn.receiver_stats().expect("receiver stats");
+        assert_eq!(stats.packets_in_buffer, 0);
+        assert_eq!(stats.available_buffer_packets, 0);
+
+        conn.handle_data_packet(DataPacket::new(PACKETS, 8, 0, 0, vec![2].into()), now)
+            .expect("full receiver drops without failing the connection");
+        assert_eq!(
+            conn.receiver_stats()
+                .expect("receiver stats")
+                .total_received,
+            u64::from(PACKETS)
+        );
+
+        assert!(matches!(
+            conn.poll_event(),
+            Some(ConnectionEvent::DataReceived {
+                packet_count: PACKETS,
+                ..
+            })
+        ));
+        assert_eq!(conn.pending_data_packets, 0);
+        assert_eq!(
+            conn.receiver_stats()
+                .expect("receiver stats")
+                .available_buffer_packets,
+            PACKETS
+        );
+    }
+
+    #[test]
+    fn delivery_packet_accounting_inline_footprint_stays_bounded() {
+        let connection_bytes = std::mem::size_of::<SrtConnection>();
+        let event_bytes = std::mem::size_of::<ConnectionEvent>();
+        let assembled_bytes = std::mem::size_of::<crate::message_assembler::AssembledMessage>();
+        eprintln!("SrtConnection inline footprint: {connection_bytes} bytes");
+        eprintln!("ConnectionEvent inline footprint: {event_bytes} bytes");
+        eprintln!("AssembledMessage inline footprint: {assembled_bytes} bytes");
+        assert!(connection_bytes <= 1_536);
+        assert!(event_bytes <= 64);
+        assert!(assembled_bytes <= 48);
     }
 
     #[test]

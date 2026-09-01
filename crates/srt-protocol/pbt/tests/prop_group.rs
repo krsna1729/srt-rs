@@ -102,6 +102,68 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
+    #[test]
+    fn fragmented_delivery_preserves_group_reservations_across_sequence_wrap(
+        initial_seq in 0u32..=0x7fff_ffff,
+        payload in prop::collection::vec(any::<u8>(), 1..5_000),
+    ) {
+        const WINDOW: u32 = 32;
+        let (mut source, listener) = establish_pair(ConnectionOptions {
+            initial_seq: Some(initial_seq),
+            tsbpd_delay: 0,
+            flow_window_packets: WINDOW,
+            receive_buffer_packets: WINDOW,
+            delivery_queue_packets: WINDOW,
+            ..ConnectionOptions::default()
+        });
+        let mut receiver = SrtGroup::new(0x4000_0032, GroupMode::Backup).expect("receiver group");
+        receiver.add_member(1, 1, listener).expect("receiver member");
+
+        source.send_message(&payload, ts(100_000)).expect("fragmented send");
+        source.send(b"following", ts(100_001)).expect("following send");
+        let packets = drain(&mut source);
+        let packet_count = packets.len() as u32 - 1;
+        for packet in packets {
+            receiver
+                .member_mut(1)
+                .expect("receiver member")
+                .connection_mut()
+                .feed_recv_buf(&packet, ts(110_000))
+                .expect("packet decodes");
+        }
+
+        let first = receiver.poll_data(ts(120_000)).expect("fragmented delivery");
+        prop_assert_eq!(first.sequence_number, initial_seq);
+        prop_assert_eq!(first.packet_count, packet_count);
+        prop_assert_eq!(first.payload.as_ref(), payload.as_slice());
+        prop_assert_eq!(
+            receiver
+                .member(1)
+                .expect("receiver member")
+                .connection()
+                .receiver_stats()
+                .expect("receiver stats")
+                .available_buffer_packets,
+            WINDOW - 1,
+        );
+
+        let following = receiver.poll_data(ts(120_000)).expect("following delivery");
+        prop_assert_eq!(
+            following.sequence_number,
+            initial_seq.wrapping_add(packet_count) & 0x7fff_ffff,
+        );
+        prop_assert_eq!(
+            receiver
+                .member(1)
+                .expect("receiver member")
+                .connection()
+                .receiver_stats()
+                .expect("receiver stats")
+                .available_buffer_packets,
+            WINDOW,
+        );
+    }
+
     /// Regression test for a real interop bug: the two ends of a 2-leg
     /// Backup group can independently (and non-deterministically -- e.g.
     /// depending on which leg's handshake happens to complete first over

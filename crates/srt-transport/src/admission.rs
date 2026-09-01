@@ -1837,6 +1837,7 @@ impl PeerTable {
                                 sequence_number: packet.sequence_number,
                                 message_number: packet.message_number,
                                 timestamp: packet.timestamp,
+                                packet_count: packet.packet_count,
                             },
                         });
                     }
