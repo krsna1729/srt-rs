@@ -11,9 +11,9 @@
 //! - TSBPD (Time-based Packet Delivery)
 //! - Receiving rate / link capacity estimation
 
+use crate::adaptive_receiver_packet_window::AdaptiveReceiverPacketWindow;
 use bytes::Bytes;
 use rustc_hash::FxHashSet;
-use std::collections::BTreeMap;
 
 #[cfg(test)]
 use std::cell::Cell;
@@ -738,9 +738,8 @@ pub struct DropRangeSummary {
 /// Receive buffer.
 #[derive(Debug)]
 pub struct ReceiverBuffer {
-    /// Received packets (sequence_number -> ReceivedPacket). Ordered storage
-    /// preserves efficient successor queries on loss/reorder paths.
-    packets: BTreeMap<u32, ReceivedPacket>,
+    /// Received packets in an adaptive sparse/dense packet window.
+    packets: AdaptiveReceiverPacketWindow<ReceivedPacket, 8>,
 
     delivery_seq_hint: Option<u32>,
 
@@ -911,7 +910,7 @@ impl ReceiverBuffer {
     ) -> Self {
         let max_buffer_size = max_buffer_size.min(MAX_FLOW_WINDOW);
         Self {
-            packets: BTreeMap::new(),
+            packets: AdaptiveReceiverPacketWindow::new(max_buffer_size, 4),
             delivery_seq_hint: None,
             oldest_retained_seq: None,
             expected_seq: initial_seq,
@@ -993,8 +992,17 @@ impl ReceiverBuffer {
             self.loss_detection_frontier = skipped_through;
         }
 
-        self.packets
-            .retain(|&seq, _| !sequence_less_than(seq, sequence_number));
+        if let Some(oldest) = self.oldest_retained_seq
+            && sequence_less_than(oldest, sequence_number)
+        {
+            let distance = sequence_number.wrapping_sub(oldest) & SEQUENCE_MASK;
+            if distance > self.max_buffer_size {
+                self.packets.clear();
+            } else {
+                let last_discard = sequence_number.wrapping_sub(1) & SEQUENCE_MASK;
+                self.packets.remove_range(oldest, last_discard);
+            }
+        }
         self.refresh_retained_hints();
         let stale_losses: Vec<u32> = self
             .loss_list
@@ -1005,7 +1013,7 @@ impl ReceiverBuffer {
             self.loss_list.remove(seq);
         }
         self.expected_seq = sequence_number;
-        while self.packets.contains_key(&self.expected_seq) {
+        while self.packets.contains_key(self.expected_seq) {
             self.expected_seq = self.expected_seq.wrapping_add(1) & 0x7FFF_FFFF;
         }
         self.loss_list.set_base(self.expected_seq);
@@ -1026,7 +1034,7 @@ impl ReceiverBuffer {
             self.total_retransmitted = self.total_retransmitted.saturating_add(1);
         }
 
-        if self.packets.contains_key(&seq) {
+        if self.packets.contains_key(seq) {
             self.total_duplicates += 1;
             return None;
         }
@@ -1167,7 +1175,10 @@ impl ReceiverBuffer {
     }
 
     fn insert_retained_packet(&mut self, seq: u32, packet: ReceivedPacket) {
-        let replaced = self.packets.insert(seq, packet);
+        let replaced = self
+            .packets
+            .insert(seq, packet)
+            .expect("alias-free live span checked by preflight");
         debug_assert!(
             replaced.is_none(),
             "duplicate packet passed receive preflight"
@@ -1183,7 +1194,7 @@ impl ReceiverBuffer {
     }
 
     fn remove_retained_packet(&mut self, seq: u32) -> Option<ReceivedPacket> {
-        let packet = self.packets.remove(&seq)?;
+        let packet = self.packets.remove(seq)?;
         debug_assert_eq!(self.oldest_retained_seq, self.delivery_seq_hint);
         if self.oldest_retained_seq == Some(seq) {
             let next = self.next_sequence_after(seq);
@@ -1200,7 +1211,7 @@ impl ReceiverBuffer {
             #[cfg(test)]
             self.receive_expected_sequence_scans
                 .set(self.receive_expected_sequence_scans.get().saturating_add(1));
-            while self.packets.contains_key(&self.expected_seq) {
+            while self.packets.contains_key(self.expected_seq) {
                 self.expected_seq = self.expected_seq.wrapping_add(1) & 0x7FFF_FFFF;
             }
         }
@@ -1265,11 +1276,9 @@ impl ReceiverBuffer {
 
     /// Find the deliverable sequence number.
     ///
-    /// BTreeMap iterates in numeric order, but 31-bit sequence numbers use
-    /// circular order with wrap at 0x7FFF_FFFF. SRT spec says TSBPD delivers
-    /// "in order, but based on timestamps" -- delivery must follow circular
-    /// order, not numeric. Returning the first numeric candidate would
-    /// invert order across the wrap, so pick the circular minimum.
+    /// 31-bit sequence numbers use circular order with wrap at 0x7FFF_FFFF.
+    /// SRT spec says TSBPD delivers "in order, but based on timestamps" --
+    /// delivery must follow circular order, not numeric.
     ///
     /// If the circular minimum packet is deliverable, return it directly.
     /// If the minimum packet's delivery time hasn't arrived, fall back to
@@ -1282,21 +1291,21 @@ impl ReceiverBuffer {
         let loss_list_min = self.loss_list.first();
         // Fast path 1: hint is deliverable right now (no gap before it).
         if let Some(seq) = self.delivery_seq_hint
-            && let Some(entry) = self.packets.get(&seq)
+            && let Some(entry) = self.packets.get(seq)
             && (!self.tsbpd_enabled || self.delivery_time(entry) <= now)
             && !loss_list_min.is_some_and(|min| sequence_less_than(min, seq))
         {
             return Some(seq);
         }
 
-        // Ordered storage gives the loss-recovery steady state an O(log n)
+        // The retained hint gives the loss-recovery steady state an O(1)
         // oldest-packet lookup. Across sequence wrap, fall back to the full
         // circular comparison below.
-        if let (Some(min), Some(&oldest)) = (loss_list_min, self.packets.keys().next())
+        if let (Some(min), Some(oldest)) = (loss_list_min, self.oldest_retained_seq)
             && !sequence_less_than(min, oldest)
             && oldest >= self.expected_seq
+            && let Some(entry) = self.packets.get(oldest)
         {
-            let entry = &self.packets[&oldest];
             if !self.tsbpd_enabled || self.delivery_time(entry) <= now {
                 return Some(oldest);
             }
@@ -1308,7 +1317,7 @@ impl ReceiverBuffer {
             .set(self.delivery_scan_calls.get().saturating_add(1));
 
         let mut best: Option<u32> = None;
-        for (&seq, entry) in &self.packets {
+        for (seq, entry) in self.packets.iter() {
             let time_ok = !self.tsbpd_enabled || self.delivery_time(entry) <= now;
             let has_gap = loss_list_min.is_some_and(|min| sequence_less_than(min, seq));
             if time_ok && !has_gap {
@@ -1325,24 +1334,39 @@ impl ReceiverBuffer {
     /// Return the nearest buffered sequence strictly after `sequence_number`
     /// in the 31-bit circular sequence space.
     fn next_sequence_after(&self, sequence_number: u32) -> Option<u32> {
-        let next = sequence_number.wrapping_add(1) & 0x7FFF_FFFF;
-        self.packets
-            .range(next..)
-            .next()
-            .map(|(&seq, _)| seq)
-            .or_else(|| self.packets.keys().next().copied())
+        self.packets.successor_after(sequence_number)
     }
 
     fn refresh_retained_hints(&mut self) {
-        let oldest = self
-            .packets
-            .keys()
-            .copied()
-            .reduce(|a, b| if sequence_less_than(a, b) { a } else { b });
+        let oldest = self.packets.first_from(self.expected_seq);
         self.delivery_seq_hint = oldest;
         self.oldest_retained_seq = oldest;
     }
 
+    /// Number of sparse pages currently allocated in the adaptive packet window.
+    pub fn sparse_pages(&self) -> usize {
+        self.packets.sparse_pages()
+    }
+
+    /// Number of dense pages currently allocated in the adaptive packet window.
+    pub fn dense_pages(&self) -> usize {
+        self.packets.dense_pages()
+    }
+
+    /// Total page promotions from sparse to dense since buffer creation.
+    pub fn promotions(&self) -> usize {
+        self.packets.promotions()
+    }
+
+    /// Total page demotions from dense to sparse since buffer creation.
+    pub fn demotions(&self) -> usize {
+        self.packets.demotions()
+    }
+
+    /// Total heap bytes owned by the adaptive packet window.
+    pub fn packet_window_heap_bytes(&self) -> usize {
+        self.packets.heap_bytes()
+    }
     #[cfg(test)]
     fn delivery_scan_calls(&self) -> usize {
         self.delivery_scan_calls.get()
@@ -1544,14 +1568,13 @@ impl ReceiverBuffer {
             .filter(|&seq| {
                 let estimated_delivery = self
                     .packets
-                    .get(&seq)
+                    .get(seq)
                     .map(|packet| self.delivery_time(packet).as_micros())
                     .unwrap_or_else(|| {
                         let next_packet = self
                             .packets
-                            .range(seq.wrapping_add(1)..)
-                            .next()
-                            .or_else(|| self.packets.iter().next());
+                            .successor_after(seq)
+                            .and_then(|next_seq| self.packets.get(next_seq));
                         next_packet.map_or_else(
                             || {
                                 let base = self.tsbpd_time_base + self.tsbpd_delay_us;
@@ -1561,7 +1584,7 @@ impl ReceiverBuffer {
                                     base
                                 }
                             },
-                            |(_, entry)| self.delivery_time(entry).as_micros(),
+                            |entry| self.delivery_time(entry).as_micros(),
                         )
                     });
                 now.as_micros() > estimated_delivery + tlpktdrop_threshold
@@ -1577,7 +1600,7 @@ impl ReceiverBuffer {
 
         if !dropped.is_empty() {
             let dropped_set: FxHashSet<u32> = dropped.iter().copied().collect();
-            while self.packets.contains_key(&self.expected_seq)
+            while self.packets.contains_key(self.expected_seq)
                 || dropped_set.contains(&self.expected_seq)
             {
                 self.expected_seq = self.expected_seq.wrapping_add(1) & 0x7FFF_FFFF;
@@ -1691,27 +1714,7 @@ impl ReceiverBuffer {
         let oldest_was_dropped = self
             .oldest_retained_seq
             .is_some_and(|oldest| sequence_in_range(first_seq, distance, oldest));
-        let mut packets_removed = 0;
-        if first_seq <= last_seq {
-            while let Some(seq) = self
-                .packets
-                .range(first_seq..=last_seq)
-                .next()
-                .map(|(&seq, _)| seq)
-            {
-                self.packets.remove(&seq);
-                packets_removed += 1;
-            }
-        } else {
-            while let Some(seq) = self.packets.range(first_seq..).next().map(|(&seq, _)| seq) {
-                self.packets.remove(&seq);
-                packets_removed += 1;
-            }
-            while let Some(seq) = self.packets.range(..=last_seq).next().map(|(&seq, _)| seq) {
-                self.packets.remove(&seq);
-                packets_removed += 1;
-            }
-        }
+        let packets_removed = self.packets.remove_range(first_seq, last_seq).unwrap_or(0) as u32;
         if oldest_was_dropped {
             let next = self.next_sequence_after(last_seq);
             self.oldest_retained_seq = next;
@@ -1725,7 +1728,7 @@ impl ReceiverBuffer {
     }
 
     fn advance_expected_after_drop(&mut self, first_seq: u32, distance: u32) {
-        while self.packets.contains_key(&self.expected_seq)
+        while self.packets.contains_key(self.expected_seq)
             || sequence_in_range(first_seq, distance, self.expected_seq)
         {
             self.expected_seq = self.expected_seq.wrapping_add(1) & SEQUENCE_MASK;
@@ -2203,7 +2206,7 @@ mod tests {
         // Replacing one reserved loss with its packet has zero occupancy
         // delta and must remain admissible even at an advertised zero window.
         assert_eq!(buf.receive(make_packet(0, 1_000_000_000), now), None);
-        assert!(buf.packets.contains_key(&0));
+        assert!(buf.packets.contains_key(0));
         assert!(!buf.loss_list.contains(0));
         assert_eq!(buf.packets.len(), 2);
         assert_eq!(buf.loss_list.len, WINDOW - 2);
@@ -2970,7 +2973,7 @@ mod tests {
     #[test]
     fn receiver_packet_storage_is_ordered() {
         let buf = ReceiverBuffer::new(0, 120, Timestamp::from_micros(0), 0);
-        let _: &BTreeMap<u32, ReceivedPacket> = &buf.packets;
+        let _: &AdaptiveReceiverPacketWindow<ReceivedPacket, 8> = &buf.packets;
     }
 
     #[test]
@@ -3855,7 +3858,7 @@ mod tests {
         assert_eq!(summary.packets_removed, 1);
         assert_eq!(summary.losses_removed, 0);
         assert_eq!(buf.packets.len(), RETAINED_PACKETS as usize - 1);
-        assert!(!buf.packets.contains_key(&DROPPED_SEQUENCE));
+        assert!(!buf.packets.contains_key(DROPPED_SEQUENCE));
         assert_eq!(buf.delivery_seq_hint, Some(0));
     }
 
@@ -3910,8 +3913,8 @@ mod tests {
 
         let summary = buf.drop_range(101, 103).expect("bounded mixed range");
         assert_eq!(summary.sequence_count, 3);
-        assert!(!buf.packets.contains_key(&102));
-        assert!(buf.packets.contains_key(&104));
+        assert!(!buf.packets.contains_key(102));
+        assert!(buf.packets.contains_key(104));
         assert!(!buf.loss_list.contains(101));
         assert!(!buf.loss_list.contains(103));
         assert_eq!(buf.expected_sequence(), 105);
