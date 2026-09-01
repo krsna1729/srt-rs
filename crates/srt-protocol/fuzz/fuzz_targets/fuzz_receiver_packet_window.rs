@@ -27,7 +27,7 @@ fuzz_target!(|data: &[u8]| {
     };
     let base = u32::from_le_bytes(initial.try_into().unwrap()) & MASK;
     let mut paged = ReceiverPacketWindow::new(WINDOW);
-    let mut adaptive = AdaptiveReceiverPacketWindow::<u8, 4>::new(WINDOW, data[0] & 1 != 0);
+    let mut adaptive = AdaptiveReceiverPacketWindow::<u8, 8>::new(WINDOW, 4);
     let mut model = BTreeMap::new();
 
     for action in data[4..].chunks_exact(4) {

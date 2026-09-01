@@ -7,8 +7,8 @@ const MASK: u32 = 0x7fff_ffff;
 
 #[test]
 fn sparse_page_promotes_and_optional_demotion_restores_sparse_storage() {
-    let mut promotion_only = AdaptiveReceiverPacketWindow::<_, 4>::new(128, false);
-    let mut demoting = AdaptiveReceiverPacketWindow::<_, 4>::new(128, true);
+    let mut promotion_only = AdaptiveReceiverPacketWindow::<_, 4>::new(128, 0);
+    let mut demoting = AdaptiveReceiverPacketWindow::<_, 4>::new(128, 4);
     for sequence in 0..5 {
         promotion_only.insert(sequence, sequence).unwrap();
         demoting.insert(sequence, sequence).unwrap();
@@ -30,9 +30,39 @@ fn sparse_page_promotes_and_optional_demotion_restores_sparse_storage() {
 }
 
 #[test]
+fn demotion_threshold_one_avoids_the_four_five_entry_churn_boundary() {
+    let mut window = AdaptiveReceiverPacketWindow::<_, 4>::new(128, 1);
+    for sequence in 0..5 {
+        window.insert(sequence, sequence).unwrap();
+    }
+    for sequence in (2..5).rev() {
+        window.remove(sequence);
+        assert_eq!((window.sparse_pages(), window.dense_pages()), (0, 1));
+    }
+    window.remove(1);
+    assert_eq!((window.sparse_pages(), window.dense_pages()), (1, 0));
+    assert_eq!(window.get(0), Some(&0));
+}
+
+#[test]
+fn capacity_eight_demotes_at_four_without_churning_at_five() {
+    let mut window = AdaptiveReceiverPacketWindow::<_, 8>::new(128, 4);
+    for sequence in 0..9 {
+        window.insert(sequence, sequence).unwrap();
+    }
+    for sequence in (5..9).rev() {
+        window.remove(sequence);
+        assert_eq!((window.sparse_pages(), window.dense_pages()), (0, 1));
+    }
+    window.remove(4);
+    assert_eq!((window.sparse_pages(), window.dense_pages()), (1, 0));
+    assert_eq!(window.get(0), Some(&0));
+}
+
+#[test]
 fn replacement_alias_rejection_successor_and_range_wrap_match_fixed_semantics() {
     let start = MASK - 70;
-    let mut window = AdaptiveReceiverPacketWindow::<_, 4>::new(256, true);
+    let mut window = AdaptiveReceiverPacketWindow::<_, 4>::new(256, 1);
     for sequence in [start, MASK - 1, MASK, 0, 1, 63, 64] {
         assert_eq!(window.insert(sequence, sequence), Ok(None));
     }
@@ -48,8 +78,8 @@ fn replacement_alias_rejection_successor_and_range_wrap_match_fixed_semantics() 
 
 #[test]
 fn capacity_four_and_eight_bound_sparse_heap_then_reclaim_to_directory_floor() {
-    let mut four = AdaptiveReceiverPacketWindow::<[u64; 7], 4>::new(8_192, true);
-    let mut eight = AdaptiveReceiverPacketWindow::<[u64; 7], 8>::new(8_192, true);
+    let mut four = AdaptiveReceiverPacketWindow::<[u64; 7], 4>::new(8_192, 1);
+    let mut eight = AdaptiveReceiverPacketWindow::<[u64; 7], 8>::new(8_192, 4);
     let four_empty = four.heap_bytes();
     let eight_empty = eight.heap_bytes();
     for sequence in (0..8_192).step_by(64) {
@@ -72,7 +102,7 @@ fn capacity_four_and_eight_bound_sparse_heap_then_reclaim_to_directory_floor() {
 
 #[test]
 fn invalid_range_is_rejected_without_mutation() {
-    let mut window = AdaptiveReceiverPacketWindow::<_, 4>::new(65, false);
+    let mut window = AdaptiveReceiverPacketWindow::<_, 4>::new(65, 0);
     window.insert(10, 10).unwrap();
     assert_eq!(window.remove_range(10, 75), None);
     assert_eq!(window.get(10), Some(&10));
