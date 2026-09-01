@@ -60,6 +60,8 @@ pub struct GroupPacket {
     pub message_number: u32,
     /// The sender's timestamp, in the units defined by the SRT wire format.
     pub timestamp: u32,
+    /// Number of SRT DATA packets represented by the reassembled payload.
+    pub packet_count: u32,
     /// Reference-counted payload bytes.
     pub payload: Bytes,
 }
@@ -254,6 +256,7 @@ impl SrtGroup {
         else {
             return false;
         };
+        self.purge_member_pending(member_id);
         self.members.remove(index);
         true
     }
@@ -265,7 +268,23 @@ impl SrtGroup {
             .members
             .iter()
             .position(|member| member.id == member_id)?;
+        let reserved_packets = self.purge_member_pending(member_id);
+        self.members[index]
+            .connection
+            .release_data_reservation(reserved_packets);
         Some(self.members.remove(index).connection)
+    }
+
+    fn purge_member_pending(&mut self, member_id: u32) -> u32 {
+        let mut packet_count = 0u32;
+        self.pending.retain(|_, packet| {
+            if packet.member_id != member_id {
+                return true;
+            }
+            packet_count = packet_count.saturating_add(packet.packet_count);
+            false
+        });
+        packet_count
     }
 
     /// Send one payload through the group per its [`GroupMode`]. Returns the
@@ -385,8 +404,15 @@ impl SrtGroup {
         })?;
         self.next_receive_sequence = Some(next);
         let packet = self.pending.remove(&next)?;
-        let following = next.wrapping_add(1) & 0x7FFF_FFFF;
+        let following = next.wrapping_add(packet.packet_count) & 0x7FFF_FFFF;
         self.next_receive_sequence = Some(following);
+        self.release_member_data_reservation(packet.member_id, packet.packet_count);
+        for offset in 1..packet.packet_count {
+            let stale_sequence = next.wrapping_add(offset) & 0x7FFF_FFFF;
+            if let Some(stale) = self.pending.remove(&stale_sequence) {
+                self.release_member_data_reservation(stale.member_id, stale.packet_count);
+            }
+        }
         for member in &mut self.members {
             member.connection.advance_receive_sequence(following, now);
         }
@@ -478,66 +504,78 @@ impl SrtGroup {
                 let member = &mut self.members[index];
                 member
                     .connection
-                    .poll_event()
+                    .poll_event_for_group()
                     .map(|event| (member.id, event))
             } {
-                match event {
-                    ConnectionEvent::Connected => {
-                        self.events
-                            .push_back(GroupEvent::MemberConnected { member_id });
-                    }
-                    // Accept DataReceived regardless of this member's local
-                    // Active/Standby label. In Backup mode the sender only
-                    // ever transmits one logical sequence stream, aligned
-                    // across legs by align_member_sequence, so whichever
-                    // physical leg the peer actually chose as active is
-                    // correct data no matter what this side's own
-                    // (independently, racily computed) Active/Standby
-                    // choice currently says -- filtering by local state here
-                    // caused the two ends of a connection to disagree about
-                    // which leg is "active" (a real race when both legs
-                    // share one UDP socket and handshakes complete in a
-                    // different order on each side) and silently drop every
-                    // payload the peer actually sent. Dedup by sequence
-                    // number below is what makes this safe, exactly as it
-                    // already is for Broadcast.
-                    ConnectionEvent::DataReceived {
-                        sequence_number,
-                        message_number,
-                        timestamp,
-                        payload,
-                    } if self
-                        .next_receive_sequence
-                        .is_none_or(|next| !sequence_less_than(sequence_number, next)) =>
-                    {
-                        self.pending.entry(sequence_number).or_insert(GroupPacket {
-                            member_id,
-                            sequence_number,
-                            message_number,
-                            timestamp,
-                            payload,
-                        });
-                    }
-                    ConnectionEvent::Error(error) => {
-                        self.events
-                            .push_back(GroupEvent::MemberError { member_id, error });
-                        self.members[index].state = GroupMemberState::Broken;
-                        if self.mode == GroupMode::Backup {
-                            self.promote_backup_member();
-                        }
-                    }
-                    ConnectionEvent::Disconnected { reason } => {
-                        self.events
-                            .push_back(GroupEvent::MemberDisconnected { member_id, reason });
-                        self.members[index].state = GroupMemberState::Broken;
-                        if self.mode == GroupMode::Backup {
-                            self.promote_backup_member();
-                        }
-                    }
-                    _ => {}
-                }
+                self.collect_member_event(index, member_id, event);
             }
         }
+    }
+
+    fn collect_member_event(&mut self, index: usize, member_id: u32, event: ConnectionEvent) {
+        match event {
+            ConnectionEvent::Connected => {
+                self.events
+                    .push_back(GroupEvent::MemberConnected { member_id });
+            }
+            // Accept DATA regardless of the member's local Active/Standby
+            // label. Sequence deduplication is the authority because peers can
+            // independently choose different active legs during handshakes.
+            ConnectionEvent::DataReceived {
+                sequence_number,
+                message_number,
+                timestamp,
+                payload,
+                packet_count,
+            } => {
+                let packet = GroupPacket {
+                    member_id,
+                    sequence_number,
+                    message_number,
+                    timestamp,
+                    payload,
+                    packet_count,
+                };
+                if !self.retain_group_packet(packet) {
+                    self.members[index]
+                        .connection
+                        .release_data_reservation(packet_count);
+                }
+            }
+            ConnectionEvent::Error(error) => {
+                self.events
+                    .push_back(GroupEvent::MemberError { member_id, error });
+                self.members[index].state = GroupMemberState::Broken;
+                if self.mode == GroupMode::Backup {
+                    self.promote_backup_member();
+                }
+            }
+            ConnectionEvent::Disconnected { reason } => {
+                self.events
+                    .push_back(GroupEvent::MemberDisconnected { member_id, reason });
+                self.members[index].state = GroupMemberState::Broken;
+                if self.mode == GroupMode::Backup {
+                    self.promote_backup_member();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn retain_group_packet(&mut self, packet: GroupPacket) -> bool {
+        if self
+            .next_receive_sequence
+            .is_some_and(|next| sequence_less_than(packet.sequence_number, next))
+        {
+            return false;
+        }
+        let std::collections::btree_map::Entry::Vacant(entry) =
+            self.pending.entry(packet.sequence_number)
+        else {
+            return false;
+        };
+        entry.insert(packet);
+        true
     }
 
     fn refresh_states(&mut self) {
@@ -552,6 +590,12 @@ impl SrtGroup {
         self.requalify_unstable_members();
         if self.mode == GroupMode::Backup && !self.has_active_member() {
             self.promote_backup_member();
+        }
+    }
+
+    fn release_member_data_reservation(&mut self, member_id: u32, packet_count: u32) {
+        if let Some(member) = self.member_mut(member_id) {
+            member.connection.release_data_reservation(packet_count);
         }
     }
 

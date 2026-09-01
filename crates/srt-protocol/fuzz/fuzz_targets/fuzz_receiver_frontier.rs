@@ -68,7 +68,7 @@ fuzz_target!(|data: &[u8]| {
                 ));
             }
             5 => {
-                if let Some(nak) = receiver.generate_periodic_nak() {
+                let loss_count = if let Some(nak) = receiver.generate_periodic_nak() {
                     assert!(
                         nak.loss_ranges
                             .windows(2)
@@ -85,7 +85,18 @@ fuzz_target!(|data: &[u8]| {
                             loss.wrapping_sub(receiver.expected_sequence()) & SEQUENCE_MASK < 8_192
                         })
                     }));
-                }
+                    loss_count as u32
+                } else {
+                    0
+                };
+                let stats = receiver.stats();
+                assert_eq!(
+                    stats
+                        .packets_in_buffer
+                        .saturating_add(loss_count)
+                        .saturating_add(stats.available_buffer_packets),
+                    stats.max_buffer_packets
+                );
             }
             6 => {
                 let retransmitted = action[4] & 1 != 0;
