@@ -10,6 +10,7 @@ repository = "https://github.com/krsna1729/srt-rs"
 license = "Apache-2.0"
 include = [
     "/src/**",
+    "/challengers/**",
     "/tests/**",
     "/benches/**",
     "LICENSE",
@@ -104,6 +105,10 @@ harness = false
 
 [[bench]]
 name = "sender_nak"
+harness = false
+
+[[bench]]
+name = "receiver_packet_window"
 harness = false
 
 [lints]

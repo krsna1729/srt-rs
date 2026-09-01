@@ -78,6 +78,13 @@ name = "fuzz_receiver_frontier"
 path = "fuzz_targets/fuzz_receiver_frontier.rs"
 test = false
 
+[[bin]]
+bench = false
+doc = false
+name = "fuzz_receiver_packet_window"
+path = "fuzz_targets/fuzz_receiver_packet_window.rs"
+test = false
+
 [dependencies]
 libfuzzer-sys = "0.4"
 shiguredo_srt = { path = ".." }
