@@ -2,6 +2,7 @@
 
 use proptest::prelude::*;
 use shiguredo_srt::{SenderBuffer, Timestamp};
+use std::collections::HashSet;
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
@@ -98,6 +99,39 @@ proptest! {
         buf.handle_nak(&[lost_seq]);
 
         prop_assert!(buf.has_retransmit());
+    }
+
+    #[test]
+    fn retransmit_queue_matches_unique_retained_reference_model(
+        initial_seq in 0u32..0x7FFF_FFE0u32,
+        reports in prop::collection::vec(prop::collection::vec(0u8..48, 0..48), 0..24),
+    ) {
+        const SEQUENCE_MASK: u32 = 0x7FFF_FFFF;
+        let mut sender = SenderBuffer::new(initial_seq, 32, 120);
+        for _ in 0..32 {
+            sender.push(vec![1], 1, 1, Timestamp::default());
+        }
+
+        let mut seen = HashSet::new();
+        let mut expected = Vec::new();
+        for report in reports {
+            let sequences = report
+                .into_iter()
+                .map(|offset| initial_seq.wrapping_add(u32::from(offset)) & SEQUENCE_MASK)
+                .collect::<Vec<_>>();
+            sender.handle_nak(&sequences);
+            for sequence in sequences {
+                let offset = sequence.wrapping_sub(initial_seq) & SEQUENCE_MASK;
+                if offset < 32 && seen.insert(sequence) {
+                    expected.push(sequence);
+                }
+            }
+        }
+
+        let actual = std::iter::from_fn(|| sender.pop_retransmit(1))
+            .map(|(header, _)| header.sequence_number)
+            .collect::<Vec<_>>();
+        prop_assert_eq!(actual, expected);
     }
 
     #[test]
