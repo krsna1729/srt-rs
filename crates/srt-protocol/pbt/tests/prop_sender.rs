@@ -329,4 +329,146 @@ proptest! {
         let expected = ((initial_seq as u64 + offset as u64 + 10) & 0x7FFF_FFFF) as u32;
         prop_assert_eq!(buf.next_sequence_number(), expected);
     }
+
+    #[test]
+    fn prop_sender_differential_state_machine(
+        initial_seq in 0u32..0x7FFF_FFFFu32,
+        window_size in 64u32..256u32,
+        operations in prop::collection::vec(0u8..8u8, 1..60),
+    ) {
+        const MASK: u32 = 0x7FFF_FFFF;
+        let mut buf = SenderBuffer::new(initial_seq, window_size, 10);
+        buf.set_congestion_window(window_size);
+
+        let mut model_packets = std::collections::BTreeMap::new();
+        let mut model_queue = std::collections::VecDeque::new();
+        let mut model_retransmit_set = std::collections::HashSet::new();
+        let mut model_oldest_unacked = initial_seq & MASK;
+        let mut model_next_seq = initial_seq & MASK;
+
+        let mut current_time_us = 1_000u64;
+
+        for op in operations {
+            current_time_us += 1_000;
+            let now = Timestamp::from_micros(current_time_us);
+
+            match op {
+                0 => {
+                    // Push 1..4 packets if capacity allows
+                    let count = 1 + (current_time_us as usize % 4);
+                    for _ in 0..count {
+                        if model_packets.len() < window_size as usize {
+                            let seq = model_next_seq;
+                            let (header, _) = buf.push(vec![1, 2, 3], 1, 1, now).expect("push succeeds");
+                            prop_assert_eq!(header.sequence_number, seq);
+                            model_packets.insert(seq, now);
+                            model_next_seq = model_next_seq.wrapping_add(1) & MASK;
+                        }
+                    }
+                }
+                1 => {
+                    // Valid cumulative ACK advancing by 1..=in_flight
+                    if !model_packets.is_empty() {
+                        let in_flight = model_packets.len();
+                        let advance = 1 + (current_time_us as usize % in_flight);
+                        let ack_seq = model_oldest_unacked.wrapping_add(advance as u32) & MASK;
+                        buf.handle_ack(ack_seq);
+
+                        // Retire prefix in model
+                        let mut cur = model_oldest_unacked;
+                        while cur != ack_seq {
+                            model_packets.remove(&cur);
+                            model_retransmit_set.remove(&cur);
+                            cur = cur.wrapping_add(1) & MASK;
+                        }
+                        model_oldest_unacked = ack_seq;
+                    }
+                }
+                2 => {
+                    // Stale / duplicate ACK (behind oldest_unacked or high bit set)
+                    let stale_ack = if current_time_us.is_multiple_of(2) {
+                        model_oldest_unacked.wrapping_sub(1) & MASK
+                    } else {
+                        model_oldest_unacked | 0x8000_0000
+                    };
+                    buf.handle_ack(stale_ack);
+                }
+                3 => {
+                    // Future / out-of-window ACK (strictly ahead of next_seq)
+                    let future_ack = model_next_seq.wrapping_add(1 + (current_time_us as u32 % 50)) & MASK;
+                    buf.handle_ack(future_ack);
+                }
+                4 => {
+                    // NAK a random sequence in the in-flight span
+                    if !model_packets.is_empty() {
+                        let in_flight = model_packets.len();
+                        let offset = (current_time_us as usize % in_flight) as u32;
+                        let nak_seq = model_oldest_unacked.wrapping_add(offset) & MASK;
+                        buf.handle_nak(&[nak_seq]);
+                        if model_packets.contains_key(&nak_seq) && model_retransmit_set.insert(nak_seq) {
+                            model_queue.push_back(nak_seq);
+                        }
+                    }
+                }
+                5 => {
+                    // Duplicate NAK on already queued or non-existent sequence
+                    let dup_seq = model_oldest_unacked;
+                    buf.handle_nak(&[dup_seq]);
+                    if model_packets.contains_key(&dup_seq) && model_retransmit_set.insert(dup_seq) {
+                        model_queue.push_back(dup_seq);
+                    }
+                }
+                6 => {
+                    // Pop retransmit
+                    if buf.has_retransmit() {
+                        let popped = buf.pop_retransmit(1);
+                        prop_assert!(popped.is_some());
+                        let seq = popped.unwrap().0.sequence_number;
+
+                        // Find matching entry in model
+                        let mut found = false;
+                        while let Some(q_seq) = model_queue.pop_front() {
+                            if model_retransmit_set.remove(&q_seq) {
+                                prop_assert_eq!(seq, q_seq);
+                                found = true;
+                                break;
+                            }
+                        }
+                        prop_assert!(found);
+                    }
+                }
+                7 => {
+                    // TLPKTDROP (advance time past 1s threshold)
+                    let drop_time = Timestamp::from_micros(current_time_us + 2_000_000);
+                    let dropped = buf.drop_expired(drop_time);
+                    for msg in dropped {
+                        let mut cur = msg.first_seq;
+                        loop {
+                            model_packets.remove(&cur);
+                            model_retransmit_set.remove(&cur);
+                            if cur == msg.last_seq {
+                                break;
+                            }
+                            cur = cur.wrapping_add(1) & MASK;
+                        }
+                        if (model_next_seq.wrapping_sub(cur.wrapping_add(1) & MASK) & MASK) <= window_size {
+                            model_oldest_unacked = cur.wrapping_add(1) & MASK;
+                        }
+                    }
+                    if model_packets.is_empty() {
+                        model_oldest_unacked = model_next_seq;
+                    }
+                }
+                _ => unreachable!(),
+            }
+
+            // Assert invariants after each operation
+            prop_assert_eq!(buf.packets_in_flight() as usize, model_packets.len());
+            prop_assert_eq!(buf.is_empty(), model_packets.is_empty());
+            prop_assert_eq!(buf.next_sequence_number(), model_next_seq);
+            prop_assert_eq!(buf.has_retransmit(), !model_retransmit_set.is_empty());
+            prop_assert_eq!(buf.stats().packets_in_loss_list as usize, model_retransmit_set.len());
+            prop_assert_eq!(buf.oldest_packet_time().is_some(), !model_packets.is_empty());
+        }
+    }
 }
