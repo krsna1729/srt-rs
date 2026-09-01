@@ -1,8 +1,11 @@
+#[path = "../../challengers/adaptive_receiver_packet_window.rs"]
+mod adaptive_receiver_packet_window;
 #[path = "../../challengers/receiver_packet_window.rs"]
 mod receiver_packet_window;
 
 use std::collections::BTreeMap;
 
+use adaptive_receiver_packet_window::AdaptiveReceiverPacketWindow;
 use proptest::prelude::*;
 use receiver_packet_window::ReceiverPacketWindow;
 
@@ -29,6 +32,8 @@ proptest! {
         actions in prop::collection::vec((any::<u8>(), any::<u16>(), any::<u16>()), 1..400),
     ) {
         let mut paged = ReceiverPacketWindow::new(window_size);
+        let mut adaptive = AdaptiveReceiverPacketWindow::<u32, 4>::new(window_size, false);
+        let mut adaptive_demoting = AdaptiveReceiverPacketWindow::<u32, 4>::new(window_size, true);
         let mut model = BTreeMap::new();
 
         for (opcode, raw_offset, raw_count) in actions {
@@ -38,15 +43,24 @@ proptest! {
                 0 => {
                     let expected = model.insert(sequence, offset);
                     prop_assert_eq!(paged.insert(sequence, offset), Ok(expected));
+                    prop_assert_eq!(adaptive.insert(sequence, offset), Ok(expected));
+                    prop_assert_eq!(adaptive_demoting.insert(sequence, offset), Ok(expected));
                 }
                 1 => {
-                    prop_assert_eq!(paged.remove(sequence), model.remove(&sequence));
+                    let expected = model.remove(&sequence);
+                    prop_assert_eq!(paged.remove(sequence), expected);
+                    prop_assert_eq!(adaptive.remove(sequence), expected);
+                    prop_assert_eq!(adaptive_demoting.remove(sequence), expected);
                 }
                 2 => {
                     prop_assert_eq!(paged.get(sequence).copied(), model.get(&sequence).copied());
+                    prop_assert_eq!(adaptive.get(sequence).copied(), model.get(&sequence).copied());
+                    prop_assert_eq!(adaptive_demoting.get(sequence).copied(), model.get(&sequence).copied());
                 }
                 3 => {
                     prop_assert_eq!(paged.successor_after(sequence), model_successor(&model, sequence));
+                    prop_assert_eq!(adaptive.successor_after(sequence), model_successor(&model, sequence));
+                    prop_assert_eq!(adaptive_demoting.successor_after(sequence), model_successor(&model, sequence));
                 }
                 _ => {
                     let count = u32::from(raw_count) % window_size + 1;
@@ -54,10 +68,16 @@ proptest! {
                     let before = model.len();
                     model.retain(|&candidate, _| !in_range(sequence, count, candidate));
                     prop_assert_eq!(paged.remove_range(sequence, last), Some(before - model.len()));
+                    prop_assert_eq!(adaptive.remove_range(sequence, last), Some(before - model.len()));
+                    prop_assert_eq!(adaptive_demoting.remove_range(sequence, last), Some(before - model.len()));
                 }
             }
             prop_assert_eq!(paged.len(), model.len());
+            prop_assert_eq!(adaptive.len(), model.len());
+            prop_assert_eq!(adaptive_demoting.len(), model.len());
             prop_assert_eq!(paged.is_empty(), model.is_empty());
+            prop_assert_eq!(adaptive.is_empty(), model.is_empty());
+            prop_assert_eq!(adaptive_demoting.is_empty(), model.is_empty());
         }
     }
 }
