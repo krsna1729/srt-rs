@@ -166,7 +166,7 @@ impl<T, const N: usize> Page<T, N> {
         }
     }
 
-    fn remove(&mut self, sequence: u32, demote: bool) -> Option<T> {
+    fn remove(&mut self, sequence: u32, demote_at: usize) -> Option<T> {
         let value = match self {
             Self::Sparse(page) => page.remove(sequence)?,
             Self::Dense(page) => {
@@ -181,7 +181,9 @@ impl<T, const N: usize> Page<T, N> {
                 slot.value
             }
         };
-        if demote && matches!(self, Self::Dense(page) if page.occupied.count_ones() <= N as u32) {
+        if demote_at != 0
+            && matches!(self, Self::Dense(page) if page.occupied.count_ones() <= demote_at as u32)
+        {
             self.demote();
         }
         Some(value)
@@ -226,13 +228,14 @@ pub struct AdaptiveReceiverPacketWindow<T, const N: usize = 4> {
     nonempty_pages: Box<[u64]>,
     nonempty_summary: u64,
     len: usize,
-    demote: bool,
+    demote_at: usize,
 }
 
 impl<T, const N: usize> AdaptiveReceiverPacketWindow<T, N> {
-    pub fn new(window_size: u32, demote: bool) -> Self {
+    pub fn new(window_size: u32, demote_at: usize) -> Self {
         assert!((1..=65_536).contains(&window_size));
         assert!((1..PAGE_SLOTS).contains(&N));
+        assert!(demote_at <= N);
         let capacity = (window_size as usize).max(PAGE_SLOTS).next_power_of_two();
         let page_count = capacity / PAGE_SLOTS;
         let summary_words = page_count.div_ceil(64);
@@ -244,7 +247,7 @@ impl<T, const N: usize> AdaptiveReceiverPacketWindow<T, N> {
             nonempty_pages: vec![0; summary_words].into_boxed_slice(),
             nonempty_summary: 0,
             len: 0,
-            demote,
+            demote_at,
         }
     }
 
@@ -308,7 +311,7 @@ impl<T, const N: usize> AdaptiveReceiverPacketWindow<T, N> {
     pub fn remove(&mut self, sequence: u32) -> Option<T> {
         let (page_index, _) = self.indices(sequence);
         let page = self.pages[page_index].as_mut()?;
-        let value = page.remove(sequence, self.demote)?;
+        let value = page.remove(sequence, self.demote_at)?;
         self.len -= 1;
         if page.occupied() == 0 {
             self.pages[page_index] = None;
@@ -465,16 +468,21 @@ impl<T, const N: usize> AdaptiveReceiverPacketWindow<T, N> {
                 let removed_value = self.pages[page_index]
                     .as_mut()
                     .expect("page remains while selected bits exist")
-                    .remove(sequence, self.demote);
+                    .remove(sequence, 0);
                 debug_assert!(removed_value.is_some());
                 removed += 1;
             }
-            if self.pages[page_index]
+            let occupancy = self.pages[page_index]
                 .as_ref()
-                .is_some_and(|page| page.occupied() == 0)
-            {
+                .map_or(0, |page| page.occupied().count_ones() as usize);
+            if occupancy == 0 {
                 self.pages[page_index] = None;
                 self.mark_page_empty(page_index);
+            } else if self.demote_at != 0 && occupancy <= self.demote_at {
+                self.pages[page_index]
+                    .as_mut()
+                    .expect("nonempty page remains")
+                    .demote();
             }
             search_page = page_index + 1;
         }

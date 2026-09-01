@@ -111,5 +111,9 @@ harness = false
 name = "receiver_packet_window"
 harness = false
 
+[[bench]]
+name = "adaptive_receiver_packet_window"
+harness = false
+
 [lints]
 workspace = true
