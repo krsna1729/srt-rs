@@ -120,6 +120,42 @@ pub const COLUMNS: &[&str] = &[
     "udp_no_ports",
 ];
 
+/// Configuration columns that define a unique benchmark workload/cell.
+/// Shared between harness reporting and comparison tooling to guarantee
+/// cell identity never drifts.
+pub const CONFIG_COLUMNS: &[&str] = &[
+    "runtime",
+    "encryption",
+    "ingress",
+    "egress",
+    "promotion",
+    "cookie",
+    "batch",
+    "sock_buf",
+    "cpus",
+    "pin",
+    "link_delay",
+    "link_jitter",
+    "link_loss",
+    "link_rate",
+    "link_reorder",
+    "link_duplicate",
+    "link_corrupt",
+    "link_limit",
+    "workers",
+    "recv_runtime",
+    "send_runtime",
+    "recv_ingress",
+    "send_ingress",
+    "recv_workers",
+    "send_workers",
+    "conns",
+    "connect_cc",
+    "bond",
+    "bitrate",
+    "secs",
+];
+
 /// The dimensions a run was configured with, rendered for the result
 /// file. Kept separate from the measurements so a report can group by any
 /// subset without knowing what the measurements mean.
@@ -363,7 +399,7 @@ impl Spread {
     }
 }
 
-fn median(mut values: Vec<f64>) -> f64 {
+pub fn median(mut values: Vec<f64>) -> f64 {
     if values.is_empty() {
         return 0.0;
     }
@@ -475,7 +511,8 @@ fn report_target_packets(record: &Record) -> Option<f64> {
         record.number("bitrate")?,
         record.number("secs")?,
     );
-    let packets = connections * bitrate * seconds / (8.0 * crate::PAYLOAD_SIZE as f64);
+    let paced_packet_size = (crate::PAYLOAD_SIZE + shiguredo_srt::SRT_HEADER_SIZE) as f64;
+    let packets = connections * (bitrate / 8.0) * seconds / paced_packet_size;
     (packets > 0.0).then_some(packets)
 }
 
@@ -1734,7 +1771,8 @@ fn matrix_cell_argv(cell: &Cell<'_>, role: Scope) -> Vec<String> {
 }
 
 struct MatrixProcessContext<'a, 'cell> {
-    exe: &'a Path,
+    sender_exe: &'a Path,
+    receiver_exe: &'a Path,
     out: &'a Path,
     cell: &'a Cell<'cell>,
     config: &'a MatrixCellConfig,
@@ -1750,7 +1788,8 @@ struct MatrixProcessContext<'a, 'cell> {
 
 fn run_matrix_processes(context: MatrixProcessContext<'_, '_>, port: u16) -> std::io::Result<()> {
     let MatrixProcessContext {
-        exe,
+        sender_exe,
+        receiver_exe,
         out,
         cell,
         config,
@@ -1778,9 +1817,9 @@ fn run_matrix_processes(context: MatrixProcessContext<'_, '_>, port: u16) -> std
     // Receiver outlives the sender so it is still listening when
     // the last packets arrive; +5s mirrors the old harness.
     let mut recv = if let Some(p) = netns {
-        in_netns(p, exe)
+        in_netns(p, receiver_exe)
     } else {
-        std::process::Command::new(exe)
+        std::process::Command::new(receiver_exe)
     }
     .arg(format!("runtime={}", config.recv_runtime))
     .arg("mode=receiver")
@@ -1811,9 +1850,9 @@ fn run_matrix_processes(context: MatrixProcessContext<'_, '_>, port: u16) -> std
     }
 
     let send = if let Some(p) = netns {
-        in_netns(p, exe)
+        in_netns(p, sender_exe)
     } else {
-        std::process::Command::new(exe)
+        std::process::Command::new(sender_exe)
     }
     .arg(format!("runtime={}", config.send_runtime))
     .arg("mode=sender")
@@ -1877,7 +1916,8 @@ fn detect_matrix_netns(cells: &[Cell<'_>]) -> std::io::Result<Option<Priv>> {
 }
 
 struct MatrixScheduleContext<'a, 'cell> {
-    exe: &'a Path,
+    sender_exe: &'a Path,
+    receiver_exe: &'a Path,
     out: &'a Path,
     cells: &'a [Cell<'cell>],
     schedule: &'a MatrixSchedule,
@@ -1891,7 +1931,8 @@ struct MatrixScheduleContext<'a, 'cell> {
 
 fn run_matrix_schedule(context: MatrixScheduleContext<'_, '_>) -> std::io::Result<usize> {
     let MatrixScheduleContext {
-        exe,
+        sender_exe,
+        receiver_exe,
         out,
         cells,
         schedule,
@@ -1942,7 +1983,8 @@ fn run_matrix_schedule(context: MatrixScheduleContext<'_, '_>) -> std::io::Resul
         };
         run_matrix_processes(
             MatrixProcessContext {
-                exe,
+                sender_exe,
+                receiver_exe,
                 out,
                 cell,
                 config: &config,
@@ -1969,6 +2011,18 @@ fn run_matrix_schedule(context: MatrixScheduleContext<'_, '_>) -> std::io::Resul
 /// in one process would attribute the sender's cost to the listener.
 pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
     let exe = std::env::current_exe()?;
+    let sender_exe = cli
+        .flags
+        .get("sender-exe")
+        .or_else(|| cli.flags.get("caller-exe"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| exe.clone());
+    let receiver_exe = cli
+        .flags
+        .get("receiver-exe")
+        .or_else(|| cli.flags.get("listener-exe"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| exe.clone());
     let out = std::path::PathBuf::from(
         cli.flags
             .get("out")
@@ -2016,7 +2070,6 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
     let netns = detect_matrix_netns(&cells)?;
 
     let skipped_runs = run_matrix_schedule(MatrixScheduleContext {
-        exe: &exe,
         out: &out,
         cells: &cells,
         schedule: &schedule,
@@ -2025,6 +2078,8 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
         latency,
         recv_cpus: &recv_cpus,
         send_cpus: &send_cpus,
+        sender_exe: &sender_exe,
+        receiver_exe: &receiver_exe,
         netns,
     })?;
     if let Some(p) = netns {
@@ -3235,8 +3290,8 @@ mod report_tests {
         ];
         let out = report(&rows, &["runtime".to_string()]);
         assert_ne!(field(&out, "offer%"), "0.0", "floored at zero:\n{out}");
-        // 2029411 / (400 * 8e6 * 10 / (8 * 1316)) = 66.8%
-        assert_eq!(field(&out, "offer%"), "66.8", "got:\n{out}");
+        // 2029411 / (400 * 1e6 * 10 / (1316 + 16)) = 67.6%
+        assert_eq!(field(&out, "offer%"), "67.6", "got:\n{out}");
     }
 
     /// A cell says `link-delay=off`; the process records that as an empty

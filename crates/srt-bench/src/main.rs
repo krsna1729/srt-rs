@@ -27,6 +27,8 @@
 //!   srt-bench report results.tsv --by runtime,promotion
 //!   srt-bench report results.tsv --format github-benchmark --out benchmark.json
 //!
+//! Comparative analysis across two result files:
+//!   srt-bench compare BASE.tsv HEAD.tsv [--format table|markdown] [--out FILE]
 //! Syscall/io_uring attribution for one pair (needs `perf`):
 //!   srt-bench sysprof --runtime glommio --connections 150
 //!
@@ -47,7 +49,7 @@ fn main() {
     // result schema.
     let args: Vec<String> = std::env::args().collect();
     let context = match args.get(1).map(String::as_str) {
-        Some("report" | "watch") => None,
+        Some("report" | "watch" | "compare") => None,
         Some("system-info") => Some("system-info"),
         Some("matrix") => Some("matrix"),
         Some("sysprof") => Some("sysprof"),
@@ -63,6 +65,7 @@ fn main() {
             return;
         }
         Some("report") => return report(&args),
+        Some("compare") => return compare(&args),
         Some("watch") => {
             let cli = srt_bench::Cli::parse(&args[1..]);
             if let Err(e) = srt_bench::watch::run(&cli) {
@@ -144,6 +147,41 @@ fn report(args: &[String]) {
     if let Some(destination) = cli.flags.get("out").filter(|value| !value.is_empty()) {
         if let Err(e) = std::fs::write(destination, output) {
             eprintln!("report: {destination}: {e}");
+            std::process::exit(1);
+        }
+    } else {
+        print!("{output}");
+    }
+}
+
+/// `srt-bench compare BASE.tsv HEAD.tsv [--format table|markdown] [--out FILE]`
+fn compare(args: &[String]) {
+    let cli = srt_bench::Cli::parse(&args[1..]);
+    if cli.positional.len() < 2 {
+        eprintln!(
+            "usage: srt-bench compare BASE.tsv HEAD.tsv [--format table|markdown] [--out FILE]"
+        );
+        std::process::exit(2);
+    }
+    let base_path = std::path::Path::new(&cli.positional[0]);
+    let head_path = std::path::Path::new(&cli.positional[1]);
+    let markdown = cli
+        .flags
+        .get("format")
+        .map(|f| f == "markdown")
+        .unwrap_or(false);
+
+    let output = match srt_bench::compare::compare_files(base_path, head_path, markdown) {
+        Ok(out) => out,
+        Err(e) => {
+            eprintln!("compare: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    if let Some(destination) = cli.flags.get("out").filter(|value| !value.is_empty()) {
+        if let Err(e) = std::fs::write(destination, output) {
+            eprintln!("compare: {destination}: {e}");
             std::process::exit(1);
         }
     } else {
