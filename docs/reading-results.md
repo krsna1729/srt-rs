@@ -68,7 +68,7 @@ what you're diagnosing, not the first one that looks plausible.
 
 | column | formula | question it answers |
 |---|---|---|
-| `offer%` | caller `core_total` ÷ target packet count | **Did the sender keep up with the configured rate?** Target is `conns × bitrate × secs ÷ (8 × PAYLOAD_SIZE)`. Below 100%: the load generator itself is the constraint — add `--workers`, or check for a stuck deadline. |
+| `offer%` | caller `core_total` ÷ target packet count | **Did the sender keep up with the configured rate?** Target is `conns × (bitrate ÷ 8) × secs ÷ (PAYLOAD_SIZE + SRT_HEADER_SIZE)` (1316B payload + 16B header, matching `SRTO_MAXBW` pacing semantics). Below 100%: the load generator itself is the constraint — add `--workers`, or check for a stuck deadline. |
 | `good%` | listener `core_total` ÷ target | **Did the receiver end up with the full stream, in absolute terms?** Ignores what the sender actually offered — useful for "did we hit the target rate" but conflates sender and listener shortfalls if read alone. |
 | `deliv%` | listener `core_total` ÷ caller `core_total` | **Of what was actually sent, how much arrived?** This is the transport's own delivery ratio. High `deliv%` with low `offer%` means the sender, not the transport, is the story. |
 | `lost` | listener `sec_a` | Loss the *protocol* detected (and presumably tried to recover from). Compare against `rcvbuf_drop` — see below. |

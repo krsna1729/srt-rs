@@ -1,0 +1,16 @@
+# Main reusable efficiency scorecard across representative runtime classes.
+runtime             = mio,tokio,monoio,compio
+ingress             = shared-pool:4
+egress              = per-connection
+encryption          = plain,256
+connections         = 50,200,600,1200
+bitrate             = 250000,1000000,4000000,8000000
+
+workers             = 1
+promotion           = all
+cookie-routing      = on
+batch               = on
+sock-buf            = 16m
+bond                = none
+connect-concurrency = 50
+pin                 = off

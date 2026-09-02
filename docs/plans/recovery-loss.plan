@@ -1,0 +1,18 @@
+# Controlled packet loss recovery under link emulation.
+runtime             = mio,tokio
+ingress             = shared-pool:4
+egress              = per-connection
+encryption          = plain
+connections         = 1,30,200
+bitrate             = 8000000
+link-loss           = off,0.1%,1%
+link-reorder        = off
+
+workers             = 1
+promotion           = all
+cookie-routing      = on
+batch               = on
+sock-buf            = 16m
+bond                = none
+connect-concurrency = 50
+pin                 = off

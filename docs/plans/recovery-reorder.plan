@@ -1,0 +1,20 @@
+# Controlled packet reordering recovery under link emulation.
+# Linux tc-netem requires a base link delay for queue-based packet reordering.
+runtime             = mio,tokio
+ingress             = shared-pool:4
+egress              = per-connection
+encryption          = plain
+connections         = 1,30,200
+bitrate             = 8000000
+link-delay          = 10ms
+link-loss           = off
+link-reorder        = off,0.1%,1%
+
+workers             = 1
+promotion           = all
+cookie-routing      = on
+batch               = on
+sock-buf            = 16m
+bond                = none
+connect-concurrency = 50
+pin                 = off
