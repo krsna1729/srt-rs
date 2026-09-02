@@ -63,10 +63,12 @@ mod caller;
 mod config;
 mod cpu;
 mod dense_slot_arena;
-#[cfg(not(any(test, feature = "bench-internals")))]
-pub(crate) use dense_slot_arena::DenseSlotArena;
 #[cfg(any(test, feature = "bench-internals"))]
-pub use dense_slot_arena::{DenseSlotArena, PeerSlot, RouteSlot, SlotMut, SlotRef};
+pub use admission::PhysicalPeerKey;
+#[cfg(any(test, feature = "bench-internals"))]
+pub use dense_slot_arena::{DenseSlotArena, PeerSlot, PeerSlotId, RouteSlot, SlotMut, SlotRef};
+#[cfg(not(any(test, feature = "bench-internals")))]
+pub(crate) use dense_slot_arena::{DenseSlotArena, PeerSlotId};
 mod due_index;
 mod group_conn;
 mod handoff;

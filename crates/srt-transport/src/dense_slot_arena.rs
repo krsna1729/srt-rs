@@ -27,10 +27,19 @@ pub struct PeerSlot<T> {
 /// empty or low-occupancy tables avoid multi-megabyte footprints while
 /// forged, stale, or port-scanning packets reject directly in L1 cache
 /// without chasing pointers to the heap-allocated connection object.
+/// Strongly typed generational slot identifier for dense peer routing and readiness queues.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PeerSlotId {
+    pub slot_idx: u32,
+    pub generation: u32,
+}
+
 #[derive(Debug)]
 pub struct RouteSlot<T> {
     pub socket_id: u32,
     pub address: SocketAddr,
+    pub ready_queued: bool,
+    pub event_ready_queued: bool,
     pub value: Option<Box<T>>,
 }
 
@@ -76,6 +85,8 @@ impl<T> DenseSlotArena<T> {
         slots.resize_with(capacity, || RouteSlot {
             socket_id: 0,
             address: SocketAddr::from(([0, 0, 0, 0], 0)),
+            ready_queued: false,
+            event_ready_queued: false,
             value: None,
         });
 
@@ -193,6 +204,8 @@ impl<T> DenseSlotArena<T> {
         self.slots[slot_idx] = RouteSlot {
             socket_id,
             address,
+            ready_queued: false,
+            event_ready_queued: false,
             value: Some(Box::new(value)),
         };
         self.len += 1;
@@ -270,6 +283,8 @@ impl<T> DenseSlotArena<T> {
         let prev_id = slot.socket_id;
         let prev_addr = slot.address;
         slot.socket_id = 0;
+        slot.ready_queued = false;
+        slot.event_ready_queued = false;
 
         let current_gen = self.slot_generations[slot_idx];
         self.slot_generations[slot_idx] = current_gen.wrapping_add(1).max(1);
@@ -283,6 +298,88 @@ impl<T> DenseSlotArena<T> {
         })
     }
 
+    /// Current generation for the slot at `slot_idx`.
+    #[inline]
+    pub fn slot_generation(&self, slot_idx: usize) -> u32 {
+        self.slot_generations.get(slot_idx).copied().unwrap_or(0)
+    }
+
+    /// Transition a slot to ready if occupied and not already queued.
+    ///
+    /// Returns `Some(PeerSlotId)` if `ready_queued` changed from `false` to `true`.
+    #[inline]
+    pub fn mark_ready(&mut self, slot_idx: usize) -> Option<PeerSlotId> {
+        let slot = self.slots.get_mut(slot_idx)?;
+        if slot.value.is_none() || slot.ready_queued {
+            return None;
+        }
+        slot.ready_queued = true;
+        Some(PeerSlotId {
+            slot_idx: slot_idx as u32,
+            generation: self.slot_generations[slot_idx],
+        })
+    }
+
+    /// Clear the `ready_queued` flag when dequeuing.
+    #[inline]
+    pub fn clear_ready(&mut self, slot_idx: usize) {
+        if let Some(slot) = self.slots.get_mut(slot_idx) {
+            slot.ready_queued = false;
+        }
+    }
+
+    /// Clear the `ready_queued` flag only if the slot generation matches `slot_id.generation`.
+    ///
+    /// Returns `true` if generation matched, `false` if stale (preserving the current occupant's flag).
+    #[inline]
+    pub fn clear_ready_if_generation_matches(&mut self, slot_id: PeerSlotId) -> bool {
+        let idx = slot_id.slot_idx as usize;
+        if self.slot_generation(idx) != slot_id.generation {
+            return false;
+        }
+        if let Some(slot) = self.slots.get_mut(idx) {
+            slot.ready_queued = false;
+        }
+        true
+    }
+    /// Transition a slot to event-ready if occupied and not already queued.
+    ///
+    /// Returns `Some(PeerSlotId)` if `event_ready_queued` changed from `false` to `true`.
+    #[inline]
+    pub fn mark_event_ready(&mut self, slot_idx: usize) -> Option<PeerSlotId> {
+        let slot = self.slots.get_mut(slot_idx)?;
+        if slot.value.is_none() || slot.event_ready_queued {
+            return None;
+        }
+        slot.event_ready_queued = true;
+        Some(PeerSlotId {
+            slot_idx: slot_idx as u32,
+            generation: self.slot_generations[slot_idx],
+        })
+    }
+
+    /// Clear the `event_ready_queued` flag when dequeuing.
+    #[inline]
+    pub fn clear_event_ready(&mut self, slot_idx: usize) {
+        if let Some(slot) = self.slots.get_mut(slot_idx) {
+            slot.event_ready_queued = false;
+        }
+    }
+
+    /// Clear the `event_ready_queued` flag only if the slot generation matches `slot_id.generation`.
+    ///
+    /// Returns `true` if generation matched, `false` if stale (preserving the current occupant's flag).
+    #[inline]
+    pub fn clear_event_ready_if_generation_matches(&mut self, slot_id: PeerSlotId) -> bool {
+        let idx = slot_id.slot_idx as usize;
+        if self.slot_generation(idx) != slot_id.generation {
+            return false;
+        }
+        if let Some(slot) = self.slots.get_mut(idx) {
+            slot.event_ready_queued = false;
+        }
+        true
+    }
     /// Iterator over all occupied peer slots.
     pub fn iter(&self) -> impl Iterator<Item = SlotRef<'_, T>> {
         self.slots.iter().filter_map(|slot| {
@@ -420,12 +517,70 @@ mod tests {
             slot2, slot1,
             "repeated preferred ID must not immediately reuse the freed slot"
         );
+
         assert_eq!(slot2, 0, "must pop front of FIFO queue (slot 0)");
         assert_ne!(id2, preferred);
         // 4. Insert with new id, verify old (preferred, same_addr) cannot resolve
         arena.insert_at_slot(slot2, id2, addr, 20);
         assert_eq!(arena.get(id2, addr), Some(&20));
         assert_eq!(arena.get(preferred, addr), None);
+    }
+    #[test]
+    fn readiness_flags_coalesce_duplicates_and_clear_on_dequeue() {
+        let mut arena: DenseSlotArena<&'static str> = DenseSlotArena::new(16);
+        let addr: SocketAddr = "127.0.0.1:6001".parse().unwrap();
+        let (slot0, id0) = arena.allocate_socket_id(0).unwrap();
+        arena.insert_at_slot(slot0, id0, addr, "peer0");
+
+        // 1. Initial mark_ready succeeds and returns PeerSlotId
+        let slot_id = arena.mark_ready(slot0).expect("first mark succeeds");
+        assert_eq!(slot_id.slot_idx, slot0 as u32);
+        assert_eq!(slot_id.generation, arena.slot_generation(slot0));
+
+        // 2. Duplicate mark_ready while already queued returns None (coalesced)
+        assert!(arena.mark_ready(slot0).is_none());
+        assert!(arena.mark_ready(slot0).is_none());
+
+        // 3. Same for event_ready
+        let event_slot_id = arena
+            .mark_event_ready(slot0)
+            .expect("first event mark succeeds");
+        assert_eq!(event_slot_id, slot_id);
+        assert!(arena.mark_event_ready(slot0).is_none());
+
+        // 4. Clear on dequeue allows rearm
+        arena.clear_ready(slot0);
+        assert!(arena.mark_ready(slot0).is_some());
+        assert!(arena.mark_ready(slot0).is_none());
+
+        arena.clear_event_ready(slot0);
+        assert!(arena.mark_event_ready(slot0).is_some());
+    }
+
+    #[test]
+    fn slot_reuse_invalidates_stale_peer_slot_ids() {
+        let mut arena: DenseSlotArena<usize> = DenseSlotArena::new(64);
+        let addr: SocketAddr = "10.0.0.1:8000".parse().unwrap();
+
+        let (slot0, id0) = arena.allocate_socket_id(0).unwrap();
+        arena.insert_at_slot(slot0, id0, addr, 100);
+        let stale_id = arena.mark_ready(slot0).unwrap();
+
+        // Remove slot0 -> advances generation
+        arena.remove_by_slot(slot0).unwrap();
+
+        // Cycle until slot0 is reused
+        let (reused_slot, new_id) = loop {
+            let (s, id) = arena.allocate_socket_id(0).unwrap();
+            if s == slot0 {
+                break (s, id);
+            }
+            arena.insert_at_slot(s, id, addr, 0);
+        };
+        arena.insert_at_slot(reused_slot, new_id, addr, 200);
+
+        // Stale PeerSlotId from prior generation does NOT match current generation!
+        assert_ne!(arena.slot_generation(slot0), stale_id.generation);
     }
 
     #[test]
