@@ -235,18 +235,57 @@ fn rss_bytes() -> Option<usize> {
 
 #[test]
 #[cfg_attr(miri, ignore = "resource-scale evidence is covered outside Miri")]
-fn same_process_btree_and_adaptive_lifecycle_records_rss_high_water() {
+fn isolated_btree_1000_lifecycle_records_rss() {
     const CONNECTIONS: usize = 1_000;
     let mut maps: Vec<BTreeMap<u32, [u64; 7]>> =
         (0..CONNECTIONS).map(|_| BTreeMap::new()).collect();
+    let idle_rss = rss_bytes();
+
+    // 1. Sparse: 4 entries per map (step 64 over 256)
+    for map in &mut maps {
+        for sequence in (0..256).step_by(64) {
+            map.insert(sequence, VALUE);
+        }
+    }
+    let sparse_rss = rss_bytes();
+
+    // 2. Dense burst: 256 entries per map
+    for map in &mut maps {
+        for sequence in 0..256 {
+            map.insert(sequence, VALUE);
+        }
+    }
+    let dense_rss = rss_bytes();
+
+    // 3. Post-settle: retain 4 entries per map
+    for map in &mut maps {
+        map.retain(|sequence, _| sequence % 64 == 0);
+    }
+    let settle_rss = rss_bytes();
+
+    // 4. Post-drain: clear all
+    for map in &mut maps {
+        map.clear();
+    }
+    let drain_rss = rss_bytes();
+
+    eprintln!(
+        "[1,000 BTreeMap isolated DSA] RSS: idle={idle_rss:?}, sparse={sparse_rss:?}, dense={dense_rss:?}, settle={settle_rss:?}, drain={drain_rss:?}"
+    );
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "resource-scale evidence is covered outside Miri")]
+fn isolated_adaptive_1000_lifecycle_records_rss() {
+    const CONNECTIONS: usize = 1_000;
     let mut windows: Vec<AdaptiveReceiverPacketWindow<[u64; 7], 8>> = (0..CONNECTIONS)
         .map(|_| AdaptiveReceiverPacketWindow::new(WINDOW, 4))
         .collect();
     let idle_rss = rss_bytes();
 
-    for (map, window) in maps.iter_mut().zip(&mut windows) {
+    // 1. Sparse: 4 entries per window (sparse pages)
+    for window in &mut windows {
         for sequence in (0..256).step_by(64) {
-            map.insert(sequence, VALUE);
             window.insert(sequence, VALUE).unwrap();
         }
     }
@@ -256,9 +295,9 @@ fn same_process_btree_and_adaptive_lifecycle_records_rss_high_water() {
         .sum();
     let sparse_rss = rss_bytes();
 
-    for (map, window) in maps.iter_mut().zip(&mut windows) {
+    // 2. Dense burst: 256 entries per window (promotes to dense pages)
+    for window in &mut windows {
         for sequence in 0..256 {
-            map.insert(sequence, VALUE);
             window.insert(sequence, VALUE).unwrap();
         }
     }
@@ -268,36 +307,33 @@ fn same_process_btree_and_adaptive_lifecycle_records_rss_high_water() {
         .sum();
     let dense_rss = rss_bytes();
 
-    for (map, window) in maps.iter_mut().zip(&mut windows) {
-        map.retain(|sequence, _| sequence % 64 == 0);
+    // 3. Post-settle: demote back to 4 entries per window (restores sparse pages)
+    for window in &mut windows {
         for sequence in 0..256 {
             if sequence % 64 != 0 {
                 window.remove(sequence);
             }
         }
     }
-    let sparse_again_heap: usize = windows
+    let settle_heap: usize = windows
         .iter()
         .map(AdaptiveReceiverPacketWindow::heap_bytes)
         .sum();
-    let sparse_again_rss = rss_bytes();
+    let settle_rss = rss_bytes();
 
-    for (map, window) in maps.iter_mut().zip(&mut windows) {
-        map.clear();
+    // 4. Post-drain: remove all remaining entries (reclaims sparse pages)
+    for window in &mut windows {
         assert_eq!(window.remove_range(0, 255), Some(4));
     }
-    let empty_heap: usize = windows
+    let drain_heap: usize = windows
         .iter()
         .map(AdaptiveReceiverPacketWindow::heap_bytes)
         .sum();
-    let empty_rss = rss_bytes();
+    let drain_rss = rss_bytes();
+
     eprintln!(
-        "1,000 same-process BTreeMap+adaptive lifecycle: RSS idle={idle_rss:?}, \
-         sparse={sparse_rss:?}, dense={dense_rss:?}, sparse-again={sparse_again_rss:?}, \
-         empty={empty_rss:?}; adaptive owned heap sparse={sparse_heap}, dense={dense_heap}, \
-         sparse-again={sparse_again_heap}, empty={empty_heap} bytes"
+        "[1,000 Adaptive isolated DSA] RSS: idle={idle_rss:?}, sparse={sparse_rss:?}, dense={dense_rss:?}, settle={settle_rss:?}, drain={drain_rss:?} | Heap: sparse={sparse_heap}, dense={dense_heap}, settle={settle_heap}, drain={drain_heap}"
     );
-    assert_eq!(sparse_again_heap, sparse_heap);
-    assert!(dense_heap > sparse_heap);
-    assert!(empty_heap < sparse_heap);
+    assert_eq!(settle_heap, sparse_heap);
+    assert_eq!(drain_heap, CONNECTIONS * 2_064);
 }

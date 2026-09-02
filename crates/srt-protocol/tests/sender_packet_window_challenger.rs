@@ -93,52 +93,62 @@ fn sender_tlpktdrop_retires_entire_message_across_wrap() {
 
 #[test]
 #[cfg_attr(miri, ignore = "resource-scale evidence is covered outside Miri")]
-fn sender_scale_1000_connections_allocates_and_reclaims_pages() {
-    const CONNECTIONS: usize = 1_000;
-    let mut senders: Vec<SenderBuffer> = (0..CONNECTIONS)
-        .map(|_| {
-            let mut s = SenderBuffer::new(0, 8_192, 120);
-            s.set_congestion_window(256);
-            s
-        })
-        .collect();
-
-    // Baseline directory floor: 1,000 * 1,040 bytes = 1,040,000 bytes.
-    let empty_heap: usize = senders.iter().map(|s| s.sender_window_heap_bytes()).sum();
-    assert_eq!(empty_heap, CONNECTIONS * 1_040);
-    for s in &senders {
-        assert_eq!(s.allocated_pages(), 0);
+fn sender_scale_1_30_200_1000_allocates_and_reclaims_pages() {
+    fn rss_bytes() -> Option<usize> {
+        let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+        let pages: usize = statm.split_whitespace().nth(1)?.parse().ok()?;
+        Some(pages * 4096)
     }
 
-    // Burst: each connection sends 128 packets (filling exactly 2 pages per connection).
-    let now = ts(1_000);
-    for s in &mut senders {
-        for _ in 0..128 {
-            s.push(vec![0x42; 64], 1, 1, now).unwrap();
+    for &conns in &[1, 30, 200, 1_000] {
+        let idle_rss = rss_bytes();
+        let mut senders: Vec<SenderBuffer> = (0..conns)
+            .map(|_| {
+                let mut s = SenderBuffer::new(0, 8_192, 120);
+                s.set_congestion_window(256);
+                s
+            })
+            .collect();
+
+        // Baseline directory floor: conns * 1,040 bytes.
+        let empty_heap: usize = senders.iter().map(|s| s.sender_window_heap_bytes()).sum();
+        assert_eq!(empty_heap, conns * 1_040);
+        for s in &senders {
+            assert_eq!(s.allocated_pages(), 0);
         }
-    }
-    let burst_heap: usize = senders.iter().map(|s| s.sender_window_heap_bytes()).sum();
-    assert!(burst_heap > empty_heap);
-    for s in &senders {
-        assert_eq!(s.allocated_pages(), 2);
-    }
 
-    // Cumulative ACK: acknowledge all 128 packets.
-    for s in &mut senders {
-        s.handle_ack(128);
-    }
+        // Burst: each connection sends 128 packets (filling exactly 2 pages per connection).
+        let now = ts(1_000);
+        for s in &mut senders {
+            for _ in 0..128 {
+                s.push(vec![0x42; 64], 1, 1, now).unwrap();
+            }
+        }
+        let burst_heap: usize = senders.iter().map(|s| s.sender_window_heap_bytes()).sum();
+        let burst_rss = rss_bytes();
+        assert!(burst_heap > empty_heap);
+        for s in &senders {
+            assert_eq!(s.allocated_pages(), 2);
+        }
 
-    // All pages eagerly reclaimed; heap returns exactly to directory floor.
-    let post_ack_heap: usize = senders.iter().map(|s| s.sender_window_heap_bytes()).sum();
-    assert_eq!(post_ack_heap, empty_heap);
-    for s in &senders {
-        assert_eq!(s.allocated_pages(), 0);
-        assert!(s.is_empty());
-    }
+        // Cumulative ACK: acknowledge all 128 packets.
+        for s in &mut senders {
+            s.handle_ack(128);
+        }
 
-    eprintln!(
-        "[1,000 senders] owned heap: empty={empty_heap} B, burst-128pkts={burst_heap} B, post-ack={post_ack_heap} B"
-    );
+        // All pages eagerly reclaimed; heap returns exactly to directory floor.
+        let post_ack_heap: usize = senders.iter().map(|s| s.sender_window_heap_bytes()).sum();
+        let post_ack_rss = rss_bytes();
+        assert_eq!(post_ack_heap, empty_heap);
+        for s in &senders {
+            assert_eq!(s.allocated_pages(), 0);
+            assert!(s.is_empty());
+        }
+
+        eprintln!(
+            "[{conns} senders] owned heap: empty={empty_heap} B, burst-128pkts={burst_heap} B, post-ack={post_ack_heap} B | RSS: idle={idle_rss:?}, burst={burst_rss:?}, post-ack={post_ack_rss:?}"
+        );
+    }
 }
 
 #[test]

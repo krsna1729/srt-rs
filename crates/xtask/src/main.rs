@@ -176,6 +176,47 @@ const GEIGER_LIFECYCLE: Step = Step {
     cwd: Some("crates/srt-lifecycle"),
     informational: true,
 };
+const ASAN_PROTOCOL: Step = Step {
+    name: "asan-protocol",
+    cmd: "cargo",
+    args: &[
+        "+nightly",
+        "test",
+        "-p",
+        "shiguredo_srt",
+        "--all-targets",
+        "--target",
+        "x86_64-unknown-linux-gnu",
+    ],
+    env: &[
+        ("RUSTFLAGS", "-Zsanitizer=address"),
+        ("RUSTDOCFLAGS", "-Zsanitizer=address"),
+    ],
+    tool: None,
+    cwd: None,
+    informational: false,
+};
+
+const ASAN_TRANSPORT: Step = Step {
+    name: "asan-transport",
+    cmd: "cargo",
+    args: &[
+        "+nightly",
+        "test",
+        "-p",
+        "srt-transport",
+        "--all-features",
+        "--target",
+        "x86_64-unknown-linux-gnu",
+    ],
+    env: &[
+        ("RUSTFLAGS", "-Zsanitizer=address"),
+        ("RUSTDOCFLAGS", "-Zsanitizer=address"),
+    ],
+    tool: None,
+    cwd: None,
+    informational: false,
+};
 
 const PRECOMMIT: &[&Step] = &[&FMT, &CLIPPY, &REPORTCARD, &DOC, &TYPOS];
 const CI: &[&Step] = &[
@@ -190,7 +231,6 @@ const CI: &[&Step] = &[
     &PACKAGE,
     &FUZZ_BUILD,
 ];
-
 fn main() -> ExitCode {
     let arg = env::args().nth(1).unwrap_or_default();
     match arg.as_str() {
@@ -204,6 +244,7 @@ fn main() -> ExitCode {
         "fuzz-build" => run_one(&FUZZ_BUILD),
         "geiger" => run_group(&[&GEIGER_PROTOCOL, &GEIGER_TRANSPORT, &GEIGER_LIFECYCLE]),
         "reportcard" => reportcard::run(&env::args().skip(2).collect::<Vec<_>>()),
+        "asan" => run_group(&[&ASAN_PROTOCOL, &ASAN_TRANSPORT]),
         "precommit" => run_group(PRECOMMIT),
         "ci" | "check-all" => run_group(CI),
         "install-hooks" => install_hooks(),
@@ -221,6 +262,7 @@ fn main() -> ExitCode {
             eprintln!("  fuzz-build     compile fuzz targets (needs cargo-fuzz + nightly)");
             eprintln!("  geiger         unsafe surface inventory (needs cargo-geiger)");
             eprintln!("  reportcard     complexity and maintainability ratchet");
+            eprintln!("  asan           run AddressSanitizer tests (needs nightly)");
             eprintln!("  precommit      fast gate: fmt + clippy + reportcard + doc + typos");
             eprintln!("  ci             full gate: all checks + report card");
             eprintln!("  check-all      alias for ci");
