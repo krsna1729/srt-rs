@@ -8,8 +8,9 @@ use shiguredo_srt::{
     SRTGROUP_MASK, SrtConnection, Timestamp,
 };
 use srt_transport::{
-    AdmissionOptions, AdmissionResolution, BondedInputPolicy, DenseSlotArena, DueIndex,
-    IngressTelemetry, ListenerPeerPolicy, PeerTable, PeerTableConfig, PolicyOverride,
+    AdmissionOptions, AdmissionResolution, BondedInputPolicy, DenseDueIndex, DenseSlotArena,
+    DueIndex, IngressTelemetry, ListenerPeerPolicy, PeerTable, PeerTableConfig, PhysicalPeerKey,
+    PolicyOverride,
 };
 
 fn induction(socket_id: u32) -> Vec<u8> {
@@ -569,6 +570,318 @@ fn bench_ready_queue_scaling(c: &mut Criterion) {
     }
     group.finish();
 }
+fn bench_dense_due_index_scaling(c: &mut Criterion) {
+    let mut group = c.benchmark_group("dense_due_index_scaling");
+
+    for size in [1, 30, 200, 1000, 4096] {
+        group.throughput(Throughput::Elements(size as u64));
+
+        // 1. Unique set: one deadline per live peer slot
+        group.bench_function(format!("unique_set/{size}"), |b| {
+            b.iter_batched_ref(
+                || {
+                    let mut arena = DenseSlotArena::<usize>::new(size);
+                    let mut slots = Vec::with_capacity(size);
+                    for i in 0..size {
+                        let addr = SocketAddr::from((
+                            [10, (i / 65536) as u8, (i / 256) as u8, (i % 256) as u8],
+                            5000,
+                        ));
+                        let (s, id) = arena.allocate_socket_id(0).unwrap();
+                        arena.insert_at_slot(s, id, addr, i);
+                        slots.push(s);
+                    }
+                    let index = DenseDueIndex::default();
+                    (arena, slots, index)
+                },
+                |state| {
+                    let (arena, slots, index) = state;
+                    for &slot in slots.iter() {
+                        index.set(slot, Timestamp::from_micros(1000), arena);
+                    }
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        // 2. Reschedule churn (modest 2x replacement)
+        group.bench_function(format!("reschedule_modest/{size}"), |b| {
+            b.iter_batched_ref(
+                || {
+                    let mut arena = DenseSlotArena::<usize>::new(size);
+                    let mut slots = Vec::with_capacity(size);
+                    let mut index = DenseDueIndex::default();
+                    for i in 0..size {
+                        let addr = SocketAddr::from((
+                            [10, (i / 65536) as u8, (i / 256) as u8, (i % 256) as u8],
+                            5000,
+                        ));
+                        let (s, id) = arena.allocate_socket_id(0).unwrap();
+                        arena.insert_at_slot(s, id, addr, i);
+                        index.set(s, Timestamp::from_micros(1000), &mut arena);
+                        slots.push(s);
+                    }
+                    (arena, slots, index)
+                },
+                |state| {
+                    let (arena, slots, index) = state;
+                    for &slot in slots.iter() {
+                        index.set(slot, Timestamp::from_micros(2000), arena);
+                    }
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        // 3. Peek min deadline with stale heads present
+        group.bench_function(format!("peek_min_stale/{size}"), |b| {
+            b.iter_batched_ref(
+                || {
+                    let mut arena = DenseSlotArena::<usize>::new(size);
+                    let mut index = DenseDueIndex::default();
+                    for i in 0..size {
+                        let addr = SocketAddr::from((
+                            [10, (i / 65536) as u8, (i / 256) as u8, (i % 256) as u8],
+                            5000,
+                        ));
+                        let (s, id) = arena.allocate_socket_id(0).unwrap();
+                        arena.insert_at_slot(s, id, addr, i);
+                        // Stale early deadline + live later deadline
+                        index.set(s, Timestamp::from_micros(500), &mut arena);
+                        index.set(s, Timestamp::from_micros(1000 + i as u64), &mut arena);
+                    }
+                    (arena, index)
+                },
+                |state| {
+                    let (arena, index) = state;
+                    black_box(index.peek_min_deadline(arena));
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        // 4. Pop due with stale predecessors
+        group.bench_function(format!("pop_due_stale/{size}"), |b| {
+            b.iter_batched_ref(
+                || {
+                    let mut arena = DenseSlotArena::<usize>::new(size);
+                    let mut index = DenseDueIndex::default();
+                    for i in 0..size {
+                        let addr = SocketAddr::from((
+                            [10, (i / 65536) as u8, (i / 256) as u8, (i % 256) as u8],
+                            5000,
+                        ));
+                        let (s, id) = arena.allocate_socket_id(0).unwrap();
+                        arena.insert_at_slot(s, id, addr, i);
+                        // 2 reschedules before due timestamp
+                        index.set(s, Timestamp::from_micros(100), &mut arena);
+                        index.set(s, Timestamp::from_micros(200), &mut arena);
+                        index.set(s, Timestamp::from_micros(300), &mut arena);
+                    }
+                    let due = Vec::with_capacity(size);
+                    (arena, index, due)
+                },
+                |state| {
+                    let (arena, index, due) = state;
+                    index.pop_due(Timestamp::from_micros(300), arena, due);
+                    black_box(&due);
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        // 5. Remove and slot reuse
+        group.bench_function(format!("remove_and_reuse/{size}"), |b| {
+            b.iter_batched_ref(
+                || {
+                    let mut arena = DenseSlotArena::<usize>::new(size);
+                    let mut index = DenseDueIndex::default();
+                    let mut slots = Vec::with_capacity(size);
+                    for i in 0..size {
+                        let addr = SocketAddr::from((
+                            [10, (i / 65536) as u8, (i / 256) as u8, (i % 256) as u8],
+                            5000,
+                        ));
+                        let (s, id) = arena.allocate_socket_id(0).unwrap();
+                        arena.insert_at_slot(s, id, addr, i);
+                        index.set(s, Timestamp::from_micros(500), &mut arena);
+                        slots.push((s, id, addr));
+                    }
+                    (arena, index, slots)
+                },
+                |state| {
+                    let (arena, index, slots) = state;
+                    for &(s, _, addr) in slots.iter() {
+                        index.remove(s, arena);
+                        arena.remove_by_slot(s);
+                        let (new_s, new_id) = arena.allocate_socket_id(0).unwrap();
+                        arena.insert_at_slot(new_s, new_id, addr, 999);
+                        index.set(new_s, Timestamp::from_micros(1000), arena);
+                    }
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+
+    // 6. Rebuild threshold policy sweep at 1,000 peers with 8x churn
+    for ratio in [0, 2, 4, 8] {
+        let label = if ratio == 0 {
+            "no_rebuild".to_string()
+        } else {
+            format!("{ratio}x_ratio")
+        };
+        group.bench_function(format!("rebuild_policy/{label}"), |b| {
+            b.iter_batched_ref(
+                || {
+                    let mut arena = DenseSlotArena::<usize>::new(1000);
+                    let mut slots = Vec::with_capacity(1000);
+                    let index = DenseDueIndex::new(64, ratio);
+                    for i in 0..1000 {
+                        let addr = SocketAddr::from((
+                            [10, (i / 65536) as u8, (i / 256) as u8, (i % 256) as u8],
+                            5000,
+                        ));
+                        let (s, id) = arena.allocate_socket_id(0).unwrap();
+                        arena.insert_at_slot(s, id, addr, i);
+                        slots.push(s);
+                    }
+                    (arena, slots, index)
+                },
+                |state| {
+                    let (arena, slots, index) = state;
+                    for &slot in slots.iter() {
+                        index.set(slot, Timestamp::from_micros(1000), arena);
+                    }
+                    for round in 1..=7 {
+                        for &slot in slots.iter() {
+                            index.set(slot, Timestamp::from_micros(1000 + round * 100), arena);
+                        }
+                    }
+                    black_box(index.heap_len());
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_generic_due_index_scaling(c: &mut Criterion) {
+    let mut group = c.benchmark_group("generic_due_index_scaling");
+
+    for size in [1, 30, 200, 1000, 4096] {
+        group.throughput(Throughput::Elements(size as u64));
+
+        let peers: Vec<PhysicalPeerKey> = (0..size)
+            .map(|i| PhysicalPeerKey {
+                address: SocketAddr::from((
+                    [10, (i / 65536) as u8, (i / 256) as u8, (i % 256) as u8],
+                    5000,
+                )),
+                local_socket_id: 100 + i as u32,
+            })
+            .collect();
+
+        // 1. Unique set: one deadline per peer
+        group.bench_function(format!("unique_set/{size}"), |b| {
+            b.iter_batched_ref(
+                || (DueIndex::<PhysicalPeerKey>::default(), peers.clone()),
+                |(index, peers)| {
+                    for &peer in peers.iter() {
+                        index.set(peer, Timestamp::from_micros(1000));
+                    }
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        // 2. Reschedule churn (modest 2x replacement)
+        group.bench_function(format!("reschedule_modest/{size}"), |b| {
+            b.iter_batched_ref(
+                || {
+                    let mut index = DueIndex::<PhysicalPeerKey>::default();
+                    for &peer in &peers {
+                        index.set(peer, Timestamp::from_micros(1000));
+                    }
+                    (index, peers.clone())
+                },
+                |(index, peers)| {
+                    for &peer in peers.iter() {
+                        index.set(peer, Timestamp::from_micros(2000));
+                    }
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        // 3. Peek min deadline with stale heads present
+        group.bench_function(format!("peek_min_stale/{size}"), |b| {
+            b.iter_batched_ref(
+                || {
+                    let mut index = DueIndex::<PhysicalPeerKey>::default();
+                    for (i, &peer) in peers.iter().enumerate() {
+                        index.set(peer, Timestamp::from_micros(500));
+                        index.set(peer, Timestamp::from_micros(1000 + i as u64));
+                    }
+                    index
+                },
+                |index| {
+                    black_box(index.peek_min_deadline());
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        // 4. Pop due with stale predecessors
+        group.bench_function(format!("pop_due_stale/{size}"), |b| {
+            b.iter_batched_ref(
+                || {
+                    let mut index = DueIndex::<PhysicalPeerKey>::default();
+                    for &peer in &peers {
+                        index.set(peer, Timestamp::from_micros(100));
+                        index.set(peer, Timestamp::from_micros(200));
+                        index.set(peer, Timestamp::from_micros(300));
+                    }
+                    let due = Vec::with_capacity(size);
+                    (index, due)
+                },
+                |(index, due)| {
+                    index.pop_due(Timestamp::from_micros(300), due);
+                    black_box(&due);
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        // 5. Remove and reuse
+        group.bench_function(format!("remove_and_reuse/{size}"), |b| {
+            b.iter_batched_ref(
+                || {
+                    let mut index = DueIndex::<PhysicalPeerKey>::default();
+                    for &peer in &peers {
+                        index.set(peer, Timestamp::from_micros(500));
+                    }
+                    (index, peers.clone())
+                },
+                |(index, peers)| {
+                    for &peer in peers.iter() {
+                        index.remove(&peer);
+                        let new_peer = PhysicalPeerKey {
+                            address: peer.address,
+                            local_socket_id: peer.local_socket_id + 100_000,
+                        };
+                        index.set(new_peer, Timestamp::from_micros(1000));
+                    }
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+
+    group.finish();
+}
 
 criterion_group!(
     benches,
@@ -580,6 +893,8 @@ criterion_group!(
     bench_bonded_second_leg_admission,
     bench_route_only_dispatch,
     bench_established_data_progression,
-    bench_ready_queue_scaling
+    bench_ready_queue_scaling,
+    bench_dense_due_index_scaling,
+    bench_generic_due_index_scaling
 );
 criterion_main!(benches);
