@@ -291,6 +291,10 @@ impl<T> SenderPacketWindow<T> {
         if count > self.window_size as usize {
             return;
         }
+        if count == 1 {
+            self.discard_single_packet(oldest_unacked, &mut on_stale_retransmit);
+            return;
+        }
         let start = self.physical_index(oldest_unacked);
         let end = start + count;
         if end <= self.index_mask + 1 {
@@ -316,6 +320,35 @@ impl<T> SenderPacketWindow<T> {
                 count as u32,
                 &mut on_stale_retransmit,
             );
+        }
+    }
+
+    fn discard_single_packet(&mut self, sequence: u32, on_stale_retransmit: &mut impl FnMut()) {
+        let (page_index, slot_index) = self.indices(sequence);
+        let Some(page) = self.pages[page_index].as_mut() else {
+            return;
+        };
+        let bit = 1u64 << slot_index;
+        if page.occupied & bit == 0 {
+            return;
+        }
+        let matches = page.slots[slot_index]
+            .as_ref()
+            .is_some_and(|s| s.sequence == sequence);
+        if !matches {
+            return;
+        }
+        page.slots[slot_index] = None;
+        page.occupied &= !bit;
+        if page.retransmit_queued & bit != 0 {
+            page.retransmit_queued &= !bit;
+            self.retransmit_queued_count -= 1;
+            on_stale_retransmit();
+        }
+        self.len -= 1;
+        if page.occupied == 0 {
+            self.pages[page_index] = None;
+            self.mark_page_empty(page_index);
         }
     }
 
