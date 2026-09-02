@@ -85,7 +85,14 @@ name = "fuzz_receiver_packet_window"
 path = "fuzz_targets/fuzz_receiver_packet_window.rs"
 test = false
 
+[[bin]]
+bench = false
+doc = false
+name = "fuzz_dense_slot_arena"
+path = "fuzz_targets/fuzz_dense_slot_arena.rs"
+test = false
+
 [dependencies]
 libfuzzer-sys = "0.4"
 shiguredo_srt = { path = ".." }
-srt-transport = { path = "../../srt-transport" }
+srt-transport = { path = "../../srt-transport", features = ["bench-internals"] }

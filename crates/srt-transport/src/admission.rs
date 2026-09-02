@@ -1,6 +1,6 @@
 use crate::{
-    DueIndex, GroupConnectionStats, GroupLogicalCounters, InboundGroupStats, IngressTelemetry,
-    ListenerPeerPolicy, ManualTimerStore, WorkerMessage, group_connection_stats,
+    DenseSlotArena, DueIndex, GroupConnectionStats, GroupLogicalCounters, InboundGroupStats,
+    IngressTelemetry, ListenerPeerPolicy, ManualTimerStore, WorkerMessage, group_connection_stats,
 };
 use shiguredo_srt::{
     Bytes, ConnectionEvent, ConnectionOptions, ConnectionOutput, SrtConnection, Timestamp,
@@ -442,8 +442,7 @@ impl LogicalPeer<'_> {
         match self.table.logical_peers.get(&self.id)? {
             LogicalPeerTarget::Direct(peer) => self
                 .table
-                .peers
-                .get(peer)
+                .get_peer(peer)
                 .and_then(|entry| entry.conn.peer_stream_id()),
             LogicalPeerTarget::Group(key) => key.stream_id.as_deref(),
         }
@@ -454,7 +453,7 @@ impl LogicalPeer<'_> {
     #[must_use]
     pub fn group_affinity(&self) -> Option<srt_lifecycle::GroupAffinity> {
         match self.table.logical_peers.get(&self.id)? {
-            LogicalPeerTarget::Direct(peer) => self.table.peers.get(peer).and_then(|entry| {
+            LogicalPeerTarget::Direct(peer) => self.table.get_peer(peer).and_then(|entry| {
                 entry
                     .conn
                     .peer_group_extension()
@@ -488,8 +487,7 @@ impl LogicalPeer<'_> {
         match self.table.logical_peers.get(&self.id)? {
             LogicalPeerTarget::Direct(peer) => self
                 .table
-                .peers
-                .get(peer)
+                .get_peer(peer)
                 .map(|entry| LogicalPeerStats::Direct(Box::new(entry.conn.stats()))),
             LogicalPeerTarget::Group(key) => self.table.groups.get(key).map(|group| {
                 LogicalPeerStats::Group(Box::new(group_connection_stats(
@@ -530,8 +528,7 @@ impl LogicalPeerMut<'_> {
         match self.table.logical_peers.get(&self.id)? {
             LogicalPeerTarget::Direct(peer) => self
                 .table
-                .peers
-                .get(peer)
+                .get_peer(peer)
                 .and_then(|entry| entry.conn.peer_stream_id()),
             LogicalPeerTarget::Group(key) => key.stream_id.as_deref(),
         }
@@ -550,8 +547,7 @@ impl LogicalPeerMut<'_> {
         match self.table.logical_peers.get(&self.id) {
             Some(LogicalPeerTarget::Direct(peer)) => self
                 .table
-                .peers
-                .get(peer)
+                .get_peer(peer)
                 .is_some_and(|entry| entry.conn.can_send()),
             Some(LogicalPeerTarget::Group(key)) => self
                 .table
@@ -567,7 +563,7 @@ impl LogicalPeerMut<'_> {
     pub fn send(&mut self, payload: &[u8], now: Timestamp) -> Result<usize, shiguredo_srt::Error> {
         match self.table.logical_peers.get(&self.id).cloned() {
             Some(LogicalPeerTarget::Direct(peer)) => {
-                let entry = self.table.peers.get_mut(&peer).ok_or_else(|| {
+                let entry = self.table.get_peer_mut(&peer).ok_or_else(|| {
                     shiguredo_srt::Error::with_reason(
                         shiguredo_srt::ErrorKind::InvalidState,
                         "logical peer no longer exists",
@@ -608,7 +604,7 @@ impl LogicalPeerMut<'_> {
         let len = payload.len() as u64;
         match self.table.logical_peers.get(&self.id).cloned() {
             Some(LogicalPeerTarget::Direct(peer)) => {
-                let entry = self.table.peers.get_mut(&peer).ok_or_else(|| {
+                let entry = self.table.get_peer_mut(&peer).ok_or_else(|| {
                     shiguredo_srt::Error::with_reason(
                         shiguredo_srt::ErrorKind::InvalidState,
                         "logical peer no longer exists",
@@ -644,7 +640,7 @@ impl LogicalPeerMut<'_> {
     pub fn disconnect(&mut self, now: Timestamp) {
         match self.table.logical_peers.get(&self.id).cloned() {
             Some(LogicalPeerTarget::Direct(peer)) => {
-                if let Some(entry) = self.table.peers.get_mut(&peer) {
+                if let Some(entry) = self.table.get_peer_mut(&peer) {
                     entry.conn.disconnect(now);
                     self.table.mark_ready_physical(peer);
                 }
@@ -704,6 +700,47 @@ struct GroupMemberHandle {
     member_id: u32,
 }
 
+#[allow(clippy::large_enum_variant)]
+enum PeerSlotTarget {
+    Direct(AdmissionPeer),
+    GroupLeg(GroupMemberHandle),
+    Detached,
+}
+
+impl PeerSlotTarget {
+    #[inline]
+    fn direct(&self) -> Option<&AdmissionPeer> {
+        match self {
+            Self::Direct(peer) => Some(peer),
+            Self::GroupLeg(_) | Self::Detached => None,
+        }
+    }
+
+    #[inline]
+    fn direct_mut(&mut self) -> Option<&mut AdmissionPeer> {
+        match self {
+            Self::Direct(peer) => Some(peer),
+            Self::GroupLeg(_) | Self::Detached => None,
+        }
+    }
+
+    #[inline]
+    fn group_leg(&self) -> Option<&GroupMemberHandle> {
+        match self {
+            Self::GroupLeg(handle) => Some(handle),
+            Self::Direct(_) | Self::Detached => None,
+        }
+    }
+
+    #[inline]
+    fn extract_direct(self) -> Option<AdmissionPeer> {
+        match self {
+            Self::Direct(peer) => Some(peer),
+            Self::GroupLeg(_) | Self::Detached => None,
+        }
+    }
+}
+
 /// The peers one acceptor is servicing off its shared listener.
 ///
 /// This is the admission session state machine, minus I/O: it owns the
@@ -712,7 +749,8 @@ struct GroupMemberHandle {
 /// It lives here rather than in srt-lifecycle because it owns clocks and
 /// live protocol state, which that crate deliberately does not.
 pub struct PeerTable {
-    peers: HashMap<PhysicalPeerKey, AdmissionPeer>,
+    slots: DenseSlotArena<PeerSlotTarget>,
+    half_open_by_caller: HashMap<(std::net::SocketAddr, u32), usize>,
     logical_peers: HashMap<LogicalPeerId, LogicalPeerTarget>,
     next_logical_peer: u64,
     source_counts: HashMap<std::net::IpAddr, usize>,
@@ -725,8 +763,6 @@ pub struct PeerTable {
     event_ready: VecDeque<PhysicalPeerKey>,
     event_ready_set: HashSet<PhysicalPeerKey>,
     groups: HashMap<srt_lifecycle::LogicalGroupKey, InboundGroup>,
-    group_peers: HashMap<PhysicalPeerKey, GroupMemberHandle>,
-    next_listener_socket_id: u32,
     last_now: Timestamp,
     config: PeerTableConfig,
 }
@@ -750,7 +786,8 @@ impl PeerTable {
         config.max_established_peers = config.max_established_peers.max(1).min(config.max_peers);
         config.max_peers_per_ip = config.max_peers_per_ip.max(1).min(config.max_peers);
         Self {
-            peers: HashMap::new(),
+            slots: DenseSlotArena::new(config.max_peers),
+            half_open_by_caller: HashMap::new(),
             logical_peers: HashMap::new(),
             next_logical_peer: 1,
             source_counts: HashMap::new(),
@@ -763,11 +800,39 @@ impl PeerTable {
             event_ready: VecDeque::new(),
             event_ready_set: HashSet::new(),
             groups: HashMap::new(),
-            group_peers: HashMap::new(),
-            next_listener_socket_id: 0,
             last_now: Timestamp::default(),
             config,
         }
+    }
+
+    #[inline]
+    fn slot_index_for_key(&self, key: &PhysicalPeerKey) -> Option<usize> {
+        let slot_idx = self.slots.slot_index_for_socket_id(key.local_socket_id);
+        let slot = self.slots.get_by_slot(slot_idx)?;
+        if slot.socket_id == key.local_socket_id && slot.address == key.address {
+            Some(slot_idx)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn get_peer(&self, key: &PhysicalPeerKey) -> Option<&AdmissionPeer> {
+        let slot_idx = self.slot_index_for_key(key)?;
+        self.slots.get_by_slot(slot_idx)?.value.direct()
+    }
+
+    #[inline]
+    fn get_peer_mut(&mut self, key: &PhysicalPeerKey) -> Option<&mut AdmissionPeer> {
+        let slot_idx = self.slot_index_for_key(key)?;
+        self.slots.get_by_slot_mut(slot_idx)?.value.direct_mut()
+    }
+
+    #[inline]
+    fn is_group_leg(&self, key: &PhysicalPeerKey) -> bool {
+        self.slot_index_for_key(key)
+            .and_then(|idx| self.slots.get_by_slot(idx))
+            .is_some_and(|slot| matches!(slot.value, PeerSlotTarget::GroupLeg(_)))
     }
 
     fn allocate_logical_peer(&mut self, target: LogicalPeerTarget) -> LogicalPeerId {
@@ -778,34 +843,22 @@ impl PeerTable {
     }
 
     fn detach_peer_for_group(&mut self, peer: &PhysicalPeerKey) -> Option<AdmissionPeer> {
+        let slot_idx = self.slot_index_for_key(peer)?;
         self.deadlines.remove(peer);
         self.half_open_deadlines.remove(peer);
         self.ready_set.remove(peer);
         self.event_ready_set.remove(peer);
-        self.peers.remove(peer)
+        let slot = self.slots.get_by_slot_mut(slot_idx)?;
+        let prev = std::mem::replace(slot.value, PeerSlotTarget::Detached);
+        prev.extract_direct()
     }
 
     fn allocate_listener_socket_id(&mut self, preferred: u32) -> u32 {
-        let mut candidate = if self.next_listener_socket_id == 0 {
-            preferred.max(1)
-        } else {
-            self.next_listener_socket_id
-        };
-        loop {
-            if !self
-                .peers
-                .keys()
-                .any(|key| key.local_socket_id == candidate)
-                && !self
-                    .group_peers
-                    .keys()
-                    .any(|key| key.local_socket_id == candidate)
-            {
-                self.next_listener_socket_id = candidate.wrapping_add(1).max(1);
-                return candidate;
-            }
-            candidate = candidate.wrapping_add(1).max(1);
-        }
+        let (_, socket_id) = self
+            .slots
+            .allocate_socket_id(preferred)
+            .expect("capacity checked before allocating listener socket ID");
+        socket_id
     }
 
     #[inline]
@@ -819,27 +872,28 @@ impl PeerTable {
             return physical;
         }
         let identity = conclusion?;
-        // Some interoperable callers retain zero in the control header for a
-        // CONCLUSION. The cookie is the handshake-phase route in that case;
-        // it is not used for established DATA/CONTROL traffic, which remains
-        // strictly Destination-Socket-ID demultiplexed.
-        self.peers
+        self.slots
             .iter()
-            .find_map(|(key, entry)| {
-                (key.address == peer && entry.conn.syn_cookie() == identity.syn_cookie)
-                    .then_some(*key)
+            .find_map(|slot| {
+                let entry = slot.value.direct()?;
+                (slot.address == peer && entry.conn.syn_cookie() == identity.syn_cookie).then_some(
+                    PhysicalPeerKey {
+                        address: slot.address,
+                        local_socket_id: slot.socket_id,
+                    },
+                )
             })
             .or_else(|| {
-                // Legacy/raw callers that bypass `SessionConfig` can advertise
-                // socket ID zero during the whole handshake. Preserve that
-                // compatibility only when the UDP tuple identifies exactly one
-                // half-open leg; shared-four-tuple sessions must materialize a
-                // non-zero caller SRT Socket ID and are never guessed by address.
-                let mut candidates = self.peers.keys().filter(|key| key.address == peer);
-                candidates
-                    .next()
-                    .copied()
-                    .filter(|_| candidates.next().is_none())
+                let mut candidates = self.slots.iter().filter(|slot| slot.address == peer);
+                let first = candidates.next()?;
+                if candidates.next().is_none() {
+                    Some(PhysicalPeerKey {
+                        address: first.address,
+                        local_socket_id: first.socket_id,
+                    })
+                } else {
+                    None
+                }
             })
     }
 
@@ -887,7 +941,7 @@ impl PeerTable {
             telemetry.record_invalid_datagram();
             return Some(Admit::Dropped(AdmissionDropReason::InvalidPacket));
         }
-        if self.peers.len() >= self.config.max_peers {
+        if self.len() >= self.config.max_peers {
             telemetry.record_admission_capacity_drop();
             return Some(Admit::Dropped(AdmissionDropReason::Capacity));
         }
@@ -909,37 +963,59 @@ impl PeerTable {
         induction_socket_id: Option<u32>,
     ) -> Option<PhysicalPeerKey> {
         if destination_socket_id != 0 {
-            return Some(PhysicalPeerKey {
-                address,
-                local_socket_id: destination_socket_id,
-            });
+            let slot_idx = self.slots.slot_index_for_socket_id(destination_socket_id);
+            let slot = self.slots.get_by_slot(slot_idx)?;
+            if slot.socket_id == destination_socket_id && slot.address == address {
+                return Some(PhysicalPeerKey {
+                    address,
+                    local_socket_id: destination_socket_id,
+                });
+            }
+            return None;
         }
         let caller_socket_id = induction_socket_id?;
-        self.peers
-            .iter()
-            .find_map(|(key, entry)| {
-                (key.address == address && entry.conn.peer_socket_id() == caller_socket_id)
-                    .then_some(*key)
-            })
-            .or_else(|| {
-                self.group_peers.iter().find_map(|(key, handle)| {
+        if let Some(&slot_idx) = self.half_open_by_caller.get(&(address, caller_socket_id)) {
+            let slot = self.slots.get_by_slot(slot_idx)?;
+            return Some(PhysicalPeerKey {
+                address: slot.address,
+                local_socket_id: slot.socket_id,
+            });
+        }
+        self.slots.iter().find_map(|slot| {
+            if slot.address != address {
+                return None;
+            }
+            match &slot.value {
+                PeerSlotTarget::Direct(entry) => (entry.conn.peer_socket_id() == caller_socket_id)
+                    .then_some(PhysicalPeerKey {
+                        address: slot.address,
+                        local_socket_id: slot.socket_id,
+                    }),
+                PeerSlotTarget::GroupLeg(handle) => {
                     let member = self
                         .groups
                         .get(&handle.key)
                         .and_then(|group| group.group.member(handle.member_id))?;
-                    (key.address == address
-                        && member.connection().peer_socket_id() == caller_socket_id)
-                        .then_some(*key)
-                })
-            })
+                    (member.connection().peer_socket_id() == caller_socket_id).then_some(
+                        PhysicalPeerKey {
+                            address: slot.address,
+                            local_socket_id: slot.socket_id,
+                        },
+                    )
+                }
+                PeerSlotTarget::Detached => None,
+            }
+        })
     }
 
     fn physical_for_address(&self, address: std::net::SocketAddr) -> Option<PhysicalPeerKey> {
-        self.peers
-            .keys()
-            .chain(self.group_peers.keys())
-            .find(|key| key.address == address)
-            .copied()
+        self.slots
+            .iter()
+            .find(|slot| slot.address == address)
+            .map(|slot| PhysicalPeerKey {
+                address: slot.address,
+                local_socket_id: slot.socket_id,
+            })
     }
 
     fn group_admission_allowed(
@@ -1046,8 +1122,7 @@ impl PeerTable {
         };
         let group_admission_allowed = self.group_admission_allowed(identity, packet, options);
         if self
-            .peers
-            .get(&physical)
+            .get_peer(&physical)
             .is_some_and(|entry| !entry.admission_established)
             && self.established_count() >= self.config.max_established_peers
         {
@@ -1055,7 +1130,7 @@ impl PeerTable {
             return Some(Admit::Dropped(AdmissionDropReason::EstablishedCapacity));
         }
         let result = {
-            let Some(entry) = self.peers.get_mut(&physical) else {
+            let Some(entry) = self.get_peer_mut(&physical) else {
                 return Some(Admit::Dropped(AdmissionDropReason::StaleConclusion));
             };
             if entry.rejected {
@@ -1149,24 +1224,45 @@ impl PeerTable {
             new_logical_peer,
         } = context;
         let mut inserted = false;
-        let entry = self.peers.entry(physical).or_insert_with(|| {
-            inserted = true;
+        let entry_slot = if let Some(idx) = self.slot_index_for_key(&physical) {
+            idx
+        } else {
+            let idx = self
+                .slots
+                .slot_index_for_socket_id(physical.local_socket_id);
             let logical_peer = new_logical_peer.unwrap_or_else(|| {
                 unreachable!("or_insert_with runs only for new peers, which set new_logical_peer")
             });
-            Self::new_admission_peer(logical_peer, physical, peer, options, worker_index, now)
-        });
+            let entry =
+                Self::new_admission_peer(logical_peer, physical, peer, options, worker_index, now);
+            self.slots.insert_at_slot(
+                idx,
+                physical.local_socket_id,
+                peer,
+                PeerSlotTarget::Direct(entry),
+            );
+            inserted = true;
+            idx
+        };
+        let slot = self.slots.get_by_slot_mut(entry_slot).expect("slot exists");
+        let entry = slot.value.direct_mut().expect("direct peer in slot");
         let feed_result = entry.conn.feed_recv_buf(data, now);
         let feed_error_kind = feed_result.as_ref().err().map(|error| error.kind);
         let fed = feed_result.is_ok();
         if fed {
             entry.last_datagram_at = now;
+            if inserted {
+                self.half_open_by_caller
+                    .insert((peer, entry.conn.peer_socket_id()), entry_slot);
+            }
         }
         let became_established = fed
             && !entry.admission_established
             && entry.conn.state() == shiguredo_srt::ConnectionState::Connected;
         if became_established {
             entry.admission_established = true;
+            self.half_open_by_caller
+                .remove(&(peer, entry.conn.peer_socket_id()));
         }
         let became_terminal =
             !fed && entry.conn.state() == shiguredo_srt::ConnectionState::Disconnected;
@@ -1222,8 +1318,7 @@ impl PeerTable {
             self.half_open_deadlines.remove(&physical);
             self.adopt_bonded_peer(physical);
         } else if !self
-            .peers
-            .get(&physical)
+            .get_peer(&physical)
             .is_some_and(|entry| entry.admission_established)
         {
             self.half_open_deadlines.set(
@@ -1236,7 +1331,7 @@ impl PeerTable {
     }
 
     fn adopt_bonded_peer(&mut self, peer: PhysicalPeerKey) {
-        let Some(entry) = self.peers.get(&peer) else {
+        let Some(entry) = self.get_peer(&peer) else {
             return;
         };
         let Some(extension) = entry.conn.peer_group_extension() else {
@@ -1304,12 +1399,21 @@ impl PeerTable {
                 timers: entry.timers,
             },
         );
-        self.group_peers
-            .insert(peer, GroupMemberHandle { key, member_id });
+        let slot_idx = self.slot_index_for_key(&peer).expect("peer has slot");
+        if let Some(slot) = self.slots.get_by_slot_mut(slot_idx) {
+            *slot.value = PeerSlotTarget::GroupLeg(GroupMemberHandle { key, member_id });
+        }
     }
-
     fn admit_group_leg(&mut self, peer: PhysicalPeerKey, data: &[u8], now: Timestamp) -> Admit {
-        let Some(handle) = self.group_peers.get(&peer).cloned() else {
+        let Some(slot_idx) = self.slot_index_for_key(&peer) else {
+            return Admit::Dropped(AdmissionDropReason::StaleConclusion);
+        };
+        let Some(handle) = self
+            .slots
+            .get_by_slot(slot_idx)
+            .and_then(|s| s.value.group_leg())
+            .cloned()
+        else {
             return Admit::Dropped(AdmissionDropReason::StaleConclusion);
         };
         let Some(group) = self.groups.get_mut(&handle.key) else {
@@ -1448,6 +1552,69 @@ impl PeerTable {
         )
     }
 
+    fn feed_established_direct(
+        &mut self,
+        physical: PhysicalPeerKey,
+        data: &[u8],
+        now: Timestamp,
+        telemetry: &IngressTelemetry,
+    ) -> Option<Admit> {
+        let slot_idx = self.slot_index_for_key(&physical)?;
+        let slot = self.slots.get_by_slot_mut(slot_idx)?;
+        let entry = slot.value.direct_mut()?;
+        if !entry.admission_established {
+            return None;
+        }
+        if entry.conn.feed_recv_buf(data, now).is_ok() {
+            entry.last_datagram_at = now;
+            self.mark_ready_physical(physical);
+            return Some(Admit::Fed);
+        }
+        if entry.conn.state() == shiguredo_srt::ConnectionState::Disconnected {
+            entry.rejected = true;
+            self.mark_ready_physical(physical);
+        }
+        telemetry.record_invalid_datagram();
+        Some(Admit::Dropped(AdmissionDropReason::InvalidPacket))
+    }
+
+    fn admit_established_datagram(
+        &mut self,
+        peer: std::net::SocketAddr,
+        destination_socket_id: u32,
+        data: &[u8],
+        now: Timestamp,
+        telemetry: &IngressTelemetry,
+    ) -> Admit {
+        if destination_socket_id != 0 {
+            let slot_idx = self.slots.slot_index_for_socket_id(destination_socket_id);
+            if let Some(slot) = self.slots.get_by_slot(slot_idx)
+                && slot.socket_id == destination_socket_id
+                && slot.address == peer
+            {
+                let physical = PhysicalPeerKey {
+                    address: peer,
+                    local_socket_id: destination_socket_id,
+                };
+                match &slot.value {
+                    PeerSlotTarget::GroupLeg(_) => {
+                        return self.admit_group_leg(physical, data, now);
+                    }
+                    PeerSlotTarget::Direct(_) => {
+                        if let Some(admit) =
+                            self.feed_established_direct(physical, data, now, telemetry)
+                        {
+                            return admit;
+                        }
+                    }
+                    PeerSlotTarget::Detached => {}
+                }
+            }
+        }
+        telemetry.record_invalid_datagram();
+        Admit::Dropped(AdmissionDropReason::InvalidPacket)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn admit_with_policy_hook<F>(
         &mut self,
@@ -1480,6 +1647,15 @@ impl PeerTable {
         // fixed-header Destination SRT Socket ID. INDUCTION is the sole
         // exception: it targets socket ID zero and carries the caller's
         // source SRT Socket ID in the handshake body.
+        if handshake.is_none() {
+            return self.admit_established_datagram(
+                peer,
+                destination_socket_id,
+                data,
+                now,
+                telemetry,
+            );
+        }
         let mut physical = self.physical_for_datagram(
             peer,
             destination_socket_id,
@@ -1489,7 +1665,7 @@ impl PeerTable {
                 .map(|packet| packet.socket_id),
         );
         if let Some(physical) = physical
-            && self.group_peers.contains_key(&physical)
+            && self.is_group_leg(&physical)
         {
             return self.admit_group_leg(physical, data, now);
         }
@@ -1498,7 +1674,7 @@ impl PeerTable {
             .map(srt_lifecycle::handshake_identity_from_handshake);
         let conclusion = identity.as_ref().filter(|identity| identity.is_conclusion);
         physical = self.resolve_conclusion_route(peer, physical, conclusion);
-        let known = physical.is_some_and(|physical| self.peers.contains_key(&physical));
+        let known = physical.is_some_and(|physical| self.get_peer(&physical).is_some());
 
         if !known && let Some(identity) = conclusion {
             return Self::stale_conclusion(
@@ -1563,7 +1739,7 @@ impl PeerTable {
         let timeout_micros = half_open_timeout_micros(self.config.half_open_timeout);
         let mut count = 0;
         for peer in due {
-            let stale = self.peers.get(&peer).is_some_and(|entry| {
+            let stale = self.get_peer(&peer).is_some_and(|entry| {
                 !entry.admission_established
                     && now.saturating_sub(entry.last_datagram_at) >= timeout_micros
             });
@@ -1700,7 +1876,7 @@ impl PeerTable {
     ) {
         while let Some(peer) = self.ready.pop_front() {
             self.ready_set.remove(&peer);
-            let Some(entry) = self.peers.get_mut(&peer) else {
+            let Some(entry) = self.get_peer_mut(&peer) else {
                 continue;
             };
             entry.timers.fire_expired(now, &mut entry.conn);
@@ -1756,7 +1932,7 @@ impl PeerTable {
     /// as ready for the next indexed maintenance pass.
     fn mark_ready_physical(&mut self, peer: PhysicalPeerKey) {
         self.reconcile_established(peer);
-        if self.peers.contains_key(&peer) {
+        if self.get_peer(&peer).is_some() {
             if self.ready_set.insert(peer) {
                 self.ready.push_back(peer);
             }
@@ -1797,7 +1973,7 @@ impl PeerTable {
         out.clear();
         while let Some(peer) = self.event_ready.pop_front() {
             self.event_ready_set.remove(&peer);
-            let Some(entry) = self.peers.get_mut(&peer) else {
+            let Some(entry) = self.get_peer_mut(&peer) else {
                 continue;
             };
             while let Some(event) = entry.conn.poll_event() {
@@ -1887,7 +2063,7 @@ impl PeerTable {
                 .cloned()
             {
                 Some(LogicalPeerTarget::Direct(physical)) => {
-                    if let Some(entry) = self.peers.get_mut(&physical)
+                    if let Some(entry) = self.get_peer_mut(&physical)
                         && entry.apply_event(admission_event.event)
                     {
                         entry.stream_deadline = Some(deadline);
@@ -1935,7 +2111,7 @@ impl PeerTable {
     #[must_use]
     pub fn logical_peer(&self, id: &LogicalPeerId) -> Option<LogicalPeer<'_>> {
         match self.logical_peers.get(id)? {
-            LogicalPeerTarget::Direct(peer) if self.peers.contains_key(peer) => Some(LogicalPeer {
+            LogicalPeerTarget::Direct(peer) if self.get_peer(peer).is_some() => Some(LogicalPeer {
                 table: self,
                 id: *id,
             }),
@@ -1987,9 +2163,9 @@ impl PeerTable {
     pub fn iter_direct_for_bench(
         &mut self,
     ) -> impl Iterator<Item = (&std::net::SocketAddr, &mut AdmissionPeer)> {
-        self.peers
-            .iter_mut()
-            .map(|(physical, entry)| (&physical.address, entry))
+        self.slots
+            .iter_direct_mut()
+            .filter_map(|(addr, target)| target.direct_mut().map(|entry| (addr, entry)))
     }
 
     /// Benchmark-only direct peer inspection for the legacy reuseport
@@ -1997,11 +2173,21 @@ impl PeerTable {
     #[cfg(feature = "bench-internals")]
     pub fn direct_for_bench(&self, peer: std::net::SocketAddr) -> Option<&AdmissionPeer> {
         self.physical_for_address(peer)
-            .and_then(|physical| self.peers.get(&physical))
+            .and_then(|physical| self.get_peer(&physical))
     }
 
     fn remove_physical(&mut self, peer: PhysicalPeerKey) -> Option<AdmissionPeer> {
-        if let Some(handle) = self.group_peers.get(&peer).cloned() {
+        let slot_idx = self.slot_index_for_key(&peer)?;
+        let is_group_leg = self
+            .slots
+            .get_by_slot(slot_idx)
+            .is_some_and(|s| matches!(s.value, PeerSlotTarget::GroupLeg(_)));
+        if is_group_leg {
+            let handle = self
+                .slots
+                .get_by_slot(slot_idx)
+                .and_then(|s| s.value.group_leg())
+                .cloned()?;
             let _ = self.remove_group(handle.key)?;
             return None;
         }
@@ -2009,26 +2195,23 @@ impl PeerTable {
     }
 
     fn remove_direct(&mut self, peer: PhysicalPeerKey) -> Option<AdmissionPeer> {
+        let slot_idx = self.slot_index_for_key(&peer)?;
         self.purge_physical_indexes(peer);
-        let removed = self.peers.remove(&peer);
-        if let Some(entry) = &removed {
-            self.logical_peers.remove(&entry.logical_peer);
-            if entry.admission_established {
-                self.established_peers = self.established_peers.saturating_sub(1);
-            } else {
-                self.half_open_peers = self.half_open_peers.saturating_sub(1);
-            }
+        let slot = self.slots.remove_by_slot(slot_idx)?;
+        let entry = match slot.value {
+            PeerSlotTarget::Direct(entry) => entry,
+            PeerSlotTarget::GroupLeg(_) | PeerSlotTarget::Detached => return None,
+        };
+        self.half_open_by_caller
+            .remove(&(slot.address, entry.conn.peer_socket_id()));
+        self.logical_peers.remove(&entry.logical_peer);
+        if entry.admission_established {
+            self.established_peers = self.established_peers.saturating_sub(1);
+        } else {
+            self.half_open_peers = self.half_open_peers.saturating_sub(1);
         }
-        if removed.is_some()
-            && let HashEntry::Occupied(mut entry) = self.source_counts.entry(peer.address.ip())
-        {
-            let count = entry.get_mut();
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                entry.remove();
-            }
-        }
-        removed
+        self.decrement_source_count(peer.address.ip());
+        Some(entry)
     }
 
     fn remove_group(&mut self, key: srt_lifecycle::LogicalGroupKey) -> Option<RemovedLogicalPeer> {
@@ -2040,11 +2223,12 @@ impl PeerTable {
                 .group
                 .remove_member_connection(member_id)
                 .expect("group I/O legs are built with matching members");
-            self.group_peers.remove(&leg.physical);
-            self.purge_physical_indexes(leg.physical);
-            self.peers.remove(&leg.physical);
-            self.established_peers = self.established_peers.saturating_sub(1);
-            self.decrement_source_count(leg.physical.address.ip());
+            if let Some(slot_idx) = self.slot_index_for_key(&leg.physical) {
+                self.purge_physical_indexes(leg.physical);
+                self.slots.remove_by_slot(slot_idx);
+                self.established_peers = self.established_peers.saturating_sub(1);
+                self.decrement_source_count(leg.physical.address.ip());
+            }
             removed.push(RemovedPeerLeg {
                 peer: leg.physical.address,
                 connection,
@@ -2071,7 +2255,7 @@ impl PeerTable {
     #[cfg(test)]
     pub(crate) fn get(&self, peer: &std::net::SocketAddr) -> Option<&AdmissionPeer> {
         self.physical_for_address(*peer)
-            .and_then(|physical| self.peers.get(&physical))
+            .and_then(|physical| self.get_peer(&physical))
     }
 
     #[cfg(test)]
@@ -2092,12 +2276,12 @@ impl PeerTable {
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.peers.len() + self.group_peers.len()
+        self.slots.len()
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.peers.is_empty() && self.group_peers.is_empty()
+        self.slots.is_empty()
     }
 
     #[must_use]
@@ -2145,7 +2329,7 @@ impl PeerTable {
     }
 
     fn reconcile_established(&mut self, peer: PhysicalPeerKey) {
-        let became_established = self.peers.get_mut(&peer).is_some_and(|entry| {
+        let became_established = self.get_peer_mut(&peer).is_some_and(|entry| {
             if !entry.admission_established
                 && entry.conn.state() == shiguredo_srt::ConnectionState::Connected
             {
@@ -2172,14 +2356,10 @@ impl PeerTable {
         connect_deadline: Instant,
         idle_grace: Duration,
     ) -> bool {
-        self.peers
+        self.slots
             .iter()
-            // Bonded physical legs are represented by the one logical group
-            // below. Their `AdmissionPeer` bookkeeping deliberately never
-            // receives direct events, so counting them here would make a
-            // completed group wait for the handshake deadline.
-            .filter(|(peer, _)| !self.group_peers.contains_key(peer))
-            .all(|(_, p)| {
+            .filter_map(|slot| slot.value.direct())
+            .all(|p| {
                 srt_lifecycle::is_terminal(
                     p.connected,
                     p.stream_deadline,
@@ -2207,12 +2387,10 @@ impl PeerTable {
     #[must_use]
     pub fn logical_connected_count(&self) -> usize {
         let direct = self
-            .peers
+            .slots
             .iter()
-            .filter(|(peer, entry)| {
-                !self.group_peers.contains_key(peer)
-                    && entry.conn.state() == shiguredo_srt::ConnectionState::Connected
-            })
+            .filter_map(|slot| slot.value.direct())
+            .filter(|entry| entry.conn.state() == shiguredo_srt::ConnectionState::Connected)
             .count();
         let groups = self
             .groups
@@ -2231,11 +2409,10 @@ impl PeerTable {
     #[must_use]
     pub fn logical_started_count(&self) -> usize {
         let direct = self
-            .peers
+            .slots
             .iter()
-            .filter(|(peer, entry)| {
-                !self.group_peers.contains_key(peer) && entry.stream_deadline.is_some()
-            })
+            .filter_map(|slot| slot.value.direct())
+            .filter(|entry| entry.stream_deadline.is_some())
             .count();
         let groups = self
             .groups
@@ -2251,9 +2428,12 @@ impl IntoIterator for PeerTable {
     type IntoIter = std::vec::IntoIter<Self::Item>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.peers
-            .into_iter()
-            .map(|(physical, peer)| (physical.address, peer))
+        self.slots
+            .into_occupied()
+            .filter_map(|slot| match slot.value {
+                PeerSlotTarget::Direct(peer) => Some((slot.address, peer)),
+                PeerSlotTarget::GroupLeg(_) | PeerSlotTarget::Detached => None,
+            })
             .collect::<Vec<_>>()
             .into_iter()
     }
