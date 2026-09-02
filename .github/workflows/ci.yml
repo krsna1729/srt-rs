@@ -243,3 +243,22 @@ jobs:
           path: sentinel.tsv
           if-no-files-found: error
           retention-days: 14
+
+  codegen-audit:
+    name: x86-64-v3 codegen audit
+    needs: quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - name: Audit x86-64-v3 lowering
+        run: |
+          set -o pipefail
+          cargo xtask audit 2>&1 | tee codegen-audit.txt
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: x86-64-v3-codegen-audit
+          path: codegen-audit.txt
+          retention-days: 14

@@ -2,6 +2,7 @@ use std::env;
 use std::process::{Command, ExitCode, Stdio};
 use std::time::Instant;
 
+mod audit;
 mod reportcard;
 
 struct Step {
@@ -248,6 +249,8 @@ fn main() -> ExitCode {
         "precommit" => run_group(PRECOMMIT),
         "ci" | "check-all" => run_group(CI),
         "install-hooks" => install_hooks(),
+        "pgo" => run_pgo(&env::args().skip(2).collect::<Vec<_>>()),
+        "audit" => audit::run(&env::args().skip(2).collect::<Vec<_>>()),
         _ => {
             eprintln!("usage: cargo xtask <command>");
             eprintln!();
@@ -267,6 +270,10 @@ fn main() -> ExitCode {
             eprintln!("  ci             full gate: all checks + report card");
             eprintln!("  check-all      alias for ci");
             eprintln!("  install-hooks  set core.hooksPath to .githooks");
+            eprintln!(
+                "  pgo            generate, build, or run benchmarks under x86-64-v3 PGO (--reuse-profile skips regen)"
+            );
+            eprintln!("  audit          run x86-64-v3 / PGO ISA and codegen audit");
             ExitCode::FAILURE
         }
     }
@@ -402,5 +409,181 @@ fn install_hooks() -> ExitCode {
     } else {
         eprintln!("  failed to set core.hooksPath");
         ExitCode::FAILURE
+    }
+}
+
+fn resolve_llvm_profdata() -> String {
+    let sysroot = Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    let profdata_tool = std::path::PathBuf::from(&sysroot)
+        .join("lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-profdata");
+    if profdata_tool.exists() {
+        profdata_tool.to_string_lossy().to_string()
+    } else {
+        "llvm-profdata".to_string()
+    }
+}
+
+fn generate_and_merge_pgo(pgo_dir: &str, merged_profdata: &str) -> bool {
+    let _ = std::fs::remove_dir_all(pgo_dir);
+    if let Err(e) = std::fs::create_dir_all(pgo_dir) {
+        eprintln!("failed creating {pgo_dir}: {e}");
+        return false;
+    }
+
+    eprintln!("=== 1. Profile Generation Run (Healthy + Loss/Reorder Matrix) ===");
+    let gen_status = Command::new("cargo")
+        .args([
+            "test",
+            "--release",
+            "-p",
+            "shiguredo_srt",
+            "-p",
+            "srt-transport",
+            "--",
+            "--nocapture",
+        ])
+        .env(
+            "RUSTFLAGS",
+            format!("-C target-cpu=x86-64-v3 -C profile-generate={pgo_dir}"),
+        )
+        .status();
+    if !gen_status.is_ok_and(|s| s.success()) {
+        return false;
+    }
+
+    eprintln!("=== 2. Merging Raw PGO Profile Data ===");
+    let profdata_cmd = resolve_llvm_profdata();
+    let merge_status = Command::new(&profdata_cmd)
+        .args(["merge", "-o", merged_profdata, pgo_dir])
+        .status();
+    merge_status.is_ok_and(|s| s.success())
+}
+
+fn parse_pgo_bench_args(args: &[String]) -> Vec<String> {
+    let mut bench_args = Vec::new();
+    let mut seen_bench_flag = false;
+    for a in args {
+        if a == "--reuse-profile" {
+            continue;
+        }
+        if !seen_bench_flag && (a == "--bench" || a == "bench") {
+            seen_bench_flag = true;
+            continue;
+        }
+        bench_args.push(a.clone());
+    }
+    bench_args
+}
+
+fn run_pgo_bench(pgo_target: &str, merged_profdata: &str, args: &[String]) -> ExitCode {
+    eprintln!("=== Running Benchmark under x86-64-v3 + PGO (target_dir: {pgo_target}) ===");
+    let bench_args = parse_pgo_bench_args(args);
+    let mut cmd = Command::new("cargo");
+    cmd.arg("bench");
+    if bench_args.is_empty() {
+        cmd.args([
+            "-p",
+            "shiguredo_srt",
+            "--bench",
+            "receiver_window_validation",
+        ]);
+    } else {
+        cmd.args(&bench_args);
+    }
+    cmd.env("CARGO_TARGET_DIR", pgo_target);
+    cmd.env(
+        "RUSTFLAGS",
+        format!("-C target-cpu=x86-64-v3 -C profile-use={merged_profdata}"),
+    );
+    let status = cmd.status();
+    if status.is_ok_and(|s| s.success()) {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+fn run_pgo_build(pgo_target: &str, merged_profdata: &str) -> ExitCode {
+    eprintln!("=== 3. Compiling Release with Profile-Use (target_dir: {pgo_target}) ===");
+    let status = Command::new("cargo")
+        .args(["build", "--release"])
+        .env("CARGO_TARGET_DIR", pgo_target)
+        .env(
+            "RUSTFLAGS",
+            format!("-C target-cpu=x86-64-v3 -C profile-use={merged_profdata}"),
+        )
+        .status();
+    if status.is_ok_and(|s| s.success()) {
+        eprintln!(
+            "PGO build successfully compiled with x86-64-v3 profile guidance at {pgo_target}/release!"
+        );
+        eprintln!("To run benchmarks under PGO:");
+        eprintln!("  cargo xtask pgo --bench [BENCH_ARGS]");
+        eprintln!("  or directly:");
+        eprintln!(
+            "  RUSTFLAGS=\"-C target-cpu=x86-64-v3 -C profile-use={merged_profdata}\" CARGO_TARGET_DIR={pgo_target} cargo bench ..."
+        );
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+fn run_pgo(args: &[String]) -> ExitCode {
+    let pgo_dir = "/tmp/srt-pgo-data";
+    let merged_profdata = format!("{pgo_dir}/merged.profdata");
+    let pgo_target = "target/build-pgo";
+
+    let reuse_profile = args.iter().any(|a| a == "--reuse-profile");
+    let has_merged = std::path::Path::new(&merged_profdata).exists();
+    let is_bench = args.iter().any(|a| a == "--bench" || a == "bench");
+
+    // Regenerate by default to guarantee fresh training profiles unless --reuse-profile is passed
+    if (!reuse_profile || !has_merged) && !generate_and_merge_pgo(pgo_dir, &merged_profdata) {
+        return ExitCode::FAILURE;
+    }
+
+    if is_bench {
+        run_pgo_bench(pgo_target, &merged_profdata, args)
+    } else {
+        run_pgo_build(pgo_target, &merged_profdata)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_pgo_bench_args_with_reuse_profile() {
+        let args = vec![
+            "--reuse-profile".to_string(),
+            "--bench".to_string(),
+            "-p".to_string(),
+            "shiguredo_srt".to_string(),
+            "--bench".to_string(),
+            "receiver_window_validation".to_string(),
+        ];
+        let parsed = parse_pgo_bench_args(&args);
+        assert_eq!(
+            parsed,
+            vec![
+                "-p".to_string(),
+                "shiguredo_srt".to_string(),
+                "--bench".to_string(),
+                "receiver_window_validation".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_pgo_bench_args_empty_defaults() {
+        let args = vec!["--bench".to_string()];
+        let parsed = parse_pgo_bench_args(&args);
+        assert!(parsed.is_empty());
     }
 }
