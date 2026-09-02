@@ -69,6 +69,11 @@ pub use admission::PhysicalPeerKey;
 pub use dense_slot_arena::{DenseSlotArena, PeerSlot, PeerSlotId, RouteSlot, SlotMut, SlotRef};
 #[cfg(not(any(test, feature = "bench-internals")))]
 pub(crate) use dense_slot_arena::{DenseSlotArena, PeerSlotId};
+mod dense_due_index;
+#[cfg(not(any(test, feature = "bench-internals")))]
+pub(crate) use dense_due_index::DenseDueIndex;
+#[cfg(any(test, feature = "bench-internals"))]
+pub use dense_due_index::{DenseDueEntry, DenseDueIndex};
 mod due_index;
 mod group_conn;
 mod handoff;

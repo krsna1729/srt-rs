@@ -1,7 +1,7 @@
 use crate::{
-    DenseSlotArena, DueIndex, GroupConnectionStats, GroupLogicalCounters, InboundGroupStats,
-    IngressTelemetry, ListenerPeerPolicy, ManualTimerStore, PeerSlotId, WorkerMessage,
-    group_connection_stats,
+    DenseDueIndex, DenseSlotArena, DueIndex, GroupConnectionStats, GroupLogicalCounters,
+    InboundGroupStats, IngressTelemetry, ListenerPeerPolicy, ManualTimerStore, PeerSlotId,
+    WorkerMessage, group_connection_stats,
 };
 use shiguredo_srt::{
     Bytes, ConnectionEvent, ConnectionOptions, ConnectionOutput, SrtConnection, Timestamp,
@@ -758,7 +758,7 @@ pub struct PeerTable {
     half_open_peers: usize,
     established_peers: usize,
     half_open_deadlines: DueIndex<PhysicalPeerKey>,
-    deadlines: DueIndex<PhysicalPeerKey>,
+    deadlines: DenseDueIndex,
     ready: VecDeque<PeerSlotId>,
     event_ready: VecDeque<PeerSlotId>,
     groups: HashMap<srt_lifecycle::LogicalGroupKey, InboundGroup>,
@@ -793,7 +793,7 @@ impl PeerTable {
             half_open_peers: 0,
             established_peers: 0,
             half_open_deadlines: DueIndex::default(),
-            deadlines: DueIndex::default(),
+            deadlines: DenseDueIndex::default(),
             ready: VecDeque::new(),
             event_ready: VecDeque::new(),
             groups: HashMap::new(),
@@ -841,7 +841,7 @@ impl PeerTable {
 
     fn detach_peer_for_group(&mut self, peer: &PhysicalPeerKey) -> Option<AdmissionPeer> {
         let slot_idx = self.slot_index_for_key(peer)?;
-        self.deadlines.remove(peer);
+        self.deadlines.remove(slot_idx, &mut self.slots);
         self.half_open_deadlines.remove(peer);
         self.slots.clear_ready(slot_idx);
         self.slots.clear_event_ready(slot_idx);
@@ -1858,9 +1858,15 @@ impl PeerTable {
 
     fn mark_due_peers(&mut self, now: Timestamp) {
         let mut due = Vec::new();
-        self.deadlines.pop_due(now, &mut due);
-        for peer in due {
-            self.mark_ready_physical(peer);
+        self.deadlines.pop_due(now, &mut self.slots, &mut due);
+        for slot_id in due {
+            let slot_idx = slot_id.slot_idx as usize;
+            if let Some(id) = self.slots.mark_ready(slot_idx) {
+                self.ready.push_back(id);
+            }
+            if let Some(id) = self.slots.mark_event_ready(slot_idx) {
+                self.event_ready.push_back(id);
+            }
         }
     }
 
@@ -1898,9 +1904,9 @@ impl PeerTable {
                 continue;
             }
             if let Some(deadline) = entry.timers.next_deadline() {
-                self.deadlines.set(peer_key, deadline);
+                self.deadlines.set(slot_idx, deadline, &mut self.slots);
             } else {
-                self.deadlines.remove(&peer_key);
+                self.deadlines.remove(slot_idx, &mut self.slots);
             }
         }
     }
@@ -1963,7 +1969,7 @@ impl PeerTable {
         self.last_now = now;
         let peer_deadline = self
             .deadlines
-            .peek_min_deadline()
+            .peek_min_deadline(&self.slots)
             .map(|deadline| deadline.saturating_sub(now))
             .unwrap_or(default_us);
         self.groups
@@ -2284,9 +2290,9 @@ impl PeerTable {
     }
 
     fn purge_physical_indexes(&mut self, peer: PhysicalPeerKey) {
-        self.deadlines.remove(&peer);
         self.half_open_deadlines.remove(&peer);
         if let Some(slot_idx) = self.slot_index_for_key(&peer) {
+            self.deadlines.remove(slot_idx, &mut self.slots);
             self.slots.clear_ready(slot_idx);
             self.slots.clear_event_ready(slot_idx);
         }
