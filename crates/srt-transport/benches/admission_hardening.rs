@@ -462,6 +462,114 @@ fn bench_established_data_progression(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_ready_queue_scaling(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ready_queue_scaling");
+    let options = AdmissionOptions::basic(100, 120, true);
+    let telemetry = IngressTelemetry::new();
+
+    for size in [1, 30, 200, 1000, 4096] {
+        let mut table = PeerTable::with_config(PeerTableConfig {
+            max_peers: size,
+            max_half_open_peers: size,
+            ..PeerTableConfig::default()
+        });
+        let mut physical_peers = Vec::with_capacity(size);
+
+        for i in 0..size {
+            let peer = SocketAddr::from((
+                [10, (i / 65536) as u8, (i / 256) as u8, (i % 256) as u8],
+                5000,
+            ));
+            let mut caller = SrtConnection::new_caller(ConnectionOptions {
+                socket_id: (i as u32) + 10,
+                stream_id: Some("#!::u=bench,r=live".to_owned()),
+                ..ConnectionOptions::default()
+            });
+            caller.connect(Timestamp::default()).expect("start caller");
+            let induction = next_packet(&mut caller);
+            let _ = table.admit(
+                peer,
+                &induction,
+                Timestamp::default(),
+                &options,
+                0,
+                1,
+                &telemetry,
+            );
+            let mut outbound = Vec::new();
+            table.poll_outbound(Timestamp::default(), &mut outbound);
+            for (_, packet) in outbound {
+                let _ = caller.feed_recv_buf(&packet, Timestamp::from_micros(1));
+            }
+            let conclusion = next_packet(&mut caller);
+            let _ = table.admit(
+                peer,
+                &conclusion,
+                Timestamp::from_micros(2),
+                &options,
+                0,
+                1,
+                &telemetry,
+            );
+            let mut outbound2 = Vec::new();
+            table.poll_outbound(Timestamp::from_micros(2), &mut outbound2);
+            for (_, packet) in outbound2 {
+                let _ = caller.feed_recv_buf(&packet, Timestamp::from_micros(2));
+            }
+            let physical = table.physical_for_address(peer).expect("peer established");
+            physical_peers.push(physical);
+        }
+
+        let mut events = Vec::new();
+        table.poll_events(&mut events);
+        let mut out = Vec::new();
+        table.poll_outbound(Timestamp::from_micros(10), &mut out);
+
+        group.throughput(Throughput::Elements(size as u64));
+
+        let mut drain_out = Vec::new();
+        let mut drain_events = Vec::new();
+        // 1. Unique readiness enqueue (transition from empty to queued)
+        group.bench_function(format!("unique_readiness_enqueue/{size}"), |b| {
+            b.iter_custom(|iters| {
+                let mut elapsed = std::time::Duration::ZERO;
+                for _ in 0..iters {
+                    table.poll_outbound(Timestamp::default(), &mut drain_out);
+                    table.poll_events(&mut drain_events);
+                    let start = std::time::Instant::now();
+                    for &peer in &physical_peers {
+                        table.mark_ready_physical(black_box(peer));
+                    }
+                    elapsed += start.elapsed();
+                }
+                elapsed
+            });
+        });
+        for &peer in &physical_peers {
+            table.mark_ready_physical(peer);
+        }
+        group.bench_function(format!("duplicate_readiness_coalescing/{size}"), |b| {
+            b.iter(|| {
+                for &peer in &physical_peers {
+                    table.mark_ready_physical(black_box(peer));
+                }
+            });
+        });
+
+        // 3. Drain + Rearm round-trip
+        group.bench_function(format!("drain_and_rearm/{size}"), |b| {
+            b.iter(|| {
+                table.poll_outbound(Timestamp::default(), &mut drain_out);
+                table.poll_events(&mut drain_events);
+                for &peer in &physical_peers {
+                    table.mark_ready_physical(black_box(peer));
+                }
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_invalid_admission,
@@ -471,6 +579,7 @@ criterion_group!(
     bench_cached_policy_resolution,
     bench_bonded_second_leg_admission,
     bench_route_only_dispatch,
-    bench_established_data_progression
+    bench_established_data_progression,
+    bench_ready_queue_scaling
 );
 criterion_main!(benches);

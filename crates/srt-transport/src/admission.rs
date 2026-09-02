@@ -1,12 +1,13 @@
 use crate::{
     DenseSlotArena, DueIndex, GroupConnectionStats, GroupLogicalCounters, InboundGroupStats,
-    IngressTelemetry, ListenerPeerPolicy, ManualTimerStore, WorkerMessage, group_connection_stats,
+    IngressTelemetry, ListenerPeerPolicy, ManualTimerStore, PeerSlotId, WorkerMessage,
+    group_connection_stats,
 };
 use shiguredo_srt::{
     Bytes, ConnectionEvent, ConnectionOptions, ConnectionOutput, SrtConnection, Timestamp,
 };
 use std::collections::hash_map::Entry as HashEntry;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 use zeroize::Zeroize;
 
@@ -409,9 +410,9 @@ enum LogicalPeerTarget {
 /// with the source UDP address, selects the leg. This is deliberately private:
 /// applications retain [`LogicalPeerId`] rather than an L4/protocol key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct PhysicalPeerKey {
-    address: std::net::SocketAddr,
-    local_socket_id: u32,
+pub struct PhysicalPeerKey {
+    pub address: std::net::SocketAddr,
+    pub local_socket_id: u32,
 }
 
 /// Snapshot of a direct or bonded logical peer.
@@ -758,10 +759,8 @@ pub struct PeerTable {
     established_peers: usize,
     half_open_deadlines: DueIndex<PhysicalPeerKey>,
     deadlines: DueIndex<PhysicalPeerKey>,
-    ready: VecDeque<PhysicalPeerKey>,
-    ready_set: HashSet<PhysicalPeerKey>,
-    event_ready: VecDeque<PhysicalPeerKey>,
-    event_ready_set: HashSet<PhysicalPeerKey>,
+    ready: VecDeque<PeerSlotId>,
+    event_ready: VecDeque<PeerSlotId>,
     groups: HashMap<srt_lifecycle::LogicalGroupKey, InboundGroup>,
     last_now: Timestamp,
     config: PeerTableConfig,
@@ -796,9 +795,7 @@ impl PeerTable {
             half_open_deadlines: DueIndex::default(),
             deadlines: DueIndex::default(),
             ready: VecDeque::new(),
-            ready_set: HashSet::new(),
             event_ready: VecDeque::new(),
-            event_ready_set: HashSet::new(),
             groups: HashMap::new(),
             last_now: Timestamp::default(),
             config,
@@ -846,8 +843,8 @@ impl PeerTable {
         let slot_idx = self.slot_index_for_key(peer)?;
         self.deadlines.remove(peer);
         self.half_open_deadlines.remove(peer);
-        self.ready_set.remove(peer);
-        self.event_ready_set.remove(peer);
+        self.slots.clear_ready(slot_idx);
+        self.slots.clear_event_ready(slot_idx);
         let slot = self.slots.get_by_slot_mut(slot_idx)?;
         let prev = std::mem::replace(slot.value, PeerSlotTarget::Detached);
         prev.extract_direct()
@@ -1007,8 +1004,7 @@ impl PeerTable {
             }
         })
     }
-
-    fn physical_for_address(&self, address: std::net::SocketAddr) -> Option<PhysicalPeerKey> {
+    pub fn physical_for_address(&self, address: std::net::SocketAddr) -> Option<PhysicalPeerKey> {
         self.slots
             .iter()
             .find(|slot| slot.address == address)
@@ -1874,26 +1870,37 @@ impl PeerTable {
         out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
         rejected: &mut Vec<PhysicalPeerKey>,
     ) {
-        while let Some(peer) = self.ready.pop_front() {
-            self.ready_set.remove(&peer);
-            let Some(entry) = self.get_peer_mut(&peer) else {
+        while let Some(slot_id) = self.ready.pop_front() {
+            let slot_idx = slot_id.slot_idx as usize;
+            if !self.slots.clear_ready_if_generation_matches(slot_id) {
+                continue;
+            }
+            let Some(slot) = self.slots.get_by_slot_mut(slot_idx) else {
+                continue;
+            };
+            let peer_addr = slot.address;
+            let peer_key = PhysicalPeerKey {
+                address: peer_addr,
+                local_socket_id: slot.socket_id,
+            };
+            let Some(entry) = slot.value.direct_mut() else {
                 continue;
             };
             entry.timers.fire_expired(now, &mut entry.conn);
             while let Some(output) = entry.conn.poll_output() {
                 match output {
-                    ConnectionOutput::SendPacket(bytes) => out.push((peer.address, bytes)),
+                    ConnectionOutput::SendPacket(bytes) => out.push((peer_addr, bytes)),
                     other => entry.timers.apply_output(&other, now),
                 }
             }
             if entry.rejected {
-                rejected.push(peer);
+                rejected.push(peer_key);
                 continue;
             }
             if let Some(deadline) = entry.timers.next_deadline() {
-                self.deadlines.set(peer, deadline);
+                self.deadlines.set(peer_key, deadline);
             } else {
-                self.deadlines.remove(&peer);
+                self.deadlines.remove(&peer_key);
             }
         }
     }
@@ -1928,16 +1935,16 @@ impl PeerTable {
         }
     }
 
-    /// Mark a peer whose protocol state was changed through [`Self::iter_mut`]
-    /// as ready for the next indexed maintenance pass.
-    fn mark_ready_physical(&mut self, peer: PhysicalPeerKey) {
+    /// Mark a peer whose protocol state was changed as ready for the
+    /// next indexed maintenance pass.
+    pub fn mark_ready_physical(&mut self, peer: PhysicalPeerKey) {
         self.reconcile_established(peer);
-        if self.get_peer(&peer).is_some() {
-            if self.ready_set.insert(peer) {
-                self.ready.push_back(peer);
+        if let Some(slot_idx) = self.slot_index_for_key(&peer) {
+            if let Some(slot_id) = self.slots.mark_ready(slot_idx) {
+                self.ready.push_back(slot_id);
             }
-            if self.event_ready_set.insert(peer) {
-                self.event_ready.push_back(peer);
+            if let Some(slot_id) = self.slots.mark_event_ready(slot_idx) {
+                self.event_ready.push_back(slot_id);
             }
         }
     }
@@ -1969,21 +1976,32 @@ impl PeerTable {
     }
 
     /// Drain logical ingress events for production consumers.
-    pub fn poll_events(&mut self, out: &mut Vec<AdmissionEvent>) {
-        out.clear();
-        while let Some(peer) = self.event_ready.pop_front() {
-            self.event_ready_set.remove(&peer);
-            let Some(entry) = self.get_peer_mut(&peer) else {
+    fn drain_direct_events(&mut self, out: &mut Vec<AdmissionEvent>) {
+        while let Some(slot_id) = self.event_ready.pop_front() {
+            let slot_idx = slot_id.slot_idx as usize;
+            if !self.slots.clear_event_ready_if_generation_matches(slot_id) {
+                continue;
+            }
+            let Some(slot) = self.slots.get_by_slot_mut(slot_idx) else {
+                continue;
+            };
+            let peer_addr = slot.address;
+            let Some(entry) = slot.value.direct_mut() else {
                 continue;
             };
             while let Some(event) = entry.conn.poll_event() {
                 out.push(AdmissionEvent {
-                    representative_peer: peer.address,
+                    representative_peer: peer_addr,
                     logical_peer: entry.logical_peer,
                     event,
                 });
             }
         }
+    }
+
+    pub fn poll_events(&mut self, out: &mut Vec<AdmissionEvent>) {
+        out.clear();
+        self.drain_direct_events(out);
         for group in self.groups.values_mut() {
             while let Some(event) = group.group.poll_event(self.last_now) {
                 match event {
@@ -2268,10 +2286,10 @@ impl PeerTable {
     fn purge_physical_indexes(&mut self, peer: PhysicalPeerKey) {
         self.deadlines.remove(&peer);
         self.half_open_deadlines.remove(&peer);
-        self.ready_set.remove(&peer);
-        self.ready.retain(|queued| *queued != peer);
-        self.event_ready_set.remove(&peer);
-        self.event_ready.retain(|queued| *queued != peer);
+        if let Some(slot_idx) = self.slot_index_for_key(&peer) {
+            self.slots.clear_ready(slot_idx);
+            self.slots.clear_event_ready(slot_idx);
+        }
     }
 
     #[must_use]
@@ -2635,5 +2653,194 @@ mod tests {
             ),
             "after expiry, peer_c should be admitted"
         );
+    }
+
+    fn insert_test_peer(
+        table: &mut PeerTable,
+        addr: std::net::SocketAddr,
+        preferred_socket_id: u32,
+    ) -> (PhysicalPeerKey, usize) {
+        let (slot_idx, actual_id) = table
+            .slots
+            .allocate_socket_id(preferred_socket_id)
+            .expect("slot allocated");
+        let physical = PhysicalPeerKey {
+            address: addr,
+            local_socket_id: actual_id,
+        };
+        let logical_peer = table.allocate_logical_peer(LogicalPeerTarget::Direct(physical));
+        let entry = PeerTable::new_admission_peer(
+            logical_peer,
+            physical,
+            addr,
+            &default_options(),
+            0,
+            Timestamp::default(),
+        );
+        table
+            .slots
+            .insert_at_slot(slot_idx, actual_id, addr, PeerSlotTarget::Direct(entry));
+        table.established_peers += 1;
+        (physical, slot_idx)
+    }
+
+    #[test]
+    fn readiness_coalesces_duplicates_and_preserves_fifo() {
+        let mut table = PeerTable::new();
+        let addr_a = "127.0.0.1:7001".parse().unwrap();
+        let addr_b = "127.0.0.1:7002".parse().unwrap();
+        let (peer_a, slot_a) = insert_test_peer(&mut table, addr_a, 100);
+        let (peer_b, slot_b) = insert_test_peer(&mut table, addr_b, 200);
+
+        // 1. Initial mark ready
+        table.mark_ready_physical(peer_a);
+        assert_eq!(table.ready.len(), 1);
+        assert_eq!(table.event_ready.len(), 1);
+        assert_eq!(table.ready[0].slot_idx, slot_a as u32);
+
+        // 2. Repeated duplicate mark_ready calls while queued coalesce to 1 entry
+        table.mark_ready_physical(peer_a);
+        table.mark_ready_physical(peer_a);
+        assert_eq!(table.ready.len(), 1);
+        assert_eq!(table.event_ready.len(), 1);
+
+        // 3. FIFO order across multiple peers
+        table.mark_ready_physical(peer_b);
+        assert_eq!(table.ready.len(), 2);
+        assert_eq!(table.event_ready.len(), 2);
+        assert_eq!(table.ready[0].slot_idx, slot_a as u32);
+        assert_eq!(table.ready[1].slot_idx, slot_b as u32);
+    }
+
+    #[test]
+    fn readiness_dequeue_clears_flags_and_allows_rearm() {
+        let mut table = PeerTable::new();
+        let addr_a = "127.0.0.1:7001".parse().unwrap();
+        let addr_b = "127.0.0.1:7002".parse().unwrap();
+        let (peer_a, slot_a) = insert_test_peer(&mut table, addr_a, 100);
+        let (peer_b, slot_b) = insert_test_peer(&mut table, addr_b, 200);
+
+        table.mark_ready_physical(peer_a);
+        table.mark_ready_physical(peer_b);
+
+        // 1. Poll events drains event_ready in FIFO order and clears flags
+        let mut events = Vec::new();
+        table.poll_events(&mut events);
+        assert!(table.event_ready.is_empty());
+
+        // Rearm event_ready for peer_a
+        table.mark_ready_physical(peer_a);
+        assert_eq!(table.event_ready.len(), 1);
+        assert_eq!(table.event_ready[0].slot_idx, slot_a as u32);
+
+        // 2. Poll direct outbound drains ready queue and clears flags
+        let mut out = Vec::new();
+        let mut rejected = Vec::new();
+        table.poll_direct_outbound(Timestamp::default(), &mut out, &mut rejected);
+        assert!(table.ready.is_empty());
+
+        // Rearm outbound for peer_b and peer_a
+        table.mark_ready_physical(peer_b);
+        table.mark_ready_physical(peer_a);
+        assert_eq!(table.ready.len(), 2);
+        assert_eq!(table.ready[0].slot_idx, slot_b as u32);
+        assert_eq!(table.ready[1].slot_idx, slot_a as u32);
+    }
+
+    #[test]
+    fn queued_peer_removal_and_slot_reuse_does_not_consume_stale_readiness() {
+        let mut table = PeerTable::with_config(PeerTableConfig {
+            max_peers: 2,
+            ..Default::default()
+        });
+        let addr_a = "10.0.0.1:8001".parse().unwrap();
+        let (peer_a, slot_a) = insert_test_peer(&mut table, addr_a, 10);
+
+        // Enqueue peer_a in ready
+        table.mark_ready_physical(peer_a);
+        assert_eq!(table.ready.len(), 1);
+        let stale_slot_id = table.ready[0];
+        assert_eq!(stale_slot_id.slot_idx, slot_a as u32);
+
+        // Remove peer_a while queued in ready -> advances generation of slot_a
+        table.remove_physical(peer_a);
+
+        // Reallocate slot_a for peer_b
+        let addr_b = "10.0.0.2:8002".parse().unwrap();
+        let (peer_b, slot_b) = loop {
+            let (p, s) = insert_test_peer(&mut table, addr_b, 0);
+            if s == slot_a {
+                break (p, s);
+            }
+            table.remove_physical(p);
+        };
+        assert_eq!(slot_b, slot_a);
+
+        // Generation of slot_a must be newer than stale_slot_id
+        assert_ne!(
+            table.slots.slot_generation(slot_a),
+            stale_slot_id.generation
+        );
+        // Mark peer_b ready BEFORE stale peer_a entry drains
+        table.mark_ready_physical(peer_b);
+        assert_eq!(table.ready.len(), 2);
+        assert_eq!(table.ready[0], stale_slot_id);
+        assert_eq!(table.ready[1].slot_idx, slot_b as u32);
+
+        // Poll outbound -> stale entry for peer_a is popped and skipped without clearing peer_b's flag
+        let mut out = Vec::new();
+        let mut rejected = Vec::new();
+        table.poll_direct_outbound(Timestamp::default(), &mut out, &mut rejected);
+        assert!(table.ready.is_empty());
+        assert!(rejected.is_empty());
+
+        // Dequeue cleared peer_b's flag, allowing peer_b to rearm
+        table.mark_ready_physical(peer_b);
+        assert_eq!(table.ready.len(), 1);
+        assert_eq!(table.ready[0].slot_idx, slot_b as u32);
+        assert_eq!(
+            table.ready[0].generation,
+            table.slots.slot_generation(slot_b)
+        );
+    }
+
+    #[test]
+    fn group_leg_readiness_marks_and_clears_dense_flags() {
+        let mut table = PeerTable::new();
+        let addr = "127.0.0.1:9001".parse().unwrap();
+        let (peer, slot_idx) = insert_test_peer(&mut table, addr, 500);
+
+        // Transform slot into GroupLeg
+        let group_key = srt_lifecycle::LogicalGroupKey {
+            group_id: 1,
+            stream_id: None,
+        };
+        if let Some(slot) = table.slots.get_by_slot_mut(slot_idx) {
+            *slot.value = PeerSlotTarget::GroupLeg(GroupMemberHandle {
+                key: group_key,
+                member_id: 1,
+            });
+        }
+
+        // 1. Mark ready enqueues slot
+        table.mark_ready_physical(peer);
+        assert_eq!(table.ready.len(), 1);
+        assert_eq!(table.ready[0].slot_idx, slot_idx as u32);
+
+        // 2. Duplicate mark coalesces
+        table.mark_ready_physical(peer);
+        assert_eq!(table.ready.len(), 1);
+
+        // 3. Dequeue in poll_direct_outbound safely clears flag and skips direct processing
+        let mut out = Vec::new();
+        let mut rejected = Vec::new();
+        table.poll_direct_outbound(Timestamp::default(), &mut out, &mut rejected);
+        assert!(table.ready.is_empty());
+        assert!(out.is_empty());
+        assert!(rejected.is_empty());
+
+        // 4. Group leg can be re-armed
+        table.mark_ready_physical(peer);
+        assert_eq!(table.ready.len(), 1);
     }
 }
