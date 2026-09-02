@@ -1,67 +1,117 @@
-//! Inbound NAK queueing benchmarks.
+//! Inbound NAK queueing and retransmission benchmarks.
 //!
-//! Setup is excluded so the measurements isolate retained-packet
-//! intersection and retransmit duplicate suppression.
+//! Excludes setup and teardown from the timed region using `iter_batched_ref`
+//! to prevent destructor overhead of populated sender buffers from contaminating
+//! retransmission membership and queueing measurements.
+
+use std::hint::black_box;
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use shiguredo_srt::{LossRange, SenderBuffer, Timestamp};
-use std::hint::black_box;
 
 const PACKETS: u32 = 8_192;
 
-fn populated_sender() -> SenderBuffer {
-    let mut sender = SenderBuffer::new(0, PACKETS, 120);
-    for _ in 0..PACKETS {
-        assert!(sender.push(vec![1], 1, 1, Timestamp::default()).is_some());
+fn populated_sender(count: u32) -> SenderBuffer {
+    let mut sender = SenderBuffer::new(0, count, 120);
+    sender.set_congestion_window(count);
+    for _ in 0..count {
+        assert!(
+            sender
+                .push(vec![1; 1316], 0, 1, Timestamp::default())
+                .is_some()
+        );
     }
     sender
 }
 
-fn benches(c: &mut Criterion) {
-    let losses = (0..PACKETS).collect::<Vec<_>>();
-    let dense = [LossRange {
-        first_seq: 0,
-        last_seq: PACKETS - 1,
-    }];
+fn bench_sender_nak_scale(c: &mut Criterion) {
     let mut group = c.benchmark_group("sender_nak");
     group.throughput(Throughput::Elements(PACKETS as u64));
 
+    let expanded_losses = (0..PACKETS).collect::<Vec<_>>();
+    let dense_range = [LossRange {
+        first_seq: 0,
+        last_seq: PACKETS - 1,
+    }];
+
+    // 1. Expanded Unique Loss List
     group.bench_function("expanded_unique_8192", |b| {
-        b.iter_batched(
-            populated_sender,
-            |mut sender| {
-                sender.handle_nak(black_box(&losses));
-                black_box(sender.stats().packets_in_loss_list)
+        b.iter_batched_ref(
+            || populated_sender(PACKETS),
+            |sender| {
+                sender.handle_nak(black_box(&expanded_losses));
+                black_box(sender.has_retransmit());
             },
-            BatchSize::LargeInput,
+            BatchSize::SmallInput,
         );
     });
+
+    // 2. Compact Dense Unique Range
     group.bench_function("compact_dense_unique_8192", |b| {
-        b.iter_batched(
-            populated_sender,
-            |mut sender| {
-                sender.handle_nak_ranges(black_box(&dense));
-                black_box(sender.stats().packets_in_loss_list)
+        b.iter_batched_ref(
+            || populated_sender(PACKETS),
+            |sender| {
+                sender.handle_nak_ranges(black_box(&dense_range));
+                black_box(sender.has_retransmit());
             },
-            BatchSize::LargeInput,
+            BatchSize::SmallInput,
         );
     });
+
+    // 3. Expanded Duplicate Loss List
     group.bench_function("expanded_duplicate_8192", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             || {
-                let mut sender = populated_sender();
-                sender.handle_nak(&losses);
+                let mut sender = populated_sender(PACKETS);
+                sender.handle_nak(&expanded_losses);
                 sender
             },
-            |mut sender| {
-                sender.handle_nak(black_box(&losses));
-                black_box(sender.stats().packets_in_loss_list)
+            |sender| {
+                sender.handle_nak(black_box(&expanded_losses));
+                black_box(sender.has_retransmit());
             },
-            BatchSize::LargeInput,
+            BatchSize::SmallInput,
         );
     });
+
+    // 4. Compact Duplicate Range
+    group.bench_function("compact_duplicate_8192", |b| {
+        b.iter_batched_ref(
+            || {
+                let mut sender = populated_sender(PACKETS);
+                sender.handle_nak_ranges(&dense_range);
+                sender
+            },
+            |sender| {
+                sender.handle_nak_ranges(black_box(&dense_range));
+                black_box(sender.has_retransmit());
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    // 5. Pop / Drain Retransmits After a Dense Compact NAK
+    group.bench_function("drain_retransmits_after_dense_nak", |b| {
+        b.iter_batched_ref(
+            || {
+                let mut sender = populated_sender(PACKETS);
+                sender.handle_nak_ranges(&dense_range);
+                sender
+            },
+            |sender| {
+                let mut drained = 0;
+                while let Some((hdr, _)) = sender.pop_retransmit(1400) {
+                    black_box(hdr);
+                    drained += 1;
+                }
+                black_box(drained)
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
     group.finish();
 }
 
-criterion_group!(sender_nak, benches);
-criterion_main!(sender_nak);
+criterion_group!(benches, bench_sender_nak_scale);
+criterion_main!(benches);
