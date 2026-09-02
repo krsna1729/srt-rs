@@ -8,8 +8,8 @@ use shiguredo_srt::{
     SRTGROUP_MASK, SrtConnection, Timestamp,
 };
 use srt_transport::{
-    AdmissionOptions, AdmissionResolution, BondedInputPolicy, DueIndex, IngressTelemetry,
-    ListenerPeerPolicy, PeerTable, PeerTableConfig, PolicyOverride,
+    AdmissionOptions, AdmissionResolution, BondedInputPolicy, DenseSlotArena, DueIndex,
+    IngressTelemetry, ListenerPeerPolicy, PeerTable, PeerTableConfig, PolicyOverride,
 };
 
 fn induction(socket_id: u32) -> Vec<u8> {
@@ -315,6 +315,152 @@ fn bench_bonded_second_leg_admission(c: &mut Criterion) {
         );
     });
 }
+fn bench_route_only_dispatch(c: &mut Criterion) {
+    let mut group = c.benchmark_group("route_only_dispatch");
+
+    for size in [1, 30, 200, 1000, 4096] {
+        let mut arena = DenseSlotArena::<usize>::new(size);
+        let mut map: std::collections::HashMap<(SocketAddr, u32), usize> =
+            std::collections::HashMap::new();
+        let mut queries = Vec::with_capacity(size);
+
+        for i in 0..size {
+            let addr = SocketAddr::from((
+                [10, (i / 65536) as u8, (i / 256) as u8, (i % 256) as u8],
+                5000,
+            ));
+            let (slot, id) = arena.allocate_socket_id(0).unwrap();
+            arena.insert_at_slot(slot, id, addr, i);
+            map.insert((addr, id), i);
+            queries.push((id, addr));
+        }
+
+        group.throughput(Throughput::Elements(size as u64));
+
+        group.bench_function(format!("dense_slot/{size}"), |b| {
+            b.iter(|| {
+                for &(id, addr) in &queries {
+                    black_box(arena.get(black_box(id), black_box(addr)));
+                }
+            });
+        });
+
+        group.bench_function(format!("hash_map/{size}"), |b| {
+            b.iter(|| {
+                for &(id, addr) in &queries {
+                    black_box(map.get(black_box(&(addr, id))));
+                }
+            });
+        });
+    }
+    group.finish();
+}
+
+fn bench_established_data_progression(c: &mut Criterion) {
+    let mut group = c.benchmark_group("established_data_progression");
+    let options = AdmissionOptions::basic(100, 120, true);
+    let telemetry = IngressTelemetry::new();
+
+    for size in [1, 30, 200, 1000, 4096] {
+        let mut table = PeerTable::with_config(PeerTableConfig {
+            max_peers: size,
+            max_half_open_peers: size,
+            ..PeerTableConfig::default()
+        });
+
+        let mut streams = Vec::with_capacity(size);
+
+        for i in 0..size {
+            let peer = SocketAddr::from((
+                [10, (i / 65536) as u8, (i / 256) as u8, (i % 256) as u8],
+                5000,
+            ));
+            let mut caller = SrtConnection::new_caller(ConnectionOptions {
+                socket_id: (i as u32) + 10,
+                stream_id: Some("#!::u=bench,r=live".to_owned()),
+                ..ConnectionOptions::default()
+            });
+            caller.connect(Timestamp::default()).expect("start caller");
+            let induction = next_packet(&mut caller);
+            let _ = table.admit(
+                peer,
+                &induction,
+                Timestamp::default(),
+                &options,
+                0,
+                1,
+                &telemetry,
+            );
+            let mut outbound = Vec::new();
+            table.poll_outbound(Timestamp::default(), &mut outbound);
+            for (_, packet) in outbound {
+                let _ = caller.feed_recv_buf(&packet, Timestamp::from_micros(1));
+            }
+            let conclusion = next_packet(&mut caller);
+            let _ = table.admit(
+                peer,
+                &conclusion,
+                Timestamp::from_micros(2),
+                &options,
+                0,
+                1,
+                &telemetry,
+            );
+            let mut outbound2 = Vec::new();
+            table.poll_outbound(Timestamp::from_micros(2), &mut outbound2);
+            for (_, packet) in outbound2 {
+                let _ = caller.feed_recv_buf(&packet, Timestamp::from_micros(2));
+            }
+
+            caller
+                .send(b"progressive payload data", Timestamp::from_micros(3))
+                .expect("send data");
+            let base_pkt = next_packet(&mut caller);
+            let initial_seq =
+                u32::from_be_bytes([base_pkt[0] & 0x7f, base_pkt[1], base_pkt[2], base_pkt[3]]);
+
+            // Pre-feed base_pkt beyond 120 ms TSBPD deadline to initialize expected_seq without gap
+            let warm_now = Timestamp::from_micros(1_000_000);
+            let _ = table.admit(peer, &base_pkt, warm_now, &options, 0, 1, &telemetry);
+
+            streams.push((peer, base_pkt, initial_seq));
+        }
+
+        group.throughput(Throughput::Elements(size as u64));
+
+        let mut events = Vec::new();
+        table.poll_events(&mut events);
+        let mut now_us = 1_000_010u64;
+
+        group.bench_function(format!("dense_slots_progression/{size}"), |b| {
+            b.iter(|| {
+                now_us = now_us.wrapping_add(10);
+                let now = Timestamp::from_micros(now_us);
+                let wire_ts = (now_us.saturating_sub(120_000) as u32).to_be_bytes();
+                for (peer, pkt, seq) in &mut streams {
+                    *seq = (*seq + 1) & 0x7fff_ffff;
+                    let be = seq.to_be_bytes();
+                    pkt[0] = be[0] & 0x7f;
+                    pkt[1] = be[1];
+                    pkt[2] = be[2];
+                    pkt[3] = be[3];
+                    pkt[8..12].copy_from_slice(&wire_ts);
+                    black_box(table.admit(
+                        black_box(*peer),
+                        black_box(pkt),
+                        now,
+                        &options,
+                        0,
+                        1,
+                        &telemetry,
+                    ));
+                }
+                table.poll_events(&mut events);
+            });
+        });
+    }
+    group.finish();
+}
 
 criterion_group!(
     benches,
@@ -323,6 +469,8 @@ criterion_group!(
     bench_due_index_churn,
     bench_per_source_capacity,
     bench_cached_policy_resolution,
-    bench_bonded_second_leg_admission
+    bench_bonded_second_leg_admission,
+    bench_route_only_dispatch,
+    bench_established_data_progression
 );
 criterion_main!(benches);

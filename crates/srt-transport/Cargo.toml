@@ -50,6 +50,7 @@ proptest = "1.11"
 [[bench]]
 name = "admission_hardening"
 harness = false
+required-features = ["bench-internals"]
 
 [features]
 mio = ["dep:mio"]
