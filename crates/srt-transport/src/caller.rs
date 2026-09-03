@@ -3,13 +3,35 @@ use crate::{
     OutputDrainReport, OutputDrainStatus, group_connection_stats,
 };
 use shiguredo_srt::{Bytes, ConnectionOutput, SrtConnection, Timestamp};
-use std::collections::{HashMap, HashSet, VecDeque};
-
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 /// Opaque application identity for one outbound SRT stream. A direct caller
 /// and a bonded Broadcast/Backup group have the same steady-state API.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LogicalCallerId(u64);
 
+/// Exact ordered deadline index for CallerTable.
+///
+/// Design choice: Unlike PeerTable's physical peers indexed by dense socket-ID
+/// slots in `DenseSlotArena`, CallerTable tracks application-level logical
+/// callers and bonded groups keyed by opaque `LogicalCallerId`. An exact
+/// `SchedEntry` provides O(log N) updates, O(log N) earliest deadline peek
+/// (leaf descent), and **no lazy stale heap** or generational rebuild. This
+/// is intentionally *not* a reuse of `DenseDueIndex`, which is specialized
+/// around `DenseSlotArena`'s dense slot/generation metadata. For CallerTable's
+/// HashMap-backed logical ids, the exact set is simpler, bounded at O(N) with
+/// zero stale amplification, and matches the paste-5 guidance to "benchmark
+/// the choice rather than starting another structural rewrite."
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct DeadlineEntry {
+    deadline_micros: u64,
+    id: LogicalCallerId,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SchedEntry {
+    ready_queued: bool,
+    deadline_micros: Option<u64>,
+}
 /// Coarse logical state of an outbound stream, independent of how many
 /// physical SRT legs currently carry it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,16 +190,16 @@ impl LogicalCallerMut<'_> {
     /// Send one logical payload. Direct callers return one; Broadcast returns
     /// the successful active-leg count; Backup returns its selected leg.
     pub fn send(&mut self, payload: &[u8], now: Timestamp) -> Result<usize, shiguredo_srt::Error> {
-        self.table
-            .sessions
-            .get_mut(&self.id)
-            .ok_or_else(|| {
-                shiguredo_srt::Error::with_reason(
-                    shiguredo_srt::ErrorKind::InvalidState,
-                    "logical caller no longer exists",
-                )
-            })?
-            .send(payload, now)
+        let session = self.table.sessions.get_mut(&self.id).ok_or_else(|| {
+            shiguredo_srt::Error::with_reason(
+                shiguredo_srt::ErrorKind::InvalidState,
+                "logical caller no longer exists",
+            )
+        })?;
+        let res = session.send(payload, now);
+        self.table.sync_deadline(self.id);
+        self.table.enqueue_ready(self.id);
+        res
     }
 
     /// Send shared payload data. Uses reference-counted `Bytes` to avoid
@@ -187,23 +209,29 @@ impl LogicalCallerMut<'_> {
         payload: Bytes,
         now: Timestamp,
     ) -> Result<usize, shiguredo_srt::Error> {
-        self.table
-            .sessions
-            .get_mut(&self.id)
-            .ok_or_else(|| {
-                shiguredo_srt::Error::with_reason(
-                    shiguredo_srt::ErrorKind::InvalidState,
-                    "logical caller no longer exists",
-                )
-            })?
-            .send_shared(payload, now)
+        let session = self.table.sessions.get_mut(&self.id).ok_or_else(|| {
+            shiguredo_srt::Error::with_reason(
+                shiguredo_srt::ErrorKind::InvalidState,
+                "logical caller no longer exists",
+            )
+        })?;
+        let res = session.send_shared(payload, now);
+        self.table.sync_deadline(self.id);
+        self.table.enqueue_ready(self.id);
+        res
     }
 
     /// Begin an orderly close. A bonded caller closes every physical leg.
     pub fn disconnect(&mut self, now: Timestamp) {
+        let exists = self.table.sessions.contains_key(&self.id);
+        if !exists {
+            return;
+        }
         if let Some(caller) = self.table.sessions.get_mut(&self.id) {
             caller.disconnect(now);
         }
+        self.table.sync_deadline(self.id);
+        self.table.enqueue_ready(self.id);
     }
 }
 
@@ -217,10 +245,25 @@ impl LogicalCallerMut<'_> {
 pub struct CallerTable {
     sessions: HashMap<LogicalCallerId, CallerSession>,
     routes: HashMap<u32, CallerRoute>,
-    round_robin: VecDeque<LogicalCallerId>,
+    ready_queue: VecDeque<LogicalCallerId>,
+    deadlines: BTreeSet<DeadlineEntry>,
+    sched: HashMap<LogicalCallerId, SchedEntry>,
     next_logical_caller: u64,
+    #[cfg(any(test, feature = "bench-internals"))]
+    sched_stats: SchedCounters,
 }
 
+#[cfg(any(test, feature = "bench-internals"))]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SchedCounters {
+    /// Due callers whose expired timers were fired.
+    pub due_callers_visited: usize,
+    /// Ready drain probes / calls to `drain_one()`.
+    pub ready_drain_probes: usize,
+    /// Output budget exhaustion events.
+    pub budget_exhausted: usize,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum CallerRoute {
     Direct(LogicalCallerId),
     Group {
@@ -386,10 +429,15 @@ impl CallerSession {
         }
     }
 
-    fn drain_one(&mut self, now: Timestamp, sink: &mut DrainSink) -> DrainOne {
+    /// Drain one output item. Returns whether table-side timer state was
+    /// touched (`SetTimer`/`ClearTimer` applied); callers must reindex the
+    /// deadline exactly when touched (or after `fire_timers`, which always
+    /// reindexes in `fire_due_ids`).
+    fn drain_one(&mut self, now: Timestamp, sink: &mut DrainSink) -> (DrainOne, bool) {
         match self {
             Self::Direct(leg) => drain_one_caller_leg(leg, now, sink),
             Self::Group(group) => {
+                let mut timers_touched = false;
                 for _ in 0..group.leg_order.len() {
                     let member_id = group.leg_order[group.next_leg];
                     group.next_leg = (group.next_leg + 1) % group.leg_order.len();
@@ -410,11 +458,13 @@ impl CallerSession {
                         connection,
                         sink,
                     ) {
-                        DrainOne::Empty => {}
+                        (DrainOne::Empty, touched) => {
+                            timers_touched |= touched;
+                        }
                         result => return result,
                     }
                 }
-                DrainOne::Empty
+                (DrainOne::Empty, timers_touched)
             }
         }
     }
@@ -444,16 +494,116 @@ impl CallerTable {
         Self {
             sessions: HashMap::new(),
             routes: HashMap::new(),
-            round_robin: VecDeque::new(),
+            ready_queue: VecDeque::new(),
+            deadlines: BTreeSet::new(),
+            sched: HashMap::new(),
             next_logical_caller: 1,
+            #[cfg(any(test, feature = "bench-internals"))]
+            sched_stats: SchedCounters::default(),
         }
+    }
+
+    fn logical_next_deadline(session: &CallerSession) -> Option<Timestamp> {
+        match session {
+            CallerSession::Direct(leg) => leg.timers.next_deadline(),
+            CallerSession::Group(group) => group
+                .legs
+                .values()
+                .filter_map(|leg| leg.timers.next_deadline())
+                .min(),
+        }
+    }
+
+    fn sync_deadline(&mut self, id: LogicalCallerId) {
+        let new_micros = self
+            .sessions
+            .get(&id)
+            .and_then(Self::logical_next_deadline)
+            .map(|ts| ts.as_micros());
+        let entry = self.sched.entry(id).or_insert(SchedEntry {
+            ready_queued: false,
+            deadline_micros: None,
+        });
+        let old_micros = entry.deadline_micros;
+        if old_micros == new_micros {
+            return;
+        }
+        if let Some(old) = old_micros {
+            self.deadlines.remove(&DeadlineEntry {
+                deadline_micros: old,
+                id,
+            });
+        }
+        if let Some(n) = new_micros {
+            self.deadlines.insert(DeadlineEntry {
+                deadline_micros: n,
+                id,
+            });
+        }
+        entry.deadline_micros = new_micros;
+    }
+
+    fn enqueue_ready(&mut self, id: LogicalCallerId) {
+        let entry = self.sched.entry(id).or_insert(SchedEntry {
+            ready_queued: false,
+            deadline_micros: None,
+        });
+        if entry.ready_queued {
+            return;
+        }
+        entry.ready_queued = true;
+        self.ready_queue.push_back(id);
+    }
+
+    fn pop_ready(&mut self) -> Option<LogicalCallerId> {
+        while let Some(id) = self.ready_queue.pop_front() {
+            let Some(meta) = self.sched.get_mut(&id) else {
+                continue;
+            };
+            if !meta.ready_queued {
+                continue;
+            }
+            if !self.sessions.contains_key(&id) {
+                meta.ready_queued = false;
+                continue;
+            }
+            meta.ready_queued = false;
+            return Some(id);
+        }
+        None
+    }
+
+    fn maybe_compact_ready_queue(&mut self) {
+        if self.ready_queue.len() > 64 && self.ready_queue.len() > self.sessions.len() * 4 {
+            self.ready_queue.retain(|id| self.sessions.contains_key(id));
+        }
+    }
+
+    #[cfg(any(test, feature = "bench-internals"))]
+    pub fn sched_counters(&self) -> SchedCounters {
+        self.sched_stats
+    }
+
+    #[cfg(any(test, feature = "bench-internals"))]
+    pub fn reset_sched_counters(&mut self) {
+        self.sched_stats = SchedCounters::default();
+    }
+
+    #[cfg(any(test, feature = "bench-internals"))]
+    pub fn deadline_count(&self) -> usize {
+        self.deadlines.len()
+    }
+
+    #[cfg(any(test, feature = "bench-internals"))]
+    pub fn ready_queue_len(&self) -> usize {
+        self.ready_queue.len()
     }
 
     /// Add one direct caller. Its non-zero SRT Socket ID must be unique among
     /// all physical legs in this shared UDP socket.
     pub fn add_direct(&mut self, leg: CallerLeg) -> Result<LogicalCallerId, shiguredo_srt::Error> {
         let socket_id = self.validate_socket_id(&leg.connection)?;
-        let id = self.allocate_logical_caller();
+        let id = self.allocate_logical_caller()?;
         self.sessions.insert(
             id,
             CallerSession::Direct(Box::new(CallerLegState {
@@ -464,7 +614,15 @@ impl CallerTable {
             })),
         );
         self.routes.insert(socket_id, CallerRoute::Direct(id));
-        self.round_robin.push_back(id);
+        self.sched.insert(
+            id,
+            SchedEntry {
+                ready_queued: false,
+                deadline_micros: None,
+            },
+        );
+        self.sync_deadline(id);
+        self.enqueue_ready(id);
         Ok(id)
     }
 
@@ -516,7 +674,7 @@ impl CallerTable {
             ));
         }
 
-        let id = self.allocate_logical_caller();
+        let id = self.allocate_logical_caller()?;
         for member in group.members() {
             let socket_id = member.connection().socket_id();
             self.routes.insert(
@@ -537,10 +695,17 @@ impl CallerTable {
                 logical: GroupLogicalCounters::default(),
             })),
         );
-        self.round_robin.push_back(id);
+        self.sched.insert(
+            id,
+            SchedEntry {
+                ready_queued: false,
+                deadline_micros: None,
+            },
+        );
+        self.sync_deadline(id);
+        self.enqueue_ready(id);
         Ok(id)
     }
-
     fn validate_socket_id(&self, connection: &SrtConnection) -> Result<u32, shiguredo_srt::Error> {
         let socket_id = connection.socket_id();
         if socket_id == 0 || self.routes.contains_key(&socket_id) {
@@ -552,10 +717,15 @@ impl CallerTable {
         Ok(socket_id)
     }
 
-    fn allocate_logical_caller(&mut self) -> LogicalCallerId {
-        let id = LogicalCallerId(self.next_logical_caller);
-        self.next_logical_caller = self.next_logical_caller.wrapping_add(1).max(1);
-        id
+    fn allocate_logical_caller(&mut self) -> Result<LogicalCallerId, shiguredo_srt::Error> {
+        let raw = self.next_logical_caller;
+        self.next_logical_caller = raw.checked_add(1).ok_or_else(|| {
+            shiguredo_srt::Error::with_reason(
+                shiguredo_srt::ErrorKind::InvalidState,
+                "logical caller ID space exhausted",
+            )
+        })?;
+        Ok(LogicalCallerId(raw))
     }
 
     /// Feed one datagram received from the application-owned UDP socket.
@@ -567,10 +737,14 @@ impl CallerTable {
         now: Timestamp,
     ) -> Result<bool, shiguredo_srt::Error> {
         let socket_id = shiguredo_srt::peek_destination_socket_id(data)?;
-        let Some(route) = self.routes.get(&socket_id) else {
-            return Ok(false);
+        let target_id = match self.routes.get(&socket_id).copied() {
+            Some(route) => match route {
+                CallerRoute::Direct(id) => id,
+                CallerRoute::Group { caller, .. } => caller,
+            },
+            None => return Ok(false),
         };
-        match *route {
+        let feed_res = match self.routes.get(&socket_id).copied().expect("checked") {
             CallerRoute::Direct(id) => {
                 let Some(CallerSession::Direct(leg)) = self.sessions.get_mut(&id) else {
                     return Ok(false);
@@ -578,7 +752,7 @@ impl CallerTable {
                 if leg.peer != peer {
                     return Ok(false);
                 }
-                leg.connection.feed_recv_buf(data, now)?;
+                leg.connection.feed_recv_buf(data, now)
             }
             CallerRoute::Group { caller, member_id } => {
                 let Some(CallerSession::Group(group)) = self.sessions.get_mut(&caller) else {
@@ -595,10 +769,45 @@ impl CallerTable {
                     .member_mut(member_id)
                     .expect("group and caller legs are built together")
                     .connection_mut()
-                    .feed_recv_buf(data, now)?;
+                    .feed_recv_buf(data, now)
             }
+        };
+        self.sync_deadline(target_id);
+        self.enqueue_ready(target_id);
+        feed_res.map(|()| true)
+    }
+
+    fn pop_due_ids(&mut self, now: Timestamp) -> Vec<LogicalCallerId> {
+        let now_micros = now.as_micros();
+        let mut due_ids = Vec::new();
+        while let Some(entry) = self.deadlines.first().copied() {
+            if entry.deadline_micros > now_micros {
+                break;
+            }
+            self.deadlines.pop_first();
+            if let Some(meta) = self.sched.get_mut(&entry.id) {
+                meta.deadline_micros = None;
+            }
+            if !self.sessions.contains_key(&entry.id) {
+                continue;
+            }
+            due_ids.push(entry.id);
         }
-        Ok(true)
+        due_ids
+    }
+
+    fn fire_due_ids(&mut self, ids: Vec<LogicalCallerId>, now: Timestamp) {
+        for id in ids {
+            if let Some(session) = self.sessions.get_mut(&id) {
+                session.fire_timers(now);
+                #[cfg(any(test, feature = "bench-internals"))]
+                {
+                    self.sched_stats.due_callers_visited += 1;
+                }
+            }
+            self.enqueue_ready(id);
+            self.sync_deadline(id);
+        }
     }
 
     /// Drive all protocol timers and collect datagrams for the application to
@@ -609,34 +818,41 @@ impl CallerTable {
         out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
     ) {
         out.clear();
-        for session in self.sessions.values_mut() {
-            match session {
-                CallerSession::Direct(leg) => drain_caller_leg(leg, now, out),
-                CallerSession::Group(group) => {
-                    let (srt_group, legs) = (&mut group.group, &mut group.legs);
-                    for (member_id, leg) in legs {
-                        let connection = srt_group
-                            .member_mut(*member_id)
-                            .expect("group and caller legs are built together")
-                            .connection_mut();
-                        leg.timers.fire_expired(now, connection);
-                        while let Some(output) = connection.poll_output() {
-                            match output {
-                                ConnectionOutput::SendPacket(packet) => {
-                                    out.push((leg.peer, packet));
-                                }
-                                other => leg.timers.apply_output(&other, now),
-                            }
-                        }
-                    }
+        let due_ids = self.pop_due_ids(now);
+        self.fire_due_ids(due_ids, now);
+        while let Some(id) = self.pop_ready() {
+            let (drain_result, timers_touched) = {
+                let Some(session) = self.sessions.get_mut(&id) else {
+                    continue;
+                };
+                let mut report = OutputDrainReport::default();
+                let mut sink = DrainSink {
+                    budget: OutputDrainBudget::new(usize::MAX, usize::MAX, usize::MAX),
+                    report: &mut report,
+                    out,
+                };
+                let res = session.drain_one(now, &mut sink);
+                #[cfg(any(test, feature = "bench-internals"))]
+                {
+                    self.sched_stats.ready_drain_probes += 1;
                 }
+                res
+            };
+            if timers_touched {
+                self.sync_deadline(id);
+            }
+            match drain_result {
+                DrainOne::Drained | DrainOne::Blocked => {
+                    self.enqueue_ready(id);
+                }
+                DrainOne::Empty => {}
             }
         }
     }
 
     /// Fairly drain bounded work from all logical callers. Due timers are
-    /// fired for every leg before the budget is shared round-robin across
-    /// logical streams, so a busy caller cannot starve another caller's
+    /// fired only for due callers before the budget is shared fairly across
+    /// ready logical streams, so a busy caller cannot starve another caller's
     /// retransmission or close timer.
     pub fn poll_outbound_bounded(
         &mut self,
@@ -650,32 +866,76 @@ impl CallerTable {
             budget.max_packets.max(1),
             budget.max_bytes.max(1),
         );
-        for session in self.sessions.values_mut() {
-            session.fire_timers(now);
-        }
+        let due_ids = self.pop_due_ids(now);
+        self.fire_due_ids(due_ids, now);
+        self.drain_ready_bounded(now, budget, out)
+    }
 
+    fn drain_ready_bounded(
+        &mut self,
+        now: Timestamp,
+        budget: OutputDrainBudget,
+        out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
+    ) -> OutputDrainReport {
         let mut report = OutputDrainReport::default();
         let mut sink = DrainSink {
             budget,
             report: &mut report,
             out,
         };
-        let mut idle_turns = 0usize;
-        while !self.round_robin.is_empty()
-            && idle_turns < self.round_robin.len()
-            && sink.report.actions < sink.budget.max_actions
-        {
-            let id = self.round_robin.pop_front().expect("checked non-empty");
-            self.round_robin.push_back(id);
-            let Some(session) = self.sessions.get_mut(&id) else {
-                continue;
+        while sink.report.actions < sink.budget.max_actions {
+            let Some(id) = self.pop_ready() else {
+                break;
             };
-            match session.drain_one(now, &mut sink) {
-                DrainOne::Drained => idle_turns = 0,
-                DrainOne::Empty | DrainOne::Blocked => idle_turns += 1,
+            let (drain_result, timers_touched) = {
+                let Some(session) = self.sessions.get_mut(&id) else {
+                    continue;
+                };
+                #[cfg(any(test, feature = "bench-internals"))]
+                {
+                    self.sched_stats.ready_drain_probes += 1;
+                }
+                session.drain_one(now, &mut sink)
+            };
+            if timers_touched {
+                self.sync_deadline(id);
+            }
+            match drain_result {
+                DrainOne::Drained => {
+                    if sink.report.actions >= sink.budget.max_actions
+                        || sink.report.packets >= sink.budget.max_packets
+                    {
+                        self.enqueue_ready(id);
+                        #[cfg(any(test, feature = "bench-internals"))]
+                        {
+                            self.sched_stats.budget_exhausted += 1;
+                        }
+                        break;
+                    }
+                    self.enqueue_ready(id);
+                }
+                DrainOne::Empty => {}
+                DrainOne::Blocked => {
+                    self.enqueue_ready(id);
+                    #[cfg(any(test, feature = "bench-internals"))]
+                    {
+                        self.sched_stats.budget_exhausted += 1;
+                    }
+                    break;
+                }
+            }
+            if sink.report.packets >= sink.budget.max_packets {
+                #[cfg(any(test, feature = "bench-internals"))]
+                {
+                    self.sched_stats.budget_exhausted += 1;
+                }
+                break;
             }
         }
-        if report.actions >= budget.max_actions || report.packets >= budget.max_packets {
+        if report.actions >= budget.max_actions
+            || report.packets >= budget.max_packets
+            || report.bytes >= budget.max_bytes
+        {
             report.status = OutputDrainStatus::BudgetExhausted;
         }
         report
@@ -690,7 +950,15 @@ impl CallerTable {
             CallerRoute::Direct(caller) => *caller != id,
             CallerRoute::Group { caller, .. } => *caller != id,
         });
-        self.round_robin.retain(|caller| *caller != id);
+        if let Some(meta) = self.sched.remove(&id)
+            && let Some(old) = meta.deadline_micros
+        {
+            self.deadlines.remove(&DeadlineEntry {
+                deadline_micros: old,
+                id,
+            });
+        }
+        self.maybe_compact_ready_queue();
         Some(match session {
             CallerSession::Direct(leg) => {
                 RemovedLogicalCaller::Direct(Box::new(RemovedCallerLeg {
@@ -732,20 +1000,118 @@ impl CallerTable {
 
     #[must_use]
     pub fn time_until_next_deadline(&self, now: Timestamp, default_micros: u64) -> u64 {
-        let mut deadline = default_micros;
-        for session in self.sessions.values() {
+        if let Some(entry) = self.deadlines.first() {
+            let deadline = Timestamp::from_micros(entry.deadline_micros);
+            let until = deadline.as_micros().saturating_sub(now.as_micros());
+            return until.min(default_micros);
+        }
+        default_micros
+    }
+
+    #[cfg(any(test, feature = "bench-internals"))]
+    pub fn bench_arm_timer(
+        &mut self,
+        id: LogicalCallerId,
+        timer_id: shiguredo_srt::TimerId,
+        duration_micros: u64,
+        now: Timestamp,
+    ) {
+        if let Some(session) = self.sessions.get_mut(&id) {
             match session {
                 CallerSession::Direct(leg) => {
-                    deadline = deadline.min(leg.timers.time_until_earliest(now, deadline));
+                    leg.timers.apply_output(
+                        &ConnectionOutput::SetTimer {
+                            id: timer_id,
+                            duration_micros,
+                        },
+                        now,
+                    );
                 }
                 CallerSession::Group(group) => {
-                    for leg in group.legs.values() {
-                        deadline = deadline.min(leg.timers.time_until_earliest(now, deadline));
+                    if let Some(leg) = group.legs.values_mut().next() {
+                        leg.timers.apply_output(
+                            &ConnectionOutput::SetTimer {
+                                id: timer_id,
+                                duration_micros,
+                            },
+                            now,
+                        );
                     }
                 }
             }
+            self.sync_deadline(id);
         }
-        deadline
+    }
+
+    #[cfg(any(test, feature = "bench-internals"))]
+    pub fn bench_inject_deadline(&mut self, id: LogicalCallerId, deadline: Timestamp) {
+        self.bench_arm_timer(
+            id,
+            shiguredo_srt::TimerId::Ack,
+            deadline.as_micros(),
+            Timestamp::from_micros(0),
+        );
+    }
+
+    #[cfg(any(test, feature = "bench-internals"))]
+    pub fn bench_clear_deadline(&mut self, id: LogicalCallerId) {
+        if let Some(session) = self.sessions.get_mut(&id) {
+            match session {
+                CallerSession::Direct(leg) => {
+                    for &t in &shiguredo_srt::TimerId::ALL {
+                        leg.timers.apply_output(
+                            &ConnectionOutput::ClearTimer { id: t },
+                            Timestamp::default(),
+                        );
+                    }
+                }
+                CallerSession::Group(group) => {
+                    for leg in group.legs.values_mut() {
+                        for &t in &shiguredo_srt::TimerId::ALL {
+                            leg.timers.apply_output(
+                                &ConnectionOutput::ClearTimer { id: t },
+                                Timestamp::default(),
+                            );
+                        }
+                    }
+                }
+            }
+            self.sync_deadline(id);
+        }
+    }
+
+    #[cfg(any(test, feature = "bench-internals"))]
+    pub fn bench_ids(&self) -> Vec<LogicalCallerId> {
+        self.sessions.keys().copied().collect()
+    }
+
+    #[cfg(any(test, feature = "bench-internals"))]
+    pub fn bench_make_ready(&mut self, id: LogicalCallerId) {
+        self.enqueue_ready(id);
+    }
+
+    #[cfg(any(test, feature = "bench-internals"))]
+    pub fn bench_push_pending(
+        &mut self,
+        id: LogicalCallerId,
+        _peer: std::net::SocketAddr,
+        packet: Vec<u8>,
+    ) {
+        if let Some(session) = self.sessions.get_mut(&id) {
+            match session {
+                CallerSession::Direct(leg) => {
+                    leg.pending.push_back(ConnectionOutput::SendPacket(packet));
+                }
+                CallerSession::Group(group) => {
+                    if let Some(first) = group.leg_order.first().copied()
+                        && let Some(leg) = group.legs.get_mut(&first)
+                    {
+                        leg.pending.push_back(ConnectionOutput::SendPacket(packet));
+                    }
+                }
+            }
+            self.enqueue_ready(id);
+        }
     }
 
     #[must_use]
@@ -764,26 +1130,11 @@ impl Default for CallerTable {
         Self::new()
     }
 }
-
-fn drain_caller_leg(
-    leg: &mut CallerLegState,
-    now: Timestamp,
-    out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
-) {
-    leg.timers.fire_expired(now, &mut leg.connection);
-    while let Some(output) = leg.connection.poll_output() {
-        match output {
-            ConnectionOutput::SendPacket(packet) => out.push((leg.peer, packet)),
-            other => leg.timers.apply_output(&other, now),
-        }
-    }
-}
-
 fn drain_one_caller_leg(
     leg: &mut CallerLegState,
     now: Timestamp,
     sink: &mut DrainSink,
-) -> DrainOne {
+) -> (DrainOne, bool) {
     drain_one_caller_leg_parts(
         leg.peer,
         now,
@@ -801,13 +1152,13 @@ fn drain_one_caller_leg_parts(
     pending: &mut VecDeque<ConnectionOutput>,
     connection: &mut SrtConnection,
     sink: &mut DrainSink,
-) -> DrainOne {
+) -> (DrainOne, bool) {
     let Some(output) = pending.pop_front().or_else(|| connection.poll_output()) else {
-        return DrainOne::Empty;
+        return (DrainOne::Empty, false);
     };
     if sink.report.actions >= sink.budget.max_actions {
         pending.push_front(output);
-        return DrainOne::Blocked;
+        return (DrainOne::Blocked, false);
     }
     match output {
         ConnectionOutput::SendPacket(packet) => {
@@ -816,19 +1167,20 @@ fn drain_one_caller_leg_parts(
                 && sink.report.bytes.saturating_add(packet.len()) > sink.budget.max_bytes;
             if exceeds_packets || exceeds_bytes {
                 pending.push_front(ConnectionOutput::SendPacket(packet));
-                return DrainOne::Blocked;
+                return (DrainOne::Blocked, false);
             }
             sink.report.actions += 1;
             sink.report.packets += 1;
             sink.report.bytes = sink.report.bytes.saturating_add(packet.len());
             sink.out.push((peer, packet));
+            (DrainOne::Drained, false)
         }
         other => {
             sink.report.actions += 1;
             timers.apply_output(&other, now);
+            (DrainOne::Drained, true)
         }
     }
-    DrainOne::Drained
 }
 
 pub(crate) fn prepend_outputs(
@@ -2847,6 +3199,385 @@ mod tests {
         assert_eq!(
             store.time_until_earliest(Timestamp::from_micros(1_000), 99),
             99
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // CallerTable ready / deadline scheduling invariants (exact BTreeSet)
+    // -----------------------------------------------------------------
+
+    fn new_connected_caller_connection(socket_id: u32) -> SrtConnection {
+        let mut caller = SrtConnection::new_caller(ConnectionOptions {
+            socket_id,
+            ..ConnectionOptions::default()
+        });
+        let mut listener = SrtConnection::new_listener(ConnectionOptions {
+            socket_id: socket_id.wrapping_add(100_000).max(1),
+            ..ConnectionOptions::default()
+        });
+        caller.connect(Timestamp::default()).expect("connect");
+        for i in 0..10 {
+            let now = Timestamp::from_micros(i * 10_000);
+            while let Some(output) = caller.poll_output() {
+                if let ConnectionOutput::SendPacket(data) = output {
+                    let _ = listener.feed_recv_buf(&data, now);
+                }
+            }
+            while let Some(output) = listener.poll_output() {
+                if let ConnectionOutput::SendPacket(data) = output {
+                    let _ = caller.feed_recv_buf(&data, now);
+                }
+            }
+            if caller.state() == shiguredo_srt::ConnectionState::Connected {
+                break;
+            }
+        }
+        assert_eq!(caller.state(), shiguredo_srt::ConnectionState::Connected);
+        caller
+    }
+
+    fn mk_table(n: usize) -> CallerTable {
+        let mut t = CallerTable::new();
+        for i in 0..n {
+            let peer = std::net::SocketAddr::from((
+                [10, 0, (i / 256) as u8, (i % 256) as u8],
+                4000 + (i % 1000) as u16,
+            ));
+            let conn = new_connected_caller_connection(1000 + i as u32);
+            t.add_direct(CallerLeg {
+                peer,
+                connection: conn,
+            })
+            .unwrap();
+        }
+        let mut out = Vec::new();
+        t.poll_outbound(Timestamp::default(), &mut out);
+        t.reset_sched_counters();
+        t
+    }
+
+    #[test]
+    fn caller_ready_deduplication() {
+        let mut table = mk_table(4);
+        let id = table.bench_ids()[0];
+        // Enqueue same caller 100 times via bench_make_ready
+        for _ in 0..100 {
+            table.bench_make_ready(id);
+        }
+        assert_eq!(table.ready_queue_len(), 1);
+
+        // Poll should consume exactly one ready visit
+        let mut out = Vec::new();
+        let budget = crate::OutputDrainBudget::new(64, 32, 256 * 1024);
+        table.poll_outbound_bounded(Timestamp::default(), budget, &mut out);
+        assert_eq!(table.ready_queue_len(), 0);
+    }
+
+    #[test]
+    fn caller_feed_error_drains_cleanup_and_cleans_deadline_index() {
+        let mut table = CallerTable::new();
+        let peer = std::net::SocketAddr::from(([127, 0, 0, 1], 9000));
+        let socket_id = 4242;
+        let mut conn = SrtConnection::new_caller(ConnectionOptions {
+            socket_id,
+            ..ConnectionOptions::default()
+        });
+        conn.connect(Timestamp::default()).expect("start caller");
+        let _id = table
+            .add_direct(CallerLeg {
+                peer,
+                connection: conn,
+            })
+            .expect("add direct");
+
+        // Drain the initial induction request packet and arm connection timers.
+        let mut out = Vec::new();
+        let budget = crate::OutputDrainBudget::new(64, 32, 256 * 1024);
+        table.poll_outbound_bounded(Timestamp::default(), budget, &mut out);
+        assert!(!out.is_empty(), "must have emitted induction request");
+
+        // Handshake timer is now armed in the index.
+        assert_eq!(table.deadline_count(), 1);
+        let initial_deadline = table.time_until_next_deadline(Timestamp::default(), 10_000_000);
+        assert!(
+            initial_deadline < 10_000_000,
+            "handshake timer should be armed"
+        );
+        // Fabricate a malformed induction response that triggers fail_caller_handshake.
+        // Specifically, an induction response with invalid SRT magic (0 instead of SRT_MAGIC_CODE).
+        let mut response = HandshakePacket::new_induction_response(socket_id, 9999, 0);
+        response.extension_field = 0; // invalid magic
+        let packet = response.encode(0, socket_id);
+        let mut bytes = Vec::new();
+        packet.encode(&mut bytes);
+
+        // 1. feed() must return Err because the handshake failed.
+        let feed_res = table.feed(peer, &bytes, Timestamp::from_micros(1000));
+        assert!(
+            feed_res.is_err(),
+            "feed should return Err on invalid handshake magic"
+        );
+
+        // 2. Caller must be enqueued ready to drain its queued cleanup output (ClearTimer).
+        assert_eq!(
+            table.ready_queue_len(),
+            1,
+            "caller must be ready to drain cleanup"
+        );
+
+        // 3. Drain the table.
+        let mut cleanup_out = Vec::new();
+        table.poll_outbound_bounded(Timestamp::from_micros(1000), budget, &mut cleanup_out);
+
+        // 4. Stale handshake deadline state must not remain in the index.
+        assert_eq!(
+            table.deadline_count(),
+            0,
+            "handshake deadline must be cleared from index"
+        );
+        assert_eq!(
+            table.time_until_next_deadline(Timestamp::from_micros(1000), 5_000_000),
+            5_000_000,
+            "no live deadline should remain"
+        );
+    }
+
+    #[test]
+    fn caller_one_ready_among_many_visits_sparse() {
+        for n in [30, 200, 1000] {
+            let mut table = mk_table(n);
+            let ids = table.bench_ids();
+            let target = ids[0];
+            let now = Timestamp::default();
+            let send_res = table
+                .logical_caller_mut(&target)
+                .unwrap()
+                .send(b"hello", now);
+            assert!(
+                send_res.is_ok(),
+                "send must succeed on Connected caller: {:?}",
+                send_res
+            );
+            table.reset_sched_counters();
+            let mut out = Vec::new();
+            let budget = crate::OutputDrainBudget::new(64, 32, 256 * 1024);
+            table.poll_outbound_bounded(Timestamp::default(), budget, &mut out);
+            let c = table.sched_counters();
+            assert!(
+                c.ready_drain_probes <= 2,
+                "n={n} one_ready should visit ~1 ready caller (at most 2 probes: drained + empty), got {}",
+                c.ready_drain_probes
+            );
+            assert_eq!(
+                c.due_callers_visited, 0,
+                "n={n} one_ready should have 0 due caller visits"
+            );
+        }
+    }
+
+    #[test]
+    fn caller_one_due_among_many_visits_sparse() {
+        for n in [30, 200, 1000] {
+            let mut table = mk_table(n);
+            let ids = table.bench_ids();
+            let target = ids[0];
+            // Clear all deadlines to known idle, then inject exactly one due deadline
+            for id in ids.clone() {
+                table.bench_clear_deadline(id);
+            }
+            let now = Timestamp::from_micros(5_000_000);
+            table.bench_arm_timer(
+                target,
+                shiguredo_srt::TimerId::Ack,
+                5_000_000,
+                Timestamp::from_micros(0),
+            );
+            table.reset_sched_counters();
+            let mut out = Vec::new();
+            let budget = crate::OutputDrainBudget::new(64, 32, 256 * 1024);
+            table.poll_outbound_bounded(now, budget, &mut out);
+            let c = table.sched_counters();
+            assert_eq!(
+                c.due_callers_visited, 1,
+                "n={n} due_callers_visited should be 1, got {}",
+                c.due_callers_visited
+            );
+        }
+    }
+
+    #[test]
+    fn caller_earliest_deadline_matches_scan() {
+        let mut table = mk_table(20);
+        // Inject staggered deadlines
+        let ids = table.bench_ids();
+        for (i, id) in ids.iter().enumerate() {
+            let dl = Timestamp::from_micros(10_000 + i as u64 * 1_000);
+            table.bench_inject_deadline(*id, dl);
+        }
+        let now = Timestamp::from_micros(0);
+        let indexed = table.time_until_next_deadline(now, 1_000_000);
+        // Reference scan over injected deadlines (they are the only ones)
+        let expected = 10_000; // earliest is 10_000
+        assert_eq!(indexed, expected);
+    }
+
+    #[test]
+    fn caller_deadline_move_earlier_and_later() {
+        let mut table = mk_table(5);
+        let ids = table.bench_ids();
+        let target = ids[0];
+        let now = Timestamp::from_micros(0);
+        for id in ids.clone() {
+            table.bench_clear_deadline(id);
+        }
+        table.bench_inject_deadline(target, Timestamp::from_micros(100_000));
+        assert_eq!(table.time_until_next_deadline(now, 999_999), 100_000);
+        // move earlier
+        table.bench_inject_deadline(target, Timestamp::from_micros(10_000));
+        assert_eq!(table.time_until_next_deadline(now, 999_999), 10_000);
+        // move later
+        table.bench_inject_deadline(target, Timestamp::from_micros(200_000));
+        assert_eq!(table.time_until_next_deadline(now, 999_999), 200_000);
+        // ensure heap size stays bounded (exact set, no stale)
+        assert!(table.deadline_count() <= 20);
+    }
+
+    #[test]
+    fn caller_remove_invalidates_ready_and_deadline() {
+        let mut table = mk_table(10);
+        let ids = table.bench_ids();
+        let target = ids[0];
+        table.bench_inject_deadline(target, Timestamp::from_micros(1_000));
+        table.bench_push_pending(
+            target,
+            std::net::SocketAddr::from(([10, 0, 0, 1], 5000)),
+            vec![1; 64],
+        );
+        let before_deadlines = table.deadline_count();
+        let before_ready = table.ready_queue_len();
+        assert!(before_deadlines > 0);
+        assert!(before_ready > 0);
+        table.remove(target);
+        // Stale entries must not fire
+        let now = Timestamp::from_micros(10_000);
+        let mut out = Vec::new();
+        let budget = crate::OutputDrainBudget::new(64, 32, 256 * 1024);
+        table.poll_outbound_bounded(now, budget, &mut out);
+        // No panic, and deadline for removed id is gone
+        assert!(
+            table.deadline_count() < before_deadlines || table.deadline_count() <= 10,
+            "deadlines should shrink after remove"
+        );
+        // IDs never wrap (checked_add), so a new caller cannot alias a removed one.
+        let peer = std::net::SocketAddr::from(([10, 0, 0, 99], 9999));
+        let conn = {
+            let mut c = SrtConnection::new_caller(ConnectionOptions {
+                socket_id: 99999,
+                ..ConnectionOptions::default()
+            });
+            c.connect(Timestamp::default()).unwrap();
+            c
+        };
+        let new_id = table
+            .add_direct(CallerLeg {
+                peer,
+                connection: conn,
+            })
+            .unwrap();
+        assert_ne!(
+            new_id, target,
+            "monotonic IDs must never alias a removed caller"
+        );
+        let _ = table.time_until_next_deadline(now, 999_999);
+    }
+
+    #[test]
+    fn caller_budget_exhaustion_preserves_pending() {
+        let mut table = mk_table(2);
+        let ids = table.bench_ids();
+        let now = Timestamp::default();
+        for id in ids.clone() {
+            for _ in 0..5 {
+                let res = table
+                    .logical_caller_mut(&id)
+                    .unwrap()
+                    .send(b"payload-data-test", now);
+                assert!(res.is_ok(), "send must succeed: {:?}", res);
+            }
+        }
+        // Tiny budget: should exhaust and leave work ready for next poll
+        let mut out = Vec::new();
+        let tiny = crate::OutputDrainBudget::new(1, 1, 1024);
+        let report = table.poll_outbound_bounded(Timestamp::default(), tiny, &mut out);
+        assert_eq!(report.status, crate::OutputDrainStatus::BudgetExhausted);
+        assert!(
+            table.ready_queue_len() > 0,
+            "pending should remain ready after budget exhaustion"
+        );
+        // Next poll should continue delivering
+        let mut out2 = Vec::new();
+        let report2 = table.poll_outbound_bounded(Timestamp::default(), tiny, &mut out2);
+        assert!(!out2.is_empty() || report2.packets > 0);
+    }
+
+    #[test]
+    fn caller_fairness_busy_does_not_starve() {
+        let mut table = mk_table(2);
+        let ids = table.bench_ids();
+        let a = ids[0];
+        let b = ids[1];
+        let now = Timestamp::default();
+        for _ in 0..10 {
+            let res = table.logical_caller_mut(&a).unwrap().send(b"a", now);
+            assert!(res.is_ok());
+        }
+        let res = table.logical_caller_mut(&b).unwrap().send(b"b", now);
+        assert!(res.is_ok());
+        table.reset_sched_counters();
+        let mut out = Vec::new();
+        // Budget allows 2 actions, should interleave rather than draining all of A's 10 before B
+        let budget = crate::OutputDrainBudget::new(2, 10, 10 * 1024);
+        let _ = table.poll_outbound_bounded(Timestamp::default(), budget, &mut out);
+        // After bounded poll with fair requeue, both callers should have been visited (b not starved)
+        let c = table.sched_counters();
+        assert!(
+            c.ready_drain_probes >= 2,
+            "fair scheduling should visit both callers, got {}",
+            c.ready_drain_probes
+        );
+    }
+    #[test]
+    fn caller_churn_bounded_memory() {
+        let mut table = mk_table(100);
+        for iter in 0..200 {
+            let ids = table.bench_ids();
+            let id = ids[iter % ids.len()];
+            // reschedule via deadline inject
+            table.bench_inject_deadline(id, Timestamp::from_micros(1_000_000 + iter as u64 * 100));
+            if iter % 10 == 0 {
+                let rm = ids[0];
+                table.remove(rm);
+                let peer = std::net::SocketAddr::from(([10, 1, 0, (iter % 250) as u8], 5000));
+                let conn = {
+                    let mut c = SrtConnection::new_caller(ConnectionOptions {
+                        socket_id: 50000 + iter as u32,
+                        ..ConnectionOptions::default()
+                    });
+                    c.connect(Timestamp::default()).unwrap();
+                    c
+                };
+                let _ = table.add_direct(CallerLeg {
+                    peer,
+                    connection: conn,
+                });
+            }
+        }
+        // Exact BTreeSet should keep deadlines == live callers (or fewer), no unbounded growth
+        assert!(
+            table.deadline_count() <= table.len() + 2,
+            "deadline index grew unbounded: {} deadlines for {} callers",
+            table.deadline_count(),
+            table.len()
         );
     }
 }

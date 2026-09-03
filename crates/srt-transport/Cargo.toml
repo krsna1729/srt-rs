@@ -52,6 +52,11 @@ name = "admission_hardening"
 harness = false
 required-features = ["bench-internals"]
 
+[[bench]]
+name = "caller_table_scheduling"
+harness = false
+required-features = ["bench-internals"]
+
 [features]
 mio = ["dep:mio"]
 tokio = ["dep:tokio"]
