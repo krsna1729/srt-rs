@@ -1,5 +1,6 @@
 //! Shared helpers for the srt-bench bench-caller/bench-listener binaries.
 
+pub mod classifier;
 pub mod compare;
 pub mod cpu_stats;
 pub mod driver;

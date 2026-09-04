@@ -134,6 +134,25 @@ pub const COLUMNS: &[&str] = &[
     "srt_maxbw_bps",
     "srt_inputbw_bps",
     "srt_oheadbw_pct",
+    "model_policy_rev",
+    "model_class_pre",
+    "model_reasons_pre",
+    "model_source_pps_total",
+    "model_packet_pps",
+    "model_srt_total_bps",
+    "model_udp_ip_bps",
+    "model_nic_wire_bps",
+    "model_retransmission_factor",
+    "model_bdp_packets",
+    "model_required_window_packets",
+    "model_flow_window_headroom_packets",
+    "model_receive_window_headroom_packets",
+    "model_recovery_margin_ms",
+    "model_socket_horizon_recv_s",
+    "model_socket_horizon_send_s",
+    "model_host_utilization",
+    "model_nic_utilization",
+    "model_admission_waves",
     "rep",
     // Identity of the *attempt* that wrote this row, not of the cell.
     // A results file is append-only, so an interrupted run can leave a
@@ -273,6 +292,7 @@ pub const CONFIG_COLUMNS: &[&str] = &[
     "datapath_q_horizon_ms",
     "retry_horizon_ms",
     "secs",
+    "model_policy_rev",
 ];
 /// The dimensions a run was configured with, rendered for the result
 /// file. Kept separate from the measurements so a report can group by any
@@ -373,6 +393,8 @@ pub fn append_result(
         recv_scheduling,
         outbound_retry,
     } = *measurements;
+    let model = crate::classifier::assessment_for_bench_config(cfg)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error.0))?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -478,6 +500,34 @@ pub fn append_result(
             .input_bytes_per_sec
             .map_or(String::new(), |b| (b * 8).to_string()),
         resolved.overhead_percent.to_string(),
+        model.policy_revision.clone(),
+        model.class.name().to_string(),
+        model
+            .reasons
+            .iter()
+            .map(|reason| reason.code())
+            .collect::<Vec<_>>()
+            .join(","),
+        model.derived.source_pps_total.to_string(),
+        model_value(model.derived.host_packet_work_pps),
+        model_value(model.derived.srt_total_bps),
+        model_value(model.derived.udp_ip_bps),
+        model_value(model.derived.nic_wire_bps),
+        model_value(model.derived.retransmission_factor),
+        model_value(model.derived.bdp_packets),
+        model_value(model.derived.required_window_packets),
+        model_value(model.derived.flow_window_headroom_packets),
+        model_value(model.derived.receive_window_headroom_packets),
+        model_value(model.derived.one_repair_margin_ms),
+        model_value(
+            model
+                .derived
+                .effective_receive_socket_buffer_horizon_seconds,
+        ),
+        model_value(model.derived.effective_send_socket_buffer_horizon_seconds),
+        model_value(model.derived.host_pps_utilization),
+        model_value(model.derived.nic_utilization),
+        model.derived.admission_waves.to_string(),
         rep.to_string(),
         cfg.attempt.clone(),
         established.to_string(),
@@ -538,6 +588,14 @@ pub fn append_result(
     debug_assert_eq!(values.len(), COLUMNS.len(), "row/header width mismatch");
     let _ = write!(row, "{}", values.join("\t"));
     writeln!(file, "{row}")
+}
+
+fn model_value<T: std::fmt::Display>(value: crate::model::Availability<T>) -> String {
+    match value {
+        crate::model::Availability::Known(value) => value.to_string(),
+        crate::model::Availability::Unknown => "unknown".to_string(),
+        crate::model::Availability::NotApplicable => "n/a".to_string(),
+    }
 }
 
 /// Read every record from a TSV result file.
@@ -1490,7 +1548,7 @@ fn record_key(record: &Record, cell: &[(&str, Scope, String)], rep: usize) -> Op
 /// A plan in a file rather than a shell loop because a comprehensive
 /// sweep is hundreds of runs over hours: it needs to be reviewable before
 /// it starts, reproducible afterwards, and identical across re-runs.
-fn read_plan(path: &Path) -> std::io::Result<Vec<(String, Vec<String>)>> {
+pub fn read_plan(path: &Path) -> std::io::Result<Vec<(String, Vec<String>)>> {
     let text = std::fs::read_to_string(path)?;
     let mut axes = Vec::new();
     // `[recv]` / `[send]` scope the keys under them to one role, which is

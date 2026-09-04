@@ -1309,6 +1309,7 @@ fn validate(input: &CapacityInput, policy: &ClassifierPolicy) -> Result<(), Mode
     validate_workload(input)?;
     validate_protocol(input)?;
     validate_network(input)?;
+    validate_host(input)?;
     validate_policy(policy)
 }
 
@@ -1380,12 +1381,33 @@ fn validate_network(input: &CapacityInput) -> Result<(), ModelError> {
     Ok(())
 }
 
+fn validate_host(input: &CapacityInput) -> Result<(), ModelError> {
+    if let Availability::Known(capacity) = input.host.host_pps_capacity
+        && !(capacity.is_finite() && capacity > 0.0)
+    {
+        return Err(ModelError(
+            "known host PPS capacity must be finite and positive".to_string(),
+        ));
+    }
+    if let Availability::Known(capacity) = input.host.nic_capacity_bps
+        && capacity == 0
+    {
+        return Err(ModelError(
+            "known NIC capacity must be positive".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_policy(policy: &ClassifierPolicy) -> Result<(), ModelError> {
     if policy.minimum_window_headroom_packets < 0.0
         || policy.minimum_recovery_margin_ms < 0.0
         || policy.minimum_socket_horizon_seconds < 0.0
         || !(0.0..=1.0).contains(&policy.max_host_pps_utilization)
         || !(0.0..=1.0).contains(&policy.max_nic_utilization)
+        || policy
+            .max_control_pps
+            .is_some_and(|value| !(value.is_finite() && value >= 0.0))
     {
         return Err(ModelError(
             "classifier policy thresholds are invalid".to_string(),
