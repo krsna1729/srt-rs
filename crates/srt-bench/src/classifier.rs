@@ -421,13 +421,12 @@ fn host_from_cli(
     let effective_send =
         availability_u64(cli, cell, &["effective-send-buffer", "effective-tx-buffer"])?
             .unwrap_or(Availability::Unknown);
-    let nic =
-        if value(cli, cell, &["nic"]).is_some_and(|value| value == "loopback" || value == "n/a") {
-            Availability::NotApplicable
-        } else {
-            availability_u64(cli, cell, &["nic-capacity-bps", "nic-bps-capacity"])?
-                .unwrap_or(Availability::Unknown)
-        };
+    let nic = match value(cli, cell, &["nic"]) {
+        None | Some("loopback" | "n/a" | "na" | "not-applicable") => Availability::NotApplicable,
+        Some("unknown") => Availability::Unknown,
+        Some(_) => availability_u64(cli, cell, &["nic-capacity-bps", "nic-bps-capacity"])?
+            .unwrap_or(Availability::Unknown),
+    };
     let host_pps = availability_f64(cli, cell, &["host-pps-capacity", "host-pps"])?
         .unwrap_or(Availability::Unknown);
     let workers = value_u64(cli, cell, &["workers"], 1)?;
@@ -892,5 +891,32 @@ mod tests {
         let output = classify(&cli).expect("classification");
         std::fs::remove_file(path).expect("remove plan");
         assert_eq!(output.lines().count(), 5);
+    }
+
+    #[test]
+    fn loopback_preflight_defaults_nic_and_keeps_observations_unknown() {
+        let cli = crate::Cli::parse(&[
+            "classify".to_string(),
+            "--format=tsv".to_string(),
+            "--source-bps=8000000".to_string(),
+        ]);
+        let input = input_from_cli(&cli, &BTreeMap::new()).expect("classification input");
+        assert_eq!(input.host.nic_capacity_bps, Availability::NotApplicable);
+        assert_eq!(
+            input.host.effective_receive_socket_buffer_bytes,
+            Availability::Unknown
+        );
+        assert_eq!(
+            input.host.effective_send_socket_buffer_bytes,
+            Availability::Unknown
+        );
+        assert_eq!(
+            input.network.expected_loss_probability,
+            Availability::Known(0.0)
+        );
+        assert_eq!(
+            input.network.expected_reorder_probability,
+            Availability::Known(0.0)
+        );
     }
 }

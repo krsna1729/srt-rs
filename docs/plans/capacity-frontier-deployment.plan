@@ -4,13 +4,17 @@
 # makes a receiver shortfall attributable to receiver capacity rather than
 # an intentionally under-provisioned load generator.
 #
-# `bitrate` is the SOURCE PAYLOAD rate produced by the application. SRT
-# pacing is configured separately: `srt-bandwidth = input-relative:25`
-# gives that source rate a 25% protocol pacing allowance.
+# `bitrate` is the SOURCE PAYLOAD rate produced by the application. This
+# receiver-attribution plan uses only the unmasked SRT pacing arm:
+# `fixed:100000000` leaves receiver/host capacity visible, whereas
+# `input-relative:25` throttles an 8 Mbit/s source to about 77% and masks it.
+# A 1000 ms source backlog tolerates scheduling jitter but does not fix
+# sustained overload: the measured 8 Mbit/s offer moved only 76.6% to 80.3%
+# when the backlog changed from 250 ms to 1000 ms.
 
 connections         = 30,200,600,1200
 bitrate             = 1000000,8000000
-srt-bandwidth       = input-relative:25
+srt-bandwidth       = fixed:100000000
 ingress             = shared-pool:4
 egress              = per-connection
 encryption          = plain
@@ -21,6 +25,9 @@ sock-buf            = 16m
 bond                = none
 connect-concurrency = 50
 pin                 = off
+link-loss           = 0
+link-reorder        = 0
+source-backlog-ms   = 1000
 
 # Receiver runtime and worker count are the deployment variables.
 [recv]
