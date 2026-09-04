@@ -20,7 +20,8 @@ type CellRepMap<'a> = BTreeMap<String, BTreeMap<String, RepRecordPair<'a>>>;
 #[derive(Clone, Debug, Default)]
 pub struct PairMetrics {
     pub conns: f64,
-    pub bitrate: f64,
+    /// Source payload rate in bits per second (the `source_bps` column).
+    pub source_bps: f64,
     pub secs: f64,
     pub caller_established: f64,
     pub listener_established: f64,
@@ -50,6 +51,15 @@ pub struct PairMetrics {
     pub listener_duplicates: f64,
     pub caller_udp_rcvbuf_err: f64,
     pub listener_udp_rcvbuf_err: f64,
+    /// Payload opportunities the sender's application source had to drop
+    /// because its bounded backlog was full: the transport could not keep
+    /// up with the configured workload. Distinct from `offer_pct`, which
+    /// is a rate, and from protocol loss, which is a wire event.
+    pub source_overflow: f64,
+    /// Worst pending-source backlog any one connection reached.
+    pub source_backlog_hwm: f64,
+    /// The configured bound that high-water mark is measured against.
+    pub source_backlog_cap: f64,
 }
 
 #[inline]
@@ -76,9 +86,9 @@ impl PairMetrics {
         let conns = listener
             .number("conns")
             .or_else(|| caller.number("conns"))?;
-        let bitrate = listener
-            .number("bitrate")
-            .or_else(|| caller.number("bitrate"))?;
+        let source_bps = listener
+            .number("source_bps")
+            .or_else(|| caller.number("source_bps"))?;
         let secs = listener.number("secs").or_else(|| caller.number("secs"))?;
 
         let caller_established = caller.number("established").unwrap_or(0.0);
@@ -89,9 +99,14 @@ impl PairMetrics {
         let sent_pkts = caller.number("core_total").unwrap_or(0.0);
         let recv_pkts = listener.number("core_total").unwrap_or(0.0);
 
-        // Pacing-aware target: SRTO_MAXBW paces on (payload + SRT_HEADER_SIZE) bytes.
-        let paced_packet_size = (PAYLOAD_SIZE + shiguredo_srt::SRT_HEADER_SIZE) as f64;
-        let target_pkts = (conns * (bitrate / 8.0) * secs) / paced_packet_size;
+        // The target is what the APPLICATION SOURCE asked for, so the
+        // denominator is the payload size. It used to be the wire size
+        // (payload + SRT header), which is SRTO_MAXBW's unit -- so "did
+        // the sender offer its load?" was measured against the pacing
+        // ceiling that produced the load, and could not fail. A cell
+        // whose MAXBW cannot carry its source rate now visibly falls
+        // short here, which is the point.
+        let target_pkts = (conns * (source_bps / 8.0) * secs) / PAYLOAD_SIZE as f64;
         let offer_pct = ratio_pct(sent_pkts, target_pkts);
         let good_pct = ratio_pct(recv_pkts, target_pkts);
         let deliv_pct = ratio_pct(recv_pkts, sent_pkts);
@@ -129,10 +144,14 @@ impl PairMetrics {
         let listener_duplicates = listener.number("sec_b").unwrap_or(0.0);
         let caller_udp_rcvbuf_err = caller.number("udp_rcvbuf_err").unwrap_or(0.0);
         let listener_udp_rcvbuf_err = listener.number("udp_rcvbuf_err").unwrap_or(0.0);
+        // Source state is the caller's: only the sender has a workload.
+        let source_overflow = caller.number("src_overflow").unwrap_or(0.0);
+        let source_backlog_hwm = caller.number("src_backlog_hwm").unwrap_or(0.0);
+        let source_backlog_cap = caller.number("src_backlog_cap").unwrap_or(0.0);
 
         Some(Self {
             conns,
-            bitrate,
+            source_bps,
             secs,
             caller_established,
             listener_established,
@@ -162,13 +181,25 @@ impl PairMetrics {
             listener_duplicates,
             caller_udp_rcvbuf_err,
             listener_udp_rcvbuf_err,
+            source_overflow,
+            source_backlog_hwm,
+            source_backlog_cap,
         })
     }
 
     /// Canonical strict per-repetition clean capacity predicate.
+    ///
     /// Requires that all asked-for connections established on both sides,
-    /// zero torn connections, offer and goodput sustained at >=99.0% of nominal pacing rate,
-    /// delivery >=99.9%, and zero UDP receive buffer drop errors on either side.
+    /// zero torn connections, offer and goodput sustained at >=99.0% of
+    /// the **source workload** (not of SRT's own pacing ceiling),
+    /// delivery >=99.9%, zero UDP receive buffer drop errors on either
+    /// side, and no application source backlog overflow.
+    ///
+    /// Note what is deliberately *not* here: a cell whose SRT bandwidth
+    /// policy paces below its source rate is a legitimate diagnostic
+    /// configuration, not an invalid one. It is not rejected for being
+    /// bandwidth-constrained; it simply fails `offer_pct`, which is the
+    /// honest way to say the protocol could not service the workload.
     pub fn is_clean(&self) -> bool {
         self.conns > 0.0
             && self.caller_established == self.conns
@@ -180,6 +211,7 @@ impl PairMetrics {
             && self.deliv_pct >= 99.9
             && self.caller_udp_rcvbuf_err == 0.0
             && self.listener_udp_rcvbuf_err == 0.0
+            && self.source_overflow == 0.0
     }
 }
 
@@ -190,7 +222,8 @@ pub struct CellSummary {
     pub pairs: usize,
     pub incomplete_reps: usize,
     pub conns: f64,
-    pub bitrate: f64,
+    /// Source payload rate in bits per second (the `source_bps` column).
+    pub source_bps: f64,
     pub caller_established: Spread,
     pub listener_established: Spread,
     pub torn_c: Spread,
@@ -232,7 +265,7 @@ fn group_records_by_cell(records: &[Record]) -> CellRepMap<'_> {
 fn compute_cell_summary(key: String, pairs: &[PairMetrics], incomplete_reps: usize) -> CellSummary {
     let n = pairs.len();
     let conns = pairs[0].conns;
-    let bitrate = pairs[0].bitrate;
+    let source_bps = pairs[0].source_bps;
 
     let caller_established = Spread::of(pairs.iter().map(|p| p.caller_established).collect());
     let listener_established = Spread::of(pairs.iter().map(|p| p.listener_established).collect());
@@ -284,7 +317,7 @@ fn compute_cell_summary(key: String, pairs: &[PairMetrics], incomplete_reps: usi
         pairs: n,
         incomplete_reps,
         conns,
-        bitrate,
+        source_bps,
         caller_established,
         listener_established,
         torn_c,
@@ -311,13 +344,13 @@ fn compute_cell_summary(key: String, pairs: &[PairMetrics], incomplete_reps: usi
 
 fn compute_empty_summary(key: String, incomplete_reps: usize, sample: &Record) -> CellSummary {
     let conns = sample.number("conns").unwrap_or(0.0);
-    let bitrate = sample.number("bitrate").unwrap_or(0.0);
+    let source_bps = sample.number("source_bps").unwrap_or(0.0);
     CellSummary {
         key,
         pairs: 0,
         incomplete_reps,
         conns,
-        bitrate,
+        source_bps,
         caller_established: Spread::default(),
         listener_established: Spread::default(),
         torn_c: Spread::default(),
@@ -398,17 +431,17 @@ pub fn extract_key_field<'a>(key: &'a str, target: &str) -> &'a str {
 pub fn format_short_cell_label(key: &str) -> String {
     let runtime = extract_key_field(key, "runtime");
     let conns = extract_key_field(key, "conns");
-    let bitrate = extract_key_field(key, "bitrate");
+    let source_bps = extract_key_field(key, "source_bps");
     let enc = extract_key_field(key, "encryption");
     let ingress = extract_key_field(key, "ingress");
     let loss = extract_key_field(key, "link_loss");
     let reorder = extract_key_field(key, "link_reorder");
     let bond = extract_key_field(key, "bond");
 
-    let br_label = match bitrate.parse::<u64>() {
+    let br_label = match source_bps.parse::<u64>() {
         Ok(b) if b >= 1_000_000 => format!("{}M", b / 1_000_000),
         Ok(b) if b >= 1_000 => format!("{}k", b / 1_000),
-        _ => bitrate.to_string(),
+        _ => source_bps.to_string(),
     };
 
     let mut label = format!("{runtime} {conns}c×{br_label}");
@@ -440,7 +473,7 @@ pub fn calculate_capacity_frontier<'a>(
 
     for s in summaries.values() {
         if s.is_clean {
-            let agg_bps = s.conns * s.bitrate;
+            let agg_bps = s.conns * s.source_bps;
             if agg_bps > max_rate {
                 max_rate = agg_bps;
                 best = Some(s);
@@ -466,11 +499,11 @@ fn format_frontier_label(summary: Option<&CellSummary>) -> String {
     summary
         .map(|s| {
             let payload_ratio = PAYLOAD_SIZE as f64 / (PAYLOAD_SIZE + shiguredo_srt::SRT_HEADER_SIZE) as f64;
-            let achieved_payload_gbps = (s.good_pct.median / 100.0) * (s.conns * s.bitrate / 1e9) * payload_ratio;
+            let achieved_payload_gbps = (s.good_pct.median / 100.0) * (s.conns * s.source_bps / 1e9) * payload_ratio;
             format!(
                 "{} (configured MAXBW: {:.3} Gbit/s, payload: {:.3} Gbit/s, offer: {:.1}%, good: {:.1}%)",
                 format_short_cell_label(&s.key),
-                s.conns * s.bitrate / 1e9,
+                s.conns * s.source_bps / 1e9,
                 achieved_payload_gbps,
                 s.offer_pct.median,
                 s.good_pct.median
@@ -497,13 +530,15 @@ fn render_frontier_markdown(
     .unwrap();
     writeln!(
         out,
-        "Pacing target accounts for 16-byte SRT header overhead: `target = conns × (bitrate ÷ 8) × secs ÷ (1316 + 16)`."
+        "Source target is the application workload, not SRT's pacing ceiling: \
+         `target = conns × (source_bps ÷ 8) × secs ÷ 1316`. SRT's own ceiling is \
+         recorded separately as `srt_maxbw_bps`."
     )
     .unwrap();
     writeln!(out).unwrap();
 
-    let base_maxbw = base_frontier.map(|s| s.conns * s.bitrate).unwrap_or(0.0);
-    let head_maxbw = head_frontier.map(|s| s.conns * s.bitrate).unwrap_or(0.0);
+    let base_maxbw = base_frontier.map(|s| s.conns * s.source_bps).unwrap_or(0.0);
+    let head_maxbw = head_frontier.map(|s| s.conns * s.source_bps).unwrap_or(0.0);
     let delta = delta_pct(base_maxbw, head_maxbw);
 
     let base_label = format_frontier_label(base_frontier);
@@ -810,8 +845,8 @@ pub fn render_table_scorecard(
     writeln!(out, "Head (Post-DSA):     {}", head_path.display()).unwrap();
     writeln!(out).unwrap();
 
-    let base_maxbw = base_frontier.map(|s| s.conns * s.bitrate).unwrap_or(0.0);
-    let head_maxbw = head_frontier.map(|s| s.conns * s.bitrate).unwrap_or(0.0);
+    let base_maxbw = base_frontier.map(|s| s.conns * s.source_bps).unwrap_or(0.0);
+    let head_maxbw = head_frontier.map(|s| s.conns * s.source_bps).unwrap_or(0.0);
     let delta = delta_pct(base_maxbw, head_maxbw);
 
     writeln!(
@@ -935,7 +970,7 @@ mod tests {
     fn make_test_caller(
         rep: &str,
         conns: &str,
-        bitrate: &str,
+        source_bps: &str,
         secs: &str,
         core_total: &str,
         cpu_user: &str,
@@ -970,7 +1005,7 @@ mod tests {
                 ("link_limit".to_string(), "off".to_string()),
                 ("workers".to_string(), "1".to_string()),
                 ("conns".to_string(), conns.to_string()),
-                ("bitrate".to_string(), bitrate.to_string()),
+                ("source_bps".to_string(), source_bps.to_string()),
                 ("secs".to_string(), secs.to_string()),
                 ("rep".to_string(), rep.to_string()),
                 ("established".to_string(), estab.to_string()),
@@ -992,7 +1027,7 @@ mod tests {
     fn make_test_listener(
         rep: &str,
         conns: &str,
-        bitrate: &str,
+        source_bps: &str,
         secs: &str,
         core_total: &str,
         cpu_user: &str,
@@ -1027,7 +1062,7 @@ mod tests {
                 ("link_limit".to_string(), "off".to_string()),
                 ("workers".to_string(), "1".to_string()),
                 ("conns".to_string(), conns.to_string()),
-                ("bitrate".to_string(), bitrate.to_string()),
+                ("source_bps".to_string(), source_bps.to_string()),
                 ("secs".to_string(), secs.to_string()),
                 ("rep".to_string(), rep.to_string()),
                 ("established".to_string(), estab.to_string()),
@@ -1048,11 +1083,11 @@ mod tests {
 
     #[test]
     fn test_format_short_cell_label() {
-        let key = "runtime=mio conns=600 bitrate=1000000 encryption=plain ingress=shared-pool:4 bond=none link_loss=0 link_reorder=0";
+        let key = "runtime=mio conns=600 source_bps=1000000 encryption=plain ingress=shared-pool:4 bond=none link_loss=0 link_reorder=0";
         let label = format_short_cell_label(key);
         assert_eq!(label, "mio 600c×1M shared-pool:4");
 
-        let key_loss = "runtime=tokio conns=1 bitrate=8000000 encryption=256 ingress=per-port bond=none link_loss=0.01 link_reorder=0";
+        let key_loss = "runtime=tokio conns=1 source_bps=8000000 encryption=256 ingress=per-port bond=none link_loss=0.01 link_reorder=0";
         let label_loss = format_short_cell_label(key_loss);
         assert_eq!(label_loss, "tokio 1c×8M 256 loss=0.01");
     }
@@ -1060,12 +1095,13 @@ mod tests {
     #[test]
     fn test_recovery_semantics() {
         // Target paced packets for conns=10, bitrate=1000000 (1M), secs=10:
-        // (10 * (1_000_000 / 8) * 10) / (1316 + 16) = 1250000 / 1332 = 9384.38 -> 9385 pkts
+        // Source target, payload denominator:
+        // (10 * (1_000_000 / 8) * 10) / 1316 = 1_250_000 / 1316 = 9498.5 -> 9499 pkts
         let caller = make_test_caller(
-            "1", "10", "1000000", "10", "9385", "120.0", "80.0", "2048", "42", "7", "0", "10", "0",
+            "1", "10", "1000000", "10", "9499", "120.0", "80.0", "2048", "42", "7", "0", "10", "0",
         );
         let listener = make_test_listener(
-            "1", "10", "1000000", "10", "9385", "150.0", "100.0", "4096", "15", "3", "0", "10", "0",
+            "1", "10", "1000000", "10", "9499", "150.0", "100.0", "4096", "15", "3", "0", "10", "0",
         );
         let m = PairMetrics::compute(&caller, &listener).expect("pair metrics compute");
 
@@ -1081,10 +1117,10 @@ mod tests {
     #[test]
     fn test_role_separated_metrics() {
         let caller = make_test_caller(
-            "1", "10", "1000000", "10", "9385", "120.0", "80.0", "2048", "0", "0", "0", "10", "0",
+            "1", "10", "1000000", "10", "9499", "120.0", "80.0", "2048", "0", "0", "0", "10", "0",
         );
         let listener = make_test_listener(
-            "1", "10", "1000000", "10", "9385", "150.0", "100.0", "4096", "0", "0", "0", "10", "0",
+            "1", "10", "1000000", "10", "9499", "150.0", "100.0", "4096", "0", "0", "0", "10", "0",
         );
         let m = PairMetrics::compute(&caller, &listener).expect("pair metrics compute");
 
@@ -1109,12 +1145,13 @@ mod tests {
 
     #[test]
     fn test_clean_predicate_thresholds() {
-        // Base clean pair: 9385 packets over (10 * 125000 * 10 / 1332 = 9384.4)
+        // Base clean pair: 9499 packets over the source target
+        // (10 * 125000 * 10 / 1316 = 9498.5)
         let c = make_test_caller(
-            "1", "10", "1000000", "10", "9385", "100.0", "100.0", "1000", "0", "0", "0", "10", "0",
+            "1", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "0", "10", "0",
         );
         let l = make_test_listener(
-            "1", "10", "1000000", "10", "9385", "100.0", "100.0", "1000", "0", "0", "0", "10", "0",
+            "1", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "0", "10", "0",
         );
         assert!(PairMetrics::compute(&c, &l).unwrap().is_clean());
 
@@ -1154,14 +1191,14 @@ mod tests {
 
         // 4. UDP receive-buffer drop rejected (listener or caller)
         let l_drop = make_test_listener(
-            "1", "10", "1000000", "10", "9385", "100.0", "100.0", "1000", "0", "0", "0", "10", "5",
+            "1", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "0", "10", "5",
         );
         assert!(
             !PairMetrics::compute(&c, &l_drop).unwrap().is_clean(),
             "listener udp_rcvbuf_err > 0 must be rejected"
         );
         let c_drop = make_test_caller(
-            "1", "10", "1000000", "10", "9385", "100.0", "100.0", "1000", "0", "0", "0", "10", "3",
+            "1", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "0", "10", "3",
         );
         assert!(
             !PairMetrics::compute(&c_drop, &l).unwrap().is_clean(),
@@ -1170,14 +1207,14 @@ mod tests {
 
         // 5. Caller or listener unestablished rejected
         let c_unestab = make_test_caller(
-            "1", "10", "1000000", "10", "9385", "100.0", "100.0", "1000", "0", "0", "0", "9", "0",
+            "1", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "0", "9", "0",
         );
         assert!(
             !PairMetrics::compute(&c_unestab, &l).unwrap().is_clean(),
             "caller_established < conns must be rejected"
         );
         let l_unestab = make_test_listener(
-            "1", "10", "1000000", "10", "9385", "100.0", "100.0", "1000", "0", "0", "0", "9", "0",
+            "1", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "0", "9", "0",
         );
         assert!(
             !PairMetrics::compute(&c, &l_unestab).unwrap().is_clean(),
@@ -1186,14 +1223,14 @@ mod tests {
 
         // 6. Torn connections rejected
         let c_torn = make_test_caller(
-            "1", "10", "1000000", "10", "9385", "100.0", "100.0", "1000", "0", "0", "1", "10", "0",
+            "1", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "1", "10", "0",
         );
         assert!(
             !PairMetrics::compute(&c_torn, &l).unwrap().is_clean(),
             "torn_c > 0 must be rejected"
         );
         let l_torn = make_test_listener(
-            "1", "10", "1000000", "10", "9385", "100.0", "100.0", "1000", "0", "0", "1", "10", "0",
+            "1", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "1", "10", "0",
         );
         assert!(
             !PairMetrics::compute(&c, &l_torn).unwrap().is_clean(),
@@ -1205,44 +1242,44 @@ mod tests {
     fn test_cell_level_all_reps_required_for_clean() {
         let records = vec![
             make_test_caller(
-                "1", "10", "1000000", "10", "9385", "100.0", "100.0", "1000", "0", "0", "0", "10",
+                "1", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "0", "10",
                 "0",
             ),
             make_test_listener(
-                "1", "10", "1000000", "10", "9385", "100.0", "100.0", "1000", "0", "0", "0", "10",
+                "1", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "0", "10",
                 "0",
             ),
             make_test_caller(
-                "2", "10", "1000000", "10", "9385", "100.0", "100.0", "1000", "0", "0", "0", "10",
+                "2", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "0", "10",
                 "0",
             ),
             make_test_listener(
-                "2", "10", "1000000", "10", "9385", "100.0", "100.0", "1000", "0", "0", "0", "10",
+                "2", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "0", "10",
                 "0",
             ),
             make_test_caller(
-                "3", "10", "1000000", "10", "9385", "100.0", "100.0", "1000", "0", "0", "0", "10",
+                "3", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "0", "10",
                 "0",
             ),
             make_test_listener(
-                "3", "10", "1000000", "10", "9385", "100.0", "100.0", "1000", "0", "0", "0", "10",
+                "3", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "0", "10",
                 "0",
             ),
             make_test_caller(
-                "4", "10", "1000000", "10", "9385", "100.0", "100.0", "1000", "0", "0", "0", "10",
+                "4", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "0", "10",
                 "0",
             ),
             make_test_listener(
-                "4", "10", "1000000", "10", "9385", "100.0", "100.0", "1000", "0", "0", "0", "10",
+                "4", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "0", "10",
                 "0",
             ),
             // Rep 5 has 1 UDP drop:
             make_test_caller(
-                "5", "10", "1000000", "10", "9385", "100.0", "100.0", "1000", "0", "0", "0", "10",
+                "5", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "0", "10",
                 "0",
             ),
             make_test_listener(
-                "5", "10", "1000000", "10", "9385", "100.0", "100.0", "1000", "0", "0", "0", "10",
+                "5", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "0", "10",
                 "1",
             ),
         ];
@@ -1261,19 +1298,19 @@ mod tests {
     #[test]
     fn test_pairing_and_config_isolation() {
         let mut r1 = make_test_caller(
-            "1", "10", "1000000", "10", "9385", "100.0", "100.0", "1000", "0", "0", "0", "10", "0",
+            "1", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "0", "10", "0",
         );
         r1.fields.retain(|(k, _)| k != "pin");
         r1.fields.push(("pin".to_string(), "off".to_string()));
 
         let mut r2 = make_test_caller(
-            "1", "10", "1000000", "10", "9385", "100.0", "100.0", "1000", "0", "0", "0", "10", "0",
+            "1", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "0", "10", "0",
         );
         r2.fields.retain(|(k, _)| k != "pin");
         r2.fields.push(("pin".to_string(), "on".to_string()));
 
         let l1 = make_test_listener(
-            "1", "10", "1000000", "10", "9385", "100.0", "100.0", "1000", "0", "0", "0", "10", "0",
+            "1", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "0", "10", "0",
         );
 
         let records = vec![r1, r2, l1];
@@ -1313,10 +1350,10 @@ mod tests {
         let mut summaries = BTreeMap::new();
         // Cell 1: 10c x 1M = 10 Mbps, clean
         let c1 = make_test_caller(
-            "1", "10", "1000000", "10", "9385", "100.0", "100.0", "1000", "0", "0", "0", "10", "0",
+            "1", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "0", "10", "0",
         );
         let l1 = make_test_listener(
-            "1", "10", "1000000", "10", "9385", "100.0", "100.0", "1000", "0", "0", "0", "10", "0",
+            "1", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "0", "10", "0",
         );
         summaries.extend(summarize_cells(&[c1, l1]));
 
@@ -1333,7 +1370,7 @@ mod tests {
 
         let frontier = calculate_capacity_frontier(&summaries).expect("frontier found");
         assert_eq!(
-            frontier.conns * frontier.bitrate,
+            frontier.conns * frontier.source_bps,
             10_000_000.0,
             "Only strict clean cells qualify for capacity frontier"
         );

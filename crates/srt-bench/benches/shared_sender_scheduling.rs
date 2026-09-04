@@ -1,6 +1,6 @@
 use std::hint::black_box;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use srt_bench::{
@@ -16,7 +16,9 @@ fn sender_config(connections: usize, cc: usize) -> srt_bench::BenchConfig {
         port: 9000,
         duration_secs: 60.0,
         latency_ms: 120,
-        bitrate_bps: 1_000_000,
+        source_bitrate_bps: 1_000_000,
+        bandwidth: srt_bench::source::BandwidthPolicy::default(),
+        source_backlog_ms: srt_bench::source::DEFAULT_SOURCE_BACKLOG_MS,
         connections,
         egress: Egress::SharedSocket,
         ingress: Ingress::SharedPool(1),
@@ -327,6 +329,28 @@ fn bench_sched_stats_readout(c: &mut Criterion) {
     group.finish();
 }
 
+/// Prices the constant-space source-clock work added to each payload path.
+fn bench_source_clock(c: &mut Criterion) {
+    let mut group = c.benchmark_group("source_clock");
+    group.throughput(Throughput::Elements(1_000));
+    group.bench_function("tick_and_accept", |b| {
+        b.iter_batched(
+            || srt_bench::source::SourceClock::new(8_000_000, 256),
+            |mut clock| {
+                for micros in 0..1_000 {
+                    clock.tick(Duration::from_micros(micros * 1_316));
+                    if clock.pending() > 0 {
+                        clock.accepted();
+                    }
+                }
+                black_box(clock.stats());
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_handshaking_tick,
@@ -337,6 +361,7 @@ criterion_group!(
     bench_quiescent_scheduler_next_wait,
     bench_admission_throttled,
     bench_sequential_admission,
-    bench_sched_stats_readout
+    bench_sched_stats_readout,
+    bench_source_clock
 );
 criterion_main!(benches);

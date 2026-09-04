@@ -13,7 +13,14 @@ ingress             = per-port,shared-pool:4,reuseport-multi:4,reuseport-single:
 egress              = per-connection
 encryption          = plain,128,192,256
 connections         = 50,200,600,1200
+# `bitrate` is the SOURCE PAYLOAD rate the application produces. SRT's
+# pacing is configured separately and explicitly below: `input-relative:25`
+# sets SRTO_INPUTBW to that source rate with a 25% SRTO_OHEADBW allowance,
+# so the protocol has headroom to carry the workload plus retransmission
+# rather than pacing fractionally below it (which is what the historical
+# `legacy-source-fixed` coupling of the two numbers did).
 bitrate             = 250000,1000000,4000000,8000000
+srt-bandwidth       = input-relative:25
 
 # Baseline controls: these are intentionally fixed for this experiment.
 promotion           = all

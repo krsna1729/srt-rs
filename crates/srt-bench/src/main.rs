@@ -8,7 +8,7 @@
 //!
 //! One run (either role):
 //!   srt-bench runtime=<mio|tokio|smol|monoio|glommio|compio> \
-//!     mode=sender <host> <port> <duration_secs> <latency_ms> [bitrate_bps] [--connections N]
+//!     mode=sender <host> <port> <duration_secs> <latency_ms> [source_bitrate_bps] [--connections N]
 //!   srt-bench runtime=<...> mode=receiver <port> <duration_secs> <latency_ms> [--connections N]
 //!   ... plus --out FILE to append a result row.
 //!

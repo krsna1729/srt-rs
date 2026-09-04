@@ -5,6 +5,7 @@ pub mod cpu_stats;
 pub mod driver;
 pub mod harness;
 pub mod shutdown;
+pub mod source;
 pub mod system;
 pub mod watch;
 
@@ -26,7 +27,11 @@ pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 // --- Shared constants across all bench-caller/bench-listener binaries ---
 
 pub const PAYLOAD_SIZE: usize = 1316;
-pub const DEFAULT_BITRATE_BPS: u64 = 8_000_000;
+/// Default *source payload* rate, in bits per second, per connection.
+///
+/// This is the workload the application offers, not SRT's pacing ceiling
+/// -- see [`crate::source`] for why those are now separate.
+pub const DEFAULT_SOURCE_BITRATE_BPS: u64 = 8_000_000;
 pub const MAX_WAIT: std::time::Duration = std::time::Duration::from_millis(20);
 pub const TAIL_SPIN: std::time::Duration = std::time::Duration::from_micros(300);
 
@@ -40,7 +45,7 @@ pub fn now_ts(start: std::time::Instant) -> shiguredo_srt::Timestamp {
 ///
 /// Flag values are consumed even when they don't start with `--`, so
 /// `--connections 4` never leaks `4` into the positionals (a bug that
-/// silently corrupted `bitrate_bps`/`host` in hand-rolled parsers).
+/// silently corrupted `source_bitrate_bps`/`host` in hand-rolled parsers).
 #[derive(Default)]
 pub struct Cli {
     pub positional: Vec<String>,
@@ -230,7 +235,24 @@ pub struct BenchConfig {
     pub port: u16,
     pub duration_secs: f64,
     pub latency_ms: u16,
-    pub bitrate_bps: u64,
+    /// The **application workload**: how fast each connection's payload
+    /// source produces `PAYLOAD_SIZE` payloads, in bits per second.
+    ///
+    /// Deliberately *not* named `bitrate_bps` any more. That one number
+    /// used to be both the workload rate and `SRTO_MAXBW`, which made
+    /// every "did the sender offer its load?" measurement a tautology.
+    /// The pacing side now lives in [`Self::bandwidth`], and the two move
+    /// independently: a source configured at 8 Mbit/s stays an 8 Mbit/s
+    /// producer whether SRT is told to pace at 4, 8 or 12.
+    pub source_bitrate_bps: u64,
+    /// The **transport configuration**: how this run configures SRT's
+    /// pacing, resolved against `source_bitrate_bps` in exactly one place
+    /// ([`Self::srt_bandwidth`]) so six runtimes cannot drift.
+    pub bandwidth: crate::source::BandwidthPolicy,
+    /// Milliseconds of source the pending-source backlog may hold before
+    /// opportunities are dropped and counted. Bounded by rate, never by
+    /// run duration.
+    pub source_backlog_ms: u64,
     pub connections: usize,
     /// Caller-side UDP socket topology. `PerConnection` gives every SRT
     /// connection its own ephemeral local port. `SharedSocket` drives all
@@ -602,6 +624,36 @@ impl BenchConfig {
             .max(1)
     }
 
+    /// The SRT pacing policy this run configures, resolved once against
+    /// the source payload rate.
+    ///
+    /// The single resolution point for all six runtimes. Six copies of
+    /// `max_bandwidth_bytes_per_sec = bitrate / 8` is exactly how the
+    /// workload rate and the pacing ceiling became the same number.
+    #[must_use]
+    pub fn srt_bandwidth(&self) -> srt_transport::Bandwidth {
+        self.bandwidth.resolve(self.source_bitrate_bps)
+    }
+
+    /// Write this run's pacing policy into raw protocol options.
+    ///
+    /// Applied for both roles: a listener never sends application data,
+    /// so its pacing ceiling is inert, and setting it uniformly keeps the
+    /// six runtimes from each deciding the question differently.
+    pub fn apply_srt_bandwidth(&self, options: &mut shiguredo_srt::ConnectionOptions) {
+        self.srt_bandwidth().apply_to(options);
+    }
+
+    /// A fresh payload source for one connection, ticking at the
+    /// configured source rate with a rate-relative bounded backlog.
+    #[must_use]
+    pub fn source_clock(&self) -> crate::source::SourceClock {
+        crate::source::SourceClock::new(
+            self.source_bitrate_bps,
+            crate::source::backlog_capacity(self.source_bitrate_bps, self.source_backlog_ms),
+        )
+    }
+
     /// Admission must use the same complete connection template as a
     /// per-port listener. In particular, a shared listener otherwise silently
     /// falls back to plaintext when it creates a peer after the handshake.
@@ -653,6 +705,10 @@ pub struct ConnStats {
     pub secondary_b: u64,
     pub rtt_us: u64,
     pub has_stats: bool,
+    /// What this connection's application payload source did, as distinct
+    /// from what the transport carried. A bonded pair reports its one
+    /// source on its first leg only, so aggregation cannot double-count.
+    pub source: crate::source::SourceStats,
 }
 
 // ---------------------------------------------------------------------------
@@ -1159,6 +1215,10 @@ struct SharedSenderSlot {
     phase: SlotPhase,
     caller: Option<srt_transport::LogicalCallerId>,
     stats: Vec<ConnStats>,
+    /// This slot's application payload producer. One per logical stream:
+    /// a bonded pair carries the same source over two legs, so it has one
+    /// source clock, not two.
+    source: crate::source::SourceClock,
     stream_deadline: Option<Instant>,
     physical_legs: usize,
     held_handshake_tokens: u8,
@@ -1260,6 +1320,7 @@ impl SharedSender {
                     phase: SlotPhase::Pending,
                     caller: None,
                     stats: vec![ConnStats::default(), ConnStats::default()],
+                    source: cfg.source_clock(),
                     stream_deadline: None,
                     physical_legs: 2,
                     held_handshake_tokens: 0,
@@ -1276,6 +1337,7 @@ impl SharedSender {
                     phase: SlotPhase::Pending,
                     caller: None,
                     stats: vec![ConnStats::default()],
+                    source: cfg.source_clock(),
                     stream_deadline: None,
                     physical_legs: 1,
                     held_handshake_tokens: 0,
@@ -1763,10 +1825,17 @@ impl SharedSender {
             Some(id) => id,
             None => return,
         };
-        let wait_us = self
+        let pacing_wait_us = self
             .callers
             .logical_caller(&caller_id)
             .map_or(MAX_WAIT.as_micros() as u64, |c| c.time_until_send(now));
+        // Two independent clocks gate the next send: SRT's pacing, and the
+        // application source. With work already pending it is pacing that
+        // has to move; with none, the source does. Waking earlier than
+        // whichever one it is buys nothing on the send path.
+        let wait_us = slot
+            .source
+            .wait_micros(now_instant.duration_since(self.start), pacing_wait_us);
         let send_instant = now_instant + Duration::from_micros(wait_us);
         let deadline_us = send_instant.duration_since(self.start).as_micros() as u64;
         self.remove_deadline(slot_id, AppDeadlineKind::Send);
@@ -1791,20 +1860,38 @@ impl SharedSender {
             self.close_slot(slot_id, now);
             return;
         }
+        // Advance the application source first, then offer it to SRT.
+        // The source's cadence is its own; SRT only decides how much of it
+        // gets through.
+        self.slots[slot_id]
+            .source
+            .tick(now_instant.duration_since(self.start));
         let mut caller = match self.callers.logical_caller_mut(&caller_id) {
             Some(c) => c,
             None => return,
         };
-        if !caller.can_send_with_pacing(now) {
-            self.schedule_send(slot_id, now_instant, now);
-            return;
+        let mut accepted = 0u32;
+        let mut refused = false;
+        while self.slots[slot_id].source.pending() > accepted {
+            if !caller.can_send_with_pacing(now) {
+                refused = true;
+                break;
+            }
+            let Ok(selected_legs) = caller.send(&self.payload, now) else {
+                refused = true;
+                break;
+            };
+            for stats in self.slots[slot_id].stats.iter_mut().take(selected_legs) {
+                stats.data_events = stats.data_events.saturating_add(1);
+            }
+            accepted += 1;
         }
-        let Ok(selected_legs) = caller.send(&self.payload, now) else {
-            self.schedule_send(slot_id, now_instant, now);
-            return;
-        };
-        for stats in self.slots[slot_id].stats.iter_mut().take(selected_legs) {
-            stats.data_events = stats.data_events.saturating_add(1);
+        let source = &mut self.slots[slot_id].source;
+        for _ in 0..accepted {
+            source.accepted();
+        }
+        if refused {
+            source.refused();
         }
         self.schedule_send(slot_id, now_instant, now);
     }
@@ -2031,7 +2118,19 @@ impl SharedSender {
                 self.callers.remove(caller_id);
             }
         }
-        self.slots.into_iter().flat_map(|slot| slot.stats).collect()
+        self.slots
+            .into_iter()
+            .flat_map(|slot| {
+                let source = slot.source.stats();
+                let mut stats = slot.stats;
+                // One source per logical stream: charge it to the first
+                // leg only so a bonded pair is not counted twice.
+                if let Some(first) = stats.first_mut() {
+                    first.source = source;
+                }
+                stats
+            })
+            .collect()
     }
 }
 
@@ -2043,12 +2142,12 @@ fn make_caller_connection(
     let mut options = shiguredo_srt::ConnectionOptions {
         socket_id: cfg.caller_socket_id_for(index),
         tsbpd_delay: cfg.latency_ms,
-        max_bandwidth_bytes_per_sec: Some(cfg.bitrate_bps / 8),
         group_extension: cfg.bond_extension_for(index),
         initial_seq: cfg.bond_initial_seq_for(index),
         stream_id: cfg.bond_stream_id_for(index),
         ..Default::default()
     };
+    cfg.apply_srt_bandwidth(&mut options);
     cfg.encryption.apply_to(&mut options);
     let mut connection = shiguredo_srt::SrtConnection::new_caller(options);
     connection
@@ -2265,6 +2364,11 @@ pub struct Aggregate {
     pub stats_count: u64,
     pub any_connected: bool,
     pub cc_peak: usize,
+    /// Process-wide application source behaviour. Counts sum across
+    /// connections; the backlog high-water mark is the worst any single
+    /// connection reached, since summing high-water marks would report a
+    /// backlog nothing ever held.
+    pub source: crate::source::SourceStats,
 }
 
 impl Aggregate {
@@ -2280,12 +2384,18 @@ impl Aggregate {
             stats_count: 0,
             any_connected: false,
             cc_peak: 0,
+            source: crate::source::SourceStats::default(),
         }
     }
 
     pub fn add(&mut self, s: ConnStats) {
         self.data_events += s.data_events;
         self.torn_down += u64::from(s.torn_down);
+        self.source.generated += s.source.generated;
+        self.source.accepted += s.source.accepted;
+        self.source.backpressure += s.source.backpressure;
+        self.source.overflow += s.source.overflow;
+        self.source.backlog_hwm = self.source.backlog_hwm.max(s.source.backlog_hwm);
         if s.connected {
             self.any_connected = true;
         }
@@ -2368,15 +2478,18 @@ impl Aggregate {
                 path,
                 c,
                 c.rep,
-                self.stats_count,
-                self.torn_down,
-                self.data_events,
-                self.core_total,
-                self.secondary_a,
-                self.secondary_b,
-                rtt,
-                elapsed_s,
-                self.cc_peak,
+                &crate::harness::RunMeasurements {
+                    established: self.stats_count,
+                    torn_down: self.torn_down,
+                    pkt_sent: self.data_events,
+                    core_total: self.core_total,
+                    sec_a: self.secondary_a,
+                    sec_b: self.secondary_b,
+                    rtt_ms: rtt,
+                    elapsed_s,
+                    cc_peak: self.cc_peak,
+                    source: self.source,
+                },
             )
         {
             eprintln!(
@@ -2391,7 +2504,9 @@ fn usage() -> ! {
     eprintln!(
         "usage: srt-bench runtime=<mio|tokio|smol|monoio|glommio|compio> \
          mode=<sender|receiver> <host?> <port> <duration_secs> <latency_ms> \
-         [bitrate_bps] [--connections N] \
+         [source_bitrate_bps] [--connections N] \
+         [--srt-bandwidth protocol-default|legacy-source-fixed|fixed:BPS|input-relative:PCT] \
+         [--source-backlog-ms MS] \
          [--ingress per-port|shared-pool=K|reuseport-multi=K|reuseport-single=W] \
          [--egress per-connection|shared-socket] \
          [--encryption plain|128|192|256] \
@@ -2475,12 +2590,36 @@ fn parse_required_positionals(cli: &Cli, mode: Mode) -> (String, u16, f64, u16, 
     let port = parse_positional(cli, offset);
     let duration_secs = parse_positional(cli, offset + 1);
     let latency_ms = parse_positional(cli, offset + 2);
-    let bitrate_bps = cli
+    let source_bitrate_bps = cli
         .positional
         .get(offset + 3)
         .and_then(|value| value.parse().ok())
-        .unwrap_or(DEFAULT_BITRATE_BPS);
-    (host, port, duration_secs, latency_ms, bitrate_bps)
+        .unwrap_or(DEFAULT_SOURCE_BITRATE_BPS);
+    (host, port, duration_secs, latency_ms, source_bitrate_bps)
+}
+
+/// `--srt-bandwidth <mode>`: how SRT's pacing is configured, as a policy
+/// over the source payload rate rather than a second copy of MAXBW.
+///
+/// Defaults to `legacy-source-fixed`, which is byte-for-byte what
+/// srt-bench always did, so an unchanged command line keeps producing
+/// unchanged numbers. Permanent plans should state the policy explicitly:
+/// a benchmark whose pacing configuration is invisible is exactly the
+/// problem this axis exists to fix.
+fn parse_bandwidth_policy(cli: &Cli) -> crate::source::BandwidthPolicy {
+    match cli.flags.get("srt-bandwidth").map(String::as_str) {
+        None | Some("") => crate::source::BandwidthPolicy::default(),
+        Some(value) => match crate::source::BandwidthPolicy::parse(value) {
+            Some(policy) => policy,
+            None => {
+                eprintln!(
+                    "error: unknown --srt-bandwidth '{value}' (want protocol-default|\
+                     legacy-source-fixed|fixed:<bps>|input-relative:<5..=100>)"
+                );
+                usage()
+            }
+        },
+    }
 }
 
 fn parse_ingress(cli: &Cli) -> Ingress {
@@ -2680,7 +2819,7 @@ pub fn bench_config_from_args() -> BenchConfig {
     let runtime = parse_runtime(&cli);
     let mode = parse_mode(&cli);
     let encryption = parse_encryption(&cli);
-    let (host, port, duration_secs, latency_ms, bitrate_bps) =
+    let (host, port, duration_secs, latency_ms, source_bitrate_bps) =
         parse_required_positionals(&cli, mode);
     let ingress = parse_ingress(&cli);
     let egress = parse_egress(&cli);
@@ -2713,7 +2852,9 @@ pub fn bench_config_from_args() -> BenchConfig {
         port,
         duration_secs,
         latency_ms,
-        bitrate_bps,
+        source_bitrate_bps,
+        bandwidth: parse_bandwidth_policy(&cli),
+        source_backlog_ms: cli.flag_or("source-backlog-ms", source::DEFAULT_SOURCE_BACKLOG_MS),
         connections: cli.connections(),
         egress,
         ingress,
@@ -2794,7 +2935,9 @@ mod tests {
             port: 0,
             duration_secs: 1.0,
             latency_ms: 120,
-            bitrate_bps: 1_000_000,
+            source_bitrate_bps: 1_000_000,
+            bandwidth: crate::source::BandwidthPolicy::default(),
+            source_backlog_ms: crate::source::DEFAULT_SOURCE_BACKLOG_MS,
             connections: 1,
             egress: Egress::PerConnection,
             ingress: Ingress::SharedPool(4),

@@ -102,7 +102,17 @@ pub const COLUMNS: &[&str] = &[
     "connect_cc",
     "cc_peak",
     "bond",
-    "bitrate",
+    // The application workload rate, in bits per second. Replaces the old
+    // `bitrate` column, which was simultaneously this and SRTO_MAXBW; the
+    // rename is deliberate, so a row can never be read as either one.
+    "source_bps",
+    // The pacing policy, and what it resolved to. Recorded rather than
+    // recomputed, so no downstream tool has to re-derive MAXBW from the
+    // source rate -- which is how the two became the same number.
+    "srt_bw_mode",
+    "srt_maxbw_bps",
+    "srt_inputbw_bps",
+    "srt_oheadbw_pct",
     "rep",
     // Identity of the *attempt* that wrote this row, not of the cell.
     // A results file is append-only, so an interrupted run can leave a
@@ -127,6 +137,15 @@ pub const COLUMNS: &[&str] = &[
     "udp_rcvbuf_err",
     "udp_in_err",
     "udp_no_ports",
+    // Application source behaviour, distinct from anything the protocol
+    // did. `src_backlog_cap` is the configured bound; a clean cell needs
+    // `src_overflow` zero.
+    "src_generated",
+    "src_accepted",
+    "src_backpressure",
+    "src_backlog_cap",
+    "src_backlog_hwm",
+    "src_overflow",
 ];
 
 /// Configuration columns that define a unique benchmark workload/cell.
@@ -161,7 +180,8 @@ pub const CONFIG_COLUMNS: &[&str] = &[
     "conns",
     "connect_cc",
     "bond",
-    "bitrate",
+    "source_bps",
+    "srt_bw_mode",
     "secs",
 ];
 
@@ -208,29 +228,52 @@ impl Record {
     }
 }
 
+/// Everything one process measured about its own run.
+///
+/// Grouped rather than passed as a dozen positional arguments: the row
+/// keeps growing as the harness learns to record more of its own state,
+/// and a positional list means every call site gains another bare `0`
+/// each time -- which is exactly how a counter ends up silently written
+/// into the wrong column.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RunMeasurements {
+    pub established: u64,
+    pub torn_down: u64,
+    pub pkt_sent: u64,
+    pub core_total: u64,
+    pub sec_a: u64,
+    pub sec_b: u64,
+    pub rtt_ms: f64,
+    pub elapsed_s: f64,
+    pub cc_peak: usize,
+    /// What the application source offered, as opposed to what the
+    /// protocol carried.
+    pub source: crate::source::SourceStats,
+}
+
 /// Append one run's result, writing the header first if the file is new.
 ///
 /// Appending (rather than truncating) is deliberate: a sweep is many
 /// processes writing to one file, and each is a separate `srt-bench`
 /// invocation with no knowledge of its siblings.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the append-only TSV row keeps each recorded benchmark field explicit"
-)]
 pub fn append_result(
     path: &Path,
     cfg: &BenchConfig,
     rep: usize,
-    established: u64,
-    torn_down: u64,
-    pkt_sent: u64,
-    core_total: u64,
-    sec_a: u64,
-    sec_b: u64,
-    rtt_ms: f64,
-    elapsed_s: f64,
-    cc_peak: usize,
+    measurements: &RunMeasurements,
 ) -> std::io::Result<()> {
+    let RunMeasurements {
+        established,
+        torn_down,
+        pkt_sent,
+        core_total,
+        sec_a,
+        sec_b,
+        rtt_ms,
+        elapsed_s,
+        cc_peak,
+        source,
+    } = *measurements;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -248,6 +291,10 @@ pub fn append_result(
     // distinguishes "the protocol lost it" from "the kernel dropped it
     // before the protocol saw it".
     let udp = crate::cpu_stats::udp_counters().since(crate::cpu_stats::udp_baseline());
+    // Record what the pacing policy resolved to rather than making a
+    // reader re-derive it. MAXBW/INPUTBW are protocol bytes/s; results
+    // state bits/s so they sit in the same units as `source_bps`.
+    let resolved = cfg.srt_bandwidth().resolve();
     let mut row = String::new();
     let values: Vec<String> = vec![
         cfg.runtime.name().to_string(),
@@ -289,7 +336,15 @@ pub fn append_result(
         cfg.connect_concurrency.to_string(),
         cc_peak.to_string(),
         describe_bond(cfg),
-        cfg.bitrate_bps.to_string(),
+        cfg.source_bitrate_bps.to_string(),
+        cfg.bandwidth.name(),
+        resolved
+            .max_bytes_per_sec
+            .map_or(String::new(), |b| (b * 8).to_string()),
+        resolved
+            .input_bytes_per_sec
+            .map_or(String::new(), |b| (b * 8).to_string()),
+        resolved.overhead_percent.to_string(),
         rep.to_string(),
         cfg.attempt.clone(),
         established.to_string(),
@@ -307,6 +362,12 @@ pub fn append_result(
         udp.rcvbuf_errors.to_string(),
         udp.in_errors.to_string(),
         udp.no_ports.to_string(),
+        source.generated.to_string(),
+        source.accepted.to_string(),
+        source.backpressure.to_string(),
+        crate::source::backlog_capacity(cfg.source_bitrate_bps, cfg.source_backlog_ms).to_string(),
+        source.backlog_hwm.to_string(),
+        source.overflow.to_string(),
     ];
     debug_assert_eq!(values.len(), COLUMNS.len(), "row/header width mismatch");
     let _ = write!(row, "{}", values.join("\t"));
@@ -325,14 +386,31 @@ pub fn read_results(path: &Path) -> std::io::Result<Vec<Record>> {
     };
     let keys: Vec<&str> = header.split('\t').collect();
     if keys != COLUMNS {
+        // A pre-source-rate file is rejected by name rather than as a
+        // generic column-count mismatch. Its `bitrate` column was both the
+        // workload rate and SRTO_MAXBW, so there is no way to read it as
+        // either one -- and silently reinterpreting it as a source rate
+        // would attach new semantics to old measurements.
+        let legacy = keys.contains(&"bitrate") && !keys.contains(&"source_bps");
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!(
-                "{}: unexpected TSV header (expected {} columns, got {})",
-                path.display(),
-                COLUMNS.len(),
-                keys.len()
-            ),
+            if legacy {
+                format!(
+                    "{}: legacy result schema (has `bitrate`, which meant both the source \
+                     payload rate and SRTO_MAXBW). Those are now separate columns \
+                     (`source_bps`, `srt_bw_mode`, `srt_maxbw_bps`), and an old row cannot \
+                     be reinterpreted as either. Re-run the sweep, or compare old files \
+                     with an older srt-bench.",
+                    path.display(),
+                )
+            } else {
+                format!(
+                    "{}: unexpected TSV header (expected {} columns, got {})",
+                    path.display(),
+                    COLUMNS.len(),
+                    keys.len()
+                )
+            },
         ));
     }
     let mut records = Vec::new();
@@ -517,14 +595,21 @@ fn report_median(records: &[&Record], column: &str) -> f64 {
     )
 }
 
-fn report_target_packets(record: &Record) -> Option<f64> {
-    let (connections, bitrate, seconds) = (
+/// How many payload packets the *application source* asked for.
+///
+/// The denominator is `PAYLOAD_SIZE`, not `PAYLOAD_SIZE +
+/// SRT_HEADER_SIZE`: this counts what the workload offered, and the
+/// workload does not produce SRT headers. Using the wire size here is
+/// what made "offer" a measurement of SRT's own pacing ceiling rather
+/// than of whether the configured load was actually produced. SRT's
+/// pacing ceiling is a separate quantity, recorded in `srt_maxbw_bps`.
+pub fn source_target_packets(record: &Record) -> Option<f64> {
+    let (connections, source_bps, seconds) = (
         record.number("conns")?,
-        record.number("bitrate")?,
+        record.number("source_bps")?,
         record.number("secs")?,
     );
-    let paced_packet_size = (crate::PAYLOAD_SIZE + shiguredo_srt::SRT_HEADER_SIZE) as f64;
-    let packets = connections * (bitrate / 8.0) * seconds / paced_packet_size;
+    let packets = connections * (source_bps / 8.0) * seconds / crate::PAYLOAD_SIZE as f64;
     (packets > 0.0).then_some(packets)
 }
 
@@ -562,7 +647,7 @@ fn report_group_row(key: &str, cells: &[&Record]) -> Option<Vec<String>> {
     let target_pkts = median(
         callers
             .iter()
-            .filter_map(|record| report_target_packets(record))
+            .filter_map(|record| source_target_packets(record))
             .collect(),
     );
     let pct = |value: f64| {
@@ -1144,7 +1229,8 @@ fn recorded_column(axis: &str) -> Option<&'static str> {
         "connections" => "conns",
         "connect-concurrency" => "connect_cc",
         "bond" => "bond",
-        "bitrate" => "bitrate",
+        "bitrate" => "source_bps",
+        "srt-bandwidth" => "srt_bw_mode",
         "pin" => "pin",
         _ => return None,
     })
@@ -1289,6 +1375,7 @@ const CANONICAL_AXIS_NAMES: &[(&str, &str)] = &[
     ("connect-concurrency", "connect-concurrency"),
     ("bond", "bond"),
     ("bitrate", "bitrate"),
+    ("srt-bandwidth", "srt-bandwidth"),
     ("link-delay", "link-delay"),
     ("link-jitter", "link-jitter"),
     ("link-loss", "link-loss"),
@@ -1522,7 +1609,12 @@ fn resolve_matrix_axes(cli: &crate::Cli) -> std::io::Result<MatrixAxisConfig> {
         axis("connections", "connections", "25"),
         axis("connect-concurrency", "connect-concurrency", "1"),
         axis("bond", "bond", "none"),
+        // The application workload rate...
         axis("bitrate", "bitrate", "8000000"),
+        // ...and, separately, how SRT is told to pace it. Defaults to the
+        // historical coupling so an unchanged command line keeps producing
+        // unchanged numbers; permanent plans state it explicitly.
+        axis("srt-bandwidth", "srt-bandwidth", "legacy-source-fixed"),
     ]);
 
     let unused: Vec<&str> = plan
@@ -1699,7 +1791,10 @@ struct MatrixCellConfig {
     send_ingress: String,
     recv_runtime: String,
     send_runtime: String,
-    bitrate: String,
+    /// The source payload rate, passed positionally to both roles. Not
+    /// SRT's pacing ceiling -- that travels as the `--srt-bandwidth` flag
+    /// like any other axis.
+    source_bitrate: String,
     ports_needed: usize,
 }
 
@@ -1730,7 +1825,7 @@ fn matrix_cell_config(cell: &Cell<'_>) -> MatrixCellConfig {
     let connections = matrix_cell_value(cell, "connections")
         .and_then(|value| value.parse().ok())
         .unwrap_or(1);
-    let bitrate = matrix_cell_value(cell, "bitrate").unwrap_or_else(|| "8000000".into());
+    let source_bitrate = matrix_cell_value(cell, "bitrate").unwrap_or_else(|| "8000000".into());
     // per-port needs one port per connection; the pooled and reuseport
     // strategies need at most K. Ask for the worst case this cell could use.
     let ports_needed = if recv_ingress == "per-port" {
@@ -1747,7 +1842,7 @@ fn matrix_cell_config(cell: &Cell<'_>) -> MatrixCellConfig {
         send_ingress,
         recv_runtime,
         send_runtime,
-        bitrate,
+        source_bitrate,
         ports_needed,
     }
 }
@@ -2014,9 +2109,9 @@ fn run_matrix_processes(
     .arg(latency.to_string())
     .env("SRT_BENCH_CHILD", "1")
     // The receiver ignores this functionally, but both rows
-    // must record the same configured bitrate or a report
+    // must record the same configured source rate or a report
     // grouping on it would split the pair and lose delivery%.
-    .arg(&config.bitrate)
+    .arg(&config.source_bitrate)
     .args(&recv_argv)
     .arg(format!("--rep={rep}"))
     .arg(format!("--attempt={attempt}"))
@@ -2043,7 +2138,7 @@ fn run_matrix_processes(
     .arg(port.to_string())
     .arg(secs.to_string())
     .arg(latency.to_string())
-    .arg(&config.bitrate)
+    .arg(&config.source_bitrate)
     .env("SRT_BENCH_CHILD", "1")
     .args(&send_argv)
     .arg(format!("--rep={rep}"))
@@ -3420,7 +3515,7 @@ mod matrix_filter_tests {
         assert_eq!(config.send_ingress, "per-port");
         assert_eq!(config.recv_runtime, "tokio");
         assert_eq!(config.send_runtime, "mio");
-        assert_eq!(config.bitrate, "1000000");
+        assert_eq!(config.source_bitrate, "1000000");
         assert_eq!(config.ports_needed, 4);
 
         assert_eq!(
@@ -3567,7 +3662,7 @@ mod report_tests {
             ("role", role),
             ("rep", rep),
             ("conns", "400"),
-            ("bitrate", "8000000"),
+            ("source_bps", "8000000"),
             ("secs", "10"),
             ("established", "400"),
             ("core_total", sent),
@@ -3619,8 +3714,9 @@ mod report_tests {
         ];
         let out = report(&rows, &["runtime".to_string()]);
         assert_ne!(field(&out, "offer%"), "0.0", "floored at zero:\n{out}");
-        // 2029411 / (400 * 1e6 * 10 / (1316 + 16)) = 67.6%
-        assert_eq!(field(&out, "offer%"), "67.6", "got:\n{out}");
+        // Against the SOURCE target (payload denominator, not wire):
+        // 2029411 / (400 * (8e6/8) * 10 / 1316) = 66.8%
+        assert_eq!(field(&out, "offer%"), "66.8", "got:\n{out}");
     }
 
     /// A cell says `link-delay=off`; the process records that as an empty

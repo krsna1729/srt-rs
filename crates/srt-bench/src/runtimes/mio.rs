@@ -119,6 +119,9 @@ struct Driver {
     /// -- a deadlock, not just a slowdown.
     started_at: Instant,
     permit: Option<crate::HandshakePermit>,
+    /// This connection's application payload producer, ticking on its own
+    /// clock rather than on SRT's pacing.
+    source: crate::source::SourceClock,
 }
 
 /// Create connection `i`'s socket and protocol state and register it with
@@ -160,12 +163,12 @@ fn spawn_driver(
             std::process::id()
         },
         tsbpd_delay: cfg.latency_ms,
-        max_bandwidth_bytes_per_sec: match cfg.mode {
-            crate::Mode::Sender => Some(cfg.bitrate_bps / 8),
-            crate::Mode::Receiver => None,
-        },
         ..Default::default()
     };
+    // One resolution point for every runtime: the pacing policy comes
+    // from the config, not from a local `bitrate / 8` that would make the
+    // workload rate and the pacing ceiling the same number again.
+    cfg.apply_srt_bandwidth(&mut options);
     cfg.encryption.apply_to(&mut options);
     let conn = match cfg.mode {
         crate::Mode::Sender => {
@@ -188,6 +191,7 @@ fn spawn_driver(
         poisoned: refused,
         started_at: Instant::now(),
         permit,
+        source: cfg.source_clock(),
     }
 }
 
@@ -421,10 +425,16 @@ fn next_poll_wait(cfg: &BenchConfig, drivers: &[Driver], start: Instant) -> Dura
     // Senders know exactly when their next paced packet is due; receivers
     // just ride the tick (ACK timer is 10ms).
     let t = crate::now_ts(start);
+    let elapsed = start.elapsed();
     let min_wait = drivers
         .iter()
         .filter(|driver| driver.connected)
-        .map(|driver| Duration::from_micros(driver.conn.conn.time_until_send(t)).min(MAX_POLL_WAIT))
+        .map(|driver| {
+            // Whichever of the two clocks is binding: SRT's pacing when
+            // source work is already pending, the source itself when not.
+            let pacing = driver.conn.conn.time_until_send(t);
+            Duration::from_micros(driver.source.wait_micros(elapsed, pacing)).min(MAX_POLL_WAIT)
+        })
         .min()
         .unwrap_or(MAX_POLL_WAIT);
     TIMER_TICK.min(min_wait)
@@ -587,17 +597,24 @@ fn send_due_payload(cfg: &BenchConfig, driver: &mut Driver, payload: &[u8], star
         return;
     }
     let t = crate::now_ts(start);
-    loop {
-        if !driver.conn.conn.can_send_with_pacing(t) {
-            break;
-        }
-        if driver.conn.conn.send(payload, t).is_err() {
+    // The application source decides how much payload exists; SRT decides
+    // how much of it is accepted. Looping "while SRT allows" made those
+    // the same question.
+    driver.source.tick(start.elapsed());
+    let mut accepted = 0;
+    while driver.source.pending() > accepted {
+        if !driver.conn.conn.can_send_with_pacing(t) || driver.conn.conn.send(payload, t).is_err() {
+            driver.source.refused();
             break;
         }
         driver.data_events += 1;
+        accepted += 1;
         if driver.conn.drain_outputs(t) {
             driver.poisoned = true;
         }
+    }
+    for _ in 0..accepted {
+        driver.source.accepted();
     }
 }
 
@@ -622,6 +639,7 @@ fn driver_stats(cfg: &BenchConfig, driver: Driver) -> ConnStats {
         connected: driver.connected,
         torn_down: driver.torn_down,
         data_events: driver.data_events,
+        source: driver.source.stats(),
         ..Default::default()
     };
     match cfg.mode {
