@@ -17,11 +17,43 @@ instead of a hunch.
 ### Configuration (identical on both rows)
 
 `runtime encryption ingress promotion cookie batch recv_rounds
-would_block_policy sock_buf cpus pin link_* workers recv_* send_* conns
-connect_cc bond source_bps srt_bw_mode rep secs` — the axes the cell
-was run at. `encryption` is `plain`, `128`, `192`, or `256`. `secs` is the
-stream length both roles agree on; it is not
-`elapsed_s` (see below).
+would_block_policy sock_buf_requested_bytes sock_*_effective_*_bytes cpus pin
+link_* workers recv_* send_* conns
+logical_streams source_streams connect_cc bond source_bps srt_bw_mode
+source_backlog_ms datapath_q_horizon_ms retry_horizon_ms rep secs` — the axes
+the cell was run at. `cpus` is the role's effective affinity mask;
+`recv_cpus` / `send_cpus` preserve the requested split-role placement on both
+rows. `encryption`
+is `plain`, `128`, `192`, or `256`. `secs` is the stream length both roles
+agree on; it is not `elapsed_s` (see below).
+
+**`source_bps` is the application workload, not SRT's pacing ceiling.**
+They used to be one column called `bitrate`, and because the sender had no
+clock of its own — it pushed payload whenever `SRTO_MAXBW` pacing allowed
+— "did the sender offer its configured load?" was a question about the
+ceiling that produced the load, and could not fail. The two are now
+separate: `source_bps` is the payload rate each source produces, and
+`srt_bw_mode` / `srt_maxbw_bps` / `srt_inputbw_bps` / `srt_oheadbw_pct`
+record the pacing policy and what it resolved to. A cell with an 8 Mbit/s
+source and a 4 Mbit/s ceiling is a legitimate diagnostic configuration; it
+shows up as roughly 50% `offer%`, not as a quietly halved target.
+
+**Three cardinalities, not one.** `conns` is *physical* connections,
+`logical_streams` is what a group-aware listener admits, and
+`source_streams` is how many independent payload producers the sender ran.
+They are equal unless the cell is bonded, where a two-leg group is two
+physical connections carrying one stream from one source. Rates are
+computed against `source_streams`; caller establishment is measured
+against `conns` and listener establishment against `logical_streams`.
+
+A result file written before this split is rejected by name rather than
+silently reinterpreted: its `bitrate` column cannot be read as either
+quantity.
+
+`sock_buf_requested_bytes` is likewise distinct from the effective receive
+and send ranges the kernel granted. The min/max columns are scoped to all
+sockets created by that row's process; a range exposes non-uniform grants
+instead of silently selecting one socket.
 
 ### What actually happened, protocol level
 
@@ -34,6 +66,32 @@ stream length both roles agree on; it is not
 | `sec_b` | packets in loss list (caller) / duplicates (listener) | role-dependent |
 | `rtt_ms` | round-trip time as measured by the listener's ACKs | listener only; the caller's is usually 0 (RTT is never wired into the caller path) |
 
+### The application source, not the protocol
+
+Only the caller row carries these; a listener has no workload to produce.
+
+| column | meaning |
+|---|---|
+| `src_generated` | payload opportunities the source clock produced, on its own cadence |
+| `src_accepted` | opportunities SRT took |
+| `src_refusal_polls` | send attempts that found SRT unwilling. **Poll-rate dependent** — a runtime that wakes more often reports more of these for identical backpressure, so it is a diagnostic, not a cross-runtime metric |
+| `src_blocked_streaks` | contiguous episodes of backpressure, one per episode however long. Poll-rate independent, so this is the one to compare across runtimes |
+| `source_backlog_ms` / `src_backlog_cap` | the configured backlog policy, and the packet capacity it resolved to at this source rate |
+| `src_backlog_hwm` | the deepest any one connection's pending source got |
+| `src_overflow` | opportunities dropped because the backlog was full |
+
+The backlog is bounded by *rate*, never by run duration, so a longer
+benchmark cannot hide a growing backlog: a source the transport cannot
+service overflows within a second or two and says so. **A clean cell
+requires `src_overflow == 0`**, which is what makes "the sender offered
+its load" a claim that can fail.
+
+`src_backlog_hwm` well below `src_backlog_cap` with zero overflow is a
+source being serviced comfortably. A high-water mark pinned at capacity
+with overflow climbing is the transport failing to carry the configured
+workload — cross-reference `srt_maxbw_bps` before blaming the runtime,
+since a pacing ceiling below the source rate produces exactly this.
+
 ### Kernel, not protocol
 
 | column | meaning |
@@ -42,21 +100,32 @@ stream length both roles agree on; it is not
 | `udp_in_err` | datagrams dropped for any other kernel reason (bad checksum, etc.) |
 | `udp_no_ports` | datagrams arriving at a port nobody was listening on |
 
-These come from `/proc/net/snmp`, delta'd against a baseline taken before
-any socket exists, so they are per-process for that run's lifetime — not
-host-wide. **This is the one thing that distinguishes "the protocol lost
-it" from "the kernel threw it away before the protocol ever saw it."** A
+These come from host-wide `/proc/net/snmp` counters, delta'd over each role's
+process lifetime. On an isolated benchmark host that window attributes the
+drops to the cell; unrelated UDP traffic is therefore a host-validity concern.
+**This is the one thing that distinguishes "the protocol lost it" from "the
+kernel threw it away before the protocol ever saw it."** A
 cell with heavy loss and `sec_a = 0` on the listener is not a mystery:
 check `udp_rcvbuf_err` first. That single check found the actual cause of
 what had been recorded as an unexplained ~50% loss with no retransmits —
 1.27M receive-queue overflows, invisible anywhere else in the row.
 
 `recv_packets`, `recv_syscalls`, and `datagrams_per_syscall` describe the
-Tokio shared-pool receive service. `timer_late_p50_us` through
-`timer_late_max_us` are fixed-histogram maintenance-tick lateness estimates.
-`retry_cap`, `retry_hwm`, `would_block`, `retry_overflow`, and `local_dropped`
-describe benchmark-owned shared-socket outbound work; a clean pair requires
-zero retry overflow and local drops.
+Tokio shared-pool receive service.
+
+`timer_late_p50_bucket_us` through `timer_late_p99_bucket_us` come from a
+fixed power-of-two histogram, so what they report is the **upper edge of
+the bucket** the percentile falls in — not the percentile itself, hence
+the name — clamped to `timer_late_max_us`. Read them as upper bounds. (An
+earlier version left them unclamped, which produced a "p99" larger than
+the largest lateness actually measured.)
+
+`retry_horizon_ms`, `retry_count`, `retry_cap_per_queue`,
+`retry_total_cap`, `retry_peak_depth_max`, `would_block`,
+`retry_overflow`, and `local_dropped` describe benchmark-owned outbound
+work the harness is holding on to. `local_dropped` is the **total**
+datagrams dropped locally; `retry_overflow` is one *reason* inside that
+total, so never add the two. A clean pair requires `local_dropped = 0`.
 
 ### Resource cost
 
@@ -76,7 +145,7 @@ what you're diagnosing, not the first one that looks plausible.
 
 | column | formula | question it answers |
 |---|---|---|
-| `offer%` | caller `core_total` ÷ target packet count | **Did the sender keep up with the configured rate?** Target is `conns × (bitrate ÷ 8) × secs ÷ (PAYLOAD_SIZE + SRT_HEADER_SIZE)` (1316B payload + 16B header, matching `SRTO_MAXBW` pacing semantics). Below 100%: the load generator itself is the constraint — add `--workers`, or check for a stuck deadline. |
+| `offer%` | caller `core_total` ÷ source target packets | **Did the sender offer the configured workload?** Target is `source_streams × (source_bps ÷ 8) × secs ÷ PAYLOAD_SIZE` — payload bytes only, because the *application* does not produce SRT headers. (It used to divide by `PAYLOAD_SIZE + SRT_HEADER_SIZE`, `SRTO_MAXBW`'s wire unit, which measured the pacing ceiling against itself.) Below 100% means either the load generator is the constraint — add `--workers`, or check for a stuck deadline — or the SRT bandwidth policy cannot carry the source rate; `srt_maxbw_bps` and `src_blocked_streaks` tell you which. |
 | `good%` | listener `core_total` ÷ target | **Did the receiver end up with the full stream, in absolute terms?** Ignores what the sender actually offered — useful for "did we hit the target rate" but conflates sender and listener shortfalls if read alone. |
 | `deliv%` | listener `core_total` ÷ caller `core_total` | **Of what was actually sent, how much arrived?** This is the transport's own delivery ratio. High `deliv%` with low `offer%` means the sender, not the transport, is the story. |
 | `lost` | listener `sec_a` | Loss the *protocol* detected (and presumably tried to recover from). Compare against `rcvbuf_drop` — see below. |
@@ -107,7 +176,7 @@ column comparison and rules out an entire category of explanation:
    `--recv-workers` (pooled ingress is single-threaded per socket-group by
    default — see [split-role-cli.md](plans/split-role-cli.md)), larger
    `--sock-buf`, or accept it as the actual ceiling at this connection
-   count / bitrate.
+   count / source rate.
 3. **`offer%` and `rcvbuf_drop` both clean, `lost` > 0?** Now it's
    protocol-level loss — genuine network conditions (`--link-loss`), or a
    retransmission/pacing issue worth investigating in the transport

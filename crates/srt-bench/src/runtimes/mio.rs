@@ -9,7 +9,7 @@ use mio::{Events, Interest, Poll, Token};
 use shiguredo_srt::{ConnectionEvent, ConnectionOptions, GroupExtensionData, SrtConnection};
 use srt_transport::mio_transport::Conn;
 use srt_transport::{Handoff, WorkerMessage};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex, mpsc};
@@ -199,12 +199,13 @@ fn run_shared_sender_mode(cfg: &BenchConfig, start: Instant) -> bool {
     if cfg.mode != crate::Mode::Sender || cfg.egress != crate::Egress::SharedSocket {
         return false;
     }
-    let (stats, cc_peak) = run_shared_sender(cfg, start);
+    let (stats, cc_peak, retry) = run_shared_sender(cfg, start);
     let mut aggregate = Aggregate::new(cfg.clone());
     for s in stats {
         aggregate.add(s);
     }
     aggregate.cc_peak = cc_peak;
+    aggregate.outbound_retry.merge(retry);
     aggregate.print(start);
     if !aggregate.any_connected {
         std::process::exit(1);
@@ -311,7 +312,10 @@ pub fn run(cfg: BenchConfig) {
     }
 }
 
-fn run_shared_sender(cfg: &BenchConfig, start: Instant) -> (Vec<ConnStats>, usize) {
+fn run_shared_sender(
+    cfg: &BenchConfig,
+    start: Instant,
+) -> (Vec<ConnStats>, usize, crate::scheduling::RetryStats) {
     let std_socket =
         crate::bind_shared_sender_socket(cfg.sock_buf_bytes).expect("bind shared sender socket");
     let mut socket = UdpSocket::from_std(std_socket);
@@ -330,19 +334,31 @@ fn run_shared_sender(cfg: &BenchConfig, start: Instant) -> (Vec<ConnStats>, usiz
     )));
     let mut sender = crate::SharedSender::new(cfg, &indices, start, limiter);
     let mut generated = Vec::new();
-    let mut pending = VecDeque::new();
+    // The retained-output queue, bounded and instrumented like every other
+    // benchmark-owned packet queue. It used to be a bare `VecDeque` that
+    // each tick extended and then drained only until the socket yielded,
+    // which is not a bound at all across ticks: whenever the socket
+    // accepts less than the sender produces, the difference accumulates
+    // for the rest of the run, and nothing in the result row said so.
+    let mut pending =
+        crate::scheduling::RetryQueue::new(cfg.would_block, cfg.outbound_retry_capacity());
     let mut buffer = [0_u8; 65_536];
     loop {
         sender.tick(cfg, &mut generated);
-        pending.extend(generated.drain(..));
-        while let Some((peer, packet)) = pending.front() {
-            match socket.send_to(packet, *peer) {
-                Ok(_) => {
-                    pending.pop_front();
+        pending.append(&mut generated);
+        let flush = pending.flush_with(|batch| {
+            let mut sent = 0;
+            for (peer, packet) in batch {
+                match socket.send_to(packet, *peer) {
+                    Ok(_) => sent += 1,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) => return Err(error),
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(error) => panic!("shared send_to: {error}"),
             }
+            Ok(sent)
+        });
+        if let Err(error) = flush {
+            panic!("shared send_to: {error}");
         }
         if sender.done() && pending.is_empty() {
             break;
@@ -358,7 +374,7 @@ fn run_shared_sender(cfg: &BenchConfig, start: Instant) -> (Vec<ConnStats>, usiz
         }
     }
     let cc_peak = sender.cc_peak();
-    (sender.finish(), cc_peak)
+    (sender.finish(), cc_peak, pending.stats())
 }
 
 fn prime_drivers(
@@ -640,6 +656,7 @@ fn driver_stats(cfg: &BenchConfig, driver: Driver) -> ConnStats {
         torn_down: driver.torn_down,
         data_events: driver.data_events,
         source: driver.source.stats(),
+        has_source: cfg.mode == crate::Mode::Sender,
         ..Default::default()
     };
     match cfg.mode {

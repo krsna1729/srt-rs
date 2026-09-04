@@ -234,15 +234,43 @@ defined once in `harness::COLUMNS` and cover both the configuration (every
 axis) and the measurements, so `report` can group by any subset:
 
 ```
-runtime  encryption  role  ingress  promotion  cookie  batch  recv_rounds  would_block_policy  sock_buf  conns  connect_cc
+runtime  encryption  role  ingress  promotion  cookie  batch  recv_rounds
+would_block_policy  sock_buf_requested_bytes
+sock_rcvbuf_effective_min_bytes  sock_rcvbuf_effective_max_bytes
+sock_sndbuf_effective_min_bytes  sock_sndbuf_effective_max_bytes
+cpus  recv_cpus  send_cpus  conns  logical_streams  source_streams  connect_cc
 bond  source_bps  srt_bw_mode  srt_maxbw_bps  srt_inputbw_bps  srt_oheadbw_pct
-rep  established  pkt_sent  core_total  sec_a  sec_b  rtt_ms  elapsed_s
-cpu_user_ms  cpu_sys_ms  peak_rss_kb  src_backpressure  src_backlog_hwm
-src_overflow  datapath_q_cap  datapath_q_hwm  datapath_q_full  datapath_q_dropped
-recv_packets  recv_syscalls  datagrams_per_syscall  timer_late_p50_us
-timer_late_p95_us  timer_late_p99_us  timer_late_max_us  retry_cap retry_hwm
-would_block retry_overflow local_dropped
+rep  attempt  established  pkt_sent  core_total  sec_a  sec_b  rtt_ms  elapsed_s
+cpu_user_ms  cpu_sys_ms  peak_rss_kb
+src_generated  src_accepted  src_refusal_polls  src_blocked_streaks
+source_backlog_ms  src_backlog_cap  src_backlog_hwm  src_overflow
+datapath_q_horizon_ms  datapath_q_count  datapath_q_cap_per_queue
+datapath_q_total_cap  datapath_q_peak_depth_max  datapath_q_peak_depth_sum
+datapath_q_full  datapath_q_dropped  datapath_q_disconnected
+recv_packets  recv_syscalls  datagrams_per_syscall  timer_late_p50_bucket_us
+timer_late_p95_bucket_us  timer_late_p99_bucket_us  timer_late_max_us
+retry_horizon_ms  retry_count  retry_cap_per_queue  retry_total_cap
+retry_peak_depth_max  would_block  retry_overflow  local_dropped
 ```
+
+Three groups of names are deliberately explicit, because each was
+previously one number standing for several different things:
+
+- `conns` / `logical_streams` / `source_streams` — physical connections,
+  streams a group-aware listener admits, and independent payload
+  producers. Equal unless the cell is bonded.
+- `source_bps` versus `srt_bw_mode` / `srt_maxbw_bps` — the application's
+  workload rate versus SRT's pacing configuration.
+- `sock_buf_requested_bytes` versus the receive/send effective min/max
+  columns — the application's request versus what the kernel granted across
+  this role's sockets.
+- `*_per_queue` / `*_count` / `*_total_*` / `*_peak_depth_max` /
+  `*_peak_total_depth` — one queue, how many, the whole pool, the worst
+  single queue, and the process-wide peak.
+
+`attempt` identifies the matrix attempt that wrote the row, so a
+half-finished pair left by an interrupted sweep cannot be mistaken for
+this attempt's output.
 
 TSV rather than JSON: no dependency to read or write, greppable, and it
 opens in a spreadsheet. Files are appended to, because a sweep is many

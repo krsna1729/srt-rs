@@ -288,7 +288,11 @@ async fn sender_task(
     limiter: Option<std::sync::Arc<std::sync::Mutex<crate::ConnectLimiter>>>,
 ) -> ConnStats {
     let mut permit = crate::HandshakeAdmission::acquire_optional(limiter.as_ref()).await;
-    let socket = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0))).expect("bind");
+    let socket = UdpSocket::new(
+        crate::bind_configured_socket(SocketAddr::from(([0, 0, 0, 0], 0)), cfg.sock_buf_bytes)
+            .expect("bind"),
+    )
+    .expect("register socket");
     socket.get_ref().connect(endpoint).expect("connect");
 
     let mut options = ConnectionOptions {
@@ -374,6 +378,7 @@ async fn sender_task(
     drain_outputs(&mut driver, t).await;
     record_sender_stats(&driver, &mut stats);
     stats.source = source.stats();
+    stats.has_source = true;
     stats
 }
 
@@ -493,7 +498,14 @@ fn record_receiver_stats(driver: &Conn, stats: &mut ConnStats) {
 }
 
 async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> ConnStats {
-    let socket = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], listen_port))).expect("bind");
+    let socket = UdpSocket::new(
+        crate::bind_configured_socket(
+            SocketAddr::from(([0, 0, 0, 0], listen_port)),
+            cfg.sock_buf_bytes,
+        )
+        .expect("bind"),
+    )
+    .expect("register socket");
 
     let mut options = ConnectionOptions {
         socket_id: std::process::id(),

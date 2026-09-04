@@ -331,7 +331,11 @@ async fn sender_task(
     // sender task is spawned upfront, so a periodic re-check here would cost
     // one timer wakeup per pending connection per millisecond of admission.
     let mut permit = crate::HandshakeAdmission::acquire_optional(limiter.as_ref()).await;
-    let socket = monoio::net::udp::UdpSocket::bind("0.0.0.0:0").expect("bind");
+    let socket = monoio::net::udp::UdpSocket::from_std(
+        crate::bind_configured_socket(SocketAddr::from(([0, 0, 0, 0], 0)), cfg.sock_buf_bytes)
+            .expect("bind"),
+    )
+    .expect("register socket");
     socket.connect(endpoint).await.expect("connect");
 
     let mut options = ConnectionOptions {
@@ -415,6 +419,7 @@ async fn sender_task(
     drain_outputs(&mut driver, t).await;
     record_sender_stats(&driver, &mut stats);
     stats.source = source.stats();
+    stats.has_source = true;
     stats
 }
 
@@ -492,8 +497,14 @@ fn record_receiver_stats(driver: &Conn, stats: &mut ConnStats) {
 }
 
 async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> ConnStats {
-    let socket = monoio::net::udp::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], listen_port)))
-        .expect("bind");
+    let socket = monoio::net::udp::UdpSocket::from_std(
+        crate::bind_configured_socket(
+            SocketAddr::from(([0, 0, 0, 0], listen_port)),
+            cfg.sock_buf_bytes,
+        )
+        .expect("bind"),
+    )
+    .expect("register socket");
 
     let mut options = ConnectionOptions {
         socket_id: std::process::id(),
@@ -820,9 +831,8 @@ async fn run_acceptor(
     // tick) and hands datagrams to the main loop through a shared local
     // bounded nonblocking queue. Full means reject the newest datagram and
     // record overload; it never parks this single-thread reactor.
-    let (inbox_tx, inbox) = crate::queue::bounded_channel(crate::queue::DATAPATH_QUEUE_CAPACITY);
-    let (recycle_tx, recycle_rx) =
-        crate::queue::bounded_channel(crate::queue::DATAPATH_QUEUE_CAPACITY);
+    let (inbox_tx, inbox) = crate::queue::bounded_channel(cfg.datapath_queue_capacity());
+    let (recycle_tx, recycle_rx) = crate::queue::bounded_channel(cfg.datapath_queue_capacity());
     let reader_listener = listener.clone();
     let _reader_task = monoio::spawn(async move {
         let mut buf = vec![0u8; 2048];

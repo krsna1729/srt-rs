@@ -77,9 +77,57 @@ pub fn available_cpus() -> usize {
     }
 }
 
+/// Format a list of CPU indices into a compact canonical range specification,
+/// e.g. `[0, 1, 2, 4, 5]` -> `"0-2,4-5"`, `[3]` -> `"3"`.
+#[must_use]
+fn format_cpu_spec(cpus: &[usize]) -> String {
+    if cpus.is_empty() {
+        return String::new();
+    }
+    let mut parts = Vec::new();
+    let mut start = cpus[0];
+    let mut prev = cpus[0];
+    for &cpu in &cpus[1..] {
+        if cpu == prev + 1 {
+            prev = cpu;
+        } else {
+            if start == prev {
+                parts.push(format!("{start}"));
+            } else {
+                parts.push(format!("{start}-{prev}"));
+            }
+            start = cpu;
+            prev = cpu;
+        }
+    }
+    if start == prev {
+        parts.push(format!("{start}"));
+    } else {
+        parts.push(format!("{start}-{prev}"));
+    }
+    parts.join(",")
+}
+
+/// Canonical CPU set string for this process's current affinity mask, e.g. `"0-3"`.
+pub fn current_cpu_spec() -> std::io::Result<String> {
+    // SAFETY: `set` is valid writable storage of the exact size supplied to
+    // the syscall. On success CPU_ISSET reads only the initialized result.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let cpus = (0..libc::CPU_SETSIZE as usize)
+            .filter(|cpu| libc::CPU_ISSET(*cpu, &set))
+            .collect::<Vec<_>>();
+        Ok(format_cpu_spec(&cpus))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn empty_spec_yields_empty() {
@@ -125,5 +173,36 @@ mod tests {
     #[test]
     fn available_cpus_is_nonzero() {
         assert!(available_cpus() >= 1);
+    }
+
+    #[test]
+    fn format_cpu_spec_empty() {
+        assert_eq!(format_cpu_spec(&[]), "");
+    }
+
+    #[test]
+    fn format_cpu_spec_scalar_and_ranges() {
+        assert_eq!(format_cpu_spec(&[3]), "3");
+        assert_eq!(format_cpu_spec(&[0, 1]), "0-1");
+        assert_eq!(format_cpu_spec(&[0, 1, 2, 3]), "0-3");
+        assert_eq!(format_cpu_spec(&[0, 2, 4]), "0,2,4");
+        assert_eq!(format_cpu_spec(&[0, 1, 4, 5]), "0-1,4-5");
+    }
+
+    #[test]
+    fn current_cpu_spec_is_nonempty() {
+        let spec = current_cpu_spec().unwrap();
+        assert!(!spec.is_empty());
+        let parsed = parse_cpu_spec(&spec);
+        assert_eq!(parsed.len(), available_cpus());
+    }
+
+    proptest! {
+        #[test]
+        fn formatted_cpu_sets_round_trip(mut cpus in proptest::collection::vec(0usize..256, 0..64)) {
+            cpus.sort_unstable();
+            cpus.dedup();
+            prop_assert_eq!(parse_cpu_spec(&format_cpu_spec(&cpus)), cpus);
+        }
     }
 }

@@ -19,9 +19,19 @@ type CellRepMap<'a> = BTreeMap<String, BTreeMap<String, RepRecordPair<'a>>>;
 /// Computed metrics for a single caller/listener pair in one rep.
 #[derive(Clone, Debug, Default)]
 pub struct PairMetrics {
+    /// Physical connections the caller established. Distinct from
+    /// `logical_streams` and `source_streams`: a two-leg bonded group is
+    /// two physical connections carrying one stream from one source, and
+    /// using one number for all three made a healthy bonded cell read as
+    /// half-offered and half-established.
     pub conns: f64,
     /// Source payload rate in bits per second (the `source_bps` column).
     pub source_bps: f64,
+    /// Application-visible streams: what a group-aware listener admits.
+    pub logical_streams: f64,
+    /// Independent payload producers the sender ran; the multiplier for
+    /// the aggregate source workload.
+    pub source_streams: f64,
     pub secs: f64,
     pub caller_established: f64,
     pub listener_established: f64,
@@ -92,6 +102,22 @@ impl PairMetrics {
             .number("source_bps")
             .or_else(|| caller.number("source_bps"))?;
         let secs = listener.number("secs").or_else(|| caller.number("secs"))?;
+        // Three distinct cardinalities. `conns` is physical connections
+        // (what the caller establishes); `logical_streams` is what a
+        // group-aware listener admits; `source_streams` is how many
+        // payload producers the sender actually ran. They coincide unless
+        // the cell is bonded, where two legs carry one stream from one
+        // source -- and using `conns` for all three made a perfect bonded
+        // run look half-offered and half-established.
+        let logical_streams = listener
+            .number("logical_streams")
+            .or_else(|| caller.number("logical_streams"))
+            .filter(|streams| *streams > 0.0)
+            .unwrap_or(conns);
+        let source_streams = caller
+            .number("source_streams")
+            .filter(|streams| *streams > 0.0)
+            .unwrap_or(logical_streams);
 
         let caller_established = caller.number("established").unwrap_or(0.0);
         let listener_established = listener.number("established").unwrap_or(0.0);
@@ -102,13 +128,14 @@ impl PairMetrics {
         let recv_pkts = listener.number("core_total").unwrap_or(0.0);
 
         // The target is what the APPLICATION SOURCE asked for, so the
-        // denominator is the payload size. It used to be the wire size
-        // (payload + SRT header), which is SRTO_MAXBW's unit -- so "did
-        // the sender offer its load?" was measured against the pacing
-        // ceiling that produced the load, and could not fail. A cell
-        // whose MAXBW cannot carry its source rate now visibly falls
-        // short here, which is the point.
-        let target_pkts = (conns * (source_bps / 8.0) * secs) / PAYLOAD_SIZE as f64;
+        // denominator is the payload size and the multiplier is the
+        // number of sources. It used to be the wire size (payload + SRT
+        // header), which is SRTO_MAXBW's unit -- so "did the sender offer
+        // its load?" was measured against the pacing ceiling that
+        // produced the load, and could not fail. A cell whose MAXBW
+        // cannot carry its source rate now visibly falls short here,
+        // which is the point.
+        let target_pkts = (source_streams * (source_bps / 8.0) * secs) / PAYLOAD_SIZE as f64;
         let offer_pct = ratio_pct(sent_pkts, target_pkts);
         let good_pct = ratio_pct(recv_pkts, target_pkts);
         let deliv_pct = ratio_pct(recv_pkts, sent_pkts);
@@ -152,14 +179,18 @@ impl PairMetrics {
         let source_backlog_cap = caller.number("src_backlog_cap").unwrap_or(0.0);
         let datapath_queue_overflow = caller.number("datapath_q_dropped").unwrap_or(0.0)
             + listener.number("datapath_q_dropped").unwrap_or(0.0);
-        let outbound_retry_loss = caller.number("retry_overflow").unwrap_or(0.0)
-            + listener.number("retry_overflow").unwrap_or(0.0)
-            + caller.number("local_dropped").unwrap_or(0.0)
+        // `local_dropped` is the TOTAL number of datagrams the harness
+        // dropped locally; `retry_overflow` is one of the reasons, and is
+        // already included in that total. Adding them counted every
+        // overflowed datagram twice.
+        let outbound_retry_loss = caller.number("local_dropped").unwrap_or(0.0)
             + listener.number("local_dropped").unwrap_or(0.0);
 
         Some(Self {
             conns,
             source_bps,
+            logical_streams,
+            source_streams,
             secs,
             caller_established,
             listener_established,
@@ -211,20 +242,73 @@ impl PairMetrics {
     /// configuration, not an invalid one. It is not rejected for being
     /// bandwidth-constrained; it simply fails `offer_pct`, which is the
     /// honest way to say the protocol could not service the workload.
+    /// Diagnoses every condition that caused this repetition to fail the canonical
+    /// clean predicate. Returns an empty vec if the repetition is clean.
+    #[must_use]
+    pub fn unclean_reasons(&self) -> Vec<String> {
+        let mut reasons = Vec::new();
+        if self.conns <= 0.0 {
+            reasons.push(format!(
+                "physical connection count is zero ({})",
+                self.conns
+            ));
+        }
+        if self.caller_established != self.conns {
+            reasons.push(format!(
+                "caller established {}/{}",
+                self.caller_established, self.conns
+            ));
+        }
+        if self.listener_established != self.logical_streams {
+            reasons.push(format!(
+                "listener established {}/{}",
+                self.listener_established, self.logical_streams
+            ));
+        }
+        if self.torn_c > 0.0 {
+            reasons.push(format!("caller torn down {}", self.torn_c));
+        }
+        if self.torn_l > 0.0 {
+            reasons.push(format!("listener torn down {}", self.torn_l));
+        }
+        if self.offer_pct < 99.0 {
+            reasons.push(format!("source offer {:.1}% < 99.0%", self.offer_pct));
+        }
+        if self.good_pct < 99.0 {
+            reasons.push(format!("source goodput {:.1}% < 99.0%", self.good_pct));
+        }
+        if self.deliv_pct < 99.9 {
+            reasons.push(format!("delivery {:.1}% < 99.9%", self.deliv_pct));
+        }
+        if self.caller_udp_rcvbuf_err > 0.0 {
+            reasons.push(format!(
+                "caller UDP rcvbuf errors {}",
+                self.caller_udp_rcvbuf_err
+            ));
+        }
+        if self.listener_udp_rcvbuf_err > 0.0 {
+            reasons.push(format!(
+                "listener UDP rcvbuf errors {}",
+                self.listener_udp_rcvbuf_err
+            ));
+        }
+        if self.source_overflow > 0.0 {
+            reasons.push(format!("source overflow {}", self.source_overflow));
+        }
+        if self.datapath_queue_overflow > 0.0 {
+            reasons.push(format!(
+                "datapath queue dropped {}",
+                self.datapath_queue_overflow
+            ));
+        }
+        if self.outbound_retry_loss > 0.0 {
+            reasons.push(format!("outbound retry loss {}", self.outbound_retry_loss));
+        }
+        reasons
+    }
+
     pub fn is_clean(&self) -> bool {
-        self.conns > 0.0
-            && self.caller_established == self.conns
-            && self.listener_established == self.conns
-            && self.torn_c == 0.0
-            && self.torn_l == 0.0
-            && self.offer_pct >= 99.0
-            && self.good_pct >= 99.0
-            && self.deliv_pct >= 99.9
-            && self.caller_udp_rcvbuf_err == 0.0
-            && self.listener_udp_rcvbuf_err == 0.0
-            && self.source_overflow == 0.0
-            && self.datapath_queue_overflow == 0.0
-            && self.outbound_retry_loss == 0.0
+        self.unclean_reasons().is_empty()
     }
 }
 
@@ -234,9 +318,14 @@ pub struct CellSummary {
     pub key: String,
     pub pairs: usize,
     pub incomplete_reps: usize,
+    /// Physical connections. See [`PairMetrics`] for why three separate
+    /// cardinalities exist.
     pub conns: f64,
     /// Source payload rate in bits per second (the `source_bps` column).
     pub source_bps: f64,
+    /// Independent payload producers: the multiplier for the aggregate
+    /// source workload, and not the same as `conns` for a bonded cell.
+    pub source_streams: f64,
     pub caller_established: Spread,
     pub listener_established: Spread,
     pub torn_c: Spread,
@@ -264,7 +353,9 @@ fn group_records_by_cell(records: &[Record]) -> CellRepMap<'_> {
     let mut by_cell: CellRepMap<'_> = BTreeMap::new();
     for r in records {
         let key = cell_key(r);
-        let rep = r.get("rep").unwrap_or("1").to_string();
+        let rep = r.get("rep").unwrap_or("1");
+        let attempt = r.get("attempt").unwrap_or_default();
+        let rep = format!("{rep} attempt={attempt}");
         let slot = by_cell.entry(key).or_default().entry(rep).or_default();
         match r.get("role") {
             Some("caller") => slot.0 = Some(r),
@@ -279,6 +370,7 @@ fn compute_cell_summary(key: String, pairs: &[PairMetrics], incomplete_reps: usi
     let n = pairs.len();
     let conns = pairs[0].conns;
     let source_bps = pairs[0].source_bps;
+    let source_streams = pairs[0].source_streams;
 
     let caller_established = Spread::of(pairs.iter().map(|p| p.caller_established).collect());
     let listener_established = Spread::of(pairs.iter().map(|p| p.listener_established).collect());
@@ -331,6 +423,7 @@ fn compute_cell_summary(key: String, pairs: &[PairMetrics], incomplete_reps: usi
         incomplete_reps,
         conns,
         source_bps,
+        source_streams,
         caller_established,
         listener_established,
         torn_c,
@@ -358,12 +451,18 @@ fn compute_cell_summary(key: String, pairs: &[PairMetrics], incomplete_reps: usi
 fn compute_empty_summary(key: String, incomplete_reps: usize, sample: &Record) -> CellSummary {
     let conns = sample.number("conns").unwrap_or(0.0);
     let source_bps = sample.number("source_bps").unwrap_or(0.0);
+    let source_streams = sample
+        .number("source_streams")
+        .filter(|streams| *streams > 0.0)
+        .or_else(|| sample.number("logical_streams").filter(|s| *s > 0.0))
+        .unwrap_or(conns);
     CellSummary {
         key,
         pairs: 0,
         incomplete_reps,
         conns,
         source_bps,
+        source_streams,
         caller_established: Spread::default(),
         listener_established: Spread::default(),
         torn_c: Spread::default(),
@@ -423,11 +522,27 @@ pub fn summarize_cells(records: &[Record]) -> BTreeMap<String, CellSummary> {
 pub fn cell_key(r: &Record) -> String {
     let mut parts = Vec::new();
     for col in CONFIG_COLUMNS {
+        if unscoped_column_is_shadowed(r, col) {
+            continue;
+        }
         if let Some(val) = r.get(col) {
             parts.push(format!("{col}={val}"));
         }
     }
     parts.join(" ")
+}
+
+fn unscoped_column_is_shadowed(record: &Record, column: &str) -> bool {
+    let scoped = match column {
+        "cpus" => ["recv_cpus", "send_cpus"],
+        "workers" => ["recv_workers", "send_workers"],
+        "runtime" => ["recv_runtime", "send_runtime"],
+        "ingress" => ["recv_ingress", "send_ingress"],
+        _ => return false,
+    };
+    scoped
+        .iter()
+        .any(|field| record.get(field).is_some_and(|value| !value.is_empty()))
 }
 
 pub fn extract_key_field<'a>(key: &'a str, target: &str) -> &'a str {
@@ -476,8 +591,20 @@ pub fn format_short_cell_label(key: &str) -> String {
     label
 }
 
-/// Finds the highest clean aggregate configured bandwidth (connections * configured bitrate)
-/// strictly among cells where all repetitions passed `is_clean`.
+/// Aggregate source workload a cell was configured to produce, in bits
+/// per second: payload sources times each source's payload rate.
+///
+/// This is the *workload*, not SRT's pacing ceiling. The two were the
+/// same number before the source/pacing split, and a frontier expressed
+/// in MAXBW answered a question about the protocol's configuration rather
+/// than about the load the stack actually carried.
+#[must_use]
+pub fn aggregate_source_bps(summary: &CellSummary) -> f64 {
+    summary.source_streams * summary.source_bps
+}
+
+/// Finds the highest clean aggregate *source workload* strictly among
+/// cells where all repetitions passed `is_clean`.
 pub fn calculate_capacity_frontier<'a>(
     summaries: &'a BTreeMap<String, CellSummary>,
 ) -> Option<&'a CellSummary> {
@@ -486,7 +613,7 @@ pub fn calculate_capacity_frontier<'a>(
 
     for s in summaries.values() {
         if s.is_clean {
-            let agg_bps = s.conns * s.source_bps;
+            let agg_bps = aggregate_source_bps(s);
             if agg_bps > max_rate {
                 max_rate = agg_bps;
                 best = Some(s);
@@ -511,18 +638,38 @@ pub fn format_spread(s: Spread) -> String {
 fn format_frontier_label(summary: Option<&CellSummary>) -> String {
     summary
         .map(|s| {
-            let payload_ratio = PAYLOAD_SIZE as f64 / (PAYLOAD_SIZE + shiguredo_srt::SRT_HEADER_SIZE) as f64;
-            let achieved_payload_gbps = (s.good_pct.median / 100.0) * (s.conns * s.source_bps / 1e9) * payload_ratio;
+            // `source_bps` is already a PAYLOAD rate, so achieved payload
+            // is simply the fraction of it that arrived. The old code
+            // additionally multiplied by PAYLOAD/(PAYLOAD + SRT_HEADER),
+            // which is the wire-overhead haircut appropriate to a MAXBW
+            // figure -- applying it here charged SRT's header cost to a
+            // number that never contained it.
+            let achieved_payload_gbps =
+                (s.good_pct.median / 100.0) * aggregate_source_bps(s) / 1e9;
             format!(
-                "{} (configured MAXBW: {:.3} Gbit/s, payload: {:.3} Gbit/s, offer: {:.1}%, good: {:.1}%)",
+                "{} (source workload: {:.3} Gbit/s, {}, achieved payload: {:.3} Gbit/s, offer: {:.1}%, good: {:.1}%)",
                 format_short_cell_label(&s.key),
-                s.conns * s.source_bps / 1e9,
+                aggregate_source_bps(s) / 1e9,
+                describe_srt_pacing(&s.key),
                 achieved_payload_gbps,
                 s.offer_pct.median,
                 s.good_pct.median
             )
         })
         .unwrap_or_else(|| "none (no cell met strict >=99% offer/good across all repetitions)".into())
+}
+
+/// How the cell configured SRT's pacing, read back from its key.
+///
+/// Printed next to the source workload precisely so the two can never be
+/// read as the same quantity again: a cell can perfectly well have an
+/// 8 Mbit/s source and a 4 Mbit/s ceiling, and that pair is the whole
+/// point of the split.
+fn describe_srt_pacing(key: &str) -> String {
+    match extract_key_field(key, "srt_bw_mode") {
+        "" => "SRT pacing: unrecorded".to_string(),
+        mode => format!("SRT pacing: {mode}"),
+    }
 }
 
 fn render_frontier_markdown(
@@ -538,7 +685,17 @@ fn render_frontier_markdown(
     writeln!(out).unwrap();
     writeln!(
         out,
-        "Clean capacity criteria: `caller_established == conns`, `listener_established == conns`, `torn == 0`, `offer >= 99.0%`, `goodput >= 99.0%`, `deliv >= 99.9%`, and `udp_rcvbuf_err == 0` (both caller and listener) across **all** repetitions."
+        "Clean capacity criteria, across **all** repetitions: \
+         `caller_established == conns` (physical legs), \
+         `listener_established == logical_streams` (a bonded group is one \
+         admitted stream, not two), `torn == 0`, `offer >= 99.0%`, \
+         `goodput >= 99.0%`, `deliv >= 99.9%`, `udp_rcvbuf_err == 0` on \
+         both roles, and zero benchmark-owned overflow \
+         (`src_overflow`, `datapath_q_dropped`, `local_dropped`). \
+         A cell whose SRT pacing ceiling sits below its source rate is a \
+         legitimate diagnostic configuration and is not rejected for that; \
+         it simply fails `offer`, which is the honest way to say the \
+         protocol could not service the workload."
     )
     .unwrap();
     writeln!(
@@ -550,9 +707,9 @@ fn render_frontier_markdown(
     .unwrap();
     writeln!(out).unwrap();
 
-    let base_maxbw = base_frontier.map(|s| s.conns * s.source_bps).unwrap_or(0.0);
-    let head_maxbw = head_frontier.map(|s| s.conns * s.source_bps).unwrap_or(0.0);
-    let delta = delta_pct(base_maxbw, head_maxbw);
+    let base_source_bps = base_frontier.map(aggregate_source_bps).unwrap_or(0.0);
+    let head_source_bps = head_frontier.map(aggregate_source_bps).unwrap_or(0.0);
+    let delta = delta_pct(base_source_bps, head_source_bps);
 
     let base_label = format_frontier_label(base_frontier);
     let head_label = format_frontier_label(head_frontier);
@@ -562,9 +719,9 @@ fn render_frontier_markdown(
     writeln!(
         out,
         "| **Max Clean Aggregate Rate** | **{:.3} Gbit/s** ({}) | **{:.3} Gbit/s** ({}) | **{:+.1}%** |",
-        base_maxbw / 1e9,
+        base_source_bps / 1e9,
         base_label,
-        head_maxbw / 1e9,
+        head_source_bps / 1e9,
         head_label,
         delta
     )
@@ -858,9 +1015,9 @@ pub fn render_table_scorecard(
     writeln!(out, "Head (Post-DSA):     {}", head_path.display()).unwrap();
     writeln!(out).unwrap();
 
-    let base_maxbw = base_frontier.map(|s| s.conns * s.source_bps).unwrap_or(0.0);
-    let head_maxbw = head_frontier.map(|s| s.conns * s.source_bps).unwrap_or(0.0);
-    let delta = delta_pct(base_maxbw, head_maxbw);
+    let base_source_bps = base_frontier.map(aggregate_source_bps).unwrap_or(0.0);
+    let head_source_bps = head_frontier.map(aggregate_source_bps).unwrap_or(0.0);
+    let delta = delta_pct(base_source_bps, head_source_bps);
 
     writeln!(
         out,
@@ -870,8 +1027,8 @@ pub fn render_table_scorecard(
     writeln!(
         out,
         "Max Clean Aggregate Rate: {:.3} Gbit/s -> {:.3} Gbit/s ({:+.1}%)",
-        base_maxbw / 1e9,
-        head_maxbw / 1e9,
+        base_source_bps / 1e9,
+        head_source_bps / 1e9,
         delta
     )
     .unwrap();
@@ -975,6 +1132,94 @@ pub fn compare_files(base_path: &Path, head_path: &Path, markdown: bool) -> Resu
     }
 }
 
+/// Validate that every cell and repetition in `path` satisfies the canonical
+/// clean benchmark predicate ([`PairMetrics::is_clean`]).
+///
+/// Returns `Ok(summary)` on success, or `Err(diagnostics)` if any repetition
+/// failed the clean predicate or was incomplete (missing a caller or listener).
+pub fn check_clean_file(path: &Path) -> Result<String, String> {
+    let records =
+        read_results(path).map_err(|e| format!("check-clean: {}: {e}\n", path.display()))?;
+    if records.is_empty() {
+        return Err(format!(
+            "check-clean: {}: result file has no rows\n",
+            path.display()
+        ));
+    }
+
+    let by_cell = group_records_by_cell(&records);
+    let mut total = 0;
+    let mut unclean = 0;
+    let mut incomplete = 0;
+    let mut failures = Vec::new();
+
+    for (cell, reps) in &by_cell {
+        for (rep, pair) in reps {
+            total += 1;
+            if let Some((is_incomplete, message)) = pair_failure(cell, rep, *pair) {
+                incomplete += usize::from(is_incomplete);
+                unclean += usize::from(!is_incomplete);
+                failures.push(message);
+            }
+        }
+    }
+
+    if !failures.is_empty() {
+        let mut out = failures.join("\n");
+        out.push('\n');
+        out.push_str(&format!(
+            "check-clean: FAILED: {} incomplete, {} unclean out of {} total pairs across {} cells\n",
+            incomplete,
+            unclean,
+            total,
+            by_cell.len()
+        ));
+        return Err(out);
+    }
+
+    Ok(format!(
+        "check-clean: OK: all {} cells ({} pairs) satisfy the canonical clean predicate\n",
+        by_cell.len(),
+        total
+    ))
+}
+
+fn pair_failure(
+    cell: &str,
+    rep: &str,
+    (caller, listener): RepRecordPair<'_>,
+) -> Option<(bool, String)> {
+    let (caller, listener) = match (caller, listener) {
+        (Some(caller), Some(listener)) => (caller, listener),
+        (Some(_), None) => {
+            return Some((
+                true,
+                format!("INCOMPLETE: cell=[{cell}] rep={rep}: missing listener row"),
+            ));
+        }
+        (None, Some(_)) => {
+            return Some((
+                true,
+                format!("INCOMPLETE: cell=[{cell}] rep={rep}: missing caller row"),
+            ));
+        }
+        (None, None) => return None,
+    };
+    let Some(metrics) = PairMetrics::compute(caller, listener) else {
+        return Some((
+            false,
+            format!("FAIL: cell=[{cell}] rep={rep}: could not compute pair metrics"),
+        ));
+    };
+    let reasons = metrics.unclean_reasons();
+    (!reasons.is_empty()).then(|| {
+        (
+            false,
+            format!("FAIL: cell=[{cell}] rep={rep}: {}", reasons.join(", ")),
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1005,7 +1250,10 @@ mod tests {
                 ("promotion".to_string(), "all".to_string()),
                 ("cookie".to_string(), "on".to_string()),
                 ("batch".to_string(), "on".to_string()),
-                ("sock_buf".to_string(), "16m".to_string()),
+                (
+                    "sock_buf_requested_bytes".to_string(),
+                    "16777216".to_string(),
+                ),
                 ("cpus".to_string(), "6".to_string()),
                 ("pin".to_string(), "off".to_string()),
                 ("link_delay".to_string(), "off".to_string()),
@@ -1062,7 +1310,10 @@ mod tests {
                 ("promotion".to_string(), "all".to_string()),
                 ("cookie".to_string(), "on".to_string()),
                 ("batch".to_string(), "on".to_string()),
-                ("sock_buf".to_string(), "16m".to_string()),
+                (
+                    "sock_buf_requested_bytes".to_string(),
+                    "16777216".to_string(),
+                ),
                 ("cpus".to_string(), "6".to_string()),
                 ("pin".to_string(), "off".to_string()),
                 ("link_delay".to_string(), "off".to_string()),
@@ -1252,6 +1503,209 @@ mod tests {
     }
 
     #[test]
+    fn test_unclean_reasons_diagnostics() {
+        let c = make_test_caller(
+            "1", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "0", "9", "5",
+        );
+        let l = make_test_listener(
+            "1", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "1", "10", "10",
+        );
+        let m = PairMetrics::compute(&c, &l).unwrap();
+        assert!(!m.is_clean());
+        let reasons = m.unclean_reasons();
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("caller established 9/10"))
+        );
+        assert!(reasons.iter().any(|r| r.contains("listener torn down 1")));
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("caller UDP rcvbuf errors 5"))
+        );
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("listener UDP rcvbuf errors 10"))
+        );
+    }
+
+    #[test]
+    fn summaries_do_not_pair_rows_from_different_attempts() {
+        let mut caller = make_test_caller(
+            "1", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "0", "10", "0",
+        );
+        let mut listener = make_test_listener(
+            "1", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "0", "10", "0",
+        );
+        let set_attempt = |record: &mut Record, value: &str| {
+            if let Some((_, attempt)) = record.fields.iter_mut().find(|(key, _)| key == "attempt") {
+                *attempt = value.to_string();
+            } else {
+                record.fields.push(("attempt".into(), value.into()));
+            }
+        };
+        set_attempt(&mut caller, "old");
+        set_attempt(&mut listener, "new");
+
+        let summaries = summarize_cells(&[caller, listener]);
+        let summary = summaries.values().next().unwrap();
+        assert_eq!(summary.pairs, 0);
+        assert_eq!(summary.incomplete_reps, 2);
+        assert!(!summary.is_clean);
+    }
+
+    #[test]
+    fn test_check_clean_file_clean_and_unclean() {
+        let dir = std::env::temp_dir().join(format!("check_clean_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+
+        let clean_path = dir.join("clean.tsv");
+        let header = crate::harness::COLUMNS.join("\t");
+        let mut c_row = vec![String::new(); crate::harness::COLUMNS.len()];
+        let mut l_row = vec![String::new(); crate::harness::COLUMNS.len()];
+
+        let set_field = |row: &mut [String], col: &str, val: &str| {
+            if let Some(pos) = crate::harness::COLUMNS.iter().position(|&c| c == col) {
+                row[pos] = val.to_string();
+            }
+        };
+
+        for row in [&mut c_row, &mut l_row] {
+            set_field(row, "runtime", "mio");
+            set_field(row, "encryption", "plain");
+            set_field(row, "ingress", "per-port");
+            set_field(row, "egress", "per-connection");
+            set_field(row, "promotion", "relocate");
+            set_field(row, "cookie", "on");
+            set_field(row, "batch", "on");
+            set_field(row, "recv_rounds", "8");
+            set_field(row, "would_block_policy", "retain");
+            set_field(row, "sock_buf_requested_bytes", "16777216");
+            set_field(row, "sock_rcvbuf_effective_min_bytes", "2097152");
+            set_field(row, "sock_rcvbuf_effective_max_bytes", "2097152");
+            set_field(row, "sock_sndbuf_effective_min_bytes", "2097152");
+            set_field(row, "sock_sndbuf_effective_max_bytes", "2097152");
+            set_field(row, "cpus", "0-3");
+            set_field(row, "pin", "off");
+            set_field(row, "workers", "1");
+            set_field(row, "conns", "10");
+            set_field(row, "logical_streams", "10");
+            set_field(row, "source_streams", "10");
+            set_field(row, "connect_cc", "1");
+            set_field(row, "cc_peak", "1");
+            set_field(row, "bond", "none");
+            set_field(row, "source_bps", "1000000");
+            set_field(row, "srt_bw_mode", "input-relative:25");
+            set_field(row, "source_backlog_ms", "250");
+            set_field(row, "datapath_q_horizon_ms", "250");
+            set_field(row, "retry_horizon_ms", "250");
+            set_field(row, "rep", "1");
+            set_field(row, "secs", "10");
+            set_field(row, "attempt", "test-1");
+            set_field(row, "established", "10");
+            set_field(row, "torn_down", "0");
+            set_field(row, "pkt_sent", "9499");
+            set_field(row, "core_total", "9499");
+            set_field(row, "udp_rcvbuf_err", "0");
+            set_field(row, "src_overflow", "0");
+            set_field(row, "datapath_q_dropped", "0");
+            set_field(row, "local_dropped", "0");
+        }
+        set_field(&mut c_row, "role", "caller");
+        set_field(&mut l_row, "role", "listener");
+
+        let clean_content = format!("{}\n{}\n{}\n", header, c_row.join("\t"), l_row.join("\t"));
+        std::fs::write(&clean_path, &clean_content).unwrap();
+
+        let res = check_clean_file(&clean_path);
+        assert!(res.is_ok(), "clean file must pass: {:?}", res.err());
+
+        // Now test unclean file (failed establishment)
+        let unclean_path = dir.join("unclean.tsv");
+        let mut bad_c_row = c_row.clone();
+        set_field(&mut bad_c_row, "established", "9");
+        let unclean_content = format!(
+            "{}\n{}\n{}\n",
+            header,
+            bad_c_row.join("\t"),
+            l_row.join("\t")
+        );
+        std::fs::write(&unclean_path, &unclean_content).unwrap();
+        let bad_res = check_clean_file(&unclean_path);
+        assert!(bad_res.is_err(), "unclean file must fail");
+        assert!(bad_res.unwrap_err().contains("caller established 9/10"));
+
+        // Incomplete file (missing listener)
+        let incomplete_path = dir.join("incomplete.tsv");
+        let incomplete_content = format!("{}\n{}\n", header, c_row.join("\t"));
+        std::fs::write(&incomplete_path, &incomplete_content).unwrap();
+        let inc_res = check_clean_file(&incomplete_path);
+        assert!(inc_res.is_err(), "incomplete file must fail");
+        assert!(inc_res.unwrap_err().contains("missing listener row"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A two-leg bonded group is two physical connections carrying one
+    /// stream from one source. Charging the workload to `conns` doubled
+    /// the target, so a source that produced exactly what it was asked
+    /// for read as ~50% offered; and requiring `listener_established ==
+    /// conns` marked every healthy bonded cell unclean, because a
+    /// group-aware listener admits one stream, not two.
+    #[test]
+    fn a_bonded_cell_is_measured_against_streams_not_physical_legs() {
+        // 10 physical legs = 5 bonded groups = 5 sources.
+        // Source target: 5 * 125000 * 10 / 1316 = 4749.2 -> 4750 packets.
+        let mut caller = make_test_caller(
+            "1", "10", "1000000", "10", "4750", "100.0", "100.0", "1000", "0", "0", "0", "10", "0",
+        );
+        caller
+            .fields
+            .push(("logical_streams".to_string(), "5".to_string()));
+        caller
+            .fields
+            .push(("source_streams".to_string(), "5".to_string()));
+        let mut listener = make_test_listener(
+            "1", "10", "1000000", "10", "4750", "100.0", "100.0", "1000", "0", "0", "0", "5", "0",
+        );
+        listener
+            .fields
+            .push(("logical_streams".to_string(), "5".to_string()));
+
+        let metrics = PairMetrics::compute(&caller, &listener).expect("pair metrics");
+        assert_eq!(metrics.source_streams, 5.0);
+        assert!(
+            (metrics.offer_pct - 100.0).abs() < 0.5,
+            "a source that produced its full workload must read as ~100%, got {}",
+            metrics.offer_pct
+        );
+        assert!(
+            metrics.is_clean(),
+            "a healthy bonded cell must be clean: listener admits {} of {} logical streams",
+            metrics.listener_established,
+            metrics.logical_streams
+        );
+    }
+
+    /// Absent the bonded columns, the three cardinalities collapse to
+    /// `conns` and nothing about an unbonded cell changes.
+    #[test]
+    fn an_unbonded_cell_still_uses_the_physical_connection_count() {
+        let caller = make_test_caller(
+            "1", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "0", "10", "0",
+        );
+        let listener = make_test_listener(
+            "1", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "0", "10", "0",
+        );
+        let metrics = PairMetrics::compute(&caller, &listener).expect("pair metrics");
+        assert_eq!(metrics.source_streams, 10.0);
+        assert_eq!(metrics.logical_streams, 10.0);
+        assert!(metrics.is_clean());
+    }
+
+    #[test]
     fn datapath_queue_overflow_invalidates_a_clean_pair() {
         let c = make_test_caller(
             "1", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "0", "10", "0",
@@ -1274,9 +1728,37 @@ mod tests {
             "1", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "0", "10", "0",
         );
         assert!(PairMetrics::compute(&c, &l).unwrap().is_clean());
+        // A retry overflow is also a local drop, so the total is what the
+        // predicate reads.
         c.fields
             .push(("retry_overflow".to_string(), "1".to_string()));
-        assert!(!PairMetrics::compute(&c, &l).unwrap().is_clean());
+        c.fields
+            .push(("local_dropped".to_string(), "1".to_string()));
+        let metrics = PairMetrics::compute(&c, &l).unwrap();
+        assert!(!metrics.is_clean());
+        assert_eq!(
+            metrics.outbound_retry_loss, 1.0,
+            "`retry_overflow` is a reason inside `local_dropped`, not a second loss to add to it"
+        );
+    }
+
+    /// Dropping on WouldBlock loses datagrams without any overflow: the
+    /// total has to count those too, or a drop policy would look clean.
+    #[test]
+    fn a_would_block_drop_counts_even_without_overflow() {
+        let mut c = make_test_caller(
+            "1", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "0", "10", "0",
+        );
+        let l = make_test_listener(
+            "1", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "0", "10", "0",
+        );
+        c.fields
+            .push(("retry_overflow".to_string(), "0".to_string()));
+        c.fields
+            .push(("local_dropped".to_string(), "7".to_string()));
+        let metrics = PairMetrics::compute(&c, &l).unwrap();
+        assert_eq!(metrics.outbound_retry_loss, 7.0);
+        assert!(!metrics.is_clean());
     }
 
     #[test]

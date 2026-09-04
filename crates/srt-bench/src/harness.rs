@@ -82,7 +82,11 @@ pub const COLUMNS: &[&str] = &[
     "batch",
     "recv_rounds",
     "would_block_policy",
-    "sock_buf",
+    "sock_buf_requested_bytes",
+    "sock_rcvbuf_effective_min_bytes",
+    "sock_rcvbuf_effective_max_bytes",
+    "sock_sndbuf_effective_min_bytes",
+    "sock_sndbuf_effective_max_bytes",
     "cpus",
     "pin",
     "link_delay",
@@ -100,7 +104,22 @@ pub const COLUMNS: &[&str] = &[
     "send_ingress",
     "recv_workers",
     "send_workers",
+    "recv_cpus",
+    "send_cpus",
+    // Three different cardinalities that a single `conns` used to stand
+    // for. They coincide for an unbonded run and diverge for a bonded
+    // one, where two physical legs carry one logical stream driven by one
+    // source clock -- so using `conns` as the workload denominator made a
+    // perfect bonded source read as ~50% offered.
+    //
+    // `conns` stays the PHYSICAL connection count (what was asked for,
+    // and what `established` is measured against on the caller side).
     "conns",
+    // Application-visible streams: what a group-aware listener admits.
+    "logical_streams",
+    // Independent payload producers this process actually ran. Measured,
+    // not derived from topology.
+    "source_streams",
     "connect_cc",
     "cc_peak",
     "bond",
@@ -144,26 +163,70 @@ pub const COLUMNS: &[&str] = &[
     // `src_overflow` zero.
     "src_generated",
     "src_accepted",
-    "src_backpressure",
+    // Poll-rate dependent: how often a send attempt found the protocol
+    // unwilling. Diagnostic only -- a runtime that wakes more often reports
+    // more refusals for identical backpressure.
+    "src_refusal_polls",
+    // Poll-rate independent: one per contiguous episode of backpressure,
+    // so this is comparable across runtimes.
+    "src_blocked_streaks",
+    // The configured backlog POLICY, alongside the packet capacity it
+    // resolved to. The policy changes `src_overflow`, which changes
+    // whether a cell is clean, so it is part of the experiment's identity
+    // -- two runs that differ only in 50ms vs 500ms of source backlog are
+    // not the same cell and must not resume or group as one.
+    "source_backlog_ms",
     "src_backlog_cap",
     "src_backlog_hwm",
     "src_overflow",
     // Benchmark-owned packet-rate queues. Capacity zero is explicitly
     // not-applicable for paths without such a queue.
-    "datapath_q_cap",
-    "datapath_q_hwm",
+    // Benchmark-owned packet queues. Names say WHICH SCOPE each figure
+    // measures: one queue, the worst single queue, or the whole process.
+    // A merged maximum reported as "high water" reads as process state
+    // while meaning "the deepest any one queue got", and at high
+    // connection counts those are very different claims.
+    "datapath_q_horizon_ms",
+    "datapath_q_count",
+    "datapath_q_cap_per_queue",
+    "datapath_q_total_cap",
+    "datapath_q_peak_depth_max",
+    // Sum of every queue's own peak: an UPPER BOUND on what the harness
+    // ever held at once, not a measured simultaneous total. Measuring the
+    // true total needs a process-global counter on every enqueue and
+    // dequeue, which is two contended atomics on the per-packet path of a
+    // tool built to measure that path.
+    "datapath_q_peak_depth_sum",
     "datapath_q_full",
+    // Capacity rejections. A clean cell requires this to be zero.
     "datapath_q_dropped",
+    // Sends to an already-gone consumer: a shutdown-ordering fact, not a
+    // capacity signal, so deliberately not part of cleanliness.
+    "datapath_q_disconnected",
     "recv_packets",
     "recv_syscalls",
     "datagrams_per_syscall",
-    "timer_late_p50_us",
-    "timer_late_p95_us",
-    "timer_late_p99_us",
+    // Timer-service lateness, from a fixed power-of-two histogram. Named
+    // `bucket` because that is what a bucketed histogram can honestly
+    // report: the upper edge of the bucket the percentile falls in, not
+    // the percentile. Clamped to `timer_late_max_us`, so a "p99" can
+    // never come out larger than the largest value actually measured.
+    "timer_late_p50_bucket_us",
+    "timer_late_p95_bucket_us",
+    "timer_late_p99_bucket_us",
     "timer_late_max_us",
-    "retry_cap",
-    "retry_hwm",
+    // Retained outbound work. Same scope discipline as the datapath
+    // queues above: one queue's capacity, how many exist, the pool total,
+    // and the worst any single queue reached.
+    "retry_horizon_ms",
+    "retry_count",
+    "retry_cap_per_queue",
+    "retry_total_cap",
+    "retry_peak_depth_max",
     "would_block",
+    // `retry_overflow` is the REASON datagrams were lost; `local_dropped`
+    // is the TOTAL the harness dropped locally, for any reason. The total
+    // is a superset -- never add the two.
     "retry_overflow",
     "local_dropped",
 ];
@@ -181,7 +244,7 @@ pub const CONFIG_COLUMNS: &[&str] = &[
     "batch",
     "recv_rounds",
     "would_block_policy",
-    "sock_buf",
+    "sock_buf_requested_bytes",
     "cpus",
     "pin",
     "link_delay",
@@ -199,14 +262,18 @@ pub const CONFIG_COLUMNS: &[&str] = &[
     "send_ingress",
     "recv_workers",
     "send_workers",
+    "recv_cpus",
+    "send_cpus",
     "conns",
     "connect_cc",
     "bond",
     "source_bps",
     "srt_bw_mode",
+    "source_backlog_ms",
+    "datapath_q_horizon_ms",
+    "retry_horizon_ms",
     "secs",
 ];
-
 /// The dimensions a run was configured with, rendered for the result
 /// file. Kept separate from the measurements so a report can group by any
 /// subset without knowing what the measurements mean.
@@ -271,6 +338,9 @@ pub struct RunMeasurements {
     /// What the application source offered, as opposed to what the
     /// protocol carried.
     pub source: crate::source::SourceStats,
+    /// How many independent payload producers ran. One per logical
+    /// stream, so a bonded pair counts once.
+    pub source_streams: u64,
     pub datapath_queue: crate::queue::QueueStats,
     pub recv_scheduling: crate::scheduling::RecvSchedulingStats,
     pub outbound_retry: crate::scheduling::RetryStats,
@@ -298,6 +368,7 @@ pub fn append_result(
         elapsed_s,
         cc_peak,
         source,
+        source_streams,
         datapath_queue,
         recv_scheduling,
         outbound_retry,
@@ -323,6 +394,30 @@ pub fn append_result(
     // reader re-derive it. MAXBW/INPUTBW are protocol bytes/s; results
     // state bits/s so they sit in the same units as `source_bps`.
     let resolved = cfg.srt_bandwidth().resolve();
+    let sock_bufs = srt_transport::socket_buffer_stats();
+    let sock_buf_requested = cfg.sock_buf_bytes;
+    let observed = |value: usize| {
+        if sock_bufs.sockets > 0 {
+            value.to_string()
+        } else {
+            String::new()
+        }
+    };
+    if sock_bufs.sockets > 0
+        && sock_buf_requested > 0
+        && (sock_bufs.rcvbuf_min_bytes < sock_buf_requested
+            || sock_bufs.sndbuf_min_bytes < sock_buf_requested)
+    {
+        eprintln!(
+            "socket buffers clamped: requested={sock_buf_requested}, sockets={}, \
+             rcvbuf={}..{}, sndbuf={}..{}",
+            sock_bufs.sockets,
+            sock_bufs.rcvbuf_min_bytes,
+            sock_bufs.rcvbuf_max_bytes,
+            sock_bufs.sndbuf_min_bytes,
+            sock_bufs.sndbuf_max_bytes,
+        );
+    }
     let mut row = String::new();
     let values: Vec<String> = vec![
         cfg.runtime.name().to_string(),
@@ -344,8 +439,12 @@ pub fn append_result(
         },
         cfg.recv_rounds.to_string(),
         cfg.would_block.as_str().to_string(),
-        cfg.sock_buf_bytes.to_string(),
-        srt_transport::available_cpus().to_string(),
+        sock_buf_requested.to_string(),
+        observed(sock_bufs.rcvbuf_min_bytes),
+        observed(sock_bufs.rcvbuf_max_bytes),
+        observed(sock_bufs.sndbuf_min_bytes),
+        observed(sock_bufs.sndbuf_max_bytes),
+        srt_transport::current_cpu_spec().unwrap_or_default(),
         if cfg.pin { "on" } else { "off" }.into(),
         cfg.link.get("delay").to_string(),
         cfg.link.get("jitter").to_string(),
@@ -362,7 +461,11 @@ pub fn append_result(
         cfg.peer_topology.send_ingress.clone(),
         cfg.peer_topology.recv_workers.clone(),
         cfg.peer_topology.send_workers.clone(),
+        cfg.peer_topology.recv_cpus.clone(),
+        cfg.peer_topology.send_cpus.clone(),
         cfg.connections.to_string(),
+        cfg.logical_connection_count().to_string(),
+        source_streams.to_string(),
         cfg.connect_concurrency.to_string(),
         cc_peak.to_string(),
         describe_bond(cfg),
@@ -394,14 +497,21 @@ pub fn append_result(
         udp.no_ports.to_string(),
         source.generated.to_string(),
         source.accepted.to_string(),
-        source.backpressure.to_string(),
+        source.refusal_polls.to_string(),
+        source.blocked_streaks.to_string(),
+        cfg.source_backlog_ms.to_string(),
         crate::source::backlog_capacity(cfg.source_bitrate_bps, cfg.source_backlog_ms).to_string(),
         source.backlog_hwm.to_string(),
         source.overflow.to_string(),
-        datapath_queue.capacity.to_string(),
-        datapath_queue.high_water.to_string(),
+        cfg.datapath_queue_horizon_ms.to_string(),
+        datapath_queue.queues.to_string(),
+        datapath_queue.capacity_per_queue.to_string(),
+        datapath_queue.total_capacity.to_string(),
+        datapath_queue.peak_depth_max.to_string(),
+        datapath_queue.peak_depth_sum.to_string(),
         datapath_queue.full_events.to_string(),
         datapath_queue.dropped_or_rejected.to_string(),
+        datapath_queue.disconnected.to_string(),
         recv_scheduling.packets.to_string(),
         recv_scheduling.syscalls.to_string(),
         if recv_scheduling.syscalls == 0 {
@@ -412,11 +522,14 @@ pub fn append_result(
                 recv_scheduling.packets as f64 / recv_scheduling.syscalls as f64
             )
         },
-        recv_scheduling.percentile_us(50).to_string(),
-        recv_scheduling.percentile_us(95).to_string(),
-        recv_scheduling.percentile_us(99).to_string(),
+        recv_scheduling.percentile_bucket_us(50).to_string(),
+        recv_scheduling.percentile_bucket_us(95).to_string(),
+        recv_scheduling.percentile_bucket_us(99).to_string(),
         recv_scheduling.lateness_max_us.to_string(),
+        cfg.outbound_retry_horizon_ms.to_string(),
+        outbound_retry.queues.to_string(),
         outbound_retry.capacity.to_string(),
+        outbound_retry.total_capacity.to_string(),
         outbound_retry.high_water.to_string(),
         outbound_retry.would_block.to_string(),
         outbound_retry.overflow.to_string(),
@@ -445,6 +558,8 @@ pub fn read_results(path: &Path) -> std::io::Result<Vec<Record>> {
         // either one -- and silently reinterpreting it as a source rate
         // would attach new semantics to old measurements.
         let legacy = keys.contains(&"bitrate") && !keys.contains(&"source_bps");
+        let legacy_sock_buf =
+            keys.contains(&"sock_buf") && !keys.contains(&"sock_buf_requested_bytes");
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             if legacy {
@@ -454,6 +569,14 @@ pub fn read_results(path: &Path) -> std::io::Result<Vec<Record>> {
                      (`source_bps`, `srt_bw_mode`, `srt_maxbw_bps`), and an old row cannot \
                      be reinterpreted as either. Re-run the sweep, or compare old files \
                      with an older srt-bench.",
+                    path.display(),
+                )
+            } else if legacy_sock_buf {
+                format!(
+                    "{}: legacy result schema (has `sock_buf`, which aliased requested vs effective \
+                     socket buffer size). Those are now separate requested/effective min/max columns. \
+                     Re-run the sweep, \
+                     or compare old files with an older srt-bench.",
                     path.display(),
                 )
             } else {
@@ -657,12 +780,19 @@ fn report_median(records: &[&Record], column: &str) -> f64 {
 /// than of whether the configured load was actually produced. SRT's
 /// pacing ceiling is a separate quantity, recorded in `srt_maxbw_bps`.
 pub fn source_target_packets(record: &Record) -> Option<f64> {
-    let (connections, source_bps, seconds) = (
-        record.number("conns")?,
-        record.number("source_bps")?,
-        record.number("secs")?,
-    );
-    let packets = connections * (source_bps / 8.0) * seconds / crate::PAYLOAD_SIZE as f64;
+    let (source_bps, seconds) = (record.number("source_bps")?, record.number("secs")?);
+    // Denominator is the number of independent payload PRODUCERS, not
+    // physical connections. A two-leg bonded group is two connections
+    // carrying one source, so `conns` would double the target and make a
+    // perfect source read as ~50% offered. `source_streams` is measured
+    // by the sender itself; a listener row has none, so fall back to the
+    // logical stream count it does record, and only then to `conns`.
+    let streams = record
+        .number("source_streams")
+        .filter(|streams| *streams > 0.0)
+        .or_else(|| record.number("logical_streams").filter(|s| *s > 0.0))
+        .or_else(|| record.number("conns"))?;
+    let packets = streams * (source_bps / 8.0) * seconds / crate::PAYLOAD_SIZE as f64;
     (packets > 0.0).then_some(packets)
 }
 
@@ -1252,7 +1382,7 @@ fn free_port_range(count: usize) -> std::io::Result<u16> {
 /// would re-run every cell forever.
 fn recorded_as(axis: &str, value: &str) -> (&'static str, String) {
     if axis == "sock-buf" {
-        return ("sock_buf", recorded_socket_buffer(value));
+        return ("sock_buf_requested_bytes", recorded_socket_buffer(value));
     }
     if let Some(column) = recorded_column(axis) {
         return (column, value.to_string());
@@ -1270,23 +1400,33 @@ fn recorded_as(axis: &str, value: &str) -> (&'static str, String) {
 }
 
 fn recorded_column(axis: &str) -> Option<&'static str> {
-    Some(match axis {
-        "runtime" => "runtime",
-        "encryption" => "encryption",
-        "ingress" => "ingress",
-        "egress" => "egress",
-        "promotion" => "promotion",
-        "cookie-routing" => "cookie",
-        "batch" => "batch",
-        "workers" => "workers",
-        "connections" => "conns",
-        "connect-concurrency" => "connect_cc",
-        "bond" => "bond",
-        "bitrate" => "source_bps",
-        "srt-bandwidth" => "srt_bw_mode",
-        "pin" => "pin",
-        _ => return None,
-    })
+    const COLUMNS: &[(&str, &str)] = &[
+        ("runtime", "runtime"),
+        ("encryption", "encryption"),
+        ("ingress", "ingress"),
+        ("egress", "egress"),
+        ("promotion", "promotion"),
+        ("cookie-routing", "cookie"),
+        ("batch", "batch"),
+        ("workers", "workers"),
+        ("connections", "conns"),
+        ("connect-concurrency", "connect_cc"),
+        ("bond", "bond"),
+        ("bitrate", "source_bps"),
+        ("srt-bandwidth", "srt_bw_mode"),
+        ("source-backlog-ms", "source_backlog_ms"),
+        ("recv-rounds", "recv_rounds"),
+        ("would-block", "would_block_policy"),
+        ("datapath-queue-horizon-ms", "datapath_q_horizon_ms"),
+        ("datapath-q-horizon-ms", "datapath_q_horizon_ms"),
+        ("outbound-retry-horizon-ms", "retry_horizon_ms"),
+        ("retry-horizon-ms", "retry_horizon_ms"),
+        ("pin", "pin"),
+    ];
+    COLUMNS
+        .iter()
+        .find(|(name, _)| *name == axis)
+        .map(|(_, column)| *column)
 }
 
 fn recorded_socket_buffer(value: &str) -> String {
@@ -1429,6 +1569,13 @@ const CANONICAL_AXIS_NAMES: &[(&str, &str)] = &[
     ("bond", "bond"),
     ("bitrate", "bitrate"),
     ("srt-bandwidth", "srt-bandwidth"),
+    ("source-backlog-ms", "source-backlog-ms"),
+    ("recv-rounds", "recv-rounds"),
+    ("would-block", "would-block"),
+    ("datapath-queue-horizon-ms", "datapath-queue-horizon-ms"),
+    ("datapath-q-horizon-ms", "datapath-queue-horizon-ms"),
+    ("outbound-retry-horizon-ms", "outbound-retry-horizon-ms"),
+    ("retry-horizon-ms", "outbound-retry-horizon-ms"),
     ("link-delay", "link-delay"),
     ("link-jitter", "link-jitter"),
     ("link-loss", "link-loss"),
@@ -1668,8 +1815,31 @@ fn resolve_matrix_axes(cli: &crate::Cli) -> std::io::Result<MatrixAxisConfig> {
         // historical coupling so an unchanged command line keeps producing
         // unchanged numbers; permanent plans state it explicitly.
         axis("srt-bandwidth", "srt-bandwidth", "legacy-source-fixed"),
+        // How much source the application may hold before dropping it.
+        // Sweepable because it is the knob that decides whether a cell
+        // reports overflow, and therefore whether it is clean.
+        axis(
+            "source-backlog-ms",
+            "source-backlog-ms",
+            &crate::source::DEFAULT_SOURCE_BACKLOG_MS.to_string(),
+        ),
+        // The receive quantum and the outbound-yield policy. First-class
+        // axes because the evidence for either value is a sweep, and a
+        // knob that cannot be swept from a plan is a knob whose setting
+        // never makes it into a result row's identity.
+        axis("recv-rounds", "recv-rounds", "8"),
+        axis("would-block", "would-block", "retain"),
+        axis(
+            "datapath-queue-horizon-ms",
+            "datapath-queue-horizon-ms",
+            &crate::queue::DEFAULT_DATAPATH_QUEUE_HORIZON_MS.to_string(),
+        ),
+        axis(
+            "outbound-retry-horizon-ms",
+            "outbound-retry-horizon-ms",
+            &crate::scheduling::DEFAULT_OUTBOUND_RETRY_HORIZON_MS.to_string(),
+        ),
     ]);
-
     let unused: Vec<&str> = plan
         .iter()
         .map(|(name, _)| name.as_str())
@@ -1920,7 +2090,7 @@ fn matrix_cell_argv(cell: &Cell<'_>, role: Scope) -> Vec<String> {
     let mut out: Vec<String> = cell
         .iter()
         .filter(|(axis, scope, _)| {
-            *axis != "bitrate" && *axis != "runtime" && scope.applies_to(role)
+            *axis != "bitrate" && *axis != "runtime" && *axis != "cpus" && scope.applies_to(role)
         })
         .map(|(axis, _, value)| format!("--{axis}={value}"))
         .collect();
@@ -2143,7 +2313,6 @@ fn run_matrix_processes(
     // The listener runs to a long backstop, but the cell's stream
     // length is what any rate is computed against.
     recv_argv.push(format!("--stream-secs={secs}"));
-
     // Receiver outlives the sender so it is still listening when
     // the last packets arrive; +5s mirrors the old harness.
     let mut recv = if let Some(p) = netns {
@@ -2460,7 +2629,8 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<MatrixReport> {
     // Cartesian product, filtered one point at a time: the whole point is
     // to know how many cells there are before starting a long sweep without
     // holding the raw 1.7-million-cell product in memory.
-    let (cells, raw_cells, filter_summary) = filtered_cartesian_cells(&axes)?;
+    let (mut cells, raw_cells, filter_summary) = filtered_cartesian_cells(&axes)?;
+    add_cpu_identity(&mut cells, &recv_cpus, &send_cpus);
     if filter_summary.total() > 0 {
         let reasons = filter_summary
             .by_reason
@@ -2507,6 +2677,36 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<MatrixReport> {
         );
     }
     Ok(report)
+}
+
+fn add_cpu_identity(cells: &mut [Cell<'_>], recv_cpus: &str, send_cpus: &str) {
+    let inherited = srt_transport::current_cpu_spec().unwrap_or_default();
+    for cell in cells {
+        if recv_cpus.is_empty() && send_cpus.is_empty() {
+            if !inherited.is_empty() {
+                cell.push(("cpus", Scope::Both, inherited.clone()));
+            }
+            continue;
+        }
+        cell.push((
+            "cpus",
+            Scope::Recv,
+            if recv_cpus.is_empty() {
+                inherited.clone()
+            } else {
+                recv_cpus.to_string()
+            },
+        ));
+        cell.push((
+            "cpus",
+            Scope::Send,
+            if send_cpus.is_empty() {
+                inherited.clone()
+            } else {
+                send_cpus.to_string()
+            },
+        ));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3596,8 +3796,17 @@ mod matrix_filter_tests {
         )
         .unwrap();
         let plan_path = path.to_str().unwrap();
-        let config =
-            resolve_matrix_axes(&cli(&["--plan", plan_path, "--axis", "runtime=smol"])).unwrap();
+        let config = resolve_matrix_axes(&cli(&[
+            "--plan",
+            plan_path,
+            "--axis",
+            "runtime=smol",
+            "--axis",
+            "datapath-q-horizon-ms=100,200",
+            "--axis",
+            "retry-horizon-ms=75",
+        ]))
+        .unwrap();
         assert_eq!(
             config.axes[0],
             ("runtime", Scope::Both, vec!["smol".to_string()])
@@ -3616,7 +3825,47 @@ mod matrix_filter_tests {
         );
         assert_eq!(config.recv_cpus, "0-1");
         assert_eq!(config.send_cpus, "2-3");
+        assert_eq!(
+            config
+                .axes
+                .iter()
+                .find(|(name, _, _)| *name == "datapath-queue-horizon-ms")
+                .unwrap()
+                .2,
+            ["100", "200"]
+        );
+        assert_eq!(
+            config
+                .axes
+                .iter()
+                .find(|(name, _, _)| *name == "outbound-retry-horizon-ms")
+                .unwrap()
+                .2,
+            ["75"]
+        );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn scoped_cpu_sets_are_part_of_recorded_cell_identity() {
+        let cell = vec![
+            ("runtime", Scope::Both, "mio".to_string()),
+            ("cpus", Scope::Recv, "0-1".to_string()),
+            ("cpus", Scope::Send, "2-3".to_string()),
+        ];
+        let record = record_for(&cell, "caller", 1);
+        assert_eq!(record_key(&record, &cell, 1), Some(cell_key(&cell, 1)));
+
+        let mut changed = cell.clone();
+        changed[2].2 = "4-5".to_string();
+        assert_ne!(
+            record_key(&record, &changed, 1),
+            Some(cell_key(&changed, 1))
+        );
+        assert_eq!(
+            matrix_cell_argv(&cell, Scope::Recv),
+            ["--recv-cpus=0-1", "--send-cpus=2-3"]
+        );
     }
 }
 

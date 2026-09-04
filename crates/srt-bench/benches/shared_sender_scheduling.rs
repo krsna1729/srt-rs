@@ -19,6 +19,8 @@ fn sender_config(connections: usize, cc: usize) -> srt_bench::BenchConfig {
         source_bitrate_bps: 1_000_000,
         bandwidth: srt_bench::source::BandwidthPolicy::default(),
         source_backlog_ms: srt_bench::source::DEFAULT_SOURCE_BACKLOG_MS,
+        datapath_queue_horizon_ms: srt_bench::queue::DEFAULT_DATAPATH_QUEUE_HORIZON_MS,
+        outbound_retry_horizon_ms: srt_bench::scheduling::DEFAULT_OUTBOUND_RETRY_HORIZON_MS,
         connections,
         egress: Egress::SharedSocket,
         ingress: Ingress::SharedPool(1),
@@ -337,7 +339,12 @@ fn bench_source_clock(c: &mut Criterion) {
     group.throughput(Throughput::Elements(1_000));
     group.bench_function("tick_and_accept", |b| {
         b.iter_batched(
-            || srt_bench::source::SourceClock::new(8_000_000, 256),
+            || {
+                srt_bench::source::SourceClock::new(
+                    std::num::NonZeroU64::new(8_000_000).expect("non-zero source rate"),
+                    256,
+                )
+            },
             |mut clock| {
                 for micros in 0..1_000 {
                     clock.tick(Duration::from_micros(micros * 1_316));
@@ -389,6 +396,7 @@ fn bench_tokio_scheduling_telemetry(c: &mut Criterion) {
             || {
                 let mut queue = srt_bench::scheduling::RetryQueue::new(
                     srt_bench::scheduling::WouldBlockPolicy::Retain,
+                    4096,
                 );
                 let mut generated = vec![("127.0.0.1:9000".parse().unwrap(), vec![0; 1316]); 32];
                 queue.append(&mut generated);
@@ -407,7 +415,7 @@ fn bench_tokio_scheduling_telemetry(c: &mut Criterion) {
         let mut stats = srt_bench::scheduling::RecvSchedulingStats::default();
         b.iter(|| {
             stats.record_lateness(black_box(std::time::Duration::from_micros(17)));
-            black_box(stats.percentile_us(99));
+            black_box(stats.percentile_bucket_us(99));
         });
     });
     group.finish();

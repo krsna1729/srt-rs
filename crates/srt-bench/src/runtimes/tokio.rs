@@ -45,7 +45,17 @@ const TIMER_TICK: Duration = Duration::from_millis(10);
 /// Send queued datagrams via `sendmmsg`. Accepted datagrams drain; the
 /// configured policy decides whether a `WouldBlock` tail stays for retry.
 fn flush_outbound(fd: std::os::fd::RawFd, outbound: &mut crate::scheduling::RetryQueue) {
-    if let Err(error) = outbound.flush_with(|batch| srt_transport::sendmsg_batch(fd, batch)) {
+    // `sendmsg_batch` wants borrowed slices, so this path materialises the
+    // view it needs. The queue no longer builds one for every caller --
+    // mio's shared sender sends one datagram at a time, does not need the
+    // view, and was paying an allocation per wakeup for it.
+    if let Err(error) = outbound.flush_with(|batch| {
+        let refs: Vec<(SocketAddr, &[u8])> = batch
+            .iter()
+            .map(|(address, packet)| (*address, packet.as_slice()))
+            .collect();
+        srt_transport::sendmsg_batch(fd, &refs)
+    }) {
         eprintln!("tokio flush_outbound: dropping retained datagrams: {error}");
         outbound.discard_all();
     }
@@ -199,7 +209,8 @@ async fn run_shared_sender(cfg: &BenchConfig, start: Instant) -> (Vec<ConnStats>
     )));
     let mut sender = crate::SharedSender::new(cfg, &indices, start, limiter);
     let mut generated = Vec::new();
-    let mut outbound = crate::scheduling::RetryQueue::new(cfg.would_block);
+    let mut outbound =
+        crate::scheduling::RetryQueue::new(cfg.would_block, cfg.outbound_retry_capacity());
     let mut buffer = [0_u8; 65_536];
     let fd = {
         use std::os::fd::AsRawFd;
@@ -400,9 +411,11 @@ async fn sender_task(
     // from the start, and a periodic re-check here would cost ~1000 timer
     // wakeups per millisecond of the admission phase.
     let mut permit = crate::HandshakeAdmission::acquire_optional(limiter.as_ref()).await;
-    let socket = tokio::net::UdpSocket::bind("0.0.0.0:0")
-        .await
-        .expect("bind");
+    let socket = tokio::net::UdpSocket::from_std(
+        crate::bind_configured_socket(SocketAddr::from(([0, 0, 0, 0], 0)), cfg.sock_buf_bytes)
+            .expect("bind"),
+    )
+    .expect("register socket");
     socket.connect(endpoint).await.expect("connect");
 
     let mut options = ConnectionOptions {
@@ -481,14 +494,25 @@ async fn sender_task(
     drain_outputs(&mut driver, t).await;
     record_sender_stats(&driver, &mut stats);
     stats.source = source.stats();
+    stats.has_source = true;
     stats
 }
 
+/// One connection's receive step.
+///
+/// `recv_rounds` bounds the post-wakeup drain for the same reason it
+/// bounds the shared `recvmmsg` path: an unbounded `while try_recv()`
+/// hands the whole loop to whichever peer is sending fastest, and the
+/// connection stops firing protocol timers for as long as that lasts.
+/// The cap was previously applied only to the shared-socket path, so the
+/// ordinary per-connection loops -- the ones every non-pooled cell uses
+/// -- had no bound at all.
 async fn receive_receiver_packets(
     driver: &mut Conn,
     peer: &mut Option<SocketAddr>,
     buffer: &mut [u8; 2048],
     start: Instant,
+    recv_rounds: usize,
 ) -> bool {
     if peer.is_none() {
         let received = tokio::time::timeout(crate::MAX_WAIT, driver.sock.recv_from(buffer)).await;
@@ -511,7 +535,10 @@ async fn receive_receiver_packets(
             }
             _ = tokio::time::sleep(crate::MAX_WAIT) => {}
         }
-        while let Ok(size) = driver.sock.try_recv(buffer) {
+        for _ in 0..recv_rounds {
+            let Ok(size) = driver.sock.try_recv(buffer) else {
+                break;
+            };
             let now = crate::now_ts(start);
             let _ = driver.conn.feed_recv_buf(&buffer[..size], now);
         }
@@ -564,9 +591,14 @@ fn record_receiver_stats(driver: &Conn, stats: &mut ConnStats) {
 }
 
 async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> ConnStats {
-    let socket = tokio::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], listen_port)))
-        .await
-        .expect("bind");
+    let socket = tokio::net::UdpSocket::from_std(
+        crate::bind_configured_socket(
+            SocketAddr::from(([0, 0, 0, 0], listen_port)),
+            cfg.sock_buf_bytes,
+        )
+        .expect("bind"),
+    )
+    .expect("register socket");
 
     let mut options = ConnectionOptions {
         socket_id: std::process::id(),
@@ -595,7 +627,8 @@ async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> Co
             break;
         }
 
-        if !receive_receiver_packets(&mut driver, &mut peer, &mut buf, start).await {
+        if !receive_receiver_packets(&mut driver, &mut peer, &mut buf, start, cfg.recv_rounds).await
+        {
             continue;
         }
 
@@ -875,7 +908,8 @@ async fn run_acceptor(
     let mut tick = tokio::time::interval(TIMER_TICK);
     let mut recv_batch = RecvBatch::new();
     let mut generated = Vec::new();
-    let mut outbound = crate::scheduling::RetryQueue::new(cfg.would_block);
+    let mut outbound =
+        crate::scheduling::RetryQueue::new(cfg.would_block, cfg.outbound_retry_capacity());
     let mut scheduling = crate::scheduling::RecvSchedulingStats::default();
 
     {
@@ -1051,7 +1085,13 @@ async fn established_conn_task(mut driver: Conn, cfg: BenchConfig, start: Instan
             }
             _ = tokio::time::sleep(crate::MAX_WAIT) => {}
         }
-        while let Ok(n) = driver.sock.try_recv(&mut buf) {
+        // Bounded for the same reason as every other receive drain: an
+        // unbounded loop here starves this connection's protocol timers
+        // whenever its peer can outpace it.
+        for _ in 0..cfg.recv_rounds {
+            let Ok(n) = driver.sock.try_recv(&mut buf) else {
+                break;
+            };
             let t = crate::now_ts(start);
             let _ = driver.conn.feed_recv_buf(&buf[..n], t);
             data_events += 1;
@@ -1181,7 +1221,8 @@ async fn serve_pool_socket(cfg: BenchConfig, index: usize, start: Instant) -> Ve
     let run_deadline = Instant::now() + stream_len + IDLE_GRACE + Duration::from_secs(30);
     let mut recv_batch = RecvBatch::new();
     let mut generated = Vec::new();
-    let mut outbound = crate::scheduling::RetryQueue::new(cfg.would_block);
+    let mut outbound =
+        crate::scheduling::RetryQueue::new(cfg.would_block, cfg.outbound_retry_capacity());
     let mut scheduling = crate::scheduling::RecvSchedulingStats::default();
     let mut tick = tokio::time::interval(TIMER_TICK);
     let mut connected = Vec::new();
@@ -1447,7 +1488,8 @@ async fn run_single_acceptor(
     let mut routed = 0usize;
     let mut recv_batch = RecvBatch::new();
     let mut generated = Vec::new();
-    let mut outbound = crate::scheduling::RetryQueue::new(cfg.would_block);
+    let mut outbound =
+        crate::scheduling::RetryQueue::new(cfg.would_block, cfg.outbound_retry_capacity());
     let mut scheduling = crate::scheduling::RecvSchedulingStats::default();
     let mut tick = tokio::time::interval(TIMER_TICK);
     let mut connected = Vec::new();
