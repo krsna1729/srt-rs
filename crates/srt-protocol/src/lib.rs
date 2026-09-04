@@ -23,7 +23,9 @@ pub use crypto::{CipherMode, CryptoContext, GCM_TAG_LEN, KeyFlag, KeyLength, KmR
 pub use error::{Error, ErrorKind};
 pub use srt_connection::{
     ConnectionEvent, ConnectionOptions, ConnectionOutput, ConnectionRole, ConnectionState,
-    DEFAULT_HANDSHAKE_RETRY_INTERVAL_MICROS, DEFAULT_HANDSHAKE_TIMEOUT_MICROS, SrtConnection,
+    DEFAULT_HANDSHAKE_RETRY_INTERVAL_MICROS, DEFAULT_HANDSHAKE_TIMEOUT_MICROS,
+    FULL_ACK_CONTROL_INFO_BYTES, KEEPALIVE_INTERVAL_MICROS, LIBSRT_COMPAT_PADDING_BYTES,
+    LIGHT_ACK_CONTROL_INFO_BYTES, NAK_RANGE_BYTES, PERIODIC_NAK_INTERVAL_MICROS, SrtConnection,
     TimerId,
 };
 pub use srt_group::{
@@ -41,9 +43,10 @@ pub use srt_packet::{
     peek_destination_socket_id,
 };
 pub use srt_receiver::{
-    AckPacket, DropRangeSummary, LossRange, NakPacket, ReceiverBuffer, ReceiverStats,
+    ACK_INTERVAL_MICROS, AckPacket, DropRangeSummary, LIGHT_ACK_INTERVAL_PACKETS, LossRange,
+    NakPacket, ReceiverBuffer, ReceiverStats,
 };
-pub use srt_sender::{SenderBuffer, SenderStats};
+pub use srt_sender::{DEFAULT_MAX_BANDWIDTH_BYTES_PER_SEC, SenderBuffer, SenderStats};
 pub use stats::{
     ConnectionStats, ConnectionStatsInterval, CounterDelta, ReceiverStatsInterval,
     SenderStatsInterval,

@@ -4,6 +4,7 @@ pub mod compare;
 pub mod cpu_stats;
 pub mod driver;
 pub mod harness;
+pub mod model;
 pub mod queue;
 pub mod scheduling;
 pub mod shutdown;

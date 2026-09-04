@@ -26,13 +26,13 @@ use crate::srt_packet::{
 use crate::time::Timestamp;
 
 /// Light ACK send interval (packets).
-const LIGHT_ACK_INTERVAL: u32 = 64;
+pub const LIGHT_ACK_INTERVAL_PACKETS: u32 = 64;
 
 /// Sequence numbers are carried in the low 31 bits of each wire word.
 const SEQUENCE_MASK: u32 = 0x7FFF_FFFF;
 
 /// Periodic ACK interval (microseconds).
-const ACK_INTERVAL_US: u64 = 10_000; // 10ms
+pub const ACK_INTERVAL_MICROS: u64 = 10_000; // 10ms
 
 /// Maximum number of entries kept for tracking ACK send times.
 const MAX_ACK_TIMESTAMPS: usize = 16;
@@ -1399,7 +1399,7 @@ impl ReceiverBuffer {
         // Light ACK: every 64 packets received. At high packet rates the
         // acknowledged position advances between ACKACKs, so a light ACK is
         // never stale.
-        if self.packets_since_ack >= LIGHT_ACK_INTERVAL {
+        if self.packets_since_ack >= LIGHT_ACK_INTERVAL_PACKETS {
             return true;
         }
 
@@ -1407,7 +1407,7 @@ impl ReceiverBuffer {
         let elapsed = now
             .as_micros()
             .saturating_sub(self.last_ack_time.as_micros());
-        if elapsed < ACK_INTERVAL_US {
+        if elapsed < ACK_INTERVAL_MICROS {
             return false;
         }
 
@@ -1423,11 +1423,11 @@ impl ReceiverBuffer {
 
     /// Generate an ACK.
     pub fn generate_ack(&mut self, now: Timestamp) -> AckPacket {
-        let is_light = self.packets_since_ack >= LIGHT_ACK_INTERVAL
+        let is_light = self.packets_since_ack >= LIGHT_ACK_INTERVAL_PACKETS
             && now
                 .as_micros()
                 .saturating_sub(self.last_ack_time.as_micros())
-                < ACK_INTERVAL_US;
+                < ACK_INTERVAL_MICROS;
 
         self.last_ack_time = now;
         self.last_ack_seq = self.expected_seq;
@@ -1502,7 +1502,7 @@ impl ReceiverBuffer {
     /// Calculate the NAK send interval: (RTT + 4*RTTVar) / 2.
     pub fn nak_interval(&self) -> u64 {
         let interval = (self.rtt as u64 + 4 * self.rtt_var as u64) / 2;
-        interval.max(20_000) // Minimum 20ms.
+        interval.max(crate::PERIODIC_NAK_INTERVAL_MICROS) // Minimum 20ms.
     }
 
     /// Process an ACKACK and update RTT.
