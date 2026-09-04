@@ -1,0 +1,24 @@
+# PR gate: high connection count with deliberately tiny steady-state load.
+# This isolates admission/ramp correctness from datapath capacity on shared CI.
+runtime                     = mio,compio
+ingress                     = shared-pool:4
+egress                      = per-connection
+encryption                  = plain
+connections                 = 600
+bitrate                     = 50000
+srt-bandwidth               = input-relative:25
+workers                     = 1
+promotion                   = all
+cookie-routing              = on
+batch                       = on
+sock-buf                    = 16m
+connect-concurrency         = 10
+bond                        = none
+source-backlog-ms           = 250
+# A two-second bound absorbs the high-N handshake ramp; the canonical clean
+# check still requires the steady-state source to be fully offered/delivered.
+datapath-queue-horizon-ms   = 2000
+outbound-retry-horizon-ms   = 250
+recv-rounds                 = 8
+would-block                 = retain
+pin                         = off
