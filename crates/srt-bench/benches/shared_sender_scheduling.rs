@@ -29,6 +29,7 @@ fn sender_config(connections: usize, cc: usize) -> srt_bench::BenchConfig {
         sock_buf_bytes: 0,
         out: None,
         rep: 1,
+        attempt: String::new(),
         cpus: 0,
         pin: false,
         workers: 1,
