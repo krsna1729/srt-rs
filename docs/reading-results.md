@@ -16,8 +16,9 @@ instead of a hunch.
 
 ### Configuration (identical on both rows)
 
-`runtime encryption ingress promotion cookie batch sock_buf cpus pin link_* workers
-recv_* send_* conns connect_cc bond bitrate rep secs` — the axes the cell
+`runtime encryption ingress promotion cookie batch recv_rounds
+would_block_policy sock_buf cpus pin link_* workers recv_* send_* conns
+connect_cc bond source_bps srt_bw_mode rep secs` — the axes the cell
 was run at. `encryption` is `plain`, `128`, `192`, or `256`. `secs` is the
 stream length both roles agree on; it is not
 `elapsed_s` (see below).
@@ -49,6 +50,13 @@ cell with heavy loss and `sec_a = 0` on the listener is not a mystery:
 check `udp_rcvbuf_err` first. That single check found the actual cause of
 what had been recorded as an unexplained ~50% loss with no retransmits —
 1.27M receive-queue overflows, invisible anywhere else in the row.
+
+`recv_packets`, `recv_syscalls`, and `datagrams_per_syscall` describe the
+Tokio shared-pool receive service. `timer_late_p50_us` through
+`timer_late_max_us` are fixed-histogram maintenance-tick lateness estimates.
+`retry_cap`, `retry_hwm`, `would_block`, `retry_overflow`, and `local_dropped`
+describe benchmark-owned shared-socket outbound work; a clean pair requires
+zero retry overflow and local drops.
 
 ### Resource cost
 

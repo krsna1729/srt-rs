@@ -42,26 +42,12 @@ use std::time::{Duration, Instant};
 const IDLE_GRACE: Duration = Duration::from_secs(10);
 const TIMER_TICK: Duration = Duration::from_millis(10);
 
-/// Send queued datagrams via `sendmmsg`.  Only the datagrams the kernel
-/// accepted are drained; unsent ones stay in `outbound` for retry.
-/// Non-retriable errors clear the buffer and are logged.
-fn flush_outbound(fd: std::os::fd::RawFd, outbound: &mut Vec<(SocketAddr, Vec<u8>)>) {
-    if outbound.is_empty() {
-        return;
-    }
-    let refs: Vec<(SocketAddr, &[u8])> = outbound.iter().map(|(a, b)| (*a, b.as_slice())).collect();
-    match srt_transport::sendmsg_batch(fd, &refs) {
-        Ok(sent) => {
-            outbound.drain(..sent);
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-        Err(e) => {
-            eprintln!(
-                "tokio flush_outbound: dropping {} datagrams: {e}",
-                outbound.len()
-            );
-            outbound.clear();
-        }
+/// Send queued datagrams via `sendmmsg`. Accepted datagrams drain; the
+/// configured policy decides whether a `WouldBlock` tail stays for retry.
+fn flush_outbound(fd: std::os::fd::RawFd, outbound: &mut crate::scheduling::RetryQueue) {
+    if let Err(error) = outbound.flush_with(|batch| srt_transport::sendmsg_batch(fd, batch)) {
+        eprintln!("tokio flush_outbound: dropping retained datagrams: {error}");
+        outbound.discard_all();
     }
 }
 
@@ -90,31 +76,35 @@ impl RecvBatch {
 fn drain_recv(
     sock: &tokio::net::UdpSocket,
     batch: &mut RecvBatch,
+    max_rounds: usize,
+    stats: &mut crate::scheduling::RecvSchedulingStats,
     mut on_datagram: impl FnMut(SocketAddr, &[u8]),
 ) {
-    const MAX_RECV_ROUNDS: usize = 8;
     use std::os::fd::AsRawFd;
     let mut rounds = 0;
-    while let Ok(received) = sock.try_io(tokio::io::Interest::READABLE, || {
-        let n = srt_transport::recvmsg_batch(
-            sock.as_raw_fd(),
-            &mut batch.bufs,
-            &mut batch.sizes,
-            &mut batch.addrs,
-        )?;
-        if n == 0 {
-            Err(std::io::ErrorKind::WouldBlock.into())
-        } else {
-            Ok(n)
-        }
-    }) {
+    loop {
+        let result = sock.try_io(tokio::io::Interest::READABLE, || {
+            let n = srt_transport::recvmsg_batch(
+                sock.as_raw_fd(),
+                &mut batch.bufs,
+                &mut batch.sizes,
+                &mut batch.addrs,
+            )?;
+            if n == 0 {
+                Err(std::io::ErrorKind::WouldBlock.into())
+            } else {
+                Ok(n)
+            }
+        });
+        let Ok(received) = result else { break };
+        stats.record_recv(received);
         for i in 0..received {
             if let Some(peer) = batch.addrs[i] {
                 on_datagram(peer, &batch.bufs[i][..batch.sizes[i]]);
             }
         }
         rounds += 1;
-        if received < batch.bufs.len() || rounds >= MAX_RECV_ROUNDS {
+        if received < batch.bufs.len() || rounds >= max_rounds {
             break;
         }
     }
@@ -208,16 +198,18 @@ async fn run_shared_sender(cfg: &BenchConfig, start: Instant) -> (Vec<ConnStats>
         cfg.connect_concurrency,
     )));
     let mut sender = crate::SharedSender::new(cfg, &indices, start, limiter);
-    let mut outbound = Vec::new();
+    let mut generated = Vec::new();
+    let mut outbound = crate::scheduling::RetryQueue::new(cfg.would_block);
     let mut buffer = [0_u8; 65_536];
     let fd = {
         use std::os::fd::AsRawFd;
         socket.as_raw_fd()
     };
     loop {
-        sender.tick(cfg, &mut outbound);
+        sender.tick(cfg, &mut generated);
+        outbound.append(&mut generated);
         flush_outbound(fd, &mut outbound);
-        if sender.done() {
+        if sender.done() && outbound.is_empty() {
             break;
         }
         tokio::select! {
@@ -230,7 +222,11 @@ async fn run_shared_sender(cfg: &BenchConfig, start: Instant) -> (Vec<ConnStats>
         }
     }
     let cc_peak = sender.cc_peak();
-    (sender.finish(), cc_peak)
+    let mut stats = sender.finish();
+    if let Some(first) = stats.first_mut() {
+        first.outbound_retry.merge(outbound.stats());
+    }
+    (stats, cc_peak)
 }
 
 /// Drive one worker's share of the connections on this thread's runtime.
@@ -711,12 +707,13 @@ async fn wait_for_acceptor_input(
     listener: &tokio::net::UdpSocket,
     tick: &mut tokio::time::Interval,
     recv_batch: &mut RecvBatch,
+    scheduling: &mut crate::scheduling::RecvSchedulingStats,
     peers: &mut srt_transport::PeerTable,
     context: &AcceptorContext<'_>,
 ) {
     tokio::select! {
         _ = listener.readable() => {
-            drain_recv(listener, recv_batch, |peer, data| {
+            drain_recv(listener, recv_batch, context.cfg.recv_rounds, scheduling, |peer, data| {
                 peers.admit_and_forward(
                     peer,
                     data,
@@ -728,7 +725,9 @@ async fn wait_for_acceptor_input(
                 );
             });
         }
-        _ = tick.tick() => {}
+        scheduled = tick.tick() => {
+            scheduling.record_lateness(tokio::time::Instant::now().saturating_duration_since(scheduled));
+        }
     }
 }
 
@@ -875,7 +874,9 @@ async fn run_acceptor(
     let run_deadline = Instant::now() + stream_len + IDLE_GRACE + Duration::from_secs(30);
     let mut tick = tokio::time::interval(TIMER_TICK);
     let mut recv_batch = RecvBatch::new();
-    let mut outbound = Vec::new();
+    let mut generated = Vec::new();
+    let mut outbound = crate::scheduling::RetryQueue::new(cfg.would_block);
+    let mut scheduling = crate::scheduling::RecvSchedulingStats::default();
 
     {
         let mut context = AcceptorContext {
@@ -901,11 +902,19 @@ async fn run_acceptor(
                 break;
             }
 
-            wait_for_acceptor_input(&listener, &mut tick, &mut recv_batch, &mut peers, &context)
-                .await;
+            wait_for_acceptor_input(
+                &listener,
+                &mut tick,
+                &mut recv_batch,
+                &mut scheduling,
+                &mut peers,
+                &context,
+            )
+            .await;
 
             let t = crate::now_ts(start);
-            peers.poll_outbound(t, &mut outbound);
+            peers.poll_outbound(t, &mut generated);
+            outbound.append(&mut generated);
             flush_outbound(listener_fd, &mut outbound);
             promote_connected_peers(&mut context, &mut peers, stream_len);
 
@@ -943,6 +952,10 @@ async fn run_acceptor(
         if let Ok(s) = task.await {
             stats.push(s);
         }
+    }
+    if let Some(first) = stats.first_mut() {
+        first.recv_scheduling.merge(scheduling);
+        first.outbound_retry.merge(outbound.stats());
     }
     stats
 }
@@ -1167,7 +1180,10 @@ async fn serve_pool_socket(cfg: BenchConfig, index: usize, start: Instant) -> Ve
     let stream_len = Duration::from_secs_f64(cfg.duration_secs);
     let run_deadline = Instant::now() + stream_len + IDLE_GRACE + Duration::from_secs(30);
     let mut recv_batch = RecvBatch::new();
-    let mut outbound: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
+    let mut generated = Vec::new();
+    let mut outbound = crate::scheduling::RetryQueue::new(cfg.would_block);
+    let mut scheduling = crate::scheduling::RecvSchedulingStats::default();
+    let mut tick = tokio::time::interval(TIMER_TICK);
     let mut connected = Vec::new();
     let mut connected_streams = 0usize;
     let mut logical_run_deadline = None;
@@ -1194,15 +1210,18 @@ async fn serve_pool_socket(cfg: BenchConfig, index: usize, start: Instant) -> Ve
 
         tokio::select! {
             _ = sock.readable() => {
-                drain_recv(&sock, &mut recv_batch, |peer, data| {
+                drain_recv(&sock, &mut recv_batch, cfg.recv_rounds, &mut scheduling, |peer, data| {
                     admit_one(&mut peers, &admission, peer, data, start);
                 });
             }
-            _ = tokio::time::sleep(TIMER_TICK) => {}
+            scheduled = tick.tick() => {
+                scheduling.record_lateness(tokio::time::Instant::now().saturating_duration_since(scheduled));
+            }
         }
 
         let t = crate::now_ts(start);
-        peers.poll_outbound(t, &mut outbound);
+        peers.poll_outbound(t, &mut generated);
+        outbound.append(&mut generated);
         flush_outbound(sock_fd, &mut outbound);
         // SharedPool never promotes, so a first Connected only starts the
         // stream clock -- which drain_events already did.
@@ -1213,7 +1232,12 @@ async fn serve_pool_socket(cfg: BenchConfig, index: usize, start: Instant) -> Ve
         }
     }
 
-    crate::collect_listener_stats(peers)
+    let mut stats = crate::collect_listener_stats(peers);
+    if let Some(first) = stats.first_mut() {
+        first.recv_scheduling.merge(scheduling);
+        first.outbound_retry.merge(outbound.stats());
+    }
+    stats
 }
 
 /// Admit one datagram. No reuseport group means no cookie forwarding, so
@@ -1280,7 +1304,7 @@ fn run_reuseport_single(cfg: BenchConfig, workers: usize) {
     }
 
     let agg_cfg = cfg.clone();
-    {
+    let (acceptor_scheduling, acceptor_retry) = {
         let router = router.clone();
         let senders = senders.clone();
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -1290,13 +1314,15 @@ fn run_reuseport_single(cfg: BenchConfig, workers: usize) {
         rt.block_on(
             tokio::task::LocalSet::new()
                 .run_until(run_single_acceptor(&cfg, start, &router, &senders)),
-        );
-    }
+        )
+    };
     // Workers stop when their tally is met; dropping the last senders
     // also unblocks any that never received one.
     drop(senders);
 
     let mut agg = Aggregate::new(agg_cfg);
+    agg.recv_scheduling.merge(acceptor_scheduling);
+    agg.outbound_retry.merge(acceptor_retry);
     for handle in handles {
         for s in handle.join().expect("worker panicked") {
             agg.add(s);
@@ -1313,18 +1339,23 @@ fn run_reuseport_single(cfg: BenchConfig, workers: usize) {
 /// as it is established.
 async fn admit_single_until_tick(
     listener: &tokio::net::UdpSocket,
-    recv_batch: &mut RecvBatch,
+    tick: &mut tokio::time::Interval,
+    recv: (&mut RecvBatch, &mut crate::scheduling::RecvSchedulingStats),
     peers: &mut srt_transport::PeerTable,
     admission: &srt_transport::AdmissionOptions,
+    recv_rounds: usize,
     start: Instant,
 ) {
+    let (recv_batch, scheduling) = recv;
     tokio::select! {
         _ = listener.readable() => {
-            drain_recv(listener, recv_batch, |peer, data| {
+            drain_recv(listener, recv_batch, recv_rounds, scheduling, |peer, data| {
                 admit_one(peers, admission, peer, data, start);
             });
         }
-        _ = tokio::time::sleep(TIMER_TICK) => {}
+        scheduled = tick.tick() => {
+            scheduling.record_lateness(tokio::time::Instant::now().saturating_duration_since(scheduled));
+        }
     }
 }
 
@@ -1389,14 +1420,17 @@ async fn run_single_acceptor(
     start: Instant,
     router: &crate::SharedWorkerRouter,
     senders: &[mpsc::Sender<WorkerMessage>],
+) -> (
+    crate::scheduling::RecvSchedulingStats,
+    crate::scheduling::RetryStats,
 ) {
     let Ok(std_socket) = srt_transport::bind_reuseport(cfg.port, cfg.sock_buf_bytes) else {
         eprintln!("[bench-tokio] reuseport-single: bind failed");
-        return;
+        return Default::default();
     };
     let Some(listener) = tokio::net::UdpSocket::from_std(std_socket).ok() else {
         eprintln!("[bench-tokio] reuseport-single: register failed");
-        return;
+        return Default::default();
     };
     let listener_fd = {
         use std::os::fd::AsRawFd;
@@ -1412,7 +1446,10 @@ async fn run_single_acceptor(
     let stream_len = Duration::from_secs_f64(cfg.duration_secs);
     let mut routed = 0usize;
     let mut recv_batch = RecvBatch::new();
-    let mut outbound: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
+    let mut generated = Vec::new();
+    let mut outbound = crate::scheduling::RetryQueue::new(cfg.would_block);
+    let mut scheduling = crate::scheduling::RecvSchedulingStats::default();
+    let mut tick = tokio::time::interval(TIMER_TICK);
     let mut connected = Vec::new();
     let context = SingleAcceptorContext {
         cfg,
@@ -1425,10 +1462,20 @@ async fn run_single_acceptor(
     // Admission ends with the connect window: anything not established by
     // then never will be.
     while Instant::now() < connect_deadline && routed < cfg.connections {
-        admit_single_until_tick(&listener, &mut recv_batch, &mut peers, &admission, start).await;
+        admit_single_until_tick(
+            &listener,
+            &mut tick,
+            (&mut recv_batch, &mut scheduling),
+            &mut peers,
+            &admission,
+            cfg.recv_rounds,
+            start,
+        )
+        .await;
 
         let t = crate::now_ts(start);
-        peers.poll_outbound(t, &mut outbound);
+        peers.poll_outbound(t, &mut generated);
+        outbound.append(&mut generated);
         flush_outbound(listener_fd, &mut outbound);
         route_connected_peers(&context, &mut peers, &mut connected, &mut routed);
     }
@@ -1447,6 +1494,7 @@ async fn run_single_acceptor(
             router.active_group_count()
         );
     }
+    (scheduling, outbound.stats())
 }
 
 /// One worker: drive whatever the acceptor hands it, to completion.

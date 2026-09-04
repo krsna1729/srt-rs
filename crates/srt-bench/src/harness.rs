@@ -80,6 +80,8 @@ pub const COLUMNS: &[&str] = &[
     "promotion",
     "cookie",
     "batch",
+    "recv_rounds",
+    "would_block_policy",
     "sock_buf",
     "cpus",
     "pin",
@@ -152,6 +154,18 @@ pub const COLUMNS: &[&str] = &[
     "datapath_q_hwm",
     "datapath_q_full",
     "datapath_q_dropped",
+    "recv_packets",
+    "recv_syscalls",
+    "datagrams_per_syscall",
+    "timer_late_p50_us",
+    "timer_late_p95_us",
+    "timer_late_p99_us",
+    "timer_late_max_us",
+    "retry_cap",
+    "retry_hwm",
+    "would_block",
+    "retry_overflow",
+    "local_dropped",
 ];
 
 /// Configuration columns that define a unique benchmark workload/cell.
@@ -165,6 +179,8 @@ pub const CONFIG_COLUMNS: &[&str] = &[
     "promotion",
     "cookie",
     "batch",
+    "recv_rounds",
+    "would_block_policy",
     "sock_buf",
     "cpus",
     "pin",
@@ -256,6 +272,8 @@ pub struct RunMeasurements {
     /// protocol carried.
     pub source: crate::source::SourceStats,
     pub datapath_queue: crate::queue::QueueStats,
+    pub recv_scheduling: crate::scheduling::RecvSchedulingStats,
+    pub outbound_retry: crate::scheduling::RetryStats,
 }
 
 /// Append one run's result, writing the header first if the file is new.
@@ -281,6 +299,8 @@ pub fn append_result(
         cc_peak,
         source,
         datapath_queue,
+        recv_scheduling,
+        outbound_retry,
     } = *measurements;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -322,6 +342,8 @@ pub fn append_result(
             Batching::On => "on".into(),
             Batching::Off => "off".into(),
         },
+        cfg.recv_rounds.to_string(),
+        cfg.would_block.as_str().to_string(),
         cfg.sock_buf_bytes.to_string(),
         srt_transport::available_cpus().to_string(),
         if cfg.pin { "on" } else { "off" }.into(),
@@ -380,6 +402,25 @@ pub fn append_result(
         datapath_queue.high_water.to_string(),
         datapath_queue.full_events.to_string(),
         datapath_queue.dropped_or_rejected.to_string(),
+        recv_scheduling.packets.to_string(),
+        recv_scheduling.syscalls.to_string(),
+        if recv_scheduling.syscalls == 0 {
+            "0".to_string()
+        } else {
+            format!(
+                "{:.3}",
+                recv_scheduling.packets as f64 / recv_scheduling.syscalls as f64
+            )
+        },
+        recv_scheduling.percentile_us(50).to_string(),
+        recv_scheduling.percentile_us(95).to_string(),
+        recv_scheduling.percentile_us(99).to_string(),
+        recv_scheduling.lateness_max_us.to_string(),
+        outbound_retry.capacity.to_string(),
+        outbound_retry.high_water.to_string(),
+        outbound_retry.would_block.to_string(),
+        outbound_retry.overflow.to_string(),
+        outbound_retry.local_dropped.to_string(),
     ];
     debug_assert_eq!(values.len(), COLUMNS.len(), "row/header width mismatch");
     let _ = write!(row, "{}", values.join("\t"));
