@@ -51,6 +51,11 @@ compio = { version = "0.19", features = ["io", "io-uring", "net", "runtime", "ti
 criterion = "0.8"
 proptest = "1.11"
 
+[[bench]]
+name = "shared_sender_scheduling"
+harness = false
+required-features = ["bench-internals"]
+
 [features]
 bench-internals = []
 
