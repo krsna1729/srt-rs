@@ -6,7 +6,14 @@ ingress             = shared-pool:1
 egress              = shared-socket
 encryption          = plain
 connections         = 32
+# `bitrate` is the SOURCE PAYLOAD rate the application produces. SRT's
+# pacing is configured separately and explicitly below: `input-relative:25`
+# sets SRTO_INPUTBW to that source rate with a 25% SRTO_OHEADBW allowance,
+# so the protocol has headroom to carry the workload plus retransmission
+# rather than pacing fractionally below it (which is what the historical
+# `legacy-source-fixed` coupling of the two numbers did).
 bitrate             = 4000000
+srt-bandwidth       = input-relative:25
 workers             = 1
 promotion           = all
 cookie-routing      = on

@@ -28,14 +28,21 @@ benchmark.
 ```
 srt-bench runtime=<mio|tokio|smol|monoio|glommio|compio> \
   mode=<sender|receiver> <host?> <port> <duration_secs> <latency_ms> \
-  [bitrate_bps] [--connections N] [--encryption plain|128|192|256]
+  [source_bitrate_bps] [--connections N] [--encryption plain|128|192|256]
+  [--srt-bandwidth protocol-default|legacy-source-fixed|fixed:BPS|input-relative:PCT]
+  [--source-backlog-ms MS]
   [--ingress …] [--egress per-connection|shared-socket] [--promotion …]
   [--cookie-routing on|off] [--batch on|off] [--sock-buf …]
   [--connect-concurrency N] [--bond …] [--out FILE]
 ```
 
-- Sender takes `<host>`; receiver doesn't. Defaults: bitrate 8 Mbps,
-  connections 1.
+- Sender takes `<host>`; receiver doesn't. The positional rate is application
+  payload in bits per second, independent of SRT pacing; it defaults to
+  8 Mbit/s. `--srt-bandwidth` defaults to the explicitly recorded
+  `legacy-source-fixed` policy (`MAXBW = source_bitrate_bps / 8`) for historical
+  comparability. `protocol-default` leaves SRT's ceiling unchanged,
+  `fixed:BPS` sets an independent MAXBW, and `input-relative:PCT` maps the
+  source rate to INPUTBW with the stated OHEADBW. Connections default to 1.
 - `per-port` uses port+i; `shared-pool:K` maps connection *i* to
   `port + i % K`; reuseport topologies share the base port.
 - Loss mode and scale mode are the same code path per runtime — loss runs

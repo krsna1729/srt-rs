@@ -278,14 +278,30 @@ fn handle_sender_events(
     }
 }
 
+/// Offer the application source's pending payload to SRT.
+///
+/// The source clock, not SRT's pacing, decides how much payload exists;
+/// SRT only decides how much of it gets through. Draining "while SRT
+/// allows" -- which is what this used to do -- made the workload rate and
+/// the pacing ceiling the same quantity.
 async fn send_paced_payload(
     driver: &mut Conn,
     payload: &[u8],
     now: shiguredo_srt::Timestamp,
     stats: &mut ConnStats,
+    source: &mut crate::source::SourceClock,
 ) {
-    while driver.send_paced(payload, now).await.is_ok() {
+    let mut accepted = 0;
+    while source.pending() > accepted {
+        if driver.send_paced(payload, now).await.is_err() {
+            source.refused();
+            break;
+        }
         stats.data_events += 1;
+        accepted += 1;
+    }
+    for _ in 0..accepted {
+        source.accepted();
     }
 }
 
@@ -315,9 +331,12 @@ async fn sender_task(
     let mut options = ConnectionOptions {
         socket_id: cfg.caller_socket_id_for(index),
         tsbpd_delay: cfg.latency_ms,
-        max_bandwidth_bytes_per_sec: Some(cfg.bitrate_bps / 8),
         ..Default::default()
     };
+    // One resolution point for every runtime: the pacing policy comes
+    // from the config, not from a local `bitrate / 8` that would make the
+    // workload rate and the pacing ceiling the same number again.
+    cfg.apply_srt_bandwidth(&mut options);
     cfg.encryption.apply_to(&mut options);
     let mut conn = SrtConnection::new_caller(options);
     conn.connect(crate::now_ts(start))
@@ -331,6 +350,7 @@ async fn sender_task(
     drain_outputs(&mut driver, crate::now_ts(start)).await;
 
     let payload = vec![0x42u8; crate::PAYLOAD_SIZE];
+    let mut source = cfg.source_clock();
     let mut stats = ConnStats::default();
     let mut stream_deadline: Option<Instant> = None;
     let handshake_started = Instant::now();
@@ -348,11 +368,12 @@ async fn sender_task(
             break;
         }
 
-        // Sleep until the next paced send is due; the reader keeps draining
-        // the socket into the channel meanwhile.
+        // Sleep until the next send is due; the reader keeps draining the
+        // socket into the channel meanwhile. Two clocks gate that: SRT's
+        // pacing and the application source, whichever is binding.
         let wait = if stats.connected {
-            Duration::from_micros(driver.conn.time_until_send(crate::now_ts(start)))
-                .min(crate::MAX_WAIT)
+            let pacing = driver.conn.time_until_send(crate::now_ts(start));
+            Duration::from_micros(source.wait_micros(start.elapsed(), pacing)).min(crate::MAX_WAIT)
         } else {
             crate::MAX_WAIT
         };
@@ -384,8 +405,9 @@ async fn sender_task(
             // so it stops firing timers (no TLPKTDROP) and stops draining
             // received ACKs, and the send buffer grows to the full flow
             // window. That was ~12 MB per connection under overload.
+            source.tick(start.elapsed());
             let now = crate::now_ts(start);
-            send_paced_payload(&mut driver, &payload, now, &mut stats).await;
+            send_paced_payload(&mut driver, &payload, now, &mut stats, &mut source).await;
         }
     }
 
@@ -400,6 +422,7 @@ async fn sender_task(
     driver.conn.disconnect(t);
     drain_outputs(&mut driver, t).await;
     record_sender_stats(&driver, &mut stats);
+    stats.source = source.stats();
     stats
 }
 

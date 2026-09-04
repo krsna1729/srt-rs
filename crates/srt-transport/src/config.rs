@@ -162,7 +162,49 @@ pub enum Bandwidth {
     },
 }
 
+/// The protocol-level pacing settings a [`Bandwidth`] resolves to, in the
+/// units `shiguredo_srt::ConnectionOptions` states them in.
+///
+/// Exposed so a caller that builds `ConnectionOptions` by hand -- a
+/// benchmark harness, say -- can both apply the policy and *record what
+/// it resolved to*, without re-deriving MAXBW from a source rate itself.
+/// A result row that only says "8000000" cannot later be read as either a
+/// workload rate or a pacing ceiling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResolvedBandwidth {
+    /// `SRTO_MAXBW`, bytes per second. `None` leaves the protocol default.
+    pub max_bytes_per_sec: Option<u64>,
+    /// `SRTO_INPUTBW`, bytes per second.
+    pub input_bytes_per_sec: Option<u64>,
+    /// `SRTO_OHEADBW`, percent. Only meaningful with `input_bytes_per_sec`.
+    pub overhead_percent: u8,
+}
+
 impl Bandwidth {
+    /// The protocol values this policy resolves to.
+    #[must_use]
+    pub fn resolve(self) -> ResolvedBandwidth {
+        let (max_bytes_per_sec, input_bytes_per_sec, overhead_percent) =
+            self.as_connection_values();
+        ResolvedBandwidth {
+            max_bytes_per_sec,
+            input_bytes_per_sec,
+            overhead_percent,
+        }
+    }
+
+    /// Write this policy into raw protocol connection options.
+    ///
+    /// The one place a `Bandwidth` becomes MAXBW/INPUTBW/OHEADBW, so
+    /// callers that construct `ConnectionOptions` directly cannot drift
+    /// from the ones that go through [`SessionConfig`].
+    pub fn apply_to(self, options: &mut shiguredo_srt::ConnectionOptions) {
+        let resolved = self.resolve();
+        options.max_bandwidth_bytes_per_sec = resolved.max_bytes_per_sec;
+        options.input_bandwidth_bytes_per_sec = resolved.input_bytes_per_sec;
+        options.overhead_bandwidth_percent = resolved.overhead_percent;
+    }
+
     fn as_connection_values(self) -> (Option<u64>, Option<u64>, u8) {
         match self {
             Self::ProtocolDefault => (None, None, 25),

@@ -9,3 +9,8 @@ egress     = shared-socket
 encryption = plain,128,192,256
 connections = 2
 bond       = broadcast:1,backup:1
+
+# SRT's pacing policy, stated explicitly rather than inherited from a
+# default: SRTO_INPUTBW tracks the source payload rate with a 25%
+# SRTO_OHEADBW allowance for retransmission.
+srt-bandwidth = input-relative:25
