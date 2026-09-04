@@ -2269,14 +2269,21 @@ fn recorded_roles(
     Ok((caller, listener))
 }
 
-/// Identity for one attempted (cell, rep), unique across processes and
-/// across re-runs of the same sweep into the same result file.
-///
-/// The pid separates concurrent or successive harness invocations; the
-/// sequence number separates attempts within one invocation. Both roles
-/// of one attempt are stamped with the same value.
-fn attempt_id(sequence: usize) -> String {
-    format!("{}-{sequence}", std::process::id())
+/// Generate a nonce that remains fresh even when the OS reuses a PID.
+fn new_invocation_nonce() -> std::io::Result<String> {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes).map_err(std::io::Error::other)?;
+    let mut nonce = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write;
+        write!(&mut nonce, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    Ok(nonce)
+}
+
+/// Identity for one attempted cell. Both roles of one attempt share it.
+fn attempt_id(invocation_nonce: &str, sequence: usize) -> String {
+    format!("{invocation_nonce}-{sequence}")
 }
 
 /// Run one cell's receiver/sender pair, returning every way a *required*
@@ -2468,6 +2475,7 @@ struct MatrixScheduleContext<'a, 'cell> {
     latency: u16,
     recv_cpus: &'a str,
     send_cpus: &'a str,
+    invocation_nonce: &'a str,
     netns: Option<Priv>,
 }
 
@@ -2483,6 +2491,7 @@ fn run_matrix_schedule(context: MatrixScheduleContext<'_, '_>) -> std::io::Resul
         latency,
         recv_cpus,
         send_cpus,
+        invocation_nonce,
         netns,
     } = context;
     let mut report = MatrixReport::default();
@@ -2509,10 +2518,10 @@ fn run_matrix_schedule(context: MatrixScheduleContext<'_, '_>) -> std::io::Resul
             report.resumed_runs += 1;
             continue;
         }
-        // One identity per attempted cell, stamped on both roles. `run_index`
-        // is unique within this invocation and the pid separates invocations,
-        // so no two attempts can ever share a stamp in one result file.
-        let attempt = attempt_id(run_index);
+        // One identity per attempted cell, stamped on both roles. The
+        // invocation nonce separates independent matrix processes; the
+        // sequence separates attempts within this invocation.
+        let attempt = attempt_id(invocation_nonce, run_index);
         let failures = run_scheduled_cell(
             MatrixProcessContext {
                 sender_exe,
@@ -2646,6 +2655,7 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<MatrixReport> {
     }
     let (order, seed) = matrix_order(cli)?;
     let schedule = build_matrix_schedule(&cells, &axes, reps, order, seed, &out)?;
+    let invocation_nonce = new_invocation_nonce()?;
 
     // Every cell of a netem sweep runs inside the namespace, including the
     // `netem=none` ones: a namespace's loopback is not identical to the
@@ -2663,6 +2673,7 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<MatrixReport> {
         latency,
         recv_cpus: &recv_cpus,
         send_cpus: &send_cpus,
+        invocation_nonce: &invocation_nonce,
         sender_exe: &sender_exe,
         receiver_exe: &receiver_exe,
         netns,
@@ -3142,10 +3153,10 @@ pub fn run_sysprof(cli: &crate::Cli) -> std::io::Result<()> {
 #[cfg(test)]
 mod matrix_filter_tests {
     use super::{
-        Axis, COLUMNS, Cell, MatrixOrder, Record, Scope, axis_overrides, build_matrix_schedule,
-        cell_key, filter_matrix_cells, filter_reason, filtered_cartesian_cells, interleave_indices,
-        matrix_cell_argv, matrix_cell_config, read_results, record_key, recorded_as,
-        resolve_matrix_axes, shuffle,
+        Axis, COLUMNS, Cell, MatrixOrder, Record, Scope, attempt_id, axis_overrides,
+        build_matrix_schedule, cell_key, filter_matrix_cells, filter_reason,
+        filtered_cartesian_cells, interleave_indices, matrix_cell_argv, matrix_cell_config,
+        read_results, record_key, recorded_as, recorded_roles, resolve_matrix_axes, shuffle,
     };
     use crate::Cli;
     use std::path::PathBuf;
@@ -3749,6 +3760,30 @@ mod matrix_filter_tests {
         assert!(orphaned.done.is_empty());
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(orphan_path);
+    }
+
+    #[test]
+    fn attempt_nonce_keeps_stale_partial_rows_out_of_a_new_run() {
+        let cells = schedule_cells();
+        let path = temp_tsv("attempt-nonce");
+        let old_attempt = attempt_id("old-invocation-nonce", 0);
+        let new_attempt = attempt_id("new-invocation-nonce", 0);
+        let mut listener = record_for(&cells[0], "listener", 1);
+        let mut caller = record_for(&cells[0], "caller", 1);
+        set_field(&mut listener.fields, "attempt", old_attempt.clone());
+        set_field(&mut caller.fields, "attempt", new_attempt.clone());
+        write_records(&path, &[listener, caller]);
+
+        assert_eq!(
+            recorded_roles(&path, &cells[0], 1, &new_attempt).unwrap(),
+            (true, false),
+            "rows from a previous invocation nonce must not satisfy a new attempt"
+        );
+        assert_eq!(
+            recorded_roles(&path, &cells[0], 1, &old_attempt).unwrap(),
+            (false, true)
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

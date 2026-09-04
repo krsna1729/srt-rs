@@ -701,7 +701,7 @@ fn render_frontier_markdown(
     writeln!(
         out,
         "Source target is the application workload, not SRT's pacing ceiling: \
-         `target = conns × (source_bps ÷ 8) × secs ÷ 1316`. SRT's own ceiling is \
+         `target = source_streams × (source_bps ÷ 8) × secs ÷ 1316`. SRT's own ceiling is \
          recorded separately as `srt_maxbw_bps`."
     )
     .unwrap();
