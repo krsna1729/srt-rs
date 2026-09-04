@@ -82,14 +82,7 @@ fn main() {
             }
             return;
         }
-        Some("matrix") => {
-            let cli = srt_bench::Cli::parse(&args[1..]);
-            if let Err(e) = srt_bench::harness::run_matrix(&cli) {
-                eprintln!("matrix: {e}");
-                std::process::exit(1);
-            }
-            return;
-        }
+        Some("matrix") => return matrix(&args),
         _ => {}
     }
 
@@ -100,6 +93,28 @@ fn main() {
 
     let cfg = srt_bench::bench_config_from_args();
     srt_bench::runtimes::run(cfg);
+}
+
+/// `srt-bench matrix ...` -- run the sweep, then exit 0 **only** if every
+/// required cell and role completed successfully.
+///
+/// A child that crashed, was signalled, or exited cleanly without writing
+/// its result row fails the whole invocation. Without that, automation
+/// could report a green benchmark campaign over a sweep whose sender had
+/// died (issue #39).
+fn matrix(args: &[String]) {
+    let cli = srt_bench::Cli::parse(&args[1..]);
+    match srt_bench::harness::run_matrix(&cli) {
+        Ok(report) if report.ok() => {}
+        Ok(report) => {
+            eprint!("{}", report.failure_summary());
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("matrix: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// `srt-bench report FILE [--by col,col,...]` -- median table over a result

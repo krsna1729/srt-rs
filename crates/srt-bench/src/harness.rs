@@ -104,6 +104,14 @@ pub const COLUMNS: &[&str] = &[
     "bond",
     "bitrate",
     "rep",
+    // Identity of the *attempt* that wrote this row, not of the cell.
+    // A results file is append-only, so an interrupted run can leave a
+    // half-finished pair behind; without this, a later attempt's listener
+    // row plus a previous attempt's caller row read as one complete pair
+    // and a row-less child looked successful. Deliberately absent from
+    // `CONFIG_COLUMNS`: two attempts at the same cell are the same
+    // experiment, and must still group and resume as one.
+    "attempt",
     "established",
     "torn_down",
     "pkt_sent",
@@ -283,6 +291,7 @@ pub fn append_result(
         describe_bond(cfg),
         cfg.bitrate_bps.to_string(),
         rep.to_string(),
+        cfg.attempt.clone(),
         established.to_string(),
         torn_down.to_string(),
         pkt_sent.to_string(),
@@ -1639,31 +1648,38 @@ fn build_matrix_schedule(
     // Resume: a sweep of this size will be interrupted at some point, and
     // re-running completed cells wastes hours and mixes measurement
     // windows. Anything already in the output file is skipped.
-    // A cell counts as done only when BOTH roles recorded a row. Keying
-    // on the listener alone meant a run interrupted mid-cell left an
-    // orphan caller row, was re-run, and appended a second caller row for
-    // the same cell -- two senders, one listener, and any statistic over
-    // them silently wrong.
+    // A cell counts as done only when BOTH roles recorded a row **in the
+    // same attempt**. Keying on the listener alone meant a run interrupted
+    // mid-cell left an orphan caller row, was re-run, and appended a
+    // second caller row for the same cell -- two senders, one listener,
+    // and any statistic over them silently wrong. Requiring one shared
+    // attempt additionally rules out a pair assembled from two different
+    // interrupted runs, which is a complete-looking cell whose two halves
+    // never ran together.
     let recorded = if out.exists() {
         read_results(out)?
     } else {
         Vec::new()
     };
-    let keys_for = |role: &str| -> std::collections::HashSet<String> {
+    let keys_for = |role: &str| -> std::collections::HashSet<(String, String)> {
         recorded
             .iter()
             .filter(|r| r.get("role") == Some(role))
             .filter_map(|r| {
                 let rep: usize = r.number("rep")? as usize;
+                let attempt = r.get("attempt")?.to_string();
                 cells
                     .iter()
                     .find_map(|cell| record_key(r, cell, rep).filter(|k| *k == cell_key(cell, rep)))
+                    .map(|key| (key, attempt))
             })
             .collect()
     };
     let (listener_keys, caller_keys) = (keys_for("listener"), keys_for("caller"));
-    let done: std::collections::HashSet<String> =
-        listener_keys.intersection(&caller_keys).cloned().collect();
+    let done: std::collections::HashSet<String> = listener_keys
+        .intersection(&caller_keys)
+        .map(|(key, _attempt)| key.clone())
+        .collect();
     eprintln!(
         "matrix: {} cells x {reps} reps = {total} runs -> {}{}",
         cells.len(),
@@ -1771,6 +1787,106 @@ fn matrix_cell_argv(cell: &Cell<'_>, role: Scope) -> Vec<String> {
     out
 }
 
+/// Why one scheduled matrix run did not complete.
+///
+/// Every variant here is a *required* role failing to do its job. None of
+/// them is "this configuration is not supported": an unsupported cell is
+/// classified up front from configuration (`matrix_cell_supported`) and
+/// never inferred from a crash, because a crash and an unimplemented
+/// combination look identical from the outside and conflating them is how
+/// a broken sweep reports success.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MatrixFailureKind {
+    /// The child exited non-zero, or was killed by a signal.
+    ChildStatus { role: &'static str, status: String },
+    /// The child exited cleanly but recorded no result row for this cell.
+    /// A benchmark row is the child's actual output; producing none is
+    /// exactly as useless as crashing.
+    MissingResult { role: &'static str },
+    /// The result file could not be read back, so the run cannot be
+    /// confirmed either way.
+    UnreadableResults { detail: String },
+    /// The cell could not be run at all for an environmental reason (no
+    /// free port range, netem apply failure). Not a protocol result and
+    /// not an unsupported configuration -- the sweep asked for it and did
+    /// not get it.
+    Infrastructure { detail: String },
+}
+
+impl std::fmt::Display for MatrixFailureKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ChildStatus { role, status } => write!(f, "{role} child failed ({status})"),
+            Self::MissingResult { role } => write!(f, "{role} recorded no result row"),
+            Self::UnreadableResults { detail } => write!(f, "result file unreadable: {detail}"),
+            Self::Infrastructure { detail } => write!(f, "could not run cell: {detail}"),
+        }
+    }
+}
+
+/// One failed (cell, rep), kept so the sweep can carry on and still fail
+/// at the end.
+#[derive(Clone, Debug)]
+pub struct MatrixFailure {
+    pub label: String,
+    pub rep: usize,
+    pub kind: MatrixFailureKind,
+}
+
+impl std::fmt::Display for MatrixFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "rep {} {}: {}", self.rep, self.label, self.kind)
+    }
+}
+
+/// What a whole `srt-bench matrix` invocation did.
+///
+/// The invariant this type exists to enforce: **exit status 0 if and only
+/// if every required cell and role completed successfully.** Previously a
+/// child could exit non-zero, get one `eprintln!`, and the sweep would
+/// still return `Ok(())` -- automation could therefore report a green
+/// benchmark campaign whose sender had crashed.
+#[derive(Clone, Debug, Default)]
+pub struct MatrixReport {
+    /// Every required-role failure seen, in schedule order.
+    pub failures: Vec<MatrixFailure>,
+    /// Runs not attempted because their configuration is explicitly
+    /// unsupported. Not a failure.
+    pub skipped_runs: usize,
+    /// Runs skipped because a previous invocation already recorded them.
+    pub resumed_runs: usize,
+    /// Runs that started and recorded both roles.
+    pub completed_runs: usize,
+    /// Runs that were attempted and did not complete. One run can
+    /// contribute several entries to `failures` (both roles crashed, say),
+    /// so this is not `failures.len()`.
+    pub failed_runs: usize,
+}
+
+impl MatrixReport {
+    /// True when every required role of every attempted cell succeeded.
+    #[must_use]
+    pub fn ok(&self) -> bool {
+        self.failures.is_empty()
+    }
+
+    /// Human-readable summary of what failed, for the process's stderr.
+    #[must_use]
+    pub fn failure_summary(&self) -> String {
+        use std::fmt::Write as _;
+        let mut out = format!(
+            "matrix: {} of {} attempted runs failed ({} distinct failures)\n",
+            self.failed_runs,
+            self.failed_runs + self.completed_runs,
+            self.failures.len()
+        );
+        for failure in &self.failures {
+            let _ = writeln!(out, "  {failure}");
+        }
+        out
+    }
+}
+
 struct MatrixProcessContext<'a, 'cell> {
     sender_exe: &'a Path,
     receiver_exe: &'a Path,
@@ -1785,9 +1901,73 @@ struct MatrixProcessContext<'a, 'cell> {
     netns: Option<Priv>,
     run_index: usize,
     total: usize,
+    /// Stamped onto both roles so their rows can be told apart from rows
+    /// an earlier, interrupted attempt at the same cell left behind.
+    attempt: &'a str,
 }
 
-fn run_matrix_processes(context: MatrixProcessContext<'_, '_>, port: u16) -> std::io::Result<()> {
+/// Which roles recorded a row for this (cell, rep) in `out`.
+///
+/// Reuses `record_key`/`cell_key`, the same identity the resume logic
+/// uses, so "this run recorded its output" and "this run is already done"
+/// can never disagree.
+/// Which roles recorded a row for this (cell, rep) **in this attempt**.
+///
+/// The attempt filter is the whole point. A result file is append-only
+/// and a sweep gets interrupted, so it routinely contains a half-finished
+/// pair from an earlier attempt. Asking only "does a caller row for this
+/// cell exist?" let a previous attempt's caller row stand in for a
+/// current sender that exited 0 and wrote nothing -- the sweep then
+/// reported success for a run that produced no sender data at all.
+fn recorded_roles(
+    out: &Path,
+    cell: &Cell<'_>,
+    rep: usize,
+    attempt: &str,
+) -> std::io::Result<(bool /* caller */, bool /* listener */)> {
+    if !out.exists() {
+        return Ok((false, false));
+    }
+    let want = cell_key(cell, rep);
+    let records = read_results(out)?;
+    let mut caller = false;
+    let mut listener = false;
+    for record in &records {
+        if record.get("attempt") != Some(attempt) {
+            continue;
+        }
+        if record.number("rep").map(|r| r as usize) != Some(rep) {
+            continue;
+        }
+        if record_key(record, cell, rep).as_ref() != Some(&want) {
+            continue;
+        }
+        match record.get("role") {
+            Some("caller") => caller = true,
+            Some("listener") => listener = true,
+            _ => {}
+        }
+    }
+    Ok((caller, listener))
+}
+
+/// Identity for one attempted (cell, rep), unique across processes and
+/// across re-runs of the same sweep into the same result file.
+///
+/// The pid separates concurrent or successive harness invocations; the
+/// sequence number separates attempts within one invocation. Both roles
+/// of one attempt are stamped with the same value.
+fn attempt_id(sequence: usize) -> String {
+    format!("{}-{sequence}", std::process::id())
+}
+
+/// Run one cell's receiver/sender pair, returning every way a *required*
+/// role failed. An empty vec means both roles exited cleanly and both
+/// recorded their result row.
+fn run_matrix_processes(
+    context: MatrixProcessContext<'_, '_>,
+    port: u16,
+) -> std::io::Result<Vec<MatrixFailureKind>> {
     let MatrixProcessContext {
         sender_exe,
         receiver_exe,
@@ -1802,6 +1982,7 @@ fn run_matrix_processes(context: MatrixProcessContext<'_, '_>, port: u16) -> std
         netns,
         run_index,
         total,
+        attempt,
     } = context;
     // Each role gets the axes scoped to it plus the shared ones.
     // Both roles additionally get every split axis's *other* side
@@ -1838,6 +2019,7 @@ fn run_matrix_processes(context: MatrixProcessContext<'_, '_>, port: u16) -> std
     .arg(&config.bitrate)
     .args(&recv_argv)
     .arg(format!("--rep={rep}"))
+    .arg(format!("--attempt={attempt}"))
     .arg(format!("--cpus={recv_cpus}"))
     .arg(format!("--out={}", out.display()))
     .stdout(std::process::Stdio::piped())
@@ -1865,6 +2047,7 @@ fn run_matrix_processes(context: MatrixProcessContext<'_, '_>, port: u16) -> std
     .env("SRT_BENCH_CHILD", "1")
     .args(&send_argv)
     .arg(format!("--rep={rep}"))
+    .arg(format!("--attempt={attempt}"))
     .arg(format!("--cpus={send_cpus}"))
     .arg(format!("--out={}", out.display()))
     .stdout(std::process::Stdio::null())
@@ -1883,17 +2066,58 @@ fn run_matrix_processes(context: MatrixProcessContext<'_, '_>, port: u16) -> std
             recv.wait()?
         }
     };
+    // A required role failing has to be remembered, not just printed.
+    // Both roles are always required today: a cell's delivery percentage
+    // is meaningless without the pair.
+    let mut failures = Vec::new();
+    if !send.success() {
+        failures.push(MatrixFailureKind::ChildStatus {
+            role: "sender",
+            status: send.to_string(),
+        });
+    }
+    if !recv_status.success() {
+        failures.push(MatrixFailureKind::ChildStatus {
+            role: "receiver",
+            status: recv_status.to_string(),
+        });
+    }
+    // Exiting 0 is necessary but not sufficient: the child's deliverable
+    // is a result row. Check for it whichever way the statuses went, so a
+    // silently row-less success is caught too. A malformed row makes
+    // `read_results` fail; that is recorded as its own failure rather than
+    // aborting the sweep, so later independent cells still run.
+    match recorded_roles(out, cell, rep, attempt) {
+        Ok((caller, listener)) => {
+            if !caller && send.success() {
+                failures.push(MatrixFailureKind::MissingResult { role: "sender" });
+            }
+            if !listener && recv_status.success() {
+                failures.push(MatrixFailureKind::MissingResult { role: "receiver" });
+            }
+        }
+        Err(error) => failures.push(MatrixFailureKind::UnreadableResults {
+            detail: error.to_string(),
+        }),
+    }
     eprintln!(
         "[{:>4}/{total}] rep {rep} {}{}",
         run_index + 1,
         config.label.join(" "),
-        if send.success() && recv_status.success() {
+        if failures.is_empty() {
             String::new()
         } else {
-            format!(" (sender={send} receiver={recv_status})")
+            format!(
+                " FAILED (sender={send} receiver={recv_status}: {})",
+                failures
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
         }
     );
-    Ok(())
+    Ok(failures)
 }
 
 fn detect_matrix_netns(cells: &[Cell<'_>]) -> std::io::Result<Option<Priv>> {
@@ -1930,7 +2154,7 @@ struct MatrixScheduleContext<'a, 'cell> {
     netns: Option<Priv>,
 }
 
-fn run_matrix_schedule(context: MatrixScheduleContext<'_, '_>) -> std::io::Result<usize> {
+fn run_matrix_schedule(context: MatrixScheduleContext<'_, '_>) -> std::io::Result<MatrixReport> {
     let MatrixScheduleContext {
         sender_exe,
         receiver_exe,
@@ -1944,45 +2168,35 @@ fn run_matrix_schedule(context: MatrixScheduleContext<'_, '_>) -> std::io::Resul
         send_cpus,
         netns,
     } = context;
-    let mut skipped_runs = 0usize;
+    let mut report = MatrixReport::default();
     let mut unsupported_cells = std::collections::HashSet::new();
+    // A failing cell does not stop the sweep: later cells are independent
+    // experiments and their data is worth having. The failure is
+    // remembered and turned into a non-zero exit at the end instead.
     for (run_index, (cell_index, rep)) in schedule.runs.iter().copied().enumerate() {
         let cell = &cells[cell_index];
         let config = matrix_cell_config(cell);
         // Skip combinations the runtime does not implement rather than
         // running them and recording the wreckage: an unsupported cell
         // produces bind collisions that look exactly like a harness bug.
+        // This is the *only* legitimate skip, and it is decided from
+        // configuration alone -- never inferred from a child crashing.
         if !matrix_cell_supported(&config) {
             if unsupported_cells.insert(cell_index) {
-                skipped_runs += reps;
+                report.skipped_runs += reps;
                 eprintln!("[skip] {} (unsupported)", config.label.join(" "));
             }
             continue;
         }
         if schedule.done.contains(&cell_key(cell, rep)) {
+            report.resumed_runs += 1;
             continue;
         }
-        if let Some(privilege) = netns {
-            netem_apply(
-                privilege,
-                netem_args(|flag| matrix_cell_link(cell, flag)).map_err(std::io::Error::other)?,
-            )?;
-        }
-        // A per-port cell can ask for more descriptors than this process may
-        // hold while probing the range. Treat that as an unavailable cell and
-        // continue the sweep so pooled results are still visible.
-        let port = match free_port_range(config.ports_needed) {
-            Ok(port) => port,
-            Err(error) => {
-                skipped_runs += 1;
-                eprintln!(
-                    "[skip] {} (port allocation failed: {error})",
-                    config.label.join(" ")
-                );
-                continue;
-            }
-        };
-        run_matrix_processes(
+        // One identity per attempted cell, stamped on both roles. `run_index`
+        // is unique within this invocation and the pid separates invocations,
+        // so no two attempts can ever share a stamp in one result file.
+        let attempt = attempt_id(run_index);
+        let failures = run_scheduled_cell(
             MatrixProcessContext {
                 sender_exe,
                 receiver_exe,
@@ -1997,11 +2211,59 @@ fn run_matrix_schedule(context: MatrixScheduleContext<'_, '_>) -> std::io::Resul
                 netns,
                 run_index,
                 total: schedule.total,
+                attempt: &attempt,
             },
-            port,
+            |flag| matrix_cell_link(cell, flag),
         )?;
+        if failures.is_empty() {
+            report.completed_runs += 1;
+            continue;
+        }
+        report.failed_runs += 1;
+        for kind in failures {
+            eprintln!("[fail] {} rep {rep}: {kind}", config.label.join(" "));
+            report.failures.push(MatrixFailure {
+                label: config.label.join(" "),
+                rep,
+                kind,
+            });
+        }
     }
-    Ok(skipped_runs)
+    Ok(report)
+}
+
+/// Prepare the environment for one scheduled cell and run its role pair.
+///
+/// Returns the ways the cell failed; empty means it completed. Setup that
+/// the sweep asked for and did not get -- link emulation that would not
+/// apply, no free port range -- is a failure of that cell rather than a
+/// skip: an environment problem and a configuration the runtime does not
+/// implement are different things, and only the latter may be silently
+/// passed over.
+fn run_scheduled_cell(
+    context: MatrixProcessContext<'_, '_>,
+    link: impl Fn(&str) -> Option<String>,
+) -> std::io::Result<Vec<MatrixFailureKind>> {
+    if let Some(privilege) = context.netns
+        && let Err(error) = netem_args(link)
+            .map_err(std::io::Error::other)
+            .and_then(|args| netem_apply(privilege, args))
+    {
+        return Ok(vec![MatrixFailureKind::Infrastructure {
+            detail: format!("link emulation could not be applied: {error}"),
+        }]);
+    }
+    // A per-port cell can ask for more descriptors than this process may
+    // hold while probing the range.
+    let port = match free_port_range(context.config.ports_needed) {
+        Ok(port) => port,
+        Err(error) => {
+            return Ok(vec![MatrixFailureKind::Infrastructure {
+                detail: format!("port allocation failed: {error}"),
+            }]);
+        }
+    };
+    run_matrix_processes(context, port)
 }
 
 /// Run the cartesian product of the requested axes, one receiver/sender
@@ -2010,7 +2272,11 @@ fn run_matrix_schedule(context: MatrixScheduleContext<'_, '_>) -> std::io::Resul
 /// Each side is a fresh child process rather than a thread: CPU is
 /// measured with `getrusage`, which is per-process, so running both roles
 /// in one process would attribute the sender's cost to the listener.
-pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
+///
+/// Returns what happened. The caller is responsible for turning a report
+/// with failures into a non-zero process exit -- `Ok` here means "the
+/// sweep ran to the end", not "everything in it worked".
+pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<MatrixReport> {
     let exe = std::env::current_exe()?;
     let sender_exe = cli
         .flags
@@ -2070,7 +2336,7 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
     // Fail before the first cell rather than midway through a sweep.
     let netns = detect_matrix_netns(&cells)?;
 
-    let skipped_runs = run_matrix_schedule(MatrixScheduleContext {
+    let report = run_matrix_schedule(MatrixScheduleContext {
         out: &out,
         cells: &cells,
         schedule: &schedule,
@@ -2086,10 +2352,13 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<()> {
     if let Some(p) = netns {
         netns_down(p);
     }
-    if skipped_runs > 0 {
-        eprintln!("matrix: skipped {skipped_runs} scheduled runs");
+    if report.skipped_runs > 0 {
+        eprintln!(
+            "matrix: skipped {} scheduled runs (unsupported configurations)",
+            report.skipped_runs
+        );
     }
-    Ok(())
+    Ok(report)
 }
 
 // ---------------------------------------------------------------------------
@@ -2358,11 +2627,17 @@ fn wait_for_listening(child: &mut std::process::Child, timeout: std::time::Durat
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
             if !announced && line.contains("LISTENING") {
                 announced = true;
-                let _ = tx.send(());
+                let _ = tx.send(true);
             }
         }
+        // EOF without the marker means the listener is already gone.
+        // Report that immediately instead of making the whole sweep sit
+        // out the timeout once per dead cell.
+        if !announced {
+            let _ = tx.send(false);
+        }
     });
-    rx.recv_timeout(timeout).is_ok()
+    rx.recv_timeout(timeout).unwrap_or(false)
 }
 
 /// Ask a child to stop cleanly. It finishes draining, writes its result

@@ -334,6 +334,13 @@ pub struct BenchConfig {
     /// Repetition index, recorded so a report can take medians across
     /// repeats of the same cell.
     pub rep: usize,
+    /// Identity of the matrix attempt that started this process.
+    ///
+    /// The harness stamps both roles of one attempted cell with the same
+    /// value so it can tell rows *this* attempt wrote from rows an
+    /// earlier, interrupted attempt left in the append-only result file.
+    /// Empty for a standalone invocation, which has no harness above it.
+    pub attempt: String,
     /// How many logical CPUs this process ended up restricted to. `0`
     /// means the inherited affinity was left alone.
     ///
@@ -2696,6 +2703,7 @@ pub fn bench_config_from_args() -> BenchConfig {
         .filter(|v| !v.is_empty())
         .map(std::path::PathBuf::from);
     let rep = cli.flag_or("rep", 1usize);
+    let attempt = cli.flags.get("attempt").cloned().unwrap_or_default();
 
     let config = BenchConfig {
         runtime,
@@ -2718,6 +2726,7 @@ pub fn bench_config_from_args() -> BenchConfig {
         sock_buf_bytes,
         out,
         rep,
+        attempt,
         cpus,
         pin,
         workers,
@@ -2798,6 +2807,7 @@ mod tests {
             sock_buf_bytes: 0,
             out: None,
             rep: 1,
+            attempt: String::new(),
             cpus: 0,
             pin: false,
             workers: 1,
