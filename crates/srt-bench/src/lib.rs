@@ -5,6 +5,7 @@ pub mod cpu_stats;
 pub mod driver;
 pub mod harness;
 pub mod queue;
+pub mod scheduling;
 pub mod shutdown;
 pub mod source;
 pub mod system;
@@ -304,6 +305,10 @@ pub struct BenchConfig {
     /// available -- the baseline `On` should be measured against. See
     /// `Batching` for which runtimes actually have a batched path today.
     pub batching: Batching,
+    /// Tokio shared-socket `recvmmsg` quanta per readiness service.
+    pub recv_rounds: usize,
+    /// Tokio shared-socket policy after a nonblocking outbound send yields.
+    pub would_block: crate::scheduling::WouldBlockPolicy,
     /// Sender only: how many connections may be simultaneously mid-
     /// handshake (started but not yet `Connected`) at once. `1` opens
     /// them strictly sequentially -- the safe default, since a real
@@ -712,6 +717,8 @@ pub struct ConnStats {
     pub source: crate::source::SourceStats,
     /// Capacity zero means this path has no benchmark-owned packet queue.
     pub datapath_queue: crate::queue::QueueStats,
+    pub recv_scheduling: crate::scheduling::RecvSchedulingStats,
+    pub outbound_retry: crate::scheduling::RetryStats,
 }
 
 // ---------------------------------------------------------------------------
@@ -2373,6 +2380,8 @@ pub struct Aggregate {
     /// backlog nothing ever held.
     pub source: crate::source::SourceStats,
     pub datapath_queue: crate::queue::QueueStats,
+    pub recv_scheduling: crate::scheduling::RecvSchedulingStats,
+    pub outbound_retry: crate::scheduling::RetryStats,
 }
 
 impl Aggregate {
@@ -2390,6 +2399,8 @@ impl Aggregate {
             cc_peak: 0,
             source: crate::source::SourceStats::default(),
             datapath_queue: crate::queue::QueueStats::default(),
+            recv_scheduling: crate::scheduling::RecvSchedulingStats::default(),
+            outbound_retry: crate::scheduling::RetryStats::default(),
         }
     }
 
@@ -2402,6 +2413,8 @@ impl Aggregate {
         self.source.overflow += s.source.overflow;
         self.source.backlog_hwm = self.source.backlog_hwm.max(s.source.backlog_hwm);
         self.datapath_queue.merge(s.datapath_queue);
+        self.recv_scheduling.merge(s.recv_scheduling);
+        self.outbound_retry.merge(s.outbound_retry);
         if s.connected {
             self.any_connected = true;
         }
@@ -2496,6 +2509,8 @@ impl Aggregate {
                     cc_peak: self.cc_peak,
                     source: self.source,
                     datapath_queue: self.datapath_queue,
+                    recv_scheduling: self.recv_scheduling,
+                    outbound_retry: self.outbound_retry,
                 },
             )
         {
@@ -2518,7 +2533,7 @@ fn usage() -> ! {
          [--egress per-connection|shared-socket] \
          [--encryption plain|128|192|256] \
          [--bond broadcast:G|backup:G|none] [--batch on|off] \
-         [--connect-concurrency N] [--promotion never|relocate|bonded|all] [--cookie-routing on|off] [--sock-buf N|Nk|Nm|default] [--out FILE] [--cpus 0-3|0,2,4] [--pin on|off] [--workers N] [--link-delay 25ms] [--link-jitter 5ms] [--link-loss 1%] [--link-rate 100mbit]"
+         [--connect-concurrency N] [--recv-rounds N] [--would-block retain|drop] [--promotion never|relocate|bonded|all] [--cookie-routing on|off] [--sock-buf N|Nk|Nm|default] [--out FILE] [--cpus 0-3|0,2,4] [--pin on|off] [--workers N] [--link-delay 25ms] [--link-jitter 5ms] [--link-loss 1%] [--link-rate 100mbit]"
     );
     std::process::exit(2)
 }
@@ -2836,6 +2851,19 @@ pub fn bench_config_from_args() -> BenchConfig {
         .flags
         .get("connect-concurrency")
         .map_or(1, |raw| parse_positive("connect-concurrency", raw));
+    let recv_rounds = cli
+        .flags
+        .get("recv-rounds")
+        .map_or(8, |raw| parse_positive("recv-rounds", raw));
+    let would_block =
+        cli.flags
+            .get("would-block")
+            .map_or(crate::scheduling::WouldBlockPolicy::Retain, |raw| {
+                crate::scheduling::WouldBlockPolicy::parse(raw).unwrap_or_else(|| {
+                    eprintln!("error: unknown --would-block '{raw}' (want retain|drop)");
+                    usage()
+                })
+            });
     let promotion = parse_promotion(&cli);
     let cookie_routing = parse_cookie_routing(&cli);
     let sock_buf_bytes = parse_sock_buf(&cli);
@@ -2868,6 +2896,8 @@ pub fn bench_config_from_args() -> BenchConfig {
         bond_mode,
         bond_pairs,
         batching,
+        recv_rounds,
+        would_block,
         connect_concurrency,
         promotion,
         cookie_routing,
@@ -2951,6 +2981,8 @@ mod tests {
             bond_mode: BondMode::None,
             bond_pairs: 0,
             batching: Batching::On,
+            recv_rounds: 8,
+            would_block: crate::scheduling::WouldBlockPolicy::Retain,
             connect_concurrency: 1,
             promotion: Promotion::Never,
             cookie_routing: true,

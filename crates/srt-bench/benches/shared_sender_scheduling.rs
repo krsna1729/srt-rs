@@ -25,6 +25,8 @@ fn sender_config(connections: usize, cc: usize) -> srt_bench::BenchConfig {
         bond_mode: BondMode::None,
         bond_pairs: 0,
         batching: srt_bench::Batching::On,
+        recv_rounds: 8,
+        would_block: srt_bench::scheduling::WouldBlockPolicy::Retain,
         connect_concurrency: cc,
         promotion: Promotion::Never,
         cookie_routing: true,
@@ -380,6 +382,37 @@ fn bench_bounded_datapath_queue(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_tokio_scheduling_telemetry(c: &mut Criterion) {
+    let mut group = c.benchmark_group("tokio_scheduling_telemetry");
+    group.bench_function("retry_would_block_retain", |b| {
+        b.iter_batched(
+            || {
+                let mut queue = srt_bench::scheduling::RetryQueue::new(
+                    srt_bench::scheduling::WouldBlockPolicy::Retain,
+                );
+                let mut generated = vec![("127.0.0.1:9000".parse().unwrap(), vec![0; 1316]); 32];
+                queue.append(&mut generated);
+                queue
+            },
+            |mut queue| {
+                queue
+                    .flush_with(|_| Err(std::io::ErrorKind::WouldBlock.into()))
+                    .unwrap();
+                black_box(queue.stats());
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    group.bench_function("timer_lateness_record", |b| {
+        let mut stats = srt_bench::scheduling::RecvSchedulingStats::default();
+        b.iter(|| {
+            stats.record_lateness(black_box(std::time::Duration::from_micros(17)));
+            black_box(stats.percentile_us(99));
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_handshaking_tick,
@@ -392,6 +425,7 @@ criterion_group!(
     bench_sequential_admission,
     bench_sched_stats_readout,
     bench_source_clock,
-    bench_bounded_datapath_queue
+    bench_bounded_datapath_queue,
+    bench_tokio_scheduling_telemetry
 );
 criterion_main!(benches);

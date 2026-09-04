@@ -32,7 +32,8 @@ srt-bench runtime=<mio|tokio|smol|monoio|glommio|compio> \
   [--srt-bandwidth protocol-default|legacy-source-fixed|fixed:BPS|input-relative:PCT]
   [--source-backlog-ms MS]
   [--ingress …] [--egress per-connection|shared-socket] [--promotion …]
-  [--cookie-routing on|off] [--batch on|off] [--sock-buf …]
+  [--cookie-routing on|off] [--batch on|off] [--recv-rounds N]
+  [--would-block retain|drop] [--sock-buf …]
   [--connect-concurrency N] [--bond …] [--out FILE]
 ```
 
@@ -43,6 +44,11 @@ srt-bench runtime=<mio|tokio|smol|monoio|glommio|compio> \
   comparability. `protocol-default` leaves SRT's ceiling unchanged,
   `fixed:BPS` sets an independent MAXBW, and `input-relative:PCT` maps the
   source rate to INPUTBW with the stated OHEADBW. Connections default to 1.
+  Tokio shared-pool ingress records receive quantum and timer lateness;
+  `--recv-rounds` defaults to 8. Shared-socket output retains the unsent tail
+  on `WouldBlock` by default; `--would-block=drop` is an explicit comparison
+  policy. Both expose retry capacity/high-water, `WouldBlock`, overflow, and
+  local-drop counters.
 - `per-port` uses port+i; `shared-pool:K` maps connection *i* to
   `port + i % K`; reuseport topologies share the base port.
 - Loss mode and scale mode are the same code path per runtime — loss runs
@@ -228,11 +234,14 @@ defined once in `harness::COLUMNS` and cover both the configuration (every
 axis) and the measurements, so `report` can group by any subset:
 
 ```
-runtime  encryption  role  ingress  promotion  cookie  batch  sock_buf  conns  connect_cc
+runtime  encryption  role  ingress  promotion  cookie  batch  recv_rounds  would_block_policy  sock_buf  conns  connect_cc
 bond  source_bps  srt_bw_mode  srt_maxbw_bps  srt_inputbw_bps  srt_oheadbw_pct
 rep  established  pkt_sent  core_total  sec_a  sec_b  rtt_ms  elapsed_s
 cpu_user_ms  cpu_sys_ms  peak_rss_kb  src_backpressure  src_backlog_hwm
 src_overflow  datapath_q_cap  datapath_q_hwm  datapath_q_full  datapath_q_dropped
+recv_packets  recv_syscalls  datagrams_per_syscall  timer_late_p50_us
+timer_late_p95_us  timer_late_p99_us  timer_late_max_us  retry_cap retry_hwm
+would_block retry_overflow local_dropped
 ```
 
 TSV rather than JSON: no dependency to read or write, greppable, and it

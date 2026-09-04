@@ -61,6 +61,7 @@ pub struct PairMetrics {
     /// The configured bound that high-water mark is measured against.
     pub source_backlog_cap: f64,
     pub datapath_queue_overflow: f64,
+    pub outbound_retry_loss: f64,
 }
 
 #[inline]
@@ -151,6 +152,10 @@ impl PairMetrics {
         let source_backlog_cap = caller.number("src_backlog_cap").unwrap_or(0.0);
         let datapath_queue_overflow = caller.number("datapath_q_dropped").unwrap_or(0.0)
             + listener.number("datapath_q_dropped").unwrap_or(0.0);
+        let outbound_retry_loss = caller.number("retry_overflow").unwrap_or(0.0)
+            + listener.number("retry_overflow").unwrap_or(0.0)
+            + caller.number("local_dropped").unwrap_or(0.0)
+            + listener.number("local_dropped").unwrap_or(0.0);
 
         Some(Self {
             conns,
@@ -188,6 +193,7 @@ impl PairMetrics {
             source_backlog_hwm,
             source_backlog_cap,
             datapath_queue_overflow,
+            outbound_retry_loss,
         })
     }
 
@@ -218,6 +224,7 @@ impl PairMetrics {
             && self.listener_udp_rcvbuf_err == 0.0
             && self.source_overflow == 0.0
             && self.datapath_queue_overflow == 0.0
+            && self.outbound_retry_loss == 0.0
     }
 }
 
@@ -1255,6 +1262,20 @@ mod tests {
         assert!(PairMetrics::compute(&c, &l).unwrap().is_clean());
         l.fields
             .push(("datapath_q_dropped".to_string(), "1".to_string()));
+        assert!(!PairMetrics::compute(&c, &l).unwrap().is_clean());
+    }
+
+    #[test]
+    fn outbound_retry_loss_invalidates_a_clean_pair() {
+        let mut c = make_test_caller(
+            "1", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "0", "10", "0",
+        );
+        let l = make_test_listener(
+            "1", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "0", "10", "0",
+        );
+        assert!(PairMetrics::compute(&c, &l).unwrap().is_clean());
+        c.fields
+            .push(("retry_overflow".to_string(), "1".to_string()));
         assert!(!PairMetrics::compute(&c, &l).unwrap().is_clean());
     }
 
