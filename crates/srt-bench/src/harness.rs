@@ -100,6 +100,7 @@ pub const COLUMNS: &[&str] = &[
     "send_workers",
     "conns",
     "connect_cc",
+    "cc_peak",
     "bond",
     "bitrate",
     "rep",
@@ -220,6 +221,7 @@ pub fn append_result(
     sec_b: u64,
     rtt_ms: f64,
     elapsed_s: f64,
+    cc_peak: usize,
 ) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -277,6 +279,7 @@ pub fn append_result(
         cfg.peer_topology.send_workers.clone(),
         cfg.connections.to_string(),
         cfg.connect_concurrency.to_string(),
+        cc_peak.to_string(),
         describe_bond(cfg),
         cfg.bitrate_bps.to_string(),
         rep.to_string(),
@@ -851,6 +854,12 @@ fn filter_reason(cell: &Cell<'_>, axes: &[Axis]) -> Option<&'static str> {
     if bonded && egress != "shared-socket" {
         return Some("bonded-egress-unsupported");
     }
+    if bonded && let Some(cc_str) = cell_value(cell, "connect-concurrency", Some(Scope::Both)) {
+        let cc: usize = cc_str.parse().unwrap_or(1);
+        if cc < 2 {
+            return Some("bonded-cc-requires-2");
+        }
+    }
     if let Some(reason) = filter_bond_capacity(cell, bond) {
         return Some(reason);
     }
@@ -887,21 +896,13 @@ fn filter_reason(cell: &Cell<'_>, axes: &[Axis]) -> Option<&'static str> {
 }
 
 fn filter_shared_egress(
-    cell: &Cell<'_>,
+    _cell: &Cell<'_>,
     axes: &[Axis],
     egress: &str,
     send_workers: Option<&str>,
 ) -> Option<&'static str> {
     if egress != "shared-socket" {
         return None;
-    }
-    // A shared caller socket drives all handshakes from one readiness loop;
-    // per-connection launch concurrency cannot alter that implementation.
-    if let Some(value) = cell_value(cell, "connect-concurrency", Some(Scope::Both))
-        && let Some(keep) = representative(axes, "connect-concurrency", "1")
-        && value != keep
-    {
-        return Some("connect-concurrency-inert");
     }
     // One shared UDP socket has one owning runtime loop. Extra sender workers
     // cannot alter it; receiver workers remain independently variable when a
@@ -2670,7 +2671,7 @@ mod matrix_filter_tests {
     }
 
     #[test]
-    fn shared_egress_filters_per_connection_launch_concurrency() {
+    fn shared_egress_now_exercises_connect_concurrency() {
         let axes = vec![
             (
                 "connect-concurrency",
@@ -2691,7 +2692,7 @@ mod matrix_filter_tests {
                 &cell(&[("egress", "shared-socket"), ("connect-concurrency", "50"),]),
                 &axes,
             ),
-            Some("connect-concurrency-inert")
+            None,
         );
         assert_eq!(
             filter_reason(
@@ -2699,6 +2700,59 @@ mod matrix_filter_tests {
                 &axes,
             ),
             None
+        );
+    }
+
+    #[test]
+    fn bonded_cc_below_2_is_rejected() {
+        let axes = vec![
+            (
+                "connect-concurrency",
+                Scope::Both,
+                ["1", "50"].into_iter().map(str::to_string).collect(),
+            ),
+            (
+                "bond",
+                Scope::Both,
+                ["none", "broadcast:4"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            ),
+            (
+                "egress",
+                Scope::Both,
+                ["shared-socket"].into_iter().map(str::to_string).collect(),
+            ),
+            (
+                "ingress",
+                Scope::Both,
+                ["shared-pool:1"].into_iter().map(str::to_string).collect(),
+            ),
+        ];
+        assert_eq!(
+            filter_reason(
+                &cell(&[
+                    ("egress", "shared-socket"),
+                    ("ingress", "shared-pool:1"),
+                    ("bond", "broadcast:4"),
+                    ("connect-concurrency", "1"),
+                ]),
+                &axes,
+            ),
+            Some("bonded-cc-requires-2"),
+        );
+        assert_eq!(
+            filter_reason(
+                &cell(&[
+                    ("egress", "shared-socket"),
+                    ("ingress", "shared-pool:1"),
+                    ("bond", "broadcast:4"),
+                    ("connect-concurrency", "50"),
+                ]),
+                &axes,
+            ),
+            None,
         );
     }
 

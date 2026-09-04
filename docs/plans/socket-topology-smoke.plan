@@ -25,5 +25,5 @@ cookie-routing      = on
 batch               = on
 sock-buf            = 16m
 bond                = none,broadcast:4,backup:4
-connect-concurrency = 1
+connect-concurrency = 2
 pin                 = off

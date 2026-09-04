@@ -118,6 +118,7 @@ struct Driver {
     /// in-flight count forever and no further connection is ever started
     /// -- a deadlock, not just a slowdown.
     started_at: Instant,
+    permit: Option<crate::HandshakePermit>,
 }
 
 /// Create connection `i`'s socket and protocol state and register it with
@@ -136,6 +137,7 @@ fn spawn_driver(
     start: Instant,
     i: usize,
     token: usize,
+    permit: Option<crate::HandshakePermit>,
 ) -> Driver {
     let addr = cfg.addr_for(i);
     let mut socket = match cfg.mode {
@@ -185,17 +187,7 @@ fn spawn_driver(
         peer: None,
         poisoned: refused,
         started_at: Instant::now(),
-    }
-}
-
-fn finish_run(cfg: BenchConfig, start: Instant, stats: Vec<ConnStats>) {
-    let mut aggregate = Aggregate::new(cfg);
-    for stats in stats {
-        aggregate.add(stats);
-    }
-    aggregate.print(start);
-    if !aggregate.any_connected {
-        std::process::exit(1);
+        permit,
     }
 }
 
@@ -203,7 +195,16 @@ fn run_shared_sender_mode(cfg: &BenchConfig, start: Instant) -> bool {
     if cfg.mode != crate::Mode::Sender || cfg.egress != crate::Egress::SharedSocket {
         return false;
     }
-    finish_run(cfg.clone(), start, run_shared_sender(cfg, start));
+    let (stats, cc_peak) = run_shared_sender(cfg, start);
+    let mut aggregate = Aggregate::new(cfg.clone());
+    for s in stats {
+        aggregate.add(s);
+    }
+    aggregate.cc_peak = cc_peak;
+    aggregate.print(start);
+    if !aggregate.any_connected {
+        std::process::exit(1);
+    }
     true
 }
 
@@ -282,11 +283,31 @@ pub fn run(cfg: BenchConfig) {
     }
     report_scale(&cfg);
 
-    let stats = crate::run_workers(&cfg, move |cfg, mine| drive(cfg, mine, start));
-    finish_run(cfg, start, stats);
+    let limiter = if cfg.mode == crate::Mode::Sender {
+        Some(std::sync::Arc::new(std::sync::Mutex::new(
+            crate::ConnectLimiter::new(cfg.connect_concurrency),
+        )))
+    } else {
+        None
+    };
+    let limiter2 = limiter.clone();
+    let stats = crate::run_workers(&cfg, move |cfg, mine| {
+        drive(cfg, mine, start, limiter2.clone())
+    });
+    let mut agg = Aggregate::new(cfg);
+    for s in stats {
+        agg.add(s);
+    }
+    if let Some(lim) = limiter {
+        agg.cc_peak = lim.lock().unwrap().peak();
+    }
+    agg.print(start);
+    if !agg.any_connected {
+        std::process::exit(1);
+    }
 }
 
-fn run_shared_sender(cfg: &BenchConfig, start: Instant) -> Vec<ConnStats> {
+fn run_shared_sender(cfg: &BenchConfig, start: Instant) -> (Vec<ConnStats>, usize) {
     let std_socket =
         crate::bind_shared_sender_socket(cfg.sock_buf_bytes).expect("bind shared sender socket");
     let mut socket = UdpSocket::from_std(std_socket);
@@ -300,7 +321,10 @@ fn run_shared_sender(cfg: &BenchConfig, start: Instant) -> Vec<ConnStats> {
         .expect("register shared socket");
     let mut events = Events::with_capacity(32);
     let indices = (0..cfg.connections).collect::<Vec<_>>();
-    let mut sender = crate::SharedSender::new(cfg, &indices, start);
+    let limiter = std::sync::Arc::new(std::sync::Mutex::new(crate::ConnectLimiter::new(
+        cfg.connect_concurrency,
+    )));
+    let mut sender = crate::SharedSender::new(cfg, &indices, start, limiter);
     let mut generated = Vec::new();
     let mut pending = VecDeque::new();
     let mut buffer = [0_u8; 65_536];
@@ -329,7 +353,8 @@ fn run_shared_sender(cfg: &BenchConfig, start: Instant) -> Vec<ConnStats> {
             }
         }
     }
-    sender.finish()
+    let cc_peak = sender.cc_peak();
+    (sender.finish(), cc_peak)
 }
 
 fn prime_drivers(
@@ -338,18 +363,11 @@ fn prime_drivers(
     start: Instant,
     mine: &[usize],
 ) -> (Vec<Driver>, usize) {
-    // Receivers create every dedicated socket up front. Senders prime only
-    // their configured handshake window; `backfill_drivers` opens the rest
-    // as earlier connections settle.
-    let priming = match cfg.mode {
-        crate::Mode::Receiver => mine.len(),
-        crate::Mode::Sender => cfg.connect_concurrency.min(mine.len()),
-    };
     let mut drivers = Vec::with_capacity(mine.len());
-    for (token, &conn) in mine.iter().take(priming).enumerate() {
-        drivers.push(spawn_driver(cfg, poll, start, conn, token));
+    for (token, &conn) in mine.iter().enumerate() {
+        drivers.push(spawn_driver(cfg, poll, start, conn, token, None));
     }
-    (drivers, priming)
+    (drivers, mine.len())
 }
 
 fn all_drivers_done(drivers: &[Driver], next_to_start: usize, total: usize) -> bool {
@@ -373,25 +391,24 @@ fn backfill_drivers(
     mine: &[usize],
     drivers: &mut Vec<Driver>,
     next_to_start: &mut usize,
+    limiter: Option<&std::sync::Arc<std::sync::Mutex<crate::ConnectLimiter>>>,
 ) {
-    // Only handshakes still within their connect window occupy a slot. An
-    // expired handshake must not block every connection behind it.
     while *next_to_start < mine.len() {
-        let in_flight = drivers
-            .iter()
-            .filter(|driver| {
-                !driver.connected && driver.started_at.elapsed() < crate::CONNECT_TIMEOUT
-            })
-            .count();
-        if in_flight >= cfg.connect_concurrency {
-            break;
-        }
+        let permit = if let Some(lim) = limiter {
+            match crate::HandshakePermit::try_acquire(lim, 1) {
+                Some(p) => Some(p),
+                None => break,
+            }
+        } else {
+            None
+        };
         drivers.push(spawn_driver(
             cfg,
             poll,
             start,
             mine[*next_to_start],
             *next_to_start,
+            permit,
         ));
         *next_to_start += 1;
     }
@@ -505,6 +522,12 @@ fn service_drivers(
     // saw traffic -- plus a full sweep whenever poll went idle.
     let t = crate::now_ts(start);
     for (index, driver) in drivers.iter_mut().enumerate() {
+        if !driver.connected
+            && driver.started_at.elapsed() >= crate::CONNECT_TIMEOUT
+            && let Some(p) = driver.permit.take()
+        {
+            p.fail();
+        }
         if woke_from_timeout || touched.get(index).copied().unwrap_or(false) {
             driver.conn.fire_expired(t);
         }
@@ -516,32 +539,41 @@ fn service_drivers(
     }
 }
 
+fn handle_driver_event(cfg: &BenchConfig, driver: &mut Driver, event: ConnectionEvent) {
+    match event {
+        ConnectionEvent::Connected => {
+            driver.connected = true;
+            if let Some(p) = driver.permit.take() {
+                p.complete();
+            }
+            if driver.stream_deadline.is_none() {
+                driver.stream_deadline =
+                    Some(Instant::now() + Duration::from_secs_f64(cfg.duration_secs));
+            }
+            if cfg.verbose() {
+                println!("CONNECTED");
+            }
+        }
+        ConnectionEvent::DataReceived { .. } => driver.data_events += 1,
+        ConnectionEvent::Disconnected { reason } => {
+            let ordered = crate::is_ordered_close(&reason);
+            if !ordered {
+                eprintln!("[bench-mio] disconnected: {reason}");
+            }
+            if let Some(p) = driver.permit.take() {
+                p.fail();
+            }
+            driver.torn_down |= !ordered;
+            driver.stream_deadline = Some(Instant::now());
+        }
+        ConnectionEvent::Error(message) => eprintln!("[bench-mio] error: {message}"),
+        _ => {}
+    }
+}
+
 fn process_events(cfg: &BenchConfig, driver: &mut Driver) {
     while let Some(event) = driver.conn.conn.poll_event() {
-        match event {
-            ConnectionEvent::Connected => {
-                driver.connected = true;
-                // Set once: a duplicate Connected must not extend the run.
-                if driver.stream_deadline.is_none() {
-                    driver.stream_deadline =
-                        Some(Instant::now() + Duration::from_secs_f64(cfg.duration_secs));
-                }
-                if cfg.verbose() {
-                    println!("CONNECTED");
-                }
-            }
-            ConnectionEvent::DataReceived { .. } => driver.data_events += 1,
-            ConnectionEvent::Disconnected { reason } => {
-                let ordered = crate::is_ordered_close(&reason);
-                if !ordered {
-                    eprintln!("[bench-mio] disconnected: {reason}");
-                }
-                driver.torn_down |= !ordered;
-                driver.stream_deadline = Some(Instant::now());
-            }
-            ConnectionEvent::Error(message) => eprintln!("[bench-mio] error: {message}"),
-            _ => {}
-        }
+        handle_driver_event(cfg, driver, event);
     }
 }
 
@@ -577,6 +609,9 @@ fn close_drivers(cfg: &BenchConfig, drivers: &mut [Driver], start: Instant) {
     // inferring the end of the stream from silence.
     let t = crate::now_ts(start);
     for driver in drivers {
+        if let Some(p) = driver.permit.take() {
+            p.fail();
+        }
         driver.conn.conn.disconnect(t);
         let _ = driver.conn.drain_outputs(t);
     }
@@ -612,11 +647,31 @@ fn driver_stats(cfg: &BenchConfig, driver: Driver) -> ConnStats {
 }
 
 /// Drive one worker's share of the connections on its own `Poll`.
-fn drive(cfg: BenchConfig, mine: Vec<usize>, start: Instant) -> Vec<ConnStats> {
+fn drive(
+    cfg: BenchConfig,
+    mine: Vec<usize>,
+    start: Instant,
+    limiter: Option<std::sync::Arc<std::sync::Mutex<crate::ConnectLimiter>>>,
+) -> Vec<ConnStats> {
     let mut poll = Poll::new().expect("mio Poll::new");
     let mut events = Events::with_capacity(4096);
 
-    let (mut drivers, mut next_to_start) = prime_drivers(&cfg, &mut poll, start, &mine);
+    let (mut drivers, mut next_to_start) = if cfg.mode == crate::Mode::Receiver {
+        prime_drivers(&cfg, &mut poll, start, &mine)
+    } else {
+        let mut drivers = Vec::with_capacity(mine.len());
+        let mut next_to_start = 0;
+        backfill_drivers(
+            &cfg,
+            &mut poll,
+            start,
+            &mine,
+            &mut drivers,
+            &mut next_to_start,
+            limiter.as_ref(),
+        );
+        (drivers, next_to_start)
+    };
     let payload = vec![0x42u8; crate::PAYLOAD_SIZE];
     let connect_deadline = Instant::now() + crate::CONNECT_TIMEOUT;
     let mut buf = [0u8; 2048];
@@ -634,15 +689,17 @@ fn drive(cfg: BenchConfig, mine: Vec<usize>, start: Instant) -> Vec<ConnStats> {
         }
 
         // Backfill starts the next connection once earlier handshakes settle.
-        backfill_drivers(
-            &cfg,
-            &mut poll,
-            start,
-            &mine,
-            &mut drivers,
-            &mut next_to_start,
-        );
-
+        if cfg.mode == crate::Mode::Sender {
+            backfill_drivers(
+                &cfg,
+                &mut poll,
+                start,
+                &mine,
+                &mut drivers,
+                &mut next_to_start,
+                limiter.as_ref(),
+            );
+        }
         poll.poll(&mut events, Some(next_poll_wait(&cfg, &drivers, start)))
             .ok();
         let woke_from_timeout = events.is_empty();

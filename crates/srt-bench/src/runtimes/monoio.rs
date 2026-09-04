@@ -117,8 +117,9 @@ pub fn run(cfg: BenchConfig) {
             .enable_timer()
             .build()
             .expect("monoio io_uring runtime");
-        let stats = rt.block_on(run_shared_sender(&cfg, start));
+        let (stats, cc_peak) = rt.block_on(run_shared_sender(&cfg, start));
         let mut agg = Aggregate::new(cfg);
+        agg.cc_peak = cc_peak;
         for stat in stats {
             agg.add(stat);
         }
@@ -138,32 +139,40 @@ pub fn run(cfg: BenchConfig) {
         return;
     }
     let start = Instant::now();
+    let limiter = std::sync::Arc::new(std::sync::Mutex::new(crate::ConnectLimiter::new(
+        cfg.connect_concurrency,
+    )));
+    let limiter2 = limiter.clone();
 
     let stats = crate::run_workers(&cfg, move |cfg, mine| {
         let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
             .enable_timer()
             .build()
             .expect("monoio io_uring runtime");
-        rt.block_on(drive(cfg, mine, start))
+        rt.block_on(drive(cfg, mine, start, limiter2.clone()))
     });
 
     let mut agg = Aggregate::new(cfg);
     for s in stats {
         agg.add(s);
     }
+    agg.cc_peak = limiter.lock().unwrap().peak();
     agg.print(start);
     if !agg.any_connected {
         std::process::exit(1);
     }
 }
 
-async fn run_shared_sender(cfg: &BenchConfig, start: Instant) -> Vec<ConnStats> {
+async fn run_shared_sender(cfg: &BenchConfig, start: Instant) -> (Vec<ConnStats>, usize) {
     let socket = monoio::net::udp::UdpSocket::from_std(
         crate::bind_shared_sender_socket(cfg.sock_buf_bytes).expect("bind shared sender socket"),
     )
     .expect("register shared sender socket");
     let indices = (0..cfg.connections).collect::<Vec<_>>();
-    let mut sender = crate::SharedSender::new(cfg, &indices, start);
+    let limiter = std::sync::Arc::new(std::sync::Mutex::new(crate::ConnectLimiter::new(
+        cfg.connect_concurrency,
+    )));
+    let mut sender = crate::SharedSender::new(cfg, &indices, start, limiter);
     let mut outbound = Vec::new();
     let mut buffer = vec![0_u8; 65_536];
     loop {
@@ -184,18 +193,29 @@ async fn run_shared_sender(cfg: &BenchConfig, start: Instant) -> Vec<ConnStats> 
             Err(_) => buffer = vec![0_u8; 65_536],
         }
     }
-    sender.finish()
+    let cc_peak = sender.cc_peak();
+    (sender.finish(), cc_peak)
 }
 
 /// Drive one worker's share of the connections on this thread's runtime.
-async fn drive(cfg: BenchConfig, mine: Vec<usize>, start: Instant) -> Vec<crate::ConnStats> {
+async fn drive(
+    cfg: BenchConfig,
+    mine: Vec<usize>,
+    start: Instant,
+    limiter: std::sync::Arc<std::sync::Mutex<crate::ConnectLimiter>>,
+) -> Vec<crate::ConnStats> {
     let mut handles = Vec::with_capacity(mine.len());
     for i in mine {
         let endpoint = cfg.addr_for(i);
         let c2 = cfg.clone();
+        let lim = if c2.mode == crate::Mode::Sender {
+            Some(limiter.clone())
+        } else {
+            None
+        };
         handles.push(monoio::spawn(async move {
             match c2.mode {
-                crate::Mode::Sender => sender_task(c2, i, endpoint, start).await,
+                crate::Mode::Sender => sender_task(c2, i, endpoint, start, lim).await,
                 crate::Mode::Receiver => receiver_task(c2, endpoint.port(), start).await,
             }
         }));
@@ -282,12 +302,18 @@ fn record_sender_stats(driver: &Conn, stats: &mut ConnStats) {
     }
 }
 
+#[allow(clippy::cognitive_complexity)]
 async fn sender_task(
     cfg: BenchConfig,
     index: usize,
     endpoint: SocketAddr,
     start: Instant,
+    limiter: Option<std::sync::Arc<std::sync::Mutex<crate::ConnectLimiter>>>,
 ) -> ConnStats {
+    // Park until a permit is free rather than polling on a timer: every
+    // sender task is spawned upfront, so a periodic re-check here would cost
+    // one timer wakeup per pending connection per millisecond of admission.
+    let mut permit = crate::HandshakeAdmission::acquire_optional(limiter.as_ref()).await;
     let socket = monoio::net::udp::UdpSocket::bind("0.0.0.0:0").expect("bind");
     socket.connect(endpoint).await.expect("connect");
 
@@ -308,7 +334,8 @@ async fn sender_task(
     let payload = vec![0x42u8; crate::PAYLOAD_SIZE];
     let mut stats = ConnStats::default();
     let mut stream_deadline: Option<Instant> = None;
-    let connect_deadline = start + crate::CONNECT_TIMEOUT;
+    let handshake_started = Instant::now();
+    let connect_deadline = handshake_started + crate::CONNECT_TIMEOUT;
     let mut recv_buf = vec![0u8; 2048];
 
     loop {
@@ -329,7 +356,11 @@ async fn sender_task(
         driver.fire_expired(t);
         drain_outputs(&mut driver, t).await;
 
+        let was_connected = stats.connected;
         handle_sender_events(&cfg, &mut driver, &mut stats, &mut stream_deadline);
+        if stats.connected && !was_connected {
+            crate::HandshakePermit::settle(&mut permit, true);
+        }
 
         // The top-of-loop deadline check passed some work ago; time has
         // moved since. Re-check at the send site or the connection keeps
@@ -356,6 +387,7 @@ async fn sender_task(
     // and raises `Disconnected { peer shutdown }` -- so pending data is
     // delivered rather than aged out, and the listener learns the stream
     // ended instead of inferring it from five seconds of silence.
+    crate::HandshakePermit::settle(&mut permit, stats.connected);
     let t = crate::now_ts(start);
     driver.conn.disconnect(t);
     drain_outputs(&mut driver, t).await;

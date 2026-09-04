@@ -203,15 +203,13 @@ jobs:
       - run: cargo build -p srt-bench
       # Only the two connect-concurrency=50 (parallel ramp-up) plans:
       # mio/compio pooled ingress, 600 connections, established=600/600 in
-      # ~4-9s on a real 4-core runner -- verified. tokio-broadcast.plan and
-      # tokio-demux-aes256.plan are connect-concurrency=1 (fully sequential
-      # handshakes); confirmed by a real run that they don't reliably
+      # ~4-9s on a real 4-core runner -- verified. tokio-broadcast.plan
+      # (connect-concurrency=2, bonded) and tokio-demux-aes256.plan
+      # (connect-concurrency=1, unbonded sequential) don't reliably
       # finish establishing within the default 8s window on shared CI
-      # infra (0-156/600 and 16/32 established). Run those two in
-      # bench-nightly.yml instead, where a multi-hour budget comfortably
-      # absorbs the slower ramp -- a gate needs to be reliably fast and
-      # non-flaky above all, which sequential-connect plans aren't proving
-      # to be here.
+      # infra. Run those two in bench-nightly.yml instead, where a
+      # multi-hour budget comfortably absorbs the slower ramp -- a gate
+      # needs to be reliably fast and non-flaky above all.
       - name: Run perf-sentinel plans
         run: |
           set -e

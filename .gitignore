@@ -4,3 +4,4 @@
 /.codegraph/
 .DS_Store
 *.lcov
+proptest-regressions/

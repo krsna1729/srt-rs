@@ -764,12 +764,14 @@ impl CallerTable {
                 if leg.peer != peer {
                     return Ok(false);
                 }
-                group
+                let res = group
                     .group
                     .member_mut(member_id)
                     .expect("group and caller legs are built together")
                     .connection_mut()
-                    .feed_recv_buf(data, now)
+                    .feed_recv_buf(data, now);
+                group.group.refresh_member_states();
+                res
             }
         };
         self.sync_deadline(target_id);
