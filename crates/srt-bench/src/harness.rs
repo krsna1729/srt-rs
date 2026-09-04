@@ -146,6 +146,12 @@ pub const COLUMNS: &[&str] = &[
     "src_backlog_cap",
     "src_backlog_hwm",
     "src_overflow",
+    // Benchmark-owned packet-rate queues. Capacity zero is explicitly
+    // not-applicable for paths without such a queue.
+    "datapath_q_cap",
+    "datapath_q_hwm",
+    "datapath_q_full",
+    "datapath_q_dropped",
 ];
 
 /// Configuration columns that define a unique benchmark workload/cell.
@@ -249,6 +255,7 @@ pub struct RunMeasurements {
     /// What the application source offered, as opposed to what the
     /// protocol carried.
     pub source: crate::source::SourceStats,
+    pub datapath_queue: crate::queue::QueueStats,
 }
 
 /// Append one run's result, writing the header first if the file is new.
@@ -273,6 +280,7 @@ pub fn append_result(
         elapsed_s,
         cc_peak,
         source,
+        datapath_queue,
     } = *measurements;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -368,6 +376,10 @@ pub fn append_result(
         crate::source::backlog_capacity(cfg.source_bitrate_bps, cfg.source_backlog_ms).to_string(),
         source.backlog_hwm.to_string(),
         source.overflow.to_string(),
+        datapath_queue.capacity.to_string(),
+        datapath_queue.high_water.to_string(),
+        datapath_queue.full_events.to_string(),
+        datapath_queue.dropped_or_rejected.to_string(),
     ];
     debug_assert_eq!(values.len(), COLUMNS.len(), "row/header width mismatch");
     let _ = write!(row, "{}", values.join("\t"));

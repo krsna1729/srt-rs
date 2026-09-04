@@ -60,6 +60,7 @@ pub struct PairMetrics {
     pub source_backlog_hwm: f64,
     /// The configured bound that high-water mark is measured against.
     pub source_backlog_cap: f64,
+    pub datapath_queue_overflow: f64,
 }
 
 #[inline]
@@ -148,6 +149,8 @@ impl PairMetrics {
         let source_overflow = caller.number("src_overflow").unwrap_or(0.0);
         let source_backlog_hwm = caller.number("src_backlog_hwm").unwrap_or(0.0);
         let source_backlog_cap = caller.number("src_backlog_cap").unwrap_or(0.0);
+        let datapath_queue_overflow = caller.number("datapath_q_dropped").unwrap_or(0.0)
+            + listener.number("datapath_q_dropped").unwrap_or(0.0);
 
         Some(Self {
             conns,
@@ -184,6 +187,7 @@ impl PairMetrics {
             source_overflow,
             source_backlog_hwm,
             source_backlog_cap,
+            datapath_queue_overflow,
         })
     }
 
@@ -193,7 +197,8 @@ impl PairMetrics {
     /// zero torn connections, offer and goodput sustained at >=99.0% of
     /// the **source workload** (not of SRT's own pacing ceiling),
     /// delivery >=99.9%, zero UDP receive buffer drop errors on either
-    /// side, and no application source backlog overflow.
+    /// side, no application source backlog overflow, and no benchmark-owned
+    /// datapath queue rejection.
     ///
     /// Note what is deliberately *not* here: a cell whose SRT bandwidth
     /// policy paces below its source rate is a legitimate diagnostic
@@ -212,6 +217,7 @@ impl PairMetrics {
             && self.caller_udp_rcvbuf_err == 0.0
             && self.listener_udp_rcvbuf_err == 0.0
             && self.source_overflow == 0.0
+            && self.datapath_queue_overflow == 0.0
     }
 }
 
@@ -1236,6 +1242,20 @@ mod tests {
             !PairMetrics::compute(&c, &l_torn).unwrap().is_clean(),
             "torn_l > 0 must be rejected"
         );
+    }
+
+    #[test]
+    fn datapath_queue_overflow_invalidates_a_clean_pair() {
+        let c = make_test_caller(
+            "1", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "0", "10", "0",
+        );
+        let mut l = make_test_listener(
+            "1", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "0", "10", "0",
+        );
+        assert!(PairMetrics::compute(&c, &l).unwrap().is_clean());
+        l.fields
+            .push(("datapath_q_dropped".to_string(), "1".to_string()));
+        assert!(!PairMetrics::compute(&c, &l).unwrap().is_clean());
     }
 
     #[test]

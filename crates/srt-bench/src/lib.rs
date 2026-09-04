@@ -4,6 +4,7 @@ pub mod compare;
 pub mod cpu_stats;
 pub mod driver;
 pub mod harness;
+pub mod queue;
 pub mod shutdown;
 pub mod source;
 pub mod system;
@@ -709,6 +710,8 @@ pub struct ConnStats {
     /// from what the transport carried. A bonded pair reports its one
     /// source on its first leg only, so aggregation cannot double-count.
     pub source: crate::source::SourceStats,
+    /// Capacity zero means this path has no benchmark-owned packet queue.
+    pub datapath_queue: crate::queue::QueueStats,
 }
 
 // ---------------------------------------------------------------------------
@@ -2369,6 +2372,7 @@ pub struct Aggregate {
     /// connection reached, since summing high-water marks would report a
     /// backlog nothing ever held.
     pub source: crate::source::SourceStats,
+    pub datapath_queue: crate::queue::QueueStats,
 }
 
 impl Aggregate {
@@ -2385,6 +2389,7 @@ impl Aggregate {
             any_connected: false,
             cc_peak: 0,
             source: crate::source::SourceStats::default(),
+            datapath_queue: crate::queue::QueueStats::default(),
         }
     }
 
@@ -2396,6 +2401,7 @@ impl Aggregate {
         self.source.backpressure += s.source.backpressure;
         self.source.overflow += s.source.overflow;
         self.source.backlog_hwm = self.source.backlog_hwm.max(s.source.backlog_hwm);
+        self.datapath_queue.merge(s.datapath_queue);
         if s.connected {
             self.any_connected = true;
         }
@@ -2489,6 +2495,7 @@ impl Aggregate {
                     elapsed_s,
                     cc_peak: self.cc_peak,
                     source: self.source,
+                    datapath_queue: self.datapath_queue,
                 },
             )
         {
