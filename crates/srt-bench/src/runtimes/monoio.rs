@@ -78,8 +78,6 @@ use crate::{Aggregate, BenchConfig, BondMode, ConnStats};
 use shiguredo_srt::{ConnectionEvent, ConnectionOptions, GroupExtensionData, SrtConnection};
 use srt_transport::monoio_transport::Conn;
 use srt_transport::{Handoff, WorkerMessage};
-use std::cell::RefCell;
-use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, mpsc};
@@ -545,8 +543,8 @@ async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> Co
 /// Datagrams handed from the reader task to the maintenance loop; see
 /// `run_acceptor`'s `inbox`. The `usize` is the valid byte count; the
 /// `Vec<u8>` is the full recv buffer, recycled via the `Recycle` pool.
-type Inbox = Rc<RefCell<VecDeque<(SocketAddr, Vec<u8>, usize)>>>;
-type Recycle = Rc<RefCell<Vec<Vec<u8>>>>;
+type Inbox = crate::queue::BoundedReceiver<(SocketAddr, Vec<u8>, usize)>;
+type Recycle = crate::queue::BoundedSender<Vec<u8>>;
 
 fn run_reuseport_multi(cfg: BenchConfig, k: usize) {
     let worker_count = k.min(cfg.connections);
@@ -644,7 +642,7 @@ fn drain_acceptor_inbox(
     peers: &mut srt_transport::PeerTable,
     context: &AcceptorContext<'_>,
 ) {
-    while let Some((peer, buf, size)) = inbox.borrow_mut().pop_front() {
+    while let Ok((peer, buf, size)) = inbox.try_recv() {
         peers.admit_and_forward(
             peer,
             &buf[..size],
@@ -654,7 +652,7 @@ fn drain_acceptor_inbox(
             context.senders,
             context.telemetry,
         );
-        recycle.borrow_mut().push(buf);
+        let _ = recycle.try_send(buf);
     }
 }
 
@@ -820,15 +818,12 @@ async fn run_acceptor(
     // the socket). The fix: a dedicated reader task recvs in a tight loop
     // (as fast as the kernel delivers, decoupled from the maintenance
     // tick) and hands datagrams to the main loop through a shared local
-    // queue -- `Rc<RefCell<..>>` is safe here because the push/pop are
-    // both synchronous (never held across an `.await`), so there's no
-    // reentrancy hazard between this task and the maintenance loop below
-    // even though both run cooperatively on the same thread.
-    let inbox: Inbox = Rc::new(RefCell::new(VecDeque::new()));
-    let recycle: Recycle = Rc::new(RefCell::new(Vec::new()));
+    // bounded nonblocking queue. Full means reject the newest datagram and
+    // record overload; it never parks this single-thread reactor.
+    let (inbox_tx, inbox) = crate::queue::bounded_channel(crate::queue::DATAPATH_QUEUE_CAPACITY);
+    let (recycle_tx, recycle_rx) =
+        crate::queue::bounded_channel(crate::queue::DATAPATH_QUEUE_CAPACITY);
     let reader_listener = listener.clone();
-    let reader_inbox = inbox.clone();
-    let reader_recycle = recycle.clone();
     let _reader_task = monoio::spawn(async move {
         let mut buf = vec![0u8; 2048];
         loop {
@@ -836,17 +831,12 @@ async fn run_acceptor(
             buf = returned;
             match res {
                 Ok((n, peer)) => {
-                    let recycled = reader_recycle
-                        .borrow_mut()
-                        .pop()
-                        .unwrap_or_else(|| vec![0u8; 2048]);
+                    let recycled = recycle_rx.try_recv().unwrap_or_else(|_| vec![0u8; 2048]);
                     let owned = std::mem::replace(&mut buf, recycled);
-                    let mut q = reader_inbox.borrow_mut();
-                    q.push_back((peer, owned, n));
-                    while q.len() > 4096 {
-                        if let Some((_, dropped, _)) = q.pop_front() {
-                            reader_recycle.borrow_mut().push(dropped);
-                        }
+                    match inbox_tx.try_send((peer, owned, n)) {
+                        Ok(()) => {}
+                        Err(mpsc::TrySendError::Full((_, dropped, _))) => buf = dropped,
+                        Err(mpsc::TrySendError::Disconnected(_)) => break,
                     }
                 }
                 Err(_) => break,
@@ -886,7 +876,7 @@ async fn run_acceptor(
             }
 
             monoio::time::sleep(TIMER_TICK).await;
-            drain_acceptor_inbox(&inbox, &recycle, &mut peers, &context);
+            drain_acceptor_inbox(&inbox, &recycle_tx, &mut peers, &context);
 
             let relocations =
                 maintain_acceptor_peers(&mut peers, &listener, start, stream_len).await;
@@ -923,6 +913,9 @@ async fn run_acceptor(
         .collect();
     for task in tasks {
         stats.push(task.await);
+    }
+    if let Some(first) = stats.first_mut() {
+        first.datapath_queue.merge(inbox.stats());
     }
     stats
 }

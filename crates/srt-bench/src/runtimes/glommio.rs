@@ -34,7 +34,7 @@
 //! the same fix as monoio's `run_acceptor`: a dedicated reader task
 //! `.await`s `recv_from` in a genuine (non-blocking-executor) loop,
 //! decoupled from the maintenance tick, handing datagrams to the main
-//! loop through a local `Rc<RefCell<VecDeque>>` queue.
+//! loop through a bounded nonblocking queue.
 //!
 //! THROUGHPUT AND `--promote-all` (measured; supersedes an earlier,
 //! wrong "KNOWN LIMITATION" note here).
@@ -69,8 +69,6 @@ use crate::{Aggregate, BenchConfig, BondMode, ConnStats};
 use shiguredo_srt::{ConnectionEvent, ConnectionOptions, GroupExtensionData, SrtConnection};
 use srt_transport::glommio_transport::Conn;
 use srt_transport::{Handoff, WorkerMessage};
-use std::cell::RefCell;
-use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, mpsc};
@@ -553,7 +551,7 @@ async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> Co
 
 /// Datagrams handed from the reader task to the maintenance loop; see
 /// `run_acceptor`'s `inbox`.
-type Inbox = Rc<RefCell<VecDeque<(SocketAddr, Vec<u8>)>>>;
+type Inbox = crate::queue::BoundedReceiver<(SocketAddr, Vec<u8>)>;
 
 fn run_reuseport_multi(cfg: BenchConfig, k: usize) {
     let worker_count = k.min(cfg.connections);
@@ -632,7 +630,7 @@ fn drain_acceptor_inbox(
     peers: &mut srt_transport::PeerTable,
     context: &AcceptorContext<'_>,
 ) {
-    while let Some((peer, data)) = inbox.borrow_mut().pop_front() {
+    while let Ok((peer, data)) = inbox.try_recv() {
         peers.admit_and_forward(
             peer,
             &data,
@@ -797,22 +795,17 @@ async fn run_acceptor(
     // via futures_lite::block_on -- forbidden, see the module doc). A
     // dedicated reader task recvs in a genuine `.await` loop, decoupled
     // from the maintenance tick below, and hands datagrams to the main
-    // loop through this local queue. `Rc<RefCell<..>>` is safe without
-    // synchronization because the push/pop are always synchronous, never
-    // held across an `.await`, even though both tasks run cooperatively
-    // on the same thread.
-    let inbox: Inbox = Rc::new(RefCell::new(VecDeque::new()));
+    // loop through a bounded nonblocking queue. A full queue rejects the
+    // newest datagram and records the overload instead of hiding it by
+    // dropping old work from an unmeasured VecDeque.
+    let (inbox_tx, inbox) = crate::queue::bounded_channel(crate::queue::DATAPATH_QUEUE_CAPACITY);
     let reader_listener = listener.clone();
-    let reader_inbox = inbox.clone();
     let _reader_task = glommio::spawn_local(async move {
         let mut buf = [0u8; 2048];
         while let Ok((n, peer)) = reader_listener.recv_from(&mut buf).await {
-            let mut q = reader_inbox.borrow_mut();
-            q.push_back((peer, buf[..n].to_vec()));
-            // Safety net against unbounded growth if the main
-            // loop ever falls behind; not expected in practice.
-            while q.len() > 4096 {
-                q.pop_front();
+            match inbox_tx.try_send((peer, buf[..n].to_vec())) {
+                Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
+                Err(mpsc::TrySendError::Disconnected(_)) => break,
             }
         }
     });
@@ -887,6 +880,9 @@ async fn run_acceptor(
         .collect();
     for task in tasks {
         stats.push(task.await);
+    }
+    if let Some(first) = stats.first_mut() {
+        first.datapath_queue.merge(inbox.stats());
     }
     stats
 }

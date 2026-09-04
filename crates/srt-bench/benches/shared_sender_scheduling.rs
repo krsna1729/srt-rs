@@ -351,6 +351,35 @@ fn bench_source_clock(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_bounded_datapath_queue(c: &mut Criterion) {
+    let mut group = c.benchmark_group("bounded_datapath_queue");
+    group.bench_function("send_receive", |b| {
+        b.iter_batched(
+            || srt_bench::queue::bounded_channel(64),
+            |(sender, receiver)| {
+                sender.try_send(black_box(1_u64)).unwrap();
+                black_box(receiver.try_recv().unwrap());
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    group.bench_function("full_reject", |b| {
+        b.iter_batched(
+            || {
+                let (sender, receiver) = srt_bench::queue::bounded_channel(1);
+                sender.try_send(1_u64).unwrap();
+                (sender, receiver)
+            },
+            |(sender, receiver)| {
+                black_box(sender.try_send(2_u64).is_err());
+                black_box(receiver.stats());
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_handshaking_tick,
@@ -362,6 +391,7 @@ criterion_group!(
     bench_admission_throttled,
     bench_sequential_admission,
     bench_sched_stats_readout,
-    bench_source_clock
+    bench_source_clock,
+    bench_bounded_datapath_queue
 );
 criterion_main!(benches);

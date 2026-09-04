@@ -229,8 +229,10 @@ axis) and the measurements, so `report` can group by any subset:
 
 ```
 runtime  encryption  role  ingress  promotion  cookie  batch  sock_buf  conns  connect_cc
-bond  bitrate  rep  established  pkt_sent  core_total  sec_a  sec_b  rtt_ms
-elapsed_s  cpu_user_ms  cpu_sys_ms  peak_rss_kb
+bond  source_bps  srt_bw_mode  srt_maxbw_bps  srt_inputbw_bps  srt_oheadbw_pct
+rep  established  pkt_sent  core_total  sec_a  sec_b  rtt_ms  elapsed_s
+cpu_user_ms  cpu_sys_ms  peak_rss_kb  src_backpressure  src_backlog_hwm
+src_overflow  datapath_q_cap  datapath_q_hwm  datapath_q_full  datapath_q_dropped
 ```
 
 TSV rather than JSON: no dependency to read or write, greppable, and it
