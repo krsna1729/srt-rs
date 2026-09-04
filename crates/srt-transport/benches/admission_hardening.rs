@@ -883,6 +883,90 @@ fn bench_generic_due_index_scaling(c: &mut Criterion) {
     group.finish();
 }
 
+/// Bounded rebuild versus the historical unbounded lazy heap. These rows
+/// separately price the normal mutation/read paths and the churn that
+/// actually triggers maintenance.
+fn bench_generic_due_index_rebuild_policy(c: &mut Criterion) {
+    let mut group = c.benchmark_group("generic_due_index_rebuild_policy");
+    let keys: Vec<u32> = (0..1_000).collect();
+
+    for (policy, ratio) in [("bounded", 4), ("unbounded", 0)] {
+        group.bench_function(format!("set_unique/{policy}"), |b| {
+            b.iter_batched(
+                || DueIndex::with_rebuild_policy(64, ratio),
+                |mut index| {
+                    for &key in &keys {
+                        index.set(key, Timestamp::from_micros(u64::from(key)));
+                    }
+                    black_box(index.heap_len());
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        group.bench_function(format!("reschedule_normal/{policy}"), |b| {
+            b.iter_batched(
+                || {
+                    let mut index = DueIndex::with_rebuild_policy(64, ratio);
+                    for &key in &keys {
+                        index.set(key, Timestamp::from_micros(1_000));
+                    }
+                    index
+                },
+                |mut index| {
+                    for &key in &keys {
+                        index.set(key, Timestamp::from_micros(2_000));
+                    }
+                    black_box(index.heap_len());
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        for operation in ["peek", "pop_due"] {
+            group.bench_function(format!("{operation}_after_churn/{policy}"), |b| {
+                b.iter_batched(
+                    || {
+                        let mut index = DueIndex::with_rebuild_policy(64, ratio);
+                        for round in 0..6_u64 {
+                            for &key in &keys {
+                                index.set(key, Timestamp::from_micros(1_000 + round));
+                            }
+                        }
+                        index
+                    },
+                    |mut index| {
+                        if operation == "peek" {
+                            black_box(index.peek_min_deadline());
+                        } else {
+                            let mut due = Vec::new();
+                            index.pop_due(Timestamp::from_micros(2_000), &mut due);
+                            black_box(due);
+                        }
+                    },
+                    BatchSize::SmallInput,
+                );
+            });
+        }
+
+        group.bench_function(format!("churn_rebuild/{policy}"), |b| {
+            b.iter_batched(
+                || DueIndex::with_rebuild_policy(64, ratio),
+                |mut index| {
+                    for round in 0..10_u64 {
+                        for &key in &keys {
+                            index.set(key, Timestamp::from_micros(round));
+                        }
+                    }
+                    black_box((index.heap_len(), index.rebuild_count()));
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_invalid_admission,
@@ -895,6 +979,7 @@ criterion_group!(
     bench_established_data_progression,
     bench_ready_queue_scaling,
     bench_dense_due_index_scaling,
-    bench_generic_due_index_scaling
+    bench_generic_due_index_scaling,
+    bench_generic_due_index_rebuild_policy
 );
 criterion_main!(benches);
