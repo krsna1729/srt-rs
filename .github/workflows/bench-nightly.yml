@@ -58,6 +58,13 @@ jobs:
             ./target/release/srt-bench matrix --plan "$plan" --reps 1 --secs 60 --out nightly.tsv
             echo "::endgroup::"
           done
+      - name: Run high-N/high-rate stress sentinels
+        run: |
+          for plan in docs/plans/perf-sentinels/mio-pool-plain.plan docs/plans/perf-sentinels/compio-pool-plain.plan; do
+            echo "::group::$plan"
+            ./target/release/srt-bench matrix --plan "$plan" --reps 1 --out nightly.tsv
+            echo "::endgroup::"
+          done
       # The real nightly sweep: full throughput-matrix.plan (1536 cells,
       # documented), not axis-trimmed -- budgeted 5h leaving 1h margin in
       # the 6h ceiling for setup and the report/upload steps. `|| true`

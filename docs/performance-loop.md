@@ -29,6 +29,11 @@ interpret a shared-host outlier as an optimization.
 
 ## Fast live sentinels
 
+The PR gate uses `docs/plans/ci-sentinels/`: one 600-connection, low-rate
+admission cell and one lower-connection datapath-load cell. Both must satisfy
+`srt-bench check-clean`. The higher-rate plans below are performance/stress
+measurements and run nightly; they are not assumed to be clean on shared CI.
+
 Each file is one deliberate cell, so its result is attributable. Run all four
 for a general hot-path change; run the directly affected subset for a narrowly
 scoped change.

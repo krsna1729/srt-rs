@@ -1,0 +1,24 @@
+# PR gate: meaningful payload traffic at a connection count with ample CI headroom.
+# The separate admission-scale plan owns high-N coverage.
+runtime                     = mio,compio
+ingress                     = shared-pool:4
+egress                      = per-connection
+encryption                  = plain
+connections                 = 8
+bitrate                     = 500000
+srt-bandwidth               = input-relative:25
+workers                     = 1
+promotion                   = all
+cookie-routing              = on
+batch                       = on
+sock-buf                    = 16m
+connect-concurrency         = 8
+bond                        = none
+# One second tolerates shared-runner scheduling jitter without hiding sustained
+# overload: check-clean still requires >=99% offer/goodput and zero overflow.
+source-backlog-ms           = 1000
+datapath-queue-horizon-ms   = 250
+outbound-retry-horizon-ms   = 250
+recv-rounds                 = 8
+would-block                 = retain
+pin                         = off

@@ -193,47 +193,33 @@ jobs:
           retention-days: 14
 
   bench-sentinel:
-    name: Bench sentinel (perf-sentinels plans)
+    name: Bench sentinel (canonical clean plans)
     needs: quality
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build -p srt-bench
-      # Only the two connect-concurrency=50 (parallel ramp-up) plans:
-      # mio/compio pooled ingress, 600 connections, established=600/600 in
-      # ~4-9s on a real 4-core runner -- verified. tokio-broadcast.plan
-      # (connect-concurrency=2, bonded) and tokio-demux-aes256.plan
-      # (connect-concurrency=1, unbonded sequential) don't reliably
-      # finish establishing within the default 8s window on shared CI
-      # infra. Run those two in bench-nightly.yml instead, where a
-      # multi-hour budget comfortably absorbs the slower ramp -- a gate
-      # needs to be reliably fast and non-flaky above all.
-      - name: Run perf-sentinel plans
+      - run: cargo build --release -p srt-bench
+      - name: Provision requested UDP socket-buffer ceiling
+        run: |
+          sudo sysctl -w net.core.rmem_max=16777216
+          sudo sysctl -w net.core.wmem_max=16777216
+          test "$(sysctl -n net.core.rmem_max)" -ge 16777216
+          test "$(sysctl -n net.core.wmem_max)" -ge 16777216
+      # Keep high-N admission and meaningful datapath load separate. The
+      # historical 600 x 1 Mbit/s cells are stress measurements, not clean
+      # shared-runner gates, and remain in bench-nightly.yml.
+      - name: Run clean sentinel plans
         run: |
           set -e
-          for plan in docs/plans/perf-sentinels/mio-pool-plain.plan docs/plans/perf-sentinels/compio-pool-plain.plan; do
+          for plan in docs/plans/ci-sentinels/admission-scale.plan docs/plans/ci-sentinels/datapath-load.plan; do
             echo "::group::$plan"
-            ./target/debug/srt-bench matrix --plan "$plan" --reps 1 --out sentinel.tsv
+            ./target/release/srt-bench matrix --plan "$plan" --reps 1 --out sentinel.tsv
             echo "::endgroup::"
           done
-      - name: Verify every cell fully established
-        run: |
-          awk -F'\t' '
-            NR==1 { for (i=1;i<=NF;i++) h[$i]=i; next }
-            {
-              if ($h["established"] < $h["conns"]) {
-                print "FAIL: role=" $h["role"] " runtime=" $h["runtime"] \
-                      " established=" $h["established"] " < conns=" $h["conns"]
-                bad=1
-              } else {
-                print "OK: role=" $h["role"] " runtime=" $h["runtime"] \
-                      " established=" $h["established"] "/" $h["conns"]
-              }
-            }
-            END { if (bad) exit 1 }
-          ' sentinel.tsv
+      - name: Verify canonical clean predicate
+        run: ./target/release/srt-bench check-clean sentinel.tsv
       - uses: actions/upload-artifact@v7
         if: always()
         with:
