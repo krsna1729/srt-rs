@@ -255,6 +255,12 @@ pub struct BenchConfig {
     /// opportunities are dropped and counted. Bounded by rate, never by
     /// run duration.
     pub source_backlog_ms: u64,
+    /// Milliseconds of offered load one benchmark-owned packet datapath
+    /// queue may hold. Bounded by rate and fan-in, never by run duration.
+    pub datapath_queue_horizon_ms: u64,
+    /// Milliseconds of offered load the harness may retain after an
+    /// outbound send yields. Same rule, against socket fan-out.
+    pub outbound_retry_horizon_ms: u64,
     pub connections: usize,
     /// Caller-side UDP socket topology. `PerConnection` gives every SRT
     /// connection its own ephemeral local port. `SharedSocket` drives all
@@ -422,6 +428,8 @@ pub struct PeerTopology {
     pub send_ingress: String,
     pub recv_workers: String,
     pub send_workers: String,
+    pub recv_cpus: String,
+    pub send_cpus: String,
 }
 
 /// Link conditions to emulate, one field per `--link-*` flag. Empty means
@@ -650,12 +658,88 @@ impl BenchConfig {
         self.srt_bandwidth().apply_to(options);
     }
 
+    /// How many peers' traffic arrives on one listener ingress socket.
+    ///
+    /// A per-port socket serves one sender; a pooled or reuseport socket
+    /// serves its share of the cell.
+    #[must_use]
+    pub fn peers_per_ingress_socket(&self) -> usize {
+        let sockets = match self.ingress {
+            Ingress::PerPort => return 1,
+            Ingress::SharedPool(k) | Ingress::ReuseportMulti(k) => k,
+            Ingress::ReuseportSingle { workers } => workers,
+        };
+        self.connections.div_ceil(sockets.max(1)).max(1)
+    }
+
+    /// How many peers share one of this process's UDP sockets.
+    ///
+    /// The single fan-in notion behind every bounded queue this process
+    /// owns. Both directions use it, because both directions go through
+    /// the same socket: a shared-egress sender puts every connection's
+    /// traffic on one socket in each direction, and a pooled listener
+    /// does the same for its share of the peers.
+    ///
+    /// One helper rather than a per-queue-kind rule, because getting this
+    /// wrong is silent and expensive: sizing a queue by an unrelated
+    /// topology knob under-provisioned a pooled listener's outbound queue
+    /// by ~50x at 200 connections and dropped a quarter of a million
+    /// acknowledgements with no `WouldBlock` to explain it.
+    ///
+    /// Over-provisions a promoted per-connection socket on a pooled
+    /// listener, which is the safe direction and keeps capacity uniform
+    /// across the process -- which is what makes reporting a single
+    /// `capacity_per_queue` meaningful.
+    #[must_use]
+    pub fn peers_per_socket(&self) -> usize {
+        match self.mode {
+            Mode::Receiver => self.peers_per_ingress_socket(),
+            Mode::Sender => match self.egress {
+                Egress::SharedSocket => self.connections.max(1),
+                Egress::PerConnection => 1,
+            },
+        }
+    }
+
+    /// Capacity for one benchmark-owned packet datapath queue.
+    ///
+    /// Derived from the queue horizon, this socket's fan-in, and the
+    /// source packet rate, so it is bounded by workload rather than by a
+    /// constant with no workload meaning. Uniform across the process,
+    /// which is what makes `capacity_per_queue` a single number worth
+    /// reporting.
+    #[must_use]
+    pub fn datapath_queue_capacity(&self) -> usize {
+        crate::queue::datapath_queue_capacity(
+            self.source_bitrate_bps,
+            self.peers_per_socket(),
+            self.datapath_queue_horizon_ms,
+        )
+    }
+
+    /// Capacity for one outbound retry queue.
+    ///
+    /// Sized by the same horizon rule and the same fan-in as a datapath
+    /// queue -- see [`Self::peers_per_socket`] -- against the outbound
+    /// horizon.
+    #[must_use]
+    pub fn outbound_retry_capacity(&self) -> usize {
+        crate::queue::datapath_queue_capacity(
+            self.source_bitrate_bps,
+            self.peers_per_socket(),
+            self.outbound_retry_horizon_ms,
+        )
+    }
+
     /// A fresh payload source for one connection, ticking at the
     /// configured source rate with a rate-relative bounded backlog.
     #[must_use]
     pub fn source_clock(&self) -> crate::source::SourceClock {
         crate::source::SourceClock::new(
-            self.source_bitrate_bps,
+            // Validated non-zero when the config was parsed: a zero source
+            // rate is a usage error, never a silent "unpaced" mode.
+            std::num::NonZeroU64::new(self.source_bitrate_bps)
+                .expect("source_bitrate_bps is validated non-zero at parse time"),
             crate::source::backlog_capacity(self.source_bitrate_bps, self.source_backlog_ms),
         )
     }
@@ -715,6 +799,14 @@ pub struct ConnStats {
     /// from what the transport carried. A bonded pair reports its one
     /// source on its first leg only, so aggregation cannot double-count.
     pub source: crate::source::SourceStats,
+    /// Whether this `ConnStats` carries a payload source at all.
+    ///
+    /// Counted rather than derived: a bonded pair is two physical legs
+    /// driven by *one* source clock, and a listener has no source, so
+    /// neither `connections` nor `established` is the number of workload
+    /// producers. Deriving it from topology would have to re-encode the
+    /// bonding rules in the report layer; measuring it cannot drift.
+    pub has_source: bool,
     /// Capacity zero means this path has no benchmark-owned packet queue.
     pub datapath_queue: crate::queue::QueueStats,
     pub recv_scheduling: crate::scheduling::RecvSchedulingStats,
@@ -2137,6 +2229,7 @@ impl SharedSender {
                 // leg only so a bonded pair is not counted twice.
                 if let Some(first) = stats.first_mut() {
                     first.source = source;
+                    first.has_source = true;
                 }
                 stats
             })
@@ -2180,15 +2273,25 @@ fn apply_sender_stats(stats: &mut ConnStats, connection: &shiguredo_srt::Connect
 /// Runtime adapters convert this socket to their native type; keeping bind
 /// and buffer configuration here ensures the `sock-buf` axis has identical
 /// meaning for every runtime.
-pub(crate) fn bind_shared_sender_socket(
+pub(crate) fn bind_configured_socket(
+    addr: std::net::SocketAddr,
     sock_buf_bytes: usize,
 ) -> std::io::Result<std::net::UdpSocket> {
     use std::os::fd::AsRawFd;
 
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+    let socket = std::net::UdpSocket::bind(addr)?;
     socket.set_nonblocking(true)?;
     srt_transport::set_sock_bufs(socket.as_raw_fd(), sock_buf_bytes)?;
     Ok(socket)
+}
+
+pub(crate) fn bind_shared_sender_socket(
+    sock_buf_bytes: usize,
+) -> std::io::Result<std::net::UdpSocket> {
+    bind_configured_socket(
+        std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
+        sock_buf_bytes,
+    )
 }
 
 /// Convert a shared-listener table into benchmark rows. A bonded publisher is
@@ -2379,6 +2482,9 @@ pub struct Aggregate {
     /// connection reached, since summing high-water marks would report a
     /// backlog nothing ever held.
     pub source: crate::source::SourceStats,
+    /// How many independent payload sources this process actually ran.
+    /// One per logical stream, so a bonded pair contributes one, not two.
+    pub source_streams: u64,
     pub datapath_queue: crate::queue::QueueStats,
     pub recv_scheduling: crate::scheduling::RecvSchedulingStats,
     pub outbound_retry: crate::scheduling::RetryStats,
@@ -2398,6 +2504,7 @@ impl Aggregate {
             any_connected: false,
             cc_peak: 0,
             source: crate::source::SourceStats::default(),
+            source_streams: 0,
             datapath_queue: crate::queue::QueueStats::default(),
             recv_scheduling: crate::scheduling::RecvSchedulingStats::default(),
             outbound_retry: crate::scheduling::RetryStats::default(),
@@ -2409,7 +2516,9 @@ impl Aggregate {
         self.torn_down += u64::from(s.torn_down);
         self.source.generated += s.source.generated;
         self.source.accepted += s.source.accepted;
-        self.source.backpressure += s.source.backpressure;
+        self.source.refusal_polls += s.source.refusal_polls;
+        self.source.blocked_streaks += s.source.blocked_streaks;
+        self.source_streams += u64::from(s.has_source);
         self.source.overflow += s.source.overflow;
         self.source.backlog_hwm = self.source.backlog_hwm.max(s.source.backlog_hwm);
         self.datapath_queue.merge(s.datapath_queue);
@@ -2508,6 +2617,7 @@ impl Aggregate {
                     elapsed_s,
                     cc_peak: self.cc_peak,
                     source: self.source,
+                    source_streams: self.source_streams,
                     datapath_queue: self.datapath_queue,
                     recv_scheduling: self.recv_scheduling,
                     outbound_retry: self.outbound_retry,
@@ -2528,7 +2638,7 @@ fn usage() -> ! {
          mode=<sender|receiver> <host?> <port> <duration_secs> <latency_ms> \
          [source_bitrate_bps] [--connections N] \
          [--srt-bandwidth protocol-default|legacy-source-fixed|fixed:BPS|input-relative:PCT] \
-         [--source-backlog-ms MS] \
+         [--source-backlog-ms MS] [--datapath-queue-horizon-ms MS] \
          [--ingress per-port|shared-pool=K|reuseport-multi=K|reuseport-single=W] \
          [--egress per-connection|shared-socket] \
          [--encryption plain|128|192|256] \
@@ -2612,11 +2722,22 @@ fn parse_required_positionals(cli: &Cli, mode: Mode) -> (String, u16, f64, u16, 
     let port = parse_positional(cli, offset);
     let duration_secs = parse_positional(cli, offset + 1);
     let latency_ms = parse_positional(cli, offset + 2);
-    let source_bitrate_bps = cli
-        .positional
-        .get(offset + 3)
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(DEFAULT_SOURCE_BITRATE_BPS);
+    // A zero source rate is a usage error, not a mode. It used to divide
+    // to zero bytes per second and select an "unpaced" generator, so
+    // `0` silently meant "as fast as SRT will accept" -- the opposite of
+    // a rate, and unreadable from a result row.
+    let source_bitrate_bps = match cli.positional.get(offset + 3) {
+        None => DEFAULT_SOURCE_BITRATE_BPS,
+        Some(value) => match value.parse::<u64>() {
+            Ok(rate) if rate > 0 => rate,
+            _ => {
+                eprintln!(
+                    "error: source_bitrate_bps must be a positive integer (got '{value}'); it is the application payload rate in bits per second, not SRT's pacing ceiling"
+                );
+                usage()
+            }
+        },
+    };
     (host, port, duration_secs, latency_ms, source_bitrate_bps)
 }
 
@@ -2802,6 +2923,8 @@ fn parse_peer_topology(cli: &Cli) -> PeerTopology {
         send_ingress: scoped_flag(cli, "send-ingress"),
         recv_workers: scoped_flag(cli, "recv-workers"),
         send_workers: scoped_flag(cli, "send-workers"),
+        recv_cpus: scoped_flag(cli, "recv-cpus"),
+        send_cpus: scoped_flag(cli, "send-cpus"),
     }
 }
 
@@ -2890,6 +3013,14 @@ pub fn bench_config_from_args() -> BenchConfig {
         source_bitrate_bps,
         bandwidth: parse_bandwidth_policy(&cli),
         source_backlog_ms: cli.flag_or("source-backlog-ms", source::DEFAULT_SOURCE_BACKLOG_MS),
+        datapath_queue_horizon_ms: cli.flag_or(
+            "datapath-queue-horizon-ms",
+            queue::DEFAULT_DATAPATH_QUEUE_HORIZON_MS,
+        ),
+        outbound_retry_horizon_ms: cli.flag_or(
+            "outbound-retry-horizon-ms",
+            scheduling::DEFAULT_OUTBOUND_RETRY_HORIZON_MS,
+        ),
         connections: cli.connections(),
         egress,
         ingress,
@@ -2975,6 +3106,8 @@ mod tests {
             source_bitrate_bps: 1_000_000,
             bandwidth: crate::source::BandwidthPolicy::default(),
             source_backlog_ms: crate::source::DEFAULT_SOURCE_BACKLOG_MS,
+            datapath_queue_horizon_ms: crate::queue::DEFAULT_DATAPATH_QUEUE_HORIZON_MS,
+            outbound_retry_horizon_ms: crate::scheduling::DEFAULT_OUTBOUND_RETRY_HORIZON_MS,
             connections: 1,
             egress: Egress::PerConnection,
             ingress: Ingress::SharedPool(4),

@@ -336,7 +336,11 @@ async fn sender_task(
     // sender task is spawned upfront, so a periodic re-check here would cost
     // one timer wakeup per pending connection per millisecond of admission.
     let mut permit = crate::HandshakeAdmission::acquire_optional(limiter.as_ref()).await;
-    let socket = glommio::net::UdpSocket::bind("0.0.0.0:0").expect("bind");
+    let socket = srt_transport::glommio_transport::from_std(
+        crate::bind_configured_socket(SocketAddr::from(([0, 0, 0, 0], 0)), cfg.sock_buf_bytes)
+            .expect("bind"),
+    )
+    .expect("register socket");
     socket.connect(endpoint).await.expect("connect");
 
     let mut options = ConnectionOptions {
@@ -423,6 +427,7 @@ async fn sender_task(
 
     record_sender_stats(&driver, &mut stats);
     stats.source = source.stats();
+    stats.has_source = true;
     stats
 }
 
@@ -496,8 +501,14 @@ fn record_receiver_stats(driver: &Conn, stats: &mut ConnStats) {
 }
 
 async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> ConnStats {
-    let socket =
-        glommio::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], listen_port))).expect("bind");
+    let socket = srt_transport::glommio_transport::from_std(
+        crate::bind_configured_socket(
+            SocketAddr::from(([0, 0, 0, 0], listen_port)),
+            cfg.sock_buf_bytes,
+        )
+        .expect("bind"),
+    )
+    .expect("register socket");
 
     let mut options = ConnectionOptions {
         socket_id: std::process::id(),
@@ -798,7 +809,7 @@ async fn run_acceptor(
     // loop through a bounded nonblocking queue. A full queue rejects the
     // newest datagram and records the overload instead of hiding it by
     // dropping old work from an unmeasured VecDeque.
-    let (inbox_tx, inbox) = crate::queue::bounded_channel(crate::queue::DATAPATH_QUEUE_CAPACITY);
+    let (inbox_tx, inbox) = crate::queue::bounded_channel(cfg.datapath_queue_capacity());
     let reader_listener = listener.clone();
     let _reader_task = glommio::spawn_local(async move {
         let mut buf = [0u8; 2048];

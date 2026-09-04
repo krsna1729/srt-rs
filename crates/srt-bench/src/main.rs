@@ -29,6 +29,10 @@
 //!
 //! Comparative analysis across two result files:
 //!   srt-bench compare BASE.tsv HEAD.tsv [--format table|markdown] [--out FILE]
+//!
+//! Validate every cell satisfies the canonical clean capacity predicate:
+//!   srt-bench check-clean sentinel.tsv
+//!
 //! Syscall/io_uring attribution for one pair (needs `perf`):
 //!   srt-bench sysprof --runtime glommio --connections 150
 //!
@@ -49,7 +53,7 @@ fn main() {
     // result schema.
     let args: Vec<String> = std::env::args().collect();
     let context = match args.get(1).map(String::as_str) {
-        Some("report" | "watch" | "compare") => None,
+        Some("report" | "watch" | "compare" | "check-clean") => None,
         Some("system-info") => Some("system-info"),
         Some("matrix") => Some("matrix"),
         Some("sysprof") => Some("sysprof"),
@@ -66,6 +70,7 @@ fn main() {
         }
         Some("report") => return report(&args),
         Some("compare") => return compare(&args),
+        Some("check-clean") => return check_clean(&args),
         Some("watch") => {
             let cli = srt_bench::Cli::parse(&args[1..]);
             if let Err(e) = srt_bench::watch::run(&cli) {
@@ -201,5 +206,24 @@ fn compare(args: &[String]) {
         }
     } else {
         print!("{output}");
+    }
+}
+
+/// `srt-bench check-clean FILE.tsv` -- validate that every cell and repetition
+/// in the file satisfies the canonical clean capacity predicate.
+fn check_clean(args: &[String]) {
+    let cli = srt_bench::Cli::parse(&args[1..]);
+    let path = cli.positional.first().cloned().unwrap_or_else(|| {
+        eprintln!("usage: srt-bench check-clean FILE.tsv");
+        std::process::exit(2);
+    });
+    match srt_bench::compare::check_clean_file(std::path::Path::new(&path)) {
+        Ok(msg) => {
+            print!("{msg}");
+        }
+        Err(msg) => {
+            eprint!("{msg}");
+            std::process::exit(1);
+        }
     }
 }

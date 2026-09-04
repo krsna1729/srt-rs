@@ -113,9 +113,12 @@ pub use config::*;
 
 // --- Public re-exports: utilities ---
 
-pub use cpu::{available_cpus, parse_cpu_spec, restrict_to_cpu_list};
+pub use cpu::{available_cpus, current_cpu_spec, parse_cpu_spec, restrict_to_cpu_list};
 pub use due_index::DueIndex;
-pub use socket_io::{SOCK_BUF_BYTES, bind_reuseport, recvmsg_batch, sendmsg_batch, set_sock_bufs};
+pub use socket_io::{
+    SOCK_BUF_BYTES, SocketBufferStats, bind_reuseport, recvmsg_batch, sendmsg_batch, set_sock_bufs,
+    socket_buffer_stats,
+};
 pub use timer::ManualTimerStore;
 
 // --- Public re-exports: admission ---

@@ -197,9 +197,8 @@ async fn run_shared_sender(cfg: &BenchConfig, start: Instant) -> (Vec<ConnStats>
         crate::bind_shared_sender_socket(cfg.sock_buf_bytes).expect("bind shared sender socket"),
     )
     .expect("register shared sender socket");
-    let (inbox_tx, inbox_rx) = crate::queue::bounded_channel(crate::queue::DATAPATH_QUEUE_CAPACITY);
-    let (recycle_tx, recycle_rx) =
-        crate::queue::bounded_channel(crate::queue::DATAPATH_QUEUE_CAPACITY);
+    let (inbox_tx, inbox_rx) = crate::queue::bounded_channel(cfg.datapath_queue_capacity());
+    let (recycle_tx, recycle_rx) = crate::queue::bounded_channel(cfg.datapath_queue_capacity());
     let reader = socket.clone();
     let _reader = compio::runtime::spawn(async move {
         let mut buffer = vec![0_u8; 65_536];
@@ -358,9 +357,11 @@ async fn sender_task(
     limiter: Option<std::sync::Arc<std::sync::Mutex<crate::ConnectLimiter>>>,
 ) -> ConnStats {
     let mut permit = crate::HandshakeAdmission::acquire_optional(limiter.as_ref()).await;
-    let socket = compio::net::UdpSocket::bind("0.0.0.0:0")
-        .await
-        .expect("bind");
+    let socket = compio::net::UdpSocket::from_std(
+        crate::bind_configured_socket(SocketAddr::from(([0, 0, 0, 0], 0)), cfg.sock_buf_bytes)
+            .expect("bind"),
+    )
+    .expect("register socket");
     socket.connect(endpoint).await.expect("connect");
 
     let mut options = ConnectionOptions {
@@ -380,9 +381,8 @@ async fn sender_task(
     let mut driver = Conn::new(conn, socket);
 
     let (received_sender, received_receiver) =
-        crate::queue::bounded_channel(crate::queue::DATAPATH_QUEUE_CAPACITY);
-    let (recycle_tx, recycle_rx) =
-        crate::queue::bounded_channel(crate::queue::DATAPATH_QUEUE_CAPACITY);
+        crate::queue::bounded_channel(cfg.datapath_queue_capacity());
+    let (recycle_tx, recycle_rx) = crate::queue::bounded_channel(cfg.datapath_queue_capacity());
     spawn_reader(&driver, received_sender, recycle_rx);
     drain_outputs(&mut driver, crate::now_ts(start)).await;
 
@@ -460,6 +460,7 @@ async fn sender_task(
     drain_outputs(&mut driver, t).await;
     record_sender_stats(&driver, &mut stats);
     stats.source = source.stats();
+    stats.has_source = true;
     stats.datapath_queue = received_receiver.stats();
     stats
 }
@@ -545,9 +546,14 @@ fn record_receiver_stats(driver: &Conn, stats: &mut ConnStats) {
 }
 
 async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> ConnStats {
-    let socket = compio::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], listen_port)))
-        .await
-        .expect("bind");
+    let socket = compio::net::UdpSocket::from_std(
+        crate::bind_configured_socket(
+            SocketAddr::from(([0, 0, 0, 0], listen_port)),
+            cfg.sock_buf_bytes,
+        )
+        .expect("bind"),
+    )
+    .expect("register socket");
 
     let mut options = ConnectionOptions {
         socket_id: std::process::id(),
@@ -560,9 +566,8 @@ async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> Co
     drain_outputs(&mut driver, crate::now_ts(start)).await;
 
     let (received_sender, received_receiver) =
-        crate::queue::bounded_channel(crate::queue::DATAPATH_QUEUE_CAPACITY);
-    let (recycle_tx, recycle_rx) =
-        crate::queue::bounded_channel(crate::queue::DATAPATH_QUEUE_CAPACITY);
+        crate::queue::bounded_channel(cfg.datapath_queue_capacity());
+    let (recycle_tx, recycle_rx) = crate::queue::bounded_channel(cfg.datapath_queue_capacity());
     let received_socket = driver.sock.clone();
     let _reader = compio::runtime::spawn(async move {
         let mut first = true;
@@ -885,9 +890,8 @@ async fn run_acceptor(
     // loop, decoupled from the maintenance tick, and hands datagrams to
     // the main loop through the channel. Never calls connect -- this
     // listener must stay unconnected to keep admitting every peer.
-    let (inbox_tx, inbox_rx) = crate::queue::bounded_channel(crate::queue::DATAPATH_QUEUE_CAPACITY);
-    let (recycle_tx, recycle_rx) =
-        crate::queue::bounded_channel(crate::queue::DATAPATH_QUEUE_CAPACITY);
+    let (inbox_tx, inbox_rx) = crate::queue::bounded_channel(cfg.datapath_queue_capacity());
+    let (recycle_tx, recycle_rx) = crate::queue::bounded_channel(cfg.datapath_queue_capacity());
     let reader_listener = listener.clone();
     let _reader = compio::runtime::spawn(async move {
         let mut buffer = vec![0u8; 2048];
@@ -1060,9 +1064,8 @@ async fn established_conn_task(mut driver: Conn, cfg: BenchConfig, start: Instan
     let mut last_data_at = Instant::now();
 
     let (received_sender, received_receiver) =
-        crate::queue::bounded_channel(crate::queue::DATAPATH_QUEUE_CAPACITY);
-    let (recycle_tx, recycle_rx) =
-        crate::queue::bounded_channel(crate::queue::DATAPATH_QUEUE_CAPACITY);
+        crate::queue::bounded_channel(cfg.datapath_queue_capacity());
+    let (recycle_tx, recycle_rx) = crate::queue::bounded_channel(cfg.datapath_queue_capacity());
     let received_socket = driver.sock.clone();
     let _reader = compio::runtime::spawn(async move {
         let mut buffer = vec![0u8; 2048];
@@ -1218,9 +1221,8 @@ async fn serve_pool_socket(cfg: BenchConfig, index: usize, start: Instant) -> Ve
     // compio has no non-blocking recv, so a reader task keeps one
     // owned-buffer recv in flight and feeds the maintenance loop, exactly
     // as the PerPort path does.
-    let (inbox_tx, inbox_rx) = crate::queue::bounded_channel(crate::queue::DATAPATH_QUEUE_CAPACITY);
-    let (recycle_tx, recycle_rx) =
-        crate::queue::bounded_channel(crate::queue::DATAPATH_QUEUE_CAPACITY);
+    let (inbox_tx, inbox_rx) = crate::queue::bounded_channel(cfg.datapath_queue_capacity());
+    let (recycle_tx, recycle_rx) = crate::queue::bounded_channel(cfg.datapath_queue_capacity());
     let reader_sock = sock.clone();
     let _reader = compio::runtime::spawn(async move {
         let mut b = vec![0u8; 2048];
@@ -1476,9 +1478,8 @@ async fn run_single_acceptor(
         return crate::queue::QueueStats::default();
     };
 
-    let (inbox_tx, inbox_rx) = crate::queue::bounded_channel(crate::queue::DATAPATH_QUEUE_CAPACITY);
-    let (recycle_tx, recycle_rx) =
-        crate::queue::bounded_channel(crate::queue::DATAPATH_QUEUE_CAPACITY);
+    let (inbox_tx, inbox_rx) = crate::queue::bounded_channel(cfg.datapath_queue_capacity());
+    let (recycle_tx, recycle_rx) = crate::queue::bounded_channel(cfg.datapath_queue_capacity());
     let reader_sock = listener.clone();
     let _reader = compio::runtime::spawn(async move {
         let mut b = vec![0u8; 2048];

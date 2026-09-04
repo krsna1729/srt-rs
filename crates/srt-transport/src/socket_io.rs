@@ -1,4 +1,5 @@
 use std::net;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Target 16 MB per socket. Adapters set this explicitly on every socket
 /// they own (never via sysctl) and read back the effective value --
@@ -6,18 +7,87 @@ use std::net;
 /// granted size can be smaller than asked.
 pub const SOCK_BUF_BYTES: usize = 16 << 20;
 
-/// Set SO_RCVBUF/SO_SNDBUF on a raw fd to `bytes`, warning once if the
-/// host clamped the request smaller. `0` leaves the OS default in place
-/// and does nothing.
-///
-/// The size is a parameter rather than a crate-level setting on purpose:
-/// a library has no business holding process-global mutable
-/// configuration, and threading it explicitly keeps the choice with the
-/// application that actually made it. [`SOCK_BUF_BYTES`] is the value
-/// callers usually want.
+/// Kernel-granted socket buffer sizes observed across this process's sockets.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct SocketBufferStats {
+    pub sockets: usize,
+    pub rcvbuf_min_bytes: usize,
+    pub rcvbuf_max_bytes: usize,
+    pub sndbuf_min_bytes: usize,
+    pub sndbuf_max_bytes: usize,
+}
+
+static SOCKET_COUNT: AtomicUsize = AtomicUsize::new(0);
+static RCVBUF_MIN: AtomicUsize = AtomicUsize::new(usize::MAX);
+static RCVBUF_MAX: AtomicUsize = AtomicUsize::new(0);
+static SNDBUF_MIN: AtomicUsize = AtomicUsize::new(usize::MAX);
+static SNDBUF_MAX: AtomicUsize = AtomicUsize::new(0);
+
+fn record_socket_buffers(rcvbuf: usize, sndbuf: usize) {
+    SOCKET_COUNT.fetch_add(1, Ordering::Relaxed);
+    RCVBUF_MIN.fetch_min(rcvbuf, Ordering::Relaxed);
+    RCVBUF_MAX.fetch_max(rcvbuf, Ordering::Relaxed);
+    SNDBUF_MIN.fetch_min(sndbuf, Ordering::Relaxed);
+    SNDBUF_MAX.fetch_max(sndbuf, Ordering::Relaxed);
+}
+
+/// Return process-wide effective socket-buffer ranges.
+#[must_use]
+pub fn socket_buffer_stats() -> SocketBufferStats {
+    let sockets = SOCKET_COUNT.load(Ordering::Relaxed);
+    if sockets == 0 {
+        return SocketBufferStats::default();
+    }
+    SocketBufferStats {
+        sockets,
+        rcvbuf_min_bytes: RCVBUF_MIN.load(Ordering::Relaxed),
+        rcvbuf_max_bytes: RCVBUF_MAX.load(Ordering::Relaxed),
+        sndbuf_min_bytes: SNDBUF_MIN.load(Ordering::Relaxed),
+        sndbuf_max_bytes: SNDBUF_MAX.load(Ordering::Relaxed),
+    }
+}
+
+/// Query SO_RCVBUF and SO_SNDBUF on `fd`.
+fn get_sock_bufs(fd: std::os::fd::RawFd) -> std::io::Result<(usize, usize)> {
+    // SAFETY: each getsockopt call receives a live caller-owned fd, writable
+    // storage for one c_int, and that storage's exact size.
+    unsafe {
+        let mut rcv: libc::c_int = 0;
+        let mut rcv_len = std::mem::size_of_val(&rcv) as libc::socklen_t;
+        if libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &mut rcv as *mut _ as *mut libc::c_void,
+            &mut rcv_len,
+        ) != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut snd: libc::c_int = 0;
+        let mut snd_len = std::mem::size_of_val(&snd) as libc::socklen_t;
+        if libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            &mut snd as *mut _ as *mut libc::c_void,
+            &mut snd_len,
+        ) != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok((rcv.max(0) as usize, snd.max(0) as usize))
+    }
+}
+
+/// Set SO_RCVBUF/SO_SNDBUF on a raw fd to `bytes` and record the effective
+/// values granted by the kernel. `0` leaves the OS defaults in place.
 pub fn set_sock_bufs(fd: std::os::fd::RawFd, bytes: usize) -> std::io::Result<()> {
     let requested = bytes;
     if requested == 0 {
+        if let Ok((rcvbuf, sndbuf)) = get_sock_bufs(fd) {
+            record_socket_buffers(rcvbuf, sndbuf);
+        }
         return Ok(());
     }
     if requested > libc::c_int::MAX as usize {
@@ -53,20 +123,10 @@ pub fn set_sock_bufs(fd: std::os::fd::RawFd, bytes: usize) -> std::io::Result<()
         if r != 0 {
             return Err(std::io::Error::last_os_error());
         }
-        // Verify effective value (Linux doubles and clamps).
-        let mut got: libc::c_int = 0;
-        let mut got_len = std::mem::size_of_val(&got) as libc::socklen_t;
-        let r = libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_RCVBUF,
-            &mut got as *mut _ as *mut libc::c_void,
-            &mut got_len,
-        );
-        if r == 0 && got >= 0 && (got as usize) < requested {
-            eprintln!("SO_RCVBUF clamped by host to {got} (requested {requested})");
-        }
     }
+
+    let (rcvbuf, sndbuf) = get_sock_bufs(fd)?;
+    record_socket_buffers(rcvbuf, sndbuf);
     Ok(())
 }
 
@@ -436,6 +496,21 @@ mod tests {
     fn set_sock_bufs_rejects_oversized() {
         let err = set_sock_bufs(-1, usize::MAX).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn socket_buffer_stats_include_receive_and_send_ranges() {
+        use std::os::fd::AsRawFd;
+
+        let socket = net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let before = socket_buffer_stats().sockets;
+        set_sock_bufs(socket.as_raw_fd(), 64 * 1024).unwrap();
+        let after = socket_buffer_stats();
+        assert!(after.sockets > before);
+        assert!(after.rcvbuf_min_bytes > 0);
+        assert!(after.rcvbuf_min_bytes <= after.rcvbuf_max_bytes);
+        assert!(after.sndbuf_min_bytes > 0);
+        assert!(after.sndbuf_min_bytes <= after.sndbuf_max_bytes);
     }
 
     #[test]
