@@ -19,6 +19,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # cpu_stats.rs: framework-agnostic CPU accounting via getrusage(), shared by
 # every loss-caller/loss-listener backend below.
 libc = "0.2"
+getrandom = "0.4"
 
 # --- Driver framework bake-off ---
 # Six backends for the sustained-throughput loss-caller/loss-listener

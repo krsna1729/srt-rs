@@ -2090,6 +2090,7 @@ dependencies = [
  "compio",
  "criterion",
  "futures-lite 2.6.1",
+ "getrandom 0.4.3",
  "glommio",
  "libc",
  "mio 1.2.2",
