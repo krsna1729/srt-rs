@@ -1,0 +1,36 @@
+# Issue #71 Stage B, question B: capacity / deployment topology.
+# The sender has three workers on its dedicated three-CPU set, while the
+# receiver sweeps one through three workers on its own dedicated set. This
+# makes a receiver shortfall attributable to receiver capacity rather than
+# an intentionally under-provisioned load generator.
+#
+# `bitrate` is the SOURCE PAYLOAD rate produced by the application. SRT
+# pacing is configured separately: `srt-bandwidth = input-relative:25`
+# gives that source rate a 25% protocol pacing allowance.
+
+connections         = 30,200,600,1200
+bitrate             = 1000000,8000000
+srt-bandwidth       = input-relative:25
+ingress             = shared-pool:4
+egress              = per-connection
+encryption          = plain
+promotion           = all
+cookie-routing      = on
+batch               = on
+sock-buf            = 16m
+bond                = none
+connect-concurrency = 50
+pin                 = off
+
+# Receiver runtime and worker count are the deployment variables.
+[recv]
+runtime             = mio,tokio
+workers             = 1,2,3
+cpus                = 0-2
+
+# Keep the sender on Tokio with all three sender CPUs/workers so it can offer
+# both source regimes while the receiver is the capacity frontier.
+[send]
+runtime             = tokio
+workers             = 3
+cpus                = 3-5
