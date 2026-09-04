@@ -44,13 +44,13 @@ jobs:
             ./target/release/srt-bench matrix --plan "$plan" --reps 1 --out nightly.tsv
             echo "::endgroup::"
           done
-      # The two connect-concurrency=1 (fully sequential handshake)
-      # perf-sentinel plans, kept out of the CI-gating sentinel because
-      # they don't reliably finish within its default 8s window on shared
-      # runners -- but still worth exercising daily. --secs raised well
-      # past their connection count (bottleneck is sequential ramp-up
-      # time, not compute) so this run measures whether they complete at
-      # all, not how fast.
+      # Low connect-concurrency perf-sentinel plans (tokio-broadcast at
+      # cc=2 for bonded, tokio-demux-aes256 at cc=1 for unbonded), kept
+      # out of CI-gating because they don't reliably finish within the
+      # default 8s window on shared runners -- but still worth exercising
+      # daily. --secs raised well past their connection count (bottleneck
+      # is sequential/near-sequential ramp-up time, not compute) so this
+      # run measures whether they complete at all, not how fast.
       - name: Run sequential-ramp perf-sentinel plans (raised duration)
         run: |
           for plan in docs/plans/perf-sentinels/tokio-broadcast.plan docs/plans/perf-sentinels/tokio-demux-aes256.plan; do

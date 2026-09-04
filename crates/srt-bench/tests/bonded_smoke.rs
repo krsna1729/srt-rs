@@ -88,6 +88,7 @@ fn smoke_once(runtime: &str, mode: &str, encryption: &str, egress: &str) -> Resu
             egress,
             &format!("--bond={mode}:1"),
             &format!("--encryption={encryption}"),
+            "--connect-concurrency=2",
         ])
         .output()
         .expect("run bonded sender");
