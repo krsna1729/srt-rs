@@ -42,6 +42,7 @@ fn sender_config(connections: usize, cc: usize) -> srt_bench::BenchConfig {
         stream_secs: 60.0,
         peer_topology: srt_bench::PeerTopology::default(),
         link: srt_bench::Link::default(),
+        classifier_policy: srt_bench::model::ClassifierPolicy::default(),
     }
 }
 

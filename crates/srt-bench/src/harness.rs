@@ -134,6 +134,10 @@ pub const COLUMNS: &[&str] = &[
     "srt_maxbw_bps",
     "srt_inputbw_bps",
     "srt_oheadbw_pct",
+    "model_policy_rev",
+    "model_policy_fingerprint",
+    "model_class_pre",
+    "model_reasons_pre",
     "rep",
     // Identity of the *attempt* that wrote this row, not of the cell.
     // A results file is append-only, so an interrupted run can leave a
@@ -273,7 +277,10 @@ pub const CONFIG_COLUMNS: &[&str] = &[
     "datapath_q_horizon_ms",
     "retry_horizon_ms",
     "secs",
+    "model_policy_rev",
+    "model_policy_fingerprint",
 ];
+
 /// The dimensions a run was configured with, rendered for the result
 /// file. Kept separate from the measurements so a report can group by any
 /// subset without knowing what the measurements mean.
@@ -373,6 +380,8 @@ pub fn append_result(
         recv_scheduling,
         outbound_retry,
     } = *measurements;
+    let model = crate::classifier::assessment_for_bench_config(cfg)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error.0))?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -478,6 +487,15 @@ pub fn append_result(
             .input_bytes_per_sec
             .map_or(String::new(), |b| (b * 8).to_string()),
         resolved.overhead_percent.to_string(),
+        model.policy_revision.clone(),
+        model.policy_fingerprint.clone(),
+        model.class.name().to_string(),
+        model
+            .reasons
+            .iter()
+            .map(|reason| reason.code())
+            .collect::<Vec<_>>()
+            .join(","),
         rep.to_string(),
         cfg.attempt.clone(),
         established.to_string(),
@@ -1490,7 +1508,7 @@ fn record_key(record: &Record, cell: &[(&str, Scope, String)], rep: usize) -> Op
 /// A plan in a file rather than a shell loop because a comprehensive
 /// sweep is hundreds of runs over hours: it needs to be reviewable before
 /// it starts, reproducible afterwards, and identical across re-runs.
-fn read_plan(path: &Path) -> std::io::Result<Vec<(String, Vec<String>)>> {
+pub fn read_plan(path: &Path) -> std::io::Result<Vec<(String, Vec<String>)>> {
     let text = std::fs::read_to_string(path)?;
     let mut axes = Vec::new();
     // `[recv]` / `[send]` scope the keys under them to one role, which is
@@ -1556,6 +1574,10 @@ const CANONICAL_AXIS_NAMES: &[(&str, &str)] = &[
     ("workers", "workers"),
     ("recv-workers", "recv-workers"),
     ("send-workers", "send-workers"),
+    ("recv-ingress", "recv-ingress"),
+    ("send-ingress", "send-ingress"),
+    ("recv-egress", "recv-egress"),
+    ("send-egress", "send-egress"),
     ("ingress", "ingress"),
     ("egress", "egress"),
     ("encryption", "encryption"),
@@ -1694,6 +1716,67 @@ struct MatrixAxisConfig {
     send_cpus: String,
 }
 
+/// Canonically resolved plan axes shared by matrix execution and classify.
+pub struct ResolvedPlan {
+    axes: Vec<Axis>,
+    recv_cpus: String,
+    send_cpus: String,
+}
+
+impl ResolvedPlan {
+    pub(crate) fn axes(&self) -> &[Axis] {
+        &self.axes
+    }
+
+    /// Expand every resolved plan cell without matrix capability filtering.
+    pub fn cells(&self) -> std::io::Result<Vec<std::collections::BTreeMap<String, String>>> {
+        let raw_cells = self.axes.iter().try_fold(1usize, |total, (_, _, values)| {
+            total.checked_mul(values.len()).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "matrix Cartesian product overflows usize",
+                )
+            })
+        })?;
+        let mut cells = Vec::with_capacity(raw_cells);
+        let mut indices = vec![0usize; self.axes.len()];
+        for _ in 0..raw_cells {
+            let cell = self
+                .axes
+                .iter()
+                .zip(&indices)
+                .map(|((name, scope, values), index)| {
+                    let key = match scope {
+                        Scope::Both => (*name).to_string(),
+                        Scope::Recv => format!("recv-{name}"),
+                        Scope::Send => format!("send-{name}"),
+                    };
+                    (key, values[*index].clone())
+                })
+                .collect();
+            cells.push(cell);
+            for axis in (0..indices.len()).rev() {
+                indices[axis] += 1;
+                if indices[axis] < self.axes[axis].2.len() {
+                    break;
+                }
+                indices[axis] = 0;
+            }
+        }
+        Ok(cells)
+    }
+}
+
+/// Resolve all plan, CLI, and default axes once for every consumer.
+pub fn resolve_plan_cells(cli: &crate::Cli) -> std::io::Result<ResolvedPlan> {
+    let config = resolve_matrix_axes(cli)?;
+    Ok(ResolvedPlan {
+        axes: config.axes,
+        recv_cpus: config.recv_cpus,
+        send_cpus: config.send_cpus,
+    })
+}
+
 fn resolve_matrix_axes(cli: &crate::Cli) -> std::io::Result<MatrixAxisConfig> {
     // A plan file, when given, supplies axis values; anything it omits
     // falls back to the CLI flag and then the built-in default. Explicit
@@ -1787,11 +1870,11 @@ fn resolve_matrix_axes(cli: &crate::Cli) -> std::io::Result<MatrixAxisConfig> {
     };
     role_axis("runtime", "runtimes", "mio", &mut split_axes);
     role_axis("workers", "workers", "1", &mut split_axes);
+    role_axis("ingress", "ingress", "per-port", &mut split_axes);
+    role_axis("egress", "egress", "per-connection", &mut split_axes);
 
     let mut axes: Vec<Axis> = split_axes;
     axes.extend([
-        axis("ingress", "ingress", "per-port"),
-        axis("egress", "egress", "per-connection"),
         axis("encryption", "encryption", "plain"),
         axis("promotion", "promotion", "relocate"),
         axis("cookie-routing", "cookie-routing", "on"),
@@ -1930,14 +2013,29 @@ struct MatrixSchedule {
     total: usize,
 }
 
-fn build_matrix_schedule(
-    cells: &[Cell<'_>],
-    axes: &[Axis],
+/// Inputs to schedule construction. A struct rather than a parameter list
+/// because resume identity spans the matrix axes and the classifier policy,
+/// which are easy to transpose positionally.
+struct ScheduleInputs<'a, 'cell> {
+    cells: &'a [Cell<'cell>],
+    axes: &'a [Axis],
     reps: usize,
     order: MatrixOrder,
     seed: u64,
-    out: &Path,
-) -> std::io::Result<MatrixSchedule> {
+    out: &'a Path,
+    policy_fingerprint: &'a str,
+}
+
+fn build_matrix_schedule(inputs: ScheduleInputs<'_, '_>) -> std::io::Result<MatrixSchedule> {
+    let ScheduleInputs {
+        cells,
+        axes,
+        reps,
+        order,
+        seed,
+        out,
+        policy_fingerprint,
+    } = inputs;
     let total = cells.len() * reps;
     let mut cell_order: Vec<usize> = match order {
         MatrixOrder::Default | MatrixOrder::Random => (0..cells.len()).collect(),
@@ -1980,6 +2078,24 @@ fn build_matrix_schedule(
         recorded
             .iter()
             .filter(|r| r.get("role") == Some(role))
+            // A row predicted under a different classifier policy is not this
+            // run's cell. The policy is not a matrix axis, so without this a
+            // rerun with changed thresholds would resume the old rows and the
+            // operator would never get a prediction under the policy they
+            // asked for -- which is exactly what persisting the fingerprint
+            // was meant to prevent.
+            .filter(|r| {
+                // Absent or blank means the row carries no policy identity to
+                // compare -- it predates fingerprinting, or was written by
+                // something other than the harness, which always records a
+                // non-empty fingerprint. Only a fingerprint that is present
+                // AND different proves the row belongs to another policy.
+                match r.get("model_policy_fingerprint") {
+                    None => true,
+                    Some("") => true,
+                    Some(recorded) => recorded == policy_fingerprint,
+                }
+            })
             .filter_map(|r| {
                 let rep: usize = r.number("rep")? as usize;
                 let attempt = r.get("attempt")?.to_string();
@@ -2222,6 +2338,11 @@ struct MatrixProcessContext<'a, 'cell> {
     /// Stamped onto both roles so their rows can be told apart from rows
     /// an earlier, interrupted attempt at the same cell left behind.
     attempt: &'a str,
+    /// The parent's classifier policy, forwarded verbatim. Without this a
+    /// child re-parses argv that carries no policy flags and silently
+    /// predicts under the default zero-margin policy, so a campaign run
+    /// with a custom policy would persist predictions nobody asked for.
+    policy_argv: &'a [String],
 }
 
 /// Which roles recorded a row for this (cell, rep) in `out`.
@@ -2308,6 +2429,7 @@ fn run_matrix_processes(
         run_index,
         total,
         attempt,
+        policy_argv,
     } = context;
     // Each role gets the axes scoped to it plus the shared ones.
     // Both roles additionally get every split axis's *other* side
@@ -2316,7 +2438,9 @@ fn run_matrix_processes(
     // only on the far side would be indistinguishable, and resume
     // would skip one of them.
     let mut recv_argv = matrix_cell_argv(cell, Scope::Recv);
-    let send_argv = matrix_cell_argv(cell, Scope::Send);
+    let mut send_argv = matrix_cell_argv(cell, Scope::Send);
+    recv_argv.extend_from_slice(policy_argv);
+    send_argv.extend_from_slice(policy_argv);
     // The listener runs to a long backstop, but the cell's stream
     // length is what any rate is computed against.
     recv_argv.push(format!("--stream-secs={secs}"));
@@ -2477,6 +2601,9 @@ struct MatrixScheduleContext<'a, 'cell> {
     send_cpus: &'a str,
     invocation_nonce: &'a str,
     netns: Option<Priv>,
+    /// Forwarded to every child so a child's prediction uses the policy the
+    /// operator asked for rather than `ClassifierPolicy::default()`.
+    policy_argv: &'a [String],
 }
 
 fn run_matrix_schedule(context: MatrixScheduleContext<'_, '_>) -> std::io::Result<MatrixReport> {
@@ -2493,6 +2620,7 @@ fn run_matrix_schedule(context: MatrixScheduleContext<'_, '_>) -> std::io::Resul
         send_cpus,
         invocation_nonce,
         netns,
+        policy_argv,
     } = context;
     let mut report = MatrixReport::default();
     let mut unsupported_cells = std::collections::HashSet::new();
@@ -2538,6 +2666,7 @@ fn run_matrix_schedule(context: MatrixScheduleContext<'_, '_>) -> std::io::Resul
                 run_index,
                 total: schedule.total,
                 attempt: &attempt,
+                policy_argv,
             },
             |flag| matrix_cell_link(cell, flag),
         )?;
@@ -2629,17 +2758,24 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<MatrixReport> {
     let secs: u64 = cli.flag_or("secs", 8);
     let latency: u16 = cli.flag_or("latency", 120);
 
-    let MatrixAxisConfig {
-        axes,
-        recv_cpus,
-        send_cpus,
-    } = resolve_matrix_axes(cli)?;
+    // Resolved BEFORE the schedule, because the policy participates in resume
+    // identity: a cell predicted under one policy is not a cell predicted
+    // under another, even though the two runs share every matrix axis.
+    let policy = crate::classifier::policy_from_cli(cli)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let policy_argv = crate::classifier::policy_argv(&policy);
+    let policy_fingerprint = policy.fingerprint();
+
+    let plan = resolve_plan_cells(cli)?;
+    let axes = plan.axes();
+    let recv_cpus = &plan.recv_cpus;
+    let send_cpus = &plan.send_cpus;
 
     // Cartesian product, filtered one point at a time: the whole point is
     // to know how many cells there are before starting a long sweep without
     // holding the raw 1.7-million-cell product in memory.
-    let (mut cells, raw_cells, filter_summary) = filtered_cartesian_cells(&axes)?;
-    add_cpu_identity(&mut cells, &recv_cpus, &send_cpus);
+    let (mut cells, raw_cells, filter_summary) = filtered_cartesian_cells(axes)?;
+    add_cpu_identity(&mut cells, recv_cpus, send_cpus);
     if filter_summary.total() > 0 {
         let reasons = filter_summary
             .by_reason
@@ -2654,7 +2790,15 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<MatrixReport> {
         );
     }
     let (order, seed) = matrix_order(cli)?;
-    let schedule = build_matrix_schedule(&cells, &axes, reps, order, seed, &out)?;
+    let schedule = build_matrix_schedule(ScheduleInputs {
+        cells: &cells,
+        axes,
+        reps,
+        order,
+        seed,
+        out: &out,
+        policy_fingerprint: &policy_fingerprint,
+    })?;
     let invocation_nonce = new_invocation_nonce()?;
 
     // Every cell of a netem sweep runs inside the namespace, including the
@@ -2671,12 +2815,13 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<MatrixReport> {
         reps,
         secs,
         latency,
-        recv_cpus: &recv_cpus,
-        send_cpus: &send_cpus,
+        recv_cpus,
+        send_cpus,
         invocation_nonce: &invocation_nonce,
         sender_exe: &sender_exe,
         receiver_exe: &receiver_exe,
         netns,
+        policy_argv: &policy_argv,
     })?;
     if let Some(p) = netns {
         netns_down(p);
@@ -3153,8 +3298,8 @@ pub fn run_sysprof(cli: &crate::Cli) -> std::io::Result<()> {
 #[cfg(test)]
 mod matrix_filter_tests {
     use super::{
-        Axis, COLUMNS, Cell, MatrixOrder, Record, Scope, attempt_id, axis_overrides,
-        build_matrix_schedule, cell_key, filter_matrix_cells, filter_reason,
+        Axis, COLUMNS, Cell, MatrixOrder, Record, ScheduleInputs, Scope, attempt_id,
+        axis_overrides, build_matrix_schedule, cell_key, filter_matrix_cells, filter_reason,
         filtered_cartesian_cells, interleave_indices, matrix_cell_argv, matrix_cell_config,
         read_results, record_key, recorded_as, recorded_roles, resolve_matrix_axes, shuffle,
     };
@@ -3701,8 +3846,16 @@ mod matrix_filter_tests {
         let cells = schedule_cells();
         let path = temp_tsv("schedule");
 
-        let default =
-            build_matrix_schedule(&cells, &[], 2, MatrixOrder::Default, 0, &path).unwrap();
+        let default = build_matrix_schedule(ScheduleInputs {
+            cells: &cells,
+            axes: &[],
+            reps: 2,
+            order: MatrixOrder::Default,
+            seed: 0,
+            out: &path,
+            policy_fingerprint: "",
+        })
+        .unwrap();
         assert_eq!(default.total, 4);
         assert_eq!(default.runs, [(0, 1), (0, 2), (1, 1), (1, 2)]);
         assert!(default.done.is_empty());
@@ -3712,8 +3865,16 @@ mod matrix_filter_tests {
             Scope::Both,
             ["mio", "tokio"].into_iter().map(str::to_string).collect(),
         )];
-        let interleaved =
-            build_matrix_schedule(&cells, &axes, 2, MatrixOrder::Interleaved, 0, &path).unwrap();
+        let interleaved = build_matrix_schedule(ScheduleInputs {
+            cells: &cells,
+            axes: &axes,
+            reps: 2,
+            order: MatrixOrder::Interleaved,
+            seed: 0,
+            out: &path,
+            policy_fingerprint: "",
+        })
+        .unwrap();
         let expected = [(0, 1), (0, 2), (1, 1), (1, 2)]
             .into_iter()
             .collect::<std::collections::HashSet<_>>();
@@ -3727,10 +3888,26 @@ mod matrix_filter_tests {
             expected
         );
 
-        let random_a =
-            build_matrix_schedule(&cells, &axes, 2, MatrixOrder::Random, 7, &path).unwrap();
-        let random_b =
-            build_matrix_schedule(&cells, &axes, 2, MatrixOrder::Random, 7, &path).unwrap();
+        let random_a = build_matrix_schedule(ScheduleInputs {
+            cells: &cells,
+            axes: &axes,
+            reps: 2,
+            order: MatrixOrder::Random,
+            seed: 7,
+            out: &path,
+            policy_fingerprint: "",
+        })
+        .unwrap();
+        let random_b = build_matrix_schedule(ScheduleInputs {
+            cells: &cells,
+            axes: &axes,
+            reps: 2,
+            order: MatrixOrder::Random,
+            seed: 7,
+            out: &path,
+            policy_fingerprint: "",
+        })
+        .unwrap();
         assert_eq!(random_a.runs, random_b.runs);
         let _ = std::fs::remove_file(path);
     }
@@ -3747,19 +3924,77 @@ mod matrix_filter_tests {
         );
         write_records(&path, &[listener, caller]);
 
-        let schedule =
-            build_matrix_schedule(&cells, &[], 2, MatrixOrder::Default, 0, &path).unwrap();
+        let schedule = build_matrix_schedule(ScheduleInputs {
+            cells: &cells,
+            axes: &[],
+            reps: 2,
+            order: MatrixOrder::Default,
+            seed: 0,
+            out: &path,
+            policy_fingerprint: "",
+        })
+        .unwrap();
         assert!(schedule.done.contains(&cell_key(&cells[0], 1)));
         assert!(!schedule.done.contains(&cell_key(&cells[0], 2)));
         assert!(!schedule.done.contains(&cell_key(&cells[1], 1)));
 
         let orphan_path = temp_tsv("resume-orphan");
         write_records(&orphan_path, &[record_for(&cells[0], "caller", 1)]);
-        let orphaned =
-            build_matrix_schedule(&cells, &[], 2, MatrixOrder::Default, 0, &orphan_path).unwrap();
+        let orphaned = build_matrix_schedule(ScheduleInputs {
+            cells: &cells,
+            axes: &[],
+            reps: 2,
+            order: MatrixOrder::Default,
+            seed: 0,
+            out: &orphan_path,
+            policy_fingerprint: "",
+        })
+        .unwrap();
         assert!(orphaned.done.is_empty());
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(orphan_path);
+    }
+
+    #[test]
+    fn resume_does_not_reuse_a_prediction_from_a_different_policy() {
+        let cells = schedule_cells();
+        let path = temp_tsv("resume-policy");
+        let mut listener = record_for(&cells[0], "listener", 1);
+        let mut caller = record_for(&cells[0], "caller", 1);
+        set_field(&mut listener.fields, "model_policy_fingerprint", "policy-a");
+        set_field(&mut caller.fields, "model_policy_fingerprint", "policy-a");
+        write_records(&path, &[listener, caller]);
+
+        let same = build_matrix_schedule(ScheduleInputs {
+            cells: &cells,
+            axes: &[],
+            reps: 2,
+            order: MatrixOrder::Default,
+            seed: 0,
+            out: &path,
+            policy_fingerprint: "policy-a",
+        })
+        .unwrap();
+        assert!(same.done.contains(&cell_key(&cells[0], 1)));
+
+        // The policy is not a matrix axis, so without the fingerprint in
+        // resume identity this run would reuse policy-a's prediction and the
+        // operator would never get one under policy-b.
+        let changed = build_matrix_schedule(ScheduleInputs {
+            cells: &cells,
+            axes: &[],
+            reps: 2,
+            order: MatrixOrder::Default,
+            seed: 0,
+            out: &path,
+            policy_fingerprint: "policy-b",
+        })
+        .unwrap();
+        assert!(
+            changed.done.is_empty(),
+            "a cell predicted under a different policy must not be resumed"
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
