@@ -1,0 +1,40 @@
+# Issue #71 Stage B, question A: controlled common topology.
+# Every Mio and Tokio cell uses the same topology, worker counts, CPU sets,
+# socket request, and protocol settings so the result compares runtimes.
+#
+# `bitrate` is the SOURCE PAYLOAD rate produced by the application. SRT
+# pacing is configured separately and this plan sweeps both meaningful arms:
+# `input-relative:25` is the SPEC regime and documents its pacing wall, while
+# `fixed:100000000` is high enough to leave receiver/host capacity unmasked.
+# At 30 connections x 8 Mbit/s, measured Mio offer was 76.6% with the paced
+# arm and 99.9%/clean with the unmasked arm. Both arms are meaningful for this
+# runtime comparison because each runtime is evaluated under both conditions.
+# A 1000 ms source backlog tolerates scheduling jitter but does not fix
+# sustained overload: the same measured offer moved only 76.6% to 80.3% when
+# the backlog changed from 250 ms to 1000 ms.
+
+runtime             = mio,tokio
+connections         = 30,200,600,1200
+bitrate             = 1000000,8000000
+srt-bandwidth       = input-relative:25,fixed:100000000
+ingress             = shared-pool:4
+egress              = per-connection
+encryption          = plain
+promotion           = all
+cookie-routing      = on
+batch               = on
+sock-buf            = 16m
+bond                = none
+connect-concurrency = 50
+pin                 = off
+source-backlog-ms   = 1000
+
+# The receiver and sender own disjoint, equal three-CPU sets. Their worker
+# counts are equal so this plan changes runtime and workload only.
+[recv]
+workers             = 3
+cpus                = 0-2
+
+[send]
+workers             = 3
+cpus                = 3-5
