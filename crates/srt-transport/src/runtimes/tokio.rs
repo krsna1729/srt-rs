@@ -471,6 +471,56 @@ pub struct TickResult {
 mod tests {
     use super::*;
 
+    /// The pacing schedule now keeps its phase across late service, so it is
+    /// worth stating what that does *not* buy at the adapter boundary.
+    ///
+    /// `SrtConnection` advances the pacing schedule when a packet is queued for
+    /// output, not when the datagram reaches the socket, so the protocol cannot
+    /// pace on transmit completion. What the adapter guarantees instead is
+    /// simple backpressure: while a previous drain left work queued,
+    /// `send_paced` refuses a further application send regardless of what the
+    /// pacing clock says. That keeps admission from running ahead of a transport
+    /// that is not draining.
+    #[test]
+    fn send_paced_refuses_while_a_previous_drain_is_still_queued() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("Tokio runtime builds");
+        runtime.block_on(async {
+            let peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("peer binds");
+            let local = std::net::UdpSocket::bind("127.0.0.1:0").expect("local binds");
+            local.set_nonblocking(true).expect("local is nonblocking");
+            let sock = UdpSocket::from_std(local).expect("tokio adopts the socket");
+
+            let mut conn = Conn::new(
+                SrtConnection::new_caller(shiguredo_srt::ConnectionOptions::default()),
+                sock,
+            );
+
+            // A queued output is exactly the state a partial or would-block
+            // drain leaves behind.
+            conn.pending_outputs
+                .push_back(ConnectionOutput::SendPacket(b"queued datagram".to_vec()));
+            assert!(conn.has_pending_outputs());
+
+            assert!(
+                conn.send_paced(b"payload", Timestamp::from_micros(0))
+                    .await
+                    .is_err(),
+                "send_paced admitted a packet while output was still queued"
+            );
+            assert!(
+                conn.send_shared_paced(Bytes::from_static(b"payload"), Timestamp::from_micros(0))
+                    .await
+                    .is_err(),
+                "send_shared_paced admitted a packet while output was still queued"
+            );
+
+            let _ = peer.local_addr();
+        });
+    }
+
     #[test]
     fn group_caller_uses_tokio_sockets_and_drives_every_leg() {
         let runtime = tokio::runtime::Builder::new_current_thread()

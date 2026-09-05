@@ -101,8 +101,11 @@ pub struct SenderBuffer {
     latency_us: u64,
     /// Packet send interval (microseconds).
     packet_send_period: u64,
-    /// Last packet send time.
-    last_send_time: Option<Timestamp>,
+    /// Instant at which the next paced send becomes eligible.
+    ///
+    /// This is a *deadline*, not a record of the last send. It was previously
+    /// named `last_send_time`, which described neither its value nor its use.
+    next_send_due: Option<Timestamp>,
     packet_send_period_overridden: bool,
     /// Total packets sent.
     total_sent: u64,
@@ -170,7 +173,7 @@ impl SenderBuffer {
             max_buffer_size: 8192,
             latency_us: latency_ms as u64 * 1000,
             packet_send_period: 0,
-            last_send_time: None,
+            next_send_due: None,
             packet_send_period_overridden: false,
             total_sent: 0,
             total_bytes_sent: 0,
@@ -237,8 +240,8 @@ impl SenderBuffer {
 
         // Check packet pacing.
         if self.packet_send_period > 0
-            && let Some(last_time) = self.last_send_time
-            && now.as_micros() < last_time.as_micros()
+            && let Some(due) = self.next_send_due
+            && now.as_micros() < due.as_micros()
         {
             return false;
         }
@@ -259,10 +262,10 @@ impl SenderBuffer {
             return 0;
         }
 
-        if let Some(last_time) = self.last_send_time
-            && now.as_micros() < last_time.as_micros()
+        if let Some(due) = self.next_send_due
+            && now.as_micros() < due.as_micros()
         {
-            return last_time.as_micros() - now.as_micros();
+            return due.as_micros() - now.as_micros();
         }
 
         0
@@ -274,26 +277,51 @@ impl SenderBuffer {
         self.packet_send_period_overridden = true;
     }
 
-    /// Record the send time.
+    /// Advance the pacing schedule after a send.
     ///
-    /// The next send is due one full pacing period after this one's actual
-    /// send time — matching libsrt, which stores the actual time at each
-    /// transmission (`m_tsLastSndTime.store(currtime)`, `core.cpp:1131`).
+    /// The schedule is a sequence of ideal slots one period apart. Servicing is
+    /// never exactly on time, so the question is what a late send does to the
+    /// phase of that sequence:
     ///
-    /// This is the R8 burst fix: the previous slot-arithmetic version
-    /// (`stale_slot + period`) left `last_send_time` in the past after any
-    /// idle gap, so every subsequent call returned 0 and the whole paused
-    /// backlog burst out back-to-back instead of at MAX_BW. Spec §5.1.2
-    /// defines PKT_SND_PERIOD as the *minimum* allowed inter-packet
-    /// interval, which actual-send-time bookkeeping enforces by
-    /// construction.
+    /// ```text
+    /// lateness < period   keep the phase:   next due = previous due + period
+    /// lateness >= period  rebase the phase: next due = now + period
+    /// ```
+    ///
+    /// The first branch is the repair. Previously every send rebased from the
+    /// actual send time, so a runtime that could not wake more precisely than
+    /// its scheduling quantum lost that quantum on *every* packet and achieved
+    /// `1/(period + lateness)` instead of `1/period`. Since no async runtime
+    /// wakes at sub-millisecond resolution, that deficit is first-order at live
+    /// bitrates: an 8 Mbit/s source paced at 10 Mbit/s measured 67.8% of its
+    /// offered payload on a single idle connection.
+    ///
+    /// The second branch preserves the behaviour verified against libsrt 1.5.3:
+    /// after a genuine idle gap exactly one packet may go immediately, and the
+    /// gap is not repaid as a burst. libsrt does repay debt while its sender
+    /// queue stays non-empty, but srt-rs has no protocol-owned queue of unsent
+    /// application demand to distinguish that case from true idle, so this is a
+    /// deliberately conservative approximation: lateness of a whole period or
+    /// more is discarded rather than carried. See `docs/perf/pacing-phase.md`.
+    ///
+    /// Both branches leave the deadline strictly after `now`, so a caller
+    /// looping while eligible can never drain more than one packet per instant.
+    /// This holds even if `period` changed during the push that preceded this
+    /// call, because both branches are evaluated against the same `period`.
     pub fn record_send_time(&mut self, now: Timestamp) {
-        self.last_send_time = Some(match (self.last_send_time, self.packet_send_period) {
-            (_, period) if period > 0 => {
-                Timestamp::from_micros(now.as_micros().saturating_add(period))
-            }
-            _ => now,
-        });
+        let period = self.packet_send_period;
+        if period == 0 {
+            self.next_send_due = Some(now);
+            return;
+        }
+        let now_us = now.as_micros();
+        let phase_preserved = self
+            .next_send_due
+            .map(|due| due.as_micros().saturating_add(period))
+            .filter(|&next| next > now_us);
+        self.next_send_due = Some(Timestamp::from_micros(
+            phase_preserved.unwrap_or_else(|| now_us.saturating_add(period)),
+        ));
     }
 
     /// Number of packets in flight.
@@ -1218,23 +1246,117 @@ mod tests {
         assert_eq!(buf.time_until_send(Timestamp::from_micros(1000)), 0);
     }
 
+    /// Replaces `test_packet_pacing_after_late_wakeup_reschedules_full_period`,
+    /// which asserted the defect: it required a wakeup 500us past the slot to
+    /// push the next deadline to 2500 rather than 2000, so lateness was
+    /// absorbed instead of repaid. Within one period the phase is now kept.
     #[test]
-    fn test_packet_pacing_after_late_wakeup_reschedules_full_period() {
+    fn pacing_sub_period_lateness_keeps_the_schedule_phase() {
         let mut buf = SenderBuffer::new(1000, 8192, 120);
         buf.set_packet_send_period(1000);
         buf.record_send_time(Timestamp::from_micros(0));
 
-        // A late wakeup (500us past the slot) must not shorten the next
-        // interval: the next send is due a full period after `now`, not
-        // after the stale slot. This is the R8 burst fix - the old
-        // behavior (next slot at slot+period) allowed sub-period spacing
-        // after any gap and, over long idles, unbounded back-to-back
-        // bursts.
+        // Serviced 500us past the 1000us slot.
         assert!(buf.can_send_with_pacing(Timestamp::from_micros(1500)));
         buf.record_send_time(Timestamp::from_micros(1500));
-        assert!(!buf.can_send_with_pacing(Timestamp::from_micros(2499)));
-        assert_eq!(buf.time_until_send(Timestamp::from_micros(2499)), 1);
-        assert!(buf.can_send_with_pacing(Timestamp::from_micros(2500)));
+
+        // The slot after that is still 2000, not 2500: the ideal schedule did
+        // not move, so the lateness is not paid for twice.
+        assert!(!buf.can_send_with_pacing(Timestamp::from_micros(1999)));
+        assert_eq!(buf.time_until_send(Timestamp::from_micros(1999)), 1);
+        assert!(buf.can_send_with_pacing(Timestamp::from_micros(2000)));
+    }
+
+    /// The defect's cumulative form, and the reason it was first-order rather
+    /// than a rounding curiosity: a runtime that is consistently a little late
+    /// used to lose that lateness on every single packet.
+    ///
+    /// 100 sends each serviced 300us past a 1000us slot must still occupy
+    /// exactly 99 periods. The old rule rebased from the actual send time and
+    /// produced a 1300us cadence, i.e. ~30ms of drift over this window and a
+    /// 23% rate loss that never recovered.
+    #[test]
+    fn pacing_repeated_sub_period_lateness_does_not_accumulate_drift() {
+        const PERIOD: u64 = 1000;
+        const LATENESS: u64 = 300;
+        const SENDS: u64 = 100;
+
+        let mut buf = SenderBuffer::new(1000, 8192, 120);
+        buf.set_packet_send_period(PERIOD);
+        buf.record_send_time(Timestamp::from_micros(0));
+
+        let mut sent_at = Vec::new();
+        for slot in 1..=SENDS {
+            let due = slot * PERIOD;
+            // The deadline is exactly the ideal slot every time.
+            assert_eq!(buf.time_until_send(Timestamp::from_micros(due - 1)), 1);
+            let serviced = due + LATENESS;
+            assert!(buf.can_send_with_pacing(Timestamp::from_micros(serviced)));
+            buf.record_send_time(Timestamp::from_micros(serviced));
+            sent_at.push(serviced);
+        }
+
+        let span = sent_at[sent_at.len() - 1] - sent_at[0];
+        assert_eq!(
+            span,
+            (SENDS - 1) * PERIOD,
+            "cadence drifted from the period"
+        );
+    }
+
+    /// The preserve/rebase boundary is exclusive, and pinned on both sides:
+    /// lateness strictly below one period keeps the phase, lateness of exactly
+    /// one period or more rebases. Off-by-one here decides whether a caller
+    /// can ever drain two packets at one instant.
+    #[test]
+    fn pacing_phase_boundary_is_exclusive_at_one_period() {
+        const PERIOD: u64 = 1000;
+        for (lateness, expected_due) in [(999u64, 2000u64), (1000, 3000), (1001, 3001)] {
+            let mut buf = SenderBuffer::new(1000, 8192, 120);
+            buf.set_packet_send_period(PERIOD);
+            buf.record_send_time(Timestamp::from_micros(0));
+
+            let serviced = PERIOD + lateness;
+            buf.record_send_time(Timestamp::from_micros(serviced));
+
+            assert!(
+                !buf.can_send_with_pacing(Timestamp::from_micros(expected_due - 1)),
+                "lateness {lateness}: eligible before {expected_due}"
+            );
+            assert!(
+                buf.can_send_with_pacing(Timestamp::from_micros(expected_due)),
+                "lateness {lateness}: not eligible at {expected_due}"
+            );
+        }
+    }
+
+    /// `record_sent_payload_size` recomputes `packet_send_period` from the IIR
+    /// payload average during the push, so the period can change between the
+    /// eligibility check and this bookkeeping. A shrinking period must not be
+    /// able to place the next deadline at or before `now`, which would let a
+    /// caller looping while eligible drain a burst.
+    #[test]
+    fn pacing_period_change_never_yields_a_deadline_in_the_past() {
+        for (first, second, serviced, expected_due) in [
+            // Shrink far below the elapsed lateness: rebase from now.
+            (1000u64, 200u64, 1500u64, 1700u64),
+            // Grow: the preserved phase is still ahead, so it is kept.
+            (1000, 5000, 1500, 6000),
+        ] {
+            let mut buf = SenderBuffer::new(1000, 8192, 120);
+            buf.set_packet_send_period(first);
+            buf.record_send_time(Timestamp::from_micros(0));
+
+            buf.set_packet_send_period(second);
+            buf.record_send_time(Timestamp::from_micros(serviced));
+
+            assert!(
+                !buf.can_send_with_pacing(Timestamp::from_micros(serviced)),
+                "{first}->{second}: immediately eligible again after the send"
+            );
+            assert!(buf.can_send_with_pacing(Timestamp::from_micros(expected_due)));
+            assert!(!buf.can_send_with_pacing(Timestamp::from_micros(expected_due - 1)));
+        }
     }
 
     /// Spec §5.1.2: PKT_SND_PERIOD is the minimum inter-packet interval,
