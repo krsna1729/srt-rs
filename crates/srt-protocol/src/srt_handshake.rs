@@ -30,6 +30,13 @@ pub const HS_VERSION_4: u32 = 4;
 pub const HS_VERSION_5: u32 = 5;
 
 /// Default MTU size.
+///
+/// Consumed as the SRT datagram budget: `SrtConnection` derives
+/// `max_payload_size = DEFAULT_MTU - SRT_HEADER_SIZE`, and protocol tests
+/// compare emitted packet lengths against it directly. It is therefore NOT
+/// an IPv4 packet MTU -- a deployment on a 1500-byte IPv4 path additionally
+/// carries IP and UDP headers, which srt-bench's capacity classifier models
+/// separately as a deployment envelope rather than as protocol truth.
 pub const DEFAULT_MTU: u32 = 1500;
 
 /// Default flow window size.

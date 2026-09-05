@@ -27,7 +27,7 @@ const STALE_RETRANSMIT_COMPACT_THRESHOLD: usize = 1_024;
 /// `BW_INFINITE` (`srtcore/common.h`): 1 Gbps expressed in bytes/sec. Live
 /// mode always paces off *some* bandwidth figure -- there is no "pacing
 /// disabled" state in real SRT live mode, just a very generous default.
-const DEFAULT_MAX_BANDWIDTH_BYTES_PER_SEC: u64 = 1_000_000_000 / 8;
+pub const DEFAULT_MAX_BANDWIDTH_BYTES_PER_SEC: u64 = 1_000_000_000 / 8;
 
 /// Optimistic initial payload-size estimate for the pacing average, before
 /// any real packets have been sent -- matches libsrt's `LiveCC` constructor
