@@ -118,3 +118,68 @@ bookkeeping once. That is a pre-existing per-packet-pacing question, orthogonal
 to the single-packet 1316-byte workload measured here. It is not addressed by
 this work, and the invariant below should not be read as covering every emitted
 fragment.
+
+## Result
+
+Same host, same plan, same 15 s x 3 reps, `f216e02` vs the phase-preservation
+commit. Raw rows: [before](../results/pacing-phase-before.tsv),
+[after](../results/pacing-phase-after.tsv),
+[boundary sweep](../results/pacing-quantum-after.tsv).
+
+### The Mio defect is fully repaired
+
+| N | arm | P (us) | before | after | achieved interval |
+|---:|---|---:|---:|---:|---:|
+| 1 | ir:25 | 1065.6 | 67.8% | **100.0%** | 1316 us (source-limited) |
+| 30 | ir:25 | 1065.6 | 93.4% | **100.0%** | 1316 us |
+| 30 | ir:50 | 888.0 | 96.5% | **100.0%** | 1316 us |
+| 200 | ir:25 | 1065.6 | 77.4% | **96.2%** | 1368 us |
+| 200 | ir:50 | 888.0 | 86.5% | **100.0%** | 1316 us |
+
+The one-connection cell became source-limited exactly as predicted, and the
+staircase is gone: `fixed:` arms at 10.2 / 10.4 / 10.6 / 10.9 Mbit/s, which
+bracketed the millisecond step, are now uniformly 100.0% on Mio.
+
+No cell exceeds its configured budget. The achieved interval is greater than or
+equal to the pacing period in every one of the 40 cells measured, so the repair
+bought rate without buying a burst. That is an aggregate rate bound; the
+per-send guarantee that no instant can admit two packets is covered by the unit
+tests, not by this campaign.
+
+### Tokio improves everywhere, and two predictions were wrong
+
+Predicted, from a model treating Tokio's service lateness as a constant ~0.83 ms:
+`ir:25` and `ir:50` would reach ~100% (lateness below one period), and `ir:100`
+would be unchanged near 88% (lateness above one period). Observed at N=1:
+
+| arm | P (us) | before | predicted | **observed** |
+|---|---:|---:|---:|---:|
+| ir:25 | 1065.6 | 68.9% | ~100% | **87.6%** |
+| ir:50 | 888.0 | 77.0% | ~100% | **87.4%** |
+| ir:100 | 666.0 | 88.4% | unchanged | **96.2%** |
+
+Both predictions failed, in opposite directions, and the cause is the same: the
+constant-lateness model is wrong. Service lateness is a *distribution*
+straddling the period, so each send independently falls into the preserve or the
+rebase branch, and every arm gets a partial repair proportional to the fraction
+of intervals landing below its period. That is why `ir:100` improved rather than
+staying flat, and why `ir:25` improved without reaching 100%.
+
+What bounds Tokio now is not phase. Post-fix achieved intervals of 1502 / 1505 /
+1368 us correspond to 666 / 665 / 731 service visits per second, against the
+760 packets per second the source offers. With one packet admitted per service
+visit, sufficiency requires
+
+```text
+service_visit_rate >= min(source_rate, pacing_rate)
+```
+
+and Tokio on this path does not meet it, while Mio (about 1000 visits/s) does.
+The residual Tokio deficit is therefore a service-rate limitation, not a pacing
+defect, and closing it would require either a faster service loop or admitting
+more than one packet per visit -- the accumulated-debt behaviour this repair
+deliberately does not implement.
+
+No regression appeared in any cell. The only negative movement is Tokio at 200
+connections on `fixed:100000000` (94.8% -> 94.3%), a control where pacing never
+binds, inside the noise of a cell already running at 215% CPU.

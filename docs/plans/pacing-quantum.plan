@@ -1,0 +1,47 @@
+# Pacing-quantum regression: one connection, 8 Mbit/s source.
+#
+# At one connection there is no contention and the sender sits at 7-8% of one
+# core, so nothing here is explained by load, the receiver, or CPU. The only
+# variable is the SRT pacing budget, and with it the pacing period relative to
+# the runtime's service granularity.
+#
+# Before the phase-preservation fix the achieved rate was 1/(period + lateness).
+# On Mio that produced a staircase, because its epoll timeout is rounded up to a
+# whole millisecond: the fixed arms bracket the step, which was measured between
+# 10.2 and 10.4 Mbit/s. On Tokio it produced a near-constant additive ~0.83 ms
+# of end-to-end sender wake/service latency and no step at all.
+#
+# The input-relative arms carry the differential prediction. At an 8 Mbit/s
+# source the periods are 1065.6 / 888.0 / 666.0 us, so ir:25 and ir:50 have
+# service lateness below one period and must be repaired, while ir:100 has
+# lateness exceeding a full period on Tokio and is deliberately NOT repaired by
+# the conservative rule. ir:100 staying near its baseline is the expected
+# limitation, not a success; if it reaches ~100% the model is wrong and the
+# reason must be found before the result is believed.
+#
+# fixed:100000000 is the control: pacing never binds, so it must stay
+# source-limited at 100%.
+
+runtime             = mio,tokio
+connections         = 1
+bitrate             = 8000000
+srt-bandwidth       = input-relative:25,input-relative:50,input-relative:100,fixed:10200000,fixed:10400000,fixed:10600000,fixed:10900000,fixed:100000000
+ingress             = shared-pool:4
+egress              = per-connection
+encryption          = plain
+promotion           = all
+cookie-routing      = on
+batch               = on
+sock-buf            = 16m
+bond                = none
+connect-concurrency = 50
+pin                 = off
+source-backlog-ms   = 1000
+
+[recv]
+workers             = 3
+cpus                = 0-2
+
+[send]
+workers             = 3
+cpus                = 3-5
