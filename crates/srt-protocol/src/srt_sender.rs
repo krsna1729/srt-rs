@@ -1262,6 +1262,73 @@ mod tests {
         }
     }
 
+    /// Reference contract, verified against libsrt 1.5.3 (see
+    /// `docs/perf/pacing-phase.md`): when the sender is serviced exactly on
+    /// time, the emitted cadence is exactly the configured period. This holds
+    /// before and after the phase-preservation change and pins the case that
+    /// must not move.
+    #[test]
+    fn pacing_exact_service_holds_the_configured_period() {
+        let mut buf = SenderBuffer::new(1000, 8192, 120);
+        buf.set_packet_send_period(1000);
+        buf.record_send_time(Timestamp::from_micros(0));
+
+        for slot in 1..=10u64 {
+            let due = slot * 1000;
+            assert!(!buf.can_send_with_pacing(Timestamp::from_micros(due - 1)));
+            assert!(buf.can_send_with_pacing(Timestamp::from_micros(due)));
+            buf.record_send_time(Timestamp::from_micros(due));
+        }
+    }
+
+    /// Reference contract: after a genuine idle gap libsrt admits exactly one
+    /// immediate packet and then resumes period spacing, independent of how
+    /// long the gap was. Probed at gaps of 2, 10 and 50 periods against
+    /// libsrt 1.5.3, all gap-independent.
+    ///
+    /// This is the property that forbids a catch-up burst, and it must survive
+    /// any change to late-service handling.
+    #[test]
+    fn pacing_post_idle_resume_admits_exactly_one_immediate_packet() {
+        for gap_periods in [2u64, 10, 50] {
+            let mut buf = SenderBuffer::new(1000, 8192, 120);
+            buf.set_packet_send_period(1000);
+            buf.record_send_time(Timestamp::from_micros(0));
+
+            let resume = gap_periods * 1000;
+            assert!(buf.can_send_with_pacing(Timestamp::from_micros(resume)));
+            buf.record_send_time(Timestamp::from_micros(resume));
+
+            // Exactly one: the very next microsecond must already be refused,
+            // however long the gap was.
+            assert!(
+                !buf.can_send_with_pacing(Timestamp::from_micros(resume + 1)),
+                "gap of {gap_periods} periods admitted a second immediate packet"
+            );
+        }
+    }
+
+    /// Structural invariant behind "at most one immediate send": recording a
+    /// send must never leave a deadline at or before the recorded instant, so
+    /// a caller looping while eligible cannot drain a burst. Checked across
+    /// on-time, sub-period-late and multi-period-late service.
+    #[test]
+    fn pacing_deadline_is_always_strictly_in_the_future() {
+        for lateness in [0u64, 1, 300, 999, 1000, 1001, 9_999] {
+            let mut buf = SenderBuffer::new(1000, 8192, 120);
+            buf.set_packet_send_period(1000);
+            buf.record_send_time(Timestamp::from_micros(0));
+
+            let now = Timestamp::from_micros(1000 + lateness);
+            assert!(buf.can_send_with_pacing(now));
+            buf.record_send_time(now);
+            assert!(
+                !buf.can_send_with_pacing(now),
+                "lateness {lateness} left the connection immediately eligible again"
+            );
+        }
+    }
+
     #[test]
     fn test_packet_pacing_includes_srt_header_bytes() {
         let mut buf = SenderBuffer::new(1000, 8192, 120);
