@@ -59,6 +59,47 @@ interaction. A candidate that changes a shared component graduates to
 corresponding focused plan (`socket-topology-smoke.plan` or
 `bonded-ingress.plan`).
 
+## Canonical capacity campaign
+
+Run the capacity campaign by composing the existing subcommands. `matrix`
+executes the sweep and persists the pre-run prediction (`model_policy_rev`,
+`model_policy_fingerprint`, `model_class_pre`, `model_reasons_pre`) into
+every result row; `check-clean`, `validate`, and `report` then read the
+same file. No meta-command sits above them: one benchmark workflow does
+not need a second orchestrator to keep in sync with the result schema.
+Run each checked-in capacity plan through `matrix`, then check, validate,
+and report the same file. Build the release binary first:
+`.cargo/config.toml` already supplies `-C target-cpu=x86-64-v3` along with
+the mold linker and hardening link args, and a set `RUSTFLAGS` -- even an
+empty one -- would replace that list wholesale, so unset it rather than
+restating the target:
+
+```sh
+env -u RUSTFLAGS cargo build --release -p srt-bench
+
+target/release/srt-bench matrix \
+  --plan docs/plans/capacity-frontier-controlled.plan \
+  --secs 30 --reps 3 --order interleaved --seed 0 \
+  --out scratch/capacity-controlled.tsv
+
+target/release/srt-bench check-clean scratch/capacity-controlled.tsv
+target/release/srt-bench validate scratch/capacity-controlled.tsv
+target/release/srt-bench report scratch/capacity-controlled.tsv
+```
+
+A rerun against the same `--out` resumes completed result pairs, and a
+rerun with changed policy thresholds re-runs the affected cells rather
+than reusing a prediction made under different thresholds.
+
+Preserve this metadata with the raw TSV, report, and validation output:
+the exact git SHA; plan and all flags; `rustc --version` and release flags;
+CPU model; kernel; receiver and sender affinity; requested and effective
+receive/send socket buffers; and the source of the host PPS/NIC envelope.
+The Stage C results and scoped limits are in the
+[issue #71 frontier evidence](results/issue71-frontier-evidence.md). The
+subcommands do not classify, skip, reorder, mutate, or auto-tune cells
+based on predictions.
+
 ## Benchmarks by decision
 
 | Change area | First benchmark |
