@@ -29,6 +29,13 @@ const MAX_NAK_RECORD_SIZE: usize = 8;
 const NAK_CHUNK_INITIAL_CAPACITY: usize = 32;
 const _: () = assert!(DEFAULT_MTU as usize - SRT_HEADER_SIZE >= MAX_NAK_RECORD_SIZE);
 
+/// Bytes in one encoded NAK range (`first_seq` + `last_seq`).
+pub const NAK_RANGE_BYTES: usize = MAX_NAK_RECORD_SIZE;
+/// Control-information bytes in a Light ACK.
+pub const LIGHT_ACK_CONTROL_INFO_BYTES: usize = 4;
+/// Control-information bytes in a Full ACK.
+pub const FULL_ACK_CONTROL_INFO_BYTES: usize = 28;
+
 /// A connection's role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionRole {
@@ -106,7 +113,10 @@ const SHUTDOWN_TIMEOUT_MICROS: u64 = 5_000_000;
 pub const DEFAULT_HANDSHAKE_RETRY_INTERVAL_MICROS: u64 = 250_000;
 /// Default deadline for the complete induction + conclusion exchange.
 pub const DEFAULT_HANDSHAKE_TIMEOUT_MICROS: u64 = 3_000_000;
-const MIN_FLOW_WINDOW_PACKETS: u32 = 32;
+/// Smallest flow/receive window the connection will run with. Requests below
+/// this are clamped up during construction, so it is the effective floor a
+/// deployment planner must model, not merely an internal guard.
+pub const MIN_FLOW_WINDOW_PACKETS: u32 = 32;
 
 /// libsrt-compatible zero padding (4 bytes).
 ///
@@ -145,7 +155,13 @@ const MIN_FLOW_WINDOW_PACKETS: u32 = 32;
 /// - Keepalive (0x0001)
 /// - ACKACK (0x0006)
 /// - Shutdown (0x0005)
-const LIBSRT_COMPAT_PADDING: [u8; 4] = [0, 0, 0, 0];
+pub const LIBSRT_COMPAT_PADDING_BYTES: usize = 4;
+const LIBSRT_COMPAT_PADDING: [u8; LIBSRT_COMPAT_PADDING_BYTES] = [0; LIBSRT_COMPAT_PADDING_BYTES];
+
+/// Keepalive timer interval (microseconds).
+pub const KEEPALIVE_INTERVAL_MICROS: u64 = 1_000_000;
+/// Periodic NAK timer interval (microseconds).
+pub const PERIODIC_NAK_INTERVAL_MICROS: u64 = 20_000;
 
 /// A connection event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -972,13 +988,13 @@ impl SrtConnection {
         if self.state == ConnectionState::Connected {
             if self
                 .last_send_time
-                .is_none_or(|last_send| now.saturating_sub(last_send) >= 1_000_000)
+                .is_none_or(|last_send| now.saturating_sub(last_send) >= KEEPALIVE_INTERVAL_MICROS)
             {
                 self.send_keepalive(now);
             }
             self.output_queue.push_back(ConnectionOutput::SetTimer {
                 id: TimerId::Keepalive,
-                duration_micros: 1_000_000,
+                duration_micros: KEEPALIVE_INTERVAL_MICROS,
             });
         }
     }
@@ -1010,7 +1026,7 @@ impl SrtConnection {
 
         self.output_queue.push_back(ConnectionOutput::SetTimer {
             id: TimerId::Ack,
-            duration_micros: 10_000,
+            duration_micros: crate::ACK_INTERVAL_MICROS,
         });
     }
 
@@ -1021,7 +1037,7 @@ impl SrtConnection {
                 .receiver
                 .as_ref()
                 .map(|r| r.nak_interval())
-                .unwrap_or(20_000);
+                .unwrap_or(PERIODIC_NAK_INTERVAL_MICROS);
             self.output_queue.push_back(ConnectionOutput::SetTimer {
                 id: TimerId::Nak,
                 duration_micros: interval,
@@ -2243,20 +2259,20 @@ impl SrtConnection {
         // Keepalive timer (1 second).
         self.output_queue.push_back(ConnectionOutput::SetTimer {
             id: TimerId::Keepalive,
-            duration_micros: 1_000_000,
+            duration_micros: KEEPALIVE_INTERVAL_MICROS,
         });
 
         // ACK timer (10ms).
         self.output_queue.push_back(ConnectionOutput::SetTimer {
             id: TimerId::Ack,
-            duration_micros: 10_000,
+            duration_micros: crate::ACK_INTERVAL_MICROS,
         });
 
         if self.periodic_nak_enabled() {
             // NAK timer (initial value 20ms).
             self.output_queue.push_back(ConnectionOutput::SetTimer {
                 id: TimerId::Nak,
-                duration_micros: 20_000,
+                duration_micros: PERIODIC_NAK_INTERVAL_MICROS,
             });
         }
 
