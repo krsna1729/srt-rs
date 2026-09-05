@@ -53,7 +53,7 @@ fn main() {
     // result schema.
     let args: Vec<String> = std::env::args().collect();
     let context = match args.get(1).map(String::as_str) {
-        Some("report" | "watch" | "compare" | "check-clean") => None,
+        Some("report" | "watch" | "compare" | "check-clean" | "classify" | "validate") => None,
         Some("system-info") => Some("system-info"),
         Some("matrix") => Some("matrix"),
         Some("sysprof") => Some("sysprof"),
@@ -64,31 +64,8 @@ fn main() {
     {
         srt_bench::system::print_startup_diagnostics(context);
     }
-    match args.get(1).map(String::as_str) {
-        Some("system-info") => {
-            return;
-        }
-        Some("report") => return report(&args),
-        Some("compare") => return compare(&args),
-        Some("check-clean") => return check_clean(&args),
-        Some("watch") => {
-            let cli = srt_bench::Cli::parse(&args[1..]);
-            if let Err(e) = srt_bench::watch::run(&cli) {
-                eprintln!("watch: {e}");
-                std::process::exit(1);
-            }
-            return;
-        }
-        Some("sysprof") => {
-            let cli = srt_bench::Cli::parse(&args[1..]);
-            if let Err(e) = srt_bench::harness::run_sysprof(&cli) {
-                eprintln!("sysprof: {e}");
-                std::process::exit(1);
-            }
-            return;
-        }
-        Some("matrix") => return matrix(&args),
-        _ => {}
+    if dispatch_subcommand(&args) {
+        return;
     }
 
     tracing_subscriber::fmt()
@@ -98,6 +75,53 @@ fn main() {
 
     let cfg = srt_bench::bench_config_from_args();
     srt_bench::runtimes::run(cfg);
+}
+
+fn dispatch_subcommand(args: &[String]) -> bool {
+    match args.get(1).map(String::as_str) {
+        Some("system-info") => true,
+        Some("report") => {
+            report(args);
+            true
+        }
+        Some("compare") => {
+            compare(args);
+            true
+        }
+        Some("check-clean") => {
+            check_clean(args);
+            true
+        }
+        Some("classify") => {
+            classify(args);
+            true
+        }
+        Some("validate") => {
+            validate(args);
+            true
+        }
+        Some("watch") => {
+            let cli = srt_bench::Cli::parse(&args[1..]);
+            if let Err(e) = srt_bench::watch::run(&cli) {
+                eprintln!("watch: {e}");
+                std::process::exit(1);
+            }
+            true
+        }
+        Some("sysprof") => {
+            let cli = srt_bench::Cli::parse(&args[1..]);
+            if let Err(e) = srt_bench::harness::run_sysprof(&cli) {
+                eprintln!("sysprof: {e}");
+                std::process::exit(1);
+            }
+            true
+        }
+        Some("matrix") => {
+            matrix(args);
+            true
+        }
+        _ => false,
+    }
 }
 
 /// `srt-bench matrix ...` -- run the sweep, then exit 0 **only** if every
@@ -225,5 +249,54 @@ fn check_clean(args: &[String]) {
             eprint!("{msg}");
             std::process::exit(1);
         }
+    }
+}
+
+/// `srt-bench classify [--plan FILE] [--format table|tsv]` -- classify
+/// explicit input or every Cartesian-product cell in a declarative plan.
+fn classify(args: &[String]) {
+    let cli = srt_bench::Cli::parse(&args[1..]);
+    let output = match srt_bench::classifier::classify(&cli) {
+        Ok(output) => output,
+        Err(error) => {
+            eprintln!("classify: {error}");
+            std::process::exit(1);
+        }
+    };
+    write_output(&cli, "classify", output);
+}
+
+/// `srt-bench validate FILE.tsv` -- compare persisted model predictions with
+/// the existing canonical observed clean predicate.
+fn validate(args: &[String]) {
+    let cli = srt_bench::Cli::parse(&args[1..]);
+    let Some(path) = cli.positional.first() else {
+        eprintln!("usage: srt-bench validate FILE.tsv [--format table|tsv]");
+        std::process::exit(2);
+    };
+    let format = cli
+        .flags
+        .get("format")
+        .map(String::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("table");
+    let output = match srt_bench::classifier::validate_results(std::path::Path::new(path), format) {
+        Ok(output) => output,
+        Err(error) => {
+            eprintln!("validate: {error}");
+            std::process::exit(1);
+        }
+    };
+    write_output(&cli, "validate", output);
+}
+
+fn write_output(cli: &srt_bench::Cli, command: &str, output: String) {
+    if let Some(destination) = cli.flags.get("out").filter(|value| !value.is_empty()) {
+        if let Err(error) = std::fs::write(destination, output) {
+            eprintln!("{command}: {destination}: {error}");
+            std::process::exit(1);
+        }
+    } else {
+        print!("{output}");
     }
 }

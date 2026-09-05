@@ -1,6 +1,8 @@
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use proptest::prelude::*;
+use srt_bench::classifier::validate_results;
+use srt_bench::harness::COLUMNS;
 use srt_bench::model::{
     Availability, BondMode, CapacityInput, CapacityReason, CellClass, ClassifierPolicy,
     EncryptionMode, HostEnvelope, NetworkEnvelope, ProtocolEnvelope, SrtBandwidthPolicy,
@@ -428,6 +430,153 @@ proptest! {
         let high_assessment = assessment(high_input);
         prop_assert!(known_value(high_assessment.derived.effective_receive_socket_buffer_horizon_seconds) >= known_value(low_assessment.derived.effective_receive_socket_buffer_horizon_seconds));
     }
+}
+
+fn result_row(role: &str, model_class: &str) -> String {
+    result_row_with_affinity(role, model_class, "", "", "")
+}
+
+fn result_row_with_affinity(
+    role: &str,
+    model_class: &str,
+    cpus: &str,
+    recv_cpus: &str,
+    send_cpus: &str,
+) -> String {
+    let mut values = vec![String::new(); COLUMNS.len()];
+    let set = |values: &mut [String], column: &str, value: &str| {
+        let index = COLUMNS
+            .iter()
+            .position(|candidate| *candidate == column)
+            .unwrap();
+        values[index] = value.to_string();
+    };
+    set(&mut values, "role", role);
+    set(&mut values, "cpus", cpus);
+    set(&mut values, "recv_cpus", recv_cpus);
+    set(&mut values, "send_cpus", send_cpus);
+    set(&mut values, "conns", "1");
+    set(&mut values, "logical_streams", "1");
+    set(&mut values, "source_streams", "1");
+    set(&mut values, "source_bps", "8000000");
+    set(&mut values, "secs", "1");
+    set(&mut values, "established", "1");
+    set(&mut values, "torn_down", "0");
+    set(&mut values, "core_total", "760");
+    set(&mut values, "cpu_user_ms", "1");
+    set(&mut values, "cpu_sys_ms", "1");
+    set(&mut values, "peak_rss_kb", "1");
+    set(&mut values, "udp_rcvbuf_err", "0");
+    set(&mut values, "src_overflow", "0");
+    set(&mut values, "datapath_q_dropped", "0");
+    set(&mut values, "local_dropped", "0");
+    set(
+        &mut values,
+        "model_policy_rev",
+        "stage-a-v1-no-unvalidated-margin",
+    );
+    set(&mut values, "model_class_pre", model_class);
+    set(&mut values, "model_reasons_pre", "");
+    values.join("\t")
+}
+
+#[test]
+fn prediction_validation_distinguishes_falsifiable_from_inconclusive() {
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let clean_path = std::env::temp_dir().join(format!("srt-model-validation-{suffix}.tsv"));
+    let header = COLUMNS.join("\t");
+    std::fs::write(
+        &clean_path,
+        format!(
+            "{header}\n{}\n{}\n",
+            result_row("caller", "production-candidate"),
+            result_row("listener", "production-candidate")
+        ),
+    )
+    .expect("write clean fixture");
+    let clean_output = validate_results(&clean_path, "tsv").expect("validate clean fixture");
+    assert!(
+        clean_output.contains("confirmed"),
+        "a ProductionCandidate observed clean is a falsifiable prediction that held: {clean_output}"
+    );
+    assert!(clean_output.contains("true"));
+    std::fs::remove_file(&clean_path).expect("remove clean fixture");
+
+    let mismatch_path = std::env::temp_dir().join(format!("srt-model-mismatch-{suffix}.tsv"));
+    std::fs::write(
+        &mismatch_path,
+        format!(
+            "{header}\n{}\n{}\n",
+            result_row("caller", "exceeds-envelope"),
+            result_row("listener", "exceeds-envelope")
+        ),
+    )
+    .expect("write mismatch fixture");
+    let mismatch_output =
+        validate_results(&mismatch_path, "tsv").expect("validate mismatch fixture");
+    assert!(
+        mismatch_output.contains("contradicted"),
+        "an ExceedsEnvelope cell observed clean contradicts the prediction: {mismatch_output}"
+    );
+    assert!(
+        !mismatch_output.contains("confirmed"),
+        "a whole-cell dirty observation cannot confirm a specific hard reason: {mismatch_output}"
+    );
+    std::fs::remove_file(mismatch_path).expect("remove mismatch fixture");
+
+    // The case the old vocabulary got wrong. Conditional asserts nothing about
+    // cleanliness -- it says a required input was unknown -- so no observation
+    // can confirm or refute it. Reporting "agreement" here made the entire
+    // campaign non-falsifiable, because every campaign cell was Conditional.
+    let conditional_path = std::env::temp_dir().join(format!("srt-model-cond-{suffix}.tsv"));
+    std::fs::write(
+        &conditional_path,
+        format!(
+            "{header}\n{}\n{}\n",
+            result_row("caller", "conditional"),
+            result_row("listener", "conditional")
+        ),
+    )
+    .expect("write conditional fixture");
+    let conditional_output =
+        validate_results(&conditional_path, "tsv").expect("validate conditional fixture");
+    assert!(
+        conditional_output.contains("inconclusive"),
+        "Conditional must never be reported as agreement: {conditional_output}"
+    );
+    assert!(
+        !conditional_output.contains("confirmed"),
+        "a non-falsifiable prediction must not be reported as confirmed: {conditional_output}"
+    );
+    std::fs::remove_file(conditional_path).expect("remove conditional fixture");
+}
+
+#[test]
+fn prediction_validation_joins_role_specific_cpu_rows() {
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("srt-model-affinity-{suffix}.tsv"));
+    let header = COLUMNS.join("\t");
+    std::fs::write(
+        &path,
+        format!(
+            "{header}\n{}\n{}\n",
+            result_row_with_affinity("caller", "production-candidate", "3-5", "0-2", "3-5"),
+            result_row_with_affinity("listener", "production-candidate", "0-2", "0-2", "3-5"),
+        ),
+    )
+    .expect("write affinity fixture");
+
+    let output = validate_results(&path, "tsv").expect("validate affinity fixture");
+    assert!(output.contains("agreement"));
+    assert!(output.contains("true"));
+    assert!(!output.contains("missing caller or listener row"));
+    std::fs::remove_file(path).expect("remove affinity fixture");
 }
 
 #[test]

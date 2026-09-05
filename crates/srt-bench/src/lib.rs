@@ -1,5 +1,6 @@
 //! Shared helpers for the srt-bench bench-caller/bench-listener binaries.
 
+pub mod classifier;
 pub mod compare;
 pub mod cpu_stats;
 pub mod driver;
@@ -418,6 +419,8 @@ pub struct BenchConfig {
     /// namespace -- an individual bench process never touches the host's
     /// networking.
     pub link: Link,
+    /// Exact classifier policy used for the pre-run result row.
+    pub classifier_policy: crate::model::ClassifierPolicy,
 }
 
 /// Role-scoped values for axes the harness split, as recorded in results.
@@ -2994,6 +2997,10 @@ pub fn bench_config_from_args() -> BenchConfig {
     let (cpus, pin, workers, stream_secs) = parse_runtime_settings(&cli, duration_secs);
     let peer_topology = parse_peer_topology(&cli);
     let link = parse_link(&cli);
+    let classifier_policy = crate::classifier::policy_from_cli(&cli).unwrap_or_else(|error| {
+        eprintln!("error: {error}");
+        usage()
+    });
 
     let out = cli
         .flags
@@ -3043,6 +3050,7 @@ pub fn bench_config_from_args() -> BenchConfig {
         stream_secs,
         peer_topology,
         link,
+        classifier_policy,
     };
     if let Err(error) = config.validate_bond_topology() {
         eprintln!("error: {error}");
@@ -3130,6 +3138,7 @@ mod tests {
             stream_secs: 1.0,
             peer_topology: PeerTopology::default(),
             link: Link::default(),
+            classifier_policy: crate::model::ClassifierPolicy::default(),
         }
     }
 
