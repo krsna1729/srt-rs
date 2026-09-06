@@ -1548,7 +1548,9 @@ fn collect_reasons(
     add_host_reasons(input, policy, derived, &mut reasons);
     add_nic_reasons(input, policy, derived, &mut reasons);
     add_policy_reasons(policy, derived, &mut reasons);
-    add_topology_reasons(input, derived, &mut reasons);
+    add_topology_reasons(input, &mut reasons);
+    add_deadline_ratio_reason(derived, &mut reasons);
+    add_retransmit_headroom_reason(input, derived, &mut reasons);
     reasons
 }
 
@@ -1806,11 +1808,7 @@ fn add_policy_reasons(
     }
 }
 
-fn add_topology_reasons(
-    input: &CapacityInput,
-    derived: &DerivedLoad,
-    reasons: &mut Vec<CapacityReason>,
-) {
+fn add_topology_reasons(input: &CapacityInput, reasons: &mut Vec<CapacityReason>) {
     let ingress = input.topology.ingress.as_str();
     if ingress.starts_with("reuseport-multi") && !input.topology.cookie_routing {
         reasons.push(CapacityReason::ReuseportRehashWithoutCookie);
@@ -1826,39 +1824,50 @@ fn add_topology_reasons(
     if bonded && input.topology.same_path_bond {
         reasons.push(CapacityReason::BondSamePathOnly);
     }
-    let offered_half_open = input
+    add_half_open_reason(input, reasons);
+}
+
+fn add_half_open_reason(input: &CapacityInput, reasons: &mut Vec<CapacityReason>) {
+    let offered = input
         .admission
         .connect_cc
         .min(input.workload.physical_connections);
-    if input.admission.max_half_open_peers > 0
-        && offered_half_open > input.admission.max_half_open_peers
-    {
+    if input.admission.max_half_open_peers > 0 && offered > input.admission.max_half_open_peers {
         reasons.push(CapacityReason::HalfOpenCapacityExceeded);
     }
+}
+
+fn add_deadline_ratio_reason(derived: &DerivedLoad, reasons: &mut Vec<CapacityReason>) {
     if let Availability::Known(rounds) = derived.approximate_repair_rounds_available
-        && rounds > 0.0
-        && rounds < 2.0
+        && (0.0..2.0).contains(&rounds)
     {
         reasons.push(CapacityReason::DeadlineRatioAggressive);
     }
-    if let Availability::Known(loss) = input.network.expected_loss_probability
-        && loss > 0.0
-    {
-        let missing = match input.protocol.bandwidth {
-            SrtBandwidthPolicy::LegacySourceFixed => true,
-            SrtBandwidthPolicy::InputRelative { overhead_percent } => {
-                match derived.retransmission_factor {
-                    Availability::Known(factor) => {
-                        (overhead_percent as f64) < (factor - 1.0) * 100.0
-                    }
-                    _ => false,
-                }
-            }
-            SrtBandwidthPolicy::ProtocolDefault | SrtBandwidthPolicy::FixedBps(_) => false,
-        };
-        if missing {
-            reasons.push(CapacityReason::RetransmissionHeadroomMissing);
+}
+
+fn retransmission_headroom_missing(input: &CapacityInput, derived: &DerivedLoad) -> bool {
+    let Availability::Known(loss) = input.network.expected_loss_probability else {
+        return false;
+    };
+    if loss <= 0.0 {
+        return false;
+    }
+    match input.protocol.bandwidth {
+        SrtBandwidthPolicy::LegacySourceFixed => true,
+        SrtBandwidthPolicy::InputRelative { overhead_percent } => {
+            matches!(derived.retransmission_factor, Availability::Known(factor) if (overhead_percent as f64) < (factor - 1.0) * 100.0)
         }
+        SrtBandwidthPolicy::ProtocolDefault | SrtBandwidthPolicy::FixedBps(_) => false,
+    }
+}
+
+fn add_retransmit_headroom_reason(
+    input: &CapacityInput,
+    derived: &DerivedLoad,
+    reasons: &mut Vec<CapacityReason>,
+) {
+    if retransmission_headroom_missing(input, derived) {
+        reasons.push(CapacityReason::RetransmissionHeadroomMissing);
     }
 }
 
