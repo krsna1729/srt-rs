@@ -632,7 +632,10 @@ cpu0 50 0 25 500 0 0 5 10 0 0
 ";
         let (steal, total) = parse_stat_steal(text).expect("steal");
         assert_eq!(steal, 25);
-        assert_eq!(total, [100, 0, 50, 1000, 0, 0, 10, 25, 0, 0].iter().sum::<u64>());
+        assert_eq!(
+            total,
+            [100, 0, 50, 1000, 0, 0, 10, 25, 0, 0].iter().sum::<u64>()
+        );
     }
 
     #[test]
