@@ -19,9 +19,14 @@
 //! Three layers:
 //!
 //! 1. **Shared utilities** (always compiled, no runtime deps):
-//!    `ManualTimerStore`, `bind_reuseport`,
+//!    `ManualTimerStore`, `DeadlineHeap`, `HighResWaiter`, `bind_reuseport`,
 //!    `recvmsg_batch`, `sendmsg_batch`, `RecvBatch`, `flush_destined`.
 //!    Protocol-level primitives that all runtimes need.
+//!    `HighResWaiter` is the issue #82 A2 worker primitive: one
+//!    high-resolution wait per worker (`epoll_pwait2` / absolute `timerfd`),
+//!    a min-heap of absolute `CLOCK_MONOTONIC` deadlines, and service of
+//!    every due connection after a single wake. It does not spin and does
+//!    not change `SrtConnection` ownership.
 //!
 //! 2. **Admission machinery** (always compiled, runtime-neutral, performs
 //!    no I/O itself -- the caller does every send): `PeerTable` and
@@ -76,9 +81,11 @@ pub(crate) use dense_due_index::DenseDueIndex;
 #[cfg(any(test, feature = "bench-internals"))]
 pub use dense_due_index::{DenseDueEntry, DenseDueIndex};
 mod batch;
+mod deadline_heap;
 mod due_index;
 mod group_conn;
 mod handoff;
+mod high_res_waiter;
 mod socket_io;
 mod telemetry;
 mod timer;
@@ -120,7 +127,12 @@ pub use batch::{
     drain_recv_fd, flush_destined,
 };
 pub use cpu::{available_cpus, current_cpu_spec, parse_cpu_spec, restrict_to_cpu_list};
+pub use deadline_heap::{DeadlineHeap, schedule_wait_micros};
 pub use due_index::DueIndex;
+pub use high_res_waiter::{
+    HighResWaiter, MonotonicDeadline, PlannedWait, WaitBackend, WaitOutcome, deadline_from_wait,
+    plan_wait,
+};
 pub use socket_io::{
     SOCK_BUF_BYTES, SocketBufferStats, bind_reuseport, recvmsg_batch, sendmsg_batch,
     sendmsg_connected_batch, set_sock_bufs, socket_buffer_stats,
