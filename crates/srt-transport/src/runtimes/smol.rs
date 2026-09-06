@@ -1,9 +1,12 @@
 use crate::{
-    OutputDrainBudget, OutputDrainReport, OutputDrainStatus, collect_output_work, prepend_outputs,
+    BatchIoStats, OutputDrainBudget, OutputDrainReport, OutputDrainStatus, RecvBatch, RecvBudget,
+    RecvDrainReport, collect_output_work, drain_output_work, drain_recv_fd, prepend_outputs,
+    sendmsg_connected_batch,
 };
 use shiguredo_srt::{Bytes, ConnectionEvent, ConnectionOutput, SrtConnection, Timestamp};
 use std::collections::VecDeque;
 use std::io;
+use std::os::fd::AsRawFd;
 use std::time::Duration;
 
 pub type UdpSocket = smol::Async<std::net::UdpSocket>;
@@ -14,6 +17,8 @@ pub struct Conn {
     pub sock: UdpSocket,
     timers: crate::ManualTimerStore,
     pending_outputs: VecDeque<ConnectionOutput>,
+    recv_batch: RecvBatch,
+    io_stats: BatchIoStats,
 }
 
 impl Conn {
@@ -23,6 +28,8 @@ impl Conn {
             sock,
             timers: crate::ManualTimerStore::new(),
             pending_outputs: VecDeque::new(),
+            recv_batch: RecvBatch::new(),
+            io_stats: BatchIoStats::default(),
         }
     }
 
@@ -44,9 +51,9 @@ impl Conn {
         now: Timestamp,
         budget: OutputDrainBudget,
     ) -> io::Result<OutputDrainReport> {
-        let (mut work, exhausted) =
+        let (work, exhausted) =
             collect_output_work(&mut self.conn, &mut self.pending_outputs, budget);
-        let mut report = OutputDrainReport {
+        let report = OutputDrainReport {
             status: if exhausted {
                 OutputDrainStatus::BudgetExhausted
             } else {
@@ -54,42 +61,24 @@ impl Conn {
             },
             ..Default::default()
         };
-        while let Some(out) = work.pop_front() {
-            match out {
-                ConnectionOutput::SendPacket(bytes) => {
-                    match self.sock.write_with(|inner| inner.send(&bytes)).await {
-                        Ok(sent) if sent == bytes.len() => {
-                            report.actions += 1;
-                            report.packets += 1;
-                            report.bytes += sent;
-                        }
-                        Ok(_) => {
-                            prepend_outputs(&mut self.pending_outputs, work.into_iter());
-                            self.pending_outputs
-                                .push_front(ConnectionOutput::SendPacket(bytes));
-                            return Err(io::Error::new(
-                                io::ErrorKind::WriteZero,
-                                "UDP send completed with a partial datagram",
-                            ));
-                        }
-                        Err(error) => {
-                            prepend_outputs(&mut self.pending_outputs, work.into_iter());
-                            self.pending_outputs
-                                .push_front(ConnectionOutput::SendPacket(bytes));
-                            if error.kind() == io::ErrorKind::WouldBlock {
-                                report.status = OutputDrainStatus::Backpressured;
-                                return Ok(report);
-                            }
-                            return Err(error);
-                        }
-                    }
-                }
-                other => {
-                    self.timers.apply_output(&other, now);
-                    report.actions += 1;
-                }
-            }
+        if work
+            .iter()
+            .any(|output| matches!(output, ConnectionOutput::SendPacket(_)))
+            && let Err(error) = self.sock.writable().await
+        {
+            prepend_outputs(&mut self.pending_outputs, work.into_iter());
+            return Err(error);
         }
+        let fd = self.sock.get_ref().as_raw_fd();
+        let report = drain_output_work(
+            work,
+            &mut self.pending_outputs,
+            &mut self.timers,
+            now,
+            report,
+            |batch| sendmsg_connected_batch(fd, batch),
+        )?;
+        self.io_stats.record_send(&report);
         Ok(report)
     }
 
@@ -98,14 +87,43 @@ impl Conn {
         !self.pending_outputs.is_empty()
     }
 
+    #[must_use]
+    pub fn io_stats(&self) -> BatchIoStats {
+        self.io_stats
+    }
+
+    pub fn recv_ready(
+        &mut self,
+        now: Timestamp,
+        budget: RecvBudget,
+    ) -> io::Result<RecvDrainReport> {
+        let report = drain_recv_fd(
+            self.sock.get_ref().as_raw_fd(),
+            &mut self.recv_batch,
+            budget,
+            |_, data| {
+                let _ = self.conn.feed_recv_buf(data, now);
+            },
+        )?;
+        self.io_stats.record_recv(report);
+        Ok(report)
+    }
+
     pub async fn recv_with_timeout(&mut self, buf: &mut [u8], timeout: Duration, now: Timestamp) {
-        let recv_fut = async { self.sock.recv(buf).await.ok() };
+        let _ = buf;
+        let recv_fut = async {
+            self.sock.readable().await.ok()?;
+            Some(())
+        };
         let timer_fut = async {
             smol::Timer::after(timeout).await;
             None
         };
-        if let Some(n) = futures_lite::future::or(recv_fut, timer_fut).await {
-            let _ = self.conn.feed_recv_buf(&buf[..n], now);
+        if futures_lite::future::or(recv_fut, timer_fut)
+            .await
+            .is_some()
+        {
+            let _ = self.recv_ready(now, RecvBudget::default());
         }
     }
 

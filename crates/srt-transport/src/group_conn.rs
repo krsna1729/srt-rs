@@ -1,10 +1,12 @@
 use crate::{
-    CallerConfig, ConfigError, GroupConfig, ManualTimerStore, OutputDrainBudget, OutputDrainReport,
-    OutputDrainStatus, RuntimeFlavor, collect_output_work, prepend_outputs,
+    BatchIoStats, CallerConfig, ConfigError, GroupConfig, ManualTimerStore, OutputDrainBudget,
+    OutputDrainReport, RecvBatch, RecvBudget, RuntimeFlavor, drain_connected_outputs,
+    drain_recv_fd, sendmsg_connected_batch,
 };
 use shiguredo_srt::{Bytes, ConnectionOutput, SrtConnection, Timestamp};
 use std::collections::VecDeque;
 use std::fmt;
+use std::os::fd::AsRawFd;
 
 // ---------------------------------------------------------------------------
 // Bonded/group caller transport
@@ -286,6 +288,8 @@ pub struct GroupConn {
     logical_payload_bytes_sent: u64,
     logical_payloads_received: u64,
     logical_payload_bytes_received: u64,
+    recv_batch: RecvBatch,
+    io_stats: BatchIoStats,
 }
 
 impl GroupConn {
@@ -360,6 +364,8 @@ impl GroupConn {
             logical_payload_bytes_sent: 0,
             logical_payloads_received: 0,
             logical_payload_bytes_received: 0,
+            recv_batch: RecvBatch::with_capacity(RecvBatch::DEFAULT_CAPACITY, 65_536),
+            io_stats: BatchIoStats::default(),
         })
     }
 
@@ -439,6 +445,11 @@ impl GroupConn {
         Some(packet)
     }
 
+    #[must_use]
+    pub fn io_stats(&self) -> BatchIoStats {
+        self.io_stats
+    }
+
     /// Drive timers, nonblocking UDP input, and a bounded output pump for
     /// every leg once. A readable leg may contain up to 64 datagrams per call
     /// to avoid one busy path starving the rest of the group.
@@ -450,8 +461,14 @@ impl GroupConn {
         let mut report = GroupDriveReport {
             legs: Vec::with_capacity(self.legs.len()),
         };
+        let recv_budget = RecvBudget::new(2, 64);
         {
-            let (group, legs) = (&mut self.group, &mut self.legs);
+            let (group, legs, recv_batch, io_stats) = (
+                &mut self.group,
+                &mut self.legs,
+                &mut self.recv_batch,
+                &mut self.io_stats,
+            );
             for leg in legs {
                 let member = group
                     .member_mut(leg.member_id)
@@ -459,25 +476,27 @@ impl GroupConn {
                 let conn = member.connection_mut();
                 leg.timers.fire_expired(now, conn);
 
-                let mut received_datagrams = 0;
-                let mut buffer = [0_u8; 65_536];
-                for _ in 0..64 {
-                    match leg.socket.recv(&mut buffer) {
-                        Ok(size) => {
-                            received_datagrams += 1;
-                            conn.feed_recv_buf(&buffer[..size], now).map_err(|error| {
-                                std::io::Error::new(std::io::ErrorKind::InvalidData, error)
-                            })?;
+                let mut feed_error = None;
+                let received = drain_recv_fd(
+                    leg.socket.as_raw_fd(),
+                    recv_batch,
+                    recv_budget,
+                    |_, data| {
+                        if let Err(error) = conn.feed_recv_buf(data, now) {
+                            feed_error.get_or_insert(error);
                         }
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                        Err(error) => return Err(error),
-                    }
+                    },
+                )?;
+                if let Some(error) = feed_error {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error));
                 }
+                io_stats.record_recv(received);
 
                 let output = drain_group_leg_outputs(conn, leg, now, output_budget)?;
+                io_stats.record_send(&output);
                 report.legs.push(GroupLegDriveReport {
                     member_id: leg.member_id,
-                    received_datagrams,
+                    received_datagrams: received.datagrams,
                     output,
                 });
             }
@@ -518,53 +537,14 @@ fn drain_group_leg_outputs(
     now: Timestamp,
     budget: OutputDrainBudget,
 ) -> std::io::Result<OutputDrainReport> {
-    let (mut work, budget_exhausted) = collect_output_work(conn, &mut leg.pending_outputs, budget);
-    let mut report = OutputDrainReport {
-        status: if budget_exhausted {
-            OutputDrainStatus::BudgetExhausted
-        } else {
-            OutputDrainStatus::Drained
-        },
-        ..OutputDrainReport::default()
-    };
-    while let Some(output) = work.pop_front() {
-        match output {
-            ConnectionOutput::SendPacket(packet) => match leg.socket.send(&packet) {
-                Ok(sent) if sent == packet.len() => {
-                    report.actions += 1;
-                    report.packets += 1;
-                    report.bytes += sent;
-                }
-                Ok(_) => {
-                    prepend_outputs(&mut leg.pending_outputs, work.into_iter());
-                    leg.pending_outputs
-                        .push_front(ConnectionOutput::SendPacket(packet));
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::WriteZero,
-                        "UDP socket reported a partial datagram send",
-                    ));
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    prepend_outputs(&mut leg.pending_outputs, work.into_iter());
-                    leg.pending_outputs
-                        .push_front(ConnectionOutput::SendPacket(packet));
-                    report.status = OutputDrainStatus::Backpressured;
-                    return Ok(report);
-                }
-                Err(error) => {
-                    prepend_outputs(&mut leg.pending_outputs, work.into_iter());
-                    leg.pending_outputs
-                        .push_front(ConnectionOutput::SendPacket(packet));
-                    return Err(error);
-                }
-            },
-            timer => {
-                leg.timers.apply_output(&timer, now);
-                report.actions += 1;
-            }
-        }
-    }
-    Ok(report)
+    drain_connected_outputs(
+        conn,
+        &mut leg.timers,
+        &mut leg.pending_outputs,
+        now,
+        budget,
+        |batch| sendmsg_connected_batch(leg.socket.as_raw_fd(), batch),
+    )
 }
 
 #[cfg(test)]

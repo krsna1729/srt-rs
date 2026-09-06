@@ -8,7 +8,7 @@ use mio::net::UdpSocket;
 use mio::{Events, Interest, Poll, Token};
 use shiguredo_srt::{ConnectionEvent, ConnectionOptions, GroupExtensionData, SrtConnection};
 use srt_transport::mio_transport::Conn;
-use srt_transport::{Handoff, WorkerMessage};
+use srt_transport::{Handoff, RecvBatch, RecvBudget, WorkerMessage};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
@@ -33,28 +33,6 @@ const TIMER_TICK: Duration = Duration::from_millis(10);
 /// more than one peer at once (`SharedPool`, `ReuseportMulti`,
 /// `ReuseportSingle`) -- `PerPort` never shares a socket, so batching
 /// doesn't apply there.
-/// Scratch space for one batched-receive admission drain: fixed-capacity
-/// slots reused across every readiness event instead of reallocated per
-/// event (hot-path rule). `CAPACITY` is how many datagrams `recvmsg_batch`
-/// is willing to fill in one syscall.
-struct RecvBatch {
-    bufs: Vec<Vec<u8>>,
-    sizes: [usize; Self::CAPACITY],
-    addrs: [Option<SocketAddr>; Self::CAPACITY],
-}
-
-impl RecvBatch {
-    const CAPACITY: usize = 32;
-
-    fn new() -> Self {
-        Self {
-            bufs: (0..Self::CAPACITY).map(|_| vec![0u8; 2048]).collect(),
-            sizes: [0usize; Self::CAPACITY],
-            addrs: [None; Self::CAPACITY],
-        }
-    }
-}
-
 fn drain_admission(
     listener: &UdpSocket,
     batching: crate::Batching,
@@ -63,32 +41,20 @@ fn drain_admission(
     mut on_datagram: impl FnMut(SocketAddr, &[u8]),
 ) {
     match batching {
-        crate::Batching::On => loop {
-            let fd = listener.as_raw_fd();
-            let received = match srt_transport::recvmsg_batch(
-                fd,
-                &mut batch.bufs,
-                &mut batch.sizes,
-                &mut batch.addrs,
+        crate::Batching::On => {
+            if let Err(error) = srt_transport::drain_recv_fd(
+                listener.as_raw_fd(),
+                batch,
+                RecvBudget::from_rounds(32),
+                |addr, data| {
+                    if let Some(peer) = addr {
+                        on_datagram(peer, data);
+                    }
+                },
             ) {
-                Ok(received) => received,
-                Err(error) => {
-                    eprintln!("[bench-mio] recvmmsg failed: {error}");
-                    break;
-                }
-            };
-            if received == 0 {
-                break;
+                eprintln!("[bench-mio] recvmmsg failed: {error}");
             }
-            for i in 0..received {
-                if let Some(peer) = batch.addrs[i] {
-                    on_datagram(peer, &batch.bufs[i][..batch.sizes[i]]);
-                }
-            }
-            if received < batch.bufs.len() {
-                break;
-            }
-        },
+        }
         crate::Batching::Off => loop {
             match listener.recv_from(buf) {
                 Ok((n, peer)) => on_datagram(peer, &buf[..n]),

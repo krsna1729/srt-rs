@@ -1,14 +1,17 @@
 use crate::{
-    GroupBuildError, GroupCallerLeg, GroupConnectionLeg, GroupConnectionStats, GroupDriveReport,
-    GroupLegDriveReport, GroupLogicalCounters, ManualTimerStore, OutputDrainBudget,
-    OutputDrainReport, OutputDrainStatus, collect_output_work, group_connection_stats,
-    prepend_outputs,
+    BatchIoStats, GroupBuildError, GroupCallerLeg, GroupConnectionLeg, GroupConnectionStats,
+    GroupDriveReport, GroupLegDriveReport, GroupLogicalCounters, ManualTimerStore,
+    OutputDrainBudget, OutputDrainReport, OutputDrainStatus, RecvBatch, RecvBudget,
+    RecvDrainReport, collect_output_work, drain_connected_outputs, drain_output_work,
+    group_connection_stats, prepend_outputs, sendmsg_connected_batch,
 };
 use shiguredo_srt::{
     Bytes, ConnectionEvent, ConnectionOutput, GroupMode, SrtConnection, Timestamp,
 };
 use std::collections::VecDeque;
 use std::io;
+use std::net::SocketAddr;
+use std::os::fd::AsRawFd;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 
@@ -18,6 +21,8 @@ pub struct Conn {
     pub sock: UdpSocket,
     timers: crate::ManualTimerStore,
     pending_outputs: VecDeque<ConnectionOutput>,
+    recv_batch: RecvBatch,
+    io_stats: BatchIoStats,
 }
 
 impl Conn {
@@ -27,6 +32,8 @@ impl Conn {
             sock,
             timers: crate::ManualTimerStore::new(),
             pending_outputs: VecDeque::new(),
+            recv_batch: RecvBatch::new(),
+            io_stats: BatchIoStats::default(),
         }
     }
 
@@ -44,16 +51,17 @@ impl Conn {
             .await
     }
 
-    /// Drain a bounded amount of output. A failed datagram and every
-    /// action after it remain queued in protocol order for the next tick.
+    /// Drain a bounded amount of output. Consecutive packets go out in
+    /// one `sendmmsg`; a failed datagram and every action after it remain
+    /// queued in protocol order for the next tick.
     pub async fn drain_outputs_bounded(
         &mut self,
         now: Timestamp,
         budget: OutputDrainBudget,
     ) -> io::Result<OutputDrainReport> {
-        let (mut work, budget_exhausted) =
+        let (work, budget_exhausted) =
             collect_output_work(&mut self.conn, &mut self.pending_outputs, budget);
-        let mut report = OutputDrainReport {
+        let report = OutputDrainReport {
             status: if budget_exhausted {
                 OutputDrainStatus::BudgetExhausted
             } else {
@@ -61,42 +69,21 @@ impl Conn {
             },
             ..OutputDrainReport::default()
         };
-
-        while let Some(output) = work.pop_front() {
-            match output {
-                ConnectionOutput::SendPacket(bytes) => match self.sock.send(&bytes).await {
-                    Ok(sent) if sent == bytes.len() => {
-                        report.actions += 1;
-                        report.packets += 1;
-                        report.bytes += sent;
-                    }
-                    Ok(_) => {
-                        prepend_outputs(&mut self.pending_outputs, work.into_iter());
-                        self.pending_outputs
-                            .push_front(ConnectionOutput::SendPacket(bytes));
-                        return Err(io::Error::new(
-                            io::ErrorKind::WriteZero,
-                            "UDP send completed with a partial datagram",
-                        ));
-                    }
-                    Err(error) => {
-                        prepend_outputs(&mut self.pending_outputs, work.into_iter());
-                        self.pending_outputs
-                            .push_front(ConnectionOutput::SendPacket(bytes));
-                        if error.kind() == io::ErrorKind::WouldBlock {
-                            report.status = OutputDrainStatus::Backpressured;
-                            return Ok(report);
-                        }
-                        return Err(error);
-                    }
-                },
-                timer => {
-                    self.timers.apply_output(&timer, now);
-                    report.actions += 1;
-                }
-            }
+        if work_has_packets(&work)
+            && let Err(error) = self.sock.writable().await
+        {
+            prepend_outputs(&mut self.pending_outputs, work.into_iter());
+            return Err(error);
         }
-
+        let report = drain_output_work(
+            work,
+            &mut self.pending_outputs,
+            &mut self.timers,
+            now,
+            report,
+            |batch| send_connected_ready(&self.sock, batch),
+        )?;
+        self.io_stats.record_send(&report);
         Ok(report)
     }
 
@@ -105,10 +92,54 @@ impl Conn {
         !self.pending_outputs.is_empty()
     }
 
-    /// Recv with timeout, feed to protocol.
+    #[must_use]
+    pub fn io_stats(&self) -> BatchIoStats {
+        self.io_stats
+    }
+
+    /// Drain every datagram currently readable, feeding the protocol.
+    /// Bounded by [`RecvBudget`] so a busy peer cannot starve timers.
+    /// Uses Tokio `try_io` so a readiness wake is cleared when empty.
+    pub fn recv_ready(
+        &mut self,
+        now: Timestamp,
+        budget: RecvBudget,
+    ) -> io::Result<RecvDrainReport> {
+        let report = drain_readable(&self.sock, &mut self.recv_batch, budget, |_, data| {
+            let _ = self.conn.feed_recv_buf(data, now);
+        })?;
+        self.io_stats.record_recv(report);
+        Ok(report)
+    }
+
+    /// Non-blocking `recvmmsg` drain that does not touch Tokio readiness.
+    /// Use after an awaited `recv` has already consumed the readable flag.
+    pub fn recv_nonblocking(
+        &mut self,
+        now: Timestamp,
+        budget: RecvBudget,
+    ) -> io::Result<RecvDrainReport> {
+        let report = crate::drain_recv_fd(
+            self.sock.as_raw_fd(),
+            &mut self.recv_batch,
+            budget,
+            |_, data| {
+                let _ = self.conn.feed_recv_buf(data, now);
+            },
+        )?;
+        self.io_stats.record_recv(report);
+        Ok(report)
+    }
+
+    /// Wait until readable or `timeout`, then batch-drain into the protocol.
+    /// `buf` is unused; the connection owns a [`RecvBatch`].
     pub async fn recv_with_timeout(&mut self, buf: &mut [u8], timeout: Duration, now: Timestamp) {
-        if let Ok(Ok(n)) = tokio::time::timeout(timeout, self.sock.recv(buf)).await {
-            let _ = self.conn.feed_recv_buf(&buf[..n], now);
+        let _ = buf;
+        if tokio::time::timeout(timeout, self.sock.readable())
+            .await
+            .is_ok()
+        {
+            let _ = self.recv_ready(now, RecvBudget::default());
         }
     }
 
@@ -164,6 +195,83 @@ impl Conn {
     }
 }
 
+/// Receive datagrams via `recvmmsg`, routed through Tokio's `try_io` so
+/// readiness is cleared when the socket has nothing left. Bounded so a
+/// busy socket cannot starve timers and sibling tasks.
+pub fn drain_readable(
+    sock: &UdpSocket,
+    batch: &mut RecvBatch,
+    budget: RecvBudget,
+    mut on_datagram: impl FnMut(Option<SocketAddr>, &[u8]),
+) -> io::Result<RecvDrainReport> {
+    let mut report = RecvDrainReport::default();
+    let max_rounds = budget.max_rounds.max(1);
+    let max_datagrams = budget.max_datagrams.max(1);
+    for _ in 0..max_rounds {
+        if report.datagrams >= max_datagrams {
+            break;
+        }
+        let result = sock.try_io(tokio::io::Interest::READABLE, || {
+            match batch.recv(sock.as_raw_fd())? {
+                0 => Err(io::ErrorKind::WouldBlock.into()),
+                n => Ok(n),
+            }
+        });
+        match result {
+            Ok(received) => {
+                report.syscalls += 1;
+                for (addr, data) in batch.iter(received) {
+                    on_datagram(addr, data);
+                    report.datagrams += 1;
+                }
+                if received < batch.capacity() {
+                    break;
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                report.would_block = true;
+                break;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(report)
+}
+
+fn send_connected_ready(sock: &UdpSocket, batch: &[Vec<u8>]) -> io::Result<usize> {
+    sock.try_io(
+        tokio::io::Interest::WRITABLE,
+        || match sendmsg_connected_batch(sock.as_raw_fd(), batch)? {
+            0 if !batch.is_empty() => Err(io::ErrorKind::WouldBlock.into()),
+            n => Ok(n),
+        },
+    )
+}
+
+fn work_has_packets(work: &VecDeque<ConnectionOutput>) -> bool {
+    work.iter()
+        .any(|output| matches!(output, ConnectionOutput::SendPacket(_)))
+}
+
+fn feed_ready(
+    sock: &UdpSocket,
+    batch: &mut RecvBatch,
+    conn: &mut SrtConnection,
+    now: Timestamp,
+    budget: RecvBudget,
+) -> io::Result<RecvDrainReport> {
+    let mut feed_error = None;
+    let report = drain_readable(sock, batch, budget, |_, data| {
+        if let Err(error) = conn.feed_recv_buf(data, now) {
+            feed_error.get_or_insert(error);
+        }
+    })?;
+    match feed_error {
+        Some(error) => Err(io::Error::new(io::ErrorKind::InvalidData, error)),
+        None => Ok(report),
+    }
+}
+
 /// Resolve and bind a listener using Tokio-native UDP sockets. Must be
 /// called from a Tokio runtime context.
 pub fn bind_listener(
@@ -208,6 +316,8 @@ pub struct GroupConn {
     logical_payload_bytes_sent: u64,
     logical_payloads_received: u64,
     logical_payload_bytes_received: u64,
+    recv_batch: RecvBatch,
+    io_stats: BatchIoStats,
 }
 
 impl GroupConn {
@@ -236,6 +346,8 @@ impl GroupConn {
             logical_payload_bytes_sent: 0,
             logical_payloads_received: 0,
             logical_payload_bytes_received: 0,
+            recv_batch: RecvBatch::with_capacity(RecvBatch::DEFAULT_CAPACITY, 65_536),
+            io_stats: BatchIoStats::default(),
         })
     }
 
@@ -338,6 +450,11 @@ impl GroupConn {
         Some(packet)
     }
 
+    #[must_use]
+    pub fn io_stats(&self) -> BatchIoStats {
+        self.io_stats
+    }
+
     /// Perform bounded, nonblocking work for every leg. Call after a
     /// Tokio readiness notification or when the next timer is due; this
     /// never blocks one leg waiting for another.
@@ -349,8 +466,14 @@ impl GroupConn {
         let mut report = GroupDriveReport {
             legs: Vec::with_capacity(self.legs.len()),
         };
+        let recv_budget = RecvBudget::new(2, 64);
         {
-            let (group, legs) = (&mut self.group, &mut self.legs);
+            let (group, legs, recv_batch, io_stats) = (
+                &mut self.group,
+                &mut self.legs,
+                &mut self.recv_batch,
+                &mut self.io_stats,
+            );
             for leg in legs {
                 let member = group
                     .member_mut(leg.member_id)
@@ -358,25 +481,14 @@ impl GroupConn {
                 let conn = member.connection_mut();
                 leg.timers.fire_expired(now, conn);
 
-                let mut received_datagrams = 0;
-                let mut buffer = [0_u8; 65_536];
-                for _ in 0..64 {
-                    match leg.socket.try_recv(&mut buffer) {
-                        Ok(size) => {
-                            received_datagrams += 1;
-                            conn.feed_recv_buf(&buffer[..size], now).map_err(|error| {
-                                io::Error::new(io::ErrorKind::InvalidData, error)
-                            })?;
-                        }
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                        Err(error) => return Err(error),
-                    }
-                }
+                let received = feed_ready(&leg.socket, recv_batch, conn, now, recv_budget)?;
+                io_stats.record_recv(received);
 
                 let output = drain_group_leg_outputs(conn, leg, now, output_budget)?;
+                io_stats.record_send(&output);
                 report.legs.push(GroupLegDriveReport {
                     member_id: leg.member_id,
-                    received_datagrams,
+                    received_datagrams: received.datagrams,
                     output,
                 });
             }
@@ -413,53 +525,14 @@ fn drain_group_leg_outputs(
     now: Timestamp,
     budget: OutputDrainBudget,
 ) -> io::Result<OutputDrainReport> {
-    let (mut work, budget_exhausted) = collect_output_work(conn, &mut leg.pending_outputs, budget);
-    let mut report = OutputDrainReport {
-        status: if budget_exhausted {
-            OutputDrainStatus::BudgetExhausted
-        } else {
-            OutputDrainStatus::Drained
-        },
-        ..OutputDrainReport::default()
-    };
-    while let Some(output) = work.pop_front() {
-        match output {
-            ConnectionOutput::SendPacket(packet) => match leg.socket.try_send(&packet) {
-                Ok(sent) if sent == packet.len() => {
-                    report.actions += 1;
-                    report.packets += 1;
-                    report.bytes += sent;
-                }
-                Ok(_) => {
-                    prepend_outputs(&mut leg.pending_outputs, work.into_iter());
-                    leg.pending_outputs
-                        .push_front(ConnectionOutput::SendPacket(packet));
-                    return Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "UDP socket reported a partial datagram send",
-                    ));
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    prepend_outputs(&mut leg.pending_outputs, work.into_iter());
-                    leg.pending_outputs
-                        .push_front(ConnectionOutput::SendPacket(packet));
-                    report.status = OutputDrainStatus::Backpressured;
-                    return Ok(report);
-                }
-                Err(error) => {
-                    prepend_outputs(&mut leg.pending_outputs, work.into_iter());
-                    leg.pending_outputs
-                        .push_front(ConnectionOutput::SendPacket(packet));
-                    return Err(error);
-                }
-            },
-            timer => {
-                leg.timers.apply_output(&timer, now);
-                report.actions += 1;
-            }
-        }
-    }
-    Ok(report)
+    drain_connected_outputs(
+        conn,
+        &mut leg.timers,
+        &mut leg.pending_outputs,
+        now,
+        budget,
+        |batch| send_connected_ready(&leg.socket, batch),
+    )
 }
 
 pub struct TickResult {
@@ -585,6 +658,77 @@ mod tests {
             assert_eq!(stats.group_id, group.group_id);
             assert_eq!(stats.legs.len(), 2);
             assert!(stats.legs.iter().all(|leg| leg.peer_addr.is_some()));
+        });
+    }
+
+    #[test]
+    fn drain_readable_clears_a_burst_through_try_io() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("Tokio runtime builds");
+        runtime.block_on(async {
+            let receiver = std::net::UdpSocket::bind("127.0.0.1:0").expect("receiver");
+            receiver.set_nonblocking(true).expect("nonblocking");
+            let dest = receiver.local_addr().expect("addr");
+            let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("sender");
+            for payload in [b"x".as_slice(), b"y", b"z"] {
+                sender.send_to(payload, dest).expect("send");
+            }
+            let sock = UdpSocket::from_std(receiver).expect("tokio adopts");
+            sock.readable().await.expect("readable");
+
+            let mut batch = RecvBatch::new();
+            let mut got = Vec::new();
+            let report =
+                drain_readable(&sock, &mut batch, RecvBudget::from_rounds(1), |_, data| {
+                    got.push(data.to_vec());
+                })
+                .expect("drain");
+            assert_eq!(report.datagrams, 3);
+            assert_eq!(report.syscalls, 1);
+            assert_eq!(got, [b"x".to_vec(), b"y".to_vec(), b"z".to_vec()]);
+        });
+    }
+
+    #[test]
+    fn drain_outputs_sends_queued_packets_as_one_sendmmsg() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("Tokio runtime builds");
+        runtime.block_on(async {
+            let peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("peer");
+            peer.set_nonblocking(true).expect("nonblocking");
+            let dest = peer.local_addr().expect("addr");
+            let local = std::net::UdpSocket::bind("127.0.0.1:0").expect("local");
+            local.set_nonblocking(true).expect("nonblocking");
+            local.connect(dest).expect("connect");
+            let sock = UdpSocket::from_std(local).expect("tokio adopts");
+
+            let mut conn = Conn::new(
+                SrtConnection::new_caller(shiguredo_srt::ConnectionOptions::default()),
+                sock,
+            );
+            conn.pending_outputs.extend([
+                ConnectionOutput::SendPacket(b"p1".to_vec()),
+                ConnectionOutput::SendPacket(b"p2".to_vec()),
+                ConnectionOutput::SendPacket(b"p3".to_vec()),
+            ]);
+            let report = conn
+                .drain_outputs(Timestamp::from_micros(0))
+                .await
+                .expect("drain");
+            assert_eq!(report.packets, 3);
+            assert_eq!(report.syscalls, 1);
+            assert!(!conn.has_pending_outputs());
+            assert_eq!(conn.io_stats().packets_per_visit(), 3.0);
+
+            let mut buf = [0u8; 64];
+            for expected in [b"p1".as_slice(), b"p2", b"p3"] {
+                let n = peer.recv(&mut buf).expect("recv");
+                assert_eq!(&buf[..n], expected);
+            }
         });
     }
 }
