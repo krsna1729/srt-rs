@@ -760,6 +760,60 @@ impl SessionConfig {
         self
     }
 
+    /// Full ACK period. Default is Haivision `COMM_SYN` (10 ms).
+    ///
+    /// Accepted range is [`shiguredo_srt::MIN_ACK_INTERVAL_MICROS`]..=
+    /// [`shiguredo_srt::MAX_ACK_INTERVAL_MICROS`]. Coalescing ACKs does not
+    /// coarsen TSBPD/TLPKTDROP: the protocol timer still ticks at `COMM_SYN`
+    /// when the interval is longer than 10 ms. High-fan-in listeners can use
+    /// [`shiguredo_srt::HIGH_FANIN_ACK_INTERVAL_MICROS`] (40 ms).
+    pub fn set_ack_interval(&mut self, interval: Duration) -> Result<&mut Self, ConfigError> {
+        let micros = duration_micros_u64(interval);
+        if !(shiguredo_srt::MIN_ACK_INTERVAL_MICROS..=shiguredo_srt::MAX_ACK_INTERVAL_MICROS)
+            .contains(&micros)
+        {
+            return Err(ConfigError::new(
+                "session.ack_interval",
+                format!(
+                    "must be {}..={} microseconds (Haivision COMM_SYN default is {})",
+                    shiguredo_srt::MIN_ACK_INTERVAL_MICROS,
+                    shiguredo_srt::MAX_ACK_INTERVAL_MICROS,
+                    shiguredo_srt::ACK_INTERVAL_MICROS
+                ),
+            ));
+        }
+        self.connection.ack_interval_micros = micros;
+        Ok(self)
+    }
+
+    /// Light ACK packet cadence. Default is the Haivision/RFC recommendation (64).
+    ///
+    /// Accepted range is [`shiguredo_srt::MIN_LIGHT_ACK_INTERVAL_PACKETS`]..=
+    /// [`shiguredo_srt::MAX_LIGHT_ACK_INTERVAL_PACKETS`]. High-fan-in
+    /// listeners can use [`shiguredo_srt::HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS`]
+    /// (256).
+    pub fn set_light_ack_interval_packets(
+        &mut self,
+        packets: u32,
+    ) -> Result<&mut Self, ConfigError> {
+        if !(shiguredo_srt::MIN_LIGHT_ACK_INTERVAL_PACKETS
+            ..=shiguredo_srt::MAX_LIGHT_ACK_INTERVAL_PACKETS)
+            .contains(&packets)
+        {
+            return Err(ConfigError::new(
+                "session.light_ack_interval_packets",
+                format!(
+                    "must be {}..={} packets (Haivision/RFC default is {})",
+                    shiguredo_srt::MIN_LIGHT_ACK_INTERVAL_PACKETS,
+                    shiguredo_srt::MAX_LIGHT_ACK_INTERVAL_PACKETS,
+                    shiguredo_srt::LIGHT_ACK_INTERVAL_PACKETS
+                ),
+            ));
+        }
+        self.connection.light_ack_interval_packets = packets;
+        Ok(self)
+    }
+
     pub fn set_encryption(&mut self, encryption: Option<EncryptionConfig>) -> &mut Self {
         self.clear_owned_secrets();
         match encryption {
@@ -821,6 +875,31 @@ impl SessionConfig {
             return Err(ConfigError::new(
                 "session.delivery_queue_packets",
                 "must not exceed the receive buffer",
+            ));
+        }
+        if !(shiguredo_srt::MIN_ACK_INTERVAL_MICROS..=shiguredo_srt::MAX_ACK_INTERVAL_MICROS)
+            .contains(&self.connection.ack_interval_micros)
+        {
+            return Err(ConfigError::new(
+                "session.ack_interval",
+                format!(
+                    "must be {}..={} microseconds",
+                    shiguredo_srt::MIN_ACK_INTERVAL_MICROS,
+                    shiguredo_srt::MAX_ACK_INTERVAL_MICROS
+                ),
+            ));
+        }
+        if !(shiguredo_srt::MIN_LIGHT_ACK_INTERVAL_PACKETS
+            ..=shiguredo_srt::MAX_LIGHT_ACK_INTERVAL_PACKETS)
+            .contains(&self.connection.light_ack_interval_packets)
+        {
+            return Err(ConfigError::new(
+                "session.light_ack_interval_packets",
+                format!(
+                    "must be {}..={} packets",
+                    shiguredo_srt::MIN_LIGHT_ACK_INTERVAL_PACKETS,
+                    shiguredo_srt::MAX_LIGHT_ACK_INTERVAL_PACKETS
+                ),
             ));
         }
         if self
@@ -2136,5 +2215,34 @@ mod tests {
 
         let error = session.validate().expect_err("invalid overhead");
         assert_eq!(error.field(), "session.bandwidth");
+    }
+
+    #[test]
+    fn ack_coalesce_setters_accept_high_fanin_and_reject_out_of_range() {
+        let mut session = SessionConfig::default();
+        session
+            .set_ack_interval(Duration::from_micros(
+                shiguredo_srt::HIGH_FANIN_ACK_INTERVAL_MICROS,
+            ))
+            .expect("40ms is in range")
+            .set_light_ack_interval_packets(shiguredo_srt::HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS)
+            .expect("256 packets is in range");
+        assert_eq!(
+            session.connection_options().ack_interval_micros,
+            shiguredo_srt::HIGH_FANIN_ACK_INTERVAL_MICROS
+        );
+        assert_eq!(
+            session.connection_options().light_ack_interval_packets,
+            shiguredo_srt::HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS
+        );
+
+        let error = session
+            .set_ack_interval(Duration::from_millis(250))
+            .expect_err("250ms is above the RTT-sample ceiling");
+        assert_eq!(error.field(), "session.ack_interval");
+        let error = session
+            .set_light_ack_interval_packets(4)
+            .expect_err("below the coalesce floor");
+        assert_eq!(error.field(), "session.light_ack_interval_packets");
     }
 }

@@ -377,8 +377,7 @@ async fn sender_task(
     // One resolution point for every runtime: the pacing policy comes
     // from the config, not from a local `bitrate / 8` that would make the
     // workload rate and the pacing ceiling the same number again.
-    cfg.apply_srt_bandwidth(&mut options);
-    cfg.encryption.apply_to(&mut options);
+    cfg.apply_protocol_options(&mut options);
     let mut conn = SrtConnection::new_caller(options);
     conn.connect(crate::now_ts(start))
         .expect("connect() should queue INDUCTION");
@@ -551,7 +550,7 @@ async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> Co
         tsbpd_delay: cfg.latency_ms,
         ..Default::default()
     };
-    cfg.encryption.apply_to(&mut options);
+    cfg.apply_protocol_options(&mut options);
     let conn = SrtConnection::new_listener(options);
     let mut driver = Conn::new(conn, socket);
 

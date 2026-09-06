@@ -21,6 +21,8 @@ fn sender_config(connections: usize, cc: usize) -> srt_bench::BenchConfig {
         source_backlog_ms: srt_bench::source::DEFAULT_SOURCE_BACKLOG_MS,
         datapath_queue_horizon_ms: srt_bench::queue::DEFAULT_DATAPATH_QUEUE_HORIZON_MS,
         outbound_retry_horizon_ms: srt_bench::scheduling::DEFAULT_OUTBOUND_RETRY_HORIZON_MS,
+        ack_interval_micros: shiguredo_srt::ACK_INTERVAL_MICROS,
+        light_ack_interval_packets: shiguredo_srt::LIGHT_ACK_INTERVAL_PACKETS,
         connections,
         egress: Egress::SharedSocket,
         ingress: Ingress::SharedPool(1),

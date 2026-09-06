@@ -136,8 +136,7 @@ fn spawn_driver(
     // One resolution point for every runtime: the pacing policy comes
     // from the config, not from a local `bitrate / 8` that would make the
     // workload rate and the pacing ceiling the same number again.
-    cfg.apply_srt_bandwidth(&mut options);
-    cfg.encryption.apply_to(&mut options);
+    cfg.apply_protocol_options(&mut options);
     let conn = match cfg.mode {
         crate::Mode::Sender => {
             let mut c = SrtConnection::new_caller(options);
@@ -334,8 +333,7 @@ fn spawn_driver_a2(
         tsbpd_delay: cfg.latency_ms,
         ..Default::default()
     };
-    cfg.apply_srt_bandwidth(&mut options);
-    cfg.encryption.apply_to(&mut options);
+    cfg.apply_protocol_options(&mut options);
     let mut c = SrtConnection::new_caller(options);
     c.connect(crate::now_ts(start))
         .expect("connect() should queue INDUCTION");
@@ -1137,7 +1135,7 @@ fn new_shared_pool_conn(cfg: &BenchConfig, peer: SocketAddr, socket_idx: usize) 
                 tsbpd_delay: cfg.latency_ms,
                 ..Default::default()
             };
-            cfg.encryption.apply_to(&mut options);
+            cfg.apply_protocol_options(&mut options);
             options
         }),
         timers: srt_transport::ManualTimerStore::new(),
@@ -2115,7 +2113,7 @@ fn new_single_pending(cfg: &BenchConfig) -> SinglePending {
                 tsbpd_delay: cfg.latency_ms,
                 ..Default::default()
             };
-            cfg.encryption.apply_to(&mut options);
+            cfg.apply_protocol_options(&mut options);
             options
         }),
         timers: srt_transport::ManualTimerStore::new(),

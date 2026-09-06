@@ -270,6 +270,12 @@ pub struct BenchConfig {
     /// Milliseconds of offered load the harness may retain after an
     /// outbound send yields. Same rule, against socket fan-out.
     pub outbound_retry_horizon_ms: u64,
+    /// Full ACK period applied to every connection this process creates.
+    /// Default is Haivision `COMM_SYN` (10 ms). Contabo 4× cell: 40_000.
+    pub ack_interval_micros: u64,
+    /// Light ACK packet cadence applied to every connection this process
+    /// creates. Default is 64. Contabo 4× cell: 256.
+    pub light_ack_interval_packets: u32,
     pub connections: usize,
     /// Caller-side UDP socket topology. `PerConnection` gives every SRT
     /// connection its own ephemeral local port. `SharedSocket` drives all
@@ -672,6 +678,23 @@ impl BenchConfig {
         self.srt_bandwidth().apply_to(options);
     }
 
+    /// Write this run's ACK coalesce knobs into raw protocol options.
+    ///
+    /// Per-connection, so a cell can set 40 ms / 256 without an env var and
+    /// without contaminating other sockets in-process.
+    pub fn apply_ack_coalesce(&self, options: &mut shiguredo_srt::ConnectionOptions) {
+        options.ack_interval_micros = self.ack_interval_micros;
+        options.light_ack_interval_packets = self.light_ack_interval_packets;
+    }
+
+    /// Bandwidth + encryption + ACK coalesce. The single place a runtime
+    /// should stamp protocol knobs onto a `ConnectionOptions` template.
+    pub fn apply_protocol_options(&self, options: &mut shiguredo_srt::ConnectionOptions) {
+        self.apply_srt_bandwidth(options);
+        self.encryption.apply_to(options);
+        self.apply_ack_coalesce(options);
+    }
+
     /// How many peers' traffic arrives on one listener ingress socket.
     ///
     /// A per-port socket serves one sender; a pooled or reuseport socket
@@ -772,6 +795,7 @@ impl BenchConfig {
             ..Default::default()
         };
         self.encryption.apply_to(&mut template);
+        self.apply_ack_coalesce(&mut template);
         srt_transport::AdmissionOptions {
             socket_id,
             tsbpd_delay: self.latency_ms,
@@ -2264,8 +2288,7 @@ fn make_caller_connection(
         stream_id: cfg.bond_stream_id_for(index),
         ..Default::default()
     };
-    cfg.apply_srt_bandwidth(&mut options);
-    cfg.encryption.apply_to(&mut options);
+    cfg.apply_protocol_options(&mut options);
     let mut connection = shiguredo_srt::SrtConnection::new_caller(options);
     connection
         .connect(now)
@@ -2658,6 +2681,7 @@ fn usage() -> ! {
          [--encryption plain|128|192|256] \
          [--bond broadcast:G|backup:G|none] [--batch on|off] \
          [--connect-concurrency N] [--recv-rounds N] [--would-block retain|drop] [--promotion never|relocate|bonded|all] [--cookie-routing on|off] [--sock-buf N|Nk|Nm|default] [--out FILE] [--cpus 0-3|0,2,4] [--pin on|off] [--workers N] [--link-delay 25ms] [--link-jitter 5ms] [--link-loss 1%] [--link-rate 100mbit] \
+         [--ack-interval-micros US] [--light-ack-interval-packets N] \
          [--host-contention refuse|mark|allow] [--allow-host-contention]"
     );
     std::process::exit(2)
@@ -2873,6 +2897,62 @@ fn parse_cookie_routing(cli: &Cli) -> bool {
     }
 }
 
+fn parse_ack_interval_micros(cli: &Cli) -> u64 {
+    match cli.flags.get("ack-interval-micros").map(String::as_str) {
+        None | Some("") => shiguredo_srt::ACK_INTERVAL_MICROS,
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(value)
+                if (shiguredo_srt::MIN_ACK_INTERVAL_MICROS
+                    ..=shiguredo_srt::MAX_ACK_INTERVAL_MICROS)
+                    .contains(&value) =>
+            {
+                value
+            }
+            _ => {
+                eprintln!(
+                    "error: --ack-interval-micros must be {}..={} (got '{raw}'); \
+                     Haivision COMM_SYN default is {}, high-fan-in 4× cell is {}",
+                    shiguredo_srt::MIN_ACK_INTERVAL_MICROS,
+                    shiguredo_srt::MAX_ACK_INTERVAL_MICROS,
+                    shiguredo_srt::ACK_INTERVAL_MICROS,
+                    shiguredo_srt::HIGH_FANIN_ACK_INTERVAL_MICROS
+                );
+                usage()
+            }
+        },
+    }
+}
+
+fn parse_light_ack_interval_packets(cli: &Cli) -> u32 {
+    match cli
+        .flags
+        .get("light-ack-interval-packets")
+        .map(String::as_str)
+    {
+        None | Some("") => shiguredo_srt::LIGHT_ACK_INTERVAL_PACKETS,
+        Some(raw) => match raw.parse::<u32>() {
+            Ok(value)
+                if (shiguredo_srt::MIN_LIGHT_ACK_INTERVAL_PACKETS
+                    ..=shiguredo_srt::MAX_LIGHT_ACK_INTERVAL_PACKETS)
+                    .contains(&value) =>
+            {
+                value
+            }
+            _ => {
+                eprintln!(
+                    "error: --light-ack-interval-packets must be {}..={} (got '{raw}'); \
+                     Haivision/RFC default is {}, high-fan-in 4× cell is {}",
+                    shiguredo_srt::MIN_LIGHT_ACK_INTERVAL_PACKETS,
+                    shiguredo_srt::MAX_LIGHT_ACK_INTERVAL_PACKETS,
+                    shiguredo_srt::LIGHT_ACK_INTERVAL_PACKETS,
+                    shiguredo_srt::HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS
+                );
+                usage()
+            }
+        },
+    }
+}
+
 fn parse_sock_buf(cli: &Cli) -> usize {
     match cli.flags.get("sock-buf").map(String::as_str) {
         None => srt_transport::SOCK_BUF_BYTES,
@@ -3019,6 +3099,8 @@ pub fn bench_config_from_args() -> BenchConfig {
         eprintln!("error: {error}");
         usage()
     });
+    let ack_interval_micros = parse_ack_interval_micros(&cli);
+    let light_ack_interval_packets = parse_light_ack_interval_packets(&cli);
 
     let out = cli
         .flags
@@ -3047,6 +3129,8 @@ pub fn bench_config_from_args() -> BenchConfig {
             "outbound-retry-horizon-ms",
             scheduling::DEFAULT_OUTBOUND_RETRY_HORIZON_MS,
         ),
+        ack_interval_micros,
+        light_ack_interval_packets,
         connections: cli.connections(),
         egress,
         ingress,
@@ -3122,6 +3206,38 @@ mod tests {
         assert_eq!(options.key_length, KeyLength::Aes128);
     }
 
+    #[test]
+    fn ack_coalesce_is_stamped_on_connection_and_admission_templates() {
+        let mut cfg = config();
+        cfg.ack_interval_micros = shiguredo_srt::HIGH_FANIN_ACK_INTERVAL_MICROS;
+        cfg.light_ack_interval_packets = shiguredo_srt::HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS;
+
+        let mut options = ConnectionOptions::default();
+        cfg.apply_protocol_options(&mut options);
+        assert_eq!(
+            options.ack_interval_micros,
+            shiguredo_srt::HIGH_FANIN_ACK_INTERVAL_MICROS
+        );
+        assert_eq!(
+            options.light_ack_interval_packets,
+            shiguredo_srt::HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS
+        );
+
+        let template = cfg
+            .admission_options(0x1234, true)
+            .connection_template
+            .clone()
+            .expect("session template");
+        assert_eq!(
+            template.ack_interval_micros,
+            shiguredo_srt::HIGH_FANIN_ACK_INTERVAL_MICROS
+        );
+        assert_eq!(
+            template.light_ack_interval_packets,
+            shiguredo_srt::HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS
+        );
+    }
+
     fn config() -> BenchConfig {
         BenchConfig {
             runtime: Runtime::Mio,
@@ -3136,6 +3252,8 @@ mod tests {
             source_backlog_ms: crate::source::DEFAULT_SOURCE_BACKLOG_MS,
             datapath_queue_horizon_ms: crate::queue::DEFAULT_DATAPATH_QUEUE_HORIZON_MS,
             outbound_retry_horizon_ms: crate::scheduling::DEFAULT_OUTBOUND_RETRY_HORIZON_MS,
+            ack_interval_micros: shiguredo_srt::ACK_INTERVAL_MICROS,
+            light_ack_interval_packets: shiguredo_srt::LIGHT_ACK_INTERVAL_PACKETS,
             connections: 1,
             egress: Egress::PerConnection,
             ingress: Ingress::SharedPool(4),

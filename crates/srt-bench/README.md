@@ -34,6 +34,7 @@ srt-bench runtime=<mio|tokio|smol|monoio|glommio|compio> \
   [--ingress …] [--egress per-connection|shared-socket] [--promotion …]
   [--cookie-routing on|off] [--batch on|off] [--recv-rounds N]
   [--would-block retain|drop] [--sock-buf …]
+  [--ack-interval-micros US] [--light-ack-interval-packets N]
   [--connect-concurrency N] [--bond …] [--out FILE]
 ```
 
@@ -54,6 +55,10 @@ srt-bench runtime=<mio|tokio|smol|monoio|glommio|compio> \
 - Loss mode and scale mode are the same code path per runtime — loss runs
   one connection, scale runs N; only the STATS schema differs.
 - Receiver prints `LISTENING` when its sockets are bound.
+- ACK coalesce defaults to Haivision `COMM_SYN` (10 ms) / Light ACK every 64
+  packets. For a high-fan-in listener rematch of the issue #30 Contabo 4×
+  cell, both roles take `--ack-interval-micros 40000 --light-ack-interval-packets 256`.
+  The knobs are per-connection options, not process-global env vars.
 
 ### Sweeping, reporting, profiling
 
