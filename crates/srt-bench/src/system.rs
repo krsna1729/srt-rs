@@ -59,6 +59,7 @@ pub fn print_startup_diagnostics(context: &str) {
         print_file(name, path);
     }
     print_memory();
+    print_host_contention();
 }
 
 const SYSCTLS: &[(&str, &str)] = &[
@@ -157,5 +158,30 @@ fn print_memory() {
                 .map(String::as_str)
                 .unwrap_or("unavailable")
         );
+    }
+}
+
+fn print_host_contention() {
+    let snap = crate::host_contention::sample_host();
+    let fmt = |resource: crate::host_contention::PsiResource, name: &str| {
+        if resource.available {
+            eprintln!(
+                "pressure.{name}.some_avg10={:.3} pressure.{name}.some_total_us={}",
+                resource.some_avg10, resource.some_total_us
+            );
+        } else {
+            eprintln!("pressure.{name}=unavailable");
+        }
+    };
+    fmt(snap.cpu, "cpu");
+    fmt(snap.memory, "memory");
+    fmt(snap.io, "io");
+    if snap.steal_available {
+        eprintln!(
+            "cpu.steal_jiffies={} cpu.total_jiffies={}",
+            snap.steal_jiffies, snap.cpu_jiffies
+        );
+    } else {
+        eprintln!("cpu.steal=unavailable");
     }
 }

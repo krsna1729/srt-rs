@@ -76,6 +76,10 @@ srt-bench system-info
 # Watch host pressure and kernel UDP drops while a benchmark runs.
 srt-bench watch 5 12
 
+# Integrity: refuse/mark cells under host contention (PSI + steal).
+# Default is mark. Noisy CI: --allow-host-contention
+srt-bench matrix --host-contention=refuse --plan docs/plans/sentinel.plan ...
+
 # Explicitly override axes from a plan; repeat --axis for more axes.
 srt-bench matrix --plan docs/plans/full-matrix.plan \
   --axis encryption=plain,128 --axis connections=50,600

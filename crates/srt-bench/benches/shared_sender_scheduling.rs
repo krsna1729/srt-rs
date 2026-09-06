@@ -43,6 +43,7 @@ fn sender_config(connections: usize, cc: usize) -> srt_bench::BenchConfig {
         peer_topology: srt_bench::PeerTopology::default(),
         link: srt_bench::Link::default(),
         classifier_policy: srt_bench::model::ClassifierPolicy::default(),
+        host_contention: srt_bench::host_contention::HostContentionPolicy::default(),
     }
 }
 

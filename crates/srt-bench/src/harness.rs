@@ -136,6 +136,10 @@ pub const COLUMNS: &[&str] = &[
     "srt_oheadbw_pct",
     "model_policy_rev",
     "model_policy_fingerprint",
+    // Host-contention policy identity — same discipline as
+    // model_policy_fingerprint. Contended cells are environment
+    // evidence; this does not redefine the clean predicate.
+    "host_contention_policy_fingerprint",
     "model_class_pre",
     "model_reasons_pre",
     "rep",
@@ -233,6 +237,18 @@ pub const COLUMNS: &[&str] = &[
     // is a superset -- never add the two.
     "retry_overflow",
     "local_dropped",
+    // Host contention evidence. Status is quiet|contended|unknown|allowed;
+    // signals names the PSI/steal reasons that fired. Pre/post CPU PSI
+    // avg10 plus stall% catch mid-cell contamination; mem/io/steal are
+    // companions. Thresholds live in host_contention_policy_fingerprint.
+    "host_contention",
+    "host_contention_signals",
+    "host_cpu_psi_some_avg10_pre",
+    "host_cpu_psi_some_avg10_post",
+    "host_cpu_psi_stall_pct",
+    "host_mem_psi_some_avg10_max",
+    "host_io_psi_some_avg10_max",
+    "host_steal_pct",
 ];
 
 /// Configuration columns that define a unique benchmark workload/cell.
@@ -279,6 +295,7 @@ pub const CONFIG_COLUMNS: &[&str] = &[
     "secs",
     "model_policy_rev",
     "model_policy_fingerprint",
+    "host_contention_policy_fingerprint",
 ];
 
 /// The dimensions a run was configured with, rendered for the result
@@ -427,6 +444,19 @@ pub fn append_result(
             sock_bufs.sndbuf_max_bytes,
         );
     }
+    let host_pre = crate::host_contention::baseline();
+    let host_post = crate::host_contention::sample_host();
+    let host_elapsed = std::time::Duration::from_secs_f64(elapsed_s.max(0.0));
+    let host =
+        crate::host_contention::evaluate(&cfg.host_contention, &host_pre, &host_post, host_elapsed);
+    if host.status == crate::host_contention::HostContentionStatus::Contended {
+        eprintln!(
+            "host contention: {} ({})",
+            host.status.as_str(),
+            host.signals_joined()
+        );
+    }
+
     let mut row = String::new();
     let values: Vec<String> = vec![
         cfg.runtime.name().to_string(),
@@ -489,6 +519,7 @@ pub fn append_result(
         resolved.overhead_percent.to_string(),
         model.policy_revision.clone(),
         model.policy_fingerprint.clone(),
+        cfg.host_contention.fingerprint(),
         model.class.name().to_string(),
         model
             .reasons
@@ -552,6 +583,14 @@ pub fn append_result(
         outbound_retry.would_block.to_string(),
         outbound_retry.overflow.to_string(),
         outbound_retry.local_dropped.to_string(),
+        host.status.as_str().to_string(),
+        host.signals_joined(),
+        host.cpu_psi_some_avg10_pre,
+        host.cpu_psi_some_avg10_post,
+        host.cpu_psi_stall_pct,
+        host.mem_psi_some_avg10_max,
+        host.io_psi_some_avg10_max,
+        host.steal_pct,
     ];
     debug_assert_eq!(values.len(), COLUMNS.len(), "row/header width mismatch");
     let _ = write!(row, "{}", values.join("\t"));
@@ -2024,6 +2063,7 @@ struct ScheduleInputs<'a, 'cell> {
     seed: u64,
     out: &'a Path,
     policy_fingerprint: &'a str,
+    host_contention_fingerprint: &'a str,
 }
 
 fn build_matrix_schedule(inputs: ScheduleInputs<'_, '_>) -> std::io::Result<MatrixSchedule> {
@@ -2035,6 +2075,7 @@ fn build_matrix_schedule(inputs: ScheduleInputs<'_, '_>) -> std::io::Result<Matr
         seed,
         out,
         policy_fingerprint,
+        host_contention_fingerprint,
     } = inputs;
     let total = cells.len() * reps;
     let mut cell_order: Vec<usize> = match order {
@@ -2090,11 +2131,17 @@ fn build_matrix_schedule(inputs: ScheduleInputs<'_, '_>) -> std::io::Result<Matr
                 // something other than the harness, which always records a
                 // non-empty fingerprint. Only a fingerprint that is present
                 // AND different proves the row belongs to another policy.
-                match r.get("model_policy_fingerprint") {
+                let model_ok = match r.get("model_policy_fingerprint") {
                     None => true,
                     Some("") => true,
                     Some(recorded) => recorded == policy_fingerprint,
-                }
+                };
+                let host_ok = match r.get("host_contention_policy_fingerprint") {
+                    None => true,
+                    Some("") => true,
+                    Some(recorded) => recorded == host_contention_fingerprint,
+                };
+                model_ok && host_ok
             })
             .filter_map(|r| {
                 let rep: usize = r.number("rep")? as usize;
@@ -2245,6 +2292,9 @@ pub enum MatrixFailureKind {
     /// not an unsupported configuration -- the sweep asked for it and did
     /// not get it.
     Infrastructure { detail: String },
+    /// The host was contended under `--host-contention=refuse`. Admission
+    /// refused the cell, or mid-cell evidence showed contamination.
+    HostContention { detail: String },
 }
 
 impl std::fmt::Display for MatrixFailureKind {
@@ -2254,6 +2304,7 @@ impl std::fmt::Display for MatrixFailureKind {
             Self::MissingResult { role } => write!(f, "{role} recorded no result row"),
             Self::UnreadableResults { detail } => write!(f, "result file unreadable: {detail}"),
             Self::Infrastructure { detail } => write!(f, "could not run cell: {detail}"),
+            Self::HostContention { detail } => write!(f, "host contention: {detail}"),
         }
     }
 }
@@ -2343,6 +2394,9 @@ struct MatrixProcessContext<'a, 'cell> {
     /// predicts under the default zero-margin policy, so a campaign run
     /// with a custom policy would persist predictions nobody asked for.
     policy_argv: &'a [String],
+    /// Host-contention thresholds/mode, forwarded so child rows record the
+    /// same policy the parent used for admission.
+    host_contention_argv: &'a [String],
 }
 
 /// Which roles recorded a row for this (cell, rep) in `out`.
@@ -2430,6 +2484,7 @@ fn run_matrix_processes(
         total,
         attempt,
         policy_argv,
+        host_contention_argv,
     } = context;
     // Each role gets the axes scoped to it plus the shared ones.
     // Both roles additionally get every split axis's *other* side
@@ -2441,6 +2496,8 @@ fn run_matrix_processes(
     let mut send_argv = matrix_cell_argv(cell, Scope::Send);
     recv_argv.extend_from_slice(policy_argv);
     send_argv.extend_from_slice(policy_argv);
+    recv_argv.extend_from_slice(host_contention_argv);
+    send_argv.extend_from_slice(host_contention_argv);
     // The listener runs to a long backstop, but the cell's stream
     // length is what any rate is computed against.
     recv_argv.push(format!("--stream-secs={secs}"));
@@ -2604,6 +2661,8 @@ struct MatrixScheduleContext<'a, 'cell> {
     /// Forwarded to every child so a child's prediction uses the policy the
     /// operator asked for rather than `ClassifierPolicy::default()`.
     policy_argv: &'a [String],
+    host_contention: &'a crate::host_contention::HostContentionPolicy,
+    host_contention_argv: &'a [String],
 }
 
 fn run_matrix_schedule(context: MatrixScheduleContext<'_, '_>) -> std::io::Result<MatrixReport> {
@@ -2621,6 +2680,8 @@ fn run_matrix_schedule(context: MatrixScheduleContext<'_, '_>) -> std::io::Resul
         invocation_nonce,
         netns,
         policy_argv,
+        host_contention,
+        host_contention_argv,
     } = context;
     let mut report = MatrixReport::default();
     let mut unsupported_cells = std::collections::HashSet::new();
@@ -2667,7 +2728,9 @@ fn run_matrix_schedule(context: MatrixScheduleContext<'_, '_>) -> std::io::Resul
                 total: schedule.total,
                 attempt: &attempt,
                 policy_argv,
+                host_contention_argv,
             },
+            host_contention,
             |flag| matrix_cell_link(cell, flag),
         )?;
         if failures.is_empty() {
@@ -2697,8 +2760,27 @@ fn run_matrix_schedule(context: MatrixScheduleContext<'_, '_>) -> std::io::Resul
 /// passed over.
 fn run_scheduled_cell(
     context: MatrixProcessContext<'_, '_>,
+    host_contention: &crate::host_contention::HostContentionPolicy,
     link: impl Fn(&str) -> Option<String>,
 ) -> std::io::Result<Vec<MatrixFailureKind>> {
+    use crate::host_contention::{
+        AdmissionOutcome, HostContentionMode, HostContentionStatus, evaluate, sample_host,
+        wait_until_quiet,
+    };
+
+    match wait_until_quiet(host_contention) {
+        AdmissionOutcome::Quiet | AdmissionOutcome::Skipped { .. } => {}
+        AdmissionOutcome::Timeout { detail } => {
+            if host_contention.mode == HostContentionMode::Refuse {
+                return Ok(vec![MatrixFailureKind::HostContention { detail }]);
+            }
+            eprintln!("[warn] host contention admission timed out: {detail}");
+        }
+    }
+
+    let pre = sample_host();
+    let started = std::time::Instant::now();
+
     if let Some(privilege) = context.netns
         && let Err(error) = netem_args(link)
             .map_err(std::io::Error::other)
@@ -2718,7 +2800,24 @@ fn run_scheduled_cell(
             }]);
         }
     };
-    run_matrix_processes(context, port)
+    let mut failures = run_matrix_processes(context, port)?;
+    let post = sample_host();
+    let evidence = evaluate(host_contention, &pre, &post, started.elapsed());
+    if evidence.status == HostContentionStatus::Contended {
+        let detail = format!(
+            "mid-cell signals={} cpu_pre={} cpu_post={} stall_pct={} steal_pct={}",
+            evidence.signals_joined(),
+            evidence.cpu_psi_some_avg10_pre,
+            evidence.cpu_psi_some_avg10_post,
+            evidence.cpu_psi_stall_pct,
+            evidence.steal_pct,
+        );
+        eprintln!("[warn] host contention: {detail}");
+        if host_contention.mode == HostContentionMode::Refuse {
+            failures.push(MatrixFailureKind::HostContention { detail });
+        }
+    }
+    Ok(failures)
 }
 
 /// Run the cartesian product of the requested axes, one receiver/sender
@@ -2765,6 +2864,15 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<MatrixReport> {
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     let policy_argv = crate::classifier::policy_argv(&policy);
     let policy_fingerprint = policy.fingerprint();
+    let host_contention = crate::host_contention::policy_from_cli(cli)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let host_contention_argv = crate::host_contention::policy_argv(&host_contention);
+    let host_contention_fingerprint = host_contention.fingerprint();
+    eprintln!(
+        "matrix: host-contention mode={} fingerprint={}",
+        host_contention.mode.as_str(),
+        host_contention_fingerprint
+    );
 
     let plan = resolve_plan_cells(cli)?;
     let axes = plan.axes();
@@ -2798,6 +2906,7 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<MatrixReport> {
         seed,
         out: &out,
         policy_fingerprint: &policy_fingerprint,
+        host_contention_fingerprint: &host_contention_fingerprint,
     })?;
     let invocation_nonce = new_invocation_nonce()?;
 
@@ -2822,6 +2931,8 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<MatrixReport> {
         receiver_exe: &receiver_exe,
         netns,
         policy_argv: &policy_argv,
+        host_contention: &host_contention,
+        host_contention_argv: &host_contention_argv,
     })?;
     if let Some(p) = netns {
         netns_down(p);
@@ -3854,6 +3965,7 @@ mod matrix_filter_tests {
             seed: 0,
             out: &path,
             policy_fingerprint: "",
+            host_contention_fingerprint: "",
         })
         .unwrap();
         assert_eq!(default.total, 4);
@@ -3873,6 +3985,7 @@ mod matrix_filter_tests {
             seed: 0,
             out: &path,
             policy_fingerprint: "",
+            host_contention_fingerprint: "",
         })
         .unwrap();
         let expected = [(0, 1), (0, 2), (1, 1), (1, 2)]
@@ -3896,6 +4009,7 @@ mod matrix_filter_tests {
             seed: 7,
             out: &path,
             policy_fingerprint: "",
+            host_contention_fingerprint: "",
         })
         .unwrap();
         let random_b = build_matrix_schedule(ScheduleInputs {
@@ -3906,6 +4020,7 @@ mod matrix_filter_tests {
             seed: 7,
             out: &path,
             policy_fingerprint: "",
+            host_contention_fingerprint: "",
         })
         .unwrap();
         assert_eq!(random_a.runs, random_b.runs);
@@ -3932,6 +4047,7 @@ mod matrix_filter_tests {
             seed: 0,
             out: &path,
             policy_fingerprint: "",
+            host_contention_fingerprint: "",
         })
         .unwrap();
         assert!(schedule.done.contains(&cell_key(&cells[0], 1)));
@@ -3948,6 +4064,7 @@ mod matrix_filter_tests {
             seed: 0,
             out: &orphan_path,
             policy_fingerprint: "",
+            host_contention_fingerprint: "",
         })
         .unwrap();
         assert!(orphaned.done.is_empty());
@@ -3973,6 +4090,7 @@ mod matrix_filter_tests {
             seed: 0,
             out: &path,
             policy_fingerprint: "policy-a",
+            host_contention_fingerprint: "",
         })
         .unwrap();
         assert!(same.done.contains(&cell_key(&cells[0], 1)));
@@ -3988,6 +4106,7 @@ mod matrix_filter_tests {
             seed: 0,
             out: &path,
             policy_fingerprint: "policy-b",
+            host_contention_fingerprint: "",
         })
         .unwrap();
         assert!(

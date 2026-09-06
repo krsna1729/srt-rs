@@ -5,6 +5,7 @@ pub mod compare;
 pub mod cpu_stats;
 pub mod driver;
 pub mod harness;
+pub mod host_contention;
 pub mod model;
 pub mod queue;
 pub mod scheduling;
@@ -421,6 +422,9 @@ pub struct BenchConfig {
     pub link: Link,
     /// Exact classifier policy used for the pre-run result row.
     pub classifier_policy: crate::model::ClassifierPolicy,
+    /// Host-contention admission/evidence policy. Separate from the
+    /// canonical clean predicate: contention is an environment fact.
+    pub host_contention: crate::host_contention::HostContentionPolicy,
 }
 
 /// Role-scoped values for axes the harness split, as recorded in results.
@@ -2647,7 +2651,8 @@ fn usage() -> ! {
          [--egress per-connection|shared-socket] \
          [--encryption plain|128|192|256] \
          [--bond broadcast:G|backup:G|none] [--batch on|off] \
-         [--connect-concurrency N] [--recv-rounds N] [--would-block retain|drop] [--promotion never|relocate|bonded|all] [--cookie-routing on|off] [--sock-buf N|Nk|Nm|default] [--out FILE] [--cpus 0-3|0,2,4] [--pin on|off] [--workers N] [--link-delay 25ms] [--link-jitter 5ms] [--link-loss 1%] [--link-rate 100mbit]"
+         [--connect-concurrency N] [--recv-rounds N] [--would-block retain|drop] [--promotion never|relocate|bonded|all] [--cookie-routing on|off] [--sock-buf N|Nk|Nm|default] [--out FILE] [--cpus 0-3|0,2,4] [--pin on|off] [--workers N] [--link-delay 25ms] [--link-jitter 5ms] [--link-loss 1%] [--link-rate 100mbit] \
+         [--host-contention refuse|mark|allow] [--allow-host-contention]"
     );
     std::process::exit(2)
 }
@@ -2962,6 +2967,9 @@ pub fn bench_config_from_args() -> BenchConfig {
     // Capture kernel UDP counters before any socket exists, so every
     // later read is a delta for this run alone.
     let _ = crate::cpu_stats::udp_baseline();
+    // Same for host contention: a before/after delta needs a start sample
+    // taken before the workload, not at result-write time.
+    let _ = crate::host_contention::baseline();
 
     let args: Vec<String> = std::env::args().collect();
     let cli = Cli::parse(&args);
@@ -2998,6 +3006,10 @@ pub fn bench_config_from_args() -> BenchConfig {
     let peer_topology = parse_peer_topology(&cli);
     let link = parse_link(&cli);
     let classifier_policy = crate::classifier::policy_from_cli(&cli).unwrap_or_else(|error| {
+        eprintln!("error: {error}");
+        usage()
+    });
+    let host_contention = crate::host_contention::policy_from_cli(&cli).unwrap_or_else(|error| {
         eprintln!("error: {error}");
         usage()
     });
@@ -3051,6 +3063,7 @@ pub fn bench_config_from_args() -> BenchConfig {
         peer_topology,
         link,
         classifier_policy,
+        host_contention,
     };
     if let Err(error) = config.validate_bond_topology() {
         eprintln!("error: {error}");
@@ -3139,6 +3152,7 @@ mod tests {
             peer_topology: PeerTopology::default(),
             link: Link::default(),
             classifier_policy: crate::model::ClassifierPolicy::default(),
+            host_contention: crate::host_contention::HostContentionPolicy::default(),
         }
     }
 
