@@ -258,17 +258,22 @@ pub struct ConnectionOptions {
     /// packets still held by the protocol receiver. This prevents an
     /// application that stops polling events from creating an unbounded queue.
     pub delivery_queue_packets: u32,
-    /// Full ACK period in microseconds (Haivision `COMM_SYN` default 10 ms).
+    /// Full ACK period in microseconds (Haivision `COMM_SYN` / RFC §3.2.4
+    /// default 10 ms).
     ///
     /// Clamped to [`crate::MIN_ACK_INTERVAL_MICROS`]..=[`crate::MAX_ACK_INTERVAL_MICROS`]
-    /// when the connection is constructed. Per-connection, not process-global.
-    /// High-fan-in recommendation: [`crate::HIGH_FANIN_ACK_INTERVAL_MICROS`].
+    /// (10–40 ms) when the connection is constructed. Per-connection, not
+    /// process-global. Values above 10 ms are **non-default /
+    /// non-RFC-recommended** coalesce and do not retarget NAK/EXP.
+    /// High-fan-in evidence target: [`crate::HIGH_FANIN_ACK_INTERVAL_MICROS`].
     pub ack_interval_micros: u64,
-    /// Light ACK packet cadence (Haivision/RFC recommendation: 64).
+    /// Light ACK packet cadence (Haivision `SELF_CLOCK_INTERVAL` / RFC
+    /// recommendation: 64).
     ///
     /// Clamped to [`crate::MIN_LIGHT_ACK_INTERVAL_PACKETS`]..=[`crate::MAX_LIGHT_ACK_INTERVAL_PACKETS`]
-    /// when the connection is constructed. Also guarded at emit time to at
-    /// most a quarter of the receive window.
+    /// (64–256) when the connection is constructed. Values above 64 are
+    /// **non-default / non-RFC-recommended** coalesce. A receive window
+    /// smaller than 64 packets does not Light-ACK; full ACK is the path.
     pub light_ack_interval_packets: u32,
 }
 
@@ -2304,8 +2309,8 @@ impl SrtConnection {
             duration_micros: KEEPALIVE_INTERVAL_MICROS,
         });
 
-        // ACK timer: COMM_SYN (10ms) for TSBPD/TLPKTDROP, or faster if the
-        // configured full-ACK interval is below COMM_SYN.
+        // ACK timer always ticks at COMM_SYN (10 ms) for TSBPD/TLPKTDROP.
+        // Coalesced ACK only skips sendto on intermediate ticks.
         self.output_queue.push_back(ConnectionOutput::SetTimer {
             id: TimerId::Ack,
             duration_micros: self.ack_timer_tick_micros(),

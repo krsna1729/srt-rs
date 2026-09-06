@@ -271,10 +271,14 @@ pub struct BenchConfig {
     /// outbound send yields. Same rule, against socket fan-out.
     pub outbound_retry_horizon_ms: u64,
     /// Full ACK period applied to every connection this process creates.
-    /// Default is Haivision `COMM_SYN` (10 ms). Contabo 4× cell: 40_000.
+    /// Default and floor is Haivision `COMM_SYN` (10 ms). Values above
+    /// that (ceiling 40 ms) are non-RFC-recommended coalesce. Contabo 4×
+    /// evidence cell: 40_000 — not the default.
     pub ack_interval_micros: u64,
     /// Light ACK packet cadence applied to every connection this process
-    /// creates. Default is 64. Contabo 4× cell: 256.
+    /// creates. Default and floor is 64. Values above that (ceiling 256)
+    /// are non-RFC-recommended coalesce. Contabo 4× evidence cell: 256 —
+    /// not the default.
     pub light_ack_interval_packets: u32,
     pub connections: usize,
     /// Caller-side UDP socket topology. `PerConnection` gives every SRT
@@ -2911,7 +2915,8 @@ fn parse_ack_interval_micros(cli: &Cli) -> u64 {
             _ => {
                 eprintln!(
                     "error: --ack-interval-micros must be {}..={} (got '{raw}'); \
-                     Haivision COMM_SYN default is {}, high-fan-in 4× cell is {}",
+                     Haivision COMM_SYN default and floor is {}, Contabo 4× evidence \
+                     ceiling is {} (values above the default are non-RFC-recommended coalesce)",
                     shiguredo_srt::MIN_ACK_INTERVAL_MICROS,
                     shiguredo_srt::MAX_ACK_INTERVAL_MICROS,
                     shiguredo_srt::ACK_INTERVAL_MICROS,
@@ -2941,7 +2946,8 @@ fn parse_light_ack_interval_packets(cli: &Cli) -> u32 {
             _ => {
                 eprintln!(
                     "error: --light-ack-interval-packets must be {}..={} (got '{raw}'); \
-                     Haivision/RFC default is {}, high-fan-in 4× cell is {}",
+                     Haivision/RFC default and floor is {}, Contabo 4× evidence \
+                     ceiling is {} (values above the default are non-RFC-recommended coalesce)",
                     shiguredo_srt::MIN_LIGHT_ACK_INTERVAL_PACKETS,
                     shiguredo_srt::MAX_LIGHT_ACK_INTERVAL_PACKETS,
                     shiguredo_srt::LIGHT_ACK_INTERVAL_PACKETS,

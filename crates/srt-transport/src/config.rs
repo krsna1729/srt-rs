@@ -760,13 +760,16 @@ impl SessionConfig {
         self
     }
 
-    /// Full ACK period. Default is Haivision `COMM_SYN` (10 ms).
+    /// Full ACK period. Default is Haivision `COMM_SYN` / RFC §3.2.4 (10 ms).
     ///
-    /// Accepted range is [`shiguredo_srt::MIN_ACK_INTERVAL_MICROS`]..=
-    /// [`shiguredo_srt::MAX_ACK_INTERVAL_MICROS`]. Coalescing ACKs does not
-    /// coarsen TSBPD/TLPKTDROP: the protocol timer still ticks at `COMM_SYN`
-    /// when the interval is longer than 10 ms. High-fan-in listeners can use
-    /// [`shiguredo_srt::HIGH_FANIN_ACK_INTERVAL_MICROS`] (40 ms).
+    /// Accepted range is 10–40 ms
+    /// ([`shiguredo_srt::MIN_ACK_INTERVAL_MICROS`]..=
+    /// [`shiguredo_srt::MAX_ACK_INTERVAL_MICROS`]). Values above 10 ms are
+    /// **non-default / non-RFC-recommended** coalesce and do not retarget
+    /// NAK/EXP. Coalescing ACKs does not coarsen TSBPD/TLPKTDROP: the
+    /// protocol timer still ticks at `COMM_SYN`. High-fan-in evidence
+    /// target: [`shiguredo_srt::HIGH_FANIN_ACK_INTERVAL_MICROS`] (40 ms) —
+    /// not a new default.
     pub fn set_ack_interval(&mut self, interval: Duration) -> Result<&mut Self, ConfigError> {
         let micros = duration_micros_u64(interval);
         if !(shiguredo_srt::MIN_ACK_INTERVAL_MICROS..=shiguredo_srt::MAX_ACK_INTERVAL_MICROS)
@@ -775,7 +778,8 @@ impl SessionConfig {
             return Err(ConfigError::new(
                 "session.ack_interval",
                 format!(
-                    "must be {}..={} microseconds (Haivision COMM_SYN default is {})",
+                    "must be {}..={} microseconds (Haivision COMM_SYN default and floor is {}; \
+                     values above that are non-RFC-recommended coalesce)",
                     shiguredo_srt::MIN_ACK_INTERVAL_MICROS,
                     shiguredo_srt::MAX_ACK_INTERVAL_MICROS,
                     shiguredo_srt::ACK_INTERVAL_MICROS
@@ -786,12 +790,16 @@ impl SessionConfig {
         Ok(self)
     }
 
-    /// Light ACK packet cadence. Default is the Haivision/RFC recommendation (64).
+    /// Light ACK packet cadence. Default is Haivision `SELF_CLOCK_INTERVAL`
+    /// / RFC recommendation (64).
     ///
-    /// Accepted range is [`shiguredo_srt::MIN_LIGHT_ACK_INTERVAL_PACKETS`]..=
-    /// [`shiguredo_srt::MAX_LIGHT_ACK_INTERVAL_PACKETS`]. High-fan-in
-    /// listeners can use [`shiguredo_srt::HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS`]
-    /// (256).
+    /// Accepted range is 64–256
+    /// ([`shiguredo_srt::MIN_LIGHT_ACK_INTERVAL_PACKETS`]..=
+    /// [`shiguredo_srt::MAX_LIGHT_ACK_INTERVAL_PACKETS`]). Values above 64
+    /// are **non-default / non-RFC-recommended** coalesce. High-fan-in
+    /// evidence target:
+    /// [`shiguredo_srt::HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS`] (256) — not
+    /// a new default.
     pub fn set_light_ack_interval_packets(
         &mut self,
         packets: u32,
@@ -803,7 +811,8 @@ impl SessionConfig {
             return Err(ConfigError::new(
                 "session.light_ack_interval_packets",
                 format!(
-                    "must be {}..={} packets (Haivision/RFC default is {})",
+                    "must be {}..={} packets (Haivision/RFC default and floor is {}; \
+                     values above that are non-RFC-recommended coalesce)",
                     shiguredo_srt::MIN_LIGHT_ACK_INTERVAL_PACKETS,
                     shiguredo_srt::MAX_LIGHT_ACK_INTERVAL_PACKETS,
                     shiguredo_srt::LIGHT_ACK_INTERVAL_PACKETS
@@ -883,7 +892,8 @@ impl SessionConfig {
             return Err(ConfigError::new(
                 "session.ack_interval",
                 format!(
-                    "must be {}..={} microseconds",
+                    "must be {}..={} microseconds (Haivision COMM_SYN default and floor; \
+                     values above that are non-RFC-recommended coalesce)",
                     shiguredo_srt::MIN_ACK_INTERVAL_MICROS,
                     shiguredo_srt::MAX_ACK_INTERVAL_MICROS
                 ),
@@ -896,7 +906,8 @@ impl SessionConfig {
             return Err(ConfigError::new(
                 "session.light_ack_interval_packets",
                 format!(
-                    "must be {}..={} packets",
+                    "must be {}..={} packets (Haivision/RFC default and floor; \
+                     values above that are non-RFC-recommended coalesce)",
                     shiguredo_srt::MIN_LIGHT_ACK_INTERVAL_PACKETS,
                     shiguredo_srt::MAX_LIGHT_ACK_INTERVAL_PACKETS
                 ),
@@ -2237,12 +2248,20 @@ mod tests {
         );
 
         let error = session
+            .set_ack_interval(Duration::from_millis(1))
+            .expect_err("1ms is below the COMM_SYN floor");
+        assert_eq!(error.field(), "session.ack_interval");
+        let error = session
             .set_ack_interval(Duration::from_millis(250))
-            .expect_err("250ms is above the RTT-sample ceiling");
+            .expect_err("250ms is above the Contabo 4× ceiling");
         assert_eq!(error.field(), "session.ack_interval");
         let error = session
             .set_light_ack_interval_packets(4)
-            .expect_err("below the coalesce floor");
+            .expect_err("below the Haivision/RFC floor");
+        assert_eq!(error.field(), "session.light_ack_interval_packets");
+        let error = session
+            .set_light_ack_interval_packets(1024)
+            .expect_err("above the Contabo 4× ceiling");
         assert_eq!(error.field(), "session.light_ack_interval_packets");
     }
 }

@@ -56,9 +56,12 @@ srt-bench runtime=<mio|tokio|smol|monoio|glommio|compio> \
   one connection, scale runs N; only the STATS schema differs.
 - Receiver prints `LISTENING` when its sockets are bound.
 - ACK coalesce defaults to Haivision `COMM_SYN` (10 ms) / Light ACK every 64
-  packets. For a high-fan-in listener rematch of the issue #30 Contabo 4×
-  cell, both roles take `--ack-interval-micros 40000 --light-ack-interval-packets 256`.
-  The knobs are per-connection options, not process-global env vars.
+  packets (RFC draft-sharabayko-srt §3.2.4). Optional coalesce is **10–40 ms
+  / 64–256** and is **non-default / non-RFC-recommended**. For a high-fan-in
+  rematch of the issue #30 Contabo 4× cell (comment 5560077515), both roles
+  take `--ack-interval-micros 40000 --light-ack-interval-packets 256`.
+  That cell is the evidence target, **not** the product default. The knobs
+  are per-connection options, not process-global env vars.
 
 ### Sweeping, reporting, profiling
 
