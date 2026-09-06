@@ -155,6 +155,7 @@ pub fn run(cfg: BenchConfig) {
     }
     match cfg.runtime {
         Runtime::Mio => mio::run(cfg),
+        Runtime::A2 => mio::run_a2(cfg),
         Runtime::Tokio => tokio::run(cfg),
         Runtime::Smol => smol::run(cfg),
         Runtime::Monoio => monoio::run(cfg),

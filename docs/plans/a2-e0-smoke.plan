@@ -1,0 +1,29 @@
+# E0 smoke: A2 HighResWaiter generation validation (PR #86).
+# 8 Mbit/s ≈ 760 pps, ~15 s, quiet host, recv CPUs 0-2 / send 3-5.
+# N=1 and N=30 only. Check generated ≈ 760 × secs × N within ~0.5%.
+
+runtime             = mio
+send-runtime        = a2
+recv-runtime        = mio
+connections         = 1,30
+bitrate             = 8000000
+srt-bandwidth       = input-relative:25
+ingress             = shared-pool:4
+egress              = per-connection
+encryption          = plain
+promotion           = all
+cookie-routing      = on
+batch               = on
+sock-buf            = 16m
+bond                = none
+connect-concurrency = 50
+pin                 = off
+source-backlog-ms   = 1000
+
+[recv]
+workers             = 3
+cpus                = 0-2
+
+[send]
+workers             = 3
+cpus                = 3-5

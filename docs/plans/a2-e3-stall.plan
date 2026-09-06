@@ -1,0 +1,26 @@
+# E3: injected stall robustness on A2 N=1 ir:25 (P≈1065.6 us).
+
+recv-runtime        = mio
+send-runtime        = a2
+connections         = 1
+bitrate             = 8000000
+srt-bandwidth       = input-relative:25
+ingress             = shared-pool:4
+egress              = per-connection
+encryption          = plain
+promotion           = all
+cookie-routing      = on
+batch               = on
+sock-buf            = 16m
+bond                = none
+connect-concurrency = 50
+pin                 = off
+source-backlog-ms   = 1000
+
+[recv]
+workers             = 3
+cpus                = 0-2
+
+[send]
+workers             = 3
+cpus                = 3-5

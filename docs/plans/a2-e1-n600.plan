@@ -1,0 +1,26 @@
+# E1 continuation: A2 vs Tokio N=600 (only because N=200 generation was valid).
+
+recv-runtime        = mio
+send-runtime        = a2,tokio
+connections         = 600
+bitrate             = 8000000
+srt-bandwidth       = input-relative:25,fixed:100000000
+ingress             = shared-pool:4
+egress              = per-connection
+encryption          = plain
+promotion           = all
+cookie-routing      = on
+batch               = on
+sock-buf            = 16m
+bond                = none
+connect-concurrency = 50
+pin                 = off
+source-backlog-ms   = 1000
+
+[recv]
+workers             = 3
+cpus                = 0-2
+
+[send]
+workers             = 3
+cpus                = 3-5
