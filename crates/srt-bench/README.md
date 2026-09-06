@@ -263,7 +263,8 @@ datapath_q_total_cap  datapath_q_peak_depth_max  datapath_q_peak_depth_sum
 datapath_q_full  datapath_q_dropped  datapath_q_disconnected
 recv_packets  recv_syscalls  datagrams_per_syscall  timer_late_p50_bucket_us
 timer_late_p95_bucket_us  timer_late_p99_bucket_us  timer_late_max_us
-retry_horizon_ms  retry_count  retry_cap_per_queue  retry_total_cap
+retry_horizon_ms  ack_interval_micros  light_ack_interval_packets
+retry_count  retry_cap_per_queue  retry_total_cap
 retry_peak_depth_max  would_block  retry_overflow  local_dropped
 ```
 

@@ -74,6 +74,14 @@ fn recorded_cell_values(runtime: &str) -> Vec<(&'static str, String)> {
         ),
         ("datapath_q_horizon_ms", "250".into()),
         ("retry_horizon_ms", "250".into()),
+        (
+            "ack_interval_micros",
+            shiguredo_srt::ACK_INTERVAL_MICROS.to_string(),
+        ),
+        (
+            "light_ack_interval_packets",
+            shiguredo_srt::LIGHT_ACK_INTERVAL_PACKETS.to_string(),
+        ),
         ("pin", "off".into()),
         ("conns", "1".into()),
         ("connect_cc", "1".into()),
@@ -109,6 +117,14 @@ fn pinning_flags(runtimes: &str) -> Vec<String> {
         "--would-block=retain".into(),
         "--datapath-queue-horizon-ms=250".into(),
         "--outbound-retry-horizon-ms=250".into(),
+        format!(
+            "--ack-interval-micros={}",
+            shiguredo_srt::ACK_INTERVAL_MICROS
+        ),
+        format!(
+            "--light-ack-interval-packets={}",
+            shiguredo_srt::LIGHT_ACK_INTERVAL_PACKETS
+        ),
     ]
     .into_iter()
     .collect()

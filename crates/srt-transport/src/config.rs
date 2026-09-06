@@ -854,6 +854,37 @@ impl SessionConfig {
             })
     }
 
+    fn validate_ack_coalesce(&self) -> Result<(), ConfigError> {
+        if !(shiguredo_srt::MIN_ACK_INTERVAL_MICROS..=shiguredo_srt::MAX_ACK_INTERVAL_MICROS)
+            .contains(&self.connection.ack_interval_micros)
+        {
+            return Err(ConfigError::new(
+                "session.ack_interval",
+                format!(
+                    "must be {}..={} microseconds (Haivision COMM_SYN default and floor; \
+                     values above that are non-RFC-recommended coalesce)",
+                    shiguredo_srt::MIN_ACK_INTERVAL_MICROS,
+                    shiguredo_srt::MAX_ACK_INTERVAL_MICROS
+                ),
+            ));
+        }
+        if !(shiguredo_srt::MIN_LIGHT_ACK_INTERVAL_PACKETS
+            ..=shiguredo_srt::MAX_LIGHT_ACK_INTERVAL_PACKETS)
+            .contains(&self.connection.light_ack_interval_packets)
+        {
+            return Err(ConfigError::new(
+                "session.light_ack_interval_packets",
+                format!(
+                    "must be {}..={} packets (Haivision/RFC default and floor; \
+                     values above that are non-RFC-recommended coalesce)",
+                    shiguredo_srt::MIN_LIGHT_ACK_INTERVAL_PACKETS,
+                    shiguredo_srt::MAX_LIGHT_ACK_INTERVAL_PACKETS
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.bandwidth().validate("session.bandwidth")?;
         if self.connection.flow_window_packets == 0 {
@@ -886,33 +917,7 @@ impl SessionConfig {
                 "must not exceed the receive buffer",
             ));
         }
-        if !(shiguredo_srt::MIN_ACK_INTERVAL_MICROS..=shiguredo_srt::MAX_ACK_INTERVAL_MICROS)
-            .contains(&self.connection.ack_interval_micros)
-        {
-            return Err(ConfigError::new(
-                "session.ack_interval",
-                format!(
-                    "must be {}..={} microseconds (Haivision COMM_SYN default and floor; \
-                     values above that are non-RFC-recommended coalesce)",
-                    shiguredo_srt::MIN_ACK_INTERVAL_MICROS,
-                    shiguredo_srt::MAX_ACK_INTERVAL_MICROS
-                ),
-            ));
-        }
-        if !(shiguredo_srt::MIN_LIGHT_ACK_INTERVAL_PACKETS
-            ..=shiguredo_srt::MAX_LIGHT_ACK_INTERVAL_PACKETS)
-            .contains(&self.connection.light_ack_interval_packets)
-        {
-            return Err(ConfigError::new(
-                "session.light_ack_interval_packets",
-                format!(
-                    "must be {}..={} packets (Haivision/RFC default and floor; \
-                     values above that are non-RFC-recommended coalesce)",
-                    shiguredo_srt::MIN_LIGHT_ACK_INTERVAL_PACKETS,
-                    shiguredo_srt::MAX_LIGHT_ACK_INTERVAL_PACKETS
-                ),
-            ));
-        }
+        self.validate_ack_coalesce()?;
         if self
             .connection
             .stream_id

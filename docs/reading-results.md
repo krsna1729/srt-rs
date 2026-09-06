@@ -20,7 +20,8 @@ instead of a hunch.
 would_block_policy sock_buf_requested_bytes sock_*_effective_*_bytes cpus pin
 link_* workers recv_* send_* conns
 logical_streams source_streams connect_cc bond source_bps srt_bw_mode
-source_backlog_ms datapath_q_horizon_ms retry_horizon_ms rep secs` — the axes
+source_backlog_ms datapath_q_horizon_ms retry_horizon_ms
+ack_interval_micros light_ack_interval_packets rep secs` — the axes
 the cell was run at. `cpus` is the role's effective affinity mask;
 `recv_cpus` / `send_cpus` preserve the requested split-role placement on both
 rows. `encryption`
