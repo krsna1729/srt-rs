@@ -1,11 +1,11 @@
 use crate::{
-    ManualTimerStore, OutputDrainBudget, OutputDrainReport, OutputDrainStatus, collect_output_work,
-    prepend_outputs,
+    BatchIoStats, ManualTimerStore, OutputDrainBudget, OutputDrainReport, drain_connected_outputs,
+    sendmsg_connected_batch,
 };
-use libc;
 use shiguredo_srt::{ConnectionOutput, SrtConnection, Timestamp};
 use std::collections::VecDeque;
 use std::io;
+use std::os::fd::AsRawFd;
 use std::time::Duration;
 
 /// Per-connection state for mio: protocol + owned socket + manual timers.
@@ -14,6 +14,7 @@ pub struct Conn {
     pub socket: mio::net::UdpSocket,
     pub timers: ManualTimerStore,
     pending_outputs: VecDeque<ConnectionOutput>,
+    io_stats: BatchIoStats,
 }
 
 impl Conn {
@@ -23,6 +24,7 @@ impl Conn {
             socket,
             timers: ManualTimerStore::new(),
             pending_outputs: VecDeque::new(),
+            io_stats: BatchIoStats::default(),
         }
     }
 
@@ -46,14 +48,16 @@ impl Conn {
         now: Timestamp,
         budget: OutputDrainBudget,
     ) -> io::Result<OutputDrainReport> {
-        drain_outputs_with(
+        let report = drain_connected_outputs(
             &mut self.conn,
             &mut self.timers,
             &mut self.pending_outputs,
             now,
             budget,
-            |batch| Self::send_batch(&self.socket, batch),
-        )
+            |batch| sendmsg_connected_batch(self.socket.as_raw_fd(), batch),
+        )?;
+        self.io_stats.record_send(&report);
+        Ok(report)
     }
 
     #[must_use]
@@ -61,58 +65,9 @@ impl Conn {
         !self.pending_outputs.is_empty()
     }
 
-    /// mmsghdr/iovec scratch, reused across calls on this thread
-    /// (hot path: `drain_outputs` runs every event-loop tick per
-    /// connection). Capacity stabilizes at the batch cap (32) after
-    /// the first few calls, giving zero-allocation steady state --
-    /// mirrors `recvmsg_batch`'s scratch in srt-bench.
-    fn send_batch(socket: &mio::net::UdpSocket, batch: &[Vec<u8>]) -> io::Result<usize> {
-        use std::cell::RefCell;
-        thread_local! {
-            static SCRATCH: RefCell<(Vec<libc::mmsghdr>, Vec<libc::iovec>)> =
-                const { RefCell::new((Vec::new(), Vec::new())) };
-        }
-        if batch.is_empty() {
-            return Ok(0);
-        }
-        SCRATCH.with(|scratch| {
-            let (msgs, iovs) = &mut *scratch.borrow_mut();
-            msgs.clear();
-            iovs.clear();
-            for buf in batch.iter() {
-                iovs.push(libc::iovec {
-                    iov_base: buf.as_ptr() as *mut _,
-                    iov_len: buf.len(),
-                });
-                msgs.push(libc::mmsghdr {
-                    // SAFETY: all-zero is a valid empty `msghdr`; the
-                    // iovec pointer and count are assigned below.
-                    msg_hdr: unsafe { std::mem::zeroed() },
-                    msg_len: 0,
-                });
-            }
-            for (msg, iov) in msgs.iter_mut().zip(iovs.iter()) {
-                msg.msg_hdr.msg_iov = iov as *const _ as *mut _;
-                msg.msg_hdr.msg_iovlen = 1;
-            }
-            let fd = {
-                use std::os::fd::AsRawFd;
-                socket.as_raw_fd()
-            };
-            let count = u32::try_from(batch.len()).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "send batch exceeds u32")
-            })?;
-            // SAFETY: `msgs` and `iovs` have exactly `batch.len()` live
-            // elements. Each iovec points into an immutable packet Vec
-            // that outlives this synchronous syscall; pointers are set
-            // only after both scratch vectors finish growing.
-            let sent = unsafe { libc::sendmmsg(fd, msgs.as_mut_ptr(), count, libc::MSG_DONTWAIT) };
-            if sent < 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(sent as usize)
-            }
-        })
+    #[must_use]
+    pub fn io_stats(&self) -> BatchIoStats {
+        self.io_stats
     }
 
     /// Compute poll timeout from next timer deadline.
@@ -147,269 +102,4 @@ pub fn caller(
     let prepared = config.prepare(crate::RuntimeFlavor::Mio)?;
     let socket = mio::net::UdpSocket::from_std(prepared.bind_socket()?);
     Ok(Conn::new(prepared.connection(now)?, socket))
-}
-
-fn collect_packet_batch(work: &mut VecDeque<ConnectionOutput>, first: Vec<u8>) -> Vec<Vec<u8>> {
-    let mut batch = vec![first];
-    while matches!(work.front(), Some(ConnectionOutput::SendPacket(_))) {
-        let Some(ConnectionOutput::SendPacket(packet)) = work.pop_front() else {
-            unreachable!();
-        };
-        batch.push(packet);
-    }
-    batch
-}
-
-fn requeue_packet_work(
-    pending: &mut VecDeque<ConnectionOutput>,
-    work: VecDeque<ConnectionOutput>,
-    batch: Vec<Vec<u8>>,
-    sent: usize,
-) {
-    prepend_outputs(pending, work.into_iter());
-    prepend_outputs(
-        pending,
-        batch
-            .into_iter()
-            .skip(sent)
-            .map(ConnectionOutput::SendPacket),
-    );
-}
-
-fn send_packet_batch<F>(
-    batch: Vec<Vec<u8>>,
-    work: &mut VecDeque<ConnectionOutput>,
-    pending: &mut VecDeque<ConnectionOutput>,
-    report: &mut OutputDrainReport,
-    mut send_batch: F,
-) -> io::Result<bool>
-where
-    F: FnMut(&[Vec<u8>]) -> io::Result<usize>,
-{
-    match send_batch(&batch) {
-        Ok(sent) if sent <= batch.len() => {
-            report.actions += sent;
-            report.packets += sent;
-            report.bytes += batch[..sent].iter().map(Vec::len).sum::<usize>();
-            if sent < batch.len() {
-                requeue_packet_work(pending, std::mem::take(work), batch, sent);
-                report.status = OutputDrainStatus::Backpressured;
-                return Ok(false);
-            }
-        }
-        Ok(_) => {
-            requeue_packet_work(pending, std::mem::take(work), batch, 0);
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "sendmmsg reported more datagrams than supplied",
-            ));
-        }
-        Err(error) => {
-            requeue_packet_work(pending, std::mem::take(work), batch, 0);
-            if error.kind() == io::ErrorKind::WouldBlock {
-                report.status = OutputDrainStatus::Backpressured;
-                return Ok(false);
-            }
-            return Err(error);
-        }
-    }
-    Ok(true)
-}
-
-fn drain_outputs_with<F>(
-    conn: &mut SrtConnection,
-    timers: &mut ManualTimerStore,
-    pending: &mut VecDeque<ConnectionOutput>,
-    now: Timestamp,
-    budget: OutputDrainBudget,
-    mut send_batch: F,
-) -> io::Result<OutputDrainReport>
-where
-    F: FnMut(&[Vec<u8>]) -> io::Result<usize>,
-{
-    let (mut work, budget_exhausted) = collect_output_work(conn, pending, budget);
-    let mut report = OutputDrainReport {
-        status: if budget_exhausted {
-            OutputDrainStatus::BudgetExhausted
-        } else {
-            OutputDrainStatus::Drained
-        },
-        ..OutputDrainReport::default()
-    };
-
-    while let Some(output) = work.pop_front() {
-        match output {
-            ConnectionOutput::SendPacket(packet) => {
-                let batch = collect_packet_batch(&mut work, packet);
-                if !send_packet_batch(batch, &mut work, pending, &mut report, &mut send_batch)? {
-                    return Ok(report);
-                }
-            }
-            timer => {
-                timers.apply_output(&timer, now);
-                report.actions += 1;
-            }
-        }
-    }
-
-    Ok(report)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{drain_outputs_with, send_packet_batch};
-    use crate::*;
-    use shiguredo_srt::{ConnectionOptions, ConnectionOutput, TimerId, Timestamp};
-    use std::collections::VecDeque;
-    use std::io;
-
-    fn caller_with_output() -> SrtConnection {
-        let mut conn = SrtConnection::new_caller(ConnectionOptions::default());
-        conn.connect(Timestamp::from_micros(0))
-            .expect("connect starts");
-        conn
-    }
-
-    #[test]
-    fn would_block_retains_packet_and_following_timer() {
-        let mut conn = caller_with_output();
-        let mut timers = ManualTimerStore::new();
-        let mut pending = VecDeque::new();
-        let mut attempts = 0;
-        let report = drain_outputs_with(
-            &mut conn,
-            &mut timers,
-            &mut pending,
-            Timestamp::from_micros(0),
-            OutputDrainBudget::default(),
-            |_| {
-                attempts += 1;
-                Err(io::Error::from(io::ErrorKind::WouldBlock))
-            },
-        )
-        .expect("WouldBlock is a yield, not packet loss");
-        assert_eq!(report.status, OutputDrainStatus::Backpressured);
-        assert_eq!(attempts, 1);
-        assert_eq!(pending.len(), 2);
-
-        let report = drain_outputs_with(
-            &mut conn,
-            &mut timers,
-            &mut pending,
-            Timestamp::from_micros(1),
-            OutputDrainBudget::default(),
-            |batch| Ok(batch.len()),
-        )
-        .expect("retry succeeds");
-        assert_eq!(report.status, OutputDrainStatus::Drained);
-        assert_eq!(report.packets, 1);
-        assert!(pending.is_empty());
-        assert_ne!(timers.time_until_earliest(Timestamp::from_micros(1), 0), 0);
-    }
-
-    #[test]
-    fn partial_send_retains_unsent_tail_in_order() {
-        let mut conn = SrtConnection::new_caller(ConnectionOptions::default());
-        let mut timers = ManualTimerStore::new();
-        let mut pending = VecDeque::from([
-            ConnectionOutput::SendPacket(vec![1]),
-            ConnectionOutput::SendPacket(vec![2]),
-            ConnectionOutput::SendPacket(vec![3]),
-        ]);
-        let report = drain_outputs_with(
-            &mut conn,
-            &mut timers,
-            &mut pending,
-            Timestamp::default(),
-            OutputDrainBudget::default(),
-            |_| Ok(1),
-        )
-        .expect("partial send yields");
-        assert_eq!(report.packets, 1);
-        assert_eq!(report.status, OutputDrainStatus::Backpressured);
-        assert_eq!(
-            pending.into_iter().collect::<Vec<_>>(),
-            vec![
-                ConnectionOutput::SendPacket(vec![2]),
-                ConnectionOutput::SendPacket(vec![3]),
-            ]
-        );
-    }
-
-    #[test]
-    fn packet_and_byte_budget_yields_with_tail_queued() {
-        let mut conn = SrtConnection::new_caller(ConnectionOptions::default());
-        let mut timers = ManualTimerStore::new();
-        let mut pending = VecDeque::from([
-            ConnectionOutput::SendPacket(vec![1, 1]),
-            ConnectionOutput::SendPacket(vec![2, 2]),
-        ]);
-        let report = drain_outputs_with(
-            &mut conn,
-            &mut timers,
-            &mut pending,
-            Timestamp::default(),
-            OutputDrainBudget::new(8, 8, 2),
-            |batch| Ok(batch.len()),
-        )
-        .expect("bounded send succeeds");
-
-        assert_eq!(report.status, OutputDrainStatus::BudgetExhausted);
-        assert_eq!(report.packets, 1);
-        assert_eq!(report.bytes, 2);
-        assert_eq!(
-            pending,
-            VecDeque::from([ConnectionOutput::SendPacket(vec![2, 2])])
-        );
-    }
-
-    #[test]
-    fn invalid_batch_count_requeues_packets_before_following_work() {
-        let batch = vec![vec![1], vec![2]];
-        let mut work = VecDeque::from([ConnectionOutput::ClearTimer { id: TimerId::Ack }]);
-        let mut pending = VecDeque::from([ConnectionOutput::SendPacket(vec![3])]);
-        let mut report = OutputDrainReport::default();
-
-        let error =
-            send_packet_batch(batch, &mut work, &mut pending, &mut report, |_| Ok(3)).unwrap_err();
-
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(work.is_empty());
-        assert_eq!(report, OutputDrainReport::default());
-        assert_eq!(
-            pending,
-            VecDeque::from([
-                ConnectionOutput::SendPacket(vec![1]),
-                ConnectionOutput::SendPacket(vec![2]),
-                ConnectionOutput::ClearTimer { id: TimerId::Ack },
-                ConnectionOutput::SendPacket(vec![3]),
-            ])
-        );
-    }
-
-    #[test]
-    fn non_would_block_batch_error_requeues_packets_before_following_work() {
-        let batch = vec![vec![1], vec![2]];
-        let mut work = VecDeque::from([ConnectionOutput::ClearTimer { id: TimerId::Ack }]);
-        let mut pending = VecDeque::from([ConnectionOutput::SendPacket(vec![3])]);
-        let mut report = OutputDrainReport::default();
-
-        let error = send_packet_batch(batch, &mut work, &mut pending, &mut report, |_| {
-            Err(io::Error::from(io::ErrorKind::BrokenPipe))
-        })
-        .unwrap_err();
-
-        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
-        assert!(work.is_empty());
-        assert_eq!(report, OutputDrainReport::default());
-        assert_eq!(
-            pending,
-            VecDeque::from([
-                ConnectionOutput::SendPacket(vec![1]),
-                ConnectionOutput::SendPacket(vec![2]),
-                ConnectionOutput::ClearTimer { id: TimerId::Ack },
-                ConnectionOutput::SendPacket(vec![3]),
-            ])
-        );
-    }
 }

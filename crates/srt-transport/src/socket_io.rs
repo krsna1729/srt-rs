@@ -330,9 +330,9 @@ unsafe fn sockaddr_to_addr(
 /// fewer than `batch.len()` under backpressure). Returns `Ok(0)` for an
 /// empty batch. `WouldBlock` from the kernel is returned as `Ok(0)` so
 /// callers can retry without special-casing the error.
-pub fn sendmsg_batch(
+pub fn sendmsg_batch<B: AsRef<[u8]>>(
     fd: std::os::fd::RawFd,
-    batch: &[(net::SocketAddr, &[u8])],
+    batch: &[(net::SocketAddr, B)],
 ) -> std::io::Result<usize> {
     use std::cell::RefCell;
     thread_local! {
@@ -400,6 +400,7 @@ pub fn sendmsg_batch(
             addrs[i].sin_port = v4.port().to_be();
             addrs[i].sin_addr.s_addr = u32::from(*v4.ip()).to_be();
 
+            let payload = payload.as_ref();
             iovs[i] = libc::iovec {
                 iov_base: payload.as_ptr() as *mut _,
                 iov_len: payload.len(),
@@ -414,6 +415,92 @@ pub fn sendmsg_batch(
         }
         // SAFETY: scratch arrays are `count` long, each msg points at its
         // own iov/addr. All payload slices outlive this synchronous syscall.
+        let sent = unsafe { libc::sendmmsg(fd, msgs.as_mut_ptr(), count_u32, libc::MSG_DONTWAIT) };
+        if sent < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                return Ok(0);
+            }
+            return Err(err);
+        }
+        Ok(sent as usize)
+    })
+}
+
+/// Send a batch of datagrams on a *connected* UDP socket in one `sendmmsg`.
+///
+/// Destinations are omitted (`msg_name` is null) so the kernel uses the
+/// connected peer. Returns the number of datagrams accepted (may be a
+/// prefix under backpressure). `WouldBlock` is `Ok(0)`, matching
+/// [`sendmsg_batch`].
+pub fn sendmsg_connected_batch<B: AsRef<[u8]>>(
+    fd: std::os::fd::RawFd,
+    batch: &[B],
+) -> std::io::Result<usize> {
+    use std::cell::RefCell;
+    thread_local! {
+        static SCRATCH: RefCell<ConnectedSendScratch> =
+            RefCell::new(ConnectedSendScratch::new(64));
+    }
+    struct ConnectedSendScratch {
+        msgs: Vec<libc::mmsghdr>,
+        iovs: Vec<libc::iovec>,
+    }
+    impl ConnectedSendScratch {
+        fn new(n: usize) -> Self {
+            Self {
+                // SAFETY: all-zero is a valid empty mmsghdr.
+                msgs: vec![unsafe { std::mem::zeroed() }; n],
+                iovs: vec![
+                    libc::iovec {
+                        iov_base: std::ptr::null_mut(),
+                        iov_len: 0,
+                    };
+                    n
+                ],
+            }
+        }
+        fn ensure_len(&mut self, n: usize) {
+            if self.msgs.len() >= n {
+                return;
+            }
+            // SAFETY: all-zero is a valid empty mmsghdr.
+            self.msgs.resize_with(n, || unsafe { std::mem::zeroed() });
+            self.iovs.resize_with(n, || libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 0,
+            });
+        }
+    }
+    let count = batch.len();
+    if count == 0 {
+        return Ok(0);
+    }
+    let count_u32 = u32::try_from(count).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "sendmsg_connected_batch exceeds sendmmsg count range",
+        )
+    })?;
+    SCRATCH.with(|scratch| {
+        let mut scratch = scratch.borrow_mut();
+        scratch.ensure_len(count);
+        let ConnectedSendScratch { msgs, iovs } = &mut *scratch;
+        for (i, payload) in batch.iter().enumerate() {
+            let payload = payload.as_ref();
+            iovs[i] = libc::iovec {
+                iov_base: payload.as_ptr() as *mut _,
+                iov_len: payload.len(),
+            };
+            // SAFETY: all-zero is a valid empty mmsghdr; fields are
+            // assigned immediately below. `msg_name` stays null so the
+            // connected peer is used.
+            msgs[i] = unsafe { std::mem::zeroed() };
+            msgs[i].msg_hdr.msg_iov = &mut iovs[i];
+            msgs[i].msg_hdr.msg_iovlen = 1;
+        }
+        // SAFETY: scratch arrays are `count` long, each msg points at its
+        // own iov. All payload slices outlive this synchronous syscall.
         let sent = unsafe { libc::sendmmsg(fd, msgs.as_mut_ptr(), count_u32, libc::MSG_DONTWAIT) };
         if sent < 0 {
             let err = std::io::Error::last_os_error();
@@ -525,7 +612,10 @@ mod tests {
 
     #[test]
     fn sendmsg_batch_empty_is_noop() {
-        assert_eq!(sendmsg_batch(-1, &[]).unwrap(), 0);
+        assert_eq!(
+            sendmsg_batch(-1, &[] as &[(net::SocketAddr, &[u8])]).unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -547,6 +637,37 @@ mod tests {
 
         let mut buf = [0u8; 64];
         for expected in [b"hello".as_slice(), b"world", b"!"] {
+            let n = receiver.recv(&mut buf).expect("recv");
+            assert_eq!(&buf[..n], expected);
+        }
+    }
+
+    #[test]
+    fn sendmsg_connected_batch_empty_is_noop() {
+        assert_eq!(sendmsg_connected_batch(-1, &[] as &[&[u8]]).unwrap(), 0);
+    }
+
+    #[test]
+    fn sendmsg_connected_batch_delivers_to_connected_peer() {
+        use std::os::fd::AsRawFd;
+        let receiver = net::UdpSocket::bind("127.0.0.1:0").expect("bind receiver");
+        receiver
+            .set_nonblocking(true)
+            .expect("nonblocking receiver");
+        let dest = receiver.local_addr().expect("receiver addr");
+        let sender = net::UdpSocket::bind("127.0.0.1:0").expect("bind sender");
+        sender.set_nonblocking(true).expect("nonblocking sender");
+        sender.connect(dest).expect("connect to receiver");
+
+        let sent = sendmsg_connected_batch(
+            sender.as_raw_fd(),
+            &[b"alpha".as_slice(), b"beta".as_slice(), b"gamma".as_slice()],
+        )
+        .expect("sendmsg_connected_batch");
+        assert_eq!(sent, 3);
+
+        let mut buf = [0u8; 64];
+        for expected in [b"alpha".as_slice(), b"beta", b"gamma"] {
             let n = receiver.recv(&mut buf).expect("recv");
             assert_eq!(&buf[..n], expected);
         }

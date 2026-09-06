@@ -148,13 +148,7 @@ fn force_kernel_would_block(
         let mut generated = (0..32).map(|_| (target, vec![0; 1316])).collect();
         queue.append(&mut generated);
         queue
-            .flush_with(|batch| {
-                let refs: Vec<(std::net::SocketAddr, &[u8])> = batch
-                    .iter()
-                    .map(|(address, packet)| (*address, packet.as_slice()))
-                    .collect();
-                srt_transport::sendmsg_batch(socket.as_raw_fd(), &refs)
-            })
+            .flush_with(|batch| srt_transport::sendmsg_batch(socket.as_raw_fd(), batch))
             .unwrap();
         if queue.stats().would_block > 0 {
             return queue.stats();

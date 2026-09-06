@@ -31,8 +31,8 @@
 
 use crate::{Aggregate, BenchConfig, BondMode, ConnStats};
 use shiguredo_srt::{ConnectionEvent, ConnectionOptions, SrtConnection};
-use srt_transport::tokio_transport::Conn;
-use srt_transport::{Handoff, WorkerMessage};
+use srt_transport::tokio_transport::{self, Conn};
+use srt_transport::{Handoff, RecvBatch, RecvBudget, WorkerMessage};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
@@ -42,47 +42,18 @@ use std::time::{Duration, Instant};
 const IDLE_GRACE: Duration = Duration::from_secs(10);
 const TIMER_TICK: Duration = Duration::from_millis(10);
 
-/// Send queued datagrams via `sendmmsg`. Accepted datagrams drain; the
-/// configured policy decides whether a `WouldBlock` tail stays for retry.
+/// Send queued datagrams via the library destined-batch path. Accepted
+/// datagrams drain; the configured policy decides whether a `WouldBlock`
+/// tail stays for retry.
 fn flush_outbound(fd: std::os::fd::RawFd, outbound: &mut crate::scheduling::RetryQueue) {
-    // `sendmsg_batch` wants borrowed slices, so this path materialises the
-    // view it needs. The queue no longer builds one for every caller --
-    // mio's shared sender sends one datagram at a time, does not need the
-    // view, and was paying an allocation per wakeup for it.
-    if let Err(error) = outbound.flush_with(|batch| {
-        let refs: Vec<(SocketAddr, &[u8])> = batch
-            .iter()
-            .map(|(address, packet)| (*address, packet.as_slice()))
-            .collect();
-        srt_transport::sendmsg_batch(fd, &refs)
-    }) {
+    if let Err(error) = outbound.flush_with(|batch| srt_transport::sendmsg_batch(fd, batch)) {
         eprintln!("tokio flush_outbound: dropping retained datagrams: {error}");
         outbound.discard_all();
     }
 }
 
-struct RecvBatch {
-    bufs: Vec<Vec<u8>>,
-    sizes: [usize; Self::CAPACITY],
-    addrs: [Option<SocketAddr>; Self::CAPACITY],
-}
-
-impl RecvBatch {
-    const CAPACITY: usize = 32;
-
-    fn new() -> Self {
-        Self {
-            bufs: (0..Self::CAPACITY).map(|_| vec![0u8; 2048]).collect(),
-            sizes: [0usize; Self::CAPACITY],
-            addrs: [None; Self::CAPACITY],
-        }
-    }
-}
-
-/// Receive datagrams via `recvmmsg`, routing through Tokio's `try_io` so
-/// readiness is properly cleared when the socket has nothing left.
-/// Bounded to `MAX_RECV_ROUNDS` iterations so sustained ingress cannot
-/// starve timers and sibling tasks.
+/// Receive datagrams via the reusable Tokio batch adapter. Bounded so
+/// sustained ingress cannot starve timers and sibling tasks.
 fn drain_recv(
     sock: &tokio::net::UdpSocket,
     batch: &mut RecvBatch,
@@ -90,33 +61,21 @@ fn drain_recv(
     stats: &mut crate::scheduling::RecvSchedulingStats,
     mut on_datagram: impl FnMut(SocketAddr, &[u8]),
 ) {
-    use std::os::fd::AsRawFd;
-    let mut rounds = 0;
-    loop {
-        let result = sock.try_io(tokio::io::Interest::READABLE, || {
-            let n = srt_transport::recvmsg_batch(
-                sock.as_raw_fd(),
-                &mut batch.bufs,
-                &mut batch.sizes,
-                &mut batch.addrs,
-            )?;
-            if n == 0 {
-                Err(std::io::ErrorKind::WouldBlock.into())
-            } else {
-                Ok(n)
+    match tokio_transport::drain_readable(
+        sock,
+        batch,
+        RecvBudget::from_rounds(max_rounds),
+        |addr, data| {
+            if let Some(peer) = addr {
+                on_datagram(peer, data);
             }
-        });
-        let Ok(received) = result else { break };
-        stats.record_recv(received);
-        for i in 0..received {
-            if let Some(peer) = batch.addrs[i] {
-                on_datagram(peer, &batch.bufs[i][..batch.sizes[i]]);
-            }
+        },
+    ) {
+        Ok(report) => {
+            stats.packets = stats.packets.saturating_add(report.datagrams as u64);
+            stats.syscalls = stats.syscalls.saturating_add(report.syscalls as u64);
         }
-        rounds += 1;
-        if received < batch.bufs.len() || rounds >= max_rounds {
-            break;
-        }
+        Err(error) => eprintln!("tokio drain_recv: {error}"),
     }
 }
 
@@ -273,17 +232,9 @@ async fn drive(
     out
 }
 
-fn drain_sender_packets(driver: &mut Conn, buffer: &mut [u8; 2048], start: Instant) {
-    loop {
-        match driver.sock.try_recv(buffer) {
-            Ok(size) => {
-                let now = crate::now_ts(start);
-                let _ = driver.conn.feed_recv_buf(&buffer[..size], now);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(_) => break,
-        }
-    }
+fn drain_sender_packets(driver: &mut Conn, start: Instant, recv_rounds: usize) {
+    let now = crate::now_ts(start);
+    let _ = driver.recv_nonblocking(now, RecvBudget::from_rounds(recv_rounds));
 }
 
 fn handle_sender_events(
@@ -457,7 +408,7 @@ async fn sender_task(
 
         wait_for_sender(&mut driver, stats.connected, &mut buf, start, &source).await;
 
-        drain_sender_packets(&mut driver, &mut buf, start);
+        drain_sender_packets(&mut driver, start, cfg.recv_rounds);
 
         let t = crate::now_ts(start);
         driver.fire_expired(t);
@@ -535,13 +486,8 @@ async fn receive_receiver_packets(
             }
             _ = tokio::time::sleep(crate::MAX_WAIT) => {}
         }
-        for _ in 0..recv_rounds {
-            let Ok(size) = driver.sock.try_recv(buffer) else {
-                break;
-            };
-            let now = crate::now_ts(start);
-            let _ = driver.conn.feed_recv_buf(&buffer[..size], now);
-        }
+        let now = crate::now_ts(start);
+        let _ = driver.recv_nonblocking(now, RecvBudget::from_rounds(recv_rounds));
     }
     true
 }
@@ -1088,13 +1034,11 @@ async fn established_conn_task(mut driver: Conn, cfg: BenchConfig, start: Instan
         // Bounded for the same reason as every other receive drain: an
         // unbounded loop here starves this connection's protocol timers
         // whenever its peer can outpace it.
-        for _ in 0..cfg.recv_rounds {
-            let Ok(n) = driver.sock.try_recv(&mut buf) else {
-                break;
-            };
-            let t = crate::now_ts(start);
-            let _ = driver.conn.feed_recv_buf(&buf[..n], t);
-            data_events += 1;
+        let t = crate::now_ts(start);
+        if let Ok(report) = driver.recv_nonblocking(t, RecvBudget::from_rounds(cfg.recv_rounds))
+            && report.datagrams > 0
+        {
+            data_events += report.datagrams as u64;
             last_data_at = Instant::now();
         }
 

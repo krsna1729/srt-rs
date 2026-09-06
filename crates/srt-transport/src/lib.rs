@@ -20,7 +20,8 @@
 //!
 //! 1. **Shared utilities** (always compiled, no runtime deps):
 //!    `ManualTimerStore`, `bind_reuseport`,
-//!    `recvmsg_batch`. Protocol-level primitives that all runtimes need.
+//!    `recvmsg_batch`, `sendmsg_batch`, `RecvBatch`, `flush_destined`.
+//!    Protocol-level primitives that all runtimes need.
 //!
 //! 2. **Admission machinery** (always compiled, runtime-neutral, performs
 //!    no I/O itself -- the caller does every send): `PeerTable` and
@@ -74,6 +75,7 @@ mod dense_due_index;
 pub(crate) use dense_due_index::DenseDueIndex;
 #[cfg(any(test, feature = "bench-internals"))]
 pub use dense_due_index::{DenseDueEntry, DenseDueIndex};
+mod batch;
 mod due_index;
 mod group_conn;
 mod handoff;
@@ -113,11 +115,15 @@ pub use config::*;
 
 // --- Public re-exports: utilities ---
 
+pub use batch::{
+    BatchIoStats, RecvBatch, RecvBudget, RecvDrainReport, SendFlushReport, apply_send_result,
+    drain_recv_fd, flush_destined,
+};
 pub use cpu::{available_cpus, current_cpu_spec, parse_cpu_spec, restrict_to_cpu_list};
 pub use due_index::DueIndex;
 pub use socket_io::{
-    SOCK_BUF_BYTES, SocketBufferStats, bind_reuseport, recvmsg_batch, sendmsg_batch, set_sock_bufs,
-    socket_buffer_stats,
+    SOCK_BUF_BYTES, SocketBufferStats, bind_reuseport, recvmsg_batch, sendmsg_batch,
+    sendmsg_connected_batch, set_sock_bufs, socket_buffer_stats,
 };
 pub use timer::ManualTimerStore;
 
@@ -145,6 +151,7 @@ pub use caller::{
     LogicalCallerState, LogicalCallerStats, RemovedCallerLeg, RemovedLogicalCaller,
 };
 // Internal helpers used by runtime and group_conn modules.
+pub(crate) use batch::{drain_connected_outputs, drain_output_work};
 pub(crate) use caller::{collect_output_work, prepend_outputs};
 
 // --- Public re-exports: group ---
@@ -304,4 +311,8 @@ pub struct OutputDrainReport {
     pub packets: usize,
     pub bytes: usize,
     pub status: OutputDrainStatus,
+    /// `sendmmsg` / send attempts in this visit.
+    pub syscalls: usize,
+    /// True when this visit stopped on `WouldBlock` or a partial `sendmmsg`.
+    pub would_block: bool,
 }

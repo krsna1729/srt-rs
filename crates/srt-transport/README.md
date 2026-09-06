@@ -43,6 +43,13 @@ Three layers:
    - `OutputDrainBudget` / `OutputDrainReport` — explicit per-tick action,
      packet, and byte limits shared by all six output pumps. Send failures
      are returned and unsent datagrams remain queued in protocol order.
+   - `RecvBatch` / `drain_recv_fd` / `tokio_transport::drain_readable` —
+     reusable readiness-runtime batch receive (`recvmmsg` + optional
+     `try_io`). `flush_destined` / `sendmsg_batch` /
+     `sendmsg_connected_batch` are the matching destined and connected
+     `sendmmsg` helpers. Partial send and `EAGAIN` keep the unsent suffix
+     in protocol order. `BatchIoStats` exposes datagrams/wake,
+     datagrams/syscall, packets/drain visit, and `WouldBlock` rate.
    - `SessionConfig`, `TransportConfig`, `AdmissionConfig`, `CallerConfig`,
      and `ListenerConfig` — layered application configuration with capability-
      checked `Auto` policies, profiles, typed units, and raw escape hatches.
