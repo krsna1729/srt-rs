@@ -384,12 +384,7 @@ fn backfill_drivers_a2(
     }
 }
 
-fn arm_a2_deadline(
-    waiter: &mut HighResWaiter<usize>,
-    driver: &Driver,
-    key: usize,
-    start: Instant,
-) {
+fn arm_a2_deadline(waiter: &mut HighResWaiter<usize>, driver: &Driver, key: usize, start: Instant) {
     // Same binding as `next_poll_wait`: source cadence when nothing is
     // pending, SRT pacing when the source is already waiting on the
     // protocol. Do **not** also min with `schedule_wait` — that collapses
@@ -398,8 +393,7 @@ fn arm_a2_deadline(
     let t = crate::now_ts(start);
     let elapsed = start.elapsed();
     let pacing = driver.conn.conn.time_until_send(t);
-    let wait =
-        Duration::from_micros(driver.source.wait_micros(elapsed, pacing)).min(MAX_POLL_WAIT);
+    let wait = Duration::from_micros(driver.source.wait_micros(elapsed, pacing)).min(MAX_POLL_WAIT);
     waiter.set_deadline(key, MonotonicDeadline::after(wait));
 }
 
