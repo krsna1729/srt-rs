@@ -258,6 +258,23 @@ pub struct ConnectionOptions {
     /// packets still held by the protocol receiver. This prevents an
     /// application that stops polling events from creating an unbounded queue.
     pub delivery_queue_packets: u32,
+    /// Full ACK period in microseconds (Haivision `COMM_SYN` / RFC §3.2.4
+    /// default 10 ms).
+    ///
+    /// Clamped to [`crate::MIN_ACK_INTERVAL_MICROS`]..=[`crate::MAX_ACK_INTERVAL_MICROS`]
+    /// (10–40 ms) when the connection is constructed. Per-connection, not
+    /// process-global. Values above 10 ms are **non-default /
+    /// non-RFC-recommended** coalesce and do not retarget NAK/EXP.
+    /// High-fan-in evidence target: [`crate::HIGH_FANIN_ACK_INTERVAL_MICROS`].
+    pub ack_interval_micros: u64,
+    /// Light ACK packet cadence (Haivision `SELF_CLOCK_INTERVAL` / RFC
+    /// recommendation: 64).
+    ///
+    /// Clamped to [`crate::MIN_LIGHT_ACK_INTERVAL_PACKETS`]..=[`crate::MAX_LIGHT_ACK_INTERVAL_PACKETS`]
+    /// (64–256) when the connection is constructed. Values above 64 are
+    /// **non-default / non-RFC-recommended** coalesce. A receive window
+    /// smaller than 64 packets does not Light-ACK; full ACK is the path.
+    pub light_ack_interval_packets: u32,
 }
 
 // Manual Debug (redacting passphrase/crypto_sek) rather than #[derive(Debug)],
@@ -301,6 +318,11 @@ impl fmt::Debug for ConnectionOptions {
             .field("flow_window_packets", &self.flow_window_packets)
             .field("receive_buffer_packets", &self.receive_buffer_packets)
             .field("delivery_queue_packets", &self.delivery_queue_packets)
+            .field("ack_interval_micros", &self.ack_interval_micros)
+            .field(
+                "light_ack_interval_packets",
+                &self.light_ack_interval_packets,
+            )
             .finish()
     }
 }
@@ -327,6 +349,8 @@ impl Default for ConnectionOptions {
             flow_window_packets: DEFAULT_FLOW_WINDOW,
             receive_buffer_packets: DEFAULT_FLOW_WINDOW,
             delivery_queue_packets: DEFAULT_FLOW_WINDOW,
+            ack_interval_micros: crate::ACK_INTERVAL_MICROS,
+            light_ack_interval_packets: crate::LIGHT_ACK_INTERVAL_PACKETS,
         }
     }
 }
@@ -439,6 +463,9 @@ fn normalize_buffer_options(mut options: ConnectionOptions) -> ConnectionOptions
         .delivery_queue_packets
         .max(1)
         .min(options.receive_buffer_packets);
+    options.ack_interval_micros = crate::clamp_ack_interval_micros(options.ack_interval_micros);
+    options.light_ack_interval_packets =
+        crate::clamp_light_ack_interval_packets(options.light_ack_interval_packets);
     options
 }
 
@@ -857,6 +884,10 @@ impl SrtConnection {
                 .min(self.options.flow_window_packets),
         );
         receiver.set_tsbpd_enabled(self.tsbpd_enabled());
+        receiver.set_ack_coalesce(
+            self.options.ack_interval_micros,
+            self.options.light_ack_interval_packets,
+        );
         self.receiver = Some(receiver);
         self.last_ack_time = Some(now);
         self.last_nak_time = Some(now);
@@ -1013,7 +1044,13 @@ impl SrtConnection {
             }
         }
         self.enqueue_ready_data(now);
-        self.send_ack(now);
+        let emit_ack = self
+            .receiver
+            .as_ref()
+            .is_none_or(|receiver| receiver.should_emit_timer_ack(now));
+        if emit_ack {
+            self.send_ack(now);
+        }
 
         if self.tlpktdrop_enabled()
             && let Some(sender) = self.sender.as_mut()
@@ -1026,7 +1063,7 @@ impl SrtConnection {
 
         self.output_queue.push_back(ConnectionOutput::SetTimer {
             id: TimerId::Ack,
-            duration_micros: crate::ACK_INTERVAL_MICROS,
+            duration_micros: self.ack_timer_tick_micros(),
         });
     }
 
@@ -2254,6 +2291,16 @@ impl SrtConnection {
         self.queue_packet(buf, now);
     }
 
+    fn ack_timer_tick_micros(&self) -> u64 {
+        self.receiver
+            .as_ref()
+            .map_or_else(
+                || crate::clamp_ack_interval_micros(self.options.ack_interval_micros),
+                ReceiverBuffer::ack_timer_tick_micros,
+            )
+            .min(crate::ACK_INTERVAL_MICROS)
+    }
+
     /// Set up timers after the connection is established.
     fn setup_connection_timers(&mut self) {
         // Keepalive timer (1 second).
@@ -2262,10 +2309,11 @@ impl SrtConnection {
             duration_micros: KEEPALIVE_INTERVAL_MICROS,
         });
 
-        // ACK timer (10ms).
+        // ACK timer always ticks at COMM_SYN (10 ms) for TSBPD/TLPKTDROP.
+        // Coalesced ACK only skips sendto on intermediate ticks.
         self.output_queue.push_back(ConnectionOutput::SetTimer {
             id: TimerId::Ack,
-            duration_micros: crate::ACK_INTERVAL_MICROS,
+            duration_micros: self.ack_timer_tick_micros(),
         });
 
         if self.periodic_nak_enabled() {
@@ -3883,5 +3931,127 @@ mod tests {
         let encoded = 0x8000_0001u32.to_be_bytes();
         let error = parse_loss_list(&encoded, 8).expect_err("range end is required");
         assert_eq!(error.kind, crate::ErrorKind::InvalidData);
+    }
+
+    fn ack_timer_duration(outputs: impl IntoIterator<Item = ConnectionOutput>) -> Option<u64> {
+        outputs.into_iter().find_map(|output| match output {
+            ConnectionOutput::SetTimer {
+                id: TimerId::Ack,
+                duration_micros,
+            } => Some(duration_micros),
+            _ => None,
+        })
+    }
+
+    fn drain_outputs(conn: &mut SrtConnection) -> Vec<ConnectionOutput> {
+        std::iter::from_fn(|| conn.poll_output()).collect()
+    }
+
+    #[test]
+    fn connection_options_clamp_ack_coalesce_per_socket() {
+        let coalesced = SrtConnection::new_listener(ConnectionOptions {
+            ack_interval_micros: 1_000_000,
+            light_ack_interval_packets: 65_536,
+            ..ConnectionOptions::default()
+        });
+        assert_eq!(
+            coalesced.options.ack_interval_micros,
+            crate::MAX_ACK_INTERVAL_MICROS
+        );
+        assert_eq!(
+            coalesced.options.light_ack_interval_packets,
+            crate::MAX_LIGHT_ACK_INTERVAL_PACKETS
+        );
+
+        let defaulted = SrtConnection::new_listener(ConnectionOptions::default());
+        assert_eq!(
+            defaulted.options.ack_interval_micros,
+            crate::ACK_INTERVAL_MICROS
+        );
+        assert_eq!(
+            defaulted.options.light_ack_interval_packets,
+            crate::LIGHT_ACK_INTERVAL_PACKETS
+        );
+        assert_ne!(
+            coalesced.options.ack_interval_micros, defaulted.options.ack_interval_micros,
+            "ACK coalesce is per connection, not process-global"
+        );
+    }
+
+    #[test]
+    fn coalesced_ack_keeps_comm_syn_tick_and_defers_sendto() {
+        let mut conn = SrtConnection::new_listener(ConnectionOptions {
+            ack_interval_micros: crate::HIGH_FANIN_ACK_INTERVAL_MICROS,
+            light_ack_interval_packets: crate::HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS,
+            tsbpd_delay: 0,
+            ..ConnectionOptions::default()
+        });
+        conn.set_state(ConnectionState::Connected);
+        let start = Timestamp::from_micros(0);
+        conn.init_buffers(start, 0, 0);
+        conn.receiver
+            .as_mut()
+            .expect("receiver")
+            .set_tsbpd_enabled(false);
+        conn.setup_connection_timers();
+
+        assert_eq!(
+            ack_timer_duration(drain_outputs(&mut conn)),
+            Some(crate::ACK_INTERVAL_MICROS)
+        );
+
+        conn.handle_timer(TimerId::Ack, Timestamp::from_micros(10_000))
+            .expect("10ms TSBPD tick");
+        let early = drain_outputs(&mut conn);
+        assert_eq!(
+            ack_timer_duration(early.iter().cloned()),
+            Some(crate::ACK_INTERVAL_MICROS)
+        );
+        assert!(
+            !early
+                .iter()
+                .any(|output| matches!(output, ConnectionOutput::SendPacket(_))),
+            "coalesced ACK must not emit at the COMM_SYN tick"
+        );
+
+        conn.handle_timer(TimerId::Ack, Timestamp::from_micros(40_000))
+            .expect("40ms full ACK");
+        let due = drain_outputs(&mut conn);
+        assert!(
+            due.iter()
+                .any(|output| matches!(output, ConnectionOutput::SendPacket(_))),
+            "full ACK is emitted once the configured interval elapses"
+        );
+    }
+
+    #[test]
+    fn default_ack_timer_still_emits_every_comm_syn() {
+        let mut conn = SrtConnection::new_listener(ConnectionOptions {
+            tsbpd_delay: 0,
+            ..ConnectionOptions::default()
+        });
+        conn.set_state(ConnectionState::Connected);
+        let start = Timestamp::from_micros(0);
+        conn.init_buffers(start, 0, 0);
+        conn.receiver
+            .as_mut()
+            .expect("receiver")
+            .set_tsbpd_enabled(false);
+        conn.setup_connection_timers();
+        let _ = drain_outputs(&mut conn);
+
+        conn.handle_timer(TimerId::Ack, Timestamp::from_micros(10_000))
+            .expect("default ACK timer");
+        let outputs = drain_outputs(&mut conn);
+        assert!(
+            outputs
+                .iter()
+                .any(|output| matches!(output, ConnectionOutput::SendPacket(_))),
+            "Haivision-compatible default still emits a full ACK every 10ms"
+        );
+        assert_eq!(
+            ack_timer_duration(outputs),
+            Some(crate::ACK_INTERVAL_MICROS)
+        );
     }
 }

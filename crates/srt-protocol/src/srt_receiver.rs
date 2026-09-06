@@ -10,6 +10,62 @@
 //! - ACK generation (periodic ACK / Light ACK)
 //! - TSBPD (Time-based Packet Delivery)
 //! - Receiving rate / link capacity estimation
+//!
+//! ## ACK cadence
+//!
+//! Defaults are Haivision-identical and RFC-aligned:
+//!
+//! - Full ACK every **10 ms** = Haivision `COMM_SYN_INTERVAL_US` (`core.h`) /
+//!   RFC [draft-sharabayko-srt](https://datatracker.ietf.org/doc/html/draft-sharabayko-srt)
+//!   §3.2.4 / [`ACK_INTERVAL_MICROS`].
+//! - Light ACK every **64** packets = Haivision `SELF_CLOCK_INTERVAL` /
+//!   RFC recommendation / [`LIGHT_ACK_INTERVAL_PACKETS`].
+//!
+//! There is no public `SRTO_*` for ACK interval. LiveCC/FileCC leave
+//! `ACKTimeout_us` / `ACKMaxPackets` at 0, so libsrt stays on the hardcoded
+//! SYN path. This crate ships the same SYN defaults; optional coalesce is a
+//! product knob, not a new CC default and not `ACKMaxPackets` as a live
+//! default.
+//!
+//! Both intervals are per-connection ([`ConnectionOptions`](crate::ConnectionOptions)
+//! / [`ReceiverBuffer::set_ack_coalesce`]), not process-global. Optional
+//! coalesce may only raise the interval (never make ACK faster than SYN):
+//!
+//! | Knob | Min (= default) | Default | Max | Label |
+//! |---|---:|---:|---:|---|
+//! | Full ACK | 10 ms | 10 ms | 40 ms | Values `> 10 ms` are **non-default / non-RFC-recommended**. Contabo 4× (40 ms, issue #30 comment 5560077515) is the evidence ceiling, **not** the default. |
+//! | Light ACK | 64 pkts | 64 pkts | 256 pkts | Values `> 64` are **non-default / non-RFC-recommended**. Contabo 4× (256) is the evidence ceiling, **not** the default. |
+//!
+//! **Light ACK cadence divergence (documented, not changed):** Haivision
+//! `checkACKTimer` escalates `64 × LightACKCount` (64, 128, 192, …) until
+//! a full ACK resets the count. This crate resets `packets_since_ack` on
+//! every ACK, including Light ACK, so the next Light ACK is again N packets.
+//! Stricter Haivision parity is out of scope unless that is the explicit
+//! goal.
+//!
+//! Correctness bounds encoded here:
+//!
+//! - **TSBPD / TLPKTDROP**: the ACK *timer tick* stays at `COMM_SYN` (10 ms)
+//!   so coalescing ACKs does not coarsen idle delivery or too-late drop.
+//!   Packet receive still calls `enqueue_ready_data` on every DATA packet.
+//! - **SYN semantics stay separate**: NAK (immediate on gap + RTT-based
+//!   periodic NAK) and EXP are **not** retargeted by the ACK knob.
+//! - **ACKACK / RTT**: ACKACK is generated only for Full ACK (Light ACK
+//!   never increments the ACK number). Same-seq ACK suppress after ACKACK
+//!   is already mirrored and **kept**. The 40 ms ceiling slows ACKACK→RTT
+//!   samples 4× — a known NAK/loss-timing risk, not a reason to raise the
+//!   default.
+//! - **Small flight / receive window**: a window smaller than 64 packets
+//!   does not Light-ACK; full ACK on the COMM_SYN timer is the progress
+//!   path. A 40 ms full ACK can stall FC / small flight windows because
+//!   ackpoint advance is 4× coarser.
+//! - **Configured latency**: hostile if TSBPD latency ≲ 2–3× the ACK
+//!   interval (e.g. 120 ms latency with a 40 ms ACK sits on that edge).
+//!   The knobs do not hard-reject that pairing.
+//!
+//! High-fan-in listeners can set the Contabo-measured 4× cell:
+//! [`HIGH_FANIN_ACK_INTERVAL_MICROS`] / [`HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS`].
+//! Do not change the global defaults to those values.
 
 use crate::adaptive_receiver_packet_window::AdaptiveReceiverPacketWindow;
 use bytes::Bytes;
@@ -26,13 +82,72 @@ use crate::srt_packet::{
 use crate::time::Timestamp;
 
 /// Light ACK send interval (packets).
+///
+/// Haivision `SELF_CLOCK_INTERVAL` / RFC recommendation. Named default
+/// **and floor** for [`ConnectionOptions::light_ack_interval_packets`](crate::ConnectionOptions).
 pub const LIGHT_ACK_INTERVAL_PACKETS: u32 = 64;
+
+/// Fewest packets between Light ACKs. Equal to the Haivision/RFC default;
+/// optional coalesce may only raise this, never lower it.
+pub const MIN_LIGHT_ACK_INTERVAL_PACKETS: u32 = LIGHT_ACK_INTERVAL_PACKETS;
+
+/// Most packets between Light ACKs. Contabo 4× evidence ceiling (issue #30
+/// comment 5560077515), not a new RFC recommendation.
+pub const MAX_LIGHT_ACK_INTERVAL_PACKETS: u32 = 256;
+
+/// Contabo-measured 4× Light ACK coalesce for high-fan-in listeners
+/// (issue #30). Optional evidence target; **not** the protocol default.
+pub const HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS: u32 = MAX_LIGHT_ACK_INTERVAL_PACKETS;
 
 /// Sequence numbers are carried in the low 31 bits of each wire word.
 const SEQUENCE_MASK: u32 = 0x7FFF_FFFF;
 
 /// Periodic ACK interval (microseconds).
+///
+/// Haivision/UDT `COMM_SYN_INTERVAL_US` (10 ms). Named default **and floor**
+/// for [`ConnectionOptions::ack_interval_micros`](crate::ConnectionOptions).
 pub const ACK_INTERVAL_MICROS: u64 = 10_000; // 10ms
+
+/// Fastest full-ACK cadence. Equal to `COMM_SYN`; optional coalesce may
+/// only raise this, never make ACK faster than Haivision SYN.
+pub const MIN_ACK_INTERVAL_MICROS: u64 = ACK_INTERVAL_MICROS;
+
+/// Slowest full-ACK cadence. Contabo 4× evidence ceiling (40 ms), not a
+/// new SYN. Full ACKs are the only ACKACK/RTT samples; 40 ms slows them 4×.
+pub const MAX_ACK_INTERVAL_MICROS: u64 = 40_000;
+
+/// Contabo-measured 4× full-ACK coalesce for high-fan-in listeners
+/// (issue #30). Optional evidence target; **not** the protocol default.
+pub const HIGH_FANIN_ACK_INTERVAL_MICROS: u64 = MAX_ACK_INTERVAL_MICROS;
+
+const _: () = assert!(MIN_ACK_INTERVAL_MICROS == ACK_INTERVAL_MICROS);
+const _: () = assert!(MAX_ACK_INTERVAL_MICROS == HIGH_FANIN_ACK_INTERVAL_MICROS);
+const _: () = assert!(MIN_LIGHT_ACK_INTERVAL_PACKETS == LIGHT_ACK_INTERVAL_PACKETS);
+const _: () = assert!(MAX_LIGHT_ACK_INTERVAL_PACKETS == HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS);
+
+/// Clamp a requested full-ACK interval to the supported range.
+#[must_use]
+pub const fn clamp_ack_interval_micros(interval_micros: u64) -> u64 {
+    if interval_micros < MIN_ACK_INTERVAL_MICROS {
+        MIN_ACK_INTERVAL_MICROS
+    } else if interval_micros > MAX_ACK_INTERVAL_MICROS {
+        MAX_ACK_INTERVAL_MICROS
+    } else {
+        interval_micros
+    }
+}
+
+/// Clamp a requested Light ACK packet interval to the supported range.
+#[must_use]
+pub const fn clamp_light_ack_interval_packets(interval_packets: u32) -> u32 {
+    if interval_packets < MIN_LIGHT_ACK_INTERVAL_PACKETS {
+        MIN_LIGHT_ACK_INTERVAL_PACKETS
+    } else if interval_packets > MAX_LIGHT_ACK_INTERVAL_PACKETS {
+        MAX_LIGHT_ACK_INTERVAL_PACKETS
+    } else {
+        interval_packets
+    }
+}
 
 /// Maximum number of entries kept for tracking ACK send times.
 const MAX_ACK_TIMESTAMPS: usize = 16;
@@ -771,6 +886,13 @@ pub struct ReceiverBuffer {
     /// Packets received since the last ACK was sent (for Light ACK).
     packets_since_ack: u32,
 
+    /// Full ACK period for this connection (clamped microseconds).
+    /// Stored as `u32` so the two knobs pack into 8 bytes (`MAX` is 40_000).
+    ack_interval_micros: u32,
+
+    /// Light ACK packet cadence for this connection (clamped).
+    light_ack_interval_packets: u32,
+
     /// ACK sequence number (the ACK packet's own number).
     ack_number: u32,
 
@@ -922,6 +1044,8 @@ impl ReceiverBuffer {
             last_ackacked_seq: None,
             last_ackacked_number: None,
             packets_since_ack: 0,
+            ack_interval_micros: ACK_INTERVAL_MICROS as u32,
+            light_ack_interval_packets: LIGHT_ACK_INTERVAL_PACKETS,
             // The first Full ACK increments this to one, as required by the
             // wire specification.
             ack_number: 0,
@@ -963,6 +1087,68 @@ impl ReceiverBuffer {
     /// Enable/disable TSBPD.
     pub fn set_tsbpd_enabled(&mut self, enabled: bool) {
         self.tsbpd_enabled = enabled;
+    }
+
+    /// Set per-connection ACK coalesce knobs. Values are clamped to
+    /// [`MIN_ACK_INTERVAL_MICROS`]..=[`MAX_ACK_INTERVAL_MICROS`] and
+    /// [`MIN_LIGHT_ACK_INTERVAL_PACKETS`]..=[`MAX_LIGHT_ACK_INTERVAL_PACKETS`].
+    pub fn set_ack_coalesce(&mut self, ack_interval_micros: u64, light_ack_interval_packets: u32) {
+        self.ack_interval_micros = clamp_ack_interval_micros(ack_interval_micros) as u32;
+        self.light_ack_interval_packets =
+            clamp_light_ack_interval_packets(light_ack_interval_packets);
+    }
+
+    /// Configured full-ACK interval for this buffer, after clamping.
+    #[must_use]
+    pub fn ack_interval_micros(&self) -> u64 {
+        u64::from(self.ack_interval_micros)
+    }
+
+    /// Configured Light ACK interval for this buffer, after clamping.
+    ///
+    /// Never below [`LIGHT_ACK_INTERVAL_PACKETS`]. A receive window smaller
+    /// than that cadence does not Light-ACK; full ACK is the progress path.
+    #[must_use]
+    pub fn light_ack_interval_packets(&self) -> u32 {
+        self.effective_light_ack_interval_packets()
+    }
+
+    /// ACK timer period. Always [`ACK_INTERVAL_MICROS`] (`COMM_SYN`) so
+    /// TSBPD/TLPKTDROP stay on the SYN tick when ACK is coalesced. Product
+    /// knobs cannot make ACK faster than SYN.
+    #[must_use]
+    pub fn ack_timer_tick_micros(&self) -> u64 {
+        u64::from(self.ack_interval_micros).min(ACK_INTERVAL_MICROS)
+    }
+
+    /// Whether the ACK timer should emit a (full) ACK this tick.
+    ///
+    /// The default (10 ms = `COMM_SYN`) emits on every tick, matching the
+    /// historic `handle_ack_timer` always-send behavior. A coalesced
+    /// interval (`> COMM_SYN`) emits only after the configured period has
+    /// elapsed; intermediate ticks still run TSBPD/TLPKTDROP.
+    #[must_use]
+    pub fn should_emit_timer_ack(&self, now: Timestamp) -> bool {
+        if u64::from(self.ack_interval_micros) <= ACK_INTERVAL_MICROS {
+            true
+        } else {
+            self.ack_interval_elapsed(now)
+        }
+    }
+
+    fn ack_interval_elapsed(&self, now: Timestamp) -> bool {
+        now.as_micros()
+            .saturating_sub(self.last_ack_time.as_micros())
+            >= u64::from(self.ack_interval_micros)
+    }
+
+    fn effective_light_ack_interval_packets(&self) -> u32 {
+        // Never emit Light ACK more often than Haivision SELF_CLOCK (64).
+        // A receive window smaller than that cadence simply never Light-ACKs;
+        // full ACK on the COMM_SYN timer is the progress path. Do not lower
+        // the interval to a quarter of a small window.
+        self.light_ack_interval_packets
+            .max(MIN_LIGHT_ACK_INTERVAL_PACKETS)
     }
 
     #[cfg(test)]
@@ -1396,18 +1582,21 @@ impl ReceiverBuffer {
 
     /// Check whether an ACK should be generated.
     pub fn should_send_ack(&self, now: Timestamp) -> bool {
-        // Light ACK: every 64 packets received. At high packet rates the
-        // acknowledged position advances between ACKACKs, so a light ACK is
-        // never stale.
-        if self.packets_since_ack >= LIGHT_ACK_INTERVAL_PACKETS {
+        // Light ACK: every N packets received (default 64 = SELF_CLOCK).
+        // At high packet rates the acknowledged position advances between
+        // ACKACKs, so a light ACK is never stale.
+        //
+        // Divergence from Haivision `checkACKTimer`: libsrt escalates
+        // `64 × LightACKCount` (64, 128, 192, …) until a full ACK. We
+        // reset `packets_since_ack` on every ACK (including Light ACK),
+        // so the next Light ACK is again N packets. Documented; not
+        // changed here.
+        if self.packets_since_ack >= self.effective_light_ack_interval_packets() {
             return true;
         }
 
-        // Periodic ACK: every 10ms.
-        let elapsed = now
-            .as_micros()
-            .saturating_sub(self.last_ack_time.as_micros());
-        if elapsed < ACK_INTERVAL_MICROS {
+        // Periodic ACK: every configured interval (default 10ms).
+        if !self.ack_interval_elapsed(now) {
             return false;
         }
 
@@ -1423,14 +1612,13 @@ impl ReceiverBuffer {
 
     /// Generate an ACK.
     pub fn generate_ack(&mut self, now: Timestamp) -> AckPacket {
-        let is_light = self.packets_since_ack >= LIGHT_ACK_INTERVAL_PACKETS
-            && now
-                .as_micros()
-                .saturating_sub(self.last_ack_time.as_micros())
-                < ACK_INTERVAL_MICROS;
+        let is_light = self.packets_since_ack >= self.effective_light_ack_interval_packets()
+            && !self.ack_interval_elapsed(now);
 
         self.last_ack_time = now;
         self.last_ack_seq = self.expected_seq;
+        // Reset every ACK. Haivision instead increments LightACKCount and
+        // stretches the next Light ACK to 64× that count until a full ACK.
         self.packets_since_ack = 0;
 
         if !is_light {
@@ -3189,6 +3377,144 @@ mod tests {
         // Full ACK では ack_number がインクリメントされる
         assert_eq!(buf.ack_number(), ack_number_before + 1);
         assert_eq!(buf.ack_number(), 1);
+    }
+
+    #[test]
+    fn ack_interval_clamps_to_correctness_bounds() {
+        assert_eq!(clamp_ack_interval_micros(0), MIN_ACK_INTERVAL_MICROS);
+        assert_eq!(
+            clamp_ack_interval_micros(1_000_000),
+            MAX_ACK_INTERVAL_MICROS
+        );
+        assert_eq!(
+            clamp_ack_interval_micros(ACK_INTERVAL_MICROS),
+            ACK_INTERVAL_MICROS
+        );
+        assert_eq!(
+            clamp_ack_interval_micros(HIGH_FANIN_ACK_INTERVAL_MICROS),
+            HIGH_FANIN_ACK_INTERVAL_MICROS
+        );
+        assert_eq!(
+            clamp_light_ack_interval_packets(1),
+            MIN_LIGHT_ACK_INTERVAL_PACKETS
+        );
+        assert_eq!(
+            clamp_light_ack_interval_packets(65_536),
+            MAX_LIGHT_ACK_INTERVAL_PACKETS
+        );
+        assert_eq!(
+            clamp_light_ack_interval_packets(LIGHT_ACK_INTERVAL_PACKETS),
+            LIGHT_ACK_INTERVAL_PACKETS
+        );
+        assert_eq!(
+            clamp_light_ack_interval_packets(HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS),
+            HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS
+        );
+    }
+
+    #[test]
+    fn configured_light_ack_interval_is_honored() {
+        let start = Timestamp::from_micros(0);
+        let mut buf = ReceiverBuffer::new(1000, 120, start, 0);
+        buf.set_tsbpd_enabled(false);
+        buf.set_ack_coalesce(HIGH_FANIN_ACK_INTERVAL_MICROS, 256);
+
+        let now = Timestamp::from_micros(0);
+        for i in 0..255 {
+            buf.receive(make_packet(1000 + i, i * 100), now);
+        }
+        assert!(
+            !buf.should_send_ack(now),
+            "255 packets is below a 256-packet Light ACK interval"
+        );
+
+        buf.receive(make_packet(1255, 25_500), now);
+        assert!(buf.should_send_ack(now));
+        let ack = buf.generate_ack(now);
+        assert!(ack.is_light);
+        assert_eq!(buf.ack_number(), 0);
+    }
+
+    #[test]
+    fn configured_ack_interval_defers_full_ack() {
+        let start = Timestamp::from_micros(0);
+        let mut buf = ReceiverBuffer::new(1000, 120, start, 0);
+        buf.set_tsbpd_enabled(false);
+        buf.set_ack_coalesce(HIGH_FANIN_ACK_INTERVAL_MICROS, 256);
+
+        buf.receive(make_packet(1000, 100), Timestamp::from_micros(0));
+        assert!(!buf.should_send_ack(Timestamp::from_micros(10_000)));
+        assert!(!buf.should_send_ack(Timestamp::from_micros(39_999)));
+        assert!(buf.should_send_ack(Timestamp::from_micros(40_000)));
+
+        let ack = buf.generate_ack(Timestamp::from_micros(40_000));
+        assert!(!ack.is_light);
+        assert_eq!(buf.ack_number(), 1);
+    }
+
+    #[test]
+    fn coalesced_ack_keeps_comm_syn_timer_tick() {
+        let start = Timestamp::from_micros(0);
+        let mut buf = ReceiverBuffer::new(1000, 120, start, 0);
+        buf.set_ack_coalesce(HIGH_FANIN_ACK_INTERVAL_MICROS, 256);
+        assert_eq!(buf.ack_timer_tick_micros(), ACK_INTERVAL_MICROS);
+        assert!(!buf.should_emit_timer_ack(Timestamp::from_micros(10_000)));
+        assert!(buf.should_emit_timer_ack(Timestamp::from_micros(40_000)));
+
+        let mut defaulted = ReceiverBuffer::new(1000, 120, start, 0);
+        defaulted.set_ack_coalesce(MIN_ACK_INTERVAL_MICROS, LIGHT_ACK_INTERVAL_PACKETS);
+        assert_eq!(defaulted.ack_timer_tick_micros(), ACK_INTERVAL_MICROS);
+        assert!(defaulted.should_emit_timer_ack(Timestamp::from_micros(0)));
+    }
+
+    #[test]
+    fn small_receive_window_does_not_lower_light_ack_below_haivision_interval() {
+        let start = Timestamp::from_micros(0);
+        let mut buf = ReceiverBuffer::with_buffer_size(1000, 120, start, 0, 32);
+        buf.set_tsbpd_enabled(false);
+        buf.set_ack_coalesce(ACK_INTERVAL_MICROS, MAX_LIGHT_ACK_INTERVAL_PACKETS);
+        assert_eq!(
+            buf.light_ack_interval_packets(),
+            MAX_LIGHT_ACK_INTERVAL_PACKETS
+        );
+
+        let now = Timestamp::from_micros(0);
+        for i in 0..32 {
+            buf.receive(make_packet(1000 + i, i * 100), now);
+        }
+        assert!(
+            !buf.should_send_ack(now),
+            "a 32-packet window cannot satisfy Light ACK ≥ 64; full ACK is the path"
+        );
+        assert!(buf.should_send_ack(Timestamp::from_micros(ACK_INTERVAL_MICROS)));
+    }
+
+    #[test]
+    fn light_ack_resets_every_interval_unlike_haivision_escalation() {
+        // Haivision checkACKTimer escalates 64×LightACKCount (64, 128, 192…)
+        // until a full ACK. This crate resets packets_since_ack on every ACK,
+        // including Light ACK, so the next Light ACK is again N packets.
+        let start = Timestamp::from_micros(0);
+        let mut buf = ReceiverBuffer::new(1000, 120, start, 0);
+        buf.set_tsbpd_enabled(false);
+
+        let now = Timestamp::from_micros(0);
+        for i in 0..64 {
+            buf.receive(make_packet(1000 + i, i * 100), now);
+        }
+        let first = buf.generate_ack(now);
+        assert!(first.is_light);
+        assert_eq!(buf.ack_number(), 0);
+
+        for i in 0..64 {
+            buf.receive(make_packet(1064 + i, (64 + i) * 100), now);
+        }
+        let second = buf.generate_ack(now);
+        assert!(
+            second.is_light,
+            "second Light ACK fires at 64 packets, not Haivision's escalated 128"
+        );
+        assert_eq!(buf.ack_number(), 0);
     }
 
     #[test]

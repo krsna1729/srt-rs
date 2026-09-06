@@ -10,8 +10,8 @@
 
 use proptest::prelude::*;
 use shiguredo_srt::{
-    CipherMode, ConnectionEvent, ConnectionOptions, ConnectionOutput, ConnectionState, ControlType,
-    DEFAULT_MTU, KeyLength, SrtConnection, SrtPacket, TimerId, Timestamp,
+    ConnectionEvent, ConnectionOptions, ConnectionOutput, ConnectionState, ControlType,
+    DEFAULT_MTU, SrtConnection, SrtPacket, TimerId, Timestamp,
 };
 
 // ============================================================================
@@ -1065,24 +1065,7 @@ proptest! {
 fn make_opts(socket_id: u32) -> ConnectionOptions {
     ConnectionOptions {
         socket_id,
-        passphrase: None,
-        key_length: KeyLength::Aes128,
-        cipher_mode: CipherMode::Ctr,
-        initial_seq: None,
-        syn_cookie: None,
-        tsbpd_delay: 120,
-        srt_version: 0x010500,
-        stream_id: None,
-        congestion_control: "live".to_string(),
-        group_extension: None,
-        crypto_salt: None,
-        crypto_sek: None,
-        max_bandwidth_bytes_per_sec: None,
-        input_bandwidth_bytes_per_sec: None,
-        overhead_bandwidth_percent: 25,
-        flow_window_packets: 8192,
-        receive_buffer_packets: 8192,
-        delivery_queue_packets: 8192,
+        ..ConnectionOptions::default()
     }
 }
 
@@ -1090,24 +1073,8 @@ fn make_opts(socket_id: u32) -> ConnectionOptions {
 fn make_opts_with_stream_id(socket_id: u32, stream_id: String) -> ConnectionOptions {
     ConnectionOptions {
         socket_id,
-        passphrase: None,
-        key_length: KeyLength::Aes128,
-        cipher_mode: CipherMode::Ctr,
-        initial_seq: None,
-        syn_cookie: None,
-        tsbpd_delay: 120,
-        srt_version: 0x010500,
         stream_id: Some(stream_id),
-        congestion_control: "live".to_string(),
-        group_extension: None,
-        crypto_salt: None,
-        crypto_sek: None,
-        max_bandwidth_bytes_per_sec: None,
-        input_bandwidth_bytes_per_sec: None,
-        overhead_bandwidth_percent: 25,
-        flow_window_packets: 8192,
-        receive_buffer_packets: 8192,
-        delivery_queue_packets: 8192,
+        ..ConnectionOptions::default()
     }
 }
 

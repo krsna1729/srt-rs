@@ -360,6 +360,22 @@ proptest! {
     }
 
     #[test]
+    fn configured_ack_interval_is_the_periodic_threshold(
+        initial_seq in 0u32..0x7FFF_FFFFu32,
+        interval_micros in shiguredo_srt::MIN_ACK_INTERVAL_MICROS
+            ..=shiguredo_srt::MAX_ACK_INTERVAL_MICROS,
+    ) {
+        let start = Timestamp::from_micros(0);
+        let mut buf = ReceiverBuffer::new(initial_seq, 120, start, 0);
+        buf.set_ack_coalesce(interval_micros, shiguredo_srt::LIGHT_ACK_INTERVAL_PACKETS);
+
+        prop_assert!(!buf.should_send_ack(Timestamp::from_micros(
+            interval_micros.saturating_sub(1)
+        )));
+        prop_assert!(buf.should_send_ack(Timestamp::from_micros(interval_micros)));
+    }
+
+    #[test]
     fn test_receiver_buffer_loss_recovery(
         initial_seq in 0u32..0x7FFF_FF00u32,
     ) {

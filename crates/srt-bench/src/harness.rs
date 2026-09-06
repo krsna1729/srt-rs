@@ -227,6 +227,8 @@ pub const COLUMNS: &[&str] = &[
     // queues above: one queue's capacity, how many exist, the pool total,
     // and the worst any single queue reached.
     "retry_horizon_ms",
+    "ack_interval_micros",
+    "light_ack_interval_packets",
     "retry_count",
     "retry_cap_per_queue",
     "retry_total_cap",
@@ -292,6 +294,8 @@ pub const CONFIG_COLUMNS: &[&str] = &[
     "source_backlog_ms",
     "datapath_q_horizon_ms",
     "retry_horizon_ms",
+    "ack_interval_micros",
+    "light_ack_interval_packets",
     "secs",
     "model_policy_rev",
     "model_policy_fingerprint",
@@ -576,6 +580,8 @@ pub fn append_result(
         recv_scheduling.percentile_bucket_us(99).to_string(),
         recv_scheduling.lateness_max_us.to_string(),
         cfg.outbound_retry_horizon_ms.to_string(),
+        cfg.ack_interval_micros.to_string(),
+        cfg.light_ack_interval_packets.to_string(),
         outbound_retry.queues.to_string(),
         outbound_retry.capacity.to_string(),
         outbound_retry.total_capacity.to_string(),
@@ -1572,6 +1578,8 @@ fn recorded_column(axis: &str) -> Option<&'static str> {
         ("datapath-q-horizon-ms", "datapath_q_horizon_ms"),
         ("outbound-retry-horizon-ms", "retry_horizon_ms"),
         ("retry-horizon-ms", "retry_horizon_ms"),
+        ("ack-interval-micros", "ack_interval_micros"),
+        ("light-ack-interval-packets", "light_ack_interval_packets"),
         ("pin", "pin"),
     ];
     COLUMNS
@@ -1731,6 +1739,8 @@ const CANONICAL_AXIS_NAMES: &[(&str, &str)] = &[
     ("datapath-q-horizon-ms", "datapath-queue-horizon-ms"),
     ("outbound-retry-horizon-ms", "outbound-retry-horizon-ms"),
     ("retry-horizon-ms", "outbound-retry-horizon-ms"),
+    ("ack-interval-micros", "ack-interval-micros"),
+    ("light-ack-interval-packets", "light-ack-interval-packets"),
     ("link-delay", "link-delay"),
     ("link-jitter", "link-jitter"),
     ("link-loss", "link-loss"),
@@ -2089,6 +2099,19 @@ fn resolve_matrix_axes(cli: &crate::Cli) -> std::io::Result<MatrixAxisConfig> {
             "outbound-retry-horizon-ms",
             "outbound-retry-horizon-ms",
             &crate::scheduling::DEFAULT_OUTBOUND_RETRY_HORIZON_MS.to_string(),
+        ),
+        // ACK coalesce. Defaults stay Haivision COMM_SYN / 64 so an
+        // unchanged command line is the same cell. Contabo 4× rematch:
+        // `--ack-interval-micros 40000 --light-ack-interval-packets 256`.
+        axis(
+            "ack-interval-micros",
+            "ack-interval-micros",
+            &shiguredo_srt::ACK_INTERVAL_MICROS.to_string(),
+        ),
+        axis(
+            "light-ack-interval-packets",
+            "light-ack-interval-packets",
+            &shiguredo_srt::LIGHT_ACK_INTERVAL_PACKETS.to_string(),
         ),
     ]);
     let unused: Vec<&str> = plan

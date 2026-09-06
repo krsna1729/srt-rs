@@ -43,8 +43,11 @@ pub use srt_packet::{
     peek_destination_socket_id,
 };
 pub use srt_receiver::{
-    ACK_INTERVAL_MICROS, AckPacket, DropRangeSummary, LIGHT_ACK_INTERVAL_PACKETS, LossRange,
-    NakPacket, ReceiverBuffer, ReceiverStats,
+    ACK_INTERVAL_MICROS, AckPacket, DropRangeSummary, HIGH_FANIN_ACK_INTERVAL_MICROS,
+    HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS, LIGHT_ACK_INTERVAL_PACKETS, LossRange,
+    MAX_ACK_INTERVAL_MICROS, MAX_LIGHT_ACK_INTERVAL_PACKETS, MIN_ACK_INTERVAL_MICROS,
+    MIN_LIGHT_ACK_INTERVAL_PACKETS, NakPacket, ReceiverBuffer, ReceiverStats,
+    clamp_ack_interval_micros, clamp_light_ack_interval_packets,
 };
 pub use srt_sender::{DEFAULT_MAX_BANDWIDTH_BYTES_PER_SEC, SenderBuffer, SenderStats};
 pub use stats::{
