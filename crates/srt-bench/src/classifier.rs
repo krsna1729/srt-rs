@@ -9,7 +9,7 @@ use crate::harness::Record;
 use crate::model::{
     AdmissionEnvelope, Availability, BondMode, CapacityAssessment, CapacityInput, CellClass,
     ClassifierPolicy, EncryptionMode, EndpointEnvelope, NetworkEnvelope, ProtocolEnvelope,
-    SocketBufferRequest, SrtBandwidthPolicy, WorkloadEnvelope, assess,
+    SocketBufferRequest, SrtBandwidthPolicy, TopologyEnvelope, WorkloadEnvelope, assess,
 };
 
 const OUTPUT_COLUMNS: &[&str] = &[
@@ -69,7 +69,10 @@ pub fn assessment_for_bench_config(
 
 fn classify_plan(cli: &crate::Cli, path: &Path) -> Result<Vec<OutputRow>, String> {
     let plan = crate::harness::resolve_plan_cells(cli).map_err(|error| error.to_string())?;
-    let cells = plan.cells().map_err(|error| error.to_string())?;
+    let (cells, enumeration) = plan
+        .enumerate_filtered()
+        .map_err(|error| error.to_string())?;
+    eprint!("{}", enumeration.render_table());
     if cells.is_empty() {
         return Err(format!(
             "{path:?}: every plan axis needs at least one value"
@@ -268,13 +271,68 @@ fn input_from_cli(
     let receiver = endpoint_from_cli(cli, cell, "recv", workload.physical_connections)?;
     let sender = endpoint_from_cli(cli, cell, "send", workload.physical_connections)?;
     let connect_cc = value_u64(cli, cell, &["connect-concurrency", "connect-cc"], 1)?;
+    let max_half_open_peers = value_u64(
+        cli,
+        cell,
+        &["max-half-open-peers", "max-half-open"],
+        srt_transport::PeerTableConfig::default().max_half_open_peers as u64,
+    )?;
+    let topology = topology_from_cli(cli, cell, bond, sender.nic_capacity_bps)?;
     Ok(CapacityInput {
         workload,
         protocol,
         network,
         sender,
         receiver,
-        admission: AdmissionEnvelope { connect_cc },
+        admission: AdmissionEnvelope {
+            connect_cc,
+            max_half_open_peers,
+        },
+        topology,
+    })
+}
+
+fn topology_from_cli(
+    cli: &crate::Cli,
+    cell: &BTreeMap<String, String>,
+    bond: BondMode,
+    sender_nic: Availability<u64>,
+) -> Result<TopologyEnvelope, String> {
+    let ingress = value(cli, cell, &["ingress", "recv-ingress"])
+        .unwrap_or("per-port")
+        .to_string();
+    let egress = value(cli, cell, &["egress", "send-egress"])
+        .unwrap_or("per-connection")
+        .to_string();
+    let cookie_routing = match value(cli, cell, &["cookie-routing", "cookie"]) {
+        Some("off" | "false" | "0") => false,
+        Some("on" | "true" | "1") | None => true,
+        Some(other) => {
+            return Err(format!(
+                "invalid --cookie-routing {other:?} (expected on or off)"
+            ));
+        }
+    };
+    let bonded = !matches!(bond, BondMode::None);
+    let nic_loopback = matches!(
+        value(cli, cell, &["nic"]),
+        Some("loopback" | "n/a" | "na" | "not-applicable")
+    ) || sender_nic == Availability::NotApplicable;
+    let same_path_bond = match value(cli, cell, &["same-path-bond"]) {
+        Some("on" | "true" | "1") => true,
+        Some("off" | "false" | "0") => false,
+        None => bonded && nic_loopback,
+        Some(other) => {
+            return Err(format!(
+                "invalid --same-path-bond {other:?} (expected on or off)"
+            ));
+        }
+    };
+    Ok(TopologyEnvelope {
+        ingress,
+        egress,
+        cookie_routing,
+        same_path_bond,
     })
 }
 
@@ -606,6 +664,17 @@ fn input_from_bench_config(cfg: &crate::BenchConfig) -> CapacityInput {
         receiver: endpoint("recv"),
         admission: AdmissionEnvelope {
             connect_cc: cfg.connect_concurrency as u64,
+            max_half_open_peers: srt_transport::PeerTableConfig::default().max_half_open_peers
+                as u64,
+        },
+        topology: TopologyEnvelope {
+            ingress: receiver_ingress,
+            egress: sender_egress.to_string(),
+            cookie_routing: cfg.cookie_routing,
+            same_path_bond: cfg.bond_mode != crate::BondMode::None
+                && (cfg.host == "127.0.0.1"
+                    || cfg.host == "localhost"
+                    || nic == Availability::NotApplicable),
         },
     }
 }

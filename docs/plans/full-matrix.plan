@@ -29,8 +29,11 @@
 # legs, but they do not provide independent network paths and therefore must
 # not be interpreted as a path-diversity/failover benchmark. Within
 # reuseport-multi with no bond group, relocate and bonded collapse to never,
-# so only never/all are retained. With the values below that leaves 67,200
-# executable, non-duplicate cells.
+# so only never/all are retained. The retained count is computed by the
+# production filter and pinned by
+# `crates/srt-bench/tests/full_matrix_enumeration.rs`; the harness prints a
+# per-reason filter summary that sums to the raw product. Do not copy a
+# retained count into this comment.
 # This is intentionally exhaustive across meaningful behavior, not a default
 # smoke test.
 #

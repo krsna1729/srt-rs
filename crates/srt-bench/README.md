@@ -127,12 +127,14 @@ bind options select one local endpoint. At the API level the unambiguous form
 is two prepared group endpoints using that same source and destination; URI
 parsing is an application convention, not part of the SRT wire protocol.
 
-For the checked-in `full-matrix.plan`, the raw product is 4,423,680 cells and
-the current capability-aware product is 67,200 cells. The harness recalculates
-and prints both values, so this documentation cannot hide a future filtering
-change. The omitted combinations are either no-op repetitions, over-capacity
-bond requests, or topologies that cannot yet realize one logical bonded
-ingress stream.
+For the checked-in `full-matrix.plan`, the raw product is 4,423,680 cells.
+The capability-aware retained count is computed by `filtered_cartesian_cells`
+and pinned by `crates/srt-bench/tests/full_matrix_enumeration.rs`. Matrix
+startup prints a per-reason filter-summary table (and optional
+`--filter-summary-json`) whose rows, including `kept`, sum to that raw
+product. Do not copy a retained count into prose: the omitted combinations
+are either no-op repetitions, over-capacity bond requests, or topologies
+that cannot yet realize one logical bonded ingress stream.
 
 `docs/plans/bonded-ingress.plan` is the focused semantic sweep: it runs a
 two-leg Broadcast and Backup publisher through the supported shared listener,

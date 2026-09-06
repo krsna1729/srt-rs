@@ -1095,9 +1095,13 @@ type Axis = (&'static str, Scope, Vec<String>);
 /// it applies to.
 type Cell<'a> = Vec<(&'a str, Scope, String)>;
 
-#[derive(Default)]
-struct MatrixFilterSummary {
-    by_reason: std::collections::BTreeMap<&'static str, usize>,
+/// Per-reason capability-filter counts for one Cartesian expansion.
+///
+/// `by_reason` counts only removed cells. Together with the kept count they
+/// reconstruct the raw product: `kept + total() == raw`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MatrixFilterSummary {
+    pub by_reason: std::collections::BTreeMap<&'static str, usize>,
 }
 
 impl MatrixFilterSummary {
@@ -1105,9 +1109,99 @@ impl MatrixFilterSummary {
         *self.by_reason.entry(reason).or_default() += 1;
     }
 
-    fn total(&self) -> usize {
+    #[must_use]
+    pub fn total(&self) -> usize {
         self.by_reason.values().sum()
     }
+
+    /// Text table with a `kept` row so the listed counts sum to `raw`.
+    #[must_use]
+    pub fn render_table(&self, raw: usize, kept: usize) -> String {
+        let mut rows: Vec<(&str, usize)> = vec![("kept", kept)];
+        rows.extend(
+            self.by_reason
+                .iter()
+                .map(|(reason, count)| (*reason, *count)),
+        );
+        let name_width = rows
+            .iter()
+            .map(|(name, _)| name.len())
+            .max()
+            .unwrap_or(6)
+            .max("reason".len());
+        let mut out = String::new();
+        out.push_str(&format!(
+            "  {reason:<name_width$}  {count:>10}\n",
+            reason = "reason",
+            count = "count"
+        ));
+        out.push_str(&format!(
+            "  {}  {}\n",
+            "-".repeat(name_width),
+            "-".repeat(10)
+        ));
+        for (reason, count) in &rows {
+            out.push_str(&format!("  {reason:<name_width$}  {count:>10}\n"));
+        }
+        out.push_str(&format!(
+            "  {}  {}\n",
+            "-".repeat(name_width),
+            "-".repeat(10)
+        ));
+        out.push_str(&format!("  {:<name_width$}  {raw:>10}\n", "raw"));
+        out
+    }
+
+    /// Machine-readable companion to [`Self::render_table`].
+    #[must_use]
+    pub fn render_json(&self, raw: usize, kept: usize) -> String {
+        let mut reasons = String::new();
+        for (i, (reason, count)) in self.by_reason.iter().enumerate() {
+            if i > 0 {
+                reasons.push(',');
+            }
+            reasons.push_str(&format!("\"{reason}\":{count}"));
+        }
+        format!(
+            "{{\"raw\":{raw},\"kept\":{kept},\"filtered\":{},\"by_reason\":{{{reasons}}}}}\n",
+            self.total()
+        )
+    }
+}
+
+/// Raw product, retained cells, and per-reason removals from the production
+/// capability filter. The kept count is whatever the current filter yields;
+/// it is not a documented constant.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MatrixEnumeration {
+    pub raw_cells: usize,
+    pub kept_cells: usize,
+    pub filter_summary: MatrixFilterSummary,
+}
+
+impl MatrixEnumeration {
+    #[must_use]
+    pub fn render_table(&self) -> String {
+        self.filter_summary
+            .render_table(self.raw_cells, self.kept_cells)
+    }
+
+    #[must_use]
+    pub fn render_json(&self) -> String {
+        self.filter_summary
+            .render_json(self.raw_cells, self.kept_cells)
+    }
+}
+
+/// Expand a plan or CLI axis set through the production capability filter.
+///
+/// This is the same walk `srt-bench matrix` uses. Tests pin the full-matrix
+/// product here instead of reimplementing the filter or copying a retained
+/// count out of prose.
+pub fn enumerate_plan(cli: &crate::Cli) -> std::io::Result<MatrixEnumeration> {
+    let plan = resolve_plan_cells(cli)?;
+    let (_cells, enumeration) = plan.enumerate_filtered()?;
+    Ok(enumeration)
 }
 
 fn matrix_axis_values<'a>(axes: &'a [Axis], name: &str) -> &'a [String] {
@@ -1765,6 +1859,41 @@ pub struct ResolvedPlan {
 impl ResolvedPlan {
     pub(crate) fn axes(&self) -> &[Axis] {
         &self.axes
+    }
+
+    /// Expand through the production capability filter and map each kept cell
+    /// onto the classify/CLI key space.
+    pub fn enumerate_filtered(
+        &self,
+    ) -> std::io::Result<(
+        Vec<std::collections::BTreeMap<String, String>>,
+        MatrixEnumeration,
+    )> {
+        let (cells, raw_cells, filter_summary) = filtered_cartesian_cells(&self.axes)?;
+        let kept_cells = cells.len();
+        let mapped = cells
+            .into_iter()
+            .map(|cell| {
+                cell.into_iter()
+                    .map(|(name, scope, value)| {
+                        let key = match scope {
+                            Scope::Both => name.to_string(),
+                            Scope::Recv => format!("recv-{name}"),
+                            Scope::Send => format!("send-{name}"),
+                        };
+                        (key, value)
+                    })
+                    .collect()
+            })
+            .collect();
+        Ok((
+            mapped,
+            MatrixEnumeration {
+                raw_cells,
+                kept_cells,
+                filter_summary,
+            },
+        ))
     }
 
     /// Expand every resolved plan cell without matrix capability filtering.
@@ -2884,18 +3013,26 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<MatrixReport> {
     // holding the raw 1.7-million-cell product in memory.
     let (mut cells, raw_cells, filter_summary) = filtered_cartesian_cells(axes)?;
     add_cpu_identity(&mut cells, recv_cpus, send_cpus);
-    if filter_summary.total() > 0 {
-        let reasons = filter_summary
-            .by_reason
-            .iter()
-            .map(|(reason, count)| format!("{reason}={count}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        eprintln!(
-            "matrix: filtered {} of {} cells ({reasons})",
-            filter_summary.total(),
-            raw_cells
-        );
+    let enumeration = MatrixEnumeration {
+        raw_cells,
+        kept_cells: cells.len(),
+        filter_summary,
+    };
+    eprintln!(
+        "matrix: {} of {} cells kept after capability filtering",
+        enumeration.kept_cells, enumeration.raw_cells
+    );
+    eprint!("{}", enumeration.render_table());
+    if let Some(path) = cli
+        .flags
+        .get("filter-summary-json")
+        .filter(|path| !path.is_empty())
+    {
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, enumeration.render_json())?;
+        eprintln!("matrix: wrote filter summary JSON to {path}");
     }
     let (order, seed) = matrix_order(cli)?;
     let schedule = build_matrix_schedule(ScheduleInputs {
@@ -3861,6 +3998,15 @@ mod matrix_filter_tests {
         assert_eq!(raw, 8);
         assert_eq!(cells.len(), 5);
         assert_eq!(summary.total(), 3);
+        assert_eq!(cells.len() + summary.total(), raw);
+        let table = summary.render_table(raw, cells.len());
+        assert!(table.contains("kept"), "{table}");
+        assert!(table.contains("batch-inert"), "{table}");
+        assert!(table.contains("raw"), "{table}");
+        let json = summary.render_json(raw, cells.len());
+        assert!(json.contains("\"raw\":8"), "{json}");
+        assert!(json.contains("\"kept\":5"), "{json}");
+        assert!(json.contains("\"filtered\":3"), "{json}");
     }
 
     #[test]

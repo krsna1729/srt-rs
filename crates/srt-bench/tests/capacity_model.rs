@@ -6,7 +6,7 @@ use srt_bench::harness::COLUMNS;
 use srt_bench::model::{
     Availability, BondMode, CapacityInput, CapacityReason, CellClass, ClassifierPolicy,
     EncryptionMode, HostEnvelope, NetworkEnvelope, ProtocolEnvelope, SrtBandwidthPolicy,
-    WorkloadEnvelope, assess,
+    TopologyEnvelope, WorkloadEnvelope, assess,
 };
 
 fn known_input() -> CapacityInput {
@@ -303,6 +303,12 @@ fn window_host_socket_and_nic_boundaries_are_typed() {
             .reasons
             .contains(&CapacityReason::HostPpsCapacityUnknown)
     );
+    assert!(
+        unknown_host
+            .reasons
+            .contains(&CapacityReason::RuntimeCapacityUnknown)
+    );
+    assert_eq!(unknown_host.class, CellClass::Conditional);
 
     input = known_input();
     input.receiver.nic_capacity_bps = Availability::NotApplicable;
@@ -661,5 +667,85 @@ fn backup_control_uncertainty_is_reflected_in_its_confidence() {
     assert!(
         a.reasons.contains(&CapacityReason::ControlRateUncertain),
         "an unknown control rate must always carry an uncertainty reason"
+    );
+}
+
+#[test]
+fn reuseport_without_cookie_is_a_labeled_diagnostic_control() {
+    let mut input = known_input();
+    input.topology = TopologyEnvelope {
+        ingress: "reuseport-multi:4".to_string(),
+        cookie_routing: false,
+        ..TopologyEnvelope::default()
+    };
+    let a = assessment(input);
+    assert_eq!(a.class, CellClass::DiagnosticControl);
+    assert!(
+        a.reasons
+            .contains(&CapacityReason::ReuseportRehashWithoutCookie)
+    );
+}
+
+#[test]
+fn shared_sender_and_connect_storm_are_labeled_not_dropped() {
+    let mut input = known_input();
+    input.topology.egress = "shared-socket".to_string();
+    input.admission.connect_cc = 50;
+    input.workload.physical_connections = 200;
+    let a = assessment(input);
+    assert_eq!(a.class, CellClass::DiagnosticControl);
+    assert!(
+        a.reasons
+            .contains(&CapacityReason::SharedSenderPopulationScan)
+    );
+    assert!(a.reasons.contains(&CapacityReason::ConnectStorm));
+}
+
+#[test]
+fn same_path_bond_is_a_diagnostic_control() {
+    let mut input = known_input();
+    input.protocol.bond = BondMode::Broadcast;
+    input.workload.physical_connections = 2;
+    input.workload.logical_streams = 1;
+    input.topology.same_path_bond = true;
+    let a = assessment(input);
+    assert_eq!(a.class, CellClass::DiagnosticControl);
+    assert!(a.reasons.contains(&CapacityReason::BondSamePathOnly));
+}
+
+#[test]
+fn half_open_offer_above_published_cap_exceeds_envelope() {
+    let mut input = known_input();
+    input.workload.physical_connections = 2000;
+    input.admission.connect_cc = 2000;
+    input.admission.max_half_open_peers =
+        srt_transport::PeerTableConfig::default().max_half_open_peers as u64;
+    let a = assessment(input);
+    assert_eq!(a.class, CellClass::ExceedsEnvelope);
+    assert!(
+        a.reasons
+            .contains(&CapacityReason::HalfOpenCapacityExceeded)
+    );
+}
+
+#[test]
+fn deadline_ratio_below_two_repair_rounds_is_conditional() {
+    let mut input = known_input();
+    input.network.expected_rtt = Availability::Known(Duration::from_millis(80));
+    input.protocol.tsbpd_latency_ms = 120;
+    let a = assessment(input);
+    assert!(a.reasons.contains(&CapacityReason::DeadlineRatioAggressive));
+    assert_eq!(a.class, CellClass::Conditional);
+}
+
+#[test]
+fn legacy_maxbw_does_not_cover_known_loss_retransmit_headroom() {
+    let mut input = known_input();
+    input.protocol.bandwidth = SrtBandwidthPolicy::LegacySourceFixed;
+    input.network.expected_loss_probability = Availability::Known(0.05);
+    let a = assessment(input);
+    assert!(
+        a.reasons
+            .contains(&CapacityReason::RetransmissionHeadroomMissing)
     );
 }

@@ -379,11 +379,48 @@ pub type HostEnvelope = EndpointEnvelope;
 pub struct AdmissionEnvelope {
     /// Process-wide connect concurrency limit.
     pub connect_cc: u64,
+    /// Listener half-open peer cap consumed from the transport admission
+    /// table. The model does not reimplement the limiter; it only compares
+    /// the offered handshake population against this published bound.
+    pub max_half_open_peers: u64,
 }
 
 impl Default for AdmissionEnvelope {
     fn default() -> Self {
-        Self { connect_cc: 1 }
+        Self {
+            connect_cc: 1,
+            max_half_open_peers: srt_transport::PeerTableConfig::default().max_half_open_peers
+                as u64,
+        }
+    }
+}
+
+/// Topology knobs that change soundness even when the load envelope fits.
+///
+/// These are not derived quantities. They are first-class inputs so a
+/// cookie-off reuseport cell, a shared-sender scan, or a same-path bond
+/// is labeled rather than dropped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TopologyEnvelope {
+    /// Listener ingress, using the bench spelling (`per-port`,
+    /// `reuseport-multi:4`, …).
+    pub ingress: String,
+    /// Caller egress (`per-connection` or `shared-socket`).
+    pub egress: String,
+    /// Cookie-keyed handshake rescue. Meaningful on reuseport-multi.
+    pub cookie_routing: bool,
+    /// Bonded legs share one physical path (loopback / identical 4-tuple).
+    pub same_path_bond: bool,
+}
+
+impl Default for TopologyEnvelope {
+    fn default() -> Self {
+        Self {
+            ingress: "per-port".to_string(),
+            egress: "per-connection".to_string(),
+            cookie_routing: true,
+            same_path_bond: false,
+        }
     }
 }
 
@@ -396,6 +433,7 @@ pub struct CapacityInput {
     pub sender: EndpointEnvelope,
     pub receiver: EndpointEnvelope,
     pub admission: AdmissionEnvelope,
+    pub topology: TopologyEnvelope,
 }
 
 impl Default for WorkloadEnvelope {
@@ -526,6 +564,14 @@ pub enum CapacityReason {
     NicCapacityExceeded,
     ExpectedControlRateHigh,
     AdmissionWavesHigh,
+    ReuseportRehashWithoutCookie,
+    HalfOpenCapacityExceeded,
+    SharedSenderPopulationScan,
+    ConnectStorm,
+    BondSamePathOnly,
+    DeadlineRatioAggressive,
+    RetransmissionHeadroomMissing,
+    RuntimeCapacityUnknown,
 }
 
 const REASON_CODES: &[&str] = &[
@@ -554,6 +600,14 @@ const REASON_CODES: &[&str] = &[
     "nic_capacity_exceeded",
     "expected_control_rate_high",
     "admission_waves_high",
+    "reuseport_rehash_without_cookie",
+    "half_open_capacity_exceeded",
+    "shared_sender_population_scan",
+    "connect_storm",
+    "bond_same_path_only",
+    "deadline_ratio_aggressive",
+    "retransmission_headroom_missing",
+    "runtime_capacity_unknown",
 ];
 
 impl CapacityReason {
@@ -569,10 +623,14 @@ impl CapacityReason {
             | Self::PayloadExceedsIpv4MtuEnvelope
             | Self::WindowBelowBdpRequirement
             | Self::HostPpsCapacityExceeded
-            | Self::NicCapacityExceeded => ReasonSeverity::Hard,
-            Self::SourceExceedsPacingEnvelope | Self::ProtocolOverheadExceedsPacingHeadroom => {
-                ReasonSeverity::Diagnostic
-            }
+            | Self::NicCapacityExceeded
+            | Self::HalfOpenCapacityExceeded => ReasonSeverity::Hard,
+            Self::SourceExceedsPacingEnvelope
+            | Self::ProtocolOverheadExceedsPacingHeadroom
+            | Self::ReuseportRehashWithoutCookie
+            | Self::SharedSenderPopulationScan
+            | Self::ConnectStorm
+            | Self::BondSamePathOnly => ReasonSeverity::Diagnostic,
             _ => ReasonSeverity::Conditional,
         }
     }
@@ -1490,6 +1548,9 @@ fn collect_reasons(
     add_host_reasons(input, policy, derived, &mut reasons);
     add_nic_reasons(input, policy, derived, &mut reasons);
     add_policy_reasons(policy, derived, &mut reasons);
+    add_topology_reasons(input, &mut reasons);
+    add_deadline_ratio_reason(derived, &mut reasons);
+    add_retransmit_headroom_reason(input, derived, &mut reasons);
     reasons
 }
 
@@ -1671,6 +1732,7 @@ fn add_host_reasons(
         .any(|(capacity, _)| *capacity == Availability::Unknown)
     {
         reasons.push(CapacityReason::HostPpsCapacityUnknown);
+        reasons.push(CapacityReason::RuntimeCapacityUnknown);
     } else if endpoint_capacities
         .iter()
         .any(|(capacity, utilization)| {
@@ -1743,6 +1805,69 @@ fn add_policy_reasons(
         && derived.admission_waves > limit
     {
         reasons.push(CapacityReason::AdmissionWavesHigh);
+    }
+}
+
+fn add_topology_reasons(input: &CapacityInput, reasons: &mut Vec<CapacityReason>) {
+    let ingress = input.topology.ingress.as_str();
+    if ingress.starts_with("reuseport-multi") && !input.topology.cookie_routing {
+        reasons.push(CapacityReason::ReuseportRehashWithoutCookie);
+    }
+    if input.topology.egress == "shared-socket" {
+        reasons.push(CapacityReason::SharedSenderPopulationScan);
+    }
+    let bonded = !matches!(input.protocol.bond, BondMode::None);
+    let storm_floor = if bonded { 2 } else { 1 };
+    if input.admission.connect_cc > storm_floor {
+        reasons.push(CapacityReason::ConnectStorm);
+    }
+    if bonded && input.topology.same_path_bond {
+        reasons.push(CapacityReason::BondSamePathOnly);
+    }
+    add_half_open_reason(input, reasons);
+}
+
+fn add_half_open_reason(input: &CapacityInput, reasons: &mut Vec<CapacityReason>) {
+    let offered = input
+        .admission
+        .connect_cc
+        .min(input.workload.physical_connections);
+    if input.admission.max_half_open_peers > 0 && offered > input.admission.max_half_open_peers {
+        reasons.push(CapacityReason::HalfOpenCapacityExceeded);
+    }
+}
+
+fn add_deadline_ratio_reason(derived: &DerivedLoad, reasons: &mut Vec<CapacityReason>) {
+    if let Availability::Known(rounds) = derived.approximate_repair_rounds_available
+        && (0.0..2.0).contains(&rounds)
+    {
+        reasons.push(CapacityReason::DeadlineRatioAggressive);
+    }
+}
+
+fn retransmission_headroom_missing(input: &CapacityInput, derived: &DerivedLoad) -> bool {
+    let Availability::Known(loss) = input.network.expected_loss_probability else {
+        return false;
+    };
+    if loss <= 0.0 {
+        return false;
+    }
+    match input.protocol.bandwidth {
+        SrtBandwidthPolicy::LegacySourceFixed => true,
+        SrtBandwidthPolicy::InputRelative { overhead_percent } => {
+            matches!(derived.retransmission_factor, Availability::Known(factor) if (overhead_percent as f64) < (factor - 1.0) * 100.0)
+        }
+        SrtBandwidthPolicy::ProtocolDefault | SrtBandwidthPolicy::FixedBps(_) => false,
+    }
+}
+
+fn add_retransmit_headroom_reason(
+    input: &CapacityInput,
+    derived: &DerivedLoad,
+    reasons: &mut Vec<CapacityReason>,
+) {
+    if retransmission_headroom_missing(input, derived) {
+        reasons.push(CapacityReason::RetransmissionHeadroomMissing);
     }
 }
 
