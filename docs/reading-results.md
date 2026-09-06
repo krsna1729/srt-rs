@@ -92,6 +92,23 @@ with overflow climbing is the transport failing to carry the configured
 workload — cross-reference `srt_maxbw_bps` before blaming the runtime,
 since a pacing ceiling below the source rate produces exactly this.
 
+### Host contention, not protocol
+
+Environment evidence. Independent of the canonical clean predicate.
+
+| column | meaning |
+|---|---|
+| `host_contention_policy_fingerprint` | thresholds + mode used for this row |
+| `host_contention` | `quiet` / `contended` / `unknown` / `allowed` |
+| `host_contention_signals` | which signals fired (`cpu_psi`, `cpu_stall`, `mem_psi`, `io_psi`, `steal`) |
+| `host_cpu_psi_some_avg10_pre` / `_post` | CPU PSI `some avg10` at role start and result write |
+| `host_cpu_psi_stall_pct` | PSI `some total` delta as percent of wall time (mid-cell) |
+| `host_mem_psi_some_avg10_max` / `host_io_psi_some_avg10_max` | max of pre/post for memory and io PSI |
+| `host_steal_pct` | steal jiffies as percent of CPU jiffies over the role |
+
+A contended row is never silently ordinary. `--host-contention=allow` opts
+out of refusal/marking for noisy CI while still recording the numbers.
+
 ### Kernel, not protocol
 
 | column | meaning |

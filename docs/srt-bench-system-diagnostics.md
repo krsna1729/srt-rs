@@ -34,3 +34,26 @@ startup raise normally resolves this when the hard limit permits it. The
 diagnostic should be saved alongside benchmark results because memory,
 affinity, socket-buffer sysctls, and io_uring availability can change the
 capacity offered by the same source revision.
+
+## Host contention (issue #83)
+
+Timing-sensitive matrix cells also sample Linux PSI (`/proc/pressure/cpu`,
+`memory`, `io`) and `/proc/stat` steal time. Contention is an *environment*
+signal: it is recorded on every result row and can refuse a cell under
+`--host-contention=refuse`, but it does **not** change the canonical clean
+predicate.
+
+| flag | meaning |
+|---|---|
+| `--host-contention=mark` | default: wait briefly for quiet, always run, stamp contended rows |
+| `--host-contention=refuse` | wait up to `--host-contention-timeout-secs` (default 60); refuse on timeout or mid-cell contention |
+| `--host-contention=allow` / `--allow-host-contention` | opt-out for noisy CI; status `allowed`, raw PSI/steal still recorded |
+| `--host-cpu-psi-avg10` / `--host-mem-psi-avg10` / `--host-io-psi-avg10` | PSI `some avg10` thresholds (percent, default 10) |
+| `--host-cpu-stall-pct` | mid-cell stall from PSI `total` delta / wall time (percent, default 10) |
+| `--host-steal-pct` | steal jiffies fraction over the cell (percent, default 5) |
+
+Row fields: `host_contention_policy_fingerprint`, `host_contention`,
+`host_contention_signals`, `host_cpu_psi_some_avg10_{pre,post}`,
+`host_cpu_psi_stall_pct`, `host_mem_psi_some_avg10_max`,
+`host_io_psi_some_avg10_max`, `host_steal_pct`.
+

@@ -161,6 +161,9 @@ fn run_matrix(dir: &Path, sender: &Path, receiver: &Path, extra: &[String]) -> M
         .arg(format!("--out={}", out.display()))
         .arg("--reps=1")
         .arg("--secs=1")
+        // Process stubs are not timing-sensitive; skip admission waits so a
+        // busy shared host cannot turn exit-status tests into timeouts.
+        .arg("--allow-host-contention")
         .args(extra)
         // Keeps the parent's host-diagnostics banner out of the captured
         // stderr; it has nothing to do with what is asserted here.
