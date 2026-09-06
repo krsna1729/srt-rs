@@ -40,10 +40,11 @@ jobs:
         run: |
           timeout 3h ./target/release/srt-bench matrix --plan docs/plans/throughput-matrix.plan \
             --reps 1 --out throughput.tsv || true
-      # full-matrix.plan is documented at 67,200 cells -- explicitly an
-      # exhaustive investigation tool, not something any realistic budget
-      # finishes in one pass. Given the remaining ~2h30m, treat it as a
-      # slowly-rotating exploration instead of a trend series: seed by ISO
+      # full-matrix.plan is the exhaustive investigation tool (raw product
+      # 4,423,680; see the enumeration pin test for the current kept count),
+      # not something any realistic budget finishes in one pass. Given the
+      # remaining ~2h30m, treat it as a slowly-rotating exploration instead
+      # of a trend series: seed by ISO
       # week number so consecutive weeks sample different regions
       # (`--order interleaved` already rotates the broad axes within one
       # run so even a partial slice stays broadly representative).

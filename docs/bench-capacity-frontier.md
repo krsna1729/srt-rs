@@ -178,6 +178,14 @@ Reason severity is separate from the English explanation:
 | `nic_capacity_exceeded` | hard | Predicted wire rate exceeds known NIC capacity. |
 | `expected_control_rate_high` | conditional | Control PPS exceeds an explicitly configured policy ceiling. |
 | `admission_waves_high` | conditional | Admission waves exceed an explicitly configured ceiling. More waves means LOWER handshake concurrency and a slower ramp, which is a timing caveat rather than a capacity limit. |
+| `reuseport_rehash_without_cookie` | diagnostic | `reuseport-multi` with cookie routing off. A valid stress/control: SO_REUSEPORT rehash can strand a handshake. Labeled, not dropped. |
+| `half_open_capacity_exceeded` | hard | Offered handshake population `min(connect_cc, physical_connections)` exceeds the published listener `max_half_open_peers` bound. The model consumes that bound; it does not reimplement admission limiting. |
+| `shared_sender_population_scan` | diagnostic | Shared-socket egress. The shared sender scans the connection population; results are a control, not a per-connection production ranking. |
+| `connect_storm` | diagnostic | Connect concurrency above the topology floor (`1` unbonded, `2` bonded). `cc=1` is the production-safe default; higher values reproduce concurrent-arrival admission. |
+| `bond_same_path_only` | diagnostic | Bonded cell on a single physical path (loopback / identical 4-tuple). Valid protocol/group exercise; not a path-diversity measurement. |
+| `deadline_ratio_aggressive` | conditional | Known TSBPD / guarded-RTT repair-round count is below 2. Distinct from `recovery_margin_insufficient`, which is an absolute millisecond policy floor. |
+| `retransmission_headroom_missing` | conditional | Expected loss is known and positive, but the pacing policy does not leave retransmission headroom (`legacy-source-fixed`, or `input-relative` overhead below `100*(1/(1-p)-1)`). |
+| `runtime_capacity_unknown` | conditional | Host packet-processing capacity was not supplied. Same condition as `host_pps_capacity_unknown`; this is the D-class / `RUNTIME_CAPACITY_UNKNOWN` label until a fitted host μ exists. |
 
 Encryption key length and cipher mode are separate inputs. `--encryption`
 selects AES-128/192/256; it does not select GCM. `Encryption::apply_to` sets
@@ -205,17 +213,21 @@ ceilings. The default revision is
 from folklore, so the campaign cells remain Conditional when RTT, jitter,
 effective buffers, or host PPS are unknown.
 
-Two reason codes from the issue's illustrative list are deliberately absent,
-recorded here rather than left as a silent deviation. `LossRecoveryHeadroomLow`
-would duplicate existing coverage: an insufficient repair budget is already
-`RecoveryMarginInsufficient`, and an unquantified loss expectation is already
-`ExpectedLossUnknown`, so a third overlapping code would make two reasons fire
-for one condition. `AdmissionConcurrencyLow` has no capacity meaning here: a
-small `connect_cc` only increases `admission_waves`, which the model derives
-and reports, and slower admission is not a capacity risk -- only an unusually
-high concurrency is, which a `max_connect_concurrency` policy would cover if
-evidence ever justified one. Both can
-be added if evidence shows a condition neither existing code expresses.
+Issue #71's remaining illustrative names that would duplicate existing codes
+are still absent, recorded here rather than left as a silent deviation.
+`LossRecoveryHeadroomLow` overlaps `RecoveryMarginInsufficient` /
+`ExpectedLossUnknown`. `AdmissionConcurrencyLow` has no capacity meaning:
+a small `connect_cc` only increases `admission_waves`. Topology and
+handshake-population codes from the same list
+(`reuseport_rehash_without_cookie`, `half_open_capacity_exceeded`,
+`shared_sender_population_scan`, `connect_storm`, `bond_same_path_only`,
+`deadline_ratio_aggressive`, `retransmission_headroom_missing`,
+`runtime_capacity_unknown`) are first-class reasons above.
+
+The full-matrix retained count is not a documented constant. Parse
+`docs/plans/full-matrix.plan` through `enumerate_plan` /
+`filtered_cartesian_cells` and read the filter-summary table; the pin is
+`crates/srt-bench/tests/full_matrix_enumeration.rs`.
 
 ## Observed frontier
 
