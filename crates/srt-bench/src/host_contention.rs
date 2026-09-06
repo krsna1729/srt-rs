@@ -196,38 +196,38 @@ pub fn parse_psi(text: &str) -> PsiResource {
         let Some((kind, rest)) = line.split_once(' ') else {
             continue;
         };
-        let mut avg10 = None;
-        let mut total = None;
-        for token in rest.split_whitespace() {
-            if let Some(value) = token.strip_prefix("avg10=") {
-                avg10 = value.parse().ok();
-            } else if let Some(value) = token.strip_prefix("total=") {
-                total = value.parse().ok();
-            }
-        }
-        match kind {
-            "some" => {
-                if let Some(v) = avg10 {
-                    resource.some_avg10 = v;
-                }
-                if let Some(v) = total {
-                    resource.some_total_us = v;
-                }
-                resource.available = true;
-            }
-            "full" => {
-                if let Some(v) = avg10 {
-                    resource.full_avg10 = v;
-                }
-                if let Some(v) = total {
-                    resource.full_total_us = v;
-                }
-                resource.available = true;
-            }
-            _ => {}
-        }
+        let (avg10, total) = parse_psi_kv(rest);
+        apply_psi_kind(&mut resource, kind, avg10, total);
     }
     resource
+}
+
+fn parse_psi_kv(rest: &str) -> (Option<f64>, Option<u64>) {
+    let mut avg10 = None;
+    let mut total = None;
+    for token in rest.split_whitespace() {
+        if let Some(value) = token.strip_prefix("avg10=") {
+            avg10 = value.parse().ok();
+        } else if let Some(value) = token.strip_prefix("total=") {
+            total = value.parse().ok();
+        }
+    }
+    (avg10, total)
+}
+
+fn apply_psi_kind(resource: &mut PsiResource, kind: &str, avg10: Option<f64>, total: Option<u64>) {
+    let (avg_slot, total_slot) = match kind {
+        "some" => (&mut resource.some_avg10, &mut resource.some_total_us),
+        "full" => (&mut resource.full_avg10, &mut resource.full_total_us),
+        _ => return,
+    };
+    if let Some(v) = avg10 {
+        *avg_slot = v;
+    }
+    if let Some(v) = total {
+        *total_slot = v;
+    }
+    resource.available = true;
 }
 
 /// Parse aggregate steal and total jiffies from `/proc/stat`.
@@ -411,15 +411,7 @@ pub fn evaluate(
         );
     }
 
-    let any_signal = pre.cpu.available
-        || post.cpu.available
-        || pre.memory.available
-        || post.memory.available
-        || pre.io.available
-        || post.io.available
-        || pre.steal_available
-        || post.steal_available;
-    if !any_signal {
+    if !any_host_signal(pre, post) {
         return build_evidence(
             HostContentionStatus::Unknown,
             Vec::new(),
@@ -431,6 +423,41 @@ pub fn evaluate(
         );
     }
 
+    let signals = collect_contention_signals(policy, pre, post, stall, observed_steal);
+    let status = if signals.is_empty() {
+        HostContentionStatus::Quiet
+    } else {
+        HostContentionStatus::Contended
+    };
+    build_evidence(
+        status,
+        signals,
+        fingerprint,
+        pre,
+        post,
+        stall,
+        observed_steal,
+    )
+}
+
+fn any_host_signal(pre: &HostContentionSnapshot, post: &HostContentionSnapshot) -> bool {
+    pre.cpu.available
+        || post.cpu.available
+        || pre.memory.available
+        || post.memory.available
+        || pre.io.available
+        || post.io.available
+        || pre.steal_available
+        || post.steal_available
+}
+
+fn collect_contention_signals(
+    policy: &HostContentionPolicy,
+    pre: &HostContentionSnapshot,
+    post: &HostContentionSnapshot,
+    stall: Option<f64>,
+    observed_steal: Option<f64>,
+) -> Vec<&'static str> {
     let mut signals = Vec::new();
     if psi_exceeds(pre.cpu, policy.cpu_psi_avg10_pct)
         || psi_exceeds(post.cpu, policy.cpu_psi_avg10_pct)
@@ -455,21 +482,7 @@ pub fn evaluate(
     {
         signals.push("steal");
     }
-
-    let status = if signals.is_empty() {
-        HostContentionStatus::Quiet
-    } else {
-        HostContentionStatus::Contended
-    };
-    build_evidence(
-        status,
-        signals,
-        fingerprint,
-        pre,
-        post,
-        stall,
-        observed_steal,
-    )
+    signals
 }
 
 fn build_evidence(
@@ -619,7 +632,7 @@ cpu0 50 0 25 500 0 0 5 10 0 0
 ";
         let (steal, total) = parse_stat_steal(text).expect("steal");
         assert_eq!(steal, 25);
-        assert_eq!(total, 100 + 0 + 50 + 1000 + 0 + 0 + 10 + 25 + 0 + 0);
+        assert_eq!(total, [100, 0, 50, 1000, 0, 0, 10, 25, 0, 0].iter().sum::<u64>());
     }
 
     #[test]
@@ -629,12 +642,14 @@ cpu0 50 0 25 500 0 0 5 10 0 0
             cpu_psi_avg10_pct: 10.0,
             ..HostContentionPolicy::default()
         };
-        let mut pre = HostContentionSnapshot::default();
-        pre.cpu = PsiResource {
-            some_avg10: 0.0,
-            some_total_us: 1_000_000,
-            available: true,
-            ..PsiResource::default()
+        let pre = HostContentionSnapshot {
+            cpu: PsiResource {
+                some_avg10: 0.0,
+                some_total_us: 1_000_000,
+                available: true,
+                ..PsiResource::default()
+            },
+            ..HostContentionSnapshot::default()
         };
         let mut post = pre;
         post.cpu.some_avg10 = 15.0;
@@ -653,12 +668,14 @@ cpu0 50 0 25 500 0 0 5 10 0 0
             cpu_stall_pct: 10.0,
             ..HostContentionPolicy::default()
         };
-        let mut pre = HostContentionSnapshot::default();
-        pre.cpu = PsiResource {
-            some_avg10: 0.0,
-            some_total_us: 1_000_000,
-            available: true,
-            ..PsiResource::default()
+        let pre = HostContentionSnapshot {
+            cpu: PsiResource {
+                some_avg10: 0.0,
+                some_total_us: 1_000_000,
+                available: true,
+                ..PsiResource::default()
+            },
+            ..HostContentionSnapshot::default()
         };
         let mut post = pre;
         // 2_000_000 us stalled over an 8s (8_000_000 us) cell => 25%.
@@ -703,12 +720,14 @@ cpu0 50 0 25 500 0 0 5 10 0 0
             mode: HostContentionMode::Allow,
             ..HostContentionPolicy::default()
         };
-        let mut snap = HostContentionSnapshot::default();
-        snap.cpu = PsiResource {
-            some_avg10: 90.0,
-            some_total_us: 1,
-            available: true,
-            ..PsiResource::default()
+        let snap = HostContentionSnapshot {
+            cpu: PsiResource {
+                some_avg10: 90.0,
+                some_total_us: 1,
+                available: true,
+                ..PsiResource::default()
+            },
+            ..HostContentionSnapshot::default()
         };
         let evidence = evaluate(&policy, &snap, &snap, Duration::from_secs(1));
         assert_eq!(evidence.status, HostContentionStatus::Allowed);
@@ -742,16 +761,18 @@ cpu0 50 0 25 500 0 0 5 10 0 0
     #[test]
     fn quiet_when_below_thresholds() {
         let policy = HostContentionPolicy::default();
-        let mut snap = HostContentionSnapshot::default();
-        snap.cpu = PsiResource {
-            some_avg10: 1.0,
-            some_total_us: 100,
-            available: true,
-            ..PsiResource::default()
+        let snap = HostContentionSnapshot {
+            cpu: PsiResource {
+                some_avg10: 1.0,
+                some_total_us: 100,
+                available: true,
+                ..PsiResource::default()
+            },
+            steal_available: true,
+            steal_jiffies: 0,
+            cpu_jiffies: 1000,
+            ..HostContentionSnapshot::default()
         };
-        snap.steal_available = true;
-        snap.steal_jiffies = 0;
-        snap.cpu_jiffies = 1000;
         let evidence = evaluate(&policy, &snap, &snap, Duration::from_secs(5));
         assert_eq!(evidence.status, HostContentionStatus::Quiet);
         assert!(evidence.signals.is_empty());
