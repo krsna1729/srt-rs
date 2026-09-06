@@ -138,6 +138,10 @@ impl Cli {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Runtime {
     Mio,
+    /// Issue #82 A2: mio-shaped sender driven by `HighResWaiter` (one
+    /// epoll_pwait2 / absolute-timerfd waiter per worker). Receiver falls
+    /// through to the ordinary mio path; measure with recv=mio / send=a2.
+    A2,
     Tokio,
     Smol,
     Monoio,
@@ -149,6 +153,7 @@ impl Runtime {
     pub fn parse(s: &str) -> Option<Self> {
         Some(match s {
             "mio" => Self::Mio,
+            "a2" => Self::A2,
             "tokio" => Self::Tokio,
             "smol" => Self::Smol,
             "monoio" => Self::Monoio,
@@ -161,6 +166,7 @@ impl Runtime {
     pub fn name(self) -> &'static str {
         match self {
             Self::Mio => "mio",
+            Self::A2 => "a2",
             Self::Tokio => "tokio",
             Self::Smol => "smol",
             Self::Monoio => "monoio",

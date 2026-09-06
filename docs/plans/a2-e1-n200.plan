@@ -1,0 +1,27 @@
+# E1: A2 HighResWaiter vs Tokio at N=200 (PR #86).
+# Only report cells where generated ≈ 760 × secs × N within ~0.5%.
+
+recv-runtime        = mio
+send-runtime        = a2,tokio
+connections         = 200
+bitrate             = 8000000
+srt-bandwidth       = input-relative:25,input-relative:100,fixed:100000000
+ingress             = shared-pool:4
+egress              = per-connection
+encryption          = plain
+promotion           = all
+cookie-routing      = on
+batch               = on
+sock-buf            = 16m
+bond                = none
+connect-concurrency = 50
+pin                 = off
+source-backlog-ms   = 1000
+
+[recv]
+workers             = 3
+cpus                = 0-2
+
+[send]
+workers             = 3
+cpus                = 3-5

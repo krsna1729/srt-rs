@@ -40,6 +40,13 @@ Three layers:
    - `DueIndex<K>` — a lazy-deletion deadline heap for shared loops that
      own many connections. Per-connection timer maps stay small; the index
      prevents a separate O(peers) scan just to find which maps are due.
+   - `DeadlineHeap<K>` / `HighResWaiter<K>` — one high-resolution waiter
+     per worker (issue #82 A2). Absolute `CLOCK_MONOTONIC` deadlines in a
+     min-heap, `epoll_pwait2` (nanosecond timeout) with absolute-`timerfd`
+     fallback, no per-connection spin. After a single wake the caller
+     services every due connection. This is the alternative that must be
+     tried before Route B ownership/debt changes to `SrtConnection`. See
+     [high-res-waiter.md](../../docs/perf/high-res-waiter.md).
    - `OutputDrainBudget` / `OutputDrainReport` — explicit per-tick action,
      packet, and byte limits shared by all six output pumps. Send failures
      are returned and unsent datagrams remain queued in protocol order.

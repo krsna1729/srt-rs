@@ -183,3 +183,17 @@ deliberately does not implement.
 No regression appeared in any cell. The only negative movement is Tokio at 200
 connections on `fixed:100000000` (94.8% -> 94.3%), a control where pacing never
 binds, inside the noise of a cell already running at 215% CPU.
+
+## Follow-up: issue #82 disposition
+
+The residual Tokio service-visit deficit is tracked in
+[#82](https://github.com/krsna1729/srt-rs/issues/82). Measured disposition:
+
+- **A1** (per-connection Tokio tail-spin) is technically sufficient at N=1
+  and **rejected on CPU economics at N=30**.
+- **A2** (one high-resolution waiter per worker, no spin) is the challenger
+  that must be tried before ownership changes. The reusable primitive lives
+  in `srt-transport` as `HighResWaiter`; see [high-res-waiter.md](high-res-waiter.md).
+- **Route B** (accumulated debt / multi-admit / `SrtConnection` ownership)
+  remains untested and is not started by the A2 waiter.
+

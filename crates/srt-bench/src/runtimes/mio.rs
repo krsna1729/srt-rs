@@ -8,7 +8,9 @@ use mio::net::UdpSocket;
 use mio::{Events, Interest, Poll, Token};
 use shiguredo_srt::{ConnectionEvent, ConnectionOptions, GroupExtensionData, SrtConnection};
 use srt_transport::mio_transport::Conn;
-use srt_transport::{Handoff, RecvBatch, RecvBudget, WorkerMessage};
+use srt_transport::{
+    Handoff, HighResWaiter, MonotonicDeadline, RecvBatch, RecvBudget, WorkerMessage,
+};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
@@ -276,6 +278,278 @@ pub fn run(cfg: BenchConfig) {
     if !agg.any_connected {
         std::process::exit(1);
     }
+}
+
+/// Issue #82 A2 measurement path: production [`HighResWaiter`] drives the
+/// sender. Receiver falls through to ordinary mio (shared-pool / per-port).
+pub fn run_a2(mut cfg: BenchConfig) {
+    if cfg.mode == crate::Mode::Receiver {
+        // A2 is a sender scheduling primitive. Keep the ordinary mio
+        // listener so cells pair as recv=mio / send=a2.
+        cfg.runtime = crate::Runtime::Mio;
+        run(cfg);
+        return;
+    }
+    let start = Instant::now();
+    if run_shared_sender_mode(&cfg, start) {
+        eprintln!("[bench-a2] shared-socket egress is not the A2 path; refusing");
+        std::process::exit(2);
+    }
+    report_scale(&cfg);
+    let limiter = Some(std::sync::Arc::new(std::sync::Mutex::new(
+        crate::ConnectLimiter::new(cfg.connect_concurrency),
+    )));
+    let limiter2 = limiter.clone();
+    let stats = crate::run_workers(&cfg, move |cfg, mine| {
+        drive_a2(cfg, mine, start, limiter2.clone())
+    });
+    let mut agg = Aggregate::new(cfg);
+    for s in stats {
+        agg.add(s);
+    }
+    if let Some(lim) = limiter {
+        agg.cc_peak = lim.lock().unwrap().peak();
+    }
+    agg.print(start);
+    if !agg.any_connected {
+        std::process::exit(1);
+    }
+}
+
+fn spawn_driver_a2(
+    cfg: &BenchConfig,
+    start: Instant,
+    i: usize,
+    permit: Option<crate::HandshakePermit>,
+) -> Driver {
+    let addr = cfg.addr_for(i);
+    let socket = {
+        let s = UdpSocket::bind("0.0.0.0:0".parse().unwrap()).expect("bind");
+        s.connect(addr).expect("connect");
+        s
+    };
+    let _ = srt_transport::set_sock_bufs(socket.as_raw_fd(), cfg.sock_buf_bytes);
+    let mut options = ConnectionOptions {
+        socket_id: cfg.caller_socket_id_for(i),
+        tsbpd_delay: cfg.latency_ms,
+        ..Default::default()
+    };
+    cfg.apply_srt_bandwidth(&mut options);
+    cfg.encryption.apply_to(&mut options);
+    let mut c = SrtConnection::new_caller(options);
+    c.connect(crate::now_ts(start))
+        .expect("connect() should queue INDUCTION");
+    let mut driver = Conn::new(c, socket);
+    let refused = driver.drain_outputs(crate::now_ts(start));
+    Driver {
+        torn_down: false,
+        conn: driver,
+        connected: false,
+        stream_deadline: None,
+        data_events: 0,
+        peer: None,
+        poisoned: refused,
+        started_at: Instant::now(),
+        permit,
+        source: cfg.source_clock(),
+    }
+}
+
+fn backfill_drivers_a2(
+    cfg: &BenchConfig,
+    start: Instant,
+    mine: &[usize],
+    drivers: &mut Vec<Driver>,
+    next_to_start: &mut usize,
+    limiter: Option<&std::sync::Arc<std::sync::Mutex<crate::ConnectLimiter>>>,
+    waiter: &mut HighResWaiter<usize>,
+) {
+    while *next_to_start < mine.len() {
+        let permit = if let Some(lim) = limiter {
+            match crate::HandshakePermit::try_acquire(lim, 1) {
+                Some(p) => Some(p),
+                None => break,
+            }
+        } else {
+            None
+        };
+        let token = drivers.len();
+        let driver = spawn_driver_a2(cfg, start, mine[*next_to_start], permit);
+        waiter
+            .register(token, driver.conn.socket.as_raw_fd())
+            .expect("a2 register");
+        arm_a2_deadline(waiter, &driver, token, start);
+        drivers.push(driver);
+        *next_to_start += 1;
+    }
+}
+
+fn arm_a2_deadline(waiter: &mut HighResWaiter<usize>, driver: &Driver, key: usize, start: Instant) {
+    // Same binding as `next_poll_wait`: source cadence when nothing is
+    // pending, SRT pacing when the source is already waiting on the
+    // protocol. Do **not** also min with `schedule_wait` — that collapses
+    // to zero whenever a protocol timer is due and turns the park into a
+    // busy Immediate loop (E0 wake-rate failure).
+    let t = crate::now_ts(start);
+    let elapsed = start.elapsed();
+    let pacing = driver.conn.conn.time_until_send(t);
+    let wait = Duration::from_micros(driver.source.wait_micros(elapsed, pacing)).min(MAX_POLL_WAIT);
+    waiter.set_deadline(key, MonotonicDeadline::after(wait));
+}
+
+/// Per-port sender loop owned by one worker, parked on production
+/// [`HighResWaiter`] (epoll_pwait2 / absolute timerfd). Services every due
+/// key after a single wake — the A2 contract. Emits wake-rate diagnostics
+/// on stderr for E0 validation.
+fn drive_a2(
+    cfg: BenchConfig,
+    mine: Vec<usize>,
+    start: Instant,
+    limiter: Option<std::sync::Arc<std::sync::Mutex<crate::ConnectLimiter>>>,
+) -> Vec<ConnStats> {
+    let mut waiter = HighResWaiter::<usize>::new().expect("HighResWaiter");
+    eprintln!(
+        "[bench-a2] worker backend={:?} conns_shard={}",
+        waiter.backend(),
+        mine.len()
+    );
+    let mut drivers = Vec::with_capacity(mine.len());
+    let mut next_to_start = 0;
+    backfill_drivers_a2(
+        &cfg,
+        start,
+        &mine,
+        &mut drivers,
+        &mut next_to_start,
+        limiter.as_ref(),
+        &mut waiter,
+    );
+    let payload = vec![0x42u8; crate::PAYLOAD_SIZE];
+    let connect_deadline = Instant::now() + crate::CONNECT_TIMEOUT;
+    let mut buf = [0u8; 2048];
+    let mut due = Vec::new();
+    let mut ready = Vec::new();
+    let mut wakes: u64 = 0;
+    let mut due_visits: u64 = 0;
+    let mut ready_hits: u64 = 0;
+    let loop_start = Instant::now();
+
+    loop {
+        if !drivers.iter().any(|d| d.connected) && Instant::now() >= connect_deadline {
+            eprintln!("[bench-a2] connect timed out");
+            break;
+        }
+        if all_drivers_done(&drivers, next_to_start, mine.len()) {
+            break;
+        }
+        backfill_drivers_a2(
+            &cfg,
+            start,
+            &mine,
+            &mut drivers,
+            &mut next_to_start,
+            limiter.as_ref(),
+            &mut waiter,
+        );
+
+        let outcome = waiter
+            .wait_with_idle(Some(MAX_POLL_WAIT), &mut due, &mut ready)
+            .expect("a2 wait");
+        wakes += 1;
+        due_visits += due.len() as u64;
+        ready_hits += ready.len() as u64;
+        let _ = outcome;
+
+        // E3: optional injected stall (deschedule stand-in). Env
+        // SRT_BENCH_A2_STALL_US sleeps that many microseconds once per
+        // SRT_BENCH_A2_STALL_EVERY_MS (default 1000) of wall time.
+        {
+            static STALL_US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            static STALL_EVERY_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            let stall_us = *STALL_US.get_or_init(|| {
+                std::env::var("SRT_BENCH_A2_STALL_US")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0)
+            });
+            if stall_us > 0 {
+                let every_ms = *STALL_EVERY_MS.get_or_init(|| {
+                    std::env::var("SRT_BENCH_A2_STALL_EVERY_MS")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(1000)
+                });
+                thread_local! {
+                    static LAST: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+                }
+                LAST.with(|last| {
+                    let now = Instant::now();
+                    let due_stall = match last.get() {
+                        None => {
+                            last.set(Some(now));
+                            false
+                        }
+                        Some(prev) => now.duration_since(prev) >= Duration::from_millis(every_ms),
+                    };
+                    if due_stall {
+                        std::thread::sleep(Duration::from_micros(stall_us));
+                        last.set(Some(Instant::now()));
+                    }
+                });
+            }
+        }
+
+        let mut touched = [false; 4096];
+        for &idx in ready.iter().chain(due.iter()) {
+            if idx < touched.len() {
+                touched[idx] = true;
+            }
+            if let Some(driver) = drivers.get_mut(idx) {
+                receive_connected_datagrams(driver, idx, &mut buf, start);
+            }
+        }
+        reconnect_poisoned(&cfg, &mine, &mut drivers);
+
+        // A2: after one park, service every due key (and ready sockets).
+        // A full timer sweep only when the park produced no keys — the
+        // idle/timeout case — matching mio's `woke_from_timeout` rule.
+        // `send_due_payload` still walks every driver so SourceClock
+        // stays wall-time aligned (tick is elapsed-based).
+        let woke_from_timeout = due.is_empty() && ready.is_empty();
+        service_drivers(
+            &cfg,
+            &mut drivers,
+            &touched,
+            woke_from_timeout,
+            &payload,
+            start,
+        );
+
+        for (idx, driver) in drivers.iter().enumerate() {
+            if driver.stream_deadline.is_some_and(|d| Instant::now() >= d) {
+                waiter.clear_deadline(&idx);
+                continue;
+            }
+            arm_a2_deadline(&mut waiter, driver, idx, start);
+        }
+    }
+
+    close_drivers(&cfg, &mut drivers, start);
+    let elapsed = loop_start.elapsed().as_secs_f64().max(1e-9);
+    let visits_per_wake = if wakes == 0 {
+        0.0
+    } else {
+        due_visits as f64 / wakes as f64
+    };
+    eprintln!(
+        "[bench-a2] wakes={wakes} wakes_per_s={:.1} due_visits={due_visits} visits_per_wake={visits_per_wake:.2} ready_hits={ready_hits} shard={}",
+        wakes as f64 / elapsed,
+        mine.len()
+    );
+    drivers
+        .into_iter()
+        .map(|driver| driver_stats(&cfg, driver))
+        .collect()
 }
 
 fn run_shared_sender(

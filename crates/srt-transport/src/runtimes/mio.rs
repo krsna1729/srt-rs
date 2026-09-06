@@ -1,9 +1,10 @@
 use crate::{
-    BatchIoStats, ManualTimerStore, OutputDrainBudget, OutputDrainReport, drain_connected_outputs,
-    sendmsg_connected_batch,
+    BatchIoStats, HighResWaiter, ManualTimerStore, MonotonicDeadline, OutputDrainBudget,
+    OutputDrainReport, drain_connected_outputs, schedule_wait_micros, sendmsg_connected_batch,
 };
 use shiguredo_srt::{ConnectionOutput, SrtConnection, Timestamp};
 use std::collections::VecDeque;
+use std::hash::Hash;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::time::Duration;
@@ -77,6 +78,38 @@ impl Conn {
                 .time_until_earliest(now, default.as_micros() as u64),
         )
     }
+
+    /// Relative delay until this connection's next paced send or protocol timer.
+    ///
+    /// The worker turns this into an absolute [`MonotonicDeadline`] on its
+    /// shared [`HighResWaiter`] (issue #82 A2). This is not a per-connection
+    /// tail-spin (A1).
+    #[must_use]
+    pub fn schedule_wait(&self, now: Timestamp) -> Duration {
+        Duration::from_micros(schedule_wait_micros(
+            self.conn.time_until_send(now),
+            self.timers.time_until_earliest(now, u64::MAX),
+        ))
+    }
+
+    /// Publish this connection onto a worker waiter and arm its next deadline.
+    ///
+    /// After [`HighResWaiter::wait`], the caller must service **every** due
+    /// key. One packet per visit remains the contract; Route B multi-admit
+    /// is out of scope.
+    pub fn schedule_on<K>(
+        &self,
+        waiter: &mut HighResWaiter<K>,
+        key: K,
+        now: Timestamp,
+    ) -> io::Result<()>
+    where
+        K: Clone + Eq + Hash,
+    {
+        waiter.register(key.clone(), self.socket.as_raw_fd())?;
+        waiter.set_deadline(key, MonotonicDeadline::after(self.schedule_wait(now)));
+        Ok(())
+    }
 }
 
 /// Resolve, bind, and convert a complete listener configuration to mio
@@ -102,4 +135,32 @@ pub fn caller(
     let prepared = config.prepare(crate::RuntimeFlavor::Mio)?;
     let socket = mio::net::UdpSocket::from_std(prepared.bind_socket()?);
     Ok(Conn::new(prepared.connection(now)?, socket))
+}
+
+#[cfg(test)]
+mod high_res_waiter_tests {
+    use super::*;
+    use shiguredo_srt::{ConnectionOptions, SrtConnection, Timestamp};
+    use std::time::Duration;
+
+    fn caller_conn() -> SrtConnection {
+        let mut conn = SrtConnection::new_caller(ConnectionOptions::default());
+        conn.connect(Timestamp::from_micros(0))
+            .expect("connect starts");
+        conn
+    }
+
+    #[test]
+    fn schedule_on_arms_the_shared_worker_waiter() {
+        let std_sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+        std_sock.set_nonblocking(true).expect("nonblocking");
+        let socket = mio::net::UdpSocket::from_std(std_sock);
+        let conn = Conn::new(caller_conn(), socket);
+        let mut waiter = HighResWaiter::<u32>::new().expect("waiter");
+        conn.schedule_on(&mut waiter, 3, Timestamp::from_micros(0))
+            .expect("schedule");
+        assert_eq!(waiter.deadline_len(), 1);
+        assert!(waiter.next_deadline().is_some());
+        assert!(conn.schedule_wait(Timestamp::from_micros(0)) > Duration::ZERO);
+    }
 }

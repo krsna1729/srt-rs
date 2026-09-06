@@ -1,14 +1,15 @@
 use crate::{
     BatchIoStats, GroupBuildError, GroupCallerLeg, GroupConnectionLeg, GroupConnectionStats,
-    GroupDriveReport, GroupLegDriveReport, GroupLogicalCounters, ManualTimerStore,
-    OutputDrainBudget, OutputDrainReport, OutputDrainStatus, RecvBatch, RecvBudget,
-    RecvDrainReport, collect_output_work, drain_connected_outputs, drain_output_work,
-    group_connection_stats, prepend_outputs, sendmsg_connected_batch,
+    GroupDriveReport, GroupLegDriveReport, GroupLogicalCounters, HighResWaiter, ManualTimerStore,
+    MonotonicDeadline, OutputDrainBudget, OutputDrainReport, OutputDrainStatus, RecvBatch,
+    RecvBudget, RecvDrainReport, collect_output_work, drain_connected_outputs, drain_output_work,
+    group_connection_stats, prepend_outputs, schedule_wait_micros, sendmsg_connected_batch,
 };
 use shiguredo_srt::{
     Bytes, ConnectionEvent, ConnectionOutput, GroupMode, SrtConnection, Timestamp,
 };
 use std::collections::VecDeque;
+use std::hash::Hash;
 use std::io;
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
@@ -95,6 +96,37 @@ impl Conn {
     #[must_use]
     pub fn io_stats(&self) -> BatchIoStats {
         self.io_stats
+    }
+
+    /// Relative delay until this connection's next paced send or protocol timer.
+    ///
+    /// Intended for a worker-owned [`HighResWaiter`], not `tokio::time::sleep`
+    /// plus a per-task tail-spin (issue #82 A1, rejected).
+    #[must_use]
+    pub fn schedule_wait(&self, now: Timestamp) -> Duration {
+        Duration::from_micros(schedule_wait_micros(
+            self.conn.time_until_send(now),
+            self.timers.time_until_earliest(now, u64::MAX),
+        ))
+    }
+
+    /// Publish this connection onto a worker waiter and arm its next deadline.
+    ///
+    /// Call from a worker thread (or `block_in_place`), not from a Tokio
+    /// timer. After [`HighResWaiter::wait`], service every due key. One
+    /// packet per visit remains the contract; Route B is out of scope.
+    pub fn schedule_on<K>(
+        &self,
+        waiter: &mut HighResWaiter<K>,
+        key: K,
+        now: Timestamp,
+    ) -> io::Result<()>
+    where
+        K: Clone + Eq + Hash,
+    {
+        waiter.register(key.clone(), self.sock.as_raw_fd())?;
+        waiter.set_deadline(key, MonotonicDeadline::after(self.schedule_wait(now)));
+        Ok(())
     }
 
     /// Drain every datagram currently readable, feeding the protocol.
@@ -729,6 +761,29 @@ mod tests {
                 let n = peer.recv(&mut buf).expect("recv");
                 assert_eq!(&buf[..n], expected);
             }
+        });
+    }
+
+    #[test]
+    fn schedule_on_arms_the_shared_worker_waiter() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("Tokio runtime builds");
+        runtime.block_on(async {
+            let local = std::net::UdpSocket::bind("127.0.0.1:0").expect("local binds");
+            local.set_nonblocking(true).expect("nonblocking");
+            let sock = UdpSocket::from_std(local).expect("tokio adopts the socket");
+            let conn = Conn::new(
+                SrtConnection::new_caller(shiguredo_srt::ConnectionOptions::default()),
+                sock,
+            );
+            let mut waiter = HighResWaiter::<u32>::new().expect("waiter");
+            conn.schedule_on(&mut waiter, 9, Timestamp::from_micros(0))
+                .expect("schedule");
+            assert_eq!(waiter.deadline_len(), 1);
+            assert!(waiter.next_deadline().is_some());
+            assert!(conn.schedule_wait(Timestamp::from_micros(0)) > Duration::ZERO);
         });
     }
 }
