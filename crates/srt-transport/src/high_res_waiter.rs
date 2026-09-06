@@ -151,6 +151,9 @@ pub struct HighResWaiter<K> {
     by_token: HashMap<u64, K>,
     next_token: u64,
     events: Vec<libc::epoll_event>,
+    /// Test-only: next `epoll_pwait2` park returns this errno, then degrades.
+    #[cfg(test)]
+    fail_next_pwait2: Option<i32>,
 }
 
 impl<K> HighResWaiter<K>
@@ -161,13 +164,15 @@ where
         Self::with_backend(detect_backend()?)
     }
 
-    /// Build a waiter on a specific backend. `EpollPwait2` fails if the
-    /// running kernel does not provide `epoll_pwait2`.
+    /// Build a waiter on a specific backend. `EpollPwait2` fails unless a
+    /// zero-timeout probe succeeds. Any probe error — including Docker
+    /// default seccomp `EPERM` for an unlisted syscall, not only `ENOSYS` —
+    /// is treated as unavailable.
     pub fn with_backend(backend: WaitBackend) -> io::Result<Self> {
         if backend == WaitBackend::EpollPwait2 && !epoll_pwait2_available() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "epoll_pwait2 is not available on this kernel",
+                "epoll_pwait2 is not available",
             ));
         }
         let epoll = create_epoll()?;
@@ -193,6 +198,8 @@ where
             by_token: HashMap::new(),
             next_token: FIRST_CONN_TOKEN,
             events: vec![empty_event(); 64],
+            #[cfg(test)]
+            fail_next_pwait2: None,
         })
     }
 
@@ -307,18 +314,59 @@ where
 
     fn park(&mut self, planned: PlannedWait) -> io::Result<usize> {
         match self.backend {
-            WaitBackend::EpollPwait2 => {
-                park_pwait2(self.epoll.as_raw_fd(), &mut self.events, planned)
-            }
-            WaitBackend::AbsoluteTimerFd => {
-                let timer = self
-                    .timer
-                    .as_ref()
-                    .expect("timerfd backend always owns a timer");
-                arm_timerfd(timer.as_raw_fd(), planned)?;
-                park_epoll_wait(self.epoll.as_raw_fd(), &mut self.events, planned)
+            WaitBackend::EpollPwait2 => self.park_pwait2_or_degrade(planned),
+            WaitBackend::AbsoluteTimerFd => self.park_timerfd(planned),
+        }
+    }
+
+    fn park_pwait2_or_degrade(&mut self, planned: PlannedWait) -> io::Result<usize> {
+        match self.try_park_pwait2(planned) {
+            Ok(n) => Ok(n),
+            Err(error) => {
+                // A probe can still lie (TOCTOU, or a filter that allows the
+                // zero-timeout probe but rejects later waits). Any failed
+                // pwait2 park degrades to the timerfd path so `wait()` does
+                // not stay wedged on a backend that cannot run.
+                if self.degrade_to_timerfd().is_err() {
+                    return Err(error);
+                }
+                self.park_timerfd(planned)
             }
         }
+    }
+
+    fn try_park_pwait2(&mut self, planned: PlannedWait) -> io::Result<usize> {
+        #[cfg(test)]
+        if let Some(errno) = self.fail_next_pwait2.take() {
+            return Err(io::Error::from_raw_os_error(errno));
+        }
+        park_pwait2(self.epoll.as_raw_fd(), &mut self.events, planned)
+    }
+
+    fn park_timerfd(&mut self, planned: PlannedWait) -> io::Result<usize> {
+        let timer = self
+            .timer
+            .as_ref()
+            .expect("timerfd backend always owns a timer");
+        arm_timerfd(timer.as_raw_fd(), planned)?;
+        park_epoll_wait(self.epoll.as_raw_fd(), &mut self.events, planned)
+    }
+
+    fn degrade_to_timerfd(&mut self) -> io::Result<()> {
+        if self.backend == WaitBackend::AbsoluteTimerFd && self.timer.is_some() {
+            return Ok(());
+        }
+        let timer = create_timerfd()?;
+        epoll_ctl(
+            self.epoll.as_raw_fd(),
+            libc::EPOLL_CTL_ADD,
+            timer.as_raw_fd(),
+            TIMER_TOKEN,
+            libc::EPOLLIN,
+        )?;
+        self.timer = Some(timer);
+        self.backend = WaitBackend::AbsoluteTimerFd;
+        Ok(())
     }
 }
 
@@ -370,21 +418,44 @@ fn detect_backend() -> io::Result<WaitBackend> {
     }
 }
 
+/// `epoll_pwait2` is usable only when the probe syscall itself succeeded.
+///
+/// Docker's default seccomp profile returns `EPERM` (not `ENOSYS`) for
+/// unlisted syscalls. The previous rule treated any errno other than
+/// `ENOSYS` as "available", selected [`WaitBackend::EpollPwait2`], and
+/// then every `wait()` failed so the timerfd fallback was never used.
+#[must_use]
+fn epoll_pwait2_probe_succeeded(rc: libc::c_int) -> bool {
+    rc >= 0
+}
+
 fn epoll_pwait2_available() -> bool {
     let Ok(epoll) = create_epoll() else {
         return false;
     };
+    epoll_pwait2_probe_succeeded(probe_epoll_pwait2(epoll.as_raw_fd()))
+}
+
+fn probe_epoll_pwait2(epfd: RawFd) -> libc::c_int {
+    #[cfg(test)]
+    if let Some(rc) = TEST_PWAIT2_PROBE_RC.with(std::cell::Cell::get) {
+        return rc;
+    }
     let mut event = empty_event();
     let timeout = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
     };
-    // SAFETY: `epoll` is a live epoll fd; `event` is writable storage for one
-    // event; `timeout` is a valid timespec. A zero max-wait probe is enough
-    // to distinguish ENOSYS from a supported syscall.
-    let rc =
-        unsafe { libc::epoll_pwait2(epoll.as_raw_fd(), &mut event, 1, &timeout, std::ptr::null()) };
-    rc >= 0 || io::Error::last_os_error().raw_os_error() != Some(libc::ENOSYS)
+    // SAFETY: `epfd` is a live epoll fd; `event` is writable storage for one
+    // event; `timeout` is a valid timespec. Success is `rc >= 0` only —
+    // `EPERM` from Docker default seccomp must not count as available.
+    unsafe { libc::epoll_pwait2(epfd, &mut event, 1, &timeout, std::ptr::null()) }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_PWAIT2_PROBE_RC: std::cell::Cell<Option<libc::c_int>> =
+        const { std::cell::Cell::new(None) };
 }
 
 fn create_epoll() -> io::Result<OwnedFd> {
@@ -563,6 +634,21 @@ mod tests {
         MonotonicDeadline::from_nanos(n)
     }
 
+    struct Pwait2ProbeOverride {
+        previous: Option<libc::c_int>,
+    }
+
+    impl Drop for Pwait2ProbeOverride {
+        fn drop(&mut self) {
+            TEST_PWAIT2_PROBE_RC.with(|cell| cell.set(self.previous));
+        }
+    }
+
+    fn override_pwait2_probe(rc: libc::c_int) -> Pwait2ProbeOverride {
+        let previous = TEST_PWAIT2_PROBE_RC.with(|cell| cell.replace(Some(rc)));
+        Pwait2ProbeOverride { previous }
+    }
+
     #[test]
     fn plan_wait_due_now_is_immediate_not_a_spin() {
         assert_eq!(
@@ -605,5 +691,70 @@ mod tests {
         assert_eq!(outcome.park_count, 0);
         assert!(due.is_empty());
         assert!(ready.is_empty());
+    }
+
+    #[test]
+    fn pwait2_probe_treats_any_negative_rc_as_unavailable() {
+        assert!(
+            epoll_pwait2_probe_succeeded(0),
+            "zero events / timeout is a successful probe"
+        );
+        assert!(epoll_pwait2_probe_succeeded(1));
+        // Historical bug: only ENOSYS counted as unavailable. Docker default
+        // seccomp returns EPERM for unlisted syscalls; EINVAL/EFAULT are the
+        // other common probe failures. Errno is ignored — any failed probe
+        // is unavailable.
+        for errno in [libc::ENOSYS, libc::EPERM, libc::EINVAL, libc::EFAULT] {
+            assert!(
+                !epoll_pwait2_probe_succeeded(-1),
+                "failed probe must be unavailable (would-be errno {errno})"
+            );
+        }
+    }
+
+    #[test]
+    fn detect_backend_uses_timerfd_when_pwait2_probe_fails() {
+        let _guard = override_pwait2_probe(-1);
+        assert_eq!(
+            detect_backend().expect("timerfd remains constructible"),
+            WaitBackend::AbsoluteTimerFd
+        );
+        let waiter = HighResWaiter::<u32>::new().expect("new");
+        assert_eq!(waiter.backend(), WaitBackend::AbsoluteTimerFd);
+    }
+
+    #[test]
+    fn with_backend_pwait2_rejects_a_failed_probe() {
+        let _guard = override_pwait2_probe(-1);
+        let Err(error) = HighResWaiter::<u32>::with_backend(WaitBackend::EpollPwait2) else {
+            panic!("forced probe failure must reject EpollPwait2");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        HighResWaiter::<u32>::with_backend(WaitBackend::AbsoluteTimerFd)
+            .expect("timerfd must still construct");
+    }
+
+    #[test]
+    fn first_pwait2_wait_failure_degrades_to_timerfd() {
+        let mut waiter = match HighResWaiter::<u32>::with_backend(WaitBackend::EpollPwait2) {
+            Ok(waiter) => waiter,
+            Err(_) => return,
+        };
+        waiter.set_deadline(1, MonotonicDeadline::now());
+        waiter.fail_next_pwait2 = Some(libc::EPERM);
+        let mut due = Vec::new();
+        let mut ready = Vec::new();
+        let outcome = waiter
+            .wait(&mut due, &mut ready)
+            .expect("EPERM park must degrade to timerfd");
+        assert_eq!(outcome.backend, WaitBackend::AbsoluteTimerFd);
+        assert_eq!(waiter.backend(), WaitBackend::AbsoluteTimerFd);
+        assert_eq!(due, vec![1]);
+        assert_eq!(outcome.park_count, 1);
+
+        waiter.set_deadline(2, MonotonicDeadline::now());
+        let second = waiter.wait(&mut due, &mut ready).expect("timerfd wait");
+        assert_eq!(second.backend, WaitBackend::AbsoluteTimerFd);
+        assert_eq!(due, vec![2]);
     }
 }
