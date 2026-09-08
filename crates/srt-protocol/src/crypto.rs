@@ -32,15 +32,20 @@ use std::fmt;
 
 use aes::{Aes128, Aes192, Aes256};
 use aes_gcm::aead::AeadInOut;
+use aes_gcm::aead::consts::U12;
 use aes_gcm::{Aes128Gcm, Aes256Gcm, KeyInit as GcmKeyInit, Nonce};
 use aes_kw::{KwAes128, KwAes192, KwAes256};
-use cipher::{KeyIvInit, StreamCipher};
-use ctr::Ctr128BE;
+#[cfg(test)]
+use cipher::KeyIvInit;
+use cipher::{InnerIvInit, StreamCipher};
+use ctr::{Ctr128BE, CtrCore};
 use pbkdf2::pbkdf2_hmac;
 use sha1::Sha1;
 use zeroize::Zeroize;
 
 use crate::error::Error;
+
+type GcmNonce = Nonce<U12>;
 
 /// Number of PBKDF2 iterations (per the SRT specification).
 const PBKDF2_ITERATIONS: u32 = 2048;
@@ -171,6 +176,160 @@ pub enum KmRefreshState {
     PostAnnounce,
 }
 
+/// Expanded AES schedule for CTR (IV still per-packet).
+#[allow(clippy::large_enum_variant)] // round-key tables; boxing would defeat the cache
+enum CachedCtr {
+    Aes128(Aes128),
+    Aes192(Aes192),
+    Aes256(Aes256),
+}
+
+impl CachedCtr {
+    fn from_sek(sek: &[u8], key_length: KeyLength) -> Result<Self, Error> {
+        match key_length {
+            KeyLength::Aes128 => {
+                Ok(Self::Aes128(Aes128::new_from_slice(sek).map_err(|e| {
+                    Error::crypto_error(format!("invalid SEK: {e}"))
+                })?))
+            }
+            KeyLength::Aes192 => {
+                Ok(Self::Aes192(Aes192::new_from_slice(sek).map_err(|e| {
+                    Error::crypto_error(format!("invalid SEK: {e}"))
+                })?))
+            }
+            KeyLength::Aes256 => {
+                Ok(Self::Aes256(Aes256::new_from_slice(sek).map_err(|e| {
+                    Error::crypto_error(format!("invalid SEK: {e}"))
+                })?))
+            }
+        }
+    }
+
+    fn apply_keystream(&self, iv: &[u8; 16], payload: &mut [u8]) {
+        match self {
+            Self::Aes128(aes) => {
+                let mut c = Ctr128BE::from_core(CtrCore::inner_iv_init(aes.clone(), iv.into()));
+                c.apply_keystream(payload);
+            }
+            Self::Aes192(aes) => {
+                let mut c = Ctr128BE::from_core(CtrCore::inner_iv_init(aes.clone(), iv.into()));
+                c.apply_keystream(payload);
+            }
+            Self::Aes256(aes) => {
+                let mut c = Ctr128BE::from_core(CtrCore::inner_iv_init(aes.clone(), iv.into()));
+                c.apply_keystream(payload);
+            }
+        }
+    }
+}
+
+/// Keyed GCM object (nonce still per-packet).
+#[allow(clippy::large_enum_variant)] // AES-GCM state; boxing would defeat the cache
+enum CachedGcm {
+    Aes128(Aes128Gcm),
+    Aes256(Aes256Gcm),
+}
+
+impl CachedGcm {
+    fn from_sek(sek: &[u8], key_length: KeyLength) -> Result<Self, Error> {
+        match key_length {
+            KeyLength::Aes128 => Ok(Self::Aes128(
+                Aes128Gcm::new_from_slice(sek)
+                    .map_err(|e| Error::crypto_error(format!("invalid SEK: {e}")))?,
+            )),
+            KeyLength::Aes192 => Err(Error::crypto_error(
+                "AES-192 is not supported with GCM mode",
+            )),
+            KeyLength::Aes256 => Ok(Self::Aes256(
+                Aes256Gcm::new_from_slice(sek)
+                    .map_err(|e| Error::crypto_error(format!("invalid SEK: {e}")))?,
+            )),
+        }
+    }
+
+    fn encrypt_in_place(
+        &self,
+        nonce: &GcmNonce,
+        aad: &[u8],
+        buffer: &mut Vec<u8>,
+    ) -> Result<(), Error> {
+        match self {
+            Self::Aes128(c) => c
+                .encrypt_in_place(nonce, aad, buffer)
+                .map_err(|e| Error::crypto_error(format!("AES-GCM encrypt failed: {e}"))),
+            Self::Aes256(c) => c
+                .encrypt_in_place(nonce, aad, buffer)
+                .map_err(|e| Error::crypto_error(format!("AES-GCM encrypt failed: {e}"))),
+        }
+    }
+
+    fn encrypt_inout_detached(
+        &self,
+        nonce: &GcmNonce,
+        aad: &[u8],
+        payload: &mut [u8],
+    ) -> Result<[u8; GCM_TAG_LEN], Error> {
+        let tag = match self {
+            Self::Aes128(c) => c
+                .encrypt_inout_detached(nonce, aad, payload.into())
+                .map_err(|e| Error::crypto_error(format!("AES-GCM encrypt failed: {e}")))?,
+            Self::Aes256(c) => c
+                .encrypt_inout_detached(nonce, aad, payload.into())
+                .map_err(|e| Error::crypto_error(format!("AES-GCM encrypt failed: {e}")))?,
+        };
+        let mut out = [0u8; GCM_TAG_LEN];
+        out.copy_from_slice(tag.as_slice());
+        Ok(out)
+    }
+
+    fn decrypt_in_place(
+        &self,
+        nonce: &GcmNonce,
+        aad: &[u8],
+        buffer: &mut Vec<u8>,
+    ) -> Result<(), Error> {
+        match self {
+            Self::Aes128(c) => c
+                .decrypt_in_place(nonce, aad, buffer)
+                .map_err(|_| Error::crypto_error("AES-GCM authentication failed")),
+            Self::Aes256(c) => c
+                .decrypt_in_place(nonce, aad, buffer)
+                .map_err(|_| Error::crypto_error("AES-GCM authentication failed")),
+        }
+    }
+
+    fn decrypt_inout_detached(
+        &self,
+        nonce: &GcmNonce,
+        aad: &[u8],
+        payload: &mut [u8],
+        tag: &[u8; GCM_TAG_LEN],
+    ) -> Result<(), Error> {
+        match self {
+            Self::Aes128(c) => c
+                .decrypt_inout_detached(nonce, aad, payload.into(), tag.into())
+                .map_err(|_| Error::crypto_error("AES-GCM authentication failed")),
+            Self::Aes256(c) => c
+                .decrypt_inout_detached(nonce, aad, payload.into(), tag.into())
+                .map_err(|_| Error::crypto_error("AES-GCM authentication failed")),
+        }
+    }
+}
+
+fn cache_ctr(sek: &[u8], key_length: KeyLength) -> Result<Option<CachedCtr>, Error> {
+    if sek.iter().all(|b| *b == 0) {
+        return Ok(None);
+    }
+    Ok(Some(CachedCtr::from_sek(sek, key_length)?))
+}
+
+fn cache_gcm(sek: &[u8], key_length: KeyLength) -> Result<Option<CachedGcm>, Error> {
+    if sek.iter().all(|b| *b == 0) {
+        return Ok(None);
+    }
+    Ok(Some(CachedGcm::from_sek(sek, key_length)?))
+}
+
 /// Encryption context.
 pub struct CryptoContext {
     /// Key Encrypting Key (derived via PBKDF2).
@@ -193,6 +352,10 @@ pub struct CryptoContext {
     km_refresh_state: KmRefreshState,
     /// The next key (generated while pre-announcing).
     next_key: Option<KeyFlag>,
+    ctr_even: Option<CachedCtr>,
+    ctr_odd: Option<CachedCtr>,
+    gcm_even: Option<CachedGcm>,
+    gcm_odd: Option<CachedGcm>,
 }
 
 // local patch (crates/srt-protocol/VENDOR.md, upstream issues
@@ -227,6 +390,10 @@ impl Drop for CryptoContext {
         self.sek_even.zeroize();
         self.sek_odd.zeroize();
         self.salt.zeroize();
+        self.ctr_even = None;
+        self.ctr_odd = None;
+        self.gcm_even = None;
+        self.gcm_odd = None;
     }
 }
 
@@ -264,7 +431,7 @@ impl CryptoContext {
         let sek_even = sek.to_vec();
         let sek_odd = vec![0u8; key_length.len()];
 
-        Ok(Self {
+        let mut ctx = Self {
             kek,
             sek_even,
             sek_odd,
@@ -275,7 +442,13 @@ impl CryptoContext {
             encrypted_packet_count: 0,
             km_refresh_state: KmRefreshState::Idle,
             next_key: None,
-        })
+            ctr_even: None,
+            ctr_odd: None,
+            gcm_even: None,
+            gcm_odd: None,
+        };
+        ctx.rebuild_cipher_cache()?;
+        Ok(ctx)
     }
 
     /// Build an encryption context from a passphrase and key material (receiver side).
@@ -307,7 +480,7 @@ impl CryptoContext {
             KeyFlag::Odd => (vec![0u8; key_length.len()], sek),
         };
 
-        Ok(Self {
+        let mut ctx = Self {
             kek,
             sek_even,
             sek_odd,
@@ -318,7 +491,49 @@ impl CryptoContext {
             encrypted_packet_count: 0,
             km_refresh_state: KmRefreshState::Idle,
             next_key: None,
-        })
+            ctr_even: None,
+            ctr_odd: None,
+            gcm_even: None,
+            gcm_odd: None,
+        };
+        ctx.rebuild_cipher_cache()?;
+        Ok(ctx)
+    }
+
+    fn rebuild_cipher_cache(&mut self) -> Result<(), Error> {
+        match self.cipher_mode {
+            CipherMode::Ctr => {
+                self.ctr_even = cache_ctr(&self.sek_even, self.key_length)?;
+                self.ctr_odd = cache_ctr(&self.sek_odd, self.key_length)?;
+                self.gcm_even = None;
+                self.gcm_odd = None;
+            }
+            CipherMode::Gcm => {
+                self.gcm_even = cache_gcm(&self.sek_even, self.key_length)?;
+                self.gcm_odd = cache_gcm(&self.sek_odd, self.key_length)?;
+                self.ctr_even = None;
+                self.ctr_odd = None;
+            }
+        }
+        Ok(())
+    }
+
+    fn cached_ctr(&self, key_flag: KeyFlag) -> Result<&CachedCtr, Error> {
+        let slot = match key_flag {
+            KeyFlag::Even => &self.ctr_even,
+            KeyFlag::Odd => &self.ctr_odd,
+        };
+        slot.as_ref()
+            .ok_or_else(|| Error::crypto_error("CTR key schedule missing for key flag"))
+    }
+
+    fn cached_gcm(&self, key_flag: KeyFlag) -> Result<&CachedGcm, Error> {
+        let slot = match key_flag {
+            KeyFlag::Even => &self.gcm_even,
+            KeyFlag::Odd => &self.gcm_odd,
+        };
+        slot.as_ref()
+            .ok_or_else(|| Error::crypto_error("GCM key schedule missing for key flag"))
     }
 
     /// Get the salt.
@@ -352,15 +567,11 @@ impl CryptoContext {
 
     /// Encrypt data in place (CTR mode).
     pub fn encrypt(&mut self, packet_index: u32, payload: &mut [u8]) -> Result<KeyFlag, Error> {
-        let sek = match self.current_key {
-            KeyFlag::Even => &self.sek_even,
-            KeyFlag::Odd => &self.sek_odd,
-        };
-
-        encrypt_payload_ctr(sek, &self.salt, packet_index, payload, self.key_length)?;
+        let key = self.current_key;
+        let iv = build_ctr_iv(&self.salt, packet_index);
+        self.cached_ctr(key)?.apply_keystream(&iv, payload);
         self.encrypted_packet_count += 1;
-
-        Ok(self.current_key)
+        Ok(key)
     }
 
     /// Encrypt data with GCM, returning ciphertext + 16-byte auth tag.
@@ -371,24 +582,16 @@ impl CryptoContext {
         &mut self,
         packet_index: u32,
         header: &[u8; 16],
-        payload: Vec<u8>,
+        mut payload: Vec<u8>,
     ) -> Result<(KeyFlag, Vec<u8>), Error> {
-        let sek = match self.current_key {
-            KeyFlag::Even => &self.sek_even,
-            KeyFlag::Odd => &self.sek_odd,
-        };
-
-        let out = encrypt_payload_gcm(
-            sek,
-            &self.salt,
-            packet_index,
-            header,
-            payload,
-            self.key_length,
-        )?;
+        let key = self.current_key;
+        let iv = build_gcm_iv(&self.salt, packet_index);
+        let nonce = Nonce::try_from(iv.as_slice())
+            .map_err(|e| Error::crypto_error(format!("invalid GCM nonce: {e}")))?;
+        self.cached_gcm(key)?
+            .encrypt_in_place(&nonce, header, &mut payload)?;
         self.encrypted_packet_count += 1;
-
-        Ok((self.current_key, out))
+        Ok((key, payload))
     }
 
     /// Encrypt a payload slice with GCM in place, returning the 16-byte tag
@@ -399,20 +602,15 @@ impl CryptoContext {
         header: &[u8; 16],
         payload: &mut [u8],
     ) -> Result<(KeyFlag, [u8; GCM_TAG_LEN]), Error> {
-        let sek = match self.current_key {
-            KeyFlag::Even => &self.sek_even,
-            KeyFlag::Odd => &self.sek_odd,
-        };
-        let tag = encrypt_payload_gcm_detached(
-            sek,
-            &self.salt,
-            packet_index,
-            header,
-            payload,
-            self.key_length,
-        )?;
+        let key = self.current_key;
+        let iv = build_gcm_iv(&self.salt, packet_index);
+        let nonce = Nonce::try_from(iv.as_slice())
+            .map_err(|e| Error::crypto_error(format!("invalid GCM nonce: {e}")))?;
+        let tag = self
+            .cached_gcm(key)?
+            .encrypt_inout_detached(&nonce, header, payload)?;
         self.encrypted_packet_count += 1;
-        Ok((self.current_key, tag))
+        Ok((key, tag))
     }
 
     /// Decrypt data in place (CTR mode).
@@ -422,12 +620,9 @@ impl CryptoContext {
         key_flag: KeyFlag,
         payload: &mut [u8],
     ) -> Result<(), Error> {
-        let sek = match key_flag {
-            KeyFlag::Even => &self.sek_even,
-            KeyFlag::Odd => &self.sek_odd,
-        };
-
-        encrypt_payload_ctr(sek, &self.salt, packet_index, payload, self.key_length)
+        let iv = build_ctr_iv(&self.salt, packet_index);
+        self.cached_ctr(key_flag)?.apply_keystream(&iv, payload);
+        Ok(())
     }
 
     /// Decrypt data with GCM, verifying the auth tag.
@@ -439,21 +634,17 @@ impl CryptoContext {
         packet_index: u32,
         key_flag: KeyFlag,
         header: &[u8; 16],
-        payload: Vec<u8>,
+        mut payload: Vec<u8>,
     ) -> Result<Vec<u8>, Error> {
-        let sek = match key_flag {
-            KeyFlag::Even => &self.sek_even,
-            KeyFlag::Odd => &self.sek_odd,
-        };
-
-        decrypt_payload_gcm(
-            sek,
-            &self.salt,
-            packet_index,
-            header,
-            payload,
-            self.key_length,
-        )
+        if payload.len() < GCM_TAG_LEN {
+            return Err(Error::crypto_error("GCM payload too short for auth tag"));
+        }
+        let iv = build_gcm_iv(&self.salt, packet_index);
+        let nonce = Nonce::try_from(iv.as_slice())
+            .map_err(|e| Error::crypto_error(format!("invalid GCM nonce: {e}")))?;
+        self.cached_gcm(key_flag)?
+            .decrypt_in_place(&nonce, header, &mut payload)?;
+        Ok(payload)
     }
 
     /// Decrypt a GCM payload in place, stripping its authentication tag.
@@ -471,10 +662,6 @@ impl CryptoContext {
             return Err(Error::crypto_error("GCM payload too short for auth tag"));
         }
 
-        let sek = match key_flag {
-            KeyFlag::Even => &self.sek_even,
-            KeyFlag::Odd => &self.sek_odd,
-        };
         let tag_bytes = payload.split_off(payload.len() - GCM_TAG_LEN);
         let tag: [u8; GCM_TAG_LEN] = tag_bytes
             .as_ref()
@@ -483,28 +670,12 @@ impl CryptoContext {
         let iv = build_gcm_iv(&self.salt, packet_index);
         let nonce = Nonce::try_from(iv.as_slice())
             .map_err(|error| Error::crypto_error(format!("invalid GCM nonce: {error}")))?;
-
-        match self.key_length {
-            KeyLength::Aes128 => {
-                let cipher = Aes128Gcm::new_from_slice(sek)
-                    .map_err(|error| Error::crypto_error(format!("invalid SEK: {error}")))?;
-                cipher
-                    .decrypt_inout_detached(&nonce, header, payload.as_mut().into(), (&tag).into())
-                    .map_err(|_| Error::crypto_error("AES-GCM authentication failed"))?;
-            }
-            KeyLength::Aes192 => {
-                return Err(Error::crypto_error(
-                    "AES-192 is not supported with GCM mode",
-                ));
-            }
-            KeyLength::Aes256 => {
-                let cipher = Aes256Gcm::new_from_slice(sek)
-                    .map_err(|error| Error::crypto_error(format!("invalid SEK: {error}")))?;
-                cipher
-                    .decrypt_inout_detached(&nonce, header, payload.as_mut().into(), (&tag).into())
-                    .map_err(|_| Error::crypto_error("AES-GCM authentication failed"))?;
-            }
-        }
+        self.cached_gcm(key_flag)?.decrypt_inout_detached(
+            &nonce,
+            header,
+            payload.as_mut(),
+            &tag,
+        )?;
         Ok(())
     }
 
@@ -560,6 +731,7 @@ impl CryptoContext {
 
         self.next_key = Some(new_key_flag);
         self.km_refresh_state = KmRefreshState::PreAnnounce;
+        self.rebuild_cipher_cache()?;
 
         let wrapped_sek = self.wrap_sek(new_key_flag)?;
         Ok((new_key_flag, wrapped_sek))
@@ -579,8 +751,16 @@ impl CryptoContext {
         // Zero the old key.
         let old_key = self.current_key.other();
         match old_key {
-            KeyFlag::Even => self.sek_even.fill(0),
-            KeyFlag::Odd => self.sek_odd.fill(0),
+            KeyFlag::Even => {
+                self.sek_even.fill(0);
+                self.ctr_even = None;
+                self.gcm_even = None;
+            }
+            KeyFlag::Odd => {
+                self.sek_odd.fill(0);
+                self.ctr_odd = None;
+                self.gcm_odd = None;
+            }
         }
         self.km_refresh_state = KmRefreshState::Idle;
     }
@@ -600,6 +780,7 @@ impl CryptoContext {
         *target = sek;
 
         self.current_key = key_flag;
+        self.rebuild_cipher_cache()?;
         Ok(())
     }
 }
@@ -669,15 +850,8 @@ fn unwrap_sek(kek: &[u8], wrapped: &[u8], key_length: KeyLength) -> Result<Vec<u
     Ok(unwrapped)
 }
 
-/// Encrypt/decrypt a payload in place with AES-CTR.
-fn encrypt_payload_ctr(
-    sek: &[u8],
-    salt: &[u8; 16],
-    packet_index: u32,
-    payload: &mut [u8],
-    key_length: KeyLength,
-) -> Result<(), Error> {
-    // Build the counter block (the initial IV for AES-CTR).
+/// Build the AES-CTR counter block from salt and packet index.
+fn build_ctr_iv(salt: &[u8; 16], packet_index: u32) -> [u8; 16] {
     // Reference: draft-sharabayko-srt.md, "Encryption" section, "AES Counter" subsection.
     // Treating the 128-bit counter block as a big-endian 16-byte array:
     //   - bits 0-15 (bytes 14-15): block counter. 0 for each packet's first block; not XORed with the salt.
@@ -685,17 +859,26 @@ fn encrypt_payload_ctr(
     //   - bits 48-127 (bytes 0-9): zero
     //   - the upper 112 bits (bytes 0-13) are XORed with IV = MSB(112, Salt) (= salt[0..14])
     // This matches the counter block construction in libsrt's haicrypt implementation.
-    // The spec's section layout, line numbers, and notation may change in the future.
     let mut iv = [0u8; 16];
-    // Place IV = MSB(112, Salt) in the upper 112 bits (bytes 0-13); bytes 14-15 stay 0.
     iv[..14].copy_from_slice(&salt[..14]);
-
-    // XOR the packet index into bytes 10-13 (to_be_bytes gives [MSB, .., LSB]).
     let pi_bytes = packet_index.to_be_bytes();
     iv[10] ^= pi_bytes[0];
     iv[11] ^= pi_bytes[1];
     iv[12] ^= pi_bytes[2];
     iv[13] ^= pi_bytes[3];
+    iv
+}
+
+/// Encrypt/decrypt a payload in place with AES-CTR.
+#[cfg(test)]
+fn encrypt_payload_ctr(
+    sek: &[u8],
+    salt: &[u8; 16],
+    packet_index: u32,
+    payload: &mut [u8],
+    key_length: KeyLength,
+) -> Result<(), Error> {
+    let iv = build_ctr_iv(salt, packet_index);
 
     // In CTR mode, encryption and decryption are the same operation (XOR with the keystream).
     // Ctr128BE treats the whole 128-bit counter block as a big-endian counter, matching
@@ -739,6 +922,7 @@ fn build_gcm_iv(salt: &[u8; 16], packet_index: u32) -> [u8; GCM_IV_LEN] {
 }
 
 /// Encrypt a payload with AES-GCM, returning ciphertext + 16-byte tag.
+#[cfg(test)]
 fn encrypt_payload_gcm(
     sek: &[u8],
     salt: &[u8; 16],
@@ -776,49 +960,10 @@ fn encrypt_payload_gcm(
     Ok(buffer)
 }
 
-/// Encrypt a payload slice with AES-GCM in place, returning the 16-byte tag.
-fn encrypt_payload_gcm_detached(
-    sek: &[u8],
-    salt: &[u8; 16],
-    packet_index: u32,
-    header: &[u8; 16],
-    payload: &mut [u8],
-    key_length: KeyLength,
-) -> Result<[u8; GCM_TAG_LEN], Error> {
-    let iv = build_gcm_iv(salt, packet_index);
-    let nonce = Nonce::try_from(iv.as_slice())
-        .map_err(|e| Error::crypto_error(format!("invalid GCM nonce: {e}")))?;
-
-    let tag = match key_length {
-        KeyLength::Aes128 => {
-            let cipher = Aes128Gcm::new_from_slice(sek)
-                .map_err(|e| Error::crypto_error(format!("invalid SEK: {e}")))?;
-            cipher
-                .encrypt_inout_detached(&nonce, header, payload.into())
-                .map_err(|e| Error::crypto_error(format!("AES-GCM encrypt failed: {e}")))?
-        }
-        KeyLength::Aes192 => {
-            return Err(Error::crypto_error(
-                "AES-192 is not supported with GCM mode",
-            ));
-        }
-        KeyLength::Aes256 => {
-            let cipher = Aes256Gcm::new_from_slice(sek)
-                .map_err(|e| Error::crypto_error(format!("invalid SEK: {e}")))?;
-            cipher
-                .encrypt_inout_detached(&nonce, header, payload.into())
-                .map_err(|e| Error::crypto_error(format!("AES-GCM encrypt failed: {e}")))?
-        }
-    };
-
-    let mut out = [0u8; GCM_TAG_LEN];
-    out.copy_from_slice(tag.as_slice());
-    Ok(out)
-}
-
 /// Decrypt a payload with AES-GCM, verifying the auth tag.
 ///
 /// `ciphertext_and_tag` contains the ciphertext followed by a 16-byte tag.
+#[cfg(test)]
 fn decrypt_payload_gcm(
     sek: &[u8],
     salt: &[u8; 16],
@@ -1256,5 +1401,47 @@ mod tests {
 
         let result = decrypt_payload_gcm(&sek, &salt, 1, &header, vec![0u8; 15], KeyLength::Aes128);
         assert!(result.is_err());
+    }
+
+    /// Microbench: per-packet AES-CTR with fresh key setup vs cached schedule.
+    /// Evidence for the key-cache raise (not a criterion gate).
+    #[test]
+    fn ctr_key_cache_cost() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let sek = vec![0x42u8; 16];
+        let salt = [0xABu8; 16];
+        let payload = vec![0x5Au8; 1316];
+        let iters = 50_000u32;
+
+        let mut buf = payload.clone();
+        let t0 = Instant::now();
+        for i in 0..iters {
+            encrypt_payload_ctr(&sek, &salt, i, &mut buf, KeyLength::Aes128).unwrap();
+            black_box(&buf);
+        }
+        let uncached_ns = t0.elapsed().as_nanos() as f64 / f64::from(iters);
+
+        let mut ctx =
+            CryptoContext::new_sender("passphrase", KeyLength::Aes128, salt, &sek, CipherMode::Ctr)
+                .unwrap();
+        buf.copy_from_slice(&payload);
+        let t1 = Instant::now();
+        for i in 0..iters {
+            ctx.encrypt(i, &mut buf).unwrap();
+            black_box(&buf);
+        }
+        let cached_ns = t1.elapsed().as_nanos() as f64 / f64::from(iters);
+
+        eprintln!(
+            "ctr_key_cache_cost: uncached={uncached_ns:.1}ns/pkt cached={cached_ns:.1}ns/pkt ratio={:.2}",
+            uncached_ns / cached_ns
+        );
+        // Cache must not be slower; allow small noise.
+        assert!(
+            cached_ns <= uncached_ns * 1.05,
+            "cached CTR should be <= uncached (uncached={uncached_ns:.1} cached={cached_ns:.1})"
+        );
     }
 }
