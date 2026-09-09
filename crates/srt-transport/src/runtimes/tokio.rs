@@ -407,7 +407,7 @@ impl GroupConn {
                     generated_initial_seq
                 }
             };
-            caller.session.connection_options_mut().initial_seq = Some(group_initial_seq);
+            caller.session.set_initial_seq(group_initial_seq);
             caller.session.set_group(Some(crate::GroupConfig {
                 group_id: group.group_id,
                 group_type: group.group_type,

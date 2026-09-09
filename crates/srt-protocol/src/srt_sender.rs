@@ -285,8 +285,9 @@ impl SenderBuffer {
 
     /// Repay missed pacing slots on the next `record_send_time`.
     ///
-    /// The application (or bench source) owns unsent demand; the protocol
-    /// only needs a boolean. Default is off so idle-gap tests stay exact.
+    /// Canonical owner is `srt_transport::SessionConfig::set_pacing`;
+    /// production code must go through it. Direct use is reserved for
+    /// unit harnesses (benches, fuzz) that measure the mechanism itself.
     pub fn set_repay_pacing_debt(&mut self, repay: bool) {
         self.repay_pacing_debt = repay;
     }
@@ -389,11 +390,6 @@ impl SenderBuffer {
     /// Whether there are packets needing retransmission.
     pub fn has_retransmit(&self) -> bool {
         self.packets.has_retransmit_queued()
-    }
-
-    /// Set the congestion window.
-    pub fn set_congestion_window(&mut self, cwnd: u32) {
-        self.congestion_window = cwnd;
     }
 
     /// Set the active flow window (the congestion window tracks it too; see
@@ -1059,7 +1055,6 @@ mod tests {
     #[test]
     fn fragmented_message_is_all_or_nothing_at_window_boundary() {
         let mut buf = SenderBuffer::new(1000, 2, 120);
-        buf.set_congestion_window(2);
         let now = Timestamp::default();
         let before_sequence = buf.next_sequence_number();
         let before_message = buf.next_message_number();

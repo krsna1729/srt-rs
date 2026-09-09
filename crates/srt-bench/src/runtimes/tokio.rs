@@ -713,10 +713,13 @@ fn promotion_decision(
     context: &AcceptorContext<'_>,
     peer: SocketAddr,
 ) -> srt_lifecycle::PromotionDecision {
-    match context.router.lock() {
-        Ok(mut router) => srt_lifecycle::decide_promotion(context.cfg.promotion, peer, None, context.worker_index, &mut router, srt_lifecycle::RoutingMode::LeastTuples, context.cfg.exclusive_udp_tuple()),
-        Err(_) => srt_lifecycle::PromotionDecision::StayOnListener,
-    }
+    crate::decide_promotion_for(
+        context.cfg,
+        context.router,
+        context.worker_index,
+        peer,
+        None,
+    )
 }
 
 fn promote_connected_peers(

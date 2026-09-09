@@ -696,15 +696,13 @@ fn promotion_decision(
     peer: SocketAddr,
     extension: Option<GroupExtensionData>,
 ) -> srt_lifecycle::PromotionDecision {
-    let group = extension.map(|extension| srt_lifecycle::GroupAffinity {
-        group_id: extension.group_id,
-        stream_id: None,
-        extension,
-    });
-    match context.router.lock() {
-        Ok(mut router) => srt_lifecycle::decide_promotion(context.cfg.promotion, peer, group, context.worker_index, &mut router, srt_lifecycle::RoutingMode::LeastTuples, context.cfg.exclusive_udp_tuple()),
-        Err(_) => srt_lifecycle::PromotionDecision::StayOnListener,
-    }
+    crate::decide_promotion_for(
+        context.cfg,
+        context.router,
+        context.worker_index,
+        peer,
+        crate::group_from_extension(extension),
+    )
 }
 
 fn apply_acceptor_promotions(

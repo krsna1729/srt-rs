@@ -246,7 +246,11 @@ pub struct ConnectionOptions {
     /// Percentage above input bandwidth reserved for retransmissions
     /// (equivalent to `SRTO_OHEADBW`; libsrt default: 25).
     pub overhead_bandwidth_percent: u8,
-    /// Flow-control window advertised in the handshake, in packets. Values
+    /// Repay pacing debt while app demand remains. Canonical owner is
+    /// `srt_transport::SessionConfig::set_pacing`; do not set directly.
+    /// Default false preserves the idle-gap contract. Packed with the
+    /// overhead byte above so the options footprint does not grow.
+    pub pacing_repay: bool,
     /// above [`crate::MAX_FLOW_WINDOW`] are clamped during construction.
     pub flow_window_packets: u32,
     /// Local receive-buffer capacity, in packets. Values above
@@ -275,10 +279,6 @@ pub struct ConnectionOptions {
     /// **non-default / non-RFC-recommended** coalesce. A receive window
     /// smaller than 64 packets does not Light-ACK; full ACK is the path.
     pub light_ack_interval_packets: u32,
-    /// Repay pacing debt while app demand remains. Canonical owner is
-    /// `srt_transport::PacingPolicy`; do not set directly. Default false
-    /// preserves the idle-gap contract (exactly one immediate packet).
-    pub pacing_repay: bool,
 }
 
 // Manual Debug (redacting passphrase/crypto_sek) rather than #[derive(Debug)],
@@ -380,7 +380,9 @@ pub struct SrtConnection {
     initial_seq: u32,
 
     /// Encryption context.
-    crypto: Option<CryptoContext>,
+    /// Boxed: only encrypted sessions pay the ~136B context (key schedules
+    /// now live behind one more pointer inside). Plain sessions stay lean.
+    crypto: Option<Box<CryptoContext>>,
 
     /// Send buffer.
     sender: Option<SenderBuffer>,
@@ -1805,13 +1807,13 @@ impl SrtConnection {
                 generated_sek.as_slice()
             }
         };
-        self.crypto = Some(CryptoContext::new_sender(
+        self.crypto = Some(Box::new(CryptoContext::new_sender(
             &passphrase,
             key_length,
             salt,
             sek,
             self.options.cipher_mode,
-        )?);
+        )?));
         Ok(())
     }
 
@@ -1990,7 +1992,7 @@ impl SrtConnection {
                     ));
                 }
             };
-            self.crypto = Some(crypto);
+            self.crypto = Some(Box::new(crypto));
             self.received_km = Some(km);
         } else if hs.get_km_request().is_some() {
             return Err(self.fail_listener_km(
@@ -3014,7 +3016,7 @@ mod tests {
         crypto.set_encrypted_packet_count_for_test(
             CryptoContext::KM_REFRESH_PERIOD - CryptoContext::KM_PRE_ANNOUNCE_PERIOD,
         );
-        conn.crypto = Some(crypto);
+        conn.crypto = Some(Box::new(crypto));
 
         conn.check_km_refresh(Timestamp::from_micros(1));
         conn.check_km_refresh(Timestamp::from_micros(2));
@@ -3666,7 +3668,7 @@ mod tests {
             ..Default::default()
         });
         conn.connect(Timestamp::from_micros(0)).unwrap();
-        conn.crypto = Some(
+        conn.crypto = Some(Box::new(
             CryptoContext::new_sender(
                 "test_passphrase",
                 KeyLength::Aes128,
@@ -3675,7 +3677,7 @@ mod tests {
                 CipherMode::Ctr,
             )
             .unwrap(),
-        );
+        ));
 
         // A CONCLUSION with no KMRSP should fail for an encrypted caller.
         let hs = HandshakePacket {

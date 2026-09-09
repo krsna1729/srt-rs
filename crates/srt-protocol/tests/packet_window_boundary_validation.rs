@@ -16,7 +16,7 @@ fn ts() -> Timestamp {
 fn sender_window_boundary_capacities_and_push_limits() {
     for &boundary in &[63, 64, 65, 127, 128, 129, 8191, 8192, 8193, 65535, 65536] {
         let mut sender = SenderBuffer::new(0, boundary, 120);
-        sender.set_congestion_window(boundary);
+        sender.set_flow_window(boundary);
 
         for _ in 0..boundary {
             assert!(
@@ -40,7 +40,7 @@ fn sender_window_boundary_capacities_and_push_limits() {
 fn unaligned_initial_sequence_and_partial_page_ack() {
     for &initial_seq in &[17, 39, 63, 127, 8191, 0x7fff_ffe0] {
         let mut sender = SenderBuffer::new(initial_seq, 256, 120);
-        sender.set_congestion_window(256);
+        sender.set_flow_window(256);
 
         // Push 100 packets starting from unaligned initial_seq
         for _ in 0..100 {
@@ -65,7 +65,7 @@ fn unaligned_initial_sequence_and_partial_page_ack() {
 fn nak_crossing_page_boundary_and_sequence_wrap() {
     // 1. NAK crossing a 64-slot page boundary (60..70)
     let mut sender = SenderBuffer::new(0, 256, 120);
-    sender.set_congestion_window(256);
+    sender.set_flow_window(256);
     for _ in 0..128 {
         sender.push(PAYLOAD.to_vec(), 0, 1, ts()).unwrap();
     }
@@ -87,7 +87,7 @@ fn nak_crossing_page_boundary_and_sequence_wrap() {
     // 2. NAK crossing 31-bit sequence wrap (0x7fff_fff8 .. 5)
     let wrap_initial = 0x7fff_fff0;
     let mut wrap_sender = SenderBuffer::new(wrap_initial, 256, 120);
-    wrap_sender.set_congestion_window(256);
+    wrap_sender.set_flow_window(256);
     for _ in 0..32 {
         wrap_sender.push(PAYLOAD.to_vec(), 0, 1, ts()).unwrap();
     }
@@ -111,7 +111,7 @@ fn nak_crossing_page_boundary_and_sequence_wrap() {
 #[test]
 fn retransmit_queue_entry_survives_physical_page_reuse_and_rejects_stale_alias() {
     let mut sender = SenderBuffer::new(0, 128, 120);
-    sender.set_congestion_window(128);
+    sender.set_flow_window(128);
 
     // Fill page 0 (0..64)
     for _ in 0..64 {

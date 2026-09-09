@@ -11,7 +11,7 @@ fn sender_packet_window_monotonic_push_ack_and_wrap() {
     const MASK: u32 = 0x7FFF_FFFF;
     let start_seq = MASK - 2;
     let mut sender = SenderBuffer::new(start_seq, 256, 120);
-    sender.set_congestion_window(256);
+    sender.set_flow_window(256);
 
     // Push packets across sequence wrap: MASK - 2, MASK - 1, MASK, 0, 1.
     for i in 0..5 {
@@ -39,7 +39,7 @@ fn sender_packet_window_monotonic_push_ack_and_wrap() {
 #[test]
 fn sender_nak_range_intersection_and_duplicate_suppression() {
     let mut sender = SenderBuffer::new(0, 256, 120);
-    sender.set_congestion_window(256);
+    sender.set_flow_window(256);
 
     for seq in 0..10 {
         sender.push(vec![seq as u8], 1, 1, ts(1000)).unwrap();
@@ -71,7 +71,7 @@ fn sender_tlpktdrop_retires_entire_message_across_wrap() {
     const MASK: u32 = 0x7FFF_FFFF;
     let start_seq = MASK - 1;
     let mut sender = SenderBuffer::new(start_seq, 256, 10);
-    sender.set_congestion_window(256);
+    sender.set_flow_window(256);
 
     // Push a multi-fragment message spanning across 31-bit wrap.
     let big_payload = vec![0xAB; 3_000]; // 3 fragments of 1000 bytes each
@@ -105,7 +105,7 @@ fn sender_scale_1_30_200_1000_allocates_and_reclaims_pages() {
         let mut senders: Vec<SenderBuffer> = (0..conns)
             .map(|_| {
                 let mut s = SenderBuffer::new(0, 8_192, 120);
-                s.set_congestion_window(256);
+                s.set_flow_window(256);
                 s
             })
             .collect();
@@ -180,7 +180,7 @@ fn physical_slot_reuse_does_not_alias_stale_retransmit_entry() {
     // With flow_window = 64, directory capacity is 64.
     // Sequence 0 and sequence 64 share the exact same physical slot index (0 in page 0).
     let mut sender = SenderBuffer::new(0, 64, 120);
-    sender.set_congestion_window(64);
+    sender.set_flow_window(64);
 
     // 1. Send packet 0 and NAK it (queued for retransmit).
     sender.push(vec![0], 1, 1, ts(1000)).unwrap();
@@ -217,7 +217,7 @@ fn physical_slot_reuse_does_not_alias_stale_retransmit_entry() {
 fn tlpktdrop_stale_retransmits_compacts_at_threshold() {
     // Latency 10ms -> TLPKTDROP threshold is 1s (1_000_000 us).
     let mut sender = SenderBuffer::new(0, 64, 10);
-    sender.set_congestion_window(64);
+    sender.set_flow_window(64);
 
     // Cycle packets: push -> NAK -> TLPKTDROP before retransmit.
     // Each drop should increment stale_retransmits because was_retransmit_queued is true.

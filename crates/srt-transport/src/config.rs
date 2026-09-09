@@ -711,12 +711,6 @@ impl SessionConfig {
         &self.connection
     }
 
-    /// Mutable sans-I/O protocol escape hatch. Validation still runs when a
-    /// caller/listener is prepared.
-    pub fn connection_options_mut(&mut self) -> &mut ConnectionOptions {
-        &mut self.connection
-    }
-
     #[must_use]
     pub fn into_connection_options(mut self) -> ConnectionOptions {
         std::mem::take(&mut self.connection)
@@ -760,6 +754,18 @@ impl SessionConfig {
         self.connection.pacing_repay = matches!(pacing, PacingPolicy::RepayOneExtra);
         self
     }
+    /// Canonical initial-sequence setter for bonded legs sharing one
+    /// group-wide sequence space.
+    pub fn set_initial_seq(&mut self, seq: u32) -> &mut Self {
+        self.connection.initial_seq = Some(seq & 0x7fff_ffff);
+        self
+    }
+
+    /// Canonical socket-ID setter. Zero means auto-assign at `prepare()`.
+    pub fn set_socket_id(&mut self, socket_id: u32) -> &mut Self {
+        self.connection.socket_id = socket_id;
+        self
+    }
 
     pub fn set_stream_id(&mut self, stream_id: Option<String>) -> &mut Self {
         self.connection.stream_id = stream_id;
@@ -774,10 +780,7 @@ impl SessionConfig {
     /// Canonical flow-control setter. Rejects `delivery_queue > receive_buffer`
     /// instead of silently clamping; call `set_delivery_queue_packets` first
     /// if you need a smaller queue.
-    pub fn set_flow_control(
-        &mut self,
-        flow: FlowControlConfig,
-    ) -> Result<&mut Self, ConfigError> {
+    pub fn set_flow_control(&mut self, flow: FlowControlConfig) -> Result<&mut Self, ConfigError> {
         if self.connection.delivery_queue_packets > flow.receive_buffer_packets.get() {
             return Err(ConfigError::new(
                 "session.delivery_queue_packets",
@@ -2181,8 +2184,8 @@ mod tests {
         assert_ne!(first.socket_id(), second.socket_id());
 
         let mut explicit = SessionConfig::default();
-        explicit.connection_options_mut().socket_id = 42;
-        explicit.connection_options_mut().initial_seq = Some(99);
+        explicit.set_socket_id(42);
+        explicit.set_initial_seq(99);
         let caller = explicit.caller(Timestamp::default()).expect("caller");
         assert_eq!(caller.socket_id(), 42);
     }

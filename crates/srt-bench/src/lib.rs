@@ -552,6 +552,42 @@ pub enum BondMode {
 /// peer-tuple key (`SocketAddr` for every adapter so far).
 pub type SharedWorkerRouter =
     std::sync::Arc<std::sync::Mutex<srt_lifecycle::WorkerRouter<std::net::SocketAddr>>>;
+/// Canonical handshake-extension to group-affinity mapping. Single place
+/// the six acceptor loops build the `decide_promotion` group argument.
+#[must_use]
+pub fn group_from_extension(
+    extension: Option<shiguredo_srt::GroupExtensionData>,
+) -> Option<srt_lifecycle::GroupAffinity> {
+    extension.map(|extension| srt_lifecycle::GroupAffinity {
+        group_id: extension.group_id,
+        stream_id: None,
+        extension,
+    })
+}
+
+/// Canonical promotion decision. Single place acceptor loops resolve
+/// `decide_promotion`; runtimes must call this instead of copying the
+/// lock-match. Poisoned router fails closed to `StayOnListener`.
+pub fn decide_promotion_for(
+    cfg: &BenchConfig,
+    router: &SharedWorkerRouter,
+    worker_index: usize,
+    peer: std::net::SocketAddr,
+    group: Option<srt_lifecycle::GroupAffinity>,
+) -> srt_lifecycle::PromotionDecision {
+    match router.lock() {
+        Ok(mut router) => srt_lifecycle::decide_promotion(
+            cfg.promotion,
+            peer,
+            group,
+            worker_index,
+            &mut router,
+            srt_lifecycle::RoutingMode::LeastTuples,
+            cfg.exclusive_udp_tuple(),
+        ),
+        Err(_) => srt_lifecycle::PromotionDecision::StayOnListener,
+    }
+}
 
 impl BenchConfig {
     /// Reject benchmark topologies that advertise a bond without actually
@@ -582,8 +618,8 @@ impl BenchConfig {
         &self,
         capabilities: srt_transport::TransportCapabilities,
     ) -> Result<srt_transport::ResolvedEndpointPlan, String> {
-        let workers = std::num::NonZeroUsize::new(self.workers.max(1))
-            .unwrap_or(std::num::NonZeroUsize::MIN);
+        let workers =
+            std::num::NonZeroUsize::new(self.workers.max(1)).unwrap_or(std::num::NonZeroUsize::MIN);
         self.endpoint_plan()
             .resolve(
                 capabilities,
@@ -601,7 +637,6 @@ impl BenchConfig {
             )
             .map_err(|e| e.to_string())
     }
-
 
     /// Destination/bind address for connection i.
     pub fn addr_for(&self, i: usize) -> std::net::SocketAddr {
@@ -705,20 +740,24 @@ impl BenchConfig {
     /// Applied for both roles: a listener never sends application data,
     /// so its pacing ceiling is inert, and setting it uniformly keeps the
     /// six runtimes from each deciding the question differently.
+    /// Canonical via [`Self::session_config`]; do not write pacing fields here.
     pub fn apply_srt_bandwidth(&self, options: &mut shiguredo_srt::ConnectionOptions) {
-        self.srt_bandwidth().apply_to(options);
+        let template = self.session_config().into_connection_options();
+        options.max_bandwidth_bytes_per_sec = template.max_bandwidth_bytes_per_sec;
+        options.input_bandwidth_bytes_per_sec = template.input_bandwidth_bytes_per_sec;
+        options.overhead_bandwidth_percent = template.overhead_bandwidth_percent;
+        options.pacing_repay = template.pacing_repay;
     }
 
-    /// Write this run's ACK coalesce knobs into raw protocol options.
-    ///
-    /// Per-connection, so a cell can set 40 ms / 256 without an env var and
-    /// without contaminating other sockets in-process.
+    /// Canonical via [`Self::session_config`]; do not write ACK fields here.
     pub fn apply_ack_coalesce(&self, options: &mut shiguredo_srt::ConnectionOptions) {
-        options.ack_interval_micros = self.ack_interval_micros;
-        options.light_ack_interval_packets = self.light_ack_interval_packets;
+        let template = self.session_config().into_connection_options();
+        options.ack_interval_micros = template.ack_interval_micros;
+        options.light_ack_interval_packets = template.light_ack_interval_packets;
     }
 
-    /// Bandwidth + encryption + ACK coalesce. The single place a runtime
+    /// Bandwidth + encryption + ACK coalesce. Delegates to
+    /// [`Self::session_config`] plus encryption; the single place a runtime
     /// should stamp protocol knobs onto a `ConnectionOptions` template.
     pub fn apply_protocol_options(&self, options: &mut shiguredo_srt::ConnectionOptions) {
         self.apply_srt_bandwidth(options);
@@ -771,12 +810,9 @@ impl BenchConfig {
     pub fn session_config(&self) -> srt_transport::SessionConfig {
         let mut session = srt_transport::SessionConfig::default();
         session.set_bandwidth(self.srt_bandwidth());
-        let _ = session.set_latency(std::time::Duration::from_millis(u64::from(
-            self.latency_ms,
-        )));
-        let _ = session.set_ack_interval(std::time::Duration::from_micros(
-            self.ack_interval_micros,
-        ));
+        let _ = session.set_latency(std::time::Duration::from_millis(u64::from(self.latency_ms)));
+        let _ =
+            session.set_ack_interval(std::time::Duration::from_micros(self.ack_interval_micros));
         let _ = session.set_light_ack_interval_packets(self.light_ack_interval_packets);
         session.set_pacing(srt_transport::PacingPolicy::Off);
         session
@@ -788,8 +824,6 @@ impl BenchConfig {
     pub fn exclusive_udp_tuple(&self) -> bool {
         self.egress != Egress::SharedSocket
     }
-
-
 
     /// How many peers' traffic arrives on one listener ingress socket.
     ///
@@ -885,13 +919,10 @@ impl BenchConfig {
         socket_id: u32,
         cookie_routing: bool,
     ) -> srt_transport::AdmissionOptions {
-        let mut template = shiguredo_srt::ConnectionOptions {
-            socket_id,
-            tsbpd_delay: self.latency_ms,
-            ..Default::default()
-        };
+        let session = self.session_config();
+        let mut template = session.into_connection_options();
+        template.socket_id = socket_id;
         self.encryption.apply_to(&mut template);
-        self.apply_ack_coalesce(&mut template);
         srt_transport::AdmissionOptions {
             socket_id,
             tsbpd_delay: self.latency_ms,

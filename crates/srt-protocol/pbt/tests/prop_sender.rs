@@ -166,7 +166,7 @@ proptest! {
         flow_window in 1u32..16u32, // 初期 congestion_window は 16
     ) {
         let mut buf = SenderBuffer::new(0, flow_window, 120);
-        buf.set_congestion_window(1000); // フローウィンドウテスト用に増やす
+        buf.set_flow_window(1000); // フローウィンドウテスト用に増やす
         let now = Timestamp::from_micros(0);
 
         // フローウィンドウ分のパケットを送信
@@ -182,11 +182,11 @@ proptest! {
     }
 
     #[test]
-    fn test_sender_buffer_congestion_window(
+    fn test_sender_buffer_flow_window_gates_send(
         cwnd in 1u32..50u32,
     ) {
         let mut buf = SenderBuffer::new(0, 8192, 120);
-        buf.set_congestion_window(cwnd);
+        buf.set_flow_window(cwnd);
         let now = Timestamp::from_micros(0);
 
         // 輻輳ウィンドウ分のパケットを送信
@@ -327,7 +327,7 @@ proptest! {
         max_payload in 100usize..500usize,
     ) {
         let mut buf = SenderBuffer::new(0, 8192, 120);
-        buf.set_congestion_window(1000); // 大きなメッセージ用に増やす
+        buf.set_flow_window(1000); // 大きなメッセージ用に増やす
         let now = Timestamp::from_micros(0);
         let payload = vec![0u8; payload_size];
 
@@ -374,7 +374,7 @@ proptest! {
         // シーケンス番号のラップアラウンドをテスト
         let initial_seq = 0x7FFF_FFFF - offset;
         let mut buf = SenderBuffer::new(initial_seq, 8192, 120);
-        buf.set_congestion_window(100); // ラップアラウンドテスト用に増やす
+        buf.set_flow_window(100); // ラップアラウンドテスト用に増やす
         let now = Timestamp::from_micros(0);
 
         // ラップアラウンドを超えてパケットを送信
@@ -395,7 +395,7 @@ proptest! {
     ) {
         const MASK: u32 = 0x7FFF_FFFF;
         let mut buf = SenderBuffer::new(initial_seq, window_size, 10);
-        buf.set_congestion_window(window_size);
+        buf.set_flow_window(window_size);
 
         let mut model_packets = std::collections::BTreeMap::new();
         let mut model_queue = std::collections::VecDeque::new();

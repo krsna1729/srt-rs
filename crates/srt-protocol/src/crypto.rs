@@ -352,10 +352,15 @@ pub struct CryptoContext {
     km_refresh_state: KmRefreshState,
     /// The next key (generated while pre-announcing).
     next_key: Option<KeyFlag>,
-    ctr_even: Option<CachedCtr>,
-    ctr_odd: Option<CachedCtr>,
-    gcm_even: Option<CachedGcm>,
-    gcm_odd: Option<CachedGcm>,
+    /// Expanded key schedules, boxed: ~4KB inline would blow the
+    /// per-connection footprint budget (`delivery_packet_accounting_*`).
+    /// Boxing costs one alloc per SEK install (handshake / KM refresh) and
+    /// one deref per packet on already-hot data; the cache win is skipping
+    /// key expansion, not avoiding the deref.
+    ctr_even: Option<Box<CachedCtr>>,
+    ctr_odd: Option<Box<CachedCtr>>,
+    gcm_even: Option<Box<CachedGcm>>,
+    gcm_odd: Option<Box<CachedGcm>>,
 }
 
 // local patch (crates/srt-protocol/VENDOR.md, upstream issues
@@ -503,14 +508,14 @@ impl CryptoContext {
     fn rebuild_cipher_cache(&mut self) -> Result<(), Error> {
         match self.cipher_mode {
             CipherMode::Ctr => {
-                self.ctr_even = cache_ctr(&self.sek_even, self.key_length)?;
-                self.ctr_odd = cache_ctr(&self.sek_odd, self.key_length)?;
+                self.ctr_even = cache_ctr(&self.sek_even, self.key_length)?.map(Box::new);
+                self.ctr_odd = cache_ctr(&self.sek_odd, self.key_length)?.map(Box::new);
                 self.gcm_even = None;
                 self.gcm_odd = None;
             }
             CipherMode::Gcm => {
-                self.gcm_even = cache_gcm(&self.sek_even, self.key_length)?;
-                self.gcm_odd = cache_gcm(&self.sek_odd, self.key_length)?;
+                self.gcm_even = cache_gcm(&self.sek_even, self.key_length)?.map(Box::new);
+                self.gcm_odd = cache_gcm(&self.sek_odd, self.key_length)?.map(Box::new);
                 self.ctr_even = None;
                 self.ctr_odd = None;
             }
@@ -523,7 +528,7 @@ impl CryptoContext {
             KeyFlag::Even => &self.ctr_even,
             KeyFlag::Odd => &self.ctr_odd,
         };
-        slot.as_ref()
+        slot.as_deref()
             .ok_or_else(|| Error::crypto_error("CTR key schedule missing for key flag"))
     }
 
@@ -532,7 +537,7 @@ impl CryptoContext {
             KeyFlag::Even => &self.gcm_even,
             KeyFlag::Odd => &self.gcm_odd,
         };
-        slot.as_ref()
+        slot.as_deref()
             .ok_or_else(|| Error::crypto_error("GCM key schedule missing for key flag"))
     }
 
