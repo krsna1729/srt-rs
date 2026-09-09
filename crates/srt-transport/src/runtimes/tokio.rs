@@ -188,15 +188,18 @@ impl Conn {
     }
 
     /// Send one paced shared-payload packet (fan-out path).
+    ///
+    /// Success means the application payload was accepted into SRT. Output
+    /// drain is best-effort afterward: returning `Err` after a successful
+    /// `send_shared` would make bus callers `push_front` and duplicate the
+    /// same application payload on the next attempt.
     pub async fn send_shared_paced(&mut self, payload: Bytes, now: Timestamp) -> Result<(), ()> {
         if self.has_pending_outputs() || !self.conn.can_send_with_pacing(now) {
             return Err(());
         }
         self.conn.send_shared(payload, now).map_err(|_| ())?;
-        let report = self.drain_outputs(now).await.map_err(|_| ())?;
-        (report.status == OutputDrainStatus::Drained)
-            .then_some(())
-            .ok_or(())
+        let _ = self.drain_outputs(now).await;
+        Ok(())
     }
 
     /// Full event-loop tick: fire timers, recv, drain, send paced.
