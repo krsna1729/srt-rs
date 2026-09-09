@@ -283,8 +283,9 @@ pub enum Promotion {
 /// What should happen to a connection that has just reached `Connected`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PromotionDecision {
-    /// Keep servicing it off the shared listener by peer-address
-    /// dispatch. No new socket, so the reuseport group is undisturbed.
+    /// Keep servicing it off the shared listener. No new socket, so the
+    /// reuseport group is undisturbed. Demux is by SRT socket ID, which
+    /// is what lets N sessions share one UDP 4-tuple.
     StayOnListener,
     /// Give it a private connected socket on this same worker.
     PromoteHere,
@@ -323,10 +324,17 @@ pub fn decide_promotion<K>(
     worker_index: usize,
     router: &mut WorkerRouter<K>,
     routing: RoutingMode,
+    exclusive_udp_tuple: bool,
 ) -> PromotionDecision
 where
     K: Eq + Hash + Clone,
 {
+    // `connect()` matches the whole UDP 4-tuple. N SRT connections on one
+    // shared-sender socket share that tuple, so the first promote steals
+    // every later handshake. PeerTable already demuxes by socket ID.
+    if !exclusive_udp_tuple {
+        return PromotionDecision::StayOnListener;
+    }
     // A bonded leg asks the router where its group already lives.
     // Unbonded connections, and everything under `Never`, have no
     // affinity to honour and so no owner.
@@ -350,6 +358,33 @@ where
             Promotion::All => PromotionDecision::PromoteHere,
             _ => PromotionDecision::StayOnListener,
         },
+    }
+}
+
+/// How a reuseport-single listener should be realized.
+///
+/// Connected workers `connect()` a private socket onto the peer 4-tuple.
+/// Shared-socket senders put every SRT session on one tuple; Linux then
+/// delivers later handshakes to the first connected socket. One
+/// unconnected reuseport member plus socket-ID demux is the shape that
+/// still works. This is the kernel fork, not a watered-down common I/O
+/// path: each runtime still runs its own connected-worker or unconnected
+/// acceptor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReuseportSinglePlan {
+    ConnectedWorkers(usize),
+    UnconnectedListener,
+}
+
+/// Plan a reuseport-single listener from the same tuple-ownership bit
+/// [`decide_promotion`] uses. Callers that `connect()` a promoted socket
+/// must take [`ReuseportSinglePlan::ConnectedWorkers`] only.
+#[must_use]
+pub fn plan_reuseport_single(workers: usize, exclusive_udp_tuple: bool) -> ReuseportSinglePlan {
+    if exclusive_udp_tuple {
+        ReuseportSinglePlan::ConnectedWorkers(workers.max(1))
+    } else {
+        ReuseportSinglePlan::UnconnectedListener
     }
 }
 
@@ -499,6 +534,7 @@ mod promotion_tests {
             worker_index,
             &mut router,
             RoutingMode::LeastTuples,
+            true,
         )
     }
 
@@ -526,6 +562,58 @@ mod promotion_tests {
             };
             assert_eq!(decision, expected, "unbonded under {mode:?}");
         }
+    }
+
+    #[test]
+    fn shared_udp_tuple_never_promotes() {
+        let mut router: WorkerRouter<u32> = WorkerRouter::new(4);
+        for mode in MODES {
+            assert_eq!(
+                decide_promotion(
+                    mode,
+                    1u32,
+                    None,
+                    0,
+                    &mut router,
+                    RoutingMode::LeastTuples,
+                    false,
+                ),
+                PromotionDecision::StayOnListener,
+                "unbonded shared tuple under {mode:?}"
+            );
+            assert_eq!(
+                decide_promotion(
+                    mode,
+                    2u32,
+                    Some(affinity(7)),
+                    0,
+                    &mut router,
+                    RoutingMode::LeastTuples,
+                    false,
+                ),
+                PromotionDecision::StayOnListener,
+                "bonded shared tuple under {mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_udp_tuple_reuseport_single_stays_unconnected() {
+        for workers in [0, 1, 4, 64] {
+            assert_eq!(
+                plan_reuseport_single(workers, false),
+                ReuseportSinglePlan::UnconnectedListener,
+                "workers={workers}"
+            );
+        }
+        assert_eq!(
+            plan_reuseport_single(4, true),
+            ReuseportSinglePlan::ConnectedWorkers(4)
+        );
+        assert_eq!(
+            plan_reuseport_single(0, true),
+            ReuseportSinglePlan::ConnectedWorkers(1)
+        );
     }
 
     #[test]
@@ -946,6 +1034,46 @@ mod proptests {
 
             prop_assert_eq!(router.active_tuple_count(), tuple_worker.len());
             prop_assert_eq!(router.active_group_count(), group_worker.len());
+        }
+
+        #[test]
+        fn shared_tuple_never_creates_a_socket(
+            mode in prop_oneof![
+                Just(Promotion::Never),
+                Just(Promotion::Relocate),
+                Just(Promotion::Bonded),
+                Just(Promotion::All)
+            ],
+            workers in 1usize..8,
+            worker in 0usize..8,
+            has_group in any::<bool>(),
+            seed_other in any::<bool>(),
+            requested in 0usize..16,
+        ) {
+            let mut router = WorkerRouter::new(workers);
+            let group = has_group.then(|| affinity(1));
+            if seed_other && has_group {
+                router.assign(99u32, group.clone(), RoutingMode::RoundRobin);
+            }
+            let decision = decide_promotion(
+                mode,
+                1u32,
+                group,
+                worker % workers,
+                &mut router,
+                RoutingMode::LeastTuples,
+                false,
+            );
+            prop_assert!(!decision.promotes());
+            prop_assert_eq!(decision, PromotionDecision::StayOnListener);
+            prop_assert_eq!(
+                plan_reuseport_single(requested, false),
+                ReuseportSinglePlan::UnconnectedListener
+            );
+            prop_assert_eq!(
+                plan_reuseport_single(requested, true),
+                ReuseportSinglePlan::ConnectedWorkers(requested.max(1))
+            );
         }
     }
 }

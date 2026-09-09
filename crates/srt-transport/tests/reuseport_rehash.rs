@@ -356,3 +356,83 @@ fn a_large_group_bound_before_any_traffic_is_harmless() {
         "a group bound entirely before any traffic should be perfectly stable"
     );
 }
+
+fn collect_u64_homes(listeners: &[UdpSocket]) -> Vec<usize> {
+    let mut landed = vec![0usize; listeners.len()];
+    let mut buf = [0u8; 128];
+    for (listener_id, listener) in listeners.iter().enumerate() {
+        while let Ok((length, _)) = listener.recv_from(&mut buf) {
+            if length == std::mem::size_of::<u64>() {
+                landed[listener_id] += 1;
+            }
+        }
+    }
+    landed
+}
+
+fn wait_for_u64_homes(listeners: &[UdpSocket], want: usize) -> Vec<usize> {
+    let mut landed = vec![0usize; listeners.len()];
+    for _ in 0..50 {
+        for (total, add) in landed.iter_mut().zip(collect_u64_homes(listeners)) {
+            *total += add;
+        }
+        if landed.iter().sum::<usize>() >= want {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    landed
+}
+
+/// Shared-socket senders put every SRT session on one UDP 4-tuple.
+/// After a listener `connect()`s to that tuple, Linux matches the
+/// connected socket ahead of the reuseport hash, so every later datagram
+/// from that client lands there -- including handshakes that belong to a
+/// different SRT socket ID. This is why a shared tuple must never promote.
+#[test]
+fn connect_steals_every_datagram_from_that_udp_tuple() {
+    let first = bind_member(0).expect("bind first reuseport member");
+    let port = first.local_addr().expect("local_addr").port();
+    let mut listeners = vec![first];
+    for _ in 1..GROUP_SIZE {
+        listeners.push(bind_member(port).expect("bind reuseport member"));
+    }
+
+    let target: SocketAddr = format!("127.0.0.1:{port}").parse().expect("target addr");
+    let client = UdpSocket::bind("127.0.0.1:0").expect("bind client");
+    client.connect(target).expect("connect client");
+    let client_addr = client.local_addr().expect("client addr");
+
+    drain_all(&listeners);
+    client.send(&0u64.to_le_bytes()).expect("warmup send");
+    let warmup = wait_for_u64_homes(&listeners, 1);
+    assert!(
+        warmup.iter().sum::<usize>() >= 1,
+        "warmup datagram never reached the unconnected reuseport group"
+    );
+
+    let promoted = bind_member(port).expect("bind promoted socket");
+    promoted
+        .connect(client_addr)
+        .expect("connect to client tuple");
+    listeners.push(promoted);
+    drain_all(&listeners);
+
+    const PROBES: usize = 16;
+    for probe in 0..PROBES {
+        client
+            .send(&(probe as u64).to_le_bytes())
+            .expect("send stolen-tuple probe");
+    }
+    let landed = wait_for_u64_homes(&listeners, PROBES);
+    let promoted_idx = listeners.len() - 1;
+    assert_eq!(
+        landed[promoted_idx], PROBES,
+        "every datagram from the stolen tuple must land on the connected socket, got {landed:?}"
+    );
+    assert_eq!(
+        landed[..promoted_idx].iter().sum::<usize>(),
+        0,
+        "unconnected members must not receive the stolen tuple, got {landed:?}"
+    );
+}

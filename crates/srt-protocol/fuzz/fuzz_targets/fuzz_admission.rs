@@ -137,5 +137,36 @@ fuzz_target!(|data: &[u8]| {
         table.poll_events(&mut events);
         let _ = table.bonded_stats();
     }
+
+    // Shared-socket callers reuse one SocketAddr with distinct SRT socket
+    // IDs. Drive extra inductions on the original peer so the table's
+    // (addr, socket_id) half-open key stays in the fuzz corpus.
+    if selector & 16 != 0 {
+        for extra in 1u32..=2 {
+            let mut extra_caller = SrtConnection::new_caller(ConnectionOptions {
+                socket_id: 0x1000_0001 + extra,
+                stream_id: Some("fuzz/admission".to_owned()),
+                ..ConnectionOptions::default()
+            });
+            if extra_caller.connect(Timestamp::default()).is_ok()
+                && let Some(induction) = next_packet(&mut extra_caller)
+            {
+                let _ = table.admit(
+                    peer,
+                    &induction,
+                    Timestamp::from_micros(now),
+                    &options,
+                    0,
+                    2,
+                    &telemetry,
+                );
+            }
+        }
+        let mut outbound = Vec::new();
+        table.poll_outbound(Timestamp::from_micros(now), &mut outbound);
+        let mut events = Vec::new();
+        table.poll_events(&mut events);
+    }
+
     let _ = table.prune_half_open(Timestamp::from_micros(now.saturating_add(1_000)));
 });

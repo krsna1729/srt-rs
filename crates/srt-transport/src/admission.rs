@@ -2590,6 +2590,83 @@ mod tests {
                 effective_limit,
             );
         }
+
+        #[test]
+        fn many_callers_on_one_udp_tuple_are_distinct_peers(
+            n in 1..16u16,
+            max_half_open in 1..16usize,
+        ) {
+            let want = usize::from(n).min(max_half_open);
+            let config = PeerTableConfig {
+                max_peers: 16,
+                max_half_open_peers: max_half_open,
+                max_established_peers: 16,
+                max_peers_per_ip: 16,
+                half_open_timeout: Duration::from_secs(60),
+            };
+            let mut table = PeerTable::with_config(config);
+            let telemetry = IngressTelemetry::new();
+            let options = default_options();
+            let peer = std::net::SocketAddr::from(([10, 0, 0, 1], 5000));
+            let mut admitted = 0usize;
+            for i in 0..n {
+                let result = table.admit(
+                    peer,
+                    &induction_packet(100 + u32::from(i)),
+                    Timestamp::from_micros(u64::from(i) * 1000),
+                    &options,
+                    0,
+                    1,
+                    &telemetry,
+                );
+                if !matches!(result, Admit::Dropped(_)) {
+                    admitted += 1;
+                }
+            }
+            prop_assert_eq!(admitted, want);
+            prop_assert_eq!(table.half_open_count(), want);
+        }
+    }
+
+    #[test]
+    fn two_callers_on_one_udp_tuple_are_two_half_open_peers() {
+        let mut table = PeerTable::with_config(PeerTableConfig {
+            max_peers: 8,
+            max_half_open_peers: 8,
+            max_established_peers: 8,
+            max_peers_per_ip: 8,
+            half_open_timeout: Duration::from_secs(60),
+        });
+        let telemetry = IngressTelemetry::new();
+        let options = default_options();
+        let peer = "10.0.0.1:5000".parse().unwrap();
+
+        assert!(!matches!(
+            table.admit(
+                peer,
+                &induction_packet(1),
+                Timestamp::from_micros(0),
+                &options,
+                0,
+                1,
+                &telemetry,
+            ),
+            Admit::Dropped(_)
+        ));
+        assert!(!matches!(
+            table.admit(
+                peer,
+                &induction_packet(2),
+                Timestamp::from_micros(1),
+                &options,
+                0,
+                1,
+                &telemetry,
+            ),
+            Admit::Dropped(_)
+        ));
+        assert_eq!(table.half_open_count(), 2);
+        assert_eq!(table.len(), 2);
     }
 
     #[test]
