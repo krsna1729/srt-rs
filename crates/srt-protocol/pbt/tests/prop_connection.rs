@@ -916,6 +916,36 @@ proptest! {
         prop_assert!(wait <= 100_000);
     }
 
+    /// Demand-on + whole-period lateness: the public connection API admits
+    /// exactly two packets at one instant, matching SenderBuffer Route B.
+    #[test]
+    fn prop_connection_pacing_demand_admits_two_when_a_period_late(
+        period in 100u64..10_000u64,
+        extra_periods in 2u64..12u64,
+    ) {
+        let mut now = Timestamp::from_micros(0);
+        let mut caller = SrtConnection::new_caller(make_opts(1));
+        let mut listener = SrtConnection::new_listener(make_opts(2));
+        establish_connection(&mut caller, &mut listener, &mut now);
+
+        caller.set_packet_send_period(period);
+        caller.send(b"x", now).expect("first send");
+        caller.set_pacing_demand(true);
+        let late = Timestamp::from_micros(
+            now.as_micros()
+                .saturating_add(period.saturating_mul(extra_periods)),
+        );
+        let mut admitted = 0u32;
+        while caller.can_send_with_pacing(late) {
+            caller.send(b"y", late).expect("repay send");
+            admitted += 1;
+            prop_assert!(admitted <= 2);
+        }
+        prop_assert_eq!(admitted, 2);
+        caller.discard_idle_pacing_debt(late);
+        prop_assert!(!caller.can_send_with_pacing(late));
+    }
+
     /// プロパティ: process_retransmit は未接続時に何もしない
     #[test]
     fn prop_process_retransmit_noop_when_disconnected(

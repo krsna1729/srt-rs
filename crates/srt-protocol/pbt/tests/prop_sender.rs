@@ -221,6 +221,63 @@ proptest! {
         prop_assert_eq!(buf.time_until_send(after_period), 0);
     }
 
+    /// Demand-off: a frozen-`now` loop never admits more than one packet,
+    /// including after multi-period lateness.
+    #[test]
+    fn prop_pacing_idle_admits_one_at_a_frozen_now(
+        period in 100u64..10_000u64,
+        lateness in 0u64..100_000u64,
+    ) {
+        let mut buf = SenderBuffer::new(0, 8192, 120);
+        buf.set_packet_send_period(period);
+        buf.record_send_time(Timestamp::from_micros(0));
+        let now = Timestamp::from_micros(period.saturating_add(lateness));
+        prop_assert_eq!(admit_count(&mut buf, now), 1);
+    }
+
+    /// Demand-on: sub-period lateness still admits one; a whole period or
+    /// more admits exactly two, never a catch-up burst of every missed slot.
+    #[test]
+    fn prop_pacing_demand_admits_at_most_two_at_a_frozen_now(
+        period in 100u64..10_000u64,
+        lateness in 0u64..100_000u64,
+    ) {
+        let mut buf = SenderBuffer::new(0, 8192, 120);
+        buf.set_packet_send_period(period);
+        buf.set_repay_pacing_debt(true);
+        buf.record_send_time(Timestamp::from_micros(0));
+        let now = Timestamp::from_micros(period.saturating_add(lateness));
+        let admitted = admit_count(&mut buf, now);
+        if lateness < period {
+            prop_assert_eq!(admitted, 1);
+        } else {
+            prop_assert_eq!(admitted, 2);
+        }
+    }
+
+    /// Discarding leftover debt after a demand-on send restores the idle
+    /// contract: a later resume is one packet, gap-independent.
+    #[test]
+    fn prop_pacing_discard_restores_one_immediate_resume(
+        period in 100u64..10_000u64,
+        lateness in 0u64..50_000u64,
+        gap_periods in 2u64..20u64,
+    ) {
+        let mut buf = SenderBuffer::new(0, 8192, 120);
+        buf.set_packet_send_period(period);
+        buf.set_repay_pacing_debt(true);
+        buf.record_send_time(Timestamp::from_micros(0));
+        let catch_up = Timestamp::from_micros(period.saturating_add(lateness));
+        let _ = admit_count(&mut buf, catch_up);
+        buf.discard_idle_pacing_debt(catch_up);
+        let resume = Timestamp::from_micros(
+            catch_up
+                .as_micros()
+                .saturating_add(period.saturating_mul(gap_periods)),
+        );
+        prop_assert_eq!(admit_count(&mut buf, resume), 1);
+    }
+
     #[test]
     fn test_sender_buffer_stats(
         count in 1usize..16usize, // 初期 congestion_window は 16
@@ -471,4 +528,17 @@ proptest! {
             prop_assert_eq!(buf.oldest_packet_time().is_some(), !model_packets.is_empty());
         }
     }
+}
+
+fn admit_count(buf: &mut SenderBuffer, now: Timestamp) -> u32 {
+    let mut admitted = 0u32;
+    while buf.can_send_with_pacing(now) {
+        buf.record_send_time(now);
+        admitted += 1;
+        assert!(
+            admitted <= 8,
+            "pacing admit loop exceeded bound at frozen now"
+        );
+    }
+    admitted
 }

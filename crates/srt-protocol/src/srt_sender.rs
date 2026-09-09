@@ -107,6 +107,11 @@ pub struct SenderBuffer {
     /// named `last_send_time`, which described neither its value nor its use.
     next_send_due: Option<Timestamp>,
     packet_send_period_overridden: bool,
+    /// When set, a late send keeps the ideal slot even if that slot is already
+    /// in the past, so a caller looping while eligible can repay missed
+    /// periods. Default off preserves the idle-gap contract (exactly one
+    /// immediate packet after silence). See `record_send_time`.
+    repay_pacing_debt: bool,
     /// Total packets sent.
     total_sent: u64,
     /// Total bytes sent.
@@ -175,6 +180,7 @@ impl SenderBuffer {
             packet_send_period: 0,
             next_send_due: None,
             packet_send_period_overridden: false,
+            repay_pacing_debt: false,
             total_sent: 0,
             total_bytes_sent: 0,
             total_srt_bytes_sent: 0,
@@ -277,6 +283,31 @@ impl SenderBuffer {
         self.packet_send_period_overridden = true;
     }
 
+    /// Repay missed pacing slots on the next `record_send_time`.
+    ///
+    /// The application (or bench source) owns unsent demand; the protocol
+    /// only needs a boolean. Default is off so idle-gap tests stay exact.
+    pub fn set_repay_pacing_debt(&mut self, repay: bool) {
+        self.repay_pacing_debt = repay;
+    }
+
+    /// Drop leftover send-time debt (libsrt empty-queue). Call when demand
+    /// has gone idle so a later resume admits exactly one immediate packet.
+    pub fn discard_idle_pacing_debt(&mut self, now: Timestamp) {
+        self.repay_pacing_debt = false;
+        let period = self.packet_send_period;
+        if period == 0 {
+            return;
+        }
+        let Some(due) = self.next_send_due else {
+            return;
+        };
+        let now_us = now.as_micros();
+        if due.as_micros() <= now_us {
+            self.next_send_due = Some(Timestamp::from_micros(now_us.saturating_add(period)));
+        }
+    }
+
     /// Advance the pacing schedule after a send.
     ///
     /// The schedule is a sequence of ideal slots one period apart. Servicing is
@@ -286,6 +317,7 @@ impl SenderBuffer {
     /// ```text
     /// lateness < period   keep the phase:   next due = previous due + period
     /// lateness >= period  rebase the phase: next due = now + period
+    ///                    (or keep the phase when repay_pacing_debt is set)
     /// ```
     ///
     /// The first branch is the repair. Previously every send rebased from the
@@ -296,32 +328,47 @@ impl SenderBuffer {
     /// bitrates: an 8 Mbit/s source paced at 10 Mbit/s measured 67.8% of its
     /// offered payload on a single idle connection.
     ///
-    /// The second branch preserves the behaviour verified against libsrt 1.5.3:
-    /// after a genuine idle gap exactly one packet may go immediately, and the
-    /// gap is not repaid as a burst. libsrt does repay debt while its sender
-    /// queue stays non-empty, but srt-rs has no protocol-owned queue of unsent
-    /// application demand to distinguish that case from true idle, so this is a
-    /// deliberately conservative approximation: lateness of a whole period or
-    /// more is discarded rather than carried. See `docs/perf/pacing-phase.md`.
+    /// The rebase branch is the idle-gap contract verified against libsrt
+    /// 1.5.3: after genuine silence, exactly one packet may go immediately.
+    /// libsrt itself *does* repay whole-period debt while the sender queue
+    /// stays non-empty. `repay_pacing_debt` is that switch: the caller tells
+    /// the pacer that application data is still waiting. Default off matches
+    /// the empty-queue / idle path. See `docs/perf/pacing-phase.md`.
     ///
-    /// Both branches leave the deadline strictly after `now`, so a caller
-    /// looping while eligible can never drain more than one packet per instant.
-    /// This holds even if `period` changed during the push that preceded this
-    /// call, because both branches are evaluated against the same `period`.
+    /// With the flag off, both branches leave the deadline strictly after
+    /// `now`, so a caller looping while eligible cannot drain more than one
+    /// packet per instant. With the flag on, a deadline may land at or before
+    /// `now` so missed slots can be repaid in the same visit.
     pub fn record_send_time(&mut self, now: Timestamp) {
         let period = self.packet_send_period;
         if period == 0 {
             self.next_send_due = Some(now);
             return;
         }
-        let now_us = now.as_micros();
-        let phase_preserved = self
-            .next_send_due
-            .map(|due| due.as_micros().saturating_add(period))
-            .filter(|&next| next > now_us);
         self.next_send_due = Some(Timestamp::from_micros(
-            phase_preserved.unwrap_or_else(|| now_us.saturating_add(period)),
+            self.next_due_after_send(now, period),
         ));
+    }
+
+    fn next_due_after_send(&self, now: Timestamp, period: u64) -> u64 {
+        let now_us = now.as_micros();
+        let next_slot = self
+            .next_send_due
+            .map(|due| due.as_micros().saturating_add(period));
+        if self.repay_pacing_debt {
+            // At most one extra packet at this instant. Full libsrt debt
+            // would emit every missed slot here; with N=600 pumped in one
+            // park that is an incast, not a repair.
+            match next_slot {
+                Some(next) if next > now_us => next,
+                Some(_) => now_us,
+                None => now_us.saturating_add(period),
+            }
+        } else {
+            next_slot
+                .filter(|&next| next > now_us)
+                .unwrap_or_else(|| now_us.saturating_add(period))
+        }
     }
 
     /// Number of packets in flight.
@@ -1449,6 +1496,117 @@ mod tests {
                 "lateness {lateness} left the connection immediately eligible again"
             );
         }
+    }
+
+    /// Route B: while application demand remains, whole-period lateness is
+    /// repaid so a frozen-`now` loop can emit the missed slots. Two periods
+    /// late admits two packets at the same instant; the third waits.
+    #[test]
+    fn pacing_repays_whole_period_lateness_while_demand_remains() {
+        let mut buf = SenderBuffer::new(1000, 8192, 120);
+        buf.set_packet_send_period(1000);
+        buf.set_repay_pacing_debt(true);
+        buf.record_send_time(Timestamp::from_micros(0));
+
+        let now = Timestamp::from_micros(2500);
+        let mut admitted = 0u32;
+        while buf.can_send_with_pacing(now) {
+            buf.record_send_time(now);
+            admitted += 1;
+            assert!(admitted <= 4, "repay unbounded at frozen now");
+        }
+        assert_eq!(admitted, 2);
+        assert!(!buf.can_send_with_pacing(now));
+        assert!(buf.can_send_with_pacing(Timestamp::from_micros(3500)));
+    }
+
+    /// A long stall with demand still waiting must not drain every missed
+    /// slot at one frozen `now` — that is an incast when many connections
+    /// share a park. One extra packet per instant is the 600x8 lever
+    /// (1.9 ms visits vs a 1.065 ms period); the rest waits for later visits.
+    #[test]
+    fn pacing_repay_is_bounded_to_one_extra_packet_per_instant() {
+        let mut buf = SenderBuffer::new(1000, 8192, 120);
+        buf.set_packet_send_period(1000);
+        buf.set_repay_pacing_debt(true);
+        buf.record_send_time(Timestamp::from_micros(0));
+
+        let now = Timestamp::from_micros(10_000);
+        let mut admitted = 0u32;
+        while buf.can_send_with_pacing(now) {
+            buf.record_send_time(now);
+            admitted += 1;
+            assert!(admitted <= 4, "bounded repay unbounded at frozen now");
+        }
+        assert_eq!(admitted, 2);
+    }
+
+    /// Clearing demand after the queue empties must restore the idle-gap
+    /// contract: leftover debt is discarded, so a later resume is one packet
+    /// rather than a catch-up burst of the missed periods.
+    #[test]
+    fn pacing_discard_idle_debt_restores_one_immediate_packet() {
+        let mut buf = SenderBuffer::new(1000, 8192, 120);
+        buf.set_packet_send_period(1000);
+        buf.set_repay_pacing_debt(true);
+        buf.record_send_time(Timestamp::from_micros(0));
+
+        let catch_up = Timestamp::from_micros(2500);
+        assert!(buf.can_send_with_pacing(catch_up));
+        buf.record_send_time(catch_up);
+        buf.discard_idle_pacing_debt(catch_up);
+
+        assert!(
+            !buf.can_send_with_pacing(catch_up),
+            "idle discard left a past deadline"
+        );
+
+        let resume = Timestamp::from_micros(10_000);
+        assert!(buf.can_send_with_pacing(resume));
+        buf.record_send_time(resume);
+        assert!(
+            !buf.can_send_with_pacing(resume),
+            "post-idle resume admitted a second immediate packet"
+        );
+    }
+
+    /// Demand-off (the default) must still refuse a second packet after a
+    /// multi-period gap; this is the same contract as
+    /// `pacing_post_idle_resume_admits_exactly_one_immediate_packet`.
+    #[test]
+    fn pacing_demand_off_does_not_repay_an_idle_gap() {
+        let mut buf = SenderBuffer::new(1000, 8192, 120);
+        buf.set_packet_send_period(1000);
+        buf.record_send_time(Timestamp::from_micros(0));
+
+        let now = Timestamp::from_micros(2500);
+        let mut admitted = 0u32;
+        while buf.can_send_with_pacing(now) {
+            buf.record_send_time(now);
+            admitted += 1;
+            assert!(admitted <= 2, "idle path burst");
+        }
+        assert_eq!(admitted, 1);
+    }
+
+    /// Clearing the demand bit without discarding leftover debt leaves a
+    /// deadline at `now` eligible — the remaining-pending path, so the next
+    /// visit can still emit the extra packet.
+    #[test]
+    fn pacing_clearing_demand_without_discard_keeps_a_due_at_now() {
+        let mut buf = SenderBuffer::new(1000, 8192, 120);
+        buf.set_packet_send_period(1000);
+        buf.set_repay_pacing_debt(true);
+        buf.record_send_time(Timestamp::from_micros(0));
+
+        let now = Timestamp::from_micros(2500);
+        assert!(buf.can_send_with_pacing(now));
+        buf.record_send_time(now);
+        buf.set_repay_pacing_debt(false);
+        assert!(
+            buf.can_send_with_pacing(now),
+            "remaining demand lost the extra slot"
+        );
     }
 
     #[test]

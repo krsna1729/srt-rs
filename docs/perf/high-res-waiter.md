@@ -73,7 +73,8 @@ the way to buy sub-millisecond waits at scale.
 ## What is deliberately deferred
 
 - Quiet-host N=1/30/200 timing campaigns and matrix sweeps
-- Route B accumulated debt, multi-admit, and `SrtConnection` ownership
+- Route B (`set_pacing_demand`) measured at N=600: one extra per conn per
+  park still incasts 600x8 (74.7% to 61%, PSI 37%). Default off, not wired.
 - Forcing completion runtimes (Monoio/Compio/Glommio) onto this waiter
 - Host-contention policy (#83) and batched UDP I/O (#73)
 

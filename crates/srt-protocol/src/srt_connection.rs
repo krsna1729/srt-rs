@@ -1345,6 +1345,26 @@ impl SrtConnection {
         }
     }
 
+    /// Tell the pacer whether unsent application data is waiting.
+    ///
+    /// When true, late service repays missed periods so a loop-while-eligible
+    /// caller can emit more than one packet at the same `now`. When false, the
+    /// idle-gap contract is restored (exactly one immediate packet).
+    pub fn set_pacing_demand(&mut self, waiting: bool) {
+        if let Some(sender) = self.sender.as_mut() {
+            sender.set_repay_pacing_debt(waiting);
+        }
+    }
+
+    /// Discard leftover send-time debt because the application queue is empty.
+    /// Matches libsrt clearing `m_tsNextSendTime` when `packUniqueData` finds
+    /// nothing to send.
+    pub fn discard_idle_pacing_debt(&mut self, now: Timestamp) {
+        if let Some(sender) = self.sender.as_mut() {
+            sender.discard_idle_pacing_debt(now);
+        }
+    }
+
     /// Get an event.
     pub fn poll_event(&mut self) -> Option<ConnectionEvent> {
         self.poll_event_inner(false)

@@ -108,6 +108,10 @@ name = "sender_nak"
 harness = false
 
 [[bench]]
+name = "sender_pacing"
+harness = false
+
+[[bench]]
 name = "receiver_packet_window"
 harness = false
 
