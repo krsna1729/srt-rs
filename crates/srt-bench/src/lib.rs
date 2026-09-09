@@ -575,6 +575,33 @@ impl BenchConfig {
         }
         Ok(())
     }
+    /// Canonical topology validation. Single place illegal
+    /// `topology+ownership+promotion` combos are rejected; call after
+    /// `validate_bond_topology` at startup so bench never runs them.
+    pub fn validate_canonical(
+        &self,
+        capabilities: srt_transport::TransportCapabilities,
+    ) -> Result<srt_transport::ResolvedEndpointPlan, String> {
+        let workers = std::num::NonZeroUsize::new(self.workers.max(1))
+            .unwrap_or(std::num::NonZeroUsize::MIN);
+        self.endpoint_plan()
+            .resolve(
+                capabilities,
+                srt_transport::WorkerCount::Count(workers),
+                if self.batching == Batching::On {
+                    srt_transport::BatchingPolicy::Auto
+                } else {
+                    srt_transport::BatchingPolicy::Disabled
+                },
+                srt_transport::SocketBufferConfig::Bytes(
+                    std::num::NonZeroUsize::new(self.sock_buf_bytes.max(1))
+                        .unwrap_or(std::num::NonZeroUsize::MIN),
+                ),
+                srt_transport::OutputDrainBudget::default(),
+            )
+            .map_err(|e| e.to_string())
+    }
+
 
     /// Destination/bind address for connection i.
     pub fn addr_for(&self, i: usize) -> std::net::SocketAddr {
@@ -698,6 +725,71 @@ impl BenchConfig {
         self.encryption.apply_to(options);
         self.apply_ack_coalesce(options);
     }
+    /// Canonical endpoint plan. Single place `Ingress + Egress + promotion`
+    /// becomes `EndpointSocketPlan`; runtimes must resolve through this,
+    /// not by matching the three enums separately.
+    #[must_use]
+    pub fn endpoint_plan(&self) -> srt_transport::EndpointSocketPlan {
+        let ownership = if self.exclusive_udp_tuple() {
+            srt_transport::SocketOwnership::Exclusive
+        } else {
+            srt_transport::SocketOwnership::Shared
+        };
+        let topology = match self.ingress {
+            Ingress::PerPort => srt_transport::ListenerTopology::PerPort,
+            Ingress::SharedPool(k) => srt_transport::ListenerTopology::SharedPool {
+                listeners: Self::worker_count(k),
+            },
+            Ingress::ReuseportMulti(k) => srt_transport::ListenerTopology::ReusePortMulti {
+                acceptors: Self::worker_count(k),
+            },
+            Ingress::ReuseportSingle { workers } => {
+                srt_transport::ListenerTopology::ReusePortSingle {
+                    workers: Self::worker_count(workers),
+                }
+            }
+        };
+        let promotion = match self.promotion {
+            Promotion::Never => srt_transport::PromotionPolicy::Never,
+            Promotion::Relocate => srt_transport::PromotionPolicy::Relocate,
+            Promotion::Bonded => srt_transport::PromotionPolicy::Bonded,
+            Promotion::All => srt_transport::PromotionPolicy::All,
+        };
+        srt_transport::EndpointSocketPlan::new(topology, ownership, promotion)
+    }
+
+    fn worker_count(n: usize) -> srt_transport::WorkerCount {
+        std::num::NonZeroUsize::new(n).map_or(
+            srt_transport::WorkerCount::Auto,
+            srt_transport::WorkerCount::Count,
+        )
+    }
+
+    /// Canonical session. Single place workload knobs become protocol knobs.
+    /// Pacing stays `Off` (bench never repays; see pacing-phase.md).
+    #[must_use]
+    pub fn session_config(&self) -> srt_transport::SessionConfig {
+        let mut session = srt_transport::SessionConfig::default();
+        session.set_bandwidth(self.srt_bandwidth());
+        let _ = session.set_latency(std::time::Duration::from_millis(u64::from(
+            self.latency_ms,
+        )));
+        let _ = session.set_ack_interval(std::time::Duration::from_micros(
+            self.ack_interval_micros,
+        ));
+        let _ = session.set_light_ack_interval_packets(self.light_ack_interval_packets);
+        session.set_pacing(srt_transport::PacingPolicy::Off);
+        session
+    }
+    /// Symmetric ownership bit. Single place `Egress` becomes
+    /// `SocketOwnership`; `decide_promotion` and `plan_reuseport_single`
+    /// must take this, not match `egress` separately.
+    #[must_use]
+    pub fn exclusive_udp_tuple(&self) -> bool {
+        self.egress != Egress::SharedSocket
+    }
+
+
 
     /// How many peers' traffic arrives on one listener ingress socket.
     ///

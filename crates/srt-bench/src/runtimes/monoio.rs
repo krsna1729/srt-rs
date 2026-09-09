@@ -700,14 +700,7 @@ fn promotion_decision(
         extension,
     });
     match context.router.lock() {
-        Ok(mut router) => srt_lifecycle::decide_promotion(
-            context.cfg.promotion,
-            peer,
-            group,
-            context.worker_index,
-            &mut router,
-            srt_lifecycle::RoutingMode::LeastTuples,
-        ),
+        Ok(mut router) => srt_lifecycle::decide_promotion(context.cfg.promotion, peer, group, context.worker_index, &mut router, srt_lifecycle::RoutingMode::LeastTuples, context.cfg.exclusive_udp_tuple()),
         Err(_) => srt_lifecycle::PromotionDecision::StayOnListener,
     }
 }

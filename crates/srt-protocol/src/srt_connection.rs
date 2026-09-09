@@ -275,6 +275,10 @@ pub struct ConnectionOptions {
     /// **non-default / non-RFC-recommended** coalesce. A receive window
     /// smaller than 64 packets does not Light-ACK; full ACK is the path.
     pub light_ack_interval_packets: u32,
+    /// Repay pacing debt while app demand remains. Canonical owner is
+    /// `srt_transport::PacingPolicy`; do not set directly. Default false
+    /// preserves the idle-gap contract (exactly one immediate packet).
+    pub pacing_repay: bool,
 }
 
 // Manual Debug (redacting passphrase/crypto_sek) rather than #[derive(Debug)],
@@ -351,6 +355,7 @@ impl Default for ConnectionOptions {
             delivery_queue_packets: DEFAULT_FLOW_WINDOW,
             ack_interval_micros: crate::ACK_INTERVAL_MICROS,
             light_ack_interval_packets: crate::LIGHT_ACK_INTERVAL_PACKETS,
+            pacing_repay: false,
         }
     }
 }
@@ -873,6 +878,7 @@ impl SrtConnection {
         } else if let Some(input_bw) = self.options.input_bandwidth_bytes_per_sec {
             sender.set_input_bandwidth(input_bw, self.options.overhead_bandwidth_percent);
         }
+        sender.set_repay_pacing_debt(self.options.pacing_repay);
         self.sender = Some(sender);
         let mut receiver = ReceiverBuffer::with_buffer_size(
             peer_initial_seq,
