@@ -93,15 +93,39 @@ fn per_conn(val: f64, conns: f64) -> f64 {
     if conns > 0.0 { val / conns } else { val }
 }
 
+/// Required validity input for the clean predicate: present, finite, and a
+/// non-negative count. Missing, NaN/infinite, or negative values invalidate
+/// the whole pair (`None`) instead of defaulting to zero — a missing
+/// loss/error count is not evidence of zero loss, and a NaN poisons every
+/// comparison it touches (`NaN > 0.0` and `NaN < 99.0` are both false, so a
+/// fully-NaN row used to read as clean). Purely informational display fields
+/// (CPU, RSS, RTT, retransmit/loss-list breakdowns, backlog watermarks) keep
+/// their legacy zero default; everything the predicate reads is required.
+fn required_count(record: &Record, key: &str) -> Option<f64> {
+    record.number(key).filter(|v| v.is_finite() && *v >= 0.0)
+}
+
+/// Shared identity across both roles (conns, source_bps, secs): a side that
+/// carries a corrupt value vetoes the pair, while a side that merely lacks
+/// the column (legacy rows) defers to the other side. Listener wins when
+/// both sides are valid, matching the previous preference.
+fn required_identity(caller: &Record, listener: &Record, key: &str) -> Option<f64> {
+    match (caller.number(key), listener.number(key)) {
+        (Some(_), Some(_)) => {
+            let _ = required_count(caller, key)?;
+            required_count(listener, key)
+        }
+        (Some(_), None) => required_count(caller, key),
+        (None, Some(_)) => required_count(listener, key),
+        (None, None) => None,
+    }
+}
+
 impl PairMetrics {
     pub fn compute(caller: &Record, listener: &Record) -> Option<Self> {
-        let conns = listener
-            .number("conns")
-            .or_else(|| caller.number("conns"))?;
-        let source_bps = listener
-            .number("source_bps")
-            .or_else(|| caller.number("source_bps"))?;
-        let secs = listener.number("secs").or_else(|| caller.number("secs"))?;
+        let conns = required_identity(caller, listener, "conns")?;
+        let source_bps = required_identity(caller, listener, "source_bps")?;
+        let secs = required_identity(caller, listener, "secs")?;
         // Three distinct cardinalities. `conns` is physical connections
         // (what the caller establishes); `logical_streams` is what a
         // group-aware listener admits; `source_streams` is how many
@@ -119,13 +143,13 @@ impl PairMetrics {
             .filter(|streams| *streams > 0.0)
             .unwrap_or(logical_streams);
 
-        let caller_established = caller.number("established").unwrap_or(0.0);
-        let listener_established = listener.number("established").unwrap_or(0.0);
-        let torn_c = caller.number("torn_down").unwrap_or(0.0);
-        let torn_l = listener.number("torn_down").unwrap_or(0.0);
+        let caller_established = required_count(caller, "established")?;
+        let listener_established = required_count(listener, "established")?;
+        let torn_c = required_count(caller, "torn_down")?;
+        let torn_l = required_count(listener, "torn_down")?;
 
-        let sent_pkts = caller.number("core_total").unwrap_or(0.0);
-        let recv_pkts = listener.number("core_total").unwrap_or(0.0);
+        let sent_pkts = required_count(caller, "core_total")?;
+        let recv_pkts = required_count(listener, "core_total")?;
 
         // The target is what the APPLICATION SOURCE asked for, so the
         // denominator is the payload size and the multiplier is the
@@ -171,20 +195,20 @@ impl PairMetrics {
         let caller_loss_list = caller.number("sec_b").unwrap_or(0.0);
         let listener_lost = listener.number("sec_a").unwrap_or(0.0);
         let listener_duplicates = listener.number("sec_b").unwrap_or(0.0);
-        let caller_udp_rcvbuf_err = caller.number("udp_rcvbuf_err").unwrap_or(0.0);
-        let listener_udp_rcvbuf_err = listener.number("udp_rcvbuf_err").unwrap_or(0.0);
+        let caller_udp_rcvbuf_err = required_count(caller, "udp_rcvbuf_err")?;
+        let listener_udp_rcvbuf_err = required_count(listener, "udp_rcvbuf_err")?;
         // Source state is the caller's: only the sender has a workload.
-        let source_overflow = caller.number("src_overflow").unwrap_or(0.0);
+        let source_overflow = required_count(caller, "src_overflow")?;
         let source_backlog_hwm = caller.number("src_backlog_hwm").unwrap_or(0.0);
         let source_backlog_cap = caller.number("src_backlog_cap").unwrap_or(0.0);
-        let datapath_queue_overflow = caller.number("datapath_q_dropped").unwrap_or(0.0)
-            + listener.number("datapath_q_dropped").unwrap_or(0.0);
+        let datapath_queue_overflow = required_count(caller, "datapath_q_dropped")?
+            + required_count(listener, "datapath_q_dropped")?;
         // `local_dropped` is the TOTAL number of datagrams the harness
         // dropped locally; `retry_overflow` is one of the reasons, and is
         // already included in that total. Adding them counted every
         // overflowed datagram twice.
-        let outbound_retry_loss = caller.number("local_dropped").unwrap_or(0.0)
-            + listener.number("local_dropped").unwrap_or(0.0);
+        let outbound_retry_loss =
+            required_count(caller, "local_dropped")? + required_count(listener, "local_dropped")?;
 
         Some(Self {
             conns,
@@ -1208,7 +1232,9 @@ fn pair_failure(
     let Some(metrics) = PairMetrics::compute(caller, listener) else {
         return Some((
             false,
-            format!("FAIL: cell=[{cell}] rep={rep}: could not compute pair metrics"),
+            format!(
+                "FAIL: cell=[{cell}] rep={rep}: missing or invalid required field, cannot compute pair metrics"
+            ),
         ));
     };
     let reasons = metrics.unclean_reasons();
@@ -1278,6 +1304,9 @@ mod tests {
                 ("cpu_sys_ms".to_string(), cpu_sys.to_string()),
                 ("peak_rss_kb".to_string(), rss.to_string()),
                 ("udp_rcvbuf_err".to_string(), rcvbuf_err.to_string()),
+                ("src_overflow".to_string(), "0".to_string()),
+                ("datapath_q_dropped".to_string(), "0".to_string()),
+                ("local_dropped".to_string(), "0".to_string()),
             ]
             .into_iter()
             .collect(),
@@ -1339,6 +1368,9 @@ mod tests {
                 ("cpu_sys_ms".to_string(), cpu_sys.to_string()),
                 ("peak_rss_kb".to_string(), rss.to_string()),
                 ("udp_rcvbuf_err".to_string(), rcvbuf_err.to_string()),
+                ("src_overflow".to_string(), "0".to_string()),
+                ("datapath_q_dropped".to_string(), "0".to_string()),
+                ("local_dropped".to_string(), "0".to_string()),
             ]
             .into_iter()
             .collect(),
@@ -1724,8 +1756,7 @@ mod tests {
             "1", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "0", "10", "0",
         );
         assert!(PairMetrics::compute(&c, &l).unwrap().is_clean());
-        l.fields
-            .push(("datapath_q_dropped".to_string(), "1".to_string()));
+        set_test_field(&mut l, "datapath_q_dropped", "1");
         assert!(!PairMetrics::compute(&c, &l).unwrap().is_clean());
     }
 
@@ -1742,8 +1773,7 @@ mod tests {
         // predicate reads.
         c.fields
             .push(("retry_overflow".to_string(), "1".to_string()));
-        c.fields
-            .push(("local_dropped".to_string(), "1".to_string()));
+        set_test_field(&mut c, "local_dropped", "1");
         let metrics = PairMetrics::compute(&c, &l).unwrap();
         assert!(!metrics.is_clean());
         assert_eq!(
@@ -1764,8 +1794,7 @@ mod tests {
         );
         c.fields
             .push(("retry_overflow".to_string(), "0".to_string()));
-        c.fields
-            .push(("local_dropped".to_string(), "7".to_string()));
+        set_test_field(&mut c, "local_dropped", "7");
         let metrics = PairMetrics::compute(&c, &l).unwrap();
         assert_eq!(metrics.outbound_retry_loss, 7.0);
         assert!(!metrics.is_clean());
@@ -1907,5 +1936,143 @@ mod tests {
             10_000_000.0,
             "Only strict clean cells qualify for capacity frontier"
         );
+    }
+
+    /// Mutate-or-insert a field on a test record. Pushing blindly would leave
+    /// a stale first value in place because `Record::number` reads the first
+    /// match.
+    fn set_test_field(record: &mut Record, key: &str, value: &str) {
+        if let Some((_, v)) = record.fields.iter_mut().find(|(k, _)| k == key) {
+            *v = value.to_string();
+        } else {
+            record.fields.push((key.to_string(), value.to_string()));
+        }
+    }
+
+    fn remove_test_field(record: &mut Record, key: &str) {
+        record.fields.retain(|(k, _)| k != key);
+    }
+
+    /// E01: missing, nonfinite, malformed, or negative validity inputs
+    /// invalidate the pair instead of defaulting to zero loss or comparing
+    /// vacuously true (a NaN `torn_down` used to read as clean because
+    /// `NaN > 0.0` is false, and a missing `torn_down` became `0.0`).
+    #[test]
+    fn invalid_validity_inputs_cannot_compute() {
+        let clean_caller = || {
+            make_test_caller(
+                "1", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "0", "10",
+                "0",
+            )
+        };
+        let clean_listener = || {
+            make_test_listener(
+                "1", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "0", "10",
+                "0",
+            )
+        };
+        assert!(PairMetrics::compute(&clean_caller(), &clean_listener()).is_some());
+
+        // NaN loss/error counts must not compare as clean.
+        let mut bad = clean_caller();
+        set_test_field(&mut bad, "torn_down", "NaN");
+        assert!(PairMetrics::compute(&bad, &clean_listener()).is_none());
+
+        // Infinite totals must not flow into ratios.
+        let mut bad = clean_caller();
+        set_test_field(&mut bad, "core_total", "inf");
+        assert!(PairMetrics::compute(&bad, &clean_listener()).is_none());
+
+        // Missing required counts are not zero.
+        let mut bad = clean_caller();
+        remove_test_field(&mut bad, "established");
+        assert!(PairMetrics::compute(&bad, &clean_listener()).is_none());
+        let mut bad = clean_caller();
+        remove_test_field(&mut bad, "local_dropped");
+        assert!(PairMetrics::compute(&bad, &clean_listener()).is_none());
+
+        // Negative counts are corrupt, not clean.
+        let mut bad = clean_caller();
+        set_test_field(&mut bad, "src_overflow", "-1");
+        assert!(PairMetrics::compute(&bad, &clean_listener()).is_none());
+        let mut bad = clean_listener();
+        set_test_field(&mut bad, "datapath_q_dropped", "-2");
+        assert!(PairMetrics::compute(&clean_caller(), &bad).is_none());
+
+        // Nonfinite identity poisons every downstream comparison.
+        let mut bad = clean_listener();
+        set_test_field(&mut bad, "conns", "NaN");
+        assert!(PairMetrics::compute(&clean_caller(), &bad).is_none());
+
+        // Malformed (non-numeric) metrics are missing, not zero.
+        let mut bad = clean_listener();
+        set_test_field(&mut bad, "core_total", "lots");
+        assert!(PairMetrics::compute(&clean_caller(), &bad).is_none());
+
+        // Zero denominators cannot become success: secs=0 still computes but
+        // the zero target keeps every threshold unmet.
+        let mut bad = clean_listener();
+        set_test_field(&mut bad, "secs", "0");
+        let metrics = PairMetrics::compute(&clean_caller(), &bad).expect("zero secs computes");
+        assert!(!metrics.is_clean());
+    }
+
+    /// E01 end-to-end: corrupt rows fail the gate file-wide, not just in
+    /// `compute` unit tests.
+    #[test]
+    fn test_check_clean_file_rejects_nonfinite_and_missing() {
+        let dir = std::env::temp_dir().join(format!("check_clean_invalid_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let header = crate::harness::COLUMNS.join("\t");
+        let set = |row: &mut [String], col: &str, val: &str| {
+            if let Some(pos) = crate::harness::COLUMNS.iter().position(|&c| c == col) {
+                row[pos] = val.to_string();
+            }
+        };
+        let rows = |overrides: &[(&str, &str, &str)]| -> String {
+            let mut out = Vec::new();
+            for role in ["caller", "listener"] {
+                let mut row = vec!["0".to_string(); crate::harness::COLUMNS.len()];
+                set(&mut row, "runtime", "mio");
+                set(&mut row, "role", role);
+                set(&mut row, "rep", "1");
+                set(&mut row, "conns", "10");
+                set(&mut row, "source_bps", "1000000");
+                set(&mut row, "secs", "10");
+                set(&mut row, "established", "10");
+                set(&mut row, "torn_down", "0");
+                set(&mut row, "core_total", "9499");
+                set(&mut row, "udp_rcvbuf_err", "0");
+                set(&mut row, "src_overflow", "0");
+                set(&mut row, "datapath_q_dropped", "0");
+                set(&mut row, "local_dropped", "0");
+                for (r, col, val) in overrides {
+                    if *r == role {
+                        set(&mut row, col, val);
+                    }
+                }
+                out.push(row.join("\t"));
+            }
+            format!("{}\n{}\n{}\n", header, out[0], out[1])
+        };
+
+        let clean_path = dir.join("valid.tsv");
+        std::fs::write(&clean_path, rows(&[])).unwrap();
+        assert!(check_clean_file(&clean_path).is_ok());
+
+        let nan_path = dir.join("nan.tsv");
+        std::fs::write(&nan_path, rows(&[("listener", "torn_down", "NaN")])).unwrap();
+        let nan_res = check_clean_file(&nan_path);
+        assert!(nan_res.is_err(), "NaN loss count must fail the gate");
+        assert!(nan_res.unwrap_err().contains("FAIL"));
+
+        let missing_path = dir.join("missing.tsv");
+        std::fs::write(&missing_path, rows(&[("caller", "established", "")])).unwrap();
+        assert!(
+            check_clean_file(&missing_path).is_err(),
+            "missing required count must fail the gate"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

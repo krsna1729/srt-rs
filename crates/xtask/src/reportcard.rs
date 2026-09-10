@@ -154,7 +154,9 @@ fn analyze_file(path: &Path, summary: &mut Summary) -> io::Result<()> {
         return Ok(());
     }
     summary.files += 1;
-    summary.sloc += metric_value(&value, "loc", "sloc");
+    // SLOC is display-only (never gated); a missing count renders as zero.
+    // Gated complexity metrics below are strict: missing is an error.
+    summary.sloc += metric_value(&value, "loc", "sloc").unwrap_or(0);
     let mut scope_ordinals = HashMap::new();
     let mut function_ordinals = HashMap::new();
     if let Some(children) = value.get("spaces").and_then(Value::as_array) {
@@ -166,7 +168,12 @@ fn analyze_file(path: &Path, summary: &mut Summary) -> io::Result<()> {
                 &mut scope_ordinals,
                 &mut function_ordinals,
                 summary,
-            );
+            )
+            .map_err(|key| {
+                io::Error::other(format!(
+                    "analyzer JSON is missing required complexity metrics for {key}"
+                ))
+            })?;
         }
     }
     Ok(())
@@ -218,14 +225,17 @@ fn collect_json_files(path: &Path, files: &mut Vec<PathBuf>) -> io::Result<()> {
     Ok(())
 }
 
-fn metric_value(value: &Value, group: &str, metric: &str) -> u64 {
+/// Required analyzer metric: present, finite, and non-negative. Missing,
+/// malformed, or negative values are `None` so gated complexity can never
+/// silently default to zero.
+fn metric_value(value: &Value, group: &str, metric: &str) -> Option<u64> {
     value
         .get("metrics")
         .and_then(|metrics| metrics.get(group))
         .and_then(|group| group.get(metric))
         .and_then(Value::as_f64)
-        .unwrap_or_default()
-        .round() as u64
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .map(|v| v.round() as u64)
 }
 
 fn collect_functions(
@@ -235,20 +245,23 @@ fn collect_functions(
     scope_ordinals: &mut HashMap<String, usize>,
     function_ordinals: &mut HashMap<String, usize>,
     summary: &mut Summary,
-) {
-    let key = build_function_metric(space, path, parent_key, scope_ordinals, function_ordinals)
-        .map(|metric| {
-            let key = metric.key.clone();
-            record_function(summary, metric);
-            key
-        });
+) -> Result<(), String> {
+    let key =
+        match build_function_metric(space, path, parent_key, scope_ordinals, function_ordinals)? {
+            Some(metric) => {
+                let key = metric.key.clone();
+                record_function(summary, metric);
+                Some(key)
+            }
+            None => None,
+        };
     collect_children(
         space,
         path,
         key.as_deref().or(parent_key),
         function_ordinals,
         summary,
-    );
+    )
 }
 
 fn build_function_metric(
@@ -257,9 +270,9 @@ fn build_function_metric(
     parent_key: Option<&str>,
     scope_ordinals: &mut HashMap<String, usize>,
     function_ordinals: &mut HashMap<String, usize>,
-) -> Option<FunctionMetric> {
+) -> Result<Option<FunctionMetric>, String> {
     if space.get("kind").and_then(Value::as_str) != Some("function") {
-        return None;
+        return Ok(None);
     }
     let name = space
         .get("name")
@@ -279,7 +292,12 @@ fn build_function_metric(
     };
     *scope_ordinal += 1;
     *function_ordinal += 1;
-    Some(FunctionMetric {
+    // A function without measurable complexity is malformed analyzer output,
+    // not a zero-complexity function: gating on a defaulted zero would pass
+    // whatever the analyzer failed to measure.
+    let cyclomatic = own_metric(space, "cyclomatic").ok_or_else(|| key.clone())?;
+    let cognitive = own_metric(space, "cognitive").ok_or_else(|| key.clone())?;
+    Ok(Some(FunctionMetric {
         key,
         name,
         path: path.to_string(),
@@ -291,9 +309,9 @@ fn build_function_metric(
             .get("end_line")
             .and_then(Value::as_u64)
             .unwrap_or_default() as usize,
-        cyclomatic: own_metric(space, "cyclomatic"),
-        cognitive: own_metric(space, "cognitive"),
-    })
+        cyclomatic,
+        cognitive,
+    }))
 }
 
 fn record_function(summary: &mut Summary, metric: FunctionMetric) {
@@ -313,9 +331,9 @@ fn collect_children(
     parent_key: Option<&str>,
     function_ordinals: &mut HashMap<String, usize>,
     summary: &mut Summary,
-) {
+) -> Result<(), String> {
     let Some(children) = space.get("spaces").and_then(Value::as_array) else {
-        return;
+        return Ok(());
     };
     let mut scope_ordinals = HashMap::new();
     for child in children {
@@ -326,20 +344,21 @@ fn collect_children(
             &mut scope_ordinals,
             function_ordinals,
             summary,
-        );
+        )?;
     }
+    Ok(())
 }
 
-fn own_metric(space: &Value, metric: &str) -> u64 {
-    let total = metric_value(space, metric, "sum");
+fn own_metric(space: &Value, metric: &str) -> Option<u64> {
+    let total = metric_value(space, metric, "sum")?;
     let children = space
         .get("spaces")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .map(|child| metric_value(child, metric, "sum"))
-        .sum::<u64>();
-    total.saturating_sub(children)
+        .sum::<Option<u64>>()?;
+    Some(total.saturating_sub(children))
 }
 
 fn max_cyclomatic(summary: &Summary) -> u64 {
@@ -584,4 +603,81 @@ fn write_reports(
         file.write_all(markdown.as_bytes())?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn metric_value_rejects_missing_and_malformed() {
+        let present = json!({"metrics": {"cyclomatic": {"sum": 3.0}}});
+        assert_eq!(metric_value(&present, "cyclomatic", "sum"), Some(3));
+        assert_eq!(
+            metric_value(&json!({"metrics": {}}), "cyclomatic", "sum"),
+            None
+        );
+        assert_eq!(metric_value(&json!({}), "cyclomatic", "sum"), None);
+        assert_eq!(
+            metric_value(
+                &json!({"metrics": {"cyclomatic": {"sum": "high"}}}),
+                "cyclomatic",
+                "sum"
+            ),
+            None
+        );
+        assert_eq!(
+            metric_value(
+                &json!({"metrics": {"cyclomatic": {"sum": -1.0}}}),
+                "cyclomatic",
+                "sum"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn own_metric_subtracts_children_and_requires_all_parts() {
+        let space = json!({
+            "metrics": {"cyclomatic": {"sum": 10.0}},
+            "spaces": [{"metrics": {"cyclomatic": {"sum": 4.0}}}]
+        });
+        assert_eq!(own_metric(&space, "cyclomatic"), Some(6));
+        let missing_child = json!({
+            "metrics": {"cyclomatic": {"sum": 10.0}},
+            "spaces": [{"metrics": {}}]
+        });
+        assert_eq!(own_metric(&missing_child, "cyclomatic"), None);
+    }
+
+    #[test]
+    fn function_without_complexity_metrics_is_an_error_not_zero() {
+        let space = json!({
+            "kind": "function",
+            "name": "unmeasured",
+            "metrics": {"loc": {"sloc": 5.0}}
+        });
+        let err = build_function_metric(
+            &space,
+            "src/lib.rs",
+            None,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+        )
+        .unwrap_err();
+        assert!(err.contains("src/lib.rs::unmeasured"), "got: {err}");
+        let non_function = json!({"kind": "class", "name": "C"});
+        assert!(
+            build_function_metric(
+                &non_function,
+                "src/lib.rs",
+                None,
+                &mut HashMap::new(),
+                &mut HashMap::new()
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
 }
