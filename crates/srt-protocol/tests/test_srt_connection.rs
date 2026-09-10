@@ -18,6 +18,14 @@ fn test_options() -> ConnectionOptions {
     }
 }
 
+fn test_options_with_repay() -> ConnectionOptions {
+    ConnectionOptions {
+        tsbpd_delay: 0,
+        pacing_repay: true,
+        ..Default::default()
+    }
+}
+
 /// テスト用のタイムスタンプを生成
 fn ts(micros: u64) -> Timestamp {
     Timestamp::from_micros(micros)
@@ -1076,7 +1084,7 @@ fn test_packet_pacing() {
 
 #[test]
 fn pacing_demand_admits_one_extra_packet_at_the_same_instant() {
-    let mut caller = SrtConnection::new_caller(test_options());
+    let mut caller = SrtConnection::new_caller(test_options_with_repay());
     let mut listener = SrtConnection::new_listener(test_options());
     establish_connection(&mut caller, &mut listener).expect("connection should be established");
 
@@ -1092,6 +1100,26 @@ fn pacing_demand_admits_one_extra_packet_at_the_same_instant() {
     assert!(
         !caller.can_send_with_pacing(now),
         "bounded repay admitted a third packet at the same instant"
+    );
+}
+
+#[test]
+fn pacing_demand_requires_static_enable() {
+    let mut caller = SrtConnection::new_caller(test_options());
+    let mut listener = SrtConnection::new_listener(test_options());
+    establish_connection(&mut caller, &mut listener).expect("connection should be established");
+
+    caller.set_packet_send_period(1000);
+    caller.send(b"first", ts(100_000)).expect("send");
+    caller.set_pacing_demand(true);
+
+    // `Off` stays off even with demand: only the idle-gap packet is due.
+    let now = ts(102_500);
+    assert!(caller.can_send_with_pacing(now));
+    caller.send(b"second", now).expect("idle resume");
+    assert!(
+        !caller.can_send_with_pacing(now),
+        "Off + demand admitted a second immediate packet"
     );
 }
 
@@ -1115,7 +1143,7 @@ fn pacing_demand_off_still_refuses_a_second_packet_after_a_gap() {
 
 #[test]
 fn discard_idle_pacing_debt_restores_the_one_packet_idle_contract() {
-    let mut caller = SrtConnection::new_caller(test_options());
+    let mut caller = SrtConnection::new_caller(test_options_with_repay());
     let mut listener = SrtConnection::new_listener(test_options());
     establish_connection(&mut caller, &mut listener).expect("connection should be established");
 

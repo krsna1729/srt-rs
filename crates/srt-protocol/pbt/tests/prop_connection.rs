@@ -924,7 +924,9 @@ proptest! {
         extra_periods in 2u64..12u64,
     ) {
         let mut now = Timestamp::from_micros(0);
-        let mut caller = SrtConnection::new_caller(make_opts(1));
+        let mut caller_opts = make_opts(1);
+        caller_opts.pacing_repay = true;
+        let mut caller = SrtConnection::new_caller(caller_opts);
         let mut listener = SrtConnection::new_listener(make_opts(2));
         establish_connection(&mut caller, &mut listener, &mut now);
 

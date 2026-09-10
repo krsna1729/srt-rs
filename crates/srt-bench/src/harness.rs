@@ -474,7 +474,13 @@ pub fn append_result(
             crate::Egress::PerConnection => "per-connection".into(),
             crate::Egress::SharedSocket => "shared-socket".into(),
         },
-        format!("{:?}", cfg.promotion).to_lowercase(),
+        // Effective promotion: Shared egress always executes as Never via
+        // endpoint_plan translation; record that, not the raw axis request.
+        if cfg.egress == crate::Egress::SharedSocket {
+            "never".to_string()
+        } else {
+            format!("{:?}", cfg.promotion).to_lowercase()
+        },
         if cfg.cookie_routing { "on" } else { "off" }.into(),
         match cfg.batching {
             Batching::On => "on".into(),
@@ -1310,7 +1316,7 @@ fn filter_reason(cell: &Cell<'_>, axes: &[Axis]) -> Option<&'static str> {
         return Some("bonded-ingress-unsupported");
     }
 
-    if let Some(reason) = filter_promotion(cell, axes, bond, is_multi, is_single) {
+    if let Some(reason) = filter_promotion(cell, axes, bond, egress, is_multi, is_single) {
         return Some(reason);
     }
 
@@ -1367,17 +1373,27 @@ fn filter_promotion(
     cell: &Cell<'_>,
     axes: &[Axis],
     bond: Option<&str>,
+    egress: &str,
     is_multi: bool,
     is_single: bool,
 ) -> Option<&'static str> {
     let promotion = cell_value(cell, "promotion", Some(Scope::Both))?;
+    if bond != Some("none") {
+        return None;
+    }
+    // Unbonded shared egress makes promotion intrinsically inert: bench
+    // translates every Shared request to Never, so keep only Never.
+    // Bonded cells bypass: bond mode itself distinguishes the cell and the
+    // bonded matrix fixes its own promotion axis.
+    if egress == "shared-socket" {
+        return representative(axes, "promotion", "never")
+            .filter(|keep| promotion != *keep)
+            .map(|_| "promotion-inert-shared-egress");
+    }
     if is_single || !is_multi {
         return representative(axes, "promotion", "all")
             .filter(|keep| promotion != *keep)
             .map(|_| "promotion-inert");
-    }
-    if bond != Some("none") {
-        return None;
     }
     let keep_never = axis_has(axes, "promotion", "never");
     let keep_all = axis_has(axes, "promotion", "all");
@@ -3840,6 +3856,32 @@ mod matrix_filter_tests {
             Some("shared-egress-workers-inert")
         );
         assert_eq!(filter_reason(&cell("1", "2"), &axes), None);
+    }
+    #[test]
+    fn shared_egress_makes_promotion_inert_except_never() {
+        let axes = axes();
+        let cell_for = |promotion: &'static str| {
+            cell(&[
+                ("ingress", "reuseport-multi:4"),
+                ("egress", "shared-socket"),
+                ("promotion", promotion),
+                ("cookie-routing", "on"),
+                ("batch", "on"),
+                ("pin", "off"),
+                ("runtime", "mio"),
+                ("connections", "200"),
+                ("bond", "none"),
+            ])
+        };
+        assert_eq!(filter_reason(&cell_for("never"), &axes), None);
+        assert_eq!(
+            filter_reason(&cell_for("all"), &axes),
+            Some("promotion-inert-shared-egress")
+        );
+        assert_eq!(
+            filter_reason(&cell_for("relocate"), &axes),
+            Some("promotion-inert-shared-egress")
+        );
     }
 
     #[test]

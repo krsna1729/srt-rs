@@ -136,7 +136,7 @@ pub fn ingress_supported(runtime: Runtime, ingress: crate::Ingress) -> bool {
 }
 
 pub fn run(cfg: BenchConfig) {
-    if let Err(error) = cfg.validate_bond_topology() {
+    if let Err(error) = cfg.validate_startup() {
         eprintln!("srt-bench: {error}");
         std::process::exit(2);
     }

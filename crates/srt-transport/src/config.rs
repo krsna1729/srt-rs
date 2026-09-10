@@ -676,7 +676,7 @@ pub struct SessionConfig {
     connection: ConnectionOptions,
     pub handshake: HandshakeConfig,
     pub payload_size: PayloadSize,
-    pub pacing: PacingPolicy,
+    pacing: PacingPolicy,
 }
 
 impl Default for SessionConfig {
@@ -749,10 +749,19 @@ impl SessionConfig {
     }
     /// Canonical pacing-debt switch. Single place that owns
     /// `SenderBuffer::repay_pacing_debt`; do not call that setter directly.
+    /// Static enable only: runtime repay also requires dynamic demand via
+    /// `SrtConnection::set_pacing_demand` (`enabled && demand`).
     pub fn set_pacing(&mut self, pacing: PacingPolicy) -> &mut Self {
         self.pacing = pacing;
         self.connection.pacing_repay = matches!(pacing, PacingPolicy::RepayOneExtra);
         self
+    }
+
+    /// Static pacing-repay enable. Dynamic demand still gates each instant;
+    /// writing the field directly cannot desync `ConnectionOptions`.
+    #[must_use]
+    pub fn pacing(&self) -> PacingPolicy {
+        self.pacing
     }
     /// Canonical initial-sequence setter for bonded legs sharing one
     /// group-wide sequence space.
@@ -1229,8 +1238,11 @@ impl EndpointSocketPlan {
     }
 
     /// Canonical resolve: topology + ownership + promotion checked together.
-    /// Rejects: `All/Bonded/Relocate + Shared`, `ReusePortSingle::Connected
-    /// + Shared`, `MaxDatagrams + PerPort` (via inner resolve).
+    /// Rejects explicit `All/Bonded/Relocate + Shared` (first `connect()`
+    /// would steal later handshakes; use `Never` + socket-ID demux) and
+    /// `ReusePortSingle + Shared`. `Auto + Shared` normalizes to `Never` by
+    /// construction. No successful `Shared` result ever carries
+    /// `promotion != Never` (post-resolve guard).
     pub fn resolve(
         self,
         capabilities: TransportCapabilities,
@@ -1240,17 +1252,19 @@ impl EndpointSocketPlan {
         output_drain: OutputDrainBudget,
     ) -> Result<ResolvedEndpointPlan, ConfigError> {
         let exclusive = matches!(self.ownership, SocketOwnership::Exclusive);
-        match (self.promotion, self.ownership) {
-            (PromotionPolicy::All, SocketOwnership::Shared)
-            | (PromotionPolicy::Bonded, SocketOwnership::Shared)
-            | (PromotionPolicy::Relocate, SocketOwnership::Shared) => {
+        let effective = match (self.promotion, self.ownership) {
+            (
+                PromotionPolicy::All | PromotionPolicy::Bonded | PromotionPolicy::Relocate,
+                SocketOwnership::Shared,
+            ) => {
                 return Err(ConfigError::new(
                     "transport.promotion",
                     "Shared UDP tuple cannot promote: first connect() steals later handshakes; use Never + socket-ID demux",
                 ));
             }
-            _ => {}
-        }
+            (PromotionPolicy::Auto, SocketOwnership::Shared) => PromotionPolicy::Never,
+            (promotion, _) => promotion,
+        };
         if matches!(self.topology, ListenerTopology::ReusePortSingle { .. }) && !exclusive {
             return Err(ConfigError::new(
                 "transport.topology",
@@ -1261,11 +1275,17 @@ impl EndpointSocketPlan {
             topology: self.topology,
             workers,
             batching,
-            promotion: self.promotion,
+            promotion: effective,
             socket_buffers,
             output_drain,
         };
         let resolved = cfg.resolve(capabilities)?;
+        if !exclusive && resolved.promotion != srt_lifecycle::Promotion::Never {
+            return Err(ConfigError::new(
+                "transport.promotion",
+                "Shared UDP tuple resolved to promotion != Never; use Never + socket-ID demux",
+            ));
+        }
         Ok(ResolvedEndpointPlan {
             topology: resolved.topology,
             promotion: resolved.promotion,
@@ -2413,5 +2433,72 @@ mod tests {
             .set_light_ack_interval_packets(1024)
             .expect_err("above the Contabo 4× ceiling");
         assert_eq!(error.field(), "session.light_ack_interval_packets");
+    }
+    #[test]
+    fn shared_auto_normalizes_to_never_on_reuseport_multi() {
+        let plan = EndpointSocketPlan::new(
+            ListenerTopology::ReusePortMulti {
+                acceptors: WorkerCount::Count(NonZeroUsize::MIN),
+            },
+            SocketOwnership::Shared,
+            PromotionPolicy::Auto,
+        );
+        let resolved = plan
+            .resolve(
+                TransportCapabilities::default(),
+                WorkerCount::Count(NonZeroUsize::MIN),
+                BatchingPolicy::Disabled,
+                SocketBufferConfig::SystemDefault,
+                OutputDrainBudget::default(),
+            )
+            .expect("Shared+Auto resolves");
+        assert!(!resolved.exclusive);
+        assert_eq!(resolved.promotion, srt_lifecycle::Promotion::Never);
+    }
+
+    #[test]
+    fn shared_topologies_never_resolve_to_promotion() {
+        let topologies = [
+            ListenerTopology::PerPort,
+            ListenerTopology::SharedPool {
+                listeners: WorkerCount::Count(NonZeroUsize::MIN),
+            },
+            ListenerTopology::ReusePortMulti {
+                acceptors: WorkerCount::Count(NonZeroUsize::MIN),
+            },
+            ListenerTopology::Auto,
+        ];
+        let promotions = [
+            PromotionPolicy::Auto,
+            PromotionPolicy::Never,
+            PromotionPolicy::Relocate,
+            PromotionPolicy::Bonded,
+            PromotionPolicy::All,
+        ];
+        for topology in topologies {
+            for promotion in promotions {
+                let plan = EndpointSocketPlan::new(topology, SocketOwnership::Shared, promotion);
+                let result = plan.resolve(
+                    TransportCapabilities::default(),
+                    WorkerCount::Count(NonZeroUsize::MIN),
+                    BatchingPolicy::Disabled,
+                    SocketBufferConfig::SystemDefault,
+                    OutputDrainBudget::default(),
+                );
+                match promotion {
+                    PromotionPolicy::Auto | PromotionPolicy::Never => {
+                        let resolved = result.expect("Shared Auto/Never resolves");
+                        assert_eq!(
+                            resolved.promotion,
+                            srt_lifecycle::Promotion::Never,
+                            "Shared {topology:?}+{promotion:?} must stay Never"
+                        );
+                    }
+                    _ => {
+                        result.expect_err("explicit Shared promote must reject");
+                    }
+                }
+            }
+        }
     }
 }

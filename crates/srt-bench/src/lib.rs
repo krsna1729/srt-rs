@@ -767,6 +767,12 @@ impl BenchConfig {
     /// Canonical endpoint plan. Single place `Ingress + Egress + promotion`
     /// becomes `EndpointSocketPlan`; runtimes must resolve through this,
     /// not by matching the three enums separately.
+    ///
+    /// `Shared` ownership makes promotion intrinsically inert (runtime
+    /// `decide_promotion` fails closed to `StayOnListener` without an
+    /// exclusive tuple), so the legacy/default `Relocate` request translates
+    /// to `Never` here. The strict transport resolver still rejects an
+    /// explicit `Shared + promote` built by hand; bench never sends one.
     #[must_use]
     pub fn endpoint_plan(&self) -> srt_transport::EndpointSocketPlan {
         let ownership = if self.exclusive_udp_tuple() {
@@ -788,11 +794,15 @@ impl BenchConfig {
                 }
             }
         };
-        let promotion = match self.promotion {
-            Promotion::Never => srt_transport::PromotionPolicy::Never,
-            Promotion::Relocate => srt_transport::PromotionPolicy::Relocate,
-            Promotion::Bonded => srt_transport::PromotionPolicy::Bonded,
-            Promotion::All => srt_transport::PromotionPolicy::All,
+        let promotion = if ownership == srt_transport::SocketOwnership::Shared {
+            srt_transport::PromotionPolicy::Never
+        } else {
+            match self.promotion {
+                Promotion::Never => srt_transport::PromotionPolicy::Never,
+                Promotion::Relocate => srt_transport::PromotionPolicy::Relocate,
+                Promotion::Bonded => srt_transport::PromotionPolicy::Bonded,
+                Promotion::All => srt_transport::PromotionPolicy::All,
+            }
         };
         srt_transport::EndpointSocketPlan::new(topology, ownership, promotion)
     }
@@ -802,6 +812,29 @@ impl BenchConfig {
             srt_transport::WorkerCount::Auto,
             srt_transport::WorkerCount::Count,
         )
+    }
+
+    /// Transport flavor for this run. `A2` is mio-shaped (flat epoll, no task
+    /// scheduler), so it resolves with `Mio` capabilities.
+    #[must_use]
+    pub fn transport_flavor(&self) -> srt_transport::RuntimeFlavor {
+        match self.runtime {
+            Runtime::Mio | Runtime::A2 => srt_transport::RuntimeFlavor::Mio,
+            Runtime::Tokio => srt_transport::RuntimeFlavor::Tokio,
+            Runtime::Smol => srt_transport::RuntimeFlavor::Smol,
+            Runtime::Monoio => srt_transport::RuntimeFlavor::Monoio,
+            Runtime::Glommio => srt_transport::RuntimeFlavor::Glommio,
+            Runtime::Compio => srt_transport::RuntimeFlavor::Compio,
+        }
+    }
+
+    /// Startup gate: bond topology first, then canonical endpoint plan.
+    /// `Shared` promotion requests arrive as `Never` via [`Self::endpoint_plan`];
+    /// `Shared + ReuseportSingle` still rejects. Runtimes and CLI parsing must
+    /// call this, not `validate_bond_topology` alone.
+    pub fn validate_startup(&self) -> Result<srt_transport::ResolvedEndpointPlan, String> {
+        self.validate_bond_topology().map_err(|e| e.to_string())?;
+        self.validate_canonical(self.transport_flavor().capabilities())
     }
 
     /// Canonical session. Single place workload knobs become protocol knobs.
@@ -3284,7 +3317,7 @@ pub fn bench_config_from_args() -> BenchConfig {
         classifier_policy,
         host_contention,
     };
-    if let Err(error) = config.validate_bond_topology() {
+    if let Err(error) = config.validate_startup() {
         eprintln!("error: {error}");
         usage()
     }
@@ -3494,6 +3527,24 @@ mod tests {
         cfg.bond_pairs = 1;
         cfg.egress = Egress::PerConnection;
         assert_eq!(cfg.validate_bond_topology(), Ok(()));
+    }
+    #[test]
+    fn startup_gate_normalizes_shared_promote_and_rejects_shared_reuseport_single() {
+        let mut cfg = config();
+        // Default fixture is Exclusive + Never: startup passes.
+        assert!(cfg.validate_startup().is_ok());
+        // Shared egress + explicit promote normalizes to Never (bonded
+        // SharedPool(1)+SharedSocket keeps working with default Relocate).
+        cfg.egress = Egress::SharedSocket;
+        cfg.ingress = Ingress::ReuseportMulti(2);
+        cfg.promotion = Promotion::Relocate;
+        let resolved = cfg.validate_startup().expect("Shared normalizes");
+        assert!(!resolved.exclusive);
+        assert_eq!(resolved.promotion, srt_lifecycle::Promotion::Never);
+        // Shared + ReuseportSingle is unreachable even with Never.
+        cfg.promotion = Promotion::Never;
+        cfg.ingress = Ingress::ReuseportSingle { workers: 2 };
+        assert!(cfg.validate_startup().is_err());
     }
 
     #[test]

@@ -246,8 +246,10 @@ pub struct ConnectionOptions {
     /// Percentage above input bandwidth reserved for retransmissions
     /// (equivalent to `SRTO_OHEADBW`; libsrt default: 25).
     pub overhead_bandwidth_percent: u8,
-    /// Repay pacing debt while app demand remains. Canonical owner is
+    /// Static repay enable. Canonical owner is
     /// `srt_transport::SessionConfig::set_pacing`; do not set directly.
+    /// Repay at an instant requires `enabled && demand`: this flag alone
+    /// never admits an extra packet, and demand alone cannot turn `Off` on.
     /// Default false preserves the idle-gap contract. Packed with the
     /// overhead byte above so the options footprint does not grow.
     pub pacing_repay: bool,
@@ -868,7 +870,9 @@ impl SrtConnection {
         Ok(())
     }
 
-    /// Initialize the send/receive buffers.
+    /// Initialize the send/receive buffers. Demand starts false: static
+    /// `pacing_repay` only enables repay, the app must still signal waiting
+    /// data via `set_pacing_demand`.
     fn init_buffers(&mut self, now: Timestamp, peer_initial_seq: u32, tsbpd_time_base: u64) {
         let mut sender = SenderBuffer::new(
             self.initial_seq,
@@ -880,7 +884,7 @@ impl SrtConnection {
         } else if let Some(input_bw) = self.options.input_bandwidth_bytes_per_sec {
             sender.set_input_bandwidth(input_bw, self.options.overhead_bandwidth_percent);
         }
-        sender.set_repay_pacing_debt(self.options.pacing_repay);
+        sender.set_repay_pacing_debt(false);
         self.sender = Some(sender);
         let mut receiver = ReceiverBuffer::with_buffer_size(
             peer_initial_seq,
@@ -1355,12 +1359,14 @@ impl SrtConnection {
 
     /// Tell the pacer whether unsent application data is waiting.
     ///
+    /// Gated by static `pacing_repay`: `Off` stays off even when waiting.
     /// When true, late service repays missed periods so a loop-while-eligible
     /// caller can emit more than one packet at the same `now`. When false, the
     /// idle-gap contract is restored (exactly one immediate packet).
     pub fn set_pacing_demand(&mut self, waiting: bool) {
+        let enabled = self.options.pacing_repay;
         if let Some(sender) = self.sender.as_mut() {
-            sender.set_repay_pacing_debt(waiting);
+            sender.set_repay_pacing_debt(enabled && waiting);
         }
     }
 
