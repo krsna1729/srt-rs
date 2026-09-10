@@ -1,4 +1,5 @@
 # PR M: Final x86-64-v3 and PGO Audit Report
+> Provenance: the function-level conclusions below (§1.2 matrix rows, §1.3 disassembly notes, Key Findings 1–3) were manually inspected at `aba97ae` (2026-09-02) with `rustc 1.96.0`, `-C target-cpu=x86-64-v3 -C codegen-units=1` on the workstation in Environment Metadata. `cargo xtask audit` re-runs the automated opcode inventory on current source; it does not re-verify these manual conclusions on HEAD.
 
 ## Executive Summary
 
