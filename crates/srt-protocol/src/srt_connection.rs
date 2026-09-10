@@ -1202,11 +1202,7 @@ impl SrtConnection {
             return Err(Error::invalid_state("send buffer full"));
         }
 
-        if let Some(sequence_number) = sequence_number
-            && self.next_sequence_number() != Some(sequence_number)
-        {
-            return Err(Error::invalid_state("sequence number is out of order"));
-        }
+        self.check_explicit_sequence(sequence_number)?;
 
         let timestamp = self.relative_timestamp(now);
         let peer_socket_id = self.peer_socket_id;
@@ -1264,6 +1260,8 @@ impl SrtConnection {
             return Err(Error::invalid_state("send buffer full"));
         }
 
+        self.check_explicit_sequence(sequence_number)?;
+
         let timestamp = self.relative_timestamp(now);
         let peer_socket_id = self.peer_socket_id;
 
@@ -1280,15 +1278,38 @@ impl SrtConnection {
             }
         };
 
-        if let Some((header, payload)) = packet {
-            let buf = self.encrypt_to_wire(&header, &payload)?;
-            self.queue_packet(buf, now);
-            if let Some(ref mut sender) = self.sender {
-                sender.record_send_time(now);
-            }
+        // `can_send()` and the explicit sequence were both just checked
+        // against the same sender this call holds `&mut` over, so the
+        // buffer's own internal guard (which would otherwise return `None`
+        // here) cannot have changed underneath us: `None` is unreachable.
+        // Never let it read as a silent, unaccounted success (I1/I2).
+        let Some((header, payload)) = packet else {
+            debug_assert!(
+                false,
+                "push_shared rejected a send after can_send/sequence were already validated"
+            );
+            return Err(Error::invalid_state("send buffer full"));
+        };
+        let buf = self.encrypt_to_wire(&header, &payload)?;
+        self.queue_packet(buf, now);
+        if let Some(ref mut sender) = self.sender {
+            sender.record_send_time(now);
         }
 
         self.check_km_refresh(now);
+        Ok(())
+    }
+
+    /// Reject a caller-supplied explicit send sequence before it reaches the
+    /// sender buffer. The buffer's own check further down would otherwise
+    /// silently return `None` for a mismatch, which a caller must never be
+    /// able to read as successful admission (I1).
+    fn check_explicit_sequence(&self, sequence_number: Option<u32>) -> Result<(), Error> {
+        if let Some(sequence_number) = sequence_number
+            && self.next_sequence_number() != Some(sequence_number)
+        {
+            return Err(Error::invalid_state("sequence number is out of order"));
+        }
         Ok(())
     }
 
@@ -3184,6 +3205,120 @@ mod tests {
         assert!(error.reason.contains("version"));
         assert_eq!(caller.state(), ConnectionState::Disconnected);
         assert_eq!(caller.peer_socket_id(), 0);
+    }
+
+    /// Drive a full caller/listener handshake to `Connected` on both ends,
+    /// for tests that only care about post-handshake send behavior.
+    fn connected_pair() -> (SrtConnection, SrtConnection) {
+        let mut caller = SrtConnection::new_caller(ConnectionOptions {
+            socket_id: 1,
+            ..ConnectionOptions::default()
+        });
+        let mut listener = SrtConnection::new_listener(ConnectionOptions {
+            socket_id: 2,
+            syn_cookie: Some(7),
+            ..ConnectionOptions::default()
+        });
+        caller
+            .connect(Timestamp::from_micros(0))
+            .expect("caller starts");
+        for round in 0..4 {
+            let now = Timestamp::from_micros(round * 10_000);
+            while let Some(ConnectionOutput::SendPacket(packet)) = caller.poll_output() {
+                listener
+                    .feed_recv_buf(&packet, now)
+                    .expect("listener accepts packet");
+            }
+            while let Some(ConnectionOutput::SendPacket(packet)) = listener.poll_output() {
+                caller
+                    .feed_recv_buf(&packet, now)
+                    .expect("caller accepts packet");
+            }
+            if caller.state() == ConnectionState::Connected
+                && listener.state() == ConnectionState::Connected
+            {
+                break;
+            }
+        }
+        assert_eq!(caller.state(), ConnectionState::Connected);
+        assert_eq!(listener.state(), ConnectionState::Connected);
+        (caller, listener)
+    }
+
+    /// S01: a wrong explicit sequence must be rejected on both the owned
+    /// and shared send paths -- the shared path used to have no such
+    /// check at all and silently returned `Ok(())` from `push_shared`'s
+    /// internal `None` (I1: a rejection must never read as admission).
+    /// Confirms the rejection leaves next_seq/output untouched and that a
+    /// subsequent correctly-sequenced send on the same path still works.
+    #[test]
+    fn explicit_sequence_mismatch_is_rejected_on_owned_and_shared_paths() {
+        let (mut caller, _listener) = connected_pair();
+        while caller.poll_output().is_some() {} // drain handshake-tail output (timers, ACKs)
+
+        // Owned path.
+        let next = caller.next_sequence_number().expect("connected sender");
+        let wrong = next.wrapping_add(1) & 0x7FFF_FFFF;
+        let err = caller
+            .send_with_sequence(b"owned", wrong, Timestamp::from_micros(100_000))
+            .expect_err("owned mismatch is rejected");
+        assert_eq!(err.reason, "sequence number is out of order");
+        assert_eq!(
+            caller.next_sequence_number(),
+            Some(next),
+            "rejection leaves next_seq unchanged"
+        );
+        assert!(
+            caller.poll_output().is_none(),
+            "no packet was queued for a rejected send"
+        );
+        caller
+            .send_with_sequence(b"owned", next, Timestamp::from_micros(100_001))
+            .expect("correct sequence is accepted");
+        assert_eq!(
+            caller.next_sequence_number(),
+            Some(next.wrapping_add(1) & 0x7FFF_FFFF)
+        );
+        assert!(matches!(
+            caller.poll_output(),
+            Some(ConnectionOutput::SendPacket(_))
+        ));
+
+        // Shared path -- this is the path that previously had no guard.
+        let next = caller.next_sequence_number().expect("connected sender");
+        let wrong = next.wrapping_add(7) & 0x7FFF_FFFF;
+        let err = caller
+            .send_shared_with_sequence(
+                Bytes::from_static(b"shared"),
+                wrong,
+                Timestamp::from_micros(100_002),
+            )
+            .expect_err("shared mismatch is rejected, not silently admitted");
+        assert_eq!(err.reason, "sequence number is out of order");
+        assert_eq!(
+            caller.next_sequence_number(),
+            Some(next),
+            "rejection leaves next_seq unchanged"
+        );
+        assert!(
+            caller.poll_output().is_none(),
+            "no packet was queued for a rejected shared send"
+        );
+        caller
+            .send_shared_with_sequence(
+                Bytes::from_static(b"shared"),
+                next,
+                Timestamp::from_micros(100_003),
+            )
+            .expect("correct sequence is accepted on the shared path");
+        assert_eq!(
+            caller.next_sequence_number(),
+            Some(next.wrapping_add(1) & 0x7FFF_FFFF)
+        );
+        assert!(matches!(
+            caller.poll_output(),
+            Some(ConnectionOutput::SendPacket(_))
+        ));
     }
 
     #[test]

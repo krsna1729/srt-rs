@@ -1133,6 +1133,54 @@ mod tests {
         assert_eq!(queued, [0x7FFF_FFFE, 0x7FFF_FFFF, 0, 1]);
     }
 
+    /// S01: `push_with_sequence`/`push_shared_with_sequence` reject any
+    /// sequence that doesn't equal `next_seq`, including immediately
+    /// across the 31-bit wraparound boundary -- a plain equality check,
+    /// so wrap-adjacent values need no special-casing, but must still be
+    /// exercised since they are exactly where an off-by-one in the
+    /// comparison would first show up.
+    #[test]
+    fn explicit_sequence_mismatch_near_wraparound_is_rejected_on_both_paths() {
+        let now = Timestamp::default();
+        let mut owned = SenderBuffer::new(0x7FFF_FFFF, 32, 120);
+        assert!(
+            owned.push_with_sequence(vec![1], 1, 1, now, 0).is_none(),
+            "next_seq is 0x7FFFFFFF, not the post-wrap 0"
+        );
+        assert_eq!(
+            owned.next_sequence_number(),
+            0x7FFF_FFFF,
+            "rejection leaves next_seq unchanged"
+        );
+        assert!(
+            owned
+                .push_with_sequence(vec![1], 1, 1, now, 0x7FFF_FFFF)
+                .is_some(),
+            "the actual next_seq is accepted"
+        );
+        assert_eq!(
+            owned.next_sequence_number(),
+            0,
+            "accepted send wraps next_seq to 0"
+        );
+
+        let mut shared = SenderBuffer::new(0x7FFF_FFFF, 32, 120);
+        let payload = Bytes::from_static(b"x");
+        assert!(
+            shared
+                .push_shared_with_sequence(payload.clone(), 1, 1, now, 0)
+                .is_none(),
+            "shared path rejects the same pre-wrap mismatch"
+        );
+        assert_eq!(shared.next_sequence_number(), 0x7FFF_FFFF);
+        assert!(
+            shared
+                .push_shared_with_sequence(payload, 1, 1, now, 0x7FFF_FFFF)
+                .is_some()
+        );
+        assert_eq!(shared.next_sequence_number(), 0);
+    }
+
     #[test]
     fn acked_stale_queue_entries_do_not_retransmit_or_hide_live_entries() {
         let mut buf = SenderBuffer::new(0, 32, 120);
