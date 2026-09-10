@@ -297,6 +297,24 @@ impl SrtGroup {
     /// `Bytes` to avoid deep-copying the payload for each leg.
     pub fn send_shared(&mut self, payload: Bytes, now: Timestamp) -> Result<usize, Error> {
         self.refresh_states();
+        // Reject an oversized payload once, here, before the per-member fan-out.
+        // `send_broadcast`/`send_backup` route a member connection's rejection
+        // through `mark_send_failure`, which has no way to tell "this payload
+        // is too large for every leg" apart from an actual member health
+        // problem -- since the window is open, it would score as `Broken`
+        // (permanent, no requalify path) and, for a same-size payload,
+        // deterministically do that to every active member. There is no
+        // group-level fragmenting send to fall back to (`send`/`send_shared`
+        // are the only group entry points), so this must be the caller's
+        // error, not the group's.
+        if let Some(&first) = self.active_indices().first() {
+            let limit = self.members[first].connection.effective_max_payload_size();
+            if payload.len() > limit {
+                return Err(Error::invalid_state(
+                    "payload exceeds the maximum single-packet size for this group",
+                ));
+            }
+        }
         match self.mode {
             GroupMode::Broadcast => self.send_broadcast(payload, now),
             GroupMode::Backup => self.send_backup(payload, now),

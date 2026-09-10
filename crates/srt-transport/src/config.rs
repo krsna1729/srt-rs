@@ -1087,7 +1087,17 @@ impl SessionConfig {
         payload: &[u8],
         now: Timestamp,
     ) -> Result<(), SessionSendError> {
-        let maximum = self.payload_size.resolve()?.get();
+        // The resolved path/live size is a policy choice; it can exceed what
+        // `connection.send` (one wire packet, no fragmentation) can actually
+        // carry once the current cipher's AEAD tag is accounted for. Report
+        // that as this same, typed error rather than letting a
+        // larger-than-1484-ish `PathMtu`/`Exact` configuration reach
+        // `connection.send` and fail there with an untyped protocol error.
+        let maximum = self
+            .payload_size
+            .resolve()?
+            .get()
+            .min(connection.effective_max_payload_size());
         if payload.len() > maximum {
             return Err(SessionSendError::PayloadTooLarge {
                 actual: payload.len(),
@@ -2246,6 +2256,50 @@ mod tests {
                 .get(),
             1_200
         );
+    }
+
+    /// `payload_size` is a policy choice independent of what
+    /// `SrtConnection::send` (one wire packet, no fragmentation) can
+    /// actually carry once the current cipher's AEAD tag is accounted for.
+    /// A configuration resolving larger than that (a jumbo-frame `PathMtu`,
+    /// or an explicit `Exact` above it) must still fail with this crate's
+    /// typed `PayloadTooLarge` -- reporting the connection's real ceiling
+    /// as `maximum` -- rather than reach `connection.send` and fail there
+    /// with an untyped protocol error instead.
+    #[test]
+    fn send_clamps_configured_payload_size_to_the_connections_real_ceiling() {
+        let mut session = SessionConfig::default();
+        session.payload_size = PayloadSize::Exact(NonZeroUsize::new(5_000).expect("size"));
+        let mut connection = session.caller(Timestamp::default()).expect("caller");
+        let ceiling = connection.effective_max_payload_size();
+        assert!(
+            ceiling < 5_000,
+            "the connection's real ceiling must be smaller than the configured 5000"
+        );
+
+        let payload = vec![0xEE; ceiling + 1];
+        let error = session
+            .send(&mut connection, &payload, Timestamp::default())
+            .expect_err("payload exceeding the real ceiling is rejected");
+        match error {
+            SessionSendError::PayloadTooLarge { actual, maximum } => {
+                assert_eq!(actual, ceiling + 1);
+                assert_eq!(
+                    maximum, ceiling,
+                    "reported maximum must be the connection's ceiling, not the configured 5000"
+                );
+            }
+            other => panic!("expected PayloadTooLarge, got {other:?}"),
+        }
+
+        // A payload at (not over) the real ceiling must pass the size check
+        // -- the connection isn't handshaken here, so it still errors, but
+        // it must not be `PayloadTooLarge`.
+        let ok_payload = vec![0xEE; ceiling];
+        let error = session
+            .send(&mut connection, &ok_payload, Timestamp::default())
+            .expect_err("an unconnected caller still fails, just not on size");
+        assert!(!matches!(error, SessionSendError::PayloadTooLarge { .. }));
     }
 
     #[test]
