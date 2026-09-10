@@ -210,57 +210,61 @@ pub fn run(args: &[String]) -> ExitCode {
 
     println!();
     println!("=== Lowering Verification Matrix ===");
+    println!("Note: automated opcode inventory COUNTS whole-crate instruction lowering per crate.");
     println!(
-        "Note: Automated opcode inventory verifies ISA instruction lowering and zero division in indexing."
+        "Counts cannot verify any single hot path. Statuses: `counted` = this run's count only, \
+         no optimality claim; `manual (pinned)` = manual-assembly conclusion from \
+         docs/perf/x86-64-v3-pgo-audit.md @ aba97ae (rustc 1.96.0, -C target-cpu=x86-64-v3, \
+         codegen-units=1), NOT re-verified on HEAD."
     );
     println!(
-        "Function-level page/slot access, dispatch, and endian loads are verified via manual assembly audit (see docs/perf/x86-64-v3-pgo-audit.md)."
+        "Function-level page/slot access, dispatch, and endian loads are covered only by that pinned manual audit."
     );
     println!("| Area | Expected lowering | Observed lowering | Status |");
     println!("|---|---|---|---|");
     println!(
-        "| ring indexing | shift / bitwise AND | no DIV/IDIV in indexing paths (manual audit); whole-crate DIV count: {} | optimal (no change) |",
+        "| ring indexing | shift / bitwise AND | no DIV/IDIV in indexing paths (manual audit); whole-crate DIV count: {} | manual (pinned) |",
         proto_counts.div + proto_counts.idiv
     );
     println!(
-        "| sequence/page indexing | shift / bitwise AND | no DIV/IDIV in indexing paths (manual audit); whole-crate DIV count: {} | optimal (no change) |",
+        "| sequence/page indexing | shift / bitwise AND | no DIV/IDIV in indexing paths (manual audit); whole-crate DIV count: {} | manual (pinned) |",
         proto_counts.div + proto_counts.idiv
     );
     println!(
-        "| trailing_zeros | TZCNT | TZCNT ({} in proto, {} in trans) | optimal (no change) |",
+        "| trailing_zeros | TZCNT | TZCNT ({} in proto, {} in trans) | counted |",
         proto_counts.tzcnt, trans_counts.tzcnt
     );
     println!(
-        "| set-bit iteration | BLSR | BLSR ({} in proto, {} in trans) | optimal (no change) |",
+        "| set-bit iteration | BLSR | BLSR ({} in proto, {} in trans) | counted |",
         proto_counts.blsr, trans_counts.blsr
     );
     println!(
-        "| count_ones | POPCNT | POPCNT ({} in proto, {} in trans) | optimal (no change) |",
+        "| count_ones | POPCNT | POPCNT ({} in proto, {} in trans) | counted |",
         proto_counts.popcnt, trans_counts.popcnt
     );
     println!(
-        "| leading_zeros | LZCNT | LZCNT ({} in proto, {} in trans) | optimal (no change) |",
+        "| leading_zeros | LZCNT | LZCNT ({} in proto, {} in trans) | counted |",
         proto_counts.lzcnt, trans_counts.lzcnt
     );
     println!(
-        "| range masks | ANDN / SHLX / BZHI | ANDN ({} in proto) + SHLX ({}) / SHRX ({}) | optimal (no change) |",
+        "| range masks | ANDN / SHLX / BZHI | ANDN ({} in proto) + SHLX ({}) / SHRX ({}) | counted |",
         proto_counts.andn, proto_counts.shlx, proto_counts.shrx
     );
     println!(
-        "| header endian reads | MOVBE / load+BSWAP | MOVBE ({} in proto) + BSWAP ({} in proto) | optimal (no change) |",
+        "| header endian reads | MOVBE / load+BSWAP | MOVBE ({} in proto) + BSWAP ({} in proto) | counted |",
         proto_counts.movbe, proto_counts.bswap
     );
     println!(
-        "| receiver page access | page index + 1 ptr load + slot | inlined direct slot indexing (manual audit) | optimal (no change) |"
+        "| receiver page access | page index + 1 ptr load + slot | inlined direct slot indexing (manual audit) | manual (pinned) |"
     );
     println!(
-        "| sender page access | page index + 1 ptr load + slot | inlined direct slot indexing (manual audit) | optimal (no change) |"
+        "| sender page access | page index + 1 ptr load + slot | inlined direct slot indexing (manual audit) | manual (pinned) |"
     );
     println!(
-        "| peer dispatch | O(1) direct slot index + check | inlined array index + addr check (manual audit) | optimal (no change) |"
+        "| peer dispatch | O(1) direct slot index + check | inlined array index + addr check (manual audit) | manual (pinned) |"
     );
     println!(
-        "| ready/deadline paths | direct slot flag mutate | inlined bit/bool flags, no heap alloc (manual audit) | optimal (no change) |"
+        "| ready/deadline paths | direct slot flag mutate | inlined bit/bool flags, no heap alloc (manual audit) | manual (pinned) |"
     );
 
     if args.iter().any(|a| a == "--bench") {
@@ -287,6 +291,33 @@ pub fn run(args: &[String]) -> ExitCode {
         }
     }
 
-    println!("\nx86-64-v3 codegen audit complete: all hot paths verified optimal.");
+    println!(
+        "\nx86-64-v3 codegen inventory complete: opcode counts above; hot-path optimality is a pinned manual-audit conclusion, not established by this run."
+    );
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scan_instructions;
+
+    #[test]
+    fn inventory_counts_opcodes_and_skips_directives() {
+        // `cargo rustc -- --emit=asm` (.s) lines: tab-indented mnemonic, no
+        // address prefix; directives start with '.'; labels have no tab.
+        let sample =
+            "shiguredo_srt_page_index:\n\ttzcntq\t%rax, %rax\n.text\n\tdivq\t%rbx\nno-tab-line\n";
+        let counts = scan_instructions(sample);
+        assert_eq!(counts.tzcnt, 1);
+        assert_eq!(counts.div, 1);
+        assert_eq!(counts.blsr, 0);
+        assert_eq!(counts.movbe, 0);
+    }
+
+    #[test]
+    fn inventory_strips_size_suffixes() {
+        let counts = scan_instructions("\tblsrq\t%rax, %rax\n\tbswapq\t%rax\n");
+        assert_eq!(counts.blsr, 1);
+        assert_eq!(counts.bswap, 1);
+    }
 }
