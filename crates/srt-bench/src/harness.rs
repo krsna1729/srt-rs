@@ -824,6 +824,7 @@ fn report_headers(group_by: &[String]) -> Vec<String> {
                 "rtt_ms",
                 "cpu_s",
                 "rss_kb",
+                "invalid",
             ]
             .iter()
             .map(|name| (*name).to_string()),
@@ -866,56 +867,45 @@ pub fn source_target_packets(record: &Record) -> Option<f64> {
 }
 
 fn report_group_row(key: &str, cells: &[&Record]) -> Option<Vec<String>> {
-    // Pair the two roles per rep instead of averaging each side
-    // independently. A run interrupted mid-cell leaves a caller row
-    // with no listener row, and resume only counts listener rows, so
-    // re-running appends a *second* caller row. Medianing the two
-    // sides separately then divides a complete listener figure by the
-    // median of one complete and one truncated caller -- which is how
-    // a delivery rate of 139% appeared. Later rows win, the file
-    // being append-only, and a rep missing either side is dropped.
-    let mut paired: std::collections::BTreeMap<String, (Option<&Record>, Option<&Record>)> =
-        std::collections::BTreeMap::new();
-    for record in cells {
-        let rep = record.get("rep").unwrap_or("1").to_string();
-        let slot = paired.entry(rep).or_default();
-        match record.get("role") {
-            Some("caller") => slot.0 = Some(record),
-            Some("listener") => slot.1 = Some(record),
-            _ => {}
+    // Canonical pairing from the comparison module: within (cell, rep,
+    // attempt) — never across cells, attempts, or duplicate role rows.
+    // Pairing per rep alone let a caller row from one attempt combine with
+    // a listener row from another into a phantom complete run, and pairing
+    // inside a report group (not a cell) mixed unrelated configurations.
+    // Per complete valid pair, compute PairMetrics first, then summarize:
+    // percentages are median-of-per-pair-ratios, counts are medians over
+    // the same paired sample set. Invalid pairs are excluded and counted
+    // in the trailing `invalid` column, never defaulted.
+    let mut paired: Vec<(&Record, &Record, crate::compare::PairMetrics)> = Vec::new();
+    let mut invalid = 0usize;
+    for slots in crate::compare::group_records_by_cell(cells).values() {
+        for slot in slots.values() {
+            if slot.duplicates > 0 {
+                invalid += slot.duplicates;
+                continue;
+            }
+            let (Some(caller), Some(listener)) = (slot.caller, slot.listener) else {
+                continue;
+            };
+            match crate::compare::PairMetrics::compute(caller, listener) {
+                Some(metrics) => paired.push((caller, listener, metrics)),
+                None => invalid += 1,
+            }
         }
     }
-    let (callers, listeners): (Vec<&Record>, Vec<&Record>) = paired
-        .values()
-        .filter_map(|(caller, listener)| Some((*caller.as_ref()?, *listener.as_ref()?)))
-        .unzip();
-    if listeners.is_empty() {
+    if paired.is_empty() {
         return None;
     }
+    let (callers, listeners): (Vec<&Record>, Vec<&Record>) = paired
+        .iter()
+        .map(|(caller, listener, _)| (*caller, *listener))
+        .unzip();
 
     let recv = report_median(&listeners, "core_total");
     let sent = report_median(&callers, "core_total");
-    let deliv = if sent > 0.0 { 100.0 * recv / sent } else { 0.0 };
-    let target_pkts = median(
-        callers
-            .iter()
-            .filter_map(|record| source_target_packets(record))
-            .collect(),
-    );
-    let pct = |value: f64| {
-        if target_pkts > 0.0 {
-            format!("{:.1}", 100.0 * value / target_pkts)
-        } else {
-            "--".to_string()
-        }
-    };
-    // `sent` is `SenderBuffer::total_sent`, which counts a packet when
-    // it is first queued and is NOT incremented by `pop_retransmit`.
-    // Retransmits are already excluded, so subtracting them again
-    // double-counts -- and where loss was heavy enough that retransmits
-    // exceeded originals it floored the figure at zero, reporting a
-    // sender that offered nothing while it sent two million packets.
-    let offered = sent;
+    let offer = median(paired.iter().map(|(_, _, m)| m.offer_pct).collect());
+    let good = median(paired.iter().map(|(_, _, m)| m.good_pct).collect());
+    let deliv = median(paired.iter().map(|(_, _, m)| m.deliv_pct).collect());
     // CPU is the whole pipeline's cost, so both sides count.
     let cpu = (report_median(&listeners, "cpu_user_ms")
         + report_median(&listeners, "cpu_sys_ms")
@@ -923,15 +913,15 @@ fn report_group_row(key: &str, cells: &[&Record]) -> Option<Vec<String>> {
         + report_median(&callers, "cpu_sys_ms"))
         / 1000.0;
     let mut row: Vec<String> = key.split('\t').map(str::to_string).collect();
-    // All reported medians below are based on these complete caller /
+    // All reported medians below are based on these complete valid caller /
     // listener pairs. Expose their count so a human or downstream tool
     // never mistakes one recovered sample for a stable comparison.
-    row.push(listeners.len().to_string());
+    row.push(paired.len().to_string());
     row.push(format!("{:.0}", report_median(&listeners, "established")));
     row.push(format!("{sent:.0}"));
     row.push(format!("{recv:.0}"));
-    row.push(pct(offered));
-    row.push(pct(recv));
+    row.push(format!("{offer:.1}"));
+    row.push(format!("{good:.1}"));
     row.push(format!("{deliv:.1}"));
     row.push(format!("{:.0}", report_median(&listeners, "sec_a")));
     row.push(format!(
@@ -951,6 +941,7 @@ fn report_group_row(key: &str, cells: &[&Record]) -> Option<Vec<String>> {
         "{:.0}",
         report_median(&listeners, "peak_rss_kb").max(report_median(&callers, "peak_rss_kb"))
     ));
+    row.push(invalid.to_string());
     Some(row)
 }
 
@@ -995,36 +986,29 @@ pub fn report(results: &[Record], group_by: &[String]) -> String {
 /// Render the listener-side throughput series expected by
 /// benchmark-action's `customBiggerIsBetter` tool.
 ///
-/// Keep this beside `report`: both consumers read the same validated TSV
-/// records, and the runtime order remains the first-seen order from the
-/// result file so chart updates stay stable.
+/// Same canonical pairing and validity as `report`: only listener rows that
+/// belong to a complete, valid (cell, rep, attempt) pair contribute. Rows
+/// from torn attempts or with invalid metrics are excluded, never
+/// defaulted — but note this is validity, not cleanliness: unclean pairs
+/// still chart (their throughput is real); whether a partial campaign may
+/// update trends is decided by the caller, not here.
 pub fn github_benchmark_json(results: &[Record]) -> String {
     let mut series: Vec<(String, f64, f64)> = Vec::new();
-    for record in results {
-        if record.get("role") != Some("listener") {
-            continue;
-        }
-        let Some(runtime) = record.get("runtime") else {
-            continue;
-        };
-        let sent = record
-            .number("pkt_sent")
-            .filter(|value| value.is_finite())
-            .unwrap_or(0.0);
-        let elapsed = record
-            .number("elapsed_s")
-            .filter(|value| value.is_finite())
-            .unwrap_or(0.0);
-        if let Some((_, total_sent, total_elapsed)) =
-            series.iter_mut().find(|(name, _, _)| name == runtime)
-        {
-            *total_sent += sent;
-            *total_elapsed += elapsed;
-        } else {
-            series.push((runtime.to_string(), sent, elapsed));
+    for slots in crate::compare::group_records_by_cell(results).values() {
+        for slot in slots.values() {
+            let Some((runtime, sent, elapsed)) = chart_point(slot) else {
+                continue;
+            };
+            if let Some((_, total_sent, total_elapsed)) =
+                series.iter_mut().find(|(name, _, _)| name == runtime)
+            {
+                *total_sent += sent;
+                *total_elapsed += elapsed;
+            } else {
+                series.push((runtime.to_string(), sent, elapsed));
+            }
         }
     }
-
     let mut out = String::from("[");
     let mut emitted = false;
     for (runtime, sent, elapsed) in series {
@@ -1044,6 +1028,36 @@ pub fn github_benchmark_json(results: &[Record]) -> String {
     }
     out.push_str("\n]\n");
     out
+}
+
+/// Listener-side chart contribution of one grouped slot: `(runtime,
+/// pkt_sent, elapsed_s)`, or `None` when the slot is not a complete valid
+/// pair. Validity here mirrors `report`, not cleanliness: unclean pairs
+/// still chart.
+fn chart_point<'a>(slot: &crate::compare::RepSlot<'a>) -> Option<(&'a str, f64, f64)> {
+    if slot.duplicates > 0 {
+        return None;
+    }
+    let (caller, listener) = (slot.caller?, slot.listener?);
+    crate::compare::PairMetrics::compute(caller, listener)?;
+    let record = listener;
+    if record.get("role") != Some("listener") {
+        return None;
+    }
+    let runtime = record.get("runtime")?;
+    let sent = record.number("pkt_sent").filter(|value| {
+        // A chart point without measurable throughput is not a zero: a
+        // missing/NaN packet count would depress the aggregate, and a
+        // missing/NaN elapsed time would inflate it (packets added, no
+        // time). Exclude the point instead of defaulting either side.
+        value.is_finite() && *value >= 0.0
+    })?;
+    let elapsed = record.number("elapsed_s").filter(|value| {
+        // Elapsed time must be positive: zero is already meaningless as a
+        // divisor, and negatives are corrupt.
+        value.is_finite() && *value > 0.0
+    })?;
+    Some((runtime, sent, elapsed))
 }
 
 fn json_string(value: &str) -> String {
@@ -4611,17 +4625,19 @@ mod report_tests {
                 .collect(),
         }
     }
-
-    /// Base row: one runtime, one cell, everything a report reads.
-    fn row(role: &str, rep: &str, sent: &str, retx: &str) -> Record {
+    /// Base row: one runtime, one cell, everything a report reads, including
+    /// every validity input the canonical pairing requires.
+    fn row(role: &str, rep: &str, sent: &str, retx: &str, attempt: &str) -> Record {
         rec(&[
             ("runtime", "smol"),
             ("role", role),
             ("rep", rep),
+            ("attempt", attempt),
             ("conns", "400"),
             ("source_bps", "8000000"),
             ("secs", "10"),
             ("established", "400"),
+            ("torn_down", "0"),
             ("core_total", sent),
             ("sec_a", retx),
             ("rtt_ms", "1"),
@@ -4629,6 +4645,9 @@ mod report_tests {
             ("cpu_sys_ms", "0"),
             ("peak_rss_kb", "0"),
             ("udp_rcvbuf_err", "0"),
+            ("src_overflow", "0"),
+            ("datapath_q_dropped", "0"),
+            ("local_dropped", "0"),
         ])
     }
 
@@ -4641,33 +4660,50 @@ mod report_tests {
     }
 
     /// An interrupted run leaves a caller row with no listener row. Resume
-    /// keyed only on listener rows, so the cell re-ran and appended a
-    /// SECOND caller row -- and averaging each side independently then
-    /// divided a complete listener figure by the median of one complete
-    /// and one truncated caller. That is how a 139% delivery rate
-    /// appeared in a real sweep.
     #[test]
     fn an_orphaned_caller_row_does_not_corrupt_delivery() {
+        // Attempts are stamped per matrix run: the interrupted attempt's
+        // caller row can never pair with the re-run's listener row.
         let rows = vec![
-            row("caller", "1", "1336760", "0"), // truncated, no listener
-            row("caller", "1", "3045575", "0"), // the completed re-run
-            row("listener", "1", "3045575", "0"),
+            row("caller", "1", "1336760", "0", "attempt-a"), // truncated, no listener
+            row("caller", "1", "3045575", "0", "attempt-b"), // the completed re-run
+            row("listener", "1", "3045575", "0", "attempt-b"),
         ];
         let out = report(&rows, &["runtime".to_string()]);
         assert_eq!(field(&out, "deliv%"), "100.0", "got:\n{out}");
         assert_eq!(field(&out, "pairs"), "1", "got:\n{out}");
     }
 
-    /// `SenderBuffer::total_sent` counts a packet when it is first queued
-    /// and is never incremented by `pop_retransmit`, so retransmits are
-    /// already excluded. Subtracting them again floored the figure at zero
-    /// under heavy loss: a sender that pushed two million packets was
-    /// reported as having offered nothing.
+    /// Two half-finished attempts must not combine into one phantom
+    /// complete run, even when rep numbers coincide.
+    #[test]
+    fn two_partial_attempts_do_not_form_a_complete_run() {
+        let rows = vec![
+            row("caller", "1", "3045575", "0", "attempt-a"),
+            row("listener", "1", "3045575", "0", "attempt-b"),
+        ];
+        let out = report(&rows, &["runtime".to_string()]);
+        assert_eq!(out.lines().count(), 1, "no pair, headers only:\n{out}");
+    }
+
+    /// A duplicated role row is ambiguous (append-only files never
+    /// supersede): the pair is refused and counted, not silently picked.
+    #[test]
+    fn duplicate_role_rows_invalidate_the_pair() {
+        let rows = vec![
+            row("caller", "1", "3045575", "0", "attempt-a"),
+            row("caller", "1", "3045575", "0", "attempt-a"),
+            row("listener", "1", "3045575", "0", "attempt-a"),
+        ];
+        let out = report(&rows, &["runtime".to_string()]);
+        assert_eq!(out.lines().count(), 1, "ambiguous pair refused:\n{out}");
+    }
+
     #[test]
     fn offered_load_does_not_subtract_retransmits_twice() {
         let rows = vec![
-            row("caller", "1", "2029411", "2048059"),
-            row("listener", "1", "731424", "0"),
+            row("caller", "1", "2029411", "2048059", "attempt-a"),
+            row("listener", "1", "731424", "0", "attempt-a"),
         ];
         let out = report(&rows, &["runtime".to_string()]);
         assert_ne!(field(&out, "offer%"), "0.0", "floored at zero:\n{out}");
@@ -4693,37 +4729,42 @@ mod report_tests {
 
     #[test]
     fn github_benchmark_json_aggregates_listener_throughput_in_first_seen_order() {
+        // Same cell, distinct reps: only complete valid pairs contribute.
+        // The torn "stale" caller row and the zero-elapsed "empty" pair are
+        // excluded, like the unpaired rows they replace.
+        fn chart_row(runtime: &str, role: &str, rep: &str, sent: &str, elapsed: &str) -> Record {
+            rec(&[
+                ("runtime", runtime),
+                ("role", role),
+                ("rep", rep),
+                ("attempt", "a"),
+                ("conns", "10"),
+                ("source_bps", "1000000"),
+                ("secs", "10"),
+                ("established", "10"),
+                ("torn_down", "0"),
+                ("core_total", "9499"),
+                ("udp_rcvbuf_err", "0"),
+                ("src_overflow", "0"),
+                ("datapath_q_dropped", "0"),
+                ("local_dropped", "0"),
+                ("pkt_sent", sent),
+                ("elapsed_s", elapsed),
+            ])
+        }
         let rows = vec![
-            rec(&[
-                ("runtime", "mio"),
-                ("role", "listener"),
-                ("pkt_sent", "10"),
-                ("elapsed_s", "2"),
-            ]),
-            rec(&[
-                ("runtime", "tokio"),
-                ("role", "caller"),
-                ("pkt_sent", "999"),
-                ("elapsed_s", "1"),
-            ]),
-            rec(&[
-                ("runtime", "mio"),
-                ("role", "listener"),
-                ("pkt_sent", "5"),
-                ("elapsed_s", "1"),
-            ]),
-            rec(&[
-                ("runtime", "tokio"),
-                ("role", "listener"),
-                ("pkt_sent", "6"),
-                ("elapsed_s", "3"),
-            ]),
-            rec(&[
-                ("runtime", "empty"),
-                ("role", "listener"),
-                ("pkt_sent", "4"),
-                ("elapsed_s", "0"),
-            ]),
+            chart_row("mio", "caller", "1", "10", "2"),
+            chart_row("mio", "listener", "1", "10", "2"),
+            chart_row("tokio", "caller", "2", "999", "1"),
+            chart_row("tokio", "listener", "2", "6", "3"),
+            chart_row("mio", "caller", "3", "5", "1"),
+            chart_row("mio", "listener", "3", "5", "1"),
+            chart_row("empty", "caller", "5", "4", "0"),
+            chart_row("empty", "listener", "5", "4", "0"),
+            // Valid pair except the measurement itself: malformed elapsed
+            // time must exclude the point, not add packets over zero time.
+            chart_row("skew", "caller", "6", "100", "9"),
+            chart_row("skew", "listener", "6", "100", "NaN"),
         ];
         assert_eq!(
             github_benchmark_json(&rows),
