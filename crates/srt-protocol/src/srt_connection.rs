@@ -3305,6 +3305,69 @@ mod tests {
         (caller, listener)
     }
 
+    /// S06 (revalidation, not a fix): `clear_config_secrets` already
+    /// zeroizes and drops `ConnectionOptions`' passphrase/salt/SEK once a
+    /// live `CryptoContext` has been built from them, on both the caller
+    /// and listener handshake paths. This pins that residual
+    /// application-facing copy is actually released, not just the
+    /// in-context copy inside `CryptoContext` (already covered by its own
+    /// `Drop`/rotation zeroization). Not testing the ephemeral
+    /// zeroize-then-drop step itself: that would mean reading memory this
+    /// code has already freed, which the card explicitly rules out.
+    #[test]
+    fn handshake_clears_config_secrets_once_crypto_is_established() {
+        let sek = vec![0x24u8; 16];
+        let mut caller = SrtConnection::new_caller(ConnectionOptions {
+            socket_id: 1,
+            passphrase: Some("shared-secret".to_owned()),
+            crypto_salt: Some(test_km_salt()),
+            crypto_sek: Some(sek.clone()),
+            ..ConnectionOptions::default()
+        });
+        let mut listener = SrtConnection::new_listener(ConnectionOptions {
+            socket_id: 2,
+            syn_cookie: Some(7),
+            passphrase: Some("shared-secret".to_owned()),
+            crypto_salt: Some(test_km_salt()),
+            crypto_sek: Some(sek),
+            ..ConnectionOptions::default()
+        });
+        caller
+            .connect(Timestamp::from_micros(0))
+            .expect("caller starts");
+        for round in 0..4 {
+            let now = Timestamp::from_micros(round * 10_000);
+            while let Some(ConnectionOutput::SendPacket(packet)) = caller.poll_output() {
+                listener
+                    .feed_recv_buf(&packet, now)
+                    .expect("listener accepts packet");
+            }
+            while let Some(ConnectionOutput::SendPacket(packet)) = listener.poll_output() {
+                caller
+                    .feed_recv_buf(&packet, now)
+                    .expect("caller accepts packet");
+            }
+            if caller.state() == ConnectionState::Connected
+                && listener.state() == ConnectionState::Connected
+            {
+                break;
+            }
+        }
+        assert_eq!(caller.state(), ConnectionState::Connected);
+        assert_eq!(listener.state(), ConnectionState::Connected);
+        assert!(caller.crypto.is_some(), "caller established a live context");
+        assert!(
+            listener.crypto.is_some(),
+            "listener established a live context"
+        );
+
+        for (who, conn) in [("caller", &caller), ("listener", &listener)] {
+            assert!(conn.options.passphrase.is_none(), "{who} passphrase");
+            assert!(conn.options.crypto_salt.is_none(), "{who} crypto_salt");
+            assert!(conn.options.crypto_sek.is_none(), "{who} crypto_sek");
+        }
+    }
+
     /// S01: a wrong explicit sequence must be rejected on both the owned
     /// and shared send paths -- the shared path used to have no such
     /// check at all and silently returned `Ok(())` from `push_shared`'s
