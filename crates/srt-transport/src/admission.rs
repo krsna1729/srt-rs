@@ -2200,6 +2200,23 @@ impl PeerTable {
             .and_then(|physical| self.get_peer(&physical))
     }
 
+    /// Mutable twin of [`Self::direct_for_bench`]: ACK/NAK a StayOnListener
+    /// peer mid-admission drain without waiting for the full peer sweep.
+    ///
+    /// Looks up by destination socket id from `data` (O(1) slot index), not
+    /// by scanning every peer address. Address-only lookup is wrong under
+    /// shared UDP tuples and turns each receive into packet×peer work.
+    #[cfg(feature = "bench-internals")]
+    pub fn direct_mut_for_bench(
+        &mut self,
+        peer: std::net::SocketAddr,
+        data: &[u8],
+    ) -> Option<&mut AdmissionPeer> {
+        let destination_socket_id = shiguredo_srt::peek_destination_socket_id(data).ok()?;
+        let physical = self.physical_for_datagram(peer, destination_socket_id, None)?;
+        self.get_peer_mut(&physical)
+    }
+
     fn remove_physical(&mut self, peer: PhysicalPeerKey) -> Option<AdmissionPeer> {
         let slot_idx = self.slot_index_for_key(&peer)?;
         let is_group_leg = self
@@ -2590,6 +2607,83 @@ mod tests {
                 effective_limit,
             );
         }
+
+        #[test]
+        fn many_callers_on_one_udp_tuple_are_distinct_peers(
+            n in 1..16u16,
+            max_half_open in 1..16usize,
+        ) {
+            let want = usize::from(n).min(max_half_open);
+            let config = PeerTableConfig {
+                max_peers: 16,
+                max_half_open_peers: max_half_open,
+                max_established_peers: 16,
+                max_peers_per_ip: 16,
+                half_open_timeout: Duration::from_secs(60),
+            };
+            let mut table = PeerTable::with_config(config);
+            let telemetry = IngressTelemetry::new();
+            let options = default_options();
+            let peer = std::net::SocketAddr::from(([10, 0, 0, 1], 5000));
+            let mut admitted = 0usize;
+            for i in 0..n {
+                let result = table.admit(
+                    peer,
+                    &induction_packet(100 + u32::from(i)),
+                    Timestamp::from_micros(u64::from(i) * 1000),
+                    &options,
+                    0,
+                    1,
+                    &telemetry,
+                );
+                if !matches!(result, Admit::Dropped(_)) {
+                    admitted += 1;
+                }
+            }
+            prop_assert_eq!(admitted, want);
+            prop_assert_eq!(table.half_open_count(), want);
+        }
+    }
+
+    #[test]
+    fn two_callers_on_one_udp_tuple_are_two_half_open_peers() {
+        let mut table = PeerTable::with_config(PeerTableConfig {
+            max_peers: 8,
+            max_half_open_peers: 8,
+            max_established_peers: 8,
+            max_peers_per_ip: 8,
+            half_open_timeout: Duration::from_secs(60),
+        });
+        let telemetry = IngressTelemetry::new();
+        let options = default_options();
+        let peer = "10.0.0.1:5000".parse().unwrap();
+
+        assert!(!matches!(
+            table.admit(
+                peer,
+                &induction_packet(1),
+                Timestamp::from_micros(0),
+                &options,
+                0,
+                1,
+                &telemetry,
+            ),
+            Admit::Dropped(_)
+        ));
+        assert!(!matches!(
+            table.admit(
+                peer,
+                &induction_packet(2),
+                Timestamp::from_micros(1),
+                &options,
+                0,
+                1,
+                &telemetry,
+            ),
+            Admit::Dropped(_)
+        ));
+        assert_eq!(table.half_open_count(), 2);
+        assert_eq!(table.len(), 2);
     }
 
     #[test]

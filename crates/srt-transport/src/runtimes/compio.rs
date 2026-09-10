@@ -105,15 +105,16 @@ impl Conn {
             .ok_or(())
     }
 
+    /// Success means the application payload was accepted into SRT. Drain is
+    /// best-effort: `Err` after `send_shared` would make bus callers retry and
+    /// duplicate the same application payload.
     pub async fn send_shared_paced(&mut self, payload: Bytes, now: Timestamp) -> Result<(), ()> {
         if self.has_pending_outputs() || !self.conn.can_send_with_pacing(now) {
             return Err(());
         }
         self.conn.send_shared(payload, now).map_err(|_| ())?;
-        let report = self.drain_outputs(now).await.map_err(|_| ())?;
-        (report.status == OutputDrainStatus::Drained)
-            .then_some(())
-            .ok_or(())
+        let _ = self.drain_outputs(now).await;
+        Ok(())
     }
 
     pub async fn tick(&mut self, payload: &[u8], now: Timestamp) -> io::Result<TickResult> {

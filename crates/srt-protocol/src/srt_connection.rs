@@ -246,7 +246,13 @@ pub struct ConnectionOptions {
     /// Percentage above input bandwidth reserved for retransmissions
     /// (equivalent to `SRTO_OHEADBW`; libsrt default: 25).
     pub overhead_bandwidth_percent: u8,
-    /// Flow-control window advertised in the handshake, in packets. Values
+    /// Static repay enable. Canonical owner is
+    /// `srt_transport::SessionConfig::set_pacing`; do not set directly.
+    /// Repay at an instant requires `enabled && demand`: this flag alone
+    /// never admits an extra packet, and demand alone cannot turn `Off` on.
+    /// Default false preserves the idle-gap contract. Packed with the
+    /// overhead byte above so the options footprint does not grow.
+    pub pacing_repay: bool,
     /// above [`crate::MAX_FLOW_WINDOW`] are clamped during construction.
     pub flow_window_packets: u32,
     /// Local receive-buffer capacity, in packets. Values above
@@ -351,6 +357,7 @@ impl Default for ConnectionOptions {
             delivery_queue_packets: DEFAULT_FLOW_WINDOW,
             ack_interval_micros: crate::ACK_INTERVAL_MICROS,
             light_ack_interval_packets: crate::LIGHT_ACK_INTERVAL_PACKETS,
+            pacing_repay: false,
         }
     }
 }
@@ -375,7 +382,9 @@ pub struct SrtConnection {
     initial_seq: u32,
 
     /// Encryption context.
-    crypto: Option<CryptoContext>,
+    /// Boxed: only encrypted sessions pay the ~136B context (key schedules
+    /// now live behind one more pointer inside). Plain sessions stay lean.
+    crypto: Option<Box<CryptoContext>>,
 
     /// Send buffer.
     sender: Option<SenderBuffer>,
@@ -861,7 +870,9 @@ impl SrtConnection {
         Ok(())
     }
 
-    /// Initialize the send/receive buffers.
+    /// Initialize the send/receive buffers. Demand starts false: static
+    /// `pacing_repay` only enables repay, the app must still signal waiting
+    /// data via `set_pacing_demand`.
     fn init_buffers(&mut self, now: Timestamp, peer_initial_seq: u32, tsbpd_time_base: u64) {
         let mut sender = SenderBuffer::new(
             self.initial_seq,
@@ -873,6 +884,7 @@ impl SrtConnection {
         } else if let Some(input_bw) = self.options.input_bandwidth_bytes_per_sec {
             sender.set_input_bandwidth(input_bw, self.options.overhead_bandwidth_percent);
         }
+        sender.set_repay_pacing_debt(false);
         self.sender = Some(sender);
         let mut receiver = ReceiverBuffer::with_buffer_size(
             peer_initial_seq,
@@ -1345,6 +1357,28 @@ impl SrtConnection {
         }
     }
 
+    /// Tell the pacer whether unsent application data is waiting.
+    ///
+    /// Gated by static `pacing_repay`: `Off` stays off even when waiting.
+    /// When true, late service repays missed periods so a loop-while-eligible
+    /// caller can emit more than one packet at the same `now`. When false, the
+    /// idle-gap contract is restored (exactly one immediate packet).
+    pub fn set_pacing_demand(&mut self, waiting: bool) {
+        let enabled = self.options.pacing_repay;
+        if let Some(sender) = self.sender.as_mut() {
+            sender.set_repay_pacing_debt(enabled && waiting);
+        }
+    }
+
+    /// Discard leftover send-time debt because the application queue is empty.
+    /// Matches libsrt clearing `m_tsNextSendTime` when `packUniqueData` finds
+    /// nothing to send.
+    pub fn discard_idle_pacing_debt(&mut self, now: Timestamp) {
+        if let Some(sender) = self.sender.as_mut() {
+            sender.discard_idle_pacing_debt(now);
+        }
+    }
+
     /// Get an event.
     pub fn poll_event(&mut self) -> Option<ConnectionEvent> {
         self.poll_event_inner(false)
@@ -1779,13 +1813,13 @@ impl SrtConnection {
                 generated_sek.as_slice()
             }
         };
-        self.crypto = Some(CryptoContext::new_sender(
+        self.crypto = Some(Box::new(CryptoContext::new_sender(
             &passphrase,
             key_length,
             salt,
             sek,
             self.options.cipher_mode,
-        )?);
+        )?));
         Ok(())
     }
 
@@ -1964,7 +1998,7 @@ impl SrtConnection {
                     ));
                 }
             };
-            self.crypto = Some(crypto);
+            self.crypto = Some(Box::new(crypto));
             self.received_km = Some(km);
         } else if hs.get_km_request().is_some() {
             return Err(self.fail_listener_km(
@@ -2988,7 +3022,7 @@ mod tests {
         crypto.set_encrypted_packet_count_for_test(
             CryptoContext::KM_REFRESH_PERIOD - CryptoContext::KM_PRE_ANNOUNCE_PERIOD,
         );
-        conn.crypto = Some(crypto);
+        conn.crypto = Some(Box::new(crypto));
 
         conn.check_km_refresh(Timestamp::from_micros(1));
         conn.check_km_refresh(Timestamp::from_micros(2));
@@ -3640,7 +3674,7 @@ mod tests {
             ..Default::default()
         });
         conn.connect(Timestamp::from_micros(0)).unwrap();
-        conn.crypto = Some(
+        conn.crypto = Some(Box::new(
             CryptoContext::new_sender(
                 "test_passphrase",
                 KeyLength::Aes128,
@@ -3649,7 +3683,7 @@ mod tests {
                 CipherMode::Ctr,
             )
             .unwrap(),
-        );
+        ));
 
         // A CONCLUSION with no KMRSP should fail for an encrypted caller.
         let hs = HandshakePacket {

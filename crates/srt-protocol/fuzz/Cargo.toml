@@ -92,6 +92,13 @@ name = "fuzz_dense_slot_arena"
 path = "fuzz_targets/fuzz_dense_slot_arena.rs"
 test = false
 
+[[bin]]
+bench = false
+doc = false
+name = "fuzz_pacing"
+path = "fuzz_targets/fuzz_pacing.rs"
+test = false
+
 [dependencies]
 libfuzzer-sys = "0.4"
 shiguredo_srt = { path = ".." }

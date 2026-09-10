@@ -13,7 +13,7 @@ const PACKETS: u32 = 8_192;
 
 fn populated_sender(count: u32) -> SenderBuffer {
     let mut sender = SenderBuffer::new(0, count, 120);
-    sender.set_congestion_window(count);
+    sender.set_flow_window(count);
     for _ in 0..count {
         assert!(
             sender

@@ -181,6 +181,46 @@ fn bench_per_source_capacity(c: &mut Criterion) {
     });
 }
 
+fn bench_same_tuple_n_callers(c: &mut Criterion) {
+    let options = AdmissionOptions::basic(7, 120, true);
+    let telemetry = IngressTelemetry::new();
+    let peer = SocketAddr::from(([127, 0, 0, 1], 10_000));
+    const N: u64 = 64;
+    c.bench_function("admission_same_tuple_64_callers", |b| {
+        b.iter_batched(
+            || {
+                let mut packets = Vec::with_capacity(N as usize);
+                for socket_id in 1..=N {
+                    packets.push(induction(socket_id as u32));
+                }
+                packets
+            },
+            |packets| {
+                let mut table = PeerTable::with_config(PeerTableConfig {
+                    max_peers: N as usize,
+                    max_half_open_peers: N as usize,
+                    max_established_peers: N as usize,
+                    max_peers_per_ip: N as usize,
+                    half_open_timeout: Duration::from_secs(10),
+                });
+                for (index, packet) in packets.iter().enumerate() {
+                    black_box(table.admit(
+                        peer,
+                        packet,
+                        Timestamp::from_micros(index as u64),
+                        &options,
+                        0,
+                        1,
+                        &telemetry,
+                    ));
+                }
+                black_box(table.half_open_count());
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
 fn bench_cached_policy_resolution(c: &mut Criterion) {
     let options = AdmissionOptions::basic(7, 120, true);
     let telemetry = IngressTelemetry::new();
@@ -973,6 +1013,7 @@ criterion_group!(
     bench_bounded_capacity,
     bench_due_index_churn,
     bench_per_source_capacity,
+    bench_same_tuple_n_callers,
     bench_cached_policy_resolution,
     bench_bonded_second_leg_admission,
     bench_route_only_dispatch,

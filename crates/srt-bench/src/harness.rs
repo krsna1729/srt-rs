@@ -474,7 +474,13 @@ pub fn append_result(
             crate::Egress::PerConnection => "per-connection".into(),
             crate::Egress::SharedSocket => "shared-socket".into(),
         },
-        format!("{:?}", cfg.promotion).to_lowercase(),
+        // Effective promotion: Shared egress always executes as Never via
+        // endpoint_plan translation; record that, not the raw axis request.
+        if cfg.egress == crate::Egress::SharedSocket {
+            "never".to_string()
+        } else {
+            format!("{:?}", cfg.promotion).to_lowercase()
+        },
         if cfg.cookie_routing { "on" } else { "off" }.into(),
         match cfg.batching {
             Batching::On => "on".into(),
@@ -1310,7 +1316,7 @@ fn filter_reason(cell: &Cell<'_>, axes: &[Axis]) -> Option<&'static str> {
         return Some("bonded-ingress-unsupported");
     }
 
-    if let Some(reason) = filter_promotion(cell, axes, bond, is_multi, is_single) {
+    if let Some(reason) = filter_promotion(cell, axes, bond, egress, is_multi, is_single) {
         return Some(reason);
     }
 
@@ -1367,17 +1373,26 @@ fn filter_promotion(
     cell: &Cell<'_>,
     axes: &[Axis],
     bond: Option<&str>,
+    egress: &str,
     is_multi: bool,
     is_single: bool,
 ) -> Option<&'static str> {
     let promotion = cell_value(cell, "promotion", Some(Scope::Both))?;
+    // Every effective Shared sender executes as Never via endpoint_plan
+    // translation (bonded included): keep only the canonical Never cell so
+    // raw never/relocate/bonded/all do not survive as duplicate identities.
+    if egress == "shared-socket" {
+        return representative(axes, "promotion", "never")
+            .filter(|keep| promotion != *keep)
+            .map(|_| "promotion-inert-shared-egress");
+    }
+    if bond != Some("none") {
+        return None;
+    }
     if is_single || !is_multi {
         return representative(axes, "promotion", "all")
             .filter(|keep| promotion != *keep)
             .map(|_| "promotion-inert");
-    }
-    if bond != Some("none") {
-        return None;
     }
     let keep_never = axis_has(axes, "promotion", "never");
     let keep_all = axis_has(axes, "promotion", "all");
@@ -1616,12 +1631,28 @@ fn recorded_link_value(value: &str) -> String {
     }
 }
 
+/// Effective promotion for identity: every Shared-egress sender executes as
+/// Never via endpoint_plan translation, so the scheduling/resume key must
+/// use Never even when the raw axis says all/relocate/bonded (including
+/// one-value custom plans where Never is not on the axis).
+fn effective_promotion_value<'r>(cell: &[(&str, Scope, String)], raw: &'r str) -> &'r str {
+    let shared = cell.iter().any(|(axis, scope, value)| {
+        *axis == "egress" && matches!(scope, Scope::Send | Scope::Both) && value == "shared-socket"
+    });
+    if shared { "never" } else { raw }
+}
+
 /// Identity of one (cell, rep) as it appears in a result file.
 fn cell_key(cell: &[(&str, Scope, String)], rep: usize) -> String {
     let mut parts: Vec<String> = cell
         .iter()
         .map(|(axis, scope, value)| {
-            let (col, v) = recorded_as(axis, value);
+            let effective = if *axis == "promotion" {
+                effective_promotion_value(cell, value)
+            } else {
+                value.as_str()
+            };
+            let (col, v) = recorded_as(axis, effective);
             format!("{}{col}={v}", scope.prefix())
         })
         .collect();
@@ -3570,9 +3601,10 @@ pub fn run_sysprof(cli: &crate::Cli) -> std::io::Result<()> {
 mod matrix_filter_tests {
     use super::{
         Axis, COLUMNS, Cell, MatrixOrder, Record, ScheduleInputs, Scope, attempt_id,
-        axis_overrides, build_matrix_schedule, cell_key, filter_matrix_cells, filter_reason,
-        filtered_cartesian_cells, interleave_indices, matrix_cell_argv, matrix_cell_config,
-        read_results, record_key, recorded_as, recorded_roles, resolve_matrix_axes, shuffle,
+        axis_overrides, build_matrix_schedule, cell_key, effective_promotion_value,
+        filter_matrix_cells, filter_reason, filtered_cartesian_cells, interleave_indices,
+        matrix_cell_argv, matrix_cell_config, read_results, record_key, recorded_as,
+        recorded_roles, resolve_matrix_axes, shuffle,
     };
     use crate::Cli;
     use std::path::PathBuf;
@@ -3841,6 +3873,71 @@ mod matrix_filter_tests {
         );
         assert_eq!(filter_reason(&cell("1", "2"), &axes), None);
     }
+    #[test]
+    fn shared_egress_makes_promotion_inert_except_never() {
+        let axes = axes();
+        let cell_for = |promotion: &'static str| {
+            cell(&[
+                ("ingress", "reuseport-multi:4"),
+                ("egress", "shared-socket"),
+                ("promotion", promotion),
+                ("cookie-routing", "on"),
+                ("batch", "on"),
+                ("pin", "off"),
+                ("runtime", "mio"),
+                ("connections", "200"),
+                ("bond", "none"),
+            ])
+        };
+        assert_eq!(filter_reason(&cell_for("never"), &axes), None);
+        assert_eq!(
+            filter_reason(&cell_for("all"), &axes),
+            Some("promotion-inert-shared-egress")
+        );
+        assert_eq!(
+            filter_reason(&cell_for("relocate"), &axes),
+            Some("promotion-inert-shared-egress")
+        );
+    }
+    #[test]
+    fn shared_egress_identity_uses_effective_never_and_round_trips() {
+        let raw_all = cell(&[
+            ("ingress", "reuseport-multi:4"),
+            ("egress", "shared-socket"),
+            ("promotion", "all"),
+            ("bond", "none"),
+        ]);
+        let raw_never = cell(&[
+            ("ingress", "reuseport-multi:4"),
+            ("egress", "shared-socket"),
+            ("promotion", "never"),
+            ("bond", "none"),
+        ]);
+        assert_eq!(effective_promotion_value(&raw_all, "all"), "never");
+        // Scheduling keys canonicalize: raw all and never collide.
+        assert_eq!(cell_key(&raw_all, 1), cell_key(&raw_never, 1));
+        // Resume key reads the recorded row (effective never) and matches.
+        let mut fields = vec![];
+        for (axis, scope, _) in &raw_never {
+            let (col, _) = recorded_as(axis, "");
+            let col = format!("{}{col}", scope.prefix());
+            let value = if *axis == "promotion" {
+                "never".to_string()
+            } else {
+                raw_never
+                    .iter()
+                    .find(|(a, s, _)| a == axis && s == scope)
+                    .map(|(_, _, v)| v.clone())
+                    .unwrap_or_default()
+            };
+            fields.push((col, value));
+        }
+        let record = Record { fields };
+        assert_eq!(
+            record_key(&record, &raw_all, 1).expect("resume key"),
+            cell_key(&raw_all, 1)
+        );
+    }
 
     #[test]
     fn rejects_bonded_ingress_without_one_group_aware_listener() {
@@ -3880,7 +3977,7 @@ mod matrix_filter_tests {
         for runtime in ["mio", "tokio", "smol", "monoio", "glommio", "compio"] {
             let supported = cell(&[
                 ("ingress", "shared-pool:1"),
-                ("promotion", "all"),
+                ("promotion", "never"),
                 ("cookie-routing", "on"),
                 ("batch", "on"),
                 ("pin", "off"),

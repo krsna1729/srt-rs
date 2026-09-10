@@ -552,6 +552,42 @@ pub enum BondMode {
 /// peer-tuple key (`SocketAddr` for every adapter so far).
 pub type SharedWorkerRouter =
     std::sync::Arc<std::sync::Mutex<srt_lifecycle::WorkerRouter<std::net::SocketAddr>>>;
+/// Canonical handshake-extension to group-affinity mapping. Single place
+/// the six acceptor loops build the `decide_promotion` group argument.
+#[must_use]
+pub fn group_from_extension(
+    extension: Option<shiguredo_srt::GroupExtensionData>,
+) -> Option<srt_lifecycle::GroupAffinity> {
+    extension.map(|extension| srt_lifecycle::GroupAffinity {
+        group_id: extension.group_id,
+        stream_id: None,
+        extension,
+    })
+}
+
+/// Canonical promotion decision. Single place acceptor loops resolve
+/// `decide_promotion`; runtimes must call this instead of copying the
+/// lock-match. Poisoned router fails closed to `StayOnListener`.
+pub fn decide_promotion_for(
+    cfg: &BenchConfig,
+    router: &SharedWorkerRouter,
+    worker_index: usize,
+    peer: std::net::SocketAddr,
+    group: Option<srt_lifecycle::GroupAffinity>,
+) -> srt_lifecycle::PromotionDecision {
+    match router.lock() {
+        Ok(mut router) => srt_lifecycle::decide_promotion(
+            cfg.promotion,
+            peer,
+            group,
+            worker_index,
+            &mut router,
+            srt_lifecycle::RoutingMode::LeastTuples,
+            cfg.exclusive_udp_tuple(),
+        ),
+        Err(_) => srt_lifecycle::PromotionDecision::StayOnListener,
+    }
+}
 
 impl BenchConfig {
     /// Reject benchmark topologies that advertise a bond without actually
@@ -574,6 +610,32 @@ impl BenchConfig {
                  and therefore require --connect-concurrency >= 2");
         }
         Ok(())
+    }
+    /// Canonical topology validation. Single place illegal
+    /// `topology+ownership+promotion` combos are rejected; call after
+    /// `validate_bond_topology` at startup so bench never runs them.
+    pub fn validate_canonical(
+        &self,
+        capabilities: srt_transport::TransportCapabilities,
+    ) -> Result<srt_transport::ResolvedEndpointPlan, String> {
+        let workers =
+            std::num::NonZeroUsize::new(self.workers.max(1)).unwrap_or(std::num::NonZeroUsize::MIN);
+        self.endpoint_plan()
+            .resolve(
+                capabilities,
+                srt_transport::WorkerCount::Count(workers),
+                if self.batching == Batching::On {
+                    srt_transport::BatchingPolicy::Auto
+                } else {
+                    srt_transport::BatchingPolicy::Disabled
+                },
+                srt_transport::SocketBufferConfig::Bytes(
+                    std::num::NonZeroUsize::new(self.sock_buf_bytes.max(1))
+                        .unwrap_or(std::num::NonZeroUsize::MIN),
+                ),
+                srt_transport::OutputDrainBudget::default(),
+            )
+            .map_err(|e| e.to_string())
     }
 
     /// Destination/bind address for connection i.
@@ -678,25 +740,122 @@ impl BenchConfig {
     /// Applied for both roles: a listener never sends application data,
     /// so its pacing ceiling is inert, and setting it uniformly keeps the
     /// six runtimes from each deciding the question differently.
+    /// Canonical via [`Self::session_config`]; do not write pacing fields here.
     pub fn apply_srt_bandwidth(&self, options: &mut shiguredo_srt::ConnectionOptions) {
-        self.srt_bandwidth().apply_to(options);
+        let template = self.session_config().into_connection_options();
+        options.max_bandwidth_bytes_per_sec = template.max_bandwidth_bytes_per_sec;
+        options.input_bandwidth_bytes_per_sec = template.input_bandwidth_bytes_per_sec;
+        options.overhead_bandwidth_percent = template.overhead_bandwidth_percent;
+        options.pacing_repay = template.pacing_repay;
     }
 
-    /// Write this run's ACK coalesce knobs into raw protocol options.
-    ///
-    /// Per-connection, so a cell can set 40 ms / 256 without an env var and
-    /// without contaminating other sockets in-process.
+    /// Canonical via [`Self::session_config`]; do not write ACK fields here.
     pub fn apply_ack_coalesce(&self, options: &mut shiguredo_srt::ConnectionOptions) {
-        options.ack_interval_micros = self.ack_interval_micros;
-        options.light_ack_interval_packets = self.light_ack_interval_packets;
+        let template = self.session_config().into_connection_options();
+        options.ack_interval_micros = template.ack_interval_micros;
+        options.light_ack_interval_packets = template.light_ack_interval_packets;
     }
 
-    /// Bandwidth + encryption + ACK coalesce. The single place a runtime
+    /// Bandwidth + encryption + ACK coalesce. Delegates to
+    /// [`Self::session_config`] plus encryption; the single place a runtime
     /// should stamp protocol knobs onto a `ConnectionOptions` template.
     pub fn apply_protocol_options(&self, options: &mut shiguredo_srt::ConnectionOptions) {
         self.apply_srt_bandwidth(options);
         self.encryption.apply_to(options);
         self.apply_ack_coalesce(options);
+    }
+    /// Canonical endpoint plan. Single place `Ingress + Egress + promotion`
+    /// becomes `EndpointSocketPlan`; runtimes must resolve through this,
+    /// not by matching the three enums separately.
+    ///
+    /// `Shared` ownership makes promotion intrinsically inert (runtime
+    /// `decide_promotion` fails closed to `StayOnListener` without an
+    /// exclusive tuple), so the legacy/default `Relocate` request translates
+    /// to `Never` here. The strict transport resolver still rejects an
+    /// explicit `Shared + promote` built by hand; bench never sends one.
+    #[must_use]
+    pub fn endpoint_plan(&self) -> srt_transport::EndpointSocketPlan {
+        let ownership = if self.exclusive_udp_tuple() {
+            srt_transport::SocketOwnership::Exclusive
+        } else {
+            srt_transport::SocketOwnership::Shared
+        };
+        let topology = match self.ingress {
+            Ingress::PerPort => srt_transport::ListenerTopology::PerPort,
+            Ingress::SharedPool(k) => srt_transport::ListenerTopology::SharedPool {
+                listeners: Self::worker_count(k),
+            },
+            Ingress::ReuseportMulti(k) => srt_transport::ListenerTopology::ReusePortMulti {
+                acceptors: Self::worker_count(k),
+            },
+            Ingress::ReuseportSingle { workers } => {
+                srt_transport::ListenerTopology::ReusePortSingle {
+                    workers: Self::worker_count(workers),
+                }
+            }
+        };
+        let promotion = if ownership == srt_transport::SocketOwnership::Shared {
+            srt_transport::PromotionPolicy::Never
+        } else {
+            match self.promotion {
+                Promotion::Never => srt_transport::PromotionPolicy::Never,
+                Promotion::Relocate => srt_transport::PromotionPolicy::Relocate,
+                Promotion::Bonded => srt_transport::PromotionPolicy::Bonded,
+                Promotion::All => srt_transport::PromotionPolicy::All,
+            }
+        };
+        srt_transport::EndpointSocketPlan::new(topology, ownership, promotion)
+    }
+
+    fn worker_count(n: usize) -> srt_transport::WorkerCount {
+        std::num::NonZeroUsize::new(n).map_or(
+            srt_transport::WorkerCount::Auto,
+            srt_transport::WorkerCount::Count,
+        )
+    }
+
+    /// Transport flavor for this run. `A2` is mio-shaped (flat epoll, no task
+    /// scheduler), so it resolves with `Mio` capabilities.
+    #[must_use]
+    pub fn transport_flavor(&self) -> srt_transport::RuntimeFlavor {
+        match self.runtime {
+            Runtime::Mio | Runtime::A2 => srt_transport::RuntimeFlavor::Mio,
+            Runtime::Tokio => srt_transport::RuntimeFlavor::Tokio,
+            Runtime::Smol => srt_transport::RuntimeFlavor::Smol,
+            Runtime::Monoio => srt_transport::RuntimeFlavor::Monoio,
+            Runtime::Glommio => srt_transport::RuntimeFlavor::Glommio,
+            Runtime::Compio => srt_transport::RuntimeFlavor::Compio,
+        }
+    }
+
+    /// Startup gate: bond topology first, then canonical endpoint plan.
+    /// `Shared` promotion requests arrive as `Never` via [`Self::endpoint_plan`];
+    /// `Shared + ReuseportSingle` still rejects. Runtimes and CLI parsing must
+    /// call this, not `validate_bond_topology` alone.
+    pub fn validate_startup(&self) -> Result<srt_transport::ResolvedEndpointPlan, String> {
+        self.validate_bond_topology().map_err(|e| e.to_string())?;
+        self.validate_canonical(self.transport_flavor().capabilities())
+    }
+
+    /// Canonical session. Single place workload knobs become protocol knobs.
+    /// Pacing stays `Off` (bench never repays; see pacing-phase.md).
+    #[must_use]
+    pub fn session_config(&self) -> srt_transport::SessionConfig {
+        let mut session = srt_transport::SessionConfig::default();
+        session.set_bandwidth(self.srt_bandwidth());
+        let _ = session.set_latency(std::time::Duration::from_millis(u64::from(self.latency_ms)));
+        let _ =
+            session.set_ack_interval(std::time::Duration::from_micros(self.ack_interval_micros));
+        let _ = session.set_light_ack_interval_packets(self.light_ack_interval_packets);
+        session.set_pacing(srt_transport::PacingPolicy::Off);
+        session
+    }
+    /// Symmetric ownership bit. Single place `Egress` becomes
+    /// `SocketOwnership`; `decide_promotion` and `plan_reuseport_single`
+    /// must take this, not match `egress` separately.
+    #[must_use]
+    pub fn exclusive_udp_tuple(&self) -> bool {
+        self.egress != Egress::SharedSocket
     }
 
     /// How many peers' traffic arrives on one listener ingress socket.
@@ -793,13 +952,10 @@ impl BenchConfig {
         socket_id: u32,
         cookie_routing: bool,
     ) -> srt_transport::AdmissionOptions {
-        let mut template = shiguredo_srt::ConnectionOptions {
-            socket_id,
-            tsbpd_delay: self.latency_ms,
-            ..Default::default()
-        };
+        let session = self.session_config();
+        let mut template = session.into_connection_options();
+        template.socket_id = socket_id;
         self.encryption.apply_to(&mut template);
-        self.apply_ack_coalesce(&mut template);
         srt_transport::AdmissionOptions {
             socket_id,
             tsbpd_delay: self.latency_ms,
@@ -3161,7 +3317,7 @@ pub fn bench_config_from_args() -> BenchConfig {
         classifier_policy,
         host_contention,
     };
-    if let Err(error) = config.validate_bond_topology() {
+    if let Err(error) = config.validate_startup() {
         eprintln!("error: {error}");
         usage()
     }
@@ -3371,6 +3527,24 @@ mod tests {
         cfg.bond_pairs = 1;
         cfg.egress = Egress::PerConnection;
         assert_eq!(cfg.validate_bond_topology(), Ok(()));
+    }
+    #[test]
+    fn startup_gate_normalizes_shared_promote_and_rejects_shared_reuseport_single() {
+        let mut cfg = config();
+        // Default fixture is Exclusive + Never: startup passes.
+        assert!(cfg.validate_startup().is_ok());
+        // Shared egress + explicit promote normalizes to Never (bonded
+        // SharedPool(1)+SharedSocket keeps working with default Relocate).
+        cfg.egress = Egress::SharedSocket;
+        cfg.ingress = Ingress::ReuseportMulti(2);
+        cfg.promotion = Promotion::Relocate;
+        let resolved = cfg.validate_startup().expect("Shared normalizes");
+        assert!(!resolved.exclusive);
+        assert_eq!(resolved.promotion, srt_lifecycle::Promotion::Never);
+        // Shared + ReuseportSingle is unreachable even with Never.
+        cfg.promotion = Promotion::Never;
+        cfg.ingress = Ingress::ReuseportSingle { workers: 2 };
+        assert!(cfg.validate_startup().is_err());
     }
 
     #[test]

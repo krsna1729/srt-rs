@@ -98,6 +98,15 @@ impl RecvBudget {
     pub const fn from_rounds(rounds: usize) -> Self {
         Self::new(rounds, rounds.saturating_mul(RecvBatch::DEFAULT_CAPACITY))
     }
+
+    /// Keep calling `recvmmsg` until the socket returns 0 (EAGAIN) or a
+    /// short batch. epoll ET plus a round cap leaves datagrams in the
+    /// kernel with no further READABLE, which is how a one-socket pool
+    /// drops millions to `udp_rcvbuf_err` while userspace sits in poll.
+    #[must_use]
+    pub const fn until_would_block() -> Self {
+        Self::new(usize::MAX, usize::MAX)
+    }
 }
 
 impl Default for RecvBudget {
@@ -504,6 +513,58 @@ mod tests {
         assert_eq!(report.datagrams, 3);
         assert_eq!(report.syscalls, 1);
         assert_eq!(got, [b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+    }
+
+    #[test]
+    fn until_would_block_drains_past_a_round_cap() {
+        use std::os::fd::AsRawFd;
+        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").expect("receiver");
+        receiver.set_nonblocking(true).expect("nonblocking");
+        let dest = receiver.local_addr().expect("addr");
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("sender");
+        assert_eq!(
+            RecvBudget::from_rounds(32).max_datagrams,
+            RecvBatch::DEFAULT_CAPACITY * 32
+        );
+        assert_eq!(RecvBudget::until_would_block().max_rounds, usize::MAX);
+        const N: usize = RecvBatch::DEFAULT_CAPACITY + 16;
+        for i in 0..N {
+            sender.send_to(&[i as u8], dest).expect("send");
+        }
+
+        let mut batch = RecvBatch::new();
+        let mut capped = 0usize;
+        drain_recv_fd(
+            receiver.as_raw_fd(),
+            &mut batch,
+            RecvBudget::from_rounds(1),
+            |_, _| capped += 1,
+        )
+        .expect("capped drain");
+        assert_eq!(capped, RecvBatch::DEFAULT_CAPACITY);
+
+        let mut rest = 0usize;
+        drain_recv_fd(
+            receiver.as_raw_fd(),
+            &mut batch,
+            RecvBudget::until_would_block(),
+            |_, _| rest += 1,
+        )
+        .expect("remainder drain");
+        assert_eq!(capped + rest, N);
+
+        for i in 0..N {
+            sender.send_to(&[i as u8], dest).expect("send");
+        }
+        let mut all = 0usize;
+        drain_recv_fd(
+            receiver.as_raw_fd(),
+            &mut batch,
+            RecvBudget::until_would_block(),
+            |_, _| all += 1,
+        )
+        .expect("full drain");
+        assert_eq!(all, N);
     }
 
     #[test]

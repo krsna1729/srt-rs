@@ -655,12 +655,28 @@ impl Default for HandshakeConfig {
     }
 }
 
+/// Pacing debt policy. Canonical owner of `SenderBuffer::repay_pacing_debt`.
+///
+/// `Off` (default) preserves the idle-gap contract: exactly one immediate
+/// packet after silence. `RepayOneExtra` lets a late visit emit at most one
+/// extra packet while app demand remains; remainder waits for later visits
+/// so N=600 in one park cannot incast. Unbounded repay is not offered:
+/// `600x4` hit 100% then tore down all 600. Bench does not set this;
+/// `600x4` already offers 99.6% at four send workers without it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PacingPolicy {
+    #[default]
+    Off,
+    RepayOneExtra,
+}
+
 /// Protocol/session configuration, independent of sockets and runtimes.
 #[derive(Clone, Debug)]
 pub struct SessionConfig {
     connection: ConnectionOptions,
     pub handshake: HandshakeConfig,
     pub payload_size: PayloadSize,
+    pacing: PacingPolicy,
 }
 
 impl Default for SessionConfig {
@@ -669,6 +685,7 @@ impl Default for SessionConfig {
             connection: ConnectionOptions::default(),
             handshake: HandshakeConfig::default(),
             payload_size: PayloadSize::Live,
+            pacing: PacingPolicy::Off,
         }
     }
 }
@@ -676,8 +693,14 @@ impl Default for SessionConfig {
 impl SessionConfig {
     #[must_use]
     pub fn from_connection_options(connection: ConnectionOptions) -> Self {
+        let pacing = if connection.pacing_repay {
+            PacingPolicy::RepayOneExtra
+        } else {
+            PacingPolicy::Off
+        };
         Self {
             connection,
+            pacing,
             ..Self::default()
         }
     }
@@ -686,12 +709,6 @@ impl SessionConfig {
     #[must_use]
     pub fn connection_options(&self) -> &ConnectionOptions {
         &self.connection
-    }
-
-    /// Mutable sans-I/O protocol escape hatch. Validation still runs when a
-    /// caller/listener is prepared.
-    pub fn connection_options_mut(&mut self) -> &mut ConnectionOptions {
-        &mut self.connection
     }
 
     #[must_use]
@@ -730,6 +747,34 @@ impl SessionConfig {
         self.connection.overhead_bandwidth_percent = overhead_percent;
         self
     }
+    /// Canonical pacing-debt switch. Single place that owns
+    /// `SenderBuffer::repay_pacing_debt`; do not call that setter directly.
+    /// Static enable only: runtime repay also requires dynamic demand via
+    /// `SrtConnection::set_pacing_demand` (`enabled && demand`).
+    pub fn set_pacing(&mut self, pacing: PacingPolicy) -> &mut Self {
+        self.pacing = pacing;
+        self.connection.pacing_repay = matches!(pacing, PacingPolicy::RepayOneExtra);
+        self
+    }
+
+    /// Static pacing-repay enable. Dynamic demand still gates each instant;
+    /// writing the field directly cannot desync `ConnectionOptions`.
+    #[must_use]
+    pub fn pacing(&self) -> PacingPolicy {
+        self.pacing
+    }
+    /// Canonical initial-sequence setter for bonded legs sharing one
+    /// group-wide sequence space.
+    pub fn set_initial_seq(&mut self, seq: u32) -> &mut Self {
+        self.connection.initial_seq = Some(seq & 0x7fff_ffff);
+        self
+    }
+
+    /// Canonical socket-ID setter. Zero means auto-assign at `prepare()`.
+    pub fn set_socket_id(&mut self, socket_id: u32) -> &mut Self {
+        self.connection.socket_id = socket_id;
+        self
+    }
 
     pub fn set_stream_id(&mut self, stream_id: Option<String>) -> &mut Self {
         self.connection.stream_id = stream_id;
@@ -741,15 +786,19 @@ impl SessionConfig {
         self
     }
 
-    pub fn set_flow_control(&mut self, flow: FlowControlConfig) -> &mut Self {
+    /// Canonical flow-control setter. Rejects `delivery_queue > receive_buffer`
+    /// instead of silently clamping; call `set_delivery_queue_packets` first
+    /// if you need a smaller queue.
+    pub fn set_flow_control(&mut self, flow: FlowControlConfig) -> Result<&mut Self, ConfigError> {
+        if self.connection.delivery_queue_packets > flow.receive_buffer_packets.get() {
+            return Err(ConfigError::new(
+                "session.delivery_queue_packets",
+                "must not exceed receive_buffer; lower delivery_queue first",
+            ));
+        }
         self.connection.flow_window_packets = flow.window_packets.get();
         self.connection.receive_buffer_packets = flow.receive_buffer_packets.get();
-        self.connection.delivery_queue_packets = self
-            .connection
-            .delivery_queue_packets
-            .min(flow.receive_buffer_packets.get())
-            .max(1);
-        self
+        Ok(self)
     }
 
     /// Bound DATA events retained for the application. Unread events consume
@@ -1144,6 +1193,122 @@ pub enum TransportProfile {
     Default,
     LowLatency,
     HighDensity,
+}
+
+/// Which side owns the UDP 4-tuple. Symmetric for caller and listener.
+///
+/// `Exclusive` = one SRT session per UDP tuple (per-connection caller,
+/// per-port listener). Private `connect()` sockets are legal and promotion
+/// may create them. `Shared` = N sessions on one tuple (shared-socket
+/// caller, shared listener). `connect()` would steal handshakes, so the
+/// only legal steady state is `StayOnListener` + socket-ID demux.
+/// This is the `exclusive_udp_tuple` bool in `decide_promotion` made
+/// type-safe and checked at `prepare()`, not mid-run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SocketOwnership {
+    #[default]
+    Exclusive,
+    Shared,
+}
+
+/// Symmetric socket plan for one endpoint (caller or listener).
+///
+/// Canonical replacement for bench `Ingress + Egress + promotion` triple.
+/// Both sides construct the same type; `resolve()` rejects illegal
+/// combinations once instead of scattering `if !exclusive` guards.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EndpointSocketPlan {
+    pub topology: ListenerTopology,
+    pub ownership: SocketOwnership,
+    pub promotion: PromotionPolicy,
+}
+
+impl EndpointSocketPlan {
+    #[must_use]
+    pub fn new(
+        topology: ListenerTopology,
+        ownership: SocketOwnership,
+        promotion: PromotionPolicy,
+    ) -> Self {
+        Self {
+            topology,
+            ownership,
+            promotion,
+        }
+    }
+
+    /// Canonical resolve: topology + ownership + promotion checked together.
+    /// Rejects explicit `All/Bonded/Relocate + Shared` (first `connect()`
+    /// would steal later handshakes; use `Never` + socket-ID demux) and
+    /// `ReusePortSingle + Shared`. `Auto + Shared` normalizes to `Never` by
+    /// construction. No successful `Shared` result ever carries
+    /// `promotion != Never` (post-resolve guard).
+    pub fn resolve(
+        self,
+        capabilities: TransportCapabilities,
+        workers: WorkerCount,
+        batching: BatchingPolicy,
+        socket_buffers: SocketBufferConfig,
+        output_drain: OutputDrainBudget,
+    ) -> Result<ResolvedEndpointPlan, ConfigError> {
+        let exclusive = matches!(self.ownership, SocketOwnership::Exclusive);
+        let effective = match (self.promotion, self.ownership) {
+            (
+                PromotionPolicy::All | PromotionPolicy::Bonded | PromotionPolicy::Relocate,
+                SocketOwnership::Shared,
+            ) => {
+                return Err(ConfigError::new(
+                    "transport.promotion",
+                    "Shared UDP tuple cannot promote: first connect() steals later handshakes; use Never + socket-ID demux",
+                ));
+            }
+            (PromotionPolicy::Auto, SocketOwnership::Shared) => PromotionPolicy::Never,
+            (promotion, _) => promotion,
+        };
+        if matches!(self.topology, ListenerTopology::ReusePortSingle { .. }) && !exclusive {
+            return Err(ConfigError::new(
+                "transport.topology",
+                "ReusePortSingle ConnectedWorkers requires Exclusive tuple; Shared must use UnconnectedListener (ReusePortMulti{1})",
+            ));
+        }
+        let cfg = TransportConfig {
+            topology: self.topology,
+            workers,
+            batching,
+            promotion: effective,
+            socket_buffers,
+            output_drain,
+        };
+        let resolved = cfg.resolve(capabilities)?;
+        if !exclusive && resolved.promotion != srt_lifecycle::Promotion::Never {
+            return Err(ConfigError::new(
+                "transport.promotion",
+                "Shared UDP tuple resolved to promotion != Never; use Never + socket-ID demux",
+            ));
+        }
+        Ok(ResolvedEndpointPlan {
+            topology: resolved.topology,
+            promotion: resolved.promotion,
+            exclusive,
+            socket_buffer_bytes: resolved.socket_buffer_bytes,
+            batch_size: resolved.batch_size,
+            workers: resolved.workers,
+            output_drain: resolved.output_drain,
+        })
+    }
+}
+
+/// Resolved symmetric plan. `exclusive=false` forces `promotion=Never`
+/// and socket-ID demux; callers must not `connect()` promoted sockets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResolvedEndpointPlan {
+    pub topology: ResolvedListenerTopology,
+    pub promotion: srt_lifecycle::Promotion,
+    pub exclusive: bool,
+    pub socket_buffer_bytes: usize,
+    pub batch_size: Option<NonZeroUsize>,
+    pub workers: NonZeroUsize,
+    pub output_drain: OutputDrainBudget,
 }
 
 /// Runtime facts used to resolve `Auto`. Applications with custom adapters can
@@ -2039,8 +2204,8 @@ mod tests {
         assert_ne!(first.socket_id(), second.socket_id());
 
         let mut explicit = SessionConfig::default();
-        explicit.connection_options_mut().socket_id = 42;
-        explicit.connection_options_mut().initial_seq = Some(99);
+        explicit.set_socket_id(42);
+        explicit.set_initial_seq(99);
         let caller = explicit.caller(Timestamp::default()).expect("caller");
         assert_eq!(caller.socket_id(), 42);
     }
@@ -2268,5 +2433,72 @@ mod tests {
             .set_light_ack_interval_packets(1024)
             .expect_err("above the Contabo 4× ceiling");
         assert_eq!(error.field(), "session.light_ack_interval_packets");
+    }
+    #[test]
+    fn shared_auto_normalizes_to_never_on_reuseport_multi() {
+        let plan = EndpointSocketPlan::new(
+            ListenerTopology::ReusePortMulti {
+                acceptors: WorkerCount::Count(NonZeroUsize::MIN),
+            },
+            SocketOwnership::Shared,
+            PromotionPolicy::Auto,
+        );
+        let resolved = plan
+            .resolve(
+                TransportCapabilities::default(),
+                WorkerCount::Count(NonZeroUsize::MIN),
+                BatchingPolicy::Disabled,
+                SocketBufferConfig::SystemDefault,
+                OutputDrainBudget::default(),
+            )
+            .expect("Shared+Auto resolves");
+        assert!(!resolved.exclusive);
+        assert_eq!(resolved.promotion, srt_lifecycle::Promotion::Never);
+    }
+
+    #[test]
+    fn shared_topologies_never_resolve_to_promotion() {
+        let topologies = [
+            ListenerTopology::PerPort,
+            ListenerTopology::SharedPool {
+                listeners: WorkerCount::Count(NonZeroUsize::MIN),
+            },
+            ListenerTopology::ReusePortMulti {
+                acceptors: WorkerCount::Count(NonZeroUsize::MIN),
+            },
+            ListenerTopology::Auto,
+        ];
+        let promotions = [
+            PromotionPolicy::Auto,
+            PromotionPolicy::Never,
+            PromotionPolicy::Relocate,
+            PromotionPolicy::Bonded,
+            PromotionPolicy::All,
+        ];
+        for topology in topologies {
+            for promotion in promotions {
+                let plan = EndpointSocketPlan::new(topology, SocketOwnership::Shared, promotion);
+                let result = plan.resolve(
+                    TransportCapabilities::default(),
+                    WorkerCount::Count(NonZeroUsize::MIN),
+                    BatchingPolicy::Disabled,
+                    SocketBufferConfig::SystemDefault,
+                    OutputDrainBudget::default(),
+                );
+                match promotion {
+                    PromotionPolicy::Auto | PromotionPolicy::Never => {
+                        let resolved = result.expect("Shared Auto/Never resolves");
+                        assert_eq!(
+                            resolved.promotion,
+                            srt_lifecycle::Promotion::Never,
+                            "Shared {topology:?}+{promotion:?} must stay Never"
+                        );
+                    }
+                    _ => {
+                        result.expect_err("explicit Shared promote must reject");
+                    }
+                }
+            }
+        }
     }
 }

@@ -18,6 +18,14 @@ fn test_options() -> ConnectionOptions {
     }
 }
 
+fn test_options_with_repay() -> ConnectionOptions {
+    ConnectionOptions {
+        tsbpd_delay: 0,
+        pacing_repay: true,
+        ..Default::default()
+    }
+}
+
 /// テスト用のタイムスタンプを生成
 fn ts(micros: u64) -> Timestamp {
     Timestamp::from_micros(micros)
@@ -1072,6 +1080,90 @@ fn test_packet_pacing() {
     // 1ms 後は送信可能
     assert!(caller.can_send_with_pacing(ts(101_000)));
     assert_eq!(caller.time_until_send(ts(101_000)), 0);
+}
+
+#[test]
+fn pacing_demand_admits_one_extra_packet_at_the_same_instant() {
+    let mut caller = SrtConnection::new_caller(test_options_with_repay());
+    let mut listener = SrtConnection::new_listener(test_options());
+    establish_connection(&mut caller, &mut listener).expect("connection should be established");
+
+    caller.set_packet_send_period(1000);
+    caller.send(b"first", ts(100_000)).expect("send");
+    caller.set_pacing_demand(true);
+
+    let now = ts(102_500);
+    assert!(caller.can_send_with_pacing(now));
+    caller.send(b"second", now).expect("repay first extra");
+    assert!(caller.can_send_with_pacing(now));
+    caller.send(b"third", now).expect("repay second extra");
+    assert!(
+        !caller.can_send_with_pacing(now),
+        "bounded repay admitted a third packet at the same instant"
+    );
+}
+
+#[test]
+fn pacing_demand_requires_static_enable() {
+    let mut caller = SrtConnection::new_caller(test_options());
+    let mut listener = SrtConnection::new_listener(test_options());
+    establish_connection(&mut caller, &mut listener).expect("connection should be established");
+
+    caller.set_packet_send_period(1000);
+    caller.send(b"first", ts(100_000)).expect("send");
+    caller.set_pacing_demand(true);
+
+    // `Off` stays off even with demand: only the idle-gap packet is due.
+    let now = ts(102_500);
+    assert!(caller.can_send_with_pacing(now));
+    caller.send(b"second", now).expect("idle resume");
+    assert!(
+        !caller.can_send_with_pacing(now),
+        "Off + demand admitted a second immediate packet"
+    );
+}
+
+#[test]
+fn pacing_demand_off_still_refuses_a_second_packet_after_a_gap() {
+    let mut caller = SrtConnection::new_caller(test_options());
+    let mut listener = SrtConnection::new_listener(test_options());
+    establish_connection(&mut caller, &mut listener).expect("connection should be established");
+
+    caller.set_packet_send_period(1000);
+    caller.send(b"first", ts(100_000)).expect("send");
+
+    let now = ts(110_000);
+    assert!(caller.can_send_with_pacing(now));
+    caller.send(b"second", now).expect("idle resume");
+    assert!(
+        !caller.can_send_with_pacing(now),
+        "idle path admitted a second immediate packet"
+    );
+}
+
+#[test]
+fn discard_idle_pacing_debt_restores_the_one_packet_idle_contract() {
+    let mut caller = SrtConnection::new_caller(test_options_with_repay());
+    let mut listener = SrtConnection::new_listener(test_options());
+    establish_connection(&mut caller, &mut listener).expect("connection should be established");
+
+    caller.set_packet_send_period(1000);
+    caller.send(b"first", ts(100_000)).expect("send");
+    caller.set_pacing_demand(true);
+    let now = ts(102_500);
+    caller.send(b"catch-up", now).expect("repay");
+    caller.discard_idle_pacing_debt(now);
+    assert!(
+        !caller.can_send_with_pacing(now),
+        "idle discard left a past deadline"
+    );
+}
+
+#[test]
+fn set_pacing_demand_before_connect_is_a_noop() {
+    let mut caller = SrtConnection::new_caller(test_options());
+    caller.set_pacing_demand(true);
+    caller.discard_idle_pacing_debt(ts(0));
 }
 
 // ============================================================================

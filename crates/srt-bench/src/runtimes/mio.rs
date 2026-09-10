@@ -1694,22 +1694,13 @@ fn pool_promotion_decision_with_extension(
     peer: SocketAddr,
     extension: Option<GroupExtensionData>,
 ) -> srt_lifecycle::PromotionDecision {
-    let group = extension.map(|extension| srt_lifecycle::GroupAffinity {
-        group_id: extension.group_id,
-        stream_id: None,
-        extension,
-    });
-    match context.router.lock() {
-        Ok(mut router) => srt_lifecycle::decide_promotion(
-            context.cfg.promotion,
-            peer,
-            group,
-            context.worker_index,
-            &mut router,
-            srt_lifecycle::RoutingMode::LeastTuples,
-        ),
-        Err(_) => srt_lifecycle::PromotionDecision::StayOnListener,
-    }
+    crate::decide_promotion_for(
+        context.cfg,
+        context.router,
+        context.worker_index,
+        peer,
+        crate::group_from_extension(extension),
+    )
 }
 
 fn run_pool_acceptor(
@@ -2298,13 +2289,7 @@ fn route_to_worker(
         return;
     }
 
-    let group = pending_conn
-        .peer_group_extension()
-        .map(|extension| srt_lifecycle::GroupAffinity {
-            group_id: extension.group_id,
-            stream_id: None,
-            extension,
-        });
+    let group = crate::group_from_extension(pending_conn.peer_group_extension());
     let worker = {
         let mut router = match router.lock() {
             Ok(r) => r,

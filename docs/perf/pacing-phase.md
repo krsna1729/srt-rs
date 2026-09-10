@@ -10,6 +10,8 @@ rather than `1/P`.
 
 Because no async runtime can wake at sub-millisecond resolution, `lateness` is
 not small relative to `P` at live bitrates, and the deficit is first-order.
+Cells whose service interval exceeds one full period need the demand-gated
+repay path (`set_pacing_demand`) to emit more than one packet per visit.
 
 ## Measured on `f216e02`
 
@@ -87,28 +89,25 @@ repayment. Both results are consistent.
 
 ## What this repository implements, and what it does not
 
-`SrtConnection::send*()` materialises and queues a packet at call time. There is
-no protocol-owned queue of *unsent application demand* whose continuous
-occupancy the pacer could observe, so srt-rs cannot currently distinguish "the
-runtime was late while data was waiting" from "the application had nothing to
-send". Reproducing libsrt's full accumulated-debt semantics would require
-introducing that demand state, which is an ownership change well beyond this
-repair.
-
-This work therefore implements a deliberately conservative approximation:
+The phase-preservation work (the measurements below) implements:
 
 ```text
 preserve phase within the current pacing interval;
 rebase the schedule after a whole interval has been missed.
 ```
 
-Lateness below one period is repaid, which is the measured defect. Lateness of a
-whole period or more discards the debt, which matches libsrt's empty-queue
-branch but is *more conservative* than libsrt's non-empty-queue branch. Cells
-whose service lateness exceeds one full period are consequently not repaired;
-that is a known limitation of the approximation, not a correctness result. The
-follow-up question -- whether srt-rs should expose enough demand/queue state to
-reproduce the full debt semantics -- is left open deliberately.
+Lateness below one period is repaid. Lateness of a whole period or more
+discards the debt when the pacer has no demand signal, matching libsrt's
+empty-queue branch.
+
+**Route B** adds an explicit demand bit. `SrtConnection::set_pacing_demand`
+tells the pacer that unsent application data is waiting; `record_send_time`
+then allows at most one extra packet at the same `now` (a missed period)
+instead of rebasing. Remaining debt waits for later visits so a 600-connection
+park cannot dump a backlog as an incast. `discard_idle_pacing_debt` restores
+the one-immediate-packet idle contract when the queue empties. The protocol
+still does not own an application queue — the caller (srt-bench:
+`SourceClock.pending()`) supplies the bit. Default remains rebase-on-idle.
 
 ## Scope note
 
@@ -194,6 +193,25 @@ The residual Tokio service-visit deficit is tracked in
 - **A2** (one high-resolution waiter per worker, no spin) is the challenger
   that must be tried before ownership changes. The reusable primitive lives
   in `srt-transport` as `HighResWaiter`; see [high-res-waiter.md](high-res-waiter.md).
-- **Route B** (accumulated debt / multi-admit / `SrtConnection` ownership)
-  remains untested and is not started by the A2 waiter.
+  At N=600, A2 did not raise offer versus classic mio: both were visit-rate
+  bound at ~one packet per wake.
+- **Route B** (repay at most one extra period per visit while application
+  demand remains) is in the protocol: `SrtConnection::set_pacing_demand` /
+  `discard_idle_pacing_debt`, default off. srt-bench does **not** drive it.
+  Measured on this 6 vCPU loopback host, mio PC per-port, 20 s, 1316 B:
+
+  | cell | repay | offer | Gbps | PSI stall | torn | RTT |
+  |---|---|---:|---:|---:|---:|---:|
+  | 600x4 sw=2 | off (recvmmsg baseline) | 45.7% | 0.97 | ~1% | 0 | ~3 ms |
+  | 600x4 sw=2 | unbounded | 100% | 2.36 | 1% | 0 | 3.5 ms |
+  | 600x4 sw=2 | one extra / frozen t | 64.1% | 1.52 | 1.3% | 0 | 5.4 ms |
+  | 600x8 sw=4 | off (recvmmsg) | 74.7% | 3.51 | 6.3% | 0 | quiet |
+  | 600x8 sw=4 | unbounded | 99% caller | 4.36 | 27% | 600 | 390-700 ms |
+  | 600x8 sw=4 | one extra / frozen t | 60.8% | 2.87 | 37% | 0 | 4.4 ms |
+
+  One extra packet per connection per park is still a 600-datagram incast
+  at N=600: 600x8 becomes self-contended and loses offer. Full libsrt
+  catch-up is worse (listener inactivity timeout). 600x4 already hits
+  99.6% at send-workers=4 without this path. Do not enable it from the
+  bench until extras are budgeted per worker, not per connection.
 
