@@ -2657,7 +2657,14 @@ where
         .collect();
     handles
         .into_iter()
-        .flat_map(|h| h.join().unwrap_or_default())
+        .flat_map(|handle| {
+            handle.join().unwrap_or_else(|payload| {
+                // A panicking worker is a failed run, not an empty one:
+                // resuming the panic fails the child process (non-zero
+                // exit) instead of recording silent partial statistics.
+                std::panic::resume_unwind(payload)
+            })
+        })
         .collect()
 }
 
@@ -4381,6 +4388,27 @@ mod tests {
         sender.tick(&cfg, &mut out);
         assert_eq!(sender.slots[1].phase, super::SlotPhase::Handshaking);
         assert_eq!(limiter.lock().unwrap().in_flight(), 1);
+    }
+
+    /// A panicking worker is a failed run, not an empty one: the panic must
+    /// reach the child process (non-zero exit) instead of joining into
+    /// default statistics that read as a short but successful run.
+    #[test]
+    fn panicking_worker_fails_the_run_instead_of_returning_empty_stats() {
+        let mut cfg = sender_config(2, 1);
+        cfg.workers = 2;
+        let result = std::panic::catch_unwind(|| {
+            super::run_workers(&cfg, |_, mine| {
+                if mine.contains(&0) {
+                    panic!("simulated worker failure");
+                }
+                Vec::new()
+            })
+        });
+        assert!(
+            result.is_err(),
+            "a panicking worker must fail the run, not yield empty stats"
+        );
     }
 
     // ----- Terminal lifecycle: every path retires the caller exactly once ---
