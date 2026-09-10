@@ -430,6 +430,8 @@ fn drive_a2(
     let mut wakes: u64 = 0;
     let mut due_visits: u64 = 0;
     let mut ready_hits: u64 = 0;
+    let mut touched = Vec::new();
+    let mut stray_ready: u64 = 0;
     let loop_start = Instant::now();
 
     loop {
@@ -497,15 +499,7 @@ fn drive_a2(
             }
         }
 
-        let mut touched = [false; 4096];
-        for &idx in ready.iter().chain(due.iter()) {
-            if idx < touched.len() {
-                touched[idx] = true;
-            }
-            if let Some(driver) = drivers.get_mut(idx) {
-                receive_connected_datagrams(driver, idx, &mut buf, start);
-            }
-        }
+        stray_ready += serve_ready_due(&mut drivers, &ready, &due, &mut buf, start, &mut touched);
         reconnect_poisoned(&cfg, &mine, &mut drivers);
 
         // A2: after one park, service every due key (and ready sockets).
@@ -544,6 +538,11 @@ fn drive_a2(
         wakes as f64 / elapsed,
         mine.len()
     );
+    if stray_ready > 0 {
+        eprintln!(
+            "[bench-a2] stray_readiness={stray_ready} (index beyond driver table; never dispatched)"
+        );
+    }
     drivers
         .into_iter()
         .map(|driver| driver_stats(&cfg, driver))
@@ -694,30 +693,77 @@ fn next_poll_wait(cfg: &BenchConfig, drivers: &[Driver], start: Instant) -> Dura
     TIMER_TICK.min(min_wait)
 }
 
+/// Size (and clear) the per-poll served table to the current driver table.
+/// Reused across polls: no per-wake allocation proportional to connections.
+fn prepare_touched(touched: &mut Vec<bool>, drivers_len: usize) {
+    touched.clear();
+    touched.resize(drivers_len, false);
+}
+
+/// Record one readiness index as served against the current driver table.
+/// A token at or beyond the table is stale (registration uses the
+/// worker-local driver slot, so a valid token is always in range): report
+/// false so the caller counts it as stray instead of dispatching it to
+/// another session.
+fn mark_served(touched: &mut [bool], drivers_len: usize, idx: usize) -> bool {
+    if idx >= drivers_len || idx >= touched.len() {
+        return false;
+    }
+    touched[idx] = true;
+    true
+}
+
+/// Serve one A2 wake's ready + due driver indices against the reused served
+/// table. Indices beyond the table are counted as stray, never dispatched.
+fn serve_ready_due(
+    drivers: &mut [Driver],
+    ready: &[usize],
+    due: &[usize],
+    buf: &mut [u8],
+    start: Instant,
+    touched: &mut Vec<bool>,
+) -> u64 {
+    prepare_touched(touched, drivers.len());
+    let mut stray = 0u64;
+    for &idx in ready.iter().chain(due.iter()) {
+        if !mark_served(touched, drivers.len(), idx) {
+            stray += 1;
+            continue;
+        }
+        if let Some(driver) = drivers.get_mut(idx) {
+            receive_connected_datagrams(driver, idx, buf, start);
+        }
+    }
+    stray
+}
+
 fn receive_ready(
     cfg: &BenchConfig,
     drivers: &mut [Driver],
     events: &Events,
     buf: &mut [u8],
     start: Instant,
-) -> [bool; 4096] {
-    let mut touched = [false; 4096];
+    touched: &mut Vec<bool>,
+) -> u64 {
+    prepare_touched(touched, drivers.len());
+    let mut stray = 0u64;
     for event in events.iter() {
         let idx = event.token().0;
-        if idx >= touched.len() {
+        if !mark_served(touched, drivers.len(), idx) {
+            stray += 1;
             continue;
         }
         let Some(driver) = drivers.get_mut(idx) else {
+            stray += 1;
             continue;
         };
-        touched[idx] = true;
         if driver.peer.is_none() && cfg.mode == crate::Mode::Receiver {
             receive_first_datagram(driver, buf, start);
         } else {
             receive_connected_datagrams(driver, idx, buf, start);
         }
     }
-    touched
+    stray
 }
 
 fn receive_first_datagram(driver: &mut Driver, buf: &mut [u8], start: Instant) {
@@ -777,7 +823,7 @@ fn reconnect_poisoned(cfg: &BenchConfig, mine: &[usize], drivers: &mut [Driver])
 fn service_drivers(
     cfg: &BenchConfig,
     drivers: &mut [Driver],
-    touched: &[bool; 4096],
+    touched: &[bool],
     woke_from_timeout: bool,
     payload: &[u8],
     start: Instant,
@@ -948,6 +994,8 @@ fn drive(
     let payload = vec![0x42u8; crate::PAYLOAD_SIZE];
     let connect_deadline = Instant::now() + crate::CONNECT_TIMEOUT;
     let mut buf = [0u8; 2048];
+    let mut touched = Vec::new();
+    let mut stray_tokens: u64 = 0;
 
     loop {
         if !drivers.iter().any(|d| d.connected) && Instant::now() >= connect_deadline {
@@ -977,7 +1025,7 @@ fn drive(
             .ok();
         let woke_from_timeout = events.is_empty();
 
-        let touched = receive_ready(&cfg, &mut drivers, &events, &mut buf, start);
+        stray_tokens += receive_ready(&cfg, &mut drivers, &events, &mut buf, start, &mut touched);
         reconnect_poisoned(&cfg, &mine, &mut drivers);
 
         service_drivers(
@@ -987,6 +1035,11 @@ fn drive(
             woke_from_timeout,
             &payload,
             start,
+        );
+    }
+    if stray_tokens > 0 {
+        eprintln!(
+            "[bench-mio] stray_tokens={stray_tokens} (event token beyond driver table; never dispatched)"
         );
     }
 
@@ -2460,5 +2513,32 @@ mod bond_affinity_tests {
         assert!(shared_pool_can_stop(2, 2, true, false));
         assert!(shared_pool_can_stop(1, 2, true, true));
         assert!(!shared_pool_can_stop(2, 2, false, true));
+    }
+}
+
+#[cfg(test)]
+mod readiness_bookkeeping_tests {
+    use super::{mark_served, prepare_touched};
+
+    #[test]
+    fn served_table_covers_configured_range_past_old_ceiling() {
+        let mut touched = Vec::new();
+        prepare_touched(&mut touched, 5000);
+        assert_eq!(touched.len(), 5000);
+        // Former 4096 ceiling: these must be served, never silently skipped.
+        for idx in [0usize, 4095, 4096, 4999] {
+            assert!(
+                mark_served(&mut touched, 5000, idx),
+                "index {idx} must be served"
+            );
+        }
+        assert!(touched[4095] && touched[4096] && touched[4999]);
+        // Stale tokens beyond the table are reported, never dispatched.
+        assert!(!mark_served(&mut touched, 5000, 5000));
+        assert!(!mark_served(&mut touched, 5000, usize::MAX));
+        // Sender backfill growth extends the table.
+        prepare_touched(&mut touched, 6000);
+        assert_eq!(touched.len(), 6000);
+        assert!(mark_served(&mut touched, 6000, 5999));
     }
 }
