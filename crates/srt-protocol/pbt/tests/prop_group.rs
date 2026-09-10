@@ -48,6 +48,43 @@ fn drain(connection: &mut SrtConnection) -> Vec<Vec<u8>> {
     packets
 }
 
+/// P03/S02 interaction: an oversized shared payload must be the caller's
+/// error, not a group health event. Before this fix, `send_shared_internal`
+/// rejecting an oversized payload (added for P03) fed straight into
+/// `mark_send_failure` on every active member, which -- since the window is
+/// open -- scores `Broken` (permanent, no requalify path). One
+/// too-large `group.send` used to kill the group forever; it must instead
+/// return an error while every member stays `Active` and a normal-size send
+/// right after still reaches every leg.
+#[test]
+fn oversized_shared_payload_is_rejected_without_breaking_any_member() {
+    let (caller_a, _listener_a) = establish_pair(ConnectionOptions::default());
+    let (caller_b, _listener_b) = establish_pair(ConnectionOptions::default());
+    let limit = caller_a.effective_max_payload_size();
+    let mut group = SrtGroup::new(0x4000_0040, GroupMode::Broadcast).expect("group");
+    group.add_member(1, 1, caller_a).expect("first member");
+    group.add_member(2, 1, caller_b).expect("second member");
+
+    let oversized = vec![0xEE; limit + 1];
+    assert!(group.send(&oversized, ts(100_000)).is_err());
+    for member_id in [1u32, 2u32] {
+        assert_eq!(
+            group.member(member_id).expect("member").state(),
+            GroupMemberState::Active,
+            "member {member_id} must not be marked Broken by a rejected oversized payload"
+        );
+    }
+
+    let ok_payload = vec![0xEE; limit];
+    assert_eq!(
+        group
+            .send(&ok_payload, ts(100_001))
+            .expect("group still sends after the rejection"),
+        2,
+        "both members still send a normal-size payload"
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(32))]
 

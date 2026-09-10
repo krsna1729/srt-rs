@@ -601,7 +601,7 @@ proptest! {
 
         // 大きなデータを送信（複数パケットになる）
         let payload = vec![0xAB; payload_size];
-        caller.send(&payload, now).expect("送信は成功する想定");
+        caller.send_message(&payload, now).expect("送信は成功する想定");
         let packets = drain_packets(&mut caller);
 
         if packets.len() < 2 {
@@ -638,7 +638,7 @@ proptest! {
         establish_connection(&mut caller, &mut listener, &mut now);
 
         let payload = vec![0xCD; payload_size];
-        caller.send(&payload, now).expect("送信は成功する想定");
+        caller.send_message(&payload, now).expect("送信は成功する想定");
         let mut packets = drain_packets(&mut caller);
 
         if packets.len() < 2 {

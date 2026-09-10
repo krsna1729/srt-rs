@@ -1263,10 +1263,14 @@ fn test_large_data_transfer() {
     while caller.poll_event().is_some() {}
     while listener.poll_event().is_some() {}
 
-    // 2KB のデータを送信 (複数パケットに分割される可能性)
+    // 2KB のデータを送信 (複数パケットに分割される) -- send_message は
+    // 1 パケット分を超えるペイロードをフラグメント化する唯一の API
+    // (send は単一パケット専用で、上限を超えると拒否される)
     let test_data = vec![0xAB; 2000];
     let now = ts(100_000);
-    caller.send(&test_data, now).expect("send should succeed");
+    caller
+        .send_message(&test_data, now)
+        .expect("send should succeed");
 
     // パケット転送
     transfer_caller_to_listener(&mut caller, &mut listener, now);

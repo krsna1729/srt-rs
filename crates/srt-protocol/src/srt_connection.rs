@@ -1184,7 +1184,7 @@ impl SrtConnection {
         self.check_can_encrypt()?;
         let timestamp = self.relative_timestamp(now);
         let peer_socket_id = self.peer_socket_id;
-        let max_payload_size = self.max_payload_size;
+        let max_payload_size = self.effective_max_payload_size();
 
         let packets = {
             let sender = self
@@ -1227,6 +1227,11 @@ impl SrtConnection {
 
         self.check_explicit_sequence(sequence_number)?;
         self.check_can_encrypt()?;
+        if payload.len() > self.effective_max_payload_size() {
+            return Err(Error::invalid_state(
+                "payload exceeds the maximum single-packet size; use send_message to fragment it",
+            ));
+        }
 
         let timestamp = self.relative_timestamp(now);
         let peer_socket_id = self.peer_socket_id;
@@ -1286,6 +1291,11 @@ impl SrtConnection {
 
         self.check_explicit_sequence(sequence_number)?;
         self.check_can_encrypt()?;
+        if payload.len() > self.effective_max_payload_size() {
+            return Err(Error::invalid_state(
+                "payload exceeds the maximum single-packet size; use send_message to fragment it",
+            ));
+        }
 
         let timestamp = self.relative_timestamp(now);
         let peer_socket_id = self.peer_socket_id;
@@ -1357,6 +1367,29 @@ impl SrtConnection {
             ));
         }
         Ok(())
+    }
+
+    /// AEAD tag bytes GCM appends to every DATA packet on the wire, beyond
+    /// the SRT header and payload (P03: which layer each byte counts
+    /// against). CTR adds none. Control packets are never encrypted, so
+    /// this must not shrink `max_control_info_size`'s budget.
+    fn crypto_tag_overhead(&self) -> usize {
+        match self.crypto.as_deref() {
+            Some(crypto) if crypto.cipher_mode() == CipherMode::Gcm => GCM_TAG_LEN,
+            _ => 0,
+        }
+    }
+
+    /// Largest single DATA packet's application payload this connection can
+    /// put on the wire without exceeding its configured datagram budget
+    /// (`max_payload_size`, SRT header already excluded), accounting for
+    /// the current cipher's AEAD tag. `send_message` fragments at this
+    /// boundary; `send`/`send_owned`/`send_shared` (and their
+    /// explicit-sequence variants) reject a payload that exceeds it outright
+    /// rather than silently emitting an oversized packet (P03).
+    pub fn effective_max_payload_size(&self) -> usize {
+        self.max_payload_size
+            .saturating_sub(self.crypto_tag_overhead())
     }
 
     /// Return the next sequence number assigned by the connection.
@@ -3505,6 +3538,76 @@ mod tests {
         assert!(err.reason.contains("encryption"), "{}", err.reason);
         assert_eq!(caller.next_sequence_number(), Some(next));
         assert!(caller.poll_output().is_none());
+    }
+
+    /// P03: GCM's 16-byte tag is real wire overhead on top of the header
+    /// and payload; a payload chunked purely against the raw
+    /// `max_payload_size` budget (no cipher awareness) would put a packet
+    /// on the wire that overshoots the connection's own configured
+    /// datagram budget once encrypted. `effective_max_payload_size` must
+    /// already exclude it, for both the single-packet and fragmented paths.
+    #[test]
+    fn gcm_wire_packets_never_exceed_the_datagram_budget() {
+        let (mut caller, _listener) = connected_pair();
+        while caller.poll_output().is_some() {}
+        caller.crypto = Some(Box::new(
+            CryptoContext::new_sender(
+                "test_passphrase",
+                KeyLength::Aes128,
+                test_km_salt(),
+                &[0x24; 16],
+                CipherMode::Gcm,
+            )
+            .expect("valid sender crypto"),
+        ));
+
+        let limit = caller.effective_max_payload_size();
+        assert_eq!(
+            limit,
+            caller.max_payload_size - GCM_TAG_LEN,
+            "GCM must shrink the effective limit by exactly its tag"
+        );
+
+        // Exactly at the limit: the single-packet path accepts it, and the
+        // resulting wire packet stays within the raw datagram budget.
+        let payload = vec![0xEE; limit];
+        caller
+            .send(&payload, Timestamp::from_micros(300_000))
+            .expect("payload at the effective limit is accepted");
+        let ConnectionOutput::SendPacket(packet) = caller.poll_output().expect("one packet") else {
+            panic!("expected a data packet");
+        };
+        assert!(
+            packet.len() <= caller.max_payload_size + SRT_HEADER_SIZE,
+            "packet of {} bytes exceeds the {}-byte datagram budget",
+            packet.len(),
+            caller.max_payload_size + SRT_HEADER_SIZE
+        );
+
+        // One byte over: the single-packet path must reject outright, not
+        // silently emit an oversized datagram.
+        let oversized = vec![0xEE; limit + 1];
+        let err = caller
+            .send(&oversized, Timestamp::from_micros(300_001))
+            .expect_err("one byte over the effective limit is rejected");
+        assert!(err.reason.contains("exceeds"), "{}", err.reason);
+        assert!(caller.poll_output().is_none());
+
+        // Fragmented path: a message spanning several chunks plus a
+        // remainder must still keep every wire packet within budget.
+        caller
+            .send_message(&vec![0xEE; limit * 2 + 37], Timestamp::from_micros(300_002))
+            .expect("fragmented message is accepted");
+        let mut fragment_count = 0;
+        while let Some(ConnectionOutput::SendPacket(packet)) = caller.poll_output() {
+            assert!(
+                packet.len() <= caller.max_payload_size + SRT_HEADER_SIZE,
+                "fragment of {} bytes exceeds the datagram budget",
+                packet.len()
+            );
+            fragment_count += 1;
+        }
+        assert_eq!(fragment_count, 3, "two full chunks plus one remainder");
     }
 
     #[test]
