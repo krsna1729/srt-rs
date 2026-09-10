@@ -13,8 +13,20 @@ use crate::harness::{CONFIG_COLUMNS, Record, Spread, read_results};
 
 pub use crate::harness::CONFIG_COLUMNS as CELL_KEY_COLUMNS;
 
-type RepRecordPair<'a> = (Option<&'a Record>, Option<&'a Record>);
-type CellRepMap<'a> = BTreeMap<String, BTreeMap<String, RepRecordPair<'a>>>;
+/// One (cell, repetition, attempt) slot: at most one row per role. A second
+/// row for an already-filled role is ambiguous — the result file is
+/// append-only, so this means concatenated or re-recorded runs, not a
+/// superseding value. The first row wins and each extra row is counted in
+/// `duplicates` so consumers refuse the pair instead of silently picking a
+/// convenient row.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct RepSlot<'a> {
+    pub caller: Option<&'a Record>,
+    pub listener: Option<&'a Record>,
+    pub duplicates: usize,
+}
+
+type CellRepMap<'a> = BTreeMap<String, BTreeMap<String, RepSlot<'a>>>;
 
 /// Computed metrics for a single caller/listener pair in one rep.
 #[derive(Clone, Debug, Default)]
@@ -93,16 +105,43 @@ fn per_conn(val: f64, conns: f64) -> f64 {
     if conns > 0.0 { val / conns } else { val }
 }
 
+/// Three-state read of a numeric column: `Record::number` conflates "column
+/// absent" with "column present but unparsable", and those mean different
+/// things — a legacy row may lack a column (defer or default), but a present
+/// corrupt value must veto, never silently fall back to another role's data.
+/// Empty text counts as absent: TSV rows pad unused columns with empties.
+enum FieldRead {
+    Missing,
+    Invalid,
+    Valid(f64),
+}
+
+fn read_field(record: &Record, key: &str) -> FieldRead {
+    let Some(text) = record.get(key) else {
+        return FieldRead::Missing;
+    };
+    if text.trim().is_empty() {
+        return FieldRead::Missing;
+    }
+    match text.parse::<f64>() {
+        Ok(value) if value.is_finite() && value >= 0.0 => FieldRead::Valid(value),
+        _ => FieldRead::Invalid,
+    }
+}
+
 /// Required validity input for the clean predicate: present, finite, and a
-/// non-negative count. Missing, NaN/infinite, or negative values invalidate
-/// the whole pair (`None`) instead of defaulting to zero — a missing
-/// loss/error count is not evidence of zero loss, and a NaN poisons every
-/// comparison it touches (`NaN > 0.0` and `NaN < 99.0` are both false, so a
-/// fully-NaN row used to read as clean). Purely informational display fields
-/// (CPU, RSS, RTT, retransmit/loss-list breakdowns, backlog watermarks) keep
-/// their legacy zero default; everything the predicate reads is required.
+/// non-negative count. Missing or invalid values invalidate the whole pair
+/// (`None`) instead of defaulting to zero — a missing loss/error count is
+/// not evidence of zero loss, and a NaN poisons every comparison it touches
+/// (`NaN > 0.0` and `NaN < 99.0` are both false, so a fully-NaN row used to
+/// read as clean). Purely informational display fields (CPU, RSS, RTT,
+/// retransmit/loss-list breakdowns, backlog watermarks) keep their legacy
+/// zero default; everything the predicate reads is required.
 fn required_count(record: &Record, key: &str) -> Option<f64> {
-    record.number(key).filter(|v| v.is_finite() && *v >= 0.0)
+    match read_field(record, key) {
+        FieldRead::Valid(value) => Some(value),
+        FieldRead::Missing | FieldRead::Invalid => None,
+    }
 }
 
 /// Shared identity across both roles (conns, source_bps, secs): a side that
@@ -110,14 +149,39 @@ fn required_count(record: &Record, key: &str) -> Option<f64> {
 /// the column (legacy rows) defers to the other side. Listener wins when
 /// both sides are valid, matching the previous preference.
 fn required_identity(caller: &Record, listener: &Record, key: &str) -> Option<f64> {
-    match (caller.number(key), listener.number(key)) {
-        (Some(_), Some(_)) => {
-            let _ = required_count(caller, key)?;
-            required_count(listener, key)
-        }
-        (Some(_), None) => required_count(caller, key),
-        (None, Some(_)) => required_count(listener, key),
-        (None, None) => None,
+    match (read_field(caller, key), read_field(listener, key)) {
+        (FieldRead::Valid(_), FieldRead::Valid(value)) => Some(value),
+        (FieldRead::Valid(value), FieldRead::Missing) => Some(value),
+        (FieldRead::Missing, FieldRead::Valid(value)) => Some(value),
+        _ => None,
+    }
+}
+
+/// Positive shared count with legacy fallback (stream cardinalities): both
+/// sides missing falls back; any present value must be finite and positive
+/// or the pair is invalid — a corrupt stream count must not silently become
+/// `conns` and rewrite the workload denominator.
+fn positive_or(caller: &Record, listener: &Record, key: &str, fallback: f64) -> Option<f64> {
+    match (read_field(caller, key), read_field(listener, key)) {
+        (FieldRead::Valid(_), FieldRead::Valid(value)) if value > 0.0 => Some(value),
+        (FieldRead::Valid(value), FieldRead::Missing) if value > 0.0 => Some(value),
+        (FieldRead::Missing, FieldRead::Valid(value)) if value > 0.0 => Some(value),
+        (FieldRead::Missing, FieldRead::Missing) => Some(fallback),
+        _ => None,
+    }
+}
+
+/// Positive count read from a single role, with legacy fallback. Unlike
+/// `logical_streams` (meaningful on either side), `source_streams` is only
+/// ever populated by the traffic source: the harness always writes a
+/// listener's column as `0` because a listener has no source streams of its
+/// own, so that `0` is structural, not corrupt evidence, and must not veto
+/// the pair the way a caller-side NaN/negative/zero/malformed value does.
+fn positive_from(record: &Record, key: &str, fallback: f64) -> Option<f64> {
+    match read_field(record, key) {
+        FieldRead::Missing => Some(fallback),
+        FieldRead::Valid(value) if value > 0.0 => Some(value),
+        FieldRead::Valid(_) | FieldRead::Invalid => None,
     }
 }
 
@@ -133,15 +197,8 @@ impl PairMetrics {
         // the cell is bonded, where two legs carry one stream from one
         // source -- and using `conns` for all three made a perfect bonded
         // run look half-offered and half-established.
-        let logical_streams = listener
-            .number("logical_streams")
-            .or_else(|| caller.number("logical_streams"))
-            .filter(|streams| *streams > 0.0)
-            .unwrap_or(conns);
-        let source_streams = caller
-            .number("source_streams")
-            .filter(|streams| *streams > 0.0)
-            .unwrap_or(logical_streams);
+        let logical_streams = positive_or(caller, listener, "logical_streams", conns)?;
+        let source_streams = positive_from(caller, "source_streams", logical_streams)?;
 
         let caller_established = required_count(caller, "established")?;
         let listener_established = required_count(listener, "established")?;
@@ -342,6 +399,10 @@ pub struct CellSummary {
     pub key: String,
     pub pairs: usize,
     pub incomplete_reps: usize,
+    /// Extra same-role rows collapsed into ambiguous slots. Each ambiguous
+    /// slot counts once in `incomplete_reps` (one untrustworthy repetition);
+    /// this counts the surplus rows themselves for diagnosis.
+    pub duplicate_rows: usize,
     /// Physical connections. See [`PairMetrics`] for why three separate
     /// cardinalities exist.
     pub conns: f64,
@@ -373,24 +434,45 @@ pub struct CellSummary {
     pub is_clean: bool,
 }
 
-fn group_records_by_cell(records: &[Record]) -> CellRepMap<'_> {
+pub(crate) fn group_records_by_cell<'a, R>(records: &'a [R]) -> CellRepMap<'a>
+where
+    R: std::borrow::Borrow<Record>,
+{
     let mut by_cell: CellRepMap<'_> = BTreeMap::new();
-    for r in records {
+    for holder in records {
+        let r: &Record = holder.borrow();
         let key = cell_key(r);
         let rep = r.get("rep").unwrap_or("1");
         let attempt = r.get("attempt").unwrap_or_default();
         let rep = format!("{rep} attempt={attempt}");
         let slot = by_cell.entry(key).or_default().entry(rep).or_default();
         match r.get("role") {
-            Some("caller") => slot.0 = Some(r),
-            Some("listener") => slot.1 = Some(r),
+            Some("caller") => {
+                if slot.caller.is_some() {
+                    slot.duplicates += 1;
+                } else {
+                    slot.caller = Some(r);
+                }
+            }
+            Some("listener") => {
+                if slot.listener.is_some() {
+                    slot.duplicates += 1;
+                } else {
+                    slot.listener = Some(r);
+                }
+            }
             _ => {}
         }
     }
     by_cell
 }
 
-fn compute_cell_summary(key: String, pairs: &[PairMetrics], incomplete_reps: usize) -> CellSummary {
+fn compute_cell_summary(
+    key: String,
+    pairs: &[PairMetrics],
+    incomplete_reps: usize,
+    duplicate_rows: usize,
+) -> CellSummary {
     let n = pairs.len();
     let conns = pairs[0].conns;
     let source_bps = pairs[0].source_bps;
@@ -445,6 +527,7 @@ fn compute_cell_summary(key: String, pairs: &[PairMetrics], incomplete_reps: usi
         key,
         pairs: n,
         incomplete_reps,
+        duplicate_rows,
         conns,
         source_bps,
         source_streams,
@@ -472,7 +555,12 @@ fn compute_cell_summary(key: String, pairs: &[PairMetrics], incomplete_reps: usi
     }
 }
 
-fn compute_empty_summary(key: String, incomplete_reps: usize, sample: &Record) -> CellSummary {
+fn compute_empty_summary(
+    key: String,
+    incomplete_reps: usize,
+    duplicate_rows: usize,
+    sample: &Record,
+) -> CellSummary {
     let conns = sample.number("conns").unwrap_or(0.0);
     let source_bps = sample.number("source_bps").unwrap_or(0.0);
     let source_streams = sample
@@ -484,6 +572,7 @@ fn compute_empty_summary(key: String, incomplete_reps: usize, sample: &Record) -
         key,
         pairs: 0,
         incomplete_reps,
+        duplicate_rows,
         conns,
         source_bps,
         source_streams,
@@ -511,32 +600,50 @@ fn compute_empty_summary(key: String, incomplete_reps: usize, sample: &Record) -
     }
 }
 
+/// Classify one grouped slot into a usable pair or an incomplete rep. An
+/// ambiguous slot (duplicate role rows) counts once as incomplete — one
+/// untrustworthy repetition — while every surplus row is counted in
+/// `duplicate_rows` for diagnosis.
+fn summarize_slot(
+    slot: &RepSlot<'_>,
+    pairs: &mut Vec<PairMetrics>,
+    incomplete_reps: &mut usize,
+    duplicate_rows: &mut usize,
+) {
+    if slot.duplicates > 0 {
+        *incomplete_reps += 1;
+        *duplicate_rows += slot.duplicates;
+        return;
+    }
+    let (Some(caller), Some(listener)) = (slot.caller, slot.listener) else {
+        *incomplete_reps += 1;
+        return;
+    };
+    match PairMetrics::compute(caller, listener) {
+        Some(metrics) => pairs.push(metrics),
+        None => *incomplete_reps += 1,
+    }
+}
+
 pub fn summarize_cells(records: &[Record]) -> BTreeMap<String, CellSummary> {
     let by_cell = group_records_by_cell(records);
     let mut summaries = BTreeMap::new();
     for (key, reps) in by_cell {
         let mut pairs: Vec<PairMetrics> = Vec::new();
         let mut incomplete_reps = 0usize;
-        for (caller, listener) in reps.values() {
-            if let (Some(c), Some(l)) = (caller, listener) {
-                if let Some(m) = PairMetrics::compute(c, l) {
-                    pairs.push(m);
-                } else {
-                    incomplete_reps += 1;
-                }
-            } else {
-                incomplete_reps += 1;
-            }
+        let mut duplicate_rows = 0usize;
+        for slot in reps.values() {
+            summarize_slot(slot, &mut pairs, &mut incomplete_reps, &mut duplicate_rows);
         }
         if !pairs.is_empty() {
             summaries.insert(
                 key.clone(),
-                compute_cell_summary(key, &pairs, incomplete_reps),
+                compute_cell_summary(key, &pairs, incomplete_reps, duplicate_rows),
             );
-        } else if let Some(sample) = reps.values().find_map(|(c, l)| (*c).or(*l)) {
+        } else if let Some(sample) = reps.values().find_map(|slot| slot.caller.or(slot.listener)) {
             summaries.insert(
                 key.clone(),
-                compute_empty_summary(key, incomplete_reps, sample),
+                compute_empty_summary(key, incomplete_reps, duplicate_rows, sample),
             );
         }
     }
@@ -1178,9 +1285,9 @@ pub fn check_clean_file(path: &Path) -> Result<String, String> {
     let mut failures = Vec::new();
 
     for (cell, reps) in &by_cell {
-        for (rep, pair) in reps {
+        for (rep, slot) in reps {
             total += 1;
-            if let Some((is_incomplete, message)) = pair_failure(cell, rep, *pair) {
+            if let Some((is_incomplete, message)) = pair_failure(cell, rep, slot) {
                 incomplete += usize::from(is_incomplete);
                 unclean += usize::from(!is_incomplete);
                 failures.push(message);
@@ -1208,12 +1315,17 @@ pub fn check_clean_file(path: &Path) -> Result<String, String> {
     ))
 }
 
-fn pair_failure(
-    cell: &str,
-    rep: &str,
-    (caller, listener): RepRecordPair<'_>,
-) -> Option<(bool, String)> {
-    let (caller, listener) = match (caller, listener) {
+fn pair_failure(cell: &str, rep: &str, slot: &RepSlot<'_>) -> Option<(bool, String)> {
+    if slot.duplicates > 0 {
+        return Some((
+            true,
+            format!(
+                "INCOMPLETE: cell=[{cell}] rep={rep}: {} duplicate role rows, ambiguous",
+                slot.duplicates
+            ),
+        ));
+    }
+    let (caller, listener) = match (slot.caller, slot.listener) {
         (Some(caller), Some(listener)) => (caller, listener),
         (Some(_), None) => {
             return Some((
@@ -2017,6 +2129,85 @@ mod tests {
         assert!(!metrics.is_clean());
     }
 
+    /// Present-but-corrupt shared values veto fallback: a garbage identity
+    /// or stream count on one role must invalidate the pair even when the
+    /// other role is valid. Only a missing column (legacy rows) defers.
+    #[test]
+    fn corrupt_shared_values_veto_fallback() {
+        let clean_caller = || {
+            make_test_caller(
+                "1", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "0", "10",
+                "0",
+            )
+        };
+        let clean_listener = || {
+            make_test_listener(
+                "1", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "0", "10",
+                "0",
+            )
+        };
+        // Malformed identity on one side vetoes the other's valid value.
+        let mut bad = clean_caller();
+        set_test_field(&mut bad, "source_bps", "garbage");
+        assert!(PairMetrics::compute(&bad, &clean_listener()).is_none());
+        // Corrupt stream counts must not silently become `conns`.
+        let mut bad = clean_listener();
+        set_test_field(&mut bad, "logical_streams", "NaN");
+        assert!(PairMetrics::compute(&clean_caller(), &bad).is_none());
+        let mut bad = clean_caller();
+        set_test_field(&mut bad, "source_streams", "lots");
+        assert!(PairMetrics::compute(&bad, &clean_listener()).is_none());
+        let mut bad = clean_caller();
+        set_test_field(&mut bad, "source_streams", "0");
+        assert!(PairMetrics::compute(&bad, &clean_listener()).is_none());
+        // Absent on both sides still falls back to `conns` (legacy rows).
+        let metrics =
+            PairMetrics::compute(&clean_caller(), &clean_listener()).expect("legacy fallback");
+        assert_eq!(metrics.logical_streams, 10.0);
+        assert_eq!(metrics.source_streams, 10.0);
+    }
+
+    /// The harness always writes a listener's `source_streams` column as
+    /// `0` (a listener has no source streams of its own); only the caller's
+    /// value is meaningful. A real, valid caller-sourced pair must not be
+    /// vetoed just because the listener's structural `0` looks like a
+    /// corrupt shared count under the wrong (two-role) predicate.
+    #[test]
+    fn listener_structural_zero_source_streams_does_not_veto() {
+        let mut caller = make_test_caller(
+            "1", "600", "50000", "8", "22800", "100.0", "100.0", "1000", "0", "0", "0", "600", "0",
+        );
+        set_test_field(&mut caller, "source_streams", "600");
+        let mut listener = make_test_listener(
+            "1", "600", "50000", "8", "22800", "100.0", "100.0", "1000", "0", "0", "0", "600", "0",
+        );
+        set_test_field(&mut listener, "logical_streams", "600");
+        set_test_field(&mut listener, "source_streams", "0");
+        let metrics = PairMetrics::compute(&caller, &listener).expect("listener's 0 is structural");
+        assert_eq!(metrics.source_streams, 600.0);
+    }
+
+    /// One ambiguous slot counts once as incomplete, while every surplus
+    /// row is counted separately for diagnosis.
+    #[test]
+    fn duplicate_rows_count_once_as_incomplete() {
+        let c1 = make_test_caller(
+            "1", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "0", "10", "0",
+        );
+        let c2 = c1.clone();
+        let c3 = c1.clone();
+        let l = make_test_listener(
+            "1", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "0", "10", "0",
+        );
+        let summaries = summarize_cells(&[c1, c2, c3, l]);
+        assert_eq!(summaries.len(), 1);
+        let summary = summaries.values().next().unwrap();
+        assert_eq!(summary.pairs, 0);
+        assert_eq!(summary.incomplete_reps, 1);
+        assert_eq!(summary.duplicate_rows, 2);
+        assert!(!summary.is_clean);
+    }
+
     /// E01 end-to-end: corrupt rows fail the gate file-wide, not just in
     /// `compute` unit tests.
     #[test]
@@ -2046,6 +2237,11 @@ mod tests {
                 set(&mut row, "src_overflow", "0");
                 set(&mut row, "datapath_q_dropped", "0");
                 set(&mut row, "local_dropped", "0");
+                // The real harness always writes a measured (positive) stream
+                // count; a literal "0" here would now (correctly) veto as
+                // corrupt evidence rather than legacy-fallback to `conns`.
+                set(&mut row, "logical_streams", "10");
+                set(&mut row, "source_streams", "10");
                 for (r, col, val) in overrides {
                     if *r == role {
                         set(&mut row, col, val);
@@ -2058,7 +2254,11 @@ mod tests {
 
         let clean_path = dir.join("valid.tsv");
         std::fs::write(&clean_path, rows(&[])).unwrap();
-        assert!(check_clean_file(&clean_path).is_ok());
+        assert!(
+            check_clean_file(&clean_path).is_ok(),
+            "{:?}",
+            check_clean_file(&clean_path)
+        );
 
         let nan_path = dir.join("nan.tsv");
         std::fs::write(&nan_path, rows(&[("listener", "torn_down", "NaN")])).unwrap();
