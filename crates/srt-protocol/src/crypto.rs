@@ -739,9 +739,9 @@ impl CryptoContext {
     /// Force `current_key`'s cipher schedule out, without going through the
     /// KM wire path that is the only real way to reach this state (a peer's
     /// KM refresh unwrapping to a key of the wrong length -- see
-    /// `update_sek`). Exists to let callers outside this module exercise
+    /// `update_sek`). Exists to let `srt_connection`'s own tests exercise
     /// `can_encrypt_current_key()` returning false deterministically.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     pub(crate) fn drop_current_key_schedule_for_test(&mut self) {
         match self.current_key {
             KeyFlag::Even => {
