@@ -1429,60 +1429,37 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// Cached CTR schedule matches fresh key setup, byte for byte.
+    /// Cached CTR schedule matches fresh key setup, byte for byte, across key
+    /// lengths, payload sizes and sequence values including wrap-adjacent
+    /// indices. This deterministic equivalence is the correctness gate for the
+    /// schedule cache. Per-packet cost of the cached production path is tracked
+    /// by `benches/core_packet_loop.rs` (`bench_encrypted*`); no production
+    /// path performs per-packet fresh key expansion (schedules are built once
+    /// per SEK install), so no timing assertion lives in unit tests.
     #[test]
     fn ctr_key_cache_matches_uncached() {
-        let sek: Vec<u8> = (1..=16u8).collect();
         let salt: [u8; 16] = std::array::from_fn(|i| (i as u8).wrapping_add(0xA0));
-        let payload = vec![0x5Au8; 1316];
-        let mut ctx =
-            CryptoContext::new_sender("passphrase", KeyLength::Aes128, salt, &sek, CipherMode::Ctr)
-                .unwrap();
-        for packet_seq in [0u32, 1, 7, 1023] {
-            let mut uncached = payload.clone();
-            encrypt_payload_ctr(&sek, &salt, packet_seq, &mut uncached, KeyLength::Aes128).unwrap();
-            let mut cached = payload.clone();
-            ctx.encrypt(packet_seq, &mut cached).unwrap();
-            assert_eq!(cached, uncached, "packet {packet_seq} diverged");
+        for key_length in [KeyLength::Aes128, KeyLength::Aes192, KeyLength::Aes256] {
+            let sek: Vec<u8> = (1..=key_length.len() as u8)
+                .map(|b| b.wrapping_mul(7))
+                .collect();
+            let mut ctx =
+                CryptoContext::new_sender("passphrase", key_length, salt, &sek, CipherMode::Ctr)
+                    .unwrap();
+            for size in [0usize, 1, 1316] {
+                let payload = vec![0x5Au8; size];
+                for packet_seq in [0u32, 1, 7, 1023, u32::MAX - 1, u32::MAX] {
+                    let mut uncached = payload.clone();
+                    encrypt_payload_ctr(&sek, &salt, packet_seq, &mut uncached, key_length)
+                        .unwrap();
+                    let mut cached = payload.clone();
+                    ctx.encrypt(packet_seq, &mut cached).unwrap();
+                    assert_eq!(
+                        cached, uncached,
+                        "{key_length:?}/size {size}/packet {packet_seq} diverged"
+                    );
+                }
+            }
         }
-    }
-
-    /// Diagnostic microbench: fresh key setup vs cached schedule.
-    /// `#[ignore]` so scheduler noise never gates correctness CI; the
-    /// criterion suite (`core_packet_loop bench_encrypted*`) is the gate.
-    #[test]
-    #[ignore = "timing diagnostic; run explicitly, not in CI"]
-    fn ctr_key_cache_cost() {
-        use std::hint::black_box;
-        use std::time::Instant;
-
-        let sek: Vec<u8> = (1..=16u8).collect();
-        let salt: [u8; 16] = std::array::from_fn(|i| (i as u8).wrapping_add(0xA0));
-        let payload = vec![0x5Au8; 1316];
-        let iters = 50_000u32;
-
-        let mut buf = payload.clone();
-        let t0 = Instant::now();
-        for i in 0..iters {
-            encrypt_payload_ctr(&sek, &salt, i, &mut buf, KeyLength::Aes128).unwrap();
-            black_box(&buf);
-        }
-        let uncached_ns = t0.elapsed().as_nanos() as f64 / f64::from(iters);
-
-        let mut ctx =
-            CryptoContext::new_sender("passphrase", KeyLength::Aes128, salt, &sek, CipherMode::Ctr)
-                .unwrap();
-        buf.copy_from_slice(&payload);
-        let t1 = Instant::now();
-        for i in 0..iters {
-            ctx.encrypt(i, &mut buf).unwrap();
-            black_box(&buf);
-        }
-        let cached_ns = t1.elapsed().as_nanos() as f64 / f64::from(iters);
-
-        eprintln!(
-            "ctr_key_cache_cost: uncached={uncached_ns:.1}ns/pkt cached={cached_ns:.1}ns/pkt ratio={:.2}",
-            uncached_ns / cached_ns
-        );
     }
 }
