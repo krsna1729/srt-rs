@@ -1369,27 +1369,22 @@ impl SrtConnection {
         Ok(())
     }
 
-    /// AEAD tag bytes GCM appends to every DATA packet on the wire, beyond
-    /// the SRT header and payload (P03: which layer each byte counts
-    /// against). CTR adds none. Control packets are never encrypted, so
-    /// this must not shrink `max_control_info_size`'s budget.
-    fn crypto_tag_overhead(&self) -> usize {
-        match self.crypto.as_deref() {
-            Some(crypto) if crypto.cipher_mode() == CipherMode::Gcm => GCM_TAG_LEN,
-            _ => 0,
-        }
-    }
-
     /// Largest single DATA packet's application payload this connection can
     /// put on the wire without exceeding its configured datagram budget
     /// (`max_payload_size`, SRT header already excluded), accounting for
-    /// the current cipher's AEAD tag. `send_message` fragments at this
+    /// the current cipher's AEAD tag (GCM appends `GCM_TAG_LEN`; CTR and no
+    /// encryption add nothing -- control packets are never encrypted, so
+    /// this must not shrink `max_control_info_size`'s budget, which stays
+    /// on the raw `max_payload_size`). `send_message` fragments at this
     /// boundary; `send`/`send_owned`/`send_shared` (and their
     /// explicit-sequence variants) reject a payload that exceeds it outright
     /// rather than silently emitting an oversized packet (P03).
     pub fn effective_max_payload_size(&self) -> usize {
-        self.max_payload_size
-            .saturating_sub(self.crypto_tag_overhead())
+        let tag_overhead = match self.crypto.as_deref() {
+            Some(crypto) if crypto.cipher_mode() == CipherMode::Gcm => GCM_TAG_LEN,
+            _ => 0,
+        };
+        self.max_payload_size.saturating_sub(tag_overhead)
     }
 
     /// Return the next sequence number assigned by the connection.
@@ -1589,20 +1584,6 @@ impl SrtConnection {
             .as_mut()
             .ok_or_else(|| Error::crypto_error("encryption not enabled"))?;
         crypto.set_encrypted_packet_count_for_test(count);
-        Ok(())
-    }
-
-    /// Force the current key's cipher schedule out, reproducing (without a
-    /// full KM wire exchange) the one realistic way `can_encrypt_current_key`
-    /// becomes false in production: see `CryptoContext::update_sek`'s doc
-    /// comment for the malformed-wrapped-key path that can leave it that way.
-    #[cfg(feature = "test-support")]
-    pub fn drop_current_key_schedule_for_test(&mut self) -> Result<(), Error> {
-        let crypto = self
-            .crypto
-            .as_mut()
-            .ok_or_else(|| Error::crypto_error("encryption not enabled"))?;
-        crypto.drop_current_key_schedule_for_test();
         Ok(())
     }
 
@@ -3302,16 +3283,7 @@ mod tests {
 
     /// Drive a full caller/listener handshake to `Connected` on both ends,
     /// for tests that only care about post-handshake send behavior.
-    fn connected_pair() -> (SrtConnection, SrtConnection) {
-        let mut caller = SrtConnection::new_caller(ConnectionOptions {
-            socket_id: 1,
-            ..ConnectionOptions::default()
-        });
-        let mut listener = SrtConnection::new_listener(ConnectionOptions {
-            socket_id: 2,
-            syn_cookie: Some(7),
-            ..ConnectionOptions::default()
-        });
+    fn drive_handshake_to_connected(caller: &mut SrtConnection, listener: &mut SrtConnection) {
         caller
             .connect(Timestamp::from_micros(0))
             .expect("caller starts");
@@ -3335,6 +3307,20 @@ mod tests {
         }
         assert_eq!(caller.state(), ConnectionState::Connected);
         assert_eq!(listener.state(), ConnectionState::Connected);
+    }
+
+    /// Default-options caller/listener pair, already `Connected`.
+    fn connected_pair() -> (SrtConnection, SrtConnection) {
+        let mut caller = SrtConnection::new_caller(ConnectionOptions {
+            socket_id: 1,
+            ..ConnectionOptions::default()
+        });
+        let mut listener = SrtConnection::new_listener(ConnectionOptions {
+            socket_id: 2,
+            syn_cookie: Some(7),
+            ..ConnectionOptions::default()
+        });
+        drive_handshake_to_connected(&mut caller, &mut listener);
         (caller, listener)
     }
 
@@ -3365,29 +3351,7 @@ mod tests {
             crypto_sek: Some(sek),
             ..ConnectionOptions::default()
         });
-        caller
-            .connect(Timestamp::from_micros(0))
-            .expect("caller starts");
-        for round in 0..4 {
-            let now = Timestamp::from_micros(round * 10_000);
-            while let Some(ConnectionOutput::SendPacket(packet)) = caller.poll_output() {
-                listener
-                    .feed_recv_buf(&packet, now)
-                    .expect("listener accepts packet");
-            }
-            while let Some(ConnectionOutput::SendPacket(packet)) = listener.poll_output() {
-                caller
-                    .feed_recv_buf(&packet, now)
-                    .expect("caller accepts packet");
-            }
-            if caller.state() == ConnectionState::Connected
-                && listener.state() == ConnectionState::Connected
-            {
-                break;
-            }
-        }
-        assert_eq!(caller.state(), ConnectionState::Connected);
-        assert_eq!(listener.state(), ConnectionState::Connected);
+        drive_handshake_to_connected(&mut caller, &mut listener);
         assert!(caller.crypto.is_some(), "caller established a live context");
         assert!(
             listener.crypto.is_some(),
