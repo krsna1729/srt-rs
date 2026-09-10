@@ -582,6 +582,21 @@ impl CryptoContext {
         self.cipher_mode
     }
 
+    /// Whether `encrypt`/`encrypt_gcm_detached` would succeed for
+    /// `current_key()` right now. The only realistic way either can fail is
+    /// a not-yet-cached schedule for the current key flag (e.g. mid
+    /// rotation, before the new key's cipher is installed) — the IV/nonce
+    /// construction is infallible and a live packet payload never
+    /// approaches AES-GCM's length limit. Checking this before committing
+    /// any sender state turns that failure into an ordinary pre-admission
+    /// rejection instead of a partially-admitted send.
+    pub fn can_encrypt_current_key(&self) -> bool {
+        match self.cipher_mode {
+            CipherMode::Ctr => self.cached_ctr(self.current_key).is_ok(),
+            CipherMode::Gcm => self.cached_gcm(self.current_key).is_ok(),
+        }
+    }
+
     /// Get the SEK, wrapped for a KM message.
     pub fn wrap_sek(&self, key_flag: KeyFlag) -> Result<Vec<u8>, Error> {
         let sek = match key_flag {
@@ -721,6 +736,25 @@ impl CryptoContext {
         self.encrypted_packet_count = count;
     }
 
+    /// Force `current_key`'s cipher schedule out, without going through the
+    /// KM wire path that is the only real way to reach this state (a peer's
+    /// KM refresh unwrapping to a key of the wrong length -- see
+    /// `update_sek`). Exists to let callers outside this module exercise
+    /// `can_encrypt_current_key()` returning false deterministically.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn drop_current_key_schedule_for_test(&mut self) {
+        match self.current_key {
+            KeyFlag::Even => {
+                self.ctr_even = None;
+                self.gcm_even = None;
+            }
+            KeyFlag::Odd => {
+                self.ctr_odd = None;
+                self.gcm_odd = None;
+            }
+        }
+    }
+
     /// Whether a key switch is needed (2^25 packets).
     pub fn should_switch_key(&self) -> bool {
         self.km_refresh_state == KmRefreshState::PreAnnounce
@@ -755,11 +789,17 @@ impl CryptoContext {
         target.clear();
         target.extend_from_slice(new_sek);
 
+        // Commit the rotation-in-progress flags only after both fallible
+        // steps succeed (S02): `next_key`/`km_refresh_state` reaching
+        // `PreAnnounce` is itself what later lets `switch_key` (called
+        // unconditionally once the packet count threshold is reached,
+        // validating nothing) advance `current_key` onto this flag. Both
+        // calls read only already-written state, so this reordering changes
+        // nothing on the success path.
+        self.rebuild_cipher_cache()?;
+        let wrapped_sek = self.wrap_sek(new_key_flag)?;
         self.next_key = Some(new_key_flag);
         self.km_refresh_state = KmRefreshState::PreAnnounce;
-        self.rebuild_cipher_cache()?;
-
-        let wrapped_sek = self.wrap_sek(new_key_flag)?;
         Ok((new_key_flag, wrapped_sek))
     }
 
@@ -794,6 +834,18 @@ impl CryptoContext {
     /// Update the SEK from a received KM message.
     pub fn update_sek(&mut self, wrapped_sek: &[u8], key_flag: KeyFlag) -> Result<(), Error> {
         let sek = unwrap_sek(&self.kek, wrapped_sek, self.key_length)?;
+        // `unwrap_sek`'s output length tracks the wire-supplied wrapped
+        // blob's length, not `self.key_length` -- AES-KW only requires a
+        // multiple of 8 bytes, so a peer's wrapped key of the wrong length
+        // unwraps without error. Reject it here, before it ever reaches the
+        // slot below: `rebuild_cipher_cache` catching the same mismatch
+        // later is too late, since by then the slot is already overwritten
+        // with the bad bytes and stays that way even though this call
+        // returns `Err` (S02 -- the same "commit before the fallible check"
+        // pattern the send paths had).
+        if sek.len() != self.key_length.len() {
+            return Err(Error::crypto_error("invalid SEK length"));
+        }
         if sek.iter().all(|byte| *byte == 0) {
             return Err(Error::crypto_error("unwrapped SEK must not be all zero"));
         }
@@ -805,8 +857,15 @@ impl CryptoContext {
         target.zeroize();
         *target = sek;
 
-        self.current_key = key_flag;
+        // Rebuild before committing `current_key`: `rebuild_cipher_cache`
+        // does not read `current_key` (it rebuilds both flags from the
+        // SEKs unconditionally), so this reordering changes nothing on the
+        // success path. On failure (e.g. an unwrapped SEK whose cipher
+        // mode/length combination this build doesn't support), it leaves
+        // `current_key` on the previously-working flag instead of
+        // advancing to one with no cached schedule at all (S02).
         self.rebuild_cipher_cache()?;
+        self.current_key = key_flag;
         Ok(())
     }
 }
@@ -1367,6 +1426,87 @@ mod tests {
             CipherMode::Gcm,
         );
         assert!(result.is_err());
+    }
+
+    /// S02: a peer's KM refresh carrying a wrapped key of the wrong length
+    /// unwraps fine (AES-KW only requires a multiple of 8 bytes) but then
+    /// fails to build a cipher schedule for it. `update_sek` must not have
+    /// already committed `current_key` to that broken flag by the time it
+    /// discovers that -- the working key stays current and encryptable.
+    #[test]
+    fn update_sek_rejects_wrong_length_key_without_advancing_current_key() {
+        let passphrase = "passphrase";
+        let salt = [0x42; 16];
+        let good_sek = [0x24; 16];
+        let mut crypto = CryptoContext::new_sender(
+            passphrase,
+            KeyLength::Aes128,
+            salt,
+            &good_sek,
+            CipherMode::Ctr,
+        )
+        .expect("valid sender context");
+        let starting_key = crypto.current_key();
+        assert!(crypto.can_encrypt_current_key());
+
+        let kek = derive_kek(passphrase, &salt, KeyLength::Aes128);
+        // A 24-byte plaintext wraps to a 32-byte blob -- valid AES-KW, but
+        // the wrong length for this context's Aes128 (16-byte) schedule.
+        let wrong_length_wrapped =
+            wrap_sek(&kek, &[0x11; 24], KeyLength::Aes128).expect("valid AES-KW wrap");
+
+        let error = crypto
+            .update_sek(&wrong_length_wrapped, starting_key.other())
+            .expect_err("wrong-length key must be rejected");
+        assert!(error.reason.contains("invalid SEK"), "{}", error.reason);
+        assert_eq!(
+            crypto.current_key(),
+            starting_key,
+            "a rejected update must not advance current_key onto an uncached flag"
+        );
+        assert!(
+            crypto.can_encrypt_current_key(),
+            "the original working key must remain usable"
+        );
+        assert!(
+            crypto.sek_odd.iter().all(|b| *b == 0),
+            "the untouched slot must not have been poisoned with the wrong-length bytes"
+        );
+    }
+
+    /// S02: `start_pre_announce` must not commit the rotation as
+    /// in-progress (`next_key`/`km_refresh_state`) before its own fallible
+    /// steps succeed. The new key here is itself valid (start_pre_announce
+    /// already validates its length/non-zero up front); the failure comes
+    /// from `rebuild_cipher_cache` rebuilding *both* flags unconditionally,
+    /// so a corrupted currently-active SEK (simulated directly -- no
+    /// production path leaves this state now that `update_sek` validates
+    /// length before writing) still fails the call, and that failure must
+    /// not leave rotation looking like it started.
+    #[test]
+    fn start_pre_announce_does_not_commit_rotation_state_on_cache_rebuild_failure() {
+        let mut crypto = CryptoContext::new_sender(
+            "passphrase",
+            KeyLength::Aes128,
+            [0x11; 16],
+            &[0x22; 16],
+            CipherMode::Ctr,
+        )
+        .expect("valid sender context");
+        assert!(crypto.next_key.is_none());
+        assert_eq!(crypto.km_refresh_state, KmRefreshState::Idle);
+
+        crypto.sek_even = vec![0x11; 4]; // wrong length for Aes128 (16 bytes)
+
+        let error = crypto
+            .start_pre_announce(&[0x33; 16])
+            .expect_err("rebuild fails on the corrupted active key");
+        assert!(error.reason.contains("invalid SEK"), "{}", error.reason);
+        assert!(
+            crypto.next_key.is_none(),
+            "rotation must not appear in-progress after a failed pre-announce"
+        );
+        assert_eq!(crypto.km_refresh_state, KmRefreshState::Idle);
     }
 
     #[test]

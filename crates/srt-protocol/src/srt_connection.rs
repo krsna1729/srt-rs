@@ -969,14 +969,36 @@ impl SrtConnection {
     /// packets' `sent_time` is no longer updated).
     pub fn process_retransmit(&mut self, now: Timestamp) {
         let dest_socket_id = self.peer_socket_id;
+        // `pop_retransmit` already retires each sequence from the loss list
+        // (S02: it does not go back in on an encrypt failure here). Losing
+        // that failure silently would make this the one place an ongoing
+        // key-schedule problem is indistinguishable from ordinary network
+        // loss -- log it so it is observable, without inventing a new
+        // retry/requeue policy (that is P01's bounded retransmission work,
+        // not this card's). A broken schedule can affect the whole queued
+        // loss list in one call, so summarize once per drain (first
+        // sequence + count) instead of once per record.
+        let mut dropped = 0u32;
+        let mut first_dropped_seq = None;
         while let Some((header, payload)) = self
             .sender
             .as_mut()
             .and_then(|s| s.pop_retransmit(dest_socket_id))
         {
-            if let Ok(buf) = self.encrypt_to_wire(&header, &payload) {
-                self.queue_packet(buf, now);
+            match self.encrypt_to_wire(&header, &payload) {
+                Ok(buf) => self.queue_packet(buf, now),
+                Err(_) => {
+                    dropped += 1;
+                    first_dropped_seq.get_or_insert(header.sequence_number);
+                }
             }
+        }
+        if dropped > 0 {
+            tracing::error!(
+                dropped,
+                first_seq = first_dropped_seq,
+                "retransmit(s) dropped: packet could not be re-encrypted"
+            );
         }
     }
 
@@ -1159,6 +1181,7 @@ impl SrtConnection {
         if !self.can_send() {
             return Err(Error::invalid_state("send buffer full"));
         }
+        self.check_can_encrypt()?;
         let timestamp = self.relative_timestamp(now);
         let peer_socket_id = self.peer_socket_id;
         let max_payload_size = self.max_payload_size;
@@ -1203,6 +1226,7 @@ impl SrtConnection {
         }
 
         self.check_explicit_sequence(sequence_number)?;
+        self.check_can_encrypt()?;
 
         let timestamp = self.relative_timestamp(now);
         let peer_socket_id = self.peer_socket_id;
@@ -1261,6 +1285,7 @@ impl SrtConnection {
         }
 
         self.check_explicit_sequence(sequence_number)?;
+        self.check_can_encrypt()?;
 
         let timestamp = self.relative_timestamp(now);
         let peer_socket_id = self.peer_socket_id;
@@ -1288,7 +1313,9 @@ impl SrtConnection {
                 false,
                 "push_shared rejected a send after can_send/sequence were already validated"
             );
-            return Err(Error::invalid_state("send buffer full"));
+            return Err(Error::invalid_state(
+                "internal invariant violated: push_shared rejected an already-validated send",
+            ));
         };
         let buf = self.encrypt_to_wire(&header, &payload)?;
         self.queue_packet(buf, now);
@@ -1309,6 +1336,25 @@ impl SrtConnection {
             && self.next_sequence_number() != Some(sequence_number)
         {
             return Err(Error::invalid_state("sequence number is out of order"));
+        }
+        Ok(())
+    }
+
+    /// Reject a send before it reaches the sender buffer if encryption
+    /// under the current key would fail (S02: the buffer already commits
+    /// the packet -- sequence advance, retained payload, retransmit
+    /// eligibility -- before `encrypt_to_wire` runs; a mid-rotation key
+    /// gap must not become an accepted-then-silently-failed send that a
+    /// plain `Err` return can't distinguish from an outright rejection).
+    fn check_can_encrypt(&self) -> Result<(), Error> {
+        if self
+            .crypto
+            .as_ref()
+            .is_some_and(|crypto| !crypto.can_encrypt_current_key())
+        {
+            return Err(Error::invalid_state(
+                "encryption key schedule not ready for current key",
+            ));
         }
         Ok(())
     }
@@ -1510,6 +1556,20 @@ impl SrtConnection {
             .as_mut()
             .ok_or_else(|| Error::crypto_error("encryption not enabled"))?;
         crypto.set_encrypted_packet_count_for_test(count);
+        Ok(())
+    }
+
+    /// Force the current key's cipher schedule out, reproducing (without a
+    /// full KM wire exchange) the one realistic way `can_encrypt_current_key`
+    /// becomes false in production: see `CryptoContext::update_sek`'s doc
+    /// comment for the malformed-wrapped-key path that can leave it that way.
+    #[cfg(feature = "test-support")]
+    pub fn drop_current_key_schedule_for_test(&mut self) -> Result<(), Error> {
+        let crypto = self
+            .crypto
+            .as_mut()
+            .ok_or_else(|| Error::crypto_error("encryption not enabled"))?;
+        crypto.drop_current_key_schedule_for_test();
         Ok(())
     }
 
@@ -3319,6 +3379,69 @@ mod tests {
             caller.poll_output(),
             Some(ConnectionOutput::SendPacket(_))
         ));
+    }
+
+    /// S02: `send`/`send_message`/`send_shared` must reject a packet before
+    /// touching sender state if it cannot actually be encrypted, rather
+    /// than advancing the sequence and retaining a fragment for
+    /// retransmission and only then discovering `encrypt_to_wire` fails.
+    /// `drop_current_key_schedule_for_test` reproduces the one realistic
+    /// way this happens in production (see `update_sek`'s doc comment)
+    /// without driving a full KM wire exchange to a malformed wrapped key.
+    #[test]
+    fn send_is_rejected_before_admission_when_current_key_cannot_encrypt() {
+        let (mut caller, _listener) = connected_pair();
+        while caller.poll_output().is_some() {}
+        caller.crypto = Some(Box::new(
+            CryptoContext::new_sender(
+                "test_passphrase",
+                KeyLength::Aes128,
+                test_km_salt(),
+                &[0x24; 16],
+                CipherMode::Ctr,
+            )
+            .expect("valid sender crypto"),
+        ));
+        caller
+            .crypto
+            .as_mut()
+            .unwrap()
+            .drop_current_key_schedule_for_test();
+
+        let next = caller.next_sequence_number().expect("connected sender");
+
+        let err = caller
+            .send(b"single packet", Timestamp::from_micros(200_000))
+            .expect_err("send is rejected, not partially admitted");
+        assert!(err.reason.contains("encryption"), "{}", err.reason);
+        assert_eq!(caller.next_sequence_number(), Some(next));
+        assert!(caller.poll_output().is_none());
+
+        // Must exceed effective_max_payload_size (1484 bytes here, plain
+        // CTR) so push_message would actually produce multiple fragments
+        // -- otherwise this proves nothing beyond the single-packet case
+        // above.
+        let multi_fragment_payload = vec![0xAA; caller.effective_max_payload_size() * 2 + 37];
+        let err = caller
+            .send_message(&multi_fragment_payload, Timestamp::from_micros(200_001))
+            .expect_err("fragmented message is rejected before any fragment is admitted");
+        assert!(err.reason.contains("encryption"), "{}", err.reason);
+        assert_eq!(
+            caller.next_sequence_number(),
+            Some(next),
+            "no fragment consumed a sequence number"
+        );
+        assert!(caller.poll_output().is_none());
+
+        let err = caller
+            .send_shared(
+                Bytes::from_static(b"shared"),
+                Timestamp::from_micros(200_002),
+            )
+            .expect_err("shared send is rejected before admission");
+        assert!(err.reason.contains("encryption"), "{}", err.reason);
+        assert_eq!(caller.next_sequence_number(), Some(next));
+        assert!(caller.poll_output().is_none());
     }
 
     #[test]
