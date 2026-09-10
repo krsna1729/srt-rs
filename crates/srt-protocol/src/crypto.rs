@@ -1509,6 +1509,75 @@ mod tests {
         assert_eq!(crypto.km_refresh_state, KmRefreshState::Idle);
     }
 
+    /// S06 (revalidation, not a fix): `#[derive(Debug)]` would print raw
+    /// key/salt bytes; the manual `Debug` impl must redact them instead.
+    /// Checks the actual formatted output, not just that the impl exists.
+    #[test]
+    fn debug_output_redacts_key_material() {
+        let salt = [0x11u8; 16];
+        let sek = [0x22u8; 16];
+        let crypto =
+            CryptoContext::new_sender("passphrase", KeyLength::Aes128, salt, &sek, CipherMode::Ctr)
+                .expect("valid sender context");
+        let debug = format!("{crypto:?}");
+        assert!(debug.contains("[REDACTED]"));
+        // The bytes above never appear as decimal in an unrelated field
+        // (encrypted_packet_count is 0, current_key/key_length/cipher_mode
+        // are short enums) -- so their presence would only come from a key
+        // field slipping through unredacted.
+        assert!(
+            !debug.contains("17, 17, 17"),
+            "salt byte 0x11 leaked: {debug}"
+        );
+        assert!(
+            !debug.contains("34, 34, 34"),
+            "sek byte 0x22 leaked: {debug}"
+        );
+    }
+
+    /// S06 (revalidation, not a fix): once the old key is decommissioned,
+    /// its SEK bytes are actually zeroed in place (`fill(0)`, not merely
+    /// dropped) -- checked directly since the field is still allocated, not
+    /// freed, so this isn't the freed-memory read the card rules out.
+    #[test]
+    fn decommission_old_key_zeroizes_the_retired_sek() {
+        let salt = [0xAAu8; 16];
+        let mut crypto = CryptoContext::new_sender(
+            "passphrase",
+            KeyLength::Aes128,
+            salt,
+            &[0x33; 16],
+            CipherMode::Ctr,
+        )
+        .expect("valid sender context");
+        assert_eq!(crypto.current_key(), KeyFlag::Even);
+        assert!(
+            crypto.sek_odd.iter().all(|b| *b == 0),
+            "unused odd slot starts zero"
+        );
+
+        crypto
+            .start_pre_announce(&[0x44; 16])
+            .expect("valid new key");
+        assert!(
+            crypto.sek_odd.iter().any(|b| *b != 0),
+            "the new odd key is now live"
+        );
+        crypto.switch_key();
+        assert_eq!(crypto.current_key(), KeyFlag::Odd);
+
+        crypto.decommission_old_key();
+        assert!(
+            crypto.sek_even.iter().all(|b| *b == 0),
+            "the retired even key must be zeroed, not merely superseded"
+        );
+        assert!(crypto.ctr_even.is_none(), "retired schedule is dropped too");
+        assert!(
+            crypto.can_encrypt_current_key(),
+            "the new key remains usable"
+        );
+    }
+
     #[test]
     fn gcm_context_encrypt_decrypt() {
         let salt = [0xABu8; 16];
