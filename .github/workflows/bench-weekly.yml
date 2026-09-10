@@ -37,9 +37,20 @@ jobs:
       # workflow meant for trend comparison across weeks, not just this
       # week's snapshot.
       - name: Run throughput-matrix.plan in full (time-boxed, 3h budget)
+        id: sweep-throughput
         run: |
+          # NB: `status=0; ... || status=$?` — GitHub runs steps under
+          # `bash -e`, so a bare failing command would kill the script
+          # before a later `status=$?` is reached.
+          status=0
           timeout 3h ./target/release/srt-bench matrix --plan docs/plans/throughput-matrix.plan \
-            --reps 1 --out throughput.tsv || true
+            --reps 1 --out throughput.tsv || status=$?
+          if [ $status -eq 124 ]; then
+            echo "partial=true" >> "$GITHUB_OUTPUT"
+            echo "TIME-BOXED: throughput sweep hit the 3h budget; throughput.tsv is partial data."
+          elif [ $status -ne 0 ]; then
+            exit $status
+          fi
       # full-matrix.plan is the exhaustive investigation tool (raw product
       # 4,423,680; see the enumeration pin test for the current kept count),
       # not something any realistic budget finishes in one pass. Given the
@@ -49,11 +60,19 @@ jobs:
       # (`--order interleaved` already rotates the broad axes within one
       # run so even a partial slice stays broadly representative).
       - name: Run full-matrix.plan slice (time-boxed, remaining budget)
+        id: sweep-slice
         run: |
           week_seed=$(date +%V)
           echo "seed=$week_seed"
-          timeout 2h30m ./target/release/srt-bench matrix --plan docs/plans/full-matrix.plan \
-            --order interleaved --seed "$week_seed" --reps 1 --out full-matrix-slice.tsv || true
+          status=0
+          timeout 150m ./target/release/srt-bench matrix --plan docs/plans/full-matrix.plan \
+            --order interleaved --seed "$week_seed" --reps 1 --out full-matrix-slice.tsv || status=$?
+          if [ $status -eq 124 ]; then
+            echo "partial=true" >> "$GITHUB_OUTPUT"
+            echo "TIME-BOXED: slice hit its budget; full-matrix-slice.tsv is partial data."
+          elif [ $status -ne 0 ]; then
+            exit $status
+          fi
       - name: Report
         if: always()
         run: |
@@ -90,7 +109,10 @@ jobs:
         if: always()
         run: ./target/release/srt-bench report throughput.tsv --format github-benchmark --out weekly-benchmark.json
       - name: Update GitHub Pages trend chart
-        if: always()
+        # throughput.tsv specifically is the week-over-week comparable series:
+        # a partial (time-boxed) campaign keeps its artifact but never moves
+        # the trend.
+        if: always() && steps.sweep-throughput.outcome == 'success' && steps.sweep-throughput.outputs.partial != 'true'
         uses: benchmark-action/github-action-benchmark@v1.22.1
         with:
           tool: "customBiggerIsBetter"

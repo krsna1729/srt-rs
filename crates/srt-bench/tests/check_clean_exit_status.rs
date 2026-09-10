@@ -72,3 +72,55 @@ fn nan_loss_count_fails_the_gate() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("FAIL"));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A campaign killed mid-attempt keeps partial rows but exits nonzero:
+/// the file is incomplete, never clean.
+#[test]
+fn torn_attempt_fails_the_gate() {
+    use srt_bench::harness::COLUMNS;
+    let dir =
+        std::env::temp_dir().join(format!("srt-bench-check-clean-torn-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("torn.tsv");
+    let set = |row: &mut [String], col: &str, val: &str| {
+        if let Some(pos) = COLUMNS.iter().position(|&c| c == col) {
+            row[pos] = val.to_string();
+        }
+    };
+    let pair = |role: &str, attempt: &str| -> String {
+        let mut row = vec!["0".to_string(); COLUMNS.len()];
+        set(&mut row, "runtime", "mio");
+        set(&mut row, "role", role);
+        set(&mut row, "rep", "1");
+        set(&mut row, "attempt", attempt);
+        set(&mut row, "conns", "10");
+        set(&mut row, "source_bps", "1000000");
+        set(&mut row, "secs", "10");
+        set(&mut row, "established", "10");
+        set(&mut row, "torn_down", "0");
+        set(&mut row, "core_total", "9499");
+        set(&mut row, "udp_rcvbuf_err", "0");
+        set(&mut row, "src_overflow", "0");
+        set(&mut row, "datapath_q_dropped", "0");
+        set(&mut row, "local_dropped", "0");
+        row.join("\t")
+    };
+    std::fs::write(
+        &path,
+        format!(
+            "{}\n{}\n{}\n{}\n",
+            COLUMNS.join("\t"),
+            pair("caller", "attempt-a"),
+            pair("listener", "attempt-a"),
+            pair("caller", "attempt-b"),
+        ),
+    )
+    .unwrap();
+    let output = Command::new(BENCH_EXE)
+        .args(["check-clean", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("INCOMPLETE"));
+    let _ = std::fs::remove_dir_all(&dir);
+}

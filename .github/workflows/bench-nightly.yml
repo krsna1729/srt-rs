@@ -67,18 +67,32 @@ jobs:
           done
       # The real nightly sweep: full throughput-matrix.plan (1536 cells,
       # documented), not axis-trimmed -- budgeted 5h leaving 1h margin in
-      # the 6h ceiling for setup and the report/upload steps. `|| true`
-      # because a `timeout` kill is an expected, not exceptional, outcome
-      # here: whatever's in nightly.tsv by then is still a real, useful
-      # partial data point, appended to (not overwritten by) the small
-      # plans above.
+      # the 6h ceiling for setup and the report/upload steps. `timeout`
+      # exit 124 is the EXPECTED time-box outcome, not a failure: whatever
+      # is in nightly.tsv by then is still a real, useful partial data
+      # point, appended to (not overwritten by) the small plans above. Any
+      # other non-zero status is a crash and fails the job. A partial
+      # campaign keeps its artifact but must not update trend charts (only
+      # complete comparable campaigns chart).
       - name: Run throughput-matrix.plan (time-boxed)
+        id: sweep
         run: |
+          # NB: `status=0; ... || status=$?` instead of running timeout bare:
+          # GitHub executes `run:` steps under `bash -e`, so a bare failing
+          # command would kill the script before `status=$?` is reached.
+          status=0
           timeout 5h ./target/release/srt-bench matrix --plan docs/plans/throughput-matrix.plan \
-            --reps 1 --out nightly.tsv || true
+            --reps 1 --out nightly.tsv || status=$?
+          if [ $status -eq 124 ]; then
+            echo "partial=true" >> "$GITHUB_OUTPUT"
+            echo "TIME-BOXED: sweep hit the 5h budget; nightly.tsv is partial data."
+          elif [ $status -ne 0 ]; then
+            exit $status
+          fi
       - name: Report
         if: always()
         run: |
+          if [ "${{ steps.sweep.outputs.partial }}" = "true" ]; then echo "## status: PARTIAL (time-boxed, not a complete campaign)"; echo; fi
           echo "## rows so far: $(($(wc -l < nightly.tsv) - 1))"
           echo
           echo "## median by runtime"
@@ -104,7 +118,9 @@ jobs:
         if: always()
         run: ./target/release/srt-bench report nightly.tsv --format github-benchmark --out nightly-benchmark.json
       - name: Update GitHub Pages trend chart
-        if: always()
+        # Partial (time-boxed) campaigns keep their TSV artifact above but
+        # never move the trend: the chart compares complete campaigns only.
+        if: always() && steps.sweep.outcome == 'success' && steps.sweep.outputs.partial != 'true'
         uses: benchmark-action/github-action-benchmark@v1.22.1
         with:
           tool: "customBiggerIsBetter"

@@ -2275,4 +2275,56 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// E03: a campaign killed mid-attempt keeps its partial rows, but the
+    /// campaign is incomplete, not clean. Attempt A completed; attempt B
+    /// died after its caller row.
+    #[test]
+    fn test_check_clean_file_torn_attempt_is_incomplete() {
+        let dir = std::env::temp_dir().join(format!("check_clean_torn_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let header = crate::harness::COLUMNS.join("\t");
+        let set = |row: &mut [String], col: &str, val: &str| {
+            if let Some(pos) = crate::harness::COLUMNS.iter().position(|&c| c == col) {
+                row[pos] = val.to_string();
+            }
+        };
+        let pair = |role: &str, attempt: &str| -> String {
+            let mut row = vec!["0".to_string(); crate::harness::COLUMNS.len()];
+            set(&mut row, "runtime", "mio");
+            set(&mut row, "role", role);
+            set(&mut row, "rep", "1");
+            set(&mut row, "attempt", attempt);
+            set(&mut row, "conns", "10");
+            set(&mut row, "source_bps", "1000000");
+            set(&mut row, "secs", "10");
+            set(&mut row, "established", "10");
+            set(&mut row, "torn_down", "0");
+            set(&mut row, "core_total", "9499");
+            set(&mut row, "udp_rcvbuf_err", "0");
+            set(&mut row, "src_overflow", "0");
+            set(&mut row, "datapath_q_dropped", "0");
+            set(&mut row, "local_dropped", "0");
+            row.join("\t")
+        };
+        let path = dir.join("torn.tsv");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}\n{}\n{}\n",
+                header,
+                pair("caller", "attempt-a"),
+                pair("listener", "attempt-a"),
+                pair("caller", "attempt-b"),
+            ),
+        )
+        .unwrap();
+        let res = check_clean_file(&path);
+        assert!(res.is_err(), "torn attempt must fail the gate");
+        let err = res.unwrap_err();
+        assert!(err.contains("INCOMPLETE"), "got: {err}");
+        assert!(err.contains("missing listener row"), "got: {err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
