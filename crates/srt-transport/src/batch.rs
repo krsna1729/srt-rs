@@ -24,6 +24,7 @@ pub struct RecvBatch {
     bufs: Vec<Vec<u8>>,
     sizes: Vec<usize>,
     addrs: Vec<Option<SocketAddr>>,
+    truncated: Vec<bool>,
 }
 
 impl RecvBatch {
@@ -45,6 +46,7 @@ impl RecvBatch {
             bufs: (0..datagrams).map(|_| vec![0u8; buf_len]).collect(),
             sizes: vec![0; datagrams],
             addrs: vec![None; datagrams],
+            truncated: vec![false; datagrams],
         }
     }
 
@@ -55,17 +57,28 @@ impl RecvBatch {
 
     /// One `recvmmsg`. Returns the datagrams received; `0` is `WouldBlock`.
     pub fn recv(&mut self, fd: RawFd) -> io::Result<usize> {
-        recvmsg_batch(fd, &mut self.bufs, &mut self.sizes, &mut self.addrs)
+        recvmsg_batch(
+            fd,
+            &mut self.bufs,
+            &mut self.sizes,
+            &mut self.addrs,
+            &mut self.truncated,
+        )
     }
 
-    /// Payloads of the first `n` datagrams from the last [`Self::recv`].
-    pub fn iter(&self, n: usize) -> impl Iterator<Item = (Option<SocketAddr>, &[u8])> {
+    /// Entries of the first `n` datagrams from the last [`Self::recv`]:
+    /// sender, the (always in-bounds) received bytes, and whether the
+    /// kernel reported `MSG_TRUNC` for that datagram (T01) -- a `true`
+    /// entry's bytes are only the datagram's leading prefix, never a
+    /// complete packet, and callers must not feed it to the protocol.
+    pub fn iter(&self, n: usize) -> impl Iterator<Item = (Option<SocketAddr>, &[u8], bool)> {
         self.bufs
             .iter()
             .zip(self.sizes.iter())
             .zip(self.addrs.iter())
+            .zip(self.truncated.iter())
             .take(n.min(self.bufs.len()))
-            .map(|((buf, size), addr)| (*addr, &buf[..*size]))
+            .map(|(((buf, size), addr), truncated)| (*addr, &buf[..*size], *truncated))
     }
 }
 
@@ -121,6 +134,9 @@ pub struct RecvDrainReport {
     pub datagrams: usize,
     pub syscalls: usize,
     pub would_block: bool,
+    /// Datagrams the kernel reported as `MSG_TRUNC`, excluded from
+    /// `datagrams` and never fed to the protocol (T01).
+    pub truncated: usize,
 }
 
 /// Result of offering a destined batch to `sendmmsg`.
@@ -141,6 +157,9 @@ pub struct BatchIoStats {
     pub recv_datagrams: u64,
     pub recv_syscalls: u64,
     pub recv_would_block: u64,
+    /// Datagrams discarded as `MSG_TRUNC` (T01): oversized for the
+    /// receive buffer, so their bytes were never a complete packet.
+    pub recv_truncated: u64,
     pub send_visits: u64,
     pub send_packets: u64,
     pub send_syscalls: u64,
@@ -152,6 +171,7 @@ impl BatchIoStats {
         self.recv_wakes = self.recv_wakes.saturating_add(1);
         self.recv_datagrams = self.recv_datagrams.saturating_add(report.datagrams as u64);
         self.recv_syscalls = self.recv_syscalls.saturating_add(report.syscalls as u64);
+        self.recv_truncated = self.recv_truncated.saturating_add(report.truncated as u64);
         if report.would_block {
             self.recv_would_block = self.recv_would_block.saturating_add(1);
         }
@@ -218,7 +238,11 @@ pub fn drain_recv_fd(
             break;
         }
         report.syscalls += 1;
-        for (addr, data) in batch.iter(received) {
+        for (addr, data, truncated) in batch.iter(received) {
+            if truncated {
+                report.truncated += 1;
+                continue;
+            }
             on_datagram(addr, data);
             report.datagrams += 1;
         }
@@ -575,11 +599,13 @@ mod tests {
             datagrams: 8,
             syscalls: 2,
             would_block: true,
+            truncated: 0,
         });
         stats.record_recv(RecvDrainReport {
             datagrams: 4,
             syscalls: 1,
             would_block: false,
+            truncated: 0,
         });
         assert_eq!(stats.datagrams_per_wake(), 6.0);
         assert_eq!(stats.datagrams_per_syscall(), 4.0);

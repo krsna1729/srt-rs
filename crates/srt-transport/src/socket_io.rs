@@ -153,14 +153,24 @@ pub fn bind_reuseport(port: u16, sock_buf_bytes: usize) -> std::io::Result<net::
 
 /// Batched receive for a bound UDP socket: up to `bufs.len()` datagrams in
 /// one `recvmmsg` syscall. Returns count received; `addrs[i]` holds each
-/// sender, `sizes[i]` the length. Buffers are hoisted by the caller and
-/// reused -- zero per-call allocation. One syscall for up to `bufs.len()`
-/// datagrams vs one per datagram with a plain `recv_from` loop.
+/// sender, `sizes[i]` the length actually copied into `bufs[i]` (always
+/// `<= bufs[i].capacity()`), `truncated[i]` whether the kernel reports
+/// `MSG_TRUNC` -- for UDP, `recvmmsg` reports the *true* datagram length
+/// in `msg_len` even when it exceeds the supplied buffer (Linux
+/// `recvmsg(2)`: "the full length of the packet or datagram is returned,
+/// even when it was longer than the passed buffer"), so `sizes[i]` is
+/// clamped here rather than trusted directly -- an unclamped `msg_len`
+/// used as a slice bound on `bufs[i]` would panic on an oversized
+/// datagram (T01). A caller must not treat a truncated entry's (clamped,
+/// incomplete) bytes as a complete datagram. Buffers are hoisted by the
+/// caller and reused -- zero per-call allocation. One syscall for up to
+/// `bufs.len()` datagrams vs one per datagram with a plain `recv_from` loop.
 pub fn recvmsg_batch(
     fd: std::os::fd::RawFd,
     bufs: &mut [Vec<u8>],
     sizes: &mut [usize],
     addrs: &mut [Option<net::SocketAddr>],
+    truncated: &mut [bool],
 ) -> std::io::Result<usize> {
     use std::cell::RefCell;
     thread_local! {
@@ -217,14 +227,15 @@ pub fn recvmsg_batch(
             });
         }
     }
-    if bufs.len() != sizes.len() || bufs.len() != addrs.len() {
+    if bufs.len() != sizes.len() || bufs.len() != addrs.len() || bufs.len() != truncated.len() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
-                "recvmsg_batch slice lengths differ: bufs={}, sizes={}, addrs={}",
+                "recvmsg_batch slice lengths differ: bufs={}, sizes={}, addrs={}, truncated={}",
                 bufs.len(),
                 sizes.len(),
-                addrs.len()
+                addrs.len(),
+                truncated.len()
             ),
         ));
     }
@@ -298,7 +309,12 @@ pub fn recvmsg_batch(
             // SAFETY: this entry was filled for a successfully received
             // datagram. The helper also validates family and returned length.
             addrs[i] = unsafe { sockaddr_to_addr(&storage_addrs[i], msgs[i].msg_hdr.msg_namelen) };
-            sizes[i] = msgs[i].msg_len as usize;
+            // `msg_len` is the *true* datagram length for UDP, which can
+            // exceed the buffer when MSG_TRUNC is set -- clamp before this
+            // is ever used as a slice bound (T01).
+            let buf_capacity = bufs[i].len();
+            sizes[i] = (msgs[i].msg_len as usize).min(buf_capacity);
+            truncated[i] = msgs[i].msg_hdr.msg_flags & libc::MSG_TRUNC != 0;
         }
         Ok(received as usize)
     })
@@ -519,7 +535,10 @@ mod tests {
 
     #[test]
     fn recvmsg_batch_empty_is_noop() {
-        assert_eq!(recvmsg_batch(-1, &mut [], &mut [], &mut []).unwrap(), 0);
+        assert_eq!(
+            recvmsg_batch(-1, &mut [], &mut [], &mut [], &mut []).unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -527,7 +546,8 @@ mod tests {
         let mut bufs = vec![vec![0u8; 64]];
         let mut sizes = [0usize; 2];
         let mut addrs = [None; 1];
-        let err = recvmsg_batch(-1, &mut bufs, &mut sizes, &mut addrs).unwrap_err();
+        let mut truncated = [false; 1];
+        let err = recvmsg_batch(-1, &mut bufs, &mut sizes, &mut addrs, &mut truncated).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 
@@ -671,5 +691,72 @@ mod tests {
             let n = receiver.recv(&mut buf).expect("recv");
             assert_eq!(&buf[..n], expected);
         }
+    }
+
+    /// T01: an oversized datagram must never become a truncated-prefix
+    /// "complete packet", must not panic (the pre-fix code sliced
+    /// `&buf[..msg_len]` using the kernel's *true* datagram length, which
+    /// for UDP can exceed the buffer -- an out-of-bounds slice), and must
+    /// not prevent a normal-sized sibling in the same batch from being
+    /// received correctly.
+    #[test]
+    fn oversized_datagram_is_truncated_flagged_not_panicking_and_does_not_lose_its_sibling() {
+        use std::os::fd::AsRawFd;
+        let receiver = net::UdpSocket::bind("127.0.0.1:0").expect("bind receiver");
+        receiver
+            .set_nonblocking(true)
+            .expect("nonblocking receiver");
+        let dest = receiver.local_addr().expect("receiver addr");
+        let sender = net::UdpSocket::bind("127.0.0.1:0").expect("bind sender");
+        sender.set_nonblocking(true).expect("nonblocking sender");
+
+        const BUF_LEN: usize = 16;
+        let oversized_payload = vec![0xEEu8; BUF_LEN * 4];
+        let valid_payload = b"sibling datagram";
+        assert!(valid_payload.len() <= BUF_LEN);
+        sender
+            .send_to(&oversized_payload, dest)
+            .expect("send oversized");
+        sender
+            .send_to(valid_payload, dest)
+            .expect("send valid sibling");
+
+        let mut bufs: Vec<Vec<u8>> = (0..2).map(|_| Vec::with_capacity(BUF_LEN)).collect();
+        let mut sizes = [0usize; 2];
+        let mut addrs = [None; 2];
+        let mut truncated = [false; 2];
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut received = 0;
+        while received < 2 && std::time::Instant::now() < deadline {
+            match recvmsg_batch(
+                receiver.as_raw_fd(),
+                &mut bufs[received..],
+                &mut sizes[received..],
+                &mut addrs[received..],
+                &mut truncated[received..],
+            ) {
+                Ok(0) => std::thread::yield_now(),
+                Ok(n) => received += n,
+                Err(error) => panic!("recvmmsg failed: {error}"),
+            }
+        }
+        assert_eq!(received, 2, "both datagrams must be observed by the kernel");
+
+        assert!(
+            truncated[0],
+            "the oversized datagram must be flagged MSG_TRUNC"
+        );
+        assert!(
+            sizes[0] <= BUF_LEN,
+            "a truncated size must never exceed the buffer capacity (no OOB slice)"
+        );
+
+        assert!(
+            !truncated[1],
+            "the normal-sized sibling must not be flagged truncated"
+        );
+        assert_eq!(sizes[1], valid_payload.len());
+        assert_eq!(&bufs[1][..sizes[1]], valid_payload);
     }
 }
