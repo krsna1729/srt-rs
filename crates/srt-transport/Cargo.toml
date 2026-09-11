@@ -9,7 +9,7 @@ description = "Layered SRT session, admission, and runtime-specific UDP transpor
 readme = "README.md"
 homepage = "https://github.com/krsna1729/srt-rs"
 repository = "https://github.com/krsna1729/srt-rs"
-include = ["/src/**", "/tests/**", "/benches/**", "LICENSE", "README.md"]
+include = ["/src/**", "/tests/**", "/benches/**", "/examples/**", "LICENSE", "README.md"]
 
 [dependencies]
 shiguredo_srt = { version = "=2026.1.0-canary.1", path = "../srt-protocol" }
@@ -30,7 +30,7 @@ getrandom = "0.4"
 zeroize = "1.8"
 
 # Runtime-specific dependencies (optional, feature-gated)
-mio = { version = "1", features = ["net"], optional = true }
+mio = { version = "1", features = ["os-poll", "net"], optional = true }
 tokio = { version = "1", features = ["net", "time", "rt"], optional = true }
 smol = { version = "2", optional = true }
 futures-lite = { version = "2", optional = true }
@@ -46,6 +46,10 @@ compio = { version = "0.19", features = ["io", "io-uring", "net", "runtime", "ti
 [dev-dependencies]
 criterion = "0.8"
 proptest = "1.11"
+
+[[example]]
+name = "mio_owner_echo"
+required-features = ["mio"]
 
 [[bench]]
 name = "admission_hardening"
