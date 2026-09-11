@@ -1,9 +1,10 @@
 use crate::{
     BatchIoStats, GroupBuildError, GroupCallerLeg, GroupConnectionLeg, GroupConnectionStats,
     GroupDriveReport, GroupLegDriveReport, GroupLogicalCounters, HighResWaiter, ManualTimerStore,
-    MonotonicDeadline, OutputDrainBudget, OutputDrainReport, OutputDrainStatus, RecvBatch,
-    RecvBudget, RecvDrainReport, collect_output_work, drain_connected_outputs, drain_output_work,
-    group_connection_stats, prepend_outputs, schedule_wait_micros, sendmsg_connected_batch,
+    MonotonicDeadline, OutputDrainBudget, OutputDrainReport, OutputDrainStatus, PacedSendOutcome,
+    RecvBatch, RecvBudget, RecvDrainReport, collect_output_work, drain_connected_outputs,
+    drain_output_work, group_connection_stats, prepend_outputs, schedule_wait_micros,
+    sendmsg_connected_batch,
 };
 use shiguredo_srt::{
     Bytes, ConnectionEvent, ConnectionOutput, GroupMode, SrtConnection, Timestamp,
@@ -175,31 +176,38 @@ impl Conn {
         }
     }
 
-    /// Send one paced packet.
-    pub async fn send_paced(&mut self, payload: &[u8], now: Timestamp) -> Result<(), ()> {
+    /// Send one paced packet. See [`PacedSendOutcome`] for what each
+    /// outcome means to the caller (S03).
+    pub async fn send_paced(&mut self, payload: &[u8], now: Timestamp) -> PacedSendOutcome {
         if self.has_pending_outputs() || !self.conn.can_send_with_pacing(now) {
-            return Err(());
+            return PacedSendOutcome::NotDue;
         }
-        self.conn.send(payload, now).map_err(|_| ())?;
-        let report = self.drain_outputs(now).await.map_err(|_| ())?;
-        (report.status == OutputDrainStatus::Drained)
-            .then_some(())
-            .ok_or(())
+        if let Err(error) = self.conn.send(payload, now) {
+            return PacedSendOutcome::Rejected(error);
+        }
+        match self.drain_outputs(now).await {
+            Ok(report) if report.status == OutputDrainStatus::Drained => PacedSendOutcome::Sent,
+            Ok(_) => PacedSendOutcome::Accepted,
+            Err(error) => PacedSendOutcome::DriverError(error),
+        }
     }
 
-    /// Send one paced shared-payload packet (fan-out path).
-    ///
-    /// Success means the application payload was accepted into SRT. Output
-    /// drain is best-effort afterward: returning `Err` after a successful
-    /// `send_shared` would make bus callers `push_front` and duplicate the
-    /// same application payload on the next attempt.
-    pub async fn send_shared_paced(&mut self, payload: Bytes, now: Timestamp) -> Result<(), ()> {
+    /// Send one paced shared-payload packet (fan-out path). Once accepted,
+    /// the payload is retained by the protocol regardless of drain outcome
+    /// -- a future bus caller must not resend it as new data on
+    /// `DriverError`/`Accepted`, only on `NotDue`/`Rejected` (S02/S03).
+    pub async fn send_shared_paced(&mut self, payload: Bytes, now: Timestamp) -> PacedSendOutcome {
         if self.has_pending_outputs() || !self.conn.can_send_with_pacing(now) {
-            return Err(());
+            return PacedSendOutcome::NotDue;
         }
-        self.conn.send_shared(payload, now).map_err(|_| ())?;
-        let _ = self.drain_outputs(now).await;
-        Ok(())
+        if let Err(error) = self.conn.send_shared(payload, now) {
+            return PacedSendOutcome::Rejected(error);
+        }
+        match self.drain_outputs(now).await {
+            Ok(report) if report.status == OutputDrainStatus::Drained => PacedSendOutcome::Sent,
+            Ok(_) => PacedSendOutcome::Accepted,
+            Err(error) => PacedSendOutcome::DriverError(error),
+        }
     }
 
     /// Full event-loop tick: fire timers, recv, drain, send paced.
@@ -216,7 +224,7 @@ impl Conn {
 
         let mut sent = 0u64;
         if drained.status == OutputDrainStatus::Drained {
-            while self.send_paced(payload, now).await.is_ok() {
+            while matches!(self.send_paced(payload, now).await, PacedSendOutcome::Sent) {
                 sent += 1;
             }
         }
@@ -613,19 +621,113 @@ mod tests {
             assert!(conn.has_pending_outputs());
 
             assert!(
-                conn.send_paced(b"payload", Timestamp::from_micros(0))
-                    .await
-                    .is_err(),
+                matches!(
+                    conn.send_paced(b"payload", Timestamp::from_micros(0)).await,
+                    PacedSendOutcome::NotDue
+                ),
                 "send_paced admitted a packet while output was still queued"
             );
             assert!(
-                conn.send_shared_paced(Bytes::from_static(b"payload"), Timestamp::from_micros(0))
-                    .await
-                    .is_err(),
+                matches!(
+                    conn.send_shared_paced(
+                        Bytes::from_static(b"payload"),
+                        Timestamp::from_micros(0)
+                    )
+                    .await,
+                    PacedSendOutcome::NotDue
+                ),
                 "send_shared_paced admitted a packet while output was still queued"
             );
 
             let _ = peer.local_addr();
+        });
+    }
+
+    /// Drive a caller/listener pair to `Connected` using pure protocol
+    /// calls (no socket I/O needed for the handshake itself).
+    fn connected_caller() -> SrtConnection {
+        let mut caller = SrtConnection::new_caller(shiguredo_srt::ConnectionOptions {
+            socket_id: 1,
+            ..Default::default()
+        });
+        let mut listener = SrtConnection::new_listener(shiguredo_srt::ConnectionOptions {
+            socket_id: 2,
+            syn_cookie: Some(7),
+            ..Default::default()
+        });
+        caller
+            .connect(Timestamp::from_micros(0))
+            .expect("caller starts");
+        for round in 0..4 {
+            let now = Timestamp::from_micros(round * 10_000);
+            while let Some(ConnectionOutput::SendPacket(packet)) = caller.poll_output() {
+                listener
+                    .feed_recv_buf(&packet, now)
+                    .expect("listener accepts packet");
+            }
+            while let Some(ConnectionOutput::SendPacket(packet)) = listener.poll_output() {
+                caller
+                    .feed_recv_buf(&packet, now)
+                    .expect("caller accepts packet");
+            }
+            if caller.state() == shiguredo_srt::ConnectionState::Connected {
+                break;
+            }
+        }
+        assert_eq!(caller.state(), shiguredo_srt::ConnectionState::Connected);
+        caller
+    }
+
+    /// S03: `send_paced` must surface a pre-admission protocol rejection
+    /// (P03's payload-size limit, here) as `Rejected`, not the old opaque
+    /// `Err(())` -- and must not touch sender state or queue any output
+    /// for a rejected payload.
+    #[test]
+    fn send_paced_surfaces_a_protocol_rejection_as_rejected() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("Tokio runtime builds");
+        runtime.block_on(async {
+            let peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("peer binds");
+            let local = std::net::UdpSocket::bind("127.0.0.1:0").expect("local binds");
+            local
+                .connect(peer.local_addr().expect("peer address"))
+                .expect("local connects to peer");
+            local.set_nonblocking(true).expect("local is nonblocking");
+            let sock = UdpSocket::from_std(local).expect("tokio adopts the socket");
+
+            let caller = connected_caller();
+            let limit = caller.effective_max_payload_size();
+            let next = caller.next_sequence_number().expect("connected sender");
+            let mut conn = Conn::new(caller, sock);
+
+            let oversized = vec![0xEE; limit + 1];
+            let outcome = conn
+                .send_paced(&oversized, Timestamp::from_micros(100_000))
+                .await;
+            assert!(
+                matches!(outcome, PacedSendOutcome::Rejected(_)),
+                "expected Rejected, got {outcome:?}"
+            );
+            assert_eq!(
+                conn.conn.next_sequence_number(),
+                Some(next),
+                "a rejected payload must not advance sender state"
+            );
+            assert!(
+                !conn.has_pending_outputs(),
+                "a rejected payload must not queue any output"
+            );
+
+            let ok_payload = vec![0xEE; limit];
+            let outcome2 = conn
+                .send_paced(&ok_payload, Timestamp::from_micros(100_001))
+                .await;
+            assert!(
+                matches!(outcome2, PacedSendOutcome::Sent),
+                "expected Sent, got {outcome2:?}"
+            );
         });
     }
 

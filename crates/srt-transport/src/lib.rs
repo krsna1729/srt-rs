@@ -59,7 +59,7 @@
 //! `SrtConnection::handle_timer`.
 //!
 
-use shiguredo_srt::{ConnectionOptions, SrtConnection};
+use shiguredo_srt::{ConnectionOptions, Error as SrtError, SrtConnection};
 use std::time::Duration;
 
 // --- Private submodules ---
@@ -327,4 +327,40 @@ pub struct OutputDrainReport {
     pub syscalls: usize,
     /// True when this visit stopped on `WouldBlock` or a partial `sendmmsg`.
     pub would_block: bool,
+}
+
+/// Outcome of one `send_paced`/`send_shared_paced` attempt (S03). The prior
+/// `Result<(), ()>` collapsed four distinct situations into one opaque
+/// `Err`: a caller following only `.is_ok()` could not tell "try again
+/// later with the same payload" from "this payload is permanently
+/// rejected" from "the protocol accepted it but the OS write failed" --
+/// and a driver couldn't preserve the failure for its own health/terminal
+/// reporting, because it had already been discarded.
+#[derive(Debug)]
+pub enum PacedSendOutcome {
+    /// Accepted by the protocol and fully drained to the wire this call.
+    Sent,
+    /// Accepted by the protocol, but the output drain did not fully
+    /// complete this call (budget exhausted). The remaining output stays
+    /// queued in protocol order for the next drain; not a failure.
+    Accepted,
+    /// Pacing was not due yet, or a previous drain is still queued. Not a
+    /// failure; retry with the same payload later.
+    NotDue,
+    /// The protocol rejected the payload. In every case this crate's own
+    /// admission checks reject (state, pacing, size, the current key's
+    /// ability to encrypt -- S02's `check_can_encrypt`), no output prefix
+    /// or retained fragment remains, so retrying with different input is
+    /// safe and retrying the identical input fails identically. The one
+    /// narrow exception is an encryption failure inside the wire-encode
+    /// step itself, past every pre-admission check: the payload is by then
+    /// already retained in the sender buffer, so this is not a strict
+    /// admission guarantee against every possible internal error, only
+    /// against the checked ones.
+    Rejected(SrtError),
+    /// The payload was accepted by the protocol -- it is retained and
+    /// eligible for retransmission -- but the runtime's output drain hit
+    /// an I/O error trying to flush it. Never resend this payload as new
+    /// data; the protocol already owns it (S02).
+    DriverError(std::io::Error),
 }
