@@ -779,10 +779,19 @@ impl CallerTable {
         feed_res.map(|()| true)
     }
 
-    fn pop_due_ids(&mut self, now: Timestamp) -> Vec<LogicalCallerId> {
+    /// Pop up to `max_due` sessions whose deadline has passed, in deadline
+    /// order, reusing the existing `deadlines` `BTreeSet` index (P02
+    /// checkpoint 3) rather than a separate scheduler. A session past the
+    /// cap is left exactly where it was -- still in `deadlines`, still
+    /// due -- so it is picked up again, unchanged, by the very next call
+    /// with a `now` no earlier than this one.
+    fn pop_due_ids(&mut self, now: Timestamp, max_due: usize) -> Vec<LogicalCallerId> {
         let now_micros = now.as_micros();
         let mut due_ids = Vec::new();
-        while let Some(entry) = self.deadlines.first().copied() {
+        while due_ids.len() < max_due {
+            let Some(entry) = self.deadlines.first().copied() else {
+                break;
+            };
             if entry.deadline_micros > now_micros {
                 break;
             }
@@ -796,6 +805,14 @@ impl CallerTable {
             due_ids.push(entry.id);
         }
         due_ids
+    }
+
+    /// Whether a due session remains in `deadlines` that this visit's
+    /// `pop_due_ids` cap left unfired (P02).
+    fn has_due_remaining(&self, now: Timestamp) -> bool {
+        self.deadlines
+            .first()
+            .is_some_and(|entry| entry.deadline_micros <= now.as_micros())
     }
 
     fn fire_due_ids(&mut self, ids: Vec<LogicalCallerId>, now: Timestamp) {
@@ -820,7 +837,7 @@ impl CallerTable {
         out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
     ) {
         out.clear();
-        let due_ids = self.pop_due_ids(now);
+        let due_ids = self.pop_due_ids(now, usize::MAX);
         self.fire_due_ids(due_ids, now);
         while let Some(id) = self.pop_ready() {
             let (drain_result, timers_touched) = {
@@ -868,9 +885,23 @@ impl CallerTable {
             budget.max_packets.max(1),
             budget.max_bytes.max(1),
         );
-        let due_ids = self.pop_due_ids(now);
+        // P02: cap how many due sessions get their timers fired this visit
+        // too, not just how much ready-queue output gets drained -- an
+        // unconditional "fire every due session first" made this
+        // function's own "bounded" contract hold only as long as no more
+        // than a handful of sessions happened to be simultaneously due.
+        let due_ids = self.pop_due_ids(now, budget.max_actions);
+        let due_remaining = self.has_due_remaining(now);
         self.fire_due_ids(due_ids, now);
-        self.drain_ready_bounded(now, budget, out)
+        let mut report = self.drain_ready_bounded(now, budget, out);
+        // Only promote a report that otherwise claimed full completion --
+        // never overwrite a status that already means "more work, come
+        // back" (e.g. a future ready-drain outcome other than Drained),
+        // which would silently discard whatever that status was signaling.
+        if due_remaining && report.status == OutputDrainStatus::Drained {
+            report.status = OutputDrainStatus::BudgetExhausted;
+        }
+        report
     }
 
     fn drain_ready_bounded(
@@ -3419,6 +3450,148 @@ mod tests {
                 c.due_callers_visited
             );
         }
+    }
+
+    /// P02: hundreds of simultaneously due sessions must not all get their
+    /// timers fired in one visit -- before this fix, `pop_due_ids` popped
+    /// every session whose deadline had passed with no cap at all, so
+    /// `poll_outbound_bounded`'s own budget only ever applied to the
+    /// ready-drain phase that ran *after* every due session's timers had
+    /// already fired.
+    #[test]
+    fn caller_hundreds_of_simultaneous_deadlines_are_serviced_over_several_visits() {
+        const N: usize = 500;
+        let mut table = mk_table(N);
+        let ids = table.bench_ids();
+        for id in ids.clone() {
+            table.bench_clear_deadline(id);
+        }
+        let now = Timestamp::from_micros(1_000_000);
+        for &id in &ids {
+            table.bench_arm_timer(
+                id,
+                shiguredo_srt::TimerId::Ack,
+                1_000_000,
+                Timestamp::from_micros(0),
+            );
+        }
+        table.reset_sched_counters();
+
+        let budget = crate::OutputDrainBudget::new(32, 32, 256 * 1024);
+        let mut out = Vec::new();
+        let mut total_visited = 0usize;
+        let mut worst_single_visit = 0usize;
+        let mut calls = 0usize;
+        loop {
+            let before = table.sched_counters().due_callers_visited;
+            let report = table.poll_outbound_bounded(now, budget, &mut out);
+            calls += 1;
+            let this_visit = table.sched_counters().due_callers_visited - before;
+            worst_single_visit = worst_single_visit.max(this_visit);
+            total_visited += this_visit;
+            assert!(
+                this_visit <= budget.max_actions,
+                "one visit fired {this_visit} due sessions, over the budget of {}",
+                budget.max_actions
+            );
+            if this_visit >= budget.max_actions {
+                assert_eq!(
+                    report.status,
+                    crate::OutputDrainStatus::BudgetExhausted,
+                    "a visit that fired the maximum due sessions this budget allows must \
+                     report BudgetExhausted"
+                );
+            }
+            // Firing a due session's timers can itself queue real protocol
+            // output (e.g. an ACK), which the *separate* ready-drain budget
+            // may not finish draining in the same visit -- so "no more due
+            // sessions to pop" does not by itself mean fully drained.
+            // `Drained` is the one authoritative "nothing left at all"
+            // signal from this function.
+            if report.status == crate::OutputDrainStatus::Drained {
+                break;
+            }
+            assert!(
+                calls < 4 * N,
+                "must make real per-visit progress, not loop forever without draining the \
+                 due set"
+            );
+        }
+
+        assert_eq!(
+            total_visited, N,
+            "every one of the {N} simultaneously due sessions must eventually be serviced, \
+             none skipped and none double-fired"
+        );
+        assert!(
+            worst_single_visit <= budget.max_actions,
+            "worst observed single-visit due-session count ({worst_single_visit}) must stay \
+             within the {}-action budget",
+            budget.max_actions
+        );
+        assert!(
+            calls > 1,
+            "{N} due sessions against a budget of {} must take more than one visit \
+             (worst single visit: {worst_single_visit}, visits taken: {calls})",
+            budget.max_actions
+        );
+    }
+
+    /// P02: isolates `pop_due_ids`'s cap and `has_due_remaining` from the
+    /// ready-drain budget (the end-to-end
+    /// `caller_hundreds_of_simultaneous_deadlines_are_serviced_over_several_visits`
+    /// test above cannot cleanly isolate this: every timer handler in this
+    /// codebase re-arms itself with a `SetTimer` output, so firing a due
+    /// session almost always produces at least one ready-drain action too,
+    /// coupling the two budgets in practice). Directly checks the index
+    /// itself: capped `pop_due_ids` must leave the uncapped remainder
+    /// exactly where it was, still discoverable as due.
+    #[test]
+    fn pop_due_ids_leaves_the_remainder_in_the_deadline_index_when_capped() {
+        const N: usize = 50;
+        const CAP: usize = 10;
+        let mut table = mk_table(N);
+        let ids = table.bench_ids();
+        for id in ids.clone() {
+            table.bench_clear_deadline(id);
+        }
+        let now = Timestamp::from_micros(1_000_000);
+        for &id in &ids {
+            table.bench_arm_timer(
+                id,
+                shiguredo_srt::TimerId::Ack,
+                1_000_000,
+                Timestamp::from_micros(0),
+            );
+        }
+        assert_eq!(table.deadlines.len(), N);
+
+        let popped = table.pop_due_ids(now, CAP);
+        assert_eq!(
+            popped.len(),
+            CAP,
+            "must pop exactly the cap, not fewer or more"
+        );
+        assert_eq!(
+            table.deadlines.len(),
+            N - CAP,
+            "everything past the cap must remain in the deadline index, untouched"
+        );
+        assert!(
+            table.has_due_remaining(now),
+            "the remainder is still due at the same `now` and must be reported as such"
+        );
+
+        // Draining the rest in one more call must account for every
+        // session exactly once: none left behind, none popped twice.
+        let rest = table.pop_due_ids(now, usize::MAX);
+        assert_eq!(rest.len(), N - CAP);
+        let mut all_popped: Vec<_> = popped.into_iter().chain(rest).collect();
+        all_popped.sort();
+        let mut expected = ids;
+        expected.sort();
+        assert_eq!(all_popped, expected);
+        assert!(!table.has_due_remaining(now));
     }
 
     #[test]
