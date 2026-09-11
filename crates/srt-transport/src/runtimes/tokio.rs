@@ -394,7 +394,9 @@ impl GroupConn {
             logical_payload_bytes_sent: 0,
             logical_payloads_received: 0,
             logical_payload_bytes_received: 0,
-            recv_batch: RecvBatch::with_capacity(RecvBatch::DEFAULT_CAPACITY, 65_536),
+            // D02: see the identical fix and rationale in group_conn.rs's
+            // own `GroupConn::new`.
+            recv_batch: RecvBatch::new(),
             io_stats: BatchIoStats::default(),
         })
     }
@@ -518,14 +520,17 @@ impl GroupConn {
     /// Perform bounded, nonblocking work for every leg. Call after a
     /// Tokio readiness notification or when the next timer is due; this
     /// never blocks one leg waiting for another.
+    ///
+    /// `report` is cleared and refilled in place (D02): a caller drives
+    /// every tick, so this reuses the caller-owned `Vec`'s capacity instead
+    /// of allocating a fresh one per call.
     pub fn drive(
         &mut self,
         now: Timestamp,
         output_budget: OutputDrainBudget,
-    ) -> io::Result<GroupDriveReport> {
-        let mut report = GroupDriveReport {
-            legs: Vec::with_capacity(self.legs.len()),
-        };
+        report: &mut GroupDriveReport,
+    ) -> io::Result<()> {
+        report.legs.clear();
         let recv_budget = RecvBudget::new(2, 64);
         {
             let (group, legs, recv_batch, io_stats) = (
@@ -591,7 +596,7 @@ impl GroupConn {
             }
         }
         self.group.refresh_member_states();
-        Ok(report)
+        Ok(())
     }
 
     #[must_use]
@@ -1033,9 +1038,13 @@ mod tests {
             for (_, socket) in conn.leg_sockets() {
                 socket.writable().await.expect("leg becomes writable");
             }
-            let report = conn
-                .drive(Timestamp::from_micros(0), OutputDrainBudget::default())
-                .expect("all induction packets are sent");
+            let mut report = GroupDriveReport::default();
+            conn.drive(
+                Timestamp::from_micros(0),
+                OutputDrainBudget::default(),
+                &mut report,
+            )
+            .expect("all induction packets are sent");
             assert_eq!(report.legs.len(), 2);
             assert_eq!(
                 report
@@ -1168,13 +1177,14 @@ mod tests {
             socket.writable().await.expect("leg becomes writable");
         }
 
+        let mut report = GroupDriveReport::default();
         for round in 0..20 {
             let now = Timestamp::from_micros(round * 10_000);
-            conn.drive(now, OutputDrainBudget::default())
+            conn.drive(now, OutputDrainBudget::default(), &mut report)
                 .expect("group sends protocol output");
             first_peer.drive(now);
             second_peer.drive(now);
-            conn.drive(now, OutputDrainBudget::default())
+            conn.drive(now, OutputDrainBudget::default(), &mut report)
                 .expect("group receives protocol output");
             if conn.group().members().iter().all(|member| {
                 member.connection().state() == shiguredo_srt::ConnectionState::Connected
@@ -1216,6 +1226,7 @@ mod tests {
                 .expect("leg 1 address");
 
             let mut total_malformed = 0usize;
+            let mut report = GroupDriveReport::default();
             for round in 0..10 {
                 let now = Timestamp::from_micros(1_000_000 + round * 10_000);
                 for _ in 0..3 {
@@ -1224,8 +1235,7 @@ mod tests {
                         .send_to(b"not an srt packet, just garbage bytes", first_addr)
                         .expect("garbage send");
                 }
-                let report = conn
-                    .drive(now, OutputDrainBudget::default())
+                conn.drive(now, OutputDrainBudget::default(), &mut report)
                     .expect("drive must not fail on malformed input");
                 let leg1 = report
                     .legs
@@ -1275,10 +1285,11 @@ mod tests {
             drop(first_peer);
 
             let mut leg1_broken = false;
+            let mut report = GroupDriveReport::default();
             for round in 0..100 {
                 let now = Timestamp::from_micros(1_500_000 + round * 10_000);
                 let _ = conn.send(b"provoke icmp unreachable on leg 1", now);
-                conn.drive(now, OutputDrainBudget::default())
+                conn.drive(now, OutputDrainBudget::default(), &mut report)
                     .expect("drive must not fail just because one leg's peer vanished");
                 second_peer.drive(now);
                 if conn.group().member(1).expect("member 1").state()
@@ -1305,10 +1316,10 @@ mod tests {
                     .expect("send still works with one healthy leg"),
                 1
             );
-            conn.drive(now, OutputDrainBudget::default())
+            conn.drive(now, OutputDrainBudget::default(), &mut report)
                 .expect("drive still services the healthy leg");
             second_peer.drive(now);
-            conn.drive(now, OutputDrainBudget::default())
+            conn.drive(now, OutputDrainBudget::default(), &mut report)
                 .expect("drive still services the healthy leg");
             assert_eq!(conn.stats().aggregate.active_legs, 1);
 
@@ -1318,7 +1329,7 @@ mod tests {
             for round in 0..100 {
                 let now = Timestamp::from_micros(3_500_000 + round * 10_000);
                 let _ = conn.send(b"provoke icmp unreachable on leg 2", now);
-                conn.drive(now, OutputDrainBudget::default())
+                conn.drive(now, OutputDrainBudget::default(), &mut report)
                     .expect("drive must not fail even when every leg has failed");
                 if conn
                     .group()
@@ -1561,4 +1572,12 @@ mod tests {
             assert!(conn.schedule_wait(Timestamp::from_micros(0)) > Duration::ZERO);
         });
     }
+
+    // D02's allocation-reuse guarantee for this file's Tokio-native
+    // `GroupConn::drive` is proven in
+    // `tests/tokio_group_drive_allocation_guard.rs`: a real allocation
+    // count across idle calls, not a `Vec::as_ptr()` comparison. An
+    // earlier version of this test used `as_ptr()` and passed even against
+    // a deliberately reintroduced free-and-reallocate regression, because
+    // glibc's allocator handed back the same address for the freed block.
 }

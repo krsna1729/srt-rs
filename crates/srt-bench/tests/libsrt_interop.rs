@@ -10,7 +10,8 @@ use shiguredo_srt::{CipherMode, ConnectionOptions, KeyLength, SrtConnection, Tim
 use srt_bench::driver;
 use srt_transport::{
     AdmissionOptions, AdmissionResolution, CallerConfig, GroupCallerLeg, GroupConfig, GroupConn,
-    IngressTelemetry, OutputDrainBudget, PeerTable, RejectionReason, RuntimeFlavor,
+    GroupDriveReport, IngressTelemetry, OutputDrainBudget, PeerTable, RejectionReason,
+    RuntimeFlavor,
 };
 use std::net::{SocketAddr, UdpSocket};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
@@ -1657,10 +1658,11 @@ fn rust_broadcast_group_interoperates_with_libsrt_listener() {
     let mut sent = false;
     let mut sent_on_two_legs = false;
     let mut max_active_legs = 0;
+    let mut drive_report = GroupDriveReport::default();
     while start.elapsed() < Duration::from_secs(15) {
         let now = Timestamp::from_micros(start.elapsed().as_micros() as u64);
         group
-            .drive(now, OutputDrainBudget::default())
+            .drive(now, OutputDrainBudget::default(), &mut drive_report)
             .expect("drive Rust broadcast group");
         let active_legs = group.stats().aggregate.active_legs;
         max_active_legs = max_active_legs.max(active_legs);
@@ -1674,7 +1676,7 @@ fn rust_broadcast_group_interoperates_with_libsrt_listener() {
             sent_on_two_legs |= selected == 2;
             sent = true;
             group
-                .drive(now, OutputDrainBudget::default())
+                .drive(now, OutputDrainBudget::default(), &mut drive_report)
                 .expect("drain Rust broadcast payload");
             break;
         }
