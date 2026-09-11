@@ -634,6 +634,7 @@ impl BenchConfig {
                         .unwrap_or(std::num::NonZeroUsize::MIN),
                 ),
                 srt_transport::OutputDrainBudget::default(),
+                srt_transport::RecvBudget::default(),
             )
             .map_err(|e| e.to_string())
     }
@@ -770,9 +771,11 @@ impl BenchConfig {
     ///
     /// `Shared` ownership makes promotion intrinsically inert (runtime
     /// `decide_promotion` fails closed to `StayOnListener` without an
-    /// exclusive tuple), so the legacy/default `Relocate` request translates
-    /// to `Never` here. The strict transport resolver still rejects an
-    /// explicit `Shared + promote` built by hand; bench never sends one.
+    /// exclusive tuple). `--promotion` cannot distinguish "not passed" from
+    /// an explicit `relocate`, so that ambiguous default alone normalizes to
+    /// `Never` under `Shared`. A genuinely explicit `bonded`/`all` request
+    /// is passed through unchanged so the strict transport resolver's
+    /// rejection actually fires instead of silently discarding the request.
     #[must_use]
     pub fn endpoint_plan(&self) -> srt_transport::EndpointSocketPlan {
         let ownership = if self.exclusive_udp_tuple() {
@@ -794,7 +797,9 @@ impl BenchConfig {
                 }
             }
         };
-        let promotion = if ownership == srt_transport::SocketOwnership::Shared {
+        let promotion = if ownership == srt_transport::SocketOwnership::Shared
+            && self.promotion == Promotion::Relocate
+        {
             srt_transport::PromotionPolicy::Never
         } else {
             match self.promotion {
@@ -828,25 +833,49 @@ impl BenchConfig {
         }
     }
 
-    /// Startup gate: bond topology first, then canonical endpoint plan.
-    /// `Shared` promotion requests arrive as `Never` via [`Self::endpoint_plan`];
-    /// `Shared + ReuseportSingle` still rejects. Runtimes and CLI parsing must
-    /// call this, not `validate_bond_topology` alone.
+    /// Startup gate: bond topology first, then canonical endpoint plan, then
+    /// the session knobs `--latency`/`--ack-interval`/`--light-ack-interval`
+    /// build. Runtimes and CLI parsing must call this, not
+    /// `validate_bond_topology` alone: an out-of-range session value used to
+    /// be silently dropped by [`Self::session_config`] instead of failing
+    /// visibly (`Q-BENCH-SOURCE`).
     pub fn validate_startup(&self) -> Result<srt_transport::ResolvedEndpointPlan, String> {
         self.validate_bond_topology().map_err(|e| e.to_string())?;
+        self.validate_session_config().map_err(|e| e.to_string())?;
         self.validate_canonical(self.transport_flavor().capabilities())
     }
 
+    /// Runs every fallible [`Self::session_config`] setter for its error
+    /// alone, so an invalid `--latency`/`--ack-interval`/
+    /// `--light-ack-interval` fails startup instead of silently keeping
+    /// `SessionConfig::default()`'s value.
+    pub fn validate_session_config(&self) -> Result<(), srt_transport::ConfigError> {
+        let mut session = srt_transport::SessionConfig::default();
+        session.set_latency(std::time::Duration::from_millis(u64::from(self.latency_ms)))?;
+        session.set_ack_interval(std::time::Duration::from_micros(self.ack_interval_micros))?;
+        session.set_light_ack_interval_packets(self.light_ack_interval_packets)?;
+        Ok(())
+    }
+
     /// Canonical session. Single place workload knobs become protocol knobs.
-    /// Pacing stays `Off` (bench never repays; see pacing-phase.md).
+    /// Pacing stays `Off` (bench never repays; see pacing-phase.md). Callers
+    /// reach this only after [`Self::validate_startup`] has already run
+    /// [`Self::validate_session_config`], so the values here are guaranteed
+    /// in-range -- the `expect`s below are that invariant, not a silent
+    /// fallback.
     #[must_use]
     pub fn session_config(&self) -> srt_transport::SessionConfig {
         let mut session = srt_transport::SessionConfig::default();
         session.set_bandwidth(self.srt_bandwidth());
-        let _ = session.set_latency(std::time::Duration::from_millis(u64::from(self.latency_ms)));
-        let _ =
-            session.set_ack_interval(std::time::Duration::from_micros(self.ack_interval_micros));
-        let _ = session.set_light_ack_interval_packets(self.light_ack_interval_packets);
+        session
+            .set_latency(std::time::Duration::from_millis(u64::from(self.latency_ms)))
+            .expect("latency_ms is validated at startup");
+        session
+            .set_ack_interval(std::time::Duration::from_micros(self.ack_interval_micros))
+            .expect("ack_interval_micros is validated at startup");
+        session
+            .set_light_ack_interval_packets(self.light_ack_interval_packets)
+            .expect("light_ack_interval_packets is validated at startup");
         session.set_pacing(srt_transport::PacingPolicy::Off);
         session
     }
@@ -3551,6 +3580,37 @@ mod tests {
         // Shared + ReuseportSingle is unreachable even with Never.
         cfg.promotion = Promotion::Never;
         cfg.ingress = Ingress::ReuseportSingle { workers: 2 };
+        assert!(cfg.validate_startup().is_err());
+    }
+
+    #[test]
+    fn explicit_shared_bonded_or_all_promotion_fails_startup_instead_of_becoming_never() {
+        let mut cfg = config();
+        cfg.egress = Egress::SharedSocket;
+        cfg.ingress = Ingress::ReuseportMulti(2);
+        // Only the ambiguous "not passed"/Relocate default silently
+        // normalizes to Never under Shared -- a genuinely explicit request
+        // for promotion the runtime cannot honor must fail visibly instead.
+        cfg.promotion = Promotion::Bonded;
+        assert!(
+            cfg.validate_startup().is_err(),
+            "explicit --promotion bonded + shared egress must be rejected, not silently downgraded"
+        );
+        cfg.promotion = Promotion::All;
+        assert!(
+            cfg.validate_startup().is_err(),
+            "explicit --promotion all + shared egress must be rejected, not silently downgraded"
+        );
+    }
+
+    #[test]
+    fn validate_startup_rejects_out_of_range_session_values_instead_of_dropping_them() {
+        let mut cfg = config();
+        assert!(cfg.validate_startup().is_ok());
+        // ack_interval below Haivision's COMM_SYN floor: session_config()
+        // used to silently ignore this via `let _ = set_ack_interval(...)`
+        // and keep the previous/default value instead of failing.
+        cfg.ack_interval_micros = 1;
         assert!(cfg.validate_startup().is_err());
     }
 

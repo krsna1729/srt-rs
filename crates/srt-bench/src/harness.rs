@@ -474,8 +474,12 @@ pub fn append_result(
             crate::Egress::PerConnection => "per-connection".into(),
             crate::Egress::SharedSocket => "shared-socket".into(),
         },
-        // Effective promotion: Shared egress always executes as Never via
-        // endpoint_plan translation; record that, not the raw axis request.
+        // Effective promotion: a config that reaches this point already
+        // passed `validate_startup()`, so a Shared-egress row's raw
+        // `cfg.promotion` can only be the ambiguous default (normalized to
+        // Never by `endpoint_plan`) or an explicit `never` -- an explicit
+        // Bonded/All request would have failed startup instead of running.
+        // Record the effective value, not the raw axis request.
         if cfg.egress == crate::Egress::SharedSocket {
             "never".to_string()
         } else {
@@ -1392,13 +1396,16 @@ fn filter_promotion(
     is_single: bool,
 ) -> Option<&'static str> {
     let promotion = cell_value(cell, "promotion", Some(Scope::Both))?;
-    // Every effective Shared sender executes as Never via endpoint_plan
-    // translation (bonded included): keep only the canonical Never cell so
-    // raw never/relocate/bonded/all do not survive as duplicate identities.
+    // Only the ambiguous "not passed"/Relocate default silently normalizes
+    // to Never under Shared egress (bonded included); an explicit
+    // Bonded/All request is now rejected by `validate_startup()`, not
+    // translated (K02). Filter unconditionally on the resolved value
+    // rather than picking a single "representative" cell per axis: with a
+    // single-valued promotion axis that never mentions "never" (e.g. a
+    // plan pinning `promotion = all`), `representative` would fall back to
+    // that axis's own first/only value and keep an invalid cell.
     if egress == "shared-socket" {
-        return representative(axes, "promotion", "never")
-            .filter(|keep| promotion != *keep)
-            .map(|_| "promotion-inert-shared-egress");
+        return (promotion != "never").then_some("promotion-inert-shared-egress");
     }
     if bond != Some("none") {
         return None;
@@ -3911,6 +3918,72 @@ mod matrix_filter_tests {
         assert_eq!(
             filter_reason(&cell_for("relocate"), &axes),
             Some("promotion-inert-shared-egress")
+        );
+    }
+
+    /// Every checked-in plan that crosses `shared-socket` egress with an
+    /// explicit `promotion` axis must keep only cells whose promotion is
+    /// `never` there -- anything else now fails `validate_startup()`
+    /// (K01/K02). Enumerates the real committed files rather than a
+    /// hand-built axis so a future plan edit that reintroduces the same
+    /// mistake is caught here, not by a CI job failing at runtime.
+    #[test]
+    fn checked_in_plans_never_keep_a_shared_egress_cell_with_non_never_promotion() {
+        let plans = [
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../docs/plans/perf-sentinels/tokio-demux-aes256.plan"
+            ),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../docs/plans/perf-sentinels/tokio-broadcast.plan"
+            ),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../docs/plans/socket-topology-smoke.plan"
+            ),
+        ];
+        for plan_path in plans {
+            let cli = cli(&["--plan", plan_path]);
+            let resolved = crate::harness::resolve_plan_cells(&cli)
+                .unwrap_or_else(|e| panic!("{plan_path} resolves: {e}"));
+            let (cells, enumeration) = resolved
+                .enumerate_filtered()
+                .unwrap_or_else(|e| panic!("{plan_path} enumerates: {e}"));
+            assert!(
+                enumeration.kept_cells > 0,
+                "{plan_path} kept zero cells -- the matrix filter silently emptied it"
+            );
+            for cell in &cells {
+                let egress = cell.get("egress").map(String::as_str).unwrap_or("");
+                let promotion = cell.get("promotion").map(String::as_str).unwrap_or("");
+                assert!(
+                    egress != "shared-socket" || promotion == "never",
+                    "{plan_path} kept a shared-socket cell with promotion={promotion}, \
+                     which validate_startup() now rejects"
+                );
+            }
+        }
+    }
+
+    /// A plan that pins one promotion value never mentioning "never" (e.g. a
+    /// bare `promotion = all` crossed with `egress = shared-socket`, the
+    /// exact shape the checked-in plans above had before this fix) must
+    /// still have its shared-egress cell filtered. `representative(axes,
+    /// "promotion", "never")` falls back to the axis's own first/only value
+    /// when "never" is absent, which used to make a lone `all` value look
+    /// like its own representative and survive filtering -- reaching
+    /// `validate_startup()` and failing there instead of being pruned up
+    /// front.
+    #[test]
+    fn shared_egress_filters_a_non_never_promotion_even_when_the_axis_never_mentions_never() {
+        let axes = vec![("promotion", Scope::Both, vec!["all".to_string()])];
+        let shared_all = cell(&[("egress", "shared-socket"), ("promotion", "all")]);
+        assert_eq!(
+            filter_reason(&shared_all, &axes),
+            Some("promotion-inert-shared-egress"),
+            "a shared-egress cell must be filtered whenever its promotion isn't never, \
+             even if the plan's promotion axis never includes never at all"
         );
     }
     #[test]

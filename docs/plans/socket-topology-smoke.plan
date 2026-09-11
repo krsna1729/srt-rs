@@ -27,7 +27,12 @@ connections         = 8
 bitrate             = 1000000
 srt-bandwidth       = input-relative:25
 workers             = 1
-promotion           = all
+# Shared egress cannot promote (K01), so its cells keep only `never`; the
+# harness's shared-egress filter needs a real `never` value in this axis
+# to select from (rather than one bare non-never value it would otherwise
+# have to synthesize) for that pruning to keep a valid cell here. The
+# per-connection cells still exercise real promotion via `all`.
+promotion           = never,all
 cookie-routing      = on
 batch               = on
 sock-buf            = 16m

@@ -13,7 +13,9 @@ connections         = 600
 bitrate             = 1000000
 srt-bandwidth       = input-relative:25
 workers             = 1
-promotion           = all
+# Shared egress cannot promote (K01): first connect() would steal a later
+# handshake, so `never` is the only value this topology accepts.
+promotion           = never
 cookie-routing      = on
 batch               = on
 sock-buf            = 16m

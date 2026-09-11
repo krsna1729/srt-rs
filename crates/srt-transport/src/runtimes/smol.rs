@@ -19,10 +19,29 @@ pub struct Conn {
     pending_outputs: VecDeque<ConnectionOutput>,
     recv_batch: RecvBatch,
     io_stats: BatchIoStats,
+    output_drain: OutputDrainBudget,
+    recv_budget: RecvBudget,
 }
 
 impl Conn {
     pub fn new(conn: SrtConnection, sock: UdpSocket) -> Self {
+        Self::with_budgets(
+            conn,
+            sock,
+            OutputDrainBudget::default(),
+            RecvBudget::default(),
+        )
+    }
+
+    /// Like [`Self::new`], but stores the given budgets instead of the
+    /// defaults (K02): [`Self::drain_outputs`]/[`Self::recv_with_timeout`]
+    /// honor these, not a hardcoded `::default()`, on every call.
+    pub fn with_budgets(
+        conn: SrtConnection,
+        sock: UdpSocket,
+        output_drain: OutputDrainBudget,
+        recv_budget: RecvBudget,
+    ) -> Self {
         Self {
             conn,
             sock,
@@ -30,6 +49,8 @@ impl Conn {
             pending_outputs: VecDeque::new(),
             recv_batch: RecvBatch::new(),
             io_stats: BatchIoStats::default(),
+            output_drain,
+            recv_budget,
         }
     }
 
@@ -42,8 +63,7 @@ impl Conn {
     }
 
     pub async fn drain_outputs(&mut self, now: Timestamp) -> io::Result<OutputDrainReport> {
-        self.drain_outputs_bounded(now, OutputDrainBudget::default())
-            .await
+        self.drain_outputs_bounded(now, self.output_drain).await
     }
 
     pub async fn drain_outputs_bounded(
@@ -125,7 +145,7 @@ impl Conn {
             .await
             .is_some()
         {
-            let _ = self.recv_ready(now, RecvBudget::default());
+            let _ = self.recv_ready(now, self.recv_budget);
         }
     }
 
@@ -216,7 +236,12 @@ pub fn caller(
 ) -> Result<Conn, crate::RuntimeBuildError> {
     let prepared = config.prepare(crate::RuntimeFlavor::Smol)?;
     let socket = smol::Async::new(prepared.bind_socket()?)?;
-    Ok(Conn::new(prepared.connection(now)?, socket))
+    Ok(Conn::with_budgets(
+        prepared.connection(now)?,
+        socket,
+        prepared.transport.output_drain,
+        prepared.transport.recv_budget,
+    ))
 }
 
 pub struct TickResult {
@@ -229,6 +254,41 @@ mod tests {
     use super::*;
     use std::future::Future;
     use std::task::{Context, Poll, Waker};
+
+    /// K02: a `Conn` built via [`caller`] must actually drive with its
+    /// configured `TransportConfig::output_drain`, not silently substitute
+    /// [`OutputDrainBudget::default`] on every [`Conn::drain_outputs`] call.
+    #[test]
+    fn caller_constructs_a_conn_that_honors_its_configured_output_drain_budget() {
+        futures_lite::future::block_on(async {
+            let peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("peer binds");
+            let remote = peer.local_addr().expect("peer address");
+
+            let config = crate::CallerConfig::builder(remote)
+                .configure_transport(|transport| {
+                    transport.output_drain = OutputDrainBudget::new(1, 1, 64 * 1024);
+                })
+                .build()
+                .expect("caller config");
+            let mut conn =
+                super::caller(&config, Timestamp::from_micros(0)).expect("caller builds");
+            conn.pending_outputs
+                .push_back(ConnectionOutput::SendPacket(b"one".to_vec()));
+            conn.pending_outputs
+                .push_back(ConnectionOutput::SendPacket(b"two".to_vec()));
+
+            let report = conn
+                .drain_outputs(Timestamp::from_micros(0))
+                .await
+                .expect("drain succeeds");
+            assert_eq!(report.status, OutputDrainStatus::BudgetExhausted);
+            assert_eq!(
+                conn.pending_outputs.len(),
+                1,
+                "the second action must remain queued under a 1-action budget"
+            );
+        });
+    }
 
     /// S04: same cancellation-safety fix and rationale as
     /// `tokio_transport::tests::drain_outputs_bounded_survives_cancellation_while_parked_on_writable`.

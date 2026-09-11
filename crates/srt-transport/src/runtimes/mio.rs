@@ -16,16 +16,29 @@ pub struct Conn {
     pub timers: ManualTimerStore,
     pending_outputs: VecDeque<ConnectionOutput>,
     io_stats: BatchIoStats,
+    output_drain: OutputDrainBudget,
 }
 
 impl Conn {
     pub fn new(conn: SrtConnection, socket: mio::net::UdpSocket) -> Self {
+        Self::with_budgets(conn, socket, OutputDrainBudget::default())
+    }
+
+    /// Like [`Self::new`], but stores the given budget instead of the
+    /// default (K02): [`Self::drain_outputs`] honors this, not a hardcoded
+    /// `::default()`, on every call.
+    pub fn with_budgets(
+        conn: SrtConnection,
+        socket: mio::net::UdpSocket,
+        output_drain: OutputDrainBudget,
+    ) -> Self {
         Self {
             conn,
             socket,
             timers: ManualTimerStore::new(),
             pending_outputs: VecDeque::new(),
             io_stats: BatchIoStats::default(),
+            output_drain,
         }
     }
 
@@ -34,11 +47,11 @@ impl Conn {
         self.timers.fire_expired(now, &mut self.conn);
     }
 
-    /// Compatibility wrapper using [`OutputDrainBudget::default`].
+    /// Compatibility wrapper using this `Conn`'s stored output budget.
     /// Returns true only for `ECONNREFUSED`; transient failures remain
     /// queued for the next tick.
     pub fn drain_outputs(&mut self, now: Timestamp) -> bool {
-        self.drain_outputs_bounded(now, OutputDrainBudget::default())
+        self.drain_outputs_bounded(now, self.output_drain)
             .is_err_and(|error| error.kind() == io::ErrorKind::ConnectionRefused)
     }
 
@@ -134,7 +147,58 @@ pub fn caller(
 ) -> Result<Conn, crate::RuntimeBuildError> {
     let prepared = config.prepare(crate::RuntimeFlavor::Mio)?;
     let socket = mio::net::UdpSocket::from_std(prepared.bind_socket()?);
-    Ok(Conn::new(prepared.connection(now)?, socket))
+    Ok(Conn::with_budgets(
+        prepared.connection(now)?,
+        socket,
+        prepared.transport.output_drain,
+    ))
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    /// K02: a `Conn` built via [`caller`] must actually drive with its
+    /// configured `TransportConfig::output_drain`, not silently substitute
+    /// [`OutputDrainBudget::default`] on every [`Conn::drain_outputs`] call.
+    #[test]
+    fn caller_constructs_a_conn_that_honors_its_configured_output_drain_budget() {
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("peer binds");
+        peer.set_nonblocking(true).expect("peer is nonblocking");
+        let remote = peer.local_addr().expect("peer address");
+
+        let distinctive = OutputDrainBudget::new(1, 1, 64 * 1024);
+        let config = crate::CallerConfig::builder(remote)
+            .configure_transport(|transport| {
+                transport.output_drain = distinctive;
+            })
+            .build()
+            .expect("caller config");
+        let mut conn = super::caller(&config, Timestamp::from_micros(0)).expect("caller builds");
+
+        conn.pending_outputs
+            .push_back(ConnectionOutput::SendPacket(b"one".to_vec()));
+        conn.pending_outputs
+            .push_back(ConnectionOutput::SendPacket(b"two".to_vec()));
+
+        // mio's `drain_outputs` wrapper returns only a bool (ECONNREFUSED),
+        // not enough detail to observe budget exhaustion behaviorally, so
+        // this checks the stored field directly -- the same thing every
+        // other runtime's equivalent test proves by observing behavior.
+        assert_eq!(
+            conn.output_drain, distinctive,
+            "Conn must store the configured budget, not silently keep the default"
+        );
+        let report = conn
+            .drain_outputs_bounded(Timestamp::from_micros(0), conn.output_drain)
+            .expect("drain succeeds");
+        assert_eq!(report.status, crate::OutputDrainStatus::BudgetExhausted);
+        assert_eq!(
+            conn.pending_outputs.len(),
+            1,
+            "the second action must remain queued under a 1-action budget"
+        );
+    }
 }
 
 #[cfg(test)]
