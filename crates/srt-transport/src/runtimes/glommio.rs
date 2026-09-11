@@ -62,8 +62,26 @@ impl Conn {
         now: Timestamp,
         budget: OutputDrainBudget,
     ) -> io::Result<OutputDrainReport> {
-        let (mut work, exhausted) =
+        let (work, exhausted) =
             collect_output_work(&mut self.conn, &mut self.pending_outputs, budget);
+        // S05: stage every collected action back into the driver-owned queue
+        // before the first per-item await. `self.pending_outputs` is popped
+        // from directly below, one action at a time, so a task cancelled
+        // while a send is in flight loses at most the one datagram
+        // glommio's reactor has already dispatched (or may be about to) --
+        // never the not-yet-submitted remainder, which stays durable
+        // throughout. glommio copies `bytes` into its own owned `DmaBuffer`
+        // before ever awaiting (see `GlommioDatagram::send`), so there is
+        // no use-after-free risk either way; we just don't know, on
+        // cancellation, whether that copy's datagram reached the wire, and
+        // deliberately don't try to requeue it -- SRT's own retransmission
+        // covers a genuinely lost packet, and requeuing a datagram that was
+        // already dispatched risks sending a duplicate. The loop below is
+        // bounded to exactly the `budget`-capped count `collect_output_work`
+        // already computed -- `self.pending_outputs` itself may hold more
+        // behind these, left by a prior cap.
+        let budget_count = work.len();
+        prepend_outputs(&mut self.pending_outputs, work.into_iter());
         let mut report = OutputDrainReport {
             status: if exhausted {
                 OutputDrainStatus::BudgetExhausted
@@ -72,7 +90,10 @@ impl Conn {
             },
             ..Default::default()
         };
-        while let Some(out) = work.pop_front() {
+        for _ in 0..budget_count {
+            let Some(out) = self.pending_outputs.pop_front() else {
+                break;
+            };
             match out {
                 ConnectionOutput::SendPacket(bytes) => match self.sock.send(&bytes).await {
                     Ok(sent) if sent == bytes.len() => {
@@ -81,7 +102,9 @@ impl Conn {
                         report.bytes += sent;
                     }
                     Ok(_) => {
-                        prepend_outputs(&mut self.pending_outputs, work.into_iter());
+                        // The op completed (not cancelled): we observed the
+                        // result, so it is safe to requeue exactly this
+                        // datagram at the front.
                         self.pending_outputs
                             .push_front(ConnectionOutput::SendPacket(bytes));
                         return Err(io::Error::new(
@@ -90,7 +113,6 @@ impl Conn {
                         ));
                     }
                     Err(error) => {
-                        prepend_outputs(&mut self.pending_outputs, work.into_iter());
                         self.pending_outputs
                             .push_front(ConnectionOutput::SendPacket(bytes));
                         return Err(io::Error::other(error.to_string()));
@@ -219,4 +241,159 @@ pub fn caller(
 pub struct TickResult {
     pub sent: u64,
     pub events: Vec<ConnectionEvent>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// S05 (Opus review): same fix and rationale as compio's
+    /// `drain_outputs_bounded_does_not_exceed_the_budget_even_with_a_backlog`.
+    /// Unlike the cancellation test below, this one is fully deterministic
+    /// on this platform: the "yolo" synchronous fast path always completes
+    /// the drain in one poll (see that test's doc for why), so there is no
+    /// Pending/Ready ambiguity here.
+    #[test]
+    fn drain_outputs_bounded_does_not_exceed_the_budget_even_with_a_backlog() {
+        glommio::LocalExecutorBuilder::default()
+            .spawn(|| async move {
+                let peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("peer binds");
+                let local = std::net::UdpSocket::bind("127.0.0.1:0").expect("local binds");
+                local
+                    .connect(peer.local_addr().expect("peer address"))
+                    .expect("local connects to peer");
+                peer.set_nonblocking(true).expect("peer is nonblocking");
+                let sock = from_std(local).expect("glommio adopts the socket");
+
+                let mut conn = Conn::new(
+                    SrtConnection::new_caller(shiguredo_srt::ConnectionOptions::default()),
+                    sock,
+                );
+                for i in 0..5u8 {
+                    conn.pending_outputs
+                        .push_back(ConnectionOutput::SendPacket(vec![i]));
+                }
+
+                let budget = OutputDrainBudget::new(usize::MAX, 2, usize::MAX);
+                let report = conn
+                    .drain_outputs_bounded(Timestamp::from_micros(0), budget)
+                    .await
+                    .expect("drain succeeds");
+                assert_eq!(
+                    report.packets, 2,
+                    "a budget of 2 packets must send exactly 2, not the whole backlog"
+                );
+                assert_eq!(report.status, OutputDrainStatus::BudgetExhausted);
+                assert_eq!(
+                    conn.pending_outputs.len(),
+                    3,
+                    "the remaining 3 packets must still be queued, not sent or dropped"
+                );
+
+                let mut buf = [0u8; 64];
+                let mut received = 0usize;
+                while peer.recv(&mut buf).is_ok() {
+                    received += 1;
+                }
+                assert_eq!(
+                    received, 2,
+                    "exactly 2 datagrams must have reached the wire"
+                );
+            })
+            .expect("glommio executor spawns")
+            .join()
+            .expect("glommio executor runs to completion");
+    }
+
+    /// S05: same fix and rationale as compio's
+    /// `drain_outputs_bounded_survives_cancellation_of_an_in_flight_send`.
+    ///
+    /// `glommio::send` copies the caller's slice into its own owned
+    /// `DmaBuffer` before ever awaiting, and `Source::drop` defers buffer
+    /// reclamation until the kernel completion arrives for anything
+    /// already dispatched -- so there is no use-after-free hazard from
+    /// cancelling here regardless of timing. `futures_lite::poll_once`
+    /// polls the drain future exactly once and drops it immediately after
+    /// (whether it was Ready or Pending), with no other `.await` in
+    /// between -- so nothing else, including glommio's own io_uring
+    /// submit/park step, can run in the gap.
+    ///
+    /// glommio also has a "yolo" fast path that tries a direct, synchronous
+    /// send before ever touching io_uring; on Linux, a UDP send to a
+    /// loopback peer essentially never blocks at the socket level
+    /// (verified empirically -- even a minimum `SO_SNDBUF` and thousands
+    /// of back-to-back sends never produced `WouldBlock`), so in practice
+    /// this branch always completes the whole drain in this one poll and
+    /// the io_uring path this fix targets isn't reachable from a unit
+    /// test on this platform. The fix's correctness for that path is
+    /// instead established by reading `Source::drop` above: a `Dispatched`
+    /// op is cancelled via `cancel_request` and its buffer reclaimed only
+    /// once the completion arrives, so ownership is never ambiguous. This
+    /// test accepts either outcome and checks the invariant that matters
+    /// for each: if the first send is still in flight, dropping it there
+    /// must not lose the not-yet-submitted remainder; if the yolo path
+    /// completed everything synchronously (the case this platform always
+    /// takes), every packet
+    /// must have actually reached the peer.
+    #[test]
+    fn drain_outputs_bounded_loses_nothing_whether_cancelled_or_completed() {
+        glommio::LocalExecutorBuilder::default()
+            .spawn(|| async move {
+                let peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("peer binds");
+                let local = std::net::UdpSocket::bind("127.0.0.1:0").expect("local binds");
+                local
+                    .connect(peer.local_addr().expect("peer address"))
+                    .expect("local connects to peer");
+                peer.set_nonblocking(true).expect("peer is nonblocking");
+                let sock = from_std(local).expect("glommio adopts the socket");
+
+                let mut conn = Conn::new(
+                    SrtConnection::new_caller(shiguredo_srt::ConnectionOptions::default()),
+                    sock,
+                );
+                conn.pending_outputs
+                    .push_back(ConnectionOutput::SendPacket(b"first".to_vec()));
+                conn.pending_outputs
+                    .push_back(ConnectionOutput::SendPacket(b"second".to_vec()));
+                conn.pending_outputs.push_back(ConnectionOutput::SetTimer {
+                    id: shiguredo_srt::TimerId::Ack,
+                    duration_micros: 10_000,
+                });
+                let not_yet_submitted: Vec<_> =
+                    conn.pending_outputs.iter().skip(1).cloned().collect();
+
+                let budget = OutputDrainBudget::new(usize::MAX, usize::MAX, usize::MAX);
+                let polled = futures_lite::future::poll_once(
+                    conn.drain_outputs_bounded(Timestamp::from_micros(0), budget),
+                )
+                .await;
+                match polled {
+                    None => {
+                        let after: Vec<_> = conn.pending_outputs.iter().cloned().collect();
+                        assert_eq!(
+                            after, not_yet_submitted,
+                            "cancelling while the first send was in flight must leave \
+                             every not-yet-submitted packet and timer action exactly \
+                             as staged, in order"
+                        );
+                    }
+                    Some(result) => {
+                        result.expect("drain must not fail against a live loopback peer");
+                        assert!(
+                            !conn.has_pending_outputs(),
+                            "a completed drain must not leave already-sent output queued"
+                        );
+                        let mut buf = [0u8; 64];
+                        let mut received = Vec::new();
+                        while let Ok(n) = peer.recv(&mut buf) {
+                            received.push(buf[..n].to_vec());
+                        }
+                        assert_eq!(received, vec![b"first".to_vec(), b"second".to_vec()]);
+                    }
+                }
+            })
+            .expect("glommio executor spawns")
+            .join()
+            .expect("glommio executor runs to completion");
+    }
 }
