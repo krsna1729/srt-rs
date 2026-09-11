@@ -165,6 +165,12 @@ jobs:
         env:
           RUSTFLAGS: -Zsanitizer=address
           RUSTDOCFLAGS: -Zsanitizer=address
+          # monoio's IoUringDriver::new intentionally Box::leak()s a couple
+          # of small fixed allocations meant to live for the process
+          # lifetime (see the suppressions file); srt-transport's own S05
+          # tests build and drop a short-lived Runtime per test, which
+          # otherwise trips LeakSanitizer on monoio's own design choice.
+          LSAN_OPTIONS: suppressions=${{ github.workspace }}/.github/lsan-suppressions-srt-transport.txt
 
   coverage:
     name: Coverage floors
