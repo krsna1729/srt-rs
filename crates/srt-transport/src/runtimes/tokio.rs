@@ -71,12 +71,13 @@ impl Conn {
             },
             ..OutputDrainReport::default()
         };
-        if work_has_packets(&work)
-            && let Err(error) = self.sock.writable().await
-        {
+        let work = if work_has_packets(&work) {
             prepend_outputs(&mut self.pending_outputs, work.into_iter());
-            return Err(error);
-        }
+            self.sock.writable().await?;
+            collect_output_work(&mut self.conn, &mut self.pending_outputs, budget).0
+        } else {
+            work
+        };
         let report = drain_output_work(
             work,
             &mut self.pending_outputs,
@@ -733,6 +734,86 @@ mod tests {
                 "expected Sent, got {outcome2:?}"
             );
         });
+    }
+
+    /// S04: a task driving `drain_outputs_bounded` can be cancelled at any
+    /// `.await`, including while parked on `sock.writable()`. Before the
+    /// fix, `collect_output_work` had already popped the packets and timer
+    /// actions out of `pending_outputs` into a local `work` queue that only
+    /// the async fn's own stack frame owned; dropping that frame mid-await
+    /// (exactly what `select!`/`JoinHandle::abort()` do) silently discarded
+    /// already-admitted output. The fix stages `work` back into
+    /// `pending_outputs` -- the caller-owned field that survives the drop
+    /// -- before ever reaching the socket await.
+    ///
+    /// A bare manual `poll()` on a freshly registered socket's `writable()`
+    /// future is a minimal, deterministic readiness boundary: it cannot
+    /// observe `Ready` because nothing has driven the reactor's `epoll`
+    /// turn yet, so the first poll is guaranteed `Pending`. That gives full
+    /// control over the cancellation point without adding any test-only
+    /// seam to production code.
+    #[test]
+    fn drain_outputs_bounded_survives_cancellation_while_parked_on_writable() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("Tokio runtime builds");
+        let _guard = runtime.enter();
+
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("peer binds");
+        let local = std::net::UdpSocket::bind("127.0.0.1:0").expect("local binds");
+        local
+            .connect(peer.local_addr().expect("peer address"))
+            .expect("local connects to peer");
+        local.set_nonblocking(true).expect("local is nonblocking");
+        peer.set_nonblocking(true).expect("peer is nonblocking");
+        let sock = UdpSocket::from_std(local).expect("tokio adopts the socket");
+
+        let mut conn = Conn::new(
+            SrtConnection::new_caller(shiguredo_srt::ConnectionOptions::default()),
+            sock,
+        );
+        conn.pending_outputs
+            .push_back(ConnectionOutput::SendPacket(b"first".to_vec()));
+        conn.pending_outputs
+            .push_back(ConnectionOutput::SendPacket(b"second".to_vec()));
+        conn.pending_outputs.push_back(ConnectionOutput::SetTimer {
+            id: shiguredo_srt::TimerId::Ack,
+            duration_micros: 10_000,
+        });
+        let before: Vec<_> = conn.pending_outputs.iter().cloned().collect();
+
+        let budget = OutputDrainBudget::new(usize::MAX, usize::MAX, usize::MAX);
+        let mut future = Box::pin(conn.drain_outputs_bounded(Timestamp::from_micros(0), budget));
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let polled = future.as_mut().poll(&mut cx);
+        assert!(
+            matches!(polled, Poll::Pending),
+            "expected the first poll to park on writable() with no reactor turn yet, got {polled:?}"
+        );
+
+        // Cancellation: drop the suspended future without ever resuming it.
+        drop(future);
+
+        assert_eq!(
+            conn.pending_outputs.iter().collect::<Vec<_>>(),
+            before.iter().collect::<Vec<_>>(),
+            "cancelling before the writable() readiness resolved must leave every \
+             queued packet and timer action exactly as staged, in order"
+        );
+
+        let mut buf = [0u8; 64];
+        assert!(
+            matches!(
+                peer.recv(&mut buf),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock
+            ),
+            "nothing should have reached the wire before cancellation"
+        );
     }
 
     #[test]

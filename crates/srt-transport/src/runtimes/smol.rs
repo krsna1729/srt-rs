@@ -61,14 +61,16 @@ impl Conn {
             },
             ..Default::default()
         };
-        if work
+        let has_packets = work
             .iter()
-            .any(|output| matches!(output, ConnectionOutput::SendPacket(_)))
-            && let Err(error) = self.sock.writable().await
-        {
+            .any(|output| matches!(output, ConnectionOutput::SendPacket(_)));
+        let work = if has_packets {
             prepend_outputs(&mut self.pending_outputs, work.into_iter());
-            return Err(error);
-        }
+            self.sock.writable().await?;
+            collect_output_work(&mut self.conn, &mut self.pending_outputs, budget).0
+        } else {
+            work
+        };
         let fd = self.sock.get_ref().as_raw_fd();
         let report = drain_output_work(
             work,
@@ -220,4 +222,85 @@ pub fn caller(
 pub struct TickResult {
     pub sent: u64,
     pub events: Vec<ConnectionEvent>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+
+    /// S04: same cancellation-safety fix and rationale as
+    /// `tokio_transport::tests::drain_outputs_bounded_survives_cancellation_while_parked_on_writable`.
+    ///
+    /// `async-io`'s reactor runs on its own background thread rather than
+    /// only when an executor drives it, so unlike Tokio, a single manual
+    /// `poll()` here is not guaranteed to observe `Pending` -- the
+    /// background thread can race ahead and confirm writability first.
+    /// This test accepts either outcome and checks the invariant that
+    /// matters for each: if the future is still parked, cancelling it must
+    /// not drop the staged output; if it raced to completion instead,
+    /// every packet must have actually reached the peer.
+    #[test]
+    fn drain_outputs_bounded_loses_nothing_whether_cancelled_or_completed() {
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("peer binds");
+        let local = std::net::UdpSocket::bind("127.0.0.1:0").expect("local binds");
+        local
+            .connect(peer.local_addr().expect("peer address"))
+            .expect("local connects to peer");
+        peer.set_nonblocking(true).expect("peer is nonblocking");
+        let sock = smol::Async::new(local).expect("async-io adopts the socket");
+
+        let mut conn = Conn::new(
+            SrtConnection::new_caller(shiguredo_srt::ConnectionOptions::default()),
+            sock,
+        );
+        conn.pending_outputs
+            .push_back(ConnectionOutput::SendPacket(b"first".to_vec()));
+        conn.pending_outputs
+            .push_back(ConnectionOutput::SendPacket(b"second".to_vec()));
+        conn.pending_outputs.push_back(ConnectionOutput::SetTimer {
+            id: shiguredo_srt::TimerId::Ack,
+            duration_micros: 10_000,
+        });
+        let before: Vec<_> = conn.pending_outputs.iter().cloned().collect();
+
+        let budget = OutputDrainBudget::new(usize::MAX, usize::MAX, usize::MAX);
+        let mut future = Box::pin(conn.drain_outputs_bounded(Timestamp::from_micros(0), budget));
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let poll = future.as_mut().poll(&mut cx);
+        drop(future);
+        match poll {
+            Poll::Pending => {
+                assert_eq!(
+                    conn.pending_outputs.iter().collect::<Vec<_>>(),
+                    before.iter().collect::<Vec<_>>(),
+                    "cancelling before the writable() readiness resolved must leave every \
+                     queued packet and timer action exactly as staged, in order"
+                );
+                let mut buf = [0u8; 64];
+                assert!(
+                    matches!(
+                        peer.recv(&mut buf),
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock
+                    ),
+                    "nothing should have reached the wire before cancellation"
+                );
+            }
+            Poll::Ready(result) => {
+                result.expect("drain must not fail against a live loopback peer");
+                assert!(
+                    !conn.has_pending_outputs(),
+                    "a completed drain must not leave already-sent output queued"
+                );
+                let mut buf = [0u8; 64];
+                let mut received = Vec::new();
+                while let Ok(n) = peer.recv(&mut buf) {
+                    received.push(buf[..n].to_vec());
+                }
+                assert_eq!(received, vec![b"first".to_vec(), b"second".to_vec()]);
+            }
+        }
+    }
 }
