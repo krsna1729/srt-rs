@@ -2062,13 +2062,14 @@ mod tests {
         let mut bufs = (0..2).map(|_| Vec::with_capacity(64)).collect::<Vec<_>>();
         let mut sizes = vec![0; 1];
         let mut addrs = vec![None; 2];
-        let error = recvmsg_batch(-1, &mut bufs, &mut sizes, &mut addrs)
+        let mut truncated = vec![false; 2];
+        let error = recvmsg_batch(-1, &mut bufs, &mut sizes, &mut addrs, &mut truncated)
             .expect_err("mismatched slices must be rejected before the syscall");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
 
         let mut sizes = vec![0; 2];
         let mut addrs = vec![None; 1];
-        let error = recvmsg_batch(-1, &mut bufs, &mut sizes, &mut addrs)
+        let error = recvmsg_batch(-1, &mut bufs, &mut sizes, &mut addrs, &mut truncated)
             .expect_err("mismatched address slice must be rejected");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
@@ -2076,7 +2077,7 @@ mod tests {
     #[test]
     fn recvmsg_batch_accepts_an_empty_batch_without_touching_the_fd() {
         assert_eq!(
-            recvmsg_batch(-1, &mut [], &mut [], &mut []).expect("empty batch is a no-op"),
+            recvmsg_batch(-1, &mut [], &mut [], &mut [], &mut []).expect("empty batch is a no-op"),
             0
         );
     }
@@ -2222,6 +2223,7 @@ mod tests {
             let mut bufs: Vec<Vec<u8>> = (0..count).map(|_| Vec::with_capacity(64)).collect();
             let mut sizes = vec![0usize; count];
             let mut addrs = vec![None; count];
+            let mut truncated = vec![false; count];
             let deadline = Instant::now() + Duration::from_secs(2);
             let mut received = 0usize;
             while received < count && Instant::now() < deadline {
@@ -2230,6 +2232,7 @@ mod tests {
                     &mut bufs[received..],
                     &mut sizes[received..],
                     &mut addrs[received..],
+                    &mut truncated[received..],
                 ) {
                     Ok(0) => std::thread::yield_now(),
                     Ok(n) => received += n,

@@ -263,7 +263,11 @@ pub fn drain_readable(
         match result {
             Ok(received) => {
                 report.syscalls += 1;
-                for (addr, data) in batch.iter(received) {
+                for (addr, data, truncated) in batch.iter(received) {
+                    if truncated {
+                        report.truncated += 1;
+                        continue;
+                    }
                     on_datagram(addr, data);
                     report.datagrams += 1;
                 }
