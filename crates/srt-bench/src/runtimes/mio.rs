@@ -1684,7 +1684,7 @@ fn maintain_pool_peers(
         let _ = drain_conn_outputs(&mut p.conn, &mut p.timers, listener, *peer, now);
         let mut just_connected = false;
         while let Some(event) = p.conn.poll_event() {
-            just_connected |= p.apply_event(event);
+            just_connected |= p.apply_event(&event);
         }
         if just_connected {
             p.stream_deadline = Some(Instant::now() + stream_len);

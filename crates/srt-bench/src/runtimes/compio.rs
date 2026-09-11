@@ -770,7 +770,7 @@ async fn maintain_acceptor_peers(
         let _ = drain_pending_outputs(&mut p.conn, &mut p.timers, listener, *peer).await;
         let mut newly_connected = false;
         while let Some(event) = p.conn.poll_event() {
-            newly_connected |= p.apply_event(event);
+            newly_connected |= p.apply_event(&event);
         }
         if newly_connected {
             p.stream_deadline = Some(Instant::now() + stream_len);
