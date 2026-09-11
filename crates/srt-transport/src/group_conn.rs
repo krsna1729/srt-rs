@@ -1,7 +1,7 @@
 use crate::{
     BatchIoStats, CallerConfig, ConfigError, GroupConfig, ManualTimerStore, OutputDrainBudget,
-    OutputDrainReport, RecvBatch, RecvBudget, RuntimeFlavor, drain_connected_outputs,
-    drain_recv_fd, sendmsg_connected_batch,
+    OutputDrainReport, RecvBatch, RecvBudget, RecvDrainReport, RuntimeFlavor,
+    drain_connected_outputs, drain_recv_fd, sendmsg_connected_batch,
 };
 use shiguredo_srt::{Bytes, ConnectionOutput, SrtConnection, Timestamp};
 use std::collections::VecDeque;
@@ -103,6 +103,18 @@ pub struct GroupLegDriveReport {
     pub member_id: u32,
     pub received_datagrams: usize,
     pub output: OutputDrainReport,
+    /// Datagrams this leg's socket delivered that `feed_recv_buf` rejected
+    /// as malformed or misdirected (T04). Never fatal to the leg or the
+    /// group -- the connection's state is untouched by a decode failure,
+    /// so these are simply dropped and counted.
+    pub malformed_datagrams: usize,
+    /// `true` if a genuine recv or send syscall failure on this leg (not
+    /// `WouldBlock`, and not a malformed datagram) caused *this* call to
+    /// transition the member into [`shiguredo_srt::GroupMemberState::Broken`]
+    /// (T04) -- `false` on a call that finds it already `Broken`, so a
+    /// consumer watching for a once-per-failure edge (trigger failover,
+    /// emit one alert) does not see it re-fire on every later drive.
+    pub newly_broken: bool,
 }
 
 /// Work completed by one bounded bonded-transport maintenance call.
@@ -470,32 +482,65 @@ impl GroupConn {
                 &mut self.io_stats,
             );
             for leg in legs {
-                let member = group
+                let conn = group
                     .member_mut(leg.member_id)
-                    .expect("group and I/O legs are built together");
-                let conn = member.connection_mut();
+                    .expect("group and I/O legs are built together")
+                    .connection_mut();
                 leg.timers.fire_expired(now, conn);
 
-                let mut feed_error = None;
-                let received = drain_recv_fd(
+                // T04: a malformed or misdirected datagram is a per-packet
+                // decode/routing failure -- `feed_recv_buf` leaves the
+                // connection's own state untouched, so it is never a
+                // reason to break this leg, let alone the group. Only a
+                // genuine syscall failure below (not `WouldBlock`, which
+                // `drain_recv_fd`/`drain_group_leg_outputs` already fold
+                // into their `Ok` reports) marks a leg broken.
+                let mut malformed_datagrams = 0usize;
+                let recv_result = drain_recv_fd(
                     leg.socket.as_raw_fd(),
                     recv_batch,
                     recv_budget,
                     |_, data| {
-                        if let Err(error) = conn.feed_recv_buf(data, now) {
-                            feed_error.get_or_insert(error);
+                        if conn.feed_recv_buf(data, now).is_err() {
+                            malformed_datagrams += 1;
                         }
                     },
-                )?;
-                if let Some(error) = feed_error {
-                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error));
-                }
-                io_stats.record_recv(received);
+                );
+                let mut newly_broken = false;
+                let received = match recv_result {
+                    Ok(received) => {
+                        io_stats.record_recv(received);
+                        received
+                    }
+                    Err(_) => {
+                        newly_broken = mark_member_broken_if_new(group, leg.member_id);
+                        RecvDrainReport::default()
+                    }
+                };
 
-                let output = drain_group_leg_outputs(conn, leg, now, output_budget)?;
-                io_stats.record_send(&output);
+                // Re-borrow: `mark_member_broken` above needed `group` free
+                // of the earlier connection borrow. A leg just marked
+                // broken can still legitimately flush queued output (e.g.
+                // a final Shutdown control packet), so this is not
+                // skipped.
+                let conn = group
+                    .member_mut(leg.member_id)
+                    .expect("group and I/O legs are built together")
+                    .connection_mut();
+                let output = match drain_group_leg_outputs(conn, leg, now, output_budget) {
+                    Ok(output) => {
+                        io_stats.record_send(&output);
+                        output
+                    }
+                    Err(_) => {
+                        newly_broken |= mark_member_broken_if_new(group, leg.member_id);
+                        OutputDrainReport::default()
+                    }
+                };
                 report.legs.push(GroupLegDriveReport {
                     member_id: leg.member_id,
+                    malformed_datagrams,
+                    newly_broken,
                     received_datagrams: received.datagrams,
                     output,
                 });
@@ -547,6 +592,19 @@ fn drain_group_leg_outputs(
     )
 }
 
+/// Mark `member_id` broken and report whether this call is what actually
+/// caused the transition (T04). `SrtGroup::mark_member_broken` returns
+/// `true` whenever the member exists, even if it was already `Broken` --
+/// so a consumer of `GroupLegDriveReport::newly_broken` watching for a
+/// once-per-failure edge (trigger failover, emit one alert) needs this
+/// distinction, not "did this call attempt to mark it".
+fn mark_member_broken_if_new(group: &mut shiguredo_srt::SrtGroup, member_id: u32) -> bool {
+    let was_broken = group
+        .member(member_id)
+        .is_some_and(|member| member.state() == shiguredo_srt::GroupMemberState::Broken);
+    group.mark_member_broken(member_id) && !was_broken
+}
+
 #[cfg(test)]
 mod group_conn_tests {
     use super::*;
@@ -596,6 +654,41 @@ mod group_conn_tests {
                 }
             }
         }
+    }
+
+    /// T04 (Opus review): `mark_member_broken_if_new` must report the
+    /// transition, not "is this member currently broken" --
+    /// `SrtGroup::mark_member_broken` itself returns `true` on every call
+    /// as long as the member exists, so a naive `newly_broken =
+    /// group.mark_member_broken(id)` re-fires on every drive of an
+    /// already-broken leg.
+    #[test]
+    fn mark_member_broken_if_new_only_reports_the_first_transition() {
+        let mut group = shiguredo_srt::SrtGroup::new(
+            shiguredo_srt::SRTGROUP_MASK | 1,
+            shiguredo_srt::GroupMode::Broadcast,
+        )
+        .expect("group builds");
+        group
+            .add_member(
+                1,
+                10,
+                SrtConnection::new_caller(shiguredo_srt::ConnectionOptions::default()),
+            )
+            .expect("member adds");
+
+        assert!(
+            mark_member_broken_if_new(&mut group, 1),
+            "the first call must report the transition into Broken"
+        );
+        assert!(
+            !mark_member_broken_if_new(&mut group, 1),
+            "a member already Broken must not report newly_broken again"
+        );
+        assert!(
+            !mark_member_broken_if_new(&mut group, 404),
+            "a nonexistent member must report false, not panic"
+        );
     }
 
     #[test]
@@ -687,5 +780,227 @@ mod group_conn_tests {
             assert_eq!(stats.aggregate.logical_payloads_sent, 1);
             assert_eq!(stats.aggregate.wire_unique_packets_sent, 2);
         }
+    }
+
+    fn connect_two_leg_group(runtime: RuntimeFlavor) -> (GroupConn, Peer, Peer) {
+        let mut first_peer = Peer::new();
+        let mut second_peer = Peer::new();
+        let group = GroupConfig::new(43, shiguredo_srt::GroupType::Broadcast);
+        let mut conn = GroupConn::caller(
+            group,
+            [
+                GroupCallerLeg::new(
+                    1,
+                    10,
+                    CallerConfig::builder(first_peer.socket.local_addr().expect("first address"))
+                        .build()
+                        .expect("first caller config"),
+                ),
+                GroupCallerLeg::new(
+                    2,
+                    20,
+                    CallerConfig::builder(second_peer.socket.local_addr().expect("second address"))
+                        .build()
+                        .expect("second caller config"),
+                ),
+            ],
+            runtime,
+            Timestamp::from_micros(0),
+        )
+        .expect("bonded caller builds");
+
+        for round in 0..20 {
+            let now = Timestamp::from_micros(round * 10_000);
+            conn.drive(now, OutputDrainBudget::default())
+                .expect("group sends protocol output");
+            first_peer.drive(now);
+            second_peer.drive(now);
+            conn.drive(now, OutputDrainBudget::default())
+                .expect("group receives protocol output");
+            if conn.group().members().iter().all(|member| {
+                member.connection().state() == shiguredo_srt::ConnectionState::Connected
+            }) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            conn.group()
+                .members()
+                .iter()
+                .all(|member| member.connection().state()
+                    == shiguredo_srt::ConnectionState::Connected),
+            "group did not connect"
+        );
+        (conn, first_peer, second_peer)
+    }
+
+    /// T04 checkpoint 1/3: sustained malformed input on one leg must never
+    /// stop `drive` from servicing the rest of the group, and must never
+    /// mark the malformed leg broken -- `feed_recv_buf` rejecting a
+    /// datagram leaves the connection's own state untouched.
+    #[test]
+    fn sustained_malformed_input_on_one_leg_does_not_stop_the_group() {
+        let (mut conn, mut first_peer, mut second_peer) = connect_two_leg_group(RuntimeFlavor::Mio);
+        let first_addr = *conn
+            .leg_sockets()
+            .find(|(id, _)| *id == 1)
+            .map(|(_, sock)| sock)
+            .expect("leg 1 socket")
+            .local_addr()
+            .as_ref()
+            .expect("leg 1 address");
+
+        let mut total_malformed = 0usize;
+        for round in 0..10 {
+            let now = Timestamp::from_micros(1_000_000 + round * 10_000);
+            for _ in 0..3 {
+                // The leg's socket is `connect()`-ed to its peer, so the
+                // garbage must come from that same peer's socket -- an
+                // unrelated third-party sender's datagrams would never
+                // reach a connected UDP socket's receive queue at all.
+                first_peer
+                    .socket
+                    .send_to(b"not an srt packet, just garbage bytes", first_addr)
+                    .expect("garbage send");
+            }
+            let report = conn
+                .drive(now, OutputDrainBudget::default())
+                .expect("drive must not fail on malformed input");
+            let leg1 = report
+                .legs
+                .iter()
+                .find(|leg| leg.member_id == 1)
+                .expect("leg 1 report");
+            total_malformed += leg1.malformed_datagrams;
+            assert!(!leg1.newly_broken, "malformed input must not break the leg");
+
+            assert_eq!(
+                conn.group().member(1).expect("member 1").state(),
+                shiguredo_srt::GroupMemberState::Active,
+                "leg 1 must stay Active through sustained malformed input"
+            );
+
+            // The healthy leg keeps making real protocol progress the
+            // whole time -- the malformed leg's noise must not starve it.
+            second_peer.drive(now);
+            first_peer.drive(now);
+        }
+        assert!(
+            total_malformed > 0,
+            "the garbage sends must have registered as malformed"
+        );
+
+        assert_eq!(
+            conn.send(b"still bonded", Timestamp::from_micros(2_000_000))
+                .expect("group send still works after sustained malformed input"),
+            2
+        );
+    }
+
+    /// T04 checkpoints 1/2/3: a genuine socket failure on one leg must be
+    /// isolated to that leg -- the group refreshes its member states even
+    /// though a leg failed, a healthy leg keeps working, and once every
+    /// leg has failed the group honestly reports zero active legs rather
+    /// than silently doing nothing.
+    #[test]
+    fn one_leg_socket_failure_is_isolated_and_all_legs_failed_is_reported_honestly() {
+        let (mut conn, first_peer, mut second_peer) = connect_two_leg_group(RuntimeFlavor::Mio);
+
+        // Dropping the peer (rather than closing our own leg's fd with
+        // `libc::close`) is both a realistic genuine failure and hermetic:
+        // `cargo test` runs tests in parallel threads in one process, and a
+        // raw `close()` on a still-live `UdpSocket`'s fd leaves a window
+        // (until this test's `conn` is dropped) where an unrelated
+        // concurrently-running test's own socket bind could be handed that
+        // exact fd number, silently stealing its datagrams. Dropping the
+        // peer instead never touches our own fd table at all -- the
+        // failure comes from a real `ECONNREFUSED` via ICMP once the
+        // peer's port stops existing.
+        drop(first_peer);
+
+        let mut leg1_broken = false;
+        for round in 0..100 {
+            let now = Timestamp::from_micros(1_500_000 + round * 10_000);
+            let _ = conn.send(b"provoke icmp unreachable on leg 1", now);
+            conn.drive(now, OutputDrainBudget::default())
+                .expect("drive must not fail just because one leg's peer vanished");
+            second_peer.drive(now);
+            if conn.group().member(1).expect("member 1").state()
+                == shiguredo_srt::GroupMemberState::Broken
+            {
+                leg1_broken = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(
+            leg1_broken,
+            "leg 1 must eventually be marked Broken once its peer is unreachable"
+        );
+        assert_eq!(
+            conn.group().member(2).expect("member 2").state(),
+            shiguredo_srt::GroupMemberState::Active,
+            "the healthy leg must be unaffected by the other leg's failure"
+        );
+
+        // `newly_broken` must be a one-time edge, not "is this leg
+        // currently broken" -- a leg that failed a while ago must not
+        // re-report `newly_broken: true` on every later drive.
+        let now = Timestamp::from_micros(2_500_000);
+        let report = conn
+            .drive(now, OutputDrainBudget::default())
+            .expect("drive on an already-broken leg must not fail");
+        let leg1 = report
+            .legs
+            .iter()
+            .find(|leg| leg.member_id == 1)
+            .expect("leg 1 report");
+        assert!(
+            !leg1.newly_broken,
+            "a leg already Broken from a prior call must not report newly_broken again"
+        );
+
+        let now = Timestamp::from_micros(3_000_000);
+        assert_eq!(
+            conn.send(b"one leg down", now)
+                .expect("send still works with one healthy leg"),
+            1
+        );
+        conn.drive(now, OutputDrainBudget::default())
+            .expect("drive still services the healthy leg");
+        second_peer.drive(now);
+        conn.drive(now, OutputDrainBudget::default())
+            .expect("drive still services the healthy leg");
+        assert_eq!(conn.stats().aggregate.active_legs, 1);
+
+        // Now the remaining leg's peer vanishes too.
+        drop(second_peer);
+        let mut all_broken = false;
+        for round in 0..100 {
+            let now = Timestamp::from_micros(3_500_000 + round * 10_000);
+            let _ = conn.send(b"provoke icmp unreachable on leg 2", now);
+            conn.drive(now, OutputDrainBudget::default())
+                .expect("drive must not fail even when every leg has failed");
+            if conn
+                .group()
+                .members()
+                .iter()
+                .all(|member| member.state() == shiguredo_srt::GroupMemberState::Broken)
+            {
+                all_broken = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(
+            all_broken,
+            "every member must be Broken once every leg's peer is unreachable"
+        );
+        assert_eq!(
+            conn.stats().aggregate.active_legs,
+            0,
+            "total group failure must be reported honestly as zero active legs"
+        );
     }
 }
