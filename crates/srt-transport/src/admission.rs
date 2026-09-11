@@ -1964,21 +1964,25 @@ impl PeerTable {
         }
     }
 
-    /// Microseconds until any tracked peer's next timer deadline.
+    /// Microseconds until any tracked peer's next timer deadline (T05:
+    /// the true minimum across direct peers *and* bonded-group legs --
+    /// not "the group minimum, falling back to the peer minimum only if
+    /// the group has no deadline at all", which silently ignored an
+    /// earlier direct-peer deadline whenever the group had any deadline).
     pub fn time_until_next_deadline(&mut self, now: Timestamp, default_us: u64) -> u64 {
         self.last_now = now;
-        let peer_deadline = self
-            .deadlines
-            .peek_min_deadline(&self.slots)
-            .map(|deadline| deadline.saturating_sub(now))
-            .unwrap_or(default_us);
-        self.groups
+        let peer_deadline = self.deadlines.peek_min_deadline(&self.slots);
+        let group_deadline = self
+            .groups
             .values()
             .flat_map(|group| group.legs.values())
             .filter_map(|leg| leg.timers.next_deadline())
-            .map(|deadline| deadline.saturating_sub(now))
-            .min()
-            .unwrap_or(peer_deadline)
+            .min();
+        match (peer_deadline, group_deadline) {
+            (Some(a), Some(b)) => a.min(b).saturating_sub(now),
+            (Some(deadline), None) | (None, Some(deadline)) => deadline.saturating_sub(now),
+            (None, None) => default_us,
+        }
     }
 
     /// Drain logical ingress events for production consumers.
@@ -2942,5 +2946,121 @@ mod tests {
         // 4. Group leg can be re-armed
         table.mark_ready_physical(peer);
         assert_eq!(table.ready.len(), 1);
+    }
+
+    /// Arm a bonded-group leg's timer at `now + micros_from_now`, via the
+    /// same `ConnectionOutput::SetTimer` path a real connection would
+    /// produce, so `next_deadline()` is under test through its normal
+    /// entry point rather than a private-field poke.
+    fn arm_group_leg_deadline(table: &mut PeerTable, now: Timestamp, micros_from_now: u64) {
+        let group = shiguredo_srt::SrtGroup::new(
+            shiguredo_srt::SRTGROUP_MASK | 1,
+            shiguredo_srt::GroupMode::Broadcast,
+        )
+        .expect("valid group");
+        let key = srt_lifecycle::LogicalGroupKey {
+            group_id: 1,
+            stream_id: None,
+        };
+        let logical_peer = table.allocate_logical_peer(LogicalPeerTarget::Group(key.clone()));
+        let mut leg = InboundGroupLeg {
+            member_id: 1,
+            physical: PhysicalPeerKey {
+                address: "127.0.0.1:9100".parse().unwrap(),
+                local_socket_id: 1,
+            },
+            timers: ManualTimerStore::new(),
+        };
+        leg.timers.apply_output(
+            &ConnectionOutput::SetTimer {
+                id: shiguredo_srt::TimerId::Ack,
+                duration_micros: micros_from_now,
+            },
+            now,
+        );
+        let mut legs = HashMap::new();
+        legs.insert(1, leg);
+        table.groups.insert(
+            key,
+            InboundGroup {
+                group,
+                legs,
+                representative_peer: "127.0.0.1:9100".parse().unwrap(),
+                logical_peer,
+                connected: false,
+                stream_deadline: None,
+                data_events: 0,
+                last_data_at: Instant::now(),
+                torn_down: false,
+                logical_payloads_received: 0,
+                logical_payload_bytes_received: 0,
+                logical_payloads_sent: 0,
+                logical_payload_bytes_sent: 0,
+            },
+        );
+    }
+
+    /// T05: the true minimum across direct-peer and bonded-group
+    /// deadlines, in both orderings, plus the documented no-deadline
+    /// cases -- not "the group's own minimum, falling back to the peer's
+    /// only when the group has none at all" (which silently ignored an
+    /// earlier direct-peer deadline whenever the group had any).
+    #[test]
+    fn time_until_next_deadline_takes_the_true_minimum_of_direct_and_group() {
+        let now = Timestamp::from_micros(1_000_000);
+
+        // Direct at 10, group at 20: must yield 10.
+        let mut table = PeerTable::new();
+        let (_peer, slot_idx) = insert_test_peer(&mut table, "127.0.0.1:9200".parse().unwrap(), 1);
+        table.deadlines.set(
+            slot_idx,
+            Timestamp::from_micros(now.as_micros() + 10),
+            &mut table.slots,
+        );
+        arm_group_leg_deadline(&mut table, now, 20);
+        assert_eq!(table.time_until_next_deadline(now, 999), 10);
+
+        // Reverse: direct at 20, group at 10: must still yield 10.
+        let mut table = PeerTable::new();
+        let (_peer, slot_idx) = insert_test_peer(&mut table, "127.0.0.1:9201".parse().unwrap(), 2);
+        table.deadlines.set(
+            slot_idx,
+            Timestamp::from_micros(now.as_micros() + 20),
+            &mut table.slots,
+        );
+        arm_group_leg_deadline(&mut table, now, 10);
+        assert_eq!(table.time_until_next_deadline(now, 999), 10);
+
+        // Direct only: group population empty.
+        let mut table = PeerTable::new();
+        let (_peer, slot_idx) = insert_test_peer(&mut table, "127.0.0.1:9202".parse().unwrap(), 3);
+        table.deadlines.set(
+            slot_idx,
+            Timestamp::from_micros(now.as_micros() + 15),
+            &mut table.slots,
+        );
+        assert_eq!(table.time_until_next_deadline(now, 999), 15);
+
+        // Group only: peer population empty.
+        let mut table = PeerTable::new();
+        arm_group_leg_deadline(&mut table, now, 25);
+        assert_eq!(table.time_until_next_deadline(now, 999), 25);
+
+        // Both empty: the documented default.
+        let mut table = PeerTable::new();
+        assert_eq!(table.time_until_next_deadline(now, 999), 999);
+
+        // An already-expired deadline (in either population) must return
+        // an immediate (0) service indication, not a negative/wrapped
+        // value.
+        let mut table = PeerTable::new();
+        let (_peer, slot_idx) = insert_test_peer(&mut table, "127.0.0.1:9203".parse().unwrap(), 4);
+        table.deadlines.set(
+            slot_idx,
+            Timestamp::from_micros(now.as_micros() - 5),
+            &mut table.slots,
+        );
+        arm_group_leg_deadline(&mut table, now, 30);
+        assert_eq!(table.time_until_next_deadline(now, 999), 0);
     }
 }
