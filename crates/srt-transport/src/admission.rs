@@ -37,12 +37,18 @@ pub struct AdmissionPeer {
     /// Live connected state, feeding `srt_lifecycle::is_terminal`. Goes
     /// false again on `Disconnected`.
     pub connected: bool,
-    /// `None` until this peer's first `Connected`, which also makes it
-    /// the "has this ever connected" flag. Final success reporting should
-    /// use this rather than `connected`: a session that streamed
+    /// `None` until the legacy bench `drain_events` path arms this peer's
+    /// success-window deadline on its first `Connected` -- exclusively
+    /// bench-owned; a production `poll_events`-only consumer never sets
+    /// this and must not read it as "has this peer ever connected" (use
+    /// [`Self::ever_connected`], which updates unconditionally).
+    pub stream_deadline: Option<Instant>,
+    /// Set once, on this peer's first-ever `Connected`, regardless of
+    /// which consumer drains the event (A01). Final success reporting
+    /// should use this rather than `connected`: a session that streamed
     /// everything and then tripped the peer-idle timeout is still a
     /// success.
-    pub stream_deadline: Option<Instant>,
+    pub ever_connected: bool,
     pub data_events: u64,
     pub last_data_at: Instant,
     /// This peer went away for a reason other than the ordered close --
@@ -68,12 +74,19 @@ impl AdmissionPeer {
     /// Disconnected event means for one admitted peer" -- previously
     /// hand-copied identically into each of the six runtime adapters'
     /// per-tick admission loops, plus a seventh, slightly different copy
-    /// inside `PeerTable::drain_events`.
-    pub fn apply_event(&mut self, event: shiguredo_srt::ConnectionEvent) -> bool {
+    /// inside `PeerTable::drain_events`. Called once, unconditionally, as
+    /// part of draining the event itself (`drain_direct_events`, below) so
+    /// `connected`/`torn_down`/`data_events` are correct for *any* consumer
+    /// -- not only one that happens to call the legacy `drain_events` (A01):
+    /// a production caller using only `poll_events` used to see none of
+    /// this bookkeeping update at all, unlike a bonded group (whose
+    /// `poll_events` loop already updates `connected`/`torn_down` directly).
+    pub fn apply_event(&mut self, event: &shiguredo_srt::ConnectionEvent) -> bool {
         use shiguredo_srt::ConnectionEvent;
         match event {
             ConnectionEvent::Connected => {
-                let first_connect = self.stream_deadline.is_none();
+                let first_connect = !self.ever_connected;
+                self.ever_connected = true;
                 self.connected = true;
                 first_connect
             }
@@ -83,7 +96,7 @@ impl AdmissionPeer {
                 false
             }
             ConnectionEvent::Disconnected { reason } => {
-                self.torn_down |= !is_ordered_close(&reason);
+                self.torn_down |= !is_ordered_close(reason);
                 self.connected = false;
                 false
             }
@@ -685,7 +698,10 @@ struct InboundGroup {
     representative_peer: std::net::SocketAddr,
     logical_peer: LogicalPeerId,
     connected: bool,
+    /// Bench-only success-window deadline; see [`AdmissionPeer::stream_deadline`].
     stream_deadline: Option<Instant>,
+    /// See [`AdmissionPeer::ever_connected`].
+    ever_connected: bool,
     data_events: u64,
     last_data_at: Instant,
     torn_down: bool,
@@ -1197,6 +1213,7 @@ impl PeerTable {
             timers: ManualTimerStore::new(),
             connected: false,
             stream_deadline: None,
+            ever_connected: false,
             data_events: 0,
             last_data_at: Instant::now(),
             torn_down: false,
@@ -1358,6 +1375,7 @@ impl PeerTable {
                     logical_peer,
                     connected: false,
                     stream_deadline: None,
+                    ever_connected: false,
                     data_events: 0,
                     last_data_at: Instant::now(),
                     torn_down: false,
@@ -2000,6 +2018,7 @@ impl PeerTable {
                 continue;
             };
             while let Some(event) = entry.conn.poll_event() {
+                entry.apply_event(&event);
                 out.push(AdmissionEvent {
                     representative_peer: peer_addr,
                     logical_peer: entry.logical_peer,
@@ -2018,6 +2037,7 @@ impl PeerTable {
                     shiguredo_srt::GroupEvent::MemberConnected { .. } => {
                         if !group.connected {
                             group.connected = true;
+                            group.ever_connected = true;
                             out.push(AdmissionEvent {
                                 representative_peer: group.representative_peer,
                                 logical_peer: group.logical_peer,
@@ -2091,8 +2111,15 @@ impl PeerTable {
                 .cloned()
             {
                 Some(LogicalPeerTarget::Direct(physical)) => {
+                    // `poll_events` (above) already applied this event to
+                    // `entry` via `apply_event`, including any `connected`
+                    // flip -- checking `stream_deadline.is_none()` here
+                    // reproduces exactly the "first-ever Connected" signal
+                    // `apply_event`'s own return value used to give,
+                    // without applying the event a second time.
                     if let Some(entry) = self.get_peer_mut(&physical)
-                        && entry.apply_event(admission_event.event)
+                        && connected
+                        && entry.stream_deadline.is_none()
                     {
                         entry.stream_deadline = Some(deadline);
                         newly_connected.push(NewlyConnectedPeer {
@@ -2349,7 +2376,7 @@ impl PeerTable {
             .iter()
             .map(|(key, group)| InboundGroupStats {
                 key: key.clone(),
-                ever_connected: group.stream_deadline.is_some(),
+                ever_connected: group.ever_connected,
                 torn_down: group.torn_down,
                 connection: group_connection_stats(
                     &group.group,
@@ -2450,19 +2477,21 @@ impl PeerTable {
     }
 
     /// Number of logical streams that have completed their initial SRT
-    /// handshake, even if an orderly close has already begun.
+    /// handshake, even if an orderly close has already begun. Reflects
+    /// `poll_events`-driven state (A01): correct for a production consumer
+    /// that never calls the legacy bench `drain_events`.
     #[must_use]
     pub fn logical_started_count(&self) -> usize {
         let direct = self
             .slots
             .iter()
             .filter_map(|slot| slot.value.direct())
-            .filter(|entry| entry.stream_deadline.is_some())
+            .filter(|entry| entry.ever_connected)
             .count();
         let groups = self
             .groups
             .values()
-            .filter(|group| group.stream_deadline.is_some())
+            .filter(|group| group.ever_connected)
             .count();
         direct + groups
     }
@@ -2989,6 +3018,7 @@ mod tests {
                 logical_peer,
                 connected: false,
                 stream_deadline: None,
+                ever_connected: false,
                 data_events: 0,
                 last_data_at: Instant::now(),
                 torn_down: false,
@@ -3062,5 +3092,278 @@ mod tests {
         );
         arm_group_leg_deadline(&mut table, now, 30);
         assert_eq!(table.time_until_next_deadline(now, 999), 0);
+    }
+
+    fn next_packet(conn: &mut SrtConnection) -> Vec<u8> {
+        loop {
+            match conn.poll_output().expect("connection output") {
+                ConnectionOutput::SendPacket(bytes) => return bytes,
+                ConnectionOutput::SetTimer { .. } | ConnectionOutput::ClearTimer { .. } => {}
+            }
+        }
+    }
+
+    /// Drives a real caller through induction against `table`, returning the
+    /// caller connection plus its not-yet-fed conclusion packet.
+    fn admit_up_to_conclusion(
+        table: &mut PeerTable,
+        peer: std::net::SocketAddr,
+        socket_id: u32,
+        options: &AdmissionOptions,
+        telemetry: &IngressTelemetry,
+    ) -> (SrtConnection, Vec<u8>) {
+        let mut caller = SrtConnection::new_caller(ConnectionOptions {
+            socket_id,
+            ..ConnectionOptions::default()
+        });
+        caller.connect(Timestamp::default()).expect("start caller");
+        assert_eq!(
+            table.admit(
+                peer,
+                &next_packet(&mut caller),
+                Timestamp::default(),
+                options,
+                0,
+                1,
+                telemetry,
+            ),
+            Admit::Fed
+        );
+        let mut outbound = Vec::new();
+        table.poll_outbound(Timestamp::default(), &mut outbound);
+        for (outbound_peer, packet) in outbound {
+            if outbound_peer == peer {
+                caller
+                    .feed_recv_buf(&packet, Timestamp::from_micros(1))
+                    .expect("induction response");
+            }
+        }
+        let conclusion = next_packet(&mut caller);
+        (caller, conclusion)
+    }
+
+    /// Feeds the caller's conclusion packet to `table`, completing the
+    /// handshake so the listener-side `AdmissionPeer` reaches `Connected`
+    /// (queued on its `SrtConnection`, not yet drained by anyone).
+    fn admit_conclusion(
+        table: &mut PeerTable,
+        peer: std::net::SocketAddr,
+        caller: &mut SrtConnection,
+        conclusion: &[u8],
+        options: &AdmissionOptions,
+        telemetry: &IngressTelemetry,
+    ) {
+        assert_eq!(
+            table.admit(
+                peer,
+                conclusion,
+                Timestamp::from_micros(2),
+                options,
+                0,
+                1,
+                telemetry,
+            ),
+            Admit::Fed
+        );
+        let mut outbound = Vec::new();
+        table.poll_outbound(Timestamp::from_micros(2), &mut outbound);
+        for (outbound_peer, packet) in outbound {
+            if outbound_peer == peer {
+                caller
+                    .feed_recv_buf(&packet, Timestamp::from_micros(3))
+                    .expect("conclusion response");
+            }
+        }
+    }
+
+    /// A1: `AdmissionPeer::connected` must update as part of draining the
+    /// event through `poll_events` itself, not only via the legacy
+    /// `drain_events` (bench) path -- a bonded group's `poll_events` loop
+    /// already updated `connected`/`torn_down` directly; a direct peer's
+    /// did not, so a production consumer using only `poll_events` never
+    /// saw a direct peer's lifecycle state change at all.
+    #[test]
+    fn poll_events_updates_direct_peer_lifecycle_state_without_drain_events() {
+        let peer = "127.0.0.1:11000".parse().expect("address");
+        let options = AdmissionOptions::basic(0x3333, 0, false);
+        let telemetry = IngressTelemetry::new();
+        let mut table = PeerTable::new();
+
+        let (mut caller, conclusion) =
+            admit_up_to_conclusion(&mut table, peer, 0x4444, &options, &telemetry);
+        admit_conclusion(
+            &mut table,
+            peer,
+            &mut caller,
+            &conclusion,
+            &options,
+            &telemetry,
+        );
+
+        let physical = table.physical_for_address(peer).expect("peer admitted");
+        assert!(
+            !table.get_peer(&physical).expect("peer entry").connected,
+            "connected must not flip before the queued Connected event is drained"
+        );
+
+        let mut events = Vec::new();
+        table.poll_events(&mut events);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.event, ConnectionEvent::Connected)),
+            "expected a Connected event among {events:?}"
+        );
+
+        assert!(
+            table.get_peer(&physical).expect("peer entry").connected,
+            "poll_events alone (never drain_events) must update AdmissionPeer::connected"
+        );
+    }
+
+    /// A1: the legacy `drain_events` (bench) path must still arm
+    /// `stream_deadline` exactly once, on the peer's first-ever Connected,
+    /// and report it via `newly_connected` -- unchanged now that the
+    /// underlying `connected`/`torn_down` mutation moved into `poll_events`.
+    #[test]
+    fn drain_events_still_arms_stream_deadline_once_on_first_connect() {
+        let peer = "127.0.0.1:11001".parse().expect("address");
+        let options = AdmissionOptions::basic(0x5555, 0, false);
+        let telemetry = IngressTelemetry::new();
+        let mut table = PeerTable::new();
+
+        let (mut caller, conclusion) =
+            admit_up_to_conclusion(&mut table, peer, 0x6666, &options, &telemetry);
+        admit_conclusion(
+            &mut table,
+            peer,
+            &mut caller,
+            &conclusion,
+            &options,
+            &telemetry,
+        );
+
+        let mut newly_connected = Vec::new();
+        table.drain_events(Duration::from_secs(30), &mut newly_connected);
+        assert_eq!(newly_connected.len(), 1);
+        assert_eq!(newly_connected[0].representative_peer, peer);
+
+        let physical = table.physical_for_address(peer).expect("peer admitted");
+        assert!(
+            table
+                .get_peer(&physical)
+                .expect("peer entry")
+                .stream_deadline
+                .is_some()
+        );
+
+        // A second drain (no new events) must not re-report the same peer.
+        table.drain_events(Duration::from_secs(30), &mut newly_connected);
+        assert!(newly_connected.is_empty());
+    }
+
+    /// A1 (Opus review): `logical_started_count`/`bonded_stats().ever_connected`
+    /// must reflect a real handshake completion through `poll_events` alone
+    /// -- previously both read `stream_deadline.is_some()`, which only
+    /// `drain_events` (the legacy bench path) ever sets, so a production
+    /// `poll_events`-only consumer always saw a started count of `0` no
+    /// matter how many peers had genuinely connected.
+    #[test]
+    fn logical_started_count_reflects_poll_events_alone() {
+        let peer = "127.0.0.1:11003".parse().expect("address");
+        let options = AdmissionOptions::basic(0x9999, 0, false);
+        let telemetry = IngressTelemetry::new();
+        let mut table = PeerTable::new();
+        assert_eq!(table.logical_started_count(), 0);
+
+        let (mut caller, conclusion) =
+            admit_up_to_conclusion(&mut table, peer, 0xaaaa, &options, &telemetry);
+        admit_conclusion(
+            &mut table,
+            peer,
+            &mut caller,
+            &conclusion,
+            &options,
+            &telemetry,
+        );
+        assert_eq!(
+            table.logical_started_count(),
+            0,
+            "not started until the queued Connected event is drained"
+        );
+
+        let mut events = Vec::new();
+        table.poll_events(&mut events);
+        assert_eq!(
+            table.logical_started_count(),
+            1,
+            "poll_events alone (never drain_events) must count this peer as started"
+        );
+    }
+
+    /// A1: guards against a `drain_events` regression this refactor made
+    /// newly possible -- applying an event's bookkeeping twice, once via
+    /// its own internal `poll_events` call (which now updates
+    /// `AdmissionPeer` state directly) and again via a second, redundant
+    /// `apply_event` call on the same drained event. Never reachable on
+    /// unmodified `main` (there `apply_event` had exactly one call site,
+    /// inside `drain_events`), but a double application would be invisible
+    /// for `Connected` (idempotent `connected = true`) while silently
+    /// doubling `data_events` for every real payload, so it is worth
+    /// pinning down explicitly now that two call sites touch the same
+    /// state.
+    #[test]
+    fn drain_events_counts_one_data_event_exactly_once() {
+        let peer = "127.0.0.1:11002".parse().expect("address");
+        let options = AdmissionOptions::basic(0x7777, 20, false);
+        let telemetry = IngressTelemetry::new();
+        let mut table = PeerTable::new();
+
+        let (mut caller, conclusion) =
+            admit_up_to_conclusion(&mut table, peer, 0x8888, &options, &telemetry);
+        admit_conclusion(
+            &mut table,
+            peer,
+            &mut caller,
+            &conclusion,
+            &options,
+            &telemetry,
+        );
+        let mut newly_connected = Vec::new();
+        table.drain_events(Duration::from_secs(30), &mut newly_connected);
+
+        caller
+            .send(b"payload", Timestamp::from_micros(4))
+            .expect("caller sends");
+        let data_packet = next_packet(&mut caller);
+        assert_eq!(
+            table.admit(
+                peer,
+                &data_packet,
+                Timestamp::from_micros(5),
+                &options,
+                0,
+                1,
+                &telemetry,
+            ),
+            Admit::Fed
+        );
+
+        // DATA is held by the negotiated TSBPD latency, which takes the max
+        // of both sides' proposed delay -- the caller's default (120ms,
+        // since `ConnectionOptions::default()` is used above) wins over the
+        // listener's 20ms. Drive the peer timers past that deadline before
+        // observing logical delivery (matches caller.rs's own admission
+        // tests' established pattern).
+        let mut outbound = Vec::new();
+        table.poll_outbound(Timestamp::from_micros(125_000), &mut outbound);
+        table.drain_events(Duration::from_secs(30), &mut newly_connected);
+
+        let physical = table.physical_for_address(peer).expect("peer admitted");
+        assert_eq!(
+            table.get_peer(&physical).expect("peer entry").data_events,
+            1,
+            "one DataReceived event must count as exactly one data_events increment"
+        );
     }
 }
