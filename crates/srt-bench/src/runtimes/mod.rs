@@ -113,19 +113,15 @@ pub mod tokio;
 
 use crate::{BenchConfig, Runtime};
 
-/// Dispatch to the selected runtime's driver.
-/// Exit code for "this runtime does not implement that ingress
-/// strategy". Distinct from a real failure so a sweep can tell a gap in
-/// coverage from a bug.
-pub const EXIT_UNSUPPORTED: i32 = 3;
-
 /// Does `runtime` actually implement `ingress` on the receiving side?
 ///
 /// Asking a runtime for a strategy it lacks used to fall through to the
 /// per-port path, where every connection computes the same handful of
 /// ports and they collide on bind -- surfacing as a pile of EADDRINUSE
 /// panics rather than "not implemented", which is alarming and hard to
-/// tell from a real port-allocation bug. Checked up front instead.
+/// tell from a real port-allocation bug. `harness`'s scheduling matrix
+/// checks this up front, before building any configuration that would
+/// hit that fallback.
 #[must_use]
 pub fn ingress_supported(runtime: Runtime, ingress: crate::Ingress) -> bool {
     // All four strategies now exist on every backend. Kept as a function
@@ -135,23 +131,11 @@ pub fn ingress_supported(runtime: Runtime, ingress: crate::Ingress) -> bool {
     true
 }
 
+/// Dispatch to the selected runtime's driver.
 pub fn run(cfg: BenchConfig) {
     if let Err(error) = cfg.validate_startup() {
         eprintln!("srt-bench: {error}");
         std::process::exit(2);
-    }
-    // Receivers are what bind; a sender just dials whatever the topology
-    // says, so it needs no capability of its own.
-    if cfg.mode == crate::Mode::Receiver
-        && cfg.connections > 1
-        && !ingress_supported(cfg.runtime, cfg.ingress)
-    {
-        eprintln!(
-            "srt-bench: {} does not implement --ingress {} (only mio does)",
-            cfg.runtime.name(),
-            crate::harness::describe_ingress(cfg.ingress),
-        );
-        std::process::exit(EXIT_UNSUPPORTED);
     }
     match cfg.runtime {
         Runtime::Mio => mio::run(cfg),

@@ -6,9 +6,7 @@ use crate::{
     drain_output_work, group_connection_stats, prepend_outputs, schedule_wait_micros,
     sendmsg_connected_batch,
 };
-use shiguredo_srt::{
-    Bytes, ConnectionEvent, ConnectionOutput, GroupMode, SrtConnection, Timestamp,
-};
+use shiguredo_srt::{Bytes, ConnectionOutput, GroupMode, SrtConnection, Timestamp};
 use std::collections::VecDeque;
 use std::hash::Hash;
 use std::io;
@@ -232,33 +230,6 @@ impl Conn {
             Ok(_) => PacedSendOutcome::Accepted,
             Err(error) => PacedSendOutcome::DriverError(error),
         }
-    }
-
-    /// Full event-loop tick: fire timers, recv, drain, send paced.
-    pub async fn tick(
-        &mut self,
-        buf: &mut [u8],
-        payload: &[u8],
-        now: Timestamp,
-    ) -> io::Result<TickResult> {
-        self.fire_expired(now);
-        self.recv_with_timeout(buf, Duration::from_micros(100), now)
-            .await;
-        let drained = self.drain_outputs(now).await?;
-
-        let mut sent = 0u64;
-        if drained.status == OutputDrainStatus::Drained {
-            while matches!(self.send_paced(payload, now).await, PacedSendOutcome::Sent) {
-                sent += 1;
-            }
-        }
-
-        let mut events = Vec::new();
-        while let Some(ev) = self.conn.poll_event() {
-            events.push(ev);
-        }
-
-        Ok(TickResult { sent, events })
     }
 }
 
@@ -672,11 +643,6 @@ fn mark_member_broken_if_new(group: &mut shiguredo_srt::SrtGroup, member_id: u32
         .member(member_id)
         .is_some_and(|member| member.state() == shiguredo_srt::GroupMemberState::Broken);
     group.mark_member_broken(member_id) && !was_broken
-}
-
-pub struct TickResult {
-    pub sent: u64,
-    pub events: Vec<ConnectionEvent>,
 }
 
 #[cfg(test)]

@@ -22,7 +22,7 @@ protocol testable, benchmarkable, and fuzzable with zero sockets.
 | `srt_receiver` | `ReceiverBuffer`: reordering, loss list, TSBPD delivery, ACK/NAK generation, RTT estimation, `ReceiverStats` |
 | `srt_sender` | `SenderBuffer`: flow window, congestion window, pacing (`time_until_send`), retransmit queue, `SenderStats` |
 | `srt_group` | Bonding groups: `SrtGroup` with Broadcast / Backup modes, member lifecycle, group-level send/receive |
-| `crypto` | `CryptoContext`: PBKDF2-HMAC-SHA1 KEK derivation, AES Key Wrap SEK exchange, AES-CTR payload encryption; key material is redacted in `Debug` and zeroized on drop |
+| `crypto` | `CryptoContext`: PBKDF2-HMAC-SHA1 KEK derivation, AES Key Wrap SEK exchange, `CipherMode::Ctr`/`Gcm` payload encryption (AES-CTR or authenticated AES-GCM); key material is redacted in `Debug` and zeroized on drop |
 | `stream_id` | StreamID + `#!::k=v,…` access-control parsing (`AccessControl`, `StreamType`, `StreamMode`) |
 | `buf`, `error`, `time` | Checked big-endian read/write cursor helpers, `Error`/`ErrorKind` with backtrace capture, `Timestamp` (µs, injected) |
 
@@ -135,8 +135,10 @@ cargo test -p pbt             # property-based suites, one per core module
 ```
 
 `tests/allocation_guard.rs` asserts steady-state per-packet allocation
-count stays **bounded and flat** (not zero — `BTreeMap` storage is a
-deliberate, measured tradeoff documented in that file's header).
+count stays **bounded and flat** (not zero — wire encoding, receive-buffer
+insertion, and application-event ownership require bounded allocations;
+measured 5/packet crate-side, with a generous 12/packet regression
+ceiling, documented in that file's header).
 
 Fuzz targets under [`fuzz/`](fuzz/) (`cargo-fuzz`, nightly): decode paths
 and stateful connection input must never panic on attacker input. Run record and the panic they already

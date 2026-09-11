@@ -3,7 +3,7 @@ use crate::{
     RecvBatch, RecvBudget, RecvDrainReport, collect_output_work, drain_output_work, drain_recv_fd,
     prepend_outputs, sendmsg_connected_batch,
 };
-use shiguredo_srt::{Bytes, ConnectionEvent, ConnectionOutput, SrtConnection, Timestamp};
+use shiguredo_srt::{Bytes, ConnectionOutput, SrtConnection, Timestamp};
 use std::collections::VecDeque;
 use std::io;
 use std::os::fd::AsRawFd;
@@ -188,32 +188,6 @@ impl Conn {
             Err(error) => PacedSendOutcome::DriverError(error),
         }
     }
-
-    pub async fn tick(
-        &mut self,
-        buf: &mut [u8],
-        payload: &[u8],
-        now: Timestamp,
-    ) -> io::Result<TickResult> {
-        self.fire_expired(now);
-        self.recv_with_timeout(buf, Duration::from_micros(100), now)
-            .await;
-        let drained = self.drain_outputs(now).await?;
-
-        let mut sent = 0u64;
-        if drained.status == OutputDrainStatus::Drained {
-            while matches!(self.send_paced(payload, now).await, PacedSendOutcome::Sent) {
-                sent += 1;
-            }
-        }
-
-        let mut events = Vec::new();
-        while let Some(ev) = self.conn.poll_event() {
-            events.push(ev);
-        }
-
-        Ok(TickResult { sent, events })
-    }
 }
 
 /// Resolve and bind a listener using smol-native async sockets.
@@ -242,11 +216,6 @@ pub fn caller(
         prepared.transport.output_drain,
         prepared.transport.recv_budget,
     ))
-}
-
-pub struct TickResult {
-    pub sent: u64,
-    pub events: Vec<ConnectionEvent>,
 }
 
 #[cfg(test)]
