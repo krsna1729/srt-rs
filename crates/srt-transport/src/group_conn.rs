@@ -338,6 +338,19 @@ impl GroupConn {
                 weight: leg.weight,
             }));
             let prepared = caller.prepare(runtime)?;
+            // Every leg already gets its own dedicated socket by
+            // construction (one per group member); `Shared` ownership,
+            // which multiplexes several sessions onto one socket, is never
+            // meaningful here and `bind_socket` (K01) leaves such a socket
+            // unconnected -- silently breaking this type's connected-socket
+            // `sendmsg_connected_batch` send path instead of failing
+            // preparation. Reject it up front instead.
+            if !prepared.transport.exclusive {
+                return Err(GroupBuildError::Config(ConfigError::new(
+                    "transport.ownership",
+                    "a bonded group leg needs its own connected socket; Shared ownership is not supported here",
+                )));
+            }
             raw_legs.push(GroupConnectionLeg {
                 member_id: leg.member_id,
                 weight: leg.weight,
@@ -779,6 +792,37 @@ mod group_conn_tests {
             assert_eq!(stats.aggregate.active_legs, 2);
             assert_eq!(stats.aggregate.logical_payloads_sent, 1);
             assert_eq!(stats.aggregate.wire_unique_packets_sent, 2);
+        }
+    }
+
+    /// K01 (Opus review): every group leg already gets its own dedicated
+    /// socket, so a leg's `CallerConfig` requesting `Shared` ownership is
+    /// never meaningful -- and `bind_socket` leaves such a socket
+    /// unconnected, silently breaking this type's connected-socket send
+    /// path. `caller()` must reject this at build time, not build a leg
+    /// that fails at first send.
+    #[test]
+    fn caller_rejects_a_shared_ownership_leg_instead_of_building_an_unconnected_socket() {
+        let peer = Peer::new();
+        let group = GroupConfig::new(44, shiguredo_srt::GroupType::Broadcast);
+        let result = GroupConn::caller(
+            group,
+            [GroupCallerLeg::new(
+                1,
+                10,
+                CallerConfig::builder(peer.socket.local_addr().expect("peer address"))
+                    .ownership(crate::SocketOwnership::Shared)
+                    .build()
+                    .expect("caller config builds"),
+            )],
+            RuntimeFlavor::Mio,
+            Timestamp::from_micros(0),
+        );
+        match result {
+            Ok(_) => {
+                panic!("a Shared-ownership leg must be rejected, not silently built unconnected")
+            }
+            Err(error) => assert!(matches!(error, GroupBuildError::Config(_))),
         }
     }
 

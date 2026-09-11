@@ -35,7 +35,7 @@ pub struct ConfigError {
 }
 
 impl ConfigError {
-    fn new(field: &'static str, reason: impl Into<String>) -> Self {
+    pub(crate) fn new(field: &'static str, reason: impl Into<String>) -> Self {
         Self {
             field,
             reason: reason.into(),
@@ -1247,12 +1247,12 @@ impl EndpointSocketPlan {
         }
     }
 
-    /// Canonical resolve: topology + ownership + promotion checked together.
-    /// Rejects explicit `All/Bonded/Relocate + Shared` (first `connect()`
-    /// would steal later handshakes; use `Never` + socket-ID demux) and
-    /// `ReusePortSingle + Shared`. `Auto + Shared` normalizes to `Never` by
-    /// construction. No successful `Shared` result ever carries
-    /// `promotion != Never` (post-resolve guard).
+    /// Thin convenience wrapper (K01): delegates entirely to
+    /// [`TransportConfig::resolve`], the one canonical resolver
+    /// `ListenerConfig`, `CallerConfig` and this type all funnel through.
+    /// Kept as a separate constructor because benchmark/pool code builds
+    /// a plan from ownership-first arguments rather than a `TransportConfig`
+    /// value; the validation itself lives in exactly one place.
     pub fn resolve(
         self,
         capabilities: TransportCapabilities,
@@ -1261,45 +1261,20 @@ impl EndpointSocketPlan {
         socket_buffers: SocketBufferConfig,
         output_drain: OutputDrainBudget,
     ) -> Result<ResolvedEndpointPlan, ConfigError> {
-        let exclusive = matches!(self.ownership, SocketOwnership::Exclusive);
-        let effective = match (self.promotion, self.ownership) {
-            (
-                PromotionPolicy::All | PromotionPolicy::Bonded | PromotionPolicy::Relocate,
-                SocketOwnership::Shared,
-            ) => {
-                return Err(ConfigError::new(
-                    "transport.promotion",
-                    "Shared UDP tuple cannot promote: first connect() steals later handshakes; use Never + socket-ID demux",
-                ));
-            }
-            (PromotionPolicy::Auto, SocketOwnership::Shared) => PromotionPolicy::Never,
-            (promotion, _) => promotion,
-        };
-        if matches!(self.topology, ListenerTopology::ReusePortSingle { .. }) && !exclusive {
-            return Err(ConfigError::new(
-                "transport.topology",
-                "ReusePortSingle ConnectedWorkers requires Exclusive tuple; Shared must use UnconnectedListener (ReusePortMulti{1})",
-            ));
-        }
         let cfg = TransportConfig {
             topology: self.topology,
             workers,
             batching,
-            promotion: effective,
+            promotion: self.promotion,
             socket_buffers,
             output_drain,
+            ownership: self.ownership,
         };
         let resolved = cfg.resolve(capabilities)?;
-        if !exclusive && resolved.promotion != srt_lifecycle::Promotion::Never {
-            return Err(ConfigError::new(
-                "transport.promotion",
-                "Shared UDP tuple resolved to promotion != Never; use Never + socket-ID demux",
-            ));
-        }
         Ok(ResolvedEndpointPlan {
             topology: resolved.topology,
             promotion: resolved.promotion,
-            exclusive,
+            exclusive: resolved.exclusive,
             socket_buffer_bytes: resolved.socket_buffer_bytes,
             batch_size: resolved.batch_size,
             workers: resolved.workers,
@@ -1376,6 +1351,13 @@ pub struct TransportConfig {
     pub promotion: PromotionPolicy,
     pub socket_buffers: SocketBufferConfig,
     pub output_drain: OutputDrainBudget,
+    /// Which side owns the UDP 4-tuple (K01). Defaults to `Exclusive`,
+    /// matching every caller of this config before this field existed:
+    /// one SRT session per UDP tuple, socket safe to `connect()`. Set
+    /// `Shared` for N sessions demultiplexed by destination socket ID on
+    /// one tuple -- `resolve()` then rejects any promotion policy that
+    /// would `connect()` the socket and steal a later handshake.
+    pub ownership: SocketOwnership,
 }
 
 impl Default for TransportConfig {
@@ -1387,6 +1369,7 @@ impl Default for TransportConfig {
             promotion: PromotionPolicy::Auto,
             socket_buffers: SocketBufferConfig::Auto,
             output_drain: OutputDrainBudget::default(),
+            ownership: SocketOwnership::Exclusive,
         }
     }
 }
@@ -1410,6 +1393,7 @@ impl TransportConfig {
                 promotion: PromotionPolicy::All,
                 socket_buffers: SocketBufferConfig::SystemDefault,
                 output_drain: OutputDrainBudget::new(32, 16, 128 * 1024),
+                ownership: SocketOwnership::Exclusive,
             },
             TransportProfile::HighDensity => Self {
                 topology: ListenerTopology::ReusePortMulti {
@@ -1422,22 +1406,59 @@ impl TransportConfig {
                     NonZeroUsize::new(SOCK_BUF_BYTES).expect("socket buffer default is non-zero"),
                 ),
                 output_drain: OutputDrainBudget::new(128, 64, 512 * 1024),
+                ownership: SocketOwnership::Exclusive,
             },
         };
         self
     }
 
+    /// Canonical resolve (K01): topology + ownership + promotion checked
+    /// together, the one path `ListenerConfig`, `CallerConfig` and
+    /// [`EndpointSocketPlan`] (kept as a thin, ownership-first-argument
+    /// convenience for benchmark/pool construction) all funnel through.
+    /// Rejects explicit `All`/`Bonded`/`Relocate` promotion with `Shared`
+    /// ownership (first `connect()` would steal a later handshake; use
+    /// `Never` + socket-ID demux) and `ReusePortSingle` with `Shared`.
+    /// `Auto` + `Shared` normalizes to `Never` by construction. No
+    /// successful `Shared` resolve ever carries `promotion != Never`
+    /// (checked again after resolving, as a post-condition).
     pub fn resolve(
         &self,
         capabilities: TransportCapabilities,
     ) -> Result<ResolvedTransportConfig, ConfigError> {
+        let exclusive = matches!(self.ownership, SocketOwnership::Exclusive);
+        let effective_promotion = match (self.promotion, self.ownership) {
+            (
+                PromotionPolicy::All | PromotionPolicy::Bonded | PromotionPolicy::Relocate,
+                SocketOwnership::Shared,
+            ) => {
+                return Err(ConfigError::new(
+                    "transport.promotion",
+                    "Shared UDP tuple cannot promote: first connect() steals later handshakes; use Never + socket-ID demux",
+                ));
+            }
+            (PromotionPolicy::Auto, SocketOwnership::Shared) => PromotionPolicy::Never,
+            (promotion, _) => promotion,
+        };
+        if matches!(self.topology, ListenerTopology::ReusePortSingle { .. }) && !exclusive {
+            return Err(ConfigError::new(
+                "transport.topology",
+                "ReusePortSingle ConnectedWorkers requires Exclusive tuple; Shared must use UnconnectedListener (ReusePortMulti{1})",
+            ));
+        }
         validate_output_budget(self.output_drain)?;
         let workers = self.workers.resolve(capabilities.available_parallelism);
         let topology = self.resolve_topology(capabilities, workers)?;
         let shared_listener = !matches!(topology, ResolvedListenerTopology::PerPort);
         let batch_size = self.resolve_batch_size(shared_listener, capabilities)?;
-        let promotion = self.promotion.resolve(topology);
+        let promotion = effective_promotion.resolve(topology);
         let socket_buffer_bytes = self.resolve_socket_buffer(shared_listener)?;
+        if !exclusive && promotion != srt_lifecycle::Promotion::Never {
+            return Err(ConfigError::new(
+                "transport.promotion",
+                "Shared UDP tuple resolved to promotion != Never; use Never + socket-ID demux",
+            ));
+        }
         Ok(ResolvedTransportConfig {
             topology,
             workers,
@@ -1445,6 +1466,7 @@ impl TransportConfig {
             promotion,
             socket_buffer_bytes,
             output_drain: self.output_drain,
+            exclusive,
         })
     }
 
@@ -1516,9 +1538,9 @@ impl TransportConfig {
     }
 
     fn resolve_socket_buffer(&self, shared_listener: bool) -> Result<usize, ConfigError> {
-        // Explicit `All` stays valid on a runtime without a task scheduler
-        // (mio): promotion still yields connected sockets there, so it is
-        // deliberately not rejected.
+        // Explicit `All` stays valid on Mio (readiness-based, no task
+        // scheduler of its own): promotion still yields connected sockets
+        // there, so it is deliberately not rejected.
         let socket_buffer_bytes = match self.socket_buffers {
             SocketBufferConfig::SystemDefault => 0,
             SocketBufferConfig::Bytes(bytes) => bytes.get(),
@@ -1571,6 +1593,11 @@ pub struct ResolvedTransportConfig {
     /// Zero means preserve the operating-system default.
     pub socket_buffer_bytes: usize,
     pub output_drain: OutputDrainBudget,
+    /// `false` (Shared) forces `promotion == Never` above and socket-ID
+    /// demux; callers must not `connect()` a socket built for this plan
+    /// (K01). [`PreparedCaller::bind_socket`] and
+    /// [`PreparedListener::bind_sockets`] already honor this.
+    pub exclusive: bool,
 }
 
 /// Listener resource and lifecycle policy.
@@ -1758,6 +1785,13 @@ impl ListenerBuilder {
         self
     }
 
+    /// Which side owns the UDP 4-tuple (K01). Defaults to `Exclusive`.
+    #[must_use]
+    pub fn ownership(mut self, ownership: SocketOwnership) -> Self {
+        self.config.transport.ownership = ownership;
+        self
+    }
+
     #[must_use]
     pub fn max_peers(mut self, max_peers: NonZeroUsize) -> Self {
         let max_peers = max_peers.get();
@@ -1881,6 +1915,15 @@ impl CallerBuilder {
     pub fn latency(mut self, latency: Duration) -> Result<Self, ConfigError> {
         self.config.session.set_latency(latency)?;
         Ok(self)
+    }
+
+    /// Which side owns the UDP 4-tuple (K01). Defaults to `Exclusive`; see
+    /// [`PreparedCaller::bind_socket`] for what `Shared` does and does not
+    /// give you out of the box.
+    #[must_use]
+    pub fn ownership(mut self, ownership: SocketOwnership) -> Self {
+        self.config.transport.ownership = ownership;
+        self
     }
 
     #[must_use]
@@ -2074,12 +2117,28 @@ pub struct RuntimeListener<S> {
 impl PreparedCaller {
     /// Bind and connect a nonblocking standard UDP socket. Convert it to the
     /// selected runtime's native type, or keep it for a custom adapter.
+    /// `connect()`s the socket to `remote` for `Exclusive` ownership (the
+    /// default, and every caller of this method before K01). For `Shared`
+    /// ownership the socket is deliberately left unconnected -- K01's
+    /// `resolve()` already rejects any promotion policy that would need
+    /// this socket to `connect()`, so calling it here regardless would
+    /// silently defeat that guarantee (a connected socket can no longer
+    /// receive from, or safely fan traffic out to, any peer but `remote`,
+    /// which is exactly the handshake-stealing failure mode `resolve()`
+    /// exists to reject). Note that this crate's own bundled native
+    /// runtime adapters (`runtimes::*::Conn`) are all built around a
+    /// connected socket's fast send path and do not yet drive an
+    /// unconnected `Shared` caller socket themselves; a `Shared` caller
+    /// needs a custom driver using `send_to`, the same pattern this
+    /// crate's listener side already uses for its own unconnected sockets.
     pub fn bind_socket(&self) -> std::io::Result<UdpSocket> {
         let local = self
             .local_bind
             .unwrap_or_else(|| unspecified_for(self.remote));
         let socket = bind_udp(local, false, self.transport.socket_buffer_bytes)?;
-        socket.connect(self.remote)?;
+        if self.transport.exclusive {
+            socket.connect(self.remote)?;
+        }
         Ok(socket)
     }
 
@@ -2395,6 +2454,69 @@ mod tests {
         assert_eq!(
             socket.peer_addr().expect("peer"),
             receiver.local_addr().expect("receiver")
+        );
+    }
+
+    /// K01: `CallerConfig::prepare` must reject the same Shared+forbidden
+    /// promotion combination `EndpointSocketPlan::resolve` already
+    /// rejected -- before this fix, `CallerConfig`/`ListenerConfig` had no
+    /// `ownership` field at all, so `TransportConfig::resolve` (the path
+    /// `prepare()` actually calls) could not even express this check,
+    /// meaning a real application's caller could silently build a Shared
+    /// caller that promotion would still try to `connect()`.
+    #[test]
+    fn caller_prepare_rejects_shared_ownership_with_forbidden_promotion() {
+        let config = CallerConfig::builder(address(0))
+            .ownership(SocketOwnership::Shared)
+            .configure_transport(|transport| {
+                transport.promotion = PromotionPolicy::All;
+            })
+            .build()
+            .expect("caller config builds");
+        let error = config.prepare(RuntimeFlavor::Mio).expect_err(
+            "Shared + All promotion must be rejected at prepare(), not silently accepted",
+        );
+        assert_eq!(error.field(), "transport.promotion");
+    }
+
+    /// K01: same as the caller version above, for `ListenerConfig::prepare`.
+    #[test]
+    fn listener_prepare_rejects_shared_ownership_with_forbidden_promotion() {
+        let config = ListenerConfig::builder(address(0))
+            .ownership(SocketOwnership::Shared)
+            .topology(ListenerTopology::ReusePortMulti {
+                acceptors: WorkerCount::Count(NonZeroUsize::MIN),
+            })
+            .configure_transport(|transport| {
+                transport.promotion = PromotionPolicy::Bonded;
+            })
+            .into_config();
+        let error = config.prepare(RuntimeFlavor::Mio).expect_err(
+            "Shared + Bonded promotion must be rejected at prepare(), not silently accepted",
+        );
+        assert_eq!(error.field(), "transport.promotion");
+    }
+
+    /// K01: a `Shared` caller's socket must not be `connect()`-ed --
+    /// `resolve()`'s whole Shared+promotion safety guarantee assumes this
+    /// socket stays free to receive from (and, for a custom send_to-based
+    /// driver, send to) more than just `remote`.
+    #[test]
+    fn prepared_caller_leaves_shared_socket_unconnected() {
+        let receiver = UdpSocket::bind(address(0)).expect("receiver");
+        let config = CallerConfig::builder(receiver.local_addr().expect("receiver address"))
+            .ownership(SocketOwnership::Shared)
+            .configure_transport(|transport| {
+                transport.socket_buffers = SocketBufferConfig::SystemDefault;
+            })
+            .build()
+            .expect("caller config");
+        let prepared = config.prepare(RuntimeFlavor::Mio).expect("prepared caller");
+        assert!(!prepared.transport.exclusive);
+        let socket = prepared.bind_socket().expect("caller socket");
+        assert!(
+            socket.peer_addr().is_err(),
+            "a Shared caller's socket must stay unconnected, not silently connect() anyway"
         );
     }
 

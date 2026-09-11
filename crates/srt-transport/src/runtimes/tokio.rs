@@ -429,6 +429,18 @@ impl GroupConn {
                 weight: leg.weight,
             }));
             let prepared = caller.prepare(crate::RuntimeFlavor::Tokio)?;
+            // Every leg already gets its own dedicated socket by
+            // construction (one per group member); `Shared` ownership,
+            // which multiplexes several sessions onto one socket, is never
+            // meaningful here and `bind_socket` (K01) leaves such a socket
+            // unconnected -- silently breaking this type's connected-socket
+            // send path instead of failing preparation. Reject it up front.
+            if !prepared.transport.exclusive {
+                return Err(GroupBuildError::Config(crate::ConfigError::new(
+                    "transport.ownership",
+                    "a bonded group leg needs its own connected socket; Shared ownership is not supported here",
+                )));
+            }
             raw_legs.push(GroupConnectionLeg {
                 member_id: leg.member_id,
                 weight: leg.weight,
@@ -960,6 +972,40 @@ mod tests {
             assert_eq!(stats.group_id, group.group_id);
             assert_eq!(stats.legs.len(), 2);
             assert!(stats.legs.iter().all(|leg| leg.peer_addr.is_some()));
+        });
+    }
+
+    /// K01 (Opus review): same as
+    /// `group_conn::group_conn_tests::caller_rejects_a_shared_ownership_leg_instead_of_building_an_unconnected_socket`,
+    /// for this Tokio-native `GroupConn::caller`.
+    #[test]
+    fn group_caller_rejects_a_shared_ownership_leg_instead_of_building_an_unconnected_socket() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("Tokio runtime builds");
+        runtime.block_on(async {
+            let peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("peer binds");
+            let remote = peer.local_addr().expect("peer address");
+            let group = crate::GroupConfig::new(45, shiguredo_srt::GroupType::Broadcast);
+            let result = GroupConn::caller(
+                group,
+                [GroupCallerLeg::new(
+                    1,
+                    10,
+                    crate::CallerConfig::builder(remote)
+                        .ownership(crate::SocketOwnership::Shared)
+                        .build()
+                        .expect("caller config builds"),
+                )],
+                Timestamp::from_micros(0),
+            );
+            match result {
+                Ok(_) => panic!(
+                    "a Shared-ownership leg must be rejected, not silently built unconnected"
+                ),
+                Err(error) => assert!(matches!(error, GroupBuildError::Config(_))),
+            }
         });
     }
 
