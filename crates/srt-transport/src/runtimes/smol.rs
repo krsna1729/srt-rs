@@ -303,4 +303,67 @@ mod tests {
             }
         }
     }
+
+    /// T02 checkpoint 3: `recv_ready` drains via `drain_recv_fd` directly
+    /// on the raw fd, entirely outside async-io's own readiness
+    /// bookkeeping -- so a budget yield here must not depend on a fresh
+    /// `readable()` edge to resume. Verify that empirically: after a
+    /// budget-exhausted drain with no new datagram arriving, a *fresh*
+    /// `sock.readable()` call still resolves promptly (not hung behind an
+    /// edge that never re-fires), and the remaining data is still there.
+    #[test]
+    fn budget_exhausted_drain_keeps_readiness_armed_without_a_new_edge() {
+        futures_lite::future::block_on(async {
+            let receiver = std::net::UdpSocket::bind("127.0.0.1:0").expect("receiver");
+            receiver.set_nonblocking(true).expect("nonblocking");
+            let dest = receiver.local_addr().expect("addr");
+            let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("sender");
+            const TOTAL: usize = RecvBatch::DEFAULT_CAPACITY + 5;
+            for i in 0..TOTAL {
+                sender.send_to(&[i as u8], dest).expect("send");
+            }
+            let sock = smol::Async::new(receiver).expect("async-io adopts");
+            sock.readable().await.expect("readable");
+
+            let mut batch = RecvBatch::new();
+            let mut first = Vec::new();
+            let report = drain_recv_fd(
+                sock.get_ref().as_raw_fd(),
+                &mut batch,
+                RecvBudget::new(1, RecvBatch::DEFAULT_CAPACITY),
+                |_, data| first.push(data[0]),
+            )
+            .expect("first drain");
+            assert_eq!(first.len(), RecvBatch::DEFAULT_CAPACITY);
+            assert!(!report.would_block);
+
+            // No new datagram arrives here -- nothing generates a fresh
+            // edge for whatever triggering mode the reactor uses.
+            let recv_fut = async {
+                sock.readable().await.ok()?;
+                Some(())
+            };
+            let timer_fut = async {
+                smol::Timer::after(Duration::from_secs(5)).await;
+                None
+            };
+            assert!(
+                futures_lite::future::or(recv_fut, timer_fut)
+                    .await
+                    .is_some(),
+                "readiness must still be armed without a new edge"
+            );
+
+            let mut rest = Vec::new();
+            drain_recv_fd(
+                sock.get_ref().as_raw_fd(),
+                &mut batch,
+                RecvBudget::until_would_block(),
+                |_, data| rest.push(data[0]),
+            )
+            .expect("second drain");
+            first.extend(rest);
+            assert_eq!(first, (0..TOTAL as u8).collect::<Vec<_>>());
+        });
+    }
 }

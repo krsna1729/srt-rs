@@ -249,14 +249,13 @@ pub fn drain_readable(
     mut on_datagram: impl FnMut(Option<SocketAddr>, &[u8]),
 ) -> io::Result<RecvDrainReport> {
     let mut report = RecvDrainReport::default();
-    let max_rounds = budget.max_rounds.max(1);
-    let max_datagrams = budget.max_datagrams.max(1);
-    for _ in 0..max_rounds {
-        if report.datagrams >= max_datagrams {
+    for _ in 0..budget.max_rounds {
+        if report.datagrams >= budget.max_datagrams {
             break;
         }
+        let requested = (budget.max_datagrams - report.datagrams).min(batch.capacity());
         let result = sock.try_io(tokio::io::Interest::READABLE, || {
-            match batch.recv(sock.as_raw_fd())? {
+            match batch.recv(sock.as_raw_fd(), requested)? {
                 0 => Err(io::ErrorKind::WouldBlock.into()),
                 n => Ok(n),
             }
@@ -272,7 +271,7 @@ pub fn drain_readable(
                     on_datagram(addr, data);
                     report.datagrams += 1;
                 }
-                if received < batch.capacity() {
+                if received < requested {
                     break;
                 }
             }
@@ -910,6 +909,131 @@ mod tests {
             assert_eq!(report.datagrams, 3);
             assert_eq!(report.syscalls, 1);
             assert_eq!(got, [b"x".to_vec(), b"y".to_vec(), b"z".to_vec()]);
+        });
+    }
+
+    /// T02: `drain_readable` used to always ask `try_io`'s closure for a
+    /// whole `RecvBatch::capacity()` batch regardless of the remaining
+    /// budget, so a small budget could be overshot within a single
+    /// `recvmmsg` call. Every budget the acceptance criteria names must
+    /// be an exact per-call ceiling.
+    #[test]
+    fn drain_readable_never_exceeds_the_recv_budget() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("Tokio runtime builds");
+        runtime.block_on(async {
+            for max_datagrams in [1usize, 31, 32, 33, 64] {
+                let receiver = std::net::UdpSocket::bind("127.0.0.1:0").expect("receiver");
+                receiver.set_nonblocking(true).expect("nonblocking");
+                let dest = receiver.local_addr().expect("addr");
+                let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("sender");
+
+                const TOTAL: usize = 100;
+                for i in 0..TOTAL {
+                    sender.send_to(&[i as u8], dest).expect("send");
+                }
+                let sock = UdpSocket::from_std(receiver).expect("tokio adopts");
+                sock.readable().await.expect("readable");
+
+                let mut batch = RecvBatch::new();
+                let mut delivered = Vec::new();
+                loop {
+                    let mut this_round = Vec::new();
+                    let report = drain_readable(
+                        &sock,
+                        &mut batch,
+                        RecvBudget::new(usize::MAX, max_datagrams),
+                        |_, data| this_round.push(data[0]),
+                    )
+                    .expect("drain");
+                    assert!(
+                        report.datagrams <= max_datagrams,
+                        "budget {max_datagrams}: a single drain reported {} datagrams",
+                        report.datagrams
+                    );
+                    if this_round.is_empty() {
+                        assert!(
+                            report.would_block,
+                            "budget {max_datagrams}: an empty round must mean WouldBlock"
+                        );
+                        break;
+                    }
+                    delivered.extend(this_round);
+                    if delivered.len() >= TOTAL {
+                        break;
+                    }
+                }
+                assert_eq!(
+                    delivered,
+                    (0..TOTAL as u8).collect::<Vec<_>>(),
+                    "budget {max_datagrams}: every datagram delivered exactly once, in order"
+                );
+            }
+        });
+    }
+
+    /// T02 checkpoint 3: a budget yield must not strand queued datagrams
+    /// behind a readiness edge that never re-fires. `try_io`'s contract is
+    /// that the readiness flag stays set unless the closure itself returns
+    /// `WouldBlock` -- `drain_readable` only ever returns `WouldBlock` from
+    /// a real empty `recvmmsg`, never merely because the datagram budget
+    /// ran out. So after a budget-exhausted drain, a *fresh* `readable()`
+    /// call (not the one already consumed to get here) must resolve
+    /// immediately, with no new datagram arriving to generate a new edge,
+    /// and the remaining data must still be there to drain.
+    #[test]
+    fn budget_exhausted_drain_keeps_readiness_armed_without_a_new_edge() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .expect("Tokio runtime builds");
+        runtime.block_on(async {
+            let receiver = std::net::UdpSocket::bind("127.0.0.1:0").expect("receiver");
+            receiver.set_nonblocking(true).expect("nonblocking");
+            let dest = receiver.local_addr().expect("addr");
+            let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("sender");
+            const TOTAL: usize = RecvBatch::DEFAULT_CAPACITY + 5;
+            for i in 0..TOTAL {
+                sender.send_to(&[i as u8], dest).expect("send");
+            }
+            let sock = UdpSocket::from_std(receiver).expect("tokio adopts");
+            sock.readable().await.expect("readable");
+
+            let mut batch = RecvBatch::new();
+            let mut first = Vec::new();
+            let report = drain_readable(
+                &sock,
+                &mut batch,
+                RecvBudget::new(1, RecvBatch::DEFAULT_CAPACITY),
+                |_, data| first.push(data[0]),
+            )
+            .expect("first drain");
+            assert_eq!(first.len(), RecvBatch::DEFAULT_CAPACITY);
+            assert!(!report.would_block);
+
+            // No new datagram arrives here -- nothing generates a fresh
+            // edge. A truly edge-triggered wait for the next readable()
+            // with no intervening data would hang; this must not hang and
+            // must not report WouldBlock either, since the remainder is
+            // still sitting in the kernel's receive queue.
+            tokio::time::timeout(std::time::Duration::from_secs(5), sock.readable())
+                .await
+                .expect("readiness must still be armed without a new edge")
+                .expect("readable");
+
+            let mut rest = Vec::new();
+            drain_readable(
+                &sock,
+                &mut batch,
+                RecvBudget::until_would_block(),
+                |_, data| rest.push(data[0]),
+            )
+            .expect("second drain");
+            first.extend(rest);
+            assert_eq!(first, (0..TOTAL as u8).collect::<Vec<_>>());
         });
     }
 
