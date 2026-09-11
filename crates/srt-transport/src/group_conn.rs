@@ -389,7 +389,15 @@ impl GroupConn {
             logical_payload_bytes_sent: 0,
             logical_payloads_received: 0,
             logical_payload_bytes_received: 0,
-            recv_batch: RecvBatch::with_capacity(RecvBatch::DEFAULT_CAPACITY, 65_536),
+            // D02: one wire datagram is always MTU-bounded (SRT's default
+            // path MTU is far under 2 KiB), the same bound every
+            // non-bonded `Conn`'s own `RecvBatch::new()` already uses
+            // successfully -- the previous 65536-byte-per-buffer choice
+            // (32x this) had no stated reason and made this the one
+            // "eager 2 MiB receive scratch" allocation in the crate.
+            // T01's own truncation handling still protects against
+            // anything larger, the same as every other `Conn`.
+            recv_batch: RecvBatch::new(),
             io_stats: BatchIoStats::default(),
         })
     }
@@ -478,14 +486,17 @@ impl GroupConn {
     /// Drive timers, nonblocking UDP input, and a bounded output pump for
     /// every leg once. A readable leg may contain up to 64 datagrams per call
     /// to avoid one busy path starving the rest of the group.
+    ///
+    /// `report` is cleared and refilled in place (D02): a caller drives
+    /// every tick, so this reuses the caller-owned `Vec`'s capacity instead
+    /// of allocating a fresh one per call.
     pub fn drive(
         &mut self,
         now: Timestamp,
         output_budget: OutputDrainBudget,
-    ) -> std::io::Result<GroupDriveReport> {
-        let mut report = GroupDriveReport {
-            legs: Vec::with_capacity(self.legs.len()),
-        };
+        report: &mut GroupDriveReport,
+    ) -> std::io::Result<()> {
+        report.legs.clear();
         let recv_budget = RecvBudget::new(2, 64);
         {
             let (group, legs, recv_batch, io_stats) = (
@@ -560,7 +571,7 @@ impl GroupConn {
             }
         }
         self.group.refresh_member_states();
-        Ok(report)
+        Ok(())
     }
 
     /// Snapshot both physical-leg and logical-group telemetry. During setup,
@@ -744,13 +755,14 @@ mod group_conn_tests {
             )
             .expect("bonded caller builds");
 
+            let mut report = GroupDriveReport::default();
             for round in 0..20 {
                 let now = Timestamp::from_micros(round * 10_000);
-                conn.drive(now, OutputDrainBudget::default())
+                conn.drive(now, OutputDrainBudget::default(), &mut report)
                     .expect("group sends protocol output");
                 first_peer.drive(now);
                 second_peer.drive(now);
-                conn.drive(now, OutputDrainBudget::default())
+                conn.drive(now, OutputDrainBudget::default(), &mut report)
                     .expect("group receives protocol output");
                 if conn.group().members().iter().all(|member| {
                     member.connection().state() == shiguredo_srt::ConnectionState::Connected
@@ -781,6 +793,7 @@ mod group_conn_tests {
             conn.drive(
                 Timestamp::from_micros(300_000),
                 OutputDrainBudget::default(),
+                &mut report,
             )
             .expect("group sends Broadcast payload");
             first_peer.drive(Timestamp::from_micros(300_000));
@@ -853,13 +866,14 @@ mod group_conn_tests {
         )
         .expect("bonded caller builds");
 
+        let mut report = GroupDriveReport::default();
         for round in 0..20 {
             let now = Timestamp::from_micros(round * 10_000);
-            conn.drive(now, OutputDrainBudget::default())
+            conn.drive(now, OutputDrainBudget::default(), &mut report)
                 .expect("group sends protocol output");
             first_peer.drive(now);
             second_peer.drive(now);
-            conn.drive(now, OutputDrainBudget::default())
+            conn.drive(now, OutputDrainBudget::default(), &mut report)
                 .expect("group receives protocol output");
             if conn.group().members().iter().all(|member| {
                 member.connection().state() == shiguredo_srt::ConnectionState::Connected
@@ -896,6 +910,7 @@ mod group_conn_tests {
             .expect("leg 1 address");
 
         let mut total_malformed = 0usize;
+        let mut report = GroupDriveReport::default();
         for round in 0..10 {
             let now = Timestamp::from_micros(1_000_000 + round * 10_000);
             for _ in 0..3 {
@@ -908,8 +923,7 @@ mod group_conn_tests {
                     .send_to(b"not an srt packet, just garbage bytes", first_addr)
                     .expect("garbage send");
             }
-            let report = conn
-                .drive(now, OutputDrainBudget::default())
+            conn.drive(now, OutputDrainBudget::default(), &mut report)
                 .expect("drive must not fail on malformed input");
             let leg1 = report
                 .legs
@@ -964,10 +978,11 @@ mod group_conn_tests {
         drop(first_peer);
 
         let mut leg1_broken = false;
+        let mut report = GroupDriveReport::default();
         for round in 0..100 {
             let now = Timestamp::from_micros(1_500_000 + round * 10_000);
             let _ = conn.send(b"provoke icmp unreachable on leg 1", now);
-            conn.drive(now, OutputDrainBudget::default())
+            conn.drive(now, OutputDrainBudget::default(), &mut report)
                 .expect("drive must not fail just because one leg's peer vanished");
             second_peer.drive(now);
             if conn.group().member(1).expect("member 1").state()
@@ -992,8 +1007,7 @@ mod group_conn_tests {
         // currently broken" -- a leg that failed a while ago must not
         // re-report `newly_broken: true` on every later drive.
         let now = Timestamp::from_micros(2_500_000);
-        let report = conn
-            .drive(now, OutputDrainBudget::default())
+        conn.drive(now, OutputDrainBudget::default(), &mut report)
             .expect("drive on an already-broken leg must not fail");
         let leg1 = report
             .legs
@@ -1011,10 +1025,10 @@ mod group_conn_tests {
                 .expect("send still works with one healthy leg"),
             1
         );
-        conn.drive(now, OutputDrainBudget::default())
+        conn.drive(now, OutputDrainBudget::default(), &mut report)
             .expect("drive still services the healthy leg");
         second_peer.drive(now);
-        conn.drive(now, OutputDrainBudget::default())
+        conn.drive(now, OutputDrainBudget::default(), &mut report)
             .expect("drive still services the healthy leg");
         assert_eq!(conn.stats().aggregate.active_legs, 1);
 
@@ -1024,7 +1038,7 @@ mod group_conn_tests {
         for round in 0..100 {
             let now = Timestamp::from_micros(3_500_000 + round * 10_000);
             let _ = conn.send(b"provoke icmp unreachable on leg 2", now);
-            conn.drive(now, OutputDrainBudget::default())
+            conn.drive(now, OutputDrainBudget::default(), &mut report)
                 .expect("drive must not fail even when every leg has failed");
             if conn
                 .group()
@@ -1047,4 +1061,11 @@ mod group_conn_tests {
             "total group failure must be reported honestly as zero active legs"
         );
     }
+
+    // D02's allocation-reuse guarantee for `drive()` is proven in
+    // `tests/group_drive_allocation_guard.rs`: a real allocation count
+    // across idle calls, not a `Vec::as_ptr()` comparison. An earlier
+    // version of this test used `as_ptr()` and passed even against a
+    // deliberately reintroduced free-and-reallocate regression, because
+    // glibc's allocator handed back the same address for the freed block.
 }
