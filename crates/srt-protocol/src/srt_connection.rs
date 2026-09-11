@@ -163,6 +163,16 @@ pub const KEEPALIVE_INTERVAL_MICROS: u64 = 1_000_000;
 /// Periodic NAK timer interval (microseconds).
 pub const PERIODIC_NAK_INTERVAL_MICROS: u64 = 20_000;
 
+/// Retained packets one [`SrtConnection::process_retransmit`] visit will
+/// encrypt and queue before yielding the remainder to a follow-up visit
+/// (P01). Without this cap, a single NAK reporting a large loss range could
+/// encrypt and queue the connection's entire retained send window
+/// synchronously in one call. This crate cannot depend on srt-transport to
+/// enforce it, but the value matches `OutputDrainBudget::default()`'s
+/// packet cap there today, by convention rather than any shared type --
+/// keep the two in sync by eye if either changes.
+const MAX_RETRANSMITS_PER_VISIT: usize = 32;
+
 /// A connection event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionEvent {
@@ -967,6 +977,15 @@ impl SrtConnection {
     /// methods (this method itself no longer uses it -- see
     /// `SenderBuffer::pop_retransmit`'s doc comment for why retransmitted
     /// packets' `sent_time` is no longer updated).
+    ///
+    /// Bounded to `MAX_RETRANSMITS_PER_VISIT` per call (P01): a NAK
+    /// reporting a large loss range, or a visit catching up after one,
+    /// used to encrypt and queue the connection's entire retained send
+    /// window synchronously in a single call. `pop_retransmit` only
+    /// removes a sequence from the loss list once it actually returns it,
+    /// so stopping early here leaves the remainder exactly where it was --
+    /// membership and FIFO ordering are untouched, and a follow-up visit
+    /// picks up right where this one left off.
     pub fn process_retransmit(&mut self, now: Timestamp) {
         let dest_socket_id = self.peer_socket_id;
         // `pop_retransmit` already retires each sequence from the loss list
@@ -980,11 +999,14 @@ impl SrtConnection {
         // sequence + count) instead of once per record.
         let mut dropped = 0u32;
         let mut first_dropped_seq = None;
-        while let Some((header, payload)) = self
-            .sender
-            .as_mut()
-            .and_then(|s| s.pop_retransmit(dest_socket_id))
-        {
+        for _ in 0..MAX_RETRANSMITS_PER_VISIT {
+            let Some((header, payload)) = self
+                .sender
+                .as_mut()
+                .and_then(|s| s.pop_retransmit(dest_socket_id))
+            else {
+                break;
+            };
             match self.encrypt_to_wire(&header, &payload) {
                 Ok(buf) => self.queue_packet(buf, now),
                 Err(_) => {
@@ -999,6 +1021,26 @@ impl SrtConnection {
                 first_seq = first_dropped_seq,
                 "retransmit(s) dropped: packet could not be re-encrypted"
             );
+        }
+        // P01: the Retransmit timer is otherwise never armed (unlike
+        // Ack/Keepalive/Nak, which self-rearm in their own handle_*_timer),
+        // so it is this visit's job to schedule the next one when the cap
+        // above left work behind. A conforming peer's periodic NAK will
+        // usually re-report deferred sequences on its own (`ReceiverBuffer`
+        // re-emits its whole loss list every periodic-NAK interval), but
+        // this must not *depend* on that -- so the follow-up is armed at
+        // `duration_micros: 0` (due immediately, not after a fixed delay):
+        // any nonzero fixed interval turns the per-visit cap into a hard
+        // aggregate retransmit-rate ceiling (packets-per-visit / interval),
+        // an unrelated policy this card has no documented rate to justify.
+        // A zero-delay rearm only bounds *work per call*, which is this
+        // card's actual charter, and lets the transport's own poll cadence
+        // decide how fast the remainder actually goes out.
+        if self.has_retransmit() {
+            self.output_queue.push_back(ConnectionOutput::SetTimer {
+                id: TimerId::Retransmit,
+                duration_micros: 0,
+            });
         }
     }
 
@@ -3322,6 +3364,114 @@ mod tests {
         });
         drive_handshake_to_connected(&mut caller, &mut listener);
         (caller, listener)
+    }
+
+    /// P01: a single visit must not encrypt/queue an unbounded number of
+    /// retransmits. Simulates the worst case directly -- a NAK covering a
+    /// loss range far larger than `MAX_RETRANSMITS_PER_VISIT` -- and checks
+    /// three things: the first visit caps at exactly the bound, the
+    /// uncapped remainder is neither lost nor duplicated once a follow-up
+    /// visit runs, and the visit self-schedules that follow-up (the
+    /// Retransmit timer is otherwise never armed by anything else).
+    #[test]
+    fn process_retransmit_bounds_one_visit_and_resumes_the_rest_on_the_next() {
+        let (mut caller, _listener) = connected_pair();
+        let now = Timestamp::from_micros(0);
+
+        const SENT: usize = MAX_RETRANSMITS_PER_VISIT + 18;
+        let first_seq = caller.next_sequence_number().expect("connected sender");
+        for i in 0..SENT {
+            caller
+                .send(format!("payload {i}").as_bytes(), now)
+                .expect("send admits the payload");
+        }
+        // Drain the normal sends to the wire -- this test cares about the
+        // *retransmit* path, not the original transmission.
+        while caller.poll_output().is_some() {}
+
+        // Simulate the peer NAK-ing every one of them in one range.
+        let last_seq = first_seq.wrapping_add(SENT as u32 - 1);
+        caller
+            .sender
+            .as_mut()
+            .expect("connected sender")
+            .handle_nak_ranges(&[LossRange {
+                first_seq,
+                last_seq,
+            }]);
+
+        caller.process_retransmit(now);
+
+        let mut first_visit_seqs = Vec::new();
+        let mut first_visit_rearmed = false;
+        while let Some(output) = caller.poll_output() {
+            match output {
+                ConnectionOutput::SendPacket(bytes) => {
+                    let SrtPacket::Data(pkt) = SrtPacket::decode(&bytes).expect("valid packet")
+                    else {
+                        panic!("retransmit must encode as a DATA packet");
+                    };
+                    first_visit_seqs.push(pkt.sequence_number);
+                }
+                ConnectionOutput::SetTimer {
+                    id: TimerId::Retransmit,
+                    ..
+                } => first_visit_rearmed = true,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            first_visit_seqs,
+            (0..MAX_RETRANSMITS_PER_VISIT as u32)
+                .map(|i| first_seq.wrapping_add(i))
+                .collect::<Vec<_>>(),
+            "one visit must retransmit exactly the first MAX_RETRANSMITS_PER_VISIT sequences, \
+             in order -- not the whole loss list, and not some other subset"
+        );
+        assert!(
+            first_visit_rearmed,
+            "leftover work after the cap must self-schedule a follow-up visit -- \
+             nothing else ever arms the Retransmit timer"
+        );
+        assert!(
+            caller.has_retransmit(),
+            "the uncapped remainder must still be pending, not dropped"
+        );
+
+        // The follow-up visit (as if the self-armed timer had just fired).
+        caller.process_retransmit(Timestamp::from_micros(1_000));
+
+        let mut second_visit_seqs = Vec::new();
+        let mut second_visit_rearmed = false;
+        while let Some(output) = caller.poll_output() {
+            match output {
+                ConnectionOutput::SendPacket(bytes) => {
+                    let SrtPacket::Data(pkt) = SrtPacket::decode(&bytes).expect("valid packet")
+                    else {
+                        panic!("retransmit must encode as a DATA packet");
+                    };
+                    second_visit_seqs.push(pkt.sequence_number);
+                }
+                ConnectionOutput::SetTimer {
+                    id: TimerId::Retransmit,
+                    ..
+                } => second_visit_rearmed = true,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            second_visit_seqs,
+            (MAX_RETRANSMITS_PER_VISIT as u32..SENT as u32)
+                .map(|i| first_seq.wrapping_add(i))
+                .collect::<Vec<_>>(),
+            "the follow-up visit must retransmit exactly the remaining sequences, in order -- \
+             none lost, none duplicated, none reordered"
+        );
+        assert!(
+            !second_visit_rearmed,
+            "once the loss list is fully drained there is nothing left to resume"
+        );
+        assert!(!caller.has_retransmit());
     }
 
     /// S06 (revalidation, not a fix): `clear_config_secrets` already
