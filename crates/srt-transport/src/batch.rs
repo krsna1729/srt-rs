@@ -55,14 +55,23 @@ impl RecvBatch {
         self.bufs.len()
     }
 
-    /// One `recvmmsg`. Returns the datagrams received; `0` is `WouldBlock`.
-    pub fn recv(&mut self, fd: RawFd) -> io::Result<usize> {
+    /// One `recvmmsg`, asking the kernel for at most `limit` datagrams
+    /// (further capped to this batch's capacity) rather than always the
+    /// full capacity -- so a caller enforcing a remaining budget of, say,
+    /// one more datagram cannot have the kernel hand back a whole capacity
+    /// batch and overshoot it (T02). Returns the datagrams received; `0`
+    /// is `WouldBlock`. `limit == 0` returns `Ok(0)` without a syscall.
+    pub fn recv(&mut self, fd: RawFd, limit: usize) -> io::Result<usize> {
+        let n = limit.min(self.bufs.len());
+        if n == 0 {
+            return Ok(0);
+        }
         recvmsg_batch(
             fd,
-            &mut self.bufs,
-            &mut self.sizes,
-            &mut self.addrs,
-            &mut self.truncated,
+            &mut self.bufs[..n],
+            &mut self.sizes[..n],
+            &mut self.addrs[..n],
+            &mut self.truncated[..n],
         )
     }
 
@@ -89,10 +98,20 @@ impl Default for RecvBatch {
 }
 
 /// Per-wake bound on batched receive so a busy socket cannot starve
-/// timers and sibling work.
+/// timers and sibling work. Both fields are enforced exactly (T02): a
+/// drain never performs more than `max_rounds` `recvmmsg` calls, never
+/// feeds more than `max_datagrams` datagrams to the protocol, and a
+/// `recvmmsg` call itself never asks the kernel for more than the
+/// remaining datagram budget. `0` in either field means "do no receive
+/// work this call" -- not "at least one", so a caller that genuinely
+/// wants to pause receiving gets that, truthfully, rather than a silently
+/// forced minimum.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RecvBudget {
+    /// Maximum number of `recvmmsg` syscalls. `0` performs none.
     pub max_rounds: usize,
+    /// Maximum number of (non-truncated) datagrams fed to the protocol.
+    /// `0` feeds none.
     pub max_datagrams: usize,
 }
 
@@ -226,13 +245,12 @@ pub fn drain_recv_fd(
     mut on_datagram: impl FnMut(Option<SocketAddr>, &[u8]),
 ) -> io::Result<RecvDrainReport> {
     let mut report = RecvDrainReport::default();
-    let max_rounds = budget.max_rounds.max(1);
-    let max_datagrams = budget.max_datagrams.max(1);
-    for _ in 0..max_rounds {
-        if report.datagrams >= max_datagrams {
+    for _ in 0..budget.max_rounds {
+        if report.datagrams >= budget.max_datagrams {
             break;
         }
-        let received = batch.recv(fd)?;
+        let requested = (budget.max_datagrams - report.datagrams).min(batch.capacity());
+        let received = batch.recv(fd, requested)?;
         if received == 0 {
             report.would_block = true;
             break;
@@ -246,7 +264,7 @@ pub fn drain_recv_fd(
             on_datagram(addr, data);
             report.datagrams += 1;
         }
-        if received < batch.capacity() {
+        if received < requested {
             break;
         }
     }
@@ -589,6 +607,122 @@ mod tests {
         )
         .expect("full drain");
         assert_eq!(all, N);
+    }
+
+    /// T02: `recvmsg_batch` used to always be asked for a whole
+    /// `RecvBatch::capacity()` batch regardless of how much of the budget
+    /// remained, so a budget smaller than the batch capacity (or smaller
+    /// than what the kernel had queued) could be overshot within a single
+    /// `recvmmsg` call -- the per-round check only ever ran *between*
+    /// syscalls, never inside one. Every budget the acceptance criteria
+    /// names must instead be an exact, per-call ceiling: never more
+    /// datagrams delivered than the budget allows, and -- since exceeding
+    /// it was the bug, not skipping -- calling again with the same small
+    /// budget must still deliver every remaining datagram exactly once.
+    #[test]
+    fn recv_budget_is_never_exceeded_even_when_more_is_queued_than_the_budget_allows() {
+        use std::os::fd::AsRawFd;
+        for max_datagrams in [1usize, 31, 32, 33, 64] {
+            let receiver = std::net::UdpSocket::bind("127.0.0.1:0").expect("receiver");
+            receiver.set_nonblocking(true).expect("nonblocking");
+            let dest = receiver.local_addr().expect("addr");
+            let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("sender");
+
+            const TOTAL: usize = 100;
+            for i in 0..TOTAL {
+                sender.send_to(&[i as u8], dest).expect("send");
+            }
+
+            let mut batch = RecvBatch::new();
+            let mut delivered = Vec::new();
+            loop {
+                let mut this_round = Vec::new();
+                let report = drain_recv_fd(
+                    receiver.as_raw_fd(),
+                    &mut batch,
+                    RecvBudget::new(usize::MAX, max_datagrams),
+                    |_, data| this_round.push(data[0]),
+                )
+                .expect("drain");
+                assert!(
+                    report.datagrams <= max_datagrams,
+                    "budget {max_datagrams}: a single drain reported {} datagrams",
+                    report.datagrams
+                );
+                assert!(
+                    this_round.len() <= max_datagrams,
+                    "budget {max_datagrams}: on_datagram ran {} times, over budget",
+                    this_round.len()
+                );
+                if this_round.is_empty() {
+                    assert!(
+                        report.would_block,
+                        "budget {max_datagrams}: an empty round must mean WouldBlock"
+                    );
+                    break;
+                }
+                delivered.extend(this_round);
+                if delivered.len() >= TOTAL {
+                    break;
+                }
+            }
+            assert_eq!(
+                delivered,
+                (0..TOTAL as u8).collect::<Vec<_>>(),
+                "budget {max_datagrams}: every datagram must be delivered exactly once, in order"
+            );
+        }
+    }
+
+    /// T02: a `RecvBudget` of zero must mean "do no receive work this
+    /// call" -- not a silently forced minimum of one round/one datagram.
+    /// Previously `drain_recv_fd` clamped both fields to `.max(1)`, so a
+    /// caller that explicitly asked for zero work (e.g. to pause
+    /// receiving under backpressure) still got one `recvmmsg` call and
+    /// had a datagram silently dequeued and delivered.
+    #[test]
+    fn zero_budget_performs_no_receive_work_and_drops_nothing() {
+        use std::os::fd::AsRawFd;
+        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").expect("receiver");
+        receiver.set_nonblocking(true).expect("nonblocking");
+        let dest = receiver.local_addr().expect("addr");
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("sender");
+        sender.send_to(b"queued", dest).expect("send");
+
+        let mut batch = RecvBatch::new();
+
+        let mut zero_rounds_calls = 0usize;
+        let report = drain_recv_fd(
+            receiver.as_raw_fd(),
+            &mut batch,
+            RecvBudget::new(0, usize::MAX),
+            |_, _| zero_rounds_calls += 1,
+        )
+        .expect("zero max_rounds drain");
+        assert_eq!(report, RecvDrainReport::default());
+        assert_eq!(zero_rounds_calls, 0);
+
+        let mut zero_datagrams_calls = 0usize;
+        let report = drain_recv_fd(
+            receiver.as_raw_fd(),
+            &mut batch,
+            RecvBudget::new(usize::MAX, 0),
+            |_, _| zero_datagrams_calls += 1,
+        )
+        .expect("zero max_datagrams drain");
+        assert_eq!(report, RecvDrainReport::default());
+        assert_eq!(zero_datagrams_calls, 0);
+
+        // The datagram neither call touched must still be there.
+        let mut got = Vec::new();
+        drain_recv_fd(
+            receiver.as_raw_fd(),
+            &mut batch,
+            RecvBudget::until_would_block(),
+            |_, data| got.push(data.to_vec()),
+        )
+        .expect("real drain");
+        assert_eq!(got, vec![b"queued".to_vec()]);
     }
 
     #[test]
