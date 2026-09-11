@@ -885,6 +885,15 @@ impl CallerTable {
             report: &mut report,
             out,
         };
+        // Set when a leg's next packet cannot fit the remaining allowance
+        // (`DrainOne::Blocked`'s exceeds_bytes case in
+        // drain_one_caller_leg_parts): the numeric counters below can all
+        // still be under their caps at that point (e.g. one 1332-byte
+        // packet leaves 668 of a 2000-byte allowance, which the next
+        // 1332-byte packet cannot fit, but report.bytes is still < 2000),
+        // yet real work was pushed back to `pending` and is not drained
+        // (T03).
+        let mut blocked_on_next_item = false;
         while sink.report.actions < sink.budget.max_actions {
             let Some(id) = self.pop_ready() else {
                 break;
@@ -919,6 +928,7 @@ impl CallerTable {
                 DrainOne::Empty => {}
                 DrainOne::Blocked => {
                     self.enqueue_ready(id);
+                    blocked_on_next_item = true;
                     #[cfg(any(test, feature = "bench-internals"))]
                     {
                         self.sched_stats.budget_exhausted += 1;
@@ -934,7 +944,8 @@ impl CallerTable {
                 break;
             }
         }
-        if report.actions >= budget.max_actions
+        if blocked_on_next_item
+            || report.actions >= budget.max_actions
             || report.packets >= budget.max_packets
             || report.bytes >= budget.max_bytes
         {
@@ -3494,6 +3505,53 @@ mod tests {
             "monotonic IDs must never alias a removed caller"
         );
         let _ = table.time_until_next_deadline(now, 999_999);
+    }
+
+    /// T03: a leg's next packet can fail to fit the remaining byte
+    /// allowance while every raw counter (actions/packets/bytes) is still
+    /// under its cap -- one 1332-byte wire packet (1316-byte payload +
+    /// 16-byte header) leaves 668 of a 2000-byte allowance, and a second
+    /// identical packet cannot fit it, but `report.bytes` (1332) is still
+    /// well under `max_bytes` (2000). The old status logic only checked
+    /// counters against caps, so this case silently reported `Drained`
+    /// while a real packet sat pushed back in `pending`, undrained.
+    #[test]
+    fn caller_reports_budget_exhausted_when_the_next_packet_does_not_fit() {
+        let mut table = mk_table(1);
+        let id = table.bench_ids()[0];
+        let now = Timestamp::default();
+        let payload = vec![0xABu8; 1316];
+        for _ in 0..2 {
+            table
+                .logical_caller_mut(&id)
+                .unwrap()
+                .send(&payload, now)
+                .expect("send succeeds");
+        }
+
+        let mut out = Vec::new();
+        // Room for exactly one 1332-byte wire packet, not two.
+        let budget = crate::OutputDrainBudget::new(usize::MAX, usize::MAX, 2000);
+        let report = table.poll_outbound_bounded(now, budget, &mut out);
+
+        assert_eq!(out.len(), 1, "only the packet that fits should be emitted");
+        assert_eq!(report.packets, 1);
+        assert_eq!(report.bytes, 1332, "sanity: this is below max_bytes (2000)");
+        assert_eq!(
+            report.status,
+            crate::OutputDrainStatus::BudgetExhausted,
+            "a packet that couldn't fit was retained, so this pass is not fully drained"
+        );
+        assert!(
+            table.ready_queue_len() > 0,
+            "the leg with retained work must stay ready for the next poll"
+        );
+
+        // The retained second packet is still there, in order, on the next poll.
+        let mut out2 = Vec::new();
+        let report2 = table.poll_outbound_bounded(now, budget, &mut out2);
+        assert_eq!(out2.len(), 1);
+        assert_eq!(report2.status, crate::OutputDrainStatus::Drained);
     }
 
     #[test]
