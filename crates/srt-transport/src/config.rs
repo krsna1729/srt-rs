@@ -18,7 +18,7 @@ use shiguredo_srt::{
 use zeroize::Zeroize;
 
 use crate::{
-    AdmissionOptions, BondedInputPolicy, OutputDrainBudget, PeerTable, PeerTableConfig,
+    AdmissionOptions, BondedInputPolicy, OutputDrainBudget, PeerTable, PeerTableConfig, RecvBudget,
     SOCK_BUF_BYTES, set_sock_bufs,
 };
 
@@ -1052,6 +1052,18 @@ impl SessionConfig {
         }
     }
 
+    /// A copy of the effective settings with owned crypto secrets zeroized,
+    /// safe to log, display or hand to a diagnostics endpoint. The live
+    /// `session` a [`PreparedListener`]/[`PreparedCaller`] actually drives
+    /// connections with keeps the real secret -- this is for introspection,
+    /// not construction.
+    #[must_use]
+    pub fn redacted(&self) -> Self {
+        let mut copy = self.clone();
+        copy.clear_owned_secrets();
+        copy
+    }
+
     fn apply_handshake(&self, connection: &mut SrtConnection) {
         connection.set_handshake_timing(
             duration_micros_u64(self.handshake.retry_interval),
@@ -1260,6 +1272,7 @@ impl EndpointSocketPlan {
         batching: BatchingPolicy,
         socket_buffers: SocketBufferConfig,
         output_drain: OutputDrainBudget,
+        recv_budget: RecvBudget,
     ) -> Result<ResolvedEndpointPlan, ConfigError> {
         let cfg = TransportConfig {
             topology: self.topology,
@@ -1268,6 +1281,7 @@ impl EndpointSocketPlan {
             promotion: self.promotion,
             socket_buffers,
             output_drain,
+            recv_budget,
             ownership: self.ownership,
         };
         let resolved = cfg.resolve(capabilities)?;
@@ -1279,6 +1293,7 @@ impl EndpointSocketPlan {
             batch_size: resolved.batch_size,
             workers: resolved.workers,
             output_drain: resolved.output_drain,
+            recv_budget: resolved.recv_budget,
         })
     }
 }
@@ -1294,6 +1309,7 @@ pub struct ResolvedEndpointPlan {
     pub batch_size: Option<NonZeroUsize>,
     pub workers: NonZeroUsize,
     pub output_drain: OutputDrainBudget,
+    pub recv_budget: RecvBudget,
 }
 
 /// Runtime facts used to resolve `Auto`. Applications with custom adapters can
@@ -1303,7 +1319,6 @@ pub struct TransportCapabilities {
     pub available_parallelism: NonZeroUsize,
     pub reuse_port: bool,
     pub receive_batching: bool,
-    pub task_scheduler: bool,
 }
 
 impl Default for TransportCapabilities {
@@ -1313,7 +1328,6 @@ impl Default for TransportCapabilities {
                 .unwrap_or(NonZeroUsize::MIN),
             reuse_port: cfg!(unix),
             receive_batching: cfg!(target_os = "linux"),
-            task_scheduler: true,
         }
     }
 }
@@ -1335,9 +1349,13 @@ impl RuntimeFlavor {
         if let Self::Custom(capabilities) = self {
             return capabilities;
         }
+        // `RecvBatch`/batch.rs's recvmmsg-based batching is shared by every
+        // readiness-based adapter (Mio, Tokio, Smol); only the
+        // completion-based adapters (Monoio, Glommio, Compio) use native
+        // one-buffer I/O and genuinely have no batched receive path.
         TransportCapabilities {
-            receive_batching: cfg!(target_os = "linux") && matches!(self, Self::Mio),
-            task_scheduler: !matches!(self, Self::Mio),
+            receive_batching: cfg!(target_os = "linux")
+                && matches!(self, Self::Mio | Self::Tokio | Self::Smol),
             ..TransportCapabilities::default()
         }
     }
@@ -1351,6 +1369,10 @@ pub struct TransportConfig {
     pub promotion: PromotionPolicy,
     pub socket_buffers: SocketBufferConfig,
     pub output_drain: OutputDrainBudget,
+    /// Per-visit receive-side work budget (K02). Constructed drivers must
+    /// store this and drive with it, not silently substitute
+    /// `RecvBudget::default()` on every call.
+    pub recv_budget: RecvBudget,
     /// Which side owns the UDP 4-tuple (K01). Defaults to `Exclusive`,
     /// matching every caller of this config before this field existed:
     /// one SRT session per UDP tuple, socket safe to `connect()`. Set
@@ -1369,6 +1391,7 @@ impl Default for TransportConfig {
             promotion: PromotionPolicy::Auto,
             socket_buffers: SocketBufferConfig::Auto,
             output_drain: OutputDrainBudget::default(),
+            recv_budget: RecvBudget::default(),
             ownership: SocketOwnership::Exclusive,
         }
     }
@@ -1393,6 +1416,7 @@ impl TransportConfig {
                 promotion: PromotionPolicy::All,
                 socket_buffers: SocketBufferConfig::SystemDefault,
                 output_drain: OutputDrainBudget::new(32, 16, 128 * 1024),
+                recv_budget: RecvBudget::default(),
                 ownership: SocketOwnership::Exclusive,
             },
             TransportProfile::HighDensity => Self {
@@ -1406,6 +1430,7 @@ impl TransportConfig {
                     NonZeroUsize::new(SOCK_BUF_BYTES).expect("socket buffer default is non-zero"),
                 ),
                 output_drain: OutputDrainBudget::new(128, 64, 512 * 1024),
+                recv_budget: RecvBudget::default(),
                 ownership: SocketOwnership::Exclusive,
             },
         };
@@ -1466,6 +1491,7 @@ impl TransportConfig {
             promotion,
             socket_buffer_bytes,
             output_drain: self.output_drain,
+            recv_budget: self.recv_budget,
             exclusive,
         })
     }
@@ -1593,6 +1619,7 @@ pub struct ResolvedTransportConfig {
     /// Zero means preserve the operating-system default.
     pub socket_buffer_bytes: usize,
     pub output_drain: OutputDrainBudget,
+    pub recv_budget: RecvBudget,
     /// `false` (Shared) forces `promotion == Never` above and socket-ID
     /// demux; callers must not `connect()` a socket built for this plan
     /// (K01). [`PreparedCaller::bind_socket`] and
@@ -1720,9 +1747,7 @@ impl ListenerConfig {
         let transport = self.transport.resolve(runtime.capabilities())?;
         check_socket_memory_budget(&self.admission, transport)?;
         let mut session = self.session.clone();
-        let materialized = session.materialized_options()?;
-        session.clear_owned_secrets();
-        session.connection = materialized;
+        session.connection = session.materialized_options()?;
         let cookie_routing = match self.admission.cookie_routing {
             CookieRoutingPolicy::Auto => transport.topology.uses_reuse_port(),
             CookieRoutingPolicy::Enabled => true,
@@ -2280,6 +2305,54 @@ mod tests {
     }
 
     #[test]
+    fn redacted_session_zeroizes_owned_secrets_but_keeps_other_settings() {
+        let mut session = SessionConfig::default();
+        session.set_encryption(Some(EncryptionConfig::new("production-secret-value")));
+        session.set_socket_id(42);
+
+        let redacted = session.redacted();
+
+        assert_eq!(
+            redacted.connection_options().passphrase,
+            Some(String::new())
+        );
+        assert_eq!(
+            session.connection_options().passphrase,
+            Some("production-secret-value".to_string()),
+            "redacted() must not mutate the live session it was cloned from"
+        );
+        assert_eq!(redacted.connection_options().socket_id, 42);
+    }
+
+    #[test]
+    fn readiness_based_runtimes_report_batching_completion_based_ones_do_not() {
+        let batching = |flavor: RuntimeFlavor| flavor.capabilities().receive_batching;
+        // These share the recvmmsg-based `RecvBatch`/batch.rs pump.
+        assert_eq!(batching(RuntimeFlavor::Mio), cfg!(target_os = "linux"));
+        assert_eq!(batching(RuntimeFlavor::Tokio), cfg!(target_os = "linux"));
+        assert_eq!(batching(RuntimeFlavor::Smol), cfg!(target_os = "linux"));
+        // These drive one buffer at a time through native completion I/O.
+        assert!(!batching(RuntimeFlavor::Monoio));
+        assert!(!batching(RuntimeFlavor::Glommio));
+        assert!(!batching(RuntimeFlavor::Compio));
+    }
+
+    #[test]
+    fn tokio_batching_is_not_rejected_solely_because_the_runtime_is_not_mio() {
+        let config = TransportConfig {
+            topology: ListenerTopology::SharedPool {
+                listeners: WorkerCount::Count(NonZeroUsize::new(2).expect("non-zero")),
+            },
+            batching: BatchingPolicy::MaxDatagrams(NonZeroUsize::new(16).expect("non-zero")),
+            ..TransportConfig::default()
+        };
+        let resolved = config
+            .resolve(RuntimeFlavor::Tokio.capabilities())
+            .expect("Tokio shares the batched receive implementation");
+        assert_eq!(resolved.batch_size, NonZeroUsize::new(16));
+    }
+
+    #[test]
     fn explicit_unsupported_batching_fails_instead_of_becoming_a_noop() {
         let config = TransportConfig {
             topology: ListenerTopology::SharedPool {
@@ -2626,6 +2699,7 @@ mod tests {
                 BatchingPolicy::Disabled,
                 SocketBufferConfig::SystemDefault,
                 OutputDrainBudget::default(),
+                RecvBudget::default(),
             )
             .expect("Shared+Auto resolves");
         assert!(!resolved.exclusive);
@@ -2660,6 +2734,7 @@ mod tests {
                     BatchingPolicy::Disabled,
                     SocketBufferConfig::SystemDefault,
                     OutputDrainBudget::default(),
+                    RecvBudget::default(),
                 );
                 match promotion {
                     PromotionPolicy::Auto | PromotionPolicy::Never => {

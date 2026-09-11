@@ -32,15 +32,28 @@ pub struct Conn {
     pub sock: glommio::net::UdpSocket,
     timers: crate::ManualTimerStore,
     pending_outputs: VecDeque<ConnectionOutput>,
+    output_drain: OutputDrainBudget,
 }
 
 impl Conn {
     pub fn new(conn: SrtConnection, sock: glommio::net::UdpSocket) -> Self {
+        Self::with_budgets(conn, sock, OutputDrainBudget::default())
+    }
+
+    /// Like [`Self::new`], but stores the given budget instead of the
+    /// default (K02): [`Self::drain_outputs`] honors this, not a hardcoded
+    /// `::default()`, on every call.
+    pub fn with_budgets(
+        conn: SrtConnection,
+        sock: glommio::net::UdpSocket,
+        output_drain: OutputDrainBudget,
+    ) -> Self {
         Self {
             conn,
             sock,
             timers: crate::ManualTimerStore::new(),
             pending_outputs: VecDeque::new(),
+            output_drain,
         }
     }
 
@@ -53,8 +66,7 @@ impl Conn {
     }
 
     pub async fn drain_outputs(&mut self, now: Timestamp) -> io::Result<OutputDrainReport> {
-        self.drain_outputs_bounded(now, OutputDrainBudget::default())
-            .await
+        self.drain_outputs_bounded(now, self.output_drain).await
     }
 
     pub async fn drain_outputs_bounded(
@@ -235,7 +247,11 @@ pub fn caller(
 ) -> Result<Conn, crate::RuntimeBuildError> {
     let prepared = config.prepare(crate::RuntimeFlavor::Glommio)?;
     let socket = from_std(prepared.bind_socket()?)?;
-    Ok(Conn::new(prepared.connection(now)?, socket))
+    Ok(Conn::with_budgets(
+        prepared.connection(now)?,
+        socket,
+        prepared.transport.output_drain,
+    ))
 }
 
 pub struct TickResult {
@@ -246,6 +262,45 @@ pub struct TickResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// K02: a `Conn` built via [`caller`] must actually drive with its
+    /// configured `TransportConfig::output_drain`, not silently substitute
+    /// [`OutputDrainBudget::default`] on every [`Conn::drain_outputs`] call.
+    #[test]
+    fn caller_constructs_a_conn_that_honors_its_configured_output_drain_budget() {
+        glommio::LocalExecutorBuilder::default()
+            .spawn(|| async move {
+                let peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("peer binds");
+                let remote = peer.local_addr().expect("peer address");
+
+                let config = crate::CallerConfig::builder(remote)
+                    .configure_transport(|transport| {
+                        transport.output_drain = OutputDrainBudget::new(1, 1, 64 * 1024);
+                    })
+                    .build()
+                    .expect("caller config");
+                let mut conn =
+                    super::caller(&config, Timestamp::from_micros(0)).expect("caller builds");
+                conn.pending_outputs
+                    .push_back(ConnectionOutput::SendPacket(b"one".to_vec()));
+                conn.pending_outputs
+                    .push_back(ConnectionOutput::SendPacket(b"two".to_vec()));
+
+                let report = conn
+                    .drain_outputs(Timestamp::from_micros(0))
+                    .await
+                    .expect("drain succeeds");
+                assert_eq!(report.status, OutputDrainStatus::BudgetExhausted);
+                assert_eq!(
+                    conn.pending_outputs.len(),
+                    1,
+                    "the second action must remain queued under a 1-action budget"
+                );
+            })
+            .expect("glommio executor spawns")
+            .join()
+            .expect("glommio executor runs to completion");
+    }
 
     /// S05 (Opus review): same fix and rationale as compio's
     /// `drain_outputs_bounded_does_not_exceed_the_budget_even_with_a_backlog`.
