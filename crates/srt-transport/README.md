@@ -30,13 +30,9 @@ policy); lifecycle never depends on this one.
 Three layers:
 
 1. **Shared utilities** (always compiled, no runtime deps)
-   - `NativeTimer` — `Pin<Box<dyn Future<Output = ()>>>`, the common shape
-     of every async runtime's per-connection timer.
-   - `is_ready(&mut NativeTimer)` — noop-waker poll; the one pattern that
-     is genuinely identical across all five async runtimes.
-   - `ManualTimerStore` — `HashMap<TimerId, Timestamp>` with O(n) scan on
-     fire. The correct primitive for mio (no timer wheel) and the explicit
-     fallback elsewhere.
+   - `ManualTimerStore` — a fixed `[Option<Timestamp>; TimerId::COUNT]`
+     array with a scan on fire. Every native runtime adapter's `Conn` uses
+     this same store; there is no per-runtime timer-future type.
    - `DueIndex<K>` — a lazy-deletion deadline heap for shared loops that
      own many connections. Per-connection timer maps stay small; the index
      prevents a separate O(peers) scan just to find which maps are due.
@@ -137,20 +133,21 @@ Three layers:
      `None`; the listening socket itself owns that address.
 
 4. **Per-runtime `Conn`** (feature-gated): wraps an `SrtConnection`
-   + that runtime's UDP socket + its native timer. Each exposes the same
-   small verb set: `fire_expired`, `drain_outputs`, `send_paced`,
-   `recv_with_timeout` (async runtimes also get a combined `tick`).
+   + that runtime's native UDP socket + a `ManualTimerStore` (the same
+   type on every runtime; there is no per-runtime timer type). Each
+   exposes the same small verb set: `fire_expired`, `drain_outputs`,
+   `send_paced`, `recv_with_timeout`.
 
 ## Feature flags
 
-| Feature | Runtime | Timer inside Conn | I/O model |
-|---|---|---|---|
-| `mio` | raw epoll, no task model | `ManualTimerStore` + `poll_timeout()` | readiness |
-| `tokio` | current-thread + tasks | native `Pin<Box<Sleep>>` | readiness |
-| `smol` | async-executor tasks | `smol::Timer` future | readiness |
-| `monoio` | thread-per-core | io_uring kernel timeouts | completion (owned buffers) |
-| `glommio` | thread-per-core (Linux-only) | `glommio::timer` wheel | completion, shared SQ ring |
-| `compio` | single runtime | `compio::time::sleep` | completion (owned buffers) |
+| Feature | Runtime | I/O model |
+|---|---|---|
+| `mio` | raw epoll, no task model | readiness |
+| `tokio` | current-thread + tasks | readiness |
+| `smol` | async-executor tasks | readiness |
+| `monoio` | thread-per-core | completion (owned buffers) |
+| `glommio` | thread-per-core (Linux-only) | completion, shared SQ ring |
+| `compio` | single runtime | completion (owned buffers) |
 
 Features are additive: enable exactly the ones your binary links.
 
@@ -186,10 +183,12 @@ let timeout = conn.poll_timeout(Duration::from_millis(20), now);
 conn.fire_expired(now);                        // service due timers
 ```
 
-Async runtimes instead offer `Conn::tick(&mut buf, &payload, now)` —
-one event-loop iteration: fire timers → recv → drain outputs → send all
-paced packets → return `io::Result<TickResult>`. Every adapter also exposes
-`drain_outputs_bounded`; a budget or backpressure yield retains the tail.
+Async runtimes drive the same explicit verbs from their own event loop
+instead: `fire_expired`, `recv_with_timeout`, `drain_outputs`/
+`drain_outputs_bounded`, `send_paced`. There is no bundled
+"one-call tick" convenience method; nothing in this crate or its
+benchmark consumers ever needed one, so it was removed rather than kept
+unused (D01).
 
 ## Application configuration
 

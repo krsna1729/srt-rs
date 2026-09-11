@@ -1,7 +1,8 @@
 use shiguredo_srt::{ConnectionOutput, SrtConnection, TimerId, Timestamp};
 
-/// Manual timer store — the fallback for runtimes without a built-in timer
-/// engine (mio) or for code that wants explicit control over timer lifecycle.
+/// Manual timer store — every native runtime's `Conn` uses this same type
+/// for explicit timer lifecycle control, rather than each wrapping its own
+/// runtime's timer primitive.
 ///
 /// Fixed `[Option<Timestamp>; 7]` array indexed by `TimerId`. No hashing,
 /// no allocation, fits in a single cache line.

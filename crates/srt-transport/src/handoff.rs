@@ -4,12 +4,20 @@ use shiguredo_srt::SrtConnection;
 /// the thread that will service it.
 ///
 /// The socket is a plain `std::net::UdpSocket` and the protocol state is
-/// a bare `SrtConnection` on purpose: both are `Send`, whereas every
-/// runtime's own `Conn` wrapper holds a native timer future that is not.
-/// Shipping the parts and rebuilding the wrapper on the receiving thread
-/// makes the cross-thread move correct by construction rather than by
-/// convention -- there is no way to accidentally put a `!Send` timer in
-/// this struct, because the type does not have a field for one.
+/// a bare `SrtConnection` on purpose: both are `Send`, whereas three of the
+/// six runtimes' own `Conn` wrapper is not -- `monoio_transport::Conn`,
+/// `glommio_transport::Conn`, and `compio_transport::Conn` each hold that
+/// runtime's native socket type, which carries a reactor-bound, thread-local
+/// handle (`Rc`-based shared fd tracking for monoio and compio; a
+/// `Weak<Reactor>` back-reference for glommio), not a timer
+/// (`ManualTimerStore`, this crate's one timer type for every runtime, is a
+/// plain array and always `Send`). `mio_transport::Conn`, `tokio_transport::
+/// Conn`, and `smol_transport::Conn` are all `Send` (confirmed the same way,
+/// compile-time). Shipping the parts and rebuilding the wrapper on the
+/// receiving thread makes the cross-thread move correct by construction
+/// rather than by convention -- there is no way to accidentally put a
+/// `!Send` native socket in this struct, because the type does not have a
+/// field for one.
 pub struct Handoff {
     pub socket: std::net::UdpSocket,
     pub conn: SrtConnection,

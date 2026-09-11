@@ -3,7 +3,7 @@ use crate::{
     prepend_outputs,
 };
 use compio::buf::BufResult;
-use shiguredo_srt::{Bytes, ConnectionEvent, ConnectionOutput, SrtConnection, Timestamp};
+use shiguredo_srt::{Bytes, ConnectionOutput, SrtConnection, Timestamp};
 use std::collections::VecDeque;
 use std::io;
 
@@ -163,25 +163,6 @@ impl Conn {
             Err(error) => PacedSendOutcome::DriverError(error),
         }
     }
-
-    pub async fn tick(&mut self, payload: &[u8], now: Timestamp) -> io::Result<TickResult> {
-        self.fire_expired(now);
-        let drained = self.drain_outputs(now).await?;
-
-        let mut sent = 0u64;
-        if drained.status == OutputDrainStatus::Drained {
-            while matches!(self.send_paced(payload, now).await, PacedSendOutcome::Sent) {
-                sent += 1;
-            }
-        }
-
-        let mut events = Vec::new();
-        while let Some(ev) = self.conn.poll_event() {
-            events.push(ev);
-        }
-
-        Ok(TickResult { sent, events })
-    }
 }
 
 /// Resolve and bind a listener using Compio-native UDP sockets. Call from
@@ -210,11 +191,6 @@ pub fn caller(
         socket,
         prepared.transport.output_drain,
     ))
-}
-
-pub struct TickResult {
-    pub sent: u64,
-    pub events: Vec<ConnectionEvent>,
 }
 
 #[cfg(test)]
