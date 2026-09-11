@@ -327,12 +327,39 @@ async fn send_paced_payload(
 ) {
     let mut accepted = 0;
     while source.pending() > accepted {
-        if driver.send_paced(payload, now).await.is_err() {
-            source.refused();
-            break;
+        match driver.send_paced(payload, now).await {
+            srt_transport::PacedSendOutcome::Sent => {
+                stats.data_events += 1;
+                accepted += 1;
+            }
+            // S02/S03: `send()` already succeeded by the time either of
+            // these is observed, so the protocol has admitted and retained
+            // this payload regardless of whether it fully drained. Treating
+            // either as a pacing refusal would leave the opportunity
+            // pending and resend the same bytes as a brand-new, separately
+            // sequenced packet next call -- a real duplicate on the wire,
+            // not merely a bench accounting quirk.
+            srt_transport::PacedSendOutcome::Accepted => {
+                stats.data_events += 1;
+                accepted += 1;
+                break;
+            }
+            srt_transport::PacedSendOutcome::NotDue => {
+                source.refused();
+                break;
+            }
+            srt_transport::PacedSendOutcome::Rejected(error) => {
+                eprintln!("[bench-compio] send_paced rejected (not a pacing refusal): {error}");
+                source.refused();
+                break;
+            }
+            srt_transport::PacedSendOutcome::DriverError(error) => {
+                eprintln!("[bench-compio] send_paced driver error: {error}");
+                stats.data_events += 1;
+                accepted += 1;
+                break;
+            }
         }
-        stats.data_events += 1;
-        accepted += 1;
     }
     for _ in 0..accepted {
         source.accepted();

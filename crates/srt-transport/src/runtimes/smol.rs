@@ -1,7 +1,7 @@
 use crate::{
-    BatchIoStats, OutputDrainBudget, OutputDrainReport, OutputDrainStatus, RecvBatch, RecvBudget,
-    RecvDrainReport, collect_output_work, drain_output_work, drain_recv_fd, prepend_outputs,
-    sendmsg_connected_batch,
+    BatchIoStats, OutputDrainBudget, OutputDrainReport, OutputDrainStatus, PacedSendOutcome,
+    RecvBatch, RecvBudget, RecvDrainReport, collect_output_work, drain_output_work, drain_recv_fd,
+    prepend_outputs, sendmsg_connected_batch,
 };
 use shiguredo_srt::{Bytes, ConnectionEvent, ConnectionOutput, SrtConnection, Timestamp};
 use std::collections::VecDeque;
@@ -135,27 +135,36 @@ impl Conn {
         }
     }
 
-    pub async fn send_paced(&mut self, payload: &[u8], now: Timestamp) -> Result<(), ()> {
+    /// See [`PacedSendOutcome`] for what each outcome means (S03).
+    pub async fn send_paced(&mut self, payload: &[u8], now: Timestamp) -> PacedSendOutcome {
         if self.has_pending_outputs() || !self.conn.can_send_with_pacing(now) {
-            return Err(());
+            return PacedSendOutcome::NotDue;
         }
-        self.conn.send(payload, now).map_err(|_| ())?;
-        let report = self.drain_outputs(now).await.map_err(|_| ())?;
-        (report.status == OutputDrainStatus::Drained)
-            .then_some(())
-            .ok_or(())
+        if let Err(error) = self.conn.send(payload, now) {
+            return PacedSendOutcome::Rejected(error);
+        }
+        match self.drain_outputs(now).await {
+            Ok(report) if report.status == OutputDrainStatus::Drained => PacedSendOutcome::Sent,
+            Ok(_) => PacedSendOutcome::Accepted,
+            Err(error) => PacedSendOutcome::DriverError(error),
+        }
     }
 
-    /// Success means the application payload was accepted into SRT. Drain is
-    /// best-effort: `Err` after `send_shared` would make bus callers retry and
-    /// duplicate the same application payload.
-    pub async fn send_shared_paced(&mut self, payload: Bytes, now: Timestamp) -> Result<(), ()> {
+    /// Once accepted, the payload is retained by the protocol regardless of
+    /// drain outcome -- a future bus caller must not resend it as new data
+    /// on `DriverError`/`Accepted`, only on `NotDue`/`Rejected` (S02/S03).
+    pub async fn send_shared_paced(&mut self, payload: Bytes, now: Timestamp) -> PacedSendOutcome {
         if self.has_pending_outputs() || !self.conn.can_send_with_pacing(now) {
-            return Err(());
+            return PacedSendOutcome::NotDue;
         }
-        self.conn.send_shared(payload, now).map_err(|_| ())?;
-        let _ = self.drain_outputs(now).await;
-        Ok(())
+        if let Err(error) = self.conn.send_shared(payload, now) {
+            return PacedSendOutcome::Rejected(error);
+        }
+        match self.drain_outputs(now).await {
+            Ok(report) if report.status == OutputDrainStatus::Drained => PacedSendOutcome::Sent,
+            Ok(_) => PacedSendOutcome::Accepted,
+            Err(error) => PacedSendOutcome::DriverError(error),
+        }
     }
 
     pub async fn tick(
@@ -171,7 +180,7 @@ impl Conn {
 
         let mut sent = 0u64;
         if drained.status == OutputDrainStatus::Drained {
-            while self.send_paced(payload, now).await.is_ok() {
+            while matches!(self.send_paced(payload, now).await, PacedSendOutcome::Sent) {
                 sent += 1;
             }
         }
