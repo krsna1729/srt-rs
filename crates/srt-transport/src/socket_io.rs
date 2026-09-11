@@ -321,24 +321,56 @@ pub fn recvmsg_batch(
 }
 
 /// SAFETY: `storage` must have been filled by `recvmmsg` with a valid
-/// address (IPv4-only, matching this workspace's bench harness).
+/// address. IPv4 and IPv6 senders both decode (A02); anything else returns
+/// `None` rather than misreading unrelated bytes as an address -- a caller
+/// must not silently treat that as "no sender" and keep processing the
+/// datagram's payload as if the source were known.
+///
+/// `bind_udp` (config.rs) never sets `IPV6_V6ONLY`, so a listener bound to
+/// an IPv6 wildcard address is dual-stack by default on Linux
+/// (`net.ipv6.bindv6only` defaults to 0): a plain IPv4 sender's datagram
+/// still arrives on that socket, but the kernel reports it as `AF_INET6`
+/// with an IPv4-mapped address (`::ffff:a.b.c.d`). Returning that
+/// as-is would key admission by a `SocketAddr::V6` no IPv4-only listener
+/// or [`sendmsg_batch`]/[`crate::flush_destined`] reply path (both reject
+/// non-`AF_INET` outright) can ever match again, so it is unmapped back to
+/// the plain `SocketAddr::V4` a genuine IPv4 peer needs.
 unsafe fn sockaddr_to_addr(
     storage: &libc::sockaddr_storage,
     name_len: libc::socklen_t,
 ) -> Option<net::SocketAddr> {
-    if storage.ss_family != libc::AF_INET as u16
-        || (name_len as usize) < std::mem::size_of::<libc::sockaddr_in>()
-    {
-        return None;
+    match storage.ss_family as i32 {
+        libc::AF_INET if (name_len as usize) >= std::mem::size_of::<libc::sockaddr_in>() => {
+            // SAFETY: the caller guarantees kernel-filled storage; the match
+            // arm establishes the IPv4 family and sufficient initialized
+            // byte length. The storage type provides alignment suitable
+            // for every sockaddr variant.
+            let addr =
+                unsafe { &*(storage as *const libc::sockaddr_storage as *const libc::sockaddr_in) };
+            Some(net::SocketAddr::from((
+                net::Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr)),
+                u16::from_be(addr.sin_port),
+            )))
+        }
+        libc::AF_INET6 if (name_len as usize) >= std::mem::size_of::<libc::sockaddr_in6>() => {
+            // SAFETY: same reasoning as the IPv4 arm, for the IPv6 family.
+            let addr = unsafe {
+                &*(storage as *const libc::sockaddr_storage as *const libc::sockaddr_in6)
+            };
+            let ip = net::Ipv6Addr::from(addr.sin6_addr.s6_addr);
+            let port = u16::from_be(addr.sin6_port);
+            if let Some(mapped) = ip.to_ipv4_mapped() {
+                return Some(net::SocketAddr::from((mapped, port)));
+            }
+            Some(net::SocketAddr::V6(net::SocketAddrV6::new(
+                ip,
+                port,
+                addr.sin6_flowinfo,
+                addr.sin6_scope_id,
+            )))
+        }
+        _ => None,
     }
-    // SAFETY: the caller guarantees kernel-filled storage; the checks above
-    // establish the IPv4 family and sufficient initialized byte length. The
-    // storage type provides alignment suitable for every sockaddr variant.
-    let addr = unsafe { &*(storage as *const libc::sockaddr_storage as *const libc::sockaddr_in) };
-    Some(net::SocketAddr::from((
-        net::Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr)),
-        u16::from_be(addr.sin_port),
-    )))
 }
 
 /// Send a batch of destination-addressed datagrams in a single `sendmmsg`
@@ -552,15 +584,102 @@ mod tests {
     }
 
     #[test]
-    fn sockaddr_to_addr_rejects_wrong_family() {
+    fn sockaddr_to_addr_rejects_ipv6_family_with_an_ipv4_sized_length() {
         // SAFETY: all-zero is a valid uninitialized sockaddr_storage.
         let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
         storage.ss_family = libc::AF_INET6 as u16;
         // SAFETY: storage is initialized with a known family; testing the
-        // rejection path.
+        // rejection path (an IPv6 family claiming only an IPv4-sized name
+        // is too short to hold a real sockaddr_in6, so it does not decode).
         let result =
             unsafe { sockaddr_to_addr(&storage, std::mem::size_of::<libc::sockaddr_in>() as u32) };
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn sockaddr_to_addr_rejects_an_unrecognized_family() {
+        // SAFETY: all-zero is a valid uninitialized sockaddr_storage.
+        let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        // AF_UNIX is neither of the two families this crate's sockets ever
+        // bind as (A02); it must not be misread as either.
+        storage.ss_family = libc::AF_UNIX as u16;
+        // SAFETY: storage is initialized with a known (unsupported) family;
+        // testing the rejection path.
+        let result = unsafe {
+            sockaddr_to_addr(
+                &storage,
+                std::mem::size_of::<libc::sockaddr_storage>() as u32,
+            )
+        };
+        assert!(result.is_none());
+    }
+
+    /// A02: a datagram from a real IPv6 sender must decode to a genuine
+    /// `SocketAddr::V6`, not silently become `None` (previously, this whole
+    /// function only recognized `AF_INET`, so every IPv6 sender's address
+    /// vanished while its payload was still processed as if the source
+    /// were unknown).
+    #[test]
+    fn sockaddr_to_addr_parses_valid_ipv6() {
+        // SAFETY: all-zero is a valid uninitialized sockaddr_storage.
+        let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        // SAFETY: sockaddr_storage is layout-compatible with sockaddr_in6
+        // when the family is AF_INET6; we fill every field before reading.
+        let addr = unsafe {
+            &mut *(&mut storage as *mut libc::sockaddr_storage as *mut libc::sockaddr_in6)
+        };
+        addr.sin6_family = libc::AF_INET6 as u16;
+        addr.sin6_port = 8080u16.to_be();
+        addr.sin6_addr.s6_addr = net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).octets();
+        addr.sin6_scope_id = 7;
+        // SAFETY: storage was filled as a valid AF_INET6 sockaddr_in6 above.
+        let result =
+            unsafe { sockaddr_to_addr(&storage, std::mem::size_of::<libc::sockaddr_in6>() as u32) };
+        assert_eq!(
+            result,
+            Some(net::SocketAddr::V6(net::SocketAddrV6::new(
+                net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+                8080,
+                0,
+                7,
+            )))
+        );
+    }
+
+    /// A02 (Opus review): `bind_udp` never sets `IPV6_V6ONLY`, so a
+    /// listener bound to an IPv6 wildcard address is dual-stack by default
+    /// on Linux -- a plain IPv4 sender's datagram still arrives there, but
+    /// the kernel reports its address as `AF_INET6` with an IPv4-mapped
+    /// address (`::ffff:a.b.c.d`). Returning that as a raw `SocketAddr::V6`
+    /// would key admission by an address no IPv4-only listener or
+    /// `sendmsg_batch` reply path (which rejects non-`AF_INET` outright)
+    /// can ever match again; it must unmap back to a plain `SocketAddr::V4`.
+    #[test]
+    fn sockaddr_to_addr_unmaps_an_ipv4_mapped_ipv6_sender() {
+        // SAFETY: all-zero is a valid uninitialized sockaddr_storage.
+        let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        // SAFETY: sockaddr_storage is layout-compatible with sockaddr_in6
+        // when the family is AF_INET6; we fill every field before reading.
+        let addr = unsafe {
+            &mut *(&mut storage as *mut libc::sockaddr_storage as *mut libc::sockaddr_in6)
+        };
+        addr.sin6_family = libc::AF_INET6 as u16;
+        addr.sin6_port = 9090u16.to_be();
+        addr.sin6_addr.s6_addr = net::Ipv4Addr::new(192, 168, 1, 42)
+            .to_ipv6_mapped()
+            .octets();
+        // SAFETY: storage was filled as a valid AF_INET6 sockaddr_in6 above.
+        let result =
+            unsafe { sockaddr_to_addr(&storage, std::mem::size_of::<libc::sockaddr_in6>() as u32) };
+        assert_eq!(
+            result,
+            Some(net::SocketAddr::from((
+                net::Ipv4Addr::new(192, 168, 1, 42),
+                9090
+            ))),
+            "an IPv4-mapped IPv6 sender must unmap to a plain V4 address, \
+             not surface as SocketAddr::V6"
+        );
     }
 
     #[test]
@@ -758,5 +877,53 @@ mod tests {
         );
         assert_eq!(sizes[1], valid_payload.len());
         assert_eq!(&bufs[1][..sizes[1]], valid_payload);
+    }
+
+    /// A02: `recvmsg_batch` must complete a real loopback exchange over
+    /// IPv6, not just decode a hand-built `sockaddr_storage` -- proves the
+    /// actual kernel-filled `AF_INET6` path, not only `sockaddr_to_addr`'s
+    /// own pure-Rust decoding logic.
+    #[test]
+    fn recvmsg_batch_completes_a_real_ipv6_loopback_exchange() {
+        use std::os::fd::AsRawFd;
+        let receiver = net::UdpSocket::bind("[::1]:0").expect("bind IPv6 receiver");
+        receiver
+            .set_nonblocking(true)
+            .expect("nonblocking receiver");
+        let dest = receiver.local_addr().expect("receiver addr");
+        assert!(dest.is_ipv6(), "receiver must be a real IPv6 socket");
+        let sender = net::UdpSocket::bind("[::1]:0").expect("bind IPv6 sender");
+        sender.set_nonblocking(true).expect("nonblocking sender");
+        let sender_addr = sender.local_addr().expect("sender addr");
+
+        sender.send_to(b"ipv6 payload", dest).expect("send");
+
+        let mut bufs: Vec<Vec<u8>> = vec![Vec::with_capacity(64)];
+        let mut sizes = [0usize; 1];
+        let mut addrs = [None; 1];
+        let mut truncated = [false; 1];
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut received = 0;
+        while received == 0 && std::time::Instant::now() < deadline {
+            match recvmsg_batch(
+                receiver.as_raw_fd(),
+                &mut bufs,
+                &mut sizes,
+                &mut addrs,
+                &mut truncated,
+            ) {
+                Ok(0) => std::thread::yield_now(),
+                Ok(n) => received = n,
+                Err(error) => panic!("recvmmsg failed: {error}"),
+            }
+        }
+        assert_eq!(received, 1, "the datagram must be observed by the kernel");
+        assert_eq!(&bufs[0][..sizes[0]], b"ipv6 payload");
+        assert_eq!(
+            addrs[0],
+            Some(sender_addr),
+            "the real IPv6 sender's address must decode correctly, not become None"
+        );
     }
 }
