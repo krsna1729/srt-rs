@@ -1336,7 +1336,7 @@ impl PeerTable {
         {
             self.half_open_deadlines.set(
                 physical,
-                now.add_micros(half_open_timeout_micros(self.config.half_open_timeout)),
+                now.add_micros(duration_micros_saturating(self.config.half_open_timeout)),
             );
         }
         self.mark_ready_physical(physical);
@@ -1750,7 +1750,7 @@ impl PeerTable {
     pub fn prune_half_open(&mut self, now: Timestamp) -> usize {
         let mut due = Vec::new();
         self.half_open_deadlines.pop_due(now, &mut due);
-        let timeout_micros = half_open_timeout_micros(self.config.half_open_timeout);
+        let timeout_micros = duration_micros_saturating(self.config.half_open_timeout);
         let mut count = 0;
         for peer in due {
             let stale = self.get_peer(&peer).is_some_and(|entry| {
@@ -1761,6 +1761,61 @@ impl PeerTable {
                 continue;
             }
             let _ = self.remove_physical(peer);
+            count += 1;
+        }
+        count
+    }
+
+    /// Start an orderly close on every established direct peer that has
+    /// gone quiet for longer than `idle_timeout` (A04) -- the same
+    /// `conn.disconnect(now)` + `mark_ready_physical` a normal
+    /// [`LogicalPeerMut::disconnect`] performs, so the resulting SHUTDOWN
+    /// is actually drained and sent on the next `poll_outbound`, and the
+    /// application observes it as an ordinary `ConnectionEvent::Disconnected`
+    /// via `poll_events` rather than the peer's state and buffers simply
+    /// vanishing. Retiring the table entry itself remains the
+    /// application's call (`remove`), same as any other disconnect.
+    ///
+    /// Distinct from [`Self::prune_half_open`] (which only ever considers
+    /// a peer still mid-handshake, `!admission_established`) and from a
+    /// peer already mid-close (this checks the protocol's own
+    /// `ConnectionState::Connected`, not the bookkeeping `connected` field,
+    /// which only updates once the *application* drains the corresponding
+    /// event via `poll_events` -- a peer that is truly `Connected` but
+    /// whose event has not yet been drained would otherwise be invisible
+    /// to both this and `prune_half_open`, unbounded). Bonded groups are
+    /// unaffected: `InboundGroup` has no equivalent idle concept yet.
+    ///
+    /// Collects a [`PhysicalPeerKey`] directly from the slot arena rather
+    /// than an address and re-resolving it: `physical_for_address` returns
+    /// the *first* slot at that address, but one address can legitimately
+    /// hold many peers (a shared caller socket is exactly this -- see
+    /// [`crate::mio_transport::Owner::connect`]), so re-resolving by
+    /// address alone risks disconnecting a different, healthy peer at the
+    /// same address instead of the one actually identified as stale.
+    pub fn prune_idle(&mut self, now: Timestamp, idle_timeout: Duration) -> usize {
+        let timeout_micros = duration_micros_saturating(idle_timeout);
+        let stale: Vec<PhysicalPeerKey> = self
+            .slots
+            .iter()
+            .filter_map(|slot| {
+                let entry = slot.value.direct()?;
+                let stale = entry.admission_established
+                    && entry.conn.state() == shiguredo_srt::ConnectionState::Connected
+                    && now.saturating_sub(entry.last_datagram_at) >= timeout_micros;
+                stale.then_some(PhysicalPeerKey {
+                    address: slot.address,
+                    local_socket_id: slot.socket_id,
+                })
+            })
+            .collect();
+        let mut count = 0;
+        for physical in stale {
+            let Some(entry) = self.get_peer_mut(&physical) else {
+                continue;
+            };
+            entry.conn.disconnect(now);
+            self.mark_ready_physical(physical);
             count += 1;
         }
         count
@@ -2531,7 +2586,7 @@ fn peer_entropy(peer: std::net::SocketAddr) -> u32 {
     std::collections::hash_map::RandomState::new().hash_one(peer) as u32
 }
 
-fn half_open_timeout_micros(timeout: Duration) -> u64 {
+fn duration_micros_saturating(timeout: Duration) -> u64 {
     u64::try_from(timeout.as_micros()).unwrap_or(u64::MAX)
 }
 
@@ -3364,6 +3419,272 @@ mod tests {
             table.get_peer(&physical).expect("peer entry").data_events,
             1,
             "one DataReceived event must count as exactly one data_events increment"
+        );
+    }
+
+    /// A04: `prune_idle` must start an orderly close on an established peer
+    /// that has gone quiet past `idle_timeout`, and must leave an equally
+    /// old but still-active peer completely untouched.
+    #[test]
+    fn prune_idle_closes_a_quiet_established_peer_but_leaves_an_active_one_alone() {
+        let quiet_peer = "127.0.0.1:11010".parse().expect("address");
+        let active_peer = "127.0.0.1:11011".parse().expect("address");
+        let options = AdmissionOptions::basic(0x9999, 20, false);
+        let telemetry = IngressTelemetry::new();
+        let mut table = PeerTable::new();
+
+        let (mut quiet_caller, quiet_conclusion) =
+            admit_up_to_conclusion(&mut table, quiet_peer, 0xAAAA, &options, &telemetry);
+        admit_conclusion(
+            &mut table,
+            quiet_peer,
+            &mut quiet_caller,
+            &quiet_conclusion,
+            &options,
+            &telemetry,
+        );
+        let (mut active_caller, active_conclusion) =
+            admit_up_to_conclusion(&mut table, active_peer, 0xBBBB, &options, &telemetry);
+        admit_conclusion(
+            &mut table,
+            active_peer,
+            &mut active_caller,
+            &active_conclusion,
+            &options,
+            &telemetry,
+        );
+
+        // Both peers' Connected events drained -- both are now
+        // `entry.connected == true`, both admitted at roughly the same
+        // (synthetic) time inside `admit_conclusion`.
+        let mut events = Vec::new();
+        table.poll_events(&mut events);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.event, ConnectionEvent::Connected))
+                .count(),
+            2,
+            "both peers must reach Connected"
+        );
+
+        // The active peer sends real data just before the idle sweep,
+        // refreshing its `last_datagram_at`; the quiet peer sends nothing
+        // further and keeps the timestamp `admit_conclusion` left it at.
+        active_caller
+            .send(b"still here", Timestamp::from_micros(1_999_999))
+            .expect("active caller sends");
+        let refresh_packet = next_packet(&mut active_caller);
+        assert_eq!(
+            table.admit(
+                active_peer,
+                &refresh_packet,
+                Timestamp::from_micros(1_999_999),
+                &options,
+                0,
+                1,
+                &telemetry,
+            ),
+            Admit::Fed
+        );
+
+        let idle_timeout = Duration::from_micros(1_000_000);
+        let now = Timestamp::from_micros(2_000_000);
+        let closed = table.prune_idle(now, idle_timeout);
+        assert_eq!(closed, 1, "exactly the quiet peer must be closed");
+
+        let mut outbound = Vec::new();
+        table.poll_outbound(now, &mut outbound);
+        let mut events = Vec::new();
+        table.poll_events(&mut events);
+        assert!(
+            events
+                .iter()
+                .any(|event| event.representative_peer == quiet_peer
+                    && matches!(
+                        event.event,
+                        ConnectionEvent::StateChanged(shiguredo_srt::ConnectionState::Closing)
+                    )),
+            "the quiet peer must observe its close starting from prune_idle, got {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event.representative_peer != active_peer),
+            "the active peer must observe no event at all -- prune_idle must not touch it"
+        );
+        let active_physical = table
+            .physical_for_address(active_peer)
+            .expect("still present");
+        assert!(
+            table
+                .get_peer(&active_physical)
+                .expect("entry present")
+                .connected,
+            "the active peer must remain connected"
+        );
+    }
+
+    /// Opus review (A04): two peers sharing one physical UDP address --
+    /// exactly what `mio_transport::Owner`'s shared caller socket produces
+    /// by default (K01 `SocketOwnership::Shared`) -- must each be judged
+    /// on their own idle state. `prune_idle`'s first draft collected a bare
+    /// `SocketAddr` and re-resolved it via `physical_for_address`, which
+    /// returns only the *first* slot at that address; with two peers at
+    /// one address this silently disconnected whichever peer happened to
+    /// occupy that first slot, independent of which one was actually
+    /// idle -- capable of closing a perfectly healthy peer while leaving
+    /// the genuinely idle one untouched forever.
+    #[test]
+    fn prune_idle_targets_the_correct_peer_when_two_peers_share_one_address() {
+        let peer_addr = "127.0.0.1:11012".parse().expect("address");
+        let options = AdmissionOptions::basic(0xDDDD, 20, false);
+        let telemetry = IngressTelemetry::new();
+        let mut table = PeerTable::new();
+
+        let (mut quiet_caller, quiet_conclusion) =
+            admit_up_to_conclusion(&mut table, peer_addr, 0xAAAA, &options, &telemetry);
+        admit_conclusion(
+            &mut table,
+            peer_addr,
+            &mut quiet_caller,
+            &quiet_conclusion,
+            &options,
+            &telemetry,
+        );
+        // `local_socket_id` is the peer's own declared socket id (the
+        // value the listener demuxes on), so it is known and unambiguous
+        // even with several peers sharing one address, unlike
+        // `physical_for_address` which cannot pick among them.
+        let quiet_physical = table
+            .physical_for_address(peer_addr)
+            .expect("quiet admitted");
+
+        let (mut active_caller, active_conclusion) =
+            admit_up_to_conclusion(&mut table, peer_addr, 0xBBBB, &options, &telemetry);
+        admit_conclusion(
+            &mut table,
+            peer_addr,
+            &mut active_caller,
+            &active_conclusion,
+            &options,
+            &telemetry,
+        );
+
+        let mut events = Vec::new();
+        table.poll_events(&mut events);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.event, ConnectionEvent::Connected))
+                .count(),
+            2,
+            "both peers, sharing one address, must reach Connected"
+        );
+
+        active_caller
+            .send(b"still here", Timestamp::from_micros(1_999_999))
+            .expect("active caller sends");
+        let refresh_packet = next_packet(&mut active_caller);
+        assert_eq!(
+            table.admit(
+                peer_addr,
+                &refresh_packet,
+                Timestamp::from_micros(1_999_999),
+                &options,
+                0,
+                1,
+                &telemetry,
+            ),
+            Admit::Fed
+        );
+
+        // The other same-address slot -- there is no public way to name
+        // it in advance (its local_socket_id is a randomly-allocated
+        // listener-side value, not the caller's own declared id), so it is
+        // identified here as "whichever direct slot at this address is
+        // not the quiet one".
+        let active_physical = table
+            .slots
+            .iter()
+            .find(|slot| {
+                slot.address == peer_addr && slot.socket_id != quiet_physical.local_socket_id
+            })
+            .map(|slot| PhysicalPeerKey {
+                address: slot.address,
+                local_socket_id: slot.socket_id,
+            })
+            .expect("the second peer occupies a distinct slot at the same address");
+
+        let idle_timeout = Duration::from_micros(1_000_000);
+        let now = Timestamp::from_micros(2_000_000);
+        let closed = table.prune_idle(now, idle_timeout);
+        assert_eq!(
+            closed, 1,
+            "exactly one of the two same-address peers must be closed"
+        );
+
+        assert_eq!(
+            table
+                .get_peer(&quiet_physical)
+                .expect("quiet peer entry still present")
+                .conn
+                .state(),
+            shiguredo_srt::ConnectionState::Closing,
+            "the quiet peer specifically must be the one closed, not whichever peer \
+             happens to occupy the first slot at the shared address"
+        );
+        assert_eq!(
+            table
+                .get_peer(&active_physical)
+                .expect("active peer entry still present")
+                .conn
+                .state(),
+            shiguredo_srt::ConnectionState::Connected,
+            "the active peer must remain untouched"
+        );
+    }
+
+    /// Opus review (A04): `prune_idle` must key off the protocol's own
+    /// `ConnectionState`, not the `AdmissionPeer::connected` bookkeeping
+    /// flag -- the latter only updates once the *application* drains the
+    /// corresponding event via `poll_events`, so a peer that is genuinely
+    /// `Connected` at the protocol level but whose event has not yet been
+    /// drained would otherwise be invisible to idle pruning (unlike
+    /// `prune_half_open`, which it must stay bounded the same way).
+    #[test]
+    fn prune_idle_retires_a_quiet_peer_even_before_its_connected_event_is_drained() {
+        let peer = "127.0.0.1:11013".parse().expect("address");
+        let options = AdmissionOptions::basic(0xEEEE, 20, false);
+        let telemetry = IngressTelemetry::new();
+        let mut table = PeerTable::new();
+
+        let (mut caller, conclusion) =
+            admit_up_to_conclusion(&mut table, peer, 0xFFFF, &options, &telemetry);
+        admit_conclusion(
+            &mut table,
+            peer,
+            &mut caller,
+            &conclusion,
+            &options,
+            &telemetry,
+        );
+        // Deliberately never call `poll_events` -- `entry.connected` stays
+        // `false` for the rest of this test, exactly as it would for an
+        // application whose event loop has fallen behind.
+        let physical = table.physical_for_address(peer).expect("peer admitted");
+        assert!(
+            !table.get_peer(&physical).expect("entry present").connected,
+            "connected must not have flipped without poll_events, or this test proves nothing"
+        );
+
+        let idle_timeout = Duration::from_micros(1_000_000);
+        let now = Timestamp::from_micros(2_000_000);
+        let closed = table.prune_idle(now, idle_timeout);
+        assert_eq!(
+            closed, 1,
+            "a protocol-Connected, quiet-too-long peer must be retired regardless of \
+             whether its Connected event has been drained yet"
         );
     }
 }

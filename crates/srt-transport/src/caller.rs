@@ -1034,6 +1034,21 @@ impl CallerTable {
         })
     }
 
+    /// The protocol's own `ConnectionState` for one direct logical caller
+    /// -- unlike [`LogicalCallerState`], which folds `Induction`/
+    /// `Conclusion`/`Listening`/`Closing` all into one `Connecting` value,
+    /// this distinguishes a session still trying to establish from one
+    /// that already connected and is now gracefully closing. `None` for a
+    /// bonded group (no single state to report) or an id that no longer
+    /// exists.
+    #[must_use]
+    pub fn raw_direct_state(&self, id: &LogicalCallerId) -> Option<shiguredo_srt::ConnectionState> {
+        match self.sessions.get(id)? {
+            CallerSession::Direct(leg) => Some(leg.connection.state()),
+            CallerSession::Group(_) => None,
+        }
+    }
+
     pub fn logical_caller_mut(&mut self, id: &LogicalCallerId) -> Option<LogicalCallerMut<'_>> {
         self.logical_caller(id)?;
         Some(LogicalCallerMut {
