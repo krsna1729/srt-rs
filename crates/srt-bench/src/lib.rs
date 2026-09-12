@@ -330,7 +330,12 @@ pub struct BenchConfig {
     /// available -- the baseline `On` should be measured against. See
     /// `Batching` for which runtimes actually have a batched path today.
     pub batching: Batching,
-    /// Tokio shared-socket `recvmmsg` quanta per readiness service.
+    /// Tokio shared-socket `recvmmsg` quanta per readiness service: up to
+    /// `RecvBatch::DEFAULT_CAPACITY` datagrams per round there, so
+    /// `--recv-rounds 8` is up to 256 datagrams. mio's own per-connection
+    /// path (B02) reuses this same field as a raw per-visit datagram count
+    /// instead (one un-batched `recv()` per round) -- comparing this
+    /// value's meaning across runtimes needs that distinction in mind.
     pub recv_rounds: usize,
     /// Tokio shared-socket policy after a nonblocking outbound send yields.
     pub would_block: crate::scheduling::WouldBlockPolicy,
