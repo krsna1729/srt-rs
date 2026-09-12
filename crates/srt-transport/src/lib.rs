@@ -164,7 +164,7 @@ pub use caller::{
     LogicalCallerMut, LogicalCallerState, LogicalCallerStats, RemovedCallerLeg,
     RemovedLogicalCaller,
 };
-pub use caller_pool::{CallerPool, CallerPoolStats, PoolOutcome};
+pub use caller_pool::{CallerPool, CallerPoolStats, PoolEvent, PoolOutcome, PoolRequestId};
 // Internal helpers used by runtime and group_conn modules.
 pub(crate) use batch::{drain_connected_outputs, drain_output_work};
 pub(crate) use caller::{collect_output_work, prepend_outputs};
@@ -200,6 +200,16 @@ impl OutputDrainBudget {
             max_packets,
             max_bytes,
         }
+    }
+
+    /// Apply a visit limit without exceeding the configured transport limits.
+    #[must_use]
+    pub fn intersect(self, other: Self) -> Self {
+        Self::new(
+            self.max_actions.min(other.max_actions),
+            self.max_packets.min(other.max_packets),
+            self.max_bytes.min(other.max_bytes),
+        )
     }
 }
 
@@ -317,6 +327,18 @@ pub enum OutputDrainStatus {
     Drained,
     BudgetExhausted,
     Backpressured,
+}
+
+impl OutputDrainStatus {
+    /// Ready work on either side takes precedence over socket backpressure.
+    #[must_use]
+    pub fn combine(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::BudgetExhausted, _) | (_, Self::BudgetExhausted) => Self::BudgetExhausted,
+            (Self::Backpressured, _) | (_, Self::Backpressured) => Self::Backpressured,
+            _ => Self::Drained,
+        }
+    }
 }
 
 /// Work completed by one bounded output-pump invocation.

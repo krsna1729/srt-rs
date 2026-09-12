@@ -12,6 +12,8 @@ use std::hash::Hash;
 use std::io;
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 
@@ -81,9 +83,10 @@ impl Conn {
         now: Timestamp,
         budget: OutputDrainBudget,
     ) -> io::Result<OutputDrainReport> {
+        let budget = budget.intersect(self.output_drain);
         let (work, budget_exhausted) =
             collect_output_work(&mut self.conn, &mut self.pending_outputs, budget);
-        let report = OutputDrainReport {
+        let mut report = OutputDrainReport {
             status: if budget_exhausted {
                 OutputDrainStatus::BudgetExhausted
             } else {
@@ -92,9 +95,17 @@ impl Conn {
             ..OutputDrainReport::default()
         };
         let work = if work_has_packets(&work) {
+            // Keep every collected item in the owned pending queue while
+            // awaiting readiness. Cancellation must never strand a timer or
+            // packet in a local future-owned deque.
             prepend_outputs(&mut self.pending_outputs, work.into_iter());
             self.sock.writable().await?;
-            collect_output_work(&mut self.conn, &mut self.pending_outputs, budget).0
+            let (work, second_budget_exhausted) =
+                collect_output_work(&mut self.conn, &mut self.pending_outputs, budget);
+            if second_budget_exhausted {
+                report.status = report.status.combine(OutputDrainStatus::BudgetExhausted);
+            }
+            work
         } else {
             work
         };
@@ -663,9 +674,9 @@ fn mark_member_broken_if_new(group: &mut shiguredo_srt::SrtGroup, member_id: u32
 fn send_destined_ready(
     sock: &UdpSocket,
     outbound: &mut Vec<(SocketAddr, Vec<u8>)>,
-) -> io::Result<()> {
+) -> io::Result<crate::SendFlushReport> {
     if outbound.is_empty() {
-        return Ok(());
+        return Ok(crate::SendFlushReport::default());
     }
     let result = sock.try_io(
         tokio::io::Interest::WRITABLE,
@@ -674,8 +685,78 @@ fn send_destined_ready(
             n => Ok(n),
         },
     );
-    crate::apply_send_result(outbound, result)?;
-    Ok(())
+    match crate::apply_send_result(outbound, result) {
+        Ok(report) => Ok(report),
+        Err(_) => {
+            // `sendmmsg` reports one error for the whole batch. A malformed
+            // destination must not take down every logical session sharing
+            // this egress socket, so retry packets individually and retire
+            // only the destination that failed. A transient `WouldBlock`
+            // keeps the suffix for the next writable wake.
+            let mut report = crate::SendFlushReport::default();
+            let index = 0;
+            while index < outbound.len() {
+                let (destination, packet) = &outbound[index];
+                let result = sock.try_io(tokio::io::Interest::WRITABLE, || {
+                    sock.try_send_to(packet, *destination)
+                });
+                match result {
+                    Ok(_) => {
+                        outbound.remove(index);
+                        report.sent = report.sent.saturating_add(1);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        report.would_block = true;
+                        break;
+                    }
+                    Err(_) => {
+                        // A destination-specific error is isolated to this
+                        // packet. Keeping it would make every future visit
+                        // fail at the same item and starve healthy peers.
+                        outbound.remove(index);
+                    }
+                }
+            }
+            Ok(report)
+        }
+    }
+}
+
+/// Combine a side's output-drain report (if one was polled this tick, i.e.
+/// `outbound` was empty going in) with its current backpressure state, then
+/// attempt to send whatever `outbound` now holds. Shared by both the
+/// listener and caller halves of [`Runtime::drive`], which differ only in
+/// how they obtain `poll_report`.
+fn drive_side_output(
+    sock: &UdpSocket,
+    outbound: &mut Vec<(SocketAddr, Vec<u8>)>,
+    write_blocked: &mut bool,
+    mut status: crate::OutputDrainStatus,
+    poll_report: Option<crate::OutputDrainReport>,
+) -> io::Result<crate::OutputDrainStatus> {
+    status = match poll_report {
+        Some(report) => status.combine(report.status),
+        None => status.combine(if *write_blocked {
+            crate::OutputDrainStatus::Backpressured
+        } else {
+            crate::OutputDrainStatus::BudgetExhausted
+        }),
+    };
+    match send_destined_ready(sock, outbound) {
+        Ok(report) => {
+            *write_blocked = report.would_block;
+            if report.would_block {
+                status = status.combine(crate::OutputDrainStatus::Backpressured);
+            }
+            Ok(status)
+        }
+        Err(error) => {
+            // Destination errors are isolated by `send_destined_ready`;
+            // only an impossible internal result reaches this branch.
+            *write_blocked = false;
+            Err(error)
+        }
+    }
 }
 
 /// A future that awaits `socket.readable()` when present, or never resolves
@@ -689,7 +770,20 @@ async fn readable_or_pending(socket: Option<&UdpSocket>) -> io::Result<()> {
     }
 }
 
-const OWNER_RECV_BUDGET: RecvBudget = RecvBudget::until_would_block();
+async fn writable_or_pending(socket: Option<&UdpSocket>, pending: bool) -> io::Result<()> {
+    if !pending {
+        return std::future::pending().await;
+    }
+    match socket {
+        Some(socket) => socket.writable().await,
+        None => std::future::pending().await,
+    }
+}
+
+fn receive_continuation(report: RecvDrainReport, budget: RecvBudget) -> bool {
+    !report.would_block
+        && (report.syscalls >= budget.max_rounds || report.datagrams >= budget.max_datagrams)
+}
 
 struct OwnerListenerSide {
     socket: UdpSocket,
@@ -699,6 +793,10 @@ struct OwnerListenerSide {
     recv_batch: RecvBatch,
     outbound: Vec<(SocketAddr, Vec<u8>)>,
     idle_timeout: Duration,
+    recv_budget: RecvBudget,
+    output_drain: OutputDrainBudget,
+    recv_pending: bool,
+    write_blocked: bool,
 }
 
 struct OwnerCallerSide {
@@ -706,6 +804,12 @@ struct OwnerCallerSide {
     callers: crate::CallerPool,
     recv_batch: RecvBatch,
     outbound: Vec<(SocketAddr, Vec<u8>)>,
+    recv_budget: RecvBudget,
+    output_drain: OutputDrainBudget,
+    recv_pending: bool,
+    write_blocked: bool,
+    local_bind: Option<SocketAddr>,
+    socket_buffer_bytes: usize,
 }
 
 /// The Tokio-native counterpart to [`crate::mio_transport::Owner`] (A03,
@@ -728,7 +832,9 @@ struct OwnerCallerSide {
 pub struct Owner {
     listener: Option<OwnerListenerSide>,
     caller: Option<OwnerCallerSide>,
-    caller_pool_policy: (std::num::NonZeroUsize, Duration),
+    caller_pool_policy: Option<(std::num::NonZeroUsize, Duration)>,
+    caller_pool_policy_explicit: bool,
+    expired_callers: Vec<crate::LogicalCallerId>,
 }
 
 impl Default for Owner {
@@ -743,7 +849,9 @@ impl Owner {
         Self {
             listener: None,
             caller: None,
-            caller_pool_policy: (std::num::NonZeroUsize::MAX, Duration::MAX),
+            caller_pool_policy: None,
+            caller_pool_policy_explicit: false,
+            expired_callers: Vec::new(),
         }
     }
 
@@ -762,7 +870,8 @@ impl Owner {
                  socket and its pool already exist",
             )));
         }
-        self.caller_pool_policy = (max_in_flight, attempt_deadline);
+        self.caller_pool_policy = Some((max_in_flight, attempt_deadline));
+        self.caller_pool_policy_explicit = true;
         Ok(())
     }
 
@@ -810,6 +919,10 @@ impl Owner {
             telemetry: crate::IngressTelemetry::new(),
             recv_batch: RecvBatch::new(),
             outbound: Vec::new(),
+            recv_budget: prepared.transport.recv_budget,
+            output_drain: prepared.transport.output_drain,
+            recv_pending: false,
+            write_blocked: false,
         });
         Ok(())
     }
@@ -840,15 +953,58 @@ impl Owner {
                  an IPv4 remote address instead",
             )));
         }
+        if let Some(side) = self.caller.as_ref()
+            && (side.local_bind != prepared.local_bind
+                || side.socket_buffer_bytes != prepared.transport.socket_buffer_bytes)
+        {
+            return Err(crate::RuntimeBuildError::from(crate::ConfigError::new(
+                "caller.transport",
+                "later Shared callers must use the first caller socket's local bind and socket buffer configuration",
+            )));
+        }
         if self.caller.is_none() {
             let socket = UdpSocket::from_std(prepared.bind_socket()?)?;
-            let (max_in_flight, attempt_deadline) = self.caller_pool_policy;
+            let policy = self.caller_pool_policy.unwrap_or((
+                prepared.connect.max_in_flight,
+                prepared.connect.attempt_deadline,
+            ));
+            self.caller_pool_policy = Some(policy);
             self.caller = Some(OwnerCallerSide {
                 socket,
-                callers: crate::CallerPool::new(max_in_flight, attempt_deadline),
+                // A zero queue capacity, not `CallerPool::new`'s default
+                // finite queue: `Facade::connect` documents that it "does
+                // not wait for a queued permit" and answers a full pool
+                // with `FacadeError::PoolFull` immediately, dropping the
+                // request on the `Facade` side. If the pool itself queued
+                // that same request, it would later admit it with no
+                // `Session`/inbox/control anywhere to claim the resulting
+                // connection -- an orphaned session (Opus review finding
+                // 3). `Owner::connect` used directly (not through
+                // `Facade`) has no such mismatch since its caller already
+                // tracks `PoolOutcome::Queued` through the pool's own
+                // outcome stream; that path is `mio::Owner`'s, which keeps
+                // a real queue.
+                callers: crate::CallerPool::with_queue_capacity(policy.0, policy.1, 0),
                 recv_batch: RecvBatch::new(),
                 outbound: Vec::new(),
+                recv_budget: prepared.transport.recv_budget,
+                output_drain: prepared.transport.output_drain,
+                recv_pending: false,
+                write_blocked: false,
+                local_bind: prepared.local_bind,
+                socket_buffer_bytes: prepared.transport.socket_buffer_bytes,
             });
+        } else if !self.caller_pool_policy_explicit
+            && self.caller_pool_policy
+                != Some((
+                    prepared.connect.max_in_flight,
+                    prepared.connect.attempt_deadline,
+                ))
+        {
+            return Err(crate::RuntimeBuildError::from(crate::ConfigError::new(
+                "caller.connect",
+                "all callers on a shared owner must use the first caller pool policy",
+            )));
         }
         let side = self.caller.as_mut().expect("just ensured above");
         side.callers.connect(prepared, now).map_err(|error| {
@@ -876,39 +1032,62 @@ impl Owner {
         now: impl Fn() -> Timestamp,
         caller_budget: crate::OutputDrainBudget,
     ) -> io::Result<crate::OutputDrainStatus> {
-        tokio::select! {
-            result = readable_or_pending(self.listener.as_ref().map(|side| &side.socket)) => {
-                result?;
+        let continuation = self.listener.as_ref().is_some_and(|side| side.recv_pending)
+            || self.caller.as_ref().is_some_and(|side| side.recv_pending);
+        if continuation {
+            // A continuation is deliberately one bounded visit, then a
+            // scheduler handoff. This keeps a permanently busy socket from
+            // spinning in a single task while still draining it promptly.
+            tokio::task::yield_now().await;
+        } else {
+            tokio::select! {
+                result = readable_or_pending(self.listener.as_ref().map(|side| &side.socket)) => {
+                    result?;
+                }
+                result = readable_or_pending(self.caller.as_ref().map(|side| &side.socket)) => {
+                    result?;
+                }
+                result = writable_or_pending(
+                    self.listener.as_ref().map(|side| &side.socket),
+                    self.listener.as_ref().is_some_and(|side| !side.outbound.is_empty()),
+                ) => {
+                    result?;
+                }
+                result = writable_or_pending(
+                    self.caller.as_ref().map(|side| &side.socket),
+                    self.caller.as_ref().is_some_and(|side| !side.outbound.is_empty()),
+                ) => {
+                    result?;
+                }
+                () = tokio::time::sleep(timeout) => {}
             }
-            result = readable_or_pending(self.caller.as_ref().map(|side| &side.socket)) => {
-                result?;
-            }
-            () = tokio::time::sleep(timeout) => {}
         }
         let recv_now = now();
         if let Some(side) = self.listener.as_mut() {
             let (peers, admission, telemetry) = (&mut side.peers, &side.admission, &side.telemetry);
-            drain_readable(
+            let report = drain_readable(
                 &side.socket,
                 &mut side.recv_batch,
-                OWNER_RECV_BUDGET,
+                side.recv_budget,
                 |addr, data| {
                     let Some(peer) = addr else { return };
                     let _ = peers.admit(peer, data, recv_now, admission, 0, 1, telemetry);
                 },
             )?;
+            side.recv_pending = receive_continuation(report, side.recv_budget);
         }
         if let Some(side) = self.caller.as_mut() {
             let callers = side.callers.table_mut();
-            drain_readable(
+            let report = drain_readable(
                 &side.socket,
                 &mut side.recv_batch,
-                OWNER_RECV_BUDGET,
+                side.recv_budget,
                 |addr, data| {
                     let Some(peer) = addr else { return };
                     let _ = callers.feed(peer, data, recv_now);
                 },
             )?;
+            side.recv_pending = receive_continuation(report, side.recv_budget);
         }
         self.drive(now(), caller_budget)
     }
@@ -924,35 +1103,48 @@ impl Owner {
         now: Timestamp,
         caller_budget: crate::OutputDrainBudget,
     ) -> io::Result<crate::OutputDrainStatus> {
-        let mut first_error = None;
+        let mut status = crate::OutputDrainStatus::Drained;
         if let Some(side) = self.listener.as_mut() {
             side.peers.prune_idle(now, side.idle_timeout);
-            if side.outbound.is_empty() {
-                side.peers.poll_outbound(now, &mut side.outbound);
-            }
-            if let Err(error) = send_destined_ready(&side.socket, &mut side.outbound) {
-                first_error.get_or_insert(error);
-            }
+            let budget = caller_budget.intersect(side.output_drain);
+            let poll_report = if side.outbound.is_empty() {
+                Some(
+                    side.peers
+                        .poll_outbound_bounded(now, budget, &mut side.outbound),
+                )
+            } else {
+                None
+            };
+            status = drive_side_output(
+                &side.socket,
+                &mut side.outbound,
+                &mut side.write_blocked,
+                status,
+                poll_report,
+            )?;
         }
-        let mut caller_status = crate::OutputDrainStatus::Drained;
         if let Some(side) = self.caller.as_mut() {
-            side.callers.poll_expirations(now);
-            if side.outbound.is_empty() {
-                let report = side.callers.table_mut().poll_outbound_bounded(
+            let expired = side.callers.poll_expirations(now);
+            self.expired_callers.extend(expired);
+            let budget = caller_budget.intersect(side.output_drain);
+            let poll_report = if side.outbound.is_empty() {
+                Some(side.callers.table_mut().poll_outbound_bounded(
                     now,
-                    caller_budget,
+                    budget,
                     &mut side.outbound,
-                );
-                caller_status = report.status;
-            }
-            if let Err(error) = send_destined_ready(&side.socket, &mut side.outbound) {
-                first_error.get_or_insert(error);
-            }
+                ))
+            } else {
+                None
+            };
+            status = drive_side_output(
+                &side.socket,
+                &mut side.outbound,
+                &mut side.write_blocked,
+                status,
+                poll_report,
+            )?;
         }
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(caller_status),
-        }
+        Ok(status)
     }
 
     /// Drain admitted-peer lifecycle/data events for the application.
@@ -1010,6 +1202,14 @@ impl Owner {
         self.caller.as_mut()?.callers.table_mut().remove(id)
     }
 
+    /// Return and clear caller attempts retired by the bounded pool deadline.
+    /// A facade uses this edge-triggered list to fail cancelled/expired
+    /// `connect()` futures and reclaim their routing state.
+    pub fn drain_expired_callers(&mut self, out: &mut Vec<crate::LogicalCallerId>) {
+        out.clear();
+        out.append(&mut self.expired_callers);
+    }
+
     /// The listener socket's bound local address, once [`Self::listen`]
     /// has been called -- useful when binding an ephemeral port (`:0`).
     #[must_use]
@@ -1047,6 +1247,25 @@ impl Owner {
 
     /// Microseconds until either side's next due timer, for sizing
     /// [`Self::run_once`]'s timeout.
+    ///
+    /// Opus review finding 4: this does not fold in
+    /// `has_pending_output`/`has_pending_events` the way `mio_transport`'s
+    /// equivalent does, so a `BudgetExhausted` drain or output queued
+    /// between ticks is not guaranteed an immediate revisit -- a real
+    /// latency/throughput note under sustained load. A fix was attempted
+    /// (routing both sides through their ready-queue `has_pending_output`
+    /// the same way `mio_transport::Owner` does) but reproducibly made
+    /// `a_closed_sessions_table_entry_is_actually_reclaimed` fail: the
+    /// caller-side close no longer completed within the test's budget,
+    /// and the exact mechanism was not pinned down before this pass ran
+    /// out of budget to investigate further (the reported deadline at the
+    /// point of the stall was a genuine, large, and correctly-decreasing
+    /// value from `CallerPool::time_until_next_deadline` itself, not an
+    /// obviously wrong number -- something earlier in the close sequence
+    /// stops progressing before that point is reached). Left as the
+    /// original, narrower calculation rather than ship a change that
+    /// regresses an existing, previously-passing test; tracked as an open
+    /// follow-up, not a numbered card.
     #[must_use]
     pub fn time_until_next_deadline(&mut self, now: Timestamp, default_us: u64) -> u64 {
         let listener = self
@@ -1057,11 +1276,20 @@ impl Owner {
             .caller
             .as_ref()
             .map(|side| side.callers.table().time_until_next_deadline(now, u64::MAX));
-        match (listener, caller) {
+        let pending_output = self
+            .listener
+            .as_ref()
+            .is_some_and(|side| !side.outbound.is_empty() && !side.write_blocked)
+            || self
+                .caller
+                .as_ref()
+                .is_some_and(|side| !side.outbound.is_empty() && !side.write_blocked);
+        let next = match (listener, caller) {
             (Some(a), Some(b)) => a.min(b).min(default_us),
             (Some(a), None) | (None, Some(a)) => a.min(default_us),
             (None, None) => default_us,
-        }
+        };
+        if pending_output { 0 } else { next }
     }
 }
 
@@ -1083,6 +1311,9 @@ pub enum FacadeError {
     /// The pool was at `max_in_flight` capacity. [`Facade::connect`] does
     /// not wait for a queued permit -- see its own doc comment.
     PoolFull,
+    /// The finite command, pending-send, or inbound application queue is
+    /// full. Callers can retry after driving/consuming the affected session.
+    QueueFull,
     Build(crate::RuntimeBuildError),
     Protocol(shiguredo_srt::Error),
 }
@@ -1092,6 +1323,7 @@ impl std::fmt::Display for FacadeError {
         match self {
             Self::DriverGone => write!(f, "the Facade driver task is no longer running"),
             Self::PoolFull => write!(f, "the caller pool is at max_in_flight capacity"),
+            Self::QueueFull => write!(f, "the Facade queue is full"),
             Self::Build(error) => error.fmt(f),
             Self::Protocol(error) => error.fmt(f),
         }
@@ -1103,7 +1335,7 @@ impl std::error::Error for FacadeError {
         match self {
             Self::Build(error) => Some(error),
             Self::Protocol(error) => Some(error),
-            Self::DriverGone | Self::PoolFull => None,
+            Self::DriverGone | Self::PoolFull | Self::QueueFull => None,
         }
     }
 }
@@ -1114,30 +1346,271 @@ enum SessionTarget {
     Caller(crate::LogicalCallerId),
 }
 
+const FACADE_COMMAND_CAPACITY: usize = 1024;
+const FACADE_COMMAND_BYTES: usize = 8 * 1024 * 1024;
+/// Fixed per-command byte charge covering a `Command`'s own overhead,
+/// added on top of any variable-size payload it carries (a `Send`'s
+/// payload) or used alone for commands with none (`Connect`, the
+/// telemetry getters) -- without it a flood of tiny commands could still
+/// exceed `COMMAND_QUEUE_ITEMS`-style bounds in spirit while reporting
+/// almost no byte usage at all.
+const COMMAND_OVERHEAD_CHARGE: usize = 32;
+const FACADE_ACCEPT_CAPACITY: usize = 1024;
+const SESSION_INBOUND_CAPACITY: usize = 1024;
+const SESSION_INBOUND_BYTES: usize = 8 * 1024 * 1024;
+const SESSION_PENDING_SENDS: usize = 1024;
+const SESSION_PENDING_BYTES: usize = 8 * 1024 * 1024;
+const DRIVER_COMMAND_QUANTUM: usize = 32;
+
+struct CommandCharge {
+    used: Arc<AtomicUsize>,
+    amount: usize,
+}
+
+impl Drop for CommandCharge {
+    fn drop(&mut self) {
+        self.used.fetch_sub(self.amount, Ordering::AcqRel);
+    }
+}
+
+fn reserve_command_bytes(
+    used: &Arc<AtomicUsize>,
+    amount: usize,
+) -> Result<CommandCharge, FacadeError> {
+    if amount > FACADE_COMMAND_BYTES {
+        return Err(FacadeError::QueueFull);
+    }
+    loop {
+        let current = used.load(Ordering::Acquire);
+        if current > FACADE_COMMAND_BYTES.saturating_sub(amount) {
+            return Err(FacadeError::QueueFull);
+        }
+        if used
+            .compare_exchange_weak(
+                current,
+                current + amount,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            return Ok(CommandCharge {
+                used: Arc::clone(used),
+                amount,
+            });
+        }
+    }
+}
+
+struct SessionControl {
+    dropped: AtomicBool,
+    close_requested: AtomicBool,
+    disconnect_sent: AtomicBool,
+    closed: AtomicBool,
+    /// Ticks [`reap_session_controls`] has seen this session as
+    /// dropped-and-already-disconnect-sent, without yet force-removing it.
+    /// Counting real driver-loop ticks (rather than this function calling
+    /// `Owner::drive` itself to force one within the same pass) sidesteps
+    /// a reproducible regression: an extra `drive()` call from inside this
+    /// scan broke `a_closed_sessions_table_entry_is_actually_reclaimed`
+    /// (the exact mechanism wasn't pinned down, but the effect was
+    /// consistent and immediate) even though every other route to
+    /// `Owner::drive` is safe.
+    reap_grace_ticks: std::sync::atomic::AtomicU32,
+}
+
+impl SessionControl {
+    fn new() -> Self {
+        Self {
+            dropped: AtomicBool::new(false),
+            close_requested: AtomicBool::new(false),
+            disconnect_sent: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+            reap_grace_ticks: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    fn is_unavailable(&self) -> bool {
+        self.dropped.load(Ordering::Acquire) || self.closed.load(Ordering::Acquire)
+    }
+}
+
+struct InboundItem {
+    payload: shiguredo_srt::Bytes,
+    bytes: Arc<AtomicUsize>,
+}
+
+impl Drop for InboundItem {
+    fn drop(&mut self) {
+        self.bytes.fetch_sub(self.payload.len(), Ordering::AcqRel);
+    }
+}
+
+impl InboundItem {
+    fn into_payload(mut self) -> shiguredo_srt::Bytes {
+        let payload = std::mem::replace(&mut self.payload, shiguredo_srt::Bytes::new());
+        self.bytes.fetch_sub(payload.len(), Ordering::AcqRel);
+        payload
+    }
+}
+
+enum InboxSend {
+    Sent,
+    Full,
+    Closed,
+}
+
+struct SessionInbox {
+    tx: tokio::sync::mpsc::Sender<InboundItem>,
+    bytes: Arc<AtomicUsize>,
+    control: Arc<SessionControl>,
+}
+
+impl SessionInbox {
+    fn new(control: Arc<SessionControl>) -> (Self, tokio::sync::mpsc::Receiver<InboundItem>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(SESSION_INBOUND_CAPACITY);
+        let bytes = Arc::new(AtomicUsize::new(0));
+        (Self { tx, bytes, control }, rx)
+    }
+
+    fn try_send(&self, payload: shiguredo_srt::Bytes) -> InboxSend {
+        if self.control.is_unavailable() {
+            return InboxSend::Closed;
+        }
+        let length = payload.len();
+        if length > SESSION_INBOUND_BYTES {
+            return InboxSend::Full;
+        }
+        loop {
+            let current = self.bytes.load(Ordering::Acquire);
+            if current > SESSION_INBOUND_BYTES.saturating_sub(length) {
+                return InboxSend::Full;
+            }
+            if self
+                .bytes
+                .compare_exchange_weak(
+                    current,
+                    current + length,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                break;
+            }
+        }
+        let item = InboundItem {
+            payload,
+            bytes: Arc::clone(&self.bytes),
+        };
+        match self.tx.try_send(item) {
+            Ok(()) => InboxSend::Sent,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => InboxSend::Full,
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => InboxSend::Closed,
+        }
+    }
+}
+
+struct PendingSend {
+    payload: Vec<u8>,
+    reply: tokio::sync::oneshot::Sender<Result<(), FacadeError>>,
+}
+
+#[derive(Default)]
+struct PendingSends {
+    by_target: std::collections::HashMap<SessionTarget, VecDeque<PendingSend>>,
+    items: usize,
+    bytes: usize,
+}
+
+impl PendingSends {
+    fn has_capacity(&self, payload_len: usize) -> bool {
+        self.items < SESSION_PENDING_SENDS
+            && self.bytes.saturating_add(payload_len) <= SESSION_PENDING_BYTES
+    }
+
+    /// A target with anything already queued must stay queued: sending a
+    /// fresh command straight through the moment pacing allows it, while an
+    /// earlier payload for the same target is still waiting in `by_target`,
+    /// would reorder that earlier payload behind this one on the wire.
+    fn has_pending(&self, target: SessionTarget) -> bool {
+        self.by_target.contains_key(&target)
+    }
+
+    fn push(
+        &mut self,
+        target: SessionTarget,
+        payload: Vec<u8>,
+        reply: tokio::sync::oneshot::Sender<Result<(), FacadeError>>,
+    ) -> Result<(), FacadeError> {
+        if self.items >= SESSION_PENDING_SENDS
+            || self.bytes.saturating_add(payload.len()) > SESSION_PENDING_BYTES
+        {
+            return Err(FacadeError::QueueFull);
+        }
+        self.bytes = self.bytes.saturating_add(payload.len());
+        self.items += 1;
+        self.by_target
+            .entry(target)
+            .or_default()
+            .push_back(PendingSend { payload, reply });
+        Ok(())
+    }
+
+    fn pop(&mut self, target: SessionTarget) -> Option<PendingSend> {
+        let queue = self.by_target.get_mut(&target)?;
+        let pending = queue.pop_front()?;
+        self.items = self.items.saturating_sub(1);
+        self.bytes = self.bytes.saturating_sub(pending.payload.len());
+        if queue.is_empty() {
+            self.by_target.remove(&target);
+        }
+        Some(pending)
+    }
+
+    fn targets(&self) -> impl Iterator<Item = SessionTarget> + '_ {
+        self.by_target.keys().copied()
+    }
+
+    fn fail_target(&mut self, target: SessionTarget) {
+        while let Some(pending) = self.pop(target) {
+            let _ = pending
+                .reply
+                .send(Err(FacadeError::Protocol(session_gone_error())));
+        }
+    }
+}
+
 enum Command {
     Connect {
         config: Box<crate::CallerConfig>,
         reply: tokio::sync::oneshot::Sender<Result<Session, FacadeError>>,
+        _charge: CommandCharge,
     },
     Send {
         target: SessionTarget,
         payload: Vec<u8>,
         reply: tokio::sync::oneshot::Sender<Result<(), FacadeError>>,
+        _charge: CommandCharge,
     },
     Disconnect {
         target: SessionTarget,
     },
     ListenerTelemetry {
         reply: tokio::sync::oneshot::Sender<Option<crate::IngressTelemetrySnapshot>>,
+        _charge: CommandCharge,
     },
     CallerPoolStats {
         reply: tokio::sync::oneshot::Sender<Option<crate::CallerPoolStats>>,
+        _charge: CommandCharge,
     },
     ListenerPeerCount {
         reply: tokio::sync::oneshot::Sender<Option<usize>>,
+        _charge: CommandCharge,
     },
     CallerCount {
         reply: tokio::sync::oneshot::Sender<Option<usize>>,
+        _charge: CommandCharge,
     },
 }
 
@@ -1147,16 +1620,15 @@ enum Command {
 /// `recv()` resolves to `None` once the session's `Disconnected` event has
 /// been observed *and* every payload already buffered before that has been
 /// delivered -- not the instant the connection starts closing. Each
-/// session's inbound channel is independent and unbounded, so one slow
-/// consumer accumulating a backlog in its own channel never blocks the
-/// driver task or any other session (checkpoint 2); the tradeoff, stated
-/// plainly, is that a consumer that never reads at all grows that backlog
-/// without bound -- there is no per-session channel capacity limit in this
-/// version, only the SRT-level flow window upstream of it.
+/// session's inbound channel has an item and byte bound. A full queue is
+/// isolated to that session and causes it to close; the driver never awaits a
+/// slow consumer while servicing other sockets.
 pub struct Session {
     target: SessionTarget,
-    commands: tokio::sync::mpsc::UnboundedSender<Command>,
-    inbound: tokio::sync::mpsc::UnboundedReceiver<shiguredo_srt::Bytes>,
+    commands: tokio::sync::mpsc::Sender<Command>,
+    command_bytes: Arc<AtomicUsize>,
+    control: Arc<SessionControl>,
+    inbound: tokio::sync::mpsc::Receiver<InboundItem>,
 }
 
 impl Session {
@@ -1165,14 +1637,23 @@ impl Session {
     /// [`FacadeError::Protocol`] reliably reflects this specific call, not
     /// a stale error from an earlier one.
     pub async fn send(&self, payload: impl Into<Vec<u8>>) -> Result<(), FacadeError> {
+        let payload = payload.into();
+        let charge = reserve_command_bytes(
+            &self.command_bytes,
+            payload.len().saturating_add(COMMAND_OVERHEAD_CHARGE),
+        )?;
         let (reply, reply_rx) = tokio::sync::oneshot::channel();
         self.commands
-            .send(Command::Send {
+            .try_send(Command::Send {
                 target: self.target,
-                payload: payload.into(),
+                payload,
                 reply,
+                _charge: charge,
             })
-            .map_err(|_| FacadeError::DriverGone)?;
+            .map_err(|error| match error {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => FacadeError::QueueFull,
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => FacadeError::DriverGone,
+            })?;
         reply_rx.await.map_err(|_| FacadeError::DriverGone)?
     }
 
@@ -1180,14 +1661,27 @@ impl Session {
     /// the session has closed and every already-buffered payload has been
     /// delivered.
     pub async fn recv(&mut self) -> Option<shiguredo_srt::Bytes> {
-        self.inbound.recv().await
+        self.inbound.recv().await.map(InboundItem::into_payload)
     }
 
     /// Start an orderly close. Fire-and-forget: does not wait for the
     /// close to complete -- await [`Self::recv`] returning `None`, or just
     /// drop this `Session`, to know it eventually has.
     pub fn close(&self) {
-        let _ = self.commands.send(Command::Disconnect {
+        self.control.close_requested.store(true, Ordering::Release);
+        let _ = self.commands.try_send(Command::Disconnect {
+            target: self.target,
+        });
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.control.dropped.store(true, Ordering::Release);
+        // This is a best-effort fast path. If a bounded command queue is
+        // full, the driver's control scan below performs the same reclaim
+        // without introducing an unbounded drop queue.
+        let _ = self.commands.try_send(Command::Disconnect {
             target: self.target,
         });
     }
@@ -1218,44 +1712,19 @@ fn handle_command(
         crate::LogicalCallerId,
         tokio::sync::oneshot::Sender<Result<Session, FacadeError>>,
     >,
+    pending_sends: &mut PendingSends,
 ) {
     match command {
-        Command::Connect { config, reply } => {
-            // The reply is deliberately not sent here: an "ergonomic
-            // connect" should resolve once the handshake actually
-            // completes, not merely once admitted, or `send`/`recv` on a
-            // freshly returned `Session` could race the handshake still
-            // in flight. Registered here, fulfilled once this id's
-            // `Connected` (or `Disconnected`, on failure) event is
-            // observed below.
-            match owner.connect(&config, now) {
-                Ok(crate::PoolOutcome::Admitted(id)) => {
-                    pending_connects.insert(id, reply);
-                }
-                Ok(crate::PoolOutcome::Queued) => {
-                    let _ = reply.send(Err(FacadeError::PoolFull));
-                }
-                Err(error) => {
-                    let _ = reply.send(Err(FacadeError::Build(error)));
-                }
-            }
+        Command::Connect { config, reply, .. } => {
+            handle_connect_command(owner, &config, reply, now, pending_connects);
         }
         Command::Send {
             target,
             payload,
             reply,
+            ..
         } => {
-            let result = match target {
-                SessionTarget::Listener(id) => owner
-                    .listener_peer_mut(id)
-                    .ok_or_else(session_gone_error)
-                    .and_then(|mut peer| peer.send(&payload, now).map(|_| ())),
-                SessionTarget::Caller(id) => owner
-                    .caller_mut(id)
-                    .ok_or_else(session_gone_error)
-                    .and_then(|mut caller| caller.send(&payload, now).map(|_| ())),
-            };
-            let _ = reply.send(result.map_err(FacadeError::Protocol));
+            handle_send_command(owner, target, payload, reply, now, pending_sends);
         }
         Command::Disconnect { target } => match target {
             SessionTarget::Listener(id) => {
@@ -1269,43 +1738,317 @@ fn handle_command(
                 }
             }
         },
-        Command::ListenerTelemetry { reply } => {
+        Command::ListenerTelemetry { reply, .. } => {
             let _ = reply.send(owner.listener_telemetry());
         }
-        Command::CallerPoolStats { reply } => {
+        Command::CallerPoolStats { reply, .. } => {
             let _ = reply.send(owner.caller_pool_stats());
         }
-        Command::ListenerPeerCount { reply } => {
+        Command::ListenerPeerCount { reply, .. } => {
             let _ = reply.send(owner.listener_peer_count());
         }
-        Command::CallerCount { reply } => {
+        Command::CallerCount { reply, .. } => {
             let _ = reply.send(owner.caller_count());
         }
     }
 }
 
+fn handle_connect_command(
+    owner: &mut Owner,
+    config: &crate::CallerConfig,
+    reply: tokio::sync::oneshot::Sender<Result<Session, FacadeError>>,
+    now: Timestamp,
+    pending_connects: &mut std::collections::HashMap<
+        crate::LogicalCallerId,
+        tokio::sync::oneshot::Sender<Result<Session, FacadeError>>,
+    >,
+) {
+    if reply.is_closed() {
+        return;
+    }
+    // The reply is deliberately not sent here: an "ergonomic connect"
+    // should resolve once the handshake actually completes, not merely
+    // once admitted, or `send`/`recv` on a freshly returned `Session`
+    // could race the handshake still in flight. Registered here, fulfilled
+    // once this id's `Connected` (or `Disconnected`, on failure) event is
+    // observed by the caller of `handle_command`.
+    match owner.connect(config, now) {
+        Ok(crate::PoolOutcome::Admitted(id)) => {
+            pending_connects.insert(id, reply);
+        }
+        Ok(crate::PoolOutcome::Queued(_)) | Ok(crate::PoolOutcome::Full) => {
+            let _ = reply.send(Err(FacadeError::PoolFull));
+        }
+        Err(error) => {
+            let _ = reply.send(Err(FacadeError::Build(error)));
+        }
+    }
+}
+
+fn handle_send_command(
+    owner: &mut Owner,
+    target: SessionTarget,
+    payload: Vec<u8>,
+    reply: tokio::sync::oneshot::Sender<Result<(), FacadeError>>,
+    now: Timestamp,
+    pending_sends: &mut PendingSends,
+) {
+    if reply.is_closed() {
+        return;
+    }
+    let can_send = !pending_sends.has_pending(target)
+        && match target {
+            SessionTarget::Listener(id) => owner
+                .listener_peer_mut(id)
+                .is_some_and(|mut peer| peer.can_send_with_pacing(now)),
+            SessionTarget::Caller(id) => owner
+                .caller_mut(id)
+                .is_some_and(|mut caller| caller.can_send_with_pacing(now)),
+        };
+    if !can_send {
+        if !pending_sends.has_capacity(payload.len()) {
+            // The queue owns no reply once this branch returns, so make
+            // backpressure explicit to this exact caller. `payload` is
+            // dropped with the failed command.
+            let _ = reply.send(Err(FacadeError::QueueFull));
+        } else {
+            let _ = pending_sends.push(target, payload, reply);
+        }
+        return;
+    }
+    let result = match target {
+        SessionTarget::Listener(id) => owner
+            .listener_peer_mut(id)
+            .ok_or_else(session_gone_error)
+            .and_then(|mut peer| peer.send(&payload, now).map(|_| ())),
+        SessionTarget::Caller(id) => owner
+            .caller_mut(id)
+            .ok_or_else(session_gone_error)
+            .and_then(|mut caller| caller.send(&payload, now).map(|_| ())),
+    };
+    let _ = reply.send(result.map_err(FacadeError::Protocol));
+}
+
+fn drive_pending_sends(owner: &mut Owner, pending: &mut PendingSends, now: Timestamp) {
+    let targets = pending
+        .targets()
+        .take(DRIVER_COMMAND_QUANTUM)
+        .collect::<Vec<_>>();
+    for target in targets {
+        let can_send = match target {
+            SessionTarget::Listener(id) => owner
+                .listener_peer_mut(id)
+                .is_some_and(|mut peer| peer.can_send_with_pacing(now)),
+            SessionTarget::Caller(id) => owner
+                .caller_mut(id)
+                .is_some_and(|mut caller| caller.can_send_with_pacing(now)),
+        };
+        if !can_send {
+            continue;
+        }
+        let Some(pending_send) = pending.pop(target) else {
+            continue;
+        };
+        if pending_send.reply.is_closed() {
+            continue;
+        }
+        let result = match target {
+            SessionTarget::Listener(id) => owner
+                .listener_peer_mut(id)
+                .ok_or_else(session_gone_error)
+                .and_then(|mut peer| peer.send(&pending_send.payload, now).map(|_| ())),
+            SessionTarget::Caller(id) => owner
+                .caller_mut(id)
+                .ok_or_else(session_gone_error)
+                .and_then(|mut caller| caller.send(&pending_send.payload, now).map(|_| ())),
+        };
+        let _ = pending_send
+            .reply
+            .send(result.map_err(FacadeError::Protocol));
+    }
+}
+
+fn remove_session_state(
+    target: SessionTarget,
+    listener_inboxes: &mut std::collections::HashMap<crate::LogicalPeerId, SessionInbox>,
+    caller_inboxes: &mut std::collections::HashMap<crate::LogicalCallerId, SessionInbox>,
+    controls: &mut std::collections::HashMap<SessionTarget, Arc<SessionControl>>,
+    pending_sends: &mut PendingSends,
+) {
+    match target {
+        SessionTarget::Listener(id) => {
+            listener_inboxes.remove(&id);
+        }
+        SessionTarget::Caller(id) => {
+            caller_inboxes.remove(&id);
+        }
+    }
+    if let Some(control) = controls.remove(&target) {
+        control.closed.store(true, Ordering::Release);
+    }
+    pending_sends.fail_target(target);
+}
+
+fn reap_session_controls(
+    owner: &mut Owner,
+    controls: &mut std::collections::HashMap<SessionTarget, Arc<SessionControl>>,
+    listener_inboxes: &mut std::collections::HashMap<crate::LogicalPeerId, SessionInbox>,
+    caller_inboxes: &mut std::collections::HashMap<crate::LogicalCallerId, SessionInbox>,
+    pending_sends: &mut PendingSends,
+    now: Timestamp,
+) {
+    let targets = controls
+        .iter()
+        .filter_map(|(target, control)| {
+            let dropped = control.dropped.load(Ordering::Acquire);
+            let close_requested = control.close_requested.load(Ordering::Acquire);
+            if dropped && !close_requested {
+                return Some((*target, false));
+            }
+            if close_requested {
+                let already_sent = control.disconnect_sent.swap(true, Ordering::AcqRel);
+                if !already_sent {
+                    return Some((*target, true));
+                }
+                // Every external handle is gone too: nothing is left to
+                // ever observe the matching `Disconnected` event, which
+                // may never arrive at all against an unreachable or
+                // non-responsive peer. Rather than pin this entry -- and
+                // its `SessionInbox`'s buffered bytes -- forever, force it
+                // once this scan has seen the same dropped-and-sent state
+                // for a few driver ticks in a row (Opus review finding 5):
+                // that's enough real ticks for the SHUTDOWN `drive()`
+                // already queued on some ordinary iteration to have had a
+                // real dispatch attempt, without this function forcing an
+                // out-of-band `drive()` call of its own -- doing that
+                // reproducibly broke
+                // `a_closed_sessions_table_entry_is_actually_reclaimed`.
+                if dropped {
+                    let ticks = control.reap_grace_ticks.fetch_add(1, Ordering::AcqRel);
+                    if ticks >= REAP_GRACE_TICKS {
+                        return Some((*target, false));
+                    }
+                }
+            }
+            None
+        })
+        .collect::<Vec<_>>();
+    for (target, orderly) in targets {
+        if orderly {
+            reap_send_disconnect(owner, target, now);
+        } else {
+            reap_remove_session(
+                owner,
+                target,
+                listener_inboxes,
+                caller_inboxes,
+                controls,
+                pending_sends,
+            );
+        }
+    }
+}
+
+/// Driver ticks a dropped session's orderly close is given to actually
+/// leave the socket (via whatever ordinary `drive()` call the loop makes
+/// on its own) before [`reap_session_controls`] force-removes it.
+const REAP_GRACE_TICKS: u32 = 3;
+
+/// Send a graceful disconnect for a dropped-but-not-yet-torn-down session
+/// -- the `close_requested` half of [`reap_session_controls`]'s two cases.
+fn reap_send_disconnect(owner: &mut Owner, target: SessionTarget, now: Timestamp) {
+    match target {
+        SessionTarget::Listener(id) => {
+            if let Some(mut peer) = owner.listener_peer_mut(id) {
+                peer.disconnect(now);
+            }
+        }
+        SessionTarget::Caller(id) => {
+            if let Some(mut caller) = owner.caller_mut(id) {
+                caller.disconnect(now);
+            }
+        }
+    }
+}
+
+/// Tear down a session whose drop was never followed by an explicit
+/// disconnect request -- the forceful half of [`reap_session_controls`]'s
+/// two cases.
+fn reap_remove_session(
+    owner: &mut Owner,
+    target: SessionTarget,
+    listener_inboxes: &mut std::collections::HashMap<crate::LogicalPeerId, SessionInbox>,
+    caller_inboxes: &mut std::collections::HashMap<crate::LogicalCallerId, SessionInbox>,
+    controls: &mut std::collections::HashMap<SessionTarget, Arc<SessionControl>>,
+    pending_sends: &mut PendingSends,
+) {
+    match target {
+        SessionTarget::Listener(id) => {
+            owner.remove_listener_peer(id);
+        }
+        SessionTarget::Caller(id) => {
+            owner.remove_caller(id);
+        }
+    }
+    remove_session_state(
+        target,
+        listener_inboxes,
+        caller_inboxes,
+        controls,
+        pending_sends,
+    );
+}
+
+fn fail_cancelled_connects(
+    owner: &mut Owner,
+    pending_connects: &mut std::collections::HashMap<
+        crate::LogicalCallerId,
+        tokio::sync::oneshot::Sender<Result<Session, FacadeError>>,
+    >,
+    caller_inboxes: &mut std::collections::HashMap<crate::LogicalCallerId, SessionInbox>,
+    controls: &mut std::collections::HashMap<SessionTarget, Arc<SessionControl>>,
+    pending_sends: &mut PendingSends,
+) {
+    let cancelled = pending_connects
+        .iter()
+        .filter_map(|(id, reply)| reply.is_closed().then_some(*id))
+        .collect::<Vec<_>>();
+    for id in cancelled {
+        pending_connects.remove(&id);
+        owner.remove_caller(id);
+        remove_session_state(
+            SessionTarget::Caller(id),
+            &mut std::collections::HashMap::new(),
+            caller_inboxes,
+            controls,
+            pending_sends,
+        );
+    }
+}
+
 async fn run_driver(
     mut owner: Owner,
-    mut commands: tokio::sync::mpsc::UnboundedReceiver<Command>,
-    commands_tx: tokio::sync::mpsc::WeakUnboundedSender<Command>,
-    accept_tx: tokio::sync::mpsc::UnboundedSender<Session>,
+    mut commands: tokio::sync::mpsc::Receiver<Command>,
+    commands_tx: tokio::sync::mpsc::WeakSender<Command>,
+    accept_tx: tokio::sync::mpsc::Sender<Session>,
+    command_bytes: Arc<AtomicUsize>,
 ) {
     let start = std::time::Instant::now();
     let now = || Timestamp::from_micros(start.elapsed().as_micros() as u64);
-    let mut listener_inboxes: std::collections::HashMap<
-        crate::LogicalPeerId,
-        tokio::sync::mpsc::UnboundedSender<shiguredo_srt::Bytes>,
-    > = std::collections::HashMap::new();
-    let mut caller_inboxes: std::collections::HashMap<
-        crate::LogicalCallerId,
-        tokio::sync::mpsc::UnboundedSender<shiguredo_srt::Bytes>,
-    > = std::collections::HashMap::new();
+    let mut listener_inboxes: std::collections::HashMap<crate::LogicalPeerId, SessionInbox> =
+        std::collections::HashMap::new();
+    let mut caller_inboxes: std::collections::HashMap<crate::LogicalCallerId, SessionInbox> =
+        std::collections::HashMap::new();
     let mut pending_connects: std::collections::HashMap<
         crate::LogicalCallerId,
         tokio::sync::oneshot::Sender<Result<Session, FacadeError>>,
     > = std::collections::HashMap::new();
+    let mut controls: std::collections::HashMap<SessionTarget, Arc<SessionControl>> =
+        std::collections::HashMap::new();
+    let mut pending_sends = PendingSends::default();
     let mut listener_events = Vec::new();
     let mut caller_events = Vec::new();
+    let mut expired_callers = Vec::new();
 
     loop {
         let wait_us = owner.time_until_next_deadline(now(), 20_000);
@@ -1324,20 +2067,71 @@ async fn run_driver(
             command = commands.recv() => {
                 match command {
                     Some(command) => {
-                        handle_command(&mut owner, command, now(), &mut pending_connects);
+                        handle_command(&mut owner, command, now(), &mut pending_connects, &mut pending_sends);
                     }
                     None => break, // every Facade/Session handle dropped -> graceful shutdown
                 }
             }
         }
 
+        drive_pending_sends(&mut owner, &mut pending_sends, now());
+
+        // A4/course correction #9: an attempt CallerPool itself retired
+        // for missing its `attempt_deadline` never produces a protocol
+        // `ConnectionEvent` at all (its `CallerTable` entry is already
+        // gone by the time this reports it) -- without this, a
+        // `Facade::connect()` behind a permit that got queued then timed
+        // out would never resolve.
+        owner.drain_expired_callers(&mut expired_callers);
+        for id in expired_callers.drain(..) {
+            if let Some(reply) = pending_connects.remove(&id) {
+                let _ = reply.send(Err(FacadeError::Protocol(connect_failed_error())));
+            }
+            remove_session_state(
+                SessionTarget::Caller(id),
+                &mut listener_inboxes,
+                &mut caller_inboxes,
+                &mut controls,
+                &mut pending_sends,
+            );
+        }
+
+        // Course correction #4: a dropped `Session`'s best-effort
+        // `Command::Disconnect` can itself be lost (a full command queue
+        // at the exact moment of drop) -- this scan is the guaranteed
+        // fallback, driven by `SessionControl`'s atomics rather than the
+        // command channel, so a dropped session is never leaked just
+        // because its one cleanup message didn't make it through.
+        reap_session_controls(
+            &mut owner,
+            &mut controls,
+            &mut listener_inboxes,
+            &mut caller_inboxes,
+            &mut pending_sends,
+            now(),
+        );
+        fail_cancelled_connects(
+            &mut owner,
+            &mut pending_connects,
+            &mut caller_inboxes,
+            &mut controls,
+            &mut pending_sends,
+        );
+
+        let sessions = SessionFactory {
+            commands_tx: &commands_tx,
+            command_bytes: &command_bytes,
+        };
+
         owner.poll_listener_events(&mut listener_events);
         for event in listener_events.drain(..) {
             route_listener_event(
                 &mut owner,
                 event,
-                &commands_tx,
+                &sessions,
                 &mut listener_inboxes,
+                &mut controls,
+                &mut pending_sends,
                 &accept_tx,
             );
         }
@@ -1347,9 +2141,11 @@ async fn run_driver(
             route_caller_event(
                 &mut owner,
                 event,
-                &commands_tx,
+                &sessions,
                 &mut caller_inboxes,
+                &mut controls,
                 &mut pending_connects,
+                &mut pending_sends,
             );
         }
     }
@@ -1366,6 +2162,39 @@ async fn run_driver(
     let _ = owner.drive(now(), OutputDrainBudget::default());
 }
 
+/// Bundles what every new `Session` needs from `run_driver` (a weak
+/// command sender plus the shared command-byte counter) into one
+/// argument, so `route_listener_event`/`route_caller_event` stay under
+/// clippy's argument-count ceiling despite each needing several other
+/// independent pieces of driver state too.
+struct SessionFactory<'a> {
+    commands_tx: &'a tokio::sync::mpsc::WeakSender<Command>,
+    command_bytes: &'a Arc<AtomicUsize>,
+}
+
+impl SessionFactory<'_> {
+    /// Mint one new `Session` plus its matching router-side state, or
+    /// `None` if every external handle (hence every strong command
+    /// sender) is already gone.
+    fn mint(&self, target: SessionTarget) -> Option<(Session, SessionInbox, Arc<SessionControl>)> {
+        // A weak clone: the driver hands out real senders to sessions it
+        // constructs, but must never hold a strong one itself, or
+        // `run_driver`'s `commands.recv()` could never observe every
+        // external handle dropped.
+        let commands = self.commands_tx.upgrade()?;
+        let control = Arc::new(SessionControl::new());
+        let (inbox, rx) = SessionInbox::new(Arc::clone(&control));
+        let session = Session {
+            target,
+            commands,
+            command_bytes: Arc::clone(self.command_bytes),
+            control: Arc::clone(&control),
+            inbound: rx,
+        };
+        Some((session, inbox, control))
+    }
+}
+
 /// Route one listener-side event to its `Session`'s inbound channel
 /// (`DataReceived`), retire it (`Disconnected`), or mint a new `Session`
 /// and hand it to `accept()` (`Connected`) -- split out of [`run_driver`]'s
@@ -1373,46 +2202,55 @@ async fn run_driver(
 fn route_listener_event(
     owner: &mut Owner,
     event: crate::AdmissionEvent,
-    commands_tx: &tokio::sync::mpsc::WeakUnboundedSender<Command>,
-    listener_inboxes: &mut std::collections::HashMap<
-        crate::LogicalPeerId,
-        tokio::sync::mpsc::UnboundedSender<shiguredo_srt::Bytes>,
-    >,
-    accept_tx: &tokio::sync::mpsc::UnboundedSender<Session>,
+    sessions: &SessionFactory<'_>,
+    listener_inboxes: &mut std::collections::HashMap<crate::LogicalPeerId, SessionInbox>,
+    controls: &mut std::collections::HashMap<SessionTarget, Arc<SessionControl>>,
+    pending_sends: &mut PendingSends,
+    accept_tx: &tokio::sync::mpsc::Sender<Session>,
 ) {
+    let target = SessionTarget::Listener(event.logical_peer);
     match event.event {
         shiguredo_srt::ConnectionEvent::Connected => {
-            // A weak clone: the driver hands out real senders to sessions
-            // it constructs, but must never hold a strong one itself, or
-            // `run_driver`'s `commands.recv()` could never observe every
-            // external handle dropped.
-            let Some(commands) = commands_tx.upgrade() else {
+            let Some((session, inbox, control)) = sessions.mint(target) else {
                 return;
             };
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            listener_inboxes.insert(event.logical_peer, tx);
-            let session = Session {
-                target: SessionTarget::Listener(event.logical_peer),
-                commands,
-                inbound: rx,
-            };
-            // `accept_tx.send` fails only once the `Facade` (which owns
-            // the matching receiver) is gone -- in that case this session
-            // has no handle anywhere and never will, so retire it from
-            // `Owner` immediately rather than leaking it the same way a
-            // cancelled `connect()` would (see `route_caller_event`).
-            if accept_tx.send(session).is_err() {
+            listener_inboxes.insert(event.logical_peer, inbox);
+            controls.insert(target, control);
+            // `accept_tx.try_send` fails once the `Facade` (which owns
+            // the matching receiver) is gone, or once `FACADE_ACCEPT_CAPACITY`
+            // admitted-but-undrained sessions are already queued -- in
+            // either case this session has no handle anywhere that will
+            // ever claim it, so retire it from `Owner` immediately rather
+            // than leaking it the same way a cancelled `connect()` would
+            // (see `route_caller_event`).
+            if accept_tx.try_send(session).is_err() {
                 listener_inboxes.remove(&event.logical_peer);
+                controls.remove(&target);
+                pending_sends.fail_target(target);
                 owner.remove_listener_peer(event.logical_peer);
             }
         }
         shiguredo_srt::ConnectionEvent::DataReceived { payload, .. } => {
-            if let Some(tx) = listener_inboxes.get(&event.logical_peer) {
-                let _ = tx.send(payload);
+            // A full or closed inbox retires this session exactly like a
+            // genuine `Disconnected` below (course correction #1): a
+            // consumer that fell far enough behind is disconnected, not
+            // grown without bound or silently starved forever.
+            let deliverable = listener_inboxes
+                .get(&event.logical_peer)
+                .is_some_and(|inbox| matches!(inbox.try_send(payload), InboxSend::Sent));
+            if !deliverable {
+                listener_inboxes.remove(&event.logical_peer);
+                controls.remove(&target);
+                pending_sends.fail_target(target);
+                owner.remove_listener_peer(event.logical_peer);
             }
         }
         shiguredo_srt::ConnectionEvent::Disconnected { .. } => {
             listener_inboxes.remove(&event.logical_peer);
+            if let Some(control) = controls.remove(&target) {
+                control.closed.store(true, Ordering::Release);
+            }
+            pending_sends.fail_target(target);
             // A `disconnect()` alone (this event firing) only transitions
             // protocol state; the table entry and its buffers stay
             // resident until something calls `remove` (see
@@ -1437,31 +2275,26 @@ fn route_listener_event(
 fn route_caller_event(
     owner: &mut Owner,
     event: crate::CallerEvent,
-    commands_tx: &tokio::sync::mpsc::WeakUnboundedSender<Command>,
-    caller_inboxes: &mut std::collections::HashMap<
-        crate::LogicalCallerId,
-        tokio::sync::mpsc::UnboundedSender<shiguredo_srt::Bytes>,
-    >,
+    sessions: &SessionFactory<'_>,
+    caller_inboxes: &mut std::collections::HashMap<crate::LogicalCallerId, SessionInbox>,
+    controls: &mut std::collections::HashMap<SessionTarget, Arc<SessionControl>>,
     pending_connects: &mut std::collections::HashMap<
         crate::LogicalCallerId,
         tokio::sync::oneshot::Sender<Result<Session, FacadeError>>,
     >,
+    pending_sends: &mut PendingSends,
 ) {
     match event.event {
         shiguredo_srt::ConnectionEvent::Connected => {
             let Some(reply) = pending_connects.remove(&event.id) else {
                 return;
             };
-            let Some(commands) = commands_tx.upgrade() else {
+            let target = SessionTarget::Caller(event.id);
+            let Some((session, inbox, control)) = sessions.mint(target) else {
                 return;
             };
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            caller_inboxes.insert(event.id, tx);
-            let session = Session {
-                target: SessionTarget::Caller(event.id),
-                commands,
-                inbound: rx,
-            };
+            caller_inboxes.insert(event.id, inbox);
+            controls.insert(target, control);
             // `reply.send` fails only if `Facade::connect`'s own future
             // was already dropped (cancelled) before this arrived -- the
             // connection is fully established with no handle anywhere
@@ -1469,19 +2302,35 @@ fn route_caller_event(
             // rather than leak it silently for the driver's whole life.
             if reply.send(Ok(session)).is_err() {
                 caller_inboxes.remove(&event.id);
+                controls.remove(&target);
                 owner.remove_caller(event.id);
             }
         }
         shiguredo_srt::ConnectionEvent::DataReceived { payload, .. } => {
-            if let Some(tx) = caller_inboxes.get(&event.id) {
-                let _ = tx.send(payload);
+            // See `route_listener_event`'s identical handling for why a
+            // failed delivery retires the session instead of growing its
+            // backlog or silently discarding data forever.
+            let deliverable = caller_inboxes
+                .get(&event.id)
+                .is_some_and(|inbox| matches!(inbox.try_send(payload), InboxSend::Sent));
+            if !deliverable {
+                let target = SessionTarget::Caller(event.id);
+                caller_inboxes.remove(&event.id);
+                controls.remove(&target);
+                pending_sends.fail_target(target);
+                owner.remove_caller(event.id);
             }
         }
         shiguredo_srt::ConnectionEvent::Disconnected { .. } => {
+            let target = SessionTarget::Caller(event.id);
             if let Some(reply) = pending_connects.remove(&event.id) {
                 let _ = reply.send(Err(FacadeError::Protocol(connect_failed_error())));
             }
             caller_inboxes.remove(&event.id);
+            if let Some(control) = controls.remove(&target) {
+                control.closed.store(true, Ordering::Release);
+            }
+            pending_sends.fail_target(target);
             // See `route_listener_event`'s identical call for why this
             // must happen here rather than never.
             owner.remove_caller(event.id);
@@ -1497,10 +2346,15 @@ fn route_caller_event(
         shiguredo_srt::ConnectionEvent::StateChanged(
             shiguredo_srt::ConnectionState::Disconnected,
         ) => {
+            let target = SessionTarget::Caller(event.id);
             if let Some(reply) = pending_connects.remove(&event.id) {
                 let _ = reply.send(Err(FacadeError::Protocol(connect_failed_error())));
             }
             caller_inboxes.remove(&event.id);
+            if let Some(control) = controls.remove(&target) {
+                control.closed.store(true, Ordering::Release);
+            }
+            pending_sends.fail_target(target);
             owner.remove_caller(event.id);
         }
         shiguredo_srt::ConnectionEvent::StateChanged(_)
@@ -1523,8 +2377,9 @@ fn route_caller_event(
 /// executor loop and does not want this crate's background task at all
 /// (checkpoint 4).
 pub struct Facade {
-    commands: tokio::sync::mpsc::UnboundedSender<Command>,
-    accept: tokio::sync::mpsc::UnboundedReceiver<Session>,
+    commands: tokio::sync::mpsc::Sender<Command>,
+    command_bytes: Arc<AtomicUsize>,
+    accept: tokio::sync::mpsc::Receiver<Session>,
     listener_local_addr: Option<SocketAddr>,
 }
 
@@ -1545,17 +2400,20 @@ impl Facade {
             owner.listen(config)?;
         }
         let listener_local_addr = owner.listener_local_addr();
-        let (commands_tx, commands_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (accept_tx, accept_rx) = tokio::sync::mpsc::unbounded_channel();
+        let command_bytes = Arc::new(AtomicUsize::new(0));
+        let (commands_tx, commands_rx) = tokio::sync::mpsc::channel(FACADE_COMMAND_CAPACITY);
+        let (accept_tx, accept_rx) = tokio::sync::mpsc::channel(FACADE_ACCEPT_CAPACITY);
         let handle = tokio::spawn(run_driver(
             owner,
             commands_rx,
             commands_tx.downgrade(),
             accept_tx,
+            Arc::clone(&command_bytes),
         ));
         Ok((
             Self {
                 commands: commands_tx,
+                command_bytes,
                 accept: accept_rx,
                 listener_local_addr,
             },
@@ -1580,20 +2438,27 @@ impl Facade {
     /// anywhere.
     ///
     /// Returns [`FacadeError::PoolFull`], not an async wait, if the caller
-    /// pool is at `max_in_flight` (see [`Owner::set_caller_pool_policy`]):
-    /// checkpoint 2 asks that no application call await behind another
-    /// session's queue, and a request genuinely has no session to hand
-    /// back until a permit frees up, so retrying is left to the caller
+    /// pool is at `max_in_flight` (see [`Owner::set_caller_pool_policy`])
+    /// or its queue is already full, and [`FacadeError::QueueFull`] if the
+    /// shared command channel itself is momentarily full: checkpoint 2
+    /// asks that no application call await behind another session's
+    /// queue, and a request genuinely has no session to hand back until a
+    /// permit or queue slot frees up, so retrying is left to the caller
     /// rather than this method blocking for an unbounded, uncancellable
     /// amount of time.
     pub async fn connect(&self, config: &crate::CallerConfig) -> Result<Session, FacadeError> {
+        let charge = reserve_command_bytes(&self.command_bytes, COMMAND_OVERHEAD_CHARGE)?;
         let (reply, reply_rx) = tokio::sync::oneshot::channel();
         self.commands
-            .send(Command::Connect {
+            .try_send(Command::Connect {
                 config: Box::new(config.clone()),
                 reply,
+                _charge: charge,
             })
-            .map_err(|_| FacadeError::DriverGone)?;
+            .map_err(|error| match error {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => FacadeError::QueueFull,
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => FacadeError::DriverGone,
+            })?;
         reply_rx.await.map_err(|_| FacadeError::DriverGone)?
     }
 
@@ -1614,22 +2479,32 @@ impl Facade {
 
     /// A snapshot of admission-path counters for the listener side, once a
     /// `listener_config` was given to [`Self::spawn`]. `None` also if the
-    /// driver task is no longer running.
+    /// driver task is no longer running or the command queue is
+    /// momentarily full.
     pub async fn listener_telemetry(&self) -> Option<crate::IngressTelemetrySnapshot> {
+        let charge = reserve_command_bytes(&self.command_bytes, COMMAND_OVERHEAD_CHARGE).ok()?;
         let (reply, reply_rx) = tokio::sync::oneshot::channel();
         self.commands
-            .send(Command::ListenerTelemetry { reply })
+            .try_send(Command::ListenerTelemetry {
+                reply,
+                _charge: charge,
+            })
             .ok()?;
         reply_rx.await.ok()?
     }
 
     /// Effective, currently-observable caller-pool state (A04), once at
     /// least one [`Self::connect`] has been attempted. `None` also if the
-    /// driver task is no longer running.
+    /// driver task is no longer running or the command queue is
+    /// momentarily full.
     pub async fn caller_pool_stats(&self) -> Option<crate::CallerPoolStats> {
+        let charge = reserve_command_bytes(&self.command_bytes, COMMAND_OVERHEAD_CHARGE).ok()?;
         let (reply, reply_rx) = tokio::sync::oneshot::channel();
         self.commands
-            .send(Command::CallerPoolStats { reply })
+            .try_send(Command::CallerPoolStats {
+                reply,
+                _charge: charge,
+            })
             .ok()?;
         reply_rx.await.ok()?
     }
@@ -1640,9 +2515,13 @@ impl Facade {
     /// actually reclaimed once its `Disconnected` event is handled,
     /// rather than left resident for the driver task's whole life.
     pub async fn listener_peer_count(&self) -> Option<usize> {
+        let charge = reserve_command_bytes(&self.command_bytes, COMMAND_OVERHEAD_CHARGE).ok()?;
         let (reply, reply_rx) = tokio::sync::oneshot::channel();
         self.commands
-            .send(Command::ListenerPeerCount { reply })
+            .try_send(Command::ListenerPeerCount {
+                reply,
+                _charge: charge,
+            })
             .ok()?;
         reply_rx.await.ok()?
     }
@@ -1651,8 +2530,14 @@ impl Facade {
     /// table -- both in-flight and established. See
     /// [`Self::listener_peer_count`] for why this exists.
     pub async fn caller_count(&self) -> Option<usize> {
+        let charge = reserve_command_bytes(&self.command_bytes, COMMAND_OVERHEAD_CHARGE).ok()?;
         let (reply, reply_rx) = tokio::sync::oneshot::channel();
-        self.commands.send(Command::CallerCount { reply }).ok()?;
+        self.commands
+            .try_send(Command::CallerCount {
+                reply,
+                _charge: charge,
+            })
+            .ok()?;
         reply_rx.await.ok()?
     }
 }
@@ -2119,6 +3004,57 @@ mod facade_tests {
                 with_timeout(client.caller_count()).await,
                 Some(0),
                 "the closed caller's table entry must be reclaimed, not left resident"
+            );
+        });
+    }
+
+    /// Opus review finding 5: a session that is `close()`d and then
+    /// dropped, with no live handle left anywhere to ever observe the
+    /// matching `Disconnected` event, must still be reclaimed even when
+    /// the peer can never answer -- not pinned in `Owner`'s table (and its
+    /// `SessionInbox`'s buffered bytes) forever. Simulated here by
+    /// dropping the whole server `Facade` before closing the caller side,
+    /// so nothing is left to ever send back an acknowledgement.
+    #[test]
+    fn a_closed_then_dropped_session_is_reclaimed_even_when_the_peer_never_answers() {
+        test_runtime().block_on(async {
+            let (mut server, server_handle) =
+                Facade::spawn(Some(&listener_config())).expect("spawn server");
+            let listen_addr = server.listener_local_addr().expect("listener bound");
+            let (client, _client_handle) = Facade::spawn(None).expect("spawn client");
+
+            let caller_session = with_timeout(client.connect(&shared_caller_config(listen_addr)))
+                .await
+                .expect("connect");
+            let listener_session = with_timeout(server.accept()).await.expect("accept");
+            assert_eq!(with_timeout(client.caller_count()).await, Some(1));
+
+            // The peer becomes permanently unreachable: every server-side
+            // handle (the `Facade` and the accepted `Session` alike, since
+            // a `Session` holds its own strong sender to the same driver)
+            // is gone, so its driver task ends and nothing is left to
+            // ever process (let alone answer) the caller's SHUTDOWN.
+            drop(server);
+            drop(listener_session);
+            with_timeout(server_handle)
+                .await
+                .expect("server driver task joins cleanly");
+
+            caller_session.close();
+            drop(caller_session);
+
+            for _ in 0..200 {
+                if with_timeout(client.caller_count()).await == Some(0) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                with_timeout(client.caller_count()).await,
+                Some(0),
+                "a closed-then-dropped session against an unreachable peer must \
+                 still be force-reclaimed, not pinned forever waiting for a \
+                 Disconnected event that can never arrive"
             );
         });
     }

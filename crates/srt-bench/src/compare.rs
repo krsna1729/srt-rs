@@ -145,14 +145,18 @@ fn required_count(record: &Record, key: &str) -> Option<f64> {
 }
 
 /// Shared identity across both roles (conns, source_bps, secs): a side that
-/// carries a corrupt value vetoes the pair, while a side that merely lacks
-/// the column (legacy rows) defers to the other side. Listener wins when
-/// both sides are valid, matching the previous preference.
+/// carries a corrupt or non-positive value vetoes the pair, while a side that
+/// merely lacks the column (legacy rows) defers to the other side. Listener
+/// wins when both sides are positive, matching the previous preference.
 fn required_identity(caller: &Record, listener: &Record, key: &str) -> Option<f64> {
     match (read_field(caller, key), read_field(listener, key)) {
-        (FieldRead::Valid(_), FieldRead::Valid(value)) => Some(value),
-        (FieldRead::Valid(value), FieldRead::Missing) => Some(value),
-        (FieldRead::Missing, FieldRead::Valid(value)) => Some(value),
+        (FieldRead::Valid(caller), FieldRead::Valid(listener))
+            if caller > 0.0 && listener > 0.0 =>
+        {
+            Some(listener)
+        }
+        (FieldRead::Valid(value), FieldRead::Missing) if value > 0.0 => Some(value),
+        (FieldRead::Missing, FieldRead::Valid(value)) if value > 0.0 => Some(value),
         _ => None,
     }
 }
@@ -163,7 +167,11 @@ fn required_identity(caller: &Record, listener: &Record, key: &str) -> Option<f6
 /// `conns` and rewrite the workload denominator.
 fn positive_or(caller: &Record, listener: &Record, key: &str, fallback: f64) -> Option<f64> {
     match (read_field(caller, key), read_field(listener, key)) {
-        (FieldRead::Valid(_), FieldRead::Valid(value)) if value > 0.0 => Some(value),
+        (FieldRead::Valid(caller), FieldRead::Valid(listener))
+            if caller > 0.0 && listener > 0.0 =>
+        {
+            Some(listener)
+        }
         (FieldRead::Valid(value), FieldRead::Missing) if value > 0.0 => Some(value),
         (FieldRead::Missing, FieldRead::Valid(value)) if value > 0.0 => Some(value),
         (FieldRead::Missing, FieldRead::Missing) => Some(fallback),
@@ -2121,12 +2129,11 @@ mod tests {
         set_test_field(&mut bad, "core_total", "lots");
         assert!(PairMetrics::compute(&clean_caller(), &bad).is_none());
 
-        // Zero denominators cannot become success: secs=0 still computes but
-        // the zero target keeps every threshold unmet.
+        // Zero identity values are invalid evidence, rather than a workload
+        // that can be paired with a positive value from the other role.
         let mut bad = clean_listener();
         set_test_field(&mut bad, "secs", "0");
-        let metrics = PairMetrics::compute(&clean_caller(), &bad).expect("zero secs computes");
-        assert!(!metrics.is_clean());
+        assert!(PairMetrics::compute(&clean_caller(), &bad).is_none());
     }
 
     /// Present-but-corrupt shared values veto fallback: a garbage identity
@@ -2150,10 +2157,27 @@ mod tests {
         let mut bad = clean_caller();
         set_test_field(&mut bad, "source_bps", "garbage");
         assert!(PairMetrics::compute(&bad, &clean_listener()).is_none());
+        // A non-positive caller identity must not hide behind a positive
+        // listener value.
+        let mut bad = clean_caller();
+        set_test_field(&mut bad, "conns", "0");
+        assert!(PairMetrics::compute(&bad, &clean_listener()).is_none());
         // Corrupt stream counts must not silently become `conns`.
         let mut bad = clean_listener();
         set_test_field(&mut bad, "logical_streams", "NaN");
         assert!(PairMetrics::compute(&clean_caller(), &bad).is_none());
+        // Both present logical-stream counts must be positive; neither role
+        // may hide a zero behind the other role's positive value.
+        let mut bad_caller = clean_caller();
+        set_test_field(&mut bad_caller, "logical_streams", "0");
+        let mut positive_listener = clean_listener();
+        set_test_field(&mut positive_listener, "logical_streams", "10");
+        assert!(PairMetrics::compute(&bad_caller, &positive_listener).is_none());
+        let mut positive_caller = clean_caller();
+        set_test_field(&mut positive_caller, "logical_streams", "10");
+        let mut bad_listener = clean_listener();
+        set_test_field(&mut bad_listener, "logical_streams", "0");
+        assert!(PairMetrics::compute(&positive_caller, &bad_listener).is_none());
         let mut bad = clean_caller();
         set_test_field(&mut bad, "source_streams", "lots");
         assert!(PairMetrics::compute(&bad, &clean_listener()).is_none());

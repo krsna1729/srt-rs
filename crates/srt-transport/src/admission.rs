@@ -1,13 +1,13 @@
 use crate::{
     DenseDueIndex, DenseSlotArena, DueIndex, GroupConnectionStats, GroupLogicalCounters,
-    InboundGroupStats, IngressTelemetry, ListenerPeerPolicy, ManualTimerStore, PeerSlotId,
-    WorkerMessage, group_connection_stats,
+    InboundGroupStats, IngressTelemetry, ListenerPeerPolicy, ManualTimerStore, OutputDrainBudget,
+    OutputDrainReport, OutputDrainStatus, PeerSlotId, WorkerMessage, group_connection_stats,
 };
 use shiguredo_srt::{
     Bytes, ConnectionEvent, ConnectionOptions, ConnectionOutput, SrtConnection, Timestamp,
 };
 use std::collections::hash_map::Entry as HashEntry;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 use zeroize::Zeroize;
 
@@ -572,6 +572,27 @@ impl LogicalPeerMut<'_> {
         }
     }
 
+    /// Whether the next logical payload can be accepted, including pacing
+    /// (finding 2): the caller-side counterpart,
+    /// [`crate::LogicalCallerMut::can_send_with_pacing`], is what a managed
+    /// facade's `Command::Send` handling must consult before calling
+    /// [`Self::send`] directly, or a configured bandwidth limit is silently
+    /// unenforced through that path.
+    pub fn can_send_with_pacing(&mut self, now: Timestamp) -> bool {
+        match self.table.logical_peers.get(&self.id) {
+            Some(LogicalPeerTarget::Direct(peer)) => self
+                .table
+                .get_peer(peer)
+                .is_some_and(|entry| entry.conn.can_send_with_pacing(now)),
+            Some(LogicalPeerTarget::Group(key)) => self
+                .table
+                .groups
+                .get_mut(key)
+                .is_some_and(|group| group.group.can_send_with_pacing(now)),
+            None => false,
+        }
+    }
+
     /// Send one logical payload. Broadcast returns one successful physical
     /// leg per healthy active member; Backup returns one selected leg.
     pub fn send(&mut self, payload: &[u8], now: Timestamp) -> Result<usize, shiguredo_srt::Error> {
@@ -599,6 +620,13 @@ impl LogicalPeerMut<'_> {
                 group.logical_payload_bytes_sent = group
                     .logical_payload_bytes_sent
                     .saturating_add(payload.len() as u64);
+                // Without this, the packets `send` just queued on each
+                // leg's connection sit unsent forever: `poll_outbound`
+                // only ever drains legs in `ready_legs`, it does not scan
+                // every group on every call, so a group send must mark
+                // its legs ready explicitly, the same as the `Direct` arm
+                // above already does via `mark_ready_physical`.
+                self.table.mark_group_all_ready(&key);
                 Ok(legs)
             }
             None => Err(shiguredo_srt::Error::with_reason(
@@ -639,6 +667,8 @@ impl LogicalPeerMut<'_> {
                 group.logical_payloads_sent = group.logical_payloads_sent.saturating_add(1);
                 group.logical_payload_bytes_sent =
                     group.logical_payload_bytes_sent.saturating_add(len);
+                // See the identical comment in `send` above.
+                self.table.mark_group_all_ready(&key);
                 Ok(legs)
             }
             None => Err(shiguredo_srt::Error::with_reason(
@@ -662,11 +692,55 @@ impl LogicalPeerMut<'_> {
             Some(LogicalPeerTarget::Group(key)) => {
                 if let Some(group) = self.table.groups.get_mut(&key) {
                     group.group.disconnect(now);
+                    // See `send`'s identical comment: a group's legs must
+                    // be marked ready explicitly, both for the SHUTDOWN
+                    // this just queued and for the resulting lifecycle
+                    // events, or `poll_outbound`/`poll_events` never
+                    // visit them.
+                    self.table.mark_group_all_ready(&key);
                 }
             }
             None => {}
         }
     }
+
+    /// Supply a replacement encryption key for this logical peer.
+    ///
+    /// A bonded peer receives the refresh on every physical leg so the
+    /// logical stream keeps one key epoch across its redundant paths. Each
+    /// successful protocol call queues its KM request; the next bounded
+    /// output pass drains those requests just like ordinary sends.
+    pub fn provide_new_sek(
+        &mut self,
+        new_sek: &[u8],
+        now: Timestamp,
+    ) -> Result<(), shiguredo_srt::Error> {
+        match self.table.logical_peers.get(&self.id).cloned() {
+            Some(LogicalPeerTarget::Direct(peer)) => {
+                let result = self
+                    .table
+                    .get_peer_mut(&peer)
+                    .ok_or_else(no_such_logical_peer)?
+                    .conn
+                    .provide_new_sek(new_sek, now);
+                if result.is_ok() {
+                    self.table.mark_ready_physical(peer);
+                }
+                result
+            }
+            Some(LogicalPeerTarget::Group(key)) => {
+                self.table.provide_group_new_sek(&key, new_sek, now)
+            }
+            None => Err(no_such_logical_peer()),
+        }
+    }
+}
+
+fn no_such_logical_peer() -> shiguredo_srt::Error {
+    shiguredo_srt::Error::with_reason(
+        shiguredo_srt::ErrorKind::InvalidState,
+        "logical peer no longer exists",
+    )
 }
 
 /// One logical ingress event emitted by an admitted peer or bonded group.
@@ -687,16 +761,31 @@ pub struct AdmissionEvent {
 }
 
 struct InboundGroupLeg {
-    member_id: u32,
     physical: PhysicalPeerKey,
     timers: ManualTimerStore,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct GroupReadyKey {
+    key: srt_lifecycle::LogicalGroupKey,
+    generation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct GroupDeadlineKey {
+    group: GroupReadyKey,
+    member_id: u32,
 }
 
 struct InboundGroup {
     group: shiguredo_srt::SrtGroup,
     legs: HashMap<u32, InboundGroupLeg>,
+    leg_order: Vec<u32>,
+    ready_legs: VecDeque<u32>,
+    ready_legs_queued: HashSet<u32>,
     representative_peer: std::net::SocketAddr,
     logical_peer: LogicalPeerId,
+    generation: u64,
     connected: bool,
     /// Bench-only success-window deadline; see [`AdmissionPeer::stream_deadline`].
     stream_deadline: Option<Instant>,
@@ -774,10 +863,18 @@ pub struct PeerTable {
     half_open_peers: usize,
     established_peers: usize,
     half_open_deadlines: DueIndex<PhysicalPeerKey>,
+    idle_deadlines: DueIndex<PhysicalPeerKey>,
     deadlines: DenseDueIndex,
+    group_deadlines: DueIndex<GroupDeadlineKey>,
+    group_deadline_values: HashMap<GroupDeadlineKey, u64>,
     ready: VecDeque<PeerSlotId>,
     event_ready: VecDeque<PeerSlotId>,
+    group_ready: VecDeque<GroupReadyKey>,
+    group_ready_queued: HashSet<GroupReadyKey>,
+    group_event_ready: VecDeque<GroupReadyKey>,
+    group_event_ready_queued: HashSet<GroupReadyKey>,
     groups: HashMap<srt_lifecycle::LogicalGroupKey, InboundGroup>,
+    next_group_generation: u64,
     last_now: Timestamp,
     config: PeerTableConfig,
 }
@@ -809,10 +906,18 @@ impl PeerTable {
             half_open_peers: 0,
             established_peers: 0,
             half_open_deadlines: DueIndex::default(),
+            idle_deadlines: DueIndex::default(),
             deadlines: DenseDueIndex::default(),
+            group_deadlines: DueIndex::default(),
+            group_deadline_values: HashMap::new(),
             ready: VecDeque::new(),
             event_ready: VecDeque::new(),
+            group_ready: VecDeque::new(),
+            group_ready_queued: HashSet::new(),
+            group_event_ready: VecDeque::new(),
+            group_event_ready_queued: HashSet::new(),
             groups: HashMap::new(),
+            next_group_generation: 1,
             last_now: Timestamp::default(),
             config,
         }
@@ -855,10 +960,165 @@ impl PeerTable {
         id
     }
 
+    fn allocate_group_generation(&mut self) -> u64 {
+        let generation = self.next_group_generation;
+        self.next_group_generation = generation.wrapping_add(1).max(1);
+        generation
+    }
+
+    fn group_ready_key(&self, key: &srt_lifecycle::LogicalGroupKey) -> Option<GroupReadyKey> {
+        Some(GroupReadyKey {
+            key: key.clone(),
+            generation: self.groups.get(key)?.generation,
+        })
+    }
+
+    fn enqueue_group_ready(&mut self, token: GroupReadyKey) {
+        if self
+            .groups
+            .get(&token.key)
+            .is_none_or(|group| group.generation != token.generation)
+        {
+            return;
+        }
+        if self.group_ready_queued.insert(token.clone()) {
+            self.group_ready.push_back(token);
+        }
+    }
+
+    fn enqueue_group_event_ready(&mut self, token: GroupReadyKey) {
+        if self
+            .groups
+            .get(&token.key)
+            .is_none_or(|group| group.generation != token.generation)
+        {
+            return;
+        }
+        if self.group_event_ready_queued.insert(token.clone()) {
+            self.group_event_ready.push_back(token);
+        }
+    }
+
+    fn mark_group_leg_ready(&mut self, key: &srt_lifecycle::LogicalGroupKey, member_id: u32) {
+        let Some(token) = self.group_ready_key(key) else {
+            return;
+        };
+        let inserted = if let Some(group) = self.groups.get_mut(key) {
+            if !group.legs.contains_key(&member_id) {
+                false
+            } else if group.ready_legs_queued.insert(member_id) {
+                group.ready_legs.push_back(member_id);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if inserted {
+            self.enqueue_group_ready(token.clone());
+        }
+        self.enqueue_group_event_ready(token);
+    }
+
+    fn mark_group_all_ready(&mut self, key: &srt_lifecycle::LogicalGroupKey) {
+        let members = self
+            .groups
+            .get(key)
+            .map(|group| group.leg_order.clone())
+            .unwrap_or_default();
+        for member_id in members {
+            self.mark_group_leg_ready(key, member_id);
+        }
+    }
+
+    /// Refresh every leg of one bonded group with a replacement encryption
+    /// key, so the logical stream keeps one key epoch across its redundant
+    /// paths -- split out of [`LogicalPeerMut::provide_new_sek`]'s own
+    /// match arm to keep it a plain per-target dispatcher.
+    fn provide_group_new_sek(
+        &mut self,
+        key: &srt_lifecycle::LogicalGroupKey,
+        new_sek: &[u8],
+        now: Timestamp,
+    ) -> Result<(), shiguredo_srt::Error> {
+        let member_ids = self
+            .groups
+            .get(key)
+            .map(|group| group.leg_order.clone())
+            .ok_or_else(no_such_logical_peer)?;
+        let Some(group) = self.groups.get_mut(key) else {
+            return Err(no_such_logical_peer());
+        };
+        for member_id in member_ids {
+            let Some(member) = group.group.member_mut(member_id) else {
+                return Err(shiguredo_srt::Error::with_reason(
+                    shiguredo_srt::ErrorKind::InvalidState,
+                    "logical peer group leg no longer exists",
+                ));
+            };
+            member.connection_mut().provide_new_sek(new_sek, now)?;
+        }
+        self.mark_group_all_ready(key);
+        Ok(())
+    }
+
+    fn sync_group_leg_deadline(&mut self, key: &srt_lifecycle::LogicalGroupKey, member_id: u32) {
+        let Some(group) = self.groups.get(key) else {
+            return;
+        };
+        let token = GroupReadyKey {
+            key: key.clone(),
+            generation: group.generation,
+        };
+        let deadline_key = GroupDeadlineKey {
+            group: token,
+            member_id,
+        };
+        let new_deadline = group
+            .legs
+            .get(&member_id)
+            .and_then(|leg| leg.timers.next_deadline())
+            .map(|deadline| deadline.as_micros());
+        let old_deadline = self.group_deadline_values.get(&deadline_key).copied();
+        if old_deadline == new_deadline {
+            return;
+        }
+        if old_deadline.is_some() {
+            self.group_deadlines.remove(&deadline_key);
+        }
+        match new_deadline {
+            Some(deadline) => {
+                self.group_deadline_values
+                    .insert(deadline_key.clone(), deadline);
+                self.group_deadlines
+                    .set(deadline_key, Timestamp::from_micros(deadline));
+            }
+            None => {
+                self.group_deadline_values.remove(&deadline_key);
+            }
+        }
+    }
+
+    fn index_idle_peer(&mut self, peer: PhysicalPeerKey) {
+        let last_datagram = self
+            .get_peer(&peer)
+            .filter(|entry| {
+                entry.admission_established
+                    && entry.conn.state() == shiguredo_srt::ConnectionState::Connected
+            })
+            .map(|entry| entry.last_datagram_at);
+        match last_datagram {
+            Some(last_datagram) => self.idle_deadlines.set(peer, last_datagram),
+            None => self.idle_deadlines.remove(&peer),
+        }
+    }
+
     fn detach_peer_for_group(&mut self, peer: &PhysicalPeerKey) -> Option<AdmissionPeer> {
         let slot_idx = self.slot_index_for_key(peer)?;
         self.deadlines.remove(slot_idx, &mut self.slots);
         self.half_open_deadlines.remove(peer);
+        self.idle_deadlines.remove(peer);
         self.slots.clear_ready(slot_idx);
         self.slots.clear_event_ready(slot_idx);
         let slot = self.slots.get_by_slot_mut(slot_idx)?;
@@ -1282,6 +1542,7 @@ impl PeerTable {
         if became_terminal {
             entry.rejected = true;
         }
+        self.index_idle_peer(physical);
         AdmissionFeedResult {
             fed,
             feed_error_kind,
@@ -1364,6 +1625,7 @@ impl PeerTable {
         let logical_peer = entry.logical_peer;
 
         if !self.groups.contains_key(&key) {
+            let generation = self.allocate_group_generation();
             let group = shiguredo_srt::SrtGroup::new(extension.group_id, mode)
                 .expect("GROUP handshakes are validated before connection admission");
             self.groups.insert(
@@ -1371,8 +1633,12 @@ impl PeerTable {
                 InboundGroup {
                     group,
                     legs: HashMap::new(),
+                    leg_order: Vec::new(),
+                    ready_legs: VecDeque::new(),
+                    ready_legs_queued: HashSet::new(),
                     representative_peer: peer.address,
                     logical_peer,
+                    generation,
                     connected: false,
                     stream_deadline: None,
                     ever_connected: false,
@@ -1408,15 +1674,20 @@ impl PeerTable {
         group.legs.insert(
             member_id,
             InboundGroupLeg {
-                member_id,
                 physical: peer,
                 timers: entry.timers,
             },
         );
+        group.leg_order.push(member_id);
         let slot_idx = self.slot_index_for_key(&peer).expect("peer has slot");
         if let Some(slot) = self.slots.get_by_slot_mut(slot_idx) {
-            *slot.value = PeerSlotTarget::GroupLeg(GroupMemberHandle { key, member_id });
+            *slot.value = PeerSlotTarget::GroupLeg(GroupMemberHandle {
+                key: key.clone(),
+                member_id,
+            });
         }
+        self.mark_group_leg_ready(&key, member_id);
+        self.sync_group_leg_deadline(&key, member_id);
     }
     fn admit_group_leg(&mut self, peer: PhysicalPeerKey, data: &[u8], now: Timestamp) -> Admit {
         let Some(slot_idx) = self.slot_index_for_key(&peer) else {
@@ -1436,10 +1707,15 @@ impl PeerTable {
         let Some(member) = group.group.member_mut(handle.member_id) else {
             return Admit::Dropped(AdmissionDropReason::StaleConclusion);
         };
-        match member.connection_mut().feed_recv_buf(data, now) {
+        let result = match member.connection_mut().feed_recv_buf(data, now) {
             Ok(()) => Admit::Fed,
             Err(_) => Admit::Dropped(AdmissionDropReason::InvalidPacket),
+        };
+        if matches!(result, Admit::Fed) {
+            self.mark_group_leg_ready(&handle.key, handle.member_id);
+            self.sync_group_leg_deadline(&handle.key, handle.member_id);
         }
+        result
     }
 
     /// Take one datagram for `peer`.
@@ -1581,6 +1857,7 @@ impl PeerTable {
         }
         if entry.conn.feed_recv_buf(data, now).is_ok() {
             entry.last_datagram_at = now;
+            self.index_idle_peer(physical);
             self.mark_ready_physical(physical);
             return Some(Admit::Fed);
         }
@@ -1645,7 +1922,11 @@ impl PeerTable {
         F: FnOnce(&AdmissionRequest, &mut SrtConnection) -> AdmissionHookResult,
     {
         self.last_now = now;
-        let expired = self.prune_half_open(now);
+        // Keep packet admission itself bounded. Remaining expired
+        // handshakes stay in the indexed deadline queue for the next
+        // maintenance pass instead of turning one receive into a table-wide
+        // sweep.
+        let expired = self.prune_half_open_bounded(now, 1);
         telemetry.record_expired_half_open(expired);
         let DecodedAdmissionDatagram {
             handshake,
@@ -1748,8 +2029,20 @@ impl PeerTable {
 
     /// Remove incomplete handshakes that have stopped making progress.
     pub fn prune_half_open(&mut self, now: Timestamp) -> usize {
+        self.prune_half_open_bounded(now, usize::MAX)
+    }
+
+    /// Remove at most `max_actions` expired incomplete handshakes. The
+    /// returned count is the number of physical peers retired; stale and
+    /// refreshed index entries still consume bounded index work but are not
+    /// reported as removals.
+    pub fn prune_half_open_bounded(&mut self, now: Timestamp, max_actions: usize) -> usize {
+        if max_actions == 0 {
+            return 0;
+        }
         let mut due = Vec::new();
-        self.half_open_deadlines.pop_due(now, &mut due);
+        self.half_open_deadlines
+            .pop_due_bounded(now, max_actions, &mut due);
         let timeout_micros = duration_micros_saturating(self.config.half_open_timeout);
         let mut count = 0;
         for peer in due {
@@ -1758,6 +2051,12 @@ impl PeerTable {
                     && now.saturating_sub(entry.last_datagram_at) >= timeout_micros
             });
             if !stale {
+                if let Some(entry) = self.get_peer(&peer)
+                    && !entry.admission_established
+                {
+                    self.half_open_deadlines
+                        .set(peer, entry.last_datagram_at.add_micros(timeout_micros));
+                }
                 continue;
             }
             let _ = self.remove_physical(peer);
@@ -1766,59 +2065,54 @@ impl PeerTable {
         count
     }
 
-    /// Start an orderly close on every established direct peer that has
-    /// gone quiet for longer than `idle_timeout` (A04) -- the same
-    /// `conn.disconnect(now)` + `mark_ready_physical` a normal
-    /// [`LogicalPeerMut::disconnect`] performs, so the resulting SHUTDOWN
-    /// is actually drained and sent on the next `poll_outbound`, and the
-    /// application observes it as an ordinary `ConnectionEvent::Disconnected`
-    /// via `poll_events` rather than the peer's state and buffers simply
-    /// vanishing. Retiring the table entry itself remains the
-    /// application's call (`remove`), same as any other disconnect.
-    ///
-    /// Distinct from [`Self::prune_half_open`] (which only ever considers
-    /// a peer still mid-handshake, `!admission_established`) and from a
-    /// peer already mid-close (this checks the protocol's own
-    /// `ConnectionState::Connected`, not the bookkeeping `connected` field,
-    /// which only updates once the *application* drains the corresponding
-    /// event via `poll_events` -- a peer that is truly `Connected` but
-    /// whose event has not yet been drained would otherwise be invisible
-    /// to both this and `prune_half_open`, unbounded). Bonded groups are
-    /// unaffected: `InboundGroup` has no equivalent idle concept yet.
-    ///
-    /// Collects a [`PhysicalPeerKey`] directly from the slot arena rather
-    /// than an address and re-resolving it: `physical_for_address` returns
-    /// the *first* slot at that address, but one address can legitimately
-    /// hold many peers (a shared caller socket is exactly this -- see
-    /// [`crate::mio_transport::Owner::connect`]), so re-resolving by
-    /// address alone risks disconnecting a different, healthy peer at the
-    /// same address instead of the one actually identified as stale.
-    pub fn prune_idle(&mut self, now: Timestamp, idle_timeout: Duration) -> usize {
-        let timeout_micros = duration_micros_saturating(idle_timeout);
-        let stale: Vec<PhysicalPeerKey> = self
-            .slots
-            .iter()
-            .filter_map(|slot| {
-                let entry = slot.value.direct()?;
-                let stale = entry.admission_established
-                    && entry.conn.state() == shiguredo_srt::ConnectionState::Connected
-                    && now.saturating_sub(entry.last_datagram_at) >= timeout_micros;
-                stale.then_some(PhysicalPeerKey {
-                    address: slot.address,
-                    local_socket_id: slot.socket_id,
-                })
-            })
-            .collect();
+    /// Start an orderly close on at most `max_actions` established direct
+    /// peers whose indexed receive timestamp has gone quiet for
+    /// `idle_timeout`. The index stores physical keys, so peers sharing one
+    /// UDP address remain distinct and stale heap entries cannot close a
+    /// replacement slot after a generation change.
+    pub fn prune_idle_bounded(
+        &mut self,
+        now: Timestamp,
+        idle_timeout: Duration,
+        max_actions: usize,
+    ) -> usize {
+        if max_actions == 0 {
+            return 0;
+        }
+        let cutoff = Timestamp::from_micros(
+            now.as_micros()
+                .saturating_sub(duration_micros_saturating(idle_timeout)),
+        );
+        let mut due = Vec::new();
+        self.idle_deadlines
+            .pop_due_bounded(cutoff, max_actions, &mut due);
         let mut count = 0;
-        for physical in stale {
-            let Some(entry) = self.get_peer_mut(&physical) else {
-                continue;
-            };
-            entry.conn.disconnect(now);
-            self.mark_ready_physical(physical);
-            count += 1;
+        for physical in due {
+            let stale = self.get_peer(&physical).is_some_and(|entry| {
+                entry.admission_established
+                    && entry.conn.state() == shiguredo_srt::ConnectionState::Connected
+                    && now.saturating_sub(entry.last_datagram_at)
+                        >= duration_micros_saturating(idle_timeout)
+            });
+            if stale {
+                if let Some(entry) = self.get_peer_mut(&physical) {
+                    entry.conn.disconnect(now);
+                }
+                self.mark_ready_physical(physical);
+                count += 1;
+            } else {
+                // The timestamp was refreshed or the protocol started
+                // closing while this key sat in the heap. Preserve the live
+                // index entry for a later bounded visit.
+                self.index_idle_peer(physical);
+            }
         }
         count
+    }
+
+    /// Compatibility wrapper that drains every currently due idle key.
+    pub fn prune_idle(&mut self, now: Timestamp, idle_timeout: Duration) -> usize {
+        self.prune_idle_bounded(now, idle_timeout, usize::MAX)
     }
 
     /// [`Self::admit`] plus the send it implies: forward the datagram to
@@ -1920,18 +2214,56 @@ impl PeerTable {
         now: Timestamp,
         out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
     ) {
+        let _ = self.poll_outbound_bounded(
+            now,
+            OutputDrainBudget::new(usize::MAX, usize::MAX, usize::MAX),
+            out,
+        );
+    }
+
+    /// Bounded counterpart to [`Self::poll_outbound`] (finding 3): fires
+    /// due direct-peer timers and drains ready output up to
+    /// `budget.max_actions`/`max_packets`/`max_bytes`, so one
+    /// continuously active connection cannot monopolize a shared driver
+    /// visit the way an unconditional full-table drain could -- the same
+    /// contract [`crate::CallerTable::poll_outbound_bounded`] already
+    /// gives the caller side.
+    ///
+    /// Bonded-group output is drained only for legs the group ready-queue
+    /// actually marks ready (never every group on every call, unlike the
+    /// old unconditional full scan), but is not itself split across
+    /// multiple `poll_outbound_bounded` calls if several groups are ready
+    /// at once. Bonded groups are a small-cardinality construct relative
+    /// to direct peers, so this is a deliberate, documented scope
+    /// decision rather than the primary unbounded-scan hazard this exists
+    /// to close -- fully budget-splitting group output is an open
+    /// follow-up, not yet a numbered card.
+    pub fn poll_outbound_bounded(
+        &mut self,
+        now: Timestamp,
+        budget: OutputDrainBudget,
+        out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
+    ) -> OutputDrainReport {
         self.last_now = now;
         out.clear();
         let mut rejected = Vec::new();
-        self.mark_due_peers(now);
-        self.poll_direct_outbound(now, out, &mut rejected);
+        let mut report = self.poll_direct_outbound_bounded(now, budget, out, &mut rejected);
         self.remove_rejected_peers(rejected);
-        self.poll_group_outbound(now, out);
+        self.poll_group_outbound_bounded(now, out);
+        if report.status == OutputDrainStatus::Drained && self.has_pending_output(now) {
+            report.status = OutputDrainStatus::BudgetExhausted;
+        }
+        report
     }
 
-    fn mark_due_peers(&mut self, now: Timestamp) {
+    fn mark_due_peers_bounded(&mut self, now: Timestamp, max_work: usize) -> (usize, bool) {
+        if max_work == 0 {
+            return (0, self.deadlines.has_due(now));
+        }
         let mut due = Vec::new();
-        self.deadlines.pop_due(now, &mut self.slots, &mut due);
+        let (visited, due_remaining) =
+            self.deadlines
+                .pop_due_bounded(now, &mut self.slots, max_work, &mut due);
         for slot_id in due {
             let slot_idx = slot_id.slot_idx as usize;
             if let Some(id) = self.slots.mark_ready(slot_idx) {
@@ -1941,47 +2273,86 @@ impl PeerTable {
                 self.event_ready.push_back(id);
             }
         }
+        (visited, due_remaining)
     }
 
-    fn poll_direct_outbound(
+    fn poll_direct_outbound_bounded(
         &mut self,
         now: Timestamp,
+        budget: OutputDrainBudget,
         out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
         rejected: &mut Vec<PhysicalPeerKey>,
-    ) {
-        while let Some(slot_id) = self.ready.pop_front() {
-            let slot_idx = slot_id.slot_idx as usize;
-            if !self.slots.clear_ready_if_generation_matches(slot_id) {
-                continue;
-            }
-            let Some(slot) = self.slots.get_by_slot_mut(slot_idx) else {
-                continue;
-            };
-            let peer_addr = slot.address;
-            let peer_key = PhysicalPeerKey {
-                address: peer_addr,
-                local_socket_id: slot.socket_id,
-            };
-            let Some(entry) = slot.value.direct_mut() else {
-                continue;
-            };
-            entry.timers.fire_expired(now, &mut entry.conn);
-            while let Some(output) = entry.conn.poll_output() {
-                match output {
-                    ConnectionOutput::SendPacket(bytes) => out.push((peer_addr, bytes)),
-                    other => entry.timers.apply_output(&other, now),
-                }
-            }
-            if entry.rejected {
-                rejected.push(peer_key);
-                continue;
-            }
-            if let Some(deadline) = entry.timers.next_deadline() {
-                self.deadlines.set(slot_idx, deadline, &mut self.slots);
+    ) -> OutputDrainReport {
+        let mut report = OutputDrainReport::default();
+        if budget.max_actions == 0 {
+            report.status = if self.ready.is_empty() && !self.deadlines.has_due(now) {
+                OutputDrainStatus::Drained
             } else {
-                self.deadlines.remove(slot_idx, &mut self.slots);
+                OutputDrainStatus::BudgetExhausted
+            };
+            return report;
+        }
+        let (_, due_remaining) = self.mark_due_peers_bounded(now, budget.max_actions);
+        while within_output_budget(&report, budget) {
+            let Some(slot_id) = self.ready.pop_front() else {
+                break;
+            };
+            if let Some(peer_key) = self.drain_one_direct_peer_slot(slot_id, now, out, &mut report)
+            {
+                rejected.push(peer_key);
             }
         }
+        if due_remaining || !self.ready.is_empty() || output_budget_exhausted(&report, budget) {
+            report.status = OutputDrainStatus::BudgetExhausted;
+        }
+        report
+    }
+
+    /// Service one ready direct-peer slot: fire its due timers, drain its
+    /// queued output into `out`/`report`, and update its own deadline
+    /// index entry. Returns the peer's key if it must be retired for
+    /// carrying a queued policy rejection -- split out of
+    /// [`Self::poll_direct_outbound_bounded`]'s own loop body to keep it a
+    /// plain "pop, service, repeat" dispatcher.
+    fn drain_one_direct_peer_slot(
+        &mut self,
+        slot_id: PeerSlotId,
+        now: Timestamp,
+        out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
+        report: &mut OutputDrainReport,
+    ) -> Option<PhysicalPeerKey> {
+        let slot_idx = slot_id.slot_idx as usize;
+        if !self.slots.clear_ready_if_generation_matches(slot_id) {
+            return None;
+        }
+        report.actions += 1;
+        let slot = self.slots.get_by_slot_mut(slot_idx)?;
+        let peer_addr = slot.address;
+        let peer_key = PhysicalPeerKey {
+            address: peer_addr,
+            local_socket_id: slot.socket_id,
+        };
+        let entry = slot.value.direct_mut()?;
+        entry.timers.fire_expired(now, &mut entry.conn);
+        while let Some(output) = entry.conn.poll_output() {
+            match output {
+                ConnectionOutput::SendPacket(bytes) => {
+                    report.packets += 1;
+                    report.bytes += bytes.len();
+                    out.push((peer_addr, bytes));
+                }
+                other => entry.timers.apply_output(&other, now),
+            }
+        }
+        if entry.rejected {
+            return Some(peer_key);
+        }
+        if let Some(deadline) = entry.timers.next_deadline() {
+            self.deadlines.set(slot_idx, deadline, &mut self.slots);
+        } else {
+            self.deadlines.remove(slot_idx, &mut self.slots);
+        }
+        None
     }
 
     fn remove_rejected_peers(&mut self, rejected: Vec<PhysicalPeerKey>) {
@@ -1990,17 +2361,62 @@ impl PeerTable {
         }
     }
 
-    fn poll_group_outbound(
+    /// Fire due bonded-group-leg timers, marking the owning leg ready for
+    /// the next [`Self::poll_group_outbound_bounded`]/event drain --
+    /// the group-leg counterpart to [`Self::mark_due_peers_bounded`].
+    fn mark_due_group_legs(&mut self, now: Timestamp) {
+        let mut due = Vec::new();
+        self.group_deadlines.pop_due(now, &mut due);
+        for deadline_key in due {
+            self.group_deadline_values.remove(&deadline_key);
+            self.mark_group_leg_ready(&deadline_key.group.key, deadline_key.member_id);
+        }
+    }
+
+    /// Drain output only for bonded-group legs the ready-queue actually
+    /// marked ready (finding 3), instead of the old unconditional scan of
+    /// every group and every leg on every call. See
+    /// [`Self::poll_outbound_bounded`]'s doc comment for why this does
+    /// not (yet) split a single call's work further across multiple
+    /// ready groups.
+    fn poll_group_outbound_bounded(
         &mut self,
         now: Timestamp,
         out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
     ) {
-        for group in self.groups.values_mut() {
+        self.mark_due_group_legs(now);
+        while let Some(token) = self.group_ready.pop_front() {
+            self.group_ready_queued.remove(&token);
+            self.drain_one_group_ready_token(token, now, out);
+        }
+    }
+
+    /// Service every ready leg of one bonded group -- split out of
+    /// [`Self::poll_group_outbound_bounded`]'s own loop body to keep it a
+    /// plain "pop, service, repeat" dispatcher.
+    fn drain_one_group_ready_token(
+        &mut self,
+        token: GroupReadyKey,
+        now: Timestamp,
+        out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
+    ) {
+        let Some(group) = self.groups.get_mut(&token.key) else {
+            return;
+        };
+        if group.generation != token.generation {
+            return;
+        }
+        let ready_legs: Vec<u32> = std::mem::take(&mut group.ready_legs).into_iter().collect();
+        group.ready_legs_queued.clear();
+        {
             let (core, legs) = (&mut group.group, &mut group.legs);
-            for leg in legs.values_mut() {
-                let member = core
-                    .member_mut(leg.member_id)
-                    .expect("group I/O legs are built with matching members");
+            for &member_id in &ready_legs {
+                let Some(leg) = legs.get_mut(&member_id) else {
+                    continue;
+                };
+                let Some(member) = core.member_mut(member_id) else {
+                    continue;
+                };
                 leg.timers.fire_expired(now, member.connection_mut());
                 while let Some(output) = member.connection_mut().poll_output() {
                     match output {
@@ -2012,6 +2428,48 @@ impl PeerTable {
                 }
             }
         }
+        for member_id in ready_legs {
+            self.sync_group_leg_deadline(&token.key, member_id);
+        }
+    }
+
+    /// Whether output or a due timer can be serviced at `now`, across
+    /// both direct peers and bonded-group legs.
+    #[must_use]
+    pub fn has_pending_output(&self, now: Timestamp) -> bool {
+        !self.ready.is_empty()
+            || !self.group_ready.is_empty()
+            || self.deadlines.has_due(now)
+            || self.group_deadlines.has_due(now)
+    }
+
+    /// Whether any event-ready direct peer or bonded-group leg remains.
+    #[must_use]
+    pub fn has_pending_events(&self) -> bool {
+        !self.event_ready.is_empty() || !self.group_event_ready.is_empty()
+    }
+
+    /// Microseconds until the earliest direct peer's idle-timeout
+    /// deadline, for sizing a runtime's poll timeout -- the idle-pruning
+    /// counterpart to [`Self::time_until_next_deadline`]. Bonded groups
+    /// have no idle concept yet (see [`Self::prune_idle_bounded`]'s doc
+    /// comment).
+    #[must_use]
+    pub fn time_until_idle_deadline(
+        &mut self,
+        now: Timestamp,
+        idle_timeout: Duration,
+        default_us: u64,
+    ) -> u64 {
+        let Some(deadline) = self.idle_deadlines.peek_min_deadline() else {
+            return default_us;
+        };
+        let cutoff_micros = deadline
+            .as_micros()
+            .saturating_add(duration_micros_saturating(idle_timeout));
+        cutoff_micros
+            .saturating_sub(now.as_micros())
+            .min(default_us)
     }
 
     /// Mark a peer whose protocol state was changed as ready for the
@@ -2045,12 +2503,11 @@ impl PeerTable {
     pub fn time_until_next_deadline(&mut self, now: Timestamp, default_us: u64) -> u64 {
         self.last_now = now;
         let peer_deadline = self.deadlines.peek_min_deadline(&self.slots);
-        let group_deadline = self
-            .groups
-            .values()
-            .flat_map(|group| group.legs.values())
-            .filter_map(|leg| leg.timers.next_deadline())
-            .min();
+        // `group_deadlines` is a `DueIndex` kept in sync with every leg's
+        // own timer (see its insert/remove call sites), so this is an
+        // O(log n) peek, not the O(groups × legs) full scan this used to
+        // be before that index existed (Opus review finding 6).
+        let group_deadline = self.group_deadlines.peek_min_deadline();
         match (peer_deadline, group_deadline) {
             (Some(a), Some(b)) => a.min(b).saturating_sub(now),
             (Some(deadline), None) | (None, Some(deadline)) => deadline.saturating_sub(now),
@@ -2059,86 +2516,93 @@ impl PeerTable {
     }
 
     /// Drain logical ingress events for production consumers.
-    fn drain_direct_events(&mut self, out: &mut Vec<AdmissionEvent>) {
-        while let Some(slot_id) = self.event_ready.pop_front() {
+    pub fn poll_events(&mut self, out: &mut Vec<AdmissionEvent>) {
+        let _ = self.poll_events_bounded(usize::MAX, out);
+    }
+
+    /// Bounded counterpart to [`Self::poll_events`] (finding 3): drains at
+    /// most `max_events` direct-peer and bonded-group-leg events instead
+    /// of the old unconditional full-table/full-group scan. Returns
+    /// whether another event-ready peer or group remains queued, mirroring
+    /// [`crate::CallerTable::poll_events_bounded`]. A zero limit is a
+    /// useful probe and consumes nothing.
+    pub fn poll_events_bounded(
+        &mut self,
+        max_events: usize,
+        out: &mut Vec<AdmissionEvent>,
+    ) -> bool {
+        out.clear();
+        if max_events == 0 {
+            return self.has_pending_events();
+        }
+        self.drain_direct_events_bounded(max_events, out);
+        if out.len() < max_events {
+            self.drain_group_events_bounded(max_events, out);
+        }
+        self.has_pending_events()
+    }
+
+    fn drain_direct_events_bounded(&mut self, max_events: usize, out: &mut Vec<AdmissionEvent>) {
+        while out.len() < max_events {
+            let Some(slot_id) = self.event_ready.pop_front() else {
+                break;
+            };
             let slot_idx = slot_id.slot_idx as usize;
             if !self.slots.clear_event_ready_if_generation_matches(slot_id) {
                 continue;
             }
-            let Some(slot) = self.slots.get_by_slot_mut(slot_idx) else {
-                continue;
+            let hit_budget = {
+                let Some(slot) = self.slots.get_by_slot_mut(slot_idx) else {
+                    continue;
+                };
+                let peer_addr = slot.address;
+                let Some(entry) = slot.value.direct_mut() else {
+                    continue;
+                };
+                while out.len() < max_events {
+                    let Some(event) = entry.conn.poll_event() else {
+                        break;
+                    };
+                    entry.apply_event(&event);
+                    out.push(AdmissionEvent {
+                        representative_peer: peer_addr,
+                        logical_peer: entry.logical_peer,
+                        event,
+                    });
+                }
+                out.len() >= max_events
             };
-            let peer_addr = slot.address;
-            let Some(entry) = slot.value.direct_mut() else {
-                continue;
-            };
-            while let Some(event) = entry.conn.poll_event() {
-                entry.apply_event(&event);
-                out.push(AdmissionEvent {
-                    representative_peer: peer_addr,
-                    logical_peer: entry.logical_peer,
-                    event,
-                });
+            // There is no protocol-side event-count accessor: an exact
+            // fill with no remaining event is cleared by the next cheap
+            // probe (see `CallerTable::poll_events_bounded`'s identical
+            // reasoning).
+            if hit_budget && let Some(id) = self.slots.mark_event_ready(slot_idx) {
+                self.event_ready.push_back(id);
             }
         }
     }
 
-    pub fn poll_events(&mut self, out: &mut Vec<AdmissionEvent>) {
-        out.clear();
-        self.drain_direct_events(out);
-        for group in self.groups.values_mut() {
-            while let Some(event) = group.group.poll_event(self.last_now) {
-                match event {
-                    shiguredo_srt::GroupEvent::MemberConnected { .. } => {
-                        if !group.connected {
-                            group.connected = true;
-                            group.ever_connected = true;
-                            out.push(AdmissionEvent {
-                                representative_peer: group.representative_peer,
-                                logical_peer: group.logical_peer,
-                                event: ConnectionEvent::Connected,
-                            });
-                        }
-                    }
-                    shiguredo_srt::GroupEvent::DataReceived(packet) => {
-                        group.logical_payloads_received =
-                            group.logical_payloads_received.saturating_add(1);
-                        group.data_events = group.data_events.saturating_add(1);
-                        group.last_data_at = Instant::now();
-                        group.logical_payload_bytes_received = group
-                            .logical_payload_bytes_received
-                            .saturating_add(packet.payload.len() as u64);
-                        out.push(AdmissionEvent {
-                            representative_peer: group.representative_peer,
-                            logical_peer: group.logical_peer,
-                            event: ConnectionEvent::DataReceived {
-                                payload: packet.payload,
-                                sequence_number: packet.sequence_number,
-                                message_number: packet.message_number,
-                                timestamp: packet.timestamp,
-                                packet_count: packet.packet_count,
-                            },
-                        });
-                    }
-                    shiguredo_srt::GroupEvent::MemberError { error, .. }
-                    | shiguredo_srt::GroupEvent::MemberDisconnected { reason: error, .. }
-                        if group.connected
-                            && !group.group.members().iter().any(|member| {
-                                member.connection().state()
-                                    == shiguredo_srt::ConnectionState::Connected
-                            }) =>
-                    {
-                        group.connected = false;
-                        group.torn_down |= !is_ordered_close(&error);
-                        out.push(AdmissionEvent {
-                            representative_peer: group.representative_peer,
-                            logical_peer: group.logical_peer,
-                            event: ConnectionEvent::Disconnected { reason: error },
-                        });
-                    }
-                    shiguredo_srt::GroupEvent::MemberError { .. }
-                    | shiguredo_srt::GroupEvent::MemberDisconnected { .. } => {}
-                }
+    fn drain_group_events_bounded(&mut self, max_events: usize, out: &mut Vec<AdmissionEvent>) {
+        let last_now = self.last_now;
+        while out.len() < max_events {
+            let Some(token) = self.group_event_ready.pop_front() else {
+                break;
+            };
+            self.group_event_ready_queued.remove(&token);
+            let Some(group) = self.groups.get_mut(&token.key) else {
+                continue;
+            };
+            if group.generation != token.generation {
+                continue;
+            }
+            while out.len() < max_events {
+                let Some(event) = group.group.poll_event(last_now) else {
+                    break;
+                };
+                apply_group_event(group, event, out);
+            }
+            if out.len() >= max_events {
+                self.enqueue_group_event_ready(token);
             }
         }
     }
@@ -2394,6 +2858,7 @@ impl PeerTable {
 
     fn purge_physical_indexes(&mut self, peer: PhysicalPeerKey) {
         self.half_open_deadlines.remove(&peer);
+        self.idle_deadlines.remove(&peer);
         if let Some(slot_idx) = self.slot_index_for_key(&peer) {
             self.deadlines.remove(slot_idx, &mut self.slots);
             self.slots.clear_ready(slot_idx);
@@ -2471,6 +2936,7 @@ impl PeerTable {
             self.established_peers += 1;
             self.half_open_deadlines.remove(&peer);
         }
+        self.index_idle_peer(peer);
     }
 
     /// Whether every tracked peer is done, so the acceptor can stop.
@@ -2588,6 +3054,83 @@ fn peer_entropy(peer: std::net::SocketAddr) -> u32 {
 
 fn duration_micros_saturating(timeout: Duration) -> u64 {
     u64::try_from(timeout.as_micros()).unwrap_or(u64::MAX)
+}
+
+/// Apply one bonded-group protocol event to its group's bookkeeping,
+/// pushing the resulting application-visible event (if any) into `out` --
+/// split out of [`PeerTable::drain_group_events_bounded`]'s own loop body
+/// to keep it a plain "pop, apply, repeat" dispatcher.
+fn apply_group_event(
+    group: &mut InboundGroup,
+    event: shiguredo_srt::GroupEvent,
+    out: &mut Vec<AdmissionEvent>,
+) {
+    match event {
+        shiguredo_srt::GroupEvent::MemberConnected { .. } => {
+            if !group.connected {
+                group.connected = true;
+                group.ever_connected = true;
+                out.push(AdmissionEvent {
+                    representative_peer: group.representative_peer,
+                    logical_peer: group.logical_peer,
+                    event: ConnectionEvent::Connected,
+                });
+            }
+        }
+        shiguredo_srt::GroupEvent::DataReceived(packet) => {
+            group.logical_payloads_received = group.logical_payloads_received.saturating_add(1);
+            group.data_events = group.data_events.saturating_add(1);
+            group.last_data_at = Instant::now();
+            group.logical_payload_bytes_received = group
+                .logical_payload_bytes_received
+                .saturating_add(packet.payload.len() as u64);
+            out.push(AdmissionEvent {
+                representative_peer: group.representative_peer,
+                logical_peer: group.logical_peer,
+                event: ConnectionEvent::DataReceived {
+                    payload: packet.payload,
+                    sequence_number: packet.sequence_number,
+                    message_number: packet.message_number,
+                    timestamp: packet.timestamp,
+                    packet_count: packet.packet_count,
+                },
+            });
+        }
+        shiguredo_srt::GroupEvent::MemberError { error, .. }
+        | shiguredo_srt::GroupEvent::MemberDisconnected { reason: error, .. }
+            if group.connected
+                && !group.group.members().iter().any(|member| {
+                    member.connection().state() == shiguredo_srt::ConnectionState::Connected
+                }) =>
+        {
+            group.connected = false;
+            group.torn_down |= !is_ordered_close(&error);
+            out.push(AdmissionEvent {
+                representative_peer: group.representative_peer,
+                logical_peer: group.logical_peer,
+                event: ConnectionEvent::Disconnected { reason: error },
+            });
+        }
+        shiguredo_srt::GroupEvent::MemberError { .. }
+        | shiguredo_srt::GroupEvent::MemberDisconnected { .. } => {}
+    }
+}
+
+/// Whether a bounded output drain may still service another ready peer
+/// under `budget` -- shared by [`PeerTable::poll_direct_outbound_bounded`]
+/// and its group counterpart.
+fn within_output_budget(report: &OutputDrainReport, budget: OutputDrainBudget) -> bool {
+    report.actions < budget.max_actions
+        && (budget.max_packets == 0 || report.packets < budget.max_packets)
+        && (budget.max_bytes == 0 || report.bytes < budget.max_bytes)
+}
+
+/// Whether a completed bounded output drain used up its packet or byte
+/// budget (distinct from the action count, which the caller already
+/// tracks against `self.ready`/due-remaining state directly).
+fn output_budget_exhausted(report: &OutputDrainReport, budget: OutputDrainBudget) -> bool {
+    (budget.max_packets > 0 && report.packets >= budget.max_packets)
+        || (budget.max_bytes > 0 && report.bytes >= budget.max_bytes)
 }
 
 #[cfg(test)]
@@ -2924,7 +3467,12 @@ mod tests {
         // 2. Poll direct outbound drains ready queue and clears flags
         let mut out = Vec::new();
         let mut rejected = Vec::new();
-        table.poll_direct_outbound(Timestamp::default(), &mut out, &mut rejected);
+        table.poll_direct_outbound_bounded(
+            Timestamp::default(),
+            OutputDrainBudget::new(usize::MAX, usize::MAX, usize::MAX),
+            &mut out,
+            &mut rejected,
+        );
         assert!(table.ready.is_empty());
 
         // Rearm outbound for peer_b and peer_a
@@ -2978,7 +3526,12 @@ mod tests {
         // Poll outbound -> stale entry for peer_a is popped and skipped without clearing peer_b's flag
         let mut out = Vec::new();
         let mut rejected = Vec::new();
-        table.poll_direct_outbound(Timestamp::default(), &mut out, &mut rejected);
+        table.poll_direct_outbound_bounded(
+            Timestamp::default(),
+            OutputDrainBudget::new(usize::MAX, usize::MAX, usize::MAX),
+            &mut out,
+            &mut rejected,
+        );
         assert!(table.ready.is_empty());
         assert!(rejected.is_empty());
 
@@ -3022,7 +3575,12 @@ mod tests {
         // 3. Dequeue in poll_direct_outbound safely clears flag and skips direct processing
         let mut out = Vec::new();
         let mut rejected = Vec::new();
-        table.poll_direct_outbound(Timestamp::default(), &mut out, &mut rejected);
+        table.poll_direct_outbound_bounded(
+            Timestamp::default(),
+            OutputDrainBudget::new(usize::MAX, usize::MAX, usize::MAX),
+            &mut out,
+            &mut rejected,
+        );
         assert!(table.ready.is_empty());
         assert!(out.is_empty());
         assert!(rejected.is_empty());
@@ -3048,7 +3606,6 @@ mod tests {
         };
         let logical_peer = table.allocate_logical_peer(LogicalPeerTarget::Group(key.clone()));
         let mut leg = InboundGroupLeg {
-            member_id: 1,
             physical: PhysicalPeerKey {
                 address: "127.0.0.1:9100".parse().unwrap(),
                 local_socket_id: 1,
@@ -3064,13 +3621,18 @@ mod tests {
         );
         let mut legs = HashMap::new();
         legs.insert(1, leg);
+        let generation = table.allocate_group_generation();
         table.groups.insert(
-            key,
+            key.clone(),
             InboundGroup {
                 group,
                 legs,
+                leg_order: vec![1],
+                ready_legs: VecDeque::new(),
+                ready_legs_queued: HashSet::new(),
                 representative_peer: "127.0.0.1:9100".parse().unwrap(),
                 logical_peer,
+                generation,
                 connected: false,
                 stream_deadline: None,
                 ever_connected: false,
@@ -3083,6 +3645,7 @@ mod tests {
                 logical_payload_bytes_sent: 0,
             },
         );
+        table.sync_group_leg_deadline(&key, 1);
     }
 
     /// T05: the true minimum across direct-peer and bonded-group

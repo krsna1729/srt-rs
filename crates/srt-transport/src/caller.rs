@@ -40,6 +40,7 @@ struct DeadlineEntry {
 #[derive(Debug, Clone, Copy)]
 struct SchedEntry {
     ready_queued: bool,
+    event_ready_queued: bool,
     deadline_micros: Option<u64>,
 }
 /// Coarse logical state of an outbound stream, independent of how many
@@ -242,6 +243,33 @@ impl LogicalCallerMut<'_> {
         }
         self.table.sync_deadline(self.id);
         self.table.enqueue_ready(self.id);
+        // Without this, the `StateChanged(Closing)`/`Disconnected` events
+        // this produces sit in the connection's own internal queue
+        // forever: `poll_events_bounded` only ever visits ids in
+        // `event_ready_queue`, it does not scan the table, so a caller
+        // this close started must be marked event-ready explicitly, the
+        // same as `enqueue_ready` already does for its output.
+        self.table.enqueue_event_ready(self.id);
+    }
+
+    /// Provide a new session encryption key to the logical caller. Direct
+    /// callers forward this to their connection; bonded callers refresh every
+    /// physical leg so the logical stream keeps one key across its paths.
+    pub fn provide_new_sek(
+        &mut self,
+        new_sek: &[u8],
+        now: Timestamp,
+    ) -> Result<(), shiguredo_srt::Error> {
+        let session = self.table.sessions.get_mut(&self.id).ok_or_else(|| {
+            shiguredo_srt::Error::with_reason(
+                shiguredo_srt::ErrorKind::InvalidState,
+                "logical caller no longer exists",
+            )
+        })?;
+        let result = session.provide_new_sek(new_sek, now);
+        self.table.sync_deadline(self.id);
+        self.table.enqueue_ready(self.id);
+        result
     }
 }
 
@@ -256,6 +284,7 @@ pub struct CallerTable {
     sessions: HashMap<LogicalCallerId, CallerSession>,
     routes: HashMap<u32, CallerRoute>,
     ready_queue: VecDeque<LogicalCallerId>,
+    event_ready_queue: VecDeque<LogicalCallerId>,
     deadlines: BTreeSet<DeadlineEntry>,
     sched: HashMap<LogicalCallerId, SchedEntry>,
     next_logical_caller: u64,
@@ -268,8 +297,14 @@ pub struct CallerTable {
 pub struct SchedCounters {
     /// Due callers whose expired timers were fired.
     pub due_callers_visited: usize,
-    /// Ready drain probes / calls to `drain_one()`.
+    /// Ready queue entries visited, including stale and empty entries.
     pub ready_drain_probes: usize,
+    /// Stale ready queue entries discarded during bounded visits.
+    pub ready_stale_visits: usize,
+    /// Live callers whose drain visit found no output.
+    pub ready_empty_visits: usize,
+    /// Live bonded callers visited by the output scheduler.
+    pub ready_group_visits: usize,
     /// Output budget exhaustion events.
     pub budget_exhausted: usize,
 }
@@ -423,6 +458,32 @@ impl CallerSession {
         }
     }
 
+    fn provide_new_sek(
+        &mut self,
+        new_sek: &[u8],
+        now: Timestamp,
+    ) -> Result<(), shiguredo_srt::Error> {
+        match self {
+            Self::Direct(leg) => leg.connection.provide_new_sek(new_sek, now),
+            Self::Group(group) => {
+                let mut first_error = None;
+                for member_id in &group.leg_order {
+                    let connection = group
+                        .group
+                        .member_mut(*member_id)
+                        .expect("group and caller legs are built together")
+                        .connection_mut();
+                    if let Err(error) = connection.provide_new_sek(new_sek, now)
+                        && first_error.is_none()
+                    {
+                        first_error = Some(error);
+                    }
+                }
+                first_error.map_or(Ok(()), Err)
+            }
+        }
+    }
+
     fn fire_timers(&mut self, now: Timestamp) {
         match self {
             Self::Direct(leg) => leg.timers.fire_expired(now, &mut leg.connection),
@@ -487,6 +548,32 @@ enum DrainOne {
     Blocked,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadyVisit {
+    Empty,
+    Stale,
+    Live(LogicalCallerId),
+}
+
+/// Outcome of servicing a single [`ReadyVisit::Live`] entry in
+/// [`CallerTable::drain_ready_bounded`], used to decide whether the outer
+/// loop should keep visiting, stop because the budget ran out, or stop
+/// because the next item didn't fit (see the `blocked_on_next_item` note
+/// on `drain_ready_bounded`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadyVisitOutcome {
+    Continue,
+    BudgetExhausted,
+    Blocked,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EventReadyVisit {
+    Empty,
+    Stale,
+    Live(LogicalCallerId),
+}
+
 fn logical_state(connection: &SrtConnection) -> LogicalCallerState {
     match connection.state() {
         shiguredo_srt::ConnectionState::Connected => LogicalCallerState::Connected,
@@ -505,6 +592,7 @@ impl CallerTable {
             sessions: HashMap::new(),
             routes: HashMap::new(),
             ready_queue: VecDeque::new(),
+            event_ready_queue: VecDeque::new(),
             deadlines: BTreeSet::new(),
             sched: HashMap::new(),
             next_logical_caller: 1,
@@ -532,6 +620,7 @@ impl CallerTable {
             .map(|ts| ts.as_micros());
         let entry = self.sched.entry(id).or_insert(SchedEntry {
             ready_queued: false,
+            event_ready_queued: false,
             deadline_micros: None,
         });
         let old_micros = entry.deadline_micros;
@@ -556,6 +645,7 @@ impl CallerTable {
     fn enqueue_ready(&mut self, id: LogicalCallerId) {
         let entry = self.sched.entry(id).or_insert(SchedEntry {
             ready_queued: false,
+            event_ready_queued: false,
             deadline_micros: None,
         });
         if entry.ready_queued {
@@ -565,27 +655,83 @@ impl CallerTable {
         self.ready_queue.push_back(id);
     }
 
-    fn pop_ready(&mut self) -> Option<LogicalCallerId> {
-        while let Some(id) = self.ready_queue.pop_front() {
-            let Some(meta) = self.sched.get_mut(&id) else {
-                continue;
-            };
-            if !meta.ready_queued {
-                continue;
-            }
-            if !self.sessions.contains_key(&id) {
-                meta.ready_queued = false;
-                continue;
-            }
-            meta.ready_queued = false;
-            return Some(id);
+    fn enqueue_event_ready(&mut self, id: LogicalCallerId) {
+        let entry = self.sched.entry(id).or_insert(SchedEntry {
+            ready_queued: false,
+            event_ready_queued: false,
+            deadline_micros: None,
+        });
+        if entry.event_ready_queued {
+            return;
         }
-        None
+        entry.event_ready_queued = true;
+        self.event_ready_queue.push_back(id);
+    }
+
+    fn pop_event_ready_visit(&mut self) -> EventReadyVisit {
+        let Some(id) = self.event_ready_queue.pop_front() else {
+            return EventReadyVisit::Empty;
+        };
+        let Some(meta) = self.sched.get_mut(&id) else {
+            return EventReadyVisit::Stale;
+        };
+        if !meta.event_ready_queued {
+            return EventReadyVisit::Stale;
+        }
+        meta.event_ready_queued = false;
+        if !self.sessions.contains_key(&id) {
+            return EventReadyVisit::Stale;
+        }
+        EventReadyVisit::Live(id)
+    }
+
+    fn pop_ready(&mut self) -> Option<LogicalCallerId> {
+        loop {
+            match self.pop_ready_visit() {
+                ReadyVisit::Live(id) => return Some(id),
+                ReadyVisit::Stale => continue,
+                ReadyVisit::Empty => return None,
+            }
+        }
+    }
+
+    fn pop_ready_visit(&mut self) -> ReadyVisit {
+        let Some(id) = self.ready_queue.pop_front() else {
+            return ReadyVisit::Empty;
+        };
+        let Some(meta) = self.sched.get_mut(&id) else {
+            return ReadyVisit::Stale;
+        };
+        if !meta.ready_queued {
+            return ReadyVisit::Stale;
+        }
+        meta.ready_queued = false;
+        if !self.sessions.contains_key(&id) {
+            return ReadyVisit::Stale;
+        }
+        ReadyVisit::Live(id)
     }
 
     fn maybe_compact_ready_queue(&mut self) {
         if self.ready_queue.len() > 64 && self.ready_queue.len() > self.sessions.len() * 4 {
-            self.ready_queue.retain(|id| self.sessions.contains_key(id));
+            self.ready_queue.retain(|id| {
+                self.sessions.contains_key(id)
+                    && self.sched.get(id).is_some_and(|meta| meta.ready_queued)
+            });
+        }
+    }
+
+    fn maybe_compact_event_ready_queue(&mut self) {
+        if self.event_ready_queue.len() > 64
+            && self.event_ready_queue.len() > self.sessions.len() * 4
+        {
+            self.event_ready_queue.retain(|id| {
+                self.sessions.contains_key(id)
+                    && self
+                        .sched
+                        .get(id)
+                        .is_some_and(|meta| meta.event_ready_queued)
+            });
         }
     }
 
@@ -609,6 +755,11 @@ impl CallerTable {
         self.ready_queue.len()
     }
 
+    #[cfg(any(test, feature = "bench-internals"))]
+    pub fn event_ready_queue_len(&self) -> usize {
+        self.event_ready_queue.len()
+    }
+
     /// Add one direct caller. Its non-zero SRT Socket ID must be unique among
     /// all physical legs in this shared UDP socket.
     pub fn add_direct(&mut self, leg: CallerLeg) -> Result<LogicalCallerId, shiguredo_srt::Error> {
@@ -628,11 +779,13 @@ impl CallerTable {
             id,
             SchedEntry {
                 ready_queued: false,
+                event_ready_queued: false,
                 deadline_micros: None,
             },
         );
         self.sync_deadline(id);
         self.enqueue_ready(id);
+        self.enqueue_event_ready(id);
         Ok(id)
     }
 
@@ -709,6 +862,7 @@ impl CallerTable {
             id,
             SchedEntry {
                 ready_queued: false,
+                event_ready_queued: false,
                 deadline_micros: None,
             },
         );
@@ -786,6 +940,7 @@ impl CallerTable {
         };
         self.sync_deadline(target_id);
         self.enqueue_ready(target_id);
+        self.enqueue_event_ready(target_id);
         feed_res.map(|()| true)
     }
 
@@ -835,6 +990,7 @@ impl CallerTable {
                 }
             }
             self.enqueue_ready(id);
+            self.enqueue_event_ready(id);
             self.sync_deadline(id);
         }
     }
@@ -874,7 +1030,12 @@ impl CallerTable {
                 DrainOne::Drained | DrainOne::Blocked => {
                     self.enqueue_ready(id);
                 }
-                DrainOne::Empty => {}
+                DrainOne::Empty => {
+                    #[cfg(any(test, feature = "bench-internals"))]
+                    {
+                        self.sched_stats.ready_empty_visits += 1;
+                    }
+                }
             }
         }
     }
@@ -890,11 +1051,16 @@ impl CallerTable {
         out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
     ) -> OutputDrainReport {
         out.clear();
-        let budget = OutputDrainBudget::new(
-            budget.max_actions.max(1),
-            budget.max_packets.max(1),
-            budget.max_bytes.max(1),
-        );
+        if budget.max_actions == 0 {
+            return OutputDrainReport {
+                status: if self.has_pending_output(now) {
+                    OutputDrainStatus::BudgetExhausted
+                } else {
+                    OutputDrainStatus::Drained
+                },
+                ..OutputDrainReport::default()
+            };
+        }
         // P02: cap how many due sessions get their timers fired this visit
         // too, not just how much ready-queue output gets drained -- an
         // unconditional "fire every due session first" made this
@@ -935,64 +1101,98 @@ impl CallerTable {
         // yet real work was pushed back to `pending` and is not drained
         // (T03).
         let mut blocked_on_next_item = false;
-        while sink.report.actions < sink.budget.max_actions {
-            let Some(id) = self.pop_ready() else {
-                break;
-            };
-            let (drain_result, timers_touched) = {
-                let Some(session) = self.sessions.get_mut(&id) else {
-                    continue;
-                };
-                #[cfg(any(test, feature = "bench-internals"))]
-                {
-                    self.sched_stats.ready_drain_probes += 1;
-                }
-                session.drain_one(now, &mut sink)
-            };
-            if timers_touched {
-                self.sync_deadline(id);
-            }
-            match drain_result {
-                DrainOne::Drained => {
-                    if sink.report.actions >= sink.budget.max_actions
-                        || sink.report.packets >= sink.budget.max_packets
-                    {
-                        self.enqueue_ready(id);
-                        #[cfg(any(test, feature = "bench-internals"))]
-                        {
-                            self.sched_stats.budget_exhausted += 1;
-                        }
-                        break;
-                    }
-                    self.enqueue_ready(id);
-                }
-                DrainOne::Empty => {}
-                DrainOne::Blocked => {
-                    self.enqueue_ready(id);
-                    blocked_on_next_item = true;
+        let mut visits = 0;
+        while visits < sink.budget.max_actions {
+            let visit = self.pop_ready_visit();
+            let ReadyVisit::Live(id) = visit else {
+                if matches!(visit, ReadyVisit::Stale) {
+                    visits += 1;
                     #[cfg(any(test, feature = "bench-internals"))]
                     {
-                        self.sched_stats.budget_exhausted += 1;
+                        self.sched_stats.ready_drain_probes += 1;
+                        self.sched_stats.ready_stale_visits += 1;
                     }
+                    continue;
+                }
+                break;
+            };
+            visits += 1;
+            match self.drain_one_ready_visit(id, now, &mut sink) {
+                ReadyVisitOutcome::Continue => {}
+                ReadyVisitOutcome::BudgetExhausted => break,
+                ReadyVisitOutcome::Blocked => {
+                    blocked_on_next_item = true;
                     break;
                 }
             }
-            if sink.report.packets >= sink.budget.max_packets {
-                #[cfg(any(test, feature = "bench-internals"))]
-                {
-                    self.sched_stats.budget_exhausted += 1;
-                }
-                break;
-            }
         }
         if blocked_on_next_item
+            || !self.ready_queue.is_empty()
             || report.actions >= budget.max_actions
-            || report.packets >= budget.max_packets
-            || report.bytes >= budget.max_bytes
+            || (budget.max_packets > 0 && report.packets >= budget.max_packets)
+            || (budget.max_bytes > 0 && report.bytes >= budget.max_bytes)
         {
             report.status = OutputDrainStatus::BudgetExhausted;
         }
         report
+    }
+
+    /// Service one ready-queue visit -- split out of
+    /// [`Self::drain_ready_bounded`]'s own loop body to keep it a plain
+    /// "pop, service, repeat" dispatcher.
+    fn drain_one_ready_visit(
+        &mut self,
+        id: LogicalCallerId,
+        now: Timestamp,
+        sink: &mut DrainSink<'_>,
+    ) -> ReadyVisitOutcome {
+        let (drain_result, timers_touched) = {
+            let Some(session) = self.sessions.get_mut(&id) else {
+                return ReadyVisitOutcome::Continue;
+            };
+            session.drain_one(now, sink)
+        };
+        #[cfg(any(test, feature = "bench-internals"))]
+        {
+            self.sched_stats.ready_drain_probes += 1;
+            if matches!(self.sessions.get(&id), Some(CallerSession::Group(_))) {
+                self.sched_stats.ready_group_visits += 1;
+            }
+        }
+        if timers_touched {
+            self.sync_deadline(id);
+        }
+        match drain_result {
+            DrainOne::Drained => {
+                self.enqueue_ready(id);
+                if sink.report.actions >= sink.budget.max_actions
+                    || sink.report.packets >= sink.budget.max_packets
+                {
+                    #[cfg(any(test, feature = "bench-internals"))]
+                    {
+                        self.sched_stats.budget_exhausted += 1;
+                    }
+                    return ReadyVisitOutcome::BudgetExhausted;
+                }
+            }
+            DrainOne::Empty => {}
+            DrainOne::Blocked => {
+                self.enqueue_ready(id);
+                #[cfg(any(test, feature = "bench-internals"))]
+                {
+                    self.sched_stats.budget_exhausted += 1;
+                }
+                return ReadyVisitOutcome::Blocked;
+            }
+        }
+        if sink.report.packets >= sink.budget.max_packets {
+            #[cfg(any(test, feature = "bench-internals"))]
+            {
+                self.sched_stats.budget_exhausted += 1;
+            }
+            return ReadyVisitOutcome::BudgetExhausted;
+        }
+        ReadyVisitOutcome::Continue
     }
 
     /// Atomically retire a direct caller or every leg of a bonded caller.
@@ -1013,6 +1213,7 @@ impl CallerTable {
             });
         }
         self.maybe_compact_ready_queue();
+        self.maybe_compact_event_ready_queue();
         Some(match session {
             CallerSession::Direct(leg) => {
                 RemovedLogicalCaller::Direct(Box::new(RemovedCallerLeg {
@@ -1060,26 +1261,77 @@ impl CallerTable {
     }
 
     /// Drain protocol events for every direct logical caller -- the
-    /// caller-side counterpart to [`crate::PeerTable::poll_events`], and
-    /// the piece that was missing (A05): this crate's direct-caller path
-    /// had `feed`/`poll_outbound(_bounded)` to send and receive protocol
-    /// packets, but nothing ever drained `SrtConnection::poll_event`, so
-    /// there was no way for an application to learn a direct caller
-    /// connected, received data, or disconnected. Bonded group callers are
-    /// out of scope here, same as elsewhere in this crate's event surface
-    /// (`crate::AdmissionEvent` doesn't cover every group transition
-    /// either); a caller-side group event drain is a follow-up, not yet a
-    /// numbered card.
+    /// caller-side counterpart to [`crate::PeerTable::poll_events`]. The
+    /// event-ready queue is populated by packet, timer, and lifecycle paths,
+    /// so an idle table does not require a population scan.
     pub fn poll_events(&mut self, out: &mut Vec<CallerEvent>) {
+        let _ = self.poll_events_bounded(usize::MAX, out);
+    }
+
+    /// Drain at most `max_events` direct caller events. Returns `true` when
+    /// another event-ready caller remains queued. A zero limit is a useful
+    /// probe and consumes nothing.
+    pub fn poll_events_bounded(&mut self, max_events: usize, out: &mut Vec<CallerEvent>) -> bool {
         out.clear();
-        for (&id, session) in &mut self.sessions {
-            let CallerSession::Direct(leg) = session else {
-                continue;
+        if max_events == 0 {
+            return self.has_pending_events();
+        }
+        let mut visits = 0;
+        while visits < max_events && out.len() < max_events {
+            let visit = self.pop_event_ready_visit();
+            let EventReadyVisit::Live(id) = visit else {
+                if matches!(visit, EventReadyVisit::Stale) {
+                    visits += 1;
+                    continue;
+                }
+                break;
             };
-            while let Some(event) = leg.connection.poll_event() {
-                out.push(CallerEvent { id, event });
+            visits += 1;
+            let filled = {
+                let Some(CallerSession::Direct(leg)) = self.sessions.get_mut(&id) else {
+                    continue;
+                };
+                while out.len() < max_events {
+                    let Some(event) = leg.connection.poll_event() else {
+                        break;
+                    };
+                    out.push(CallerEvent { id, event });
+                }
+                out.len() == max_events
+            };
+            // There is no protocol-side event-count accessor. If this visit
+            // filled the caller-facing budget, leave a deduplicated marker so
+            // the next call probes it; an exact fill with no remaining event
+            // is cleared by that next cheap probe.
+            if filled {
+                self.enqueue_event_ready(id);
+                break;
             }
         }
+        self.has_pending_events()
+    }
+
+    /// Whether any event-ready queue entry remains. A stale entry is still
+    /// pending bounded maintenance and is removed by the next poll.
+    #[must_use]
+    pub fn has_pending_events(&self) -> bool {
+        !self.event_ready_queue.is_empty()
+    }
+
+    /// Whether output or a due timer can be serviced at `now`.
+    #[must_use]
+    pub fn has_pending_output(&self, now: Timestamp) -> bool {
+        !self.ready_queue.is_empty()
+            || self
+                .deadlines
+                .first()
+                .is_some_and(|entry| entry.deadline_micros <= now.as_micros())
+    }
+
+    /// Whether this table has any bounded work to drive at `now`.
+    #[must_use]
+    pub fn has_pending_work(&self, now: Timestamp) -> bool {
+        self.has_pending_output(now) || self.has_pending_events()
     }
 
     pub fn logical_caller_mut(&mut self, id: &LogicalCallerId) -> Option<LogicalCallerMut<'_>> {
@@ -2568,7 +2820,27 @@ mod tests {
             ),
             Admit::Fed
         );
-        assert_eq!(table.len(), 1);
+        // `admit` now bounds its own half-open pruning to one entry per
+        // call (finding 3/10, keeping packet admission itself bounded
+        // rather than turning one receive into a table-wide sweep) --
+        // both peers[0] and peers[1] are overdue at this point, so this
+        // first admit only retires one of them.
+        assert_eq!(table.len(), 2);
+        assert_eq!(telemetry.expired_half_open.load(Ordering::Relaxed), 1);
+
+        // A second admission call's own bounded prune drains the
+        // remaining overdue half-open entry.
+        let peer_four = "127.0.0.1:10003".parse().expect("address");
+        let _ = table.admit(
+            peer_four,
+            &induction(4),
+            Timestamp::from_micros(102),
+            &options,
+            0,
+            1,
+            &telemetry,
+        );
+        assert_eq!(table.len(), 2);
         assert_eq!(telemetry.expired_half_open.load(Ordering::Relaxed), 2);
     }
 

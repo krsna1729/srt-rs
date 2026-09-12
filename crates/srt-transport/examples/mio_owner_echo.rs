@@ -29,6 +29,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // example's whole point: `Owner` drives exactly one listener socket.
     let listener_config = ListenerConfig::builder("127.0.0.1:0".parse()?)
         .topology(ListenerTopology::PerPort)
+        .configure_transport(|transport| {
+            transport.promotion = srt_transport::PromotionPolicy::Never
+        })
         .build()?;
     owner.listen(&listener_config)?;
     let listen_addr = owner.listener_local_addr().expect("just bound above");
@@ -47,14 +50,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let caller_config = CallerConfig::builder(listen_addr)
         .ownership(SocketOwnership::Shared)
         .build()?;
-    // `Owner`'s caller pool policy defaults to effectively unbounded (A04),
-    // so `connect()` always admits immediately unless the application opts
-    // into real max_in_flight/attempt_deadline enforcement via
-    // `set_caller_pool_policy` before its first `connect()` call.
+    // The default allows one concurrent attempt; this first request fits.
     let srt_transport::PoolOutcome::Admitted(caller_id) =
         owner.connect(&caller_config, now_ts(start))?
     else {
-        unreachable!("default pool policy is unbounded, so connect() must admit immediately")
+        unreachable!("the first caller fits the pool limit")
     };
 
     // Drive both sides until the listener admits the caller AND the caller

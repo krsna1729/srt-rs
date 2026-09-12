@@ -245,11 +245,22 @@ pub fn drain_recv_fd(
     mut on_datagram: impl FnMut(Option<SocketAddr>, &[u8]),
 ) -> io::Result<RecvDrainReport> {
     let mut report = RecvDrainReport::default();
+    // Preserve the low-level pause contract of a zero budget. In particular,
+    // do not turn a zero datagram limit into a zero-length probe that reports
+    // `WouldBlock`; no receive work happened at all.
+    if budget.max_rounds == 0 || budget.max_datagrams == 0 {
+        return Ok(report);
+    }
+    // `report.datagrams` intentionally counts only complete datagrams fed to
+    // the protocol. Keep a separate dequeue count so a queue full of
+    // truncated packets cannot make one wake consume unbounded kernel work
+    // while the visible datagram count stays at zero.
+    let mut dequeued = 0usize;
     for _ in 0..budget.max_rounds {
-        if report.datagrams >= budget.max_datagrams {
+        if dequeued >= budget.max_datagrams {
             break;
         }
-        let requested = (budget.max_datagrams - report.datagrams).min(batch.capacity());
+        let requested = (budget.max_datagrams - dequeued).min(batch.capacity());
         let received = batch.recv(fd, requested)?;
         if received == 0 {
             report.would_block = true;
@@ -257,6 +268,7 @@ pub fn drain_recv_fd(
         }
         report.syscalls += 1;
         for (addr, data, truncated) in batch.iter(received) {
+            dequeued += 1;
             if truncated {
                 report.truncated += 1;
                 continue;
@@ -723,6 +735,44 @@ mod tests {
         )
         .expect("real drain");
         assert_eq!(got, vec![b"queued".to_vec()]);
+    }
+
+    #[test]
+    fn truncated_dequeues_consume_the_receive_budget_without_feeding_protocol() {
+        use std::os::fd::AsRawFd;
+        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").expect("receiver");
+        receiver.set_nonblocking(true).expect("nonblocking");
+        let dest = receiver.local_addr().expect("addr");
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("sender");
+        sender
+            .send_to(&vec![0xA5; RecvBatch::DEFAULT_BUF_LEN + 1], dest)
+            .expect("oversized datagram");
+        sender
+            .send_to(b"complete", dest)
+            .expect("complete datagram");
+
+        let mut batch = RecvBatch::new();
+        let mut delivered = Vec::new();
+        let first = drain_recv_fd(
+            receiver.as_raw_fd(),
+            &mut batch,
+            RecvBudget::new(1, 1),
+            |_, data| delivered.push(data.to_vec()),
+        )
+        .expect("truncated drain");
+        assert_eq!(first.datagrams, 0);
+        assert_eq!(first.truncated, 1);
+        assert!(delivered.is_empty());
+
+        let second = drain_recv_fd(
+            receiver.as_raw_fd(),
+            &mut batch,
+            RecvBudget::new(1, 1),
+            |_, data| delivered.push(data.to_vec()),
+        )
+        .expect("remaining drain");
+        assert_eq!(second.datagrams, 1);
+        assert_eq!(delivered, vec![b"complete".to_vec()]);
     }
 
     #[test]
