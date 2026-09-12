@@ -1427,12 +1427,62 @@ impl ReceiverBuffer {
         Timestamp::from_micros(base_and_delay.saturating_add_signed(self.drift_tracer.drift_us()))
     }
 
+    /// The connection-clock-domain moment the sender originally queued this
+    /// packet (F01): `packet_base_time` plus the same sender/receiver
+    /// clock-drift correction `delivery_time` applies, but WITHOUT TSBPD's
+    /// deliberate release delay (`tsbpd_delay_us`) -- that delay is a
+    /// buffering policy, not part of the clock-domain conversion this is
+    /// for. This keeps the identity `delivery_time == source_time +
+    /// tsbpd_delay_us` exactly, and keeps `age()` accurate to within the
+    /// receiver's own RTT-sample jitter rather than a further constant
+    /// bias of up to `TSBPD_DRIFT_MAX_US`. When TSBPD is disabled there is
+    /// no established time base to convert against, so this falls back to
+    /// `recv_time`, mirroring `delivery_time`'s own fallback.
+    fn source_time(&self, entry: &ReceivedPacket) -> Timestamp {
+        if !self.tsbpd_enabled {
+            return entry.recv_time;
+        }
+        Timestamp::from_micros(
+            self.packet_base_time(entry.timestamp)
+                .saturating_add_signed(self.drift_tracer.drift_us()),
+        )
+    }
+
     /// Get a deliverable packet (TSBPD).
     pub fn pop_ready(&mut self, now: Timestamp) -> Option<DataPacket> {
+        self.pop_ready_with_source_time(now)
+            .map(|(packet, _)| packet)
+    }
+
+    /// Like [`Self::pop_ready`], additionally returning the packet's source
+    /// time (F01) -- when the sender originally queued it (clock-drift
+    /// corrected, same as `delivery_time`), not when it arrived
+    /// (`recv_time`) or when TSBPD released it (`delivery_time`, which
+    /// adds only the deliberate buffering delay on top of this same base:
+    /// `delivery_time == source_time + tsbpd_delay_us`). A separate method
+    /// (not a new struct field stashing the last value) so
+    /// `ReceiverBuffer`'s inline footprint, checked by
+    /// `receiver_buffer_inline_footprint_stays_bounded`, does not grow for
+    /// callers that don't need this.
+    pub fn pop_ready_with_source_time(
+        &mut self,
+        now: Timestamp,
+    ) -> Option<(DataPacket, Timestamp)> {
         // Find a deliverable sequence number.
         let delivery_seq = self.find_deliverable_seq(now)?;
 
         let entry = self.remove_retained_packet(delivery_seq)?;
+
+        // Computed before the wraparound-period mutation below purely as
+        // documentation of intent (this entry's source time logically
+        // belongs to "before" the mutation the entry itself triggers), not
+        // because the two orderings actually differ: the mutation folds
+        // exactly the `MAX_TIMESTAMP + 1` the pre-mutation branch of
+        // `packet_base_time` would otherwise add on the fly into the base
+        // itself, so for the one packet that triggers it (and every other
+        // packet, which the mutation never touches) `source_time` is
+        // provably identical whichever side of the mutation it's read on.
+        let source_time = self.source_time(&entry);
 
         // Detect the end of the TSBPD wraparound period.
         // Per spec (draft-sharabayko-srt.md, #tsbpd-time-base section):
@@ -1447,17 +1497,20 @@ impl ReceiverBuffer {
             }
         }
 
-        Some(DataPacket {
-            sequence_number: delivery_seq,
-            position: entry.position,
-            order_flag: entry.order_flag,
-            encryption_flag: 0,
-            retransmitted: false,
-            message_number: entry.message_number,
-            timestamp: entry.timestamp,
-            dest_socket_id: 0,
-            payload: entry.payload,
-        })
+        Some((
+            DataPacket {
+                sequence_number: delivery_seq,
+                position: entry.position,
+                order_flag: entry.order_flag,
+                encryption_flag: 0,
+                retransmitted: false,
+                message_number: entry.message_number,
+                timestamp: entry.timestamp,
+                dest_socket_id: 0,
+                payload: entry.payload,
+            },
+            source_time,
+        ))
     }
 
     /// Find the deliverable sequence number.
@@ -3732,6 +3785,53 @@ mod tests {
         assert!(
             !buf.wrapping_period_active,
             "終了判定が発火し wrapping_period_active が false になるはず"
+        );
+    }
+
+    /// F01: `source_time` must apply the wrap correction for a packet
+    /// popped from within the wraparound window, and for the specific
+    /// packet that closes that window out (mutating
+    /// `tsbpd_time_base`/`wrapping_period_active` as a side effect of
+    /// `pop_ready`) -- proving the formula doesn't silently drop the
+    /// correction for either. It does NOT distinguish reading `source_time`
+    /// before vs. after that mutation: the two are provably identical (see
+    /// `pop_ready_with_source_time`'s own comment), so no test could
+    /// meaningfully assert an ordering dependency here. Also checks source
+    /// time never appears to regress across the boundary.
+    #[test]
+    fn source_time_across_the_wrap_boundary_is_monotonic_not_reset() {
+        let start = Timestamp::from_micros(0);
+        let mut buf = ReceiverBuffer::new(1000, 120, start, 0);
+
+        let wrap_start_ts = WRAPPING_PERIOD_START as u32;
+        let now = Timestamp::from_micros(1_000_000);
+        buf.receive(make_packet(1000, wrap_start_ts), now);
+        assert!(buf.wrapping_period_active);
+
+        let end_ts: u32 = 40_000_000;
+        buf.receive(make_packet(1001, end_ts), now);
+
+        let late = Timestamp::from_micros(4_335_088_000);
+        let (pkt0, source_time_0) = buf
+            .pop_ready_with_source_time(late)
+            .expect("1000 is deliverable");
+        assert_eq!(pkt0.sequence_number, 1000);
+        assert_eq!(source_time_0, Timestamp::from_micros(WRAPPING_PERIOD_START));
+
+        let (pkt1, source_time_1) = buf
+            .pop_ready_with_source_time(late)
+            .expect("1001 is deliverable, closing out the wrap window");
+        assert_eq!(pkt1.sequence_number, 1001);
+        assert_eq!(
+            source_time_1,
+            Timestamp::from_micros(MAX_TIMESTAMP + 1 + u64::from(end_ts)),
+            "the boundary packet's own source time must include the wrap \
+             correction, not read as if it were still pre-wrap"
+        );
+        assert!(
+            source_time_1 > source_time_0,
+            "source time must keep advancing across the wrap boundary, \
+             never appear to jump backward: {source_time_0:?} -> {source_time_1:?}"
         );
     }
 

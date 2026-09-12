@@ -185,6 +185,13 @@ pub enum ConnectionEvent {
         sequence_number: u32,
         message_number: u32,
         timestamp: u32,
+        /// F01: when the sender originally queued this message (the first
+        /// fragment's, for a reassembled multi-packet message), converted
+        /// into this connection's own local clock domain -- distinct from
+        /// `timestamp` (the raw, still-wrapping wire value), from when it
+        /// arrived, and from when TSBPD released it. Comparable directly
+        /// against a `Timestamp` this same process reads via `now()`.
+        source_time: Timestamp,
         /// Number of SRT DATA packets represented by this reassembled message.
         packet_count: u32,
     },
@@ -1665,19 +1672,20 @@ impl SrtConnection {
         }
 
         for _ in 0..available {
-            let Some(packet) = self
+            let Some((packet, source_time)) = self
                 .receiver
                 .as_mut()
-                .and_then(|receiver| receiver.pop_ready(now))
+                .and_then(|receiver| receiver.pop_ready_with_source_time(now))
             else {
                 break;
             };
-            if let Some(msg) = self.assembler.feed(packet) {
+            if let Some(msg) = self.assembler.feed(packet, source_time) {
                 self.event_queue.push_back(ConnectionEvent::DataReceived {
                     payload: msg.payload,
                     sequence_number: msg.first_sequence_number,
                     message_number: msg.message_number,
                     timestamp: msg.timestamp,
+                    source_time: msg.source_time,
                     packet_count: msg.packet_count,
                 });
                 self.pending_data_events = self.pending_data_events.saturating_add(1);
@@ -4127,7 +4135,10 @@ mod tests {
         eprintln!("AssembledMessage inline footprint: {assembled_bytes} bytes");
         assert!(connection_bytes <= 1_536);
         assert!(event_bytes <= 64);
-        assert!(assembled_bytes <= 48);
+        // F01 added `source_time: Timestamp` (8 bytes) to preserve a
+        // message's original source time through reassembly -- a
+        // deliberate, one-time budget increase, not drift.
+        assert!(assembled_bytes <= 56);
     }
 
     #[test]

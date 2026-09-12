@@ -55,6 +55,10 @@ required-features = ["mio"]
 name = "tokio_facade_echo"
 required-features = ["tokio"]
 
+[[example]]
+name = "tokio_relay"
+required-features = ["tokio"]
+
 [[bench]]
 name = "admission_hardening"
 harness = false

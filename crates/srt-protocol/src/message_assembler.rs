@@ -1,3 +1,4 @@
+use crate::Timestamp;
 use crate::srt_packet::{DataPacket, PacketPosition, sequence_less_than};
 use bytes::Bytes;
 
@@ -5,6 +6,10 @@ pub(crate) struct AssembledMessage {
     pub payload: Bytes,
     pub message_number: u32,
     pub timestamp: u32,
+    /// F01: the first fragment's source time (see
+    /// `ReceiverBuffer::last_source_time`), carried through reassembly
+    /// unchanged -- the same way `timestamp` already is.
+    pub source_time: Timestamp,
     pub first_sequence_number: u32,
     pub packet_count: u32,
 }
@@ -15,6 +20,7 @@ struct PartialMessage {
     next_expected_seq: u32,
     fragments: Vec<Bytes>,
     timestamp: u32,
+    source_time: Timestamp,
 }
 
 pub(crate) struct MessageAssembler {
@@ -26,7 +32,11 @@ impl MessageAssembler {
         Self { pending: None }
     }
 
-    pub fn feed(&mut self, packet: DataPacket) -> Option<AssembledMessage> {
+    /// `source_time` is this specific packet's own source time (F01),
+    /// already resolved by the receiver at pop time -- only the value from
+    /// the `Single`/`First` fragment is ever retained; later fragments'
+    /// values are ignored, matching how `timestamp` is already handled.
+    pub fn feed(&mut self, packet: DataPacket, source_time: Timestamp) -> Option<AssembledMessage> {
         match packet.position {
             PacketPosition::Single => {
                 self.pending = None;
@@ -34,6 +44,7 @@ impl MessageAssembler {
                     first_sequence_number: packet.sequence_number,
                     message_number: packet.message_number,
                     timestamp: packet.timestamp,
+                    source_time,
                     payload: packet.payload,
                     packet_count: 1,
                 })
@@ -46,6 +57,7 @@ impl MessageAssembler {
                     next_expected_seq: next_seq,
                     fragments: vec![packet.payload],
                     timestamp: packet.timestamp,
+                    source_time,
                 });
                 None
             }
@@ -87,6 +99,7 @@ impl MessageAssembler {
                         payload: payload.into(),
                         message_number: partial.message_number,
                         timestamp: partial.timestamp,
+                        source_time: partial.source_time,
                         first_sequence_number: partial.first_sequence_number,
                         packet_count,
                     })
@@ -145,7 +158,9 @@ mod tests {
     fn single_packet_passes_through() {
         let mut asm = MessageAssembler::new();
         let pkt = data_packet(0, 0, PacketPosition::Single, vec![1, 2, 3]);
-        let msg = asm.feed(pkt).expect("Single should emit immediately");
+        let msg = asm
+            .feed(pkt, Timestamp::from_micros(0))
+            .expect("Single should emit immediately");
         assert_eq!(msg.payload, vec![1, 2, 3]);
         assert_eq!(msg.message_number, 0);
         assert_eq!(msg.first_sequence_number, 0);
@@ -156,11 +171,17 @@ mod tests {
     fn two_packet_message_reassembles() {
         let mut asm = MessageAssembler::new();
         assert!(
-            asm.feed(data_packet(10, 5, PacketPosition::First, vec![1, 2]))
-                .is_none()
+            asm.feed(
+                data_packet(10, 5, PacketPosition::First, vec![1, 2]),
+                Timestamp::from_micros(0)
+            )
+            .is_none()
         );
         let msg = asm
-            .feed(data_packet(11, 5, PacketPosition::Last, vec![3, 4]))
+            .feed(
+                data_packet(11, 5, PacketPosition::Last, vec![3, 4]),
+                Timestamp::from_micros(0),
+            )
             .expect("Last should complete the message");
         assert_eq!(msg.payload, vec![1, 2, 3, 4]);
         assert_eq!(msg.message_number, 5);
@@ -168,19 +189,56 @@ mod tests {
         assert_eq!(msg.packet_count, 2);
     }
 
+    /// F01: a reassembled multi-fragment message must report the FIRST
+    /// fragment's source time, not the last fragment's (which would
+    /// silently understate age by however long reassembly took) and not
+    /// the moment reassembly completed.
+    #[test]
+    fn multi_fragment_message_retains_the_first_fragments_source_time() {
+        let mut asm = MessageAssembler::new();
+        let first_source_time = Timestamp::from_micros(1_000_000);
+        let last_source_time = Timestamp::from_micros(9_000_000);
+        assert!(
+            asm.feed(
+                data_packet(10, 5, PacketPosition::First, vec![1, 2]),
+                first_source_time
+            )
+            .is_none()
+        );
+        let msg = asm
+            .feed(
+                data_packet(11, 5, PacketPosition::Last, vec![3, 4]),
+                last_source_time,
+            )
+            .expect("Last should complete the message");
+        assert_eq!(
+            msg.source_time, first_source_time,
+            "must retain the first fragment's source time, not the last fragment's"
+        );
+    }
+
     #[test]
     fn three_packet_message_reassembles() {
         let mut asm = MessageAssembler::new();
         assert!(
-            asm.feed(data_packet(0, 1, PacketPosition::First, vec![10]))
-                .is_none()
+            asm.feed(
+                data_packet(0, 1, PacketPosition::First, vec![10]),
+                Timestamp::from_micros(0)
+            )
+            .is_none()
         );
         assert!(
-            asm.feed(data_packet(1, 1, PacketPosition::Middle, vec![20]))
-                .is_none()
+            asm.feed(
+                data_packet(1, 1, PacketPosition::Middle, vec![20]),
+                Timestamp::from_micros(0)
+            )
+            .is_none()
         );
         let msg = asm
-            .feed(data_packet(2, 1, PacketPosition::Last, vec![30]))
+            .feed(
+                data_packet(2, 1, PacketPosition::Last, vec![30]),
+                Timestamp::from_micros(0),
+            )
             .expect("Last completes");
         assert_eq!(msg.payload, vec![10, 20, 30]);
         assert_eq!(msg.packet_count, 3);
@@ -190,16 +248,25 @@ mod tests {
     fn incomplete_message_dropped_on_new_first() {
         let mut asm = MessageAssembler::new();
         assert!(
-            asm.feed(data_packet(0, 1, PacketPosition::First, vec![1]))
-                .is_none()
+            asm.feed(
+                data_packet(0, 1, PacketPosition::First, vec![1]),
+                Timestamp::from_micros(0)
+            )
+            .is_none()
         );
         // New First for a different message drops the pending one.
         assert!(
-            asm.feed(data_packet(2, 2, PacketPosition::First, vec![10]))
-                .is_none()
+            asm.feed(
+                data_packet(2, 2, PacketPosition::First, vec![10]),
+                Timestamp::from_micros(0)
+            )
+            .is_none()
         );
         let msg = asm
-            .feed(data_packet(3, 2, PacketPosition::Last, vec![20]))
+            .feed(
+                data_packet(3, 2, PacketPosition::Last, vec![20]),
+                Timestamp::from_micros(0),
+            )
             .expect("second message completes");
         assert_eq!(msg.payload, vec![10, 20]);
         assert_eq!(msg.message_number, 2);
@@ -209,13 +276,19 @@ mod tests {
     fn gap_in_sequence_drops_partial() {
         let mut asm = MessageAssembler::new();
         assert!(
-            asm.feed(data_packet(0, 1, PacketPosition::First, vec![1]))
-                .is_none()
+            asm.feed(
+                data_packet(0, 1, PacketPosition::First, vec![1]),
+                Timestamp::from_micros(0)
+            )
+            .is_none()
         );
         // seq 1 is missing — seq 2 Middle doesn't match next_expected_seq.
         assert!(
-            asm.feed(data_packet(2, 1, PacketPosition::Middle, vec![3]))
-                .is_none()
+            asm.feed(
+                data_packet(2, 1, PacketPosition::Middle, vec![3]),
+                Timestamp::from_micros(0)
+            )
+            .is_none()
         );
         // Partial should be dropped.
         assert!(asm.pending.is_none());
@@ -225,8 +298,11 @@ mod tests {
     fn drop_message_purges_partial() {
         let mut asm = MessageAssembler::new();
         assert!(
-            asm.feed(data_packet(0, 7, PacketPosition::First, vec![1]))
-                .is_none()
+            asm.feed(
+                data_packet(0, 7, PacketPosition::First, vec![1]),
+                Timestamp::from_micros(0)
+            )
+            .is_none()
         );
         assert!(asm.pending.is_some());
         asm.drop_message(7);
@@ -237,8 +313,11 @@ mod tests {
     fn drop_message_ignores_different_number() {
         let mut asm = MessageAssembler::new();
         assert!(
-            asm.feed(data_packet(0, 7, PacketPosition::First, vec![1]))
-                .is_none()
+            asm.feed(
+                data_packet(0, 7, PacketPosition::First, vec![1]),
+                Timestamp::from_micros(0)
+            )
+            .is_none()
         );
         asm.drop_message(99);
         assert!(asm.pending.is_some());
@@ -248,8 +327,11 @@ mod tests {
     fn sequence_advance_discards_only_obsolete_partial_message() {
         let mut asm = MessageAssembler::new();
         assert!(
-            asm.feed(data_packet(0x7fff_fffe, 7, PacketPosition::First, vec![1]))
-                .is_none()
+            asm.feed(
+                data_packet(0x7fff_fffe, 7, PacketPosition::First, vec![1]),
+                Timestamp::from_micros(0)
+            )
+            .is_none()
         );
 
         asm.discard_before(0x7fff_fffe);
@@ -264,11 +346,17 @@ mod tests {
         let mut asm = MessageAssembler::new();
         let msg_num = 0x03FF_FFFF; // max 26-bit value
         assert!(
-            asm.feed(data_packet(0, msg_num, PacketPosition::First, vec![1]))
-                .is_none()
+            asm.feed(
+                data_packet(0, msg_num, PacketPosition::First, vec![1]),
+                Timestamp::from_micros(0)
+            )
+            .is_none()
         );
         let msg = asm
-            .feed(data_packet(1, msg_num, PacketPosition::Last, vec![2]))
+            .feed(
+                data_packet(1, msg_num, PacketPosition::Last, vec![2]),
+                Timestamp::from_micros(0),
+            )
             .expect("completes");
         assert_eq!(msg.message_number, msg_num);
         assert_eq!(msg.payload, vec![1, 2]);
@@ -278,11 +366,17 @@ mod tests {
     fn single_drops_pending_partial() {
         let mut asm = MessageAssembler::new();
         assert!(
-            asm.feed(data_packet(0, 1, PacketPosition::First, vec![1]))
-                .is_none()
+            asm.feed(
+                data_packet(0, 1, PacketPosition::First, vec![1]),
+                Timestamp::from_micros(0)
+            )
+            .is_none()
         );
         let msg = asm
-            .feed(data_packet(2, 2, PacketPosition::Single, vec![99]))
+            .feed(
+                data_packet(2, 2, PacketPosition::Single, vec![99]),
+                Timestamp::from_micros(0),
+            )
             .expect("Single emits");
         assert_eq!(msg.payload, vec![99]);
         assert!(asm.pending.is_none());
@@ -292,12 +386,18 @@ mod tests {
     fn wrong_message_number_on_middle_drops_partial() {
         let mut asm = MessageAssembler::new();
         assert!(
-            asm.feed(data_packet(0, 1, PacketPosition::First, vec![1]))
-                .is_none()
+            asm.feed(
+                data_packet(0, 1, PacketPosition::First, vec![1]),
+                Timestamp::from_micros(0)
+            )
+            .is_none()
         );
         assert!(
-            asm.feed(data_packet(1, 2, PacketPosition::Middle, vec![2]))
-                .is_none()
+            asm.feed(
+                data_packet(1, 2, PacketPosition::Middle, vec![2]),
+                Timestamp::from_micros(0)
+            )
+            .is_none()
         );
         assert!(asm.pending.is_none());
     }
@@ -307,17 +407,26 @@ mod tests {
         let mut asm = MessageAssembler::new();
         let max_seq = 0x7FFF_FFFE;
         assert!(
-            asm.feed(data_packet(max_seq, 1, PacketPosition::First, vec![1]))
-                .is_none()
+            asm.feed(
+                data_packet(max_seq, 1, PacketPosition::First, vec![1]),
+                Timestamp::from_micros(0)
+            )
+            .is_none()
         );
         // Next seq wraps to max_seq + 1 = 0x7FFF_FFFF
         assert!(
-            asm.feed(data_packet(0x7FFF_FFFF, 1, PacketPosition::Middle, vec![2]))
-                .is_none()
+            asm.feed(
+                data_packet(0x7FFF_FFFF, 1, PacketPosition::Middle, vec![2]),
+                Timestamp::from_micros(0)
+            )
+            .is_none()
         );
         // Next wraps to 0
         let msg = asm
-            .feed(data_packet(0, 1, PacketPosition::Last, vec![3]))
+            .feed(
+                data_packet(0, 1, PacketPosition::Last, vec![3]),
+                Timestamp::from_micros(0),
+            )
             .expect("completes across wrap");
         assert_eq!(msg.payload, vec![1, 2, 3]);
         assert_eq!(msg.first_sequence_number, max_seq);

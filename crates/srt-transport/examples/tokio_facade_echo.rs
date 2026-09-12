@@ -49,11 +49,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let received = tokio::time::timeout(deadline, listener_session.recv())
         .await?
         .expect("the payload arrives before the session closes");
-    assert_eq!(received.as_ref(), message);
+    assert_eq!(received.payload.as_ref(), message);
     println!(
-        "listener received {} bytes verbatim: {:?}",
-        received.len(),
-        String::from_utf8_lossy(&received)
+        "listener received {} bytes verbatim: {:?} ({:?} old -- see the tokio_relay \
+         example for preserving this age across a forwarding hop)",
+        received.payload.len(),
+        String::from_utf8_lossy(&received.payload),
+        received.age(facade.now()),
     );
 
     // Orderly close: the caller disconnects; the listener's session
