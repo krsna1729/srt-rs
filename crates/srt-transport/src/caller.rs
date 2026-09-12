@@ -9,6 +9,16 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LogicalCallerId(u64);
 
+/// One logical event emitted by a direct caller (A05). The caller-side
+/// counterpart to [`crate::AdmissionEvent`] -- no `representative_peer`
+/// field, since a caller's own configured remote address is already known
+/// to whoever holds its [`LogicalCallerId`].
+#[derive(Debug, Clone)]
+pub struct CallerEvent {
+    pub id: LogicalCallerId,
+    pub event: shiguredo_srt::ConnectionEvent,
+}
+
 /// Exact ordered deadline index for CallerTable.
 ///
 /// Design choice: Unlike PeerTable's physical peers indexed by dense socket-ID
@@ -1049,6 +1059,29 @@ impl CallerTable {
         }
     }
 
+    /// Drain protocol events for every direct logical caller -- the
+    /// caller-side counterpart to [`crate::PeerTable::poll_events`], and
+    /// the piece that was missing (A05): this crate's direct-caller path
+    /// had `feed`/`poll_outbound(_bounded)` to send and receive protocol
+    /// packets, but nothing ever drained `SrtConnection::poll_event`, so
+    /// there was no way for an application to learn a direct caller
+    /// connected, received data, or disconnected. Bonded group callers are
+    /// out of scope here, same as elsewhere in this crate's event surface
+    /// (`crate::AdmissionEvent` doesn't cover every group transition
+    /// either); a caller-side group event drain is a follow-up, not yet a
+    /// numbered card.
+    pub fn poll_events(&mut self, out: &mut Vec<CallerEvent>) {
+        out.clear();
+        for (&id, session) in &mut self.sessions {
+            let CallerSession::Direct(leg) = session else {
+                continue;
+            };
+            while let Some(event) = leg.connection.poll_event() {
+                out.push(CallerEvent { id, event });
+            }
+        }
+    }
+
     pub fn logical_caller_mut(&mut self, id: &LogicalCallerId) -> Option<LogicalCallerMut<'_>> {
         self.logical_caller(id)?;
         Some(LogicalCallerMut {
@@ -1977,6 +2010,148 @@ mod tests {
         assert!(listeners.is_empty());
         assert_eq!(listeners.established_count(), 0);
         assert_eq!(listeners.half_open_count(), 0);
+    }
+
+    /// A05: `CallerTable::poll_events` must surface a direct caller's
+    /// `Connected`, `DataReceived`, and `Disconnected` transitions -- the
+    /// gap this crate had left open since A03 first noted "CallerTable has
+    /// no poll_events anywhere," now closed because the Tokio facade's
+    /// receive-message method genuinely needs it.
+    #[test]
+    fn poll_events_surfaces_a_direct_callers_full_lifecycle() {
+        let peer = "127.0.0.1:11020".parse().expect("address");
+        let options = AdmissionOptions::basic(0x1234, 0, false);
+        let telemetry = IngressTelemetry::new();
+        let mut callers = CallerTable::new();
+        let id = callers
+            .add_direct(CallerLeg::new(
+                peer,
+                caller_connection(ConnectionOptions {
+                    socket_id: 55,
+                    tsbpd_delay: 0,
+                    ..ConnectionOptions::default()
+                }),
+            ))
+            .expect("direct caller is admitted");
+
+        let mut listeners = PeerTable::new();
+        let mut micros: u64 = 0;
+        fn pump(
+            callers: &mut CallerTable,
+            listeners: &mut PeerTable,
+            options: &AdmissionOptions,
+            telemetry: &IngressTelemetry,
+            micros: &mut u64,
+            rounds: u32,
+        ) {
+            for _ in 0..rounds {
+                *micros += 10;
+                pump_caller_table(
+                    callers,
+                    listeners,
+                    options,
+                    telemetry,
+                    Timestamp::from_micros(*micros),
+                );
+            }
+        }
+        pump(
+            &mut callers,
+            &mut listeners,
+            &options,
+            &telemetry,
+            &mut micros,
+            8,
+        );
+
+        let mut events = Vec::new();
+        callers.poll_events(&mut events);
+        assert!(
+            events.iter().any(|event| event.id == id
+                && matches!(event.event, shiguredo_srt::ConnectionEvent::Connected)),
+            "a direct caller's Connected transition must be observable, got {events:?}"
+        );
+
+        micros += 10;
+        callers
+            .logical_caller_mut(&id)
+            .expect("caller exists")
+            .send(b"outbound", Timestamp::from_micros(micros))
+            .expect("send");
+        pump(
+            &mut callers,
+            &mut listeners,
+            &options,
+            &telemetry,
+            &mut micros,
+            8,
+        );
+
+        // The fake listener in `pump_caller_table` never sends anything
+        // back, so drive a real reply from it directly to prove
+        // DataReceived actually reaches the caller side, not just what the
+        // caller itself sent. Capture the listener's own view of this
+        // peer's identity via its own poll_events, since a PhysicalPeerKey
+        // doesn't directly give a LogicalPeerId.
+        let mut listener_events = Vec::new();
+        listeners.poll_events(&mut listener_events);
+        let listener_peer_id = listener_events
+            .iter()
+            .find(|event| event.representative_peer == peer)
+            .map(|event| event.logical_peer)
+            .expect("listener observed this peer's admission");
+        micros += 10;
+        listeners
+            .logical_peer_mut(&listener_peer_id)
+            .expect("logical peer exists")
+            .send(b"inbound", Timestamp::from_micros(micros))
+            .expect("listener sends");
+        pump(
+            &mut callers,
+            &mut listeners,
+            &options,
+            &telemetry,
+            &mut micros,
+            8,
+        );
+
+        let mut events = Vec::new();
+        callers.poll_events(&mut events);
+        assert!(
+            events.iter().any(|event| event.id == id
+                && matches!(
+                    &event.event,
+                    shiguredo_srt::ConnectionEvent::DataReceived { payload, .. }
+                        if payload.as_ref() == b"inbound"
+                )),
+            "a direct caller's received payload must be observable via poll_events, got {events:?}"
+        );
+
+        micros += 10;
+        callers
+            .logical_caller_mut(&id)
+            .expect("caller exists")
+            .disconnect(Timestamp::from_micros(micros));
+        pump(
+            &mut callers,
+            &mut listeners,
+            &options,
+            &telemetry,
+            &mut micros,
+            8,
+        );
+        let mut events = Vec::new();
+        callers.poll_events(&mut events);
+        assert!(
+            events.iter().any(|event| event.id == id
+                && matches!(
+                    event.event,
+                    shiguredo_srt::ConnectionEvent::StateChanged(
+                        shiguredo_srt::ConnectionState::Closing
+                    )
+                )),
+            "a direct caller's close starting must be observable via poll_events, got {events:?}"
+        );
     }
 
     #[test]

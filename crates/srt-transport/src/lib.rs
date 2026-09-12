@@ -160,8 +160,9 @@ pub use telemetry::{IngressTelemetry, IngressTelemetrySnapshot};
 // --- Public re-exports: caller ---
 
 pub use caller::{
-    CallerGroupLeg, CallerLeg, CallerTable, LogicalCaller, LogicalCallerId, LogicalCallerMut,
-    LogicalCallerState, LogicalCallerStats, RemovedCallerLeg, RemovedLogicalCaller,
+    CallerEvent, CallerGroupLeg, CallerLeg, CallerTable, LogicalCaller, LogicalCallerId,
+    LogicalCallerMut, LogicalCallerState, LogicalCallerStats, RemovedCallerLeg,
+    RemovedLogicalCaller,
 };
 pub use caller_pool::{CallerPool, CallerPoolStats, PoolOutcome};
 // Internal helpers used by runtime and group_conn modules.
