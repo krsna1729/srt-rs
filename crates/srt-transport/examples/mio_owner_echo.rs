@@ -47,7 +47,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let caller_config = CallerConfig::builder(listen_addr)
         .ownership(SocketOwnership::Shared)
         .build()?;
-    let caller_id = owner.connect(&caller_config, now_ts(start))?;
+    // `Owner`'s caller pool policy defaults to effectively unbounded (A04),
+    // so `connect()` always admits immediately unless the application opts
+    // into real max_in_flight/attempt_deadline enforcement via
+    // `set_caller_pool_policy` before its first `connect()` call.
+    let srt_transport::PoolOutcome::Admitted(caller_id) =
+        owner.connect(&caller_config, now_ts(start))?
+    else {
+        unreachable!("default pool policy is unbounded, so connect() must admit immediately")
+    };
 
     // Drive both sides until the listener admits the caller AND the caller
     // itself reports Connected -- the listener side reaches Connected on

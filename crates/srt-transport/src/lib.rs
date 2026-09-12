@@ -66,6 +66,7 @@ use std::time::Duration;
 
 mod admission;
 mod caller;
+mod caller_pool;
 mod config;
 mod cpu;
 mod dense_slot_arena;
@@ -162,6 +163,7 @@ pub use caller::{
     CallerGroupLeg, CallerLeg, CallerTable, LogicalCaller, LogicalCallerId, LogicalCallerMut,
     LogicalCallerState, LogicalCallerStats, RemovedCallerLeg, RemovedLogicalCaller,
 };
+pub use caller_pool::{CallerPool, CallerPoolStats, PoolOutcome};
 // Internal helpers used by runtime and group_conn modules.
 pub(crate) use batch::{drain_connected_outputs, drain_output_work};
 pub(crate) use caller::{collect_output_work, prepend_outputs};

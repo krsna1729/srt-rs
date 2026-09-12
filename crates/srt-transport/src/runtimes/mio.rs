@@ -179,11 +179,13 @@ struct OwnerListenerSide {
     telemetry: crate::IngressTelemetry,
     recv_batch: crate::RecvBatch,
     outbound: Vec<(std::net::SocketAddr, Vec<u8>)>,
+    /// A04: enforced every [`Owner::drive`] tick via `PeerTable::prune_idle`.
+    idle_timeout: Duration,
 }
 
 struct OwnerCallerSide {
     socket: mio::net::UdpSocket,
-    callers: crate::CallerTable,
+    callers: crate::CallerPool,
     recv_batch: crate::RecvBatch,
     outbound: Vec<(std::net::SocketAddr, Vec<u8>)>,
 }
@@ -210,6 +212,17 @@ struct OwnerCallerSide {
 /// dynamic runtime abstraction, and the async-runtime readiness/completion
 /// cancellation cards (S04/S05) do not gate this independent path.
 ///
+/// The caller side is a [`crate::CallerPool`] (A04), defaulting to an
+/// effectively unbounded policy so [`Self::connect`]'s existing behavior is
+/// unchanged unless an application opts into real `max_in_flight`/
+/// `attempt_deadline` enforcement via [`Self::set_caller_pool_policy`]
+/// before its first `connect()` call; [`Self::drive`] retires stalled
+/// attempts and admits queued ones every tick regardless of policy. The
+/// listener side enforces `AdmissionConfig::idle_timeout` every tick via
+/// `PeerTable::prune_idle`, unconditionally (there is no equivalent opt-out
+/// -- an idle established peer is never a legitimate long-term resource
+/// hold the way an in-flight connect attempt briefly is).
+///
 /// Two known gaps, tracked as explicit follow-ups rather than partial
 /// fixes bolted onto this card:
 ///
@@ -229,6 +242,16 @@ pub struct Owner {
     events: mio::Events,
     listener: Option<OwnerListenerSide>,
     caller: Option<OwnerCallerSide>,
+    /// A04: policy for the [`crate::CallerPool`] backing the caller side,
+    /// set once before the first [`Self::connect`] call locks it in.
+    /// Defaults to effectively unbounded so `Owner::connect`'s existing
+    /// (A03) behavior is unchanged for an application that never calls
+    /// [`Self::set_caller_pool_policy`] -- `ConnectConfig::default()`'s own
+    /// `max_in_flight` of 1 would otherwise silently make every
+    /// default-configured caller wait for the previous one to connect,
+    /// which is not this card's call to make unilaterally for existing
+    /// callers.
+    caller_pool_policy: (std::num::NonZeroUsize, Duration),
 }
 
 impl Owner {
@@ -238,7 +261,31 @@ impl Owner {
             events: mio::Events::with_capacity(1024),
             listener: None,
             caller: None,
+            caller_pool_policy: (std::num::NonZeroUsize::MAX, Duration::MAX),
         })
+    }
+
+    /// Opt into real `max_in_flight`/`attempt_deadline` enforcement
+    /// (A04) on the caller side, instead of the effectively-unbounded
+    /// default. Must be called before the first [`Self::connect`] --
+    /// once the shared caller socket and its [`crate::CallerPool`] exist,
+    /// changing the policy underneath already-admitted attempts would be
+    /// ambiguous (rescale existing deadlines? leave them? which ones
+    /// count against the new limit?), so this returns an error instead.
+    pub fn set_caller_pool_policy(
+        &mut self,
+        max_in_flight: std::num::NonZeroUsize,
+        attempt_deadline: Duration,
+    ) -> Result<(), crate::RuntimeBuildError> {
+        if self.caller.is_some() {
+            return Err(crate::RuntimeBuildError::from(crate::ConfigError::new(
+                "caller_pool_policy",
+                "must be set before the first connect() call, not after the caller \
+                 socket and its pool already exist",
+            )));
+        }
+        self.caller_pool_policy = (max_in_flight, attempt_deadline);
+        Ok(())
     }
 
     /// Bind and register this owner's one listener socket. May be called at
@@ -294,6 +341,7 @@ impl Owner {
         self.listener = Some(OwnerListenerSide {
             socket,
             admission: prepared.admission_options(),
+            idle_timeout: prepared.admission.idle_timeout,
             peers: prepared.peer_table(),
             telemetry: crate::IngressTelemetry::new(),
             recv_batch: crate::RecvBatch::new(),
@@ -315,11 +363,17 @@ impl Owner {
     /// `config.remote` and every session setting, by contrast, are honored
     /// on every call: only the socket-construction half of a later config
     /// is ignored, never the session/protocol half.
+    ///
+    /// Returns [`crate::PoolOutcome::Admitted`] immediately unless a
+    /// bounded policy was set via [`Self::set_caller_pool_policy`] and the
+    /// pool is already at `max_in_flight`, in which case it returns
+    /// [`crate::PoolOutcome::Queued`] -- call [`Self::drive`] to let the
+    /// pool retire stalled attempts and admit queued ones (A04).
     pub fn connect(
         &mut self,
         config: &crate::CallerConfig,
         now: Timestamp,
-    ) -> Result<crate::LogicalCallerId, crate::RuntimeBuildError> {
+    ) -> Result<crate::PoolOutcome, crate::RuntimeBuildError> {
         let prepared = config.prepare(crate::RuntimeFlavor::Mio)?;
         if prepared.transport.exclusive {
             return Err(crate::RuntimeBuildError::from(crate::ConfigError::new(
@@ -347,19 +401,18 @@ impl Owner {
                 OWNER_CALLER_TOKEN,
                 mio::Interest::READABLE,
             )?;
+            let (max_in_flight, attempt_deadline) = self.caller_pool_policy;
             self.caller = Some(OwnerCallerSide {
                 socket,
-                callers: crate::CallerTable::new(),
+                callers: crate::CallerPool::new(max_in_flight, attempt_deadline),
                 recv_batch: crate::RecvBatch::new(),
                 outbound: Vec::new(),
             });
         }
         let side = self.caller.as_mut().expect("just ensured above");
-        let connection = prepared.connection(now)?;
-        let leg = crate::CallerLeg::new(config.remote, connection);
-        side.callers.add_direct(leg).map_err(|error| {
+        side.callers.connect(prepared, now).map_err(|error| {
             crate::RuntimeBuildError::from(crate::ConfigError::new(
-                "caller.add_direct",
+                "caller.connect",
                 error.to_string(),
             ))
         })
@@ -418,7 +471,7 @@ impl Owner {
             }
         }
         if caller_ready && let Some(side) = self.caller.as_mut() {
-            let callers = &mut side.callers;
+            let callers = side.callers.table_mut();
             let result = crate::drain_recv_fd(
                 side.socket.as_raw_fd(),
                 &mut side.recv_batch,
@@ -467,6 +520,11 @@ impl Owner {
     ) -> io::Result<crate::OutputDrainStatus> {
         let mut first_error = None;
         if let Some(side) = self.listener.as_mut() {
+            // A04: start an orderly close on every established peer that
+            // has gone quiet past the configured idle timeout, before this
+            // tick's own poll_outbound drains and sends the resulting
+            // SHUTDOWN alongside everything else already due.
+            side.peers.prune_idle(now, side.idle_timeout);
             if side.outbound.is_empty() {
                 side.peers.poll_outbound(now, &mut side.outbound);
             }
@@ -476,10 +534,17 @@ impl Owner {
         }
         let mut caller_status = crate::OutputDrainStatus::Drained;
         if let Some(side) = self.caller.as_mut() {
+            // A04: retire any attempt past its deadline and admit the next
+            // queued request before this tick's own output draining, so a
+            // freshly-admitted attempt's own first handshake packet goes
+            // out in the same tick rather than waiting a full extra visit.
+            side.callers.poll_expirations(now);
             if side.outbound.is_empty() {
-                let report =
-                    side.callers
-                        .poll_outbound_bounded(now, caller_budget, &mut side.outbound);
+                let report = side.callers.table_mut().poll_outbound_bounded(
+                    now,
+                    caller_budget,
+                    &mut side.outbound,
+                );
                 caller_status = report.status;
             }
             if let Err(error) = crate::flush_destined(side.socket.as_raw_fd(), &mut side.outbound) {
@@ -514,7 +579,11 @@ impl Owner {
         &mut self,
         id: crate::LogicalCallerId,
     ) -> Option<crate::LogicalCallerMut<'_>> {
-        self.caller.as_mut()?.callers.logical_caller_mut(&id)
+        self.caller
+            .as_mut()?
+            .callers
+            .table_mut()
+            .logical_caller_mut(&id)
     }
 
     /// Atomically retire one admitted peer, reclaiming its table entry and
@@ -537,7 +606,7 @@ impl Owner {
         &mut self,
         id: crate::LogicalCallerId,
     ) -> Option<crate::RemovedLogicalCaller> {
-        self.caller.as_mut()?.callers.remove(id)
+        self.caller.as_mut()?.callers.table_mut().remove(id)
     }
 
     /// The listener socket's bound local address, once [`Self::listen`] has
@@ -555,6 +624,14 @@ impl Owner {
         Some(self.listener.as_ref()?.telemetry.snapshot())
     }
 
+    /// Effective, currently-observable caller-pool state (A04) -- in
+    /// flight/queued counts and lifetime started/expired totals -- once
+    /// [`Self::connect`] has been called at least once.
+    #[must_use]
+    pub fn caller_pool_stats(&self) -> Option<crate::CallerPoolStats> {
+        Some(self.caller.as_ref()?.callers.stats())
+    }
+
     /// Microseconds until either side's next due timer, for sizing
     /// [`Self::poll_io`]'s timeout. `default_us` is returned when neither
     /// side has anything scheduled.
@@ -567,7 +644,7 @@ impl Owner {
         let caller = self
             .caller
             .as_ref()
-            .map(|side| side.callers.time_until_next_deadline(now, u64::MAX));
+            .map(|side| side.callers.table().time_until_next_deadline(now, u64::MAX));
         match (listener, caller) {
             (Some(a), Some(b)) => a.min(b).min(default_us),
             (Some(a), None) | (None, Some(a)) => a.min(default_us),
@@ -579,9 +656,10 @@ impl Owner {
 #[cfg(test)]
 mod owner_tests {
     use super::*;
-    use crate::{AdmissionEvent, LogicalCallerState, SocketOwnership};
+    use crate::{AdmissionEvent, LogicalCallerState, PoolOutcome, SocketOwnership};
     use shiguredo_srt::ConnectionEvent;
     use std::net::SocketAddr;
+    use std::num::NonZeroUsize;
 
     fn now_ts(start: std::time::Instant) -> Timestamp {
         Timestamp::from_micros(start.elapsed().as_micros() as u64)
@@ -637,9 +715,12 @@ mod owner_tests {
         owner.listen(&listener_config()).expect("listen");
         let listen_addr = owner.listener_local_addr().expect("listener bound");
 
-        let caller_id = owner
+        let crate::PoolOutcome::Admitted(caller_id) = owner
             .connect(&shared_caller_config(listen_addr), now_ts(start))
-            .expect("connect");
+            .expect("connect")
+        else {
+            panic!("default pool policy is unbounded, so connect() must admit immediately")
+        };
 
         // Connect: both sides reach Connected.
         let mut peer_id = None;
@@ -743,9 +824,13 @@ mod owner_tests {
 
         let caller_ids: Vec<_> = (0..2)
             .map(|_| {
-                owner
+                let crate::PoolOutcome::Admitted(id) = owner
                     .connect(&shared_caller_config(listen_addr), now_ts(start))
                     .expect("connect")
+                else {
+                    panic!("default pool policy is unbounded, so connect() must admit immediately")
+                };
+                id
             })
             .collect();
 
@@ -822,6 +907,57 @@ mod owner_tests {
         assert!(
             result.is_err(),
             "Exclusive ownership must be rejected, not silently accepted"
+        );
+    }
+
+    /// A04, Opus review's judgment call: `CallerPool`'s max_in_flight/
+    /// attempt_deadline enforcement must be reachable through the one
+    /// driver this crate ships, not merely usable as a standalone library
+    /// type nothing ever exercises. `set_caller_pool_policy` bounds
+    /// `Owner::connect` to one in-flight attempt; a second request must
+    /// queue, and once the first attempt (pointed at an address nothing is
+    /// listening on, so its handshake can never complete) misses its
+    /// deadline, the queued request must be admitted in its place --
+    /// through the exact same `connect`/`drive` calls every other `Owner`
+    /// test uses, with no separate opt-out code path.
+    #[test]
+    fn set_caller_pool_policy_bounds_and_enforces_owner_connect() {
+        let start = std::time::Instant::now();
+        let mut owner = Owner::new().expect("owner builds");
+        owner
+            .set_caller_pool_policy(NonZeroUsize::new(1).unwrap(), Duration::from_millis(50))
+            .expect("policy set before any connect() call");
+
+        // Nothing listens here; the handshake can never complete on its own.
+        let dead_end: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let config = crate::CallerConfig::builder(dead_end)
+            .ownership(SocketOwnership::Shared)
+            .build()
+            .expect("caller config");
+
+        let first = owner
+            .connect(&config, now_ts(start))
+            .expect("connect first");
+        assert!(matches!(first, PoolOutcome::Admitted(_)));
+        let second = owner
+            .connect(&config, now_ts(start))
+            .expect("connect second");
+        assert_eq!(
+            second,
+            PoolOutcome::Queued,
+            "max_in_flight=1 must queue the second request through Owner::connect itself"
+        );
+        assert_eq!(owner.caller_pool_stats().expect("pool exists").queued, 1);
+
+        let admitted = drive_until(&mut owner, start, Duration::from_secs(5), |owner, _now| {
+            owner
+                .caller_pool_stats()
+                .is_some_and(|stats| stats.queued == 0 && stats.expired >= 1)
+        });
+        assert!(
+            admitted,
+            "the stalled first attempt must expire and the queued second one must be \
+             admitted in its place, purely by driving Owner as normal"
         );
     }
 
