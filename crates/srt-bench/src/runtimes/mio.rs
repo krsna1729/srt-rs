@@ -499,23 +499,23 @@ fn drive_a2(
             }
         }
 
-        stray_ready += serve_ready_due(&mut drivers, &ready, &due, &mut buf, start, &mut touched);
+        stray_ready += serve_ready_due(
+            &cfg,
+            &mut drivers,
+            &ready,
+            &due,
+            &mut buf,
+            start,
+            &mut touched,
+        );
         reconnect_poisoned(&cfg, &mine, &mut drivers);
 
         // A2: after one park, service every due key (and ready sockets).
-        // A full timer sweep only when the park produced no keys — the
-        // idle/timeout case — matching mio's `woke_from_timeout` rule.
         // `send_due_payload` still walks every driver so SourceClock
-        // stays wall-time aligned (tick is elapsed-based).
-        let woke_from_timeout = due.is_empty() && ready.is_empty();
-        service_drivers(
-            &cfg,
-            &mut drivers,
-            &touched,
-            woke_from_timeout,
-            &payload,
-            start,
-        );
+        // stays wall-time aligned (tick is elapsed-based). Every driver's
+        // timers are swept unconditionally (B02) rather than gated on this
+        // wake's own due/ready keys.
+        service_drivers(&cfg, &mut drivers, &payload, start);
 
         for (idx, driver) in drivers.iter().enumerate() {
             if driver.stream_deadline.is_some_and(|d| Instant::now() >= d) {
@@ -715,7 +715,12 @@ fn mark_served(touched: &mut [bool], drivers_len: usize, idx: usize) -> bool {
 
 /// Serve one A2 wake's ready + due driver indices against the reused served
 /// table. Indices beyond the table are counted as stray, never dispatched.
+/// `HighResWaiter` registers its fds plain level-triggered (B02), so a
+/// session whose receive budget runs out here needs no special handling --
+/// the kernel keeps reporting it `ready` on every following wait until it
+/// is actually drained, unlike `mio::Poll` below.
 fn serve_ready_due(
+    cfg: &BenchConfig,
     drivers: &mut [Driver],
     ready: &[usize],
     due: &[usize],
@@ -726,17 +731,33 @@ fn serve_ready_due(
     prepare_touched(touched, drivers.len());
     let mut stray = 0u64;
     for &idx in ready.iter().chain(due.iter()) {
+        // A driver both readable and due appears in `ready` and `due`
+        // independently -- skip an index this call already served rather
+        // than double-budgeting it (a real bug this exact guard fixed:
+        // see `receive_ready`'s identical check for the full writeup).
+        if idx < touched.len() && touched[idx] {
+            continue;
+        }
         if !mark_served(touched, drivers.len(), idx) {
             stray += 1;
             continue;
         }
         if let Some(driver) = drivers.get_mut(idx) {
-            receive_connected_datagrams(driver, idx, buf, start);
+            let _ = receive_connected_datagrams(driver, idx, buf, start, cfg.recv_rounds);
         }
     }
     stray
 }
 
+/// Service this wake's `mio::Poll` events plus any `extra` indices carried
+/// over from a prior call whose receive budget ran out before the socket
+/// actually went to `WouldBlock` (B02). `mio::Poll` registers `EPOLLET`
+/// (edge triggered): once a socket's readable transition has been
+/// consumed, no further event ever arrives for it while it stays
+/// readable, so a caller that stops early on purpose must remember to
+/// revisit it -- `pending` is exactly that memory: taken out (and
+/// serviced first) at the start of the call, then refilled with whatever
+/// this pass still could not finish.
 fn receive_ready(
     cfg: &BenchConfig,
     drivers: &mut [Driver],
@@ -744,11 +765,30 @@ fn receive_ready(
     buf: &mut [u8],
     start: Instant,
     touched: &mut Vec<bool>,
+    pending: &mut Vec<usize>,
 ) -> u64 {
     prepare_touched(touched, drivers.len());
+    // Take this call's carried-over backlog out, so the loop below can
+    // refill `*pending` fresh with whatever remains after this pass.
+    let carried = std::mem::take(pending);
     let mut stray = 0u64;
-    for event in events.iter() {
-        let idx = event.token().0;
+    let indices = carried
+        .iter()
+        .copied()
+        .chain(events.iter().map(|event| event.token().0));
+    for idx in indices {
+        // BUG-1 (Opus review): a carried-over `pending` index and a fresh
+        // mio event for that same driver both land in `indices` when new
+        // datagrams arrived on an already-behind socket since the last
+        // poll -- with no guard, that index gets serviced (and pushed
+        // back into `pending`) again on every subsequent call, so a
+        // driver's *effective* receive budget grows without bound as
+        // duplicates accumulate (observed 7x at 200 real connections),
+        // defeating this card's entire purpose. An index this call
+        // already served is skipped, not double-budgeted.
+        if idx < touched.len() && touched[idx] {
+            continue;
+        }
         if !mark_served(touched, drivers.len(), idx) {
             stray += 1;
             continue;
@@ -759,8 +799,8 @@ fn receive_ready(
         };
         if driver.peer.is_none() && cfg.mode == crate::Mode::Receiver {
             receive_first_datagram(driver, buf, start);
-        } else {
-            receive_connected_datagrams(driver, idx, buf, start);
+        } else if receive_connected_datagrams(driver, idx, buf, start, cfg.recv_rounds) {
+            pending.push(idx);
         }
     }
     stray
@@ -782,24 +822,41 @@ fn receive_first_datagram(driver: &mut Driver, buf: &mut [u8], start: Instant) {
     }
 }
 
-fn receive_connected_datagrams(driver: &mut Driver, index: usize, buf: &mut [u8], start: Instant) {
-    loop {
+/// Drain up to `budget` datagrams from one connected session's socket
+/// (B02: previously unbounded, looping until `WouldBlock` no matter how
+/// much a peer kept sending -- one continuously busy connection could
+/// starve every sibling driver's turn in the same poll wake, including
+/// their own overdue timers). Returns `true` when the budget ran out
+/// while the socket was still readable, meaning more work is waiting that
+/// this call did not get to; the caller is responsible for revisiting the
+/// session (see `receive_ready`'s doc comment for why that matters on
+/// `mio::Poll`, and `serve_ready_due`'s for why it does not on
+/// `HighResWaiter`).
+fn receive_connected_datagrams(
+    driver: &mut Driver,
+    index: usize,
+    buf: &mut [u8],
+    start: Instant,
+    budget: usize,
+) -> bool {
+    for _ in 0..budget {
         match driver.conn.socket.recv(buf) {
             Ok(n) => {
                 let t = crate::now_ts(start);
                 let _ = driver.conn.conn.feed_recv_buf(&buf[..n], t);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return false,
             Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
                 driver.poisoned = true;
-                break;
+                return false;
             }
             Err(error) => {
                 eprintln!("[bench-mio] recv error conn {index}: {error}");
-                break;
+                return false;
             }
         }
     }
+    budget > 0
 }
 
 fn reconnect_poisoned(cfg: &BenchConfig, mine: &[usize], drivers: &mut [Driver]) {
@@ -820,27 +877,24 @@ fn reconnect_poisoned(cfg: &BenchConfig, mine: &[usize], drivers: &mut [Driver])
     }
 }
 
-fn service_drivers(
-    cfg: &BenchConfig,
-    drivers: &mut [Driver],
-    touched: &[bool],
-    woke_from_timeout: bool,
-    payload: &[u8],
-    start: Instant,
-) {
-    // Timer scans are O(armed timers) per driver, so only sweep drivers that
-    // saw traffic -- plus a full sweep whenever poll went idle.
+fn service_drivers(cfg: &BenchConfig, drivers: &mut [Driver], payload: &[u8], start: Instant) {
+    // B02: this used to skip `fire_expired` for any driver that neither saw
+    // traffic this wake nor was in a wake mio reported as a bare timeout --
+    // an "only sweep what needs it" optimization that let a continuously
+    // active sibling connection (whose own readiness kept poll from ever
+    // returning as a plain timeout) silently starve every other driver's
+    // due ACK/NAK/keepalive/retransmit timers for as long as it stayed
+    // busy. Every driver's timers are now swept unconditionally on every
+    // wake; a driver with nothing due pays only a cheap deadline check.
     let t = crate::now_ts(start);
-    for (index, driver) in drivers.iter_mut().enumerate() {
+    for driver in drivers.iter_mut() {
         if !driver.connected
             && driver.started_at.elapsed() >= crate::CONNECT_TIMEOUT
             && let Some(p) = driver.permit.take()
         {
             p.fail();
         }
-        if woke_from_timeout || touched.get(index).copied().unwrap_or(false) {
-            driver.conn.fire_expired(t);
-        }
+        driver.conn.fire_expired(t);
         if driver.conn.drain_outputs(t) {
             driver.poisoned = true;
         }
@@ -996,6 +1050,13 @@ fn drive(
     let mut buf = [0u8; 2048];
     let mut touched = Vec::new();
     let mut stray_tokens: u64 = 0;
+    // B02 continuation: drivers `receive_ready` didn't finish draining last
+    // call (budget ran out before `WouldBlock`). `mio::Poll` is edge
+    // triggered, so no fresh event will ever arrive for one of these on
+    // its own -- they're fed back in as `extra` next call, and until
+    // they're gone the loop must not block waiting on new readiness that
+    // isn't coming.
+    let mut pending: Vec<usize> = Vec::new();
 
     loop {
         if !drivers.iter().any(|d| d.connected) && Instant::now() >= connect_deadline {
@@ -1021,21 +1082,25 @@ fn drive(
                 limiter.as_ref(),
             );
         }
-        poll.poll(&mut events, Some(next_poll_wait(&cfg, &drivers, start)))
-            .ok();
-        let woke_from_timeout = events.is_empty();
+        let timeout = if pending.is_empty() {
+            next_poll_wait(&cfg, &drivers, start)
+        } else {
+            Duration::ZERO
+        };
+        poll.poll(&mut events, Some(timeout)).ok();
 
-        stray_tokens += receive_ready(&cfg, &mut drivers, &events, &mut buf, start, &mut touched);
-        reconnect_poisoned(&cfg, &mine, &mut drivers);
-
-        service_drivers(
+        stray_tokens += receive_ready(
             &cfg,
             &mut drivers,
-            &touched,
-            woke_from_timeout,
-            &payload,
+            &events,
+            &mut buf,
             start,
+            &mut touched,
+            &mut pending,
         );
+        reconnect_poisoned(&cfg, &mine, &mut drivers);
+
+        service_drivers(&cfg, &mut drivers, &payload, start);
     }
     if stray_tokens > 0 {
         eprintln!(
@@ -2540,5 +2605,306 @@ mod readiness_bookkeeping_tests {
         prepare_touched(&mut touched, 6000);
         assert_eq!(touched.len(), 6000);
         assert!(mark_served(&mut touched, 6000, 5999));
+    }
+}
+
+#[cfg(test)]
+mod b02_regression_tests {
+    use super::*;
+    use std::net::UdpSocket as StdUdpSocket;
+    use std::num::NonZeroU64;
+
+    /// Same shape as `BenchConfig`'s own private test fixture (lib.rs);
+    /// duplicated here because that one lives in a private `mod tests` no
+    /// sibling module can reach. Field values themselves are irrelevant to
+    /// these tests beyond `mode`/`recv_rounds`.
+    fn test_bench_config() -> BenchConfig {
+        BenchConfig {
+            runtime: crate::Runtime::Mio,
+            mode: crate::Mode::Sender,
+            encryption: crate::Encryption::Aes256,
+            host: "127.0.0.1".to_owned(),
+            port: 0,
+            duration_secs: 1.0,
+            latency_ms: 120,
+            source_bitrate_bps: 1_000_000,
+            bandwidth: crate::source::BandwidthPolicy::default(),
+            source_backlog_ms: crate::source::DEFAULT_SOURCE_BACKLOG_MS,
+            datapath_queue_horizon_ms: crate::queue::DEFAULT_DATAPATH_QUEUE_HORIZON_MS,
+            outbound_retry_horizon_ms: crate::scheduling::DEFAULT_OUTBOUND_RETRY_HORIZON_MS,
+            ack_interval_micros: shiguredo_srt::ACK_INTERVAL_MICROS,
+            light_ack_interval_packets: shiguredo_srt::LIGHT_ACK_INTERVAL_PACKETS,
+            connections: 1,
+            egress: crate::Egress::PerConnection,
+            ingress: crate::Ingress::SharedPool(4),
+            bond_mode: BondMode::None,
+            bond_pairs: 0,
+            batching: crate::Batching::On,
+            recv_rounds: 4,
+            would_block: crate::scheduling::WouldBlockPolicy::Retain,
+            connect_concurrency: 1,
+            promotion: crate::Promotion::Never,
+            cookie_routing: true,
+            sock_buf_bytes: 0,
+            out: None,
+            rep: 1,
+            attempt: String::new(),
+            cpus: 0,
+            pin: false,
+            workers: 1,
+            stream_secs: 1.0,
+            peer_topology: crate::PeerTopology::default(),
+            link: crate::Link::default(),
+            classifier_policy: crate::model::ClassifierPolicy::default(),
+            host_contention: crate::host_contention::HostContentionPolicy::default(),
+        }
+    }
+
+    fn minimal_driver(conn: Conn) -> Driver {
+        Driver {
+            conn,
+            connected: false,
+            torn_down: false,
+            stream_deadline: None,
+            data_events: 0,
+            peer: None,
+            poisoned: false,
+            started_at: Instant::now(),
+            permit: None,
+            source: crate::source::SourceClock::new(NonZeroU64::new(1_000_000).unwrap(), 1),
+        }
+    }
+
+    /// A driver's own connected mio socket, plus a plain std socket
+    /// standing in for its peer.
+    fn connected_pair() -> (mio::net::UdpSocket, StdUdpSocket) {
+        let a = mio::net::UdpSocket::bind("127.0.0.1:0".parse().unwrap()).expect("bind a");
+        let a_addr = a.local_addr().expect("local addr a");
+        let b = StdUdpSocket::bind("127.0.0.1:0").expect("bind b");
+        let b_addr = b.local_addr().expect("local addr b");
+        a.connect(b_addr).expect("connect a to b");
+        b.connect(a_addr).expect("connect b to a");
+        (a, b)
+    }
+
+    /// Opus-review BUG-1: `receive_ready` fed a chained
+    /// `carried.iter().chain(events.iter()...)` straight into the service
+    /// loop with nothing deduplicating an index that appears in *both* --
+    /// exactly what happens when a driver's receive budget ran out last
+    /// call (carrying it into `pending`) AND new datagrams arrived on that
+    /// same still-behind socket before the next `poll()` (mio's
+    /// edge-triggered registration wakes again on that new arrival, not
+    /// only on the very first not-ready-to-ready transition). Each
+    /// duplicate serviced the same driver an extra time in one call *and*
+    /// pushed it back into `pending` an extra time, so the effective
+    /// per-visit budget for a hot connection grew without bound across
+    /// calls (7x observed at 200 real connections) -- defeating this
+    /// card's entire purpose. Reproduces the review's own repro shape
+    /// exactly: flood, poll, `receive_ready`, repeat, and confirm
+    /// `pending` never accumulates more than one entry per driver.
+    #[test]
+    fn receive_ready_does_not_double_budget_a_driver_carried_over_and_freshly_ready() {
+        let mut poll = Poll::new().expect("mio Poll::new");
+        let mut events = Events::with_capacity(8);
+
+        let mut socket = mio::net::UdpSocket::bind("127.0.0.1:0".parse().unwrap()).expect("bind");
+        let peer = StdUdpSocket::bind("127.0.0.1:0").expect("bind peer");
+        peer.connect(socket.local_addr().expect("local addr"))
+            .expect("connect peer to socket");
+        socket
+            .connect(peer.local_addr().expect("peer addr"))
+            .expect("connect socket to peer");
+        poll.registry()
+            .register(&mut socket, Token(0), Interest::READABLE)
+            .expect("register");
+
+        let cfg = test_bench_config(); // recv_rounds = 4
+        let mut drivers = vec![minimal_driver(Conn::new(
+            SrtConnection::new_listener(ConnectionOptions::default()),
+            socket,
+        ))];
+        let start = Instant::now();
+        let mut buf = [0u8; 2048];
+        let mut touched = Vec::new();
+        let mut pending: Vec<usize> = Vec::new();
+
+        // First visit: a real backlog (well past the budget of 4) makes
+        // the first receive_ready call carry driver 0 into `pending`.
+        for i in 0..20u8 {
+            peer.send(&[i]).expect("send");
+        }
+        poll.poll(&mut events, Some(Duration::from_millis(200)))
+            .expect("poll");
+        assert!(!events.is_empty(), "socket must be reported readable");
+        receive_ready(
+            &cfg,
+            &mut drivers,
+            &events,
+            &mut buf,
+            start,
+            &mut touched,
+            &mut pending,
+        );
+        assert_eq!(pending, vec![0], "budget-exhausted driver must be carried");
+
+        // Three more rounds, each sending fresh data before polling again
+        // (still without ever fully draining) -- the exact condition that
+        // produced a duplicate `pending` entry before the fix.
+        for round in 0..3 {
+            peer.send(&[0xAA]).expect("send");
+            poll.poll(&mut events, Some(Duration::from_millis(200)))
+                .expect("poll");
+            receive_ready(
+                &cfg,
+                &mut drivers,
+                &events,
+                &mut buf,
+                start,
+                &mut touched,
+                &mut pending,
+            );
+            assert_eq!(
+                pending,
+                vec![0],
+                "round {round}: pending must never accumulate a duplicate index"
+            );
+        }
+    }
+
+    /// B02 checkpoint 1: `receive_connected_datagrams` used to loop until
+    /// `WouldBlock` no matter how much a peer kept sending, which is what
+    /// let one continuously busy connection monopolize a shared poll wake
+    /// for as long as it stayed busy. It must now stop after exactly
+    /// `budget` datagrams and report that more work remains, and later
+    /// calls must pick up exactly where it left off -- nothing lost.
+    #[test]
+    fn receive_connected_datagrams_stops_at_the_budget_and_reports_continuation() {
+        let (a, b) = connected_pair();
+        let mut driver = minimal_driver(Conn::new(
+            SrtConnection::new_listener(ConnectionOptions::default()),
+            a,
+        ));
+        for i in 0..10u8 {
+            b.send(&[i]).expect("send");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+
+        let start = Instant::now();
+        let mut buf = [0u8; 2048];
+
+        // Budget 4 against 10 queued datagrams: two calls must each stop
+        // early and report continuation, the third must finish the
+        // remaining 2 and see the real `WouldBlock`.
+        assert!(receive_connected_datagrams(
+            &mut driver,
+            0,
+            &mut buf,
+            start,
+            4
+        ));
+        assert!(receive_connected_datagrams(
+            &mut driver,
+            0,
+            &mut buf,
+            start,
+            4
+        ));
+        assert!(!receive_connected_datagrams(
+            &mut driver,
+            0,
+            &mut buf,
+            start,
+            4
+        ));
+    }
+
+    /// Zero budget performs no receive work at all -- T02's precedent that
+    /// `0` means "do none this call", not "at least one" -- and must not
+    /// silently drop the datagram it declined to read.
+    #[test]
+    fn zero_budget_performs_no_receive_work_and_drops_nothing() {
+        let (a, b) = connected_pair();
+        let mut driver = minimal_driver(Conn::new(
+            SrtConnection::new_listener(ConnectionOptions::default()),
+            a,
+        ));
+        b.send(&[7]).expect("send");
+        std::thread::sleep(Duration::from_millis(50));
+
+        let start = Instant::now();
+        let mut buf = [0u8; 2048];
+        assert!(!receive_connected_datagrams(
+            &mut driver,
+            0,
+            &mut buf,
+            start,
+            0
+        ));
+
+        // The datagram must still be sitting in the kernel receive buffer.
+        let (n, _) = driver
+            .conn
+            .socket
+            .recv_from(&mut buf)
+            .expect("datagram must still be queued, not silently consumed");
+        assert_eq!(&buf[..n], &[7]);
+    }
+
+    /// B02 checkpoint 2: `service_drivers` used to fire a driver's expired
+    /// timers only if that driver itself was marked "touched" this wake or
+    /// the whole poll came back as a bare timeout. A driver with nothing
+    /// of its own to report but a genuinely overdue timer -- exactly what
+    /// happens whenever a *different*, continuously busy sibling
+    /// connection keeps causing `poll` to return non-empty -- would then
+    /// never have that timer fire for as long as the sibling stayed busy.
+    /// It must now fire unconditionally on every call, for every driver.
+    #[test]
+    fn service_drivers_fires_an_overdue_handshake_retry_with_no_touched_or_timeout_signal() {
+        let cfg = test_bench_config();
+        let start = Instant::now();
+
+        let socket = mio::net::UdpSocket::bind("127.0.0.1:0".parse().unwrap()).expect("bind");
+        let peer = StdUdpSocket::bind("127.0.0.1:0").expect("bind peer");
+        // A bounded read timeout so a real regression (no retry ever sent)
+        // fails this assertion quickly instead of hanging the test suite.
+        peer.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set_read_timeout");
+        peer.connect(socket.local_addr().expect("local addr"))
+            .expect("connect peer to socket");
+        socket
+            .connect(peer.local_addr().expect("peer addr"))
+            .expect("connect socket to peer");
+
+        let mut conn = SrtConnection::new_caller(ConnectionOptions::default());
+        conn.connect(crate::now_ts(start))
+            .expect("connect() should queue INDUCTION");
+        let mut driver_conn = Conn::new(conn, socket);
+        driver_conn.drain_outputs(crate::now_ts(start));
+
+        // Drain the initial INDUCTION so only the handshake retry timer --
+        // not the first send -- is what the assertion below detects.
+        let mut discard = [0u8; 2048];
+        assert!(
+            peer.recv(&mut discard).is_ok(),
+            "must actually drain the INDUCTION, or the final assertion below could \
+             pass on it instead of on the retry this test means to prove"
+        );
+
+        let mut driver = minimal_driver(driver_conn);
+
+        // Real wall-clock gap past the 250ms (+ up to 20% jitter)
+        // handshake retry interval, so the retry timer is genuinely due
+        // by the time `service_drivers` runs -- no `touched` entry and no
+        // `woke_from_timeout` signal exist any more for it to depend on.
+        std::thread::sleep(Duration::from_millis(400));
+
+        let payload = vec![0x42u8; crate::PAYLOAD_SIZE];
+        service_drivers(&cfg, std::slice::from_mut(&mut driver), &payload, start);
+
+        let mut buf = [0u8; 2048];
+        assert!(
+            peer.recv(&mut buf).is_ok(),
+            "an overdue handshake retry must have actually been retransmitted"
+        );
     }
 }
