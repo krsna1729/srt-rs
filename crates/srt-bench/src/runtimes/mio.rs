@@ -27,43 +27,83 @@ const TIMER_TICK: Duration = Duration::from_millis(10);
 
 /// Drain one socket for admission, calling `on_datagram(peer, data)` for
 /// each queued datagram -- either batched (`recvmmsg`, one syscall for up
-/// to `admit_bufs.len()` datagrams) or one `recv_from` syscall per
-/// datagram, per `BenchConfig::batching`. This is the axis `Batching`
+/// to `RecvBatch::DEFAULT_CAPACITY` datagrams) or one `recv_from` syscall
+/// per datagram, per `BenchConfig::batching`. `recv_rounds` bounds the
+/// `recvmmsg` calls or `recv_from` calls offered by this visit. This is the
+/// axis `Batching`
 /// exists to let a run select: isolating whatever win (or lack of one)
 /// batched admission gives at a given fan-in level from every other
 /// variable. Shared by every ingress strategy that has a socket serving
 /// more than one peer at once (`SharedPool`, `ReuseportMulti`,
 /// `ReuseportSingle`) -- `PerPort` never shares a socket, so batching
-/// doesn't apply there.
+/// doesn't apply there. Returns whether the caller must revisit the socket
+/// immediately: Mio's readiness is edge-triggered, so reaching the budget
+/// without seeing `WouldBlock` can leave queued datagrams without another
+/// event.
 fn drain_admission(
     listener: &UdpSocket,
     batching: crate::Batching,
     batch: &mut RecvBatch,
+    recv_rounds: usize,
     buf: &mut [u8],
     mut on_datagram: impl FnMut(SocketAddr, &[u8]),
-) {
+) -> bool {
+    if recv_rounds == 0 {
+        return false;
+    }
     match batching {
         crate::Batching::On => {
-            if let Err(error) = srt_transport::drain_recv_fd(
+            match srt_transport::drain_recv_fd(
                 listener.as_raw_fd(),
                 batch,
-                RecvBudget::from_rounds(32),
+                RecvBudget::from_rounds(recv_rounds),
                 |addr, data| {
                     if let Some(peer) = addr {
                         on_datagram(peer, data);
                     }
                 },
             ) {
-                eprintln!("[bench-mio] recvmmsg failed: {error}");
+                Ok(report) => !report.would_block,
+                Err(error) => {
+                    eprintln!("[bench-mio] recvmmsg failed: {error}");
+                    false
+                }
             }
         }
-        crate::Batching::Off => loop {
-            match listener.recv_from(buf) {
-                Ok((n, peer)) => on_datagram(peer, &buf[..n]),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(_) => break,
+        crate::Batching::Off => {
+            for _ in 0..recv_rounds {
+                match listener.recv_from(buf) {
+                    Ok((n, peer)) => on_datagram(peer, &buf[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return false,
+                    Err(_) => return false,
+                }
             }
-        },
+            true
+        }
+    }
+}
+
+/// One per-port receive visit, including the one datagram that establishes a
+/// receiver's connected peer. The first read counts against the same finite
+/// budget as subsequent connected reads; returning `true` asks the edge-
+/// triggered caller to revisit the socket after the budget is spent.
+fn receive_ready_driver(
+    cfg: &BenchConfig,
+    driver: &mut Driver,
+    index: usize,
+    buf: &mut [u8],
+    start: Instant,
+) -> bool {
+    if driver.peer.is_none() && cfg.mode == crate::Mode::Receiver {
+        if cfg.recv_rounds == 0 || !receive_first_datagram(driver, buf, start) {
+            return false;
+        }
+        if cfg.recv_rounds == 1 {
+            return true;
+        }
+        receive_connected_datagrams(driver, index, buf, start, cfg.recv_rounds.saturating_sub(1))
+    } else {
+        receive_connected_datagrams(driver, index, buf, start, cfg.recv_rounds)
     }
 }
 
@@ -755,9 +795,9 @@ fn serve_ready_due(
 /// (edge triggered): once a socket's readable transition has been
 /// consumed, no further event ever arrives for it while it stays
 /// readable, so a caller that stops early on purpose must remember to
-/// revisit it -- `pending` is exactly that memory: taken out (and
-/// serviced first) at the start of the call, then refilled with whatever
-/// this pass still could not finish.
+/// revisit it. `pending` carries one continuation per driver; carried
+/// entries are serviced first, then replaced in place with whatever this
+/// pass still could not finish.
 fn receive_ready(
     cfg: &BenchConfig,
     drivers: &mut [Driver],
@@ -768,45 +808,65 @@ fn receive_ready(
     pending: &mut Vec<usize>,
 ) -> u64 {
     prepare_touched(touched, drivers.len());
-    // Take this call's carried-over backlog out, so the loop below can
-    // refill `*pending` fresh with whatever remains after this pass.
-    let carried = std::mem::take(pending);
     let mut stray = 0u64;
-    let indices = carried
-        .iter()
-        .copied()
-        .chain(events.iter().map(|event| event.token().0));
-    for idx in indices {
+    // Keep the carried prefix in `pending` while servicing it, then remove
+    // only that prefix. This reuses the vector's allocation on every wake;
+    // moving the Vec out would replace it with an empty vector and force
+    // capacity growth again as continuations accumulated.
+    let carried_len = pending.len();
+    for carried_idx in 0..carried_len {
+        let idx = pending[carried_idx];
         // BUG-1 (Opus review): a carried-over `pending` index and a fresh
-        // mio event for that same driver both land in `indices` when new
-        // datagrams arrived on an already-behind socket since the last
-        // poll -- with no guard, that index gets serviced (and pushed
-        // back into `pending`) again on every subsequent call, so a
-        // driver's *effective* receive budget grows without bound as
-        // duplicates accumulate (observed 7x at 200 real connections),
-        // defeating this card's entire purpose. An index this call
-        // already served is skipped, not double-budgeted.
-        if idx < touched.len() && touched[idx] {
-            continue;
-        }
-        if !mark_served(touched, drivers.len(), idx) {
-            stray += 1;
-            continue;
-        }
-        let Some(driver) = drivers.get_mut(idx) else {
-            stray += 1;
-            continue;
-        };
-        if driver.peer.is_none() && cfg.mode == crate::Mode::Receiver {
-            receive_first_datagram(driver, buf, start);
-        } else if receive_connected_datagrams(driver, idx, buf, start, cfg.recv_rounds) {
-            pending.push(idx);
-        }
+        // driver both land in this call when new datagrams arrived on an
+        // already-behind socket since the last poll -- with no guard, that
+        // index gets serviced (and pushed back into `pending`) again on every
+        // subsequent call, so a driver's effective receive budget grows
+        // without bound as duplicates accumulate (observed 7x at 200 real
+        // connections). An index this call already served is skipped, not
+        // double-budgeted.
+        service_ready_index(cfg, drivers, idx, buf, start, touched, pending, &mut stray);
+    }
+    drop(pending.drain(..carried_len));
+
+    for event in events.iter() {
+        let idx = event.token().0;
+        service_ready_index(cfg, drivers, idx, buf, start, touched, pending, &mut stray);
     }
     stray
 }
 
-fn receive_first_datagram(driver: &mut Driver, buf: &mut [u8], start: Instant) {
+/// Service one readiness index -- either a fresh `mio::Poll` event or a
+/// carried-over continuation from a prior [`receive_ready`] call -- shared
+/// by both of that function's loops, which differ only in where `idx`
+/// comes from.
+#[allow(clippy::too_many_arguments)]
+fn service_ready_index(
+    cfg: &BenchConfig,
+    drivers: &mut [Driver],
+    idx: usize,
+    buf: &mut [u8],
+    start: Instant,
+    touched: &mut [bool],
+    pending: &mut Vec<usize>,
+    stray: &mut u64,
+) {
+    if idx < touched.len() && touched[idx] {
+        return;
+    }
+    if !mark_served(touched, drivers.len(), idx) {
+        *stray += 1;
+        return;
+    }
+    let Some(driver) = drivers.get_mut(idx) else {
+        *stray += 1;
+        return;
+    };
+    if receive_ready_driver(cfg, driver, idx, buf, start) {
+        pending.push(idx);
+    }
+}
+
+fn receive_first_datagram(driver: &mut Driver, buf: &mut [u8], start: Instant) -> bool {
     // The first datagram reveals the caller. Connect before feeding it into
     // the protocol because output draining uses connected `send()`.
     match driver.conn.socket.recv_from(buf) {
@@ -815,11 +875,13 @@ fn receive_first_datagram(driver: &mut Driver, buf: &mut [u8], start: Instant) {
                 driver.peer = Some(addr);
                 let t = crate::now_ts(start);
                 let _ = driver.conn.conn.feed_recv_buf(&buf[..n], t);
+                return true;
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
         Err(error) => eprintln!("[bench-mio] recv error: {error}"),
     }
+    false
 }
 
 /// Drain up to `budget` datagrams from one connected session's socket
@@ -1179,6 +1241,7 @@ fn run_bonded_shared_pool(cfg: BenchConfig) {
     let mut admit_batch = RecvBatch::new();
     let mut outbound = Vec::new();
     let mut connected = Vec::new();
+    let mut admission_pending = false;
 
     loop {
         let now = Instant::now();
@@ -1187,16 +1250,19 @@ fn run_bonded_shared_pool(cfg: BenchConfig) {
         {
             break;
         }
-        poll.poll(&mut events, Some(TIMER_TICK)).ok();
-        for event in events.iter() {
-            if event.token() != Token(0) {
-                continue;
-            }
+        let timeout = if admission_pending {
+            Duration::ZERO
+        } else {
+            TIMER_TICK
+        };
+        poll.poll(&mut events, Some(timeout)).ok();
+        if admission_pending || events.iter().any(|event| event.token() == Token(0)) {
             let timestamp = crate::now_ts(start);
-            drain_admission(
+            admission_pending = drain_admission(
                 &socket,
                 cfg.batching,
                 &mut admit_batch,
+                cfg.recv_rounds,
                 &mut buf,
                 |peer, data| {
                     let _ = peers.admit(peer, data, timestamp, &admission, 0, 1, &telemetry);
@@ -1281,6 +1347,7 @@ fn shared_pool_conn_is_terminal(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn admit_shared_pool_events(
     events: &Events,
     sockets: &[UdpSocket],
@@ -1289,21 +1356,65 @@ fn admit_shared_pool_events(
     buf: &mut [u8],
     conns: &mut HashMap<SocketAddr, SharedPoolConn>,
     start: Instant,
+    pending: &mut Vec<bool>,
+    touched: &mut Vec<bool>,
 ) {
+    pending.resize(sockets.len(), false);
+    prepare_touched(touched, sockets.len());
+
+    // Continue carried-over edge-triggered work before considering fresh
+    // events. A fresh event for the same socket is deduplicated below.
+    for socket_idx in 0..sockets.len() {
+        if !pending[socket_idx] {
+            continue;
+        }
+        touched[socket_idx] = true;
+        let socket = &sockets[socket_idx];
+        let timestamp = crate::now_ts(start);
+        pending[socket_idx] = drain_admission(
+            socket,
+            cfg.batching,
+            batch,
+            cfg.recv_rounds,
+            buf,
+            |peer, data| {
+                let entry = conns
+                    .entry(peer)
+                    .or_insert_with(|| new_shared_pool_conn(cfg, peer, socket_idx));
+                let _ = entry.conn.feed_recv_buf(data, timestamp);
+                entry.data_events += 1;
+                entry.last_data_at = Instant::now();
+            },
+        );
+    }
+
     for event in events.iter() {
         let socket_idx = event.token().0;
         let Some(socket) = sockets.get(socket_idx) else {
             continue;
         };
+        if socket_idx < touched.len() && touched[socket_idx] {
+            continue;
+        }
+        if !mark_served(touched, sockets.len(), socket_idx) {
+            continue;
+        }
         let timestamp = crate::now_ts(start);
-        drain_admission(socket, cfg.batching, batch, buf, |peer, data| {
-            let entry = conns
-                .entry(peer)
-                .or_insert_with(|| new_shared_pool_conn(cfg, peer, socket_idx));
-            let _ = entry.conn.feed_recv_buf(data, timestamp);
-            entry.data_events += 1;
-            entry.last_data_at = Instant::now();
-        });
+        pending[socket_idx] = drain_admission(
+            socket,
+            cfg.batching,
+            batch,
+            cfg.recv_rounds,
+            buf,
+            |peer, data| {
+                let entry = conns
+                    .entry(peer)
+                    .or_insert_with(|| new_shared_pool_conn(cfg, peer, socket_idx));
+                let _ = entry.conn.feed_recv_buf(data, timestamp);
+                entry.data_events += 1;
+                entry.last_data_at = Instant::now();
+            },
+        );
     }
 }
 
@@ -1399,6 +1510,8 @@ fn run_shared_pool_shard(
     let run_deadline = Instant::now() + stream_len + IDLE_GRACE + Duration::from_secs(30);
     let mut buf = [0u8; 2048];
     let mut admit_batch = RecvBatch::new();
+    let mut admission_pending = vec![false; sockets.len()];
+    let mut admission_touched = Vec::new();
 
     loop {
         let now = Instant::now();
@@ -1416,7 +1529,12 @@ fn run_shared_pool_shard(
         ) {
             break;
         }
-        poll.poll(&mut events, Some(TIMER_TICK)).ok();
+        let timeout = if admission_pending.iter().any(|&pending| pending) {
+            Duration::ZERO
+        } else {
+            TIMER_TICK
+        };
+        poll.poll(&mut events, Some(timeout)).ok();
 
         admit_shared_pool_events(
             &events,
@@ -1426,6 +1544,8 @@ fn run_shared_pool_shard(
             &mut buf,
             &mut conns,
             start,
+            &mut admission_pending,
+            &mut admission_touched,
         );
         drive_shared_pool_connections(&mut conns, &sockets, start, stream_len);
     }
@@ -1706,15 +1826,22 @@ fn service_pool_events(
     listener: &UdpSocket,
     admit_batch: &mut RecvBatch,
     buf: &mut [u8; 2048],
+    admission_pending: &mut bool,
 ) {
     let batching = context.cfg.batching;
     let admission = context.admission;
     let worker_index = context.worker_index;
     let senders = context.senders;
     let telemetry = context.telemetry;
-    for event in events.iter() {
-        match event.token().0 {
-            0 => drain_admission(listener, batching, admit_batch, buf, |peer, data| {
+    let mut admission_served = false;
+    if *admission_pending {
+        *admission_pending = drain_admission(
+            listener,
+            batching,
+            admit_batch,
+            context.cfg.recv_rounds,
+            buf,
+            |peer, data| {
                 peers.admit_and_forward(
                     peer,
                     data,
@@ -1724,7 +1851,35 @@ fn service_pool_events(
                     senders,
                     telemetry,
                 );
-            }),
+            },
+        );
+        admission_served = true;
+    }
+    for event in events.iter() {
+        match event.token().0 {
+            0 => {
+                if !admission_served {
+                    *admission_pending = drain_admission(
+                        listener,
+                        batching,
+                        admit_batch,
+                        context.cfg.recv_rounds,
+                        buf,
+                        |peer, data| {
+                            peers.admit_and_forward(
+                                peer,
+                                data,
+                                crate::now_ts(context.start),
+                                admission,
+                                worker_index,
+                                senders,
+                                telemetry,
+                            );
+                        },
+                    );
+                    admission_served = true;
+                }
+            }
             index => service_slot_event(
                 context.slots,
                 context.token_index,
@@ -1873,6 +2028,7 @@ fn run_pool_acceptor(
     // (hot-path rule).
     let mut admit_batch = RecvBatch::new();
     let mut buf = [0u8; 2048];
+    let mut admission_pending = false;
 
     {
         let mut context = PoolAcceptorContext {
@@ -1901,7 +2057,12 @@ fn run_pool_acceptor(
             if crate::shutdown::requested() || (now >= connect_deadline && all_terminal) {
                 break;
             }
-            context.poll.poll(&mut events, Some(TIMER_TICK)).ok();
+            let timeout = if admission_pending {
+                Duration::ZERO
+            } else {
+                TIMER_TICK
+            };
+            context.poll.poll(&mut events, Some(timeout)).ok();
 
             drain_pool_handoffs(&mut context, &mut peers, &handoffs, stream_len);
 
@@ -1912,6 +2073,7 @@ fn run_pool_acceptor(
                 &listener,
                 &mut admit_batch,
                 &mut buf,
+                &mut admission_pending,
             );
 
             let newly_connected = maintain_pool_peers(&mut peers, &listener, start, stream_len);
@@ -2231,6 +2393,7 @@ fn new_single_pending(cfg: &BenchConfig) -> SinglePending {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn admit_single_events(
     events: &Events,
     listener: &UdpSocket,
@@ -2239,18 +2402,48 @@ fn admit_single_events(
     buf: &mut [u8],
     pending: &mut HashMap<SocketAddr, SinglePending>,
     start: Instant,
+    admission_pending: &mut bool,
 ) {
+    let mut admission_served = false;
+    if *admission_pending {
+        let timestamp = crate::now_ts(start);
+        *admission_pending = drain_admission(
+            listener,
+            cfg.batching,
+            batch,
+            cfg.recv_rounds,
+            buf,
+            |peer, data| {
+                let entry = pending
+                    .entry(peer)
+                    .or_insert_with(|| new_single_pending(cfg));
+                let _ = entry.conn.feed_recv_buf(data, timestamp);
+            },
+        );
+        admission_served = true;
+    }
     for event in events.iter() {
         if event.token() != Token(0) {
             continue;
         }
+        if admission_served {
+            continue;
+        }
         let t = crate::now_ts(start);
-        drain_admission(listener, cfg.batching, batch, buf, |peer, data| {
-            let entry = pending
-                .entry(peer)
-                .or_insert_with(|| new_single_pending(cfg));
-            let _ = entry.conn.feed_recv_buf(data, t);
-        });
+        *admission_pending = drain_admission(
+            listener,
+            cfg.batching,
+            batch,
+            cfg.recv_rounds,
+            buf,
+            |peer, data| {
+                let entry = pending
+                    .entry(peer)
+                    .or_insert_with(|| new_single_pending(cfg));
+                let _ = entry.conn.feed_recv_buf(data, t);
+            },
+        );
+        admission_served = true;
     }
 }
 
@@ -2339,13 +2532,19 @@ fn run_single_acceptor(
     let mut admit_batch = RecvBatch::new();
     let mut buf = [0u8; 2048];
     let mut per_worker_count = vec![0usize; senders.len()];
+    let mut admission_pending = false;
 
     loop {
         let now = Instant::now();
         if now >= connect_deadline && pending.is_empty() {
             break;
         }
-        poll.poll(&mut events, Some(TIMER_TICK)).ok();
+        let timeout = if admission_pending {
+            Duration::ZERO
+        } else {
+            TIMER_TICK
+        };
+        poll.poll(&mut events, Some(timeout)).ok();
 
         admit_single_events(
             &events,
@@ -2355,6 +2554,7 @@ fn run_single_acceptor(
             &mut buf,
             &mut pending,
             start,
+            &mut admission_pending,
         );
 
         // Drive pending handshakes toward Connected, then route -- same
@@ -2687,6 +2887,49 @@ mod b02_regression_tests {
         (a, b)
     }
 
+    /// Drain every queued `SendPacket` output on `from` into `to`'s receive
+    /// path -- one direction of a handshake round-trip, shared by both
+    /// directions in [`established_protocol_pair`]'s loop.
+    fn pump_handshake_output(
+        from: &mut SrtConnection,
+        to: &mut SrtConnection,
+        now: shiguredo_srt::Timestamp,
+        decode_expect: &str,
+    ) {
+        while let Some(output) = from.poll_output() {
+            if let shiguredo_srt::ConnectionOutput::SendPacket(packet) = output {
+                to.feed_recv_buf(&packet, now).expect(decode_expect);
+            }
+        }
+    }
+
+    fn established_protocol_pair() -> (SrtConnection, SrtConnection) {
+        let options = ConnectionOptions {
+            tsbpd_delay: 0,
+            ..Default::default()
+        };
+        let mut caller = SrtConnection::new_caller(options.clone());
+        let mut listener = SrtConnection::new_listener(options);
+        caller
+            .connect(shiguredo_srt::Timestamp::from_micros(0))
+            .expect("caller connects");
+        for round in 0..10u64 {
+            let now = shiguredo_srt::Timestamp::from_micros(round * 10_000);
+            pump_handshake_output(&mut caller, &mut listener, now, "caller packet decodes");
+            pump_handshake_output(&mut listener, &mut caller, now, "listener packet decodes");
+            if caller.state() == shiguredo_srt::ConnectionState::Connected
+                && listener.state() == shiguredo_srt::ConnectionState::Connected
+            {
+                break;
+            }
+        }
+        assert_eq!(caller.state(), shiguredo_srt::ConnectionState::Connected);
+        assert_eq!(listener.state(), shiguredo_srt::ConnectionState::Connected);
+        while caller.poll_event().is_some() {}
+        while listener.poll_event().is_some() {}
+        (caller, listener)
+    }
+
     /// Opus-review BUG-1: `receive_ready` fed a chained
     /// `carried.iter().chain(events.iter()...)` straight into the service
     /// loop with nothing deduplicating an index that appears in *both* --
@@ -2746,6 +2989,7 @@ mod b02_regression_tests {
             &mut pending,
         );
         assert_eq!(pending, vec![0], "budget-exhausted driver must be carried");
+        let pending_capacity = pending.capacity();
 
         // Three more rounds, each sending fresh data before polling again
         // (still without ever fully draining) -- the exact condition that
@@ -2768,7 +3012,119 @@ mod b02_regression_tests {
                 vec![0],
                 "round {round}: pending must never accumulate a duplicate index"
             );
+            assert_eq!(
+                pending.capacity(),
+                pending_capacity,
+                "round {round}: continuation storage must be reused"
+            );
         }
+    }
+
+    /// A budget yield on Mio must be continued by the owner even when no new
+    /// edge arrives. This uses real SRT DATA packets so the test proves the
+    /// protocol receives the whole backlog, including the first-datagram
+    /// receiver path, rather than merely counting malformed UDP reads.
+    #[test]
+    fn receive_ready_drains_backlog_without_a_new_readiness_edge() {
+        let (mut caller, listener) = established_protocol_pair();
+        let mut poll = Poll::new().expect("mio Poll::new");
+        let mut events = Events::with_capacity(8);
+        let mut socket = mio::net::UdpSocket::bind("127.0.0.1:0".parse().unwrap()).expect("bind");
+        let peer = StdUdpSocket::bind("127.0.0.1:0").expect("bind peer");
+        peer.connect(socket.local_addr().expect("local addr"))
+            .expect("peer connects");
+        socket
+            .connect(peer.local_addr().expect("peer addr"))
+            .expect("socket connects");
+        poll.registry()
+            .register(&mut socket, Token(0), Interest::READABLE)
+            .expect("register");
+
+        // Monotonically after `established_protocol_pair`'s own handshake
+        // simulation (which already advanced this connection's clock up
+        // to 90_000us) -- regressing to an earlier timestamp than the
+        // connection's own established baseline silently confused its
+        // internal timing bookkeeping and made every packet fed below
+        // vanish before ever surfacing as `DataReceived`.
+        let now = shiguredo_srt::Timestamp::from_micros(100_000);
+        for i in 0..12u8 {
+            caller.send(&[i], now).expect("valid SRT data");
+        }
+        let mut packets = Vec::new();
+        while let Some(output) = caller.poll_output() {
+            if let shiguredo_srt::ConnectionOutput::SendPacket(packet) = output {
+                packets.push(packet);
+            }
+        }
+        assert_eq!(packets.len(), 12, "each one-byte message is one SRT packet");
+        for packet in packets {
+            peer.send(&packet).expect("queue SRT data");
+        }
+
+        let mut cfg = test_bench_config();
+        cfg.mode = crate::Mode::Receiver;
+        cfg.recv_rounds = 2;
+        let mut drivers = vec![minimal_driver(Conn::new(listener, socket))];
+        // Offset into the past so `crate::now_ts(start)` (real elapsed
+        // time, what `receive_connected_datagrams`/`receive_first_datagram`
+        // actually feed to the protocol) reports a value safely after
+        // `listener`'s own already-advanced 90_000us handshake baseline --
+        // feeding it a regressed timestamp silently confused its internal
+        // timing bookkeeping and made every packet fed below vanish
+        // before ever surfacing as `DataReceived`.
+        let start = Instant::now() - Duration::from_micros(150_000);
+        let mut buf = [0u8; 2048];
+        let mut touched = Vec::new();
+        let mut pending = Vec::new();
+
+        poll.poll(&mut events, Some(Duration::from_millis(200)))
+            .expect("initial poll");
+        assert!(!events.is_empty(), "backlog must produce initial readiness");
+        receive_ready(
+            &cfg,
+            &mut drivers,
+            &events,
+            &mut buf,
+            start,
+            &mut touched,
+            &mut pending,
+        );
+        assert_eq!(
+            pending,
+            vec![0],
+            "the capped first visit needs continuation"
+        );
+
+        // No datagram is sent after the first poll. The only way to make
+        // progress now is the carried continuation, even if edge readiness
+        // stays quiet while the socket remains readable.
+        for _ in 0..16 {
+            if pending.is_empty() {
+                break;
+            }
+            poll.poll(&mut events, Some(Duration::ZERO))
+                .expect("continuation poll");
+            receive_ready(
+                &cfg,
+                &mut drivers,
+                &events,
+                &mut buf,
+                start,
+                &mut touched,
+                &mut pending,
+            );
+        }
+        assert!(
+            pending.is_empty(),
+            "backlog continuation must eventually finish"
+        );
+        let delivered = std::iter::from_fn(|| drivers[0].conn.conn.poll_event())
+            .filter(|event| matches!(event, ConnectionEvent::DataReceived { .. }))
+            .count();
+        assert_eq!(
+            delivered, 12,
+            "all valid SRT DATA packets must be delivered"
+        );
     }
 
     /// B02 checkpoint 1: `receive_connected_datagrams` used to loop until

@@ -87,11 +87,27 @@ where
     }
 
     pub fn pop_due(&mut self, now: Timestamp, out: &mut Vec<K>) {
+        let _ = self.pop_due_bounded(now, usize::MAX, out);
+    }
+
+    /// Drain at most `max_work` due heap entries, including stale entries.
+    /// Returns `(entries_visited, due_entries_remaining)`. Counting stale
+    /// entries here lets a caller put a hard cap around maintenance even when
+    /// a queue has accumulated historical replacements.
+    pub fn pop_due_bounded(
+        &mut self,
+        now: Timestamp,
+        max_work: usize,
+        out: &mut Vec<K>,
+    ) -> (usize, bool) {
         out.clear();
+        let mut visited = 0;
         while let Some(std::cmp::Reverse(top)) = self.heap.peek()
             && top.deadline_micros <= now.as_micros()
+            && visited < max_work
         {
             let std::cmp::Reverse(entry) = self.heap.pop().expect("peeked entry exists");
+            visited += 1;
             match self.current.entry(entry.key.clone()) {
                 HashEntry::Occupied(slot) if *slot.get() == entry.deadline_micros => {
                     slot.remove();
@@ -105,7 +121,29 @@ where
                 }
             }
         }
-        self.maybe_rebuild();
+        // A finite maintenance visit must not trigger the proportional
+        // rebuild pass: rebuilding is O(live) and would defeat the caller's
+        // work bound. The compatibility, unbounded path keeps the original
+        // amortized rebuild behavior.
+        if max_work == usize::MAX {
+            self.maybe_rebuild();
+        }
+        let due_remaining = self
+            .heap
+            .peek()
+            .is_some_and(|top| top.0.deadline_micros <= now.as_micros());
+        (visited, due_remaining)
+    }
+
+    /// Conservative O(1) due probe. A stale heap head may report work that
+    /// the next bounded pop will discard, which is intentional: callers can
+    /// wake for a cheap extra maintenance visit without scanning stale keys.
+    #[must_use]
+    #[inline]
+    pub fn has_due(&self, now: Timestamp) -> bool {
+        self.heap
+            .peek()
+            .is_some_and(|top| top.0.deadline_micros <= now.as_micros())
     }
 
     /// Earliest live deadline, cleaning stale heap entries as necessary.

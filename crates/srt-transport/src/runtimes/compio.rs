@@ -185,6 +185,7 @@ pub fn caller(
     now: Timestamp,
 ) -> Result<Conn, crate::RuntimeBuildError> {
     let prepared = config.prepare(crate::RuntimeFlavor::Compio)?;
+    prepared.require_exclusive()?;
     let socket = compio::net::UdpSocket::from_std(prepared.bind_socket()?)?;
     Ok(Conn::with_budgets(
         prepared.connection(now)?,
@@ -198,6 +199,22 @@ mod tests {
     use super::*;
     use std::future::Future;
     use std::task::{Context, Poll, Waker};
+
+    #[test]
+    fn caller_rejects_shared_ownership_before_socket_bind() {
+        let config = crate::CallerConfig::builder("127.0.0.1:9".parse().expect("address"))
+            .ownership(crate::SocketOwnership::Shared)
+            .build()
+            .expect("caller config");
+        let result = super::caller(&config, Timestamp::default());
+        match result {
+            Err(crate::RuntimeBuildError::Config(error)) => {
+                assert_eq!(error.field(), "transport.ownership")
+            }
+            Err(error) => panic!("expected ownership rejection, got {error}"),
+            Ok(_) => panic!("Shared caller must be rejected before binding"),
+        }
+    }
 
     /// K02: a `Conn` built via [`caller`] must actually drive with its
     /// configured `TransportConfig::output_drain`, not silently substitute

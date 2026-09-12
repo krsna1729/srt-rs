@@ -95,6 +95,13 @@ struct GroupLegIo {
     socket: std::net::UdpSocket,
     timers: ManualTimerStore,
     pending_outputs: VecDeque<ConnectionOutput>,
+    recv_budget: RecvBudget,
+}
+
+#[derive(Clone, Copy)]
+struct GroupLegPolicy {
+    recv_budget: RecvBudget,
+    batch_capacity: usize,
 }
 
 /// Per-leg I/O work completed by one [`GroupConn::drive`] call.
@@ -318,7 +325,7 @@ impl GroupConn {
         runtime: RuntimeFlavor,
         now: Timestamp,
     ) -> Result<Self, GroupBuildError> {
-        let mut raw_legs = Vec::new();
+        let mut prepared_legs = Vec::new();
         let mut shared_initial_seq = None;
         for leg in legs {
             let mut caller = leg.caller;
@@ -341,26 +348,31 @@ impl GroupConn {
             // Every leg already gets its own dedicated socket by
             // construction (one per group member); `Shared` ownership,
             // which multiplexes several sessions onto one socket, is never
-            // meaningful here and `bind_socket` (K01) leaves such a socket
-            // unconnected -- silently breaking this type's connected-socket
-            // `sendmsg_connected_batch` send path instead of failing
-            // preparation. Reject it up front instead.
-            if !prepared.transport.exclusive {
-                return Err(GroupBuildError::Config(ConfigError::new(
-                    "transport.ownership",
-                    "a bonded group leg needs its own connected socket; Shared ownership is not supported here",
-                )));
-            }
-            raw_legs.push(GroupConnectionLeg {
-                member_id: leg.member_id,
-                weight: leg.weight,
-                connection: prepared.connection(now)?,
-                socket: prepared.bind_socket()?,
-            });
+            // meaningful here. Reject it before `bind_socket` can perform
+            // any socket I/O: Shared callers are deliberately left
+            // unconnected and cannot use this driver's connected send path.
+            prepared.require_exclusive()?;
+            let policy = GroupLegPolicy {
+                recv_budget: prepared.transport.recv_budget,
+                batch_capacity: prepared.transport.recv_batch_capacity(),
+            };
+            prepared_legs.push((
+                GroupConnectionLeg {
+                    member_id: leg.member_id,
+                    weight: leg.weight,
+                    connection: prepared.connection(now)?,
+                    socket: prepared.bind_socket()?,
+                },
+                policy,
+            ));
         }
         let mode = shiguredo_srt::GroupMode::from_group_type(group.group_type)
             .ok_or(GroupBuildError::InvalidGroupType)?;
-        Ok(Self::new(group.group_id, mode, raw_legs)?)
+        Ok(Self::new_with_policies(
+            group.group_id,
+            mode,
+            prepared_legs,
+        )?)
     }
 
     /// Assemble a group from application-owned protocol cores and connected,
@@ -371,17 +383,45 @@ impl GroupConn {
         mode: shiguredo_srt::GroupMode,
         legs: impl IntoIterator<Item = GroupConnectionLeg>,
     ) -> Result<Self, shiguredo_srt::Error> {
+        Self::new_with_policies(
+            group_id,
+            mode,
+            legs.into_iter().map(|leg| {
+                (
+                    leg,
+                    GroupLegPolicy {
+                        recv_budget: RecvBudget::default(),
+                        batch_capacity: RecvBatch::DEFAULT_CAPACITY,
+                    },
+                )
+            }),
+        )
+    }
+
+    fn new_with_policies(
+        group_id: u32,
+        mode: shiguredo_srt::GroupMode,
+        legs: impl IntoIterator<Item = (GroupConnectionLeg, GroupLegPolicy)>,
+    ) -> Result<Self, shiguredo_srt::Error> {
         let mut group = shiguredo_srt::SrtGroup::new(group_id, mode)?;
         let mut io_legs = Vec::new();
-        for leg in legs {
+        let mut batch_capacity = 0usize;
+        for (leg, policy) in legs {
             group.add_member(leg.member_id, leg.weight, leg.connection)?;
+            batch_capacity = batch_capacity.max(policy.batch_capacity);
             io_legs.push(GroupLegIo {
                 member_id: leg.member_id,
                 socket: leg.socket,
                 timers: ManualTimerStore::new(),
                 pending_outputs: VecDeque::new(),
+                recv_budget: policy.recv_budget,
             });
         }
+        let batch_capacity = if io_legs.is_empty() {
+            RecvBatch::DEFAULT_CAPACITY
+        } else {
+            batch_capacity.max(1)
+        };
         Ok(Self {
             group,
             legs: io_legs,
@@ -390,14 +430,12 @@ impl GroupConn {
             logical_payloads_received: 0,
             logical_payload_bytes_received: 0,
             // D02: one wire datagram is always MTU-bounded (SRT's default
-            // path MTU is far under 2 KiB), the same bound every
-            // non-bonded `Conn`'s own `RecvBatch::new()` already uses
-            // successfully -- the previous 65536-byte-per-buffer choice
-            // (32x this) had no stated reason and made this the one
-            // "eager 2 MiB receive scratch" allocation in the crate.
-            // T01's own truncation handling still protects against
-            // anything larger, the same as every other `Conn`.
-            recv_batch: RecvBatch::new(),
+            // path MTU is far under 2 KiB), and every slot uses the same
+            // bounded buffer as the non-bonded receive driver. The scratch
+            // count is the largest resolved per-leg batch policy so each leg
+            // can still receive up to its own configured budget without a
+            // per-leg allocation.
+            recv_batch: RecvBatch::with_capacity(batch_capacity, RecvBatch::DEFAULT_BUF_LEN),
             io_stats: BatchIoStats::default(),
         })
     }
@@ -484,8 +522,8 @@ impl GroupConn {
     }
 
     /// Drive timers, nonblocking UDP input, and a bounded output pump for
-    /// every leg once. A readable leg may contain up to 64 datagrams per call
-    /// to avoid one busy path starving the rest of the group.
+    /// every leg once. Each leg's resolved receive budget bounds its own
+    /// work, so a busy member cannot consume another member's budget.
     ///
     /// `report` is cleared and refilled in place (D02): a caller drives
     /// every tick, so this reuses the caller-owned `Vec`'s capacity instead
@@ -497,7 +535,6 @@ impl GroupConn {
         report: &mut GroupDriveReport,
     ) -> std::io::Result<()> {
         report.legs.clear();
-        let recv_budget = RecvBudget::new(2, 64);
         {
             let (group, legs, recv_batch, io_stats) = (
                 &mut self.group,
@@ -523,7 +560,7 @@ impl GroupConn {
                 let recv_result = drain_recv_fd(
                     leg.socket.as_raw_fd(),
                     recv_batch,
-                    recv_budget,
+                    leg.recv_budget,
                     |_, data| {
                         if conn.feed_recv_buf(data, now).is_err() {
                             malformed_datagrams += 1;
@@ -632,6 +669,8 @@ fn mark_member_broken_if_new(group: &mut shiguredo_srt::SrtGroup, member_id: u32
 #[cfg(test)]
 mod group_conn_tests {
     use super::*;
+    use crate::{BatchingPolicy, ListenerTopology, SocketBufferConfig, WorkerCount};
+    use std::num::NonZeroUsize;
 
     struct Peer {
         socket: std::net::UdpSocket,
@@ -837,6 +876,54 @@ mod group_conn_tests {
             }
             Err(error) => assert!(matches!(error, GroupBuildError::Config(_))),
         }
+    }
+
+    #[test]
+    fn caller_uses_each_leg_receive_budget_and_largest_batch_capacity() {
+        if !RuntimeFlavor::Mio.capabilities().receive_batching {
+            return;
+        }
+        let first_peer = Peer::new();
+        let second_peer = Peer::new();
+        let first_config = CallerConfig::builder(first_peer.socket.local_addr().expect("address"))
+            .configure_transport(|transport| {
+                transport.topology = ListenerTopology::SharedPool {
+                    listeners: WorkerCount::Count(NonZeroUsize::MIN),
+                };
+                transport.batching =
+                    BatchingPolicy::MaxDatagrams(NonZeroUsize::new(3).expect("batch capacity"));
+                transport.recv_budget = RecvBudget::new(1, 2);
+                transport.socket_buffers = SocketBufferConfig::SystemDefault;
+            })
+            .build()
+            .expect("first caller config");
+        let second_config =
+            CallerConfig::builder(second_peer.socket.local_addr().expect("address"))
+                .configure_transport(|transport| {
+                    transport.topology = ListenerTopology::SharedPool {
+                        listeners: WorkerCount::Count(NonZeroUsize::MIN),
+                    };
+                    transport.batching =
+                        BatchingPolicy::MaxDatagrams(NonZeroUsize::new(7).expect("batch capacity"));
+                    transport.recv_budget = RecvBudget::new(4, 9);
+                    transport.socket_buffers = SocketBufferConfig::SystemDefault;
+                })
+                .build()
+                .expect("second caller config");
+        let conn = GroupConn::caller(
+            GroupConfig::new(45, shiguredo_srt::GroupType::Broadcast),
+            [
+                GroupCallerLeg::new(1, 10, first_config),
+                GroupCallerLeg::new(2, 20, second_config),
+            ],
+            RuntimeFlavor::Mio,
+            Timestamp::default(),
+        )
+        .expect("group caller");
+
+        assert_eq!(conn.recv_batch.capacity(), 7);
+        assert_eq!(conn.legs[0].recv_budget, RecvBudget::new(1, 2));
+        assert_eq!(conn.legs[1].recv_budget, RecvBudget::new(4, 9));
     }
 
     fn connect_two_leg_group(runtime: RuntimeFlavor) -> (GroupConn, Peer, Peer) {

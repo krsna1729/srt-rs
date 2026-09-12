@@ -1472,6 +1472,7 @@ impl TransportConfig {
             ));
         }
         validate_output_budget(self.output_drain)?;
+        validate_recv_budget(self.recv_budget)?;
         let workers = self.workers.resolve(capabilities.available_parallelism);
         let topology = self.resolve_topology(capabilities, workers)?;
         let shared_listener = !matches!(topology, ResolvedListenerTopology::PerPort);
@@ -1625,6 +1626,20 @@ pub struct ResolvedTransportConfig {
     /// (K01). [`PreparedCaller::bind_socket`] and
     /// [`PreparedListener::bind_sockets`] already honor this.
     pub exclusive: bool,
+}
+
+impl ResolvedTransportConfig {
+    /// Number of receive scratch slots a readiness driver should allocate for
+    /// this resolved plan. A disabled batch policy still gets one slot so
+    /// the same driver can use the bounded receive helper without inventing a
+    /// second capacity convention.
+    #[must_use]
+    pub const fn recv_batch_capacity(self) -> usize {
+        match self.batch_size {
+            Some(size) => size.get(),
+            None => 1,
+        }
+    }
 }
 
 /// Listener resource and lifecycle policy.
@@ -2140,6 +2155,56 @@ pub struct RuntimeListener<S> {
 }
 
 impl PreparedCaller {
+    /// Require the connected socket contract used by the built-in native
+    /// caller adapters. Shared callers intentionally remain unconnected and
+    /// must be driven by a destination-aware owner.
+    pub fn require_exclusive(&self) -> Result<(), ConfigError> {
+        if self.transport.exclusive {
+            Ok(())
+        } else {
+            Err(ConfigError::new(
+                "transport.ownership",
+                "this caller adapter requires Exclusive socket ownership; Shared callers need a destination-aware driver",
+            ))
+        }
+    }
+
+    /// Check the settings that must agree when several prepared callers share
+    /// one owner. Remote endpoint, session identity, and per-connection
+    /// policy remain leg-specific. Pass `Some(first.connect)` when the owner
+    /// wants connect policies to match; pass `None` when it explicitly
+    /// replaces that policy with its own pool setting. Keeping the comparison
+    /// values separate means an owner need not retain the first caller's
+    /// session (and its crypto material) merely for compatibility checks.
+    pub fn validate_shared_compatibility(
+        &self,
+        local_bind: Option<SocketAddr>,
+        transport: ResolvedTransportConfig,
+        connect: Option<ConnectConfig>,
+    ) -> Result<(), ConfigError> {
+        if self.local_bind != local_bind {
+            return Err(ConfigError::new(
+                "caller.local_bind",
+                "shared callers must use the same local bind address",
+            ));
+        }
+        if self.transport != transport {
+            return Err(ConfigError::new(
+                "caller.transport",
+                "shared callers must use the same resolved transport settings",
+            ));
+        }
+        if let Some(connect) = connect
+            && self.connect != connect
+        {
+            return Err(ConfigError::new(
+                "caller.connect",
+                "shared callers must use the same connect policy",
+            ));
+        }
+        Ok(())
+    }
+
     /// Bind and connect a nonblocking standard UDP socket. Convert it to the
     /// selected runtime's native type, or keep it for a custom adapter.
     /// `connect()`s the socket to `remote` for `Exclusive` ownership (the
@@ -2228,6 +2293,16 @@ pub(crate) fn validate_output_budget(budget: OutputDrainBudget) -> Result<(), Co
         return Err(ConfigError::new(
             "transport.output_drain",
             "all action, packet, and byte limits must be non-zero",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_recv_budget(budget: RecvBudget) -> Result<(), ConfigError> {
+    if budget.max_rounds == 0 || budget.max_datagrams == 0 {
+        return Err(ConfigError::new(
+            "transport.recv_budget",
+            "all receive round and datagram limits must be non-zero",
         ));
     }
     Ok(())
@@ -2369,6 +2444,70 @@ mod tests {
             .resolve(capabilities)
             .expect_err("unsupported batching");
         assert_eq!(error.field(), "transport.batching");
+    }
+
+    #[test]
+    fn resolved_receive_settings_expose_batch_capacity_and_reject_zero_budget() {
+        let config = TransportConfig {
+            topology: ListenerTopology::SharedPool {
+                listeners: WorkerCount::Count(NonZeroUsize::MIN),
+            },
+            batching: BatchingPolicy::MaxDatagrams(
+                NonZeroUsize::new(7).expect("non-zero batch capacity"),
+            ),
+            recv_budget: RecvBudget::new(3, 11),
+            ..TransportConfig::default()
+        };
+        let resolved = config
+            .resolve(RuntimeFlavor::Mio.capabilities())
+            .expect("resolved receive settings");
+        assert_eq!(resolved.recv_batch_capacity(), 7);
+        assert_eq!(resolved.recv_budget, RecvBudget::new(3, 11));
+
+        let mut invalid = config;
+        invalid.recv_budget = RecvBudget::new(0, 11);
+        let error = invalid
+            .resolve(RuntimeFlavor::Mio.capabilities())
+            .expect_err("zero receive rounds");
+        assert_eq!(error.field(), "transport.recv_budget");
+    }
+
+    #[test]
+    fn prepared_caller_exclusive_and_shared_compatibility_checks_are_explicit() {
+        let first = CallerConfig::builder(address(9))
+            .local_bind(address(0))
+            .build()
+            .expect("caller config")
+            .prepare(RuntimeFlavor::Mio)
+            .expect("prepared caller");
+        first
+            .require_exclusive()
+            .expect("default caller is exclusive");
+        first
+            .validate_shared_compatibility(first.local_bind, first.transport, Some(first.connect))
+            .expect("matching shared owner settings");
+
+        let second = CallerConfig::builder(address(10))
+            .local_bind(address(1))
+            .build()
+            .expect("caller config")
+            .prepare(RuntimeFlavor::Mio)
+            .expect("prepared caller");
+        let error = second
+            .validate_shared_compatibility(first.local_bind, first.transport, Some(first.connect))
+            .expect_err("different local bind");
+        assert_eq!(error.field(), "caller.local_bind");
+
+        let shared = CallerConfig::builder(address(9))
+            .ownership(SocketOwnership::Shared)
+            .build()
+            .expect("shared caller config")
+            .prepare(RuntimeFlavor::Mio)
+            .expect("prepared shared caller");
+        let error = shared
+            .require_exclusive()
+            .expect_err("shared caller has no connected-only contract");
+        assert_eq!(error.field(), "transport.ownership");
     }
 
     #[test]

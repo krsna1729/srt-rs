@@ -146,6 +146,7 @@ pub fn caller(
     now: Timestamp,
 ) -> Result<Conn, crate::RuntimeBuildError> {
     let prepared = config.prepare(crate::RuntimeFlavor::Mio)?;
+    prepared.require_exclusive()?;
     let socket = mio::net::UdpSocket::from_std(prepared.bind_socket()?);
     Ok(Conn::with_budgets(
         prepared.connection(now)?,
@@ -161,17 +162,6 @@ pub fn caller(
 const OWNER_LISTENER_TOKEN: mio::Token = mio::Token(0);
 const OWNER_CALLER_TOKEN: mio::Token = mio::Token(1);
 
-/// [`Owner::poll_io`]'s receive budget: drain each ready socket until the
-/// kernel reports `WouldBlock`, not a fixed round/datagram cap. Mio
-/// registers both sockets edge-triggered ([`mio::Interest::READABLE`] with
-/// no level-triggered fallback), so a round cap that stops before the
-/// socket is actually empty leaves datagrams sitting in the kernel with no
-/// further `READABLE` event to signal they are still there -- this is
-/// exactly the hazard [`crate::RecvBudget::until_would_block`]'s own doc
-/// comment describes, and a peer stuck behind that backlog never gets
-/// unstuck without a fresh arrival re-arming the edge.
-const OWNER_RECV_BUDGET: crate::RecvBudget = crate::RecvBudget::until_would_block();
-
 struct OwnerListenerSide {
     socket: mio::net::UdpSocket,
     peers: crate::PeerTable,
@@ -179,8 +169,12 @@ struct OwnerListenerSide {
     telemetry: crate::IngressTelemetry,
     recv_batch: crate::RecvBatch,
     outbound: Vec<(std::net::SocketAddr, Vec<u8>)>,
-    /// A04: enforced every [`Owner::drive`] tick via `PeerTable::prune_idle`.
     idle_timeout: Duration,
+    transport: crate::ResolvedTransportConfig,
+    recv_pending: bool,
+    output_pending: bool,
+    event_pending: bool,
+    write_blocked: bool,
 }
 
 struct OwnerCallerSide {
@@ -188,6 +182,13 @@ struct OwnerCallerSide {
     callers: crate::CallerPool,
     recv_batch: crate::RecvBatch,
     outbound: Vec<(std::net::SocketAddr, Vec<u8>)>,
+    transport: crate::ResolvedTransportConfig,
+    local_bind: Option<std::net::SocketAddr>,
+    connect_config: crate::ConnectConfig,
+    recv_pending: bool,
+    output_pending: bool,
+    event_pending: bool,
+    write_blocked: bool,
 }
 
 /// A single [`mio::Poll`] driving one shared-socket listener side and one
@@ -212,39 +213,17 @@ struct OwnerCallerSide {
 /// dynamic runtime abstraction, and the async-runtime readiness/completion
 /// cancellation cards (S04/S05) do not gate this independent path.
 ///
-/// The caller side is a [`crate::CallerPool`] (A04), defaulting to an
-/// effectively unbounded policy so [`Self::connect`]'s existing behavior is
-/// unchanged unless an application opts into real `max_in_flight`/
-/// `attempt_deadline` enforcement via [`Self::set_caller_pool_policy`]
-/// before its first `connect()` call; [`Self::drive`] retires stalled
-/// attempts and admits queued ones every tick regardless of policy. The
-/// listener side enforces `AdmissionConfig::idle_timeout` every tick via
-/// `PeerTable::prune_idle`, unconditionally (there is no equivalent opt-out
-/// -- an idle established peer is never a legitimate long-term resource
-/// hold the way an in-flight connect attempt briefly is).
-///
-/// One known gap, tracked as an explicit follow-up rather than a partial
-/// fix bolted onto this card:
-///
-/// - `listen()` validates only the listener socket topology, not the
-///   resolved promotion policy; a `ListenerConfig` requesting a non-`Never`
-///   promotion resolves and binds fine, then is silently never acted on
-///   (this owner has no relocation target to promote a peer onto).
+/// Caller concurrency and attempt deadlines come from the first caller's
+/// `ConnectConfig`, unless explicitly overridden before connecting. Each
+/// socket visit has finite receive, output and event budgets. Readiness
+/// continuations survive budget exhaustion, including Mio's edge-triggered
+/// receive path. A socket blocked on output waits for writable readiness.
 pub struct Owner {
     poll: mio::Poll,
     events: mio::Events,
     listener: Option<OwnerListenerSide>,
     caller: Option<OwnerCallerSide>,
-    /// A04: policy for the [`crate::CallerPool`] backing the caller side,
-    /// set once before the first [`Self::connect`] call locks it in.
-    /// Defaults to effectively unbounded so `Owner::connect`'s existing
-    /// (A03) behavior is unchanged for an application that never calls
-    /// [`Self::set_caller_pool_policy`] -- `ConnectConfig::default()`'s own
-    /// `max_in_flight` of 1 would otherwise silently make every
-    /// default-configured caller wait for the previous one to connect,
-    /// which is not this card's call to make unilaterally for existing
-    /// callers.
-    caller_pool_policy: (std::num::NonZeroUsize, Duration),
+    caller_pool_policy: Option<(std::num::NonZeroUsize, Duration)>,
 }
 
 impl Owner {
@@ -254,17 +233,11 @@ impl Owner {
             events: mio::Events::with_capacity(1024),
             listener: None,
             caller: None,
-            caller_pool_policy: (std::num::NonZeroUsize::MAX, Duration::MAX),
+            caller_pool_policy: None,
         })
     }
 
-    /// Opt into real `max_in_flight`/`attempt_deadline` enforcement
-    /// (A04) on the caller side, instead of the effectively-unbounded
-    /// default. Must be called before the first [`Self::connect`] --
-    /// once the shared caller socket and its [`crate::CallerPool`] exist,
-    /// changing the policy underneath already-admitted attempts would be
-    /// ambiguous (rescale existing deadlines? leave them? which ones
-    /// count against the new limit?), so this returns an error instead.
+    /// Override the first caller's pool policy before binding the caller socket.
     pub fn set_caller_pool_policy(
         &mut self,
         max_in_flight: std::num::NonZeroUsize,
@@ -277,7 +250,14 @@ impl Owner {
                  socket and its pool already exist",
             )));
         }
-        self.caller_pool_policy = (max_in_flight, attempt_deadline);
+        if attempt_deadline.is_zero() {
+            return Err(crate::ConfigError::new(
+                "caller_pool_policy",
+                "attempt deadline must be positive",
+            )
+            .into());
+        }
+        self.caller_pool_policy = Some((max_in_flight, attempt_deadline));
         Ok(())
     }
 
@@ -305,6 +285,13 @@ impl Owner {
                  reuseport topologies need a multi-acceptor driver, which \
                  this card does not build",
             )));
+        }
+        if prepared.transport.promotion != srt_lifecycle::Promotion::Never {
+            return Err(crate::ConfigError::new(
+                "listener.transport.promotion",
+                "Owner has no relocation target; set promotion to Never",
+            )
+            .into());
         }
         if !prepared.bind.is_ipv4() {
             // `sendmsg_batch` (every reply this owner ever sends) rejects a
@@ -337,8 +324,16 @@ impl Owner {
             idle_timeout: prepared.admission.idle_timeout,
             peers: prepared.peer_table(),
             telemetry: crate::IngressTelemetry::new(),
-            recv_batch: crate::RecvBatch::new(),
+            recv_batch: crate::RecvBatch::with_capacity(
+                prepared.transport.recv_batch_capacity(),
+                crate::RecvBatch::DEFAULT_BUF_LEN,
+            ),
             outbound: Vec::new(),
+            transport: prepared.transport,
+            recv_pending: false,
+            output_pending: false,
+            event_pending: false,
+            write_blocked: false,
         });
         Ok(())
     }
@@ -350,24 +345,19 @@ impl Owner {
     /// already be `Shared` -- the default `Exclusive` would `connect()` the
     /// socket to one remote, which cannot be shared with other sessions.
     ///
-    /// Only the *first* call's `config.local_bind`/`socket_buffer_bytes`
-    /// take effect -- they choose the one socket every later call shares,
-    /// and a later call's own values are silently not applied to it.
-    /// `config.remote` and every session setting, by contrast, are honored
-    /// on every call: only the socket-construction half of a later config
-    /// is ignored, never the session/protocol half.
-    ///
-    /// Returns [`crate::PoolOutcome::Admitted`] immediately unless a
-    /// bounded policy was set via [`Self::set_caller_pool_policy`] and the
-    /// pool is already at `max_in_flight`, in which case it returns
-    /// [`crate::PoolOutcome::Queued`] -- call [`Self::drive`] to let the
-    /// pool retire stalled attempts and admit queued ones (A04).
+    /// Later calls must use compatible shared socket settings and pool policy.
+    /// A full pool queues within its configured finite queue limit; applications
+    /// observe queued outcomes through the caller pool.
     pub fn connect(
         &mut self,
         config: &crate::CallerConfig,
         now: Timestamp,
     ) -> Result<crate::PoolOutcome, crate::RuntimeBuildError> {
-        let prepared = config.prepare(crate::RuntimeFlavor::Mio)?;
+        let mut prepared = config.prepare(crate::RuntimeFlavor::Mio)?;
+        if let Some((max_in_flight, attempt_deadline)) = self.caller_pool_policy {
+            prepared.connect.max_in_flight = max_in_flight;
+            prepared.connect.attempt_deadline = attempt_deadline;
+        }
         if prepared.transport.exclusive {
             return Err(crate::RuntimeBuildError::from(crate::ConfigError::new(
                 "caller.transport.ownership",
@@ -387,6 +377,13 @@ impl Owner {
                  an IPv4 remote address instead",
             )));
         }
+        if let Some(side) = self.caller.as_ref() {
+            prepared.validate_shared_compatibility(
+                side.local_bind,
+                side.transport,
+                Some(side.connect_config),
+            )?;
+        }
         if self.caller.is_none() {
             let mut socket = mio::net::UdpSocket::from_std(prepared.bind_socket()?);
             self.poll.registry().register(
@@ -394,12 +391,25 @@ impl Owner {
                 OWNER_CALLER_TOKEN,
                 mio::Interest::READABLE,
             )?;
-            let (max_in_flight, attempt_deadline) = self.caller_pool_policy;
+            let crate::ConnectConfig {
+                max_in_flight,
+                attempt_deadline,
+            } = prepared.connect;
             self.caller = Some(OwnerCallerSide {
                 socket,
                 callers: crate::CallerPool::new(max_in_flight, attempt_deadline),
-                recv_batch: crate::RecvBatch::new(),
+                recv_batch: crate::RecvBatch::with_capacity(
+                    prepared.transport.recv_batch_capacity(),
+                    crate::RecvBatch::DEFAULT_BUF_LEN,
+                ),
                 outbound: Vec::new(),
+                transport: prepared.transport,
+                local_bind: prepared.local_bind,
+                connect_config: prepared.connect,
+                recv_pending: false,
+                output_pending: false,
+                event_pending: false,
+                write_blocked: false,
             });
         }
         let side = self.caller.as_mut().expect("just ensured above");
@@ -411,8 +421,8 @@ impl Owner {
         })
     }
 
-    /// Poll the OS for readiness and drain every ready socket's incoming
-    /// datagrams into the listener/caller tables. Fires no timers and sends
+    /// Poll readiness and receive within each socket's configured budget.
+    /// Remember unfinished receive work across visits. Fires no timers and sends
     /// nothing; call [`Self::drive`] afterward to do both.
     ///
     /// `now` is called only *after* [`mio::Poll::poll`] returns, not before
@@ -430,124 +440,159 @@ impl Owner {
         timeout: Option<Duration>,
         now: impl FnOnce() -> Timestamp,
     ) -> io::Result<()> {
+        // Continue known work without relying on another readiness edge.
+        let pending = self.listener.as_ref().is_some_and(|side| {
+            side_has_continuation_work(
+                side.recv_pending,
+                side.event_pending,
+                side.write_blocked,
+                side.output_pending,
+                side.outbound.is_empty(),
+            )
+        }) || self.caller.as_ref().is_some_and(|side| {
+            side_has_continuation_work(
+                side.recv_pending,
+                side.event_pending,
+                side.write_blocked,
+                side.output_pending,
+                side.outbound.is_empty(),
+            )
+        });
+        let timeout = if pending {
+            Some(Duration::ZERO)
+        } else {
+            timeout
+        };
+        let started = std::time::Instant::now();
         loop {
-            match self.poll.poll(&mut self.events, timeout) {
+            let remaining = timeout.map(|timeout| timeout.saturating_sub(started.elapsed()));
+            match self.poll.poll(&mut self.events, remaining) {
                 Ok(()) => break,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) => return Err(error),
             }
         }
-        let mut listener_ready = false;
-        let mut caller_ready = false;
         for event in self.events.iter() {
-            match event.token() {
-                OWNER_LISTENER_TOKEN => listener_ready = true,
-                OWNER_CALLER_TOKEN => caller_ready = true,
-                _ => {}
+            let side = match event.token() {
+                OWNER_LISTENER_TOKEN => self.listener.as_mut().map(|side| {
+                    (
+                        &mut side.recv_pending,
+                        &mut side.write_blocked,
+                        &mut side.socket,
+                    )
+                }),
+                OWNER_CALLER_TOKEN => self.caller.as_mut().map(|side| {
+                    (
+                        &mut side.recv_pending,
+                        &mut side.write_blocked,
+                        &mut side.socket,
+                    )
+                }),
+                _ => None,
+            };
+            if let Some((recv_pending, write_blocked, socket)) = side {
+                apply_readiness_event(&self.poll, event, recv_pending, write_blocked, socket)?;
             }
         }
         let now = now();
         let mut first_error = None;
-        if listener_ready && let Some(side) = self.listener.as_mut() {
+        if let Some(side) = self.listener.as_mut()
+            && side.recv_pending
+        {
             let (peers, admission, telemetry) = (&mut side.peers, &side.admission, &side.telemetry);
-            let result = crate::drain_recv_fd(
+            if let Err(error) = drain_side_recv(
+                &mut side.recv_pending,
                 side.socket.as_raw_fd(),
                 &mut side.recv_batch,
-                OWNER_RECV_BUDGET,
+                side.transport.recv_budget,
                 |addr, data| {
                     let Some(peer) = addr else { return };
                     let _ = peers.admit(peer, data, now, admission, 0, 1, telemetry);
                 },
-            );
-            if let Err(error) = result {
+            ) {
                 first_error.get_or_insert(error);
             }
         }
-        if caller_ready && let Some(side) = self.caller.as_mut() {
+        if let Some(side) = self.caller.as_mut()
+            && side.recv_pending
+        {
             let callers = side.callers.table_mut();
-            let result = crate::drain_recv_fd(
+            if let Err(error) = drain_side_recv(
+                &mut side.recv_pending,
                 side.socket.as_raw_fd(),
                 &mut side.recv_batch,
-                OWNER_RECV_BUDGET,
+                side.transport.recv_budget,
                 |addr, data| {
                     let Some(peer) = addr else { return };
                     let _ = callers.feed(peer, data, now);
                 },
-            );
-            if let Err(error) = result {
+            ) {
                 first_error.get_or_insert(error);
             }
         }
         first_error.map_or(Ok(()), Err)
     }
 
-    /// Fire due timers and send every pending protocol output on both
-    /// sides. The caller side uses its existing bounded scheduler
-    /// ([`crate::CallerTable::poll_outbound_bounded`], P02) so one caller
-    /// with a large backlog cannot starve another's due timer; the
-    /// listener side's equivalent bound does not exist yet (tracked
-    /// follow-up on `crate::PeerTable::poll_outbound`, also from P02's
-    /// review) and drains unconditionally instead.
+    /// Service both sides with finite per-side limits. The visit budget is
+    /// capped by each side's transport configuration. Idle/pool maintenance
+    /// has the same action limit; receive and application event visits have
+    /// their own configured limits.
     ///
-    /// A side's own table is only asked for fresh output
-    /// (`poll_outbound`/`poll_outbound_bounded`) once its previous visit's
-    /// `outbound` queue is fully sent -- both of those methods start by
-    /// clearing `out`, so calling either while a send from the last visit
-    /// is still queued (kernel backpressure, or a batch over
-    /// `sendmmsg`'s `UIO_MAXIOV` datagram limit) would silently discard the
-    /// unsent remainder instead of retrying it. One side's send error is
-    /// returned only after the other side has still been driven, for the
-    /// same reason as [`Self::poll_io`].
-    ///
-    /// Returns the caller side's [`crate::OutputDrainStatus`] --
-    /// `BudgetExhausted` means more work was ready than `caller_budget`
-    /// allowed, and the application should call [`Self::drive`] again
-    /// immediately rather than wait out its usual poll timeout; `Drained`
-    /// (also returned when there is no caller side) means it is safe to
-    /// wait. The listener side has no equivalent bound yet (see above), so
-    /// it has no comparable status to report.
+    /// `BudgetExhausted` requests another immediate visit. `Backpressured`
+    /// requests a writable wait; the unsent suffix remains owned here.
     pub fn drive(
         &mut self,
         now: Timestamp,
-        caller_budget: crate::OutputDrainBudget,
+        budget: crate::OutputDrainBudget,
     ) -> io::Result<crate::OutputDrainStatus> {
         let mut first_error = None;
+        let mut status = crate::OutputDrainStatus::Drained;
         if let Some(side) = self.listener.as_mut() {
-            // A04: start an orderly close on every established peer that
-            // has gone quiet past the configured idle timeout, before this
-            // tick's own poll_outbound drains and sends the resulting
-            // SHUTDOWN alongside everything else already due.
-            side.peers.prune_idle(now, side.idle_timeout);
+            let budget = budget.intersect(side.transport.output_drain);
+            side.peers
+                .prune_idle_bounded(now, side.idle_timeout, budget.max_actions);
             if side.outbound.is_empty() {
-                side.peers.poll_outbound(now, &mut side.outbound);
+                let report = side
+                    .peers
+                    .poll_outbound_bounded(now, budget, &mut side.outbound);
+                side.output_pending = report.status == crate::OutputDrainStatus::BudgetExhausted;
             }
-            if let Err(error) = crate::flush_destined(side.socket.as_raw_fd(), &mut side.outbound) {
-                first_error.get_or_insert(error);
-            }
+            let side_status = flush_owner_side(
+                &self.poll,
+                &mut side.socket,
+                OWNER_LISTENER_TOKEN,
+                &mut side.outbound,
+                side.recv_pending,
+                side.output_pending,
+                &mut side.write_blocked,
+                &mut first_error,
+            );
+            status = status.combine(side_status);
         }
-        let mut caller_status = crate::OutputDrainStatus::Drained;
         if let Some(side) = self.caller.as_mut() {
-            // A04: retire any attempt past its deadline and admit the next
-            // queued request before this tick's own output draining, so a
-            // freshly-admitted attempt's own first handshake packet goes
-            // out in the same tick rather than waiting a full extra visit.
-            side.callers.poll_expirations(now);
+            let budget = budget.intersect(side.transport.output_drain);
+            side.callers
+                .poll_expirations_bounded(now, budget.max_actions);
             if side.outbound.is_empty() {
-                let report = side.callers.table_mut().poll_outbound_bounded(
-                    now,
-                    caller_budget,
-                    &mut side.outbound,
-                );
-                caller_status = report.status;
+                let report =
+                    side.callers
+                        .table_mut()
+                        .poll_outbound_bounded(now, budget, &mut side.outbound);
+                side.output_pending = report.status == crate::OutputDrainStatus::BudgetExhausted;
             }
-            if let Err(error) = crate::flush_destined(side.socket.as_raw_fd(), &mut side.outbound) {
-                first_error.get_or_insert(error);
-            }
+            let side_status = flush_owner_side(
+                &self.poll,
+                &mut side.socket,
+                OWNER_CALLER_TOKEN,
+                &mut side.outbound,
+                side.recv_pending,
+                side.output_pending,
+                &mut side.write_blocked,
+                &mut first_error,
+            );
+            status = status.combine(side_status);
         }
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(caller_status),
-        }
+        first_error.map_or(Ok(status), Err)
     }
 
     /// Drain admitted-peer lifecycle/data events for the application.
@@ -556,7 +601,9 @@ impl Owner {
         let Some(side) = self.listener.as_mut() else {
             return;
         };
-        side.peers.poll_events(out);
+        side.peers
+            .poll_events_bounded(side.transport.output_drain.max_actions, out);
+        side.event_pending = side.peers.has_pending_events();
     }
 
     /// Drain protocol events (A05) for every direct outbound session --
@@ -566,7 +613,10 @@ impl Owner {
         let Some(side) = self.caller.as_mut() else {
             return;
         };
-        side.callers.table_mut().poll_events(out);
+        side.callers
+            .table_mut()
+            .poll_events_bounded(side.transport.output_drain.max_actions, out);
+        side.event_pending = side.callers.table().has_pending_events();
     }
 
     /// Steady-state handle for one admitted peer: send, stats, orderly close.
@@ -609,7 +659,7 @@ impl Owner {
         &mut self,
         id: crate::LogicalCallerId,
     ) -> Option<crate::RemovedLogicalCaller> {
-        self.caller.as_mut()?.callers.table_mut().remove(id)
+        self.caller.as_mut()?.callers.remove(id)
     }
 
     /// The listener socket's bound local address, once [`Self::listen`] has
@@ -640,19 +690,174 @@ impl Owner {
     /// side has anything scheduled.
     #[must_use]
     pub fn time_until_next_deadline(&mut self, now: Timestamp, default_us: u64) -> u64 {
-        let listener = self
-            .listener
-            .as_mut()
-            .map(|side| side.peers.time_until_next_deadline(now, u64::MAX));
-        let caller = self
-            .caller
-            .as_ref()
-            .map(|side| side.callers.table().time_until_next_deadline(now, u64::MAX));
-        match (listener, caller) {
-            (Some(a), Some(b)) => a.min(b).min(default_us),
-            (Some(a), None) | (None, Some(a)) => a.min(default_us),
-            (None, None) => default_us,
+        let mut wait = default_us;
+        if let Some(side) = self.listener.as_mut() {
+            match listener_time_until_deadline(side, now) {
+                None => return 0,
+                Some(side_wait) => wait = wait.min(side_wait),
+            }
         }
+        if let Some(side) = self.caller.as_mut() {
+            match caller_time_until_deadline(side, now) {
+                None => return 0,
+                Some(side_wait) => wait = wait.min(side_wait),
+            }
+        }
+        wait
+    }
+}
+
+/// The listener side's contribution to [`Owner::time_until_next_deadline`],
+/// or `None` if it already has work that must run immediately (equivalent
+/// to the caller-visible `0`) -- split out to keep the combining function
+/// itself a plain two-branch dispatcher.
+fn listener_time_until_deadline(side: &mut OwnerListenerSide, now: Timestamp) -> Option<u64> {
+    if side.recv_pending || side.event_pending {
+        return None;
+    }
+    let mut wait = side
+        .peers
+        .time_until_idle_deadline(now, side.idle_timeout, u64::MAX);
+    if side.write_blocked {
+        return Some(wait);
+    }
+    if side.output_pending || !side.outbound.is_empty() || side.peers.has_pending_output(now) {
+        return None;
+    }
+    wait = wait.min(side.peers.time_until_next_deadline(now, u64::MAX));
+    Some(wait)
+}
+
+/// The caller side's counterpart to [`listener_time_until_deadline`].
+/// `CallerPool::time_until_next_deadline` already combines the pool's own
+/// attempt deadlines with the underlying table's protocol timers, unlike
+/// the listener side's genuinely separate idle/protocol indexes.
+fn caller_time_until_deadline(side: &mut OwnerCallerSide, now: Timestamp) -> Option<u64> {
+    if side.recv_pending || side.event_pending {
+        return None;
+    }
+    let wait = side.callers.time_until_next_deadline(now, u64::MAX);
+    if side.write_blocked {
+        return Some(wait);
+    }
+    if side.output_pending
+        || !side.outbound.is_empty()
+        || side.callers.table().has_pending_output(now)
+    {
+        return None;
+    }
+    Some(wait)
+}
+
+/// Whether a side has known work that must be revisited without waiting
+/// for a new readiness edge -- the identical predicate [`Owner::poll_io`]
+/// applies to both the listener and caller side.
+fn side_has_continuation_work(
+    recv_pending: bool,
+    event_pending: bool,
+    write_blocked: bool,
+    output_pending: bool,
+    outbound_empty: bool,
+) -> bool {
+    recv_pending || event_pending || (!write_blocked && (output_pending || !outbound_empty))
+}
+
+/// Apply one readiness event to a side's `recv_pending`/`write_blocked`
+/// bookkeeping -- split out of [`Owner::poll_io`]'s own event loop, since
+/// the listener and caller side otherwise repeat this identically.
+fn apply_readiness_event(
+    poll: &mio::Poll,
+    event: &mio::event::Event,
+    recv_pending: &mut bool,
+    write_blocked: &mut bool,
+    socket: &mut mio::net::UdpSocket,
+) -> io::Result<()> {
+    *recv_pending |= event.is_readable() || event.is_error();
+    if event.is_writable() && *write_blocked {
+        poll.registry()
+            .reregister(socket, event.token(), mio::Interest::READABLE)?;
+        *write_blocked = false;
+    }
+    Ok(())
+}
+
+/// Drain one side's receive path and update its `recv_pending` flag from
+/// the resulting [`crate::RecvDrainReport`] -- split out of
+/// [`Owner::poll_io`]'s own body, since the listener and caller side
+/// otherwise repeat this identically apart from `on_datagram`.
+fn drain_side_recv(
+    recv_pending: &mut bool,
+    fd: std::os::fd::RawFd,
+    recv_batch: &mut crate::RecvBatch,
+    recv_budget: crate::RecvBudget,
+    on_datagram: impl FnMut(Option<std::net::SocketAddr>, &[u8]),
+) -> io::Result<()> {
+    match crate::drain_recv_fd(fd, recv_batch, recv_budget, on_datagram) {
+        Ok(report) => {
+            *recv_pending = !report.would_block;
+            Ok(())
+        }
+        Err(error) => {
+            *recv_pending = false;
+            Err(error)
+        }
+    }
+}
+
+/// Flush one side's already-collected `outbound` queue and fold the result
+/// into that side's [`crate::OutputDrainStatus`] -- the identical tail
+/// half of [`Owner::drive`]'s listener and caller branches, extracted so
+/// `drive` itself stays a plain two-branch dispatcher.
+#[allow(clippy::too_many_arguments)]
+fn flush_owner_side(
+    poll: &mio::Poll,
+    socket: &mut mio::net::UdpSocket,
+    token: mio::Token,
+    outbound: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
+    recv_pending: bool,
+    output_pending: bool,
+    write_blocked: &mut bool,
+    first_error: &mut Option<io::Error>,
+) -> crate::OutputDrainStatus {
+    if !*write_blocked {
+        match crate::flush_destined(socket.as_raw_fd(), outbound) {
+            Ok(report) => {
+                // A positive partial send is runnable immediately; only a
+                // zero-progress WouldBlock needs writable readiness.
+                if report.sent == 0 && report.would_block {
+                    if let Err(error) = poll.registry().reregister(
+                        socket,
+                        token,
+                        mio::Interest::READABLE.add(mio::Interest::WRITABLE),
+                    ) {
+                        first_error.get_or_insert(error);
+                    }
+                    *write_blocked = true;
+                }
+            }
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    owner_side_status(
+        recv_pending,
+        output_pending || !outbound.is_empty(),
+        *write_blocked,
+    )
+}
+
+fn owner_side_status(
+    recv_pending: bool,
+    output_pending: bool,
+    write_blocked: bool,
+) -> crate::OutputDrainStatus {
+    if recv_pending || (output_pending && !write_blocked) {
+        crate::OutputDrainStatus::BudgetExhausted
+    } else if write_blocked {
+        crate::OutputDrainStatus::Backpressured
+    } else {
+        crate::OutputDrainStatus::Drained
     }
 }
 
@@ -671,6 +876,7 @@ mod owner_tests {
     fn listener_config() -> crate::ListenerConfig {
         crate::ListenerConfig::builder("127.0.0.1:0".parse().unwrap())
             .topology(crate::ListenerTopology::PerPort)
+            .configure_transport(|transport| transport.promotion = crate::PromotionPolicy::Never)
             .build()
             .expect("listener config")
     }
@@ -722,7 +928,7 @@ mod owner_tests {
             .connect(&shared_caller_config(listen_addr), now_ts(start))
             .expect("connect")
         else {
-            panic!("default pool policy is unbounded, so connect() must admit immediately")
+            panic!("the first caller fits the pool limit")
         };
 
         // Connect: both sides reach Connected.
@@ -802,6 +1008,9 @@ mod owner_tests {
     fn multiple_sessions_survive_one_stalled_peer() {
         let start = std::time::Instant::now();
         let mut owner = Owner::new().expect("owner builds");
+        owner
+            .set_caller_pool_policy(NonZeroUsize::new(2).unwrap(), Duration::from_secs(5))
+            .unwrap();
         owner.listen(&listener_config()).expect("listen");
         let listen_addr = owner.listener_local_addr().expect("listener bound");
 
@@ -831,7 +1040,7 @@ mod owner_tests {
                     .connect(&shared_caller_config(listen_addr), now_ts(start))
                     .expect("connect")
                 else {
-                    panic!("default pool policy is unbounded, so connect() must admit immediately")
+                    panic!("the first caller fits the pool limit")
                 };
                 id
             })
@@ -928,7 +1137,7 @@ mod owner_tests {
             .connect(&shared_caller_config(listen_addr), now_ts(start))
             .expect("connect")
         else {
-            panic!("default pool policy is unbounded, so connect() must admit immediately")
+            panic!("the first caller fits the pool limit")
         };
 
         let mut caller_events = Vec::new();
@@ -998,9 +1207,8 @@ mod owner_tests {
         let second = owner
             .connect(&config, now_ts(start))
             .expect("connect second");
-        assert_eq!(
-            second,
-            PoolOutcome::Queued,
+        assert!(
+            matches!(second, PoolOutcome::Queued(_)),
             "max_in_flight=1 must queue the second request through Owner::connect itself"
         );
         assert_eq!(owner.caller_pool_stats().expect("pool exists").queued, 1);
@@ -1017,95 +1225,154 @@ mod owner_tests {
         );
     }
 
-    /// Opus review (A03): `drive()` must retry a batch `sendmsg_batch`
-    /// could not fully accept on the next call instead of discarding it --
-    /// `CallerTable::poll_outbound_bounded`/`PeerTable::poll_outbound` both
-    /// start with `out.clear()`, so calling either again while the last
-    /// visit's send is still incomplete would silently wipe the unsent
-    /// remainder. `sendmmsg` accepts at most `UIO_MAXIOV` (1024 on Linux)
-    /// datagrams per call, so 2000 simultaneous handshakes -- one pending
-    /// `SendPacket` each, all collected into one `drive()` visit since the
-    /// budget here is unbounded -- reliably force a partial send on the
-    /// first attempt.
     #[test]
-    fn drive_retains_a_partially_sent_batch_across_calls_instead_of_discarding_it() {
-        let start = std::time::Instant::now();
-        let collector = std::net::UdpSocket::bind("127.0.0.1:0").expect("collector binds");
-        collector
-            .set_nonblocking(true)
-            .expect("collector is nonblocking");
-        // A comfortably large receive buffer: the property under test is
-        // `Owner` retaining and resending its own unsent output, not
-        // whether an unrelated test-only receiver can drain a burst of
-        // ~1000 back-to-back datagrams as fast as the kernel delivers
-        // them. Without this, the default OS receive buffer can drop
-        // datagrams the sender genuinely sent, which would misreport as
-        // exactly the bug this test exists to catch.
-        crate::set_sock_bufs(std::os::fd::AsRawFd::as_raw_fd(&collector), 8 * 1024 * 1024)
-            .expect("collector receive buffer grows");
-        let collector_addr = collector.local_addr().expect("collector address");
-
-        let mut owner = Owner::new().expect("owner builds");
-        const SESSIONS: usize = 2000;
-        for _ in 0..SESSIONS {
-            owner
-                .connect(&shared_caller_config(collector_addr), now_ts(start))
-                .expect("connect");
+    fn receive_budget_continues_backlog_without_a_new_edge() {
+        let mut owner = Owner::new().unwrap();
+        let mut config = listener_config();
+        // A PerPort listener's `RecvBatch` capacity is always 1 datagram:
+        // `TransportConfig::resolve_batch_size` only ever elevates it
+        // above that for a *shared*-listener topology, which a single
+        // PerPort `Owner` listener never is -- so `max_datagrams` above 1
+        // has no effect here regardless of its value. What this test
+        // actually exercises is `recv_pending` correctly carrying a
+        // remembered backlog across *multiple* `poll_io` calls with no
+        // new readiness edge in between, not a multi-datagram batch
+        // within one call.
+        config.transport.recv_budget = crate::RecvBudget::new(1, 1);
+        owner.listen(&config).unwrap();
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        const SENT: u64 = 7;
+        for _ in 0..SENT {
+            sender
+                .send_to(&[0], owner.listener_local_addr().unwrap())
+                .unwrap();
         }
-
-        let unbounded = OutputDrainBudget::new(usize::MAX, usize::MAX, usize::MAX);
+        let now = Timestamp::from_micros(0);
         owner
-            .drive(now_ts(start), unbounded)
-            .expect("first drive collects and partially sends the whole backlog");
-        let remaining_after_first = owner
-            .caller
-            .as_ref()
-            .expect("caller side exists")
-            .outbound
-            .len();
-        assert!(
-            remaining_after_first > 0,
-            "{SESSIONS} simultaneous handshake packets in one visit must exceed \
-             sendmmsg's per-call datagram limit, leaving a real remainder to retain"
-        );
+            .poll_io(Some(Duration::from_millis(50)), || now)
+            .unwrap();
+        assert_eq!(owner.listener_telemetry().unwrap().invalid_datagrams, 1);
+        assert!(owner.listener.as_ref().unwrap().recv_pending);
+        // No new packets arrive. Each visit still finds the remembered
+        // backlog without needing a fresh edge-triggered readiness event,
+        // one datagram at a time, until the whole backlog drains.
+        for _ in 0..SENT - 1 {
+            owner
+                .poll_io(Some(Duration::from_millis(50)), || now)
+                .unwrap();
+        }
+        assert_eq!(owner.listener_telemetry().unwrap().invalid_datagrams, SENT);
+        owner.poll_io(Some(Duration::ZERO), || now).unwrap();
+        assert!(!owner.listener.as_ref().unwrap().recv_pending);
+    }
 
-        // Drain the collector between ticks (not only at the end) so its
-        // own OS receive buffer never has to hold all `SESSIONS` datagrams
-        // at once -- that would be a test-infrastructure limit, not the
-        // property under test. However many further ticks it takes, every
-        // packet must eventually be sent: none silently dropped because a
-        // later tick called `poll_outbound_bounded` again while a send was
-        // still incomplete.
-        let mut received = 0usize;
-        let mut buffer = [0_u8; 2048];
-        let mut drain_collector = |collector: &std::net::UdpSocket, received: &mut usize| loop {
-            match collector.recv(&mut buffer) {
-                Ok(_) => *received += 1,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(error) => panic!("collector receive failed: {error}"),
+    #[test]
+    fn blocked_output_waits_for_writable_then_resumes() {
+        let mut owner = Owner::new().unwrap();
+        let collector = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        collector.set_nonblocking(true).unwrap();
+        let address = collector.local_addr().unwrap();
+        let now = Timestamp::from_micros(0);
+        owner.connect(&shared_caller_config(address), now).unwrap();
+        owner.poll_caller_events(&mut Vec::new());
+        let side = owner.caller.as_mut().unwrap();
+        side.outbound.push((address, vec![9]));
+        side.write_blocked = true;
+        owner
+            .poll
+            .registry()
+            .reregister(
+                &mut side.socket,
+                OWNER_CALLER_TOKEN,
+                mio::Interest::READABLE.add(mio::Interest::WRITABLE),
+            )
+            .unwrap();
+        assert_eq!(
+            owner.drive(now, OutputDrainBudget::default()).unwrap(),
+            crate::OutputDrainStatus::Backpressured
+        );
+        assert!(owner.time_until_next_deadline(now, 10_000) > 0);
+        owner
+            .poll_io(Some(Duration::from_millis(50)), || now)
+            .unwrap();
+        assert!(!owner.caller.as_ref().unwrap().write_blocked);
+        owner.drive(now, OutputDrainBudget::default()).unwrap();
+        assert!(owner.caller.as_ref().unwrap().outbound.is_empty());
+        let mut packet = [0; 1];
+        assert_eq!(collector.recv(&mut packet).unwrap(), 1);
+        assert_eq!(packet, [9]);
+    }
+
+    #[test]
+    fn configured_pool_limit_and_shared_socket_compatibility_are_enforced() {
+        let mut owner = Owner::new().unwrap();
+        let sink = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let config = shared_caller_config(sink.local_addr().unwrap());
+        let now = Timestamp::from_micros(0);
+        assert!(matches!(
+            owner.connect(&config, now).unwrap(),
+            PoolOutcome::Admitted(_)
+        ));
+        assert!(matches!(
+            owner.connect(&config, now).unwrap(),
+            PoolOutcome::Queued(_)
+        ));
+        assert_eq!(owner.caller_pool_stats().unwrap().in_flight, 1);
+        let mut different = config.clone();
+        different.transport.socket_buffers =
+            crate::SocketBufferConfig::Bytes(std::num::NonZeroUsize::new(65536).unwrap());
+        assert!(owner.connect(&different, now).is_err());
+        assert_eq!(owner.caller_pool_stats().unwrap().queued, 1);
+        let mut unsupported = listener_config();
+        unsupported.transport.promotion = crate::PromotionPolicy::All;
+        assert!(owner.listen(&unsupported).is_err());
+    }
+
+    #[test]
+    fn drive_retains_unsent_output_and_reports_continuation() {
+        let mut owner = Owner::new().unwrap();
+        let collector = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        collector.set_nonblocking(true).unwrap();
+        crate::set_sock_bufs(collector.as_raw_fd(), 8 * 1024 * 1024).unwrap();
+        let address = collector.local_addr().unwrap();
+        owner
+            .connect(&shared_caller_config(address), Timestamp::from_micros(0))
+            .unwrap();
+        // Inject a retained suffix to exercise the owner independently of
+        // protocol scheduling. This exceeds Linux's per-sendmmsg iovec cap.
+        const PACKETS: usize = 1100;
+        owner.caller.as_mut().unwrap().outbound =
+            (0..PACKETS).map(|_| (address, vec![7])).collect();
+        let status = owner
+            .drive(Timestamp::from_micros(0), OutputDrainBudget::default())
+            .unwrap();
+        assert_eq!(status, crate::OutputDrainStatus::BudgetExhausted);
+        assert!(!owner.caller.as_ref().unwrap().outbound.is_empty());
+        assert_eq!(
+            owner.time_until_next_deadline(Timestamp::from_micros(0), 100_000),
+            0
+        );
+        let mut received = 0;
+        let mut buf = [0; 2048];
+        for _ in 0..PACKETS {
+            while let Ok(size) = collector.recv(&mut buf) {
+                if size == 1 && buf[0] == 7 {
+                    received += 1;
+                }
             }
-        };
-        drain_collector(&collector, &mut received);
-        for _ in 0..20 {
-            if owner
-                .caller
-                .as_ref()
-                .expect("caller side exists")
-                .outbound
-                .is_empty()
-            {
+            if owner.caller.as_ref().unwrap().outbound.is_empty() {
                 break;
             }
             owner
-                .drive(now_ts(start), unbounded)
-                .expect("later drive retries the retained remainder");
-            drain_collector(&collector, &mut received);
+                .drive(Timestamp::from_micros(0), OutputDrainBudget::default())
+                .unwrap();
         }
-        assert_eq!(
-            received, SESSIONS,
-            "every handshake packet must reach the wire across retries, not just the \
-             first sendmmsg-accepted subset"
-        );
+        while let Ok(size) = collector.recv(&mut buf) {
+            if size == 1 && buf[0] == 7 {
+                received += 1;
+            }
+        }
+        assert_eq!(received, PACKETS);
     }
 
     /// Opus review (A03): `Owner`'s send path (`sendmsg_batch`) is
@@ -1119,6 +1386,7 @@ mod owner_tests {
         let mut owner = Owner::new().expect("owner builds");
         let ipv6_listener = crate::ListenerConfig::builder("[::1]:0".parse().unwrap())
             .topology(crate::ListenerTopology::PerPort)
+            .configure_transport(|transport| transport.promotion = crate::PromotionPolicy::Never)
             .build()
             .expect("listener config");
         assert!(

@@ -119,13 +119,29 @@ impl DenseDueIndex {
         slots: &mut DenseSlotArena<T>,
         out: &mut Vec<PeerSlotId>,
     ) {
+        let _ = self.pop_due_bounded(now, slots, usize::MAX, out);
+    }
+
+    /// Drain at most `max_work` due heap entries, including stale entries.
+    /// Returns `(entries_visited, due_entries_remaining)` so a maintenance
+    /// caller can cap stale cleanup as well as live timer work.
+    pub fn pop_due_bounded<T>(
+        &mut self,
+        now: Timestamp,
+        slots: &mut DenseSlotArena<T>,
+        max_work: usize,
+        out: &mut Vec<PeerSlotId>,
+    ) -> (usize, bool) {
         out.clear();
         let now_micros = now.as_micros();
         let mut live_popped = false;
+        let mut visited = 0;
         while let Some(Reverse(top)) = self.heap.peek()
             && top.deadline_micros <= now_micros
+            && visited < max_work
         {
             let Reverse(entry) = self.heap.pop().expect("peeked entry exists");
+            visited += 1;
             let idx = entry.slot_idx as usize;
             if let Some(slot_id) = slots.consume_due_deadline(
                 idx,
@@ -140,9 +156,25 @@ impl DenseDueIndex {
                 self.stale_popped += 1;
             }
         }
-        if live_popped {
+        if live_popped && max_work == usize::MAX {
             self.maybe_rebuild(slots);
         }
+        let due_remaining = self
+            .heap
+            .peek()
+            .is_some_and(|top| top.0.deadline_micros <= now_micros);
+        (visited, due_remaining)
+    }
+
+    /// Conservative O(1) due probe. A stale heap head may report work that
+    /// the next bounded pop will discard, which is intentional: callers can
+    /// wake for a cheap extra maintenance visit without scanning stale slots.
+    #[must_use]
+    #[inline]
+    pub fn has_due(&self, now: Timestamp) -> bool {
+        self.heap
+            .peek()
+            .is_some_and(|top| top.0.deadline_micros <= now.as_micros())
     }
 
     /// Earliest live deadline, discarding stale heap heads lazily.

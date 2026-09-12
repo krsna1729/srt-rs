@@ -42,12 +42,30 @@ impl Conn {
         output_drain: OutputDrainBudget,
         recv_budget: RecvBudget,
     ) -> Self {
+        Self::with_budgets_and_batch(
+            conn,
+            sock,
+            output_drain,
+            recv_budget,
+            RecvBatch::DEFAULT_CAPACITY,
+        )
+    }
+
+    /// Like [`Self::with_budgets`], using the resolved receive batch size
+    /// instead of silently falling back to the default scratch capacity.
+    pub fn with_budgets_and_batch(
+        conn: SrtConnection,
+        sock: UdpSocket,
+        output_drain: OutputDrainBudget,
+        recv_budget: RecvBudget,
+        batch_capacity: usize,
+    ) -> Self {
         Self {
             conn,
             sock,
             timers: crate::ManualTimerStore::new(),
             pending_outputs: VecDeque::new(),
-            recv_batch: RecvBatch::new(),
+            recv_batch: RecvBatch::with_capacity(batch_capacity, RecvBatch::DEFAULT_BUF_LEN),
             io_stats: BatchIoStats::default(),
             output_drain,
             recv_budget,
@@ -209,12 +227,14 @@ pub fn caller(
     now: Timestamp,
 ) -> Result<Conn, crate::RuntimeBuildError> {
     let prepared = config.prepare(crate::RuntimeFlavor::Smol)?;
+    prepared.require_exclusive()?;
     let socket = smol::Async::new(prepared.bind_socket()?)?;
-    Ok(Conn::with_budgets(
+    Ok(Conn::with_budgets_and_batch(
         prepared.connection(now)?,
         socket,
         prepared.transport.output_drain,
         prepared.transport.recv_budget,
+        prepared.transport.recv_batch_capacity(),
     ))
 }
 
@@ -223,6 +243,22 @@ mod tests {
     use super::*;
     use std::future::Future;
     use std::task::{Context, Poll, Waker};
+
+    #[test]
+    fn caller_rejects_shared_ownership_before_socket_bind() {
+        let config = crate::CallerConfig::builder("127.0.0.1:9".parse().expect("address"))
+            .ownership(crate::SocketOwnership::Shared)
+            .build()
+            .expect("caller config");
+        let result = super::caller(&config, Timestamp::default());
+        match result {
+            Err(crate::RuntimeBuildError::Config(error)) => {
+                assert_eq!(error.field(), "transport.ownership")
+            }
+            Err(error) => panic!("expected ownership rejection, got {error}"),
+            Ok(_) => panic!("Shared caller must be rejected before binding"),
+        }
+    }
 
     /// K02: a `Conn` built via [`caller`] must actually drive with its
     /// configured `TransportConfig::output_drain`, not silently substitute
