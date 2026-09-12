@@ -31,7 +31,7 @@ zeroize = "1.8"
 
 # Runtime-specific dependencies (optional, feature-gated)
 mio = { version = "1", features = ["os-poll", "net"], optional = true }
-tokio = { version = "1", features = ["net", "time", "rt"], optional = true }
+tokio = { version = "1", features = ["net", "time", "rt", "sync", "macros"], optional = true }
 smol = { version = "2", optional = true }
 futures-lite = { version = "2", optional = true }
 monoio = { version = "0.2", features = ["sync"], optional = true }
@@ -50,6 +50,10 @@ proptest = "1.11"
 [[example]]
 name = "mio_owner_echo"
 required-features = ["mio"]
+
+[[example]]
+name = "tokio_facade_echo"
+required-features = ["tokio"]
 
 [[bench]]
 name = "admission_hardening"

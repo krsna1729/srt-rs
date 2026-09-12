@@ -223,16 +223,9 @@ struct OwnerCallerSide {
 /// -- an idle established peer is never a legitimate long-term resource
 /// hold the way an in-flight connect attempt briefly is).
 ///
-/// Two known gaps, tracked as explicit follow-ups rather than partial
-/// fixes bolted onto this card:
+/// One known gap, tracked as an explicit follow-up rather than a partial
+/// fix bolted onto this card:
 ///
-/// - There is no way to read data a *caller*-side session received:
-///   `crate::CallerTable` (unlike `crate::PeerTable`) has no `poll_events`
-///   anywhere in this crate today -- building one is a real addition to a
-///   shared, already-tested table type, out of proportion to "assemble the
-///   owner from existing building blocks" (checkpoint 3). The acceptance
-///   round trip this card's example demonstrates is the listener-side
-///   direction only: caller sends, listener receives.
 /// - `listen()` validates only the listener socket topology, not the
 ///   resolved promotion policy; a `ListenerConfig` requesting a non-`Never`
 ///   promotion resolves and binds fine, then is silently never acted on
@@ -564,6 +557,16 @@ impl Owner {
             return;
         };
         side.peers.poll_events(out);
+    }
+
+    /// Drain protocol events (A05) for every direct outbound session --
+    /// the caller-side counterpart to [`Self::poll_listener_events`].
+    pub fn poll_caller_events(&mut self, out: &mut Vec<crate::CallerEvent>) {
+        out.clear();
+        let Some(side) = self.caller.as_mut() else {
+            return;
+        };
+        side.callers.table_mut().poll_events(out);
     }
 
     /// Steady-state handle for one admitted peer: send, stats, orderly close.
@@ -907,6 +910,59 @@ mod owner_tests {
         assert!(
             result.is_err(),
             "Exclusive ownership must be rejected, not silently accepted"
+        );
+    }
+
+    /// A05, ponytail review: `poll_caller_events` (added to
+    /// `mio_transport::Owner` for parity with the Tokio facade, which
+    /// genuinely needs it) must actually surface a direct caller's
+    /// `Connected` and `Disconnected` transitions, not sit unexercised.
+    #[test]
+    fn poll_caller_events_surfaces_connected_and_disconnected() {
+        let start = std::time::Instant::now();
+        let mut owner = Owner::new().expect("owner builds");
+        owner.listen(&listener_config()).expect("listen");
+        let listen_addr = owner.listener_local_addr().expect("listener bound");
+
+        let PoolOutcome::Admitted(caller_id) = owner
+            .connect(&shared_caller_config(listen_addr), now_ts(start))
+            .expect("connect")
+        else {
+            panic!("default pool policy is unbounded, so connect() must admit immediately")
+        };
+
+        let mut caller_events = Vec::new();
+        let connected = drive_until(&mut owner, start, Duration::from_secs(5), |owner, _now| {
+            let mut events = Vec::new();
+            owner.poll_listener_events(&mut events); // drive the handshake to completion
+            owner.poll_caller_events(&mut caller_events);
+            caller_events.iter().any(|event| {
+                event.id == caller_id && matches!(event.event, ConnectionEvent::Connected)
+            })
+        });
+        assert!(
+            connected,
+            "poll_caller_events must surface the caller's own Connected transition"
+        );
+
+        owner
+            .caller_mut(caller_id)
+            .expect("caller session still exists")
+            .disconnect(now_ts(start));
+        let mut caller_events = Vec::new();
+        let closing = drive_until(&mut owner, start, Duration::from_secs(5), |owner, _now| {
+            owner.poll_caller_events(&mut caller_events);
+            caller_events.iter().any(|event| {
+                event.id == caller_id
+                    && matches!(
+                        event.event,
+                        ConnectionEvent::StateChanged(shiguredo_srt::ConnectionState::Closing)
+                    )
+            })
+        });
+        assert!(
+            closing,
+            "poll_caller_events must surface the caller's own close starting"
         );
     }
 
