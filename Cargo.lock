@@ -1972,6 +1972,7 @@ dependencies = [
  "pbkdf2",
  "rustc-hash",
  "sha1",
+ "shiguredo_srt",
  "tracing",
  "zeroize",
 ]

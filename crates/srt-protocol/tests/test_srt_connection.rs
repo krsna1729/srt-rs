@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use shiguredo_srt::{
     CipherMode, ConnectionEvent, ConnectionOptions, ConnectionOutput, ConnectionState,
-    ConnectionStats, DataPacket, ErrorKind, GroupExtensionData, GroupType, KeyLength,
+    ConnectionStats, DataPacket, ErrorKind, GroupExtensionData, GroupType, KeyFlag, KeyLength,
     PacketPosition, SrtConnection, SrtPacket, TimerId, Timestamp,
 };
 
@@ -61,6 +61,30 @@ fn transfer_listener_to_caller(
 fn exchange_packets(caller: &mut SrtConnection, listener: &mut SrtConnection, now: Timestamp) {
     transfer_caller_to_listener(caller, listener, now);
     transfer_listener_to_caller(listener, caller, now);
+}
+
+/// Like `exchange_packets`, but also returns the encryption key flag (KK
+/// field) of every DATA packet the caller sent this round -- so a test can
+/// assert which key a payload actually went out under, not just that it
+/// eventually decrypts (which a sender that silently never switched keys
+/// would also satisfy, since the listener still holds the original key
+/// too).
+fn capture_and_transfer(
+    caller: &mut SrtConnection,
+    listener: &mut SrtConnection,
+    now: Timestamp,
+) -> Vec<u8> {
+    let mut kk_fields = Vec::new();
+    while let Some(output) = caller.poll_output() {
+        if let ConnectionOutput::SendPacket(data) = output {
+            if let Ok(SrtPacket::Data(packet)) = SrtPacket::decode(&data) {
+                kk_fields.push(packet.encryption_flag);
+            }
+            let _ = listener.feed_recv_buf(&data, now);
+        }
+    }
+    transfer_listener_to_caller(listener, caller, now);
+    kk_fields
 }
 
 /// 接続が確立するまでパケットを交換
@@ -1797,5 +1821,168 @@ fn dropreq_rejects_range_larger_than_receive_window() {
         .feed_recv_buf(&encoded, ts(100_000))
         .expect_err("DROPREQ range must fit the negotiated receive window");
     assert_eq!(error.kind, ErrorKind::InvalidData);
+    assert_eq!(listener.state(), ConnectionState::Connected);
+}
+
+// ============================================================================
+// V01: deterministic simulation of scenarios not previously covered at the
+// full-connection level (key rotation over the wire, sequence-number wrap
+// across a real transfer) -- purely sans-I/O, driven by injected
+// Timestamps, same pattern as every other test in this file.
+// ============================================================================
+
+/// V01: a real on-wire key rotation between two connected peers -- not just
+/// `CryptoContext`'s own internal state machine (already covered by
+/// `crypto.rs`'s unit tests), but the full `provide_new_sek` ->
+/// `send_km_request` -> KMREQ delivered to the peer round trip, checking
+/// the sender's own encryption key flag (KK field) actually flips from
+/// Even to Odd on the wire -- not just that data keeps decrypting, which a
+/// sender that silently never switched keys would also satisfy (the
+/// listener still holds the original key too). `SRT_CMD_KMRSP` is handled
+/// as a pure acknowledgement with no effect on the sender's own switch
+/// timing (see `srt_connection.rs`'s handling of it), so there is nothing
+/// for a black-box test to observe on that leg specifically.
+/// `seed_encrypted_packet_count_for_test` (the `test-support` feature's
+/// accelerated-refresh hook, otherwise only exercised by `srt-bench`'s
+/// live libsrt interop test) lets this stay a fast, deterministic
+/// simulation instead of a real 2^25-packet transfer.
+#[test]
+fn key_rotation_exchanges_km_control_packets_and_data_keeps_flowing() {
+    let passphrase = "rotation-passphrase".to_string();
+    let caller_opts = ConnectionOptions {
+        passphrase: Some(passphrase.clone()),
+        crypto_salt: Some([0x11; 16]),
+        key_length: KeyLength::Aes128,
+        tsbpd_delay: 0,
+        ..Default::default()
+    };
+    let listener_opts = ConnectionOptions {
+        passphrase: Some(passphrase),
+        key_length: KeyLength::Aes128,
+        tsbpd_delay: 0,
+        ..Default::default()
+    };
+    let mut caller = SrtConnection::new_caller(caller_opts);
+    let mut listener = SrtConnection::new_listener(listener_opts);
+    establish_connection(&mut caller, &mut listener).expect("connected");
+
+    // Baseline: a message sent under the original key arrives correctly,
+    // and is genuinely tagged Even -- the state this test claims to move
+    // away from, not an assumption.
+    let now = ts(1_000_000);
+    caller
+        .send(b"before rotation", now)
+        .expect("send before rotation");
+    let baseline_kk = capture_and_transfer(&mut caller, &mut listener, now);
+    assert_eq!(
+        baseline_kk,
+        vec![KeyFlag::Even.to_kk_field()],
+        "the connection must start on the Even key"
+    );
+    assert_eq!(
+        collect_received_data(&mut listener),
+        vec![b"before rotation".to_vec()]
+    );
+
+    // Accelerate past the refresh boundary without transmitting 2^25
+    // packets, then send one more message: this is what makes the
+    // connection's own `check_km_refresh` notice a rotation is due.
+    const PACKETS_TO_SWITCH: u64 = 4;
+    caller
+        .seed_encrypted_packet_count_for_test(
+            shiguredo_srt::CryptoContext::KM_REFRESH_PERIOD - PACKETS_TO_SWITCH,
+        )
+        .expect("seed encrypted packet count for accelerated key refresh");
+
+    let mut refresh_requested = false;
+    for i in 0..PACKETS_TO_SWITCH {
+        let now = ts(1_000_000 + (i + 1) * 10_000);
+        caller
+            .send(b"during rotation window", now)
+            .expect("send during rotation window");
+        while let Some(event) = caller.poll_event() {
+            if matches!(event, ConnectionEvent::KeyRefreshNeeded { .. }) {
+                refresh_requested = true;
+                caller
+                    .provide_new_sek(&[0x5a; 16], now)
+                    .expect("pre-announce replacement SEK");
+            }
+        }
+        exchange_packets(&mut caller, &mut listener, now);
+    }
+    assert!(
+        refresh_requested,
+        "accelerating the packet count must have triggered KeyRefreshNeeded"
+    );
+    // Every payload sent during the rotation window must still have
+    // decrypted correctly on the listener -- the KMREQ/KMRSP exchange
+    // happens alongside real data, not instead of it.
+    assert_eq!(
+        collect_received_data(&mut listener),
+        vec![b"during rotation window".to_vec(); PACKETS_TO_SWITCH as usize]
+    );
+
+    // A message sent after the rotation has fully completed (the caller
+    // has both announced the new key via KMREQ and actually switched onto
+    // it) must be tagged Odd, not just "still decryptable" -- a sender
+    // that silently never switched keys would also pass a decrypt-only
+    // check, since the listener still holds the original key too.
+    let now = ts(2_000_000);
+    caller
+        .send(b"after rotation", now)
+        .expect("send after rotation");
+    let post_rotation_kk = capture_and_transfer(&mut caller, &mut listener, now);
+    assert_eq!(
+        post_rotation_kk,
+        vec![KeyFlag::Odd.to_kk_field()],
+        "the sender must actually have switched onto the pre-announced key, \
+         not merely announced it"
+    );
+    assert_eq!(
+        collect_received_data(&mut listener),
+        vec![b"after rotation".to_vec()],
+        "data sent after the key rotation completed must still decrypt correctly"
+    );
+    assert_eq!(caller.state(), ConnectionState::Connected);
+    assert_eq!(listener.state(), ConnectionState::Connected);
+}
+
+/// V01: sequence numbers wrapping mid-stream (the 31-bit space SRT DATA
+/// packets use) across a real, connected transfer -- not just
+/// `SenderBuffer`'s own unit-level wraparound arithmetic (already covered
+/// by `prop_sender.rs`), but a genuine caller/listener pair exchanging real
+/// packets whose sequence numbers cross `0x7FFF_FFFF` back to `0`, checking
+/// every message still arrives with correct content and in order.
+#[test]
+fn sequence_numbers_wrap_across_a_real_connected_transfer() {
+    const MESSAGES_TO_SEND: u32 = 12;
+    // Chosen so the stream crosses the wrap boundary partway through.
+    let initial_seq = 0x7FFF_FFFF - (MESSAGES_TO_SEND / 2);
+    let caller_opts = ConnectionOptions {
+        initial_seq: Some(initial_seq),
+        tsbpd_delay: 0,
+        ..Default::default()
+    };
+    let mut caller = SrtConnection::new_caller(caller_opts);
+    let mut listener = SrtConnection::new_listener(test_options());
+    establish_connection(&mut caller, &mut listener).expect("connected");
+
+    let expected: Vec<Vec<u8>> = (0..MESSAGES_TO_SEND)
+        .map(|i| format!("message {i}").into_bytes())
+        .collect();
+    let mut received = Vec::new();
+    for (i, message) in expected.iter().enumerate() {
+        let now = ts(1_000_000 + i as u64 * 10_000);
+        caller.send(message, now).expect("send across the wrap");
+        exchange_packets(&mut caller, &mut listener, now);
+        received.extend(collect_received_data(&mut listener));
+    }
+
+    assert_eq!(
+        received, expected,
+        "every message must arrive with correct content and in order, \
+         whether its sequence number was before or after the 31-bit wrap"
+    );
+    assert_eq!(caller.state(), ConnectionState::Connected);
     assert_eq!(listener.state(), ConnectionState::Connected);
 }

@@ -659,6 +659,67 @@ proptest! {
         prop_assert_eq!(listener.state(), ConnectionState::Connected);
     }
 
+    /// V01: `prop_out_of_order_packets_handled` above only reverses one
+    /// message's own fragments and only checks connection state survives,
+    /// not content -- checkpoint 3's "check invariants and content/sequence
+    /// outcomes, not merely no panic" wants more. This sends several whole
+    /// messages, then delivers every packet from all of them under a
+    /// pseudo-random permutation (not just a full reverse), and asserts the
+    /// exact original byte content is reassembled in the correct final
+    /// order regardless of arrival order.
+    #[test]
+    fn prop_general_packet_reorder_preserves_content_and_order(
+        message_count in 2usize..6,
+        // Wide enough that most messages fragment across several DATA
+        // packets (max_payload_size is well under 1484 bytes), so this
+        // actually exercises MessageAssembler's First/Middle/Last path,
+        // not just whole-message (Single-packet) reordering.
+        payload_len in 50usize..4000,
+        // Fixed-length, not a range starting at 0: a shorter-than-packets
+        // key vector falls back to identity order for the un-covered
+        // tail, which a proptest shrinker actively steers toward,
+        // defeating the "general random reorder" premise for exactly the
+        // cases meant to be hardest. 64 keys covers every case this range
+        // of message_count/payload_len can produce.
+        shuffle_keys in prop::collection::vec(any::<u32>(), 64),
+    ) {
+        let mut now = Timestamp::from_micros(0);
+
+        let mut caller = SrtConnection::new_caller(make_opts(1));
+        let mut listener = SrtConnection::new_listener(make_opts(2));
+        establish_connection(&mut caller, &mut listener, &mut now);
+
+        let messages: Vec<Vec<u8>> = (0..message_count)
+            .map(|i| vec![(i % 256) as u8; payload_len])
+            .collect();
+        for message in &messages {
+            caller.send_message(message, now).expect("送信は成功する想定");
+        }
+        let mut packets = drain_packets(&mut caller);
+
+        now = Timestamp::from_micros(now.as_micros() + 200_000);
+
+        // Sort-by-random-key: a genuine pseudo-random permutation of
+        // delivery order, not just a fixed reverse.
+        let mut keyed: Vec<(u32, Vec<u8>)> = packets
+            .drain(..)
+            .enumerate()
+            .map(|(i, pkt)| (shuffle_keys[i], pkt))
+            .collect();
+        keyed.sort_by_key(|(key, _)| *key);
+        for (_, pkt) in &keyed {
+            listener.feed_recv_buf(pkt, now).expect("受信バッファへのフィードは成功する想定");
+        }
+
+        listener.handle_timer(TimerId::Ack, now).expect("タイマー処理は成功する想定");
+
+        let events = drain_events(&mut listener);
+        let received = extract_received_data(&events);
+        let expected: Vec<u8> = messages.concat();
+        prop_assert_eq!(received, expected);
+        prop_assert_eq!(listener.state(), ConnectionState::Connected);
+    }
+
     /// プロパティ: 重複パケットでもパニックしない
     #[test]
     fn prop_duplicate_packets_handled(

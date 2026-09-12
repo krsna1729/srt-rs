@@ -54,6 +54,15 @@ tracing = "0.1"
 # comparing Rust protocol cost with libsrt without I/O in the way. Same
 # criterion version this repo's root Cargo.toml pins.
 criterion = "0.8"
+# V01: `seed_encrypted_packet_count_for_test` (an accelerated key-refresh
+# test hook) is gated behind the opt-in `test-support` feature, which this
+# crate's own test/pbt targets do not otherwise enable -- without this, the
+# only reason `cargo test -p shiguredo_srt` compiled at all was feature
+# unification from srt-bench (the one crate that enables `test-support`)
+# sharing the same workspace build graph, which is not the case for CI
+# invocations that build only this crate (e.g. the ASan job, release.yml).
+# A path-only dev-dependency on itself is stripped on publish.
+shiguredo_srt = { path = ".", features = ["test-support"] }
 
 [[bench]]
 name = "core_packet_loop"
