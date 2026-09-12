@@ -1437,6 +1437,7 @@ impl SessionControl {
 
 struct InboundItem {
     payload: shiguredo_srt::Bytes,
+    source_time: Timestamp,
     bytes: Arc<AtomicUsize>,
 }
 
@@ -1447,10 +1448,13 @@ impl Drop for InboundItem {
 }
 
 impl InboundItem {
-    fn into_payload(mut self) -> shiguredo_srt::Bytes {
+    fn into_message(mut self) -> ReceivedMessage {
         let payload = std::mem::replace(&mut self.payload, shiguredo_srt::Bytes::new());
         self.bytes.fetch_sub(payload.len(), Ordering::AcqRel);
-        payload
+        ReceivedMessage {
+            payload,
+            source_time: self.source_time,
+        }
     }
 }
 
@@ -1473,7 +1477,7 @@ impl SessionInbox {
         (Self { tx, bytes, control }, rx)
     }
 
-    fn try_send(&self, payload: shiguredo_srt::Bytes) -> InboxSend {
+    fn try_send(&self, payload: shiguredo_srt::Bytes, source_time: Timestamp) -> InboxSend {
         if self.control.is_unavailable() {
             return InboxSend::Closed;
         }
@@ -1501,6 +1505,7 @@ impl SessionInbox {
         }
         let item = InboundItem {
             payload,
+            source_time,
             bytes: Arc::clone(&self.bytes),
         };
         match self.tx.try_send(item) {
@@ -1614,6 +1619,33 @@ enum Command {
     },
 }
 
+/// One payload delivered by [`Session::recv`], paired with when the sender
+/// originally queued it (F01: preserving source age through relay APIs).
+/// `source_time` is in this session's own local clock domain -- comparable
+/// directly against a `Timestamp` this same process reads via `now()`, not
+/// against a value from a different connection or process. A relay
+/// forwarding this payload onward must carry `source_time` (or an "age so
+/// far" derived from it) as its own application-level metadata: the new
+/// connection it re-sends on has its own, unrelated wire timestamp epoch.
+#[derive(Debug, Clone)]
+pub struct ReceivedMessage {
+    pub payload: shiguredo_srt::Bytes,
+    pub source_time: Timestamp,
+}
+
+impl ReceivedMessage {
+    /// How long ago this message's source time was, relative to `now` (both
+    /// in the same connection's clock domain). Saturates to zero rather
+    /// than going negative if `now` is somehow earlier than `source_time`
+    /// (e.g. a caller comparing against a stale `now` reading).
+    #[must_use]
+    pub fn age(&self, now: Timestamp) -> std::time::Duration {
+        std::time::Duration::from_micros(
+            now.as_micros().saturating_sub(self.source_time.as_micros()),
+        )
+    }
+}
+
 /// One admitted or originated SRT session (A05), obtained from
 /// [`Facade::accept`] or [`Facade::connect`].
 ///
@@ -1629,9 +1661,23 @@ pub struct Session {
     command_bytes: Arc<AtomicUsize>,
     control: Arc<SessionControl>,
     inbound: tokio::sync::mpsc::Receiver<InboundItem>,
+    start: std::time::Instant,
 }
 
 impl Session {
+    /// The current time in this session's own driver's clock domain --
+    /// the same one every [`ReceivedMessage::source_time`] this `Session`
+    /// produces is expressed in (F01), and the same value
+    /// [`Facade::now`] would return. A `Session` is designed to outlive
+    /// its `Facade` (dropping the `Facade` alone does not end the driver
+    /// task while any `Session` remains), so `age()` needs this rather
+    /// than requiring the application to keep the `Facade` around just to
+    /// call `now()`.
+    #[must_use]
+    pub fn now(&self) -> Timestamp {
+        Timestamp::from_micros(self.start.elapsed().as_micros() as u64)
+    }
+
     /// Send one payload. Resolves once the driver task has actually
     /// attempted the send (not merely queued the request), so a
     /// [`FacadeError::Protocol`] reliably reflects this specific call, not
@@ -1660,8 +1706,8 @@ impl Session {
     /// The next payload this session received, in order, or `None` once
     /// the session has closed and every already-buffered payload has been
     /// delivered.
-    pub async fn recv(&mut self) -> Option<shiguredo_srt::Bytes> {
-        self.inbound.recv().await.map(InboundItem::into_payload)
+    pub async fn recv(&mut self) -> Option<ReceivedMessage> {
+        self.inbound.recv().await.map(InboundItem::into_message)
     }
 
     /// Start an orderly close. Fire-and-forget: does not wait for the
@@ -2032,8 +2078,13 @@ async fn run_driver(
     commands_tx: tokio::sync::mpsc::WeakSender<Command>,
     accept_tx: tokio::sync::mpsc::Sender<Session>,
     command_bytes: Arc<AtomicUsize>,
+    start: std::time::Instant,
 ) {
-    let start = std::time::Instant::now();
+    // `start` is captured by `Facade::spawn` before this task exists, and
+    // exposed there too (`Facade::now`) -- so an application computing a
+    // `ReceivedMessage::age` against `source_time` reads `now()` in the
+    // exact same clock domain this driver's own `Timestamp`s live in,
+    // with no round-trip through the command channel needed.
     let now = || Timestamp::from_micros(start.elapsed().as_micros() as u64);
     let mut listener_inboxes: std::collections::HashMap<crate::LogicalPeerId, SessionInbox> =
         std::collections::HashMap::new();
@@ -2121,6 +2172,7 @@ async fn run_driver(
         let sessions = SessionFactory {
             commands_tx: &commands_tx,
             command_bytes: &command_bytes,
+            start,
         };
 
         owner.poll_listener_events(&mut listener_events);
@@ -2170,6 +2222,7 @@ async fn run_driver(
 struct SessionFactory<'a> {
     commands_tx: &'a tokio::sync::mpsc::WeakSender<Command>,
     command_bytes: &'a Arc<AtomicUsize>,
+    start: std::time::Instant,
 }
 
 impl SessionFactory<'_> {
@@ -2190,6 +2243,7 @@ impl SessionFactory<'_> {
             command_bytes: Arc::clone(self.command_bytes),
             control: Arc::clone(&control),
             inbound: rx,
+            start: self.start,
         };
         Some((session, inbox, control))
     }
@@ -2230,14 +2284,20 @@ fn route_listener_event(
                 owner.remove_listener_peer(event.logical_peer);
             }
         }
-        shiguredo_srt::ConnectionEvent::DataReceived { payload, .. } => {
+        shiguredo_srt::ConnectionEvent::DataReceived {
+            payload,
+            source_time,
+            ..
+        } => {
             // A full or closed inbox retires this session exactly like a
             // genuine `Disconnected` below (course correction #1): a
             // consumer that fell far enough behind is disconnected, not
             // grown without bound or silently starved forever.
             let deliverable = listener_inboxes
                 .get(&event.logical_peer)
-                .is_some_and(|inbox| matches!(inbox.try_send(payload), InboxSend::Sent));
+                .is_some_and(|inbox| {
+                    matches!(inbox.try_send(payload, source_time), InboxSend::Sent)
+                });
             if !deliverable {
                 listener_inboxes.remove(&event.logical_peer);
                 controls.remove(&target);
@@ -2306,13 +2366,17 @@ fn route_caller_event(
                 owner.remove_caller(event.id);
             }
         }
-        shiguredo_srt::ConnectionEvent::DataReceived { payload, .. } => {
+        shiguredo_srt::ConnectionEvent::DataReceived {
+            payload,
+            source_time,
+            ..
+        } => {
             // See `route_listener_event`'s identical handling for why a
             // failed delivery retires the session instead of growing its
             // backlog or silently discarding data forever.
-            let deliverable = caller_inboxes
-                .get(&event.id)
-                .is_some_and(|inbox| matches!(inbox.try_send(payload), InboxSend::Sent));
+            let deliverable = caller_inboxes.get(&event.id).is_some_and(|inbox| {
+                matches!(inbox.try_send(payload, source_time), InboxSend::Sent)
+            });
             if !deliverable {
                 let target = SessionTarget::Caller(event.id);
                 caller_inboxes.remove(&event.id);
@@ -2381,6 +2445,7 @@ pub struct Facade {
     command_bytes: Arc<AtomicUsize>,
     accept: tokio::sync::mpsc::Receiver<Session>,
     listener_local_addr: Option<SocketAddr>,
+    start: std::time::Instant,
 }
 
 impl Facade {
@@ -2403,12 +2468,19 @@ impl Facade {
         let command_bytes = Arc::new(AtomicUsize::new(0));
         let (commands_tx, commands_rx) = tokio::sync::mpsc::channel(FACADE_COMMAND_CAPACITY);
         let (accept_tx, accept_rx) = tokio::sync::mpsc::channel(FACADE_ACCEPT_CAPACITY);
+        // Captured here, before the driver task exists, and shared with it
+        // (rather than each independently calling `Instant::now()`) so
+        // `Facade::now()` and the driver's own internal clock never drift
+        // apart by even the scheduling delay between this call and the
+        // task's first poll.
+        let start = std::time::Instant::now();
         let handle = tokio::spawn(run_driver(
             owner,
             commands_rx,
             commands_tx.downgrade(),
             accept_tx,
             Arc::clone(&command_bytes),
+            start,
         ));
         Ok((
             Self {
@@ -2416,9 +2488,22 @@ impl Facade {
                 command_bytes,
                 accept: accept_rx,
                 listener_local_addr,
+                start,
             },
             handle,
         ))
+    }
+
+    /// The current time in this `Facade`'s own clock domain -- the same
+    /// one every [`ReceivedMessage::source_time`] from a `Session` this
+    /// `Facade` produced is expressed in (F01). Comparing a `source_time`
+    /// from a *different* `Facade`/`Owner` (a different process, or even a
+    /// second `Facade` in this one) against this value is meaningless;
+    /// each has its own independent clock origin. A pure, synchronous
+    /// computation -- no round-trip through the driver task.
+    #[must_use]
+    pub fn now(&self) -> Timestamp {
+        Timestamp::from_micros(self.start.elapsed().as_micros() as u64)
     }
 
     /// Start one outbound session. `config.transport.ownership` must be
@@ -2762,7 +2847,7 @@ mod facade_tests {
             let received = with_timeout(listener_session.recv())
                 .await
                 .expect("listener session receives the payload");
-            assert_eq!(received.as_ref(), b"known message");
+            assert_eq!(received.payload.as_ref(), b"known message");
 
             caller_session.close();
             let closed = with_timeout(listener_session.recv()).await;
@@ -2820,7 +2905,10 @@ mod facade_tests {
                 let received = with_timeout(active_listener_session.recv())
                     .await
                     .expect("active listener session receives");
-                assert_eq!(received.as_ref(), format!("active {i}").into_bytes());
+                assert_eq!(
+                    received.payload.as_ref(),
+                    format!("active {i}").into_bytes()
+                );
                 assert!(
                     started.elapsed() < Duration::from_millis(500),
                     "active round trip {i} took {:?} -- the slow session's concurrent \
@@ -2838,7 +2926,10 @@ mod facade_tests {
                 let payload = with_timeout(slow_listener_session.recv())
                     .await
                     .expect("slow session's backlog is preserved");
-                assert_eq!(payload.as_ref(), format!("backlog {i}").into_bytes());
+                assert_eq!(
+                    payload.payload.as_ref(),
+                    format!("backlog {i}").into_bytes()
+                );
             }
         });
     }
@@ -2871,7 +2962,7 @@ mod facade_tests {
             let received = with_timeout(second_listener_session.recv())
                 .await
                 .expect("second session still works after the first was dropped");
-            assert_eq!(received.as_ref(), b"after a drop");
+            assert_eq!(received.payload.as_ref(), b"after a drop");
         });
     }
 
@@ -3055,6 +3146,139 @@ mod facade_tests {
                 "a closed-then-dropped session against an unreachable peer must \
                  still be force-reclaimed, not pinned forever waiting for a \
                  Disconnected event that can never arrive"
+            );
+        });
+    }
+
+    /// F01 acceptance criterion: a relay forwarding a message across two
+    /// hops (source -> relay -> destination) must preserve its original
+    /// source age, not reset it at the republish. Delays injected both
+    /// before and after the relay's own forwarding send must both show up
+    /// in the age finally observed at the destination.
+    ///
+    /// `source_time` only survives one connection: the relay's own egress
+    /// leg to the destination has a completely independent clock epoch
+    /// from its ingress leg, so the relay must carry the ingress age
+    /// forward as application data (an 8-byte little-endian micros prefix
+    /// here), not expect the wire protocol to do it. See
+    /// `examples/tokio_relay.rs` for the same pattern written as a
+    /// standalone demonstration.
+    #[test]
+    fn relayed_message_preserves_source_age_across_both_injected_delays() {
+        test_runtime().block_on(async {
+            let (source, _source_handle) = Facade::spawn(None).expect("spawn source facade");
+            let (mut relay, _relay_handle) =
+                Facade::spawn(Some(&listener_config())).expect("spawn relay facade");
+            let relay_listen_addr = relay.listener_local_addr().expect("relay listener bound");
+            let (mut destination, _destination_handle) =
+                Facade::spawn(Some(&listener_config())).expect("spawn destination facade");
+            let destination_listen_addr = destination
+                .listener_local_addr()
+                .expect("destination listener bound");
+
+            let source_session =
+                with_timeout(source.connect(&shared_caller_config(relay_listen_addr)))
+                    .await
+                    .expect("source connects to relay");
+            let mut relay_ingress = with_timeout(relay.accept())
+                .await
+                .expect("relay accepts source");
+            let relay_egress =
+                with_timeout(relay.connect(&shared_caller_config(destination_listen_addr)))
+                    .await
+                    .expect("relay connects onward to destination");
+            let mut destination_session = with_timeout(destination.accept())
+                .await
+                .expect("destination accepts relay");
+
+            with_timeout(source_session.send(b"live payload".to_vec()))
+                .await
+                .expect("source sends");
+            let received = with_timeout(relay_ingress.recv())
+                .await
+                .expect("relay receives from source");
+
+            // Delay injected BEFORE the relay republishes: simulates the
+            // relay holding/processing the message for a while.
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let age_before_republish = received.age(relay.now());
+            let mut envelope = (age_before_republish.as_micros() as u64)
+                .to_le_bytes()
+                .to_vec();
+            envelope.extend_from_slice(&received.payload);
+            with_timeout(relay_egress.send(envelope))
+                .await
+                .expect("relay forwards to destination");
+
+            // Delay injected AFTER publication: simulates a slow consumer
+            // at the destination.
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let forwarded = with_timeout(destination_session.recv())
+                .await
+                .expect("destination receives from relay");
+            let age_bytes: [u8; 8] = forwarded.payload[..8]
+                .try_into()
+                .expect("envelope carries an 8-byte micros age prefix");
+            let carried_age = Duration::from_micros(u64::from_le_bytes(age_bytes));
+            let transit_age = forwarded.age(destination.now());
+            let total_age = carried_age + transit_age;
+
+            assert_eq!(&forwarded.payload[8..], b"live payload");
+            assert!(
+                age_before_republish >= Duration::from_millis(140),
+                "age captured before republish must reflect its injected delay, \
+                 got {age_before_republish:?}"
+            );
+            assert!(
+                transit_age >= Duration::from_millis(140),
+                "age captured after republish must reflect its injected delay, \
+                 got {transit_age:?}"
+            );
+            assert!(
+                total_age >= Duration::from_millis(280),
+                "total observed age at the destination must reflect BOTH \
+                 injected delays, not just the more recent one (a reset-at-\
+                 republish bug would show roughly transit_age alone here): \
+                 got {total_age:?}"
+            );
+        });
+    }
+
+    /// F01 / Opus review: a `Session` is designed to outlive its `Facade`
+    /// (dropping the `Facade` alone does not end the driver task while any
+    /// `Session` remains -- see `dropping_a_session_does_not_disrupt_the_
+    /// driver`'s sibling `dropping_every_facade_handle_ends_the_driver_
+    /// task`), so an application computing `ReceivedMessage::age` must not
+    /// need to keep the `Facade` around just to call `now()`. `Session`
+    /// gets its own `now()`, sharing the same clock origin.
+    #[test]
+    fn session_now_keeps_working_after_its_facade_is_dropped() {
+        test_runtime().block_on(async {
+            let (mut server, _server_handle) =
+                Facade::spawn(Some(&listener_config())).expect("spawn server");
+            let listen_addr = server.listener_local_addr().expect("listener bound");
+            let (client, _client_handle) = Facade::spawn(None).expect("spawn client");
+
+            let caller_session = with_timeout(client.connect(&shared_caller_config(listen_addr)))
+                .await
+                .expect("connect");
+            let mut listener_session = with_timeout(server.accept()).await.expect("accept");
+
+            with_timeout(caller_session.send(b"payload".to_vec()))
+                .await
+                .expect("send");
+            let received = with_timeout(listener_session.recv()).await.expect("recv");
+
+            // Drop every Facade handle for the listener side -- only the
+            // Session itself is left holding this driver open.
+            drop(server);
+            drop(client);
+
+            let age = received.age(listener_session.now());
+            assert!(
+                age < Duration::from_secs(1),
+                "age computed via Session::now() after dropping the Facade \
+                 should still be a small, sane value, got {age:?}"
             );
         });
     }

@@ -3092,6 +3092,7 @@ fn apply_group_event(
                     sequence_number: packet.sequence_number,
                     message_number: packet.message_number,
                     timestamp: packet.timestamp,
+                    source_time: packet.source_time,
                     packet_count: packet.packet_count,
                 },
             });

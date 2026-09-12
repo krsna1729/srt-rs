@@ -60,6 +60,10 @@ pub struct GroupPacket {
     pub message_number: u32,
     /// The sender's timestamp, in the units defined by the SRT wire format.
     pub timestamp: u32,
+    /// F01: when the sender originally queued this message, converted into
+    /// this member connection's local clock domain -- see
+    /// `ConnectionEvent::DataReceived`'s field of the same name.
+    pub source_time: crate::Timestamp,
     /// Number of SRT DATA packets represented by the reassembled payload.
     pub packet_count: u32,
     /// Reference-counted payload bytes.
@@ -543,6 +547,7 @@ impl SrtGroup {
                 sequence_number,
                 message_number,
                 timestamp,
+                source_time,
                 payload,
                 packet_count,
             } => {
@@ -551,6 +556,7 @@ impl SrtGroup {
                     sequence_number,
                     message_number,
                     timestamp,
+                    source_time,
                     payload,
                     packet_count,
                 };
