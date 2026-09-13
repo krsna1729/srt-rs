@@ -7,6 +7,7 @@ pub mod driver;
 pub mod harness;
 pub mod host_contention;
 pub mod model;
+pub mod qualification;
 pub mod queue;
 pub mod scheduling;
 pub mod shutdown;
