@@ -1,7 +1,7 @@
 use crate::{
     BatchIoStats, CallerConfig, ConfigError, GroupConfig, ManualTimerStore, OutputDrainBudget,
     OutputDrainReport, RecvBatch, RecvBudget, RecvDrainReport, RuntimeFlavor,
-    drain_connected_outputs, drain_recv_fd, sendmsg_connected_batch,
+    drain_connected_outputs, drain_recv_fd_with_capacity, sendmsg_connected_batch,
 };
 use shiguredo_srt::{Bytes, ConnectionOutput, SrtConnection, Timestamp};
 use std::collections::VecDeque;
@@ -96,6 +96,7 @@ struct GroupLegIo {
     timers: ManualTimerStore,
     pending_outputs: VecDeque<ConnectionOutput>,
     recv_budget: RecvBudget,
+    batch_capacity: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -415,6 +416,7 @@ impl GroupConn {
                 timers: ManualTimerStore::new(),
                 pending_outputs: VecDeque::new(),
                 recv_budget: policy.recv_budget,
+                batch_capacity: policy.batch_capacity.max(1),
             });
         }
         let batch_capacity = if io_legs.is_empty() {
@@ -557,10 +559,11 @@ impl GroupConn {
                 // `drain_recv_fd`/`drain_group_leg_outputs` already fold
                 // into their `Ok` reports) marks a leg broken.
                 let mut malformed_datagrams = 0usize;
-                let recv_result = drain_recv_fd(
+                let recv_result = drain_recv_fd_with_capacity(
                     leg.socket.as_raw_fd(),
                     recv_batch,
                     leg.recv_budget,
+                    leg.batch_capacity,
                     |_, data| {
                         if conn.feed_recv_buf(data, now).is_err() {
                             malformed_datagrams += 1;
@@ -924,6 +927,8 @@ mod group_conn_tests {
         assert_eq!(conn.recv_batch.capacity(), 7);
         assert_eq!(conn.legs[0].recv_budget, RecvBudget::new(1, 2));
         assert_eq!(conn.legs[1].recv_budget, RecvBudget::new(4, 9));
+        assert_eq!(conn.legs[0].batch_capacity, 3);
+        assert_eq!(conn.legs[1].batch_capacity, 7);
     }
 
     fn connect_two_leg_group(runtime: RuntimeFlavor) -> (GroupConn, Peer, Peer) {

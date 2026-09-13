@@ -254,6 +254,21 @@ pub fn drain_recv_fd(
     fd: RawFd,
     batch: &mut RecvBatch,
     budget: RecvBudget,
+    on_datagram: impl FnMut(Option<SocketAddr>, &[u8]),
+) -> io::Result<RecvDrainReport> {
+    let batch_capacity = batch.capacity();
+    drain_recv_fd_with_capacity(fd, batch, budget, batch_capacity, on_datagram)
+}
+
+/// Drain a non-blocking fd with a per-visit scratch limit. The backing
+/// [`RecvBatch`] may be shared at the owner level, but `batch_capacity` keeps
+/// each leg's resolved batching policy effective instead of silently using
+/// the largest sibling capacity.
+pub(crate) fn drain_recv_fd_with_capacity(
+    fd: RawFd,
+    batch: &mut RecvBatch,
+    budget: RecvBudget,
+    batch_capacity: usize,
     mut on_datagram: impl FnMut(Option<SocketAddr>, &[u8]),
 ) -> io::Result<RecvDrainReport> {
     let mut report = RecvDrainReport::default();
@@ -267,12 +282,13 @@ pub fn drain_recv_fd(
     // the protocol. Keep a separate dequeue count so a queue full of
     // truncated packets cannot make one wake consume unbounded kernel work
     // while the visible datagram count stays at zero.
+    let batch_capacity = batch_capacity.clamp(1, batch.capacity());
     let mut dequeued = 0usize;
     for _ in 0..budget.max_rounds {
         if dequeued >= budget.max_datagrams {
             break;
         }
-        let requested = (budget.max_datagrams - dequeued).min(batch.capacity());
+        let requested = (budget.max_datagrams - dequeued).min(batch_capacity);
         let received = batch.recv(fd, requested)?;
         if received == 0 {
             report.would_block = true;

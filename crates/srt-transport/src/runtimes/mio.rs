@@ -619,6 +619,18 @@ impl Owner {
         side.event_pending = side.callers.table().has_pending_events();
     }
 
+    /// Drain bounded caller-pool lifecycle outcomes. A queued request's
+    /// [`crate::PoolRequestId`] must be observed here to correlate its later
+    /// admission, expiry, failure, or cancellation with the original call.
+    pub fn poll_caller_pool_events(&mut self, out: &mut Vec<crate::PoolEvent>) {
+        out.clear();
+        let Some(side) = self.caller.as_mut() else {
+            return;
+        };
+        side.callers
+            .poll_outcomes_bounded(side.transport.output_drain.max_actions, out);
+    }
+
     /// Steady-state handle for one admitted peer: send, stats, orderly close.
     pub fn listener_peer_mut(
         &mut self,

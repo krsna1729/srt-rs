@@ -126,6 +126,7 @@ pub use config::*;
 
 // --- Public re-exports: utilities ---
 
+pub(crate) use batch::drain_recv_fd_with_capacity;
 pub use batch::{
     BatchIoStats, RecvBatch, RecvBudget, RecvDrainReport, SendFlushReport, apply_send_result,
     drain_recv_fd, flush_destined,

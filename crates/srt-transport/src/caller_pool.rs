@@ -549,6 +549,45 @@ mod tests {
         assert_eq!(pool.stats().queued, 1);
     }
 
+    #[test]
+    fn queued_request_outcomes_keep_the_request_identity() {
+        let mut pool = CallerPool::new(NonZeroUsize::new(1).unwrap(), Duration::from_secs(1));
+        let remote: SocketAddr = "127.0.0.1:19005".parse().unwrap();
+        let now = Timestamp::from_micros(0);
+        let first = pool
+            .connect(prepared_caller(remote), now)
+            .expect("first connect");
+        let first_id = match first {
+            PoolOutcome::Admitted(id) => id,
+            other => panic!("first request must admit, got {other:?}"),
+        };
+        let queued = pool
+            .connect(prepared_caller(remote), now)
+            .expect("queued connect");
+        let request_id = match queued {
+            PoolOutcome::Queued(id) => id,
+            other => panic!("second request must queue, got {other:?}"),
+        };
+
+        let mut events = Vec::new();
+        pool.poll_outcomes(&mut events);
+        assert!(events.iter().any(|event| {
+            matches!(event, PoolEvent::Queued { request_id: id } if *id == request_id)
+        }));
+
+        pool.poll_expirations(Timestamp::from_micros(2_000_000));
+        pool.poll_outcomes(&mut events);
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                PoolEvent::Admitted {
+                    request_id: id,
+                    caller_id,
+                } if *id == request_id && *caller_id != first_id
+            )
+        }));
+    }
+
     /// A04: a stalled attempt (never reaches `Connected`) must be retired
     /// once it passes `attempt_deadline`, releasing its permit so the
     /// queued request behind it is admitted.

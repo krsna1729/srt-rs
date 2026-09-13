@@ -268,14 +268,26 @@ pub fn drain_readable(
     sock: &UdpSocket,
     batch: &mut RecvBatch,
     budget: RecvBudget,
+    on_datagram: impl FnMut(Option<SocketAddr>, &[u8]),
+) -> io::Result<RecvDrainReport> {
+    let batch_capacity = batch.capacity();
+    drain_readable_with_capacity(sock, batch, budget, batch_capacity, on_datagram)
+}
+
+fn drain_readable_with_capacity(
+    sock: &UdpSocket,
+    batch: &mut RecvBatch,
+    budget: RecvBudget,
+    batch_capacity: usize,
     mut on_datagram: impl FnMut(Option<SocketAddr>, &[u8]),
 ) -> io::Result<RecvDrainReport> {
     let mut report = RecvDrainReport::default();
+    let batch_capacity = batch_capacity.clamp(1, batch.capacity());
     for _ in 0..budget.max_rounds {
         if report.datagrams >= budget.max_datagrams {
             break;
         }
-        let requested = (budget.max_datagrams - report.datagrams).min(batch.capacity());
+        let requested = (budget.max_datagrams - report.datagrams).min(batch_capacity);
         let result = sock.try_io(tokio::io::Interest::READABLE, || {
             match batch.recv(sock.as_raw_fd(), requested)? {
                 0 => Err(io::ErrorKind::WouldBlock.into()),
@@ -334,9 +346,10 @@ fn feed_ready(
     conn: &mut SrtConnection,
     now: Timestamp,
     budget: RecvBudget,
+    batch_capacity: usize,
     malformed_datagrams: &mut usize,
 ) -> io::Result<RecvDrainReport> {
-    drain_readable(sock, batch, budget, |_, data| {
+    drain_readable_with_capacity(sock, batch, budget, batch_capacity, |_, data| {
         if conn.feed_recv_buf(data, now).is_err() {
             *malformed_datagrams += 1;
         }
@@ -380,6 +393,7 @@ struct GroupLeg {
     timers: ManualTimerStore,
     pending_outputs: VecDeque<ConnectionOutput>,
     recv_budget: RecvBudget,
+    batch_capacity: usize,
 }
 
 struct TokioGroupLeg {
@@ -446,6 +460,7 @@ impl GroupConn {
                 timers: ManualTimerStore::new(),
                 pending_outputs: VecDeque::new(),
                 recv_budget,
+                batch_capacity: leg_batch_capacity.max(1),
             });
         }
         Ok(Self {
@@ -610,6 +625,7 @@ impl GroupConn {
                     conn,
                     now,
                     leg.recv_budget,
+                    leg.batch_capacity,
                     &mut malformed_datagrams,
                 );
                 let mut newly_broken = false;
@@ -895,6 +911,14 @@ fn drive_side_output(
             *write_blocked = report.would_block;
             if report.would_block {
                 status = status.combine(crate::OutputDrainStatus::Backpressured);
+            } else if !outbound.is_empty() {
+                // A destination-specific send error can retire one packet
+                // without setting `would_block`, while a later packet in
+                // the same queue remains unsent. Returning `Drained` here
+                // would strand that suffix if the caller waits only for a
+                // readiness edge. Keep the continuation visible even when
+                // the socket itself was writable for the prefix.
+                status = status.combine(crate::OutputDrainStatus::BudgetExhausted);
             }
             Ok(status)
         }
@@ -1065,8 +1089,15 @@ impl Owner {
                 "listener.transport.topology",
                 "Owner drives a single PerPort listener socket; pooled or \
                  reuseport topologies need a multi-acceptor driver, which \
-                 this card does not build",
+                this card does not build",
             )));
+        }
+        if prepared.transport.promotion != srt_lifecycle::Promotion::Never {
+            return Err(crate::ConfigError::new(
+                "listener.transport.promotion",
+                "Owner has no relocation target; set promotion to Never",
+            )
+            .into());
         }
         if !prepared.bind.is_ipv4() {
             // Same reasoning as the Mio owner: sendmsg_batch is IPv4-only
@@ -1331,6 +1362,18 @@ impl Owner {
             .table_mut()
             .poll_events_bounded(side.transport.output_drain.max_actions, out);
         side.event_pending = side.callers.table().has_pending_events();
+    }
+
+    /// Drain bounded caller-pool lifecycle outcomes. A queued request's
+    /// [`crate::PoolRequestId`] must be observed here to correlate its later
+    /// admission, expiry, failure, or cancellation with the original call.
+    pub fn poll_caller_pool_events(&mut self, out: &mut Vec<crate::PoolEvent>) {
+        out.clear();
+        let Some(side) = self.caller.as_mut() else {
+            return;
+        };
+        side.callers
+            .poll_outcomes_bounded(side.transport.output_drain.max_actions, out);
     }
 
     /// Steady-state handle for one admitted peer: send, stats, orderly close.
@@ -3321,6 +3364,27 @@ mod owner_tests {
             .expect("caller config")
     }
 
+    #[test]
+    fn owner_rejects_listener_promotion_without_a_relocation_target() {
+        let mut owner = Owner::new();
+        let config = crate::ListenerConfig::builder("127.0.0.1:0".parse().unwrap())
+            .topology(crate::ListenerTopology::PerPort)
+            .configure_transport(|transport| {
+                transport.promotion = crate::PromotionPolicy::All;
+            })
+            .build()
+            .expect("listener config");
+        let error = owner
+            .listen(&config)
+            .expect_err("promotion must be rejected");
+        match error {
+            crate::RuntimeBuildError::Config(error) => {
+                assert_eq!(error.field(), "listener.transport.promotion");
+            }
+            other => panic!("expected configuration error, got {other:?}"),
+        }
+    }
+
     fn test_runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
             .enable_io()
@@ -4651,6 +4715,53 @@ mod tests {
                 ),
                 Err(error) => assert!(matches!(error, GroupBuildError::Config(_))),
             }
+        });
+    }
+
+    #[test]
+    fn tokio_group_preserves_each_leg_receive_budget_and_batch_capacity() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("Tokio runtime builds");
+        runtime.block_on(async {
+            let first_peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("first peer binds");
+            let second_peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("second peer binds");
+            let first_config =
+                crate::CallerConfig::builder(first_peer.local_addr().expect("first address"))
+                    .configure_transport(|transport| {
+                        transport.batching = crate::BatchingPolicy::MaxDatagrams(
+                            std::num::NonZeroUsize::new(3).expect("batch capacity"),
+                        );
+                        transport.recv_budget = RecvBudget::new(1, 2);
+                    })
+                    .build()
+                    .expect("first caller config");
+            let second_config =
+                crate::CallerConfig::builder(second_peer.local_addr().expect("second address"))
+                    .configure_transport(|transport| {
+                        transport.batching = crate::BatchingPolicy::MaxDatagrams(
+                            std::num::NonZeroUsize::new(7).expect("batch capacity"),
+                        );
+                        transport.recv_budget = RecvBudget::new(4, 9);
+                    })
+                    .build()
+                    .expect("second caller config");
+            let conn = GroupConn::caller(
+                crate::GroupConfig::new(46, shiguredo_srt::GroupType::Broadcast),
+                [
+                    GroupCallerLeg::new(1, 10, first_config),
+                    GroupCallerLeg::new(2, 20, second_config),
+                ],
+                Timestamp::from_micros(0),
+            )
+            .expect("group caller");
+
+            assert_eq!(conn.recv_batch.capacity(), 7);
+            assert_eq!(conn.legs[0].recv_budget, RecvBudget::new(1, 2));
+            assert_eq!(conn.legs[1].recv_budget, RecvBudget::new(4, 9));
+            assert_eq!(conn.legs[0].batch_capacity, 3);
+            assert_eq!(conn.legs[1].batch_capacity, 7);
         });
     }
 
