@@ -577,6 +577,20 @@ mod tests {
     }
 
     #[test]
+    fn exhausted_action_budget_does_not_collect_one_extra_output() {
+        let mut conn = caller_with_output();
+        let mut pending = VecDeque::new();
+        let (work, exhausted) =
+            collect_output_work(&mut conn, &mut pending, OutputDrainBudget::new(0, 1, 1024));
+        assert!(work.is_empty());
+        assert!(exhausted);
+        assert!(
+            conn.poll_output().is_some(),
+            "the output must remain queued"
+        );
+    }
+
+    #[test]
     fn receive_batch_clamps_adversarial_capacity() {
         let batch = RecvBatch::with_capacity(usize::MAX, 1);
         assert_eq!(batch.capacity(), RecvBatch::MAX_CAPACITY);

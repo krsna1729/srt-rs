@@ -1573,7 +1573,15 @@ pub(crate) fn collect_output_work(
     pending: &mut VecDeque<ConnectionOutput>,
     budget: OutputDrainBudget,
 ) -> (VecDeque<ConnectionOutput>, bool) {
-    let max_actions = budget.max_actions.max(1);
+    // A composed owner budget can legitimately reach zero after an earlier
+    // phase consumed the shared action allowance. Do not turn that exhausted
+    // state into one extra output action; packet/byte zero retain their
+    // historical "unlimited" meaning for standalone callers, while the
+    // action counter is the hard work bound.
+    if budget.max_actions == 0 {
+        return (VecDeque::new(), true);
+    }
+    let max_actions = budget.max_actions;
     let max_packets = budget.max_packets.max(1);
     let max_bytes = budget.max_bytes.max(1);
     let mut work = VecDeque::new();
