@@ -1,10 +1,10 @@
 # Production progress
 Guide version: 2026-09-13 / audit `6397f6a` (bounded hardening and SRT-600 qualification follow)
 Working repository: /home/dev/srt-rs
-Working branch / HEAD: codex/bounded-correctness @ 6397f6a + working diff (no commit/push authorized)
+Working branch / HEAD: codex/bounded-correctness @ f7b425a (grouped commits complete; no push authorized)
 Protected checkout: none — host idle at setup (only codegraph MCP server running); prior benchmark protection lifted by user authorization below
-Implementation authorization: user 2026-09-10 — "cleanup local. get latest origin/main. take a look at prompt and production guide md files placed. achieve it with a proper commits and PR strategy."
-Validation host and authorization: same host authorized for implementation AND validation (no benchmark process observed at setup); perf-window work still needs explicit per-run confirmation
+Implementation authorization: user 2026-09-10 — "cleanup local. get latest origin/main. take a look at prompt and production guide md files placed. achieve it with a proper commits and PR strategy." Grouped local commits are authorized; push remains out of scope.
+Validation host and authorization: same host authorized for implementation AND focused validation (no benchmark process observed at setup); live perf-window work still needs explicit per-run confirmation
 Allowed resource/time limits: focused validation on the authorized idle host; benchmark/perf windows remain separately protected and workload-bound
 Workload contract: PENDING (V00) — 600-destination target dimension; source rate, message shape, encryption, bonding, latency/resource limits all unfilled
 Current card: F04 VERIFIED — owner-local fixed-size shard telemetry is implemented and tested. F05 is covered by the existing A05 managed-facade shutdown/reclamation and group-failure tests. Source-completable K02 regressions are repaired in the working tree: Tokio listener promotion is rejected without a relocation target, Tokio retained output cannot report `Drained`, caller-pool events expose request identity, and generic/Tokio group legs honor their own receive batch capacities. The bounded SRT-600 corpus/scorer is also implemented; V00 and steady-state qualification remain input/perf-window dependent.
@@ -13,7 +13,7 @@ Required blockers: V00 still needs source rate, message shape, encryption/group 
 Last passed broad gate and source: `cargo xtask ci` (fmt/clippy/reportcard/doc/typos, workspace tests, deny, package and fuzz-build) passed; `cargo xtask asan` passed (275 protocol tests plus protocol benches, 306 transport tests, integration tests and doctests; the repository LSan suppression accounts only for monoio's intentional 6-allocation/72-byte process-lifetime driver state); all seven isolated runtime feature checks, `cargo +1.93.0 check -p shiguredo_srt --all-targets --locked`, `cargo +1.96.0 check -p srt-transport --all-targets --locked`, and 12 fuzz targets at 5 seconds each passed.
 Unrelated changes to preserve:
 - `gpt-6-astra-light.md` (untracked, 300 KB, unrelated per guide §2) — never commit/stash/overwrite
-- `srt-rs-agent-prompt.md`, `srt-rs-production-guide.md` (tracked handoff specs) — update only in the grouped documentation commit
+- `srt-rs-agent-prompt.md`, `srt-rs-production-guide.md` (tracked handoff specs) — updated in the grouped documentation commit
 - `feat/srt-bench-relay-use-cases` (129 commits ahead of origin/main, base 63d617e) — active relay experiment, relevant to F02; do not delete; reuse selectively, no wholesale cherry-pick
 - stashes `pr90-executor` and `contabo-wip-before-pr86` (2026-09-06) — pre-merge WIP, kept as-is pending per-card inspection
 - deleted as superseded (squash-merged, remote branches gone): contabo-pr86-a2, pr-90-ack-coalesce, feat/config-canonical-knobs; prunable worktree /tmp/srt-audit-20260907 removed; local main fast-forwarded 0797e06 → 8f38c1f
@@ -81,6 +81,6 @@ Unrelated changes to preserve:
 - F04 is source-complete: `ShardTelemetry` uses fixed arrays and owner-local counters; no per-packet global atomics, dynamic labels or unbounded histogram/storage path was added.
 - F05 behavior is already covered by the managed-facade close/reaper tests and group-leg failure tests; only a deterministic close-with-pending-send test is a useful remaining coverage improvement.
 - V00 is explicitly blocked on application-owned workload and SLO inputs; V03 consequently remains qualification-blocked rather than being inferred from loopback or CI-smoke traffic.
-- Checks executed: `cargo xtask ci` passed (all non-ignored workspace tests, including 275 protocol, 187 bench, 23 lifecycle, 306 transport and 23 interop cases; explicit live/io_uring sentinels remain ignored), seven feature checks, MSRV/current checks, package, deny, fuzz build plus 12 bounded fuzz runs, and `cargo xtask asan` passed (protocol tests/benches and transport tests/integration/doctests). The xtask ASan wrapper resolves the repository LSan suppression path; its only suppression is monoio's intentional fixed process-lifetime driver allocation (6 allocations, 72 bytes), not a library leak.
+- Checks executed before and after the grouped changes: the prior `cargo xtask ci`/ASan/runtime/MSRV/package/deny/fuzz gates remain green; current post-change `cargo xtask precommit`, report card, no-default-feature transport check, full all-feature transport tests, full bench tests including live interop/bonded cases, focused bench exit/source tests, and qualification CLI plan/score smoke tests all pass. Explicit live/io_uring sentinels remain ignored.
 - Performance remains unqualified: existing benchmark samples are noisy and no new claim of improvement or regression is made. V00/V03 require the application workload contract and a quiet pinned host.
-- Uncommitted source and the three handoff documents remain in the working tree; no Git mutation was performed.
+- Source and handoff documents are committed in grouped local commits; only the unrelated `gpt-6-astra-light.md` remains untracked.
