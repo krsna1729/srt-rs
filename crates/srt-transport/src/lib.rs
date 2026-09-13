@@ -87,6 +87,7 @@ mod due_index;
 mod group_conn;
 mod handoff;
 mod high_res_waiter;
+mod publication_bus;
 mod socket_io;
 mod telemetry;
 mod timer;
@@ -152,6 +153,9 @@ pub use admission::{
 // --- Public re-exports: handoff ---
 
 pub use handoff::{Handoff, WorkerMessage};
+pub use publication_bus::{
+    BusStats, PublicationBus, Published, Publisher, RecvOutcome, Subscription,
+};
 
 // --- Public re-exports: telemetry ---
 
