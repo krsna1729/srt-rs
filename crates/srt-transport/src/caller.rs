@@ -9,6 +9,20 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LogicalCallerId(u64);
 
+impl LogicalCallerId {
+    /// A distinct, otherwise-meaningless id for tests that only need two
+    /// (or more) hashable keys and have no real `CallerTable` entry to
+    /// mint one from (e.g. exercising `SessionTarget`-keyed structures in
+    /// `runtimes/tokio.rs` without a full connection round trip). Gated on
+    /// the `tokio` feature too, not just `test`: its only caller lives
+    /// behind that feature, and an isolated `cargo test -p srt-transport`
+    /// (no `--all-features`) would otherwise warn this is unused.
+    #[cfg(all(test, feature = "tokio"))]
+    pub(crate) fn for_test(id: u64) -> Self {
+        Self(id)
+    }
+}
+
 /// One logical event emitted by a direct caller (A05). The caller-side
 /// counterpart to [`crate::AdmissionEvent`] -- no `representative_peer`
 /// field, since a caller's own configured remote address is already known
