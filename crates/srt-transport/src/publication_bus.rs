@@ -368,7 +368,9 @@ impl<T> Publisher<T> {
         if inner.retained_bytes > MAX_PUBLICATION_BYTES.saturating_sub(byte_len) {
             pre_evicted = inner.enforce_retention_bounded(
                 self.bus.retain_items,
-                self.bus.retain_bytes,
+                self.bus
+                    .retain_bytes
+                    .min(MAX_PUBLICATION_BYTES.saturating_sub(byte_len)),
                 self.bus.retain_age,
                 now,
             );
@@ -848,6 +850,36 @@ mod tests {
             Err(BusError::ItemTooLarge)
         ));
         assert_eq!(bus.stats(), BusStats::default());
+    }
+
+    #[test]
+    fn hard_byte_ceiling_reclaims_oldest_entry_before_accepting_new_data() {
+        let (publisher, bus) = PublicationBus::<u8>::new(
+            MAX_PUBLICATION_ITEMS,
+            MAX_PUBLICATION_BYTES,
+            Duration::from_secs(60),
+        );
+        {
+            let mut inner = bus.inner.lock().unwrap();
+            inner.ring.push_back(Entry {
+                sequence: 0,
+                published_at: Instant::now(),
+                bytes: MAX_PUBLICATION_BYTES,
+                item: Arc::new(0),
+            });
+            inner.next_sequence = 1;
+            inner.retained_bytes = MAX_PUBLICATION_BYTES;
+        }
+        assert_eq!(
+            publisher
+                .publish(1, 1)
+                .expect("publish fits after eviction"),
+            1
+        );
+        let inner = bus.inner.lock().unwrap();
+        assert_eq!(inner.retained_bytes, 1);
+        assert_eq!(inner.ring.len(), 1);
+        assert_eq!(inner.ring.front().unwrap().sequence, 1);
     }
 
     #[test]
