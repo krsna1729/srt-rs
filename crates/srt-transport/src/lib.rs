@@ -126,11 +126,15 @@ pub use config::*;
 
 // --- Public re-exports: utilities ---
 
+#[cfg(any(feature = "mio", feature = "tokio"))]
+pub(crate) use batch::destined_send_limit;
+pub(crate) use batch::drain_recv_fd_with_capacity;
+#[cfg(feature = "mio")]
+pub(crate) use batch::flush_destined_bounded;
 pub use batch::{
     BatchIoStats, RecvBatch, RecvBudget, RecvDrainReport, SendFlushReport, apply_send_result,
     drain_recv_fd, flush_destined,
 };
-pub(crate) use batch::{destined_send_limit, drain_recv_fd_with_capacity, flush_destined_bounded};
 pub use cpu::{available_cpus, current_cpu_spec, parse_cpu_spec, restrict_to_cpu_list};
 pub use deadline_heap::{DeadlineHeap, schedule_wait_micros};
 pub use due_index::DueIndex;
@@ -228,6 +232,7 @@ impl OutputDrainBudget {
         )
     }
 
+    #[cfg(any(feature = "mio", feature = "tokio"))]
     pub(crate) fn consume(&mut self, actions: usize, packets: usize, bytes: usize) {
         self.max_actions = self.max_actions.saturating_sub(actions);
         let packets_exhausted = self.max_packets != 0 && packets >= self.max_packets;

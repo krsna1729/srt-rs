@@ -352,6 +352,7 @@ pub fn flush_destined(
     apply_send_result(packets, crate::sendmsg_batch(fd, packets))
 }
 
+#[cfg(any(feature = "mio", feature = "tokio"))]
 pub(crate) fn destined_send_limit(
     packets: &[(SocketAddr, Vec<u8>)],
     budget: OutputDrainBudget,
@@ -378,6 +379,7 @@ pub(crate) fn destined_send_limit(
     count
 }
 
+#[cfg(feature = "mio")]
 pub(crate) fn flush_destined_bounded(
     fd: RawFd,
     packets: &mut Vec<(SocketAddr, Vec<u8>)>,
@@ -542,6 +544,7 @@ mod tests {
         (SocketAddr::from(([127, 0, 0, 1], 9000)), vec![value])
     }
 
+    #[cfg(any(feature = "mio", feature = "tokio"))]
     #[test]
     fn destined_send_limit_honors_action_packet_and_byte_caps() {
         let packets = vec![
