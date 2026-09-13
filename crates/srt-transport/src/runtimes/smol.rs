@@ -391,6 +391,7 @@ mod tests {
             sock.readable().await.expect("readable");
 
             let mut batch = RecvBatch::new();
+            let batch_capacity = batch.capacity();
             let mut first = Vec::new();
             let report = drain_recv_fd(
                 sock.get_ref().as_raw_fd(),
@@ -423,7 +424,7 @@ mod tests {
             drain_recv_fd(
                 sock.get_ref().as_raw_fd(),
                 &mut batch,
-                RecvBudget::until_would_block(),
+                RecvBudget::for_datagrams(TOTAL, batch_capacity),
                 |_, data| rest.push(data[0]),
             )
             .expect("second drain");

@@ -86,8 +86,10 @@ where
         }
     }
 
+    /// Drain every currently indexed due entry. The index itself is bounded
+    /// by the caller-owned key set and stale amplification invariant.
     pub fn pop_due(&mut self, now: Timestamp, out: &mut Vec<K>) {
-        let _ = self.pop_due_bounded(now, usize::MAX, out);
+        let _ = self.pop_due_bounded(now, self.heap.len(), out);
     }
 
     /// Drain at most `max_work` due heap entries, including stale entries.
@@ -121,13 +123,6 @@ where
                 }
             }
         }
-        // A finite maintenance visit must not trigger the proportional
-        // rebuild pass: rebuilding is O(live) and would defeat the caller's
-        // work bound. The compatibility, unbounded path keeps the original
-        // amortized rebuild behavior.
-        if max_work == usize::MAX {
-            self.maybe_rebuild();
-        }
         let due_remaining = self
             .heap
             .peek()
@@ -148,7 +143,10 @@ where
 
     /// Earliest live deadline, cleaning stale heap entries as necessary.
     pub fn peek_min_deadline(&mut self) -> Option<Timestamp> {
-        loop {
+        // Peeking never inserts entries, so the heap length at entry bounds
+        // the number of stale heads this call can remove.
+        let max_work = self.heap.len();
+        for _ in 0..max_work {
             let std::cmp::Reverse(entry) = self.heap.pop()?;
             match self.current.get(&entry.key) {
                 Some(&deadline) if deadline == entry.deadline_micros => {
@@ -165,6 +163,7 @@ where
                 }
             }
         }
+        None
     }
 
     /// Rebuild once stale history exceeds a proportional threshold.

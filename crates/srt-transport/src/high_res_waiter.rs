@@ -302,7 +302,7 @@ where
         if let Some(timer) = self.timer.as_ref() {
             drain_timerfd(timer.as_raw_fd());
         }
-        self.heap.pop_due(MonotonicDeadline::now(), due);
+        let _ = self.heap.pop_due_bounded(MonotonicDeadline::now(), 64, due);
         Ok(WaitOutcome {
             backend: self.backend,
             planned,

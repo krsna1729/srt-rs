@@ -18,8 +18,8 @@ use shiguredo_srt::{
 use zeroize::Zeroize;
 
 use crate::{
-    AdmissionOptions, BondedInputPolicy, OutputDrainBudget, PeerTable, PeerTableConfig, RecvBudget,
-    SOCK_BUF_BYTES, set_sock_bufs,
+    AdmissionOptions, BondedInputPolicy, MAX_DENSE_SLOTS, OutputDrainBudget, PeerTable,
+    PeerTableConfig, RecvBatch, RecvBudget, SOCK_BUF_BYTES, set_sock_bufs,
 };
 
 const DEFAULT_MESSAGE_PAYLOAD: usize = 1_316;
@@ -1560,6 +1560,12 @@ impl TransportConfig {
                     "the selected runtime adapter has no batched receive implementation",
                 ))
             }
+            BatchingPolicy::MaxDatagrams(count) if count.get() > RecvBatch::MAX_CAPACITY => {
+                Err(ConfigError::new(
+                    "transport.batching",
+                    format!("must not exceed {} datagrams", RecvBatch::MAX_CAPACITY),
+                ))
+            }
             BatchingPolicy::MaxDatagrams(count) => Ok(Some(count)),
         }
     }
@@ -1669,6 +1675,12 @@ impl Default for AdmissionConfig {
 
 impl AdmissionConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.limits.max_peers > MAX_DENSE_SLOTS {
+            return Err(ConfigError::new(
+                "admission.max_peers",
+                format!("must not exceed {MAX_DENSE_SLOTS} peers"),
+            ));
+        }
         if self.limits.max_peers == 0 {
             return Err(ConfigError::new("admission.max_peers", "must be non-zero"));
         }
@@ -2447,6 +2459,27 @@ mod tests {
     }
 
     #[test]
+    fn explicit_batching_above_scratch_cap_is_rejected() {
+        let config = TransportConfig {
+            topology: ListenerTopology::SharedPool {
+                listeners: WorkerCount::Count(NonZeroUsize::MIN),
+            },
+            batching: BatchingPolicy::MaxDatagrams(
+                NonZeroUsize::new(RecvBatch::MAX_CAPACITY + 1).expect("non-zero batch capacity"),
+            ),
+            ..TransportConfig::default()
+        };
+        let capabilities = TransportCapabilities {
+            receive_batching: true,
+            ..TransportCapabilities::default()
+        };
+        let error = config
+            .resolve(capabilities)
+            .expect_err("batching must fit the bounded receive scratch arena");
+        assert_eq!(error.field(), "transport.batching");
+    }
+
+    #[test]
     fn resolved_receive_settings_expose_batch_capacity_and_reject_zero_budget() {
         let config = TransportConfig {
             topology: ListenerTopology::SharedPool {
@@ -2784,6 +2817,19 @@ mod tests {
 
         let error = session.validate().expect_err("invalid overhead");
         assert_eq!(error.field(), "session.bandwidth");
+    }
+
+    #[test]
+    fn admission_rejects_capacity_above_dense_arena_limit() {
+        let config = ListenerConfig::builder(address(0))
+            .configure_admission(|admission| {
+                admission.limits.max_peers = MAX_DENSE_SLOTS + 1;
+            })
+            .into_config();
+        let error = config
+            .prepare(RuntimeFlavor::Mio)
+            .expect_err("an arena-sized capacity is the hard admission limit");
+        assert_eq!(error.field(), "admission.max_peers");
     }
 
     #[test]

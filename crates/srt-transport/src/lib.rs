@@ -73,9 +73,11 @@ mod dense_slot_arena;
 #[cfg(any(test, feature = "bench-internals"))]
 pub use admission::PhysicalPeerKey;
 #[cfg(any(test, feature = "bench-internals"))]
-pub use dense_slot_arena::{DenseSlotArena, PeerSlot, PeerSlotId, RouteSlot, SlotMut, SlotRef};
+pub use dense_slot_arena::{
+    DenseSlotArena, MAX_DENSE_SLOTS, PeerSlot, PeerSlotId, RouteSlot, SlotMut, SlotRef,
+};
 #[cfg(not(any(test, feature = "bench-internals")))]
-pub(crate) use dense_slot_arena::{DenseSlotArena, PeerSlotId};
+pub(crate) use dense_slot_arena::{DenseSlotArena, MAX_DENSE_SLOTS, PeerSlotId};
 mod dense_due_index;
 #[cfg(not(any(test, feature = "bench-internals")))]
 pub(crate) use dense_due_index::DenseDueIndex;
@@ -154,23 +156,32 @@ pub use admission::{
 
 pub use handoff::{Handoff, WorkerMessage};
 pub use publication_bus::{
-    BusStats, PublicationBus, Published, Publisher, RecvOutcome, Subscription,
+    BusError, BusStats, MAX_PUBLICATION_BYTES, MAX_PUBLICATION_ITEMS, MAX_SUBSCRIPTIONS,
+    PublicationBus, Published, Publisher, RecvOutcome, Subscription,
 };
 
 // --- Public re-exports: telemetry ---
 
-pub use telemetry::{IngressTelemetry, IngressTelemetrySnapshot};
+pub use telemetry::{
+    IngressTelemetry, IngressTelemetrySnapshot, SHARD_LATENESS_BUCKETS, SHARD_OVERLOAD_REASONS,
+    ShardOverloadReason, ShardTelemetry, ShardTelemetrySnapshot,
+};
 
 // --- Public re-exports: caller ---
 
 pub use caller::{
-    CallerEvent, CallerGroupLeg, CallerLeg, CallerTable, LogicalCaller, LogicalCallerId,
-    LogicalCallerMut, LogicalCallerState, LogicalCallerStats, RemovedCallerLeg,
-    RemovedLogicalCaller,
+    CallerEvent, CallerGroupLeg, CallerLeg, CallerTable, DEFAULT_MAX_CALLERS, LogicalCaller,
+    LogicalCallerId, LogicalCallerMut, LogicalCallerState, LogicalCallerStats, MAX_CALLERS,
+    RemovedCallerLeg, RemovedLogicalCaller,
 };
-pub use caller_pool::{CallerPool, CallerPoolStats, PoolEvent, PoolOutcome, PoolRequestId};
+pub use caller_pool::{
+    CallerPool, CallerPoolStats, MAX_CALLER_POOL_IN_FLIGHT, MAX_CALLER_POOL_QUEUE, PoolEvent,
+    PoolOutcome, PoolRequestId,
+};
 // Internal helpers used by runtime and group_conn modules.
-pub(crate) use batch::{drain_connected_outputs, drain_output_work};
+pub(crate) use batch::drain_connected_outputs;
+#[cfg(any(feature = "tokio", feature = "smol"))]
+pub(crate) use batch::drain_output_work;
 pub(crate) use caller::{collect_output_work, prepend_outputs};
 
 // --- Public re-exports: group ---

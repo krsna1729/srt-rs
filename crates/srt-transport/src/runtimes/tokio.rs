@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::net::UdpSocket;
+use zeroize::Zeroize;
 
 /// Per-connection state for tokio: protocol + async socket + timer deadlines.
 pub struct Conn {
@@ -48,12 +49,28 @@ impl Conn {
         output_drain: OutputDrainBudget,
         recv_budget: RecvBudget,
     ) -> Self {
+        Self::with_transport(
+            conn,
+            sock,
+            output_drain,
+            recv_budget,
+            RecvBatch::DEFAULT_CAPACITY,
+        )
+    }
+
+    fn with_transport(
+        conn: SrtConnection,
+        sock: UdpSocket,
+        output_drain: OutputDrainBudget,
+        recv_budget: RecvBudget,
+        batch_capacity: usize,
+    ) -> Self {
         Self {
             conn,
             sock,
             timers: crate::ManualTimerStore::new(),
             pending_outputs: VecDeque::new(),
-            recv_batch: RecvBatch::new(),
+            recv_batch: RecvBatch::with_capacity(batch_capacity, RecvBatch::DEFAULT_BUF_LEN),
             io_stats: BatchIoStats::default(),
             output_drain,
             recv_budget,
@@ -346,12 +363,14 @@ pub fn caller(
     now: Timestamp,
 ) -> Result<Conn, crate::RuntimeBuildError> {
     let prepared = config.prepare(crate::RuntimeFlavor::Tokio)?;
+    prepared.require_exclusive()?;
     let socket = UdpSocket::from_std(prepared.bind_socket()?)?;
-    Ok(Conn::with_budgets(
+    Ok(Conn::with_transport(
         prepared.connection(now)?,
         socket,
         prepared.transport.output_drain,
         prepared.transport.recv_budget,
+        prepared.transport.recv_batch_capacity(),
     ))
 }
 
@@ -360,6 +379,13 @@ struct GroupLeg {
     socket: UdpSocket,
     timers: ManualTimerStore,
     pending_outputs: VecDeque<ConnectionOutput>,
+    recv_budget: RecvBudget,
+}
+
+struct TokioGroupLeg {
+    leg: GroupConnectionLeg,
+    recv_budget: RecvBudget,
+    batch_capacity: usize,
 }
 
 /// Tokio-native multi-socket driver for an SRT Broadcast or Backup group.
@@ -387,15 +413,39 @@ impl GroupConn {
         mode: GroupMode,
         legs: impl IntoIterator<Item = GroupConnectionLeg>,
     ) -> Result<Self, GroupBuildError> {
+        Self::new_with_policies(
+            group_id,
+            mode,
+            legs.into_iter().map(|leg| TokioGroupLeg {
+                leg,
+                recv_budget: RecvBudget::default(),
+                batch_capacity: RecvBatch::DEFAULT_CAPACITY,
+            }),
+        )
+    }
+
+    fn new_with_policies(
+        group_id: u32,
+        mode: GroupMode,
+        legs: impl IntoIterator<Item = TokioGroupLeg>,
+    ) -> Result<Self, GroupBuildError> {
         let mut group = shiguredo_srt::SrtGroup::new(group_id, mode)?;
         let mut io_legs = Vec::new();
-        for leg in legs {
+        let mut batch_capacity = 1;
+        for TokioGroupLeg {
+            leg,
+            recv_budget,
+            batch_capacity: leg_batch_capacity,
+        } in legs
+        {
             group.add_member(leg.member_id, leg.weight, leg.connection)?;
+            batch_capacity = batch_capacity.max(leg_batch_capacity);
             io_legs.push(GroupLeg {
                 member_id: leg.member_id,
                 socket: UdpSocket::from_std(leg.socket)?,
                 timers: ManualTimerStore::new(),
                 pending_outputs: VecDeque::new(),
+                recv_budget,
             });
         }
         Ok(Self {
@@ -405,9 +455,7 @@ impl GroupConn {
             logical_payload_bytes_sent: 0,
             logical_payloads_received: 0,
             logical_payload_bytes_received: 0,
-            // D02: see the identical fix and rationale in group_conn.rs's
-            // own `GroupConn::new`.
-            recv_batch: RecvBatch::new(),
+            recv_batch: RecvBatch::with_capacity(batch_capacity, RecvBatch::DEFAULT_BUF_LEN),
             io_stats: BatchIoStats::default(),
         })
     }
@@ -447,22 +495,21 @@ impl GroupConn {
             // meaningful here and `bind_socket` (K01) leaves such a socket
             // unconnected -- silently breaking this type's connected-socket
             // send path instead of failing preparation. Reject it up front.
-            if !prepared.transport.exclusive {
-                return Err(GroupBuildError::Config(crate::ConfigError::new(
-                    "transport.ownership",
-                    "a bonded group leg needs its own connected socket; Shared ownership is not supported here",
-                )));
-            }
-            raw_legs.push(GroupConnectionLeg {
-                member_id: leg.member_id,
-                weight: leg.weight,
-                connection: prepared.connection(now)?,
-                socket: prepared.bind_socket()?,
+            prepared.require_exclusive()?;
+            raw_legs.push(TokioGroupLeg {
+                recv_budget: prepared.transport.recv_budget,
+                batch_capacity: prepared.transport.recv_batch_capacity(),
+                leg: GroupConnectionLeg {
+                    member_id: leg.member_id,
+                    weight: leg.weight,
+                    connection: prepared.connection(now)?,
+                    socket: prepared.bind_socket()?,
+                },
             });
         }
         let mode = GroupMode::from_group_type(group.group_type)
             .ok_or(GroupBuildError::InvalidGroupType)?;
-        Self::new(group.group_id, mode, raw_legs)
+        Self::new_with_policies(group.group_id, mode, raw_legs)
     }
 
     #[must_use]
@@ -542,7 +589,6 @@ impl GroupConn {
         report: &mut GroupDriveReport,
     ) -> io::Result<()> {
         report.legs.clear();
-        let recv_budget = RecvBudget::new(2, 64);
         {
             let (group, legs, recv_batch, io_stats) = (
                 &mut self.group,
@@ -563,7 +609,7 @@ impl GroupConn {
                     recv_batch,
                     conn,
                     now,
-                    recv_budget,
+                    leg.recv_budget,
                     &mut malformed_datagrams,
                 );
                 let mut newly_broken = false;
@@ -687,39 +733,141 @@ fn send_destined_ready(
     );
     match crate::apply_send_result(outbound, result) {
         Ok(report) => Ok(report),
-        Err(_) => {
+        Err(batch_error) => {
+            if is_transient_send_error(&batch_error) {
+                return Ok(crate::SendFlushReport {
+                    would_block: true,
+                    ..crate::SendFlushReport::default()
+                });
+            }
             // `sendmmsg` reports one error for the whole batch. A malformed
             // destination must not take down every logical session sharing
             // this egress socket, so retry packets individually and retire
             // only the destination that failed. A transient `WouldBlock`
             // keeps the suffix for the next writable wake.
             let mut report = crate::SendFlushReport::default();
-            let index = 0;
-            while index < outbound.len() {
-                let (destination, packet) = &outbound[index];
+            let mut completed = 0;
+            while completed < outbound.len() {
+                let (destination, packet) = &outbound[completed];
                 let result = sock.try_io(tokio::io::Interest::WRITABLE, || {
                     sock.try_send_to(packet, *destination)
                 });
                 match result {
                     Ok(_) => {
-                        outbound.remove(index);
+                        completed += 1;
                         report.sent = report.sent.saturating_add(1);
                     }
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    Err(error) if is_transient_send_error(&error) => {
                         report.would_block = true;
                         break;
                     }
-                    Err(_) => {
+                    Err(error) if is_destination_send_error(&error) => {
                         // A destination-specific error is isolated to this
                         // packet. Keeping it would make every future visit
                         // fail at the same item and starve healthy peers.
-                        outbound.remove(index);
+                        completed += 1;
+                    }
+                    Err(error) => {
+                        outbound.drain(..completed);
+                        return Err(error);
                     }
                 }
             }
+            outbound.drain(..completed);
             Ok(report)
         }
     }
+}
+
+fn is_transient_send_error(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::WouldBlock
+        || matches!(error.raw_os_error(), Some(libc::ENOBUFS | libc::ENOMEM))
+}
+
+fn is_destination_send_error(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(
+            libc::EAFNOSUPPORT
+                | libc::EADDRNOTAVAIL
+                | libc::EHOSTUNREACH
+                | libc::ENETUNREACH
+                | libc::ECONNREFUSED
+                | libc::EMSGSIZE
+        )
+    )
+}
+
+fn side_output_budget(
+    transport: crate::ResolvedTransportConfig,
+    caller_budget: crate::OutputDrainBudget,
+) -> crate::OutputDrainBudget {
+    caller_budget
+        .intersect(transport.output_drain)
+        .intersect(OutputDrainBudget::new(
+            OWNER_MAINTENANCE_MAX_ACTIONS,
+            caller_budget.max_packets,
+            caller_budget.max_bytes,
+        ))
+}
+
+fn drive_listener_side(
+    side: &mut OwnerListenerSide,
+    now: Timestamp,
+    caller_budget: crate::OutputDrainBudget,
+    status: crate::OutputDrainStatus,
+) -> io::Result<crate::OutputDrainStatus> {
+    let budget = side_output_budget(side.transport, caller_budget);
+    side.peers
+        .prune_idle_bounded(now, side.idle_timeout, budget.max_actions);
+    let poll_report = side.outbound.is_empty().then(|| {
+        side.peers
+            .poll_outbound_bounded(now, budget, &mut side.outbound)
+    });
+    if let Some(report) = poll_report {
+        side.output_pending = report.status == crate::OutputDrainStatus::BudgetExhausted;
+    }
+    drive_side_output(
+        &side.socket,
+        &mut side.outbound,
+        &mut side.write_blocked,
+        status,
+        poll_report,
+    )
+}
+
+fn drive_caller_side(
+    side: &mut OwnerCallerSide,
+    expired_callers: &mut VecDeque<crate::LogicalCallerId>,
+    now: Timestamp,
+    caller_budget: crate::OutputDrainBudget,
+    status: crate::OutputDrainStatus,
+) -> io::Result<crate::OutputDrainStatus> {
+    let budget = side_output_budget(side.transport, caller_budget);
+    for id in side
+        .callers
+        .poll_expirations_bounded(now, budget.max_actions)
+    {
+        if expired_callers.len() == OWNER_MAINTENANCE_MAX_ACTIONS {
+            expired_callers.pop_front();
+        }
+        expired_callers.push_back(id);
+    }
+    let poll_report = side.outbound.is_empty().then(|| {
+        side.callers
+            .table_mut()
+            .poll_outbound_bounded(now, budget, &mut side.outbound)
+    });
+    if let Some(report) = poll_report {
+        side.output_pending = report.status == crate::OutputDrainStatus::BudgetExhausted;
+    }
+    drive_side_output(
+        &side.socket,
+        &mut side.outbound,
+        &mut side.write_blocked,
+        status,
+        poll_report,
+    )
 }
 
 /// Combine a side's output-drain report (if one was polled this tick, i.e.
@@ -785,6 +933,18 @@ fn receive_continuation(report: RecvDrainReport, budget: RecvBudget) -> bool {
         && (report.syscalls >= budget.max_rounds || report.datagrams >= budget.max_datagrams)
 }
 
+const OWNER_MAINTENANCE_MAX_ACTIONS: usize = 1024;
+
+fn side_needs_immediate_work(
+    recv_pending: bool,
+    event_pending: bool,
+    output_pending: bool,
+    write_blocked: bool,
+    outbound_empty: bool,
+) -> bool {
+    recv_pending || event_pending || (!write_blocked && (output_pending || !outbound_empty))
+}
+
 struct OwnerListenerSide {
     socket: UdpSocket,
     peers: crate::PeerTable,
@@ -793,9 +953,10 @@ struct OwnerListenerSide {
     recv_batch: RecvBatch,
     outbound: Vec<(SocketAddr, Vec<u8>)>,
     idle_timeout: Duration,
-    recv_budget: RecvBudget,
-    output_drain: OutputDrainBudget,
+    transport: crate::ResolvedTransportConfig,
     recv_pending: bool,
+    output_pending: bool,
+    event_pending: bool,
     write_blocked: bool,
 }
 
@@ -804,12 +965,13 @@ struct OwnerCallerSide {
     callers: crate::CallerPool,
     recv_batch: RecvBatch,
     outbound: Vec<(SocketAddr, Vec<u8>)>,
-    recv_budget: RecvBudget,
-    output_drain: OutputDrainBudget,
+    transport: crate::ResolvedTransportConfig,
     recv_pending: bool,
+    output_pending: bool,
+    event_pending: bool,
     write_blocked: bool,
     local_bind: Option<SocketAddr>,
-    socket_buffer_bytes: usize,
+    connect_config: crate::ConnectConfig,
 }
 
 /// The Tokio-native counterpart to [`crate::mio_transport::Owner`] (A03,
@@ -819,7 +981,7 @@ struct OwnerCallerSide {
 /// Every other design decision mirrors the Mio owner exactly -- same
 /// `PerPort`-only listener topology, same `SocketOwnership::Shared`
 /// requirement for callers, same IPv4-only send path restriction, same
-/// effectively-unbounded default caller-pool policy overridable via
+/// finite default caller-pool policy overridable via
 /// [`Self::set_caller_pool_policy`], same `idle_timeout` enforcement every
 /// tick -- because both owners are assembled from the identical
 /// runtime-agnostic tables; only the socket layer differs.
@@ -834,7 +996,7 @@ pub struct Owner {
     caller: Option<OwnerCallerSide>,
     caller_pool_policy: Option<(std::num::NonZeroUsize, Duration)>,
     caller_pool_policy_explicit: bool,
-    expired_callers: Vec<crate::LogicalCallerId>,
+    expired_callers: VecDeque<crate::LogicalCallerId>,
 }
 
 impl Default for Owner {
@@ -851,12 +1013,11 @@ impl Owner {
             caller: None,
             caller_pool_policy: None,
             caller_pool_policy_explicit: false,
-            expired_callers: Vec::new(),
+            expired_callers: VecDeque::new(),
         }
     }
 
-    /// Opt into real `max_in_flight`/`attempt_deadline` enforcement (A04)
-    /// on the caller side, instead of the effectively-unbounded default.
+    /// Set the caller-side `max_in_flight`/`attempt_deadline` policy (A04).
     /// Must be called before the first [`Self::connect`] call.
     pub fn set_caller_pool_policy(
         &mut self,
@@ -869,6 +1030,13 @@ impl Owner {
                 "must be set before the first connect() call, not after the caller \
                  socket and its pool already exist",
             )));
+        }
+        if attempt_deadline.is_zero() {
+            return Err(crate::ConfigError::new(
+                "caller_pool_policy",
+                "attempt deadline must be positive",
+            )
+            .into());
         }
         self.caller_pool_policy = Some((max_in_flight, attempt_deadline));
         self.caller_pool_policy_explicit = true;
@@ -917,11 +1085,15 @@ impl Owner {
             idle_timeout: prepared.admission.idle_timeout,
             peers: prepared.peer_table(),
             telemetry: crate::IngressTelemetry::new(),
-            recv_batch: RecvBatch::new(),
+            recv_batch: RecvBatch::with_capacity(
+                prepared.transport.recv_batch_capacity(),
+                RecvBatch::DEFAULT_BUF_LEN,
+            ),
             outbound: Vec::new(),
-            recv_budget: prepared.transport.recv_budget,
-            output_drain: prepared.transport.output_drain,
+            transport: prepared.transport,
             recv_pending: false,
+            output_pending: false,
+            event_pending: false,
             write_blocked: false,
         });
         Ok(())
@@ -936,7 +1108,13 @@ impl Owner {
         config: &crate::CallerConfig,
         now: Timestamp,
     ) -> Result<crate::PoolOutcome, crate::RuntimeBuildError> {
-        let prepared = config.prepare(crate::RuntimeFlavor::Tokio)?;
+        let mut prepared = config.prepare(crate::RuntimeFlavor::Tokio)?;
+        if self.caller_pool_policy_explicit
+            && let Some((max_in_flight, attempt_deadline)) = self.caller_pool_policy
+        {
+            prepared.connect.max_in_flight = max_in_flight;
+            prepared.connect.attempt_deadline = attempt_deadline;
+        }
         if prepared.transport.exclusive {
             return Err(crate::RuntimeBuildError::from(crate::ConfigError::new(
                 "caller.transport.ownership",
@@ -953,14 +1131,12 @@ impl Owner {
                  an IPv4 remote address instead",
             )));
         }
-        if let Some(side) = self.caller.as_ref()
-            && (side.local_bind != prepared.local_bind
-                || side.socket_buffer_bytes != prepared.transport.socket_buffer_bytes)
-        {
-            return Err(crate::RuntimeBuildError::from(crate::ConfigError::new(
-                "caller.transport",
-                "later Shared callers must use the first caller socket's local bind and socket buffer configuration",
-            )));
+        if let Some(side) = self.caller.as_ref() {
+            prepared.validate_shared_compatibility(
+                side.local_bind,
+                side.transport,
+                Some(side.connect_config),
+            )?;
         }
         if self.caller.is_none() {
             let socket = UdpSocket::from_std(prepared.bind_socket()?)?;
@@ -985,14 +1161,18 @@ impl Owner {
                 // outcome stream; that path is `mio::Owner`'s, which keeps
                 // a real queue.
                 callers: crate::CallerPool::with_queue_capacity(policy.0, policy.1, 0),
-                recv_batch: RecvBatch::new(),
+                recv_batch: RecvBatch::with_capacity(
+                    prepared.transport.recv_batch_capacity(),
+                    RecvBatch::DEFAULT_BUF_LEN,
+                ),
                 outbound: Vec::new(),
-                recv_budget: prepared.transport.recv_budget,
-                output_drain: prepared.transport.output_drain,
+                transport: prepared.transport,
                 recv_pending: false,
+                output_pending: false,
+                event_pending: false,
                 write_blocked: false,
                 local_bind: prepared.local_bind,
-                socket_buffer_bytes: prepared.transport.socket_buffer_bytes,
+                connect_config: prepared.connect,
             });
         } else if !self.caller_pool_policy_explicit
             && self.caller_pool_policy
@@ -1032,8 +1212,23 @@ impl Owner {
         now: impl Fn() -> Timestamp,
         caller_budget: crate::OutputDrainBudget,
     ) -> io::Result<crate::OutputDrainStatus> {
-        let continuation = self.listener.as_ref().is_some_and(|side| side.recv_pending)
-            || self.caller.as_ref().is_some_and(|side| side.recv_pending);
+        let continuation = self.listener.as_ref().is_some_and(|side| {
+            side_needs_immediate_work(
+                side.recv_pending,
+                side.event_pending,
+                side.output_pending,
+                side.write_blocked,
+                side.outbound.is_empty(),
+            )
+        }) || self.caller.as_ref().is_some_and(|side| {
+            side_needs_immediate_work(
+                side.recv_pending,
+                side.event_pending,
+                side.output_pending,
+                side.write_blocked,
+                side.outbound.is_empty(),
+            )
+        });
         if continuation {
             // A continuation is deliberately one bounded visit, then a
             // scheduler handoff. This keeps a permanently busy socket from
@@ -1068,26 +1263,26 @@ impl Owner {
             let report = drain_readable(
                 &side.socket,
                 &mut side.recv_batch,
-                side.recv_budget,
+                side.transport.recv_budget,
                 |addr, data| {
                     let Some(peer) = addr else { return };
                     let _ = peers.admit(peer, data, recv_now, admission, 0, 1, telemetry);
                 },
             )?;
-            side.recv_pending = receive_continuation(report, side.recv_budget);
+            side.recv_pending = receive_continuation(report, side.transport.recv_budget);
         }
         if let Some(side) = self.caller.as_mut() {
             let callers = side.callers.table_mut();
             let report = drain_readable(
                 &side.socket,
                 &mut side.recv_batch,
-                side.recv_budget,
+                side.transport.recv_budget,
                 |addr, data| {
                     let Some(peer) = addr else { return };
                     let _ = callers.feed(peer, data, recv_now);
                 },
             )?;
-            side.recv_pending = receive_continuation(report, side.recv_budget);
+            side.recv_pending = receive_continuation(report, side.transport.recv_budget);
         }
         self.drive(now(), caller_budget)
     }
@@ -1105,44 +1300,11 @@ impl Owner {
     ) -> io::Result<crate::OutputDrainStatus> {
         let mut status = crate::OutputDrainStatus::Drained;
         if let Some(side) = self.listener.as_mut() {
-            side.peers.prune_idle(now, side.idle_timeout);
-            let budget = caller_budget.intersect(side.output_drain);
-            let poll_report = if side.outbound.is_empty() {
-                Some(
-                    side.peers
-                        .poll_outbound_bounded(now, budget, &mut side.outbound),
-                )
-            } else {
-                None
-            };
-            status = drive_side_output(
-                &side.socket,
-                &mut side.outbound,
-                &mut side.write_blocked,
-                status,
-                poll_report,
-            )?;
+            status = drive_listener_side(side, now, caller_budget, status)?;
         }
         if let Some(side) = self.caller.as_mut() {
-            let expired = side.callers.poll_expirations(now);
-            self.expired_callers.extend(expired);
-            let budget = caller_budget.intersect(side.output_drain);
-            let poll_report = if side.outbound.is_empty() {
-                Some(side.callers.table_mut().poll_outbound_bounded(
-                    now,
-                    budget,
-                    &mut side.outbound,
-                ))
-            } else {
-                None
-            };
-            status = drive_side_output(
-                &side.socket,
-                &mut side.outbound,
-                &mut side.write_blocked,
-                status,
-                poll_report,
-            )?;
+            status =
+                drive_caller_side(side, &mut self.expired_callers, now, caller_budget, status)?;
         }
         Ok(status)
     }
@@ -1153,7 +1315,9 @@ impl Owner {
         let Some(side) = self.listener.as_mut() else {
             return;
         };
-        side.peers.poll_events(out);
+        side.peers
+            .poll_events_bounded(side.transport.output_drain.max_actions, out);
+        side.event_pending = side.peers.has_pending_events();
     }
 
     /// Drain protocol events (A05) for every direct outbound session --
@@ -1163,7 +1327,10 @@ impl Owner {
         let Some(side) = self.caller.as_mut() else {
             return;
         };
-        side.callers.table_mut().poll_events(out);
+        side.callers
+            .table_mut()
+            .poll_events_bounded(side.transport.output_drain.max_actions, out);
+        side.event_pending = side.callers.table().has_pending_events();
     }
 
     /// Steady-state handle for one admitted peer: send, stats, orderly close.
@@ -1199,7 +1366,7 @@ impl Owner {
         &mut self,
         id: crate::LogicalCallerId,
     ) -> Option<crate::RemovedLogicalCaller> {
-        self.caller.as_mut()?.callers.table_mut().remove(id)
+        self.caller.as_mut()?.callers.remove(id)
     }
 
     /// Return and clear caller attempts retired by the bounded pool deadline.
@@ -1207,7 +1374,7 @@ impl Owner {
     /// `connect()` futures and reclaim their routing state.
     pub fn drain_expired_callers(&mut self, out: &mut Vec<crate::LogicalCallerId>) {
         out.clear();
-        out.append(&mut self.expired_callers);
+        out.extend(self.expired_callers.drain(..));
     }
 
     /// The listener socket's bound local address, once [`Self::listen`]
@@ -1248,49 +1415,61 @@ impl Owner {
     /// Microseconds until either side's next due timer, for sizing
     /// [`Self::run_once`]'s timeout.
     ///
-    /// Opus review finding 4: this does not fold in
-    /// `has_pending_output`/`has_pending_events` the way `mio_transport`'s
-    /// equivalent does, so a `BudgetExhausted` drain or output queued
-    /// between ticks is not guaranteed an immediate revisit -- a real
-    /// latency/throughput note under sustained load. A fix was attempted
-    /// (routing both sides through their ready-queue `has_pending_output`
-    /// the same way `mio_transport::Owner` does) but reproducibly made
-    /// `a_closed_sessions_table_entry_is_actually_reclaimed` fail: the
-    /// caller-side close no longer completed within the test's budget,
-    /// and the exact mechanism was not pinned down before this pass ran
-    /// out of budget to investigate further (the reported deadline at the
-    /// point of the stall was a genuine, large, and correctly-decreasing
-    /// value from `CallerPool::time_until_next_deadline` itself, not an
-    /// obviously wrong number -- something earlier in the close sequence
-    /// stops progressing before that point is reached). Left as the
-    /// original, narrower calculation rather than ship a change that
-    /// regresses an existing, previously-passing test; tracked as an open
-    /// follow-up, not a numbered card.
+    /// Pending receive, event, and output work returns zero so the next
+    /// [`Self::run_once`] call performs a bounded immediate pass. Otherwise
+    /// the result is the minimum of the caller-pool, listener-idle, and
+    /// protocol timer deadlines, capped by `default_us`.
     #[must_use]
     pub fn time_until_next_deadline(&mut self, now: Timestamp, default_us: u64) -> u64 {
-        let listener = self
-            .listener
-            .as_mut()
-            .map(|side| side.peers.time_until_next_deadline(now, u64::MAX));
-        let caller = self
-            .caller
-            .as_ref()
-            .map(|side| side.callers.table().time_until_next_deadline(now, u64::MAX));
-        let pending_output = self
-            .listener
-            .as_ref()
-            .is_some_and(|side| !side.outbound.is_empty() && !side.write_blocked)
-            || self
-                .caller
-                .as_ref()
-                .is_some_and(|side| !side.outbound.is_empty() && !side.write_blocked);
-        let next = match (listener, caller) {
-            (Some(a), Some(b)) => a.min(b).min(default_us),
-            (Some(a), None) | (None, Some(a)) => a.min(default_us),
-            (None, None) => default_us,
-        };
-        if pending_output { 0 } else { next }
+        let mut wait = default_us;
+        if let Some(side) = self.listener.as_mut() {
+            match tokio_listener_time_until_deadline(side, now) {
+                None => return 0,
+                Some(side_wait) => wait = wait.min(side_wait),
+            }
+        }
+        if let Some(side) = self.caller.as_mut() {
+            match tokio_caller_time_until_deadline(side, now) {
+                None => return 0,
+                Some(side_wait) => wait = wait.min(side_wait),
+            }
+        }
+        wait
     }
+}
+
+fn tokio_listener_time_until_deadline(side: &mut OwnerListenerSide, now: Timestamp) -> Option<u64> {
+    if side.recv_pending || side.event_pending {
+        return None;
+    }
+    let mut wait = side
+        .peers
+        .time_until_idle_deadline(now, side.idle_timeout, u64::MAX);
+    if side.write_blocked {
+        return Some(wait);
+    }
+    if side.output_pending || !side.outbound.is_empty() || side.peers.has_pending_output(now) {
+        return None;
+    }
+    wait = wait.min(side.peers.time_until_next_deadline(now, u64::MAX));
+    Some(wait)
+}
+
+fn tokio_caller_time_until_deadline(side: &mut OwnerCallerSide, now: Timestamp) -> Option<u64> {
+    if side.recv_pending || side.event_pending {
+        return None;
+    }
+    let wait = side.callers.time_until_next_deadline(now, u64::MAX);
+    if side.write_blocked {
+        return Some(wait);
+    }
+    if side.output_pending
+        || !side.outbound.is_empty()
+        || side.callers.table().has_pending_output(now)
+    {
+        return None;
+    }
+    Some(wait)
 }
 
 // ---------------------------------------------------------------------------
@@ -1357,6 +1536,9 @@ enum SessionTarget {
 
 const FACADE_COMMAND_CAPACITY: usize = 1024;
 const FACADE_COMMAND_BYTES: usize = 8 * 1024 * 1024;
+const SESSION_COMMAND_CAPACITY: usize = 64;
+const SESSION_COMMAND_BYTES: usize = 1024 * 1024;
+const MAX_QUOTA_CAS_RETRIES: usize = 16;
 /// Fixed per-command byte charge covering a `Command`'s own overhead,
 /// added on top of any variable-size payload it carries (a `Send`'s
 /// payload) or used alone for commands with none (`Connect`, the
@@ -1385,15 +1567,24 @@ const FACADE_PENDING_BYTES_TOTAL: usize = 64 * 1024 * 1024;
 /// earlier than) any protocol-level TLPKTDROP/ARQ retirement.
 const SESSION_PENDING_MAX_AGE: Duration = Duration::from_secs(5);
 const DRIVER_COMMAND_QUANTUM: usize = 32;
+const SHUTDOWN_MAX_TICKS: usize = 256;
+const SHUTDOWN_MAX_TIME: Duration = Duration::from_millis(100);
 
 struct CommandCharge {
     used: Arc<AtomicUsize>,
     amount: usize,
+    session: Option<Arc<SessionControl>>,
 }
 
 impl Drop for CommandCharge {
     fn drop(&mut self) {
         self.used.fetch_sub(self.amount, Ordering::AcqRel);
+        if let Some(session) = &self.session {
+            session
+                .command_bytes
+                .fetch_sub(self.amount, Ordering::AcqRel);
+            session.command_items.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 }
 
@@ -1404,7 +1595,7 @@ fn reserve_command_bytes(
     if amount > FACADE_COMMAND_BYTES {
         return Err(FacadeError::QueueFull);
     }
-    loop {
+    for _ in 0..MAX_QUOTA_CAS_RETRIES {
         let current = used.load(Ordering::Acquire);
         if current > FACADE_COMMAND_BYTES.saturating_sub(amount) {
             return Err(FacadeError::QueueFull);
@@ -1421,9 +1612,59 @@ fn reserve_command_bytes(
             return Ok(CommandCharge {
                 used: Arc::clone(used),
                 amount,
+                session: None,
             });
         }
     }
+    Err(FacadeError::QueueFull)
+}
+
+fn reserve_session_command(
+    used: &Arc<AtomicUsize>,
+    session: &Arc<SessionControl>,
+    amount: usize,
+) -> Result<CommandCharge, FacadeError> {
+    let mut charge = reserve_command_bytes(used, amount)?;
+    let mut item_reserved = false;
+    for _ in 0..MAX_QUOTA_CAS_RETRIES {
+        let items = session.command_items.load(Ordering::Acquire);
+        if items >= SESSION_COMMAND_CAPACITY {
+            return Err(FacadeError::QueueFull);
+        }
+        if session
+            .command_items
+            .compare_exchange_weak(items, items + 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            item_reserved = true;
+            break;
+        }
+    }
+    if !item_reserved {
+        return Err(FacadeError::QueueFull);
+    }
+    let mut bytes_reserved = false;
+    for _ in 0..MAX_QUOTA_CAS_RETRIES {
+        let bytes = session.command_bytes.load(Ordering::Acquire);
+        if bytes > SESSION_COMMAND_BYTES.saturating_sub(amount) {
+            session.command_items.fetch_sub(1, Ordering::AcqRel);
+            return Err(FacadeError::QueueFull);
+        }
+        if session
+            .command_bytes
+            .compare_exchange_weak(bytes, bytes + amount, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            bytes_reserved = true;
+            break;
+        }
+    }
+    if !bytes_reserved {
+        session.command_items.fetch_sub(1, Ordering::AcqRel);
+        return Err(FacadeError::QueueFull);
+    }
+    charge.session = Some(Arc::clone(session));
+    Ok(charge)
 }
 
 struct SessionControl {
@@ -1431,6 +1672,8 @@ struct SessionControl {
     close_requested: AtomicBool,
     disconnect_sent: AtomicBool,
     closed: AtomicBool,
+    command_items: AtomicUsize,
+    command_bytes: AtomicUsize,
     /// Ticks [`reap_session_controls`] has seen this session as
     /// dropped-and-already-disconnect-sent, without yet force-removing it.
     /// Counting real driver-loop ticks (rather than this function calling
@@ -1450,6 +1693,8 @@ impl SessionControl {
             close_requested: AtomicBool::new(false),
             disconnect_sent: AtomicBool::new(false),
             closed: AtomicBool::new(false),
+            command_items: AtomicUsize::new(0),
+            command_bytes: AtomicUsize::new(0),
             reap_grace_ticks: std::sync::atomic::AtomicU32::new(0),
         }
     }
@@ -1509,7 +1754,8 @@ impl SessionInbox {
         if length > SESSION_INBOUND_BYTES {
             return InboxSend::Full;
         }
-        loop {
+        let mut reserved = false;
+        for _ in 0..MAX_QUOTA_CAS_RETRIES {
             let current = self.bytes.load(Ordering::Acquire);
             if current > SESSION_INBOUND_BYTES.saturating_sub(length) {
                 return InboxSend::Full;
@@ -1524,8 +1770,12 @@ impl SessionInbox {
                 )
                 .is_ok()
             {
+                reserved = true;
                 break;
             }
+        }
+        if !reserved {
+            return InboxSend::Full;
         }
         let item = InboundItem {
             payload,
@@ -1565,12 +1815,9 @@ struct PendingSends {
     /// method below, so [`Self::has_capacity`] never has to re-sum the map.
     total_items: usize,
     total_bytes: usize,
-    /// Rotating start point for [`Self::drain_targets`] (F03): without it,
-    /// repeatedly taking the first `DRIVER_COMMAND_QUANTUM` keys in a
-    /// `HashMap`'s (call-to-call stable) iteration order would starve any
-    /// destination past that cut whenever more than `DRIVER_COMMAND_QUANTUM`
-    /// destinations are backlogged at once.
-    drain_cursor: usize,
+    ready: VecDeque<SessionTarget>,
+    ready_queued: std::collections::HashSet<SessionTarget>,
+    deadlines: crate::DueIndex<SessionTarget>,
 }
 
 impl PendingSends {
@@ -1610,14 +1857,19 @@ impl PendingSends {
         }
         let len = payload.len();
         let queue = self.by_target.entry(target).or_default();
+        let was_empty = queue.items.is_empty();
         queue.bytes = queue.bytes.saturating_add(len);
         queue.items.push_back(PendingSend {
             payload,
             queued_at,
             reply,
         });
-        self.total_items += 1;
+        self.total_items = self.total_items.saturating_add(1);
         self.total_bytes = self.total_bytes.saturating_add(len);
+        if was_empty {
+            self.index_front(target, SESSION_PENDING_MAX_AGE);
+            self.enqueue_ready(target);
+        }
     }
 
     fn pop(&mut self, target: SessionTarget) -> Option<PendingSend> {
@@ -1626,30 +1878,65 @@ impl PendingSends {
         queue.bytes = queue.bytes.saturating_sub(pending.payload.len());
         if queue.items.is_empty() {
             self.by_target.remove(&target);
+            self.deadlines.remove(&target);
+            self.ready_queued.remove(&target);
+        } else {
+            self.index_front(target, SESSION_PENDING_MAX_AGE);
+            self.enqueue_ready(target);
         }
         self.total_items = self.total_items.saturating_sub(1);
         self.total_bytes = self.total_bytes.saturating_sub(pending.payload.len());
         Some(pending)
     }
 
-    /// Up to `quantum` targets to service this tick, rotating the start
-    /// point each call (F03) so every backlogged destination eventually
-    /// gets a turn even when more than `quantum` are backlogged at once --
-    /// see `drain_cursor`'s own doc comment.
-    fn drain_targets(&mut self, quantum: usize) -> Vec<SessionTarget> {
-        let mut targets: Vec<SessionTarget> = self.by_target.keys().copied().collect();
-        if targets.is_empty() {
-            return targets;
+    fn enqueue_ready(&mut self, target: SessionTarget) {
+        if self.by_target.contains_key(&target) && self.ready_queued.insert(target) {
+            self.ready.push_back(target);
         }
-        let start = self.drain_cursor % targets.len();
-        targets.rotate_left(start);
-        targets.truncate(quantum);
-        self.drain_cursor = self.drain_cursor.wrapping_add(targets.len());
+    }
+
+    fn index_front(&mut self, target: SessionTarget, max_age: Duration) {
+        let Some(front) = self
+            .by_target
+            .get(&target)
+            .and_then(|queue| queue.items.front())
+        else {
+            self.deadlines.remove(&target);
+            return;
+        };
+        let max_age_us = u64::try_from(max_age.as_micros()).unwrap_or(u64::MAX);
+        self.deadlines.set(
+            target,
+            front.queued_at.add_micros(max_age_us.saturating_add(1)),
+        );
+    }
+
+    /// Pop at most `quantum` deduplicated ready destinations without
+    /// scanning the destination map. A destination still backlogged after
+    /// its visit is requeued by [`Self::pop`] or [`Self::enqueue_ready`].
+    fn drain_targets(&mut self, quantum: usize) -> Vec<SessionTarget> {
+        let mut targets = Vec::with_capacity(quantum.min(self.ready.len()));
+        while targets.len() < quantum {
+            let Some(target) = self.ready.pop_front() else {
+                break;
+            };
+            if !self.ready_queued.remove(&target) || !self.by_target.contains_key(&target) {
+                continue;
+            }
+            targets.push(target);
+        }
         targets
     }
 
     fn fail_target(&mut self, target: SessionTarget) {
-        while let Some(pending) = self.pop(target) {
+        let Some(mut queue) = self.by_target.remove(&target) else {
+            return;
+        };
+        self.deadlines.remove(&target);
+        self.ready_queued.remove(&target);
+        self.total_items = self.total_items.saturating_sub(queue.items.len());
+        self.total_bytes = self.total_bytes.saturating_sub(queue.bytes);
+        while let Some(pending) = queue.items.pop_front() {
             let _ = pending
                 .reply
                 .send(Err(FacadeError::Protocol(session_gone_error())));
@@ -1662,26 +1949,30 @@ impl PendingSends {
     /// destination (`items` is FIFO), so a destination that recovers mid-
     /// scan keeps whatever is still fresh enough once its stale prefix is
     /// gone.
-    fn expire_stale(&mut self, now: Timestamp, max_age: Duration) {
+    fn expire_stale(&mut self, now: Timestamp, max_age: Duration, max_actions: usize) {
         let max_age_us = u64::try_from(max_age.as_micros()).unwrap_or(u64::MAX);
-        let mut expired_items = 0usize;
-        let mut expired_bytes = 0usize;
-        self.by_target.retain(|_, queue| {
-            while let Some(front) = queue.items.front() {
-                let age_us = now.as_micros().saturating_sub(front.queued_at.as_micros());
-                if age_us <= max_age_us {
+        let mut due = Vec::new();
+        for _ in 0..max_actions {
+            self.deadlines.pop_due_bounded(now, 1, &mut due);
+            let Some(target) = due.pop() else {
+                if !self.deadlines.has_due(now) {
                     break;
                 }
-                let expired = queue.items.pop_front().expect("front just checked Some");
-                queue.bytes = queue.bytes.saturating_sub(expired.payload.len());
-                expired_items += 1;
-                expired_bytes += expired.payload.len();
+                continue;
+            };
+            let stale = self.by_target.get(&target).is_some_and(|queue| {
+                queue.items.front().is_some_and(|front| {
+                    now.as_micros().saturating_sub(front.queued_at.as_micros()) > max_age_us
+                })
+            });
+            if !stale {
+                self.index_front(target, max_age);
+                continue;
+            }
+            if let Some(expired) = self.pop(target) {
                 let _ = expired.reply.send(Err(FacadeError::Expired));
             }
-            !queue.items.is_empty()
-        });
-        self.total_items = self.total_items.saturating_sub(expired_items);
-        self.total_bytes = self.total_bytes.saturating_sub(expired_bytes);
+        }
     }
 }
 
@@ -1694,6 +1985,7 @@ enum Command {
     Send {
         target: SessionTarget,
         payload: Vec<u8>,
+        queued_at: Timestamp,
         reply: tokio::sync::oneshot::Sender<Result<(), FacadeError>>,
         _charge: CommandCharge,
     },
@@ -1782,9 +2074,11 @@ impl Session {
     /// [`FacadeError::Protocol`] reliably reflects this specific call, not
     /// a stale error from an earlier one.
     pub async fn send(&self, payload: impl Into<Vec<u8>>) -> Result<(), FacadeError> {
+        let queued_at = self.now();
         let payload = payload.into();
-        let charge = reserve_command_bytes(
+        let charge = reserve_session_command(
             &self.command_bytes,
+            &self.control,
             payload.len().saturating_add(COMMAND_OVERHEAD_CHARGE),
         )?;
         let (reply, reply_rx) = tokio::sync::oneshot::channel();
@@ -1792,6 +2086,7 @@ impl Session {
             .try_send(Command::Send {
                 target: self.target,
                 payload,
+                queued_at,
                 reply,
                 _charge: charge,
             })
@@ -1813,10 +2108,11 @@ impl Session {
     /// close to complete -- await [`Self::recv`] returning `None`, or just
     /// drop this `Session`, to know it eventually has.
     pub fn close(&self) {
-        self.control.close_requested.store(true, Ordering::Release);
-        let _ = self.commands.try_send(Command::Disconnect {
-            target: self.target,
-        });
+        if !self.control.close_requested.swap(true, Ordering::AcqRel) {
+            let _ = self.commands.try_send(Command::Disconnect {
+                target: self.target,
+            });
+        }
     }
 }
 
@@ -1826,9 +2122,11 @@ impl Drop for Session {
         // This is a best-effort fast path. If a bounded command queue is
         // full, the driver's control scan below performs the same reclaim
         // without introducing an unbounded drop queue.
-        let _ = self.commands.try_send(Command::Disconnect {
-            target: self.target,
-        });
+        if !self.control.close_requested.swap(true, Ordering::AcqRel) {
+            let _ = self.commands.try_send(Command::Disconnect {
+                target: self.target,
+            });
+        }
     }
 }
 
@@ -1857,19 +2155,21 @@ fn handle_command(
         crate::LogicalCallerId,
         tokio::sync::oneshot::Sender<Result<Session, FacadeError>>,
     >,
+    connect_checks: &mut VecDeque<crate::LogicalCallerId>,
     pending_sends: &mut PendingSends,
 ) {
     match command {
         Command::Connect { config, reply, .. } => {
-            handle_connect_command(owner, &config, reply, now, pending_connects);
+            handle_connect_command(owner, &config, reply, now, pending_connects, connect_checks);
         }
         Command::Send {
             target,
             payload,
+            queued_at,
             reply,
             ..
         } => {
-            handle_send_command(owner, target, payload, reply, now, pending_sends);
+            handle_send_command(owner, target, payload, queued_at, reply, now, pending_sends);
         }
         Command::Disconnect { target } => match target {
             SessionTarget::Listener(id) => {
@@ -1907,6 +2207,7 @@ fn handle_connect_command(
         crate::LogicalCallerId,
         tokio::sync::oneshot::Sender<Result<Session, FacadeError>>,
     >,
+    connect_checks: &mut VecDeque<crate::LogicalCallerId>,
 ) {
     if reply.is_closed() {
         return;
@@ -1920,6 +2221,7 @@ fn handle_connect_command(
     match owner.connect(config, now) {
         Ok(crate::PoolOutcome::Admitted(id)) => {
             pending_connects.insert(id, reply);
+            connect_checks.push_back(id);
         }
         Ok(crate::PoolOutcome::Queued(_)) | Ok(crate::PoolOutcome::Full) => {
             let _ = reply.send(Err(FacadeError::PoolFull));
@@ -1934,6 +2236,7 @@ fn handle_send_command(
     owner: &mut Owner,
     target: SessionTarget,
     payload: Vec<u8>,
+    queued_at: Timestamp,
     reply: tokio::sync::oneshot::Sender<Result<(), FacadeError>>,
     now: Timestamp,
     pending_sends: &mut PendingSends,
@@ -1956,7 +2259,7 @@ fn handle_send_command(
         // stalled destination can exhaust neither a different, healthy
         // destination's own headroom nor drive the whole Facade past its
         // shared safety ceiling.
-        pending_sends.push(target, payload, now, reply);
+        pending_sends.push(target, payload, queued_at, reply);
         return;
     }
     let result = match target {
@@ -1984,6 +2287,7 @@ fn drive_pending_sends(owner: &mut Owner, pending: &mut PendingSends, now: Times
                 .is_some_and(|mut caller| caller.can_send_with_pacing(now)),
         };
         if !can_send {
+            pending.enqueue_ready(target);
             continue;
         }
         let Some(pending_send) = pending.pop(target) else {
@@ -2035,63 +2339,65 @@ fn reap_session_controls(
     listener_inboxes: &mut std::collections::HashMap<crate::LogicalPeerId, SessionInbox>,
     caller_inboxes: &mut std::collections::HashMap<crate::LogicalCallerId, SessionInbox>,
     pending_sends: &mut PendingSends,
+    control_checks: &mut VecDeque<SessionTarget>,
     now: Timestamp,
 ) {
-    let targets = controls
-        .iter()
-        .filter_map(|(target, control)| {
+    // A grace tick is one driver pass, not one entry in this pass. Requeuing
+    // the same control inside the loop would otherwise consume all three
+    // grace ticks immediately and force-remove a just-closed session before
+    // its queued SHUTDOWN can be driven.
+    let checks = control_checks.len().min(DRIVER_COMMAND_QUANTUM);
+    for _ in 0..checks {
+        let Some(target) = control_checks.pop_front() else {
+            break;
+        };
+        let action = controls.get(&target).and_then(|control| {
             let dropped = control.dropped.load(Ordering::Acquire);
             let close_requested = control.close_requested.load(Ordering::Acquire);
             if dropped && !close_requested {
-                return Some((*target, false));
+                return Some(false);
             }
             if close_requested {
                 let already_sent = control.disconnect_sent.swap(true, Ordering::AcqRel);
                 if !already_sent {
-                    return Some((*target, true));
+                    return Some(true);
                 }
-                // Every external handle is gone too: nothing is left to
-                // ever observe the matching `Disconnected` event, which
-                // may never arrive at all against an unreachable or
-                // non-responsive peer. Rather than pin this entry -- and
-                // its `SessionInbox`'s buffered bytes -- forever, force it
-                // once this scan has seen the same dropped-and-sent state
-                // for a few driver ticks in a row (Opus review finding 5):
-                // that's enough real ticks for the SHUTDOWN `drive()`
-                // already queued on some ordinary iteration to have had a
-                // real dispatch attempt, without this function forcing an
-                // out-of-band `drive()` call of its own -- doing that
-                // reproducibly broke
-                // `a_closed_sessions_table_entry_is_actually_reclaimed`.
-                if dropped {
-                    let ticks = control.reap_grace_ticks.fetch_add(1, Ordering::AcqRel);
-                    if ticks >= REAP_GRACE_TICKS {
-                        return Some((*target, false));
-                    }
+                // An explicit close means the application has elected to
+                // stop using this session; a peer may never answer the
+                // SHUTDOWN (and waiting for the protocol timeout would pin
+                // this entry and its buffered bytes). Force reclaim after a
+                // few real driver ticks, whether the handle is subsequently
+                // dropped or still held while its recv() observes closure.
+                // Counting driver passes rather than requeue iterations keeps
+                // this grace period from being consumed in one scan.
+                let ticks = control.reap_grace_ticks.fetch_add(1, Ordering::AcqRel);
+                if ticks >= REAP_GRACE_TICKS {
+                    return Some(false);
                 }
             }
             None
-        })
-        .collect::<Vec<_>>();
-    for (target, orderly) in targets {
-        if orderly {
-            reap_send_disconnect(owner, target, now);
-        } else {
-            reap_remove_session(
+        });
+        match action {
+            Some(true) => reap_send_disconnect(owner, target, now),
+            Some(false) => reap_remove_session(
                 owner,
                 target,
                 listener_inboxes,
                 caller_inboxes,
                 controls,
                 pending_sends,
-            );
+            ),
+            None => {}
+        }
+        if controls.contains_key(&target) {
+            control_checks.push_back(target);
         }
     }
 }
 
-/// Driver ticks a dropped session's orderly close is given to actually
-/// leave the socket (via whatever ordinary `drive()` call the loop makes
-/// on its own) before [`reap_session_controls`] force-removes it.
+/// Driver ticks an orderly close is given to actually leave the socket (via
+/// whatever ordinary `drive()` call the loop makes on its own) before
+/// [`reap_session_controls`] force-removes it.
 const REAP_GRACE_TICKS: u32 = 3;
 
 /// Send a graceful disconnect for a dropped-but-not-yet-torn-down session
@@ -2148,24 +2454,32 @@ fn fail_cancelled_connects(
     caller_inboxes: &mut std::collections::HashMap<crate::LogicalCallerId, SessionInbox>,
     controls: &mut std::collections::HashMap<SessionTarget, Arc<SessionControl>>,
     pending_sends: &mut PendingSends,
+    connect_checks: &mut VecDeque<crate::LogicalCallerId>,
 ) {
-    let cancelled = pending_connects
-        .iter()
-        .filter_map(|(id, reply)| reply.is_closed().then_some(*id))
-        .collect::<Vec<_>>();
-    for id in cancelled {
-        pending_connects.remove(&id);
-        owner.remove_caller(id);
-        remove_session_state(
-            SessionTarget::Caller(id),
-            &mut std::collections::HashMap::new(),
-            caller_inboxes,
-            controls,
-            pending_sends,
-        );
+    for _ in 0..DRIVER_COMMAND_QUANTUM {
+        let Some(id) = connect_checks.pop_front() else {
+            break;
+        };
+        let cancelled = pending_connects
+            .get(&id)
+            .is_some_and(|reply| reply.is_closed());
+        if cancelled {
+            pending_connects.remove(&id);
+            owner.remove_caller(id);
+            remove_session_state(
+                SessionTarget::Caller(id),
+                &mut std::collections::HashMap::new(),
+                caller_inboxes,
+                controls,
+                pending_sends,
+            );
+        } else if pending_connects.contains_key(&id) {
+            connect_checks.push_back(id);
+        }
     }
 }
 
+#[allow(clippy::cognitive_complexity)]
 async fn run_driver(
     mut owner: Owner,
     mut commands: tokio::sync::mpsc::Receiver<Command>,
@@ -2190,6 +2504,8 @@ async fn run_driver(
     > = std::collections::HashMap::new();
     let mut controls: std::collections::HashMap<SessionTarget, Arc<SessionControl>> =
         std::collections::HashMap::new();
+    let mut control_checks = VecDeque::new();
+    let mut connect_checks = VecDeque::new();
     let mut pending_sends = PendingSends::default();
     let mut listener_events = Vec::new();
     let mut caller_events = Vec::new();
@@ -2212,7 +2528,21 @@ async fn run_driver(
             command = commands.recv() => {
                 match command {
                     Some(command) => {
-                        handle_command(&mut owner, command, now(), &mut pending_connects, &mut pending_sends);
+                        handle_command(
+                            &mut owner,
+                            command,
+                            now(),
+                            &mut pending_connects,
+                            &mut connect_checks,
+                            &mut pending_sends,
+                        );
+                        // A command-heavy facade must not starve the owner
+                        // socket: drive one bounded maintenance pass after
+                        // each command branch before selecting again.
+                        let drive_result = owner.drive(now(), OutputDrainBudget::default());
+                        if drive_result.is_err() {
+                            break;
+                        }
                     }
                     None => break, // every Facade/Session handle dropped -> graceful shutdown
                 }
@@ -2223,7 +2553,7 @@ async fn run_driver(
         // F03 checkpoint 2: a destination that never reopens must not hold
         // unadmitted sends forever -- drop anything past its age bound on
         // every tick, same cadence as draining what did become sendable.
-        pending_sends.expire_stale(now(), SESSION_PENDING_MAX_AGE);
+        pending_sends.expire_stale(now(), SESSION_PENDING_MAX_AGE, DRIVER_COMMAND_QUANTUM);
 
         // A4/course correction #9: an attempt CallerPool itself retired
         // for missing its `attempt_deadline` never produces a protocol
@@ -2257,6 +2587,7 @@ async fn run_driver(
             &mut listener_inboxes,
             &mut caller_inboxes,
             &mut pending_sends,
+            &mut control_checks,
             now(),
         );
         fail_cancelled_connects(
@@ -2265,6 +2596,7 @@ async fn run_driver(
             &mut caller_inboxes,
             &mut controls,
             &mut pending_sends,
+            &mut connect_checks,
         );
 
         let sessions = SessionFactory {
@@ -2278,10 +2610,12 @@ async fn run_driver(
             route_listener_event(
                 &mut owner,
                 event,
+                now(),
                 &sessions,
                 &mut listener_inboxes,
                 &mut controls,
                 &mut pending_sends,
+                &mut control_checks,
                 &accept_tx,
             );
         }
@@ -2291,25 +2625,40 @@ async fn run_driver(
             route_caller_event(
                 &mut owner,
                 event,
+                now(),
                 &sessions,
                 &mut caller_inboxes,
                 &mut controls,
                 &mut pending_connects,
                 &mut pending_sends,
+                &mut control_checks,
             );
         }
     }
 
-    // The loop above can `break` with a just-queued SHUTDOWN (from a
-    // `Command::Disconnect` this same tick handled, or the very last thing
-    // an application did before dropping every handle) still sitting in
-    // `Owner`'s own output queue -- `drive()` is what actually attempts the
-    // send, and nothing after the `break` ever called it again. One more
-    // synchronous attempt here is enough for the overwhelmingly common
-    // case (a UDP send essentially never blocks), closing the gap between
-    // "close() was requested" and "the driver task ended" that graceful
-    // shutdown depends on.
-    let _ = owner.drive(now(), OutputDrainBudget::default());
+    // Give queued SHUTDOWN packets a bounded chance to leave. Each tick has
+    // the same finite work quantum as steady state; both iterations and wall
+    // time are capped so a permanently backpressured socket cannot hold task
+    // shutdown forever.
+    let shutdown_deadline = std::time::Instant::now() + SHUTDOWN_MAX_TIME;
+    for _ in 0..SHUTDOWN_MAX_TICKS {
+        if controls.is_empty() || std::time::Instant::now() >= shutdown_deadline {
+            break;
+        }
+        reap_session_controls(
+            &mut owner,
+            &mut controls,
+            &mut listener_inboxes,
+            &mut caller_inboxes,
+            &mut pending_sends,
+            &mut control_checks,
+            now(),
+        );
+        if owner.drive(now(), OutputDrainBudget::default()).is_err() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
 }
 
 /// Bundles what every new `Session` needs from `run_driver` (a weak
@@ -2351,77 +2700,178 @@ impl SessionFactory<'_> {
 /// (`DataReceived`), retire it (`Disconnected`), or mint a new `Session`
 /// and hand it to `accept()` (`Connected`) -- split out of [`run_driver`]'s
 /// own loop body to keep its cognitive complexity down.
+#[allow(clippy::too_many_arguments)]
 fn route_listener_event(
     owner: &mut Owner,
     event: crate::AdmissionEvent,
+    now: Timestamp,
     sessions: &SessionFactory<'_>,
     listener_inboxes: &mut std::collections::HashMap<crate::LogicalPeerId, SessionInbox>,
     controls: &mut std::collections::HashMap<SessionTarget, Arc<SessionControl>>,
     pending_sends: &mut PendingSends,
+    control_checks: &mut VecDeque<SessionTarget>,
     accept_tx: &tokio::sync::mpsc::Sender<Session>,
 ) {
-    let target = SessionTarget::Listener(event.logical_peer);
+    let id = event.logical_peer;
+    let target = SessionTarget::Listener(id);
     match event.event {
-        shiguredo_srt::ConnectionEvent::Connected => {
-            let Some((session, inbox, control)) = sessions.mint(target) else {
-                return;
-            };
-            listener_inboxes.insert(event.logical_peer, inbox);
-            controls.insert(target, control);
-            // `accept_tx.try_send` fails once the `Facade` (which owns
-            // the matching receiver) is gone, or once `FACADE_ACCEPT_CAPACITY`
-            // admitted-but-undrained sessions are already queued -- in
-            // either case this session has no handle anywhere that will
-            // ever claim it, so retire it from `Owner` immediately rather
-            // than leaking it the same way a cancelled `connect()` would
-            // (see `route_caller_event`).
-            if accept_tx.try_send(session).is_err() {
-                listener_inboxes.remove(&event.logical_peer);
-                controls.remove(&target);
-                pending_sends.fail_target(target);
-                owner.remove_listener_peer(event.logical_peer);
-            }
-        }
+        shiguredo_srt::ConnectionEvent::Connected => route_listener_connected(
+            owner,
+            id,
+            now,
+            sessions,
+            listener_inboxes,
+            controls,
+            pending_sends,
+            control_checks,
+            accept_tx,
+            target,
+        ),
         shiguredo_srt::ConnectionEvent::DataReceived {
             payload,
             source_time,
             ..
-        } => {
-            // A full or closed inbox retires this session exactly like a
-            // genuine `Disconnected` below (course correction #1): a
-            // consumer that fell far enough behind is disconnected, not
-            // grown without bound or silently starved forever.
-            let deliverable = listener_inboxes
-                .get(&event.logical_peer)
-                .is_some_and(|inbox| {
-                    matches!(inbox.try_send(payload, source_time), InboxSend::Sent)
-                });
-            if !deliverable {
-                listener_inboxes.remove(&event.logical_peer);
-                controls.remove(&target);
-                pending_sends.fail_target(target);
-                owner.remove_listener_peer(event.logical_peer);
-            }
-        }
-        shiguredo_srt::ConnectionEvent::Disconnected { .. } => {
-            listener_inboxes.remove(&event.logical_peer);
-            if let Some(control) = controls.remove(&target) {
-                control.closed.store(true, Ordering::Release);
-            }
-            pending_sends.fail_target(target);
-            // A `disconnect()` alone (this event firing) only transitions
-            // protocol state; the table entry and its buffers stay
-            // resident until something calls `remove` (see
-            // `Owner::remove_listener_peer`'s own doc comment). The
-            // `Facade` is the only application code that ever sees this
-            // peer, so it must be the one to retire it, or a long-lived
-            // `Facade` serving many short sessions leaks one table entry
-            // per closed session for the rest of the driver task's life.
-            owner.remove_listener_peer(event.logical_peer);
+        } => route_listener_data(
+            owner,
+            id,
+            target,
+            now,
+            payload,
+            source_time,
+            listener_inboxes,
+            controls,
+            pending_sends,
+        ),
+        shiguredo_srt::ConnectionEvent::Disconnected { .. } => route_listener_disconnected(
+            owner,
+            id,
+            target,
+            listener_inboxes,
+            controls,
+            pending_sends,
+        ),
+        shiguredo_srt::ConnectionEvent::KeyRefreshNeeded { key_length } => {
+            route_listener_key_refresh(owner, id, key_length, now);
         }
         shiguredo_srt::ConnectionEvent::StateChanged(_)
-        | shiguredo_srt::ConnectionEvent::Error(_)
-        | shiguredo_srt::ConnectionEvent::KeyRefreshNeeded { .. } => {}
+        | shiguredo_srt::ConnectionEvent::Error(_) => {}
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn route_listener_connected(
+    owner: &mut Owner,
+    id: crate::LogicalPeerId,
+    now: Timestamp,
+    sessions: &SessionFactory<'_>,
+    listener_inboxes: &mut std::collections::HashMap<crate::LogicalPeerId, SessionInbox>,
+    controls: &mut std::collections::HashMap<SessionTarget, Arc<SessionControl>>,
+    pending_sends: &mut PendingSends,
+    control_checks: &mut VecDeque<SessionTarget>,
+    accept_tx: &tokio::sync::mpsc::Sender<Session>,
+    target: SessionTarget,
+) {
+    let Some((session, inbox, control)) = sessions.mint(target) else {
+        return;
+    };
+    listener_inboxes.insert(id, inbox);
+    controls.insert(target, control);
+    control_checks.push_back(target);
+    // A full or closed accept queue leaves no application handle for this
+    // connection, so retire it immediately and keep the owner bounded.
+    if accept_tx.try_send(session).is_err() {
+        disconnect_listener_session(
+            owner,
+            id,
+            target,
+            now,
+            listener_inboxes,
+            controls,
+            pending_sends,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn route_listener_data(
+    owner: &mut Owner,
+    id: crate::LogicalPeerId,
+    target: SessionTarget,
+    now: Timestamp,
+    payload: Bytes,
+    source_time: Timestamp,
+    listener_inboxes: &mut std::collections::HashMap<crate::LogicalPeerId, SessionInbox>,
+    controls: &mut std::collections::HashMap<SessionTarget, Arc<SessionControl>>,
+    pending_sends: &mut PendingSends,
+) {
+    let deliverable = listener_inboxes
+        .get(&id)
+        .is_some_and(|inbox| matches!(inbox.try_send(payload, source_time), InboxSend::Sent));
+    if !deliverable {
+        disconnect_listener_session(
+            owner,
+            id,
+            target,
+            now,
+            listener_inboxes,
+            controls,
+            pending_sends,
+        );
+    }
+}
+
+fn disconnect_listener_session(
+    owner: &mut Owner,
+    id: crate::LogicalPeerId,
+    target: SessionTarget,
+    now: Timestamp,
+    listener_inboxes: &mut std::collections::HashMap<crate::LogicalPeerId, SessionInbox>,
+    controls: &mut std::collections::HashMap<SessionTarget, Arc<SessionControl>>,
+    pending_sends: &mut PendingSends,
+) {
+    if let Some(mut peer) = owner.listener_peer_mut(id) {
+        peer.disconnect(now);
+    }
+    clear_listener_session(id, target, listener_inboxes, controls, pending_sends);
+}
+
+fn clear_listener_session(
+    id: crate::LogicalPeerId,
+    target: SessionTarget,
+    listener_inboxes: &mut std::collections::HashMap<crate::LogicalPeerId, SessionInbox>,
+    controls: &mut std::collections::HashMap<SessionTarget, Arc<SessionControl>>,
+    pending_sends: &mut PendingSends,
+) {
+    listener_inboxes.remove(&id);
+    if let Some(control) = controls.remove(&target) {
+        control.closed.store(true, Ordering::Release);
+    }
+    pending_sends.fail_target(target);
+}
+
+fn route_listener_disconnected(
+    owner: &mut Owner,
+    id: crate::LogicalPeerId,
+    target: SessionTarget,
+    listener_inboxes: &mut std::collections::HashMap<crate::LogicalPeerId, SessionInbox>,
+    controls: &mut std::collections::HashMap<SessionTarget, Arc<SessionControl>>,
+    pending_sends: &mut PendingSends,
+) {
+    clear_listener_session(id, target, listener_inboxes, controls, pending_sends);
+    owner.remove_listener_peer(id);
+}
+
+fn route_listener_key_refresh(
+    owner: &mut Owner,
+    id: crate::LogicalPeerId,
+    key_length: usize,
+    now: Timestamp,
+) {
+    let refreshed = owner
+        .listener_peer_mut(id)
+        .is_some_and(|mut peer| refresh_key(key_length, |sek| peer.provide_new_sek(sek, now)));
+    if !refreshed && let Some(mut peer) = owner.listener_peer_mut(id) {
+        peer.disconnect(now);
     }
 }
 
@@ -2430,9 +2880,11 @@ fn route_listener_event(
 /// inbound channel, or retire it and fail any still-pending connect once
 /// the attempt is truly over -- split out of [`run_driver`]'s own loop body
 /// to keep its cognitive complexity down.
+#[allow(clippy::too_many_arguments)]
 fn route_caller_event(
     owner: &mut Owner,
     event: crate::CallerEvent,
+    now: Timestamp,
     sessions: &SessionFactory<'_>,
     caller_inboxes: &mut std::collections::HashMap<crate::LogicalCallerId, SessionInbox>,
     controls: &mut std::collections::HashMap<SessionTarget, Arc<SessionControl>>,
@@ -2441,62 +2893,43 @@ fn route_caller_event(
         tokio::sync::oneshot::Sender<Result<Session, FacadeError>>,
     >,
     pending_sends: &mut PendingSends,
+    control_checks: &mut VecDeque<SessionTarget>,
 ) {
     match event.event {
-        shiguredo_srt::ConnectionEvent::Connected => {
-            let Some(reply) = pending_connects.remove(&event.id) else {
-                return;
-            };
-            let target = SessionTarget::Caller(event.id);
-            let Some((session, inbox, control)) = sessions.mint(target) else {
-                return;
-            };
-            caller_inboxes.insert(event.id, inbox);
-            controls.insert(target, control);
-            // `reply.send` fails only if `Facade::connect`'s own future
-            // was already dropped (cancelled) before this arrived -- the
-            // connection is fully established with no handle anywhere
-            // and nothing left to ever close it, so tear it down here
-            // rather than leak it silently for the driver's whole life.
-            if reply.send(Ok(session)).is_err() {
-                caller_inboxes.remove(&event.id);
-                controls.remove(&target);
-                owner.remove_caller(event.id);
-            }
-        }
+        shiguredo_srt::ConnectionEvent::Connected => route_caller_connected(
+            owner,
+            event.id,
+            now,
+            sessions,
+            caller_inboxes,
+            controls,
+            pending_connects,
+            pending_sends,
+            control_checks,
+        ),
         shiguredo_srt::ConnectionEvent::DataReceived {
             payload,
             source_time,
             ..
-        } => {
-            // See `route_listener_event`'s identical handling for why a
-            // failed delivery retires the session instead of growing its
-            // backlog or silently discarding data forever.
-            let deliverable = caller_inboxes.get(&event.id).is_some_and(|inbox| {
-                matches!(inbox.try_send(payload, source_time), InboxSend::Sent)
-            });
-            if !deliverable {
-                let target = SessionTarget::Caller(event.id);
-                caller_inboxes.remove(&event.id);
-                controls.remove(&target);
-                pending_sends.fail_target(target);
-                owner.remove_caller(event.id);
-            }
-        }
-        shiguredo_srt::ConnectionEvent::Disconnected { .. } => {
-            let target = SessionTarget::Caller(event.id);
-            if let Some(reply) = pending_connects.remove(&event.id) {
-                let _ = reply.send(Err(FacadeError::Protocol(connect_failed_error())));
-            }
-            caller_inboxes.remove(&event.id);
-            if let Some(control) = controls.remove(&target) {
-                control.closed.store(true, Ordering::Release);
-            }
-            pending_sends.fail_target(target);
-            // See `route_listener_event`'s identical call for why this
-            // must happen here rather than never.
-            owner.remove_caller(event.id);
-        }
+        } => route_caller_data(
+            owner,
+            event.id,
+            now,
+            payload,
+            source_time,
+            caller_inboxes,
+            controls,
+            pending_sends,
+        ),
+        shiguredo_srt::ConnectionEvent::Disconnected { .. } => route_caller_ended(
+            owner,
+            event.id,
+            true,
+            caller_inboxes,
+            controls,
+            pending_connects,
+            pending_sends,
+        ),
         // A handshake that never reaches `Connected` -- rejected, or
         // timed out -- ends here, not at `ConnectionEvent::Disconnected`:
         // that event is emitted only by a peer's SHUTDOWN or a graceful
@@ -2507,27 +2940,167 @@ fn route_caller_event(
         // handshake) never resolves at all.
         shiguredo_srt::ConnectionEvent::StateChanged(
             shiguredo_srt::ConnectionState::Disconnected,
-        ) => {
-            let target = SessionTarget::Caller(event.id);
-            if let Some(reply) = pending_connects.remove(&event.id) {
-                let _ = reply.send(Err(FacadeError::Protocol(connect_failed_error())));
-            }
-            caller_inboxes.remove(&event.id);
-            if let Some(control) = controls.remove(&target) {
-                control.closed.store(true, Ordering::Release);
-            }
-            pending_sends.fail_target(target);
-            owner.remove_caller(event.id);
+        ) => route_caller_ended(
+            owner,
+            event.id,
+            true,
+            caller_inboxes,
+            controls,
+            pending_connects,
+            pending_sends,
+        ),
+        shiguredo_srt::ConnectionEvent::KeyRefreshNeeded { key_length } => {
+            route_caller_key_refresh(owner, event.id, key_length, now);
         }
         shiguredo_srt::ConnectionEvent::StateChanged(_)
-        | shiguredo_srt::ConnectionEvent::Error(_)
-        | shiguredo_srt::ConnectionEvent::KeyRefreshNeeded { .. } => {}
+        | shiguredo_srt::ConnectionEvent::Error(_) => {}
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn route_caller_connected(
+    owner: &mut Owner,
+    id: crate::LogicalCallerId,
+    now: Timestamp,
+    sessions: &SessionFactory<'_>,
+    caller_inboxes: &mut std::collections::HashMap<crate::LogicalCallerId, SessionInbox>,
+    controls: &mut std::collections::HashMap<SessionTarget, Arc<SessionControl>>,
+    pending_connects: &mut std::collections::HashMap<
+        crate::LogicalCallerId,
+        tokio::sync::oneshot::Sender<Result<Session, FacadeError>>,
+    >,
+    pending_sends: &mut PendingSends,
+    control_checks: &mut VecDeque<SessionTarget>,
+) {
+    let Some(reply) = pending_connects.remove(&id) else {
+        return;
+    };
+    let target = SessionTarget::Caller(id);
+    let Some((session, inbox, control)) = sessions.mint(target) else {
+        return;
+    };
+    caller_inboxes.insert(id, inbox);
+    controls.insert(target, control);
+    control_checks.push_back(target);
+    // A cancelled connect leaves no handle for the established session, so
+    // close it immediately instead of retaining an orphaned caller.
+    if reply.send(Ok(session)).is_err() {
+        disconnect_caller_session(
+            owner,
+            id,
+            target,
+            now,
+            caller_inboxes,
+            controls,
+            pending_sends,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn route_caller_data(
+    owner: &mut Owner,
+    id: crate::LogicalCallerId,
+    now: Timestamp,
+    payload: Bytes,
+    source_time: Timestamp,
+    caller_inboxes: &mut std::collections::HashMap<crate::LogicalCallerId, SessionInbox>,
+    controls: &mut std::collections::HashMap<SessionTarget, Arc<SessionControl>>,
+    pending_sends: &mut PendingSends,
+) {
+    let deliverable = caller_inboxes
+        .get(&id)
+        .is_some_and(|inbox| matches!(inbox.try_send(payload, source_time), InboxSend::Sent));
+    if !deliverable {
+        let target = SessionTarget::Caller(id);
+        disconnect_caller_session(
+            owner,
+            id,
+            target,
+            now,
+            caller_inboxes,
+            controls,
+            pending_sends,
+        );
+    }
+}
+
+fn disconnect_caller_session(
+    owner: &mut Owner,
+    id: crate::LogicalCallerId,
+    target: SessionTarget,
+    now: Timestamp,
+    caller_inboxes: &mut std::collections::HashMap<crate::LogicalCallerId, SessionInbox>,
+    controls: &mut std::collections::HashMap<SessionTarget, Arc<SessionControl>>,
+    pending_sends: &mut PendingSends,
+) {
+    if let Some(mut caller) = owner.caller_mut(id) {
+        caller.disconnect(now);
+    }
+    clear_caller_session(id, target, caller_inboxes, controls, pending_sends);
+}
+
+fn clear_caller_session(
+    id: crate::LogicalCallerId,
+    target: SessionTarget,
+    caller_inboxes: &mut std::collections::HashMap<crate::LogicalCallerId, SessionInbox>,
+    controls: &mut std::collections::HashMap<SessionTarget, Arc<SessionControl>>,
+    pending_sends: &mut PendingSends,
+) {
+    caller_inboxes.remove(&id);
+    if let Some(control) = controls.remove(&target) {
+        control.closed.store(true, Ordering::Release);
+    }
+    pending_sends.fail_target(target);
+}
+
+fn route_caller_ended(
+    owner: &mut Owner,
+    id: crate::LogicalCallerId,
+    fail_connect: bool,
+    caller_inboxes: &mut std::collections::HashMap<crate::LogicalCallerId, SessionInbox>,
+    controls: &mut std::collections::HashMap<SessionTarget, Arc<SessionControl>>,
+    pending_connects: &mut std::collections::HashMap<
+        crate::LogicalCallerId,
+        tokio::sync::oneshot::Sender<Result<Session, FacadeError>>,
+    >,
+    pending_sends: &mut PendingSends,
+) {
+    let target = SessionTarget::Caller(id);
+    if fail_connect && let Some(reply) = pending_connects.remove(&id) {
+        let _ = reply.send(Err(FacadeError::Protocol(connect_failed_error())));
+    }
+    clear_caller_session(id, target, caller_inboxes, controls, pending_sends);
+    owner.remove_caller(id);
+}
+
+fn route_caller_key_refresh(
+    owner: &mut Owner,
+    id: crate::LogicalCallerId,
+    key_length: usize,
+    now: Timestamp,
+) {
+    let refreshed = owner
+        .caller_mut(id)
+        .is_some_and(|mut caller| refresh_key(key_length, |sek| caller.provide_new_sek(sek, now)));
+    if !refreshed && let Some(mut caller) = owner.caller_mut(id) {
+        caller.disconnect(now);
+    }
+}
+
+fn refresh_key(
+    key_length: usize,
+    provide: impl FnOnce(&[u8]) -> Result<(), shiguredo_srt::Error>,
+) -> bool {
+    let mut sek = vec![0; key_length];
+    let result = getrandom::fill(&mut sek).is_ok() && provide(&sek).is_ok();
+    sek.zeroize();
+    result
 }
 
 /// A managed, ergonomic async facade (A05 checkpoint 1) around [`Owner`]:
 /// spawns a background driver task and communicates with it over bounded
-/// application-facing handles ([`Session`]) backed by unbounded internal
+/// application-facing handles ([`Session`]) backed by bounded internal
 /// command/event channels, so no application call ever awaits behind
 /// another session's full queue (checkpoint 2) -- the channels themselves
 /// never block a `send`, only the awaiting side ever suspends.
@@ -2799,7 +3372,7 @@ mod owner_tests {
                 .connect(&shared_caller_config(listen_addr), now_ts(start))
                 .expect("connect")
             else {
-                panic!("default pool policy is unbounded, so connect() must admit immediately")
+                panic!("the default pool admits the first connect() immediately")
             };
 
             let mut peer_id = None;
@@ -3517,7 +4090,11 @@ mod tests {
         let mut fresh_rx = push_expect_queued(&mut pending, target, b"fresh".to_vec(), fresh_at);
 
         let past_bound = Timestamp::from_micros(SESSION_PENDING_MAX_AGE.as_micros() as u64 + 1);
-        pending.expire_stale(past_bound, SESSION_PENDING_MAX_AGE);
+        pending.expire_stale(
+            past_bound,
+            SESSION_PENDING_MAX_AGE,
+            FACADE_PENDING_SENDS_TOTAL,
+        );
 
         let outcome = stale_rx.try_recv().expect("stale send got a reply");
         assert!(
@@ -3561,7 +4138,11 @@ mod tests {
         let mut rx_c = push_expect_queued(&mut pending, target, b"c".to_vec(), queued_at);
 
         let past_bound = Timestamp::from_micros(SESSION_PENDING_MAX_AGE.as_micros() as u64 + 1);
-        pending.expire_stale(past_bound, SESSION_PENDING_MAX_AGE);
+        pending.expire_stale(
+            past_bound,
+            SESSION_PENDING_MAX_AGE,
+            FACADE_PENDING_SENDS_TOTAL,
+        );
 
         for rx in [&mut rx_a, &mut rx_b, &mut rx_c] {
             assert!(
@@ -3587,7 +4168,11 @@ mod tests {
         let mut rx = push_expect_queued(&mut pending, target, b"item".to_vec(), queued_at);
 
         let exactly_at_bound = Timestamp::from_micros(SESSION_PENDING_MAX_AGE.as_micros() as u64);
-        pending.expire_stale(exactly_at_bound, SESSION_PENDING_MAX_AGE);
+        pending.expire_stale(
+            exactly_at_bound,
+            SESSION_PENDING_MAX_AGE,
+            FACADE_PENDING_SENDS_TOTAL,
+        );
 
         assert!(
             rx.try_recv().is_err(),
@@ -4469,11 +5054,12 @@ mod tests {
                 .expect("readiness must still be armed without a new edge")
                 .expect("readable");
 
+            let batch_capacity = batch.capacity();
             let mut rest = Vec::new();
             drain_readable(
                 &sock,
                 &mut batch,
-                RecvBudget::until_would_block(),
+                RecvBudget::for_datagrams(TOTAL, batch_capacity),
                 |_, data| rest.push(data[0]),
             )
             .expect("second drain");

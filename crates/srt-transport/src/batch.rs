@@ -32,6 +32,13 @@ impl RecvBatch {
     /// fast path that this type was extracted from.
     pub const DEFAULT_CAPACITY: usize = 32;
     pub const DEFAULT_BUF_LEN: usize = 2048;
+    /// Hard cap for receive scratch slots allocated by one batch helper.
+    /// Larger values multiply fixed datagram buffers and are almost always a
+    /// configuration error; callers can use multiple bounded rounds instead.
+    pub const MAX_CAPACITY: usize = 1024;
+    /// Hard cap for one receive scratch buffer. UDP datagrams larger than
+    /// this are reported as truncated by the kernel and never fed to SRT.
+    pub const MAX_BUF_LEN: usize = shiguredo_srt::MAX_DATAGRAM_SIZE;
 
     #[must_use]
     pub fn new() -> Self {
@@ -40,8 +47,8 @@ impl RecvBatch {
 
     #[must_use]
     pub fn with_capacity(datagrams: usize, buf_len: usize) -> Self {
-        let datagrams = datagrams.max(1);
-        let buf_len = buf_len.max(1);
+        let datagrams = datagrams.clamp(1, Self::MAX_CAPACITY);
+        let buf_len = buf_len.clamp(1, Self::MAX_BUF_LEN);
         Self {
             bufs: (0..datagrams).map(|_| vec![0u8; buf_len]).collect(),
             sizes: vec![0; datagrams],
@@ -124,20 +131,25 @@ impl RecvBudget {
         }
     }
 
-    /// One readiness visit: `rounds` `recvmmsg` calls, each up to
-    /// [`RecvBatch::DEFAULT_CAPACITY`] datagrams.
+    /// One readiness visit expressed as receive rounds. Each round permits up
+    /// to [`RecvBatch::DEFAULT_CAPACITY`] datagrams.
     #[must_use]
     pub const fn from_rounds(rounds: usize) -> Self {
         Self::new(rounds, rounds.saturating_mul(RecvBatch::DEFAULT_CAPACITY))
     }
 
-    /// Keep calling `recvmmsg` until the socket returns 0 (EAGAIN) or a
-    /// short batch. epoll ET plus a round cap leaves datagrams in the
-    /// kernel with no further READABLE, which is how a one-socket pool
-    /// drops millions to `udp_rcvbuf_err` while userspace sits in poll.
+    /// Build a budget for a datagram quantum using the actual receive batch
+    /// capacity. The syscall count is derived, so batching and non-batching
+    /// paths expose the same maximum number of datagrams to the protocol.
     #[must_use]
-    pub const fn until_would_block() -> Self {
-        Self::new(usize::MAX, usize::MAX)
+    pub const fn for_datagrams(max_datagrams: usize, batch_capacity: usize) -> Self {
+        let capacity = if batch_capacity == 0 {
+            1
+        } else {
+            batch_capacity
+        };
+        let rounds = max_datagrams.saturating_add(capacity.saturating_sub(1)) / capacity;
+        Self::new(rounds, max_datagrams)
     }
 }
 
@@ -471,6 +483,14 @@ mod tests {
     }
 
     #[test]
+    fn receive_batch_clamps_adversarial_capacity() {
+        let batch = RecvBatch::with_capacity(usize::MAX, 1);
+        assert_eq!(batch.capacity(), RecvBatch::MAX_CAPACITY);
+        let wide = RecvBatch::with_capacity(1, usize::MAX);
+        assert_eq!(wide.bufs[0].len(), RecvBatch::MAX_BUF_LEN);
+    }
+
+    #[test]
     fn partial_send_preserves_unsent_suffix_in_order() {
         let mut packets = vec![pkt(1), pkt(2), pkt(3), pkt(4)];
         let report = apply_send_result(&mut packets, Ok(2)).expect("partial send");
@@ -570,7 +590,7 @@ mod tests {
     }
 
     #[test]
-    fn until_would_block_drains_past_a_round_cap() {
+    fn finite_budget_drains_past_a_round_cap() {
         use std::os::fd::AsRawFd;
         let receiver = std::net::UdpSocket::bind("127.0.0.1:0").expect("receiver");
         receiver.set_nonblocking(true).expect("nonblocking");
@@ -580,13 +600,13 @@ mod tests {
             RecvBudget::from_rounds(32).max_datagrams,
             RecvBatch::DEFAULT_CAPACITY * 32
         );
-        assert_eq!(RecvBudget::until_would_block().max_rounds, usize::MAX);
         const N: usize = RecvBatch::DEFAULT_CAPACITY + 16;
         for i in 0..N {
             sender.send_to(&[i as u8], dest).expect("send");
         }
 
         let mut batch = RecvBatch::new();
+        let batch_capacity = batch.capacity();
         let mut capped = 0usize;
         drain_recv_fd(
             receiver.as_raw_fd(),
@@ -601,7 +621,7 @@ mod tests {
         drain_recv_fd(
             receiver.as_raw_fd(),
             &mut batch,
-            RecvBudget::until_would_block(),
+            RecvBudget::for_datagrams(N, batch_capacity),
             |_, _| rest += 1,
         )
         .expect("remainder drain");
@@ -614,7 +634,7 @@ mod tests {
         drain_recv_fd(
             receiver.as_raw_fd(),
             &mut batch,
-            RecvBudget::until_would_block(),
+            RecvBudget::for_datagrams(N, batch_capacity),
             |_, _| all += 1,
         )
         .expect("full drain");
@@ -646,13 +666,14 @@ mod tests {
             }
 
             let mut batch = RecvBatch::new();
+            let batch_capacity = batch.capacity();
             let mut delivered = Vec::new();
             loop {
                 let mut this_round = Vec::new();
                 let report = drain_recv_fd(
                     receiver.as_raw_fd(),
                     &mut batch,
-                    RecvBudget::new(usize::MAX, max_datagrams),
+                    RecvBudget::for_datagrams(max_datagrams, batch_capacity),
                     |_, data| this_round.push(data[0]),
                 )
                 .expect("drain");
@@ -702,6 +723,7 @@ mod tests {
         sender.send_to(b"queued", dest).expect("send");
 
         let mut batch = RecvBatch::new();
+        let batch_capacity = batch.capacity();
 
         let mut zero_rounds_calls = 0usize;
         let report = drain_recv_fd(
@@ -730,7 +752,7 @@ mod tests {
         drain_recv_fd(
             receiver.as_raw_fd(),
             &mut batch,
-            RecvBudget::until_would_block(),
+            RecvBudget::for_datagrams(1, batch_capacity),
             |_, data| got.push(data.to_vec()),
         )
         .expect("real drain");

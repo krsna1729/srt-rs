@@ -10,6 +10,7 @@
 //! data: its next [`Subscription::try_recv`] reports exactly how many
 //! items it missed via [`RecvOutcome::Lagged`], then resumes from the
 //! oldest item still retained.
+//! The number of live subscriptions is capped by [`MAX_SUBSCRIPTIONS`].
 //!
 //! This crate already calls one independent unit of fan-out concurrency a
 //! "shard" elsewhere (see `tokio_transport::Facade`'s own doc comment: "one
@@ -25,8 +26,21 @@
 //! anywhere in this module.
 
 use std::collections::{HashSet, VecDeque};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
+
+/// Maximum number of live subscription cursors on one publication bus.
+/// Retention is independently bounded; this cap bounds the bus's identity
+/// bookkeeping when an application repeatedly creates readers without
+/// releasing them.
+pub const MAX_SUBSCRIPTIONS: usize = 4096;
+/// Hard cap for retained publication entries on one bus. A caller may choose
+/// a lower count (including zero); an accidental `usize::MAX` cannot make the
+/// retention ring grow until allocation failure.
+pub const MAX_PUBLICATION_ITEMS: usize = 1 << 20;
+/// Hard cap for retained publication bytes on one bus. The caller's
+/// `byte_len` accounting remains authoritative within this finite ceiling.
+pub const MAX_PUBLICATION_BYTES: usize = 1 << 30;
 
 /// Lock the bus's inner state, recovering from poisoning rather than
 /// propagating it: every mutation this module makes while holding the
@@ -102,6 +116,29 @@ pub struct BusStats {
     pub evicted: u64,
 }
 
+/// A publication/subscription identity counter or byte total cannot be
+/// represented without aliasing or wrapping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BusError {
+    SequenceExhausted,
+    SubscriptionIdExhausted,
+    ByteCountOverflow,
+    SubscriptionLimit,
+}
+
+impl std::fmt::Display for BusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SequenceExhausted => write!(f, "publication sequence space exhausted"),
+            Self::SubscriptionIdExhausted => write!(f, "subscription ID space exhausted"),
+            Self::ByteCountOverflow => write!(f, "retained byte accounting overflow"),
+            Self::SubscriptionLimit => write!(f, "publication bus subscription limit reached"),
+        }
+    }
+}
+
+impl std::error::Error for BusError {}
+
 struct Entry<T> {
     sequence: u64,
     published_at: Instant,
@@ -122,25 +159,20 @@ struct Inner<T> {
     /// instead); this set exists purely so [`PublicationBus::subscriber_count`]
     /// has something to count.
     cursors: HashSet<u64>,
-    live_publishers: usize,
 }
 
 impl<T> Inner<T> {
-    /// Evict from the front of the ring until every retention bound
-    /// (item count, total bytes, age) holds, or only the newest item is
-    /// left. The byte and age bounds never evict the sole remaining
-    /// item -- a single item larger than `retain_bytes`, or older than
-    /// `retain_age` by the time the next item arrives, must still be
-    /// delivered at least once rather than vanish before any subscriber
-    /// can read it. Only the item-count bound (`retain_items == 0`) can
-    /// evict down to empty.
+    /// Evict from the front until every retention bound holds. Returned
+    /// entries are dropped after the mutex is released, so an arbitrary
+    /// payload destructor cannot block every producer and subscriber.
     fn enforce_retention(
         &mut self,
         retain_items: usize,
         retain_bytes: usize,
         retain_age: Duration,
         now: Instant,
-    ) {
+    ) -> Vec<Entry<T>> {
+        let mut evicted_entries = Vec::new();
         while let Some(front) = self.ring.front() {
             let over_items = self.ring.len() > retain_items;
             let over_bytes = self.retained_bytes > retain_bytes;
@@ -148,13 +180,12 @@ impl<T> Inner<T> {
             if !(over_items || over_bytes || over_age) {
                 break;
             }
-            if self.ring.len() == 1 && !over_items {
-                break;
-            }
             let evicted = self.ring.pop_front().expect("front just checked Some");
             self.retained_bytes -= evicted.bytes;
-            self.total_evicted += 1;
+            self.total_evicted = self.total_evicted.saturating_add(1);
+            evicted_entries.push(evicted);
         }
+        evicted_entries
     }
 
     fn oldest_retained_sequence(&self) -> u64 {
@@ -172,6 +203,7 @@ pub struct PublicationBus<T> {
     retain_items: usize,
     retain_bytes: usize,
     retain_age: Duration,
+    publishers: Weak<()>,
 }
 
 impl<T> Clone for PublicationBus<T> {
@@ -181,6 +213,7 @@ impl<T> Clone for PublicationBus<T> {
             retain_items: self.retain_items,
             retain_bytes: self.retain_bytes,
             retain_age: self.retain_age,
+            publishers: self.publishers.clone(),
         }
     }
 }
@@ -191,21 +224,15 @@ impl<T> Clone for PublicationBus<T> {
 /// is only considered closed once every clone has been dropped.
 pub struct Publisher<T> {
     bus: PublicationBus<T>,
+    _liveness: Arc<()>,
 }
 
 impl<T> Clone for Publisher<T> {
     fn clone(&self) -> Self {
-        lock(&self.bus.inner).live_publishers += 1;
         Self {
             bus: self.bus.clone(),
+            _liveness: Arc::clone(&self._liveness),
         }
-    }
-}
-
-impl<T> Drop for Publisher<T> {
-    fn drop(&mut self) {
-        let mut inner = lock(&self.bus.inner);
-        inner.live_publishers = inner.live_publishers.saturating_sub(1);
     }
 }
 
@@ -228,14 +255,18 @@ impl<T> PublicationBus<T> {
     /// Build a new bus and its sole initial [`Publisher`] handle.
     /// `retain_items`/`retain_bytes`/`retain_age` bound retention jointly:
     /// an item is evicted once ANY one of them is exceeded, whichever
-    /// comes first. Pass `usize::MAX`/[`Duration::MAX`] for a bound that
-    /// should never itself trigger eviction.
+    /// comes first. Count and byte limits are clamped to
+    /// [`MAX_PUBLICATION_ITEMS`] and [`MAX_PUBLICATION_BYTES`]; use a large
+    /// value when one dimension should be effectively inactive within those
+    /// hard process-local ceilings.
     #[must_use]
     pub fn new(
         retain_items: usize,
         retain_bytes: usize,
         retain_age: Duration,
     ) -> (Publisher<T>, Self) {
+        let retain_items = retain_items.min(MAX_PUBLICATION_ITEMS);
+        let retain_bytes = retain_bytes.min(MAX_PUBLICATION_BYTES);
         let bus = Self {
             inner: Arc::new(Mutex::new(Inner {
                 ring: VecDeque::new(),
@@ -244,13 +275,19 @@ impl<T> PublicationBus<T> {
                 total_evicted: 0,
                 next_subscription_id: 0,
                 cursors: HashSet::new(),
-                live_publishers: 1,
             })),
             retain_items,
             retain_bytes,
             retain_age,
+            publishers: Weak::new(),
         };
-        let publisher = Publisher { bus: bus.clone() };
+        let liveness = Arc::new(());
+        let mut bus = bus;
+        bus.publishers = Arc::downgrade(&liveness);
+        let publisher = Publisher {
+            bus: bus.clone(),
+            _liveness: liveness,
+        };
         (publisher, bus)
     }
 
@@ -260,18 +297,23 @@ impl<T> PublicationBus<T> {
     /// resubscribing shard expects (a shard that wants replay of
     /// already-retained items can be added later without changing this
     /// default).
-    #[must_use]
-    pub fn subscribe(&self) -> Subscription<T> {
+    pub fn subscribe(&self) -> Result<Subscription<T>, BusError> {
         let mut inner = lock(&self.inner);
+        if inner.cursors.len() >= MAX_SUBSCRIPTIONS {
+            return Err(BusError::SubscriptionLimit);
+        }
         let id = inner.next_subscription_id;
-        inner.next_subscription_id += 1;
+        inner.next_subscription_id = inner
+            .next_subscription_id
+            .checked_add(1)
+            .ok_or(BusError::SubscriptionIdExhausted)?;
         let next_sequence = inner.next_sequence;
         inner.cursors.insert(id);
-        Subscription {
+        Ok(Subscription {
             bus: self.clone(),
             id,
             next_sequence,
-        }
+        })
     }
 
     /// Number of subscriptions currently live.
@@ -297,32 +339,41 @@ impl<T> Publisher<T> {
     /// module has no way to measure an arbitrary `T` itself); pass `0` if
     /// byte-bounded retention is not meaningful for this bus's payload
     /// type. Returns the sequence number just assigned.
-    pub fn publish(&self, item: T, byte_len: usize) -> u64 {
+    pub fn publish(&self, item: T, byte_len: usize) -> Result<u64, BusError> {
         let now = Instant::now();
         let mut inner = lock(&self.bus.inner);
         let sequence = inner.next_sequence;
-        inner.next_sequence += 1;
-        inner.retained_bytes += byte_len;
+        let next_sequence = inner
+            .next_sequence
+            .checked_add(1)
+            .ok_or(BusError::SequenceExhausted)?;
+        let retained_bytes = inner
+            .retained_bytes
+            .checked_add(byte_len)
+            .ok_or(BusError::ByteCountOverflow)?;
+        inner.next_sequence = next_sequence;
+        inner.retained_bytes = retained_bytes;
         inner.ring.push_back(Entry {
             sequence,
             published_at: now,
             bytes: byte_len,
             item: Arc::new(item),
         });
-        inner.enforce_retention(
+        let evicted = inner.enforce_retention(
             self.bus.retain_items,
             self.bus.retain_bytes,
             self.bus.retain_age,
             now,
         );
-        sequence
+        drop(inner);
+        drop(evicted);
+        Ok(sequence)
     }
 
     /// Convenience for a caller that only holds a `Publisher` handle and
     /// would otherwise need to thread the matching `PublicationBus`
     /// around separately just to add a reader.
-    #[must_use]
-    pub fn subscribe(&self) -> Subscription<T> {
+    pub fn subscribe(&self) -> Result<Subscription<T>, BusError> {
         self.bus.subscribe()
     }
 }
@@ -333,7 +384,7 @@ impl<T> Subscription<T> {
     pub fn try_recv(&mut self) -> RecvOutcome<T> {
         let now = Instant::now();
         let mut inner = lock(&self.bus.inner);
-        inner.enforce_retention(
+        let evicted = inner.enforce_retention(
             self.bus.retain_items,
             self.bus.retain_bytes,
             self.bus.retain_age,
@@ -344,17 +395,23 @@ impl<T> Subscription<T> {
         if self.next_sequence < oldest_retained {
             let skipped = oldest_retained - self.next_sequence;
             self.next_sequence = oldest_retained;
+            drop(inner);
+            drop(evicted);
             return RecvOutcome::Lagged { skipped };
         }
 
         // Already known `>= oldest_retained` (the Lagged branch above
         // returns otherwise), so this is always a valid, non-negative
         // offset into the ring.
-        let ring_index = (self.next_sequence - oldest_retained) as usize;
-        let Some(entry) = inner.ring.get(ring_index) else {
-            if inner.live_publishers == 0 {
+        let ring_index = usize::try_from(self.next_sequence - oldest_retained).ok();
+        let Some(entry) = ring_index.and_then(|index| inner.ring.get(index)) else {
+            if self.bus.publishers.upgrade().is_none() {
+                drop(inner);
+                drop(evicted);
                 return RecvOutcome::Closed;
             }
+            drop(inner);
+            drop(evicted);
             return RecvOutcome::Empty;
         };
         let published = Published {
@@ -363,6 +420,8 @@ impl<T> Subscription<T> {
             item: Arc::clone(&entry.item),
         };
         self.next_sequence += 1;
+        drop(inner);
+        drop(evicted);
         RecvOutcome::Item(published)
     }
 
@@ -395,11 +454,11 @@ mod tests {
     fn multiple_subscriptions_each_observe_every_publication() {
         let (publisher, bus) =
             PublicationBus::<Vec<u8>>::new(16, 1_000_000, Duration::from_secs(60));
-        let mut a = bus.subscribe();
-        let mut b = bus.subscribe();
+        let mut a = bus.subscribe().expect("subscription");
+        let mut b = bus.subscribe().expect("subscription");
 
-        publisher.publish(b"first".to_vec(), 5);
-        publisher.publish(b"second".to_vec(), 6);
+        publisher.publish(b"first".to_vec(), 5).expect("publish");
+        publisher.publish(b"second".to_vec(), 6).expect("publish");
 
         for sub in [&mut a, &mut b] {
             let RecvOutcome::Item(first) = sub.try_recv() else {
@@ -417,13 +476,13 @@ mod tests {
     #[test]
     fn a_stalled_subscription_reports_explicit_lag_not_corrupted_data() {
         let (publisher, bus) = PublicationBus::<u32>::new(2, usize::MAX, Duration::from_secs(60));
-        let mut slow = bus.subscribe();
+        let mut slow = bus.subscribe().expect("subscription");
 
         // Fill past the 2-item retention bound without the subscription
         // ever reading -- items 0 and 1 must be evicted once item 3
         // arrives (ring holds at most 2: {2, 3}).
         for i in 0..4u32 {
-            publisher.publish(i, 4);
+            publisher.publish(i, 4).expect("publish");
         }
 
         match slow.try_recv() {
@@ -448,11 +507,11 @@ mod tests {
     #[test]
     fn lag_reports_how_far_behind_a_subscription_is_before_it_next_receives() {
         let (publisher, bus) = PublicationBus::<u32>::new(100, usize::MAX, Duration::from_secs(60));
-        let mut sub = bus.subscribe();
+        let mut sub = bus.subscribe().expect("subscription");
         assert_eq!(sub.lag(), 0, "a fresh subscription starts with no lag");
 
         for i in 0..5u32 {
-            publisher.publish(i, 4);
+            publisher.publish(i, 4).expect("publish");
         }
         assert_eq!(sub.lag(), 5, "lag must reflect every unread publication");
 
@@ -469,7 +528,7 @@ mod tests {
     fn producer_progress_and_memory_stay_bounded_even_with_no_readers() {
         let (publisher, bus) = PublicationBus::<u32>::new(4, usize::MAX, Duration::from_secs(60));
         for i in 0..1000u32 {
-            publisher.publish(i, 4);
+            publisher.publish(i, 4).expect("publish");
         }
         // The ring itself never grows past `retain_items`, regardless of
         // how many items were ever published or whether anything read
@@ -482,7 +541,7 @@ mod tests {
         // `resubscribing_starts_fresh_from_the_current_tail_...` below),
         // so it correctly sees nothing pending -- not a crash, and not a
         // replay of everything it missed before it existed.
-        let mut late = bus.subscribe();
+        let mut late = bus.subscribe().expect("subscription");
         match late.try_recv() {
             RecvOutcome::Empty => {} // caught up to tail already, nothing more was published
             other => panic!("unexpected: {other:?}"),
@@ -492,8 +551,8 @@ mod tests {
     #[test]
     fn byte_bound_evicts_even_under_the_item_count_bound() {
         let (publisher, bus) = PublicationBus::<Vec<u8>>::new(100, 10, Duration::from_secs(60));
-        publisher.publish(vec![0; 6], 6);
-        publisher.publish(vec![0; 6], 6);
+        publisher.publish(vec![0; 6], 6).expect("publish");
+        publisher.publish(vec![0; 6], 6).expect("publish");
         // Total published bytes (12) exceeds the 10-byte bound, so the
         // first entry must already be evicted despite being well under
         // the 100-item bound.
@@ -506,9 +565,9 @@ mod tests {
     fn age_bound_evicts_stale_items_on_the_next_publish() {
         let (publisher, bus) =
             PublicationBus::<u32>::new(100, usize::MAX, Duration::from_millis(1));
-        publisher.publish(1, 4);
+        publisher.publish(1, 4).expect("publish");
         std::thread::sleep(Duration::from_millis(20));
-        publisher.publish(2, 4);
+        publisher.publish(2, 4).expect("publish");
         let inner = bus.inner.lock().unwrap();
         assert_eq!(
             inner.ring.len(),
@@ -521,14 +580,14 @@ mod tests {
     #[test]
     fn unsubscribe_releases_its_cursor_and_does_not_affect_other_subscriptions() {
         let (publisher, bus) = PublicationBus::<u32>::new(2, usize::MAX, Duration::from_secs(60));
-        let departing = bus.subscribe();
-        let mut staying = bus.subscribe();
+        let departing = bus.subscribe().expect("subscription");
+        let mut staying = bus.subscribe().expect("subscription");
         assert_eq!(bus.subscriber_count(), 2);
 
         departing.unsubscribe();
         assert_eq!(bus.subscriber_count(), 1);
 
-        publisher.publish(1, 4);
+        publisher.publish(1, 4).expect("publish");
         let RecvOutcome::Item(item) = staying.try_recv() else {
             panic!("expected an item");
         };
@@ -538,16 +597,16 @@ mod tests {
     #[test]
     fn resubscribing_starts_fresh_from_the_current_tail_not_from_retained_history() {
         let (publisher, bus) = PublicationBus::<u32>::new(10, usize::MAX, Duration::from_secs(60));
-        publisher.publish(1, 4);
-        publisher.publish(2, 4);
+        publisher.publish(1, 4).expect("publish");
+        publisher.publish(2, 4).expect("publish");
 
-        let mut fresh = bus.subscribe();
+        let mut fresh = bus.subscribe().expect("subscription");
         assert!(
             matches!(fresh.try_recv(), RecvOutcome::Empty),
             "a new subscription must not replay history published before it joined"
         );
 
-        publisher.publish(3, 4);
+        publisher.publish(3, 4).expect("publish");
         let RecvOutcome::Item(item) = fresh.try_recv() else {
             panic!("expected the item published after subscribing");
         };
@@ -557,8 +616,8 @@ mod tests {
     #[test]
     fn dropping_every_publisher_eventually_reports_closed() {
         let (publisher, bus) = PublicationBus::<u32>::new(10, usize::MAX, Duration::from_secs(60));
-        let mut sub = bus.subscribe();
-        publisher.publish(1, 4);
+        let mut sub = bus.subscribe().expect("subscription");
+        publisher.publish(1, 4).expect("publish");
         drop(publisher);
 
         let RecvOutcome::Item(item) = sub.try_recv() else {
@@ -576,15 +635,19 @@ mod tests {
     fn safe_references_outlive_overwritten_slots() {
         let (publisher, bus) =
             PublicationBus::<Vec<u8>>::new(1, usize::MAX, Duration::from_secs(60));
-        let mut sub = bus.subscribe();
-        publisher.publish(b"kept".to_vec(), 4);
+        let mut sub = bus.subscribe().expect("subscription");
+        publisher.publish(b"kept".to_vec(), 4).expect("publish");
         let RecvOutcome::Item(held) = sub.try_recv() else {
             panic!("expected the first item");
         };
         // Evict the slot `held` came from by publishing past the
         // 1-item retention bound.
-        publisher.publish(b"overwrites".to_vec(), 10);
-        publisher.publish(b"overwrites again".to_vec(), 16);
+        publisher
+            .publish(b"overwrites".to_vec(), 10)
+            .expect("publish");
+        publisher
+            .publish(b"overwrites again".to_vec(), 16)
+            .expect("publish");
         // The subscriber's own Arc-backed copy is completely unaffected
         // by the bus internally evicting/overwriting its ring slot.
         assert_eq!(held.item.as_slice(), b"kept");
@@ -606,11 +669,11 @@ mod tests {
 
         const ITEMS: u64 = 5_000;
         let (publisher, bus) = PublicationBus::<u64>::new(64, usize::MAX, Duration::from_secs(60));
-        let mut sub = bus.subscribe();
+        let mut sub = bus.subscribe().expect("subscription");
 
         let producer = thread::spawn(move || {
             for i in 0..ITEMS {
-                publisher.publish(i, 8);
+                publisher.publish(i, 8).expect("publish");
             }
         });
 
@@ -665,10 +728,10 @@ mod tests {
     fn a_second_publisher_keeps_the_bus_open_after_the_first_is_dropped() {
         let (first, bus) = PublicationBus::<u32>::new(10, usize::MAX, Duration::from_secs(60));
         let second = first.clone();
-        let mut sub = bus.subscribe();
+        let mut sub = bus.subscribe().expect("subscription");
 
         drop(first);
-        second.publish(1, 4);
+        second.publish(1, 4).expect("publish");
 
         // The bus must not report `Closed` while a clone of the original
         // `Publisher` is still alive and publishing, even though the
@@ -686,9 +749,9 @@ mod tests {
     #[test]
     fn byte_bound_eviction_is_reported_to_a_subscriber_as_explicit_lag() {
         let (publisher, bus) = PublicationBus::<Vec<u8>>::new(100, 10, Duration::from_secs(60));
-        let mut sub = bus.subscribe();
-        publisher.publish(vec![0; 6], 6);
-        publisher.publish(vec![0; 6], 6); // pushes total past the 10-byte bound
+        let mut sub = bus.subscribe().expect("subscription");
+        publisher.publish(vec![0; 6], 6).expect("publish");
+        publisher.publish(vec![0; 6], 6).expect("publish"); // pushes total past the 10-byte bound
 
         match sub.try_recv() {
             RecvOutcome::Lagged { skipped } => assert_eq!(skipped, 1),
@@ -704,10 +767,10 @@ mod tests {
     fn age_bound_eviction_is_reported_to_a_subscriber_as_explicit_lag() {
         let (publisher, bus) =
             PublicationBus::<u32>::new(100, usize::MAX, Duration::from_millis(1));
-        let mut sub = bus.subscribe();
-        publisher.publish(1, 4);
+        let mut sub = bus.subscribe().expect("subscription");
+        publisher.publish(1, 4).expect("publish");
         std::thread::sleep(Duration::from_millis(20));
-        publisher.publish(2, 4); // ages the first item out on this publish
+        publisher.publish(2, 4).expect("publish"); // ages the first item out on this publish
 
         match sub.try_recv() {
             RecvOutcome::Lagged { skipped } => assert_eq!(skipped, 1),
@@ -720,19 +783,24 @@ mod tests {
     }
 
     #[test]
-    fn an_item_larger_than_the_byte_bound_is_still_delivered_once() {
-        // A shard configured with a byte bound smaller than one jumbo
-        // payload must not silently drop every single item it is ever
-        // given -- the sole retained item is delivered at least once
-        // before any later publish can evict it.
+    fn an_item_larger_than_the_byte_bound_is_not_retained() {
         let (publisher, bus) = PublicationBus::<Vec<u8>>::new(100, 10, Duration::from_secs(60));
-        let mut sub = bus.subscribe();
-        publisher.publish(vec![0; 50], 50);
+        let mut sub = bus.subscribe().expect("subscription");
+        publisher.publish(vec![0; 50], 50).expect("publish");
 
-        let RecvOutcome::Item(item) = sub.try_recv() else {
-            panic!("an oversized-for-its-bound item must still be delivered");
-        };
-        assert_eq!(item.item.len(), 50);
+        assert!(matches!(sub.try_recv(), RecvOutcome::Lagged { skipped: 1 }));
+        assert!(matches!(sub.try_recv(), RecvOutcome::Empty));
+        let inner = bus.inner.lock().unwrap();
+        assert!(inner.ring.is_empty());
+        assert_eq!(inner.retained_bytes, 0);
+    }
+
+    #[test]
+    fn publication_retention_clamps_adversarial_limits() {
+        let (_publisher, bus) =
+            PublicationBus::<u8>::new(usize::MAX, usize::MAX, Duration::from_secs(60));
+        assert_eq!(bus.retain_items, MAX_PUBLICATION_ITEMS);
+        assert_eq!(bus.retain_bytes, MAX_PUBLICATION_BYTES);
     }
 
     #[test]
@@ -740,8 +808,8 @@ mod tests {
         let (publisher, bus) = PublicationBus::<u32>::new(1, usize::MAX, Duration::from_secs(60));
         assert_eq!(bus.stats(), BusStats::default());
 
-        publisher.publish(1, 4);
-        publisher.publish(2, 4); // evicts sequence 0 under the 1-item bound
+        publisher.publish(1, 4).expect("publish");
+        publisher.publish(2, 4).expect("publish"); // evicts sequence 0 under the 1-item bound
 
         let stats = bus.stats();
         assert_eq!(stats.published, 2);
@@ -751,11 +819,25 @@ mod tests {
     #[test]
     fn publisher_subscribe_is_equivalent_to_bus_subscribe() {
         let (publisher, _bus) = PublicationBus::<u32>::new(10, usize::MAX, Duration::from_secs(60));
-        let mut sub = publisher.subscribe();
-        publisher.publish(1, 4);
+        let mut sub = publisher.subscribe().expect("subscription");
+        publisher.publish(1, 4).expect("publish");
         let RecvOutcome::Item(item) = sub.try_recv() else {
             panic!("expected an item via a Publisher-minted subscription");
         };
         assert_eq!(*item.item, 1);
+    }
+
+    #[test]
+    fn subscription_count_is_bounded_and_released_on_drop() {
+        let (_publisher, bus) = PublicationBus::<u32>::new(1, usize::MAX, Duration::from_secs(60));
+        let mut subscriptions = Vec::with_capacity(MAX_SUBSCRIPTIONS);
+        for _ in 0..MAX_SUBSCRIPTIONS {
+            subscriptions.push(bus.subscribe().expect("subscription within cap"));
+        }
+        assert_eq!(bus.subscriber_count(), MAX_SUBSCRIPTIONS);
+        assert!(matches!(bus.subscribe(), Err(BusError::SubscriptionLimit)));
+        subscriptions.pop();
+        assert_eq!(bus.subscriber_count(), MAX_SUBSCRIPTIONS - 1);
+        assert!(bus.subscribe().is_ok());
     }
 }

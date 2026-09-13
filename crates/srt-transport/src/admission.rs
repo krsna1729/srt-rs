@@ -1,7 +1,8 @@
 use crate::{
     DenseDueIndex, DenseSlotArena, DueIndex, GroupConnectionStats, GroupLogicalCounters,
-    InboundGroupStats, IngressTelemetry, ListenerPeerPolicy, ManualTimerStore, OutputDrainBudget,
-    OutputDrainReport, OutputDrainStatus, PeerSlotId, WorkerMessage, group_connection_stats,
+    InboundGroupStats, IngressTelemetry, ListenerPeerPolicy, MAX_DENSE_SLOTS, ManualTimerStore,
+    OutputDrainBudget, OutputDrainReport, OutputDrainStatus, PeerSlotId, WorkerMessage,
+    group_connection_stats,
 };
 use shiguredo_srt::{
     Bytes, ConnectionEvent, ConnectionOptions, ConnectionOutput, SrtConnection, Timestamp,
@@ -34,6 +35,7 @@ pub struct AdmissionPeer {
     logical_peer: LogicalPeerId,
     pub conn: SrtConnection,
     pub timers: ManualTimerStore,
+    pending_outputs: VecDeque<ConnectionOutput>,
     /// Live connected state, feeding `srt_lifecycle::is_terminal`. Goes
     /// false again on `Disconnected`.
     pub connected: bool,
@@ -763,6 +765,7 @@ pub struct AdmissionEvent {
 struct InboundGroupLeg {
     physical: PhysicalPeerKey,
     timers: ManualTimerStore,
+    pending_outputs: VecDeque<ConnectionOutput>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -893,7 +896,7 @@ impl PeerTable {
 
     #[must_use]
     pub fn with_config(mut config: PeerTableConfig) -> Self {
-        config.max_peers = config.max_peers.max(1);
+        config.max_peers = config.max_peers.clamp(1, MAX_DENSE_SLOTS);
         config.max_half_open_peers = config.max_half_open_peers.max(1).min(config.max_peers);
         config.max_established_peers = config.max_established_peers.max(1).min(config.max_peers);
         config.max_peers_per_ip = config.max_peers_per_ip.max(1).min(config.max_peers);
@@ -1471,6 +1474,7 @@ impl PeerTable {
             logical_peer,
             conn,
             timers: ManualTimerStore::new(),
+            pending_outputs: VecDeque::new(),
             connected: false,
             stream_deadline: None,
             ever_connected: false,
@@ -1676,6 +1680,7 @@ impl PeerTable {
             InboundGroupLeg {
                 physical: peer,
                 timers: entry.timers,
+                pending_outputs: entry.pending_outputs,
             },
         );
         group.leg_order.push(member_id);
@@ -2029,7 +2034,7 @@ impl PeerTable {
 
     /// Remove incomplete handshakes that have stopped making progress.
     pub fn prune_half_open(&mut self, now: Timestamp) -> usize {
-        self.prune_half_open_bounded(now, usize::MAX)
+        self.prune_half_open_bounded(now, OutputDrainBudget::default().max_actions)
     }
 
     /// Remove at most `max_actions` expired incomplete handshakes. The
@@ -2112,7 +2117,7 @@ impl PeerTable {
 
     /// Compatibility wrapper that drains every currently due idle key.
     pub fn prune_idle(&mut self, now: Timestamp, idle_timeout: Duration) -> usize {
-        self.prune_idle_bounded(now, idle_timeout, usize::MAX)
+        self.prune_idle_bounded(now, idle_timeout, OutputDrainBudget::default().max_actions)
     }
 
     /// [`Self::admit`] plus the send it implies: forward the datagram to
@@ -2214,11 +2219,7 @@ impl PeerTable {
         now: Timestamp,
         out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
     ) {
-        let _ = self.poll_outbound_bounded(
-            now,
-            OutputDrainBudget::new(usize::MAX, usize::MAX, usize::MAX),
-            out,
-        );
+        let _ = self.poll_outbound_bounded(now, OutputDrainBudget::default(), out);
     }
 
     /// Bounded counterpart to [`Self::poll_outbound`] (finding 3): fires
@@ -2229,15 +2230,9 @@ impl PeerTable {
     /// contract [`crate::CallerTable::poll_outbound_bounded`] already
     /// gives the caller side.
     ///
-    /// Bonded-group output is drained only for legs the group ready-queue
-    /// actually marks ready (never every group on every call, unlike the
-    /// old unconditional full scan), but is not itself split across
-    /// multiple `poll_outbound_bounded` calls if several groups are ready
-    /// at once. Bonded groups are a small-cardinality construct relative
-    /// to direct peers, so this is a deliberate, documented scope
-    /// decision rather than the primary unbounded-scan hazard this exists
-    /// to close -- fully budget-splitting group output is an open
-    /// follow-up, not yet a numbered card.
+    /// Deadline visits, stale ready tokens, timer outputs and packets share
+    /// the same action allowance. A call therefore performs at most
+    /// `max_actions` table/index visits even under simultaneous timer churn.
     pub fn poll_outbound_bounded(
         &mut self,
         now: Timestamp,
@@ -2247,10 +2242,30 @@ impl PeerTable {
         self.last_now = now;
         out.clear();
         let mut rejected = Vec::new();
-        let mut report = self.poll_direct_outbound_bounded(now, budget, out, &mut rejected);
+        let mut report = OutputDrainReport::default();
+        let (mut visits, direct_due_remaining) =
+            self.mark_due_peers_bounded(now, budget.max_actions);
+        let direct_blocked = self.poll_direct_outbound_bounded(
+            now,
+            budget,
+            out,
+            &mut rejected,
+            &mut report,
+            &mut visits,
+        );
         self.remove_rejected_peers(rejected);
-        self.poll_group_outbound_bounded(now, out);
-        if report.status == OutputDrainStatus::Drained && self.has_pending_output(now) {
+        let (group_due_visits, group_due_remaining) =
+            self.mark_due_group_legs_bounded(now, budget.max_actions.saturating_sub(visits));
+        visits = visits.saturating_add(group_due_visits);
+        let group_blocked =
+            self.poll_group_outbound_bounded(now, budget, out, &mut report, &mut visits);
+        if direct_due_remaining
+            || group_due_remaining
+            || direct_blocked
+            || group_blocked
+            || visits >= budget.max_actions
+            || self.has_pending_output(now)
+        {
             report.status = OutputDrainStatus::BudgetExhausted;
         }
         report
@@ -2282,30 +2297,32 @@ impl PeerTable {
         budget: OutputDrainBudget,
         out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
         rejected: &mut Vec<PhysicalPeerKey>,
-    ) -> OutputDrainReport {
-        let mut report = OutputDrainReport::default();
-        if budget.max_actions == 0 {
-            report.status = if self.ready.is_empty() && !self.deadlines.has_due(now) {
-                OutputDrainStatus::Drained
-            } else {
-                OutputDrainStatus::BudgetExhausted
-            };
-            return report;
-        }
-        let (_, due_remaining) = self.mark_due_peers_bounded(now, budget.max_actions);
-        while within_output_budget(&report, budget) {
+        report: &mut OutputDrainReport,
+        visits: &mut usize,
+    ) -> bool {
+        let mut blocked = false;
+        while *visits < budget.max_actions && within_output_budget(report, budget) {
             let Some(slot_id) = self.ready.pop_front() else {
                 break;
             };
-            if let Some(peer_key) = self.drain_one_direct_peer_slot(slot_id, now, out, &mut report)
-            {
+            *visits += 1;
+            let (peer_key, should_requeue, item_blocked) =
+                self.drain_one_direct_peer_slot(slot_id, now, budget, out, report);
+            if let Some(peer_key) = peer_key {
                 rejected.push(peer_key);
             }
+            if should_requeue {
+                let slot_idx = slot_id.slot_idx as usize;
+                if let Some(id) = self.slots.mark_ready(slot_idx) {
+                    self.ready.push_back(id);
+                }
+            }
+            if item_blocked {
+                blocked = true;
+                break;
+            }
         }
-        if due_remaining || !self.ready.is_empty() || output_budget_exhausted(&report, budget) {
-            report.status = OutputDrainStatus::BudgetExhausted;
-        }
-        report
+        blocked
     }
 
     /// Service one ready direct-peer slot: fire its due timers, drain its
@@ -2318,41 +2335,67 @@ impl PeerTable {
         &mut self,
         slot_id: PeerSlotId,
         now: Timestamp,
+        budget: OutputDrainBudget,
         out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
         report: &mut OutputDrainReport,
-    ) -> Option<PhysicalPeerKey> {
+    ) -> (Option<PhysicalPeerKey>, bool, bool) {
         let slot_idx = slot_id.slot_idx as usize;
         if !self.slots.clear_ready_if_generation_matches(slot_id) {
-            return None;
+            return (None, false, false);
         }
-        report.actions += 1;
-        let slot = self.slots.get_by_slot_mut(slot_idx)?;
+        let Some(slot) = self.slots.get_by_slot_mut(slot_idx) else {
+            return (None, false, false);
+        };
         let peer_addr = slot.address;
         let peer_key = PhysicalPeerKey {
             address: peer_addr,
             local_socket_id: slot.socket_id,
         };
-        let entry = slot.value.direct_mut()?;
+        let Some(entry) = slot.value.direct_mut() else {
+            return (None, false, false);
+        };
         entry.timers.fire_expired(now, &mut entry.conn);
-        while let Some(output) = entry.conn.poll_output() {
-            match output {
-                ConnectionOutput::SendPacket(bytes) => {
+        let Some(output) = entry
+            .pending_outputs
+            .pop_front()
+            .or_else(|| entry.conn.poll_output())
+        else {
+            let rejected = entry.rejected.then_some(peer_key);
+            if let Some(deadline) = entry.timers.next_deadline() {
+                self.deadlines.set(slot_idx, deadline, &mut self.slots);
+            } else {
+                self.deadlines.remove(slot_idx, &mut self.slots);
+            }
+            return (rejected, false, false);
+        };
+        let mut blocked = false;
+        match output {
+            ConnectionOutput::SendPacket(bytes) => {
+                let exceeds_packets = report.packets >= budget.max_packets;
+                let exceeds_bytes = report.bytes.saturating_add(bytes.len()) > budget.max_bytes;
+                if exceeds_packets || exceeds_bytes {
+                    entry
+                        .pending_outputs
+                        .push_front(ConnectionOutput::SendPacket(bytes));
+                    blocked = true;
+                } else {
+                    report.actions += 1;
                     report.packets += 1;
-                    report.bytes += bytes.len();
+                    report.bytes = report.bytes.saturating_add(bytes.len());
                     out.push((peer_addr, bytes));
                 }
-                other => entry.timers.apply_output(&other, now),
             }
-        }
-        if entry.rejected {
-            return Some(peer_key);
+            other => {
+                report.actions += 1;
+                entry.timers.apply_output(&other, now);
+            }
         }
         if let Some(deadline) = entry.timers.next_deadline() {
             self.deadlines.set(slot_idx, deadline, &mut self.slots);
         } else {
             self.deadlines.remove(slot_idx, &mut self.slots);
         }
-        None
+        (None, true, blocked)
     }
 
     fn remove_rejected_peers(&mut self, rejected: Vec<PhysicalPeerKey>) {
@@ -2364,13 +2407,16 @@ impl PeerTable {
     /// Fire due bonded-group-leg timers, marking the owning leg ready for
     /// the next [`Self::poll_group_outbound_bounded`]/event drain --
     /// the group-leg counterpart to [`Self::mark_due_peers_bounded`].
-    fn mark_due_group_legs(&mut self, now: Timestamp) {
+    fn mark_due_group_legs_bounded(&mut self, now: Timestamp, max_work: usize) -> (usize, bool) {
         let mut due = Vec::new();
-        self.group_deadlines.pop_due(now, &mut due);
+        let result = self
+            .group_deadlines
+            .pop_due_bounded(now, max_work, &mut due);
         for deadline_key in due {
             self.group_deadline_values.remove(&deadline_key);
             self.mark_group_leg_ready(&deadline_key.group.key, deadline_key.member_id);
         }
+        result
     }
 
     /// Drain output only for bonded-group legs the ready-queue actually
@@ -2382,13 +2428,24 @@ impl PeerTable {
     fn poll_group_outbound_bounded(
         &mut self,
         now: Timestamp,
+        budget: OutputDrainBudget,
         out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
-    ) {
-        self.mark_due_group_legs(now);
-        while let Some(token) = self.group_ready.pop_front() {
+        report: &mut OutputDrainReport,
+        visits: &mut usize,
+    ) -> bool {
+        let mut blocked = false;
+        while *visits < budget.max_actions && within_output_budget(report, budget) {
+            let Some(token) = self.group_ready.pop_front() else {
+                break;
+            };
+            *visits += 1;
             self.group_ready_queued.remove(&token);
-            self.drain_one_group_ready_token(token, now, out);
+            if self.drain_one_group_ready_token(token, now, budget, out, report) {
+                blocked = true;
+                break;
+            }
         }
+        blocked
     }
 
     /// Service every ready leg of one bonded group -- split out of
@@ -2398,39 +2455,67 @@ impl PeerTable {
         &mut self,
         token: GroupReadyKey,
         now: Timestamp,
+        budget: OutputDrainBudget,
         out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
-    ) {
+        report: &mut OutputDrainReport,
+    ) -> bool {
         let Some(group) = self.groups.get_mut(&token.key) else {
-            return;
+            return false;
         };
         if group.generation != token.generation {
-            return;
+            return false;
         }
-        let ready_legs: Vec<u32> = std::mem::take(&mut group.ready_legs).into_iter().collect();
-        group.ready_legs_queued.clear();
-        {
-            let (core, legs) = (&mut group.group, &mut group.legs);
-            for &member_id in &ready_legs {
-                let Some(leg) = legs.get_mut(&member_id) else {
-                    continue;
-                };
-                let Some(member) = core.member_mut(member_id) else {
-                    continue;
-                };
-                leg.timers.fire_expired(now, member.connection_mut());
-                while let Some(output) = member.connection_mut().poll_output() {
-                    match output {
-                        ConnectionOutput::SendPacket(bytes) => {
-                            out.push((leg.physical.address, bytes));
-                        }
-                        other => leg.timers.apply_output(&other, now),
+        let Some(member_id) = group.ready_legs.pop_front() else {
+            return false;
+        };
+        group.ready_legs_queued.remove(&member_id);
+        let Some(leg) = group.legs.get_mut(&member_id) else {
+            return false;
+        };
+        let Some(member) = group.group.member_mut(member_id) else {
+            return false;
+        };
+        let connection = member.connection_mut();
+        leg.timers.fire_expired(now, connection);
+        let output = leg
+            .pending_outputs
+            .pop_front()
+            .or_else(|| connection.poll_output());
+        let had_output = output.is_some();
+        let mut blocked = false;
+        if let Some(output) = output {
+            match output {
+                ConnectionOutput::SendPacket(bytes) => {
+                    let exceeds_packets = report.packets >= budget.max_packets;
+                    let exceeds_bytes = report.bytes.saturating_add(bytes.len()) > budget.max_bytes;
+                    if exceeds_packets || exceeds_bytes {
+                        leg.pending_outputs
+                            .push_front(ConnectionOutput::SendPacket(bytes));
+                        blocked = true;
+                    } else {
+                        report.actions += 1;
+                        report.packets += 1;
+                        report.bytes = report.bytes.saturating_add(bytes.len());
+                        out.push((leg.physical.address, bytes));
                     }
+                }
+                other => {
+                    report.actions += 1;
+                    leg.timers.apply_output(&other, now);
                 }
             }
         }
-        for member_id in ready_legs {
-            self.sync_group_leg_deadline(&token.key, member_id);
+        self.sync_group_leg_deadline(&token.key, member_id);
+        if had_output {
+            self.mark_group_leg_ready(&token.key, member_id);
+        } else if self
+            .groups
+            .get(&token.key)
+            .is_some_and(|group| !group.ready_legs.is_empty())
+        {
+            self.enqueue_group_ready(token);
         }
+        blocked
     }
 
     /// Whether output or a due timer can be serviced at `now`, across
@@ -2517,7 +2602,7 @@ impl PeerTable {
 
     /// Drain logical ingress events for production consumers.
     pub fn poll_events(&mut self, out: &mut Vec<AdmissionEvent>) {
-        let _ = self.poll_events_bounded(usize::MAX, out);
+        let _ = self.poll_events_bounded(OutputDrainBudget::default().max_actions, out);
     }
 
     /// Bounded counterpart to [`Self::poll_events`] (finding 3): drains at
@@ -2535,18 +2620,24 @@ impl PeerTable {
         if max_events == 0 {
             return self.has_pending_events();
         }
-        self.drain_direct_events_bounded(max_events, out);
-        if out.len() < max_events {
-            self.drain_group_events_bounded(max_events, out);
+        let direct_visits = self.drain_direct_events_bounded(max_events, out);
+        if out.len() < max_events && direct_visits < max_events {
+            self.drain_group_events_bounded(max_events, max_events - direct_visits, out);
         }
         self.has_pending_events()
     }
 
-    fn drain_direct_events_bounded(&mut self, max_events: usize, out: &mut Vec<AdmissionEvent>) {
-        while out.len() < max_events {
+    fn drain_direct_events_bounded(
+        &mut self,
+        max_events: usize,
+        out: &mut Vec<AdmissionEvent>,
+    ) -> usize {
+        let mut visits = 0;
+        while visits < max_events && out.len() < max_events {
             let Some(slot_id) = self.event_ready.pop_front() else {
                 break;
             };
+            visits += 1;
             let slot_idx = slot_id.slot_idx as usize;
             if !self.slots.clear_event_ready_if_generation_matches(slot_id) {
                 continue;
@@ -2580,14 +2671,22 @@ impl PeerTable {
                 self.event_ready.push_back(id);
             }
         }
+        visits
     }
 
-    fn drain_group_events_bounded(&mut self, max_events: usize, out: &mut Vec<AdmissionEvent>) {
+    fn drain_group_events_bounded(
+        &mut self,
+        max_events: usize,
+        max_visits: usize,
+        out: &mut Vec<AdmissionEvent>,
+    ) {
         let last_now = self.last_now;
-        while out.len() < max_events {
+        let mut visits = 0;
+        while visits < max_visits && out.len() < max_events {
             let Some(token) = self.group_event_ready.pop_front() else {
                 break;
             };
+            visits += 1;
             self.group_event_ready_queued.remove(&token);
             let Some(group) = self.groups.get_mut(&token.key) else {
                 continue;
@@ -3129,11 +3228,6 @@ fn within_output_budget(report: &OutputDrainReport, budget: OutputDrainBudget) -
 /// Whether a completed bounded output drain used up its packet or byte
 /// budget (distinct from the action count, which the caller already
 /// tracks against `self.ready`/due-remaining state directly).
-fn output_budget_exhausted(report: &OutputDrainReport, budget: OutputDrainBudget) -> bool {
-    (budget.max_packets > 0 && report.packets >= budget.max_packets)
-        || (budget.max_bytes > 0 && report.bytes >= budget.max_bytes)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3468,11 +3562,15 @@ mod tests {
         // 2. Poll direct outbound drains ready queue and clears flags
         let mut out = Vec::new();
         let mut rejected = Vec::new();
+        let mut report = OutputDrainReport::default();
+        let mut visits = 0;
         table.poll_direct_outbound_bounded(
             Timestamp::default(),
             OutputDrainBudget::new(usize::MAX, usize::MAX, usize::MAX),
             &mut out,
             &mut rejected,
+            &mut report,
+            &mut visits,
         );
         assert!(table.ready.is_empty());
 
@@ -3527,11 +3625,15 @@ mod tests {
         // Poll outbound -> stale entry for peer_a is popped and skipped without clearing peer_b's flag
         let mut out = Vec::new();
         let mut rejected = Vec::new();
+        let mut report = OutputDrainReport::default();
+        let mut visits = 0;
         table.poll_direct_outbound_bounded(
             Timestamp::default(),
             OutputDrainBudget::new(usize::MAX, usize::MAX, usize::MAX),
             &mut out,
             &mut rejected,
+            &mut report,
+            &mut visits,
         );
         assert!(table.ready.is_empty());
         assert!(rejected.is_empty());
@@ -3576,11 +3678,15 @@ mod tests {
         // 3. Dequeue in poll_direct_outbound safely clears flag and skips direct processing
         let mut out = Vec::new();
         let mut rejected = Vec::new();
+        let mut report = OutputDrainReport::default();
+        let mut visits = 0;
         table.poll_direct_outbound_bounded(
             Timestamp::default(),
             OutputDrainBudget::new(usize::MAX, usize::MAX, usize::MAX),
             &mut out,
             &mut rejected,
+            &mut report,
+            &mut visits,
         );
         assert!(table.ready.is_empty());
         assert!(out.is_empty());
@@ -3612,6 +3718,7 @@ mod tests {
                 local_socket_id: 1,
             },
             timers: ManualTimerStore::new(),
+            pending_outputs: VecDeque::new(),
         };
         leg.timers.apply_output(
             &ConnectionOutput::SetTimer {

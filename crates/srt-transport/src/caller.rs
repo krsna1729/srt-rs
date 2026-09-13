@@ -4,6 +4,16 @@ use crate::{
 };
 use shiguredo_srt::{Bytes, ConnectionOutput, SrtConnection, Timestamp};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+
+/// Default maximum number of logical callers held by one table.
+///
+/// The table is a shard-local owner, so this cap bounds the hash maps,
+/// scheduler queues, protocol cores, and per-caller pending outputs together.
+pub const DEFAULT_MAX_CALLERS: usize = 4096;
+/// Hard upper bound for one caller-table shard. Applications can choose a
+/// lower limit, but an accidental `usize::MAX` must not turn a shard into an
+/// unbounded admission promise.
+pub const MAX_CALLERS: usize = 1 << 16;
 /// Opaque application identity for one outbound SRT stream. A direct caller
 /// and a bonded Broadcast/Backup group have the same steady-state API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -293,7 +303,9 @@ impl LogicalCallerMut<'_> {
 /// The runtime performs `recv_from`/`send_to`; this table owns protocol cores,
 /// timers, source-address validation, and SRT Socket-ID routing. Group policy
 /// stays in the shared [`shiguredo_srt::SrtGroup`] core, so every runtime sees
-/// identical Broadcast and Backup behavior.
+/// identical Broadcast and Backup behavior. A table has a finite logical
+/// caller cap; use [`Self::with_max_callers`] when a shard needs a different
+/// explicit bound.
 pub struct CallerTable {
     sessions: HashMap<LogicalCallerId, CallerSession>,
     routes: HashMap<u32, CallerRoute>,
@@ -302,6 +314,7 @@ pub struct CallerTable {
     deadlines: BTreeSet<DeadlineEntry>,
     sched: HashMap<LogicalCallerId, SchedEntry>,
     next_logical_caller: u64,
+    max_callers: usize,
     #[cfg(any(test, feature = "bench-internals"))]
     sched_stats: SchedCounters,
 }
@@ -602,6 +615,12 @@ fn logical_state(connection: &SrtConnection) -> LogicalCallerState {
 impl CallerTable {
     #[must_use]
     pub fn new() -> Self {
+        Self::with_max_callers(DEFAULT_MAX_CALLERS)
+    }
+
+    /// Build a table with an explicit finite logical-caller cap.
+    #[must_use]
+    pub fn with_max_callers(max_callers: usize) -> Self {
         Self {
             sessions: HashMap::new(),
             routes: HashMap::new(),
@@ -610,6 +629,7 @@ impl CallerTable {
             deadlines: BTreeSet::new(),
             sched: HashMap::new(),
             next_logical_caller: 1,
+            max_callers: max_callers.clamp(1, MAX_CALLERS),
             #[cfg(any(test, feature = "bench-internals"))]
             sched_stats: SchedCounters::default(),
         }
@@ -699,16 +719,6 @@ impl CallerTable {
         EventReadyVisit::Live(id)
     }
 
-    fn pop_ready(&mut self) -> Option<LogicalCallerId> {
-        loop {
-            match self.pop_ready_visit() {
-                ReadyVisit::Live(id) => return Some(id),
-                ReadyVisit::Stale => continue,
-                ReadyVisit::Empty => return None,
-            }
-        }
-    }
-
     fn pop_ready_visit(&mut self) -> ReadyVisit {
         let Some(id) = self.ready_queue.pop_front() else {
             return ReadyVisit::Empty;
@@ -777,6 +787,12 @@ impl CallerTable {
     /// Add one direct caller. Its non-zero SRT Socket ID must be unique among
     /// all physical legs in this shared UDP socket.
     pub fn add_direct(&mut self, leg: CallerLeg) -> Result<LogicalCallerId, shiguredo_srt::Error> {
+        if self.sessions.len() >= self.max_callers {
+            return Err(shiguredo_srt::Error::with_reason(
+                shiguredo_srt::ErrorKind::InvalidState,
+                "caller table capacity reached",
+            ));
+        }
         let socket_id = self.validate_socket_id(&leg.connection)?;
         let id = self.allocate_logical_caller()?;
         self.sessions.insert(
@@ -812,6 +828,12 @@ impl CallerTable {
         mode: shiguredo_srt::GroupMode,
         legs: impl IntoIterator<Item = CallerGroupLeg>,
     ) -> Result<LogicalCallerId, shiguredo_srt::Error> {
+        if self.sessions.len() >= self.max_callers {
+            return Err(shiguredo_srt::Error::with_reason(
+                shiguredo_srt::ErrorKind::InvalidState,
+                "caller table capacity reached",
+            ));
+        }
         let mut group = shiguredo_srt::SrtGroup::new(group_id, mode)?;
         let mut caller_legs = HashMap::new();
         let mut socket_ids = HashSet::new();
@@ -1016,42 +1038,14 @@ impl CallerTable {
         now: Timestamp,
         out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
     ) {
-        out.clear();
-        let due_ids = self.pop_due_ids(now, usize::MAX);
-        self.fire_due_ids(due_ids, now);
-        while let Some(id) = self.pop_ready() {
-            let (drain_result, timers_touched) = {
-                let Some(session) = self.sessions.get_mut(&id) else {
-                    continue;
-                };
-                let mut report = OutputDrainReport::default();
-                let mut sink = DrainSink {
-                    budget: OutputDrainBudget::new(usize::MAX, usize::MAX, usize::MAX),
-                    report: &mut report,
-                    out,
-                };
-                let res = session.drain_one(now, &mut sink);
-                #[cfg(any(test, feature = "bench-internals"))]
-                {
-                    self.sched_stats.ready_drain_probes += 1;
-                }
-                res
-            };
-            if timers_touched {
-                self.sync_deadline(id);
-            }
-            match drain_result {
-                DrainOne::Drained | DrainOne::Blocked => {
-                    self.enqueue_ready(id);
-                }
-                DrainOne::Empty => {
-                    #[cfg(any(test, feature = "bench-internals"))]
-                    {
-                        self.sched_stats.ready_empty_visits += 1;
-                    }
-                }
-            }
-        }
+        // Compatibility API: retain its historical drain-current-work
+        // behavior, with a finite ceiling large enough for the supported
+        // caller fan-in and flow/control bursts.
+        let _ = self.poll_outbound_bounded(
+            now,
+            OutputDrainBudget::new(65_536, 65_536, 64 * 1024 * 1024),
+            out,
+        );
     }
 
     /// Fairly drain bounded work from all logical callers. Due timers are
@@ -1081,9 +1075,16 @@ impl CallerTable {
         // function's own "bounded" contract hold only as long as no more
         // than a handful of sessions happened to be simultaneously due.
         let due_ids = self.pop_due_ids(now, budget.max_actions);
+        let due_actions = due_ids.len();
         let due_remaining = self.has_due_remaining(now);
         self.fire_due_ids(due_ids, now);
-        let mut report = self.drain_ready_bounded(now, budget, out);
+        let remaining = OutputDrainBudget::new(
+            budget.max_actions.saturating_sub(due_actions),
+            budget.max_packets,
+            budget.max_bytes,
+        );
+        let mut report = self.drain_ready_bounded(now, remaining, out);
+        report.actions = report.actions.saturating_add(due_actions);
         // Only promote a report that otherwise claimed full completion --
         // never overwrite a status that already means "more work, come
         // back" (e.g. a future ready-drain outcome other than Drained),
@@ -1279,7 +1280,7 @@ impl CallerTable {
     /// event-ready queue is populated by packet, timer, and lifecycle paths,
     /// so an idle table does not require a population scan.
     pub fn poll_events(&mut self, out: &mut Vec<CallerEvent>) {
-        let _ = self.poll_events_bounded(usize::MAX, out);
+        let _ = self.poll_events_bounded(OutputDrainBudget::default().max_actions, out);
     }
 
     /// Drain at most `max_events` direct caller events. Returns `true` when
@@ -1480,6 +1481,11 @@ impl CallerTable {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.sessions.is_empty()
+    }
+
+    #[must_use]
+    pub fn max_callers(&self) -> usize {
+        self.max_callers
     }
 }
 
@@ -2111,6 +2117,37 @@ mod tests {
             .connect(Timestamp::default())
             .expect("caller starts handshake");
         connection
+    }
+
+    #[test]
+    fn caller_table_capacity_rejects_an_extra_logical_session() {
+        let mut callers = CallerTable::with_max_callers(1);
+        let peer = "127.0.0.1:11000".parse().expect("address");
+        callers
+            .add_direct(CallerLeg::new(
+                peer,
+                caller_connection(ConnectionOptions {
+                    socket_id: 101,
+                    ..ConnectionOptions::default()
+                }),
+            ))
+            .expect("first caller is admitted");
+        let error = callers
+            .add_direct(CallerLeg::new(
+                peer,
+                caller_connection(ConnectionOptions {
+                    socket_id: 102,
+                    ..ConnectionOptions::default()
+                }),
+            ))
+            .expect_err("the configured caller cap must reject the second session");
+        assert!(error.to_string().contains("capacity"));
+    }
+
+    #[test]
+    fn caller_table_clamps_adversarial_capacity() {
+        let callers = CallerTable::with_max_callers(usize::MAX);
+        assert_eq!(callers.max_callers(), MAX_CALLERS);
     }
 
     #[test]
