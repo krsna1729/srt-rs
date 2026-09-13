@@ -119,6 +119,12 @@ The open work is:
 4. keep the per-card status headings and the detailed progress ledger
    synchronized with executed acceptance commands.
 
+The bounded SRT-600 qualification tool now supplies the promotion gate
+mechanics: `cargo run -p srt-bench -- qualify plan` emits the fixed ten-scenario
+corpus and `qualify score BASE.tsv HEAD.tsv` checks correctness, noise and
+geometric resource ratios. It validates runner output; it does not invent
+product workload values or execute live traffic.
+
 ## 4. Rules for every implementation card
 
 1. Read current source, applicable AGENTS.md and the nearest tests. If `.codegraph/` exists, use CodeGraph first for symbols/call paths; never initialize an index as part of this work. Use `rg` for omitted details or repositories without an index.
@@ -1106,6 +1112,7 @@ A command filter can legitimately match zero tests. Read its reported executed c
 | Q-BENCH-HARNESS | `cargo test -p srt-bench --lib harness::` |
 | Q-BENCH-COMPARE | `cargo test -p srt-bench --lib compare::` |
 | Q-BENCH-MIO | `cargo test -p srt-bench --lib runtimes::mio::` — add the card's regression in that module if no matching coverage exists |
+| Q-BENCH-SRT600 | `cargo test -p srt-bench --lib qualification::`; generate the corpus with `cargo run -p srt-bench -- qualify plan` and score paired output with `qualify score BASE.tsv HEAD.tsv` |
 | Q-XTASK | `cargo test -p xtask` — add narrow parser/output regressions in existing modules where needed |
 | Q-FEATURE-TOKIO | `cargo check -p srt-transport --no-default-features --features tokio` |
 | Q-FEATURES | Run `cargo check -p srt-transport --no-default-features`, then the same command with one `--features` value at a time: `mio`, `tokio`, `smol`, `monoio`, `glommio`, `compio`; run matching native tests after each affected implementation |

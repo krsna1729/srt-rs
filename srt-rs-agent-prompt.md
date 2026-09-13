@@ -41,6 +41,8 @@ Work loop:
 - Never return a retryable rejection for already-admitted data. Core encryption/message admission must be accounted before adapting wrapper errors.
 - Bound generation, timer visits and delivery as well as socket output. Keep byte-budget progress and readiness continuation explicit.
 - Keep benchmark validity/attempt pairing/failure handling repaired before accepting performance conclusions.
+- Use the fixed SRT-600 corpus for promotion decisions: `cargo run -p srt-bench -- qualify plan` defines the ten scenarios and `qualify score BASE.tsv HEAD.tsv` enforces the correctness, noise and geometric resource gates. Keep the exhaustive matrix for diagnosis; do not optimize matrix size as a product goal.
+- Iterate from the accepted candidate: run the immutable qualification corpus, apply the hidden mutation set, accept only a Pareto improvement, then regenerate workload seeds and continue. If a required workload input or quiet host is unavailable, record qualification as blocked instead of inventing numbers.
 - Review the diff, update the ledger with exact checks/outcomes/skips, then continue to the next ready card.
 
 Efficiency and uncertainty:
