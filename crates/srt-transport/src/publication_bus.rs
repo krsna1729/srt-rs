@@ -5,7 +5,10 @@
 //! [`Subscription`] independently observes every item a [`Publisher`]
 //! publishes -- broadcast, not competing consumption. Retention is bounded
 //! by item count, total bytes, and age together; whichever bound is hit
-//! first evicts the oldest retained item next. A subscription that falls
+//! first evicts the oldest retained item next. Eviction work is quantized so
+//! one mutex operation cannot scan the whole ring; the hard process-local
+//! item/byte ceilings remain absolute while later operations finish an
+//! age-only cleanup. A subscription that falls
 //! behind the retention window is never silently fed stale or missing
 //! data: its next [`Subscription::try_recv`] reports exactly how many
 //! items it missed via [`RecvOutcome::Lagged`], then resumes from the
@@ -41,6 +44,11 @@ pub const MAX_PUBLICATION_ITEMS: usize = 1 << 20;
 /// Hard cap for retained publication bytes on one bus. The caller's
 /// `byte_len` accounting remains authoritative within this finite ceiling.
 pub const MAX_PUBLICATION_BYTES: usize = 1 << 30;
+/// Maximum number of retained entries one publish/receive operation may
+/// evict while holding the bus mutex. A later operation continues the
+/// bounded cleanup; the hard item/byte ceilings remain the absolute memory
+/// backstop even when a long-idle bus has many age-expired entries.
+pub const MAX_PUBLICATION_EVICTIONS_PER_OP: usize = 64;
 
 /// Lock the bus's inner state, recovering from poisoning rather than
 /// propagating it: every mutation this module makes while holding the
@@ -123,6 +131,7 @@ pub enum BusError {
     SequenceExhausted,
     SubscriptionIdExhausted,
     ByteCountOverflow,
+    ItemTooLarge,
     SubscriptionLimit,
 }
 
@@ -132,6 +141,7 @@ impl std::fmt::Display for BusError {
             Self::SequenceExhausted => write!(f, "publication sequence space exhausted"),
             Self::SubscriptionIdExhausted => write!(f, "subscription ID space exhausted"),
             Self::ByteCountOverflow => write!(f, "retained byte accounting overflow"),
+            Self::ItemTooLarge => write!(f, "publication item exceeds the retained byte ceiling"),
             Self::SubscriptionLimit => write!(f, "publication bus subscription limit reached"),
         }
     }
@@ -162,18 +172,22 @@ struct Inner<T> {
 }
 
 impl<T> Inner<T> {
-    /// Evict from the front until every retention bound holds. Returned
-    /// entries are dropped after the mutex is released, so an arbitrary
-    /// payload destructor cannot block every producer and subscriber.
-    fn enforce_retention(
+    /// Evict a bounded prefix from the front until the retention bounds hold
+    /// or this operation's work quantum is exhausted. Returned entries are
+    /// dropped after the mutex is released, so an arbitrary payload
+    /// destructor cannot block every producer and subscriber. A later
+    /// operation continues any remaining cleanup.
+    fn enforce_retention_bounded(
         &mut self,
         retain_items: usize,
         retain_bytes: usize,
         retain_age: Duration,
         now: Instant,
     ) -> Vec<Entry<T>> {
-        let mut evicted_entries = Vec::new();
-        while let Some(front) = self.ring.front() {
+        let mut evicted_entries = Vec::with_capacity(MAX_PUBLICATION_EVICTIONS_PER_OP);
+        while evicted_entries.len() < MAX_PUBLICATION_EVICTIONS_PER_OP
+            && let Some(front) = self.ring.front()
+        {
             let over_items = self.ring.len() > retain_items;
             let over_bytes = self.retained_bytes > retain_bytes;
             let over_age = now.saturating_duration_since(front.published_at) > retain_age;
@@ -258,7 +272,8 @@ impl<T> PublicationBus<T> {
     /// comes first. Count and byte limits are clamped to
     /// [`MAX_PUBLICATION_ITEMS`] and [`MAX_PUBLICATION_BYTES`]; use a large
     /// value when one dimension should be effectively inactive within those
-    /// hard process-local ceilings.
+    /// hard process-local ceilings. Retention cleanup runs in bounded
+    /// quanta; a later publish/receive completes a large age-only cleanup.
     #[must_use]
     pub fn new(
         retain_items: usize,
@@ -334,14 +349,35 @@ impl<T> PublicationBus<T> {
 }
 
 impl<T> Publisher<T> {
-    /// Publish one item, evicting whatever retention bounds now require.
+    /// Publish one item and perform one bounded retention cleanup pass.
     /// `byte_len` is the caller's own accounting of `item`'s size (this
     /// module has no way to measure an arbitrary `T` itself); pass `0` if
     /// byte-bounded retention is not meaningful for this bus's payload
     /// type. Returns the sequence number just assigned.
     pub fn publish(&self, item: T, byte_len: usize) -> Result<u64, BusError> {
+        if byte_len > MAX_PUBLICATION_BYTES {
+            return Err(BusError::ItemTooLarge);
+        }
         let now = Instant::now();
         let mut inner = lock(&self.bus.inner);
+        // Never let a single accepted item push the process-local hard byte
+        // ceiling above `MAX_PUBLICATION_BYTES`. If stale entries currently
+        // occupy the remaining headroom, make one bounded cleanup attempt;
+        // the caller can retry after another operation continues the drain.
+        let mut pre_evicted = Vec::new();
+        if inner.retained_bytes > MAX_PUBLICATION_BYTES.saturating_sub(byte_len) {
+            pre_evicted = inner.enforce_retention_bounded(
+                self.bus.retain_items,
+                self.bus.retain_bytes,
+                self.bus.retain_age,
+                now,
+            );
+            if inner.retained_bytes > MAX_PUBLICATION_BYTES.saturating_sub(byte_len) {
+                drop(inner);
+                drop(pre_evicted);
+                return Err(BusError::ItemTooLarge);
+            }
+        }
         let sequence = inner.next_sequence;
         let next_sequence = inner
             .next_sequence
@@ -359,13 +395,14 @@ impl<T> Publisher<T> {
             bytes: byte_len,
             item: Arc::new(item),
         });
-        let evicted = inner.enforce_retention(
+        let evicted = inner.enforce_retention_bounded(
             self.bus.retain_items,
             self.bus.retain_bytes,
             self.bus.retain_age,
             now,
         );
         drop(inner);
+        drop(pre_evicted);
         drop(evicted);
         Ok(sequence)
     }
@@ -384,7 +421,7 @@ impl<T> Subscription<T> {
     pub fn try_recv(&mut self) -> RecvOutcome<T> {
         let now = Instant::now();
         let mut inner = lock(&self.bus.inner);
-        let evicted = inner.enforce_retention(
+        let evicted = inner.enforce_retention_bounded(
             self.bus.retain_items,
             self.bus.retain_bytes,
             self.bus.retain_age,
@@ -801,6 +838,41 @@ mod tests {
             PublicationBus::<u8>::new(usize::MAX, usize::MAX, Duration::from_secs(60));
         assert_eq!(bus.retain_items, MAX_PUBLICATION_ITEMS);
         assert_eq!(bus.retain_bytes, MAX_PUBLICATION_BYTES);
+    }
+
+    #[test]
+    fn oversized_byte_claim_is_rejected_before_sequence_assignment() {
+        let (publisher, bus) = PublicationBus::<u8>::new(4, usize::MAX, Duration::from_secs(60));
+        assert!(matches!(
+            publisher.publish(1, MAX_PUBLICATION_BYTES + 1),
+            Err(BusError::ItemTooLarge)
+        ));
+        assert_eq!(bus.stats(), BusStats::default());
+    }
+
+    #[test]
+    fn stale_retention_cleanup_is_quantized_across_receives() {
+        let (publisher, bus) = PublicationBus::<u32>::new(1000, usize::MAX, Duration::from_secs(1));
+        let mut sub = bus.subscribe().expect("subscription");
+        for value in 0..100u32 {
+            publisher.publish(value, 4).expect("publish");
+        }
+        {
+            let mut inner = bus.inner.lock().unwrap();
+            let old = Instant::now() - Duration::from_secs(2);
+            for entry in &mut inner.ring {
+                entry.published_at = old;
+            }
+        }
+        let RecvOutcome::Lagged { skipped } = sub.try_recv() else {
+            panic!("expected the first bounded lag report");
+        };
+        assert_eq!(
+            skipped, MAX_PUBLICATION_EVICTIONS_PER_OP as u64,
+            "one receive may evict only the configured retention quantum"
+        );
+        assert_eq!(bus.stats().evicted, MAX_PUBLICATION_EVICTIONS_PER_OP as u64);
+        assert!(matches!(sub.try_recv(), RecvOutcome::Lagged { .. }));
     }
 
     #[test]

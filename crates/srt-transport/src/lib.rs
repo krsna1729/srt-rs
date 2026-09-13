@@ -161,8 +161,9 @@ pub use admission::{
 
 pub use handoff::{Handoff, WorkerMessage};
 pub use publication_bus::{
-    BusError, BusStats, MAX_PUBLICATION_BYTES, MAX_PUBLICATION_ITEMS, MAX_SUBSCRIPTIONS,
-    PublicationBus, Published, Publisher, RecvOutcome, Subscription,
+    BusError, BusStats, MAX_PUBLICATION_BYTES, MAX_PUBLICATION_EVICTIONS_PER_OP,
+    MAX_PUBLICATION_ITEMS, MAX_SUBSCRIPTIONS, PublicationBus, Published, Publisher, RecvOutcome,
+    Subscription,
 };
 
 // --- Public re-exports: telemetry ---
