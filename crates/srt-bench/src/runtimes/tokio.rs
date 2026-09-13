@@ -64,7 +64,7 @@ fn drain_recv(
     match tokio_transport::drain_readable(
         sock,
         batch,
-        RecvBudget::from_rounds(max_rounds),
+        RecvBudget::for_datagrams(max_rounds, batch.capacity()),
         |addr, data| {
             if let Some(peer) = addr {
                 on_datagram(peer, data);
@@ -234,7 +234,10 @@ async fn drive(
 
 fn drain_sender_packets(driver: &mut Conn, start: Instant, recv_rounds: usize) {
     let now = crate::now_ts(start);
-    let _ = driver.recv_nonblocking(now, RecvBudget::from_rounds(recv_rounds));
+    let _ = driver.recv_nonblocking(
+        now,
+        RecvBudget::for_datagrams(recv_rounds, RecvBatch::DEFAULT_CAPACITY),
+    );
 }
 
 fn handle_sender_events(
@@ -513,7 +516,10 @@ async fn receive_receiver_packets(
             _ = tokio::time::sleep(crate::MAX_WAIT) => {}
         }
         let now = crate::now_ts(start);
-        let _ = driver.recv_nonblocking(now, RecvBudget::from_rounds(recv_rounds));
+        let _ = driver.recv_nonblocking(
+            now,
+            RecvBudget::for_datagrams(recv_rounds, RecvBatch::DEFAULT_CAPACITY),
+        );
     }
     true
 }
@@ -1057,8 +1063,10 @@ async fn established_conn_task(mut driver: Conn, cfg: BenchConfig, start: Instan
         // unbounded loop here starves this connection's protocol timers
         // whenever its peer can outpace it.
         let t = crate::now_ts(start);
-        if let Ok(report) = driver.recv_nonblocking(t, RecvBudget::from_rounds(cfg.recv_rounds))
-            && report.datagrams > 0
+        if let Ok(report) = driver.recv_nonblocking(
+            t,
+            RecvBudget::for_datagrams(cfg.recv_rounds, RecvBatch::DEFAULT_CAPACITY),
+        ) && report.datagrams > 0
         {
             data_events += report.datagrams as u64;
             last_data_at = Instant::now();

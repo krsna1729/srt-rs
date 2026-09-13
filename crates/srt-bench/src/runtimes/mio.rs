@@ -28,8 +28,9 @@ const TIMER_TICK: Duration = Duration::from_millis(10);
 /// Drain one socket for admission, calling `on_datagram(peer, data)` for
 /// each queued datagram -- either batched (`recvmmsg`, one syscall for up
 /// to `RecvBatch::DEFAULT_CAPACITY` datagrams) or one `recv_from` syscall
-/// per datagram, per `BenchConfig::batching`. `recv_rounds` bounds the
-/// `recvmmsg` calls or `recv_from` calls offered by this visit. This is the
+/// per datagram, per `BenchConfig::batching`. `recv_rounds` is the finite
+/// datagram quantum offered by this visit; batching only changes syscall
+/// count. This is the
 /// axis `Batching`
 /// exists to let a run select: isolating whatever win (or lack of one)
 /// batched admission gives at a given fan-in level from every other
@@ -56,7 +57,7 @@ fn drain_admission(
             match srt_transport::drain_recv_fd(
                 listener.as_raw_fd(),
                 batch,
-                RecvBudget::from_rounds(recv_rounds),
+                RecvBudget::for_datagrams(recv_rounds, batch.capacity()),
                 |addr, data| {
                     if let Some(peer) = addr {
                         on_datagram(peer, data);

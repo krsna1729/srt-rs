@@ -213,6 +213,10 @@ const ASAN_TRANSPORT: Step = Step {
     env: &[
         ("RUSTFLAGS", "-Zsanitizer=address"),
         ("RUSTDOCFLAGS", "-Zsanitizer=address"),
+        (
+            "LSAN_OPTIONS",
+            "suppressions=.github/lsan-suppressions-srt-transport.txt",
+        ),
     ],
     tool: None,
     cwd: None,
@@ -385,7 +389,16 @@ fn execute(step: &Step) -> StepResult {
     let mut c = Command::new(step.cmd);
     c.args(step.args);
     for &(k, v) in step.env {
-        c.env(k, v);
+        if k == "LSAN_OPTIONS"
+            && let Some(relative) = v.strip_prefix("suppressions=")
+        {
+            let value = env::current_dir()
+                .map(|root| format!("suppressions={}", root.join(relative).display()))
+                .unwrap_or_else(|_| v.to_string());
+            c.env(k, value);
+        } else {
+            c.env(k, v);
+        }
     }
     if let Some(dir) = step.cwd {
         c.current_dir(dir);
