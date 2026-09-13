@@ -173,6 +173,20 @@ pub const PERIODIC_NAK_INTERVAL_MICROS: u64 = 20_000;
 /// keep the two in sync by eye if either changes.
 const MAX_RETRANSMITS_PER_VISIT: usize = 32;
 
+/// Hard fail-closed limits for protocol outputs retained by the sans-I/O
+/// core. The runtime normally drains these every pass; these limits protect
+/// direct users that keep feeding packets or firing timers without polling
+/// outputs.
+pub const MAX_OUTPUT_QUEUE_ACTIONS: usize = 8_192;
+pub const MAX_OUTPUT_QUEUE_BYTES: usize = 16 << 20;
+const OUTPUT_QUEUE_OVERFLOW_REASON: &str = "protocol output queue limit exceeded";
+/// Hard cap for lifecycle and application events retained by the sans-I/O
+/// core. DATA events are already limited by the negotiated delivery window;
+/// this extra headroom covers state/error notifications without allowing a
+/// reconnecting caller that never polls events to grow memory forever.
+pub const MAX_EVENT_QUEUE_ACTIONS: usize = MAX_FLOW_WINDOW as usize + 64;
+const EVENT_QUEUE_OVERFLOW_REASON: &str = "protocol event queue limit exceeded";
+
 /// A connection event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionEvent {
@@ -239,16 +253,18 @@ pub struct ConnectionOptions {
     pub tsbpd_delay: u16,
     /// SRT version.
     pub srt_version: u32,
-    /// Stream ID (the identifier the Caller sends to the Listener, up to 512 bytes).
+    /// Stream ID (the identifier the Caller sends to the Listener, capped at
+    /// 512 bytes at construction).
     pub stream_id: Option<String>,
     /// Congestion control mode name declared in the handshake extension
-    /// (e.g. "live", "file"). A real libsrt peer that declares a mode
-    /// itself refuses to transmit if the other side declares nothing at
-    /// all, assuming a live/file mismatch (confirmed by interop testing
-    /// against `srt-file-transmit`, which logs "peer DID NOT DECLARE
-    /// congctl" and disconnects without sending data). This crate's
-    /// receive/delivery path does not itself branch on the mode -- this
-    /// field only controls what gets declared and compared on the wire.
+    /// (e.g. "live", "file"), capped at 512 bytes at construction. A real
+    /// libsrt peer that declares a mode itself refuses to transmit if the
+    /// other side declares nothing at all, assuming a live/file mismatch
+    /// (confirmed by interop testing against `srt-file-transmit`, which logs
+    /// "peer DID NOT DECLARE congctl" and disconnects without sending data).
+    /// This crate's receive/delivery path does not itself branch on the mode
+    /// -- this field only controls what gets declared and compared on the
+    /// wire.
     pub congestion_control: String,
     /// Optional libsrt-compatible bonding group metadata.
     pub group_extension: Option<GroupExtensionData>,
@@ -418,13 +434,19 @@ pub struct SrtConnection {
     /// current refresh cycle. Reset after `provide_new_sek` starts that cycle.
     key_refresh_notified: bool,
     /// DATA events waiting for application consumption. Control/state events
-    /// are state-machine bounded; DATA is the unbounded-rate class.
+    /// are state-machine bounded; DATA arrival rate is unbounded but retained
+    /// events are capped by the configured delivery/receive windows.
     pending_data_events: u32,
     /// DATA packet positions retained by queued application events. This is
     /// distinct from the event count because one message can span many packets.
     pending_data_packets: u32,
-    /// Output queue.
+    /// Output queue, bounded by [`MAX_OUTPUT_QUEUE_ACTIONS`] and
+    /// [`MAX_OUTPUT_QUEUE_BYTES`]; overflow transitions the core to a
+    /// fail-closed disconnected state.
     output_queue: VecDeque<ConnectionOutput>,
+    output_queue_bytes: usize,
+    output_overflowed: bool,
+    event_overflowed: bool,
 
     /// Connection start time.
     start_time: Option<Timestamp>,
@@ -474,6 +496,14 @@ fn random_nonzero_socket_id() -> u32 {
     std::process::id() | 1
 }
 
+const MAX_HANDSHAKE_OPTION_BYTES: usize = 512;
+
+fn truncate_utf8(value: &mut String, max_bytes: usize) {
+    if value.len() > max_bytes {
+        value.truncate(value.floor_char_boundary(max_bytes));
+    }
+}
+
 fn normalize_buffer_options(mut options: ConnectionOptions) -> ConnectionOptions {
     if options.socket_id == 0 {
         options.socket_id = random_nonzero_socket_id();
@@ -489,6 +519,10 @@ fn normalize_buffer_options(mut options: ConnectionOptions) -> ConnectionOptions
         .delivery_queue_packets
         .max(1)
         .min(options.receive_buffer_packets);
+    if let Some(stream_id) = options.stream_id.as_mut() {
+        truncate_utf8(stream_id, MAX_HANDSHAKE_OPTION_BYTES);
+    }
+    truncate_utf8(&mut options.congestion_control, MAX_HANDSHAKE_OPTION_BYTES);
     options.ack_interval_micros = crate::clamp_ack_interval_micros(options.ack_interval_micros);
     options.light_ack_interval_packets =
         crate::clamp_light_ack_interval_packets(options.light_ack_interval_packets);
@@ -507,6 +541,77 @@ impl SrtConnection {
         Ok(buf)
     }
 
+    fn queue_output(&mut self, output: ConnectionOutput) {
+        if self.output_overflowed || self.event_overflowed {
+            return;
+        }
+        let bytes = match &output {
+            ConnectionOutput::SendPacket(packet) => packet.len(),
+            ConnectionOutput::SetTimer { .. } | ConnectionOutput::ClearTimer { .. } => 0,
+        };
+        if self.output_queue.len() >= MAX_OUTPUT_QUEUE_ACTIONS
+            || self.output_queue_bytes.saturating_add(bytes) > MAX_OUTPUT_QUEUE_BYTES
+        {
+            self.output_queue.clear();
+            self.output_queue_bytes = 0;
+            self.output_overflowed = true;
+            self.set_state(ConnectionState::Disconnected);
+            self.queue_event(ConnectionEvent::Error(
+                OUTPUT_QUEUE_OVERFLOW_REASON.to_string(),
+            ));
+            self.queue_event(ConnectionEvent::Disconnected {
+                reason: OUTPUT_QUEUE_OVERFLOW_REASON.to_string(),
+            });
+            return;
+        }
+        self.output_queue_bytes = self.output_queue_bytes.saturating_add(bytes);
+        self.output_queue.push_back(output);
+    }
+
+    fn check_output_queue(&self) -> Result<(), Error> {
+        if self.output_overflowed {
+            Err(Error::invalid_state(OUTPUT_QUEUE_OVERFLOW_REASON))
+        } else if self.event_overflowed {
+            Err(Error::invalid_state(EVENT_QUEUE_OVERFLOW_REASON))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn queue_event(&mut self, event: ConnectionEvent) {
+        if self.event_overflowed {
+            return;
+        }
+        if self.event_queue.len() < MAX_EVENT_QUEUE_ACTIONS {
+            self.event_queue.push_back(event);
+            return;
+        }
+
+        // Discarding unread DATA events must also release their receive-window
+        // reservations; otherwise a terminal connection would retain a fake
+        // application backlog until drop. The queue is cleared before the
+        // terminal diagnostics are installed, so this path remains bounded.
+        let mut dropped_packets = 0u32;
+        let mut dropped_events = 0u32;
+        while let Some(queued) = self.event_queue.pop_front() {
+            if let ConnectionEvent::DataReceived { packet_count, .. } = queued {
+                dropped_events = dropped_events.saturating_add(1);
+                dropped_packets = dropped_packets.saturating_add(packet_count);
+            }
+        }
+        self.pending_data_events = self.pending_data_events.saturating_sub(dropped_events);
+        self.pending_data_packets = self.pending_data_packets.saturating_sub(dropped_packets);
+        self.sync_application_backlog();
+        self.event_overflowed = true;
+        self.state = ConnectionState::Disconnected;
+        self.event_queue.push_back(ConnectionEvent::Error(
+            EVENT_QUEUE_OVERFLOW_REASON.to_string(),
+        ));
+        self.event_queue.push_back(ConnectionEvent::Disconnected {
+            reason: EVENT_QUEUE_OVERFLOW_REASON.to_string(),
+        });
+    }
+
     /// Put the handshake into its terminal failed state.
     ///
     /// Every path that abandons a handshake -- rejection, KM failure,
@@ -519,7 +624,7 @@ impl SrtConnection {
         self.handshake_started_at = None;
         self.handshake_state = HandshakeState::Failed;
         self.set_state(ConnectionState::Disconnected);
-        self.output_queue.push_back(ConnectionOutput::ClearTimer {
+        self.queue_output(ConnectionOutput::ClearTimer {
             id: TimerId::Handshake,
         });
         self.clear_config_secrets();
@@ -562,6 +667,9 @@ impl SrtConnection {
             pending_data_events: 0,
             pending_data_packets: 0,
             output_queue: VecDeque::new(),
+            output_queue_bytes: 0,
+            output_overflowed: false,
+            event_overflowed: false,
             start_time: None,
             last_ack_time: None,
             last_nak_time: None,
@@ -603,6 +711,9 @@ impl SrtConnection {
             pending_data_events: 0,
             pending_data_packets: 0,
             output_queue: VecDeque::new(),
+            output_queue_bytes: 0,
+            output_overflowed: false,
+            event_overflowed: false,
             start_time: None,
             last_ack_time: None,
             last_nak_time: None,
@@ -853,6 +964,7 @@ impl SrtConnection {
 
     /// Start the connection (Caller only).
     pub fn connect(&mut self, now: Timestamp) -> Result<(), Error> {
+        self.check_output_queue()?;
         if self.role != ConnectionRole::Caller {
             return Err(Error::invalid_state("only caller can initiate connection"));
         }
@@ -865,7 +977,7 @@ impl SrtConnection {
         self.handshake_state = HandshakeState::InductionSent;
         self.arm_handshake_timer(now);
 
-        Ok(())
+        self.check_output_queue()
     }
 
     /// Reject the pending listener handshake with an SRT rejection response.
@@ -884,7 +996,7 @@ impl SrtConnection {
         packet.encode(&mut bytes);
         self.queue_handshake_packet(bytes);
         self.terminate_handshake();
-        Ok(())
+        self.check_output_queue()
     }
 
     /// Initialize the send/receive buffers. Demand starts false: static
@@ -930,6 +1042,7 @@ impl SrtConnection {
 
     /// Process received data.
     pub fn feed_recv_buf(&mut self, buf: &[u8], now: Timestamp) -> Result<(), Error> {
+        self.check_output_queue()?;
         if buf.len() < SRT_HEADER_SIZE {
             return Err(Error::insufficient_buffer());
         }
@@ -964,13 +1077,15 @@ impl SrtConnection {
             self.last_recv_time = Some(now);
         }
 
-        match packet {
+        let result = match packet {
             SrtPacket::Data(data_pkt) => {
                 tracing::debug!("received DATA packet, seq={}", data_pkt.sequence_number);
                 self.handle_data_packet(data_pkt, now)
             }
             SrtPacket::Control(ctrl_pkt) => self.handle_control_packet(ctrl_pkt, now),
-        }
+        };
+        result?;
+        self.check_output_queue()
     }
 
     /// Whether there are packets needing retransmission.
@@ -1044,7 +1159,7 @@ impl SrtConnection {
         // card's actual charter, and lets the transport's own poll cadence
         // decide how fast the remainder actually goes out.
         if self.has_retransmit() {
-            self.output_queue.push_back(ConnectionOutput::SetTimer {
+            self.queue_output(ConnectionOutput::SetTimer {
                 id: TimerId::Retransmit,
                 duration_micros: 0,
             });
@@ -1069,12 +1184,12 @@ impl SrtConnection {
                         now.as_micros().saturating_sub(t.as_micros())
                     });
                     if elapsed >= INACTIVITY_TIMEOUT_MICROS {
-                        self.event_queue.push_back(ConnectionEvent::Disconnected {
+                        self.queue_event(ConnectionEvent::Disconnected {
                             reason: "inactivity timeout".to_string(),
                         });
                         self.set_state(ConnectionState::Disconnected);
                     } else {
-                        self.output_queue.push_back(ConnectionOutput::SetTimer {
+                        self.queue_output(ConnectionOutput::SetTimer {
                             id: TimerId::Inactivity,
                             duration_micros: INACTIVITY_TIMEOUT_MICROS - elapsed,
                         });
@@ -1083,7 +1198,7 @@ impl SrtConnection {
             }
             TimerId::Shutdown => self.handle_shutdown_timer(now),
         }
-        Ok(())
+        self.check_output_queue()
     }
 
     fn handle_handshake_timer(&mut self, now: Timestamp) {
@@ -1106,7 +1221,7 @@ impl SrtConnection {
             {
                 self.send_keepalive(now);
             }
-            self.output_queue.push_back(ConnectionOutput::SetTimer {
+            self.queue_output(ConnectionOutput::SetTimer {
                 id: TimerId::Keepalive,
                 duration_micros: KEEPALIVE_INTERVAL_MICROS,
             });
@@ -1144,7 +1259,7 @@ impl SrtConnection {
             }
         }
 
-        self.output_queue.push_back(ConnectionOutput::SetTimer {
+        self.queue_output(ConnectionOutput::SetTimer {
             id: TimerId::Ack,
             duration_micros: self.ack_timer_tick_micros(),
         });
@@ -1158,7 +1273,7 @@ impl SrtConnection {
                 .as_ref()
                 .map(|r| r.nak_interval())
                 .unwrap_or(PERIODIC_NAK_INTERVAL_MICROS);
-            self.output_queue.push_back(ConnectionOutput::SetTimer {
+            self.queue_output(ConnectionOutput::SetTimer {
                 id: TimerId::Nak,
                 duration_micros: interval,
             });
@@ -1174,7 +1289,7 @@ impl SrtConnection {
                 self.finish_local_close("shutdown timeout");
             } else {
                 self.send_shutdown(now);
-                self.output_queue.push_back(ConnectionOutput::SetTimer {
+                self.queue_output(ConnectionOutput::SetTimer {
                     id: TimerId::Shutdown,
                     duration_micros: SHUTDOWN_RETRY_INTERVAL_MICROS,
                 });
@@ -1184,6 +1299,7 @@ impl SrtConnection {
 
     /// Send data.
     pub fn send(&mut self, payload: &[u8], now: Timestamp) -> Result<(), Error> {
+        self.validate_send_request(payload.len(), None)?;
         self.send_internal(payload.to_vec(), None, now)
     }
 
@@ -1215,6 +1331,7 @@ impl SrtConnection {
         sequence_number: u32,
         now: Timestamp,
     ) -> Result<(), Error> {
+        self.validate_send_request(payload.len(), Some(sequence_number))?;
         self.send_internal(payload.to_vec(), Some(sequence_number), now)
     }
 
@@ -1257,7 +1374,7 @@ impl SrtConnection {
         }
 
         self.check_km_refresh(now);
-        Ok(())
+        self.check_output_queue()
     }
 
     fn send_internal(
@@ -1266,21 +1383,7 @@ impl SrtConnection {
         sequence_number: Option<u32>,
         now: Timestamp,
     ) -> Result<(), Error> {
-        if self.state != ConnectionState::Connected {
-            return Err(Error::invalid_state("not connected"));
-        }
-
-        if !self.can_send() {
-            return Err(Error::invalid_state("send buffer full"));
-        }
-
-        self.check_explicit_sequence(sequence_number)?;
-        self.check_can_encrypt()?;
-        if payload.len() > self.effective_max_payload_size() {
-            return Err(Error::invalid_state(
-                "payload exceeds the maximum single-packet size; use send_message to fragment it",
-            ));
-        }
+        self.validate_send_request(payload.len(), sequence_number)?;
 
         let timestamp = self.relative_timestamp(now);
         let peer_socket_id = self.peer_socket_id;
@@ -1322,6 +1425,27 @@ impl SrtConnection {
 
         self.check_km_refresh(now);
 
+        self.check_output_queue()
+    }
+
+    fn validate_send_request(
+        &self,
+        payload_len: usize,
+        sequence_number: Option<u32>,
+    ) -> Result<(), Error> {
+        if self.state != ConnectionState::Connected {
+            return Err(Error::invalid_state("not connected"));
+        }
+        if !self.can_send() {
+            return Err(Error::invalid_state("send buffer full"));
+        }
+        self.check_explicit_sequence(sequence_number)?;
+        self.check_can_encrypt()?;
+        if payload_len > self.effective_max_payload_size() {
+            return Err(Error::invalid_state(
+                "payload exceeds the maximum single-packet size; use send_message to fragment it",
+            ));
+        }
         Ok(())
     }
 
@@ -1383,7 +1507,7 @@ impl SrtConnection {
         }
 
         self.check_km_refresh(now);
-        Ok(())
+        self.check_output_queue()
     }
 
     /// Reject a caller-supplied explicit send sequence before it reaches the
@@ -1551,7 +1675,13 @@ impl SrtConnection {
 
     /// Get an output.
     pub fn poll_output(&mut self) -> Option<ConnectionOutput> {
-        self.output_queue.pop_front()
+        let output = self.output_queue.pop_front()?;
+        let bytes = match &output {
+            ConnectionOutput::SendPacket(packet) => packet.len(),
+            ConnectionOutput::SetTimer { .. } | ConnectionOutput::ClearTimer { .. } => 0,
+        };
+        self.output_queue_bytes = self.output_queue_bytes.saturating_sub(bytes);
+        Some(output)
     }
 
     /// Disconnect.
@@ -1565,7 +1695,7 @@ impl SrtConnection {
             self.enqueue_ready_data(now);
             self.send_shutdown(now);
             self.shutdown_started_at = Some(now);
-            self.output_queue.push_back(ConnectionOutput::SetTimer {
+            self.queue_output(ConnectionOutput::SetTimer {
                 id: TimerId::Shutdown,
                 duration_micros: SHUTDOWN_RETRY_INTERVAL_MICROS,
             });
@@ -1617,7 +1747,7 @@ impl SrtConnection {
         );
         self.send_km_request(&km_message, now);
 
-        Ok(())
+        self.check_output_queue()
     }
 
     /// Seed the encrypted-packet count for an accelerated key-refresh test.
@@ -1643,8 +1773,7 @@ impl SrtConnection {
     fn set_state(&mut self, new_state: ConnectionState) {
         if self.state != new_state {
             self.state = new_state;
-            self.event_queue
-                .push_back(ConnectionEvent::StateChanged(new_state));
+            self.queue_event(ConnectionEvent::StateChanged(new_state));
         }
     }
 
@@ -1680,7 +1809,7 @@ impl SrtConnection {
                 break;
             };
             if let Some(msg) = self.assembler.feed(packet, source_time) {
-                self.event_queue.push_back(ConnectionEvent::DataReceived {
+                self.queue_event(ConnectionEvent::DataReceived {
                     payload: msg.payload,
                     sequence_number: msg.first_sequence_number,
                     message_number: msg.message_number,
@@ -1688,6 +1817,9 @@ impl SrtConnection {
                     source_time: msg.source_time,
                     packet_count: msg.packet_count,
                 });
+                if self.event_overflowed {
+                    break;
+                }
                 self.pending_data_events = self.pending_data_events.saturating_add(1);
                 self.pending_data_packets =
                     self.pending_data_packets.saturating_add(msg.packet_count);
@@ -2003,12 +2135,12 @@ impl SrtConnection {
         let tsbpd_time_base = now.as_micros().saturating_sub(hsreq_timestamp as u64);
         self.init_buffers(now, hs.initial_packet_seq, tsbpd_time_base);
 
-        self.output_queue.push_back(ConnectionOutput::ClearTimer {
+        self.queue_output(ConnectionOutput::ClearTimer {
             id: TimerId::Handshake,
         });
         self.setup_connection_timers();
         self.clear_config_secrets();
-        self.event_queue.push_back(ConnectionEvent::Connected);
+        self.queue_event(ConnectionEvent::Connected);
         Ok(())
     }
 
@@ -2170,12 +2302,12 @@ impl SrtConnection {
 
         let tsbpd_time_base = now.as_micros().saturating_sub(hsreq_timestamp as u64);
         self.init_buffers(now, hs.initial_packet_seq, tsbpd_time_base);
-        self.output_queue.push_back(ConnectionOutput::ClearTimer {
+        self.queue_output(ConnectionOutput::ClearTimer {
             id: TimerId::Handshake,
         });
         self.setup_connection_timers();
         self.clear_config_secrets();
-        self.event_queue.push_back(ConnectionEvent::Connected);
+        self.queue_event(ConnectionEvent::Connected);
     }
 
     fn handle_ack(&mut self, pkt: ControlPacket, now: Timestamp) -> Result<(), Error> {
@@ -2282,6 +2414,13 @@ impl SrtConnection {
     }
 
     fn handle_shutdown(&mut self, now: Timestamp) -> Result<(), Error> {
+        // A peer may retransmit SHUTDOWN after it has already been
+        // acknowledged. Once terminal, ignore duplicates so an application
+        // that is not polling events cannot accumulate one Disconnected
+        // event per retransmission forever.
+        if self.state == ConnectionState::Disconnected {
+            return Ok(());
+        }
         // Flush the receive buffer before disconnecting (ignore TSBPD, deliver immediately).
         if let Some(receiver) = self.receiver.as_mut() {
             receiver.set_tsbpd_enabled(false);
@@ -2289,11 +2428,11 @@ impl SrtConnection {
         self.enqueue_ready_data(now);
 
         self.shutdown_started_at = None;
-        self.output_queue.push_back(ConnectionOutput::ClearTimer {
+        self.queue_output(ConnectionOutput::ClearTimer {
             id: TimerId::Shutdown,
         });
         self.set_state(ConnectionState::Disconnected);
-        self.event_queue.push_back(ConnectionEvent::Disconnected {
+        self.queue_event(ConnectionEvent::Disconnected {
             reason: "peer shutdown".to_string(),
         });
         Ok(())
@@ -2301,11 +2440,11 @@ impl SrtConnection {
 
     fn finish_local_close(&mut self, reason: &str) {
         self.shutdown_started_at = None;
-        self.output_queue.push_back(ConnectionOutput::ClearTimer {
+        self.queue_output(ConnectionOutput::ClearTimer {
             id: TimerId::Shutdown,
         });
         self.set_state(ConnectionState::Disconnected);
-        self.event_queue.push_back(ConnectionEvent::Disconnected {
+        self.queue_event(ConnectionEvent::Disconnected {
             reason: reason.to_owned(),
         });
     }
@@ -2396,10 +2535,9 @@ impl SrtConnection {
 
         if crypto.should_pre_announce() && !self.key_refresh_notified {
             // Notify the outside world that a new SEK is needed.
-            self.event_queue
-                .push_back(ConnectionEvent::KeyRefreshNeeded {
-                    key_length: crypto.key_length().len(),
-                });
+            self.queue_event(ConnectionEvent::KeyRefreshNeeded {
+                key_length: crypto.key_length().len(),
+            });
             self.key_refresh_notified = true;
         }
 
@@ -2483,28 +2621,28 @@ impl SrtConnection {
     /// Set up timers after the connection is established.
     fn setup_connection_timers(&mut self) {
         // Keepalive timer (1 second).
-        self.output_queue.push_back(ConnectionOutput::SetTimer {
+        self.queue_output(ConnectionOutput::SetTimer {
             id: TimerId::Keepalive,
             duration_micros: KEEPALIVE_INTERVAL_MICROS,
         });
 
         // ACK timer always ticks at COMM_SYN (10 ms) for TSBPD/TLPKTDROP.
         // Coalesced ACK only skips sendto on intermediate ticks.
-        self.output_queue.push_back(ConnectionOutput::SetTimer {
+        self.queue_output(ConnectionOutput::SetTimer {
             id: TimerId::Ack,
             duration_micros: self.ack_timer_tick_micros(),
         });
 
         if self.periodic_nak_enabled() {
             // NAK timer (initial value 20ms).
-            self.output_queue.push_back(ConnectionOutput::SetTimer {
+            self.queue_output(ConnectionOutput::SetTimer {
                 id: TimerId::Nak,
                 duration_micros: PERIODIC_NAK_INTERVAL_MICROS,
             });
         }
 
         // Inactivity timer (5 seconds).
-        self.output_queue.push_back(ConnectionOutput::SetTimer {
+        self.queue_output(ConnectionOutput::SetTimer {
             id: TimerId::Inactivity,
             duration_micros: INACTIVITY_TIMEOUT_MICROS,
         });
@@ -2585,26 +2723,20 @@ impl SrtConnection {
         debug_assert!(max_control_info_size >= MAX_NAK_RECORD_SIZE);
         let timestamp = self.relative_timestamp(now);
         let peer_socket_id = self.peer_socket_id;
-        let output_queue = &mut self.output_queue;
         let mut chunks = NakChunkEncoder::new(max_control_info_size);
-        let mut packets_sent = 0u32;
+        let mut packets = Vec::new();
         receiver.for_each_periodic_nak_range(|loss| {
             if let Some(control_info) = chunks.push(loss) {
-                output_queue.push_back(ConnectionOutput::SendPacket(encode_nak_packet(
-                    control_info,
-                    timestamp,
-                    peer_socket_id,
-                )));
-                packets_sent += 1;
+                packets.push(encode_nak_packet(control_info, timestamp, peer_socket_id));
             }
         });
         if let Some(control_info) = chunks.finish() {
-            output_queue.push_back(ConnectionOutput::SendPacket(encode_nak_packet(
-                control_info,
-                timestamp,
-                peer_socket_id,
-            )));
-            packets_sent += 1;
+            packets.push(encode_nak_packet(control_info, timestamp, peer_socket_id));
+        }
+
+        let packets_sent = packets.len() as u32;
+        for packet in packets {
+            self.queue_output(ConnectionOutput::SendPacket(packet));
         }
 
         if packets_sent != 0 {
@@ -2858,20 +2990,17 @@ impl SrtConnection {
 
     fn queue_handshake_packet(&mut self, packet: Vec<u8>) {
         self.last_handshake_packet = Some(packet.clone());
-        self.output_queue
-            .push_back(ConnectionOutput::SendPacket(packet));
+        self.queue_output(ConnectionOutput::SendPacket(packet));
     }
 
     fn queue_packet(&mut self, packet: Vec<u8>, now: Timestamp) {
         self.last_send_time = Some(now);
-        self.output_queue
-            .push_back(ConnectionOutput::SendPacket(packet));
+        self.queue_output(ConnectionOutput::SendPacket(packet));
     }
 
     fn retransmit_handshake(&mut self) {
         if let Some(packet) = self.last_handshake_packet.as_ref() {
-            self.output_queue
-                .push_back(ConnectionOutput::SendPacket(packet.clone()));
+            self.queue_output(ConnectionOutput::SendPacket(packet.clone()));
         }
     }
 
@@ -2884,8 +3013,7 @@ impl SrtConnection {
         if self.handshake_state == HandshakeState::Failed {
             return;
         }
-        self.event_queue
-            .push_back(ConnectionEvent::Error("handshake timeout".to_string()));
+        self.queue_event(ConnectionEvent::Error("handshake timeout".to_string()));
         self.terminate_handshake();
     }
 
@@ -2915,7 +3043,7 @@ impl SrtConnection {
                     .saturating_sub(now)
             })
             .unwrap_or(self.handshake_timeout_micros);
-        self.output_queue.push_back(ConnectionOutput::SetTimer {
+        self.queue_output(ConnectionOutput::SetTimer {
             id: TimerId::Handshake,
             duration_micros: interval.min(remaining),
         });
@@ -3151,6 +3279,51 @@ mod tests {
         let conn = SrtConnection::new_caller(ConnectionOptions::default());
         assert_eq!(conn.state(), ConnectionState::Disconnected);
         assert_eq!(conn.role, ConnectionRole::Caller);
+    }
+
+    #[test]
+    fn handshake_option_strings_are_bounded_at_construction() {
+        let conn = SrtConnection::new_caller(ConnectionOptions {
+            stream_id: Some("あ".repeat(200)),
+            congestion_control: "live-".to_owned() + &"x".repeat(600),
+            ..ConnectionOptions::default()
+        });
+
+        let stream_id = conn.options.stream_id.as_deref().expect("stream id");
+        assert_eq!(stream_id.len(), 510);
+        assert!(conn.options.congestion_control.len() <= MAX_HANDSHAKE_OPTION_BYTES);
+    }
+
+    #[test]
+    fn output_queue_overflow_fails_closed_and_stays_bounded() {
+        let mut conn = SrtConnection::new_caller(ConnectionOptions::default());
+        conn.connect(Timestamp::default()).expect("start handshake");
+
+        let mut overflow = false;
+        for _ in 0..=MAX_OUTPUT_QUEUE_ACTIONS {
+            if conn
+                .handle_timer(TimerId::Handshake, Timestamp::default())
+                .is_err()
+            {
+                overflow = true;
+                break;
+            }
+        }
+
+        assert!(overflow, "the finite output cap must fail closed");
+        assert!(conn.output_queue.len() <= MAX_OUTPUT_QUEUE_ACTIONS);
+        assert!(conn.output_queue_bytes <= MAX_OUTPUT_QUEUE_BYTES);
+        assert_eq!(conn.state(), ConnectionState::Disconnected);
+
+        let events_after_overflow = conn.event_queue.len();
+        for _ in 0..128 {
+            assert!(conn.connect(Timestamp::default()).is_err());
+        }
+        assert_eq!(
+            conn.event_queue.len(),
+            events_after_overflow,
+            "terminal output overflow must reject reconnects without growing events"
+        );
     }
 
     #[test]
@@ -3922,6 +4095,47 @@ mod tests {
         assert!(std::iter::from_fn(|| conn.poll_event()).any(
             |event| matches!(event, ConnectionEvent::Disconnected { reason } if reason == "shutdown timeout")
         ));
+    }
+
+    #[test]
+    fn duplicate_shutdowns_do_not_grow_terminal_event_queue() {
+        let mut conn = SrtConnection::new_listener(ConnectionOptions::default());
+        conn.set_state(ConnectionState::Connected);
+        conn.handle_shutdown(Timestamp::default())
+            .expect("first shutdown is accepted");
+        let events_after_first = conn.event_queue.len();
+
+        for _ in 0..100_000 {
+            conn.handle_shutdown(Timestamp::default())
+                .expect("duplicate shutdown is ignored");
+        }
+
+        assert_eq!(conn.state(), ConnectionState::Disconnected);
+        assert_eq!(conn.event_queue.len(), events_after_first);
+    }
+
+    #[test]
+    fn event_queue_overflow_fails_closed_and_stays_bounded() {
+        let mut conn = SrtConnection::new_caller(ConnectionOptions::default());
+        for _ in 0..=MAX_EVENT_QUEUE_ACTIONS {
+            conn.queue_event(ConnectionEvent::Error("synthetic".to_string()));
+        }
+
+        assert!(conn.event_overflowed);
+        assert_eq!(conn.state(), ConnectionState::Disconnected);
+        assert!(conn.event_queue.len() <= MAX_EVENT_QUEUE_ACTIONS);
+        assert!(
+            conn.connect(Timestamp::default())
+                .expect_err("event overflow is terminal")
+                .reason
+                .contains(EVENT_QUEUE_OVERFLOW_REASON)
+        );
+
+        let events_after_overflow = conn.event_queue.len();
+        for _ in 0..128 {
+            conn.queue_event(ConnectionEvent::Error("ignored".to_string()));
+        }
+        assert_eq!(conn.event_queue.len(), events_after_overflow);
     }
 
     #[test]

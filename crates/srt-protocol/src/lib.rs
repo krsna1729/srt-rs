@@ -25,11 +25,13 @@ pub use srt_connection::{
     ConnectionEvent, ConnectionOptions, ConnectionOutput, ConnectionRole, ConnectionState,
     DEFAULT_HANDSHAKE_RETRY_INTERVAL_MICROS, DEFAULT_HANDSHAKE_TIMEOUT_MICROS,
     FULL_ACK_CONTROL_INFO_BYTES, KEEPALIVE_INTERVAL_MICROS, LIBSRT_COMPAT_PADDING_BYTES,
-    LIGHT_ACK_CONTROL_INFO_BYTES, MIN_FLOW_WINDOW_PACKETS, NAK_RANGE_BYTES,
-    PERIODIC_NAK_INTERVAL_MICROS, SrtConnection, TimerId,
+    LIGHT_ACK_CONTROL_INFO_BYTES, MAX_EVENT_QUEUE_ACTIONS, MAX_OUTPUT_QUEUE_ACTIONS,
+    MAX_OUTPUT_QUEUE_BYTES, MIN_FLOW_WINDOW_PACKETS, NAK_RANGE_BYTES, PERIODIC_NAK_INTERVAL_MICROS,
+    SrtConnection, TimerId,
 };
 pub use srt_group::{
-    GroupEvent, GroupMemberState, GroupMode, GroupPacket, SrtGroup, SrtGroupMember,
+    GroupEvent, GroupMemberState, GroupMode, GroupPacket, MAX_GROUP_MEMBERS, SrtGroup,
+    SrtGroupMember,
 };
 pub use srt_handshake::peek_handshake;
 pub use srt_handshake::{
@@ -39,8 +41,8 @@ pub use srt_handshake::{
     extension_flags, srt_flags,
 };
 pub use srt_packet::{
-    ControlPacket, ControlType, DataHeader, DataPacket, PacketPosition, SRT_HEADER_SIZE, SrtPacket,
-    peek_destination_socket_id,
+    ControlPacket, ControlType, DataHeader, DataPacket, MAX_DATAGRAM_SIZE, PacketPosition,
+    SRT_HEADER_SIZE, SrtPacket, peek_destination_socket_id,
 };
 pub use srt_receiver::{
     ACK_INTERVAL_MICROS, AckPacket, DropRangeSummary, HIGH_FANIN_ACK_INTERVAL_MICROS,

@@ -7,6 +7,27 @@ fn ts(micros: u64) -> Timestamp {
     Timestamp::from_micros(micros)
 }
 
+#[test]
+fn group_member_limit_is_enforced() {
+    let mut group = SrtGroup::new(0x4000_0100, GroupMode::Broadcast).unwrap();
+    for member_id in 0..shiguredo_srt::MAX_GROUP_MEMBERS as u32 {
+        group
+            .add_member(
+                member_id,
+                1,
+                SrtConnection::new_caller(ConnectionOptions::default()),
+            )
+            .unwrap();
+    }
+    let result = group.add_member(
+        shiguredo_srt::MAX_GROUP_MEMBERS as u32,
+        1,
+        SrtConnection::new_caller(ConnectionOptions::default()),
+    );
+    assert!(result.is_err());
+    assert_eq!(group.members().len(), shiguredo_srt::MAX_GROUP_MEMBERS);
+}
+
 fn transfer(caller: &mut SrtConnection, listener: &mut SrtConnection, now: Timestamp) {
     while let Some(output) = caller.poll_output() {
         if let ConnectionOutput::SendPacket(packet) = output {

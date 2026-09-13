@@ -9,6 +9,10 @@ use bytes::Bytes;
 
 /// The minimum SRT packet header size (16 bytes).
 pub const SRT_HEADER_SIZE: usize = 16;
+/// Maximum datagram-sized input accepted by the codec. UDP cannot carry a
+/// larger payload, and keeping the same finite ceiling for direct callers
+/// prevents decode helpers from copying attacker-sized slices.
+pub const MAX_DATAGRAM_SIZE: usize = 65_536;
 
 /// Packet type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +48,9 @@ impl SrtPacket {
     #[track_caller]
     pub fn decode(buf: &[u8]) -> Result<Self, Error> {
         Error::check_buffer_size(SRT_HEADER_SIZE, buf)?;
+        if buf.len() > MAX_DATAGRAM_SIZE {
+            return Err(Error::invalid_data("SRT datagram exceeds maximum size"));
+        }
 
         let mut slice = buf;
         let first_word = read_u32(&mut slice)?;
@@ -470,6 +477,13 @@ mod tests {
             };
 
         assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn decode_rejects_oversized_datagram() {
+        let oversized = vec![0u8; MAX_DATAGRAM_SIZE + 1];
+        let error = SrtPacket::decode(&oversized).expect_err("codec input is capped");
+        assert_eq!(error.kind, crate::ErrorKind::InvalidData);
     }
 
     #[test]

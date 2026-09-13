@@ -22,7 +22,7 @@ use crate::buf::{
 };
 use crate::crypto::{KeyFlag, KeyLength};
 use crate::error::Error;
-use crate::srt_packet::{ControlPacket, ControlType};
+use crate::srt_packet::{ControlPacket, ControlType, MAX_DATAGRAM_SIZE, SRT_HEADER_SIZE};
 
 /// Handshake version.
 pub const HS_VERSION_4: u32 = 4;
@@ -377,6 +377,9 @@ impl HandshakePacket {
     pub fn decode(packet: &ControlPacket) -> Result<Self, Error> {
         if packet.control_type != ControlType::Handshake {
             return Err(Error::invalid_data("not a handshake packet"));
+        }
+        if packet.control_info.len() > MAX_DATAGRAM_SIZE.saturating_sub(SRT_HEADER_SIZE) {
+            return Err(Error::invalid_data("SRT datagram exceeds maximum size"));
         }
 
         let mut buf = packet.control_info.as_slice();
@@ -1134,6 +1137,20 @@ mod tests {
         assert_eq!(original.handshake_type, decoded.handshake_type);
         assert_eq!(original.socket_id, decoded.socket_id);
         assert_eq!(original.syn_cookie, decoded.syn_cookie);
+    }
+
+    #[test]
+    fn decode_rejects_oversized_control_info() {
+        let packet = ControlPacket {
+            control_type: ControlType::Handshake,
+            subtype: 0,
+            type_specific_info: 0,
+            timestamp: 0,
+            dest_socket_id: 0,
+            control_info: vec![0; MAX_DATAGRAM_SIZE],
+        };
+        let error = HandshakePacket::decode(&packet).expect_err("handshake input is capped");
+        assert_eq!(error.kind, crate::ErrorKind::InvalidData);
     }
 
     #[test]

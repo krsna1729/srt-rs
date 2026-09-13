@@ -565,14 +565,13 @@ impl SenderBuffer {
         if max_payload_size == 0 {
             return Vec::new();
         }
-        let chunks: Vec<&[u8]> = payload.chunks(max_payload_size).collect();
-        let total_chunks = chunks.len();
+        let total_chunks = payload.len().div_ceil(max_payload_size);
         if !self.can_send_message(total_chunks) {
             return Vec::new();
         }
         let mut results = Vec::with_capacity(total_chunks);
 
-        for (i, chunk) in chunks.into_iter().enumerate() {
+        for (i, chunk) in payload.chunks(max_payload_size).enumerate() {
             let position = match (i, total_chunks) {
                 (0, 1) => PacketPosition::Single,
                 (0, _) => PacketPosition::First,

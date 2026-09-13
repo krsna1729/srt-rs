@@ -1030,7 +1030,7 @@ impl ReceiverBuffer {
         tsbpd_time_base: u64,
         max_buffer_size: u32,
     ) -> Self {
-        let max_buffer_size = max_buffer_size.min(MAX_FLOW_WINDOW);
+        let max_buffer_size = max_buffer_size.clamp(1, MAX_FLOW_WINDOW);
         Self {
             packets: AdaptiveReceiverPacketWindow::new(max_buffer_size, 4),
             delivery_seq_hint: None,
@@ -2315,6 +2315,12 @@ mod tests {
         let start = Timestamp::from_micros(0);
         let buf = ReceiverBuffer::new(1000, 120, start, 0);
         assert_eq!(buf.expected_sequence(), 1000);
+    }
+
+    #[test]
+    fn zero_receive_window_is_clamped_to_one_slot() {
+        let buf = ReceiverBuffer::with_buffer_size(1000, 120, Timestamp::default(), 0, 0);
+        assert_eq!(buf.max_buffer_size, 1);
     }
 
     #[test]
