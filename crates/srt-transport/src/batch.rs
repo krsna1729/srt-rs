@@ -352,6 +352,61 @@ pub fn flush_destined(
     apply_send_result(packets, crate::sendmsg_batch(fd, packets))
 }
 
+pub(crate) fn destined_send_limit(
+    packets: &[(SocketAddr, Vec<u8>)],
+    budget: OutputDrainBudget,
+) -> usize {
+    let mut limit = packets.len().min(budget.max_actions);
+    if budget.max_packets != 0 {
+        limit = limit.min(budget.max_packets);
+    }
+    if budget.max_bytes == 0 {
+        return limit;
+    }
+    let mut bytes = 0usize;
+    let mut count = 0usize;
+    while count < limit {
+        let next = bytes.saturating_add(packets[count].1.len());
+        // Permit one oversized datagram so a packet larger than the
+        // remaining byte allowance cannot strand the queue forever.
+        if count > 0 && next > budget.max_bytes {
+            break;
+        }
+        bytes = next;
+        count += 1;
+    }
+    count
+}
+
+pub(crate) fn flush_destined_bounded(
+    fd: RawFd,
+    packets: &mut Vec<(SocketAddr, Vec<u8>)>,
+    budget: OutputDrainBudget,
+) -> io::Result<SendFlushReport> {
+    let limit = destined_send_limit(packets, budget);
+    if limit == 0 {
+        return Ok(SendFlushReport::default());
+    }
+    match crate::sendmsg_batch(fd, &packets[..limit]) {
+        Ok(sent) if sent <= limit => {
+            packets.drain(..sent);
+            Ok(SendFlushReport {
+                sent,
+                would_block: sent < limit,
+            })
+        }
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "sendmmsg reported more datagrams than supplied",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(SendFlushReport {
+            would_block: true,
+            ..SendFlushReport::default()
+        }),
+        Err(error) => Err(error),
+    }
+}
+
 fn collect_packet_batch(work: &mut VecDeque<ConnectionOutput>, first: Vec<u8>) -> Vec<Vec<u8>> {
     let mut batch = vec![first];
     while matches!(work.front(), Some(ConnectionOutput::SendPacket(_))) {
@@ -485,6 +540,26 @@ mod tests {
 
     fn pkt(value: u8) -> (SocketAddr, Vec<u8>) {
         (SocketAddr::from(([127, 0, 0, 1], 9000)), vec![value])
+    }
+
+    #[test]
+    fn destined_send_limit_honors_action_packet_and_byte_caps() {
+        let packets = vec![
+            (SocketAddr::from(([127, 0, 0, 1], 9000)), vec![0; 4]),
+            (SocketAddr::from(([127, 0, 0, 1], 9000)), vec![0; 4]),
+            (SocketAddr::from(([127, 0, 0, 1], 9000)), vec![0; 4]),
+        ];
+        assert_eq!(
+            destined_send_limit(&packets, OutputDrainBudget::new(2, 2, 5)),
+            1
+        );
+        assert_eq!(
+            destined_send_limit(&packets, OutputDrainBudget::new(0, 2, 5)),
+            0
+        );
+        let mut remaining = OutputDrainBudget::new(4, 1, 8);
+        remaining.consume(0, 1, 4);
+        assert_eq!(remaining.max_actions, 0);
     }
 
     fn ids(packets: &[(SocketAddr, Vec<u8>)]) -> Vec<u8> {

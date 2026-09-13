@@ -30,8 +30,8 @@ pub use srt_connection::{
     SrtConnection, TimerId,
 };
 pub use srt_group::{
-    GroupEvent, GroupMemberState, GroupMode, GroupPacket, MAX_GROUP_MEMBERS, SrtGroup,
-    SrtGroupMember,
+    GroupDataPoll, GroupEvent, GroupMemberState, GroupMode, GroupPacket, MAX_GROUP_MEMBERS,
+    SrtGroup, SrtGroupMember,
 };
 pub use srt_handshake::peek_handshake;
 pub use srt_handshake::{

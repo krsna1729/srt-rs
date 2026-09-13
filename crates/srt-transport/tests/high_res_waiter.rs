@@ -60,6 +60,28 @@ fn wait_returns_every_due_connection_after_one_park() {
 }
 
 #[test]
+fn wait_reports_and_drains_due_continuations_without_losing_deadlines() {
+    for backend in backends() {
+        let mut waiter = HighResWaiter::with_backend(backend).expect("waiter");
+        let now = MonotonicDeadline::now();
+        for key in 0..65u32 {
+            waiter.set_deadline(key, now);
+        }
+        let mut due = Vec::new();
+        let mut ready = Vec::new();
+        let first = waiter.wait(&mut due, &mut ready).expect("first wait");
+        assert_eq!(due.len(), 64);
+        assert!(first.due_remaining);
+        let second = waiter
+            .wait(&mut due, &mut ready)
+            .expect("continuation wait");
+        assert_eq!(due.len(), 1);
+        assert!(!second.due_remaining);
+        assert_eq!(waiter.deadline_len(), 0);
+    }
+}
+
+#[test]
 fn consumed_deadline_is_not_rearmed_so_the_next_wait_does_not_spin() {
     for backend in backends() {
         let mut waiter = HighResWaiter::with_backend(backend).expect("waiter");

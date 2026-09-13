@@ -2081,15 +2081,26 @@ impl PeerTable {
         idle_timeout: Duration,
         max_actions: usize,
     ) -> usize {
+        self.prune_idle_bounded_with_visits(now, idle_timeout, max_actions)
+            .0
+    }
+
+    pub(crate) fn prune_idle_bounded_with_visits(
+        &mut self,
+        now: Timestamp,
+        idle_timeout: Duration,
+        max_actions: usize,
+    ) -> (usize, usize) {
         if max_actions == 0 {
-            return 0;
+            return (0, 0);
         }
         let cutoff = Timestamp::from_micros(
             now.as_micros()
                 .saturating_sub(duration_micros_saturating(idle_timeout)),
         );
         let mut due = Vec::new();
-        self.idle_deadlines
+        let (visits, _) = self
+            .idle_deadlines
             .pop_due_bounded(cutoff, max_actions, &mut due);
         let mut count = 0;
         for physical in due {
@@ -2112,7 +2123,7 @@ impl PeerTable {
                 self.index_idle_peer(physical);
             }
         }
-        count
+        (count, visits)
     }
 
     /// Compatibility wrapper that drains every currently due idle key.
@@ -2239,6 +2250,15 @@ impl PeerTable {
         budget: OutputDrainBudget,
         out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
     ) -> OutputDrainReport {
+        self.poll_outbound_bounded_with_visits(now, budget, out).0
+    }
+
+    pub(crate) fn poll_outbound_bounded_with_visits(
+        &mut self,
+        now: Timestamp,
+        budget: OutputDrainBudget,
+        out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
+    ) -> (OutputDrainReport, usize) {
         self.last_now = now;
         out.clear();
         let mut rejected = Vec::new();
@@ -2268,7 +2288,7 @@ impl PeerTable {
         {
             report.status = OutputDrainStatus::BudgetExhausted;
         }
-        report
+        (report, visits)
     }
 
     fn mark_due_peers_bounded(&mut self, now: Timestamp, max_work: usize) -> (usize, bool) {

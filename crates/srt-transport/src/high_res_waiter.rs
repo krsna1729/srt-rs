@@ -136,6 +136,10 @@ pub struct WaitOutcome {
     pub backend: WaitBackend,
     pub planned: PlannedWait,
     pub due_count: usize,
+    /// True when the bounded due batch left another expired deadline in the
+    /// heap. Callers must run another immediate service pass before waiting
+    /// for a future deadline.
+    pub due_remaining: bool,
     pub ready_count: usize,
     /// Always 1: A2 parks once per `wait`, including the Immediate case.
     pub park_count: usize,
@@ -272,7 +276,8 @@ where
         self.heap.len()
     }
 
-    /// Park once, then fill `due` (every expired deadline) and `ready` fds.
+    /// Park once, then fill a bounded `due` batch and `ready` fds. Check
+    /// [`WaitOutcome::due_remaining`] before waiting again.
     pub fn wait(&mut self, due: &mut Vec<K>, ready: &mut Vec<K>) -> io::Result<WaitOutcome> {
         self.wait_with_idle(None, due, ready)
     }
@@ -291,6 +296,7 @@ where
                 backend: self.backend,
                 planned: PlannedWait::Immediate,
                 due_count: 0,
+                due_remaining: false,
                 ready_count: 0,
                 park_count: 0,
             });
@@ -302,11 +308,12 @@ where
         if let Some(timer) = self.timer.as_ref() {
             drain_timerfd(timer.as_raw_fd());
         }
-        let _ = self.heap.pop_due_bounded(MonotonicDeadline::now(), 64, due);
+        let (_, due_remaining) = self.heap.pop_due_bounded(MonotonicDeadline::now(), 64, due);
         Ok(WaitOutcome {
             backend: self.backend,
             planned,
             due_count: due.len(),
+            due_remaining,
             ready_count: ready.len(),
             park_count: 1,
         })

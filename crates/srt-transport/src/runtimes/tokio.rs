@@ -163,7 +163,8 @@ impl Conn {
     /// Publish this connection onto a worker waiter and arm its next deadline.
     ///
     /// Call from a worker thread (or `block_in_place`), not from a Tokio
-    /// timer. After [`HighResWaiter::wait`], service every due key. One
+    /// timer. After [`HighResWaiter::wait`], service the returned due batch
+    /// and repeat immediately while `WaitOutcome::due_remaining` is set. One
     /// packet per visit remains the contract; Route B is out of scope.
     pub fn schedule_on<K>(
         &self,
@@ -283,11 +284,12 @@ fn drain_readable_with_capacity(
 ) -> io::Result<RecvDrainReport> {
     let mut report = RecvDrainReport::default();
     let batch_capacity = batch_capacity.clamp(1, batch.capacity());
+    let mut dequeued = 0usize;
     for _ in 0..budget.max_rounds {
-        if report.datagrams >= budget.max_datagrams {
+        if dequeued >= budget.max_datagrams {
             break;
         }
-        let requested = (budget.max_datagrams - report.datagrams).min(batch_capacity);
+        let requested = (budget.max_datagrams - dequeued).min(batch_capacity);
         let result = sock.try_io(tokio::io::Interest::READABLE, || {
             match batch.recv(sock.as_raw_fd(), requested)? {
                 0 => Err(io::ErrorKind::WouldBlock.into()),
@@ -298,6 +300,7 @@ fn drain_readable_with_capacity(
             Ok(received) => {
                 report.syscalls += 1;
                 for (addr, data, truncated) in batch.iter(received) {
+                    dequeued += 1;
                     if truncated {
                         report.truncated += 1;
                         continue;
@@ -577,12 +580,26 @@ impl GroupConn {
     }
 
     pub fn poll_data(&mut self, now: Timestamp) -> Option<shiguredo_srt::GroupPacket> {
-        let packet = self.group.poll_data(now)?;
+        self.poll_data_bounded(now, shiguredo_srt::MAX_GROUP_MEMBERS)
+            .packet
+    }
+
+    /// Return the next deduplicated payload and whether another immediate
+    /// lifecycle-drain pass is required before waiting for new input.
+    pub fn poll_data_bounded(
+        &mut self,
+        now: Timestamp,
+        max_events: usize,
+    ) -> shiguredo_srt::GroupDataPoll {
+        let poll = self.group.poll_data_bounded(now, max_events);
+        let Some(packet) = poll.packet.as_ref() else {
+            return poll;
+        };
         self.logical_payloads_received = self.logical_payloads_received.saturating_add(1);
         self.logical_payload_bytes_received = self
             .logical_payload_bytes_received
             .saturating_add(packet.payload.len() as u64);
-        Some(packet)
+        poll
     }
 
     #[must_use]
@@ -736,19 +753,38 @@ fn mark_member_broken_if_new(group: &mut shiguredo_srt::SrtGroup, member_id: u32
 fn send_destined_ready(
     sock: &UdpSocket,
     outbound: &mut Vec<(SocketAddr, Vec<u8>)>,
+    budget: OutputDrainBudget,
 ) -> io::Result<crate::SendFlushReport> {
     if outbound.is_empty() {
         return Ok(crate::SendFlushReport::default());
     }
+    let limit = crate::destined_send_limit(outbound, budget);
+    if limit == 0 {
+        return Ok(crate::SendFlushReport::default());
+    }
     let result = sock.try_io(
         tokio::io::Interest::WRITABLE,
-        || match crate::sendmsg_batch(sock.as_raw_fd(), outbound)? {
-            0 if !outbound.is_empty() => Err(io::ErrorKind::WouldBlock.into()),
+        || match crate::sendmsg_batch(sock.as_raw_fd(), &outbound[..limit])? {
+            0 if limit != 0 => Err(io::ErrorKind::WouldBlock.into()),
             n => Ok(n),
         },
     );
-    match crate::apply_send_result(outbound, result) {
-        Ok(report) => Ok(report),
+    match result {
+        Ok(sent) if sent <= limit => {
+            outbound.drain(..sent);
+            Ok(crate::SendFlushReport {
+                sent,
+                would_block: sent < limit,
+            })
+        }
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "sendmmsg reported more datagrams than supplied",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(crate::SendFlushReport {
+            would_block: true,
+            ..crate::SendFlushReport::default()
+        }),
         Err(batch_error) => {
             if is_transient_send_error(&batch_error) {
                 return Ok(crate::SendFlushReport {
@@ -763,7 +799,7 @@ fn send_destined_ready(
             // keeps the suffix for the next writable wake.
             let mut report = crate::SendFlushReport::default();
             let mut completed = 0;
-            while completed < outbound.len() {
+            while completed < limit {
                 let (destination, packet) = &outbound[completed];
                 let result = sock.try_io(tokio::io::Interest::WRITABLE, || {
                     sock.try_send_to(packet, *destination)
@@ -830,60 +866,93 @@ fn side_output_budget(
 fn drive_listener_side(
     side: &mut OwnerListenerSide,
     now: Timestamp,
-    caller_budget: crate::OutputDrainBudget,
+    remaining: &mut crate::OutputDrainBudget,
     status: crate::OutputDrainStatus,
 ) -> io::Result<crate::OutputDrainStatus> {
-    let budget = side_output_budget(side.transport, caller_budget);
-    side.peers
-        .prune_idle_bounded(now, side.idle_timeout, budget.max_actions);
-    let poll_report = side.outbound.is_empty().then(|| {
+    let was_empty = side.outbound.is_empty();
+    let before_len = side.outbound.len();
+    let before_bytes: usize = side.outbound.iter().map(|(_, packet)| packet.len()).sum();
+    let budget = side_output_budget(side.transport, *remaining);
+    let (_, maintenance_visits) =
         side.peers
-            .poll_outbound_bounded(now, budget, &mut side.outbound)
+            .prune_idle_bounded_with_visits(now, side.idle_timeout, budget.max_actions);
+    remaining.consume(maintenance_visits, 0, 0);
+    let poll_report = side.outbound.is_empty().then(|| {
+        let budget = side_output_budget(side.transport, *remaining);
+        side.peers
+            .poll_outbound_bounded_with_visits(now, budget, &mut side.outbound)
     });
-    if let Some(report) = poll_report {
+    if let Some((report, visits)) = poll_report {
+        remaining.consume(visits, report.packets, report.bytes);
         side.output_pending = report.status == crate::OutputDrainStatus::BudgetExhausted;
     }
-    drive_side_output(
+    let flush_budget = poll_report
+        .map(|(report, _)| OutputDrainBudget::new(report.packets, report.packets, report.bytes))
+        .unwrap_or(*remaining);
+    let result = drive_side_output(
         &side.socket,
         &mut side.outbound,
         &mut side.write_blocked,
         status,
         poll_report,
-    )
+        flush_budget,
+    );
+    if !was_empty {
+        let after_bytes: usize = side.outbound.iter().map(|(_, packet)| packet.len()).sum();
+        let sent = before_len.saturating_sub(side.outbound.len());
+        remaining.consume(sent, sent, before_bytes.saturating_sub(after_bytes));
+    }
+    result
 }
 
 fn drive_caller_side(
     side: &mut OwnerCallerSide,
     expired_callers: &mut VecDeque<crate::LogicalCallerId>,
     now: Timestamp,
-    caller_budget: crate::OutputDrainBudget,
+    remaining: &mut crate::OutputDrainBudget,
     status: crate::OutputDrainStatus,
 ) -> io::Result<crate::OutputDrainStatus> {
-    let budget = side_output_budget(side.transport, caller_budget);
-    for id in side
+    let was_empty = side.outbound.is_empty();
+    let before_len = side.outbound.len();
+    let before_bytes: usize = side.outbound.iter().map(|(_, packet)| packet.len()).sum();
+    let budget = side_output_budget(side.transport, *remaining);
+    let (expired, maintenance_visits) = side
         .callers
-        .poll_expirations_bounded(now, budget.max_actions)
-    {
+        .poll_expirations_bounded_with_visits(now, budget.max_actions);
+    remaining.consume(maintenance_visits, 0, 0);
+    for id in expired {
         if expired_callers.len() == OWNER_MAINTENANCE_MAX_ACTIONS {
             expired_callers.pop_front();
         }
         expired_callers.push_back(id);
     }
     let poll_report = side.outbound.is_empty().then(|| {
+        let budget = side_output_budget(side.transport, *remaining);
         side.callers
             .table_mut()
-            .poll_outbound_bounded(now, budget, &mut side.outbound)
+            .poll_outbound_bounded_with_visits(now, budget, &mut side.outbound)
     });
-    if let Some(report) = poll_report {
+    if let Some((report, visits)) = poll_report {
+        remaining.consume(visits, report.packets, report.bytes);
         side.output_pending = report.status == crate::OutputDrainStatus::BudgetExhausted;
     }
-    drive_side_output(
+    let flush_budget = poll_report
+        .map(|(report, _)| OutputDrainBudget::new(report.packets, report.packets, report.bytes))
+        .unwrap_or(*remaining);
+    let result = drive_side_output(
         &side.socket,
         &mut side.outbound,
         &mut side.write_blocked,
         status,
         poll_report,
-    )
+        flush_budget,
+    );
+    if !was_empty {
+        let after_bytes: usize = side.outbound.iter().map(|(_, packet)| packet.len()).sum();
+        let sent = before_len.saturating_sub(side.outbound.len());
+        remaining.consume(sent, sent, before_bytes.saturating_sub(after_bytes));
+    }
+    result
 }
 
 /// Combine a side's output-drain report (if one was polled this tick, i.e.
@@ -896,17 +965,18 @@ fn drive_side_output(
     outbound: &mut Vec<(SocketAddr, Vec<u8>)>,
     write_blocked: &mut bool,
     mut status: crate::OutputDrainStatus,
-    poll_report: Option<crate::OutputDrainReport>,
+    poll_report: Option<(crate::OutputDrainReport, usize)>,
+    flush_budget: OutputDrainBudget,
 ) -> io::Result<crate::OutputDrainStatus> {
     status = match poll_report {
-        Some(report) => status.combine(report.status),
+        Some((report, _)) => status.combine(report.status),
         None => status.combine(if *write_blocked {
             crate::OutputDrainStatus::Backpressured
         } else {
             crate::OutputDrainStatus::BudgetExhausted
         }),
     };
-    match send_destined_ready(sock, outbound) {
+    match send_destined_ready(sock, outbound, flush_budget) {
         Ok(report) => {
             *write_blocked = report.would_block;
             if report.would_block {
@@ -1330,12 +1400,19 @@ impl Owner {
         caller_budget: crate::OutputDrainBudget,
     ) -> io::Result<crate::OutputDrainStatus> {
         let mut status = crate::OutputDrainStatus::Drained;
+        let mut remaining = caller_budget;
         if let Some(side) = self.listener.as_mut() {
-            status = drive_listener_side(side, now, caller_budget, status)?;
+            status = drive_listener_side(side, now, &mut remaining, status)?;
         }
         if let Some(side) = self.caller.as_mut() {
             status =
-                drive_caller_side(side, &mut self.expired_callers, now, caller_budget, status)?;
+                drive_caller_side(side, &mut self.expired_callers, now, &mut remaining, status)?;
+        }
+        if (caller_budget.max_actions > 0 && remaining.max_actions == 0)
+            || (caller_budget.max_packets > 0 && remaining.max_packets == 0)
+            || (caller_budget.max_bytes > 0 && remaining.max_bytes == 0)
+        {
+            status = status.combine(crate::OutputDrainStatus::BudgetExhausted);
         }
         Ok(status)
     }
@@ -5112,6 +5189,45 @@ mod tests {
                     "budget {max_datagrams}: every datagram delivered exactly once, in order"
                 );
             }
+        });
+    }
+
+    #[test]
+    fn drain_readable_counts_truncated_dequeues_against_the_recv_budget() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("Tokio runtime builds");
+        runtime.block_on(async {
+            let receiver = std::net::UdpSocket::bind("127.0.0.1:0").expect("receiver");
+            receiver.set_nonblocking(true).expect("nonblocking");
+            let dest = receiver.local_addr().expect("addr");
+            let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("sender");
+            sender
+                .send_to(&vec![0xA5; RecvBatch::DEFAULT_BUF_LEN + 1], dest)
+                .expect("oversized datagram");
+            sender
+                .send_to(b"complete", dest)
+                .expect("complete datagram");
+
+            let sock = UdpSocket::from_std(receiver).expect("tokio adopts");
+            sock.readable().await.expect("readable");
+            let mut batch = RecvBatch::new();
+            let mut delivered = Vec::new();
+            let first = drain_readable(&sock, &mut batch, RecvBudget::new(1, 1), |_, data| {
+                delivered.push(data.to_vec());
+            })
+            .expect("truncated drain");
+            assert_eq!(first.datagrams, 0);
+            assert_eq!(first.truncated, 1);
+            assert!(delivered.is_empty());
+
+            let second = drain_readable(&sock, &mut batch, RecvBudget::new(1, 1), |_, data| {
+                delivered.push(data.to_vec());
+            })
+            .expect("remaining drain");
+            assert_eq!(second.datagrams, 1);
+            assert_eq!(delivered, vec![b"complete".to_vec()]);
         });
     }
 

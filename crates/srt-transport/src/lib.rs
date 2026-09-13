@@ -126,11 +126,11 @@ pub use config::*;
 
 // --- Public re-exports: utilities ---
 
-pub(crate) use batch::drain_recv_fd_with_capacity;
 pub use batch::{
     BatchIoStats, RecvBatch, RecvBudget, RecvDrainReport, SendFlushReport, apply_send_result,
     drain_recv_fd, flush_destined,
 };
+pub(crate) use batch::{destined_send_limit, drain_recv_fd_with_capacity, flush_destined_bounded};
 pub use cpu::{available_cpus, current_cpu_spec, parse_cpu_spec, restrict_to_cpu_list};
 pub use deadline_heap::{DeadlineHeap, schedule_wait_micros};
 pub use due_index::DueIndex;
@@ -226,6 +226,25 @@ impl OutputDrainBudget {
             self.max_packets.min(other.max_packets),
             self.max_bytes.min(other.max_bytes),
         )
+    }
+
+    pub(crate) fn consume(&mut self, actions: usize, packets: usize, bytes: usize) {
+        self.max_actions = self.max_actions.saturating_sub(actions);
+        let packets_exhausted = self.max_packets != 0 && packets >= self.max_packets;
+        if self.max_packets != 0 {
+            self.max_packets = self.max_packets.saturating_sub(packets);
+        }
+        let bytes_exhausted = self.max_bytes != 0 && bytes >= self.max_bytes;
+        if self.max_bytes != 0 {
+            self.max_bytes = self.max_bytes.saturating_sub(bytes);
+        }
+        // The lower-level table helpers historically use zero packet/byte
+        // limits as "unlimited". Mark a finite packet/byte exhaustion by
+        // also closing the action allowance so it cannot be misread as an
+        // unlimited follow-up phase.
+        if packets_exhausted || bytes_exhausted {
+            self.max_actions = 0;
+        }
     }
 }
 

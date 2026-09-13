@@ -1058,16 +1058,28 @@ impl CallerTable {
         budget: OutputDrainBudget,
         out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
     ) -> OutputDrainReport {
+        self.poll_outbound_bounded_with_visits(now, budget, out).0
+    }
+
+    pub(crate) fn poll_outbound_bounded_with_visits(
+        &mut self,
+        now: Timestamp,
+        budget: OutputDrainBudget,
+        out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
+    ) -> (OutputDrainReport, usize) {
         out.clear();
         if budget.max_actions == 0 {
-            return OutputDrainReport {
-                status: if self.has_pending_output(now) {
-                    OutputDrainStatus::BudgetExhausted
-                } else {
-                    OutputDrainStatus::Drained
+            return (
+                OutputDrainReport {
+                    status: if self.has_pending_output(now) {
+                        OutputDrainStatus::BudgetExhausted
+                    } else {
+                        OutputDrainStatus::Drained
+                    },
+                    ..OutputDrainReport::default()
                 },
-                ..OutputDrainReport::default()
-            };
+                0,
+            );
         }
         // P02: cap how many due sessions get their timers fired this visit
         // too, not just how much ready-queue output gets drained -- an
@@ -1083,7 +1095,7 @@ impl CallerTable {
             budget.max_packets,
             budget.max_bytes,
         );
-        let mut report = self.drain_ready_bounded(now, remaining, out);
+        let (mut report, ready_visits) = self.drain_ready_bounded(now, remaining, out);
         report.actions = report.actions.saturating_add(due_actions);
         // Only promote a report that otherwise claimed full completion --
         // never overwrite a status that already means "more work, come
@@ -1092,7 +1104,7 @@ impl CallerTable {
         if due_remaining && report.status == OutputDrainStatus::Drained {
             report.status = OutputDrainStatus::BudgetExhausted;
         }
-        report
+        (report, due_actions.saturating_add(ready_visits))
     }
 
     fn drain_ready_bounded(
@@ -1100,7 +1112,7 @@ impl CallerTable {
         now: Timestamp,
         budget: OutputDrainBudget,
         out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
-    ) -> OutputDrainReport {
+    ) -> (OutputDrainReport, usize) {
         let mut report = OutputDrainReport::default();
         let mut sink = DrainSink {
             budget,
@@ -1149,7 +1161,7 @@ impl CallerTable {
         {
             report.status = OutputDrainStatus::BudgetExhausted;
         }
-        report
+        (report, visits)
     }
 
     /// Service one ready-queue visit -- split out of

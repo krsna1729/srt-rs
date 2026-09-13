@@ -308,7 +308,7 @@ impl CallerPool {
     /// Admit queued requests into whatever permits are currently free,
     /// each with its deadline starting now (not whenever it was
     /// originally requested).
-    fn admit_queued(&mut self, now: Timestamp, max_actions: usize) {
+    fn admit_queued(&mut self, now: Timestamp, max_actions: usize) -> usize {
         let mut actions = 0;
         while actions < max_actions && self.in_flight.len() < self.max_in_flight {
             let Some(QueuedConnect {
@@ -336,6 +336,7 @@ impl CallerPool {
                 }
             }
         }
+        actions
     }
 
     /// Retire every in-flight attempt that reached `attempt_deadline`
@@ -359,9 +360,18 @@ impl CallerPool {
         now: Timestamp,
         max_actions: usize,
     ) -> Vec<LogicalCallerId> {
+        self.poll_expirations_bounded_with_visits(now, max_actions)
+            .0
+    }
+
+    pub(crate) fn poll_expirations_bounded_with_visits(
+        &mut self,
+        now: Timestamp,
+        max_actions: usize,
+    ) -> (Vec<LogicalCallerId>, usize) {
         use shiguredo_srt::ConnectionState;
         if max_actions == 0 {
-            return Vec::new();
+            return (Vec::new(), 0);
         }
         let now_micros = now.as_micros();
         let candidates: Vec<PoolDeadline> =
@@ -409,11 +419,15 @@ impl CallerPool {
             }
         }
         self.expired = self.expired.saturating_add(expired.len() as u64);
-        self.admit_queued(now, max_actions.saturating_sub(candidate_actions));
-        expired
-            .into_iter()
-            .map(|candidate| candidate.caller_id)
-            .collect()
+        let admitted = self.admit_queued(now, max_actions.saturating_sub(candidate_actions));
+        let visits = candidate_actions.saturating_add(admitted);
+        (
+            expired
+                .into_iter()
+                .map(|candidate| candidate.caller_id)
+                .collect(),
+            visits,
+        )
     }
 
     /// Atomically retire one pooled attempt or established session,

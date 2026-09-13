@@ -74,6 +74,16 @@ pub struct GroupPacket {
     pub payload: Bytes,
 }
 
+/// Result of one bounded logical-data poll.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct GroupDataPoll {
+    /// The next deduplicated payload, if one was available within the visit.
+    pub packet: Option<GroupPacket>,
+    /// The visit reached its lifecycle-event limit. Call the bounded method
+    /// again immediately before waiting for new socket input.
+    pub continuation: bool,
+}
+
 /// One physical-leg event observed while driving an SRT group.
 ///
 /// Applications normally consume [`SrtGroup::poll_data`] for the logical,
@@ -419,18 +429,47 @@ impl SrtGroup {
     }
 
     /// Return the next deduplicated, in-order payload, discarding any
-    /// member-lifecycle events along the way. Applications that need those
-    /// events too should use [`Self::poll_event`] instead.
+    /// member-lifecycle events along the way. Applications that need to know
+    /// whether the bounded lifecycle drain left more work should use
+    /// [`Self::poll_data_bounded`] instead.
     pub fn poll_data(&mut self, now: Timestamp) -> Option<GroupPacket> {
-        for _ in 0..MAX_GROUP_MEMBERS {
-            match self.poll_event(now)? {
-                GroupEvent::DataReceived(packet) => return Some(packet),
+        self.poll_data_bounded(now, MAX_GROUP_MEMBERS).packet
+    }
+
+    /// Return the next deduplicated payload after at most `max_events`
+    /// lifecycle-event visits. The limit is clamped to [`MAX_GROUP_MEMBERS`]
+    /// so a caller cannot turn a single poll into an unbounded scan.
+    pub fn poll_data_bounded(&mut self, now: Timestamp, max_events: usize) -> GroupDataPoll {
+        let limit = max_events.min(MAX_GROUP_MEMBERS);
+        if limit == 0 {
+            return GroupDataPoll {
+                packet: None,
+                continuation: !self.events.is_empty() || !self.pending.is_empty(),
+            };
+        }
+        for _ in 0..limit {
+            let Some(event) = self.poll_event(now) else {
+                return GroupDataPoll {
+                    packet: None,
+                    continuation: false,
+                };
+            };
+            match event {
+                GroupEvent::DataReceived(packet) => {
+                    return GroupDataPoll {
+                        packet: Some(packet),
+                        continuation: false,
+                    };
+                }
                 GroupEvent::MemberConnected { .. }
                 | GroupEvent::MemberError { .. }
                 | GroupEvent::MemberDisconnected { .. } => {}
             }
         }
-        None
+        GroupDataPoll {
+            packet: None,
+            continuation: true,
+        }
     }
 
     /// Return the next member-lifecycle event or deduplicated group payload.
@@ -782,5 +821,28 @@ impl SrtGroup {
             return;
         };
         self.members[index].state = GroupMemberState::Active;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_data_poll_reports_lifecycle_continuation() {
+        let mut group = SrtGroup::new(SRTGROUP_MASK, GroupMode::Broadcast).unwrap();
+        for member_id in 0..=MAX_GROUP_MEMBERS as u32 {
+            group
+                .events
+                .push_back(GroupEvent::MemberConnected { member_id });
+        }
+
+        let first = group.poll_data_bounded(Timestamp::default(), MAX_GROUP_MEMBERS);
+        assert!(first.packet.is_none());
+        assert!(first.continuation);
+
+        let second = group.poll_data_bounded(Timestamp::default(), MAX_GROUP_MEMBERS);
+        assert!(second.packet.is_none());
+        assert!(!second.continuation);
     }
 }

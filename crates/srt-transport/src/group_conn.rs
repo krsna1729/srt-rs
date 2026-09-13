@@ -510,12 +510,26 @@ impl GroupConn {
 
     /// Return the next deduplicated, sequence-aligned group payload.
     pub fn poll_data(&mut self, now: Timestamp) -> Option<shiguredo_srt::GroupPacket> {
-        let packet = self.group.poll_data(now)?;
+        self.poll_data_bounded(now, shiguredo_srt::MAX_GROUP_MEMBERS)
+            .packet
+    }
+
+    /// Return the next deduplicated payload and whether another immediate
+    /// lifecycle-drain pass is required before waiting for new input.
+    pub fn poll_data_bounded(
+        &mut self,
+        now: Timestamp,
+        max_events: usize,
+    ) -> shiguredo_srt::GroupDataPoll {
+        let poll = self.group.poll_data_bounded(now, max_events);
+        let Some(packet) = poll.packet.as_ref() else {
+            return poll;
+        };
         self.logical_payloads_received = self.logical_payloads_received.saturating_add(1);
         self.logical_payload_bytes_received = self
             .logical_payload_bytes_received
             .saturating_add(packet.payload.len() as u64);
-        Some(packet)
+        poll
     }
 
     #[must_use]
