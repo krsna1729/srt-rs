@@ -288,12 +288,16 @@ pub fn read_measurements(path: &Path) -> Result<[Measurement; SCENARIO_COUNT], S
 
 fn read_bounded_text(path: &Path) -> Result<String, String> {
     let file = std::fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    if file
+    let metadata = file
         .metadata()
-        .map_err(|error| format!("{}: {error}", path.display()))?
-        .len()
-        > MAX_INPUT_BYTES
-    {
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "{}: qualification input must be a regular file",
+            path.display()
+        ));
+    }
+    if metadata.len() > MAX_INPUT_BYTES {
         return Err(format!(
             "{}: qualification input exceeds {MAX_INPUT_BYTES} bytes",
             path.display()
@@ -549,6 +553,17 @@ mod tests {
         let report = evaluate(baseline, candidate, QualificationPolicy::default()).expect("score");
         assert!(report.passed);
         assert!((report.score - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn measurement_reader_rejects_non_regular_inputs() {
+        let path =
+            std::env::temp_dir().join(format!("srt600-qualification-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir(&path).expect("temporary directory");
+        let error = read_measurements(&path).expect_err("directories are not measurements");
+        std::fs::remove_dir(&path).expect("temporary directory cleanup");
+        assert!(error.contains("regular file"));
     }
 
     #[test]
