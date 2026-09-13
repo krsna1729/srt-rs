@@ -1314,6 +1314,11 @@ pub enum FacadeError {
     /// The finite command, pending-send, or inbound application queue is
     /// full. Callers can retry after driving/consuming the affected session.
     QueueFull,
+    /// F03: this send was still waiting for its destination to accept it
+    /// (pacing/window not yet open) when it aged past this crate's pending-
+    /// send age bound and was dropped -- an explicit, per-destination
+    /// expiry, not a silent stall or an unbounded wait.
+    Expired,
     Build(crate::RuntimeBuildError),
     Protocol(shiguredo_srt::Error),
 }
@@ -1324,6 +1329,10 @@ impl std::fmt::Display for FacadeError {
             Self::DriverGone => write!(f, "the Facade driver task is no longer running"),
             Self::PoolFull => write!(f, "the caller pool is at max_in_flight capacity"),
             Self::QueueFull => write!(f, "the Facade queue is full"),
+            Self::Expired => write!(
+                f,
+                "this send aged out waiting for its destination to accept it"
+            ),
             Self::Build(error) => error.fmt(f),
             Self::Protocol(error) => error.fmt(f),
         }
@@ -1335,7 +1344,7 @@ impl std::error::Error for FacadeError {
         match self {
             Self::Build(error) => Some(error),
             Self::Protocol(error) => Some(error),
-            Self::DriverGone | Self::PoolFull | Self::QueueFull => None,
+            Self::DriverGone | Self::PoolFull | Self::QueueFull | Self::Expired => None,
         }
     }
 }
@@ -1360,6 +1369,21 @@ const SESSION_INBOUND_CAPACITY: usize = 1024;
 const SESSION_INBOUND_BYTES: usize = 8 * 1024 * 1024;
 const SESSION_PENDING_SENDS: usize = 1024;
 const SESSION_PENDING_BYTES: usize = 8 * 1024 * 1024;
+/// F03: an aggregate ceiling on top of each destination's own bound above
+/// -- the per-destination bound alone stops one destination from starving
+/// another's headroom, but this Facade's own total memory use still needs
+/// a backstop independent of how many destinations happen to be
+/// simultaneously backlogged (this project's target dimension is on the
+/// order of hundreds of destinations per shard, not thousands each maxed
+/// out at once).
+const FACADE_PENDING_SENDS_TOTAL: usize = 16 * 1024;
+const FACADE_PENDING_BYTES_TOTAL: usize = 64 * 1024 * 1024;
+/// F03: how long a send may wait in [`PendingSends`] for its destination's
+/// pacing/window to open before it is dropped as [`FacadeError::Expired`]
+/// -- an explicit bound so a destination that never recovers cannot hold
+/// unadmitted application data forever, distinct from (and enforced far
+/// earlier than) any protocol-level TLPKTDROP/ARQ retirement.
+const SESSION_PENDING_MAX_AGE: Duration = Duration::from_secs(5);
 const DRIVER_COMMAND_QUANTUM: usize = 32;
 
 struct CommandCharge {
@@ -1518,20 +1542,46 @@ impl SessionInbox {
 
 struct PendingSend {
     payload: Vec<u8>,
+    queued_at: Timestamp,
     reply: tokio::sync::oneshot::Sender<Result<(), FacadeError>>,
+}
+
+/// One destination's own backlog: `SESSION_PENDING_SENDS`/`_BYTES` are
+/// enforced against this queue alone (`items`/`bytes` below), never against
+/// every destination's combined total -- F03's "no shared owner awaits one
+/// destination's queue capacity": a single stalled destination filling its
+/// own bound must leave every other destination's own headroom untouched.
+#[derive(Default)]
+struct DestinationQueue {
+    items: VecDeque<PendingSend>,
+    bytes: usize,
 }
 
 #[derive(Default)]
 struct PendingSends {
-    by_target: std::collections::HashMap<SessionTarget, VecDeque<PendingSend>>,
-    items: usize,
-    bytes: usize,
+    by_target: std::collections::HashMap<SessionTarget, DestinationQueue>,
+    /// Combined totals across every destination -- kept in lockstep with
+    /// `by_target`'s own per-destination counts/bytes by every mutating
+    /// method below, so [`Self::has_capacity`] never has to re-sum the map.
+    total_items: usize,
+    total_bytes: usize,
+    /// Rotating start point for [`Self::drain_targets`] (F03): without it,
+    /// repeatedly taking the first `DRIVER_COMMAND_QUANTUM` keys in a
+    /// `HashMap`'s (call-to-call stable) iteration order would starve any
+    /// destination past that cut whenever more than `DRIVER_COMMAND_QUANTUM`
+    /// destinations are backlogged at once.
+    drain_cursor: usize,
 }
 
 impl PendingSends {
-    fn has_capacity(&self, payload_len: usize) -> bool {
-        self.items < SESSION_PENDING_SENDS
-            && self.bytes.saturating_add(payload_len) <= SESSION_PENDING_BYTES
+    fn has_capacity(&self, target: SessionTarget, payload_len: usize) -> bool {
+        let queue = self.by_target.get(&target);
+        let items = queue.map_or(0, |q| q.items.len());
+        let bytes = queue.map_or(0, |q| q.bytes);
+        items < SESSION_PENDING_SENDS
+            && bytes.saturating_add(payload_len) <= SESSION_PENDING_BYTES
+            && self.total_items < FACADE_PENDING_SENDS_TOTAL
+            && self.total_bytes.saturating_add(payload_len) <= FACADE_PENDING_BYTES_TOTAL
     }
 
     /// A target with anything already queued must stay queued: sending a
@@ -1542,39 +1592,60 @@ impl PendingSends {
         self.by_target.contains_key(&target)
     }
 
+    /// Checked via [`Self::has_capacity`] (both the per-destination and the
+    /// aggregate bound) before touching `by_target` at all, so a rejected
+    /// push never leaves a spurious empty [`DestinationQueue`] behind. Owns
+    /// `reply` outright and resolves it itself either way -- a caller never
+    /// needs a second `QueueFull` reply path of its own.
     fn push(
         &mut self,
         target: SessionTarget,
         payload: Vec<u8>,
+        queued_at: Timestamp,
         reply: tokio::sync::oneshot::Sender<Result<(), FacadeError>>,
-    ) -> Result<(), FacadeError> {
-        if self.items >= SESSION_PENDING_SENDS
-            || self.bytes.saturating_add(payload.len()) > SESSION_PENDING_BYTES
-        {
-            return Err(FacadeError::QueueFull);
+    ) {
+        if !self.has_capacity(target, payload.len()) {
+            let _ = reply.send(Err(FacadeError::QueueFull));
+            return;
         }
-        self.bytes = self.bytes.saturating_add(payload.len());
-        self.items += 1;
-        self.by_target
-            .entry(target)
-            .or_default()
-            .push_back(PendingSend { payload, reply });
-        Ok(())
+        let len = payload.len();
+        let queue = self.by_target.entry(target).or_default();
+        queue.bytes = queue.bytes.saturating_add(len);
+        queue.items.push_back(PendingSend {
+            payload,
+            queued_at,
+            reply,
+        });
+        self.total_items += 1;
+        self.total_bytes = self.total_bytes.saturating_add(len);
     }
 
     fn pop(&mut self, target: SessionTarget) -> Option<PendingSend> {
         let queue = self.by_target.get_mut(&target)?;
-        let pending = queue.pop_front()?;
-        self.items = self.items.saturating_sub(1);
-        self.bytes = self.bytes.saturating_sub(pending.payload.len());
-        if queue.is_empty() {
+        let pending = queue.items.pop_front()?;
+        queue.bytes = queue.bytes.saturating_sub(pending.payload.len());
+        if queue.items.is_empty() {
             self.by_target.remove(&target);
         }
+        self.total_items = self.total_items.saturating_sub(1);
+        self.total_bytes = self.total_bytes.saturating_sub(pending.payload.len());
         Some(pending)
     }
 
-    fn targets(&self) -> impl Iterator<Item = SessionTarget> + '_ {
-        self.by_target.keys().copied()
+    /// Up to `quantum` targets to service this tick, rotating the start
+    /// point each call (F03) so every backlogged destination eventually
+    /// gets a turn even when more than `quantum` are backlogged at once --
+    /// see `drain_cursor`'s own doc comment.
+    fn drain_targets(&mut self, quantum: usize) -> Vec<SessionTarget> {
+        let mut targets: Vec<SessionTarget> = self.by_target.keys().copied().collect();
+        if targets.is_empty() {
+            return targets;
+        }
+        let start = self.drain_cursor % targets.len();
+        targets.rotate_left(start);
+        targets.truncate(quantum);
+        self.drain_cursor = self.drain_cursor.wrapping_add(targets.len());
+        targets
     }
 
     fn fail_target(&mut self, target: SessionTarget) {
@@ -1583,6 +1654,34 @@ impl PendingSends {
                 .reply
                 .send(Err(FacadeError::Protocol(session_gone_error())));
         }
+    }
+
+    /// F03 checkpoint 2: drop (and report, via each send's own reply
+    /// channel) any complete unadmitted message that has waited longer
+    /// than `max_age` for its destination to accept it. Oldest-first per
+    /// destination (`items` is FIFO), so a destination that recovers mid-
+    /// scan keeps whatever is still fresh enough once its stale prefix is
+    /// gone.
+    fn expire_stale(&mut self, now: Timestamp, max_age: Duration) {
+        let max_age_us = u64::try_from(max_age.as_micros()).unwrap_or(u64::MAX);
+        let mut expired_items = 0usize;
+        let mut expired_bytes = 0usize;
+        self.by_target.retain(|_, queue| {
+            while let Some(front) = queue.items.front() {
+                let age_us = now.as_micros().saturating_sub(front.queued_at.as_micros());
+                if age_us <= max_age_us {
+                    break;
+                }
+                let expired = queue.items.pop_front().expect("front just checked Some");
+                queue.bytes = queue.bytes.saturating_sub(expired.payload.len());
+                expired_items += 1;
+                expired_bytes += expired.payload.len();
+                let _ = expired.reply.send(Err(FacadeError::Expired));
+            }
+            !queue.items.is_empty()
+        });
+        self.total_items = self.total_items.saturating_sub(expired_items);
+        self.total_bytes = self.total_bytes.saturating_sub(expired_bytes);
     }
 }
 
@@ -1852,14 +1951,12 @@ fn handle_send_command(
                 .is_some_and(|mut caller| caller.can_send_with_pacing(now)),
         };
     if !can_send {
-        if !pending_sends.has_capacity(payload.len()) {
-            // The queue owns no reply once this branch returns, so make
-            // backpressure explicit to this exact caller. `payload` is
-            // dropped with the failed command.
-            let _ = reply.send(Err(FacadeError::QueueFull));
-        } else {
-            let _ = pending_sends.push(target, payload, reply);
-        }
+        // `push` checks this target's own backlog and the Facade-wide
+        // aggregate (F03) and resolves `reply` itself either way -- a
+        // stalled destination can exhaust neither a different, healthy
+        // destination's own headroom nor drive the whole Facade past its
+        // shared safety ceiling.
+        pending_sends.push(target, payload, now, reply);
         return;
     }
     let result = match target {
@@ -1876,10 +1973,7 @@ fn handle_send_command(
 }
 
 fn drive_pending_sends(owner: &mut Owner, pending: &mut PendingSends, now: Timestamp) {
-    let targets = pending
-        .targets()
-        .take(DRIVER_COMMAND_QUANTUM)
-        .collect::<Vec<_>>();
+    let targets = pending.drain_targets(DRIVER_COMMAND_QUANTUM);
     for target in targets {
         let can_send = match target {
             SessionTarget::Listener(id) => owner
@@ -2126,6 +2220,10 @@ async fn run_driver(
         }
 
         drive_pending_sends(&mut owner, &mut pending_sends, now());
+        // F03 checkpoint 2: a destination that never reopens must not hold
+        // unadmitted sends forever -- drop anything past its age bound on
+        // every tick, same cadence as draining what did become sendable.
+        pending_sends.expire_stale(now(), SESSION_PENDING_MAX_AGE);
 
         // A4/course correction #9: an attempt CallerPool itself retired
         // for missing its `attempt_deadline` never produces a protocol
@@ -3287,6 +3385,247 @@ mod facade_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type TestReply = (
+        tokio::sync::oneshot::Sender<Result<(), FacadeError>>,
+        tokio::sync::oneshot::Receiver<Result<(), FacadeError>>,
+    );
+
+    fn test_reply() -> TestReply {
+        tokio::sync::oneshot::channel()
+    }
+
+    /// Pushes and asserts the send was actually queued (its reply is still
+    /// unresolved), not rejected as `QueueFull` -- `push` no longer returns
+    /// a `Result` since it resolves `reply` itself either way.
+    fn push_expect_queued(
+        pending: &mut PendingSends,
+        target: SessionTarget,
+        payload: Vec<u8>,
+        queued_at: Timestamp,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), FacadeError>> {
+        let (reply, mut rx) = test_reply();
+        pending.push(target, payload, queued_at, reply);
+        assert!(
+            rx.try_recv().is_err(),
+            "expected this push to be queued, not immediately rejected"
+        );
+        rx
+    }
+
+    /// F03: `PendingSends` previously enforced `SESSION_PENDING_SENDS`/
+    /// `_BYTES` against the combined total across every destination, not
+    /// each destination's own backlog -- despite the constant names (and
+    /// `SESSION_INBOUND_CAPACITY`'s existing genuinely-per-session
+    /// enforcement) implying a per-destination bound. A single stalled
+    /// destination filling that shared total made `has_capacity` return
+    /// `false` for a completely different, healthy destination too, i.e.
+    /// exactly the "shared owner awaits one destination's queue capacity"
+    /// anti-pattern this card's checkpoint 4 forbids. Reverting the
+    /// per-target queue back to a shared counter reproduces this: pushing
+    /// `SESSION_PENDING_SENDS` items to target A alone then makes this
+    /// assertion for target B fail. Covers both dimensions independently
+    /// (items and bytes), since a fix that only re-scoped one of the two
+    /// would still leave the other globally shared.
+    #[test]
+    fn one_destinations_backlog_does_not_consume_another_destinations_capacity() {
+        let mut pending = PendingSends::default();
+        let target_a = SessionTarget::Caller(crate::LogicalCallerId::for_test(0));
+        let target_b = SessionTarget::Caller(crate::LogicalCallerId::for_test(1));
+        let now = Timestamp::from_micros(0);
+
+        for _ in 0..SESSION_PENDING_SENDS {
+            push_expect_queued(&mut pending, target_a, vec![0u8; 4], now);
+        }
+        assert!(
+            !pending.has_capacity(target_a, 4),
+            "target A's own item-count bound must be reached"
+        );
+        assert!(
+            pending.has_capacity(target_b, 4),
+            "target B is untouched by A's item-count backlog and must still \
+             have its own full headroom"
+        );
+        push_expect_queued(&mut pending, target_b, vec![0u8; 4], now);
+
+        // Same isolation, the byte dimension: a fix that only re-scoped
+        // the item-count check would still leave bytes globally shared.
+        let mut pending = PendingSends::default();
+        push_expect_queued(
+            &mut pending,
+            target_a,
+            vec![0u8; SESSION_PENDING_BYTES],
+            now,
+        );
+        assert!(
+            !pending.has_capacity(target_a, 1),
+            "target A's own byte bound must be reached"
+        );
+        assert!(
+            pending.has_capacity(target_b, SESSION_PENDING_BYTES),
+            "target B's own byte headroom must be untouched by A's backlog"
+        );
+    }
+
+    /// F03: on top of each destination's own bound, an aggregate ceiling
+    /// (`FACADE_PENDING_SENDS_TOTAL`/`_BYTES_TOTAL`) still bounds this
+    /// Facade's total memory use regardless of how many destinations are
+    /// simultaneously backlogged -- re-scoping the bound to be
+    /// per-destination-only would otherwise let unlimited destinations
+    /// each holding their own full `SESSION_PENDING_SENDS` backlog grow
+    /// this Facade's memory without bound.
+    #[test]
+    fn an_aggregate_ceiling_still_bounds_total_memory_across_many_destinations() {
+        let mut pending = PendingSends::default();
+        let now = Timestamp::from_micros(0);
+        let mut id = 0u64;
+        while pending.total_items < FACADE_PENDING_SENDS_TOTAL {
+            let target = SessionTarget::Caller(crate::LogicalCallerId::for_test(id));
+            id += 1;
+            push_expect_queued(&mut pending, target, vec![0u8; 4], now);
+        }
+        let fresh_target = SessionTarget::Caller(crate::LogicalCallerId::for_test(id));
+        assert!(
+            !pending.has_capacity(fresh_target, 4),
+            "a brand-new destination with no backlog of its own must still be \
+             rejected once the Facade-wide aggregate ceiling is reached"
+        );
+        let (reply, mut rx) = test_reply();
+        pending.push(fresh_target, vec![0u8; 4], now, reply);
+        assert!(
+            matches!(rx.try_recv(), Ok(Err(FacadeError::QueueFull))),
+            "push must itself reply QueueFull, not silently drop the reply"
+        );
+    }
+
+    /// F03 checkpoint 2: a send that has waited longer than
+    /// `SESSION_PENDING_MAX_AGE` for its destination to accept it is
+    /// dropped and reported back via its own reply channel -- an explicit
+    /// expiry, not an unbounded wait. A fresher item for the same
+    /// destination, queued after the stale one, is untouched, and the
+    /// per-destination/aggregate byte accounting reflects the eviction
+    /// (not just the `VecDeque` contents) so a subsequent push isn't
+    /// wrongly rejected against inflated leftover byte counts.
+    #[test]
+    fn expire_stale_drops_only_what_has_aged_past_the_bound_and_reports_it() {
+        let mut pending = PendingSends::default();
+        let target = SessionTarget::Caller(crate::LogicalCallerId::for_test(0));
+        let queued_at = Timestamp::from_micros(0);
+
+        let mut stale_rx = push_expect_queued(&mut pending, target, b"stale".to_vec(), queued_at);
+        let fresh_at = Timestamp::from_micros(SESSION_PENDING_MAX_AGE.as_micros() as u64 - 1);
+        let mut fresh_rx = push_expect_queued(&mut pending, target, b"fresh".to_vec(), fresh_at);
+
+        let past_bound = Timestamp::from_micros(SESSION_PENDING_MAX_AGE.as_micros() as u64 + 1);
+        pending.expire_stale(past_bound, SESSION_PENDING_MAX_AGE);
+
+        let outcome = stale_rx.try_recv().expect("stale send got a reply");
+        assert!(
+            matches!(outcome, Err(FacadeError::Expired)),
+            "expected Expired, got {outcome:?}"
+        );
+        assert!(
+            fresh_rx.try_recv().is_err(),
+            "the fresher item must not have been expired or replied to yet"
+        );
+        assert_eq!(
+            pending.total_bytes,
+            b"fresh".len(),
+            "expiring the stale entry must decrement the tracked byte totals \
+             by exactly its own size, not leave them inflated"
+        );
+        assert!(
+            pending.has_capacity(target, SESSION_PENDING_BYTES - b"fresh".len()),
+            "the destination's own DestinationQueue byte count, not just the \
+             aggregate, must be decremented by exactly the expired item's \
+             size -- a leftover-inflated per-destination count would wrongly \
+             reject a push that should fit in what's actually now free"
+        );
+        let popped = pending.pop(target).expect("the fresh item is still queued");
+        assert_eq!(popped.payload, b"fresh");
+    }
+
+    /// F03: every item past the age bound is dropped in one pass, not just
+    /// the first -- and once a destination's entire backlog has expired,
+    /// it must stop being tracked at all (`has_pending` false), not linger
+    /// as an empty entry that would otherwise keep consuming a slot in
+    /// `drive_pending_sends`' every-tick service quantum for nothing.
+    #[test]
+    fn expire_stale_clears_every_stale_item_and_forgets_a_fully_expired_destination() {
+        let mut pending = PendingSends::default();
+        let target = SessionTarget::Caller(crate::LogicalCallerId::for_test(0));
+        let queued_at = Timestamp::from_micros(0);
+
+        let mut rx_a = push_expect_queued(&mut pending, target, b"a".to_vec(), queued_at);
+        let mut rx_b = push_expect_queued(&mut pending, target, b"b".to_vec(), queued_at);
+        let mut rx_c = push_expect_queued(&mut pending, target, b"c".to_vec(), queued_at);
+
+        let past_bound = Timestamp::from_micros(SESSION_PENDING_MAX_AGE.as_micros() as u64 + 1);
+        pending.expire_stale(past_bound, SESSION_PENDING_MAX_AGE);
+
+        for rx in [&mut rx_a, &mut rx_b, &mut rx_c] {
+            assert!(
+                matches!(rx.try_recv(), Ok(Err(FacadeError::Expired))),
+                "every stale item must be expired in one pass, not just the first"
+            );
+        }
+        assert!(
+            !pending.has_pending(target),
+            "a destination with nothing left after expiry must not still be tracked"
+        );
+        assert_eq!(pending.total_items, 0);
+        assert_eq!(pending.total_bytes, 0);
+    }
+
+    /// F03: an item exactly at the age bound is not yet expired -- `expire_stale`
+    /// drops items strictly older than `max_age`, not "at least as old as".
+    #[test]
+    fn an_item_exactly_at_the_age_bound_is_not_yet_expired() {
+        let mut pending = PendingSends::default();
+        let target = SessionTarget::Caller(crate::LogicalCallerId::for_test(0));
+        let queued_at = Timestamp::from_micros(0);
+        let mut rx = push_expect_queued(&mut pending, target, b"item".to_vec(), queued_at);
+
+        let exactly_at_bound = Timestamp::from_micros(SESSION_PENDING_MAX_AGE.as_micros() as u64);
+        pending.expire_stale(exactly_at_bound, SESSION_PENDING_MAX_AGE);
+
+        assert!(
+            rx.try_recv().is_err(),
+            "an item exactly at the age bound must not be expired yet"
+        );
+    }
+
+    /// F03: `drive_pending_sends`' every-tick service quantum
+    /// (`DRIVER_COMMAND_QUANTUM`) previously always took the same first N
+    /// targets in a `HashMap`'s (call-to-call stable) iteration order --
+    /// with more backlogged destinations than the quantum, any destination
+    /// past that cut was starved forever, not just delayed. `drain_targets`
+    /// must rotate its start point so repeated calls eventually cover
+    /// every destination, not the same prefix every time.
+    #[test]
+    fn drain_targets_rotates_so_every_destination_is_eventually_serviced() {
+        let mut pending = PendingSends::default();
+        let now = Timestamp::from_micros(0);
+        const DESTINATIONS: u64 = 100;
+        const QUANTUM: usize = 32;
+        for id in 0..DESTINATIONS {
+            let target = SessionTarget::Caller(crate::LogicalCallerId::for_test(id));
+            push_expect_queued(&mut pending, target, vec![0u8; 4], now);
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..(DESTINATIONS as usize).div_ceil(QUANTUM) + 2 {
+            for target in pending.drain_targets(QUANTUM) {
+                seen.insert(target);
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            DESTINATIONS as usize,
+            "every backlogged destination must be visited within a bounded \
+             number of ticks, not just the first {QUANTUM}"
+        );
+    }
 
     /// K02: a `Conn` built via [`caller`] must actually drive with its
     /// configured `TransportConfig::output_drain`, not silently substitute
