@@ -16,8 +16,13 @@ The runner must produce a bounded measurement file with this exact header and
 one row for each scenario:
 
 ```text
-scenario	offered	delivered	correctness_failures	cpu_ms	p99_lateness_us	rss_kb	syscalls
+scenario	workload_id	offered	offered_bytes	duration_ms	delivered	correctness_failures	cpu_ms	p99_lateness_us	rss_kb	syscalls
 ```
+
+`workload_id` is a nonzero stable identifier for the complete frozen contract
+(source rate and shape, runtime/topology, impairment, seed and repetitions).
+Baseline and candidate rows must use the same ID, offered packet/byte counts,
+and duration; rows with missing or zero resource metrics are rejected.
 
 Score a candidate against a known-good baseline:
 
@@ -29,8 +34,9 @@ The score is admissible only when every scenario has zero correctness failures
 and delivered/offered is at least 0.99. CPU time, p99 service lateness, RSS,
 and syscall count are compared by a geometric mean of baseline/candidate
 ratios. A candidate that regresses any metric by more than the configured noise
-budget (3% by default) fails the whole qualification. Optional production LOC
-penalty inputs are bounded and applied only after the correctness gate.
+budget (3% by default), or whose aggregate resource score is below 1, fails the
+whole qualification. Optional production LOC penalty inputs are bounded and
+applied only after the correctness gate.
 
 The corpus covers clean operation, 600-destination fan-out, loss/reorder,
 burst loss, encrypted key rotation, one slow consumer, connect churn, relay

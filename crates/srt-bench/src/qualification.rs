@@ -20,7 +20,10 @@ pub const PLAN_COLUMNS: &[&str] = &[
 ];
 pub const MEASUREMENT_COLUMNS: &[&str] = &[
     "scenario",
+    "workload_id",
     "offered",
+    "offered_bytes",
+    "duration_ms",
     "delivered",
     "correctness_failures",
     "cpu_ms",
@@ -178,7 +181,13 @@ pub const SCENARIOS: [ScenarioSpec; SCENARIO_COUNT] = [
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Measurement {
+    /// Stable digest/ID of the complete workload contract (rate, shape,
+    /// runtime, topology, seed and repetitions). Baseline and candidate must
+    /// carry the same ID before resource totals are compared.
+    pub workload_id: u64,
     pub offered: u64,
+    pub offered_bytes: u64,
+    pub duration_ms: u64,
     pub delivered: u64,
     pub correctness_failures: u64,
     pub cpu_ms: f64,
@@ -343,13 +352,16 @@ fn parse_measurement_line(
         )
     })?;
     let measurement = Measurement {
-        offered: parse_u64(fields[1], path, line_number)?,
-        delivered: parse_u64(fields[2], path, line_number)?,
-        correctness_failures: parse_u64(fields[3], path, line_number)?,
-        cpu_ms: parse_metric(fields[4], path, line_number)?,
-        p99_lateness_us: parse_metric(fields[5], path, line_number)?,
-        rss_kb: parse_metric(fields[6], path, line_number)?,
-        syscalls: parse_metric(fields[7], path, line_number)?,
+        workload_id: parse_u64(fields[1], path, line_number)?,
+        offered: parse_u64(fields[2], path, line_number)?,
+        offered_bytes: parse_u64(fields[3], path, line_number)?,
+        duration_ms: parse_u64(fields[4], path, line_number)?,
+        delivered: parse_u64(fields[5], path, line_number)?,
+        correctness_failures: parse_u64(fields[6], path, line_number)?,
+        cpu_ms: parse_metric(fields[7], path, line_number)?,
+        p99_lateness_us: parse_metric(fields[8], path, line_number)?,
+        rss_kb: parse_metric(fields[9], path, line_number)?,
+        syscalls: parse_metric(fields[10], path, line_number)?,
     };
     Ok(Some((scenario, measurement)))
 }
@@ -374,9 +386,9 @@ fn parse_metric(value: &str, path: &Path, line: usize) -> Result<f64, String> {
             value
         )
     })?;
-    if !metric.is_finite() || metric < 0.0 {
+    if !metric.is_finite() || metric <= 0.0 {
         return Err(format!(
-            "{}:{}: metric must be finite and non-negative",
+            "{}:{}: metric must be finite and positive",
             path.display(),
             line + 2
         ));
@@ -398,39 +410,16 @@ pub fn evaluate(
         reason: String::new(),
     });
     let mut all_passed = true;
-    for (index, _scenario) in Scenario::ALL.into_iter().enumerate() {
-        let base = baseline[index];
-        let head = candidate[index];
-        let base_ok = correctness_ok(base, policy.required_delivery_ratio);
-        let head_ok = correctness_ok(head, policy.required_delivery_ratio);
-        if !base_ok || !head_ok {
-            scenarios[index].reason = if !base_ok {
-                "baseline violates the correctness gate".into()
-            } else {
-                "candidate violates the correctness gate".into()
-            };
-            all_passed = false;
-            continue;
-        }
-        let ratios = [
-            metric_ratio(base.cpu_ms, head.cpu_ms),
-            metric_ratio(base.p99_lateness_us, head.p99_lateness_us),
-            metric_ratio(base.rss_kb, head.rss_kb),
-            metric_ratio(base.syscalls, head.syscalls),
-        ];
-        if ratios
-            .iter()
-            .any(|ratio| *ratio > 1.0 + policy.max_noise_ratio)
-        {
-            scenarios[index].reason = "candidate regresses beyond the noise budget".into();
-            all_passed = false;
-            continue;
-        }
-        let score = ratios.iter().map(|ratio| -ratio.ln()).sum::<f64>() / ratios.len() as f64;
-        scenarios[index].score = score.exp();
-        scenarios[index].passed = true;
-        scenarios[index].reason = "pass".into();
-        product_log += score;
+    for index in 0..SCENARIO_COUNT {
+        let (result, contribution) = evaluate_scenario(
+            Scenario::ALL[index],
+            baseline[index],
+            candidate[index],
+            policy,
+        );
+        all_passed &= result.passed;
+        product_log += contribution.unwrap_or(0.0);
+        scenarios[index] = result;
     }
     let penalty = (-policy.complexity_lambda * policy.production_loc_delta.max(0.0)).exp();
     let score = if all_passed {
@@ -445,8 +434,62 @@ pub fn evaluate(
     })
 }
 
+fn evaluate_scenario(
+    scenario: Scenario,
+    baseline: Measurement,
+    candidate: Measurement,
+    policy: QualificationPolicy,
+) -> (ScenarioResult, Option<f64>) {
+    let mut result = ScenarioResult {
+        scenario,
+        passed: false,
+        score: 0.0,
+        reason: String::new(),
+    };
+    if !same_workload(baseline, candidate) {
+        result.reason = "baseline and candidate use different workloads".into();
+        return (result, None);
+    }
+    let baseline_ok = correctness_ok(baseline, policy.required_delivery_ratio);
+    let candidate_ok = correctness_ok(candidate, policy.required_delivery_ratio);
+    if !baseline_ok || !candidate_ok {
+        result.reason = if !baseline_ok {
+            "baseline violates the correctness gate"
+        } else {
+            "candidate violates the correctness gate"
+        }
+        .into();
+        return (result, None);
+    }
+    let ratios = [
+        candidate.cpu_ms / baseline.cpu_ms,
+        candidate.p99_lateness_us / baseline.p99_lateness_us,
+        candidate.rss_kb / baseline.rss_kb,
+        candidate.syscalls / baseline.syscalls,
+    ];
+    if ratios
+        .iter()
+        .any(|ratio| *ratio > 1.0 + policy.max_noise_ratio)
+    {
+        result.reason = "candidate regresses beyond the noise budget".into();
+        return (result, None);
+    }
+    let log_score = ratios.iter().map(|ratio| -ratio.ln()).sum::<f64>() / ratios.len() as f64;
+    result.score = log_score.exp();
+    if result.score < 1.0 {
+        result.reason = "candidate is not a resource non-regression".into();
+        return (result, None);
+    }
+    result.passed = true;
+    result.reason = "pass".into();
+    (result, Some(log_score))
+}
+
 fn correctness_ok(measurement: Measurement, required_delivery_ratio: f64) -> bool {
-    measurement.offered > 0
+    measurement.workload_id > 0
+        && measurement.offered > 0
+        && measurement.offered_bytes > 0
+        && measurement.duration_ms > 0
         && measurement.delivered <= measurement.offered
         && measurement.correctness_failures == 0
         && (measurement.delivered as f64 / measurement.offered as f64) >= required_delivery_ratio
@@ -457,15 +500,14 @@ fn correctness_ok(measurement: Measurement, required_delivery_ratio: f64) -> boo
             measurement.syscalls,
         ]
         .iter()
-        .all(|metric| metric.is_finite() && *metric >= 0.0)
+        .all(|metric| metric.is_finite() && *metric > 0.0)
 }
 
-fn metric_ratio(baseline: f64, candidate: f64) -> f64 {
-    match (baseline, candidate) {
-        (0.0, 0.0) => 1.0,
-        (0.0, _) => f64::INFINITY,
-        _ => candidate / baseline,
-    }
+fn same_workload(baseline: Measurement, candidate: Measurement) -> bool {
+    baseline.workload_id == candidate.workload_id
+        && baseline.offered == candidate.offered
+        && baseline.offered_bytes == candidate.offered_bytes
+        && baseline.duration_ms == candidate.duration_ms
 }
 
 pub fn render_plan() -> String {
@@ -507,7 +549,10 @@ mod tests {
 
     fn measurement() -> Measurement {
         Measurement {
+            workload_id: 1,
             offered: 100,
+            offered_bytes: 131_600,
+            duration_ms: 1_000,
             delivered: 100,
             correctness_failures: 0,
             cpu_ms: 10.0,
@@ -538,6 +583,16 @@ mod tests {
         let report = evaluate(baseline, candidate, QualificationPolicy::default()).expect("score");
         assert!(!report.passed);
         assert_eq!(report.score, 0.0);
+
+        candidate = baseline;
+        for measurement in &mut candidate {
+            measurement.cpu_ms *= 1.02;
+            measurement.p99_lateness_us *= 1.02;
+            measurement.rss_kb *= 1.02;
+            measurement.syscalls *= 1.02;
+        }
+        let report = evaluate(baseline, candidate, QualificationPolicy::default()).expect("score");
+        assert!(!report.passed, "an aggregate resource regression must fail");
     }
 
     #[test]
@@ -567,16 +622,16 @@ mod tests {
     }
 
     #[test]
-    fn zero_resource_baselines_are_compared_without_hiding_regressions() {
-        let mut baseline = [measurement(); SCENARIO_COUNT];
+    fn mismatched_workloads_and_zero_metrics_fail_closed() {
+        let baseline = [measurement(); SCENARIO_COUNT];
         let mut candidate = baseline;
-        baseline[Scenario::Clean.index()].syscalls = 0.0;
-        candidate[Scenario::Clean.index()].syscalls = 1.0;
+        candidate[Scenario::Clean.index()].offered += 1;
         let report = evaluate(baseline, candidate, QualificationPolicy::default()).expect("score");
         assert!(!report.passed);
 
+        candidate = baseline;
         candidate[Scenario::Clean.index()].syscalls = 0.0;
         let report = evaluate(baseline, candidate, QualificationPolicy::default()).expect("score");
-        assert!(report.passed);
+        assert!(!report.passed);
     }
 }
