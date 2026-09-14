@@ -4,6 +4,7 @@
 //! data packets (0) from control packets (1).
 
 use crate::buf::{read_u32, write_bytes, write_u32};
+use crate::crypto_impl::{CipherMode, CryptoContext, GCM_TAG_LEN, TxCryptoStamp};
 use crate::error::Error;
 use bytes::Bytes;
 
@@ -332,7 +333,7 @@ impl DataPacket {
 /// `encryption_flag`, which is determined by the crypto layer after
 /// the header is created.  The payload travels separately as `Bytes`
 /// so the wire buffer can be built with a single payload copy.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DataHeader {
     pub sequence_number: u32,
     pub position: PacketPosition,
@@ -358,6 +359,12 @@ impl DataHeader {
         buf[12..16].copy_from_slice(&self.dest_socket_id.to_be_bytes());
     }
 
+    /// Write the 16-byte header into the prefix of a byte slice.
+    pub fn write_header_slice(&self, buf: &mut [u8], encryption_flag: u8) {
+        let mut hdr = [0u8; SRT_HEADER_SIZE];
+        self.write_header(&mut hdr, encryption_flag);
+        buf[..SRT_HEADER_SIZE].copy_from_slice(&hdr);
+    }
     /// Build the 16-byte GCM AAD (R bit forced to 0).
     pub fn gcm_aad(&self, encryption_flag: u8) -> [u8; 16] {
         let first_word = self.sequence_number & 0x7FFF_FFFF;
@@ -371,6 +378,123 @@ impl DataHeader {
         aad[8..12].copy_from_slice(&self.timestamp.to_be_bytes());
         aad[12..16].copy_from_slice(&self.dest_socket_id.to_be_bytes());
         aad
+    }
+}
+
+/// A pending outgoing DATA packet awaiting materialization into a caller-supplied buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingData {
+    pub header: DataHeader,
+    pub payload: Bytes,
+    pub crypto: Option<TxCryptoStamp>,
+}
+
+impl PendingData {
+    /// Create a new pending data packet.
+    #[must_use]
+    pub fn new(header: DataHeader, payload: Bytes, crypto: Option<TxCryptoStamp>) -> Self {
+        Self {
+            header,
+            payload,
+            crypto,
+        }
+    }
+
+    /// Exact wire length in bytes when serialized.
+    #[must_use]
+    pub fn wire_len(&self) -> usize {
+        let tag_len = match self.crypto {
+            Some(stamp) if stamp.cipher_mode == CipherMode::Gcm => GCM_TAG_LEN,
+            _ => 0,
+        };
+        SRT_HEADER_SIZE + self.payload.len() + tag_len
+    }
+
+    /// Encode and encrypt the packet directly into destination storage.
+    ///
+    /// The destination slice must be at least [`Self::wire_len`] bytes.
+    pub fn encode_into(
+        &self,
+        crypto: Option<&CryptoContext>,
+        dst: &mut [u8],
+    ) -> Result<usize, Error> {
+        let wire_len = self.wire_len();
+        if wire_len > MAX_DATAGRAM_SIZE {
+            return Err(Error::invalid_data("SRT datagram exceeds maximum size"));
+        }
+        Error::check_buffer_size(wire_len, dst)?;
+
+        match self.crypto {
+            None => {
+                self.header.write_header_slice(dst, 0);
+                dst[SRT_HEADER_SIZE..wire_len].copy_from_slice(&self.payload);
+                Ok(wire_len)
+            }
+            Some(stamp) => {
+                let crypto = crypto.ok_or_else(|| {
+                    Error::crypto_error("encrypted datagram but no crypto context provided")
+                })?;
+                let payload_len = self.payload.len();
+                let payload_end = SRT_HEADER_SIZE + payload_len;
+                match stamp.cipher_mode {
+                    CipherMode::Ctr => {
+                        dst[SRT_HEADER_SIZE..payload_end].copy_from_slice(&self.payload);
+                        crypto.encrypt_with_stamp(
+                            stamp,
+                            self.header.sequence_number,
+                            &mut dst[SRT_HEADER_SIZE..payload_end],
+                        )?;
+                        self.header
+                            .write_header_slice(dst, stamp.key_flag.to_kk_field());
+                        Ok(wire_len)
+                    }
+                    CipherMode::Gcm => {
+                        let enc_flag = stamp.key_flag.to_kk_field();
+                        self.header.write_header_slice(dst, enc_flag);
+                        let aad = self.header.gcm_aad(enc_flag);
+                        dst[SRT_HEADER_SIZE..payload_end].copy_from_slice(&self.payload);
+                        let tag = crypto.encrypt_gcm_with_stamp(
+                            stamp,
+                            self.header.sequence_number,
+                            &aad,
+                            &mut dst[SRT_HEADER_SIZE..payload_end],
+                        )?;
+                        dst[payload_end..wire_len].copy_from_slice(&tag);
+                        Ok(wire_len)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A pending outgoing datagram (data or control) awaiting materialization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingDatagram {
+    Data(PendingData),
+    Control(ControlPacket),
+}
+
+impl PendingDatagram {
+    /// Exact wire length in bytes.
+    #[must_use]
+    pub fn wire_len(&self) -> usize {
+        match self {
+            Self::Data(data) => data.wire_len(),
+            Self::Control(control) => control.encoded_size(),
+        }
+    }
+
+    /// Encode and encrypt the packet directly into destination storage.
+    pub fn encode_into(
+        &self,
+        crypto: Option<&CryptoContext>,
+        dst: &mut [u8],
+    ) -> Result<usize, Error> {
+        match self {
+            Self::Data(data) => data.encode_into(crypto, dst),
+            Self::Control(control) => control.encode_into(dst),
+        }
     }
 }
 

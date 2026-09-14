@@ -190,7 +190,7 @@ where
 /// relative delay. The worker turns that into an absolute
 /// [`MonotonicDeadline`] immediately before arming the waiter.
 #[must_use]
-#[cfg(any(feature = "mio", feature = "tokio"))]
+#[cfg(any(test, feature = "mio", feature = "tokio"))]
 pub fn schedule_wait_micros(pacing_us: u64, timer_us: u64) -> u64 {
     pacing_us.min(timer_us)
 }

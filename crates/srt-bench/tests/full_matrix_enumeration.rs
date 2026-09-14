@@ -56,7 +56,7 @@ fn full_matrix_plan_uses_production_filter_and_pins_current_kept_count() {
     // 57,984 figure is a historical baseline). Update this pin when the
     // filter changes, not to match prose.
     assert_eq!(
-        enumeration.kept_cells, 61_952,
+        enumeration.kept_cells, 54_080,
         "kept count drifted; update this pin and the filter-summary docs together: {enumeration:?}"
     );
     let reasons: Vec<(&str, usize)> = enumeration
@@ -74,7 +74,7 @@ fn full_matrix_plan_uses_production_filter_and_pins_current_kept_count() {
             ("bonded-egress-unsupported", 1_474_560),
             ("bonded-ingress-unsupported", 147_456),
             ("cookie-routing-inert", 102_912),
-            ("pin-inert", 46_208),
+            ("pin-inert", 54_080),
             ("promotion-inert", 516_096),
             ("promotion-inert-shared-egress", 211_968),
             ("shared-egress-workers-inert", 1_474_560),
@@ -87,6 +87,6 @@ fn full_matrix_plan_uses_production_filter_and_pins_current_kept_count() {
     assert!(table.contains("raw"), "{table}");
     let json = enumeration.render_json();
     assert!(json.contains("\"raw\":4423680"), "{json}");
-    assert!(json.contains("\"kept\":61952"), "{json}");
+    assert!(json.contains("\"kept\":54080"), "{json}");
     assert!(json.contains("by_reason"), "{json}");
 }

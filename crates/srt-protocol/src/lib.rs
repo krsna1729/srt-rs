@@ -48,7 +48,7 @@ pub mod handshake {
 /// Supported key-management and encryption protocol component APIs.
 pub mod crypto {
     pub use super::crypto_impl::{
-        CipherMode, CryptoContext, GCM_TAG_LEN, KeyFlag, KeyLength, KmRefreshState,
+        CipherMode, CryptoContext, GCM_TAG_LEN, KeyFlag, KeyLength, KmRefreshState, TxCryptoStamp,
     };
 }
 
@@ -57,7 +57,8 @@ pub mod crypto {
 pub mod wire {
     pub use super::srt_packet::{
         ControlPacket, ControlType, DataHeader, DataPacket, MAX_DATAGRAM_SIZE, PacketPosition,
-        PacketType, SRT_HEADER_SIZE, SrtPacket, peek_destination_socket_id,
+        PacketType, PendingData, PendingDatagram, SRT_HEADER_SIZE, SrtPacket,
+        peek_destination_socket_id,
     };
 }
 
@@ -81,8 +82,8 @@ pub use srt_connection::{
     DEFAULT_HANDSHAKE_RETRY_INTERVAL_MICROS, DEFAULT_HANDSHAKE_TIMEOUT_MICROS, DisconnectReason,
     FULL_ACK_CONTROL_INFO_BYTES, KEEPALIVE_INTERVAL_MICROS, LIBSRT_COMPAT_PADDING_BYTES,
     LIGHT_ACK_CONTROL_INFO_BYTES, MAX_EVENT_QUEUE_ACTIONS, MAX_OUTPUT_QUEUE_ACTIONS,
-    MAX_OUTPUT_QUEUE_BYTES, MIN_FLOW_WINDOW_PACKETS, NAK_RANGE_BYTES, PERIODIC_NAK_INTERVAL_MICROS,
-    SrtConnection, TimerId,
+    MAX_OUTPUT_QUEUE_BYTES, MIN_FLOW_WINDOW_PACKETS, NAK_RANGE_BYTES, OutputInto, OutputMeta,
+    PERIODIC_NAK_INTERVAL_MICROS, SrtConnection, TimerId,
 };
 pub use srt_group::{
     GroupDataPoll, GroupEvent, GroupMemberState, GroupMode, MAX_GROUP_MEMBERS, SrtGroup,

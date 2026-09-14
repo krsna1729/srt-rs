@@ -2730,7 +2730,7 @@ impl PeerTable {
     /// Returns, in `newly_connected`, the peers whose *first* `Connected`
     /// fired on this tick -- the moment a promotion decision is due.
     /// `stream_len` sets each one's stream deadline from now.
-    #[cfg(feature = "bench-internals")]
+    #[cfg(any(test, feature = "bench-internals"))]
     pub fn drain_events(
         &mut self,
         stream_len: Duration,
@@ -3062,7 +3062,7 @@ impl PeerTable {
     /// Vacuously true when empty, so an acceptor that never admitted
     /// anything still exits once its connect window closes.
     #[must_use]
-    #[cfg(feature = "bench-internals")]
+    #[cfg(any(test, feature = "bench-internals"))]
     pub fn all_terminal(
         &self,
         now: Instant,
