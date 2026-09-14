@@ -60,6 +60,7 @@ per-StreamID authorization and credential selection.
 ```rust
 use srt_lifecycle::wire::{handshake_identity, handshake_route,
                           group_extension_from_packet};
+use srt_lifecycle::{GroupAffinity, HandshakeIdentity};
 
 // Full identity: phase + StreamID + GROUP affinity
 let id: Option<HandshakeIdentity> = handshake_identity(&datagram);
