@@ -1,8 +1,8 @@
 # Production progress
-Guide version: 2026-09-14 / audit `a3e3f74` (bounded hardening and SRT-600 qualification follow)
+Guide version: 2026-09-14 / audit `9070795` (bounded hardening and SRT-600 qualification follow)
 Working repository: /home/dev/srt-rs
 Working branch: codex/bounded-correctness
-Implementation head reviewed by this ledger: `a3e3f74`
+Implementation head reviewed by this ledger: `9070795`
 Ledger update commit: see Git history
 Protected checkout: none — host idle at setup (only codegraph MCP server running); prior benchmark protection lifted by user authorization below
 Implementation authorization: user 2026-09-10 — "cleanup local. get latest origin/main. take a look at prompt and production guide md files placed. achieve it with a proper commits and PR strategy." Grouped local commits and pushing the working branch are authorized.
@@ -92,5 +92,6 @@ Unrelated changes to preserve:
 - The six runtime `Conn` adapters no longer expose a lossy `into_parts()` operation that could drop manual timers or pending datagrams. Custom owners must retain the prepared protocol/socket ownership before constructing an adapter.
 - `srt-protocol` semantic modules use explicit export lists, all workspace callers dogfood `sender`/`receiver`/`handshake`/`crypto`/`wire`/`group`, and the transitional low-level root aliases are removed. `srt-transport` has the same curated root/`advanced::*` split, with `advanced::handoff` as the supported home for `Handoff` and `WorkerMessage`.
 - `ConnectionEvent::Disconnected` carries typed `DisconnectReason` values, with `Display` preserving existing diagnostics and transport ordered-close checks no longer comparing strings. Packet types also expose allocation-neutral `encode_into` methods with unchanged-on-error buffer semantics.
-- The protocol package is now independently identified as `srt-proto` v0.1.0; its library import remains `srt_proto` for the explicit protocol namespace. The integrated `Vec<u8>` output contract is deliberately retained for this API freeze, with direct transactional output deferred until allocation measurements justify it.
+- The protocol package is now independently identified as `srt-proto` v0.1.0; its library import is `srt_proto` for the fork's explicit protocol namespace. The integrated `Vec<u8>` output contract is deliberately retained for this API freeze, with direct transactional output deferred until allocation measurements justify it.
+- `HighResWaiter` releases deadline-only keys immediately after they fire, so natural expiry cannot consume a capacity slot permanently; the capacity-reuse regression is covered by `fired_deadline_only_key_releases_capacity`.
 - The focused protocol, lifecycle, transport, workspace all-target compile, rustdoc (`-D warnings`), clippy (`-D warnings`), isolated `pbt` suite, stable/nightly fuzz builds, full `cargo xtask ci`, and `cargo xtask asan` checks pass after this follow-up. No performance claim is made; V00/V03 remain workload and host dependent.
