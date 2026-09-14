@@ -184,11 +184,6 @@ where
     pub fn is_empty(&self) -> bool {
         self.current.is_empty()
     }
-
-    #[must_use]
-    pub fn contains_key(&self, key: &K) -> bool {
-        self.current.contains_key(key)
-    }
 }
 
 /// Combine a connection's pacing wait and next protocol-timer wait into one

@@ -14,7 +14,7 @@
 //! > never live protocol, socket, clock, or runtime resources.**
 //!
 //! Time arrives as a parameter ([`is_terminal`]), never read from a
-//! clock. Wire bytes are decoded by `shiguredo_srt::peek_handshake` and
+//! clock. Wire bytes are decoded by `shiguredo_srt::handshake::peek_handshake` and
 //! only *interpreted* here. Anything holding a live `SrtConnection`, a
 //! timer store, or a file descriptor belongs in `srt-transport` --
 //! which is where the admission peer table lives, calling back into the
@@ -46,7 +46,7 @@ pub use terminal::*;
 #[cfg(test)]
 mod promotion_tests {
     use super::*;
-    use shiguredo_srt::GroupExtensionData;
+    use shiguredo_srt::handshake::{GroupExtensionData, GroupType};
 
     const MODES: [Promotion; 4] = [
         Promotion::Never,
@@ -61,7 +61,7 @@ mod promotion_tests {
             stream_id: None,
             extension: GroupExtensionData {
                 group_id,
-                group_type: shiguredo_srt::GroupType::Broadcast,
+                group_type: GroupType::Broadcast,
                 flags: 0,
                 weight: 0,
             },
@@ -301,7 +301,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
-    use shiguredo_srt::{GroupExtensionData, GroupType, SRTGROUP_MASK};
+    use shiguredo_srt::handshake::{GroupExtensionData, GroupType, SRTGROUP_MASK};
 
     #[test]
     fn is_terminal_never_connected_waits_for_connect_window() {
@@ -447,7 +447,7 @@ mod tests {
     #[test]
     fn conclusion_identity_exposes_stream_without_group_metadata() {
         let mut handshake =
-            shiguredo_srt::HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
+            shiguredo_srt::handshake::HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
         handshake.add_sid_extension("publish:camera");
         let mut packet = Vec::new();
         handshake
@@ -472,7 +472,7 @@ mod tests {
 mod proptests {
     use super::*;
     use proptest::prelude::*;
-    use shiguredo_srt::{GroupExtensionData, GroupType};
+    use shiguredo_srt::handshake::{GroupExtensionData, GroupType};
     use std::collections::{HashMap, HashSet};
 
     fn affinity(group_id: u8) -> GroupAffinity {

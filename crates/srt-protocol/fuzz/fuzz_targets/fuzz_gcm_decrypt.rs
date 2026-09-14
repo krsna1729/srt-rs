@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use shiguredo_srt::{CipherMode, CryptoContext, KeyLength};
+use shiguredo_srt::crypto::{CipherMode, CryptoContext, KeyLength};
 
 fuzz_target!(|data: &[u8]| {
     // Fuzz the GCM decrypt path with arbitrary ciphertext+tag payloads.

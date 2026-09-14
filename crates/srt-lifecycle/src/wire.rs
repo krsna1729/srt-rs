@@ -1,7 +1,7 @@
 //! Explicit byte-oriented compatibility helpers.
 
 use crate::identity::{GroupAffinity, HandshakeIdentity, handshake_identity_from_handshake};
-use shiguredo_srt::GroupExtensionData;
+use shiguredo_srt::handshake::{GroupExtensionData, peek_handshake};
 
 /// Extract the handshake phase and optional GROUP affinity from one datagram.
 #[must_use]
@@ -15,7 +15,7 @@ pub fn handshake_route(packet: &[u8]) -> Option<(bool, Option<GroupAffinity>)> {
 pub fn handshake_identity(packet: &[u8]) -> Option<HandshakeIdentity> {
     // Decoding is the codec crate's job; this function's business is
     // turning a handshake into routing identity.
-    let handshake = shiguredo_srt::peek_handshake(packet)?;
+    let handshake = peek_handshake(packet)?;
     Some(handshake_identity_from_handshake(&handshake))
 }
 

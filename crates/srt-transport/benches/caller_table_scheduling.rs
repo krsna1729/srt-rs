@@ -2,8 +2,9 @@ use std::hint::black_box;
 use std::net::SocketAddr;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use shiguredo_srt::{ConnectionOptions, ConnectionOutput, SRTGROUP_MASK, SrtConnection, Timestamp};
-use srt_transport::{CallerLeg, CallerTable};
+use shiguredo_srt::handshake::SRTGROUP_MASK;
+use shiguredo_srt::{ConnectionOptions, ConnectionOutput, SrtConnection, Timestamp};
+use srt_transport::advanced::caller::{CallerLeg, CallerTable, LogicalCallerId};
 
 fn make_peer(idx: usize) -> SocketAddr {
     SocketAddr::from((
@@ -42,7 +43,7 @@ fn new_connected_caller_connection(socket_id: u32) -> SrtConnection {
     caller
 }
 
-type TableFixture = (CallerTable, Vec<srt_transport::LogicalCallerId>);
+type TableFixture = (CallerTable, Vec<LogicalCallerId>);
 
 fn make_table(n: usize, base_now: Timestamp) -> TableFixture {
     let mut table = CallerTable::new();
@@ -86,7 +87,8 @@ fn bench_idle_poll(c: &mut Criterion) {
                     let (table, _ids) = fixture;
                     let mut out = Vec::new();
                     let now = Timestamp::from_micros(1_000_000);
-                    let budget = srt_transport::OutputDrainBudget::new(64, 32, 256 * 1024);
+                    let budget =
+                        srt_transport::advanced::driver::OutputDrainBudget::new(64, 32, 256 * 1024);
                     let report = table.poll_outbound_bounded(now, budget, &mut out);
                     black_box(report);
                     #[cfg(feature = "bench-internals")]
@@ -131,7 +133,8 @@ fn bench_one_ready(c: &mut Criterion) {
                     let (table, _ids) = fixture;
                     let mut out = Vec::new();
                     let now = Timestamp::from_micros(1_000_000);
-                    let budget = srt_transport::OutputDrainBudget::new(64, 32, 256 * 1024);
+                    let budget =
+                        srt_transport::advanced::driver::OutputDrainBudget::new(64, 32, 256 * 1024);
                     let report = table.poll_outbound_bounded(now, budget, &mut out);
                     black_box(report);
                     #[cfg(feature = "bench-internals")]
@@ -168,7 +171,8 @@ fn bench_one_due(c: &mut Criterion) {
                     let (table, _ids) = fixture;
                     let mut out = Vec::new();
                     let now = Timestamp::from_micros(1_000_000);
-                    let budget = srt_transport::OutputDrainBudget::new(64, 32, 256 * 1024);
+                    let budget =
+                        srt_transport::advanced::driver::OutputDrainBudget::new(64, 32, 256 * 1024);
                     let report = table.poll_outbound_bounded(now, budget, &mut out);
                     black_box(report);
                     #[cfg(feature = "bench-internals")]
@@ -209,7 +213,8 @@ fn bench_sparse_ready(c: &mut Criterion) {
                 |fixture| {
                     let (table, _ids) = fixture;
                     let mut out = Vec::new();
-                    let budget = srt_transport::OutputDrainBudget::new(64, 32, 256 * 1024);
+                    let budget =
+                        srt_transport::advanced::driver::OutputDrainBudget::new(64, 32, 256 * 1024);
                     let now = Timestamp::from_micros(1_000_000);
                     let report = table.poll_outbound_bounded(now, budget, &mut out);
                     black_box(report);
@@ -248,8 +253,11 @@ fn bench_all_ready(c: &mut Criterion) {
                     let (table, _ids) = fixture;
                     let mut out = Vec::new();
                     let now = Timestamp::from_micros(1_000_000);
-                    let budget =
-                        srt_transport::OutputDrainBudget::new(usize::MAX, usize::MAX, usize::MAX);
+                    let budget = srt_transport::advanced::driver::OutputDrainBudget::new(
+                        usize::MAX,
+                        usize::MAX,
+                        usize::MAX,
+                    );
                     let report = table.poll_outbound_bounded(now, budget, &mut out);
                     black_box(report);
                     out
@@ -272,7 +280,7 @@ fn bench_reschedule(c: &mut Criterion) {
                     let first_id = ids[0];
                     (table, first_id, now)
                 },
-                |state: &mut (CallerTable, srt_transport::LogicalCallerId, Timestamp)| {
+                |state: &mut (CallerTable, LogicalCallerId, Timestamp)| {
                     let mut now = state.2;
                     for i in 0..100 {
                         now = Timestamp::from_micros(now.as_micros() + 1000 + i);
@@ -341,7 +349,7 @@ fn bench_groups(c: &mut Criterion) {
                             let peer = make_peer(i * 10 + j);
                             let conn =
                                 new_connected_caller_connection(300000 + (i * 10 + j) as u32);
-                            srt_transport::CallerGroupLeg {
+                            srt_transport::advanced::caller::CallerGroupLeg {
                                 member_id: j as u32,
                                 weight: 1,
                                 peer,
@@ -370,7 +378,8 @@ fn bench_groups(c: &mut Criterion) {
                 },
                 |table| {
                     let mut out = Vec::new();
-                    let budget = srt_transport::OutputDrainBudget::new(64, 32, 256 * 1024);
+                    let budget =
+                        srt_transport::advanced::driver::OutputDrainBudget::new(64, 32, 256 * 1024);
                     let report =
                         table.poll_outbound_bounded(Timestamp::default(), budget, &mut out);
                     black_box(report);

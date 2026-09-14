@@ -1097,7 +1097,9 @@ impl KmError {
 /// rather than in whatever crate happens to be doing admission.
 #[must_use]
 pub fn peek_handshake(datagram: &[u8]) -> Option<HandshakePacket> {
-    let crate::SrtPacket::Control(control) = crate::SrtPacket::decode(datagram).ok()? else {
+    let crate::srt_packet::SrtPacket::Control(control) =
+        crate::srt_packet::SrtPacket::decode(datagram).ok()?
+    else {
         return None;
     };
     HandshakePacket::decode(&control).ok()

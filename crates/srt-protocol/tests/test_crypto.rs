@@ -25,7 +25,7 @@
 
 use cipher::{KeyIvInit, StreamCipher};
 use ctr::Ctr128BE;
-use shiguredo_srt::{CipherMode, CryptoContext, KeyLength};
+use shiguredo_srt::crypto::{CipherMode, CryptoContext, KeyLength};
 
 /// SRT 仕様の byte 配置に従ってカウンタブロック (AES-CTR の初期 IV) を構築する。
 ///

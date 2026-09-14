@@ -6,11 +6,12 @@
 use crate::{Aggregate, BenchConfig, BondMode, ConnStats};
 use mio::net::UdpSocket;
 use mio::{Events, Interest, Poll, Token};
-use shiguredo_srt::{ConnectionEvent, ConnectionOptions, GroupExtensionData, SrtConnection};
+use shiguredo_srt::handshake::GroupExtensionData;
+use shiguredo_srt::{ConnectionEvent, ConnectionOptions, SrtConnection};
+use srt_transport::advanced::driver::RecvBudget;
+use srt_transport::advanced::handoff::{Handoff, WorkerMessage};
+use srt_transport::advanced::native_io::{HighResWaiter, MonotonicDeadline, RecvBatch};
 use srt_transport::mio_transport::Conn;
-use srt_transport::{
-    Handoff, HighResWaiter, MonotonicDeadline, RecvBatch, RecvBudget, WorkerMessage,
-};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
@@ -54,7 +55,7 @@ fn drain_admission(
     }
     match batching {
         crate::Batching::On => {
-            match srt_transport::drain_recv_fd(
+            match srt_transport::advanced::native_io::drain_recv_fd(
                 listener.as_raw_fd(),
                 batch,
                 RecvBudget::for_datagrams(recv_rounds, batch.capacity()),
@@ -160,7 +161,8 @@ fn spawn_driver(
         }
         crate::Mode::Receiver => UdpSocket::bind(addr).expect("bind"),
     };
-    let _ = srt_transport::set_sock_bufs(socket.as_raw_fd(), cfg.sock_buf_bytes);
+    let _ =
+        srt_transport::advanced::platform::set_sock_bufs(socket.as_raw_fd(), cfg.sock_buf_bytes);
     poll.registry()
         .register(&mut socket, Token(token), Interest::READABLE)
         .expect("register socket");
@@ -368,7 +370,8 @@ fn spawn_driver_a2(
         s.connect(addr).expect("connect");
         s
     };
-    let _ = srt_transport::set_sock_bufs(socket.as_raw_fd(), cfg.sock_buf_bytes);
+    let _ =
+        srt_transport::advanced::platform::set_sock_bufs(socket.as_raw_fd(), cfg.sock_buf_bytes);
     let mut options = ConnectionOptions {
         socket_id: cfg.caller_socket_id_for(i),
         tsbpd_delay: cfg.latency_ms,
@@ -1220,7 +1223,7 @@ fn run_shared_pool(cfg: BenchConfig, k: usize) {
 
 /// The ordinary mio shared-pool loop predates group-aware admission and owns
 /// one `SrtConnection` per address. Bonded input needs the shared
-/// [`srt_transport::PeerTable`] so both legs become one logical stream.
+/// [`srt_transport::advanced::admission::PeerTable`] so both legs become one logical stream.
 /// This one-socket path is the only viable bonded shared-pool topology, and
 /// keeps mio aligned with every completion/runtime adapter without changing
 /// its unbonded benchmark path.
@@ -1231,14 +1234,15 @@ fn run_bonded_shared_pool(cfg: BenchConfig) {
     let mut events = Events::with_capacity(1024);
     let addr = SocketAddr::new(std::net::IpAddr::from([0, 0, 0, 0]), cfg.port);
     let mut socket = UdpSocket::bind(addr).expect("bind bonded shared-pool socket");
-    let _ = srt_transport::set_sock_bufs(socket.as_raw_fd(), cfg.sock_buf_bytes);
+    let _ =
+        srt_transport::advanced::platform::set_sock_bufs(socket.as_raw_fd(), cfg.sock_buf_bytes);
     poll.registry()
         .register(&mut socket, Token(0), Interest::READABLE)
         .expect("register bonded shared-pool socket");
 
-    let mut peers = srt_transport::PeerTable::new();
+    let mut peers = srt_transport::advanced::admission::PeerTable::new();
     let admission = cfg.admission_options(std::process::id(), false);
-    let telemetry = srt_transport::IngressTelemetry::new();
+    let telemetry = srt_transport::advanced::telemetry::IngressTelemetry::new();
     let connect_deadline = Instant::now() + crate::CONNECT_TIMEOUT;
     let stream_len = Duration::from_secs_f64(cfg.duration_secs);
     let run_deadline = Instant::now() + stream_len + IDLE_GRACE + Duration::from_secs(30);
@@ -1301,7 +1305,7 @@ fn run_bonded_shared_pool(cfg: BenchConfig) {
 /// carries. The two only coincide when there is a single worker.
 struct SharedPoolConn {
     conn: SrtConnection,
-    timers: srt_transport::ManualTimerStore,
+    timers: srt_transport::advanced::driver::ManualTimerStore,
     connected: bool,
     torn_down: bool,
     data_events: u64,
@@ -1327,7 +1331,7 @@ fn new_shared_pool_conn(cfg: &BenchConfig, peer: SocketAddr, socket_idx: usize) 
             cfg.apply_protocol_options(&mut options);
             options
         }),
-        timers: srt_transport::ManualTimerStore::new(),
+        timers: srt_transport::advanced::driver::ManualTimerStore::new(),
         connected: false,
         data_events: 0,
         peer,
@@ -1499,7 +1503,10 @@ fn run_shared_pool_shard(
             cfg.port + pool_index as u16,
         );
         let mut socket = UdpSocket::bind(addr).expect("bind shared-pool socket");
-        let _ = srt_transport::set_sock_bufs(socket.as_raw_fd(), cfg.sock_buf_bytes);
+        let _ = srt_transport::advanced::platform::set_sock_bufs(
+            socket.as_raw_fd(),
+            cfg.sock_buf_bytes,
+        );
         poll.registry()
             .register(&mut socket, Token(token), Interest::READABLE)
             .expect("register shared-pool socket");
@@ -1621,10 +1628,9 @@ fn slot_is_terminal(slot: &PoolSlot, now: Instant) -> bool {
 const IDLE_GRACE: Duration = Duration::from_secs(10);
 
 fn bind_reuseport(port: u16, sock_buf_bytes: usize) -> std::io::Result<UdpSocket> {
-    Ok(UdpSocket::from_std(srt_transport::bind_reuseport(
-        port,
-        sock_buf_bytes,
-    )?))
+    Ok(UdpSocket::from_std(
+        srt_transport::advanced::platform::bind_reuseport(port, sock_buf_bytes)?,
+    ))
 }
 
 /// Drain outputs for an unconnected (handshake-phase) connection: sends go
@@ -1632,7 +1638,7 @@ fn bind_reuseport(port: u16, sock_buf_bytes: usize) -> std::io::Result<UdpSocket
 /// when a send failed (treat the pending handshake as dead).
 fn drain_conn_outputs(
     conn: &mut SrtConnection,
-    timers: &mut srt_transport::ManualTimerStore,
+    timers: &mut srt_transport::advanced::driver::ManualTimerStore,
     socket: &UdpSocket,
     destination: SocketAddr,
     now: shiguredo_srt::Timestamp,
@@ -1712,8 +1718,8 @@ fn run_pool_receiver(cfg: BenchConfig, k: usize) {
     let router: crate::SharedWorkerRouter =
         Arc::new(Mutex::new(srt_lifecycle::WorkerRouter::new(worker_count)));
     // One set of counters for every acceptor thread; see
-    // `srt_transport::IngressTelemetry`.
-    let telemetry = Arc::new(srt_transport::IngressTelemetry::new());
+    // `srt_transport::advanced::telemetry::IngressTelemetry`.
+    let telemetry = Arc::new(srt_transport::advanced::telemetry::IngressTelemetry::new());
 
     // All channels must exist before any thread is spawned: promote_slot
     // indexes `senders` by owner worker index, so every thread needs the
@@ -1762,10 +1768,10 @@ struct PoolAcceptorContext<'a> {
     cfg: &'a BenchConfig,
     worker_index: usize,
     start: Instant,
-    admission: &'a srt_transport::AdmissionOptions,
+    admission: &'a srt_transport::advanced::admission::AdmissionOptions,
     router: &'a crate::SharedWorkerRouter,
     senders: &'a [mpsc::Sender<WorkerMessage>],
-    telemetry: &'a srt_transport::IngressTelemetry,
+    telemetry: &'a srt_transport::advanced::telemetry::IngressTelemetry,
     poll: &'a mut Poll,
     next_token: &'a mut usize,
     slots: &'a mut Vec<PoolSlot>,
@@ -1774,7 +1780,7 @@ struct PoolAcceptorContext<'a> {
 
 fn drain_pool_handoffs(
     context: &mut PoolAcceptorContext<'_>,
-    peers: &mut srt_transport::PeerTable,
+    peers: &mut srt_transport::advanced::admission::PeerTable,
     handoffs: &mpsc::Receiver<WorkerMessage>,
     stream_len: Duration,
 ) {
@@ -1826,7 +1832,7 @@ fn drain_pool_handoffs(
 
 fn service_pool_events(
     context: &mut PoolAcceptorContext<'_>,
-    peers: &mut srt_transport::PeerTable,
+    peers: &mut srt_transport::advanced::admission::PeerTable,
     events: &Events,
     listener: &UdpSocket,
     admit_batch: &mut RecvBatch,
@@ -1897,7 +1903,7 @@ fn service_pool_events(
 }
 
 fn maintain_pool_peers(
-    peers: &mut srt_transport::PeerTable,
+    peers: &mut srt_transport::advanced::admission::PeerTable,
     listener: &UdpSocket,
     start: Instant,
     stream_len: Duration,
@@ -1921,7 +1927,7 @@ fn maintain_pool_peers(
 
 fn promote_pool_peers(
     context: &mut PoolAcceptorContext<'_>,
-    peers: &mut srt_transport::PeerTable,
+    peers: &mut srt_transport::advanced::admission::PeerTable,
     newly_connected: Vec<SocketAddr>,
 ) {
     for peer in newly_connected {
@@ -1988,7 +1994,7 @@ fn run_pool_acceptor(
     router: crate::SharedWorkerRouter,
     senders: Vec<mpsc::Sender<WorkerMessage>>,
     handoffs: mpsc::Receiver<WorkerMessage>,
-    telemetry: Arc<srt_transport::IngressTelemetry>,
+    telemetry: Arc<srt_transport::advanced::telemetry::IngressTelemetry>,
 ) -> Vec<ConnStats> {
     let mut poll = Poll::new().expect("mio Poll::new");
     let mut events = Events::with_capacity(1024);
@@ -2008,7 +2014,7 @@ fn run_pool_acceptor(
     // exactly like `SharedPool`. A flow leaves `peers` only when it is
     // promoted or relocated -- so it is always either mid-handshake here,
     // or fully promoted into `slots`, never in between.
-    let mut peers = srt_transport::PeerTable::new();
+    let mut peers = srt_transport::advanced::admission::PeerTable::new();
     let admission = cfg.admission_options(std::process::id(), cfg.cookie_routing);
     // Promoted connections -- local or handed off in from another
     // acceptor -- each with a dedicated connected socket and mio token,
@@ -2135,9 +2141,9 @@ fn relocate_to_owner(
     pending_conn: SrtConnection,
     owner: usize,
     senders: &[mpsc::Sender<WorkerMessage>],
-    telemetry: &srt_transport::IngressTelemetry,
+    telemetry: &srt_transport::advanced::telemetry::IngressTelemetry,
 ) {
-    let socket = match srt_transport::bind_reuseport(port, sock_buf_bytes) {
+    let socket = match srt_transport::advanced::platform::bind_reuseport(port, sock_buf_bytes) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[bench-mio] relocate {peer}: bind {e}");
@@ -2176,7 +2182,7 @@ fn promote_locally(
     stream_len: Duration,
     slots: &mut Vec<PoolSlot>,
     token_index: &mut HashMap<usize, usize>,
-    telemetry: &srt_transport::IngressTelemetry,
+    telemetry: &srt_transport::advanced::telemetry::IngressTelemetry,
 ) {
     let mut socket = match bind_reuseport(port, sock_buf_bytes) {
         Ok(s) => s,
@@ -2376,7 +2382,7 @@ fn run_reuseport_single(cfg: BenchConfig, workers: usize) {
 /// from "none have arrived yet" instead of guessing off a wall clock.
 struct SinglePending {
     conn: SrtConnection,
-    timers: srt_transport::ManualTimerStore,
+    timers: srt_transport::advanced::driver::ManualTimerStore,
     connected: bool,
     created_at: Instant,
 }
@@ -2392,7 +2398,7 @@ fn new_single_pending(cfg: &BenchConfig) -> SinglePending {
             cfg.apply_protocol_options(&mut options);
             options
         }),
-        timers: srt_transport::ManualTimerStore::new(),
+        timers: srt_transport::advanced::driver::ManualTimerStore::new(),
         connected: false,
         created_at: Instant::now(),
     }
@@ -2600,7 +2606,7 @@ fn route_to_worker(
     senders: &[mpsc::Sender<WorkerMessage>],
     per_worker_count: &mut [usize],
 ) {
-    let socket = match srt_transport::bind_reuseport(port, sock_buf_bytes) {
+    let socket = match srt_transport::advanced::platform::bind_reuseport(port, sock_buf_bytes) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[bench-mio] route {peer}: bind {e}");
@@ -2739,8 +2745,11 @@ mod bond_affinity_tests {
         // type only accepts `Send` parts, which is what makes the
         // cross-thread move sound.
         let socket = {
-            let s = srt_transport::bind_reuseport(0, srt_transport::SOCK_BUF_BYTES)
-                .expect("bind ephemeral reuseport");
+            let s = srt_transport::advanced::platform::bind_reuseport(
+                0,
+                srt_transport::advanced::platform::SOCK_BUF_BYTES,
+            )
+            .expect("bind ephemeral reuseport");
             s.connect("127.0.0.1:1".parse::<SocketAddr>().unwrap())
                 .expect("connect");
             s
@@ -2837,8 +2846,8 @@ mod b02_regression_tests {
             source_backlog_ms: crate::source::DEFAULT_SOURCE_BACKLOG_MS,
             datapath_queue_horizon_ms: crate::queue::DEFAULT_DATAPATH_QUEUE_HORIZON_MS,
             outbound_retry_horizon_ms: crate::scheduling::DEFAULT_OUTBOUND_RETRY_HORIZON_MS,
-            ack_interval_micros: shiguredo_srt::ACK_INTERVAL_MICROS,
-            light_ack_interval_packets: shiguredo_srt::LIGHT_ACK_INTERVAL_PACKETS,
+            ack_interval_micros: shiguredo_srt::receiver::ACK_INTERVAL_MICROS,
+            light_ack_interval_packets: shiguredo_srt::receiver::LIGHT_ACK_INTERVAL_PACKETS,
             connections: 1,
             egress: crate::Egress::PerConnection,
             ingress: crate::Ingress::SharedPool(4),

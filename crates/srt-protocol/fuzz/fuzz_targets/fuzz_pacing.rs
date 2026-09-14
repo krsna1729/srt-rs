@@ -1,7 +1,8 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use shiguredo_srt::{SenderBuffer, Timestamp};
+use shiguredo_srt::sender::SenderBuffer;
+use shiguredo_srt::Timestamp;
 
 fn admit_count(buf: &mut SenderBuffer, now: Timestamp) -> u32 {
     let mut admitted = 0u32;

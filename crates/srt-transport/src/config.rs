@@ -11,10 +11,9 @@ use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::os::fd::AsRawFd;
 use std::time::Duration;
 
-use shiguredo_srt::{
-    ConnectionOptions, GroupExtensionData, GroupType, KeyLength, SRTGROUP_MASK, SrtConnection,
-    Timestamp,
-};
+use shiguredo_srt::crypto::KeyLength;
+use shiguredo_srt::handshake::{GroupExtensionData, GroupType, SRTGROUP_MASK};
+use shiguredo_srt::{ConnectionOptions, SrtConnection, Timestamp};
 use zeroize::Zeroize;
 
 use crate::{
@@ -543,7 +542,7 @@ pub struct FlowControlConfig {
 
 impl Default for FlowControlConfig {
     fn default() -> Self {
-        let window = NonZeroU32::new(shiguredo_srt::DEFAULT_FLOW_WINDOW)
+        let window = NonZeroU32::new(shiguredo_srt::handshake::DEFAULT_FLOW_WINDOW)
             .expect("protocol default flow window is non-zero");
         Self {
             window_packets: window,
@@ -812,16 +811,17 @@ impl SessionConfig {
     /// Full ACK period. Default is Haivision `COMM_SYN` / RFC §3.2.4 (10 ms).
     ///
     /// Accepted range is 10–40 ms
-    /// ([`shiguredo_srt::MIN_ACK_INTERVAL_MICROS`]..=
-    /// [`shiguredo_srt::MAX_ACK_INTERVAL_MICROS`]). Values above 10 ms are
+    /// ([`shiguredo_srt::receiver::MIN_ACK_INTERVAL_MICROS`]..=
+    /// [`shiguredo_srt::receiver::MAX_ACK_INTERVAL_MICROS`]). Values above 10 ms are
     /// **non-default / non-RFC-recommended** coalesce and do not retarget
     /// NAK/EXP. Coalescing ACKs does not coarsen TSBPD/TLPKTDROP: the
     /// protocol timer still ticks at `COMM_SYN`. High-fan-in evidence
-    /// target: [`shiguredo_srt::HIGH_FANIN_ACK_INTERVAL_MICROS`] (40 ms) —
+    /// target: [`shiguredo_srt::receiver::HIGH_FANIN_ACK_INTERVAL_MICROS`] (40 ms) —
     /// not a new default.
     pub fn set_ack_interval(&mut self, interval: Duration) -> Result<&mut Self, ConfigError> {
         let micros = duration_micros_u64(interval);
-        if !(shiguredo_srt::MIN_ACK_INTERVAL_MICROS..=shiguredo_srt::MAX_ACK_INTERVAL_MICROS)
+        if !(shiguredo_srt::receiver::MIN_ACK_INTERVAL_MICROS
+            ..=shiguredo_srt::receiver::MAX_ACK_INTERVAL_MICROS)
             .contains(&micros)
         {
             return Err(ConfigError::new(
@@ -829,9 +829,9 @@ impl SessionConfig {
                 format!(
                     "must be {}..={} microseconds (Haivision COMM_SYN default and floor is {}; \
                      values above that are non-RFC-recommended coalesce)",
-                    shiguredo_srt::MIN_ACK_INTERVAL_MICROS,
-                    shiguredo_srt::MAX_ACK_INTERVAL_MICROS,
-                    shiguredo_srt::ACK_INTERVAL_MICROS
+                    shiguredo_srt::receiver::MIN_ACK_INTERVAL_MICROS,
+                    shiguredo_srt::receiver::MAX_ACK_INTERVAL_MICROS,
+                    shiguredo_srt::receiver::ACK_INTERVAL_MICROS
                 ),
             ));
         }
@@ -843,18 +843,18 @@ impl SessionConfig {
     /// / RFC recommendation (64).
     ///
     /// Accepted range is 64–256
-    /// ([`shiguredo_srt::MIN_LIGHT_ACK_INTERVAL_PACKETS`]..=
-    /// [`shiguredo_srt::MAX_LIGHT_ACK_INTERVAL_PACKETS`]). Values above 64
+    /// ([`shiguredo_srt::receiver::MIN_LIGHT_ACK_INTERVAL_PACKETS`]..=
+    /// [`shiguredo_srt::receiver::MAX_LIGHT_ACK_INTERVAL_PACKETS`]). Values above 64
     /// are **non-default / non-RFC-recommended** coalesce. High-fan-in
     /// evidence target:
-    /// [`shiguredo_srt::HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS`] (256) — not
+    /// [`shiguredo_srt::receiver::HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS`] (256) — not
     /// a new default.
     pub fn set_light_ack_interval_packets(
         &mut self,
         packets: u32,
     ) -> Result<&mut Self, ConfigError> {
-        if !(shiguredo_srt::MIN_LIGHT_ACK_INTERVAL_PACKETS
-            ..=shiguredo_srt::MAX_LIGHT_ACK_INTERVAL_PACKETS)
+        if !(shiguredo_srt::receiver::MIN_LIGHT_ACK_INTERVAL_PACKETS
+            ..=shiguredo_srt::receiver::MAX_LIGHT_ACK_INTERVAL_PACKETS)
             .contains(&packets)
         {
             return Err(ConfigError::new(
@@ -862,9 +862,9 @@ impl SessionConfig {
                 format!(
                     "must be {}..={} packets (Haivision/RFC default and floor is {}; \
                      values above that are non-RFC-recommended coalesce)",
-                    shiguredo_srt::MIN_LIGHT_ACK_INTERVAL_PACKETS,
-                    shiguredo_srt::MAX_LIGHT_ACK_INTERVAL_PACKETS,
-                    shiguredo_srt::LIGHT_ACK_INTERVAL_PACKETS
+                    shiguredo_srt::receiver::MIN_LIGHT_ACK_INTERVAL_PACKETS,
+                    shiguredo_srt::receiver::MAX_LIGHT_ACK_INTERVAL_PACKETS,
+                    shiguredo_srt::receiver::LIGHT_ACK_INTERVAL_PACKETS
                 ),
             ));
         }
@@ -904,7 +904,8 @@ impl SessionConfig {
     }
 
     fn validate_ack_coalesce(&self) -> Result<(), ConfigError> {
-        if !(shiguredo_srt::MIN_ACK_INTERVAL_MICROS..=shiguredo_srt::MAX_ACK_INTERVAL_MICROS)
+        if !(shiguredo_srt::receiver::MIN_ACK_INTERVAL_MICROS
+            ..=shiguredo_srt::receiver::MAX_ACK_INTERVAL_MICROS)
             .contains(&self.connection.ack_interval_micros)
         {
             return Err(ConfigError::new(
@@ -912,13 +913,13 @@ impl SessionConfig {
                 format!(
                     "must be {}..={} microseconds (Haivision COMM_SYN default and floor; \
                      values above that are non-RFC-recommended coalesce)",
-                    shiguredo_srt::MIN_ACK_INTERVAL_MICROS,
-                    shiguredo_srt::MAX_ACK_INTERVAL_MICROS
+                    shiguredo_srt::receiver::MIN_ACK_INTERVAL_MICROS,
+                    shiguredo_srt::receiver::MAX_ACK_INTERVAL_MICROS
                 ),
             ));
         }
-        if !(shiguredo_srt::MIN_LIGHT_ACK_INTERVAL_PACKETS
-            ..=shiguredo_srt::MAX_LIGHT_ACK_INTERVAL_PACKETS)
+        if !(shiguredo_srt::receiver::MIN_LIGHT_ACK_INTERVAL_PACKETS
+            ..=shiguredo_srt::receiver::MAX_LIGHT_ACK_INTERVAL_PACKETS)
             .contains(&self.connection.light_ack_interval_packets)
         {
             return Err(ConfigError::new(
@@ -926,8 +927,8 @@ impl SessionConfig {
                 format!(
                     "must be {}..={} packets (Haivision/RFC default and floor; \
                      values above that are non-RFC-recommended coalesce)",
-                    shiguredo_srt::MIN_LIGHT_ACK_INTERVAL_PACKETS,
-                    shiguredo_srt::MAX_LIGHT_ACK_INTERVAL_PACKETS
+                    shiguredo_srt::receiver::MIN_LIGHT_ACK_INTERVAL_PACKETS,
+                    shiguredo_srt::receiver::MAX_LIGHT_ACK_INTERVAL_PACKETS
                 ),
             ));
         }
@@ -1239,12 +1240,14 @@ pub enum SocketOwnership {
 /// Both sides construct the same type; `resolve()` rejects illegal
 /// combinations once instead of scattering `if !exclusive` guards.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub struct EndpointSocketPlan {
     pub topology: ListenerTopology,
     pub ownership: SocketOwnership,
     pub promotion: PromotionPolicy,
 }
 
+#[allow(dead_code)]
 impl EndpointSocketPlan {
     #[must_use]
     pub fn new(
@@ -2837,18 +2840,20 @@ mod tests {
         let mut session = SessionConfig::default();
         session
             .set_ack_interval(Duration::from_micros(
-                shiguredo_srt::HIGH_FANIN_ACK_INTERVAL_MICROS,
+                shiguredo_srt::receiver::HIGH_FANIN_ACK_INTERVAL_MICROS,
             ))
             .expect("40ms is in range")
-            .set_light_ack_interval_packets(shiguredo_srt::HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS)
+            .set_light_ack_interval_packets(
+                shiguredo_srt::receiver::HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS,
+            )
             .expect("256 packets is in range");
         assert_eq!(
             session.connection_options().ack_interval_micros,
-            shiguredo_srt::HIGH_FANIN_ACK_INTERVAL_MICROS
+            shiguredo_srt::receiver::HIGH_FANIN_ACK_INTERVAL_MICROS
         );
         assert_eq!(
             session.connection_options().light_ack_interval_packets,
-            shiguredo_srt::HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS
+            shiguredo_srt::receiver::HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS
         );
 
         let error = session

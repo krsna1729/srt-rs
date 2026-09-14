@@ -1,7 +1,8 @@
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use shiguredo_srt::{SenderBuffer, Timestamp};
+use shiguredo_srt::Timestamp;
+use shiguredo_srt::sender::SenderBuffer;
 
 const PAYLOAD_SIZE: usize = 1316;
 

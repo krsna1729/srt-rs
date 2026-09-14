@@ -50,11 +50,6 @@ impl Conn {
         &self.sock
     }
 
-    /// Transfer protocol and socket ownership to a custom driver.
-    pub fn into_parts(self) -> (SrtConnection, UdpSocket) {
-        (self.conn, self.sock)
-    }
-
     /// Like [`Self::new`], but stores the given budgets instead of the
     /// defaults (K02): [`Self::drain_outputs`]/[`Self::recv_with_timeout`]
     /// honor these, not a hardcoded `::default()`, on every call.

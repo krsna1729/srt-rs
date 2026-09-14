@@ -1,7 +1,7 @@
 //! Property-based tests for SRT packets
 
 use proptest::prelude::*;
-use shiguredo_srt::{
+use shiguredo_srt::wire::{
     ControlPacket, ControlType, DataPacket, PacketPosition, SRT_HEADER_SIZE, SrtPacket,
 };
 

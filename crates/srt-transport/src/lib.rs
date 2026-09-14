@@ -90,17 +90,18 @@ mod timer;
 pub mod advanced {
     /// Prepared configuration and runtime-neutral endpoint plans.
     pub mod prepared {
-        pub use super::super::{
-            PreparedCaller, PreparedListener, ResolvedEndpointPlan, ResolvedTransportConfig,
-            RuntimeListener, TransportCapabilities,
+        pub use super::super::config::{
+            EndpointSocketPlan, PreparedCaller, PreparedListener, ResolvedEndpointPlan,
+            ResolvedListenerTopology, ResolvedTransportConfig, RuntimeListener,
+            TransportCapabilities,
         };
     }
 
     /// Runtime-neutral admission owners and logical peer handles.
     pub mod admission {
         #[cfg(feature = "bench-internals")]
-        pub use super::super::AdmissionPeer;
-        pub use super::super::{
+        pub use super::super::admission::AdmissionPeer;
+        pub use super::super::admission::{
             AdmissionDecision, AdmissionDropReason, AdmissionEvent, AdmissionOptions,
             AdmissionRequest, AdmissionResolution, Admit, BondedInputPolicy, LogicalPeer,
             LogicalPeerId, LogicalPeerMut, LogicalPeerStats, NewlyConnectedPeer, PeerTable,
@@ -110,49 +111,62 @@ pub mod advanced {
 
     /// Runtime-neutral caller owners and logical egress handles.
     pub mod caller {
-        pub use super::super::{
-            CallerEvent, CallerGroupLeg, CallerLeg, CallerPool, CallerPoolStats, CallerTable,
-            DEFAULT_MAX_CALLERS, LogicalCaller, LogicalCallerId, LogicalCallerMut,
-            LogicalCallerState, LogicalCallerStats, MAX_CALLER_POOL_IN_FLIGHT,
-            MAX_CALLER_POOL_QUEUE, MAX_CALLERS, PoolEvent, PoolOutcome, PoolRequestId,
-            RemovedCallerLeg, RemovedLogicalCaller,
+        pub use super::super::caller::{
+            CallerEvent, CallerGroupLeg, CallerLeg, CallerTable, DEFAULT_MAX_CALLERS,
+            LogicalCaller, LogicalCallerId, LogicalCallerMut, LogicalCallerState,
+            LogicalCallerStats, MAX_CALLERS, RemovedCallerLeg, RemovedLogicalCaller,
+        };
+        pub use super::super::caller_pool::{
+            CallerPool, CallerPoolStats, MAX_CALLER_POOL_IN_FLIGHT, MAX_CALLER_POOL_QUEUE,
+            PoolEvent, PoolOutcome, PoolRequestId,
         };
     }
 
     /// Bonded-group socket/protocol ownership.
     pub mod group {
-        pub use super::super::{
+        pub use super::super::group_conn::{
             GroupAggregateStats, GroupBuildError, GroupCallerLeg, GroupConn, GroupConnectionLeg,
             GroupConnectionStats, GroupDriveReport, GroupLegDriveReport, GroupLegStats,
             InboundGroupStats,
         };
     }
 
+    /// Acceptor-to-worker ownership-transfer messages.
+    pub mod handoff {
+        pub use super::super::handoff::{Handoff, WorkerMessage};
+    }
+
     /// Runtime-neutral bounded driver operations.
     pub mod driver {
+        pub use super::super::batch::RecvBudget;
         #[cfg(any(feature = "mio", feature = "tokio"))]
         pub use super::super::deadline_heap::schedule_wait_micros;
+        pub use super::super::timer::ManualTimerStore;
         pub use super::super::{
-            ManualTimerStore, OutputDrainBudget, OutputDrainReport, OutputDrainStatus,
-            PacedSendOutcome, RecvBudget,
+            OutputDrainBudget, OutputDrainReport, OutputDrainStatus, PacedSendOutcome,
         };
     }
 
     /// Native I/O and wait primitives for custom event-loop owners.
     pub mod native_io {
-        pub use super::super::{
-            BatchIoStats, HighResWaiter, MAX_WAITER_KEYS, MonotonicDeadline, PlannedWait,
-            RecvBatch, RecvDrainReport, SendFlushReport, WaitBackend, WaitOutcome,
-            apply_send_result, deadline_from_wait, drain_recv_fd, flush_destined, plan_wait,
-            recvmsg_batch, sendmsg_batch, sendmsg_connected_batch,
+        pub use super::super::batch::{
+            BatchIoStats, RecvBatch, RecvDrainReport, SendFlushReport, apply_send_result,
+            drain_recv_fd, flush_destined,
         };
+        pub use super::super::high_res_waiter::{
+            HighResWaiter, MAX_WAITER_KEYS, MonotonicDeadline, PlannedWait, WaitBackend,
+            WaitOutcome, deadline_from_wait, plan_wait,
+        };
+        pub use super::super::socket_io::{recvmsg_batch, sendmsg_batch, sendmsg_connected_batch};
     }
 
     /// Platform and socket deployment helpers.
     pub mod platform {
-        pub use super::super::{
-            SOCK_BUF_BYTES, SocketBufferStats, available_cpus, bind_reuseport, current_cpu_spec,
-            parse_cpu_spec, restrict_to_cpu_list, set_sock_bufs, socket_buffer_stats,
+        pub use super::super::cpu::{
+            available_cpus, current_cpu_spec, parse_cpu_spec, restrict_to_cpu_list,
+        };
+        pub use super::super::socket_io::{
+            SOCK_BUF_BYTES, SocketBufferStats, bind_reuseport, set_sock_bufs, socket_buffer_stats,
         };
     }
 
@@ -164,7 +178,7 @@ pub mod advanced {
     /// Mutable telemetry owners used by an adapter or worker. Exporters
     /// should retain only the snapshot types from the crate root.
     pub mod telemetry {
-        pub use super::super::{IngressTelemetry, ShardTelemetry};
+        pub use super::super::telemetry::{IngressTelemetry, ShardTelemetry};
     }
 }
 
@@ -221,80 +235,80 @@ pub use compio_transport as compio;
 
 // --- Public re-exports: config ---
 
-pub use config::*;
+// Keep the implementation modules able to share the complete configuration
+// vocabulary while publishing only the application-facing policy surface.
+pub(crate) use config::*;
+pub use config::{
+    AdmissionConfig, Bandwidth, BatchingPolicy, CallerBuilder, CallerConfig, ConfigError,
+    ConnectConfig, CookieRoutingPolicy, EncryptionConfig, FlowControlConfig, GroupConfig,
+    HandshakeConfig, ListenerBuilder, ListenerConfig, ListenerEncryptionConfig, ListenerPeerPolicy,
+    ListenerTopology, PacingPolicy, PayloadSize, PolicyOverride, PromotionPolicy,
+    RuntimeBuildError, RuntimeFlavor, SessionConfig, SessionSendError, SocketBufferConfig,
+    SocketOwnership, TransportConfig, TransportProfile, WorkerCount,
+};
 
-// --- Public re-exports: utilities ---
+// --- Internal utility imports ---
 
+#[allow(unused_imports)]
+pub(crate) use admission::{
+    AdmissionDecision, AdmissionDropReason, AdmissionEvent, AdmissionOptions, AdmissionRequest,
+    AdmissionResolution, Admit, BondedInputPolicy, LogicalPeer, LogicalPeerId, LogicalPeerMut,
+    LogicalPeerStats, NewlyConnectedPeer, PeerTable, PeerTableConfig, RejectionReason,
+    RemovedLogicalPeer, RemovedPeerLeg, is_ordered_close,
+};
 #[cfg(any(feature = "mio", feature = "tokio"))]
 pub(crate) use batch::destined_send_limit;
 pub(crate) use batch::drain_recv_fd_with_capacity;
 #[cfg(feature = "mio")]
 pub(crate) use batch::flush_destined_bounded;
-#[doc(hidden)]
-pub use batch::{
+#[allow(unused_imports)]
+pub(crate) use batch::{
     BatchIoStats, RecvBatch, RecvBudget, RecvDrainReport, SendFlushReport, apply_send_result,
     drain_recv_fd, flush_destined,
 };
-#[doc(hidden)]
-pub use cpu::{available_cpus, current_cpu_spec, parse_cpu_spec, restrict_to_cpu_list};
+#[allow(unused_imports)]
+pub(crate) use caller::{
+    CallerEvent, CallerGroupLeg, CallerLeg, CallerTable, DEFAULT_MAX_CALLERS, LogicalCaller,
+    LogicalCallerId, LogicalCallerMut, LogicalCallerState, LogicalCallerStats, MAX_CALLERS,
+    RemovedCallerLeg, RemovedLogicalCaller,
+};
+#[allow(unused_imports)]
+pub(crate) use caller_pool::{
+    CallerPool, CallerPoolStats, MAX_CALLER_POOL_IN_FLIGHT, MAX_CALLER_POOL_QUEUE, PoolEvent,
+    PoolOutcome, PoolRequestId,
+};
+#[allow(unused_imports)]
+pub(crate) use cpu::{available_cpus, current_cpu_spec, parse_cpu_spec, restrict_to_cpu_list};
 #[cfg(any(feature = "mio", feature = "tokio"))]
 pub(crate) use deadline_heap::schedule_wait_micros;
 pub(crate) use due_index::DueIndex;
-#[doc(hidden)]
-pub use high_res_waiter::{
+#[allow(unused_imports)]
+pub(crate) use group_conn::{
+    GroupAggregateStats, GroupBuildError, GroupCallerLeg, GroupConn, GroupConnectionLeg,
+    GroupConnectionStats, GroupDriveReport, GroupLegDriveReport, GroupLegStats, InboundGroupStats,
+};
+#[allow(unused_imports)]
+pub(crate) use handoff::{Handoff, WorkerMessage};
+#[allow(unused_imports)]
+pub(crate) use high_res_waiter::{
     HighResWaiter, MAX_WAITER_KEYS, MonotonicDeadline, PlannedWait, WaitBackend, WaitOutcome,
     deadline_from_wait, plan_wait,
 };
-#[doc(hidden)]
-pub use socket_io::{
+#[allow(unused_imports)]
+pub(crate) use socket_io::{
     SOCK_BUF_BYTES, SocketBufferStats, bind_reuseport, recvmsg_batch, sendmsg_batch,
     sendmsg_connected_batch, set_sock_bufs, socket_buffer_stats,
 };
-#[doc(hidden)]
-pub use timer::ManualTimerStore;
+#[allow(unused_imports)]
+pub(crate) use telemetry::{IngressTelemetry, ShardTelemetry};
+#[allow(unused_imports)]
+pub(crate) use timer::ManualTimerStore;
 
-// --- Public re-exports: admission ---
+// --- Public re-exports: telemetry snapshots ---
 
-#[cfg(feature = "bench-internals")]
-#[doc(hidden)]
-pub use admission::AdmissionPeer;
-pub use admission::{
-    AdmissionDecision, AdmissionDropReason, AdmissionEvent, AdmissionOptions, AdmissionRequest,
-    AdmissionResolution, Admit, BondedInputPolicy, LogicalPeer, LogicalPeerId, LogicalPeerMut,
-    LogicalPeerStats, NewlyConnectedPeer, RejectionReason, RemovedLogicalPeer, RemovedPeerLeg,
-    is_ordered_close,
-};
-#[doc(hidden)]
-pub use admission::{PeerTable, PeerTableConfig};
-
-// --- Public re-exports: handoff ---
-
-#[doc(hidden)]
-pub use handoff::{Handoff, WorkerMessage};
-
-// --- Public re-exports: telemetry ---
-
-#[doc(hidden)]
-pub use telemetry::{IngressTelemetry, ShardTelemetry};
 pub use telemetry::{
     IngressTelemetrySnapshot, SHARD_LATENESS_BUCKETS, SHARD_OVERLOAD_REASONS, ShardOverloadReason,
     ShardTelemetrySnapshot,
-};
-
-// --- Public re-exports: caller ---
-
-#[doc(hidden)]
-pub use caller::{
-    CallerEvent, CallerGroupLeg, CallerLeg, CallerTable, DEFAULT_MAX_CALLERS, MAX_CALLERS,
-    RemovedCallerLeg, RemovedLogicalCaller,
-};
-pub use caller::{
-    LogicalCaller, LogicalCallerId, LogicalCallerMut, LogicalCallerState, LogicalCallerStats,
-};
-#[doc(hidden)]
-pub use caller_pool::{
-    CallerPool, CallerPoolStats, MAX_CALLER_POOL_IN_FLIGHT, MAX_CALLER_POOL_QUEUE, PoolEvent,
-    PoolOutcome, PoolRequestId,
 };
 // Internal helpers used by runtime and group_conn modules.
 pub(crate) use batch::drain_connected_outputs;
@@ -302,13 +316,6 @@ pub(crate) use batch::drain_connected_outputs;
 pub(crate) use batch::drain_output_work;
 pub(crate) use caller::{collect_output_work, prepend_outputs};
 
-// --- Public re-exports: group ---
-
-#[doc(hidden)]
-pub use group_conn::{
-    GroupAggregateStats, GroupBuildError, GroupCallerLeg, GroupConn, GroupConnectionLeg,
-    GroupConnectionStats, GroupDriveReport, GroupLegDriveReport, GroupLegStats, InboundGroupStats,
-};
 // Internal types used by admission and caller modules.
 pub(crate) use group_conn::{GroupLogicalCounters, group_connection_stats};
 

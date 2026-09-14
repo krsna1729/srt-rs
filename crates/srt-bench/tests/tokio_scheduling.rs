@@ -142,13 +142,15 @@ fn force_kernel_would_block(
         .expect("socket address");
     let socket = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
     socket.set_nonblocking(true).unwrap();
-    srt_transport::set_sock_bufs(socket.as_raw_fd(), 1024).unwrap();
+    srt_transport::advanced::platform::set_sock_bufs(socket.as_raw_fd(), 1024).unwrap();
     let mut queue = srt_bench::scheduling::RetryQueue::new(policy, 4096);
     for _ in 0..128 {
         let mut generated = (0..32).map(|_| (target, vec![0; 1316])).collect();
         queue.append(&mut generated);
         queue
-            .flush_with(|batch| srt_transport::sendmsg_batch(socket.as_raw_fd(), batch))
+            .flush_with(|batch| {
+                srt_transport::advanced::native_io::sendmsg_batch(socket.as_raw_fd(), batch)
+            })
             .unwrap();
         if queue.stats().would_block > 0 {
             return queue.stats();

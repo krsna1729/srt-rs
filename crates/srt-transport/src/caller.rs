@@ -936,7 +936,7 @@ impl CallerTable {
         data: &[u8],
         now: Timestamp,
     ) -> Result<bool, shiguredo_srt::Error> {
-        let socket_id = shiguredo_srt::peek_destination_socket_id(data)?;
+        let socket_id = shiguredo_srt::wire::peek_destination_socket_id(data)?;
         let target_id = match self.routes.get(&socket_id).copied() {
             Some(route) => match route {
                 CallerRoute::Direct(id) => id,
@@ -1612,9 +1612,11 @@ pub(crate) fn collect_output_work(
 mod tests {
     use crate::*;
     use proptest::prelude::*;
+    use shiguredo_srt::handshake::HandshakePacket;
+    use shiguredo_srt::wire::SrtPacket;
     use shiguredo_srt::{
-        ConnectionEvent, ConnectionOptions, ConnectionOutput, ErrorKind, HandshakePacket,
-        SrtConnection, SrtPacket, TimerId, Timestamp,
+        ConnectionEvent, ConnectionOptions, ConnectionOutput, ErrorKind, SrtConnection, TimerId,
+        Timestamp,
     };
     use std::collections::HashMap;
     use std::sync::atomic::Ordering;
@@ -1735,9 +1737,9 @@ mod tests {
             ConnectionOptions {
                 socket_id: 0x1111,
                 stream_id: Some("publish:bonded".to_string()),
-                group_extension: Some(shiguredo_srt::GroupExtensionData {
-                    group_id: shiguredo_srt::SRTGROUP_MASK | 42,
-                    group_type: shiguredo_srt::GroupType::Broadcast,
+                group_extension: Some(shiguredo_srt::handshake::GroupExtensionData {
+                    group_id: shiguredo_srt::handshake::SRTGROUP_MASK | 42,
+                    group_type: shiguredo_srt::handshake::GroupType::Broadcast,
                     flags: 0,
                     weight: 1,
                 }),
@@ -1774,9 +1776,9 @@ mod tests {
             peer,
             ConnectionOptions {
                 socket_id: 0x1111,
-                group_extension: Some(shiguredo_srt::GroupExtensionData {
-                    group_id: shiguredo_srt::SRTGROUP_MASK | 42,
-                    group_type: shiguredo_srt::GroupType::Unknown(3),
+                group_extension: Some(shiguredo_srt::handshake::GroupExtensionData {
+                    group_id: shiguredo_srt::handshake::SRTGROUP_MASK | 42,
+                    group_type: shiguredo_srt::handshake::GroupType::Unknown(3),
                     flags: 0,
                     weight: 1,
                 }),
@@ -1819,14 +1821,14 @@ mod tests {
         options.bonded_inputs = BondedInputPolicy::Accept;
         let telemetry = IngressTelemetry::new();
         let mut table = PeerTable::new();
-        let group_id = shiguredo_srt::SRTGROUP_MASK | 42;
+        let group_id = shiguredo_srt::handshake::SRTGROUP_MASK | 42;
         let caller_options = |socket_id, weight| ConnectionOptions {
             socket_id,
             initial_seq: Some(1234),
             stream_id: Some("publish:bonded".to_string()),
-            group_extension: Some(shiguredo_srt::GroupExtensionData {
+            group_extension: Some(shiguredo_srt::handshake::GroupExtensionData {
                 group_id,
-                group_type: shiguredo_srt::GroupType::Broadcast,
+                group_type: shiguredo_srt::handshake::GroupType::Broadcast,
                 flags: 0,
                 weight,
             }),
@@ -1905,8 +1907,8 @@ mod tests {
             outbound
                 .iter()
                 .filter(|(_, packet)| matches!(
-                    shiguredo_srt::SrtPacket::decode(packet),
-                    Ok(shiguredo_srt::SrtPacket::Data(_))
+                    shiguredo_srt::wire::SrtPacket::decode(packet),
+                    Ok(shiguredo_srt::wire::SrtPacket::Data(_))
                 ))
                 .count(),
             2,
@@ -1975,7 +1977,7 @@ mod tests {
         assert_eq!(
             outbound
                 .iter()
-                .filter(|(_, packet)| matches!(shiguredo_srt::SrtPacket::decode(packet), Ok(shiguredo_srt::SrtPacket::Control(control)) if control.control_type == shiguredo_srt::ControlType::Shutdown))
+                .filter(|(_, packet)| matches!(shiguredo_srt::wire::SrtPacket::decode(packet), Ok(shiguredo_srt::wire::SrtPacket::Control(control)) if control.control_type == shiguredo_srt::wire::ControlType::Shutdown))
                 .count(),
             2,
             "an orderly logical close shuts down every group leg"
@@ -1990,11 +1992,11 @@ mod tests {
         options.bonded_inputs = BondedInputPolicy::Accept;
         let telemetry = IngressTelemetry::new();
         let mut table = PeerTable::new();
-        let group_id = shiguredo_srt::SRTGROUP_MASK | 42;
+        let group_id = shiguredo_srt::handshake::SRTGROUP_MASK | 42;
         let caller_options = |socket_id, group_type| ConnectionOptions {
             socket_id,
             stream_id: Some("publish:bonded".to_string()),
-            group_extension: Some(shiguredo_srt::GroupExtensionData {
+            group_extension: Some(shiguredo_srt::handshake::GroupExtensionData {
                 group_id,
                 group_type,
                 flags: 0,
@@ -2005,7 +2007,7 @@ mod tests {
         let (mut first_caller, first_conclusion) = prepare_conclusion_with_options(
             &mut table,
             first,
-            caller_options(0x1111, shiguredo_srt::GroupType::Broadcast),
+            caller_options(0x1111, shiguredo_srt::handshake::GroupType::Broadcast),
             &options,
             &telemetry,
         );
@@ -2020,7 +2022,7 @@ mod tests {
         let (_, second_conclusion) = prepare_conclusion_with_options(
             &mut table,
             second,
-            caller_options(0x2222, shiguredo_srt::GroupType::Backup),
+            caller_options(0x2222, shiguredo_srt::handshake::GroupType::Backup),
             &options,
             &telemetry,
         );
@@ -2098,13 +2100,13 @@ mod tests {
         let mut outbound = Vec::new();
         table.poll_outbound(Timestamp::from_micros(4), &mut outbound);
         assert!(outbound.iter().any(|(_, packet)| matches!(
-            shiguredo_srt::SrtPacket::decode(packet),
-            Ok(shiguredo_srt::SrtPacket::Data(_))
+            shiguredo_srt::wire::SrtPacket::decode(packet),
+            Ok(shiguredo_srt::wire::SrtPacket::Data(_))
         )));
         assert!(outbound.iter().any(|(_, packet)| matches!(
-            shiguredo_srt::SrtPacket::decode(packet),
-            Ok(shiguredo_srt::SrtPacket::Control(control))
-                if control.control_type == shiguredo_srt::ControlType::Shutdown
+            shiguredo_srt::wire::SrtPacket::decode(packet),
+            Ok(shiguredo_srt::wire::SrtPacket::Control(control))
+                if control.control_type == shiguredo_srt::wire::ControlType::Shutdown
         )));
     }
 
@@ -2178,7 +2180,7 @@ mod tests {
         let direct_peer = "127.0.0.1:11000".parse().expect("address");
         let first_peer = "127.0.0.1:11001".parse().expect("address");
         let second_peer = first_peer;
-        let group_id = shiguredo_srt::SRTGROUP_MASK | 55;
+        let group_id = shiguredo_srt::handshake::SRTGROUP_MASK | 55;
         let mut callers = CallerTable::new();
         let direct = callers
             .add_direct(CallerLeg::new(
@@ -2201,9 +2203,9 @@ mod tests {
                         caller_connection(ConnectionOptions {
                             socket_id: 102,
                             initial_seq: Some(1234),
-                            group_extension: Some(shiguredo_srt::GroupExtensionData {
+                            group_extension: Some(shiguredo_srt::handshake::GroupExtensionData {
                                 group_id,
-                                group_type: shiguredo_srt::GroupType::Broadcast,
+                                group_type: shiguredo_srt::handshake::GroupType::Broadcast,
                                 flags: 0,
                                 weight: 1,
                             }),
@@ -2217,9 +2219,9 @@ mod tests {
                         caller_connection(ConnectionOptions {
                             socket_id: 103,
                             initial_seq: Some(1234),
-                            group_extension: Some(shiguredo_srt::GroupExtensionData {
+                            group_extension: Some(shiguredo_srt::handshake::GroupExtensionData {
                                 group_id,
-                                group_type: shiguredo_srt::GroupType::Broadcast,
+                                group_type: shiguredo_srt::handshake::GroupType::Broadcast,
                                 flags: 0,
                                 weight: 1,
                             }),
@@ -2289,8 +2291,8 @@ mod tests {
             outbound
                 .iter()
                 .filter(|(_, packet)| matches!(
-                    shiguredo_srt::SrtPacket::decode(packet),
-                    Ok(shiguredo_srt::SrtPacket::Data(_))
+                    shiguredo_srt::wire::SrtPacket::decode(packet),
+                    Ok(shiguredo_srt::wire::SrtPacket::Data(_))
                 ))
                 .count(),
             3,
@@ -2576,14 +2578,14 @@ mod tests {
             options.bonded_inputs = BondedInputPolicy::Accept;
             let telemetry = IngressTelemetry::new();
             let mut table = PeerTable::new();
-            let group_id = shiguredo_srt::SRTGROUP_MASK | group_suffix;
+            let group_id = shiguredo_srt::handshake::SRTGROUP_MASK | group_suffix;
             let caller_options = |socket_id| ConnectionOptions {
                 socket_id,
                 initial_seq: Some(initial_seq),
                 stream_id: Some("publish:property-group".to_string()),
-                group_extension: Some(shiguredo_srt::GroupExtensionData {
+                group_extension: Some(shiguredo_srt::handshake::GroupExtensionData {
                     group_id,
-                    group_type: shiguredo_srt::GroupType::Broadcast,
+                    group_type: shiguredo_srt::handshake::GroupType::Broadcast,
                     flags: 0,
                     weight: 1,
                 }),
@@ -3195,8 +3197,11 @@ mod tests {
                 assert_eq!(access.resource_name(), Some("live/camera"));
                 AdmissionResolution::Configure(ListenerPeerPolicy {
                     encryption: PolicyOverride::Set(Some(
-                        ListenerEncryptionConfig::new(passphrase, shiguredo_srt::KeyLength::Aes128)
-                            .expect("valid listener secret"),
+                        ListenerEncryptionConfig::new(
+                            passphrase,
+                            shiguredo_srt::crypto::KeyLength::Aes128,
+                        )
+                        .expect("valid listener secret"),
                     )),
                     ..Default::default()
                 })
@@ -3253,7 +3258,7 @@ mod tests {
                     encryption: PolicyOverride::Set(Some(
                         ListenerEncryptionConfig::new(
                             "incorrect-secret-123",
-                            shiguredo_srt::KeyLength::Aes128,
+                            shiguredo_srt::crypto::KeyLength::Aes128,
                         )
                         .expect("valid listener secret"),
                     )),

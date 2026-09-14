@@ -3,15 +3,14 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
-use shiguredo_srt::{
-    ConnectionOptions, ConnectionOutput, GroupExtensionData, GroupType, HandshakePacket,
-    SRTGROUP_MASK, SrtConnection, Timestamp,
+use shiguredo_srt::handshake::{GroupExtensionData, GroupType, HandshakePacket, SRTGROUP_MASK};
+use shiguredo_srt::{ConnectionOptions, ConnectionOutput, SrtConnection, Timestamp};
+use srt_transport::advanced::admission::{
+    AdmissionOptions, AdmissionResolution, BondedInputPolicy, PeerTable, PeerTableConfig,
 };
+use srt_transport::advanced::telemetry::IngressTelemetry;
 use srt_transport::test_support::{DenseDueIndex, DenseSlotArena, DueIndex, PhysicalPeerKey};
-use srt_transport::{
-    AdmissionOptions, AdmissionResolution, BondedInputPolicy, IngressTelemetry, ListenerPeerPolicy,
-    PeerTable, PeerTableConfig, PolicyOverride,
-};
+use srt_transport::{ListenerPeerPolicy, PolicyOverride};
 
 fn induction(socket_id: u32) -> Vec<u8> {
     let packet = HandshakePacket::new_induction_request(socket_id).encode(0, 0);

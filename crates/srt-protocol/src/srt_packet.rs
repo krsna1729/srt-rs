@@ -75,6 +75,22 @@ impl SrtPacket {
         Ok(())
     }
 
+    /// Encode into caller-provided storage without allocating.
+    ///
+    /// The buffer is unchanged when it is too small or the datagram exceeds
+    /// the protocol maximum. The returned length is the exact wire length.
+    pub fn encode_into(&self, buf: &mut [u8]) -> Result<usize, Error> {
+        let size = self.encoded_size();
+        if size > MAX_DATAGRAM_SIZE {
+            return Err(Error::invalid_data("SRT datagram exceeds maximum size"));
+        }
+        Error::check_buffer_size(size, buf)?;
+        match self {
+            Self::Data(packet) => packet.encode_into(buf),
+            Self::Control(packet) => packet.encode_into(buf),
+        }
+    }
+
     /// Encode without repeating the size check. This is restricted to the
     /// protocol implementation; callers should use [`Self::encode`].
     pub(crate) fn encode_unchecked(&self, buf: &mut Vec<u8>) {
@@ -235,6 +251,27 @@ impl DataPacket {
         }
         self.encode_unchecked(buf);
         Ok(())
+    }
+
+    /// Encode into caller-provided storage without allocating.
+    pub fn encode_into(&self, buf: &mut [u8]) -> Result<usize, Error> {
+        let size = self.encoded_size();
+        if size > MAX_DATAGRAM_SIZE {
+            return Err(Error::invalid_data("SRT datagram exceeds maximum size"));
+        }
+        Error::check_buffer_size(size, buf)?;
+        let first_word = self.sequence_number & 0x7FFF_FFFF;
+        let second_word = ((self.position.to_bits() as u32) << 30)
+            | ((self.order_flag as u32) << 29)
+            | ((self.encryption_flag as u32 & 0b11) << 27)
+            | ((self.retransmitted as u32) << 26)
+            | (self.message_number & 0x03FF_FFFF);
+        buf[0..4].copy_from_slice(&first_word.to_be_bytes());
+        buf[4..8].copy_from_slice(&second_word.to_be_bytes());
+        buf[8..12].copy_from_slice(&self.timestamp.to_be_bytes());
+        buf[12..16].copy_from_slice(&self.dest_socket_id.to_be_bytes());
+        buf[16..size].copy_from_slice(&self.payload);
+        Ok(size)
     }
 
     /// Encode without repeating the size check. This is restricted to the
@@ -452,6 +489,24 @@ impl ControlPacket {
         Ok(())
     }
 
+    /// Encode into caller-provided storage without allocating.
+    pub fn encode_into(&self, buf: &mut [u8]) -> Result<usize, Error> {
+        let size = self.encoded_size();
+        if size > MAX_DATAGRAM_SIZE {
+            return Err(Error::invalid_data("SRT datagram exceeds maximum size"));
+        }
+        Error::check_buffer_size(size, buf)?;
+        let first_word = 0x8000_0000
+            | ((self.control_type as u32 & 0x7FFF) << 16)
+            | (self.subtype as u32 & 0xFFFF);
+        buf[0..4].copy_from_slice(&first_word.to_be_bytes());
+        buf[4..8].copy_from_slice(&self.type_specific_info.to_be_bytes());
+        buf[8..12].copy_from_slice(&self.timestamp.to_be_bytes());
+        buf[12..16].copy_from_slice(&self.dest_socket_id.to_be_bytes());
+        buf[16..size].copy_from_slice(&self.control_info);
+        Ok(size)
+    }
+
     /// Encode without repeating the size check. This is restricted to the
     /// protocol implementation; callers should use [`Self::encode`].
     pub(crate) fn encode_unchecked(&self, buf: &mut Vec<u8>) {
@@ -568,6 +623,34 @@ mod tests {
         let mut control_buf = vec![4, 5, 6];
         assert!(control.encode(&mut control_buf).is_err());
         assert_eq!(control_buf, vec![4, 5, 6]);
+    }
+
+    #[test]
+    fn encode_into_writes_exactly_once_without_allocating() {
+        let data = DataPacket::new(7, 9, 11, 13, Bytes::from_static(b"payload"));
+        let mut data_buf = [0xA5; MAX_DATAGRAM_SIZE];
+        let data_len = data.encode_into(&mut data_buf).expect("buffer fits");
+        assert_eq!(data_len, data.encoded_size());
+        assert!(matches!(
+            SrtPacket::decode(&data_buf[..data_len]),
+            Ok(SrtPacket::Data(decoded)) if decoded == data
+        ));
+
+        let control = ControlPacket {
+            control_info: vec![1, 2, 3],
+            ..ControlPacket::new(ControlType::Ack, 17, 19)
+        };
+        let mut control_buf = [0x5A; MAX_DATAGRAM_SIZE];
+        let control_len = control.encode_into(&mut control_buf).expect("buffer fits");
+        assert_eq!(control_len, control.encoded_size());
+        assert!(matches!(
+            SrtPacket::decode(&control_buf[..control_len]),
+            Ok(SrtPacket::Control(decoded)) if decoded == control
+        ));
+
+        let mut short = [0xCC; 3];
+        assert!(data.encode_into(&mut short).is_err());
+        assert_eq!(short, [0xCC; 3]);
     }
 
     #[test]

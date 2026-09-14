@@ -57,11 +57,6 @@ impl Conn {
         &self.sock
     }
 
-    /// Transfer protocol and socket ownership to a custom driver.
-    pub fn into_parts(self) -> (SrtConnection, UdpSocket) {
-        (self.conn, self.sock)
-    }
-
     /// Like [`Self::new`], but stores the given budgets instead of the
     /// defaults (K02): [`Self::drain_outputs`]/[`Self::recv_with_timeout`]
     /// honor these, not a hardcoded `::default()`, on every call.
@@ -600,7 +595,7 @@ impl GroupConn {
         self.group.disconnect(now);
     }
 
-    pub fn poll_data(&mut self, now: Timestamp) -> Option<shiguredo_srt::GroupPacket> {
+    pub fn poll_data(&mut self, now: Timestamp) -> Option<shiguredo_srt::group::GroupPacket> {
         self.poll_data_bounded(now, shiguredo_srt::MAX_GROUP_MEMBERS)
             .packet
     }
@@ -4686,9 +4681,11 @@ mod tests {
     /// `mark_member_broken_if_new_only_reports_the_first_transition`.
     #[test]
     fn mark_member_broken_if_new_only_reports_the_first_transition() {
-        let mut group =
-            shiguredo_srt::SrtGroup::new(shiguredo_srt::SRTGROUP_MASK | 1, GroupMode::Broadcast)
-                .expect("group builds");
+        let mut group = shiguredo_srt::SrtGroup::new(
+            shiguredo_srt::handshake::SRTGROUP_MASK | 1,
+            GroupMode::Broadcast,
+        )
+        .expect("group builds");
         group
             .add_member(
                 1,
@@ -4727,7 +4724,7 @@ mod tests {
                 .set_nonblocking(true)
                 .expect("second peer is nonblocking");
 
-            let group = crate::GroupConfig::new(42, shiguredo_srt::GroupType::Broadcast);
+            let group = crate::GroupConfig::new(42, shiguredo_srt::handshake::GroupType::Broadcast);
             let mut conn = GroupConn::caller(
                 group,
                 [
@@ -4794,7 +4791,7 @@ mod tests {
         runtime.block_on(async {
             let peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("peer binds");
             let remote = peer.local_addr().expect("peer address");
-            let group = crate::GroupConfig::new(45, shiguredo_srt::GroupType::Broadcast);
+            let group = crate::GroupConfig::new(45, shiguredo_srt::handshake::GroupType::Broadcast);
             let result = GroupConn::caller(
                 group,
                 [GroupCallerLeg::new(
@@ -4846,7 +4843,7 @@ mod tests {
                     .build()
                     .expect("second caller config");
             let conn = GroupConn::caller(
-                crate::GroupConfig::new(46, shiguredo_srt::GroupType::Broadcast),
+                crate::GroupConfig::new(46, shiguredo_srt::handshake::GroupType::Broadcast),
                 [
                     GroupCallerLeg::new(1, 10, first_config),
                     GroupCallerLeg::new(2, 20, second_config),
@@ -4913,7 +4910,7 @@ mod tests {
     async fn connect_two_leg_tokio_group() -> (GroupConn, GroupPeer, GroupPeer) {
         let mut first_peer = GroupPeer::new();
         let mut second_peer = GroupPeer::new();
-        let group = crate::GroupConfig::new(44, shiguredo_srt::GroupType::Broadcast);
+        let group = crate::GroupConfig::new(44, shiguredo_srt::handshake::GroupType::Broadcast);
         let mut conn = GroupConn::caller(
             group,
             [

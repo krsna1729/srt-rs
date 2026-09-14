@@ -1,10 +1,10 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use shiguredo_srt::{
-    ConnectionOptions, ConnectionOutput, ControlPacket, ControlType, SrtConnection, TimerId,
-    Timestamp, DEFAULT_MTU, write_u32,
-};
+use shiguredo_srt::{ConnectionOptions, ConnectionOutput, SrtConnection, TimerId, Timestamp};
+use shiguredo_srt::handshake::DEFAULT_MTU;
+use shiguredo_srt::wire::{ControlPacket, ControlType};
+use shiguredo_srt::write_u32;
 
 fn transfer(from: &mut SrtConnection, to: &mut SrtConnection, now: Timestamp) {
     while let Some(output) = from.poll_output() {

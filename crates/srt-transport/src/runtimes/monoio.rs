@@ -38,11 +38,6 @@ impl Conn {
         &self.sock
     }
 
-    /// Transfer protocol and socket ownership to a custom driver.
-    pub fn into_parts(self) -> (SrtConnection, monoio::net::udp::UdpSocket) {
-        (self.conn, self.sock)
-    }
-
     /// Like [`Self::new`], but stores the given budget instead of the
     /// default (K02): [`Self::drain_outputs`] honors this, not a hardcoded
     /// `::default()`, on every call.

@@ -7,7 +7,7 @@ publish = false
 
 [dev-dependencies]
 proptest = "1.11"
-shiguredo_srt = { path = "../" }
+shiguredo_srt = { path = "../", features = ["raw-codec"] }
 
 [lints]
 workspace = true

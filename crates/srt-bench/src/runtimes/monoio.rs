@@ -39,7 +39,7 @@
 //! straight off the shared listener socket by peer-address dispatch,
 //! bypassing the `Conn` wrapper (whose `drain_outputs`/`send` assume a
 //! connected socket) in favor of direct `SrtConnection` +
-//! `srt_transport::ManualTimerStore` + `listener.send_to`. Promoting every
+//! `srt_transport::advanced::driver::ManualTimerStore` + `listener.send_to`. Promoting every
 //! connection was measured (on mio, reproduced on tokio and smol) to cost
 //! 5-6x listener CPU-sys time and nonzero retransmits: every new socket
 //! joining the reuseport group can reroute some other still-pending
@@ -75,9 +75,10 @@
 //! outstanding fix for that.
 
 use crate::{Aggregate, BenchConfig, BondMode, ConnStats};
-use shiguredo_srt::{ConnectionEvent, ConnectionOptions, GroupExtensionData, SrtConnection};
+use shiguredo_srt::handshake::GroupExtensionData;
+use shiguredo_srt::{ConnectionEvent, ConnectionOptions, SrtConnection};
+use srt_transport::advanced::handoff::{Handoff, WorkerMessage};
 use srt_transport::monoio_transport::Conn;
-use srt_transport::{Handoff, WorkerMessage};
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, mpsc};
@@ -102,7 +103,8 @@ fn promote_locally(
     peer: SocketAddr,
     conn: SrtConnection,
 ) -> Option<Conn> {
-    let std_socket = srt_transport::bind_reuseport(port, sock_buf_bytes).ok()?;
+    let std_socket =
+        srt_transport::advanced::platform::bind_reuseport(port, sock_buf_bytes).ok()?;
     std_socket.connect(peer).ok()?;
     let sock = monoio::net::udp::UdpSocket::from_std(std_socket).ok()?;
     Some(Conn::new(conn, sock))
@@ -299,7 +301,7 @@ async fn send_paced_payload(
     let mut accepted = 0;
     while source.pending() > accepted {
         match driver.send_paced(payload, now).await {
-            srt_transport::PacedSendOutcome::Sent => {
+            srt_transport::advanced::driver::PacedSendOutcome::Sent => {
                 stats.data_events += 1;
                 accepted += 1;
             }
@@ -310,21 +312,21 @@ async fn send_paced_payload(
             // pending and resend the same bytes as a brand-new, separately
             // sequenced packet next call -- a real duplicate on the wire,
             // not merely a bench accounting quirk.
-            srt_transport::PacedSendOutcome::Accepted => {
+            srt_transport::advanced::driver::PacedSendOutcome::Accepted => {
                 stats.data_events += 1;
                 accepted += 1;
                 break;
             }
-            srt_transport::PacedSendOutcome::NotDue => {
+            srt_transport::advanced::driver::PacedSendOutcome::NotDue => {
                 source.refused();
                 break;
             }
-            srt_transport::PacedSendOutcome::Rejected(error) => {
+            srt_transport::advanced::driver::PacedSendOutcome::Rejected(error) => {
                 eprintln!("[bench-monoio] send_paced rejected (not a pacing refusal): {error}");
                 source.refused();
                 break;
             }
-            srt_transport::PacedSendOutcome::DriverError(error) => {
+            srt_transport::advanced::driver::PacedSendOutcome::DriverError(error) => {
                 eprintln!("[bench-monoio] send_paced driver error: {error}");
                 stats.data_events += 1;
                 accepted += 1;
@@ -590,8 +592,8 @@ fn run_reuseport_multi(cfg: BenchConfig, k: usize) {
     let router: crate::SharedWorkerRouter =
         Arc::new(Mutex::new(srt_lifecycle::WorkerRouter::new(worker_count)));
     // One set of counters for every acceptor thread; see
-    // `srt_transport::IngressTelemetry`.
-    let telemetry = Arc::new(srt_transport::IngressTelemetry::new());
+    // `srt_transport::advanced::telemetry::IngressTelemetry`.
+    let telemetry = Arc::new(srt_transport::advanced::telemetry::IngressTelemetry::new());
 
     // All channels exist before any thread spawns -- see the identical
     // mio/tokio/smol bug this avoids: cloning a partially-built
@@ -666,17 +668,17 @@ struct AcceptorContext<'a> {
     cfg: &'a BenchConfig,
     worker_index: usize,
     start: Instant,
-    admission: &'a srt_transport::AdmissionOptions,
+    admission: &'a srt_transport::advanced::admission::AdmissionOptions,
     router: &'a crate::SharedWorkerRouter,
     senders: &'a [mpsc::Sender<WorkerMessage>],
-    telemetry: &'a srt_transport::IngressTelemetry,
+    telemetry: &'a srt_transport::advanced::telemetry::IngressTelemetry,
     tasks: &'a mut Vec<monoio::task::JoinHandle<ConnStats>>,
 }
 
 fn drain_acceptor_inbox(
     inbox: &Inbox,
     recycle: &Recycle,
-    peers: &mut srt_transport::PeerTable,
+    peers: &mut srt_transport::advanced::admission::PeerTable,
     context: &AcceptorContext<'_>,
 ) {
     while let Ok((peer, buf, size)) = inbox.try_recv() {
@@ -694,7 +696,7 @@ fn drain_acceptor_inbox(
 }
 
 async fn maintain_acceptor_peers(
-    peers: &mut srt_transport::PeerTable,
+    peers: &mut srt_transport::advanced::admission::PeerTable,
     listener: &monoio::net::udp::UdpSocket,
     start: Instant,
     stream_len: Duration,
@@ -732,7 +734,7 @@ fn promotion_decision(
 
 fn apply_acceptor_promotions(
     context: &mut AcceptorContext<'_>,
-    peers: &mut srt_transport::PeerTable,
+    peers: &mut srt_transport::advanced::admission::PeerTable,
     relocations: Vec<(SocketAddr, Option<GroupExtensionData>)>,
 ) {
     for (peer, extension) in relocations {
@@ -774,7 +776,7 @@ fn apply_acceptor_promotions(
 
 fn drain_acceptor_handoffs(
     context: &mut AcceptorContext<'_>,
-    peers: &mut srt_transport::PeerTable,
+    peers: &mut srt_transport::advanced::admission::PeerTable,
     handoffs: &mpsc::Receiver<WorkerMessage>,
 ) {
     while let Ok(message) = handoffs.try_recv() {
@@ -818,15 +820,16 @@ async fn run_acceptor(
     router: crate::SharedWorkerRouter,
     senders: Vec<mpsc::Sender<WorkerMessage>>,
     handoffs: mpsc::Receiver<WorkerMessage>,
-    telemetry: Arc<srt_transport::IngressTelemetry>,
+    telemetry: Arc<srt_transport::advanced::telemetry::IngressTelemetry>,
 ) -> Vec<ConnStats> {
-    let std_listener = match srt_transport::bind_reuseport(cfg.port, cfg.sock_buf_bytes) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("[bench-monoio] acceptor {worker_index}: bind {e}");
-            return Vec::new();
-        }
-    };
+    let std_listener =
+        match srt_transport::advanced::platform::bind_reuseport(cfg.port, cfg.sock_buf_bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[bench-monoio] acceptor {worker_index}: bind {e}");
+                return Vec::new();
+            }
+        };
     let listener = match monoio::net::udp::UdpSocket::from_std(std_listener) {
         Ok(s) => Rc::new(s),
         Err(e) => {
@@ -871,7 +874,7 @@ async fn run_acceptor(
         }
     });
 
-    let mut peers = srt_transport::PeerTable::new();
+    let mut peers = srt_transport::advanced::admission::PeerTable::new();
     let admission = cfg.admission_options(std::process::id(), cfg.cookie_routing);
     let mut tasks: Vec<monoio::task::JoinHandle<ConnStats>> = Vec::new();
     let connect_deadline = Instant::now() + crate::CONNECT_TIMEOUT;
@@ -949,7 +952,7 @@ async fn run_acceptor(
 
 async fn drain_pending_outputs(
     conn: &mut SrtConnection,
-    timers: &mut srt_transport::ManualTimerStore,
+    timers: &mut srt_transport::advanced::driver::ManualTimerStore,
     listener: &monoio::net::udp::UdpSocket,
     destination: SocketAddr,
 ) -> bool {
@@ -981,9 +984,9 @@ fn relocate_to_owner(
     pending_conn: SrtConnection,
     owner: usize,
     senders: &[mpsc::Sender<WorkerMessage>],
-    telemetry: &srt_transport::IngressTelemetry,
+    telemetry: &srt_transport::advanced::telemetry::IngressTelemetry,
 ) {
-    let std_socket = match srt_transport::bind_reuseport(port, sock_buf_bytes) {
+    let std_socket = match srt_transport::advanced::platform::bind_reuseport(port, sock_buf_bytes) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[bench-monoio] relocate {peer}: bind {e}");
@@ -1151,11 +1154,14 @@ async fn serve_pool_socket(cfg: BenchConfig, index: usize, start: Instant) -> Ve
         .expect("nonblocking shared-pool socket");
     {
         use std::os::fd::AsRawFd;
-        let _ = srt_transport::set_sock_bufs(std_socket.as_raw_fd(), cfg.sock_buf_bytes);
+        let _ = srt_transport::advanced::platform::set_sock_bufs(
+            std_socket.as_raw_fd(),
+            cfg.sock_buf_bytes,
+        );
     }
     let sock = monoio::net::udp::UdpSocket::from_std(std_socket).expect("register pool socket");
 
-    let mut peers = srt_transport::PeerTable::new();
+    let mut peers = srt_transport::advanced::admission::PeerTable::new();
     // No SO_REUSEPORT group here, so nothing can rehash and there is
     // nowhere to forward to: one worker, cookie routing inert.
     let admission = cfg.admission_options(std::process::id(), false);
@@ -1215,13 +1221,13 @@ async fn serve_pool_socket(cfg: BenchConfig, index: usize, start: Instant) -> Ve
 /// Admit one datagram. No reuseport group means no cookie forwarding, so
 /// this is the table's admit with a single-worker view.
 fn admit_one(
-    peers: &mut srt_transport::PeerTable,
-    admission: &srt_transport::AdmissionOptions,
+    peers: &mut srt_transport::advanced::admission::PeerTable,
+    admission: &srt_transport::advanced::admission::AdmissionOptions,
     peer: SocketAddr,
     data: &[u8],
     start: Instant,
 ) {
-    let telemetry = srt_transport::IngressTelemetry::new();
+    let telemetry = srt_transport::advanced::telemetry::IngressTelemetry::new();
     let _ = peers.admit(
         peer,
         data,
@@ -1305,8 +1311,8 @@ fn run_reuseport_single(cfg: BenchConfig, workers: usize) {
 async fn receive_single_packet(
     listener: &monoio::net::udp::UdpSocket,
     buffer: &mut Vec<u8>,
-    peers: &mut srt_transport::PeerTable,
-    admission: &srt_transport::AdmissionOptions,
+    peers: &mut srt_transport::advanced::admission::PeerTable,
+    admission: &srt_transport::advanced::admission::AdmissionOptions,
     start: Instant,
 ) {
     match monoio::time::timeout(TIMER_TICK, listener.recv_from(std::mem::take(buffer))).await {
@@ -1332,20 +1338,20 @@ struct SingleAcceptorContext<'a> {
     cfg: &'a BenchConfig,
     router: &'a crate::SharedWorkerRouter,
     senders: &'a [mpsc::Sender<WorkerMessage>],
-    telemetry: &'a srt_transport::IngressTelemetry,
+    telemetry: &'a srt_transport::advanced::telemetry::IngressTelemetry,
 }
 
 fn route_one_connected_peer(
     context: &SingleAcceptorContext<'_>,
-    peers: &mut srt_transport::PeerTable,
-    connected: srt_transport::NewlyConnectedPeer,
+    peers: &mut srt_transport::advanced::admission::PeerTable,
+    connected: srt_transport::advanced::admission::NewlyConnectedPeer,
     routed: &mut usize,
 ) {
     let peer = connected.representative_peer;
     let group = peers
         .logical_peer(&connected.logical_peer)
         .and_then(|logical| logical.group_affinity());
-    let Some(srt_transport::RemovedLogicalPeer::Direct(entry)) =
+    let Some(srt_transport::advanced::admission::RemovedLogicalPeer::Direct(entry)) =
         peers.remove(connected.logical_peer)
     else {
         return;
@@ -1354,14 +1360,16 @@ fn route_one_connected_peer(
         Ok(mut router) => router.assign(peer, group, srt_lifecycle::RoutingMode::LeastTuples),
         Err(_) => 0,
     };
-    let Ok(socket) = srt_transport::bind_reuseport(context.cfg.port, context.cfg.sock_buf_bytes)
-    else {
+    let Ok(socket) = srt_transport::advanced::platform::bind_reuseport(
+        context.cfg.port,
+        context.cfg.sock_buf_bytes,
+    ) else {
         return;
     };
     if socket.connect(peer).is_err() {
         return;
     }
-    let message = WorkerMessage::Handoff(Box::new(srt_transport::Handoff {
+    let message = WorkerMessage::Handoff(Box::new(Handoff {
         socket,
         conn: entry.connection,
     }));
@@ -1374,8 +1382,8 @@ fn route_one_connected_peer(
 fn route_connected_peers(
     context: &SingleAcceptorContext<'_>,
     stream_len: Duration,
-    peers: &mut srt_transport::PeerTable,
-    connected: &mut Vec<srt_transport::NewlyConnectedPeer>,
+    peers: &mut srt_transport::advanced::admission::PeerTable,
+    connected: &mut Vec<srt_transport::advanced::admission::NewlyConnectedPeer>,
     routed: &mut usize,
 ) {
     peers.drain_events(stream_len, connected);
@@ -1390,7 +1398,9 @@ async fn run_single_acceptor(
     router: &crate::SharedWorkerRouter,
     senders: &[mpsc::Sender<WorkerMessage>],
 ) {
-    let Ok(std_socket) = srt_transport::bind_reuseport(cfg.port, cfg.sock_buf_bytes) else {
+    let Ok(std_socket) =
+        srt_transport::advanced::platform::bind_reuseport(cfg.port, cfg.sock_buf_bytes)
+    else {
         eprintln!("[bench-monoio] reuseport-single: bind failed");
         return;
     };
@@ -1399,11 +1409,11 @@ async fn run_single_acceptor(
         return;
     };
 
-    let mut peers = srt_transport::PeerTable::new();
+    let mut peers = srt_transport::advanced::admission::PeerTable::new();
     // One acceptor means one owner for every handshake, so there is
     // nobody a stray CONCLUSION could need forwarding to.
     let admission = cfg.admission_options(std::process::id(), false);
-    let telemetry = srt_transport::IngressTelemetry::new();
+    let telemetry = srt_transport::advanced::telemetry::IngressTelemetry::new();
     let connect_deadline = Instant::now() + crate::CONNECT_TIMEOUT;
     let stream_len = Duration::from_secs_f64(cfg.duration_secs);
     let mut routed = 0usize;

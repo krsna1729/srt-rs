@@ -123,11 +123,13 @@ impl EncryptionMode {
     /// implementation never emits, inflating the MTU check, the SRT DATA
     /// wire rate and the UDP/IP rate.
     #[must_use]
-    const fn tag_bytes(self, cipher: shiguredo_srt::CipherMode) -> u64 {
+    const fn tag_bytes(self, cipher: shiguredo_srt::crypto::CipherMode) -> u64 {
         match (self, cipher) {
             (Self::Plain, _) => 0,
-            (_, shiguredo_srt::CipherMode::Ctr) => 0,
-            (_, shiguredo_srt::CipherMode::Gcm) => shiguredo_srt::GCM_TAG_LEN as u64,
+            (_, shiguredo_srt::crypto::CipherMode::Ctr) => 0,
+            (_, shiguredo_srt::crypto::CipherMode::Gcm) => {
+                shiguredo_srt::crypto::GCM_TAG_LEN as u64
+            }
         }
     }
 }
@@ -146,8 +148,8 @@ impl EncryptionMode {
 pub const fn effective_windows(flow_requested: u32, receive_requested: u32) -> (u32, u32) {
     let flow = if flow_requested < shiguredo_srt::MIN_FLOW_WINDOW_PACKETS {
         shiguredo_srt::MIN_FLOW_WINDOW_PACKETS
-    } else if flow_requested > shiguredo_srt::MAX_FLOW_WINDOW {
-        shiguredo_srt::MAX_FLOW_WINDOW
+    } else if flow_requested > shiguredo_srt::handshake::MAX_FLOW_WINDOW {
+        shiguredo_srt::handshake::MAX_FLOW_WINDOW
     } else {
         flow_requested
     };
@@ -170,7 +172,7 @@ pub const fn effective_windows(flow_requested: u32, receive_requested: u32) -> (
 /// spurious `SourceExceedsPacingEnvelope`.
 #[must_use]
 pub const fn pacing_packet_size_bytes(payload_bytes: u64) -> u64 {
-    shiguredo_srt::SRT_HEADER_SIZE as u64 + payload_bytes
+    shiguredo_srt::wire::SRT_HEADER_SIZE as u64 + payload_bytes
 }
 
 /// Encoded IPv4/UDP/SRT DATA packet size, including an optional GCM tag.
@@ -184,11 +186,11 @@ pub const fn pacing_packet_size_bytes(payload_bytes: u64) -> u64 {
 pub const fn encoded_packet_size_bytes(
     payload_bytes: u64,
     encryption: EncryptionMode,
-    cipher: shiguredo_srt::CipherMode,
+    cipher: shiguredo_srt::crypto::CipherMode,
     udp_ip_header_bytes: u64,
 ) -> u64 {
     udp_ip_header_bytes
-        + shiguredo_srt::SRT_HEADER_SIZE as u64
+        + shiguredo_srt::wire::SRT_HEADER_SIZE as u64
         + payload_bytes
         + encryption.tag_bytes(cipher)
 }
@@ -234,7 +236,7 @@ pub struct ProtocolEnvelope {
     /// Cipher mode, which is what decides whether a DATA packet carries an
     /// authentication tag. The protocol default is `Ctr`, which carries
     /// none; srt-bench never selects `Gcm`.
-    pub cipher_mode: shiguredo_srt::CipherMode,
+    pub cipher_mode: shiguredo_srt::crypto::CipherMode,
     /// Sender flow-control window (packets).
     pub flow_window_packets: u32,
     /// Receiver window (packets).
@@ -262,12 +264,12 @@ impl Default for ProtocolEnvelope {
             encryption: EncryptionMode::default(),
             // Matches `ConnectionOptions`' own default; srt-bench never
             // negotiates GCM.
-            cipher_mode: shiguredo_srt::CipherMode::Ctr,
-            flow_window_packets: shiguredo_srt::DEFAULT_FLOW_WINDOW,
-            receive_window_packets: shiguredo_srt::DEFAULT_FLOW_WINDOW,
+            cipher_mode: shiguredo_srt::crypto::CipherMode::Ctr,
+            flow_window_packets: shiguredo_srt::handshake::DEFAULT_FLOW_WINDOW,
+            receive_window_packets: shiguredo_srt::handshake::DEFAULT_FLOW_WINDOW,
             tsbpd_latency_ms: 120,
-            ack_interval: Duration::from_micros(shiguredo_srt::ACK_INTERVAL_MICROS),
-            light_ack_interval_packets: shiguredo_srt::LIGHT_ACK_INTERVAL_PACKETS,
+            ack_interval: Duration::from_micros(shiguredo_srt::receiver::ACK_INTERVAL_MICROS),
+            light_ack_interval_packets: shiguredo_srt::receiver::LIGHT_ACK_INTERVAL_PACKETS,
             nak_interval: Duration::from_micros(shiguredo_srt::PERIODIC_NAK_INTERVAL_MICROS),
             keepalive_interval: Duration::from_micros(shiguredo_srt::KEEPALIVE_INTERVAL_MICROS),
             periodic_nak_enabled: true,
@@ -389,8 +391,8 @@ impl Default for AdmissionEnvelope {
     fn default() -> Self {
         Self {
             connect_cc: 1,
-            max_half_open_peers: srt_transport::PeerTableConfig::default().max_half_open_peers
-                as u64,
+            max_half_open_peers: srt_transport::advanced::admission::PeerTableConfig::default()
+                .max_half_open_peers as u64,
         }
     }
 }
@@ -932,7 +934,7 @@ fn derive_core(input: &CapacityInput) -> CoreRates {
         BondMode::Broadcast | BondMode::Backup => Availability::Unknown,
     };
     let payload_bps = w.source_bps_per_stream as f64 * w.source_streams as f64;
-    let srt_header_bytes = shiguredo_srt::SRT_HEADER_SIZE as u64;
+    let srt_header_bytes = shiguredo_srt::wire::SRT_HEADER_SIZE as u64;
     // Pacing and the SRT DATA wire size are different layers: the pacer never
     // sees the GCM tag.
     let pacing_packet_bytes = pacing_packet_size_bytes(w.payload_bytes);
@@ -977,7 +979,7 @@ fn derive_core(input: &CapacityInput) -> CoreRates {
 fn pacing_bytes_per_second(protocol: &ProtocolEnvelope, source_bps: u64) -> f64 {
     match protocol.bandwidth {
         SrtBandwidthPolicy::ProtocolDefault => {
-            shiguredo_srt::DEFAULT_MAX_BANDWIDTH_BYTES_PER_SEC as f64
+            shiguredo_srt::sender::DEFAULT_MAX_BANDWIDTH_BYTES_PER_SEC as f64
         }
         SrtBandwidthPolicy::LegacySourceFixed => (source_bps / 8).max(1) as f64,
         SrtBandwidthPolicy::FixedBps(bps) => (bps / 8).max(1) as f64,
@@ -1579,7 +1581,9 @@ fn add_pacing_reasons(
     // claimed the protocol maximum was 1468 and could raise a false hard
     // ExceedsEnvelope. The tag still belongs in the IPv4 envelope below and in
     // all wire-rate accounting.
-    if pacing_packet_size_bytes(input.workload.payload_bytes) > shiguredo_srt::DEFAULT_MTU as u64 {
+    if pacing_packet_size_bytes(input.workload.payload_bytes)
+        > shiguredo_srt::handshake::DEFAULT_MTU as u64
+    {
         reasons.push(CapacityReason::PayloadExceedsProtocolMtu);
     }
     if encoded_packet_size_bytes(
@@ -1587,7 +1591,7 @@ fn add_pacing_reasons(
         input.protocol.encryption,
         input.protocol.cipher_mode,
         input.network.udp_ip_header_bytes,
-    ) > shiguredo_srt::DEFAULT_MTU as u64
+    ) > shiguredo_srt::handshake::DEFAULT_MTU as u64
     {
         reasons.push(CapacityReason::PayloadExceedsIpv4MtuEnvelope);
     }
@@ -1924,7 +1928,7 @@ fn validate_protocol(input: &CapacityInput) -> Result<(), ModelError> {
     // cannot instantiate and must not be classified as though it could run
     // -- neither Conditional nor ExceedsEnvelope describes "impossible".
     if input.protocol.encryption == EncryptionMode::Aes192
-        && input.protocol.cipher_mode == shiguredo_srt::CipherMode::Gcm
+        && input.protocol.cipher_mode == shiguredo_srt::crypto::CipherMode::Gcm
     {
         return Err(ModelError(
             "AES-192 is not supported with GCM mode".to_string(),
@@ -2178,13 +2182,13 @@ mod tests {
         assert_eq!(effective_windows(31, 31), (32, 32));
         assert_eq!(effective_windows(32, 32), (32, 32), "at minimum unchanged");
         assert_eq!(
-            effective_windows(shiguredo_srt::MAX_FLOW_WINDOW, 64),
-            (shiguredo_srt::MAX_FLOW_WINDOW, 64),
+            effective_windows(shiguredo_srt::handshake::MAX_FLOW_WINDOW, 64),
+            (shiguredo_srt::handshake::MAX_FLOW_WINDOW, 64),
             "at maximum unchanged"
         );
         assert_eq!(
-            effective_windows(shiguredo_srt::MAX_FLOW_WINDOW + 1, 64),
-            (shiguredo_srt::MAX_FLOW_WINDOW, 64),
+            effective_windows(shiguredo_srt::handshake::MAX_FLOW_WINDOW + 1, 64),
+            (shiguredo_srt::handshake::MAX_FLOW_WINDOW, 64),
             "above maximum clamps down"
         );
         assert_eq!(

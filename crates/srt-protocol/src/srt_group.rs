@@ -662,8 +662,10 @@ impl SrtGroup {
                 }
             }
             ConnectionEvent::Disconnected { reason } => {
-                self.events
-                    .push_back(GroupEvent::MemberDisconnected { member_id, reason });
+                self.events.push_back(GroupEvent::MemberDisconnected {
+                    member_id,
+                    reason: reason.to_string(),
+                });
                 self.members[index].state = GroupMemberState::Broken;
                 if self.mode == GroupMode::Backup {
                     self.promote_backup_member();

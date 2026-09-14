@@ -66,7 +66,7 @@ fn protocol_mtu_boundary_matches_what_the_core_actually_enforces() {
     // must match that, or the classifier would call a payload the
     // implementation happily emits a protocol violation.
     let mut input = known_input();
-    let max_payload = (0..=shiguredo_srt::DEFAULT_MTU as u64)
+    let max_payload = (0..=shiguredo_srt::handshake::DEFAULT_MTU as u64)
         .rev()
         .find(|payload| {
             srt_bench::model::encoded_packet_size_bytes(
@@ -74,12 +74,12 @@ fn protocol_mtu_boundary_matches_what_the_core_actually_enforces() {
                 input.protocol.encryption,
                 input.protocol.cipher_mode,
                 0,
-            ) <= shiguredo_srt::DEFAULT_MTU as u64
+            ) <= shiguredo_srt::handshake::DEFAULT_MTU as u64
         })
         .expect("an MTU-sized packet fits");
     assert_eq!(
         max_payload,
-        shiguredo_srt::DEFAULT_MTU as u64 - shiguredo_srt::SRT_HEADER_SIZE as u64,
+        shiguredo_srt::handshake::DEFAULT_MTU as u64 - shiguredo_srt::wire::SRT_HEADER_SIZE as u64,
         "plaintext protocol budget must equal the core's max_payload_size"
     );
     input.workload.payload_bytes = max_payload;
@@ -106,7 +106,7 @@ fn ipv4_envelope_is_reported_separately_from_protocol_truth() {
     // so it is its own reason and must not masquerade as protocol truth.
     let mut input = known_input();
     input.workload.payload_bytes =
-        shiguredo_srt::DEFAULT_MTU as u64 - shiguredo_srt::SRT_HEADER_SIZE as u64;
+        shiguredo_srt::handshake::DEFAULT_MTU as u64 - shiguredo_srt::wire::SRT_HEADER_SIZE as u64;
     let a = assessment(input);
     assert!(
         !a.reasons
@@ -139,10 +139,10 @@ fn key_length_alone_does_not_add_an_authentication_tag() {
 
     // Only selecting GCM adds one.
     let mut gcm = aes;
-    gcm.protocol.cipher_mode = shiguredo_srt::CipherMode::Gcm;
+    gcm.protocol.cipher_mode = shiguredo_srt::crypto::CipherMode::Gcm;
     assert_eq!(
         assessment(gcm).derived.srt_data_packet_bytes,
-        assessment(plain).derived.srt_data_packet_bytes + shiguredo_srt::GCM_TAG_LEN as u64,
+        assessment(plain).derived.srt_data_packet_bytes + shiguredo_srt::crypto::GCM_TAG_LEN as u64,
         "GCM adds exactly one tag"
     );
 }
@@ -154,10 +154,11 @@ fn the_gcm_tag_is_not_part_of_the_protocol_mtu_limit() {
     // applied. So the core accepts the same plaintext payload under GCM as in
     // plain, and charging the tag to the protocol limit claimed a maximum of
     // 1468 where the implementation allows 1484 -- a false hard reason.
-    let max_plaintext = shiguredo_srt::DEFAULT_MTU as u64 - shiguredo_srt::SRT_HEADER_SIZE as u64;
+    let max_plaintext =
+        shiguredo_srt::handshake::DEFAULT_MTU as u64 - shiguredo_srt::wire::SRT_HEADER_SIZE as u64;
     let mut gcm = known_input();
     gcm.protocol.encryption = EncryptionMode::Aes256;
-    gcm.protocol.cipher_mode = shiguredo_srt::CipherMode::Gcm;
+    gcm.protocol.cipher_mode = shiguredo_srt::crypto::CipherMode::Gcm;
     gcm.workload.payload_bytes = max_plaintext;
     let a = assessment(gcm.clone());
     assert!(
@@ -180,10 +181,10 @@ fn the_gcm_tag_still_counts_at_the_wire_and_ip_layers() {
     let plain = known_input();
     let mut gcm = plain.clone();
     gcm.protocol.encryption = EncryptionMode::Aes256;
-    gcm.protocol.cipher_mode = shiguredo_srt::CipherMode::Gcm;
+    gcm.protocol.cipher_mode = shiguredo_srt::crypto::CipherMode::Gcm;
     assert_eq!(
         assessment(gcm).derived.srt_data_packet_bytes,
-        assessment(plain).derived.srt_data_packet_bytes + shiguredo_srt::GCM_TAG_LEN as u64,
+        assessment(plain).derived.srt_data_packet_bytes + shiguredo_srt::crypto::GCM_TAG_LEN as u64,
         "the tag is real on the wire even though it is not in the MTU limit"
     );
 }
@@ -622,7 +623,7 @@ fn aes192_with_gcm_is_not_classifiable() {
     // can never exist.
     let mut input = known_input();
     input.protocol.encryption = EncryptionMode::Aes192;
-    input.protocol.cipher_mode = shiguredo_srt::CipherMode::Gcm;
+    input.protocol.cipher_mode = shiguredo_srt::crypto::CipherMode::Gcm;
     let err = srt_bench::model::assess(input, srt_bench::model::ClassifierPolicy::default())
         .expect_err("AES-192 + GCM must not classify");
     assert!(err.0.contains("AES-192"), "{}", err.0);
@@ -719,7 +720,7 @@ fn half_open_offer_above_published_cap_exceeds_envelope() {
     input.workload.physical_connections = 2000;
     input.admission.connect_cc = 2000;
     input.admission.max_half_open_peers =
-        srt_transport::PeerTableConfig::default().max_half_open_peers as u64;
+        srt_transport::advanced::admission::PeerTableConfig::default().max_half_open_peers as u64;
     let a = assessment(input);
     assert_eq!(a.class, CellClass::ExceedsEnvelope);
     assert!(

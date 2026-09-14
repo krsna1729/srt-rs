@@ -1,6 +1,7 @@
+use shiguredo_srt::wire::{ControlPacket, ControlType, SrtPacket};
 use shiguredo_srt::{
-    ConnectionOptions, ConnectionOutput, ConnectionState, ControlPacket, ControlType,
-    GroupMemberState, GroupMode, SrtConnection, SrtGroup, SrtPacket, TimerId, Timestamp,
+    ConnectionOptions, ConnectionOutput, ConnectionState, GroupMemberState, GroupMode,
+    SrtConnection, SrtGroup, TimerId, Timestamp,
 };
 
 fn ts(micros: u64) -> Timestamp {

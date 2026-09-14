@@ -187,6 +187,62 @@ const OUTPUT_QUEUE_OVERFLOW_REASON: &str = "protocol output queue limit exceeded
 pub const MAX_EVENT_QUEUE_ACTIONS: usize = MAX_FLOW_WINDOW as usize + 64;
 const EVENT_QUEUE_OVERFLOW_REASON: &str = "protocol event queue limit exceeded";
 
+/// Why a connection became disconnected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DisconnectReason {
+    /// The peer sent an SRT SHUTDOWN packet.
+    PeerShutdown,
+    /// The peer stopped sending traffic for the inactivity interval.
+    InactivityTimeout,
+    /// A local graceful close exceeded its shutdown retry window.
+    ShutdownTimeout,
+    /// The peer sent traffic after a local close began.
+    PeerActivityAfterShutdown,
+    /// The bounded protocol output queue overflowed.
+    OutputQueueOverflow,
+    /// The bounded protocol event queue overflowed.
+    EventQueueOverflow,
+    /// A protocol error supplied by a lower layer.
+    ProtocolError(String),
+}
+
+impl DisconnectReason {
+    /// Convert a legacy diagnostic string into a typed reason.
+    #[must_use]
+    pub fn from_message(message: &str) -> Self {
+        match message {
+            "peer shutdown" => Self::PeerShutdown,
+            "inactivity timeout" => Self::InactivityTimeout,
+            "shutdown timeout" => Self::ShutdownTimeout,
+            "peer activity after shutdown" => Self::PeerActivityAfterShutdown,
+            OUTPUT_QUEUE_OVERFLOW_REASON => Self::OutputQueueOverflow,
+            EVENT_QUEUE_OVERFLOW_REASON => Self::EventQueueOverflow,
+            other => Self::ProtocolError(other.to_owned()),
+        }
+    }
+}
+
+impl From<String> for DisconnectReason {
+    fn from(value: String) -> Self {
+        Self::from_message(&value)
+    }
+}
+
+impl fmt::Display for DisconnectReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::PeerShutdown => "peer shutdown",
+            Self::InactivityTimeout => "inactivity timeout",
+            Self::ShutdownTimeout => "shutdown timeout",
+            Self::PeerActivityAfterShutdown => "peer activity after shutdown",
+            Self::OutputQueueOverflow => OUTPUT_QUEUE_OVERFLOW_REASON,
+            Self::EventQueueOverflow => EVENT_QUEUE_OVERFLOW_REASON,
+            Self::ProtocolError(message) => message,
+        };
+        f.write_str(message)
+    }
+}
+
 /// A connection event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionEvent {
@@ -214,7 +270,7 @@ pub enum ConnectionEvent {
     /// An error occurred.
     Error(String),
     /// Disconnected.
-    Disconnected { reason: String },
+    Disconnected { reason: DisconnectReason },
     /// A key refresh is needed.
     KeyRefreshNeeded { key_length: usize },
 }
@@ -286,10 +342,10 @@ pub struct ConnectionOptions {
     /// Default false preserves the idle-gap contract. Packed with the
     /// overhead byte above so the options footprint does not grow.
     pub pacing_repay: bool,
-    /// above [`crate::MAX_FLOW_WINDOW`] are clamped during construction.
+    /// above [`crate::handshake::MAX_FLOW_WINDOW`] are clamped during construction.
     pub flow_window_packets: u32,
     /// Local receive-buffer capacity, in packets. Values above
-    /// [`crate::MAX_FLOW_WINDOW`] are clamped during construction.
+    /// [`crate::handshake::MAX_FLOW_WINDOW`] are clamped during construction.
     pub receive_buffer_packets: u32,
     /// Maximum number of delivered DATA events retained for the application.
     ///
@@ -300,16 +356,16 @@ pub struct ConnectionOptions {
     /// Full ACK period in microseconds (Haivision `COMM_SYN` / RFC §3.2.4
     /// default 10 ms).
     ///
-    /// Clamped to [`crate::MIN_ACK_INTERVAL_MICROS`]..=[`crate::MAX_ACK_INTERVAL_MICROS`]
+    /// Clamped to [`crate::receiver::MIN_ACK_INTERVAL_MICROS`]..=[`crate::receiver::MAX_ACK_INTERVAL_MICROS`]
     /// (10–40 ms) when the connection is constructed. Per-connection, not
     /// process-global. Values above 10 ms are **non-default /
     /// non-RFC-recommended** coalesce and do not retarget NAK/EXP.
-    /// High-fan-in evidence target: [`crate::HIGH_FANIN_ACK_INTERVAL_MICROS`].
+    /// High-fan-in evidence target: [`crate::receiver::HIGH_FANIN_ACK_INTERVAL_MICROS`].
     pub ack_interval_micros: u64,
     /// Light ACK packet cadence (Haivision `SELF_CLOCK_INTERVAL` / RFC
     /// recommendation: 64).
     ///
-    /// Clamped to [`crate::MIN_LIGHT_ACK_INTERVAL_PACKETS`]..=[`crate::MAX_LIGHT_ACK_INTERVAL_PACKETS`]
+    /// Clamped to [`crate::receiver::MIN_LIGHT_ACK_INTERVAL_PACKETS`]..=[`crate::receiver::MAX_LIGHT_ACK_INTERVAL_PACKETS`]
     /// (64–256) when the connection is constructed. Values above 64 are
     /// **non-default / non-RFC-recommended** coalesce. A receive window
     /// smaller than 64 packets does not Light-ACK; full ACK is the path.
@@ -388,8 +444,8 @@ impl Default for ConnectionOptions {
             flow_window_packets: DEFAULT_FLOW_WINDOW,
             receive_buffer_packets: DEFAULT_FLOW_WINDOW,
             delivery_queue_packets: DEFAULT_FLOW_WINDOW,
-            ack_interval_micros: crate::ACK_INTERVAL_MICROS,
-            light_ack_interval_packets: crate::LIGHT_ACK_INTERVAL_PACKETS,
+            ack_interval_micros: crate::receiver::ACK_INTERVAL_MICROS,
+            light_ack_interval_packets: crate::receiver::LIGHT_ACK_INTERVAL_PACKETS,
             pacing_repay: false,
         }
     }
@@ -523,9 +579,10 @@ fn normalize_buffer_options(mut options: ConnectionOptions) -> ConnectionOptions
         truncate_utf8(stream_id, MAX_HANDSHAKE_OPTION_BYTES);
     }
     truncate_utf8(&mut options.congestion_control, MAX_HANDSHAKE_OPTION_BYTES);
-    options.ack_interval_micros = crate::clamp_ack_interval_micros(options.ack_interval_micros);
+    options.ack_interval_micros =
+        crate::receiver::clamp_ack_interval_micros(options.ack_interval_micros);
     options.light_ack_interval_packets =
-        crate::clamp_light_ack_interval_packets(options.light_ack_interval_packets);
+        crate::receiver::clamp_light_ack_interval_packets(options.light_ack_interval_packets);
     options
 }
 
@@ -560,7 +617,7 @@ impl SrtConnection {
                 OUTPUT_QUEUE_OVERFLOW_REASON.to_string(),
             ));
             self.queue_event(ConnectionEvent::Disconnected {
-                reason: OUTPUT_QUEUE_OVERFLOW_REASON.to_string(),
+                reason: DisconnectReason::OutputQueueOverflow,
             });
             return;
         }
@@ -608,7 +665,7 @@ impl SrtConnection {
             EVENT_QUEUE_OVERFLOW_REASON.to_string(),
         ));
         self.event_queue.push_back(ConnectionEvent::Disconnected {
-            reason: EVENT_QUEUE_OVERFLOW_REASON.to_string(),
+            reason: DisconnectReason::EventQueueOverflow,
         });
     }
 
@@ -1187,7 +1244,7 @@ impl SrtConnection {
                     });
                     if elapsed >= INACTIVITY_TIMEOUT_MICROS {
                         self.queue_event(ConnectionEvent::Disconnected {
-                            reason: "inactivity timeout".to_string(),
+                            reason: DisconnectReason::InactivityTimeout,
                         });
                         self.set_state(ConnectionState::Disconnected);
                     } else {
@@ -1288,7 +1345,7 @@ impl SrtConnection {
                 .shutdown_started_at
                 .is_some_and(|started| now.saturating_sub(started) >= SHUTDOWN_TIMEOUT_MICROS)
             {
-                self.finish_local_close("shutdown timeout");
+                self.finish_local_close(DisconnectReason::ShutdownTimeout);
             } else {
                 self.send_shutdown(now);
                 self.queue_output(ConnectionOutput::SetTimer {
@@ -1886,7 +1943,7 @@ impl SrtConnection {
 
     fn handle_data_packet(&mut self, mut pkt: DataPacket, now: Timestamp) -> Result<(), Error> {
         if self.state == ConnectionState::Closing {
-            self.finish_local_close("peer activity after shutdown");
+            self.finish_local_close(DisconnectReason::PeerActivityAfterShutdown);
             return Ok(());
         }
         if self.state != ConnectionState::Connected {
@@ -1985,7 +2042,7 @@ impl SrtConnection {
             pkt.control_info.len()
         );
         if self.state == ConnectionState::Closing && pkt.control_type != ControlType::Shutdown {
-            self.finish_local_close("peer activity after shutdown");
+            self.finish_local_close(DisconnectReason::PeerActivityAfterShutdown);
             return Ok(());
         }
         match pkt.control_type {
@@ -2435,20 +2492,18 @@ impl SrtConnection {
         });
         self.set_state(ConnectionState::Disconnected);
         self.queue_event(ConnectionEvent::Disconnected {
-            reason: "peer shutdown".to_string(),
+            reason: DisconnectReason::PeerShutdown,
         });
         Ok(())
     }
 
-    fn finish_local_close(&mut self, reason: &str) {
+    fn finish_local_close(&mut self, reason: DisconnectReason) {
         self.shutdown_started_at = None;
         self.queue_output(ConnectionOutput::ClearTimer {
             id: TimerId::Shutdown,
         });
         self.set_state(ConnectionState::Disconnected);
-        self.queue_event(ConnectionEvent::Disconnected {
-            reason: reason.to_owned(),
-        });
+        self.queue_event(ConnectionEvent::Disconnected { reason });
     }
 
     fn handle_drop_req(&mut self, pkt: ControlPacket, now: Timestamp) -> Result<(), Error> {
@@ -2618,10 +2673,10 @@ impl SrtConnection {
         self.receiver
             .as_ref()
             .map_or_else(
-                || crate::clamp_ack_interval_micros(self.options.ack_interval_micros),
+                || crate::receiver::clamp_ack_interval_micros(self.options.ack_interval_micros),
                 ReceiverBuffer::ack_timer_tick_micros,
             )
-            .min(crate::ACK_INTERVAL_MICROS)
+            .min(crate::receiver::ACK_INTERVAL_MICROS)
     }
 
     /// Set up timers after the connection is established.
@@ -3274,7 +3329,7 @@ fn encode_nak_packet(control_info: Vec<u8>, timestamp: u32, peer_socket_id: u32)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{GroupType, SRTGROUP_MASK};
+    use crate::handshake::{GroupType, SRTGROUP_MASK};
 
     /// Deterministic, non-secret KM salt for protocol test fixtures.
     fn test_km_salt() -> [u8; 16] {
@@ -4110,9 +4165,30 @@ mod tests {
         .expect("shutdown timeout succeeds");
 
         assert_eq!(conn.state(), ConnectionState::Disconnected);
-        assert!(std::iter::from_fn(|| conn.poll_event()).any(
-            |event| matches!(event, ConnectionEvent::Disconnected { reason } if reason == "shutdown timeout")
+        assert!(
+            std::iter::from_fn(|| conn.poll_event()).any(|event| matches!(
+                event,
+                ConnectionEvent::Disconnected {
+                    reason: DisconnectReason::ShutdownTimeout
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn disconnect_reason_is_typed_and_keeps_legacy_display_text() {
+        assert!(matches!(
+            DisconnectReason::from_message("peer shutdown"),
+            DisconnectReason::PeerShutdown
         ));
+        assert!(matches!(
+            DisconnectReason::from_message("unexpected peer error"),
+            DisconnectReason::ProtocolError(message) if message == "unexpected peer error"
+        ));
+        assert_eq!(
+            DisconnectReason::ShutdownTimeout.to_string(),
+            "shutdown timeout"
+        );
     }
 
     #[test]
@@ -4771,21 +4847,21 @@ mod tests {
         });
         assert_eq!(
             coalesced.options.ack_interval_micros,
-            crate::MAX_ACK_INTERVAL_MICROS
+            crate::receiver::MAX_ACK_INTERVAL_MICROS
         );
         assert_eq!(
             coalesced.options.light_ack_interval_packets,
-            crate::MAX_LIGHT_ACK_INTERVAL_PACKETS
+            crate::receiver::MAX_LIGHT_ACK_INTERVAL_PACKETS
         );
 
         let defaulted = SrtConnection::new_listener(ConnectionOptions::default());
         assert_eq!(
             defaulted.options.ack_interval_micros,
-            crate::ACK_INTERVAL_MICROS
+            crate::receiver::ACK_INTERVAL_MICROS
         );
         assert_eq!(
             defaulted.options.light_ack_interval_packets,
-            crate::LIGHT_ACK_INTERVAL_PACKETS
+            crate::receiver::LIGHT_ACK_INTERVAL_PACKETS
         );
         assert_ne!(
             coalesced.options.ack_interval_micros, defaulted.options.ack_interval_micros,
@@ -4796,8 +4872,8 @@ mod tests {
     #[test]
     fn coalesced_ack_keeps_comm_syn_tick_and_defers_sendto() {
         let mut conn = SrtConnection::new_listener(ConnectionOptions {
-            ack_interval_micros: crate::HIGH_FANIN_ACK_INTERVAL_MICROS,
-            light_ack_interval_packets: crate::HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS,
+            ack_interval_micros: crate::receiver::HIGH_FANIN_ACK_INTERVAL_MICROS,
+            light_ack_interval_packets: crate::receiver::HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS,
             tsbpd_delay: 0,
             ..ConnectionOptions::default()
         });
@@ -4812,7 +4888,7 @@ mod tests {
 
         assert_eq!(
             ack_timer_duration(drain_outputs(&mut conn)),
-            Some(crate::ACK_INTERVAL_MICROS)
+            Some(crate::receiver::ACK_INTERVAL_MICROS)
         );
 
         conn.handle_timer(TimerId::Ack, Timestamp::from_micros(10_000))
@@ -4820,7 +4896,7 @@ mod tests {
         let early = drain_outputs(&mut conn);
         assert_eq!(
             ack_timer_duration(early.iter().cloned()),
-            Some(crate::ACK_INTERVAL_MICROS)
+            Some(crate::receiver::ACK_INTERVAL_MICROS)
         );
         assert!(
             !early
@@ -4866,7 +4942,7 @@ mod tests {
         );
         assert_eq!(
             ack_timer_duration(outputs),
-            Some(crate::ACK_INTERVAL_MICROS)
+            Some(crate::receiver::ACK_INTERVAL_MICROS)
         );
     }
 }

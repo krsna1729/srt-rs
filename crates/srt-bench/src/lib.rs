@@ -17,7 +17,7 @@ pub mod watch;
 
 use std::time::{Duration, Instant};
 
-pub use srt_transport::is_ordered_close;
+pub use srt_transport::advanced::admission::is_ordered_close;
 pub mod runtimes;
 
 // Real handshakes over real loopback sockets on a real (often shared, CI)
@@ -222,12 +222,12 @@ impl Encryption {
                 options.passphrase = None;
                 options.crypto_salt = None;
                 options.crypto_sek = None;
-                options.key_length = shiguredo_srt::KeyLength::Aes128;
+                options.key_length = shiguredo_srt::crypto::KeyLength::Aes128;
                 return;
             }
-            Self::Aes128 => shiguredo_srt::KeyLength::Aes128,
-            Self::Aes192 => shiguredo_srt::KeyLength::Aes192,
-            Self::Aes256 => shiguredo_srt::KeyLength::Aes256,
+            Self::Aes128 => shiguredo_srt::crypto::KeyLength::Aes128,
+            Self::Aes192 => shiguredo_srt::crypto::KeyLength::Aes192,
+            Self::Aes256 => shiguredo_srt::crypto::KeyLength::Aes256,
         };
         options.passphrase = Some("srt-bench-encryption".to_string());
         options.key_length = key_length;
@@ -567,7 +567,7 @@ pub type SharedWorkerRouter =
 /// the six acceptor loops build the `decide_promotion` group argument.
 #[must_use]
 pub fn group_from_extension(
-    extension: Option<shiguredo_srt::GroupExtensionData>,
+    extension: Option<shiguredo_srt::handshake::GroupExtensionData>,
 ) -> Option<srt_lifecycle::GroupAffinity> {
     extension.map(|extension| srt_lifecycle::GroupAffinity {
         group_id: extension.group_id,
@@ -627,8 +627,8 @@ impl BenchConfig {
     /// `validate_bond_topology` at startup so bench never runs them.
     pub fn validate_canonical(
         &self,
-        capabilities: srt_transport::TransportCapabilities,
-    ) -> Result<srt_transport::ResolvedEndpointPlan, String> {
+        capabilities: srt_transport::advanced::prepared::TransportCapabilities,
+    ) -> Result<srt_transport::advanced::prepared::ResolvedEndpointPlan, String> {
         let workers =
             std::num::NonZeroUsize::new(self.workers.max(1)).unwrap_or(std::num::NonZeroUsize::MIN);
         self.endpoint_plan()
@@ -644,8 +644,8 @@ impl BenchConfig {
                     std::num::NonZeroUsize::new(self.sock_buf_bytes.max(1))
                         .unwrap_or(std::num::NonZeroUsize::MIN),
                 ),
-                srt_transport::OutputDrainBudget::default(),
-                srt_transport::RecvBudget::default(),
+                srt_transport::advanced::driver::OutputDrainBudget::default(),
+                srt_transport::advanced::driver::RecvBudget::default(),
             )
             .map_err(|e| e.to_string())
     }
@@ -693,17 +693,20 @@ impl BenchConfig {
     /// Handshake group metadata for one physical leg. Two adjacent legs form
     /// one group so the listener can exercise actual grouped ingress rather
     /// than merely parse an otherwise-unused extension.
-    pub fn bond_extension_for(&self, index: usize) -> Option<shiguredo_srt::GroupExtensionData> {
+    pub fn bond_extension_for(
+        &self,
+        index: usize,
+    ) -> Option<shiguredo_srt::handshake::GroupExtensionData> {
         if self.bond_mode == BondMode::None || index >= self.bond_pairs * 2 {
             return None;
         }
         let group_type = match self.bond_mode {
-            BondMode::Broadcast => shiguredo_srt::GroupType::Broadcast,
-            BondMode::Backup => shiguredo_srt::GroupType::Backup,
+            BondMode::Broadcast => shiguredo_srt::handshake::GroupType::Broadcast,
+            BondMode::Backup => shiguredo_srt::handshake::GroupType::Backup,
             BondMode::None => unreachable!("checked above"),
         };
-        Some(shiguredo_srt::GroupExtensionData {
-            group_id: shiguredo_srt::SRTGROUP_MASK | ((index / 2) as u32 + 1),
+        Some(shiguredo_srt::handshake::GroupExtensionData {
+            group_id: shiguredo_srt::handshake::SRTGROUP_MASK | ((index / 2) as u32 + 1),
             group_type,
             flags: 0,
             // Give backup legs an unambiguous active/standby ordering. A
@@ -788,7 +791,7 @@ impl BenchConfig {
     /// is passed through unchanged so the strict transport resolver's
     /// rejection actually fires instead of silently discarding the request.
     #[must_use]
-    pub fn endpoint_plan(&self) -> srt_transport::EndpointSocketPlan {
+    pub fn endpoint_plan(&self) -> srt_transport::advanced::prepared::EndpointSocketPlan {
         let ownership = if self.exclusive_udp_tuple() {
             srt_transport::SocketOwnership::Exclusive
         } else {
@@ -820,7 +823,7 @@ impl BenchConfig {
                 Promotion::All => srt_transport::PromotionPolicy::All,
             }
         };
-        srt_transport::EndpointSocketPlan::new(topology, ownership, promotion)
+        srt_transport::advanced::prepared::EndpointSocketPlan::new(topology, ownership, promotion)
     }
 
     fn worker_count(n: usize) -> srt_transport::WorkerCount {
@@ -850,7 +853,9 @@ impl BenchConfig {
     /// `validate_bond_topology` alone: an out-of-range session value used to
     /// be silently dropped by [`Self::session_config`] instead of failing
     /// visibly (`Q-BENCH-SOURCE`).
-    pub fn validate_startup(&self) -> Result<srt_transport::ResolvedEndpointPlan, String> {
+    pub fn validate_startup(
+        &self,
+    ) -> Result<srt_transport::advanced::prepared::ResolvedEndpointPlan, String> {
         self.validate_bond_topology().map_err(|e| e.to_string())?;
         self.validate_session_config().map_err(|e| e.to_string())?;
         self.validate_canonical(self.transport_flavor().capabilities())
@@ -991,19 +996,19 @@ impl BenchConfig {
         &self,
         socket_id: u32,
         cookie_routing: bool,
-    ) -> srt_transport::AdmissionOptions {
+    ) -> srt_transport::advanced::admission::AdmissionOptions {
         let session = self.session_config();
         let mut template = session.into_connection_options();
         template.socket_id = socket_id;
         self.encryption.apply_to(&mut template);
-        srt_transport::AdmissionOptions {
+        srt_transport::advanced::admission::AdmissionOptions {
             socket_id,
             tsbpd_delay: self.latency_ms,
             cookie_routing,
             bonded_inputs: if self.bond_mode == BondMode::None {
-                srt_transport::BondedInputPolicy::Reject
+                srt_transport::advanced::admission::BondedInputPolicy::Reject
             } else {
-                srt_transport::BondedInputPolicy::Accept
+                srt_transport::advanced::admission::BondedInputPolicy::Accept
             },
             connection_template: Some(template),
             handshake_retry_interval: std::time::Duration::from_micros(
@@ -1553,7 +1558,7 @@ enum SlotPhase {
 
 struct SharedSenderSlot {
     phase: SlotPhase,
-    caller: Option<srt_transport::LogicalCallerId>,
+    caller: Option<srt_transport::advanced::caller::LogicalCallerId>,
     stats: Vec<ConnStats>,
     /// This slot's application payload producer. One per logical stream:
     /// a bonded pair carries the same source over two legs, so it has one
@@ -1615,7 +1620,7 @@ impl SharedSenderSchedStats {
 /// (application deadline expired), or in-flight-handshake slots are
 /// visited. Idle slots cost nothing.
 pub struct SharedSender {
-    callers: srt_transport::CallerTable,
+    callers: srt_transport::advanced::caller::CallerTable,
     slots: Vec<SharedSenderSlot>,
     payload: Vec<u8>,
     start: Instant,
@@ -1693,7 +1698,7 @@ impl SharedSender {
         }
 
         Self {
-            callers: srt_transport::CallerTable::new(),
+            callers: srt_transport::advanced::caller::CallerTable::new(),
             slots,
             payload: vec![0x42; PAYLOAD_SIZE],
             start,
@@ -1740,7 +1745,7 @@ impl SharedSender {
         if let Some(pair_index) = slot.bond_pair_index {
             let first = make_caller_connection(cfg, index, now);
             let second = make_caller_connection(cfg, pair_index, now);
-            let group_id = shiguredo_srt::SRTGROUP_MASK | ((index / 2) as u32 + 1);
+            let group_id = shiguredo_srt::handshake::SRTGROUP_MASK | ((index / 2) as u32 + 1);
             let mode = match cfg.bond_mode {
                 BondMode::Broadcast => shiguredo_srt::GroupMode::Broadcast,
                 BondMode::Backup => shiguredo_srt::GroupMode::Backup,
@@ -1754,13 +1759,13 @@ impl SharedSender {
                     group_id,
                     mode,
                     [
-                        srt_transport::CallerGroupLeg::new(
+                        srt_transport::advanced::caller::CallerGroupLeg::new(
                             index as u32 + 1,
                             cfg.bond_extension_for(index).expect("group leg").weight,
                             cfg.addr_for(index),
                             first,
                         ),
-                        srt_transport::CallerGroupLeg::new(
+                        srt_transport::advanced::caller::CallerGroupLeg::new(
                             pair_index as u32 + 1,
                             cfg.bond_extension_for(pair_index)
                                 .expect("group leg")
@@ -1779,7 +1784,7 @@ impl SharedSender {
             let sid = cfg.caller_socket_id_for(index);
             let caller = self
                 .callers
-                .add_direct(srt_transport::CallerLeg::new(
+                .add_direct(srt_transport::advanced::caller::CallerLeg::new(
                     cfg.addr_for(index),
                     make_caller_connection(cfg, index, now),
                 ))
@@ -1803,7 +1808,7 @@ impl SharedSender {
     }
 
     pub fn feed(&mut self, peer: std::net::SocketAddr, data: &[u8]) {
-        if let Ok(sid) = shiguredo_srt::peek_destination_socket_id(data)
+        if let Ok(sid) = shiguredo_srt::wire::peek_destination_socket_id(data)
             && let Some(&slot_id) = self.socket_id_to_slot.get(&sid)
         {
             let slot = &mut self.slots[slot_id];
@@ -1913,14 +1918,14 @@ impl SharedSender {
                 .logical_caller(&caller_id)
                 .and_then(|c| c.state());
             match state {
-                Some(srt_transport::LogicalCallerState::Connected) => {
+                Some(srt_transport::advanced::caller::LogicalCallerState::Connected) => {
                     if self.transition_to_streaming(slot_id, now_instant, now) {
                         self.in_flight_set.swap_remove(i);
                     } else {
                         i += 1;
                     }
                 }
-                Some(srt_transport::LogicalCallerState::Disconnected) => {
+                Some(srt_transport::advanced::caller::LogicalCallerState::Disconnected) => {
                     self.mark_slot_failed(slot_id);
                     self.in_flight_set.swap_remove(i);
                 }
@@ -1953,7 +1958,7 @@ impl SharedSender {
                 .callers
                 .logical_caller(&caller_id)
                 .and_then(|c| c.state());
-            if let Some(srt_transport::LogicalCallerState::Disconnected) = state {
+            if let Some(srt_transport::advanced::caller::LogicalCallerState::Disconnected) = state {
                 self.finalize_slot(slot_id, false);
                 self.closing_set.swap_remove(i);
             } else {
@@ -1980,16 +1985,18 @@ impl SharedSender {
 
         match slot.phase {
             SlotPhase::Handshaking => match state {
-                Some(srt_transport::LogicalCallerState::Connected) => {
+                Some(srt_transport::advanced::caller::LogicalCallerState::Connected) => {
                     self.transition_to_streaming(slot_id, now_instant, now);
                 }
-                Some(srt_transport::LogicalCallerState::Disconnected) => {
+                Some(srt_transport::advanced::caller::LogicalCallerState::Disconnected) => {
                     self.mark_slot_failed(slot_id);
                 }
                 _ => {}
             },
             SlotPhase::Streaming => {
-                if let Some(srt_transport::LogicalCallerState::Disconnected) = state {
+                if let Some(srt_transport::advanced::caller::LogicalCallerState::Disconnected) =
+                    state
+                {
                     self.mark_slot_disconnected(slot_id);
                 }
             }
@@ -1997,7 +2004,9 @@ impl SharedSender {
                 // A dirty inbound packet can observe the close completing
                 // before `check_closing` walks the closing set, so this path
                 // must retire the caller too, not just mark the slot Closed.
-                if let Some(srt_transport::LogicalCallerState::Disconnected) = state {
+                if let Some(srt_transport::advanced::caller::LogicalCallerState::Disconnected) =
+                    state
+                {
                     self.finalize_slot(slot_id, false);
                 }
             }
@@ -2058,7 +2067,7 @@ impl SharedSender {
             .logical_caller(&caller_id)
             .and_then(|c| c.stats())
             .is_some_and(|s| match s {
-                srt_transport::LogicalCallerStats::Group(g) => {
+                srt_transport::advanced::caller::LogicalCallerStats::Group(g) => {
                     g.aggregate.pending_legs == 0
                         || (g.legs.len() == slot.physical_legs
                             && g.legs.iter().all(|l| l.connection.sender.is_some()))
@@ -2088,14 +2097,10 @@ impl SharedSender {
             .logical_caller(&caller_id)
             .and_then(|c| c.stats())
             .map_or(0, |s| match s {
-                srt_transport::LogicalCallerStats::Direct(d) => {
-                    if d.sender.is_some() {
-                        1
-                    } else {
-                        0
-                    }
+                srt_transport::advanced::caller::LogicalCallerStats::Direct(d) => {
+                    if d.sender.is_some() { 1 } else { 0 }
                 }
-                srt_transport::LogicalCallerStats::Group(g) => g
+                srt_transport::advanced::caller::LogicalCallerStats::Group(g) => g
                     .legs
                     .iter()
                     .filter(|l| l.connection.sender.is_some())
@@ -2125,7 +2130,7 @@ impl SharedSender {
     fn snapshot_caller_stats(
         &mut self,
         slot_id: SlotId,
-        caller_id: srt_transport::LogicalCallerId,
+        caller_id: srt_transport::advanced::caller::LogicalCallerId,
     ) {
         let slot = &mut self.slots[slot_id];
         match self
@@ -2133,10 +2138,10 @@ impl SharedSender {
             .logical_caller(&caller_id)
             .and_then(|caller| caller.stats())
         {
-            Some(srt_transport::LogicalCallerStats::Direct(stats)) => {
+            Some(srt_transport::advanced::caller::LogicalCallerStats::Direct(stats)) => {
                 apply_sender_stats(&mut slot.stats[0], &stats);
             }
-            Some(srt_transport::LogicalCallerStats::Group(stats)) => {
+            Some(srt_transport::advanced::caller::LogicalCallerStats::Group(stats)) => {
                 for (result, leg) in slot.stats.iter_mut().zip(stats.legs) {
                     result.connected |= matches!(
                         leg.state,
@@ -2518,7 +2523,7 @@ pub(crate) fn bind_configured_socket(
 
     let socket = std::net::UdpSocket::bind(addr)?;
     socket.set_nonblocking(true)?;
-    srt_transport::set_sock_bufs(socket.as_raw_fd(), sock_buf_bytes)?;
+    srt_transport::advanced::platform::set_sock_bufs(socket.as_raw_fd(), sock_buf_bytes)?;
     Ok(socket)
 }
 
@@ -2534,7 +2539,9 @@ pub(crate) fn bind_shared_sender_socket(
 /// Convert a shared-listener table into benchmark rows. A bonded publisher is
 /// one logical receiver row, with logical delivery counters and aggregated
 /// wire telemetry; ordinary peers retain their physical-connection rows.
-pub fn collect_listener_stats(peers: srt_transport::PeerTable) -> Vec<ConnStats> {
+pub fn collect_listener_stats(
+    peers: srt_transport::advanced::admission::PeerTable,
+) -> Vec<ConnStats> {
     let mut stats = peers
         .bonded_stats()
         .into_iter()
@@ -3106,11 +3113,11 @@ fn parse_cookie_routing(cli: &Cli) -> bool {
 
 fn parse_ack_interval_micros(cli: &Cli) -> u64 {
     match cli.flags.get("ack-interval-micros").map(String::as_str) {
-        None | Some("") => shiguredo_srt::ACK_INTERVAL_MICROS,
+        None | Some("") => shiguredo_srt::receiver::ACK_INTERVAL_MICROS,
         Some(raw) => match raw.parse::<u64>() {
             Ok(value)
-                if (shiguredo_srt::MIN_ACK_INTERVAL_MICROS
-                    ..=shiguredo_srt::MAX_ACK_INTERVAL_MICROS)
+                if (shiguredo_srt::receiver::MIN_ACK_INTERVAL_MICROS
+                    ..=shiguredo_srt::receiver::MAX_ACK_INTERVAL_MICROS)
                     .contains(&value) =>
             {
                 value
@@ -3120,10 +3127,10 @@ fn parse_ack_interval_micros(cli: &Cli) -> u64 {
                     "error: --ack-interval-micros must be {}..={} (got '{raw}'); \
                      Haivision COMM_SYN default and floor is {}, Contabo 4× evidence \
                      ceiling is {} (values above the default are non-RFC-recommended coalesce)",
-                    shiguredo_srt::MIN_ACK_INTERVAL_MICROS,
-                    shiguredo_srt::MAX_ACK_INTERVAL_MICROS,
-                    shiguredo_srt::ACK_INTERVAL_MICROS,
-                    shiguredo_srt::HIGH_FANIN_ACK_INTERVAL_MICROS
+                    shiguredo_srt::receiver::MIN_ACK_INTERVAL_MICROS,
+                    shiguredo_srt::receiver::MAX_ACK_INTERVAL_MICROS,
+                    shiguredo_srt::receiver::ACK_INTERVAL_MICROS,
+                    shiguredo_srt::receiver::HIGH_FANIN_ACK_INTERVAL_MICROS
                 );
                 usage()
             }
@@ -3137,11 +3144,11 @@ fn parse_light_ack_interval_packets(cli: &Cli) -> u32 {
         .get("light-ack-interval-packets")
         .map(String::as_str)
     {
-        None | Some("") => shiguredo_srt::LIGHT_ACK_INTERVAL_PACKETS,
+        None | Some("") => shiguredo_srt::receiver::LIGHT_ACK_INTERVAL_PACKETS,
         Some(raw) => match raw.parse::<u32>() {
             Ok(value)
-                if (shiguredo_srt::MIN_LIGHT_ACK_INTERVAL_PACKETS
-                    ..=shiguredo_srt::MAX_LIGHT_ACK_INTERVAL_PACKETS)
+                if (shiguredo_srt::receiver::MIN_LIGHT_ACK_INTERVAL_PACKETS
+                    ..=shiguredo_srt::receiver::MAX_LIGHT_ACK_INTERVAL_PACKETS)
                     .contains(&value) =>
             {
                 value
@@ -3151,10 +3158,10 @@ fn parse_light_ack_interval_packets(cli: &Cli) -> u32 {
                     "error: --light-ack-interval-packets must be {}..={} (got '{raw}'); \
                      Haivision/RFC default and floor is {}, Contabo 4× evidence \
                      ceiling is {} (values above the default are non-RFC-recommended coalesce)",
-                    shiguredo_srt::MIN_LIGHT_ACK_INTERVAL_PACKETS,
-                    shiguredo_srt::MAX_LIGHT_ACK_INTERVAL_PACKETS,
-                    shiguredo_srt::LIGHT_ACK_INTERVAL_PACKETS,
-                    shiguredo_srt::HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS
+                    shiguredo_srt::receiver::MIN_LIGHT_ACK_INTERVAL_PACKETS,
+                    shiguredo_srt::receiver::MAX_LIGHT_ACK_INTERVAL_PACKETS,
+                    shiguredo_srt::receiver::LIGHT_ACK_INTERVAL_PACKETS,
+                    shiguredo_srt::receiver::HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS
                 );
                 usage()
             }
@@ -3164,7 +3171,7 @@ fn parse_light_ack_interval_packets(cli: &Cli) -> u32 {
 
 fn parse_sock_buf(cli: &Cli) -> usize {
     match cli.flags.get("sock-buf").map(String::as_str) {
-        None => srt_transport::SOCK_BUF_BYTES,
+        None => srt_transport::advanced::platform::SOCK_BUF_BYTES,
         Some("default") | Some("0") => 0,
         Some(raw) => {
             let (digits, scale) = match raw.strip_suffix(['m', 'M']) {
@@ -3185,10 +3192,11 @@ fn parse_sock_buf(cli: &Cli) -> usize {
 
 fn parse_runtime_settings(cli: &Cli, duration_secs: f64) -> (usize, bool, usize, f64) {
     // A CPU *set*, not a count: the two roles need disjoint cores.
-    let cpu_list =
-        srt_transport::parse_cpu_spec(cli.flags.get("cpus").map(String::as_str).unwrap_or(""));
+    let cpu_list = srt_transport::advanced::platform::parse_cpu_spec(
+        cli.flags.get("cpus").map(String::as_str).unwrap_or(""),
+    );
     if !cpu_list.is_empty()
-        && let Err(error) = srt_transport::restrict_to_cpu_list(&cpu_list)
+        && let Err(error) = srt_transport::advanced::platform::restrict_to_cpu_list(&cpu_list)
     {
         eprintln!("warning: could not restrict to CPUs {cpu_list:?}: {error}");
     }
@@ -3378,7 +3386,8 @@ mod tests {
         HandshakeAdmission, HandshakePermit, Ingress, Link, Mode, PeerTopology, Promotion, Runtime,
         SharedSender, parse_required_positionals,
     };
-    use shiguredo_srt::{ConnectionOptions, KeyLength};
+    use shiguredo_srt::ConnectionOptions;
+    use shiguredo_srt::crypto::KeyLength;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -3418,18 +3427,19 @@ mod tests {
     #[test]
     fn ack_coalesce_is_stamped_on_connection_and_admission_templates() {
         let mut cfg = config();
-        cfg.ack_interval_micros = shiguredo_srt::HIGH_FANIN_ACK_INTERVAL_MICROS;
-        cfg.light_ack_interval_packets = shiguredo_srt::HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS;
+        cfg.ack_interval_micros = shiguredo_srt::receiver::HIGH_FANIN_ACK_INTERVAL_MICROS;
+        cfg.light_ack_interval_packets =
+            shiguredo_srt::receiver::HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS;
 
         let mut options = ConnectionOptions::default();
         cfg.apply_protocol_options(&mut options);
         assert_eq!(
             options.ack_interval_micros,
-            shiguredo_srt::HIGH_FANIN_ACK_INTERVAL_MICROS
+            shiguredo_srt::receiver::HIGH_FANIN_ACK_INTERVAL_MICROS
         );
         assert_eq!(
             options.light_ack_interval_packets,
-            shiguredo_srt::HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS
+            shiguredo_srt::receiver::HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS
         );
 
         let template = cfg
@@ -3439,11 +3449,11 @@ mod tests {
             .expect("session template");
         assert_eq!(
             template.ack_interval_micros,
-            shiguredo_srt::HIGH_FANIN_ACK_INTERVAL_MICROS
+            shiguredo_srt::receiver::HIGH_FANIN_ACK_INTERVAL_MICROS
         );
         assert_eq!(
             template.light_ack_interval_packets,
-            shiguredo_srt::HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS
+            shiguredo_srt::receiver::HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS
         );
     }
 
@@ -3461,8 +3471,8 @@ mod tests {
             source_backlog_ms: crate::source::DEFAULT_SOURCE_BACKLOG_MS,
             datapath_queue_horizon_ms: crate::queue::DEFAULT_DATAPATH_QUEUE_HORIZON_MS,
             outbound_retry_horizon_ms: crate::scheduling::DEFAULT_OUTBOUND_RETRY_HORIZON_MS,
-            ack_interval_micros: shiguredo_srt::ACK_INTERVAL_MICROS,
-            light_ack_interval_packets: shiguredo_srt::LIGHT_ACK_INTERVAL_PACKETS,
+            ack_interval_micros: shiguredo_srt::receiver::ACK_INTERVAL_MICROS,
+            light_ack_interval_packets: shiguredo_srt::receiver::LIGHT_ACK_INTERVAL_PACKETS,
             connections: 1,
             egress: Egress::PerConnection,
             ingress: Ingress::SharedPool(4),
@@ -3502,7 +3512,7 @@ mod tests {
         assert_eq!(template.key_length, KeyLength::Aes256);
         assert_eq!(
             admission.bonded_inputs,
-            srt_transport::BondedInputPolicy::Reject
+            srt_transport::advanced::admission::BondedInputPolicy::Reject
         );
         cfg.bond_mode = BondMode::Backup;
         cfg.bond_pairs = 1;
@@ -3517,7 +3527,7 @@ mod tests {
         assert_ne!(cfg.caller_socket_id_for(0), cfg.caller_socket_id_for(1));
         assert_eq!(
             cfg.admission_options(17, false).bonded_inputs,
-            srt_transport::BondedInputPolicy::Accept
+            srt_transport::advanced::admission::BondedInputPolicy::Accept
         );
     }
 
@@ -4405,7 +4415,7 @@ mod tests {
 
     fn assert_timeout_invariants(
         sender: &SharedSender,
-        caller_id: srt_transport::LogicalCallerId,
+        caller_id: srt_transport::advanced::caller::LogicalCallerId,
         sid: u32,
     ) {
         assert_eq!(sender.slots[0].phase, super::SlotPhase::Closed);
@@ -4489,7 +4499,7 @@ mod tests {
     fn streaming_slot_fixture(
         sender: &mut SharedSender,
         cfg: &BenchConfig,
-    ) -> (srt_transport::LogicalCallerId, u32) {
+    ) -> (srt_transport::advanced::caller::LogicalCallerId, u32) {
         let mut out = Vec::new();
         sender.tick(cfg, &mut out);
         let caller_id = sender.slots[0].caller.expect("caller must be allocated");

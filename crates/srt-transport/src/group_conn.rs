@@ -509,7 +509,7 @@ impl GroupConn {
     }
 
     /// Return the next deduplicated, sequence-aligned group payload.
-    pub fn poll_data(&mut self, now: Timestamp) -> Option<shiguredo_srt::GroupPacket> {
+    pub fn poll_data(&mut self, now: Timestamp) -> Option<shiguredo_srt::group::GroupPacket> {
         self.poll_data_bounded(now, shiguredo_srt::MAX_GROUP_MEMBERS)
             .packet
     }
@@ -745,7 +745,7 @@ mod group_conn_tests {
     #[test]
     fn mark_member_broken_if_new_only_reports_the_first_transition() {
         let mut group = shiguredo_srt::SrtGroup::new(
-            shiguredo_srt::SRTGROUP_MASK | 1,
+            shiguredo_srt::handshake::SRTGROUP_MASK | 1,
             shiguredo_srt::GroupMode::Broadcast,
         )
         .expect("group builds");
@@ -783,7 +783,7 @@ mod group_conn_tests {
         ] {
             let mut first_peer = Peer::new();
             let mut second_peer = Peer::new();
-            let group = GroupConfig::new(42, shiguredo_srt::GroupType::Broadcast);
+            let group = GroupConfig::new(42, shiguredo_srt::handshake::GroupType::Broadcast);
             let mut conn = GroupConn::caller(
                 group,
                 [
@@ -873,7 +873,7 @@ mod group_conn_tests {
     #[test]
     fn caller_rejects_a_shared_ownership_leg_instead_of_building_an_unconnected_socket() {
         let peer = Peer::new();
-        let group = GroupConfig::new(44, shiguredo_srt::GroupType::Broadcast);
+        let group = GroupConfig::new(44, shiguredo_srt::handshake::GroupType::Broadcast);
         let result = GroupConn::caller(
             group,
             [GroupCallerLeg::new(
@@ -928,7 +928,7 @@ mod group_conn_tests {
                 .build()
                 .expect("second caller config");
         let conn = GroupConn::caller(
-            GroupConfig::new(45, shiguredo_srt::GroupType::Broadcast),
+            GroupConfig::new(45, shiguredo_srt::handshake::GroupType::Broadcast),
             [
                 GroupCallerLeg::new(1, 10, first_config),
                 GroupCallerLeg::new(2, 20, second_config),
@@ -948,7 +948,7 @@ mod group_conn_tests {
     fn connect_two_leg_group(runtime: RuntimeFlavor) -> (GroupConn, Peer, Peer) {
         let mut first_peer = Peer::new();
         let mut second_peer = Peer::new();
-        let group = GroupConfig::new(43, shiguredo_srt::GroupType::Broadcast);
+        let group = GroupConfig::new(43, shiguredo_srt::handshake::GroupType::Broadcast);
         let mut conn = GroupConn::caller(
             group,
             [

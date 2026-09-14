@@ -6,7 +6,9 @@
 use std::net::UdpSocket;
 use std::time::{Duration, Instant};
 
-use srt_transport::{HighResWaiter, MonotonicDeadline, PlannedWait, WaitBackend, plan_wait};
+use srt_transport::advanced::native_io::{
+    HighResWaiter, MonotonicDeadline, PlannedWait, WaitBackend, plan_wait,
+};
 
 fn backends() -> Vec<WaitBackend> {
     let mut out = vec![WaitBackend::AbsoluteTimerFd];

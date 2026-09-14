@@ -12,11 +12,11 @@
 //! a real, nonzero, per-call allocation count instead of a lucky pointer
 //! match.
 
-use shiguredo_srt::{ConnectionOutput, GroupType, SrtConnection, Timestamp};
-use srt_transport::{
-    CallerConfig, GroupCallerLeg, GroupConfig, GroupConn, GroupDriveReport, OutputDrainBudget,
-    RuntimeFlavor,
-};
+use shiguredo_srt::handshake::GroupType;
+use shiguredo_srt::{ConnectionOutput, SrtConnection, Timestamp};
+use srt_transport::advanced::driver::OutputDrainBudget;
+use srt_transport::advanced::group::{GroupCallerLeg, GroupConn, GroupDriveReport};
+use srt_transport::{CallerConfig, GroupConfig, RuntimeFlavor};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering};
 

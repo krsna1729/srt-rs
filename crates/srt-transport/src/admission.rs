@@ -5,7 +5,8 @@ use crate::{
     group_connection_stats,
 };
 use shiguredo_srt::{
-    Bytes, ConnectionEvent, ConnectionOptions, ConnectionOutput, SrtConnection, Timestamp,
+    Bytes, ConnectionEvent, ConnectionOptions, ConnectionOutput, DisconnectReason, SrtConnection,
+    Timestamp,
 };
 use std::collections::hash_map::Entry as HashEntry;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -27,8 +28,8 @@ use zeroize::Zeroize;
 /// sender itself gets no event for its own close, so on that side every
 /// `Disconnected` is by definition unplanned.
 #[must_use]
-pub fn is_ordered_close(reason: &str) -> bool {
-    reason == "peer shutdown"
+pub fn is_ordered_close(reason: &DisconnectReason) -> bool {
+    matches!(reason, DisconnectReason::PeerShutdown)
 }
 
 pub struct AdmissionPeer {
@@ -255,7 +256,7 @@ impl RejectionReason {
 pub struct AdmissionRequest {
     pub peer: std::net::SocketAddr,
     pub claimed_identity: srt_lifecycle::HandshakeIdentity,
-    pub handshake: shiguredo_srt::HandshakePacket,
+    pub handshake: shiguredo_srt::handshake::HandshakePacket,
     pub access_control: Option<shiguredo_srt::stream_id::AccessControl>,
 }
 
@@ -281,7 +282,7 @@ enum AdmissionHookResult {
 }
 
 struct DecodedAdmissionDatagram {
-    handshake: Option<shiguredo_srt::HandshakePacket>,
+    handshake: Option<shiguredo_srt::handshake::HandshakePacket>,
     destination_socket_id: u32,
 }
 
@@ -296,7 +297,7 @@ struct AdmissionFeedResult {
 struct KnownConclusionContext<'a> {
     peer: std::net::SocketAddr,
     physical: Option<PhysicalPeerKey>,
-    handshake: Option<&'a shiguredo_srt::HandshakePacket>,
+    handshake: Option<&'a shiguredo_srt::handshake::HandshakePacket>,
     identity: Option<&'a srt_lifecycle::HandshakeIdentity>,
     now: Timestamp,
     options: &'a AdmissionOptions,
@@ -321,9 +322,10 @@ fn decode_admission_datagram(data: &[u8]) -> Result<DecodedAdmissionDatagram, ()
     // guard each datagram is decoded twice and the first payload allocation
     // is discarded on the next line.
     let handshake = is_control_datagram(data)
-        .then(|| shiguredo_srt::peek_handshake(data))
+        .then(|| shiguredo_srt::handshake::peek_handshake(data))
         .flatten();
-    let destination_socket_id = shiguredo_srt::peek_destination_socket_id(data).map_err(|_| ())?;
+    let destination_socket_id =
+        shiguredo_srt::wire::peek_destination_socket_id(data).map_err(|_| ())?;
     Ok(DecodedAdmissionDatagram {
         handshake,
         destination_socket_id,
@@ -1205,14 +1207,14 @@ impl PeerTable {
     fn reject_new_peer(
         &self,
         peer: std::net::SocketAddr,
-        handshake: Option<&shiguredo_srt::HandshakePacket>,
+        handshake: Option<&shiguredo_srt::handshake::HandshakePacket>,
         telemetry: &IngressTelemetry,
     ) -> Option<Admit> {
         let Some(packet) = handshake else {
             telemetry.record_invalid_datagram();
             return Some(Admit::Dropped(AdmissionDropReason::InvalidPacket));
         };
-        if packet.handshake_type != shiguredo_srt::HandshakeType::Induction {
+        if packet.handshake_type != shiguredo_srt::handshake::HandshakeType::Induction {
             telemetry.record_invalid_datagram();
             return Some(Admit::Dropped(AdmissionDropReason::InvalidPacket));
         }
@@ -1295,7 +1297,7 @@ impl PeerTable {
     fn group_admission_allowed(
         &self,
         identity: &srt_lifecycle::HandshakeIdentity,
-        handshake: &shiguredo_srt::HandshakePacket,
+        handshake: &shiguredo_srt::handshake::HandshakePacket,
         options: &AdmissionOptions,
     ) -> bool {
         let Some(group) = identity.group.as_ref() else {
@@ -1306,7 +1308,7 @@ impl PeerTable {
             return false;
         };
         if options.bonded_inputs != BondedInputPolicy::Accept
-            || group.group_id & shiguredo_srt::SRTGROUP_MASK == 0
+            || group.group_id & shiguredo_srt::handshake::SRTGROUP_MASK == 0
         {
             return false;
         }
@@ -1962,7 +1964,9 @@ impl PeerTable {
             destination_socket_id,
             handshake
                 .as_ref()
-                .filter(|packet| packet.handshake_type == shiguredo_srt::HandshakeType::Induction)
+                .filter(|packet| {
+                    packet.handshake_type == shiguredo_srt::handshake::HandshakeType::Induction
+                })
                 .map(|packet| packet.socket_id),
         );
         if let Some(physical) = physical
@@ -2883,7 +2887,7 @@ impl PeerTable {
         peer: std::net::SocketAddr,
         data: &[u8],
     ) -> Option<&mut AdmissionPeer> {
-        let destination_socket_id = shiguredo_srt::peek_destination_socket_id(data).ok()?;
+        let destination_socket_id = shiguredo_srt::wire::peek_destination_socket_id(data).ok()?;
         let physical = self.physical_for_datagram(peer, destination_socket_id, None)?;
         self.get_peer_mut(&physical)
     }
@@ -3228,11 +3232,12 @@ fn apply_group_event(
                 }) =>
         {
             group.connected = false;
-            group.torn_down |= !is_ordered_close(&error);
+            let reason = DisconnectReason::from_message(&error);
+            group.torn_down |= !is_ordered_close(&reason);
             out.push(AdmissionEvent {
                 representative_peer: group.representative_peer,
                 logical_peer: group.logical_peer,
-                event: ConnectionEvent::Disconnected { reason: error },
+                event: ConnectionEvent::Disconnected { reason },
             });
         }
         shiguredo_srt::GroupEvent::MemberError { .. }
@@ -3258,7 +3263,8 @@ mod tests {
     use proptest::prelude::*;
 
     fn induction_packet(socket_id: u32) -> Vec<u8> {
-        let packet = shiguredo_srt::HandshakePacket::new_induction_request(socket_id).encode(0, 0);
+        let packet = shiguredo_srt::handshake::HandshakePacket::new_induction_request(socket_id)
+            .encode(0, 0);
         let mut bytes = Vec::new();
         packet
             .encode(&mut bytes)
@@ -3729,7 +3735,7 @@ mod tests {
     /// entry point rather than a private-field poke.
     fn arm_group_leg_deadline(table: &mut PeerTable, now: Timestamp, micros_from_now: u64) {
         let group = shiguredo_srt::SrtGroup::new(
-            shiguredo_srt::SRTGROUP_MASK | 1,
+            shiguredo_srt::handshake::SRTGROUP_MASK | 1,
             shiguredo_srt::GroupMode::Broadcast,
         )
         .expect("valid group");

@@ -38,7 +38,7 @@ impl RecvBatch {
     pub const MAX_CAPACITY: usize = 1024;
     /// Hard cap for one receive scratch buffer. UDP datagrams larger than
     /// this are reported as truncated by the kernel and never fed to SRT.
-    pub const MAX_BUF_LEN: usize = shiguredo_srt::MAX_DATAGRAM_SIZE;
+    pub const MAX_BUF_LEN: usize = shiguredo_srt::wire::MAX_DATAGRAM_SIZE;
 
     #[must_use]
     pub fn new() -> Self {

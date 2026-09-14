@@ -4,10 +4,12 @@
 
 use std::time::Duration;
 
+use shiguredo_srt::crypto::{CipherMode, KeyFlag, KeyLength};
+use shiguredo_srt::handshake::{GroupExtensionData, GroupType};
+use shiguredo_srt::wire::{DataPacket, PacketPosition, SrtPacket};
 use shiguredo_srt::{
-    CipherMode, ConnectionEvent, ConnectionOptions, ConnectionOutput, ConnectionState,
-    ConnectionStats, DataPacket, ErrorKind, GroupExtensionData, GroupType, KeyFlag, KeyLength,
-    PacketPosition, SrtConnection, SrtPacket, TimerId, Timestamp,
+    ConnectionEvent, ConnectionOptions, ConnectionOutput, ConnectionState, ConnectionStats,
+    ErrorKind, SrtConnection, TimerId, Timestamp,
 };
 
 /// テスト用のデフォルトオプション (TSBPD 遅延を 0 にして即時配信)
@@ -1754,8 +1756,8 @@ fn dropreq_drops_receiver_message() {
         _ => panic!("expected data packet"),
     };
 
-    let mut dropreq = shiguredo_srt::ControlPacket::new(
-        shiguredo_srt::ControlType::DropReq,
+    let mut dropreq = shiguredo_srt::wire::ControlPacket::new(
+        shiguredo_srt::wire::ControlType::DropReq,
         100,
         listener.socket_id(),
     );
@@ -1786,8 +1788,8 @@ fn dropreq_rejects_high_bit_endpoints() {
         let mut listener = SrtConnection::new_listener(test_options());
         establish_connection(&mut caller, &mut listener).expect("connected");
 
-        let mut dropreq = shiguredo_srt::ControlPacket::new(
-            shiguredo_srt::ControlType::DropReq,
+        let mut dropreq = shiguredo_srt::wire::ControlPacket::new(
+            shiguredo_srt::wire::ControlType::DropReq,
             100,
             listener.socket_id(),
         );
@@ -1814,8 +1816,8 @@ fn dropreq_rejects_range_larger_than_receive_window() {
     let mut listener = SrtConnection::new_listener(test_options());
     establish_connection(&mut caller, &mut listener).expect("connected");
 
-    let mut dropreq = shiguredo_srt::ControlPacket::new(
-        shiguredo_srt::ControlType::DropReq,
+    let mut dropreq = shiguredo_srt::wire::ControlPacket::new(
+        shiguredo_srt::wire::ControlType::DropReq,
         100,
         listener.socket_id(),
     );
@@ -1901,7 +1903,7 @@ fn key_rotation_exchanges_km_control_packets_and_data_keeps_flowing() {
     const PACKETS_TO_SWITCH: u64 = 4;
     caller
         .seed_encrypted_packet_count_for_test(
-            shiguredo_srt::CryptoContext::KM_REFRESH_PERIOD - PACKETS_TO_SWITCH,
+            shiguredo_srt::crypto::CryptoContext::KM_REFRESH_PERIOD - PACKETS_TO_SWITCH,
         )
         .expect("seed encrypted packet count for accelerated key refresh");
 

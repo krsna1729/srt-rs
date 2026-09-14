@@ -8,11 +8,12 @@
 //! an inference from the generic implementation's test passing.
 #![cfg(feature = "tokio")]
 
-use shiguredo_srt::{ConnectionOutput, GroupType, SrtConnection, Timestamp};
+use shiguredo_srt::handshake::GroupType;
+use shiguredo_srt::{ConnectionOutput, SrtConnection, Timestamp};
+use srt_transport::advanced::driver::OutputDrainBudget;
+use srt_transport::advanced::group::{GroupCallerLeg, GroupDriveReport};
 use srt_transport::tokio_transport::GroupConn;
-use srt_transport::{
-    CallerConfig, GroupCallerLeg, GroupConfig, GroupDriveReport, OutputDrainBudget,
-};
+use srt_transport::{CallerConfig, GroupConfig};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering};
 

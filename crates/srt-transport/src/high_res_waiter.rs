@@ -160,6 +160,9 @@ pub struct HighResWaiter<K> {
     backend: WaitBackend,
     heap: DeadlineHeap<K>,
     max_keys: usize,
+    /// Logical keys retained by either the fd registry or deadline heap.
+    /// A key may have both representations but consumes one capacity slot.
+    keys: HashSet<K>,
     by_key: HashMap<K, (RawFd, u64)>,
     by_token: HashMap<u64, K>,
     next_token: u64,
@@ -193,6 +196,12 @@ where
     /// Build a waiter on a specific backend with an explicit finite key
     /// capacity.
     pub fn with_backend_and_capacity(backend: WaitBackend, max_keys: usize) -> io::Result<Self> {
+        if max_keys == 0 || max_keys > MAX_WAITER_KEYS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "high-resolution waiter capacity must be in 1..=MAX_WAITER_KEYS",
+            ));
+        }
         if backend == WaitBackend::EpollPwait2 && !epoll_pwait2_available() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -218,7 +227,8 @@ where
             timer,
             backend,
             heap: DeadlineHeap::new(),
-            max_keys: max_keys.clamp(1, MAX_WAITER_KEYS),
+            max_keys,
+            keys: HashSet::new(),
             by_key: HashMap::new(),
             by_token: HashMap::new(),
             next_token: FIRST_CONN_TOKEN,
@@ -256,9 +266,7 @@ where
             self.by_key.insert(key, (fd, token));
             return Ok(());
         }
-        if !self.heap.contains_key(&key)
-            && self.by_key.len().saturating_add(self.heap.len()) >= self.max_keys
-        {
+        if !self.keys.contains(&key) && self.keys.len() >= self.max_keys {
             return Err(io::Error::other(
                 "high-resolution waiter key capacity exhausted",
             ));
@@ -273,34 +281,38 @@ where
             libc::EPOLLIN,
         )?;
         self.by_token.insert(token, key.clone());
-        self.by_key.insert(key, (fd, token));
+        self.by_key.insert(key.clone(), (fd, token));
+        self.keys.insert(key);
         Ok(())
     }
 
     pub fn deregister(&mut self, key: &K) -> io::Result<()> {
         self.heap.remove(key);
         let Some((fd, token)) = self.by_key.remove(key) else {
+            self.keys.remove(key);
             return Ok(());
         };
         self.by_token.remove(&token);
+        self.keys.remove(key);
         epoll_ctl(self.epoll.as_raw_fd(), libc::EPOLL_CTL_DEL, fd, token, 0)
     }
 
     pub fn set_deadline(&mut self, key: K, deadline: MonotonicDeadline) -> io::Result<()> {
-        if !self.by_key.contains_key(&key)
-            && !self.heap.contains_key(&key)
-            && self.by_key.len().saturating_add(self.heap.len()) >= self.max_keys
-        {
+        if !self.keys.contains(&key) && self.keys.len() >= self.max_keys {
             return Err(io::Error::other(
                 "high-resolution waiter key capacity exhausted",
             ));
         }
+        self.keys.insert(key.clone());
         self.heap.set(key, deadline);
         Ok(())
     }
 
     pub fn clear_deadline(&mut self, key: &K) {
         self.heap.remove(key);
+        if !self.by_key.contains_key(key) {
+            self.keys.remove(key);
+        }
     }
 
     #[must_use]
@@ -815,5 +827,37 @@ mod tests {
             .expect("first key fits");
         assert!(waiter.set_deadline(2, MonotonicDeadline::now()).is_err());
         assert_eq!(waiter.deadline_len(), 1);
+    }
+
+    #[test]
+    fn capacity_counts_each_registered_and_armed_key_once() {
+        let mut waiter = HighResWaiter::with_backend_and_capacity(WaitBackend::AbsoluteTimerFd, 3)
+            .expect("timerfd waiter");
+        let sockets: Vec<_> = (0..4)
+            .map(|_| std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap())
+            .collect();
+        for (key, socket) in sockets.iter().take(3).enumerate() {
+            waiter.register(key, socket.as_raw_fd()).expect("key fits");
+            waiter
+                .set_deadline(key, MonotonicDeadline::now())
+                .expect("arming the same key does not consume another slot");
+        }
+        assert!(waiter.register(3, sockets[3].as_raw_fd()).is_err());
+        assert_eq!(waiter.deadline_len(), 3);
+    }
+
+    #[test]
+    fn explicit_capacity_rejects_silent_clamping() {
+        assert!(matches!(
+            HighResWaiter::<u32>::with_backend_and_capacity(WaitBackend::AbsoluteTimerFd, 0),
+            Err(error) if error.kind() == io::ErrorKind::InvalidInput
+        ));
+        assert!(matches!(
+            HighResWaiter::<u32>::with_backend_and_capacity(
+                WaitBackend::AbsoluteTimerFd,
+                MAX_WAITER_KEYS + 1,
+            ),
+            Err(error) if error.kind() == io::ErrorKind::InvalidInput
+        ));
     }
 }

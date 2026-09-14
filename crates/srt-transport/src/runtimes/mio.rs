@@ -41,11 +41,6 @@ impl Conn {
         &self.socket
     }
 
-    /// Transfer protocol and socket ownership to a custom driver.
-    pub fn into_parts(self) -> (SrtConnection, mio::net::UdpSocket) {
-        (self.conn, self.socket)
-    }
-
     /// Like [`Self::new`], but stores the given budget instead of the
     /// default (K02): [`Self::drain_outputs`] honors this, not a hardcoded
     /// `::default()`, on every call.
@@ -224,7 +219,7 @@ struct OwnerCallerSide {
 /// shared-socket caller "needs a custom driver using `send_to`, the same
 /// pattern this crate's listener side already uses" (K01). `Owner` is that
 /// missing driver, kept deliberately narrow: exactly one non-pooled
-/// listener socket ([`crate::ResolvedListenerTopology::PerPort`]) and
+/// listener socket ([`crate::advanced::prepared::ResolvedListenerTopology::PerPort`]) and
 /// exactly one caller socket shared by every [`Owner::connect`]ed session
 /// (which therefore requires `SocketOwnership::Shared`, not the default
 /// `Exclusive`). Pooled/reuseport listener topologies and per-caller

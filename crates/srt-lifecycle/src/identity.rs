@@ -1,6 +1,6 @@
 //! Runtime-neutral lifecycle identity and routing policy.
 
-use shiguredo_srt::{GroupExtensionData, HandshakeType};
+use shiguredo_srt::handshake::{GroupExtensionData, HandshakePacket, HandshakeType};
 
 /// Group metadata observed during handshake admission.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,9 +59,7 @@ pub fn normalize_stream_id(stream_id: Option<String>) -> Option<String> {
 /// Admission code uses this form so the same untrusted datagram is decoded
 /// once before cookie validation, policy resolution, and protocol processing.
 #[must_use]
-pub fn handshake_identity_from_handshake(
-    handshake: &shiguredo_srt::HandshakePacket,
-) -> HandshakeIdentity {
+pub fn handshake_identity_from_handshake(handshake: &HandshakePacket) -> HandshakeIdentity {
     let is_conclusion = matches!(handshake.handshake_type, HandshakeType::Conclusion);
     let stream_id = handshake.get_sid_extension();
     let group = handshake

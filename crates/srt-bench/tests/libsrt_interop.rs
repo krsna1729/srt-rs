@@ -6,13 +6,16 @@
 //! `cargo test` runs on a machine without libsrt installed still pass. CI
 //! installs `srt-tools` explicitly before running this suite.
 
-use shiguredo_srt::{CipherMode, ConnectionOptions, KeyLength, SrtConnection, Timestamp};
+use shiguredo_srt::crypto::{CipherMode, KeyLength};
+use shiguredo_srt::{ConnectionOptions, SrtConnection, Timestamp};
 use srt_bench::driver;
-use srt_transport::{
-    AdmissionOptions, AdmissionResolution, CallerConfig, GroupCallerLeg, GroupConfig, GroupConn,
-    GroupDriveReport, IngressTelemetry, OutputDrainBudget, PeerTable, RejectionReason,
-    RuntimeFlavor,
+use srt_transport::advanced::admission::{
+    AdmissionOptions, AdmissionResolution, PeerTable, RejectionReason,
 };
+use srt_transport::advanced::driver::OutputDrainBudget;
+use srt_transport::advanced::group::{GroupCallerLeg, GroupConn, GroupDriveReport};
+use srt_transport::advanced::telemetry::IngressTelemetry;
+use srt_transport::{CallerConfig, GroupConfig, RuntimeFlavor};
 use std::net::{SocketAddr, UdpSocket};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::{
@@ -1250,7 +1253,7 @@ fn rust_live_caller_refreshes_key_with_libsrt_listener() {
         Duration::from_secs(20),
         |conn, now| {
             conn.seed_encrypted_packet_count_for_test(
-                shiguredo_srt::CryptoContext::KM_REFRESH_PERIOD - PACKETS_TO_SWITCH as u64,
+                shiguredo_srt::crypto::CryptoContext::KM_REFRESH_PERIOD - PACKETS_TO_SWITCH as u64,
             )
             .expect("seed encrypted packet count for accelerated key refresh");
             for chunk in payload.chunks(1) {
@@ -1543,7 +1546,7 @@ fn libsrt_broadcast_group_interoperates_with_rust_listener() {
     let start = Instant::now();
     let mut table = PeerTable::new();
     let mut options = AdmissionOptions::basic(0x2000_0001, 120, true);
-    options.bonded_inputs = srt_transport::BondedInputPolicy::Accept;
+    options.bonded_inputs = srt_transport::advanced::admission::BondedInputPolicy::Accept;
     let telemetry = IngressTelemetry::new();
     let mut outbound = Vec::new();
     let mut events = Vec::new();
@@ -1643,7 +1646,7 @@ fn rust_broadcast_group_interoperates_with_libsrt_listener() {
         .build()
         .expect("build bonded caller config");
     let mut group = GroupConn::caller(
-        GroupConfig::new(0x1234, shiguredo_srt::GroupType::Broadcast),
+        GroupConfig::new(0x1234, shiguredo_srt::handshake::GroupType::Broadcast),
         [
             GroupCallerLeg::new(1, 10, caller.clone()),
             GroupCallerLeg::new(2, 20, caller),

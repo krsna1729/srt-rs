@@ -424,7 +424,7 @@ pub fn append_result(
     // reader re-derive it. MAXBW/INPUTBW are protocol bytes/s; results
     // state bits/s so they sit in the same units as `source_bps`.
     let resolved = cfg.srt_bandwidth().resolve();
-    let sock_bufs = srt_transport::socket_buffer_stats();
+    let sock_bufs = srt_transport::advanced::platform::socket_buffer_stats();
     let sock_buf_requested = cfg.sock_buf_bytes;
     let observed = |value: usize| {
         if sock_bufs.sockets > 0 {
@@ -497,7 +497,7 @@ pub fn append_result(
         observed(sock_bufs.rcvbuf_max_bytes),
         observed(sock_bufs.sndbuf_min_bytes),
         observed(sock_bufs.sndbuf_max_bytes),
-        srt_transport::current_cpu_spec().unwrap_or_default(),
+        srt_transport::advanced::platform::current_cpu_spec().unwrap_or_default(),
         if cfg.pin { "on" } else { "off" }.into(),
         cfg.link.get("delay").to_string(),
         cfg.link.get("jitter").to_string(),
@@ -2158,12 +2158,12 @@ fn resolve_matrix_axes(cli: &crate::Cli) -> std::io::Result<MatrixAxisConfig> {
         axis(
             "ack-interval-micros",
             "ack-interval-micros",
-            &shiguredo_srt::ACK_INTERVAL_MICROS.to_string(),
+            &shiguredo_srt::receiver::ACK_INTERVAL_MICROS.to_string(),
         ),
         axis(
             "light-ack-interval-packets",
             "light-ack-interval-packets",
-            &shiguredo_srt::LIGHT_ACK_INTERVAL_PACKETS.to_string(),
+            &shiguredo_srt::receiver::LIGHT_ACK_INTERVAL_PACKETS.to_string(),
         ),
     ]);
     let unused: Vec<&str> = plan
@@ -3159,7 +3159,7 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<MatrixReport> {
 }
 
 fn add_cpu_identity(cells: &mut [Cell<'_>], recv_cpus: &str, send_cpus: &str) {
-    let inherited = srt_transport::current_cpu_spec().unwrap_or_default();
+    let inherited = srt_transport::advanced::platform::current_cpu_spec().unwrap_or_default();
     for cell in cells {
         if recv_cpus.is_empty() && send_cpus.is_empty() {
             if !inherited.is_empty() {

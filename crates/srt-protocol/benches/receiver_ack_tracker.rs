@@ -1,5 +1,7 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use shiguredo_srt::{DataPacket, PacketPosition, ReceiverBuffer, Timestamp};
+use shiguredo_srt::Timestamp;
+use shiguredo_srt::receiver::ReceiverBuffer;
+use shiguredo_srt::wire::{DataPacket, PacketPosition};
 use std::hint::black_box;
 
 fn packet(sequence_number: u32, timestamp: u32) -> DataPacket {
