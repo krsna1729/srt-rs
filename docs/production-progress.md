@@ -1,7 +1,7 @@
 # Production progress
-Guide version: 2026-09-14 / audit `2276529` (bounded hardening and SRT-600 qualification follow)
+Guide version: 2026-09-14 / audit `2cb565a` (bounded hardening and SRT-600 qualification follow)
 Working repository: /home/dev/srt-rs
-Working branch / HEAD: codex/bounded-correctness @ 2276529 (grouped commits pushed to origin)
+Working branch / HEAD: codex/bounded-correctness @ 2cb565a (grouped implementation commits complete; push authorized)
 Protected checkout: none — host idle at setup (only codegraph MCP server running); prior benchmark protection lifted by user authorization below
 Implementation authorization: user 2026-09-10 — "cleanup local. get latest origin/main. take a look at prompt and production guide md files placed. achieve it with a proper commits and PR strategy." Grouped local commits and pushing the working branch are authorized.
 Validation host and authorization: same host authorized for implementation AND focused validation (no benchmark process observed at setup); live perf-window work still needs explicit per-run confirmation
