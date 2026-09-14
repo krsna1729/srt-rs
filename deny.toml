@@ -5,8 +5,7 @@
 
 [graph]
 # Check every feature combination this workspace actually builds --
-# srt-bench links all six runtime backends, so a default-features-only
-# check would silently skip the glommio subtree.
+# srt-bench links the three runtime backends (mio, tokio, compio).
 all-features = true
 no-default-features = false
 targets = [
@@ -16,22 +15,9 @@ targets = [
 [advisories]
 # Catch any new unsoundness advisory in the dependency graph immediately.
 unsound = "all"
-# These two advisories are confined to optional runtime adapters in the
-# unpublished benchmark/transport crates. Neither is reachable from the
-# published `srt-proto` crate. There is no compatible fixed release:
-# glommio 0.9 is still the current upstream release and monoio 0.2.4 is the
-# current monoio release. Review dates and replacement criteria are tracked in
-# docs/dependency-exceptions.md; CI still fails on every other advisory.
-ignore = [
-    # UNSOUND: bitmaps 3.2 TryFrom<&[u8]> creates invalid bool (UB in safe
-    # code). Crate archived, no patched version. Transitive via glommio 0.9
-    # internal allocator; community fork still carries it.
-    "RUSTSEC-2025-0167",
-    # UNMAINTAINED: bitmaps (same crate, separate unmaintained notice).
-    "RUSTSEC-2026-0247",
-    # UNMAINTAINED: fxhash via monoio 0.2.4. No memory-safety defect.
-    "RUSTSEC-2025-0057",
-]
+# All prior advisory exceptions (bitmaps, fxhash) were confined to optional
+# glommio/monoio adapters and were eliminated with their removal.
+ignore = []
 
 [licenses]
 version = 2
@@ -45,10 +31,8 @@ allow = [
     # targets Linux only -- so no bare BSD allows here. If a future dep
     # pulls a BSD-only crate onto the linux-gnu graph, the check fails
     # loudly and the term gets added deliberately.
-    "MPL-2.0",       # bitmaps (file-level copyleft; acceptable)
     "Zlib",          # nanorand, slotmap
     "Unlicense",     # memchr/byteorder/aho-corasick option
-    "0BSD",          # adler2 option
     "Unicode-3.0",   # unicode-ident (dual (MIT OR Apache-2.0) AND Unicode-3.0)
     # r-efi's LGPL arm is not exercised (MIT/Apache grant is the one used);
     # cargo-deny warns on unencountered allows, so it lives in the clarify

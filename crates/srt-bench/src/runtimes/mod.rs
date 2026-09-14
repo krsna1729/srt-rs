@@ -104,11 +104,7 @@
 //! no adapter expresses today.
 
 pub mod compio;
-#[cfg(target_os = "linux")]
-pub mod glommio;
 pub mod mio;
-pub mod monoio;
-pub mod smol;
 pub mod tokio;
 
 use crate::{BenchConfig, Runtime};
@@ -141,18 +137,6 @@ pub fn run(cfg: BenchConfig) {
         Runtime::Mio => mio::run(cfg),
         Runtime::A2 => mio::run_a2(cfg),
         Runtime::Tokio => tokio::run(cfg),
-        Runtime::Smol => smol::run(cfg),
-        Runtime::Monoio => monoio::run(cfg),
-        Runtime::Glommio => {
-            #[cfg(target_os = "linux")]
-            glommio::run(cfg);
-            #[cfg(not(target_os = "linux"))]
-            {
-                let _ = cfg;
-                eprintln!("srt-bench: glommio is Linux-only (io_uring)");
-                std::process::exit(2);
-            }
-        }
         Runtime::Compio => compio::run(cfg),
     }
 }

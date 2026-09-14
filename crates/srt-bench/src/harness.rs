@@ -1450,12 +1450,9 @@ fn filter_batching(
 fn filter_pinning(
     cell: &Cell<'_>,
     axes: &[Axis],
-    runtime_recv: &str,
-    runtime_send: &str,
+    _runtime_recv: &str,
+    _runtime_send: &str,
 ) -> Option<&'static str> {
-    if runtime_recv == "glommio" || runtime_send == "glommio" {
-        return None;
-    }
     let pin = cell_value(cell, "pin", Some(Scope::Both))?;
     representative(axes, "pin", "off")
         .filter(|keep| pin != *keep)
@@ -4061,7 +4058,7 @@ mod matrix_filter_tests {
             Some("bonded-egress-unsupported")
         );
 
-        for runtime in ["mio", "tokio", "smol", "monoio", "glommio", "compio"] {
+        for runtime in ["mio", "tokio", "compio"] {
             let supported = cell(&[
                 ("ingress", "shared-pool:1"),
                 ("promotion", "never"),
@@ -4141,12 +4138,12 @@ mod matrix_filter_tests {
             .collect::<Vec<_>>();
         assert_eq!(filter_reason(&cell(&mio), &axes), Some("pin-inert"));
 
-        let glommio = pin_base
+        let compio = pin_base
             .iter()
             .copied()
-            .chain([("runtime", "glommio")])
+            .chain([("runtime", "compio")])
             .collect::<Vec<_>>();
-        assert_eq!(filter_reason(&cell(&glommio), &axes), None);
+        assert_eq!(filter_reason(&cell(&compio), &axes), Some("pin-inert"));
     }
 
     #[test]
@@ -4542,7 +4539,7 @@ mod matrix_filter_tests {
             "--plan",
             plan_path,
             "--axis",
-            "runtime=smol",
+            "runtime=compio",
             "--axis",
             "datapath-q-horizon-ms=100,200",
             "--axis",
@@ -4551,7 +4548,7 @@ mod matrix_filter_tests {
         .unwrap();
         assert_eq!(
             config.axes[0],
-            ("runtime", Scope::Both, vec!["smol".to_string()])
+            ("runtime", Scope::Both, vec!["compio".to_string()])
         );
         assert_eq!(
             config.axes[1],
@@ -4702,7 +4699,7 @@ mod report_tests {
     /// every validity input the canonical pairing requires.
     fn row(role: &str, rep: &str, sent: &str, retx: &str, attempt: &str) -> Record {
         rec(&[
-            ("runtime", "smol"),
+            ("runtime", "tokio"),
             ("role", role),
             ("rep", rep),
             ("attempt", attempt),

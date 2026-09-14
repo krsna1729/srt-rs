@@ -1,13 +1,13 @@
 //! Unified bench/scale driver over the pure-Rust SRT Core.
 //!
-//! One binary for all six runtime backends and both roles. Loss mode
-//! (connections=1) and scale mode (connections=N) are the same code path
+//! One binary for the three runtime backends (mio, tokio, compio) and both roles.
+//! Loss mode (connections=1) and scale mode (connections=N) are the same code path
 //! per runtime -- only the STATS schema differs.
 //!
 //! Usage:
 //!
 //! One run (either role):
-//!   srt-bench runtime=<mio|tokio|smol|monoio|glommio|compio> \
+//!   srt-bench runtime=<mio|tokio|compio> \
 //!     mode=sender <host> <port> <duration_secs> <latency_ms> [source_bitrate_bps] [--connections N]
 //!   srt-bench runtime=<...> mode=receiver <port> <duration_secs> <latency_ms> [--connections N]
 //!   ... plus --out FILE to append a result row.
@@ -38,7 +38,7 @@
 //!   srt-bench qualify score BASE.tsv HEAD.tsv
 //!
 //! Syscall/io_uring attribution for one pair (needs `perf`):
-//!   srt-bench sysprof --runtime glommio --connections 150
+//!   srt-bench sysprof --runtime compio --connections 150
 //!
 //! Live host watch while a benchmark runs:
 //!   srt-bench watch [interval_secs] [heartbeat_every_n_samples]

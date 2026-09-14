@@ -207,9 +207,6 @@ impl CallerPool {
         test,
         feature = "mio",
         feature = "tokio",
-        feature = "smol",
-        feature = "monoio",
-        feature = "glommio",
         feature = "compio",
         feature = "bench-internals"
     ))]

@@ -144,9 +144,6 @@ pub enum Runtime {
     /// through to the ordinary mio path; measure with recv=mio / send=a2.
     A2,
     Tokio,
-    Smol,
-    Monoio,
-    Glommio,
     Compio,
 }
 
@@ -156,9 +153,6 @@ impl Runtime {
             "mio" => Self::Mio,
             "a2" => Self::A2,
             "tokio" => Self::Tokio,
-            "smol" => Self::Smol,
-            "monoio" => Self::Monoio,
-            "glommio" => Self::Glommio,
             "compio" => Self::Compio,
             _ => return None,
         })
@@ -169,9 +163,6 @@ impl Runtime {
             Self::Mio => "mio",
             Self::A2 => "a2",
             Self::Tokio => "tokio",
-            Self::Smol => "smol",
-            Self::Monoio => "monoio",
-            Self::Glommio => "glommio",
             Self::Compio => "compio",
         }
     }
@@ -840,9 +831,6 @@ impl BenchConfig {
         match self.runtime {
             Runtime::Mio | Runtime::A2 => srt_transport::RuntimeFlavor::Mio,
             Runtime::Tokio => srt_transport::RuntimeFlavor::Tokio,
-            Runtime::Smol => srt_transport::RuntimeFlavor::Smol,
-            Runtime::Monoio => srt_transport::RuntimeFlavor::Monoio,
-            Runtime::Glommio => srt_transport::RuntimeFlavor::Glommio,
             Runtime::Compio => srt_transport::RuntimeFlavor::Compio,
         }
     }
@@ -2880,7 +2868,7 @@ impl Aggregate {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: srt-bench runtime=<mio|tokio|smol|monoio|glommio|compio> \
+        "usage: srt-bench runtime=<mio|tokio|compio> \
          mode=<sender|receiver> <host?> <port> <duration_secs> <latency_ms> \
          [source_bitrate_bps] [--connections N] \
          [--srt-bandwidth protocol-default|legacy-source-fixed|fixed:BPS|input-relative:PCT] \
@@ -3536,14 +3524,7 @@ mod tests {
         cfg.egress = Egress::SharedSocket;
         cfg.connect_concurrency = 2;
 
-        for runtime in [
-            Runtime::Mio,
-            Runtime::Tokio,
-            Runtime::Smol,
-            Runtime::Monoio,
-            Runtime::Glommio,
-            Runtime::Compio,
-        ] {
+        for runtime in [Runtime::Mio, Runtime::Tokio, Runtime::Compio] {
             cfg.runtime = runtime;
             assert_eq!(cfg.validate_bond_topology(), Ok(()), "{runtime:?}");
         }

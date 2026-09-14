@@ -776,9 +776,6 @@ mod group_conn_tests {
         for runtime in [
             RuntimeFlavor::Mio,
             RuntimeFlavor::Tokio,
-            RuntimeFlavor::Smol,
-            RuntimeFlavor::Monoio,
-            RuntimeFlavor::Glommio,
             RuntimeFlavor::Compio,
         ] {
             let mut first_peer = Peer::new();

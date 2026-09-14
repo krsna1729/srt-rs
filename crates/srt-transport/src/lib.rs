@@ -209,24 +209,6 @@ pub mod tokio_transport;
 #[cfg(feature = "tokio")]
 pub use tokio_transport as tokio;
 
-#[cfg(feature = "smol")]
-#[path = "runtimes/smol.rs"]
-pub mod smol_transport;
-#[cfg(feature = "smol")]
-pub use smol_transport as smol;
-
-#[cfg(feature = "monoio")]
-#[path = "runtimes/monoio.rs"]
-pub mod monoio_transport;
-#[cfg(feature = "monoio")]
-pub use monoio_transport as monoio;
-
-#[cfg(feature = "glommio")]
-#[path = "runtimes/glommio.rs"]
-pub mod glommio_transport;
-#[cfg(feature = "glommio")]
-pub use glommio_transport as glommio;
-
 #[cfg(feature = "compio")]
 #[path = "runtimes/compio.rs"]
 pub mod compio_transport;
@@ -312,7 +294,7 @@ pub use telemetry::{
 };
 // Internal helpers used by runtime and group_conn modules.
 pub(crate) use batch::drain_connected_outputs;
-#[cfg(any(feature = "tokio", feature = "smol"))]
+#[cfg(feature = "tokio")]
 pub(crate) use batch::drain_output_work;
 pub(crate) use caller::{collect_output_work, prepend_outputs};
 

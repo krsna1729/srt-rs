@@ -1339,9 +1339,6 @@ impl Default for TransportCapabilities {
 pub enum RuntimeFlavor {
     Mio,
     Tokio,
-    Smol,
-    Monoio,
-    Glommio,
     Compio,
     Custom(TransportCapabilities),
 }
@@ -1357,8 +1354,7 @@ impl RuntimeFlavor {
         // completion-based adapters (Monoio, Glommio, Compio) use native
         // one-buffer I/O and genuinely have no batched receive path.
         TransportCapabilities {
-            receive_batching: cfg!(target_os = "linux")
-                && matches!(self, Self::Mio | Self::Tokio | Self::Smol),
+            receive_batching: cfg!(target_os = "linux") && matches!(self, Self::Mio | Self::Tokio),
             ..TransportCapabilities::default()
         }
     }
@@ -2444,13 +2440,10 @@ mod tests {
     #[test]
     fn readiness_based_runtimes_report_batching_completion_based_ones_do_not() {
         let batching = |flavor: RuntimeFlavor| flavor.capabilities().receive_batching;
-        // These share the recvmmsg-based `RecvBatch`/batch.rs pump.
+        // Mio and Tokio share the recvmmsg-based `RecvBatch`/batch.rs pump.
         assert_eq!(batching(RuntimeFlavor::Mio), cfg!(target_os = "linux"));
         assert_eq!(batching(RuntimeFlavor::Tokio), cfg!(target_os = "linux"));
-        assert_eq!(batching(RuntimeFlavor::Smol), cfg!(target_os = "linux"));
-        // These drive one buffer at a time through native completion I/O.
-        assert!(!batching(RuntimeFlavor::Monoio));
-        assert!(!batching(RuntimeFlavor::Glommio));
+        // Compio drives one buffer at a time through native completion I/O.
         assert!(!batching(RuntimeFlavor::Compio));
     }
 
