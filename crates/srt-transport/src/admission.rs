@@ -39,11 +39,9 @@ pub struct AdmissionPeer {
     /// Live connected state, feeding `srt_lifecycle::is_terminal`. Goes
     /// false again on `Disconnected`.
     pub connected: bool,
-    /// `None` until the legacy bench `drain_events` path arms this peer's
-    /// success-window deadline on its first `Connected` -- exclusively
-    /// bench-owned; a production `poll_events`-only consumer never sets
-    /// this and must not read it as "has this peer ever connected" (use
-    /// [`Self::ever_connected`], which updates unconditionally).
+    /// `None` until the legacy benchmark adapter arms this peer's
+    /// success-window deadline on its first `Connected`.
+    #[cfg(any(test, feature = "bench-internals"))]
     pub stream_deadline: Option<Instant>,
     /// Set once, on this peer's first-ever `Connected`, regardless of
     /// which consumer drains the event (A01). Final success reporting
@@ -790,7 +788,8 @@ struct InboundGroup {
     logical_peer: LogicalPeerId,
     generation: u64,
     connected: bool,
-    /// Bench-only success-window deadline; see [`AdmissionPeer::stream_deadline`].
+    /// Benchmark-only success-window deadline; see [`AdmissionPeer::stream_deadline`].
+    #[cfg(any(test, feature = "bench-internals"))]
     stream_deadline: Option<Instant>,
     /// See [`AdmissionPeer::ever_connected`].
     ever_connected: bool,
@@ -1476,6 +1475,7 @@ impl PeerTable {
             timers: ManualTimerStore::new(),
             pending_outputs: VecDeque::new(),
             connected: false,
+            #[cfg(any(test, feature = "bench-internals"))]
             stream_deadline: None,
             ever_connected: false,
             data_events: 0,
@@ -1644,6 +1644,7 @@ impl PeerTable {
                     logical_peer,
                     generation,
                     connected: false,
+                    #[cfg(any(test, feature = "bench-internals"))]
                     stream_deadline: None,
                     ever_connected: false,
                     data_events: 0,
@@ -2726,11 +2727,12 @@ impl PeerTable {
         }
     }
 
-    /// Drain protocol events into per-peer bookkeeping.
+    /// Drain protocol events into the legacy benchmark bookkeeping.
     ///
     /// Returns, in `newly_connected`, the peers whose *first* `Connected`
     /// fired on this tick -- the moment a promotion decision is due.
     /// `stream_len` sets each one's stream deadline from now.
+    #[cfg(feature = "bench-internals")]
     pub fn drain_events(
         &mut self,
         stream_len: Duration,
@@ -3058,10 +3060,11 @@ impl PeerTable {
         self.index_idle_peer(peer);
     }
 
-    /// Whether every tracked peer is done, so the acceptor can stop.
+    /// Whether every tracked peer is done, so the benchmark acceptor can stop.
     /// Vacuously true when empty, so an acceptor that never admitted
     /// anything still exits once its connect window closes.
     #[must_use]
+    #[cfg(feature = "bench-internals")]
     pub fn all_terminal(
         &self,
         now: Instant,
@@ -3762,6 +3765,7 @@ mod tests {
                 logical_peer,
                 generation,
                 connected: false,
+                #[cfg(any(test, feature = "bench-internals"))]
                 stream_deadline: None,
                 ever_connected: false,
                 data_events: 0,

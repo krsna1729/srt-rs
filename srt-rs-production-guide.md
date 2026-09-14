@@ -95,7 +95,8 @@ The following hardening work is implemented in the current working tree:
 - explicit caller-table capacity (`CallerTable::with_max_callers`, default 4096);
 - hard 2^16 caps on caller-table and dense admission-slot capacities;
 - hard 2^16 caps on caller-pool in-flight attempts and queued requests;
-- explicit publication-bus subscription capacity (`MAX_SUBSCRIPTIONS`, 4096);
+- application-owned publication remains outside the transport crate; any
+  future fan-out layer must bound item, byte and age retention explicitly;
 - fail-closed protocol event/output retention (`MAX_EVENT_QUEUE_ACTIONS`,
   `MAX_FLOW_WINDOW + 64`; `MAX_OUTPUT_QUEUE_ACTIONS`, 8192;
   `MAX_OUTPUT_QUEUE_BYTES`, 16 MiB);
@@ -893,7 +894,7 @@ Read the common sections once, then read only the selected card, prerequisites, 
 
 ### F02. Implement or reuse a bounded publication bus for shards
 
-**Phase:** Live fan-out. **Prerequisites:** F01, A05. **Initial status:** TODO. **Current status:** VERIFIED (Opus-reviewed, amended).
+**Phase:** Live fan-out. **Prerequisites:** F01, A05. **Initial status:** TODO. **Current status:** DEFERRED (application-owned; transport reference removed).
 
 **Read first:** [crates/srt-bench/src/queue.rs:1](/home/dev/srt-rs/crates/srt-bench/src/queue.rs:1), [crates/srt-bench/src/lib.rs:2598](/home/dev/srt-rs/crates/srt-bench/src/lib.rs:2598), [crates/srt-transport/src/handoff.rs:1](/home/dev/srt-rs/crates/srt-transport/src/handoff.rs:1).
 
@@ -904,7 +905,9 @@ Read the common sections once, then read only the selected card, prerequisites, 
 3. A work-stealing SPMC queue is not broadcast. Each applicable shard must see each item. Per-destination acceptance cursors remain inside that shard; advancing a shard cursor must not discard a still-needed destination disposition.
 4. Prefer a proven safe implementation. If only a locked reference implementation can be established, label it as a reference and leave any claimed lock-free target unqualified. Do not write unreviewed atomic-pointer reclamation.
 
-**Acceptance:** Multiple shards each observe their publications; stalled shard lag is explicit; producer progress and memory stay bounded; safe references outlive overwritten slots. Stress wrap, unsubscribe, resubscribe and source close. A claim of lock-free progress needs an actual algorithm/reclamation review, not merely absence of Mutex text.
+**Current decision:** The former `srt-transport::PublicationBus` reference implementation was removed from the default transport surface because no runtime or benchmark consumer uses it. The eventual implementation belongs in the application/restream layer, where media type, expiry, destination placement and shard topology are known. Preserve this contract when that layer is implemented: one publication per transformed item, one cursor per applicable shard, explicit lag, bounded item/byte/age retention, and no claim of lock-free progress without an algorithm and reclamation review.
+
+**Acceptance:** Multiple shards each observe their publications; stalled shard lag is explicit; producer progress and memory stay bounded; safe references outlive overwritten slots. Stress wrap, unsubscribe, resubscribe and source close.
 
 **Checks after authorization:** `NEW: deterministic publication/cursor/lag tests`; `NEW: concurrency model/stress checks appropriate to the actual implementation`; `REVIEW: ownership, publication linearization and memory reclamation`.
 
