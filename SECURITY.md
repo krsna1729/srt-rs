@@ -3,7 +3,7 @@
 ## Supported versions
 
 This project is pre-1.0. Security fixes are made on the current default branch
-and the newest published `srt-proto` release. Older canary releases are not
+and the latest `srt-proto` release once published. Older canary releases are not
 maintained.
 
 ## Reporting a vulnerability
