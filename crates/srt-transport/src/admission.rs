@@ -750,7 +750,7 @@ fn no_such_logical_peer() -> shiguredo_srt::Error {
 /// been ordered and deduplicated across legs.
 /// Otherwise this is the unmodified protocol event. Production consumers
 /// should use [`PeerTable::poll_events`]; the benchmark-only
-/// [`PeerTable::drain_events`] adapter remains for its legacy counters and
+/// `PeerTable::drain_events` adapter remains for its legacy counters and
 /// promotion timing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdmissionEvent {
@@ -3009,7 +3009,7 @@ impl PeerTable {
 
     /// Snapshot every active bonded ingress with both logical delivery and
     /// per-leg wire telemetry. Ordinary unbonded peers are intentionally not
-    /// included: their existing [`AdmissionPeer`] stats retain the normal
+    /// included: their existing admission-state stats retain the normal
     /// single-connection meaning.
     #[must_use]
     pub fn bonded_stats(&self) -> Vec<InboundGroupStats> {
@@ -3140,6 +3140,7 @@ impl PeerTable {
     }
 }
 
+#[cfg(feature = "bench-internals")]
 impl IntoIterator for PeerTable {
     type Item = (std::net::SocketAddr, AdmissionPeer);
     type IntoIter = std::vec::IntoIter<Self::Item>;
@@ -3259,7 +3260,9 @@ mod tests {
     fn induction_packet(socket_id: u32) -> Vec<u8> {
         let packet = shiguredo_srt::HandshakePacket::new_induction_request(socket_id).encode(0, 0);
         let mut bytes = Vec::new();
-        packet.encode(&mut bytes);
+        packet
+            .encode(&mut bytes)
+            .expect("packet fits configured datagram bound");
         bytes
     }
 

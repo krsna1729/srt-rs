@@ -156,7 +156,8 @@ fn aligned_group_member_retransmits_after_sequence_jump() {
     let mut nak = ControlPacket::new(ControlType::Nak, 0, member.socket_id());
     nak.control_info.extend_from_slice(&1_000u32.to_be_bytes());
     let mut encoded = Vec::new();
-    nak.encode(&mut encoded);
+    nak.encode(&mut encoded)
+        .expect("packet fits configured datagram bound");
     member.feed_recv_buf(&encoded, ts(101_000)).unwrap();
 
     let retransmitted = packets_from(member)

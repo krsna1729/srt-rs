@@ -268,14 +268,18 @@ fn default_window_alternating_loss_connection() -> SrtConnection {
     };
     packet.sequence_number = WINDOW - 1;
     let mut encoded = Vec::new();
-    SrtPacket::Data(packet.clone()).encode(&mut encoded);
+    SrtPacket::Data(packet.clone())
+        .encode(&mut encoded)
+        .expect("packet fits configured datagram bound");
     listener
         .feed_recv_buf(&encoded, now)
         .expect("expose loss window");
     for sequence_number in (1..WINDOW - 1).step_by(2) {
         packet.sequence_number = sequence_number;
         encoded.clear();
-        SrtPacket::Data(packet.clone()).encode(&mut encoded);
+        SrtPacket::Data(packet.clone())
+            .encode(&mut encoded)
+            .expect("packet fits configured datagram bound");
         listener
             .feed_recv_buf(&encoded, now)
             .expect("recover odd packet");

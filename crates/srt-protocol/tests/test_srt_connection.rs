@@ -252,7 +252,8 @@ fn connected_connection_rejects_packets_for_another_socket_id() {
     };
     data.dest_socket_id = 0x3333;
     let mut misrouted = Vec::new();
-    data.encode(&mut misrouted);
+    data.encode(&mut misrouted)
+        .expect("packet fits configured datagram bound");
 
     let error = listener
         .feed_recv_buf(&misrouted, ts(20_001))
@@ -1032,7 +1033,9 @@ fn connection_stats_cover_restream_quality_inputs() {
         payload: vec![1, 2, 3].into(),
     };
     let mut encoded = Vec::new();
-    undecryptable.encode(&mut encoded);
+    undecryptable
+        .encode(&mut encoded)
+        .expect("packet fits configured datagram bound");
     assert!(listener.feed_recv_buf(&encoded, ts(130_000)).is_err());
     assert_eq!(
         listener
@@ -1071,7 +1074,9 @@ fn encrypted_connection_counts_and_rejects_plaintext_data() {
         payload: b"must be encrypted".to_vec().into(),
     };
     let mut encoded = Vec::new();
-    plaintext.encode(&mut encoded);
+    plaintext
+        .encode(&mut encoded)
+        .expect("packet fits configured datagram bound");
 
     assert!(listener.feed_recv_buf(&encoded, ts(100_000)).is_err());
     let receiver = listener.stats().receiver.expect("receiver telemetry");
@@ -1760,7 +1765,9 @@ fn dropreq_drops_receiver_message() {
     shiguredo_srt::write_u32(&mut cif, last_seq);
     dropreq.control_info = cif;
     let mut buf = Vec::new();
-    dropreq.encode(&mut buf);
+    dropreq
+        .encode(&mut buf)
+        .expect("packet fits configured datagram bound");
 
     listener.feed_recv_buf(&buf, now).expect("feed dropreq");
 
@@ -1789,7 +1796,9 @@ fn dropreq_rejects_high_bit_endpoints() {
         shiguredo_srt::write_u32(&mut cif, last_seq);
         dropreq.control_info = cif;
         let mut encoded = Vec::new();
-        dropreq.encode(&mut encoded);
+        dropreq
+            .encode(&mut encoded)
+            .expect("packet fits configured datagram bound");
 
         let error = listener
             .feed_recv_buf(&encoded, ts(100_000))
@@ -1815,7 +1824,9 @@ fn dropreq_rejects_range_larger_than_receive_window() {
     shiguredo_srt::write_u32(&mut cif, 0x7FFF_FFFF);
     dropreq.control_info = cif;
     let mut encoded = Vec::new();
-    dropreq.encode(&mut encoded);
+    dropreq
+        .encode(&mut encoded)
+        .expect("packet fits configured datagram bound");
 
     let error = listener
         .feed_recv_buf(&encoded, ts(100_000))

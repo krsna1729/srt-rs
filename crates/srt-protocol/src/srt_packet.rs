@@ -64,11 +64,23 @@ impl SrtPacket {
         }
     }
 
-    /// Encode to a byte buffer.
-    pub fn encode(&self, buf: &mut Vec<u8>) {
+    /// Encode to a byte buffer when the resulting datagram fits the wire
+    /// limit. The destination buffer is unchanged when the packet is too
+    /// large.
+    pub fn encode(&self, buf: &mut Vec<u8>) -> Result<(), Error> {
+        if self.encoded_size() > MAX_DATAGRAM_SIZE {
+            return Err(Error::invalid_data("SRT datagram exceeds maximum size"));
+        }
+        self.encode_unchecked(buf);
+        Ok(())
+    }
+
+    /// Encode without repeating the size check. This is restricted to the
+    /// protocol implementation; callers should use [`Self::encode`].
+    pub(crate) fn encode_unchecked(&self, buf: &mut Vec<u8>) {
         match self {
-            SrtPacket::Data(pkt) => pkt.encode(buf),
-            SrtPacket::Control(pkt) => pkt.encode(buf),
+            SrtPacket::Data(pkt) => pkt.encode_unchecked(buf),
+            SrtPacket::Control(pkt) => pkt.encode_unchecked(buf),
         }
     }
 
@@ -82,14 +94,10 @@ impl SrtPacket {
         }
     }
 
-    /// Encode only when the resulting datagram fits the codec's finite wire
-    /// limit. The destination buffer is unchanged on rejection.
+    /// Backwards-compatible name for [`Self::encode`].
+    #[deprecated(note = "use encode; packet encoding is checked by default")]
     pub fn try_encode(&self, buf: &mut Vec<u8>) -> Result<(), Error> {
-        if self.encoded_size() > MAX_DATAGRAM_SIZE {
-            return Err(Error::invalid_data("SRT datagram exceeds maximum size"));
-        }
-        self.encode(buf);
-        Ok(())
+        self.encode(buf)
     }
 }
 
@@ -218,8 +226,20 @@ impl DataPacket {
         })
     }
 
-    /// Encode to a byte buffer.
-    pub fn encode(&self, buf: &mut Vec<u8>) {
+    /// Encode to a byte buffer when the resulting datagram fits the wire
+    /// limit. The destination buffer is unchanged when the packet is too
+    /// large.
+    pub fn encode(&self, buf: &mut Vec<u8>) -> Result<(), Error> {
+        if self.encoded_size() > MAX_DATAGRAM_SIZE {
+            return Err(Error::invalid_data("SRT datagram exceeds maximum size"));
+        }
+        self.encode_unchecked(buf);
+        Ok(())
+    }
+
+    /// Encode without repeating the size check. This is restricted to the
+    /// protocol implementation; callers should use [`Self::encode`].
+    pub(crate) fn encode_unchecked(&self, buf: &mut Vec<u8>) {
         // First word: F=0, sequence_number
         let first_word = self.sequence_number & 0x7FFF_FFFF;
         write_u32(buf, first_word);
@@ -237,14 +257,10 @@ impl DataPacket {
         write_bytes(buf, &self.payload);
     }
 
-    /// Encode only when the resulting datagram fits the codec's finite wire
-    /// limit. The destination buffer is unchanged on rejection.
+    /// Backwards-compatible name for [`Self::encode`].
+    #[deprecated(note = "use encode; packet encoding is checked by default")]
     pub fn try_encode(&self, buf: &mut Vec<u8>) -> Result<(), Error> {
-        if self.encoded_size() > MAX_DATAGRAM_SIZE {
-            return Err(Error::invalid_data("SRT datagram exceeds maximum size"));
-        }
-        self.encode(buf);
-        Ok(())
+        self.encode(buf)
     }
 
     /// Get the encoded size.
@@ -425,8 +441,20 @@ impl ControlPacket {
         })
     }
 
-    /// Encode to a byte buffer.
-    pub fn encode(&self, buf: &mut Vec<u8>) {
+    /// Encode to a byte buffer when the resulting datagram fits the wire
+    /// limit. The destination buffer is unchanged when the packet is too
+    /// large.
+    pub fn encode(&self, buf: &mut Vec<u8>) -> Result<(), Error> {
+        if self.encoded_size() > MAX_DATAGRAM_SIZE {
+            return Err(Error::invalid_data("SRT datagram exceeds maximum size"));
+        }
+        self.encode_unchecked(buf);
+        Ok(())
+    }
+
+    /// Encode without repeating the size check. This is restricted to the
+    /// protocol implementation; callers should use [`Self::encode`].
+    pub(crate) fn encode_unchecked(&self, buf: &mut Vec<u8>) {
         // First word: F=1, control_type, subtype
         let first_word = 0x8000_0000
             | ((self.control_type as u32 & 0x7FFF) << 16)
@@ -439,14 +467,10 @@ impl ControlPacket {
         write_bytes(buf, &self.control_info);
     }
 
-    /// Encode only when the resulting datagram fits the codec's finite wire
-    /// limit. The destination buffer is unchanged on rejection.
+    /// Backwards-compatible name for [`Self::encode`].
+    #[deprecated(note = "use encode; packet encoding is checked by default")]
     pub fn try_encode(&self, buf: &mut Vec<u8>) -> Result<(), Error> {
-        if self.encoded_size() > MAX_DATAGRAM_SIZE {
-            return Err(Error::invalid_data("SRT datagram exceeds maximum size"));
-        }
-        self.encode(buf);
-        Ok(())
+        self.encode(buf)
     }
 
     /// Get the encoded size.
@@ -485,7 +509,9 @@ mod tests {
         };
 
         let mut buf = Vec::new();
-        original.encode(&mut buf);
+        original
+            .encode(&mut buf)
+            .expect("packet fits configured datagram bound");
 
         let decoded =
             match SrtPacket::decode(&buf).expect("decoding an encoded packet should succeed") {
@@ -508,7 +534,9 @@ mod tests {
         };
 
         let mut buf = Vec::new();
-        original.encode(&mut buf);
+        original
+            .encode(&mut buf)
+            .expect("packet fits configured datagram bound");
 
         let decoded =
             match SrtPacket::decode(&buf).expect("decoding an encoded packet should succeed") {
@@ -530,7 +558,7 @@ mod tests {
     fn checked_encode_rejects_oversized_datagrams_without_mutating_buffer() {
         let data = DataPacket::new(0, 0, 0, 0, Bytes::from(vec![0; MAX_DATAGRAM_SIZE]));
         let mut data_buf = vec![1, 2, 3];
-        assert!(data.try_encode(&mut data_buf).is_err());
+        assert!(data.encode(&mut data_buf).is_err());
         assert_eq!(data_buf, vec![1, 2, 3]);
 
         let control = ControlPacket {
@@ -538,7 +566,7 @@ mod tests {
             ..ControlPacket::new(ControlType::Ack, 0, 0)
         };
         let mut control_buf = vec![4, 5, 6];
-        assert!(control.try_encode(&mut control_buf).is_err());
+        assert!(control.encode(&mut control_buf).is_err());
         assert_eq!(control_buf, vec![4, 5, 6]);
     }
 
@@ -553,7 +581,9 @@ mod tests {
             control_info: vec![0; 1500],
         };
         let mut bytes = Vec::new();
-        packet.encode(&mut bytes);
+        packet
+            .encode(&mut bytes)
+            .expect("packet fits configured datagram bound");
         assert_eq!(
             peek_destination_socket_id(&bytes).expect("complete header"),
             0xABCD_1234

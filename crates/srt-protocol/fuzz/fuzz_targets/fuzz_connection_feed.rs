@@ -57,7 +57,7 @@ fn feed_drop_req(target: &mut SrtConnection, input: &[u8], now: Timestamp) {
     write_u32(&mut packet.control_info, first_seq);
     write_u32(&mut packet.control_info, last_seq);
     let mut encoded = Vec::new();
-    packet.encode(&mut encoded);
+    packet.encode(&mut encoded).expect("packet fits configured datagram bound");
     let _ = target.feed_recv_buf(&encoded, now);
 }
 
@@ -77,7 +77,7 @@ fn feed_nak(target: &mut SrtConnection, input: &[u8], now: Timestamp) {
         write_u32(&mut packet.control_info, last_seq);
     }
     let mut encoded = Vec::new();
-    packet.encode(&mut encoded);
+    packet.encode(&mut encoded).expect("packet fits configured datagram bound");
     let _ = target.feed_recv_buf(&encoded, now);
 }
 

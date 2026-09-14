@@ -26,6 +26,14 @@ protocol testable, benchmarkable, and fuzzable with zero sockets.
 | `stream_id` | StreamID + `#!::k=v,…` access-control parsing (`AccessControl`, `StreamType`, `StreamMode`) |
 | `buf`, `error`, `time` | Internal checked big-endian cursor helpers (`raw-codec` feature for compatibility tooling), `Error`/`ErrorKind` with backtrace capture, `Timestamp` (µs, injected) |
 
+The default root exports are the complete sans-I/O endpoint surface. Protocol
+component APIs are also available under explicit namespaces: `sender`,
+`receiver`, `handshake`, `crypto`, `wire`, `group`, and `stream_id`. Those
+modules expose protocol semantics that can be composed into an alternative
+state machine; packet windows, loss bitmaps, estimators, assemblers, and raw
+cursor implementation details remain private. The untyped cursor compatibility
+surface is opt-in through the `raw-codec` feature.
+
 Handshake attempts default to libsrt-compatible 250 ms request spacing
 with non-early jitter and a 3 s deadline for the complete induction plus
 conclusion exchange. Applications needing different bounds can call
@@ -95,7 +103,8 @@ mid-handshake via `set_listener_policy(passphrase, key_length,
 tsbpd_delay, flow_window, rcvbuf)` — mirrors libsrt's accept hook. The guarded
 listener setters work only after INDUCTION has created a listening connection
 and before CONCLUSION is processed. Full-stack applications should normally
-enter that window through `srt_transport::PeerTable::admit_with_resolver`,
+enter that window through
+`srt_transport::advanced::admission::PeerTable::admit_with_resolver`,
 which preserves cookie validation, rejection delivery, deferral bounds, and
 admission telemetry; see the
 [`listener admission guide`](../../docs/listener-admission-policy.md).

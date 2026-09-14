@@ -1623,7 +1623,9 @@ mod tests {
     fn induction(socket_id: u32) -> Vec<u8> {
         let packet = HandshakePacket::new_induction_request(socket_id).encode(0, 0);
         let mut bytes = Vec::new();
-        packet.encode(&mut bytes);
+        packet
+            .encode(&mut bytes)
+            .expect("packet fits configured datagram bound");
         bytes
     }
 
@@ -3889,7 +3891,9 @@ mod tests {
         response.extension_field = 0; // invalid magic
         let packet = response.encode(0, socket_id);
         let mut bytes = Vec::new();
-        packet.encode(&mut bytes);
+        packet
+            .encode(&mut bytes)
+            .expect("packet fits configured datagram bound");
 
         // 1. feed() must return Err because the handshake failed.
         let feed_res = table.feed(peer, &bytes, Timestamp::from_micros(1000));

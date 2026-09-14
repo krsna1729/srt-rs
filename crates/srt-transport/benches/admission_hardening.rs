@@ -7,16 +7,18 @@ use shiguredo_srt::{
     ConnectionOptions, ConnectionOutput, GroupExtensionData, GroupType, HandshakePacket,
     SRTGROUP_MASK, SrtConnection, Timestamp,
 };
+use srt_transport::test_support::{DenseDueIndex, DenseSlotArena, DueIndex, PhysicalPeerKey};
 use srt_transport::{
-    AdmissionOptions, AdmissionResolution, BondedInputPolicy, DenseDueIndex, DenseSlotArena,
-    DueIndex, IngressTelemetry, ListenerPeerPolicy, PeerTable, PeerTableConfig, PhysicalPeerKey,
-    PolicyOverride,
+    AdmissionOptions, AdmissionResolution, BondedInputPolicy, IngressTelemetry, ListenerPeerPolicy,
+    PeerTable, PeerTableConfig, PolicyOverride,
 };
 
 fn induction(socket_id: u32) -> Vec<u8> {
     let packet = HandshakePacket::new_induction_request(socket_id).encode(0, 0);
     let mut bytes = Vec::new();
-    packet.encode(&mut bytes);
+    packet
+        .encode(&mut bytes)
+        .expect("packet fits configured datagram bound");
     bytes
 }
 

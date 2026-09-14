@@ -887,7 +887,10 @@ mod tests {
             shiguredo_srt::HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
         handshake.add_sid_extension("publish:camera");
         let mut packet = Vec::new();
-        handshake.encode(0, 0).encode(&mut packet);
+        handshake
+            .encode(0, 0)
+            .encode(&mut packet)
+            .expect("packet fits configured datagram bound");
 
         let identity = super::handshake_identity(&packet).expect("handshake identity");
         assert!(identity.is_conclusion);

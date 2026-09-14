@@ -93,7 +93,7 @@ proptest! {
     #[test]
     fn test_data_packet_roundtrip(packet in arb_data_packet()) {
         let mut buf = Vec::new();
-        packet.encode(&mut buf);
+        packet.encode(&mut buf).expect("packet fits configured datagram bound");
 
         let decoded = SrtPacket::decode(&buf).expect("decode should succeed");
 
@@ -116,7 +116,7 @@ proptest! {
     #[test]
     fn test_control_packet_roundtrip(packet in arb_control_packet()) {
         let mut buf = Vec::new();
-        packet.encode(&mut buf);
+        packet.encode(&mut buf).expect("packet fits configured datagram bound");
 
         let decoded = SrtPacket::decode(&buf).expect("decode should succeed");
 
@@ -173,7 +173,7 @@ proptest! {
 
         // 実際にエンコードして確認
         let mut buf = Vec::new();
-        packet.encode(&mut buf);
+        packet.encode(&mut buf).expect("packet fits configured datagram bound");
         prop_assert_eq!(buf.len(), size);
     }
 
@@ -199,7 +199,7 @@ proptest! {
 
         // 実際にエンコードして確認
         let mut buf = Vec::new();
-        packet.encode(&mut buf);
+        packet.encode(&mut buf).expect("packet fits configured datagram bound");
         prop_assert_eq!(buf.len(), size);
     }
 
@@ -207,11 +207,11 @@ proptest! {
     fn test_srt_packet_encode_data(packet in arb_data_packet()) {
         let srt_packet = SrtPacket::Data(packet.clone());
         let mut buf = Vec::new();
-        srt_packet.encode(&mut buf);
+        srt_packet.encode(&mut buf).expect("packet fits configured datagram bound");
 
         // 直接エンコードと同じ結果
         let mut direct_buf = Vec::new();
-        packet.encode(&mut direct_buf);
+        packet.encode(&mut direct_buf).expect("packet fits configured datagram bound");
         prop_assert_eq!(buf, direct_buf);
     }
 
@@ -219,11 +219,11 @@ proptest! {
     fn test_srt_packet_encode_control(packet in arb_control_packet()) {
         let srt_packet = SrtPacket::Control(packet.clone());
         let mut buf = Vec::new();
-        srt_packet.encode(&mut buf);
+        srt_packet.encode(&mut buf).expect("packet fits configured datagram bound");
 
         // 直接エンコードと同じ結果
         let mut direct_buf = Vec::new();
-        packet.encode(&mut direct_buf);
+        packet.encode(&mut direct_buf).expect("packet fits configured datagram bound");
         prop_assert_eq!(buf, direct_buf);
     }
 

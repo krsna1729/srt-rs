@@ -20,7 +20,7 @@ use std::net::IpAddr;
 use crate::buf::{
     read_bytes, read_u8, read_u16, read_u32, write_bytes, write_u8, write_u16, write_u32,
 };
-use crate::crypto::{KeyFlag, KeyLength};
+use crate::crypto_impl::{KeyFlag, KeyLength};
 use crate::error::Error;
 use crate::srt_packet::{ControlPacket, ControlType, MAX_DATAGRAM_SIZE, SRT_HEADER_SIZE};
 
@@ -929,11 +929,11 @@ impl KmMessage {
         key_length: KeyLength,
         salt: [u8; 16],
         wrapped_key: Vec<u8>,
-        cipher_mode: crate::crypto::CipherMode,
+        cipher_mode: crate::crypto_impl::CipherMode,
     ) -> Self {
         let (cipher, auth) = match cipher_mode {
-            crate::crypto::CipherMode::Ctr => (cipher_type::AES_CTR, auth_type::NONE),
-            crate::crypto::CipherMode::Gcm => (cipher_type::AES_GCM, auth_type::AES_GCM),
+            crate::crypto_impl::CipherMode::Ctr => (cipher_type::AES_CTR, auth_type::NONE),
+            crate::crypto_impl::CipherMode::Gcm => (cipher_type::AES_GCM, auth_type::AES_GCM),
         };
         Self {
             version: KM_VERSION,
@@ -1186,7 +1186,7 @@ mod tests {
             KeyLength::Aes128,
             salt,
             wrapped_key.clone(),
-            crate::crypto::CipherMode::Ctr,
+            crate::crypto_impl::CipherMode::Ctr,
         );
 
         let encoded = original.encode();
@@ -1212,7 +1212,7 @@ mod tests {
             KeyLength::Aes128,
             salt,
             wrapped_key,
-            crate::crypto::CipherMode::Ctr,
+            crate::crypto_impl::CipherMode::Ctr,
         );
 
         let mut hs = HandshakePacket::new_conclusion_request(1, 2, 3, 2, true);

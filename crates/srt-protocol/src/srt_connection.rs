@@ -10,7 +10,7 @@ use bytes::{Bytes, BytesMut};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::buf::{read_u32, write_u32};
-use crate::crypto::{CipherMode, CryptoContext, GCM_TAG_LEN, KeyFlag, KeyLength};
+use crate::crypto_impl::{CipherMode, CryptoContext, GCM_TAG_LEN, KeyFlag, KeyLength};
 use crate::error::Error;
 use crate::message_assembler::MessageAssembler;
 use crate::srt_handshake::{
@@ -993,7 +993,9 @@ impl SrtConnection {
             HandshakePacket::new_rejection(self.options.socket_id, self.syn_cookie, reason);
         let packet = handshake.encode(self.relative_timestamp(now), self.peer_socket_id);
         let mut bytes = Vec::with_capacity(packet.encoded_size());
-        packet.encode(&mut bytes);
+        packet
+            .encode(&mut bytes)
+            .expect("packet fits configured datagram bound");
         self.queue_handshake_packet(bytes);
         self.terminate_handshake();
         self.check_output_queue()
@@ -2484,7 +2486,8 @@ impl SrtConnection {
         write_u32(&mut cif, last_seq);
         pkt.control_info = cif;
         let mut buf = Vec::with_capacity(pkt.encoded_size());
-        pkt.encode(&mut buf);
+        pkt.encode(&mut buf)
+            .expect("packet fits configured datagram bound");
         self.queue_packet(buf, now);
     }
 
@@ -2568,7 +2571,8 @@ impl SrtConnection {
         };
 
         let mut buf = Vec::with_capacity(pkt.encoded_size());
-        pkt.encode(&mut buf);
+        pkt.encode(&mut buf)
+            .expect("packet fits configured datagram bound");
         self.queue_packet(buf, now);
     }
 
@@ -2586,7 +2590,8 @@ impl SrtConnection {
         };
 
         let mut buf = Vec::with_capacity(pkt.encoded_size());
-        pkt.encode(&mut buf);
+        pkt.encode(&mut buf)
+            .expect("packet fits configured datagram bound");
         self.queue_packet(buf, now);
     }
 
@@ -2604,7 +2609,8 @@ impl SrtConnection {
             control_info,
         };
         let mut buf = Vec::with_capacity(pkt.encoded_size());
-        pkt.encode(&mut buf);
+        pkt.encode(&mut buf)
+            .expect("packet fits configured datagram bound");
         self.queue_packet(buf, now);
     }
 
@@ -2683,7 +2689,8 @@ impl SrtConnection {
         };
 
         let mut buf = Vec::with_capacity(pkt.encoded_size());
-        pkt.encode(&mut buf);
+        pkt.encode(&mut buf)
+            .expect("packet fits configured datagram bound");
         self.queue_packet(buf, now);
     }
 
@@ -2766,7 +2773,8 @@ impl SrtConnection {
         };
 
         let mut buf = Vec::with_capacity(pkt.encoded_size());
-        pkt.encode(&mut buf);
+        pkt.encode(&mut buf)
+            .expect("packet fits configured datagram bound");
         self.queue_packet(buf, now);
     }
 
@@ -2775,7 +2783,8 @@ impl SrtConnection {
         hs.flow_window = self.flight_capacity_packets();
         let pkt = hs.encode(self.relative_timestamp(now), 0);
         let mut buf = Vec::with_capacity(pkt.encoded_size());
-        pkt.encode(&mut buf);
+        pkt.encode(&mut buf)
+            .expect("packet fits configured datagram bound");
         self.queue_handshake_packet(buf);
     }
 
@@ -2843,7 +2852,8 @@ impl SrtConnection {
         hs.flow_window = self.flight_capacity_packets();
         let pkt = hs.encode(self.relative_timestamp(now), self.peer_socket_id);
         let mut buf = Vec::with_capacity(pkt.encoded_size());
-        pkt.encode(&mut buf);
+        pkt.encode(&mut buf)
+            .expect("packet fits configured datagram bound");
         self.queue_handshake_packet(buf);
     }
 
@@ -2913,7 +2923,8 @@ impl SrtConnection {
         // A CONCLUSION request is sent with dest_socket_id = 0 (libsrt compatibility).
         let pkt = hs.encode(self.relative_timestamp(now), 0);
         let mut buf = Vec::with_capacity(pkt.encoded_size());
-        pkt.encode(&mut buf);
+        pkt.encode(&mut buf)
+            .expect("packet fits configured datagram bound");
         self.queue_handshake_packet(buf);
         Ok(())
     }
@@ -2953,7 +2964,8 @@ impl SrtConnection {
 
         let pkt = hs.encode(self.relative_timestamp(now), self.peer_socket_id);
         let mut buf = Vec::with_capacity(pkt.encoded_size());
-        pkt.encode(&mut buf);
+        pkt.encode(&mut buf)
+            .expect("packet fits configured datagram bound");
         self.queue_handshake_packet(buf);
     }
 
@@ -2977,7 +2989,9 @@ impl SrtConnection {
         }
         let packet = hs.encode(self.relative_timestamp(now), self.peer_socket_id);
         let mut bytes = Vec::with_capacity(packet.encoded_size());
-        packet.encode(&mut bytes);
+        packet
+            .encode(&mut bytes)
+            .expect("packet fits configured datagram bound");
         self.queue_handshake_packet(bytes);
         self.terminate_handshake();
         Error::handshake_rejected(reason)
@@ -3068,7 +3082,8 @@ impl SrtConnection {
             control_info: LIBSRT_COMPAT_PADDING.to_vec(),
         };
         let mut buf = Vec::with_capacity(pkt.encoded_size());
-        pkt.encode(&mut buf);
+        pkt.encode(&mut buf)
+            .expect("packet fits configured datagram bound");
         self.queue_packet(buf, now);
     }
 
@@ -3090,7 +3105,8 @@ impl SrtConnection {
             control_info: LIBSRT_COMPAT_PADDING.to_vec(),
         };
         let mut buf = Vec::with_capacity(pkt.encoded_size());
-        pkt.encode(&mut buf);
+        pkt.encode(&mut buf)
+            .expect("packet fits configured datagram bound");
         self.queue_packet(buf, now);
     }
 }
@@ -3249,7 +3265,9 @@ fn encode_nak_packet(control_info: Vec<u8>, timestamp: u32, peer_socket_id: u32)
         control_info,
     };
     let mut encoded = Vec::with_capacity(packet.encoded_size());
-    packet.encode(&mut encoded);
+    packet
+        .encode(&mut encoded)
+        .expect("packet fits configured datagram bound");
     encoded
 }
 
