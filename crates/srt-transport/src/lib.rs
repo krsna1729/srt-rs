@@ -81,9 +81,11 @@ mod due_index;
 mod group_conn;
 mod handoff;
 mod high_res_waiter;
+mod sink;
 mod socket_io;
 mod telemetry;
 mod timer;
+pub use sink::{DatagramSink, PushResult};
 
 /// Explicit composition APIs for applications that own a runtime, socket
 /// topology, or connection scheduling loop themselves.
@@ -179,6 +181,11 @@ pub mod advanced {
     /// should retain only the snapshot types from the crate root.
     pub mod telemetry {
         pub use super::super::telemetry::{IngressTelemetry, ShardTelemetry};
+    }
+
+    /// Final-storage datagram sink abstraction.
+    pub mod sink {
+        pub use super::super::sink::{DatagramSink, PushResult};
     }
 }
 

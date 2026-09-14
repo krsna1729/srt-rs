@@ -14,9 +14,9 @@
 //! [`CallerTable`].
 
 use crate::{
-    CallerEvent, CallerLeg, CallerTable, DEFAULT_MAX_CALLERS, LogicalCaller, LogicalCallerId,
-    LogicalCallerMut, MAX_CALLERS, OutputDrainBudget, OutputDrainReport, PreparedCaller,
-    RemovedLogicalCaller,
+    CallerEvent, CallerLeg, CallerTable, DEFAULT_MAX_CALLERS, DatagramSink, LogicalCaller,
+    LogicalCallerId, LogicalCallerMut, MAX_CALLERS, OutputDrainBudget, OutputDrainReport,
+    PreparedCaller, RemovedLogicalCaller,
 };
 use srt_proto::Timestamp;
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -242,6 +242,16 @@ impl CallerPool {
         out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
     ) -> OutputDrainReport {
         self.callers.poll_outbound_bounded(now, budget, out)
+    }
+
+    /// Drain caller output with an explicit work budget into any [`DatagramSink`].
+    pub fn poll_outbound_bounded_to<S: DatagramSink + ?Sized>(
+        &mut self,
+        now: Timestamp,
+        budget: OutputDrainBudget,
+        sink: &mut S,
+    ) -> OutputDrainReport {
+        self.callers.poll_outbound_bounded_to(now, budget, sink)
     }
 
     /// Drain caller protocol events with an explicit event bound.

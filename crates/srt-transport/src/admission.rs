@@ -1,12 +1,12 @@
 use crate::{
-    DenseDueIndex, DenseSlotArena, DueIndex, GroupConnectionStats, GroupLogicalCounters,
-    InboundGroupStats, IngressTelemetry, ListenerPeerPolicy, MAX_DENSE_SLOTS, ManualTimerStore,
-    OutputDrainBudget, OutputDrainReport, OutputDrainStatus, PeerSlotId, WorkerMessage,
-    group_connection_stats,
+    DatagramSink, DenseDueIndex, DenseSlotArena, DueIndex, GroupConnectionStats,
+    GroupLogicalCounters, InboundGroupStats, IngressTelemetry, ListenerPeerPolicy, MAX_DENSE_SLOTS,
+    ManualTimerStore, OutputDrainBudget, OutputDrainReport, OutputDrainStatus, PeerSlotId,
+    PushResult, WorkerMessage, group_connection_stats,
 };
 use srt_proto::{
-    Bytes, ConnectionEvent, ConnectionOptions, ConnectionOutput, DisconnectReason, SrtConnection,
-    Timestamp,
+    Bytes, ConnectionEvent, ConnectionOptions, ConnectionOutput, DisconnectReason, OutputInto,
+    OutputMeta, SrtConnection, Timestamp,
 };
 use std::collections::hash_map::Entry as HashEntry;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -2243,23 +2243,24 @@ impl PeerTable {
     /// Deadline visits, stale ready tokens, timer outputs and packets share
     /// the same action allowance. A call therefore performs at most
     /// `max_actions` table/index visits even under simultaneous timer churn.
-    pub fn poll_outbound_bounded(
+    /// Drain ready output into any [`DatagramSink`].
+    pub fn poll_outbound_bounded_to<S: DatagramSink + ?Sized>(
         &mut self,
         now: Timestamp,
         budget: OutputDrainBudget,
-        out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
+        sink: &mut S,
     ) -> OutputDrainReport {
-        self.poll_outbound_bounded_with_visits(now, budget, out).0
+        self.poll_outbound_bounded_to_with_visits(now, budget, sink)
+            .0
     }
 
-    pub(crate) fn poll_outbound_bounded_with_visits(
+    pub(crate) fn poll_outbound_bounded_to_with_visits<S: DatagramSink + ?Sized>(
         &mut self,
         now: Timestamp,
         budget: OutputDrainBudget,
-        out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
+        sink: &mut S,
     ) -> (OutputDrainReport, usize) {
         self.last_now = now;
-        out.clear();
         let mut rejected = Vec::new();
         let mut report = OutputDrainReport::default();
         let (mut visits, direct_due_remaining) =
@@ -2267,7 +2268,7 @@ impl PeerTable {
         let direct_blocked = self.poll_direct_outbound_bounded(
             now,
             budget,
-            out,
+            sink,
             &mut rejected,
             &mut report,
             &mut visits,
@@ -2277,7 +2278,7 @@ impl PeerTable {
             self.mark_due_group_legs_bounded(now, budget.max_actions.saturating_sub(visits));
         visits = visits.saturating_add(group_due_visits);
         let group_blocked =
-            self.poll_group_outbound_bounded(now, budget, out, &mut report, &mut visits);
+            self.poll_group_outbound_bounded(now, budget, sink, &mut report, &mut visits);
         if direct_due_remaining
             || group_due_remaining
             || direct_blocked
@@ -2288,6 +2289,27 @@ impl PeerTable {
             report.status = OutputDrainStatus::BudgetExhausted;
         }
         (report, visits)
+    }
+
+    /// Bounded drain into a [`Vec<(SocketAddr, Vec<u8>)>`].
+    pub fn poll_outbound_bounded(
+        &mut self,
+        now: Timestamp,
+        budget: OutputDrainBudget,
+        out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
+    ) -> OutputDrainReport {
+        out.clear();
+        self.poll_outbound_bounded_to(now, budget, out)
+    }
+
+    pub(crate) fn poll_outbound_bounded_with_visits(
+        &mut self,
+        now: Timestamp,
+        budget: OutputDrainBudget,
+        out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
+    ) -> (OutputDrainReport, usize) {
+        out.clear();
+        self.poll_outbound_bounded_to_with_visits(now, budget, out)
     }
 
     fn mark_due_peers_bounded(&mut self, now: Timestamp, max_work: usize) -> (usize, bool) {
@@ -2310,11 +2332,11 @@ impl PeerTable {
         (visited, due_remaining)
     }
 
-    fn poll_direct_outbound_bounded(
+    fn poll_direct_outbound_bounded<S: DatagramSink + ?Sized>(
         &mut self,
         now: Timestamp,
         budget: OutputDrainBudget,
-        out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
+        sink: &mut S,
         rejected: &mut Vec<PhysicalPeerKey>,
         report: &mut OutputDrainReport,
         visits: &mut usize,
@@ -2326,7 +2348,7 @@ impl PeerTable {
             };
             *visits += 1;
             let (peer_key, should_requeue, item_blocked) =
-                self.drain_one_direct_peer_slot(slot_id, now, budget, out, report);
+                self.drain_one_direct_peer_slot(slot_id, now, budget, sink, report);
             if let Some(peer_key) = peer_key {
                 rejected.push(peer_key);
             }
@@ -2350,12 +2372,24 @@ impl PeerTable {
     /// carrying a queued policy rejection -- split out of
     /// [`Self::poll_direct_outbound_bounded`]'s own loop body to keep it a
     /// plain "pop, service, repeat" dispatcher.
-    fn drain_one_direct_peer_slot(
+    fn sync_direct_peer_deadline(&mut self, slot_idx: usize) {
+        if let Some(slot) = self.slots.get_by_slot_mut(slot_idx)
+            && let Some(entry) = slot.value.direct_mut()
+        {
+            if let Some(deadline) = entry.timers.next_deadline() {
+                self.deadlines.set(slot_idx, deadline, &mut self.slots);
+            } else {
+                self.deadlines.remove(slot_idx, &mut self.slots);
+            }
+        }
+    }
+
+    fn drain_one_direct_peer_slot<S: DatagramSink + ?Sized>(
         &mut self,
         slot_id: PeerSlotId,
         now: Timestamp,
         budget: OutputDrainBudget,
-        out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
+        sink: &mut S,
         report: &mut OutputDrainReport,
     ) -> (Option<PhysicalPeerKey>, bool, bool) {
         let slot_idx = slot_id.slot_idx as usize;
@@ -2374,47 +2408,136 @@ impl PeerTable {
             return (None, false, false);
         };
         entry.timers.fire_expired(now, &mut entry.conn);
-        let Some(output) = entry
-            .pending_outputs
-            .pop_front()
-            .or_else(|| entry.conn.poll_output())
-        else {
+
+        if let Some(blocked) =
+            Self::drain_peer_legacy_output(peer_addr, now, budget, entry, sink, report)
+        {
+            self.sync_direct_peer_deadline(slot_idx);
+            return (None, true, blocked);
+        }
+
+        let Some(meta) = entry.conn.peek_output() else {
             let rejected = entry.rejected.then_some(peer_key);
-            if let Some(deadline) = entry.timers.next_deadline() {
-                self.deadlines.set(slot_idx, deadline, &mut self.slots);
-            } else {
-                self.deadlines.remove(slot_idx, &mut self.slots);
-            }
+            self.sync_direct_peer_deadline(slot_idx);
             return (rejected, false, false);
         };
-        let mut blocked = false;
+
+        let blocked =
+            Self::drain_peer_direct_meta(peer_addr, now, budget, entry, meta, sink, report);
+        self.sync_direct_peer_deadline(slot_idx);
+        (None, true, blocked)
+    }
+
+    fn drain_peer_legacy_output<S: DatagramSink + ?Sized>(
+        peer_addr: std::net::SocketAddr,
+        now: Timestamp,
+        budget: OutputDrainBudget,
+        entry: &mut AdmissionPeer,
+        sink: &mut S,
+        report: &mut OutputDrainReport,
+    ) -> Option<bool> {
+        let output = entry.pending_outputs.front()?;
         match output {
             ConnectionOutput::SendPacket(bytes) => {
+                let wire_len = bytes.len();
                 let exceeds_packets = report.packets >= budget.max_packets;
-                let exceeds_bytes = report.bytes.saturating_add(bytes.len()) > budget.max_bytes;
+                let exceeds_bytes = report.bytes.saturating_add(wire_len) > budget.max_bytes;
                 if exceeds_packets || exceeds_bytes {
-                    entry
-                        .pending_outputs
-                        .push_front(ConnectionOutput::SendPacket(bytes));
-                    blocked = true;
-                } else {
-                    report.actions += 1;
-                    report.packets += 1;
-                    report.bytes = report.bytes.saturating_add(bytes.len());
-                    out.push((peer_addr, bytes));
+                    return Some(true);
+                }
+                match sink.push_datagram(peer_addr, wire_len, |buf| {
+                    buf[..wire_len].copy_from_slice(bytes);
+                    Ok(wire_len)
+                }) {
+                    Ok(PushResult::Pushed { len }) => {
+                        entry.pending_outputs.pop_front();
+                        report.actions += 1;
+                        report.packets += 1;
+                        report.bytes = report.bytes.saturating_add(len);
+                        Some(false)
+                    }
+                    Ok(PushResult::Exhausted) => Some(true),
+                    Err(e) => {
+                        let _ = e;
+                        entry.pending_outputs.pop_front();
+                        Some(false)
+                    }
                 }
             }
-            other => {
+            _other => {
+                let out = entry.pending_outputs.pop_front().unwrap();
                 report.actions += 1;
-                entry.timers.apply_output(&other, now);
+                entry.timers.apply_output(&out, now);
+                Some(false)
             }
         }
-        if let Some(deadline) = entry.timers.next_deadline() {
-            self.deadlines.set(slot_idx, deadline, &mut self.slots);
-        } else {
-            self.deadlines.remove(slot_idx, &mut self.slots);
+    }
+
+    fn drain_peer_direct_meta<S: DatagramSink + ?Sized>(
+        peer_addr: std::net::SocketAddr,
+        now: Timestamp,
+        budget: OutputDrainBudget,
+        entry: &mut AdmissionPeer,
+        meta: OutputMeta,
+        sink: &mut S,
+        report: &mut OutputDrainReport,
+    ) -> bool {
+        match meta {
+            OutputMeta::Datagram { wire_len } => {
+                let exceeds_packets = report.packets >= budget.max_packets;
+                let exceeds_bytes = report.bytes.saturating_add(wire_len) > budget.max_bytes;
+                if exceeds_packets || exceeds_bytes {
+                    return true;
+                }
+                match sink.push_datagram(peer_addr, wire_len, |buf| {
+                    match entry.conn.poll_output_into(buf)? {
+                        Some(OutputInto::Datagram { len }) => Ok(len),
+                        _ => Err(srt_proto::Error::with_reason(
+                            srt_proto::ErrorKind::InvalidState,
+                            "expected datagram",
+                        )),
+                    }
+                }) {
+                    Ok(PushResult::Pushed { len }) => {
+                        report.actions += 1;
+                        report.packets += 1;
+                        report.bytes = report.bytes.saturating_add(len);
+                        false
+                    }
+                    Ok(PushResult::Exhausted) => true,
+                    Err(e) => {
+                        let _ = e;
+                        false
+                    }
+                }
+            }
+            OutputMeta::SetTimer { .. } | OutputMeta::ClearTimer { .. } => {
+                let mut dummy = [];
+                match entry.conn.poll_output_into(&mut dummy) {
+                    Ok(Some(OutputInto::SetTimer {
+                        id,
+                        duration_micros,
+                    })) => {
+                        report.actions += 1;
+                        entry.timers.apply_output(
+                            &ConnectionOutput::SetTimer {
+                                id,
+                                duration_micros,
+                            },
+                            now,
+                        );
+                    }
+                    Ok(Some(OutputInto::ClearTimer { id })) => {
+                        report.actions += 1;
+                        entry
+                            .timers
+                            .apply_output(&ConnectionOutput::ClearTimer { id }, now);
+                    }
+                    _ => {}
+                }
+                false
+            }
         }
-        (None, true, blocked)
     }
 
     fn remove_rejected_peers(&mut self, rejected: Vec<PhysicalPeerKey>) {
@@ -2444,11 +2567,11 @@ impl PeerTable {
     /// [`Self::poll_outbound_bounded`]'s doc comment for why this does
     /// not (yet) split a single call's work further across multiple
     /// ready groups.
-    fn poll_group_outbound_bounded(
+    fn poll_group_outbound_bounded<S: DatagramSink + ?Sized>(
         &mut self,
         now: Timestamp,
         budget: OutputDrainBudget,
-        out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
+        sink: &mut S,
         report: &mut OutputDrainReport,
         visits: &mut usize,
     ) -> bool {
@@ -2459,7 +2582,7 @@ impl PeerTable {
             };
             *visits += 1;
             self.group_ready_queued.remove(&token);
-            if self.drain_one_group_ready_token(token, now, budget, out, report) {
+            if self.drain_one_group_ready_token(token, now, budget, sink, report) {
                 blocked = true;
                 break;
             }
@@ -2470,12 +2593,12 @@ impl PeerTable {
     /// Service every ready leg of one bonded group -- split out of
     /// [`Self::poll_group_outbound_bounded`]'s own loop body to keep it a
     /// plain "pop, service, repeat" dispatcher.
-    fn drain_one_group_ready_token(
+    fn drain_one_group_ready_token<S: DatagramSink + ?Sized>(
         &mut self,
         token: GroupReadyKey,
         now: Timestamp,
         budget: OutputDrainBudget,
-        out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
+        sink: &mut S,
         report: &mut OutputDrainReport,
     ) -> bool {
         let Some(group) = self.groups.get_mut(&token.key) else {
@@ -2496,34 +2619,22 @@ impl PeerTable {
         };
         let connection = member.connection_mut();
         leg.timers.fire_expired(now, connection);
-        let output = leg
-            .pending_outputs
-            .pop_front()
-            .or_else(|| connection.poll_output());
-        let had_output = output.is_some();
+
+        let peer_addr = leg.physical.address;
+        let mut had_output = false;
         let mut blocked = false;
-        if let Some(output) = output {
-            match output {
-                ConnectionOutput::SendPacket(bytes) => {
-                    let exceeds_packets = report.packets >= budget.max_packets;
-                    let exceeds_bytes = report.bytes.saturating_add(bytes.len()) > budget.max_bytes;
-                    if exceeds_packets || exceeds_bytes {
-                        leg.pending_outputs
-                            .push_front(ConnectionOutput::SendPacket(bytes));
-                        blocked = true;
-                    } else {
-                        report.actions += 1;
-                        report.packets += 1;
-                        report.bytes = report.bytes.saturating_add(bytes.len());
-                        out.push((leg.physical.address, bytes));
-                    }
-                }
-                other => {
-                    report.actions += 1;
-                    leg.timers.apply_output(&other, now);
-                }
-            }
+
+        if let Some(blk) =
+            Self::drain_group_leg_legacy_output(peer_addr, now, budget, leg, sink, report)
+        {
+            had_output = true;
+            blocked = blk;
+        } else if let Some(meta) = connection.peek_output() {
+            had_output = true;
+            blocked =
+                Self::drain_group_leg_direct_meta(now, budget, leg, connection, meta, sink, report);
         }
+
         self.sync_group_leg_deadline(&token.key, member_id);
         if had_output {
             self.mark_group_leg_ready(&token.key, member_id);
@@ -2535,6 +2646,117 @@ impl PeerTable {
             self.enqueue_group_ready(token);
         }
         blocked
+    }
+
+    fn drain_group_leg_legacy_output<S: DatagramSink + ?Sized>(
+        peer_addr: std::net::SocketAddr,
+        now: Timestamp,
+        budget: OutputDrainBudget,
+        leg: &mut InboundGroupLeg,
+        sink: &mut S,
+        report: &mut OutputDrainReport,
+    ) -> Option<bool> {
+        let output = leg.pending_outputs.front()?;
+        match output {
+            ConnectionOutput::SendPacket(bytes) => {
+                let wire_len = bytes.len();
+                let exceeds_packets = report.packets >= budget.max_packets;
+                let exceeds_bytes = report.bytes.saturating_add(wire_len) > budget.max_bytes;
+                if exceeds_packets || exceeds_bytes {
+                    return Some(true);
+                }
+                match sink.push_datagram(peer_addr, wire_len, |buf| {
+                    buf[..wire_len].copy_from_slice(bytes);
+                    Ok(wire_len)
+                }) {
+                    Ok(PushResult::Pushed { len }) => {
+                        leg.pending_outputs.pop_front();
+                        report.actions += 1;
+                        report.packets += 1;
+                        report.bytes = report.bytes.saturating_add(len);
+                        Some(false)
+                    }
+                    Ok(PushResult::Exhausted) => Some(true),
+                    Err(e) => {
+                        let _ = e;
+                        leg.pending_outputs.pop_front();
+                        Some(false)
+                    }
+                }
+            }
+            _other => {
+                let out = leg.pending_outputs.pop_front().unwrap();
+                report.actions += 1;
+                leg.timers.apply_output(&out, now);
+                Some(false)
+            }
+        }
+    }
+
+    fn drain_group_leg_direct_meta<S: DatagramSink + ?Sized>(
+        now: Timestamp,
+        budget: OutputDrainBudget,
+        leg: &mut InboundGroupLeg,
+        connection: &mut SrtConnection,
+        meta: OutputMeta,
+        sink: &mut S,
+        report: &mut OutputDrainReport,
+    ) -> bool {
+        match meta {
+            OutputMeta::Datagram { wire_len } => {
+                let exceeds_packets = report.packets >= budget.max_packets;
+                let exceeds_bytes = report.bytes.saturating_add(wire_len) > budget.max_bytes;
+                if exceeds_packets || exceeds_bytes {
+                    return true;
+                }
+                match sink.push_datagram(leg.physical.address, wire_len, |buf| {
+                    match connection.poll_output_into(buf)? {
+                        Some(OutputInto::Datagram { len }) => Ok(len),
+                        _ => Err(srt_proto::Error::with_reason(
+                            srt_proto::ErrorKind::InvalidState,
+                            "expected datagram",
+                        )),
+                    }
+                }) {
+                    Ok(PushResult::Pushed { len }) => {
+                        report.actions += 1;
+                        report.packets += 1;
+                        report.bytes = report.bytes.saturating_add(len);
+                        false
+                    }
+                    Ok(PushResult::Exhausted) => true,
+                    Err(e) => {
+                        let _ = e;
+                        false
+                    }
+                }
+            }
+            OutputMeta::SetTimer { .. } | OutputMeta::ClearTimer { .. } => {
+                let mut dummy = [];
+                match connection.poll_output_into(&mut dummy) {
+                    Ok(Some(OutputInto::SetTimer {
+                        id,
+                        duration_micros,
+                    })) => {
+                        report.actions += 1;
+                        leg.timers.apply_output(
+                            &ConnectionOutput::SetTimer {
+                                id,
+                                duration_micros,
+                            },
+                            now,
+                        );
+                    }
+                    Ok(Some(OutputInto::ClearTimer { id })) => {
+                        report.actions += 1;
+                        leg.timers
+                            .apply_output(&ConnectionOutput::ClearTimer { id }, now);
+                    }
+                    _ => {}
+                }
+                false
+            }
+        }
     }
 
     /// Whether output or a due timer can be serviced at `now`, across

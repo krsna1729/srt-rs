@@ -1,8 +1,8 @@
 use crate::{
-    GroupConnectionStats, GroupLogicalCounters, ManualTimerStore, OutputDrainBudget,
-    OutputDrainReport, OutputDrainStatus, group_connection_stats,
+    DatagramSink, GroupConnectionStats, GroupLogicalCounters, ManualTimerStore, OutputDrainBudget,
+    OutputDrainReport, OutputDrainStatus, PushResult, group_connection_stats,
 };
-use srt_proto::{Bytes, ConnectionOutput, SrtConnection, Timestamp};
+use srt_proto::{Bytes, ConnectionOutput, OutputInto, OutputMeta, SrtConnection, Timestamp};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 /// Default maximum number of logical callers held by one table.
@@ -375,10 +375,10 @@ enum CallerSession {
 /// down to the single-output-item helpers. Bundled because the three always
 /// travel together; `budget` is read-only for the pass, `report` and `out`
 /// accumulate across every leg it visits.
-struct DrainSink<'a> {
+struct DrainSink<'a, S: ?Sized> {
     budget: OutputDrainBudget,
     report: &'a mut OutputDrainReport,
-    out: &'a mut Vec<(std::net::SocketAddr, Vec<u8>)>,
+    sink: &'a mut S,
 }
 
 impl CallerSession {
@@ -523,7 +523,11 @@ impl CallerSession {
     /// touched (`SetTimer`/`ClearTimer` applied); callers must reindex the
     /// deadline exactly when touched (or after `fire_timers`, which always
     /// reindexes in `fire_due_ids`).
-    fn drain_one(&mut self, now: Timestamp, sink: &mut DrainSink) -> (DrainOne, bool) {
+    fn drain_one<S: DatagramSink + ?Sized>(
+        &mut self,
+        now: Timestamp,
+        sink: &mut DrainSink<'_, S>,
+    ) -> (DrainOne, bool) {
         match self {
             Self::Direct(leg) => drain_one_caller_leg(leg, now, sink),
             Self::Group(group) => {
@@ -1044,22 +1048,23 @@ impl CallerTable {
     /// fired only for due callers before the budget is shared fairly across
     /// ready logical streams, so a busy caller cannot starve another caller's
     /// retransmission or close timer.
-    pub fn poll_outbound_bounded(
+    /// Drain ready output into any [`DatagramSink`].
+    pub fn poll_outbound_bounded_to<S: DatagramSink + ?Sized>(
         &mut self,
         now: Timestamp,
         budget: OutputDrainBudget,
-        out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
+        sink: &mut S,
     ) -> OutputDrainReport {
-        self.poll_outbound_bounded_with_visits(now, budget, out).0
+        self.poll_outbound_bounded_to_with_visits(now, budget, sink)
+            .0
     }
 
-    pub(crate) fn poll_outbound_bounded_with_visits(
+    pub(crate) fn poll_outbound_bounded_to_with_visits<S: DatagramSink + ?Sized>(
         &mut self,
         now: Timestamp,
         budget: OutputDrainBudget,
-        out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
+        sink: &mut S,
     ) -> (OutputDrainReport, usize) {
-        out.clear();
         if budget.max_actions == 0 {
             return (
                 OutputDrainReport {
@@ -1073,11 +1078,6 @@ impl CallerTable {
                 0,
             );
         }
-        // P02: cap how many due sessions get their timers fired this visit
-        // too, not just how much ready-queue output gets drained -- an
-        // unconditional "fire every due session first" made this
-        // function's own "bounded" contract hold only as long as no more
-        // than a handful of sessions happened to be simultaneously due.
         let due_ids = self.pop_due_ids(now, budget.max_actions);
         let due_actions = due_ids.len();
         let due_remaining = self.has_due_remaining(now);
@@ -1087,29 +1087,46 @@ impl CallerTable {
             budget.max_packets,
             budget.max_bytes,
         );
-        let (mut report, ready_visits) = self.drain_ready_bounded(now, remaining, out);
+        let (mut report, ready_visits) = self.drain_ready_bounded(now, remaining, sink);
         report.actions = report.actions.saturating_add(due_actions);
-        // Only promote a report that otherwise claimed full completion --
-        // never overwrite a status that already means "more work, come
-        // back" (e.g. a future ready-drain outcome other than Drained),
-        // which would silently discard whatever that status was signaling.
         if due_remaining && report.status == OutputDrainStatus::Drained {
             report.status = OutputDrainStatus::BudgetExhausted;
         }
         (report, due_actions.saturating_add(ready_visits))
     }
 
-    fn drain_ready_bounded(
+    /// Bounded drain into a [`Vec<(SocketAddr, Vec<u8>)>`].
+    pub fn poll_outbound_bounded(
+        &mut self,
+        now: Timestamp,
+        budget: OutputDrainBudget,
+        out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
+    ) -> OutputDrainReport {
+        out.clear();
+        self.poll_outbound_bounded_to(now, budget, out)
+    }
+
+    pub(crate) fn poll_outbound_bounded_with_visits(
         &mut self,
         now: Timestamp,
         budget: OutputDrainBudget,
         out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
     ) -> (OutputDrainReport, usize) {
+        out.clear();
+        self.poll_outbound_bounded_to_with_visits(now, budget, out)
+    }
+
+    fn drain_ready_bounded<S: DatagramSink + ?Sized>(
+        &mut self,
+        now: Timestamp,
+        budget: OutputDrainBudget,
+        sink_dest: &mut S,
+    ) -> (OutputDrainReport, usize) {
         let mut report = OutputDrainReport::default();
         let mut sink = DrainSink {
             budget,
             report: &mut report,
-            out,
+            sink: sink_dest,
         };
         // Set when a leg's next packet cannot fit the remaining allowance
         // (`DrainOne::Blocked`'s exceeds_bytes case in
@@ -1159,11 +1176,11 @@ impl CallerTable {
     /// Service one ready-queue visit -- split out of
     /// [`Self::drain_ready_bounded`]'s own loop body to keep it a plain
     /// "pop, service, repeat" dispatcher.
-    fn drain_one_ready_visit(
+    fn drain_one_ready_visit<S: DatagramSink + ?Sized>(
         &mut self,
         id: LogicalCallerId,
         now: Timestamp,
-        sink: &mut DrainSink<'_>,
+        sink: &mut DrainSink<'_, S>,
     ) -> ReadyVisitOutcome {
         let (drain_result, timers_touched) = {
             let Some(session) = self.sessions.get_mut(&id) else {
@@ -1498,10 +1515,10 @@ impl Default for CallerTable {
         Self::new()
     }
 }
-fn drain_one_caller_leg(
+fn drain_one_caller_leg<S: DatagramSink + ?Sized>(
     leg: &mut CallerLegState,
     now: Timestamp,
-    sink: &mut DrainSink,
+    sink: &mut DrainSink<'_, S>,
 ) -> (DrainOne, bool) {
     drain_one_caller_leg_parts(
         leg.peer,
@@ -1513,42 +1530,135 @@ fn drain_one_caller_leg(
     )
 }
 
-fn drain_one_caller_leg_parts(
+fn drain_caller_legacy_output<S: DatagramSink + ?Sized>(
+    peer: std::net::SocketAddr,
+    now: Timestamp,
+    timers: &mut ManualTimerStore,
+    pending: &mut VecDeque<ConnectionOutput>,
+    sink: &mut DrainSink<'_, S>,
+) -> Option<(DrainOne, bool)> {
+    let output = pending.front()?;
+    match output {
+        ConnectionOutput::SendPacket(packet) => {
+            let wire_len = packet.len();
+            let exceeds_packets = sink.report.packets >= sink.budget.max_packets;
+            let exceeds_bytes = sink.report.packets > 0
+                && sink.report.bytes.saturating_add(wire_len) > sink.budget.max_bytes;
+            if exceeds_packets || exceeds_bytes {
+                return Some((DrainOne::Blocked, false));
+            }
+            match sink.sink.push_datagram(peer, wire_len, |buf| {
+                buf[..wire_len].copy_from_slice(packet);
+                Ok(wire_len)
+            }) {
+                Ok(PushResult::Pushed { len }) => {
+                    pending.pop_front();
+                    sink.report.actions += 1;
+                    sink.report.packets += 1;
+                    sink.report.bytes = sink.report.bytes.saturating_add(len);
+                    Some((DrainOne::Drained, false))
+                }
+                Ok(PushResult::Exhausted) => Some((DrainOne::Blocked, false)),
+                Err(e) => {
+                    let _ = e;
+                    pending.pop_front();
+                    Some((DrainOne::Empty, false))
+                }
+            }
+        }
+        _other => {
+            let output = pending.pop_front().unwrap();
+            sink.report.actions += 1;
+            timers.apply_output(&output, now);
+            Some((DrainOne::Drained, true))
+        }
+    }
+}
+
+fn drain_caller_direct_meta<S: DatagramSink + ?Sized>(
+    peer: std::net::SocketAddr,
+    now: Timestamp,
+    timers: &mut ManualTimerStore,
+    connection: &mut SrtConnection,
+    meta: OutputMeta,
+    sink: &mut DrainSink<'_, S>,
+) -> (DrainOne, bool) {
+    match meta {
+        OutputMeta::Datagram { wire_len } => {
+            let exceeds_packets = sink.report.packets >= sink.budget.max_packets;
+            let exceeds_bytes = sink.report.packets > 0
+                && sink.report.bytes.saturating_add(wire_len) > sink.budget.max_bytes;
+            if exceeds_packets || exceeds_bytes {
+                return (DrainOne::Blocked, false);
+            }
+            match sink.sink.push_datagram(peer, wire_len, |buf| {
+                match connection.poll_output_into(buf)? {
+                    Some(OutputInto::Datagram { len }) => Ok(len),
+                    _ => Err(srt_proto::Error::with_reason(
+                        srt_proto::ErrorKind::InvalidState,
+                        "expected datagram",
+                    )),
+                }
+            }) {
+                Ok(PushResult::Pushed { len }) => {
+                    sink.report.actions += 1;
+                    sink.report.packets += 1;
+                    sink.report.bytes = sink.report.bytes.saturating_add(len);
+                    (DrainOne::Drained, false)
+                }
+                Ok(PushResult::Exhausted) => (DrainOne::Blocked, false),
+                Err(e) => {
+                    let _ = e;
+                    (DrainOne::Empty, false)
+                }
+            }
+        }
+        OutputMeta::SetTimer { .. } | OutputMeta::ClearTimer { .. } => {
+            let mut dummy = [];
+            match connection.poll_output_into(&mut dummy) {
+                Ok(Some(OutputInto::SetTimer {
+                    id,
+                    duration_micros,
+                })) => {
+                    sink.report.actions += 1;
+                    timers.apply_output(
+                        &ConnectionOutput::SetTimer {
+                            id,
+                            duration_micros,
+                        },
+                        now,
+                    );
+                    (DrainOne::Drained, true)
+                }
+                Ok(Some(OutputInto::ClearTimer { id })) => {
+                    sink.report.actions += 1;
+                    timers.apply_output(&ConnectionOutput::ClearTimer { id }, now);
+                    (DrainOne::Drained, true)
+                }
+                _ => (DrainOne::Empty, false),
+            }
+        }
+    }
+}
+
+fn drain_one_caller_leg_parts<S: DatagramSink + ?Sized>(
     peer: std::net::SocketAddr,
     now: Timestamp,
     timers: &mut ManualTimerStore,
     pending: &mut VecDeque<ConnectionOutput>,
     connection: &mut SrtConnection,
-    sink: &mut DrainSink,
+    sink: &mut DrainSink<'_, S>,
 ) -> (DrainOne, bool) {
-    let Some(output) = pending.pop_front().or_else(|| connection.poll_output()) else {
-        return (DrainOne::Empty, false);
-    };
     if sink.report.actions >= sink.budget.max_actions {
-        pending.push_front(output);
         return (DrainOne::Blocked, false);
     }
-    match output {
-        ConnectionOutput::SendPacket(packet) => {
-            let exceeds_packets = sink.report.packets >= sink.budget.max_packets;
-            let exceeds_bytes = sink.report.packets > 0
-                && sink.report.bytes.saturating_add(packet.len()) > sink.budget.max_bytes;
-            if exceeds_packets || exceeds_bytes {
-                pending.push_front(ConnectionOutput::SendPacket(packet));
-                return (DrainOne::Blocked, false);
-            }
-            sink.report.actions += 1;
-            sink.report.packets += 1;
-            sink.report.bytes = sink.report.bytes.saturating_add(packet.len());
-            sink.out.push((peer, packet));
-            (DrainOne::Drained, false)
-        }
-        other => {
-            sink.report.actions += 1;
-            timers.apply_output(&other, now);
-            (DrainOne::Drained, true)
-        }
+    if let Some(res) = drain_caller_legacy_output(peer, now, timers, pending, sink) {
+        return res;
     }
+    let Some(meta) = connection.peek_output() else {
+        return (DrainOne::Empty, false);
+    };
+    drain_caller_direct_meta(peer, now, timers, connection, meta, sink)
 }
 
 pub(crate) fn prepend_outputs(
@@ -1650,6 +1760,67 @@ mod tests {
             telemetry,
         )
         .1
+    }
+
+    #[test]
+    fn poll_outbound_bounded_to_drains_directly_and_handles_exhaustion() {
+        struct TestSink {
+            capacity: usize,
+            packets: Vec<(std::net::SocketAddr, Vec<u8>)>,
+        }
+
+        impl DatagramSink for TestSink {
+            fn push_datagram<F>(
+                &mut self,
+                peer: std::net::SocketAddr,
+                wire_len: usize,
+                fill: F,
+            ) -> Result<PushResult, srt_proto::Error>
+            where
+                F: FnOnce(&mut [u8]) -> Result<usize, srt_proto::Error>,
+            {
+                if self.packets.len() >= self.capacity {
+                    return Ok(PushResult::Exhausted);
+                }
+                let mut buf = vec![0u8; wire_len];
+                let len = fill(&mut buf)?;
+                buf.truncate(len);
+                self.packets.push((peer, buf));
+                Ok(PushResult::Pushed { len })
+            }
+        }
+
+        let mut table = CallerTable::default();
+        let peer: std::net::SocketAddr = "127.0.0.1:9001".parse().unwrap();
+        let mut conn = SrtConnection::new_caller(ConnectionOptions {
+            socket_id: 0x5555,
+            ..Default::default()
+        });
+        let now = Timestamp::from_micros(10_000);
+        conn.connect(now).expect("connect");
+        let leg = CallerLeg {
+            peer,
+            connection: conn,
+        };
+        let _id = table.add_direct(leg).expect("admitted");
+        // Try draining with sink capacity = 0 (completely exhausted)
+        let mut sink0 = TestSink {
+            capacity: 0,
+            packets: Vec::new(),
+        };
+        let report0 = table.poll_outbound_bounded_to(now, OutputDrainBudget::default(), &mut sink0);
+        assert_eq!(sink0.packets.len(), 0);
+        assert_eq!(report0.status, OutputDrainStatus::BudgetExhausted);
+
+        // Now drain with capacity = 1
+        let mut sink1 = TestSink {
+            capacity: 1,
+            packets: Vec::new(),
+        };
+        let _report1 =
+            table.poll_outbound_bounded_to(now, OutputDrainBudget::default(), &mut sink1);
+        assert_eq!(sink1.packets.len(), 1);
+        assert_eq!(sink1.packets[0].0, peer);
     }
 
     fn prepare_conclusion_with_options(
