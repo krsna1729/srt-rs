@@ -1442,6 +1442,7 @@ version = "0.1.0"
 dependencies = [
  "compio",
  "criterion",
+ "futures-util",
  "getrandom 0.4.3",
  "libc",
  "mio",

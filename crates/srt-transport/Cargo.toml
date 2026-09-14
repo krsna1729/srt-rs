@@ -33,6 +33,7 @@ zeroize = "1.8"
 mio = { version = "1", features = ["os-poll", "net"], optional = true }
 tokio = { version = "1", features = ["net", "time", "rt", "sync", "macros"], optional = true }
 compio = { version = "0.19", features = ["io", "io-uring", "net", "runtime", "time"], optional = true }
+futures-util = { version = "0.3", default-features = false, features = ["alloc"], optional = true }
 
 [dev-dependencies]
 criterion = "0.8"
@@ -63,7 +64,7 @@ required-features = ["bench-internals"]
 [features]
 mio = ["dep:mio"]
 tokio = ["dep:tokio"]
-compio = ["dep:compio"]
+compio = ["dep:compio", "dep:futures-util"]
 bench-internals = []
 
 [lints]
