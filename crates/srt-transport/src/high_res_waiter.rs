@@ -358,6 +358,14 @@ where
             drain_timerfd(timer.as_raw_fd());
         }
         let (_, due_remaining) = self.heap.pop_due_bounded(MonotonicDeadline::now(), 64, due);
+        // A deadline-only key has no other ownership once it fires. Retain
+        // registered keys for their fd lifetime, but release timer-only keys
+        // immediately so the finite capacity can be reused.
+        for key in due.iter() {
+            if !self.by_key.contains_key(key) {
+                self.keys.remove(key);
+            }
+        }
         Ok(WaitOutcome {
             backend: self.backend,
             planned,
@@ -827,6 +835,22 @@ mod tests {
             .expect("first key fits");
         assert!(waiter.set_deadline(2, MonotonicDeadline::now()).is_err());
         assert_eq!(waiter.deadline_len(), 1);
+    }
+
+    #[test]
+    fn fired_deadline_only_key_releases_capacity() {
+        let mut waiter = HighResWaiter::with_backend_and_capacity(WaitBackend::AbsoluteTimerFd, 1)
+            .expect("timerfd waiter");
+        waiter
+            .set_deadline(1, MonotonicDeadline::now())
+            .expect("first key fits");
+        let mut due = Vec::new();
+        let mut ready = Vec::new();
+        waiter.wait(&mut due, &mut ready).expect("deadline fires");
+        assert_eq!(due, vec![1]);
+        waiter
+            .set_deadline(2, MonotonicDeadline::now())
+            .expect("fired timer-only key released its slot");
     }
 
     #[test]
