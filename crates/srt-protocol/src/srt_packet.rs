@@ -71,6 +71,26 @@ impl SrtPacket {
             SrtPacket::Control(pkt) => pkt.encode(buf),
         }
     }
+
+    /// Return the encoded size in bytes, saturating on theoretical `usize`
+    /// overflow.
+    #[must_use]
+    pub fn encoded_size(&self) -> usize {
+        match self {
+            SrtPacket::Data(pkt) => pkt.encoded_size(),
+            SrtPacket::Control(pkt) => pkt.encoded_size(),
+        }
+    }
+
+    /// Encode only when the resulting datagram fits the codec's finite wire
+    /// limit. The destination buffer is unchanged on rejection.
+    pub fn try_encode(&self, buf: &mut Vec<u8>) -> Result<(), Error> {
+        if self.encoded_size() > MAX_DATAGRAM_SIZE {
+            return Err(Error::invalid_data("SRT datagram exceeds maximum size"));
+        }
+        self.encode(buf);
+        Ok(())
+    }
 }
 
 /// Read the destination SRT Socket ID from a complete SRT header.
@@ -217,9 +237,19 @@ impl DataPacket {
         write_bytes(buf, &self.payload);
     }
 
+    /// Encode only when the resulting datagram fits the codec's finite wire
+    /// limit. The destination buffer is unchanged on rejection.
+    pub fn try_encode(&self, buf: &mut Vec<u8>) -> Result<(), Error> {
+        if self.encoded_size() > MAX_DATAGRAM_SIZE {
+            return Err(Error::invalid_data("SRT datagram exceeds maximum size"));
+        }
+        self.encode(buf);
+        Ok(())
+    }
+
     /// Get the encoded size.
     pub fn encoded_size(&self) -> usize {
-        SRT_HEADER_SIZE + self.payload.len()
+        SRT_HEADER_SIZE.saturating_add(self.payload.len())
     }
 
     /// Build the 16-byte header used as AAD for AES-GCM.
@@ -409,9 +439,19 @@ impl ControlPacket {
         write_bytes(buf, &self.control_info);
     }
 
+    /// Encode only when the resulting datagram fits the codec's finite wire
+    /// limit. The destination buffer is unchanged on rejection.
+    pub fn try_encode(&self, buf: &mut Vec<u8>) -> Result<(), Error> {
+        if self.encoded_size() > MAX_DATAGRAM_SIZE {
+            return Err(Error::invalid_data("SRT datagram exceeds maximum size"));
+        }
+        self.encode(buf);
+        Ok(())
+    }
+
     /// Get the encoded size.
     pub fn encoded_size(&self) -> usize {
-        SRT_HEADER_SIZE + self.control_info.len()
+        SRT_HEADER_SIZE.saturating_add(self.control_info.len())
     }
 }
 
@@ -484,6 +524,22 @@ mod tests {
         let oversized = vec![0u8; MAX_DATAGRAM_SIZE + 1];
         let error = SrtPacket::decode(&oversized).expect_err("codec input is capped");
         assert_eq!(error.kind, crate::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn checked_encode_rejects_oversized_datagrams_without_mutating_buffer() {
+        let data = DataPacket::new(0, 0, 0, 0, Bytes::from(vec![0; MAX_DATAGRAM_SIZE]));
+        let mut data_buf = vec![1, 2, 3];
+        assert!(data.try_encode(&mut data_buf).is_err());
+        assert_eq!(data_buf, vec![1, 2, 3]);
+
+        let control = ControlPacket {
+            control_info: vec![0; MAX_DATAGRAM_SIZE],
+            ..ControlPacket::new(ControlType::Ack, 0, 0)
+        };
+        let mut control_buf = vec![4, 5, 6];
+        assert!(control.try_encode(&mut control_buf).is_err());
+        assert_eq!(control_buf, vec![4, 5, 6]);
     }
 
     #[test]

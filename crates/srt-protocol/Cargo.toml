@@ -24,6 +24,10 @@ include = [
 # Test-only hooks for black-box interop validation. They are intentionally
 # opt-in so production connections always use the protocol refresh cadence.
 test-support = []
+# Raw cursor helpers are kept as an opt-in compatibility surface for protocol
+# tests and custom wire tooling; the normal crate surface is typed packets and
+# handshakes.
+raw-codec = []
 
 [dependencies]
 # local patch (crates/srt-protocol/VENDOR.md): replaced aws-lc-rs
@@ -62,7 +66,7 @@ criterion = "0.8"
 # sharing the same workspace build graph, which is not the case for CI
 # invocations that build only this crate (e.g. the ASan job, release.yml).
 # A path-only dev-dependency on itself is stripped on publish.
-shiguredo_srt = { path = ".", features = ["test-support"] }
+shiguredo_srt = { path = ".", features = ["test-support", "raw-codec"] }
 
 [[bench]]
 name = "core_packet_loop"

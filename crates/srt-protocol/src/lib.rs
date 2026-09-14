@@ -1,6 +1,7 @@
 pub(crate) mod adaptive_receiver_packet_window;
 pub(crate) mod sender_packet_window;
 
+#[allow(dead_code)]
 mod buf;
 mod crypto;
 mod error;
@@ -15,6 +16,7 @@ mod stats;
 pub mod stream_id;
 mod time;
 
+#[cfg(feature = "raw-codec")]
 pub use buf::{
     read_bytes, read_u8, read_u16, read_u32, read_u64, read_utf8, write_bytes, write_u8, write_u16,
     write_u32, write_u64,

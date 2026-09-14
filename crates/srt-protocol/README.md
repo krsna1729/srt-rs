@@ -24,7 +24,7 @@ protocol testable, benchmarkable, and fuzzable with zero sockets.
 | `srt_group` | Bonding groups: `SrtGroup` with Broadcast / Backup modes, member lifecycle, group-level send/receive |
 | `crypto` | `CryptoContext`: PBKDF2-HMAC-SHA1 KEK derivation, AES Key Wrap SEK exchange, `CipherMode::Ctr`/`Gcm` payload encryption (AES-CTR or authenticated AES-GCM); key material is redacted in `Debug` and zeroized on drop |
 | `stream_id` | StreamID + `#!::k=v,…` access-control parsing (`AccessControl`, `StreamType`, `StreamMode`) |
-| `buf`, `error`, `time` | Checked big-endian read/write cursor helpers, `Error`/`ErrorKind` with backtrace capture, `Timestamp` (µs, injected) |
+| `buf`, `error`, `time` | Internal checked big-endian cursor helpers (`raw-codec` feature for compatibility tooling), `Error`/`ErrorKind` with backtrace capture, `Timestamp` (µs, injected) |
 
 Handshake attempts default to libsrt-compatible 250 ms request spacing
 with non-early jitter and a 3 s deadline for the complete induction plus
