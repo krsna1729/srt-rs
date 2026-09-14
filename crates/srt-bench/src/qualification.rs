@@ -13,7 +13,11 @@ pub const SCENARIO_COUNT: usize = 10;
 pub const MAX_INPUT_BYTES: u64 = 64 * 1024;
 pub const PLAN_COLUMNS: &[&str] = &[
     "scenario",
-    "connections",
+    "logical_destinations",
+    "physical_legs",
+    "active_data_legs",
+    "bond_mode",
+    "legs_per_destination",
     "encryption",
     "impairment",
     "consumer",
@@ -100,7 +104,23 @@ impl Scenario {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScenarioSpec {
     pub scenario: Scenario,
-    pub connections: usize,
+    /// Logical egress destinations ("600 destinations" counts these, not
+    /// physical SRT legs). For unbonded scenarios this equals the physical
+    /// connection count; for bonded scenarios each destination owns
+    /// `legs_per_destination` physical legs.
+    pub logical_destinations: usize,
+    /// Physical SRT legs derived from the destination/leg model. Unbonded:
+    /// equals `logical_destinations`. N-leg bonded: destinations × legs.
+    pub physical_legs: usize,
+    /// Number of legs actively transmitting DATA in steady state. For 2-leg
+    /// Broadcast this is 2 × logical (both active); for Backup it is 1 × logical
+    /// (primary active, standby idle).
+    pub active_data_legs: usize,
+    /// SRT-level bonding for this scenario: `none`, `broadcast`, `backup`.
+    pub bond_mode: &'static str,
+    /// Physical legs per logical destination (1 unbonded, 2 for the current
+    /// two-leg bonded scenarios).
+    pub legs_per_destination: usize,
     pub encryption: &'static str,
     pub impairment: &'static str,
     pub consumer: &'static str,
@@ -109,70 +129,110 @@ pub struct ScenarioSpec {
 pub const SCENARIOS: [ScenarioSpec; SCENARIO_COUNT] = [
     ScenarioSpec {
         scenario: Scenario::Clean,
-        connections: 1,
+        logical_destinations: 1,
+        physical_legs: 1,
+        active_data_legs: 1,
+        bond_mode: "none",
+        legs_per_destination: 1,
         encryption: "plain",
         impairment: "none",
         consumer: "normal",
     },
     ScenarioSpec {
         scenario: Scenario::Fanout600,
-        connections: 600,
+        logical_destinations: 600,
+        physical_legs: 600,
+        active_data_legs: 600,
+        bond_mode: "none",
+        legs_per_destination: 1,
         encryption: "plain",
         impairment: "none",
         consumer: "normal",
     },
     ScenarioSpec {
         scenario: Scenario::LossReorder,
-        connections: 600,
+        logical_destinations: 600,
+        physical_legs: 600,
+        active_data_legs: 600,
+        bond_mode: "none",
+        legs_per_destination: 1,
         encryption: "plain",
         impairment: "loss=1%,reorder=1%",
         consumer: "normal",
     },
     ScenarioSpec {
         scenario: Scenario::BurstLoss,
-        connections: 600,
+        logical_destinations: 600,
+        physical_legs: 600,
+        active_data_legs: 600,
+        bond_mode: "none",
+        legs_per_destination: 1,
         encryption: "plain",
         impairment: "loss=5%",
         consumer: "normal",
     },
     ScenarioSpec {
         scenario: Scenario::EncryptedRotation,
-        connections: 600,
+        logical_destinations: 600,
+        physical_legs: 600,
+        active_data_legs: 600,
+        bond_mode: "none",
+        legs_per_destination: 1,
         encryption: "aes256+rotation",
         impairment: "none",
         consumer: "normal",
     },
     ScenarioSpec {
         scenario: Scenario::SlowConsumer,
-        connections: 600,
+        logical_destinations: 600,
+        physical_legs: 600,
+        active_data_legs: 600,
+        bond_mode: "none",
+        legs_per_destination: 1,
         encryption: "plain",
         impairment: "none",
         consumer: "one-slow-destination",
     },
     ScenarioSpec {
         scenario: Scenario::ConnectChurn,
-        connections: 600,
+        logical_destinations: 600,
+        physical_legs: 600,
+        active_data_legs: 600,
+        bond_mode: "none",
+        legs_per_destination: 1,
         encryption: "plain",
         impairment: "connect-disconnect-churn",
         consumer: "normal",
     },
     ScenarioSpec {
         scenario: Scenario::RelayAge,
-        connections: 600,
+        logical_destinations: 600,
+        physical_legs: 600,
+        active_data_legs: 600,
+        bond_mode: "none",
+        legs_per_destination: 1,
         encryption: "plain",
         impairment: "one-hop-relay",
         consumer: "normal",
     },
     ScenarioSpec {
         scenario: Scenario::LibsrtInterop,
-        connections: 600,
+        logical_destinations: 600,
+        physical_legs: 600,
+        active_data_legs: 600,
+        bond_mode: "none",
+        legs_per_destination: 1,
         encryption: "plain",
         impairment: "libsrt-peer",
         consumer: "normal",
     },
     ScenarioSpec {
         scenario: Scenario::BondedBroadcast,
-        connections: 600,
+        logical_destinations: 600,
+        physical_legs: 1200,
+        active_data_legs: 1200,
+        bond_mode: "broadcast",
+        legs_per_destination: 2,
         encryption: "plain",
         impairment: "bonded-broadcast",
         consumer: "normal",
@@ -516,7 +576,15 @@ pub fn render_plan() -> String {
     for spec in SCENARIOS {
         output.push_str(spec.scenario.name());
         output.push('\t');
-        output.push_str(&spec.connections.to_string());
+        output.push_str(&spec.logical_destinations.to_string());
+        output.push('\t');
+        output.push_str(&spec.physical_legs.to_string());
+        output.push('\t');
+        output.push_str(&spec.active_data_legs.to_string());
+        output.push('\t');
+        output.push_str(spec.bond_mode);
+        output.push('\t');
+        output.push_str(&spec.legs_per_destination.to_string());
         output.push('\t');
         output.push_str(spec.encryption);
         output.push('\t');
@@ -567,6 +635,18 @@ mod tests {
         assert_eq!(SCENARIOS.len(), SCENARIO_COUNT);
         assert_eq!(Scenario::ALL.len(), SCENARIO_COUNT);
         assert!(render_plan().lines().count() <= SCENARIO_COUNT + 1);
+        let broadcast = SCENARIOS[Scenario::BondedBroadcast.index()];
+        assert_eq!(broadcast.logical_destinations, 600);
+        assert_eq!(broadcast.physical_legs, 1200);
+        assert_eq!(broadcast.active_data_legs, 1200);
+        assert_eq!(broadcast.bond_mode, "broadcast");
+        assert_eq!(broadcast.legs_per_destination, 2);
+        let fanout = SCENARIOS[Scenario::Fanout600.index()];
+        assert_eq!(fanout.logical_destinations, 600);
+        assert_eq!(fanout.physical_legs, 600);
+        assert_eq!(fanout.active_data_legs, 600);
+        assert_eq!(fanout.bond_mode, "none");
+        assert_eq!(fanout.legs_per_destination, 1);
     }
 
     #[test]

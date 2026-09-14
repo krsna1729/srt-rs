@@ -12,6 +12,20 @@ Generate the immutable scenario corpus with:
 cargo run -p srt-bench -- qualify plan --out scratch/srt600-plan.tsv
 ```
 
+The plan specifies ten scenarios with logical destinations and derived legs:
+
+```text
+scenario	logical_destinations	physical_legs	active_data_legs	bond_mode	legs_per_destination	encryption	impairment	consumer
+```
+
+"600 destinations" counts logical Restream/SRT outputs, not physical SRT
+legs. For unbonded scenarios, logical destinations equals physical legs and
+active data legs (600). For 2-leg Broadcast, 600 logical destinations implies
+1,200 physical legs and 1,200 active data legs; for 2-leg Backup, 600 logical
+destinations implies 1,200 physical legs with 600 active data legs in steady state.
+Calling both cases `connections = 600` is prohibited because DATA wire work scales
+with active legs.
+
 The runner must produce a bounded measurement file with this exact header and
 one row for each scenario:
 
@@ -20,10 +34,10 @@ scenario	workload_id	offered	offered_bytes	duration_ms	delivered	correctness_fai
 ```
 
 `workload_id` is a nonzero stable identifier for the complete frozen contract
-(source rate and shape, runtime/topology, impairment, seed and repetitions).
-Baseline and candidate rows must use the same ID, offered packet/byte counts,
-and duration; rows with missing or zero resource metrics are rejected.
-
+(source rate and shape, runtime/topology including logical destinations and legs,
+impairment, seed and repetitions). Baseline and candidate rows must use the same
+ID, offered packet/byte counts, and duration; rows with missing or zero resource
+metrics are rejected.
 Score a candidate against a known-good baseline:
 
 ```text
