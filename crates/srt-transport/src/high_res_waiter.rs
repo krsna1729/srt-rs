@@ -29,6 +29,9 @@ use crate::deadline_heap::DeadlineHeap;
 
 const TIMER_TOKEN: u64 = 0;
 const FIRST_CONN_TOKEN: u64 = 1;
+/// Maximum number of keys a waiter can retain. Callers that need a smaller
+/// owner-local envelope should use [`HighResWaiter::with_capacity`].
+pub const MAX_WAITER_KEYS: usize = 1 << 16;
 
 /// Absolute `CLOCK_MONOTONIC` instant, in nanoseconds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -146,11 +149,17 @@ pub struct WaitOutcome {
 }
 
 /// One high-resolution scheduling waiter per transport worker.
+///
+/// The waiter has a finite key envelope. [`Self::new`] uses
+/// [`MAX_WAITER_KEYS`]; custom owners can select a smaller bound with
+/// [`Self::with_capacity`]. Registration and deadline insertion fail once the
+/// envelope is full instead of growing the scheduler indefinitely.
 pub struct HighResWaiter<K> {
     epoll: OwnedFd,
     timer: Option<OwnedFd>,
     backend: WaitBackend,
     heap: DeadlineHeap<K>,
+    max_keys: usize,
     by_key: HashMap<K, (RawFd, u64)>,
     by_token: HashMap<u64, K>,
     next_token: u64,
@@ -165,7 +174,12 @@ where
     K: Clone + Eq + Hash,
 {
     pub fn new() -> io::Result<Self> {
-        Self::with_backend(detect_backend()?)
+        Self::with_capacity(MAX_WAITER_KEYS)
+    }
+
+    /// Build a waiter with an explicit finite key capacity.
+    pub fn with_capacity(max_keys: usize) -> io::Result<Self> {
+        Self::with_backend_and_capacity(detect_backend()?, max_keys)
     }
 
     /// Build a waiter on a specific backend. `EpollPwait2` fails unless a
@@ -173,6 +187,12 @@ where
     /// default seccomp `EPERM` for an unlisted syscall, not only `ENOSYS` —
     /// is treated as unavailable.
     pub fn with_backend(backend: WaitBackend) -> io::Result<Self> {
+        Self::with_backend_and_capacity(backend, MAX_WAITER_KEYS)
+    }
+
+    /// Build a waiter on a specific backend with an explicit finite key
+    /// capacity.
+    pub fn with_backend_and_capacity(backend: WaitBackend, max_keys: usize) -> io::Result<Self> {
         if backend == WaitBackend::EpollPwait2 && !epoll_pwait2_available() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -198,6 +218,7 @@ where
             timer,
             backend,
             heap: DeadlineHeap::new(),
+            max_keys: max_keys.clamp(1, MAX_WAITER_KEYS),
             by_key: HashMap::new(),
             by_token: HashMap::new(),
             next_token: FIRST_CONN_TOKEN,
@@ -235,6 +256,13 @@ where
             self.by_key.insert(key, (fd, token));
             return Ok(());
         }
+        if !self.heap.contains_key(&key)
+            && self.by_key.len().saturating_add(self.heap.len()) >= self.max_keys
+        {
+            return Err(io::Error::other(
+                "high-resolution waiter key capacity exhausted",
+            ));
+        }
         let token = self.next_token;
         self.next_token = self.next_token.saturating_add(1);
         epoll_ctl(
@@ -258,8 +286,17 @@ where
         epoll_ctl(self.epoll.as_raw_fd(), libc::EPOLL_CTL_DEL, fd, token, 0)
     }
 
-    pub fn set_deadline(&mut self, key: K, deadline: MonotonicDeadline) {
+    pub fn set_deadline(&mut self, key: K, deadline: MonotonicDeadline) -> io::Result<()> {
+        if !self.by_key.contains_key(&key)
+            && !self.heap.contains_key(&key)
+            && self.by_key.len().saturating_add(self.heap.len()) >= self.max_keys
+        {
+            return Err(io::Error::other(
+                "high-resolution waiter key capacity exhausted",
+            ));
+        }
         self.heap.set(key, deadline);
+        Ok(())
     }
 
     pub fn clear_deadline(&mut self, key: &K) {
@@ -747,7 +784,9 @@ mod tests {
             Ok(waiter) => waiter,
             Err(_) => return,
         };
-        waiter.set_deadline(1, MonotonicDeadline::now());
+        waiter
+            .set_deadline(1, MonotonicDeadline::now())
+            .expect("deadline within waiter capacity");
         waiter.fail_next_pwait2 = Some(libc::EPERM);
         let mut due = Vec::new();
         let mut ready = Vec::new();
@@ -759,9 +798,22 @@ mod tests {
         assert_eq!(due, vec![1]);
         assert_eq!(outcome.park_count, 1);
 
-        waiter.set_deadline(2, MonotonicDeadline::now());
+        waiter
+            .set_deadline(2, MonotonicDeadline::now())
+            .expect("deadline within waiter capacity");
         let second = waiter.wait(&mut due, &mut ready).expect("timerfd wait");
         assert_eq!(second.backend, WaitBackend::AbsoluteTimerFd);
         assert_eq!(due, vec![2]);
+    }
+
+    #[test]
+    fn explicit_capacity_rejects_an_extra_deadline_key() {
+        let mut waiter = HighResWaiter::with_backend_and_capacity(WaitBackend::AbsoluteTimerFd, 1)
+            .expect("timerfd waiter");
+        waiter
+            .set_deadline(1, MonotonicDeadline::now())
+            .expect("first key fits");
+        assert!(waiter.set_deadline(2, MonotonicDeadline::now()).is_err());
+        assert_eq!(waiter.deadline_len(), 1);
     }
 }

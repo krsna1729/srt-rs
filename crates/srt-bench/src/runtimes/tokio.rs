@@ -246,7 +246,7 @@ fn handle_sender_events(
     stats: &mut ConnStats,
     stream_deadline: &mut Option<Instant>,
 ) {
-    while let Some(event) = driver.conn.poll_event() {
+    while let Some(event) = driver.protocol_mut().poll_event() {
         match event {
             ConnectionEvent::Connected => {
                 stats.connected = true;
@@ -336,7 +336,7 @@ async fn wait_for_sender(
         // Two clocks gate the next send: SRT's pacing and the application
         // source. Whichever is binding is the one worth waiting for.
         let elapsed = start.elapsed();
-        let pacing = driver.conn.time_until_send(crate::now_ts(start));
+        let pacing = driver.protocol().time_until_send(crate::now_ts(start));
         Duration::from_micros(source.wait_micros(elapsed, pacing)).min(crate::MAX_WAIT)
     } else {
         crate::MAX_WAIT
@@ -344,10 +344,10 @@ async fn wait_for_sender(
     let block_for = wait.saturating_sub(crate::TAIL_SPIN);
     if block_for > Duration::ZERO {
         tokio::select! {
-            result = driver.sock.recv(buffer) => {
+            result = driver.socket().recv(buffer) => {
                 if let Ok(size) = result {
                     let now = crate::now_ts(start);
-                    let _ = driver.conn.feed_recv_buf(&buffer[..size], now);
+                    let _ = driver.protocol_mut().feed_recv_buf(&buffer[..size], now);
                 }
             }
             _ = tokio::time::sleep(block_for) => {}
@@ -371,7 +371,7 @@ async fn send_sender_payload_if_due(
 }
 
 fn record_sender_stats(driver: &Conn, stats: &mut ConnStats) {
-    if let Some(sender) = driver.conn.sender_stats() {
+    if let Some(sender) = driver.protocol().sender_stats() {
         stats.has_stats = true;
         stats.core_total = sender.total_sent;
         stats.secondary_a = sender.total_retransmits;
@@ -427,7 +427,7 @@ async fn sender_task(
         if !stats.connected && Instant::now() >= connect_deadline {
             eprintln!(
                 "[bench-tokio] connect timed out, state={:?}",
-                driver.conn.state()
+                driver.protocol().state()
             );
             break;
         }
@@ -470,7 +470,7 @@ async fn sender_task(
     // ended instead of inferring it from five seconds of silence.
     crate::HandshakePermit::settle(&mut permit, stats.connected);
     let t = crate::now_ts(start);
-    driver.conn.disconnect(t);
+    driver.protocol_mut().disconnect(t);
     drain_outputs(&mut driver, t).await;
     record_sender_stats(&driver, &mut stats);
     stats.source = source.stats();
@@ -495,22 +495,23 @@ async fn receive_receiver_packets(
     recv_rounds: usize,
 ) -> bool {
     if peer.is_none() {
-        let received = tokio::time::timeout(crate::MAX_WAIT, driver.sock.recv_from(buffer)).await;
+        let received =
+            tokio::time::timeout(crate::MAX_WAIT, driver.socket().recv_from(buffer)).await;
         if let Ok(Ok((size, addr))) = received {
-            if let Err(error) = driver.sock.connect(addr).await {
+            if let Err(error) = driver.socket().connect(addr).await {
                 eprintln!("[bench-tokio] connect to peer failed: {error}");
                 return false;
             }
             *peer = Some(addr);
             let now = crate::now_ts(start);
-            let _ = driver.conn.feed_recv_buf(&buffer[..size], now);
+            let _ = driver.protocol_mut().feed_recv_buf(&buffer[..size], now);
         }
     } else {
         tokio::select! {
-            result = driver.sock.recv(buffer) => {
+            result = driver.socket().recv(buffer) => {
                 if let Ok(size) = result {
                     let now = crate::now_ts(start);
-                    let _ = driver.conn.feed_recv_buf(&buffer[..size], now);
+                    let _ = driver.protocol_mut().feed_recv_buf(&buffer[..size], now);
                 }
             }
             _ = tokio::time::sleep(crate::MAX_WAIT) => {}
@@ -530,7 +531,7 @@ fn handle_receiver_events(
     stats: &mut ConnStats,
     stream_deadline: &mut Option<Instant>,
 ) {
-    while let Some(event) = driver.conn.poll_event() {
+    while let Some(event) = driver.protocol_mut().poll_event() {
         match event {
             ConnectionEvent::Connected => {
                 stats.connected = true;
@@ -559,7 +560,7 @@ fn handle_receiver_events(
 }
 
 fn record_receiver_stats(driver: &Conn, stats: &mut ConnStats) {
-    if let Some(receiver) = driver.conn.receiver_stats() {
+    if let Some(receiver) = driver.protocol().receiver_stats() {
         stats.has_stats = true;
         stats.core_total = receiver.total_received;
         stats.secondary_a = receiver.total_lost;
@@ -597,7 +598,7 @@ async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> Co
         if !stats.connected && Instant::now() >= connect_deadline {
             eprintln!(
                 "[bench-tokio] connect timed out, state={:?}",
-                driver.conn.state()
+                driver.protocol().state()
             );
             break;
         }
@@ -1049,10 +1050,10 @@ async fn established_conn_task(mut driver: Conn, cfg: BenchConfig, start: Instan
         }
 
         tokio::select! {
-            res = driver.sock.recv(&mut buf) => {
+            res = driver.socket().recv(&mut buf) => {
                 if let Ok(n) = res {
                     let t = crate::now_ts(start);
-                    let _ = driver.conn.feed_recv_buf(&buf[..n], t);
+                    let _ = driver.protocol_mut().feed_recv_buf(&buf[..n], t);
                     data_events += 1;
                     last_data_at = Instant::now();
                 }
@@ -1076,7 +1077,7 @@ async fn established_conn_task(mut driver: Conn, cfg: BenchConfig, start: Instan
         driver.fire_expired(t);
         drain_outputs(&mut driver, t).await;
 
-        while let Some(ev) = driver.conn.poll_event() {
+        while let Some(ev) = driver.protocol_mut().poll_event() {
             match ev {
                 ConnectionEvent::Disconnected { reason } => {
                     eprintln!("[bench-tokio] disconnected: {reason}");
@@ -1095,7 +1096,7 @@ async fn established_conn_task(mut driver: Conn, cfg: BenchConfig, start: Instan
         data_events,
         ..Default::default()
     };
-    if let Some(s) = driver.conn.receiver_stats() {
+    if let Some(s) = driver.protocol().receiver_stats() {
         stats.has_stats = true;
         stats.core_total = s.total_received;
         stats.secondary_a = s.total_lost;

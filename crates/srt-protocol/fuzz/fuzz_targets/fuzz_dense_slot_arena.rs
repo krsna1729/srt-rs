@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use srt_transport::DenseSlotArena;
+use srt_transport::test_support::DenseSlotArena;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 

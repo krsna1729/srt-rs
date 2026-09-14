@@ -276,7 +276,7 @@ async fn drive(
 fn drain_sender_packets(driver: &mut Conn, received: &Received, recycle: &Recycle, start: Instant) {
     while let Ok((buffer, size)) = received.try_recv() {
         let now = crate::now_ts(start);
-        let _ = driver.conn.feed_recv_buf(&buffer[..size], now);
+        let _ = driver.protocol_mut().feed_recv_buf(&buffer[..size], now);
         let _ = recycle.try_send(buffer);
     }
 }
@@ -287,7 +287,7 @@ fn handle_sender_events(
     stats: &mut ConnStats,
     stream_deadline: &mut Option<Instant>,
 ) {
-    while let Some(event) = driver.conn.poll_event() {
+    while let Some(event) = driver.protocol_mut().poll_event() {
         match event {
             ConnectionEvent::Connected => {
                 stats.connected = true;
@@ -367,7 +367,7 @@ async fn send_paced_payload(
 }
 
 fn record_sender_stats(driver: &Conn, stats: &mut ConnStats) {
-    if let Some(sender) = driver.conn.sender_stats() {
+    if let Some(sender) = driver.protocol().sender_stats() {
         stats.has_stats = true;
         stats.core_total = sender.total_sent;
         stats.secondary_a = sender.total_retransmits;
@@ -423,7 +423,7 @@ async fn sender_task(
         if !stats.connected && Instant::now() >= connect_deadline {
             eprintln!(
                 "[bench-compio] connect timed out, state={:?}",
-                driver.conn.state()
+                driver.protocol().state()
             );
             break;
         }
@@ -435,7 +435,7 @@ async fn sender_task(
         // socket into the channel meanwhile. Two clocks gate that: SRT's
         // pacing and the application source, whichever is binding.
         let wait = if stats.connected {
-            let pacing = driver.conn.time_until_send(crate::now_ts(start));
+            let pacing = driver.protocol().time_until_send(crate::now_ts(start));
             Duration::from_micros(source.wait_micros(start.elapsed(), pacing)).min(crate::MAX_WAIT)
         } else {
             crate::MAX_WAIT
@@ -482,7 +482,7 @@ async fn sender_task(
     // ended instead of inferring it from five seconds of silence.
     crate::HandshakePermit::settle(&mut permit, stats.connected);
     let t = crate::now_ts(start);
-    driver.conn.disconnect(t);
+    driver.protocol_mut().disconnect(t);
     drain_outputs(&mut driver, t).await;
     record_sender_stats(&driver, &mut stats);
     stats.source = source.stats();
@@ -496,7 +496,7 @@ fn spawn_reader(
     received_sender: crate::queue::BoundedSender<(Vec<u8>, usize)>,
     recycle_rx: crate::queue::BoundedReceiver<Vec<u8>>,
 ) {
-    let received_socket = driver.sock.clone();
+    let received_socket = driver.socket().clone();
     compio::runtime::spawn(async move {
         let mut buffer = vec![0u8; 2048];
         loop {
@@ -522,7 +522,7 @@ fn drain_receiver_packets(
 ) {
     while let Ok((buffer, size)) = received.try_recv() {
         let now = crate::now_ts(start);
-        let _ = driver.conn.feed_recv_buf(&buffer[..size], now);
+        let _ = driver.protocol_mut().feed_recv_buf(&buffer[..size], now);
         let _ = recycle.try_send(buffer);
     }
 }
@@ -533,7 +533,7 @@ fn handle_receiver_events(
     stats: &mut ConnStats,
     stream_deadline: &mut Option<Instant>,
 ) {
-    while let Some(event) = driver.conn.poll_event() {
+    while let Some(event) = driver.protocol_mut().poll_event() {
         match event {
             ConnectionEvent::Connected => {
                 stats.connected = true;
@@ -562,7 +562,7 @@ fn handle_receiver_events(
 }
 
 fn record_receiver_stats(driver: &Conn, stats: &mut ConnStats) {
-    if let Some(receiver) = driver.conn.receiver_stats() {
+    if let Some(receiver) = driver.protocol().receiver_stats() {
         stats.has_stats = true;
         stats.core_total = receiver.total_received;
         stats.secondary_a = receiver.total_lost;
@@ -594,7 +594,7 @@ async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> Co
     let (received_sender, received_receiver) =
         crate::queue::bounded_channel(cfg.datapath_queue_capacity());
     let (recycle_tx, recycle_rx) = crate::queue::bounded_channel(cfg.datapath_queue_capacity());
-    let received_socket = driver.sock.clone();
+    let received_socket = driver.socket().clone();
     let _reader = compio::runtime::spawn(async move {
         let mut first = true;
         let mut buffer = vec![0u8; 2048];
@@ -623,7 +623,7 @@ async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> Co
         if !stats.connected && Instant::now() >= connect_deadline {
             eprintln!(
                 "[bench-compio] connect timed out, state={:?}",
-                driver.conn.state()
+                driver.protocol().state()
             );
             break;
         }
@@ -1083,7 +1083,7 @@ async fn established_conn_task(mut driver: Conn, cfg: BenchConfig, start: Instan
     let (received_sender, received_receiver) =
         crate::queue::bounded_channel(cfg.datapath_queue_capacity());
     let (recycle_tx, recycle_rx) = crate::queue::bounded_channel(cfg.datapath_queue_capacity());
-    let received_socket = driver.sock.clone();
+    let received_socket = driver.socket().clone();
     let _reader = compio::runtime::spawn(async move {
         let mut buffer = vec![0u8; 2048];
         loop {
@@ -1123,7 +1123,7 @@ async fn established_conn_task(mut driver: Conn, cfg: BenchConfig, start: Instan
 
         while let Ok((buf, size)) = received_receiver.try_recv() {
             let t = crate::now_ts(start);
-            let _ = driver.conn.feed_recv_buf(&buf[..size], t);
+            let _ = driver.protocol_mut().feed_recv_buf(&buf[..size], t);
             let _ = recycle_tx.try_send(buf);
         }
 
@@ -1131,7 +1131,7 @@ async fn established_conn_task(mut driver: Conn, cfg: BenchConfig, start: Instan
         driver.fire_expired(t);
         drain_outputs(&mut driver, t).await;
 
-        while let Some(ev) = driver.conn.poll_event() {
+        while let Some(ev) = driver.protocol_mut().poll_event() {
             match ev {
                 ConnectionEvent::DataReceived { .. } => {
                     data_events += 1;
@@ -1154,7 +1154,7 @@ async fn established_conn_task(mut driver: Conn, cfg: BenchConfig, start: Instan
         data_events,
         ..Default::default()
     };
-    if let Some(s) = driver.conn.receiver_stats() {
+    if let Some(s) = driver.protocol().receiver_stats() {
         stats.has_stats = true;
         stats.core_total = s.total_received;
         stats.secondary_a = s.total_lost;

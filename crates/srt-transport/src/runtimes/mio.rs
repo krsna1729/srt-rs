@@ -11,9 +11,9 @@ use std::time::Duration;
 
 /// Per-connection state for mio: protocol + owned socket + manual timers.
 pub struct Conn {
-    pub conn: SrtConnection,
-    pub socket: mio::net::UdpSocket,
-    pub timers: ManualTimerStore,
+    conn: SrtConnection,
+    socket: mio::net::UdpSocket,
+    timers: ManualTimerStore,
     pending_outputs: VecDeque<ConnectionOutput>,
     io_stats: BatchIoStats,
     output_drain: OutputDrainBudget,
@@ -22,6 +22,28 @@ pub struct Conn {
 impl Conn {
     pub fn new(conn: SrtConnection, socket: mio::net::UdpSocket) -> Self {
         Self::with_budgets(conn, socket, OutputDrainBudget::default())
+    }
+
+    /// Borrow the protocol state without exposing the adapter's internals.
+    #[must_use]
+    pub fn protocol(&self) -> &SrtConnection {
+        &self.conn
+    }
+
+    /// Mutably access protocol state for a scoped custom-driver operation.
+    pub fn protocol_mut(&mut self) -> &mut SrtConnection {
+        &mut self.conn
+    }
+
+    /// Borrow the runtime socket used by this connection.
+    #[must_use]
+    pub fn socket(&self) -> &mio::net::UdpSocket {
+        &self.socket
+    }
+
+    /// Transfer protocol and socket ownership to a custom driver.
+    pub fn into_parts(self) -> (SrtConnection, mio::net::UdpSocket) {
+        (self.conn, self.socket)
     }
 
     /// Like [`Self::new`], but stores the given budget instead of the
@@ -121,8 +143,7 @@ impl Conn {
         K: Clone + Eq + Hash,
     {
         waiter.register(key.clone(), self.socket.as_raw_fd())?;
-        waiter.set_deadline(key, MonotonicDeadline::after(self.schedule_wait(now)));
-        Ok(())
+        waiter.set_deadline(key, MonotonicDeadline::after(self.schedule_wait(now)))
     }
 }
 

@@ -236,16 +236,16 @@ async fn receive_sender_packet(
     // Two clocks gate the next send: SRT's pacing and the application
     // source. Whichever is binding is the one worth waiting for.
     let wait = if connected {
-        let pacing = driver.conn.time_until_send(crate::now_ts(start));
+        let pacing = driver.protocol().time_until_send(crate::now_ts(start));
         Duration::from_micros(source.wait_micros(start.elapsed(), pacing)).min(crate::MAX_WAIT)
     } else {
         crate::MAX_WAIT
     };
-    match monoio::time::timeout(wait, driver.sock.recv(std::mem::take(buffer))).await {
+    match monoio::time::timeout(wait, driver.socket().recv(std::mem::take(buffer))).await {
         Ok((Ok(size), returned)) => {
             *buffer = returned;
             let now = crate::now_ts(start);
-            let _ = driver.conn.feed_recv_buf(&buffer[..size], now);
+            let _ = driver.protocol_mut().feed_recv_buf(&buffer[..size], now);
         }
         Ok((Err(_), returned)) => *buffer = returned,
         Err(_) => *buffer = vec![0u8; 2048],
@@ -258,7 +258,7 @@ fn handle_sender_events(
     stats: &mut ConnStats,
     stream_deadline: &mut Option<Instant>,
 ) {
-    while let Some(event) = driver.conn.poll_event() {
+    while let Some(event) = driver.protocol_mut().poll_event() {
         match event {
             ConnectionEvent::Connected => {
                 stats.connected = true;
@@ -338,7 +338,7 @@ async fn send_paced_payload(
 }
 
 fn record_sender_stats(driver: &Conn, stats: &mut ConnStats) {
-    if let Some(sender) = driver.conn.sender_stats() {
+    if let Some(sender) = driver.protocol().sender_stats() {
         stats.has_stats = true;
         stats.core_total = sender.total_sent;
         stats.secondary_a = sender.total_retransmits;
@@ -393,7 +393,7 @@ async fn sender_task(
         if !stats.connected && Instant::now() >= connect_deadline {
             eprintln!(
                 "[bench-monoio] connect timed out, state={:?}",
-                driver.conn.state()
+                driver.protocol().state()
             );
             break;
         }
@@ -441,7 +441,7 @@ async fn sender_task(
     // ended instead of inferring it from five seconds of silence.
     crate::HandshakePermit::settle(&mut permit, stats.connected);
     let t = crate::now_ts(start);
-    driver.conn.disconnect(t);
+    driver.protocol_mut().disconnect(t);
     drain_outputs(&mut driver, t).await;
     record_sender_stats(&driver, &mut stats);
     stats.source = source.stats();
@@ -457,21 +457,21 @@ async fn receive_receiver_packet(
 ) {
     match monoio::time::timeout(
         crate::MAX_WAIT,
-        driver.sock.recv_from(std::mem::take(buffer)),
+        driver.socket().recv_from(std::mem::take(buffer)),
     )
     .await
     {
         Ok((Ok((size, addr)), returned)) => {
             *buffer = returned;
             if peer.is_none() {
-                if let Err(error) = driver.sock.connect(addr).await {
+                if let Err(error) = driver.socket().connect(addr).await {
                     eprintln!("[bench-monoio] connect to peer failed: {error}");
                 } else {
                     *peer = Some(addr);
                 }
             }
             let now = crate::now_ts(start);
-            let _ = driver.conn.feed_recv_buf(&buffer[..size], now);
+            let _ = driver.protocol_mut().feed_recv_buf(&buffer[..size], now);
         }
         Ok((Err(_), returned)) => *buffer = returned,
         Err(_) => *buffer = vec![0u8; 2048],
@@ -484,7 +484,7 @@ fn handle_receiver_events(
     stats: &mut ConnStats,
     stream_deadline: &mut Option<Instant>,
 ) {
-    while let Some(event) = driver.conn.poll_event() {
+    while let Some(event) = driver.protocol_mut().poll_event() {
         match event {
             ConnectionEvent::Connected => {
                 stats.connected = true;
@@ -513,7 +513,7 @@ fn handle_receiver_events(
 }
 
 fn record_receiver_stats(driver: &Conn, stats: &mut ConnStats) {
-    if let Some(receiver) = driver.conn.receiver_stats() {
+    if let Some(receiver) = driver.protocol().receiver_stats() {
         stats.has_stats = true;
         stats.core_total = receiver.total_received;
         stats.secondary_a = receiver.total_lost;
@@ -551,7 +551,7 @@ async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> Co
         if !stats.connected && Instant::now() >= connect_deadline {
             eprintln!(
                 "[bench-monoio] connect timed out, state={:?}",
-                driver.conn.state()
+                driver.protocol().state()
             );
             break;
         }
@@ -1039,11 +1039,11 @@ async fn established_conn_task(mut driver: Conn, cfg: BenchConfig, start: Instan
             break;
         }
 
-        match monoio::time::timeout(crate::MAX_WAIT, driver.sock.recv(recv_buf)).await {
+        match monoio::time::timeout(crate::MAX_WAIT, driver.socket().recv(recv_buf)).await {
             Ok((Ok(n), returned)) => {
                 recv_buf = returned;
                 let t = crate::now_ts(start);
-                let _ = driver.conn.feed_recv_buf(&recv_buf[..n], t);
+                let _ = driver.protocol_mut().feed_recv_buf(&recv_buf[..n], t);
             }
             Ok((Err(_), returned)) => recv_buf = returned,
             Err(_) => recv_buf = vec![0u8; 2048],
@@ -1053,7 +1053,7 @@ async fn established_conn_task(mut driver: Conn, cfg: BenchConfig, start: Instan
         driver.fire_expired(t);
         drain_outputs(&mut driver, t).await;
 
-        while let Some(ev) = driver.conn.poll_event() {
+        while let Some(ev) = driver.protocol_mut().poll_event() {
             match ev {
                 ConnectionEvent::DataReceived { .. } => {
                     data_events += 1;
@@ -1076,7 +1076,7 @@ async fn established_conn_task(mut driver: Conn, cfg: BenchConfig, start: Instan
         data_events,
         ..Default::default()
     };
-    if let Some(s) = driver.conn.receiver_stats() {
+    if let Some(s) = driver.protocol().receiver_stats() {
         stats.has_stats = true;
         stats.core_total = s.total_received;
         stats.secondary_a = s.total_lost;

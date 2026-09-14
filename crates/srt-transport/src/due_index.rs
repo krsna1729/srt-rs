@@ -88,6 +88,7 @@ where
 
     /// Drain every currently indexed due entry. The index itself is bounded
     /// by the caller-owned key set and stale amplification invariant.
+    #[allow(dead_code)]
     pub fn pop_due(&mut self, now: Timestamp, out: &mut Vec<K>) {
         let _ = self.pop_due_bounded(now, self.heap.len(), out);
     }
@@ -198,11 +199,13 @@ where
     }
 
     #[must_use]
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.current.len()
     }
 
     #[must_use]
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.current.is_empty()
     }

@@ -20,8 +20,8 @@ use zeroize::Zeroize;
 
 /// Per-connection state for tokio: protocol + async socket + timer deadlines.
 pub struct Conn {
-    pub conn: SrtConnection,
-    pub sock: UdpSocket,
+    conn: SrtConnection,
+    sock: UdpSocket,
     timers: crate::ManualTimerStore,
     pending_outputs: VecDeque<ConnectionOutput>,
     recv_batch: RecvBatch,
@@ -38,6 +38,28 @@ impl Conn {
             OutputDrainBudget::default(),
             RecvBudget::default(),
         )
+    }
+
+    /// Borrow the protocol state without exposing the adapter's internals.
+    #[must_use]
+    pub fn protocol(&self) -> &SrtConnection {
+        &self.conn
+    }
+
+    /// Mutably access protocol state for a scoped custom-driver operation.
+    pub fn protocol_mut(&mut self) -> &mut SrtConnection {
+        &mut self.conn
+    }
+
+    /// Borrow the runtime socket used by this connection.
+    #[must_use]
+    pub fn socket(&self) -> &UdpSocket {
+        &self.sock
+    }
+
+    /// Transfer protocol and socket ownership to a custom driver.
+    pub fn into_parts(self) -> (SrtConnection, UdpSocket) {
+        (self.conn, self.sock)
     }
 
     /// Like [`Self::new`], but stores the given budgets instead of the
@@ -176,8 +198,7 @@ impl Conn {
         K: Clone + Eq + Hash,
     {
         waiter.register(key.clone(), self.sock.as_raw_fd())?;
-        waiter.set_deadline(key, MonotonicDeadline::after(self.schedule_wait(now)));
-        Ok(())
+        waiter.set_deadline(key, MonotonicDeadline::after(self.schedule_wait(now)))
     }
 
     /// Drain every datagram currently readable, feeding the protocol.

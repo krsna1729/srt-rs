@@ -213,6 +213,7 @@ impl CallerPool {
         feature = "compio",
         feature = "bench-internals"
     ))]
+    #[allow(dead_code)]
     pub(crate) fn table_mut(&mut self) -> &mut CallerTable {
         &mut self.callers
     }

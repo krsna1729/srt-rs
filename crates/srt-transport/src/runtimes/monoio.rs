@@ -9,8 +9,8 @@ use std::time::Duration;
 
 /// Per-connection state for monoio: protocol + owned-buffer socket + timer deadlines.
 pub struct Conn {
-    pub conn: SrtConnection,
-    pub sock: monoio::net::udp::UdpSocket,
+    conn: SrtConnection,
+    sock: monoio::net::udp::UdpSocket,
     timers: crate::ManualTimerStore,
     pending_outputs: VecDeque<ConnectionOutput>,
     output_drain: OutputDrainBudget,
@@ -19,6 +19,28 @@ pub struct Conn {
 impl Conn {
     pub fn new(conn: SrtConnection, sock: monoio::net::udp::UdpSocket) -> Self {
         Self::with_budgets(conn, sock, OutputDrainBudget::default())
+    }
+
+    /// Borrow the protocol state without exposing the adapter's internals.
+    #[must_use]
+    pub fn protocol(&self) -> &SrtConnection {
+        &self.conn
+    }
+
+    /// Mutably access protocol state for a scoped custom-driver operation.
+    pub fn protocol_mut(&mut self) -> &mut SrtConnection {
+        &mut self.conn
+    }
+
+    /// Borrow the runtime socket used by this connection.
+    #[must_use]
+    pub fn socket(&self) -> &monoio::net::udp::UdpSocket {
+        &self.sock
+    }
+
+    /// Transfer protocol and socket ownership to a custom driver.
+    pub fn into_parts(self) -> (SrtConnection, monoio::net::udp::UdpSocket) {
+        (self.conn, self.sock)
     }
 
     /// Like [`Self::new`], but stores the given budget instead of the

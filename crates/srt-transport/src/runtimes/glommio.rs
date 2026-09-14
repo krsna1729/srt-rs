@@ -28,8 +28,8 @@ pub fn from_std(socket: std::net::UdpSocket) -> io::Result<glommio::net::UdpSock
 
 /// Per-connection state for glommio: protocol + borrowed-buffer socket + timer deadlines.
 pub struct Conn {
-    pub conn: SrtConnection,
-    pub sock: glommio::net::UdpSocket,
+    conn: SrtConnection,
+    sock: glommio::net::UdpSocket,
     timers: crate::ManualTimerStore,
     pending_outputs: VecDeque<ConnectionOutput>,
     output_drain: OutputDrainBudget,
@@ -38,6 +38,28 @@ pub struct Conn {
 impl Conn {
     pub fn new(conn: SrtConnection, sock: glommio::net::UdpSocket) -> Self {
         Self::with_budgets(conn, sock, OutputDrainBudget::default())
+    }
+
+    /// Borrow the protocol state without exposing the adapter's internals.
+    #[must_use]
+    pub fn protocol(&self) -> &SrtConnection {
+        &self.conn
+    }
+
+    /// Mutably access protocol state for a scoped custom-driver operation.
+    pub fn protocol_mut(&mut self) -> &mut SrtConnection {
+        &mut self.conn
+    }
+
+    /// Borrow the runtime socket used by this connection.
+    #[must_use]
+    pub fn socket(&self) -> &glommio::net::UdpSocket {
+        &self.sock
+    }
+
+    /// Transfer protocol and socket ownership to a custom driver.
+    pub fn into_parts(self) -> (SrtConnection, glommio::net::UdpSocket) {
+        (self.conn, self.sock)
     }
 
     /// Like [`Self::new`], but stores the given budget instead of the

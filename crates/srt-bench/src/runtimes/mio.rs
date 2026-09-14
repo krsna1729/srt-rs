@@ -415,7 +415,7 @@ fn backfill_drivers_a2(
         let token = drivers.len();
         let driver = spawn_driver_a2(cfg, start, mine[*next_to_start], permit);
         waiter
-            .register(token, driver.conn.socket.as_raw_fd())
+            .register(token, driver.conn.socket().as_raw_fd())
             .expect("a2 register");
         arm_a2_deadline(waiter, &driver, token, start);
         drivers.push(driver);
@@ -431,9 +431,11 @@ fn arm_a2_deadline(waiter: &mut HighResWaiter<usize>, driver: &Driver, key: usiz
     // busy Immediate loop (E0 wake-rate failure).
     let t = crate::now_ts(start);
     let elapsed = start.elapsed();
-    let pacing = driver.conn.conn.time_until_send(t);
+    let pacing = driver.conn.protocol().time_until_send(t);
     let wait = Duration::from_micros(driver.source.wait_micros(elapsed, pacing)).min(MAX_POLL_WAIT);
-    waiter.set_deadline(key, MonotonicDeadline::after(wait));
+    waiter
+        .set_deadline(key, MonotonicDeadline::after(wait))
+        .expect("a2 waiter deadline capacity");
 }
 
 /// Per-port sender loop owned by one worker, parked on production
@@ -726,7 +728,7 @@ fn next_poll_wait(cfg: &BenchConfig, drivers: &[Driver], start: Instant) -> Dura
         .map(|driver| {
             // Whichever of the two clocks is binding: SRT's pacing when
             // source work is already pending, the source itself when not.
-            let pacing = driver.conn.conn.time_until_send(t);
+            let pacing = driver.conn.protocol().time_until_send(t);
             Duration::from_micros(driver.source.wait_micros(elapsed, pacing)).min(MAX_POLL_WAIT)
         })
         .min()
@@ -870,12 +872,12 @@ fn service_ready_index(
 fn receive_first_datagram(driver: &mut Driver, buf: &mut [u8], start: Instant) -> bool {
     // The first datagram reveals the caller. Connect before feeding it into
     // the protocol because output draining uses connected `send()`.
-    match driver.conn.socket.recv_from(buf) {
+    match driver.conn.socket().recv_from(buf) {
         Ok((n, addr)) => {
-            if driver.conn.socket.connect(addr).is_ok() {
+            if driver.conn.socket().connect(addr).is_ok() {
                 driver.peer = Some(addr);
                 let t = crate::now_ts(start);
-                let _ = driver.conn.conn.feed_recv_buf(&buf[..n], t);
+                let _ = driver.conn.protocol_mut().feed_recv_buf(&buf[..n], t);
                 return true;
             }
         }
@@ -903,10 +905,10 @@ fn receive_connected_datagrams(
     budget: usize,
 ) -> bool {
     for _ in 0..budget {
-        match driver.conn.socket.recv(buf) {
+        match driver.conn.socket().recv(buf) {
             Ok(n) => {
                 let t = crate::now_ts(start);
-                let _ = driver.conn.conn.feed_recv_buf(&buf[..n], t);
+                let _ = driver.conn.protocol_mut().feed_recv_buf(&buf[..n], t);
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return false,
             Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
@@ -935,7 +937,7 @@ fn reconnect_poisoned(cfg: &BenchConfig, mine: &[usize], drivers: &mut [Driver])
         let Some(destination) = destination else {
             continue;
         };
-        let _ = driver.conn.socket.connect(destination);
+        let _ = driver.conn.socket().connect(destination);
         driver.poisoned = false;
     }
 }
@@ -999,7 +1001,7 @@ fn handle_driver_event(cfg: &BenchConfig, driver: &mut Driver, event: Connection
 }
 
 fn process_events(cfg: &BenchConfig, driver: &mut Driver) {
-    while let Some(event) = driver.conn.conn.poll_event() {
+    while let Some(event) = driver.conn.protocol_mut().poll_event() {
         handle_driver_event(cfg, driver, event);
     }
 }
@@ -1020,7 +1022,9 @@ fn send_due_payload(cfg: &BenchConfig, driver: &mut Driver, payload: &[u8], star
     driver.source.tick(start.elapsed());
     let mut accepted = 0;
     while driver.source.pending() > accepted {
-        if !driver.conn.conn.can_send_with_pacing(t) || driver.conn.conn.send(payload, t).is_err() {
+        if !driver.conn.protocol().can_send_with_pacing(t)
+            || driver.conn.protocol_mut().send(payload, t).is_err()
+        {
             driver.source.refused();
             break;
         }
@@ -1046,7 +1050,7 @@ fn close_drivers(cfg: &BenchConfig, drivers: &mut [Driver], start: Instant) {
         if let Some(p) = driver.permit.take() {
             p.fail();
         }
-        driver.conn.conn.disconnect(t);
+        driver.conn.protocol_mut().disconnect(t);
         let _ = driver.conn.drain_outputs(t);
     }
 }
@@ -1062,7 +1066,7 @@ fn driver_stats(cfg: &BenchConfig, driver: Driver) -> ConnStats {
     };
     match cfg.mode {
         crate::Mode::Sender => {
-            if let Some(protocol) = driver.conn.conn.sender_stats() {
+            if let Some(protocol) = driver.conn.protocol().sender_stats() {
                 stats.has_stats = true;
                 stats.core_total = protocol.total_sent;
                 stats.secondary_a = protocol.total_retransmits;
@@ -1070,7 +1074,7 @@ fn driver_stats(cfg: &BenchConfig, driver: Driver) -> ConnStats {
             }
         }
         crate::Mode::Receiver => {
-            if let Some(protocol) = driver.conn.conn.receiver_stats() {
+            if let Some(protocol) = driver.conn.protocol().receiver_stats() {
                 stats.has_stats = true;
                 stats.core_total = protocol.total_received;
                 stats.secondary_a = protocol.total_lost;
@@ -2240,9 +2244,9 @@ fn service_slot_event(
     };
     let t = crate::now_ts(start);
     loop {
-        match slot.conn.socket.recv(buf) {
+        match slot.conn.socket().recv(buf) {
             Ok(n) => {
-                let _ = slot.conn.conn.feed_recv_buf(&buf[..n], t);
+                let _ = slot.conn.protocol_mut().feed_recv_buf(&buf[..n], t);
                 slot.data_events += 1;
                 slot.last_data_at = Instant::now();
             }
@@ -2265,7 +2269,7 @@ fn maintain_slots(slots: &mut [PoolSlot], start: Instant) {
         if slot.conn.drain_outputs(t) {
             slot.poisoned = true;
         }
-        while let Some(ev) = slot.conn.conn.poll_event() {
+        while let Some(ev) = slot.conn.protocol_mut().poll_event() {
             if let ConnectionEvent::Disconnected { reason } = &ev {
                 slot.torn_down |= !crate::is_ordered_close(reason);
                 slot.connected = false;
@@ -2273,8 +2277,8 @@ fn maintain_slots(slots: &mut [PoolSlot], start: Instant) {
         }
         if slot.poisoned {
             // Reconnect clears ECONNREFUSED poison on connected UDP.
-            if let Ok(peer) = slot.conn.socket.peer_addr() {
-                let _ = slot.conn.socket.connect(peer);
+            if let Ok(peer) = slot.conn.socket().peer_addr() {
+                let _ = slot.conn.socket().connect(peer);
                 slot.poisoned = false;
             }
         }
@@ -2290,7 +2294,7 @@ fn slots_to_stats(slots: Vec<PoolSlot>) -> Vec<ConnStats> {
                 data_events: slot.data_events,
                 ..Default::default()
             };
-            if let Some(st) = slot.conn.conn.receiver_stats() {
+            if let Some(st) = slot.conn.protocol().receiver_stats() {
                 s.has_stats = true;
                 s.core_total = st.total_received;
                 s.secondary_a = st.total_lost;
@@ -3119,7 +3123,7 @@ mod b02_regression_tests {
             pending.is_empty(),
             "backlog continuation must eventually finish"
         );
-        let delivered = std::iter::from_fn(|| drivers[0].conn.conn.poll_event())
+        let delivered = std::iter::from_fn(|| drivers[0].conn.protocol_mut().poll_event())
             .filter(|event| matches!(event, ConnectionEvent::DataReceived { .. }))
             .count();
         assert_eq!(
@@ -3201,7 +3205,7 @@ mod b02_regression_tests {
         // The datagram must still be sitting in the kernel receive buffer.
         let (n, _) = driver
             .conn
-            .socket
+            .socket()
             .recv_from(&mut buf)
             .expect("datagram must still be queued, not silently consumed");
         assert_eq!(&buf[..n], &[7]);
