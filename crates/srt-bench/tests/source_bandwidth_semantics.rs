@@ -65,7 +65,7 @@ fn a_pacing_ceiling_below_the_source_does_not_lower_the_target() {
     // What a 4 Mbit/s ceiling can actually pace, in payload packets:
     // wire-byte pacing over (1316 + 16)-byte packets.
     let paced = 4_000_000.0 / 8.0 * 10.0
-        / (srt_bench::PAYLOAD_SIZE + shiguredo_srt::wire::SRT_HEADER_SIZE) as f64;
+        / (srt_bench::PAYLOAD_SIZE + srt_proto::wire::SRT_HEADER_SIZE) as f64;
     assert!(
         paced / target < 0.55,
         "a half-rate ceiling must read as ~50% offered, not 100%: {paced}/{target}"

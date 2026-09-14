@@ -2,7 +2,7 @@ use crate::{
     BatchIoStats, HighResWaiter, ManualTimerStore, MonotonicDeadline, OutputDrainBudget,
     OutputDrainReport, drain_connected_outputs, schedule_wait_micros, sendmsg_connected_batch,
 };
-use shiguredo_srt::{ConnectionOutput, SrtConnection, Timestamp};
+use srt_proto::{ConnectionOutput, SrtConnection, Timestamp};
 use std::collections::VecDeque;
 use std::hash::Hash;
 use std::io;
@@ -967,7 +967,7 @@ fn owner_side_status(
 mod owner_tests {
     use super::*;
     use crate::{AdmissionEvent, LogicalCallerState, PoolOutcome, SocketOwnership};
-    use shiguredo_srt::ConnectionEvent;
+    use srt_proto::ConnectionEvent;
     use std::net::SocketAddr;
     use std::num::NonZeroUsize;
 
@@ -1267,7 +1267,7 @@ mod owner_tests {
                 event.id == caller_id
                     && matches!(
                         event.event,
-                        ConnectionEvent::StateChanged(shiguredo_srt::ConnectionState::Closing)
+                        ConnectionEvent::StateChanged(srt_proto::ConnectionState::Closing)
                     )
             })
         });
@@ -1587,7 +1587,7 @@ mod config_tests {
 #[cfg(test)]
 mod high_res_waiter_tests {
     use super::*;
-    use shiguredo_srt::{ConnectionOptions, SrtConnection, Timestamp};
+    use srt_proto::{ConnectionOptions, SrtConnection, Timestamp};
     use std::time::Duration;
 
     fn caller_conn() -> SrtConnection {

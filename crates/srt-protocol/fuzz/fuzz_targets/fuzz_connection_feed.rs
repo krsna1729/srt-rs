@@ -1,10 +1,10 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use shiguredo_srt::{ConnectionOptions, ConnectionOutput, SrtConnection, TimerId, Timestamp};
-use shiguredo_srt::handshake::DEFAULT_MTU;
-use shiguredo_srt::wire::{ControlPacket, ControlType};
-use shiguredo_srt::write_u32;
+use srt_proto::{ConnectionOptions, ConnectionOutput, SrtConnection, TimerId, Timestamp};
+use srt_proto::handshake::DEFAULT_MTU;
+use srt_proto::wire::{ControlPacket, ControlType};
+use srt_proto::write_u32;
 
 fn transfer(from: &mut SrtConnection, to: &mut SrtConnection, now: Timestamp) {
     while let Some(output) = from.poll_output() {
@@ -23,8 +23,8 @@ fn connected_pair() -> Option<(SrtConnection, SrtConnection)> {
         let now = Timestamp::from_micros(round * 1_000);
         transfer(&mut caller, &mut listener, now);
         transfer(&mut listener, &mut caller, now);
-        if caller.state() == shiguredo_srt::ConnectionState::Connected
-            && listener.state() == shiguredo_srt::ConnectionState::Connected
+        if caller.state() == srt_proto::ConnectionState::Connected
+            && listener.state() == srt_proto::ConnectionState::Connected
         {
             return Some((caller, listener));
         }

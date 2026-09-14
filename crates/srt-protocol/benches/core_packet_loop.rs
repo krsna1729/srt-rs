@@ -12,8 +12,8 @@
 //! isolated C throughput floor in `test/native/srt-scaling/`.
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use shiguredo_srt::crypto::CipherMode;
-use shiguredo_srt::{
+use srt_proto::crypto::CipherMode;
+use srt_proto::{
     ConnectionOptions, ConnectionOutput, ConnectionState, SrtConnection, TimerId, Timestamp,
 };
 use std::hint::black_box;

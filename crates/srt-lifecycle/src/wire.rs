@@ -1,7 +1,7 @@
 //! Explicit byte-oriented compatibility helpers.
 
 use crate::identity::{GroupAffinity, HandshakeIdentity, handshake_identity_from_handshake};
-use shiguredo_srt::handshake::{GroupExtensionData, peek_handshake};
+use srt_proto::handshake::{GroupExtensionData, peek_handshake};
 
 /// Extract the handshake phase and optional GROUP affinity from one datagram.
 #[must_use]

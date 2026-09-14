@@ -7,9 +7,9 @@
 use std::hint::black_box;
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
-use shiguredo_srt::Timestamp;
-use shiguredo_srt::receiver::LossRange;
-use shiguredo_srt::sender::SenderBuffer;
+use srt_proto::Timestamp;
+use srt_proto::receiver::LossRange;
+use srt_proto::sender::SenderBuffer;
 
 const PACKETS: u32 = 8_192;
 

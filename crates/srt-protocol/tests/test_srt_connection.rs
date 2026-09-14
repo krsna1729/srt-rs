@@ -4,10 +4,10 @@
 
 use std::time::Duration;
 
-use shiguredo_srt::crypto::{CipherMode, KeyFlag, KeyLength};
-use shiguredo_srt::handshake::{GroupExtensionData, GroupType};
-use shiguredo_srt::wire::{DataPacket, PacketPosition, SrtPacket};
-use shiguredo_srt::{
+use srt_proto::crypto::{CipherMode, KeyFlag, KeyLength};
+use srt_proto::handshake::{GroupExtensionData, GroupType};
+use srt_proto::wire::{DataPacket, PacketPosition, SrtPacket};
+use srt_proto::{
     ConnectionEvent, ConnectionOptions, ConnectionOutput, ConnectionState, ConnectionStats,
     ErrorKind, SrtConnection, TimerId, Timestamp,
 };
@@ -407,7 +407,7 @@ fn encrypted_connection_rejects_an_explicit_all_zero_sek() {
         }
     }
     let error = error.expect("zero SEK must fail during induction response handling");
-    assert_eq!(error.kind, shiguredo_srt::ErrorKind::CryptoError);
+    assert_eq!(error.kind, srt_proto::ErrorKind::CryptoError);
     assert!(error.reason.contains("all zero"));
 }
 
@@ -1756,15 +1756,15 @@ fn dropreq_drops_receiver_message() {
         _ => panic!("expected data packet"),
     };
 
-    let mut dropreq = shiguredo_srt::wire::ControlPacket::new(
-        shiguredo_srt::wire::ControlType::DropReq,
+    let mut dropreq = srt_proto::wire::ControlPacket::new(
+        srt_proto::wire::ControlType::DropReq,
         100,
         listener.socket_id(),
     );
     dropreq.type_specific_info = msg_num & 0x03FF_FFFF;
     let mut cif = Vec::new();
-    shiguredo_srt::write_u32(&mut cif, first_seq);
-    shiguredo_srt::write_u32(&mut cif, last_seq);
+    srt_proto::write_u32(&mut cif, first_seq);
+    srt_proto::write_u32(&mut cif, last_seq);
     dropreq.control_info = cif;
     let mut buf = Vec::new();
     dropreq
@@ -1788,14 +1788,14 @@ fn dropreq_rejects_high_bit_endpoints() {
         let mut listener = SrtConnection::new_listener(test_options());
         establish_connection(&mut caller, &mut listener).expect("connected");
 
-        let mut dropreq = shiguredo_srt::wire::ControlPacket::new(
-            shiguredo_srt::wire::ControlType::DropReq,
+        let mut dropreq = srt_proto::wire::ControlPacket::new(
+            srt_proto::wire::ControlType::DropReq,
             100,
             listener.socket_id(),
         );
         let mut cif = Vec::with_capacity(8);
-        shiguredo_srt::write_u32(&mut cif, first_seq);
-        shiguredo_srt::write_u32(&mut cif, last_seq);
+        srt_proto::write_u32(&mut cif, first_seq);
+        srt_proto::write_u32(&mut cif, last_seq);
         dropreq.control_info = cif;
         let mut encoded = Vec::new();
         dropreq
@@ -1816,14 +1816,14 @@ fn dropreq_rejects_range_larger_than_receive_window() {
     let mut listener = SrtConnection::new_listener(test_options());
     establish_connection(&mut caller, &mut listener).expect("connected");
 
-    let mut dropreq = shiguredo_srt::wire::ControlPacket::new(
-        shiguredo_srt::wire::ControlType::DropReq,
+    let mut dropreq = srt_proto::wire::ControlPacket::new(
+        srt_proto::wire::ControlType::DropReq,
         100,
         listener.socket_id(),
     );
     let mut cif = Vec::with_capacity(8);
-    shiguredo_srt::write_u32(&mut cif, 0);
-    shiguredo_srt::write_u32(&mut cif, 0x7FFF_FFFF);
+    srt_proto::write_u32(&mut cif, 0);
+    srt_proto::write_u32(&mut cif, 0x7FFF_FFFF);
     dropreq.control_info = cif;
     let mut encoded = Vec::new();
     dropreq
@@ -1903,7 +1903,7 @@ fn key_rotation_exchanges_km_control_packets_and_data_keeps_flowing() {
     const PACKETS_TO_SWITCH: u64 = 4;
     caller
         .seed_encrypted_packet_count_for_test(
-            shiguredo_srt::crypto::CryptoContext::KM_REFRESH_PERIOD - PACKETS_TO_SWITCH,
+            srt_proto::crypto::CryptoContext::KM_REFRESH_PERIOD - PACKETS_TO_SWITCH,
         )
         .expect("seed encrypted packet count for accelerated key refresh");
 

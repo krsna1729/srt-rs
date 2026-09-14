@@ -1,8 +1,8 @@
 //! Property-based tests for SRT SenderBuffer
 
 use proptest::prelude::*;
-use shiguredo_srt::Timestamp;
-use shiguredo_srt::sender::SenderBuffer;
+use srt_proto::Timestamp;
+use srt_proto::sender::SenderBuffer;
 use std::collections::HashSet;
 
 proptest! {

@@ -9,7 +9,7 @@
 //! close the caller in an orderly way and confirm the listener observes it;
 //! then demonstrate one error path (attempting to `listen` a second time).
 
-use shiguredo_srt::{ConnectionEvent, Timestamp};
+use srt_proto::{ConnectionEvent, Timestamp};
 use srt_transport::advanced::caller::LogicalCallerState;
 use srt_transport::advanced::driver::OutputDrainBudget;
 use srt_transport::mio_transport::Owner;

@@ -1,4 +1,4 @@
-use shiguredo_srt::Timestamp;
+use srt_proto::Timestamp;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::hash_map::Entry as HashEntry;
 use std::collections::{BinaryHeap, HashMap};

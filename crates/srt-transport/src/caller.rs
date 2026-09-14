@@ -2,7 +2,7 @@ use crate::{
     GroupConnectionStats, GroupLogicalCounters, ManualTimerStore, OutputDrainBudget,
     OutputDrainReport, OutputDrainStatus, group_connection_stats,
 };
-use shiguredo_srt::{Bytes, ConnectionOutput, SrtConnection, Timestamp};
+use srt_proto::{Bytes, ConnectionOutput, SrtConnection, Timestamp};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 /// Default maximum number of logical callers held by one table.
@@ -40,7 +40,7 @@ impl LogicalCallerId {
 #[derive(Debug, Clone)]
 pub struct CallerEvent {
     pub id: LogicalCallerId,
-    pub event: shiguredo_srt::ConnectionEvent,
+    pub event: srt_proto::ConnectionEvent,
 }
 
 /// Exact ordered deadline index for CallerTable.
@@ -120,7 +120,7 @@ impl CallerGroupLeg {
 /// Telemetry for an outbound logical caller. Group snapshots contain both the
 /// aggregate logical/wire counters and the individual physical leg rows.
 pub enum LogicalCallerStats {
-    Direct(Box<shiguredo_srt::ConnectionStats>),
+    Direct(Box<srt_proto::ConnectionStats>),
     Group(Box<GroupConnectionStats>),
 }
 
@@ -224,10 +224,10 @@ impl LogicalCallerMut<'_> {
 
     /// Send one logical payload. Direct callers return one; Broadcast returns
     /// the successful active-leg count; Backup returns its selected leg.
-    pub fn send(&mut self, payload: &[u8], now: Timestamp) -> Result<usize, shiguredo_srt::Error> {
+    pub fn send(&mut self, payload: &[u8], now: Timestamp) -> Result<usize, srt_proto::Error> {
         let session = self.table.sessions.get_mut(&self.id).ok_or_else(|| {
-            shiguredo_srt::Error::with_reason(
-                shiguredo_srt::ErrorKind::InvalidState,
+            srt_proto::Error::with_reason(
+                srt_proto::ErrorKind::InvalidState,
                 "logical caller no longer exists",
             )
         })?;
@@ -243,10 +243,10 @@ impl LogicalCallerMut<'_> {
         &mut self,
         payload: Bytes,
         now: Timestamp,
-    ) -> Result<usize, shiguredo_srt::Error> {
+    ) -> Result<usize, srt_proto::Error> {
         let session = self.table.sessions.get_mut(&self.id).ok_or_else(|| {
-            shiguredo_srt::Error::with_reason(
-                shiguredo_srt::ErrorKind::InvalidState,
+            srt_proto::Error::with_reason(
+                srt_proto::ErrorKind::InvalidState,
                 "logical caller no longer exists",
             )
         })?;
@@ -283,10 +283,10 @@ impl LogicalCallerMut<'_> {
         &mut self,
         new_sek: &[u8],
         now: Timestamp,
-    ) -> Result<(), shiguredo_srt::Error> {
+    ) -> Result<(), srt_proto::Error> {
         let session = self.table.sessions.get_mut(&self.id).ok_or_else(|| {
-            shiguredo_srt::Error::with_reason(
-                shiguredo_srt::ErrorKind::InvalidState,
+            srt_proto::Error::with_reason(
+                srt_proto::ErrorKind::InvalidState,
                 "logical caller no longer exists",
             )
         })?;
@@ -302,7 +302,7 @@ impl LogicalCallerMut<'_> {
 ///
 /// The runtime performs `recv_from`/`send_to`; this table owns protocol cores,
 /// timers, source-address validation, and SRT Socket-ID routing. Group policy
-/// stays in the shared [`shiguredo_srt::SrtGroup`] core, so every runtime sees
+/// stays in the shared [`srt_proto::SrtGroup`] core, so every runtime sees
 /// identical Broadcast and Backup behavior. A table has a finite logical
 /// caller cap; use [`Self::with_max_callers`] when a shard needs a different
 /// explicit bound.
@@ -358,7 +358,7 @@ struct CallerGroupLegState {
 }
 
 struct CallerGroupState {
-    group: shiguredo_srt::SrtGroup,
+    group: srt_proto::SrtGroup,
     legs: HashMap<u32, CallerGroupLegState>,
     leg_order: Vec<u32>,
     next_leg: usize,
@@ -387,11 +387,11 @@ impl CallerSession {
             Self::Direct(leg) => logical_state(&leg.connection),
             Self::Group(group) => {
                 if group.group.members().iter().any(|member| {
-                    member.connection().state() == shiguredo_srt::ConnectionState::Connected
+                    member.connection().state() == srt_proto::ConnectionState::Connected
                 }) {
                     LogicalCallerState::Connected
                 } else if group.group.members().iter().all(|member| {
-                    member.connection().state() == shiguredo_srt::ConnectionState::Disconnected
+                    member.connection().state() == srt_proto::ConnectionState::Disconnected
                 }) {
                     LogicalCallerState::Disconnected
                 } else {
@@ -439,7 +439,7 @@ impl CallerSession {
         }
     }
 
-    fn send(&mut self, payload: &[u8], now: Timestamp) -> Result<usize, shiguredo_srt::Error> {
+    fn send(&mut self, payload: &[u8], now: Timestamp) -> Result<usize, srt_proto::Error> {
         match self {
             Self::Direct(leg) => {
                 leg.connection.send(payload, now)?;
@@ -457,11 +457,7 @@ impl CallerSession {
         }
     }
 
-    fn send_shared(
-        &mut self,
-        payload: Bytes,
-        now: Timestamp,
-    ) -> Result<usize, shiguredo_srt::Error> {
+    fn send_shared(&mut self, payload: Bytes, now: Timestamp) -> Result<usize, srt_proto::Error> {
         let len = payload.len() as u64;
         match self {
             Self::Direct(leg) => {
@@ -485,11 +481,7 @@ impl CallerSession {
         }
     }
 
-    fn provide_new_sek(
-        &mut self,
-        new_sek: &[u8],
-        now: Timestamp,
-    ) -> Result<(), shiguredo_srt::Error> {
+    fn provide_new_sek(&mut self, new_sek: &[u8], now: Timestamp) -> Result<(), srt_proto::Error> {
         match self {
             Self::Direct(leg) => leg.connection.provide_new_sek(new_sek, now),
             Self::Group(group) => {
@@ -603,12 +595,12 @@ enum EventReadyVisit {
 
 fn logical_state(connection: &SrtConnection) -> LogicalCallerState {
     match connection.state() {
-        shiguredo_srt::ConnectionState::Connected => LogicalCallerState::Connected,
-        shiguredo_srt::ConnectionState::Disconnected => LogicalCallerState::Disconnected,
-        shiguredo_srt::ConnectionState::Induction
-        | shiguredo_srt::ConnectionState::Conclusion
-        | shiguredo_srt::ConnectionState::Listening
-        | shiguredo_srt::ConnectionState::Closing => LogicalCallerState::Connecting,
+        srt_proto::ConnectionState::Connected => LogicalCallerState::Connected,
+        srt_proto::ConnectionState::Disconnected => LogicalCallerState::Disconnected,
+        srt_proto::ConnectionState::Induction
+        | srt_proto::ConnectionState::Conclusion
+        | srt_proto::ConnectionState::Listening
+        | srt_proto::ConnectionState::Closing => LogicalCallerState::Connecting,
     }
 }
 
@@ -786,10 +778,10 @@ impl CallerTable {
 
     /// Add one direct caller. Its non-zero SRT Socket ID must be unique among
     /// all physical legs in this shared UDP socket.
-    pub fn add_direct(&mut self, leg: CallerLeg) -> Result<LogicalCallerId, shiguredo_srt::Error> {
+    pub fn add_direct(&mut self, leg: CallerLeg) -> Result<LogicalCallerId, srt_proto::Error> {
         if self.sessions.len() >= self.max_callers {
-            return Err(shiguredo_srt::Error::with_reason(
-                shiguredo_srt::ErrorKind::InvalidState,
+            return Err(srt_proto::Error::with_reason(
+                srt_proto::ErrorKind::InvalidState,
                 "caller table capacity reached",
             ));
         }
@@ -825,24 +817,24 @@ impl CallerTable {
     pub fn add_group(
         &mut self,
         group_id: u32,
-        mode: shiguredo_srt::GroupMode,
+        mode: srt_proto::GroupMode,
         legs: impl IntoIterator<Item = CallerGroupLeg>,
-    ) -> Result<LogicalCallerId, shiguredo_srt::Error> {
+    ) -> Result<LogicalCallerId, srt_proto::Error> {
         if self.sessions.len() >= self.max_callers {
-            return Err(shiguredo_srt::Error::with_reason(
-                shiguredo_srt::ErrorKind::InvalidState,
+            return Err(srt_proto::Error::with_reason(
+                srt_proto::ErrorKind::InvalidState,
                 "caller table capacity reached",
             ));
         }
-        let mut group = shiguredo_srt::SrtGroup::new(group_id, mode)?;
+        let mut group = srt_proto::SrtGroup::new(group_id, mode)?;
         let mut caller_legs = HashMap::new();
         let mut socket_ids = HashSet::new();
         let mut leg_order = Vec::new();
         for leg in legs {
             let socket_id = self.validate_socket_id(&leg.connection)?;
             if !socket_ids.insert(socket_id) {
-                return Err(shiguredo_srt::Error::with_reason(
-                    shiguredo_srt::ErrorKind::InvalidState,
+                return Err(srt_proto::Error::with_reason(
+                    srt_proto::ErrorKind::InvalidState,
                     "shared caller groups require distinct SRT socket IDs",
                 ));
             }
@@ -858,8 +850,8 @@ impl CallerTable {
                 )
                 .is_some()
             {
-                return Err(shiguredo_srt::Error::with_reason(
-                    shiguredo_srt::ErrorKind::InvalidState,
+                return Err(srt_proto::Error::with_reason(
+                    srt_proto::ErrorKind::InvalidState,
                     "shared caller groups require distinct member IDs",
                 ));
             }
@@ -867,8 +859,8 @@ impl CallerTable {
         }
 
         if leg_order.is_empty() {
-            return Err(shiguredo_srt::Error::with_reason(
-                shiguredo_srt::ErrorKind::InvalidState,
+            return Err(srt_proto::Error::with_reason(
+                srt_proto::ErrorKind::InvalidState,
                 "shared caller groups require at least one member",
             ));
         }
@@ -906,22 +898,22 @@ impl CallerTable {
         self.enqueue_ready(id);
         Ok(id)
     }
-    fn validate_socket_id(&self, connection: &SrtConnection) -> Result<u32, shiguredo_srt::Error> {
+    fn validate_socket_id(&self, connection: &SrtConnection) -> Result<u32, srt_proto::Error> {
         let socket_id = connection.socket_id();
         if socket_id == 0 || self.routes.contains_key(&socket_id) {
-            return Err(shiguredo_srt::Error::with_reason(
-                shiguredo_srt::ErrorKind::InvalidState,
+            return Err(srt_proto::Error::with_reason(
+                srt_proto::ErrorKind::InvalidState,
                 "shared caller sockets require distinct non-zero SRT socket IDs",
             ));
         }
         Ok(socket_id)
     }
 
-    fn allocate_logical_caller(&mut self) -> Result<LogicalCallerId, shiguredo_srt::Error> {
+    fn allocate_logical_caller(&mut self) -> Result<LogicalCallerId, srt_proto::Error> {
         let raw = self.next_logical_caller;
         self.next_logical_caller = raw.checked_add(1).ok_or_else(|| {
-            shiguredo_srt::Error::with_reason(
-                shiguredo_srt::ErrorKind::InvalidState,
+            srt_proto::Error::with_reason(
+                srt_proto::ErrorKind::InvalidState,
                 "logical caller ID space exhausted",
             )
         })?;
@@ -935,8 +927,8 @@ impl CallerTable {
         peer: std::net::SocketAddr,
         data: &[u8],
         now: Timestamp,
-    ) -> Result<bool, shiguredo_srt::Error> {
-        let socket_id = shiguredo_srt::wire::peek_destination_socket_id(data)?;
+    ) -> Result<bool, srt_proto::Error> {
+        let socket_id = srt_proto::wire::peek_destination_socket_id(data)?;
         let target_id = match self.routes.get(&socket_id).copied() {
             Some(route) => match route {
                 CallerRoute::Direct(id) => id,
@@ -1280,7 +1272,7 @@ impl CallerTable {
     /// bonded group (no single state to report) or an id that no longer
     /// exists.
     #[must_use]
-    pub fn raw_direct_state(&self, id: &LogicalCallerId) -> Option<shiguredo_srt::ConnectionState> {
+    pub fn raw_direct_state(&self, id: &LogicalCallerId) -> Option<srt_proto::ConnectionState> {
         match self.sessions.get(id)? {
             CallerSession::Direct(leg) => Some(leg.connection.state()),
             CallerSession::Group(_) => None,
@@ -1383,7 +1375,7 @@ impl CallerTable {
     pub fn bench_arm_timer(
         &mut self,
         id: LogicalCallerId,
-        timer_id: shiguredo_srt::TimerId,
+        timer_id: srt_proto::TimerId,
         duration_micros: u64,
         now: Timestamp,
     ) {
@@ -1418,7 +1410,7 @@ impl CallerTable {
     pub fn bench_inject_deadline(&mut self, id: LogicalCallerId, deadline: Timestamp) {
         self.bench_arm_timer(
             id,
-            shiguredo_srt::TimerId::Ack,
+            srt_proto::TimerId::Ack,
             deadline.as_micros(),
             Timestamp::from_micros(0),
         );
@@ -1429,7 +1421,7 @@ impl CallerTable {
         if let Some(session) = self.sessions.get_mut(&id) {
             match session {
                 CallerSession::Direct(leg) => {
-                    for &t in &shiguredo_srt::TimerId::ALL {
+                    for &t in &srt_proto::TimerId::ALL {
                         leg.timers.apply_output(
                             &ConnectionOutput::ClearTimer { id: t },
                             Timestamp::default(),
@@ -1438,7 +1430,7 @@ impl CallerTable {
                 }
                 CallerSession::Group(group) => {
                     for leg in group.legs.values_mut() {
-                        for &t in &shiguredo_srt::TimerId::ALL {
+                        for &t in &srt_proto::TimerId::ALL {
                             leg.timers.apply_output(
                                 &ConnectionOutput::ClearTimer { id: t },
                                 Timestamp::default(),
@@ -1612,9 +1604,9 @@ pub(crate) fn collect_output_work(
 mod tests {
     use crate::*;
     use proptest::prelude::*;
-    use shiguredo_srt::handshake::HandshakePacket;
-    use shiguredo_srt::wire::SrtPacket;
-    use shiguredo_srt::{
+    use srt_proto::handshake::HandshakePacket;
+    use srt_proto::wire::SrtPacket;
+    use srt_proto::{
         ConnectionEvent, ConnectionOptions, ConnectionOutput, ErrorKind, SrtConnection, TimerId,
         Timestamp,
     };
@@ -1737,9 +1729,9 @@ mod tests {
             ConnectionOptions {
                 socket_id: 0x1111,
                 stream_id: Some("publish:bonded".to_string()),
-                group_extension: Some(shiguredo_srt::handshake::GroupExtensionData {
-                    group_id: shiguredo_srt::handshake::SRTGROUP_MASK | 42,
-                    group_type: shiguredo_srt::handshake::GroupType::Broadcast,
+                group_extension: Some(srt_proto::handshake::GroupExtensionData {
+                    group_id: srt_proto::handshake::SRTGROUP_MASK | 42,
+                    group_type: srt_proto::handshake::GroupType::Broadcast,
                     flags: 0,
                     weight: 1,
                 }),
@@ -1776,9 +1768,9 @@ mod tests {
             peer,
             ConnectionOptions {
                 socket_id: 0x1111,
-                group_extension: Some(shiguredo_srt::handshake::GroupExtensionData {
-                    group_id: shiguredo_srt::handshake::SRTGROUP_MASK | 42,
-                    group_type: shiguredo_srt::handshake::GroupType::Unknown(3),
+                group_extension: Some(srt_proto::handshake::GroupExtensionData {
+                    group_id: srt_proto::handshake::SRTGROUP_MASK | 42,
+                    group_type: srt_proto::handshake::GroupType::Unknown(3),
                     flags: 0,
                     weight: 1,
                 }),
@@ -1821,14 +1813,14 @@ mod tests {
         options.bonded_inputs = BondedInputPolicy::Accept;
         let telemetry = IngressTelemetry::new();
         let mut table = PeerTable::new();
-        let group_id = shiguredo_srt::handshake::SRTGROUP_MASK | 42;
+        let group_id = srt_proto::handshake::SRTGROUP_MASK | 42;
         let caller_options = |socket_id, weight| ConnectionOptions {
             socket_id,
             initial_seq: Some(1234),
             stream_id: Some("publish:bonded".to_string()),
-            group_extension: Some(shiguredo_srt::handshake::GroupExtensionData {
+            group_extension: Some(srt_proto::handshake::GroupExtensionData {
                 group_id,
-                group_type: shiguredo_srt::handshake::GroupType::Broadcast,
+                group_type: srt_proto::handshake::GroupType::Broadcast,
                 flags: 0,
                 weight,
             }),
@@ -1907,8 +1899,8 @@ mod tests {
             outbound
                 .iter()
                 .filter(|(_, packet)| matches!(
-                    shiguredo_srt::wire::SrtPacket::decode(packet),
-                    Ok(shiguredo_srt::wire::SrtPacket::Data(_))
+                    srt_proto::wire::SrtPacket::decode(packet),
+                    Ok(srt_proto::wire::SrtPacket::Data(_))
                 ))
                 .count(),
             2,
@@ -1977,7 +1969,7 @@ mod tests {
         assert_eq!(
             outbound
                 .iter()
-                .filter(|(_, packet)| matches!(shiguredo_srt::wire::SrtPacket::decode(packet), Ok(shiguredo_srt::wire::SrtPacket::Control(control)) if control.control_type == shiguredo_srt::wire::ControlType::Shutdown))
+                .filter(|(_, packet)| matches!(srt_proto::wire::SrtPacket::decode(packet), Ok(srt_proto::wire::SrtPacket::Control(control)) if control.control_type == srt_proto::wire::ControlType::Shutdown))
                 .count(),
             2,
             "an orderly logical close shuts down every group leg"
@@ -1992,11 +1984,11 @@ mod tests {
         options.bonded_inputs = BondedInputPolicy::Accept;
         let telemetry = IngressTelemetry::new();
         let mut table = PeerTable::new();
-        let group_id = shiguredo_srt::handshake::SRTGROUP_MASK | 42;
+        let group_id = srt_proto::handshake::SRTGROUP_MASK | 42;
         let caller_options = |socket_id, group_type| ConnectionOptions {
             socket_id,
             stream_id: Some("publish:bonded".to_string()),
-            group_extension: Some(shiguredo_srt::handshake::GroupExtensionData {
+            group_extension: Some(srt_proto::handshake::GroupExtensionData {
                 group_id,
                 group_type,
                 flags: 0,
@@ -2007,7 +1999,7 @@ mod tests {
         let (mut first_caller, first_conclusion) = prepare_conclusion_with_options(
             &mut table,
             first,
-            caller_options(0x1111, shiguredo_srt::handshake::GroupType::Broadcast),
+            caller_options(0x1111, srt_proto::handshake::GroupType::Broadcast),
             &options,
             &telemetry,
         );
@@ -2022,7 +2014,7 @@ mod tests {
         let (_, second_conclusion) = prepare_conclusion_with_options(
             &mut table,
             second,
-            caller_options(0x2222, shiguredo_srt::handshake::GroupType::Backup),
+            caller_options(0x2222, srt_proto::handshake::GroupType::Backup),
             &options,
             &telemetry,
         );
@@ -2041,7 +2033,7 @@ mod tests {
         );
         assert_eq!(
             table.bonded_stats()[0].connection.mode,
-            shiguredo_srt::GroupMode::Broadcast
+            srt_proto::GroupMode::Broadcast
         );
         assert_eq!(table.bonded_stats()[0].connection.legs.len(), 1);
     }
@@ -2100,13 +2092,13 @@ mod tests {
         let mut outbound = Vec::new();
         table.poll_outbound(Timestamp::from_micros(4), &mut outbound);
         assert!(outbound.iter().any(|(_, packet)| matches!(
-            shiguredo_srt::wire::SrtPacket::decode(packet),
-            Ok(shiguredo_srt::wire::SrtPacket::Data(_))
+            srt_proto::wire::SrtPacket::decode(packet),
+            Ok(srt_proto::wire::SrtPacket::Data(_))
         )));
         assert!(outbound.iter().any(|(_, packet)| matches!(
-            shiguredo_srt::wire::SrtPacket::decode(packet),
-            Ok(shiguredo_srt::wire::SrtPacket::Control(control))
-                if control.control_type == shiguredo_srt::wire::ControlType::Shutdown
+            srt_proto::wire::SrtPacket::decode(packet),
+            Ok(srt_proto::wire::SrtPacket::Control(control))
+                if control.control_type == srt_proto::wire::ControlType::Shutdown
         )));
     }
 
@@ -2180,7 +2172,7 @@ mod tests {
         let direct_peer = "127.0.0.1:11000".parse().expect("address");
         let first_peer = "127.0.0.1:11001".parse().expect("address");
         let second_peer = first_peer;
-        let group_id = shiguredo_srt::handshake::SRTGROUP_MASK | 55;
+        let group_id = srt_proto::handshake::SRTGROUP_MASK | 55;
         let mut callers = CallerTable::new();
         let direct = callers
             .add_direct(CallerLeg::new(
@@ -2194,7 +2186,7 @@ mod tests {
         let grouped = callers
             .add_group(
                 group_id,
-                shiguredo_srt::GroupMode::Broadcast,
+                srt_proto::GroupMode::Broadcast,
                 [
                     CallerGroupLeg::new(
                         1,
@@ -2203,9 +2195,9 @@ mod tests {
                         caller_connection(ConnectionOptions {
                             socket_id: 102,
                             initial_seq: Some(1234),
-                            group_extension: Some(shiguredo_srt::handshake::GroupExtensionData {
+                            group_extension: Some(srt_proto::handshake::GroupExtensionData {
                                 group_id,
-                                group_type: shiguredo_srt::handshake::GroupType::Broadcast,
+                                group_type: srt_proto::handshake::GroupType::Broadcast,
                                 flags: 0,
                                 weight: 1,
                             }),
@@ -2219,9 +2211,9 @@ mod tests {
                         caller_connection(ConnectionOptions {
                             socket_id: 103,
                             initial_seq: Some(1234),
-                            group_extension: Some(shiguredo_srt::handshake::GroupExtensionData {
+                            group_extension: Some(srt_proto::handshake::GroupExtensionData {
                                 group_id,
-                                group_type: shiguredo_srt::handshake::GroupType::Broadcast,
+                                group_type: srt_proto::handshake::GroupType::Broadcast,
                                 flags: 0,
                                 weight: 1,
                             }),
@@ -2291,8 +2283,8 @@ mod tests {
             outbound
                 .iter()
                 .filter(|(_, packet)| matches!(
-                    shiguredo_srt::wire::SrtPacket::decode(packet),
-                    Ok(shiguredo_srt::wire::SrtPacket::Data(_))
+                    srt_proto::wire::SrtPacket::decode(packet),
+                    Ok(srt_proto::wire::SrtPacket::Data(_))
                 ))
                 .count(),
             3,
@@ -2395,7 +2387,7 @@ mod tests {
         callers.poll_events(&mut events);
         assert!(
             events.iter().any(|event| event.id == id
-                && matches!(event.event, shiguredo_srt::ConnectionEvent::Connected)),
+                && matches!(event.event, srt_proto::ConnectionEvent::Connected)),
             "a direct caller's Connected transition must be observable, got {events:?}"
         );
 
@@ -2448,7 +2440,7 @@ mod tests {
             events.iter().any(|event| event.id == id
                 && matches!(
                     &event.event,
-                    shiguredo_srt::ConnectionEvent::DataReceived { payload, .. }
+                    srt_proto::ConnectionEvent::DataReceived { payload, .. }
                         if payload.as_ref() == b"inbound"
                 )),
             "a direct caller's received payload must be observable via poll_events, got {events:?}"
@@ -2473,9 +2465,7 @@ mod tests {
             events.iter().any(|event| event.id == id
                 && matches!(
                     event.event,
-                    shiguredo_srt::ConnectionEvent::StateChanged(
-                        shiguredo_srt::ConnectionState::Closing
-                    )
+                    srt_proto::ConnectionEvent::StateChanged(srt_proto::ConnectionState::Closing)
                 )),
             "a direct caller's close starting must be observable via poll_events, got {events:?}"
         );
@@ -2578,14 +2568,14 @@ mod tests {
             options.bonded_inputs = BondedInputPolicy::Accept;
             let telemetry = IngressTelemetry::new();
             let mut table = PeerTable::new();
-            let group_id = shiguredo_srt::handshake::SRTGROUP_MASK | group_suffix;
+            let group_id = srt_proto::handshake::SRTGROUP_MASK | group_suffix;
             let caller_options = |socket_id| ConnectionOptions {
                 socket_id,
                 initial_seq: Some(initial_seq),
                 stream_id: Some("publish:property-group".to_string()),
-                group_extension: Some(shiguredo_srt::handshake::GroupExtensionData {
+                group_extension: Some(srt_proto::handshake::GroupExtensionData {
                     group_id,
-                    group_type: shiguredo_srt::handshake::GroupType::Broadcast,
+                    group_type: srt_proto::handshake::GroupType::Broadcast,
                     flags: 0,
                     weight: 1,
                 }),
@@ -2680,8 +2670,8 @@ mod tests {
         config.connection.tsbpd_delay = 250;
         let caller = config.caller().expect("valid caller config");
         let listener = config.listener().expect("valid listener config");
-        assert_eq!(caller.state(), shiguredo_srt::ConnectionState::Disconnected);
-        assert_eq!(listener.state(), shiguredo_srt::ConnectionState::Listening);
+        assert_eq!(caller.state(), srt_proto::ConnectionState::Disconnected);
+        assert_eq!(listener.state(), srt_proto::ConnectionState::Listening);
         assert!(
             config
                 .peer_table()
@@ -3099,7 +3089,7 @@ mod tests {
                 .expect("peer retained to send rejection")
                 .conn
                 .state(),
-            shiguredo_srt::ConnectionState::Connected
+            srt_proto::ConnectionState::Connected
         );
         assert_eq!(
             table.admit(
@@ -3115,7 +3105,7 @@ mod tests {
         );
         assert_ne!(
             table.get(&peer).expect("rejected peer").conn.state(),
-            shiguredo_srt::ConnectionState::Connected
+            srt_proto::ConnectionState::Connected
         );
 
         table.poll_outbound(Timestamp::from_micros(2), &mut outbound);
@@ -3199,7 +3189,7 @@ mod tests {
                     encryption: PolicyOverride::Set(Some(
                         ListenerEncryptionConfig::new(
                             passphrase,
-                            shiguredo_srt::crypto::KeyLength::Aes128,
+                            srt_proto::crypto::KeyLength::Aes128,
                         )
                         .expect("valid listener secret"),
                     )),
@@ -3210,7 +3200,7 @@ mod tests {
         assert_eq!(result, Admit::Fed);
         assert_eq!(
             table.get(&peer).expect("listener peer").conn.state(),
-            shiguredo_srt::ConnectionState::Connected
+            srt_proto::ConnectionState::Connected
         );
 
         let mut outbound = Vec::new();
@@ -3220,7 +3210,7 @@ mod tests {
                 .feed_recv_buf(&packet, Timestamp::from_micros(3))
                 .expect("caller accepts KM response");
         }
-        assert_eq!(caller.state(), shiguredo_srt::ConnectionState::Connected);
+        assert_eq!(caller.state(), srt_proto::ConnectionState::Connected);
         let snapshot = telemetry.snapshot();
         assert_eq!(snapshot.policy_requests, 1);
         assert_eq!(snapshot.policy_configurations, 1);
@@ -3258,7 +3248,7 @@ mod tests {
                     encryption: PolicyOverride::Set(Some(
                         ListenerEncryptionConfig::new(
                             "incorrect-secret-123",
-                            shiguredo_srt::crypto::KeyLength::Aes128,
+                            srt_proto::crypto::KeyLength::Aes128,
                         )
                         .expect("valid listener secret"),
                     )),
@@ -3269,7 +3259,7 @@ mod tests {
         assert_eq!(result, Admit::Dropped(AdmissionDropReason::InvalidPacket));
         assert_ne!(
             table.get(&peer).expect("half-open peer").conn.state(),
-            shiguredo_srt::ConnectionState::Connected
+            srt_proto::ConnectionState::Connected
         );
         assert_eq!(telemetry.snapshot().credential_failures, 1);
     }
@@ -3306,7 +3296,7 @@ mod tests {
         );
         assert_eq!(
             table.get(&peer).expect("terminal peer").conn.state(),
-            shiguredo_srt::ConnectionState::Disconnected
+            srt_proto::ConnectionState::Disconnected
         );
         assert_eq!(telemetry.snapshot().credential_failures, 1);
 
@@ -3320,7 +3310,7 @@ mod tests {
                     .err()
             })
             .expect("caller receives KM mismatch");
-        assert_eq!(error.kind, shiguredo_srt::ErrorKind::HandshakeRejected);
+        assert_eq!(error.kind, srt_proto::ErrorKind::HandshakeRejected);
         assert!(
             !table.contains(&peer),
             "terminal peer retires after response"
@@ -3815,11 +3805,11 @@ mod tests {
                     let _ = caller.feed_recv_buf(&data, now);
                 }
             }
-            if caller.state() == shiguredo_srt::ConnectionState::Connected {
+            if caller.state() == srt_proto::ConnectionState::Connected {
                 break;
             }
         }
-        assert_eq!(caller.state(), shiguredo_srt::ConnectionState::Connected);
+        assert_eq!(caller.state(), srt_proto::ConnectionState::Connected);
         caller
     }
 
@@ -3977,7 +3967,7 @@ mod tests {
             let now = Timestamp::from_micros(5_000_000);
             table.bench_arm_timer(
                 target,
-                shiguredo_srt::TimerId::Ack,
+                srt_proto::TimerId::Ack,
                 5_000_000,
                 Timestamp::from_micros(0),
             );
@@ -4012,7 +4002,7 @@ mod tests {
         for &id in &ids {
             table.bench_arm_timer(
                 id,
-                shiguredo_srt::TimerId::Ack,
+                srt_proto::TimerId::Ack,
                 1_000_000,
                 Timestamp::from_micros(0),
             );
@@ -4101,7 +4091,7 @@ mod tests {
         for &id in &ids {
             table.bench_arm_timer(
                 id,
-                shiguredo_srt::TimerId::Ack,
+                srt_proto::TimerId::Ack,
                 1_000_000,
                 Timestamp::from_micros(0),
             );

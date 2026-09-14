@@ -1545,7 +1545,7 @@ name = "pbt"
 version = "0.0.0"
 dependencies = [
  "proptest",
- "shiguredo_srt",
+ "srt-proto",
 ]
 
 [[package]]
@@ -1957,27 +1957,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "shiguredo_srt"
-version = "2026.1.0-canary.1"
-dependencies = [
- "aes",
- "aes-gcm",
- "aes-kw",
- "bytes",
- "cipher",
- "criterion",
- "ctr",
- "getrandom 0.4.3",
- "hmac",
- "pbkdf2",
- "rustc-hash",
- "sha1",
- "shiguredo_srt",
- "tracing",
- "zeroize",
-]
-
-[[package]]
 name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2101,9 +2080,9 @@ dependencies = [
  "mio 1.2.2",
  "monoio",
  "proptest",
- "shiguredo_srt",
  "smol",
  "srt-lifecycle",
+ "srt-proto",
  "srt-transport",
  "tokio",
  "tracing",
@@ -2115,7 +2094,28 @@ name = "srt-lifecycle"
 version = "0.1.0"
 dependencies = [
  "proptest",
- "shiguredo_srt",
+ "srt-proto",
+]
+
+[[package]]
+name = "srt-proto"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "aes-gcm",
+ "aes-kw",
+ "bytes",
+ "cipher",
+ "criterion",
+ "ctr",
+ "getrandom 0.4.3",
+ "hmac",
+ "pbkdf2",
+ "rustc-hash",
+ "sha1",
+ "srt-proto",
+ "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -2131,11 +2131,11 @@ dependencies = [
  "mio 1.2.2",
  "monoio",
  "proptest",
- "shiguredo_srt",
  "smol",
  "socket2 0.4.10",
  "socket2 0.6.5",
  "srt-lifecycle",
+ "srt-proto",
  "tokio",
  "zeroize",
 ]

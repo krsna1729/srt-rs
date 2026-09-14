@@ -9,9 +9,9 @@
 //! 4. エッジケース: 境界値、空データ、大量データでの動作
 
 use proptest::prelude::*;
-use shiguredo_srt::handshake::DEFAULT_MTU;
-use shiguredo_srt::wire::{ControlType, SrtPacket};
-use shiguredo_srt::{
+use srt_proto::handshake::DEFAULT_MTU;
+use srt_proto::wire::{ControlType, SrtPacket};
+use srt_proto::{
     ConnectionEvent, ConnectionOptions, ConnectionOutput, ConnectionState, SrtConnection, TimerId,
     Timestamp,
 };

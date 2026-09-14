@@ -1,6 +1,6 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use shiguredo_srt::Timestamp;
-use shiguredo_srt::receiver::ReceiverBuffer;
+use srt_proto::Timestamp;
+use srt_proto::receiver::ReceiverBuffer;
 use std::hint::black_box;
 
 fn receiver_with_acks(count: u32) -> (ReceiverBuffer, u32) {

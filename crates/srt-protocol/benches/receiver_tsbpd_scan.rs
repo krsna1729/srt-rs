@@ -1,9 +1,9 @@
 use std::hint::black_box;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use shiguredo_srt::Timestamp;
-use shiguredo_srt::receiver::ReceiverBuffer;
-use shiguredo_srt::wire::DataPacket;
+use srt_proto::Timestamp;
+use srt_proto::receiver::ReceiverBuffer;
+use srt_proto::wire::DataPacket;
 
 const PACKET_COUNT: u32 = 8192;
 const PACKET_INTERVAL_US: u64 = 1_316;

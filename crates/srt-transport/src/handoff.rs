@@ -1,4 +1,4 @@
-use shiguredo_srt::SrtConnection;
+use srt_proto::SrtConnection;
 
 /// A connection handed from the acceptor that completed its handshake to
 /// the thread that will service it.

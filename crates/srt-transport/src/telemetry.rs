@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use shiguredo_srt::Timestamp;
+use srt_proto::Timestamp;
 
 /// Fixed number of power-of-two buckets used for owner-local shard lateness.
 pub const SHARD_LATENESS_BUCKETS: usize = 32;

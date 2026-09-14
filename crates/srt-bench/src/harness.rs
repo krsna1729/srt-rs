@@ -2158,12 +2158,12 @@ fn resolve_matrix_axes(cli: &crate::Cli) -> std::io::Result<MatrixAxisConfig> {
         axis(
             "ack-interval-micros",
             "ack-interval-micros",
-            &shiguredo_srt::receiver::ACK_INTERVAL_MICROS.to_string(),
+            &srt_proto::receiver::ACK_INTERVAL_MICROS.to_string(),
         ),
         axis(
             "light-ack-interval-packets",
             "light-ack-interval-packets",
-            &shiguredo_srt::receiver::LIGHT_ACK_INTERVAL_PACKETS.to_string(),
+            &srt_proto::receiver::LIGHT_ACK_INTERVAL_PACKETS.to_string(),
         ),
     ]);
     let unused: Vec<&str> = plan

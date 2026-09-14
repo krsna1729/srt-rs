@@ -12,7 +12,7 @@ repository = "https://github.com/krsna1729/srt-rs"
 include = ["/src/**", "/tests/**", "/benches/**", "/examples/**", "LICENSE", "README.md"]
 
 [dependencies]
-shiguredo_srt = { version = "=2026.1.0-canary.1", path = "../srt-protocol" }
+srt_proto = { package = "srt-proto", version = "=0.1.0", path = "../srt-protocol" }
 # The admission table applies admission policy (cookie routing, terminal
 # checks), so mechanism depends on policy. Acyclic: lifecycle depends only
 # on the protocol crate and never on this one.

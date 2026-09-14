@@ -6,8 +6,8 @@
 use crate::{Aggregate, BenchConfig, BondMode, ConnStats};
 use mio::net::UdpSocket;
 use mio::{Events, Interest, Poll, Token};
-use shiguredo_srt::handshake::GroupExtensionData;
-use shiguredo_srt::{ConnectionEvent, ConnectionOptions, SrtConnection};
+use srt_proto::handshake::GroupExtensionData;
+use srt_proto::{ConnectionEvent, ConnectionOptions, SrtConnection};
 use srt_transport::advanced::driver::RecvBudget;
 use srt_transport::advanced::handoff::{Handoff, WorkerMessage};
 use srt_transport::advanced::native_io::{HighResWaiter, MonotonicDeadline, RecvBatch};
@@ -1439,7 +1439,7 @@ fn drive_shared_pool_connections(
         let socket = &sockets[conn.socket_idx];
         while let Some(output) = conn.conn.poll_output() {
             match output {
-                shiguredo_srt::ConnectionOutput::SendPacket(bytes) => {
+                srt_proto::ConnectionOutput::SendPacket(bytes) => {
                     let _ = socket.send_to(&bytes, conn.peer);
                 }
                 other => conn.timers.apply_output(&other, timestamp),
@@ -1641,9 +1641,9 @@ fn drain_conn_outputs(
     timers: &mut srt_transport::advanced::driver::ManualTimerStore,
     socket: &UdpSocket,
     destination: SocketAddr,
-    now: shiguredo_srt::Timestamp,
+    now: srt_proto::Timestamp,
 ) -> bool {
-    use shiguredo_srt::ConnectionOutput;
+    use srt_proto::ConnectionOutput;
     let mut refused = false;
     while let Some(out) = conn.poll_output() {
         match out {
@@ -2846,8 +2846,8 @@ mod b02_regression_tests {
             source_backlog_ms: crate::source::DEFAULT_SOURCE_BACKLOG_MS,
             datapath_queue_horizon_ms: crate::queue::DEFAULT_DATAPATH_QUEUE_HORIZON_MS,
             outbound_retry_horizon_ms: crate::scheduling::DEFAULT_OUTBOUND_RETRY_HORIZON_MS,
-            ack_interval_micros: shiguredo_srt::receiver::ACK_INTERVAL_MICROS,
-            light_ack_interval_packets: shiguredo_srt::receiver::LIGHT_ACK_INTERVAL_PACKETS,
+            ack_interval_micros: srt_proto::receiver::ACK_INTERVAL_MICROS,
+            light_ack_interval_packets: srt_proto::receiver::LIGHT_ACK_INTERVAL_PACKETS,
             connections: 1,
             egress: crate::Egress::PerConnection,
             ingress: crate::Ingress::SharedPool(4),
@@ -2907,11 +2907,11 @@ mod b02_regression_tests {
     fn pump_handshake_output(
         from: &mut SrtConnection,
         to: &mut SrtConnection,
-        now: shiguredo_srt::Timestamp,
+        now: srt_proto::Timestamp,
         decode_expect: &str,
     ) {
         while let Some(output) = from.poll_output() {
-            if let shiguredo_srt::ConnectionOutput::SendPacket(packet) = output {
+            if let srt_proto::ConnectionOutput::SendPacket(packet) = output {
                 to.feed_recv_buf(&packet, now).expect(decode_expect);
             }
         }
@@ -2925,20 +2925,20 @@ mod b02_regression_tests {
         let mut caller = SrtConnection::new_caller(options.clone());
         let mut listener = SrtConnection::new_listener(options);
         caller
-            .connect(shiguredo_srt::Timestamp::from_micros(0))
+            .connect(srt_proto::Timestamp::from_micros(0))
             .expect("caller connects");
         for round in 0..10u64 {
-            let now = shiguredo_srt::Timestamp::from_micros(round * 10_000);
+            let now = srt_proto::Timestamp::from_micros(round * 10_000);
             pump_handshake_output(&mut caller, &mut listener, now, "caller packet decodes");
             pump_handshake_output(&mut listener, &mut caller, now, "listener packet decodes");
-            if caller.state() == shiguredo_srt::ConnectionState::Connected
-                && listener.state() == shiguredo_srt::ConnectionState::Connected
+            if caller.state() == srt_proto::ConnectionState::Connected
+                && listener.state() == srt_proto::ConnectionState::Connected
             {
                 break;
             }
         }
-        assert_eq!(caller.state(), shiguredo_srt::ConnectionState::Connected);
-        assert_eq!(listener.state(), shiguredo_srt::ConnectionState::Connected);
+        assert_eq!(caller.state(), srt_proto::ConnectionState::Connected);
+        assert_eq!(listener.state(), srt_proto::ConnectionState::Connected);
         while caller.poll_event().is_some() {}
         while listener.poll_event().is_some() {}
         (caller, listener)
@@ -3060,13 +3060,13 @@ mod b02_regression_tests {
         // connection's own established baseline silently confused its
         // internal timing bookkeeping and made every packet fed below
         // vanish before ever surfacing as `DataReceived`.
-        let now = shiguredo_srt::Timestamp::from_micros(100_000);
+        let now = srt_proto::Timestamp::from_micros(100_000);
         for i in 0..12u8 {
             caller.send(&[i], now).expect("valid SRT data");
         }
         let mut packets = Vec::new();
         while let Some(output) = caller.poll_output() {
-            if let shiguredo_srt::ConnectionOutput::SendPacket(packet) = output {
+            if let srt_proto::ConnectionOutput::SendPacket(packet) = output {
                 packets.push(packet);
             }
         }

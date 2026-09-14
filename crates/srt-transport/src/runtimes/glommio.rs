@@ -2,7 +2,7 @@ use crate::{
     OutputDrainBudget, OutputDrainReport, OutputDrainStatus, PacedSendOutcome, collect_output_work,
     prepend_outputs,
 };
-use shiguredo_srt::{Bytes, ConnectionOutput, SrtConnection, Timestamp};
+use srt_proto::{Bytes, ConnectionOutput, SrtConnection, Timestamp};
 use std::collections::VecDeque;
 use std::io;
 use std::time::Duration;
@@ -324,7 +324,7 @@ mod tests {
                 let sock = from_std(local).expect("glommio adopts the socket");
 
                 let mut conn = Conn::new(
-                    SrtConnection::new_caller(shiguredo_srt::ConnectionOptions::default()),
+                    SrtConnection::new_caller(srt_proto::ConnectionOptions::default()),
                     sock,
                 );
                 for i in 0..5u8 {
@@ -406,7 +406,7 @@ mod tests {
                 let sock = from_std(local).expect("glommio adopts the socket");
 
                 let mut conn = Conn::new(
-                    SrtConnection::new_caller(shiguredo_srt::ConnectionOptions::default()),
+                    SrtConnection::new_caller(srt_proto::ConnectionOptions::default()),
                     sock,
                 );
                 conn.pending_outputs
@@ -414,7 +414,7 @@ mod tests {
                 conn.pending_outputs
                     .push_back(ConnectionOutput::SendPacket(b"second".to_vec()));
                 conn.pending_outputs.push_back(ConnectionOutput::SetTimer {
-                    id: shiguredo_srt::TimerId::Ack,
+                    id: srt_proto::TimerId::Ack,
                     duration_micros: 10_000,
                 });
                 let not_yet_submitted: Vec<_> =

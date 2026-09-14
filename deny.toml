@@ -18,7 +18,7 @@ targets = [
 unsound = "all"
 # These two advisories are confined to optional runtime adapters in the
 # unpublished benchmark/transport crates. Neither is reachable from the
-# published `shiguredo_srt` crate. There is no compatible fixed release:
+# published `srt-proto` crate. There is no compatible fixed release:
 # glommio 0.9 is still the current upstream release and monoio 0.2.4 is the
 # current monoio release. Review dates and replacement criteria are tracked in
 # docs/dependency-exceptions.md; CI still fails on every other advisory.

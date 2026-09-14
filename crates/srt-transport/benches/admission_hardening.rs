@@ -3,8 +3,8 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
-use shiguredo_srt::handshake::{GroupExtensionData, GroupType, HandshakePacket, SRTGROUP_MASK};
-use shiguredo_srt::{ConnectionOptions, ConnectionOutput, SrtConnection, Timestamp};
+use srt_proto::handshake::{GroupExtensionData, GroupType, HandshakePacket, SRTGROUP_MASK};
+use srt_proto::{ConnectionOptions, ConnectionOutput, SrtConnection, Timestamp};
 use srt_transport::advanced::admission::{
     AdmissionOptions, AdmissionResolution, BondedInputPolicy, PeerTable, PeerTableConfig,
 };

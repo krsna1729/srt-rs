@@ -125,13 +125,7 @@ const DENY_WORKSPACE: Step = Step {
 const PACKAGE: Step = Step {
     name: "package",
     cmd: "cargo",
-    args: &[
-        "package",
-        "-p",
-        "shiguredo_srt",
-        "--locked",
-        "--allow-dirty",
-    ],
+    args: &["package", "-p", "srt-proto", "--locked", "--allow-dirty"],
     env: &[],
     tool: None,
     cwd: None,
@@ -184,7 +178,7 @@ const ASAN_PROTOCOL: Step = Step {
         "+nightly",
         "test",
         "-p",
-        "shiguredo_srt",
+        "srt-proto",
         "--all-targets",
         "--target",
         "x86_64-unknown-linux-gnu",
@@ -265,7 +259,7 @@ fn main() -> ExitCode {
             eprintln!("  typos          spellcheck (needs typos-cli)");
             eprintln!("  test           workspace tests");
             eprintln!("  deny           advisory and license audit (needs cargo-deny)");
-            eprintln!("  package        dry-run package of shiguredo_srt");
+            eprintln!("  package        dry-run package of srt-proto");
             eprintln!("  fuzz-build     compile fuzz targets (needs cargo-fuzz + nightly)");
             eprintln!("  geiger         unsafe surface inventory (needs cargo-geiger)");
             eprintln!("  reportcard     complexity and maintainability ratchet");
@@ -453,7 +447,7 @@ fn generate_and_merge_pgo(pgo_dir: &str, merged_profdata: &str) -> bool {
             "test",
             "--release",
             "-p",
-            "shiguredo_srt",
+            "srt-proto",
             "-p",
             "srt-transport",
             "--",
@@ -498,12 +492,7 @@ fn run_pgo_bench(pgo_target: &str, merged_profdata: &str, args: &[String]) -> Ex
     let mut cmd = Command::new("cargo");
     cmd.arg("bench");
     if bench_args.is_empty() {
-        cmd.args([
-            "-p",
-            "shiguredo_srt",
-            "--bench",
-            "receiver_window_validation",
-        ]);
+        cmd.args(["-p", "srt-proto", "--bench", "receiver_window_validation"]);
     } else {
         cmd.args(&bench_args);
     }
@@ -577,7 +566,7 @@ mod tests {
             "--reuse-profile".to_string(),
             "--bench".to_string(),
             "-p".to_string(),
-            "shiguredo_srt".to_string(),
+            "srt-proto".to_string(),
             "--bench".to_string(),
             "receiver_window_validation".to_string(),
         ];
@@ -586,7 +575,7 @@ mod tests {
             parsed,
             vec![
                 "-p".to_string(),
-                "shiguredo_srt".to_string(),
+                "srt-proto".to_string(),
                 "--bench".to_string(),
                 "receiver_window_validation".to_string(),
             ]

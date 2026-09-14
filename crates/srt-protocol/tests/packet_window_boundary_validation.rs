@@ -4,9 +4,9 @@
 //! window boundaries, unaligned initial sequence numbers, 31-bit sequence wrap,
 //! page-aligned ACK retirement, and NAK intersection across page boundaries.
 
-use shiguredo_srt::Timestamp;
-use shiguredo_srt::receiver::LossRange;
-use shiguredo_srt::sender::SenderBuffer;
+use srt_proto::Timestamp;
+use srt_proto::receiver::LossRange;
+use srt_proto::sender::SenderBuffer;
 
 const PAYLOAD: &[u8] = &[42u8; 1316];
 

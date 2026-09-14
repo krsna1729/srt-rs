@@ -30,7 +30,7 @@
 //! fix and identical reasoning as mio's `run_pool_acceptor`.
 
 use crate::{Aggregate, BenchConfig, BondMode, ConnStats};
-use shiguredo_srt::{ConnectionEvent, ConnectionOptions, SrtConnection};
+use srt_proto::{ConnectionEvent, ConnectionOptions, SrtConnection};
 use srt_transport::advanced::driver::RecvBudget;
 use srt_transport::advanced::handoff::{Handoff, WorkerMessage};
 use srt_transport::advanced::native_io::RecvBatch;
@@ -83,7 +83,7 @@ fn drain_recv(
     }
 }
 
-async fn drain_outputs(driver: &mut Conn, now: shiguredo_srt::Timestamp) {
+async fn drain_outputs(driver: &mut Conn, now: srt_proto::Timestamp) {
     super::report_drain_error("tokio", driver.drain_outputs(now).await);
 }
 
@@ -285,7 +285,7 @@ fn handle_sender_events(
 async fn send_paced_payload(
     driver: &mut Conn,
     payload: &[u8],
-    now: shiguredo_srt::Timestamp,
+    now: srt_proto::Timestamp,
     stats: &mut ConnStats,
     source: &mut crate::source::SourceClock,
 ) {

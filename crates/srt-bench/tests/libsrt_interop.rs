@@ -6,9 +6,9 @@
 //! `cargo test` runs on a machine without libsrt installed still pass. CI
 //! installs `srt-tools` explicitly before running this suite.
 
-use shiguredo_srt::crypto::{CipherMode, KeyLength};
-use shiguredo_srt::{ConnectionOptions, SrtConnection, Timestamp};
 use srt_bench::driver;
+use srt_proto::crypto::{CipherMode, KeyLength};
+use srt_proto::{ConnectionOptions, SrtConnection, Timestamp};
 use srt_transport::advanced::admission::{
     AdmissionOptions, AdmissionResolution, PeerTable, RejectionReason,
 };
@@ -564,8 +564,8 @@ fn receive_live_with_stream_id_policy(
         table.poll_events(&mut events);
         for event in events.drain(..) {
             match event.event {
-                shiguredo_srt::ConnectionEvent::Connected => connected = true,
-                shiguredo_srt::ConnectionEvent::DataReceived { payload, .. } => {
+                srt_proto::ConnectionEvent::Connected => connected = true,
+                srt_proto::ConnectionEvent::DataReceived { payload, .. } => {
                     received.extend(payload);
                 }
                 _ => {}
@@ -1253,16 +1253,13 @@ fn rust_live_caller_refreshes_key_with_libsrt_listener() {
         Duration::from_secs(20),
         |conn, now| {
             conn.seed_encrypted_packet_count_for_test(
-                shiguredo_srt::crypto::CryptoContext::KM_REFRESH_PERIOD - PACKETS_TO_SWITCH as u64,
+                srt_proto::crypto::CryptoContext::KM_REFRESH_PERIOD - PACKETS_TO_SWITCH as u64,
             )
             .expect("seed encrypted packet count for accelerated key refresh");
             for chunk in payload.chunks(1) {
                 conn.send(chunk, now).expect("send encrypted test payload");
                 while let Some(event) = conn.poll_event() {
-                    if matches!(
-                        event,
-                        shiguredo_srt::ConnectionEvent::KeyRefreshNeeded { .. }
-                    ) {
+                    if matches!(event, srt_proto::ConnectionEvent::KeyRefreshNeeded { .. }) {
                         refresh_requested = true;
                         conn.provide_new_sek(&[0x5a; 16], now)
                             .expect("preannounce replacement SEK");
@@ -1592,7 +1589,7 @@ fn libsrt_broadcast_group_interoperates_with_rust_listener() {
         }
         table.poll_events(&mut events);
         for event in events.drain(..) {
-            if let shiguredo_srt::ConnectionEvent::DataReceived { payload, .. } = event.event {
+            if let srt_proto::ConnectionEvent::DataReceived { payload, .. } = event.event {
                 received.extend(payload);
             }
         }
@@ -1646,7 +1643,7 @@ fn rust_broadcast_group_interoperates_with_libsrt_listener() {
         .build()
         .expect("build bonded caller config");
     let mut group = GroupConn::caller(
-        GroupConfig::new(0x1234, shiguredo_srt::handshake::GroupType::Broadcast),
+        GroupConfig::new(0x1234, srt_proto::handshake::GroupType::Broadcast),
         [
             GroupCallerLeg::new(1, 10, caller.clone()),
             GroupCallerLeg::new(2, 20, caller),

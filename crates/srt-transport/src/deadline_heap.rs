@@ -1,6 +1,6 @@
 //! Min-heap of absolute worker-schedule deadlines.
 //!
-//! [`crate::DueIndex`] indexes protocol [`shiguredo_srt::Timestamp`] values
+//! [`crate::DueIndex`] indexes protocol [`srt_proto::Timestamp`] values
 //! (microseconds). This heap stores [`crate::MonotonicDeadline`] nanoseconds
 //! so a worker can arm `epoll_pwait2` / absolute `timerfd` without rounding
 //! the next wake to a whole microsecond or scanning every connection.

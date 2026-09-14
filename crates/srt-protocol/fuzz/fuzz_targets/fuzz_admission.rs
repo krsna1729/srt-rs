@@ -4,8 +4,8 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use libfuzzer_sys::fuzz_target;
-use shiguredo_srt::{ConnectionOptions, ConnectionOutput, SrtConnection, Timestamp};
-use shiguredo_srt::handshake::{GroupExtensionData, GroupType, SRTGROUP_MASK};
+use srt_proto::{ConnectionOptions, ConnectionOutput, SrtConnection, Timestamp};
+use srt_proto::handshake::{GroupExtensionData, GroupType, SRTGROUP_MASK};
 use srt_transport::advanced::admission::{
     AdmissionOptions, AdmissionResolution, BondedInputPolicy, PeerTable, PeerTableConfig,
     RejectionReason,

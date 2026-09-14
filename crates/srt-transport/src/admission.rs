@@ -4,7 +4,7 @@ use crate::{
     OutputDrainBudget, OutputDrainReport, OutputDrainStatus, PeerSlotId, WorkerMessage,
     group_connection_stats,
 };
-use shiguredo_srt::{
+use srt_proto::{
     Bytes, ConnectionEvent, ConnectionOptions, ConnectionOutput, DisconnectReason, SrtConnection,
     Timestamp,
 };
@@ -82,8 +82,8 @@ impl AdmissionPeer {
     /// a production caller using only `poll_events` used to see none of
     /// this bookkeeping update at all, unlike a bonded group (whose
     /// `poll_events` loop already updates `connected`/`torn_down` directly).
-    pub fn apply_event(&mut self, event: &shiguredo_srt::ConnectionEvent) -> bool {
-        use shiguredo_srt::ConnectionEvent;
+    pub fn apply_event(&mut self, event: &srt_proto::ConnectionEvent) -> bool {
+        use srt_proto::ConnectionEvent;
         match event {
             ConnectionEvent::Connected => {
                 let first_connect = !self.ever_connected;
@@ -148,11 +148,9 @@ impl AdmissionOptions {
             bonded_inputs: BondedInputPolicy::Reject,
             connection_template: None,
             handshake_retry_interval: Duration::from_micros(
-                shiguredo_srt::DEFAULT_HANDSHAKE_RETRY_INTERVAL_MICROS,
+                srt_proto::DEFAULT_HANDSHAKE_RETRY_INTERVAL_MICROS,
             ),
-            handshake_timeout: Duration::from_micros(
-                shiguredo_srt::DEFAULT_HANDSHAKE_TIMEOUT_MICROS,
-            ),
+            handshake_timeout: Duration::from_micros(srt_proto::DEFAULT_HANDSHAKE_TIMEOUT_MICROS),
         }
     }
 }
@@ -256,8 +254,8 @@ impl RejectionReason {
 pub struct AdmissionRequest {
     pub peer: std::net::SocketAddr,
     pub claimed_identity: srt_lifecycle::HandshakeIdentity,
-    pub handshake: shiguredo_srt::handshake::HandshakePacket,
-    pub access_control: Option<shiguredo_srt::stream_id::AccessControl>,
+    pub handshake: srt_proto::handshake::HandshakePacket,
+    pub access_control: Option<srt_proto::stream_id::AccessControl>,
 }
 
 /// Result of resolving policy for one valid CONCLUSION.
@@ -282,13 +280,13 @@ enum AdmissionHookResult {
 }
 
 struct DecodedAdmissionDatagram {
-    handshake: Option<shiguredo_srt::handshake::HandshakePacket>,
+    handshake: Option<srt_proto::handshake::HandshakePacket>,
     destination_socket_id: u32,
 }
 
 struct AdmissionFeedResult {
     fed: bool,
-    feed_error_kind: Option<shiguredo_srt::ErrorKind>,
+    feed_error_kind: Option<srt_proto::ErrorKind>,
     inserted: bool,
     became_established: bool,
     became_terminal: bool,
@@ -297,7 +295,7 @@ struct AdmissionFeedResult {
 struct KnownConclusionContext<'a> {
     peer: std::net::SocketAddr,
     physical: Option<PhysicalPeerKey>,
-    handshake: Option<&'a shiguredo_srt::handshake::HandshakePacket>,
+    handshake: Option<&'a srt_proto::handshake::HandshakePacket>,
     identity: Option<&'a srt_lifecycle::HandshakeIdentity>,
     now: Timestamp,
     options: &'a AdmissionOptions,
@@ -322,10 +320,10 @@ fn decode_admission_datagram(data: &[u8]) -> Result<DecodedAdmissionDatagram, ()
     // guard each datagram is decoded twice and the first payload allocation
     // is discarded on the next line.
     let handshake = is_control_datagram(data)
-        .then(|| shiguredo_srt::handshake::peek_handshake(data))
+        .then(|| srt_proto::handshake::peek_handshake(data))
         .flatten();
     let destination_socket_id =
-        shiguredo_srt::wire::peek_destination_socket_id(data).map_err(|_| ())?;
+        srt_proto::wire::peek_destination_socket_id(data).map_err(|_| ())?;
     Ok(DecodedAdmissionDatagram {
         handshake,
         destination_socket_id,
@@ -433,7 +431,7 @@ pub struct PhysicalPeerKey {
 /// Snapshot of a direct or bonded logical peer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LogicalPeerStats {
-    Direct(Box<shiguredo_srt::ConnectionStats>),
+    Direct(Box<srt_proto::ConnectionStats>),
     Group(Box<GroupConnectionStats>),
 }
 
@@ -597,12 +595,12 @@ impl LogicalPeerMut<'_> {
 
     /// Send one logical payload. Broadcast returns one successful physical
     /// leg per healthy active member; Backup returns one selected leg.
-    pub fn send(&mut self, payload: &[u8], now: Timestamp) -> Result<usize, shiguredo_srt::Error> {
+    pub fn send(&mut self, payload: &[u8], now: Timestamp) -> Result<usize, srt_proto::Error> {
         match self.table.logical_peers.get(&self.id).cloned() {
             Some(LogicalPeerTarget::Direct(peer)) => {
                 let entry = self.table.get_peer_mut(&peer).ok_or_else(|| {
-                    shiguredo_srt::Error::with_reason(
-                        shiguredo_srt::ErrorKind::InvalidState,
+                    srt_proto::Error::with_reason(
+                        srt_proto::ErrorKind::InvalidState,
                         "logical peer no longer exists",
                     )
                 })?;
@@ -612,8 +610,8 @@ impl LogicalPeerMut<'_> {
             }
             Some(LogicalPeerTarget::Group(key)) => {
                 let group = self.table.groups.get_mut(&key).ok_or_else(|| {
-                    shiguredo_srt::Error::with_reason(
-                        shiguredo_srt::ErrorKind::InvalidState,
+                    srt_proto::Error::with_reason(
+                        srt_proto::ErrorKind::InvalidState,
                         "logical peer no longer exists",
                     )
                 })?;
@@ -631,8 +629,8 @@ impl LogicalPeerMut<'_> {
                 self.table.mark_group_all_ready(&key);
                 Ok(legs)
             }
-            None => Err(shiguredo_srt::Error::with_reason(
-                shiguredo_srt::ErrorKind::InvalidState,
+            None => Err(srt_proto::Error::with_reason(
+                srt_proto::ErrorKind::InvalidState,
                 "logical peer no longer exists",
             )),
         }
@@ -644,13 +642,13 @@ impl LogicalPeerMut<'_> {
         &mut self,
         payload: Bytes,
         now: Timestamp,
-    ) -> Result<usize, shiguredo_srt::Error> {
+    ) -> Result<usize, srt_proto::Error> {
         let len = payload.len() as u64;
         match self.table.logical_peers.get(&self.id).cloned() {
             Some(LogicalPeerTarget::Direct(peer)) => {
                 let entry = self.table.get_peer_mut(&peer).ok_or_else(|| {
-                    shiguredo_srt::Error::with_reason(
-                        shiguredo_srt::ErrorKind::InvalidState,
+                    srt_proto::Error::with_reason(
+                        srt_proto::ErrorKind::InvalidState,
                         "logical peer no longer exists",
                     )
                 })?;
@@ -660,8 +658,8 @@ impl LogicalPeerMut<'_> {
             }
             Some(LogicalPeerTarget::Group(key)) => {
                 let group = self.table.groups.get_mut(&key).ok_or_else(|| {
-                    shiguredo_srt::Error::with_reason(
-                        shiguredo_srt::ErrorKind::InvalidState,
+                    srt_proto::Error::with_reason(
+                        srt_proto::ErrorKind::InvalidState,
                         "logical peer no longer exists",
                     )
                 })?;
@@ -673,8 +671,8 @@ impl LogicalPeerMut<'_> {
                 self.table.mark_group_all_ready(&key);
                 Ok(legs)
             }
-            None => Err(shiguredo_srt::Error::with_reason(
-                shiguredo_srt::ErrorKind::InvalidState,
+            None => Err(srt_proto::Error::with_reason(
+                srt_proto::ErrorKind::InvalidState,
                 "logical peer no longer exists",
             )),
         }
@@ -716,7 +714,7 @@ impl LogicalPeerMut<'_> {
         &mut self,
         new_sek: &[u8],
         now: Timestamp,
-    ) -> Result<(), shiguredo_srt::Error> {
+    ) -> Result<(), srt_proto::Error> {
         match self.table.logical_peers.get(&self.id).cloned() {
             Some(LogicalPeerTarget::Direct(peer)) => {
                 let result = self
@@ -738,9 +736,9 @@ impl LogicalPeerMut<'_> {
     }
 }
 
-fn no_such_logical_peer() -> shiguredo_srt::Error {
-    shiguredo_srt::Error::with_reason(
-        shiguredo_srt::ErrorKind::InvalidState,
+fn no_such_logical_peer() -> srt_proto::Error {
+    srt_proto::Error::with_reason(
+        srt_proto::ErrorKind::InvalidState,
         "logical peer no longer exists",
     )
 }
@@ -781,7 +779,7 @@ struct GroupDeadlineKey {
 }
 
 struct InboundGroup {
-    group: shiguredo_srt::SrtGroup,
+    group: srt_proto::SrtGroup,
     legs: HashMap<u32, InboundGroupLeg>,
     leg_order: Vec<u32>,
     ready_legs: VecDeque<u32>,
@@ -1045,7 +1043,7 @@ impl PeerTable {
         key: &srt_lifecycle::LogicalGroupKey,
         new_sek: &[u8],
         now: Timestamp,
-    ) -> Result<(), shiguredo_srt::Error> {
+    ) -> Result<(), srt_proto::Error> {
         let member_ids = self
             .groups
             .get(key)
@@ -1056,8 +1054,8 @@ impl PeerTable {
         };
         for member_id in member_ids {
             let Some(member) = group.group.member_mut(member_id) else {
-                return Err(shiguredo_srt::Error::with_reason(
-                    shiguredo_srt::ErrorKind::InvalidState,
+                return Err(srt_proto::Error::with_reason(
+                    srt_proto::ErrorKind::InvalidState,
                     "logical peer group leg no longer exists",
                 ));
             };
@@ -1109,7 +1107,7 @@ impl PeerTable {
             .get_peer(&peer)
             .filter(|entry| {
                 entry.admission_established
-                    && entry.conn.state() == shiguredo_srt::ConnectionState::Connected
+                    && entry.conn.state() == srt_proto::ConnectionState::Connected
             })
             .map(|entry| entry.last_datagram_at);
         match last_datagram {
@@ -1207,14 +1205,14 @@ impl PeerTable {
     fn reject_new_peer(
         &self,
         peer: std::net::SocketAddr,
-        handshake: Option<&shiguredo_srt::handshake::HandshakePacket>,
+        handshake: Option<&srt_proto::handshake::HandshakePacket>,
         telemetry: &IngressTelemetry,
     ) -> Option<Admit> {
         let Some(packet) = handshake else {
             telemetry.record_invalid_datagram();
             return Some(Admit::Dropped(AdmissionDropReason::InvalidPacket));
         };
-        if packet.handshake_type != shiguredo_srt::handshake::HandshakeType::Induction {
+        if packet.handshake_type != srt_proto::handshake::HandshakeType::Induction {
             telemetry.record_invalid_datagram();
             return Some(Admit::Dropped(AdmissionDropReason::InvalidPacket));
         }
@@ -1297,18 +1295,17 @@ impl PeerTable {
     fn group_admission_allowed(
         &self,
         identity: &srt_lifecycle::HandshakeIdentity,
-        handshake: &shiguredo_srt::handshake::HandshakePacket,
+        handshake: &srt_proto::handshake::HandshakePacket,
         options: &AdmissionOptions,
     ) -> bool {
         let Some(group) = identity.group.as_ref() else {
             return true;
         };
-        let Some(mode) = shiguredo_srt::GroupMode::from_group_type(group.extension.group_type)
-        else {
+        let Some(mode) = srt_proto::GroupMode::from_group_type(group.extension.group_type) else {
             return false;
         };
         if options.bonded_inputs != BondedInputPolicy::Accept
-            || group.group_id & shiguredo_srt::handshake::SRTGROUP_MASK == 0
+            || group.group_id & srt_proto::handshake::SRTGROUP_MASK == 0
         {
             return false;
         }
@@ -1423,7 +1420,7 @@ impl PeerTable {
                 access_control: identity
                     .stream_id
                     .as_deref()
-                    .and_then(shiguredo_srt::stream_id::AccessControl::parse),
+                    .and_then(srt_proto::stream_id::AccessControl::parse),
             };
             telemetry.record_policy_request();
             if !group_admission_allowed {
@@ -1537,14 +1534,14 @@ impl PeerTable {
         }
         let became_established = fed
             && !entry.admission_established
-            && entry.conn.state() == shiguredo_srt::ConnectionState::Connected;
+            && entry.conn.state() == srt_proto::ConnectionState::Connected;
         if became_established {
             entry.admission_established = true;
             self.half_open_by_caller
                 .remove(&(peer, entry.conn.peer_socket_id()));
         }
         let became_terminal =
-            !fed && entry.conn.state() == shiguredo_srt::ConnectionState::Disconnected;
+            !fed && entry.conn.state() == srt_proto::ConnectionState::Disconnected;
         if became_terminal {
             entry.rejected = true;
         }
@@ -1569,10 +1566,7 @@ impl PeerTable {
         if conclusion.is_some()
             && matches!(
                 feed.feed_error_kind,
-                Some(
-                    shiguredo_srt::ErrorKind::CryptoError
-                        | shiguredo_srt::ErrorKind::HandshakeRejected
-                )
+                Some(srt_proto::ErrorKind::CryptoError | srt_proto::ErrorKind::HandshakeRejected)
             )
         {
             telemetry.record_credential_failure();
@@ -1617,7 +1611,7 @@ impl PeerTable {
         let Some(extension) = entry.conn.peer_group_extension() else {
             return;
         };
-        let Some(mode) = shiguredo_srt::GroupMode::from_group_type(extension.group_type) else {
+        let Some(mode) = srt_proto::GroupMode::from_group_type(extension.group_type) else {
             return;
         };
         let affinity = srt_lifecycle::GroupAffinity {
@@ -1632,7 +1626,7 @@ impl PeerTable {
 
         if !self.groups.contains_key(&key) {
             let generation = self.allocate_group_generation();
-            let group = shiguredo_srt::SrtGroup::new(extension.group_id, mode)
+            let group = srt_proto::SrtGroup::new(extension.group_id, mode)
                 .expect("GROUP handshakes are validated before connection admission");
             self.groups.insert(
                 key.clone(),
@@ -1869,7 +1863,7 @@ impl PeerTable {
             self.mark_ready_physical(physical);
             return Some(Admit::Fed);
         }
-        if entry.conn.state() == shiguredo_srt::ConnectionState::Disconnected {
+        if entry.conn.state() == srt_proto::ConnectionState::Disconnected {
             entry.rejected = true;
             self.mark_ready_physical(physical);
         }
@@ -1965,7 +1959,7 @@ impl PeerTable {
             handshake
                 .as_ref()
                 .filter(|packet| {
-                    packet.handshake_type == shiguredo_srt::handshake::HandshakeType::Induction
+                    packet.handshake_type == srt_proto::handshake::HandshakeType::Induction
                 })
                 .map(|packet| packet.socket_id),
         );
@@ -2111,7 +2105,7 @@ impl PeerTable {
         for physical in due {
             let stale = self.get_peer(&physical).is_some_and(|entry| {
                 entry.admission_established
-                    && entry.conn.state() == shiguredo_srt::ConnectionState::Connected
+                    && entry.conn.state() == srt_proto::ConnectionState::Connected
                     && now.saturating_sub(entry.last_datagram_at)
                         >= duration_micros_saturating(idle_timeout)
             });
@@ -2887,7 +2881,7 @@ impl PeerTable {
         peer: std::net::SocketAddr,
         data: &[u8],
     ) -> Option<&mut AdmissionPeer> {
-        let destination_socket_id = shiguredo_srt::wire::peek_destination_socket_id(data).ok()?;
+        let destination_socket_id = srt_proto::wire::peek_destination_socket_id(data).ok()?;
         let physical = self.physical_for_datagram(peer, destination_socket_id, None)?;
         self.get_peer_mut(&physical)
     }
@@ -3048,7 +3042,7 @@ impl PeerTable {
     fn reconcile_established(&mut self, peer: PhysicalPeerKey) {
         let became_established = self.get_peer_mut(&peer).is_some_and(|entry| {
             if !entry.admission_established
-                && entry.conn.state() == shiguredo_srt::ConnectionState::Connected
+                && entry.conn.state() == srt_proto::ConnectionState::Connected
             {
                 entry.admission_established = true;
                 true
@@ -3109,14 +3103,14 @@ impl PeerTable {
             .slots
             .iter()
             .filter_map(|slot| slot.value.direct())
-            .filter(|entry| entry.conn.state() == shiguredo_srt::ConnectionState::Connected)
+            .filter(|entry| entry.conn.state() == srt_proto::ConnectionState::Connected)
             .count();
         let groups = self
             .groups
             .values()
             .filter(|group| {
                 group.group.members().iter().any(|member| {
-                    member.connection().state() == shiguredo_srt::ConnectionState::Connected
+                    member.connection().state() == srt_proto::ConnectionState::Connected
                 })
             })
             .count();
@@ -3189,11 +3183,11 @@ fn duration_micros_saturating(timeout: Duration) -> u64 {
 /// to keep it a plain "pop, apply, repeat" dispatcher.
 fn apply_group_event(
     group: &mut InboundGroup,
-    event: shiguredo_srt::GroupEvent,
+    event: srt_proto::GroupEvent,
     out: &mut Vec<AdmissionEvent>,
 ) {
     match event {
-        shiguredo_srt::GroupEvent::MemberConnected { .. } => {
+        srt_proto::GroupEvent::MemberConnected { .. } => {
             if !group.connected {
                 group.connected = true;
                 group.ever_connected = true;
@@ -3204,7 +3198,7 @@ fn apply_group_event(
                 });
             }
         }
-        shiguredo_srt::GroupEvent::DataReceived(packet) => {
+        srt_proto::GroupEvent::DataReceived(packet) => {
             group.logical_payloads_received = group.logical_payloads_received.saturating_add(1);
             group.data_events = group.data_events.saturating_add(1);
             group.last_data_at = Instant::now();
@@ -3224,11 +3218,11 @@ fn apply_group_event(
                 },
             });
         }
-        shiguredo_srt::GroupEvent::MemberError { error, .. }
-        | shiguredo_srt::GroupEvent::MemberDisconnected { reason: error, .. }
+        srt_proto::GroupEvent::MemberError { error, .. }
+        | srt_proto::GroupEvent::MemberDisconnected { reason: error, .. }
             if group.connected
                 && !group.group.members().iter().any(|member| {
-                    member.connection().state() == shiguredo_srt::ConnectionState::Connected
+                    member.connection().state() == srt_proto::ConnectionState::Connected
                 }) =>
         {
             group.connected = false;
@@ -3240,8 +3234,8 @@ fn apply_group_event(
                 event: ConnectionEvent::Disconnected { reason },
             });
         }
-        shiguredo_srt::GroupEvent::MemberError { .. }
-        | shiguredo_srt::GroupEvent::MemberDisconnected { .. } => {}
+        srt_proto::GroupEvent::MemberError { .. }
+        | srt_proto::GroupEvent::MemberDisconnected { .. } => {}
     }
 }
 
@@ -3263,8 +3257,8 @@ mod tests {
     use proptest::prelude::*;
 
     fn induction_packet(socket_id: u32) -> Vec<u8> {
-        let packet = shiguredo_srt::handshake::HandshakePacket::new_induction_request(socket_id)
-            .encode(0, 0);
+        let packet =
+            srt_proto::handshake::HandshakePacket::new_induction_request(socket_id).encode(0, 0);
         let mut bytes = Vec::new();
         packet
             .encode(&mut bytes)
@@ -3734,9 +3728,9 @@ mod tests {
     /// produce, so `next_deadline()` is under test through its normal
     /// entry point rather than a private-field poke.
     fn arm_group_leg_deadline(table: &mut PeerTable, now: Timestamp, micros_from_now: u64) {
-        let group = shiguredo_srt::SrtGroup::new(
-            shiguredo_srt::handshake::SRTGROUP_MASK | 1,
-            shiguredo_srt::GroupMode::Broadcast,
+        let group = srt_proto::SrtGroup::new(
+            srt_proto::handshake::SRTGROUP_MASK | 1,
+            srt_proto::GroupMode::Broadcast,
         )
         .expect("valid group");
         let key = srt_lifecycle::LogicalGroupKey {
@@ -3754,7 +3748,7 @@ mod tests {
         };
         leg.timers.apply_output(
             &ConnectionOutput::SetTimer {
-                id: shiguredo_srt::TimerId::Ack,
+                id: srt_proto::TimerId::Ack,
                 duration_micros: micros_from_now,
             },
             now,
@@ -4207,7 +4201,7 @@ mod tests {
                 .any(|event| event.representative_peer == quiet_peer
                     && matches!(
                         event.event,
-                        ConnectionEvent::StateChanged(shiguredo_srt::ConnectionState::Closing)
+                        ConnectionEvent::StateChanged(srt_proto::ConnectionState::Closing)
                     )),
             "the quiet peer must observe its close starting from prune_idle, got {events:?}"
         );
@@ -4334,7 +4328,7 @@ mod tests {
                 .expect("quiet peer entry still present")
                 .conn
                 .state(),
-            shiguredo_srt::ConnectionState::Closing,
+            srt_proto::ConnectionState::Closing,
             "the quiet peer specifically must be the one closed, not whichever peer \
              happens to occupy the first slot at the shared address"
         );
@@ -4344,7 +4338,7 @@ mod tests {
                 .expect("active peer entry still present")
                 .conn
                 .state(),
-            shiguredo_srt::ConnectionState::Connected,
+            srt_proto::ConnectionState::Connected,
             "the active peer must remain untouched"
         );
     }

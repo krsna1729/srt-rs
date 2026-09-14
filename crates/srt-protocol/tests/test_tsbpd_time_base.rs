@@ -1,7 +1,7 @@
 //! Regression tests for the caller-side TSBPD time base (spec §4.5.1.1).
 
-use shiguredo_srt::wire::SrtPacket;
-use shiguredo_srt::{ConnectionOptions, ConnectionOutput, SrtConnection, Timestamp};
+use srt_proto::wire::SrtPacket;
+use srt_proto::{ConnectionOptions, ConnectionOutput, SrtConnection, Timestamp};
 
 fn ts(micros: u64) -> Timestamp {
     Timestamp::from_micros(micros)
@@ -53,7 +53,7 @@ fn listener_conclusion_response_carries_session_timestamp() {
         SrtPacket::Control(control) => {
             assert_eq!(
                 control.control_type,
-                shiguredo_srt::wire::ControlType::Handshake
+                srt_proto::wire::ControlType::Handshake
             );
             assert_eq!(
                 control.timestamp,

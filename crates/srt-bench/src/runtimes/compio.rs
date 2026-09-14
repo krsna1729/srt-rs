@@ -71,8 +71,8 @@
 
 use crate::{Aggregate, BenchConfig, BondMode, ConnStats};
 use compio::buf::BufResult;
-use shiguredo_srt::handshake::GroupExtensionData;
-use shiguredo_srt::{ConnectionEvent, ConnectionOptions, SrtConnection};
+use srt_proto::handshake::GroupExtensionData;
+use srt_proto::{ConnectionEvent, ConnectionOptions, SrtConnection};
 use srt_transport::advanced::handoff::{Handoff, WorkerMessage};
 use srt_transport::compio_transport::Conn;
 use std::net::SocketAddr;
@@ -122,7 +122,7 @@ fn enqueue_addressed(
     }
 }
 
-async fn drain_outputs(driver: &mut Conn, now: shiguredo_srt::Timestamp) {
+async fn drain_outputs(driver: &mut Conn, now: srt_proto::Timestamp) {
     super::report_drain_error("compio", driver.drain_outputs(now).await);
 }
 
@@ -323,7 +323,7 @@ fn handle_sender_events(
 async fn send_paced_payload(
     driver: &mut Conn,
     payload: &[u8],
-    now: shiguredo_srt::Timestamp,
+    now: srt_proto::Timestamp,
     stats: &mut ConnStats,
     source: &mut crate::source::SourceClock,
 ) {
@@ -1011,7 +1011,7 @@ async fn drain_pending_outputs(
     listener: &compio::net::UdpSocket,
     destination: SocketAddr,
 ) -> bool {
-    use shiguredo_srt::ConnectionOutput;
+    use srt_proto::ConnectionOutput;
     let now = crate::now_ts(Instant::now());
     let mut refused = false;
     while let Some(out) = conn.poll_output() {

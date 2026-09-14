@@ -3,7 +3,7 @@ use crate::{
     prepend_outputs,
 };
 use compio::buf::BufResult;
-use shiguredo_srt::{Bytes, ConnectionOutput, SrtConnection, Timestamp};
+use srt_proto::{Bytes, ConnectionOutput, SrtConnection, Timestamp};
 use std::collections::VecDeque;
 use std::io;
 
@@ -293,7 +293,7 @@ mod tests {
             let sock = compio::net::UdpSocket::from_std(local).expect("compio adopts the socket");
 
             let mut conn = Conn::new(
-                SrtConnection::new_caller(shiguredo_srt::ConnectionOptions::default()),
+                SrtConnection::new_caller(srt_proto::ConnectionOptions::default()),
                 sock,
             );
             // Simulates the exact scenario a short/failed prior send
@@ -362,7 +362,7 @@ mod tests {
             let sock = compio::net::UdpSocket::from_std(local).expect("compio adopts the socket");
 
             let mut conn = Conn::new(
-                SrtConnection::new_caller(shiguredo_srt::ConnectionOptions::default()),
+                SrtConnection::new_caller(srt_proto::ConnectionOptions::default()),
                 sock,
             );
             conn.pending_outputs
@@ -370,7 +370,7 @@ mod tests {
             conn.pending_outputs
                 .push_back(ConnectionOutput::SendPacket(b"second".to_vec()));
             conn.pending_outputs.push_back(ConnectionOutput::SetTimer {
-                id: shiguredo_srt::TimerId::Ack,
+                id: srt_proto::TimerId::Ack,
                 duration_micros: 10_000,
             });
             let not_yet_submitted: Vec<_> = conn.pending_outputs.iter().skip(1).cloned().collect();

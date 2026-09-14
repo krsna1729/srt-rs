@@ -96,13 +96,13 @@ pub fn run(args: &[String]) -> ExitCode {
     let deps_dir = audit_dir.join("release/deps");
 
     // 2. Emit assembly under x86-64-v3 + codegen-units=1 for srt-protocol
-    eprintln!("Emitting x86-64-v3 assembly for shiguredo_srt in {audit_dir:?}...");
+    eprintln!("Emitting x86-64-v3 assembly for srt_proto in {audit_dir:?}...");
     let status_proto = Command::new("cargo")
         .args([
             "rustc",
             "--release",
             "-p",
-            "shiguredo_srt",
+            "srt-proto",
             "--lib",
             "--",
             "--emit=asm",
@@ -114,7 +114,7 @@ pub fn run(args: &[String]) -> ExitCode {
         .env("CARGO_TARGET_DIR", &audit_dir)
         .status();
     if !status_proto.is_ok_and(|s| s.success()) {
-        eprintln!("Failed generating assembly for shiguredo_srt");
+        eprintln!("Failed generating assembly for srt_proto");
         return ExitCode::FAILURE;
     }
 
@@ -142,7 +142,7 @@ pub fn run(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let proto_asm = find_single_asm_file(&deps_dir, "shiguredo_srt");
+    let proto_asm = find_single_asm_file(&deps_dir, "srt_proto");
     let trans_asm = find_single_asm_file(&deps_dir, "srt_transport");
 
     eprintln!("Auditing fresh artifacts: {proto_asm:?} and {trans_asm:?}");
@@ -157,7 +157,7 @@ pub fn run(args: &[String]) -> ExitCode {
     println!("=== Automated Machine Instruction Lowering Inventory (-C target-cpu=x86-64-v3) ===");
     println!(
         "{:<20} {:>15} {:>15}",
-        "Instruction", "shiguredo_srt", "srt-transport"
+        "Instruction", "srt_proto", "srt-transport"
     );
     println!("{:-<52}", "");
     println!(
@@ -273,7 +273,7 @@ pub fn run(args: &[String]) -> ExitCode {
             .args([
                 "bench",
                 "-p",
-                "shiguredo_srt",
+                "srt-proto",
                 "--bench",
                 "receiver_window_validation",
                 "--",
@@ -306,7 +306,7 @@ mod tests {
         // `cargo rustc -- --emit=asm` (.s) lines: tab-indented mnemonic, no
         // address prefix; directives start with '.'; labels have no tab.
         let sample =
-            "shiguredo_srt_page_index:\n\ttzcntq\t%rax, %rax\n.text\n\tdivq\t%rbx\nno-tab-line\n";
+            "srt_proto_page_index:\n\ttzcntq\t%rax, %rax\n.text\n\tdivq\t%rbx\nno-tab-line\n";
         let counts = scan_instructions(sample);
         assert_eq!(counts.tzcnt, 1);
         assert_eq!(counts.div, 1);

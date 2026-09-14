@@ -1,5 +1,5 @@
-use shiguredo_srt::wire::{ControlPacket, ControlType, SrtPacket};
-use shiguredo_srt::{
+use srt_proto::wire::{ControlPacket, ControlType, SrtPacket};
+use srt_proto::{
     ConnectionOptions, ConnectionOutput, ConnectionState, GroupMemberState, GroupMode,
     SrtConnection, SrtGroup, TimerId, Timestamp,
 };
@@ -11,7 +11,7 @@ fn ts(micros: u64) -> Timestamp {
 #[test]
 fn group_member_limit_is_enforced() {
     let mut group = SrtGroup::new(0x4000_0100, GroupMode::Broadcast).unwrap();
-    for member_id in 0..shiguredo_srt::MAX_GROUP_MEMBERS as u32 {
+    for member_id in 0..srt_proto::MAX_GROUP_MEMBERS as u32 {
         group
             .add_member(
                 member_id,
@@ -21,12 +21,12 @@ fn group_member_limit_is_enforced() {
             .unwrap();
     }
     let result = group.add_member(
-        shiguredo_srt::MAX_GROUP_MEMBERS as u32,
+        srt_proto::MAX_GROUP_MEMBERS as u32,
         1,
         SrtConnection::new_caller(ConnectionOptions::default()),
     );
     assert!(result.is_err());
-    assert_eq!(group.members().len(), shiguredo_srt::MAX_GROUP_MEMBERS);
+    assert_eq!(group.members().len(), srt_proto::MAX_GROUP_MEMBERS);
 }
 
 fn transfer(caller: &mut SrtConnection, listener: &mut SrtConnection, now: Timestamp) {

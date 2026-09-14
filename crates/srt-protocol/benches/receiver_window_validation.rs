@@ -7,9 +7,9 @@ use std::hint::black_box;
 
 use bytes::Bytes;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use shiguredo_srt::Timestamp;
-use shiguredo_srt::receiver::ReceiverBuffer;
-use shiguredo_srt::wire::DataPacket;
+use srt_proto::Timestamp;
+use srt_proto::receiver::ReceiverBuffer;
+use srt_proto::wire::DataPacket;
 
 const PAYLOAD: &[u8] = &[7u8; 1316];
 

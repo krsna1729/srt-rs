@@ -5,7 +5,7 @@
 //! enough to prove wire-level interop against real libsrt.
 
 use bytes::Bytes;
-use shiguredo_srt::{ConnectionEvent, ConnectionOutput, SrtConnection, TimerId, Timestamp};
+use srt_proto::{ConnectionEvent, ConnectionOutput, SrtConnection, TimerId, Timestamp};
 use std::collections::HashMap;
 use std::net::UdpSocket;
 use std::time::Instant;

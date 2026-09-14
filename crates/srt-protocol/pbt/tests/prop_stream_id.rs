@@ -1,7 +1,7 @@
 //! Property-based tests for SRT Stream ID
 
 use proptest::prelude::*;
-use shiguredo_srt::stream_id::{AccessControl, AccessControlBuilder, StreamMode, StreamType};
+use srt_proto::stream_id::{AccessControl, AccessControlBuilder, StreamMode, StreamType};
 
 /// StreamType の任意生成
 fn arb_stream_type() -> impl Strategy<Value = StreamType> {

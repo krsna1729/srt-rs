@@ -19,7 +19,7 @@
 //! hiding in the amortized larger-batch numbers.
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use shiguredo_srt::{
+use srt_proto::{
     ConnectionEvent, ConnectionOptions, ConnectionOutput, ConnectionState, SrtConnection, TimerId,
     Timestamp,
 };

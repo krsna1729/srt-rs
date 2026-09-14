@@ -18,7 +18,7 @@ use crate::{
     LogicalCallerMut, MAX_CALLERS, OutputDrainBudget, OutputDrainReport, PreparedCaller,
     RemovedLogicalCaller,
 };
-use shiguredo_srt::Timestamp;
+use srt_proto::Timestamp;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::num::NonZeroUsize;
 use std::time::Duration;
@@ -224,7 +224,7 @@ impl CallerPool {
         peer: std::net::SocketAddr,
         data: &[u8],
         now: Timestamp,
-    ) -> Result<bool, shiguredo_srt::Error> {
+    ) -> Result<bool, srt_proto::Error> {
         self.callers.feed(peer, data, now)
     }
 
@@ -268,11 +268,11 @@ impl CallerPool {
         self.callers.logical_caller_mut(id)
     }
 
-    fn allocate_request_id(&mut self) -> Result<PoolRequestId, shiguredo_srt::Error> {
+    fn allocate_request_id(&mut self) -> Result<PoolRequestId, srt_proto::Error> {
         let id = PoolRequestId(self.next_request_id);
         self.next_request_id = self.next_request_id.checked_add(1).ok_or_else(|| {
-            shiguredo_srt::Error::with_reason(
-                shiguredo_srt::ErrorKind::InvalidState,
+            srt_proto::Error::with_reason(
+                srt_proto::ErrorKind::InvalidState,
                 "caller pool request ID space exhausted",
             )
         })?;
@@ -313,7 +313,7 @@ impl CallerPool {
         &mut self,
         prepared: PreparedCaller,
         now: Timestamp,
-    ) -> Result<PoolOutcome, shiguredo_srt::Error> {
+    ) -> Result<PoolOutcome, srt_proto::Error> {
         let request_id = self.allocate_request_id()?;
         if self.in_flight.len() < self.max_in_flight {
             let id = self.admit(request_id, prepared, now)?;
@@ -339,12 +339,9 @@ impl CallerPool {
         request_id: PoolRequestId,
         prepared: PreparedCaller,
         now: Timestamp,
-    ) -> Result<LogicalCallerId, shiguredo_srt::Error> {
+    ) -> Result<LogicalCallerId, srt_proto::Error> {
         let connection = prepared.connection(now).map_err(|error| {
-            shiguredo_srt::Error::with_reason(
-                shiguredo_srt::ErrorKind::InvalidState,
-                error.to_string(),
-            )
+            srt_proto::Error::with_reason(srt_proto::ErrorKind::InvalidState, error.to_string())
         })?;
         let leg = CallerLeg::new(prepared.remote, connection);
         let id = self.callers.add_direct(leg)?;
@@ -428,7 +425,7 @@ impl CallerPool {
         now: Timestamp,
         max_actions: usize,
     ) -> (Vec<LogicalCallerId>, usize) {
-        use shiguredo_srt::ConnectionState;
+        use srt_proto::ConnectionState;
         if max_actions == 0 {
             return (Vec::new(), 0);
         }

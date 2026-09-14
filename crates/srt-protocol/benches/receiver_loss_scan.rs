@@ -24,9 +24,9 @@
 //! calls it.
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
-use shiguredo_srt::Timestamp;
-use shiguredo_srt::receiver::ReceiverBuffer;
-use shiguredo_srt::wire::{DataPacket, PacketPosition};
+use srt_proto::Timestamp;
+use srt_proto::receiver::ReceiverBuffer;
+use srt_proto::wire::{DataPacket, PacketPosition};
 use std::hint::black_box;
 
 const TOTAL_PACKETS: u32 = 5000;

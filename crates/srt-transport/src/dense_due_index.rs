@@ -9,7 +9,7 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
-use shiguredo_srt::Timestamp;
+use srt_proto::Timestamp;
 
 use crate::dense_slot_arena::{DenseSlotArena, PeerSlotId};
 

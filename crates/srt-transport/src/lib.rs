@@ -61,7 +61,7 @@
 //! `SrtConnection::handle_timer`.
 //!
 
-use shiguredo_srt::{ConnectionOptions, Error as SrtError, SrtConnection};
+use srt_proto::{ConnectionOptions, Error as SrtError, SrtConnection};
 use std::time::Duration;
 
 // --- Private submodules ---
@@ -467,11 +467,9 @@ impl SrtStackConfig {
             bonded_inputs: BondedInputPolicy::Reject,
             connection_template: Some(self.connection.clone()),
             handshake_retry_interval: Duration::from_micros(
-                shiguredo_srt::DEFAULT_HANDSHAKE_RETRY_INTERVAL_MICROS,
+                srt_proto::DEFAULT_HANDSHAKE_RETRY_INTERVAL_MICROS,
             ),
-            handshake_timeout: Duration::from_micros(
-                shiguredo_srt::DEFAULT_HANDSHAKE_TIMEOUT_MICROS,
-            ),
+            handshake_timeout: Duration::from_micros(srt_proto::DEFAULT_HANDSHAKE_TIMEOUT_MICROS),
         }
     }
 

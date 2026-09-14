@@ -1,9 +1,9 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use shiguredo_srt::receiver::ReceiverBuffer;
-use shiguredo_srt::wire::{DataPacket, PacketPosition};
-use shiguredo_srt::Timestamp;
+use srt_proto::receiver::ReceiverBuffer;
+use srt_proto::wire::{DataPacket, PacketPosition};
+use srt_proto::Timestamp;
 
 const SEQUENCE_MASK: u32 = 0x7FFF_FFFF;
 // Keep individual fuzz executions cheap enough for sanitizer builds. Full

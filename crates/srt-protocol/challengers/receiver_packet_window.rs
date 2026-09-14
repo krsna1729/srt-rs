@@ -1,6 +1,6 @@
 //! Private receiver packet-window challenger shared by tests and benchmarks.
 //!
-//! This file is intentionally not part of the `shiguredo_srt` module tree.
+//! This file is intentionally not part of the `srt_proto` module tree.
 //! It can therefore gather evidence for a direct-indexed receiver without
 //! changing the published API or the production packet store.
 

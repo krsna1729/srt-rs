@@ -1,6 +1,6 @@
 //! Runtime-neutral lifecycle identity and routing policy.
 
-use shiguredo_srt::handshake::{GroupExtensionData, HandshakePacket, HandshakeType};
+use srt_proto::handshake::{GroupExtensionData, HandshakePacket, HandshakeType};
 
 /// Group metadata observed during handshake admission.
 #[derive(Debug, Clone, PartialEq, Eq)]

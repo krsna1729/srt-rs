@@ -23,7 +23,7 @@
 //! ## Example
 //!
 //! ```
-//! use shiguredo_srt::stream_id::{AccessControl, StreamMode, StreamType};
+//! use srt_proto::stream_id::{AccessControl, StreamMode, StreamType};
 //!
 //! let ac = AccessControl::parse("#!::u=admin,r=live/stream1").unwrap();
 //! assert_eq!(ac.user_name(), Some("admin"));

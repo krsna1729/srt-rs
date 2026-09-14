@@ -1,8 +1,8 @@
 //! Allocation regression coverage for receiver hot paths.
 
-use shiguredo_srt::receiver::ReceiverBuffer;
-use shiguredo_srt::wire::{DataPacket, PacketPosition, SrtPacket};
-use shiguredo_srt::{
+use srt_proto::receiver::ReceiverBuffer;
+use srt_proto::wire::{DataPacket, PacketPosition, SrtPacket};
+use srt_proto::{
     ConnectionOptions, ConnectionOutput, ConnectionState, SrtConnection, TimerId, Timestamp,
 };
 use std::alloc::{GlobalAlloc, Layout, System};

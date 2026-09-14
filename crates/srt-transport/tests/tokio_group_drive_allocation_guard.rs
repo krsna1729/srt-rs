@@ -8,8 +8,8 @@
 //! an inference from the generic implementation's test passing.
 #![cfg(feature = "tokio")]
 
-use shiguredo_srt::handshake::GroupType;
-use shiguredo_srt::{ConnectionOutput, SrtConnection, Timestamp};
+use srt_proto::handshake::GroupType;
+use srt_proto::{ConnectionOutput, SrtConnection, Timestamp};
 use srt_transport::advanced::driver::OutputDrainBudget;
 use srt_transport::advanced::group::{GroupCallerLeg, GroupDriveReport};
 use srt_transport::tokio_transport::GroupConn;
@@ -52,7 +52,7 @@ impl Peer {
         socket.set_nonblocking(true).expect("peer is nonblocking");
         Self {
             socket,
-            connection: SrtConnection::new_listener(shiguredo_srt::ConnectionOptions {
+            connection: SrtConnection::new_listener(srt_proto::ConnectionOptions {
                 tsbpd_delay: 0,
                 ..Default::default()
             }),
@@ -130,7 +130,7 @@ async fn connect_two_leg_group() -> (GroupConn, Peer, Peer) {
             .group()
             .members()
             .iter()
-            .all(|member| member.connection().state() == shiguredo_srt::ConnectionState::Connected)
+            .all(|member| member.connection().state() == srt_proto::ConnectionState::Connected)
         {
             break;
         }
@@ -140,7 +140,7 @@ async fn connect_two_leg_group() -> (GroupConn, Peer, Peer) {
         conn.group()
             .members()
             .iter()
-            .all(|member| member.connection().state() == shiguredo_srt::ConnectionState::Connected),
+            .all(|member| member.connection().state() == srt_proto::ConnectionState::Connected),
         "group did not connect"
     );
     (conn, first_peer, second_peer)

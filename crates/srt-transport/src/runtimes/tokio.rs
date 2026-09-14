@@ -6,7 +6,7 @@ use crate::{
     drain_output_work, group_connection_stats, prepend_outputs, schedule_wait_micros,
     sendmsg_connected_batch,
 };
-use shiguredo_srt::{Bytes, ConnectionOutput, GroupMode, SrtConnection, Timestamp};
+use srt_proto::{Bytes, ConnectionOutput, GroupMode, SrtConnection, Timestamp};
 use std::collections::VecDeque;
 use std::hash::Hash;
 use std::io;
@@ -428,7 +428,7 @@ struct TokioGroupLeg {
 /// shared protocol core; this type supplies Tokio's nonblocking socket
 /// operations and exposes every leg for readiness registration.
 pub struct GroupConn {
-    group: shiguredo_srt::SrtGroup,
+    group: srt_proto::SrtGroup,
     legs: Vec<GroupLeg>,
     logical_payloads_sent: u64,
     logical_payload_bytes_sent: u64,
@@ -462,7 +462,7 @@ impl GroupConn {
         mode: GroupMode,
         legs: impl IntoIterator<Item = TokioGroupLeg>,
     ) -> Result<Self, GroupBuildError> {
-        let mut group = shiguredo_srt::SrtGroup::new(group_id, mode)?;
+        let mut group = srt_proto::SrtGroup::new(group_id, mode)?;
         let mut io_legs = Vec::new();
         let mut batch_capacity = 1;
         for TokioGroupLeg {
@@ -547,7 +547,7 @@ impl GroupConn {
     }
 
     #[must_use]
-    pub fn group(&self) -> &shiguredo_srt::SrtGroup {
+    pub fn group(&self) -> &srt_proto::SrtGroup {
         &self.group
     }
 
@@ -570,7 +570,7 @@ impl GroupConn {
         self.group.can_send()
     }
 
-    pub fn send(&mut self, payload: &[u8], now: Timestamp) -> Result<usize, shiguredo_srt::Error> {
+    pub fn send(&mut self, payload: &[u8], now: Timestamp) -> Result<usize, srt_proto::Error> {
         let legs = self.group.send(payload, now)?;
         self.logical_payloads_sent = self.logical_payloads_sent.saturating_add(1);
         self.logical_payload_bytes_sent = self
@@ -583,7 +583,7 @@ impl GroupConn {
         &mut self,
         payload: Bytes,
         now: Timestamp,
-    ) -> Result<usize, shiguredo_srt::Error> {
+    ) -> Result<usize, srt_proto::Error> {
         let len = payload.len() as u64;
         let legs = self.group.send_shared(payload, now)?;
         self.logical_payloads_sent = self.logical_payloads_sent.saturating_add(1);
@@ -595,8 +595,8 @@ impl GroupConn {
         self.group.disconnect(now);
     }
 
-    pub fn poll_data(&mut self, now: Timestamp) -> Option<shiguredo_srt::group::GroupPacket> {
-        self.poll_data_bounded(now, shiguredo_srt::MAX_GROUP_MEMBERS)
+    pub fn poll_data(&mut self, now: Timestamp) -> Option<srt_proto::group::GroupPacket> {
+        self.poll_data_bounded(now, srt_proto::MAX_GROUP_MEMBERS)
             .packet
     }
 
@@ -606,7 +606,7 @@ impl GroupConn {
         &mut self,
         now: Timestamp,
         max_events: usize,
-    ) -> shiguredo_srt::GroupDataPoll {
+    ) -> srt_proto::GroupDataPoll {
         let poll = self.group.poll_data_bounded(now, max_events);
         let Some(packet) = poll.packet.as_ref() else {
             return poll;
@@ -749,10 +749,10 @@ fn drain_group_leg_outputs(
 /// so a consumer of `GroupLegDriveReport::newly_broken` watching for a
 /// once-per-failure edge (trigger failover, emit one alert) needs this
 /// distinction, not "did this call attempt to mark it".
-fn mark_member_broken_if_new(group: &mut shiguredo_srt::SrtGroup, member_id: u32) -> bool {
+fn mark_member_broken_if_new(group: &mut srt_proto::SrtGroup, member_id: u32) -> bool {
     let was_broken = group
         .member(member_id)
-        .is_some_and(|member| member.state() == shiguredo_srt::GroupMemberState::Broken);
+        .is_some_and(|member| member.state() == srt_proto::GroupMemberState::Broken);
     group.mark_member_broken(member_id) && !was_broken
 }
 
@@ -1635,7 +1635,7 @@ pub enum FacadeError {
     /// expiry, not a silent stall or an unbounded wait.
     Expired,
     Build(crate::RuntimeBuildError),
-    Protocol(shiguredo_srt::Error),
+    Protocol(srt_proto::Error),
 }
 
 impl std::fmt::Display for FacadeError {
@@ -1841,7 +1841,7 @@ impl SessionControl {
 }
 
 struct InboundItem {
-    payload: shiguredo_srt::Bytes,
+    payload: srt_proto::Bytes,
     source_time: Timestamp,
     bytes: Arc<AtomicUsize>,
 }
@@ -1854,7 +1854,7 @@ impl Drop for InboundItem {
 
 impl InboundItem {
     fn into_message(mut self) -> ReceivedMessage {
-        let payload = std::mem::replace(&mut self.payload, shiguredo_srt::Bytes::new());
+        let payload = std::mem::replace(&mut self.payload, srt_proto::Bytes::new());
         self.bytes.fetch_sub(payload.len(), Ordering::AcqRel);
         ReceivedMessage {
             payload,
@@ -1882,7 +1882,7 @@ impl SessionInbox {
         (Self { tx, bytes, control }, rx)
     }
 
-    fn try_send(&self, payload: shiguredo_srt::Bytes, source_time: Timestamp) -> InboxSend {
+    fn try_send(&self, payload: srt_proto::Bytes, source_time: Timestamp) -> InboxSend {
         if self.control.is_unavailable() {
             return InboxSend::Closed;
         }
@@ -2156,7 +2156,7 @@ enum Command {
 /// connection it re-sends on has its own, unrelated wire timestamp epoch.
 #[derive(Debug, Clone)]
 pub struct ReceivedMessage {
-    pub payload: shiguredo_srt::Bytes,
+    pub payload: srt_proto::Bytes,
     pub source_time: Timestamp,
 }
 
@@ -2266,9 +2266,9 @@ impl Drop for Session {
     }
 }
 
-fn session_gone_error() -> shiguredo_srt::Error {
-    shiguredo_srt::Error::with_reason(
-        shiguredo_srt::ErrorKind::InvalidState,
+fn session_gone_error() -> srt_proto::Error {
+    srt_proto::Error::with_reason(
+        srt_proto::ErrorKind::InvalidState,
         "session no longer exists",
     )
 }
@@ -2276,9 +2276,9 @@ fn session_gone_error() -> shiguredo_srt::Error {
 /// Reasons a pending [`Command::Connect`] never gets a session: the
 /// connection failed before ever reaching `Connected` (rejected handshake,
 /// timeout, ...), or the driver is stopping and can no longer wait for it.
-fn connect_failed_error() -> shiguredo_srt::Error {
-    shiguredo_srt::Error::with_reason(
-        shiguredo_srt::ErrorKind::InvalidState,
+fn connect_failed_error() -> srt_proto::Error {
+    srt_proto::Error::with_reason(
+        srt_proto::ErrorKind::InvalidState,
         "connection did not reach Connected",
     )
 }
@@ -2851,7 +2851,7 @@ fn route_listener_event(
     let id = event.logical_peer;
     let target = SessionTarget::Listener(id);
     match event.event {
-        shiguredo_srt::ConnectionEvent::Connected => route_listener_connected(
+        srt_proto::ConnectionEvent::Connected => route_listener_connected(
             owner,
             id,
             now,
@@ -2863,7 +2863,7 @@ fn route_listener_event(
             accept_tx,
             target,
         ),
-        shiguredo_srt::ConnectionEvent::DataReceived {
+        srt_proto::ConnectionEvent::DataReceived {
             payload,
             source_time,
             ..
@@ -2878,7 +2878,7 @@ fn route_listener_event(
             controls,
             pending_sends,
         ),
-        shiguredo_srt::ConnectionEvent::Disconnected { .. } => route_listener_disconnected(
+        srt_proto::ConnectionEvent::Disconnected { .. } => route_listener_disconnected(
             owner,
             id,
             target,
@@ -2886,11 +2886,10 @@ fn route_listener_event(
             controls,
             pending_sends,
         ),
-        shiguredo_srt::ConnectionEvent::KeyRefreshNeeded { key_length } => {
+        srt_proto::ConnectionEvent::KeyRefreshNeeded { key_length } => {
             route_listener_key_refresh(owner, id, key_length, now);
         }
-        shiguredo_srt::ConnectionEvent::StateChanged(_)
-        | shiguredo_srt::ConnectionEvent::Error(_) => {}
+        srt_proto::ConnectionEvent::StateChanged(_) | srt_proto::ConnectionEvent::Error(_) => {}
     }
 }
 
@@ -3032,7 +3031,7 @@ fn route_caller_event(
     control_checks: &mut VecDeque<SessionTarget>,
 ) {
     match event.event {
-        shiguredo_srt::ConnectionEvent::Connected => route_caller_connected(
+        srt_proto::ConnectionEvent::Connected => route_caller_connected(
             owner,
             event.id,
             now,
@@ -3043,7 +3042,7 @@ fn route_caller_event(
             pending_sends,
             control_checks,
         ),
-        shiguredo_srt::ConnectionEvent::DataReceived {
+        srt_proto::ConnectionEvent::DataReceived {
             payload,
             source_time,
             ..
@@ -3057,7 +3056,7 @@ fn route_caller_event(
             controls,
             pending_sends,
         ),
-        shiguredo_srt::ConnectionEvent::Disconnected { .. } => route_caller_ended(
+        srt_proto::ConnectionEvent::Disconnected { .. } => route_caller_ended(
             owner,
             event.id,
             true,
@@ -3074,22 +3073,21 @@ fn route_caller_event(
         // pending connect on this transition, `Facade::connect()` against
         // any address that never answers (or that actively rejects the
         // handshake) never resolves at all.
-        shiguredo_srt::ConnectionEvent::StateChanged(
-            shiguredo_srt::ConnectionState::Disconnected,
-        ) => route_caller_ended(
-            owner,
-            event.id,
-            true,
-            caller_inboxes,
-            controls,
-            pending_connects,
-            pending_sends,
-        ),
-        shiguredo_srt::ConnectionEvent::KeyRefreshNeeded { key_length } => {
+        srt_proto::ConnectionEvent::StateChanged(srt_proto::ConnectionState::Disconnected) => {
+            route_caller_ended(
+                owner,
+                event.id,
+                true,
+                caller_inboxes,
+                controls,
+                pending_connects,
+                pending_sends,
+            )
+        }
+        srt_proto::ConnectionEvent::KeyRefreshNeeded { key_length } => {
             route_caller_key_refresh(owner, event.id, key_length, now);
         }
-        shiguredo_srt::ConnectionEvent::StateChanged(_)
-        | shiguredo_srt::ConnectionEvent::Error(_) => {}
+        srt_proto::ConnectionEvent::StateChanged(_) | srt_proto::ConnectionEvent::Error(_) => {}
     }
 }
 
@@ -3226,7 +3224,7 @@ fn route_caller_key_refresh(
 
 fn refresh_key(
     key_length: usize,
-    provide: impl FnOnce(&[u8]) -> Result<(), shiguredo_srt::Error>,
+    provide: impl FnOnce(&[u8]) -> Result<(), srt_proto::Error>,
 ) -> bool {
     let mut sek = vec![0; key_length];
     let result = getrandom::fill(&mut sek).is_ok() && provide(&sek).is_ok();
@@ -3538,7 +3536,7 @@ mod owner_tests {
                     let mut events = Vec::new();
                     owner.poll_listener_events(&mut events);
                     for event in events {
-                        if let shiguredo_srt::ConnectionEvent::Connected = event.event {
+                        if let srt_proto::ConnectionEvent::Connected = event.event {
                             peer_id = Some(event.logical_peer);
                         }
                     }
@@ -3562,7 +3560,7 @@ mod owner_tests {
                 owner.poll_listener_events(&mut events);
                 for event in events {
                     if event.logical_peer == peer_id
-                        && let shiguredo_srt::ConnectionEvent::DataReceived { payload, .. } =
+                        && let srt_proto::ConnectionEvent::DataReceived { payload, .. } =
                             event.event
                     {
                         received = Some(payload.to_vec());
@@ -3585,10 +3583,7 @@ mod owner_tests {
                 owner.poll_listener_events(&mut events);
                 for event in events {
                     if event.logical_peer == peer_id
-                        && matches!(
-                            event.event,
-                            shiguredo_srt::ConnectionEvent::Disconnected { .. }
-                        )
+                        && matches!(event.event, srt_proto::ConnectionEvent::Disconnected { .. })
                     {
                         saw_disconnect = true;
                     }
@@ -4476,7 +4471,7 @@ mod tests {
             let sock = UdpSocket::from_std(local).expect("tokio adopts the socket");
 
             let mut conn = Conn::new(
-                SrtConnection::new_caller(shiguredo_srt::ConnectionOptions::default()),
+                SrtConnection::new_caller(srt_proto::ConnectionOptions::default()),
                 sock,
             );
 
@@ -4512,11 +4507,11 @@ mod tests {
     /// Drive a caller/listener pair to `Connected` using pure protocol
     /// calls (no socket I/O needed for the handshake itself).
     fn connected_caller() -> SrtConnection {
-        let mut caller = SrtConnection::new_caller(shiguredo_srt::ConnectionOptions {
+        let mut caller = SrtConnection::new_caller(srt_proto::ConnectionOptions {
             socket_id: 1,
             ..Default::default()
         });
-        let mut listener = SrtConnection::new_listener(shiguredo_srt::ConnectionOptions {
+        let mut listener = SrtConnection::new_listener(srt_proto::ConnectionOptions {
             socket_id: 2,
             syn_cookie: Some(7),
             ..Default::default()
@@ -4536,11 +4531,11 @@ mod tests {
                     .feed_recv_buf(&packet, now)
                     .expect("caller accepts packet");
             }
-            if caller.state() == shiguredo_srt::ConnectionState::Connected {
+            if caller.state() == srt_proto::ConnectionState::Connected {
                 break;
             }
         }
-        assert_eq!(caller.state(), shiguredo_srt::ConnectionState::Connected);
+        assert_eq!(caller.state(), srt_proto::ConnectionState::Connected);
         caller
     }
 
@@ -4634,7 +4629,7 @@ mod tests {
         let sock = UdpSocket::from_std(local).expect("tokio adopts the socket");
 
         let mut conn = Conn::new(
-            SrtConnection::new_caller(shiguredo_srt::ConnectionOptions::default()),
+            SrtConnection::new_caller(srt_proto::ConnectionOptions::default()),
             sock,
         );
         conn.pending_outputs
@@ -4642,7 +4637,7 @@ mod tests {
         conn.pending_outputs
             .push_back(ConnectionOutput::SendPacket(b"second".to_vec()));
         conn.pending_outputs.push_back(ConnectionOutput::SetTimer {
-            id: shiguredo_srt::TimerId::Ack,
+            id: srt_proto::TimerId::Ack,
             duration_micros: 10_000,
         });
         let before: Vec<_> = conn.pending_outputs.iter().cloned().collect();
@@ -4681,8 +4676,8 @@ mod tests {
     /// `mark_member_broken_if_new_only_reports_the_first_transition`.
     #[test]
     fn mark_member_broken_if_new_only_reports_the_first_transition() {
-        let mut group = shiguredo_srt::SrtGroup::new(
-            shiguredo_srt::handshake::SRTGROUP_MASK | 1,
+        let mut group = srt_proto::SrtGroup::new(
+            srt_proto::handshake::SRTGROUP_MASK | 1,
             GroupMode::Broadcast,
         )
         .expect("group builds");
@@ -4690,7 +4685,7 @@ mod tests {
             .add_member(
                 1,
                 10,
-                SrtConnection::new_caller(shiguredo_srt::ConnectionOptions::default()),
+                SrtConnection::new_caller(srt_proto::ConnectionOptions::default()),
             )
             .expect("member adds");
 
@@ -4724,7 +4719,7 @@ mod tests {
                 .set_nonblocking(true)
                 .expect("second peer is nonblocking");
 
-            let group = crate::GroupConfig::new(42, shiguredo_srt::handshake::GroupType::Broadcast);
+            let group = crate::GroupConfig::new(42, srt_proto::handshake::GroupType::Broadcast);
             let mut conn = GroupConn::caller(
                 group,
                 [
@@ -4791,7 +4786,7 @@ mod tests {
         runtime.block_on(async {
             let peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("peer binds");
             let remote = peer.local_addr().expect("peer address");
-            let group = crate::GroupConfig::new(45, shiguredo_srt::handshake::GroupType::Broadcast);
+            let group = crate::GroupConfig::new(45, srt_proto::handshake::GroupType::Broadcast);
             let result = GroupConn::caller(
                 group,
                 [GroupCallerLeg::new(
@@ -4843,7 +4838,7 @@ mod tests {
                     .build()
                     .expect("second caller config");
             let conn = GroupConn::caller(
-                crate::GroupConfig::new(46, shiguredo_srt::handshake::GroupType::Broadcast),
+                crate::GroupConfig::new(46, srt_proto::handshake::GroupType::Broadcast),
                 [
                     GroupCallerLeg::new(1, 10, first_config),
                     GroupCallerLeg::new(2, 20, second_config),
@@ -4872,7 +4867,7 @@ mod tests {
             socket.set_nonblocking(true).expect("peer is nonblocking");
             Self {
                 socket,
-                connection: SrtConnection::new_listener(shiguredo_srt::ConnectionOptions {
+                connection: SrtConnection::new_listener(srt_proto::ConnectionOptions {
                     tsbpd_delay: 0,
                     ..Default::default()
                 }),
@@ -4910,7 +4905,7 @@ mod tests {
     async fn connect_two_leg_tokio_group() -> (GroupConn, GroupPeer, GroupPeer) {
         let mut first_peer = GroupPeer::new();
         let mut second_peer = GroupPeer::new();
-        let group = crate::GroupConfig::new(44, shiguredo_srt::handshake::GroupType::Broadcast);
+        let group = crate::GroupConfig::new(44, srt_proto::handshake::GroupType::Broadcast);
         let mut conn = GroupConn::caller(
             group,
             [
@@ -4950,9 +4945,12 @@ mod tests {
             second_peer.drive(now);
             conn.drive(now, OutputDrainBudget::default(), &mut report)
                 .expect("group receives protocol output");
-            if conn.group().members().iter().all(|member| {
-                member.connection().state() == shiguredo_srt::ConnectionState::Connected
-            }) {
+            if conn
+                .group()
+                .members()
+                .iter()
+                .all(|member| member.connection().state() == srt_proto::ConnectionState::Connected)
+            {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
@@ -4961,8 +4959,7 @@ mod tests {
             conn.group()
                 .members()
                 .iter()
-                .all(|member| member.connection().state()
-                    == shiguredo_srt::ConnectionState::Connected),
+                .all(|member| member.connection().state() == srt_proto::ConnectionState::Connected),
             "group did not connect"
         );
         (conn, first_peer, second_peer)
@@ -5010,7 +5007,7 @@ mod tests {
                 assert!(!leg1.newly_broken, "malformed input must not break the leg");
                 assert_eq!(
                     conn.group().member(1).expect("member 1").state(),
-                    shiguredo_srt::GroupMemberState::Active,
+                    srt_proto::GroupMemberState::Active,
                     "leg 1 must stay Active through sustained malformed input"
                 );
                 second_peer.drive(now);
@@ -5057,7 +5054,7 @@ mod tests {
                     .expect("drive must not fail just because one leg's peer vanished");
                 second_peer.drive(now);
                 if conn.group().member(1).expect("member 1").state()
-                    == shiguredo_srt::GroupMemberState::Broken
+                    == srt_proto::GroupMemberState::Broken
                 {
                     leg1_broken = true;
                     break;
@@ -5070,7 +5067,7 @@ mod tests {
             );
             assert_eq!(
                 conn.group().member(2).expect("member 2").state(),
-                shiguredo_srt::GroupMemberState::Active,
+                srt_proto::GroupMemberState::Active,
                 "the healthy leg must be unaffected by the other leg's failure"
             );
 
@@ -5099,7 +5096,7 @@ mod tests {
                     .group()
                     .members()
                     .iter()
-                    .all(|member| member.state() == shiguredo_srt::GroupMemberState::Broken)
+                    .all(|member| member.state() == srt_proto::GroupMemberState::Broken)
                 {
                     all_broken = true;
                     break;
@@ -5329,7 +5326,7 @@ mod tests {
             let sock = UdpSocket::from_std(local).expect("tokio adopts");
 
             let mut conn = Conn::new(
-                SrtConnection::new_caller(shiguredo_srt::ConnectionOptions::default()),
+                SrtConnection::new_caller(srt_proto::ConnectionOptions::default()),
                 sock,
             );
             conn.pending_outputs.extend([
@@ -5365,7 +5362,7 @@ mod tests {
             local.set_nonblocking(true).expect("nonblocking");
             let sock = UdpSocket::from_std(local).expect("tokio adopts the socket");
             let conn = Conn::new(
-                SrtConnection::new_caller(shiguredo_srt::ConnectionOptions::default()),
+                SrtConnection::new_caller(srt_proto::ConnectionOptions::default()),
                 sock,
             );
             let mut waiter = HighResWaiter::<u32>::new().expect("waiter");

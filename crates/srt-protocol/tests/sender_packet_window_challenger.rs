@@ -1,7 +1,7 @@
 //! Integration and scale verification for the direct paged `SenderPacketWindow`.
 
-use shiguredo_srt::Timestamp;
-use shiguredo_srt::sender::SenderBuffer;
+use srt_proto::Timestamp;
+use srt_proto::sender::SenderBuffer;
 
 fn ts(micros: u64) -> Timestamp {
     Timestamp::from_micros(micros)

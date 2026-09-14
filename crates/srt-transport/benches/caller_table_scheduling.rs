@@ -2,8 +2,8 @@ use std::hint::black_box;
 use std::net::SocketAddr;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use shiguredo_srt::handshake::SRTGROUP_MASK;
-use shiguredo_srt::{ConnectionOptions, ConnectionOutput, SrtConnection, Timestamp};
+use srt_proto::handshake::SRTGROUP_MASK;
+use srt_proto::{ConnectionOptions, ConnectionOutput, SrtConnection, Timestamp};
 use srt_transport::advanced::caller::{CallerLeg, CallerTable, LogicalCallerId};
 
 fn make_peer(idx: usize) -> SocketAddr {
@@ -35,11 +35,11 @@ fn new_connected_caller_connection(socket_id: u32) -> SrtConnection {
                 let _ = caller.feed_recv_buf(&data, now);
             }
         }
-        if caller.state() == shiguredo_srt::ConnectionState::Connected {
+        if caller.state() == srt_proto::ConnectionState::Connected {
             break;
         }
     }
-    assert_eq!(caller.state(), shiguredo_srt::ConnectionState::Connected);
+    assert_eq!(caller.state(), srt_proto::ConnectionState::Connected);
     caller
 }
 
@@ -163,7 +163,7 @@ fn bench_one_due(c: &mut Criterion) {
                     if n > 0 {
                         let first_id = ids[0];
                         // Arm a real Ack timer on first_id exactly at now.
-                        table.bench_arm_timer(first_id, shiguredo_srt::TimerId::Ack, 0, now);
+                        table.bench_arm_timer(first_id, srt_proto::TimerId::Ack, 0, now);
                     }
                     (table, ids)
                 },
@@ -284,12 +284,9 @@ fn bench_reschedule(c: &mut Criterion) {
                     let mut now = state.2;
                     for i in 0..100 {
                         now = Timestamp::from_micros(now.as_micros() + 1000 + i);
-                        state.0.bench_arm_timer(
-                            state.1,
-                            shiguredo_srt::TimerId::Ack,
-                            1000 + i,
-                            now,
-                        );
+                        state
+                            .0
+                            .bench_arm_timer(state.1, srt_proto::TimerId::Ack, 1000 + i, now);
                         black_box(state.0.time_until_next_deadline(now, 100_000));
                     }
                     black_box(state.0.deadline_count());
@@ -357,7 +354,7 @@ fn bench_groups(c: &mut Criterion) {
                             }
                         });
                         let id = table
-                            .add_group(gid, shiguredo_srt::GroupMode::Broadcast, legs)
+                            .add_group(gid, srt_proto::GroupMode::Broadcast, legs)
                             .unwrap();
                         if first_group_id.is_none() {
                             first_group_id = Some(id);

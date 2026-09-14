@@ -43,8 +43,8 @@ pub const TAIL_SPIN: std::time::Duration = std::time::Duration::from_micros(300)
 
 /// Convert an `Instant` (session start) to an SRT `Timestamp`.
 #[inline]
-pub fn now_ts(start: std::time::Instant) -> shiguredo_srt::Timestamp {
-    shiguredo_srt::Timestamp::from_micros(start.elapsed().as_micros() as u64)
+pub fn now_ts(start: std::time::Instant) -> srt_proto::Timestamp {
+    srt_proto::Timestamp::from_micros(start.elapsed().as_micros() as u64)
 }
 
 /// Parsed CLI: positional arguments plus `--flag value` pairs.
@@ -216,18 +216,18 @@ impl Encryption {
     }
 
     /// Apply the benchmark's shared passphrase and selected AES key length.
-    pub fn apply_to(self, options: &mut shiguredo_srt::ConnectionOptions) {
+    pub fn apply_to(self, options: &mut srt_proto::ConnectionOptions) {
         let key_length = match self {
             Self::Plain => {
                 options.passphrase = None;
                 options.crypto_salt = None;
                 options.crypto_sek = None;
-                options.key_length = shiguredo_srt::crypto::KeyLength::Aes128;
+                options.key_length = srt_proto::crypto::KeyLength::Aes128;
                 return;
             }
-            Self::Aes128 => shiguredo_srt::crypto::KeyLength::Aes128,
-            Self::Aes192 => shiguredo_srt::crypto::KeyLength::Aes192,
-            Self::Aes256 => shiguredo_srt::crypto::KeyLength::Aes256,
+            Self::Aes128 => srt_proto::crypto::KeyLength::Aes128,
+            Self::Aes192 => srt_proto::crypto::KeyLength::Aes192,
+            Self::Aes256 => srt_proto::crypto::KeyLength::Aes256,
         };
         options.passphrase = Some("srt-bench-encryption".to_string());
         options.key_length = key_length;
@@ -567,7 +567,7 @@ pub type SharedWorkerRouter =
 /// the six acceptor loops build the `decide_promotion` group argument.
 #[must_use]
 pub fn group_from_extension(
-    extension: Option<shiguredo_srt::handshake::GroupExtensionData>,
+    extension: Option<srt_proto::handshake::GroupExtensionData>,
 ) -> Option<srt_lifecycle::GroupAffinity> {
     extension.map(|extension| srt_lifecycle::GroupAffinity {
         group_id: extension.group_id,
@@ -696,17 +696,17 @@ impl BenchConfig {
     pub fn bond_extension_for(
         &self,
         index: usize,
-    ) -> Option<shiguredo_srt::handshake::GroupExtensionData> {
+    ) -> Option<srt_proto::handshake::GroupExtensionData> {
         if self.bond_mode == BondMode::None || index >= self.bond_pairs * 2 {
             return None;
         }
         let group_type = match self.bond_mode {
-            BondMode::Broadcast => shiguredo_srt::handshake::GroupType::Broadcast,
-            BondMode::Backup => shiguredo_srt::handshake::GroupType::Backup,
+            BondMode::Broadcast => srt_proto::handshake::GroupType::Broadcast,
+            BondMode::Backup => srt_proto::handshake::GroupType::Backup,
             BondMode::None => unreachable!("checked above"),
         };
-        Some(shiguredo_srt::handshake::GroupExtensionData {
-            group_id: shiguredo_srt::handshake::SRTGROUP_MASK | ((index / 2) as u32 + 1),
+        Some(srt_proto::handshake::GroupExtensionData {
+            group_id: srt_proto::handshake::SRTGROUP_MASK | ((index / 2) as u32 + 1),
             group_type,
             flags: 0,
             // Give backup legs an unambiguous active/standby ordering. A
@@ -756,7 +756,7 @@ impl BenchConfig {
     /// so its pacing ceiling is inert, and setting it uniformly keeps the
     /// six runtimes from each deciding the question differently.
     /// Canonical via [`Self::session_config`]; do not write pacing fields here.
-    pub fn apply_srt_bandwidth(&self, options: &mut shiguredo_srt::ConnectionOptions) {
+    pub fn apply_srt_bandwidth(&self, options: &mut srt_proto::ConnectionOptions) {
         let template = self.session_config().into_connection_options();
         options.max_bandwidth_bytes_per_sec = template.max_bandwidth_bytes_per_sec;
         options.input_bandwidth_bytes_per_sec = template.input_bandwidth_bytes_per_sec;
@@ -765,7 +765,7 @@ impl BenchConfig {
     }
 
     /// Canonical via [`Self::session_config`]; do not write ACK fields here.
-    pub fn apply_ack_coalesce(&self, options: &mut shiguredo_srt::ConnectionOptions) {
+    pub fn apply_ack_coalesce(&self, options: &mut srt_proto::ConnectionOptions) {
         let template = self.session_config().into_connection_options();
         options.ack_interval_micros = template.ack_interval_micros;
         options.light_ack_interval_packets = template.light_ack_interval_packets;
@@ -774,7 +774,7 @@ impl BenchConfig {
     /// Bandwidth + encryption + ACK coalesce. Delegates to
     /// [`Self::session_config`] plus encryption; the single place a runtime
     /// should stamp protocol knobs onto a `ConnectionOptions` template.
-    pub fn apply_protocol_options(&self, options: &mut shiguredo_srt::ConnectionOptions) {
+    pub fn apply_protocol_options(&self, options: &mut srt_proto::ConnectionOptions) {
         self.apply_srt_bandwidth(options);
         self.encryption.apply_to(options);
         self.apply_ack_coalesce(options);
@@ -1012,10 +1012,10 @@ impl BenchConfig {
             },
             connection_template: Some(template),
             handshake_retry_interval: std::time::Duration::from_micros(
-                shiguredo_srt::DEFAULT_HANDSHAKE_RETRY_INTERVAL_MICROS,
+                srt_proto::DEFAULT_HANDSHAKE_RETRY_INTERVAL_MICROS,
             ),
             handshake_timeout: std::time::Duration::from_micros(
-                shiguredo_srt::DEFAULT_HANDSHAKE_TIMEOUT_MICROS,
+                srt_proto::DEFAULT_HANDSHAKE_TIMEOUT_MICROS,
             ),
         }
     }
@@ -1745,10 +1745,10 @@ impl SharedSender {
         if let Some(pair_index) = slot.bond_pair_index {
             let first = make_caller_connection(cfg, index, now);
             let second = make_caller_connection(cfg, pair_index, now);
-            let group_id = shiguredo_srt::handshake::SRTGROUP_MASK | ((index / 2) as u32 + 1);
+            let group_id = srt_proto::handshake::SRTGROUP_MASK | ((index / 2) as u32 + 1);
             let mode = match cfg.bond_mode {
-                BondMode::Broadcast => shiguredo_srt::GroupMode::Broadcast,
-                BondMode::Backup => shiguredo_srt::GroupMode::Backup,
+                BondMode::Broadcast => srt_proto::GroupMode::Broadcast,
+                BondMode::Backup => srt_proto::GroupMode::Backup,
                 BondMode::None => unreachable!("group extension requires a bond mode"),
             };
             let sid1 = cfg.caller_socket_id_for(index);
@@ -1808,7 +1808,7 @@ impl SharedSender {
     }
 
     pub fn feed(&mut self, peer: std::net::SocketAddr, data: &[u8]) {
-        if let Ok(sid) = shiguredo_srt::wire::peek_destination_socket_id(data)
+        if let Ok(sid) = srt_proto::wire::peek_destination_socket_id(data)
             && let Some(&slot_id) = self.socket_id_to_slot.get(&sid)
         {
             let slot = &mut self.slots[slot_id];
@@ -1838,7 +1838,7 @@ impl SharedSender {
         self.callers.poll_outbound(now, out);
     }
 
-    fn process_dirty_slots(&mut self, now_instant: Instant, now: shiguredo_srt::Timestamp) {
+    fn process_dirty_slots(&mut self, now_instant: Instant, now: srt_proto::Timestamp) {
         let mut count = self.dirty_ready.len();
         while count > 0 {
             count -= 1;
@@ -1854,7 +1854,7 @@ impl SharedSender {
         }
     }
 
-    fn process_due_deadlines(&mut self, now_instant: Instant, now: shiguredo_srt::Timestamp) {
+    fn process_due_deadlines(&mut self, now_instant: Instant, now: srt_proto::Timestamp) {
         let now_us = now_instant.duration_since(self.start).as_micros() as u64;
         self.due_scratch.clear();
         while let Some(entry) = self.app_deadlines.first().copied() {
@@ -1879,7 +1879,7 @@ impl SharedSender {
         &mut self,
         entry: AppDeadlineEntry,
         now_instant: Instant,
-        now: shiguredo_srt::Timestamp,
+        now: srt_proto::Timestamp,
     ) {
         let phase = self.slots[entry.slot].phase;
         match entry.kind {
@@ -1896,7 +1896,7 @@ impl SharedSender {
         }
     }
 
-    fn check_in_flight(&mut self, now_instant: Instant, now: shiguredo_srt::Timestamp) {
+    fn check_in_flight(&mut self, now_instant: Instant, now: srt_proto::Timestamp) {
         let mut i = 0;
         while i < self.in_flight_set.len() {
             let slot_id = self.in_flight_set[i];
@@ -1971,7 +1971,7 @@ impl SharedSender {
         &mut self,
         slot_id: SlotId,
         now_instant: Instant,
-        now: shiguredo_srt::Timestamp,
+        now: srt_proto::Timestamp,
     ) {
         let slot = &self.slots[slot_id];
         let caller_id = match slot.caller {
@@ -2018,7 +2018,7 @@ impl SharedSender {
         &mut self,
         slot_id: SlotId,
         now_instant: Instant,
-        now: shiguredo_srt::Timestamp,
+        now: srt_proto::Timestamp,
     ) -> bool {
         let slot = &self.slots[slot_id];
         if slot.phase == SlotPhase::Closed || slot.phase == SlotPhase::Streaming {
@@ -2145,9 +2145,9 @@ impl SharedSender {
                 for (result, leg) in slot.stats.iter_mut().zip(stats.legs) {
                     result.connected |= matches!(
                         leg.state,
-                        shiguredo_srt::GroupMemberState::Active
-                            | shiguredo_srt::GroupMemberState::Standby
-                            | shiguredo_srt::GroupMemberState::Unstable
+                        srt_proto::GroupMemberState::Active
+                            | srt_proto::GroupMemberState::Standby
+                            | srt_proto::GroupMemberState::Unstable
                     ) || leg.connection.sender.is_some();
                     apply_sender_stats(result, &leg.connection);
                 }
@@ -2156,12 +2156,7 @@ impl SharedSender {
         }
     }
 
-    fn schedule_send(
-        &mut self,
-        slot_id: SlotId,
-        now_instant: Instant,
-        now: shiguredo_srt::Timestamp,
-    ) {
+    fn schedule_send(&mut self, slot_id: SlotId, now_instant: Instant, now: srt_proto::Timestamp) {
         let slot = &self.slots[slot_id];
         if slot.phase != SlotPhase::Streaming {
             return;
@@ -2193,7 +2188,7 @@ impl SharedSender {
             .insert((slot_id, AppDeadlineKind::Send), deadline_us);
     }
 
-    fn send_slot(&mut self, slot_id: SlotId, now_instant: Instant, now: shiguredo_srt::Timestamp) {
+    fn send_slot(&mut self, slot_id: SlotId, now_instant: Instant, now: srt_proto::Timestamp) {
         let slot = &self.slots[slot_id];
         let caller_id = match slot.caller {
             Some(id) => id,
@@ -2241,7 +2236,7 @@ impl SharedSender {
         self.schedule_send(slot_id, now_instant, now);
     }
 
-    fn close_slot(&mut self, slot_id: SlotId, now: shiguredo_srt::Timestamp) {
+    fn close_slot(&mut self, slot_id: SlotId, now: srt_proto::Timestamp) {
         let phase = self.slots[slot_id].phase;
         if phase == SlotPhase::Closed || phase == SlotPhase::Closing {
             return;
@@ -2483,9 +2478,9 @@ impl SharedSender {
 fn make_caller_connection(
     cfg: &BenchConfig,
     index: usize,
-    now: shiguredo_srt::Timestamp,
-) -> shiguredo_srt::SrtConnection {
-    let mut options = shiguredo_srt::ConnectionOptions {
+    now: srt_proto::Timestamp,
+) -> srt_proto::SrtConnection {
+    let mut options = srt_proto::ConnectionOptions {
         socket_id: cfg.caller_socket_id_for(index),
         tsbpd_delay: cfg.latency_ms,
         group_extension: cfg.bond_extension_for(index),
@@ -2494,14 +2489,14 @@ fn make_caller_connection(
         ..Default::default()
     };
     cfg.apply_protocol_options(&mut options);
-    let mut connection = shiguredo_srt::SrtConnection::new_caller(options);
+    let mut connection = srt_proto::SrtConnection::new_caller(options);
     connection
         .connect(now)
         .expect("shared caller connect queues INDUCTION");
     connection
 }
 
-fn apply_sender_stats(stats: &mut ConnStats, connection: &shiguredo_srt::ConnectionStats) {
+fn apply_sender_stats(stats: &mut ConnStats, connection: &srt_proto::ConnectionStats) {
     if let Some(sender) = connection.sender {
         stats.has_stats = true;
         stats.core_total = sender.total_sent;
@@ -3113,11 +3108,11 @@ fn parse_cookie_routing(cli: &Cli) -> bool {
 
 fn parse_ack_interval_micros(cli: &Cli) -> u64 {
     match cli.flags.get("ack-interval-micros").map(String::as_str) {
-        None | Some("") => shiguredo_srt::receiver::ACK_INTERVAL_MICROS,
+        None | Some("") => srt_proto::receiver::ACK_INTERVAL_MICROS,
         Some(raw) => match raw.parse::<u64>() {
             Ok(value)
-                if (shiguredo_srt::receiver::MIN_ACK_INTERVAL_MICROS
-                    ..=shiguredo_srt::receiver::MAX_ACK_INTERVAL_MICROS)
+                if (srt_proto::receiver::MIN_ACK_INTERVAL_MICROS
+                    ..=srt_proto::receiver::MAX_ACK_INTERVAL_MICROS)
                     .contains(&value) =>
             {
                 value
@@ -3127,10 +3122,10 @@ fn parse_ack_interval_micros(cli: &Cli) -> u64 {
                     "error: --ack-interval-micros must be {}..={} (got '{raw}'); \
                      Haivision COMM_SYN default and floor is {}, Contabo 4× evidence \
                      ceiling is {} (values above the default are non-RFC-recommended coalesce)",
-                    shiguredo_srt::receiver::MIN_ACK_INTERVAL_MICROS,
-                    shiguredo_srt::receiver::MAX_ACK_INTERVAL_MICROS,
-                    shiguredo_srt::receiver::ACK_INTERVAL_MICROS,
-                    shiguredo_srt::receiver::HIGH_FANIN_ACK_INTERVAL_MICROS
+                    srt_proto::receiver::MIN_ACK_INTERVAL_MICROS,
+                    srt_proto::receiver::MAX_ACK_INTERVAL_MICROS,
+                    srt_proto::receiver::ACK_INTERVAL_MICROS,
+                    srt_proto::receiver::HIGH_FANIN_ACK_INTERVAL_MICROS
                 );
                 usage()
             }
@@ -3144,11 +3139,11 @@ fn parse_light_ack_interval_packets(cli: &Cli) -> u32 {
         .get("light-ack-interval-packets")
         .map(String::as_str)
     {
-        None | Some("") => shiguredo_srt::receiver::LIGHT_ACK_INTERVAL_PACKETS,
+        None | Some("") => srt_proto::receiver::LIGHT_ACK_INTERVAL_PACKETS,
         Some(raw) => match raw.parse::<u32>() {
             Ok(value)
-                if (shiguredo_srt::receiver::MIN_LIGHT_ACK_INTERVAL_PACKETS
-                    ..=shiguredo_srt::receiver::MAX_LIGHT_ACK_INTERVAL_PACKETS)
+                if (srt_proto::receiver::MIN_LIGHT_ACK_INTERVAL_PACKETS
+                    ..=srt_proto::receiver::MAX_LIGHT_ACK_INTERVAL_PACKETS)
                     .contains(&value) =>
             {
                 value
@@ -3158,10 +3153,10 @@ fn parse_light_ack_interval_packets(cli: &Cli) -> u32 {
                     "error: --light-ack-interval-packets must be {}..={} (got '{raw}'); \
                      Haivision/RFC default and floor is {}, Contabo 4× evidence \
                      ceiling is {} (values above the default are non-RFC-recommended coalesce)",
-                    shiguredo_srt::receiver::MIN_LIGHT_ACK_INTERVAL_PACKETS,
-                    shiguredo_srt::receiver::MAX_LIGHT_ACK_INTERVAL_PACKETS,
-                    shiguredo_srt::receiver::LIGHT_ACK_INTERVAL_PACKETS,
-                    shiguredo_srt::receiver::HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS
+                    srt_proto::receiver::MIN_LIGHT_ACK_INTERVAL_PACKETS,
+                    srt_proto::receiver::MAX_LIGHT_ACK_INTERVAL_PACKETS,
+                    srt_proto::receiver::LIGHT_ACK_INTERVAL_PACKETS,
+                    srt_proto::receiver::HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS
                 );
                 usage()
             }
@@ -3386,8 +3381,8 @@ mod tests {
         HandshakeAdmission, HandshakePermit, Ingress, Link, Mode, PeerTopology, Promotion, Runtime,
         SharedSender, parse_required_positionals,
     };
-    use shiguredo_srt::ConnectionOptions;
-    use shiguredo_srt::crypto::KeyLength;
+    use srt_proto::ConnectionOptions;
+    use srt_proto::crypto::KeyLength;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -3427,19 +3422,18 @@ mod tests {
     #[test]
     fn ack_coalesce_is_stamped_on_connection_and_admission_templates() {
         let mut cfg = config();
-        cfg.ack_interval_micros = shiguredo_srt::receiver::HIGH_FANIN_ACK_INTERVAL_MICROS;
-        cfg.light_ack_interval_packets =
-            shiguredo_srt::receiver::HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS;
+        cfg.ack_interval_micros = srt_proto::receiver::HIGH_FANIN_ACK_INTERVAL_MICROS;
+        cfg.light_ack_interval_packets = srt_proto::receiver::HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS;
 
         let mut options = ConnectionOptions::default();
         cfg.apply_protocol_options(&mut options);
         assert_eq!(
             options.ack_interval_micros,
-            shiguredo_srt::receiver::HIGH_FANIN_ACK_INTERVAL_MICROS
+            srt_proto::receiver::HIGH_FANIN_ACK_INTERVAL_MICROS
         );
         assert_eq!(
             options.light_ack_interval_packets,
-            shiguredo_srt::receiver::HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS
+            srt_proto::receiver::HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS
         );
 
         let template = cfg
@@ -3449,11 +3443,11 @@ mod tests {
             .expect("session template");
         assert_eq!(
             template.ack_interval_micros,
-            shiguredo_srt::receiver::HIGH_FANIN_ACK_INTERVAL_MICROS
+            srt_proto::receiver::HIGH_FANIN_ACK_INTERVAL_MICROS
         );
         assert_eq!(
             template.light_ack_interval_packets,
-            shiguredo_srt::receiver::HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS
+            srt_proto::receiver::HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS
         );
     }
 
@@ -3471,8 +3465,8 @@ mod tests {
             source_backlog_ms: crate::source::DEFAULT_SOURCE_BACKLOG_MS,
             datapath_queue_horizon_ms: crate::queue::DEFAULT_DATAPATH_QUEUE_HORIZON_MS,
             outbound_retry_horizon_ms: crate::scheduling::DEFAULT_OUTBOUND_RETRY_HORIZON_MS,
-            ack_interval_micros: shiguredo_srt::receiver::ACK_INTERVAL_MICROS,
-            light_ack_interval_packets: shiguredo_srt::receiver::LIGHT_ACK_INTERVAL_PACKETS,
+            ack_interval_micros: srt_proto::receiver::ACK_INTERVAL_MICROS,
+            light_ack_interval_packets: srt_proto::receiver::LIGHT_ACK_INTERVAL_PACKETS,
             connections: 1,
             egress: Egress::PerConnection,
             ingress: Ingress::SharedPool(4),

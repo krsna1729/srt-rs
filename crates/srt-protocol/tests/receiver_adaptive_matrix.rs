@@ -21,9 +21,9 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
-use shiguredo_srt::receiver::ReceiverBuffer;
-use shiguredo_srt::wire::{DataPacket, PacketPosition};
-use shiguredo_srt::{
+use srt_proto::receiver::ReceiverBuffer;
+use srt_proto::wire::{DataPacket, PacketPosition};
+use srt_proto::{
     ConnectionOptions, ConnectionOutput, ConnectionState, GroupEvent, GroupMode, SrtConnection,
     SrtGroup, Timestamp,
 };
@@ -395,7 +395,7 @@ fn fragmented_message_and_application_backlog_accounting() {
 
     let mut received_bytes = 0;
     while let Some(event) = listener.poll_event() {
-        if let shiguredo_srt::ConnectionEvent::DataReceived { payload, .. } = event {
+        if let srt_proto::ConnectionEvent::DataReceived { payload, .. } = event {
             received_bytes += payload.len();
         }
     }

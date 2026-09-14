@@ -1756,12 +1756,12 @@ mod tests {
             set_field(
                 row,
                 "ack_interval_micros",
-                &shiguredo_srt::receiver::ACK_INTERVAL_MICROS.to_string(),
+                &srt_proto::receiver::ACK_INTERVAL_MICROS.to_string(),
             );
             set_field(
                 row,
                 "light_ack_interval_packets",
-                &shiguredo_srt::receiver::LIGHT_ACK_INTERVAL_PACKETS.to_string(),
+                &srt_proto::receiver::LIGHT_ACK_INTERVAL_PACKETS.to_string(),
             );
             set_field(row, "rep", "1");
             set_field(row, "secs", "10");

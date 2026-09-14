@@ -7,9 +7,9 @@
 //! draining the generated sans-I/O output.
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use shiguredo_srt::handshake::{DEFAULT_MTU, MAX_FLOW_WINDOW};
-use shiguredo_srt::wire::SrtPacket;
-use shiguredo_srt::{
+use srt_proto::handshake::{DEFAULT_MTU, MAX_FLOW_WINDOW};
+use srt_proto::wire::SrtPacket;
+use srt_proto::{
     ConnectionOptions, ConnectionOutput, ConnectionState, SrtConnection, TimerId, Timestamp,
 };
 use std::hint::black_box;

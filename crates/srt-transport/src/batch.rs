@@ -12,7 +12,7 @@ use crate::{
     ManualTimerStore, OutputDrainBudget, OutputDrainReport, OutputDrainStatus, collect_output_work,
     prepend_outputs, recvmsg_batch,
 };
-use shiguredo_srt::{ConnectionOutput, SrtConnection, Timestamp};
+use srt_proto::{ConnectionOutput, SrtConnection, Timestamp};
 use std::collections::VecDeque;
 use std::io;
 use std::net::SocketAddr;
@@ -38,7 +38,7 @@ impl RecvBatch {
     pub const MAX_CAPACITY: usize = 1024;
     /// Hard cap for one receive scratch buffer. UDP datagrams larger than
     /// this are reported as truncated by the kernel and never fed to SRT.
-    pub const MAX_BUF_LEN: usize = shiguredo_srt::wire::MAX_DATAGRAM_SIZE;
+    pub const MAX_BUF_LEN: usize = srt_proto::wire::MAX_DATAGRAM_SIZE;
 
     #[must_use]
     pub fn new() -> Self {
@@ -536,7 +536,7 @@ where
 mod tests {
     use super::*;
     use crate::*;
-    use shiguredo_srt::{ConnectionOptions, ConnectionOutput, TimerId, Timestamp};
+    use srt_proto::{ConnectionOptions, ConnectionOutput, TimerId, Timestamp};
     use std::collections::VecDeque;
     use std::io;
 
