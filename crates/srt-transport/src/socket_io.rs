@@ -130,12 +130,14 @@ pub fn set_sock_bufs(fd: std::os::fd::RawFd, bytes: usize) -> std::io::Result<()
     Ok(())
 }
 
-/// Bind a UDP socket with SO_REUSEPORT set, 16 MB send/recv buffers, and
-/// non-blocking mode. Returns a plain `std::net::UdpSocket`; each adapter
+/// Bind an IPv4-only UDP socket with SO_REUSEPORT set, non-blocking mode, and
+/// `sock_buf_bytes` applied via [`set_sock_bufs`]. IPv4-only by construction
+/// (`Domain::IPV4`); family-symmetric binds go through `config::bind_udp`
+/// (via `PreparedListener::bind_sockets`).
+/// Returns a plain `std::net::UdpSocket`; each adapter
 /// converts that to its own native socket type (mio's own `UdpSocket`
 /// wraps it directly; tokio's needs no conversion at all -- it already
 /// takes a std socket). `sock_buf_bytes` is passed to [`set_sock_bufs`];
-/// `0` leaves the OS default.
 pub fn bind_reuseport(port: u16, sock_buf_bytes: usize) -> std::io::Result<net::UdpSocket> {
     use std::os::fd::AsRawFd;
     let sock = socket2::Socket::new(
