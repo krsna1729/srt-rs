@@ -1661,6 +1661,16 @@ pub struct AdmissionConfig {
     pub idle_timeout: Duration,
     /// Aggregate requested socket-buffer memory budget. `None` leaves resource
     /// accounting to the application/container.
+    ///
+    /// This budget caps the conservative requested allocation (Linux doubles
+    /// SO_RCVBUF and SO_SNDBUF requests, so 4 × requested bytes per socket).
+    /// It is checked during listener preparation and enforced by shared `Owner`
+    /// drivers when binding shared caller sockets so combined listener and
+    /// caller socket requests cannot bypass the declared budget.
+    ///
+    /// Kernel-granted effective bounds are observable via
+    /// [`crate::advanced::platform::socket_buffer_stats`], which tracks
+    /// the actual OS-granted SO_RCVBUF/SO_SNDBUF sizes across all sockets in the process.
     pub socket_memory_budget: Option<NonZeroUsize>,
 }
 
@@ -2150,6 +2160,16 @@ impl PreparedListener {
         }
         Ok(sockets)
     }
+
+    /// Conservative requested buffer allocation across every listener socket,
+    /// accounting for Linux kernel doubling of SO_RCVBUF and SO_SNDBUF (4 × buffer_bytes × sockets).
+    #[must_use]
+    pub fn requested_socket_memory_bytes(&self) -> usize {
+        self.transport
+            .socket_buffer_bytes
+            .saturating_mul(4)
+            .saturating_mul(self.transport.topology.listener_socket_count().get())
+    }
 }
 
 /// Validated, auto-resolved caller and caller-pool configuration.
@@ -2251,6 +2271,13 @@ impl PreparedCaller {
     /// socket ID and initial sequence number, which makes this caller-pool safe.
     pub fn connection(&self, now: Timestamp) -> Result<SrtConnection, ConfigError> {
         self.session.caller(now)
+    }
+
+    /// Conservative requested buffer allocation for this caller's socket,
+    /// accounting for Linux kernel doubling of SO_RCVBUF and SO_SNDBUF (4 × buffer_bytes).
+    #[must_use]
+    pub fn requested_socket_memory_bytes(&self) -> usize {
+        self.transport.socket_buffer_bytes.saturating_mul(4)
     }
 }
 

@@ -17,6 +17,37 @@ pub struct SocketBufferStats {
     pub sndbuf_max_bytes: usize,
 }
 
+impl SocketBufferStats {
+    /// Conservative lower bound of kernel-granted socket buffer memory across all
+    /// tracked sockets (`sockets × (min_rcvbuf + min_sndbuf)`). Returns zero when
+    /// no sockets have been recorded yet.
+    #[must_use]
+    pub fn min_effective_bytes(self) -> usize {
+        if self.sockets == 0
+            || self.rcvbuf_min_bytes == usize::MAX
+            || self.sndbuf_min_bytes == usize::MAX
+        {
+            0
+        } else {
+            self.sockets
+                .saturating_mul(self.rcvbuf_min_bytes.saturating_add(self.sndbuf_min_bytes))
+        }
+    }
+
+    /// Conservative upper bound of kernel-granted socket buffer memory across all
+    /// tracked sockets (`sockets × (max_rcvbuf + max_sndbuf)`). Returns zero when
+    /// no sockets have been recorded yet.
+    #[must_use]
+    pub fn max_effective_bytes(self) -> usize {
+        if self.sockets == 0 {
+            0
+        } else {
+            self.sockets
+                .saturating_mul(self.rcvbuf_max_bytes.saturating_add(self.sndbuf_max_bytes))
+        }
+    }
+}
+
 static SOCKET_COUNT: AtomicUsize = AtomicUsize::new(0);
 static RCVBUF_MIN: AtomicUsize = AtomicUsize::new(usize::MAX);
 static RCVBUF_MAX: AtomicUsize = AtomicUsize::new(0);
@@ -739,6 +770,10 @@ mod tests {
         assert!(after.rcvbuf_min_bytes <= after.rcvbuf_max_bytes);
         assert!(after.sndbuf_min_bytes > 0);
         assert!(after.sndbuf_min_bytes <= after.sndbuf_max_bytes);
+        assert!(after.min_effective_bytes() > 0);
+        assert!(after.min_effective_bytes() <= after.max_effective_bytes());
+        assert_eq!(SocketBufferStats::default().min_effective_bytes(), 0);
+        assert_eq!(SocketBufferStats::default().max_effective_bytes(), 0);
     }
 
     #[test]

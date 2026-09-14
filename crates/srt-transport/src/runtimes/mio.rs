@@ -241,6 +241,7 @@ pub struct Owner {
     listener: Option<OwnerListenerSide>,
     caller: Option<OwnerCallerSide>,
     caller_pool_policy: Option<(std::num::NonZeroUsize, Duration)>,
+    socket_memory_budget: Option<std::num::NonZeroUsize>,
 }
 
 impl Owner {
@@ -251,6 +252,7 @@ impl Owner {
             listener: None,
             caller: None,
             caller_pool_policy: None,
+            socket_memory_budget: None,
         })
     }
 
@@ -328,6 +330,25 @@ impl Owner {
                  IPv4 address instead of an IPv6 or dual-stack one",
             )));
         }
+        if let Some(budget) = prepared.admission.socket_memory_budget {
+            let caller_requested = self
+                .caller
+                .as_ref()
+                .map_or(0, |c| c.transport.socket_buffer_bytes.saturating_mul(4));
+            let total = prepared
+                .requested_socket_memory_bytes()
+                .saturating_add(caller_requested);
+            if total > budget.get() {
+                return Err(crate::RuntimeBuildError::from(crate::ConfigError::new(
+                    "admission.socket_memory_budget",
+                    format!(
+                        "{total} bytes requested for combined listener and caller buffers exceeds owner budget of {} bytes",
+                        budget.get()
+                    ),
+                )));
+            }
+            self.socket_memory_budget = Some(budget);
+        }
         let mut sockets = prepared.bind_sockets()?;
         let mut socket = mio::net::UdpSocket::from_std(sockets.remove(0));
         self.poll.registry().register(
@@ -402,6 +423,25 @@ impl Owner {
             )?;
         }
         if self.caller.is_none() {
+            if let Some(budget) = self.socket_memory_budget {
+                let listener_requested = self.listener.as_ref().map_or(0, |l| {
+                    l.transport
+                        .socket_buffer_bytes
+                        .saturating_mul(4)
+                        .saturating_mul(l.transport.topology.listener_socket_count().get())
+                });
+                let total =
+                    listener_requested.saturating_add(prepared.requested_socket_memory_bytes());
+                if total > budget.get() {
+                    return Err(crate::RuntimeBuildError::from(crate::ConfigError::new(
+                        "caller.socket_memory_budget",
+                        format!(
+                            "{total} bytes requested for combined listener and caller buffers exceeds owner budget of {} bytes",
+                            budget.get()
+                        ),
+                    )));
+                }
+            }
             let mut socket = mio::net::UdpSocket::from_std(prepared.bind_socket()?);
             self.poll.registry().register(
                 &mut socket,
@@ -1222,6 +1262,29 @@ mod owner_tests {
             result.is_err(),
             "Exclusive ownership must be rejected, not silently accepted"
         );
+    }
+
+    #[test]
+    fn owner_enforces_socket_memory_budget_across_listener_and_caller() {
+        let mut owner = Owner::new().expect("owner builds");
+        let mut config = listener_config();
+        config.transport.socket_buffers =
+            crate::SocketBufferConfig::Bytes(std::num::NonZeroUsize::new(1_024).unwrap());
+        config.admission.socket_memory_budget = std::num::NonZeroUsize::new(5_000);
+        owner.listen(&config).expect("listener fits budget");
+
+        let mut caller_cfg = shared_caller_config("127.0.0.1:9".parse().unwrap());
+        caller_cfg.transport.socket_buffers =
+            crate::SocketBufferConfig::Bytes(std::num::NonZeroUsize::new(1_024).unwrap());
+        let err = owner
+            .connect(&caller_cfg, Timestamp::default())
+            .expect_err("combined listener + caller buffers must exceed budget");
+        match err {
+            crate::RuntimeBuildError::Config(err) => {
+                assert_eq!(err.field(), "caller.socket_memory_budget");
+            }
+            other => panic!("expected ConfigError, got {other:?}"),
+        }
     }
 
     /// A05, ponytail review: `poll_caller_events` (added to

@@ -1107,6 +1107,7 @@ pub struct Owner {
     caller_pool_policy: Option<(std::num::NonZeroUsize, Duration)>,
     caller_pool_policy_explicit: bool,
     expired_callers: VecDeque<crate::LogicalCallerId>,
+    socket_memory_budget: Option<std::num::NonZeroUsize>,
 }
 
 impl Default for Owner {
@@ -1124,6 +1125,7 @@ impl Owner {
             caller_pool_policy: None,
             caller_pool_policy_explicit: false,
             expired_callers: VecDeque::new(),
+            socket_memory_budget: None,
         }
     }
 
@@ -1194,6 +1196,25 @@ impl Owner {
                  IPv4 address instead of an IPv6 or dual-stack one",
             )));
         }
+        if let Some(budget) = prepared.admission.socket_memory_budget {
+            let caller_requested = self
+                .caller
+                .as_ref()
+                .map_or(0, |c| c.transport.socket_buffer_bytes.saturating_mul(4));
+            let total = prepared
+                .requested_socket_memory_bytes()
+                .saturating_add(caller_requested);
+            if total > budget.get() {
+                return Err(crate::RuntimeBuildError::from(crate::ConfigError::new(
+                    "admission.socket_memory_budget",
+                    format!(
+                        "{total} bytes requested for combined listener and caller buffers exceeds owner budget of {} bytes",
+                        budget.get()
+                    ),
+                )));
+            }
+            self.socket_memory_budget = Some(budget);
+        }
         let mut sockets = prepared.bind_sockets()?;
         let socket = UdpSocket::from_std(sockets.remove(0))?;
         self.listener = Some(OwnerListenerSide {
@@ -1256,6 +1277,25 @@ impl Owner {
             )?;
         }
         if self.caller.is_none() {
+            if let Some(budget) = self.socket_memory_budget {
+                let listener_requested = self.listener.as_ref().map_or(0, |l| {
+                    l.transport
+                        .socket_buffer_bytes
+                        .saturating_mul(4)
+                        .saturating_mul(l.transport.topology.listener_socket_count().get())
+                });
+                let total =
+                    listener_requested.saturating_add(prepared.requested_socket_memory_bytes());
+                if total > budget.get() {
+                    return Err(crate::RuntimeBuildError::from(crate::ConfigError::new(
+                        "caller.socket_memory_budget",
+                        format!(
+                            "{total} bytes requested for combined listener and caller buffers exceeds owner budget of {} bytes",
+                            budget.get()
+                        ),
+                    )));
+                }
+            }
             let socket = UdpSocket::from_std(prepared.bind_socket()?)?;
             let policy = self.caller_pool_policy.unwrap_or((
                 prepared.connect.max_in_flight,
@@ -3612,6 +3652,31 @@ mod owner_tests {
             );
         });
     }
+
+    #[test]
+    fn owner_enforces_socket_memory_budget_across_listener_and_caller() {
+        test_runtime().block_on(async {
+            let mut owner = Owner::new();
+            let mut config = listener_config();
+            config.transport.socket_buffers =
+                crate::SocketBufferConfig::Bytes(std::num::NonZeroUsize::new(1_024).unwrap());
+            config.admission.socket_memory_budget = std::num::NonZeroUsize::new(5_000);
+            owner.listen(&config).expect("listener fits budget");
+
+            let mut caller_cfg = shared_caller_config("127.0.0.1:9".parse().unwrap());
+            caller_cfg.transport.socket_buffers =
+                crate::SocketBufferConfig::Bytes(std::num::NonZeroUsize::new(1_024).unwrap());
+            let err = owner
+                .connect(&caller_cfg, Timestamp::default())
+                .expect_err("combined listener + caller buffers must exceed budget");
+            match err {
+                crate::RuntimeBuildError::Config(err) => {
+                    assert_eq!(err.field(), "caller.socket_memory_budget");
+                }
+                other => panic!("expected ConfigError, got {other:?}"),
+            }
+        });
+    }
 }
 
 #[cfg(test)]
@@ -4373,6 +4438,78 @@ mod tests {
         pending.fail_target(target);
         assert_eq!(pending.total_items, 1);
         assert_eq!(pending.total_bytes, b"other".len());
+    }
+
+    /// Revalidates the historical F03 command-channel fairness finding:
+    /// one destination flooding `Session::send()` commands is bounded by its
+    /// per-session quota (`SESSION_COMMAND_CAPACITY = 64`, `SESSION_COMMAND_BYTES = 1 MiB`),
+    /// leaving ample headroom in the shared channel (`FACADE_COMMAND_CAPACITY = 1024`,
+    /// `FACADE_COMMAND_BYTES = 8 MiB`) so a sibling healthy destination is not starved.
+    #[test]
+    fn flooding_session_cannot_starve_sibling_session_command_headroom() {
+        let shared_bytes = Arc::new(AtomicUsize::new(0));
+        let session_a = Arc::new(SessionControl::new());
+        let session_b = Arc::new(SessionControl::new());
+        let (commands_tx, mut commands_rx) = tokio::sync::mpsc::channel(FACADE_COMMAND_CAPACITY);
+
+        // Session A floods up to its item limit
+        let mut charges_a = Vec::new();
+        for _ in 0..SESSION_COMMAND_CAPACITY {
+            let charge =
+                reserve_session_command(&shared_bytes, &session_a, COMMAND_OVERHEAD_CHARGE)
+                    .expect("session A within quota");
+            commands_tx
+                .try_send(Command::Disconnect {
+                    target: SessionTarget::Caller(crate::LogicalCallerId::for_test(0)),
+                })
+                .expect("channel has room");
+            charges_a.push(charge);
+        }
+        // Session A is now blocked by its own quota:
+        let err = match reserve_session_command(&shared_bytes, &session_a, COMMAND_OVERHEAD_CHARGE)
+        {
+            Ok(_) => panic!("session A must hit QueueFull once its quota is reached"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, FacadeError::QueueFull));
+
+        // But Session B is completely untouched and can still reserve and send commands:
+        let charge_b = reserve_session_command(&shared_bytes, &session_b, COMMAND_OVERHEAD_CHARGE)
+            .expect("session B must have full admission headroom despite session A's flood");
+        commands_tx
+            .try_send(Command::Disconnect {
+                target: SessionTarget::Caller(crate::LogicalCallerId::for_test(1)),
+            })
+            .expect("channel has room for session B");
+        drop(charge_b);
+
+        // Also test the byte quota dimension:
+        let session_c = Arc::new(SessionControl::new());
+        let large_charge =
+            reserve_session_command(&shared_bytes, &session_c, SESSION_COMMAND_BYTES)
+                .expect("session C reserves up to its byte quota");
+        let byte_err = match reserve_session_command(&shared_bytes, &session_c, 1) {
+            Ok(_) => panic!("session C must hit byte QueueFull"),
+            Err(err) => err,
+        };
+        assert!(matches!(byte_err, FacadeError::QueueFull));
+
+        // Session B still has headroom for smaller commands under the shared byte bound:
+        let charge_b2 = reserve_session_command(&shared_bytes, &session_b, 1024)
+            .expect("session B can still reserve bytes within shared limit");
+        drop(charge_b2);
+        drop(large_charge);
+
+        // Once Session A's charges drop (as commands are processed), Session A can reserve again:
+        charges_a.clear();
+        assert_eq!(session_a.command_items.load(Ordering::Acquire), 0);
+        let fresh_charge =
+            reserve_session_command(&shared_bytes, &session_a, COMMAND_OVERHEAD_CHARGE)
+                .expect("session A recovers once previous commands complete");
+        drop(fresh_charge);
+
+        // Drain the dummy commands so channels close cleanly
+        while commands_rx.try_recv().is_ok() {}
     }
 
     /// F03: `drive_pending_sends`' every-tick service quantum
