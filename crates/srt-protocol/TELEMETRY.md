@@ -9,7 +9,7 @@ while using Rust names with explicit units instead of reproducing the
 ```rust
 use std::time::Duration;
 
-# use shiguredo_srt::SrtConnection;
+# use srt_proto::SrtConnection;
 # fn sample(connection: &SrtConnection) {
 let first = connection.stats();
 // The application waits using its own runtime and clock.
@@ -63,7 +63,7 @@ but produces no rate.
 The following mapping covers the fields currently sampled by Restream's SRT
 ingest and egress quality collectors:
 
-| Restream/libSRT family | `shiguredo_srt` source |
+| Restream/libSRT family | `srt_proto` source |
 | --- | --- |
 | `msRTT` | receiver `rtt`; sender `peer_rtt_micros` |
 | `mbpsSendRate` | sender interval `srt_bytes_sent.per_second`, plus transport-layer overhead when exact libSRT parity is required |

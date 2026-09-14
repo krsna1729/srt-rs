@@ -54,12 +54,12 @@ mechanisms are validated together. Resolve only the fields that differ for one
 peer:
 
 ```rust
-use shiguredo_srt::{KeyLength, Timestamp};
+use srt_proto::{Timestamp, crypto::KeyLength};
 use srt_transport::{
-    AdmissionResolution, IngressTelemetry, ListenerConfig,
-    ListenerEncryptionConfig, ListenerPeerPolicy, PolicyOverride,
-    RejectionReason, RuntimeFlavor,
+    ListenerConfig, ListenerEncryptionConfig, ListenerPeerPolicy, PolicyOverride, RuntimeFlavor,
 };
+use srt_transport::advanced::admission::{AdmissionResolution, RejectionReason};
+use srt_transport::advanced::telemetry::IngressTelemetry;
 
 let listener = ListenerConfig::builder("0.0.0.0:9000".parse()?).build()?;
 let prepared = listener.prepare(RuntimeFlavor::Tokio)?;

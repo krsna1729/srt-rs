@@ -1,4 +1,16 @@
-# shiguredo_srt
+# srt-proto
+
+The independently versioned Cargo package is `srt-proto`; its Rust library
+crate is `srt_proto`, the fork's explicit protocol namespace.
+
+The integrated endpoint intentionally keeps `ConnectionOutput::SendPacket(Vec<u8>)`
+as its simple ownership contract for the 0.1 API. Callers that own a reusable
+buffer can use `wire::*::encode_into`; a transactional direct-output API will be
+added only if allocation measurements show that the integrated endpoint needs it.
+
+`ConnectionOptions`, `ConnectionEvent`, `ConnectionOutput`, and the related
+0.1 enums remain exhaustive so callers can construct and match them directly;
+future additions require an explicit versioned API review.
 
 Sans-I/O SRT (Secure Reliable Transport) protocol implementation — the
 protocol core of this workspace. Vendored from
@@ -43,7 +55,7 @@ timeout_micros)` before starting or admitting a connection.
 ## Core API
 
 ```rust
-use shiguredo_srt::{
+use srt_proto::{
     ConnectionOptions, ConnectionEvent, ConnectionOutput,
     ConnectionState, SrtConnection, TimerId, Timestamp,
 };
@@ -134,8 +146,8 @@ reachable listener for every connection.
 ## Testing
 
 ```sh
-cargo test -p shiguredo_srt   # unit + integration + doctests
-cargo bench -p shiguredo_srt  # criterion benches:
+cargo test -p srt-proto      # unit + integration + doctests
+cargo bench -p srt-proto     # criterion benches:
                               #   core_packet_loop      per-packet CPU cost, zero I/O
                               #   core_packet_loop_io   same over real loopback UDP
                               #   receiver_loss_scan    O(n)->O(1) loss-list fix regression guard

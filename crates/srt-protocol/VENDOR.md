@@ -1,6 +1,10 @@
 # VENDOR.md — shiguredo/srt-rs import
 
-This crate (`shiguredo_srt`) is a vendored import of
+The independently versioned Cargo package is `srt-proto`; the library crate
+is intentionally named `srt_proto` so the fork has an explicit protocol
+namespace separate from its upstream provenance.
+
+This library crate (`srt_proto`, packaged as `srt-proto`) is a vendored import of
 [`shiguredo/srt-rs`](https://github.com/shiguredo/srt-rs), imported via
 `git subtree` so future upstream commits can be pulled in with a normal
 merge rather than a manual re-copy. It was selected for its pure-Rust,
@@ -82,7 +86,7 @@ nightly-toolchain requirements leaking into the main build).
 The vendored crate's own `[workspace]` block (which listed the four paths
 above) was removed from `crates/srt-protocol/Cargo.toml` — a crate cannot
 both be a member of this repo's root workspace and declare its own separate
-workspace. `pbt/Cargo.toml`'s `shiguredo_srt = { path = "../" }` dependency
+workspace. `pbt/Cargo.toml`'s `srt_proto = { path = "../" }` dependency
 still resolves correctly regardless of which workspace root is in effect.
 
 ## Local patches
@@ -146,7 +150,7 @@ The crypto fixes include regression tests that prove independently-created
 encrypted callers emit different handshake material, explicit zero SEKs are
 rejected, and secret-bearing configuration is redacted. All tests across the crate (unit +
 integration + property-based + doctests) pass after these patches —
-verified via `cargo test -p shiguredo_srt` and `cargo test -p pbt`.
+verified via `cargo test -p srt-proto` and `cargo test -p pbt`.
 
 ## Protocol compliance remediation
 
@@ -324,7 +328,7 @@ This performs a real merge against the squashed import history, so local
 patches (above) will show as ordinary merge conflicts if upstream touches
 the same lines — most likely because upstream fixed the same issue
 themselves, in which case prefer upstream's version and drop the local
-patch. Re-run `cargo test -p shiguredo_srt -p pbt` after any pull, and
+patch. Re-run `cargo test -p srt-proto -p pbt` after any pull, and
 re-check the trimmed paths above (`crates/c-api`, `examples/`) in case
 upstream reintroduces them — re-remove or reconsider case by case.
 

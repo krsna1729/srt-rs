@@ -261,11 +261,9 @@ telemetry, security, and escape hatches, is in the workspace
 The core resolver shape is:
 
 ```rust
-use shiguredo_srt::crypto::KeyLength;
-use srt_transport::{
-    AdmissionResolution, ListenerEncryptionConfig, ListenerPeerPolicy,
-    PolicyOverride, RejectionReason,
-};
+use srt_proto::crypto::KeyLength;
+use srt_transport::{ListenerEncryptionConfig, ListenerPeerPolicy, PolicyOverride};
+use srt_transport::advanced::admission::{AdmissionResolution, RejectionReason};
 
 let outcome = peers.admit_with_resolver(
     peer,

@@ -55,7 +55,7 @@ No automatic commit, push, merge, tag, publication, deployment, system tuning or
 
 | Location | Actual responsibility |
 |---|---|
-| `crates/srt-protocol` (package `shiguredo_srt`) | Sans-I/O protocol, packet parsing, handshake, crypto, sender/receiver windows, message assembly, groups, injected timestamps, statistics. |
+| `crates/srt-protocol` (package `srt-proto`, library `srt_proto`) | Sans-I/O protocol, packet parsing, handshake, crypto, sender/receiver windows, message assembly, groups, injected timestamps, statistics. |
 | `crates/srt-protocol/pbt` (package `pbt`) | Existing property tests. |
 | `crates/srt-protocol/fuzz` | Existing libFuzzer targets; excluded from the main workspace. |
 | `crates/srt-lifecycle` | Pure admission/routing/promotion decisions. Keep clocks, sockets and application policy services out. |
@@ -668,7 +668,7 @@ Read the common sections once, then read only the selected card, prerequisites, 
 
 **Acceptance:** The standalone protocol feature graph requests the zeroization needed for all cached sensitive state. Encryption and rotation vectors still pass. Document residual application-owned copies accurately.
 
-**Checks after authorization:** `Q-CRYPTO-UNIT`; `Q-CRYPTO`; `Q-PROP-CRYPTO`; `Q-CORE`; `VALIDATE ONLY: cargo tree -p shiguredo_srt -e features`.
+**Checks after authorization:** `Q-CRYPTO-UNIT`; `Q-CRYPTO`; `Q-PROP-CRYPTO`; `Q-CORE`; `VALIDATE ONLY: cargo tree -p srt-proto -e features`.
 
 <a id="p03"></a>
 
@@ -1089,13 +1089,13 @@ A command filter can legitimately match zero tests. Read its reported executed c
 
 | Check ID | Command / meaning |
 |---|---|
-| Q-CORE | `cargo test -p shiguredo_srt --lib srt_connection::tests` |
-| Q-CONNECTION | `cargo test -p shiguredo_srt --test test_srt_connection` |
-| Q-CRYPTO-UNIT | `cargo test -p shiguredo_srt --lib crypto::tests` — after E05 removes the timing assertion |
-| Q-CRYPTO | `cargo test -p shiguredo_srt --test test_crypto` |
-| Q-GROUP | `cargo test -p shiguredo_srt --test test_srt_group` |
-| Q-BOUNDS | `cargo test -p shiguredo_srt --test packet_window_boundary_validation` |
-| Q-ALLOC | `cargo test -p shiguredo_srt --test allocation_guard`; extend only where it measures the changed path |
+| Q-CORE | `cargo test -p srt-proto --lib srt_connection::tests` |
+| Q-CONNECTION | `cargo test -p srt-proto --test test_srt_connection` |
+| Q-CRYPTO-UNIT | `cargo test -p srt-proto --lib crypto::tests` — after E05 removes the timing assertion |
+| Q-CRYPTO | `cargo test -p srt-proto --test test_crypto` |
+| Q-GROUP | `cargo test -p srt-proto --test test_srt_group` |
+| Q-BOUNDS | `cargo test -p srt-proto --test packet_window_boundary_validation` |
+| Q-ALLOC | `cargo test -p srt-proto --test allocation_guard`; extend only where it measures the changed path |
 | Q-PROP-CONNECTION | `cargo test -p pbt --test prop_connection` |
 | Q-PROP-MESSAGE | `cargo test -p pbt --test prop_message` |
 | Q-PROP-SENDER | `cargo test -p pbt --test prop_sender` |
@@ -1120,7 +1120,7 @@ A command filter can legitimately match zero tests. Read its reported executed c
 | Q-FEATURE-TOKIO | `cargo check -p srt-transport --no-default-features --features tokio` |
 | Q-FEATURES | Run `cargo check -p srt-transport --no-default-features`, then the same command with one `--features` value at a time: `mio`, `tokio`, `smol`, `monoio`, `glommio`, `compio`; run matching native tests after each affected implementation |
 | Q-DOCS | `cargo xtask doc`; also compile each new example under its documented feature. Inspect current xtask scope first. |
-| Q-MSRV | Existing protocol check: `cargo +1.93.0 check -p shiguredo_srt --all-targets --locked`; separately qualify transport on its declared 1.96 toolchain. Installing toolchains is not a read-only action. |
+| Q-MSRV | Existing protocol check: `cargo +1.93.0 check -p srt-proto --all-targets --locked`; separately qualify transport on its declared 1.96 toolchain. Installing toolchains is not a read-only action. |
 | Q-INTEROP | `cargo test -p srt-bench --test libsrt_interop -- --nocapture` — external libsrt prerequisites and actual executed cases required |
 | Q-BONDED | `cargo test -p srt-bench --test bonded_smoke` — live I/O |
 | Q-COMPIO-QUEUE | `cargo test -p srt-bench --test datapath_queue_bounds -- --ignored --nocapture` — explicit Linux/io_uring live sentinel |
@@ -1130,7 +1130,7 @@ A command filter can legitimately match zero tests. Read its reported executed c
 
 Command cautions:
 
-- Protocol directory `srt-protocol` is package **`shiguredo_srt`**, not package `srt-protocol`.
+- Protocol directory `srt-protocol` is package **`srt-proto`** (library crate `srt_proto`).
 - The workspace toolchain is 1.96.0; protocol declares 1.93. Transport declares 1.96.
 - `srt-bench` enables all six runtime dependencies even when the test filter is narrow.
 - Avoid routine `cargo test --all-targets`: Criterion targets use `harness = false` and can execute benchmark binaries. `cargo check --all-targets` compiles rather than runs, but still consumes resources.

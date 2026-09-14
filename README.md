@@ -15,7 +15,7 @@ No C toolchain, no libsrt linkage — the entire stack is Rust
 
 | Crate | Path | Role |
 |---|---|---|
-| [`shiguredo_srt`](crates/srt-protocol) | `crates/srt-protocol` | Sans-I/O SRT protocol core: handshake (v4/v5), encryption, ACK/NAK/TSBPD, bonding groups, StreamID access control |
+| [`srt-proto`](crates/srt-protocol) (library `srt_proto`) | `crates/srt-protocol` | Sans-I/O SRT protocol core: handshake (v4/v5), encryption, ACK/NAK/TSBPD, bonding groups, StreamID access control |
 | [`srt-transport`](crates/srt-transport) | `crates/srt-transport` | Mechanism: per-runtime UDP adapters, bonded caller and opt-in logical-ingress groups, admission peer table, handoff message types, socket helpers, and ingress telemetry |
 | [`srt-lifecycle`](crates/srt-lifecycle) | `crates/srt-lifecycle` | Policy: worker routing, group affinity, promotion ladder, SYN-cookie codec, terminal-state rule |
 | [`srt-bench`](crates/srt-bench) | `crates/srt-bench` | Caller/listener binaries + bake-off harness across all six runtimes |
@@ -48,7 +48,7 @@ Four crates, layered so that dependencies only ever point downward:
   └───────────┬──────────────────┘   └───────────┬───────────────┘
               │                                  │
   ┌───────────▼──────────────────────────────────▼───────────────┐
-  │ srt-protocol (shiguredo_srt)        sans-I/O state machine   │
+  │ srt-proto (library: srt_proto) sans-I/O state machine   │
   │ SrtConnection · feed_recv_buf() → poll_output()/poll_event() │
   │ handshake · encryption · ACK/NAK/TSBPD · bonding · StreamID  │
   └──────────────────────────────────────────────────────────────┘
@@ -238,11 +238,11 @@ Lint policy is centralized in the root `Cargo.toml` under
 ### Testing
 
 ```sh
-cargo test -p shiguredo_srt      # unit + integration + doctests
+cargo test -p srt-proto        # unit + integration + doctests
 cargo test -p pbt                # property-based tests (proptest)
 cargo test -p srt-lifecycle
 cargo test -p srt-transport --all-features
-cargo bench -p shiguredo_srt     # criterion: core packet loop, loss/tsbpd scans
+cargo bench -p srt-proto       # criterion: core packet loop, loss/tsbpd scans
 cargo bench -p srt-transport     # admission limits and deadline/index tradeoffs
 ```
 

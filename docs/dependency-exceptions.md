@@ -3,7 +3,7 @@
 Last reviewed: 2026-08-24. Next mandatory review: 2026-11-24 or before any
 release that publishes a runtime adapter, whichever comes first.
 
-The published `shiguredo_srt` protocol crate has no known RustSec advisory.
+The published `srt-proto` protocol crate has no known RustSec advisory.
 Two unmaintained transitive crates are present only because this workspace also
 builds six benchmark runtime backends:
 
