@@ -83,7 +83,7 @@ snapshot and sampling interval.
 
 ## Bonded transport
 
-`srt_transport::GroupConnectionStats` and ingress
+`srt_transport::advanced::group::GroupConnectionStats` and ingress
 `PeerTable::bonded_stats()` expose both views needed for a bonded session:
 `logical_*` is the ordered, deduplicated media stream, while `wire_*` is the
 sum across physical legs. Do not replace either with the other: logical

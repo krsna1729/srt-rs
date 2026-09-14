@@ -34,7 +34,7 @@ is not merged; this document describes the production primitive.
 
 ## API shape
 
-`srt_transport::HighResWaiter<K>` is owned by one worker. Connections are
+`srt_transport::advanced::native_io::HighResWaiter<K>` is owned by one worker. Connections are
 sharded onto workers; no shared dataplane state is required.
 
 ```text

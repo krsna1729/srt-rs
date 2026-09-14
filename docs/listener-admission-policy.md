@@ -5,7 +5,7 @@ incoming SRT handshake. Use it when one listening address serves several
 tenants, resources, credentials, or bonding groups.
 
 The recommended entry point is
-`srt_transport::PeerTable::admit_with_resolver`. It provides typed policy,
+`srt_transport::advanced::admission::PeerTable::admit_with_resolver`. It provides typed policy,
 bounded deferral, rejection codes, telemetry, and a guarded raw escape hatch
 without moving application policy into the sans-I/O protocol core.
 

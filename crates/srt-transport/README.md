@@ -261,7 +261,7 @@ telemetry, security, and escape hatches, is in the workspace
 The core resolver shape is:
 
 ```rust
-use shiguredo_srt::KeyLength;
+use shiguredo_srt::crypto::KeyLength;
 use srt_transport::{
     AdmissionResolution, ListenerEncryptionConfig, ListenerPeerPolicy,
     PolicyOverride, RejectionReason,

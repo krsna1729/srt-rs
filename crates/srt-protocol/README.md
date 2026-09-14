@@ -17,11 +17,11 @@ protocol testable, benchmarkable, and fuzzable with zero sockets.
 | Module | Contents |
 |---|---|
 | `srt_connection` | `SrtConnection` — the central state machine (handshake, encryption, keepalive, ACK/NAK scheduling, inactivity timeout) |
-| `srt_handshake` | Caller-listener handshake v4/v5: INDUCTION → CONCLUSION, extensions (HS, KM, SID, GROUP, congestion), reject reasons |
-| `srt_packet` | Wire format: `DataPacket` / `ControlPacket` decode/encode (F-bit dispatch, 16-byte header) |
-| `srt_receiver` | `ReceiverBuffer`: reordering, loss list, TSBPD delivery, ACK/NAK generation, RTT estimation, `ReceiverStats` |
-| `srt_sender` | `SenderBuffer`: flow window, congestion window, pacing (`time_until_send`), retransmit queue, `SenderStats` |
-| `srt_group` | Bonding groups: `SrtGroup` with Broadcast / Backup modes, member lifecycle, group-level send/receive |
+| `handshake` | Caller-listener handshake v4/v5: INDUCTION → CONCLUSION, extensions (HS, KM, SID, GROUP, congestion), reject reasons |
+| `wire` | Wire format: `DataPacket` / `ControlPacket` decode/encode (F-bit dispatch, 16-byte header) |
+| `receiver` | `ReceiverBuffer`: reordering, loss list, TSBPD delivery, ACK/NAK generation, RTT estimation, `ReceiverStats` |
+| `sender` | `SenderBuffer`: flow window, congestion window, pacing (`time_until_send`), retransmit queue, `SenderStats` |
+| `group` | Bonding groups: `SrtGroup` with Broadcast / Backup modes, member lifecycle, group-level send/receive |
 | `crypto` | `CryptoContext`: PBKDF2-HMAC-SHA1 KEK derivation, AES Key Wrap SEK exchange, `CipherMode::Ctr`/`Gcm` payload encryption (AES-CTR or authenticated AES-GCM); key material is redacted in `Debug` and zeroized on drop |
 | `stream_id` | StreamID + `#!::k=v,…` access-control parsing (`AccessControl`, `StreamType`, `StreamMode`) |
 | `buf`, `error`, `time` | Internal checked big-endian cursor helpers (`raw-codec` feature for compatibility tooling), `Error`/`ErrorKind` with backtrace capture, `Timestamp` (µs, injected) |
