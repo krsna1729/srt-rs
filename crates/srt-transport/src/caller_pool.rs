@@ -9,12 +9,13 @@
 //! Deliberately socket-agnostic, like [`CallerTable`] itself: this is pure
 //! admission-control/scheduling state, with no socket of its own. An
 //! application (or [`crate::mio_transport::Owner`]) still owns the actual
-//! egress socket and drives `feed`/`poll_outbound_bounded` on
-//! [`CallerPool::table`]/[`CallerPool::table_mut`] exactly as it would
-//! against a bare [`CallerTable`].
+//! egress socket and drives [`CallerPool::feed`] and
+//! [`CallerPool::poll_outbound_bounded`] exactly as it would against a bare
+//! [`CallerTable`].
 
 use crate::{
-    CallerLeg, CallerTable, DEFAULT_MAX_CALLERS, LogicalCallerId, MAX_CALLERS, PreparedCaller,
+    CallerEvent, CallerLeg, CallerTable, DEFAULT_MAX_CALLERS, LogicalCaller, LogicalCallerId,
+    LogicalCallerMut, MAX_CALLERS, OutputDrainBudget, OutputDrainReport, PreparedCaller,
     RemovedLogicalCaller,
 };
 use shiguredo_srt::Timestamp;
@@ -199,14 +200,71 @@ impl CallerPool {
         &self.callers
     }
 
-    /// Mutable access to the underlying table, for the parts of its API
-    /// this pool does not need to intercept (`feed`, `poll_outbound_bounded`,
-    /// `logical_caller_mut`, ...). Do not call `add_direct`/`remove` on it
-    /// directly for a pooled attempt -- use [`Self::connect`] and
-    /// [`Self::poll_expirations`] instead, or `in_flight`/`queue` here will
-    /// silently drift from the table's real contents.
-    pub fn table_mut(&mut self) -> &mut CallerTable {
+    /// Internal mutable access for runtime adapters. Application code should
+    /// use the forwarding methods below so pool admission bookkeeping cannot
+    /// be bypassed accidentally.
+    #[cfg(any(
+        test,
+        feature = "mio",
+        feature = "tokio",
+        feature = "smol",
+        feature = "monoio",
+        feature = "glommio",
+        feature = "compio",
+        feature = "bench-internals"
+    ))]
+    pub(crate) fn table_mut(&mut self) -> &mut CallerTable {
         &mut self.callers
+    }
+
+    /// Feed one datagram into the pooled caller table.
+    pub fn feed(
+        &mut self,
+        peer: std::net::SocketAddr,
+        data: &[u8],
+        now: Timestamp,
+    ) -> Result<bool, shiguredo_srt::Error> {
+        self.callers.feed(peer, data, now)
+    }
+
+    /// Drain caller output for the application-owned socket.
+    pub fn poll_outbound(
+        &mut self,
+        now: Timestamp,
+        out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
+    ) {
+        self.callers.poll_outbound(now, out);
+    }
+
+    /// Drain caller output with an explicit work budget.
+    pub fn poll_outbound_bounded(
+        &mut self,
+        now: Timestamp,
+        budget: OutputDrainBudget,
+        out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
+    ) -> OutputDrainReport {
+        self.callers.poll_outbound_bounded(now, budget, out)
+    }
+
+    /// Drain caller protocol events with an explicit event bound.
+    pub fn poll_events_bounded(&mut self, max_events: usize, out: &mut Vec<CallerEvent>) -> bool {
+        self.callers.poll_events_bounded(max_events, out)
+    }
+
+    /// Drain caller protocol events using the default finite work bound.
+    pub fn poll_events(&mut self, out: &mut Vec<CallerEvent>) {
+        self.callers.poll_events(out);
+    }
+
+    /// Borrow one logical caller without exposing the table itself.
+    #[must_use]
+    pub fn logical_caller(&self, id: &LogicalCallerId) -> Option<LogicalCaller<'_>> {
+        self.callers.logical_caller(id)
+    }
+
+    /// Mutably borrow one logical caller without exposing admission methods.
+    pub fn logical_caller_mut(&mut self, id: &LogicalCallerId) -> Option<LogicalCallerMut<'_>> {
+        self.callers.logical_caller_mut(id)
     }
 
     fn allocate_request_id(&mut self) -> Result<PoolRequestId, shiguredo_srt::Error> {
@@ -524,13 +582,13 @@ mod tests {
         now: Timestamp,
     ) {
         let mut outbound = Vec::new();
-        pool.table_mut().poll_outbound(now, &mut outbound);
+        pool.poll_outbound(now, &mut outbound);
         for (_, packet) in outbound.drain(..) {
             let _ = listener.admit(peer, &packet, now, options, 0, 1, telemetry);
         }
         listener.poll_outbound(now, &mut outbound);
         for (_, packet) in outbound {
-            let _ = pool.table_mut().feed(peer, &packet, now);
+            let _ = pool.feed(peer, &packet, now);
         }
     }
 
@@ -769,8 +827,7 @@ mod tests {
 
         // Start an orderly close immediately -- `poll_expirations` is
         // never called while this session reads back as `Connected`.
-        pool.table_mut()
-            .logical_caller_mut(&id)
+        pool.logical_caller_mut(&id)
             .expect("session still exists")
             .disconnect(Timestamp::from_micros(500));
 
