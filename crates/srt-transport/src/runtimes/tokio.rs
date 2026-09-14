@@ -4332,6 +4332,49 @@ mod tests {
         );
     }
 
+    /// F05: closing a session while a `Session::send` is still queued in
+    /// `PendingSends` must resolve that send instead of leaking it.
+    /// `fail_target` replies `Protocol(session-gone)`, drops the byte/item
+    /// accounting, and forgets the destination, while another destination's
+    /// backlog is untouched. Unit-level (no sockets): the live close paths
+    /// (`clear_listener_session`/`clear_caller_session`) all funnel here.
+    #[test]
+    fn close_with_queued_sends_fails_only_the_closed_destination() {
+        let mut pending = PendingSends::default();
+        let target = SessionTarget::Caller(crate::LogicalCallerId::for_test(0));
+        let other = SessionTarget::Caller(crate::LogicalCallerId::for_test(1));
+        let now = Timestamp::from_micros(0);
+        let mut rx_a = push_expect_queued(&mut pending, target, b"a".to_vec(), now);
+        let mut rx_b = push_expect_queued(&mut pending, target, b"b".to_vec(), now);
+        let mut other_rx = push_expect_queued(&mut pending, other, b"other".to_vec(), now);
+        assert_eq!(pending.total_items, 3);
+        pending.fail_target(target);
+        for rx in [&mut rx_a, &mut rx_b] {
+            assert!(
+                matches!(rx.try_recv(), Ok(Err(FacadeError::Protocol(_)))),
+                "a send queued on a closed session must resolve, not leak"
+            );
+        }
+        assert!(
+            other_rx.try_recv().is_err(),
+            "another destination's queued send must be untouched by this close"
+        );
+        assert!(
+            !pending.has_pending(target),
+            "a fully failed destination must stop being tracked"
+        );
+        assert!(pending.has_pending(other));
+        assert_eq!(pending.total_items, 1);
+        assert_eq!(pending.total_bytes, b"other".len());
+        assert!(
+            pending.has_capacity(target, SESSION_PENDING_BYTES),
+            "the closed destination's byte accounting must be released"
+        );
+        pending.fail_target(target);
+        assert_eq!(pending.total_items, 1);
+        assert_eq!(pending.total_bytes, b"other".len());
+    }
+
     /// F03: `drive_pending_sends`' every-tick service quantum
     /// (`DRIVER_COMMAND_QUANTUM`) previously always took the same first N
     /// targets in a `HashMap`'s (call-to-call stable) iteration order --
