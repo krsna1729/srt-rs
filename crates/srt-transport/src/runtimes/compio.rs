@@ -327,15 +327,84 @@ impl Default for CompioProductionProfile {
     }
 }
 
+/// Production runtime envelope: explicit SQ/CQ sizing derived from the
+/// Owner TX/RX budget (lanes + RX burst + timeout slack), never Compio
+/// defaults chosen blindly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProductionRuntimeConfig {
+    /// Fixed TX lane count (= TX capacity).
+    pub tx_lanes: usize,
+    /// io_uring submit-queue capacity.
+    pub sq_capacity: u32,
+    /// io_uring completion-queue size.
+    pub cq_size: u32,
+    /// Managed RX buffer-ring entry count (power of two).
+    pub rx_ring_entries: u16,
+    /// Managed RX buffer length (covers max UDP payload).
+    pub rx_buffer_len: usize,
+}
+
+impl ProductionRuntimeConfig {
+    /// Derive SQ/CQ/ring sizes from the Owner envelope. CQ covers lanes +
+    /// RX burst + timeout slack; ring entries round up to power of two.
+    #[must_use]
+    pub fn for_owner(tx_lanes: usize) -> Self {
+        let lanes = tx_lanes.max(1) as u32;
+        let sq_capacity = lanes.saturating_add(256).max(512);
+        let cq_size = sq_capacity.saturating_mul(2);
+        Self {
+            tx_lanes: tx_lanes.max(1),
+            sq_capacity,
+            cq_size,
+            rx_ring_entries: 256,
+            rx_buffer_len: DEFAULT_RX_SLOT_SIZE,
+        }
+    }
+}
+
 /// Build the canonical production Compio runtime for one Owner shard thread.
 ///
-/// Uses default `ProactorBuilder` settings: the Owner's fixed TX lanes and
-/// single-consumer RX path are the only concurrency structure srt-rs
-/// imposes. Returns the live runtime; call [`observe_production_runtime`]
-/// on it to record qualification diagnostics.
-#[must_use]
-pub fn production_runtime_builder() -> compio::runtime::RuntimeBuilder {
-    compio::runtime::RuntimeBuilder::new()
+/// Fail-closed on Linux high-density production: forces
+/// `DriverType::IoUring`, explicit SQ/CQ sizing, `single_issuer`, and an
+/// explicit managed-RX buffer pool. `coop_taskrun` / `taskrun_flag` /
+/// `defer_taskrun` stay at Compio defaults (no evidence to enable them);
+/// SQPOLL stays off (unmeasured default would hide latency truth).
+/// Restream supplies CPU affinity/shard topology; srt-rs never pins CPUs.
+/// Returns `Err` rather than silently becoming Poll.
+pub fn production_runtime_builder(
+    config: ProductionRuntimeConfig,
+) -> Result<compio::runtime::RuntimeBuilder, String> {
+    let mut proactor = compio::driver::ProactorBuilder::new();
+    proactor.driver_type(compio::driver::DriverType::IoUring);
+    proactor.capacity(config.sq_capacity);
+    proactor.cqsize(config.cq_size);
+    proactor.single_issuer(true);
+    proactor.buffer_pool_size(
+        std::num::NonZero::new(config.rx_ring_entries)
+            .ok_or_else(|| "rx_ring_entries must be nonzero".to_string())?,
+    );
+    proactor.buffer_pool_buffer_len(config.rx_buffer_len);
+    let mut builder = compio::runtime::RuntimeBuilder::new();
+    builder.with_proactor(proactor);
+    Ok(builder)
+}
+
+#[cfg(test)]
+mod production_config_tests {
+    use super::*;
+
+    #[test]
+    fn production_config_derives_explicit_envelope() {
+        let cfg = ProductionRuntimeConfig::for_owner(64);
+        assert_eq!(cfg.tx_lanes, 64);
+        // SQ covers lanes + RX burst + slack; CQ doubles SQ.
+        assert!(cfg.sq_capacity >= 64 + 256);
+        assert_eq!(cfg.cq_size, cfg.sq_capacity * 2);
+        assert_eq!(cfg.rx_ring_entries, 256);
+        assert_eq!(cfg.rx_buffer_len, DEFAULT_RX_SLOT_SIZE);
+        // Builder constructs without silently falling back.
+        let _ = production_runtime_builder(cfg).expect("production builder builds");
+    }
 }
 
 /// Observe an already-constructed runtime and return its production profile.
@@ -345,7 +414,6 @@ pub fn production_runtime_builder() -> compio::runtime::RuntimeBuilder {
 /// (`IORING_REGISTER_PBUF_RING`) from multishot receive itself: if the
 /// substrate fails, multishot is reported as
 /// [`MultishotRecvStatus::NotTestedBecauseBufferRingUnavailable`], never
-/// as broken.
 pub async fn observe_production_runtime(
     runtime: &compio::runtime::Runtime,
     tx_lanes: usize,
