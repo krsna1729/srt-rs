@@ -5,8 +5,9 @@
 
 Pure-Rust SRT (Secure Reliable Transport) workspace: a sans-I/O protocol
 core, runtime-specific transport adapters, a runtime-neutral admission
-policy layer, and an executable benchmark harness that compares six async /
-polling runtimes against each other on real loopback UDP traffic.
+policy layer, and an executable benchmark harness that compares the three
+supported runtimes (Mio readiness baseline, Tokio managed async, Compio
+io_uring completion) against each other on real loopback UDP traffic.
 
 No C toolchain, no libsrt linkage — the entire stack is Rust
 (`rust-toolchain.toml` pins 1.96.0).
@@ -18,7 +19,7 @@ No C toolchain, no libsrt linkage — the entire stack is Rust
 | [`srt-proto`](crates/srt-protocol) (library `srt_proto`) | `crates/srt-protocol` | Sans-I/O SRT protocol core: handshake (v4/v5), encryption, ACK/NAK/TSBPD, bonding groups, StreamID access control |
 | [`srt-transport`](crates/srt-transport) | `crates/srt-transport` | Mechanism: per-runtime UDP adapters, bonded caller and opt-in logical-ingress groups, admission peer table, handoff message types, socket helpers, and ingress telemetry |
 | [`srt-lifecycle`](crates/srt-lifecycle) | `crates/srt-lifecycle` | Policy: worker routing, group affinity, promotion ladder, SYN-cookie codec, terminal-state rule |
-| [`srt-bench`](crates/srt-bench) | `crates/srt-bench` | Caller/listener binaries + bake-off harness across all six runtimes |
+| [`srt-bench`](crates/srt-bench) | `crates/srt-bench` | Caller/listener binaries + bake-off harness across the three supported runtimes (mio, tokio, compio) |
 
 Inside `crates/srt-protocol`: [`pbt/`](crates/srt-protocol/pbt)
 (proptest suites, workspace member) and
@@ -79,10 +80,9 @@ protocol settings. Presets remain freely overrideable, and raw
 and each runtime-native `Conn` stay public as supported escape hatches.
 
 ### Listener ingress strategies
-
 A listener can accept many callers four different ways. All four are
-implemented on all six runtimes, so a sweep compares *strategies* rather
-than reporting where coverage happens to exist.
+implemented on all three supported runtimes, so a sweep compares
+*strategies* rather than reporting where coverage happens to exist.
 
 ```
   per-port              shared-pool:K          reuseport-multi:K      reuseport-single:W
@@ -157,7 +157,7 @@ and reports on the results. There is no shell harness to keep in sync.
 
 ```sh
 # Sweep a matrix. One child process per role per cell; results append to TSV.
-srt-bench matrix --runtimes mio,tokio,smol,monoio,glommio,compio \
+srt-bench matrix --runtimes mio,tokio,compio \
   --ingress per-port,shared-pool:4,reuseport-multi:4,reuseport-single:4 \
   --encryption plain,128,192,256 --connections 25 --reps 3 \
   --out scratch/base.tsv
@@ -166,7 +166,7 @@ srt-bench matrix --runtimes mio,tokio,smol,monoio,glommio,compio \
 srt-bench report scratch/base.tsv --by ingress,runtime
 
 # Syscall / io_uring attribution for one pair (needs `perf`).
-srt-bench sysprof --runtime glommio --connections 150
+srt-bench sysprof --runtime compio --connections 150
 
 # A single run, either role (connection *i* lives on port+i for per-port):
 srt-bench runtime=mio mode=receiver 12000 13 120 --connections 4
@@ -306,4 +306,7 @@ or leak artifacts outside the repo.
 - `crates/srt-protocol/VENDOR.md` documents provenance (git-subtree import
   of [shiguredo/srt-rs](https://github.com/shiguredo/srt-rs)), every local
   patch applied on top, and how to pull future upstream commits.
-- glommio backend is Linux-only (io_uring); other runtimes are portable.
+- Smol, Monoio, and Glommio were removed from the supported runtime matrix
+  in `b984c9e`; historical multi-runtime comparisons (for example
+  `docs/cpu-budget.md`) are retained as pre-reduction records and are not
+  reproducible against the current source.

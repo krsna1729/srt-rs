@@ -1,3 +1,10 @@
+> **Historical record (pre-runtime-reduction).** This comparison was
+> measured across six runtimes before `b984c9e` permanently reduced the
+> supported matrix to **Mio, Tokio, and Compio**. Smol, Monoio, and
+> Glommio no longer exist in the tree, so these numbers cannot be
+> reproduced against current source; they are retained for methodology
+> context only.
+
 # CPU budget: what the benchmarks are actually measuring
 
 Short version: until now the benchmarks controlled CPU **implicitly and

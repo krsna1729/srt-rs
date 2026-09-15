@@ -6,18 +6,17 @@ for wire-level interop testing and the six-runtime driver-framework
 bake-off — without linking an application crate or libsrt.
 `publish = false`.
 
-One binary, **six runtime backends**, two roles. At startup it raises the
-soft `RLIMIT_NOFILE` to the hard limit when permitted; `matrix` also prints a
-host-capacity diagnostic, and `system-info` prints the same report on demand.
+One binary, **three runtime backends** (mio, tokio, compio), two roles. At
+startup it raises the
 
 | Backend | Execution model | Notes |
 |---|---|---|
 | `mio` | flat single-threaded epoll loop | only architecture sustaining line-rate at 600 conns (see below) |
 | `tokio` | task-per-connection (`spawn_local` + `LocalSet`) | native `Sleep` timers |
-| `smol` | task-per-connection (`async_executor::LocalExecutor`) | smol's own `block_on` needs `Send`; Conn timers are `!Send` |
-| `monoio` | thread-per-core, completion-based | blocking recvs own their socket |
-| `glommio` | thread-per-core (Linux-only, io_uring) | known listener starvation ≥300 conns — see `src/runtimes/glommio.rs` header |
 | `compio` | completion-based | protocol task + never-cancelled reader task/channel per conn |
+
+Smol, Monoio, and Glommio were removed from the supported matrix in
+`b984c9e`.
 
 ## Usage
 
@@ -146,7 +145,7 @@ that cannot yet realize one logical bonded ingress stream.
 
 `docs/plans/bonded-ingress.plan` is the focused semantic sweep: it runs a
 two-leg Broadcast and Backup publisher through the supported shared listener,
-on all six runtime adapters and every encryption mode. The receiver reports one
+on all three supported runtime adapters and every encryption mode. The receiver reports one
 established logical stream, while its aggregate telemetry retains per-leg wire
 counters; the caller still reports two physical legs. Direct runs reject
 `--bond` unless sender egress is `shared-socket` and ingress is
@@ -237,7 +236,7 @@ sizing) are catalogued in `src/runtimes/mod.rs`.
 ## Build notes
 
 ```sh
-cargo build --release -p srt-bench   # links all six transports
+cargo build --release -p srt-bench   # links mio, tokio, and compio transports
 RUST_LOG=debug ./target/release/srt-bench …   # tracing to stderr
 ```
 

@@ -96,6 +96,45 @@ Unrelated changes to preserve:
 - `HighResWaiter` releases deadline-only keys immediately after they fire, so natural expiry cannot consume a capacity slot permanently; the capacity-reuse regression is covered by `fired_deadline_only_key_releases_capacity`.
 - The focused protocol, lifecycle, transport, workspace all-target compile, rustdoc (`-D warnings`), clippy (`-D warnings`), isolated `pbt` suite, stable/nightly fuzz builds, full `cargo xtask ci`, and `cargo xtask asan` checks pass after this follow-up. No performance claim is made; V00/V03 remain workload and host dependent.
 
+## Bounded-correctness execution: repository/PR truth reconcile (2026-09-15)
+
+Status of the branch at the start of the bounded-correctness execution run
+(head `43b4ab7`, PR #116 base `main`), recorded so neither this ledger, the
+PR body, nor a reviewer is directed at removed architecture:
+
+- Runtime adapters: **Mio / Tokio / Compio only**. Smol, Monoio, and Glommio
+  were removed in `b984c9e` and every remaining `Cargo.toml`, feature flag,
+  and workflow reflects that; historical six-runtime documents
+  (`docs/cpu-budget.md`, parts of `README.md` before this update) describe
+  pre-reduction measurements and are marked as such.
+- Protocol direct final-buffer TX: **landed** (`QueuedOutput`, `OutputMeta`,
+  `OutputInto`, `PendingDatagram`, `PendingData`, `TxCryptoStamp`, direct
+  `encode_into`; encryption deferred to materialization with
+  admission-time reservation, `9cd07bf` + `af45529`). The PR body sentence
+  "transactional direct output deferred" was false and is removed.
+- Legacy `ConnectionOutput::SendPacket(Vec<u8>)`: compatibility /
+  simple-endpoint surface only (`collect_output_work`, unit tests,
+  prepared-caller pending paths). The high-density shared Owner does not
+  route through it.
+- Compio shared `Owner`: production candidate (shared listener + caller
+  socket, `TxPool`, bounded service loop). Its RX still copies payload
+  bytes into protocol-owned state on DATA decode; RX zero-copy is not a
+  merge blocker.
+- `compio_production_fanout` is **smoke/micro evidence only**: its
+  post-window drain disables TX (`max_tx_packets=0`) and waits for
+  `tx_in_flight()==0`, which drains submitted operations but not
+  protocol/scheduler backlog; large admitted-vs-submitted gaps at
+  N=100/600/1000 are backlog evidence, not throughput. Truthful
+  two-role capacity qualification replaces it in this series.
+- `caller_scheduler_allocs` Class-B numbers on this exact head
+  (`docs/results/baseline-caller-scheduler-allocs-43b4ab7.txt`):
+  0.001 alloc/op at 1 caller, 21.705 at 600 direct, 40.782 at 600
+  2-leg groups (1200 legs). The earlier "retain BTreeSet" decision is
+  reversed by this series: the per-op allocation churn (pop-due scratch
+  Vec, protocol ACK `control_info` Vec) is removed via a versioned
+  bounded due heap and pooled control-info buffers, keeping the exact
+  deadline semantics.
+
 ## Reviewer sequence, V00 semantics freeze and PR #116 (2026-09-14)
 - V00 semantics frozen: 1 source → 600 logical egress destinations. Unbonded: 600 logical destinations = 600 physical SRT connections. 2-leg Broadcast: 600 logical destinations = 1,200 physical legs = 1,200 active DATA legs. 2-leg Backup: 600 logical destinations = 1,200 physical legs = 600 active DATA legs (steady state). Numerical workload values (source rate, message shape, impairment, absolute lateness/resource thresholds) remain BLOCKED until real application inputs are supplied.
 - SRT-600 qualification schema: `PLAN_COLUMNS` and `ScenarioSpec` in `srt-bench` replace bare `connections` with `logical_destinations`, `physical_legs`, `active_data_legs`, `bond_mode`, and `legs_per_destination`. `render_plan()` outputs the 9-column plan; `corpus_is_fixed_and_bounded` asserts the derived leg dimensions for all scenarios.

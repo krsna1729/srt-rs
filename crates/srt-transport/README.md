@@ -53,7 +53,7 @@ are implementation details and are available only through the
      insertion fail at that envelope. After a single wake the caller
      services every due connection. See [high-res-waiter.md](../../docs/perf/high-res-waiter.md).
    - `OutputDrainBudget` / `OutputDrainReport` — explicit per-tick action,
-     packet, and byte limits shared by all six output pumps. Send failures
+     packet, and byte limits shared by every runtime's output pumps. Send failures
      are returned and unsent datagrams remain queued in protocol order.
    - `RecvBatch` / `drain_recv_fd` / `tokio_transport::drain_readable` —
      reusable readiness-runtime batch receive (`recvmmsg` + optional
@@ -327,7 +327,8 @@ implementation details.
 
 ## Consumers
 
-- [`srt-bench`](../srt-bench) — enables **all six features** and builds
-  one adapter binary per runtime for the bake-off.
+- [`srt-bench`](../srt-bench) — enables **all three supported runtime
+  features** (mio, tokio, compio) and builds one adapter binary per
+  runtime for the bake-off.
 - Application code should pick one feature and depend on only that
   module (`srt_transport::<runtime>::Conn`).
