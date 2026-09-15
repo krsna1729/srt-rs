@@ -553,6 +553,7 @@ pub struct ListenerSide {
     pub telemetry: IngressTelemetry,
     pub options: crate::AdmissionOptions,
     pub transport: crate::ResolvedTransportConfig,
+    pub idle_timeout: std::time::Duration,
     rx_buf: Vec<u8>,
     poll_fd: compio::runtime::fd::PollFd<std::net::UdpSocket>,
     pending_rx: Option<(SocketAddr, Vec<u8>)>,
@@ -579,6 +580,7 @@ impl ListenerSide {
             telemetry: IngressTelemetry::new(),
             options: prepared.admission_options(),
             transport: prepared.transport,
+            idle_timeout: prepared.admission.idle_timeout,
             rx_buf: vec![0u8; DEFAULT_RX_SLOT_SIZE],
             poll_fd,
             pending_rx: None,
@@ -1303,6 +1305,36 @@ impl Owner {
             )));
         }
         let prepared = config.prepare(crate::RuntimeFlavor::Compio)?;
+        if !matches!(
+            prepared.transport.topology,
+            crate::ResolvedListenerTopology::PerPort
+        ) {
+            return Err(crate::RuntimeBuildError::from(crate::ConfigError::new(
+                "listener.transport.topology",
+                "Owner drives a single PerPort listener socket; pooled or \
+                 reuseport topologies need a multi-acceptor driver, which \
+                 this Owner does not build",
+            )));
+        }
+        if prepared.transport.promotion != srt_lifecycle::Promotion::Never {
+            return Err(crate::ConfigError::new(
+                "listener.transport.promotion",
+                "Owner has no relocation target; set promotion to Never",
+            )
+            .into());
+        }
+        let payload_size = prepared.session.payload_size.resolve()?.get();
+        let has_encryption = prepared.session.encryption().is_some();
+        let req_ceiling = required_session_wire_ceiling(payload_size, has_encryption);
+        if req_ceiling > self.wire_ceiling {
+            return Err(crate::RuntimeBuildError::from(crate::ConfigError::new(
+                "listener",
+                format!(
+                    "session required wire ceiling {req_ceiling} exceeds owner wire ceiling {}",
+                    self.wire_ceiling
+                ),
+            )));
+        }
         if let Some(budget) = prepared.admission.socket_memory_budget {
             let caller_requested = self
                 .caller
@@ -1545,7 +1577,11 @@ impl Owner {
     /// `CallerPool` attempt deadlines (not just protocol timers).
     pub fn time_until_next_deadline(&mut self, now: Timestamp, default_us: u64) -> u64 {
         let l_us = self.listener.as_mut().map_or(default_us, |l| {
-            l.table.time_until_next_deadline(now, default_us)
+            let idle_us = l
+                .table
+                .time_until_idle_deadline(now, l.idle_timeout, default_us);
+            let proto_us = l.table.time_until_next_deadline(now, default_us);
+            idle_us.min(proto_us)
         });
         let c_us = self.caller.as_ref().map_or(default_us, |c| {
             c.pool.time_until_next_deadline(now, default_us)
@@ -1853,6 +1889,23 @@ impl Owner {
         report: &mut OwnerServiceReport,
     ) {
         if let Some(ref mut listener) = self.listener {
+            // Idle reclaim under the same action allowance as output, exactly
+            // like the Mio/Tokio owners. Zero budget performs zero maintenance.
+            let mut allowed = tx_budget.max_actions;
+            if allowed > 0 {
+                let (_, visits) = listener.table.prune_idle_bounded_with_visits(
+                    now,
+                    listener.idle_timeout,
+                    allowed,
+                );
+                report.actions = report.actions.saturating_add(visits);
+                allowed = allowed.saturating_sub(visits);
+            }
+            if allowed == 0 {
+                return;
+            }
+            let bounded =
+                OutputDrainBudget::new(allowed, tx_budget.max_packets, tx_budget.max_bytes);
             let mut sink = OwnerTxSink {
                 sock: &listener.sock,
                 tx_pool: &mut self.tx_pool,
@@ -1860,7 +1913,7 @@ impl Owner {
             };
             let drain_report = listener
                 .table
-                .poll_outbound_bounded_to(now, tx_budget, &mut sink);
+                .poll_outbound_bounded_to(now, bounded, &mut sink);
             report.actions += drain_report.actions;
             report.tx_packets_submitted += drain_report.packets;
             report.tx_bytes_submitted += drain_report.bytes;
@@ -3120,6 +3173,78 @@ mod tests {
                 "one action budget bounds maintenance + drain, got {}",
                 report.actions
             );
+        });
+    }
+
+    #[test]
+    fn listener_rejects_non_perport_topology_and_promotion() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            let l_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+            let l_addr = l_std.local_addr().expect("addr");
+            let cfg = crate::ListenerConfig::builder(l_addr)
+                .topology(crate::ListenerTopology::SharedPool {
+                    listeners: crate::WorkerCount::Count(std::num::NonZeroUsize::MIN),
+                })
+                .build()
+                .expect("config builds");
+            let mut owner = Owner::new(4);
+            let res = owner.listen(&cfg);
+            assert!(
+                res.is_err(),
+                "shared-pool topology must be rejected: {res:?}"
+            );
+            assert!(
+                res.unwrap_err().to_string().contains("topology"),
+                "error must name the topology field"
+            );
+            let cfg2 = crate::ListenerConfig::builder(l_addr)
+                .topology(crate::ListenerTopology::PerPort)
+                .configure_transport(|t| t.promotion = crate::PromotionPolicy::Relocate)
+                .build()
+                .expect("config builds");
+            let res2 = owner.listen(&cfg2);
+            assert!(
+                res2.is_err(),
+                "relocate promotion must be rejected: {res2:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn listener_idle_deadline_visible_in_owner_wake() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            let l_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind listener std");
+            let l_addr = l_std.local_addr().expect("listener addr");
+            let l_sock = compio::net::UdpSocket::from_std(l_std).expect("adopt");
+            let l_cfg = crate::ListenerConfig::builder(l_addr)
+                .topology(crate::ListenerTopology::PerPort)
+                .configure_transport(|t| t.promotion = crate::PromotionPolicy::Never)
+                .build()
+                .expect("listener config");
+            let listener_side = ListenerSide::new(l_sock, &l_cfg).expect("listener side");
+            assert!(
+                !listener_side.idle_timeout.is_zero(),
+                "idle timeout must be configured"
+            );
+            let mut owner = Owner::new(16).with_listener(listener_side);
+            let now = Timestamp::from_micros(1_000_000);
+            let wake = owner.time_until_next_deadline(now, 1_000_000);
+            assert!(
+                wake <= 1_000_000,
+                "owner wake must include idle deadline, got {wake}"
+            );
+            let zero = OwnerServiceBudget {
+                max_actions: 0,
+                max_completions: 0,
+                max_rx_packets: 0,
+                max_rx_bytes: 0,
+                max_tx_packets: 0,
+                max_tx_bytes: 0,
+            };
+            let report = owner.service(now, zero).await;
+            assert_eq!(report.actions, 0, "zero budget must prune nothing");
         });
     }
 
