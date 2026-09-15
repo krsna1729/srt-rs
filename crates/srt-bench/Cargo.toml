@@ -39,8 +39,9 @@ required-features = ["bench-internals"]
 
 [[bench]]
 name = "compio_production_fanout"
+[[bench]]
+name = "compio_tx_qd_sweep"
 harness = false
-
 [features]
 bench-internals = []
 
