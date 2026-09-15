@@ -950,6 +950,94 @@ impl TxEngine {
         reaped
     }
 
+    /// Phase 1 of the two-phase shutdown: stop new admissions while
+    /// keeping every fixed lane alive so in-flight `send_to` work can still
+    /// complete and be reaped. Returns `true` when the engine was running.
+    pub fn begin_shutdown(&mut self) -> bool {
+        if self.shutdown {
+            return false;
+        }
+        self.shutdown = true;
+        true
+    }
+
+    /// Quiescent drain: reap already-ready completions (bounded), then park
+    /// only until in-flight work completes or `deadline` elapses. Returns
+    /// `true` when `in_flight() == 0`. Never resets counters while work is
+    /// still owned by a lane: every slot returns exactly once, through
+    /// normal completion reaping.
+    pub async fn drain_in_flight(
+        &mut self,
+        tx_pool: &mut TxPool,
+        completions: &mut OwnerTxCompletionStats,
+        max_completions: usize,
+        deadline: std::time::Instant,
+    ) -> bool {
+        while self.in_flight() > 0 {
+            let reaped = self.poll_completions(None, max_completions, |meta, res, buf| {
+                tx_pool.return_slot(buf);
+                match res {
+                    Ok(sent) if sent == meta.expected_len => {
+                        completions.completed_ok += 1;
+                    }
+                    Ok(_) => {
+                        completions.short_sends += 1;
+                        completions.last_failed_peer = Some(meta.peer);
+                    }
+                    Err(_) => {
+                        completions.failed_sends += 1;
+                        completions.last_failed_peer = Some(meta.peer);
+                    }
+                }
+            });
+            if self.in_flight() == 0 {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            if reaped == 0 {
+                compio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        }
+        true
+    }
+
+    /// Phase 2 (terminal): after `drain_in_flight` reports quiescence (or
+    /// the caller accepts the hung remainder), stop every lane, reclaim any
+    /// still-owned buffer exactly once, and mark the engine faulted so no
+    /// new work can be admitted afterwards. Lane tasks observe `shutdown`
+    /// and exit; dropping their `JoinHandle`s cancels any still-parked
+    /// worker without awaiting kernel I/O.
+    pub fn finish_shutdown(&mut self, tx_pool: &mut TxPool) {
+        if self.fault.is_some() && self.lanes.iter().all(|l| l.handle.is_finished()) {
+            return;
+        }
+        self.shutdown = true;
+        self.fault = Some(OwnerFault::Shutdown);
+        for lane in &self.lanes {
+            let mut s = lane.state.borrow_mut();
+            s.shutdown = true;
+            if let Some(w) = s.worker_waker.take() {
+                w.wake();
+            }
+            if let Some(job) = s.job.take() {
+                tx_pool.return_slot(job.buf);
+                self.in_flight_count = self.in_flight_count.saturating_sub(1);
+            }
+            if let Some(completion) = s.completion.take() {
+                tx_pool.return_slot(completion.buf);
+                self.in_flight_count = self.in_flight_count.saturating_sub(1);
+            }
+        }
+        self.completed_lanes.borrow_mut().clear();
+        self.idle_lanes.clear();
+        for i in 0..self.capacity {
+            self.idle_lanes.push(i);
+        }
+        self.in_flight_count = 0;
+    }
+
     pub fn shutdown(&mut self, tx_pool: &mut TxPool) {
         if self.shutdown {
             return;
@@ -1216,10 +1304,42 @@ impl Owner {
         self.tx_engine.fault()
     }
 
-    /// Explicit shutdown: stops new admissions, drains jobs, joins workers,
-    /// and returns all buffers to the pool.
+    /// Explicit shutdown: stops new admissions, reclaims queued jobs and
+    /// ready completions, and returns all owned buffers to the pool.
+    ///
+    /// This synchronous form never awaits kernel I/O: a buffer already moved
+    /// into a worker-local in-flight `send_to` stays owned by that lane
+    /// until its completion arrives (see `shutdown_and_drain` for the
+    /// quiescent form that waits for it). No completion can appear after
+    /// lane state is reclaimed.
     pub fn shutdown(&mut self) {
         self.tx_engine.shutdown(&mut self.tx_pool);
+    }
+
+    /// Two-phase quiescent shutdown for production teardown:
+    ///
+    /// 1. `begin_shutdown` stops new admissions/TX submissions;
+    /// 2. in-flight `send_to` work is reaped to zero, bounded by `timeout`;
+    /// 3. `finish_shutdown` stops every fixed lane and reclaims any
+    ///    still-owned buffer exactly once.
+    ///
+    /// Returns `true` when quiescent (`in_flight() == 0`, every slot back in
+    /// the pool). Returns `false` on timeout: lanes are still stopped and
+    /// accounted, but the caller must treat the teardown as hung/unclean
+    /// rather than quiescent.
+    pub async fn shutdown_and_drain(&mut self, timeout: std::time::Duration) -> bool {
+        self.tx_engine.begin_shutdown();
+        let deadline = std::time::Instant::now() + timeout;
+        let (tx_pool, completions, tx_engine) = (
+            &mut self.tx_pool,
+            &mut self.completions,
+            &mut self.tx_engine,
+        );
+        let drained = tx_engine
+            .drain_in_flight(tx_pool, completions, usize::MAX, deadline)
+            .await;
+        self.tx_engine.finish_shutdown(&mut self.tx_pool);
+        drained && self.tx_engine.in_flight() == 0
     }
 
     fn poll_tx_activity(&mut self, cx: &mut Context<'_>) -> Poll<()> {
@@ -3125,6 +3245,52 @@ mod tests {
             );
             assert_eq!(owner.tx_in_flight(), 0);
             assert!(owner.fault().is_some(), "shutdown sets fault");
+        });
+    }
+
+    #[test]
+    fn shutdown_and_drain_reaps_in_flight_to_quiescence() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            let c_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+            let c_sock = compio::net::UdpSocket::from_std(c_std).expect("adopt");
+            let caller_side = CallerSide::new_single(c_sock);
+            let mut owner = Owner::new(4).with_caller(caller_side);
+            let peer: SocketAddr = "127.0.0.1:19998".parse().unwrap();
+            for _ in 0..3 {
+                let caller = owner.caller.as_ref().unwrap();
+                let mut sink = OwnerTxSink {
+                    sock: &caller.sock,
+                    tx_pool: &mut owner.tx_pool,
+                    tx_engine: &mut owner.tx_engine,
+                };
+                let _ = sink.push_datagram(peer, 20, |buf| {
+                    buf[..20].fill(0x77);
+                    Ok(20)
+                });
+            }
+            assert_eq!(owner.tx_in_flight(), 3);
+            let drained = owner
+                .shutdown_and_drain(std::time::Duration::from_secs(5))
+                .await;
+            assert!(drained, "loopback sends must drain to quiescence");
+            assert_eq!(owner.tx_in_flight(), 0);
+            assert_eq!(owner.tx_pool().free_count(), owner.tx_pool().capacity());
+            // Terminal: no new admission after shutdown.
+            let caller = owner.caller.as_ref().unwrap();
+            let mut sink = OwnerTxSink {
+                sock: &caller.sock,
+                tx_pool: &mut owner.tx_pool,
+                tx_engine: &mut owner.tx_engine,
+            };
+            let res = sink.push_datagram(peer, 20, |buf| {
+                buf[..20].fill(0x78);
+                Ok(20)
+            });
+            assert!(
+                matches!(res, Err(_) | Ok(PushResult::Exhausted)),
+                "post-shutdown submit must fail or exhaust, got {res:?}"
+            );
         });
     }
 
