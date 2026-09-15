@@ -1526,13 +1526,14 @@ impl Owner {
     pub fn tx_in_flight(&self) -> usize {
         self.tx_engine.in_flight()
     }
-    /// Delay until the next due timer across all sessions.
+    /// Delay until the next due timer across all sessions, including
+    /// `CallerPool` attempt deadlines (not just protocol timers).
     pub fn time_until_next_deadline(&mut self, now: Timestamp, default_us: u64) -> u64 {
         let l_us = self.listener.as_mut().map_or(default_us, |l| {
             l.table.time_until_next_deadline(now, default_us)
         });
         let c_us = self.caller.as_ref().map_or(default_us, |c| {
-            c.pool.table().time_until_next_deadline(now, default_us)
+            c.pool.time_until_next_deadline(now, default_us)
         });
         l_us.min(c_us)
     }
@@ -2785,13 +2786,54 @@ mod tests {
     }
 
     #[test]
+    fn owner_wake_includes_caller_pool_attempt_deadline() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            let mut owner = Owner::new(16);
+            owner
+                .set_caller_pool_policy(
+                    std::num::NonZeroUsize::new(1).unwrap(),
+                    std::time::Duration::from_millis(10),
+                )
+                .expect("policy set");
+
+            let remote: SocketAddr = "127.0.0.1:19001".parse().unwrap();
+            let cfg = crate::CallerConfig::builder(remote)
+                .ownership(crate::SocketOwnership::Shared)
+                .build()
+                .expect("config");
+            // Attempt admitted at t=0 with a 10ms attempt deadline; the
+            // connection never completes, so no protocol timer is earlier.
+            let now = Timestamp::from_micros(0);
+            let outcome = owner.connect(&cfg, now).expect("connect");
+            assert!(
+                matches!(outcome, crate::PoolOutcome::Admitted(_)),
+                "attempt must be admitted, got {outcome:?}"
+            );
+            // Pool-level deadline (10ms) must surface through the Owner wake,
+            // not just the table's protocol timers.
+            let pool_us = owner
+                .caller
+                .as_ref()
+                .unwrap()
+                .pool
+                .time_until_next_deadline(now, 1_000_000);
+            assert_eq!(pool_us, 10_000, "pool deadline must be 10ms");
+            let owner_us = owner.time_until_next_deadline(now, 1_000_000);
+            assert_eq!(
+                owner_us, 10_000,
+                "Owner wake must include CallerPool attempt deadline"
+            );
+        });
+    }
+
+    #[test]
     fn wire_ceiling_exact_succeeds_and_plus_one_rejected() {
         let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
         runtime.block_on(async {
             let c_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
             let c_sock = compio::net::UdpSocket::from_std(c_std).expect("adopt");
             let caller_side = CallerSide::new_single(c_sock);
-
             // Ceiling of 100 bytes
             let mut owner = Owner::new_with_ceiling(4, 100).with_caller(caller_side);
             assert_eq!(owner.wire_ceiling(), 100);
