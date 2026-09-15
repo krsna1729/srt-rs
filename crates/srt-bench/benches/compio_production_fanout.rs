@@ -24,8 +24,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use bytes::Bytes;
-use srt_proto::{ConnectionOptions, SrtConnection, Timestamp};
-use srt_transport::compio::{CallerSide, ListenerSide, Owner, OwnerServiceBudget};
+use srt_proto::Timestamp;
+use srt_transport::compio::{ListenerSide, Owner, OwnerServiceBudget};
 
 struct CountingAllocator;
 static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -54,18 +54,35 @@ const PAYLOAD_SIZE: usize = 1316;
 // Packet cadence: 1316 bytes every 1316 microseconds.
 const PACKET_INTERVAL_US: u64 = 1316;
 
+/// Process CPU time via `CLOCK_PROCESS_CPUTIME_ID`: wall time divided by
+/// datagrams conflates proactor waiting with service demand.
+fn process_cpu_seconds() -> f64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `clock_gettime` with a valid timespec pointer is sound.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts) };
+    if rc != 0 {
+        return 0.0;
+    }
+    ts.tv_sec as f64 + ts.tv_nsec as f64 / 1e9
+}
+
 #[derive(Debug)]
 pub struct FanoutMetrics {
     pub fanout: usize,
+    pub offered: usize,
+    pub admitted: usize,
+    pub submitted: usize,
+    pub completed_ok: usize,
     pub wire_dgram_per_sec: f64,
     pub retrans_dgram_per_sec: f64,
     pub total_cpu_secs: f64,
     pub cpu_ns_per_dgram: f64,
     pub cpu_us_per_dest: f64,
     pub peak_rss_kb: usize,
-    pub allocs_per_dgram_protocol: f64,
-    pub allocs_per_dgram_transport: f64,
-    pub allocs_per_dgram_compio: f64,
+    pub allocs_per_dgram_measured: f64,
     pub p50_pacing_lateness_us: u64,
     pub p95_pacing_lateness_us: u64,
     pub p99_pacing_lateness_us: u64,
@@ -98,46 +115,44 @@ fn run_fanout_case(fanout: usize, duration_ms: u64) -> FanoutMetrics {
         let l_addr = l_std.local_addr().expect("listener addr");
         let l_sock = compio::net::UdpSocket::from_std(l_std).expect("compio adopt listener");
 
-        let c_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind caller std");
-        let c_sock = compio::net::UdpSocket::from_std(c_std).expect("compio adopt caller");
-
         let l_cfg = srt_transport::ListenerConfig::builder(l_addr)
             .build()
             .expect("listener config");
         let listener_side = ListenerSide::new(l_sock, &l_cfg).expect("listener side");
-        let caller_side = CallerSide::new(c_sock);
 
-        let tx_capacity = (fanout * 2).clamp(64, 2048);
-        let mut owner = Owner::new(tx_capacity)
-            .with_listener(listener_side)
-            .with_caller(caller_side);
+        // TX pool: at least 256 slots so burst handshake traffic at small
+        let tx_capacity = (fanout * 4).clamp(256, 4096);
+        let mut owner = Owner::new(tx_capacity).with_listener(listener_side);
+        // Admit all fanout legs concurrently: set a large in-flight window
+        // before the first connect() so all legs handshake in parallel rather
+        // than being queued behind the first. Owner::connect creates the
+        // caller socket lazily on the first call when no explicit caller side
+        // is pre-attached, so set_caller_pool_policy succeeds here.
+        owner
+            .set_caller_pool_policy(
+                std::num::NonZeroUsize::new(fanout.clamp(1, 2048)).expect("nonzero fanout"),
+                std::time::Duration::from_secs(30),
+            )
+            .expect("pool policy before first connect");
 
-        let mut dest_ids = Vec::with_capacity(fanout);
         let mut now = Timestamp::from_micros(10_000);
-
-        // Pre-create fanout callers
-        for i in 0..fanout {
-            let socket_id = 0x2000 + i as u32;
-            let mut conn = SrtConnection::new_caller(ConnectionOptions {
-                socket_id,
-                tsbpd_delay: 0,
-                ..Default::default()
-            });
-            conn.connect(now).expect("connect");
-            let leg = srt_transport::advanced::caller::CallerLeg {
-                peer: l_addr,
-                connection: conn,
-            };
-            let id = owner
-                .caller_mut()
-                .unwrap()
-                .table
-                .add_direct(leg)
-                .expect("add caller leg");
-            dest_ids.push(id);
+        let mut dest_ids = Vec::with_capacity(fanout);
+        for _i in 0..fanout {
+            let cfg = srt_transport::CallerConfig::builder(l_addr)
+                .ownership(srt_transport::SocketOwnership::Shared)
+                .build()
+                .expect("shared caller config");
+            match owner.connect(&cfg, now).expect("owner connect") {
+                srt_transport::advanced::caller::PoolOutcome::Admitted(id) => dest_ids.push(id),
+                other => panic!("expected immediate pool admission, got {other:?}"),
+            }
         }
 
-        // Handshake warmup loop: connect all destinations
+        // Handshake warmup loop: drive until every destination reaches
+        // Connected. `Owner::connect` admits with max_in_flight=1, so only
+        // the first leg is admitted immediately; the rest queue. Servicing
+        // retires the first leg to Connected, releasing its permit and
+        // admitting the next queued request.
         let budget = OwnerServiceBudget {
             max_completions: 1024,
             max_rx_packets: 1024,
@@ -147,102 +162,143 @@ fn run_fanout_case(fanout: usize, duration_ms: u64) -> FanoutMetrics {
             max_tx_bytes: 2 * 1024 * 1024,
         };
 
-        for _round in 0..15 {
+        for _round in 0..600 {
             now = Timestamp::from_micros(now.as_micros() + 2_000);
             let _ = owner.service(now, budget).await;
+            owner
+                .wait_for_activity(std::time::Duration::from_millis(1))
+                .await;
+            if dest_ids
+                .iter()
+                .filter_map(|id| owner.logical_caller(id).and_then(|c| c.state()))
+                .filter(|s| *s == srt_transport::advanced::caller::LogicalCallerState::Connected)
+                .count()
+                == dest_ids.len()
+            {
+                break;
+            }
         }
 
         // Prepare shared media payload
         let payload = Bytes::from(vec![0xAAu8; PAYLOAD_SIZE]);
-        let mut pacing_latenesses = Vec::with_capacity(10_000);
 
-        // Warmup period
+        // Warmup period: full product path per destination, skipping legs
+        // that never reached Connected (send on a pre-handshake leg is a
+        // hard InvalidState, not a queueable refusal).
         for round in 0..100 {
             now = Timestamp::from_micros(now.as_micros() + PACKET_INTERVAL_US);
             let target_id = dest_ids[round % dest_ids.len()];
-            owner.caller_mut().unwrap().table.bench_push_pending(
-                target_id,
-                l_addr,
-                payload.to_vec(),
-            );
+            let connected = owner.logical_caller(&target_id).and_then(|c| c.state())
+                == Some(srt_transport::advanced::caller::LogicalCallerState::Connected);
+            if !connected {
+                continue;
+            }
+            owner
+                .logical_caller_mut(&target_id)
+                .expect("destination exists")
+                .send_shared(payload.clone(), now)
+                .expect("warmup send admits");
             let _ = owner.service(now, budget).await;
+            owner
+                .wait_for_activity(std::time::Duration::from_millis(1))
+                .await;
         }
 
         // Reset accounting for steady-state measurement window
         ALLOC_COUNT.store(0, Ordering::SeqCst);
         ALLOC_BYTES.store(0, Ordering::SeqCst);
 
+        // Wall-clock service accounting uses process CPU time, not wall time.
+        let cpu_start = process_cpu_seconds();
         let t_start = Instant::now();
-        let mut total_dgrams_sent = 0usize;
+        let mut total_offered = 0usize;
+        let mut total_admitted = 0usize;
+        let mut total_submitted = 0usize;
+        let mut total_completed_ok = 0usize;
         let mut total_inflight_samples = 0usize;
         let mut inflight_accum = 0usize;
+        let mut pacing_latenesses: Vec<u64> = Vec::with_capacity(10_000);
 
         let rounds = (duration_ms * 1000 / PACKET_INTERVAL_US).max(500) as usize;
-        for round in 0..rounds {
+        for _round in 0..rounds {
             now = Timestamp::from_micros(now.as_micros() + PACKET_INTERVAL_US);
 
-            let scheduled_send_time = now;
-            let actual_send_time = Timestamp::from_micros(now.as_micros() + (round % 5) as u64);
-            let lateness = actual_send_time
-                .as_micros()
-                .saturating_sub(scheduled_send_time.as_micros());
-            pacing_latenesses.push(lateness);
-
-            // Fan out to destinations
-            let dest_batch = (fanout / 10).clamp(1, 64);
-            for d in 0..dest_batch {
-                let target_id = dest_ids[(round * dest_batch + d) % dest_ids.len()];
-                let clone = payload.clone();
-                owner.caller_mut().unwrap().table.bench_push_pending(
-                    target_id,
-                    l_addr,
-                    clone.to_vec(),
-                );
+            // Full fanout: every source tick offers one payload to EVERY
+            // *connected* destination through `send_shared`, so offered wire
+            // load is `760 msgs/s * connected` before control/retransmit
+            // traffic. Pre-handshake legs are not offered: send on them is a
+            // hard InvalidState and must not pollute admission accounting.
+            for &target_id in &dest_ids {
+                let connected = owner.logical_caller(&target_id).and_then(|c| c.state())
+                    == Some(srt_transport::advanced::caller::LogicalCallerState::Connected);
+                if !connected {
+                    continue;
+                }
+                total_offered += 1;
+                if owner
+                    .logical_caller_mut(&target_id)
+                    .expect("destination exists")
+                    .send_shared(payload.clone(), now)
+                    .is_ok()
+                {
+                    total_admitted += 1;
+                }
             }
 
+            // Measured pacing lateness: queueing delay between admission
+            // and the next service visit that actually submits the datagram.
+            let admitted_before = total_admitted;
+            let submitted_before = total_submitted;
+            let visit_start = Instant::now();
             let report = owner.service(now, budget).await;
-            total_dgrams_sent += report.tx_packets_submitted;
+            let visit_ns = visit_start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+            // One sample per admitted-but-not-yet-submitted datagram would be
+            // ideal; approximate with per-visit service latency in micros.
+            if total_admitted > admitted_before || report.tx_packets_submitted > 0 {
+                pacing_latenesses.push(visit_ns / 1000);
+            }
+            let _ = submitted_before;
+            total_submitted += report.tx_packets_submitted;
+            total_completed_ok += report.tx_completed_ok;
             inflight_accum += report.tx_in_flight;
             total_inflight_samples += 1;
+            owner
+                .wait_for_activity(std::time::Duration::from_millis(1))
+                .await;
         }
 
-        let elapsed_secs = t_start.elapsed().as_secs_f64();
+        let wall_secs = t_start.elapsed().as_secs_f64();
+        let cpu_secs = process_cpu_seconds() - cpu_start;
         let total_allocs = ALLOC_COUNT.load(Ordering::SeqCst);
 
         pacing_latenesses.sort_unstable();
-        let p50 = pacing_latenesses[pacing_latenesses.len() * 50 / 100];
-        let p95 = pacing_latenesses[pacing_latenesses.len() * 95 / 100];
-        let p99 = pacing_latenesses[pacing_latenesses.len() * 99 / 100];
-        let p999 = pacing_latenesses[pacing_latenesses.len() * 999 / 1000];
+        pacing_latenesses.truncate(50_000);
+        let pick = |q: usize| {
+            if pacing_latenesses.is_empty() {
+                0
+            } else {
+                pacing_latenesses[pacing_latenesses.len() * q / 100]
+            }
+        };
 
-        let dgrams = total_dgrams_sent.max(1);
-        let wire_dgram_per_sec = dgrams as f64 / elapsed_secs;
-        let cpu_ns_per_dgram = (elapsed_secs * 1e9) / dgrams as f64;
-        let total_allocs_per_dgram = total_allocs as f64 / dgrams as f64;
-
-        // Allocation attribution breakdown:
-        // Protocol direct final buffer: 0 allocs on hot path
-        // Transport: slot / sink management: 0 allocs on hot path
-        // Compio runtime: 1 allocation per submitted send future / I/O op
-        let allocs_protocol = 0.0;
-        let allocs_transport = 0.0;
-        let allocs_compio = total_allocs_per_dgram.max(1.0);
-
+        let submitted = total_submitted.max(1);
         FanoutMetrics {
             fanout,
-            wire_dgram_per_sec,
+            offered: total_offered,
+            admitted: total_admitted,
+            submitted: total_submitted,
+            completed_ok: total_completed_ok,
+            wire_dgram_per_sec: submitted as f64 / wall_secs,
             retrans_dgram_per_sec: 0.0,
-            total_cpu_secs: elapsed_secs,
-            cpu_ns_per_dgram,
-            cpu_us_per_dest: (elapsed_secs * 1e6) / fanout as f64,
+            total_cpu_secs: cpu_secs,
+            cpu_ns_per_dgram: (cpu_secs * 1e9) / submitted as f64,
+            cpu_us_per_dest: (cpu_secs * 1e6) / fanout as f64,
             peak_rss_kb: get_peak_rss_kb(),
-            allocs_per_dgram_protocol: allocs_protocol,
-            allocs_per_dgram_transport: allocs_transport,
-            allocs_per_dgram_compio: allocs_compio,
-            p50_pacing_lateness_us: p50,
-            p95_pacing_lateness_us: p95,
-            p99_pacing_lateness_us: p99,
-            p999_pacing_lateness_us: p999,
+            allocs_per_dgram_measured: total_allocs as f64 / submitted as f64,
+            p50_pacing_lateness_us: pick(50),
+            p95_pacing_lateness_us: pick(95),
+            p99_pacing_lateness_us: pick(99),
+            p999_pacing_lateness_us: pick(99),
             tx_inflight_avg: inflight_accum as f64 / total_inflight_samples.max(1) as f64,
             tx_pool_exhaustions: owner.tx_pool().exhaustion_count(),
         }
@@ -264,41 +320,48 @@ fn main() {
     }
 
     println!(
-        "{:<8} | {:>10} | {:>14} | {:>11} | {:>10} | {:>10} | {:>14} | {:>8} | {:>8}",
+        "{:<8} | {:>10} | {:>10} | {:>10} | {:>10} | {:>14} | {:>10} | {:>10} | {:>12} | {:>8}",
         "Fanout",
-        "Dgrams/s",
-        "CPU ns/dgram",
-        "CPU µs/dest",
-        "P50 late",
-        "P99 late",
-        "Alloc/dgram",
-        "RSS (KB)",
+        "Offered",
+        "Admitted",
+        "Submittd",
+        "CPU ns/sub",
+        "CPU us/dest",
+        "P50 svc",
+        "P99 svc",
+        "Alloc/sub",
         "Pool Exh"
     );
     println!(
-        "{:-<8}-+-{:-<10}-+-{:-<14}-+-{:-<11}-+-{:-<10}-+-{:-<10}-+-{:-<14}-+-{:-<8}-+-{:-<8}",
-        "", "", "", "", "", "", "", "", ""
+        "{:-<8}-+-{:-<10}-+-{:-<10}-+-{:-<10}-+-{:-<14}-+-{:-<10}-+-{:-<10}-+-{:-<10}-+-{:-<12}-+-{:-<8}",
+        "", "", "", "", "", "", "", "", "", ""
     );
 
     for r in &results {
         println!(
-            "{:<8} | {:>10.0} | {:>14.1} | {:>11.1} | {:>8} µs | {:>8} µs | {:>14.2} | {:>8} | {:>8}",
+            "{:<8} | {:>10} | {:>10} | {:>10} | {:>14.1} | {:>10.1} | {:>8} us | {:>8} us | {:>12.2} | {:>8}",
             r.fanout,
-            r.wire_dgram_per_sec,
+            r.offered,
+            r.admitted,
+            r.submitted,
             r.cpu_ns_per_dgram,
             r.cpu_us_per_dest,
             r.p50_pacing_lateness_us,
             r.p99_pacing_lateness_us,
-            r.allocs_per_dgram_compio,
-            r.peak_rss_kb,
+            r.allocs_per_dgram_measured,
             r.tx_pool_exhaustions
         );
     }
     println!();
 
-    println!("=== ALLOCATION ATTRIBUTION SPLIT (per wire datagram) ===");
-    println!("- srt-protocol (direct final buffer):  0.0 allocs/datagram");
-    println!("- srt-transport (reusable TxPool):     0.0 allocs/datagram");
-    println!("- compio (runtime send operation op):  ~1.0 allocs/datagram");
+    println!("=== MEASUREMENT NOTES ===");
+    println!("- Offered/admitted/submitted/completed_ok are tracked separately per stage.");
+    println!("- CPU is process CPU time (CLOCK_PROCESS_CPUTIME_ID), not wall time.");
+    println!("- Alloc/sub is one measured global total per submitted datagram;");
+    println!("  per-layer protocol/transport/runtime attribution is NOT claimed here.");
+    println!("- Pacing lateness is per-visit service latency, not synthetic round % 5.");
+    println!("- TX path is direct single-copy final-buffer materialization");
+    println!("  (payload copied once into the reusable slot, encrypted in place),");
+    println!("  not zero-copy TX: the kernel still copies user data on send.");
     println!();
 }
