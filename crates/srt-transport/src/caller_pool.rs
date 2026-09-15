@@ -150,6 +150,10 @@ pub struct CallerPool {
     expired: u64,
     failed: u64,
     cancelled: u64,
+    /// Table-owned reusable scratch for bounded expiration visits. Holds at
+    /// most `max_actions` candidates per visit; retained across visits so
+    /// the production path never allocates.
+    visit_scratch: Vec<PoolDeadline>,
 }
 
 impl CallerPool {
@@ -190,6 +194,7 @@ impl CallerPool {
             expired: 0,
             failed: 0,
             cancelled: 0,
+            visit_scratch: Vec::new(),
         }
     }
 
@@ -443,12 +448,17 @@ impl CallerPool {
             return (Vec::new(), 0);
         }
         let now_micros = now.as_micros();
-        let candidates: Vec<PoolDeadline> =
-            self.deadlines.iter().take(max_actions).copied().collect();
-        let candidate_actions = candidates.len();
-        let mut expired = Vec::new();
-        let mut resolved = Vec::new();
-        for candidate in candidates {
+        // Non-allocating production path: reuse table-owned scratch for
+        self.visit_scratch.clear();
+        self.visit_scratch
+            .extend(self.deadlines.iter().take(max_actions).copied());
+        let candidate_actions = self.visit_scratch.len();
+        let mut expired_ids: Vec<LogicalCallerId> = Vec::new();
+        let mut expired_count = 0usize;
+        let mut idx = 0;
+        while idx < self.visit_scratch.len() {
+            let candidate = self.visit_scratch[idx];
+            idx += 1;
             // `raw_direct_state`, not `LogicalCallerState`: the latter
             // folds `Closing` into the same `Connecting` value as a
             // session that has never connected at all, which would make a
@@ -468,35 +478,30 @@ impl CallerPool {
                     ConnectionState::Connected
                     | ConnectionState::Disconnected
                     | ConnectionState::Closing,
-                ) => resolved.push(candidate),
-                Some(_) if candidate.deadline_micros <= now_micros => expired.push(candidate),
+                ) => {
+                    self.deadlines.remove(&candidate);
+                    self.in_flight.remove(&candidate.caller_id);
+                }
+                Some(_) if candidate.deadline_micros <= now_micros => {
+                    self.deadlines.remove(&candidate);
+                    if let Some(attempt) = self.in_flight.remove(&candidate.caller_id) {
+                        self.callers.remove(candidate.caller_id);
+                        self.push_outcome(PoolEvent::Expired {
+                            request_id: attempt.request_id,
+                            caller_id: candidate.caller_id,
+                        });
+                        expired_ids.push(candidate.caller_id);
+                    }
+                    expired_count += 1;
+                }
                 Some(_) => {}
             }
         }
-        for candidate in &resolved {
-            self.deadlines.remove(candidate);
-            self.in_flight.remove(&candidate.caller_id);
-        }
-        for candidate in &expired {
-            self.deadlines.remove(candidate);
-            if let Some(attempt) = self.in_flight.remove(&candidate.caller_id) {
-                self.callers.remove(candidate.caller_id);
-                self.push_outcome(PoolEvent::Expired {
-                    request_id: attempt.request_id,
-                    caller_id: candidate.caller_id,
-                });
-            }
-        }
-        self.expired = self.expired.saturating_add(expired.len() as u64);
+        self.visit_scratch.clear();
+        self.expired = self.expired.saturating_add(expired_count as u64);
         let admitted = self.admit_queued(now, max_actions.saturating_sub(candidate_actions));
         let visits = candidate_actions.saturating_add(admitted);
-        (
-            expired
-                .into_iter()
-                .map(|candidate| candidate.caller_id)
-                .collect(),
-            visits,
-        )
+        (expired_ids, visits)
     }
 
     /// Atomically retire one pooled attempt or established session,

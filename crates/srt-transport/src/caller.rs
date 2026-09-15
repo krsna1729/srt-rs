@@ -87,6 +87,7 @@ impl LogicalDueIndex {
         }
     }
 
+    #[cfg(any(test, feature = "bench-internals"))]
     fn len(&self) -> usize {
         self.heap.len()
     }

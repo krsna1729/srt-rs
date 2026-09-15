@@ -1839,14 +1839,26 @@ impl Owner {
         tx_budget: OutputDrainBudget,
         report: &mut OwnerServiceReport,
     ) {
-        if let Some(ref mut caller) = self.caller {
+        if let Some(caller) = self.caller.as_mut() {
             // Retire stalled attempts to Connected-established sessions and
             // admit queued requests, exactly like the Mio/Tokio owners. This
             // is what releases the in-flight permit so the next queued fanout
             // leg can handshake instead of stalling behind the first.
-            let _ = caller
-                .pool
-                .poll_expirations_bounded(now, tx_budget.max_actions.max(1));
+            // Zero action budget performs zero maintenance: the whole visit
+            // is bounded by one shared action allowance.
+            let mut allowed = tx_budget.max_actions;
+            if allowed > 0 {
+                let (_, visits) = caller
+                    .pool
+                    .poll_expirations_bounded_with_visits(now, allowed);
+                report.actions = report.actions.saturating_add(visits);
+                allowed = allowed.saturating_sub(visits);
+            }
+            if allowed == 0 {
+                return;
+            }
+            let bounded =
+                OutputDrainBudget::new(allowed, tx_budget.max_packets, tx_budget.max_bytes);
             let mut sink = OwnerTxSink {
                 sock: &caller.sock,
                 tx_pool: &mut self.tx_pool,
@@ -1854,7 +1866,7 @@ impl Owner {
             };
             let drain_report = caller
                 .pool
-                .poll_outbound_bounded_to(now, tx_budget, &mut sink);
+                .poll_outbound_bounded_to(now, bounded, &mut sink);
             report.actions += drain_report.actions;
             report.tx_packets_submitted += drain_report.packets;
             report.tx_bytes_submitted += drain_report.bytes;
@@ -3036,6 +3048,54 @@ mod tests {
             );
             assert_eq!(owner.tx_in_flight(), 0);
             assert!(owner.fault().is_some(), "shutdown sets fault");
+        });
+    }
+
+    #[test]
+    fn zero_action_budget_performs_zero_maintenance() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            let c_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+            let c_sock = compio::net::UdpSocket::from_std(c_std).expect("adopt");
+            let caller_side = CallerSide::new_single(c_sock);
+            let mut owner = Owner::new(4).with_caller(caller_side);
+            let now = Timestamp::from_micros(1_000);
+            let budget = OwnerServiceBudget {
+                max_actions: 0,
+                max_completions: 0,
+                max_rx_packets: 0,
+                max_rx_bytes: 0,
+                max_tx_packets: 0,
+                max_tx_bytes: 0,
+            };
+            let report = owner.service(now, budget).await;
+            assert_eq!(report.actions, 0, "zero budget must perform zero actions");
+            assert_eq!(report.tx_packets_submitted, 0);
+            assert_eq!(report.completions_reaped, 0);
+        });
+    }
+
+    #[test]
+    fn one_action_budget_bounds_whole_caller_visit() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            let c_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+            let c_sock = compio::net::UdpSocket::from_std(c_std).expect("adopt");
+            let caller_side = CallerSide::new_single(c_sock);
+            let mut owner = Owner::new(16).with_caller(caller_side);
+            // Expired attempt + queued output both eligible: exactly one
+            // bounded unit of action work may occur.
+            let now = Timestamp::from_micros(1_000_000);
+            let budget = OwnerServiceBudget {
+                max_actions: 1,
+                ..Default::default()
+            };
+            let report = owner.service(now, budget).await;
+            assert!(
+                report.actions <= 1,
+                "one action budget bounds maintenance + drain, got {}",
+                report.actions
+            );
         });
     }
 
