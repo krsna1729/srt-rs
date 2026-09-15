@@ -1,10 +1,32 @@
-use shiguredo_srt::{
-    ConnectionOptions, ConnectionOutput, ConnectionState, ControlPacket, ControlType,
-    GroupMemberState, GroupMode, SrtConnection, SrtGroup, SrtPacket, TimerId, Timestamp,
+use srt_proto::wire::{ControlPacket, ControlType, SrtPacket};
+use srt_proto::{
+    ConnectionOptions, ConnectionOutput, ConnectionState, GroupMemberState, GroupMode,
+    SrtConnection, SrtGroup, TimerId, Timestamp,
 };
 
 fn ts(micros: u64) -> Timestamp {
     Timestamp::from_micros(micros)
+}
+
+#[test]
+fn group_member_limit_is_enforced() {
+    let mut group = SrtGroup::new(0x4000_0100, GroupMode::Broadcast).unwrap();
+    for member_id in 0..srt_proto::MAX_GROUP_MEMBERS as u32 {
+        group
+            .add_member(
+                member_id,
+                1,
+                SrtConnection::new_caller(ConnectionOptions::default()),
+            )
+            .unwrap();
+    }
+    let result = group.add_member(
+        srt_proto::MAX_GROUP_MEMBERS as u32,
+        1,
+        SrtConnection::new_caller(ConnectionOptions::default()),
+    );
+    assert!(result.is_err());
+    assert_eq!(group.members().len(), srt_proto::MAX_GROUP_MEMBERS);
 }
 
 fn transfer(caller: &mut SrtConnection, listener: &mut SrtConnection, now: Timestamp) {
@@ -135,7 +157,8 @@ fn aligned_group_member_retransmits_after_sequence_jump() {
     let mut nak = ControlPacket::new(ControlType::Nak, 0, member.socket_id());
     nak.control_info.extend_from_slice(&1_000u32.to_be_bytes());
     let mut encoded = Vec::new();
-    nak.encode(&mut encoded);
+    nak.encode(&mut encoded)
+        .expect("packet fits configured datagram bound");
     member.feed_recv_buf(&encoded, ts(101_000)).unwrap();
 
     let retransmitted = packets_from(member)

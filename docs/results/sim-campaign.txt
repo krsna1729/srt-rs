@@ -1,0 +1,9 @@
+seed=305419896 loss=0% reorder=0% sent=500 delivered=500 gaps=0
+seed=3405705229 loss=5% reorder=5% sent=500 delivered=36 gaps=464
+seed=1 loss=10% reorder=5% sent=500 delivered=26 gaps=474
+seed=3735928559 loss=5% reorder=0% sent=500 delivered=32 gaps=468
+seed=2882343476 loss=20% reorder=0% sent=500 delivered=0 gaps=500
+seed=2 loss=10% reorder=5% sent=500 delivered=40 gaps=460
+seed=3 loss=10% reorder=5% sent=500 delivered=0 gaps=500
+seed=42 loss=10% reorder=5% sent=500 delivered=20 gaps=480
+seed=999 loss=10% reorder=5% sent=500 delivered=4 gaps=496

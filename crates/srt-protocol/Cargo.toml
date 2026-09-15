@@ -1,6 +1,6 @@
 [package]
-name = "shiguredo_srt"
-version = "2026.1.0-canary.1"
+name = "srt-proto"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.93"
 description = "SRT (Secure Reliable Transport) library"
@@ -20,10 +20,19 @@ include = [
     "VENDOR.md",
 ]
 
+# The package is independently versioned as `srt-proto`; keep the library
+# import name explicit so the fork's protocol API is `srt_proto`.
+[lib]
+name = "srt_proto"
+
 [features]
 # Test-only hooks for black-box interop validation. They are intentionally
 # opt-in so production connections always use the protocol refresh cadence.
 test-support = []
+# Raw cursor helpers are kept as an opt-in compatibility surface for protocol
+# tests and custom wire tooling; the normal crate surface is typed packets and
+# handshakes.
+raw-codec = []
 
 [dependencies]
 # local patch (crates/srt-protocol/VENDOR.md): replaced aws-lc-rs
@@ -57,12 +66,12 @@ criterion = "0.8"
 # V01: `seed_encrypted_packet_count_for_test` (an accelerated key-refresh
 # test hook) is gated behind the opt-in `test-support` feature, which this
 # crate's own test/pbt targets do not otherwise enable -- without this, the
-# only reason `cargo test -p shiguredo_srt` compiled at all was feature
+# only reason the protocol tests compiled at all was feature
 # unification from srt-bench (the one crate that enables `test-support`)
 # sharing the same workspace build graph, which is not the case for CI
 # invocations that build only this crate (e.g. the ASan job, release.yml).
 # A path-only dev-dependency on itself is stripped on publish.
-shiguredo_srt = { path = ".", features = ["test-support"] }
+srt_proto = { package = "srt-proto", path = ".", features = ["test-support", "raw-codec"] }
 
 [[bench]]
 name = "core_packet_loop"

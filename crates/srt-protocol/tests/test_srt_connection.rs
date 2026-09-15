@@ -4,10 +4,12 @@
 
 use std::time::Duration;
 
-use shiguredo_srt::{
-    CipherMode, ConnectionEvent, ConnectionOptions, ConnectionOutput, ConnectionState,
-    ConnectionStats, DataPacket, ErrorKind, GroupExtensionData, GroupType, KeyFlag, KeyLength,
-    PacketPosition, SrtConnection, SrtPacket, TimerId, Timestamp,
+use srt_proto::crypto::{CipherMode, KeyFlag, KeyLength};
+use srt_proto::handshake::{GroupExtensionData, GroupType};
+use srt_proto::wire::{DataPacket, PacketPosition, SrtPacket};
+use srt_proto::{
+    ConnectionEvent, ConnectionOptions, ConnectionOutput, ConnectionState, ConnectionStats,
+    ErrorKind, SrtConnection, TimerId, Timestamp,
 };
 
 /// テスト用のデフォルトオプション (TSBPD 遅延を 0 にして即時配信)
@@ -252,7 +254,8 @@ fn connected_connection_rejects_packets_for_another_socket_id() {
     };
     data.dest_socket_id = 0x3333;
     let mut misrouted = Vec::new();
-    data.encode(&mut misrouted);
+    data.encode(&mut misrouted)
+        .expect("packet fits configured datagram bound");
 
     let error = listener
         .feed_recv_buf(&misrouted, ts(20_001))
@@ -404,7 +407,7 @@ fn encrypted_connection_rejects_an_explicit_all_zero_sek() {
         }
     }
     let error = error.expect("zero SEK must fail during induction response handling");
-    assert_eq!(error.kind, shiguredo_srt::ErrorKind::CryptoError);
+    assert_eq!(error.kind, srt_proto::ErrorKind::CryptoError);
     assert!(error.reason.contains("all zero"));
 }
 
@@ -1032,7 +1035,9 @@ fn connection_stats_cover_restream_quality_inputs() {
         payload: vec![1, 2, 3].into(),
     };
     let mut encoded = Vec::new();
-    undecryptable.encode(&mut encoded);
+    undecryptable
+        .encode(&mut encoded)
+        .expect("packet fits configured datagram bound");
     assert!(listener.feed_recv_buf(&encoded, ts(130_000)).is_err());
     assert_eq!(
         listener
@@ -1071,7 +1076,9 @@ fn encrypted_connection_counts_and_rejects_plaintext_data() {
         payload: b"must be encrypted".to_vec().into(),
     };
     let mut encoded = Vec::new();
-    plaintext.encode(&mut encoded);
+    plaintext
+        .encode(&mut encoded)
+        .expect("packet fits configured datagram bound");
 
     assert!(listener.feed_recv_buf(&encoded, ts(100_000)).is_err());
     let receiver = listener.stats().receiver.expect("receiver telemetry");
@@ -1749,18 +1756,20 @@ fn dropreq_drops_receiver_message() {
         _ => panic!("expected data packet"),
     };
 
-    let mut dropreq = shiguredo_srt::ControlPacket::new(
-        shiguredo_srt::ControlType::DropReq,
+    let mut dropreq = srt_proto::wire::ControlPacket::new(
+        srt_proto::wire::ControlType::DropReq,
         100,
         listener.socket_id(),
     );
     dropreq.type_specific_info = msg_num & 0x03FF_FFFF;
     let mut cif = Vec::new();
-    shiguredo_srt::write_u32(&mut cif, first_seq);
-    shiguredo_srt::write_u32(&mut cif, last_seq);
+    srt_proto::write_u32(&mut cif, first_seq);
+    srt_proto::write_u32(&mut cif, last_seq);
     dropreq.control_info = cif;
     let mut buf = Vec::new();
-    dropreq.encode(&mut buf);
+    dropreq
+        .encode(&mut buf)
+        .expect("packet fits configured datagram bound");
 
     listener.feed_recv_buf(&buf, now).expect("feed dropreq");
 
@@ -1779,17 +1788,19 @@ fn dropreq_rejects_high_bit_endpoints() {
         let mut listener = SrtConnection::new_listener(test_options());
         establish_connection(&mut caller, &mut listener).expect("connected");
 
-        let mut dropreq = shiguredo_srt::ControlPacket::new(
-            shiguredo_srt::ControlType::DropReq,
+        let mut dropreq = srt_proto::wire::ControlPacket::new(
+            srt_proto::wire::ControlType::DropReq,
             100,
             listener.socket_id(),
         );
         let mut cif = Vec::with_capacity(8);
-        shiguredo_srt::write_u32(&mut cif, first_seq);
-        shiguredo_srt::write_u32(&mut cif, last_seq);
+        srt_proto::write_u32(&mut cif, first_seq);
+        srt_proto::write_u32(&mut cif, last_seq);
         dropreq.control_info = cif;
         let mut encoded = Vec::new();
-        dropreq.encode(&mut encoded);
+        dropreq
+            .encode(&mut encoded)
+            .expect("packet fits configured datagram bound");
 
         let error = listener
             .feed_recv_buf(&encoded, ts(100_000))
@@ -1805,17 +1816,19 @@ fn dropreq_rejects_range_larger_than_receive_window() {
     let mut listener = SrtConnection::new_listener(test_options());
     establish_connection(&mut caller, &mut listener).expect("connected");
 
-    let mut dropreq = shiguredo_srt::ControlPacket::new(
-        shiguredo_srt::ControlType::DropReq,
+    let mut dropreq = srt_proto::wire::ControlPacket::new(
+        srt_proto::wire::ControlType::DropReq,
         100,
         listener.socket_id(),
     );
     let mut cif = Vec::with_capacity(8);
-    shiguredo_srt::write_u32(&mut cif, 0);
-    shiguredo_srt::write_u32(&mut cif, 0x7FFF_FFFF);
+    srt_proto::write_u32(&mut cif, 0);
+    srt_proto::write_u32(&mut cif, 0x7FFF_FFFF);
     dropreq.control_info = cif;
     let mut encoded = Vec::new();
-    dropreq.encode(&mut encoded);
+    dropreq
+        .encode(&mut encoded)
+        .expect("packet fits configured datagram bound");
 
     let error = listener
         .feed_recv_buf(&encoded, ts(100_000))
@@ -1890,7 +1903,7 @@ fn key_rotation_exchanges_km_control_packets_and_data_keeps_flowing() {
     const PACKETS_TO_SWITCH: u64 = 4;
     caller
         .seed_encrypted_packet_count_for_test(
-            shiguredo_srt::CryptoContext::KM_REFRESH_PERIOD - PACKETS_TO_SWITCH,
+            srt_proto::crypto::CryptoContext::KM_REFRESH_PERIOD - PACKETS_TO_SWITCH,
         )
         .expect("seed encrypted packet count for accelerated key refresh");
 

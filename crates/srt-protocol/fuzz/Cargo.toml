@@ -101,5 +101,5 @@ test = false
 
 [dependencies]
 libfuzzer-sys = "0.4"
-shiguredo_srt = { path = ".." }
+srt_proto = { package = "srt-proto", path = "..", features = ["raw-codec"] }
 srt-transport = { path = "../../srt-transport", features = ["bench-internals"] }

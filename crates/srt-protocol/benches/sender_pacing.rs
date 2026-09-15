@@ -6,7 +6,8 @@
 use std::hint::black_box;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use shiguredo_srt::{SenderBuffer, Timestamp};
+use srt_proto::Timestamp;
+use srt_proto::sender::SenderBuffer;
 
 fn primed(period: u64, repay: bool) -> SenderBuffer {
     let mut buf = SenderBuffer::new(0, 8192, 120);

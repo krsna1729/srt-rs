@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use shiguredo_srt::{ConnectionOutput, SrtConnection, ConnectionOptions, ConnectionState, TimerId, Timestamp};
+use srt_proto::{ConnectionOutput, SrtConnection, ConnectionOptions, ConnectionState, TimerId, Timestamp};
 
 fn transfer(from: &mut SrtConnection, to: &mut SrtConnection, now: Timestamp) {
     while let Some(output) = from.poll_output() {

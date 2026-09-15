@@ -9,9 +9,11 @@
 //! 4. エッジケース: 境界値、空データ、大量データでの動作
 
 use proptest::prelude::*;
-use shiguredo_srt::{
-    ConnectionEvent, ConnectionOptions, ConnectionOutput, ConnectionState, ControlType,
-    DEFAULT_MTU, SrtConnection, SrtPacket, TimerId, Timestamp,
+use srt_proto::handshake::DEFAULT_MTU;
+use srt_proto::wire::{ControlType, SrtPacket};
+use srt_proto::{
+    ConnectionEvent, ConnectionOptions, ConnectionOutput, ConnectionState, SrtConnection, TimerId,
+    Timestamp,
 };
 
 // ============================================================================
@@ -567,7 +569,7 @@ proptest! {
         };
         packet.dest_socket_id = wrong_socket;
         let mut bytes = Vec::new();
-        SrtPacket::Data(packet).encode(&mut bytes);
+        SrtPacket::Data(packet).encode(&mut bytes).expect("packet fits configured datagram bound");
 
         let rejected = listener.feed_recv_buf(&bytes, now);
         prop_assert!(rejected.is_err());
@@ -801,7 +803,7 @@ proptest! {
         let high_offset = recovered.len() as u32;
         template.sequence_number = initial_seq.wrapping_add(high_offset) & SEQUENCE_MASK;
         let mut bytes = Vec::new();
-        SrtPacket::Data(template.clone()).encode(&mut bytes);
+        SrtPacket::Data(template.clone()).encode(&mut bytes).expect("packet fits configured datagram bound");
         listener.feed_recv_buf(&bytes, now).expect("expose loss window");
 
         for (offset, was_recovered) in recovered.iter().copied().enumerate() {
@@ -810,7 +812,7 @@ proptest! {
             }
             template.sequence_number = initial_seq.wrapping_add(offset as u32) & SEQUENCE_MASK;
             bytes.clear();
-            SrtPacket::Data(template.clone()).encode(&mut bytes);
+            SrtPacket::Data(template.clone()).encode(&mut bytes).expect("packet fits configured datagram bound");
             listener.feed_recv_buf(&bytes, now).expect("recover packet");
         }
 

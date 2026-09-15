@@ -1,4 +1,4 @@
-use shiguredo_srt::{ConnectionOutput, SrtConnection, TimerId, Timestamp};
+use srt_proto::{ConnectionOutput, SrtConnection, TimerId, Timestamp};
 
 /// Manual timer store — every native runtime's `Conn` uses this same type
 /// for explicit timer lifecycle control, rather than each wrapping its own

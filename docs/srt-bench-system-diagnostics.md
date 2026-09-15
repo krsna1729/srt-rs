@@ -20,7 +20,7 @@ cells. The report includes:
 - UDP socket buffer defaults and maxima;
 - UDP memory pressure thresholds and the local port range;
 - network backlog/listener limits; and
-- kernel/io_uring settings relevant to the six runtime backends.
+- kernel/io_uring settings relevant to the supported runtime backends (mio, tokio, compio).
 
 The matrix's resource requirement is per process. A sender retains one UDP
 socket per connection, while pooled listeners retain their listener sockets

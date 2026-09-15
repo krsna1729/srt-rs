@@ -1,0 +1,16 @@
+=== CALLER TABLE SCHEDULER ALLOCATOR & DEADLINE MEASUREMENT ===
+Warmed steady-state: deadline update + ready cycling + bounded drain + timer movement
+Iterations: 10,000 per scenario
+
+Scenario                                      |  Allocs/op |   Bytes/op |  Mean CPU ns |     P50 ns |     P95 ns |     P99 ns
+----------------------------------------------+------------+------------+--------------+------------+------------+-----------
+1 logical caller                              |      2.552 |      122.3 |        695.9 |        561 |        751 |       4657
+600 logical callers                           |     30.890 |     1135.5 |      14167.2 |      13911 |      25208 |      45628
+600 bonded groups (1200 physical legs)        |     58.899 |     2096.5 |      42499.7 |      40281 |      78638 |     107090
+
+=== CLASS B: SCHEDULER-ISOLATED (no payload send) ===
+isolated: 1 logical caller                    |      0.001 |        0.0 |        277.8 |        260 |        310 |        450
+isolated: 600 logical callers                 |     21.705 |      732.1 |       9798.0 |       9024 |      17526 |      34813
+isolated: 600 bonded groups (1200 legs)       |     40.782 |     1292.9 |      28582.0 |      28433 |      51818 |      67921
+
+Class A mixes scheduler + sender/protocol allocation. Only class B isolates the BTreeSet deadline structure.

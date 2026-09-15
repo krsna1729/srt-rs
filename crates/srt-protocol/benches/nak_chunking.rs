@@ -7,9 +7,10 @@
 //! draining the generated sans-I/O output.
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use shiguredo_srt::{
-    ConnectionOptions, ConnectionOutput, ConnectionState, DEFAULT_MTU, MAX_FLOW_WINDOW,
-    SrtConnection, SrtPacket, TimerId, Timestamp,
+use srt_proto::handshake::{DEFAULT_MTU, MAX_FLOW_WINDOW};
+use srt_proto::wire::SrtPacket;
+use srt_proto::{
+    ConnectionOptions, ConnectionOutput, ConnectionState, SrtConnection, TimerId, Timestamp,
 };
 use std::hint::black_box;
 
@@ -79,7 +80,9 @@ fn prepared_listener(window: u32, shape: LossShape) -> (SrtConnection, u64) {
     };
     packet.sequence_number = high_offset & SEQUENCE_MASK;
     let mut encoded = Vec::new();
-    SrtPacket::Data(packet.clone()).encode(&mut encoded);
+    SrtPacket::Data(packet.clone())
+        .encode(&mut encoded)
+        .expect("packet fits configured datagram bound");
     listener
         .feed_recv_buf(&encoded, now)
         .expect("expose benchmark losses");
@@ -95,7 +98,9 @@ fn prepared_listener(window: u32, shape: LossShape) -> (SrtConnection, u64) {
         }
         packet.sequence_number = offset;
         encoded.clear();
-        SrtPacket::Data(packet.clone()).encode(&mut encoded);
+        SrtPacket::Data(packet.clone())
+            .encode(&mut encoded)
+            .expect("packet fits configured datagram bound");
         listener
             .feed_recv_buf(&encoded, now)
             .expect("recover benchmark packet");

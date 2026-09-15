@@ -12,7 +12,7 @@ repository = "https://github.com/krsna1729/srt-rs"
 include = ["/src/**", "/tests/**", "/benches/**", "/examples/**", "LICENSE", "README.md"]
 
 [dependencies]
-shiguredo_srt = { version = "=2026.1.0-canary.1", path = "../srt-protocol" }
+srt_proto = { package = "srt-proto", version = "=0.1.0", path = "../srt-protocol" }
 # The admission table applies admission policy (cookie routing, terminal
 # checks), so mechanism depends on policy. Acyclic: lifecycle depends only
 # on the protocol crate and never on this one.
@@ -32,16 +32,8 @@ zeroize = "1.8"
 # Runtime-specific dependencies (optional, feature-gated)
 mio = { version = "1", features = ["os-poll", "net"], optional = true }
 tokio = { version = "1", features = ["net", "time", "rt", "sync", "macros"], optional = true }
-smol = { version = "2", optional = true }
-futures-lite = { version = "2", optional = true }
-monoio = { version = "0.2", features = ["sync"], optional = true }
-glommio = { version = "0.9", optional = true }
-# glommio 0.9 takes `From<socket2::Socket>` at its own pinned 0.4.x, not the
-# 0.6 used above -- Cargo allows both as distinct deps via this rename, so
-# glommio_transport's socket conversions build against the version glommio
-# itself actually expects.
-socket2_glommio = { package = "socket2", version = "0.4", optional = true }
-compio = { version = "0.19", features = ["io", "io-uring", "net", "runtime", "time"], optional = true }
+compio = { version = "=0.19.2", features = ["io", "io-uring", "net", "runtime", "time"], optional = true }
+futures-util = { version = "0.3", default-features = false, features = ["alloc"], optional = true }
 
 [dev-dependencies]
 criterion = "0.8"
@@ -69,13 +61,20 @@ name = "caller_table_scheduling"
 harness = false
 required-features = ["bench-internals"]
 
+[[bench]]
+name = "caller_scheduler_allocs"
+harness = false
+required-features = ["bench-internals"]
+
+[[bench]]
+name = "compio_tx_allocs"
+harness = false
+required-features = ["compio", "bench-internals"]
+
 [features]
 mio = ["dep:mio"]
 tokio = ["dep:tokio"]
-smol = ["dep:smol", "dep:futures-lite"]
-monoio = ["dep:monoio"]
-glommio = ["dep:glommio", "dep:futures-lite", "dep:socket2_glommio"]
-compio = ["dep:compio"]
+compio = ["dep:compio", "dep:futures-util"]
 bench-internals = []
 
 [lints]

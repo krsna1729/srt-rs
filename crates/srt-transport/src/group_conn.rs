@@ -1,9 +1,9 @@
 use crate::{
     BatchIoStats, CallerConfig, ConfigError, GroupConfig, ManualTimerStore, OutputDrainBudget,
     OutputDrainReport, RecvBatch, RecvBudget, RecvDrainReport, RuntimeFlavor,
-    drain_connected_outputs, drain_recv_fd, sendmsg_connected_batch,
+    drain_connected_outputs, drain_recv_fd_with_capacity, sendmsg_connected_batch,
 };
-use shiguredo_srt::{Bytes, ConnectionOutput, SrtConnection, Timestamp};
+use srt_proto::{Bytes, ConnectionOutput, SrtConnection, Timestamp};
 use std::collections::VecDeque;
 use std::fmt;
 use std::os::fd::AsRawFd;
@@ -46,7 +46,7 @@ impl GroupCallerLeg {
 pub enum GroupBuildError {
     Config(ConfigError),
     Io(std::io::Error),
-    Protocol(shiguredo_srt::Error),
+    Protocol(srt_proto::Error),
     InvalidGroupType,
 }
 
@@ -84,8 +84,8 @@ impl From<std::io::Error> for GroupBuildError {
     }
 }
 
-impl From<shiguredo_srt::Error> for GroupBuildError {
-    fn from(value: shiguredo_srt::Error) -> Self {
+impl From<srt_proto::Error> for GroupBuildError {
+    fn from(value: srt_proto::Error) -> Self {
         Self::Protocol(value)
     }
 }
@@ -96,6 +96,7 @@ struct GroupLegIo {
     timers: ManualTimerStore,
     pending_outputs: VecDeque<ConnectionOutput>,
     recv_budget: RecvBudget,
+    batch_capacity: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -117,7 +118,7 @@ pub struct GroupLegDriveReport {
     pub malformed_datagrams: usize,
     /// `true` if a genuine recv or send syscall failure on this leg (not
     /// `WouldBlock`, and not a malformed datagram) caused *this* call to
-    /// transition the member into [`shiguredo_srt::GroupMemberState::Broken`]
+    /// transition the member into [`srt_proto::GroupMemberState::Broken`]
     /// (T04) -- `false` on a call that finds it already `Broken`, so a
     /// consumer watching for a once-per-failure edge (trigger failover,
     /// emit one alert) does not see it re-fire on every later drive.
@@ -143,10 +144,10 @@ impl GroupDriveReport {
 pub struct GroupLegStats {
     pub member_id: u32,
     pub weight: u16,
-    pub state: shiguredo_srt::GroupMemberState,
+    pub state: srt_proto::GroupMemberState,
     pub local_addr: Option<std::net::SocketAddr>,
     pub peer_addr: Option<std::net::SocketAddr>,
-    pub connection: shiguredo_srt::ConnectionStats,
+    pub connection: srt_proto::ConnectionStats,
 }
 
 /// Group-level telemetry with explicitly separate logical and wire views.
@@ -191,7 +192,7 @@ pub struct GroupAggregateStats {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GroupConnectionStats {
     pub group_id: u32,
-    pub mode: shiguredo_srt::GroupMode,
+    pub mode: srt_proto::GroupMode,
     pub aggregate: GroupAggregateStats,
     pub legs: Vec<GroupLegStats>,
 }
@@ -217,7 +218,7 @@ pub(crate) struct GroupLogicalCounters {
 }
 
 pub(crate) fn group_connection_stats(
-    group: &shiguredo_srt::SrtGroup,
+    group: &srt_proto::SrtGroup,
     logical: GroupLogicalCounters,
     mut addresses: impl FnMut(u32) -> (Option<std::net::SocketAddr>, Option<std::net::SocketAddr>),
 ) -> GroupConnectionStats {
@@ -231,11 +232,11 @@ pub(crate) fn group_connection_stats(
     let mut legs = Vec::with_capacity(group.members().len());
     for member in group.members() {
         match member.state() {
-            shiguredo_srt::GroupMemberState::Active => aggregate.active_legs += 1,
-            shiguredo_srt::GroupMemberState::Standby => aggregate.standby_legs += 1,
-            shiguredo_srt::GroupMemberState::Pending => aggregate.pending_legs += 1,
-            shiguredo_srt::GroupMemberState::Unstable => aggregate.unstable_legs += 1,
-            shiguredo_srt::GroupMemberState::Broken => aggregate.broken_legs += 1,
+            srt_proto::GroupMemberState::Active => aggregate.active_legs += 1,
+            srt_proto::GroupMemberState::Standby => aggregate.standby_legs += 1,
+            srt_proto::GroupMemberState::Pending => aggregate.pending_legs += 1,
+            srt_proto::GroupMemberState::Unstable => aggregate.unstable_legs += 1,
+            srt_proto::GroupMemberState::Broken => aggregate.broken_legs += 1,
         }
         let connection = member.connection().stats();
         if let Some(sender) = connection.sender {
@@ -301,7 +302,7 @@ pub(crate) fn group_connection_stats(
 /// keeps group semantics in one implementation instead of copying subtly
 /// different versions into every runtime adapter.
 pub struct GroupConn {
-    group: shiguredo_srt::SrtGroup,
+    group: srt_proto::SrtGroup,
     legs: Vec<GroupLegIo>,
     logical_payloads_sent: u64,
     logical_payload_bytes_sent: u64,
@@ -366,7 +367,7 @@ impl GroupConn {
                 policy,
             ));
         }
-        let mode = shiguredo_srt::GroupMode::from_group_type(group.group_type)
+        let mode = srt_proto::GroupMode::from_group_type(group.group_type)
             .ok_or(GroupBuildError::InvalidGroupType)?;
         Ok(Self::new_with_policies(
             group.group_id,
@@ -380,9 +381,9 @@ impl GroupConn {
     /// and for applications that own their own socket provisioning.
     pub fn new(
         group_id: u32,
-        mode: shiguredo_srt::GroupMode,
+        mode: srt_proto::GroupMode,
         legs: impl IntoIterator<Item = GroupConnectionLeg>,
-    ) -> Result<Self, shiguredo_srt::Error> {
+    ) -> Result<Self, srt_proto::Error> {
         Self::new_with_policies(
             group_id,
             mode,
@@ -400,10 +401,10 @@ impl GroupConn {
 
     fn new_with_policies(
         group_id: u32,
-        mode: shiguredo_srt::GroupMode,
+        mode: srt_proto::GroupMode,
         legs: impl IntoIterator<Item = (GroupConnectionLeg, GroupLegPolicy)>,
-    ) -> Result<Self, shiguredo_srt::Error> {
-        let mut group = shiguredo_srt::SrtGroup::new(group_id, mode)?;
+    ) -> Result<Self, srt_proto::Error> {
+        let mut group = srt_proto::SrtGroup::new(group_id, mode)?;
         let mut io_legs = Vec::new();
         let mut batch_capacity = 0usize;
         for (leg, policy) in legs {
@@ -415,6 +416,7 @@ impl GroupConn {
                 timers: ManualTimerStore::new(),
                 pending_outputs: VecDeque::new(),
                 recv_budget: policy.recv_budget,
+                batch_capacity: policy.batch_capacity.max(1),
             });
         }
         let batch_capacity = if io_legs.is_empty() {
@@ -441,7 +443,7 @@ impl GroupConn {
     }
 
     #[must_use]
-    pub fn group(&self) -> &shiguredo_srt::SrtGroup {
+    pub fn group(&self) -> &srt_proto::SrtGroup {
         &self.group
     }
 
@@ -464,7 +466,7 @@ impl GroupConn {
 
     /// Send one logical payload according to the group's Broadcast or Backup
     /// policy. The return value is the number of physical legs selected.
-    pub fn send(&mut self, payload: &[u8], now: Timestamp) -> Result<usize, shiguredo_srt::Error> {
+    pub fn send(&mut self, payload: &[u8], now: Timestamp) -> Result<usize, srt_proto::Error> {
         let legs = self.group.send(payload, now)?;
         self.logical_payloads_sent = self.logical_payloads_sent.saturating_add(1);
         self.logical_payload_bytes_sent = self
@@ -479,7 +481,7 @@ impl GroupConn {
         &mut self,
         payload: Bytes,
         now: Timestamp,
-    ) -> Result<usize, shiguredo_srt::Error> {
+    ) -> Result<usize, srt_proto::Error> {
         let len = payload.len() as u64;
         let legs = self.group.send_shared(payload, now)?;
         self.logical_payloads_sent = self.logical_payloads_sent.saturating_add(1);
@@ -507,13 +509,27 @@ impl GroupConn {
     }
 
     /// Return the next deduplicated, sequence-aligned group payload.
-    pub fn poll_data(&mut self, now: Timestamp) -> Option<shiguredo_srt::GroupPacket> {
-        let packet = self.group.poll_data(now)?;
+    pub fn poll_data(&mut self, now: Timestamp) -> Option<srt_proto::group::GroupPacket> {
+        self.poll_data_bounded(now, srt_proto::MAX_GROUP_MEMBERS)
+            .packet
+    }
+
+    /// Return the next deduplicated payload and whether another immediate
+    /// lifecycle-drain pass is required before waiting for new input.
+    pub fn poll_data_bounded(
+        &mut self,
+        now: Timestamp,
+        max_events: usize,
+    ) -> srt_proto::GroupDataPoll {
+        let poll = self.group.poll_data_bounded(now, max_events);
+        let Some(packet) = poll.packet.as_ref() else {
+            return poll;
+        };
         self.logical_payloads_received = self.logical_payloads_received.saturating_add(1);
         self.logical_payload_bytes_received = self
             .logical_payload_bytes_received
             .saturating_add(packet.payload.len() as u64);
-        Some(packet)
+        poll
     }
 
     #[must_use]
@@ -557,10 +573,11 @@ impl GroupConn {
                 // `drain_recv_fd`/`drain_group_leg_outputs` already fold
                 // into their `Ok` reports) marks a leg broken.
                 let mut malformed_datagrams = 0usize;
-                let recv_result = drain_recv_fd(
+                let recv_result = drain_recv_fd_with_capacity(
                     leg.socket.as_raw_fd(),
                     recv_batch,
                     leg.recv_budget,
+                    leg.batch_capacity,
                     |_, data| {
                         if conn.feed_recv_buf(data, now).is_err() {
                             malformed_datagrams += 1;
@@ -659,10 +676,10 @@ fn drain_group_leg_outputs(
 /// so a consumer of `GroupLegDriveReport::newly_broken` watching for a
 /// once-per-failure edge (trigger failover, emit one alert) needs this
 /// distinction, not "did this call attempt to mark it".
-fn mark_member_broken_if_new(group: &mut shiguredo_srt::SrtGroup, member_id: u32) -> bool {
+fn mark_member_broken_if_new(group: &mut srt_proto::SrtGroup, member_id: u32) -> bool {
     let was_broken = group
         .member(member_id)
-        .is_some_and(|member| member.state() == shiguredo_srt::GroupMemberState::Broken);
+        .is_some_and(|member| member.state() == srt_proto::GroupMemberState::Broken);
     group.mark_member_broken(member_id) && !was_broken
 }
 
@@ -684,7 +701,7 @@ mod group_conn_tests {
             socket.set_nonblocking(true).expect("peer is nonblocking");
             Self {
                 socket,
-                connection: SrtConnection::new_listener(shiguredo_srt::ConnectionOptions {
+                connection: SrtConnection::new_listener(srt_proto::ConnectionOptions {
                     tsbpd_delay: 0,
                     ..Default::default()
                 }),
@@ -727,16 +744,16 @@ mod group_conn_tests {
     /// already-broken leg.
     #[test]
     fn mark_member_broken_if_new_only_reports_the_first_transition() {
-        let mut group = shiguredo_srt::SrtGroup::new(
-            shiguredo_srt::SRTGROUP_MASK | 1,
-            shiguredo_srt::GroupMode::Broadcast,
+        let mut group = srt_proto::SrtGroup::new(
+            srt_proto::handshake::SRTGROUP_MASK | 1,
+            srt_proto::GroupMode::Broadcast,
         )
         .expect("group builds");
         group
             .add_member(
                 1,
                 10,
-                SrtConnection::new_caller(shiguredo_srt::ConnectionOptions::default()),
+                SrtConnection::new_caller(srt_proto::ConnectionOptions::default()),
             )
             .expect("member adds");
 
@@ -759,14 +776,11 @@ mod group_conn_tests {
         for runtime in [
             RuntimeFlavor::Mio,
             RuntimeFlavor::Tokio,
-            RuntimeFlavor::Smol,
-            RuntimeFlavor::Monoio,
-            RuntimeFlavor::Glommio,
             RuntimeFlavor::Compio,
         ] {
             let mut first_peer = Peer::new();
             let mut second_peer = Peer::new();
-            let group = GroupConfig::new(42, shiguredo_srt::GroupType::Broadcast);
+            let group = GroupConfig::new(42, srt_proto::handshake::GroupType::Broadcast);
             let mut conn = GroupConn::caller(
                 group,
                 [
@@ -804,7 +818,7 @@ mod group_conn_tests {
                 conn.drive(now, OutputDrainBudget::default(), &mut report)
                     .expect("group receives protocol output");
                 if conn.group().members().iter().all(|member| {
-                    member.connection().state() == shiguredo_srt::ConnectionState::Connected
+                    member.connection().state() == srt_proto::ConnectionState::Connected
                 }) {
                     break;
                 }
@@ -815,7 +829,7 @@ mod group_conn_tests {
                     .members()
                     .iter()
                     .all(|member| member.connection().state()
-                        == shiguredo_srt::ConnectionState::Connected),
+                        == srt_proto::ConnectionState::Connected),
                 "{runtime:?} group did not connect"
             );
             assert_eq!(
@@ -856,7 +870,7 @@ mod group_conn_tests {
     #[test]
     fn caller_rejects_a_shared_ownership_leg_instead_of_building_an_unconnected_socket() {
         let peer = Peer::new();
-        let group = GroupConfig::new(44, shiguredo_srt::GroupType::Broadcast);
+        let group = GroupConfig::new(44, srt_proto::handshake::GroupType::Broadcast);
         let result = GroupConn::caller(
             group,
             [GroupCallerLeg::new(
@@ -911,7 +925,7 @@ mod group_conn_tests {
                 .build()
                 .expect("second caller config");
         let conn = GroupConn::caller(
-            GroupConfig::new(45, shiguredo_srt::GroupType::Broadcast),
+            GroupConfig::new(45, srt_proto::handshake::GroupType::Broadcast),
             [
                 GroupCallerLeg::new(1, 10, first_config),
                 GroupCallerLeg::new(2, 20, second_config),
@@ -924,12 +938,14 @@ mod group_conn_tests {
         assert_eq!(conn.recv_batch.capacity(), 7);
         assert_eq!(conn.legs[0].recv_budget, RecvBudget::new(1, 2));
         assert_eq!(conn.legs[1].recv_budget, RecvBudget::new(4, 9));
+        assert_eq!(conn.legs[0].batch_capacity, 3);
+        assert_eq!(conn.legs[1].batch_capacity, 7);
     }
 
     fn connect_two_leg_group(runtime: RuntimeFlavor) -> (GroupConn, Peer, Peer) {
         let mut first_peer = Peer::new();
         let mut second_peer = Peer::new();
-        let group = GroupConfig::new(43, shiguredo_srt::GroupType::Broadcast);
+        let group = GroupConfig::new(43, srt_proto::handshake::GroupType::Broadcast);
         let mut conn = GroupConn::caller(
             group,
             [
@@ -962,9 +978,12 @@ mod group_conn_tests {
             second_peer.drive(now);
             conn.drive(now, OutputDrainBudget::default(), &mut report)
                 .expect("group receives protocol output");
-            if conn.group().members().iter().all(|member| {
-                member.connection().state() == shiguredo_srt::ConnectionState::Connected
-            }) {
+            if conn
+                .group()
+                .members()
+                .iter()
+                .all(|member| member.connection().state() == srt_proto::ConnectionState::Connected)
+            {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -973,8 +992,7 @@ mod group_conn_tests {
             conn.group()
                 .members()
                 .iter()
-                .all(|member| member.connection().state()
-                    == shiguredo_srt::ConnectionState::Connected),
+                .all(|member| member.connection().state() == srt_proto::ConnectionState::Connected),
             "group did not connect"
         );
         (conn, first_peer, second_peer)
@@ -1022,7 +1040,7 @@ mod group_conn_tests {
 
             assert_eq!(
                 conn.group().member(1).expect("member 1").state(),
-                shiguredo_srt::GroupMemberState::Active,
+                srt_proto::GroupMemberState::Active,
                 "leg 1 must stay Active through sustained malformed input"
             );
 
@@ -1073,7 +1091,7 @@ mod group_conn_tests {
                 .expect("drive must not fail just because one leg's peer vanished");
             second_peer.drive(now);
             if conn.group().member(1).expect("member 1").state()
-                == shiguredo_srt::GroupMemberState::Broken
+                == srt_proto::GroupMemberState::Broken
             {
                 leg1_broken = true;
                 break;
@@ -1086,7 +1104,7 @@ mod group_conn_tests {
         );
         assert_eq!(
             conn.group().member(2).expect("member 2").state(),
-            shiguredo_srt::GroupMemberState::Active,
+            srt_proto::GroupMemberState::Active,
             "the healthy leg must be unaffected by the other leg's failure"
         );
 
@@ -1131,7 +1149,7 @@ mod group_conn_tests {
                 .group()
                 .members()
                 .iter()
-                .all(|member| member.state() == shiguredo_srt::GroupMemberState::Broken)
+                .all(|member| member.state() == srt_proto::GroupMemberState::Broken)
             {
                 all_broken = true;
                 break;

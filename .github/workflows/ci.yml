@@ -52,7 +52,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
       - run: rustup toolchain install 1.93.0 --profile minimal
-      - run: cargo +1.93.0 check -p shiguredo_srt --all-targets --locked
+      - run: cargo +1.93.0 check -p srt-proto --all-targets --locked
 
   secrets:
     name: Secret history scan
@@ -77,7 +77,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: rustup toolchain install nightly --profile minimal --component miri,rust-src
       - run: cargo +nightly miri setup
-      - run: cargo +nightly miri test -p shiguredo_srt srt_connection::tests
+      - run: cargo +nightly miri test -p srt-proto srt_connection::tests
         env:
           MIRIFLAGS: -Zmiri-tree-borrows
 
@@ -167,7 +167,7 @@ jobs:
           symbolizer=$(command -v llvm-symbolizer || find /usr/lib/llvm-*/bin -name llvm-symbolizer | sort -V | tail -1)
           test -x "$symbolizer"
           echo "ASAN_SYMBOLIZER_PATH=$symbolizer" >> "$GITHUB_ENV"
-      - run: cargo +nightly test -p shiguredo_srt --all-targets --target x86_64-unknown-linux-gnu
+      - run: cargo +nightly test -p srt-proto --all-targets --target x86_64-unknown-linux-gnu
         env:
           RUSTFLAGS: -Zsanitizer=address
           RUSTDOCFLAGS: -Zsanitizer=address
@@ -195,7 +195,7 @@ jobs:
         with:
           tool: cargo-llvm-cov
       - name: Protocol and lifecycle (80% lines)
-        run: cargo llvm-cov -p shiguredo_srt -p pbt -p srt-lifecycle --all-features --fail-under-lines 80 --lcov --output-path protocol-lifecycle.lcov
+        run: cargo llvm-cov -p srt-proto -p pbt -p srt-lifecycle --all-features --fail-under-lines 80 --lcov --output-path protocol-lifecycle.lcov
       - run: cargo llvm-cov clean --workspace
       - name: All-feature runtime adapters (50% lines)
         run: cargo llvm-cov -p srt-transport --all-features --ignore-filename-regex 'srt-protocol|srt-lifecycle' --fail-under-lines 50 --lcov --output-path transport.lcov

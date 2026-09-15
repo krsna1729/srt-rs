@@ -3,7 +3,7 @@
 Real-socket cross-validation of this workspace's protocol core against the
 reference implementation, run 2026-08-25. libsrt built from source at
 `master` (1.5.6, encryption enabled); Rust side driven through
-`shiguredo_srt` with a purpose-built listener/caller (`/tmp/srt-interop/rxbin`)
+`srt_proto` with a purpose-built listener/caller (`/tmp/srt-interop/rxbin`)
 plus `srt-bench` for sustained-rate runs.
 
 Test payload: 5,000,000 random bytes (`md5 ac4f9de38cec18157125f66d5b5455f4`),

@@ -11,15 +11,14 @@ use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::os::fd::AsRawFd;
 use std::time::Duration;
 
-use shiguredo_srt::{
-    ConnectionOptions, GroupExtensionData, GroupType, KeyLength, SRTGROUP_MASK, SrtConnection,
-    Timestamp,
-};
+use srt_proto::crypto::KeyLength;
+use srt_proto::handshake::{GroupExtensionData, GroupType, SRTGROUP_MASK};
+use srt_proto::{ConnectionOptions, SrtConnection, Timestamp};
 use zeroize::Zeroize;
 
 use crate::{
-    AdmissionOptions, BondedInputPolicy, OutputDrainBudget, PeerTable, PeerTableConfig, RecvBudget,
-    SOCK_BUF_BYTES, set_sock_bufs,
+    AdmissionOptions, BondedInputPolicy, MAX_DENSE_SLOTS, OutputDrainBudget, PeerTable,
+    PeerTableConfig, RecvBatch, RecvBudget, SOCK_BUF_BYTES, set_sock_bufs,
 };
 
 const DEFAULT_MESSAGE_PAYLOAD: usize = 1_316;
@@ -68,7 +67,7 @@ impl std::error::Error for ConfigError {}
 pub enum SessionSendError {
     PayloadTooLarge { actual: usize, maximum: usize },
     Config(ConfigError),
-    Protocol(shiguredo_srt::Error),
+    Protocol(srt_proto::Error),
 }
 
 impl fmt::Display for SessionSendError {
@@ -96,8 +95,8 @@ impl std::error::Error for SessionSendError {
     }
 }
 
-impl From<shiguredo_srt::Error> for SessionSendError {
-    fn from(value: shiguredo_srt::Error) -> Self {
+impl From<srt_proto::Error> for SessionSendError {
+    fn from(value: srt_proto::Error) -> Self {
         Self::Protocol(value)
     }
 }
@@ -163,7 +162,7 @@ pub enum Bandwidth {
 }
 
 /// The protocol-level pacing settings a [`Bandwidth`] resolves to, in the
-/// units `shiguredo_srt::ConnectionOptions` states them in.
+/// units `srt_proto::ConnectionOptions` states them in.
 ///
 /// Exposed so a caller that builds `ConnectionOptions` by hand -- a
 /// benchmark harness, say -- can both apply the policy and *record what
@@ -198,7 +197,7 @@ impl Bandwidth {
     /// The one place a `Bandwidth` becomes MAXBW/INPUTBW/OHEADBW, so
     /// callers that construct `ConnectionOptions` directly cannot drift
     /// from the ones that go through [`SessionConfig`].
-    pub fn apply_to(self, options: &mut shiguredo_srt::ConnectionOptions) {
+    pub fn apply_to(self, options: &mut srt_proto::ConnectionOptions) {
         let resolved = self.resolve();
         options.max_bandwidth_bytes_per_sec = resolved.max_bytes_per_sec;
         options.input_bandwidth_bytes_per_sec = resolved.input_bytes_per_sec;
@@ -543,7 +542,7 @@ pub struct FlowControlConfig {
 
 impl Default for FlowControlConfig {
     fn default() -> Self {
-        let window = NonZeroU32::new(shiguredo_srt::DEFAULT_FLOW_WINDOW)
+        let window = NonZeroU32::new(srt_proto::handshake::DEFAULT_FLOW_WINDOW)
             .expect("protocol default flow window is non-zero");
         Self {
             window_packets: window,
@@ -648,9 +647,9 @@ impl Default for HandshakeConfig {
     fn default() -> Self {
         Self {
             retry_interval: Duration::from_micros(
-                shiguredo_srt::DEFAULT_HANDSHAKE_RETRY_INTERVAL_MICROS,
+                srt_proto::DEFAULT_HANDSHAKE_RETRY_INTERVAL_MICROS,
             ),
-            timeout: Duration::from_micros(shiguredo_srt::DEFAULT_HANDSHAKE_TIMEOUT_MICROS),
+            timeout: Duration::from_micros(srt_proto::DEFAULT_HANDSHAKE_TIMEOUT_MICROS),
         }
     }
 }
@@ -812,16 +811,17 @@ impl SessionConfig {
     /// Full ACK period. Default is Haivision `COMM_SYN` / RFC §3.2.4 (10 ms).
     ///
     /// Accepted range is 10–40 ms
-    /// ([`shiguredo_srt::MIN_ACK_INTERVAL_MICROS`]..=
-    /// [`shiguredo_srt::MAX_ACK_INTERVAL_MICROS`]). Values above 10 ms are
+    /// ([`srt_proto::receiver::MIN_ACK_INTERVAL_MICROS`]..=
+    /// [`srt_proto::receiver::MAX_ACK_INTERVAL_MICROS`]). Values above 10 ms are
     /// **non-default / non-RFC-recommended** coalesce and do not retarget
     /// NAK/EXP. Coalescing ACKs does not coarsen TSBPD/TLPKTDROP: the
     /// protocol timer still ticks at `COMM_SYN`. High-fan-in evidence
-    /// target: [`shiguredo_srt::HIGH_FANIN_ACK_INTERVAL_MICROS`] (40 ms) —
+    /// target: [`srt_proto::receiver::HIGH_FANIN_ACK_INTERVAL_MICROS`] (40 ms) —
     /// not a new default.
     pub fn set_ack_interval(&mut self, interval: Duration) -> Result<&mut Self, ConfigError> {
         let micros = duration_micros_u64(interval);
-        if !(shiguredo_srt::MIN_ACK_INTERVAL_MICROS..=shiguredo_srt::MAX_ACK_INTERVAL_MICROS)
+        if !(srt_proto::receiver::MIN_ACK_INTERVAL_MICROS
+            ..=srt_proto::receiver::MAX_ACK_INTERVAL_MICROS)
             .contains(&micros)
         {
             return Err(ConfigError::new(
@@ -829,9 +829,9 @@ impl SessionConfig {
                 format!(
                     "must be {}..={} microseconds (Haivision COMM_SYN default and floor is {}; \
                      values above that are non-RFC-recommended coalesce)",
-                    shiguredo_srt::MIN_ACK_INTERVAL_MICROS,
-                    shiguredo_srt::MAX_ACK_INTERVAL_MICROS,
-                    shiguredo_srt::ACK_INTERVAL_MICROS
+                    srt_proto::receiver::MIN_ACK_INTERVAL_MICROS,
+                    srt_proto::receiver::MAX_ACK_INTERVAL_MICROS,
+                    srt_proto::receiver::ACK_INTERVAL_MICROS
                 ),
             ));
         }
@@ -843,18 +843,18 @@ impl SessionConfig {
     /// / RFC recommendation (64).
     ///
     /// Accepted range is 64–256
-    /// ([`shiguredo_srt::MIN_LIGHT_ACK_INTERVAL_PACKETS`]..=
-    /// [`shiguredo_srt::MAX_LIGHT_ACK_INTERVAL_PACKETS`]). Values above 64
+    /// ([`srt_proto::receiver::MIN_LIGHT_ACK_INTERVAL_PACKETS`]..=
+    /// [`srt_proto::receiver::MAX_LIGHT_ACK_INTERVAL_PACKETS`]). Values above 64
     /// are **non-default / non-RFC-recommended** coalesce. High-fan-in
     /// evidence target:
-    /// [`shiguredo_srt::HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS`] (256) — not
+    /// [`srt_proto::receiver::HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS`] (256) — not
     /// a new default.
     pub fn set_light_ack_interval_packets(
         &mut self,
         packets: u32,
     ) -> Result<&mut Self, ConfigError> {
-        if !(shiguredo_srt::MIN_LIGHT_ACK_INTERVAL_PACKETS
-            ..=shiguredo_srt::MAX_LIGHT_ACK_INTERVAL_PACKETS)
+        if !(srt_proto::receiver::MIN_LIGHT_ACK_INTERVAL_PACKETS
+            ..=srt_proto::receiver::MAX_LIGHT_ACK_INTERVAL_PACKETS)
             .contains(&packets)
         {
             return Err(ConfigError::new(
@@ -862,9 +862,9 @@ impl SessionConfig {
                 format!(
                     "must be {}..={} packets (Haivision/RFC default and floor is {}; \
                      values above that are non-RFC-recommended coalesce)",
-                    shiguredo_srt::MIN_LIGHT_ACK_INTERVAL_PACKETS,
-                    shiguredo_srt::MAX_LIGHT_ACK_INTERVAL_PACKETS,
-                    shiguredo_srt::LIGHT_ACK_INTERVAL_PACKETS
+                    srt_proto::receiver::MIN_LIGHT_ACK_INTERVAL_PACKETS,
+                    srt_proto::receiver::MAX_LIGHT_ACK_INTERVAL_PACKETS,
+                    srt_proto::receiver::LIGHT_ACK_INTERVAL_PACKETS
                 ),
             ));
         }
@@ -904,7 +904,8 @@ impl SessionConfig {
     }
 
     fn validate_ack_coalesce(&self) -> Result<(), ConfigError> {
-        if !(shiguredo_srt::MIN_ACK_INTERVAL_MICROS..=shiguredo_srt::MAX_ACK_INTERVAL_MICROS)
+        if !(srt_proto::receiver::MIN_ACK_INTERVAL_MICROS
+            ..=srt_proto::receiver::MAX_ACK_INTERVAL_MICROS)
             .contains(&self.connection.ack_interval_micros)
         {
             return Err(ConfigError::new(
@@ -912,13 +913,13 @@ impl SessionConfig {
                 format!(
                     "must be {}..={} microseconds (Haivision COMM_SYN default and floor; \
                      values above that are non-RFC-recommended coalesce)",
-                    shiguredo_srt::MIN_ACK_INTERVAL_MICROS,
-                    shiguredo_srt::MAX_ACK_INTERVAL_MICROS
+                    srt_proto::receiver::MIN_ACK_INTERVAL_MICROS,
+                    srt_proto::receiver::MAX_ACK_INTERVAL_MICROS
                 ),
             ));
         }
-        if !(shiguredo_srt::MIN_LIGHT_ACK_INTERVAL_PACKETS
-            ..=shiguredo_srt::MAX_LIGHT_ACK_INTERVAL_PACKETS)
+        if !(srt_proto::receiver::MIN_LIGHT_ACK_INTERVAL_PACKETS
+            ..=srt_proto::receiver::MAX_LIGHT_ACK_INTERVAL_PACKETS)
             .contains(&self.connection.light_ack_interval_packets)
         {
             return Err(ConfigError::new(
@@ -926,8 +927,8 @@ impl SessionConfig {
                 format!(
                     "must be {}..={} packets (Haivision/RFC default and floor; \
                      values above that are non-RFC-recommended coalesce)",
-                    shiguredo_srt::MIN_LIGHT_ACK_INTERVAL_PACKETS,
-                    shiguredo_srt::MAX_LIGHT_ACK_INTERVAL_PACKETS
+                    srt_proto::receiver::MIN_LIGHT_ACK_INTERVAL_PACKETS,
+                    srt_proto::receiver::MAX_LIGHT_ACK_INTERVAL_PACKETS
                 ),
             ));
         }
@@ -1239,12 +1240,14 @@ pub enum SocketOwnership {
 /// Both sides construct the same type; `resolve()` rejects illegal
 /// combinations once instead of scattering `if !exclusive` guards.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub struct EndpointSocketPlan {
     pub topology: ListenerTopology,
     pub ownership: SocketOwnership,
     pub promotion: PromotionPolicy,
 }
 
+#[allow(dead_code)]
 impl EndpointSocketPlan {
     #[must_use]
     pub fn new(
@@ -1336,9 +1339,6 @@ impl Default for TransportCapabilities {
 pub enum RuntimeFlavor {
     Mio,
     Tokio,
-    Smol,
-    Monoio,
-    Glommio,
     Compio,
     Custom(TransportCapabilities),
 }
@@ -1354,8 +1354,7 @@ impl RuntimeFlavor {
         // completion-based adapters (Monoio, Glommio, Compio) use native
         // one-buffer I/O and genuinely have no batched receive path.
         TransportCapabilities {
-            receive_batching: cfg!(target_os = "linux")
-                && matches!(self, Self::Mio | Self::Tokio | Self::Smol),
+            receive_batching: cfg!(target_os = "linux") && matches!(self, Self::Mio | Self::Tokio),
             ..TransportCapabilities::default()
         }
     }
@@ -1560,6 +1559,12 @@ impl TransportConfig {
                     "the selected runtime adapter has no batched receive implementation",
                 ))
             }
+            BatchingPolicy::MaxDatagrams(count) if count.get() > RecvBatch::MAX_CAPACITY => {
+                Err(ConfigError::new(
+                    "transport.batching",
+                    format!("must not exceed {} datagrams", RecvBatch::MAX_CAPACITY),
+                ))
+            }
             BatchingPolicy::MaxDatagrams(count) => Ok(Some(count)),
         }
     }
@@ -1652,6 +1657,16 @@ pub struct AdmissionConfig {
     pub idle_timeout: Duration,
     /// Aggregate requested socket-buffer memory budget. `None` leaves resource
     /// accounting to the application/container.
+    ///
+    /// This budget caps the conservative requested allocation (Linux doubles
+    /// SO_RCVBUF and SO_SNDBUF requests, so 4 × requested bytes per socket).
+    /// It is checked during listener preparation and enforced by shared `Owner`
+    /// drivers when binding shared caller sockets so combined listener and
+    /// caller socket requests cannot bypass the declared budget.
+    ///
+    /// Kernel-granted effective bounds are observable via
+    /// [`crate::advanced::platform::socket_buffer_stats`], which tracks
+    /// the actual OS-granted SO_RCVBUF/SO_SNDBUF sizes across all sockets in the process.
     pub socket_memory_budget: Option<NonZeroUsize>,
 }
 
@@ -1669,6 +1684,12 @@ impl Default for AdmissionConfig {
 
 impl AdmissionConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.limits.max_peers > MAX_DENSE_SLOTS {
+            return Err(ConfigError::new(
+                "admission.max_peers",
+                format!("must not exceed {MAX_DENSE_SLOTS} peers"),
+            ));
+        }
         if self.limits.max_peers == 0 {
             return Err(ConfigError::new("admission.max_peers", "must be non-zero"));
         }
@@ -2135,6 +2156,16 @@ impl PreparedListener {
         }
         Ok(sockets)
     }
+
+    /// Conservative requested buffer allocation across every listener socket,
+    /// accounting for Linux kernel doubling of SO_RCVBUF and SO_SNDBUF (4 × buffer_bytes × sockets).
+    #[must_use]
+    pub fn requested_socket_memory_bytes(&self) -> usize {
+        self.transport
+            .socket_buffer_bytes
+            .saturating_mul(4)
+            .saturating_mul(self.transport.topology.listener_socket_count().get())
+    }
 }
 
 /// Validated, auto-resolved caller and caller-pool configuration.
@@ -2236,6 +2267,13 @@ impl PreparedCaller {
     /// socket ID and initial sequence number, which makes this caller-pool safe.
     pub fn connection(&self, now: Timestamp) -> Result<SrtConnection, ConfigError> {
         self.session.caller(now)
+    }
+
+    /// Conservative requested buffer allocation for this caller's socket,
+    /// accounting for Linux kernel doubling of SO_RCVBUF and SO_SNDBUF (4 × buffer_bytes).
+    #[must_use]
+    pub fn requested_socket_memory_bytes(&self) -> usize {
+        self.transport.socket_buffer_bytes.saturating_mul(4)
     }
 }
 
@@ -2402,13 +2440,10 @@ mod tests {
     #[test]
     fn readiness_based_runtimes_report_batching_completion_based_ones_do_not() {
         let batching = |flavor: RuntimeFlavor| flavor.capabilities().receive_batching;
-        // These share the recvmmsg-based `RecvBatch`/batch.rs pump.
+        // Mio and Tokio share the recvmmsg-based `RecvBatch`/batch.rs pump.
         assert_eq!(batching(RuntimeFlavor::Mio), cfg!(target_os = "linux"));
         assert_eq!(batching(RuntimeFlavor::Tokio), cfg!(target_os = "linux"));
-        assert_eq!(batching(RuntimeFlavor::Smol), cfg!(target_os = "linux"));
-        // These drive one buffer at a time through native completion I/O.
-        assert!(!batching(RuntimeFlavor::Monoio));
-        assert!(!batching(RuntimeFlavor::Glommio));
+        // Compio drives one buffer at a time through native completion I/O.
         assert!(!batching(RuntimeFlavor::Compio));
     }
 
@@ -2443,6 +2478,27 @@ mod tests {
         let error = config
             .resolve(capabilities)
             .expect_err("unsupported batching");
+        assert_eq!(error.field(), "transport.batching");
+    }
+
+    #[test]
+    fn explicit_batching_above_scratch_cap_is_rejected() {
+        let config = TransportConfig {
+            topology: ListenerTopology::SharedPool {
+                listeners: WorkerCount::Count(NonZeroUsize::MIN),
+            },
+            batching: BatchingPolicy::MaxDatagrams(
+                NonZeroUsize::new(RecvBatch::MAX_CAPACITY + 1).expect("non-zero batch capacity"),
+            ),
+            ..TransportConfig::default()
+        };
+        let capabilities = TransportCapabilities {
+            receive_batching: true,
+            ..TransportCapabilities::default()
+        };
+        let error = config
+            .resolve(capabilities)
+            .expect_err("batching must fit the bounded receive scratch arena");
         assert_eq!(error.field(), "transport.batching");
     }
 
@@ -2787,22 +2843,37 @@ mod tests {
     }
 
     #[test]
+    fn admission_rejects_capacity_above_dense_arena_limit() {
+        let config = ListenerConfig::builder(address(0))
+            .configure_admission(|admission| {
+                admission.limits.max_peers = MAX_DENSE_SLOTS + 1;
+            })
+            .into_config();
+        let error = config
+            .prepare(RuntimeFlavor::Mio)
+            .expect_err("an arena-sized capacity is the hard admission limit");
+        assert_eq!(error.field(), "admission.max_peers");
+    }
+
+    #[test]
     fn ack_coalesce_setters_accept_high_fanin_and_reject_out_of_range() {
         let mut session = SessionConfig::default();
         session
             .set_ack_interval(Duration::from_micros(
-                shiguredo_srt::HIGH_FANIN_ACK_INTERVAL_MICROS,
+                srt_proto::receiver::HIGH_FANIN_ACK_INTERVAL_MICROS,
             ))
             .expect("40ms is in range")
-            .set_light_ack_interval_packets(shiguredo_srt::HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS)
+            .set_light_ack_interval_packets(
+                srt_proto::receiver::HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS,
+            )
             .expect("256 packets is in range");
         assert_eq!(
             session.connection_options().ack_interval_micros,
-            shiguredo_srt::HIGH_FANIN_ACK_INTERVAL_MICROS
+            srt_proto::receiver::HIGH_FANIN_ACK_INTERVAL_MICROS
         );
         assert_eq!(
             session.connection_options().light_ack_interval_packets,
-            shiguredo_srt::HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS
+            srt_proto::receiver::HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS
         );
 
         let error = session

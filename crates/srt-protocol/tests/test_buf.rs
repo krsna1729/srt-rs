@@ -1,4 +1,4 @@
-use shiguredo_srt::read_utf8;
+use srt_proto::read_utf8;
 
 #[test]
 fn test_read_utf8_invalid() {

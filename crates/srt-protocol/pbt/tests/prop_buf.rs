@@ -1,7 +1,7 @@
 //! Property-based tests for Buf (read / write functions)
 
 use proptest::prelude::*;
-use shiguredo_srt::{
+use srt_proto::{
     read_bytes, read_u16, read_u32, read_u64, write_bytes, write_u16, write_u32, write_u64,
 };
 

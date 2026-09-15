@@ -50,7 +50,7 @@ pub fn print_startup_diagnostics(context: &str) {
     eprintln!("cpu.available_parallelism={parallelism}");
     eprintln!(
         "cpu.transport_available={}",
-        srt_transport::available_cpus()
+        srt_transport::advanced::platform::available_cpus()
     );
     print_proc_line("cpu.affinity", "/proc/self/status", "Cpus_allowed_list:");
 

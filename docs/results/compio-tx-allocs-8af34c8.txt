@@ -1,0 +1,11 @@
+Layer 1: Protocol materialization (poll_output_into): raw_allocs=0 raw_bytes=0 iters=10000
+Layer 2: Scheduler mechanics (heap set/peek/presence): raw_allocs=1 raw_bytes=80000 iters=10000
+Layer 3: Compio native UdpSocket::send_to baseline: raw_allocs=10001 raw_bytes=3280000 iters=10000
+Layer 3b: Owner TX engine (push_datagram + send_to + reap): raw_allocs=30001 raw_bytes=12400000 iters=10000
+Layer 4: Full loopback (Caller TX + Listener RX + ACKs): raw_allocs=88680 raw_bytes=31133046 iters=10000
+Layer                                                      |  Allocs/op |   Bytes/op |  Mean CPU ns |     P50 ns |     P95 ns |     P99 ns
+Layer 1: Protocol materialization (poll_output_into)       |      0.000 |        0.0 |         77.6 |         70 |         90 |        120
+Layer 2: Scheduler mechanics (heap set/peek/presence)      |      0.000 |        8.0 |         98.8 |        100 |        111 |        130
+Layer 3: Compio native UdpSocket::send_to baseline         |      1.000 |      328.0 |       6314.7 |       5628 |       6690 |      15163
+Layer 3b: Owner TX engine (push_datagram + send_to + reap) |      3.000 |     1240.0 |       9118.8 |       8043 |      14060 |      31878
+Layer 4: Full loopback (Caller TX + Listener RX + ACKs)    |      8.868 |     3113.3 |      22021.7 |      19740 |      49222 |     102984

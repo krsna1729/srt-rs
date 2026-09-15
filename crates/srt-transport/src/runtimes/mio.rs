@@ -2,7 +2,7 @@ use crate::{
     BatchIoStats, HighResWaiter, ManualTimerStore, MonotonicDeadline, OutputDrainBudget,
     OutputDrainReport, drain_connected_outputs, schedule_wait_micros, sendmsg_connected_batch,
 };
-use shiguredo_srt::{ConnectionOutput, SrtConnection, Timestamp};
+use srt_proto::{ConnectionOutput, SrtConnection, Timestamp};
 use std::collections::VecDeque;
 use std::hash::Hash;
 use std::io;
@@ -11,9 +11,9 @@ use std::time::Duration;
 
 /// Per-connection state for mio: protocol + owned socket + manual timers.
 pub struct Conn {
-    pub conn: SrtConnection,
-    pub socket: mio::net::UdpSocket,
-    pub timers: ManualTimerStore,
+    conn: SrtConnection,
+    socket: mio::net::UdpSocket,
+    timers: ManualTimerStore,
     pending_outputs: VecDeque<ConnectionOutput>,
     io_stats: BatchIoStats,
     output_drain: OutputDrainBudget,
@@ -22,6 +22,23 @@ pub struct Conn {
 impl Conn {
     pub fn new(conn: SrtConnection, socket: mio::net::UdpSocket) -> Self {
         Self::with_budgets(conn, socket, OutputDrainBudget::default())
+    }
+
+    /// Borrow the protocol state without exposing the adapter's internals.
+    #[must_use]
+    pub fn protocol(&self) -> &SrtConnection {
+        &self.conn
+    }
+
+    /// Mutably access protocol state for a scoped custom-driver operation.
+    pub fn protocol_mut(&mut self) -> &mut SrtConnection {
+        &mut self.conn
+    }
+
+    /// Borrow the runtime socket used by this connection.
+    #[must_use]
+    pub fn socket(&self) -> &mio::net::UdpSocket {
+        &self.socket
     }
 
     /// Like [`Self::new`], but stores the given budget instead of the
@@ -107,9 +124,10 @@ impl Conn {
 
     /// Publish this connection onto a worker waiter and arm its next deadline.
     ///
-    /// After [`HighResWaiter::wait`], the caller must service **every** due
-    /// key. One packet per visit remains the contract; Route B multi-admit
-    /// is out of scope.
+    /// After [`HighResWaiter::wait`], the caller must service the returned due
+    /// batch and repeat immediately while `WaitOutcome::due_remaining` is set.
+    /// One packet per visit remains the contract; Route B multi-admit is out
+    /// of scope.
     pub fn schedule_on<K>(
         &self,
         waiter: &mut HighResWaiter<K>,
@@ -120,8 +138,7 @@ impl Conn {
         K: Clone + Eq + Hash,
     {
         waiter.register(key.clone(), self.socket.as_raw_fd())?;
-        waiter.set_deadline(key, MonotonicDeadline::after(self.schedule_wait(now)));
-        Ok(())
+        waiter.set_deadline(key, MonotonicDeadline::after(self.schedule_wait(now)))
     }
 }
 
@@ -202,7 +219,7 @@ struct OwnerCallerSide {
 /// shared-socket caller "needs a custom driver using `send_to`, the same
 /// pattern this crate's listener side already uses" (K01). `Owner` is that
 /// missing driver, kept deliberately narrow: exactly one non-pooled
-/// listener socket ([`crate::ResolvedListenerTopology::PerPort`]) and
+/// listener socket ([`crate::advanced::prepared::ResolvedListenerTopology::PerPort`]) and
 /// exactly one caller socket shared by every [`Owner::connect`]ed session
 /// (which therefore requires `SocketOwnership::Shared`, not the default
 /// `Exclusive`). Pooled/reuseport listener topologies and per-caller
@@ -224,6 +241,7 @@ pub struct Owner {
     listener: Option<OwnerListenerSide>,
     caller: Option<OwnerCallerSide>,
     caller_pool_policy: Option<(std::num::NonZeroUsize, Duration)>,
+    socket_memory_budget: Option<std::num::NonZeroUsize>,
 }
 
 impl Owner {
@@ -234,6 +252,7 @@ impl Owner {
             listener: None,
             caller: None,
             caller_pool_policy: None,
+            socket_memory_budget: None,
         })
     }
 
@@ -311,6 +330,25 @@ impl Owner {
                  IPv4 address instead of an IPv6 or dual-stack one",
             )));
         }
+        if let Some(budget) = prepared.admission.socket_memory_budget {
+            let caller_requested = self
+                .caller
+                .as_ref()
+                .map_or(0, |c| c.transport.socket_buffer_bytes.saturating_mul(4));
+            let total = prepared
+                .requested_socket_memory_bytes()
+                .saturating_add(caller_requested);
+            if total > budget.get() {
+                return Err(crate::RuntimeBuildError::from(crate::ConfigError::new(
+                    "admission.socket_memory_budget",
+                    format!(
+                        "{total} bytes requested for combined listener and caller buffers exceeds owner budget of {} bytes",
+                        budget.get()
+                    ),
+                )));
+            }
+            self.socket_memory_budget = Some(budget);
+        }
         let mut sockets = prepared.bind_sockets()?;
         let mut socket = mio::net::UdpSocket::from_std(sockets.remove(0));
         self.poll.registry().register(
@@ -385,6 +423,25 @@ impl Owner {
             )?;
         }
         if self.caller.is_none() {
+            if let Some(budget) = self.socket_memory_budget {
+                let listener_requested = self.listener.as_ref().map_or(0, |l| {
+                    l.transport
+                        .socket_buffer_bytes
+                        .saturating_mul(4)
+                        .saturating_mul(l.transport.topology.listener_socket_count().get())
+                });
+                let total =
+                    listener_requested.saturating_add(prepared.requested_socket_memory_bytes());
+                if total > budget.get() {
+                    return Err(crate::RuntimeBuildError::from(crate::ConfigError::new(
+                        "caller.socket_memory_budget",
+                        format!(
+                            "{total} bytes requested for combined listener and caller buffers exceeds owner budget of {} bytes",
+                            budget.get()
+                        ),
+                    )));
+                }
+            }
             let mut socket = mio::net::UdpSocket::from_std(prepared.bind_socket()?);
             self.poll.registry().register(
                 &mut socket,
@@ -547,50 +604,30 @@ impl Owner {
     ) -> io::Result<crate::OutputDrainStatus> {
         let mut first_error = None;
         let mut status = crate::OutputDrainStatus::Drained;
+        let mut remaining = budget;
         if let Some(side) = self.listener.as_mut() {
-            let budget = budget.intersect(side.transport.output_drain);
-            side.peers
-                .prune_idle_bounded(now, side.idle_timeout, budget.max_actions);
-            if side.outbound.is_empty() {
-                let report = side
-                    .peers
-                    .poll_outbound_bounded(now, budget, &mut side.outbound);
-                side.output_pending = report.status == crate::OutputDrainStatus::BudgetExhausted;
-            }
-            let side_status = flush_owner_side(
+            status = status.combine(drive_listener_side(
                 &self.poll,
-                &mut side.socket,
-                OWNER_LISTENER_TOKEN,
-                &mut side.outbound,
-                side.recv_pending,
-                side.output_pending,
-                &mut side.write_blocked,
+                side,
+                now,
+                &mut remaining,
                 &mut first_error,
-            );
-            status = status.combine(side_status);
+            ));
         }
         if let Some(side) = self.caller.as_mut() {
-            let budget = budget.intersect(side.transport.output_drain);
-            side.callers
-                .poll_expirations_bounded(now, budget.max_actions);
-            if side.outbound.is_empty() {
-                let report =
-                    side.callers
-                        .table_mut()
-                        .poll_outbound_bounded(now, budget, &mut side.outbound);
-                side.output_pending = report.status == crate::OutputDrainStatus::BudgetExhausted;
-            }
-            let side_status = flush_owner_side(
+            status = status.combine(drive_caller_side(
                 &self.poll,
-                &mut side.socket,
-                OWNER_CALLER_TOKEN,
-                &mut side.outbound,
-                side.recv_pending,
-                side.output_pending,
-                &mut side.write_blocked,
+                side,
+                now,
+                &mut remaining,
                 &mut first_error,
-            );
-            status = status.combine(side_status);
+            ));
+        }
+        if (budget.max_actions > 0 && remaining.max_actions == 0)
+            || (budget.max_packets > 0 && remaining.max_packets == 0)
+            || (budget.max_bytes > 0 && remaining.max_bytes == 0)
+        {
+            status = status.combine(crate::OutputDrainStatus::BudgetExhausted);
         }
         first_error.map_or(Ok(status), Err)
     }
@@ -617,6 +654,18 @@ impl Owner {
             .table_mut()
             .poll_events_bounded(side.transport.output_drain.max_actions, out);
         side.event_pending = side.callers.table().has_pending_events();
+    }
+
+    /// Drain bounded caller-pool lifecycle outcomes. A queued request's
+    /// [`crate::PoolRequestId`] must be observed here to correlate its later
+    /// admission, expiry, failure, or cancellation with the original call.
+    pub fn poll_caller_pool_events(&mut self, out: &mut Vec<crate::PoolEvent>) {
+        out.clear();
+        let Some(side) = self.caller.as_mut() else {
+            return;
+        };
+        side.callers
+            .poll_outcomes_bounded(side.transport.output_drain.max_actions, out);
     }
 
     /// Steady-state handle for one admitted peer: send, stats, orderly close.
@@ -804,6 +853,98 @@ fn drain_side_recv(
     }
 }
 
+fn drive_listener_side(
+    poll: &mio::Poll,
+    side: &mut OwnerListenerSide,
+    now: Timestamp,
+    remaining: &mut crate::OutputDrainBudget,
+    first_error: &mut Option<io::Error>,
+) -> crate::OutputDrainStatus {
+    let was_empty = side.outbound.is_empty();
+    let before_len = side.outbound.len();
+    let before_bytes: usize = side.outbound.iter().map(|(_, packet)| packet.len()).sum();
+    let side_budget = remaining.intersect(side.transport.output_drain);
+    let (_, maintenance_visits) =
+        side.peers
+            .prune_idle_bounded_with_visits(now, side.idle_timeout, side_budget.max_actions);
+    remaining.consume(maintenance_visits, 0, 0);
+    let flush_budget = if was_empty {
+        let side_budget = remaining.intersect(side.transport.output_drain);
+        let (report, visits) =
+            side.peers
+                .poll_outbound_bounded_with_visits(now, side_budget, &mut side.outbound);
+        remaining.consume(visits, report.packets, report.bytes);
+        side.output_pending = report.status == crate::OutputDrainStatus::BudgetExhausted;
+        OutputDrainBudget::new(report.packets, report.packets, report.bytes)
+    } else {
+        remaining.intersect(side.transport.output_drain)
+    };
+    let status = flush_owner_side(
+        poll,
+        &mut side.socket,
+        OWNER_LISTENER_TOKEN,
+        &mut side.outbound,
+        side.recv_pending,
+        side.output_pending,
+        &mut side.write_blocked,
+        flush_budget,
+        first_error,
+    );
+    if !was_empty {
+        let after_bytes: usize = side.outbound.iter().map(|(_, packet)| packet.len()).sum();
+        let sent = before_len.saturating_sub(side.outbound.len());
+        remaining.consume(sent, sent, before_bytes.saturating_sub(after_bytes));
+    }
+    status
+}
+
+fn drive_caller_side(
+    poll: &mio::Poll,
+    side: &mut OwnerCallerSide,
+    now: Timestamp,
+    remaining: &mut crate::OutputDrainBudget,
+    first_error: &mut Option<io::Error>,
+) -> crate::OutputDrainStatus {
+    let was_empty = side.outbound.is_empty();
+    let before_len = side.outbound.len();
+    let before_bytes: usize = side.outbound.iter().map(|(_, packet)| packet.len()).sum();
+    let side_budget = remaining.intersect(side.transport.output_drain);
+    let (_, maintenance_visits) = side
+        .callers
+        .poll_expirations_bounded_with_visits(now, side_budget.max_actions);
+    remaining.consume(maintenance_visits, 0, 0);
+    let flush_budget = if was_empty {
+        let side_budget = remaining.intersect(side.transport.output_drain);
+        let (report, visits) = side.callers.table_mut().poll_outbound_bounded_with_visits(
+            now,
+            side_budget,
+            &mut side.outbound,
+        );
+        remaining.consume(visits, report.packets, report.bytes);
+        side.output_pending = report.status == crate::OutputDrainStatus::BudgetExhausted;
+        OutputDrainBudget::new(report.packets, report.packets, report.bytes)
+    } else {
+        remaining.intersect(side.transport.output_drain)
+    };
+    let status = flush_owner_side(
+        poll,
+        &mut side.socket,
+        OWNER_CALLER_TOKEN,
+        &mut side.outbound,
+        side.recv_pending,
+        side.output_pending,
+        &mut side.write_blocked,
+        flush_budget,
+        first_error,
+    );
+    if !was_empty {
+        let after_bytes: usize = side.outbound.iter().map(|(_, packet)| packet.len()).sum();
+        let sent = before_len.saturating_sub(side.outbound.len());
+        remaining.consume(sent, sent, before_bytes.saturating_sub(after_bytes));
+    }
+    status
+}
+
 /// Flush one side's already-collected `outbound` queue and fold the result
 /// into that side's [`crate::OutputDrainStatus`] -- the identical tail
 /// half of [`Owner::drive`]'s listener and caller branches, extracted so
@@ -817,10 +958,11 @@ fn flush_owner_side(
     recv_pending: bool,
     output_pending: bool,
     write_blocked: &mut bool,
+    budget: crate::OutputDrainBudget,
     first_error: &mut Option<io::Error>,
 ) -> crate::OutputDrainStatus {
     if !*write_blocked {
-        match crate::flush_destined(socket.as_raw_fd(), outbound) {
+        match crate::flush_destined_bounded(socket.as_raw_fd(), outbound, budget) {
             Ok(report) => {
                 // A positive partial send is runnable immediately; only a
                 // zero-progress WouldBlock needs writable readiness.
@@ -865,7 +1007,7 @@ fn owner_side_status(
 mod owner_tests {
     use super::*;
     use crate::{AdmissionEvent, LogicalCallerState, PoolOutcome, SocketOwnership};
-    use shiguredo_srt::ConnectionEvent;
+    use srt_proto::ConnectionEvent;
     use std::net::SocketAddr;
     use std::num::NonZeroUsize;
 
@@ -1122,6 +1264,29 @@ mod owner_tests {
         );
     }
 
+    #[test]
+    fn owner_enforces_socket_memory_budget_across_listener_and_caller() {
+        let mut owner = Owner::new().expect("owner builds");
+        let mut config = listener_config();
+        config.transport.socket_buffers =
+            crate::SocketBufferConfig::Bytes(std::num::NonZeroUsize::new(1_024).unwrap());
+        config.admission.socket_memory_budget = std::num::NonZeroUsize::new(5_000);
+        owner.listen(&config).expect("listener fits budget");
+
+        let mut caller_cfg = shared_caller_config("127.0.0.1:9".parse().unwrap());
+        caller_cfg.transport.socket_buffers =
+            crate::SocketBufferConfig::Bytes(std::num::NonZeroUsize::new(1_024).unwrap());
+        let err = owner
+            .connect(&caller_cfg, Timestamp::default())
+            .expect_err("combined listener + caller buffers must exceed budget");
+        match err {
+            crate::RuntimeBuildError::Config(err) => {
+                assert_eq!(err.field(), "caller.socket_memory_budget");
+            }
+            other => panic!("expected ConfigError, got {other:?}"),
+        }
+    }
+
     /// A05, ponytail review: `poll_caller_events` (added to
     /// `mio_transport::Owner` for parity with the Tokio facade, which
     /// genuinely needs it) must actually surface a direct caller's
@@ -1165,7 +1330,7 @@ mod owner_tests {
                 event.id == caller_id
                     && matches!(
                         event.event,
-                        ConnectionEvent::StateChanged(shiguredo_srt::ConnectionState::Closing)
+                        ConnectionEvent::StateChanged(srt_proto::ConnectionState::Closing)
                     )
             })
         });
@@ -1301,6 +1466,33 @@ mod owner_tests {
         let mut packet = [0; 1];
         assert_eq!(collector.recv(&mut packet).unwrap(), 1);
         assert_eq!(packet, [9]);
+    }
+
+    #[test]
+    fn owner_drive_shares_the_action_budget_between_listener_and_caller() {
+        let mut owner = Owner::new().unwrap();
+        owner.listen(&listener_config()).unwrap();
+        let sink = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let remote = sink.local_addr().unwrap();
+        owner
+            .connect(&shared_caller_config(remote), Timestamp::default())
+            .unwrap();
+
+        let packet = (remote, vec![7]);
+        owner
+            .listener
+            .as_mut()
+            .unwrap()
+            .outbound
+            .push(packet.clone());
+        owner.caller.as_mut().unwrap().outbound.push(packet);
+
+        let status = owner
+            .drive(Timestamp::default(), OutputDrainBudget::new(1, 1, 64))
+            .unwrap();
+        assert_eq!(status, crate::OutputDrainStatus::BudgetExhausted);
+        assert_eq!(owner.listener.as_ref().unwrap().outbound.len(), 0);
+        assert_eq!(owner.caller.as_ref().unwrap().outbound.len(), 1);
     }
 
     #[test]
@@ -1458,7 +1650,7 @@ mod config_tests {
 #[cfg(test)]
 mod high_res_waiter_tests {
     use super::*;
-    use shiguredo_srt::{ConnectionOptions, SrtConnection, Timestamp};
+    use srt_proto::{ConnectionOptions, SrtConnection, Timestamp};
     use std::time::Duration;
 
     fn caller_conn() -> SrtConnection {

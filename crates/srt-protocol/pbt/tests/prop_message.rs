@@ -1,5 +1,5 @@
 use proptest::prelude::*;
-use shiguredo_srt::{
+use srt_proto::{
     ConnectionEvent, ConnectionOptions, ConnectionOutput, ConnectionState, SrtConnection, Timestamp,
 };
 

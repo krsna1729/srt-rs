@@ -1,7 +1,8 @@
 use std::sync::Arc;
 use std::thread;
 
-use srt_transport::{Handoff, IngressTelemetry};
+use srt_transport::advanced::handoff::Handoff;
+use srt_transport::advanced::telemetry::IngressTelemetry;
 
 fn assert_send<T: Send>() {}
 fn assert_send_sync<T: Send + Sync>() {}

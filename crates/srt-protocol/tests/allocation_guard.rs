@@ -23,7 +23,7 @@
 //! allocates -- worth calling out explicitly since it's an easy trap for any
 //! allocation-counting test built around this crate's poll-based API).
 
-use shiguredo_srt::{
+use srt_proto::{
     ConnectionOptions, ConnectionOutput, ConnectionState, SrtConnection, TimerId, Timestamp,
 };
 use std::alloc::{GlobalAlloc, Layout, System};

@@ -1,6 +1,6 @@
 //! Min-heap of absolute worker-schedule deadlines.
 //!
-//! [`crate::DueIndex`] indexes protocol [`shiguredo_srt::Timestamp`] values
+//! [`crate::DueIndex`] indexes protocol [`srt_proto::Timestamp`] values
 //! (microseconds). This heap stores [`crate::MonotonicDeadline`] nanoseconds
 //! so a worker can arm `epoll_pwait2` / absolute `timerfd` without rounding
 //! the next wake to a whole microsecond or scanning every connection.
@@ -92,14 +92,30 @@ where
         }
     }
 
-    /// Drain every live key whose deadline is at or before `now`.
+    /// Drain every currently indexed due key. The heap is bounded by the
+    /// caller-owned key set and stale-amplification invariant.
+    #[allow(dead_code)]
     pub fn pop_due(&mut self, now: MonotonicDeadline, out: &mut Vec<K>) {
+        let _ = self.pop_due_bounded(now, self.heap.len(), out);
+    }
+
+    /// Drain at most `max_work` heap entries, including stale entries.
+    /// Returns `(entries_visited, due_entries_remaining)`.
+    pub fn pop_due_bounded(
+        &mut self,
+        now: MonotonicDeadline,
+        max_work: usize,
+        out: &mut Vec<K>,
+    ) -> (usize, bool) {
         out.clear();
         let now_nanos = now.as_nanos();
+        let mut visited = 0;
         while let Some(std::cmp::Reverse(top)) = self.heap.peek()
             && top.deadline_nanos <= now_nanos
+            && visited < max_work
         {
             let std::cmp::Reverse(entry) = self.heap.pop().expect("peeked entry exists");
+            visited += 1;
             match self.current.entry(entry.key.clone()) {
                 HashEntry::Occupied(slot) if *slot.get() == entry.deadline_nanos => {
                     slot.remove();
@@ -108,12 +124,22 @@ where
                 _ => {}
             }
         }
-        self.maybe_rebuild();
+        if max_work == usize::MAX {
+            self.maybe_rebuild();
+        }
+        let due_remaining = self
+            .heap
+            .peek()
+            .is_some_and(|top| top.0.deadline_nanos <= now_nanos);
+        (visited, due_remaining)
     }
 
     /// Earliest live deadline, discarding stale heap heads.
     pub fn peek_min(&mut self) -> Option<MonotonicDeadline> {
-        loop {
+        // No mutation can add entries during this call, so the initial heap
+        // length is a hard upper bound on stale heads we can inspect.
+        let max_work = self.heap.len();
+        for _ in 0..max_work {
             let std::cmp::Reverse(entry) = self.heap.pop()?;
             match self.current.get(&entry.key) {
                 Some(&deadline) if deadline == entry.deadline_nanos => {
@@ -124,6 +150,7 @@ where
                 _ => continue,
             }
         }
+        None
     }
 
     fn maybe_rebuild(&mut self) {
@@ -163,6 +190,7 @@ where
 /// relative delay. The worker turns that into an absolute
 /// [`MonotonicDeadline`] immediately before arming the waiter.
 #[must_use]
+#[cfg(any(test, feature = "mio", feature = "tokio"))]
 pub fn schedule_wait_micros(pacing_us: u64, timer_us: u64) -> u64 {
     pacing_us.min(timer_us)
 }

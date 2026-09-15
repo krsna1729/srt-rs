@@ -1,4 +1,4 @@
-use shiguredo_srt::{ErrorKind, read_u32};
+use srt_proto::{ErrorKind, read_u32};
 
 #[test]
 fn test_read_with_exact_buffer() {

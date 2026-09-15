@@ -19,9 +19,11 @@
 //! Three layers:
 //!
 //! 1. **Shared utilities** (always compiled, no runtime deps):
-//!    `ManualTimerStore`, `DeadlineHeap`, `HighResWaiter`, `bind_reuseport`,
-//!    `recvmsg_batch`, `sendmsg_batch`, `RecvBatch`, `flush_destined`.
-//!    Protocol-level primitives that all runtimes need.
+//!    `ManualTimerStore`, `HighResWaiter`, `bind_reuseport`, `recvmsg_batch`,
+//!    `sendmsg_batch`, `RecvBatch`, `flush_destined`.
+//!    Protocol-level primitives that all runtimes need. These are available
+//!    under [`advanced::driver`], [`advanced::native_io`], and
+//!    [`advanced::platform`]; scheduling indexes remain implementation detail.
 //!    `HighResWaiter` is the issue #82 A2 worker primitive: one
 //!    high-resolution wait per worker (`epoll_pwait2` / absolute `timerfd`),
 //!    a min-heap of absolute `CLOCK_MONOTONIC` deadlines, and service of
@@ -59,7 +61,7 @@
 //! `SrtConnection::handle_timer`.
 //!
 
-use shiguredo_srt::{ConnectionOptions, Error as SrtError, SrtConnection};
+use srt_proto::{ConnectionOptions, Error as SrtError, SrtConnection};
 use std::time::Duration;
 
 // --- Private submodules ---
@@ -70,115 +72,235 @@ mod caller_pool;
 mod config;
 mod cpu;
 mod dense_slot_arena;
-#[cfg(any(test, feature = "bench-internals"))]
-pub use admission::PhysicalPeerKey;
-#[cfg(any(test, feature = "bench-internals"))]
-pub use dense_slot_arena::{DenseSlotArena, PeerSlot, PeerSlotId, RouteSlot, SlotMut, SlotRef};
-#[cfg(not(any(test, feature = "bench-internals")))]
-pub(crate) use dense_slot_arena::{DenseSlotArena, PeerSlotId};
+pub(crate) use dense_slot_arena::{DenseSlotArena, MAX_DENSE_SLOTS, PeerSlotId};
 mod dense_due_index;
-#[cfg(not(any(test, feature = "bench-internals")))]
 pub(crate) use dense_due_index::DenseDueIndex;
-#[cfg(any(test, feature = "bench-internals"))]
-pub use dense_due_index::{DenseDueEntry, DenseDueIndex};
 mod batch;
 mod deadline_heap;
 mod due_index;
 mod group_conn;
 mod handoff;
 mod high_res_waiter;
-mod publication_bus;
+mod sink;
 mod socket_io;
 mod telemetry;
 mod timer;
+pub use sink::{DatagramSink, PushResult};
+
+/// Explicit composition APIs for applications that own a runtime, socket
+/// topology, or connection scheduling loop themselves.
+pub mod advanced {
+    /// Prepared configuration and runtime-neutral endpoint plans.
+    pub mod prepared {
+        pub use super::super::config::{
+            EndpointSocketPlan, PreparedCaller, PreparedListener, ResolvedEndpointPlan,
+            ResolvedListenerTopology, ResolvedTransportConfig, RuntimeListener,
+            TransportCapabilities,
+        };
+    }
+
+    /// Runtime-neutral admission owners and logical peer handles.
+    pub mod admission {
+        #[cfg(feature = "bench-internals")]
+        pub use super::super::admission::AdmissionPeer;
+        pub use super::super::admission::{
+            AdmissionDecision, AdmissionDropReason, AdmissionEvent, AdmissionOptions,
+            AdmissionRequest, AdmissionResolution, Admit, BondedInputPolicy, LogicalPeer,
+            LogicalPeerId, LogicalPeerMut, LogicalPeerStats, NewlyConnectedPeer, PeerTable,
+            PeerTableConfig, RejectionReason, RemovedLogicalPeer, RemovedPeerLeg, is_ordered_close,
+        };
+    }
+
+    /// Runtime-neutral caller owners and logical egress handles.
+    pub mod caller {
+        pub use super::super::caller::{
+            CallerEvent, CallerGroupLeg, CallerLeg, CallerTable, DEFAULT_MAX_CALLERS,
+            LogicalCaller, LogicalCallerId, LogicalCallerMut, LogicalCallerState,
+            LogicalCallerStats, MAX_CALLERS, RemovedCallerLeg, RemovedLogicalCaller,
+        };
+        pub use super::super::caller_pool::{
+            CallerPool, CallerPoolStats, MAX_CALLER_POOL_IN_FLIGHT, MAX_CALLER_POOL_QUEUE,
+            PoolEvent, PoolOutcome, PoolRequestId,
+        };
+    }
+
+    /// Bonded-group socket/protocol ownership.
+    pub mod group {
+        pub use super::super::group_conn::{
+            GroupAggregateStats, GroupBuildError, GroupCallerLeg, GroupConn, GroupConnectionLeg,
+            GroupConnectionStats, GroupDriveReport, GroupLegDriveReport, GroupLegStats,
+            InboundGroupStats,
+        };
+    }
+
+    /// Acceptor-to-worker ownership-transfer messages.
+    pub mod handoff {
+        pub use super::super::handoff::{Handoff, WorkerMessage};
+    }
+
+    /// Runtime-neutral bounded driver operations.
+    pub mod driver {
+        pub use super::super::batch::RecvBudget;
+        #[cfg(any(feature = "mio", feature = "tokio"))]
+        pub use super::super::deadline_heap::schedule_wait_micros;
+        pub use super::super::timer::ManualTimerStore;
+        pub use super::super::{
+            OutputDrainBudget, OutputDrainReport, OutputDrainStatus, PacedSendOutcome,
+        };
+    }
+
+    /// Native I/O and wait primitives for custom event-loop owners.
+    pub mod native_io {
+        pub use super::super::batch::{
+            BatchIoStats, RecvBatch, RecvDrainReport, SendFlushReport, apply_send_result,
+            drain_recv_fd, flush_destined,
+        };
+        pub use super::super::high_res_waiter::{
+            HighResWaiter, MAX_WAITER_KEYS, MonotonicDeadline, PlannedWait, WaitBackend,
+            WaitOutcome, deadline_from_wait, plan_wait,
+        };
+        pub use super::super::socket_io::{recvmsg_batch, sendmsg_batch, sendmsg_connected_batch};
+    }
+
+    /// Platform and socket deployment helpers.
+    pub mod platform {
+        pub use super::super::cpu::{
+            available_cpus, current_cpu_spec, parse_cpu_spec, restrict_to_cpu_list,
+        };
+        pub use super::super::socket_io::{
+            SOCK_BUF_BYTES, SocketBufferStats, bind_reuseport, set_sock_bufs, socket_buffer_stats,
+        };
+    }
+
+    /// Mutable telemetry owners used by an adapter or worker. Exporters
+    /// should retain only the snapshot types from the crate root.
+    pub mod telemetry {
+        pub use super::super::telemetry::{IngressTelemetry, ShardTelemetry};
+    }
+
+    /// Final-storage datagram sink abstraction.
+    pub mod sink {
+        pub use super::super::sink::{DatagramSink, PushResult};
+    }
+}
+
+/// Benchmark-only access to implementation data structures. These are kept
+/// out of the production API so scheduling representation can change without
+/// becoming an application contract.
+#[cfg(feature = "bench-internals")]
+pub mod test_support {
+    pub use super::admission::PhysicalPeerKey;
+    pub use super::dense_due_index::{DenseDueEntry, DenseDueIndex};
+    pub use super::dense_slot_arena::{
+        DenseSlotArena, MAX_DENSE_SLOTS, PeerSlot, PeerSlotId, RouteSlot, SlotMut, SlotRef,
+    };
+    pub use super::due_index::DueIndex;
+}
 
 // --- Feature-gated runtime adapters (src/runtimes/) ---
 
 #[cfg(feature = "mio")]
 #[path = "runtimes/mio.rs"]
 pub mod mio_transport;
+#[cfg(feature = "mio")]
+pub use mio_transport as mio;
 
 #[cfg(feature = "tokio")]
 #[path = "runtimes/tokio.rs"]
 pub mod tokio_transport;
-
-#[cfg(feature = "smol")]
-#[path = "runtimes/smol.rs"]
-pub mod smol_transport;
-
-#[cfg(feature = "monoio")]
-#[path = "runtimes/monoio.rs"]
-pub mod monoio_transport;
-
-#[cfg(feature = "glommio")]
-#[path = "runtimes/glommio.rs"]
-pub mod glommio_transport;
+#[cfg(feature = "tokio")]
+pub use tokio_transport as tokio;
 
 #[cfg(feature = "compio")]
 #[path = "runtimes/compio.rs"]
 pub mod compio_transport;
+#[cfg(feature = "compio")]
+pub use compio_transport as compio;
 
 // --- Public re-exports: config ---
 
-pub use config::*;
+// Keep the implementation modules able to share the complete configuration
+// vocabulary while publishing only the application-facing policy surface.
+pub(crate) use config::*;
+pub use config::{
+    AdmissionConfig, Bandwidth, BatchingPolicy, CallerBuilder, CallerConfig, ConfigError,
+    ConnectConfig, CookieRoutingPolicy, EncryptionConfig, FlowControlConfig, GroupConfig,
+    HandshakeConfig, ListenerBuilder, ListenerConfig, ListenerEncryptionConfig, ListenerPeerPolicy,
+    ListenerTopology, PacingPolicy, PayloadSize, PolicyOverride, PromotionPolicy,
+    RuntimeBuildError, RuntimeFlavor, SessionConfig, SessionSendError, SocketBufferConfig,
+    SocketOwnership, TransportConfig, TransportProfile, WorkerCount,
+};
 
-// --- Public re-exports: utilities ---
+// --- Internal utility imports ---
 
-pub use batch::{
+#[allow(unused_imports)]
+pub(crate) use admission::{
+    AdmissionDecision, AdmissionDropReason, AdmissionEvent, AdmissionOptions, AdmissionRequest,
+    AdmissionResolution, Admit, BondedInputPolicy, LogicalPeer, LogicalPeerId, LogicalPeerMut,
+    LogicalPeerStats, NewlyConnectedPeer, PeerTable, PeerTableConfig, RejectionReason,
+    RemovedLogicalPeer, RemovedPeerLeg, is_ordered_close,
+};
+#[cfg(any(feature = "mio", feature = "tokio"))]
+pub(crate) use batch::destined_send_limit;
+pub(crate) use batch::drain_recv_fd_with_capacity;
+#[cfg(feature = "mio")]
+pub(crate) use batch::flush_destined_bounded;
+#[allow(unused_imports)]
+pub(crate) use batch::{
     BatchIoStats, RecvBatch, RecvBudget, RecvDrainReport, SendFlushReport, apply_send_result,
     drain_recv_fd, flush_destined,
 };
-pub use cpu::{available_cpus, current_cpu_spec, parse_cpu_spec, restrict_to_cpu_list};
-pub use deadline_heap::{DeadlineHeap, schedule_wait_micros};
-pub use due_index::DueIndex;
-pub use high_res_waiter::{
-    HighResWaiter, MonotonicDeadline, PlannedWait, WaitBackend, WaitOutcome, deadline_from_wait,
-    plan_wait,
+#[allow(unused_imports)]
+pub(crate) use caller::{
+    CallerEvent, CallerGroupLeg, CallerLeg, CallerTable, DEFAULT_MAX_CALLERS, LogicalCaller,
+    LogicalCallerId, LogicalCallerMut, LogicalCallerState, LogicalCallerStats, MAX_CALLERS,
+    RemovedCallerLeg, RemovedLogicalCaller,
 };
-pub use socket_io::{
-    SOCK_BUF_BYTES, SocketBufferStats, bind_reuseport, recvmsg_batch, sendmsg_batch,
-    sendmsg_connected_batch, set_sock_bufs, socket_buffer_stats,
+#[allow(unused_imports)]
+pub(crate) use caller_pool::{
+    CallerPool, CallerPoolStats, MAX_CALLER_POOL_IN_FLIGHT, MAX_CALLER_POOL_QUEUE, PoolEvent,
+    PoolOutcome, PoolRequestId,
 };
-pub use timer::ManualTimerStore;
-
-// --- Public re-exports: admission ---
-
-pub use admission::{
-    AdmissionDecision, AdmissionDropReason, AdmissionEvent, AdmissionOptions, AdmissionPeer,
-    AdmissionRequest, AdmissionResolution, Admit, BondedInputPolicy, LogicalPeer, LogicalPeerId,
-    LogicalPeerMut, LogicalPeerStats, NewlyConnectedPeer, PeerTable, PeerTableConfig,
-    RejectionReason, RemovedLogicalPeer, RemovedPeerLeg, is_ordered_close,
-};
-
-// --- Public re-exports: handoff ---
-
-pub use handoff::{Handoff, WorkerMessage};
-pub use publication_bus::{
-    BusStats, PublicationBus, Published, Publisher, RecvOutcome, Subscription,
-};
-
-// --- Public re-exports: telemetry ---
-
-pub use telemetry::{IngressTelemetry, IngressTelemetrySnapshot};
-
-// --- Public re-exports: caller ---
-
-pub use caller::{
-    CallerEvent, CallerGroupLeg, CallerLeg, CallerTable, LogicalCaller, LogicalCallerId,
-    LogicalCallerMut, LogicalCallerState, LogicalCallerStats, RemovedCallerLeg,
-    RemovedLogicalCaller,
-};
-pub use caller_pool::{CallerPool, CallerPoolStats, PoolEvent, PoolOutcome, PoolRequestId};
-// Internal helpers used by runtime and group_conn modules.
-pub(crate) use batch::{drain_connected_outputs, drain_output_work};
-pub(crate) use caller::{collect_output_work, prepend_outputs};
-
-// --- Public re-exports: group ---
-
-pub use group_conn::{
+#[allow(unused_imports)]
+pub(crate) use cpu::{available_cpus, current_cpu_spec, parse_cpu_spec, restrict_to_cpu_list};
+#[allow(unused_imports)]
+#[cfg(any(test, feature = "mio", feature = "tokio"))]
+pub(crate) use deadline_heap::schedule_wait_micros;
+pub(crate) use due_index::DueIndex;
+#[allow(unused_imports)]
+pub(crate) use group_conn::{
     GroupAggregateStats, GroupBuildError, GroupCallerLeg, GroupConn, GroupConnectionLeg,
     GroupConnectionStats, GroupDriveReport, GroupLegDriveReport, GroupLegStats, InboundGroupStats,
 };
+#[allow(unused_imports)]
+pub(crate) use handoff::{Handoff, WorkerMessage};
+#[allow(unused_imports)]
+pub(crate) use high_res_waiter::{
+    HighResWaiter, MAX_WAITER_KEYS, MonotonicDeadline, PlannedWait, WaitBackend, WaitOutcome,
+    deadline_from_wait, plan_wait,
+};
+#[allow(unused_imports)]
+pub(crate) use socket_io::{
+    SOCK_BUF_BYTES, SocketBufferStats, bind_reuseport, recvmsg_batch, sendmsg_batch,
+    sendmsg_connected_batch, set_sock_bufs, socket_buffer_stats,
+};
+#[allow(unused_imports)]
+pub(crate) use telemetry::{IngressTelemetry, ShardTelemetry};
+#[allow(unused_imports)]
+pub(crate) use timer::ManualTimerStore;
+
+// --- Public re-exports: telemetry snapshots ---
+
+pub use telemetry::{
+    IngressTelemetrySnapshot, SHARD_LATENESS_BUCKETS, SHARD_OVERLOAD_REASONS, ShardOverloadReason,
+    ShardTelemetrySnapshot,
+};
+// Internal helpers used by runtime and group_conn modules.
+pub(crate) use batch::drain_connected_outputs;
+#[cfg(feature = "tokio")]
+pub(crate) use batch::drain_output_work;
+pub(crate) use caller::{collect_output_work, prepend_outputs};
+
 // Internal types used by admission and caller modules.
 pub(crate) use group_conn::{GroupLogicalCounters, group_connection_stats};
 
@@ -189,6 +311,10 @@ pub(crate) use group_conn::{GroupLogicalCounters, group_connection_stats};
 /// The bounds are deliberately expressed in actions, packets, and bytes:
 /// timer churn cannot bypass the action cap, while a burst of large UDP
 /// datagrams cannot monopolize a readiness-loop iteration.
+///
+/// Zero means zero work, never unlimited: a budget constructed with any
+/// zero field performs no output work on that axis. `usize::MAX` is the
+/// way to express an effectively unlimited axis.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OutputDrainBudget {
     pub max_actions: usize,
@@ -214,6 +340,13 @@ impl OutputDrainBudget {
             self.max_packets.min(other.max_packets),
             self.max_bytes.min(other.max_bytes),
         )
+    }
+
+    #[cfg(any(feature = "mio", feature = "tokio"))]
+    pub(crate) fn consume(&mut self, actions: usize, packets: usize, bytes: usize) {
+        self.max_actions = self.max_actions.saturating_sub(actions);
+        self.max_packets = self.max_packets.saturating_sub(packets);
+        self.max_bytes = self.max_bytes.saturating_sub(bytes);
     }
 }
 
@@ -310,11 +443,9 @@ impl SrtStackConfig {
             bonded_inputs: BondedInputPolicy::Reject,
             connection_template: Some(self.connection.clone()),
             handshake_retry_interval: Duration::from_micros(
-                shiguredo_srt::DEFAULT_HANDSHAKE_RETRY_INTERVAL_MICROS,
+                srt_proto::DEFAULT_HANDSHAKE_RETRY_INTERVAL_MICROS,
             ),
-            handshake_timeout: Duration::from_micros(
-                shiguredo_srt::DEFAULT_HANDSHAKE_TIMEOUT_MICROS,
-            ),
+            handshake_timeout: Duration::from_micros(srt_proto::DEFAULT_HANDSHAKE_TIMEOUT_MICROS),
         }
     }
 

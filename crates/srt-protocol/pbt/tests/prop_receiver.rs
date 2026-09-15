@@ -1,10 +1,10 @@
 //! Property-based tests for SRT ReceiverBuffer
 
 use proptest::prelude::*;
-use shiguredo_srt::{
-    DEFAULT_FLOW_WINDOW, DataPacket, LossRange, NakPacket, PacketPosition, ReceiverBuffer,
-    Timestamp,
-};
+use srt_proto::Timestamp;
+use srt_proto::handshake::DEFAULT_FLOW_WINDOW;
+use srt_proto::receiver::{LossRange, NakPacket, ReceiverBuffer};
+use srt_proto::wire::{DataPacket, PacketPosition};
 
 fn expand_range(range: LossRange) -> Vec<u32> {
     range.iter().collect()
@@ -362,12 +362,12 @@ proptest! {
     #[test]
     fn configured_ack_interval_is_the_periodic_threshold(
         initial_seq in 0u32..0x7FFF_FFFFu32,
-        interval_micros in shiguredo_srt::MIN_ACK_INTERVAL_MICROS
-            ..=shiguredo_srt::MAX_ACK_INTERVAL_MICROS,
+        interval_micros in srt_proto::receiver::MIN_ACK_INTERVAL_MICROS
+            ..=srt_proto::receiver::MAX_ACK_INTERVAL_MICROS,
     ) {
         let start = Timestamp::from_micros(0);
         let mut buf = ReceiverBuffer::new(initial_seq, 120, start, 0);
-        buf.set_ack_coalesce(interval_micros, shiguredo_srt::LIGHT_ACK_INTERVAL_PACKETS);
+        buf.set_ack_coalesce(interval_micros, srt_proto::receiver::LIGHT_ACK_INTERVAL_PACKETS);
 
         prop_assert!(!buf.should_send_ack(Timestamp::from_micros(
             interval_micros.saturating_sub(1)

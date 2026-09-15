@@ -10,8 +10,9 @@ socket preparation, and lifecycle surfaces are runtime-neutral.
 The dividing line against [`srt-lifecycle`](../srt-lifecycle) is
 ownership, not subject matter. Both crates deal with admission:
 
-* **lifecycle takes values and returns decisions.** No sockets, no
-  clocks, no protocol objects; time is passed in.
+* **lifecycle takes values and returns decisions.** It owns policy
+  bookkeeping, but no live sockets, clocks, protocol objects, or runtime
+  resources; time is passed in.
 * **transport owns things.** Live `SrtConnection`s, their timers, file
   descriptors, counters.
 
@@ -29,22 +30,30 @@ policy); lifecycle never depends on this one.
 
 Three layers:
 
+The root is the application-facing configuration, logical-handle, bounded
+budget, and snapshot surface. Custom owners should use the explicit
+`advanced::prepared`, `advanced::admission`, `advanced::caller`,
+`advanced::group`, `advanced::driver`, `advanced::native_io`, and
+`advanced::platform` namespaces. Deadline indexes and dense slot structures
+are implementation details and are available only through the
+`bench-internals` `test_support` module.
+
 1. **Shared utilities** (always compiled, no runtime deps)
    - `ManualTimerStore` — a fixed `[Option<Timestamp>; TimerId::COUNT]`
      array with a scan on fire. Every native runtime adapter's `Conn` uses
      this same store; there is no per-runtime timer-future type.
-   - `DueIndex<K>` — a lazy-deletion deadline heap for shared loops that
+   - internal `DueIndex<K>` — a lazy-deletion deadline heap for shared loops that
      own many connections. Per-connection timer maps stay small; the index
      prevents a separate O(peers) scan just to find which maps are due.
-   - `DeadlineHeap<K>` / `HighResWaiter<K>` — one high-resolution waiter
+   - `HighResWaiter<K>` — one high-resolution waiter
      per worker (issue #82 A2). Absolute `CLOCK_MONOTONIC` deadlines in a
      min-heap, `epoll_pwait2` (nanosecond timeout) with absolute-`timerfd`
-     fallback, no per-connection spin. After a single wake the caller
-     services every due connection. This is the alternative that must be
-     tried before Route B ownership/debt changes to `SrtConnection`. See
-     [high-res-waiter.md](../../docs/perf/high-res-waiter.md).
+     fallback, no per-connection spin. `HighResWaiter::with_capacity` gives
+     each owner an explicit finite key envelope; registration and deadline
+     insertion fail at that envelope. After a single wake the caller
+     services every due connection. See [high-res-waiter.md](../../docs/perf/high-res-waiter.md).
    - `OutputDrainBudget` / `OutputDrainReport` — explicit per-tick action,
-     packet, and byte limits shared by all six output pumps. Send failures
+     packet, and byte limits shared by every runtime's output pumps. Send failures
      are returned and unsent datagrams remain queued in protocol order.
    - `RecvBatch` / `drain_recv_fd` / `tokio_transport::drain_readable` —
      reusable readiness-runtime batch receive (`recvmmsg` + optional
@@ -61,17 +70,16 @@ Three layers:
 
 2. **Admission machinery** (always compiled, runtime-neutral, does no I/O
    of its own — the caller performs every send)
-   - `PeerTable` / `AdmissionPeer` — the peers one acceptor is servicing
+   - `PeerTable` — the peers one acceptor is servicing
      off its shared listener socket, from first datagram until the
      connection is promoted, relocated, or retired. Mints each
-     connection's SYN cookie, applies cookie routing, and answers
-     `all_terminal()`.
+     connection's SYN cookie and applies cookie routing. The benchmark-only
+     `all_terminal()` helper is available only with `bench-internals`.
    - `poll_outbound()` uses a ready queue plus `DueIndex` to service only
      peers with input/output work or a due timer.
    - `poll_events()` returns unmodified `AdmissionEvent`s (including data
-     payloads) for production consumers. `drain_events()` is the legacy
-     benchmark adapter that folds those events into counters and promotion
-     timing.
+     payloads) for production consumers. The legacy `drain_events()` adapter
+     is available only with the `bench-internals` feature.
    - Bonded input is an explicit `BondedInputPolicy`: `Reject` is the default,
      preventing silent degradation into unrelated single-leg publishers.
      With `Accept`, `PeerTable` validates each leg normally, groups matching
@@ -172,14 +180,14 @@ backend by argument, not by trait object. Same rationale as
 ## Usage sketch (mio)
 
 ```rust
-use srt_transport::mio_transport::Conn;
+use srt_transport::mio::Conn;
 
 let mut conn = Conn::new(srt_connection, mio_socket);
 let report = conn.drain_outputs_bounded(now, Default::default())?;
 // A BudgetExhausted/Backpressured report means yield and service it again;
 // unsent datagrams remain queued in order.
 let timeout = conn.poll_timeout(Duration::from_millis(20), now);
-// poll.poll(&mut events, Some(timeout)); ... feed datagrams to conn.conn
+// poll.poll(&mut events, Some(timeout)); ... feed datagrams to conn.protocol_mut()
 conn.fire_expired(now);                        // service due timers
 ```
 
@@ -253,11 +261,9 @@ telemetry, security, and escape hatches, is in the workspace
 The core resolver shape is:
 
 ```rust
-use shiguredo_srt::KeyLength;
-use srt_transport::{
-    AdmissionResolution, ListenerEncryptionConfig, ListenerPeerPolicy,
-    PolicyOverride, RejectionReason,
-};
+use srt_proto::crypto::KeyLength;
+use srt_transport::{ListenerEncryptionConfig, ListenerPeerPolicy, PolicyOverride};
+use srt_transport::advanced::admission::{AdmissionResolution, RejectionReason};
 
 let outcome = peers.admit_with_resolver(
     peer,
@@ -321,7 +327,8 @@ implementation details.
 
 ## Consumers
 
-- [`srt-bench`](../srt-bench) — enables **all six features** and builds
-  one adapter binary per runtime for the bake-off.
+- [`srt-bench`](../srt-bench) — enables **all three supported runtime
+  features** (mio, tokio, compio) and builds one adapter binary per
+  runtime for the bake-off.
 - Application code should pick one feature and depend on only that
-  module (`srt_transport::<runtime>_transport::Conn`).
+  module (`srt_transport::<runtime>::Conn`).

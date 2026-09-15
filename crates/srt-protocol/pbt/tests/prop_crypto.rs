@@ -1,7 +1,7 @@
 //! Property-based tests for SRT crypto
 
 use proptest::prelude::*;
-use shiguredo_srt::{CipherMode, CryptoContext, KeyFlag, KeyLength, KmRefreshState};
+use srt_proto::crypto::{CipherMode, CryptoContext, KeyFlag, KeyLength, KmRefreshState};
 
 fn generate_sek(key_length: KeyLength) -> Vec<u8> {
     vec![0x42u8; key_length.len()]

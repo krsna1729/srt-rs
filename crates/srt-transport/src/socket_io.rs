@@ -17,6 +17,37 @@ pub struct SocketBufferStats {
     pub sndbuf_max_bytes: usize,
 }
 
+impl SocketBufferStats {
+    /// Conservative lower bound of kernel-granted socket buffer memory across all
+    /// tracked sockets (`sockets × (min_rcvbuf + min_sndbuf)`). Returns zero when
+    /// no sockets have been recorded yet.
+    #[must_use]
+    pub fn min_effective_bytes(self) -> usize {
+        if self.sockets == 0
+            || self.rcvbuf_min_bytes == usize::MAX
+            || self.sndbuf_min_bytes == usize::MAX
+        {
+            0
+        } else {
+            self.sockets
+                .saturating_mul(self.rcvbuf_min_bytes.saturating_add(self.sndbuf_min_bytes))
+        }
+    }
+
+    /// Conservative upper bound of kernel-granted socket buffer memory across all
+    /// tracked sockets (`sockets × (max_rcvbuf + max_sndbuf)`). Returns zero when
+    /// no sockets have been recorded yet.
+    #[must_use]
+    pub fn max_effective_bytes(self) -> usize {
+        if self.sockets == 0 {
+            0
+        } else {
+            self.sockets
+                .saturating_mul(self.rcvbuf_max_bytes.saturating_add(self.sndbuf_max_bytes))
+        }
+    }
+}
+
 static SOCKET_COUNT: AtomicUsize = AtomicUsize::new(0);
 static RCVBUF_MIN: AtomicUsize = AtomicUsize::new(usize::MAX);
 static RCVBUF_MAX: AtomicUsize = AtomicUsize::new(0);
@@ -130,12 +161,14 @@ pub fn set_sock_bufs(fd: std::os::fd::RawFd, bytes: usize) -> std::io::Result<()
     Ok(())
 }
 
-/// Bind a UDP socket with SO_REUSEPORT set, 16 MB send/recv buffers, and
-/// non-blocking mode. Returns a plain `std::net::UdpSocket`; each adapter
+/// Bind an IPv4-only UDP socket with SO_REUSEPORT set, non-blocking mode, and
+/// `sock_buf_bytes` applied via [`set_sock_bufs`]. IPv4-only by construction
+/// (`Domain::IPV4`); family-symmetric binds go through `config::bind_udp`
+/// (via `PreparedListener::bind_sockets`).
+/// Returns a plain `std::net::UdpSocket`; each adapter
 /// converts that to its own native socket type (mio's own `UdpSocket`
 /// wraps it directly; tokio's needs no conversion at all -- it already
 /// takes a std socket). `sock_buf_bytes` is passed to [`set_sock_bufs`];
-/// `0` leaves the OS default.
 pub fn bind_reuseport(port: u16, sock_buf_bytes: usize) -> std::io::Result<net::UdpSocket> {
     use std::os::fd::AsRawFd;
     let sock = socket2::Socket::new(
@@ -737,6 +770,10 @@ mod tests {
         assert!(after.rcvbuf_min_bytes <= after.rcvbuf_max_bytes);
         assert!(after.sndbuf_min_bytes > 0);
         assert!(after.sndbuf_min_bytes <= after.sndbuf_max_bytes);
+        assert!(after.min_effective_bytes() > 0);
+        assert!(after.min_effective_bytes() <= after.max_effective_bytes());
+        assert_eq!(SocketBufferStats::default().min_effective_bytes(), 0);
+        assert_eq!(SocketBufferStats::default().max_effective_bytes(), 0);
     }
 
     #[test]

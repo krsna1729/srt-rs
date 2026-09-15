@@ -424,7 +424,7 @@ pub fn append_result(
     // reader re-derive it. MAXBW/INPUTBW are protocol bytes/s; results
     // state bits/s so they sit in the same units as `source_bps`.
     let resolved = cfg.srt_bandwidth().resolve();
-    let sock_bufs = srt_transport::socket_buffer_stats();
+    let sock_bufs = srt_transport::advanced::platform::socket_buffer_stats();
     let sock_buf_requested = cfg.sock_buf_bytes;
     let observed = |value: usize| {
         if sock_bufs.sockets > 0 {
@@ -497,7 +497,7 @@ pub fn append_result(
         observed(sock_bufs.rcvbuf_max_bytes),
         observed(sock_bufs.sndbuf_min_bytes),
         observed(sock_bufs.sndbuf_max_bytes),
-        srt_transport::current_cpu_spec().unwrap_or_default(),
+        srt_transport::advanced::platform::current_cpu_spec().unwrap_or_default(),
         if cfg.pin { "on" } else { "off" }.into(),
         cfg.link.get("delay").to_string(),
         cfg.link.get("jitter").to_string(),
@@ -1450,12 +1450,9 @@ fn filter_batching(
 fn filter_pinning(
     cell: &Cell<'_>,
     axes: &[Axis],
-    runtime_recv: &str,
-    runtime_send: &str,
+    _runtime_recv: &str,
+    _runtime_send: &str,
 ) -> Option<&'static str> {
-    if runtime_recv == "glommio" || runtime_send == "glommio" {
-        return None;
-    }
     let pin = cell_value(cell, "pin", Some(Scope::Both))?;
     representative(axes, "pin", "off")
         .filter(|keep| pin != *keep)
@@ -2158,12 +2155,12 @@ fn resolve_matrix_axes(cli: &crate::Cli) -> std::io::Result<MatrixAxisConfig> {
         axis(
             "ack-interval-micros",
             "ack-interval-micros",
-            &shiguredo_srt::ACK_INTERVAL_MICROS.to_string(),
+            &srt_proto::receiver::ACK_INTERVAL_MICROS.to_string(),
         ),
         axis(
             "light-ack-interval-packets",
             "light-ack-interval-packets",
-            &shiguredo_srt::LIGHT_ACK_INTERVAL_PACKETS.to_string(),
+            &srt_proto::receiver::LIGHT_ACK_INTERVAL_PACKETS.to_string(),
         ),
     ]);
     let unused: Vec<&str> = plan
@@ -3159,7 +3156,7 @@ pub fn run_matrix(cli: &crate::Cli) -> std::io::Result<MatrixReport> {
 }
 
 fn add_cpu_identity(cells: &mut [Cell<'_>], recv_cpus: &str, send_cpus: &str) {
-    let inherited = srt_transport::current_cpu_spec().unwrap_or_default();
+    let inherited = srt_transport::advanced::platform::current_cpu_spec().unwrap_or_default();
     for cell in cells {
         if recv_cpus.is_empty() && send_cpus.is_empty() {
             if !inherited.is_empty() {
@@ -4061,7 +4058,7 @@ mod matrix_filter_tests {
             Some("bonded-egress-unsupported")
         );
 
-        for runtime in ["mio", "tokio", "smol", "monoio", "glommio", "compio"] {
+        for runtime in ["mio", "tokio", "compio"] {
             let supported = cell(&[
                 ("ingress", "shared-pool:1"),
                 ("promotion", "never"),
@@ -4141,12 +4138,12 @@ mod matrix_filter_tests {
             .collect::<Vec<_>>();
         assert_eq!(filter_reason(&cell(&mio), &axes), Some("pin-inert"));
 
-        let glommio = pin_base
+        let compio = pin_base
             .iter()
             .copied()
-            .chain([("runtime", "glommio")])
+            .chain([("runtime", "compio")])
             .collect::<Vec<_>>();
-        assert_eq!(filter_reason(&cell(&glommio), &axes), None);
+        assert_eq!(filter_reason(&cell(&compio), &axes), Some("pin-inert"));
     }
 
     #[test]
@@ -4542,7 +4539,7 @@ mod matrix_filter_tests {
             "--plan",
             plan_path,
             "--axis",
-            "runtime=smol",
+            "runtime=compio",
             "--axis",
             "datapath-q-horizon-ms=100,200",
             "--axis",
@@ -4551,7 +4548,7 @@ mod matrix_filter_tests {
         .unwrap();
         assert_eq!(
             config.axes[0],
-            ("runtime", Scope::Both, vec!["smol".to_string()])
+            ("runtime", Scope::Both, vec!["compio".to_string()])
         );
         assert_eq!(
             config.axes[1],
@@ -4702,7 +4699,7 @@ mod report_tests {
     /// every validity input the canonical pairing requires.
     fn row(role: &str, rep: &str, sent: &str, retx: &str, attempt: &str) -> Record {
         rec(&[
-            ("runtime", "smol"),
+            ("runtime", "tokio"),
             ("role", role),
             ("rep", rep),
             ("attempt", attempt),
