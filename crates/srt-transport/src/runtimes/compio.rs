@@ -233,28 +233,32 @@ pub fn caller(
 
 /// Canonical production runtime profile for a shared Compio Owner.
 ///
-/// Restream calls [`production_runtime_builder`] from its shard thread and
-/// `block_on`s the returned runtime; srt-rs never chooses process/thread/NUMA
-/// topology itself.
+/// Restream constructs the actual shard [`compio::runtime::Runtime`], then
+/// calls [`observe_production_runtime`] on that exact runtime to record
+/// qualification data. srt-rs never chooses process/thread/NUMA topology
+/// itself. Capability fields are observed host data, not policy: a host
+/// without buffer-ring support stays on the readiness + raw `recvfrom` path
+/// without changing architecture.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompioProductionProfile {
     /// Fixed TX lane count (= TX capacity) for the Owner.
     pub tx_lanes: usize,
     /// Wire ceiling in bytes for every TxPool slot.
     pub wire_ceiling: usize,
-    /// Managed/multishot RX is unavailable on this host: the kernel rejected
-    /// `IORING_REGISTER_PBUF_RING` (observed EINVAL on io_uring buffer-ring
-    /// registration), so the Owner uses readiness + raw `recvfrom`.
+    /// Whether managed/multishot RX armed cleanly on the observed runtime.
     pub managed_rx_available: bool,
-    /// Whether the active driver is io_uring (vs Poll fallback).
+    /// Whether the observed driver is io_uring (vs Poll fallback).
     pub is_io_uring: bool,
     /// Kernel release string from `/proc/version`.
     pub kernel_version: String,
-    /// Pinned Compio version from `Cargo.lock`.
+    /// Pinned Compio version from `Cargo.lock` (not the srt-transport version).
     pub compio_version: String,
-    /// Active driver name (`IoUring` or `Poll`).
+    /// Observed driver name (`IoUring` or `Poll`).
     pub driver_type: String,
 }
+
+/// Pinned Compio dependency version, kept in sync with `Cargo.lock`.
+pub const PINNED_COMPIO_VERSION: &str = "0.19.2";
 
 impl Default for CompioProductionProfile {
     fn default() -> Self {
@@ -264,7 +268,7 @@ impl Default for CompioProductionProfile {
             managed_rx_available: false,
             is_io_uring: false,
             kernel_version: String::new(),
-            compio_version: env!("CARGO_PKG_VERSION").to_string(),
+            compio_version: PINNED_COMPIO_VERSION.to_string(),
             driver_type: String::new(),
         }
     }
@@ -272,50 +276,49 @@ impl Default for CompioProductionProfile {
 
 /// Build the canonical production Compio runtime for one Owner shard thread.
 ///
-/// Uses default `ProactorBuilder` settings (no `coop_taskrun`, no custom
-/// thread-pool fallback): the Owner's fixed TX lanes and single-consumer RX
-/// path are the only concurrency structure srt-rs imposes.
+/// Uses default `ProactorBuilder` settings: the Owner's fixed TX lanes and
+/// single-consumer RX path are the only concurrency structure srt-rs
+/// imposes. Returns the live runtime; call [`observe_production_runtime`]
+/// on it to record qualification diagnostics.
 #[must_use]
 pub fn production_runtime_builder() -> compio::runtime::RuntimeBuilder {
     compio::runtime::RuntimeBuilder::new()
 }
 
-/// Probe the active runtime and return the production profile + diagnostics.
+/// Observe an already-constructed runtime and return its production profile.
 ///
-/// Records whether managed/multishot RX (`recv_from_multi` /
-/// `recv_msg_multi` over the runtime buffer pool) is usable on this host by
-/// attempting one zero-length multishot poll; a completed `Err(EINVAL)` means
-/// the kernel rejected buffer-ring registration and the Owner must stay on
-/// the readiness + raw `recvfrom` path.
-pub fn production_profile() -> CompioProductionProfile {
-    let runtime = compio::runtime::Runtime::new().expect("compio runtime builds for profile probe");
-    runtime.block_on(async {
-        let driver = runtime.driver_type();
-        let is_io_uring = driver.is_iouring();
-        let kernel = std::fs::read_to_string("/proc/version")
-            .unwrap_or_else(|_| "unknown kernel".to_string())
-            .trim()
-            .to_string();
-        // Probe managed RX availability with a throwaway socket.
-        let mut managed_rx_available = false;
-        if let Ok(sock) = compio::net::UdpSocket::bind("127.0.0.1:0").await {
-            use futures_util::{FutureExt, Stream};
-            let mut s = Box::pin(sock.recv_from_multi());
-            let r = std::future::poll_fn(|cx| Stream::poll_next(s.as_mut(), cx)).now_or_never();
-            // `Pending` means the multishot op armed cleanly; `Err(EINVAL)`
-            // means buffer-ring registration failed on this host.
-            managed_rx_available = r.is_none();
-        }
-        CompioProductionProfile {
-            tx_lanes: DEFAULT_TX_POOL_CAPACITY,
-            wire_ceiling: DEFAULT_TX_SLOT_SIZE,
-            managed_rx_available,
-            is_io_uring,
-            kernel_version: kernel,
-            compio_version: "0.19.2".to_string(),
-            driver_type: format!("{driver:?}"),
-        }
-    })
+/// Inspects the exact runtime Restream built for the shard (never a
+/// throwaway probe runtime). Records whether managed/multishot RX
+/// (`recv_from_multi` over the runtime buffer pool) arms cleanly: `Pending`
+/// means usable; `Err(EINVAL)` means the kernel rejected buffer-ring
+/// registration on this host.
+pub async fn observe_production_runtime(
+    runtime: &compio::runtime::Runtime,
+    tx_lanes: usize,
+    wire_ceiling: usize,
+) -> CompioProductionProfile {
+    let driver = runtime.driver_type();
+    let is_io_uring = driver.is_iouring();
+    let kernel = std::fs::read_to_string("/proc/version")
+        .unwrap_or_else(|_| "unknown kernel".to_string())
+        .trim()
+        .to_string();
+    let mut managed_rx_available = false;
+    if let Ok(sock) = compio::net::UdpSocket::bind("127.0.0.1:0").await {
+        use futures_util::{FutureExt, Stream};
+        let mut s = Box::pin(sock.recv_from_multi());
+        let r = std::future::poll_fn(|cx| Stream::poll_next(s.as_mut(), cx)).now_or_never();
+        managed_rx_available = r.is_none();
+    }
+    CompioProductionProfile {
+        tx_lanes,
+        wire_ceiling,
+        managed_rx_available,
+        is_io_uring,
+        kernel_version: kernel,
+        compio_version: PINNED_COMPIO_VERSION.to_string(),
+        driver_type: format!("{driver:?}"),
+    }
 }
 
 /// Live runtime driver inspection record.
@@ -2909,13 +2912,23 @@ mod tests {
     }
 
     #[test]
-    fn production_profile_reports_host_truth() {
-        let profile = super::production_profile();
-        // This host rejects PBUF_RING (EINVAL): managed RX unavailable.
-        assert!(!profile.managed_rx_available);
-        assert!(profile.is_io_uring);
-        assert_eq!(profile.compio_version, "0.19.2");
+    fn production_profile_observes_live_runtime() {
+        // Portable: observes the exact runtime under test, asserts only
+        // structural invariants. Capability bits are qualification data
+        // recorded per host, never deterministic unit-test invariants.
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        let profile = runtime.block_on(super::observe_production_runtime(
+            &runtime,
+            super::DEFAULT_TX_POOL_CAPACITY,
+            super::DEFAULT_TX_SLOT_SIZE,
+        ));
+        assert_eq!(profile.tx_lanes, super::DEFAULT_TX_POOL_CAPACITY);
+        assert_eq!(profile.wire_ceiling, super::DEFAULT_TX_SLOT_SIZE);
+        assert_eq!(profile.compio_version, super::PINNED_COMPIO_VERSION);
         assert!(!profile.kernel_version.is_empty());
         assert!(!profile.driver_type.is_empty());
+        // `is_io_uring` and `managed_rx_available` are recorded, not asserted:
+        // they vary by host kernel and backend.
+        let _ = (profile.is_io_uring, profile.managed_rx_available);
     }
 }
