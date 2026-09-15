@@ -17,24 +17,29 @@ Delivery: sender core_total == receiver core_total within 4 packets
 torn_down=0. Latency (rtt_ms): sender 0.000 (sender-side clock), receiver
 24.805. Raw TSVs: `qual-compio-100-send.tsv`, `qual-compio-100-recv.tsv`.
 
-## fanout 600 (partial: 364/600 established)
+## fanout 600 (INVALID for capacity: receiver timeout-start skew)
 
 | side | established | pkt_sent | core_total | throughput_pps | cpu_user_ms | cpu_sys_ms | peak_rss_kb |
 |------|-------------|----------|------------|----------------|-------------|------------|-------------|
 | sender | 364/600 | 3800522 | 3800522 | 34543 | 49428.1 | 59217.9 | 38216 |
 | receiver | 364/600 | 3800375 | 3800375 | 33033 | 44675.0 | 60502.1 | 50036 |
 
-Handshake timeout on 236 legs (`connect timed out, state=Listening`);
-established legs deliver symmetric packet counts (3800522 vs 3800375,
-delta 147 = in-flight at shutdown). Receiver torn_down=19 at exit.
+INVALID: per-port receiver tasks armed `connect_deadline` at task spawn
+while the sender opens handshakes at `connect_cc=1`; hundreds of idle
+listeners consumed their 25s timeout waiting for first contact
+(`connect timed out, state=Listening`). Fixed on this branch by arming
+the receiver handshake deadline on first received datagram (+ 3x process
+backstop); rerun required before any 600 capacity claim. Preserved here
+only as diagnostic evidence of the skew bug, not a frontier result.
 Raw TSVs: `qual-compio-600-send.tsv`, `qual-compio-600-recv.tsv`.
 
 ## Interpretation
 
 - The task-per-connection bench adapter sustains 100 destinations cleanly
-  on this host; 600 exceeds single-process handshake throughput (not an
-  Owner datapath result — the shared Owner was not under test here).
-- Shard frontier on this host: 1 process x 100 destinations clean;
-  600 needs sharding and/or connect-concurrency tuning.
-- Next: run the shared-Owner two-process harness (Owner sender shards x
-  external receiver) to measure Q << F with the real datapath.
+  on this host (valid). The 600 row is INVALID (see above) and must not
+  be read as "600 exceeds single-process handshake throughput".
+- Validated shard frontier on this host: 1 process x 100 destinations
+  clean; 600 unordered.
+- Next: rerun 600/1000 with the first-contact deadline fix; then run the
+  shared-Owner two-process harness (Owner sender shards x external
+  receiver) to measure Q << F with the real datapath.

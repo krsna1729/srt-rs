@@ -19,9 +19,9 @@ CPU to justify building and maintaining a second runtime backend?
    multishot-receive prototype cannot even register its buffer ring here;
    it would measure the fallback path, not the opportunity.
 3. Qualification frontier (`qual-compio-frontier.md`): 100x100 clean at
-   ~55k pps sender-side; the binding constraint at 600 is single-process
-   handshake throughput, not per-send op cost. Sharding moves the needle;
-   op-shaving does not.
+   ~55k pps sender-side; the 600 row is INVALID (receiver timeout-start
+   skew, rerun pending) and is not evidence for or against op cost.
+   No valid same-workload shared-Owner A/B exists yet.
 4. Cost: a native backend duplicates driver setup, buffer-ring management,
    completion reaping, cancellation, and Poll-fallback — all already owned
    by Compio and covered by its tests.
