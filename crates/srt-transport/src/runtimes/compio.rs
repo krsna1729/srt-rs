@@ -1133,4 +1133,78 @@ mod tests {
             assert!(owner.tx_in_flight() <= 4);
         });
     }
+
+    #[test]
+    fn compio_relay_composition_fanout_clones_bytes_without_payload_copy() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            let l_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind listener std");
+            let l_addr = l_std.local_addr().expect("listener addr");
+            let l_sock = compio::net::UdpSocket::from_std(l_std).expect("compio adopt listener");
+
+            let c_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind caller std");
+            let c_sock = compio::net::UdpSocket::from_std(c_std).expect("compio adopt caller");
+
+            let l_cfg = crate::ListenerConfig::builder(l_addr)
+                .build()
+                .expect("listener config");
+            let listener_side = ListenerSide::new(l_sock, &l_cfg).expect("listener side");
+            let caller_side = CallerSide::new(c_sock);
+
+            let mut owner = Owner::new(64)
+                .with_listener(listener_side)
+                .with_caller(caller_side);
+
+            // Add 4 downstream destinations
+            let mut dest_ids = Vec::new();
+            for i in 1..=4u32 {
+                let peer: std::net::SocketAddr =
+                    format!("127.0.0.1:{}", 35000 + i).parse().unwrap();
+                let mut conn = SrtConnection::new_caller(srt_proto::ConnectionOptions {
+                    socket_id: 0x3000 + i,
+                    ..Default::default()
+                });
+                let now = Timestamp::from_micros(10_000);
+                conn.connect(now).expect("connect");
+                let leg = crate::caller::CallerLeg {
+                    peer,
+                    connection: conn,
+                };
+                let id = owner
+                    .caller_mut()
+                    .unwrap()
+                    .table
+                    .add_direct(leg)
+                    .expect("add direct");
+                dest_ids.push(id);
+            }
+
+            // Simulate incoming media payload
+            let media = Bytes::from_static(b"relay-media-payload-1316-bytes-test");
+            let media_ptr = media.as_ptr();
+
+            // Fan out by cloning Bytes handles to all 4 destinations
+            let now = Timestamp::from_micros(10_000);
+            for &id in &dest_ids {
+                let clone = media.clone();
+                assert_eq!(
+                    clone.as_ptr(),
+                    media_ptr,
+                    "Bytes clone must share underlying memory"
+                );
+                owner.caller_mut().unwrap().table.bench_push_pending(
+                    id,
+                    "127.0.0.1:35001".parse().unwrap(),
+                    clone.to_vec(),
+                );
+            }
+
+            let budget = OwnerServiceBudget {
+                max_tx_packets: 10,
+                ..Default::default()
+            };
+            let report = owner.service(now, budget).await;
+            assert_eq!(report.tx_packets_submitted, 8);
+        });
+    }
 }

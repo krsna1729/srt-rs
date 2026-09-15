@@ -1541,8 +1541,9 @@ fn drain_caller_legacy_output<S: DatagramSink + ?Sized>(
     match output {
         ConnectionOutput::SendPacket(packet) => {
             let wire_len = packet.len();
-            let exceeds_packets = sink.report.packets >= sink.budget.max_packets;
-            let exceeds_bytes = sink.report.packets > 0
+            let exceeds_packets =
+                sink.budget.max_packets > 0 && sink.report.packets >= sink.budget.max_packets;
+            let exceeds_bytes = sink.budget.max_bytes > 0
                 && sink.report.bytes.saturating_add(wire_len) > sink.budget.max_bytes;
             if exceeds_packets || exceeds_bytes {
                 return Some((DrainOne::Blocked, false));
@@ -1585,8 +1586,9 @@ fn drain_caller_direct_meta<S: DatagramSink + ?Sized>(
 ) -> (DrainOne, bool) {
     match meta {
         OutputMeta::Datagram { wire_len } => {
-            let exceeds_packets = sink.report.packets >= sink.budget.max_packets;
-            let exceeds_bytes = sink.report.packets > 0
+            let exceeds_packets =
+                sink.budget.max_packets > 0 && sink.report.packets >= sink.budget.max_packets;
+            let exceeds_bytes = sink.budget.max_bytes > 0
                 && sink.report.bytes.saturating_add(wire_len) > sink.budget.max_bytes;
             if exceeds_packets || exceeds_bytes {
                 return (DrainOne::Blocked, false);
@@ -2500,6 +2502,108 @@ mod tests {
         assert!(listeners.is_empty());
         assert_eq!(listeners.established_count(), 0);
         assert_eq!(listeners.half_open_count(), 0);
+    }
+
+    #[test]
+    fn bonded_group_drain_never_exceeds_declared_action_packet_or_byte_budget() {
+        let mut callers = CallerTable::default();
+        let group_id = 999 | srt_proto::handshake::SRTGROUP_MASK;
+        let first_peer: std::net::SocketAddr = "127.0.0.1:31001".parse().unwrap();
+        let second_peer: std::net::SocketAddr = "127.0.0.1:31002".parse().unwrap();
+
+        let grouped = callers
+            .add_group(
+                group_id,
+                srt_proto::GroupMode::Broadcast,
+                [
+                    CallerGroupLeg::new(
+                        1,
+                        1,
+                        first_peer,
+                        caller_connection(ConnectionOptions {
+                            socket_id: 202,
+                            initial_seq: Some(1000),
+                            group_extension: Some(srt_proto::handshake::GroupExtensionData {
+                                group_id,
+                                group_type: srt_proto::handshake::GroupType::Broadcast,
+                                flags: 0,
+                                weight: 1,
+                            }),
+                            ..ConnectionOptions::default()
+                        }),
+                    ),
+                    CallerGroupLeg::new(
+                        2,
+                        1,
+                        second_peer,
+                        caller_connection(ConnectionOptions {
+                            socket_id: 203,
+                            initial_seq: Some(1000),
+                            group_extension: Some(srt_proto::handshake::GroupExtensionData {
+                                group_id,
+                                group_type: srt_proto::handshake::GroupType::Broadcast,
+                                flags: 0,
+                                weight: 1,
+                            }),
+                            ..ConnectionOptions::default()
+                        }),
+                    ),
+                ],
+            )
+            .expect("grouped caller admitted");
+
+        let mut listeners = PeerTable::new();
+        let mut options = AdmissionOptions::basic(999, 0, true);
+        options.bonded_inputs = BondedInputPolicy::Accept;
+        let telemetry = IngressTelemetry::new();
+        for round in 0..8 {
+            pump_caller_table(
+                &mut callers,
+                &mut listeners,
+                &options,
+                &telemetry,
+                Timestamp::from_micros(round * 10),
+            );
+        }
+
+        // Send 5 broadcast messages (each produces 2 physical packets, total 10 packets)
+        for i in 0..5 {
+            let _ = callers.logical_caller_mut(&grouped).unwrap().send(
+                format!("broadcast payload {i}").as_bytes(),
+                Timestamp::from_micros(100),
+            );
+        }
+
+        let now = Timestamp::from_micros(100);
+
+        // 1. Drain with max_packets = 1
+        let mut out = Vec::new();
+        let report =
+            callers.poll_outbound_bounded(now, OutputDrainBudget::new(10, 1, 100_000), &mut out);
+        assert_eq!(report.packets, 1);
+        assert_eq!(out.len(), 1);
+        assert_eq!(report.status, OutputDrainStatus::BudgetExhausted);
+
+        // 2. Drain with max_actions = 1
+        let report =
+            callers.poll_outbound_bounded(now, OutputDrainBudget::new(1, 10, 100_000), &mut out);
+        assert_eq!(report.actions, 1);
+        assert_eq!(out.len(), 1);
+        assert_eq!(report.status, OutputDrainStatus::BudgetExhausted);
+
+        // 3. Drain with max_bytes = 20 (smaller than the wire size of 1 data packet = 35B)
+        let report =
+            callers.poll_outbound_bounded(now, OutputDrainBudget::new(10, 10, 20), &mut out);
+        assert_eq!(report.bytes, 0);
+        assert_eq!(out.len(), 0);
+        assert_eq!(report.status, OutputDrainStatus::BudgetExhausted);
+
+        // 4. Drain with max_bytes = 50: fits exactly 1 packet (35B), second (35+35=70) is blocked
+        let report =
+            callers.poll_outbound_bounded(now, OutputDrainBudget::new(10, 10, 50), &mut out);
+        assert_eq!(report.bytes, 35);
+        assert_eq!(out.len(), 1);
+        assert_eq!(report.status, OutputDrainStatus::BudgetExhausted);
     }
 
     /// A05: `CallerTable::poll_events` must surface a direct caller's

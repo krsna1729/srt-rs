@@ -2440,8 +2440,10 @@ impl PeerTable {
         match output {
             ConnectionOutput::SendPacket(bytes) => {
                 let wire_len = bytes.len();
-                let exceeds_packets = report.packets >= budget.max_packets;
-                let exceeds_bytes = report.bytes.saturating_add(wire_len) > budget.max_bytes;
+                let exceeds_packets =
+                    budget.max_packets > 0 && report.packets >= budget.max_packets;
+                let exceeds_bytes = budget.max_bytes > 0
+                    && report.bytes.saturating_add(wire_len) > budget.max_bytes;
                 if exceeds_packets || exceeds_bytes {
                     return Some(true);
                 }
@@ -2484,8 +2486,10 @@ impl PeerTable {
     ) -> bool {
         match meta {
             OutputMeta::Datagram { wire_len } => {
-                let exceeds_packets = report.packets >= budget.max_packets;
-                let exceeds_bytes = report.bytes.saturating_add(wire_len) > budget.max_bytes;
+                let exceeds_packets =
+                    budget.max_packets > 0 && report.packets >= budget.max_packets;
+                let exceeds_bytes = budget.max_bytes > 0
+                    && report.bytes.saturating_add(wire_len) > budget.max_bytes;
                 if exceeds_packets || exceeds_bytes {
                     return true;
                 }
@@ -2660,8 +2664,10 @@ impl PeerTable {
         match output {
             ConnectionOutput::SendPacket(bytes) => {
                 let wire_len = bytes.len();
-                let exceeds_packets = report.packets >= budget.max_packets;
-                let exceeds_bytes = report.bytes.saturating_add(wire_len) > budget.max_bytes;
+                let exceeds_packets =
+                    budget.max_packets > 0 && report.packets >= budget.max_packets;
+                let exceeds_bytes = budget.max_bytes > 0
+                    && report.bytes.saturating_add(wire_len) > budget.max_bytes;
                 if exceeds_packets || exceeds_bytes {
                     return Some(true);
                 }
@@ -2704,8 +2710,10 @@ impl PeerTable {
     ) -> bool {
         match meta {
             OutputMeta::Datagram { wire_len } => {
-                let exceeds_packets = report.packets >= budget.max_packets;
-                let exceeds_bytes = report.bytes.saturating_add(wire_len) > budget.max_bytes;
+                let exceeds_packets =
+                    budget.max_packets > 0 && report.packets >= budget.max_packets;
+                let exceeds_bytes = budget.max_bytes > 0
+                    && report.bytes.saturating_add(wire_len) > budget.max_bytes;
                 if exceeds_packets || exceeds_bytes {
                     return true;
                 }
