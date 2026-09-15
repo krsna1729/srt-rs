@@ -31,11 +31,21 @@ compio = { version = "0.19", features = ["io", "io-uring", "net", "runtime", "ti
 [dev-dependencies]
 criterion = "0.8"
 proptest = "1.11"
+io-uring = "0.7"
+futures-util = "0.3"
 
 [[bench]]
 name = "shared_sender_scheduling"
 harness = false
 required-features = ["bench-internals"]
+
+[[bench]]
+name = "compio_production_fanout"
+harness = false
+
+[[bench]]
+name = "raw_vs_compio_driver"
+harness = false
 
 [features]
 bench-internals = []
