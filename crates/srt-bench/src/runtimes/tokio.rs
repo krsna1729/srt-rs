@@ -595,20 +595,35 @@ async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> Co
 
     let mut stats = ConnStats::default();
     let mut stream_deadline: Option<Instant> = None;
-    let connect_deadline = Instant::now() + crate::CONNECT_TIMEOUT;
+    // Same first-contact arming as the compio receiver: spawn-relative
+    // deadlines expire idle later listeners under connect_cc=1.
+    let mut connect_deadline: Option<Instant> = None;
+    let process_backstop = Instant::now() + 3 * crate::CONNECT_TIMEOUT;
     let mut peer: Option<SocketAddr> = None;
     let mut buf = [0u8; 2048];
 
     loop {
-        if !stats.connected && Instant::now() >= connect_deadline {
+        if !stats.connected
+            && let Some(deadline) = connect_deadline
+            && Instant::now() >= deadline
+        {
             eprintln!(
                 "[bench-tokio] connect timed out, state={:?}",
                 driver.protocol().state()
             );
             break;
         }
+        if Instant::now() >= process_backstop {
+            if !stats.connected {
+                eprintln!("[bench-tokio] connect timed out (process backstop)");
+            }
+            break;
+        }
         if crate::shutdown::past(stream_deadline) {
             break;
+        }
+        if peer.is_some() && connect_deadline.is_none() {
+            connect_deadline = Some(Instant::now() + crate::CONNECT_TIMEOUT);
         }
 
         if !receive_receiver_packets(&mut driver, &mut peer, &mut buf, start, cfg.recv_rounds).await

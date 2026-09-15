@@ -521,12 +521,15 @@ fn drain_receiver_packets(
     received: &Received,
     recycle: &Recycle,
     start: Instant,
-) {
+) -> usize {
+    let mut fed = 0;
     while let Ok((buffer, size)) = received.try_recv() {
         let now = crate::now_ts(start);
         let _ = driver.protocol_mut().feed_recv_buf(&buffer[..size], now);
         let _ = recycle.try_send(buffer);
+        fed += 1;
     }
+    fed
 }
 
 fn handle_receiver_events(
@@ -619,14 +622,29 @@ async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> Co
 
     let mut stats = ConnStats::default();
     let mut stream_deadline: Option<Instant> = None;
-    let connect_deadline = Instant::now() + crate::CONNECT_TIMEOUT;
+    // Handshake deadline arms on FIRST RECEIVED DATAGRAM, not task spawn:
+    // with connect_cc=1 the sender contacts later listeners long after
+    // process start; a spawn-relative deadline would expire idle listeners
+    // still waiting for initial contact (timeout-skew bug). A process-level
+    // backstop (3x CONNECT_TIMEOUT) still guarantees termination.
+    let mut connect_deadline: Option<Instant> = None;
+    let process_backstop = Instant::now() + 3 * crate::CONNECT_TIMEOUT;
 
     loop {
-        if !stats.connected && Instant::now() >= connect_deadline {
+        if !stats.connected
+            && let Some(deadline) = connect_deadline
+            && Instant::now() >= deadline
+        {
             eprintln!(
                 "[bench-compio] connect timed out, state={:?}",
                 driver.protocol().state()
             );
+            break;
+        }
+        if Instant::now() >= process_backstop {
+            if !stats.connected {
+                eprintln!("[bench-compio] connect timed out (process backstop)");
+            }
             break;
         }
         if crate::shutdown::past(stream_deadline) {
@@ -637,7 +655,10 @@ async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> Co
         // for protocol maintenance once per MAX_WAIT.
         compio::time::sleep(crate::MAX_WAIT).await;
 
-        drain_receiver_packets(&mut driver, &received_receiver, &recycle_tx, start);
+        let fed = drain_receiver_packets(&mut driver, &received_receiver, &recycle_tx, start);
+        if fed > 0 && connect_deadline.is_none() {
+            connect_deadline = Some(Instant::now() + crate::CONNECT_TIMEOUT);
+        }
 
         let t = crate::now_ts(start);
         driver.fire_expired(t);

@@ -1117,6 +1117,11 @@ fn drive(
     };
     let payload = vec![0x42u8; crate::PAYLOAD_SIZE];
     let connect_deadline = Instant::now() + crate::CONNECT_TIMEOUT;
+    // Process backstop: per-driver `started_at` bounds each handshake
+    // individually; the spawn-relative global deadline only gates the
+    // nothing-connected-yet bootstrap so connect_cc staggering cannot let
+    // later drivers wait forever.
+    let process_backstop = Instant::now() + 3 * crate::CONNECT_TIMEOUT;
     let mut buf = [0u8; 2048];
     let mut touched = Vec::new();
     let mut stray_tokens: u64 = 0;
@@ -1131,6 +1136,9 @@ fn drive(
     loop {
         if !drivers.iter().any(|d| d.connected) && Instant::now() >= connect_deadline {
             eprintln!("[bench-mio] connect timed out");
+            break;
+        }
+        if Instant::now() >= process_backstop {
             break;
         }
         // A connection is settled once it has either finished streaming or
