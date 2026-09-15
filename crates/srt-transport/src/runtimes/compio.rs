@@ -556,6 +556,7 @@ pub struct ListenerSide {
     rx_buf: Vec<u8>,
     poll_fd: compio::runtime::fd::PollFd<std::net::UdpSocket>,
     pending_rx: Option<(SocketAddr, Vec<u8>)>,
+    stage_buf: Vec<u8>,
 }
 
 impl ListenerSide {
@@ -572,7 +573,7 @@ impl ListenerSide {
         prepared: crate::PreparedListener,
     ) -> Result<Self, crate::RuntimeBuildError> {
         let poll_fd = make_poll_fd(&sock)?;
-        Ok(Self {
+        let side = Self {
             sock: Rc::new(sock),
             table: prepared.peer_table(),
             telemetry: IngressTelemetry::new(),
@@ -581,7 +582,9 @@ impl ListenerSide {
             rx_buf: vec![0u8; DEFAULT_RX_SLOT_SIZE],
             poll_fd,
             pending_rx: None,
-        })
+            stage_buf: vec![0u8; DEFAULT_RX_SLOT_SIZE],
+        };
+        Ok(side)
     }
 
     fn poll_read_ready(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
@@ -606,6 +609,7 @@ pub struct OwnerCallerSide {
     rx_buf: Vec<u8>,
     poll_fd: compio::runtime::fd::PollFd<std::net::UdpSocket>,
     pending_rx: Option<(SocketAddr, Vec<u8>)>,
+    stage_buf: Vec<u8>,
 }
 
 impl OwnerCallerSide {
@@ -627,6 +631,7 @@ impl OwnerCallerSide {
             rx_buf: vec![0u8; DEFAULT_RX_SLOT_SIZE],
             poll_fd,
             pending_rx: None,
+            stage_buf: vec![0u8; DEFAULT_RX_SLOT_SIZE],
         }
     }
 
@@ -666,6 +671,7 @@ impl OwnerCallerSide {
             rx_buf: vec![0u8; DEFAULT_RX_SLOT_SIZE],
             poll_fd,
             pending_rx: None,
+            stage_buf: vec![0u8; DEFAULT_RX_SLOT_SIZE],
         }
     }
 }
@@ -1626,6 +1632,16 @@ impl Owner {
     /// 3. An incoming datagram on the caller socket (wakes immediately).
     /// 4. Timer expiry (`timeout` elapses).
     pub async fn wait_for_activity(&mut self, timeout: std::time::Duration) {
+        // Staged work wakes immediately: never sleep past work the next
+        // service() call can already consume.
+        if self
+            .listener
+            .as_ref()
+            .is_some_and(|l| l.pending_rx.is_some())
+            || self.caller.as_ref().is_some_and(|c| c.pending_rx.is_some())
+        {
+            return;
+        }
         let _ = compio::time::timeout(
             timeout,
             std::future::poll_fn(|cx| {
@@ -1703,9 +1719,14 @@ impl Owner {
             let Some(peer) = sockaddr_to_std(addr_storage, addr_len) else {
                 break;
             };
-            // Hard byte cap: if datagram exceeds remaining byte budget, stage in pending_rx!
+            // Hard byte cap: if datagram exceeds remaining byte budget, stage
+            // into the preallocated slot WITHOUT allocating: swap the filled
+            // stage buffer with the socket buffer and reuse both.
             if report.rx_bytes.saturating_add(len) > budget.max_rx_bytes {
-                listener.pending_rx = Some((peer, buf[..len].to_vec()));
+                listener.stage_buf.resize(len, 0);
+                listener.stage_buf[..len].copy_from_slice(&buf[..len]);
+                std::mem::swap(&mut listener.stage_buf, buf);
+                listener.pending_rx = Some((peer, std::mem::take(&mut listener.stage_buf)));
                 break;
             }
             report.rx_packets += 1;
@@ -1769,9 +1790,13 @@ impl Owner {
             let Some(peer) = sockaddr_to_std(addr_storage, addr_len) else {
                 break;
             };
-            // Hard byte cap: if datagram exceeds remaining byte budget, stage in pending_rx!
+            // Hard byte cap: stage into the preallocated slot WITHOUT
+            // allocating (buffer swap, same contract as listener side).
             if report.rx_bytes.saturating_add(len) > budget.max_rx_bytes {
-                caller.pending_rx = Some((peer, buf[..len].to_vec()));
+                caller.stage_buf.resize(len, 0);
+                caller.stage_buf[..len].copy_from_slice(&buf[..len]);
+                std::mem::swap(&mut caller.stage_buf, buf);
+                caller.pending_rx = Some((peer, std::mem::take(&mut caller.stage_buf)));
                 break;
             }
             report.rx_packets += 1;
