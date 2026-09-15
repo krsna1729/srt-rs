@@ -83,14 +83,13 @@ pub struct FanoutMetrics {
     pub cpu_us_per_dest: f64,
     pub peak_rss_kb: usize,
     pub allocs_per_dgram_measured: f64,
-    pub p50_pacing_lateness_us: u64,
-    pub p95_pacing_lateness_us: u64,
-    pub p99_pacing_lateness_us: u64,
-    pub p999_pacing_lateness_us: u64,
+    pub p50_service_visit_latency_us: u64,
+    pub p95_service_visit_latency_us: u64,
+    pub p99_service_visit_latency_us: u64,
+    pub p999_service_visit_latency_us: u64,
     pub tx_inflight_avg: f64,
     pub tx_pool_exhaustions: u64,
 }
-
 fn get_peak_rss_kb() -> usize {
     if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
         for line in status.lines() {
@@ -257,24 +256,27 @@ fn run_fanout_case(fanout: usize, duration_ms: u64) -> FanoutMetrics {
         let mut total_inflight_samples = 0usize;
         let mut inflight_accum = 0usize;
         let mut service_visit_latencies: Vec<u64> = Vec::with_capacity(10_000);
+        let duration = std::time::Duration::from_millis(duration_ms);
+        let mut next_source_tick = 0u64;
 
-        let rounds = (duration_ms * 1000 / PACKET_INTERVAL_US).max(500) as usize;
-        for _round in 0..rounds {
-            now = Timestamp::from_micros(now.as_micros() + PACKET_INTERVAL_US);
-
-            // Full fanout: every source tick offers one payload to EVERY
-            // *connected* destination through `send_shared`, so offered wire
-            // load is `760 msgs/s * connected` before control/retransmit
-            // traffic. Pre-handshake legs are not offered: send on them is a
-            for &target_id in &dest_ids {
-                total_offered += 1;
-                if owner
-                    .logical_caller_mut(&target_id)
-                    .expect("destination exists")
-                    .send_shared(payload.clone(), now)
-                    .is_ok()
-                {
-                    total_admitted += 1;
+        while t_start.elapsed() < duration {
+            let elapsed_us = t_start.elapsed().as_micros() as u64;
+            // Open-loop generator: if one or more 1316 µs source ticks are due,
+            // generate payloads at the fixed production cadence regardless of
+            // how long service() took!
+            while elapsed_us >= next_source_tick {
+                next_source_tick += PACKET_INTERVAL_US;
+                now = Timestamp::from_micros(now.as_micros() + PACKET_INTERVAL_US);
+                for &target_id in &dest_ids {
+                    total_offered += 1;
+                    if owner
+                        .logical_caller_mut(&target_id)
+                        .expect("destination exists")
+                        .send_shared(payload.clone(), now)
+                        .is_ok()
+                    {
+                        total_admitted += 1;
+                    }
                 }
             }
 
@@ -290,10 +292,40 @@ fn run_fanout_case(fanout: usize, duration_ms: u64) -> FanoutMetrics {
             total_completed_ok += report.tx_completed_ok;
             inflight_accum += report.tx_in_flight;
             total_inflight_samples += 1;
+
+            if !report.work_remaining {
+                owner
+                    .wait_for_activity(std::time::Duration::from_micros(200))
+                    .await;
+            }
+        }
+
+        // Drain-to-empty qualification gate:
+        // Drive owner until all submitted datagrams complete.
+        let drain_budget = OwnerServiceBudget {
+            max_completions: 4096,
+            max_rx_packets: 4096,
+            max_rx_bytes: 8 * 1024 * 1024,
+            max_actions: 4096,
+            max_tx_packets: 0,
+            max_tx_bytes: 0,
+        };
+        for _drain_round in 0..5000 {
+            if owner.tx_in_flight() == 0 {
+                break;
+            }
+            let report = owner.service(now, drain_budget).await;
+            total_completed_ok += report.tx_completed_ok;
             owner
                 .wait_for_activity(std::time::Duration::from_millis(1))
                 .await;
         }
+
+        let uncompleted_in_flight = owner.tx_in_flight();
+        assert_eq!(
+            uncompleted_in_flight, 0,
+            "drain-to-empty gate: all submitted datagrams must complete at end of window, {uncompleted_in_flight} remained"
+        );
 
         let wall_secs = t_start.elapsed().as_secs_f64();
         let cpu_secs = process_cpu_seconds() - cpu_start;
@@ -324,10 +356,10 @@ fn run_fanout_case(fanout: usize, duration_ms: u64) -> FanoutMetrics {
             cpu_us_per_dest: (cpu_secs * 1e6) / fanout as f64,
             peak_rss_kb: get_peak_rss_kb(),
             allocs_per_dgram_measured: total_allocs as f64 / submitted as f64,
-            p50_pacing_lateness_us: pick_q(50, 100),
-            p95_pacing_lateness_us: pick_q(95, 100),
-            p99_pacing_lateness_us: pick_q(99, 100),
-            p999_pacing_lateness_us: pick_q(999, 1000),
+            p50_service_visit_latency_us: pick_q(50, 100),
+            p95_service_visit_latency_us: pick_q(95, 100),
+            p99_service_visit_latency_us: pick_q(99, 100),
+            p999_service_visit_latency_us: pick_q(999, 1000),
             tx_inflight_avg: inflight_accum as f64 / total_inflight_samples.max(1) as f64,
             tx_pool_exhaustions: owner.tx_pool().exhaustion_count(),
         }
@@ -375,8 +407,8 @@ fn main() {
             r.submitted,
             r.cpu_ns_per_dgram,
             r.cpu_us_per_dest,
-            r.p50_pacing_lateness_us,
-            r.p99_pacing_lateness_us,
+            r.p50_service_visit_latency_us,
+            r.p99_service_visit_latency_us,
             r.allocs_per_dgram_measured,
             r.tx_pool_exhaustions
         );

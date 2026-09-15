@@ -186,6 +186,20 @@ impl Conn {
         }
     }
 }
+fn make_poll_fd(
+    sock: &compio::net::UdpSocket,
+) -> Result<compio::runtime::fd::PollFd<std::net::UdpSocket>, crate::RuntimeBuildError> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    // SAFETY: dup creates a new valid file descriptor with independent lifetime.
+    let new_fd = unsafe { libc::dup(sock.as_raw_fd()) };
+    if new_fd < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    // SAFETY: new_fd was successfully created by dup and ownership is transferred to std_sock.
+    let std_sock = unsafe { std::net::UdpSocket::from_raw_fd(new_fd) };
+    let _ = std_sock.set_nonblocking(true);
+    compio::runtime::fd::PollFd::new(std_sock).map_err(|e| e.into())
+}
 
 /// Resolve and bind a listener using Compio-native UDP sockets. Call from
 /// the runtime thread that will own them.
@@ -342,8 +356,6 @@ impl TxPool {
 /// Persistent receive buffer size (64 KiB covers max UDP payload without reallocation).
 pub const DEFAULT_RX_SLOT_SIZE: usize = 65536;
 
-type InFlightRx = Pin<Box<dyn Future<Output = (io::Result<(usize, SocketAddr)>, Vec<u8>)>>>;
-
 /// Listener side of a shared Compio owner.
 pub struct ListenerSide {
     pub sock: Rc<compio::net::UdpSocket>,
@@ -352,9 +364,8 @@ pub struct ListenerSide {
     pub options: crate::AdmissionOptions,
     pub transport: crate::ResolvedTransportConfig,
     rx_buf: Vec<u8>,
-    wait_rx_buf: Option<Vec<u8>>,
-    wait_rx_fut: Option<InFlightRx>,
-    pending_rx: Option<(SocketAddr, usize, Vec<u8>)>,
+    poll_fd: compio::runtime::fd::PollFd<std::net::UdpSocket>,
+    pending_rx: Option<(SocketAddr, Vec<u8>)>,
 }
 
 impl ListenerSide {
@@ -370,6 +381,7 @@ impl ListenerSide {
         sock: compio::net::UdpSocket,
         prepared: crate::PreparedListener,
     ) -> Result<Self, crate::RuntimeBuildError> {
+        let poll_fd = make_poll_fd(&sock)?;
         Ok(Self {
             sock: Rc::new(sock),
             table: prepared.peer_table(),
@@ -377,44 +389,13 @@ impl ListenerSide {
             options: prepared.admission_options(),
             transport: prepared.transport,
             rx_buf: vec![0u8; DEFAULT_RX_SLOT_SIZE],
-            wait_rx_buf: Some(vec![0u8; DEFAULT_RX_SLOT_SIZE]),
-            wait_rx_fut: None,
+            poll_fd,
             pending_rx: None,
         })
     }
 
-    fn ensure_wait_rx_in_flight(&mut self) {
-        if self.wait_rx_fut.is_none() && self.pending_rx.is_none() {
-            let buf = self
-                .wait_rx_buf
-                .take()
-                .unwrap_or_else(|| vec![0u8; DEFAULT_RX_SLOT_SIZE]);
-            let sock = self.sock.clone();
-            self.wait_rx_fut = Some(Box::pin(async move {
-                let BufResult(res, buf) = sock.recv_from(buf).await;
-                (res, buf)
-            }));
-        }
-    }
-
-    fn poll_wait_rx(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
-        let Some(fut) = self.wait_rx_fut.as_mut() else {
-            return std::task::Poll::Pending;
-        };
-        let std::task::Poll::Ready((res, buf)) = fut.as_mut().poll(cx) else {
-            return std::task::Poll::Pending;
-        };
-        if let Ok((len, peer)) = res {
-            if len > 0 {
-                self.pending_rx = Some((peer, len, buf));
-            } else {
-                self.wait_rx_buf = Some(buf);
-            }
-        } else {
-            self.wait_rx_buf = Some(buf);
-        }
-        self.wait_rx_fut = None;
-        std::task::Poll::Ready(())
+    fn poll_read_ready(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+        self.poll_fd.poll_read_ready(cx)
     }
 }
 
@@ -424,6 +405,7 @@ impl ListenerSide {
 /// [`OwnerCallerSide`], which carries the same `CallerPool` admission,
 /// attempt-deadline, and socket-memory policy as the Mio/Tokio owners.
 pub type CallerSide = OwnerCallerSide;
+
 /// Pool-backed caller side of a shared Compio owner.
 pub struct OwnerCallerSide {
     pub sock: Rc<compio::net::UdpSocket>,
@@ -432,9 +414,8 @@ pub struct OwnerCallerSide {
     pub local_bind: Option<std::net::SocketAddr>,
     pub connect_config: crate::ConnectConfig,
     rx_buf: Vec<u8>,
-    wait_rx_buf: Option<Vec<u8>>,
-    wait_rx_fut: Option<InFlightRx>,
-    pending_rx: Option<(SocketAddr, usize, Vec<u8>)>,
+    poll_fd: compio::runtime::fd::PollFd<std::net::UdpSocket>,
+    pending_rx: Option<(SocketAddr, Vec<u8>)>,
 }
 
 impl OwnerCallerSide {
@@ -446,6 +427,7 @@ impl OwnerCallerSide {
         local_bind: Option<std::net::SocketAddr>,
         connect_config: crate::ConnectConfig,
     ) -> Self {
+        let poll_fd = make_poll_fd(&sock).expect("caller poll_fd initializes");
         Self {
             sock: Rc::new(sock),
             pool: crate::CallerPool::new(max_in_flight, attempt_deadline),
@@ -453,43 +435,13 @@ impl OwnerCallerSide {
             local_bind,
             connect_config,
             rx_buf: vec![0u8; DEFAULT_RX_SLOT_SIZE],
-            wait_rx_buf: Some(vec![0u8; DEFAULT_RX_SLOT_SIZE]),
-            wait_rx_fut: None,
+            poll_fd,
             pending_rx: None,
         }
     }
 
-    fn ensure_wait_rx_in_flight(&mut self) {
-        if self.wait_rx_fut.is_none() && self.pending_rx.is_none() {
-            let buf = self
-                .wait_rx_buf
-                .take()
-                .unwrap_or_else(|| vec![0u8; DEFAULT_RX_SLOT_SIZE]);
-            let sock = self.sock.clone();
-            self.wait_rx_fut = Some(Box::pin(async move {
-                let BufResult(res, buf) = sock.recv_from(buf).await;
-                (res, buf)
-            }));
-        }
-    }
-    fn poll_wait_rx(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
-        let Some(fut) = self.wait_rx_fut.as_mut() else {
-            return std::task::Poll::Pending;
-        };
-        let std::task::Poll::Ready((res, buf)) = fut.as_mut().poll(cx) else {
-            return std::task::Poll::Pending;
-        };
-        if let Ok((len, peer)) = res {
-            if len > 0 {
-                self.pending_rx = Some((peer, len, buf));
-            } else {
-                self.wait_rx_buf = Some(buf);
-            }
-        } else {
-            self.wait_rx_buf = Some(buf);
-        }
-        self.wait_rx_fut = None;
-        std::task::Poll::Ready(())
+    fn poll_read_ready(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+        self.poll_fd.poll_read_ready(cx)
     }
 
     /// Immutable access to the pooled caller table.
@@ -505,6 +457,7 @@ impl OwnerCallerSide {
     /// as shared-compatible instead of rejecting the first extra caller.
     #[must_use]
     pub fn new_single(sock: compio::net::UdpSocket) -> Self {
+        let poll_fd = make_poll_fd(&sock).expect("caller poll_fd initializes");
         let transport = crate::TransportConfig {
             ownership: crate::SocketOwnership::Shared,
             ..crate::TransportConfig::default()
@@ -521,8 +474,7 @@ impl OwnerCallerSide {
             local_bind: None,
             connect_config: crate::ConnectConfig::default(),
             rx_buf: vec![0u8; DEFAULT_RX_SLOT_SIZE],
-            wait_rx_buf: Some(vec![0u8; DEFAULT_RX_SLOT_SIZE]),
-            wait_rx_fut: None,
+            poll_fd,
             pending_rx: None,
         }
     }
@@ -1048,6 +1000,9 @@ impl Owner {
         budget: OwnerServiceBudget,
     ) -> OwnerServiceReport {
         let mut report = OwnerServiceReport::default();
+        let prev_ok = self.completions.completed_ok;
+        let prev_short = self.completions.short_sends;
+        let prev_failed = self.completions.failed_sends;
 
         // 1. Reap only already-ready completions, never waiting.
         while report.completions_reaped < budget.max_completions && !self.tx_in_flight.is_empty() {
@@ -1072,9 +1027,9 @@ impl Owner {
         report.tx_in_flight = self.tx_in_flight.len();
         report.tx_pool_free = self.tx_pool.free_count();
         report.next_deadline_us = Some(self.time_until_next_deadline(now, 100_000));
-        report.tx_completed_ok = self.completions.completed_ok;
-        report.tx_short_sends = self.completions.short_sends;
-        report.tx_failed_sends = self.completions.failed_sends;
+        report.tx_completed_ok = self.completions.completed_ok.saturating_sub(prev_ok);
+        report.tx_short_sends = self.completions.short_sends.saturating_sub(prev_short);
+        report.tx_failed_sends = self.completions.failed_sends.saturating_sub(prev_failed);
 
         let has_pending = self.has_pending_work(now);
         // Runnable work remaining: timers due, application data queued
@@ -1086,7 +1041,9 @@ impl Owner {
         report.work_remaining = has_pending;
         report.budget_exhausted = report.completions_reaped >= budget.max_completions
             || report.rx_packets >= budget.max_rx_packets
+            || report.rx_bytes >= budget.max_rx_bytes
             || report.tx_packets_submitted >= budget.max_tx_packets
+            || report.tx_bytes_submitted >= budget.max_tx_bytes
             || report.actions >= budget.max_actions;
 
         report
@@ -1103,26 +1060,19 @@ impl Owner {
     /// 3. An incoming datagram on the caller socket (wakes immediately).
     /// 4. Timer expiry (`timeout` elapses).
     pub async fn wait_for_activity(&mut self, timeout: std::time::Duration) {
-        if let Some(listener) = self.listener.as_mut() {
-            listener.ensure_wait_rx_in_flight();
-        }
-        if let Some(caller) = self.caller.as_mut() {
-            caller.ensure_wait_rx_in_flight();
-        }
-
         let _ = compio::time::timeout(
             timeout,
             std::future::poll_fn(|cx| {
                 if self.poll_tx_activity(cx).is_ready() {
                     return std::task::Poll::Ready(());
                 }
-                if let Some(listener) = self.listener.as_mut()
-                    && listener.poll_wait_rx(cx).is_ready()
+                if let Some(listener) = self.listener.as_ref()
+                    && listener.poll_read_ready(cx).is_ready()
                 {
                     return std::task::Poll::Ready(());
                 }
-                if let Some(caller) = self.caller.as_mut()
-                    && caller.poll_wait_rx(cx).is_ready()
+                if let Some(caller) = self.caller.as_ref()
+                    && caller.poll_read_ready(cx).is_ready()
                 {
                     return std::task::Poll::Ready(());
                 }
@@ -1138,24 +1088,29 @@ impl Owner {
         budget: &OwnerServiceBudget,
         report: &mut OwnerServiceReport,
     ) {
-        // 1. Consume any datagram completed while wait_for_activity was parked
-        if let Some((peer, len, buf)) = listener.pending_rx.take() {
-            report.rx_packets += 1;
-            report.rx_bytes += len;
-            let _ = listener.table.admit(
-                peer,
-                &buf[..len],
-                now,
-                &listener.options,
-                0,
-                1,
-                &listener.telemetry,
-            );
-            listener.wait_rx_buf = Some(buf);
+        // 1. Consume any staged packet from pending_rx ONLY if budget permits
+        if let Some((_peer, bytes)) = listener.pending_rx.as_ref() {
+            let exceeds_packets = report.rx_packets >= budget.max_rx_packets;
+            let exceeds_bytes = report.rx_bytes.saturating_add(bytes.len()) > budget.max_rx_bytes;
+            if !exceeds_packets && !exceeds_bytes {
+                let (peer, bytes) = listener.pending_rx.take().unwrap();
+                report.rx_packets += 1;
+                report.rx_bytes += bytes.len();
+                let _ = listener.table.admit(
+                    peer,
+                    &bytes,
+                    now,
+                    &listener.options,
+                    0,
+                    1,
+                    &listener.telemetry,
+                );
+            } else {
+                return;
+            }
         }
 
-        // 2. Drain all currently-available datagrams into the persistent rx_buf.
-        // Zero heap allocations: rx_buf is pre-allocated and mutably borrowed.
+        // 2. Drain from socket up to budget. Zero heap allocations: rx_buf is pre-allocated.
         let buf = &mut listener.rx_buf;
         while report.rx_packets < budget.max_rx_packets && report.rx_bytes < budget.max_rx_bytes {
             use std::os::fd::AsRawFd;
@@ -1182,6 +1137,11 @@ impl Owner {
             let Some(peer) = sockaddr_to_std(addr_storage, addr_len) else {
                 break;
             };
+            // Hard byte cap: if datagram exceeds remaining byte budget, stage in pending_rx!
+            if report.rx_bytes.saturating_add(len) > budget.max_rx_bytes {
+                listener.pending_rx = Some((peer, buf[..len].to_vec()));
+                break;
+            }
             report.rx_packets += 1;
             report.rx_bytes += len;
             let _ = listener.table.admit(
@@ -1202,16 +1162,21 @@ impl Owner {
         budget: &OwnerServiceBudget,
         report: &mut OwnerServiceReport,
     ) {
-        // 1. Consume any datagram completed while wait_for_activity was parked
-        if let Some((peer, len, buf)) = caller.pending_rx.take() {
-            report.rx_packets += 1;
-            report.rx_bytes += len;
-            let _ = caller.pool.table_mut().feed(peer, &buf[..len], now);
-            caller.wait_rx_buf = Some(buf);
+        // 1. Consume any staged packet from pending_rx ONLY if budget permits
+        if let Some((_peer, bytes)) = caller.pending_rx.as_ref() {
+            let exceeds_packets = report.rx_packets >= budget.max_rx_packets;
+            let exceeds_bytes = report.rx_bytes.saturating_add(bytes.len()) > budget.max_rx_bytes;
+            if !exceeds_packets && !exceeds_bytes {
+                let (peer, bytes) = caller.pending_rx.take().unwrap();
+                report.rx_packets += 1;
+                report.rx_bytes += bytes.len();
+                let _ = caller.pool.table_mut().feed(peer, &bytes, now);
+            } else {
+                return;
+            }
         }
 
-        // 2. Drain all currently-available datagrams into the persistent rx_buf.
-        // Zero heap allocations: rx_buf is pre-allocated and mutably borrowed.
+        // 2. Drain from socket up to budget. Zero heap allocations: rx_buf is pre-allocated.
         let buf = &mut caller.rx_buf;
         while report.rx_packets < budget.max_rx_packets && report.rx_bytes < budget.max_rx_bytes {
             use std::os::fd::AsRawFd;
@@ -1238,6 +1203,11 @@ impl Owner {
             let Some(peer) = sockaddr_to_std(addr_storage, addr_len) else {
                 break;
             };
+            // Hard byte cap: if datagram exceeds remaining byte budget, stage in pending_rx!
+            if report.rx_bytes.saturating_add(len) > budget.max_rx_bytes {
+                caller.pending_rx = Some((peer, buf[..len].to_vec()));
+                break;
+            }
             report.rx_packets += 1;
             report.rx_bytes += len;
             let _ = caller.pool.table_mut().feed(peer, &buf[..len], now);
@@ -1377,15 +1347,16 @@ impl Owner {
         }
     }
 
-    fn has_pending_work(&self, now: Timestamp) -> bool {
+    #[must_use]
+    pub fn has_pending_work(&self, now: Timestamp) -> bool {
         let l_pending = self
             .listener
             .as_ref()
-            .is_some_and(|l| l.table.has_pending_output(now));
+            .is_some_and(|l| l.pending_rx.is_some() || l.table.has_pending_output(now));
         let c_pending = self
             .caller
             .as_ref()
-            .is_some_and(|c| c.pool.table().has_pending_output(now));
+            .is_some_and(|c| c.pending_rx.is_some() || c.pool.table().has_pending_output(now));
         l_pending || c_pending
     }
 }
@@ -2072,6 +2043,78 @@ mod tests {
             );
 
             bg_handle.join().unwrap();
+        });
+    }
+    #[test]
+    fn staged_pending_rx_obeys_rx_budget_and_signals_continuation() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            let l_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind listener std");
+            let l_addr = l_std.local_addr().expect("listener addr");
+            let l_sock = compio::net::UdpSocket::from_std(l_std).expect("compio adopt listener");
+
+            let c_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind caller std");
+            let c_sock = compio::net::UdpSocket::from_std(c_std).expect("compio adopt caller");
+
+            let l_cfg = crate::ListenerConfig::builder(l_addr)
+                .build()
+                .expect("listener config");
+            let listener_side = ListenerSide::new(l_sock, &l_cfg).expect("listener side");
+            let caller_side = CallerSide::new_single(c_sock);
+
+            let mut owner = Owner::new(16)
+                .with_listener(listener_side)
+                .with_caller(caller_side);
+
+            // Stage a packet on listener side and caller side
+            let dummy_peer: std::net::SocketAddr = "127.0.0.1:39001".parse().unwrap();
+            owner.listener.as_mut().unwrap().pending_rx =
+                Some((dummy_peer, b"dummy-packet-1".to_vec()));
+            owner.caller.as_mut().unwrap().pending_rx =
+                Some((dummy_peer, b"dummy-packet-2".to_vec()));
+
+            // has_pending_work must report true because staged packets exist!
+            assert!(
+                owner.has_pending_work(Timestamp::from_micros(100)),
+                "staged pending_rx must signal work_remaining to the scheduler"
+            );
+
+            // 1. service with max_rx_packets = 0 must process ZERO packets and leave both pending!
+            let zero_budget = OwnerServiceBudget {
+                max_rx_packets: 0,
+                ..Default::default()
+            };
+            let report = owner
+                .service(Timestamp::from_micros(100), zero_budget)
+                .await;
+            assert_eq!(
+                report.rx_packets, 0,
+                "max_rx_packets=0 must perform zero RX work"
+            );
+            assert!(owner.listener.as_ref().unwrap().pending_rx.is_some());
+            assert!(owner.caller.as_ref().unwrap().pending_rx.is_some());
+            assert!(report.work_remaining);
+
+            // 2. service with max_rx_packets = 1 must process EXACTLY one packet
+            let one_budget = OwnerServiceBudget {
+                max_rx_packets: 1,
+                ..Default::default()
+            };
+            let report = owner.service(Timestamp::from_micros(200), one_budget).await;
+            assert_eq!(
+                report.rx_packets, 1,
+                "max_rx_packets=1 must process exactly one packet"
+            );
+            assert!(report.work_remaining, "second packet remains pending");
+
+            // 3. next service with max_rx_packets = 1 processes the second packet
+            let report = owner.service(Timestamp::from_micros(300), one_budget).await;
+            assert_eq!(
+                report.rx_packets, 1,
+                "next service must process the second packet"
+            );
+            assert!(owner.listener.as_ref().unwrap().pending_rx.is_none());
+            assert!(owner.caller.as_ref().unwrap().pending_rx.is_none());
         });
     }
 

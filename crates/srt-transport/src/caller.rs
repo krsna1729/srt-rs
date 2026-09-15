@@ -1543,8 +1543,7 @@ fn drain_caller_legacy_output<S: DatagramSink + ?Sized>(
         ConnectionOutput::SendPacket(packet) => {
             let wire_len = packet.len();
             let exceeds_packets = sink.report.packets >= sink.budget.max_packets;
-            let exceeds_bytes = sink.budget.max_bytes > 0
-                && sink.report.bytes.saturating_add(wire_len) > sink.budget.max_bytes;
+            let exceeds_bytes = sink.report.bytes.saturating_add(wire_len) > sink.budget.max_bytes;
             if exceeds_packets || exceeds_bytes {
                 return Some((DrainOne::Blocked, false));
             }
@@ -1587,8 +1586,7 @@ fn drain_caller_direct_meta<S: DatagramSink + ?Sized>(
     match meta {
         OutputMeta::Datagram { wire_len } => {
             let exceeds_packets = sink.report.packets >= sink.budget.max_packets;
-            let exceeds_bytes = sink.budget.max_bytes > 0
-                && sink.report.bytes.saturating_add(wire_len) > sink.budget.max_bytes;
+            let exceeds_bytes = sink.report.bytes.saturating_add(wire_len) > sink.budget.max_bytes;
             if exceeds_packets || exceeds_bytes {
                 return (DrainOne::Blocked, false);
             }
@@ -2503,6 +2501,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cognitive_complexity)]
     fn bonded_group_drain_never_exceeds_declared_action_packet_or_byte_budget() {
         let mut callers = CallerTable::default();
         let group_id = 999 | srt_proto::handshake::SRTGROUP_MASK;
@@ -2589,14 +2588,28 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(report.status, OutputDrainStatus::BudgetExhausted);
 
-        // 3. Drain with max_bytes = 20 (smaller than the wire size of 1 data packet = 35B)
+        // 3. Drain with max_bytes = 0 (zero means zero work, never unlimited)
         let report =
-            callers.poll_outbound_bounded(now, OutputDrainBudget::new(10, 10, 20), &mut out);
+            callers.poll_outbound_bounded(now, OutputDrainBudget::new(10, 10, 0), &mut out);
         assert_eq!(report.bytes, 0);
         assert_eq!(out.len(), 0);
         assert_eq!(report.status, OutputDrainStatus::BudgetExhausted);
 
-        // 4. Drain with max_bytes = 50: fits exactly 1 packet (35B), second (35+35=70) is blocked
+        // 4. Drain with max_bytes = wire_len - 1 = 34B (smaller than 1 packet of 35B)
+        let report =
+            callers.poll_outbound_bounded(now, OutputDrainBudget::new(10, 10, 34), &mut out);
+        assert_eq!(report.bytes, 0);
+        assert_eq!(out.len(), 0);
+        assert_eq!(report.status, OutputDrainStatus::BudgetExhausted);
+
+        // 5. Drain with max_bytes = wire_len = 35B (fits exactly 1 packet)
+        let report =
+            callers.poll_outbound_bounded(now, OutputDrainBudget::new(10, 10, 35), &mut out);
+        assert_eq!(report.bytes, 35);
+        assert_eq!(out.len(), 1);
+        assert_eq!(report.status, OutputDrainStatus::BudgetExhausted);
+
+        // 6. Drain with max_bytes = 50: fits 1 packet (35B), second (35+35=70) is blocked
         let report =
             callers.poll_outbound_bounded(now, OutputDrainBudget::new(10, 10, 50), &mut out);
         assert_eq!(report.bytes, 35);
@@ -2604,6 +2617,87 @@ mod tests {
         assert_eq!(report.status, OutputDrainStatus::BudgetExhausted);
     }
 
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn direct_caller_drain_never_exceeds_declared_action_packet_or_byte_budget() {
+        let mut callers = CallerTable::default();
+        let peer: std::net::SocketAddr = "127.0.0.1:31010".parse().unwrap();
+        let id = callers
+            .add_direct(CallerLeg::new(
+                peer,
+                caller_connection(ConnectionOptions {
+                    socket_id: 301,
+                    initial_seq: Some(1000),
+                    ..ConnectionOptions::default()
+                }),
+            ))
+            .expect("direct caller admitted");
+
+        let mut listeners = PeerTable::new();
+        let options = AdmissionOptions::basic(999, 0, true);
+        let telemetry = IngressTelemetry::new();
+        for round in 0..8 {
+            pump_caller_table(
+                &mut callers,
+                &mut listeners,
+                &options,
+                &telemetry,
+                Timestamp::from_micros(round * 10),
+            );
+        }
+
+        // Send 5 messages (each produces 1 packet of 35 bytes: "direct payload {i}")
+        for i in 0..5 {
+            let _ = callers.logical_caller_mut(&id).unwrap().send(
+                format!("direct payload {i}").as_bytes(),
+                Timestamp::from_micros(100),
+            );
+        }
+
+        let now = Timestamp::from_micros(100);
+        let mut out = Vec::new();
+
+        // 1. max_bytes = 0: drains 0 bytes, 0 packets, BudgetExhausted
+        let report =
+            callers.poll_outbound_bounded(now, OutputDrainBudget::new(10, 10, 0), &mut out);
+        assert_eq!(report.bytes, 0);
+        assert_eq!(out.len(), 0);
+        assert_eq!(report.status, OutputDrainStatus::BudgetExhausted);
+
+        // 2. max_bytes = wire_len - 1 = 30B (smaller than 31B payload)
+        // Let's check actual wire_len of direct packet
+        let report_sample =
+            callers.poll_outbound_bounded(now, OutputDrainBudget::new(1, 1, 100_000), &mut out);
+        let wire_len = report_sample.bytes;
+        assert!(wire_len > 0);
+
+        // Drain with max_bytes = wire_len - 1
+        let report = callers.poll_outbound_bounded(
+            now,
+            OutputDrainBudget::new(10, 10, wire_len - 1),
+            &mut out,
+        );
+        assert_eq!(report.bytes, 0);
+        assert_eq!(out.len(), 0);
+        assert_eq!(report.status, OutputDrainStatus::BudgetExhausted);
+
+        // Drain with max_bytes = wire_len
+        let report =
+            callers.poll_outbound_bounded(now, OutputDrainBudget::new(10, 10, wire_len), &mut out);
+        assert_eq!(report.bytes, wire_len);
+        assert_eq!(out.len(), 1);
+        assert_eq!(report.status, OutputDrainStatus::BudgetExhausted);
+
+        // Drain with max_bytes = wire_len + wire_len / 2 (second packet cannot fit)
+        let report = callers.poll_outbound_bounded(
+            now,
+            OutputDrainBudget::new(10, 10, wire_len + wire_len / 2),
+            &mut out,
+        );
+        assert_eq!(report.bytes, wire_len);
+        assert_eq!(out.len(), 1);
+        assert_eq!(report.status, OutputDrainStatus::BudgetExhausted);
+    }
     /// A05: `CallerTable::poll_events` must surface a direct caller's
     /// `Connected`, `DataReceived`, and `Disconnected` transitions -- the
     /// gap this crate had left open since A03 first noted "CallerTable has

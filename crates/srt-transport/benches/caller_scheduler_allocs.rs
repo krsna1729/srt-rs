@@ -207,22 +207,36 @@ fn run_steady_state_measurement(
 /// and bounded drain into a no-allocation sink. No payload is admitted, so the
 /// sender, protocol packetization, and wire encoding paths contribute zero
 /// allocations by construction; whatever remains is the scheduler structure.
-struct DiscardSink;
+struct ScratchSink {
+    scratch: [u8; 2048],
+    wire_len: usize,
+}
 
-impl srt_transport::DatagramSink for DiscardSink {
+impl ScratchSink {
+    fn new() -> Self {
+        Self {
+            scratch: [0u8; 2048],
+            wire_len: 0,
+        }
+    }
+}
+
+impl srt_transport::DatagramSink for ScratchSink {
     fn push_datagram<F>(
         &mut self,
         _peer: SocketAddr,
         wire_len: usize,
-        _fill: F,
+        fill: F,
     ) -> Result<srt_transport::PushResult, srt_proto::Error>
     where
         F: FnOnce(&mut [u8]) -> Result<usize, srt_proto::Error>,
     {
-        // Never invoke `fill`: the datagram stays queued and no encoding
-        // runs, so this measures pure scheduler/index traversal cost.
-        // Report the wire length as the accounted length for budget motion.
-        Ok(srt_transport::PushResult::Pushed { len: wire_len })
+        if wire_len > self.scratch.len() {
+            return Ok(srt_transport::PushResult::Exhausted);
+        }
+        let len = fill(&mut self.scratch[..wire_len])?;
+        self.wire_len = len;
+        Ok(srt_transport::PushResult::Pushed { len })
     }
 }
 
@@ -241,7 +255,7 @@ fn run_scheduler_isolated_measurement(
         table.bench_arm_timer(target_id, srt_proto::TimerId::Ack, 100, now);
         let _ = table.time_until_next_deadline(now, 100_000);
         table.bench_make_ready(target_id);
-        let mut sink = DiscardSink;
+        let mut sink = ScratchSink::new();
         let _ = table.poll_outbound_bounded_to(
             now,
             OutputDrainBudget::new(64, 32, 256 * 1024),
@@ -259,7 +273,7 @@ fn run_scheduler_isolated_measurement(
         table.bench_arm_timer(target_id, srt_proto::TimerId::Ack, 100, now);
         let _ = table.time_until_next_deadline(now, 100_000);
         table.bench_make_ready(target_id);
-        let mut sink = DiscardSink;
+        let mut sink = ScratchSink::new();
         let _ = table.poll_outbound_bounded_to(
             now,
             OutputDrainBudget::new(64, 32, 256 * 1024),

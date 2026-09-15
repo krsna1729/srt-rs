@@ -2442,8 +2442,7 @@ impl PeerTable {
             ConnectionOutput::SendPacket(bytes) => {
                 let wire_len = bytes.len();
                 let exceeds_packets = report.packets >= budget.max_packets;
-                let exceeds_bytes =
-                    report.packets > 0 && report.bytes.saturating_add(wire_len) > budget.max_bytes;
+                let exceeds_bytes = report.bytes.saturating_add(wire_len) > budget.max_bytes;
                 if exceeds_packets || exceeds_bytes {
                     return Some(true);
                 }
@@ -2487,8 +2486,7 @@ impl PeerTable {
         match meta {
             OutputMeta::Datagram { wire_len } => {
                 let exceeds_packets = report.packets >= budget.max_packets;
-                let exceeds_bytes =
-                    report.packets > 0 && report.bytes.saturating_add(wire_len) > budget.max_bytes;
+                let exceeds_bytes = report.bytes.saturating_add(wire_len) > budget.max_bytes;
                 if exceeds_packets || exceeds_bytes {
                     return true;
                 }
@@ -2664,8 +2662,7 @@ impl PeerTable {
             ConnectionOutput::SendPacket(bytes) => {
                 let wire_len = bytes.len();
                 let exceeds_packets = report.packets >= budget.max_packets;
-                let exceeds_bytes =
-                    report.packets > 0 && report.bytes.saturating_add(wire_len) > budget.max_bytes;
+                let exceeds_bytes = report.bytes.saturating_add(wire_len) > budget.max_bytes;
                 if exceeds_packets || exceeds_bytes {
                     return Some(true);
                 }
@@ -2709,8 +2706,7 @@ impl PeerTable {
         match meta {
             OutputMeta::Datagram { wire_len } => {
                 let exceeds_packets = report.packets >= budget.max_packets;
-                let exceeds_bytes =
-                    report.packets > 0 && report.bytes.saturating_add(wire_len) > budget.max_bytes;
+                let exceeds_bytes = report.bytes.saturating_add(wire_len) > budget.max_bytes;
                 if exceeds_packets || exceeds_bytes {
                     return true;
                 }
@@ -4611,5 +4607,88 @@ mod tests {
             "a protocol-Connected, quiet-too-long peer must be retired regardless of \
              whether its Connected event has been drained yet"
         );
+    }
+
+    #[test]
+    fn direct_peer_drain_never_exceeds_declared_action_packet_or_byte_budget() {
+        let peer = "127.0.0.1:11050".parse().expect("address");
+        let options = AdmissionOptions::basic(0xAAAA, 20, false);
+        let telemetry = IngressTelemetry::new();
+        let mut table = PeerTable::new();
+
+        let (mut caller, conclusion) =
+            admit_up_to_conclusion(&mut table, peer, 0xBBBB, &options, &telemetry);
+        admit_conclusion(
+            &mut table,
+            peer,
+            &mut caller,
+            &conclusion,
+            &options,
+            &telemetry,
+        );
+
+        let mut events = Vec::new();
+        table.poll_events(&mut events);
+        let peer_id = events
+            .iter()
+            .find_map(|e| match e.event {
+                srt_proto::ConnectionEvent::Connected => Some(e.logical_peer),
+                _ => None,
+            })
+            .expect("peer reached Connected");
+
+        // Send 5 messages from the listener peer
+        for i in 0..5 {
+            table
+                .logical_peer_mut(&peer_id)
+                .expect("logical peer exists")
+                .send(
+                    format!("peer payload {i}").as_bytes(),
+                    Timestamp::from_micros(100),
+                )
+                .expect("send succeeds");
+        }
+
+        let now = Timestamp::from_micros(100);
+        let mut out = Vec::new();
+
+        // 1. Drain with max_bytes = 0 (zero means zero work, never unlimited)
+        let report = table.poll_outbound_bounded(now, OutputDrainBudget::new(10, 10, 0), &mut out);
+        assert_eq!(report.bytes, 0);
+        assert_eq!(out.len(), 0);
+        assert_eq!(report.status, OutputDrainStatus::BudgetExhausted);
+
+        // Sample 1 packet to measure exact wire length
+        let sample =
+            table.poll_outbound_bounded(now, OutputDrainBudget::new(1, 1, 100_000), &mut out);
+        let wire_len = sample.bytes;
+        assert!(wire_len > 0);
+
+        // 2. Drain with max_bytes = wire_len - 1
+        let report = table.poll_outbound_bounded(
+            now,
+            OutputDrainBudget::new(10, 10, wire_len - 1),
+            &mut out,
+        );
+        assert_eq!(report.bytes, 0);
+        assert_eq!(out.len(), 0);
+        assert_eq!(report.status, OutputDrainStatus::BudgetExhausted);
+
+        // 3. Drain with max_bytes = wire_len (fits exactly 1 packet)
+        let report =
+            table.poll_outbound_bounded(now, OutputDrainBudget::new(10, 10, wire_len), &mut out);
+        assert_eq!(report.bytes, wire_len);
+        assert_eq!(out.len(), 1);
+        assert_eq!(report.status, OutputDrainStatus::BudgetExhausted);
+
+        // 4. Drain with max_bytes = wire_len + wire_len / 2 (second packet cannot fit)
+        let report = table.poll_outbound_bounded(
+            now,
+            OutputDrainBudget::new(10, 10, wire_len + wire_len / 2),
+            &mut out,
+        );
+        assert_eq!(report.bytes, wire_len);
+        assert_eq!(out.len(), 1);
+        assert_eq!(report.status, OutputDrainStatus::BudgetExhausted);
     }
 }
