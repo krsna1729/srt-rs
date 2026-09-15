@@ -172,11 +172,6 @@ pub mod advanced {
         };
     }
 
-    /// Compatibility configuration for legacy low-level integrations.
-    pub mod compat {
-        pub use super::super::SrtStackConfig;
-    }
-
     /// Mutable telemetry owners used by an adapter or worker. Exporters
     /// should retain only the snapshot types from the crate root.
     pub mod telemetry {

@@ -594,13 +594,6 @@ impl ListenerSide {
     }
 }
 
-/// Caller side of a shared Compio owner.
-///
-/// Kept for source compatibility with earlier drafts of this module; prefer
-/// [`OwnerCallerSide`], which carries the same `CallerPool` admission,
-/// attempt-deadline, and socket-memory policy as the Mio/Tokio owners.
-pub type CallerSide = OwnerCallerSide;
-
 /// Pool-backed caller side of a shared Compio owner.
 pub struct OwnerCallerSide {
     pub sock: Rc<compio::net::UdpSocket>,
@@ -647,11 +640,13 @@ impl OwnerCallerSide {
         self.pool.table()
     }
 
-    /// Convenience single-socket side for tests and direct table use.
+    /// Test-only single-socket side for direct table use.
     ///
     /// Uses the same `Shared` ownership transport policy as
     /// [`Owner::connect`]-created sides so later `connect()` calls validate
     /// as shared-compatible instead of rejecting the first extra caller.
+    /// Production code must go through [`Owner::connect`].
+    #[cfg(any(test, feature = "bench-internals"))]
     #[must_use]
     pub fn new_single(sock: compio::net::UdpSocket) -> Self {
         let poll_fd = make_poll_fd(&sock).expect("caller poll_fd initializes");
@@ -748,7 +743,7 @@ struct TxLane {
     handle: compio::runtime::JoinHandle<()>,
 }
 
-pub struct TxEngine {
+pub(crate) struct TxEngine {
     lanes: Vec<TxLane>,
     idle_lanes: Vec<usize>,
     completed_lanes: Rc<RefCell<VecDeque<usize>>>,
@@ -803,7 +798,7 @@ async fn tx_lane_worker(
 
 impl TxEngine {
     #[must_use]
-    pub fn new(capacity: usize) -> Self {
+    pub(crate) fn new(capacity: usize) -> Self {
         let capacity = capacity.max(1);
         let mut engine = Self {
             lanes: Vec::with_capacity(capacity),
@@ -819,7 +814,7 @@ impl TxEngine {
         engine
     }
 
-    pub fn ensure_started(&mut self) {
+    pub(crate) fn ensure_started(&mut self) {
         if !self.lanes.is_empty() || self.shutdown {
             return;
         }
@@ -844,26 +839,26 @@ impl TxEngine {
     }
 
     #[must_use]
-    pub fn in_flight(&self) -> usize {
+    pub(crate) fn in_flight(&self) -> usize {
         self.in_flight_count
     }
 
     #[must_use]
-    pub fn capacity(&self) -> usize {
+    pub(crate) fn capacity(&self) -> usize {
         self.capacity
     }
 
     #[must_use]
-    pub fn has_fault(&self) -> bool {
+    pub(crate) fn has_fault(&self) -> bool {
         self.fault.is_some()
     }
 
     #[must_use]
-    pub fn fault(&self) -> Option<&OwnerFault> {
+    pub(crate) fn fault(&self) -> Option<&OwnerFault> {
         self.fault.as_ref()
     }
 
-    pub fn check_worker_faults(&mut self) {
+    pub(crate) fn check_worker_faults(&mut self) {
         if self.fault.is_some() || self.shutdown {
             return;
         }
@@ -875,7 +870,7 @@ impl TxEngine {
         }
     }
 
-    pub fn reserve_lane(&mut self) -> Option<usize> {
+    pub(crate) fn reserve_lane(&mut self) -> Option<usize> {
         self.ensure_started();
         if self.fault.is_some() || self.shutdown {
             return None;
@@ -889,7 +884,7 @@ impl TxEngine {
         Some(lane_idx)
     }
 
-    pub fn release_reserved_lane(&mut self, lane_idx: usize) {
+    pub(crate) fn release_reserved_lane(&mut self, lane_idx: usize) {
         self.idle_lanes.push(lane_idx);
         self.in_flight_count = self.in_flight_count.saturating_sub(1);
     }
@@ -953,7 +948,7 @@ impl TxEngine {
     /// Phase 1 of the two-phase shutdown: stop new admissions while
     /// keeping every fixed lane alive so in-flight `send_to` work can still
     /// complete and be reaped. Returns `true` when the engine was running.
-    pub fn begin_shutdown(&mut self) -> bool {
+    pub(crate) fn begin_shutdown(&mut self) -> bool {
         if self.shutdown {
             return false;
         }
@@ -966,7 +961,7 @@ impl TxEngine {
     /// `true` when `in_flight() == 0`. Never resets counters while work is
     /// still owned by a lane: every slot returns exactly once, through
     /// normal completion reaping.
-    pub async fn drain_in_flight(
+    pub(crate) async fn drain_in_flight(
         &mut self,
         tx_pool: &mut TxPool,
         completions: &mut OwnerTxCompletionStats,
@@ -1009,7 +1004,7 @@ impl TxEngine {
     /// new work can be admitted afterwards. Lane tasks observe `shutdown`
     /// and exit; dropping their `JoinHandle`s cancels any still-parked
     /// worker without awaiting kernel I/O.
-    pub fn finish_shutdown(&mut self, tx_pool: &mut TxPool) {
+    pub(crate) fn finish_shutdown(&mut self, tx_pool: &mut TxPool) {
         if self.fault.is_some() && self.lanes.iter().all(|l| l.handle.is_finished()) {
             return;
         }
@@ -1038,7 +1033,7 @@ impl TxEngine {
         self.in_flight_count = 0;
     }
 
-    pub fn shutdown(&mut self, tx_pool: &mut TxPool) {
+    pub(crate) fn shutdown(&mut self, tx_pool: &mut TxPool) {
         if self.shutdown {
             return;
         }
@@ -1666,11 +1661,11 @@ impl Owner {
     }
 
     #[must_use]
-    pub fn caller(&self) -> Option<&CallerSide> {
+    pub fn caller(&self) -> Option<&OwnerCallerSide> {
         self.caller.as_ref()
     }
 
-    pub fn caller_mut(&mut self) -> Option<&mut CallerSide> {
+    pub fn caller_mut(&mut self) -> Option<&mut OwnerCallerSide> {
         self.caller.as_mut()
     }
 
@@ -1900,7 +1895,7 @@ impl Owner {
     }
 
     async fn service_rx_caller(
-        caller: &mut CallerSide,
+        caller: &mut OwnerCallerSide,
         now: Timestamp,
         budget: &OwnerServiceBudget,
         report: &mut OwnerServiceReport,
@@ -2373,7 +2368,7 @@ mod tests {
                 .build()
                 .expect("listener config");
             let listener_side = ListenerSide::new(l_sock, &l_cfg).expect("listener side");
-            let caller_side = CallerSide::new_single(c_sock);
+            let caller_side = OwnerCallerSide::new_single(c_sock);
 
             let mut owner = Owner::new(64)
                 .with_listener(listener_side)
@@ -2467,7 +2462,7 @@ mod tests {
         runtime.block_on(async {
             let c_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind caller std");
             let c_sock = compio::net::UdpSocket::from_std(c_std).expect("compio adopt caller");
-            let caller_side = CallerSide::new_single(c_sock);
+            let caller_side = OwnerCallerSide::new_single(c_sock);
 
             // Create owner with strict capacity of 2 in-flight sends
             let mut owner = Owner::new(2).with_caller(caller_side);
@@ -2532,7 +2527,7 @@ mod tests {
 
             let c_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind caller std");
             let c_sock = compio::net::UdpSocket::from_std(c_std).expect("compio adopt caller");
-            let caller_side = CallerSide::new_single(c_sock);
+            let caller_side = OwnerCallerSide::new_single(c_sock);
 
             let mut owner = Owner::new(64).with_caller(caller_side);
 
@@ -2638,7 +2633,7 @@ mod tests {
                 .build()
                 .expect("listener config");
             let listener_side = ListenerSide::new(l_sock, &l_cfg).expect("listener side");
-            let caller_side = CallerSide::new_single(c_sock);
+            let caller_side = OwnerCallerSide::new_single(c_sock);
 
             let mut owner = Owner::new(64)
                 .with_listener(listener_side)
@@ -2730,7 +2725,7 @@ mod tests {
             let c_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind caller std");
             let c_sock = compio::net::UdpSocket::from_std(c_std).expect("compio adopt caller");
 
-            let caller_side = CallerSide::new_single(c_sock);
+            let caller_side = OwnerCallerSide::new_single(c_sock);
             let mut owner = Owner::new(16).with_caller(caller_side);
 
             let initial_free = owner.tx_pool().free_count();
@@ -2833,7 +2828,7 @@ mod tests {
                 .build()
                 .expect("listener config");
             let listener_side = ListenerSide::new(l_sock, &l_cfg).expect("listener side");
-            let caller_side = CallerSide::new_single(c_sock);
+            let caller_side = OwnerCallerSide::new_single(c_sock);
 
             let mut owner = Owner::new(16)
                 .with_listener(listener_side)
@@ -2897,7 +2892,7 @@ mod tests {
         runtime.block_on(async {
             let c_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind caller std");
             let c_sock = compio::net::UdpSocket::from_std(c_std).expect("compio adopt caller");
-            let caller_side = CallerSide::new_single(c_sock);
+            let caller_side = OwnerCallerSide::new_single(c_sock);
             let mut owner = Owner::new(16).with_caller(caller_side);
 
             // Submit send
@@ -3042,7 +3037,7 @@ mod tests {
         runtime.block_on(async {
             let c_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
             let c_sock = compio::net::UdpSocket::from_std(c_std).expect("adopt");
-            let caller_side = CallerSide::new_single(c_sock);
+            let caller_side = OwnerCallerSide::new_single(c_sock);
             // Ceiling of 100 bytes
             let mut owner = Owner::new_with_ceiling(4, 100).with_caller(caller_side);
             assert_eq!(owner.wire_ceiling(), 100);
@@ -3145,7 +3140,7 @@ mod tests {
         runtime.block_on(async {
             let c_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
             let c_sock = compio::net::UdpSocket::from_std(c_std).expect("adopt");
-            let caller_side = CallerSide::new_single(c_sock);
+            let caller_side = OwnerCallerSide::new_single(c_sock);
 
             let mut owner = Owner::new(4).with_caller(caller_side);
             assert_eq!(owner.tx_pool().free_count(), 4);
@@ -3254,7 +3249,7 @@ mod tests {
         runtime.block_on(async {
             let c_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
             let c_sock = compio::net::UdpSocket::from_std(c_std).expect("adopt");
-            let caller_side = CallerSide::new_single(c_sock);
+            let caller_side = OwnerCallerSide::new_single(c_sock);
             let mut owner = Owner::new(4).with_caller(caller_side);
             let peer: SocketAddr = "127.0.0.1:19998".parse().unwrap();
             for _ in 0..3 {
@@ -3300,7 +3295,7 @@ mod tests {
         runtime.block_on(async {
             let c_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
             let c_sock = compio::net::UdpSocket::from_std(c_std).expect("adopt");
-            let caller_side = CallerSide::new_single(c_sock);
+            let caller_side = OwnerCallerSide::new_single(c_sock);
             let mut owner = Owner::new(4).with_caller(caller_side);
             let now = Timestamp::from_micros(1_000);
             let budget = OwnerServiceBudget {
@@ -3324,7 +3319,7 @@ mod tests {
         runtime.block_on(async {
             let c_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
             let c_sock = compio::net::UdpSocket::from_std(c_std).expect("adopt");
-            let caller_side = CallerSide::new_single(c_sock);
+            let caller_side = OwnerCallerSide::new_single(c_sock);
             let mut owner = Owner::new(16).with_caller(caller_side);
             // Expired attempt + queued output both eligible: exactly one
             // bounded unit of action work may occur.

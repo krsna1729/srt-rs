@@ -383,16 +383,16 @@ impl DataHeader {
 
 /// A pending outgoing DATA packet awaiting materialization into a caller-supplied buffer.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingData {
-    pub header: DataHeader,
-    pub payload: Bytes,
-    pub crypto: Option<TxCryptoStamp>,
+pub(crate) struct PendingData {
+    pub(crate) header: DataHeader,
+    pub(crate) payload: Bytes,
+    pub(crate) crypto: Option<TxCryptoStamp>,
 }
 
 impl PendingData {
     /// Create a new pending data packet.
     #[must_use]
-    pub fn new(header: DataHeader, payload: Bytes, crypto: Option<TxCryptoStamp>) -> Self {
+    pub(crate) fn new(header: DataHeader, payload: Bytes, crypto: Option<TxCryptoStamp>) -> Self {
         Self {
             header,
             payload,
@@ -402,7 +402,7 @@ impl PendingData {
 
     /// Exact wire length in bytes when serialized.
     #[must_use]
-    pub fn wire_len(&self) -> usize {
+    pub(crate) fn wire_len(&self) -> usize {
         let tag_len = match self.crypto {
             Some(stamp) if stamp.cipher_mode == CipherMode::Gcm => GCM_TAG_LEN,
             _ => 0,
@@ -413,7 +413,7 @@ impl PendingData {
     /// Encode and encrypt the packet directly into destination storage.
     ///
     /// The destination slice must be at least [`Self::wire_len`] bytes.
-    pub fn encode_into(
+    pub(crate) fn encode_into(
         &self,
         crypto: Option<&CryptoContext>,
         dst: &mut [u8],
@@ -470,7 +470,7 @@ impl PendingData {
 
 /// A pending outgoing datagram (data or control) awaiting materialization.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PendingDatagram {
+pub(crate) enum PendingDatagram {
     Data(PendingData),
     Control(ControlPacket),
 }
@@ -478,7 +478,7 @@ pub enum PendingDatagram {
 impl PendingDatagram {
     /// Exact wire length in bytes.
     #[must_use]
-    pub fn wire_len(&self) -> usize {
+    pub(crate) fn wire_len(&self) -> usize {
         match self {
             Self::Data(data) => data.wire_len(),
             Self::Control(control) => control.encoded_size(),
@@ -486,7 +486,7 @@ impl PendingDatagram {
     }
 
     /// Encode and encrypt the packet directly into destination storage.
-    pub fn encode_into(
+    pub(crate) fn encode_into(
         &self,
         crypto: Option<&CryptoContext>,
         dst: &mut [u8],

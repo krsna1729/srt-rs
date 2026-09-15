@@ -57,8 +57,7 @@ pub mod crypto {
 pub mod wire {
     pub use super::srt_packet::{
         ControlPacket, ControlType, DataHeader, DataPacket, MAX_DATAGRAM_SIZE, PacketPosition,
-        PacketType, PendingData, PendingDatagram, SRT_HEADER_SIZE, SrtPacket,
-        peek_destination_socket_id,
+        PacketType, SRT_HEADER_SIZE, SrtPacket, peek_destination_socket_id,
     };
 }
 

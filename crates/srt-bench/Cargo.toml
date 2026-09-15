@@ -26,7 +26,7 @@ getrandom = "0.4"
 # mio (readiness reference), tokio (managed async), and compio (io_uring completion).
 mio = { version = "1", features = ["os-poll", "net"] }
 tokio = { version = "1", features = ["net", "time", "rt", "rt-multi-thread", "macros"] }
-compio = { version = "0.19", features = ["io", "io-uring", "net", "runtime", "time", "macros"] }
+compio = { version = "=0.19.2", features = ["io", "io-uring", "net", "runtime", "time", "macros"] }
 
 [dev-dependencies]
 criterion = "0.8"

@@ -16,7 +16,7 @@ use std::time::Instant;
 use compio::buf::BufResult;
 use srt_proto::{Bytes, ConnectionOptions, ConnectionOutput, OutputInto, SrtConnection, Timestamp};
 use srt_transport::advanced::caller::{CallerLeg, CallerTable};
-use srt_transport::compio::{CallerSide, Owner, OwnerServiceBudget};
+use srt_transport::compio::{Owner, OwnerCallerSide, OwnerServiceBudget};
 
 struct CountingAllocator;
 static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -271,7 +271,7 @@ fn bench_layer3b_owner_tx_pipeline(iterations: usize) -> LayerResult {
     runtime.block_on(async {
         let c_std = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let c_sock = compio::net::UdpSocket::from_std(c_std).unwrap();
-        let caller_side = CallerSide::new_single(c_sock);
+        let caller_side = OwnerCallerSide::new_single(c_sock);
         let sink_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         sink_sock.set_nonblocking(true).unwrap();
         let sink_addr = sink_sock.local_addr().unwrap();
@@ -375,7 +375,7 @@ fn bench_layer4_full_compio_owner_tx(iterations: usize) -> LayerResult {
 
         let c_std = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let c_sock = compio::net::UdpSocket::from_std(c_std).unwrap();
-        let caller_side = CallerSide::new_single(c_sock);
+        let caller_side = OwnerCallerSide::new_single(c_sock);
 
         let mut owner = Owner::new(64)
             .with_listener(listener_side)
