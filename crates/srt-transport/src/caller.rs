@@ -4925,4 +4925,193 @@ mod tests {
             table.len()
         );
     }
+
+    // -----------------------------------------------------------------
+    // Property / differential tests for the versioned due-index
+    // -----------------------------------------------------------------
+
+    /// Reference model: a simple BTreeSet that tracks the canonical
+    /// (id -> deadline_micros) mapping. Used to diff against the heap index.
+    use std::collections::BTreeMap;
+
+    fn ref_earliest_due(model: &BTreeMap<LogicalCallerId, u64>, now_us: u64) -> bool {
+        model.values().any(|&d| d <= now_us)
+    }
+
+    fn ref_time_until(model: &BTreeMap<LogicalCallerId, u64>, now_us: u64, default: u64) -> u64 {
+        model
+            .values()
+            .map(|&d| d.saturating_sub(now_us))
+            .min()
+            .unwrap_or(default)
+            .min(default)
+    }
+
+    #[test]
+    fn due_index_differential_randomised() {
+        // Deterministic pseudo-random trace: insert, update, remove, query.
+        let n = 80usize;
+        let mut table = mk_table(n);
+        let ids: Vec<_> = table.bench_ids();
+        // Clear all protocol-set timers so the model starts empty.
+        for &id in &ids {
+            table.bench_clear_deadline(id);
+        }
+        let mut model: BTreeMap<LogicalCallerId, u64> = BTreeMap::new();
+
+        let mut seed: u64 = 0xdeadbeef_cafebabe;
+        let lcg = |s: u64| {
+            s.wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407)
+        };
+
+        for step in 0u64..5_000 {
+            seed = lcg(seed);
+            let now_us = step * 500;
+            let now = Timestamp::from_micros(now_us);
+
+            let op = seed % 5;
+            let idx = (seed >> 16) as usize % ids.len();
+            let id = ids[idx];
+
+            match op {
+                0 | 1 => {
+                    // set/change deadline
+                    let dl_us = now_us + (seed >> 32) % 200_000 + 1;
+                    table.bench_inject_deadline(id, Timestamp::from_micros(dl_us));
+                    model.insert(id, dl_us);
+                }
+                2 => {
+                    // clear deadline
+                    table.bench_clear_deadline(id);
+                    model.remove(&id);
+                }
+                3 => {
+                    // set same deadline twice (idempotent)
+                    let dl_us = now_us + 50_000;
+                    table.bench_inject_deadline(id, Timestamp::from_micros(dl_us));
+                    table.bench_inject_deadline(id, Timestamp::from_micros(dl_us));
+                    model.insert(id, dl_us);
+                }
+                _ => {
+                    // many callers same deadline (tie semantics)
+                    let dl_us = now_us + 1_000;
+                    for &other in ids.iter().take(4) {
+                        table.bench_inject_deadline(other, Timestamp::from_micros(dl_us));
+                        model.insert(other, dl_us);
+                    }
+                }
+            }
+
+            // Invariant 1: deadline_count == model size
+            assert_eq!(
+                table.deadline_count(),
+                model.len(),
+                "step {step}: live count mismatch"
+            );
+
+            // Invariant 2: if model says NOT due, table must also say not due.
+            // (Table may report ready_queue work the model doesn't track, so
+            // we only assert in the false direction.)
+            let model_due = ref_earliest_due(&model, now_us);
+            if !model_due {
+                assert!(
+                    !table.has_pending_output(now),
+                    "step {step}: table reports due work but model says none"
+                );
+            }
+
+            // Invariant 3: time_until_next_deadline agrees (within 1 us for ties)
+            let model_us = ref_time_until(&model, now_us, 999_999);
+            let table_us = table.time_until_next_deadline(now, 999_999);
+            assert_eq!(
+                table_us, model_us,
+                "step {step}: time_until mismatch: table={table_us} model={model_us}"
+            );
+        }
+    }
+
+    #[test]
+    fn due_index_remove_then_readd_never_revived_by_stale() {
+        // Remove a caller, re-add it, verify stale heap entries do not
+        // fire the new caller's deadline falsely.
+        let mut table = CallerTable::new();
+        let peer = std::net::SocketAddr::from(([10, 0, 0, 1], 5000));
+        let make_conn = |sid: u32| {
+            let mut c = SrtConnection::new_caller(ConnectionOptions {
+                socket_id: sid,
+                ..ConnectionOptions::default()
+            });
+            c.connect(Timestamp::default()).unwrap();
+            c
+        };
+        let id1 = table
+            .add_direct(CallerLeg {
+                peer,
+                connection: make_conn(1001),
+            })
+            .unwrap();
+        // Flush the initial ready/deadline state so the table is quiescent.
+        let mut out = Vec::new();
+        table.poll_outbound(Timestamp::default(), &mut out);
+        table.bench_inject_deadline(id1, Timestamp::from_micros(1_000));
+        assert_eq!(table.deadline_count(), 1);
+
+        // Remove: sched entry gone → live drops to 0; heap entries go stale.
+        table.remove(id1);
+        assert_eq!(table.deadline_count(), 0);
+        // After draining any residual ready work, no output should remain.
+        let now = Timestamp::from_micros(2_000);
+        table.poll_outbound(now, &mut out);
+        assert!(
+            !table.has_pending_output(now),
+            "removed caller must not appear due"
+        );
+
+        // Add a new caller — gets a fresh monotonic id.
+        let id2 = table
+            .add_direct(CallerLeg {
+                peer,
+                connection: make_conn(1002),
+            })
+            .unwrap();
+        assert_ne!(id1, id2, "ids must be monotonically distinct");
+        // Flush id2's initial ready state, then clear its deadline.
+        table.poll_outbound(now, &mut out);
+        table.bench_clear_deadline(id2);
+        assert_eq!(table.deadline_count(), 0);
+        // No stale entry from id1 must show up as id2's deadline.
+        assert!(
+            !table.has_pending_output(Timestamp::from_micros(1_000)),
+            "stale heap entry from removed id1 must not revive as id2 due"
+        );
+    }
+
+    #[test]
+    fn due_index_stale_amplification_bounded() {
+        // Arm + re-arm the same caller 1000 times; verify the physical heap
+        // size stays bounded by the amortized rebuild mechanism.
+        let n = 1usize; // single caller: no protocol noise from others
+        let mut table = mk_table(n);
+        let ids = table.bench_ids();
+        let id = ids[0];
+        // Clear all existing deadlines so we start from a clean heap.
+        table.bench_clear_deadline(id);
+        let mut out = Vec::new();
+        table.poll_outbound(Timestamp::default(), &mut out);
+
+        for k in 0u64..1_000 {
+            table.bench_inject_deadline(id, Timestamp::from_micros(k * 100 + 50));
+        }
+        let snap = table.due_index_snapshot();
+        // After 1000 updates of one caller, exactly one live entry.
+        assert_eq!(snap.live, 1, "only one live entry for one caller");
+        // Physical must be << 1000 due to rebuild keeping heap compact.
+        assert!(
+            snap.physical <= 20,
+            "stale amplification not bounded: physical={} after 1000 updates",
+            snap.physical
+        );
+        assert!(snap.rebuilds > 0, "expected at least one amortized rebuild");
+    }
 }

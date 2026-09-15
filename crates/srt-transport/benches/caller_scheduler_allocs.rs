@@ -298,6 +298,60 @@ fn run_scheduler_isolated_measurement(
     }
 }
 
+/// Pure-mechanical due-index measurement: only deadline set/peek/pop.
+/// No protocol timer fires, no payload admission, no wire encoding.
+/// Isolation proof: if allocs/op > 0 here, the heap structure itself
+/// allocates. If allocs/op == 0, scheduler is allocation-free.
+fn run_scheduler_pure_mechanical(
+    scenario: &'static str,
+    mut table: CallerTable,
+    ids: Vec<LogicalCallerId>,
+    iterations: usize,
+) -> BenchmarkResults {
+    let mut durations_ns = Vec::with_capacity(iterations);
+    let mut now = Timestamp::from_micros(1_000_000);
+
+    // Warmup: inject and cycle deadlines without draining protocol work.
+    for i in 0..500 {
+        now = Timestamp::from_micros(now.as_micros() + 1_000);
+        let target_id = ids[i % ids.len()];
+        table.bench_inject_deadline(target_id, Timestamp::from_micros(now.as_micros() + 10_000));
+        let _ = table.time_until_next_deadline(now, 100_000);
+        let _ = table.has_pending_output(now);
+    }
+
+    ALLOC_COUNT.store(0, Ordering::SeqCst);
+    ALLOC_BYTES.store(0, Ordering::SeqCst);
+
+    for i in 0..iterations {
+        now = Timestamp::from_micros(now.as_micros() + 1_000);
+        let target_id = ids[i % ids.len()];
+        let t0 = Instant::now();
+        // Set/update: one O(log N) push, old entry superseded stale.
+        table.bench_inject_deadline(target_id, Timestamp::from_micros(now.as_micros() + 10_000));
+        // Peek: O(live + stale_depth) scan for min live deadline.
+        let _ = table.time_until_next_deadline(now, 100_000);
+        // Presence check.
+        let _ = table.has_pending_output(now);
+        durations_ns.push(t0.elapsed().as_nanos() as u64);
+    }
+
+    let total_allocs = ALLOC_COUNT.load(Ordering::SeqCst);
+    let total_bytes = ALLOC_BYTES.load(Ordering::SeqCst);
+    durations_ns.sort_unstable();
+    let mean_cpu_ns = durations_ns.iter().sum::<u64>() as f64 / iterations as f64;
+    BenchmarkResults {
+        scenario,
+        iterations,
+        allocs_per_op: total_allocs as f64 / iterations as f64,
+        bytes_per_op: total_bytes as f64 / iterations as f64,
+        mean_cpu_ns,
+        p50_cpu_ns: durations_ns[iterations * 50 / 100],
+        p95_cpu_ns: durations_ns[iterations * 95 / 100],
+        p99_cpu_ns: durations_ns[iterations * 99 / 100],
+    }
+}
+
 fn main() {
     println!("=== CALLER TABLE SCHEDULER ALLOCATOR & DEADLINE MEASUREMENT ===");
     println!(
@@ -373,7 +427,34 @@ fn main() {
         );
     }
     println!();
-    println!(
-        "Class A mixes scheduler + sender/protocol allocation. Only class B isolates the BTreeSet deadline structure."
+
+    println!("=== CLASS B2: PURE SCHEDULER MECHANICS (heap only, no protocol) ===");
+    println!("Isolates the versioned due-index: bench_inject_deadline + time_until_next_deadline");
+    println!("+ has_pending_output. Zero protocol work; allocs/op == 0 proves heap is alloc-free.");
+    let (m1, mids1) = build_direct_table(1);
+    let mech1 = run_scheduler_pure_mechanical("mechanical: 1 caller", m1, mids1, ITERS);
+    let (m600, mids600) = build_direct_table(600);
+    let mech600 = run_scheduler_pure_mechanical("mechanical: 600 callers", m600, mids600, ITERS);
+    let (m1200, mids1200) = build_bonded_table(600);
+    let mech1200 = run_scheduler_pure_mechanical(
+        "mechanical: 600 bonded groups (1200 legs)",
+        m1200,
+        mids1200,
+        ITERS,
     );
+    for res in [&mech1, &mech600, &mech1200] {
+        println!(
+            "{:<45} | {:>10.3} | {:>10.1} | {:>12.1} | {:>10} | {:>10} | {:>10}",
+            res.scenario,
+            res.allocs_per_op,
+            res.bytes_per_op,
+            res.mean_cpu_ns,
+            res.p50_cpu_ns,
+            res.p95_cpu_ns,
+            res.p99_cpu_ns
+        );
+    }
+    println!();
+    println!("Class A: scheduler + sender/protocol. Class B: isolated but fires protocol timers.");
+    println!("Class B2: pure heap mechanics; allocs/op = 0 proves the due-index is alloc-free.");
 }
