@@ -1,17 +1,15 @@
 //! Allocator-instrumented steady-state measurement of CallerTable scheduling.
 //!
-//! Measures allocation churn, bytes allocated, and service visit latency
-//! across:
-//! 1. 1 logical caller
-//! 2. 600 logical callers
-//! 3. 600 bonded callers (x 2 legs = 1200 physical legs)
+//! Two measurement classes:
+//! A. Full steady-state service (deadline update + ready cycling + bounded
+//!    output drain + timer movement), including payload admission.
+//! B. Scheduler-isolated service (deadline remove/reinsert + ready cycling +
+//!    bounded drain into a no-allocation sink, no payload send). Class B is
+//!    the only valid basis for claims about the BTreeSet deadline structure
+//!    itself; class A mixes scheduler cost with sender/protocol allocation.
 //!
-//! In steady state, measuring repeated:
-//! - deadline update
-//! - ready cycling
-//! - bounded output drain
-//! - timer movement
-
+//! Scenarios: 1 logical caller, 600 logical callers, 600 bonded groups
+//! (x 2 legs = 1200 physical legs).
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -205,6 +203,87 @@ fn run_steady_state_measurement(
     }
 }
 
+/// Scheduler-isolated measurement: deadline remove/reinsert, ready cycling,
+/// and bounded drain into a no-allocation sink. No payload is admitted, so the
+/// sender, protocol packetization, and wire encoding paths contribute zero
+/// allocations by construction; whatever remains is the scheduler structure.
+struct DiscardSink;
+
+impl srt_transport::DatagramSink for DiscardSink {
+    fn push_datagram<F>(
+        &mut self,
+        _peer: SocketAddr,
+        wire_len: usize,
+        _fill: F,
+    ) -> Result<srt_transport::PushResult, srt_proto::Error>
+    where
+        F: FnOnce(&mut [u8]) -> Result<usize, srt_proto::Error>,
+    {
+        // Never invoke `fill`: the datagram stays queued and no encoding
+        // runs, so this measures pure scheduler/index traversal cost.
+        // Report the wire length as the accounted length for budget motion.
+        Ok(srt_transport::PushResult::Pushed { len: wire_len })
+    }
+}
+
+fn run_scheduler_isolated_measurement(
+    scenario: &'static str,
+    mut table: CallerTable,
+    ids: Vec<LogicalCallerId>,
+    iterations: usize,
+) -> BenchmarkResults {
+    let mut durations_ns = Vec::with_capacity(iterations);
+    let mut now = Timestamp::from_micros(1_000_000);
+
+    for i in 0..500 {
+        now = Timestamp::from_micros(now.as_micros() + 100);
+        let target_id = ids[i % ids.len()];
+        table.bench_arm_timer(target_id, srt_proto::TimerId::Ack, 100, now);
+        let _ = table.time_until_next_deadline(now, 100_000);
+        table.bench_make_ready(target_id);
+        let mut sink = DiscardSink;
+        let _ = table.poll_outbound_bounded_to(
+            now,
+            OutputDrainBudget::new(64, 32, 256 * 1024),
+            &mut sink,
+        );
+    }
+
+    ALLOC_COUNT.store(0, Ordering::SeqCst);
+    ALLOC_BYTES.store(0, Ordering::SeqCst);
+
+    for i in 0..iterations {
+        now = Timestamp::from_micros(now.as_micros() + 100);
+        let target_id = ids[i % ids.len()];
+        let t0 = Instant::now();
+        table.bench_arm_timer(target_id, srt_proto::TimerId::Ack, 100, now);
+        let _ = table.time_until_next_deadline(now, 100_000);
+        table.bench_make_ready(target_id);
+        let mut sink = DiscardSink;
+        let _ = table.poll_outbound_bounded_to(
+            now,
+            OutputDrainBudget::new(64, 32, 256 * 1024),
+            &mut sink,
+        );
+        durations_ns.push(t0.elapsed().as_nanos() as u64);
+    }
+
+    let total_allocs = ALLOC_COUNT.load(Ordering::SeqCst);
+    let total_bytes = ALLOC_BYTES.load(Ordering::SeqCst);
+    durations_ns.sort_unstable();
+    let mean_cpu_ns = durations_ns.iter().sum::<u64>() as f64 / iterations as f64;
+    BenchmarkResults {
+        scenario,
+        iterations,
+        allocs_per_op: total_allocs as f64 / iterations as f64,
+        bytes_per_op: total_bytes as f64 / iterations as f64,
+        mean_cpu_ns,
+        p50_cpu_ns: durations_ns[iterations * 50 / 100],
+        p95_cpu_ns: durations_ns[iterations * 95 / 100],
+        p99_cpu_ns: durations_ns[iterations * 99 / 100],
+    }
+}
+
 fn main() {
     println!("=== CALLER TABLE SCHEDULER ALLOCATOR & DEADLINE MEASUREMENT ===");
     println!(
@@ -253,4 +332,34 @@ fn main() {
         );
     }
     println!();
+
+    println!("=== CLASS B: SCHEDULER-ISOLATED (no payload send) ===");
+    let (s1, sids1) = build_direct_table(1);
+    let iso1 = run_scheduler_isolated_measurement("isolated: 1 logical caller", s1, sids1, ITERS);
+    let (s600, sids600) = build_direct_table(600);
+    let iso600 =
+        run_scheduler_isolated_measurement("isolated: 600 logical callers", s600, sids600, ITERS);
+    let (s1200, sids1200) = build_bonded_table(600);
+    let iso1200 = run_scheduler_isolated_measurement(
+        "isolated: 600 bonded groups (1200 legs)",
+        s1200,
+        sids1200,
+        ITERS,
+    );
+    for res in [&iso1, &iso600, &iso1200] {
+        println!(
+            "{:<45} | {:>10.3} | {:>10.1} | {:>12.1} | {:>10} | {:>10} | {:>10}",
+            res.scenario,
+            res.allocs_per_op,
+            res.bytes_per_op,
+            res.mean_cpu_ns,
+            res.p50_cpu_ns,
+            res.p95_cpu_ns,
+            res.p99_cpu_ns
+        );
+    }
+    println!();
+    println!(
+        "Class A mixes scheduler + sender/protocol allocation. Only class B isolates the BTreeSet deadline structure."
+    );
 }
