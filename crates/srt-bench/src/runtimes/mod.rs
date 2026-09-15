@@ -2,7 +2,7 @@
 //! file per runtime. Loss mode and scale mode are the SAME code everywhere:
 //! loss runs one connection, scale runs N. Only the STATS schema differs.
 //!
-//! # Ingress strategies (all four, on all six runtimes)
+//! # Ingress strategies (all four, on every runtime)
 //!
 //! How a listener fans many callers across sockets and threads. Selected
 //! with `--ingress`; every combination is implemented everywhere, so a

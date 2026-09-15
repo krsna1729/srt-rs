@@ -73,9 +73,9 @@ impl AdmissionPeer {
     ///
     /// The single implementation of "what a Connected/DataReceived/
     /// Disconnected event means for one admitted peer" -- previously
-    /// hand-copied identically into each of the six runtime adapters'
-    /// per-tick admission loops, plus a seventh, slightly different copy
-    /// inside `PeerTable::drain_events`. Called once, unconditionally, as
+    /// hand-copied identically into each runtime adapter's per-tick
+    /// admission loop, plus a slightly different copy inside
+    /// `PeerTable::drain_events`. Called once, unconditionally, as
     /// part of draining the event itself (`drain_direct_events`, below) so
     /// `connected`/`torn_down`/`data_events` are correct for *any* consumer
     /// -- not only one that happens to call the legacy `drain_events` (A01):

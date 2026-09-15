@@ -2,8 +2,9 @@
 
 Standalone caller/listener binaries over
 [`srt-protocol`](../srt-protocol) + [`srt-transport`](../srt-transport),
-for wire-level interop testing and the six-runtime driver-framework
-bake-off — without linking an application crate or libsrt.
+for wire-level interop testing and the driver-framework bake-off
+across the three supported runtimes — without linking an application
+crate or libsrt.
 `publish = false`.
 
 One binary, **three runtime backends** (mio, tokio, compio), two roles. At
@@ -25,7 +26,7 @@ the results, profile one pair, inspect host capacity, or watch a running
 benchmark.
 
 ```
-srt-bench runtime=<mio|tokio|smol|monoio|glommio|compio> \
+srt-bench runtime=<mio|tokio|compio> \
   mode=<sender|receiver> <host?> <port> <duration_secs> <latency_ms> \
   [source_bitrate_bps] [--connections N] [--encryption plain|128|192|256]
   [--srt-bandwidth protocol-default|legacy-source-fixed|fixed:BPS|input-relative:PCT]

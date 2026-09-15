@@ -1132,7 +1132,7 @@ Command cautions:
 
 - Protocol directory `srt-protocol` is package **`srt-proto`** (library crate `srt_proto`).
 - The workspace toolchain is 1.96.0; protocol declares 1.93. Transport declares 1.96.
-- `srt-bench` enables all six runtime dependencies even when the test filter is narrow.
+- `srt-bench` enables all runtime dependencies even when the test filter is narrow.
 - Avoid routine `cargo test --all-targets`: Criterion targets use `harness = false` and can execute benchmark binaries. `cargo check --all-targets` compiles rather than runs, but still consumes resources.
 - Fix E05 before relying on broad protocol unit tests as a stable correctness gate.
 - Interop tests may skip unavailable tools/features. Record expected and actual case execution; release qualification must not silently skip required coverage.

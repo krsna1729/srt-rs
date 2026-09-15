@@ -250,7 +250,7 @@ pub struct BenchConfig {
     pub source_bitrate_bps: u64,
     /// The **transport configuration**: how this run configures SRT's
     /// pacing, resolved against `source_bitrate_bps` in exactly one place
-    /// ([`Self::srt_bandwidth`]) so six runtimes cannot drift.
+    /// ([`Self::srt_bandwidth`]) so no runtime can drift.
     pub bandwidth: crate::source::BandwidthPolicy,
     /// Milliseconds of source the pending-source backlog may hold before
     /// opportunities are dropped and counted. Bounded by rate, never by
@@ -733,7 +733,7 @@ impl BenchConfig {
     /// The SRT pacing policy this run configures, resolved once against
     /// the source payload rate.
     ///
-    /// The single resolution point for all six runtimes. Six copies of
+    /// The single resolution point for every runtime. One copy of
     /// `max_bandwidth_bytes_per_sec = bitrate / 8` is exactly how the
     /// workload rate and the pacing ceiling became the same number.
     #[must_use]
@@ -745,7 +745,7 @@ impl BenchConfig {
     ///
     /// Applied for both roles: a listener never sends application data,
     /// so its pacing ceiling is inert, and setting it uniformly keeps the
-    /// six runtimes from each deciding the question differently.
+    /// every runtime from each deciding the question differently.
     /// Canonical via [`Self::session_config`]; do not write pacing fields here.
     pub fn apply_srt_bandwidth(&self, options: &mut srt_proto::ConnectionOptions) {
         let template = self.session_config().into_connection_options();
