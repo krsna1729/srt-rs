@@ -4,14 +4,15 @@ use crate::{
     prepend_outputs,
 };
 use compio::buf::BufResult;
-use futures_util::stream::{FuturesUnordered, StreamExt};
+use compio::runtime::spawn;
 use srt_proto::{Bytes, ConnectionOutput, SrtConnection, Timestamp};
+use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::future::Future;
+use std::future::poll_fn;
 use std::io;
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::rc::Rc;
+use std::task::{Context, Poll, Waker};
 /// Per-connection state for compio: protocol + owned-buffer socket + timer deadlines.
 pub struct Conn {
     conn: SrtConnection,
@@ -287,13 +288,13 @@ pub struct TxPoolSnapshot {
     pub free: usize,
     pub exhaustions: u64,
 }
-
 /// Reusable finite TX buffer pool for direct final-buffer outbound datagrams.
+/// All slots are eagerly allocated to `slot_size` on creation; no runtime
+/// growth or lazy allocation occurs.
 pub struct TxPool {
     slot_size: usize,
     capacity: usize,
     free_buffers: Vec<Vec<u8>>,
-    allocated: usize,
     exhaustion_count: u64,
 }
 
@@ -302,6 +303,7 @@ impl TxPool {
     #[must_use]
     pub fn new(capacity: usize, slot_size: usize) -> Self {
         let capacity = capacity.max(1);
+        let slot_size = slot_size.max(1);
         let mut free_buffers = Vec::with_capacity(capacity);
         for _ in 0..capacity {
             free_buffers.push(vec![0u8; slot_size]);
@@ -310,41 +312,43 @@ impl TxPool {
             slot_size,
             capacity,
             free_buffers,
-            allocated: capacity,
             exhaustion_count: 0,
         }
     }
 
     /// Allocate or take a free buffer slot.
     pub(crate) fn alloc_slot(&mut self) -> Option<Vec<u8>> {
-        if let Some(mut buf) = self.free_buffers.pop() {
-            buf.clear();
-            return Some(buf);
+        if let Some(buf) = self.free_buffers.pop() {
+            Some(buf)
+        } else {
+            self.exhaustion_count = self.exhaustion_count.saturating_add(1);
+            None
         }
-        if self.allocated < self.capacity {
-            self.allocated += 1;
-            return Some(Vec::with_capacity(self.slot_size));
-        }
-        self.exhaustion_count = self.exhaustion_count.saturating_add(1);
-        None
     }
 
     /// Return an owned buffer slot back to the pool.
     pub(crate) fn return_slot(&mut self, mut buf: Vec<u8>) {
         buf.clear();
+        buf.resize(self.slot_size, 0);
         self.free_buffers.push(buf);
     }
 
     /// Number of free buffers immediately available.
     #[must_use]
     pub fn free_count(&self) -> usize {
-        self.free_buffers.len() + (self.capacity.saturating_sub(self.allocated))
+        self.free_buffers.len()
     }
 
     /// Total capacity of the pool.
     #[must_use]
     pub fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    /// Fixed size of each buffer slot.
+    #[must_use]
+    pub fn slot_size(&self) -> usize {
+        self.slot_size
     }
 
     /// Number of times the pool was exhausted when a slot was requested.
@@ -479,11 +483,29 @@ impl OwnerCallerSide {
         }
     }
 }
+/// Compute the canonical maximum wire-datagram size required for a configured SRT session.
+///
+/// Accounts for:
+/// - DATA packets: `payload_size + SRT_HEADER_SIZE (16) + GCM_TAG (16 if GCM enabled)`
+/// - Handshake / control packets:
+///   - Base handshake: 48 bytes body + 16 bytes SRT header = 64 bytes
+///   - Extensions: SRT extension (16 bytes), StreamId extension (up to 512 + 4 = 516 bytes),
+///     KM extension (32-byte key material + 12 = 44 bytes), Group extension (20 bytes)
+///   - Largest legal control datagram: DEFAULT_MTU (1500) for full NAK chunks and control ceilings
+#[must_use]
+pub fn required_session_wire_ceiling(payload_size: usize, has_gcm: bool) -> usize {
+    let data_wire = payload_size
+        .saturating_add(srt_proto::wire::SRT_HEADER_SIZE)
+        .saturating_add(if has_gcm { 16 } else { 0 });
+    let control_wire = (srt_proto::handshake::DEFAULT_MTU as usize).max(660);
+    data_wire.max(control_wire)
+}
+
 /// attributed, validated, and reported instead of silently discarded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct InFlightMeta {
-    peer: SocketAddr,
-    expected_len: usize,
+pub(crate) struct InFlightMeta {
+    pub peer: SocketAddr,
+    pub expected_len: usize,
 }
 
 /// Aggregated TX completion accounting surfaced through [`OwnerServiceReport`].
@@ -492,15 +514,279 @@ pub struct OwnerTxCompletionStats {
     pub completed_ok: usize,
     pub short_sends: usize,
     pub failed_sends: usize,
+    pub last_failed_peer: Option<SocketAddr>,
 }
 
-type InFlightSend = Pin<Box<dyn Future<Output = (InFlightMeta, io::Result<usize>, Vec<u8>)>>>;
+/// Typed fault state for a Compio Owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnerFault {
+    /// A fixed TX worker task terminated unexpectedly (panicked).
+    WorkerPanicked { lane: usize },
+    /// Owner has been shut down.
+    Shutdown,
+}
+
+struct TxJob {
+    sock: Rc<compio::net::UdpSocket>,
+    buf: Vec<u8>,
+    peer: SocketAddr,
+    meta: InFlightMeta,
+}
+
+pub(crate) struct TxCompletion {
+    pub meta: InFlightMeta,
+    pub res: io::Result<usize>,
+    pub buf: Vec<u8>,
+}
+
+struct TxLaneState {
+    job: Option<TxJob>,
+    worker_waker: Option<Waker>,
+    completion: Option<TxCompletion>,
+    shutdown: bool,
+}
+
+struct TxLane {
+    state: Rc<RefCell<TxLaneState>>,
+    handle: compio::runtime::JoinHandle<()>,
+}
+
+pub struct TxEngine {
+    lanes: Vec<TxLane>,
+    idle_lanes: Vec<usize>,
+    completed_lanes: Rc<RefCell<VecDeque<usize>>>,
+    owner_waker: Rc<RefCell<Option<Waker>>>,
+    capacity: usize,
+    in_flight_count: usize,
+    fault: Option<OwnerFault>,
+    shutdown: bool,
+}
+
+async fn tx_lane_worker(
+    state: Rc<RefCell<TxLaneState>>,
+    completed_lanes: Rc<RefCell<VecDeque<usize>>>,
+    owner_waker: Rc<RefCell<Option<Waker>>>,
+    lane_idx: usize,
+) {
+    loop {
+        let job = poll_fn(|cx| {
+            let mut s = state.borrow_mut();
+            if s.shutdown {
+                return Poll::Ready(None);
+            }
+            if let Some(job) = s.job.take() {
+                return Poll::Ready(Some(job));
+            }
+            s.worker_waker = Some(cx.waker().clone());
+            Poll::Pending
+        })
+        .await;
+
+        let Some(job) = job else {
+            break;
+        };
+
+        let BufResult(res, mut buf) = job.sock.send_to(job.buf, job.peer).await;
+        buf.clear();
+
+        {
+            let mut s = state.borrow_mut();
+            s.completion = Some(TxCompletion {
+                meta: job.meta,
+                res,
+                buf,
+            });
+        }
+        completed_lanes.borrow_mut().push_back(lane_idx);
+        if let Some(w) = owner_waker.borrow_mut().take() {
+            w.wake();
+        }
+    }
+}
+
+impl TxEngine {
+    #[must_use]
+    pub fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
+        let mut engine = Self {
+            lanes: Vec::with_capacity(capacity),
+            idle_lanes: (0..capacity).rev().collect(),
+            completed_lanes: Rc::new(RefCell::new(VecDeque::with_capacity(capacity))),
+            owner_waker: Rc::new(RefCell::new(None)),
+            capacity,
+            in_flight_count: 0,
+            fault: None,
+            shutdown: false,
+        };
+        engine.ensure_started();
+        engine
+    }
+
+    pub fn ensure_started(&mut self) {
+        if !self.lanes.is_empty() || self.shutdown {
+            return;
+        }
+        if compio::runtime::Runtime::try_current().is_none() {
+            return;
+        }
+        for lane_idx in 0..self.capacity {
+            let state = Rc::new(RefCell::new(TxLaneState {
+                job: None,
+                worker_waker: None,
+                completion: None,
+                shutdown: false,
+            }));
+            let completed_lanes = Rc::clone(&self.completed_lanes);
+            let owner_waker = Rc::clone(&self.owner_waker);
+            let worker_state = Rc::clone(&state);
+            let handle = spawn(async move {
+                tx_lane_worker(worker_state, completed_lanes, owner_waker, lane_idx).await;
+            });
+            self.lanes.push(TxLane { state, handle });
+        }
+    }
+
+    #[must_use]
+    pub fn in_flight(&self) -> usize {
+        self.in_flight_count
+    }
+
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    #[must_use]
+    pub fn has_fault(&self) -> bool {
+        self.fault.is_some()
+    }
+
+    #[must_use]
+    pub fn fault(&self) -> Option<&OwnerFault> {
+        self.fault.as_ref()
+    }
+
+    pub fn check_worker_faults(&mut self) {
+        if self.fault.is_some() || self.shutdown {
+            return;
+        }
+        for (idx, lane) in self.lanes.iter().enumerate() {
+            if lane.handle.is_finished() {
+                self.fault = Some(OwnerFault::WorkerPanicked { lane: idx });
+                break;
+            }
+        }
+    }
+
+    pub fn reserve_lane(&mut self) -> Option<usize> {
+        self.ensure_started();
+        if self.fault.is_some() || self.shutdown {
+            return None;
+        }
+        self.check_worker_faults();
+        if self.fault.is_some() {
+            return None;
+        }
+        let lane_idx = self.idle_lanes.pop()?;
+        self.in_flight_count += 1;
+        Some(lane_idx)
+    }
+
+    pub fn release_reserved_lane(&mut self, lane_idx: usize) {
+        self.idle_lanes.push(lane_idx);
+        self.in_flight_count = self.in_flight_count.saturating_sub(1);
+    }
+
+    pub(crate) fn submit_job(
+        &mut self,
+        lane_idx: usize,
+        sock: Rc<compio::net::UdpSocket>,
+        buf: Vec<u8>,
+        peer: SocketAddr,
+        meta: InFlightMeta,
+    ) {
+        let lane = &self.lanes[lane_idx];
+        let mut s = lane.state.borrow_mut();
+        s.job = Some(TxJob {
+            sock,
+            buf,
+            peer,
+            meta,
+        });
+        if let Some(w) = s.worker_waker.take() {
+            w.wake();
+        }
+    }
+
+    pub(crate) fn poll_completions<F>(
+        &mut self,
+        cx: Option<&mut Context<'_>>,
+        max_completions: usize,
+        mut on_completion: F,
+    ) -> usize
+    where
+        F: FnMut(InFlightMeta, io::Result<usize>, Vec<u8>),
+    {
+        self.ensure_started();
+        self.check_worker_faults();
+        let mut reaped = 0;
+        while reaped < max_completions {
+            let Some(lane_idx) = self.completed_lanes.borrow_mut().pop_front() else {
+                break;
+            };
+            let completion = self.lanes[lane_idx]
+                .state
+                .borrow_mut()
+                .completion
+                .take()
+                .expect("completion present when indexed");
+            on_completion(completion.meta, completion.res, completion.buf);
+            self.idle_lanes.push(lane_idx);
+            self.in_flight_count = self.in_flight_count.saturating_sub(1);
+            reaped += 1;
+        }
+        if let Some(cx) = cx
+            && self.in_flight_count > 0
+        {
+            *self.owner_waker.borrow_mut() = Some(cx.waker().clone());
+        }
+        reaped
+    }
+
+    pub fn shutdown(&mut self, tx_pool: &mut TxPool) {
+        if self.shutdown {
+            return;
+        }
+        self.shutdown = true;
+        self.fault = Some(OwnerFault::Shutdown);
+        for lane in &self.lanes {
+            let mut s = lane.state.borrow_mut();
+            s.shutdown = true;
+            if let Some(w) = s.worker_waker.take() {
+                w.wake();
+            }
+            if let Some(job) = s.job.take() {
+                tx_pool.return_slot(job.buf);
+                self.in_flight_count = self.in_flight_count.saturating_sub(1);
+            }
+            if let Some(completion) = s.completion.take() {
+                tx_pool.return_slot(completion.buf);
+                self.in_flight_count = self.in_flight_count.saturating_sub(1);
+            }
+        }
+        self.completed_lanes.borrow_mut().clear();
+        self.idle_lanes.clear();
+        for i in 0..self.capacity {
+            self.idle_lanes.push(i);
+        }
+        self.in_flight_count = 0;
+    }
+}
 
 struct OwnerTxSink<'a> {
     sock: &'a Rc<compio::net::UdpSocket>,
     tx_pool: &'a mut TxPool,
-    tx_in_flight: &'a mut FuturesUnordered<InFlightSend>,
-    tx_capacity: usize,
+    tx_engine: &'a mut TxEngine,
 }
 
 impl DatagramSink for OwnerTxSink<'_> {
@@ -513,46 +799,52 @@ impl DatagramSink for OwnerTxSink<'_> {
     where
         F: FnOnce(&mut [u8]) -> Result<usize, srt_proto::Error>,
     {
-        if self.tx_in_flight.len() >= self.tx_capacity {
-            return Ok(PushResult::Exhausted);
+        if wire_len > self.tx_pool.slot_size() {
+            return Err(srt_proto::Error::with_reason(
+                srt_proto::ErrorKind::InvalidData,
+                format!(
+                    "datagram wire_len {} exceeds TxPool slot ceiling {}",
+                    wire_len,
+                    self.tx_pool.slot_size()
+                ),
+            ));
         }
-        let Some(mut buf) = self.tx_pool.alloc_slot() else {
+        if self.tx_engine.has_fault() {
+            return Err(srt_proto::Error::with_reason(
+                srt_proto::ErrorKind::InvalidState,
+                "owner TX engine in fault state",
+            ));
+        }
+        let Some(lane_idx) = self.tx_engine.reserve_lane() else {
             return Ok(PushResult::Exhausted);
         };
-        if buf.len() < wire_len {
-            buf.resize(wire_len, 0);
-        }
+        let Some(mut buf) = self.tx_pool.alloc_slot() else {
+            self.tx_engine.release_reserved_lane(lane_idx);
+            return Ok(PushResult::Exhausted);
+        };
+        buf.resize(wire_len, 0);
         let len = match fill(&mut buf[..wire_len]) {
             Ok(len) => len,
             Err(error) => {
                 self.tx_pool.return_slot(buf);
+                self.tx_engine.release_reserved_lane(lane_idx);
                 return Err(error);
             }
         };
         if len != wire_len {
             self.tx_pool.return_slot(buf);
+            self.tx_engine.release_reserved_lane(lane_idx);
             return Err(srt_proto::Error::with_reason(
                 srt_proto::ErrorKind::InvalidData,
                 "owner sink fill must materialize exactly the advertised wire length",
             ));
         }
-        let sock = self.sock.clone();
         let meta = InFlightMeta {
             peer,
             expected_len: len,
         };
-        // Allocation note: `Box::pin` here allocates in the `srt-transport`
-        // orchestration layer to track concurrent in-flight sends inside
-        // `FuturesUnordered`. The underlying protocol dataplane (`srt-proto`
-        // `poll_output_into`) contributes zero heap allocations; global
-        // allocator measurements reflect this transport future boxing plus
-        // Compio's runtime driver state, not protocol packetization.
-        self.tx_in_flight.push(Box::pin(async move {
-            let BufResult(res, mut b) = sock.send_to(buf, peer).await;
-            b.clear();
-            (meta, res, b)
-        }));
-
+        self.tx_engine
+            .submit_job(lane_idx, self.sock.clone(), buf, peer, meta);
         Ok(PushResult::Pushed { len })
     }
 }
@@ -654,9 +946,10 @@ pub struct Owner {
     listener: Option<ListenerSide>,
     caller: Option<OwnerCallerSide>,
     tx_pool: TxPool,
-    tx_in_flight: FuturesUnordered<InFlightSend>,
-    tx_capacity: usize,
+    tx_engine: TxEngine,
     completions: OwnerTxCompletionStats,
+    wire_ceiling: usize,
+    sessions_started: bool,
     rx_priority_listener_first: bool,
     tx_priority_listener_first: bool,
     caller_pool_policy: Option<(std::num::NonZeroUsize, std::time::Duration)>,
@@ -664,59 +957,111 @@ pub struct Owner {
 }
 
 impl Owner {
-    fn handle_tx_completion(&mut self, meta: InFlightMeta, res: io::Result<usize>, buf: Vec<u8>) {
-        self.tx_pool.return_slot(buf);
-        match res {
-            Ok(sent) if sent == meta.expected_len => {
-                self.completions.completed_ok += 1;
-            }
-            Ok(_) => {
-                self.completions.short_sends += 1;
-            }
-            Err(_) => {
-                self.completions.failed_sends += 1;
-            }
-        }
-    }
-
-    /// Create a new Owner with bounded concurrent TX capacity.
+    /// Create a new Owner with bounded concurrent TX capacity using the default MTU (1500) wire ceiling.
     #[must_use]
     pub fn new(tx_capacity: usize) -> Self {
+        Self::new_with_ceiling(tx_capacity, DEFAULT_TX_SLOT_SIZE)
+    }
+
+    /// Create a new Owner with bounded concurrent TX capacity and an explicit wire ceiling.
+    #[must_use]
+    pub fn new_with_ceiling(tx_capacity: usize, wire_ceiling: usize) -> Self {
         let capacity = tx_capacity.max(1);
+        let wire_ceiling = wire_ceiling.max(1);
         Self {
             listener: None,
             caller: None,
-            tx_pool: TxPool::new(capacity, DEFAULT_TX_SLOT_SIZE),
-            tx_in_flight: FuturesUnordered::new(),
-            tx_capacity: capacity,
+            tx_pool: TxPool::new(capacity, wire_ceiling),
+            tx_engine: TxEngine::new(capacity),
             completions: OwnerTxCompletionStats::default(),
+            wire_ceiling,
+            sessions_started: false,
             rx_priority_listener_first: true,
             tx_priority_listener_first: true,
             caller_pool_policy: None,
             socket_memory_budget: None,
         }
     }
-    fn poll_tx_activity(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
-        if self.tx_in_flight.is_empty() {
-            return std::task::Poll::Pending;
+
+    /// Current wire ceiling in bytes.
+    #[must_use]
+    pub fn wire_ceiling(&self) -> usize {
+        self.wire_ceiling
+    }
+
+    /// Set or change the wire ceiling before any sessions start.
+    ///
+    /// Fails with an error if called after sessions have started (via `listen`,
+    /// `connect`, `with_listener`, or `with_caller`).
+    pub fn set_wire_ceiling(
+        &mut self,
+        wire_ceiling: usize,
+    ) -> Result<(), crate::RuntimeBuildError> {
+        if self.sessions_started {
+            return Err(crate::RuntimeBuildError::from(crate::ConfigError::new(
+                "wire_ceiling",
+                "cannot change wire ceiling after sessions have started",
+            )));
         }
-        match self.tx_in_flight.poll_next_unpin(cx) {
-            std::task::Poll::Ready(Some((meta, res, buf))) => {
-                self.handle_tx_completion(meta, res, buf);
-                std::task::Poll::Ready(())
-            }
-            _ => std::task::Poll::Pending,
+        let wire_ceiling = wire_ceiling.max(1);
+        self.wire_ceiling = wire_ceiling;
+        self.tx_pool = TxPool::new(self.tx_engine.capacity(), wire_ceiling);
+        Ok(())
+    }
+
+    /// Typed fault state if any worker has failed or owner has been shut down.
+    #[must_use]
+    pub fn fault(&self) -> Option<&OwnerFault> {
+        self.tx_engine.fault()
+    }
+
+    /// Explicit shutdown: stops new admissions, drains jobs, joins workers,
+    /// and returns all buffers to the pool.
+    pub fn shutdown(&mut self) {
+        self.tx_engine.shutdown(&mut self.tx_pool);
+    }
+
+    fn poll_tx_activity(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if self.tx_engine.in_flight() == 0 {
+            return Poll::Pending;
+        }
+        let completions = &mut self.completions;
+        let tx_pool = &mut self.tx_pool;
+        let reaped = self
+            .tx_engine
+            .poll_completions(Some(cx), 1, |meta, res, buf| {
+                tx_pool.return_slot(buf);
+                match res {
+                    Ok(sent) if sent == meta.expected_len => {
+                        completions.completed_ok += 1;
+                    }
+                    Ok(_) => {
+                        completions.short_sends += 1;
+                        completions.last_failed_peer = Some(meta.peer);
+                    }
+                    Err(_) => {
+                        completions.failed_sends += 1;
+                        completions.last_failed_peer = Some(meta.peer);
+                    }
+                }
+            });
+        if reaped > 0 {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
         }
     }
 
     /// Attach a listener side.
     pub fn with_listener(mut self, listener: ListenerSide) -> Self {
+        self.sessions_started = true;
         self.listener = Some(listener);
         self
     }
 
     /// Attach a caller side built around a [`crate::CallerPool`].
     pub fn with_caller(mut self, caller: OwnerCallerSide) -> Self {
+        self.sessions_started = true;
         self.caller = Some(caller);
         self
     }
@@ -780,6 +1125,7 @@ impl Owner {
         }
         let mut sockets = prepared.bind_sockets()?;
         let sock = compio::net::UdpSocket::from_std(sockets.remove(0))?;
+        self.sessions_started = true;
         self.listener = Some(ListenerSide::from_prepared(sock, prepared)?);
         Ok(())
     }
@@ -794,6 +1140,25 @@ impl Owner {
         now: Timestamp,
     ) -> Result<crate::PoolOutcome, crate::RuntimeBuildError> {
         let mut prepared = config.prepare(crate::RuntimeFlavor::Compio)?;
+        if self.tx_engine.has_fault() {
+            return Err(crate::RuntimeBuildError::from(crate::ConfigError::new(
+                "caller.connect",
+                "owner TX engine in fault state",
+            )));
+        }
+        let payload_size = prepared.session.payload_size.resolve()?.get();
+        let has_encryption = prepared.session.encryption().is_some();
+        let req_ceiling = required_session_wire_ceiling(payload_size, has_encryption);
+        if req_ceiling > self.wire_ceiling {
+            return Err(crate::RuntimeBuildError::from(crate::ConfigError::new(
+                "caller.connect",
+                format!(
+                    "session required wire ceiling {req_ceiling} exceeds owner wire ceiling {}",
+                    self.wire_ceiling
+                ),
+            )));
+        }
+        self.sessions_started = true;
         if let Some((max_in_flight, attempt_deadline)) = self.caller_pool_policy {
             prepared.connect.max_in_flight = max_in_flight;
             prepared.connect.attempt_deadline = attempt_deadline;
@@ -909,7 +1274,7 @@ impl Owner {
         &mut self,
         id: crate::LogicalCallerId,
     ) -> Option<crate::RemovedLogicalCaller> {
-        self.caller.as_mut()?.pool.table_mut().remove(id)
+        self.caller.as_mut()?.pool.remove(id)
     }
 
     /// Borrow one logical caller without exposing the pool itself.
@@ -975,9 +1340,8 @@ impl Owner {
 
     #[must_use]
     pub fn tx_in_flight(&self) -> usize {
-        self.tx_in_flight.len()
+        self.tx_engine.in_flight()
     }
-
     /// Delay until the next due timer across all sessions.
     pub fn time_until_next_deadline(&mut self, now: Timestamp, default_us: u64) -> u64 {
         let l_us = self.listener.as_mut().map_or(default_us, |l| {
@@ -1005,18 +1369,26 @@ impl Owner {
         let prev_failed = self.completions.failed_sends;
 
         // 1. Reap only already-ready completions, never waiting.
-        while report.completions_reaped < budget.max_completions && !self.tx_in_flight.is_empty() {
-            use futures_util::FutureExt;
-            let poll_res =
-                std::future::poll_fn(|cx| self.tx_in_flight.poll_next_unpin(cx)).now_or_never();
-            match poll_res {
-                Some(Some((meta, res, buf))) => {
-                    self.handle_tx_completion(meta, res, buf);
-                    report.completions_reaped += 1;
-                }
-                _ => break,
-            }
-        }
+        let completions = &mut self.completions;
+        let tx_pool = &mut self.tx_pool;
+        report.completions_reaped +=
+            self.tx_engine
+                .poll_completions(None, budget.max_completions, |meta, res, buf| {
+                    tx_pool.return_slot(buf);
+                    match res {
+                        Ok(sent) if sent == meta.expected_len => {
+                            completions.completed_ok += 1;
+                        }
+                        Ok(_) => {
+                            completions.short_sends += 1;
+                            completions.last_failed_peer = Some(meta.peer);
+                        }
+                        Err(_) => {
+                            completions.failed_sends += 1;
+                            completions.last_failed_peer = Some(meta.peer);
+                        }
+                    }
+                });
 
         // 2. Service incoming RX up to max_rx_packets / max_rx_bytes
         self.service_rx(now, &budget, &mut report).await;
@@ -1024,7 +1396,7 @@ impl Owner {
         // 3. Service outbound TX up to max_tx_packets / max_tx_bytes / max_actions
         self.service_tx(now, &budget, &mut report);
 
-        report.tx_in_flight = self.tx_in_flight.len();
+        report.tx_in_flight = self.tx_engine.in_flight();
         report.tx_pool_free = self.tx_pool.free_count();
         report.next_deadline_us = Some(self.time_until_next_deadline(now, 100_000));
         report.tx_completed_ok = self.completions.completed_ok.saturating_sub(prev_ok);
@@ -1265,8 +1637,7 @@ impl Owner {
             let mut sink = OwnerTxSink {
                 sock: &listener.sock,
                 tx_pool: &mut self.tx_pool,
-                tx_in_flight: &mut self.tx_in_flight,
-                tx_capacity: self.tx_capacity,
+                tx_engine: &mut self.tx_engine,
             };
             let drain_report = listener
                 .table
@@ -1294,8 +1665,7 @@ impl Owner {
             let mut sink = OwnerTxSink {
                 sock: &caller.sock,
                 tx_pool: &mut self.tx_pool,
-                tx_in_flight: &mut self.tx_in_flight,
-                tx_capacity: self.tx_capacity,
+                tx_engine: &mut self.tx_engine,
             };
             let drain_report = caller
                 .pool
@@ -1968,8 +2338,7 @@ mod tests {
                 let mut sink = OwnerTxSink {
                     sock: &caller.sock,
                     tx_pool: &mut owner.tx_pool,
-                    tx_in_flight: &mut owner.tx_in_flight,
-                    tx_capacity: owner.tx_capacity,
+                    tx_engine: &mut owner.tx_engine,
                 };
                 let res = sink.push_datagram(l_addr, 10, |buf| {
                     buf[..10].copy_from_slice(b"0123456789");
@@ -1979,7 +2348,7 @@ mod tests {
             }
 
             // Slot allocated: 1 in flight, free count is 15
-            assert_eq!(owner.tx_in_flight.len(), 1);
+            assert_eq!(owner.tx_in_flight(), 1);
             assert_eq!(owner.tx_pool().free_count(), 15);
 
             // Calling wait_for_activity must reap the completion, return the
@@ -2134,8 +2503,7 @@ mod tests {
                 let mut sink = OwnerTxSink {
                     sock: &caller.sock,
                     tx_pool: &mut owner.tx_pool,
-                    tx_in_flight: &mut owner.tx_in_flight,
-                    tx_capacity: owner.tx_capacity,
+                    tx_engine: &mut owner.tx_engine,
                 };
                 let _ = sink.push_datagram(peer, 8, |buf| {
                     buf[..8].copy_from_slice(b"12345678");
@@ -2163,5 +2531,285 @@ mod tests {
         assert!(info.is_io_uring);
         assert_eq!(info.driver_type, "IoUring");
         assert!(!info.kernel_version.is_empty());
+    }
+
+    #[test]
+    fn compio_remove_caller_releases_permit_to_queued_caller() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            let mut owner = Owner::new(16);
+            owner
+                .set_caller_pool_policy(
+                    std::num::NonZeroUsize::new(1).unwrap(),
+                    std::time::Duration::from_secs(10),
+                )
+                .expect("policy set");
+
+            let remote_a: SocketAddr = "127.0.0.1:19001".parse().unwrap();
+            let remote_b: SocketAddr = "127.0.0.1:19002".parse().unwrap();
+            let cfg_a = crate::CallerConfig::builder(remote_a)
+                .ownership(crate::SocketOwnership::Shared)
+                .build()
+                .expect("config a");
+            let cfg_b = crate::CallerConfig::builder(remote_b)
+                .ownership(crate::SocketOwnership::Shared)
+                .build()
+                .expect("config b");
+
+            let now = Timestamp::from_micros(1_000);
+            let outcome_a = owner.connect(&cfg_a, now).expect("connect a");
+            let id_a = match outcome_a {
+                crate::PoolOutcome::Admitted(id) => id,
+                other => panic!("expected caller A to be admitted, got {other:?}"),
+            };
+
+            // Second caller must be queued because max_in_flight == 1
+            let outcome_b = owner.connect(&cfg_b, now).expect("connect b");
+            assert!(
+                matches!(outcome_b, crate::PoolOutcome::Queued { .. }),
+                "expected caller B to be queued, got {outcome_b:?}"
+            );
+
+            let stats = owner.caller_pool_stats().unwrap();
+            assert_eq!(stats.in_flight, 1);
+            assert_eq!(stats.queued, 1);
+
+            // Removing caller A through Owner::remove_caller must release the permit from CallerPool!
+            let removed = owner.remove_caller(id_a);
+            assert!(removed.is_some(), "caller A removed");
+
+            let stats = owner.caller_pool_stats().unwrap();
+            assert_eq!(
+                stats.in_flight, 0,
+                "removing A must decrease in_flight in CallerPool"
+            );
+
+            // Service the caller side: now permit is available, caller B can be admitted
+            let budget = OwnerServiceBudget::default();
+            let _ = owner.service(Timestamp::from_micros(2_000), budget).await;
+
+            let mut pool_events = Vec::new();
+            owner.poll_caller_pool_events(&mut pool_events);
+            let b_admitted = pool_events
+                .iter()
+                .any(|ev| matches!(ev, crate::PoolEvent::Admitted { .. }));
+            assert!(
+                b_admitted,
+                "caller B must be admitted once caller A permit is released"
+            );
+        });
+    }
+
+    #[test]
+    fn wire_ceiling_exact_succeeds_and_plus_one_rejected() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            let c_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+            let c_sock = compio::net::UdpSocket::from_std(c_std).expect("adopt");
+            let caller_side = CallerSide::new_single(c_sock);
+
+            // Ceiling of 100 bytes
+            let mut owner = Owner::new_with_ceiling(4, 100).with_caller(caller_side);
+            assert_eq!(owner.wire_ceiling(), 100);
+            assert_eq!(owner.tx_pool().slot_size(), 100);
+
+            let peer: SocketAddr = "127.0.0.1:19999".parse().unwrap();
+            // 1. Exact ceiling (100 bytes) must succeed
+            {
+                let caller = owner.caller.as_ref().unwrap();
+                let mut sink = OwnerTxSink {
+                    sock: &caller.sock,
+                    tx_pool: &mut owner.tx_pool,
+                    tx_engine: &mut owner.tx_engine,
+                };
+                let res = sink.push_datagram(peer, 100, |buf| {
+                    buf[..100].fill(0xAA);
+                    Ok(100)
+                });
+                assert!(matches!(res, Ok(PushResult::Pushed { len: 100 })));
+            }
+
+            // 2. Ceiling + 1 (101 bytes) must be rejected before send / slot allocation
+            {
+                let caller = owner.caller.as_ref().unwrap();
+                let mut sink = OwnerTxSink {
+                    sock: &caller.sock,
+                    tx_pool: &mut owner.tx_pool,
+                    tx_engine: &mut owner.tx_engine,
+                };
+                let res = sink.push_datagram(peer, 101, |buf| {
+                    buf[..101].fill(0xBB);
+                    Ok(101)
+                });
+                assert!(
+                    res.is_err(),
+                    "101 bytes must be rejected when ceiling is 100"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn owner_rejects_session_with_incompatible_wire_ceiling() {
+        let mut owner = Owner::new_with_ceiling(4, 1500);
+
+        // Config with large payload (2000 bytes) + GCM (16 bytes tag) = 2032 bytes > 1500
+        let remote: SocketAddr = "127.0.0.1:19000".parse().unwrap();
+        let large_cfg = crate::CallerConfig::builder(remote)
+            .ownership(crate::SocketOwnership::Shared)
+            .configure_session(|s| {
+                s.payload_size =
+                    crate::PayloadSize::Exact(std::num::NonZeroUsize::new(2000).unwrap());
+                s.set_encryption(Some(crate::EncryptionConfig::new("production-secret-123")));
+            })
+            .build()
+            .expect("config builds");
+
+        let res = owner.connect(&large_cfg, Timestamp::from_micros(0));
+        assert!(
+            res.is_err(),
+            "owner with ceiling 1500 must reject session requiring 2032 bytes"
+        );
+        let err = res.unwrap_err().to_string();
+        assert!(
+            err.contains("exceeds owner wire ceiling"),
+            "error message: {err}"
+        );
+    }
+
+    #[test]
+    fn wire_ceiling_freeze_after_session_started() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            let mut owner = Owner::new(4);
+            // Changing ceiling before sessions started succeeds
+            assert!(owner.set_wire_ceiling(2048).is_ok());
+            assert_eq!(owner.wire_ceiling(), 2048);
+            assert_eq!(owner.tx_pool().slot_size(), 2048);
+
+            // Start a session
+            let remote: SocketAddr = "127.0.0.1:19000".parse().unwrap();
+            let cfg = crate::CallerConfig::builder(remote)
+                .ownership(crate::SocketOwnership::Shared)
+                .build()
+                .expect("config");
+            let _ = owner.connect(&cfg, Timestamp::from_micros(0));
+
+            // Changing ceiling after session started must be rejected
+            let res = owner.set_wire_ceiling(4096);
+            assert!(
+                res.is_err(),
+                "cannot change wire ceiling after sessions started"
+            );
+        });
+    }
+
+    #[test]
+    fn slot_conservation_across_success_error_and_shutdown() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            let c_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+            let c_sock = compio::net::UdpSocket::from_std(c_std).expect("adopt");
+            let caller_side = CallerSide::new_single(c_sock);
+
+            let mut owner = Owner::new(4).with_caller(caller_side);
+            assert_eq!(owner.tx_pool().free_count(), 4);
+            assert_eq!(owner.tx_pool().capacity(), 4);
+
+            let peer: SocketAddr = "127.0.0.1:19999".parse().unwrap();
+
+            // 1. Fill error: slot and lane must be returned immediately
+            {
+                let caller = owner.caller.as_ref().unwrap();
+                let mut sink = OwnerTxSink {
+                    sock: &caller.sock,
+                    tx_pool: &mut owner.tx_pool,
+                    tx_engine: &mut owner.tx_engine,
+                };
+                let res = sink.push_datagram(peer, 20, |_buf| {
+                    Err(srt_proto::Error::with_reason(
+                        srt_proto::ErrorKind::InvalidData,
+                        "simulated fill failure",
+                    ))
+                });
+                assert!(res.is_err());
+            }
+            assert_eq!(
+                owner.tx_pool().free_count(),
+                4,
+                "fill error must restore free_count to 4"
+            );
+            assert_eq!(owner.tx_in_flight(), 0);
+
+            // 2. Materialization length mismatch: slot and lane must be returned
+            {
+                let caller = owner.caller.as_ref().unwrap();
+                let mut sink = OwnerTxSink {
+                    sock: &caller.sock,
+                    tx_pool: &mut owner.tx_pool,
+                    tx_engine: &mut owner.tx_engine,
+                };
+                let res = sink.push_datagram(peer, 20, |_buf| {
+                    Ok(10) // advertised 20, returned 10
+                });
+                assert!(res.is_err());
+            }
+            assert_eq!(
+                owner.tx_pool().free_count(),
+                4,
+                "length mismatch must restore free_count to 4"
+            );
+            assert_eq!(owner.tx_in_flight(), 0);
+
+            // 3. Successful send + reap: returns slot
+            {
+                let caller = owner.caller.as_ref().unwrap();
+                let mut sink = OwnerTxSink {
+                    sock: &caller.sock,
+                    tx_pool: &mut owner.tx_pool,
+                    tx_engine: &mut owner.tx_engine,
+                };
+                let res = sink.push_datagram(peer, 20, |buf| {
+                    buf[..20].fill(0x55);
+                    Ok(20)
+                });
+                assert!(res.is_ok());
+            }
+            assert_eq!(owner.tx_pool().free_count(), 3);
+            assert_eq!(owner.tx_in_flight(), 1);
+
+            owner
+                .wait_for_activity(std::time::Duration::from_millis(500))
+                .await;
+            assert_eq!(
+                owner.tx_pool().free_count(),
+                4,
+                "reaped completion must restore free_count to 4"
+            );
+            assert_eq!(owner.tx_in_flight(), 0);
+
+            // 4. Shutdown with send in flight returns all slots
+            {
+                let caller = owner.caller.as_ref().unwrap();
+                let mut sink = OwnerTxSink {
+                    sock: &caller.sock,
+                    tx_pool: &mut owner.tx_pool,
+                    tx_engine: &mut owner.tx_engine,
+                };
+                let _ = sink.push_datagram(peer, 20, |buf| {
+                    buf[..20].fill(0x66);
+                    Ok(20)
+                });
+            }
+            assert_eq!(owner.tx_pool().free_count(), 3);
+            owner.shutdown();
+            assert_eq!(
+                owner.tx_pool().free_count(),
+                4,
+                "shutdown must return all slots to tx_pool"
+            );
+            assert_eq!(owner.tx_in_flight(), 0);
+            assert!(owner.fault().is_some(), "shutdown sets fault");
+        });
     }
 }
