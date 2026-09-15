@@ -358,11 +358,9 @@ pub(crate) fn destined_send_limit(
     budget: OutputDrainBudget,
 ) -> usize {
     let mut limit = packets.len().min(budget.max_actions);
-    if budget.max_packets != 0 {
-        limit = limit.min(budget.max_packets);
-    }
+    limit = limit.min(budget.max_packets);
     if budget.max_bytes == 0 {
-        return limit;
+        return 0;
     }
     let mut bytes = 0usize;
     let mut count = 0usize;
@@ -557,12 +555,18 @@ mod tests {
             1
         );
         assert_eq!(
-            destined_send_limit(&packets, OutputDrainBudget::new(0, 2, 5)),
+            destined_send_limit(&packets, OutputDrainBudget::new(2, 0, 5)),
+            0
+        );
+        assert_eq!(
+            destined_send_limit(&packets, OutputDrainBudget::new(2, 2, 0)),
             0
         );
         let mut remaining = OutputDrainBudget::new(4, 1, 8);
         remaining.consume(0, 1, 4);
-        assert_eq!(remaining.max_actions, 0);
+        assert_eq!(remaining.max_actions, 4);
+        assert_eq!(remaining.max_packets, 0);
+        assert_eq!(remaining.max_bytes, 4);
     }
 
     fn ids(packets: &[(SocketAddr, Vec<u8>)]) -> Vec<u8> {

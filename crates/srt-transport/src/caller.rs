@@ -1166,8 +1166,8 @@ impl CallerTable {
         if blocked_on_next_item
             || !self.ready_queue.is_empty()
             || report.actions >= budget.max_actions
-            || (budget.max_packets > 0 && report.packets >= budget.max_packets)
-            || (budget.max_bytes > 0 && report.bytes >= budget.max_bytes)
+            || report.packets >= budget.max_packets
+            || report.bytes >= budget.max_bytes
         {
             report.status = OutputDrainStatus::BudgetExhausted;
         }
@@ -1542,8 +1542,7 @@ fn drain_caller_legacy_output<S: DatagramSink + ?Sized>(
     match output {
         ConnectionOutput::SendPacket(packet) => {
             let wire_len = packet.len();
-            let exceeds_packets =
-                sink.budget.max_packets > 0 && sink.report.packets >= sink.budget.max_packets;
+            let exceeds_packets = sink.report.packets >= sink.budget.max_packets;
             let exceeds_bytes = sink.budget.max_bytes > 0
                 && sink.report.bytes.saturating_add(wire_len) > sink.budget.max_bytes;
             if exceeds_packets || exceeds_bytes {
@@ -1587,8 +1586,7 @@ fn drain_caller_direct_meta<S: DatagramSink + ?Sized>(
 ) -> (DrainOne, bool) {
     match meta {
         OutputMeta::Datagram { wire_len } => {
-            let exceeds_packets =
-                sink.budget.max_packets > 0 && sink.report.packets >= sink.budget.max_packets;
+            let exceeds_packets = sink.report.packets >= sink.budget.max_packets;
             let exceeds_bytes = sink.budget.max_bytes > 0
                 && sink.report.bytes.saturating_add(wire_len) > sink.budget.max_bytes;
             if exceeds_packets || exceeds_bytes {
@@ -1678,17 +1676,16 @@ pub(crate) fn collect_output_work(
     pending: &mut VecDeque<ConnectionOutput>,
     budget: OutputDrainBudget,
 ) -> (VecDeque<ConnectionOutput>, bool) {
-    // A composed owner budget can legitimately reach zero after an earlier
-    // phase consumed the shared action allowance. Do not turn that exhausted
-    // state into one extra output action; packet/byte zero retain their
-    // historical "unlimited" meaning for standalone callers, while the
-    // action counter is the hard work bound.
+    // `max_actions == 0` performs no work. A composed owner budget can
+    // legitimately reach zero after an earlier phase consumed the shared
+    // allowance, and that must stop the follow-up phase rather than reopening
+    // it as unlimited.
     if budget.max_actions == 0 {
         return (VecDeque::new(), true);
     }
     let max_actions = budget.max_actions;
-    let max_packets = budget.max_packets.max(1);
-    let max_bytes = budget.max_bytes.max(1);
+    let max_packets = budget.max_packets;
+    let max_bytes = budget.max_bytes;
     let mut work = VecDeque::new();
     let mut packets = 0usize;
     let mut bytes = 0usize;
@@ -1699,7 +1696,7 @@ pub(crate) fn collect_output_work(
         };
         if let ConnectionOutput::SendPacket(packet) = &output {
             let exceeds_packet_cap = packets >= max_packets;
-            let exceeds_byte_cap = packets > 0 && bytes.saturating_add(packet.len()) > max_bytes;
+            let exceeds_byte_cap = bytes.saturating_add(packet.len()) > max_bytes;
             if exceeds_packet_cap || exceeds_byte_cap {
                 pending.push_front(output);
                 return (work, true);

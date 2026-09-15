@@ -316,6 +316,10 @@ pub(crate) use group_conn::{GroupLogicalCounters, group_connection_stats};
 /// The bounds are deliberately expressed in actions, packets, and bytes:
 /// timer churn cannot bypass the action cap, while a burst of large UDP
 /// datagrams cannot monopolize a readiness-loop iteration.
+///
+/// Zero means zero work, never unlimited: a budget constructed with any
+/// zero field performs no output work on that axis. `usize::MAX` is the
+/// way to express an effectively unlimited axis.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OutputDrainBudget {
     pub max_actions: usize,
@@ -346,21 +350,8 @@ impl OutputDrainBudget {
     #[cfg(any(feature = "mio", feature = "tokio"))]
     pub(crate) fn consume(&mut self, actions: usize, packets: usize, bytes: usize) {
         self.max_actions = self.max_actions.saturating_sub(actions);
-        let packets_exhausted = self.max_packets != 0 && packets >= self.max_packets;
-        if self.max_packets != 0 {
-            self.max_packets = self.max_packets.saturating_sub(packets);
-        }
-        let bytes_exhausted = self.max_bytes != 0 && bytes >= self.max_bytes;
-        if self.max_bytes != 0 {
-            self.max_bytes = self.max_bytes.saturating_sub(bytes);
-        }
-        // The lower-level table helpers historically use zero packet/byte
-        // limits as "unlimited". Mark a finite packet/byte exhaustion by
-        // also closing the action allowance so it cannot be misread as an
-        // unlimited follow-up phase.
-        if packets_exhausted || bytes_exhausted {
-            self.max_actions = 0;
-        }
+        self.max_packets = self.max_packets.saturating_sub(packets);
+        self.max_bytes = self.max_bytes.saturating_sub(bytes);
     }
 }
 
