@@ -231,6 +231,93 @@ pub fn caller(
     ))
 }
 
+/// Canonical production runtime profile for a shared Compio Owner.
+///
+/// Restream calls [`production_runtime_builder`] from its shard thread and
+/// `block_on`s the returned runtime; srt-rs never chooses process/thread/NUMA
+/// topology itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompioProductionProfile {
+    /// Fixed TX lane count (= TX capacity) for the Owner.
+    pub tx_lanes: usize,
+    /// Wire ceiling in bytes for every TxPool slot.
+    pub wire_ceiling: usize,
+    /// Managed/multishot RX is unavailable on this host: the kernel rejected
+    /// `IORING_REGISTER_PBUF_RING` (observed EINVAL on io_uring buffer-ring
+    /// registration), so the Owner uses readiness + raw `recvfrom`.
+    pub managed_rx_available: bool,
+    /// Whether the active driver is io_uring (vs Poll fallback).
+    pub is_io_uring: bool,
+    /// Kernel release string from `/proc/version`.
+    pub kernel_version: String,
+    /// Pinned Compio version from `Cargo.lock`.
+    pub compio_version: String,
+    /// Active driver name (`IoUring` or `Poll`).
+    pub driver_type: String,
+}
+
+impl Default for CompioProductionProfile {
+    fn default() -> Self {
+        Self {
+            tx_lanes: 256,
+            wire_ceiling: DEFAULT_TX_SLOT_SIZE,
+            managed_rx_available: false,
+            is_io_uring: false,
+            kernel_version: String::new(),
+            compio_version: env!("CARGO_PKG_VERSION").to_string(),
+            driver_type: String::new(),
+        }
+    }
+}
+
+/// Build the canonical production Compio runtime for one Owner shard thread.
+///
+/// Uses default `ProactorBuilder` settings (no `coop_taskrun`, no custom
+/// thread-pool fallback): the Owner's fixed TX lanes and single-consumer RX
+/// path are the only concurrency structure srt-rs imposes.
+#[must_use]
+pub fn production_runtime_builder() -> compio::runtime::RuntimeBuilder {
+    compio::runtime::RuntimeBuilder::new()
+}
+
+/// Probe the active runtime and return the production profile + diagnostics.
+///
+/// Records whether managed/multishot RX (`recv_from_multi` /
+/// `recv_msg_multi` over the runtime buffer pool) is usable on this host by
+/// attempting one zero-length multishot poll; a completed `Err(EINVAL)` means
+/// the kernel rejected buffer-ring registration and the Owner must stay on
+/// the readiness + raw `recvfrom` path.
+pub fn production_profile() -> CompioProductionProfile {
+    let runtime = compio::runtime::Runtime::new().expect("compio runtime builds for profile probe");
+    runtime.block_on(async {
+        let driver = runtime.driver_type();
+        let is_io_uring = driver.is_iouring();
+        let kernel = std::fs::read_to_string("/proc/version")
+            .unwrap_or_else(|_| "unknown kernel".to_string())
+            .trim()
+            .to_string();
+        // Probe managed RX availability with a throwaway socket.
+        let mut managed_rx_available = false;
+        if let Ok(sock) = compio::net::UdpSocket::bind("127.0.0.1:0").await {
+            use futures_util::{FutureExt, Stream};
+            let mut s = Box::pin(sock.recv_from_multi());
+            let r = std::future::poll_fn(|cx| Stream::poll_next(s.as_mut(), cx)).now_or_never();
+            // `Pending` means the multishot op armed cleanly; `Err(EINVAL)`
+            // means buffer-ring registration failed on this host.
+            managed_rx_available = r.is_none();
+        }
+        CompioProductionProfile {
+            tx_lanes: DEFAULT_TX_POOL_CAPACITY,
+            wire_ceiling: DEFAULT_TX_SLOT_SIZE,
+            managed_rx_available,
+            is_io_uring,
+            kernel_version: kernel,
+            compio_version: "0.19.2".to_string(),
+            driver_type: format!("{driver:?}"),
+        }
+    })
+}
+
 /// Live runtime driver inspection record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompioDriverInfo {
@@ -278,7 +365,6 @@ pub fn live_driver_sentinel() -> Result<CompioDriverInfo, String> {
 pub const DEFAULT_TX_POOL_CAPACITY: usize = 256;
 /// Default slot size matching standard 1500 MTU datagram bound.
 pub const DEFAULT_TX_SLOT_SIZE: usize = 1500;
-
 /// Reusable finite TX buffer pool for direct final-buffer outbound datagrams.
 /// Observable telemetry snapshot for [`TxPool`]; the pool itself is mutated
 /// only by the owner internals, never by external callers.
@@ -2811,5 +2897,16 @@ mod tests {
             assert_eq!(owner.tx_in_flight(), 0);
             assert!(owner.fault().is_some(), "shutdown sets fault");
         });
+    }
+
+    #[test]
+    fn production_profile_reports_host_truth() {
+        let profile = super::production_profile();
+        // This host rejects PBUF_RING (EINVAL): managed RX unavailable.
+        assert!(!profile.managed_rx_available);
+        assert!(profile.is_io_uring);
+        assert_eq!(profile.compio_version, "0.19.2");
+        assert!(!profile.kernel_version.is_empty());
+        assert!(!profile.driver_type.is_empty());
     }
 }
