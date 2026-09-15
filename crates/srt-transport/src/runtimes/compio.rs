@@ -339,6 +339,10 @@ impl TxPool {
         self.exhaustion_count
     }
 }
+/// Persistent receive buffer size (64 KiB covers max UDP payload without reallocation).
+pub const DEFAULT_RX_SLOT_SIZE: usize = 65536;
+
+type InFlightRx = Pin<Box<dyn Future<Output = (io::Result<(usize, SocketAddr)>, Vec<u8>)>>>;
 
 /// Listener side of a shared Compio owner.
 pub struct ListenerSide {
@@ -347,7 +351,10 @@ pub struct ListenerSide {
     pub telemetry: IngressTelemetry,
     pub options: crate::AdmissionOptions,
     pub transport: crate::ResolvedTransportConfig,
-    rx_buf: Option<Vec<u8>>,
+    rx_buf: Vec<u8>,
+    wait_rx_buf: Option<Vec<u8>>,
+    wait_rx_fut: Option<InFlightRx>,
+    pending_rx: Option<(SocketAddr, usize, Vec<u8>)>,
 }
 
 impl ListenerSide {
@@ -369,8 +376,45 @@ impl ListenerSide {
             telemetry: IngressTelemetry::new(),
             options: prepared.admission_options(),
             transport: prepared.transport,
-            rx_buf: None,
+            rx_buf: vec![0u8; DEFAULT_RX_SLOT_SIZE],
+            wait_rx_buf: Some(vec![0u8; DEFAULT_RX_SLOT_SIZE]),
+            wait_rx_fut: None,
+            pending_rx: None,
         })
+    }
+
+    fn ensure_wait_rx_in_flight(&mut self) {
+        if self.wait_rx_fut.is_none() && self.pending_rx.is_none() {
+            let buf = self
+                .wait_rx_buf
+                .take()
+                .unwrap_or_else(|| vec![0u8; DEFAULT_RX_SLOT_SIZE]);
+            let sock = self.sock.clone();
+            self.wait_rx_fut = Some(Box::pin(async move {
+                let BufResult(res, buf) = sock.recv_from(buf).await;
+                (res, buf)
+            }));
+        }
+    }
+
+    fn poll_wait_rx(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        let Some(fut) = self.wait_rx_fut.as_mut() else {
+            return std::task::Poll::Pending;
+        };
+        let std::task::Poll::Ready((res, buf)) = fut.as_mut().poll(cx) else {
+            return std::task::Poll::Pending;
+        };
+        if let Ok((len, peer)) = res {
+            if len > 0 {
+                self.pending_rx = Some((peer, len, buf));
+            } else {
+                self.wait_rx_buf = Some(buf);
+            }
+        } else {
+            self.wait_rx_buf = Some(buf);
+        }
+        self.wait_rx_fut = None;
+        std::task::Poll::Ready(())
     }
 }
 
@@ -380,7 +424,6 @@ impl ListenerSide {
 /// [`OwnerCallerSide`], which carries the same `CallerPool` admission,
 /// attempt-deadline, and socket-memory policy as the Mio/Tokio owners.
 pub type CallerSide = OwnerCallerSide;
-
 /// Pool-backed caller side of a shared Compio owner.
 pub struct OwnerCallerSide {
     pub sock: Rc<compio::net::UdpSocket>,
@@ -388,7 +431,10 @@ pub struct OwnerCallerSide {
     pub transport: crate::ResolvedTransportConfig,
     pub local_bind: Option<std::net::SocketAddr>,
     pub connect_config: crate::ConnectConfig,
-    rx_buf: Option<Vec<u8>>,
+    rx_buf: Vec<u8>,
+    wait_rx_buf: Option<Vec<u8>>,
+    wait_rx_fut: Option<InFlightRx>,
+    pending_rx: Option<(SocketAddr, usize, Vec<u8>)>,
 }
 
 impl OwnerCallerSide {
@@ -406,8 +452,44 @@ impl OwnerCallerSide {
             transport,
             local_bind,
             connect_config,
-            rx_buf: None,
+            rx_buf: vec![0u8; DEFAULT_RX_SLOT_SIZE],
+            wait_rx_buf: Some(vec![0u8; DEFAULT_RX_SLOT_SIZE]),
+            wait_rx_fut: None,
+            pending_rx: None,
         }
+    }
+
+    fn ensure_wait_rx_in_flight(&mut self) {
+        if self.wait_rx_fut.is_none() && self.pending_rx.is_none() {
+            let buf = self
+                .wait_rx_buf
+                .take()
+                .unwrap_or_else(|| vec![0u8; DEFAULT_RX_SLOT_SIZE]);
+            let sock = self.sock.clone();
+            self.wait_rx_fut = Some(Box::pin(async move {
+                let BufResult(res, buf) = sock.recv_from(buf).await;
+                (res, buf)
+            }));
+        }
+    }
+    fn poll_wait_rx(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        let Some(fut) = self.wait_rx_fut.as_mut() else {
+            return std::task::Poll::Pending;
+        };
+        let std::task::Poll::Ready((res, buf)) = fut.as_mut().poll(cx) else {
+            return std::task::Poll::Pending;
+        };
+        if let Ok((len, peer)) = res {
+            if len > 0 {
+                self.pending_rx = Some((peer, len, buf));
+            } else {
+                self.wait_rx_buf = Some(buf);
+            }
+        } else {
+            self.wait_rx_buf = Some(buf);
+        }
+        self.wait_rx_fut = None;
+        std::task::Poll::Ready(())
     }
 
     /// Immutable access to the pooled caller table.
@@ -438,12 +520,13 @@ impl OwnerCallerSide {
             transport,
             local_bind: None,
             connect_config: crate::ConnectConfig::default(),
-            rx_buf: None,
+            rx_buf: vec![0u8; DEFAULT_RX_SLOT_SIZE],
+            wait_rx_buf: Some(vec![0u8; DEFAULT_RX_SLOT_SIZE]),
+            wait_rx_fut: None,
+            pending_rx: None,
         }
     }
 }
-
-/// Metadata carried with one submitted UDP send so its completion can be
 /// attributed, validated, and reported instead of silently discarded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct InFlightMeta {
@@ -506,6 +589,12 @@ impl DatagramSink for OwnerTxSink<'_> {
             peer,
             expected_len: len,
         };
+        // Allocation note: `Box::pin` here allocates in the `srt-transport`
+        // orchestration layer to track concurrent in-flight sends inside
+        // `FuturesUnordered`. The underlying protocol dataplane (`srt-proto`
+        // `poll_output_into`) contributes zero heap allocations; global
+        // allocator measurements reflect this transport future boxing plus
+        // Compio's runtime driver state, not protocol packetization.
         self.tx_in_flight.push(Box::pin(async move {
             let BufResult(res, mut b) = sock.send_to(buf, peer).await;
             b.clear();
@@ -586,7 +675,6 @@ fn sockaddr_to_std(storage: libc::sockaddr_storage, len: libc::socklen_t) -> Opt
     }
     None
 }
-
 /// Execution report for one [`Owner::service`] visit.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OwnerServiceReport {
@@ -624,6 +712,21 @@ pub struct Owner {
 }
 
 impl Owner {
+    fn handle_tx_completion(&mut self, meta: InFlightMeta, res: io::Result<usize>, buf: Vec<u8>) {
+        self.tx_pool.return_slot(buf);
+        match res {
+            Ok(sent) if sent == meta.expected_len => {
+                self.completions.completed_ok += 1;
+            }
+            Ok(_) => {
+                self.completions.short_sends += 1;
+            }
+            Err(_) => {
+                self.completions.failed_sends += 1;
+            }
+        }
+    }
+
     /// Create a new Owner with bounded concurrent TX capacity.
     #[must_use]
     pub fn new(tx_capacity: usize) -> Self {
@@ -639,6 +742,18 @@ impl Owner {
             tx_priority_listener_first: true,
             caller_pool_policy: None,
             socket_memory_budget: None,
+        }
+    }
+    fn poll_tx_activity(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        if self.tx_in_flight.is_empty() {
+            return std::task::Poll::Pending;
+        }
+        match self.tx_in_flight.poll_next_unpin(cx) {
+            std::task::Poll::Ready(Some((meta, res, buf))) => {
+                self.handle_tx_completion(meta, res, buf);
+                std::task::Poll::Ready(())
+            }
+            _ => std::task::Poll::Pending,
         }
     }
 
@@ -941,23 +1056,8 @@ impl Owner {
                 std::future::poll_fn(|cx| self.tx_in_flight.poll_next_unpin(cx)).now_or_never();
             match poll_res {
                 Some(Some((meta, res, buf))) => {
-                    self.tx_pool.return_slot(buf);
+                    self.handle_tx_completion(meta, res, buf);
                     report.completions_reaped += 1;
-                    match res {
-                        Ok(sent) if sent == meta.expected_len => {
-                            self.completions.completed_ok += 1;
-                        }
-                        Ok(_) => {
-                            // A completed short UDP send is a definite driver
-                            // outcome (not a cancellation): SRT ARQ owns
-                            // recovery, so record it explicitly rather than
-                            // silently treating it as success.
-                            self.completions.short_sends += 1;
-                        }
-                        Err(_) => {
-                            self.completions.failed_sends += 1;
-                        }
-                    }
                 }
                 _ => break,
             }
@@ -977,7 +1077,13 @@ impl Owner {
         report.tx_failed_sends = self.completions.failed_sends;
 
         let has_pending = self.has_pending_work(now);
-        report.work_remaining = has_pending || !self.tx_in_flight.is_empty();
+        // Runnable work remaining: timers due, application data queued
+        // waiting for budget, or caller pool requests waiting for admission.
+        // Merely having I/O in flight is NOT runnable work: setting
+        // `work_remaining = true` when only `tx_in_flight > 0` causes the outer
+        // event loop to busy-spin in `service()` instead of parking on the
+        // proactor via `wait_for_activity()`.
+        report.work_remaining = has_pending;
         report.budget_exhausted = report.completions_reaped >= budget.max_completions
             || report.rx_packets >= budget.max_rx_packets
             || report.tx_packets_submitted >= budget.max_tx_packets
@@ -990,12 +1096,40 @@ impl Owner {
     /// the only waiting entry point: `service` itself never blocks, so an
     /// outer Restream shard calls `wait_for_activity` when idle and
     /// `service` when woken or on its timer deadline.
+    ///
+    /// Awakened by:
+    /// 1. An in-flight TX completion (buffer returned to `TxPool`, counters updated).
+    /// 2. An incoming datagram on the listener socket (wakes immediately).
+    /// 3. An incoming datagram on the caller socket (wakes immediately).
+    /// 4. Timer expiry (`timeout` elapses).
     pub async fn wait_for_activity(&mut self, timeout: std::time::Duration) {
-        if self.tx_in_flight.is_empty() {
-            compio::time::sleep(timeout).await;
-            return;
+        if let Some(listener) = self.listener.as_mut() {
+            listener.ensure_wait_rx_in_flight();
         }
-        let _ = compio::time::timeout(timeout, self.tx_in_flight.next()).await;
+        if let Some(caller) = self.caller.as_mut() {
+            caller.ensure_wait_rx_in_flight();
+        }
+
+        let _ = compio::time::timeout(
+            timeout,
+            std::future::poll_fn(|cx| {
+                if self.poll_tx_activity(cx).is_ready() {
+                    return std::task::Poll::Ready(());
+                }
+                if let Some(listener) = self.listener.as_mut()
+                    && listener.poll_wait_rx(cx).is_ready()
+                {
+                    return std::task::Poll::Ready(());
+                }
+                if let Some(caller) = self.caller.as_mut()
+                    && caller.poll_wait_rx(cx).is_ready()
+                {
+                    return std::task::Poll::Ready(());
+                }
+                std::task::Poll::Pending
+            }),
+        )
+        .await;
     }
 
     async fn service_rx_listener(
@@ -1004,64 +1138,62 @@ impl Owner {
         budget: &OwnerServiceBudget,
         report: &mut OwnerServiceReport,
     ) {
-        // The persistent buffer is cloned into each synchronous readiness
-        // probe so a Pending poll never consumes driver-owned state and the
-        // stored buffer is always retained. Probes use the std socket behind
-        // the Compio socket in nonblocking mode with a zeroed spare buffer.
-        let spare = listener
-            .rx_buf
-            .take()
-            .unwrap_or_else(|| vec![0u8; DEFAULT_TX_SLOT_SIZE]);
-        let mut spare = Some(spare);
-        while report.rx_packets < budget.max_rx_packets && report.rx_bytes < budget.max_rx_bytes {
-            use std::os::fd::AsRawFd;
-            let raw_fd = compio::net::UdpSocket::as_raw_fd(&listener.sock);
-            let probe_buf = spare.take().expect("spare rx buffer held");
-            let mut probe = vec![0u8; DEFAULT_TX_SLOT_SIZE];
-            // SAFETY: `sockaddr_storage` is plain data; zeroing initializes it.
-            let mut addr_storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-            let mut addr_len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-            // SAFETY: `raw_fd` is a live UDP socket owned by `listener.sock`;
-            // `recvfrom` writes at most `probe.len()` bytes into `probe` plus
-            // the peer address into `addr_storage`, all stack-owned here.
-            let received = unsafe {
-                libc::recvfrom(
-                    raw_fd,
-                    probe.as_mut_ptr() as *mut libc::c_void,
-                    probe.len(),
-                    libc::MSG_DONTWAIT,
-                    &mut addr_storage as *mut _ as *mut libc::sockaddr,
-                    &mut addr_len,
-                )
-            };
-            if received < 0 {
-                spare = Some(probe_buf);
-                break;
-            }
-            let len = received as usize;
-            if len == 0 {
-                spare = Some(probe_buf);
-                break;
-            }
-            let peer = sockaddr_to_std(addr_storage, addr_len);
-            let Some(peer) = peer else {
-                spare = Some(probe_buf);
-                break;
-            };
+        // 1. Consume any datagram completed while wait_for_activity was parked
+        if let Some((peer, len, buf)) = listener.pending_rx.take() {
             report.rx_packets += 1;
             report.rx_bytes += len;
             let _ = listener.table.admit(
                 peer,
-                &probe[..len],
+                &buf[..len],
                 now,
                 &listener.options,
                 0,
                 1,
                 &listener.telemetry,
             );
-            spare = Some(probe_buf);
+            listener.wait_rx_buf = Some(buf);
         }
-        listener.rx_buf = spare;
+
+        // 2. Drain all currently-available datagrams into the persistent rx_buf.
+        // Zero heap allocations: rx_buf is pre-allocated and mutably borrowed.
+        let buf = &mut listener.rx_buf;
+        while report.rx_packets < budget.max_rx_packets && report.rx_bytes < budget.max_rx_bytes {
+            use std::os::fd::AsRawFd;
+            let raw_fd = compio::net::UdpSocket::as_raw_fd(&listener.sock);
+            // SAFETY: `sockaddr_storage` is plain data; zeroing initializes it.
+            let mut addr_storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+            let mut addr_len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            // SAFETY: `raw_fd` is a live UDP socket; `recvfrom` writes at most
+            // `buf.len()` bytes into `buf` plus peer address into `addr_storage`.
+            let received = unsafe {
+                libc::recvfrom(
+                    raw_fd,
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                    libc::MSG_DONTWAIT,
+                    &mut addr_storage as *mut _ as *mut libc::sockaddr,
+                    &mut addr_len,
+                )
+            };
+            if received <= 0 {
+                break;
+            }
+            let len = received as usize;
+            let Some(peer) = sockaddr_to_std(addr_storage, addr_len) else {
+                break;
+            };
+            report.rx_packets += 1;
+            report.rx_bytes += len;
+            let _ = listener.table.admit(
+                peer,
+                &buf[..len],
+                now,
+                &listener.options,
+                0,
+                1,
+                &listener.telemetry,
+            );
+        }
     }
 
     async fn service_rx_caller(
@@ -1070,53 +1202,47 @@ impl Owner {
         budget: &OwnerServiceBudget,
         report: &mut OwnerServiceReport,
     ) {
-        let spare = caller
-            .rx_buf
-            .take()
-            .unwrap_or_else(|| vec![0u8; DEFAULT_TX_SLOT_SIZE]);
-        let mut spare = Some(spare);
+        // 1. Consume any datagram completed while wait_for_activity was parked
+        if let Some((peer, len, buf)) = caller.pending_rx.take() {
+            report.rx_packets += 1;
+            report.rx_bytes += len;
+            let _ = caller.pool.table_mut().feed(peer, &buf[..len], now);
+            caller.wait_rx_buf = Some(buf);
+        }
+
+        // 2. Drain all currently-available datagrams into the persistent rx_buf.
+        // Zero heap allocations: rx_buf is pre-allocated and mutably borrowed.
+        let buf = &mut caller.rx_buf;
         while report.rx_packets < budget.max_rx_packets && report.rx_bytes < budget.max_rx_bytes {
             use std::os::fd::AsRawFd;
             let raw_fd = compio::net::UdpSocket::as_raw_fd(&caller.sock);
-            let probe_buf = spare.take().expect("spare rx buffer held");
-            let mut probe = vec![0u8; DEFAULT_TX_SLOT_SIZE];
             // SAFETY: `sockaddr_storage` is plain data; zeroing initializes it.
             let mut addr_storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
             let mut addr_len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-            // SAFETY: `raw_fd` is a live UDP socket owned by `listener.sock`;
-            // `recvfrom` writes at most `probe.len()` bytes into `probe` plus
-            // the peer address into `addr_storage`, all stack-owned here.
+            // SAFETY: `raw_fd` is a live UDP socket; `recvfrom` writes at most
+            // `buf.len()` bytes into `buf` plus peer address into `addr_storage`.
             let received = unsafe {
                 libc::recvfrom(
                     raw_fd,
-                    probe.as_mut_ptr() as *mut libc::c_void,
-                    probe.len(),
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
                     libc::MSG_DONTWAIT,
                     &mut addr_storage as *mut _ as *mut libc::sockaddr,
                     &mut addr_len,
                 )
             };
-            if received < 0 {
-                spare = Some(probe_buf);
+            if received <= 0 {
                 break;
             }
             let len = received as usize;
-            if len == 0 {
-                spare = Some(probe_buf);
-                break;
-            }
             let Some(peer) = sockaddr_to_std(addr_storage, addr_len) else {
-                spare = Some(probe_buf);
                 break;
             };
             report.rx_packets += 1;
             report.rx_bytes += len;
-            let _ = caller.pool.table_mut().feed(peer, &probe[..len], now);
-            spare = Some(probe_buf);
+            let _ = caller.pool.table_mut().feed(peer, &buf[..len], now);
         }
-        caller.rx_buf = spare;
     }
-
     async fn service_rx(
         &mut self,
         now: Timestamp,
@@ -1847,6 +1973,142 @@ mod tests {
                 report.tx_packets_submitted >= 4,
                 "all 4 fanout payloads must be submitted, got {}",
                 report.tx_packets_submitted
+            );
+        });
+    }
+    #[test]
+    fn wait_for_activity_returns_tx_buffers_and_updates_completion_stats() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            let l_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind listener std");
+            let l_addr = l_std.local_addr().expect("listener addr");
+            let c_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind caller std");
+            let c_sock = compio::net::UdpSocket::from_std(c_std).expect("compio adopt caller");
+
+            let caller_side = CallerSide::new_single(c_sock);
+            let mut owner = Owner::new(16).with_caller(caller_side);
+
+            let initial_free = owner.tx_pool().free_count();
+            assert_eq!(initial_free, 16);
+
+            // Manually submit a UDP send through OwnerTxSink
+            {
+                let caller = owner.caller.as_ref().unwrap();
+                let mut sink = OwnerTxSink {
+                    sock: &caller.sock,
+                    tx_pool: &mut owner.tx_pool,
+                    tx_in_flight: &mut owner.tx_in_flight,
+                    tx_capacity: owner.tx_capacity,
+                };
+                let res = sink.push_datagram(l_addr, 10, |buf| {
+                    buf[..10].copy_from_slice(b"0123456789");
+                    Ok(10)
+                });
+                assert!(matches!(res, Ok(PushResult::Pushed { len: 10 })));
+            }
+
+            // Slot allocated: 1 in flight, free count is 15
+            assert_eq!(owner.tx_in_flight.len(), 1);
+            assert_eq!(owner.tx_pool().free_count(), 15);
+
+            // Calling wait_for_activity must reap the completion, return the
+            // slot to tx_pool, and increment completed_ok.
+            owner
+                .wait_for_activity(std::time::Duration::from_millis(500))
+                .await;
+
+            assert_eq!(
+                owner.tx_pool().free_count(),
+                16,
+                "wait_for_activity must return reaped TX buffer to tx_pool"
+            );
+            assert_eq!(
+                owner.completions.completed_ok, 1,
+                "wait_for_activity must update completion statistics"
+            );
+        });
+    }
+
+    #[test]
+    fn idle_rx_wakes_owner_in_wait_for_activity() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            let l_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind listener std");
+            let l_addr = l_std.local_addr().expect("listener addr");
+            let l_sock = compio::net::UdpSocket::from_std(l_std).expect("compio adopt listener");
+
+            let l_cfg = crate::ListenerConfig::builder(l_addr)
+                .build()
+                .expect("listener config");
+            let listener_side = ListenerSide::new(l_sock, &l_cfg).expect("listener side");
+            let mut owner = Owner::new(16).with_listener(listener_side);
+
+            // Spawn a background thread to send a datagram to the idle listener
+            // after a brief delay
+            let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind sender std");
+            let bg_handle = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                let _ = sender.send_to(b"wake-up-datagram", l_addr);
+            });
+
+            let t0 = std::time::Instant::now();
+            // wait_for_activity with 5 second timeout must wake within ~100ms
+            // when the background datagram arrives, NOT sleeping the full 5s.
+            owner
+                .wait_for_activity(std::time::Duration::from_secs(5))
+                .await;
+            let elapsed = t0.elapsed();
+            assert!(
+                elapsed < std::time::Duration::from_secs(2),
+                "idle_rx must wake wait_for_activity immediately, elapsed: {elapsed:?}"
+            );
+
+            let report = owner
+                .service(Timestamp::from_micros(100), OwnerServiceBudget::default())
+                .await;
+            assert_eq!(
+                report.rx_packets, 1,
+                "service must process the datagram that woke wait_for_activity"
+            );
+
+            bg_handle.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn work_remaining_is_false_when_only_tx_in_flight() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            let c_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind caller std");
+            let c_sock = compio::net::UdpSocket::from_std(c_std).expect("compio adopt caller");
+            let caller_side = CallerSide::new_single(c_sock);
+            let mut owner = Owner::new(16).with_caller(caller_side);
+
+            // Submit send
+            let peer: std::net::SocketAddr = "127.0.0.1:39999".parse().unwrap();
+            {
+                let caller = owner.caller.as_ref().unwrap();
+                let mut sink = OwnerTxSink {
+                    sock: &caller.sock,
+                    tx_pool: &mut owner.tx_pool,
+                    tx_in_flight: &mut owner.tx_in_flight,
+                    tx_capacity: owner.tx_capacity,
+                };
+                let _ = sink.push_datagram(peer, 8, |buf| {
+                    buf[..8].copy_from_slice(b"12345678");
+                    Ok(8)
+                });
+            }
+
+            let budget = OwnerServiceBudget {
+                max_completions: 0, // don't reap completions in this service call
+                ..Default::default()
+            };
+            let report = owner.service(Timestamp::from_micros(100), budget).await;
+            assert_eq!(report.tx_in_flight, 1);
+            assert!(
+                !report.work_remaining,
+                "merely having tx_in_flight must NOT set work_remaining to true"
             );
         });
     }

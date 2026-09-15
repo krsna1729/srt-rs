@@ -112,10 +112,34 @@ fn run_fanout_case(fanout: usize, duration_ms: u64) -> FanoutMetrics {
 
     runtime.block_on(async move {
         let l_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind listener std");
+        {
+            use std::os::fd::AsRawFd;
+            let buf_size: libc::c_int = 4 * 1024 * 1024;
+            // SAFETY: `l_std` is a valid open UDP socket; `buf_size` is a valid c_int.
+            unsafe {
+                libc::setsockopt(
+                    l_std.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVBUF,
+                    &buf_size as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&buf_size) as libc::socklen_t,
+                );
+                libc::setsockopt(
+                    l_std.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    &buf_size as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&buf_size) as libc::socklen_t,
+                );
+            }
+        }
         let l_addr = l_std.local_addr().expect("listener addr");
         let l_sock = compio::net::UdpSocket::from_std(l_std).expect("compio adopt listener");
 
         let l_cfg = srt_transport::ListenerConfig::builder(l_addr)
+            .configure_session(|s| {
+                s.handshake.timeout = std::time::Duration::from_secs(30);
+            })
             .build()
             .expect("listener config");
         let listener_side = ListenerSide::new(l_sock, &l_cfg).expect("listener side");
@@ -140,6 +164,9 @@ fn run_fanout_case(fanout: usize, duration_ms: u64) -> FanoutMetrics {
         for _i in 0..fanout {
             let cfg = srt_transport::CallerConfig::builder(l_addr)
                 .ownership(srt_transport::SocketOwnership::Shared)
+                .configure_session(|s| {
+                    s.handshake.timeout = std::time::Duration::from_secs(30);
+                })
                 .build()
                 .expect("shared caller config");
             match owner.connect(&cfg, now).expect("owner connect") {
@@ -162,23 +189,35 @@ fn run_fanout_case(fanout: usize, duration_ms: u64) -> FanoutMetrics {
             max_tx_bytes: 2 * 1024 * 1024,
         };
 
-        for _round in 0..600 {
-            now = Timestamp::from_micros(now.as_micros() + 2_000);
+        for _round in 0..10_000 {
+            now = Timestamp::from_micros(now.as_micros() + 250);
             let _ = owner.service(now, budget).await;
             owner
                 .wait_for_activity(std::time::Duration::from_millis(1))
                 .await;
-            if dest_ids
+            let connected = dest_ids
                 .iter()
                 .filter_map(|id| owner.logical_caller(id).and_then(|c| c.state()))
                 .filter(|s| *s == srt_transport::advanced::caller::LogicalCallerState::Connected)
-                .count()
-                == dest_ids.len()
-            {
+                .count();
+            if connected == dest_ids.len() {
                 break;
             }
         }
-
+        let mut not_connected = 0;
+        for (i, id) in dest_ids.iter().enumerate() {
+            let state = owner.logical_caller(id).and_then(|c| c.state());
+            if state != Some(srt_transport::advanced::caller::LogicalCallerState::Connected) {
+                eprintln!("dest {i} ({id:?}) state: {state:?}");
+                not_connected += 1;
+            }
+        }
+        let connected_count = dest_ids.len() - not_connected;
+        assert_eq!(
+            connected_count,
+            dest_ids.len(),
+            "qualification gate: all {fanout} requested destinations must reach Connected before measurement, only {connected_count} connected"
+        );
         // Prepare shared media payload
         let payload = Bytes::from(vec![0xAAu8; PAYLOAD_SIZE]);
 
@@ -217,7 +256,7 @@ fn run_fanout_case(fanout: usize, duration_ms: u64) -> FanoutMetrics {
         let mut total_completed_ok = 0usize;
         let mut total_inflight_samples = 0usize;
         let mut inflight_accum = 0usize;
-        let mut pacing_latenesses: Vec<u64> = Vec::with_capacity(10_000);
+        let mut service_visit_latencies: Vec<u64> = Vec::with_capacity(10_000);
 
         let rounds = (duration_ms * 1000 / PACKET_INTERVAL_US).max(500) as usize;
         for _round in 0..rounds {
@@ -227,13 +266,7 @@ fn run_fanout_case(fanout: usize, duration_ms: u64) -> FanoutMetrics {
             // *connected* destination through `send_shared`, so offered wire
             // load is `760 msgs/s * connected` before control/retransmit
             // traffic. Pre-handshake legs are not offered: send on them is a
-            // hard InvalidState and must not pollute admission accounting.
             for &target_id in &dest_ids {
-                let connected = owner.logical_caller(&target_id).and_then(|c| c.state())
-                    == Some(srt_transport::advanced::caller::LogicalCallerState::Connected);
-                if !connected {
-                    continue;
-                }
                 total_offered += 1;
                 if owner
                     .logical_caller_mut(&target_id)
@@ -245,19 +278,14 @@ fn run_fanout_case(fanout: usize, duration_ms: u64) -> FanoutMetrics {
                 }
             }
 
-            // Measured pacing lateness: queueing delay between admission
-            // and the next service visit that actually submits the datagram.
-            let admitted_before = total_admitted;
-            let submitted_before = total_submitted;
+            // Service visit latency: duration of owner.service() when packets
+            // are submitted to the driver.
             let visit_start = Instant::now();
             let report = owner.service(now, budget).await;
-            let visit_ns = visit_start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
-            // One sample per admitted-but-not-yet-submitted datagram would be
-            // ideal; approximate with per-visit service latency in micros.
-            if total_admitted > admitted_before || report.tx_packets_submitted > 0 {
-                pacing_latenesses.push(visit_ns / 1000);
+            let visit_us = (visit_start.elapsed().as_nanos().min(u128::from(u64::MAX)) / 1000) as u64;
+            if report.tx_packets_submitted > 0 {
+                service_visit_latencies.push(visit_us);
             }
-            let _ = submitted_before;
             total_submitted += report.tx_packets_submitted;
             total_completed_ok += report.tx_completed_ok;
             inflight_accum += report.tx_in_flight;
@@ -271,13 +299,14 @@ fn run_fanout_case(fanout: usize, duration_ms: u64) -> FanoutMetrics {
         let cpu_secs = process_cpu_seconds() - cpu_start;
         let total_allocs = ALLOC_COUNT.load(Ordering::SeqCst);
 
-        pacing_latenesses.sort_unstable();
-        pacing_latenesses.truncate(50_000);
-        let pick = |q: usize| {
-            if pacing_latenesses.is_empty() {
+        service_visit_latencies.sort_unstable();
+        service_visit_latencies.truncate(50_000);
+        let pick_q = |num: usize, den: usize| {
+            if service_visit_latencies.is_empty() {
                 0
             } else {
-                pacing_latenesses[pacing_latenesses.len() * q / 100]
+                let idx = (service_visit_latencies.len() * num / den).min(service_visit_latencies.len() - 1);
+                service_visit_latencies[idx]
             }
         };
 
@@ -295,10 +324,10 @@ fn run_fanout_case(fanout: usize, duration_ms: u64) -> FanoutMetrics {
             cpu_us_per_dest: (cpu_secs * 1e6) / fanout as f64,
             peak_rss_kb: get_peak_rss_kb(),
             allocs_per_dgram_measured: total_allocs as f64 / submitted as f64,
-            p50_pacing_lateness_us: pick(50),
-            p95_pacing_lateness_us: pick(95),
-            p99_pacing_lateness_us: pick(99),
-            p999_pacing_lateness_us: pick(99),
+            p50_pacing_lateness_us: pick_q(50, 100),
+            p95_pacing_lateness_us: pick_q(95, 100),
+            p99_pacing_lateness_us: pick_q(99, 100),
+            p999_pacing_lateness_us: pick_q(999, 1000),
             tx_inflight_avg: inflight_accum as f64 / total_inflight_samples.max(1) as f64,
             tx_pool_exhaustions: owner.tx_pool().exhaustion_count(),
         }
@@ -356,12 +385,17 @@ fn main() {
 
     println!("=== MEASUREMENT NOTES ===");
     println!("- Offered/admitted/submitted/completed_ok are tracked separately per stage.");
-    println!("- CPU is process CPU time (CLOCK_PROCESS_CPUTIME_ID), not wall time.");
-    println!("- Alloc/sub is one measured global total per submitted datagram;");
-    println!("  per-layer protocol/transport/runtime attribution is NOT claimed here.");
-    println!("- Pacing lateness is per-visit service latency, not synthetic round % 5.");
-    println!("- TX path is direct single-copy final-buffer materialization");
-    println!("  (payload copied once into the reusable slot, encrypted in place),");
-    println!("  not zero-copy TX: the kernel still copies user data on send.");
-    println!();
+    println!("- Loopback attribution: process CPU time (CLOCK_PROCESS_CPUTIME_ID) reflects both");
+    println!("  sender transmission and loopback receiver ACK/control handling in one process,");
+    println!("  not isolated sender egress demand.");
+    println!(
+        "- Alloc/sub is measured global total per submitted datagram; shared between transport"
+    );
+    println!("  future boxing (Box::pin in OwnerTxSink) and Compio runtime operation state.");
+    println!("  Protocol dataplane (srt-proto poll_output_into) contributes zero allocations.");
+    println!(
+        "- Svc latency measures per-visit service call duration when datagrams are submitted."
+    );
+    println!("- TX path is direct single-copy final-buffer materialization (payload copied once");
+    println!("  into reusable slot, encrypted in place); not zero-copy: kernel copies on send.");
 }
