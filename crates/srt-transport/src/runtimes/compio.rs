@@ -237,16 +237,20 @@ pub fn caller(
 /// calls [`observe_production_runtime`] on that exact runtime to record
 /// qualification data. srt-rs never chooses process/thread/NUMA topology
 /// itself. Capability fields are observed host data, not policy: a host
-/// without buffer-ring support stays on the readiness + raw `recvfrom` path
-/// without changing architecture.
+/// whose kernel rejects buffer-ring registration stays on the readiness +
+/// raw `recvfrom` fallback without changing architecture.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompioProductionProfile {
     /// Fixed TX lane count (= TX capacity) for the Owner.
     pub tx_lanes: usize,
     /// Wire ceiling in bytes for every TxPool slot.
     pub wire_ceiling: usize,
-    /// Whether managed/multishot RX armed cleanly on the observed runtime.
-    pub managed_rx_available: bool,
+    /// Provided-buffer-ring registration outcome on the observed runtime.
+    pub buffer_ring: ProvidedBufferRingStatus,
+    /// Multishot `RECVMSG` capability. `NotTestedBecauseBufferRingUnavailable`
+    /// when the ring substrate failed first: RECVMSG_MULTISHOT itself was
+    /// never reached, so it must not be reported as broken.
+    pub multishot_recv: MultishotRecvStatus,
     /// Whether the observed driver is io_uring (vs Poll fallback).
     pub is_io_uring: bool,
     /// Kernel release string from `/proc/version`.
@@ -257,6 +261,54 @@ pub struct CompioProductionProfile {
     pub driver_type: String,
 }
 
+impl CompioProductionProfile {
+    /// Whether Compio managed RX (`recv_from_multi` / `recv_msg_multi` over
+    /// the runtime buffer pool) is usable on the observed runtime.
+    #[must_use]
+    pub fn managed_rx_available(&self) -> bool {
+        matches!(
+            (&self.buffer_ring, &self.multishot_recv),
+            (
+                ProvidedBufferRingStatus::Available,
+                MultishotRecvStatus::Available
+            )
+        )
+    }
+
+    /// Whether this host may run the high-density SRT path. Fails closed
+    /// when the buffer-ring substrate is unavailable; the single-reader
+    /// fallback remains valid for development/compatibility.
+    #[must_use]
+    pub fn high_density_qualified(&self) -> bool {
+        self.is_io_uring && self.managed_rx_available()
+    }
+}
+
+/// Outcome of `IORING_REGISTER_PBUF_RING` on the observed host.
+///
+/// A valid request rejected with `EINVAL` (observed on Ubuntu Noble
+/// `6.8.0-139-generic` via strace) is a kernel-build defect, not evidence
+/// that multishot receive itself is broken.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProvidedBufferRingStatus {
+    /// Buffer-ring registration succeeded.
+    Available,
+    /// Registration failed with the given errno (e.g. `EINVAL` = 22).
+    RegistrationFailed(i32),
+}
+
+/// Multishot `RECVMSG` capability, tested only when the buffer-ring
+/// substrate initialized successfully.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MultishotRecvStatus {
+    /// A multishot receive armed cleanly.
+    Available,
+    /// Multishot receive itself failed.
+    Unsupported,
+    /// Never reached: buffer-ring registration failed first.
+    NotTestedBecauseBufferRingUnavailable,
+}
+
 /// Pinned Compio dependency version, kept in sync with `Cargo.lock`.
 pub const PINNED_COMPIO_VERSION: &str = "0.19.2";
 
@@ -265,7 +317,8 @@ impl Default for CompioProductionProfile {
         Self {
             tx_lanes: 256,
             wire_ceiling: DEFAULT_TX_SLOT_SIZE,
-            managed_rx_available: false,
+            buffer_ring: ProvidedBufferRingStatus::RegistrationFailed(-1),
+            multishot_recv: MultishotRecvStatus::NotTestedBecauseBufferRingUnavailable,
             is_io_uring: false,
             kernel_version: String::new(),
             compio_version: PINNED_COMPIO_VERSION.to_string(),
@@ -288,10 +341,11 @@ pub fn production_runtime_builder() -> compio::runtime::RuntimeBuilder {
 /// Observe an already-constructed runtime and return its production profile.
 ///
 /// Inspects the exact runtime Restream built for the shard (never a
-/// throwaway probe runtime). Records whether managed/multishot RX
-/// (`recv_from_multi` over the runtime buffer pool) arms cleanly: `Pending`
-/// means usable; `Err(EINVAL)` means the kernel rejected buffer-ring
-/// registration on this host.
+/// throwaway probe runtime). Distinguishes the buffer-ring substrate
+/// (`IORING_REGISTER_PBUF_RING`) from multishot receive itself: if the
+/// substrate fails, multishot is reported as
+/// [`MultishotRecvStatus::NotTestedBecauseBufferRingUnavailable`], never
+/// as broken.
 pub async fn observe_production_runtime(
     runtime: &compio::runtime::Runtime,
     tx_lanes: usize,
@@ -303,17 +357,49 @@ pub async fn observe_production_runtime(
         .unwrap_or_else(|_| "unknown kernel".to_string())
         .trim()
         .to_string();
-    let mut managed_rx_available = false;
-    if let Ok(sock) = compio::net::UdpSocket::bind("127.0.0.1:0").await {
-        use futures_util::{FutureExt, Stream};
-        let mut s = Box::pin(sock.recv_from_multi());
-        let r = std::future::poll_fn(|cx| Stream::poll_next(s.as_mut(), cx)).now_or_never();
-        managed_rx_available = r.is_none();
-    }
+    // Classify the multishot stream outcome without conflating layers.
+    let (buffer_ring, multishot_recv) =
+        if let Ok(sock) = compio::net::UdpSocket::bind("127.0.0.1:0").await {
+            use futures_util::{FutureExt, Stream};
+            let mut s = Box::pin(sock.recv_from_multi());
+            match std::future::poll_fn(|cx| Stream::poll_next(s.as_mut(), cx)).now_or_never() {
+                // Armed cleanly: both substrate and multishot work.
+                None => (
+                    ProvidedBufferRingStatus::Available,
+                    MultishotRecvStatus::Available,
+                ),
+                Some(Some(Ok(_))) => (
+                    ProvidedBufferRingStatus::Available,
+                    MultishotRecvStatus::Available,
+                ),
+                // Error from the multishot op: extract errno where possible.
+                Some(Some(Err(e))) => {
+                    let errno = e.raw_os_error().unwrap_or(-1);
+                    // EINVAL at arm time on a fresh ring = registration
+                    // rejected by this kernel build (observed on Noble 6.8).
+                    (
+                        ProvidedBufferRingStatus::RegistrationFailed(errno),
+                        MultishotRecvStatus::NotTestedBecauseBufferRingUnavailable,
+                    )
+                }
+                // Stream immediately finished: treat as unsupported, not as
+                // proof of a broken substrate.
+                Some(None) => (
+                    ProvidedBufferRingStatus::Available,
+                    MultishotRecvStatus::Unsupported,
+                ),
+            }
+        } else {
+            (
+                ProvidedBufferRingStatus::RegistrationFailed(-1),
+                MultishotRecvStatus::NotTestedBecauseBufferRingUnavailable,
+            )
+        };
     CompioProductionProfile {
         tx_lanes,
         wire_ceiling,
-        managed_rx_available,
+        buffer_ring,
+        multishot_recv,
         is_io_uring,
         kernel_version: kernel,
         compio_version: PINNED_COMPIO_VERSION.to_string(),
@@ -2914,7 +3000,7 @@ mod tests {
     #[test]
     fn production_profile_observes_live_runtime() {
         // Portable: observes the exact runtime under test, asserts only
-        // structural invariants. Capability bits are qualification data
+        // structural invariants. Capability outcomes are qualification data
         // recorded per host, never deterministic unit-test invariants.
         let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
         let profile = runtime.block_on(super::observe_production_runtime(
@@ -2927,8 +3013,41 @@ mod tests {
         assert_eq!(profile.compio_version, super::PINNED_COMPIO_VERSION);
         assert!(!profile.kernel_version.is_empty());
         assert!(!profile.driver_type.is_empty());
-        // `is_io_uring` and `managed_rx_available` are recorded, not asserted:
-        // they vary by host kernel and backend.
-        let _ = (profile.is_io_uring, profile.managed_rx_available);
+        // Capability classification is recorded, not asserted: it varies by
+        // host kernel and backend. Just exercise the accessors.
+        let _ = profile.managed_rx_available();
+        let _ = profile.high_density_qualified();
+    }
+
+    #[test]
+    fn buffer_ring_classification_does_not_conflate_layers() {
+        use super::{MultishotRecvStatus, ProvidedBufferRingStatus};
+        // Registration failure must block multishot verdict, not condemn it.
+        let blocked = super::CompioProductionProfile {
+            buffer_ring: ProvidedBufferRingStatus::RegistrationFailed(22),
+            multishot_recv: MultishotRecvStatus::NotTestedBecauseBufferRingUnavailable,
+            ..Default::default()
+        };
+        assert!(!blocked.managed_rx_available());
+        assert!(!blocked.high_density_qualified());
+        // Full availability qualifies.
+        let ok = super::CompioProductionProfile {
+            buffer_ring: ProvidedBufferRingStatus::Available,
+            multishot_recv: MultishotRecvStatus::Available,
+            is_io_uring: true,
+            ..Default::default()
+        };
+        assert!(ok.managed_rx_available());
+        assert!(ok.high_density_qualified());
+        // Available ring + broken multishot stays unqualified without
+        // blaming the substrate.
+        let no_ms = super::CompioProductionProfile {
+            buffer_ring: ProvidedBufferRingStatus::Available,
+            multishot_recv: MultishotRecvStatus::Unsupported,
+            is_io_uring: true,
+            ..Default::default()
+        };
+        assert!(!no_ms.managed_rx_available());
+        assert!(!no_ms.high_density_qualified());
     }
 }
