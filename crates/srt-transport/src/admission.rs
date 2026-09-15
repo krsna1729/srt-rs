@@ -2302,6 +2302,7 @@ impl PeerTable {
         self.poll_outbound_bounded_to(now, budget, out)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn poll_outbound_bounded_with_visits(
         &mut self,
         now: Timestamp,

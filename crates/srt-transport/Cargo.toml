@@ -61,6 +61,11 @@ name = "caller_table_scheduling"
 harness = false
 required-features = ["bench-internals"]
 
+[[bench]]
+name = "caller_scheduler_allocs"
+harness = false
+required-features = ["bench-internals"]
+
 [features]
 mio = ["dep:mio"]
 tokio = ["dep:tokio"]
