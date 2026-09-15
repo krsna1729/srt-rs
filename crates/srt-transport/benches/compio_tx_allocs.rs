@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use compio::buf::BufResult;
-use srt_proto::{Bytes, ConnectionOptions, ConnectionOutput, SrtConnection, Timestamp};
+use srt_proto::{Bytes, ConnectionOptions, ConnectionOutput, OutputInto, SrtConnection, Timestamp};
 use srt_transport::advanced::caller::{CallerLeg, CallerTable};
 use srt_transport::compio::{CallerSide, Owner, OwnerServiceBudget};
 
@@ -70,6 +70,50 @@ fn new_connected_pair(socket_id: u32) -> (SrtConnection, SrtConnection) {
     (caller, listener)
 }
 
+const EXPECTED_PAYLOAD_LEN: usize = 1316;
+
+fn payload_1316(seed: u8) -> Bytes {
+    let mut v = vec![0u8; EXPECTED_PAYLOAD_LEN];
+    for (i, b) in v.iter_mut().enumerate() {
+        *b = seed.wrapping_add((i % 251) as u8);
+    }
+    let payload = Bytes::from(v);
+    assert_eq!(
+        payload.len(),
+        EXPECTED_PAYLOAD_LEN,
+        "bench payload must be exactly 1316 bytes"
+    );
+    payload
+}
+
+fn finish_layer(
+    layer: &'static str,
+    total_allocs: usize,
+    total_bytes: usize,
+    iterations: usize,
+    #[allow(clippy::ptr_arg)] durations: &mut Vec<u64>,
+) -> LayerResult {
+    durations.sort_unstable();
+    assert!(!durations.is_empty());
+    let p50 = durations[durations.len() * 50 / 100];
+    let p95 = durations[durations.len() * 95 / 100];
+    let p99 = durations[durations.len() * 99 / 100];
+    assert!(
+        p50 <= p95 && p95 <= p99,
+        "{layer}: quantiles out of order: p50={p50} p95={p95} p99={p99}"
+    );
+    eprintln!("{layer}: raw_allocs={total_allocs} raw_bytes={total_bytes} iters={iterations}");
+    LayerResult {
+        layer,
+        allocs_per_op: total_allocs as f64 / iterations as f64,
+        bytes_per_op: total_bytes as f64 / iterations as f64,
+        mean_cpu_ns: durations.iter().sum::<u64>() as f64 / durations.len() as f64,
+        p50_cpu_ns: p50,
+        p95_cpu_ns: p95,
+        p99_cpu_ns: p99,
+    }
+}
+
 struct LayerResult {
     layer: &'static str,
     allocs_per_op: f64,
@@ -81,48 +125,63 @@ struct LayerResult {
 }
 
 fn bench_layer1_protocol_materialization(iterations: usize) -> LayerResult {
-    let (mut caller, _listener) = new_connected_pair(1001);
-    let payload =
-        Bytes::from_static(b"steady-state-1316-byte-srt-media-payload-data-for-layer1-bench");
+    // Fresh connection pair every 2000 iterations: the sender flow window
+    // only drains on real ACKs, so a single pair cannot sustain 10k
+    // back-to-back sends without a live peer.
+    const PAIR_ITERS: usize = 2000;
+    assert!(iterations.is_multiple_of(PAIR_ITERS));
+    let payload = payload_1316(0xAA);
     let mut dst = [0u8; 2048];
-    let now = Timestamp::from_micros(100_000);
-
-    // Warmup
-    for _ in 0..500 {
-        let _ = caller.send(&payload, now);
-        let _ = caller.poll_output_into(&mut dst);
-    }
-
+    let mut now = Timestamp::from_micros(100_000);
     let mut durations = Vec::with_capacity(iterations);
-    let mut total_allocs = 0;
-    let mut total_bytes = 0;
-    const BATCH: usize = 50;
-    let batches = iterations / BATCH;
-    for _ in 0..batches {
-        for _ in 0..BATCH {
-            let _ = caller.send(&payload, now);
+    let mut total_allocs = 0usize;
+    let mut total_bytes = 0usize;
+    for _ in 0..iterations / PAIR_ITERS {
+        let (mut caller, _listener) = new_connected_pair(1001);
+        // Warmup the fresh pair.
+        for _ in 0..50 {
+            caller.send(&payload, now).expect("warmup send admits");
+            loop {
+                match caller.poll_output_into(&mut dst) {
+                    Ok(Some(OutputInto::Datagram { len })) => {
+                        assert!(len > 0);
+                        break;
+                    }
+                    Ok(Some(_)) => continue,
+                    other => panic!("warmup must materialize DATA, got {other:?}"),
+                }
+            }
         }
-        let a0 = ALLOC_COUNT.load(Ordering::SeqCst);
-        let b0 = ALLOC_BYTES.load(Ordering::SeqCst);
-        let t0 = Instant::now();
-        for _ in 0..BATCH {
-            let _ = caller.poll_output_into(&mut dst);
+        for _ in 0..PAIR_ITERS {
+            now = Timestamp::from_micros(now.as_micros() + 1_000);
+            caller.send(&payload, now).expect("send admits");
+            let a0 = ALLOC_COUNT.load(Ordering::SeqCst);
+            let b0 = ALLOC_BYTES.load(Ordering::SeqCst);
+            let t0 = Instant::now();
+            loop {
+                match caller.poll_output_into(&mut dst) {
+                    Ok(Some(OutputInto::Datagram { len })) => {
+                        assert!(len > 0, "each iteration must materialize one DATA datagram");
+                        break;
+                    }
+                    Ok(Some(_)) => continue,
+                    other => {
+                        panic!("each iteration must materialize one DATA datagram, got {other:?}")
+                    }
+                }
+            }
+            durations.push(t0.elapsed().as_nanos() as u64);
+            total_allocs += ALLOC_COUNT.load(Ordering::SeqCst) - a0;
+            total_bytes += ALLOC_BYTES.load(Ordering::SeqCst) - b0;
         }
-        durations.push((t0.elapsed().as_nanos() / BATCH as u128) as u64);
-        total_allocs += ALLOC_COUNT.load(Ordering::SeqCst) - a0;
-        total_bytes += ALLOC_BYTES.load(Ordering::SeqCst) - b0;
     }
-    let allocs = total_allocs as f64 / iterations as f64;
-    let bytes = total_bytes as f64 / iterations as f64;
-    LayerResult {
-        layer: "Layer 1: Protocol materialization (poll_output_into)",
-        allocs_per_op: allocs,
-        bytes_per_op: bytes,
-        mean_cpu_ns: durations.iter().sum::<u64>() as f64 / durations.len() as f64,
-        p50_cpu_ns: durations[durations.len() * 50 / 100],
-        p95_cpu_ns: durations[durations.len() * 95 / 100],
-        p99_cpu_ns: durations[durations.len() * 99 / 100],
-    }
+    finish_layer(
+        "Layer 1: Protocol materialization (poll_output_into)",
+        total_allocs,
+        total_bytes,
+        iterations,
+        &mut durations,
+    )
 }
 
 fn bench_layer2_scheduler_mechanics(iterations: usize) -> LayerResult {
@@ -158,19 +217,15 @@ fn bench_layer2_scheduler_mechanics(iterations: usize) -> LayerResult {
         let _ = table.has_pending_output(now);
         durations.push(t0.elapsed().as_nanos() as u64);
     }
-
-    let allocs = ALLOC_COUNT.load(Ordering::SeqCst) as f64 / iterations as f64;
-    let bytes = ALLOC_BYTES.load(Ordering::SeqCst) as f64 / iterations as f64;
-    durations.sort_unstable();
-    LayerResult {
-        layer: "Layer 2: Scheduler mechanics (heap set/peek/presence)",
-        allocs_per_op: allocs,
-        bytes_per_op: bytes,
-        mean_cpu_ns: durations.iter().sum::<u64>() as f64 / iterations as f64,
-        p50_cpu_ns: durations[iterations * 50 / 100],
-        p95_cpu_ns: durations[iterations * 95 / 100],
-        p99_cpu_ns: durations[iterations * 99 / 100],
-    }
+    let total_allocs = ALLOC_COUNT.load(Ordering::SeqCst);
+    let total_bytes = ALLOC_BYTES.load(Ordering::SeqCst);
+    finish_layer(
+        "Layer 2: Scheduler mechanics (heap set/peek/presence)",
+        total_allocs,
+        total_bytes,
+        iterations,
+        &mut durations,
+    )
 }
 
 fn bench_layer3_compio_native_udp_send(iterations: usize) -> LayerResult {
@@ -199,20 +254,18 @@ fn bench_layer3_compio_native_udp_send(iterations: usize) -> LayerResult {
             buf = b;
         }
 
-        let allocs = ALLOC_COUNT.load(Ordering::SeqCst) as f64 / iterations as f64;
-        let bytes = ALLOC_BYTES.load(Ordering::SeqCst) as f64 / iterations as f64;
-        durations.sort_unstable();
-        LayerResult {
-            layer: "Layer 3: Compio native UdpSocket::send_to baseline",
-            allocs_per_op: allocs,
-            bytes_per_op: bytes,
-            mean_cpu_ns: durations.iter().sum::<u64>() as f64 / iterations as f64,
-            p50_cpu_ns: durations[iterations * 50 / 100],
-            p95_cpu_ns: durations[iterations * 95 / 100],
-            p99_cpu_ns: durations[iterations * 99 / 100],
-        }
+        let total_allocs = ALLOC_COUNT.load(Ordering::SeqCst);
+        let total_bytes = ALLOC_BYTES.load(Ordering::SeqCst);
+        finish_layer(
+            "Layer 3: Compio native UdpSocket::send_to baseline",
+            total_allocs,
+            total_bytes,
+            iterations,
+            &mut durations,
+        )
     })
 }
+
 fn bench_layer3b_owner_tx_pipeline(iterations: usize) -> LayerResult {
     let runtime = compio::runtime::Runtime::new().expect("compio runtime");
     runtime.block_on(async {
@@ -296,18 +349,15 @@ fn bench_layer3b_owner_tx_pipeline(iterations: usize) -> LayerResult {
             let _ = (a_start, a_after_service, a_after_wait);
         }
 
-        let allocs = ALLOC_COUNT.load(Ordering::SeqCst) as f64 / iterations as f64;
-        let bytes = ALLOC_BYTES.load(Ordering::SeqCst) as f64 / iterations as f64;
-        durations.sort_unstable();
-        LayerResult {
-            layer: "Layer 3b: Owner TX engine (push_datagram + send_to + reap)",
-            allocs_per_op: allocs,
-            bytes_per_op: bytes,
-            mean_cpu_ns: durations.iter().sum::<u64>() as f64 / iterations as f64,
-            p50_cpu_ns: durations[iterations * 50 / 100],
-            p95_cpu_ns: durations[iterations * 95 / 100],
-            p99_cpu_ns: durations[iterations * 99 / 100],
-        }
+        let total_allocs = ALLOC_COUNT.load(Ordering::SeqCst);
+        let total_bytes = ALLOC_BYTES.load(Ordering::SeqCst);
+        finish_layer(
+            "Layer 3b: Owner TX engine (push_datagram + send_to + reap)",
+            total_allocs,
+            total_bytes,
+            iterations,
+            &mut durations,
+        )
     })
 }
 
@@ -317,6 +367,7 @@ fn bench_layer4_full_compio_owner_tx(iterations: usize) -> LayerResult {
         let l_std = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let l_addr = l_std.local_addr().unwrap();
         let l_sock = compio::net::UdpSocket::from_std(l_std).unwrap();
+        let payload = payload_1316(0x55);
         let l_cfg = srt_transport::ListenerConfig::builder(l_addr)
             .build()
             .unwrap();
@@ -364,9 +415,7 @@ fn bench_layer4_full_compio_owner_tx(iterations: usize) -> LayerResult {
             }
         }
 
-        let payload = Bytes::from_static(
-            b"steady-state-1316-byte-compio-owner-datagram-transmission-payload",
-        );
+        // `payload` (1316 bytes, defined above) is reused for warmup + measurement.
 
         // Warmup: cycle sends and reap completions
         for round in 0..500 {
@@ -403,18 +452,15 @@ fn bench_layer4_full_compio_owner_tx(iterations: usize) -> LayerResult {
             owner.listener_mut().unwrap().table.poll_events(&mut events);
         }
 
-        let allocs = ALLOC_COUNT.load(Ordering::SeqCst) as f64 / iterations as f64;
-        let bytes = ALLOC_BYTES.load(Ordering::SeqCst) as f64 / iterations as f64;
-        durations.sort_unstable();
-        LayerResult {
-            layer: "Layer 4: Full loopback (Caller TX + Listener RX + ACKs)",
-            allocs_per_op: allocs,
-            bytes_per_op: bytes,
-            mean_cpu_ns: durations.iter().sum::<u64>() as f64 / iterations as f64,
-            p50_cpu_ns: durations[iterations * 50 / 100],
-            p95_cpu_ns: durations[iterations * 95 / 100],
-            p99_cpu_ns: durations[iterations * 99 / 100],
-        }
+        let total_allocs = ALLOC_COUNT.load(Ordering::SeqCst);
+        let total_bytes = ALLOC_BYTES.load(Ordering::SeqCst);
+        finish_layer(
+            "Layer 4: Full loopback (Caller TX + Listener RX + ACKs)",
+            total_allocs,
+            total_bytes,
+            iterations,
+            &mut durations,
+        )
     })
 }
 
