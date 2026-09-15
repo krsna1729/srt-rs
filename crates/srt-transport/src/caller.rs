@@ -3,7 +3,7 @@ use crate::{
     OutputDrainReport, OutputDrainStatus, PushResult, group_connection_stats,
 };
 use srt_proto::{Bytes, ConnectionOutput, OutputInto, OutputMeta, SrtConnection, Timestamp};
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Default maximum number of logical callers held by one table.
 ///
@@ -43,30 +43,93 @@ pub struct CallerEvent {
     pub event: srt_proto::ConnectionEvent,
 }
 
-/// Exact ordered deadline index for CallerTable.
+/// Bounded versioned due-deadline entry for `CallerTable`.
 ///
-/// Design choice: Unlike PeerTable's physical peers indexed by dense socket-ID
-/// slots in `DenseSlotArena`, CallerTable tracks application-level logical
-/// callers and bonded groups keyed by opaque `LogicalCallerId`. An exact
-/// `SchedEntry` provides O(log N) updates, O(log N) earliest deadline peek
-/// (leaf descent), and **no lazy stale heap** or generational rebuild. This
-/// is intentionally *not* a reuse of `DenseDueIndex`, which is specialized
-/// around `DenseSlotArena`'s dense slot/generation metadata. For CallerTable's
-/// HashMap-backed logical ids, the exact set is simpler, bounded at O(N) with
-/// zero stale amplification, and matches the paste-5 guidance to "benchmark
-/// the choice rather than starting another structural rewrite."
+/// Ordered by `(deadline_micros, id)` ascending — the exact same tie
+/// semantics the previous `BTreeSet<DeadlineEntry>` had: equal deadlines
+/// pop in caller-id order. `version` is the caller's deadline generation
+/// at push time; it only participates in staleness validation, never in
+/// ordering (two entries for one caller can never share a version).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct DeadlineEntry {
+struct LogicalDueEntry {
     deadline_micros: u64,
     id: LogicalCallerId,
+    version: u64,
 }
 
+/// Bounded versioned due-deadline index for [`CallerTable`].
+///
+/// Replaces the exact `BTreeSet<DeadlineEntry>`: every deadline change
+/// there was a remove+insert pair and every due drain allocated a fresh
+/// scratch `Vec`. The versioned lazy-stale heap keeps the same observable
+/// semantics with steady-state allocation stability:
+///
+/// - set/update is an O(log N) push; the superseded entry becomes stale
+///   and is never scanned for — it is discarded lazily when it reaches
+///   the heap head;
+/// - removal (`CallerTable::remove`) never scans the heap; the caller's
+///   sched entry disappears, so its heap entries fail validation and
+///   drain lazily;
+/// - a removed-then-re-added caller cannot be revived by a stale entry:
+///   logical ids are monotonic (never reused) and every re-set bumps the
+///   version the stale entry does not carry;
+/// - stale amplification is bounded: when stale pops since the last
+///   rebuild exceed half the physical heap, a single O(N) rebuild
+///   validates every entry against the scheduler map;
+/// - earliest-live peek discards stale heads lazily, so `now` probes
+///   (`time_until_next_deadline`, `has_due_remaining`) never report a
+///   dead deadline.
+///
+/// `live` is bookkept exactly: push +1; a superseded entry -1; a validated
+/// pop -1; a rebuild recomputes it as the kept count. Stale pops never
+/// touch it (their live slot was already reclaimed at supersession).
+#[derive(Debug)]
+struct LogicalDueIndex {
+    heap: std::collections::BinaryHeap<std::cmp::Reverse<LogicalDueEntry>>,
+    live: usize,
+    stale_popped: u64,
+    rebuilds: u64,
+    stale_since_rebuild: usize,
+    /// Reusable scratch for allocation-free `rebuild_due_index`. Retained
+    /// between rebuilds so the O(N) sweep never re-allocates.
+    rebuild_scratch: Vec<std::cmp::Reverse<LogicalDueEntry>>,
+}
+
+impl LogicalDueIndex {
+    /// Pre-sized to the caller cap.
+    fn new(capacity: usize) -> Self {
+        Self {
+            heap: std::collections::BinaryHeap::with_capacity(capacity),
+            live: 0,
+            stale_popped: 0,
+            rebuilds: 0,
+            stale_since_rebuild: 0,
+            rebuild_scratch: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn push(&mut self, entry: LogicalDueEntry) {
+        self.heap.push(std::cmp::Reverse(entry));
+        self.live += 1;
+    }
+
+    fn physical_len(&self) -> usize {
+        self.heap.len()
+    }
+}
+
+/// One caller's scheduler metadata. `deadline_version` increments (u64,
+/// wrapping) on every deadline set/clear, so every heap entry names
+/// exactly one generation; the `u64` width makes wraparound aliasing
+/// unreachable for any real caller lifetime.
 #[derive(Debug, Clone, Copy)]
 struct SchedEntry {
     ready_queued: bool,
     event_ready_queued: bool,
     deadline_micros: Option<u64>,
+    deadline_version: u64,
 }
+
 /// Coarse logical state of an outbound stream, independent of how many
 /// physical SRT legs currently carry it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -311,8 +374,12 @@ pub struct CallerTable {
     routes: HashMap<u32, CallerRoute>,
     ready_queue: VecDeque<LogicalCallerId>,
     event_ready_queue: VecDeque<LogicalCallerId>,
-    deadlines: BTreeSet<DeadlineEntry>,
+    deadlines: LogicalDueIndex,
     sched: HashMap<LogicalCallerId, SchedEntry>,
+    /// Table-owned reusable due scratch: `pop_due_ids` fills it, the fire
+    /// phase drains it, and its capacity is retained across calls so the
+    /// normal service path never allocates.
+    due_scratch: Vec<LogicalCallerId>,
     next_logical_caller: u64,
     max_callers: usize,
     #[cfg(any(test, feature = "bench-internals"))]
@@ -335,6 +402,21 @@ pub struct SchedCounters {
     /// Output budget exhaustion events.
     pub budget_exhausted: usize,
 }
+
+/// Telemetry snapshot of the versioned due index (bench/tests).
+#[cfg(any(test, feature = "bench-internals"))]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DueIndexSnapshot {
+    /// Live (validated) deadline entries.
+    pub live: usize,
+    /// Physical heap entries, including stale ones not yet discarded.
+    pub physical: usize,
+    /// Cumulative stale entries discarded lazily at peek/pop.
+    pub stale_popped: u64,
+    /// Cumulative amortized rebuilds.
+    pub rebuilds: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum CallerRoute {
     Direct(LogicalCallerId),
@@ -614,23 +696,27 @@ impl CallerTable {
         Self::with_max_callers(DEFAULT_MAX_CALLERS)
     }
 
-    /// Build a table with an explicit finite logical-caller cap.
+    /// Build a table with an explicit finite logical-caller cap. All
+    /// scheduler containers (sessions/routes maps, both ready queues, the
+    /// due index, and the due scratch) are pre-sized from the bounded cap
+    /// so steady-state service never grows one.
     #[must_use]
     pub fn with_max_callers(max_callers: usize) -> Self {
+        let bounded = max_callers.clamp(1, MAX_CALLERS);
         Self {
-            sessions: HashMap::new(),
-            routes: HashMap::new(),
-            ready_queue: VecDeque::new(),
-            event_ready_queue: VecDeque::new(),
-            deadlines: BTreeSet::new(),
-            sched: HashMap::new(),
+            sessions: HashMap::with_capacity(bounded),
+            routes: HashMap::with_capacity(bounded),
+            ready_queue: VecDeque::with_capacity(bounded),
+            event_ready_queue: VecDeque::with_capacity(bounded),
+            deadlines: LogicalDueIndex::new(bounded),
+            sched: HashMap::with_capacity(bounded),
+            due_scratch: Vec::with_capacity(bounded.min(256)),
             next_logical_caller: 1,
-            max_callers: max_callers.clamp(1, MAX_CALLERS),
+            max_callers: bounded,
             #[cfg(any(test, feature = "bench-internals"))]
             sched_stats: SchedCounters::default(),
         }
     }
-
     fn logical_next_deadline(session: &CallerSession) -> Option<Timestamp> {
         match session {
             CallerSession::Direct(leg) => leg.timers.next_deadline(),
@@ -652,24 +738,94 @@ impl CallerTable {
             ready_queued: false,
             event_ready_queued: false,
             deadline_micros: None,
+            deadline_version: 0,
         });
         let old_micros = entry.deadline_micros;
         if old_micros == new_micros {
             return;
         }
-        if let Some(old) = old_micros {
-            self.deadlines.remove(&DeadlineEntry {
-                deadline_micros: old,
-                id,
-            });
+        // The old entry, if any, is superseded: its live slot is reclaimed
+        // here and the heap copy drains lazily at the head. The version
+        // bump means the stale copy can never validate again.
+        if old_micros.is_some() {
+            self.deadlines.live = self.deadlines.live.saturating_sub(1);
+            self.deadlines.stale_since_rebuild += 1;
         }
+        entry.deadline_version = entry.deadline_version.wrapping_add(1);
         if let Some(n) = new_micros {
-            self.deadlines.insert(DeadlineEntry {
+            let version = entry.deadline_version;
+            self.deadlines.push(LogicalDueEntry {
                 deadline_micros: n,
                 id,
+                version,
             });
         }
         entry.deadline_micros = new_micros;
+        if self.stale_amplification_exceeded() {
+            self.rebuild_due_index();
+        }
+    }
+
+    /// Whether a heap entry names the caller's current deadline generation.
+    fn due_entry_is_live(&self, entry: &LogicalDueEntry) -> bool {
+        match self.sched.get(&entry.id) {
+            None => false,
+            Some(meta) => {
+                meta.deadline_micros == Some(entry.deadline_micros)
+                    && meta.deadline_version == entry.version
+            }
+        }
+    }
+
+    /// Pop the head while it is stale, so the remaining head is either a
+    /// live entry or the heap is empty. Returns the live head.
+    fn validate_due_head(&mut self) -> Option<LogicalDueEntry> {
+        loop {
+            let head = self.deadlines.heap.peek()?.0;
+            if self.due_entry_is_live(&head) {
+                return Some(head);
+            }
+            self.deadlines.heap.pop();
+            self.deadlines.stale_popped = self.deadlines.stale_popped.saturating_add(1);
+            self.deadlines.stale_since_rebuild += 1;
+            if self.stale_amplification_exceeded() {
+                self.rebuild_due_index();
+            }
+        }
+    }
+
+    fn stale_amplification_exceeded(&self) -> bool {
+        self.deadlines.stale_since_rebuild > self.deadlines.physical_len() / 2
+    }
+
+    /// Amortized O(N) validation sweep that drops every stale entry at
+    /// once when lazily-discarded staleness has grown past half the
+    /// physical heap. Bounded: runs at most once per `heap.len()/2` stale
+    /// pops. Uses `rebuild_scratch` so no allocation occurs.
+    fn rebuild_due_index(&mut self) {
+        // Phase 1: drain heap into scratch (no alloc; heap retains capacity).
+        self.deadlines.rebuild_scratch.clear();
+        self.deadlines
+            .rebuild_scratch
+            .extend(self.deadlines.heap.drain());
+        // Phase 2: compact scratch in-place without holding a borrow on it
+        // while calling `due_entry_is_live` (which borrows `self.sched`).
+        let mut write = 0;
+        for read in 0..self.deadlines.rebuild_scratch.len() {
+            if self.due_entry_is_live(&self.deadlines.rebuild_scratch[read].0) {
+                self.deadlines.rebuild_scratch.swap(write, read);
+                write += 1;
+            }
+        }
+        self.deadlines.rebuild_scratch.truncate(write);
+        let live = write;
+        // Phase 3: bulk-extend back into the heap (O(N) heapify; no alloc).
+        self.deadlines
+            .heap
+            .extend(self.deadlines.rebuild_scratch.drain(..));
+        self.deadlines.live = live;
+        self.deadlines.rebuilds = self.deadlines.rebuilds.saturating_add(1);
+        self.deadlines.stale_since_rebuild = 0;
     }
 
     fn enqueue_ready(&mut self, id: LogicalCallerId) {
@@ -677,6 +833,7 @@ impl CallerTable {
             ready_queued: false,
             event_ready_queued: false,
             deadline_micros: None,
+            deadline_version: 0,
         });
         if entry.ready_queued {
             return;
@@ -690,6 +847,7 @@ impl CallerTable {
             ready_queued: false,
             event_ready_queued: false,
             deadline_micros: None,
+            deadline_version: 0,
         });
         if entry.event_ready_queued {
             return;
@@ -767,9 +925,25 @@ impl CallerTable {
 
     #[cfg(any(test, feature = "bench-internals"))]
     pub fn deadline_count(&self) -> usize {
-        self.deadlines.len()
+        self.deadlines.live
     }
 
+    #[cfg(any(test, feature = "bench-internals"))]
+    pub fn due_index_snapshot(&self) -> DueIndexSnapshot {
+        DueIndexSnapshot {
+            live: self.deadlines.live,
+            physical: self.deadlines.physical_len(),
+            stale_popped: self.deadlines.stale_popped,
+            rebuilds: self.deadlines.rebuilds,
+        }
+    }
+
+    #[cfg(any(test, feature = "bench-internals"))]
+    /// Ids collected by the last `pop_due_ids` call, before
+    /// `fire_due_ids` consumes them.
+    pub fn bench_due_scratch(&self) -> &[LogicalCallerId] {
+        &self.due_scratch
+    }
     #[cfg(any(test, feature = "bench-internals"))]
     pub fn ready_queue_len(&self) -> usize {
         self.ready_queue.len()
@@ -807,6 +981,7 @@ impl CallerTable {
                 ready_queued: false,
                 event_ready_queued: false,
                 deadline_micros: None,
+                deadline_version: 0,
             },
         );
         self.sync_deadline(id);
@@ -896,6 +1071,7 @@ impl CallerTable {
                 ready_queued: false,
                 event_ready_queued: false,
                 deadline_micros: None,
+                deadline_version: 0,
             },
         );
         self.sync_deadline(id);
@@ -976,44 +1152,51 @@ impl CallerTable {
         feed_res.map(|()| true)
     }
 
-    /// Pop up to `max_due` sessions whose deadline has passed, in deadline
-    /// order, reusing the existing `deadlines` `BTreeSet` index (P02
-    /// checkpoint 3) rather than a separate scheduler. A session past the
-    /// cap is left exactly where it was -- still in `deadlines`, still
-    /// due -- so it is picked up again, unchanged, by the very next call
-    /// with a `now` no earlier than this one.
-    fn pop_due_ids(&mut self, now: Timestamp, max_due: usize) -> Vec<LogicalCallerId> {
+    /// Pop up to `max_due` sessions whose deadline has passed, in
+    /// `(deadline, id)` order, into the table-owned due scratch. Returns
+    /// the popped count; the ids stay in `due_scratch` until
+    /// [`Self::fire_due_ids`] drains them. A session past the cap is left
+    /// exactly where it was -- still live in the due index, still due -- so
+    /// it is picked up again, unchanged, by the very next call with a
+    /// `now` no earlier than this one. Zero `max_due` performs no work.
+    fn pop_due_ids(&mut self, now: Timestamp, max_due: usize) -> usize {
+        self.due_scratch.clear();
         let now_micros = now.as_micros();
-        let mut due_ids = Vec::new();
-        while due_ids.len() < max_due {
-            let Some(entry) = self.deadlines.first().copied() else {
+        while self.due_scratch.len() < max_due {
+            let Some(entry) = self.validate_due_head() else {
                 break;
             };
             if entry.deadline_micros > now_micros {
                 break;
             }
-            self.deadlines.pop_first();
+            let popped = self.deadlines.heap.pop().expect("validated head exists");
+            debug_assert_eq!(popped.0, entry);
+            self.deadlines.live = self.deadlines.live.saturating_sub(1);
             if let Some(meta) = self.sched.get_mut(&entry.id) {
                 meta.deadline_micros = None;
             }
             if !self.sessions.contains_key(&entry.id) {
                 continue;
             }
-            due_ids.push(entry.id);
+            self.due_scratch.push(entry.id);
         }
-        due_ids
+        self.due_scratch.len()
     }
 
-    /// Whether a due session remains in `deadlines` that this visit's
-    /// `pop_due_ids` cap left unfired (P02).
-    fn has_due_remaining(&self, now: Timestamp) -> bool {
-        self.deadlines
-            .first()
+    /// Whether a due session remains that this visit's `pop_due_ids` cap
+    /// left unfired (P02). Discards stale heads first so a superseded or
+    /// removed caller can never look like pending work.
+    fn has_due_remaining(&mut self, now: Timestamp) -> bool {
+        self.validate_due_head()
             .is_some_and(|entry| entry.deadline_micros <= now.as_micros())
     }
 
-    fn fire_due_ids(&mut self, ids: Vec<LogicalCallerId>, now: Timestamp) {
-        for id in ids {
+    /// Fire the timers of every due id left in `due_scratch` by the last
+    /// [`Self::pop_due_ids`], then drain the scratch.
+    fn fire_due_ids(&mut self, now: Timestamp) {
+        let count = self.due_scratch.len();
+        for i in 0..count {
+            let id = self.due_scratch[i];
             if let Some(session) = self.sessions.get_mut(&id) {
                 session.fire_timers(now);
                 #[cfg(any(test, feature = "bench-internals"))]
@@ -1025,6 +1208,7 @@ impl CallerTable {
             self.enqueue_event_ready(id);
             self.sync_deadline(id);
         }
+        self.due_scratch.clear();
     }
 
     /// Drive all protocol timers and collect datagrams for the application to
@@ -1078,10 +1262,9 @@ impl CallerTable {
                 0,
             );
         }
-        let due_ids = self.pop_due_ids(now, budget.max_actions);
-        let due_actions = due_ids.len();
+        let due_actions = self.pop_due_ids(now, budget.max_actions);
         let due_remaining = self.has_due_remaining(now);
-        self.fire_due_ids(due_ids, now);
+        self.fire_due_ids(now);
         let remaining = OutputDrainBudget::new(
             budget.max_actions.saturating_sub(due_actions),
             budget.max_packets,
@@ -1241,13 +1424,13 @@ impl CallerTable {
             CallerRoute::Direct(caller) => *caller != id,
             CallerRoute::Group { caller, .. } => *caller != id,
         });
+        // Removing the sched entry invalidates every heap entry for this
+        // caller (validation looks the id up in `sched`); the physical
+        // copies drain lazily. No heap scan here.
         if let Some(meta) = self.sched.remove(&id)
-            && let Some(old) = meta.deadline_micros
+            && meta.deadline_micros.is_some()
         {
-            self.deadlines.remove(&DeadlineEntry {
-                deadline_micros: old,
-                id,
-            });
+            self.deadlines.live = self.deadlines.live.saturating_sub(1);
         }
         self.maybe_compact_ready_queue();
         self.maybe_compact_event_ready_queue();
@@ -1356,13 +1539,22 @@ impl CallerTable {
     }
 
     /// Whether output or a due timer can be serviced at `now`.
+    ///
+    /// Scans for the earliest live deadline so stale heap entries do not
+    /// cause spurious wakeups. `live == 0` short-circuits immediately.
     #[must_use]
     pub fn has_pending_output(&self, now: Timestamp) -> bool {
-        !self.ready_queue.is_empty()
-            || self
-                .deadlines
-                .first()
-                .is_some_and(|entry| entry.deadline_micros <= now.as_micros())
+        if !self.ready_queue.is_empty() {
+            return true;
+        }
+        if self.deadlines.live == 0 {
+            return false;
+        }
+        let now_us = now.as_micros();
+        self.deadlines
+            .heap
+            .iter()
+            .any(|rev| self.due_entry_is_live(&rev.0) && rev.0.deadline_micros <= now_us)
     }
 
     /// Whether this table has any bounded work to drive at `now`.
@@ -1379,14 +1571,34 @@ impl CallerTable {
         })
     }
 
+    /// Time in microseconds until the nearest **live** deadline, capped at
+    /// `default_micros`.
+    ///
+    /// Iterates the heap from the minimum until it finds a live entry, so
+    /// stale entries left from a superseded or cleared deadline do not
+    /// cause the caller to wake too early. In practice the stale depth at
+    /// the head is 0 or 1, so this is O(1) on the hot path.
     #[must_use]
     pub fn time_until_next_deadline(&self, now: Timestamp, default_micros: u64) -> u64 {
-        if let Some(entry) = self.deadlines.first() {
-            let deadline = Timestamp::from_micros(entry.deadline_micros);
-            let until = deadline.as_micros().saturating_sub(now.as_micros());
-            return until.min(default_micros);
+        if self.deadlines.live == 0 {
+            return default_micros;
         }
-        default_micros
+        // Walk the ordered heap from min to find the first live entry.
+        // BinaryHeap's iterator is unordered, but the minimum is the
+        // true live head or very near it. We want the smallest
+        // deadline_micros among live entries.
+        let now_us = now.as_micros();
+        let mut best = u64::MAX;
+        for rev in self.deadlines.heap.iter() {
+            let e = &rev.0;
+            if self.due_entry_is_live(e) {
+                best = best.min(e.deadline_micros);
+            }
+        }
+        if best == u64::MAX {
+            return default_micros;
+        }
+        best.saturating_sub(now_us).min(default_micros)
     }
 
     #[cfg(any(test, feature = "bench-internals"))]
@@ -4463,16 +4675,13 @@ mod tests {
                 Timestamp::from_micros(0),
             );
         }
-        assert_eq!(table.deadlines.len(), N);
+        assert_eq!(table.deadline_count(), N);
 
-        let popped = table.pop_due_ids(now, CAP);
+        let n_popped = table.pop_due_ids(now, CAP);
+        assert_eq!(n_popped, CAP, "must pop exactly the cap, not fewer or more");
+        let popped: Vec<_> = table.bench_due_scratch().to_vec();
         assert_eq!(
-            popped.len(),
-            CAP,
-            "must pop exactly the cap, not fewer or more"
-        );
-        assert_eq!(
-            table.deadlines.len(),
+            table.deadline_count(),
             N - CAP,
             "everything past the cap must remain in the deadline index, untouched"
         );
@@ -4483,8 +4692,9 @@ mod tests {
 
         // Draining the rest in one more call must account for every
         // session exactly once: none left behind, none popped twice.
-        let rest = table.pop_due_ids(now, usize::MAX);
-        assert_eq!(rest.len(), N - CAP);
+        let n_rest = table.pop_due_ids(now, usize::MAX);
+        assert_eq!(n_rest, N - CAP);
+        let rest: Vec<_> = table.bench_due_scratch().to_vec();
         let mut all_popped: Vec<_> = popped.into_iter().chain(rest).collect();
         all_popped.sort();
         let mut expected = ids;
