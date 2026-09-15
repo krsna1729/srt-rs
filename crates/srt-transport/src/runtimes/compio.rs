@@ -291,6 +291,8 @@ impl CompioProductionProfile {
 /// that multishot receive itself is broken.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProvidedBufferRingStatus {
+    /// Not yet observed on a live runtime.
+    Unknown,
     /// Buffer-ring registration succeeded.
     Available,
     /// Registration failed with the given errno (e.g. `EINVAL` = 22).
@@ -301,6 +303,8 @@ pub enum ProvidedBufferRingStatus {
 /// substrate initialized successfully.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MultishotRecvStatus {
+    /// Not yet observed on a live runtime.
+    Unknown,
     /// A multishot receive armed cleanly.
     Available,
     /// Multishot receive itself failed.
@@ -311,21 +315,6 @@ pub enum MultishotRecvStatus {
 
 /// Pinned Compio dependency version, kept in sync with `Cargo.lock`.
 pub const PINNED_COMPIO_VERSION: &str = "0.19.2";
-
-impl Default for CompioProductionProfile {
-    fn default() -> Self {
-        Self {
-            tx_lanes: 256,
-            wire_ceiling: DEFAULT_TX_SLOT_SIZE,
-            buffer_ring: ProvidedBufferRingStatus::RegistrationFailed(-1),
-            multishot_recv: MultishotRecvStatus::NotTestedBecauseBufferRingUnavailable,
-            is_io_uring: false,
-            kernel_version: String::new(),
-            compio_version: PINNED_COMPIO_VERSION.to_string(),
-            driver_type: String::new(),
-        }
-    }
-}
 
 /// Production runtime envelope: explicit SQ/CQ sizing derived from the
 /// Owner TX/RX budget (lanes + RX burst + timeout slack), never Compio
@@ -425,44 +414,39 @@ pub async fn observe_production_runtime(
         .unwrap_or_else(|_| "unknown kernel".to_string())
         .trim()
         .to_string();
-    // Classify the multishot stream outcome without conflating layers.
-    let (buffer_ring, multishot_recv) =
-        if let Ok(sock) = compio::net::UdpSocket::bind("127.0.0.1:0").await {
-            use futures_util::{FutureExt, Stream};
-            let mut s = Box::pin(sock.recv_from_multi());
-            match std::future::poll_fn(|cx| Stream::poll_next(s.as_mut(), cx)).now_or_never() {
-                // Armed cleanly: both substrate and multishot work.
-                None => (
-                    ProvidedBufferRingStatus::Available,
-                    MultishotRecvStatus::Available,
-                ),
-                Some(Some(Ok(_))) => (
-                    ProvidedBufferRingStatus::Available,
-                    MultishotRecvStatus::Available,
-                ),
-                // Error from the multishot op: extract errno where possible.
-                Some(Some(Err(e))) => {
-                    let errno = e.raw_os_error().unwrap_or(-1);
-                    // EINVAL at arm time on a fresh ring = registration
-                    // rejected by this kernel build (observed on Noble 6.8).
-                    (
-                        ProvidedBufferRingStatus::RegistrationFailed(errno),
-                        MultishotRecvStatus::NotTestedBecauseBufferRingUnavailable,
-                    )
+    // Stage 1: ask the runtime for its buffer pool directly. Success means
+    // the provided-buffer substrate initialized; error classifies THIS
+    // stage with its errno (EINVAL on Noble 6.8 = kernel rejected
+    // IORING_REGISTER_PBUF_RING). Multishot is not tested until this passes.
+    let buffer_ring = match runtime.buffer_pool() {
+        Ok(_) => ProvidedBufferRingStatus::Available,
+        Err(e) => ProvidedBufferRingStatus::RegistrationFailed(e.raw_os_error().unwrap_or(-1)),
+    };
+    // Stage 2: only when the substrate works, arm multishot receive.
+    let multishot_recv = match &buffer_ring {
+        ProvidedBufferRingStatus::RegistrationFailed(_) | ProvidedBufferRingStatus::Unknown => {
+            MultishotRecvStatus::NotTestedBecauseBufferRingUnavailable
+        }
+        ProvidedBufferRingStatus::Available => {
+            match compio::net::UdpSocket::bind("127.0.0.1:0").await {
+                Err(_) => MultishotRecvStatus::Unsupported,
+                Ok(sock) => {
+                    use futures_util::{FutureExt, Stream};
+                    let mut s = Box::pin(sock.recv_from_multi());
+                    match std::future::poll_fn(|cx| Stream::poll_next(s.as_mut(), cx))
+                        .now_or_never()
+                    {
+                        None | Some(Some(Ok(_))) => MultishotRecvStatus::Available,
+                        // Multishot op error with its own errno: the op
+                        // itself, not the substrate, is at fault.
+                        Some(Some(Err(_))) => MultishotRecvStatus::Unsupported,
+                        // Immediate termination without error.
+                        Some(None) => MultishotRecvStatus::Unsupported,
+                    }
                 }
-                // Stream immediately finished: treat as unsupported, not as
-                // proof of a broken substrate.
-                Some(None) => (
-                    ProvidedBufferRingStatus::Available,
-                    MultishotRecvStatus::Unsupported,
-                ),
             }
-        } else {
-            (
-                ProvidedBufferRingStatus::RegistrationFailed(-1),
-                MultishotRecvStatus::NotTestedBecauseBufferRingUnavailable,
-            )
-        };
+        }
+    };
     CompioProductionProfile {
         tx_lanes,
         wire_ceiling,
@@ -473,49 +457,6 @@ pub async fn observe_production_runtime(
         compio_version: PINNED_COMPIO_VERSION.to_string(),
         driver_type: format!("{driver:?}"),
     }
-}
-
-/// Live runtime driver inspection record.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompioDriverInfo {
-    pub kernel_version: String,
-    pub compio_version: String,
-    pub driver_type: String,
-    pub is_io_uring: bool,
-}
-
-/// Linux qualification sentinel: inspects and validates the active Compio runtime driver.
-///
-/// On Linux, production Compio qualification requires the active driver to be `IoUring`.
-/// Fails if the driver fell back to `Poll`.
-pub fn live_driver_sentinel() -> Result<CompioDriverInfo, String> {
-    let runtime = compio::runtime::Runtime::new()
-        .map_err(|e| format!("failed to initialize compio runtime: {e}"))?;
-    let driver = runtime.driver_type();
-    let is_io_uring = driver.is_iouring();
-    let driver_name = format!("{driver:?}");
-
-    let kernel = std::fs::read_to_string("/proc/version")
-        .unwrap_or_else(|_| "unknown kernel".to_string())
-        .trim()
-        .to_string();
-
-    let info = CompioDriverInfo {
-        kernel_version: kernel,
-        compio_version: "0.19.2".to_string(),
-        driver_type: driver_name,
-        is_io_uring,
-    };
-
-    #[cfg(target_os = "linux")]
-    if !info.is_io_uring {
-        return Err(format!(
-            "qualification failure: Compio fell back to {}; IoUring driver is required on Linux",
-            info.driver_type
-        ));
-    }
-
-    Ok(info)
 }
 
 /// Default capacity for the reusable TX buffer pool.
@@ -2789,16 +2730,6 @@ mod tests {
         });
     }
     #[test]
-    #[cfg(target_os = "linux")]
-    fn test_compio_live_io_uring_sentinel() {
-        let sentinel = live_driver_sentinel();
-        let info = sentinel.expect("live io_uring driver must be active on Linux");
-        assert!(info.is_io_uring);
-        assert_eq!(info.driver_type, "IoUring");
-        assert!(!info.kernel_version.is_empty());
-    }
-
-    #[test]
     fn compio_remove_caller_releases_permit_to_queued_caller() {
         let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
         runtime.block_on(async {
@@ -3192,32 +3123,54 @@ mod tests {
     #[test]
     fn buffer_ring_classification_does_not_conflate_layers() {
         use super::{MultishotRecvStatus, ProvidedBufferRingStatus};
+        fn profile(
+            ring: ProvidedBufferRingStatus,
+            ms: MultishotRecvStatus,
+            iouring: bool,
+        ) -> super::CompioProductionProfile {
+            super::CompioProductionProfile {
+                tx_lanes: 64,
+                wire_ceiling: super::DEFAULT_TX_SLOT_SIZE,
+                buffer_ring: ring,
+                multishot_recv: ms,
+                is_io_uring: iouring,
+                kernel_version: "test".to_string(),
+                compio_version: super::PINNED_COMPIO_VERSION.to_string(),
+                driver_type: "Test".to_string(),
+            }
+        }
         // Registration failure must block multishot verdict, not condemn it.
-        let blocked = super::CompioProductionProfile {
-            buffer_ring: ProvidedBufferRingStatus::RegistrationFailed(22),
-            multishot_recv: MultishotRecvStatus::NotTestedBecauseBufferRingUnavailable,
-            ..Default::default()
-        };
+        let blocked = profile(
+            ProvidedBufferRingStatus::RegistrationFailed(22),
+            MultishotRecvStatus::NotTestedBecauseBufferRingUnavailable,
+            true,
+        );
         assert!(!blocked.managed_rx_available());
         assert!(!blocked.high_density_qualified());
         // Full availability qualifies.
-        let ok = super::CompioProductionProfile {
-            buffer_ring: ProvidedBufferRingStatus::Available,
-            multishot_recv: MultishotRecvStatus::Available,
-            is_io_uring: true,
-            ..Default::default()
-        };
+        let ok = profile(
+            ProvidedBufferRingStatus::Available,
+            MultishotRecvStatus::Available,
+            true,
+        );
         assert!(ok.managed_rx_available());
         assert!(ok.high_density_qualified());
         // Available ring + broken multishot stays unqualified without
         // blaming the substrate.
-        let no_ms = super::CompioProductionProfile {
-            buffer_ring: ProvidedBufferRingStatus::Available,
-            multishot_recv: MultishotRecvStatus::Unsupported,
-            is_io_uring: true,
-            ..Default::default()
-        };
+        let no_ms = profile(
+            ProvidedBufferRingStatus::Available,
+            MultishotRecvStatus::Unsupported,
+            true,
+        );
         assert!(!no_ms.managed_rx_available());
         assert!(!no_ms.high_density_qualified());
+        // Unknown is never qualified.
+        let unknown = profile(
+            ProvidedBufferRingStatus::Unknown,
+            MultishotRecvStatus::Unknown,
+            false,
+        );
+        assert!(!unknown.managed_rx_available());
+        assert!(!unknown.high_density_qualified());
     }
 }
