@@ -216,6 +216,49 @@ pub fn caller(
     ))
 }
 
+/// Live runtime driver inspection record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompioDriverInfo {
+    pub kernel_version: String,
+    pub compio_version: String,
+    pub driver_type: String,
+    pub is_io_uring: bool,
+}
+
+/// Linux qualification sentinel: inspects and validates the active Compio runtime driver.
+///
+/// On Linux, production Compio qualification requires the active driver to be `IoUring`.
+/// Fails if the driver fell back to `Poll`.
+pub fn live_driver_sentinel() -> Result<CompioDriverInfo, String> {
+    let runtime = compio::runtime::Runtime::new()
+        .map_err(|e| format!("failed to initialize compio runtime: {e}"))?;
+    let driver = runtime.driver_type();
+    let is_io_uring = driver.is_iouring();
+    let driver_name = format!("{driver:?}");
+
+    let kernel = std::fs::read_to_string("/proc/version")
+        .unwrap_or_else(|_| "unknown kernel".to_string())
+        .trim()
+        .to_string();
+
+    let info = CompioDriverInfo {
+        kernel_version: kernel,
+        compio_version: "0.19.2".to_string(),
+        driver_type: driver_name,
+        is_io_uring,
+    };
+
+    #[cfg(target_os = "linux")]
+    if !info.is_io_uring {
+        return Err(format!(
+            "qualification failure: Compio fell back to {}; IoUring driver is required on Linux",
+            info.driver_type
+        ));
+    }
+
+    Ok(info)
+}
+
 /// Default capacity for the reusable TX buffer pool.
 pub const DEFAULT_TX_POOL_CAPACITY: usize = 256;
 /// Default slot size matching standard 1500 MTU datagram bound.
@@ -1206,5 +1249,14 @@ mod tests {
             let report = owner.service(now, budget).await;
             assert_eq!(report.tx_packets_submitted, 8);
         });
+    }
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_compio_live_io_uring_sentinel() {
+        let sentinel = live_driver_sentinel();
+        let info = sentinel.expect("live io_uring driver must be active on Linux");
+        assert!(info.is_io_uring);
+        assert_eq!(info.driver_type, "IoUring");
+        assert!(!info.kernel_version.is_empty());
     }
 }

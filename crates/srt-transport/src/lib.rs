@@ -268,6 +268,7 @@ pub(crate) use caller_pool::{
 };
 #[allow(unused_imports)]
 pub(crate) use cpu::{available_cpus, current_cpu_spec, parse_cpu_spec, restrict_to_cpu_list};
+#[allow(unused_imports)]
 #[cfg(any(test, feature = "mio", feature = "tokio"))]
 pub(crate) use deadline_heap::schedule_wait_micros;
 pub(crate) use due_index::DueIndex;
