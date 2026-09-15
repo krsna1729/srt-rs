@@ -14,6 +14,11 @@ pub const DEFAULT_MAX_CALLERS: usize = 4096;
 /// lower limit, but an accidental `usize::MAX` must not turn a shard into an
 /// unbounded admission promise.
 pub const MAX_CALLERS: usize = 1 << 16;
+/// Internal cap on due-timer fires per drain visit. Production never fires
+/// thousands of timers synchronously just because an outer compatibility
+/// budget supplied `usize::MAX`: the remainder stays live in the heap and
+/// is picked up, unchanged, by the next visit.
+pub(crate) const MAX_DUE_PER_VISIT: usize = 256;
 /// Opaque application identity for one outbound SRT stream. A direct caller
 /// and a bonded Broadcast/Backup group have the same steady-state API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -43,91 +48,77 @@ pub struct CallerEvent {
     pub event: srt_proto::ConnectionEvent,
 }
 
-/// Bounded versioned due-deadline entry for `CallerTable`.
+/// One node of the indexed caller-deadline min-heap.
 ///
 /// Ordered by `(deadline_micros, id)` ascending — the exact same tie
 /// semantics the previous `BTreeSet<DeadlineEntry>` had: equal deadlines
-/// pop in caller-id order. `version` is the caller's deadline generation
-/// at push time; it only participates in staleness validation, never in
-/// ordering (two entries for one caller can never share a version).
+/// pop in caller-id order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct LogicalDueEntry {
+struct DeadlineNode {
     deadline_micros: u64,
     id: LogicalCallerId,
-    version: u64,
 }
 
-/// Bounded versioned due-deadline index for [`CallerTable`].
+/// Bounded indexed due-deadline min-heap for [`CallerTable`].
 ///
 /// Replaces the exact `BTreeSet<DeadlineEntry>`: every deadline change
-/// there was a remove+insert pair and every due drain allocated a fresh
-/// scratch `Vec`. The versioned lazy-stale heap keeps the same observable
-/// semantics with steady-state allocation stability:
+/// there was a remove+insert pair allocating a tree node, and every due
+/// drain allocated a fresh scratch `Vec`. The indexed heap keeps the same
+/// observable semantics with steady-state allocation stability and no
+/// population scans:
 ///
-/// - set/update is an O(log N) push; the superseded entry becomes stale
-///   and is never scanned for — it is discarded lazily when it reaches
-///   the heap head;
-/// - removal (`CallerTable::remove`) never scans the heap; the caller's
-///   sched entry disappears, so its heap entries fail validation and
-///   drain lazily;
-/// - a removed-then-re-added caller cannot be revived by a stale entry:
-///   logical ids are monotonic (never reused) and every re-set bumps the
-///   version the stale entry does not carry;
-/// - stale amplification is bounded: when stale pops since the last
-///   rebuild exceed half the physical heap, a single O(N) rebuild
-///   validates every entry against the scheduler map;
-/// - earliest-live peek discards stale heads lazily, so `now` probes
-///   (`time_until_next_deadline`, `has_due_remaining`) never report a
-///   dead deadline.
-///
-/// `live` is bookkept exactly: push +1; a superseded entry -1; a validated
-/// pop -1; a rebuild recomputes it as the kept count. Stale pops never
-/// touch it (their live slot was already reclaimed at supersession).
+/// - each live caller occupies exactly one heap slot; `heap_pos` in its
+///   `SchedEntry` names that slot, so set/update/remove are O(log N) with
+///   zero stale entries, zero rebuilds, zero lazy discards;
+/// - `heap[0]` is always the earliest live deadline: `next deadline` and
+///   `has due` probes are O(1) with no heap iteration;
+/// - preallocated to `max_callers`: pushes never reallocate after warmup.
 #[derive(Debug)]
 struct LogicalDueIndex {
-    heap: std::collections::BinaryHeap<std::cmp::Reverse<LogicalDueEntry>>,
-    live: usize,
-    stale_popped: u64,
-    rebuilds: u64,
-    stale_since_rebuild: usize,
-    /// Reusable scratch for allocation-free `rebuild_due_index`. Retained
-    /// between rebuilds so the O(N) sweep never re-allocates.
-    rebuild_scratch: Vec<std::cmp::Reverse<LogicalDueEntry>>,
+    heap: Vec<DeadlineNode>,
 }
 
 impl LogicalDueIndex {
-    /// Pre-sized to the caller cap.
+    /// Pre-sized to the caller cap: every slot is reserved up front so
+    /// steady-state set/update/pop never reallocates.
     fn new(capacity: usize) -> Self {
         Self {
-            heap: std::collections::BinaryHeap::with_capacity(capacity),
-            live: 0,
-            stale_popped: 0,
-            rebuilds: 0,
-            stale_since_rebuild: 0,
-            rebuild_scratch: Vec::with_capacity(capacity),
+            heap: Vec::with_capacity(capacity),
         }
     }
 
-    fn push(&mut self, entry: LogicalDueEntry) {
-        self.heap.push(std::cmp::Reverse(entry));
-        self.live += 1;
+    fn len(&self) -> usize {
+        self.heap.len()
     }
 
-    fn physical_len(&self) -> usize {
-        self.heap.len()
+    fn peek(&self) -> Option<DeadlineNode> {
+        self.heap.first().copied()
+    }
+
+    /// Insert a new node for a caller that has no live deadline.
+    fn push_node(&mut self, node: DeadlineNode) {
+        self.heap.push(node);
+    }
+
+    fn swap_nodes(&mut self, a: usize, b: usize) {
+        self.heap.swap(a, b);
+    }
+
+    fn truncate(&mut self, len: usize) {
+        self.heap.truncate(len);
     }
 }
 
-/// One caller's scheduler metadata. `deadline_version` increments (u64,
-/// wrapping) on every deadline set/clear, so every heap entry names
-/// exactly one generation; the `u64` width makes wraparound aliasing
-/// unreachable for any real caller lifetime.
+/// One caller's scheduler metadata. `heap_pos` is `Some(index)` exactly when
+/// the caller has a live deadline in the due-index heap at that position;
+/// `None` means no live deadline. All heap movement goes through
+/// [`CallerTable`] helpers that keep both sides in sync.
 #[derive(Debug, Clone, Copy)]
 struct SchedEntry {
     ready_queued: bool,
     event_ready_queued: bool,
     deadline_micros: Option<u64>,
-    deadline_version: u64,
+    heap_pos: Option<u32>,
 }
 
 /// Coarse logical state of an outbound stream, independent of how many
@@ -406,20 +397,18 @@ pub struct SchedCounters {
     pub budget_exhausted: usize,
 }
 
-/// Telemetry snapshot of the versioned due index (bench/tests).
+/// Telemetry snapshot of the indexed due min-heap (bench/tests).
 ///
-/// Fixed-cost: four scalar fields, `Copy`, zero heap allocation to collect.
+/// Fixed-cost: two scalar fields, `Copy`, zero heap allocation to collect.
+/// Every entry in the heap is live by construction: no stale entries, no
+/// rebuilds, so `live == physical` always.
 #[cfg(any(test, feature = "bench-internals"))]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct DueIndexSnapshot {
-    /// Live (validated) deadline entries.
+    /// Live deadline entries (= heap length).
     pub live: usize,
-    /// Physical heap entries, including stale ones not yet discarded.
+    /// Physical heap entries (= heap length; identical to `live`).
     pub physical: usize,
-    /// Cumulative stale entries discarded lazily at peek/pop.
-    pub stale_popped: u64,
-    /// Cumulative amortized rebuilds.
-    pub rebuilds: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -715,7 +704,7 @@ impl CallerTable {
             event_ready_queue: VecDeque::with_capacity(bounded),
             deadlines: LogicalDueIndex::new(bounded),
             sched: HashMap::with_capacity(bounded),
-            due_scratch: Vec::with_capacity(bounded.min(256)),
+            due_scratch: Vec::with_capacity(bounded.min(MAX_DUE_PER_VISIT)),
             next_logical_caller: 1,
             max_callers: bounded,
             #[cfg(any(test, feature = "bench-internals"))]
@@ -743,94 +732,120 @@ impl CallerTable {
             ready_queued: false,
             event_ready_queued: false,
             deadline_micros: None,
-            deadline_version: 0,
+            heap_pos: None,
         });
         let old_micros = entry.deadline_micros;
         if old_micros == new_micros {
             return;
         }
-        // The old entry, if any, is superseded: its live slot is reclaimed
-        // here and the heap copy drains lazily at the head. The version
-        // bump means the stale copy can never validate again.
-        if old_micros.is_some() {
-            self.deadlines.live = self.deadlines.live.saturating_sub(1);
-            self.deadlines.stale_since_rebuild += 1;
-        }
-        entry.deadline_version = entry.deadline_version.wrapping_add(1);
-        if let Some(n) = new_micros {
-            let version = entry.deadline_version;
-            self.deadlines.push(LogicalDueEntry {
-                deadline_micros: n,
-                id,
-                version,
-            });
-        }
         entry.deadline_micros = new_micros;
-        if self.stale_amplification_exceeded() {
-            self.rebuild_due_index();
-        }
-    }
-
-    /// Whether a heap entry names the caller's current deadline generation.
-    fn due_entry_is_live(&self, entry: &LogicalDueEntry) -> bool {
-        match self.sched.get(&entry.id) {
-            None => false,
-            Some(meta) => {
-                meta.deadline_micros == Some(entry.deadline_micros)
-                    && meta.deadline_version == entry.version
+        match (entry.heap_pos, new_micros) {
+            // No live node and no new deadline: nothing to do.
+            (None, None) => {}
+            // New deadline, no live node: insert.
+            (None, Some(n)) => {
+                let pos = self.deadlines.heap.len();
+                self.deadlines.push_node(DeadlineNode {
+                    deadline_micros: n,
+                    id,
+                });
+                self.sched.get_mut(&id).expect("just inserted").heap_pos = Some(pos as u32);
+                self.sift_up(pos);
+            }
+            // Live node but deadline cleared: remove.
+            (Some(_), None) => {
+                self.heap_remove(id);
+            }
+            // Live node with changed deadline: update key and re-sift.
+            (Some(_), Some(n)) => {
+                let pos = self.heap_pos_of(id).expect("live node has position");
+                self.deadlines.heap[pos].deadline_micros = n;
+                // Key may have moved either direction; sift both ways.
+                self.sift_up(pos);
+                let pos = self.heap_pos_of(id).expect("still live after sift_up");
+                self.sift_down(pos);
             }
         }
     }
 
-    /// Pop the head while it is stale, so the remaining head is either a
-    /// live entry or the heap is empty. Returns the live head.
-    fn validate_due_head(&mut self) -> Option<LogicalDueEntry> {
+    /// Current heap position of a caller with a live deadline.
+    fn heap_pos_of(&self, id: LogicalCallerId) -> Option<usize> {
+        self.sched.get(&id)?.heap_pos.map(|p| p as usize)
+    }
+
+    /// Record that the node at `pos` belongs to `id`.
+    fn set_heap_pos(&mut self, id: LogicalCallerId, pos: usize) {
+        if let Some(entry) = self.sched.get_mut(&id) {
+            entry.heap_pos = Some(pos as u32);
+        }
+    }
+
+    /// Swap heap nodes at `a` and `b`, keeping both owners' `heap_pos` in sync.
+    fn heap_swap(&mut self, a: usize, b: usize) {
+        if a == b {
+            return;
+        }
+        let id_a = self.deadlines.heap[a].id;
+        let id_b = self.deadlines.heap[b].id;
+        self.deadlines.swap_nodes(a, b);
+        self.set_heap_pos(id_a, b);
+        self.set_heap_pos(id_b, a);
+    }
+
+    /// Restore the heap property upward from `pos`.
+    fn sift_up(&mut self, mut pos: usize) {
+        while pos > 0 {
+            let parent = (pos - 1) / 2;
+            if self.deadlines.heap[pos] < self.deadlines.heap[parent] {
+                self.heap_swap(pos, parent);
+                pos = parent;
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Restore the heap property downward from `pos`.
+    fn sift_down(&mut self, mut pos: usize) {
+        let len = self.deadlines.heap.len();
         loop {
-            let head = self.deadlines.heap.peek()?.0;
-            if self.due_entry_is_live(&head) {
-                return Some(head);
+            let left = pos * 2 + 1;
+            let right = left + 1;
+            let mut smallest = pos;
+            if left < len && self.deadlines.heap[left] < self.deadlines.heap[smallest] {
+                smallest = left;
             }
-            self.deadlines.heap.pop();
-            self.deadlines.stale_popped = self.deadlines.stale_popped.saturating_add(1);
-            self.deadlines.stale_since_rebuild += 1;
-            if self.stale_amplification_exceeded() {
-                self.rebuild_due_index();
+            if right < len && self.deadlines.heap[right] < self.deadlines.heap[smallest] {
+                smallest = right;
             }
+            if smallest == pos {
+                break;
+            }
+            self.heap_swap(pos, smallest);
+            pos = smallest;
         }
     }
 
-    fn stale_amplification_exceeded(&self) -> bool {
-        self.deadlines.stale_since_rebuild > self.deadlines.physical_len() / 2
-    }
-
-    /// Amortized O(N) validation sweep that drops every stale entry at
-    /// once when lazily-discarded staleness has grown past half the
-    /// physical heap. Bounded: runs at most once per `heap.len()/2` stale
-    /// pops. Uses `rebuild_scratch` so no allocation occurs.
-    fn rebuild_due_index(&mut self) {
-        // Phase 1: drain heap into scratch (no alloc; heap retains capacity).
-        self.deadlines.rebuild_scratch.clear();
-        self.deadlines
-            .rebuild_scratch
-            .extend(self.deadlines.heap.drain());
-        // Phase 2: compact scratch in-place without holding a borrow on it
-        // while calling `due_entry_is_live` (which borrows `self.sched`).
-        let mut write = 0;
-        for read in 0..self.deadlines.rebuild_scratch.len() {
-            if self.due_entry_is_live(&self.deadlines.rebuild_scratch[read].0) {
-                self.deadlines.rebuild_scratch.swap(write, read);
-                write += 1;
+    /// Remove the live deadline node for `id`, if any. O(log N), no scan.
+    fn heap_remove(&mut self, id: LogicalCallerId) {
+        let Some(pos) = self.heap_pos_of(id) else {
+            return;
+        };
+        let last = self.deadlines.heap.len() - 1;
+        if pos != last {
+            self.heap_swap(pos, last);
+        }
+        self.deadlines.truncate(last);
+        if let Some(entry) = self.sched.get_mut(&id) {
+            entry.heap_pos = None;
+        }
+        if pos != last && pos < self.deadlines.heap.len() {
+            self.sift_up(pos);
+            let moved_id = self.deadlines.heap[pos].id;
+            if self.heap_pos_of(moved_id) == Some(pos) {
+                self.sift_down(pos);
             }
         }
-        self.deadlines.rebuild_scratch.truncate(write);
-        let live = write;
-        // Phase 3: bulk-extend back into the heap (O(N) heapify; no alloc).
-        self.deadlines
-            .heap
-            .extend(self.deadlines.rebuild_scratch.drain(..));
-        self.deadlines.live = live;
-        self.deadlines.rebuilds = self.deadlines.rebuilds.saturating_add(1);
-        self.deadlines.stale_since_rebuild = 0;
     }
 
     fn enqueue_ready(&mut self, id: LogicalCallerId) {
@@ -838,7 +853,7 @@ impl CallerTable {
             ready_queued: false,
             event_ready_queued: false,
             deadline_micros: None,
-            deadline_version: 0,
+            heap_pos: None,
         });
         if entry.ready_queued {
             return;
@@ -852,7 +867,7 @@ impl CallerTable {
             ready_queued: false,
             event_ready_queued: false,
             deadline_micros: None,
-            deadline_version: 0,
+            heap_pos: None,
         });
         if entry.event_ready_queued {
             return;
@@ -930,16 +945,14 @@ impl CallerTable {
 
     #[cfg(any(test, feature = "bench-internals"))]
     pub fn deadline_count(&self) -> usize {
-        self.deadlines.live
+        self.deadlines.len()
     }
 
     #[cfg(any(test, feature = "bench-internals"))]
     pub fn due_index_snapshot(&self) -> DueIndexSnapshot {
         DueIndexSnapshot {
-            live: self.deadlines.live,
-            physical: self.deadlines.physical_len(),
-            stale_popped: self.deadlines.stale_popped,
-            rebuilds: self.deadlines.rebuilds,
+            live: self.deadlines.len(),
+            physical: self.deadlines.len(),
         }
     }
 
@@ -986,7 +999,7 @@ impl CallerTable {
                 ready_queued: false,
                 event_ready_queued: false,
                 deadline_micros: None,
-                deadline_version: 0,
+                heap_pos: None,
             },
         );
         self.sync_deadline(id);
@@ -1076,7 +1089,7 @@ impl CallerTable {
                 ready_queued: false,
                 event_ready_queued: false,
                 deadline_micros: None,
-                deadline_version: 0,
+                heap_pos: None,
             },
         );
         self.sync_deadline(id);
@@ -1164,36 +1177,55 @@ impl CallerTable {
     /// exactly where it was -- still live in the due index, still due -- so
     /// it is picked up again, unchanged, by the very next call with a
     /// `now` no earlier than this one. Zero `max_due` performs no work.
+    /// The internal [`MAX_DUE_PER_VISIT`] cap bounds synchronous timer work
+    /// even when an outer compatibility budget is effectively unbounded.
     fn pop_due_ids(&mut self, now: Timestamp, max_due: usize) -> usize {
         self.due_scratch.clear();
         let now_micros = now.as_micros();
-        while self.due_scratch.len() < max_due {
-            let Some(entry) = self.validate_due_head() else {
+        let cap = max_due.min(MAX_DUE_PER_VISIT);
+        while self.due_scratch.len() < cap {
+            let Some(head) = self.deadlines.peek() else {
                 break;
             };
-            if entry.deadline_micros > now_micros {
+            if head.deadline_micros > now_micros {
                 break;
             }
-            let popped = self.deadlines.heap.pop().expect("validated head exists");
-            debug_assert_eq!(popped.0, entry);
-            self.deadlines.live = self.deadlines.live.saturating_sub(1);
-            if let Some(meta) = self.sched.get_mut(&entry.id) {
+            // Exact indexed pop: root is live by construction (no stale
+            // entries exist), so pop it directly.
+            let node = self.indexed_pop_root();
+            if let Some(meta) = self.sched.get_mut(&node.id) {
                 meta.deadline_micros = None;
+                meta.heap_pos = None;
             }
-            if !self.sessions.contains_key(&entry.id) {
+            if !self.sessions.contains_key(&node.id) {
                 continue;
             }
-            self.due_scratch.push(entry.id);
+            self.due_scratch.push(node.id);
         }
         self.due_scratch.len()
     }
 
+    /// Pop the heap root and restore the heap property. The root owner's
+    /// `heap_pos` is cleared by the caller (`pop_due_ids`); the node moved
+    /// to the root gets its position updated here.
+    fn indexed_pop_root(&mut self) -> DeadlineNode {
+        let last = self.deadlines.heap.len() - 1;
+        self.heap_swap(0, last);
+        let node = self.deadlines.heap.pop().expect("nonempty heap");
+        if !self.deadlines.heap.is_empty() {
+            let moved_id = self.deadlines.heap[0].id;
+            self.set_heap_pos(moved_id, 0);
+            self.sift_down(0);
+        }
+        node
+    }
+
     /// Whether a due session remains that this visit's `pop_due_ids` cap
-    /// left unfired (P02). Discards stale heads first so a superseded or
-    /// removed caller can never look like pending work.
-    fn has_due_remaining(&mut self, now: Timestamp) -> bool {
-        self.validate_due_head()
-            .is_some_and(|entry| entry.deadline_micros <= now.as_micros())
+    /// left unfired (P02). O(1): the heap root is always live.
+    fn has_due_remaining(&self, now: Timestamp) -> bool {
+        self.deadlines
+            .peek()
+            .is_some_and(|head| head.deadline_micros <= now.as_micros())
     }
 
     /// Fire the timers of every due id left in `due_scratch` by the last
@@ -1429,14 +1461,17 @@ impl CallerTable {
             CallerRoute::Direct(caller) => *caller != id,
             CallerRoute::Group { caller, .. } => *caller != id,
         });
-        // Removing the sched entry invalidates every heap entry for this
-        // caller (validation looks the id up in `sched`); the physical
-        // copies drain lazily. No heap scan here.
-        if let Some(meta) = self.sched.remove(&id)
-            && meta.deadline_micros.is_some()
+        // Exact removal from the indexed heap: O(log N), no scan, no stale
+        // residue. A removed-then-re-added caller gets a fresh heap node;
+        // monotonic ids mean the old node can never alias the new one.
+        if self
+            .sched
+            .get(&id)
+            .is_some_and(|meta| meta.heap_pos.is_some())
         {
-            self.deadlines.live = self.deadlines.live.saturating_sub(1);
+            self.heap_remove(id);
         }
+        self.sched.remove(&id);
         self.maybe_compact_ready_queue();
         self.maybe_compact_event_ready_queue();
         Some(match session {
@@ -1543,23 +1578,16 @@ impl CallerTable {
         !self.event_ready_queue.is_empty()
     }
 
-    /// Whether output or a due timer can be serviced at `now`.
-    ///
-    /// Scans for the earliest live deadline so stale heap entries do not
-    /// cause spurious wakeups. `live == 0` short-circuits immediately.
+    /// Whether output or a due timer can be serviced at `now`. O(1): the
+    /// heap root is always the earliest live deadline.
     #[must_use]
     pub fn has_pending_output(&self, now: Timestamp) -> bool {
         if !self.ready_queue.is_empty() {
             return true;
         }
-        if self.deadlines.live == 0 {
-            return false;
-        }
-        let now_us = now.as_micros();
         self.deadlines
-            .heap
-            .iter()
-            .any(|rev| self.due_entry_is_live(&rev.0) && rev.0.deadline_micros <= now_us)
+            .peek()
+            .is_some_and(|head| head.deadline_micros <= now.as_micros())
     }
 
     /// Whether this table has any bounded work to drive at `now`.
@@ -1576,34 +1604,17 @@ impl CallerTable {
         })
     }
 
-    /// Time in microseconds until the nearest **live** deadline, capped at
-    /// `default_micros`.
-    ///
-    /// Iterates the heap from the minimum until it finds a live entry, so
-    /// stale entries left from a superseded or cleared deadline do not
-    /// cause the caller to wake too early. In practice the stale depth at
-    /// the head is 0 or 1, so this is O(1) on the hot path.
+    /// Time in microseconds until the nearest live deadline, capped at
+    /// `default_micros`. O(1): reads the heap root, no scan.
     #[must_use]
     pub fn time_until_next_deadline(&self, now: Timestamp, default_micros: u64) -> u64 {
-        if self.deadlines.live == 0 {
-            return default_micros;
+        match self.deadlines.peek() {
+            None => default_micros,
+            Some(head) => head
+                .deadline_micros
+                .saturating_sub(now.as_micros())
+                .min(default_micros),
         }
-        // Walk the ordered heap from min to find the first live entry.
-        // BinaryHeap's iterator is unordered, but the minimum is the
-        // true live head or very near it. We want the smallest
-        // deadline_micros among live entries.
-        let now_us = now.as_micros();
-        let mut best = u64::MAX;
-        for rev in self.deadlines.heap.iter() {
-            let e = &rev.0;
-            if self.due_entry_is_live(e) {
-                best = best.min(e.deadline_micros);
-            }
-        }
-        if best == u64::MAX {
-            return default_micros;
-        }
-        best.saturating_sub(now_us).min(default_micros)
     }
 
     #[cfg(any(test, feature = "bench-internals"))]
@@ -5038,8 +5049,9 @@ mod tests {
 
     #[test]
     fn due_index_remove_then_readd_never_revived_by_stale() {
-        // Remove a caller, re-add it, verify stale heap entries do not
-        // fire the new caller's deadline falsely.
+        // Remove a caller, re-add it, verify the removed heap node cannot
+        // fire the new caller's deadline falsely. The indexed heap removes
+        // the node exactly at remove() time, so no stale residue exists.
         let mut table = CallerTable::new();
         let peer = std::net::SocketAddr::from(([10, 0, 0, 1], 5000));
         let make_conn = |sid: u32| {
@@ -5062,7 +5074,7 @@ mod tests {
         table.bench_inject_deadline(id1, Timestamp::from_micros(1_000));
         assert_eq!(table.deadline_count(), 1);
 
-        // Remove: sched entry gone → live drops to 0; heap entries go stale.
+        // Remove: heap node removed exactly, live drops to 0.
         table.remove(id1);
         assert_eq!(table.deadline_count(), 0);
         // After draining any residual ready work, no output should remain.
@@ -5093,9 +5105,10 @@ mod tests {
     }
 
     #[test]
-    fn due_index_stale_amplification_bounded() {
-        // Arm + re-arm the same caller 1000 times; verify the physical heap
-        // size stays bounded by the amortized rebuild mechanism.
+    fn due_index_exact_one_node_per_caller_no_stale() {
+        // Arm + re-arm the same caller 1000 times; the indexed heap must
+        // hold exactly one node for it: updates are in-place key changes,
+        // never stale duplicates. No rebuild machinery exists.
         let n = 1usize; // single caller: no protocol noise from others
         let mut table = mk_table(n);
         let ids = table.bench_ids();
@@ -5109,14 +5122,144 @@ mod tests {
             table.bench_inject_deadline(id, Timestamp::from_micros(k * 100 + 50));
         }
         let snap = table.due_index_snapshot();
-        // After 1000 updates of one caller, exactly one live entry.
-        assert_eq!(snap.live, 1, "only one live entry for one caller");
-        // Physical must be << 1000 due to rebuild keeping heap compact.
-        assert!(
-            snap.physical <= 20,
-            "stale amplification not bounded: physical={} after 1000 updates",
-            snap.physical
+        // After 1000 updates of one caller, exactly one node exists.
+        assert_eq!(snap.live, 1, "only one node for one caller");
+        assert_eq!(
+            snap.physical, 1,
+            "indexed heap has no stale entries: physical must equal live"
         );
-        assert!(snap.rebuilds > 0, "expected at least one amortized rebuild");
+    }
+
+    /// One recorded scheduler op: (step, caller id, op kind, deadline arg).
+    type InvariantOp = (u64, LogicalCallerId, u8, u64);
+
+    fn invariant_trace_table() -> (CallerTable, Vec<LogicalCallerId>, Vec<InvariantOp>) {
+        // Deterministic 2000-op trace shared by the three invariant tests.
+        let n = 30usize;
+        let mut table = mk_table(n);
+        let ids: Vec<_> = table.bench_ids();
+        for &id in &ids {
+            table.bench_clear_deadline(id);
+        }
+        let mut seed: u64 = 0x1234_5678_9abc_def0;
+        let lcg = |s: u64| {
+            s.wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407)
+        };
+        let mut ops = Vec::with_capacity(2_000);
+        for step in 0u64..2_000 {
+            seed = lcg(seed);
+            let id = ids[(seed >> 16) as usize % ids.len()];
+            let op = (seed % 3) as u8;
+            let arg = step * 500 + (seed >> 32) % 100_000 + 1;
+            ops.push((step, id, op, arg));
+        }
+        (table, ids, ops)
+    }
+
+    fn apply_invariant_op(
+        table: &mut CallerTable,
+        step: u64,
+        id: LogicalCallerId,
+        op: u8,
+        arg: u64,
+    ) {
+        match op {
+            0 => {
+                table.bench_inject_deadline(id, Timestamp::from_micros(arg));
+            }
+            1 => table.bench_clear_deadline(id),
+            _ => {
+                table.remove(id);
+                let peer = std::net::SocketAddr::from(([10, 9, 9, 9], 5000));
+                let mut c = SrtConnection::new_caller(ConnectionOptions {
+                    socket_id: 90000 + (step % 1000) as u32,
+                    ..ConnectionOptions::default()
+                });
+                c.connect(Timestamp::default()).unwrap();
+                let _ = table.add_direct(CallerLeg {
+                    peer,
+                    connection: c,
+                });
+            }
+        }
+    }
+
+    fn assert_heap_len_matches_sched(table: &CallerTable, step: u64) {
+        let live_sched = table
+            .sched
+            .values()
+            .filter(|e| e.deadline_micros.is_some())
+            .count();
+        assert_eq!(
+            table.deadlines.heap.len(),
+            live_sched,
+            "step {step}: heap length must equal live sched count"
+        );
+    }
+
+    fn assert_heap_pos_round_trip(table: &CallerTable, step: u64) {
+        for (sid, entry) in table.sched.iter() {
+            if let Some(pos) = entry.heap_pos {
+                let node = &table.deadlines.heap[pos as usize];
+                assert_eq!(node.id, *sid, "step {step}: heap_pos must name own node");
+                assert_eq!(
+                    Some(node.deadline_micros),
+                    entry.deadline_micros,
+                    "step {step}: node key must match sched deadline"
+                );
+            } else {
+                assert!(
+                    entry.deadline_micros.is_none(),
+                    "step {step}: no heap_pos implies no deadline"
+                );
+            }
+        }
+    }
+
+    fn assert_min_heap_property(table: &CallerTable, step: u64) {
+        for (i, node) in table.deadlines.heap.iter().enumerate() {
+            let left = i * 2 + 1;
+            let right = left + 1;
+            if left < table.deadlines.heap.len() {
+                assert!(
+                    *node <= table.deadlines.heap[left],
+                    "step {step}: heap property violated at {i}"
+                );
+            }
+            if right < table.deadlines.heap.len() {
+                assert!(
+                    *node <= table.deadlines.heap[right],
+                    "step {step}: heap property violated at {i}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn due_index_heap_len_matches_sched_count() {
+        let (mut table, _ids, ops) = invariant_trace_table();
+        for (step, id, op, arg) in ops {
+            apply_invariant_op(&mut table, step, id, op, arg);
+            assert_heap_len_matches_sched(&table, step);
+        }
+    }
+
+    #[test]
+    fn due_index_heap_pos_round_trips() {
+        let (mut table, _ids, ops) = invariant_trace_table();
+        for (step, id, op, arg) in ops {
+            apply_invariant_op(&mut table, step, id, op, arg);
+            assert_heap_pos_round_trip(&table, step);
+        }
+    }
+
+    #[test]
+    fn due_index_min_heap_property_holds() {
+        let (mut table, _ids, ops) = invariant_trace_table();
+        for (step, id, op, arg) in ops {
+            apply_invariant_op(&mut table, step, id, op, arg);
+            assert_min_heap_property(&table, step);
+        }
     }
 }
