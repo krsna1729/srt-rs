@@ -386,6 +386,9 @@ pub struct CallerTable {
     sched_stats: SchedCounters,
 }
 
+/// Scheduler visit counters (bench/tests).
+///
+/// Fixed-cost: scalar counters only, `Copy`, zero heap allocation to collect.
 #[cfg(any(test, feature = "bench-internals"))]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SchedCounters {
@@ -404,6 +407,8 @@ pub struct SchedCounters {
 }
 
 /// Telemetry snapshot of the versioned due index (bench/tests).
+///
+/// Fixed-cost: four scalar fields, `Copy`, zero heap allocation to collect.
 #[cfg(any(test, feature = "bench-internals"))]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct DueIndexSnapshot {

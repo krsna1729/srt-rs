@@ -368,6 +368,8 @@ pub const DEFAULT_TX_SLOT_SIZE: usize = 1500;
 /// Reusable finite TX buffer pool for direct final-buffer outbound datagrams.
 /// Observable telemetry snapshot for [`TxPool`]; the pool itself is mutated
 /// only by the owner internals, never by external callers.
+///
+/// Fixed-cost: three scalar fields, `Copy`, zero heap allocation to collect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TxPoolSnapshot {
     pub capacity: usize,
@@ -595,6 +597,9 @@ pub(crate) struct InFlightMeta {
 }
 
 /// Aggregated TX completion accounting surfaced through [`OwnerServiceReport`].
+///
+/// Fixed-cost: scalar counters plus one inline `Option<SocketAddr>`; `Copy`,
+/// zero heap allocation to collect or copy.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OwnerTxCompletionStats {
     pub completed_ok: usize,
@@ -1006,6 +1011,10 @@ fn sockaddr_to_std(storage: libc::sockaddr_storage, len: libc::socklen_t) -> Opt
     None
 }
 /// Execution report for one [`Owner::service`] visit.
+///
+/// Fixed-cost by construction: every field is a `usize`/`bool`/`Option<u64>`
+/// scalar. No `String`, `Vec`, map, or boxed field exists on this path, so
+/// collecting or copying a report performs zero heap allocation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OwnerServiceReport {
     pub completions_reaped: usize,
