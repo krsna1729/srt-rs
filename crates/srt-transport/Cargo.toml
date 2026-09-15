@@ -66,6 +66,11 @@ name = "caller_scheduler_allocs"
 harness = false
 required-features = ["bench-internals"]
 
+[[bench]]
+name = "compio_tx_allocs"
+harness = false
+required-features = ["compio", "bench-internals"]
+
 [features]
 mio = ["dep:mio"]
 tokio = ["dep:tokio"]

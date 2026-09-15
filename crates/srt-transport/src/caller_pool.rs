@@ -215,6 +215,12 @@ impl CallerPool {
         &mut self.callers
     }
 
+    #[cfg(any(test, feature = "bench-internals"))]
+    /// Internal mutable access for harness benchmarks only.
+    pub fn bench_table_mut(&mut self) -> &mut CallerTable {
+        &mut self.callers
+    }
+
     /// Feed one datagram into the pooled caller table.
     pub fn feed(
         &mut self,
