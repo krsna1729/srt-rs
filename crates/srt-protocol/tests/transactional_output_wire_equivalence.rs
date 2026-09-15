@@ -476,3 +476,122 @@ fn wire_equivalence_key_rotation() {
         }
     }
 }
+
+fn drain_timers_only(caller: &mut SrtConnection) {
+    for _ in 0..16 {
+        match caller.peek_output() {
+            Some(OutputMeta::SetTimer { .. }) | Some(OutputMeta::ClearTimer { .. }) => {
+                let mut dummy = [];
+                caller
+                    .poll_output_into(&mut dummy)
+                    .expect("timer drains without materialization");
+            }
+            _ => break,
+        }
+    }
+}
+
+fn drain_filler_until_held(
+    caller: &mut SrtConnection,
+    listener: &mut SrtConnection,
+    held_wire_len: usize,
+    now: Timestamp,
+) {
+    while let Some(meta) = caller.peek_output() {
+        match meta {
+            OutputMeta::Datagram { wire_len } if wire_len == held_wire_len => break,
+            OutputMeta::Datagram { wire_len } => {
+                let mut buf = vec![0u8; wire_len];
+                caller
+                    .poll_output_into(&mut buf)
+                    .expect("filler materializes");
+                listener
+                    .feed_recv_buf(&buf, now)
+                    .expect("listener accepts filler");
+                while listener.poll_event().is_some() {}
+            }
+            OutputMeta::SetTimer { .. } | OutputMeta::ClearTimer { .. } => {
+                let mut dummy = [];
+                caller.poll_output_into(&mut dummy).expect("timer drains");
+            }
+        }
+    }
+}
+
+#[test]
+fn old_key_datagram_materializes_across_switch_and_mass_new_key_admissions() {
+    let (mut caller, mut listener) =
+        establish_pair(Some("rotation_pass"), KeyLength::Aes128, CipherMode::Ctr);
+    let mut now = ts(600_000);
+
+    // Seed to just before the switch threshold so the next admission trips the switch.
+    caller
+        .seed_encrypted_packet_count_for_test(
+            srt_proto::crypto::CryptoContext::KM_REFRESH_PERIOD - 1,
+        )
+        .expect("seed packet count");
+    caller
+        .provide_new_sek(&[0x5B; 16], now)
+        .expect("provide new sek");
+    while let Some(out) = caller.poll_output() {
+        if let ConnectionOutput::SendPacket(bytes) = out {
+            listener.feed_recv_buf(&bytes, now).expect("feed listener");
+        }
+    }
+    while let Some(out) = listener.poll_output() {
+        if let ConnectionOutput::SendPacket(bytes) = out {
+            caller.feed_recv_buf(&bytes, now).expect("feed caller");
+        }
+    }
+
+    // Queue one old-key (EVEN) datagram and deliberately leave it unmaterialized.
+    caller
+        .send(b"old-key-held-packet", now)
+        .expect("old key admission");
+    let held_meta = caller.peek_output().expect("held datagram queued");
+    let held_wire_len = match held_meta {
+        OutputMeta::Datagram { wire_len } => wire_len,
+        other => panic!("expected datagram, got {other:?}"),
+    };
+
+    // Drain ONLY the timer actions queued behind/around it, never the datagram.
+    // Timers consume no materialization, so the stamp stays outstanding.
+    drain_timers_only(&mut caller);
+    assert_eq!(
+        caller.peek_output(),
+        Some(OutputMeta::Datagram {
+            wire_len: held_wire_len
+        }),
+        "held old-key datagram must still be queued"
+    );
+
+    // Admit 4,000 new-key packets, draining each immediately so only the held
+    // packet remains outstanding on the old key.
+    for i in 0..4_000u32 {
+        now = ts(610_000 + u64::from(i));
+        caller
+            .send(format!("new-key-filler-{i}").as_bytes(), now)
+            .expect("new key admission");
+        // Drain filler until the queue front is the held packet again. FIFO
+        // order keeps the held packet first; materialize it LAST below.
+        drain_filler_until_held(&mut caller, &mut listener, held_wire_len, now);
+    }
+
+    // The held old-key packet must still materialize correctly: its cipher
+    // schedule must have survived the switch plus 4,000 new-key admissions.
+    let mut held_buf = vec![0u8; held_wire_len];
+    let out = caller
+        .poll_output_into(&mut held_buf)
+        .expect("held old-key datagram still materializes");
+    assert_eq!(out, Some(OutputInto::Datagram { len: held_wire_len }));
+    listener
+        .feed_recv_buf(&held_buf, now)
+        .expect("listener decrypts held old-key packet");
+    let event = listener.poll_event().expect("held packet delivers");
+    match event {
+        ConnectionEvent::DataReceived { payload, .. } => {
+            assert_eq!(payload.as_ref(), b"old-key-held-packet");
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+}

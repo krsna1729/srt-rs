@@ -532,6 +532,14 @@ pub struct SrtConnection {
     /// fail-closed disconnected state.
     output_queue: VecDeque<QueuedOutput>,
     output_queue_bytes: usize,
+    /// Outstanding delayed-materialization crypto reservations per key flag.
+    /// Incremented when a DATA packet reserves a `TxCryptoStamp` at admission,
+    /// decremented when the stamped datagram is materialized via
+    /// `poll_output_into` or discarded by an output-queue overflow clear.
+    /// Gates old-key decommission so a queued-but-unmaterialized datagram
+    /// can never outlive its cipher schedule.
+    pending_tx_even: u64,
+    pending_tx_odd: u64,
     output_overflowed: bool,
     event_overflowed: bool,
 
@@ -629,6 +637,17 @@ impl SrtConnection {
         Ok(buf)
     }
 
+    /// Release exactly one crypto reservation for `flag`. Releasing more than
+    /// was reserved saturates at zero; the counter is a retirement gate, not
+    /// an exact leak detector.
+    fn release_tx_reservation(&mut self, flag: KeyFlag) {
+        let counter = match flag {
+            KeyFlag::Even => &mut self.pending_tx_even,
+            KeyFlag::Odd => &mut self.pending_tx_odd,
+        };
+        *counter = counter.saturating_sub(1);
+    }
+
     fn queue_output(&mut self, output: QueuedOutput) {
         if self.output_overflowed || self.event_overflowed {
             return;
@@ -640,6 +659,7 @@ impl SrtConnection {
         if self.output_queue.len() >= MAX_OUTPUT_QUEUE_ACTIONS
             || self.output_queue_bytes.saturating_add(bytes) > MAX_OUTPUT_QUEUE_BYTES
         {
+            self.release_queued_tx_reservations();
             self.output_queue.clear();
             self.output_queue_bytes = 0;
             self.output_overflowed = true;
@@ -652,8 +672,33 @@ impl SrtConnection {
             });
             return;
         }
+        if let QueuedOutput::Datagram(PendingDatagram::Data(data)) = &output
+            && let Some(stamp) = data.crypto
+        {
+            let counter = match stamp.key_flag {
+                KeyFlag::Even => &mut self.pending_tx_even,
+                KeyFlag::Odd => &mut self.pending_tx_odd,
+            };
+            *counter = counter.saturating_add(1);
+        }
         self.output_queue_bytes = self.output_queue_bytes.saturating_add(bytes);
         self.output_queue.push_back(output);
+    }
+
+    fn release_queued_tx_reservations(&mut self) {
+        let (mut even, mut odd) = (0u64, 0u64);
+        for output in &self.output_queue {
+            if let QueuedOutput::Datagram(PendingDatagram::Data(data)) = output
+                && let Some(stamp) = data.crypto
+            {
+                match stamp.key_flag {
+                    KeyFlag::Even => even = even.saturating_add(1),
+                    KeyFlag::Odd => odd = odd.saturating_add(1),
+                }
+            }
+        }
+        self.pending_tx_even = self.pending_tx_even.saturating_sub(even);
+        self.pending_tx_odd = self.pending_tx_odd.saturating_sub(odd);
     }
 
     fn queue_control_packet(&mut self, pkt: ControlPacket, now: Timestamp) {
@@ -690,6 +735,9 @@ impl SrtConnection {
         self.queue_output(QueuedOutput::Datagram(PendingDatagram::Data(
             PendingData::new(header, payload, crypto),
         )));
+        // Reservation accounting is owned by `queue_output` so a rejected
+        // (overflowed) queue cannot leak a reservation for a packet that was
+        // never actually queued.
         Ok(())
     }
 
@@ -793,6 +841,8 @@ impl SrtConnection {
             pending_data_packets: 0,
             output_queue: VecDeque::new(),
             output_queue_bytes: 0,
+            pending_tx_even: 0,
+            pending_tx_odd: 0,
             output_overflowed: false,
             event_overflowed: false,
             start_time: None,
@@ -837,6 +887,8 @@ impl SrtConnection {
             pending_data_packets: 0,
             output_queue: VecDeque::new(),
             output_queue_bytes: 0,
+            pending_tx_even: 0,
+            pending_tx_odd: 0,
             output_overflowed: false,
             event_overflowed: false,
             start_time: None,
@@ -1838,7 +1890,14 @@ impl SrtConnection {
                 }
                 let written = pkt.encode_into(self.crypto.as_deref(), dst)?;
                 debug_assert_eq!(written, wire_len);
+                let released = match pkt {
+                    PendingDatagram::Data(data) => data.crypto.map(|stamp| stamp.key_flag),
+                    PendingDatagram::Control(_) => None,
+                };
                 self.output_queue.pop_front();
+                if let Some(flag) = released {
+                    self.release_tx_reservation(flag);
+                }
                 self.output_queue_bytes = self.output_queue_bytes.saturating_sub(wire_len);
                 Ok(Some(OutputInto::Datagram { len: written }))
             }
@@ -2717,8 +2776,16 @@ impl SrtConnection {
                 crypto.switch_key();
             }
 
-            // Check whether the old key needs to be disposed of.
-            if crypto.should_decommission_old_key() {
+            // Check whether the old key needs to be disposed of. The old
+            // cipher schedule must outlive every queued-but-unmaterialized
+            // datagram stamped with its key flag.
+            let should_decommission = crypto.should_decommission_old_key();
+            let old_flag = crypto.current_key().other();
+            let outstanding = match old_flag {
+                KeyFlag::Even => self.pending_tx_even,
+                KeyFlag::Odd => self.pending_tx_odd,
+            };
+            if should_decommission && outstanding == 0 {
                 crypto.decommission_old_key();
             }
         }
