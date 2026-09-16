@@ -55,7 +55,9 @@ Committed evidence for this exact table — measured from a **clean checkout** o
 the SHA it names, by the committed parser/generator (`cargo run --release -p
 srt-bench --bin qual-evidence`), which keeps every field the harness prints —
 [`qual-shared-owner-fixed-kh-503ef2f.json`](qual-shared-owner-fixed-kh-503ef2f.json)
-(SHA `c65be16`, kernel `6.8.0-139-generic`, 6 CPUs); it carries every field the harness prints, plus the verbatim stdout line of sender and receiver for each run.
+(SHA `503ef2f`, `git_dirty: false`, kernel `6.8.0-139-generic`, 6 CPUs); it
+carries every field the harness prints, plus the verbatim stdout line of sender
+and receiver for each run.
 
 | F | established | pre-window drained | expected / generated / missed ticks | missed ticks % | data offered = accepted | wire submitted (window) | lateness p50 / p99 / max (µs) | drain | in-flight at window end | receiver DATA | receiver lost `sec_a` |
 |---:|---:|---|---|---:|---:|---:|---|---|---:|---:|---:|
@@ -94,17 +96,20 @@ and why a separately paced producer remains the stronger target-host design. Do
 not read a single row, or a single three-second sample, as a capacity figure.
 - **That is a reconciliation statement, not a sustained-capacity statement.**
   F=150 and F=200 reach zero outstanding only after a post-window drain phase
-  much larger than their window traffic (219,564 and 525,582 wire datagrams
-  drained against 226,029 and 224,936 submitted inside the window). Read as:
-  "nothing is lost once the source stops, and the shard drains what it
-  buffered", not "F=200 is sustainable at 8 Mbps per destination".
+  far larger than their window traffic: they submit 187,780 and 211,484 wire
+  datagrams inside the window and then drain 301,557 and 549,164 completions
+  (301,301 and 548,908 newly submitted during the drain). Read as: "nothing is
+  lost once the source stops, and the shard drains what it buffered", not
+  "F=200 is sustainable at 8 Mbps per destination".
 - **F=600 and F=1000 are OVERLOAD rows, not capacity results.** The shard
-  saturates: the source itself starts missing intervals (3.5 % at 600, 17.9 %
-  at 1000 — the honest measure of "one core cannot carry F x 8 Mbps" on this
-  host), the window's wire submissions collapse relative to accepted copies,
-  the receiver loses 73 and 566 DATA packets, and the drain deadline expires
-  with 256 sends still outstanding. No clean-delivery claim is made for either
-  tier.
+  saturates: the source itself misses 5.0 % and 20.8 % of its intervals (the
+  honest measure of "one core cannot carry F x 8 Mbps" on this host), the
+  window's wire submissions collapse to 82,045 and 10,101 against 1,299,600 and
+  1,805,000 accepted copies, and the bounded run **never drains** (256 sends
+  still outstanding at the deadline). The receiver reports no loss
+  (`sec_a = 0`) but its DATA count, 574,213 and 579,581, does not reconcile with
+  the offered copies — the comparison the delivered-everything reading of the
+  earlier tables relied on. No clean-delivery claim is made for either tier.
 - **These are raw-reader rows.** `IORING_REGISTER_PBUF_RING` fails with
   `EINVAL` on this kernel build, so the Owner selected `RawReadiness` and every
   row prints `managed_rx=false`;
@@ -171,8 +176,9 @@ Reading them:
   The 600 row is thus a clean establishment result but not a clean delivery
   result. (Historical reading, retained verbatim: with the corrected source
   accounting the canonical F=600 row above shows the binding constraint is the
-  sender shard's own service capacity — 80 missed source ticks and 73 lost
-  receiver DATA packets — rather than a two-process receiver limit.)
+  sender shard's own service capacity — 113 missed source ticks of 2279, wire
+  submissions collapsing to 82,045 inside the window, and a bounded run that
+  never drains — rather than a two-process receiver limit.)
 - Sender CPU is ~95 % of one core per shard at both 150 and 300 offered
   copies/second per shard, i.e. the per-copy cost is stable and the shard count
   is what buys capacity.
