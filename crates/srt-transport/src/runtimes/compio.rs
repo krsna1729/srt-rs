@@ -262,10 +262,15 @@ pub struct CompioProductionProfile {
 }
 
 impl CompioProductionProfile {
-    /// Whether Compio managed RX (`recv_from_multi` / `recv_msg_multi` over
-    /// the runtime buffer pool) is usable on the observed runtime.
+    /// Whether this HOST can run managed RX (`recv_msg_multi` over the
+    /// runtime's provided-buffer ring).
+    ///
+    /// Capability only: it says nothing about which datapath an Owner is
+    /// running. [`ProductionQualification`] is the type that answers that,
+    /// because qualification also requires the Owner to have selected
+    /// [`OwnerRxMode::ManagedMultishot`].
     #[must_use]
-    pub fn managed_rx_available(&self) -> bool {
+    pub fn host_managed_rx_capable(&self) -> bool {
         matches!(
             (&self.buffer_ring, &self.multishot_recv),
             (
@@ -274,13 +279,116 @@ impl CompioProductionProfile {
             )
         )
     }
+}
 
-    /// Whether this host may run the high-density SRT path. Fails closed
-    /// when the buffer-ring substrate is unavailable; the single-reader
-    /// fallback remains valid for development/compatibility.
+/// Which receive datapath an Owner is actually running.
+///
+/// Selected at socket attach from the observed substrate and never changed
+/// silently afterwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerRxMode {
+    /// One persistent managed `recv_msg_multi()` stream per shared UDP socket,
+    /// consuming runtime provided-ring buffers, with `MSG_TRUNC` reporting so
+    /// an oversized datagram is dropped and counted instead of parsed short.
+    /// This is the production high-density mode.
+    ManagedMultishot,
+    /// Readiness wake plus one raw nonblocking `recvfrom` consumer into a
+    /// persistent slot. Valid development fallback, and the only option on a
+    /// kernel that cannot register a provided-buffer ring.
+    RawReadiness,
+}
+
+/// How an Owner resolves [`OwnerRxMode`] when it attaches a socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RxModePolicy {
+    /// Use managed multishot when the live runtime provides the substrate,
+    /// otherwise fall back to the readiness reader. The selected mode stays
+    /// observable through [`Owner::rx_mode`], and a fallback is never
+    /// reported as a qualification pass.
+    #[default]
+    ManagedPreferred,
+    /// Fail closed: attaching a socket on a runtime without the managed
+    /// substrate is a configuration error rather than a silent fallback.
+    /// Production shards use this.
+    ManagedRequired,
+}
+
+impl RxModePolicy {
+    /// Resolve the mode for one socket attach from the observed substrate.
+    pub(crate) fn resolve(self, managed_available: bool) -> Result<OwnerRxMode, &'static str> {
+        match (self, managed_available) {
+            (_, true) => Ok(OwnerRxMode::ManagedMultishot),
+            (Self::ManagedPreferred, false) => Ok(OwnerRxMode::RawReadiness),
+            (Self::ManagedRequired, false) => Err(
+                "managed multishot RX requires a runtime whose provided-buffer ring \
+                 registers; this host rejected IORING_REGISTER_PBUF_RING, so a \
+                 ManagedRequired Owner refuses to attach",
+            ),
+        }
+    }
+}
+
+/// Verdict for one managed RX completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManagedDatagram {
+    /// The datagram fits the ring slot: safe to hand to `srt-proto`.
+    Complete,
+    /// The kernel reported `MSG_TRUNC`, so the slot did not hold the whole
+    /// datagram. It is dropped and counted; truncated bytes are NEVER parsed
+    /// as if they were a complete SRT datagram.
+    Truncated,
+}
+
+/// Whether one more RX datagram of `len` bytes fits this visit's remaining
+/// packet and byte allowances. Zero allowances are strict: a zero packet or
+/// byte budget accepts nothing, including the first datagram.
+pub(crate) fn rx_budget_fits(
+    report: &OwnerServiceReport,
+    budget: &OwnerServiceBudget,
+    len: usize,
+) -> bool {
+    report.rx_packets < budget.max_rx_packets
+        && report.rx_bytes.saturating_add(len) <= budget.max_rx_bytes
+}
+
+/// Classify one managed completion against the ring slot size.
+pub(crate) fn classify_managed_datagram(
+    len: usize,
+    slot_len: usize,
+    trunc_flag: bool,
+) -> ManagedDatagram {
+    if trunc_flag || len > slot_len {
+        ManagedDatagram::Truncated
+    } else {
+        ManagedDatagram::Complete
+    }
+}
+
+/// Managed RX ring depth per shared socket. Fixed and preallocated; the ring
+/// never grows, and an overflow drops the newest completion (bounded loss)
+/// rather than queueing without limit.
+pub const MANAGED_RX_RING_DEPTH: usize = 256;
+
+/// Host capability paired with the mode the Owner actually selected.
+///
+/// Qualification is the conjunction: a host that could run managed RX while
+/// the Owner is still on the raw reader is NOT qualified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProductionQualification {
+    /// Observed host/runtime capability.
+    pub profile: CompioProductionProfile,
+    /// Receive datapath the Owner selected for its shared sockets.
+    pub owner_rx_mode: OwnerRxMode,
+}
+
+impl ProductionQualification {
+    /// True only when the host provides the managed substrate AND the Owner
+    /// selected it.
     #[must_use]
-    pub fn high_density_qualified(&self) -> bool {
-        self.is_io_uring && self.managed_rx_available()
+    pub fn qualified(&self) -> bool {
+        self.profile.is_io_uring
+            && self.profile.host_managed_rx_capable()
+            && self.owner_rx_mode == OwnerRxMode::ManagedMultishot
     }
 }
 
@@ -333,11 +441,28 @@ pub struct ProductionRuntimeConfig {
     pub rx_buffer_len: usize,
 }
 
+/// Managed RX slot size for a given Owner wire ceiling.
+///
+/// Sized from the largest datagram the Owner will accept, NOT the 64 KiB UDP
+/// maximum: truncation is reported by the kernel (`MSG_TRUNC`) through the
+/// msg-multishot form, so an oversized datagram is detected and dropped
+/// rather than silently parsed short. That keeps the provided-buffer pool
+/// proportional to the real ceiling (2048 B x 256 slots = 512 KiB for a
+/// 1500-byte ceiling) instead of 16 MiB.
+///
+/// Rounded up to a power of two, which is what a provided-buffer ring wants.
+#[must_use]
+pub fn managed_rx_buffer_len(wire_ceiling: usize) -> usize {
+    let floor = srt_proto::wire::SRT_HEADER_SIZE + 1;
+    wire_ceiling.max(floor).next_power_of_two()
+}
+
 impl ProductionRuntimeConfig {
-    /// Derive SQ/CQ/ring sizes from the Owner envelope. CQ covers lanes +
-    /// RX burst + timeout slack; ring entries round up to power of two.
+    /// Derive SQ/CQ/ring sizes from the Owner envelope (TX lanes and the
+    /// configured session wire ceiling). CQ covers lanes + RX burst +
+    /// timeout slack.
     #[must_use]
-    pub fn for_owner(tx_lanes: usize) -> Self {
+    pub fn for_owner(tx_lanes: usize, wire_ceiling: usize) -> Self {
         let lanes = tx_lanes.max(1) as u32;
         let sq_capacity = lanes.saturating_add(256).max(512);
         let cq_size = sq_capacity.saturating_mul(2);
@@ -346,7 +471,7 @@ impl ProductionRuntimeConfig {
             sq_capacity,
             cq_size,
             rx_ring_entries: 256,
-            rx_buffer_len: DEFAULT_RX_SLOT_SIZE,
+            rx_buffer_len: managed_rx_buffer_len(wire_ceiling),
         }
     }
 }
@@ -384,13 +509,16 @@ mod production_config_tests {
 
     #[test]
     fn production_config_derives_explicit_envelope() {
-        let cfg = ProductionRuntimeConfig::for_owner(64);
+        let cfg = ProductionRuntimeConfig::for_owner(64, 1500);
         assert_eq!(cfg.tx_lanes, 64);
         // SQ covers lanes + RX burst + slack; CQ doubles SQ.
         assert!(cfg.sq_capacity >= 64 + 256);
         assert_eq!(cfg.cq_size, cfg.sq_capacity * 2);
         assert_eq!(cfg.rx_ring_entries, 256);
-        assert_eq!(cfg.rx_buffer_len, DEFAULT_RX_SLOT_SIZE);
+        // Slot sizing follows the wire ceiling (1500 -> next power of two),
+        // so the ring costs 256 x 2048 B instead of 256 x 64 KiB.
+        assert_eq!(cfg.rx_buffer_len, 2048);
+        assert_eq!(MANAGED_RX_RING_DEPTH, 256);
         // Builder constructs without silently falling back.
         let _ = production_runtime_builder(cfg).expect("production builder builds");
     }
@@ -546,6 +674,256 @@ impl TxPool {
 /// Persistent receive buffer size (64 KiB covers max UDP payload without reallocation).
 pub const DEFAULT_RX_SLOT_SIZE: usize = 65536;
 
+/// One managed RX completion: the runtime's ring buffer plus its peer.
+///
+/// The buffer is a lease on the runtime's provided-buffer pool; dropping this
+/// value returns it. The datapath copies out of it during protocol admission
+/// and then drops it -- it is never retained across receiver reorder windows.
+pub(crate) struct ManagedRxDatagram {
+    peer: SocketAddr,
+    result: compio::driver::op::RecvMsgMultiResult,
+}
+
+impl ManagedRxDatagram {
+    fn len(&self) -> usize {
+        self.result.data().len()
+    }
+
+    fn bytes(&self) -> &[u8] {
+        self.result.data()
+    }
+}
+
+/// A managed RX task that stopped or errored. Surfaced through
+/// [`OwnerFault`] so a dead consumer can never look like a quiet socket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RxFault {
+    /// The multishot stream ended or returned an error.
+    StreamError(String),
+}
+
+/// Bounded completion ring under one fixed managed RX task.
+///
+/// Unbounded queueing is forbidden: the ring is preallocated to
+/// [`MANAGED_RX_RING_DEPTH`], and a completion that does not fit is dropped
+/// and counted. Truncated datagrams (`MSG_TRUNC`) are counted separately and
+/// never reach `srt-proto`.
+pub(crate) struct ManagedRxRing {
+    completions: VecDeque<ManagedRxDatagram>,
+    capacity: usize,
+    waker: Option<Waker>,
+    fault: Option<RxFault>,
+    /// Completions dropped because the ring was full (bounded loss).
+    dropped: u64,
+    /// Datagrams the kernel reported as truncated: too large for the ring
+    /// slot. Dropped without parsing.
+    truncated: u64,
+    shutdown: bool,
+    task: Option<compio::runtime::JoinHandle<()>>,
+}
+
+impl ManagedRxRing {
+    fn new() -> Self {
+        Self {
+            completions: VecDeque::with_capacity(MANAGED_RX_RING_DEPTH),
+            capacity: MANAGED_RX_RING_DEPTH,
+            waker: None,
+            fault: None,
+            dropped: 0,
+            truncated: 0,
+            shutdown: false,
+            task: None,
+        }
+    }
+
+    fn push(&mut self, datagram: ManagedRxDatagram) -> bool {
+        if self.completions.len() >= self.capacity {
+            self.dropped = self.dropped.saturating_add(1);
+            return false;
+        }
+        self.completions.push_back(datagram);
+        if let Some(waker) = self.waker.take() {
+            waker.wake();
+        }
+        true
+    }
+
+    fn pop(&mut self) -> Option<ManagedRxDatagram> {
+        self.completions.pop_front()
+    }
+
+    fn pending(&self) -> bool {
+        !self.completions.is_empty()
+    }
+
+    /// Count one truncated (oversized) datagram and wake the Owner so the
+    /// counter is observable without waiting for the next completion.
+    fn note_truncated(&mut self) {
+        self.truncated = self.truncated.saturating_add(1);
+        if let Some(waker) = self.waker.take() {
+            waker.wake();
+        }
+    }
+
+    fn fault(&mut self, fault: RxFault) {
+        self.fault = Some(fault);
+        if let Some(waker) = self.waker.take() {
+            waker.wake();
+        }
+    }
+}
+
+/// The single fixed managed RX task for one shared UDP socket.
+///
+/// One task per socket, created once at attach: never per datagram, never per
+/// connection. It is the ONLY consumer of that socket while it runs, which is
+/// what makes the datapath single-consumer by construction.
+async fn managed_rx_task(
+    sock: Rc<compio::net::UdpSocket>,
+    ring: Rc<RefCell<ManagedRxRing>>,
+    slot_len: usize,
+) {
+    use futures_util::StreamExt;
+    // `recv_msg_multi` (not `recv_from_multi`) because only the msg form
+    // reports the returned message flags, which is how a datagram larger than
+    // the ring slot is detected as truncated instead of being parsed short.
+    let mut stream = Box::pin(sock.recv_msg_multi(0));
+    loop {
+        if ring.borrow().shutdown {
+            break;
+        }
+        match stream.next().await {
+            None => {
+                ring.borrow_mut()
+                    .fault(RxFault::StreamError("managed RX stream ended".to_string()));
+                break;
+            }
+            Some(Err(error)) => {
+                ring.borrow_mut()
+                    .fault(RxFault::StreamError(error.to_string()));
+                break;
+            }
+            Some(Ok(result)) => {
+                let truncated = result.flags().bits() & (libc::MSG_TRUNC as u32) != 0;
+                if classify_managed_datagram(result.data().len(), slot_len, truncated)
+                    == ManagedDatagram::Truncated
+                {
+                    ring.borrow_mut().note_truncated();
+                    continue;
+                }
+                let Some(peer) = result.addr().and_then(|addr| addr.as_socket()) else {
+                    continue;
+                };
+                ring.borrow_mut().push(ManagedRxDatagram { peer, result });
+            }
+        }
+    }
+}
+
+/// Shared accessor shape for the two sides' receive state, so the wait path
+/// has one implementation instead of two copies.
+trait SideRxHolder {
+    fn rx_ring(&self) -> Option<&Rc<RefCell<ManagedRxRing>>> {
+        None
+    }
+
+    fn poll_read_ready(&self, cx: &mut Context<'_>) -> std::task::Poll<io::Result<()>>;
+}
+
+impl SideRxHolder for ListenerSide {
+    fn rx_ring(&self) -> Option<&Rc<RefCell<ManagedRxRing>>> {
+        self.rx.ring.as_ref()
+    }
+
+    fn poll_read_ready(&self, cx: &mut Context<'_>) -> std::task::Poll<io::Result<()>> {
+        self.poll_fd.poll_read_ready(cx)
+    }
+}
+
+impl SideRxHolder for OwnerCallerSide {
+    fn rx_ring(&self) -> Option<&Rc<RefCell<ManagedRxRing>>> {
+        self.rx.ring.as_ref()
+    }
+
+    fn poll_read_ready(&self, cx: &mut Context<'_>) -> std::task::Poll<io::Result<()>> {
+        self.poll_fd.poll_read_ready(cx)
+    }
+}
+
+/// Per-side receive state: the selected mode, the managed ring when the owner
+/// is running managed multishot, and at most one staged completion whose lease
+/// is retained rather than copied.
+pub(crate) struct SideRx {
+    mode: OwnerRxMode,
+    ring: Option<Rc<RefCell<ManagedRxRing>>>,
+    staged: Option<ManagedRxDatagram>,
+}
+
+impl SideRx {
+    fn raw() -> Self {
+        Self {
+            mode: OwnerRxMode::RawReadiness,
+            ring: None,
+            staged: None,
+        }
+    }
+
+    fn managed(_slot_len: usize, sock_is_live: bool) -> Self {
+        Self {
+            mode: OwnerRxMode::ManagedMultishot,
+            ring: Some(Rc::new(RefCell::new(ManagedRxRing::new()))).filter(|_| sock_is_live),
+            staged: None,
+        }
+    }
+
+    fn pending(&self) -> bool {
+        self.staged.is_some()
+            || self
+                .ring
+                .as_ref()
+                .is_some_and(|ring| ring.borrow().pending() || ring.borrow().fault.is_some())
+    }
+
+    fn take_fault(&self) -> Option<RxFault> {
+        self.ring.as_ref().and_then(|ring| {
+            let mut ring = ring.borrow_mut();
+            ring.fault.take()
+        })
+    }
+
+    fn stats(&self) -> ManagedRxStats {
+        let (depth, dropped, truncated) = self.ring.as_ref().map_or((0, 0, 0), |ring| {
+            let ring = ring.borrow();
+            (ring.completions.len(), ring.dropped, ring.truncated)
+        });
+        ManagedRxStats {
+            mode: self.mode,
+            depth,
+            capacity: MANAGED_RX_RING_DEPTH,
+            dropped,
+            truncated,
+            staged: self.staged.is_some(),
+        }
+    }
+}
+
+/// Observable managed RX state for one Owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ManagedRxStats {
+    /// Datapath the Owner selected.
+    pub mode: OwnerRxMode,
+    /// Completions currently queued in the bounded ring.
+    pub depth: usize,
+    /// Fixed ring capacity.
+    pub capacity: usize,
+    /// Completions dropped because the ring was full.
+    pub dropped: u64,
+    /// Datagrams dropped as truncated (larger than the ring slot).
+    pub truncated: u64,
+    /// Whether a whole completion is staged for the next visit.
+    pub staged: bool,
+}
+
 /// Listener side of a shared Compio owner.
 ///
 /// Sealed on purpose: every field is private and the only construction paths
@@ -561,6 +939,8 @@ pub struct ListenerSide {
     options: crate::AdmissionOptions,
     transport: crate::ResolvedTransportConfig,
     idle_timeout: std::time::Duration,
+    /// Selected receive datapath plus its managed ring/staged completion.
+    rx: SideRx,
     /// Persistent receive slot. ALWAYS `DEFAULT_RX_SLOT_SIZE`; staging swaps
     /// the two buffers, it never resizes either.
     rx_buf: Vec<u8>,
@@ -587,28 +967,63 @@ impl ListenerSide {
     /// Production construction path, reached only through
     /// [`Owner::listen`] (and in-crate tests), which performs the Owner's
     /// validation first.
+    #[cfg(any(test, feature = "bench-internals"))]
     pub(crate) fn from_prepared(
         sock: compio::net::UdpSocket,
         prepared: crate::PreparedListener,
     ) -> Result<Self, crate::RuntimeBuildError> {
+        Self::from_prepared_with_rx_mode(sock, prepared, OwnerRxMode::RawReadiness, 0)
+    }
+
+    /// Attach with an explicit receive mode. Under
+    /// [`OwnerRxMode::ManagedMultishot`] the socket gets exactly one
+    /// persistent `recv_msg_multi` consumer task, spawned here once at attach
+    /// -- never per datagram, never per connection.
+    pub(crate) fn from_prepared_with_rx_mode(
+        sock: compio::net::UdpSocket,
+        prepared: crate::PreparedListener,
+        rx_mode: OwnerRxMode,
+        managed_slot_len: usize,
+    ) -> Result<Self, crate::RuntimeBuildError> {
         let poll_fd = make_poll_fd(&sock)?;
-        let side = Self {
-            sock: Rc::new(sock),
+        let sock = Rc::new(sock);
+        let mut side = Self {
+            sock,
             table: prepared.peer_table(),
             telemetry: IngressTelemetry::new(),
             options: prepared.admission_options(),
             transport: prepared.transport,
             idle_timeout: prepared.admission.idle_timeout,
+            rx: SideRx::raw(),
             rx_buf: vec![0u8; DEFAULT_RX_SLOT_SIZE],
             poll_fd,
             pending_rx: None,
             stage_buf: vec![0u8; DEFAULT_RX_SLOT_SIZE],
         };
+        if rx_mode == OwnerRxMode::ManagedMultishot {
+            side.rx = SideRx::managed(managed_slot_len, true);
+            side.spawn_managed_rx_task(managed_slot_len);
+        }
         Ok(side)
     }
 
-    fn poll_read_ready(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
-        self.poll_fd.poll_read_ready(cx)
+    /// Spawn the one fixed managed RX task for this socket (idempotent).
+    fn spawn_managed_rx_task(&mut self, slot_len: usize) {
+        if compio::runtime::Runtime::try_current().is_none() {
+            return;
+        }
+        let Some(ring) = self.rx.ring.as_ref().cloned() else {
+            return;
+        };
+        if ring.borrow().task.is_some() {
+            return;
+        }
+        let handle = spawn(managed_rx_task(
+            Rc::clone(&self.sock),
+            Rc::clone(&ring),
+            slot_len,
+        ));
+        ring.borrow_mut().task = Some(handle);
     }
 }
 
@@ -623,6 +1038,8 @@ pub struct OwnerCallerSide {
     transport: crate::ResolvedTransportConfig,
     local_bind: Option<std::net::SocketAddr>,
     connect_config: crate::ConnectConfig,
+    /// Selected receive datapath plus its managed ring/staged completion.
+    rx: SideRx,
     /// Persistent receive slot; always `DEFAULT_RX_SLOT_SIZE` (see the
     /// listener side's identical fields).
     rx_buf: Vec<u8>,
@@ -656,6 +1073,7 @@ impl OwnerCallerSide {
 
     /// Production construction path, reached only through [`Owner::connect`]
     /// (and in-crate tests), which performs the Owner's validation first.
+    #[cfg(any(test, feature = "bench-internals"))]
     pub(crate) fn from_parts(
         sock: compio::net::UdpSocket,
         max_in_flight: std::num::NonZeroUsize,
@@ -664,22 +1082,69 @@ impl OwnerCallerSide {
         local_bind: Option<std::net::SocketAddr>,
         connect_config: crate::ConnectConfig,
     ) -> Self {
+        Self::from_parts_with_rx_mode(
+            sock,
+            max_in_flight,
+            attempt_deadline,
+            transport,
+            local_bind,
+            connect_config,
+            OwnerRxMode::RawReadiness,
+            0,
+        )
+    }
+
+    /// Attach with an explicit receive mode; see the listener side's
+    /// `from_prepared_with_rx_mode`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_parts_with_rx_mode(
+        sock: compio::net::UdpSocket,
+        max_in_flight: std::num::NonZeroUsize,
+        attempt_deadline: std::time::Duration,
+        transport: crate::ResolvedTransportConfig,
+        local_bind: Option<std::net::SocketAddr>,
+        connect_config: crate::ConnectConfig,
+        rx_mode: OwnerRxMode,
+        managed_slot_len: usize,
+    ) -> Self {
         let poll_fd = make_poll_fd(&sock).expect("caller poll_fd initializes");
-        Self {
-            sock: Rc::new(sock),
+        let sock = Rc::new(sock);
+        let mut side = Self {
+            sock,
             pool: crate::CallerPool::new(max_in_flight, attempt_deadline),
             transport,
             local_bind,
             connect_config,
+            rx: SideRx::raw(),
             rx_buf: vec![0u8; DEFAULT_RX_SLOT_SIZE],
             poll_fd,
             pending_rx: None,
             stage_buf: vec![0u8; DEFAULT_RX_SLOT_SIZE],
+        };
+        if rx_mode == OwnerRxMode::ManagedMultishot {
+            side.rx = SideRx::managed(managed_slot_len, true);
+            side.spawn_managed_rx_task(managed_slot_len);
         }
+        side
     }
 
-    fn poll_read_ready(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
-        self.poll_fd.poll_read_ready(cx)
+    /// Spawn the one fixed managed RX task for this socket (idempotent).
+    fn spawn_managed_rx_task(&mut self, slot_len: usize) {
+        if compio::runtime::Runtime::try_current().is_none() {
+            return;
+        }
+        let Some(ring) = self.rx.ring.as_ref().cloned() else {
+            return;
+        };
+        if ring.borrow().task.is_some() {
+            return;
+        }
+        let handle = spawn(managed_rx_task(
+            Rc::clone(&self.sock),
+            Rc::clone(&ring),
+            slot_len,
+        ));
+        ring.borrow_mut().task = Some(handle);
     }
 
     /// Immutable access to the pooled caller table.
@@ -706,6 +1171,7 @@ impl OwnerCallerSide {
         .expect("shared transport resolves");
         Self {
             sock: Rc::new(sock),
+            rx: SideRx::raw(),
             pool: crate::CallerPool::new(
                 std::num::NonZeroUsize::MIN,
                 std::time::Duration::from_secs(5),
@@ -765,6 +1231,9 @@ pub struct OwnerTxCompletionStats {
 pub enum OwnerFault {
     /// A fixed TX worker task terminated unexpectedly (panicked).
     WorkerPanicked { lane: usize },
+    /// The single managed RX task for one shared socket stopped or errored.
+    /// The Owner no longer receives on that socket; it is not a quiet socket.
+    RxStreamFailed { side: &'static str, detail: String },
     /// A lane's `send_to` completed having written fewer bytes than the
     /// materialized wire length. The datagram did not reach the wire intact,
     /// and the final buffer is already consumed by the protocol output path,
@@ -1420,6 +1889,12 @@ pub struct Owner {
     tx_priority_listener_first: bool,
     caller_pool_policy: Option<(std::num::NonZeroUsize, std::time::Duration)>,
     socket_memory_budget: Option<std::num::NonZeroUsize>,
+    /// How attach resolves the receive datapath.
+    rx_mode_policy: RxModePolicy,
+    /// Receive datapath selected by the most recent attach.
+    rx_mode: Option<OwnerRxMode>,
+    /// A managed RX task that stopped or errored, surfaced by [`Self::fault`].
+    rx_fault: Option<OwnerFault>,
 }
 
 impl Owner {
@@ -1446,7 +1921,37 @@ impl Owner {
             tx_priority_listener_first: true,
             caller_pool_policy: None,
             socket_memory_budget: None,
+            rx_mode_policy: RxModePolicy::default(),
+            rx_mode: None,
+            rx_fault: None,
         }
+    }
+
+    /// Require (or merely prefer) managed multishot RX for later attaches.
+    ///
+    /// Production shards use [`RxModePolicy::ManagedRequired`] so a host
+    /// without the provided-buffer substrate is a startup error rather than a
+    /// silent fallback to the raw reader.
+    pub fn set_rx_mode_policy(&mut self, policy: RxModePolicy) {
+        self.rx_mode_policy = policy;
+    }
+
+    /// Receive datapath selected for this Owner's shared sockets.
+    ///
+    /// `None` before any socket is attached.
+    #[must_use]
+    pub fn rx_mode(&self) -> Option<OwnerRxMode> {
+        self.rx_mode
+    }
+
+    /// Managed RX ring/truncation/drop state for the listener side (or the
+    /// caller side when no listener is attached).
+    #[must_use]
+    pub fn rx_stats(&self) -> Option<ManagedRxStats> {
+        self.listener
+            .as_ref()
+            .map(|side| side.rx.stats())
+            .or_else(|| self.caller.as_ref().map(|side| side.rx.stats()))
     }
 
     /// Current wire ceiling in bytes.
@@ -1475,10 +1980,12 @@ impl Owner {
         Ok(())
     }
 
-    /// Typed fault state if any worker has failed or owner has been shut down.
+    /// Typed fault state: a failed TX worker or completion, a stopped managed
+    /// RX task, or a completed shutdown. A fault stops new admission and new
+    /// TX; it is never a silently degraded steady state.
     #[must_use]
     pub fn fault(&self) -> Option<&OwnerFault> {
-        self.tx_engine.fault()
+        self.tx_engine.fault().or(self.rx_fault.as_ref())
     }
 
     /// Non-awaiting shutdown: stops new admissions, signals the fixed lanes to
@@ -1531,6 +2038,29 @@ impl Owner {
         let free = self.tx_pool.free_count();
         let capacity = self.tx_pool.capacity();
         self.tx_engine.in_flight() == 0 && free == capacity
+    }
+
+    /// Turn a stopped managed RX task into a typed Owner fault. Called every
+    /// visit so a dead consumer surfaces promptly instead of looking like a
+    /// socket that simply has nothing to deliver.
+    fn harvest_rx_faults(&mut self) {
+        if self.rx_fault.is_some() {
+            return;
+        }
+        let listener = self
+            .listener
+            .as_ref()
+            .and_then(|side| side.rx.take_fault().map(|fault| ("listener", fault)));
+        let caller = self
+            .caller
+            .as_ref()
+            .and_then(|side| side.rx.take_fault().map(|fault| ("caller", fault)));
+        let (side, fault) = match listener.or(caller) {
+            Some(pair) => pair,
+            None => return,
+        };
+        let RxFault::StreamError(detail) = fault;
+        self.rx_fault = Some(OwnerFault::RxStreamFailed { side, detail });
     }
 
     fn poll_tx_activity(&mut self, cx: &mut Context<'_>) -> Poll<()> {
@@ -1684,11 +2214,33 @@ impl Owner {
             }
             self.socket_memory_budget = Some(budget);
         }
+        let rx_mode = self.resolve_rx_mode("listener.rx_mode")?;
+        self.rx_mode = Some(rx_mode);
         let mut sockets = prepared.bind_sockets()?;
         let sock = compio::net::UdpSocket::from_std(sockets.remove(0))?;
         self.sessions_started = true;
-        self.listener = Some(ListenerSide::from_prepared(sock, prepared)?);
+        let slot_len = managed_rx_buffer_len(self.wire_ceiling);
+        self.listener = Some(ListenerSide::from_prepared_with_rx_mode(
+            sock, prepared, rx_mode, slot_len,
+        )?);
         Ok(())
+    }
+
+    /// Resolve the receive datapath for a socket attach from the live
+    /// runtime's substrate, failing closed under
+    /// [`RxModePolicy::ManagedRequired`].
+    fn resolve_rx_mode(
+        &self,
+        field: &'static str,
+    ) -> Result<OwnerRxMode, crate::RuntimeBuildError> {
+        let managed_available = compio::runtime::Runtime::try_current().is_some_and(|runtime| {
+            runtime.driver_type().is_iouring() && runtime.buffer_pool().is_ok()
+        });
+        self.rx_mode_policy
+            .resolve(managed_available)
+            .map_err(|reason| {
+                crate::RuntimeBuildError::from(crate::ConfigError::new(field, reason))
+            })
     }
 
     /// Start one outbound session on this owner's shared caller socket,
@@ -1765,13 +2317,18 @@ impl Owner {
                 max_in_flight,
                 attempt_deadline,
             } = prepared.connect;
-            self.caller = Some(OwnerCallerSide::from_parts(
+            let rx_mode = self.resolve_rx_mode("caller.connect.rx_mode")?;
+            self.rx_mode = Some(rx_mode);
+            let slot_len = managed_rx_buffer_len(self.wire_ceiling);
+            self.caller = Some(OwnerCallerSide::from_parts_with_rx_mode(
                 sock,
                 max_in_flight,
                 attempt_deadline,
                 prepared.transport,
                 prepared.local_bind,
                 prepared.connect,
+                rx_mode,
+                slot_len,
             ));
         }
         let side = self.caller.as_mut().expect("just ensured above");
@@ -1954,6 +2511,7 @@ impl Owner {
 
         // 2. Service incoming RX up to max_rx_packets / max_rx_bytes
         self.service_rx(now, &budget, &mut report).await;
+        self.harvest_rx_faults();
 
         // 3. Lifecycle maintenance, bounded by max_actions only (see
         //    `service_maintenance`): independent of the packet/byte axes.
@@ -1999,13 +2557,16 @@ impl Owner {
     /// 3. An incoming datagram on the caller socket (wakes immediately).
     /// 4. Timer expiry (`timeout` elapses).
     pub async fn wait_for_activity(&mut self, timeout: std::time::Duration) {
-        // Staged work wakes immediately: never sleep past work the next
-        // service() call can already consume.
+        // Staged or already-queued work wakes immediately: never sleep past
+        // work the next service() call can already consume.
         if self
             .listener
             .as_ref()
-            .is_some_and(|l| l.pending_rx.is_some())
-            || self.caller.as_ref().is_some_and(|c| c.pending_rx.is_some())
+            .is_some_and(|l| l.pending_rx.is_some() || l.rx.pending())
+            || self
+                .caller
+                .as_ref()
+                .is_some_and(|c| c.pending_rx.is_some() || c.rx.pending())
         {
             return;
         }
@@ -2015,14 +2576,10 @@ impl Owner {
                 if self.poll_tx_activity(cx).is_ready() {
                     return std::task::Poll::Ready(());
                 }
-                if let Some(listener) = self.listener.as_ref()
-                    && listener.poll_read_ready(cx).is_ready()
-                {
+                if Self::side_rx_ready(self.listener.as_ref(), cx) {
                     return std::task::Poll::Ready(());
                 }
-                if let Some(caller) = self.caller.as_ref()
-                    && caller.poll_read_ready(cx).is_ready()
-                {
+                if Self::side_rx_ready(self.caller.as_ref(), cx) {
                     return std::task::Poll::Ready(());
                 }
                 std::task::Poll::Pending
@@ -2031,12 +2588,44 @@ impl Owner {
         .await;
     }
 
+    /// Whether one side has receive work now, registering this task's waker
+    /// for later.
+    ///
+    /// Managed mode wakes on the RX task's ring -- never on socket readiness,
+    /// because that task is the socket's only consumer. Raw mode wakes on
+    /// readiness as before.
+    fn side_rx_ready<R>(side: Option<&R>, cx: &mut Context<'_>) -> bool
+    where
+        R: SideRxHolder,
+    {
+        let Some(side) = side else {
+            return false;
+        };
+        match side.rx_ring() {
+            Some(ring) => {
+                let mut ring = ring.borrow_mut();
+                if ring.pending() || ring.fault.is_some() {
+                    return true;
+                }
+                ring.waker = Some(cx.waker().clone());
+                false
+            }
+            None => side.poll_read_ready(cx).is_ready(),
+        }
+    }
+
     async fn service_rx_listener(
         listener: &mut ListenerSide,
         now: Timestamp,
         budget: &OwnerServiceBudget,
         report: &mut OwnerServiceReport,
     ) {
+        // Managed multishot: completions come from the fixed RX task's ring,
+        // and the socket itself is never read by this path.
+        if listener.rx.mode == OwnerRxMode::ManagedMultishot {
+            Self::service_rx_listener_managed(listener, now, budget, report).await;
+            return;
+        }
         // 1. Consume a staged packet (metadata only) when the budget permits.
         if let Some((peer, len)) = listener.pending_rx {
             let exceeds_packets = report.rx_packets >= budget.max_rx_packets;
@@ -2109,12 +2698,130 @@ impl Owner {
         }
     }
 
+    /// Feed one managed completion into listener admission and account it.
+    fn admit_managed(
+        listener: &mut ListenerSide,
+        datagram: &ManagedRxDatagram,
+        now: Timestamp,
+        report: &mut OwnerServiceReport,
+    ) {
+        report.rx_packets += 1;
+        report.rx_bytes += datagram.len();
+        let _ = listener.table.admit(
+            datagram.peer,
+            datagram.bytes(),
+            now,
+            &listener.options,
+            0,
+            1,
+            &listener.telemetry,
+        );
+    }
+
+    /// Managed drain for the listener socket: completions come from the fixed
+    /// RX task's bounded ring, never from the socket itself (the task is the
+    /// only consumer). A completion that does not fit the remaining byte
+    /// budget is held as staged work with its lease intact -- no copy, and the
+    /// pool buffer returns when it is finally consumed.
+    async fn service_rx_listener_managed(
+        listener: &mut ListenerSide,
+        now: Timestamp,
+        budget: &OwnerServiceBudget,
+        report: &mut OwnerServiceReport,
+    ) {
+        let Some(ring) = listener.rx.ring.as_ref().cloned() else {
+            return;
+        };
+        // Register this visit's waker so the next completion wakes the Owner
+        // instead of leaving it parked on a timer.
+        let _ = std::future::poll_fn(|cx| {
+            ring.borrow_mut().waker = Some(cx.waker().clone());
+            std::task::Poll::Ready(())
+        })
+        .await;
+
+        if let Some(staged) = listener.rx.staged.take() {
+            if !rx_budget_fits(report, budget, staged.len()) {
+                listener.rx.staged = Some(staged);
+                return;
+            }
+            Self::admit_managed(listener, &staged, now, report);
+        }
+
+        while report.rx_packets < budget.max_rx_packets && report.rx_bytes < budget.max_rx_bytes {
+            let Some(datagram) = ring.borrow_mut().pop() else {
+                break;
+            };
+            if !rx_budget_fits(report, budget, datagram.len()) {
+                listener.rx.staged = Some(datagram);
+                break;
+            }
+            Self::admit_managed(listener, &datagram, now, report);
+        }
+    }
+
+    /// Feed one managed completion into the pooled caller table and account it.
+    fn feed_managed(
+        caller: &mut OwnerCallerSide,
+        datagram: &ManagedRxDatagram,
+        now: Timestamp,
+        report: &mut OwnerServiceReport,
+    ) {
+        report.rx_packets += 1;
+        report.rx_bytes += datagram.len();
+        let _ = caller
+            .pool
+            .table_mut()
+            .feed(datagram.peer, datagram.bytes(), now);
+    }
+
+    /// Managed drain for the caller socket; the caller-side counterpart to
+    /// [`Self::service_rx_listener_managed`].
+    async fn service_rx_caller_managed(
+        caller: &mut OwnerCallerSide,
+        now: Timestamp,
+        budget: &OwnerServiceBudget,
+        report: &mut OwnerServiceReport,
+    ) {
+        let Some(ring) = caller.rx.ring.as_ref().cloned() else {
+            return;
+        };
+        let _ = std::future::poll_fn(|cx| {
+            ring.borrow_mut().waker = Some(cx.waker().clone());
+            std::task::Poll::Ready(())
+        })
+        .await;
+
+        if let Some(staged) = caller.rx.staged.take() {
+            if !rx_budget_fits(report, budget, staged.len()) {
+                caller.rx.staged = Some(staged);
+                return;
+            }
+            Self::feed_managed(caller, &staged, now, report);
+        }
+
+        while report.rx_packets < budget.max_rx_packets && report.rx_bytes < budget.max_rx_bytes {
+            let Some(datagram) = ring.borrow_mut().pop() else {
+                break;
+            };
+            if !rx_budget_fits(report, budget, datagram.len()) {
+                caller.rx.staged = Some(datagram);
+                break;
+            }
+            Self::feed_managed(caller, &datagram, now, report);
+        }
+    }
+
     async fn service_rx_caller(
         caller: &mut OwnerCallerSide,
         now: Timestamp,
         budget: &OwnerServiceBudget,
         report: &mut OwnerServiceReport,
     ) {
+        if caller.rx.mode == OwnerRxMode::ManagedMultishot {
+            Self::service_rx_caller_managed(caller, now, budget, report).await;
+            return;
+        }
         // 1. Consume a staged packet (metadata only) when the budget permits.
         if let Some((peer, len)) = caller.pending_rx {
             let exceeds_packets = report.rx_packets >= budget.max_rx_packets;
@@ -2339,14 +3046,12 @@ impl Owner {
 
     #[must_use]
     pub fn has_pending_work(&self, now: Timestamp) -> bool {
-        let l_pending = self
-            .listener
-            .as_ref()
-            .is_some_and(|l| l.pending_rx.is_some() || l.table.has_pending_output(now));
-        let c_pending = self
-            .caller
-            .as_ref()
-            .is_some_and(|c| c.pending_rx.is_some() || c.pool.table().has_pending_output(now));
+        let l_pending = self.listener.as_ref().is_some_and(|l| {
+            l.pending_rx.is_some() || l.rx.pending() || l.table.has_pending_output(now)
+        });
+        let c_pending = self.caller.as_ref().is_some_and(|c| {
+            c.pending_rx.is_some() || c.rx.pending() || c.pool.table().has_pending_output(now)
+        });
         l_pending || c_pending
     }
 }
@@ -3780,6 +4485,175 @@ mod tests {
         });
     }
 
+    /// Managed-RX budget rule: zero allowances accept nothing, and the byte
+    /// boundary is exact. This is the seam the managed drain uses to decide
+    /// whether a completion may be consumed or must stay staged.
+    #[test]
+    fn rx_budget_is_exact_and_zero_means_zero() {
+        let budget = OwnerServiceBudget {
+            max_rx_packets: 2,
+            max_rx_bytes: 100,
+            ..Default::default()
+        };
+        let mut report = OwnerServiceReport::default();
+
+        assert!(
+            rx_budget_fits(&report, &budget, 100),
+            "exactly the byte cap fits"
+        );
+        assert!(
+            !rx_budget_fits(&report, &budget, 101),
+            "one byte over must not fit"
+        );
+        report.rx_bytes = 100;
+        assert!(
+            !rx_budget_fits(&report, &budget, 1),
+            "exhausted bytes accept nothing"
+        );
+        report.rx_bytes = 0;
+        report.rx_packets = 2;
+        assert!(
+            !rx_budget_fits(&report, &budget, 1),
+            "exhausted packets accept nothing"
+        );
+
+        let zero = OwnerServiceBudget {
+            max_rx_packets: 0,
+            max_rx_bytes: 0,
+            ..Default::default()
+        };
+        let report = OwnerServiceReport::default();
+        assert!(
+            !rx_budget_fits(&report, &zero, 0),
+            "a zero packet budget performs zero work even for a zero-length datagram"
+        );
+    }
+
+    /// A managed-mode side reports its selected mode and an empty ring before
+    /// anything arrives, and the readiness fallback reports raw mode. This is
+    /// the mode/observability seam the qualification contract depends on.
+    #[test]
+    fn side_rx_reports_selected_mode_and_empty_ring() {
+        let raw = SideRx::raw();
+        assert_eq!(raw.mode, OwnerRxMode::RawReadiness);
+        assert!(!raw.pending());
+        let stats = raw.stats();
+        assert_eq!(stats.mode, OwnerRxMode::RawReadiness);
+        assert_eq!(stats.depth, 0);
+        assert_eq!(stats.capacity, MANAGED_RX_RING_DEPTH);
+        assert_eq!((stats.dropped, stats.truncated), (0, 0));
+
+        let managed = SideRx::managed(2048, true);
+        assert_eq!(managed.mode, OwnerRxMode::ManagedMultishot);
+        assert!(!managed.pending(), "a fresh ring holds nothing");
+        assert!(managed.ring.is_some(), "managed mode owns a ring");
+        let stats = managed.stats();
+        assert_eq!(stats.mode, OwnerRxMode::ManagedMultishot);
+        assert_eq!(stats.depth, 0);
+        assert!(!stats.staged);
+    }
+
+    /// A managed RX stream failure is a typed Owner fault, not a quiet socket,
+    /// and it stops new admission. Injected at the ring so the assertion does
+    /// not depend on a kernel that can register a provided-buffer ring.
+    #[test]
+    fn managed_rx_stream_failure_faults_the_owner() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            let c_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+            let c_sock = compio::net::UdpSocket::from_std(c_std).expect("adopt");
+            let mut owner = Owner::new(4).with_caller(OwnerCallerSide::new_single(c_sock));
+
+            // Simulate the RX task's terminal condition.
+            {
+                let ring = Rc::new(RefCell::new(ManagedRxRing::new()));
+                ring.borrow_mut()
+                    .fault(RxFault::StreamError("simulated stream end".to_string()));
+                owner.caller.as_mut().expect("caller side").rx = SideRx {
+                    mode: OwnerRxMode::ManagedMultishot,
+                    ring: Some(ring),
+                    staged: None,
+                };
+            }
+            assert!(
+                owner.has_pending_work(Timestamp::from_micros(1_000)),
+                "a faulted RX side is observable work, not silence"
+            );
+
+            let _ = owner
+                .service(Timestamp::from_micros(1_000), OwnerServiceBudget::default())
+                .await;
+            match owner.fault() {
+                Some(OwnerFault::RxStreamFailed { side, detail }) => {
+                    assert_eq!(*side, "caller");
+                    assert!(detail.contains("stream end"), "detail: {detail}");
+                }
+                other => panic!("a stopped managed RX task must fault the owner, got {other:?}"),
+            }
+        });
+    }
+
+    /// Fail-closed attach: under `ManagedRequired` an Owner refuses to attach
+    /// on a runtime whose provided-buffer ring cannot register, while
+    /// `ManagedPreferred` selects the raw reader and says so. Portable: the
+    /// capability probe is the same one production uses, so the test asserts
+    /// the branch appropriate to the host it runs on.
+    #[test]
+    fn managed_required_fails_closed_without_the_substrate() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        let managed_available = runtime.block_on(async {
+            runtime.driver_type().is_iouring() && runtime.buffer_pool().is_ok()
+        });
+        runtime.block_on(async {
+            // Reserve an address, then release it: the Owner binds it itself.
+            let l_addr = {
+                let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind probe");
+                probe.local_addr().expect("probe addr")
+            };
+            let cfg = crate::ListenerConfig::builder(l_addr)
+                .topology(crate::ListenerTopology::PerPort)
+                .configure_transport(|t| t.promotion = crate::PromotionPolicy::Never)
+                .build()
+                .expect("listener config");
+
+            // Each Owner needs its own port: binding the same address twice
+            // would fail with AddrInUse for reasons unrelated to RX mode.
+            let mut required = Owner::new(4);
+            required.set_rx_mode_policy(RxModePolicy::ManagedRequired);
+            let res = required.listen(&cfg);
+            if managed_available {
+                res.expect("a capable runtime must attach managed multishot");
+                assert_eq!(required.rx_mode(), Some(OwnerRxMode::ManagedMultishot));
+            } else {
+                assert!(
+                    res.is_err(),
+                    "ManagedRequired must refuse to attach without the managed substrate"
+                );
+            }
+
+            let p_addr = {
+                let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind probe");
+                probe.local_addr().expect("probe addr")
+            };
+            let p_cfg = crate::ListenerConfig::builder(p_addr)
+                .topology(crate::ListenerTopology::PerPort)
+                .configure_transport(|t| t.promotion = crate::PromotionPolicy::Never)
+                .build()
+                .expect("listener config");
+            let mut preferred = Owner::new(4);
+            preferred.set_rx_mode_policy(RxModePolicy::ManagedPreferred);
+            preferred
+                .listen(&p_cfg)
+                .expect("ManagedPreferred always attaches");
+            let expected = if managed_available {
+                OwnerRxMode::ManagedMultishot
+            } else {
+                OwnerRxMode::RawReadiness
+            };
+            assert_eq!(preferred.rx_mode(), Some(expected));
+        });
+    }
+
     /// P1: lifecycle maintenance is independent of the packet/byte axes. A
     /// visit that grants zero TX packets/bytes must still run bounded
     /// maintenance work, and zero actions must still run none.
@@ -4210,8 +5084,8 @@ mod tests {
         assert!(!profile.driver_type.is_empty());
         // Capability classification is recorded, not asserted: it varies by
         // host kernel and backend. Just exercise the accessors.
-        let _ = profile.managed_rx_available();
-        let _ = profile.high_density_qualified();
+        // Capability only; qualification also needs the Owner's selected mode.
+        let _ = profile.host_managed_rx_capable();
     }
 
     #[test]
@@ -4239,32 +5113,99 @@ mod tests {
             MultishotRecvStatus::NotTestedBecauseBufferRingUnavailable,
             true,
         );
-        assert!(!blocked.managed_rx_available());
-        assert!(!blocked.high_density_qualified());
-        // Full availability qualifies.
+        assert!(!blocked.host_managed_rx_capable());
+        // Full availability is capable.
         let ok = profile(
             ProvidedBufferRingStatus::Available,
             MultishotRecvStatus::Available,
             true,
         );
-        assert!(ok.managed_rx_available());
-        assert!(ok.high_density_qualified());
-        // Available ring + broken multishot stays unqualified without
-        // blaming the substrate.
+        assert!(ok.host_managed_rx_capable());
+        // Capability is NOT qualification: an Owner still on the raw reader is
+        // unqualified even on a fully capable host.
+        assert!(
+            !ProductionQualification {
+                profile: ok.clone(),
+                owner_rx_mode: OwnerRxMode::RawReadiness,
+            }
+            .qualified(),
+            "host capability alone must never read as a qualification pass"
+        );
+        assert!(
+            ProductionQualification {
+                profile: ok.clone(),
+                owner_rx_mode: OwnerRxMode::ManagedMultishot,
+            }
+            .qualified()
+        );
+        // Available ring + broken multishot stays incapable without blaming
+        // the substrate.
         let no_ms = profile(
             ProvidedBufferRingStatus::Available,
             MultishotRecvStatus::Unsupported,
             true,
         );
-        assert!(!no_ms.managed_rx_available());
-        assert!(!no_ms.high_density_qualified());
-        // Unknown is never qualified.
+        assert!(!no_ms.host_managed_rx_capable());
+        assert!(
+            !ProductionQualification {
+                profile: no_ms,
+                owner_rx_mode: OwnerRxMode::ManagedMultishot,
+            }
+            .qualified()
+        );
+        // Unknown is never capable.
         let unknown = profile(
             ProvidedBufferRingStatus::Unknown,
             MultishotRecvStatus::Unknown,
             false,
         );
-        assert!(!unknown.managed_rx_available());
-        assert!(!unknown.high_density_qualified());
+        assert!(!unknown.host_managed_rx_capable());
+    }
+
+    /// Managed RX resources and policy: slots track the wire ceiling (not the
+    /// 64 KiB UDP maximum), mode selection fails closed only under
+    /// `ManagedRequired`, and an oversized datagram is classified as truncated
+    /// rather than parsed short.
+    #[test]
+    fn managed_rx_sizing_mode_and_truncation_policy() {
+        assert_eq!(managed_rx_buffer_len(1500), 2048);
+        assert_eq!(managed_rx_buffer_len(1316 + 16 + 16), 2048);
+        assert_eq!(managed_rx_buffer_len(3000), 4096);
+        assert_eq!(managed_rx_buffer_len(0), 32);
+
+        assert_eq!(
+            RxModePolicy::ManagedRequired.resolve(true),
+            Ok(OwnerRxMode::ManagedMultishot)
+        );
+        assert_eq!(
+            RxModePolicy::ManagedPreferred.resolve(true),
+            Ok(OwnerRxMode::ManagedMultishot)
+        );
+        assert_eq!(
+            RxModePolicy::ManagedPreferred.resolve(false),
+            Ok(OwnerRxMode::RawReadiness)
+        );
+        assert!(
+            RxModePolicy::ManagedRequired.resolve(false).is_err(),
+            "ManagedRequired must refuse to attach without the substrate"
+        );
+
+        assert_eq!(
+            classify_managed_datagram(64, 2048, false),
+            ManagedDatagram::Complete
+        );
+        assert_eq!(
+            classify_managed_datagram(2048, 2048, false),
+            ManagedDatagram::Complete
+        );
+        assert_eq!(
+            classify_managed_datagram(2048, 2048, true),
+            ManagedDatagram::Truncated,
+            "MSG_TRUNC must never be parsed as a complete datagram"
+        );
+        assert_eq!(
+            classify_managed_datagram(4096, 2048, false),
+            ManagedDatagram::Truncated
+        );
     }
 }
