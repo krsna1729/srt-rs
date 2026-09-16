@@ -9,7 +9,7 @@ fn ts(micros: u64) -> Timestamp {
 }
 
 fn transfer(source: &mut SrtConnection, target: &mut SrtConnection, now: Timestamp) {
-    while let Some(output) = source.poll_output() {
+    while let Some(output) = source.poll_output().unwrap() {
         if let ConnectionOutput::SendPacket(packet) = output {
             target.feed_recv_buf(&packet, now).expect("packet decodes");
         }
@@ -40,7 +40,7 @@ fn establish_pair(options: ConnectionOptions) -> (SrtConnection, SrtConnection) 
 
 fn drain(connection: &mut SrtConnection) -> Vec<Vec<u8>> {
     let mut packets = Vec::new();
-    while let Some(output) = connection.poll_output() {
+    while let Some(output) = connection.poll_output().unwrap() {
         if let ConnectionOutput::SendPacket(packet) = output {
             packets.push(packet);
         }

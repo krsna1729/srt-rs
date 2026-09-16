@@ -4108,7 +4108,11 @@ mod tests {
 
     fn next_packet(conn: &mut SrtConnection) -> Vec<u8> {
         loop {
-            match conn.poll_output().expect("connection output") {
+            match conn
+                .poll_output()
+                .expect("exact-size output materializes")
+                .expect("connection output")
+            {
                 ConnectionOutput::SendPacket(bytes) => return bytes,
                 ConnectionOutput::SetTimer { .. } | ConnectionOutput::ClearTimer { .. } => {}
             }

@@ -1445,7 +1445,11 @@ fn drive_shared_pool_connections(
     for conn in conns.values_mut() {
         conn.timers.fire_expired(timestamp, &mut conn.conn);
         let socket = &sockets[conn.socket_idx];
-        while let Some(output) = conn.conn.poll_output() {
+        while let Some(output) = conn
+            .conn
+            .poll_output()
+            .expect("exact-size output materializes")
+        {
             match output {
                 srt_proto::ConnectionOutput::SendPacket(bytes) => {
                     let _ = socket.send_to(&bytes, conn.peer);
@@ -1653,7 +1657,7 @@ fn drain_conn_outputs(
 ) -> bool {
     use srt_proto::ConnectionOutput;
     let mut refused = false;
-    while let Some(out) = conn.poll_output() {
+    while let Some(out) = conn.poll_output().expect("exact-size output materializes") {
         match out {
             ConnectionOutput::SendPacket(bytes) => {
                 if socket.send_to(&bytes, destination).is_err() {
@@ -2918,7 +2922,7 @@ mod b02_regression_tests {
         now: srt_proto::Timestamp,
         decode_expect: &str,
     ) {
-        while let Some(output) = from.poll_output() {
+        while let Some(output) = from.poll_output().expect("exact-size output materializes") {
             if let srt_proto::ConnectionOutput::SendPacket(packet) = output {
                 to.feed_recv_buf(&packet, now).expect(decode_expect);
             }
@@ -3073,7 +3077,10 @@ mod b02_regression_tests {
             caller.send(&[i], now).expect("valid SRT data");
         }
         let mut packets = Vec::new();
-        while let Some(output) = caller.poll_output() {
+        while let Some(output) = caller
+            .poll_output()
+            .expect("exact-size output materializes")
+        {
             if let srt_proto::ConnectionOutput::SendPacket(packet) = output {
                 packets.push(packet);
             }

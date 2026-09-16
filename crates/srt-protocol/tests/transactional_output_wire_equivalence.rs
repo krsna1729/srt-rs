@@ -51,13 +51,13 @@ fn establish_pair(
     for round in 0..10 {
         now = ts(2_000 + round * 1_000);
         let mut progress = false;
-        while let Some(out) = caller.poll_output() {
+        while let Some(out) = caller.poll_output().unwrap() {
             progress = true;
             if let ConnectionOutput::SendPacket(packet) = out {
                 let _ = listener.feed_recv_buf(&packet, now);
             }
         }
-        while let Some(out) = listener.poll_output() {
+        while let Some(out) = listener.poll_output().unwrap() {
             progress = true;
             if let ConnectionOutput::SendPacket(packet) = out {
                 let _ = caller.feed_recv_buf(&packet, now);
@@ -78,8 +78,8 @@ fn establish_pair(
 
     // Drain any remaining initial connection timer events
     // Drain any remaining initial connection timer events and events
-    while caller.poll_output().is_some() {}
-    while listener.poll_output().is_some() {}
+    while caller.poll_output().unwrap().is_some() {}
+    while listener.poll_output().unwrap().is_some() {}
     while caller.poll_event().is_some() {}
     while listener.poll_event().is_some() {}
     (caller, listener)
@@ -145,7 +145,7 @@ fn wire_equivalence_plaintext() {
 
     // Path A: legacy poll_output()
     let mut packet_a = None;
-    while let Some(out) = caller_a.poll_output() {
+    while let Some(out) = caller_a.poll_output().unwrap() {
         if let ConnectionOutput::SendPacket(bytes) = out {
             packet_a = Some(bytes);
             break;
@@ -222,7 +222,7 @@ fn wire_equivalence_ctr_modes() {
 
         // Path A: legacy poll_output
         let mut packet_a = None;
-        while let Some(out) = caller_a.poll_output() {
+        while let Some(out) = caller_a.poll_output().unwrap() {
             if let ConnectionOutput::SendPacket(bytes) = out {
                 packet_a = Some(bytes);
                 break;
@@ -285,7 +285,7 @@ fn wire_equivalence_gcm_modes() {
             .expect("send shared b");
 
         let mut packet_a = None;
-        while let Some(out) = caller_a.poll_output() {
+        while let Some(out) = caller_a.poll_output().unwrap() {
             if let ConnectionOutput::SendPacket(bytes) = out {
                 packet_a = Some(bytes);
                 break;
@@ -344,11 +344,11 @@ fn wire_equivalence_retransmits() {
 
     // Deliver packet 0 and packet 2, dropping packet 1 to cause a NAK
     let mut pkts_a = Vec::new();
-    while let Some(ConnectionOutput::SendPacket(p)) = caller_a.poll_output() {
+    while let Some(ConnectionOutput::SendPacket(p)) = caller_a.poll_output().unwrap() {
         pkts_a.push(p);
     }
     let mut pkts_b = Vec::new();
-    while let Some(ConnectionOutput::SendPacket(p)) = caller_b.poll_output() {
+    while let Some(ConnectionOutput::SendPacket(p)) = caller_b.poll_output().unwrap() {
         pkts_b.push(p);
     }
     assert_eq!(pkts_a.len(), 3);
@@ -374,7 +374,7 @@ fn wire_equivalence_retransmits() {
     caller_b.feed_recv_buf(&nak_bytes, now).expect("feed nak b");
     // Path A: legacy poll_output()
     let mut retx_a = None;
-    while let Some(out) = caller_a.poll_output() {
+    while let Some(out) = caller_a.poll_output().unwrap() {
         if let ConnectionOutput::SendPacket(bytes) = out {
             retx_a = Some(bytes);
             break;
@@ -427,13 +427,13 @@ fn wire_equivalence_key_rotation() {
         .expect("provide new sek");
 
     // Transfer KMREQ to listener
-    while let Some(out) = caller.poll_output() {
+    while let Some(out) = caller.poll_output().unwrap() {
         if let ConnectionOutput::SendPacket(bytes) = out {
             listener.feed_recv_buf(&bytes, now).expect("feed listener");
         }
     }
     // Transfer KMRSP back to caller
-    while let Some(out) = listener.poll_output() {
+    while let Some(out) = listener.poll_output().unwrap() {
         if let ConnectionOutput::SendPacket(bytes) = out {
             caller.feed_recv_buf(&bytes, now).expect("feed caller");
         }
@@ -533,12 +533,12 @@ fn old_key_datagram_materializes_across_switch_and_mass_new_key_admissions() {
     caller
         .provide_new_sek(&[0x5B; 16], now)
         .expect("provide new sek");
-    while let Some(out) = caller.poll_output() {
+    while let Some(out) = caller.poll_output().unwrap() {
         if let ConnectionOutput::SendPacket(bytes) = out {
             listener.feed_recv_buf(&bytes, now).expect("feed listener");
         }
     }
-    while let Some(out) = listener.poll_output() {
+    while let Some(out) = listener.poll_output().unwrap() {
         if let ConnectionOutput::SendPacket(bytes) = out {
             caller.feed_recv_buf(&bytes, now).expect("feed caller");
         }

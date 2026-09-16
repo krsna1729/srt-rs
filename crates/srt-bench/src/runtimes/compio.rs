@@ -1035,7 +1035,7 @@ async fn drain_pending_outputs(
     use srt_proto::ConnectionOutput;
     let now = crate::now_ts(Instant::now());
     let mut refused = false;
-    while let Some(out) = conn.poll_output() {
+    while let Some(out) = conn.poll_output().expect("exact-size output materializes") {
         match out {
             ConnectionOutput::SendPacket(bytes) => {
                 let BufResult(res, _buf) = listener.send_to(bytes, destination).await;

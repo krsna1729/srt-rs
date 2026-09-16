@@ -48,12 +48,18 @@ fn connected_pair() -> (SrtConnection, SrtConnection) {
     // Handshake.
     for i in 0..10 {
         let now = Timestamp::from_micros(i * 10_000);
-        while let Some(out) = caller.poll_output() {
+        while let Some(out) = caller
+            .poll_output()
+            .expect("exact-size output materializes")
+        {
             if let srt_proto::ConnectionOutput::SendPacket(d) = out {
                 let _ = listener.feed_recv_buf(&d, now);
             }
         }
-        while let Some(out) = listener.poll_output() {
+        while let Some(out) = listener
+            .poll_output()
+            .expect("exact-size output materializes")
+        {
             if let srt_proto::ConnectionOutput::SendPacket(d) = out {
                 let _ = caller.feed_recv_buf(&d, now);
             }
@@ -96,7 +102,10 @@ fn run_sim(cfg: &SimConfig) -> SimOutcome {
         }
         caller.process_retransmit(now);
         listener.process_retransmit(now);
-        while let Some(out) = caller.poll_output() {
+        while let Some(out) = caller
+            .poll_output()
+            .expect("exact-size output materializes")
+        {
             if let srt_proto::ConnectionOutput::SendPacket(d) = out {
                 let r = rng.next() % 100;
                 if r < cfg.loss_pct {
@@ -130,12 +139,18 @@ fn run_sim(cfg: &SimConfig) -> SimOutcome {
             }
         }
         // Pump ACKs back.
-        while let Some(out) = listener.poll_output() {
+        while let Some(out) = listener
+            .poll_output()
+            .expect("exact-size output materializes")
+        {
             if let srt_proto::ConnectionOutput::SendPacket(d) = out {
                 let _ = caller.feed_recv_buf(&d, now);
             }
         }
-        while let Some(out) = caller.poll_output() {
+        while let Some(out) = caller
+            .poll_output()
+            .expect("exact-size output materializes")
+        {
             if let srt_proto::ConnectionOutput::SendPacket(d) = out {
                 let _ = d;
             } else {
@@ -162,12 +177,18 @@ fn run_sim(cfg: &SimConfig) -> SimOutcome {
                 i += 1;
             }
         }
-        while let Some(out) = listener.poll_output() {
+        while let Some(out) = listener
+            .poll_output()
+            .expect("exact-size output materializes")
+        {
             if let srt_proto::ConnectionOutput::SendPacket(d) = out {
                 let _ = caller.feed_recv_buf(&d, now);
             }
         }
-        while let Some(out) = caller.poll_output() {
+        while let Some(out) = caller
+            .poll_output()
+            .expect("exact-size output materializes")
+        {
             if let srt_proto::ConnectionOutput::SendPacket(d) = out {
                 let _ = d;
             } else {

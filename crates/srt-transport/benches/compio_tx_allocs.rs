@@ -52,12 +52,18 @@ fn new_connected_pair(socket_id: u32) -> (SrtConnection, SrtConnection) {
     caller.connect(Timestamp::default()).expect("connect");
     for i in 0..10 {
         let now = Timestamp::from_micros(i * 10_000);
-        while let Some(output) = caller.poll_output() {
+        while let Some(output) = caller
+            .poll_output()
+            .expect("exact-size output materializes")
+        {
             if let ConnectionOutput::SendPacket(data) = output {
                 let _ = listener.feed_recv_buf(&data, now);
             }
         }
-        while let Some(output) = listener.poll_output() {
+        while let Some(output) = listener
+            .poll_output()
+            .expect("exact-size output materializes")
+        {
             if let ConnectionOutput::SendPacket(data) = output {
                 let _ = caller.feed_recv_buf(&data, now);
             }

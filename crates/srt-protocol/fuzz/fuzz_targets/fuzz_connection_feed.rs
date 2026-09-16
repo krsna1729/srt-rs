@@ -7,7 +7,7 @@ use srt_proto::wire::{ControlPacket, ControlType};
 use srt_proto::write_u32;
 
 fn transfer(from: &mut SrtConnection, to: &mut SrtConnection, now: Timestamp) {
-    while let Some(output) = from.poll_output() {
+    while let Some(output) = from.poll_output().unwrap() {
         if let ConnectionOutput::SendPacket(packet) = output {
             assert!(packet.len() <= DEFAULT_MTU as usize);
             let _ = to.feed_recv_buf(&packet, now);

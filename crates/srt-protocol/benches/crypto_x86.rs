@@ -296,7 +296,7 @@ fn connection_options(spec: CipherSpec, i: usize) -> ConnectionOptions {
 /// keep polling after non-packet actions rather than stopping at the first one.
 fn drain_packets(conn: &mut SrtConnection, dst: &mut Vec<Vec<u8>>) {
     dst.clear();
-    while let Some(out) = conn.poll_output() {
+    while let Some(out) = conn.poll_output().unwrap() {
         if let ConnectionOutput::SendPacket(packet) = out {
             dst.push(packet);
         }
@@ -423,7 +423,7 @@ impl SrtTxRig {
                 .send_shared(black_box(self.shared_payload.clone()), now)
                 .expect("send_shared");
 
-            while let Some(out) = self.callers[i].poll_output() {
+            while let Some(out) = self.callers[i].poll_output().unwrap() {
                 if let ConnectionOutput::SendPacket(packet) = out {
                     self.wires[i].push(packet);
                 }
@@ -463,7 +463,7 @@ impl SrtTxRig {
             }
 
             self.ack_wires[i].clear();
-            while let Some(out) = self.listeners[i].poll_output() {
+            while let Some(out) = self.listeners[i].poll_output().unwrap() {
                 if let ConnectionOutput::SendPacket(packet) = out {
                     self.ack_wires[i].push(packet);
                 }
@@ -478,7 +478,7 @@ impl SrtTxRig {
             // ACK processing can queue ACKACK (and key-management control).
             // Deliver it back so the receiver's ACK state also advances.
             self.ackack_wires[i].clear();
-            while let Some(out) = self.callers[i].poll_output() {
+            while let Some(out) = self.callers[i].poll_output().unwrap() {
                 if let ConnectionOutput::SendPacket(packet) = out {
                     self.ackack_wires[i].push(packet);
                 }

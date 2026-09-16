@@ -11,7 +11,7 @@ const ONE_WAY_US: u64 = 5_000;
 
 fn drain(conn: &mut SrtConnection) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
-    while let Some(output) = conn.poll_output() {
+    while let Some(output) = conn.poll_output().unwrap() {
         if let ConnectionOutput::SendPacket(bytes) = output {
             out.push(bytes);
         }

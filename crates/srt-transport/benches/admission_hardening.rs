@@ -23,7 +23,10 @@ fn induction(socket_id: u32) -> Vec<u8> {
 
 fn next_packet(connection: &mut SrtConnection) -> Vec<u8> {
     loop {
-        if let Some(ConnectionOutput::SendPacket(packet)) = connection.poll_output() {
+        if let Some(ConnectionOutput::SendPacket(packet)) = connection
+            .poll_output()
+            .expect("exact-size output materializes")
+        {
             return packet;
         }
     }

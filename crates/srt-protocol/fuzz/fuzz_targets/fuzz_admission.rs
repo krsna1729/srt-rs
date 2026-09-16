@@ -14,7 +14,7 @@ use srt_transport::advanced::telemetry::IngressTelemetry;
 use srt_transport::{ListenerPeerPolicy, PolicyOverride};
 
 fn next_packet(connection: &mut SrtConnection) -> Option<Vec<u8>> {
-    while let Some(output) = connection.poll_output() {
+    while let Some(output) = connection.poll_output().unwrap() {
         if let ConnectionOutput::SendPacket(packet) = output {
             return Some(packet);
         }

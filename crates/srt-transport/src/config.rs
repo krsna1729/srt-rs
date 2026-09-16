@@ -710,6 +710,21 @@ impl SessionConfig {
         &self.connection
     }
 
+    /// Encryption this session will actually carry, as
+    /// `(cipher mode, resolved)`: `None` when no passphrase is configured, so
+    /// a plain session is not charged an authentication tag.
+    ///
+    /// The mode is read from the same `ConnectionOptions` the protocol uses,
+    /// which is what makes the Owner's wire-ceiling check cipher-exact
+    /// instead of charging every AES-CTR session for AES-GCM's tag.
+    #[must_use]
+    pub fn resolved_cipher_mode(&self) -> Option<srt_proto::crypto::CipherMode> {
+        self.connection
+            .passphrase
+            .as_ref()
+            .map(|_| self.connection.cipher_mode)
+    }
+
     #[must_use]
     pub fn into_connection_options(mut self) -> ConnectionOptions {
         std::mem::take(&mut self.connection)

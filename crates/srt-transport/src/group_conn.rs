@@ -726,7 +726,11 @@ mod group_conn_tests {
             let Some(caller) = self.caller else {
                 return;
             };
-            while let Some(output) = self.connection.poll_output() {
+            while let Some(output) = self
+                .connection
+                .poll_output()
+                .expect("exact-size output materializes")
+            {
                 if let ConnectionOutput::SendPacket(packet) = output {
                     self.socket
                         .send_to(&packet, caller)

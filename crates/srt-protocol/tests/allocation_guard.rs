@@ -62,7 +62,7 @@ fn ts(micros: u64) -> Timestamp {
 /// crate, when the packet was encoded) -- this helper just moves it
 /// straight into `feed_recv_buf` without copying or re-collecting it.
 fn forward_sent(from: &mut SrtConnection, to: &mut SrtConnection, now: Timestamp) {
-    while let Some(out) = from.poll_output() {
+    while let Some(out) = from.poll_output().unwrap() {
         if let ConnectionOutput::SendPacket(data) = out {
             let _ = to.feed_recv_buf(&data, now);
         }

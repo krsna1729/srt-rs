@@ -20,6 +20,13 @@
 //!
 //! Semantics that matter for the numbers:
 //!
+//! * **F, K and H are independent inputs.** `--fanout F` is the destination
+//!   population, `--tx-lanes K` is the fixed TX lane count (= TX capacity),
+//!   and `--connect-cc H` is the number of connect attempts allowed in flight
+//!   at once. Neither K nor H is derived from F: a run is only comparable to
+//!   another run with the same K and H, which is what makes the capacity
+//!   frontier a statement about the fixed-cost shard model.
+//!
 //! * **Establishment barrier.** Nothing is measured until every logical
 //!   destination has reached `Connected`, or a connect deadline expires. A
 //!   partial establishment is reported as such and the run is not a
@@ -55,6 +62,16 @@ const DRAIN_DEADLINE: Duration = Duration::from_secs(10);
 #[derive(Debug, Default)]
 struct QualReport {
     fanout: usize,
+    tx_lanes: usize,
+    connect_cc: usize,
+    desired: usize,
+    /// `connect` calls the pool accepted (admitted or queued).
+    issued: usize,
+    admitted: usize,
+    queued: usize,
+    /// `connect` calls the pool refused because its bounded queue was full.
+    /// Refusal is expected under a fixed H; the harness re-issues later.
+    refused: usize,
     established: usize,
     offered: u64,
     accepted: u64,
@@ -62,6 +79,9 @@ struct QualReport {
     completed_ok: u64,
     short_sends: u64,
     failed_sends: u64,
+    peer_local_failures: u64,
+    transient_failures: u64,
+    tx_failures_pending: usize,
     service_visits: u64,
     lateness_p50_us: u64,
     lateness_p99_us: u64,
@@ -106,17 +126,32 @@ fn parse_arg<T: std::str::FromStr>(args: &[String], name: &str, default: T) -> T
         .unwrap_or(default)
 }
 
-async fn run_sender(fanout: usize, duration_ms: u64, base_port: u16) -> QualReport {
+async fn run_sender(
+    fanout: usize,
+    duration_ms: u64,
+    base_port: u16,
+    tx_lanes: usize,
+    connect_cc: usize,
+) -> QualReport {
     let mut report = QualReport {
         fanout,
+        tx_lanes,
+        connect_cc,
+        desired: fanout,
         ..Default::default()
     };
 
     // Production attach path: require io_uring and the managed RX substrate.
     // `ManagedPreferred` (not Required) so this run still produces evidence on
     // a fallback host -- and reports that it did.
-    let wire_ceiling = srt_transport::compio::required_session_wire_ceiling(PAYLOAD_SIZE, false);
-    let tx_capacity = (fanout * 4).clamp(256, 4096);
+    //
+    // A plain session (no passphrase) carries no authentication tag, so the
+    // cipher argument is `None`.
+    let wire_ceiling = srt_transport::compio::required_session_wire_ceiling(PAYLOAD_SIZE, None);
+    // K is an input, never a function of F: the whole point of the fixed-cost
+    // shard model is that TX concurrency does not grow with the destination
+    // population.
+    let tx_capacity = tx_lanes;
     let cfg = ProductionRuntimeConfig::for_owner(tx_capacity, wire_ceiling);
     let builder = match production_runtime_builder(cfg) {
         Ok(builder) => builder,
@@ -129,38 +164,88 @@ async fn run_sender(fanout: usize, duration_ms: u64, base_port: u16) -> QualRepo
     runtime.block_on(async {
         let mut owner = Owner::new_with_ceiling(tx_capacity, wire_ceiling);
         owner.set_rx_mode_policy(RxModePolicy::ManagedPreferred);
+        // H is an input too: F sessions may be desired while only H
+        // connection attempts are active at any moment.
         owner
             .set_caller_pool_policy(
-                std::num::NonZeroUsize::new(fanout.clamp(1, 2048)).expect("nonzero"),
+                std::num::NonZeroUsize::new(connect_cc.max(1)).expect("nonzero"),
                 CONNECT_DEADLINE,
             )
             .expect("pool policy set before first connect");
 
         let mut now = Timestamp::from_micros(10_000);
-        let mut ids = Vec::with_capacity(fanout);
-        for index in 0..fanout {
-            let remote: SocketAddr =
-                SocketAddr::from(([127, 0, 0, 1], base_port + (index as u16 % 4096)));
-            let caller_cfg = CallerConfig::builder(remote)
-                .ownership(SocketOwnership::Shared)
-                .configure_session(|session| {
-                    session.handshake.timeout = CONNECT_DEADLINE;
-                })
-                .build()
-                .expect("caller config");
-            match owner.connect(&caller_cfg, now).expect("owner connect") {
-                srt_transport::advanced::caller::PoolOutcome::Admitted(id) => ids.push(id),
-                other => panic!("expected admission, got {other:?}"),
-            }
-        }
+        // F sessions are DESIRED; H controls how many connect requests the
+        // pool works on at once. The pool's own queue is bounded too, so a
+        // refused request is simply re-issued on a later tick -- exactly how a
+        // real application fills a bounded pool -- and refusals are reported.
+        let mut ids: Vec<srt_transport::advanced::caller::LogicalCallerId> =
+            Vec::with_capacity(fanout);
+        let mut issued = 0usize;
+        let caller_cfgs: Vec<CallerConfig> = (0..fanout)
+            .map(|index| {
+                let remote: SocketAddr =
+                    SocketAddr::from(([127, 0, 0, 1], base_port + (index as u16 % 4096)));
+                CallerConfig::builder(remote)
+                    .ownership(SocketOwnership::Shared)
+                    .configure_session(|session| {
+                        session.handshake.timeout = CONNECT_DEADLINE;
+                    })
+                    .build()
+                    .expect("caller config")
+            })
+            .collect();
+        // Requests the pool queued under `--connect-cc`: the pool reports their
+        // admission as an event, and the event stream also mirrors
+        // immediately-admitted requests, so only queued ids are matched here.
+        let mut queued_requests = std::collections::HashSet::new();
 
         // --- establishment barrier: nothing is measured until every
         // destination is Connected, or the deadline expires.
         let budget = OwnerServiceBudget::default();
         let barrier_start = Instant::now();
+        let mut pool_events = Vec::new();
         while barrier_start.elapsed() < CONNECT_DEADLINE {
             now = Timestamp::from_micros(now.as_micros() + 1_000);
+            // Bounded per tick: at most H new requests, and only while the
+            // pool's bounded queue still accepts them.
+            for _ in 0..connect_cc.max(1) {
+                if issued == fanout {
+                    break;
+                }
+                match owner
+                    .connect(&caller_cfgs[issued], now)
+                    .expect("owner connect")
+                {
+                    srt_transport::advanced::caller::PoolOutcome::Admitted(id) => {
+                        ids.push(id);
+                        issued += 1;
+                    }
+                    srt_transport::advanced::caller::PoolOutcome::Queued(request) => {
+                        queued_requests.insert(request);
+                        report.queued += 1;
+                        issued += 1;
+                    }
+                    srt_transport::advanced::caller::PoolOutcome::Full => {
+                        report.refused += 1;
+                        break;
+                    }
+                }
+            }
+            report.issued = issued;
             let _ = owner.service(now, budget).await;
+            // A queued request becomes a real logical caller when a permit
+            // frees up: the pool event carries its id.
+            owner.poll_caller_pool_events(&mut pool_events);
+            for event in &pool_events {
+                if let srt_transport::advanced::caller::PoolEvent::Admitted {
+                    request_id,
+                    caller_id,
+                } = event
+                    && queued_requests.remove(request_id)
+                {
+                    ids.push(*caller_id);
+                }
+            }
             owner.wait_for_activity(Duration::from_millis(1)).await;
             let connected = ids
                 .iter()
@@ -173,6 +258,7 @@ async fn run_sender(fanout: usize, duration_ms: u64, base_port: u16) -> QualRepo
                 break;
             }
         }
+        report.admitted = ids.len();
         report.established = ids
             .iter()
             .filter(|id| {
@@ -212,6 +298,8 @@ async fn run_sender(fanout: usize, duration_ms: u64, base_port: u16) -> QualRepo
             report.completed_ok += visit.tx_completed_ok as u64;
             report.short_sends += visit.tx_short_sends as u64;
             report.failed_sends += visit.tx_failed_sends as u64;
+            report.peer_local_failures += visit.tx_peer_local_failures as u64;
+            report.transient_failures += visit.tx_transient_failures as u64;
             report.service_visits += 1;
 
             // Open-loop pacing: wait out the rest of the source interval.
@@ -244,6 +332,8 @@ async fn run_sender(fanout: usize, duration_ms: u64, base_port: u16) -> QualRepo
             report.completed_ok += visit.tx_completed_ok as u64;
             report.short_sends += visit.tx_short_sends as u64;
             report.failed_sends += visit.tx_failed_sends as u64;
+            report.peer_local_failures += visit.tx_peer_local_failures as u64;
+            report.transient_failures += visit.tx_transient_failures as u64;
             if owner.tx_in_flight() == 0 && !owner.has_pending_work(now) {
                 report.drained = true;
                 break;
@@ -254,10 +344,12 @@ async fn run_sender(fanout: usize, duration_ms: u64, base_port: u16) -> QualRepo
             owner.tx_in_flight() as u64 + if owner.has_pending_work(now) { 1 } else { 0 };
 
         report.rx_mode = format!("{:?}", owner.rx_mode());
-        if let Some(stats) = owner.rx_stats() {
+        // The sender's own receive side is the caller socket.
+        if let Some(stats) = owner.rx_stats().caller {
             report.rx_dropped = stats.dropped;
             report.rx_truncated = stats.truncated;
         }
+        report.tx_failures_pending = owner.tx_failures_pending();
         report.tx_pool_capacity = owner.tx_pool().capacity();
         report.tx_pool_free = owner.tx_pool().free_count();
         report
@@ -269,6 +361,8 @@ fn main() {
     let fanout: usize = parse_arg(&args, "--fanout", 100);
     let duration_ms: u64 = parse_arg(&args, "--duration-ms", 30_000);
     let base_port: u16 = parse_arg(&args, "--base-port", 12_000);
+    let tx_lanes: usize = parse_arg(&args, "--tx-lanes", 256);
+    let connect_cc: usize = parse_arg(&args, "--connect-cc", 64);
     let send_shards: usize = parse_arg(&args, "--send-shards", 1);
     assert_eq!(
         send_shards, 1,
@@ -276,16 +370,31 @@ fn main() {
     );
 
     let runtime = compio::runtime::Runtime::new().expect("runtime for setup");
-    let report = runtime.block_on(run_sender(fanout, duration_ms, base_port));
+    let report = runtime.block_on(run_sender(
+        fanout,
+        duration_ms,
+        base_port,
+        tx_lanes,
+        connect_cc,
+    ));
 
     let managed = report.rx_mode == format!("{:?}", OwnerRxMode::ManagedMultishot);
     println!(
-        "SHARED_OWNER_QUAL fanout={} established={} offered={} accepted={} \
-         submitted={} completed_ok={} short={} failed={} service_visits={} \
+        "SHARED_OWNER_QUAL fanout={} tx_lanes={} connect_cc={} desired={} \
+         issued={} admitted={} queued={} refused={} established={} offered={} accepted={} \
+         submitted={} completed_ok={} short={} failed={} peer_local={} \
+         transient={} tx_failures_pending={} service_visits={} \
          lateness_us_p50={} p99={} max={} drain_ok={} pending_after_drain={} \
          rx_mode={} managed_rx={} rx_dropped={} rx_truncated={} \
          tx_pool={}/{} cpu_ms={:.1}",
         report.fanout,
+        report.tx_lanes,
+        report.connect_cc,
+        report.desired,
+        report.issued,
+        report.admitted,
+        report.queued,
+        report.refused,
         report.established,
         report.offered,
         report.accepted,
@@ -293,6 +402,9 @@ fn main() {
         report.completed_ok,
         report.short_sends,
         report.failed_sends,
+        report.peer_local_failures,
+        report.transient_failures,
+        report.tx_failures_pending,
         report.service_visits,
         report.lateness_p50_us,
         report.lateness_p99_us,

@@ -111,7 +111,7 @@ proptest! {
         conn.handle_timer(TimerId::Inactivity, now).expect("タイマー処理は成功する想定");
 
         prop_assert_eq!(conn.state(), initial_state);
-        prop_assert!(conn.poll_output().is_none());
+        prop_assert!(conn.poll_output().unwrap().is_none());
     }
 
 }
@@ -1020,7 +1020,7 @@ proptest! {
         let now = Timestamp::from_micros(time);
 
         conn.process_retransmit(now);
-        prop_assert!(conn.poll_output().is_none());
+        prop_assert!(conn.poll_output().unwrap().is_none());
     }
 
     /// プロパティ: has_retransmit は未接続時に false
@@ -1175,7 +1175,7 @@ fn make_opts_with_stream_id(socket_id: u32, stream_id: String) -> ConnectionOpti
 
 fn drain_packets(conn: &mut SrtConnection) -> Vec<Vec<u8>> {
     let mut packets = Vec::new();
-    while let Some(output) = conn.poll_output() {
+    while let Some(output) = conn.poll_output().unwrap() {
         if let ConnectionOutput::SendPacket(pkt) = output {
             packets.push(pkt);
         }

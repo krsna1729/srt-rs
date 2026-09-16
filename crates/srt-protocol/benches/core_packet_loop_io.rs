@@ -49,7 +49,7 @@ fn connection_options(passphrase: Option<&str>) -> ConnectionOptions {
 }
 
 fn drain_sent(conn: &mut SrtConnection, sock: &UdpSocket) {
-    while let Some(out) = conn.poll_output() {
+    while let Some(out) = conn.poll_output().unwrap() {
         if let ConnectionOutput::SendPacket(data) = out {
             let _ = sock.send(&data);
         }

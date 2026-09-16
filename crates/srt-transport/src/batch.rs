@@ -518,7 +518,8 @@ pub(crate) fn drain_connected_outputs<F>(
 where
     F: FnMut(&[Vec<u8>]) -> io::Result<usize>,
 {
-    let (work, budget_exhausted) = collect_output_work(conn, pending, budget);
+    let (work, budget_exhausted) = collect_output_work(conn, pending, budget)
+        .map_err(|error| io::Error::other(error.to_string()))?;
     let report = OutputDrainReport {
         status: if budget_exhausted {
             OutputDrainStatus::BudgetExhausted
@@ -585,11 +586,14 @@ mod tests {
         let mut conn = caller_with_output();
         let mut pending = VecDeque::new();
         let (work, exhausted) =
-            collect_output_work(&mut conn, &mut pending, OutputDrainBudget::new(0, 1, 1024));
+            collect_output_work(&mut conn, &mut pending, OutputDrainBudget::new(0, 1, 1024))
+                .expect("collection is infallible here");
         assert!(work.is_empty());
         assert!(exhausted);
         assert!(
-            conn.poll_output().is_some(),
+            conn.poll_output()
+                .expect("exact-size output materializes")
+                .is_some(),
             "the output must remain queued"
         );
     }

@@ -221,7 +221,7 @@ fn link_capacity_calculation_is_allocation_free_after_warmup() {
 
 fn drain_connection_packets(connection: &mut SrtConnection) -> Vec<Vec<u8>> {
     let mut packets = Vec::new();
-    while let Some(output) = connection.poll_output() {
+    while let Some(output) = connection.poll_output().unwrap() {
         if let ConnectionOutput::SendPacket(packet) = output {
             packets.push(packet);
         }
@@ -299,7 +299,7 @@ fn periodic_nak_chunking_has_bounded_temporary_allocations() {
         listener
             .handle_timer(TimerId::Nak, timestamp(20_000))
             .expect("NAK timer");
-        while let Some(output) = listener.poll_output() {
+        while let Some(output) = listener.poll_output().unwrap() {
             if let ConnectionOutput::SendPacket(packet) = output {
                 wire_packets += 1;
                 wire_bytes += packet.len();

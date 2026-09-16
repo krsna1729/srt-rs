@@ -26,7 +26,7 @@ enum LossShape {
 
 fn drain_packets(connection: &mut SrtConnection) -> Vec<Vec<u8>> {
     let mut packets = Vec::new();
-    while let Some(output) = connection.poll_output() {
+    while let Some(output) = connection.poll_output().unwrap() {
         if let ConnectionOutput::SendPacket(packet) = output {
             packets.push(packet);
         }

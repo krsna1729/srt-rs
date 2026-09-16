@@ -4,7 +4,7 @@ use libfuzzer_sys::fuzz_target;
 use srt_proto::{ConnectionOutput, SrtConnection, ConnectionOptions, ConnectionState, TimerId, Timestamp};
 
 fn transfer(from: &mut SrtConnection, to: &mut SrtConnection, now: Timestamp) {
-    while let Some(output) = from.poll_output() {
+    while let Some(output) = from.poll_output().unwrap() {
         if let ConnectionOutput::SendPacket(packet) = output {
             let _ = to.feed_recv_buf(&packet, now);
         }

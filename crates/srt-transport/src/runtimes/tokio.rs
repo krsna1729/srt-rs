@@ -119,7 +119,8 @@ impl Conn {
     ) -> io::Result<OutputDrainReport> {
         let budget = budget.intersect(self.output_drain);
         let (work, budget_exhausted) =
-            collect_output_work(&mut self.conn, &mut self.pending_outputs, budget);
+            collect_output_work(&mut self.conn, &mut self.pending_outputs, budget)
+                .map_err(|error| io::Error::other(error.to_string()))?;
         let mut report = OutputDrainReport {
             status: if budget_exhausted {
                 OutputDrainStatus::BudgetExhausted
@@ -135,7 +136,8 @@ impl Conn {
             prepend_outputs(&mut self.pending_outputs, work.into_iter());
             self.sock.writable().await?;
             let (work, second_budget_exhausted) =
-                collect_output_work(&mut self.conn, &mut self.pending_outputs, budget);
+                collect_output_work(&mut self.conn, &mut self.pending_outputs, budget)
+                    .map_err(|error| io::Error::other(error.to_string()))?;
             if second_budget_exhausted {
                 report.status = report.status.combine(OutputDrainStatus::BudgetExhausted);
             }
@@ -4701,12 +4703,18 @@ mod tests {
             .expect("caller starts");
         for round in 0..4 {
             let now = Timestamp::from_micros(round * 10_000);
-            while let Some(ConnectionOutput::SendPacket(packet)) = caller.poll_output() {
+            while let Some(ConnectionOutput::SendPacket(packet)) = caller
+                .poll_output()
+                .expect("exact-size output materializes")
+            {
                 listener
                     .feed_recv_buf(&packet, now)
                     .expect("listener accepts packet");
             }
-            while let Some(ConnectionOutput::SendPacket(packet)) = listener.poll_output() {
+            while let Some(ConnectionOutput::SendPacket(packet)) = listener
+                .poll_output()
+                .expect("exact-size output materializes")
+            {
                 caller
                     .feed_recv_buf(&packet, now)
                     .expect("caller accepts packet");
@@ -5072,7 +5080,11 @@ mod tests {
             let Some(caller) = self.caller else {
                 return;
             };
-            while let Some(output) = self.connection.poll_output() {
+            while let Some(output) = self
+                .connection
+                .poll_output()
+                .expect("exact-size output materializes")
+            {
                 if let ConnectionOutput::SendPacket(packet) = output {
                     self.socket
                         .send_to(&packet, caller)

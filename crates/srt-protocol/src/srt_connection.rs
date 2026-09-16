@@ -1921,44 +1921,58 @@ impl SrtConnection {
         }
     }
 
-    /// Backwards-compatible allocating poll.
+    /// Allocating compatibility poll for the simple endpoint surface.
     ///
     /// Implemented on top of [`Self::peek_output`] and [`Self::poll_output_into`].
-    pub fn poll_output(&mut self) -> Option<ConnectionOutput> {
-        let meta = self.peek_output()?;
+    ///
+    /// Returns `Ok(None)` only when there is genuinely nothing queued. A
+    /// transactional failure is reported as `Err`, never as `None`: the
+    /// offending output stays queued, so mapping it to `None` would tell a
+    /// caller it had drained a packet that is still pending. `Err` here means
+    /// the connection's output or event queue overflowed
+    /// ([`Self::poll_output_into`]'s `InvalidState`), or materializing the
+    /// front datagram failed (`InvalidData`); both are terminal conditions the
+    /// caller must handle rather than read as "nothing to send".
+    pub fn poll_output(&mut self) -> Result<Option<ConnectionOutput>, Error> {
+        let Some(meta) = self.peek_output() else {
+            return Ok(None);
+        };
         match meta {
             OutputMeta::Datagram { wire_len } => {
                 let mut buf = vec![0u8; wire_len];
-                match self.poll_output_into(&mut buf) {
-                    Ok(Some(OutputInto::Datagram { len })) => {
+                match self.poll_output_into(&mut buf)? {
+                    Some(OutputInto::Datagram { len }) => {
                         buf.truncate(len);
-                        Some(ConnectionOutput::SendPacket(buf))
+                        Ok(Some(ConnectionOutput::SendPacket(buf)))
                     }
-                    _ => None,
+                    Some(_) => Err(Error::invalid_state(
+                        "output variant changed between peek and poll",
+                    )),
+                    None => Err(Error::invalid_state(
+                        "peeked output vanished before it was polled",
+                    )),
                 }
             }
-            OutputMeta::SetTimer { .. } => {
-                let mut dummy = [];
-                match self.poll_output_into(&mut dummy) {
-                    Ok(Some(OutputInto::SetTimer {
-                        id,
-                        duration_micros,
-                    })) => Some(ConnectionOutput::SetTimer {
-                        id,
-                        duration_micros,
-                    }),
-                    _ => None,
+            OutputMeta::SetTimer { .. } => match self.poll_output_into(&mut [])? {
+                Some(OutputInto::SetTimer {
+                    id,
+                    duration_micros,
+                }) => Ok(Some(ConnectionOutput::SetTimer {
+                    id,
+                    duration_micros,
+                })),
+                _ => Err(Error::invalid_state(
+                    "peeked timer action vanished before it was polled",
+                )),
+            },
+            OutputMeta::ClearTimer { .. } => match self.poll_output_into(&mut [])? {
+                Some(OutputInto::ClearTimer { id }) => {
+                    Ok(Some(ConnectionOutput::ClearTimer { id }))
                 }
-            }
-            OutputMeta::ClearTimer { .. } => {
-                let mut dummy = [];
-                match self.poll_output_into(&mut dummy) {
-                    Ok(Some(OutputInto::ClearTimer { id })) => {
-                        Some(ConnectionOutput::ClearTimer { id })
-                    }
-                    _ => None,
-                }
-            }
+                _ => Err(Error::invalid_state(
+                    "peeked timer action vanished before it was polled",
+                )),
+            },
         }
     }
 
@@ -3580,7 +3594,7 @@ mod tests {
         )
         .expect("unsecured refresh KMREQ is answered");
 
-        let Some(ConnectionOutput::SendPacket(bytes)) = conn.poll_output() else {
+        let Some(ConnectionOutput::SendPacket(bytes)) = conn.poll_output().unwrap() else {
             panic!("KMRSP NOSECRET is queued");
         };
         let SrtPacket::Control(response) = SrtPacket::decode(&bytes).expect("valid response")
@@ -3603,13 +3617,13 @@ mod tests {
             .expect("caller connection starts");
 
         assert!(matches!(
-            conn.poll_output(),
+            conn.poll_output().unwrap(),
             Some(ConnectionOutput::SendPacket(_))
         ));
         let Some(ConnectionOutput::SetTimer {
             id: TimerId::Handshake,
             duration_micros,
-        }) = conn.poll_output()
+        }) = conn.poll_output().unwrap()
         else {
             panic!("caller arms its handshake retry");
         };
@@ -3622,7 +3636,7 @@ mod tests {
         let mut conn = SrtConnection::new_caller(ConnectionOptions::default());
         conn.connect(Timestamp::from_micros(0))
             .expect("caller connection starts");
-        while conn.poll_output().is_some() {}
+        while conn.poll_output().unwrap().is_some() {}
 
         conn.handle_timer(
             TimerId::Handshake,
@@ -3646,10 +3660,10 @@ mod tests {
         conn.set_handshake_timing(400_000, 900_000);
         conn.connect(Timestamp::from_micros(100_000))
             .expect("caller connection starts");
-        let _ = conn.poll_output();
+        let _ = conn.poll_output().unwrap();
         let Some(ConnectionOutput::SetTimer {
             duration_micros, ..
-        }) = conn.poll_output()
+        }) = conn.poll_output().unwrap()
         else {
             panic!("caller arms its handshake retry");
         };
@@ -3706,12 +3720,12 @@ mod tests {
             .expect("caller starts");
         for round in 0..4 {
             let now = Timestamp::from_micros(round * 10_000);
-            while let Some(ConnectionOutput::SendPacket(packet)) = caller.poll_output() {
+            while let Some(ConnectionOutput::SendPacket(packet)) = caller.poll_output().unwrap() {
                 listener
                     .feed_recv_buf(&packet, now)
                     .expect("listener accepts packet");
             }
-            while let Some(ConnectionOutput::SendPacket(packet)) = listener.poll_output() {
+            while let Some(ConnectionOutput::SendPacket(packet)) = listener.poll_output().unwrap() {
                 caller
                     .feed_recv_buf(&packet, now)
                     .expect("caller accepts packet");
@@ -3762,7 +3776,7 @@ mod tests {
         }
         // Drain the normal sends to the wire -- this test cares about the
         // *retransmit* path, not the original transmission.
-        while caller.poll_output().is_some() {}
+        while caller.poll_output().unwrap().is_some() {}
 
         // Simulate the peer NAK-ing every one of them in one range.
         let last_seq = first_seq.wrapping_add(SENT as u32 - 1);
@@ -3779,7 +3793,7 @@ mod tests {
 
         let mut first_visit_seqs = Vec::new();
         let mut first_visit_rearmed = false;
-        while let Some(output) = caller.poll_output() {
+        while let Some(output) = caller.poll_output().unwrap() {
             match output {
                 ConnectionOutput::SendPacket(bytes) => {
                     let SrtPacket::Data(pkt) = SrtPacket::decode(&bytes).expect("valid packet")
@@ -3818,7 +3832,7 @@ mod tests {
 
         let mut second_visit_seqs = Vec::new();
         let mut second_visit_rearmed = false;
-        while let Some(output) = caller.poll_output() {
+        while let Some(output) = caller.poll_output().unwrap() {
             match output {
                 ConnectionOutput::SendPacket(bytes) => {
                     let SrtPacket::Data(pkt) = SrtPacket::decode(&bytes).expect("valid packet")
@@ -3899,7 +3913,7 @@ mod tests {
     #[test]
     fn explicit_sequence_mismatch_is_rejected_on_owned_and_shared_paths() {
         let (mut caller, _listener) = connected_pair();
-        while caller.poll_output().is_some() {} // drain handshake-tail output (timers, ACKs)
+        while caller.poll_output().unwrap().is_some() {} // drain handshake-tail output (timers, ACKs)
 
         // Owned path.
         let next = caller.next_sequence_number().expect("connected sender");
@@ -3914,7 +3928,7 @@ mod tests {
             "rejection leaves next_seq unchanged"
         );
         assert!(
-            caller.poll_output().is_none(),
+            caller.poll_output().unwrap().is_none(),
             "no packet was queued for a rejected send"
         );
         caller
@@ -3925,7 +3939,7 @@ mod tests {
             Some(next.wrapping_add(1) & 0x7FFF_FFFF)
         );
         assert!(matches!(
-            caller.poll_output(),
+            caller.poll_output().unwrap(),
             Some(ConnectionOutput::SendPacket(_))
         ));
 
@@ -3946,7 +3960,7 @@ mod tests {
             "rejection leaves next_seq unchanged"
         );
         assert!(
-            caller.poll_output().is_none(),
+            caller.poll_output().unwrap().is_none(),
             "no packet was queued for a rejected shared send"
         );
         caller
@@ -3961,7 +3975,7 @@ mod tests {
             Some(next.wrapping_add(1) & 0x7FFF_FFFF)
         );
         assert!(matches!(
-            caller.poll_output(),
+            caller.poll_output().unwrap(),
             Some(ConnectionOutput::SendPacket(_))
         ));
     }
@@ -3976,7 +3990,7 @@ mod tests {
     #[test]
     fn send_is_rejected_before_admission_when_current_key_cannot_encrypt() {
         let (mut caller, _listener) = connected_pair();
-        while caller.poll_output().is_some() {}
+        while caller.poll_output().unwrap().is_some() {}
         caller.crypto = Some(Box::new(
             CryptoContext::new_sender(
                 "test_passphrase",
@@ -4000,7 +4014,7 @@ mod tests {
             .expect_err("send is rejected, not partially admitted");
         assert!(err.reason.contains("encryption"), "{}", err.reason);
         assert_eq!(caller.next_sequence_number(), Some(next));
-        assert!(caller.poll_output().is_none());
+        assert!(caller.poll_output().unwrap().is_none());
 
         // Must exceed effective_max_payload_size (1484 bytes here, plain
         // CTR) so push_message would actually produce multiple fragments
@@ -4016,7 +4030,7 @@ mod tests {
             Some(next),
             "no fragment consumed a sequence number"
         );
-        assert!(caller.poll_output().is_none());
+        assert!(caller.poll_output().unwrap().is_none());
 
         let err = caller
             .send_shared(
@@ -4026,7 +4040,7 @@ mod tests {
             .expect_err("shared send is rejected before admission");
         assert!(err.reason.contains("encryption"), "{}", err.reason);
         assert_eq!(caller.next_sequence_number(), Some(next));
-        assert!(caller.poll_output().is_none());
+        assert!(caller.poll_output().unwrap().is_none());
     }
 
     /// P03: GCM's 16-byte tag is real wire overhead on top of the header
@@ -4038,7 +4052,7 @@ mod tests {
     #[test]
     fn gcm_wire_packets_never_exceed_the_datagram_budget() {
         let (mut caller, _listener) = connected_pair();
-        while caller.poll_output().is_some() {}
+        while caller.poll_output().unwrap().is_some() {}
         caller.crypto = Some(Box::new(
             CryptoContext::new_sender(
                 "test_passphrase",
@@ -4063,7 +4077,9 @@ mod tests {
         caller
             .send(&payload, Timestamp::from_micros(300_000))
             .expect("payload at the effective limit is accepted");
-        let ConnectionOutput::SendPacket(packet) = caller.poll_output().expect("one packet") else {
+        let ConnectionOutput::SendPacket(packet) =
+            caller.poll_output().unwrap().expect("one packet")
+        else {
             panic!("expected a data packet");
         };
         assert!(
@@ -4080,7 +4096,7 @@ mod tests {
             .send(&oversized, Timestamp::from_micros(300_001))
             .expect_err("one byte over the effective limit is rejected");
         assert!(err.reason.contains("exceeds"), "{}", err.reason);
-        assert!(caller.poll_output().is_none());
+        assert!(caller.poll_output().unwrap().is_none());
 
         // Fragmented path: a message spanning several chunks plus a
         // remainder must still keep every wire packet within budget.
@@ -4088,7 +4104,7 @@ mod tests {
             .send_message(&vec![0xEE; limit * 2 + 37], Timestamp::from_micros(300_002))
             .expect("fragmented message is accepted");
         let mut fragment_count = 0;
-        while let Some(ConnectionOutput::SendPacket(packet)) = caller.poll_output() {
+        while let Some(ConnectionOutput::SendPacket(packet)) = caller.poll_output().unwrap() {
             assert!(
                 packet.len() <= caller.max_payload_size + SRT_HEADER_SIZE,
                 "fragment of {} bytes exceeds the datagram budget",
@@ -4118,12 +4134,12 @@ mod tests {
             .expect("caller starts");
         for round in 0..4 {
             let now = Timestamp::from_micros(round * 10_000);
-            while let Some(ConnectionOutput::SendPacket(packet)) = caller.poll_output() {
+            while let Some(ConnectionOutput::SendPacket(packet)) = caller.poll_output().unwrap() {
                 listener
                     .feed_recv_buf(&packet, now)
                     .expect("listener accepts packet");
             }
-            while let Some(ConnectionOutput::SendPacket(packet)) = listener.poll_output() {
+            while let Some(ConnectionOutput::SendPacket(packet)) = listener.poll_output().unwrap() {
                 caller
                     .feed_recv_buf(&packet, now)
                     .expect("caller accepts packet");
@@ -4174,21 +4190,21 @@ mod tests {
         let mut conn = SrtConnection::new_listener(ConnectionOptions::default());
         conn.set_state(ConnectionState::Connected);
         conn.init_buffers(Timestamp::from_micros(0), 0, 0);
-        while conn.poll_output().is_some() {}
+        while conn.poll_output().unwrap().is_some() {}
 
         conn.send(b"data", Timestamp::from_micros(900_000))
             .expect("connected sender queues data");
-        while conn.poll_output().is_some() {}
+        while conn.poll_output().unwrap().is_some() {}
 
         conn.handle_timer(TimerId::Keepalive, Timestamp::from_micros(1_500_000))
             .expect("keepalive timer succeeds");
-        assert!(std::iter::from_fn(|| conn.poll_output()).all(
+        assert!(std::iter::from_fn(|| conn.poll_output().unwrap()).all(
             |output| !matches!(output, ConnectionOutput::SendPacket(packet) if matches!(SrtPacket::decode(&packet), Ok(SrtPacket::Control(ControlPacket { control_type: ControlType::Keepalive, .. }))))
         ));
 
         conn.handle_timer(TimerId::Keepalive, Timestamp::from_micros(1_900_000))
             .expect("keepalive timer succeeds");
-        assert!(std::iter::from_fn(|| conn.poll_output()).any(
+        assert!(std::iter::from_fn(|| conn.poll_output().unwrap()).any(
             |output| matches!(output, ConnectionOutput::SendPacket(packet) if matches!(SrtPacket::decode(&packet), Ok(SrtPacket::Control(ControlPacket { control_type: ControlType::Keepalive, .. }))))
         ));
     }
@@ -4203,7 +4219,7 @@ mod tests {
             .expect("receiver")
             .set_tsbpd_enabled(true);
         while conn.poll_event().is_some() {}
-        while conn.poll_output().is_some() {}
+        while conn.poll_output().unwrap().is_some() {}
 
         conn.handle_data_packet(
             DataPacket::new(0, 0, 0, 0, b"queued".to_vec().into()),
@@ -4226,12 +4242,12 @@ mod tests {
         conn.set_state(ConnectionState::Connected);
         conn.init_buffers(Timestamp::from_micros(0), 0, 0);
         while conn.poll_event().is_some() {}
-        while conn.poll_output().is_some() {}
+        while conn.poll_output().unwrap().is_some() {}
 
         conn.disconnect(Timestamp::from_micros(0));
         assert_eq!(conn.state(), ConnectionState::Closing);
         assert!(
-            std::iter::from_fn(|| conn.poll_output()).any(|output| matches!(
+            std::iter::from_fn(|| conn.poll_output().unwrap()).any(|output| matches!(
                 output,
                 ConnectionOutput::SetTimer {
                     id: TimerId::Shutdown,
@@ -4242,7 +4258,7 @@ mod tests {
 
         conn.handle_timer(TimerId::Shutdown, Timestamp::from_micros(1_000_000))
             .expect("shutdown retry succeeds");
-        assert!(std::iter::from_fn(|| conn.poll_output()).any(
+        assert!(std::iter::from_fn(|| conn.poll_output().unwrap()).any(
             |output| matches!(output, ConnectionOutput::SendPacket(packet) if matches!(SrtPacket::decode(&packet), Ok(SrtPacket::Control(ControlPacket { control_type: ControlType::Shutdown, .. }))))
         ));
 
@@ -4260,7 +4276,7 @@ mod tests {
         .expect("peer activity completes close");
         assert_eq!(conn.state(), ConnectionState::Disconnected);
         assert!(
-            std::iter::from_fn(|| conn.poll_output()).any(|output| matches!(
+            std::iter::from_fn(|| conn.poll_output().unwrap()).any(|output| matches!(
                 output,
                 ConnectionOutput::ClearTimer {
                     id: TimerId::Shutdown
@@ -4275,9 +4291,9 @@ mod tests {
         conn.set_state(ConnectionState::Connected);
         conn.init_buffers(Timestamp::from_micros(0), 0, 0);
         while conn.poll_event().is_some() {}
-        while conn.poll_output().is_some() {}
+        while conn.poll_output().unwrap().is_some() {}
         conn.disconnect(Timestamp::from_micros(0));
-        while conn.poll_output().is_some() {}
+        while conn.poll_output().unwrap().is_some() {}
 
         conn.handle_timer(
             TimerId::Shutdown,
@@ -4378,6 +4394,7 @@ mod tests {
         listener.send_conclusion_response(Timestamp::from_micros(0));
         let ConnectionOutput::SendPacket(packet) = listener
             .poll_output()
+            .unwrap()
             .expect("listener emits conclusion response")
         else {
             panic!("listener conclusion response is a packet");
@@ -4612,7 +4629,8 @@ mod tests {
         });
         conn.connect(Timestamp::from_micros(0))
             .expect("caller connection starts");
-        let ConnectionOutput::SendPacket(packet) = conn.poll_output().expect("induction packet")
+        let ConnectionOutput::SendPacket(packet) =
+            conn.poll_output().unwrap().expect("induction packet")
         else {
             panic!("caller must emit an induction packet");
         };
@@ -4627,7 +4645,7 @@ mod tests {
         conn.send_conclusion_request(Timestamp::from_micros(1))
             .expect("caller emits conclusion");
         let packet = loop {
-            match conn.poll_output() {
+            match conn.poll_output().unwrap() {
                 Some(ConnectionOutput::SendPacket(packet)) => break packet,
                 Some(_) => {}
                 None => panic!("caller must emit a conclusion packet"),
@@ -4750,7 +4768,7 @@ mod tests {
         let mut conn = SrtConnection::new_listener(ConnectionOptions::default());
         conn.set_state(ConnectionState::Connected);
         conn.init_buffers(Timestamp::default(), 0, 0);
-        while conn.poll_output().is_some() {}
+        while conn.poll_output().unwrap().is_some() {}
 
         conn.handle_data_packet(
             DataPacket::new(8_191, 1, 1, 0, Vec::new().into()),
@@ -4759,27 +4777,29 @@ mod tests {
         .expect("the gap is accepted");
 
         let expected = [0x8000_0000u32.to_be_bytes(), 8_190u32.to_be_bytes()].concat();
-        let immediate = std::iter::from_fn(|| conn.poll_output()).find_map(|output| match output {
-            ConnectionOutput::SendPacket(bytes) => match SrtPacket::decode(&bytes) {
-                Ok(SrtPacket::Control(packet)) if packet.control_type == ControlType::Nak => {
-                    Some(packet.control_info)
-                }
+        let immediate =
+            std::iter::from_fn(|| conn.poll_output().unwrap()).find_map(|output| match output {
+                ConnectionOutput::SendPacket(bytes) => match SrtPacket::decode(&bytes) {
+                    Ok(SrtPacket::Control(packet)) if packet.control_type == ControlType::Nak => {
+                        Some(packet.control_info)
+                    }
+                    _ => None,
+                },
                 _ => None,
-            },
-            _ => None,
-        });
+            });
         assert_eq!(immediate.as_deref(), Some(expected.as_slice()));
 
         conn.send_periodic_nak(Timestamp::from_micros(2));
-        let periodic = std::iter::from_fn(|| conn.poll_output()).find_map(|output| match output {
-            ConnectionOutput::SendPacket(bytes) => match SrtPacket::decode(&bytes) {
-                Ok(SrtPacket::Control(packet)) if packet.control_type == ControlType::Nak => {
-                    Some(packet.control_info)
-                }
+        let periodic =
+            std::iter::from_fn(|| conn.poll_output().unwrap()).find_map(|output| match output {
+                ConnectionOutput::SendPacket(bytes) => match SrtPacket::decode(&bytes) {
+                    Ok(SrtPacket::Control(packet)) if packet.control_type == ControlType::Nak => {
+                        Some(packet.control_info)
+                    }
+                    _ => None,
+                },
                 _ => None,
-            },
-            _ => None,
-        });
+            });
         assert_eq!(periodic.as_deref(), Some(expected.as_slice()));
     }
 
@@ -4796,7 +4816,7 @@ mod tests {
         .expect("the wrapped gap is accepted");
 
         let control_info =
-            std::iter::from_fn(|| conn.poll_output()).find_map(|output| match output {
+            std::iter::from_fn(|| conn.poll_output().unwrap()).find_map(|output| match output {
                 ConnectionOutput::SendPacket(bytes) => match SrtPacket::decode(&bytes) {
                     Ok(SrtPacket::Control(packet)) if packet.control_type == ControlType::Nak => {
                         Some(packet.control_info)
@@ -4863,7 +4883,7 @@ mod tests {
         let mut conn = SrtConnection::new_listener(options);
         conn.set_state(ConnectionState::Connected);
         conn.init_buffers(Timestamp::default(), 0, 0);
-        while conn.poll_output().is_some() {}
+        while conn.poll_output().unwrap().is_some() {}
 
         let now = Timestamp::from_micros(1);
         let receiver = conn.receiver.as_mut().unwrap();
@@ -4881,7 +4901,7 @@ mod tests {
         conn.send_periodic_nak(Timestamp::from_micros(2));
         let mut decoded = Vec::new();
         let mut wire_packets = 0u64;
-        while let Some(output) = conn.poll_output() {
+        while let Some(output) = conn.poll_output().unwrap() {
             let ConnectionOutput::SendPacket(bytes) = output else {
                 continue;
             };
@@ -4956,7 +4976,7 @@ mod tests {
     }
 
     fn drain_outputs(conn: &mut SrtConnection) -> Vec<ConnectionOutput> {
-        std::iter::from_fn(|| conn.poll_output()).collect()
+        std::iter::from_fn(|| conn.poll_output().unwrap()).collect()
     }
 
     #[test]

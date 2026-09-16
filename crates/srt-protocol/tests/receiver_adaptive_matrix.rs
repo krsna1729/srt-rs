@@ -138,7 +138,7 @@ fn make_packet(seq: u32, timestamp_us: u32) -> DataPacket {
 }
 
 fn transfer(caller: &mut SrtConnection, listener: &mut SrtConnection, now: Timestamp) {
-    while let Some(output) = caller.poll_output() {
+    while let Some(output) = caller.poll_output().unwrap() {
         if let ConnectionOutput::SendPacket(packet) = output {
             listener
                 .feed_recv_buf(&packet, now)
@@ -159,7 +159,7 @@ fn establish_pair() -> (SrtConnection, SrtConnection) {
     caller.connect(ts(0)).expect("caller should connect");
     for round in 0..10 {
         transfer(&mut caller, &mut listener, ts(round * 10_000));
-        while let Some(output) = listener.poll_output() {
+        while let Some(output) = listener.poll_output().unwrap() {
             if let ConnectionOutput::SendPacket(packet) = output {
                 caller
                     .feed_recv_buf(&packet, ts(round * 10_000))
@@ -177,7 +177,7 @@ fn establish_pair() -> (SrtConnection, SrtConnection) {
 
 fn packets_from(connection: &mut SrtConnection) -> Vec<Vec<u8>> {
     let mut packets = Vec::new();
-    while let Some(output) = connection.poll_output() {
+    while let Some(output) = connection.poll_output().unwrap() {
         if let ConnectionOutput::SendPacket(packet) = output {
             packets.push(packet);
         }

@@ -1986,17 +1986,23 @@ pub(crate) fn prepend_outputs(
     }
 }
 
+/// Collect protocol output for one bounded drain.
+///
+/// Fallible because `poll_output` is: a transactional materialization failure
+/// (`InvalidState` after a queue overflow, `InvalidData` on a malformed
+/// datagram) leaves the offending output queued, so it must be reported rather
+/// than read as "nothing left to send".
 pub(crate) fn collect_output_work(
     conn: &mut SrtConnection,
     pending: &mut VecDeque<ConnectionOutput>,
     budget: OutputDrainBudget,
-) -> (VecDeque<ConnectionOutput>, bool) {
+) -> Result<(VecDeque<ConnectionOutput>, bool), srt_proto::Error> {
     // `max_actions == 0` performs no work. A composed owner budget can
     // legitimately reach zero after an earlier phase consumed the shared
     // allowance, and that must stop the follow-up phase rather than reopening
     // it as unlimited.
     if budget.max_actions == 0 {
-        return (VecDeque::new(), true);
+        return Ok((VecDeque::new(), true));
     }
     let max_actions = budget.max_actions;
     let max_packets = budget.max_packets;
@@ -2006,15 +2012,19 @@ pub(crate) fn collect_output_work(
     let mut bytes = 0usize;
 
     while work.len() < max_actions {
-        let Some(output) = pending.pop_front().or_else(|| conn.poll_output()) else {
-            return (work, false);
+        let output = match pending.pop_front() {
+            Some(output) => output,
+            None => match conn.poll_output()? {
+                Some(output) => output,
+                None => return Ok((work, false)),
+            },
         };
         if let ConnectionOutput::SendPacket(packet) = &output {
             let exceeds_packet_cap = packets >= max_packets;
             let exceeds_byte_cap = bytes.saturating_add(packet.len()) > max_bytes;
             if exceeds_packet_cap || exceeds_byte_cap {
                 pending.push_front(output);
-                return (work, true);
+                return Ok((work, true));
             }
             packets += 1;
             bytes = bytes.saturating_add(packet.len());
@@ -2022,7 +2032,7 @@ pub(crate) fn collect_output_work(
         work.push_back(output);
     }
 
-    (work, true)
+    Ok((work, true))
 }
 
 #[cfg(test)]
@@ -2050,7 +2060,11 @@ mod tests {
 
     fn next_packet(conn: &mut SrtConnection) -> Vec<u8> {
         loop {
-            match conn.poll_output().expect("connection output") {
+            match conn
+                .poll_output()
+                .expect("exact-size output materializes")
+                .expect("connection output")
+            {
                 ConnectionOutput::SendPacket(bytes) => return bytes,
                 ConnectionOutput::SetTimer { .. } | ConnectionOutput::ClearTimer { .. } => {}
             }
@@ -4744,12 +4758,18 @@ mod tests {
         caller.connect(Timestamp::default()).expect("connect");
         for i in 0..10 {
             let now = Timestamp::from_micros(i * 10_000);
-            while let Some(output) = caller.poll_output() {
+            while let Some(output) = caller
+                .poll_output()
+                .expect("exact-size output materializes")
+            {
                 if let ConnectionOutput::SendPacket(data) = output {
                     let _ = listener.feed_recv_buf(&data, now);
                 }
             }
-            while let Some(output) = listener.poll_output() {
+            while let Some(output) = listener
+                .poll_output()
+                .expect("exact-size output materializes")
+            {
                 if let ConnectionOutput::SendPacket(data) = output {
                     let _ = caller.feed_recv_buf(&data, now);
                 }

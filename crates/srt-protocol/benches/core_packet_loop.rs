@@ -45,7 +45,7 @@ fn ts(micros: u64) -> Timestamp {
 /// already uses for exactly this reason.
 fn drain_sent(conn: &mut SrtConnection) -> Vec<Vec<u8>> {
     let mut sent = Vec::new();
-    while let Some(out) = conn.poll_output() {
+    while let Some(out) = conn.poll_output().unwrap() {
         if let ConnectionOutput::SendPacket(data) = out {
             sent.push(data);
         }

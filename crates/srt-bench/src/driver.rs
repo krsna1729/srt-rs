@@ -166,7 +166,7 @@ pub fn drain_outputs(
     timers: &mut HashMap<TimerId, Timestamp>,
     now: Timestamp,
 ) {
-    while let Some(out) = conn.poll_output() {
+    while let Some(out) = conn.poll_output().expect("exact-size output materializes") {
         match out {
             ConnectionOutput::SendPacket(bytes) => {
                 let _ = socket.send(&bytes);
