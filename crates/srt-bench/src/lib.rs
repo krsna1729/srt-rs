@@ -2723,10 +2723,20 @@ pub struct Aggregate {
     pub datapath_queue: crate::queue::QueueStats,
     pub recv_scheduling: crate::scheduling::RecvSchedulingStats,
     pub outbound_retry: crate::scheduling::RetryStats,
+    /// Delivered DATA count of every connection, in arrival order.
+    ///
+    /// Aggregates hide starvation: 1000 destinations where half receive
+    /// nothing produce the same `data_events` total as 1000 where all
+    /// receive half, and the two have completely different scaling
+    /// stories. Filled once per connection at teardown (never on the
+    /// datapath) so a published row can report min/p50/max and the number
+    /// of destinations that were starved outright.
+    pub per_conn_data: Vec<u64>,
 }
 
 impl Aggregate {
     pub fn new(config: BenchConfig) -> Self {
+        let per_conn_capacity = config.connections.max(1);
         Self {
             config,
             data_events: 0,
@@ -2743,11 +2753,13 @@ impl Aggregate {
             datapath_queue: crate::queue::QueueStats::default(),
             recv_scheduling: crate::scheduling::RecvSchedulingStats::default(),
             outbound_retry: crate::scheduling::RetryStats::default(),
+            per_conn_data: Vec::with_capacity(per_conn_capacity),
         }
     }
 
     pub fn add(&mut self, s: ConnStats) {
         self.data_events += s.data_events;
+        self.per_conn_data.push(s.data_events);
         self.torn_down += u64::from(s.torn_down);
         self.source.generated += s.source.generated;
         self.source.accepted += s.source.accepted;
@@ -2779,11 +2791,40 @@ impl Aggregate {
         }
     }
 
+    /// `(min, p50, max, zero, below_half_mean)` over the per-connection
+    /// delivered DATA counts.
+    ///
+    /// Teardown-only and in place: the sort happens after the run is
+    /// over, on a vector with one entry per connection, and mutates the
+    /// caller's storage rather than copying it. `below_half_mean` is the
+    /// starvation count -- destinations that received less than half of
+    /// what the average destination received, which is the number an
+    /// aggregate total cannot show.
+    pub fn data_distribution(&mut self) -> (u64, u64, u64, u64, u64) {
+        if self.per_conn_data.is_empty() {
+            return (0, 0, 0, 0, 0);
+        }
+        let v = &mut self.per_conn_data;
+        v.sort_unstable();
+        let n = v.len();
+        let min = v[0];
+        let max = v[n - 1];
+        let p50 = v[n / 2];
+        let total: u64 = v.iter().sum();
+        let mean = total as f64 / n as f64;
+        let zero = v.iter().filter(|&&c| c == 0).count() as u64;
+        let below = v.iter().filter(|&&c| (c as f64) < mean / 2.0).count() as u64;
+        (min, p50, max, zero, below)
+    }
+
     /// Print the STATS line. Legacy single-connection schema when
     /// connections == 1 (orchestration compat); aggregated schema otherwise.
-    pub fn print(&self, start: std::time::Instant) {
+    pub fn print(&mut self, start: std::time::Instant) {
         let elapsed_s = start.elapsed().as_secs_f64();
         let p = cpu_stats::process_stats();
+        // Sorted in place before the immutable borrow of `config` below;
+        // this is teardown, not the datapath.
+        let (d_min, d_p50, d_max, d_zero, d_below) = self.data_distribution();
         let c = &self.config;
         let role = match c.mode {
             Mode::Sender => "caller",
@@ -2819,7 +2860,8 @@ impl Aggregate {
             println!(
                 "STATS role={} backend={} connections={} established={} pkt_sent={} \
                  core_total={} sec_a={} sec_b={} rtt_ms={:.3} elapsed_s={:.3} \
-                 throughput_pps={:.0} cpu_user_ms={:.1} cpu_sys_ms={:.1} peak_rss_kb={}",
+                 throughput_pps={:.0} cpu_user_ms={:.1} cpu_sys_ms={:.1} peak_rss_kb={} \
+                 data_min={} data_p50={} data_max={} data_zero={} data_below_half_mean={}",
                 role,
                 c.runtime.name(),
                 c.connections,
@@ -2834,6 +2876,11 @@ impl Aggregate {
                 p.cpu_user_ms,
                 p.cpu_sys_ms,
                 p.peak_rss_kb,
+                d_min,
+                d_p50,
+                d_max,
+                d_zero,
+                d_below,
             );
         }
         if let Some(path) = &c.out
