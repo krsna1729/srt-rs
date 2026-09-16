@@ -5,12 +5,13 @@ Runtime-neutral SRT admission, affinity, and ownership policy.
 
 The crate deliberately stops at the **lifecycle boundary**: it owns the
 logical identity and assignment invariants that a listener and its worker
-pool must agree on, and nothing else — no sockets, clocks, threads, event
-loops, media delivery, or authorization.
+pool must agree on. It owns policy bookkeeping, but no live resources such as
+sockets, clocks, threads, event loops, media delivery, or authorization.
 
 The rule, stated as a test you can apply to any candidate addition:
 
-> **This crate takes values and returns decisions. It never owns things.**
+> **This crate takes values and returns decisions. It owns policy bookkeeping,
+> but never live protocol, socket, clock, or runtime resources.**
 
 Time is a parameter (`is_terminal(…, now, …)`), never read from a clock;
 wire bytes are decoded by [`srt-protocol`](../srt-protocol)
@@ -19,6 +20,10 @@ a live `SrtConnection`, a timer store, or an fd belongs in
 [`srt-transport`](../srt-transport) instead — which is exactly where the
 admission peer table lives, calling back into the policy defined here.
 
+The public modules mirror the policy domains: `identity`, `routing`,
+`promotion`, `cookie`, `terminal`, and the explicit byte-oriented `wire`
+helpers. Root re-exports remain available for the existing workspace callers.
+
 ```
         decisions (this crate)          things (srt-transport)
         ──────────────────────          ──────────────────────
@@ -26,7 +31,7 @@ admission peer table lives, calling back into the policy defined here.
         decide_promotion()              ManualTimerStore
         cookie_for_worker()             Handoff / WorkerMessage
         is_terminal()                   IngressTelemetry
-        handshake_identity()            per-runtime Conn
+        wire::handshake_identity()      per-runtime Conn
 ```
 
 ## Problem it solves
@@ -53,8 +58,9 @@ per-StreamID authorization and credential selection.
 ### Wire decoding (pre-admission)
 
 ```rust
-use srt_lifecycle::{handshake_identity, handshake_route,
-                    group_extension_from_packet};
+use srt_lifecycle::wire::{handshake_identity, handshake_route,
+                          group_extension_from_packet};
+use srt_lifecycle::{GroupAffinity, HandshakeIdentity};
 
 // Full identity: phase + StreamID + GROUP affinity
 let id: Option<HandshakeIdentity> = handshake_identity(&datagram);

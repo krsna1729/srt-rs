@@ -3,10 +3,11 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use proptest::prelude::*;
-use shiguredo_srt::{
-    ControlPacket, ControlType, ExtensionType, HandshakeExtension, HandshakePacket, HandshakeType,
-    KeyFlag, KeyLength, KmError, KmMessage,
+use srt_proto::crypto::{KeyFlag, KeyLength};
+use srt_proto::handshake::{
+    ExtensionType, HandshakeExtension, HandshakePacket, HandshakeType, KmError, KmMessage,
 };
+use srt_proto::wire::{ControlPacket, ControlType};
 
 /// HandshakePacket の生成 (IPv4)
 fn arb_handshake_packet_ipv4() -> impl Strategy<Value = HandshakePacket> {
@@ -136,7 +137,7 @@ fn arb_km_message() -> impl Strategy<Value = KmMessage> {
                         key_length,
                         salt,
                         wrapped_key,
-                        shiguredo_srt::CipherMode::Ctr,
+                        srt_proto::crypto::CipherMode::Ctr,
                     )
                 },
             )

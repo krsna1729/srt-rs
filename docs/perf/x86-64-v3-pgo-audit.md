@@ -32,7 +32,7 @@ for `srt-rs` following the completion of the structural Data Structures and Algo
 
 ## 1. Assembly & Codegen Lowering Audit
 
-Hot functions across `shiguredo_srt` and `srt-transport` were compiled under isolated target directories (`target/xtask-audit`) with:
+Hot functions across `srt_proto` and `srt-transport` were compiled under isolated target directories (`target/xtask-audit`) with:
 ```bash
 cargo rustc --release --lib -C target-cpu=x86-64-v3 -C codegen-units=1 -- --emit=asm
 ```
@@ -42,7 +42,7 @@ and inspected at the machine-instruction level.
 
 Dynamically scanned across clean crate assembly artifacts by `cargo xtask audit`:
 
-| Instruction | Architectural Meaning | `shiguredo_srt` Occurrences | `srt-transport` Occurrences | Primary Hot-Path Roles |
+| Instruction | Architectural Meaning | `srt_proto` Occurrences | `srt-transport` Occurrences | Primary Hot-Path Roles |
 |---|---|:---:|:---:|---|
 | **`TZCNT`** | Count trailing zeros (first set bit) | **51** | **145** | Loss scanning, run scanning, page/slot scans, readiness flags |
 | **`BLSR`** | Reset lowest set bit (`x & (x - 1)`) | **20** | **40** | Set-bit iteration, page directory clearing, event draining |
@@ -206,7 +206,7 @@ cargo xtask audit
 ```
 Automates:
 1. Cleans and initializes `target/xtask-audit`.
-2. Emits assembly for `shiguredo_srt` and `srt-transport` with `-C target-cpu=x86-64-v3 -C codegen-units=1`.
+2. Emits assembly for `srt_proto` and `srt-transport` with `-C target-cpu=x86-64-v3 -C codegen-units=1`.
 3. Deterministically scans the exact output files for hardware instruction lowerings.
 4. Verifies absence of hardware division in indexing and prints the lowering inventory.
 
@@ -220,7 +220,7 @@ cargo xtask pgo --reuse-profile
 ```
 Automates:
 1. Compiles test suites under `-C target-cpu=x86-64-v3 -C profile-generate=/tmp/srt-pgo-data`.
-2. Runs the full healthy in-order and loss/reorder/recovery training corpus across `shiguredo_srt` and `srt-transport`.
+2. Runs the full healthy in-order and loss/reorder/recovery training corpus across `srt_proto` and `srt-transport`.
 3. Merges raw profiles with matching `llvm-profdata` from `rustc sysroot`.
 4. Compiles release binaries with `-C target-cpu=x86-64-v3 -C profile-use=/tmp/srt-pgo-data/merged.profdata` in `target/build-pgo`.
 
@@ -228,15 +228,15 @@ Automates:
 To run benchmarks with profile-use applied in isolated `target/build-pgo`:
 ```bash
 # Automated via xtask (regenerates profile first to ensure fresh data):
-cargo xtask pgo --bench -p shiguredo_srt --bench receiver_window_validation
+cargo xtask pgo --bench -p srt-proto --bench receiver_window_validation
 
 # Fast re-run reusing existing merged profile:
-cargo xtask pgo --reuse-profile --bench -p shiguredo_srt --bench receiver_window_validation
+cargo xtask pgo --reuse-profile --bench -p srt-proto --bench receiver_window_validation
 
 # Or directly via cargo:
 RUSTFLAGS="-C target-cpu=x86-64-v3 -C profile-use=/tmp/srt-pgo-data/merged.profdata" \
 CARGO_TARGET_DIR=target/build-pgo \
-cargo bench -p shiguredo_srt --bench receiver_window_validation
+cargo bench -p srt-proto --bench receiver_window_validation
 ```
 
 ---

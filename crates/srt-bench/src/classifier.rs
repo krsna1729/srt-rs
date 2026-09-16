@@ -275,7 +275,7 @@ fn input_from_cli(
         cli,
         cell,
         &["max-half-open-peers", "max-half-open"],
-        srt_transport::PeerTableConfig::default().max_half_open_peers as u64,
+        srt_transport::advanced::admission::PeerTableConfig::default().max_half_open_peers as u64,
     )?;
     let topology = topology_from_cli(cli, cell, bond, sender.nic_capacity_bps)?;
     Ok(CapacityInput {
@@ -390,8 +390,8 @@ fn protocol_from_cli(
     // that does negotiate GCM can be classified, but it must not be inferred
     // from the key length.
     let cipher_mode = match value(cli, cell, &["cipher-mode"]).unwrap_or("ctr") {
-        "ctr" => shiguredo_srt::CipherMode::Ctr,
-        "gcm" => shiguredo_srt::CipherMode::Gcm,
+        "ctr" => srt_proto::crypto::CipherMode::Ctr,
+        "gcm" => srt_proto::crypto::CipherMode::Gcm,
         other => {
             return Err(format!(
                 "invalid --cipher-mode {other:?} (expected ctr or gcm)"
@@ -406,29 +406,29 @@ fn protocol_from_cli(
             cli,
             cell,
             &["flow-window", "flow-window-packets"],
-            shiguredo_srt::DEFAULT_FLOW_WINDOW as u64,
+            srt_proto::handshake::DEFAULT_FLOW_WINDOW as u64,
         )?,
         receive_window_packets: value_u32(
             cli,
             cell,
             &["receive-window", "receive-window-packets"],
-            shiguredo_srt::DEFAULT_FLOW_WINDOW as u64,
+            srt_proto::handshake::DEFAULT_FLOW_WINDOW as u64,
         )?,
         tsbpd_latency_ms: value_u64(cli, cell, &["tsbpd-latency-ms", "latency-ms"], 120)?,
         ack_interval: Duration::from_micros(value_u64(
             cli,
             cell,
             &["ack-interval-micros"],
-            shiguredo_srt::ACK_INTERVAL_MICROS,
+            srt_proto::receiver::ACK_INTERVAL_MICROS,
         )?),
         light_ack_interval_packets: value_u32(
             cli,
             cell,
             &["light-ack-interval-packets"],
-            u64::from(shiguredo_srt::LIGHT_ACK_INTERVAL_PACKETS),
+            u64::from(srt_proto::receiver::LIGHT_ACK_INTERVAL_PACKETS),
         )?,
-        nak_interval: Duration::from_micros(shiguredo_srt::PERIODIC_NAK_INTERVAL_MICROS),
-        keepalive_interval: Duration::from_micros(shiguredo_srt::KEEPALIVE_INTERVAL_MICROS),
+        nak_interval: Duration::from_micros(srt_proto::PERIODIC_NAK_INTERVAL_MICROS),
+        keepalive_interval: Duration::from_micros(srt_proto::KEEPALIVE_INTERVAL_MICROS),
         periodic_nak_enabled: true,
         bond,
     })
@@ -676,8 +676,8 @@ fn input_from_bench_config(cfg: &crate::BenchConfig) -> CapacityInput {
         receiver: endpoint("recv"),
         admission: AdmissionEnvelope {
             connect_cc: cfg.connect_concurrency as u64,
-            max_half_open_peers: srt_transport::PeerTableConfig::default().max_half_open_peers
-                as u64,
+            max_half_open_peers: srt_transport::advanced::admission::PeerTableConfig::default()
+                .max_half_open_peers as u64,
         },
         topology: TopologyEnvelope {
             ingress: receiver_ingress,

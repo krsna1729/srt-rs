@@ -12,7 +12,7 @@ repository = "https://github.com/krsna1729/srt-rs"
 include = ["/src/**", "LICENSE", "README.md"]
 
 [dependencies]
-shiguredo_srt = { version = "=2026.1.0-canary.1", path = "../srt-protocol" }
+srt_proto = { package = "srt-proto", version = "=0.1.0", path = "../srt-protocol" }
 
 [dev-dependencies]
 proptest = "1.11"

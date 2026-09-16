@@ -10,7 +10,7 @@ use bytes::{Bytes, BytesMut};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::buf::{read_u32, write_u32};
-use crate::crypto::{CipherMode, CryptoContext, GCM_TAG_LEN, KeyFlag, KeyLength};
+use crate::crypto_impl::{CipherMode, CryptoContext, GCM_TAG_LEN, KeyFlag, KeyLength};
 use crate::error::Error;
 use crate::message_assembler::MessageAssembler;
 use crate::srt_handshake::{
@@ -18,7 +18,8 @@ use crate::srt_handshake::{
     HandshakeState, HandshakeType, KmError, KmMessage, MAX_FLOW_WINDOW, SRT_MAGIC_CODE, srt_flags,
 };
 use crate::srt_packet::{
-    ControlPacket, ControlType, DataHeader, DataPacket, SRT_HEADER_SIZE, SrtPacket,
+    ControlPacket, ControlType, DataHeader, DataPacket, PendingData, PendingDatagram,
+    SRT_HEADER_SIZE, SrtPacket,
 };
 use crate::srt_receiver::{LossRange, ReceiverBuffer};
 use crate::srt_sender::SenderBuffer;
@@ -173,6 +174,76 @@ pub const PERIODIC_NAK_INTERVAL_MICROS: u64 = 20_000;
 /// keep the two in sync by eye if either changes.
 const MAX_RETRANSMITS_PER_VISIT: usize = 32;
 
+/// Hard fail-closed limits for protocol outputs retained by the sans-I/O
+/// core. The runtime normally drains these every pass; these limits protect
+/// direct users that keep feeding packets or firing timers without polling
+/// outputs.
+pub const MAX_OUTPUT_QUEUE_ACTIONS: usize = 8_192;
+pub const MAX_OUTPUT_QUEUE_BYTES: usize = 16 << 20;
+const OUTPUT_QUEUE_OVERFLOW_REASON: &str = "protocol output queue limit exceeded";
+/// Hard cap for lifecycle and application events retained by the sans-I/O
+/// core. DATA events are already limited by the negotiated delivery window;
+/// this extra headroom covers state/error notifications without allowing a
+/// reconnecting caller that never polls events to grow memory forever.
+pub const MAX_EVENT_QUEUE_ACTIONS: usize = MAX_FLOW_WINDOW as usize + 64;
+const EVENT_QUEUE_OVERFLOW_REASON: &str = "protocol event queue limit exceeded";
+
+/// Why a connection became disconnected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DisconnectReason {
+    /// The peer sent an SRT SHUTDOWN packet.
+    PeerShutdown,
+    /// The peer stopped sending traffic for the inactivity interval.
+    InactivityTimeout,
+    /// A local graceful close exceeded its shutdown retry window.
+    ShutdownTimeout,
+    /// The peer sent traffic after a local close began.
+    PeerActivityAfterShutdown,
+    /// The bounded protocol output queue overflowed.
+    OutputQueueOverflow,
+    /// The bounded protocol event queue overflowed.
+    EventQueueOverflow,
+    /// A protocol error supplied by a lower layer.
+    ProtocolError(String),
+}
+
+impl DisconnectReason {
+    /// Convert a legacy diagnostic string into a typed reason.
+    #[must_use]
+    pub fn from_message(message: &str) -> Self {
+        match message {
+            "peer shutdown" => Self::PeerShutdown,
+            "inactivity timeout" => Self::InactivityTimeout,
+            "shutdown timeout" => Self::ShutdownTimeout,
+            "peer activity after shutdown" => Self::PeerActivityAfterShutdown,
+            OUTPUT_QUEUE_OVERFLOW_REASON => Self::OutputQueueOverflow,
+            EVENT_QUEUE_OVERFLOW_REASON => Self::EventQueueOverflow,
+            other => Self::ProtocolError(other.to_owned()),
+        }
+    }
+}
+
+impl From<String> for DisconnectReason {
+    fn from(value: String) -> Self {
+        Self::from_message(&value)
+    }
+}
+
+impl fmt::Display for DisconnectReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::PeerShutdown => "peer shutdown",
+            Self::InactivityTimeout => "inactivity timeout",
+            Self::ShutdownTimeout => "shutdown timeout",
+            Self::PeerActivityAfterShutdown => "peer activity after shutdown",
+            Self::OutputQueueOverflow => OUTPUT_QUEUE_OVERFLOW_REASON,
+            Self::EventQueueOverflow => EVENT_QUEUE_OVERFLOW_REASON,
+            Self::ProtocolError(message) => message,
+        };
+        f.write_str(message)
+    }
+}
+
 /// A connection event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionEvent {
@@ -200,7 +271,7 @@ pub enum ConnectionEvent {
     /// An error occurred.
     Error(String),
     /// Disconnected.
-    Disconnected { reason: String },
+    Disconnected { reason: DisconnectReason },
     /// A key refresh is needed.
     KeyRefreshNeeded { key_length: usize },
 }
@@ -213,6 +284,36 @@ pub enum ConnectionOutput {
     /// Set a timer.
     SetTimer { id: TimerId, duration_micros: u64 },
     /// Clear a timer.
+    ClearTimer { id: TimerId },
+}
+
+/// Metadata for the next pending protocol output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputMeta {
+    /// The next output is a datagram requiring `wire_len` bytes of storage.
+    Datagram { wire_len: usize },
+    /// The next output requests arming a timer.
+    SetTimer { id: TimerId, duration_micros: u64 },
+    /// The next output requests disarming a timer.
+    ClearTimer { id: TimerId },
+}
+
+/// Result of materializing the next protocol output into caller-provided storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputInto {
+    /// A datagram of `len` bytes was encoded into the buffer and consumed from the connection.
+    Datagram { len: usize },
+    /// A timer set action was consumed from the connection.
+    SetTimer { id: TimerId, duration_micros: u64 },
+    /// A timer clear action was consumed from the connection.
+    ClearTimer { id: TimerId },
+}
+
+/// Internal queued output action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum QueuedOutput {
+    Datagram(PendingDatagram),
+    SetTimer { id: TimerId, duration_micros: u64 },
     ClearTimer { id: TimerId },
 }
 
@@ -239,16 +340,18 @@ pub struct ConnectionOptions {
     pub tsbpd_delay: u16,
     /// SRT version.
     pub srt_version: u32,
-    /// Stream ID (the identifier the Caller sends to the Listener, up to 512 bytes).
+    /// Stream ID (the identifier the Caller sends to the Listener, capped at
+    /// 512 bytes at construction).
     pub stream_id: Option<String>,
     /// Congestion control mode name declared in the handshake extension
-    /// (e.g. "live", "file"). A real libsrt peer that declares a mode
-    /// itself refuses to transmit if the other side declares nothing at
-    /// all, assuming a live/file mismatch (confirmed by interop testing
-    /// against `srt-file-transmit`, which logs "peer DID NOT DECLARE
-    /// congctl" and disconnects without sending data). This crate's
-    /// receive/delivery path does not itself branch on the mode -- this
-    /// field only controls what gets declared and compared on the wire.
+    /// (e.g. "live", "file"), capped at 512 bytes at construction. A real
+    /// libsrt peer that declares a mode itself refuses to transmit if the
+    /// other side declares nothing at all, assuming a live/file mismatch
+    /// (confirmed by interop testing against `srt-file-transmit`, which logs
+    /// "peer DID NOT DECLARE congctl" and disconnects without sending data).
+    /// This crate's receive/delivery path does not itself branch on the mode
+    /// -- this field only controls what gets declared and compared on the
+    /// wire.
     pub congestion_control: String,
     /// Optional libsrt-compatible bonding group metadata.
     pub group_extension: Option<GroupExtensionData>,
@@ -270,10 +373,10 @@ pub struct ConnectionOptions {
     /// Default false preserves the idle-gap contract. Packed with the
     /// overhead byte above so the options footprint does not grow.
     pub pacing_repay: bool,
-    /// above [`crate::MAX_FLOW_WINDOW`] are clamped during construction.
+    /// above [`crate::handshake::MAX_FLOW_WINDOW`] are clamped during construction.
     pub flow_window_packets: u32,
     /// Local receive-buffer capacity, in packets. Values above
-    /// [`crate::MAX_FLOW_WINDOW`] are clamped during construction.
+    /// [`crate::handshake::MAX_FLOW_WINDOW`] are clamped during construction.
     pub receive_buffer_packets: u32,
     /// Maximum number of delivered DATA events retained for the application.
     ///
@@ -284,16 +387,16 @@ pub struct ConnectionOptions {
     /// Full ACK period in microseconds (Haivision `COMM_SYN` / RFC §3.2.4
     /// default 10 ms).
     ///
-    /// Clamped to [`crate::MIN_ACK_INTERVAL_MICROS`]..=[`crate::MAX_ACK_INTERVAL_MICROS`]
+    /// Clamped to [`crate::receiver::MIN_ACK_INTERVAL_MICROS`]..=[`crate::receiver::MAX_ACK_INTERVAL_MICROS`]
     /// (10–40 ms) when the connection is constructed. Per-connection, not
     /// process-global. Values above 10 ms are **non-default /
     /// non-RFC-recommended** coalesce and do not retarget NAK/EXP.
-    /// High-fan-in evidence target: [`crate::HIGH_FANIN_ACK_INTERVAL_MICROS`].
+    /// High-fan-in evidence target: [`crate::receiver::HIGH_FANIN_ACK_INTERVAL_MICROS`].
     pub ack_interval_micros: u64,
     /// Light ACK packet cadence (Haivision `SELF_CLOCK_INTERVAL` / RFC
     /// recommendation: 64).
     ///
-    /// Clamped to [`crate::MIN_LIGHT_ACK_INTERVAL_PACKETS`]..=[`crate::MAX_LIGHT_ACK_INTERVAL_PACKETS`]
+    /// Clamped to [`crate::receiver::MIN_LIGHT_ACK_INTERVAL_PACKETS`]..=[`crate::receiver::MAX_LIGHT_ACK_INTERVAL_PACKETS`]
     /// (64–256) when the connection is constructed. Values above 64 are
     /// **non-default / non-RFC-recommended** coalesce. A receive window
     /// smaller than 64 packets does not Light-ACK; full ACK is the path.
@@ -372,8 +475,8 @@ impl Default for ConnectionOptions {
             flow_window_packets: DEFAULT_FLOW_WINDOW,
             receive_buffer_packets: DEFAULT_FLOW_WINDOW,
             delivery_queue_packets: DEFAULT_FLOW_WINDOW,
-            ack_interval_micros: crate::ACK_INTERVAL_MICROS,
-            light_ack_interval_packets: crate::LIGHT_ACK_INTERVAL_PACKETS,
+            ack_interval_micros: crate::receiver::ACK_INTERVAL_MICROS,
+            light_ack_interval_packets: crate::receiver::LIGHT_ACK_INTERVAL_PACKETS,
             pacing_repay: false,
         }
     }
@@ -418,13 +521,27 @@ pub struct SrtConnection {
     /// current refresh cycle. Reset after `provide_new_sek` starts that cycle.
     key_refresh_notified: bool,
     /// DATA events waiting for application consumption. Control/state events
-    /// are state-machine bounded; DATA is the unbounded-rate class.
+    /// are state-machine bounded; DATA arrival rate is unbounded but retained
+    /// events are capped by the configured delivery/receive windows.
     pending_data_events: u32,
     /// DATA packet positions retained by queued application events. This is
     /// distinct from the event count because one message can span many packets.
     pending_data_packets: u32,
-    /// Output queue.
-    output_queue: VecDeque<ConnectionOutput>,
+    /// Output queue, bounded by [`MAX_OUTPUT_QUEUE_ACTIONS`] and
+    /// [`MAX_OUTPUT_QUEUE_BYTES`]; overflow transitions the core to a
+    /// fail-closed disconnected state.
+    output_queue: VecDeque<QueuedOutput>,
+    output_queue_bytes: usize,
+    /// Outstanding delayed-materialization crypto reservations per key flag.
+    /// Incremented when a DATA packet reserves a `TxCryptoStamp` at admission,
+    /// decremented when the stamped datagram is materialized via
+    /// `poll_output_into` or discarded by an output-queue overflow clear.
+    /// Gates old-key decommission so a queued-but-unmaterialized datagram
+    /// can never outlive its cipher schedule.
+    pending_tx_even: u64,
+    pending_tx_odd: u64,
+    output_overflowed: bool,
+    event_overflowed: bool,
 
     /// Connection start time.
     start_time: Option<Timestamp>,
@@ -450,7 +567,7 @@ pub struct SrtConnection {
     peer_srt_flags: Option<u32>,
     /// Peer bonding group metadata.
     peer_group_extension: Option<GroupExtensionData>,
-    last_handshake_packet: Option<Vec<u8>>,
+    last_handshake_packet: Option<ControlPacket>,
     handshake_retry_sequence: u32,
     handshake_started_at: Option<Timestamp>,
     handshake_retry_interval_micros: u64,
@@ -474,6 +591,14 @@ fn random_nonzero_socket_id() -> u32 {
     std::process::id() | 1
 }
 
+const MAX_HANDSHAKE_OPTION_BYTES: usize = 512;
+
+fn truncate_utf8(value: &mut String, max_bytes: usize) {
+    if value.len() > max_bytes {
+        value.truncate(value.floor_char_boundary(max_bytes));
+    }
+}
+
 fn normalize_buffer_options(mut options: ConnectionOptions) -> ConnectionOptions {
     if options.socket_id == 0 {
         options.socket_id = random_nonzero_socket_id();
@@ -489,9 +614,14 @@ fn normalize_buffer_options(mut options: ConnectionOptions) -> ConnectionOptions
         .delivery_queue_packets
         .max(1)
         .min(options.receive_buffer_packets);
-    options.ack_interval_micros = crate::clamp_ack_interval_micros(options.ack_interval_micros);
+    if let Some(stream_id) = options.stream_id.as_mut() {
+        truncate_utf8(stream_id, MAX_HANDSHAKE_OPTION_BYTES);
+    }
+    truncate_utf8(&mut options.congestion_control, MAX_HANDSHAKE_OPTION_BYTES);
+    options.ack_interval_micros =
+        crate::receiver::clamp_ack_interval_micros(options.ack_interval_micros);
     options.light_ack_interval_packets =
-        crate::clamp_light_ack_interval_packets(options.light_ack_interval_packets);
+        crate::receiver::clamp_light_ack_interval_packets(options.light_ack_interval_packets);
     options
 }
 
@@ -507,6 +637,154 @@ impl SrtConnection {
         Ok(buf)
     }
 
+    /// Release exactly one crypto reservation for `flag`. Releasing more than
+    /// was reserved saturates at zero; the counter is a retirement gate, not
+    /// an exact leak detector.
+    fn release_tx_reservation(&mut self, flag: KeyFlag) {
+        let counter = match flag {
+            KeyFlag::Even => &mut self.pending_tx_even,
+            KeyFlag::Odd => &mut self.pending_tx_odd,
+        };
+        *counter = counter.saturating_sub(1);
+    }
+
+    fn queue_output(&mut self, output: QueuedOutput) {
+        if self.output_overflowed || self.event_overflowed {
+            return;
+        }
+        let bytes = match &output {
+            QueuedOutput::Datagram(packet) => packet.wire_len(),
+            QueuedOutput::SetTimer { .. } | QueuedOutput::ClearTimer { .. } => 0,
+        };
+        if self.output_queue.len() >= MAX_OUTPUT_QUEUE_ACTIONS
+            || self.output_queue_bytes.saturating_add(bytes) > MAX_OUTPUT_QUEUE_BYTES
+        {
+            self.release_queued_tx_reservations();
+            self.output_queue.clear();
+            self.output_queue_bytes = 0;
+            self.output_overflowed = true;
+            self.set_state(ConnectionState::Disconnected);
+            self.queue_event(ConnectionEvent::Error(
+                OUTPUT_QUEUE_OVERFLOW_REASON.to_string(),
+            ));
+            self.queue_event(ConnectionEvent::Disconnected {
+                reason: DisconnectReason::OutputQueueOverflow,
+            });
+            return;
+        }
+        if let QueuedOutput::Datagram(PendingDatagram::Data(data)) = &output
+            && let Some(stamp) = data.crypto
+        {
+            let counter = match stamp.key_flag {
+                KeyFlag::Even => &mut self.pending_tx_even,
+                KeyFlag::Odd => &mut self.pending_tx_odd,
+            };
+            *counter = counter.saturating_add(1);
+        }
+        self.output_queue_bytes = self.output_queue_bytes.saturating_add(bytes);
+        self.output_queue.push_back(output);
+    }
+
+    fn release_queued_tx_reservations(&mut self) {
+        let (mut even, mut odd) = (0u64, 0u64);
+        for output in &self.output_queue {
+            if let QueuedOutput::Datagram(PendingDatagram::Data(data)) = output
+                && let Some(stamp) = data.crypto
+            {
+                match stamp.key_flag {
+                    KeyFlag::Even => even = even.saturating_add(1),
+                    KeyFlag::Odd => odd = odd.saturating_add(1),
+                }
+            }
+        }
+        self.pending_tx_even = self.pending_tx_even.saturating_sub(even);
+        self.pending_tx_odd = self.pending_tx_odd.saturating_sub(odd);
+    }
+
+    fn queue_control_packet(&mut self, pkt: ControlPacket, now: Timestamp) {
+        self.last_send_time = Some(now);
+        self.queue_output(QueuedOutput::Datagram(PendingDatagram::Control(pkt)));
+    }
+
+    fn queue_handshake_control_packet(&mut self, pkt: ControlPacket, now: Timestamp) {
+        self.last_send_time = Some(now);
+        self.last_handshake_packet = Some(pkt.clone());
+        self.queue_output(QueuedOutput::Datagram(PendingDatagram::Control(pkt)));
+    }
+
+    fn retransmit_handshake(&mut self) {
+        if let Some(packet) = self.last_handshake_packet.as_ref() {
+            self.queue_output(QueuedOutput::Datagram(PendingDatagram::Control(
+                packet.clone(),
+            )));
+        }
+    }
+
+    fn queue_data_packet(
+        &mut self,
+        header: DataHeader,
+        payload: Bytes,
+        now: Timestamp,
+    ) -> Result<(), Error> {
+        let crypto = if let Some(ref mut c) = self.crypto {
+            Some(c.reserve_tx_stamp()?)
+        } else {
+            None
+        };
+        self.last_send_time = Some(now);
+        self.queue_output(QueuedOutput::Datagram(PendingDatagram::Data(
+            PendingData::new(header, payload, crypto),
+        )));
+        // Reservation accounting is owned by `queue_output` so a rejected
+        // (overflowed) queue cannot leak a reservation for a packet that was
+        // never actually queued.
+        Ok(())
+    }
+
+    fn check_output_queue(&self) -> Result<(), Error> {
+        if self.output_overflowed {
+            Err(Error::invalid_state(OUTPUT_QUEUE_OVERFLOW_REASON))
+        } else if self.event_overflowed {
+            Err(Error::invalid_state(EVENT_QUEUE_OVERFLOW_REASON))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn queue_event(&mut self, event: ConnectionEvent) {
+        if self.event_overflowed {
+            return;
+        }
+        if self.event_queue.len() < MAX_EVENT_QUEUE_ACTIONS {
+            self.event_queue.push_back(event);
+            return;
+        }
+
+        // Discarding unread DATA events must also release their receive-window
+        // reservations; otherwise a terminal connection would retain a fake
+        // application backlog until drop. The queue is cleared before the
+        // terminal diagnostics are installed, so this path remains bounded.
+        let mut dropped_packets = 0u32;
+        let mut dropped_events = 0u32;
+        while let Some(queued) = self.event_queue.pop_front() {
+            if let ConnectionEvent::DataReceived { packet_count, .. } = queued {
+                dropped_events = dropped_events.saturating_add(1);
+                dropped_packets = dropped_packets.saturating_add(packet_count);
+            }
+        }
+        self.pending_data_events = self.pending_data_events.saturating_sub(dropped_events);
+        self.pending_data_packets = self.pending_data_packets.saturating_sub(dropped_packets);
+        self.sync_application_backlog();
+        self.event_overflowed = true;
+        self.state = ConnectionState::Disconnected;
+        self.event_queue.push_back(ConnectionEvent::Error(
+            EVENT_QUEUE_OVERFLOW_REASON.to_string(),
+        ));
+        self.event_queue.push_back(ConnectionEvent::Disconnected {
+            reason: DisconnectReason::EventQueueOverflow,
+        });
+    }
+
     /// Put the handshake into its terminal failed state.
     ///
     /// Every path that abandons a handshake -- rejection, KM failure,
@@ -519,7 +797,7 @@ impl SrtConnection {
         self.handshake_started_at = None;
         self.handshake_state = HandshakeState::Failed;
         self.set_state(ConnectionState::Disconnected);
-        self.output_queue.push_back(ConnectionOutput::ClearTimer {
+        self.queue_output(QueuedOutput::ClearTimer {
             id: TimerId::Handshake,
         });
         self.clear_config_secrets();
@@ -562,6 +840,11 @@ impl SrtConnection {
             pending_data_events: 0,
             pending_data_packets: 0,
             output_queue: VecDeque::new(),
+            output_queue_bytes: 0,
+            pending_tx_even: 0,
+            pending_tx_odd: 0,
+            output_overflowed: false,
+            event_overflowed: false,
             start_time: None,
             last_ack_time: None,
             last_nak_time: None,
@@ -603,6 +886,11 @@ impl SrtConnection {
             pending_data_events: 0,
             pending_data_packets: 0,
             output_queue: VecDeque::new(),
+            output_queue_bytes: 0,
+            pending_tx_even: 0,
+            pending_tx_odd: 0,
+            output_overflowed: false,
+            event_overflowed: false,
             start_time: None,
             last_ack_time: None,
             last_nak_time: None,
@@ -853,6 +1141,7 @@ impl SrtConnection {
 
     /// Start the connection (Caller only).
     pub fn connect(&mut self, now: Timestamp) -> Result<(), Error> {
+        self.check_output_queue()?;
         if self.role != ConnectionRole::Caller {
             return Err(Error::invalid_state("only caller can initiate connection"));
         }
@@ -865,7 +1154,7 @@ impl SrtConnection {
         self.handshake_state = HandshakeState::InductionSent;
         self.arm_handshake_timer(now);
 
-        Ok(())
+        self.check_output_queue()
     }
 
     /// Reject the pending listener handshake with an SRT rejection response.
@@ -880,11 +1169,9 @@ impl SrtConnection {
         let handshake =
             HandshakePacket::new_rejection(self.options.socket_id, self.syn_cookie, reason);
         let packet = handshake.encode(self.relative_timestamp(now), self.peer_socket_id);
-        let mut bytes = Vec::with_capacity(packet.encoded_size());
-        packet.encode(&mut bytes);
-        self.queue_handshake_packet(bytes);
+        self.queue_handshake_control_packet(packet, now);
         self.terminate_handshake();
-        Ok(())
+        self.check_output_queue()
     }
 
     /// Initialize the send/receive buffers. Demand starts false: static
@@ -930,6 +1217,7 @@ impl SrtConnection {
 
     /// Process received data.
     pub fn feed_recv_buf(&mut self, buf: &[u8], now: Timestamp) -> Result<(), Error> {
+        self.check_output_queue()?;
         if buf.len() < SRT_HEADER_SIZE {
             return Err(Error::insufficient_buffer());
         }
@@ -964,13 +1252,15 @@ impl SrtConnection {
             self.last_recv_time = Some(now);
         }
 
-        match packet {
+        let result = match packet {
             SrtPacket::Data(data_pkt) => {
                 tracing::debug!("received DATA packet, seq={}", data_pkt.sequence_number);
                 self.handle_data_packet(data_pkt, now)
             }
             SrtPacket::Control(ctrl_pkt) => self.handle_control_packet(ctrl_pkt, now),
-        }
+        };
+        result?;
+        self.check_output_queue()
     }
 
     /// Whether there are packets needing retransmission.
@@ -1014,11 +1304,12 @@ impl SrtConnection {
             else {
                 break;
             };
-            match self.encrypt_to_wire(&header, &payload) {
-                Ok(buf) => self.queue_packet(buf, now),
+            let seq = header.sequence_number;
+            match self.queue_data_packet(header, payload, now) {
+                Ok(()) => {}
                 Err(_) => {
                     dropped += 1;
-                    first_dropped_seq.get_or_insert(header.sequence_number);
+                    first_dropped_seq.get_or_insert(seq);
                 }
             }
         }
@@ -1044,7 +1335,7 @@ impl SrtConnection {
         // card's actual charter, and lets the transport's own poll cadence
         // decide how fast the remainder actually goes out.
         if self.has_retransmit() {
-            self.output_queue.push_back(ConnectionOutput::SetTimer {
+            self.queue_output(QueuedOutput::SetTimer {
                 id: TimerId::Retransmit,
                 duration_micros: 0,
             });
@@ -1069,12 +1360,12 @@ impl SrtConnection {
                         now.as_micros().saturating_sub(t.as_micros())
                     });
                     if elapsed >= INACTIVITY_TIMEOUT_MICROS {
-                        self.event_queue.push_back(ConnectionEvent::Disconnected {
-                            reason: "inactivity timeout".to_string(),
+                        self.queue_event(ConnectionEvent::Disconnected {
+                            reason: DisconnectReason::InactivityTimeout,
                         });
                         self.set_state(ConnectionState::Disconnected);
                     } else {
-                        self.output_queue.push_back(ConnectionOutput::SetTimer {
+                        self.queue_output(QueuedOutput::SetTimer {
                             id: TimerId::Inactivity,
                             duration_micros: INACTIVITY_TIMEOUT_MICROS - elapsed,
                         });
@@ -1083,7 +1374,7 @@ impl SrtConnection {
             }
             TimerId::Shutdown => self.handle_shutdown_timer(now),
         }
-        Ok(())
+        self.check_output_queue()
     }
 
     fn handle_handshake_timer(&mut self, now: Timestamp) {
@@ -1106,7 +1397,7 @@ impl SrtConnection {
             {
                 self.send_keepalive(now);
             }
-            self.output_queue.push_back(ConnectionOutput::SetTimer {
+            self.queue_output(QueuedOutput::SetTimer {
                 id: TimerId::Keepalive,
                 duration_micros: KEEPALIVE_INTERVAL_MICROS,
             });
@@ -1144,7 +1435,7 @@ impl SrtConnection {
             }
         }
 
-        self.output_queue.push_back(ConnectionOutput::SetTimer {
+        self.queue_output(QueuedOutput::SetTimer {
             id: TimerId::Ack,
             duration_micros: self.ack_timer_tick_micros(),
         });
@@ -1158,7 +1449,7 @@ impl SrtConnection {
                 .as_ref()
                 .map(|r| r.nak_interval())
                 .unwrap_or(PERIODIC_NAK_INTERVAL_MICROS);
-            self.output_queue.push_back(ConnectionOutput::SetTimer {
+            self.queue_output(QueuedOutput::SetTimer {
                 id: TimerId::Nak,
                 duration_micros: interval,
             });
@@ -1171,10 +1462,10 @@ impl SrtConnection {
                 .shutdown_started_at
                 .is_some_and(|started| now.saturating_sub(started) >= SHUTDOWN_TIMEOUT_MICROS)
             {
-                self.finish_local_close("shutdown timeout");
+                self.finish_local_close(DisconnectReason::ShutdownTimeout);
             } else {
                 self.send_shutdown(now);
-                self.output_queue.push_back(ConnectionOutput::SetTimer {
+                self.queue_output(QueuedOutput::SetTimer {
                     id: TimerId::Shutdown,
                     duration_micros: SHUTDOWN_RETRY_INTERVAL_MICROS,
                 });
@@ -1184,6 +1475,7 @@ impl SrtConnection {
 
     /// Send data.
     pub fn send(&mut self, payload: &[u8], now: Timestamp) -> Result<(), Error> {
+        self.validate_send_request(payload.len(), None)?;
         self.send_internal(payload.to_vec(), None, now)
     }
 
@@ -1215,6 +1507,7 @@ impl SrtConnection {
         sequence_number: u32,
         now: Timestamp,
     ) -> Result<(), Error> {
+        self.validate_send_request(payload.len(), Some(sequence_number))?;
         self.send_internal(payload.to_vec(), Some(sequence_number), now)
     }
 
@@ -1248,8 +1541,7 @@ impl SrtConnection {
         }
 
         for (header, payload) in packets {
-            let buf = self.encrypt_to_wire(&header, &payload)?;
-            self.queue_packet(buf, now);
+            self.queue_data_packet(header, payload, now)?;
         }
 
         if let Some(ref mut sender) = self.sender {
@@ -1257,7 +1549,7 @@ impl SrtConnection {
         }
 
         self.check_km_refresh(now);
-        Ok(())
+        self.check_output_queue()
     }
 
     fn send_internal(
@@ -1266,21 +1558,7 @@ impl SrtConnection {
         sequence_number: Option<u32>,
         now: Timestamp,
     ) -> Result<(), Error> {
-        if self.state != ConnectionState::Connected {
-            return Err(Error::invalid_state("not connected"));
-        }
-
-        if !self.can_send() {
-            return Err(Error::invalid_state("send buffer full"));
-        }
-
-        self.check_explicit_sequence(sequence_number)?;
-        self.check_can_encrypt()?;
-        if payload.len() > self.effective_max_payload_size() {
-            return Err(Error::invalid_state(
-                "payload exceeds the maximum single-packet size; use send_message to fragment it",
-            ));
-        }
+        self.validate_send_request(payload.len(), sequence_number)?;
 
         let timestamp = self.relative_timestamp(now);
         let peer_socket_id = self.peer_socket_id;
@@ -1312,9 +1590,7 @@ impl SrtConnection {
                 payload.len()
             );
 
-            let buf = self.encrypt_to_wire(&header, &payload)?;
-            self.queue_packet(buf, now);
-
+            self.queue_data_packet(header, payload, now)?;
             if let Some(ref mut sender) = self.sender {
                 sender.record_send_time(now);
             }
@@ -1322,6 +1598,27 @@ impl SrtConnection {
 
         self.check_km_refresh(now);
 
+        self.check_output_queue()
+    }
+
+    fn validate_send_request(
+        &self,
+        payload_len: usize,
+        sequence_number: Option<u32>,
+    ) -> Result<(), Error> {
+        if self.state != ConnectionState::Connected {
+            return Err(Error::invalid_state("not connected"));
+        }
+        if !self.can_send() {
+            return Err(Error::invalid_state("send buffer full"));
+        }
+        self.check_explicit_sequence(sequence_number)?;
+        self.check_can_encrypt()?;
+        if payload_len > self.effective_max_payload_size() {
+            return Err(Error::invalid_state(
+                "payload exceeds the maximum single-packet size; use send_message to fragment it",
+            ));
+        }
         Ok(())
     }
 
@@ -1376,14 +1673,13 @@ impl SrtConnection {
                 "internal invariant violated: push_shared rejected an already-validated send",
             ));
         };
-        let buf = self.encrypt_to_wire(&header, &payload)?;
-        self.queue_packet(buf, now);
+        self.queue_data_packet(header, payload, now)?;
         if let Some(ref mut sender) = self.sender {
             sender.record_send_time(now);
         }
 
         self.check_km_refresh(now);
-        Ok(())
+        self.check_output_queue()
     }
 
     /// Reject a caller-supplied explicit send sequence before it reaches the
@@ -1549,9 +1845,135 @@ impl SrtConnection {
         self.sync_application_backlog();
     }
 
-    /// Get an output.
-    pub fn poll_output(&mut self) -> Option<ConnectionOutput> {
-        self.output_queue.pop_front()
+    /// Inspect the next pending output without consuming it or modifying connection state.
+    #[must_use]
+    pub fn peek_output(&self) -> Option<OutputMeta> {
+        self.output_queue.front().map(|out| match out {
+            QueuedOutput::Datagram(pkt) => OutputMeta::Datagram {
+                wire_len: pkt.wire_len(),
+            },
+            QueuedOutput::SetTimer {
+                id,
+                duration_micros,
+            } => OutputMeta::SetTimer {
+                id: *id,
+                duration_micros: *duration_micros,
+            },
+            QueuedOutput::ClearTimer { id } => OutputMeta::ClearTimer { id: *id },
+        })
+    }
+
+    /// Transactionally poll the next output into caller-provided storage.
+    ///
+    /// If the output is a datagram:
+    /// - If `dst.len() < wire_len`: returns `Err(Error::insufficient_buffer())`.
+    ///   The output remains in the queue, byte accounting is unchanged, and no
+    ///   protocol or crypto state advances.
+    /// - If `dst.len() >= wire_len`: encodes directly into `dst`, pops the datagram
+    ///   from the output queue, deducts `wire_len` from queue bytes, and returns
+    ///   `Ok(Some(OutputInto::Datagram { len: wire_len }))`.
+    ///
+    /// If the output is a timer action:
+    /// - Pops the action from the output queue and returns the action.
+    pub fn poll_output_into(&mut self, dst: &mut [u8]) -> Result<Option<OutputInto>, Error> {
+        self.check_output_queue()?;
+        let front = match self.output_queue.front() {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+
+        match front {
+            QueuedOutput::Datagram(pkt) => {
+                let wire_len = pkt.wire_len();
+                if dst.len() < wire_len {
+                    return Err(Error::insufficient_buffer());
+                }
+                let written = pkt.encode_into(self.crypto.as_deref(), dst)?;
+                debug_assert_eq!(written, wire_len);
+                let released = match pkt {
+                    PendingDatagram::Data(data) => data.crypto.map(|stamp| stamp.key_flag),
+                    PendingDatagram::Control(_) => None,
+                };
+                self.output_queue.pop_front();
+                if let Some(flag) = released {
+                    self.release_tx_reservation(flag);
+                }
+                self.output_queue_bytes = self.output_queue_bytes.saturating_sub(wire_len);
+                Ok(Some(OutputInto::Datagram { len: written }))
+            }
+            QueuedOutput::SetTimer {
+                id,
+                duration_micros,
+            } => {
+                let id = *id;
+                let duration_micros = *duration_micros;
+                self.output_queue.pop_front();
+                Ok(Some(OutputInto::SetTimer {
+                    id,
+                    duration_micros,
+                }))
+            }
+            QueuedOutput::ClearTimer { id } => {
+                let id = *id;
+                self.output_queue.pop_front();
+                Ok(Some(OutputInto::ClearTimer { id }))
+            }
+        }
+    }
+
+    /// Allocating compatibility poll for the simple endpoint surface.
+    ///
+    /// Implemented on top of [`Self::peek_output`] and [`Self::poll_output_into`].
+    ///
+    /// Returns `Ok(None)` only when there is genuinely nothing queued. A
+    /// transactional failure is reported as `Err`, never as `None`: the
+    /// offending output stays queued, so mapping it to `None` would tell a
+    /// caller it had drained a packet that is still pending. `Err` here means
+    /// the connection's output or event queue overflowed
+    /// ([`Self::poll_output_into`]'s `InvalidState`), or materializing the
+    /// front datagram failed (`InvalidData`); both are terminal conditions the
+    /// caller must handle rather than read as "nothing to send".
+    pub fn poll_output(&mut self) -> Result<Option<ConnectionOutput>, Error> {
+        let Some(meta) = self.peek_output() else {
+            return Ok(None);
+        };
+        match meta {
+            OutputMeta::Datagram { wire_len } => {
+                let mut buf = vec![0u8; wire_len];
+                match self.poll_output_into(&mut buf)? {
+                    Some(OutputInto::Datagram { len }) => {
+                        buf.truncate(len);
+                        Ok(Some(ConnectionOutput::SendPacket(buf)))
+                    }
+                    Some(_) => Err(Error::invalid_state(
+                        "output variant changed between peek and poll",
+                    )),
+                    None => Err(Error::invalid_state(
+                        "peeked output vanished before it was polled",
+                    )),
+                }
+            }
+            OutputMeta::SetTimer { .. } => match self.poll_output_into(&mut [])? {
+                Some(OutputInto::SetTimer {
+                    id,
+                    duration_micros,
+                }) => Ok(Some(ConnectionOutput::SetTimer {
+                    id,
+                    duration_micros,
+                })),
+                _ => Err(Error::invalid_state(
+                    "peeked timer action vanished before it was polled",
+                )),
+            },
+            OutputMeta::ClearTimer { .. } => match self.poll_output_into(&mut [])? {
+                Some(OutputInto::ClearTimer { id }) => {
+                    Ok(Some(ConnectionOutput::ClearTimer { id }))
+                }
+                _ => Err(Error::invalid_state(
+                    "peeked timer action vanished before it was polled",
+                )),
+            },
+        }
     }
 
     /// Disconnect.
@@ -1565,7 +1987,7 @@ impl SrtConnection {
             self.enqueue_ready_data(now);
             self.send_shutdown(now);
             self.shutdown_started_at = Some(now);
-            self.output_queue.push_back(ConnectionOutput::SetTimer {
+            self.queue_output(QueuedOutput::SetTimer {
                 id: TimerId::Shutdown,
                 duration_micros: SHUTDOWN_RETRY_INTERVAL_MICROS,
             });
@@ -1617,7 +2039,7 @@ impl SrtConnection {
         );
         self.send_km_request(&km_message, now);
 
-        Ok(())
+        self.check_output_queue()
     }
 
     /// Seed the encrypted-packet count for an accelerated key-refresh test.
@@ -1643,8 +2065,7 @@ impl SrtConnection {
     fn set_state(&mut self, new_state: ConnectionState) {
         if self.state != new_state {
             self.state = new_state;
-            self.event_queue
-                .push_back(ConnectionEvent::StateChanged(new_state));
+            self.queue_event(ConnectionEvent::StateChanged(new_state));
         }
     }
 
@@ -1680,7 +2101,7 @@ impl SrtConnection {
                 break;
             };
             if let Some(msg) = self.assembler.feed(packet, source_time) {
-                self.event_queue.push_back(ConnectionEvent::DataReceived {
+                self.queue_event(ConnectionEvent::DataReceived {
                     payload: msg.payload,
                     sequence_number: msg.first_sequence_number,
                     message_number: msg.message_number,
@@ -1688,57 +2109,15 @@ impl SrtConnection {
                     source_time: msg.source_time,
                     packet_count: msg.packet_count,
                 });
+                if self.event_overflowed {
+                    break;
+                }
                 self.pending_data_events = self.pending_data_events.saturating_add(1);
                 self.pending_data_packets =
                     self.pending_data_packets.saturating_add(msg.packet_count);
             }
         }
         self.sync_application_backlog();
-    }
-
-    /// Build a wire-ready buffer: header + encrypted payload (+ GCM tag).
-    ///
-    /// Copies the plaintext into the wire buffer exactly once and encrypts
-    /// in place, eliminating the intermediate `DataPacket.payload` copy
-    /// that the old `encrypt_packet` + `encode` path required.
-    fn encrypt_to_wire(&mut self, header: &DataHeader, payload: &[u8]) -> Result<Vec<u8>, Error> {
-        let Some(ref mut crypto) = self.crypto else {
-            let mut buf = Vec::with_capacity(SRT_HEADER_SIZE + payload.len());
-            let mut hdr = [0u8; SRT_HEADER_SIZE];
-            header.write_header(&mut hdr, 0);
-            buf.extend_from_slice(&hdr);
-            buf.extend_from_slice(payload);
-            return Ok(buf);
-        };
-        match crypto.cipher_mode() {
-            CipherMode::Ctr => {
-                let mut buf = Vec::with_capacity(SRT_HEADER_SIZE + payload.len());
-                buf.extend_from_slice(&[0u8; SRT_HEADER_SIZE]);
-                buf.extend_from_slice(payload);
-                let key_flag =
-                    crypto.encrypt(header.sequence_number, &mut buf[SRT_HEADER_SIZE..])?;
-                let mut hdr = [0u8; SRT_HEADER_SIZE];
-                header.write_header(&mut hdr, key_flag.to_kk_field());
-                buf[..SRT_HEADER_SIZE].copy_from_slice(&hdr);
-                Ok(buf)
-            }
-            CipherMode::Gcm => {
-                let enc_flag = crypto.current_key().to_kk_field();
-                let mut buf = Vec::with_capacity(SRT_HEADER_SIZE + payload.len() + GCM_TAG_LEN);
-                let mut hdr = [0u8; SRT_HEADER_SIZE];
-                header.write_header(&mut hdr, enc_flag);
-                buf.extend_from_slice(&hdr);
-                buf.extend_from_slice(payload);
-                let aad = header.gcm_aad(enc_flag);
-                let (_, tag) = crypto.encrypt_gcm_detached(
-                    header.sequence_number,
-                    &aad,
-                    &mut buf[SRT_HEADER_SIZE..],
-                )?;
-                buf.extend_from_slice(&tag);
-                Ok(buf)
-            }
-        }
     }
 
     fn sync_application_backlog(&mut self) {
@@ -1752,7 +2131,7 @@ impl SrtConnection {
 
     fn handle_data_packet(&mut self, mut pkt: DataPacket, now: Timestamp) -> Result<(), Error> {
         if self.state == ConnectionState::Closing {
-            self.finish_local_close("peer activity after shutdown");
+            self.finish_local_close(DisconnectReason::PeerActivityAfterShutdown);
             return Ok(());
         }
         if self.state != ConnectionState::Connected {
@@ -1851,7 +2230,7 @@ impl SrtConnection {
             pkt.control_info.len()
         );
         if self.state == ConnectionState::Closing && pkt.control_type != ControlType::Shutdown {
-            self.finish_local_close("peer activity after shutdown");
+            self.finish_local_close(DisconnectReason::PeerActivityAfterShutdown);
             return Ok(());
         }
         match pkt.control_type {
@@ -2003,12 +2382,12 @@ impl SrtConnection {
         let tsbpd_time_base = now.as_micros().saturating_sub(hsreq_timestamp as u64);
         self.init_buffers(now, hs.initial_packet_seq, tsbpd_time_base);
 
-        self.output_queue.push_back(ConnectionOutput::ClearTimer {
+        self.queue_output(QueuedOutput::ClearTimer {
             id: TimerId::Handshake,
         });
         self.setup_connection_timers();
         self.clear_config_secrets();
-        self.event_queue.push_back(ConnectionEvent::Connected);
+        self.queue_event(ConnectionEvent::Connected);
         Ok(())
     }
 
@@ -2170,12 +2549,12 @@ impl SrtConnection {
 
         let tsbpd_time_base = now.as_micros().saturating_sub(hsreq_timestamp as u64);
         self.init_buffers(now, hs.initial_packet_seq, tsbpd_time_base);
-        self.output_queue.push_back(ConnectionOutput::ClearTimer {
+        self.queue_output(QueuedOutput::ClearTimer {
             id: TimerId::Handshake,
         });
         self.setup_connection_timers();
         self.clear_config_secrets();
-        self.event_queue.push_back(ConnectionEvent::Connected);
+        self.queue_event(ConnectionEvent::Connected);
     }
 
     fn handle_ack(&mut self, pkt: ControlPacket, now: Timestamp) -> Result<(), Error> {
@@ -2282,6 +2661,13 @@ impl SrtConnection {
     }
 
     fn handle_shutdown(&mut self, now: Timestamp) -> Result<(), Error> {
+        // A peer may retransmit SHUTDOWN after it has already been
+        // acknowledged. Once terminal, ignore duplicates so an application
+        // that is not polling events cannot accumulate one Disconnected
+        // event per retransmission forever.
+        if self.state == ConnectionState::Disconnected {
+            return Ok(());
+        }
         // Flush the receive buffer before disconnecting (ignore TSBPD, deliver immediately).
         if let Some(receiver) = self.receiver.as_mut() {
             receiver.set_tsbpd_enabled(false);
@@ -2289,25 +2675,23 @@ impl SrtConnection {
         self.enqueue_ready_data(now);
 
         self.shutdown_started_at = None;
-        self.output_queue.push_back(ConnectionOutput::ClearTimer {
+        self.queue_output(QueuedOutput::ClearTimer {
             id: TimerId::Shutdown,
         });
         self.set_state(ConnectionState::Disconnected);
-        self.event_queue.push_back(ConnectionEvent::Disconnected {
-            reason: "peer shutdown".to_string(),
+        self.queue_event(ConnectionEvent::Disconnected {
+            reason: DisconnectReason::PeerShutdown,
         });
         Ok(())
     }
 
-    fn finish_local_close(&mut self, reason: &str) {
+    fn finish_local_close(&mut self, reason: DisconnectReason) {
         self.shutdown_started_at = None;
-        self.output_queue.push_back(ConnectionOutput::ClearTimer {
+        self.queue_output(QueuedOutput::ClearTimer {
             id: TimerId::Shutdown,
         });
         self.set_state(ConnectionState::Disconnected);
-        self.event_queue.push_back(ConnectionEvent::Disconnected {
-            reason: reason.to_owned(),
-        });
+        self.queue_event(ConnectionEvent::Disconnected { reason });
     }
 
     fn handle_drop_req(&mut self, pkt: ControlPacket, now: Timestamp) -> Result<(), Error> {
@@ -2344,9 +2728,7 @@ impl SrtConnection {
         write_u32(&mut cif, first_seq);
         write_u32(&mut cif, last_seq);
         pkt.control_info = cif;
-        let mut buf = Vec::with_capacity(pkt.encoded_size());
-        pkt.encode(&mut buf);
-        self.queue_packet(buf, now);
+        self.queue_control_packet(pkt, now);
     }
 
     /// Process a UserDefined packet (KM Refresh).
@@ -2396,10 +2778,9 @@ impl SrtConnection {
 
         if crypto.should_pre_announce() && !self.key_refresh_notified {
             // Notify the outside world that a new SEK is needed.
-            self.event_queue
-                .push_back(ConnectionEvent::KeyRefreshNeeded {
-                    key_length: crypto.key_length().len(),
-                });
+            self.queue_event(ConnectionEvent::KeyRefreshNeeded {
+                key_length: crypto.key_length().len(),
+            });
             self.key_refresh_notified = true;
         }
 
@@ -2409,8 +2790,16 @@ impl SrtConnection {
                 crypto.switch_key();
             }
 
-            // Check whether the old key needs to be disposed of.
-            if crypto.should_decommission_old_key() {
+            // Check whether the old key needs to be disposed of. The old
+            // cipher schedule must outlive every queued-but-unmaterialized
+            // datagram stamped with its key flag.
+            let should_decommission = crypto.should_decommission_old_key();
+            let old_flag = crypto.current_key().other();
+            let outstanding = match old_flag {
+                KeyFlag::Even => self.pending_tx_even,
+                KeyFlag::Odd => self.pending_tx_odd,
+            };
+            if should_decommission && outstanding == 0 {
                 crypto.decommission_old_key();
             }
         }
@@ -2429,9 +2818,7 @@ impl SrtConnection {
             control_info: km_message.encode(),
         };
 
-        let mut buf = Vec::with_capacity(pkt.encoded_size());
-        pkt.encode(&mut buf);
-        self.queue_packet(buf, now);
+        self.queue_control_packet(pkt, now);
     }
 
     /// Send a KMRSP packet (KM Refresh).
@@ -2447,9 +2834,7 @@ impl SrtConnection {
             control_info: km_message.encode(),
         };
 
-        let mut buf = Vec::with_capacity(pkt.encoded_size());
-        pkt.encode(&mut buf);
-        self.queue_packet(buf, now);
+        self.queue_control_packet(pkt, now);
     }
 
     /// Send a KM refresh error response (KMRSP with its four-byte state).
@@ -2465,46 +2850,44 @@ impl SrtConnection {
             dest_socket_id: self.peer_socket_id,
             control_info,
         };
-        let mut buf = Vec::with_capacity(pkt.encoded_size());
-        pkt.encode(&mut buf);
-        self.queue_packet(buf, now);
+        self.queue_control_packet(pkt, now);
     }
 
     fn ack_timer_tick_micros(&self) -> u64 {
         self.receiver
             .as_ref()
             .map_or_else(
-                || crate::clamp_ack_interval_micros(self.options.ack_interval_micros),
+                || crate::receiver::clamp_ack_interval_micros(self.options.ack_interval_micros),
                 ReceiverBuffer::ack_timer_tick_micros,
             )
-            .min(crate::ACK_INTERVAL_MICROS)
+            .min(crate::receiver::ACK_INTERVAL_MICROS)
     }
 
     /// Set up timers after the connection is established.
     fn setup_connection_timers(&mut self) {
         // Keepalive timer (1 second).
-        self.output_queue.push_back(ConnectionOutput::SetTimer {
+        self.queue_output(QueuedOutput::SetTimer {
             id: TimerId::Keepalive,
             duration_micros: KEEPALIVE_INTERVAL_MICROS,
         });
 
         // ACK timer always ticks at COMM_SYN (10 ms) for TSBPD/TLPKTDROP.
         // Coalesced ACK only skips sendto on intermediate ticks.
-        self.output_queue.push_back(ConnectionOutput::SetTimer {
+        self.queue_output(QueuedOutput::SetTimer {
             id: TimerId::Ack,
             duration_micros: self.ack_timer_tick_micros(),
         });
 
         if self.periodic_nak_enabled() {
             // NAK timer (initial value 20ms).
-            self.output_queue.push_back(ConnectionOutput::SetTimer {
+            self.queue_output(QueuedOutput::SetTimer {
                 id: TimerId::Nak,
                 duration_micros: PERIODIC_NAK_INTERVAL_MICROS,
             });
         }
 
         // Inactivity timer (5 seconds).
-        self.output_queue.push_back(ConnectionOutput::SetTimer {
+        self.queue_output(QueuedOutput::SetTimer {
             id: TimerId::Inactivity,
             duration_micros: INACTIVITY_TIMEOUT_MICROS,
         });
@@ -2544,9 +2927,7 @@ impl SrtConnection {
             control_info,
         };
 
-        let mut buf = Vec::with_capacity(pkt.encoded_size());
-        pkt.encode(&mut buf);
-        self.queue_packet(buf, now);
+        self.queue_control_packet(pkt, now);
     }
 
     fn send_encoded_nak(&mut self, control_info: Vec<u8>, now: Timestamp) {
@@ -2560,12 +2941,12 @@ impl SrtConnection {
             receiver.record_nak_sent();
         }
 
-        let packet = encode_nak_packet(
+        let packet = make_nak_packet(
             control_info,
             self.relative_timestamp(now),
             self.peer_socket_id,
         );
-        self.queue_packet(packet, now);
+        self.queue_control_packet(packet, now);
     }
 
     /// Control packets and DATA packets share the configured SRT datagram
@@ -2585,26 +2966,20 @@ impl SrtConnection {
         debug_assert!(max_control_info_size >= MAX_NAK_RECORD_SIZE);
         let timestamp = self.relative_timestamp(now);
         let peer_socket_id = self.peer_socket_id;
-        let output_queue = &mut self.output_queue;
         let mut chunks = NakChunkEncoder::new(max_control_info_size);
-        let mut packets_sent = 0u32;
+        let mut packets = Vec::new();
         receiver.for_each_periodic_nak_range(|loss| {
             if let Some(control_info) = chunks.push(loss) {
-                output_queue.push_back(ConnectionOutput::SendPacket(encode_nak_packet(
-                    control_info,
-                    timestamp,
-                    peer_socket_id,
-                )));
-                packets_sent += 1;
+                packets.push(make_nak_packet(control_info, timestamp, peer_socket_id));
             }
         });
         if let Some(control_info) = chunks.finish() {
-            output_queue.push_back(ConnectionOutput::SendPacket(encode_nak_packet(
-                control_info,
-                timestamp,
-                peer_socket_id,
-            )));
-            packets_sent += 1;
+            packets.push(make_nak_packet(control_info, timestamp, peer_socket_id));
+        }
+
+        let packets_sent = packets.len() as u32;
+        for packet in packets {
+            self.queue_control_packet(packet, now);
         }
 
         if packets_sent != 0 {
@@ -2633,18 +3008,14 @@ impl SrtConnection {
             control_info: LIBSRT_COMPAT_PADDING.to_vec(),
         };
 
-        let mut buf = Vec::with_capacity(pkt.encoded_size());
-        pkt.encode(&mut buf);
-        self.queue_packet(buf, now);
+        self.queue_control_packet(pkt, now);
     }
 
     fn send_induction_request(&mut self, now: Timestamp) {
         let mut hs = HandshakePacket::new_induction_request(self.options.socket_id);
         hs.flow_window = self.flight_capacity_packets();
         let pkt = hs.encode(self.relative_timestamp(now), 0);
-        let mut buf = Vec::with_capacity(pkt.encoded_size());
-        pkt.encode(&mut buf);
-        self.queue_handshake_packet(buf);
+        self.queue_handshake_control_packet(pkt, now);
     }
 
     /// SRT flags advertised in the CONCLUSION handshake extension.
@@ -2710,9 +3081,7 @@ impl SrtConnection {
         );
         hs.flow_window = self.flight_capacity_packets();
         let pkt = hs.encode(self.relative_timestamp(now), self.peer_socket_id);
-        let mut buf = Vec::with_capacity(pkt.encoded_size());
-        pkt.encode(&mut buf);
-        self.queue_handshake_packet(buf);
+        self.queue_handshake_control_packet(pkt, now);
     }
 
     fn send_conclusion_request(&mut self, now: Timestamp) -> Result<(), Error> {
@@ -2780,9 +3149,7 @@ impl SrtConnection {
 
         // A CONCLUSION request is sent with dest_socket_id = 0 (libsrt compatibility).
         let pkt = hs.encode(self.relative_timestamp(now), 0);
-        let mut buf = Vec::with_capacity(pkt.encoded_size());
-        pkt.encode(&mut buf);
-        self.queue_handshake_packet(buf);
+        self.queue_handshake_control_packet(pkt, now);
         Ok(())
     }
 
@@ -2820,9 +3187,7 @@ impl SrtConnection {
         }
 
         let pkt = hs.encode(self.relative_timestamp(now), self.peer_socket_id);
-        let mut buf = Vec::with_capacity(pkt.encoded_size());
-        pkt.encode(&mut buf);
-        self.queue_handshake_packet(buf);
+        self.queue_handshake_control_packet(pkt, now);
     }
 
     /// Queue a protocol-level KM failure and make the listener attempt
@@ -2844,9 +3209,7 @@ impl SrtConnection {
             hs.add_group_extension(group);
         }
         let packet = hs.encode(self.relative_timestamp(now), self.peer_socket_id);
-        let mut bytes = Vec::with_capacity(packet.encoded_size());
-        packet.encode(&mut bytes);
-        self.queue_handshake_packet(bytes);
+        self.queue_handshake_control_packet(packet, now);
         self.terminate_handshake();
         Error::handshake_rejected(reason)
     }
@@ -2854,25 +3217,6 @@ impl SrtConnection {
     fn fail_caller_handshake(&mut self, reason: &str) -> Error {
         self.terminate_handshake();
         Error::handshake_rejected(reason)
-    }
-
-    fn queue_handshake_packet(&mut self, packet: Vec<u8>) {
-        self.last_handshake_packet = Some(packet.clone());
-        self.output_queue
-            .push_back(ConnectionOutput::SendPacket(packet));
-    }
-
-    fn queue_packet(&mut self, packet: Vec<u8>, now: Timestamp) {
-        self.last_send_time = Some(now);
-        self.output_queue
-            .push_back(ConnectionOutput::SendPacket(packet));
-    }
-
-    fn retransmit_handshake(&mut self) {
-        if let Some(packet) = self.last_handshake_packet.as_ref() {
-            self.output_queue
-                .push_back(ConnectionOutput::SendPacket(packet.clone()));
-        }
     }
 
     fn handshake_timed_out(&self, now: Timestamp) -> bool {
@@ -2884,8 +3228,7 @@ impl SrtConnection {
         if self.handshake_state == HandshakeState::Failed {
             return;
         }
-        self.event_queue
-            .push_back(ConnectionEvent::Error("handshake timeout".to_string()));
+        self.queue_event(ConnectionEvent::Error("handshake timeout".to_string()));
         self.terminate_handshake();
     }
 
@@ -2915,7 +3258,7 @@ impl SrtConnection {
                     .saturating_sub(now)
             })
             .unwrap_or(self.handshake_timeout_micros);
-        self.output_queue.push_back(ConnectionOutput::SetTimer {
+        self.queue_output(QueuedOutput::SetTimer {
             id: TimerId::Handshake,
             duration_micros: interval.min(remaining),
         });
@@ -2939,9 +3282,7 @@ impl SrtConnection {
             // libsrt compatibility: 0-byte data section -> 4 bytes of zero padding.
             control_info: LIBSRT_COMPAT_PADDING.to_vec(),
         };
-        let mut buf = Vec::with_capacity(pkt.encoded_size());
-        pkt.encode(&mut buf);
-        self.queue_packet(buf, now);
+        self.queue_control_packet(pkt, now);
     }
 
     /// Send a Shutdown packet.
@@ -2961,9 +3302,7 @@ impl SrtConnection {
             // libsrt compatibility: 0-byte data section -> 4 bytes of zero padding.
             control_info: LIBSRT_COMPAT_PADDING.to_vec(),
         };
-        let mut buf = Vec::with_capacity(pkt.encoded_size());
-        pkt.encode(&mut buf);
-        self.queue_packet(buf, now);
+        self.queue_control_packet(pkt, now);
     }
 }
 
@@ -3111,24 +3450,21 @@ impl NakChunkEncoder {
     }
 }
 
-fn encode_nak_packet(control_info: Vec<u8>, timestamp: u32, peer_socket_id: u32) -> Vec<u8> {
-    let packet = ControlPacket {
+fn make_nak_packet(control_info: Vec<u8>, timestamp: u32, peer_socket_id: u32) -> ControlPacket {
+    ControlPacket {
         control_type: ControlType::Nak,
         subtype: 0,
         type_specific_info: 0,
         timestamp,
         dest_socket_id: peer_socket_id,
         control_info,
-    };
-    let mut encoded = Vec::with_capacity(packet.encoded_size());
-    packet.encode(&mut encoded);
-    encoded
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{GroupType, SRTGROUP_MASK};
+    use crate::handshake::{GroupType, SRTGROUP_MASK};
 
     /// Deterministic, non-secret KM salt for protocol test fixtures.
     fn test_km_salt() -> [u8; 16] {
@@ -3151,6 +3487,55 @@ mod tests {
         let conn = SrtConnection::new_caller(ConnectionOptions::default());
         assert_eq!(conn.state(), ConnectionState::Disconnected);
         assert_eq!(conn.role, ConnectionRole::Caller);
+    }
+
+    #[test]
+    fn handshake_option_strings_are_bounded_at_construction() {
+        let conn = SrtConnection::new_caller(ConnectionOptions {
+            stream_id: Some("あ".repeat(200)),
+            congestion_control: "live-".to_owned() + &"x".repeat(600),
+            ..ConnectionOptions::default()
+        });
+
+        let stream_id = conn.options.stream_id.as_deref().expect("stream id");
+        assert_eq!(stream_id.len(), 510);
+        assert!(conn.options.congestion_control.len() <= MAX_HANDSHAKE_OPTION_BYTES);
+    }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "cap-scale loop (MAX_OUTPUT_QUEUE_ACTIONS retries); the fail-closed                   behavior is proven here at full scale outside Miri, and `handle_timer`                   ownership is exercised by the rest of this module under Miri"
+    )]
+    fn output_queue_overflow_fails_closed_and_stays_bounded() {
+        let mut conn = SrtConnection::new_caller(ConnectionOptions::default());
+        conn.connect(Timestamp::default()).expect("start handshake");
+
+        let mut overflow = false;
+        for _ in 0..=MAX_OUTPUT_QUEUE_ACTIONS {
+            if conn
+                .handle_timer(TimerId::Handshake, Timestamp::default())
+                .is_err()
+            {
+                overflow = true;
+                break;
+            }
+        }
+
+        assert!(overflow, "the finite output cap must fail closed");
+        assert!(conn.output_queue.len() <= MAX_OUTPUT_QUEUE_ACTIONS);
+        assert!(conn.output_queue_bytes <= MAX_OUTPUT_QUEUE_BYTES);
+        assert_eq!(conn.state(), ConnectionState::Disconnected);
+
+        let events_after_overflow = conn.event_queue.len();
+        for _ in 0..128 {
+            assert!(conn.connect(Timestamp::default()).is_err());
+        }
+        assert_eq!(
+            conn.event_queue.len(),
+            events_after_overflow,
+            "terminal output overflow must reject reconnects without growing events"
+        );
     }
 
     #[test]
@@ -3213,7 +3598,7 @@ mod tests {
         )
         .expect("unsecured refresh KMREQ is answered");
 
-        let Some(ConnectionOutput::SendPacket(bytes)) = conn.poll_output() else {
+        let Some(ConnectionOutput::SendPacket(bytes)) = conn.poll_output().unwrap() else {
             panic!("KMRSP NOSECRET is queued");
         };
         let SrtPacket::Control(response) = SrtPacket::decode(&bytes).expect("valid response")
@@ -3236,13 +3621,13 @@ mod tests {
             .expect("caller connection starts");
 
         assert!(matches!(
-            conn.poll_output(),
+            conn.poll_output().unwrap(),
             Some(ConnectionOutput::SendPacket(_))
         ));
         let Some(ConnectionOutput::SetTimer {
             id: TimerId::Handshake,
             duration_micros,
-        }) = conn.poll_output()
+        }) = conn.poll_output().unwrap()
         else {
             panic!("caller arms its handshake retry");
         };
@@ -3255,7 +3640,7 @@ mod tests {
         let mut conn = SrtConnection::new_caller(ConnectionOptions::default());
         conn.connect(Timestamp::from_micros(0))
             .expect("caller connection starts");
-        while conn.poll_output().is_some() {}
+        while conn.poll_output().unwrap().is_some() {}
 
         conn.handle_timer(
             TimerId::Handshake,
@@ -3279,10 +3664,10 @@ mod tests {
         conn.set_handshake_timing(400_000, 900_000);
         conn.connect(Timestamp::from_micros(100_000))
             .expect("caller connection starts");
-        let _ = conn.poll_output();
+        let _ = conn.poll_output().unwrap();
         let Some(ConnectionOutput::SetTimer {
             duration_micros, ..
-        }) = conn.poll_output()
+        }) = conn.poll_output().unwrap()
         else {
             panic!("caller arms its handshake retry");
         };
@@ -3339,12 +3724,12 @@ mod tests {
             .expect("caller starts");
         for round in 0..4 {
             let now = Timestamp::from_micros(round * 10_000);
-            while let Some(ConnectionOutput::SendPacket(packet)) = caller.poll_output() {
+            while let Some(ConnectionOutput::SendPacket(packet)) = caller.poll_output().unwrap() {
                 listener
                     .feed_recv_buf(&packet, now)
                     .expect("listener accepts packet");
             }
-            while let Some(ConnectionOutput::SendPacket(packet)) = listener.poll_output() {
+            while let Some(ConnectionOutput::SendPacket(packet)) = listener.poll_output().unwrap() {
                 caller
                     .feed_recv_buf(&packet, now)
                     .expect("caller accepts packet");
@@ -3395,7 +3780,7 @@ mod tests {
         }
         // Drain the normal sends to the wire -- this test cares about the
         // *retransmit* path, not the original transmission.
-        while caller.poll_output().is_some() {}
+        while caller.poll_output().unwrap().is_some() {}
 
         // Simulate the peer NAK-ing every one of them in one range.
         let last_seq = first_seq.wrapping_add(SENT as u32 - 1);
@@ -3412,7 +3797,7 @@ mod tests {
 
         let mut first_visit_seqs = Vec::new();
         let mut first_visit_rearmed = false;
-        while let Some(output) = caller.poll_output() {
+        while let Some(output) = caller.poll_output().unwrap() {
             match output {
                 ConnectionOutput::SendPacket(bytes) => {
                     let SrtPacket::Data(pkt) = SrtPacket::decode(&bytes).expect("valid packet")
@@ -3451,7 +3836,7 @@ mod tests {
 
         let mut second_visit_seqs = Vec::new();
         let mut second_visit_rearmed = false;
-        while let Some(output) = caller.poll_output() {
+        while let Some(output) = caller.poll_output().unwrap() {
             match output {
                 ConnectionOutput::SendPacket(bytes) => {
                     let SrtPacket::Data(pkt) = SrtPacket::decode(&bytes).expect("valid packet")
@@ -3532,7 +3917,7 @@ mod tests {
     #[test]
     fn explicit_sequence_mismatch_is_rejected_on_owned_and_shared_paths() {
         let (mut caller, _listener) = connected_pair();
-        while caller.poll_output().is_some() {} // drain handshake-tail output (timers, ACKs)
+        while caller.poll_output().unwrap().is_some() {} // drain handshake-tail output (timers, ACKs)
 
         // Owned path.
         let next = caller.next_sequence_number().expect("connected sender");
@@ -3547,7 +3932,7 @@ mod tests {
             "rejection leaves next_seq unchanged"
         );
         assert!(
-            caller.poll_output().is_none(),
+            caller.poll_output().unwrap().is_none(),
             "no packet was queued for a rejected send"
         );
         caller
@@ -3558,7 +3943,7 @@ mod tests {
             Some(next.wrapping_add(1) & 0x7FFF_FFFF)
         );
         assert!(matches!(
-            caller.poll_output(),
+            caller.poll_output().unwrap(),
             Some(ConnectionOutput::SendPacket(_))
         ));
 
@@ -3579,7 +3964,7 @@ mod tests {
             "rejection leaves next_seq unchanged"
         );
         assert!(
-            caller.poll_output().is_none(),
+            caller.poll_output().unwrap().is_none(),
             "no packet was queued for a rejected shared send"
         );
         caller
@@ -3594,7 +3979,7 @@ mod tests {
             Some(next.wrapping_add(1) & 0x7FFF_FFFF)
         );
         assert!(matches!(
-            caller.poll_output(),
+            caller.poll_output().unwrap(),
             Some(ConnectionOutput::SendPacket(_))
         ));
     }
@@ -3609,7 +3994,7 @@ mod tests {
     #[test]
     fn send_is_rejected_before_admission_when_current_key_cannot_encrypt() {
         let (mut caller, _listener) = connected_pair();
-        while caller.poll_output().is_some() {}
+        while caller.poll_output().unwrap().is_some() {}
         caller.crypto = Some(Box::new(
             CryptoContext::new_sender(
                 "test_passphrase",
@@ -3633,7 +4018,7 @@ mod tests {
             .expect_err("send is rejected, not partially admitted");
         assert!(err.reason.contains("encryption"), "{}", err.reason);
         assert_eq!(caller.next_sequence_number(), Some(next));
-        assert!(caller.poll_output().is_none());
+        assert!(caller.poll_output().unwrap().is_none());
 
         // Must exceed effective_max_payload_size (1484 bytes here, plain
         // CTR) so push_message would actually produce multiple fragments
@@ -3649,7 +4034,7 @@ mod tests {
             Some(next),
             "no fragment consumed a sequence number"
         );
-        assert!(caller.poll_output().is_none());
+        assert!(caller.poll_output().unwrap().is_none());
 
         let err = caller
             .send_shared(
@@ -3659,7 +4044,7 @@ mod tests {
             .expect_err("shared send is rejected before admission");
         assert!(err.reason.contains("encryption"), "{}", err.reason);
         assert_eq!(caller.next_sequence_number(), Some(next));
-        assert!(caller.poll_output().is_none());
+        assert!(caller.poll_output().unwrap().is_none());
     }
 
     /// P03: GCM's 16-byte tag is real wire overhead on top of the header
@@ -3671,7 +4056,7 @@ mod tests {
     #[test]
     fn gcm_wire_packets_never_exceed_the_datagram_budget() {
         let (mut caller, _listener) = connected_pair();
-        while caller.poll_output().is_some() {}
+        while caller.poll_output().unwrap().is_some() {}
         caller.crypto = Some(Box::new(
             CryptoContext::new_sender(
                 "test_passphrase",
@@ -3696,7 +4081,9 @@ mod tests {
         caller
             .send(&payload, Timestamp::from_micros(300_000))
             .expect("payload at the effective limit is accepted");
-        let ConnectionOutput::SendPacket(packet) = caller.poll_output().expect("one packet") else {
+        let ConnectionOutput::SendPacket(packet) =
+            caller.poll_output().unwrap().expect("one packet")
+        else {
             panic!("expected a data packet");
         };
         assert!(
@@ -3713,7 +4100,7 @@ mod tests {
             .send(&oversized, Timestamp::from_micros(300_001))
             .expect_err("one byte over the effective limit is rejected");
         assert!(err.reason.contains("exceeds"), "{}", err.reason);
-        assert!(caller.poll_output().is_none());
+        assert!(caller.poll_output().unwrap().is_none());
 
         // Fragmented path: a message spanning several chunks plus a
         // remainder must still keep every wire packet within budget.
@@ -3721,7 +4108,7 @@ mod tests {
             .send_message(&vec![0xEE; limit * 2 + 37], Timestamp::from_micros(300_002))
             .expect("fragmented message is accepted");
         let mut fragment_count = 0;
-        while let Some(ConnectionOutput::SendPacket(packet)) = caller.poll_output() {
+        while let Some(ConnectionOutput::SendPacket(packet)) = caller.poll_output().unwrap() {
             assert!(
                 packet.len() <= caller.max_payload_size + SRT_HEADER_SIZE,
                 "fragment of {} bytes exceeds the datagram budget",
@@ -3751,12 +4138,12 @@ mod tests {
             .expect("caller starts");
         for round in 0..4 {
             let now = Timestamp::from_micros(round * 10_000);
-            while let Some(ConnectionOutput::SendPacket(packet)) = caller.poll_output() {
+            while let Some(ConnectionOutput::SendPacket(packet)) = caller.poll_output().unwrap() {
                 listener
                     .feed_recv_buf(&packet, now)
                     .expect("listener accepts packet");
             }
-            while let Some(ConnectionOutput::SendPacket(packet)) = listener.poll_output() {
+            while let Some(ConnectionOutput::SendPacket(packet)) = listener.poll_output().unwrap() {
                 caller
                     .feed_recv_buf(&packet, now)
                     .expect("caller accepts packet");
@@ -3807,21 +4194,21 @@ mod tests {
         let mut conn = SrtConnection::new_listener(ConnectionOptions::default());
         conn.set_state(ConnectionState::Connected);
         conn.init_buffers(Timestamp::from_micros(0), 0, 0);
-        while conn.poll_output().is_some() {}
+        while conn.poll_output().unwrap().is_some() {}
 
         conn.send(b"data", Timestamp::from_micros(900_000))
             .expect("connected sender queues data");
-        while conn.poll_output().is_some() {}
+        while conn.poll_output().unwrap().is_some() {}
 
         conn.handle_timer(TimerId::Keepalive, Timestamp::from_micros(1_500_000))
             .expect("keepalive timer succeeds");
-        assert!(std::iter::from_fn(|| conn.poll_output()).all(
+        assert!(std::iter::from_fn(|| conn.poll_output().unwrap()).all(
             |output| !matches!(output, ConnectionOutput::SendPacket(packet) if matches!(SrtPacket::decode(&packet), Ok(SrtPacket::Control(ControlPacket { control_type: ControlType::Keepalive, .. }))))
         ));
 
         conn.handle_timer(TimerId::Keepalive, Timestamp::from_micros(1_900_000))
             .expect("keepalive timer succeeds");
-        assert!(std::iter::from_fn(|| conn.poll_output()).any(
+        assert!(std::iter::from_fn(|| conn.poll_output().unwrap()).any(
             |output| matches!(output, ConnectionOutput::SendPacket(packet) if matches!(SrtPacket::decode(&packet), Ok(SrtPacket::Control(ControlPacket { control_type: ControlType::Keepalive, .. }))))
         ));
     }
@@ -3836,7 +4223,7 @@ mod tests {
             .expect("receiver")
             .set_tsbpd_enabled(true);
         while conn.poll_event().is_some() {}
-        while conn.poll_output().is_some() {}
+        while conn.poll_output().unwrap().is_some() {}
 
         conn.handle_data_packet(
             DataPacket::new(0, 0, 0, 0, b"queued".to_vec().into()),
@@ -3859,12 +4246,12 @@ mod tests {
         conn.set_state(ConnectionState::Connected);
         conn.init_buffers(Timestamp::from_micros(0), 0, 0);
         while conn.poll_event().is_some() {}
-        while conn.poll_output().is_some() {}
+        while conn.poll_output().unwrap().is_some() {}
 
         conn.disconnect(Timestamp::from_micros(0));
         assert_eq!(conn.state(), ConnectionState::Closing);
         assert!(
-            std::iter::from_fn(|| conn.poll_output()).any(|output| matches!(
+            std::iter::from_fn(|| conn.poll_output().unwrap()).any(|output| matches!(
                 output,
                 ConnectionOutput::SetTimer {
                     id: TimerId::Shutdown,
@@ -3875,7 +4262,7 @@ mod tests {
 
         conn.handle_timer(TimerId::Shutdown, Timestamp::from_micros(1_000_000))
             .expect("shutdown retry succeeds");
-        assert!(std::iter::from_fn(|| conn.poll_output()).any(
+        assert!(std::iter::from_fn(|| conn.poll_output().unwrap()).any(
             |output| matches!(output, ConnectionOutput::SendPacket(packet) if matches!(SrtPacket::decode(&packet), Ok(SrtPacket::Control(ControlPacket { control_type: ControlType::Shutdown, .. }))))
         ));
 
@@ -3893,7 +4280,7 @@ mod tests {
         .expect("peer activity completes close");
         assert_eq!(conn.state(), ConnectionState::Disconnected);
         assert!(
-            std::iter::from_fn(|| conn.poll_output()).any(|output| matches!(
+            std::iter::from_fn(|| conn.poll_output().unwrap()).any(|output| matches!(
                 output,
                 ConnectionOutput::ClearTimer {
                     id: TimerId::Shutdown
@@ -3908,9 +4295,9 @@ mod tests {
         conn.set_state(ConnectionState::Connected);
         conn.init_buffers(Timestamp::from_micros(0), 0, 0);
         while conn.poll_event().is_some() {}
-        while conn.poll_output().is_some() {}
+        while conn.poll_output().unwrap().is_some() {}
         conn.disconnect(Timestamp::from_micros(0));
-        while conn.poll_output().is_some() {}
+        while conn.poll_output().unwrap().is_some() {}
 
         conn.handle_timer(
             TimerId::Shutdown,
@@ -3919,9 +4306,75 @@ mod tests {
         .expect("shutdown timeout succeeds");
 
         assert_eq!(conn.state(), ConnectionState::Disconnected);
-        assert!(std::iter::from_fn(|| conn.poll_event()).any(
-            |event| matches!(event, ConnectionEvent::Disconnected { reason } if reason == "shutdown timeout")
+        assert!(
+            std::iter::from_fn(|| conn.poll_event()).any(|event| matches!(
+                event,
+                ConnectionEvent::Disconnected {
+                    reason: DisconnectReason::ShutdownTimeout
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn disconnect_reason_is_typed_and_keeps_legacy_display_text() {
+        assert!(matches!(
+            DisconnectReason::from_message("peer shutdown"),
+            DisconnectReason::PeerShutdown
         ));
+        assert!(matches!(
+            DisconnectReason::from_message("unexpected peer error"),
+            DisconnectReason::ProtocolError(message) if message == "unexpected peer error"
+        ));
+        assert_eq!(
+            DisconnectReason::ShutdownTimeout.to_string(),
+            "shutdown timeout"
+        );
+    }
+
+    #[test]
+    fn duplicate_shutdowns_do_not_grow_terminal_event_queue() {
+        let mut conn = SrtConnection::new_listener(ConnectionOptions::default());
+        conn.set_state(ConnectionState::Connected);
+        conn.handle_shutdown(Timestamp::default())
+            .expect("first shutdown is accepted");
+        let events_after_first = conn.event_queue.len();
+
+        for _ in 0..100_000 {
+            conn.handle_shutdown(Timestamp::default())
+                .expect("duplicate shutdown is ignored");
+        }
+
+        assert_eq!(conn.state(), ConnectionState::Disconnected);
+        assert_eq!(conn.event_queue.len(), events_after_first);
+    }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "cap-scale loop (MAX_EVENT_QUEUE_ACTIONS == MAX_FLOW_WINDOW + 64                   allocations); the fail-closed behavior is proven here at full scale                   outside Miri, and `queue_event` ownership is exercised by the rest of                   this module under Miri"
+    )]
+    fn event_queue_overflow_fails_closed_and_stays_bounded() {
+        let mut conn = SrtConnection::new_caller(ConnectionOptions::default());
+        for _ in 0..=MAX_EVENT_QUEUE_ACTIONS {
+            conn.queue_event(ConnectionEvent::Error("synthetic".to_string()));
+        }
+
+        assert!(conn.event_overflowed);
+        assert_eq!(conn.state(), ConnectionState::Disconnected);
+        assert!(conn.event_queue.len() <= MAX_EVENT_QUEUE_ACTIONS);
+        assert!(
+            conn.connect(Timestamp::default())
+                .expect_err("event overflow is terminal")
+                .reason
+                .contains(EVENT_QUEUE_OVERFLOW_REASON)
+        );
+
+        let events_after_overflow = conn.event_queue.len();
+        for _ in 0..128 {
+            conn.queue_event(ConnectionEvent::Error("ignored".to_string()));
+        }
+        assert_eq!(conn.event_queue.len(), events_after_overflow);
     }
 
     #[test]
@@ -3949,6 +4402,7 @@ mod tests {
         listener.send_conclusion_response(Timestamp::from_micros(0));
         let ConnectionOutput::SendPacket(packet) = listener
             .poll_output()
+            .unwrap()
             .expect("listener emits conclusion response")
         else {
             panic!("listener conclusion response is a packet");
@@ -4183,7 +4637,8 @@ mod tests {
         });
         conn.connect(Timestamp::from_micros(0))
             .expect("caller connection starts");
-        let ConnectionOutput::SendPacket(packet) = conn.poll_output().expect("induction packet")
+        let ConnectionOutput::SendPacket(packet) =
+            conn.poll_output().unwrap().expect("induction packet")
         else {
             panic!("caller must emit an induction packet");
         };
@@ -4198,7 +4653,7 @@ mod tests {
         conn.send_conclusion_request(Timestamp::from_micros(1))
             .expect("caller emits conclusion");
         let packet = loop {
-            match conn.poll_output() {
+            match conn.poll_output().unwrap() {
                 Some(ConnectionOutput::SendPacket(packet)) => break packet,
                 Some(_) => {}
                 None => panic!("caller must emit a conclusion packet"),
@@ -4321,7 +4776,7 @@ mod tests {
         let mut conn = SrtConnection::new_listener(ConnectionOptions::default());
         conn.set_state(ConnectionState::Connected);
         conn.init_buffers(Timestamp::default(), 0, 0);
-        while conn.poll_output().is_some() {}
+        while conn.poll_output().unwrap().is_some() {}
 
         conn.handle_data_packet(
             DataPacket::new(8_191, 1, 1, 0, Vec::new().into()),
@@ -4330,27 +4785,29 @@ mod tests {
         .expect("the gap is accepted");
 
         let expected = [0x8000_0000u32.to_be_bytes(), 8_190u32.to_be_bytes()].concat();
-        let immediate = std::iter::from_fn(|| conn.poll_output()).find_map(|output| match output {
-            ConnectionOutput::SendPacket(bytes) => match SrtPacket::decode(&bytes) {
-                Ok(SrtPacket::Control(packet)) if packet.control_type == ControlType::Nak => {
-                    Some(packet.control_info)
-                }
+        let immediate =
+            std::iter::from_fn(|| conn.poll_output().unwrap()).find_map(|output| match output {
+                ConnectionOutput::SendPacket(bytes) => match SrtPacket::decode(&bytes) {
+                    Ok(SrtPacket::Control(packet)) if packet.control_type == ControlType::Nak => {
+                        Some(packet.control_info)
+                    }
+                    _ => None,
+                },
                 _ => None,
-            },
-            _ => None,
-        });
+            });
         assert_eq!(immediate.as_deref(), Some(expected.as_slice()));
 
         conn.send_periodic_nak(Timestamp::from_micros(2));
-        let periodic = std::iter::from_fn(|| conn.poll_output()).find_map(|output| match output {
-            ConnectionOutput::SendPacket(bytes) => match SrtPacket::decode(&bytes) {
-                Ok(SrtPacket::Control(packet)) if packet.control_type == ControlType::Nak => {
-                    Some(packet.control_info)
-                }
+        let periodic =
+            std::iter::from_fn(|| conn.poll_output().unwrap()).find_map(|output| match output {
+                ConnectionOutput::SendPacket(bytes) => match SrtPacket::decode(&bytes) {
+                    Ok(SrtPacket::Control(packet)) if packet.control_type == ControlType::Nak => {
+                        Some(packet.control_info)
+                    }
+                    _ => None,
+                },
                 _ => None,
-            },
-            _ => None,
-        });
+            });
         assert_eq!(periodic.as_deref(), Some(expected.as_slice()));
     }
 
@@ -4367,7 +4824,7 @@ mod tests {
         .expect("the wrapped gap is accepted");
 
         let control_info =
-            std::iter::from_fn(|| conn.poll_output()).find_map(|output| match output {
+            std::iter::from_fn(|| conn.poll_output().unwrap()).find_map(|output| match output {
                 ConnectionOutput::SendPacket(bytes) => match SrtPacket::decode(&bytes) {
                     Ok(SrtPacket::Control(packet)) if packet.control_type == ControlType::Nak => {
                         Some(packet.control_info)
@@ -4434,7 +4891,7 @@ mod tests {
         let mut conn = SrtConnection::new_listener(options);
         conn.set_state(ConnectionState::Connected);
         conn.init_buffers(Timestamp::default(), 0, 0);
-        while conn.poll_output().is_some() {}
+        while conn.poll_output().unwrap().is_some() {}
 
         let now = Timestamp::from_micros(1);
         let receiver = conn.receiver.as_mut().unwrap();
@@ -4452,7 +4909,7 @@ mod tests {
         conn.send_periodic_nak(Timestamp::from_micros(2));
         let mut decoded = Vec::new();
         let mut wire_packets = 0u64;
-        while let Some(output) = conn.poll_output() {
+        while let Some(output) = conn.poll_output().unwrap() {
             let ConnectionOutput::SendPacket(bytes) = output else {
                 continue;
             };
@@ -4527,7 +4984,7 @@ mod tests {
     }
 
     fn drain_outputs(conn: &mut SrtConnection) -> Vec<ConnectionOutput> {
-        std::iter::from_fn(|| conn.poll_output()).collect()
+        std::iter::from_fn(|| conn.poll_output().unwrap()).collect()
     }
 
     #[test]
@@ -4539,21 +4996,21 @@ mod tests {
         });
         assert_eq!(
             coalesced.options.ack_interval_micros,
-            crate::MAX_ACK_INTERVAL_MICROS
+            crate::receiver::MAX_ACK_INTERVAL_MICROS
         );
         assert_eq!(
             coalesced.options.light_ack_interval_packets,
-            crate::MAX_LIGHT_ACK_INTERVAL_PACKETS
+            crate::receiver::MAX_LIGHT_ACK_INTERVAL_PACKETS
         );
 
         let defaulted = SrtConnection::new_listener(ConnectionOptions::default());
         assert_eq!(
             defaulted.options.ack_interval_micros,
-            crate::ACK_INTERVAL_MICROS
+            crate::receiver::ACK_INTERVAL_MICROS
         );
         assert_eq!(
             defaulted.options.light_ack_interval_packets,
-            crate::LIGHT_ACK_INTERVAL_PACKETS
+            crate::receiver::LIGHT_ACK_INTERVAL_PACKETS
         );
         assert_ne!(
             coalesced.options.ack_interval_micros, defaulted.options.ack_interval_micros,
@@ -4564,8 +5021,8 @@ mod tests {
     #[test]
     fn coalesced_ack_keeps_comm_syn_tick_and_defers_sendto() {
         let mut conn = SrtConnection::new_listener(ConnectionOptions {
-            ack_interval_micros: crate::HIGH_FANIN_ACK_INTERVAL_MICROS,
-            light_ack_interval_packets: crate::HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS,
+            ack_interval_micros: crate::receiver::HIGH_FANIN_ACK_INTERVAL_MICROS,
+            light_ack_interval_packets: crate::receiver::HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS,
             tsbpd_delay: 0,
             ..ConnectionOptions::default()
         });
@@ -4580,7 +5037,7 @@ mod tests {
 
         assert_eq!(
             ack_timer_duration(drain_outputs(&mut conn)),
-            Some(crate::ACK_INTERVAL_MICROS)
+            Some(crate::receiver::ACK_INTERVAL_MICROS)
         );
 
         conn.handle_timer(TimerId::Ack, Timestamp::from_micros(10_000))
@@ -4588,7 +5045,7 @@ mod tests {
         let early = drain_outputs(&mut conn);
         assert_eq!(
             ack_timer_duration(early.iter().cloned()),
-            Some(crate::ACK_INTERVAL_MICROS)
+            Some(crate::receiver::ACK_INTERVAL_MICROS)
         );
         assert!(
             !early
@@ -4634,7 +5091,7 @@ mod tests {
         );
         assert_eq!(
             ack_timer_duration(outputs),
-            Some(crate::ACK_INTERVAL_MICROS)
+            Some(crate::receiver::ACK_INTERVAL_MICROS)
         );
     }
 }

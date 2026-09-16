@@ -21,9 +21,11 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
-use shiguredo_srt::{
-    ConnectionOptions, ConnectionOutput, ConnectionState, DataPacket, GroupEvent, GroupMode,
-    PacketPosition, ReceiverBuffer, SrtConnection, SrtGroup, Timestamp,
+use srt_proto::receiver::ReceiverBuffer;
+use srt_proto::wire::{DataPacket, PacketPosition};
+use srt_proto::{
+    ConnectionOptions, ConnectionOutput, ConnectionState, GroupEvent, GroupMode, SrtConnection,
+    SrtGroup, Timestamp,
 };
 
 struct CountingAllocator;
@@ -136,7 +138,7 @@ fn make_packet(seq: u32, timestamp_us: u32) -> DataPacket {
 }
 
 fn transfer(caller: &mut SrtConnection, listener: &mut SrtConnection, now: Timestamp) {
-    while let Some(output) = caller.poll_output() {
+    while let Some(output) = caller.poll_output().unwrap() {
         if let ConnectionOutput::SendPacket(packet) = output {
             listener
                 .feed_recv_buf(&packet, now)
@@ -157,7 +159,7 @@ fn establish_pair() -> (SrtConnection, SrtConnection) {
     caller.connect(ts(0)).expect("caller should connect");
     for round in 0..10 {
         transfer(&mut caller, &mut listener, ts(round * 10_000));
-        while let Some(output) = listener.poll_output() {
+        while let Some(output) = listener.poll_output().unwrap() {
             if let ConnectionOutput::SendPacket(packet) = output {
                 caller
                     .feed_recv_buf(&packet, ts(round * 10_000))
@@ -175,7 +177,7 @@ fn establish_pair() -> (SrtConnection, SrtConnection) {
 
 fn packets_from(connection: &mut SrtConnection) -> Vec<Vec<u8>> {
     let mut packets = Vec::new();
-    while let Some(output) = connection.poll_output() {
+    while let Some(output) = connection.poll_output().unwrap() {
         if let ConnectionOutput::SendPacket(packet) = output {
             packets.push(packet);
         }
@@ -393,7 +395,7 @@ fn fragmented_message_and_application_backlog_accounting() {
 
     let mut received_bytes = 0;
     while let Some(event) = listener.poll_event() {
-        if let shiguredo_srt::ConnectionEvent::DataReceived { payload, .. } = event {
+        if let srt_proto::ConnectionEvent::DataReceived { payload, .. } = event {
             received_bytes += payload.len();
         }
     }

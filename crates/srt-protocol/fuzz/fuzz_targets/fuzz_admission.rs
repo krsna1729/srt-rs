@@ -4,17 +4,17 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use libfuzzer_sys::fuzz_target;
-use shiguredo_srt::{
-    ConnectionOptions, ConnectionOutput, GroupExtensionData, GroupType, SRTGROUP_MASK,
-    SrtConnection, Timestamp,
+use srt_proto::{ConnectionOptions, ConnectionOutput, SrtConnection, Timestamp};
+use srt_proto::handshake::{GroupExtensionData, GroupType, SRTGROUP_MASK};
+use srt_transport::advanced::admission::{
+    AdmissionOptions, AdmissionResolution, BondedInputPolicy, PeerTable, PeerTableConfig,
+    RejectionReason,
 };
-use srt_transport::{
-    AdmissionOptions, AdmissionResolution, BondedInputPolicy, IngressTelemetry, ListenerPeerPolicy,
-    PeerTable, PeerTableConfig, PolicyOverride, RejectionReason,
-};
+use srt_transport::advanced::telemetry::IngressTelemetry;
+use srt_transport::{ListenerPeerPolicy, PolicyOverride};
 
 fn next_packet(connection: &mut SrtConnection) -> Option<Vec<u8>> {
-    while let Some(output) = connection.poll_output() {
+    while let Some(output) = connection.poll_output().unwrap() {
         if let ConnectionOutput::SendPacket(packet) = output {
             return Some(packet);
         }

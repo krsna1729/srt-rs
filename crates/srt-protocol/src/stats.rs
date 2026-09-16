@@ -8,7 +8,8 @@
 
 use std::time::Duration;
 
-use crate::{ReceiverStats, SenderStats};
+use crate::receiver::ReceiverStats;
+use crate::sender::SenderStats;
 
 /// A non-clearing snapshot of all statistics available for one connection.
 ///

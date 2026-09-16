@@ -23,7 +23,7 @@
 //! ## Example
 //!
 //! ```
-//! use shiguredo_srt::stream_id::{AccessControl, StreamMode, StreamType};
+//! use srt_proto::stream_id::{AccessControl, StreamMode, StreamType};
 //!
 //! let ac = AccessControl::parse("#!::u=admin,r=live/stream1").unwrap();
 //! assert_eq!(ac.user_name(), Some("admin"));
@@ -34,6 +34,8 @@ use std::collections::HashMap;
 
 /// The Access Control syntax's prefix.
 const ACCESS_CONTROL_PREFIX: &str = "#!::";
+/// Maximum UTF-8 byte length accepted for an SRT Stream ID.
+pub const MAX_STREAM_ID_BYTES: usize = 512;
 
 /// Stream type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -126,8 +128,11 @@ impl AccessControl {
     /// Parse the Access Control syntax.
     ///
     /// Returns `None` if the `#!::` prefix is absent, i.e. for a free-form
-    /// Stream ID.
+    /// Stream ID, or if the input exceeds the wire-level Stream ID limit.
     pub fn parse(stream_id: &str) -> Option<Self> {
+        if stream_id.len() > MAX_STREAM_ID_BYTES {
+            return None;
+        }
         // Check the prefix.
         let content = stream_id.strip_prefix(ACCESS_CONTROL_PREFIX)?;
 
@@ -353,6 +358,12 @@ mod tests {
     fn test_parse_wrong_prefix() {
         let ac = AccessControl::parse("#!:u=test");
         assert!(ac.is_none());
+    }
+
+    #[test]
+    fn test_parse_rejects_oversized_stream_id() {
+        let stream_id = format!("#!::u={}", "x".repeat(MAX_STREAM_ID_BYTES));
+        assert!(AccessControl::parse(&stream_id).is_none());
     }
 
     #[test]

@@ -4,11 +4,16 @@
 //! data packets (0) from control packets (1).
 
 use crate::buf::{read_u32, write_bytes, write_u32};
+use crate::crypto_impl::{CipherMode, CryptoContext, GCM_TAG_LEN, TxCryptoStamp};
 use crate::error::Error;
 use bytes::Bytes;
 
 /// The minimum SRT packet header size (16 bytes).
 pub const SRT_HEADER_SIZE: usize = 16;
+/// Maximum datagram-sized input accepted by the codec. UDP cannot carry a
+/// larger payload, and keeping the same finite ceiling for direct callers
+/// prevents decode helpers from copying attacker-sized slices.
+pub const MAX_DATAGRAM_SIZE: usize = 65_536;
 
 /// Packet type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +49,9 @@ impl SrtPacket {
     #[track_caller]
     pub fn decode(buf: &[u8]) -> Result<Self, Error> {
         Error::check_buffer_size(SRT_HEADER_SIZE, buf)?;
+        if buf.len() > MAX_DATAGRAM_SIZE {
+            return Err(Error::invalid_data("SRT datagram exceeds maximum size"));
+        }
 
         let mut slice = buf;
         let first_word = read_u32(&mut slice)?;
@@ -57,12 +65,56 @@ impl SrtPacket {
         }
     }
 
-    /// Encode to a byte buffer.
-    pub fn encode(&self, buf: &mut Vec<u8>) {
-        match self {
-            SrtPacket::Data(pkt) => pkt.encode(buf),
-            SrtPacket::Control(pkt) => pkt.encode(buf),
+    /// Encode to a byte buffer when the resulting datagram fits the wire
+    /// limit. The destination buffer is unchanged when the packet is too
+    /// large.
+    pub fn encode(&self, buf: &mut Vec<u8>) -> Result<(), Error> {
+        if self.encoded_size() > MAX_DATAGRAM_SIZE {
+            return Err(Error::invalid_data("SRT datagram exceeds maximum size"));
         }
+        self.encode_unchecked(buf);
+        Ok(())
+    }
+
+    /// Encode into caller-provided storage without allocating.
+    ///
+    /// The buffer is unchanged when it is too small or the datagram exceeds
+    /// the protocol maximum. The returned length is the exact wire length.
+    pub fn encode_into(&self, buf: &mut [u8]) -> Result<usize, Error> {
+        let size = self.encoded_size();
+        if size > MAX_DATAGRAM_SIZE {
+            return Err(Error::invalid_data("SRT datagram exceeds maximum size"));
+        }
+        Error::check_buffer_size(size, buf)?;
+        match self {
+            Self::Data(packet) => packet.encode_into(buf),
+            Self::Control(packet) => packet.encode_into(buf),
+        }
+    }
+
+    /// Encode without repeating the size check. This is restricted to the
+    /// protocol implementation; callers should use [`Self::encode`].
+    pub(crate) fn encode_unchecked(&self, buf: &mut Vec<u8>) {
+        match self {
+            SrtPacket::Data(pkt) => pkt.encode_unchecked(buf),
+            SrtPacket::Control(pkt) => pkt.encode_unchecked(buf),
+        }
+    }
+
+    /// Return the encoded size in bytes, saturating on theoretical `usize`
+    /// overflow.
+    #[must_use]
+    pub fn encoded_size(&self) -> usize {
+        match self {
+            SrtPacket::Data(pkt) => pkt.encoded_size(),
+            SrtPacket::Control(pkt) => pkt.encoded_size(),
+        }
+    }
+
+    /// Backwards-compatible name for [`Self::encode`].
+    #[deprecated(note = "use encode; packet encoding is checked by default")]
+    pub fn try_encode(&self, buf: &mut Vec<u8>) -> Result<(), Error> {
+        self.encode(buf)
     }
 }
 
@@ -191,8 +243,41 @@ impl DataPacket {
         })
     }
 
-    /// Encode to a byte buffer.
-    pub fn encode(&self, buf: &mut Vec<u8>) {
+    /// Encode to a byte buffer when the resulting datagram fits the wire
+    /// limit. The destination buffer is unchanged when the packet is too
+    /// large.
+    pub fn encode(&self, buf: &mut Vec<u8>) -> Result<(), Error> {
+        if self.encoded_size() > MAX_DATAGRAM_SIZE {
+            return Err(Error::invalid_data("SRT datagram exceeds maximum size"));
+        }
+        self.encode_unchecked(buf);
+        Ok(())
+    }
+
+    /// Encode into caller-provided storage without allocating.
+    pub fn encode_into(&self, buf: &mut [u8]) -> Result<usize, Error> {
+        let size = self.encoded_size();
+        if size > MAX_DATAGRAM_SIZE {
+            return Err(Error::invalid_data("SRT datagram exceeds maximum size"));
+        }
+        Error::check_buffer_size(size, buf)?;
+        let first_word = self.sequence_number & 0x7FFF_FFFF;
+        let second_word = ((self.position.to_bits() as u32) << 30)
+            | ((self.order_flag as u32) << 29)
+            | ((self.encryption_flag as u32 & 0b11) << 27)
+            | ((self.retransmitted as u32) << 26)
+            | (self.message_number & 0x03FF_FFFF);
+        buf[0..4].copy_from_slice(&first_word.to_be_bytes());
+        buf[4..8].copy_from_slice(&second_word.to_be_bytes());
+        buf[8..12].copy_from_slice(&self.timestamp.to_be_bytes());
+        buf[12..16].copy_from_slice(&self.dest_socket_id.to_be_bytes());
+        buf[16..size].copy_from_slice(&self.payload);
+        Ok(size)
+    }
+
+    /// Encode without repeating the size check. This is restricted to the
+    /// protocol implementation; callers should use [`Self::encode`].
+    pub(crate) fn encode_unchecked(&self, buf: &mut Vec<u8>) {
         // First word: F=0, sequence_number
         let first_word = self.sequence_number & 0x7FFF_FFFF;
         write_u32(buf, first_word);
@@ -210,9 +295,15 @@ impl DataPacket {
         write_bytes(buf, &self.payload);
     }
 
+    /// Backwards-compatible name for [`Self::encode`].
+    #[deprecated(note = "use encode; packet encoding is checked by default")]
+    pub fn try_encode(&self, buf: &mut Vec<u8>) -> Result<(), Error> {
+        self.encode(buf)
+    }
+
     /// Get the encoded size.
     pub fn encoded_size(&self) -> usize {
-        SRT_HEADER_SIZE + self.payload.len()
+        SRT_HEADER_SIZE.saturating_add(self.payload.len())
     }
 
     /// Build the 16-byte header used as AAD for AES-GCM.
@@ -242,7 +333,7 @@ impl DataPacket {
 /// `encryption_flag`, which is determined by the crypto layer after
 /// the header is created.  The payload travels separately as `Bytes`
 /// so the wire buffer can be built with a single payload copy.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DataHeader {
     pub sequence_number: u32,
     pub position: PacketPosition,
@@ -268,6 +359,12 @@ impl DataHeader {
         buf[12..16].copy_from_slice(&self.dest_socket_id.to_be_bytes());
     }
 
+    /// Write the 16-byte header into the prefix of a byte slice.
+    pub fn write_header_slice(&self, buf: &mut [u8], encryption_flag: u8) {
+        let mut hdr = [0u8; SRT_HEADER_SIZE];
+        self.write_header(&mut hdr, encryption_flag);
+        buf[..SRT_HEADER_SIZE].copy_from_slice(&hdr);
+    }
     /// Build the 16-byte GCM AAD (R bit forced to 0).
     pub fn gcm_aad(&self, encryption_flag: u8) -> [u8; 16] {
         let first_word = self.sequence_number & 0x7FFF_FFFF;
@@ -281,6 +378,123 @@ impl DataHeader {
         aad[8..12].copy_from_slice(&self.timestamp.to_be_bytes());
         aad[12..16].copy_from_slice(&self.dest_socket_id.to_be_bytes());
         aad
+    }
+}
+
+/// A pending outgoing DATA packet awaiting materialization into a caller-supplied buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingData {
+    pub(crate) header: DataHeader,
+    pub(crate) payload: Bytes,
+    pub(crate) crypto: Option<TxCryptoStamp>,
+}
+
+impl PendingData {
+    /// Create a new pending data packet.
+    #[must_use]
+    pub(crate) fn new(header: DataHeader, payload: Bytes, crypto: Option<TxCryptoStamp>) -> Self {
+        Self {
+            header,
+            payload,
+            crypto,
+        }
+    }
+
+    /// Exact wire length in bytes when serialized.
+    #[must_use]
+    pub(crate) fn wire_len(&self) -> usize {
+        let tag_len = match self.crypto {
+            Some(stamp) if stamp.cipher_mode == CipherMode::Gcm => GCM_TAG_LEN,
+            _ => 0,
+        };
+        SRT_HEADER_SIZE + self.payload.len() + tag_len
+    }
+
+    /// Encode and encrypt the packet directly into destination storage.
+    ///
+    /// The destination slice must be at least [`Self::wire_len`] bytes.
+    pub(crate) fn encode_into(
+        &self,
+        crypto: Option<&CryptoContext>,
+        dst: &mut [u8],
+    ) -> Result<usize, Error> {
+        let wire_len = self.wire_len();
+        if wire_len > MAX_DATAGRAM_SIZE {
+            return Err(Error::invalid_data("SRT datagram exceeds maximum size"));
+        }
+        Error::check_buffer_size(wire_len, dst)?;
+
+        match self.crypto {
+            None => {
+                self.header.write_header_slice(dst, 0);
+                dst[SRT_HEADER_SIZE..wire_len].copy_from_slice(&self.payload);
+                Ok(wire_len)
+            }
+            Some(stamp) => {
+                let crypto = crypto.ok_or_else(|| {
+                    Error::crypto_error("encrypted datagram but no crypto context provided")
+                })?;
+                let payload_len = self.payload.len();
+                let payload_end = SRT_HEADER_SIZE + payload_len;
+                match stamp.cipher_mode {
+                    CipherMode::Ctr => {
+                        dst[SRT_HEADER_SIZE..payload_end].copy_from_slice(&self.payload);
+                        crypto.encrypt_with_stamp(
+                            stamp,
+                            self.header.sequence_number,
+                            &mut dst[SRT_HEADER_SIZE..payload_end],
+                        )?;
+                        self.header
+                            .write_header_slice(dst, stamp.key_flag.to_kk_field());
+                        Ok(wire_len)
+                    }
+                    CipherMode::Gcm => {
+                        let enc_flag = stamp.key_flag.to_kk_field();
+                        self.header.write_header_slice(dst, enc_flag);
+                        let aad = self.header.gcm_aad(enc_flag);
+                        dst[SRT_HEADER_SIZE..payload_end].copy_from_slice(&self.payload);
+                        let tag = crypto.encrypt_gcm_with_stamp(
+                            stamp,
+                            self.header.sequence_number,
+                            &aad,
+                            &mut dst[SRT_HEADER_SIZE..payload_end],
+                        )?;
+                        dst[payload_end..wire_len].copy_from_slice(&tag);
+                        Ok(wire_len)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A pending outgoing datagram (data or control) awaiting materialization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PendingDatagram {
+    Data(PendingData),
+    Control(ControlPacket),
+}
+
+impl PendingDatagram {
+    /// Exact wire length in bytes.
+    #[must_use]
+    pub(crate) fn wire_len(&self) -> usize {
+        match self {
+            Self::Data(data) => data.wire_len(),
+            Self::Control(control) => control.encoded_size(),
+        }
+    }
+
+    /// Encode and encrypt the packet directly into destination storage.
+    pub(crate) fn encode_into(
+        &self,
+        crypto: Option<&CryptoContext>,
+        dst: &mut [u8],
+    ) -> Result<usize, Error> {
+        match self {
+            Self::Data(data) => data.encode_into(crypto, dst),
+            Self::Control(control) => control.encode_into(dst),
+        }
     }
 }
 
@@ -388,8 +602,38 @@ impl ControlPacket {
         })
     }
 
-    /// Encode to a byte buffer.
-    pub fn encode(&self, buf: &mut Vec<u8>) {
+    /// Encode to a byte buffer when the resulting datagram fits the wire
+    /// limit. The destination buffer is unchanged when the packet is too
+    /// large.
+    pub fn encode(&self, buf: &mut Vec<u8>) -> Result<(), Error> {
+        if self.encoded_size() > MAX_DATAGRAM_SIZE {
+            return Err(Error::invalid_data("SRT datagram exceeds maximum size"));
+        }
+        self.encode_unchecked(buf);
+        Ok(())
+    }
+
+    /// Encode into caller-provided storage without allocating.
+    pub fn encode_into(&self, buf: &mut [u8]) -> Result<usize, Error> {
+        let size = self.encoded_size();
+        if size > MAX_DATAGRAM_SIZE {
+            return Err(Error::invalid_data("SRT datagram exceeds maximum size"));
+        }
+        Error::check_buffer_size(size, buf)?;
+        let first_word = 0x8000_0000
+            | ((self.control_type as u32 & 0x7FFF) << 16)
+            | (self.subtype as u32 & 0xFFFF);
+        buf[0..4].copy_from_slice(&first_word.to_be_bytes());
+        buf[4..8].copy_from_slice(&self.type_specific_info.to_be_bytes());
+        buf[8..12].copy_from_slice(&self.timestamp.to_be_bytes());
+        buf[12..16].copy_from_slice(&self.dest_socket_id.to_be_bytes());
+        buf[16..size].copy_from_slice(&self.control_info);
+        Ok(size)
+    }
+
+    /// Encode without repeating the size check. This is restricted to the
+    /// protocol implementation; callers should use [`Self::encode`].
+    pub(crate) fn encode_unchecked(&self, buf: &mut Vec<u8>) {
         // First word: F=1, control_type, subtype
         let first_word = 0x8000_0000
             | ((self.control_type as u32 & 0x7FFF) << 16)
@@ -402,9 +646,15 @@ impl ControlPacket {
         write_bytes(buf, &self.control_info);
     }
 
+    /// Backwards-compatible name for [`Self::encode`].
+    #[deprecated(note = "use encode; packet encoding is checked by default")]
+    pub fn try_encode(&self, buf: &mut Vec<u8>) -> Result<(), Error> {
+        self.encode(buf)
+    }
+
     /// Get the encoded size.
     pub fn encoded_size(&self) -> usize {
-        SRT_HEADER_SIZE + self.control_info.len()
+        SRT_HEADER_SIZE.saturating_add(self.control_info.len())
     }
 }
 
@@ -438,7 +688,9 @@ mod tests {
         };
 
         let mut buf = Vec::new();
-        original.encode(&mut buf);
+        original
+            .encode(&mut buf)
+            .expect("packet fits configured datagram bound");
 
         let decoded =
             match SrtPacket::decode(&buf).expect("decoding an encoded packet should succeed") {
@@ -461,7 +713,9 @@ mod tests {
         };
 
         let mut buf = Vec::new();
-        original.encode(&mut buf);
+        original
+            .encode(&mut buf)
+            .expect("packet fits configured datagram bound");
 
         let decoded =
             match SrtPacket::decode(&buf).expect("decoding an encoded packet should succeed") {
@@ -470,6 +724,57 @@ mod tests {
             };
 
         assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn decode_rejects_oversized_datagram() {
+        let oversized = vec![0u8; MAX_DATAGRAM_SIZE + 1];
+        let error = SrtPacket::decode(&oversized).expect_err("codec input is capped");
+        assert_eq!(error.kind, crate::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn checked_encode_rejects_oversized_datagrams_without_mutating_buffer() {
+        let data = DataPacket::new(0, 0, 0, 0, Bytes::from(vec![0; MAX_DATAGRAM_SIZE]));
+        let mut data_buf = vec![1, 2, 3];
+        assert!(data.encode(&mut data_buf).is_err());
+        assert_eq!(data_buf, vec![1, 2, 3]);
+
+        let control = ControlPacket {
+            control_info: vec![0; MAX_DATAGRAM_SIZE],
+            ..ControlPacket::new(ControlType::Ack, 0, 0)
+        };
+        let mut control_buf = vec![4, 5, 6];
+        assert!(control.encode(&mut control_buf).is_err());
+        assert_eq!(control_buf, vec![4, 5, 6]);
+    }
+
+    #[test]
+    fn encode_into_writes_exactly_once_without_allocating() {
+        let data = DataPacket::new(7, 9, 11, 13, Bytes::from_static(b"payload"));
+        let mut data_buf = [0xA5; MAX_DATAGRAM_SIZE];
+        let data_len = data.encode_into(&mut data_buf).expect("buffer fits");
+        assert_eq!(data_len, data.encoded_size());
+        assert!(matches!(
+            SrtPacket::decode(&data_buf[..data_len]),
+            Ok(SrtPacket::Data(decoded)) if decoded == data
+        ));
+
+        let control = ControlPacket {
+            control_info: vec![1, 2, 3],
+            ..ControlPacket::new(ControlType::Ack, 17, 19)
+        };
+        let mut control_buf = [0x5A; MAX_DATAGRAM_SIZE];
+        let control_len = control.encode_into(&mut control_buf).expect("buffer fits");
+        assert_eq!(control_len, control.encoded_size());
+        assert!(matches!(
+            SrtPacket::decode(&control_buf[..control_len]),
+            Ok(SrtPacket::Control(decoded)) if decoded == control
+        ));
+
+        let mut short = [0xCC; 3];
+        assert!(data.encode_into(&mut short).is_err());
+        assert_eq!(short, [0xCC; 3]);
     }
 
     #[test]
@@ -483,7 +788,9 @@ mod tests {
             control_info: vec![0; 1500],
         };
         let mut bytes = Vec::new();
-        packet.encode(&mut bytes);
+        packet
+            .encode(&mut bytes)
+            .expect("packet fits configured datagram bound");
         assert_eq!(
             peek_destination_socket_id(&bytes).expect("complete header"),
             0xABCD_1234

@@ -5,7 +5,7 @@
 //! enough to prove wire-level interop against real libsrt.
 
 use bytes::Bytes;
-use shiguredo_srt::{ConnectionEvent, ConnectionOutput, SrtConnection, TimerId, Timestamp};
+use srt_proto::{ConnectionEvent, ConnectionOutput, SrtConnection, TimerId, Timestamp};
 use std::collections::HashMap;
 use std::net::UdpSocket;
 use std::time::Instant;
@@ -166,7 +166,7 @@ pub fn drain_outputs(
     timers: &mut HashMap<TimerId, Timestamp>,
     now: Timestamp,
 ) {
-    while let Some(out) = conn.poll_output() {
+    while let Some(out) = conn.poll_output().expect("exact-size output materializes") {
         match out {
             ConnectionOutput::SendPacket(bytes) => {
                 let _ = socket.send(&bytes);

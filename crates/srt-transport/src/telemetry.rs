@@ -1,4 +1,249 @@
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+use srt_proto::Timestamp;
+
+/// Fixed number of power-of-two buckets used for owner-local shard lateness.
+pub const SHARD_LATENESS_BUCKETS: usize = 32;
+/// Fixed number of overload counters in each shard snapshot.
+pub const SHARD_OVERLOAD_REASONS: usize = 4;
+
+/// Fixed overload categories. Keeping this an enum rather than accepting
+/// arbitrary labels makes snapshot storage and exporter cardinality bounded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShardOverloadReason {
+    ReceiveBudget = 0,
+    OutputBudget = 1,
+    OutputBackpressure = 2,
+    QueueLimit = 3,
+    /// A protocol output could not be materialized for its sink. Distinct
+    /// from a budget/backpressure condition: it is a property of the affected
+    /// session, not of the shard's capacity.
+    OutputProtocolError = 4,
+}
+
+impl ShardOverloadReason {
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Fixed-size, serialization-friendly snapshot for one application-owned
+/// shard. The shard owns and mutates [`ShardTelemetry`]; exporters can copy
+/// this value without taking a global lock or allocating per-shard labels.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ShardTelemetrySnapshot {
+    /// Number of service visits represented by this snapshot.
+    pub service_visits: u64,
+    /// Sum and maximum of observed service duration in microseconds.
+    pub service_time_total_us: u64,
+    pub service_time_max_us: u64,
+    /// The most recently observed intended deadline and service start.
+    pub last_intended_deadline: Option<Timestamp>,
+    pub last_service_start: Option<Timestamp>,
+    /// Number and maximum of positive deadline lateness samples.
+    pub lateness_samples: u64,
+    pub lateness_max_us: u64,
+    pub lateness_buckets: [u64; SHARD_LATENESS_BUCKETS],
+    /// Last observed queue state and high-water marks for one shard's
+    /// application queue. Age is the oldest retained item age in microseconds.
+    pub queue_items: usize,
+    pub queue_bytes: usize,
+    pub queue_oldest_age_us: u64,
+    pub queue_peak_items: usize,
+    pub queue_peak_bytes: usize,
+    pub queue_peak_age_us: u64,
+    /// Bounded work and outcome counters.
+    pub receive_datagrams: u64,
+    pub receive_syscalls: u64,
+    pub receive_truncated: u64,
+    pub output_actions: u64,
+    pub output_packets: u64,
+    pub output_bytes: u64,
+    pub output_syscalls: u64,
+    pub output_would_block: u64,
+    pub budget_exhausted: u64,
+    /// Service visits that reported a protocol materialization failure.
+    pub protocol_output_failures: u64,
+    pub backpressured: u64,
+    pub accepted: u64,
+    pub rejected: u64,
+    pub expired: u64,
+    pub failed: u64,
+    /// Counts indexed by [`ShardOverloadReason`]'s discriminant.
+    pub overloads: [u64; SHARD_OVERLOAD_REASONS],
+}
+
+impl ShardTelemetrySnapshot {
+    #[must_use]
+    pub fn overload_count(self, reason: ShardOverloadReason) -> u64 {
+        self.overloads[reason.index()]
+    }
+
+    #[must_use]
+    pub fn overload_total(self) -> u64 {
+        self.overloads.into_iter().fold(0, u64::saturating_add)
+    }
+}
+
+/// Owner-local telemetry for one runtime shard.
+///
+/// This type deliberately contains no atomics and no dynamic collections.
+/// A runtime records into the instance it already owns, then periodically
+/// exports [`Self::snapshot`]. Cross-shard aggregation belongs to the
+/// application and can merge fixed snapshots at its chosen cadence.
+#[derive(Clone, Debug, Default)]
+pub struct ShardTelemetry {
+    snapshot: ShardTelemetrySnapshot,
+}
+
+impl ShardTelemetry {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one bounded service visit. `intended_deadline` is optional for
+    /// work that has no deadline; lateness is recorded only when it exists.
+    pub fn record_service(
+        &mut self,
+        intended_deadline: Option<Timestamp>,
+        service_start: Timestamp,
+        service_time: Duration,
+    ) {
+        let service_us = service_time.as_micros().min(u64::MAX as u128) as u64;
+        self.snapshot.service_visits = self.snapshot.service_visits.saturating_add(1);
+        self.snapshot.service_time_total_us = self
+            .snapshot
+            .service_time_total_us
+            .saturating_add(service_us);
+        self.snapshot.service_time_max_us = self.snapshot.service_time_max_us.max(service_us);
+        self.snapshot.last_intended_deadline = intended_deadline;
+        self.snapshot.last_service_start = Some(service_start);
+        if let Some(deadline) = intended_deadline {
+            let lateness = service_start.saturating_sub(deadline);
+            self.record_lateness(lateness);
+        }
+    }
+
+    /// Record a positive or zero deadline lateness sample in a fixed
+    /// power-of-two histogram. Zero is kept in bucket zero.
+    pub fn record_lateness(&mut self, lateness: u64) {
+        let bucket = if lateness == 0 {
+            0
+        } else {
+            (u64::BITS - lateness.leading_zeros()) as usize
+        }
+        .min(SHARD_LATENESS_BUCKETS - 1);
+        self.snapshot.lateness_samples = self.snapshot.lateness_samples.saturating_add(1);
+        self.snapshot.lateness_max_us = self.snapshot.lateness_max_us.max(lateness);
+        self.snapshot.lateness_buckets[bucket] =
+            self.snapshot.lateness_buckets[bucket].saturating_add(1);
+    }
+
+    /// Observe the current application queue. The caller supplies the oldest
+    /// retained item's age; no item references or dynamic labels are retained.
+    pub fn observe_queue(&mut self, items: usize, bytes: usize, oldest_age: Duration) {
+        let age_us = oldest_age.as_micros().min(u64::MAX as u128) as u64;
+        self.snapshot.queue_items = items;
+        self.snapshot.queue_bytes = bytes;
+        self.snapshot.queue_oldest_age_us = age_us;
+        self.snapshot.queue_peak_items = self.snapshot.queue_peak_items.max(items);
+        self.snapshot.queue_peak_bytes = self.snapshot.queue_peak_bytes.max(bytes);
+        self.snapshot.queue_peak_age_us = self.snapshot.queue_peak_age_us.max(age_us);
+    }
+
+    /// Record receive work from one bounded receive visit.
+    pub fn record_receive(
+        &mut self,
+        datagrams: usize,
+        syscalls: usize,
+        truncated: usize,
+        budget_exhausted: bool,
+    ) {
+        self.snapshot.receive_datagrams = self
+            .snapshot
+            .receive_datagrams
+            .saturating_add(datagrams as u64);
+        self.snapshot.receive_syscalls = self
+            .snapshot
+            .receive_syscalls
+            .saturating_add(syscalls as u64);
+        self.snapshot.receive_truncated = self
+            .snapshot
+            .receive_truncated
+            .saturating_add(truncated as u64);
+        if budget_exhausted {
+            self.record_overload(ShardOverloadReason::ReceiveBudget);
+        }
+    }
+
+    /// Record one bounded output visit using the public report's already
+    /// accounted units.
+    pub fn record_output(&mut self, report: &crate::OutputDrainReport) {
+        self.snapshot.output_actions = self
+            .snapshot
+            .output_actions
+            .saturating_add(report.actions as u64);
+        self.snapshot.output_packets = self
+            .snapshot
+            .output_packets
+            .saturating_add(report.packets as u64);
+        self.snapshot.output_bytes = self
+            .snapshot
+            .output_bytes
+            .saturating_add(report.bytes as u64);
+        self.snapshot.output_syscalls = self
+            .snapshot
+            .output_syscalls
+            .saturating_add(report.syscalls as u64);
+        if report.would_block {
+            self.snapshot.output_would_block = self.snapshot.output_would_block.saturating_add(1);
+        }
+        match report.status {
+            crate::OutputDrainStatus::Drained => {}
+            crate::OutputDrainStatus::BudgetExhausted => {
+                self.snapshot.budget_exhausted = self.snapshot.budget_exhausted.saturating_add(1);
+                self.record_overload(ShardOverloadReason::OutputBudget);
+            }
+            crate::OutputDrainStatus::Backpressured => {
+                self.snapshot.backpressured = self.snapshot.backpressured.saturating_add(1);
+                self.record_overload(ShardOverloadReason::OutputBackpressure);
+            }
+            crate::OutputDrainStatus::ProtocolError => {
+                self.snapshot.protocol_output_failures =
+                    self.snapshot.protocol_output_failures.saturating_add(1);
+                self.record_overload(ShardOverloadReason::OutputProtocolError);
+            }
+        }
+    }
+
+    pub fn record_overload(&mut self, reason: ShardOverloadReason) {
+        self.snapshot.overloads[reason.index()] =
+            self.snapshot.overloads[reason.index()].saturating_add(1);
+    }
+
+    pub fn record_accepted(&mut self) {
+        self.snapshot.accepted = self.snapshot.accepted.saturating_add(1);
+    }
+
+    pub fn record_rejected(&mut self) {
+        self.snapshot.rejected = self.snapshot.rejected.saturating_add(1);
+    }
+
+    pub fn record_expired(&mut self) {
+        self.snapshot.expired = self.snapshot.expired.saturating_add(1);
+    }
+
+    pub fn record_failed(&mut self) {
+        self.snapshot.failed = self.snapshot.failed.saturating_add(1);
+    }
+
+    #[must_use]
+    pub const fn snapshot(&self) -> ShardTelemetrySnapshot {
+        self.snapshot
+    }
+}
 
 /// Counters for one reuseport listener's admission path.
 ///
@@ -332,5 +577,92 @@ mod tests {
         assert_eq!(s.local_promotions, 4000);
         assert_eq!(s.invalid_datagrams, 4000);
         assert_eq!(s.expired_half_open, 4000);
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn shard_snapshot_reconciles_service_work_and_queue_state() {
+        let mut telemetry = ShardTelemetry::new();
+        telemetry.record_service(
+            Some(Timestamp::from_micros(100)),
+            Timestamp::from_micros(125),
+            Duration::from_micros(7),
+        );
+        telemetry.record_receive(3, 2, 1, true);
+        telemetry.record_output(&crate::OutputDrainReport {
+            sink_outcome: crate::SinkOutcome::Accepted,
+            sink_error_kind: None,
+            sink_rejections: 0,
+            protocol_output_failures: 0,
+            protocol_output_error_kind: None,
+            actions: 4,
+            packets: 2,
+            bytes: 1200,
+            status: crate::OutputDrainStatus::BudgetExhausted,
+            syscalls: 1,
+            would_block: false,
+        });
+        telemetry.observe_queue(3, 900, Duration::from_micros(11));
+        telemetry.observe_queue(1, 200, Duration::from_micros(4));
+        telemetry.record_accepted();
+        telemetry.record_rejected();
+        telemetry.record_expired();
+        telemetry.record_failed();
+        telemetry.record_overload(ShardOverloadReason::QueueLimit);
+
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.service_visits, 1);
+        assert_eq!(snapshot.service_time_total_us, 7);
+        assert_eq!(snapshot.service_time_max_us, 7);
+        assert_eq!(snapshot.lateness_samples, 1);
+        assert_eq!(snapshot.lateness_max_us, 25);
+        assert_eq!(snapshot.receive_datagrams, 3);
+        assert_eq!(snapshot.receive_syscalls, 2);
+        assert_eq!(snapshot.receive_truncated, 1);
+        assert_eq!(snapshot.output_actions, 4);
+        assert_eq!(snapshot.output_packets, 2);
+        assert_eq!(snapshot.output_bytes, 1200);
+        assert_eq!(snapshot.output_syscalls, 1);
+        assert_eq!(snapshot.budget_exhausted, 1);
+        assert_eq!(snapshot.queue_items, 1);
+        assert_eq!(snapshot.queue_bytes, 200);
+        assert_eq!(snapshot.queue_oldest_age_us, 4);
+        assert_eq!(snapshot.queue_peak_items, 3);
+        assert_eq!(snapshot.queue_peak_bytes, 900);
+        assert_eq!(snapshot.queue_peak_age_us, 11);
+        assert_eq!(snapshot.accepted, 1);
+        assert_eq!(snapshot.rejected, 1);
+        assert_eq!(snapshot.expired, 1);
+        assert_eq!(snapshot.failed, 1);
+        assert_eq!(
+            snapshot.overload_count(ShardOverloadReason::ReceiveBudget),
+            1
+        );
+        assert_eq!(
+            snapshot.overload_count(ShardOverloadReason::OutputBudget),
+            1
+        );
+        assert_eq!(snapshot.overload_count(ShardOverloadReason::QueueLimit), 1);
+        assert_eq!(snapshot.overload_total(), 3);
+    }
+
+    #[test]
+    fn shard_lateness_histogram_keeps_a_fixed_storage_shape() {
+        let mut telemetry = ShardTelemetry::new();
+        telemetry.record_lateness(0);
+        telemetry.record_lateness(1);
+        telemetry.record_lateness(u64::MAX);
+        telemetry.record_service(None, Timestamp::from_micros(9), Duration::ZERO);
+
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.lateness_samples, 3);
+        assert_eq!(snapshot.lateness_max_us, u64::MAX);
+        assert_eq!(snapshot.lateness_buckets.len(), SHARD_LATENESS_BUCKETS);
+        assert_eq!(snapshot.lateness_buckets[0], 1);
+        assert_eq!(snapshot.lateness_buckets[1], 1);
+        assert_eq!(snapshot.lateness_buckets[SHARD_LATENESS_BUCKETS - 1], 1);
+        assert_eq!(snapshot.service_visits, 1);
+        assert_eq!(snapshot.last_intended_deadline, None);
+        assert_eq!(snapshot.last_service_start, Some(Timestamp::from_micros(9)));
     }
 }

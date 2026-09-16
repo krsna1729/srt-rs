@@ -4,10 +4,12 @@
 
 use std::time::Duration;
 
-use shiguredo_srt::{
-    CipherMode, ConnectionEvent, ConnectionOptions, ConnectionOutput, ConnectionState,
-    ConnectionStats, DataPacket, ErrorKind, GroupExtensionData, GroupType, KeyFlag, KeyLength,
-    PacketPosition, SrtConnection, SrtPacket, TimerId, Timestamp,
+use srt_proto::crypto::{CipherMode, KeyFlag, KeyLength};
+use srt_proto::handshake::{GroupExtensionData, GroupType};
+use srt_proto::wire::{DataPacket, PacketPosition, SrtPacket};
+use srt_proto::{
+    ConnectionEvent, ConnectionOptions, ConnectionOutput, ConnectionState, ConnectionStats,
+    ErrorKind, SrtConnection, TimerId, Timestamp,
 };
 
 /// テスト用のデフォルトオプション (TSBPD 遅延を 0 にして即時配信)
@@ -37,7 +39,7 @@ fn transfer_caller_to_listener(
     listener: &mut SrtConnection,
     now: Timestamp,
 ) {
-    while let Some(output) = caller.poll_output() {
+    while let Some(output) = caller.poll_output().unwrap() {
         if let ConnectionOutput::SendPacket(data) = output {
             let _ = listener.feed_recv_buf(&data, now);
         }
@@ -50,7 +52,7 @@ fn transfer_listener_to_caller(
     caller: &mut SrtConnection,
     now: Timestamp,
 ) {
-    while let Some(output) = listener.poll_output() {
+    while let Some(output) = listener.poll_output().unwrap() {
         if let ConnectionOutput::SendPacket(data) = output {
             let _ = caller.feed_recv_buf(&data, now);
         }
@@ -75,7 +77,7 @@ fn capture_and_transfer(
     now: Timestamp,
 ) -> Vec<u8> {
     let mut kk_fields = Vec::new();
-    while let Some(output) = caller.poll_output() {
+    while let Some(output) = caller.poll_output().unwrap() {
         if let ConnectionOutput::SendPacket(data) = output {
             if let Ok(SrtPacket::Data(packet)) = SrtPacket::decode(&data) {
                 kk_fields.push(packet.encryption_flag);
@@ -237,12 +239,12 @@ fn connected_connection_rejects_packets_for_another_socket_id() {
         ..Default::default()
     });
     establish_connection(&mut caller, &mut listener).expect("connected pair");
-    while caller.poll_output().is_some() {}
-    while listener.poll_output().is_some() {}
+    while caller.poll_output().unwrap().is_some() {}
+    while listener.poll_output().unwrap().is_some() {}
 
     caller.send(b"wrong destination", ts(20_000)).expect("send");
     let packet = loop {
-        let output = caller.poll_output().expect("data packet");
+        let output = caller.poll_output().unwrap().expect("data packet");
         if let ConnectionOutput::SendPacket(bytes) = output {
             break bytes;
         }
@@ -252,7 +254,8 @@ fn connected_connection_rejects_packets_for_another_socket_id() {
     };
     data.dest_socket_id = 0x3333;
     let mut misrouted = Vec::new();
-    data.encode(&mut misrouted);
+    data.encode(&mut misrouted)
+        .expect("packet fits configured datagram bound");
 
     let error = listener
         .feed_recv_buf(&misrouted, ts(20_001))
@@ -281,7 +284,7 @@ fn connected_connection_rejects_zero_destination_handshake() {
     });
     attacker.connect(ts(20_000)).expect("attacker starts");
     let induction = loop {
-        let output = attacker.poll_output().expect("induction output");
+        let output = attacker.poll_output().unwrap().expect("induction output");
         if let ConnectionOutput::SendPacket(bytes) = output {
             break bytes;
         }
@@ -300,19 +303,19 @@ fn test_handshake_retransmits_after_packet_loss() {
     let mut listener = SrtConnection::new_listener(test_options());
 
     caller.connect(ts(0)).expect("caller connection starts");
-    while caller.poll_output().is_some() {}
+    while caller.poll_output().unwrap().is_some() {}
 
     caller
         .handle_timer(TimerId::Handshake, ts(1_000_000))
         .expect("caller handshake retry");
     transfer_caller_to_listener(&mut caller, &mut listener, ts(1_000_000));
-    while listener.poll_output().is_some() {}
+    while listener.poll_output().unwrap().is_some() {}
 
     listener
         .handle_timer(TimerId::Handshake, ts(2_000_000))
         .expect("listener handshake retry");
     transfer_listener_to_caller(&mut listener, &mut caller, ts(2_000_000));
-    while caller.poll_output().is_some() {}
+    while caller.poll_output().unwrap().is_some() {}
 
     caller
         .handle_timer(TimerId::Handshake, ts(2_750_000))
@@ -370,7 +373,7 @@ fn encrypted_connections_generate_fresh_default_key_material() {
         caller.connect(ts(0)).expect("start caller");
         transfer_caller_to_listener(&mut caller, &mut listener, ts(0));
         transfer_listener_to_caller(&mut listener, &mut caller, ts(1));
-        while let Some(output) = caller.poll_output() {
+        while let Some(output) = caller.poll_output().unwrap() {
             if let ConnectionOutput::SendPacket(bytes) = output {
                 return bytes;
             }
@@ -398,13 +401,13 @@ fn encrypted_connection_rejects_an_explicit_all_zero_sek() {
     transfer_caller_to_listener(&mut caller, &mut listener, ts(0));
 
     let mut error = None;
-    while let Some(output) = listener.poll_output() {
+    while let Some(output) = listener.poll_output().unwrap() {
         if let ConnectionOutput::SendPacket(bytes) = output {
             error = caller.feed_recv_buf(&bytes, ts(1)).err();
         }
     }
     let error = error.expect("zero SEK must fail during induction response handling");
-    assert_eq!(error.kind, shiguredo_srt::ErrorKind::CryptoError);
+    assert_eq!(error.kind, srt_proto::ErrorKind::CryptoError);
     assert!(error.reason.contains("all zero"));
 }
 
@@ -484,7 +487,7 @@ fn listener_encryption_mismatches_fail_closed_with_km_errors() {
         transfer_listener_to_caller(&mut listener, &mut caller, ts(1));
 
         let conclusion = loop {
-            if let Some(ConnectionOutput::SendPacket(packet)) = caller.poll_output() {
+            if let Some(ConnectionOutput::SendPacket(packet)) = caller.poll_output().unwrap() {
                 break packet;
             }
         };
@@ -495,7 +498,7 @@ fn listener_encryption_mismatches_fail_closed_with_km_errors() {
         assert_eq!(listener.state(), ConnectionState::Disconnected);
 
         let caller_error = loop {
-            let output = listener.poll_output().expect("KM error response");
+            let output = listener.poll_output().unwrap().expect("KM error response");
             if let ConnectionOutput::SendPacket(packet) = output
                 && let Err(error) = caller.feed_recv_buf(&packet, ts(3))
             {
@@ -837,7 +840,7 @@ fn test_keepalive_timer() {
 
     // Keepalive パケットが送信される
     let mut has_packet = false;
-    while let Some(output) = caller.poll_output() {
+    while let Some(output) = caller.poll_output().unwrap() {
         if matches!(output, ConnectionOutput::SendPacket(_)) {
             has_packet = true;
         }
@@ -1032,7 +1035,9 @@ fn connection_stats_cover_restream_quality_inputs() {
         payload: vec![1, 2, 3].into(),
     };
     let mut encoded = Vec::new();
-    undecryptable.encode(&mut encoded);
+    undecryptable
+        .encode(&mut encoded)
+        .expect("packet fits configured datagram bound");
     assert!(listener.feed_recv_buf(&encoded, ts(130_000)).is_err());
     assert_eq!(
         listener
@@ -1071,7 +1076,9 @@ fn encrypted_connection_counts_and_rejects_plaintext_data() {
         payload: b"must be encrypted".to_vec().into(),
     };
     let mut encoded = Vec::new();
-    plaintext.encode(&mut encoded);
+    plaintext
+        .encode(&mut encoded)
+        .expect("packet fits configured datagram bound");
 
     assert!(listener.feed_recv_buf(&encoded, ts(100_000)).is_err());
     let receiver = listener.stats().receiver.expect("receiver telemetry");
@@ -1452,7 +1459,7 @@ fn test_dropped_packet_triggers_nak_then_retransmit() {
     // Deliver every DATA packet except the 6th (index 5), simulating one
     // lost packet.
     let mut idx = 0;
-    while let Some(output) = caller.poll_output() {
+    while let Some(output) = caller.poll_output().unwrap() {
         if let ConnectionOutput::SendPacket(data) = output {
             if idx != 5 {
                 let _ = listener.feed_recv_buf(&data, now);
@@ -1469,7 +1476,7 @@ fn test_dropped_packet_triggers_nak_then_retransmit() {
 
     // Transfer the listener's output (should include a NAK) to the caller.
     let mut nak_sent = false;
-    while let Some(output) = listener.poll_output() {
+    while let Some(output) = listener.poll_output().unwrap() {
         if let ConnectionOutput::SendPacket(data) = output {
             nak_sent = true;
             let _ = caller.feed_recv_buf(&data, now2);
@@ -1714,7 +1721,7 @@ fn dropreq_drops_receiver_message() {
 
     // Collect all output packets from caller.
     let mut packets = Vec::new();
-    while let Some(output) = caller.poll_output() {
+    while let Some(output) = caller.poll_output().unwrap() {
         if let ConnectionOutput::SendPacket(data) = output {
             packets.push(data);
         }
@@ -1749,18 +1756,20 @@ fn dropreq_drops_receiver_message() {
         _ => panic!("expected data packet"),
     };
 
-    let mut dropreq = shiguredo_srt::ControlPacket::new(
-        shiguredo_srt::ControlType::DropReq,
+    let mut dropreq = srt_proto::wire::ControlPacket::new(
+        srt_proto::wire::ControlType::DropReq,
         100,
         listener.socket_id(),
     );
     dropreq.type_specific_info = msg_num & 0x03FF_FFFF;
     let mut cif = Vec::new();
-    shiguredo_srt::write_u32(&mut cif, first_seq);
-    shiguredo_srt::write_u32(&mut cif, last_seq);
+    srt_proto::write_u32(&mut cif, first_seq);
+    srt_proto::write_u32(&mut cif, last_seq);
     dropreq.control_info = cif;
     let mut buf = Vec::new();
-    dropreq.encode(&mut buf);
+    dropreq
+        .encode(&mut buf)
+        .expect("packet fits configured datagram bound");
 
     listener.feed_recv_buf(&buf, now).expect("feed dropreq");
 
@@ -1779,17 +1788,19 @@ fn dropreq_rejects_high_bit_endpoints() {
         let mut listener = SrtConnection::new_listener(test_options());
         establish_connection(&mut caller, &mut listener).expect("connected");
 
-        let mut dropreq = shiguredo_srt::ControlPacket::new(
-            shiguredo_srt::ControlType::DropReq,
+        let mut dropreq = srt_proto::wire::ControlPacket::new(
+            srt_proto::wire::ControlType::DropReq,
             100,
             listener.socket_id(),
         );
         let mut cif = Vec::with_capacity(8);
-        shiguredo_srt::write_u32(&mut cif, first_seq);
-        shiguredo_srt::write_u32(&mut cif, last_seq);
+        srt_proto::write_u32(&mut cif, first_seq);
+        srt_proto::write_u32(&mut cif, last_seq);
         dropreq.control_info = cif;
         let mut encoded = Vec::new();
-        dropreq.encode(&mut encoded);
+        dropreq
+            .encode(&mut encoded)
+            .expect("packet fits configured datagram bound");
 
         let error = listener
             .feed_recv_buf(&encoded, ts(100_000))
@@ -1805,17 +1816,19 @@ fn dropreq_rejects_range_larger_than_receive_window() {
     let mut listener = SrtConnection::new_listener(test_options());
     establish_connection(&mut caller, &mut listener).expect("connected");
 
-    let mut dropreq = shiguredo_srt::ControlPacket::new(
-        shiguredo_srt::ControlType::DropReq,
+    let mut dropreq = srt_proto::wire::ControlPacket::new(
+        srt_proto::wire::ControlType::DropReq,
         100,
         listener.socket_id(),
     );
     let mut cif = Vec::with_capacity(8);
-    shiguredo_srt::write_u32(&mut cif, 0);
-    shiguredo_srt::write_u32(&mut cif, 0x7FFF_FFFF);
+    srt_proto::write_u32(&mut cif, 0);
+    srt_proto::write_u32(&mut cif, 0x7FFF_FFFF);
     dropreq.control_info = cif;
     let mut encoded = Vec::new();
-    dropreq.encode(&mut encoded);
+    dropreq
+        .encode(&mut encoded)
+        .expect("packet fits configured datagram bound");
 
     let error = listener
         .feed_recv_buf(&encoded, ts(100_000))
@@ -1890,7 +1903,7 @@ fn key_rotation_exchanges_km_control_packets_and_data_keeps_flowing() {
     const PACKETS_TO_SWITCH: u64 = 4;
     caller
         .seed_encrypted_packet_count_for_test(
-            shiguredo_srt::CryptoContext::KM_REFRESH_PERIOD - PACKETS_TO_SWITCH,
+            srt_proto::crypto::CryptoContext::KM_REFRESH_PERIOD - PACKETS_TO_SWITCH,
         )
         .expect("seed encrypted packet count for accelerated key refresh");
 

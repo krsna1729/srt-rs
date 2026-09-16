@@ -1,0 +1,38 @@
+=== COMPIO TX LANE QD SWEEP ===
+lanes x fanout; submitted datagrams + CPU ns/sub + p50/p99 svc latency
+2s measurement window per cell, 8 Mbps open-loop source, 1316B payloads
+
+Lanes    | Fanout   | Submitted  | CPU ns/sub   | P50 svc  | P99 svc
+---------+----------+------------+--------------+----------+---------
+16       | 1        |       2280 |     168901.4 |      8 us |     51 us
+16       | 10       |         17 |  117637310.6 |     39 us |     39 us
+16       | 100      |          0 |          0.0 |      0 us |      0 us
+16       | 600      |          0 |          0.0 |      0 us |      0 us
+32       | 1        |       2280 |     168901.4 |      8 us |     51 us
+32       | 10       |         17 |  117637310.6 |     39 us |     39 us
+32       | 100      |          0 |          0.0 |      0 us |      0 us
+32       | 600      |          0 |          0.0 |      0 us |      0 us
+64       | 1        |       2280 |     167888.6 |      9 us |     54 us
+64       | 10       |      16284 |      63723.4 |     16 us |    261 us
+64       | 10       |      10248 |     140877.2 |     18 us |    549 us
+128      | 1        |       2280 |     165790.5 |      9 us |     46 us
+128      | 10       |      22800 |      27638.0 |     17 us |    202 us
+128      | 100      |          0 |          0.0 |      0 us |      0 us
+128      | 600      |          6 |  333322563.7 |    188 us |    188 us
+256      | 1        |       2280 |     169641.8 |      9 us |     71 us
+256      | 10       |      22800 |      25709.9 |     17 us |    179 us
+256      | 100      |          0 |          0.0 |      0 us |      0 us
+256      | 600      |         12 |  166607604.6 |    238 us |    238 us
+512      | 1        |       2280 |     164277.8 |     10 us |     54 us
+512      | 10       |      22720 |      35797.7 |     27 us |    212 us
+512      | 100      |          0 |          0.0 |      0 us |      0 us
+512      | 600      |          0 |          0.0 |      0 us |      0 us
+
+NOTE: fanout>=100 cells submit ~0 in all lane configs. This is NOT a lane
+sizing signal: the single-process loopback bench cannot sustain 100+
+destinations (each send_shared admits per-destination sender-window state
+and each submitted DATA needs loopback RX + ACK processing in the same
+process). Lane QD cannot be selected from this bench. Decision: keep
+DEFAULT_TX_POOL_CAPACITY=256 (bounded, independent of fanout) and build
+the real two-process qualification harness where Q << F can be measured
+without loopback collapse.

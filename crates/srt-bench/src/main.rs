@@ -1,13 +1,13 @@
 //! Unified bench/scale driver over the pure-Rust SRT Core.
 //!
-//! One binary for all six runtime backends and both roles. Loss mode
-//! (connections=1) and scale mode (connections=N) are the same code path
+//! One binary for the three runtime backends (mio, tokio, compio) and both roles.
+//! Loss mode (connections=1) and scale mode (connections=N) are the same code path
 //! per runtime -- only the STATS schema differs.
 //!
 //! Usage:
 //!
 //! One run (either role):
-//!   srt-bench runtime=<mio|tokio|smol|monoio|glommio|compio> \
+//!   srt-bench runtime=<mio|tokio|compio> \
 //!     mode=sender <host> <port> <duration_secs> <latency_ms> [source_bitrate_bps] [--connections N]
 //!   srt-bench runtime=<...> mode=receiver <port> <duration_secs> <latency_ms> [--connections N]
 //!   ... plus --out FILE to append a result row.
@@ -33,8 +33,12 @@
 //! Validate every cell satisfies the canonical clean capacity predicate:
 //!   srt-bench check-clean sentinel.tsv
 //!
+//! Generate or score the fixed SRT-600 qualification corpus:
+//!   srt-bench qualify plan --out scratch/srt600-plan.tsv
+//!   srt-bench qualify score BASE.tsv HEAD.tsv
+//!
 //! Syscall/io_uring attribution for one pair (needs `perf`):
-//!   srt-bench sysprof --runtime glommio --connections 150
+//!   srt-bench sysprof --runtime compio --connections 150
 //!
 //! Live host watch while a benchmark runs:
 //!   srt-bench watch [interval_secs] [heartbeat_every_n_samples]
@@ -53,7 +57,9 @@ fn main() {
     // result schema.
     let args: Vec<String> = std::env::args().collect();
     let context = match args.get(1).map(String::as_str) {
-        Some("report" | "watch" | "compare" | "check-clean" | "classify" | "validate") => None,
+        Some(
+            "report" | "watch" | "compare" | "check-clean" | "classify" | "validate" | "qualify",
+        ) => None,
         Some("system-info") => Some("system-info"),
         Some("matrix") => Some("matrix"),
         Some("sysprof") => Some("sysprof"),
@@ -92,6 +98,10 @@ fn dispatch_subcommand(args: &[String]) -> bool {
             check_clean(args);
             true
         }
+        Some("qualify") => {
+            qualify(args);
+            true
+        }
         Some("classify") => {
             classify(args);
             true
@@ -121,6 +131,83 @@ fn dispatch_subcommand(args: &[String]) -> bool {
             true
         }
         _ => false,
+    }
+}
+
+/// `srt-bench qualify plan|score ...` -- emit the fixed SRT-600 corpus or
+/// score two bounded measurement files against one another.
+fn qualify(args: &[String]) {
+    let cli = srt_bench::Cli::parse(&args[1..]);
+    match cli.positional.first().map(String::as_str) {
+        Some("plan") => qualify_plan(&cli),
+        Some("score") => qualify_score(&cli),
+        _ => {
+            eprintln!("usage: srt-bench qualify plan [--out FILE]");
+            eprintln!("       srt-bench qualify score BASE.tsv HEAD.tsv [--noise 0.03]");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn qualify_plan(cli: &srt_bench::Cli) {
+    let output = srt_bench::qualification::render_plan();
+    if let Some(destination) = cli.flags.get("out").filter(|value| !value.is_empty()) {
+        if let Err(error) = std::fs::write(destination, output) {
+            eprintln!("qualify plan: {destination}: {error}");
+            std::process::exit(1);
+        }
+    } else {
+        print!("{output}");
+    }
+}
+
+fn qualify_score(cli: &srt_bench::Cli) {
+    if cli.positional.len() < 3 {
+        eprintln!("usage: srt-bench qualify score BASE.tsv HEAD.tsv [--noise 0.03]");
+        std::process::exit(2);
+    }
+    let policy = srt_bench::qualification::QualificationPolicy {
+        required_delivery_ratio: score_flag(cli, "delivery", 0.99),
+        max_noise_ratio: score_flag(cli, "noise", 0.03),
+        complexity_lambda: score_flag(cli, "complexity-lambda", 0.0),
+        production_loc_delta: score_flag(cli, "production-loc-delta", 0.0),
+    };
+    let baseline = score_input(&cli.positional[1]);
+    let candidate = score_input(&cli.positional[2]);
+    let report = match srt_bench::qualification::evaluate(baseline, candidate, policy) {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!("qualify score: {error}");
+            std::process::exit(2);
+        }
+    };
+    print!("{}", srt_bench::qualification::render_report(&report));
+    if !report.passed {
+        std::process::exit(1);
+    }
+}
+
+fn score_flag(cli: &srt_bench::Cli, name: &str, default: f64) -> f64 {
+    cli.flags
+        .get(name)
+        .map_or(default, |value| match value.parse() {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                eprintln!("qualify score: invalid --{name} value {value:?}");
+                std::process::exit(2);
+            }
+        })
+}
+
+fn score_input(
+    path: &str,
+) -> [srt_bench::qualification::Measurement; srt_bench::qualification::SCENARIO_COUNT] {
+    match srt_bench::qualification::read_measurements(std::path::Path::new(path)) {
+        Ok(measurements) => measurements,
+        Err(error) => {
+            eprintln!("qualify score: {error}");
+            std::process::exit(1);
+        }
     }
 }
 

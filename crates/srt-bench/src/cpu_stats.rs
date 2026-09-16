@@ -1,5 +1,5 @@
 //! Framework-agnostic process CPU/memory accounting, shared by every
-//! bench-caller/bench-listener backend (mio/tokio/smol/monoio/glommio/compio)
+//! bench-caller/bench-listener backend (mio/tokio/compio)
 //! so their STATS lines are directly comparable on resource cost, not just
 //! throughput/RTT. The driver-framework bake-off is judged on latency
 //! introduced, throughput, *and* CPU/memory.

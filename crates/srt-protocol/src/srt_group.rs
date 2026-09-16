@@ -8,6 +8,10 @@ use crate::srt_handshake::{GroupType, SRTGROUP_MASK};
 use crate::srt_packet::sequence_less_than;
 use crate::time::Timestamp;
 
+/// Hard implementation bound for one bonded group. Every group-wide scan and
+/// retained per-member queue is therefore finite even for adversarial input.
+pub const MAX_GROUP_MEMBERS: usize = 64;
+
 /// How an [`SrtGroup`] distributes payload across its members.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupMode {
@@ -68,6 +72,16 @@ pub struct GroupPacket {
     pub packet_count: u32,
     /// Reference-counted payload bytes.
     pub payload: Bytes,
+}
+
+/// Result of one bounded logical-data poll.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct GroupDataPoll {
+    /// The next deduplicated payload, if one was available within the visit.
+    pub packet: Option<GroupPacket>,
+    /// The visit reached its lifecycle-event limit. Call the bounded method
+    /// again immediately before waiting for new socket input.
+    pub continuation: bool,
 }
 
 /// One physical-leg event observed while driving an SRT group.
@@ -152,6 +166,7 @@ pub struct SrtGroup {
     next_receive_sequence: Option<u32>,
     pending: BTreeMap<u32, GroupPacket>,
     events: std::collections::VecDeque<GroupEvent>,
+    next_event_member: usize,
 }
 
 impl SrtGroup {
@@ -169,6 +184,7 @@ impl SrtGroup {
             next_receive_sequence: None,
             pending: BTreeMap::new(),
             events: std::collections::VecDeque::new(),
+            next_event_member: 0,
         })
     }
 
@@ -208,6 +224,9 @@ impl SrtGroup {
         weight: u16,
         connection: SrtConnection,
     ) -> Result<(), Error> {
+        if self.members.len() >= MAX_GROUP_MEMBERS {
+            return Err(Error::invalid_state("group member limit reached"));
+        }
         if self.member(member_id).is_some() {
             return Err(Error::invalid_state("duplicate group member ID"));
         }
@@ -262,6 +281,9 @@ impl SrtGroup {
         };
         self.purge_member_pending(member_id);
         self.members.remove(index);
+        self.next_event_member = self
+            .next_event_member
+            .min(self.members.len().saturating_sub(1));
         true
     }
 
@@ -276,7 +298,11 @@ impl SrtGroup {
         self.members[index]
             .connection
             .release_data_reservation(reserved_packets);
-        Some(self.members.remove(index).connection)
+        let connection = self.members.remove(index).connection;
+        self.next_event_member = self
+            .next_event_member
+            .min(self.members.len().saturating_sub(1));
+        Some(connection)
     }
 
     fn purge_member_pending(&mut self, member_id: u32) -> u32 {
@@ -294,13 +320,20 @@ impl SrtGroup {
     /// Send one payload through the group per its [`GroupMode`]. Returns the
     /// number of members it was actually sent on.
     pub fn send(&mut self, payload: &[u8], now: Timestamp) -> Result<usize, Error> {
-        self.send_shared(Bytes::copy_from_slice(payload), now)
+        self.refresh_states();
+        self.validate_payload_size(payload.len())?;
+        self.send_mode(Bytes::copy_from_slice(payload), now)
     }
 
     /// Send shared payload data across group members. Uses reference-counted
     /// `Bytes` to avoid deep-copying the payload for each leg.
     pub fn send_shared(&mut self, payload: Bytes, now: Timestamp) -> Result<usize, Error> {
         self.refresh_states();
+        self.validate_payload_size(payload.len())?;
+        self.send_mode(payload, now)
+    }
+
+    fn validate_payload_size(&self, payload_len: usize) -> Result<(), Error> {
         // Reject an oversized payload once, here, before the per-member fan-out.
         // `send_broadcast`/`send_backup` route a member connection's rejection
         // through `mark_send_failure`, which has no way to tell "this payload
@@ -313,12 +346,16 @@ impl SrtGroup {
         // error, not the group's.
         if let Some(&first) = self.active_indices().first() {
             let limit = self.members[first].connection.effective_max_payload_size();
-            if payload.len() > limit {
+            if payload_len > limit {
                 return Err(Error::invalid_state(
                     "payload exceeds the maximum single-packet size for this group",
                 ));
             }
         }
+        Ok(())
+    }
+
+    fn send_mode(&mut self, payload: Bytes, now: Timestamp) -> Result<usize, Error> {
         match self.mode {
             GroupMode::Broadcast => self.send_broadcast(payload, now),
             GroupMode::Backup => self.send_backup(payload, now),
@@ -392,23 +429,66 @@ impl SrtGroup {
     }
 
     /// Return the next deduplicated, in-order payload, discarding any
-    /// member-lifecycle events along the way. Applications that need those
-    /// events too should use [`Self::poll_event`] instead.
+    /// member-lifecycle events along the way. Applications that need to know
+    /// whether the bounded lifecycle drain left more work should use
+    /// [`Self::poll_data_bounded`] instead.
     pub fn poll_data(&mut self, now: Timestamp) -> Option<GroupPacket> {
-        loop {
-            match self.poll_event(now)? {
-                GroupEvent::DataReceived(packet) => return Some(packet),
+        self.poll_data_bounded(now, MAX_GROUP_MEMBERS).packet
+    }
+
+    /// Return the next deduplicated payload after at most `max_events`
+    /// lifecycle-event visits. The limit is clamped to [`MAX_GROUP_MEMBERS`]
+    /// so a caller cannot turn a single poll into an unbounded scan.
+    pub fn poll_data_bounded(&mut self, now: Timestamp, max_events: usize) -> GroupDataPoll {
+        let limit = max_events.min(MAX_GROUP_MEMBERS);
+        if limit == 0 {
+            return GroupDataPoll {
+                packet: None,
+                continuation: !self.events.is_empty() || !self.pending.is_empty(),
+            };
+        }
+        for _ in 0..limit {
+            let Some(event) = self.poll_event(now) else {
+                return GroupDataPoll {
+                    packet: None,
+                    continuation: false,
+                };
+            };
+            match event {
+                GroupEvent::DataReceived(packet) => {
+                    return GroupDataPoll {
+                        packet: Some(packet),
+                        continuation: false,
+                    };
+                }
                 GroupEvent::MemberConnected { .. }
                 | GroupEvent::MemberError { .. }
                 | GroupEvent::MemberDisconnected { .. } => {}
             }
+        }
+        GroupDataPoll {
+            packet: None,
+            continuation: true,
         }
     }
 
     /// Return the next member-lifecycle event or deduplicated group payload.
     pub fn poll_event(&mut self, now: Timestamp) -> Option<GroupEvent> {
         self.refresh_pending_states();
-        self.collect_events();
+        for _ in 0..MAX_GROUP_MEMBERS {
+            if let Some(event) = self.events.pop_front() {
+                return Some(event);
+            }
+            if !self.collect_one_event() {
+                break;
+            }
+            if let Some(event) = self.events.pop_front() {
+                return Some(event);
+            }
+            if !self.pending.is_empty() {
+                break;
+            }
+        }
         self.refresh_states();
 
         if let Some(event) = self.events.pop_front() {
@@ -520,18 +600,25 @@ impl SrtGroup {
         Ok(sequence_number)
     }
 
-    fn collect_events(&mut self) {
-        for index in 0..self.members.len() {
-            while let Some((member_id, event)) = {
-                let member = &mut self.members[index];
-                member
-                    .connection
-                    .poll_event_for_group()
-                    .map(|event| (member.id, event))
-            } {
-                self.collect_member_event(index, member_id, event);
-            }
+    fn collect_one_event(&mut self) -> bool {
+        let len = self.members.len();
+        if len == 0 {
+            return false;
         }
+        for offset in 0..len {
+            let index = (self.next_event_member + offset) % len;
+            let event = self.members[index]
+                .connection
+                .poll_event_for_group()
+                .map(|event| (self.members[index].id, event));
+            let Some((member_id, event)) = event else {
+                continue;
+            };
+            self.next_event_member = (index + 1) % len;
+            self.collect_member_event(index, member_id, event);
+            return true;
+        }
+        false
     }
 
     fn collect_member_event(&mut self, index: usize, member_id: u32, event: ConnectionEvent) {
@@ -575,8 +662,10 @@ impl SrtGroup {
                 }
             }
             ConnectionEvent::Disconnected { reason } => {
-                self.events
-                    .push_back(GroupEvent::MemberDisconnected { member_id, reason });
+                self.events.push_back(GroupEvent::MemberDisconnected {
+                    member_id,
+                    reason: reason.to_string(),
+                });
                 self.members[index].state = GroupMemberState::Broken;
                 if self.mode == GroupMode::Backup {
                     self.promote_backup_member();
@@ -734,5 +823,28 @@ impl SrtGroup {
             return;
         };
         self.members[index].state = GroupMemberState::Active;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_data_poll_reports_lifecycle_continuation() {
+        let mut group = SrtGroup::new(SRTGROUP_MASK, GroupMode::Broadcast).unwrap();
+        for member_id in 0..=MAX_GROUP_MEMBERS as u32 {
+            group
+                .events
+                .push_back(GroupEvent::MemberConnected { member_id });
+        }
+
+        let first = group.poll_data_bounded(Timestamp::default(), MAX_GROUP_MEMBERS);
+        assert!(first.packet.is_none());
+        assert!(first.continuation);
+
+        let second = group.poll_data_bounded(Timestamp::default(), MAX_GROUP_MEMBERS);
+        assert!(second.packet.is_none());
+        assert!(!second.continuation);
     }
 }

@@ -176,6 +176,17 @@ impl KeyFlag {
     }
 }
 
+/// Immutable per-datagram cryptographic reservation.
+///
+/// Reserved at packet admission so that delayed materialization into a
+/// caller-supplied buffer cannot alter which key or counter boundary
+/// the packet belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TxCryptoStamp {
+    pub key_flag: KeyFlag,
+    pub cipher_mode: CipherMode,
+}
+
 /// KM refresh state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum KmRefreshState {
@@ -652,6 +663,76 @@ impl CryptoContext {
             .encrypt_inout_detached(&nonce, header, payload)?;
         self.encrypted_packet_count += 1;
         Ok((key, tag))
+    }
+
+    /// Verify that the current key schedule is present and capable of encryption.
+    pub fn verify_can_encrypt(&self) -> Result<(), Error> {
+        match self.cipher_mode {
+            CipherMode::Ctr => {
+                let _ = self.cached_ctr(self.current_key)?;
+            }
+            CipherMode::Gcm => {
+                let _ = self.cached_gcm(self.current_key)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Reserve an immutable cryptographic stamp at packet admission.
+    ///
+    /// Validates that the active key schedule is present, increments the
+    /// encrypted packet count exactly once, and captures the key flag and cipher mode.
+    pub fn reserve_tx_stamp(&mut self) -> Result<TxCryptoStamp, Error> {
+        self.verify_can_encrypt()?;
+        let key_flag = self.current_key;
+        let cipher_mode = self.cipher_mode;
+        self.encrypted_packet_count += 1;
+        Ok(TxCryptoStamp {
+            key_flag,
+            cipher_mode,
+        })
+    }
+
+    /// Encrypt payload in place (CTR mode) using a pre-reserved stamp.
+    /// Does not advance key counters again.
+    pub fn encrypt_with_stamp(
+        &self,
+        stamp: TxCryptoStamp,
+        packet_index: u32,
+        payload: &mut [u8],
+    ) -> Result<(), Error> {
+        if stamp.cipher_mode != CipherMode::Ctr {
+            return Err(Error::crypto_error(
+                "encrypt_with_stamp called on non-CTR stamp; use encrypt_gcm_with_stamp for GCM",
+            ));
+        }
+        let iv = build_ctr_iv(&self.salt, packet_index);
+        self.cached_ctr(stamp.key_flag)?
+            .apply_keystream(&iv, payload);
+        Ok(())
+    }
+
+    /// Encrypt payload in place (GCM mode) using a pre-reserved stamp, returning
+    /// the detached authentication tag. Does not advance key counters again.
+    pub fn encrypt_gcm_with_stamp(
+        &self,
+        stamp: TxCryptoStamp,
+        packet_index: u32,
+        header: &[u8; 16],
+        payload: &mut [u8],
+    ) -> Result<[u8; GCM_TAG_LEN], Error> {
+        if stamp.cipher_mode != CipherMode::Gcm {
+            return Err(Error::crypto_error(
+                "encrypt_gcm_with_stamp called on non-GCM stamp; use encrypt_with_stamp for CTR",
+            ));
+        }
+        let iv = build_gcm_iv(&self.salt, packet_index);
+        let nonce = Nonce::try_from(iv.as_slice())
+            .map_err(|e| Error::crypto_error(format!("invalid GCM nonce: {e}")))?;
+        let tag = self
+            .cached_gcm(stamp.key_flag)?
+            .encrypt_inout_detached(&nonce, header, payload)?;
+        Ok(tag)
     }
 
     /// Decrypt data in place (CTR mode).

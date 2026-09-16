@@ -2,16 +2,102 @@
 
 Application-facing configuration and adapter plumbing between
 [`srt-protocol`](../srt-protocol) (sans-I/O) and runtime-specific I/O.
-Per-runtime `Conn` structs are feature-gated; the configuration, admission,
-socket preparation, and lifecycle surfaces are runtime-neutral.
+Runtime adapters are feature-gated; the configuration, admission, socket
+preparation, and lifecycle surfaces are runtime-neutral.
+
+## Which adapter shape an application builds against
+
+There are two shapes, and the difference decides how many OS resources a
+deployment needs per SRT destination:
+
+| Runtime | Endpoint shape | High-density shape |
+|---|---|---|
+| `mio` | `mio::Conn` — one socket, one connection | `mio::Owner` |
+| `tokio` | `tokio::Conn`, and the managed `tokio::Facade` | `tokio::Owner` |
+| `compio` | `compio::Conn` — simple endpoint / interop API | **`compio::Owner`** |
+
+`Mio` and `Tokio` are the portability/reference adapters. `Compio` is the
+production high-density substrate, and its two shapes are not
+interchangeable:
+
+* `compio::Conn` — one `SrtConnection`, one socket, one task. Correct for an
+  interop test, a reference implementation, or an application with genuinely
+  a handful of sessions.
+* `compio::Owner` — **the interface an embedding application (Restream and
+  friends) should build against.** One shared listener UDP socket plus one
+  shared caller UDP socket per owner; O(1) runtime engines per owner (a fixed
+  TX lane pool, one managed RX task per socket); bounded per-visit budgets; a
+  finite direct-final-buffer TX pool; and **no task or thread per SRT
+  destination**. A shard is one `Owner` driven by `Owner::service` and
+  `Owner::wait_for_activity`; connection count is protocol state, not
+  scheduler state.
+
+Do not integrate by spawning one `Conn` task per destination: that
+reintroduces a task per SRT stream — the cost the Owner exists to remove —
+and gives up shared-socket admission, the finite TX pool, and the bounded
+service budget at the same time.
+
+### Compio Owner: production contract
+
+* **Attach** with `Owner::listen(&ListenerConfig)` and
+  `Owner::connect(&CallerConfig, now)` only. The listener topology must be
+  `PerPort` with promotion `Never`, callers must be
+  `SocketOwnership::Shared`, and every session's wire ceiling must fit the
+  owner's. Side internals are sealed so these cannot be bypassed.
+* **Drive** with `service(now, budget)` (never blocks; every dimension
+  bounded) and `wait_for_activity(timeout)` when idle. `Owner::fault()` is
+  typed: a panicked TX lane, a short/failed send completion, a stopped
+  managed RX task, or shutdown.
+* **Shut down** with `shutdown_and_drain(timeout)`: it proves quiescence
+  (`in_flight == 0`, every lane joined, pool back to capacity) or returns
+  `false` with ownership untouched and `OwnerFault::ShutdownTimedOut`.
+* **Receive mode** is selected at attach and observable through
+  `Owner::rx_mode()`: `ManagedMultishot` (one persistent `recv_msg_multi`
+  consumer per socket over the runtime provided-buffer ring; the only
+  consumer) or `RawReadiness` (readiness wake + a raw `recvfrom` reader).
+  `RxModePolicy::ManagedRequired` makes a host without the managed substrate a
+  startup error instead of a silent degrade, and it consumes ONE observed fact:
+  `ManagedRxSubstrate`, declared once through `Owner::set_rx_substrate` from
+  `observe_production_runtime` on the exact shard runtime. `Available` means
+  **io_uring AND a registered provided-buffer ring AND a successful actual
+  `recv_msg_multi(0)` loopback completion** — the exact primitive production
+  uses, executed once at startup with a sentinel payload check, never a
+  shallow feature probe and never a first-poll `Pending`. Host capability
+  (`CompioProductionProfile::host_managed_rx_capable`) and the selected mode
+  are deliberately different facts; `ManagedRxQualification::managed_rx_active()`
+  requires both, and it is a *datapath* statement, not a workload
+  qualification.
+* **Direct final-buffer TX** is the only datapath on this path: the protocol
+  materializes into a reserved `TxPool` slot (`DatagramSink::acquire_target` →
+  `poll_output_into` → infallible `commit`), so a sink refusal can never
+  consume a protocol datagram, and `compio::Conn`'s legacy
+  `ConnectionOutput::SendPacket(Vec<u8>)` queue is never used here.
+* **A failed materialization is never "empty".** If `poll_output_into` refuses
+  a peeked datagram, the output stays queued, the visit reports
+  `OutputDrainStatus::ProtocolError`, and the affected logical session/leg is
+  quarantined with one attributed record on the table's bounded
+  `poll_output_failures` queue. Siblings keep running; the quarantined leg is
+  neither re-offered nor re-reported.
+* **One operational predicate.** `Owner::is_operational()` gates attach,
+  submission, and every `service` phase, and `service` re-evaluates it after
+  each phase that can discover a fault — so a structural completion failure or
+  a dead receive consumer stops that same visit, not the next one. Peer-local
+  and transient send failures are deliberately *not* faults: they are
+  attributed on the bounded `poll_tx_failures` queue with a `TxAttribution`
+  token (logical session + physical leg), because a `SocketAddr` cannot
+  identify a session on a shared socket.
+* **Attach is transactional.** A `listen`/`connect` that fails leaves the Owner
+  exactly as configurable as it was: no side, no claimed receive datapath, no
+  started session.
 
 ## Charter: this crate owns *things*
 
 The dividing line against [`srt-lifecycle`](../srt-lifecycle) is
 ownership, not subject matter. Both crates deal with admission:
 
-* **lifecycle takes values and returns decisions.** No sockets, no
-  clocks, no protocol objects; time is passed in.
+* **lifecycle takes values and returns decisions.** It owns policy
+  bookkeeping, but no live sockets, clocks, protocol objects, or runtime
+  resources; time is passed in.
 * **transport owns things.** Live `SrtConnection`s, their timers, file
   descriptors, counters.
 
@@ -29,22 +115,30 @@ policy); lifecycle never depends on this one.
 
 Three layers:
 
+The root is the application-facing configuration, logical-handle, bounded
+budget, and snapshot surface. Custom owners should use the explicit
+`advanced::prepared`, `advanced::admission`, `advanced::caller`,
+`advanced::group`, `advanced::driver`, `advanced::native_io`, and
+`advanced::platform` namespaces. Deadline indexes and dense slot structures
+are implementation details and are available only through the
+`bench-internals` `test_support` module.
+
 1. **Shared utilities** (always compiled, no runtime deps)
    - `ManualTimerStore` — a fixed `[Option<Timestamp>; TimerId::COUNT]`
      array with a scan on fire. Every native runtime adapter's `Conn` uses
      this same store; there is no per-runtime timer-future type.
-   - `DueIndex<K>` — a lazy-deletion deadline heap for shared loops that
+   - internal `DueIndex<K>` — a lazy-deletion deadline heap for shared loops that
      own many connections. Per-connection timer maps stay small; the index
      prevents a separate O(peers) scan just to find which maps are due.
-   - `DeadlineHeap<K>` / `HighResWaiter<K>` — one high-resolution waiter
+   - `HighResWaiter<K>` — one high-resolution waiter
      per worker (issue #82 A2). Absolute `CLOCK_MONOTONIC` deadlines in a
      min-heap, `epoll_pwait2` (nanosecond timeout) with absolute-`timerfd`
-     fallback, no per-connection spin. After a single wake the caller
-     services every due connection. This is the alternative that must be
-     tried before Route B ownership/debt changes to `SrtConnection`. See
-     [high-res-waiter.md](../../docs/perf/high-res-waiter.md).
+     fallback, no per-connection spin. `HighResWaiter::with_capacity` gives
+     each owner an explicit finite key envelope; registration and deadline
+     insertion fail at that envelope. After a single wake the caller
+     services every due connection. See [high-res-waiter.md](../../docs/perf/high-res-waiter.md).
    - `OutputDrainBudget` / `OutputDrainReport` — explicit per-tick action,
-     packet, and byte limits shared by all six output pumps. Send failures
+     packet, and byte limits shared by every runtime's output pumps. Send failures
      are returned and unsent datagrams remain queued in protocol order.
    - `RecvBatch` / `drain_recv_fd` / `tokio_transport::drain_readable` —
      reusable readiness-runtime batch receive (`recvmmsg` + optional
@@ -61,17 +155,16 @@ Three layers:
 
 2. **Admission machinery** (always compiled, runtime-neutral, does no I/O
    of its own — the caller performs every send)
-   - `PeerTable` / `AdmissionPeer` — the peers one acceptor is servicing
+   - `PeerTable` — the peers one acceptor is servicing
      off its shared listener socket, from first datagram until the
      connection is promoted, relocated, or retired. Mints each
-     connection's SYN cookie, applies cookie routing, and answers
-     `all_terminal()`.
+     connection's SYN cookie and applies cookie routing. The benchmark-only
+     `all_terminal()` helper is available only with `bench-internals`.
    - `poll_outbound()` uses a ready queue plus `DueIndex` to service only
      peers with input/output work or a due timer.
    - `poll_events()` returns unmodified `AdmissionEvent`s (including data
-     payloads) for production consumers. `drain_events()` is the legacy
-     benchmark adapter that folds those events into counters and promotion
-     timing.
+     payloads) for production consumers. The legacy `drain_events()` adapter
+     is available only with the `bench-internals` feature.
    - Bonded input is an explicit `BondedInputPolicy`: `Reject` is the default,
      preventing silent degradation into unrelated single-leg publishers.
      With `Accept`, `PeerTable` validates each leg normally, groups matching
@@ -172,14 +265,14 @@ backend by argument, not by trait object. Same rationale as
 ## Usage sketch (mio)
 
 ```rust
-use srt_transport::mio_transport::Conn;
+use srt_transport::mio::Conn;
 
 let mut conn = Conn::new(srt_connection, mio_socket);
 let report = conn.drain_outputs_bounded(now, Default::default())?;
 // A BudgetExhausted/Backpressured report means yield and service it again;
 // unsent datagrams remain queued in order.
 let timeout = conn.poll_timeout(Duration::from_millis(20), now);
-// poll.poll(&mut events, Some(timeout)); ... feed datagrams to conn.conn
+// poll.poll(&mut events, Some(timeout)); ... feed datagrams to conn.protocol_mut()
 conn.fire_expired(now);                        // service due timers
 ```
 
@@ -253,11 +346,9 @@ telemetry, security, and escape hatches, is in the workspace
 The core resolver shape is:
 
 ```rust
-use shiguredo_srt::KeyLength;
-use srt_transport::{
-    AdmissionResolution, ListenerEncryptionConfig, ListenerPeerPolicy,
-    PolicyOverride, RejectionReason,
-};
+use srt_proto::crypto::KeyLength;
+use srt_transport::{ListenerEncryptionConfig, ListenerPeerPolicy, PolicyOverride};
+use srt_transport::advanced::admission::{AdmissionResolution, RejectionReason};
 
 let outcome = peers.admit_with_resolver(
     peer,
@@ -321,7 +412,8 @@ implementation details.
 
 ## Consumers
 
-- [`srt-bench`](../srt-bench) — enables **all six features** and builds
-  one adapter binary per runtime for the bake-off.
+- [`srt-bench`](../srt-bench) — enables **all three supported runtime
+  features** (mio, tokio, compio) and builds one adapter binary per
+  runtime for the bake-off.
 - Application code should pick one feature and depend on only that
-  module (`srt_transport::<runtime>_transport::Conn`).
+  module (`srt_transport::<runtime>::Conn`).

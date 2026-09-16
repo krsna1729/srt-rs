@@ -11,6 +11,12 @@
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
+
+/// Hard upper bound for one dense routing arena. The socket-ID index is a
+/// fixed-width 32-bit namespace; keeping the low-bit slot domain at 2^16
+/// gives predictable allocation and prevents an unchecked `next_power_of_two`
+/// from turning an adversarial capacity into an overflow or an OOM.
+pub const MAX_DENSE_SLOTS: usize = 1 << 16;
 /// One peer slot returned when removing an active peer from the arena.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -80,7 +86,7 @@ pub struct DenseSlotArena<T> {
 impl<T> DenseSlotArena<T> {
     /// Create a new slot arena bounded by `max_slots`.
     pub fn new(max_slots: usize) -> Self {
-        let max_slots = max_slots.max(1);
+        let max_slots = max_slots.clamp(1, MAX_DENSE_SLOTS);
         let capacity = max_slots.max(64).next_power_of_two();
         let slot_bits = capacity.trailing_zeros();
         let slot_mask = capacity - 1;
@@ -527,6 +533,13 @@ impl<T> DenseSlotArena<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arena_clamps_adversarial_capacity_before_rounding() {
+        let arena: DenseSlotArena<()> = DenseSlotArena::new(usize::MAX);
+        assert_eq!(arena.max_slots(), MAX_DENSE_SLOTS);
+        assert!(arena.slots.len().is_power_of_two());
+    }
 
     #[test]
     fn arena_allocates_up_to_capacity_and_generates_masked_ids() {

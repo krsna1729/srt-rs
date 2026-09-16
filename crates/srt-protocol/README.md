@@ -1,4 +1,16 @@
-# shiguredo_srt
+# srt-proto
+
+The independently versioned Cargo package is `srt-proto`; its Rust library
+crate is `srt_proto`, the fork's explicit protocol namespace.
+
+The integrated endpoint intentionally keeps `ConnectionOutput::SendPacket(Vec<u8>)`
+as its simple ownership contract for the 0.1 API. Callers that own a reusable
+buffer can use `wire::*::encode_into`; a transactional direct-output API will be
+added only if allocation measurements show that the integrated endpoint needs it.
+
+`ConnectionOptions`, `ConnectionEvent`, `ConnectionOutput`, and the related
+0.1 enums remain exhaustive so callers can construct and match them directly;
+future additions require an explicit versioned API review.
 
 Sans-I/O SRT (Secure Reliable Transport) protocol implementation — the
 protocol core of this workspace. Vendored from
@@ -17,14 +29,22 @@ protocol testable, benchmarkable, and fuzzable with zero sockets.
 | Module | Contents |
 |---|---|
 | `srt_connection` | `SrtConnection` — the central state machine (handshake, encryption, keepalive, ACK/NAK scheduling, inactivity timeout) |
-| `srt_handshake` | Caller-listener handshake v4/v5: INDUCTION → CONCLUSION, extensions (HS, KM, SID, GROUP, congestion), reject reasons |
-| `srt_packet` | Wire format: `DataPacket` / `ControlPacket` decode/encode (F-bit dispatch, 16-byte header) |
-| `srt_receiver` | `ReceiverBuffer`: reordering, loss list, TSBPD delivery, ACK/NAK generation, RTT estimation, `ReceiverStats` |
-| `srt_sender` | `SenderBuffer`: flow window, congestion window, pacing (`time_until_send`), retransmit queue, `SenderStats` |
-| `srt_group` | Bonding groups: `SrtGroup` with Broadcast / Backup modes, member lifecycle, group-level send/receive |
+| `handshake` | Caller-listener handshake v4/v5: INDUCTION → CONCLUSION, extensions (HS, KM, SID, GROUP, congestion), reject reasons |
+| `wire` | Wire format: `DataPacket` / `ControlPacket` decode/encode (F-bit dispatch, 16-byte header) |
+| `receiver` | `ReceiverBuffer`: reordering, loss list, TSBPD delivery, ACK/NAK generation, RTT estimation, `ReceiverStats` |
+| `sender` | `SenderBuffer`: flow window, congestion window, pacing (`time_until_send`), retransmit queue, `SenderStats` |
+| `group` | Bonding groups: `SrtGroup` with Broadcast / Backup modes, member lifecycle, group-level send/receive |
 | `crypto` | `CryptoContext`: PBKDF2-HMAC-SHA1 KEK derivation, AES Key Wrap SEK exchange, `CipherMode::Ctr`/`Gcm` payload encryption (AES-CTR or authenticated AES-GCM); key material is redacted in `Debug` and zeroized on drop |
 | `stream_id` | StreamID + `#!::k=v,…` access-control parsing (`AccessControl`, `StreamType`, `StreamMode`) |
-| `buf`, `error`, `time` | Checked big-endian read/write cursor helpers, `Error`/`ErrorKind` with backtrace capture, `Timestamp` (µs, injected) |
+| `buf`, `error`, `time` | Internal checked big-endian cursor helpers (`raw-codec` feature for compatibility tooling), `Error`/`ErrorKind` with backtrace capture, `Timestamp` (µs, injected) |
+
+The default root exports are the complete sans-I/O endpoint surface. Protocol
+component APIs are also available under explicit namespaces: `sender`,
+`receiver`, `handshake`, `crypto`, `wire`, `group`, and `stream_id`. Those
+modules expose protocol semantics that can be composed into an alternative
+state machine; packet windows, loss bitmaps, estimators, assemblers, and raw
+cursor implementation details remain private. The untyped cursor compatibility
+surface is opt-in through the `raw-codec` feature.
 
 Handshake attempts default to libsrt-compatible 250 ms request spacing
 with non-early jitter and a 3 s deadline for the complete induction plus
@@ -35,7 +55,7 @@ timeout_micros)` before starting or admitting a connection.
 ## Core API
 
 ```rust
-use shiguredo_srt::{
+use srt_proto::{
     ConnectionOptions, ConnectionEvent, ConnectionOutput,
     ConnectionState, SrtConnection, TimerId, Timestamp,
 };
@@ -95,7 +115,8 @@ mid-handshake via `set_listener_policy(passphrase, key_length,
 tsbpd_delay, flow_window, rcvbuf)` — mirrors libsrt's accept hook. The guarded
 listener setters work only after INDUCTION has created a listening connection
 and before CONCLUSION is processed. Full-stack applications should normally
-enter that window through `srt_transport::PeerTable::admit_with_resolver`,
+enter that window through
+`srt_transport::advanced::admission::PeerTable::admit_with_resolver`,
 which preserves cookie validation, rejection delivery, deferral bounds, and
 admission telemetry; see the
 [`listener admission guide`](../../docs/listener-admission-policy.md).
@@ -125,8 +146,8 @@ reachable listener for every connection.
 ## Testing
 
 ```sh
-cargo test -p shiguredo_srt   # unit + integration + doctests
-cargo bench -p shiguredo_srt  # criterion benches:
+cargo test -p srt-proto      # unit + integration + doctests
+cargo bench -p srt-proto     # criterion benches:
                               #   core_packet_loop      per-packet CPU cost, zero I/O
                               #   core_packet_loop_io   same over real loopback UDP
                               #   receiver_loss_scan    O(n)->O(1) loss-list fix regression guard

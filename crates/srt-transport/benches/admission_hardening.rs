@@ -3,26 +3,30 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
-use shiguredo_srt::{
-    ConnectionOptions, ConnectionOutput, GroupExtensionData, GroupType, HandshakePacket,
-    SRTGROUP_MASK, SrtConnection, Timestamp,
+use srt_proto::handshake::{GroupExtensionData, GroupType, HandshakePacket, SRTGROUP_MASK};
+use srt_proto::{ConnectionOptions, ConnectionOutput, SrtConnection, Timestamp};
+use srt_transport::advanced::admission::{
+    AdmissionOptions, AdmissionResolution, BondedInputPolicy, PeerTable, PeerTableConfig,
 };
-use srt_transport::{
-    AdmissionOptions, AdmissionResolution, BondedInputPolicy, DenseDueIndex, DenseSlotArena,
-    DueIndex, IngressTelemetry, ListenerPeerPolicy, PeerTable, PeerTableConfig, PhysicalPeerKey,
-    PolicyOverride,
-};
+use srt_transport::advanced::telemetry::IngressTelemetry;
+use srt_transport::test_support::{DenseDueIndex, DenseSlotArena, DueIndex, PhysicalPeerKey};
+use srt_transport::{ListenerPeerPolicy, PolicyOverride};
 
 fn induction(socket_id: u32) -> Vec<u8> {
     let packet = HandshakePacket::new_induction_request(socket_id).encode(0, 0);
     let mut bytes = Vec::new();
-    packet.encode(&mut bytes);
+    packet
+        .encode(&mut bytes)
+        .expect("packet fits configured datagram bound");
     bytes
 }
 
 fn next_packet(connection: &mut SrtConnection) -> Vec<u8> {
     loop {
-        if let Some(ConnectionOutput::SendPacket(packet)) = connection.poll_output() {
+        if let Some(ConnectionOutput::SendPacket(packet)) = connection
+            .poll_output()
+            .expect("exact-size output materializes")
+        {
             return packet;
         }
     }

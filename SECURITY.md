@@ -3,7 +3,7 @@
 ## Supported versions
 
 This project is pre-1.0. Security fixes are made on the current default branch
-and the newest published `shiguredo_srt` release. Older canary releases are not
+and the latest `srt-proto` release once published. Older canary releases are not
 maintained.
 
 ## Reporting a vulnerability
@@ -17,7 +17,7 @@ after a fix is available.
 
 ## Protocol threat model
 
-`shiguredo_srt` parses attacker-controlled UDP datagrams. Applications must
+`srt-proto` parses attacker-controlled UDP datagrams. Applications must
 assume that source addresses can be spoofed and that packets may be duplicated,
 reordered, truncated, replayed, or intentionally malformed. The transport
 admission layer rejects malformed traffic before allocating a peer and

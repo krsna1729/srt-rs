@@ -1,8 +1,9 @@
 //! Allocation regression coverage for receiver hot paths.
 
-use shiguredo_srt::{
-    ConnectionOptions, ConnectionOutput, ConnectionState, DataPacket, PacketPosition,
-    ReceiverBuffer, SrtConnection, SrtPacket, TimerId, Timestamp,
+use srt_proto::receiver::ReceiverBuffer;
+use srt_proto::wire::{DataPacket, PacketPosition, SrtPacket};
+use srt_proto::{
+    ConnectionOptions, ConnectionOutput, ConnectionState, SrtConnection, TimerId, Timestamp,
 };
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -220,7 +221,7 @@ fn link_capacity_calculation_is_allocation_free_after_warmup() {
 
 fn drain_connection_packets(connection: &mut SrtConnection) -> Vec<Vec<u8>> {
     let mut packets = Vec::new();
-    while let Some(output) = connection.poll_output() {
+    while let Some(output) = connection.poll_output().unwrap() {
         if let ConnectionOutput::SendPacket(packet) = output {
             packets.push(packet);
         }
@@ -268,14 +269,18 @@ fn default_window_alternating_loss_connection() -> SrtConnection {
     };
     packet.sequence_number = WINDOW - 1;
     let mut encoded = Vec::new();
-    SrtPacket::Data(packet.clone()).encode(&mut encoded);
+    SrtPacket::Data(packet.clone())
+        .encode(&mut encoded)
+        .expect("packet fits configured datagram bound");
     listener
         .feed_recv_buf(&encoded, now)
         .expect("expose loss window");
     for sequence_number in (1..WINDOW - 1).step_by(2) {
         packet.sequence_number = sequence_number;
         encoded.clear();
-        SrtPacket::Data(packet.clone()).encode(&mut encoded);
+        SrtPacket::Data(packet.clone())
+            .encode(&mut encoded)
+            .expect("packet fits configured datagram bound");
         listener
             .feed_recv_buf(&encoded, now)
             .expect("recover odd packet");
@@ -294,7 +299,7 @@ fn periodic_nak_chunking_has_bounded_temporary_allocations() {
         listener
             .handle_timer(TimerId::Nak, timestamp(20_000))
             .expect("NAK timer");
-        while let Some(output) = listener.poll_output() {
+        while let Some(output) = listener.poll_output().unwrap() {
             if let ConnectionOutput::SendPacket(packet) = output {
                 wire_packets += 1;
                 wire_bytes += packet.len();

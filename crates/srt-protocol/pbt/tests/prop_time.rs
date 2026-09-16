@@ -1,7 +1,7 @@
 //! Property-based tests for Timestamp
 
 use proptest::prelude::*;
-use shiguredo_srt::Timestamp;
+use srt_proto::Timestamp;
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(1000))]

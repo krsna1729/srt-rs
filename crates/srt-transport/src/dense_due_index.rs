@@ -9,7 +9,7 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
-use shiguredo_srt::Timestamp;
+use srt_proto::Timestamp;
 
 use crate::dense_slot_arena::{DenseSlotArena, PeerSlotId};
 
@@ -112,14 +112,15 @@ impl DenseDueIndex {
         }
     }
 
-    /// Drain all deadlines due at or before `now`.
+    /// Drain every currently indexed due deadline. The index itself is
+    /// bounded by the caller-owned slot arena and stale-amplification rule.
     pub fn pop_due<T>(
         &mut self,
         now: Timestamp,
         slots: &mut DenseSlotArena<T>,
         out: &mut Vec<PeerSlotId>,
     ) {
-        let _ = self.pop_due_bounded(now, slots, usize::MAX, out);
+        let _ = self.pop_due_bounded(now, slots, self.heap.len(), out);
     }
 
     /// Drain at most `max_work` due heap entries, including stale entries.
@@ -134,7 +135,6 @@ impl DenseDueIndex {
     ) -> (usize, bool) {
         out.clear();
         let now_micros = now.as_micros();
-        let mut live_popped = false;
         let mut visited = 0;
         while let Some(Reverse(top)) = self.heap.peek()
             && top.deadline_micros <= now_micros
@@ -151,13 +151,9 @@ impl DenseDueIndex {
             ) {
                 self.live = self.live.saturating_sub(1);
                 out.push(slot_id);
-                live_popped = true;
             } else {
                 self.stale_popped += 1;
             }
-        }
-        if live_popped && max_work == usize::MAX {
-            self.maybe_rebuild(slots);
         }
         let due_remaining = self
             .heap
@@ -179,7 +175,13 @@ impl DenseDueIndex {
 
     /// Earliest live deadline, discarding stale heap heads lazily.
     pub fn peek_min_deadline<T>(&mut self, slots: &DenseSlotArena<T>) -> Option<Timestamp> {
-        while let Some(Reverse(entry)) = self.heap.peek() {
+        // Peeking never inserts entries, so the initial heap length is a hard
+        // upper bound on stale heads this call can inspect.
+        let max_work = self.heap.len();
+        for _ in 0..max_work {
+            let Some(Reverse(entry)) = self.heap.peek() else {
+                break;
+            };
             let idx = entry.slot_idx as usize;
             if slots.is_live_deadline(idx, entry.generation, entry.version, entry.deadline_micros) {
                 return Some(Timestamp::from_micros(entry.deadline_micros));

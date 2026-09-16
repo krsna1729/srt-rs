@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use shiguredo_srt::SrtPacket;
+use srt_proto::wire::SrtPacket;
 
 fuzz_target!(|data: &[u8]| {
     // パケットデコードを試行

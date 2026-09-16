@@ -7,7 +7,7 @@
 
 use bytes::Bytes;
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use shiguredo_srt::{
+use srt_proto::{
     ConnectionOptions, ConnectionOutput, ConnectionState, SrtConnection, TimerId, Timestamp,
 };
 use std::hint::black_box;
@@ -23,7 +23,7 @@ fn ts(micros: u64) -> Timestamp {
 
 fn drain_sent(conn: &mut SrtConnection) -> Vec<Vec<u8>> {
     let mut sent = Vec::new();
-    while let Some(out) = conn.poll_output() {
+    while let Some(out) = conn.poll_output().unwrap() {
         if let ConnectionOutput::SendPacket(data) = out {
             sent.push(data);
         }
@@ -101,7 +101,7 @@ fn upstream_recv(rig: &mut FanoutRig, now: Timestamp) -> Bytes {
     }
     let mut received = None;
     while let Some(event) = rig.upstream_listener.poll_event() {
-        if let shiguredo_srt::ConnectionEvent::DataReceived { payload, .. } = event {
+        if let srt_proto::ConnectionEvent::DataReceived { payload, .. } = event {
             received = Some(payload);
         }
     }

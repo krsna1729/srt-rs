@@ -9,12 +9,11 @@
 //! close the caller in an orderly way and confirm the listener observes it;
 //! then demonstrate one error path (attempting to `listen` a second time).
 
-use shiguredo_srt::{ConnectionEvent, Timestamp};
+use srt_proto::{ConnectionEvent, Timestamp};
+use srt_transport::advanced::caller::LogicalCallerState;
+use srt_transport::advanced::driver::OutputDrainBudget;
 use srt_transport::mio_transport::Owner;
-use srt_transport::{
-    CallerConfig, ListenerConfig, ListenerTopology, LogicalCallerState, OutputDrainBudget,
-    SocketOwnership,
-};
+use srt_transport::{CallerConfig, ListenerConfig, ListenerTopology, SocketOwnership};
 use std::time::{Duration, Instant};
 
 fn now_ts(start: Instant) -> Timestamp {
@@ -51,7 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ownership(SocketOwnership::Shared)
         .build()?;
     // The default allows one concurrent attempt; this first request fits.
-    let srt_transport::PoolOutcome::Admitted(caller_id) =
+    let srt_transport::advanced::caller::PoolOutcome::Admitted(caller_id) =
         owner.connect(&caller_config, now_ts(start))?
     else {
         unreachable!("the first caller fits the pool limit")

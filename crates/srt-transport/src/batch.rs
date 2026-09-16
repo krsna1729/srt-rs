@@ -12,7 +12,7 @@ use crate::{
     ManualTimerStore, OutputDrainBudget, OutputDrainReport, OutputDrainStatus, collect_output_work,
     prepend_outputs, recvmsg_batch,
 };
-use shiguredo_srt::{ConnectionOutput, SrtConnection, Timestamp};
+use srt_proto::{ConnectionOutput, SrtConnection, Timestamp};
 use std::collections::VecDeque;
 use std::io;
 use std::net::SocketAddr;
@@ -32,6 +32,13 @@ impl RecvBatch {
     /// fast path that this type was extracted from.
     pub const DEFAULT_CAPACITY: usize = 32;
     pub const DEFAULT_BUF_LEN: usize = 2048;
+    /// Hard cap for receive scratch slots allocated by one batch helper.
+    /// Larger values multiply fixed datagram buffers and are almost always a
+    /// configuration error; callers can use multiple bounded rounds instead.
+    pub const MAX_CAPACITY: usize = 1024;
+    /// Hard cap for one receive scratch buffer. UDP datagrams larger than
+    /// this are reported as truncated by the kernel and never fed to SRT.
+    pub const MAX_BUF_LEN: usize = srt_proto::wire::MAX_DATAGRAM_SIZE;
 
     #[must_use]
     pub fn new() -> Self {
@@ -40,8 +47,8 @@ impl RecvBatch {
 
     #[must_use]
     pub fn with_capacity(datagrams: usize, buf_len: usize) -> Self {
-        let datagrams = datagrams.max(1);
-        let buf_len = buf_len.max(1);
+        let datagrams = datagrams.clamp(1, Self::MAX_CAPACITY);
+        let buf_len = buf_len.clamp(1, Self::MAX_BUF_LEN);
         Self {
             bufs: (0..datagrams).map(|_| vec![0u8; buf_len]).collect(),
             sizes: vec![0; datagrams],
@@ -124,20 +131,25 @@ impl RecvBudget {
         }
     }
 
-    /// One readiness visit: `rounds` `recvmmsg` calls, each up to
-    /// [`RecvBatch::DEFAULT_CAPACITY`] datagrams.
+    /// One readiness visit expressed as receive rounds. Each round permits up
+    /// to [`RecvBatch::DEFAULT_CAPACITY`] datagrams.
     #[must_use]
     pub const fn from_rounds(rounds: usize) -> Self {
         Self::new(rounds, rounds.saturating_mul(RecvBatch::DEFAULT_CAPACITY))
     }
 
-    /// Keep calling `recvmmsg` until the socket returns 0 (EAGAIN) or a
-    /// short batch. epoll ET plus a round cap leaves datagrams in the
-    /// kernel with no further READABLE, which is how a one-socket pool
-    /// drops millions to `udp_rcvbuf_err` while userspace sits in poll.
+    /// Build a budget for a datagram quantum using the actual receive batch
+    /// capacity. The syscall count is derived, so batching and non-batching
+    /// paths expose the same maximum number of datagrams to the protocol.
     #[must_use]
-    pub const fn until_would_block() -> Self {
-        Self::new(usize::MAX, usize::MAX)
+    pub const fn for_datagrams(max_datagrams: usize, batch_capacity: usize) -> Self {
+        let capacity = if batch_capacity == 0 {
+            1
+        } else {
+            batch_capacity
+        };
+        let rounds = max_datagrams.saturating_add(capacity.saturating_sub(1)) / capacity;
+        Self::new(rounds, max_datagrams)
     }
 }
 
@@ -242,6 +254,21 @@ pub fn drain_recv_fd(
     fd: RawFd,
     batch: &mut RecvBatch,
     budget: RecvBudget,
+    on_datagram: impl FnMut(Option<SocketAddr>, &[u8]),
+) -> io::Result<RecvDrainReport> {
+    let batch_capacity = batch.capacity();
+    drain_recv_fd_with_capacity(fd, batch, budget, batch_capacity, on_datagram)
+}
+
+/// Drain a non-blocking fd with a per-visit scratch limit. The backing
+/// [`RecvBatch`] may be shared at the owner level, but `batch_capacity` keeps
+/// each leg's resolved batching policy effective instead of silently using
+/// the largest sibling capacity.
+pub(crate) fn drain_recv_fd_with_capacity(
+    fd: RawFd,
+    batch: &mut RecvBatch,
+    budget: RecvBudget,
+    batch_capacity: usize,
     mut on_datagram: impl FnMut(Option<SocketAddr>, &[u8]),
 ) -> io::Result<RecvDrainReport> {
     let mut report = RecvDrainReport::default();
@@ -255,12 +282,13 @@ pub fn drain_recv_fd(
     // the protocol. Keep a separate dequeue count so a queue full of
     // truncated packets cannot make one wake consume unbounded kernel work
     // while the visible datagram count stays at zero.
+    let batch_capacity = batch_capacity.clamp(1, batch.capacity());
     let mut dequeued = 0usize;
     for _ in 0..budget.max_rounds {
         if dequeued >= budget.max_datagrams {
             break;
         }
-        let requested = (budget.max_datagrams - dequeued).min(batch.capacity());
+        let requested = (budget.max_datagrams - dequeued).min(batch_capacity);
         let received = batch.recv(fd, requested)?;
         if received == 0 {
             report.would_block = true;
@@ -322,6 +350,61 @@ pub fn flush_destined(
         return Ok(SendFlushReport::default());
     }
     apply_send_result(packets, crate::sendmsg_batch(fd, packets))
+}
+
+#[cfg(any(feature = "mio", feature = "tokio"))]
+pub(crate) fn destined_send_limit(
+    packets: &[(SocketAddr, Vec<u8>)],
+    budget: OutputDrainBudget,
+) -> usize {
+    let mut limit = packets.len().min(budget.max_actions);
+    limit = limit.min(budget.max_packets);
+    if budget.max_bytes == 0 {
+        return 0;
+    }
+    let mut bytes = 0usize;
+    let mut count = 0usize;
+    while count < limit {
+        let next = bytes.saturating_add(packets[count].1.len());
+        // Permit one oversized datagram so a packet larger than the
+        // remaining byte allowance cannot strand the queue forever.
+        if count > 0 && next > budget.max_bytes {
+            break;
+        }
+        bytes = next;
+        count += 1;
+    }
+    count
+}
+
+#[cfg(feature = "mio")]
+pub(crate) fn flush_destined_bounded(
+    fd: RawFd,
+    packets: &mut Vec<(SocketAddr, Vec<u8>)>,
+    budget: OutputDrainBudget,
+) -> io::Result<SendFlushReport> {
+    let limit = destined_send_limit(packets, budget);
+    if limit == 0 {
+        return Ok(SendFlushReport::default());
+    }
+    match crate::sendmsg_batch(fd, &packets[..limit]) {
+        Ok(sent) if sent <= limit => {
+            packets.drain(..sent);
+            Ok(SendFlushReport {
+                sent,
+                would_block: sent < limit,
+            })
+        }
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "sendmmsg reported more datagrams than supplied",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(SendFlushReport {
+            would_block: true,
+            ..SendFlushReport::default()
+        }),
+        Err(error) => Err(error),
+    }
 }
 
 fn collect_packet_batch(work: &mut VecDeque<ConnectionOutput>, first: Vec<u8>) -> Vec<Vec<u8>> {
@@ -435,7 +518,8 @@ pub(crate) fn drain_connected_outputs<F>(
 where
     F: FnMut(&[Vec<u8>]) -> io::Result<usize>,
 {
-    let (work, budget_exhausted) = collect_output_work(conn, pending, budget);
+    let (work, budget_exhausted) = collect_output_work(conn, pending, budget)
+        .map_err(|error| io::Error::other(error.to_string()))?;
     let report = OutputDrainReport {
         status: if budget_exhausted {
             OutputDrainStatus::BudgetExhausted
@@ -451,12 +535,39 @@ where
 mod tests {
     use super::*;
     use crate::*;
-    use shiguredo_srt::{ConnectionOptions, ConnectionOutput, TimerId, Timestamp};
+    use srt_proto::{ConnectionOptions, ConnectionOutput, TimerId, Timestamp};
     use std::collections::VecDeque;
     use std::io;
 
     fn pkt(value: u8) -> (SocketAddr, Vec<u8>) {
         (SocketAddr::from(([127, 0, 0, 1], 9000)), vec![value])
+    }
+
+    #[cfg(any(feature = "mio", feature = "tokio"))]
+    #[test]
+    fn destined_send_limit_honors_action_packet_and_byte_caps() {
+        let packets = vec![
+            (SocketAddr::from(([127, 0, 0, 1], 9000)), vec![0; 4]),
+            (SocketAddr::from(([127, 0, 0, 1], 9000)), vec![0; 4]),
+            (SocketAddr::from(([127, 0, 0, 1], 9000)), vec![0; 4]),
+        ];
+        assert_eq!(
+            destined_send_limit(&packets, OutputDrainBudget::new(2, 2, 5)),
+            1
+        );
+        assert_eq!(
+            destined_send_limit(&packets, OutputDrainBudget::new(2, 0, 5)),
+            0
+        );
+        assert_eq!(
+            destined_send_limit(&packets, OutputDrainBudget::new(2, 2, 0)),
+            0
+        );
+        let mut remaining = OutputDrainBudget::new(4, 1, 8);
+        remaining.consume(0, 1, 4);
+        assert_eq!(remaining.max_actions, 4);
+        assert_eq!(remaining.max_packets, 0);
+        assert_eq!(remaining.max_bytes, 4);
     }
 
     fn ids(packets: &[(SocketAddr, Vec<u8>)]) -> Vec<u8> {
@@ -468,6 +579,31 @@ mod tests {
         conn.connect(Timestamp::from_micros(0))
             .expect("connect starts");
         conn
+    }
+
+    #[test]
+    fn exhausted_action_budget_does_not_collect_one_extra_output() {
+        let mut conn = caller_with_output();
+        let mut pending = VecDeque::new();
+        let (work, exhausted) =
+            collect_output_work(&mut conn, &mut pending, OutputDrainBudget::new(0, 1, 1024))
+                .expect("collection is infallible here");
+        assert!(work.is_empty());
+        assert!(exhausted);
+        assert!(
+            conn.poll_output()
+                .expect("exact-size output materializes")
+                .is_some(),
+            "the output must remain queued"
+        );
+    }
+
+    #[test]
+    fn receive_batch_clamps_adversarial_capacity() {
+        let batch = RecvBatch::with_capacity(usize::MAX, 1);
+        assert_eq!(batch.capacity(), RecvBatch::MAX_CAPACITY);
+        let wide = RecvBatch::with_capacity(1, usize::MAX);
+        assert_eq!(wide.bufs[0].len(), RecvBatch::MAX_BUF_LEN);
     }
 
     #[test]
@@ -570,7 +706,7 @@ mod tests {
     }
 
     #[test]
-    fn until_would_block_drains_past_a_round_cap() {
+    fn finite_budget_drains_past_a_round_cap() {
         use std::os::fd::AsRawFd;
         let receiver = std::net::UdpSocket::bind("127.0.0.1:0").expect("receiver");
         receiver.set_nonblocking(true).expect("nonblocking");
@@ -580,13 +716,13 @@ mod tests {
             RecvBudget::from_rounds(32).max_datagrams,
             RecvBatch::DEFAULT_CAPACITY * 32
         );
-        assert_eq!(RecvBudget::until_would_block().max_rounds, usize::MAX);
         const N: usize = RecvBatch::DEFAULT_CAPACITY + 16;
         for i in 0..N {
             sender.send_to(&[i as u8], dest).expect("send");
         }
 
         let mut batch = RecvBatch::new();
+        let batch_capacity = batch.capacity();
         let mut capped = 0usize;
         drain_recv_fd(
             receiver.as_raw_fd(),
@@ -601,7 +737,7 @@ mod tests {
         drain_recv_fd(
             receiver.as_raw_fd(),
             &mut batch,
-            RecvBudget::until_would_block(),
+            RecvBudget::for_datagrams(N, batch_capacity),
             |_, _| rest += 1,
         )
         .expect("remainder drain");
@@ -614,7 +750,7 @@ mod tests {
         drain_recv_fd(
             receiver.as_raw_fd(),
             &mut batch,
-            RecvBudget::until_would_block(),
+            RecvBudget::for_datagrams(N, batch_capacity),
             |_, _| all += 1,
         )
         .expect("full drain");
@@ -646,13 +782,14 @@ mod tests {
             }
 
             let mut batch = RecvBatch::new();
+            let batch_capacity = batch.capacity();
             let mut delivered = Vec::new();
             loop {
                 let mut this_round = Vec::new();
                 let report = drain_recv_fd(
                     receiver.as_raw_fd(),
                     &mut batch,
-                    RecvBudget::new(usize::MAX, max_datagrams),
+                    RecvBudget::for_datagrams(max_datagrams, batch_capacity),
                     |_, data| this_round.push(data[0]),
                 )
                 .expect("drain");
@@ -702,6 +839,7 @@ mod tests {
         sender.send_to(b"queued", dest).expect("send");
 
         let mut batch = RecvBatch::new();
+        let batch_capacity = batch.capacity();
 
         let mut zero_rounds_calls = 0usize;
         let report = drain_recv_fd(
@@ -730,7 +868,7 @@ mod tests {
         drain_recv_fd(
             receiver.as_raw_fd(),
             &mut batch,
-            RecvBudget::until_would_block(),
+            RecvBudget::for_datagrams(1, batch_capacity),
             |_, data| got.push(data.to_vec()),
         )
         .expect("real drain");

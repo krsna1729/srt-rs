@@ -1,13 +1,13 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use shiguredo_srt::{
-    ConnectionOptions, ConnectionOutput, ControlPacket, ControlType, SrtConnection, TimerId,
-    Timestamp, DEFAULT_MTU, write_u32,
-};
+use srt_proto::{ConnectionOptions, ConnectionOutput, SrtConnection, TimerId, Timestamp};
+use srt_proto::handshake::DEFAULT_MTU;
+use srt_proto::wire::{ControlPacket, ControlType};
+use srt_proto::write_u32;
 
 fn transfer(from: &mut SrtConnection, to: &mut SrtConnection, now: Timestamp) {
-    while let Some(output) = from.poll_output() {
+    while let Some(output) = from.poll_output().unwrap() {
         if let ConnectionOutput::SendPacket(packet) = output {
             assert!(packet.len() <= DEFAULT_MTU as usize);
             let _ = to.feed_recv_buf(&packet, now);
@@ -23,8 +23,8 @@ fn connected_pair() -> Option<(SrtConnection, SrtConnection)> {
         let now = Timestamp::from_micros(round * 1_000);
         transfer(&mut caller, &mut listener, now);
         transfer(&mut listener, &mut caller, now);
-        if caller.state() == shiguredo_srt::ConnectionState::Connected
-            && listener.state() == shiguredo_srt::ConnectionState::Connected
+        if caller.state() == srt_proto::ConnectionState::Connected
+            && listener.state() == srt_proto::ConnectionState::Connected
         {
             return Some((caller, listener));
         }
@@ -57,7 +57,7 @@ fn feed_drop_req(target: &mut SrtConnection, input: &[u8], now: Timestamp) {
     write_u32(&mut packet.control_info, first_seq);
     write_u32(&mut packet.control_info, last_seq);
     let mut encoded = Vec::new();
-    packet.encode(&mut encoded);
+    packet.encode(&mut encoded).expect("packet fits configured datagram bound");
     let _ = target.feed_recv_buf(&encoded, now);
 }
 
@@ -77,7 +77,7 @@ fn feed_nak(target: &mut SrtConnection, input: &[u8], now: Timestamp) {
         write_u32(&mut packet.control_info, last_seq);
     }
     let mut encoded = Vec::new();
-    packet.encode(&mut encoded);
+    packet.encode(&mut encoded).expect("packet fits configured datagram bound");
     let _ = target.feed_recv_buf(&encoded, now);
 }
 

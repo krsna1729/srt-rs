@@ -6,7 +6,9 @@
 use std::net::UdpSocket;
 use std::time::{Duration, Instant};
 
-use srt_transport::{HighResWaiter, MonotonicDeadline, PlannedWait, WaitBackend, plan_wait};
+use srt_transport::advanced::native_io::{
+    HighResWaiter, MonotonicDeadline, PlannedWait, WaitBackend, plan_wait,
+};
 
 fn backends() -> Vec<WaitBackend> {
     let mut out = vec![WaitBackend::AbsoluteTimerFd];
@@ -44,9 +46,15 @@ fn wait_returns_every_due_connection_after_one_park() {
     for backend in backends() {
         let mut waiter = HighResWaiter::with_backend(backend).expect("waiter");
         let now = MonotonicDeadline::now();
-        waiter.set_deadline(1, now);
-        waiter.set_deadline(2, now);
-        waiter.set_deadline(3, now.saturating_add(Duration::from_secs(30)));
+        waiter
+            .set_deadline(1, now)
+            .expect("deadline within waiter capacity");
+        waiter
+            .set_deadline(2, now)
+            .expect("deadline within waiter capacity");
+        waiter
+            .set_deadline(3, now.saturating_add(Duration::from_secs(30)))
+            .expect("deadline within waiter capacity");
         let mut due = Vec::new();
         let mut ready = Vec::new();
         let outcome = waiter.wait(&mut due, &mut ready).expect("wait");
@@ -60,10 +68,36 @@ fn wait_returns_every_due_connection_after_one_park() {
 }
 
 #[test]
+fn wait_reports_and_drains_due_continuations_without_losing_deadlines() {
+    for backend in backends() {
+        let mut waiter = HighResWaiter::with_backend(backend).expect("waiter");
+        let now = MonotonicDeadline::now();
+        for key in 0..65u32 {
+            waiter
+                .set_deadline(key, now)
+                .expect("deadline within waiter capacity");
+        }
+        let mut due = Vec::new();
+        let mut ready = Vec::new();
+        let first = waiter.wait(&mut due, &mut ready).expect("first wait");
+        assert_eq!(due.len(), 64);
+        assert!(first.due_remaining);
+        let second = waiter
+            .wait(&mut due, &mut ready)
+            .expect("continuation wait");
+        assert_eq!(due.len(), 1);
+        assert!(!second.due_remaining);
+        assert_eq!(waiter.deadline_len(), 0);
+    }
+}
+
+#[test]
 fn consumed_deadline_is_not_rearmed_so_the_next_wait_does_not_spin() {
     for backend in backends() {
         let mut waiter = HighResWaiter::with_backend(backend).expect("waiter");
-        waiter.set_deadline(1, MonotonicDeadline::now());
+        waiter
+            .set_deadline(1, MonotonicDeadline::now())
+            .expect("deadline within waiter capacity");
         let mut due = Vec::new();
         let mut ready = Vec::new();
         let first = waiter.wait(&mut due, &mut ready).expect("first");
@@ -87,7 +121,9 @@ fn immediate_waits_do_not_busy_loop_inside_the_waiter() {
     let mut ready = Vec::new();
     let start = Instant::now();
     for i in 0..64u32 {
-        waiter.set_deadline(i, MonotonicDeadline::now());
+        waiter
+            .set_deadline(i, MonotonicDeadline::now())
+            .expect("deadline within waiter capacity");
         let outcome = waiter.wait(&mut due, &mut ready).expect("immediate");
         assert_eq!(outcome.park_count, 1);
         assert!(outcome.planned.is_immediate());
@@ -104,7 +140,9 @@ fn future_deadline_blocks_without_a_spin_tail() {
     for backend in backends() {
         let mut waiter = HighResWaiter::with_backend(backend).expect("waiter");
         let delay = Duration::from_millis(3);
-        waiter.set_deadline(1, MonotonicDeadline::after(delay));
+        waiter
+            .set_deadline(1, MonotonicDeadline::after(delay))
+            .expect("deadline within waiter capacity");
         let mut due = Vec::new();
         let mut ready = Vec::new();
         let start = Instant::now();
@@ -133,7 +171,9 @@ fn socket_readiness_wakes_before_a_distant_deadline() {
         waiter
             .register(11, std::os::fd::AsRawFd::as_raw_fd(&rx))
             .expect("register");
-        waiter.set_deadline(11, MonotonicDeadline::after(Duration::from_secs(30)));
+        waiter
+            .set_deadline(11, MonotonicDeadline::after(Duration::from_secs(30)))
+            .expect("deadline within waiter capacity");
         tx.send_to(b"wake", rx.local_addr().expect("rx addr"))
             .expect("send");
 
@@ -159,7 +199,9 @@ fn worker_loop_services_every_due_key_after_one_wake() {
     let mut waiter = HighResWaiter::<u32>::new().expect("waiter");
     let now = MonotonicDeadline::now();
     for key in 1..=5 {
-        waiter.set_deadline(key, now);
+        waiter
+            .set_deadline(key, now)
+            .expect("deadline within waiter capacity");
     }
     let mut due = Vec::new();
     let mut ready = Vec::new();

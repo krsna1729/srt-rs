@@ -19,7 +19,7 @@
 //! hiding in the amortized larger-batch numbers.
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use shiguredo_srt::{
+use srt_proto::{
     ConnectionEvent, ConnectionOptions, ConnectionOutput, ConnectionState, SrtConnection, TimerId,
     Timestamp,
 };
@@ -49,7 +49,7 @@ fn connection_options(passphrase: Option<&str>) -> ConnectionOptions {
 }
 
 fn drain_sent(conn: &mut SrtConnection, sock: &UdpSocket) {
-    while let Some(out) = conn.poll_output() {
+    while let Some(out) = conn.poll_output().unwrap() {
         if let ConnectionOutput::SendPacket(data) = out {
             let _ = sock.send(&data);
         }

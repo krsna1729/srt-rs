@@ -12,9 +12,9 @@
 //! isolated C throughput floor in `test/native/srt-scaling/`.
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use shiguredo_srt::{
-    CipherMode, ConnectionOptions, ConnectionOutput, ConnectionState, SrtConnection, TimerId,
-    Timestamp,
+use srt_proto::crypto::CipherMode;
+use srt_proto::{
+    ConnectionOptions, ConnectionOutput, ConnectionState, SrtConnection, TimerId, Timestamp,
 };
 use std::hint::black_box;
 
@@ -45,7 +45,7 @@ fn ts(micros: u64) -> Timestamp {
 /// already uses for exactly this reason.
 fn drain_sent(conn: &mut SrtConnection) -> Vec<Vec<u8>> {
     let mut sent = Vec::new();
-    while let Some(out) = conn.poll_output() {
+    while let Some(out) = conn.poll_output().unwrap() {
         if let ConnectionOutput::SendPacket(data) = out {
             sent.push(data);
         }

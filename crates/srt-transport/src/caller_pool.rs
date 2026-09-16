@@ -9,15 +9,26 @@
 //! Deliberately socket-agnostic, like [`CallerTable`] itself: this is pure
 //! admission-control/scheduling state, with no socket of its own. An
 //! application (or [`crate::mio_transport::Owner`]) still owns the actual
-//! egress socket and drives `feed`/`poll_outbound_bounded` on
-//! [`CallerPool::table`]/[`CallerPool::table_mut`] exactly as it would
-//! against a bare [`CallerTable`].
+//! egress socket and drives [`CallerPool::feed`] and
+//! [`CallerPool::poll_outbound_bounded`] exactly as it would against a bare
+//! [`CallerTable`].
 
-use crate::{CallerLeg, CallerTable, LogicalCallerId, PreparedCaller, RemovedLogicalCaller};
-use shiguredo_srt::Timestamp;
+use crate::{
+    CallerEvent, CallerLeg, CallerTable, DEFAULT_MAX_CALLERS, DatagramSink, LogicalCaller,
+    LogicalCallerId, LogicalCallerMut, MAX_CALLERS, OutputDrainBudget, OutputDrainReport,
+    PreparedCaller, RemovedLogicalCaller,
+};
+use srt_proto::Timestamp;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::num::NonZeroUsize;
 use std::time::Duration;
+
+/// Hard cap for concurrent caller attempts owned by one pool. It matches the
+/// maximum logical caller-table shard size, so the pool cannot accept a limit
+/// its underlying table cannot represent without allocation growth.
+pub const MAX_CALLER_POOL_IN_FLIGHT: usize = MAX_CALLERS;
+/// Hard cap for queued caller requests retained by one pool.
+pub const MAX_CALLER_POOL_QUEUE: usize = MAX_CALLERS;
 
 /// Stable identity for a request retained by the legacy queue. IDs never
 /// wrap, so a cancelled queue entry cannot alias a later request.
@@ -139,6 +150,10 @@ pub struct CallerPool {
     expired: u64,
     failed: u64,
     cancelled: u64,
+    /// Table-owned reusable scratch for bounded expiration visits. Holds at
+    /// most `max_actions` candidates per visit; retained across visits so
+    /// the production path never allocates.
+    visit_scratch: Vec<PoolDeadline>,
 }
 
 impl CallerPool {
@@ -160,9 +175,11 @@ impl CallerPool {
         attempt_deadline: Duration,
         queue_capacity: usize,
     ) -> Self {
+        let max_in_flight = max_in_flight.get().min(MAX_CALLER_POOL_IN_FLIGHT);
+        let queue_capacity = queue_capacity.min(MAX_CALLER_POOL_QUEUE);
         Self {
-            callers: CallerTable::new(),
-            max_in_flight: max_in_flight.get(),
+            callers: CallerTable::with_max_callers(max_in_flight.max(DEFAULT_MAX_CALLERS)),
+            max_in_flight,
             attempt_deadline_micros: u64::try_from(attempt_deadline.as_micros())
                 .unwrap_or(u64::MAX),
             in_flight: HashMap::new(),
@@ -177,6 +194,7 @@ impl CallerPool {
             expired: 0,
             failed: 0,
             cancelled: 0,
+            visit_scratch: Vec::new(),
         }
     }
 
@@ -187,24 +205,96 @@ impl CallerPool {
         &self.callers
     }
 
-    /// Mutable access to the underlying table, for the parts of its API
-    /// this pool does not need to intercept (`feed`, `poll_outbound_bounded`,
-    /// `logical_caller_mut`, ...). Do not call `add_direct`/`remove` on it
-    /// directly for a pooled attempt -- use [`Self::connect`] and
-    /// [`Self::poll_expirations`] instead, or `in_flight`/`queue` here will
-    /// silently drift from the table's real contents.
-    pub fn table_mut(&mut self) -> &mut CallerTable {
+    /// Internal mutable access for runtime adapters. Application code should
+    /// use the forwarding methods below so pool admission bookkeeping cannot
+    /// be bypassed accidentally.
+    #[cfg(any(
+        test,
+        feature = "mio",
+        feature = "tokio",
+        feature = "compio",
+        feature = "bench-internals"
+    ))]
+    #[allow(dead_code)]
+    pub(crate) fn table_mut(&mut self) -> &mut CallerTable {
         &mut self.callers
     }
 
-    fn allocate_request_id(&mut self) -> PoolRequestId {
+    #[cfg(any(test, feature = "bench-internals"))]
+    /// Internal mutable access for harness benchmarks only.
+    pub fn bench_table_mut(&mut self) -> &mut CallerTable {
+        &mut self.callers
+    }
+
+    /// Feed one datagram into the pooled caller table.
+    pub fn feed(
+        &mut self,
+        peer: std::net::SocketAddr,
+        data: &[u8],
+        now: Timestamp,
+    ) -> Result<bool, srt_proto::Error> {
+        self.callers.feed(peer, data, now)
+    }
+
+    /// Drain caller output for the application-owned socket.
+    pub fn poll_outbound(
+        &mut self,
+        now: Timestamp,
+        out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
+    ) {
+        self.callers.poll_outbound(now, out);
+    }
+
+    /// Drain caller output with an explicit work budget.
+    pub fn poll_outbound_bounded(
+        &mut self,
+        now: Timestamp,
+        budget: OutputDrainBudget,
+        out: &mut Vec<(std::net::SocketAddr, Vec<u8>)>,
+    ) -> OutputDrainReport {
+        self.callers.poll_outbound_bounded(now, budget, out)
+    }
+
+    /// Drain caller output with an explicit work budget into any [`DatagramSink`].
+    pub fn poll_outbound_bounded_to<S: DatagramSink + ?Sized>(
+        &mut self,
+        now: Timestamp,
+        budget: OutputDrainBudget,
+        sink: &mut S,
+    ) -> OutputDrainReport {
+        self.callers.poll_outbound_bounded_to(now, budget, sink)
+    }
+
+    /// Drain caller protocol events with an explicit event bound.
+    pub fn poll_events_bounded(&mut self, max_events: usize, out: &mut Vec<CallerEvent>) -> bool {
+        self.callers.poll_events_bounded(max_events, out)
+    }
+
+    /// Drain caller protocol events using the default finite work bound.
+    pub fn poll_events(&mut self, out: &mut Vec<CallerEvent>) {
+        self.callers.poll_events(out);
+    }
+
+    /// Borrow one logical caller without exposing the table itself.
+    #[must_use]
+    pub fn logical_caller(&self, id: &LogicalCallerId) -> Option<LogicalCaller<'_>> {
+        self.callers.logical_caller(id)
+    }
+
+    /// Mutably borrow one logical caller without exposing admission methods.
+    pub fn logical_caller_mut(&mut self, id: &LogicalCallerId) -> Option<LogicalCallerMut<'_>> {
+        self.callers.logical_caller_mut(id)
+    }
+
+    fn allocate_request_id(&mut self) -> Result<PoolRequestId, srt_proto::Error> {
         let id = PoolRequestId(self.next_request_id);
-        // `saturating_add`, not `wrapping_add`: the type's own doc comment
-        // promises IDs never wrap, so a cancelled queue entry can never
-        // alias a later request -- a `wrapping_add` would contradict that
-        // after 2^64 requests instead of just saturating.
-        self.next_request_id = self.next_request_id.saturating_add(1);
-        id
+        self.next_request_id = self.next_request_id.checked_add(1).ok_or_else(|| {
+            srt_proto::Error::with_reason(
+                srt_proto::ErrorKind::InvalidState,
+                "caller pool request ID space exhausted",
+            )
+        })?;
+        Ok(id)
     }
 
     /// Retain a lifecycle event (finding 9), dropping the oldest once the
@@ -221,8 +311,14 @@ impl CallerPool {
     /// Drain retained lifecycle events: correlates a request with its
     /// eventual admission, failure, expiry, or cancellation (finding 9).
     pub fn poll_outcomes(&mut self, out: &mut Vec<PoolEvent>) {
+        self.poll_outcomes_bounded(crate::OutputDrainBudget::default().max_actions, out);
+    }
+
+    /// Drain at most `max_events` retained lifecycle outcomes.
+    pub fn poll_outcomes_bounded(&mut self, max_events: usize, out: &mut Vec<PoolEvent>) {
         out.clear();
-        out.extend(self.outcomes.drain(..));
+        let count = max_events.min(self.outcomes.len());
+        out.extend(self.outcomes.drain(..count));
     }
 
     /// Request one outbound connection. Admits it immediately (starting
@@ -235,8 +331,8 @@ impl CallerPool {
         &mut self,
         prepared: PreparedCaller,
         now: Timestamp,
-    ) -> Result<PoolOutcome, shiguredo_srt::Error> {
-        let request_id = self.allocate_request_id();
+    ) -> Result<PoolOutcome, srt_proto::Error> {
+        let request_id = self.allocate_request_id()?;
         if self.in_flight.len() < self.max_in_flight {
             let id = self.admit(request_id, prepared, now)?;
             self.push_outcome(PoolEvent::Admitted {
@@ -261,12 +357,9 @@ impl CallerPool {
         request_id: PoolRequestId,
         prepared: PreparedCaller,
         now: Timestamp,
-    ) -> Result<LogicalCallerId, shiguredo_srt::Error> {
+    ) -> Result<LogicalCallerId, srt_proto::Error> {
         let connection = prepared.connection(now).map_err(|error| {
-            shiguredo_srt::Error::with_reason(
-                shiguredo_srt::ErrorKind::InvalidState,
-                error.to_string(),
-            )
+            srt_proto::Error::with_reason(srt_proto::ErrorKind::InvalidState, error.to_string())
         })?;
         let leg = CallerLeg::new(prepared.remote, connection);
         let id = self.callers.add_direct(leg)?;
@@ -282,15 +375,16 @@ impl CallerPool {
             deadline_micros,
             caller_id: id,
         });
-        self.started += 1;
+        self.started = self.started.saturating_add(1);
         Ok(id)
     }
 
     /// Admit queued requests into whatever permits are currently free,
     /// each with its deadline starting now (not whenever it was
     /// originally requested).
-    fn admit_queued(&mut self, now: Timestamp) {
-        while self.in_flight.len() < self.max_in_flight {
+    fn admit_queued(&mut self, now: Timestamp, max_actions: usize) -> usize {
+        let mut actions = 0;
+        while actions < max_actions && self.in_flight.len() < self.max_in_flight {
             let Some(QueuedConnect {
                 request_id,
                 prepared,
@@ -298,6 +392,7 @@ impl CallerPool {
             else {
                 break;
             };
+            actions += 1;
             match self.admit(request_id, prepared, now) {
                 Ok(id) => self.push_outcome(PoolEvent::Admitted {
                     request_id,
@@ -315,6 +410,7 @@ impl CallerPool {
                 }
             }
         }
+        actions
     }
 
     /// Retire every in-flight attempt that reached `attempt_deadline`
@@ -326,7 +422,7 @@ impl CallerPool {
     ///
     /// Returns the ids retired for missing their deadline.
     pub fn poll_expirations(&mut self, now: Timestamp) -> Vec<LogicalCallerId> {
-        self.poll_expirations_bounded(now, usize::MAX)
+        self.poll_expirations_bounded(now, crate::OutputDrainBudget::default().max_actions)
     }
 
     /// Bounded counterpart to [`Self::poll_expirations`] (finding 3/10):
@@ -338,16 +434,59 @@ impl CallerPool {
         now: Timestamp,
         max_actions: usize,
     ) -> Vec<LogicalCallerId> {
-        use shiguredo_srt::ConnectionState;
+        self.poll_expirations_bounded_with_visits(now, max_actions)
+            .0
+    }
+
+    /// Count-only maintenance: identical bounded work to
+    /// [`Self::poll_expirations_bounded_with_visits`], without materializing
+    /// the retired ids.
+    ///
+    /// The production Compio Owner only needs the visit count (it surfaces
+    /// retired sessions through `PoolEvent`s it already drains), so this path
+    /// allocates nothing at all -- an `Option<&mut Vec>` that stays `None`
+    /// rather than a fresh `Vec` the caller would immediately discard.
+    pub(crate) fn poll_expirations_count_only(
+        &mut self,
+        now: Timestamp,
+        max_actions: usize,
+    ) -> usize {
+        self.expire_due(now, max_actions, None)
+    }
+
+    pub(crate) fn poll_expirations_bounded_with_visits(
+        &mut self,
+        now: Timestamp,
+        max_actions: usize,
+    ) -> (Vec<LogicalCallerId>, usize) {
+        let mut retired = Vec::new();
+        let visits = self.expire_due(now, max_actions, Some(&mut retired));
+        (retired, visits)
+    }
+
+    /// The single bounded expiration pass. `retired` is `None` for the
+    /// count-only path, which is what keeps that path allocation-free.
+    fn expire_due(
+        &mut self,
+        now: Timestamp,
+        max_actions: usize,
+        mut retired: Option<&mut Vec<LogicalCallerId>>,
+    ) -> usize {
+        use srt_proto::ConnectionState;
         if max_actions == 0 {
-            return Vec::new();
+            return 0;
         }
         let now_micros = now.as_micros();
-        let candidates: Vec<PoolDeadline> =
-            self.deadlines.iter().take(max_actions).copied().collect();
-        let mut expired = Vec::new();
-        let mut resolved = Vec::new();
-        for candidate in candidates {
+        // Non-allocating production path: reuse table-owned scratch for
+        self.visit_scratch.clear();
+        self.visit_scratch
+            .extend(self.deadlines.iter().take(max_actions).copied());
+        let candidate_actions = self.visit_scratch.len();
+        let mut expired_count = 0usize;
+        let mut idx = 0;
+        while idx < self.visit_scratch.len() {
+            let candidate = self.visit_scratch[idx];
+            idx += 1;
             // `raw_direct_state`, not `LogicalCallerState`: the latter
             // folds `Closing` into the same `Connecting` value as a
             // session that has never connected at all, which would make a
@@ -367,31 +506,31 @@ impl CallerPool {
                     ConnectionState::Connected
                     | ConnectionState::Disconnected
                     | ConnectionState::Closing,
-                ) => resolved.push(candidate),
-                Some(_) if candidate.deadline_micros <= now_micros => expired.push(candidate),
+                ) => {
+                    self.deadlines.remove(&candidate);
+                    self.in_flight.remove(&candidate.caller_id);
+                }
+                Some(_) if candidate.deadline_micros <= now_micros => {
+                    self.deadlines.remove(&candidate);
+                    if let Some(attempt) = self.in_flight.remove(&candidate.caller_id) {
+                        self.callers.remove(candidate.caller_id);
+                        self.push_outcome(PoolEvent::Expired {
+                            request_id: attempt.request_id,
+                            caller_id: candidate.caller_id,
+                        });
+                        if let Some(out) = retired.as_deref_mut() {
+                            out.push(candidate.caller_id);
+                        }
+                    }
+                    expired_count += 1;
+                }
                 Some(_) => {}
             }
         }
-        for candidate in &resolved {
-            self.deadlines.remove(candidate);
-            self.in_flight.remove(&candidate.caller_id);
-        }
-        for candidate in &expired {
-            self.deadlines.remove(candidate);
-            if let Some(attempt) = self.in_flight.remove(&candidate.caller_id) {
-                self.callers.remove(candidate.caller_id);
-                self.push_outcome(PoolEvent::Expired {
-                    request_id: attempt.request_id,
-                    caller_id: candidate.caller_id,
-                });
-            }
-        }
-        self.expired = self.expired.saturating_add(expired.len() as u64);
-        self.admit_queued(now);
-        expired
-            .into_iter()
-            .map(|candidate| candidate.caller_id)
-            .collect()
+        self.visit_scratch.clear();
+        self.expired = self.expired.saturating_add(expired_count as u64);
+        let admitted = self.admit_queued(now, max_actions.saturating_sub(candidate_actions));
+        candidate_actions.saturating_add(admitted)
     }
 
     /// Atomically retire one pooled attempt or established session,
@@ -461,6 +600,20 @@ mod tests {
             .expect("prepared caller")
     }
 
+    #[test]
+    fn pool_clamps_adversarial_capacities() {
+        let pool = CallerPool::with_queue_capacity(
+            NonZeroUsize::new(usize::MAX).expect("non-zero"),
+            Duration::from_secs(1),
+            usize::MAX,
+        );
+        let stats = pool.stats();
+        assert_eq!(stats.in_flight, 0);
+        assert_eq!(stats.queued, 0);
+        assert_eq!(stats.queue_capacity, MAX_CALLER_POOL_QUEUE);
+        assert_eq!(pool.table().max_callers(), MAX_CALLER_POOL_IN_FLIGHT);
+    }
+
     /// One round trip between a pool's caller side and a fake listener,
     /// using `peer` as a fixed stand-in source address for both directions
     /// (no real socket exists in this test, so there is nothing else to key
@@ -474,13 +627,13 @@ mod tests {
         now: Timestamp,
     ) {
         let mut outbound = Vec::new();
-        pool.table_mut().poll_outbound(now, &mut outbound);
+        pool.poll_outbound(now, &mut outbound);
         for (_, packet) in outbound.drain(..) {
             let _ = listener.admit(peer, &packet, now, options, 0, 1, telemetry);
         }
         listener.poll_outbound(now, &mut outbound);
         for (_, packet) in outbound {
-            let _ = pool.table_mut().feed(peer, &packet, now);
+            let _ = pool.feed(peer, &packet, now);
         }
     }
 
@@ -511,6 +664,45 @@ mod tests {
         );
         assert_eq!(pool.stats().in_flight, 2);
         assert_eq!(pool.stats().queued, 1);
+    }
+
+    #[test]
+    fn queued_request_outcomes_keep_the_request_identity() {
+        let mut pool = CallerPool::new(NonZeroUsize::new(1).unwrap(), Duration::from_secs(1));
+        let remote: SocketAddr = "127.0.0.1:19005".parse().unwrap();
+        let now = Timestamp::from_micros(0);
+        let first = pool
+            .connect(prepared_caller(remote), now)
+            .expect("first connect");
+        let first_id = match first {
+            PoolOutcome::Admitted(id) => id,
+            other => panic!("first request must admit, got {other:?}"),
+        };
+        let queued = pool
+            .connect(prepared_caller(remote), now)
+            .expect("queued connect");
+        let request_id = match queued {
+            PoolOutcome::Queued(id) => id,
+            other => panic!("second request must queue, got {other:?}"),
+        };
+
+        let mut events = Vec::new();
+        pool.poll_outcomes(&mut events);
+        assert!(events.iter().any(|event| {
+            matches!(event, PoolEvent::Queued { request_id: id } if *id == request_id)
+        }));
+
+        pool.poll_expirations(Timestamp::from_micros(2_000_000));
+        pool.poll_outcomes(&mut events);
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                PoolEvent::Admitted {
+                    request_id: id,
+                    caller_id,
+                } if *id == request_id && *caller_id != first_id
+            )
+        }));
     }
 
     /// A04: a stalled attempt (never reaches `Connected`) must be retired
@@ -680,8 +872,7 @@ mod tests {
 
         // Start an orderly close immediately -- `poll_expirations` is
         // never called while this session reads back as `Connected`.
-        pool.table_mut()
-            .logical_caller_mut(&id)
+        pool.logical_caller_mut(&id)
             .expect("session still exists")
             .disconnect(Timestamp::from_micros(500));
 

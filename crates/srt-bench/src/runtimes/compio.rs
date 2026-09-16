@@ -27,7 +27,7 @@
 //! own task -- and its own socket -- if it actually needs to relocate for
 //! bond affinity; the common case is serviced straight off the shared
 //! listener socket by peer-address dispatch, bypassing the `Conn` wrapper
-//! in favor of direct `SrtConnection` + `srt_transport::ManualTimerStore`
+//! in favor of direct `SrtConnection` + `srt_transport::advanced::driver::ManualTimerStore`
 //! + `listener.send_to`.
 //!
 //! Admission reuses the exact reader-task + bounded-channel shape already
@@ -71,9 +71,10 @@
 
 use crate::{Aggregate, BenchConfig, BondMode, ConnStats};
 use compio::buf::BufResult;
-use shiguredo_srt::{ConnectionEvent, ConnectionOptions, GroupExtensionData, SrtConnection};
+use srt_proto::handshake::GroupExtensionData;
+use srt_proto::{ConnectionEvent, ConnectionOptions, SrtConnection};
+use srt_transport::advanced::handoff::{Handoff, WorkerMessage};
 use srt_transport::compio_transport::Conn;
-use srt_transport::{Handoff, WorkerMessage};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
@@ -121,7 +122,7 @@ fn enqueue_addressed(
     }
 }
 
-async fn drain_outputs(driver: &mut Conn, now: shiguredo_srt::Timestamp) {
+async fn drain_outputs(driver: &mut Conn, now: srt_proto::Timestamp) {
     super::report_drain_error("compio", driver.drain_outputs(now).await);
 }
 
@@ -135,7 +136,8 @@ fn promote_locally(
     peer: SocketAddr,
     conn: SrtConnection,
 ) -> Option<Conn> {
-    let std_socket = srt_transport::bind_reuseport(port, sock_buf_bytes).ok()?;
+    let std_socket =
+        srt_transport::advanced::platform::bind_reuseport(port, sock_buf_bytes).ok()?;
     std_socket.connect(peer).ok()?;
     let sock = compio::net::UdpSocket::from_std(std_socket).ok()?;
     Some(Conn::new(conn, sock))
@@ -276,7 +278,7 @@ async fn drive(
 fn drain_sender_packets(driver: &mut Conn, received: &Received, recycle: &Recycle, start: Instant) {
     while let Ok((buffer, size)) = received.try_recv() {
         let now = crate::now_ts(start);
-        let _ = driver.conn.feed_recv_buf(&buffer[..size], now);
+        let _ = driver.protocol_mut().feed_recv_buf(&buffer[..size], now);
         let _ = recycle.try_send(buffer);
     }
 }
@@ -287,7 +289,7 @@ fn handle_sender_events(
     stats: &mut ConnStats,
     stream_deadline: &mut Option<Instant>,
 ) {
-    while let Some(event) = driver.conn.poll_event() {
+    while let Some(event) = driver.protocol_mut().poll_event() {
         match event {
             ConnectionEvent::Connected => {
                 stats.connected = true;
@@ -321,14 +323,14 @@ fn handle_sender_events(
 async fn send_paced_payload(
     driver: &mut Conn,
     payload: &[u8],
-    now: shiguredo_srt::Timestamp,
+    now: srt_proto::Timestamp,
     stats: &mut ConnStats,
     source: &mut crate::source::SourceClock,
 ) {
     let mut accepted = 0;
     while source.pending() > accepted {
         match driver.send_paced(payload, now).await {
-            srt_transport::PacedSendOutcome::Sent => {
+            srt_transport::advanced::driver::PacedSendOutcome::Sent => {
                 stats.data_events += 1;
                 accepted += 1;
             }
@@ -339,21 +341,21 @@ async fn send_paced_payload(
             // pending and resend the same bytes as a brand-new, separately
             // sequenced packet next call -- a real duplicate on the wire,
             // not merely a bench accounting quirk.
-            srt_transport::PacedSendOutcome::Accepted => {
+            srt_transport::advanced::driver::PacedSendOutcome::Accepted => {
                 stats.data_events += 1;
                 accepted += 1;
                 break;
             }
-            srt_transport::PacedSendOutcome::NotDue => {
+            srt_transport::advanced::driver::PacedSendOutcome::NotDue => {
                 source.refused();
                 break;
             }
-            srt_transport::PacedSendOutcome::Rejected(error) => {
+            srt_transport::advanced::driver::PacedSendOutcome::Rejected(error) => {
                 eprintln!("[bench-compio] send_paced rejected (not a pacing refusal): {error}");
                 source.refused();
                 break;
             }
-            srt_transport::PacedSendOutcome::DriverError(error) => {
+            srt_transport::advanced::driver::PacedSendOutcome::DriverError(error) => {
                 eprintln!("[bench-compio] send_paced driver error: {error}");
                 stats.data_events += 1;
                 accepted += 1;
@@ -367,7 +369,7 @@ async fn send_paced_payload(
 }
 
 fn record_sender_stats(driver: &Conn, stats: &mut ConnStats) {
-    if let Some(sender) = driver.conn.sender_stats() {
+    if let Some(sender) = driver.protocol().sender_stats() {
         stats.has_stats = true;
         stats.core_total = sender.total_sent;
         stats.secondary_a = sender.total_retransmits;
@@ -423,7 +425,7 @@ async fn sender_task(
         if !stats.connected && Instant::now() >= connect_deadline {
             eprintln!(
                 "[bench-compio] connect timed out, state={:?}",
-                driver.conn.state()
+                driver.protocol().state()
             );
             break;
         }
@@ -435,7 +437,7 @@ async fn sender_task(
         // socket into the channel meanwhile. Two clocks gate that: SRT's
         // pacing and the application source, whichever is binding.
         let wait = if stats.connected {
-            let pacing = driver.conn.time_until_send(crate::now_ts(start));
+            let pacing = driver.protocol().time_until_send(crate::now_ts(start));
             Duration::from_micros(source.wait_micros(start.elapsed(), pacing)).min(crate::MAX_WAIT)
         } else {
             crate::MAX_WAIT
@@ -482,7 +484,7 @@ async fn sender_task(
     // ended instead of inferring it from five seconds of silence.
     crate::HandshakePermit::settle(&mut permit, stats.connected);
     let t = crate::now_ts(start);
-    driver.conn.disconnect(t);
+    driver.protocol_mut().disconnect(t);
     drain_outputs(&mut driver, t).await;
     record_sender_stats(&driver, &mut stats);
     stats.source = source.stats();
@@ -496,7 +498,7 @@ fn spawn_reader(
     received_sender: crate::queue::BoundedSender<(Vec<u8>, usize)>,
     recycle_rx: crate::queue::BoundedReceiver<Vec<u8>>,
 ) {
-    let received_socket = driver.sock.clone();
+    let received_socket = driver.socket().clone();
     compio::runtime::spawn(async move {
         let mut buffer = vec![0u8; 2048];
         loop {
@@ -519,12 +521,15 @@ fn drain_receiver_packets(
     received: &Received,
     recycle: &Recycle,
     start: Instant,
-) {
+) -> usize {
+    let mut fed = 0;
     while let Ok((buffer, size)) = received.try_recv() {
         let now = crate::now_ts(start);
-        let _ = driver.conn.feed_recv_buf(&buffer[..size], now);
+        let _ = driver.protocol_mut().feed_recv_buf(&buffer[..size], now);
         let _ = recycle.try_send(buffer);
+        fed += 1;
     }
+    fed
 }
 
 fn handle_receiver_events(
@@ -533,7 +538,7 @@ fn handle_receiver_events(
     stats: &mut ConnStats,
     stream_deadline: &mut Option<Instant>,
 ) {
-    while let Some(event) = driver.conn.poll_event() {
+    while let Some(event) = driver.protocol_mut().poll_event() {
         match event {
             ConnectionEvent::Connected => {
                 stats.connected = true;
@@ -562,7 +567,7 @@ fn handle_receiver_events(
 }
 
 fn record_receiver_stats(driver: &Conn, stats: &mut ConnStats) {
-    if let Some(receiver) = driver.conn.receiver_stats() {
+    if let Some(receiver) = driver.protocol().receiver_stats() {
         stats.has_stats = true;
         stats.core_total = receiver.total_received;
         stats.secondary_a = receiver.total_lost;
@@ -594,7 +599,7 @@ async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> Co
     let (received_sender, received_receiver) =
         crate::queue::bounded_channel(cfg.datapath_queue_capacity());
     let (recycle_tx, recycle_rx) = crate::queue::bounded_channel(cfg.datapath_queue_capacity());
-    let received_socket = driver.sock.clone();
+    let received_socket = driver.socket().clone();
     let _reader = compio::runtime::spawn(async move {
         let mut first = true;
         let mut buffer = vec![0u8; 2048];
@@ -617,14 +622,29 @@ async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> Co
 
     let mut stats = ConnStats::default();
     let mut stream_deadline: Option<Instant> = None;
-    let connect_deadline = Instant::now() + crate::CONNECT_TIMEOUT;
+    // Handshake deadline arms on FIRST RECEIVED DATAGRAM, not task spawn:
+    // with connect_cc=1 the sender contacts later listeners long after
+    // process start; a spawn-relative deadline would expire idle listeners
+    // still waiting for initial contact (timeout-skew bug). A process-level
+    // backstop (3x CONNECT_TIMEOUT) still guarantees termination.
+    let mut connect_deadline: Option<Instant> = None;
+    let process_backstop = Instant::now() + 3 * crate::CONNECT_TIMEOUT;
 
     loop {
-        if !stats.connected && Instant::now() >= connect_deadline {
+        if !stats.connected
+            && let Some(deadline) = connect_deadline
+            && Instant::now() >= deadline
+        {
             eprintln!(
                 "[bench-compio] connect timed out, state={:?}",
-                driver.conn.state()
+                driver.protocol().state()
             );
+            break;
+        }
+        if Instant::now() >= process_backstop {
+            if !stats.connected {
+                eprintln!("[bench-compio] connect timed out (process backstop)");
+            }
             break;
         }
         if crate::shutdown::past(stream_deadline) {
@@ -635,7 +655,10 @@ async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> Co
         // for protocol maintenance once per MAX_WAIT.
         compio::time::sleep(crate::MAX_WAIT).await;
 
-        drain_receiver_packets(&mut driver, &received_receiver, &recycle_tx, start);
+        let fed = drain_receiver_packets(&mut driver, &received_receiver, &recycle_tx, start);
+        if fed > 0 && connect_deadline.is_none() {
+            connect_deadline = Some(Instant::now() + crate::CONNECT_TIMEOUT);
+        }
 
         let t = crate::now_ts(start);
         driver.fire_expired(t);
@@ -661,8 +684,8 @@ fn run_reuseport_multi(cfg: BenchConfig, k: usize) {
     let router: crate::SharedWorkerRouter =
         Arc::new(Mutex::new(srt_lifecycle::WorkerRouter::new(worker_count)));
     // One set of counters for every acceptor thread; see
-    // `srt_transport::IngressTelemetry`.
-    let telemetry = Arc::new(srt_transport::IngressTelemetry::new());
+    // `srt_transport::advanced::telemetry::IngressTelemetry`.
+    let telemetry = Arc::new(srt_transport::advanced::telemetry::IngressTelemetry::new());
 
     // All channels exist before any thread spawns -- see the identical
     // mio/tokio/smol/monoio/glommio bug this avoids: cloning a
@@ -730,17 +753,17 @@ struct AcceptorContext<'a> {
     cfg: &'a BenchConfig,
     worker_index: usize,
     start: Instant,
-    admission: &'a srt_transport::AdmissionOptions,
+    admission: &'a srt_transport::advanced::admission::AdmissionOptions,
     router: &'a crate::SharedWorkerRouter,
     senders: &'a [mpsc::Sender<WorkerMessage>],
-    telemetry: &'a srt_transport::IngressTelemetry,
+    telemetry: &'a srt_transport::advanced::telemetry::IngressTelemetry,
     tasks: &'a mut Vec<compio::runtime::JoinHandle<ConnStats>>,
 }
 
 fn drain_acceptor_inbox(
     inbox: &AddressedReceived,
     recycle: &Recycle,
-    peers: &mut srt_transport::PeerTable,
+    peers: &mut srt_transport::advanced::admission::PeerTable,
     context: &AcceptorContext<'_>,
 ) {
     while let Ok((peer, buffer, size)) = inbox.try_recv() {
@@ -758,7 +781,7 @@ fn drain_acceptor_inbox(
 }
 
 async fn maintain_acceptor_peers(
-    peers: &mut srt_transport::PeerTable,
+    peers: &mut srt_transport::advanced::admission::PeerTable,
     listener: &compio::net::UdpSocket,
     start: Instant,
     stream_len: Duration,
@@ -796,7 +819,7 @@ fn promotion_decision(
 
 fn apply_acceptor_promotions(
     context: &mut AcceptorContext<'_>,
-    peers: &mut srt_transport::PeerTable,
+    peers: &mut srt_transport::advanced::admission::PeerTable,
     relocations: Vec<(SocketAddr, Option<GroupExtensionData>)>,
 ) {
     for (peer, extension) in relocations {
@@ -838,7 +861,7 @@ fn apply_acceptor_promotions(
 
 fn drain_acceptor_handoffs(
     context: &mut AcceptorContext<'_>,
-    peers: &mut srt_transport::PeerTable,
+    peers: &mut srt_transport::advanced::admission::PeerTable,
     handoffs: &mpsc::Receiver<WorkerMessage>,
 ) {
     while let Ok(message) = handoffs.try_recv() {
@@ -884,15 +907,16 @@ async fn run_acceptor(
     router: crate::SharedWorkerRouter,
     senders: Vec<mpsc::Sender<WorkerMessage>>,
     handoffs: mpsc::Receiver<WorkerMessage>,
-    telemetry: Arc<srt_transport::IngressTelemetry>,
+    telemetry: Arc<srt_transport::advanced::telemetry::IngressTelemetry>,
 ) -> Vec<ConnStats> {
-    let std_listener = match srt_transport::bind_reuseport(cfg.port, cfg.sock_buf_bytes) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("[bench-compio] acceptor {worker_index}: bind {e}");
-            return Vec::new();
-        }
-    };
+    let std_listener =
+        match srt_transport::advanced::platform::bind_reuseport(cfg.port, cfg.sock_buf_bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[bench-compio] acceptor {worker_index}: bind {e}");
+                return Vec::new();
+            }
+        };
     let listener = match compio::net::UdpSocket::from_std(std_listener) {
         Ok(s) => s,
         Err(e) => {
@@ -925,7 +949,7 @@ async fn run_acceptor(
         }
     });
 
-    let mut peers = srt_transport::PeerTable::new();
+    let mut peers = srt_transport::advanced::admission::PeerTable::new();
     let admission = cfg.admission_options(std::process::id(), cfg.cookie_routing);
     let mut tasks: Vec<compio::runtime::JoinHandle<ConnStats>> = Vec::new();
     let connect_deadline = Instant::now() + crate::CONNECT_TIMEOUT;
@@ -1004,14 +1028,14 @@ async fn run_acceptor(
 
 async fn drain_pending_outputs(
     conn: &mut SrtConnection,
-    timers: &mut srt_transport::ManualTimerStore,
+    timers: &mut srt_transport::advanced::driver::ManualTimerStore,
     listener: &compio::net::UdpSocket,
     destination: SocketAddr,
 ) -> bool {
-    use shiguredo_srt::ConnectionOutput;
+    use srt_proto::ConnectionOutput;
     let now = crate::now_ts(Instant::now());
     let mut refused = false;
-    while let Some(out) = conn.poll_output() {
+    while let Some(out) = conn.poll_output().expect("exact-size output materializes") {
         match out {
             ConnectionOutput::SendPacket(bytes) => {
                 let BufResult(res, _buf) = listener.send_to(bytes, destination).await;
@@ -1036,9 +1060,9 @@ fn relocate_to_owner(
     pending_conn: SrtConnection,
     owner: usize,
     senders: &[mpsc::Sender<WorkerMessage>],
-    telemetry: &srt_transport::IngressTelemetry,
+    telemetry: &srt_transport::advanced::telemetry::IngressTelemetry,
 ) {
-    let std_socket = match srt_transport::bind_reuseport(port, sock_buf_bytes) {
+    let std_socket = match srt_transport::advanced::platform::bind_reuseport(port, sock_buf_bytes) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[bench-compio] relocate {peer}: bind {e}");
@@ -1083,7 +1107,7 @@ async fn established_conn_task(mut driver: Conn, cfg: BenchConfig, start: Instan
     let (received_sender, received_receiver) =
         crate::queue::bounded_channel(cfg.datapath_queue_capacity());
     let (recycle_tx, recycle_rx) = crate::queue::bounded_channel(cfg.datapath_queue_capacity());
-    let received_socket = driver.sock.clone();
+    let received_socket = driver.socket().clone();
     let _reader = compio::runtime::spawn(async move {
         let mut buffer = vec![0u8; 2048];
         loop {
@@ -1123,7 +1147,7 @@ async fn established_conn_task(mut driver: Conn, cfg: BenchConfig, start: Instan
 
         while let Ok((buf, size)) = received_receiver.try_recv() {
             let t = crate::now_ts(start);
-            let _ = driver.conn.feed_recv_buf(&buf[..size], t);
+            let _ = driver.protocol_mut().feed_recv_buf(&buf[..size], t);
             let _ = recycle_tx.try_send(buf);
         }
 
@@ -1131,7 +1155,7 @@ async fn established_conn_task(mut driver: Conn, cfg: BenchConfig, start: Instan
         driver.fire_expired(t);
         drain_outputs(&mut driver, t).await;
 
-        while let Some(ev) = driver.conn.poll_event() {
+        while let Some(ev) = driver.protocol_mut().poll_event() {
             match ev {
                 ConnectionEvent::DataReceived { .. } => {
                     data_events += 1;
@@ -1154,7 +1178,7 @@ async fn established_conn_task(mut driver: Conn, cfg: BenchConfig, start: Instan
         data_events,
         ..Default::default()
     };
-    if let Some(s) = driver.conn.receiver_stats() {
+    if let Some(s) = driver.protocol().receiver_stats() {
         stats.has_stats = true;
         stats.core_total = s.total_received;
         stats.secondary_a = s.total_lost;
@@ -1231,7 +1255,10 @@ async fn serve_pool_socket(cfg: BenchConfig, index: usize, start: Instant) -> Ve
         .expect("nonblocking shared-pool socket");
     {
         use std::os::fd::AsRawFd;
-        let _ = srt_transport::set_sock_bufs(std_socket.as_raw_fd(), cfg.sock_buf_bytes);
+        let _ = srt_transport::advanced::platform::set_sock_bufs(
+            std_socket.as_raw_fd(),
+            cfg.sock_buf_bytes,
+        );
     }
     let sock = compio::net::UdpSocket::from_std(std_socket).expect("register pool socket");
 
@@ -1254,7 +1281,7 @@ async fn serve_pool_socket(cfg: BenchConfig, index: usize, start: Instant) -> Ve
         }
     });
 
-    let mut peers = srt_transport::PeerTable::new();
+    let mut peers = srt_transport::advanced::admission::PeerTable::new();
     // No SO_REUSEPORT group here, so nothing can rehash and there is
     // nowhere to forward to: one worker, cookie routing inert.
     let admission = cfg.admission_options(std::process::id(), false);
@@ -1316,13 +1343,13 @@ async fn serve_pool_socket(cfg: BenchConfig, index: usize, start: Instant) -> Ve
 /// Admit one datagram. No reuseport group means no cookie forwarding, so
 /// this is the table's admit with a single-worker view.
 fn admit_one(
-    peers: &mut srt_transport::PeerTable,
-    admission: &srt_transport::AdmissionOptions,
+    peers: &mut srt_transport::advanced::admission::PeerTable,
+    admission: &srt_transport::advanced::admission::AdmissionOptions,
     peer: SocketAddr,
     data: &[u8],
     start: Instant,
 ) {
-    let telemetry = srt_transport::IngressTelemetry::new();
+    let telemetry = srt_transport::advanced::telemetry::IngressTelemetry::new();
     let _ = peers.admit(
         peer,
         data,
@@ -1405,8 +1432,8 @@ fn run_reuseport_single(cfg: BenchConfig, workers: usize) {
 fn drain_single_inbox(
     inbox: &AddressedReceived,
     recycle: &Recycle,
-    peers: &mut srt_transport::PeerTable,
-    admission: &srt_transport::AdmissionOptions,
+    peers: &mut srt_transport::advanced::admission::PeerTable,
+    admission: &srt_transport::advanced::admission::AdmissionOptions,
     start: Instant,
 ) {
     while let Ok((peer, buffer, size)) = inbox.try_recv() {
@@ -1428,20 +1455,20 @@ struct SingleAcceptorContext<'a> {
     cfg: &'a BenchConfig,
     router: &'a crate::SharedWorkerRouter,
     senders: &'a [mpsc::Sender<WorkerMessage>],
-    telemetry: &'a srt_transport::IngressTelemetry,
+    telemetry: &'a srt_transport::advanced::telemetry::IngressTelemetry,
 }
 
 fn route_one_connected_peer(
     context: &SingleAcceptorContext<'_>,
-    peers: &mut srt_transport::PeerTable,
-    connected: srt_transport::NewlyConnectedPeer,
+    peers: &mut srt_transport::advanced::admission::PeerTable,
+    connected: srt_transport::advanced::admission::NewlyConnectedPeer,
     routed: &mut usize,
 ) {
     let peer = connected.representative_peer;
     let group = peers
         .logical_peer(&connected.logical_peer)
         .and_then(|logical| logical.group_affinity());
-    let Some(srt_transport::RemovedLogicalPeer::Direct(entry)) =
+    let Some(srt_transport::advanced::admission::RemovedLogicalPeer::Direct(entry)) =
         peers.remove(connected.logical_peer)
     else {
         return;
@@ -1450,14 +1477,16 @@ fn route_one_connected_peer(
         Ok(mut router) => router.assign(peer, group, srt_lifecycle::RoutingMode::LeastTuples),
         Err(_) => 0,
     };
-    let Ok(socket) = srt_transport::bind_reuseport(context.cfg.port, context.cfg.sock_buf_bytes)
-    else {
+    let Ok(socket) = srt_transport::advanced::platform::bind_reuseport(
+        context.cfg.port,
+        context.cfg.sock_buf_bytes,
+    ) else {
         return;
     };
     if socket.connect(peer).is_err() {
         return;
     }
-    let message = WorkerMessage::Handoff(Box::new(srt_transport::Handoff {
+    let message = WorkerMessage::Handoff(Box::new(Handoff {
         socket,
         conn: entry.connection,
     }));
@@ -1470,8 +1499,8 @@ fn route_one_connected_peer(
 fn route_connected_peers(
     context: &SingleAcceptorContext<'_>,
     stream_len: Duration,
-    peers: &mut srt_transport::PeerTable,
-    connected: &mut Vec<srt_transport::NewlyConnectedPeer>,
+    peers: &mut srt_transport::advanced::admission::PeerTable,
+    connected: &mut Vec<srt_transport::advanced::admission::NewlyConnectedPeer>,
     routed: &mut usize,
 ) {
     peers.drain_events(stream_len, connected);
@@ -1486,7 +1515,9 @@ async fn run_single_acceptor(
     router: &crate::SharedWorkerRouter,
     senders: &[mpsc::Sender<WorkerMessage>],
 ) -> crate::queue::QueueStats {
-    let Ok(std_socket) = srt_transport::bind_reuseport(cfg.port, cfg.sock_buf_bytes) else {
+    let Ok(std_socket) =
+        srt_transport::advanced::platform::bind_reuseport(cfg.port, cfg.sock_buf_bytes)
+    else {
         eprintln!("[bench-compio] reuseport-single: bind failed");
         return crate::queue::QueueStats::default();
     };
@@ -1511,11 +1542,11 @@ async fn run_single_acceptor(
         }
     });
 
-    let mut peers = srt_transport::PeerTable::new();
+    let mut peers = srt_transport::advanced::admission::PeerTable::new();
     // One acceptor means one owner for every handshake, so there is
     // nobody a stray CONCLUSION could need forwarding to.
     let admission = cfg.admission_options(std::process::id(), false);
-    let telemetry = srt_transport::IngressTelemetry::new();
+    let telemetry = srt_transport::advanced::telemetry::IngressTelemetry::new();
     let connect_deadline = Instant::now() + crate::CONNECT_TIMEOUT;
     let stream_len = Duration::from_secs_f64(cfg.duration_secs);
     let mut routed = 0usize;

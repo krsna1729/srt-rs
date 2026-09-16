@@ -20,9 +20,9 @@ use std::net::IpAddr;
 use crate::buf::{
     read_bytes, read_u8, read_u16, read_u32, write_bytes, write_u8, write_u16, write_u32,
 };
-use crate::crypto::{KeyFlag, KeyLength};
+use crate::crypto_impl::{KeyFlag, KeyLength};
 use crate::error::Error;
-use crate::srt_packet::{ControlPacket, ControlType};
+use crate::srt_packet::{ControlPacket, ControlType, MAX_DATAGRAM_SIZE, SRT_HEADER_SIZE};
 
 /// Handshake version.
 pub const HS_VERSION_4: u32 = 4;
@@ -377,6 +377,9 @@ impl HandshakePacket {
     pub fn decode(packet: &ControlPacket) -> Result<Self, Error> {
         if packet.control_type != ControlType::Handshake {
             return Err(Error::invalid_data("not a handshake packet"));
+        }
+        if packet.control_info.len() > MAX_DATAGRAM_SIZE.saturating_sub(SRT_HEADER_SIZE) {
+            return Err(Error::invalid_data("SRT datagram exceeds maximum size"));
         }
 
         let mut buf = packet.control_info.as_slice();
@@ -926,11 +929,11 @@ impl KmMessage {
         key_length: KeyLength,
         salt: [u8; 16],
         wrapped_key: Vec<u8>,
-        cipher_mode: crate::crypto::CipherMode,
+        cipher_mode: crate::crypto_impl::CipherMode,
     ) -> Self {
         let (cipher, auth) = match cipher_mode {
-            crate::crypto::CipherMode::Ctr => (cipher_type::AES_CTR, auth_type::NONE),
-            crate::crypto::CipherMode::Gcm => (cipher_type::AES_GCM, auth_type::AES_GCM),
+            crate::crypto_impl::CipherMode::Ctr => (cipher_type::AES_CTR, auth_type::NONE),
+            crate::crypto_impl::CipherMode::Gcm => (cipher_type::AES_GCM, auth_type::AES_GCM),
         };
         Self {
             version: KM_VERSION,
@@ -1094,7 +1097,9 @@ impl KmError {
 /// rather than in whatever crate happens to be doing admission.
 #[must_use]
 pub fn peek_handshake(datagram: &[u8]) -> Option<HandshakePacket> {
-    let crate::SrtPacket::Control(control) = crate::SrtPacket::decode(datagram).ok()? else {
+    let crate::srt_packet::SrtPacket::Control(control) =
+        crate::srt_packet::SrtPacket::decode(datagram).ok()?
+    else {
         return None;
     };
     HandshakePacket::decode(&control).ok()
@@ -1137,6 +1142,20 @@ mod tests {
     }
 
     #[test]
+    fn decode_rejects_oversized_control_info() {
+        let packet = ControlPacket {
+            control_type: ControlType::Handshake,
+            subtype: 0,
+            type_specific_info: 0,
+            timestamp: 0,
+            dest_socket_id: 0,
+            control_info: vec![0; MAX_DATAGRAM_SIZE],
+        };
+        let error = HandshakePacket::decode(&packet).expect_err("handshake input is capped");
+        assert_eq!(error.kind, crate::ErrorKind::InvalidData);
+    }
+
+    #[test]
     fn test_hs_extension() {
         let mut hs = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
         hs.add_hs_extension(0x010500, srt_flags::TSBPDSND | srt_flags::TSBPDRCV, 120);
@@ -1169,7 +1188,7 @@ mod tests {
             KeyLength::Aes128,
             salt,
             wrapped_key.clone(),
-            crate::crypto::CipherMode::Ctr,
+            crate::crypto_impl::CipherMode::Ctr,
         );
 
         let encoded = original.encode();
@@ -1195,7 +1214,7 @@ mod tests {
             KeyLength::Aes128,
             salt,
             wrapped_key,
-            crate::crypto::CipherMode::Ctr,
+            crate::crypto_impl::CipherMode::Ctr,
         );
 
         let mut hs = HandshakePacket::new_conclusion_request(1, 2, 3, 2, true);
