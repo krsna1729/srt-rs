@@ -554,9 +554,14 @@ pub struct ListenerSide {
     pub options: crate::AdmissionOptions,
     pub transport: crate::ResolvedTransportConfig,
     pub idle_timeout: std::time::Duration,
+    /// Persistent receive slot. ALWAYS `DEFAULT_RX_SLOT_SIZE`; staging swaps
+    /// the two buffers, it never resizes either.
     rx_buf: Vec<u8>,
     poll_fd: compio::runtime::fd::PollFd<std::net::UdpSocket>,
-    pending_rx: Option<(SocketAddr, Vec<u8>)>,
+    /// Staged packet as metadata only: `(peer, len)` into `stage_buf`.
+    /// No owned payload copy, no allocation.
+    pending_rx: Option<(SocketAddr, usize)>,
+    /// Persistent staging slot. ALWAYS `DEFAULT_RX_SLOT_SIZE`.
     stage_buf: Vec<u8>,
 }
 
@@ -601,9 +606,13 @@ pub struct OwnerCallerSide {
     pub transport: crate::ResolvedTransportConfig,
     pub local_bind: Option<std::net::SocketAddr>,
     pub connect_config: crate::ConnectConfig,
+    /// Persistent receive slot; always `DEFAULT_RX_SLOT_SIZE` (see the
+    /// listener side's identical fields).
     rx_buf: Vec<u8>,
     poll_fd: compio::runtime::fd::PollFd<std::net::UdpSocket>,
-    pending_rx: Option<(SocketAddr, Vec<u8>)>,
+    /// Staged packet as metadata only: `(peer, len)` into `stage_buf`.
+    pending_rx: Option<(SocketAddr, usize)>,
+    /// Persistent staging slot; always `DEFAULT_RX_SLOT_SIZE`.
     stage_buf: Vec<u8>,
 }
 
@@ -1821,30 +1830,29 @@ impl Owner {
         budget: &OwnerServiceBudget,
         report: &mut OwnerServiceReport,
     ) {
-        // 1. Consume any staged packet from pending_rx ONLY if budget permits
-        if let Some((_peer, bytes)) = listener.pending_rx.as_ref() {
+        // 1. Consume a staged packet (metadata only) when the budget permits.
+        if let Some((peer, len)) = listener.pending_rx {
             let exceeds_packets = report.rx_packets >= budget.max_rx_packets;
-            let exceeds_bytes = report.rx_bytes.saturating_add(bytes.len()) > budget.max_rx_bytes;
-            if !exceeds_packets && !exceeds_bytes {
-                let (peer, bytes) = listener.pending_rx.take().unwrap();
-                report.rx_packets += 1;
-                report.rx_bytes += bytes.len();
-                let _ = listener.table.admit(
-                    peer,
-                    &bytes,
-                    now,
-                    &listener.options,
-                    0,
-                    1,
-                    &listener.telemetry,
-                );
-            } else {
+            let exceeds_bytes = report.rx_bytes.saturating_add(len) > budget.max_rx_bytes;
+            if exceeds_packets || exceeds_bytes {
                 return;
             }
+            report.rx_packets += 1;
+            report.rx_bytes += len;
+            let _ = listener.table.admit(
+                peer,
+                &listener.stage_buf[..len],
+                now,
+                &listener.options,
+                0,
+                1,
+                &listener.telemetry,
+            );
+            listener.pending_rx = None;
         }
 
-        // 2. Drain from socket up to budget. Zero heap allocations: rx_buf is pre-allocated.
-        let buf = &mut listener.rx_buf;
+        // 2. Drain from the socket. Zero heap allocations on this path: both
+        // persistent slots are preallocated and never resized.
         while report.rx_packets < budget.max_rx_packets && report.rx_bytes < budget.max_rx_bytes {
             use std::os::fd::AsRawFd;
             let raw_fd = compio::net::UdpSocket::as_raw_fd(&listener.sock);
@@ -1852,12 +1860,13 @@ impl Owner {
             let mut addr_storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
             let mut addr_len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
             // SAFETY: `raw_fd` is a live UDP socket; `recvfrom` writes at most
-            // `buf.len()` bytes into `buf` plus peer address into `addr_storage`.
+            // `rx_buf.len()` bytes into `rx_buf` plus peer address into
+            // `addr_storage`.
             let received = unsafe {
                 libc::recvfrom(
                     raw_fd,
-                    buf.as_mut_ptr() as *mut libc::c_void,
-                    buf.len(),
+                    listener.rx_buf.as_mut_ptr() as *mut libc::c_void,
+                    listener.rx_buf.len(),
                     libc::MSG_DONTWAIT,
                     &mut addr_storage as *mut _ as *mut libc::sockaddr,
                     &mut addr_len,
@@ -1870,21 +1879,20 @@ impl Owner {
             let Some(peer) = sockaddr_to_std(addr_storage, addr_len) else {
                 break;
             };
-            // Hard byte cap: if datagram exceeds remaining byte budget, stage
-            // into the preallocated slot WITHOUT allocating: swap the filled
-            // stage buffer with the socket buffer and reuse both.
+            // Hard byte cap: if the datagram does not fit the remaining byte
+            // budget, stage it by SWAPPING the two persistent slots (the
+            // datagram ends up in `stage_buf`), recording only `(peer, len)`.
+            // No allocation, no copy, and neither buffer changes length.
             if report.rx_bytes.saturating_add(len) > budget.max_rx_bytes {
-                listener.stage_buf.resize(len, 0);
-                listener.stage_buf[..len].copy_from_slice(&buf[..len]);
-                std::mem::swap(&mut listener.stage_buf, buf);
-                listener.pending_rx = Some((peer, std::mem::take(&mut listener.stage_buf)));
+                std::mem::swap(&mut listener.rx_buf, &mut listener.stage_buf);
+                listener.pending_rx = Some((peer, len));
                 break;
             }
             report.rx_packets += 1;
             report.rx_bytes += len;
             let _ = listener.table.admit(
                 peer,
-                &buf[..len],
+                &listener.rx_buf[..len],
                 now,
                 &listener.options,
                 0,
@@ -1900,22 +1908,25 @@ impl Owner {
         budget: &OwnerServiceBudget,
         report: &mut OwnerServiceReport,
     ) {
-        // 1. Consume any staged packet from pending_rx ONLY if budget permits
-        if let Some((_peer, bytes)) = caller.pending_rx.as_ref() {
+        // 1. Consume a staged packet (metadata only) when the budget permits.
+        if let Some((peer, len)) = caller.pending_rx {
             let exceeds_packets = report.rx_packets >= budget.max_rx_packets;
-            let exceeds_bytes = report.rx_bytes.saturating_add(bytes.len()) > budget.max_rx_bytes;
-            if !exceeds_packets && !exceeds_bytes {
-                let (peer, bytes) = caller.pending_rx.take().unwrap();
-                report.rx_packets += 1;
-                report.rx_bytes += bytes.len();
-                let _ = caller.pool.table_mut().feed(peer, &bytes, now);
-            } else {
+            let exceeds_bytes = report.rx_bytes.saturating_add(len) > budget.max_rx_bytes;
+            if exceeds_packets || exceeds_bytes {
                 return;
             }
+            report.rx_packets += 1;
+            report.rx_bytes += len;
+            let _ = caller
+                .pool
+                .table_mut()
+                .feed(peer, &caller.stage_buf[..len], now);
+            caller.pending_rx = None;
         }
 
-        // 2. Drain from socket up to budget. Zero heap allocations: rx_buf is pre-allocated.
-        let buf = &mut caller.rx_buf;
+        // 2. Drain from the socket. Zero heap allocations on this path: both
+        // persistent slots are preallocated and never resized (same contract
+        // as the listener side).
         while report.rx_packets < budget.max_rx_packets && report.rx_bytes < budget.max_rx_bytes {
             use std::os::fd::AsRawFd;
             let raw_fd = compio::net::UdpSocket::as_raw_fd(&caller.sock);
@@ -1923,12 +1934,13 @@ impl Owner {
             let mut addr_storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
             let mut addr_len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
             // SAFETY: `raw_fd` is a live UDP socket; `recvfrom` writes at most
-            // `buf.len()` bytes into `buf` plus peer address into `addr_storage`.
+            // `rx_buf.len()` bytes into `rx_buf` plus peer address into
+            // `addr_storage`.
             let received = unsafe {
                 libc::recvfrom(
                     raw_fd,
-                    buf.as_mut_ptr() as *mut libc::c_void,
-                    buf.len(),
+                    caller.rx_buf.as_mut_ptr() as *mut libc::c_void,
+                    caller.rx_buf.len(),
                     libc::MSG_DONTWAIT,
                     &mut addr_storage as *mut _ as *mut libc::sockaddr,
                     &mut addr_len,
@@ -1941,18 +1953,20 @@ impl Owner {
             let Some(peer) = sockaddr_to_std(addr_storage, addr_len) else {
                 break;
             };
-            // Hard byte cap: stage into the preallocated slot WITHOUT
-            // allocating (buffer swap, same contract as listener side).
+            // Hard byte cap: stage by swapping the two persistent slots,
+            // recording only `(peer, len)`. No allocation, no copy, and
+            // neither buffer changes length.
             if report.rx_bytes.saturating_add(len) > budget.max_rx_bytes {
-                caller.stage_buf.resize(len, 0);
-                caller.stage_buf[..len].copy_from_slice(&buf[..len]);
-                std::mem::swap(&mut caller.stage_buf, buf);
-                caller.pending_rx = Some((peer, std::mem::take(&mut caller.stage_buf)));
+                std::mem::swap(&mut caller.rx_buf, &mut caller.stage_buf);
+                caller.pending_rx = Some((peer, len));
                 break;
             }
             report.rx_packets += 1;
             report.rx_bytes += len;
-            let _ = caller.pool.table_mut().feed(peer, &buf[..len], now);
+            let _ = caller
+                .pool
+                .table_mut()
+                .feed(peer, &caller.rx_buf[..len], now);
         }
     }
     async fn service_rx(
@@ -2834,12 +2848,21 @@ mod tests {
                 .with_listener(listener_side)
                 .with_caller(caller_side);
 
-            // Stage a packet on listener side and caller side
+            // Stage a packet on listener side and caller side: metadata only
+            // (`(peer, len)`) over the persistent staging slot.
             let dummy_peer: std::net::SocketAddr = "127.0.0.1:39001".parse().unwrap();
-            owner.listener.as_mut().unwrap().pending_rx =
-                Some((dummy_peer, b"dummy-packet-1".to_vec()));
-            owner.caller.as_mut().unwrap().pending_rx =
-                Some((dummy_peer, b"dummy-packet-2".to_vec()));
+            let l_pkt = b"dummy-packet-1";
+            let c_pkt = b"dummy-packet-2";
+            {
+                let l = owner.listener.as_mut().unwrap();
+                l.stage_buf[..l_pkt.len()].copy_from_slice(l_pkt);
+                l.pending_rx = Some((dummy_peer, l_pkt.len()));
+            }
+            {
+                let c = owner.caller.as_mut().unwrap();
+                c.stage_buf[..c_pkt.len()].copy_from_slice(c_pkt);
+                c.pending_rx = Some((dummy_peer, c_pkt.len()));
+            }
 
             // has_pending_work must report true because staged packets exist!
             assert!(
@@ -2883,6 +2906,149 @@ mod tests {
             );
             assert!(owner.listener.as_ref().unwrap().pending_rx.is_none());
             assert!(owner.caller.as_ref().unwrap().pending_rx.is_none());
+        });
+    }
+
+    /// P0-1: when a datagram does not fit the remaining byte budget, the
+    /// listener must stage it by swapping the two persistent slots, keeping
+    /// the exact payload and leaving BOTH buffers at `DEFAULT_RX_SLOT_SIZE`.
+    #[test]
+    fn listener_staging_keeps_exact_payload_and_full_buffer_lengths() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            let l_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind listener std");
+            let l_addr = l_std.local_addr().expect("listener addr");
+            let l_sock = compio::net::UdpSocket::from_std(l_std).expect("adopt listener");
+            let l_cfg = crate::ListenerConfig::builder(l_addr)
+                .build()
+                .expect("listener config");
+            let listener_side = ListenerSide::new(l_sock, &l_cfg).expect("listener side");
+            let mut owner = Owner::new(16).with_listener(listener_side);
+
+            // A datagram larger than the byte budget we will grant.
+            let payload = vec![0xABu8; 900];
+            let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind sender");
+            sender.send_to(&payload, l_addr).expect("send");
+
+            // Park until the datagram is readable, then service with a byte
+            // budget below the datagram size so it must be staged.
+            let tiny = OwnerServiceBudget {
+                max_rx_bytes: 64,
+                ..Default::default()
+            };
+            let mut report = owner.service(Timestamp::from_micros(100), tiny).await;
+            for _ in 0..200 {
+                if owner.listener.as_ref().unwrap().pending_rx.is_some() {
+                    break;
+                }
+                owner
+                    .wait_for_activity(std::time::Duration::from_millis(10))
+                    .await;
+                report = owner.service(Timestamp::from_micros(200), tiny).await;
+            }
+            let _ = report;
+
+            let staged = owner
+                .listener
+                .as_ref()
+                .unwrap()
+                .pending_rx
+                .expect("oversized-to-budget datagram must be staged, not dropped");
+            assert_eq!(
+                staged.1,
+                payload.len(),
+                "staged length must be the datagram length"
+            );
+            let l = owner.listener.as_ref().unwrap();
+            assert_eq!(
+                l.stage_buf[..staged.1],
+                payload[..],
+                "staged bytes must be the exact datagram payload"
+            );
+            assert_eq!(
+                l.rx_buf.len(),
+                DEFAULT_RX_SLOT_SIZE,
+                "receive slot must not shrink when staging"
+            );
+            assert_eq!(
+                l.stage_buf.len(),
+                DEFAULT_RX_SLOT_SIZE,
+                "staging slot must not shrink when staging"
+            );
+
+            // Next visit with room consumes it and clears the staged metadata.
+            let report = owner
+                .service(Timestamp::from_micros(300), OwnerServiceBudget::default())
+                .await;
+            assert_eq!(
+                report.rx_packets, 1,
+                "staged packet must be consumed next visit"
+            );
+            assert_eq!(report.rx_bytes, payload.len());
+            let l = owner.listener.as_ref().unwrap();
+            assert!(
+                l.pending_rx.is_none(),
+                "staged metadata must clear on consume"
+            );
+            assert_eq!(l.rx_buf.len(), DEFAULT_RX_SLOT_SIZE);
+            assert_eq!(l.stage_buf.len(), DEFAULT_RX_SLOT_SIZE);
+        });
+    }
+
+    /// P0-1 (caller side): identical staging contract as the listener.
+    #[test]
+    fn caller_staging_keeps_exact_payload_and_full_buffer_lengths() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            let c_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind caller std");
+            let c_addr = c_std.local_addr().expect("caller addr");
+            let c_sock = compio::net::UdpSocket::from_std(c_std).expect("adopt caller");
+            let caller_side = OwnerCallerSide::new_single(c_sock);
+            let mut owner = Owner::new(16).with_caller(caller_side);
+
+            let payload = vec![0xCDu8; 1200];
+            let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind sender");
+            sender.send_to(&payload, c_addr).expect("send");
+
+            let tiny = OwnerServiceBudget {
+                max_rx_bytes: 64,
+                ..Default::default()
+            };
+            for _ in 0..200 {
+                owner.service(Timestamp::from_micros(100), tiny).await;
+                if owner.caller.as_ref().unwrap().pending_rx.is_some() {
+                    break;
+                }
+                owner
+                    .wait_for_activity(std::time::Duration::from_millis(10))
+                    .await;
+            }
+
+            let staged = owner
+                .caller
+                .as_ref()
+                .unwrap()
+                .pending_rx
+                .expect("oversized-to-budget datagram must be staged on the caller side");
+            assert_eq!(staged.1, payload.len());
+            let c = owner.caller.as_ref().unwrap();
+            assert_eq!(
+                c.stage_buf[..staged.1],
+                payload[..],
+                "staged bytes must be the exact datagram payload"
+            );
+            assert_eq!(c.rx_buf.len(), DEFAULT_RX_SLOT_SIZE);
+            assert_eq!(c.stage_buf.len(), DEFAULT_RX_SLOT_SIZE);
+
+            let report = owner
+                .service(Timestamp::from_micros(300), OwnerServiceBudget::default())
+                .await;
+            assert_eq!(report.rx_packets, 1);
+            assert_eq!(report.rx_bytes, payload.len());
+            let c = owner.caller.as_ref().unwrap();
+            assert!(c.pending_rx.is_none());
+            assert_eq!(c.rx_buf.len(), DEFAULT_RX_SLOT_SIZE);
+            assert_eq!(c.stage_buf.len(), DEFAULT_RX_SLOT_SIZE);
         });
     }
 
