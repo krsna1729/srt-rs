@@ -47,8 +47,42 @@ receiver process's own `STATS`.
 | 1 | 1/1 | 7,599 | 7,599 | 9,539 | 5,742 | 892 (9 %) | 0 / 0 / 2,376 | 7,599 | ok |
 | 10 | 10/10 | 75,990 | 75,990 | 95,070 | 91,284 | 1,794 (18 %) | 0 / 0 / 2,760 | 75,990 | ok |
 | 100 | 100/100 | 759,900 | 759,900 | 905,866 | 899,250 | 9,390 (94 %) | 0 / 18,122 / 40,801 | 759,900 | ok |
-| 600 | **0/600** | 0 | 0 | 0 | 0 | 0 | — | 0 | not reached |
-| 1000 | **0/1000** | 0 | 0 | 0 | 0 | 0 | — | 0 | not reached |
+| 600 (1 process) | **0/600** | 0 | 0 | 0 | 0 | 0 | — | 0 | not reached |
+| 1000 (1 process) | **0/1000** | 0 | 0 | 0 | 0 | 0 | — | 0 | not reached |
+
+### Sharded sender runs (same harness, several sender processes)
+
+A single sender process cannot offer 600 destinations on this host, so the
+earlier rows above are a *single-process* limit, not a datapath limit. Splitting
+the same destinations across several sender Owner processes (each with its own
+shared caller socket, all pointing at one receiver process) changes the answer:
+
+| fanout | sender shards | established | offered = accepted | wire datagrams (all shards) | sender CPU ms each | receiver `core_total` = `pkt_sent` | receiver `sec_a` (lost) | drain |
+|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 200 | 2 x 100 | 200/200 | 380,000 each | 656,223 / 680,078 | 4,890 / 4,832 | **641,647 = 641,647** | **0** | ok |
+| 600 | 4 x 150 | **600/600** | 342,000 each | 687,166 / 687,091 / 690,901 / 692,409 | ~2,860 each | 574,981 = 574,981 | **44,700** | ok |
+
+Raw logs: `scratch/qual/send-shard200-{0,1}.log`, `scratch/qual/send-shard*.log`,
+`scratch/qual/recv-shard{200,600}.log`.
+
+Reading them:
+
+- **600 destinations *do* establish when the sender is sharded**: 600/600 across
+  four Owner processes, each 100 % of its offered copies accepted, every shard
+  drained to zero with `short=0` and `failed=0`. The one-process 0/600 row above
+  is therefore a per-process admission limit on this host, not a transport
+  ceiling — the inference in the earlier reading of this document is now a
+  measurement.
+- **The receiver process is what breaks first at 600, not the sender.** With four
+  sender processes (~3.8 cores) plus one 600-port receiver process on six CPUs,
+  the receiver reports `sec_a = 44,700` lost DATA packets, while at 200
+  destinations (two senders) it reports `core_total == pkt_sent` with `sec_a = 0`.
+  The 600 row is thus a **clean establishment** result but not a clean delivery
+  result: receiver capacity, not the Owner datapath, is the binding constraint
+  there.
+- Sender CPU is ~95 % of one core per shard at both 150 and 300 offered
+  copies/second per shard, i.e. the per-copy cost is stable and the shard count
+  is what buys capacity.
 
 `managed_rx=false`, `rx_dropped=0`, `rx_truncated=0`, `short=0`, `failed=0`
 for every row.
@@ -68,13 +102,15 @@ sender lines are reproduced above in full).
   p99 = 0 with 9 %/18 % CPU. This is the same-host service-demand curve the
   library is supposed to publish; it is a *shard* limit, not a per-connection
   cost.
-- **600 and 1000 did not establish** with one sender process and one receiver
-  process on 6 CPUs: 0 of 600 and 0 of 1000 destinations reached `Connected`
-  inside the 30 s barrier (the receiver's own log shows `established=0`). No
-  600/1000 capacity claim is made from this host. Establishing those tiers
-  needs sharding (multiple sender Owner processes and a receiver with its own
-  capacity) plus a longer barrier, which is out of scope for a single 6-CPU
-  loopback box.
+- **600 establishes once the sender is sharded** (4 x 150: 600/600, all copies
+  accepted, all shards drained), and 200 with two shards is clean end-to-end
+  (`core_total == pkt_sent`, `sec_a = 0`). **600 clean delivery** is not
+  claimed: with four sender processes plus one receiver process on six CPUs the
+  receiver is starved and reports 44,700 lost DATA packets, so the binding
+  constraint at that tier is receiver capacity on this host.
+- **1000 is still unestablished** on this host (1/10/100/200 sharded all work;
+  1000 needs more sender shards and, especially, a receiver with its own
+  cores). No 1000 claim is made.
 - **These are raw-reader rows.** `IORING_REGISTER_PBUF_RING` fails with
   `EINVAL` on this kernel build (reproducer: `scratch/pbufring.c`), so the
   Owner selected `RawReadiness` and every row prints `managed_rx=false`.
