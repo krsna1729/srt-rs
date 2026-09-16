@@ -5448,63 +5448,87 @@ mod tests {
     }
 
     /// Fail-closed attach: under `ManagedRequired` an Owner refuses to attach
-    /// on a runtime whose provided-buffer ring cannot register, while
-    /// `ManagedPreferred` selects the raw reader and says so. Portable: the
-    /// capability probe is the same one production uses, so the test asserts
-    /// the branch appropriate to the host it runs on.
+    /// Fail-closed attach, in all four substrate states.
+    ///
+    /// `ManagedRequired` attaches a managed consumer only on an observed
+    /// `ManagedRxSubstrate::Available` — io_uring AND registered
+    /// provided-buffer ring AND `recvmsg` multishot — so no state of this host
+    /// can make it attach by accident. Portable: nothing here depends on what
+    /// the running kernel can actually do.
     #[test]
-    fn managed_required_fails_closed_without_the_substrate() {
+    fn managed_required_attaches_only_on_a_declared_available_substrate() {
         let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
-        let managed_available = runtime.block_on(async {
-            runtime.driver_type().is_iouring() && runtime.buffer_pool().is_ok()
-        });
-        runtime.block_on(async {
+        let bind_addr = || {
             // Reserve an address, then release it: the Owner binds it itself.
-            let l_addr = {
-                let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind probe");
-                probe.local_addr().expect("probe addr")
-            };
-            let cfg = crate::ListenerConfig::builder(l_addr)
+            let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind probe");
+            probe.local_addr().expect("probe addr")
+        };
+        let cfg_for = |addr| {
+            crate::ListenerConfig::builder(addr)
                 .topology(crate::ListenerTopology::PerPort)
                 .configure_transport(|t| t.promotion = crate::PromotionPolicy::Never)
                 .build()
-                .expect("listener config");
+                .expect("listener config")
+        };
+        runtime.block_on(async {
+            // 1. Nothing observed: refuse, whatever this host could provide.
+            let mut unobserved = Owner::new(4);
+            unobserved.set_rx_mode_policy(RxModePolicy::ManagedRequired);
+            let error = unobserved
+                .listen(&cfg_for(bind_addr()))
+                .expect_err("an unobserved substrate must never be read as available");
+            assert!(
+                error.to_string().contains("observed managed-RX substrate"),
+                "{error}"
+            );
 
-            // Each Owner needs its own port: binding the same address twice
-            // would fail with AddrInUse for reasons unrelated to RX mode.
-            let mut required = Owner::new(4);
-            required.set_rx_mode_policy(RxModePolicy::ManagedRequired);
-            let res = required.listen(&cfg);
-            if managed_available {
-                res.expect("a capable runtime must attach managed multishot");
-                assert_eq!(required.rx_mode(), Some(OwnerRxMode::ManagedMultishot));
-            } else {
-                assert!(
-                    res.is_err(),
-                    "ManagedRequired must refuse to attach without the managed substrate"
-                );
-            }
+            // 2. Observed, but not the full substrate: still refuse, and the
+            //    reason names the layer that failed.
+            let mut incomplete = Owner::new(4);
+            incomplete.set_rx_mode_policy(RxModePolicy::ManagedRequired);
+            incomplete
+                .set_rx_substrate(ManagedRxSubstrate::MultishotRecvUnsupported)
+                .expect("substrate before sessions");
+            let error = incomplete
+                .listen(&cfg_for(bind_addr()))
+                .expect_err("ring-without-multishot must refuse ManagedRequired");
+            assert!(error.to_string().contains("multishot"), "{error}");
 
-            let p_addr = {
-                let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind probe");
-                probe.local_addr().expect("probe addr")
-            };
-            let p_cfg = crate::ListenerConfig::builder(p_addr)
-                .topology(crate::ListenerTopology::PerPort)
-                .configure_transport(|t| t.promotion = crate::PromotionPolicy::Never)
-                .build()
-                .expect("listener config");
+            // 3. Declared available: attach, and select the managed datapath.
+            let mut capable = Owner::new(4);
+            capable.set_rx_mode_policy(RxModePolicy::ManagedRequired);
+            capable
+                .set_rx_substrate(ManagedRxSubstrate::Available)
+                .expect("substrate before sessions");
+            capable
+                .listen(&cfg_for(bind_addr()))
+                .expect("a declared managed substrate attaches");
+            assert_eq!(capable.rx_mode(), Some(OwnerRxMode::ManagedMultishot));
+
+            // 4. ManagedPreferred always attaches, and never claims managed
+            //    without an observation.
             let mut preferred = Owner::new(4);
             preferred.set_rx_mode_policy(RxModePolicy::ManagedPreferred);
             preferred
-                .listen(&p_cfg)
+                .listen(&cfg_for(bind_addr()))
                 .expect("ManagedPreferred always attaches");
-            let expected = if managed_available {
-                OwnerRxMode::ManagedMultishot
-            } else {
-                OwnerRxMode::RawReadiness
-            };
-            assert_eq!(preferred.rx_mode(), Some(expected));
+            assert_eq!(
+                preferred.rx_mode(),
+                Some(OwnerRxMode::RawReadiness),
+                "an unobserved substrate selects the raw reader, visibly"
+            );
+
+            // Both attached owners release what they own.
+            assert!(
+                capable
+                    .shutdown_and_drain(std::time::Duration::from_secs(5))
+                    .await
+            );
+            assert!(
+                preferred
+                    .shutdown_and_drain(std::time::Duration::from_secs(5))
+                    .await
+            );
         });
     }
 
