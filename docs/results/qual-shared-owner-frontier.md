@@ -1,4 +1,4 @@
-# Shared-Owner qualification frontier (`compio_shared_owner_qual`)
+# Shared-Owner qualification (`compio_shared_owner_qual`)
 
 Two-process run: the **sender is the production shared
 `srt_transport::compio::Owner`** on its production attach path
@@ -9,46 +9,112 @@ reserve-then-commit final-buffer TX); the receiver is an independent
 ```text
 # receiver (separate process)
 srt-bench runtime=compio mode=receiver <base_port> <duration> 120 --connections <N>
-# sender (this bench, separate process)
+# sender (separate process)
 target/release/deps/compio_shared_owner_qual-<hash> \
     --fanout <N> --tx-lanes 256 --connect-cc 64 \
     --duration-ms 3000 --base-port <base_port>
 ```
 
-F, K and H are **independent inputs**: `--fanout F` is the destination
+**F, K and H are independent inputs**: `--fanout F` is the destination
 population, `--tx-lanes K` the fixed TX lane count (= TX capacity), and
-`--connect-cc H` the number of connect attempts the pool works on at once. No
-run below derives K or H from F, and rows are only comparable at the same K/H.
-The harness respects the pool's own bounded request queue: a `connect` that the
-queue refuses is re-issued on a later tick and counted in `refused`.
+`--connect-cc H` the number of connect attempts the pool works on at once.
+Neither K nor H is derived from F, and the harness respects the pool's own
+bounded request queue by re-issuing a refused connect on a later tick (counted
+in `refused`). Rows are only comparable at the same K and H.
 
 ## Method
 
-- **Open-loop source at the declared 8 Mbps / 1316-byte cadence.** The source
-  clock advances on `PACKET_INTERVAL_US = 1316` and never waits for service
-  capacity; the loop then sleeps out the rest of the interval. A destination
-  that refuses a tick loses that copy and it is counted, never queued in a
-  harness backlog.
-- **Establishment barrier.** Nothing is measured until every logical
-  destination reports `Connected`, or a 30 s connect deadline expires.
-  `established` is printed per row, and a partial establishment is reported as
-  such rather than converted into a capacity result.
-- **TX-enabled drain to equilibrium** after the window, bounded by 10 s:
-  `pending_after_drain == 0` means protocol output *and* in-flight sends
-  reached zero, not merely that already-submitted operations were reaped.
+- **Wall-clock-anchored open-loop source.** Source deadlines are
+  `epoch + n x interval`, and the SRT `Timestamp` handed to the protocol is
+  `srt_epoch + wall_elapsed`. An overrunning service visit therefore cannot
+  slow the source down, nor can protocol time drift from wall time — which is
+  exactly when it would drift furthest. Every source interval in the window is
+  either a generated tick or an explicitly counted `missed_source_ticks`, so
+  the identity `expected_ticks == generated_ticks + missed_source_ticks` holds
+  and a service-coupled shortfall can never look like a lower offered rate.
+- **A destination that refuses a tick loses that copy** (counted in
+  `data_accepted` vs `data_offered`), never queued in a harness backlog.
+- **Establishment barrier, then a pre-measurement equilibrium drain**
+  (`pre_window_drained`): nothing is measured until every destination is
+  `Connected` and pre-window protocol/TX work has drained to zero, so no
+  handshake or control completion can cross the window start.
+- **The window and the drain are counted separately.** `inflight_at_window_end`
+  is sampled at the end of the window, before any drain;
+  `drain_submitted`/`drain_completed` count the post-window drain phase (bounded
+  by 10 s), and window figures never include drain traffic. `cpu_ms` covers the
+  window only.
 - **RX mode is recorded per row.** `managed_rx=false` means the Owner selected
   `RawReadiness`, so the row is a valid datapath result but **not** a
   managed-multishot qualification.
 
-## Host
+## Canonical rows (K = 256, H = 64, one sender process)
 
-Ubuntu `6.8.0-139-generic`, AMD EPYC (KVM), 6 CPUs, loopback. Release build,
-no CPU pinning, one sender Owner shard and one receiver process.
+Committed evidence for this exact table, with host/kernel/config provenance:
+[`qual-shared-owner-fixed-kh-4db7f0d.json`](qual-shared-owner-fixed-kh-4db7f0d.json)
+(SHA `4db7f0d`, kernel `6.8.0-139-generic`, 6 CPUs).
 
-## Results
+| F | established | pre-window drained | expected / generated / missed ticks | data offered = accepted | wire submitted (window) | missed ticks % | lateness p50 / p99 / max (µs) | drain | in-flight at window end | receiver DATA | receiver lost `sec_a` |
+|---:|---:|---|---|---:|---:|---:|---|---|---:|---:|---:|
+| 1 | 1/1 | yes | 2279 / 2265 / 13 | 2,265 | 2,842 | 0.6 % | 93 / 847 / 4,273 | ok | 1 | 2,265 | 0 |
+| 10 | 10/10 | yes | 2279 / 2274 / 5 | 22,740 | 28,440 | 0.2 % | 125 / 689 / 3,861 | ok | 10 | 22,740 | 0 |
+| 100 | 100/100 | yes | 2279 / 2233 / 46 | 223,300 | 234,279 | 2.0 % | 450 / 2,476 / 13,132 | ok | 256 | 223,300 | 0 |
+| 150 | 150/150 | yes | 2279 / 2269 / 10 | 340,350 | 226,016 | 0.4 % | 520 / 1,759 / 4,196 | ok | 256 | 340,350 | 0 |
+| 200 | 200/200 | yes | 2279 / 2267 / 12 | 453,400 | 197,005 | 0.5 % | 646 / 2,037 / 3,676 | ok | 256 | 453,400 | 0 |
+| 600 | **600/600** | no | 2279 / 2199 / 80 | 1,319,400 = 1,319,400 | 80,290 | 3.5 % | 1,180 / 4,641 / 17,040 | **not reached** | 256 | 561,548 | 73 |
+| 1000 | **1000/1000** | no | 2279 / 1871 / 408 | 1,871,000 = 1,871,000 | 12,162 | 17.9 % | 2,172 / 6,156 / 35,591 | **not reached** | 256 | 566,150 | 566 |
 
-Sender lines are verbatim `SHARED_OWNER_QUAL` output; receiver lines are the
-receiver process's own `STATS`.
+`short = 0`, `failed = 0`, `peer_local = 0`, `transient = 0`, `tx_failures_pending = 0`,
+`rx_dropped = 0`, `rx_truncated = 0` on every row. Raw harness stdout for the
+seven runs is reproduced verbatim in the JSON above; the runs also remain in
+`scratch/qual5/` on the measuring host (gitignored).
+
+What this establishes, and what it does not:
+
+- **Establishment is a configuration fact and it holds at 1000 destinations
+  from ONE sender process** at K=256/H=64, with 100 % of offered copies
+  accepted. The one-process 0/600 rows in the superseded table below were a
+  handshake-concurrency artifact of `max_in_flight = fanout`, not a datapath
+  limit.
+- **Delivery reconciles exactly through F=200**: every row reaches a drained
+  equilibrium (`drain_ok`, `pending_after_drain = 0`) with the receiver
+  reporting exactly `data_offered` DATA packets and zero loss (`sec_a = 0`),
+  and p99 source lateness ≤ 2.5 ms.
+- **F=600 and F=1000 are OVERLOAD rows, not capacity results.** The shard
+  saturates: the source itself starts missing intervals (3.5 % at 600, 17.9 %
+  at 1000 — the honest measure of "one core cannot carry F x 8 Mbps" on this
+  host), the window's wire submissions collapse relative to accepted copies,
+  the receiver loses 73 and 566 DATA packets, and the drain deadline expires
+  with 256 sends still outstanding. No clean-delivery claim is made for either
+  tier.
+- **These are raw-reader rows.** `IORING_REGISTER_PBUF_RING` fails with
+  `EINVAL` on this kernel build, so the Owner selected `RawReadiness` and every
+  row prints `managed_rx=false`;
+  `ManagedRxQualification::managed_rx_active()` is consequently false here. The
+  managed datapath is proven separately by booting a capable kernel under QEMU
+  — see [`managed-rx-verification.md`](managed-rx-verification.md).
+
+### The measurement itself was a defect until this head
+
+The rows above are the first canonical set whose source accounting is honest.
+The earlier harness generated one tick per loop iteration and advanced protocol
+time by a fixed 1316 us per iteration, so under overload a slow `service()` call
+reduced the number of ticks generated instead of being counted as source
+shortfall: F=1000 "offered" 2,058,000 copies where a true 3 s / 1316 us cadence
+called for ~2,279 ticks x 1000 destinations, and protocol time diverged from
+wall time by hundreds of milliseconds in exactly the overload case being
+characterized. The fixed harness reports `expected_ticks`,
+`generated_ticks`, and `missed_source_ticks`, and the identity
+`expected == generated + missed` is what makes the F=600/F=1000 rows above
+readable.
+
+## Superseded / historical evidence
+
+Kept for provenance only. **Both tables below were produced by harness builds
+whose source accounting was service-coupled and whose counters mixed the
+measurement window with the post-window drain; their `submitted` figures and
+their "lossless" readings are not comparable with the canonical table above.**
+The first table also used `tx_capacity = (fanout * 4).clamp(256, 4096)` and
+`max_in_flight = fanout`, so its K and H varied with F.
 
 | fanout | established | offered | accepted | wire datagrams submitted | sender completed_ok | sender CPU ms / 10 s | source lateness p50 / p99 / max (µs) | receiver `core_total` | drain |
 |---:|---:|---:|---:|---:|---:|---:|---|---:|---|
@@ -57,85 +123,6 @@ receiver process's own `STATS`.
 | 100 | 100/100 | 759,900 | 759,900 | 905,866 | 899,250 | 9,390 (94 %) | 0 / 18,122 / 40,801 | 759,900 | ok |
 | 600 (1 process) | **0/600** | 0 | 0 | 0 | 0 | 0 | — | 0 | not reached |
 | 1000 (1 process) | **0/1000** | 0 | 0 | 0 | 0 | 0 | — | 0 | not reached |
-
-## Canonical fixed-K / fixed-H run (K = 256, H = 64)
-
-One **sender process** with fixed `--tx-lanes 256 --connect-cc 64`, so K and H
-never vary with F. The earlier rows above used
-`tx_capacity = (fanout * 4).clamp(256, 4096)` and `max_in_flight = fanout` and
-are kept only as historical/intermediate evidence.
-
-The sender now also **drains to equilibrium before the window opens**
-(`pre_window_drained`), so no handshake or control completion can cross the
-measurement boundary, and the printed fields name their domains:
-`data_offered`/`data_accepted` are application copies, `tx_submitted_wire` and
-`tx_completed` count wire datagrams (which include control traffic and
-retransmissions and therefore need not equal the copy counts).
-
-### Canonical rows (measured 2026-09-16, head `f19dcd0`)
-
-| F | established | pre-window drained | data offered = accepted | wire submitted = completed | CPU ms / 3 s | lateness p50 / p99 / max (µs) | drain | in-flight at window end | receiver `core_total` | `sec_a` |
-|---:|---:|---|---:|---:|---:|---|---|---:|---:|---:|
-| 1 | 1/1 | yes | 2,280 | 2,857 | 477 | 0 / 3,117 / 9,765 | ok | 0 | 2,280 | 0 |
-| 10 | 10/10 | yes | 22,790 | 28,500 | 617 | 0 / 1,245 / 6,733 | ok | 0 | 22,790 | 0 |
-| 100 | 100/100 | yes | 228,000 | 259,643 | 2,628 | 0 / 608 / 3,815 | ok | 0 | 228,000 | 0 |
-| 150 | 150/150 | yes | 342,000 | 497,781 | 2,703 | 0 / 956 / 4,457 | ok | 0 | 342,000 | 0 |
-| 200 | 200/200 | yes | 456,000 | 762,698 | 2,758 | 0 / 486 / 1,428 | ok | 0 | 456,000 | 0 |
-| 600 | **600/600** | no | 1,368,000 = 1,368,000 | 1,132,343 | 2,991 | 0 / 26,617 / 42,912 | **not reached** | 256 | 598,068 | 0 |
-| 1000 | **1000/1000** | no | 2,058,000 = 2,058,000 | 1,062,621 | 3,001 | 199,136 / 409,323 / 410,835 | **not reached** | 256 | 585,142 | 0 |
-
-Raw logs: `scratch/qual3/send-<F>.log`, `scratch/qual3/recv-<F>.log`.
-
-**The harness is sensitive to co-resident load, and one row demonstrates it.**
-The same F=100 configuration measured 1,224,858 wire datagrams with a
-non-drained window and a receiver RTT of 804 ms while other work was running on
-the host, and 259,643 wire datagrams with a drained window and 73 ms RTT when
-run alone (the row above). The difference was entirely on the receiver side
-(its own `elapsed_s` doubled), with `sec_a = 0` in both. Treat any single row
-as a same-host, same-load observation, and re-run before reading a frontier
-point off it.
-
-Rows through 200 reconcile delivery exactly (`core_total == data_offered`,
-`sec_a = 0`) with a drained window and p99 source lateness under 1 ms.
-**600 and 1000 are establishment and overload rows: they are NOT one-shard
-drained-equilibrium capacity results**, and the pre-window equilibrium itself
-could not be reached at those tiers before the window opened.
-
-| F | issued | admitted | queued | refused | established | offered = accepted | wire datagrams submitted | completed_ok | sender CPU ms / 3 s window | source lateness p50 / p99 / max (µs) | receiver `core_total` = `pkt_sent` | `sec_a` | drain | pool free/cap |
-|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---|---|
-| 1 | 1 | 1 | 0 | 0 | 1/1 | 2,280 | 2,861 | 2,861 | 310 | 0 / 0 / 1,408 | 2,280 = 2,280 | 0 | ok | 256/256 |
-| 10 | 10 | 10 | 0 | 0 | 10/10 | 22,800 | 28,530 | 28,530 | 520 | 0 / 0 / 643 | 22,800 = 22,800 | 0 | ok | 256/256 |
-| 100 | 100 | 100 | 36 | 0 | 100/100 | 228,000 | 269,038 | 269,093 | 2,557 | 0 / 0 / 1,845 | 228,000 = 228,000 | 0 | ok | 256/256 |
-| 150 | 150 | 150 | 86 | 24 | 150/150 | 342,000 | 471,140 | 471,309 | 2,660 | 0 / 134 / 2,331 | 342,000 = 342,000 | 0 | ok | 256/256 |
-| 200 | 200 | 200 | 136 | 74 | 200/200 | 456,000 | 721,718 | 721,847 | 2,734 | 0 / 445 / 1,782 | 456,000 = 456,000 | 0 | ok | 256/256 |
-| 600 | 600 | 600 | 536 | 567 | **600/600** | 1,368,000 | 1,114,364 | 1,114,364 | 2,978 | 0 / 29,970 / 39,506 | 943,296 = 943,296 | 0 | **not reached** | 0/256 |
-| 1000 | 1000 | 1000 | 936 | 1,305 | **1000/1000** | 2,270,000 | 1,011,843 | 1,011,843 | 3,000 | 130,684 / 268,407 / 271,617 | 814,117 = 814,117 | 0 | **not reached** | 0/256 |
-
-Raw logs: `scratch/qual2/send-<F>.log`, `scratch/qual2/recv-<F>.log`.
-
-What these rows establish, and what they do not:
-
-- **A single sender process establishes 600 and 1000 destinations** at
-  K=256/H=64, with 100 % of offered copies accepted and every destination
-  `Connected`. That retires the earlier "600 cannot establish in one process"
-  reading: with H fixed at 64 and the pool's bounded queue respected by the
-  harness, one process does it. The 1-process 0/600 rows above were a
-  *handshake-concurrency* artifact (`max_in_flight = fanout` = 600 concurrent
-  handshakes), not a datapath limit.
-- **Zero receiver loss to F = 200.** `core_total == pkt_sent` and `sec_a = 0`
-  on every row through 200, with `drain_ok=true` and `pending_after_drain=0`:
-  the shard kept pace with F x 8 Mbps.
-- **F = 600 and F = 1000 saturate, and that is a capacity statement, not a
-  correctness one.** Offered load is F x 8 Mbps (4.8 and 8.0 Gbps on one
-  loopback shard), far beyond one core of UDP. Delivery stayed lossless
-  (`sec_a = 0`, `core_total == pkt_sent`) but the drain deadline expired with
-  257 in flight and the pool at 0/256 free, and source lateness grew to
-  30 ms p99 (F=600) and 131 ms p50 / 268 ms p99 (F=1000). The sender used
-  ~3.0 s of CPU in a 3.0 s window: **one shard is one core**, so the frontier is
-  "how many destinations one core can carry at the offered rate", not "how many
-  can be established".
-- **`not reached` drain is reported as such.** No row claims a drained
-  equilibrium it did not observe.
 
 ### Sharded sender runs (same harness, several sender processes)
 
@@ -162,9 +149,11 @@ Reading them:
   sender processes (~3.8 cores) plus one 600-port receiver process on six CPUs,
   the receiver reports `sec_a = 44,700` lost DATA packets, while at 200
   destinations (two senders) it reports `core_total == pkt_sent` with `sec_a = 0`.
-  The 600 row is thus a **clean establishment** result but not a clean delivery
-  result: receiver capacity, not the Owner datapath, is the binding constraint
-  there.
+  The 600 row is thus a clean establishment result but not a clean delivery
+  result. (Historical reading, retained verbatim: with the corrected source
+  accounting the canonical F=600 row above shows the binding constraint is the
+  sender shard's own service capacity — 80 missed source ticks and 73 lost
+  receiver DATA packets — rather than a two-process receiver limit.)
 - Sender CPU is ~95 % of one core per shard at both 150 and 300 offered
   copies/second per shard, i.e. the per-copy cost is stable and the shard count
   is what buys capacity.
@@ -175,44 +164,13 @@ for every row.
 Raw logs: `scratch/qual/recv-p{1,10,100,600}.log` (gitignored scratch; the
 sender lines are reproduced above in full).
 
-## Interpretation
+## Deferred
 
-- **Delivery reconciles exactly at 100 destinations**: the sender accepted
-  759,900 copies and the receiver's `core_total` is 759,900 — no loss inside
-  the measured steady state, with `drain_ok=true` and
-  `pending_after_drain=0`.
-- **One Owner core is the limit at ~100 destinations** on this host: sender
-  CPU is 94 % of one core for the 10 s window and source lateness appears
-  (p99 18.1 ms, max 40.8 ms) at exactly that tier, while 1 and 10 stay at
-  p99 = 0 with 9 %/18 % CPU. This is the same-host service-demand curve the
-  library is supposed to publish; it is a *shard* limit, not a per-connection
-  cost.
-- **A single sender process establishes 600/600 and 1000/1000** at fixed
-  K=256/H=64 with every copy accepted, and delivery stays lossless
-  (`receiver sec_a = 0`, `core_total == pkt_sent`) to F = 200 with a drained
-  equilibrium. Both high tiers saturate the one-core shard at F x 8 Mbps
-  offered load and report their missed drain honestly; no clean *delivery*
-  capacity is claimed for them.
-- **1000 is established but not capacity-qualified.** Establishment is a
-  configuration fact; the capacity statement is the drained-equilibrium row,
-  and there is none at 1000.
-- **These are raw-reader rows.** `IORING_REGISTER_PBUF_RING` fails with
-  `EINVAL` on this kernel build (reproducer: `scratch/pbufring.c`), so the
-  Owner selected `RawReadiness` and every row prints `managed_rx=false`.
-  `ManagedRxQualification::managed_rx_active()` is consequently **false**
-  here: a managed-multishot qualification requires a kernel whose
-  provided-buffer ring registers. That kernel (`7.0.0-31-generic`) is not
-  bootable on this development host, so the managed datapath is proven by
-  booting it under QEMU instead — see
-  [`managed-rx-verification.md`](managed-rx-verification.md).
-
-## What this does and does not establish
-
-- Establishes: the production Owner attaches, admits, sends, drains to
-  equilibrium, and reconciles delivery end-to-end against an external
-  receiver process from 1 to 200 destinations with zero loss, and establishes
-  600/1000 with every copy accepted, at a fixed K=256/H=64.
-- Does not establish: a drained-equilibrium capacity figure for 600/1000 (the
-  one-core shard saturates at F x 8 Mbps), or a managed-multishot
-  qualification on this kernel (proven separately under QEMU on a capable
-  kernel).
+- A drained-equilibrium capacity figure for 600/1000 destinations: on this host
+  one Owner shard is CPU-bound well below F x 8 Mbps, and the honest next step
+  is sharding on target hardware rather than more harness tuning.
+- A managed-multishot qualification on this host (proven separately under
+  QEMU on a capable kernel).
+- Per-connection-scaling questions beyond establishment: the harness now
+  separates window from drain, so a later qualification run can add a
+  steady-state delivery-rate column without redefining the existing ones.
