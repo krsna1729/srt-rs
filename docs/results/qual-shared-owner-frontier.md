@@ -11,8 +11,16 @@ reserve-then-commit final-buffer TX); the receiver is an independent
 srt-bench runtime=compio mode=receiver <base_port> <duration> 120 --connections <N>
 # sender (this bench, separate process)
 target/release/deps/compio_shared_owner_qual-<hash> \
-    --fanout <N> --duration-ms 10000 --base-port <base_port>
+    --fanout <N> --tx-lanes 256 --connect-cc 64 \
+    --duration-ms 3000 --base-port <base_port>
 ```
+
+F, K and H are **independent inputs**: `--fanout F` is the destination
+population, `--tx-lanes K` the fixed TX lane count (= TX capacity), and
+`--connect-cc H` the number of connect attempts the pool works on at once. No
+run below derives K or H from F, and rows are only comparable at the same K/H.
+The harness respects the pool's own bounded request queue: a `connect` that the
+queue refuses is re-issued on a later tick and counted in `refused`.
 
 ## Method
 
@@ -50,6 +58,50 @@ receiver process's own `STATS`.
 | 600 (1 process) | **0/600** | 0 | 0 | 0 | 0 | 0 | — | 0 | not reached |
 | 1000 (1 process) | **0/1000** | 0 | 0 | 0 | 0 | 0 | — | 0 | not reached |
 
+## Canonical fixed-K / fixed-H run (K = 256, H = 64)
+
+These are the post-closure-pass rows: one **sender process** with fixed
+`--tx-lanes 256 --connect-cc 64`, so K and H no longer vary with F. The
+earlier rows above used `tx_capacity = (fanout * 4).clamp(256, 4096)` and
+`max_in_flight = fanout` and are kept only as historical/intermediate
+evidence.
+
+| F | issued | admitted | queued | refused | established | offered = accepted | wire datagrams submitted | completed_ok | sender CPU ms / 3 s window | source lateness p50 / p99 / max (µs) | receiver `core_total` = `pkt_sent` | `sec_a` | drain | pool free/cap |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---|---|
+| 1 | 1 | 1 | 0 | 0 | 1/1 | 2,280 | 2,861 | 2,861 | 310 | 0 / 0 / 1,408 | 2,280 = 2,280 | 0 | ok | 256/256 |
+| 10 | 10 | 10 | 0 | 0 | 10/10 | 22,800 | 28,530 | 28,530 | 520 | 0 / 0 / 643 | 22,800 = 22,800 | 0 | ok | 256/256 |
+| 100 | 100 | 100 | 36 | 0 | 100/100 | 228,000 | 269,038 | 269,093 | 2,557 | 0 / 0 / 1,845 | 228,000 = 228,000 | 0 | ok | 256/256 |
+| 150 | 150 | 150 | 86 | 24 | 150/150 | 342,000 | 471,140 | 471,309 | 2,660 | 0 / 134 / 2,331 | 342,000 = 342,000 | 0 | ok | 256/256 |
+| 200 | 200 | 200 | 136 | 74 | 200/200 | 456,000 | 721,718 | 721,847 | 2,734 | 0 / 445 / 1,782 | 456,000 = 456,000 | 0 | ok | 256/256 |
+| 600 | 600 | 600 | 536 | 567 | **600/600** | 1,368,000 | 1,114,364 | 1,114,364 | 2,978 | 0 / 29,970 / 39,506 | 943,296 = 943,296 | 0 | **not reached** | 0/256 |
+| 1000 | 1000 | 1000 | 936 | 1,305 | **1000/1000** | 2,270,000 | 1,011,843 | 1,011,843 | 3,000 | 130,684 / 268,407 / 271,617 | 814,117 = 814,117 | 0 | **not reached** | 0/256 |
+
+Raw logs: `scratch/qual2/send-<F>.log`, `scratch/qual2/recv-<F>.log`.
+
+What these rows establish, and what they do not:
+
+- **A single sender process establishes 600 and 1000 destinations** at
+  K=256/H=64, with 100 % of offered copies accepted and every destination
+  `Connected`. That retires the earlier "600 cannot establish in one process"
+  reading: with H fixed at 64 and the pool's bounded queue respected by the
+  harness, one process does it. The 1-process 0/600 rows above were a
+  *handshake-concurrency* artifact (`max_in_flight = fanout` = 600 concurrent
+  handshakes), not a datapath limit.
+- **Zero receiver loss to F = 200.** `core_total == pkt_sent` and `sec_a = 0`
+  on every row through 200, with `drain_ok=true` and `pending_after_drain=0`:
+  the shard kept pace with F x 8 Mbps.
+- **F = 600 and F = 1000 saturate, and that is a capacity statement, not a
+  correctness one.** Offered load is F x 8 Mbps (4.8 and 8.0 Gbps on one
+  loopback shard), far beyond one core of UDP. Delivery stayed lossless
+  (`sec_a = 0`, `core_total == pkt_sent`) but the drain deadline expired with
+  257 in flight and the pool at 0/256 free, and source lateness grew to
+  30 ms p99 (F=600) and 131 ms p50 / 268 ms p99 (F=1000). The sender used
+  ~3.0 s of CPU in a 3.0 s window: **one shard is one core**, so the frontier is
+  "how many destinations one core can carry at the offered rate", not "how many
+  can be established".
+- **`not reached` drain is reported as such.** No row claims a drained
+  equilibrium it did not observe.
+
 ### Sharded sender runs (same harness, several sender processes)
 
 A single sender process cannot offer 600 destinations on this host, so the
@@ -67,12 +119,10 @@ Raw logs: `scratch/qual/send-shard200-{0,1}.log`, `scratch/qual/send-shard*.log`
 
 Reading them:
 
-- **600 destinations *do* establish when the sender is sharded**: 600/600 across
-  four Owner processes, each 100 % of its offered copies accepted, every shard
-  drained to zero with `short=0` and `failed=0`. The one-process 0/600 row above
-  is therefore a per-process admission limit on this host, not a transport
-  ceiling — the inference in the earlier reading of this document is now a
-  measurement.
+- **Historical/intermediate evidence.** These sharded rows used the
+  fanout-derived configuration (`tx_capacity = fanout * 4`, `max_in_flight =
+  fanout`), so they are establishment evidence only and are superseded by the
+  fixed-K/H table above: 600 is not a per-process limit at all.
 - **The receiver process is what breaks first at 600, not the sender.** With four
   sender processes (~3.8 cores) plus one 600-port receiver process on six CPUs,
   the receiver reports `sec_a = 44,700` lost DATA packets, while at 200
@@ -102,28 +152,32 @@ sender lines are reproduced above in full).
   p99 = 0 with 9 %/18 % CPU. This is the same-host service-demand curve the
   library is supposed to publish; it is a *shard* limit, not a per-connection
   cost.
-- **600 establishes once the sender is sharded** (4 x 150: 600/600, all copies
-  accepted, all shards drained), and 200 with two shards is clean end-to-end
-  (`core_total == pkt_sent`, `sec_a = 0`). **600 clean delivery** is not
-  claimed: with four sender processes plus one receiver process on six CPUs the
-  receiver is starved and reports 44,700 lost DATA packets, so the binding
-  constraint at that tier is receiver capacity on this host.
-- **1000 is still unestablished** on this host (1/10/100/200 sharded all work;
-  1000 needs more sender shards and, especially, a receiver with its own
-  cores). No 1000 claim is made.
+- **A single sender process establishes 600/600 and 1000/1000** at fixed
+  K=256/H=64 with every copy accepted, and delivery stays lossless
+  (`receiver sec_a = 0`, `core_total == pkt_sent`) to F = 200 with a drained
+  equilibrium. Both high tiers saturate the one-core shard at F x 8 Mbps
+  offered load and report their missed drain honestly; no clean *delivery*
+  capacity is claimed for them.
+- **1000 is established but not capacity-qualified.** Establishment is a
+  configuration fact; the capacity statement is the drained-equilibrium row,
+  and there is none at 1000.
 - **These are raw-reader rows.** `IORING_REGISTER_PBUF_RING` fails with
   `EINVAL` on this kernel build (reproducer: `scratch/pbufring.c`), so the
   Owner selected `RawReadiness` and every row prints `managed_rx=false`.
-  `ProductionQualification::qualified()` is consequently **false** here: a
-  managed-multishot qualification requires a kernel whose provided-buffer
-  ring registers. Linux `7.0.0-31-generic` is installed on this host but not
-  booted.
+  `ManagedRxQualification::managed_rx_active()` is consequently **false**
+  here: a managed-multishot qualification requires a kernel whose
+  provided-buffer ring registers. That kernel (`7.0.0-31-generic`) is not
+  bootable on this development host, so the managed datapath is proven by
+  booting it under QEMU instead — see
+  [`managed-rx-verification.md`](managed-rx-verification.md).
 
 ## What this does and does not establish
 
 - Establishes: the production Owner attaches, admits, sends, drains to
   equilibrium, and reconciles delivery end-to-end against an external
-  receiver process at 1/10/100 destinations, with honest accounting of
-  latency and CPU.
-- Does not establish: a 600/1000 frontier (did not establish here), or a
-  managed-multishot qualification (this kernel cannot provide the substrate).
+  receiver process from 1 to 200 destinations with zero loss, and establishes
+  600/1000 with every copy accepted, at a fixed K=256/H=64.
+- Does not establish: a drained-equilibrium capacity figure for 600/1000 (the
+  one-core shard saturates at F x 8 Mbps), or a managed-multishot
+  qualification on this kernel (proven separately under QEMU on a capable
+  kernel).

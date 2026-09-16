@@ -5356,8 +5356,20 @@ mod tests {
                 .configure_transport(|t| t.promotion = crate::PromotionPolicy::Never)
                 .build()
                 .expect("listener config");
+            // Capability is declared once, from an observation of THIS
+            // runtime, exactly as production does it.
+            let substrate = observe_production_runtime(&built, 64, 1500)
+                .await
+                .managed_rx_substrate();
+            assert!(
+                substrate.is_available(),
+                "the capable-kernel gate above promised the managed substrate"
+            );
             let mut owner = Owner::new(64);
             owner.set_rx_mode_policy(RxModePolicy::ManagedRequired);
+            owner
+                .set_rx_substrate(substrate)
+                .expect("substrate before sessions");
             owner
                 .listen(&l_cfg)
                 .expect("a capable kernel must attach managed multishot");

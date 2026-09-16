@@ -6,7 +6,7 @@
 development host (`Ubuntu 6.8.0-139-generic`, valid params, page-aligned
 ring, power-of-two entries — reproducer `scratch/pbufring.c`). On that kernel
 the Owner correctly selects `RawReadiness` and
-`ProductionQualification::qualified()` is **false**.
+`ManagedRxQualification::managed_rx_active()` is **false**.
 
 So the managed datapath is implemented and selectable, but the dev host cannot
 exercise it. This document records the run that does, on a kernel whose
@@ -24,8 +24,12 @@ The production path, not a replica of it:
   provided-buffer pool, `rx_buffer_len = 2048` (derived from the 1500-byte
   wire ceiling: 256 slots x 2048 B = 512 KiB, not 16 MiB).
 - `Owner::new(64)` + `set_rx_mode_policy(RxModePolicy::ManagedRequired)` +
-  `Owner::listen(&ListenerConfig)` — the sealed production attach path, which
-  under `ManagedRequired` refuses to attach at all without the substrate.
+  `set_rx_substrate(observe_production_runtime(&runtime, ..).managed_rx_substrate())`
+  + `Owner::listen(&ListenerConfig)` — the sealed production attach path. Under
+  `ManagedRequired` the Owner attaches a managed consumer only on
+  `ManagedRxSubstrate::Available` (io_uring AND provided-buffer ring AND
+  recvmsg multishot) and refuses without an observation, so the test observes
+  the substrate of its own runtime first, exactly as production does.
 - Traffic: one 64-byte datagram (legal) and one 4096-byte datagram (beyond
   both the 1500-byte wire ceiling and the 2048-byte ring slot).
 
@@ -50,18 +54,32 @@ one binary, with an `init` that mounts `/proc`, `/sys`, `/dev`, brings up
 
 ## Results
 
-### Committed regression test, kernel 7.0.0-31-generic
+### Committed tests, kernel 7.0.0-31-generic, ASan/LSan build
+
+Re-run on the closure-pass head (`735aa41`), where the managed loop was
+restructured to hold no strong ring reference across the receive await and
+`shutdown_and_drain` began awaiting the consumer:
 
 ```text
 GUEST_READY kernel=7.0.0-31-generic
-
-running 1 test
 test compio_transport::tests::managed_multishot_delivers_and_counts_truncated_datagrams ... ok
-
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 292 filtered out; finished in 0.29s
-
-GUEST_TEST_EXIT=0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 359 filtered out; finished in 0.84s
+GUEST_MANAGED_EXIT=0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 359 filtered out; finished in 0.25s
+GUEST_SHUTDOWN_EXIT=0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 359 filtered out; finished in 0.14s
+GUEST_LIFETIME_EXIT=0
 ```
+
+- `managed_multishot_delivers_and_counts_truncated_datagrams` — the managed
+  datapath end to end, ending with the shutdown lease-return assertions.
+- `shutdown_verdict_requires_rx_quiescence` — teardown reaches quiescence with
+  a real managed consumer attached, and the verdict is false while one is live.
+- `managed_rx_task_holds_no_strong_ring_across_the_receive_await` — the
+  production loop function parked in its receive await holds no strong ring
+  reference, so dropping the owner frees the ring immediately.
+
+No LeakSanitizer report appears in any of the three runs.
 
 ### Standalone probe, same kernel
 
@@ -110,8 +128,6 @@ Re-running the same ASan build in the same guest:
 GUEST_READY kernel=7.0.0-31-generic
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 346 filtered out; finished in 0.61s
 GUEST_MANAGED_EXIT=0
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 346 filtered out; finished in 0.22s
-GUEST_FAULT_EXIT=0
 ```
 
 No leak. This is why the managed-buffer contract is "return to zero after
@@ -141,10 +157,11 @@ drain/shutdown": cancelling without awaiting is not enough.
 ## What this does not establish
 
 - Not a capacity result. `docs/results/qual-shared-owner-frontier.md` remains
-  the capacity evidence, and its rows are raw-reader rows on this host; the
-  600/1000 tiers did not establish there for host/sharding reasons.
+  the capacity evidence, and its rows are raw-reader rows on this host
+  (`managed_rx=false`); 600/1000 establish there at a fixed K/H but do not
+  reach a drained equilibrium, so no clean delivery capacity is claimed.
 - Not a claim that this dev host is qualified: on `6.8.0-139-generic` the
-  Owner still runs `RawReadiness` and `ProductionQualification::qualified()`
+  Owner still runs `RawReadiness` and `ManagedRxQualification::managed_rx_active()`
   is false.
 - Not a substitute for running the qualification harness on a production
   kernel; it narrows the remaining work to "run the existing harness on a

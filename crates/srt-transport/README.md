@@ -58,7 +58,7 @@ service budget at the same time.
   `RxModePolicy::ManagedRequired` makes a host without the provided-buffer
   substrate a startup error instead of a silent degrade. Host capability
   (`CompioProductionProfile::host_managed_rx_capable`) and the selected mode
-  are deliberately different facts; `ProductionQualification::qualified()`
+  are deliberately different facts; `ManagedRxQualification::managed_rx_active()`
   requires both.
 * **Direct final-buffer TX** is the only datapath on this path: the protocol
   materializes into a reserved `TxPool` slot (`DatagramSink::acquire` →
