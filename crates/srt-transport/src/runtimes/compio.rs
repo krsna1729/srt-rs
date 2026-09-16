@@ -719,10 +719,30 @@ pub struct OwnerTxCompletionStats {
 }
 
 /// Typed fault state for a Compio Owner.
+///
+/// A fault stops new admission and new TX submission on that Owner: it is
+/// never a silently reduced-capacity steady state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OwnerFault {
     /// A fixed TX worker task terminated unexpectedly (panicked).
     WorkerPanicked { lane: usize },
+    /// A lane's `send_to` completed having written fewer bytes than the
+    /// materialized wire length. The datagram did not reach the wire intact,
+    /// and the final buffer is already consumed by the protocol output path,
+    /// so this is a fault rather than a retryable metric.
+    TxShortSend {
+        peer: SocketAddr,
+        expected: usize,
+        sent: usize,
+    },
+    /// A lane's `send_to` failed: the datagram was not delivered. The
+    /// materialized wire buffer is retained (returned to the pool) but the
+    /// protocol output that produced it is already consumed, so this is a
+    /// fault, not silent loss with a healthy-looking transport.
+    TxFailed {
+        peer: SocketAddr,
+        kind: io::ErrorKind,
+    },
     /// Owner has been shut down.
     Shutdown,
 }
@@ -941,6 +961,29 @@ impl TxEngine {
                 .completion
                 .take()
                 .expect("completion present when indexed");
+            // Single policy point for every completion path (`service`,
+            // `wait_for_activity`, and quiescent drain): the first short send
+            // or send error faults the Owner, and a fault stops new admission
+            // and new TX. Later completions only add statistics -- the
+            // originating fault is the one surfaced.
+            if self.fault.is_none() {
+                match completion.res {
+                    Ok(sent) if sent == completion.meta.expected_len => {}
+                    Ok(sent) => {
+                        self.fault = Some(OwnerFault::TxShortSend {
+                            peer: completion.meta.peer,
+                            expected: completion.meta.expected_len,
+                            sent,
+                        });
+                    }
+                    Err(ref error) => {
+                        self.fault = Some(OwnerFault::TxFailed {
+                            peer: completion.meta.peer,
+                            kind: error.kind(),
+                        });
+                    }
+                }
+            }
             on_completion(completion.meta, completion.res, completion.buf);
             self.idle_lanes.push(lane_idx);
             self.in_flight_count = self.in_flight_count.saturating_sub(1);
@@ -1018,7 +1061,9 @@ impl TxEngine {
             return;
         }
         self.shutdown = true;
-        self.fault = Some(OwnerFault::Shutdown);
+        if self.fault.is_none() {
+            self.fault = Some(OwnerFault::Shutdown);
+        }
         for lane in &self.lanes {
             let mut s = lane.state.borrow_mut();
             s.shutdown = true;
@@ -1047,7 +1092,9 @@ impl TxEngine {
             return;
         }
         self.shutdown = true;
-        self.fault = Some(OwnerFault::Shutdown);
+        if self.fault.is_none() {
+            self.fault = Some(OwnerFault::Shutdown);
+        }
         for lane in &self.lanes {
             let mut s = lane.state.borrow_mut();
             s.shutdown = true;
@@ -3406,6 +3453,108 @@ mod tests {
             );
             assert_eq!(owner.tx_in_flight(), 0);
             assert!(owner.fault().is_some(), "shutdown sets fault");
+        });
+    }
+
+    /// P0-2: a short send is a typed Owner fault, and a fault stops new TX.
+    #[test]
+    fn short_send_faults_owner_and_stops_new_tx() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            let c_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+            let c_sock = compio::net::UdpSocket::from_std(c_std).expect("adopt");
+            let caller_side = OwnerCallerSide::new_single(c_sock);
+            let mut owner = Owner::new(2).with_caller(caller_side);
+            let peer: SocketAddr = "127.0.0.1:19997".parse().unwrap();
+
+            // Hand one lane a completion that reports fewer bytes than the
+            // materialized wire length, through the real reaping path.
+            {
+                let engine = &mut owner.tx_engine;
+                engine.ensure_started();
+                assert!(!engine.lanes.is_empty(), "lane must be running");
+                let _ = engine.idle_lanes.pop();
+                engine.in_flight_count += 1;
+                let lane = &engine.lanes[0];
+                lane.state.borrow_mut().completion = Some(TxCompletion {
+                    meta: InFlightMeta {
+                        peer,
+                        expected_len: 20,
+                    },
+                    res: Ok(7),
+                    buf: vec![0u8; DEFAULT_TX_SLOT_SIZE],
+                });
+                engine.completed_lanes.borrow_mut().push_back(0);
+            }
+
+            let report = owner
+                .service(Timestamp::from_micros(1_000), OwnerServiceBudget::default())
+                .await;
+            assert_eq!(report.tx_short_sends, 1, "short send must be counted");
+            match owner.fault() {
+                Some(OwnerFault::TxShortSend { expected, sent, .. }) => {
+                    assert_eq!((*expected, *sent), (20, 7));
+                }
+                other => panic!("short send must fault the owner, got {other:?}"),
+            }
+
+            // No new TX after a fault: submission is refused, not silently
+            // accepted at reduced capacity.
+            let caller = owner.caller.as_ref().unwrap();
+            let mut sink = OwnerTxSink {
+                sock: &caller.sock,
+                tx_pool: &mut owner.tx_pool,
+                tx_engine: &mut owner.tx_engine,
+            };
+            let res = sink.push_datagram(peer, 20, |buf| {
+                buf[..20].fill(0x11);
+                Ok(20)
+            });
+            assert!(
+                res.is_err(),
+                "post-fault submission must be refused, got {res:?}"
+            );
+        });
+    }
+
+    /// P0-2: a send error is likewise a typed Owner fault.
+    #[test]
+    fn send_error_faults_owner() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            let c_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+            let c_sock = compio::net::UdpSocket::from_std(c_std).expect("adopt");
+            let mut owner = Owner::new(2).with_caller(OwnerCallerSide::new_single(c_sock));
+            let peer: SocketAddr = "127.0.0.1:19996".parse().unwrap();
+            {
+                let engine = &mut owner.tx_engine;
+                engine.ensure_started();
+                let _ = engine.idle_lanes.pop();
+                engine.in_flight_count += 1;
+                let lane = &engine.lanes[0];
+                lane.state.borrow_mut().completion = Some(TxCompletion {
+                    meta: InFlightMeta {
+                        peer,
+                        expected_len: 20,
+                    },
+                    res: Err(io::Error::new(
+                        io::ErrorKind::NetworkUnreachable,
+                        "no route",
+                    )),
+                    buf: vec![0u8; DEFAULT_TX_SLOT_SIZE],
+                });
+                engine.completed_lanes.borrow_mut().push_back(0);
+            }
+            let report = owner
+                .service(Timestamp::from_micros(1_000), OwnerServiceBudget::default())
+                .await;
+            assert_eq!(report.tx_failed_sends, 1);
+            match owner.fault() {
+                Some(OwnerFault::TxFailed { kind, .. }) => {
+                    assert_eq!(*kind, io::ErrorKind::NetworkUnreachable);
+                }
+                other => panic!("send error must fault the owner, got {other:?}"),
+            }
         });
     }
 
