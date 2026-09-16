@@ -73,14 +73,29 @@ struct QualReport {
     /// Refusal is expected under a fixed H; the harness re-issues later.
     refused: usize,
     established: usize,
+    /// Source ticks the window's wall-clock elapsed time called for.
+    expected_ticks: u64,
+    /// Ticks the generator actually produced.
+    generated_ticks: u64,
+    /// Ticks the generator never produced because a service visit overran its
+    /// interval. Counted explicitly so a service-coupled shortfall cannot look
+    /// like a lower offered rate.
+    missed_source_ticks: u64,
+    /// Application copies offered in the window (generated_ticks x F minus
+    /// destinations that no longer existed).
     offered: u64,
     accepted: u64,
+    /// Wire submissions attributed to the WINDOW only; the drain phase is
+    /// counted separately so the two are never mixed.
     submitted: u64,
     completed_ok: u64,
     short_sends: u64,
     failed_sends: u64,
     peer_local_failures: u64,
     transient_failures: u64,
+    /// Wire submissions during the post-window drain phase.
+    drain_submitted: u64,
+    drain_completed_ok: u64,
     tx_failures_pending: usize,
     service_visits: u64,
     lateness_p50_us: u64,
@@ -98,6 +113,8 @@ struct QualReport {
     rx_truncated: u64,
     tx_pool_free: usize,
     tx_pool_capacity: usize,
+    /// Process CPU consumed by the measurement window alone; the drain phase
+    /// is excluded.
     cpu_ms: f64,
 }
 
@@ -294,16 +311,59 @@ async fn run_sender(
         }
 
         // --- open-loop measurement window
+        //
+        // Both clocks in this loop are derived from ONE wall-clock epoch:
+        //
+        //   * source deadlines are `epoch + n x interval`, so an overrunning
+        //     service visit can no longer slow the source down, and any
+        //     interval it consumes is counted in `missed_source_ticks` instead
+        //     of quietly reducing the offered load;
+        //   * the SRT `Timestamp` handed to the protocol is
+        //     `srt_epoch + wall_elapsed`, so protocol time cannot drift away
+        //     from wall time under overload (which is exactly when it drifts
+        //     furthest).
         let cpu_start = process_cpu_ms();
-        let deadline = Instant::now() + Duration::from_millis(duration_ms);
+        let interval = Duration::from_micros(PACKET_INTERVAL_US);
+        let epoch = Instant::now();
+        let srt_epoch = now;
+        let deadline = epoch + Duration::from_millis(duration_ms);
         let payload = Bytes::from(vec![0x5A_u8; PAYLOAD_SIZE]);
         let mut lateness =
             Vec::with_capacity((duration_ms * 1000 / PACKET_INTERVAL_US) as usize + 8);
-        let mut next_tick = Instant::now();
-        while Instant::now() < deadline {
-            next_tick += Duration::from_micros(PACKET_INTERVAL_US);
-            // Open loop: the source tick happens whether or not the Owner can
-            // take it. A destination that refuses loses this copy.
+        let mut next_tick = epoch + interval;
+        loop {
+            if Instant::now() >= deadline {
+                break;
+            }
+            // Pace to the next source deadline when service left time over.
+            let early = next_tick.saturating_duration_since(Instant::now());
+            if !early.is_zero() {
+                compio::time::sleep(early).await;
+            }
+            let tick_wall = Instant::now();
+            if tick_wall >= deadline {
+                break;
+            }
+            // The schedule is anchored to the epoch and advances by WHOLE
+            // intervals, so the remainder of an overrun stays pending instead
+            // of shifting the source clock. Every boundary the visit passed is
+            // then either a generated tick or an explicitly counted missed
+            // tick -- `generated + missed == expected` is the identity a
+            // service-coupled producer would break.
+            let scheduled = next_tick;
+            next_tick += interval;
+            while next_tick <= tick_wall {
+                next_tick += interval;
+                report.missed_source_ticks += 1;
+            }
+            report.generated_ticks += 1;
+            // Protocol time tracks wall time from the single epoch.
+            now = Timestamp::from_micros(
+                srt_epoch.as_micros() + (tick_wall - epoch).as_micros() as u64,
+            );
+
+            // Open loop: the tick happens whether or not the Owner can take
+            // it. A destination that refuses loses this copy.
             for id in &ids {
                 report.offered += 1;
                 if let Some(mut caller) = owner.logical_caller_mut(id)
@@ -312,7 +372,6 @@ async fn run_sender(
                     report.accepted += 1;
                 }
             }
-            now = Timestamp::from_micros(now.as_micros() + PACKET_INTERVAL_US);
             let visit = owner.service(now, budget).await;
             report.submitted += visit.tx_packets_submitted as u64;
             report.completed_ok += visit.tx_completed_ok as u64;
@@ -322,21 +381,22 @@ async fn run_sender(
             report.transient_failures += visit.tx_transient_failures as u64;
             report.service_visits += 1;
 
-            // Open-loop pacing: wait out the rest of the source interval.
-            // Without this the source free-runs as fast as the service loop,
-            // offered load stops being 8 Mbps, and lateness is meaningless.
-            let after_service = Instant::now();
-            let late_us = after_service
-                .saturating_duration_since(next_tick)
-                .as_micros() as u64;
-            lateness.push(late_us);
-            if after_service < next_tick {
-                compio::time::sleep(next_tick - after_service).await;
-            }
+            // How late this tick's service completed relative to its own
+            // source deadline.
+            lateness.push(
+                Instant::now()
+                    .saturating_duration_since(scheduled)
+                    .as_micros() as u64,
+            );
             // Do not idle the Owner past its own receive work.
             owner.wait_for_activity(Duration::from_micros(0)).await;
         }
+        let window_elapsed = deadline.saturating_duration_since(epoch);
+        report.expected_ticks = (window_elapsed.as_micros() / PACKET_INTERVAL_US as u128) as u64;
         report.cpu_ms = process_cpu_ms() - cpu_start;
+        // Sampled at the END OF THE WINDOW, before any post-window drain: this
+        // is what the shard had outstanding when the measurement stopped.
+        report.inflight_at_window_end = owner.tx_in_flight() as u64;
 
         lateness.sort_unstable();
         report.lateness_p50_us = percentile(&lateness, 0.50);
@@ -348,8 +408,10 @@ async fn run_sender(
         while drain_start.elapsed() < DRAIN_DEADLINE {
             now = Timestamp::from_micros(now.as_micros() + 1_000);
             let visit = owner.service(now, budget).await;
-            report.submitted += visit.tx_packets_submitted as u64;
-            report.completed_ok += visit.tx_completed_ok as u64;
+            // Drain-phase traffic is counted separately so no window figure
+            // ever includes it.
+            report.drain_submitted += visit.tx_packets_submitted as u64;
+            report.drain_completed_ok += visit.tx_completed_ok as u64;
             report.short_sends += visit.tx_short_sends as u64;
             report.failed_sends += visit.tx_failed_sends as u64;
             report.peer_local_failures += visit.tx_peer_local_failures as u64;
@@ -360,9 +422,8 @@ async fn run_sender(
             }
             owner.wait_for_activity(Duration::from_millis(1)).await;
         }
-        report.inflight_at_window_end = owner.tx_in_flight() as u64;
         report.pending_after_drain =
-            report.inflight_at_window_end + if owner.has_pending_work(now) { 1 } else { 0 };
+            owner.tx_in_flight() as u64 + if owner.has_pending_work(now) { 1 } else { 0 };
 
         report.rx_mode = format!("{:?}", owner.rx_mode());
         // The sender's own receive side is the caller socket.
@@ -407,10 +468,12 @@ fn main() {
         // include control traffic and therefore do not have to be equal.
         "SHARED_OWNER_QUAL fanout={} tx_lanes={} connect_cc={} desired={} \
          issued={} admitted={} queued={} refused={} established={} pre_window_drained={} \
+         expected_ticks={} generated_ticks={} missed_source_ticks={} \
          data_offered={} data_accepted={} tx_submitted_wire={} tx_completed={} \
          short={} failed={} peer_local={} transient={} tx_failures_pending={} \
          service_visits={} lateness_us_p50={} p99={} max={} drain_ok={} \
-         inflight_at_window_end={} pending_after_drain={} rx_mode={} managed_rx={} \
+         inflight_at_window_end={} drain_submitted={} drain_completed={} \
+         pending_after_drain={} rx_mode={} managed_rx={} \
          rx_dropped={} rx_truncated={} tx_pool={}/{} cpu_ms={:.1}",
         report.fanout,
         report.tx_lanes,
@@ -422,6 +485,9 @@ fn main() {
         report.refused,
         report.established,
         report.pre_window_drained,
+        report.expected_ticks,
+        report.generated_ticks,
+        report.missed_source_ticks,
         report.offered,
         report.accepted,
         report.submitted,
@@ -437,6 +503,8 @@ fn main() {
         report.lateness_max_us,
         report.drained,
         report.inflight_at_window_end,
+        report.drain_submitted,
+        report.drain_completed_ok,
         report.pending_after_drain,
         report.rx_mode,
         managed,

@@ -1,6 +1,4 @@
-use crate::sink::{
-    DatagramTarget, ProtocolOutputFailure, ProtocolOutputFailureQueue, TxAttribution,
-};
+use crate::sink::{DatagramTarget, ProtocolOutputFailure, TxAttribution};
 use crate::{
     DatagramSink, DatagramSlot, GroupConnectionStats, GroupLogicalCounters, ManualTimerStore,
     OutputDrainBudget, OutputDrainReport, OutputDrainStatus, SinkOutcome, group_connection_stats,
@@ -388,10 +386,16 @@ pub struct CallerTable {
     /// phase drains it, and its capacity is retained across calls so the
     /// normal service path never allocates.
     due_scratch: Vec<LogicalCallerId>,
-    /// Bounded, attributed protocol-output failures awaiting application
-    /// drain. `Option` so one drain pass can move it into its `DrainSink`;
-    /// it is always `Some` outside a pass.
-    protocol_failures: Option<ProtocolOutputFailureQueue>,
+    /// Non-lossy index of legs holding an undrained
+    /// [`ProtocolOutputFailure`], in quarantine order. One entry is appended
+    /// at the moment a leg is quarantined, so its length can never exceed the
+    /// number of quarantined legs and there is no capacity to overflow: the
+    /// retirement token for a quarantined leg is always discoverable.
+    protocol_failure_index: VecDeque<(LogicalCallerId, u32)>,
+    /// Reusable per-pass scratch for records produced by the drain path
+    /// before the table stores them on the leg they belong to. `Option` so a
+    /// pass can move it into its `DrainSink` borrow; always `Some` otherwise.
+    protocol_failure_scratch: Option<Vec<ProtocolOutputFailure>>,
     next_logical_caller: u64,
     max_callers: usize,
     #[cfg(any(test, feature = "bench-internals"))]
@@ -454,6 +458,11 @@ struct CallerLegState {
     /// ordinary work: it would rediscover the same failure forever. The
     /// application retires the session through the normal removal API.
     output_faulted: bool,
+    /// The attributed retirement token for this leg, written exactly once at
+    /// quarantine. Stored ON THE LEG so it cannot be lost while the leg is
+    /// quarantined: the record and the quarantine are created in the same
+    /// step, and the table's index only points at legs that hold one.
+    output_failure: Option<ProtocolOutputFailure>,
 }
 
 struct CallerGroupLegState {
@@ -463,6 +472,8 @@ struct CallerGroupLegState {
     /// Per-leg quarantine; see [`CallerLegState::output_faulted`]. A faulted
     /// member does not stop its siblings.
     output_faulted: bool,
+    /// Per-leg retirement token; see [`CallerLegState::output_failure`].
+    output_failure: Option<ProtocolOutputFailure>,
 }
 
 struct CallerGroupState {
@@ -487,11 +498,13 @@ struct DrainSink<'a, S: ?Sized> {
     budget: OutputDrainBudget,
     report: &'a mut OutputDrainReport,
     sink: &'a mut S,
-    /// Bounded, attributed protocol-output failures. Moved out of the table
-    /// for the duration of one drain pass (see `drain_ready_bounded`) so the
-    /// per-leg paths can record failures without borrowing the table that
-    /// owns the sessions they are walking.
-    failures: &'a mut ProtocolOutputFailureQueue,
+    /// Per-pass scratch for records produced by the leg paths. Moved out of
+    /// the table for the duration of one drain pass (see
+    /// `drain_ready_bounded`) so the leg paths can record failures without
+    /// borrowing the table that owns the sessions they are walking. The table
+    /// stores each record on the leg it belongs to (and indexes that leg)
+    /// before the pass ends, so this scratch is always emptied inside the pass.
+    failures: &'a mut Vec<ProtocolOutputFailure>,
 }
 
 /// Account one committed datagram.
@@ -508,7 +521,7 @@ fn record_pushed(report: &mut OutputDrainReport, len: usize) {
 /// layer can react instead of this reading as "nothing to send".
 fn record_protocol_failure(
     report: &mut OutputDrainReport,
-    failures: &mut ProtocolOutputFailureQueue,
+    failures: &mut Vec<ProtocolOutputFailure>,
     attribution: TxAttribution,
     error: &srt_proto::Error,
 ) {
@@ -549,7 +562,7 @@ fn split<'d, S: ?Sized>(sink: &'d mut DrainSink<'_, S>) -> (&'d mut OutputDrainR
 /// What one leg's materialization path needs besides the sink itself: the
 /// failure queue and the datagram's logical attribution.
 struct DrainChain<'a> {
-    failures: &'a mut ProtocolOutputFailureQueue,
+    failures: &'a mut Vec<ProtocolOutputFailure>,
 }
 
 /// Split the sink for a materialization attempt: report, queue, destination.
@@ -709,6 +722,7 @@ impl CallerSession {
         id: LogicalCallerId,
         now: Timestamp,
         sink: &mut DrainSink<'_, S>,
+        failure_index: &mut VecDeque<(LogicalCallerId, u32)>,
     ) -> (DrainOne, bool) {
         match self {
             Self::Direct(leg) => {
@@ -720,6 +734,14 @@ impl CallerSession {
                 let result = drain_one_caller_leg(id, leg, now, sink);
                 if matches!(result.0, DrainOne::ProtocolFailed { .. }) {
                     leg.output_faulted = true;
+                    // The retirement token is stored ON the leg in the same
+                    // step as the quarantine, so it cannot be lost.
+                    leg.output_failure = sink.failures.pop();
+                    debug_assert!(
+                        leg.output_failure.is_some(),
+                        "quarantine always has its attributed record"
+                    );
+                    failure_index.push_back((id, 0));
                 }
                 result
             }
@@ -760,6 +782,12 @@ impl CallerSession {
                         // session keep carrying traffic.
                         (DrainOne::ProtocolFailed { .. }, touched) => {
                             leg.output_faulted = true;
+                            leg.output_failure = sink.failures.pop();
+                            debug_assert!(
+                                leg.output_failure.is_some(),
+                                "quarantine always has its attributed record"
+                            );
+                            failure_index.push_back((id, member_id));
                             timers_touched |= touched;
                             failed_member = Some(member_id);
                         }
@@ -860,9 +888,8 @@ impl CallerTable {
             deadlines: LogicalDueIndex::new(bounded),
             sched: HashMap::with_capacity(bounded),
             due_scratch: Vec::with_capacity(bounded.min(MAX_DUE_PER_VISIT)),
-            protocol_failures: Some(ProtocolOutputFailureQueue::new(
-                crate::sink::PROTOCOL_OUTPUT_FAILURE_CAPACITY,
-            )),
+            protocol_failure_index: VecDeque::new(),
+            protocol_failure_scratch: Some(Vec::new()),
             next_logical_caller: 1,
             max_callers: bounded,
             #[cfg(any(test, feature = "bench-internals"))]
@@ -1030,34 +1057,43 @@ impl CallerTable {
     /// Drain attributed protocol materialization failures, oldest first.
     ///
     /// Each entry names the logical session and the physical leg and carries
-    /// the protocol's own error kind and reason. The affected leg stays
-    /// quarantined until the application retires the session, so a failure is
-    /// reported once rather than every visit.
+    /// the protocol's own error kind and reason. Every quarantined leg has
+    /// exactly one record and that record lives on the leg, so this drain
+    /// cannot lose one however many legs fault before it runs; entries whose
+    /// session/leg has since been retired are skipped because the leg (and
+    /// therefore the problem) is already gone.
     pub fn poll_output_failures(
         &mut self,
         max_events: usize,
         out: &mut Vec<ProtocolOutputFailure>,
     ) {
         out.clear();
-        if let Some(queue) = self.protocol_failures.as_mut() {
-            queue.drain_into(max_events, out);
+        for _ in 0..max_events {
+            let Some((id, member)) = self.protocol_failure_index.pop_front() else {
+                break;
+            };
+            let Some(session) = self.sessions.get_mut(&id) else {
+                continue;
+            };
+            let record = match session {
+                CallerSession::Direct(leg) if member == 0 => leg.output_failure.take(),
+                CallerSession::Group(group) => group
+                    .legs
+                    .get_mut(&member)
+                    .and_then(|leg| leg.output_failure.take()),
+                _ => None,
+            };
+            if let Some(record) = record {
+                out.push(record);
+            }
         }
     }
 
-    /// Protocol-output failures still queued for the application.
+    /// Protocol-output failures still awaiting application drain. Always equal
+    /// to the number of quarantined legs whose record has not been drained.
     #[must_use]
     pub fn output_failures_pending(&self) -> usize {
-        self.protocol_failures
-            .as_ref()
-            .map_or(0, ProtocolOutputFailureQueue::len)
-    }
-
-    /// Protocol-output failures dropped because the bounded queue was full.
-    #[must_use]
-    pub fn output_failures_dropped(&self) -> u64 {
-        self.protocol_failures
-            .as_ref()
-            .map_or(0, ProtocolOutputFailureQueue::dropped)
+        self.protocol_failure_index.len()
     }
 
     fn enqueue_ready(&mut self, id: LogicalCallerId) {
@@ -1206,6 +1242,7 @@ impl CallerTable {
                 timers: ManualTimerStore::new(),
                 pending: VecDeque::new(),
                 output_faulted: false,
+                output_failure: None,
             })),
         );
         self.routes.insert(socket_id, CallerRoute::Direct(id));
@@ -1260,6 +1297,7 @@ impl CallerTable {
                         timers: ManualTimerStore::new(),
                         pending: VecDeque::new(),
                         output_faulted: false,
+                        output_failure: None,
                     },
                 )
                 .is_some()
@@ -1561,9 +1599,8 @@ impl CallerTable {
         sink_dest: &mut S,
     ) -> (OutputDrainReport, usize) {
         let mut report = OutputDrainReport::default();
-        let mut failures = self.protocol_failures.take().unwrap_or_else(|| {
-            ProtocolOutputFailureQueue::new(crate::sink::PROTOCOL_OUTPUT_FAILURE_CAPACITY)
-        });
+        let mut failures = self.protocol_failure_scratch.take().unwrap_or_default();
+        failures.clear();
         let mut sink = DrainSink {
             budget,
             report: &mut report,
@@ -1612,7 +1649,11 @@ impl CallerTable {
         {
             report.status = OutputDrainStatus::BudgetExhausted;
         }
-        self.protocol_failures = Some(failures);
+        debug_assert!(
+            failures.is_empty(),
+            "every record produced in a pass is stored on its leg before the pass ends"
+        );
+        self.protocol_failure_scratch = Some(failures);
         (report, visits)
     }
 
@@ -1625,11 +1666,18 @@ impl CallerTable {
         now: Timestamp,
         sink: &mut DrainSink<'_, S>,
     ) -> ReadyVisitOutcome {
+        // Disjoint field borrows: the session being drained and the failure
+        // index it appends to are different fields of this table.
+        let Self {
+            sessions,
+            protocol_failure_index,
+            ..
+        } = self;
         let (drain_result, timers_touched) = {
-            let Some(session) = self.sessions.get_mut(&id) else {
+            let Some(session) = sessions.get_mut(&id) else {
                 return ReadyVisitOutcome::Continue;
             };
-            session.drain_one(id, now, sink)
+            session.drain_one(id, now, sink, protocol_failure_index)
         };
         #[cfg(any(test, feature = "bench-internals"))]
         {
@@ -2822,6 +2870,115 @@ mod tests {
                 .count(),
             2,
             "both datagrams went to the same address"
+        );
+    }
+
+    /// Adversarial: MORE than the old 64-entry failure queue's worth of legs
+    /// fault before the application drains anything.
+    ///
+    /// The retirement token is the only way to identify a quarantined leg, and
+    /// a quarantined leg is deliberately never re-offered or re-reported, so a
+    /// lost record means a permanently invisible session. This test faults 70
+    /// separately identifiable legs with nothing drained in between and
+    /// requires every one of them back exactly once.
+    #[test]
+    fn every_quarantined_leg_stays_discoverable_past_any_queue_bound() {
+        /// Comfortably past the 64-entry bound the queue used to have.
+        const LEGS: usize = 70;
+        const { assert!(LEGS > 64) };
+        let mut table = CallerTable::new();
+        let now = Timestamp::from_micros(10_000);
+        let mut ids = Vec::with_capacity(LEGS);
+        for i in 0..LEGS {
+            let peer: std::net::SocketAddr = format!("127.0.0.1:{}", 20_000 + i)
+                .parse()
+                .expect("address");
+            ids.push(
+                table
+                    .add_direct(CallerLeg {
+                        peer,
+                        connection: caller_connection(ConnectionOptions {
+                            socket_id: 0x20_000 + i as u32,
+                            ..ConnectionOptions::default()
+                        }),
+                    })
+                    .expect("admitted"),
+            );
+        }
+
+        // Every leg faults; nothing is drained until all of them have.
+        let mut short = ShortBufferSink {
+            acquisitions: 0,
+            committed: Vec::new(),
+            last_attribution: None,
+            short_by: 8,
+        };
+        let budget = OutputDrainBudget::new(4096, 4096, 1 << 22);
+        let _ = table.poll_outbound_bounded_to(now, budget, &mut short);
+        let after_first = short.acquisitions;
+        assert_eq!(
+            after_first, LEGS,
+            "every leg is offered once, then quarantined"
+        );
+        assert!(short.committed.is_empty(), "no leg materialized anything");
+        // Later visits must not re-offer a quarantined leg.
+        for _ in 0..4 {
+            let _ = table.poll_outbound_bounded_to(now, budget, &mut short);
+        }
+        assert_eq!(
+            short.acquisitions, after_first,
+            "quarantined legs are never re-offered"
+        );
+        assert_eq!(
+            table.output_failures_pending(),
+            LEGS,
+            "every quarantined leg has an undrained record"
+        );
+
+        // Drain everything and require exactly one record per leg.
+        let mut failures = Vec::new();
+        table.poll_output_failures(LEGS * 2, &mut failures);
+        assert_eq!(failures.len(), LEGS, "no record was lost");
+        let mut reported: Vec<LogicalCallerId> = failures
+            .iter()
+            .filter_map(|record| record.attribution.caller_id())
+            .collect();
+        reported.sort();
+        let mut expected = ids.clone();
+        expected.sort();
+        assert_eq!(
+            reported, expected,
+            "every failed leg is returned exactly once, in no particular order"
+        );
+        assert_eq!(table.output_failures_pending(), 0);
+
+        // And no leg is left quarantined without a discoverable record: a
+        // second drain finds nothing, and each id is uniquely represented.
+        let mut again = Vec::new();
+        table.poll_output_failures(LEGS * 2, &mut again);
+        assert!(again.is_empty());
+
+        // Siblings still progress: a healthy leg added afterwards drains fine.
+        let healthy_peer: std::net::SocketAddr = "127.0.0.1:21999".parse().expect("address");
+        let healthy = table
+            .add_direct(CallerLeg {
+                peer: healthy_peer,
+                connection: caller_connection(ConnectionOptions {
+                    socket_id: 0x2_1999,
+                    ..ConnectionOptions::default()
+                }),
+            })
+            .expect("admitted");
+        table.bench_make_ready(healthy);
+        let mut good = TestSink {
+            capacity: 8,
+            packets: Vec::new(),
+        };
+        let _ =
+            table.poll_outbound_bounded_to(now, OutputDrainBudget::new(64, 64, 1 << 20), &mut good);
+        assert!(
+            !good.packets.is_empty(),
+            "a healthy leg still drains while many legs are quarantined"
         );
     }
 

@@ -127,10 +127,14 @@ impl TxAttribution {
 /// the peeked datagram.
 ///
 /// This is NOT "nothing to send". The protocol output stays queued in the
-/// connection, so the affected session/leg is quarantined and this event is
-/// the observable, attributed record of why. One event is produced per
-/// affected leg, which is what keeps the path bounded: a quarantined leg is
-/// never re-offered, so it cannot re-report the same failure forever.
+/// connection, so the affected session/leg is quarantined and this record is
+/// the ONLY token by which the application can identify and retire it.
+///
+/// Because the record participates in lifecycle recovery, it must never be
+/// dropped: a table stores it **on the leg itself** at the moment of
+/// quarantine and indexes that leg, so the number of outstanding records is
+/// bounded by the number of quarantined legs (at most one per leg, since
+/// quarantine prevents re-reporting) and there is no capacity to overflow.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProtocolOutputFailure {
     /// Logical session and physical leg the failure belongs to.
@@ -139,57 +143,6 @@ pub struct ProtocolOutputFailure {
     pub kind: srt_proto::ErrorKind,
     /// The protocol's own reason string.
     pub reason: String,
-}
-
-/// Bounded queue of [`ProtocolOutputFailure`]s awaiting application drain.
-///
-/// Preallocated and finite: a full queue drops the NEWEST event and counts it,
-/// because the oldest events are the ones the application has not acted on yet.
-#[derive(Debug)]
-pub(crate) struct ProtocolOutputFailureQueue {
-    events: std::collections::VecDeque<ProtocolOutputFailure>,
-    capacity: usize,
-    dropped: u64,
-}
-
-/// Capacity of one table's protocol-output failure queue.
-pub(crate) const PROTOCOL_OUTPUT_FAILURE_CAPACITY: usize = 64;
-
-impl ProtocolOutputFailureQueue {
-    pub(crate) fn new(capacity: usize) -> Self {
-        let capacity = capacity.max(1);
-        Self {
-            events: std::collections::VecDeque::with_capacity(capacity),
-            capacity,
-            dropped: 0,
-        }
-    }
-
-    pub(crate) fn push(&mut self, event: ProtocolOutputFailure) {
-        if self.events.len() >= self.capacity {
-            self.dropped = self.dropped.saturating_add(1);
-            return;
-        }
-        self.events.push_back(event);
-    }
-
-    /// Move up to `max_events` failures into `out`, oldest first.
-    pub(crate) fn drain_into(&mut self, max_events: usize, out: &mut Vec<ProtocolOutputFailure>) {
-        for _ in 0..max_events {
-            let Some(event) = self.events.pop_front() else {
-                break;
-            };
-            out.push(event);
-        }
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.events.len()
-    }
-
-    pub(crate) fn dropped(&self) -> u64 {
-        self.dropped
-    }
 }
 
 /// One destination offer: where the datagram goes, and what it belongs to.

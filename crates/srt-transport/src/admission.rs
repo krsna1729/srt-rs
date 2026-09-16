@@ -1,4 +1,4 @@
-use crate::sink::{DatagramTarget, ProtocolOutputFailureQueue, TxAttribution};
+use crate::sink::{DatagramTarget, ProtocolOutputFailure, TxAttribution};
 use crate::{
     DatagramSink, DatagramSlot, DenseDueIndex, DenseSlotArena, DueIndex, GroupConnectionStats,
     GroupLogicalCounters, InboundGroupStats, IngressTelemetry, ListenerPeerPolicy, MAX_DENSE_SLOTS,
@@ -69,6 +69,10 @@ pub struct AdmissionPeer {
     /// ordinary work: it would rediscover the same failure every visit. The
     /// application observes the attributed failure and retires the peer.
     output_faulted: bool,
+    /// The attributed retirement token for this peer, written exactly once at
+    /// quarantine and stored ON the peer so it cannot be lost while the peer
+    /// stays quarantined.
+    output_failure: Option<ProtocolOutputFailure>,
 }
 
 impl AdmissionPeer {
@@ -788,6 +792,17 @@ struct InboundGroupLeg {
     /// Per-leg quarantine; see [`AdmissionPeer::output_faulted`]. A faulted
     /// member does not stop its siblings.
     output_faulted: bool,
+    /// Per-leg retirement token; see [`AdmissionPeer::output_failure`].
+    output_failure: Option<ProtocolOutputFailure>,
+}
+
+/// Where the retirement token for one quarantined peer/leg lives.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum PeerFailureKey {
+    /// Direct peer occupying this arena slot.
+    Direct(usize),
+    /// One bonded group member.
+    Group { key: GroupReadyKey, member: u32 },
 }
 
 /// Outcome of one peer materialization attempt.
@@ -904,9 +919,15 @@ pub struct PeerTable {
     source_counts: HashMap<std::net::IpAddr, usize>,
     half_open_peers: usize,
     established_peers: usize,
-    /// Bounded, attributed protocol-output failures awaiting application
-    /// drain; see [`PeerTable::poll_output_failures`].
-    protocol_failures: ProtocolOutputFailureQueue,
+    /// Non-lossy index of peers/legs holding an undrained
+    /// [`ProtocolOutputFailure`]. One entry is appended at the moment of
+    /// quarantine, so its length cannot exceed the quarantined population and
+    /// there is no capacity to overflow: a quarantined peer's retirement token
+    /// is always discoverable.
+    protocol_failure_index: VecDeque<PeerFailureKey>,
+    /// Reusable per-pass scratch for records produced by the peer drain paths
+    /// before they are stored on the peer/leg they belong to.
+    protocol_failure_scratch: Vec<ProtocolOutputFailure>,
     half_open_deadlines: DueIndex<PhysicalPeerKey>,
     idle_deadlines: DueIndex<PhysicalPeerKey>,
     deadlines: DenseDueIndex,
@@ -956,7 +977,7 @@ fn record_peer_sink_rejection(report: &mut OutputDrainReport, error: &srt_proto:
 /// send".
 fn record_peer_protocol_failure(
     report: &mut OutputDrainReport,
-    failures: &mut ProtocolOutputFailureQueue,
+    failures: &mut Vec<ProtocolOutputFailure>,
     attribution: TxAttribution,
     error: &srt_proto::Error,
 ) {
@@ -996,9 +1017,8 @@ impl PeerTable {
             source_counts: HashMap::new(),
             half_open_peers: 0,
             established_peers: 0,
-            protocol_failures: ProtocolOutputFailureQueue::new(
-                crate::sink::PROTOCOL_OUTPUT_FAILURE_CAPACITY,
-            ),
+            protocol_failure_index: VecDeque::new(),
+            protocol_failure_scratch: Vec::new(),
             half_open_deadlines: DueIndex::default(),
             idle_deadlines: DueIndex::default(),
             deadlines: DenseDueIndex::default(),
@@ -1576,6 +1596,7 @@ impl PeerTable {
             admission_established: false,
             last_datagram_at: now,
             output_faulted: false,
+            output_failure: None,
         }
     }
 
@@ -1772,6 +1793,7 @@ impl PeerTable {
                 timers: entry.timers,
                 pending_outputs: entry.pending_outputs,
                 output_faulted: false,
+                output_failure: None,
             },
         );
         group.leg_order.push(member_id);
@@ -2442,28 +2464,45 @@ impl PeerTable {
     /// Drain attributed protocol materialization failures, oldest first.
     ///
     /// Each entry names the logical peer and the physical leg and carries the
-    /// protocol's own error kind and reason. The affected leg stays
-    /// quarantined until the application retires the peer, so a failure is
-    /// reported once rather than every visit.
+    /// protocol's own error kind and reason. Every quarantined peer/leg has
+    /// exactly one record and that record lives on the peer itself, so this
+    /// drain cannot lose one however many peers fault before it runs; entries
+    /// whose peer has since been retired are skipped because the peer (and
+    /// therefore the problem) is already gone.
     pub fn poll_output_failures(
         &mut self,
         max_events: usize,
-        out: &mut Vec<crate::sink::ProtocolOutputFailure>,
+        out: &mut Vec<ProtocolOutputFailure>,
     ) {
         out.clear();
-        self.protocol_failures.drain_into(max_events, out);
+        for _ in 0..max_events {
+            let Some(key) = self.protocol_failure_index.pop_front() else {
+                break;
+            };
+            let record = match key {
+                PeerFailureKey::Direct(slot_idx) => self
+                    .slots
+                    .get_by_slot_mut(slot_idx)
+                    .and_then(|slot| slot.value.direct_mut())
+                    .and_then(|entry| entry.output_failure.take()),
+                PeerFailureKey::Group { key, member } => self
+                    .groups
+                    .get_mut(&key.key)
+                    .and_then(|group| group.legs.get_mut(&member))
+                    .and_then(|leg| leg.output_failure.take()),
+            };
+            if let Some(record) = record {
+                out.push(record);
+            }
+        }
     }
 
-    /// Protocol-output failures still queued for the application.
+    /// Protocol-output failures still awaiting application drain. Always equal
+    /// to the number of quarantined peers/legs whose record has not been
+    /// drained.
     #[must_use]
     pub fn output_failures_pending(&self) -> usize {
-        self.protocol_failures.len()
-    }
-
-    /// Protocol-output failures dropped because the bounded queue was full.
-    #[must_use]
-    pub fn output_failures_dropped(&self) -> u64 {
-        self.protocol_failures.dropped()
+        self.protocol_failure_index.len()
     }
 
     fn poll_direct_outbound_bounded<S: DatagramSink + ?Sized>(
@@ -2569,10 +2608,7 @@ impl PeerTable {
             return (None, false, false);
         }
         let attribution = TxAttribution::peer(entry.logical_peer, 0);
-        let mut failures = std::mem::replace(
-            &mut self.protocol_failures,
-            ProtocolOutputFailureQueue::new(crate::sink::PROTOCOL_OUTPUT_FAILURE_CAPACITY),
-        );
+        let mut failures = std::mem::take(&mut self.protocol_failure_scratch);
         let step = Self::drain_peer_direct_meta(
             peer_addr,
             attribution,
@@ -2585,15 +2621,28 @@ impl PeerTable {
             &mut failures,
             report,
         );
-        self.protocol_failures = failures;
         let blocked = match step {
             PeerDrainStep::Continue => false,
             PeerDrainStep::Blocked => true,
             PeerDrainStep::ProtocolFailed { .. } => {
                 entry.output_faulted = true;
+                // The retirement token is stored ON the peer in the same step
+                // as the quarantine, then indexed, so it cannot be lost.
+                entry.output_failure = failures.pop();
+                debug_assert!(
+                    entry.output_failure.is_some(),
+                    "quarantine always has its attributed record"
+                );
+                self.protocol_failure_index
+                    .push_back(PeerFailureKey::Direct(slot_idx));
                 false
             }
         };
+        self.protocol_failure_scratch = failures;
+        debug_assert!(
+            self.protocol_failure_scratch.is_empty(),
+            "every record produced in a visit is stored on its peer before the visit ends"
+        );
         self.sync_direct_peer_deadline(slot_idx);
         (None, true, blocked)
     }
@@ -2654,7 +2703,7 @@ impl PeerTable {
         entry: &mut AdmissionPeer,
         meta: OutputMeta,
         sink: &mut S,
-        failures: &mut ProtocolOutputFailureQueue,
+        failures: &mut Vec<ProtocolOutputFailure>,
         report: &mut OutputDrainReport,
     ) -> PeerDrainStep {
         match meta {
@@ -2831,10 +2880,7 @@ impl PeerTable {
             return false;
         }
         let attribution = TxAttribution::peer(group.logical_peer, member_id);
-        let mut failures = std::mem::replace(
-            &mut self.protocol_failures,
-            ProtocolOutputFailureQueue::new(crate::sink::PROTOCOL_OUTPUT_FAILURE_CAPACITY),
-        );
+        let mut failures = std::mem::take(&mut self.protocol_failure_scratch);
         let mut had_output = false;
         let mut blocked = false;
 
@@ -2861,12 +2907,27 @@ impl PeerTable {
                 PeerDrainStep::Blocked => blocked = true,
                 PeerDrainStep::ProtocolFailed { .. } => {
                     // Quarantine exactly this leg: its siblings in the same
-                    // bonded group keep carrying traffic.
+                    // bonded group keep carrying traffic. The retirement token
+                    // is stored on THIS leg and indexed immediately.
                     leg.output_faulted = true;
+                    leg.output_failure = failures.pop();
+                    debug_assert!(
+                        leg.output_failure.is_some(),
+                        "quarantine always has its attributed record"
+                    );
+                    self.protocol_failure_index
+                        .push_back(PeerFailureKey::Group {
+                            key: token.clone(),
+                            member: member_id,
+                        });
                 }
             }
         }
-        self.protocol_failures = failures;
+        self.protocol_failure_scratch = failures;
+        debug_assert!(
+            self.protocol_failure_scratch.is_empty(),
+            "every record produced in a visit is stored on its leg before the visit ends"
+        );
 
         self.sync_group_leg_deadline(&token.key, member_id);
         if had_output {
@@ -2937,7 +2998,7 @@ impl PeerTable {
         connection: &mut SrtConnection,
         meta: OutputMeta,
         sink: &mut S,
-        failures: &mut ProtocolOutputFailureQueue,
+        failures: &mut Vec<ProtocolOutputFailure>,
         report: &mut OutputDrainReport,
     ) -> PeerDrainStep {
         match meta {
@@ -4240,6 +4301,7 @@ mod tests {
         let logical_peer = table.allocate_logical_peer(LogicalPeerTarget::Group(key.clone()));
         let mut leg = InboundGroupLeg {
             output_faulted: false,
+            output_failure: None,
             physical: PhysicalPeerKey {
                 address: "127.0.0.1:9100".parse().unwrap(),
                 local_socket_id: 1,
@@ -4828,6 +4890,65 @@ mod tests {
         assert_eq!(sink.committed[0].0, peer);
         assert_eq!(sink.attributions[0].peer_id(), Some(logical));
         assert_eq!(table.output_failures_pending(), 0);
+    }
+
+    /// Adversarial peer-side counterpart: more established peers fault than the
+    /// old 64-entry queue could hold, with nothing drained in between, and
+    /// every one must still come back exactly once.
+    #[test]
+    fn every_quarantined_peer_stays_discoverable_past_any_queue_bound() {
+        /// Comfortably past the 64-entry bound the queue used to have.
+        const PEERS: usize = 70;
+        const { assert!(PEERS > 64) };
+        let options = AdmissionOptions::basic(0x9200, 20, false);
+        let telemetry = IngressTelemetry::new();
+        let mut table = PeerTable::new();
+        let now = Timestamp::from_micros(3_000_000);
+        let mut expected = Vec::with_capacity(PEERS);
+        for i in 0..PEERS {
+            let peer: std::net::SocketAddr = format!("127.0.0.1:{}", 21_000 + i)
+                .parse()
+                .expect("address");
+            expected.push(established_peer_with_queued_output(
+                &mut table,
+                peer,
+                0x9200 + i as u32,
+                &options,
+                &telemetry,
+            ));
+        }
+
+        // Every peer faults in one visit; nothing is drained until after.
+        let mut short = ShortPeerSink {
+            committed: Vec::new(),
+            attributions: Vec::new(),
+            short_by: 8,
+            failing: None,
+        };
+        let budget = OutputDrainBudget::new(4096, 4096, 1 << 22);
+        let _ = table.poll_outbound_bounded_to(now, budget, &mut short);
+        assert!(short.committed.is_empty(), "no peer materialized anything");
+        assert_eq!(table.output_failures_pending(), PEERS);
+
+        let mut failures = Vec::new();
+        table.poll_output_failures(PEERS * 2, &mut failures);
+        assert_eq!(failures.len(), PEERS, "no record was lost");
+        let mut reported: Vec<u64> = failures
+            .iter()
+            .filter_map(|record| record.attribution.peer_id())
+            .map(|id| id.as_u64())
+            .collect();
+        reported.sort_unstable();
+        let mut expected: Vec<u64> = expected.iter().map(|id| id.as_u64()).collect();
+        expected.sort_unstable();
+        assert_eq!(
+            reported, expected,
+            "every failed peer returned exactly once"
+        );
+        assert_eq!(table.output_failures_pending(), 0);
+        let mut again = Vec::new();
+        table.poll_output_failures(PEERS * 2, &mut again);
+        assert!(again.is_empty());
     }
 
     #[test]
