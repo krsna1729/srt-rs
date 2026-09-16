@@ -39,14 +39,42 @@
 //!    cross-thread move is correct by construction; `IngressTelemetry`
 //!    defines the counters and the report line once.
 //!
-//! 3. **Per-runtime `Conn` structs** (feature-gated): each wraps
-//!    `SrtConnection` + runtime-specific socket + runtime-specific timer.
-//!    Provides `fire_expired`, `drain_outputs`, `send_paced`,
-//!    `recv_with_timeout`.
+//! 3. **Runtime adapters** (feature-gated). Two shapes, and the difference
+//!    matters for what an application should build against:
+//!
+//!    | Runtime | Endpoint shape | High-density shape |
+//!    |---|---|---|
+//!    | `mio` | [`mio_transport::Conn`]: one socket, one connection | [`mio_transport::Owner`] |
+//!    | `tokio` | [`tokio_transport::Conn`], plus the managed [`tokio_transport::Facade`] | [`tokio_transport::Owner`] |
+//!    | `compio` | [`compio_transport::Conn`]: simple endpoint/interop API | [`compio_transport::Owner`] |
+//!
+//!    `Mio` and `Tokio` are the portability/reference adapters. `Compio` is
+//!    the production high-density substrate, and its two shapes are not
+//!    interchangeable:
+//!
+//!    * [`compio_transport::Conn`] is the *simple endpoint* API: one
+//!      `SrtConnection`, one socket, one task. Right for an interop test, a
+//!      reference implementation, or an application that genuinely has a
+//!      handful of sessions.
+//!    * [`compio_transport::Owner`] is the *high-density* API and the one an
+//!      embedding application (Restream and friends) should build against:
+//!      one shared listener UDP socket plus one shared caller UDP socket per
+//!      owner, O(1) runtime engines per owner (a fixed TX lane pool and one
+//!      managed RX task per socket), bounded per-visit budgets, a finite
+//!      direct-final-buffer TX pool, and **no task or thread per SRT
+//!      destination**. A shard is one `Owner` driven by
+//!      [`compio_transport::Owner::service`] and
+//!      [`compio_transport::Owner::wait_for_activity`]; the number of
+//!      connections on it is protocol state, not scheduler state.
+//!
+//!    Do not integrate by spawning one `Conn` task per destination: that
+//!    reintroduces a task per SRT stream, which is the cost the Owner exists
+//!    to remove, and it gives up the shared-socket admission, the finite TX
+//!    pool, and the bounded service budget in one step.
 //!
 //! # Design principle: no lowest common denominator
 //!
-//! Each runtime's `Conn` uses its own socket and its own I/O primitives
+//! Each runtime's adapter uses its own socket and its own I/O primitives
 //! directly -- no shared trait flattens them, because the completion
 //! runtimes need owned buffers and the readiness runtimes do not.
 //!

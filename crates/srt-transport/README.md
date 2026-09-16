@@ -2,8 +2,69 @@
 
 Application-facing configuration and adapter plumbing between
 [`srt-protocol`](../srt-protocol) (sans-I/O) and runtime-specific I/O.
-Per-runtime `Conn` structs are feature-gated; the configuration, admission,
-socket preparation, and lifecycle surfaces are runtime-neutral.
+Runtime adapters are feature-gated; the configuration, admission, socket
+preparation, and lifecycle surfaces are runtime-neutral.
+
+## Which adapter shape an application builds against
+
+There are two shapes, and the difference decides how many OS resources a
+deployment needs per SRT destination:
+
+| Runtime | Endpoint shape | High-density shape |
+|---|---|---|
+| `mio` | `mio::Conn` — one socket, one connection | `mio::Owner` |
+| `tokio` | `tokio::Conn`, and the managed `tokio::Facade` | `tokio::Owner` |
+| `compio` | `compio::Conn` — simple endpoint / interop API | **`compio::Owner`** |
+
+`Mio` and `Tokio` are the portability/reference adapters. `Compio` is the
+production high-density substrate, and its two shapes are not
+interchangeable:
+
+* `compio::Conn` — one `SrtConnection`, one socket, one task. Correct for an
+  interop test, a reference implementation, or an application with genuinely
+  a handful of sessions.
+* `compio::Owner` — **the interface an embedding application (Restream and
+  friends) should build against.** One shared listener UDP socket plus one
+  shared caller UDP socket per owner; O(1) runtime engines per owner (a fixed
+  TX lane pool, one managed RX task per socket); bounded per-visit budgets; a
+  finite direct-final-buffer TX pool; and **no task or thread per SRT
+  destination**. A shard is one `Owner` driven by `Owner::service` and
+  `Owner::wait_for_activity`; connection count is protocol state, not
+  scheduler state.
+
+Do not integrate by spawning one `Conn` task per destination: that
+reintroduces a task per SRT stream — the cost the Owner exists to remove —
+and gives up shared-socket admission, the finite TX pool, and the bounded
+service budget at the same time.
+
+### Compio Owner: production contract
+
+* **Attach** with `Owner::listen(&ListenerConfig)` and
+  `Owner::connect(&CallerConfig, now)` only. The listener topology must be
+  `PerPort` with promotion `Never`, callers must be
+  `SocketOwnership::Shared`, and every session's wire ceiling must fit the
+  owner's. Side internals are sealed so these cannot be bypassed.
+* **Drive** with `service(now, budget)` (never blocks; every dimension
+  bounded) and `wait_for_activity(timeout)` when idle. `Owner::fault()` is
+  typed: a panicked TX lane, a short/failed send completion, a stopped
+  managed RX task, or shutdown.
+* **Shut down** with `shutdown_and_drain(timeout)`: it proves quiescence
+  (`in_flight == 0`, every lane joined, pool back to capacity) or returns
+  `false` with ownership untouched and `OwnerFault::ShutdownTimedOut`.
+* **Receive mode** is selected at attach and observable through
+  `Owner::rx_mode()`: `ManagedMultishot` (one persistent `recv_msg_multi`
+  consumer per socket over the runtime provided-buffer ring; the only
+  consumer) or `RawReadiness` (readiness wake + a raw `recvfrom` reader).
+  `RxModePolicy::ManagedRequired` makes a host without the provided-buffer
+  substrate a startup error instead of a silent degrade. Host capability
+  (`CompioProductionProfile::host_managed_rx_capable`) and the selected mode
+  are deliberately different facts; `ProductionQualification::qualified()`
+  requires both.
+* **Direct final-buffer TX** is the only datapath on this path: the protocol
+  materializes into a reserved `TxPool` slot (`DatagramSink::acquire` →
+  `poll_output_into` → infallible `commit`), so a sink refusal can never
+  consume a protocol datagram, and `compio::Conn`'s legacy
+  `ConnectionOutput::SendPacket(Vec<u8>)` queue is never used here.
 
 ## Charter: this crate owns *things*
 
