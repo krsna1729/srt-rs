@@ -55,16 +55,40 @@ service budget at the same time.
   `Owner::rx_mode()`: `ManagedMultishot` (one persistent `recv_msg_multi`
   consumer per socket over the runtime provided-buffer ring; the only
   consumer) or `RawReadiness` (readiness wake + a raw `recvfrom` reader).
-  `RxModePolicy::ManagedRequired` makes a host without the provided-buffer
-  substrate a startup error instead of a silent degrade. Host capability
+  `RxModePolicy::ManagedRequired` makes a host without the managed substrate a
+  startup error instead of a silent degrade, and it consumes ONE observed fact:
+  `ManagedRxSubstrate`, declared once through `Owner::set_rx_substrate` from
+  `observe_production_runtime` on the exact shard runtime. `Available` means
+  **io_uring AND a registered provided-buffer ring AND a successful actual
+  `recv_msg_multi(0)` loopback completion** — the exact primitive production
+  uses, executed once at startup with a sentinel payload check, never a
+  shallow feature probe and never a first-poll `Pending`. Host capability
   (`CompioProductionProfile::host_managed_rx_capable`) and the selected mode
   are deliberately different facts; `ManagedRxQualification::managed_rx_active()`
-  requires both.
+  requires both, and it is a *datapath* statement, not a workload
+  qualification.
 * **Direct final-buffer TX** is the only datapath on this path: the protocol
-  materializes into a reserved `TxPool` slot (`DatagramSink::acquire` →
+  materializes into a reserved `TxPool` slot (`DatagramSink::acquire_target` →
   `poll_output_into` → infallible `commit`), so a sink refusal can never
   consume a protocol datagram, and `compio::Conn`'s legacy
   `ConnectionOutput::SendPacket(Vec<u8>)` queue is never used here.
+* **A failed materialization is never "empty".** If `poll_output_into` refuses
+  a peeked datagram, the output stays queued, the visit reports
+  `OutputDrainStatus::ProtocolError`, and the affected logical session/leg is
+  quarantined with one attributed record on the table's bounded
+  `poll_output_failures` queue. Siblings keep running; the quarantined leg is
+  neither re-offered nor re-reported.
+* **One operational predicate.** `Owner::is_operational()` gates attach,
+  submission, and every `service` phase, and `service` re-evaluates it after
+  each phase that can discover a fault — so a structural completion failure or
+  a dead receive consumer stops that same visit, not the next one. Peer-local
+  and transient send failures are deliberately *not* faults: they are
+  attributed on the bounded `poll_tx_failures` queue with a `TxAttribution`
+  token (logical session + physical leg), because a `SocketAddr` cannot
+  identify a session on a shared socket.
+* **Attach is transactional.** A `listen`/`connect` that fails leaves the Owner
+  exactly as configurable as it was: no side, no claimed receive datapath, no
+  started session.
 
 ## Charter: this crate owns *things*
 
