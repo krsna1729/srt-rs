@@ -743,6 +743,10 @@ pub enum OwnerFault {
         peer: SocketAddr,
         kind: io::ErrorKind,
     },
+    /// A quiescent shutdown drain did not reach `in_flight() == 0` before its
+    /// deadline. Ownership is left exactly as it was: lanes still own their
+    /// slots, `in_flight` is not reset, and no buffer is reclaimed early.
+    ShutdownTimedOut { in_flight: usize },
     /// Owner has been shut down.
     Shutdown,
 }
@@ -765,6 +769,11 @@ struct TxLaneState {
     worker_waker: Option<Waker>,
     completion: Option<TxCompletion>,
     shutdown: bool,
+    /// The worker has taken a job and its `send_to` has not published a
+    /// completion yet. This slot is owned by the lane, not by the engine's
+    /// queued/completed lists, which is what makes `in_flight` truthful even
+    /// if a shutdown drain times out.
+    in_kernel: bool,
 }
 
 struct TxLane {
@@ -796,6 +805,7 @@ async fn tx_lane_worker(
                 return Poll::Ready(None);
             }
             if let Some(job) = s.job.take() {
+                s.in_kernel = true;
                 return Poll::Ready(Some(job));
             }
             s.worker_waker = Some(cx.waker().clone());
@@ -812,6 +822,7 @@ async fn tx_lane_worker(
 
         {
             let mut s = state.borrow_mut();
+            s.in_kernel = false;
             s.completion = Some(TxCompletion {
                 meta: job.meta,
                 res,
@@ -856,6 +867,7 @@ impl TxEngine {
                 worker_waker: None,
                 completion: None,
                 shutdown: false,
+                in_kernel: false,
             }));
             let completed_lanes = Rc::clone(&self.completed_lanes);
             let owner_waker = Rc::clone(&self.owner_waker);
@@ -1072,19 +1084,48 @@ impl TxEngine {
             }
             if let Some(job) = s.job.take() {
                 tx_pool.return_slot(job.buf);
-                self.in_flight_count = self.in_flight_count.saturating_sub(1);
             }
             if let Some(completion) = s.completion.take() {
                 tx_pool.return_slot(completion.buf);
-                self.in_flight_count = self.in_flight_count.saturating_sub(1);
             }
         }
         self.completed_lanes.borrow_mut().clear();
+        // Ownership stays truthful: a lane whose `send_to` is still with the
+        // kernel keeps its slot until its own completion returns it, so the
+        // in-flight count is recomputed from lane state rather than zeroed.
+        self.in_flight_count = self
+            .lanes
+            .iter()
+            .filter(|lane| lane.state.borrow().in_kernel)
+            .count();
         self.idle_lanes.clear();
-        for i in 0..self.capacity {
-            self.idle_lanes.push(i);
+        for lane_idx in 0..self.capacity {
+            if lane_idx < self.lanes.len() && self.lanes[lane_idx].state.borrow().in_kernel {
+                continue;
+            }
+            self.idle_lanes.push(lane_idx);
         }
-        self.in_flight_count = 0;
+    }
+
+    /// Record a timed-out teardown without touching ownership: the fault is
+    /// surfaced, but `in_flight` and the pool keep counting what the kernel
+    /// still owns.
+    pub(crate) fn note_shutdown_timeout(&mut self, in_flight: usize) {
+        self.shutdown = true;
+        if self.fault.is_none() {
+            self.fault = Some(OwnerFault::ShutdownTimedOut { in_flight });
+        }
+    }
+
+    /// Await every fixed lane worker to completion. Only valid after a drain
+    /// proved `in_flight() == 0` and lanes were signalled to stop: each worker
+    /// then observes `shutdown` and exits, so this returns without cancelling
+    /// anything. Consumes the handles, so a second call is a no-op.
+    pub(crate) async fn join_lanes(&mut self) {
+        let lanes = std::mem::take(&mut self.lanes);
+        for lane in lanes {
+            let _ = lane.handle.await;
+        }
     }
 
     pub(crate) fn shutdown(&mut self, tx_pool: &mut TxPool) {
@@ -1103,19 +1144,27 @@ impl TxEngine {
             }
             if let Some(job) = s.job.take() {
                 tx_pool.return_slot(job.buf);
-                self.in_flight_count = self.in_flight_count.saturating_sub(1);
             }
             if let Some(completion) = s.completion.take() {
                 tx_pool.return_slot(completion.buf);
-                self.in_flight_count = self.in_flight_count.saturating_sub(1);
             }
         }
         self.completed_lanes.borrow_mut().clear();
+        // Ownership stays truthful: a lane whose `send_to` is still with the
+        // kernel keeps its slot until its own completion returns it, so the
+        // in-flight count is recomputed from lane state rather than zeroed.
+        self.in_flight_count = self
+            .lanes
+            .iter()
+            .filter(|lane| lane.state.borrow().in_kernel)
+            .count();
         self.idle_lanes.clear();
-        for i in 0..self.capacity {
-            self.idle_lanes.push(i);
+        for lane_idx in 0..self.capacity {
+            if lane_idx < self.lanes.len() && self.lanes[lane_idx].state.borrow().in_kernel {
+                continue;
+            }
+            self.idle_lanes.push(lane_idx);
         }
-        self.in_flight_count = 0;
     }
 }
 
@@ -1355,29 +1404,34 @@ impl Owner {
         self.tx_engine.fault()
     }
 
-    /// Explicit shutdown: stops new admissions, reclaims queued jobs and
-    /// ready completions, and returns all owned buffers to the pool.
+    /// Non-awaiting shutdown: stops new admissions, signals the fixed lanes to
+    /// stop, and reclaims only the buffers the engine still owns (a queued job
+    /// or an unpublished completion).
     ///
-    /// This synchronous form never awaits kernel I/O: a buffer already moved
-    /// into a worker-local in-flight `send_to` stays owned by that lane
-    /// until its completion arrives (see `shutdown_and_drain` for the
-    /// quiescent form that waits for it). No completion can appear after
-    /// lane state is reclaimed.
+    /// Ownership stays truthful. A lane whose `send_to` is already with the
+    /// kernel keeps its slot, so `tx_in_flight()` keeps counting it and
+    /// `tx_pool().free_count()` stays below capacity until that completion is
+    /// reaped. This form never fabricates quiescence; use
+    /// [`Self::shutdown_and_drain`] when the caller needs to prove it.
     pub fn shutdown(&mut self) {
         self.tx_engine.shutdown(&mut self.tx_pool);
     }
 
-    /// Two-phase quiescent shutdown for production teardown:
+    /// Quiescent shutdown for production teardown:
     ///
-    /// 1. `begin_shutdown` stops new admissions/TX submissions;
-    /// 2. in-flight `send_to` work is reaped to zero, bounded by `timeout`;
-    /// 3. `finish_shutdown` stops every fixed lane and reclaims any
-    ///    still-owned buffer exactly once.
+    /// 1. stop new admissions/TX submissions (`begin_shutdown`);
+    /// 2. reap in-flight `send_to` work to zero, bounded by `timeout`;
+    /// 3. only after that proof: signal every lane to stop, await/join every
+    ///    lane worker, and mark the terminal state.
     ///
-    /// Returns `true` when quiescent (`in_flight() == 0`, every slot back in
-    /// the pool). Returns `false` on timeout: lanes are still stopped and
-    /// accounted, but the caller must treat the teardown as hung/unclean
-    /// rather than quiescent.
+    /// Returns `true` when the teardown is proven quiescent: `in_flight() == 0`,
+    /// every lane joined, and `tx_pool().free_count() == capacity()`.
+    ///
+    /// On timeout it returns `false` **without** fabricating anything: no lane
+    /// is joined, no buffer is reclaimed early, `in_flight()` still counts the
+    /// work the kernel owns, and the Owner is faulted with
+    /// [`OwnerFault::ShutdownTimedOut`] so the caller can see the teardown did
+    /// not complete.
     pub async fn shutdown_and_drain(&mut self, timeout: std::time::Duration) -> bool {
         self.tx_engine.begin_shutdown();
         let deadline = std::time::Instant::now() + timeout;
@@ -1389,8 +1443,17 @@ impl Owner {
         let drained = tx_engine
             .drain_in_flight(tx_pool, completions, usize::MAX, deadline)
             .await;
+        if !drained || self.tx_engine.in_flight() != 0 {
+            let in_flight = self.tx_engine.in_flight();
+            self.tx_engine.note_shutdown_timeout(in_flight);
+            return false;
+        }
+        // Proven quiescent: stop the lanes, join them, then mark terminal.
         self.tx_engine.finish_shutdown(&mut self.tx_pool);
-        drained && self.tx_engine.in_flight() == 0
+        self.tx_engine.join_lanes().await;
+        let free = self.tx_pool.free_count();
+        let capacity = self.tx_pool.capacity();
+        self.tx_engine.in_flight() == 0 && free == capacity
     }
 
     fn poll_tx_activity(&mut self, cx: &mut Context<'_>) -> Poll<()> {
@@ -3446,12 +3509,13 @@ mod tests {
             }
             assert_eq!(owner.tx_pool().free_count(), 3);
             owner.shutdown();
+            // Truthful ownership: a slot already with the kernel stays owned
+            // by its lane. Conservation must hold either way.
             assert_eq!(
-                owner.tx_pool().free_count(),
+                owner.tx_pool().free_count() + owner.tx_in_flight(),
                 4,
-                "shutdown must return all slots to tx_pool"
+                "free + in-flight must always equal capacity after shutdown"
             );
-            assert_eq!(owner.tx_in_flight(), 0);
             assert!(owner.fault().is_some(), "shutdown sets fault");
         });
     }
@@ -3558,6 +3622,61 @@ mod tests {
         });
     }
 
+    /// P0-3: a drain that cannot reach quiescence leaves ownership intact.
+    #[test]
+    fn shutdown_timeout_does_not_fabricate_quiescence() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            let c_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+            let c_sock = compio::net::UdpSocket::from_std(c_std).expect("adopt");
+            let mut owner = Owner::new(2).with_caller(OwnerCallerSide::new_single(c_sock));
+            let capacity = owner.tx_pool().capacity();
+
+            // One lane owns a slot the kernel is still "sending": the slot is
+            // out of the pool, the engine counts it in flight, and no
+            // completion will ever be published for it here.
+            {
+                // Dropped rather than leaked: the point is pool/counter
+                // disagreement, not the bytes themselves, and a leak would
+                // trip the ASan job.
+                let held = owner.tx_pool.free_buffers.pop().expect("slot available");
+                drop(held);
+                let engine = &mut owner.tx_engine;
+                engine.ensure_started();
+                let _ = engine.idle_lanes.pop();
+                engine.in_flight_count = 1;
+                engine.lanes[0].state.borrow_mut().in_kernel = true;
+            }
+            let free_before = owner.tx_pool().free_count();
+
+            let drained = owner
+                .shutdown_and_drain(std::time::Duration::from_millis(30))
+                .await;
+            assert!(
+                !drained,
+                "a stuck in-flight send must not report quiescence"
+            );
+            assert_eq!(
+                owner.tx_in_flight(),
+                1,
+                "in-flight ownership must survive a timed-out drain"
+            );
+            assert_eq!(
+                owner.tx_pool().free_count(),
+                free_before,
+                "a timed-out drain must not reclaim slots it does not own"
+            );
+            assert!(
+                owner.tx_pool().free_count() < capacity,
+                "the lane still owns its slot"
+            );
+            match owner.fault() {
+                Some(OwnerFault::ShutdownTimedOut { in_flight }) => assert_eq!(*in_flight, 1),
+                other => panic!("timed-out teardown must be a typed fault, got {other:?}"),
+            }
+        });
+    }
+
     #[test]
     fn shutdown_and_drain_reaps_in_flight_to_quiescence() {
         let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
@@ -3586,6 +3705,10 @@ mod tests {
             assert!(drained, "loopback sends must drain to quiescence");
             assert_eq!(owner.tx_in_flight(), 0);
             assert_eq!(owner.tx_pool().free_count(), owner.tx_pool().capacity());
+            assert!(
+                owner.tx_engine.lanes.is_empty(),
+                "terminal shutdown must join every fixed lane"
+            );
             // Terminal: no new admission after shutdown.
             let caller = owner.caller.as_ref().unwrap();
             let mut sink = OwnerTxSink {
