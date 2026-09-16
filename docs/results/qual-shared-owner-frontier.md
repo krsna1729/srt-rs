@@ -51,19 +51,21 @@ in `refused`). Rows are only comparable at the same K and H.
 
 ## Canonical rows (K = 256, H = 64, one sender process)
 
-Committed evidence for this exact table, with host/kernel/config provenance:
-[`qual-shared-owner-fixed-kh-c65be16.json`](qual-shared-owner-fixed-kh-c65be16.json)
+Committed evidence for this exact table — measured from a **clean checkout** of
+the SHA it names, by the committed parser/generator (`cargo run --release -p
+srt-bench --bin qual-evidence`), which keeps every field the harness prints —
+[`qual-shared-owner-fixed-kh-503ef2f.json`](qual-shared-owner-fixed-kh-503ef2f.json)
 (SHA `c65be16`, kernel `6.8.0-139-generic`, 6 CPUs); it carries every field the harness prints, plus the verbatim stdout line of sender and receiver for each run.
 
-| F | established | pre-window drained | expected / generated / missed ticks | data offered = accepted | wire submitted (window) | missed ticks % | lateness p50 / p99 / max (µs) | drain | in-flight at window end | receiver DATA | receiver lost `sec_a` |
+| F | established | pre-window drained | expected / generated / missed ticks | missed ticks % | data offered = accepted | wire submitted (window) | lateness p50 / p99 / max (µs) | drain | in-flight at window end | receiver DATA | receiver lost `sec_a` |
 |---:|---:|---|---|---:|---:|---:|---|---|---:|---:|---:|
-| 1 | 1/1 | yes | 2279 / 2279 / 0 | 2,279 | 2,859 | 0.0 % | 81 / 284 / 1058 | ok | 1 | 2,279 | 0 |
-| 10 | 10/10 | yes | 2279 / 2279 / 0 | 22,790 | 28,510 | 0.0 % | 109 / 556 / 1629 | ok | 10 | 22,790 | 0 |
-| 100 | 100/100 | yes | 2279 / 2278 / 1 | 227,800 | 271,834 | 0.0 % | 367 / 1077 / 3011 | ok | 235 | 227,800 | 0 |
-| 150 | 150/150 | yes | 2279 / 2272 / 7 | 340,800 | 226,029 | 0.3 % | 532 / 1680 / 4811 | ok | 256 | 340,800 | 0 |
-| 200 | 200/200 | yes | 2279 / 2279 / 0 | 455,800 | 224,936 | 0.0 % | 577 / 1368 / 2332 | ok | 256 | 455,800 | 0 |
-| 600 | 600/600 | no | 2279 / 2197 / 82 | 1,318,200 | 88,764 | 3.6 % | 1150 / 4763 / 15312 | **not reached** | 256 | 611,474 | 0 |
-| 1000 | 1000/1000 | no | 2279 / 1882 / 397 | 1,882,000 | 15,996 | 17.4 % | 2079 / 6362 / 22429 | **not reached** | 256 | 595,798 | 0 |
+| 1 | 1/1 | yes | 2279 / 2277 / 2 | 0.1 % | 2,277 | 2,856 | 95 / 678 / 1988 | ok | 2 | 2,277 | 0 |
+| 10 | 10/10 | yes | 2279 / 2227 / 52 | 2.3 % | 22,270 | 27,906 | 137 / 2089 / 9645 | ok | 10 | 22,270 | 0 |
+| 100 | 100/100 | yes | 2279 / 2238 / 41 | 1.8 % | 223,800 | 242,616 | 445 / 2229 / 7529 | ok | 256 | 223,800 | 0 |
+| 150 | 150/150 | yes | 2279 / 2184 / 95 | 4.2 % | 327,600 | 187,780 | 598 / 3753 / 13921 | ok | 256 | 327,600 | 0 |
+| 200 | 200/200 | yes | 2279 / 2270 / 9 | 0.4 % | 454,000 | 211,484 | 597 / 1823 / 4121 | ok | 256 | 454,000 | 0 |
+| 600 | 600/600 | no | 2279 / 2166 / 113 | 5.0 % | 1,299,600 | 82,045 | 1173 / 4923 / 23293 | **not reached** | 256 | 574,213 | 0 |
+| 1000 | 1000/1000 | no | 2279 / 1805 / 474 | 20.8 % | 1,805,000 | 10,101 | 2346 / 6098 / 27119 | **not reached** | 256 | 579,581 | 0 |
 
 `short = 0`, `failed = 0`, `peer_local = 0`, `transient = 0`, `tx_failures_pending = 0`,
 `rx_dropped = 0`, `rx_truncated = 0` on every row. Raw harness stdout for the
@@ -80,7 +82,16 @@ What this establishes, and what it does not:
 - **Delivery reconciles exactly through F=200**: every row reaches a drained
   equilibrium (`drain_ok`, `pending_after_drain = 0`) with the receiver
   reporting exactly `data_offered` DATA packets and zero loss (`sec_a = 0`),
-  and p99 source lateness ≤ 1.7 ms.
+  and p99 source lateness ≤ 3.8 ms.
+
+**Run-to-run spread is real and is not smoothed over.** The same commands on the
+same host produced, for `missed_source_ticks` out of 2279: F=1: 0, 2, 13, 57;
+F=10: 0, 44, 52; F=100: 1, 12, 41, 46; F=150: 7, 10, 16, 95; F=200: 0, 1, 9, 12;
+F=600: 74, 82, 113; F=1000: 397, 474, 529. The producer shares this thread with
+`owner.service()`, so much of that spread is host scheduling jitter rather than a
+shard property — which is exactly the limitation the terminology above records,
+and why a separately paced producer remains the stronger target-host design. Do
+not read a single row, or a single three-second sample, as a capacity figure.
 - **That is a reconciliation statement, not a sustained-capacity statement.**
   F=150 and F=200 reach zero outstanding only after a post-window drain phase
   much larger than their window traffic (219,564 and 525,582 wire datagrams
