@@ -11,7 +11,7 @@ use std::collections::VecDeque;
 use std::future::poll_fn;
 use std::io;
 use std::net::SocketAddr;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::task::{Context, Poll, Waker};
 /// Per-connection state for compio: protocol + owned-buffer socket + timer deadlines.
 pub struct Conn {
@@ -780,7 +780,7 @@ impl ManagedRxRing {
 /// what makes the datapath single-consumer by construction.
 async fn managed_rx_task(
     sock: Rc<compio::net::UdpSocket>,
-    ring: Rc<RefCell<ManagedRxRing>>,
+    ring: Weak<RefCell<ManagedRxRing>>,
     slot_len: usize,
 ) {
     use futures_util::StreamExt;
@@ -789,6 +789,14 @@ async fn managed_rx_task(
     // the ring slot is detected as truncated instead of being parsed short.
     let mut stream = Box::pin(sock.recv_msg_multi(0));
     loop {
+        // Weak, not Rc: the ring owns this task's JoinHandle, so holding a
+        // strong reference back to the ring would be an Rc cycle that never
+        // drops -- a leaked ring, a leaked task, and a socket reader that
+        // outlives the Owner that created it. Losing the owner means the ring
+        // is gone: stop.
+        let Some(ring) = ring.upgrade() else {
+            break;
+        };
         if ring.borrow().shutdown {
             break;
         }
@@ -1020,7 +1028,7 @@ impl ListenerSide {
         }
         let handle = spawn(managed_rx_task(
             Rc::clone(&self.sock),
-            Rc::clone(&ring),
+            Rc::downgrade(&ring),
             slot_len,
         ));
         ring.borrow_mut().task = Some(handle);
@@ -1141,7 +1149,7 @@ impl OwnerCallerSide {
         }
         let handle = spawn(managed_rx_task(
             Rc::clone(&self.sock),
-            Rc::clone(&ring),
+            Rc::downgrade(&ring),
             slot_len,
         ));
         ring.borrow_mut().task = Some(handle);
@@ -4481,6 +4489,66 @@ mod tests {
             assert_eq!(
                 pending_before, pending_after,
                 "a refused acquisition must leave the same queued output, unreserved"
+            );
+        });
+    }
+
+    /// The managed RX task's ring reference must not form a cycle.
+    ///
+    /// The ring owns the task's `JoinHandle`, so a *strong* reference back to
+    /// the ring from inside the task is an Rc cycle: the ring never drops, the
+    /// task is never cancelled, and the socket reader outlives the Owner (an
+    /// ASan/LSan leak on any host whose kernel can register a provided-buffer
+    /// ring). Production passes `Weak` -- that is enforced by
+    /// `managed_rx_task`'s signature and by the spawn sites -- and this test
+    /// asserts the difference between the two patterns explicitly, so the
+    /// reason for the `Weak` is executable rather than a comment.
+    #[test]
+    fn managed_rx_ring_reference_pattern_has_no_cycle() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            // Weak (production): the owner's drop frees the ring immediately,
+            // even while a task that only holds the Weak is still running.
+            let weak_ring = Rc::new(RefCell::new(ManagedRxRing::new()));
+            let weak_seen = Rc::downgrade(&weak_ring);
+            let task_ref = Rc::downgrade(&weak_ring);
+            let weak_task = compio::runtime::spawn(async move {
+                while task_ref.upgrade().is_some() {
+                    compio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            });
+            weak_ring.borrow_mut().task = Some(weak_task);
+            drop(weak_ring);
+            for _ in 0..500 {
+                if weak_seen.upgrade().is_none() {
+                    break;
+                }
+                compio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            assert!(
+                weak_seen.upgrade().is_none(),
+                "a task holding only Weak must not keep its ring alive"
+            );
+
+            // Strong (the shape this test exists to rule out): the same
+            // arrangement keeps the ring alive until the task itself ends.
+            let strong_ring = Rc::new(RefCell::new(ManagedRxRing::new()));
+            let strong_seen = Rc::downgrade(&strong_ring);
+            let held = Rc::clone(&strong_ring);
+            let strong_task = compio::runtime::spawn(async move {
+                let _held = held;
+                compio::time::sleep(std::time::Duration::from_millis(50)).await;
+            });
+            strong_ring.borrow_mut().task = Some(strong_task);
+            drop(strong_ring);
+            assert!(
+                strong_seen.upgrade().is_some(),
+                "a strong task reference keeps the ring alive -- the cycle"
+            );
+            compio::time::sleep(std::time::Duration::from_millis(120)).await;
+            assert!(
+                strong_seen.upgrade().is_none(),
+                "only once the task itself ends does the ring go"
             );
         });
     }
