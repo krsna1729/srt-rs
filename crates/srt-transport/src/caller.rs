@@ -1,3 +1,6 @@
+use crate::sink::{
+    DatagramTarget, ProtocolOutputFailure, ProtocolOutputFailureQueue, TxAttribution,
+};
 use crate::{
     DatagramSink, DatagramSlot, GroupConnectionStats, GroupLogicalCounters, ManualTimerStore,
     OutputDrainBudget, OutputDrainReport, OutputDrainStatus, SinkOutcome, group_connection_stats,
@@ -25,6 +28,19 @@ pub(crate) const MAX_DUE_PER_VISIT: usize = 256;
 pub struct LogicalCallerId(u64);
 
 impl LogicalCallerId {
+    /// The raw id, for opaque transport attribution. Not a handle: callers
+    /// outside this crate never interpret it.
+    #[must_use]
+    pub(crate) fn as_u64(self) -> u64 {
+        self.0
+    }
+
+    /// Rebuild from a raw id minted by [`Self::as_u64`].
+    #[must_use]
+    pub(crate) fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
     /// A distinct, otherwise-meaningless id for tests that only need two
     /// (or more) hashable keys and have no real `CallerTable` entry to
     /// mint one from (e.g. exercising `SessionTarget`-keyed structures in
@@ -372,6 +388,10 @@ pub struct CallerTable {
     /// phase drains it, and its capacity is retained across calls so the
     /// normal service path never allocates.
     due_scratch: Vec<LogicalCallerId>,
+    /// Bounded, attributed protocol-output failures awaiting application
+    /// drain. `Option` so one drain pass can move it into its `DrainSink`;
+    /// it is always `Some` outside a pass.
+    protocol_failures: Option<ProtocolOutputFailureQueue>,
     next_logical_caller: u64,
     max_callers: usize,
     #[cfg(any(test, feature = "bench-internals"))]
@@ -396,6 +416,9 @@ pub struct SchedCounters {
     pub ready_group_visits: usize,
     /// Output budget exhaustion events.
     pub budget_exhausted: usize,
+    /// Ready visits whose session was quarantined by a protocol
+    /// materialization failure.
+    pub protocol_failed_visits: usize,
 }
 
 /// Telemetry snapshot of the indexed due min-heap (bench/tests).
@@ -426,12 +449,20 @@ struct CallerLegState {
     connection: SrtConnection,
     timers: ManualTimerStore,
     pending: VecDeque<ConnectionOutput>,
+    /// Set when `poll_output_into` refuses this leg's peeked datagram. The
+    /// queue still holds that output, so the leg must not be re-offered as
+    /// ordinary work: it would rediscover the same failure forever. The
+    /// application retires the session through the normal removal API.
+    output_faulted: bool,
 }
 
 struct CallerGroupLegState {
     peer: std::net::SocketAddr,
     timers: ManualTimerStore,
     pending: VecDeque<ConnectionOutput>,
+    /// Per-leg quarantine; see [`CallerLegState::output_faulted`]. A faulted
+    /// member does not stop its siblings.
+    output_faulted: bool,
 }
 
 struct CallerGroupState {
@@ -456,6 +487,11 @@ struct DrainSink<'a, S: ?Sized> {
     budget: OutputDrainBudget,
     report: &'a mut OutputDrainReport,
     sink: &'a mut S,
+    /// Bounded, attributed protocol-output failures. Moved out of the table
+    /// for the duration of one drain pass (see `drain_ready_bounded`) so the
+    /// per-leg paths can record failures without borrowing the table that
+    /// owns the sessions they are walking.
+    failures: &'a mut ProtocolOutputFailureQueue,
 }
 
 /// Account one committed datagram.
@@ -464,6 +500,28 @@ fn record_pushed(report: &mut OutputDrainReport, len: usize) {
     report.actions += 1;
     report.packets += 1;
     report.bytes = report.bytes.saturating_add(len);
+}
+
+/// Account one protocol materialization failure. The protocol output stays
+/// queued in the connection; the typed kind rides on the report and the
+/// attributed record goes to the table's bounded failure queue, so an upper
+/// layer can react instead of this reading as "nothing to send".
+fn record_protocol_failure(
+    report: &mut OutputDrainReport,
+    failures: &mut ProtocolOutputFailureQueue,
+    attribution: TxAttribution,
+    error: &srt_proto::Error,
+) {
+    report.protocol_output_failures += 1;
+    if report.protocol_output_error_kind.is_none() {
+        report.protocol_output_error_kind = Some(error.kind);
+    }
+    report.status = OutputDrainStatus::ProtocolError;
+    failures.push(ProtocolOutputFailure {
+        attribution,
+        kind: error.kind,
+        reason: error.to_string(),
+    });
 }
 
 /// Account one sink refusal, recorded BEFORE materialization. The protocol
@@ -486,6 +544,22 @@ fn record_unavailable(report: &mut OutputDrainReport) {
 /// mutably borrowed by the in-flight reservation.
 fn split<'d, S: ?Sized>(sink: &'d mut DrainSink<'_, S>) -> (&'d mut OutputDrainReport, &'d mut S) {
     (&mut *sink.report, &mut *sink.sink)
+}
+
+/// What one leg's materialization path needs besides the sink itself: the
+/// failure queue and the datagram's logical attribution.
+struct DrainChain<'a> {
+    failures: &'a mut ProtocolOutputFailureQueue,
+}
+
+/// Split the sink for a materialization attempt: report, queue, destination.
+fn split_chain<'d, S: ?Sized>(
+    sink: &'d mut DrainSink<'_, S>,
+) -> (&'d mut OutputDrainReport, DrainChain<'d>, &'d mut S) {
+    let chain = DrainChain {
+        failures: &mut *sink.failures,
+    };
+    (&mut *sink.report, chain, &mut *sink.sink)
 }
 
 impl CallerSession {
@@ -632,13 +706,26 @@ impl CallerSession {
     /// reindexes in `fire_due_ids`).
     fn drain_one<S: DatagramSink + ?Sized>(
         &mut self,
+        id: LogicalCallerId,
         now: Timestamp,
         sink: &mut DrainSink<'_, S>,
     ) -> (DrainOne, bool) {
         match self {
-            Self::Direct(leg) => drain_one_caller_leg(leg, now, sink),
+            Self::Direct(leg) => {
+                if leg.output_faulted {
+                    // Already reported and still holding its queued output:
+                    // re-offering it would rediscover the same failure.
+                    return (DrainOne::Empty, false);
+                }
+                let result = drain_one_caller_leg(id, leg, now, sink);
+                if matches!(result.0, DrainOne::ProtocolFailed { .. }) {
+                    leg.output_faulted = true;
+                }
+                result
+            }
             Self::Group(group) => {
                 let mut timers_touched = false;
+                let mut failed_member: Option<u32> = None;
                 for _ in 0..group.leg_order.len() {
                     let member_id = group.leg_order[group.next_leg];
                     group.next_leg = (group.next_leg + 1) % group.leg_order.len();
@@ -646,6 +733,10 @@ impl CallerSession {
                         .legs
                         .get_mut(&member_id)
                         .expect("group and caller legs are built together");
+                    if leg.output_faulted {
+                        failed_member = Some(member_id);
+                        continue;
+                    }
                     let connection = group
                         .group
                         .member_mut(member_id)
@@ -653,6 +744,8 @@ impl CallerSession {
                         .connection_mut();
                     match drain_one_caller_leg_parts(
                         leg.peer,
+                        TxAttribution::caller(id, member_id),
+                        Some(member_id),
                         now,
                         &mut leg.timers,
                         &mut leg.pending,
@@ -662,12 +755,29 @@ impl CallerSession {
                         (DrainOne::Empty, touched) => {
                             timers_touched |= touched;
                         }
+                        // A materialization failure is quarantined to the leg
+                        // that reported it: its siblings in the same bonded
+                        // session keep carrying traffic.
+                        (DrainOne::ProtocolFailed { .. }, touched) => {
+                            leg.output_faulted = true;
+                            timers_touched |= touched;
+                            failed_member = Some(member_id);
+                        }
                         // A refusal on one leg must not be retried against the
                         // next leg of the same group either.
                         result => return result,
                     }
                 }
-                (DrainOne::Empty, timers_touched)
+                match failed_member {
+                    // Every leg is quarantined: the logical session has no
+                    // live output path left, so say so once, at session level.
+                    Some(member) if group.legs.values().all(|leg| leg.output_faulted) => (
+                        DrainOne::ProtocolFailed { leg: Some(member) },
+                        timers_touched,
+                    ),
+                    // Some legs failed and were reported; the rest still work.
+                    _ => (DrainOne::Empty, timers_touched),
+                }
             }
         }
     }
@@ -683,6 +793,13 @@ enum DrainOne {
     /// only repeat the refusal, so the visit stops; the refusal itself is
     /// reported through `sink_rejections`/`sink_error_kind`.
     SinkRejected,
+    /// `poll_output_into` refused to materialize the peeked datagram. The
+    /// protocol output is STILL QUEUED and the error is recorded on the
+    /// report; `leg` names the physical leg (`None` for a direct session) so
+    /// exactly that leg can be quarantined instead of the whole session.
+    ProtocolFailed {
+        leg: Option<u32>,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -743,6 +860,9 @@ impl CallerTable {
             deadlines: LogicalDueIndex::new(bounded),
             sched: HashMap::with_capacity(bounded),
             due_scratch: Vec::with_capacity(bounded.min(MAX_DUE_PER_VISIT)),
+            protocol_failures: Some(ProtocolOutputFailureQueue::new(
+                crate::sink::PROTOCOL_OUTPUT_FAILURE_CAPACITY,
+            )),
             next_logical_caller: 1,
             max_callers: bounded,
             #[cfg(any(test, feature = "bench-internals"))]
@@ -761,11 +881,17 @@ impl CallerTable {
     }
 
     fn sync_deadline(&mut self, id: LogicalCallerId) {
-        let new_micros = self
-            .sessions
-            .get(&id)
-            .and_then(Self::logical_next_deadline)
-            .map(|ts| ts.as_micros());
+        let new_micros = if self.session_output_quarantined(id) {
+            // A quarantined session has no schedulable deadlines: leaving one
+            // live would keep the shard reporting pending work it will never
+            // act on.
+            None
+        } else {
+            self.sessions
+                .get(&id)
+                .and_then(Self::logical_next_deadline)
+                .map(|ts| ts.as_micros())
+        };
         let entry = self.sched.entry(id).or_insert(SchedEntry {
             ready_queued: false,
             event_ready_queued: false,
@@ -886,7 +1012,58 @@ impl CallerTable {
         }
     }
 
+    /// Whether this session has no live output path left because every leg
+    /// of it was quarantined by a protocol materialization failure.
+    ///
+    /// A quarantined session still holds its queued output, so it must be kept
+    /// out of the ready queue and the due heap: re-offering it would either
+    /// rediscover the same failure forever or report a shard that always has
+    /// pending work while the application has not yet retired it.
+    fn session_output_quarantined(&self, id: LogicalCallerId) -> bool {
+        match self.sessions.get(&id) {
+            Some(CallerSession::Direct(leg)) => leg.output_faulted,
+            Some(CallerSession::Group(group)) => group.legs.values().all(|leg| leg.output_faulted),
+            None => false,
+        }
+    }
+
+    /// Drain attributed protocol materialization failures, oldest first.
+    ///
+    /// Each entry names the logical session and the physical leg and carries
+    /// the protocol's own error kind and reason. The affected leg stays
+    /// quarantined until the application retires the session, so a failure is
+    /// reported once rather than every visit.
+    pub fn poll_output_failures(
+        &mut self,
+        max_events: usize,
+        out: &mut Vec<ProtocolOutputFailure>,
+    ) {
+        out.clear();
+        if let Some(queue) = self.protocol_failures.as_mut() {
+            queue.drain_into(max_events, out);
+        }
+    }
+
+    /// Protocol-output failures still queued for the application.
+    #[must_use]
+    pub fn output_failures_pending(&self) -> usize {
+        self.protocol_failures
+            .as_ref()
+            .map_or(0, ProtocolOutputFailureQueue::len)
+    }
+
+    /// Protocol-output failures dropped because the bounded queue was full.
+    #[must_use]
+    pub fn output_failures_dropped(&self) -> u64 {
+        self.protocol_failures
+            .as_ref()
+            .map_or(0, ProtocolOutputFailureQueue::dropped)
+    }
+
     fn enqueue_ready(&mut self, id: LogicalCallerId) {
+        if self.session_output_quarantined(id) {
+            return;
+        }
         let entry = self.sched.entry(id).or_insert(SchedEntry {
             ready_queued: false,
             event_ready_queued: false,
@@ -1028,6 +1205,7 @@ impl CallerTable {
                 connection: leg.connection,
                 timers: ManualTimerStore::new(),
                 pending: VecDeque::new(),
+                output_faulted: false,
             })),
         );
         self.routes.insert(socket_id, CallerRoute::Direct(id));
@@ -1081,6 +1259,7 @@ impl CallerTable {
                         peer: leg.peer,
                         timers: ManualTimerStore::new(),
                         pending: VecDeque::new(),
+                        output_faulted: false,
                     },
                 )
                 .is_some()
@@ -1382,10 +1561,14 @@ impl CallerTable {
         sink_dest: &mut S,
     ) -> (OutputDrainReport, usize) {
         let mut report = OutputDrainReport::default();
+        let mut failures = self.protocol_failures.take().unwrap_or_else(|| {
+            ProtocolOutputFailureQueue::new(crate::sink::PROTOCOL_OUTPUT_FAILURE_CAPACITY)
+        });
         let mut sink = DrainSink {
             budget,
             report: &mut report,
             sink: sink_dest,
+            failures: &mut failures,
         };
         // Set when a leg's next packet cannot fit the remaining allowance
         // (`DrainOne::Blocked`'s exceeds_bytes case in
@@ -1429,6 +1612,7 @@ impl CallerTable {
         {
             report.status = OutputDrainStatus::BudgetExhausted;
         }
+        self.protocol_failures = Some(failures);
         (report, visits)
     }
 
@@ -1445,7 +1629,7 @@ impl CallerTable {
             let Some(session) = self.sessions.get_mut(&id) else {
                 return ReadyVisitOutcome::Continue;
             };
-            session.drain_one(now, sink)
+            session.drain_one(id, now, sink)
         };
         #[cfg(any(test, feature = "bench-internals"))]
         {
@@ -1471,6 +1655,19 @@ impl CallerTable {
                 }
             }
             DrainOne::Empty => {}
+            DrainOne::ProtocolFailed { leg } => {
+                // The session (or every leg of it) is quarantined: its output
+                // stays queued, the attributed failure is already on the
+                // bounded queue, and it must not be re-enqueued as ordinary
+                // work. Other sessions in this visit are unaffected, so the
+                // loop simply continues.
+                let _ = leg;
+                #[cfg(any(test, feature = "bench-internals"))]
+                {
+                    self.sched_stats.protocol_failed_visits += 1;
+                }
+                return ReadyVisitOutcome::Continue;
+            }
             DrainOne::SinkRejected => {
                 // Nothing was consumed. The id must stay visible to the
                 // scheduler -- dropping it out of the ready queue would hide a
@@ -1816,12 +2013,15 @@ impl Default for CallerTable {
     }
 }
 fn drain_one_caller_leg<S: DatagramSink + ?Sized>(
+    id: LogicalCallerId,
     leg: &mut CallerLegState,
     now: Timestamp,
     sink: &mut DrainSink<'_, S>,
 ) -> (DrainOne, bool) {
     drain_one_caller_leg_parts(
         leg.peer,
+        TxAttribution::caller(id, 0),
+        None,
         now,
         &mut leg.timers,
         &mut leg.pending,
@@ -1880,8 +2080,11 @@ fn drain_caller_legacy_output<S: DatagramSink + ?Sized>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drain_caller_direct_meta<S: DatagramSink + ?Sized>(
     peer: std::net::SocketAddr,
+    attribution: TxAttribution,
+    leg: Option<u32>,
     now: Timestamp,
     timers: &mut ManualTimerStore,
     connection: &mut SrtConnection,
@@ -1897,8 +2100,9 @@ fn drain_caller_direct_meta<S: DatagramSink + ?Sized>(
             }
             // Reserve first: `poll_output_into` is only reached once capacity
             // is irrevocably held, so a refusal cannot consume protocol state.
-            let (report, dest) = split(sink);
-            let mut slot = match dest.acquire(peer, wire_len) {
+            let (report, chain, dest) = split_chain(sink);
+            let mut slot = match dest.acquire_target(DatagramTarget { peer, attribution }, wire_len)
+            {
                 Ok(Some(slot)) => slot,
                 Ok(None) => {
                     record_unavailable(report);
@@ -1913,10 +2117,14 @@ fn drain_caller_direct_meta<S: DatagramSink + ?Sized>(
                 let buf = slot.bytes_mut();
                 match connection.poll_output_into(buf) {
                     Ok(Some(OutputInto::Datagram { len })) => Ok(len),
-                    // Not a datagram after all (or nothing pending): no
-                    // protocol output was consumed, so drop the reservation.
-                    Ok(_) => Err(()),
-                    Err(_) => Err(()),
+                    // The peeked datagram is still queued: a datagram that
+                    // vanished between peek and poll, or a protocol refusal,
+                    // is a real condition of this session -- never "empty".
+                    Ok(_) => Err(srt_proto::Error::with_reason(
+                        srt_proto::ErrorKind::InvalidState,
+                        "peeked datagram output vanished before materialization",
+                    )),
+                    Err(error) => Err(error),
                 }
             };
             match materialized {
@@ -1926,7 +2134,10 @@ fn drain_caller_direct_meta<S: DatagramSink + ?Sized>(
                     record_pushed(report, len);
                     (DrainOne::Drained, false)
                 }
-                Err(()) => (DrainOne::Empty, false),
+                Err(error) => {
+                    record_protocol_failure(report, chain.failures, attribution, &error);
+                    (DrainOne::ProtocolFailed { leg }, false)
+                }
             }
         }
         OutputMeta::SetTimer { .. } | OutputMeta::ClearTimer { .. } => {
@@ -1957,8 +2168,11 @@ fn drain_caller_direct_meta<S: DatagramSink + ?Sized>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drain_one_caller_leg_parts<S: DatagramSink + ?Sized>(
     peer: std::net::SocketAddr,
+    attribution: TxAttribution,
+    leg: Option<u32>,
     now: Timestamp,
     timers: &mut ManualTimerStore,
     pending: &mut VecDeque<ConnectionOutput>,
@@ -1974,7 +2188,7 @@ fn drain_one_caller_leg_parts<S: DatagramSink + ?Sized>(
     let Some(meta) = connection.peek_output() else {
         return (DrainOne::Empty, false);
     };
-    drain_caller_direct_meta(peer, now, timers, connection, meta, sink)
+    drain_caller_direct_meta(peer, attribution, leg, now, timers, connection, meta, sink)
 }
 
 pub(crate) fn prepend_outputs(
@@ -2167,6 +2381,448 @@ mod tests {
                 buf: vec![0u8; wire_len],
             }))
         }
+    }
+
+    /// Adversarial sink: it reserves the requested capacity but hands the
+    /// protocol a SHORTER buffer, so `poll_output_into` refuses with
+    /// `insufficient_buffer` while the protocol output stays queued.
+    ///
+    /// That is the deterministic injection the materialization-failure
+    /// contract needs: no kernel, no timing, and no dependence on which error
+    /// the protocol picks. A sink that violates its own reservation contract
+    /// is exactly the hostile case the table must survive.
+    struct ShortBufferSink {
+        acquisitions: usize,
+        committed: Vec<(std::net::SocketAddr, Vec<u8>)>,
+        /// Attribution offered on the most recent acquisition, so a test can
+        /// prove the table passes the logical identity, not just an address.
+        last_attribution: Option<crate::sink::TxAttribution>,
+        short_by: usize,
+    }
+
+    struct ShortBufferSlot<'a> {
+        sink: &'a mut ShortBufferSink,
+        peer: std::net::SocketAddr,
+        buf: Vec<u8>,
+    }
+
+    impl DatagramSlot for ShortBufferSlot<'_> {
+        fn bytes_mut(&mut self) -> &mut [u8] {
+            &mut self.buf
+        }
+
+        fn commit(self, len: usize) {
+            let mut buf = self.buf;
+            buf.truncate(len);
+            self.sink.committed.push((self.peer, buf));
+        }
+    }
+
+    impl DatagramSink for ShortBufferSink {
+        type Slot<'a> = ShortBufferSlot<'a>;
+
+        fn acquire(
+            &mut self,
+            peer: std::net::SocketAddr,
+            wire_len: usize,
+        ) -> Result<Option<Self::Slot<'_>>, srt_proto::Error> {
+            self.acquisitions += 1;
+            let len = wire_len.saturating_sub(self.short_by).max(1);
+            Ok(Some(ShortBufferSlot {
+                sink: self,
+                peer,
+                buf: vec![0u8; len],
+            }))
+        }
+
+        fn acquire_target(
+            &mut self,
+            target: crate::sink::DatagramTarget,
+            wire_len: usize,
+        ) -> Result<Option<Self::Slot<'_>>, srt_proto::Error> {
+            self.last_attribution = Some(target.attribution);
+            self.acquire(target.peer, wire_len)
+        }
+    }
+
+    /// A protocol materialization failure must never read as "nothing to
+    /// send": the output stays queued, the failure is typed and attributed to
+    /// the logical caller, and the caller is not re-offered as ordinary empty
+    /// work (which would rediscover the same failure every visit).
+    #[test]
+    fn direct_protocol_materialization_failure_is_typed_and_attributed() {
+        let mut table = CallerTable::new();
+        let peer: std::net::SocketAddr = "127.0.0.1:9401".parse().unwrap();
+        let now = Timestamp::from_micros(10_000);
+        let leg = CallerLeg {
+            peer,
+            connection: caller_connection(ConnectionOptions {
+                socket_id: 0x9401,
+                ..ConnectionOptions::default()
+            }),
+        };
+        let id = table.add_direct(leg).expect("admitted");
+
+        // First visit with a hostile sink: the reservation is granted but the
+        // protocol cannot materialize into it.
+        let mut short = ShortBufferSink {
+            acquisitions: 0,
+            committed: Vec::new(),
+            last_attribution: None,
+            short_by: 8,
+        };
+        let report = table.poll_outbound_bounded_to(now, OutputDrainBudget::default(), &mut short);
+        assert_eq!(
+            report.protocol_output_failures, 1,
+            "the refusal is counted, not swallowed"
+        );
+        assert_eq!(
+            report.protocol_output_error_kind,
+            Some(srt_proto::ErrorKind::InsufficientBuffer),
+            "the protocol's own kind is surfaced"
+        );
+        assert_eq!(report.status, OutputDrainStatus::ProtocolError);
+        assert!(short.committed.is_empty(), "nothing was committed");
+        assert_eq!(
+            short.last_attribution.and_then(|a| a.caller_id()),
+            Some(id),
+            "the reservation carried the logical caller identity"
+        );
+        // The offending output is STILL QUEUED.
+        assert!(
+            table.bench_peek_output(&id).is_some(),
+            "a refused materialization leaves the output queued"
+        );
+
+        let mut failures = Vec::new();
+        table.poll_output_failures(8, &mut failures);
+        assert_eq!(failures.len(), 1, "one attributed failure is reported");
+        assert_eq!(failures[0].attribution.caller_id(), Some(id));
+        assert_eq!(failures[0].attribution.leg(), 0);
+        assert_eq!(failures[0].kind, srt_proto::ErrorKind::InsufficientBuffer);
+    }
+
+    /// Follow-up to the test above: a quarantined caller is not rediscovered,
+    /// and a healthy sibling in the same table keeps draining.
+    #[test]
+    fn quarantined_caller_is_not_rediscovered_and_siblings_keep_draining() {
+        let mut table = CallerTable::new();
+        let peer: std::net::SocketAddr = "127.0.0.1:9403".parse().unwrap();
+        let now = Timestamp::from_micros(10_000);
+        let id = table
+            .add_direct(CallerLeg {
+                peer,
+                connection: caller_connection(ConnectionOptions {
+                    socket_id: 0x9403,
+                    ..ConnectionOptions::default()
+                }),
+            })
+            .expect("admitted");
+        let mut short = ShortBufferSink {
+            acquisitions: 0,
+            committed: Vec::new(),
+            last_attribution: None,
+            short_by: 8,
+        };
+        let report = table.poll_outbound_bounded_to(now, OutputDrainBudget::default(), &mut short);
+        assert_eq!(report.protocol_output_failures, 1);
+        let mut failures = Vec::new();
+        table.poll_output_failures(8, &mut failures);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].attribution.caller_id(), Some(id));
+
+        // The quarantined caller is not rediscovered: further visits neither
+        // re-report nor spin, and the table stops claiming pending output.
+        for _ in 0..3 {
+            let mut again = ShortBufferSink {
+                acquisitions: 0,
+                committed: Vec::new(),
+                last_attribution: None,
+                short_by: 8,
+            };
+            let report =
+                table.poll_outbound_bounded_to(now, OutputDrainBudget::default(), &mut again);
+            assert_eq!(
+                report.protocol_output_failures, 0,
+                "a quarantined caller must not re-report the same failure"
+            );
+            assert_eq!(again.acquisitions, 0, "and must not be re-offered");
+        }
+        assert_eq!(table.output_failures_pending(), 0);
+        assert!(
+            !table.has_pending_output(now),
+            "a quarantined caller is not schedulable work"
+        );
+
+        // A healthy sibling in the same table keeps draining.
+        let other_peer: std::net::SocketAddr = "127.0.0.1:9402".parse().unwrap();
+        let other = table
+            .add_direct(CallerLeg {
+                peer: other_peer,
+                connection: caller_connection(ConnectionOptions {
+                    socket_id: 0x9402,
+                    ..ConnectionOptions::default()
+                }),
+            })
+            .expect("admitted");
+        table.bench_make_ready(other);
+        let mut good = TestSink {
+            capacity: 8,
+            packets: Vec::new(),
+        };
+        let report = table.poll_outbound_bounded_to(now, OutputDrainBudget::default(), &mut good);
+        assert_eq!(
+            report.protocol_output_failures, 0,
+            "the sibling's datagram materializes normally"
+        );
+        assert!(!good.packets.is_empty(), "the sibling kept sending");
+        assert_eq!(good.packets[0].0, other_peer);
+    }
+
+    /// The same contract for a bonded caller: the failure names the exact leg,
+    /// and the other leg of that group keeps working.
+    #[test]
+    fn bonded_protocol_materialization_failure_isolates_one_leg() {
+        let mut callers = CallerTable::new();
+        let group_id = srt_proto::handshake::SRTGROUP_MASK | 78;
+        let first_peer: std::net::SocketAddr = "127.0.0.1:9412".parse().unwrap();
+        let second_peer: std::net::SocketAddr = "127.0.0.1:9413".parse().unwrap();
+        let now = Timestamp::from_micros(10_000);
+        let id = callers
+            .add_group(
+                group_id,
+                srt_proto::GroupMode::Broadcast,
+                [
+                    CallerGroupLeg::new(
+                        1,
+                        1,
+                        first_peer,
+                        caller_connection(ConnectionOptions {
+                            socket_id: 112,
+                            initial_seq: Some(1234),
+                            ..ConnectionOptions::default()
+                        }),
+                    ),
+                    CallerGroupLeg::new(
+                        2,
+                        1,
+                        second_peer,
+                        caller_connection(ConnectionOptions {
+                            socket_id: 113,
+                            initial_seq: Some(1234),
+                            ..ConnectionOptions::default()
+                        }),
+                    ),
+                ],
+            )
+            .expect("group admitted");
+
+        // Fail the first leg only: the sink grants the reservation for the
+        // first peer and shortens every buffer, then behaves for the second.
+        let mut selective = SelectiveShortSink {
+            failing_peer: first_peer,
+            short_by: 8,
+            committed: Vec::new(),
+            attributions: Vec::new(),
+        };
+        let _ = callers.poll_outbound_bounded_to(now, OutputDrainBudget::default(), &mut selective);
+
+        let mut failures = Vec::new();
+        callers.poll_output_failures(8, &mut failures);
+        assert_eq!(failures.len(), 1, "exactly one leg is reported");
+        assert_eq!(failures[0].attribution.caller_id(), Some(id));
+        assert_eq!(
+            failures[0].attribution.leg(),
+            1,
+            "the failing MEMBER id is the attribution, not the peer address"
+        );
+        assert_eq!(failures[0].kind, srt_proto::ErrorKind::InsufficientBuffer);
+
+        // Only the failing leg is quarantined: the same visit already
+        // materialized the sibling leg's datagram, on its own peer address.
+        assert!(
+            selective
+                .committed
+                .iter()
+                .any(|(peer, _)| *peer == second_peer),
+            "the healthy leg of the group still materializes"
+        );
+        assert!(
+            !selective
+                .committed
+                .iter()
+                .any(|(peer, _)| *peer == first_peer),
+            "the failing leg committed nothing"
+        );
+
+        // Later visits neither re-report the quarantined leg nor stop the
+        // group from being serviceable.
+        let mut good = TestSink {
+            capacity: 8,
+            packets: Vec::new(),
+        };
+        let report = callers.poll_outbound_bounded_to(now, OutputDrainBudget::default(), &mut good);
+        assert_eq!(
+            report.protocol_output_failures, 0,
+            "the quarantined leg is not re-reported"
+        );
+        let mut more = Vec::new();
+        callers.poll_output_failures(8, &mut more);
+        assert!(more.is_empty(), "one failure per leg, not one per visit");
+    }
+
+    /// Sink that fails materialization for one peer only, so a bonded test can
+    /// prove leg-level isolation instead of whole-group failure.
+    struct SelectiveShortSink {
+        failing_peer: std::net::SocketAddr,
+        short_by: usize,
+        committed: Vec<(std::net::SocketAddr, Vec<u8>)>,
+        attributions: Vec<crate::sink::DatagramTarget>,
+    }
+
+    struct SelectiveShortSlot<'a> {
+        sink: &'a mut SelectiveShortSink,
+        peer: std::net::SocketAddr,
+        buf: Vec<u8>,
+    }
+
+    impl DatagramSlot for SelectiveShortSlot<'_> {
+        fn bytes_mut(&mut self) -> &mut [u8] {
+            &mut self.buf
+        }
+
+        fn commit(self, len: usize) {
+            let mut buf = self.buf;
+            buf.truncate(len);
+            self.sink.committed.push((self.peer, buf));
+        }
+    }
+
+    impl DatagramSink for SelectiveShortSink {
+        type Slot<'a> = SelectiveShortSlot<'a>;
+
+        fn acquire_target(
+            &mut self,
+            target: crate::sink::DatagramTarget,
+            wire_len: usize,
+        ) -> Result<Option<Self::Slot<'_>>, srt_proto::Error> {
+            let len = if target.peer == self.failing_peer {
+                wire_len.saturating_sub(self.short_by).max(1)
+            } else {
+                wire_len
+            };
+            self.attributions.push(target);
+            Ok(Some(SelectiveShortSlot {
+                sink: self,
+                peer: target.peer,
+                buf: vec![0u8; len],
+            }))
+        }
+
+        fn acquire(
+            &mut self,
+            peer: std::net::SocketAddr,
+            wire_len: usize,
+        ) -> Result<Option<Self::Slot<'_>>, srt_proto::Error> {
+            self.acquire_target(crate::sink::DatagramTarget::unattributed(peer), wire_len)
+        }
+    }
+
+    /// The successful path is unchanged: reserve, materialize, commit -- with
+    /// the attribution still recorded on the sink.
+    #[test]
+    fn successful_materialization_still_commits_with_attribution() {
+        let mut table = CallerTable::new();
+        let peer: std::net::SocketAddr = "127.0.0.1:9421".parse().unwrap();
+        let now = Timestamp::from_micros(10_000);
+        let id = table
+            .add_direct(CallerLeg {
+                peer,
+                connection: caller_connection(ConnectionOptions {
+                    socket_id: 0x9421,
+                    ..ConnectionOptions::default()
+                }),
+            })
+            .expect("admitted");
+        let mut sink = ShortBufferSink {
+            acquisitions: 0,
+            committed: Vec::new(),
+            last_attribution: None,
+            short_by: 0,
+        };
+        let report = table.poll_outbound_bounded_to(now, OutputDrainBudget::default(), &mut sink);
+        assert_eq!(report.protocol_output_failures, 0);
+        assert_eq!(report.status, OutputDrainStatus::Drained);
+        assert_eq!(sink.committed.len(), 1, "one datagram committed");
+        assert_eq!(sink.committed[0].0, peer);
+        assert_eq!(
+            sink.last_attribution.and_then(|a| a.caller_id()),
+            Some(id),
+            "attribution survives the successful path too"
+        );
+        assert_eq!(table.output_failures_pending(), 0);
+    }
+
+    /// Two logical callers can share one remote UDP endpoint; SRT routing
+    /// distinguishes them by socket identity, not by address. The attribution
+    /// that reaches the sink must therefore be the logical caller, and it must
+    /// differ between them.
+    #[test]
+    fn attribution_distinguishes_logical_callers_sharing_one_peer_address() {
+        let mut table = CallerTable::new();
+        // Same address for both legs: only the socket id differs.
+        let shared: std::net::SocketAddr = "127.0.0.1:9501".parse().unwrap();
+        let now = Timestamp::from_micros(10_000);
+        let first = table
+            .add_direct(CallerLeg {
+                peer: shared,
+                connection: caller_connection(ConnectionOptions {
+                    socket_id: 0x9501,
+                    ..ConnectionOptions::default()
+                }),
+            })
+            .expect("first admitted");
+        let second = table
+            .add_direct(CallerLeg {
+                peer: shared,
+                connection: caller_connection(ConnectionOptions {
+                    socket_id: 0x9502,
+                    ..ConnectionOptions::default()
+                }),
+            })
+            .expect("second admitted");
+        assert_ne!(first, second, "distinct logical callers");
+
+        let mut sink = SelectiveShortSink {
+            failing_peer: "127.0.0.1:0".parse().unwrap(),
+            short_by: 0,
+            committed: Vec::new(),
+            attributions: Vec::new(),
+        };
+        table.bench_make_ready(first);
+        table.bench_make_ready(second);
+        let _ =
+            table.poll_outbound_bounded_to(now, OutputDrainBudget::new(64, 64, 1 << 20), &mut sink);
+        let mut attributed: Vec<LogicalCallerId> = sink
+            .attributions
+            .iter()
+            .filter_map(|target| target.attribution.caller_id())
+            .collect();
+        attributed.sort();
+        attributed.dedup();
+        assert_eq!(
+            attributed,
+            vec![first.min(second), first.max(second)],
+            "each datagram carries its own logical caller even on a shared address"
+        );
+        assert_eq!(
+            sink.attributions
+                .iter()
+                .filter(|target| target.peer == shared)
+                .count(),
+            2,
+            "both datagrams went to the same address"
+        );
     }
 
     /// A sink that refuses every datagram in `acquire`, so a test can prove

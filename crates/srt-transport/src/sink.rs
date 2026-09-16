@@ -25,6 +25,193 @@
 
 use std::net::SocketAddr;
 
+use crate::admission::LogicalPeerId;
+use crate::caller::LogicalCallerId;
+
+/// Which identity space a [`TxAttribution`] id belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum TxAttributionKind {
+    /// No attribution: the sink was not told which logical session this
+    /// datagram belongs to (compatibility sinks, tests, simple endpoints).
+    #[default]
+    Unattributed,
+    /// Id space of [`LogicalCallerId`] (outbound/direct callers and their
+    /// bonded groups).
+    Caller,
+    /// Id space of [`LogicalPeerId`] (admitted publishers and their bonded
+    /// groups).
+    Peer,
+}
+
+/// Opaque transport-level attribution for one submitted datagram.
+///
+/// A `SocketAddr` is not an identity in a shared SRT Owner: several logical
+/// sessions and group legs can share one remote UDP endpoint, and SRT routing
+/// distinguishes them by socket/group identity. This token is minted by
+/// srt-transport when the datagram is offered, travels with the reservation
+/// through the TX pool and the in-flight metadata, and comes back on the
+/// completion, so a failure can name the exact logical session and physical
+/// leg.
+///
+/// It is deliberately opaque: the embedding application maps it onto its own
+/// objects and never interprets the bits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct TxAttribution {
+    kind: TxAttributionKind,
+    id: u64,
+    leg: u32,
+}
+
+impl TxAttribution {
+    /// No attribution.
+    pub const UNATTRIBUTED: Self = Self {
+        kind: TxAttributionKind::Unattributed,
+        id: 0,
+        leg: 0,
+    };
+
+    /// Attribute to one logical caller, optionally naming its physical leg
+    /// (`0` for a direct caller with a single leg).
+    #[must_use]
+    pub fn caller(id: LogicalCallerId, leg: u32) -> Self {
+        Self {
+            kind: TxAttributionKind::Caller,
+            id: id.as_u64(),
+            leg,
+        }
+    }
+
+    /// Attribute to one logical peer, optionally naming its physical leg.
+    #[must_use]
+    pub fn peer(id: LogicalPeerId, leg: u32) -> Self {
+        Self {
+            kind: TxAttributionKind::Peer,
+            id: id.as_u64(),
+            leg,
+        }
+    }
+
+    /// Which identity space this token belongs to.
+    #[must_use]
+    pub fn kind(self) -> TxAttributionKind {
+        self.kind
+    }
+
+    /// The logical caller this datagram belongs to, if it was a caller.
+    #[must_use]
+    pub fn caller_id(self) -> Option<LogicalCallerId> {
+        (self.kind == TxAttributionKind::Caller).then(|| LogicalCallerId::from_raw(self.id))
+    }
+
+    /// The logical peer this datagram belongs to, if it was a peer.
+    #[must_use]
+    pub fn peer_id(self) -> Option<LogicalPeerId> {
+        (self.kind == TxAttributionKind::Peer).then(|| LogicalPeerId::from_raw(self.id))
+    }
+
+    /// Physical leg index inside the logical session (`0` for a direct
+    /// single-leg session).
+    #[must_use]
+    pub fn leg(self) -> u32 {
+        self.leg
+    }
+
+    /// Whether anything was attributed at all.
+    #[must_use]
+    pub fn is_attributed(self) -> bool {
+        self.kind != TxAttributionKind::Unattributed
+    }
+}
+
+/// A protocol materialization failure: `poll_output_into` refused to produce
+/// the peeked datagram.
+///
+/// This is NOT "nothing to send". The protocol output stays queued in the
+/// connection, so the affected session/leg is quarantined and this event is
+/// the observable, attributed record of why. One event is produced per
+/// affected leg, which is what keeps the path bounded: a quarantined leg is
+/// never re-offered, so it cannot re-report the same failure forever.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtocolOutputFailure {
+    /// Logical session and physical leg the failure belongs to.
+    pub attribution: TxAttribution,
+    /// Typed protocol error kind.
+    pub kind: srt_proto::ErrorKind,
+    /// The protocol's own reason string.
+    pub reason: String,
+}
+
+/// Bounded queue of [`ProtocolOutputFailure`]s awaiting application drain.
+///
+/// Preallocated and finite: a full queue drops the NEWEST event and counts it,
+/// because the oldest events are the ones the application has not acted on yet.
+#[derive(Debug)]
+pub(crate) struct ProtocolOutputFailureQueue {
+    events: std::collections::VecDeque<ProtocolOutputFailure>,
+    capacity: usize,
+    dropped: u64,
+}
+
+/// Capacity of one table's protocol-output failure queue.
+pub(crate) const PROTOCOL_OUTPUT_FAILURE_CAPACITY: usize = 64;
+
+impl ProtocolOutputFailureQueue {
+    pub(crate) fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
+        Self {
+            events: std::collections::VecDeque::with_capacity(capacity),
+            capacity,
+            dropped: 0,
+        }
+    }
+
+    pub(crate) fn push(&mut self, event: ProtocolOutputFailure) {
+        if self.events.len() >= self.capacity {
+            self.dropped = self.dropped.saturating_add(1);
+            return;
+        }
+        self.events.push_back(event);
+    }
+
+    /// Move up to `max_events` failures into `out`, oldest first.
+    pub(crate) fn drain_into(&mut self, max_events: usize, out: &mut Vec<ProtocolOutputFailure>) {
+        for _ in 0..max_events {
+            let Some(event) = self.events.pop_front() else {
+                break;
+            };
+            out.push(event);
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    pub(crate) fn dropped(&self) -> u64 {
+        self.dropped
+    }
+}
+
+/// One destination offer: where the datagram goes, and what it belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DatagramTarget {
+    /// Wire destination.
+    pub peer: SocketAddr,
+    /// Logical identity of the session/leg this datagram belongs to.
+    pub attribution: TxAttribution,
+}
+
+impl DatagramTarget {
+    /// A target with no logical attribution.
+    #[must_use]
+    pub fn unattributed(peer: SocketAddr) -> Self {
+        Self {
+            peer,
+            attribution: TxAttribution::UNATTRIBUTED,
+        }
+    }
+}
+
 /// What a sink did with one datagram offer, as reported by the bounded drain
 /// paths. Fixed-cost and `Copy`, so it never allocates to observe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -80,6 +267,21 @@ pub trait DatagramSink {
         peer: SocketAddr,
         wire_len: usize,
     ) -> Result<Option<Self::Slot<'_>>, srt_proto::Error>;
+
+    /// Reserve final storage for one datagram that carries logical identity.
+    ///
+    /// The high-density tables call this so the reservation, the in-flight
+    /// metadata and every completion report the same
+    /// [`TxAttribution`]. Sinks that have nowhere to keep it ignore it, which
+    /// is why this has a default implementation rather than a second sink
+    /// trait.
+    fn acquire_target(
+        &mut self,
+        target: DatagramTarget,
+        wire_len: usize,
+    ) -> Result<Option<Self::Slot<'_>>, srt_proto::Error> {
+        self.acquire(target.peer, wire_len)
+    }
 }
 
 /// Compatibility sink: an unbounded `Vec` of already-materialized datagrams.

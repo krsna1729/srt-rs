@@ -1,3 +1,4 @@
+use crate::sink::{DatagramTarget, TxAttribution};
 use crate::{
     CallerTable, DatagramSink, DatagramSlot, IngressTelemetry, OutputDrainBudget,
     OutputDrainReport, OutputDrainStatus, PacedSendOutcome, PeerTable, collect_output_work,
@@ -314,8 +315,17 @@ impl ManagedRxSubstrate {
 
 impl CompioProductionProfile {
     /// The managed-RX substrate of the observed runtime, as one fact.
+    ///
+    /// The driver check dominates: a runtime that is not io_uring has no
+    /// managed receive at all, so it cannot resolve to
+    /// [`ManagedRxSubstrate::Available`] even if both later stages somehow
+    /// reported success. That is the whole point of deriving the token from
+    /// the complete observation instead of from a pair of fields.
     #[must_use]
     pub fn managed_rx_substrate(&self) -> ManagedRxSubstrate {
+        if !self.is_io_uring {
+            return ManagedRxSubstrate::NotIoUring;
+        }
         match (&self.buffer_ring, &self.multishot_recv) {
             (ProvidedBufferRingStatus::Available, MultishotRecvStatus::Available) => {
                 ManagedRxSubstrate::Available
@@ -326,7 +336,10 @@ impl CompioProductionProfile {
             (ProvidedBufferRingStatus::RegistrationFailed(errno), _) => {
                 ManagedRxSubstrate::BufferRingRegistrationFailed(*errno)
             }
-            (ProvidedBufferRingStatus::Unknown, _) => ManagedRxSubstrate::NotIoUring,
+            // Not io_uring, or never observed: not a managed substrate.
+            (ProvidedBufferRingStatus::NotIoUring | ProvidedBufferRingStatus::Unknown, _) => {
+                ManagedRxSubstrate::NotIoUring
+            }
         }
     }
 
@@ -476,6 +489,10 @@ impl ManagedRxQualification {
 pub enum ProvidedBufferRingStatus {
     /// Not yet observed on a live runtime.
     Unknown,
+    /// The observed runtime is not io_uring, so no ring was even attempted.
+    /// Kept distinct from a registration failure: nothing was rejected, the
+    /// substrate simply does not exist.
+    NotIoUring,
     /// Buffer-ring registration succeeded.
     Available,
     /// Registration failed with the given errno (e.g. `EINVAL` = 22).
@@ -620,33 +637,30 @@ pub async fn observe_production_runtime(
     // Stage 1: ask the runtime for its buffer pool directly. Success means
     // the provided-buffer substrate initialized; error classifies THIS
     // stage with its errno (EINVAL on Noble 6.8 = kernel rejected
-    // IORING_REGISTER_PBUF_RING). Multishot is not tested until this passes.
-    let buffer_ring = match runtime.buffer_pool() {
-        Ok(_) => ProvidedBufferRingStatus::Available,
-        Err(e) => ProvidedBufferRingStatus::RegistrationFailed(e.raw_os_error().unwrap_or(-1)),
+    // IORING_REGISTER_PBUF_RING). Multishot is not tested until this passes,
+    // and a non-io_uring runtime is not probed at all: asking a Poll driver
+    // for a buffer pool would report a ring failure that never happened.
+    let buffer_ring = if is_io_uring {
+        match runtime.buffer_pool() {
+            Ok(_) => ProvidedBufferRingStatus::Available,
+            Err(e) => ProvidedBufferRingStatus::RegistrationFailed(e.raw_os_error().unwrap_or(-1)),
+        }
+    } else {
+        ProvidedBufferRingStatus::NotIoUring
     };
-    // Stage 2: only when the substrate works, arm multishot receive.
+    // Stage 2: only when the substrate works, execute the EXACT production
+    // managed receive on loopback and require a real completion.
     let multishot_recv = match &buffer_ring {
-        ProvidedBufferRingStatus::RegistrationFailed(_) | ProvidedBufferRingStatus::Unknown => {
+        ProvidedBufferRingStatus::RegistrationFailed(_)
+        | ProvidedBufferRingStatus::Unknown
+        | ProvidedBufferRingStatus::NotIoUring => {
             MultishotRecvStatus::NotTestedBecauseBufferRingUnavailable
         }
         ProvidedBufferRingStatus::Available => {
-            match compio::net::UdpSocket::bind("127.0.0.1:0").await {
-                Err(_) => MultishotRecvStatus::Unsupported,
-                Ok(sock) => {
-                    use futures_util::{FutureExt, Stream};
-                    let mut s = Box::pin(sock.recv_from_multi());
-                    match std::future::poll_fn(|cx| Stream::poll_next(s.as_mut(), cx))
-                        .now_or_never()
-                    {
-                        None | Some(Some(Ok(_))) => MultishotRecvStatus::Available,
-                        // Multishot op error with its own errno: the op
-                        // itself, not the substrate, is at fault.
-                        Some(Some(Err(_))) => MultishotRecvStatus::Unsupported,
-                        // Immediate termination without error.
-                        Some(None) => MultishotRecvStatus::Unsupported,
-                    }
-                }
+            if is_io_uring {
+                probe_managed_recv_msg_multi().await
+            } else {
+                MultishotRecvStatus::NotTestedBecauseBufferRingUnavailable
             }
         }
     };
@@ -659,6 +673,78 @@ pub async fn observe_production_runtime(
         kernel_version: kernel,
         compio_version: PINNED_COMPIO_VERSION.to_string(),
         driver_type: format!("{driver:?}"),
+    }
+}
+
+/// Bounded cold-start proof of the EXACT production managed receive.
+///
+/// Production receives with `recv_msg_multi(0)` — the msg form, because only
+/// it reports the returned message flags that make `MSG_TRUNC` detection
+/// possible — so the capability proof must execute `recv_msg_multi` itself and
+/// observe a real completion on a loopback datagram with known bytes.
+///
+/// A first poll that returns `Pending` proves nothing: with a completion-native
+/// multishot operation it can mean the operation was merely submitted. So the
+/// probe sends a sentinel and then requires the stream to yield an actual item,
+/// inside a bounded timeout, with:
+///
+/// - no error, and no end-of-stream,
+/// - no `MSG_TRUNC` flag,
+/// - payload bytes equal to the sentinel,
+/// - a source address parse present.
+///
+/// Anything else is [`MultishotRecvStatus::Unsupported`]: the managed receive
+/// either does not work on this runtime or was never demonstrated to work.
+///
+/// This runs once per shard at startup, so its cost (and its allocations) are
+/// cold-path.
+async fn probe_managed_recv_msg_multi() -> MultishotRecvStatus {
+    use futures_util::{FutureExt, StreamExt};
+    /// Deliberately distinctive: a mismatch means the completion was not ours.
+    const SENTINEL: &[u8] = b"srt-rs managed-rx capability probe";
+    const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(750);
+
+    let Ok(sock) = compio::net::UdpSocket::bind("127.0.0.1:0").await else {
+        return MultishotRecvStatus::Unsupported;
+    };
+    let Ok(local) = sock.local_addr() else {
+        return MultishotRecvStatus::Unsupported;
+    };
+    let Ok(sender) = std::net::UdpSocket::bind("127.0.0.1:0") else {
+        return MultishotRecvStatus::Unsupported;
+    };
+    let Ok(sender_addr) = sender.local_addr() else {
+        return MultishotRecvStatus::Unsupported;
+    };
+
+    let mut stream = Box::pin(sock.recv_msg_multi(0));
+    // Arm the receive before the datagram exists. `Pending` is the expected
+    // answer here and is NOT treated as success; a completion arriving before
+    // anything was sent would be unattributable.
+    let armed = std::future::poll_fn(|cx| futures_util::Stream::poll_next(stream.as_mut(), cx));
+    if armed.now_or_never().is_some() {
+        return MultishotRecvStatus::Unsupported;
+    }
+    if sender.send_to(SENTINEL, local).is_err() {
+        return MultishotRecvStatus::Unsupported;
+    }
+
+    let Ok(received) = compio::time::timeout(PROBE_TIMEOUT, stream.next()).await else {
+        return MultishotRecvStatus::Unsupported;
+    };
+    let Some(Ok(result)) = received else {
+        return MultishotRecvStatus::Unsupported;
+    };
+    let truncated = result.flags().bits() & (libc::MSG_TRUNC as u32) != 0;
+    if truncated {
+        return MultishotRecvStatus::Unsupported;
+    }
+    if result.data() != SENTINEL {
+        return MultishotRecvStatus::Unsupported;
+    }
+    match result.addr().and_then(|addr| addr.as_socket()) {
+        Some(addr) if addr == sender_addr => MultishotRecvStatus::Available,
+        _ => MultishotRecvStatus::Unsupported,
     }
 }
 
@@ -1490,6 +1576,11 @@ pub fn required_session_wire_ceiling_for_side(
 pub(crate) struct InFlightMeta {
     pub peer: SocketAddr,
     pub expected_len: usize,
+    /// Logical session/leg this datagram belongs to. A `SocketAddr` is not an
+    /// identity here: several logical sessions and group legs can share one
+    /// remote endpoint, so the completion reports the token the sink was
+    /// given rather than a destination that cannot distinguish them.
+    pub attribution: TxAttribution,
 }
 
 /// Aggregated TX completion accounting surfaced through [`OwnerServiceReport`].
@@ -1586,8 +1677,11 @@ impl TxFailureClass {
 /// One classified TX failure, attributed to the destination that failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TxFailureEvent {
-    /// Destination whose `send_to` failed. The caller/caller table maps this
-    /// to the logical session or leg.
+    /// Logical session/leg whose `send_to` failed. This is the identity the
+    /// application acts on; [`Self::peer`] is diagnostic metadata only.
+    pub attribution: TxAttribution,
+    /// Destination the datagram was sent to. Diagnostic: multiple logical
+    /// sessions can share one remote endpoint.
     pub peer: SocketAddr,
     pub class: TxFailureClass,
     pub kind: io::ErrorKind,
@@ -1668,15 +1762,6 @@ pub enum OwnerFault {
     /// protocol output that produced it is already consumed, so this is a
     /// fault, not silent loss with a healthy-looking transport.
     TxFailed {
-        peer: SocketAddr,
-        kind: io::ErrorKind,
-    },
-    /// A peer/session-local `send_to` failed: the datagram was not delivered
-    /// to that one destination. Unrelated siblings on the shared socket keep
-    /// working; the failure is reported through
-    /// [`Owner::poll_tx_failures`] with its class so the application can
-    /// degrade exactly the affected session/leg.
-    TxPeerLocal {
         peer: SocketAddr,
         kind: io::ErrorKind,
     },
@@ -1993,6 +2078,7 @@ impl TxEngine {
             stats.transient_failures += 1;
         }
         failures.push(TxFailureEvent {
+            attribution: meta.attribution,
             peer: meta.peer,
             class,
             kind: error.kind(),
@@ -2170,6 +2256,9 @@ struct OwnerTxSlot<'a> {
     sock: &'a Rc<compio::net::UdpSocket>,
     tx_pool: &'a mut TxPool,
     tx_engine: &'a mut TxEngine,
+    /// Logical identity of the datagram in this slot, carried through the
+    /// completion so a failure can name it.
+    attribution: TxAttribution,
     lane_idx: usize,
     peer: SocketAddr,
     wire_len: usize,
@@ -2202,6 +2291,7 @@ impl DatagramSlot for OwnerTxSlot<'_> {
         let meta = InFlightMeta {
             peer: self.peer,
             expected_len: len,
+            attribution: self.attribution,
         };
         self.tx_engine
             .submit_job(self.lane_idx, self.sock.clone(), buf, self.peer, meta);
@@ -2219,8 +2309,29 @@ impl<'s> DatagramSink for OwnerTxSink<'s> {
         peer: SocketAddr,
         wire_len: usize,
     ) -> Result<Option<Self::Slot<'_>>, srt_proto::Error> {
-        // Every fallible capacity decision happens here, before the protocol
-        // materializes anything.
+        self.reserve(peer, TxAttribution::UNATTRIBUTED, wire_len)
+    }
+
+    /// Attributed reservation: identical capacity decisions, plus the logical
+    /// identity the completion will report.
+    fn acquire_target(
+        &mut self,
+        target: DatagramTarget,
+        wire_len: usize,
+    ) -> Result<Option<Self::Slot<'_>>, srt_proto::Error> {
+        self.reserve(target.peer, target.attribution, wire_len)
+    }
+}
+
+impl OwnerTxSink<'_> {
+    /// One reservation: every fallible capacity decision happens here, before
+    /// the protocol materializes anything.
+    fn reserve(
+        &mut self,
+        peer: SocketAddr,
+        attribution: TxAttribution,
+        wire_len: usize,
+    ) -> Result<Option<OwnerTxSlot<'_>>, srt_proto::Error> {
         if wire_len > self.tx_pool.slot_size() {
             return Err(srt_proto::Error::with_reason(
                 srt_proto::ErrorKind::InvalidData,
@@ -2249,6 +2360,7 @@ impl<'s> DatagramSink for OwnerTxSink<'s> {
             sock: self.sock,
             tx_pool: self.tx_pool,
             tx_engine: self.tx_engine,
+            attribution,
             lane_idx,
             peer,
             wire_len,
@@ -2349,6 +2461,12 @@ pub struct OwnerServiceReport {
     pub tx_completed_ok: usize,
     pub tx_short_sends: usize,
     pub tx_failed_sends: usize,
+    /// Protocol-output materialization failures recorded in THIS visit by the
+    /// listener and caller tables. The output stays queued, the affected
+    /// session/leg is quarantined, and the attributed record is available from
+    /// [`Owner::poll_caller_output_failures`] /
+    /// [`Owner::poll_listener_output_failures`].
+    pub protocol_output_failures: usize,
     /// Peer/session-local send failures reaped in THIS visit. These do not
     /// fault the Owner; the attribution is in [`Owner::poll_tx_failures`].
     pub tx_peer_local_failures: usize,
@@ -2479,6 +2597,35 @@ impl Owner {
     #[must_use]
     pub fn rx_substrate(&self) -> Option<ManagedRxSubstrate> {
         self.rx_substrate
+    }
+
+    /// Drain attributed protocol-output materialization failures from the
+    /// caller table, oldest first. The affected legs stay quarantined until
+    /// the application retires those sessions.
+    pub fn poll_caller_output_failures(
+        &mut self,
+        max_events: usize,
+        out: &mut Vec<crate::sink::ProtocolOutputFailure>,
+    ) {
+        out.clear();
+        if let Some(caller) = self.caller.as_mut() {
+            caller
+                .pool
+                .table_mut()
+                .poll_output_failures(max_events, out);
+        }
+    }
+
+    /// Listener-side counterpart of [`Self::poll_caller_output_failures`].
+    pub fn poll_listener_output_failures(
+        &mut self,
+        max_events: usize,
+        out: &mut Vec<crate::sink::ProtocolOutputFailure>,
+    ) {
+        out.clear();
+        if let Some(listener) = self.listener.as_mut() {
+            listener.table.poll_output_failures(max_events, out);
+        }
     }
 
     /// Drain classified TX failures (oldest first, bounded by
@@ -2804,14 +2951,15 @@ impl Owner {
             self.socket_memory_budget = Some(budget);
         }
         let rx_mode = self.resolve_rx_mode("listener.rx_mode")?;
-        self.rx_mode = Some(rx_mode);
         let mut sockets = prepared.bind_sockets()?;
         let sock = compio::net::UdpSocket::from_std(sockets.remove(0))?;
-        self.sessions_started = true;
         let slot_len = managed_rx_buffer_len(self.wire_ceiling);
-        self.listener = Some(ListenerSide::from_prepared_with_rx_mode(
-            sock, prepared, rx_mode, slot_len,
-        )?);
+        // Construct first: a refused attach drops the bound socket and leaves
+        // the Owner exactly as configurable as it was before the attempt.
+        let side = ListenerSide::from_prepared_with_rx_mode(sock, prepared, rx_mode, slot_len)?;
+        self.listener = Some(side);
+        self.rx_mode = Some(rx_mode);
+        self.sessions_started = true;
         Ok(())
     }
 
@@ -2875,7 +3023,9 @@ impl Owner {
                 ),
             )));
         }
-        self.sessions_started = true;
+        // Nothing configuration-visible is committed until the attach has
+        // actually succeeded: a failed `connect` must leave the Owner exactly
+        // as configurable as it was.
         if let Some((max_in_flight, attempt_deadline)) = self.caller_pool_policy {
             prepared.connect.max_in_flight = max_in_flight;
             prepared.connect.attempt_deadline = attempt_deadline;
@@ -2922,9 +3072,10 @@ impl Owner {
                 attempt_deadline,
             } = prepared.connect;
             let rx_mode = self.resolve_rx_mode("caller.connect.rx_mode")?;
-            self.rx_mode = Some(rx_mode);
             let slot_len = managed_rx_buffer_len(self.wire_ceiling);
-            self.caller = Some(OwnerCallerSide::from_parts_with_rx_mode(
+            // Construct the side first; a failure here drops the socket and
+            // the reservation with it, and leaves the Owner untouched.
+            let side = OwnerCallerSide::from_parts_with_rx_mode(
                 sock,
                 max_in_flight,
                 attempt_deadline,
@@ -2933,7 +3084,12 @@ impl Owner {
                 prepared.connect,
                 rx_mode,
                 slot_len,
-            )?);
+            )?;
+            // Commit: only now is this Owner bound to a receive datapath and
+            // to a socket it owns.
+            self.caller = Some(side);
+            self.rx_mode = Some(rx_mode);
+            self.sessions_started = true;
         }
         let side = self.caller.as_mut().expect("just ensured above");
         side.pool.connect(prepared, now).map_err(|error| {
@@ -3087,83 +3243,101 @@ impl Owner {
         budget: OwnerServiceBudget,
     ) -> OwnerServiceReport {
         let mut report = OwnerServiceReport::default();
-        let prev_ok = self.completions.completed_ok;
-        let prev_short = self.completions.short_sends;
-        let prev_failed = self.completions.failed_sends;
-        let prev_peer_local = self.completions.peer_local_failures;
-        let prev_transient = self.completions.transient_failures;
+        let prev = self.completions;
 
         // 0. Harvest faults BEFORE admitting anything. A visit must never
         //    admit state on behalf of a receive consumer or TX lane that is
         //    already known dead, so the Owner-wide predicate is refreshed
-        //    first and gates steps 2-4 below.
+        //    first and gates every phase below.
         self.tx_engine.check_worker_faults();
         self.harvest_rx_faults();
-        let operational = self.is_operational();
 
         // 1. Reap only already-ready completions, never waiting. Reaping is
         //    always allowed -- it is how slots come back and how a faulted or
         //    shutting-down Owner still reports truthfully -- and `service` is
         //    the only normal reaper, so `max_completions` is authoritative.
-        let (completions, tx_pool, failures) = (
-            &mut self.completions,
-            &mut self.tx_pool,
-            &mut self.tx_failures,
-        );
-        report.completions_reaped += self.tx_engine.poll_completions(
-            None,
-            budget.max_completions,
-            tx_pool,
-            completions,
-            failures,
-        );
-
-        if operational {
-            // 2. Service incoming RX up to max_rx_packets / max_rx_bytes
-            self.service_rx(now, &budget, &mut report).await;
-            // A consumer that died during this visit stops the rest of it.
-            self.harvest_rx_faults();
-
-            // 3. Lifecycle maintenance, bounded by max_actions only (see
-            //    `service_maintenance`): independent of the packet/byte axes.
-            self.service_maintenance(now, &budget, &mut report);
-
-            // 4. Service outbound TX up to max_tx_packets / max_tx_bytes / the
-            //    remaining action allowance.
-            self.service_tx(now, &budget, &mut report);
+        {
+            let (completions, tx_pool, failures) = (
+                &mut self.completions,
+                &mut self.tx_pool,
+                &mut self.tx_failures,
+            );
+            report.completions_reaped += self.tx_engine.poll_completions(
+                None,
+                budget.max_completions,
+                tx_pool,
+                completions,
+                failures,
+            );
         }
 
+        // 2. Re-gate: completion classification can create a structural Owner
+        //    fault, and a fault discovered in this visit must stop this very
+        //    visit's RX, maintenance, and TX phases -- not the next one.
+        if self.is_operational() {
+            // 3. Service incoming RX up to max_rx_packets / max_rx_bytes
+            self.service_rx(now, &budget, &mut report).await;
+
+            // 4. Re-gate again: the managed consumer can die during this
+            //    visit, which is an Owner-fatal condition.
+            self.harvest_rx_faults();
+            if self.is_operational() {
+                // 5. Lifecycle maintenance, bounded by max_actions only (see
+                //    `service_maintenance`): independent of the packet/byte
+                //    axes.
+                self.service_maintenance(now, &budget, &mut report);
+
+                // 6. Service outbound TX up to max_tx_packets / max_tx_bytes /
+                //    the remaining action allowance. The sink keeps its own
+                //    fresh admission gate on top of this.
+                self.service_tx(now, &budget, &mut report);
+            }
+        }
+
+        self.finalize_report(&mut report, now, budget, prev);
+        report
+    }
+
+    /// Fill every mandatory [`OwnerServiceReport`] field.
+    ///
+    /// Every `service` outcome -- including the paths that stop the visit the
+    /// moment a fault becomes known -- goes through here, so a stopped visit
+    /// still reports truthful in-flight/pool/deadline state and per-visit
+    /// completion deltas instead of leaving them zeroed.
+    fn finalize_report(
+        &mut self,
+        report: &mut OwnerServiceReport,
+        now: Timestamp,
+        budget: OwnerServiceBudget,
+        prev: OwnerTxCompletionStats,
+    ) {
+        let current = self.completions;
         report.tx_in_flight = self.tx_engine.in_flight();
         report.tx_pool_free = self.tx_pool.free_count();
         report.next_deadline_us = Some(self.time_until_next_deadline(now, 100_000));
-        report.tx_completed_ok = self.completions.completed_ok.saturating_sub(prev_ok);
-        report.tx_short_sends = self.completions.short_sends.saturating_sub(prev_short);
-        report.tx_failed_sends = self.completions.failed_sends.saturating_sub(prev_failed);
-        report.tx_peer_local_failures = self
-            .completions
+        report.tx_completed_ok = current.completed_ok.saturating_sub(prev.completed_ok);
+        report.tx_short_sends = current.short_sends.saturating_sub(prev.short_sends);
+        report.tx_failed_sends = current.failed_sends.saturating_sub(prev.failed_sends);
+        report.tx_peer_local_failures = current
             .peer_local_failures
-            .saturating_sub(prev_peer_local);
-        report.tx_transient_failures = self
-            .completions
+            .saturating_sub(prev.peer_local_failures);
+        report.tx_transient_failures = current
             .transient_failures
-            .saturating_sub(prev_transient);
+            .saturating_sub(prev.transient_failures);
 
-        let has_pending = self.has_pending_work(now);
-        // Runnable work remaining: timers due, application data queued
-        // waiting for budget, or caller pool requests waiting for admission.
-        // Merely having I/O in flight is NOT runnable work: setting
-        // `work_remaining = true` when only `tx_in_flight > 0` causes the outer
-        // event loop to busy-spin in `service()` instead of parking on the
-        // proactor via `wait_for_activity()`.
-        report.work_remaining = has_pending;
+        // Runnable work remaining: timers due, application data queued waiting
+        // for budget, or caller pool requests waiting for admission. Merely
+        // having I/O in flight is NOT runnable work: setting
+        // `work_remaining = true` when only `tx_in_flight > 0` causes the
+        // outer event loop to busy-spin in `service()` instead of parking on
+        // the proactor via `wait_for_activity()`.
+        report.work_remaining = self.has_pending_work(now);
         report.budget_exhausted = report.completions_reaped >= budget.max_completions
             || report.rx_packets >= budget.max_rx_packets
             || report.rx_bytes >= budget.max_rx_bytes
             || report.tx_packets_submitted >= budget.max_tx_packets
             || report.tx_bytes_submitted >= budget.max_tx_bytes
             || report.actions >= budget.max_actions;
-
-        report
     }
 
     /// Wait until the proactor reports activity or `timeout` elapses. This is
@@ -3607,6 +3781,7 @@ impl Owner {
             report.actions += drain_report.actions;
             report.tx_packets_submitted += drain_report.packets;
             report.tx_bytes_submitted += drain_report.bytes;
+            report.protocol_output_failures += drain_report.protocol_output_failures;
         }
     }
 
@@ -3630,6 +3805,7 @@ impl Owner {
             report.actions += drain_report.actions;
             report.tx_packets_submitted += drain_report.packets;
             report.tx_bytes_submitted += drain_report.bytes;
+            report.protocol_output_failures += drain_report.protocol_output_failures;
         }
     }
 
@@ -5641,6 +5817,7 @@ mod tests {
                     meta: InFlightMeta {
                         peer,
                         expected_len: 20,
+                        attribution: TxAttribution::UNATTRIBUTED,
                     },
                     res: Ok(7),
                     buf: vec![0u8; DEFAULT_TX_SLOT_SIZE],
@@ -5703,6 +5880,7 @@ mod tests {
                     meta: InFlightMeta {
                         peer,
                         expected_len: 20,
+                        attribution: TxAttribution::UNATTRIBUTED,
                     },
                     res: Err(io::Error::new(
                         io::ErrorKind::NetworkUnreachable,
@@ -5741,6 +5919,7 @@ mod tests {
                     meta: InFlightMeta {
                         peer,
                         expected_len: 20,
+                        attribution: TxAttribution::UNATTRIBUTED,
                     },
                     res: Err(io::Error::from_raw_os_error(libc::EMSGSIZE)),
                     buf: vec![0u8; DEFAULT_TX_SLOT_SIZE],
@@ -6087,6 +6266,99 @@ mod tests {
             false,
         );
         assert!(!unknown.host_managed_rx_capable());
+    }
+
+    /// The derived substrate token enforces the FULL invariant, including the
+    /// driver: a runtime that is not io_uring has no managed receive, so no
+    /// combination of the later stages can make it resolve to `Available`.
+    #[test]
+    fn managed_substrate_requires_io_uring_first() {
+        let profile = |ring, ms, iouring| super::CompioProductionProfile {
+            tx_lanes: 64,
+            wire_ceiling: super::DEFAULT_TX_SLOT_SIZE,
+            buffer_ring: ring,
+            multishot_recv: ms,
+            is_io_uring: iouring,
+            kernel_version: "test".to_string(),
+            compio_version: super::PINNED_COMPIO_VERSION.to_string(),
+            driver_type: "Test".to_string(),
+        };
+
+        // The case that used to be wrong: both later stages report success on
+        // a runtime that is not io_uring at all.
+        assert_eq!(
+            profile(
+                ProvidedBufferRingStatus::Available,
+                MultishotRecvStatus::Available,
+                false
+            )
+            .managed_rx_substrate(),
+            ManagedRxSubstrate::NotIoUring,
+            "the driver check must dominate every later stage"
+        );
+        // Not io_uring is also reported as such when the ring stage recorded it
+        // explicitly, rather than being blamed on a registration that was never
+        // attempted.
+        assert_eq!(
+            profile(
+                ProvidedBufferRingStatus::NotIoUring,
+                MultishotRecvStatus::NotTestedBecauseBufferRingUnavailable,
+                false
+            )
+            .managed_rx_substrate(),
+            ManagedRxSubstrate::NotIoUring
+        );
+        // Full substrate on io_uring is available.
+        assert_eq!(
+            profile(
+                ProvidedBufferRingStatus::Available,
+                MultishotRecvStatus::Available,
+                true
+            )
+            .managed_rx_substrate(),
+            ManagedRxSubstrate::Available
+        );
+        // Ring registers but multishot does not work: attributed to multishot.
+        assert_eq!(
+            profile(
+                ProvidedBufferRingStatus::Available,
+                MultishotRecvStatus::Unsupported,
+                true
+            )
+            .managed_rx_substrate(),
+            ManagedRxSubstrate::MultishotRecvUnsupported
+        );
+        // Ring registration fails: attributed to the ring, with its errno.
+        assert_eq!(
+            profile(
+                ProvidedBufferRingStatus::RegistrationFailed(22),
+                MultishotRecvStatus::NotTestedBecauseBufferRingUnavailable,
+                true
+            )
+            .managed_rx_substrate(),
+            ManagedRxSubstrate::BufferRingRegistrationFailed(22)
+        );
+        // Never observed: not available, and not blamed on a layer either.
+        assert_eq!(
+            profile(
+                ProvidedBufferRingStatus::Unknown,
+                MultishotRecvStatus::Unknown,
+                true
+            )
+            .managed_rx_substrate(),
+            ManagedRxSubstrate::NotIoUring
+        );
+        assert!(
+            !ManagedRxQualification {
+                profile: profile(
+                    ProvidedBufferRingStatus::Available,
+                    MultishotRecvStatus::Available,
+                    false
+                ),
+                owner_rx_mode: OwnerRxMode::ManagedMultishot,
+            }
+            .managed_rx_active()
+        );
     }
 
     /// Managed RX resources and policy: slots track the wire ceiling (not the
@@ -6582,6 +6854,7 @@ mod tests {
                     InFlightMeta {
                         peer,
                         expected_len: 0,
+                        attribution: TxAttribution::UNATTRIBUTED,
                     },
                 );
                 // Take the job back off the lane the way a completed
@@ -6598,6 +6871,7 @@ mod tests {
                         meta: InFlightMeta {
                             peer,
                             expected_len: 10,
+                            attribution: TxAttribution::UNATTRIBUTED,
                         },
                         res: Err(error),
                         // The completion carries the SAME slot the job took:
@@ -6721,6 +6995,260 @@ mod tests {
                 Some(OwnerRxMode::ManagedMultishot)
             );
             assert!(stats.listener.is_none());
+        });
+    }
+
+    /// Item 3: a structural TX completion failure is discovered by the reaping
+    /// phase, and it must stop THIS visit's RX, maintenance, and TX phases --
+    /// while the report still carries truthful state and deltas.
+    #[test]
+    fn structural_completion_fault_stops_the_same_visit() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            let l_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+            let l_sock = compio::net::UdpSocket::from_std(l_std).expect("adopt");
+            let l_cfg = crate::ListenerConfig::builder("127.0.0.1:0".parse().unwrap())
+                .topology(crate::ListenerTopology::PerPort)
+                .configure_transport(|t| t.promotion = crate::PromotionPolicy::Never)
+                .build()
+                .expect("listener config");
+            let mut owner =
+                Owner::new(4).with_listener(ListenerSide::new(l_sock, &l_cfg).expect("side"));
+            let peer: SocketAddr = "127.0.0.1:19991".parse().unwrap();
+            let _local = owner.listener_local_addr().expect("listener addr");
+
+            // A datagram is staged for admission, so "did RX advance?" is
+            // observable in the same visit.
+            {
+                let l = owner.listener.as_mut().expect("listener");
+                l.stage_buf[..8].copy_from_slice(b"stagedRX");
+                l.pending_rx = Some((peer, 8));
+            }
+
+            // A structural completion (EMSGSIZE: our own sized datagram was
+            // refused) is ready to be reaped.
+            {
+                let engine = &mut owner.tx_engine;
+                engine.ensure_started();
+                let _ = engine.idle_lanes.pop();
+                engine.in_flight_count += 1;
+                let lane = &engine.lanes[0];
+                lane.state.borrow_mut().completion = Some(TxCompletion {
+                    meta: InFlightMeta {
+                        peer,
+                        expected_len: 20,
+                        attribution: TxAttribution::UNATTRIBUTED,
+                    },
+                    res: Err(io::Error::from_raw_os_error(libc::EMSGSIZE)),
+                    buf: vec![0u8; DEFAULT_TX_SLOT_SIZE],
+                });
+                engine.completed_lanes.borrow_mut().push_back(0);
+            }
+
+            let now = Timestamp::from_micros(10_000);
+            let report = owner.service(now, OwnerServiceBudget::default()).await;
+
+            assert_eq!(report.completions_reaped, 1, "the completion was reaped");
+            assert_eq!(report.tx_failed_sends, 1, "and classified");
+            assert!(
+                !owner.is_operational(),
+                "a structural send failure faults the Owner"
+            );
+            assert_eq!(
+                report.rx_packets, 0,
+                "RX must not advance after a fault becomes known in this visit"
+            );
+            assert_eq!(
+                report.tx_packets_submitted, 0,
+                "no new TX is admitted after the same-visit fault"
+            );
+            assert!(
+                owner
+                    .listener
+                    .as_ref()
+                    .expect("listener")
+                    .pending_rx
+                    .is_some(),
+                "staged RX work is preserved, not consumed by a stopped visit"
+            );
+            // Early return still reports truthfully.
+            assert_eq!(report.tx_in_flight, owner.tx_in_flight());
+            assert_eq!(report.tx_pool_free, owner.tx_pool().free_count());
+            assert!(report.next_deadline_us.is_some());
+        });
+    }
+
+    /// Item 3: an RX consumer fault stops RX, maintenance, and TX in the same
+    /// visit, and the Owner stays serviceable so it can still be reaped and
+    /// torn down.
+    #[test]
+    fn rx_consumer_fault_stops_rx_maintenance_and_tx() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            let c_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+            let c_sock = compio::net::UdpSocket::from_std(c_std).expect("adopt");
+            let mut owner = Owner::new(4).with_caller(OwnerCallerSide::new_single(c_sock));
+            let ring = Rc::new(RefCell::new(ManagedRxRing::new()));
+            ring.borrow_mut()
+                .fault(RxFault::StreamError("simulated consumer death".to_string()));
+            owner.caller.as_mut().expect("caller side").rx = SideRx {
+                mode: OwnerRxMode::ManagedMultishot,
+                ring: Some(ring),
+                staged: None,
+            };
+
+            let now = Timestamp::from_micros(10_000);
+            let report = owner.service(now, OwnerServiceBudget::default()).await;
+            assert!(matches!(
+                owner.fault(),
+                Some(OwnerFault::RxStreamFailed { .. })
+            ));
+            assert_eq!(report.rx_packets, 0, "RX does not advance");
+            assert_eq!(report.tx_packets_submitted, 0, "TX does not advance");
+            assert_eq!(report.actions, 0, "no maintenance actions either");
+            // Still serviceable: reaping and reporting keep working.
+            let report = owner.service(now, OwnerServiceBudget::default()).await;
+            assert!(report.next_deadline_us.is_some());
+            assert!(
+                !owner
+                    .shutdown_and_drain(std::time::Duration::from_secs(2))
+                    .await
+                    || owner.tx_in_flight() == 0,
+                "a faulted owner must still be tearable-down"
+            );
+        });
+    }
+
+    /// Item 4: a failed attach leaves the Owner exactly as configurable as it
+    /// was -- no side, no claimed receive datapath -- and a later valid attach
+    /// still works.
+    #[test]
+    fn failed_attach_does_not_freeze_the_owner() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            let addr = || {
+                let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind probe");
+                probe.local_addr().expect("probe addr")
+            };
+            let caller_cfg = |port: SocketAddr| {
+                crate::CallerConfig::builder(port)
+                    .ownership(crate::SocketOwnership::Shared)
+                    .build()
+                    .expect("caller config")
+            };
+
+            // 1. ManagedRequired with no observed substrate: refused, and the
+            //    Owner is untouched.
+            let mut owner = Owner::new(4);
+            owner.set_rx_mode_policy(RxModePolicy::ManagedRequired);
+            let error = owner
+                .connect(&caller_cfg(addr()), Timestamp::default())
+                .expect_err("unobserved substrate must refuse");
+            assert!(error.to_string().contains("observed managed-RX substrate"));
+            assert!(owner.caller.is_none(), "no caller side was committed");
+            assert_eq!(owner.rx_mode(), None, "no datapath was claimed");
+            assert!(
+                !owner.sessions_started,
+                "a refused attach is not a started session"
+            );
+            // The same Owner still accepts a valid attach after declaring the
+            // substrate, i.e. configuration was not frozen.
+            owner
+                .set_rx_substrate(ManagedRxSubstrate::Available)
+                .expect("configurable after a failed attach");
+            assert!(
+                owner
+                    .connect(&caller_cfg(addr()), Timestamp::default())
+                    .is_ok(),
+                "a valid connect succeeds after a failed attempt"
+            );
+            assert!(owner.sessions_started);
+
+            // 2. An exclusive caller is rejected without freezing anything.
+            let mut owner = Owner::new(4);
+            let exclusive = crate::CallerConfig::builder(addr())
+                .ownership(crate::SocketOwnership::Exclusive)
+                .build()
+                .expect("caller config");
+            assert!(owner.connect(&exclusive, Timestamp::default()).is_err());
+            assert!(owner.caller.is_none());
+            assert!(!owner.sessions_started);
+            assert!(
+                owner
+                    .connect(&caller_cfg(addr()), Timestamp::default())
+                    .is_ok(),
+                "a shared caller still attaches after an exclusive rejection"
+            );
+
+            // 3. A refused listener attach leaves no side and no datapath.
+            let mut owner = Owner::new(4);
+            owner.set_rx_mode_policy(RxModePolicy::ManagedRequired);
+            let listener = crate::ListenerConfig::builder(addr())
+                .topology(crate::ListenerTopology::PerPort)
+                .configure_transport(|t| t.promotion = crate::PromotionPolicy::Never)
+                .build()
+                .expect("listener config");
+            assert!(owner.listen(&listener).is_err(), "ManagedRequired refuses");
+            assert!(owner.listener.is_none());
+            assert_eq!(owner.rx_mode(), None);
+            assert!(!owner.sessions_started);
+            owner
+                .set_rx_substrate(ManagedRxSubstrate::Available)
+                .expect("still configurable");
+            let listener = crate::ListenerConfig::builder(addr())
+                .topology(crate::ListenerTopology::PerPort)
+                .configure_transport(|t| t.promotion = crate::PromotionPolicy::Never)
+                .build()
+                .expect("listener config");
+            assert!(
+                owner.listen(&listener).is_ok(),
+                "a valid listener attach succeeds afterwards"
+            );
+            assert_eq!(owner.rx_mode(), Some(OwnerRxMode::ManagedMultishot));
+        });
+    }
+
+    /// Item 5: a peer-local completion failure reports the exact logical
+    /// attribution the reservation carried, not just the destination address.
+    #[test]
+    fn tx_failure_event_reports_the_logical_attribution() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            let c_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+            let c_sock = compio::net::UdpSocket::from_std(c_std).expect("adopt");
+            let mut owner = Owner::new(4).with_caller(OwnerCallerSide::new_single(c_sock));
+            let peer: SocketAddr = "127.0.0.1:19995".parse().unwrap();
+            let token = TxAttribution::caller(crate::caller::LogicalCallerId::from_raw(0x77), 3);
+            {
+                let engine = &mut owner.tx_engine;
+                engine.ensure_started();
+                let _ = engine.idle_lanes.pop();
+                engine.in_flight_count += 1;
+                let lane = &engine.lanes[0];
+                lane.state.borrow_mut().completion = Some(TxCompletion {
+                    meta: InFlightMeta {
+                        peer,
+                        expected_len: 20,
+                        attribution: token,
+                    },
+                    res: Err(io::Error::from_raw_os_error(libc::EHOSTUNREACH)),
+                    buf: vec![0u8; DEFAULT_TX_SLOT_SIZE],
+                });
+                engine.completed_lanes.borrow_mut().push_back(0);
+            }
+            let _ = owner
+                .service(Timestamp::from_micros(1_000), OwnerServiceBudget::default())
+                .await;
+            assert!(owner.is_operational(), "a peer-local failure is not fatal");
+            let mut events = Vec::new();
+            owner.poll_tx_failures(8, &mut events);
+            assert_eq!(events.len(), 1);
+            assert_eq!(
+                events[0].attribution, token,
+                "the token survives reservation -> in-flight -> completion -> event"
+            );
+            assert_eq!(events[0].attribution.leg(), 3, "the leg is preserved");
+            assert_eq!(events[0].peer, peer, "the address stays diagnostic");
         });
     }
 

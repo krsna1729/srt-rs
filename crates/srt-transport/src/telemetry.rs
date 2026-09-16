@@ -16,6 +16,10 @@ pub enum ShardOverloadReason {
     OutputBudget = 1,
     OutputBackpressure = 2,
     QueueLimit = 3,
+    /// A protocol output could not be materialized for its sink. Distinct
+    /// from a budget/backpressure condition: it is a property of the affected
+    /// session, not of the shard's capacity.
+    OutputProtocolError = 4,
 }
 
 impl ShardOverloadReason {
@@ -59,6 +63,8 @@ pub struct ShardTelemetrySnapshot {
     pub output_syscalls: u64,
     pub output_would_block: u64,
     pub budget_exhausted: u64,
+    /// Service visits that reported a protocol materialization failure.
+    pub protocol_output_failures: u64,
     pub backpressured: u64,
     pub accepted: u64,
     pub rejected: u64,
@@ -203,6 +209,11 @@ impl ShardTelemetry {
             crate::OutputDrainStatus::Backpressured => {
                 self.snapshot.backpressured = self.snapshot.backpressured.saturating_add(1);
                 self.record_overload(ShardOverloadReason::OutputBackpressure);
+            }
+            crate::OutputDrainStatus::ProtocolError => {
+                self.snapshot.protocol_output_failures =
+                    self.snapshot.protocol_output_failures.saturating_add(1);
+                self.record_overload(ShardOverloadReason::OutputProtocolError);
             }
         }
     }
@@ -582,6 +593,8 @@ mod tests {
             sink_outcome: crate::SinkOutcome::Accepted,
             sink_error_kind: None,
             sink_rejections: 0,
+            protocol_output_failures: 0,
+            protocol_output_error_kind: None,
             actions: 4,
             packets: 2,
             bytes: 1200,

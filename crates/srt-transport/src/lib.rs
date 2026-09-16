@@ -208,7 +208,10 @@ pub mod advanced {
 
     /// Final-storage datagram sink abstraction.
     pub mod sink {
-        pub use super::super::sink::{DatagramSink, DatagramSlot, SinkOutcome, VecSlot};
+        pub use super::super::sink::{
+            DatagramSink, DatagramSlot, DatagramTarget, ProtocolOutputFailure, SinkOutcome,
+            TxAttribution, TxAttributionKind, VecSlot,
+        };
     }
 }
 
@@ -490,6 +493,11 @@ pub enum OutputDrainStatus {
     Drained,
     BudgetExhausted,
     Backpressured,
+    /// A peeked protocol datagram could not be materialized. The output is
+    /// still queued and the affected session/leg is quarantined with an
+    /// attributed failure record; this is a condition of that session, not an
+    /// empty queue and not a budget effect.
+    ProtocolError,
 }
 
 impl OutputDrainStatus {
@@ -497,6 +505,10 @@ impl OutputDrainStatus {
     #[must_use]
     pub fn combine(self, other: Self) -> Self {
         match (self, other) {
+            // A protocol failure is the most specific thing that happened in
+            // the visit and must survive combination, not be masked by a
+            // budget/backpressure summary.
+            (Self::ProtocolError, _) | (_, Self::ProtocolError) => Self::ProtocolError,
             (Self::BudgetExhausted, _) | (_, Self::BudgetExhausted) => Self::BudgetExhausted,
             (Self::Backpressured, _) | (_, Self::Backpressured) => Self::Backpressured,
             _ => Self::Drained,
@@ -525,6 +537,15 @@ pub struct OutputDrainReport {
     /// Number of datagrams a sink refused *before* materialization in this
     /// visit. Always zero for well-behaved sinks under capacity.
     pub sink_rejections: usize,
+    /// Number of `poll_output_into` failures in this visit.
+    ///
+    /// A failure here is never "nothing to send": the protocol output stays
+    /// queued in the connection. The affected session/leg is quarantined and
+    /// the attributed record is available from the table's bounded
+    /// protocol-output failure queue.
+    pub protocol_output_failures: usize,
+    /// Kind of the first protocol materialization failure in this visit.
+    pub protocol_output_error_kind: Option<srt_proto::ErrorKind>,
 }
 
 /// Outcome of one `send_paced`/`send_shared_paced` attempt (S03). The prior

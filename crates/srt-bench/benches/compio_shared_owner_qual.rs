@@ -88,6 +88,11 @@ struct QualReport {
     lateness_max_us: u64,
     pending_after_drain: u64,
     drained: bool,
+    /// Whether the pre-measurement drain reached equilibrium, so no
+    /// handshake/control completion can cross the window start.
+    pre_window_drained: bool,
+    /// In-flight wire sends at the end of the measurement window.
+    inflight_at_window_end: u64,
     rx_mode: String,
     rx_dropped: u64,
     rx_truncated: u64,
@@ -258,6 +263,21 @@ async fn run_sender(
                 break;
             }
         }
+        // --- pre-measurement equilibrium: every handshake/timer/socket
+        // completion that belongs to establishment is drained BEFORE the
+        // window opens, so the window's counters cannot include a completion
+        // whose submission happened before it.
+        let warm_start = Instant::now();
+        while warm_start.elapsed() < DRAIN_DEADLINE {
+            now = Timestamp::from_micros(now.as_micros() + 1_000);
+            let _ = owner.service(now, budget).await;
+            if owner.tx_in_flight() == 0 && !owner.has_pending_work(now) {
+                report.pre_window_drained = true;
+                break;
+            }
+            owner.wait_for_activity(Duration::from_millis(1)).await;
+        }
+
         report.admitted = ids.len();
         report.established = ids
             .iter()
@@ -340,8 +360,9 @@ async fn run_sender(
             }
             owner.wait_for_activity(Duration::from_millis(1)).await;
         }
+        report.inflight_at_window_end = owner.tx_in_flight() as u64;
         report.pending_after_drain =
-            owner.tx_in_flight() as u64 + if owner.has_pending_work(now) { 1 } else { 0 };
+            report.inflight_at_window_end + if owner.has_pending_work(now) { 1 } else { 0 };
 
         report.rx_mode = format!("{:?}", owner.rx_mode());
         // The sender's own receive side is the caller socket.
@@ -380,13 +401,17 @@ fn main() {
 
     let managed = report.rx_mode == format!("{:?}", OwnerRxMode::ManagedMultishot);
     println!(
+        // Field labels distinguish the measurement domains explicitly:
+        // `data_offered`/`data_accepted` are application copies, while
+        // `tx_submitted_wire`/`tx_completed` count wire datagrams, which
+        // include control traffic and therefore do not have to be equal.
         "SHARED_OWNER_QUAL fanout={} tx_lanes={} connect_cc={} desired={} \
-         issued={} admitted={} queued={} refused={} established={} offered={} accepted={} \
-         submitted={} completed_ok={} short={} failed={} peer_local={} \
-         transient={} tx_failures_pending={} service_visits={} \
-         lateness_us_p50={} p99={} max={} drain_ok={} pending_after_drain={} \
-         rx_mode={} managed_rx={} rx_dropped={} rx_truncated={} \
-         tx_pool={}/{} cpu_ms={:.1}",
+         issued={} admitted={} queued={} refused={} established={} pre_window_drained={} \
+         data_offered={} data_accepted={} tx_submitted_wire={} tx_completed={} \
+         short={} failed={} peer_local={} transient={} tx_failures_pending={} \
+         service_visits={} lateness_us_p50={} p99={} max={} drain_ok={} \
+         inflight_at_window_end={} pending_after_drain={} rx_mode={} managed_rx={} \
+         rx_dropped={} rx_truncated={} tx_pool={}/{} cpu_ms={:.1}",
         report.fanout,
         report.tx_lanes,
         report.connect_cc,
@@ -396,6 +421,7 @@ fn main() {
         report.queued,
         report.refused,
         report.established,
+        report.pre_window_drained,
         report.offered,
         report.accepted,
         report.submitted,
@@ -410,6 +436,7 @@ fn main() {
         report.lateness_p99_us,
         report.lateness_max_us,
         report.drained,
+        report.inflight_at_window_end,
         report.pending_after_drain,
         report.rx_mode,
         managed,

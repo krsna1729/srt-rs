@@ -1,3 +1,4 @@
+use crate::sink::{DatagramTarget, ProtocolOutputFailureQueue, TxAttribution};
 use crate::{
     DatagramSink, DatagramSlot, DenseDueIndex, DenseSlotArena, DueIndex, GroupConnectionStats,
     GroupLogicalCounters, InboundGroupStats, IngressTelemetry, ListenerPeerPolicy, MAX_DENSE_SLOTS,
@@ -63,6 +64,11 @@ pub struct AdmissionPeer {
     rejected: bool,
     admission_established: bool,
     last_datagram_at: Timestamp,
+    /// Set when `poll_output_into` refuses this peer's peeked datagram. The
+    /// queue still holds that output, so the peer must not be re-offered as
+    /// ordinary work: it would rediscover the same failure every visit. The
+    /// application observes the attributed failure and retires the peer.
+    output_faulted: bool,
 }
 
 impl AdmissionPeer {
@@ -384,6 +390,21 @@ pub enum Admit {
 /// value from [`AdmissionEvent::logical_peer`] for steady-state operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LogicalPeerId(u64);
+
+impl LogicalPeerId {
+    /// The raw id, for opaque transport attribution. Not a handle: callers
+    /// outside this crate never interpret it.
+    #[must_use]
+    pub(crate) fn as_u64(self) -> u64 {
+        self.0
+    }
+
+    /// Rebuild from a raw id minted by [`Self::as_u64`].
+    #[must_use]
+    pub(crate) fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+}
 
 /// A logical peer which has been atomically retired from a [`PeerTable`].
 ///
@@ -764,6 +785,25 @@ struct InboundGroupLeg {
     physical: PhysicalPeerKey,
     timers: ManualTimerStore,
     pending_outputs: VecDeque<ConnectionOutput>,
+    /// Per-leg quarantine; see [`AdmissionPeer::output_faulted`]. A faulted
+    /// member does not stop its siblings.
+    output_faulted: bool,
+}
+
+/// Outcome of one peer materialization attempt.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PeerDrainStep {
+    /// Output committed (or the front item was a timer action); keep visiting.
+    Continue,
+    /// The offer did not fit this visit's allowance, or the sink had no
+    /// capacity. The output stays queued and the peer stays scheduled.
+    Blocked,
+    /// `poll_output_into` refused to materialize the peeked datagram. The
+    /// output is STILL QUEUED; the error is recorded on the report and on the
+    /// bounded attributed failure queue, and the leg is quarantined so it is
+    /// neither re-offered nor re-reported. `leg` names the physical leg
+    /// (`None` for a direct peer).
+    ProtocolFailed { leg: Option<u32> },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -864,6 +904,9 @@ pub struct PeerTable {
     source_counts: HashMap<std::net::IpAddr, usize>,
     half_open_peers: usize,
     established_peers: usize,
+    /// Bounded, attributed protocol-output failures awaiting application
+    /// drain; see [`PeerTable::poll_output_failures`].
+    protocol_failures: ProtocolOutputFailureQueue,
     half_open_deadlines: DueIndex<PhysicalPeerKey>,
     idle_deadlines: DueIndex<PhysicalPeerKey>,
     deadlines: DenseDueIndex,
@@ -906,6 +949,29 @@ fn record_peer_sink_rejection(report: &mut OutputDrainReport, error: &srt_proto:
     report.sink_rejections = report.sink_rejections.saturating_add(1);
 }
 
+/// Account one protocol materialization failure for a peer/leg. The protocol
+/// output stays queued; the typed kind rides on the report and the attributed
+/// record goes to the table's bounded failure queue so an upper layer can
+/// retire exactly the affected peer/leg instead of reading this as "nothing to
+/// send".
+fn record_peer_protocol_failure(
+    report: &mut OutputDrainReport,
+    failures: &mut ProtocolOutputFailureQueue,
+    attribution: TxAttribution,
+    error: &srt_proto::Error,
+) {
+    report.protocol_output_failures += 1;
+    if report.protocol_output_error_kind.is_none() {
+        report.protocol_output_error_kind = Some(error.kind);
+    }
+    report.status = OutputDrainStatus::ProtocolError;
+    failures.push(crate::sink::ProtocolOutputFailure {
+        attribution,
+        kind: error.kind,
+        reason: error.to_string(),
+    });
+}
+
 fn record_peer_unavailable(report: &mut OutputDrainReport) {
     report.sink_outcome = SinkOutcome::Unavailable;
 }
@@ -930,6 +996,9 @@ impl PeerTable {
             source_counts: HashMap::new(),
             half_open_peers: 0,
             established_peers: 0,
+            protocol_failures: ProtocolOutputFailureQueue::new(
+                crate::sink::PROTOCOL_OUTPUT_FAILURE_CAPACITY,
+            ),
             half_open_deadlines: DueIndex::default(),
             idle_deadlines: DueIndex::default(),
             deadlines: DenseDueIndex::default(),
@@ -1506,6 +1575,7 @@ impl PeerTable {
             rejected: false,
             admission_established: false,
             last_datagram_at: now,
+            output_faulted: false,
         }
     }
 
@@ -1701,6 +1771,7 @@ impl PeerTable {
                 physical: peer,
                 timers: entry.timers,
                 pending_outputs: entry.pending_outputs,
+                output_faulted: false,
             },
         );
         group.leg_order.push(member_id);
@@ -2346,6 +2417,9 @@ impl PeerTable {
                 .pop_due_bounded(now, &mut self.slots, max_work, &mut due);
         for slot_id in due {
             let slot_idx = slot_id.slot_idx as usize;
+            if self.peer_slot_output_quarantined(slot_idx) {
+                continue;
+            }
             if let Some(id) = self.slots.mark_ready(slot_idx) {
                 self.ready.push_back(id);
             }
@@ -2354,6 +2428,42 @@ impl PeerTable {
             }
         }
         (visited, due_remaining)
+    }
+
+    /// Whether the direct peer occupying `slot_idx` was quarantined by a
+    /// protocol materialization failure.
+    fn peer_slot_output_quarantined(&self, slot_idx: usize) -> bool {
+        self.slots
+            .get_by_slot(slot_idx)
+            .and_then(|slot| slot.value.direct())
+            .is_some_and(|entry| entry.output_faulted)
+    }
+
+    /// Drain attributed protocol materialization failures, oldest first.
+    ///
+    /// Each entry names the logical peer and the physical leg and carries the
+    /// protocol's own error kind and reason. The affected leg stays
+    /// quarantined until the application retires the peer, so a failure is
+    /// reported once rather than every visit.
+    pub fn poll_output_failures(
+        &mut self,
+        max_events: usize,
+        out: &mut Vec<crate::sink::ProtocolOutputFailure>,
+    ) {
+        out.clear();
+        self.protocol_failures.drain_into(max_events, out);
+    }
+
+    /// Protocol-output failures still queued for the application.
+    #[must_use]
+    pub fn output_failures_pending(&self) -> usize {
+        self.protocol_failures.len()
+    }
+
+    /// Protocol-output failures dropped because the bounded queue was full.
+    #[must_use]
+    pub fn output_failures_dropped(&self) -> u64 {
+        self.protocol_failures.dropped()
     }
 
     fn poll_direct_outbound_bounded<S: DatagramSink + ?Sized>(
@@ -2400,6 +2510,12 @@ impl PeerTable {
         if let Some(slot) = self.slots.get_by_slot_mut(slot_idx)
             && let Some(entry) = slot.value.direct_mut()
         {
+            if entry.output_faulted {
+                // Quarantined: leaving a live deadline would keep the table
+                // reporting due work it will never act on.
+                self.deadlines.remove(slot_idx, &mut self.slots);
+                return;
+            }
             if let Some(deadline) = entry.timers.next_deadline() {
                 self.deadlines.set(slot_idx, deadline, &mut self.slots);
             } else {
@@ -2446,8 +2562,38 @@ impl PeerTable {
             return (rejected, false, false);
         };
 
-        let blocked =
-            Self::drain_peer_direct_meta(peer_addr, now, budget, entry, meta, sink, report);
+        if entry.output_faulted {
+            // Already reported and still holding its queued output: offering it
+            // again would rediscover the same failure every visit.
+            self.sync_direct_peer_deadline(slot_idx);
+            return (None, false, false);
+        }
+        let attribution = TxAttribution::peer(entry.logical_peer, 0);
+        let mut failures = std::mem::replace(
+            &mut self.protocol_failures,
+            ProtocolOutputFailureQueue::new(crate::sink::PROTOCOL_OUTPUT_FAILURE_CAPACITY),
+        );
+        let step = Self::drain_peer_direct_meta(
+            peer_addr,
+            attribution,
+            None,
+            now,
+            budget,
+            entry,
+            meta,
+            sink,
+            &mut failures,
+            report,
+        );
+        self.protocol_failures = failures;
+        let blocked = match step {
+            PeerDrainStep::Continue => false,
+            PeerDrainStep::Blocked => true,
+            PeerDrainStep::ProtocolFailed { .. } => {
+                entry.output_faulted = true;
+                false
+            }
+        };
         self.sync_direct_peer_deadline(slot_idx);
         (None, true, blocked)
     }
@@ -2498,48 +2644,68 @@ impl PeerTable {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn drain_peer_direct_meta<S: DatagramSink + ?Sized>(
         peer_addr: std::net::SocketAddr,
+        attribution: TxAttribution,
+        leg: Option<u32>,
         now: Timestamp,
         budget: OutputDrainBudget,
         entry: &mut AdmissionPeer,
         meta: OutputMeta,
         sink: &mut S,
+        failures: &mut ProtocolOutputFailureQueue,
         report: &mut OutputDrainReport,
-    ) -> bool {
+    ) -> PeerDrainStep {
         match meta {
             OutputMeta::Datagram { wire_len } => {
                 let exceeds_packets = report.packets >= budget.max_packets;
                 let exceeds_bytes = report.bytes.saturating_add(wire_len) > budget.max_bytes;
                 if exceeds_packets || exceeds_bytes {
-                    return true;
+                    return PeerDrainStep::Blocked;
                 }
-                let mut slot = match sink.acquire(peer_addr, wire_len) {
+                let mut slot = match sink.acquire_target(
+                    DatagramTarget {
+                        peer: peer_addr,
+                        attribution,
+                    },
+                    wire_len,
+                ) {
                     Ok(Some(slot)) => slot,
                     Ok(None) => {
                         record_peer_unavailable(report);
-                        return true;
+                        return PeerDrainStep::Blocked;
                     }
                     Err(error) => {
                         record_peer_sink_rejection(report, &error);
-                        return true;
+                        return PeerDrainStep::Blocked;
                     }
                 };
                 let materialized = {
                     let buf = slot.bytes_mut();
                     match entry.conn.poll_output_into(buf) {
                         Ok(Some(OutputInto::Datagram { len })) => Ok(len),
-                        // Nothing consumed: drop the reservation.
-                        Ok(_) | Err(_) => Err(()),
+                        // The peeked datagram is still queued: a datagram that
+                        // vanished between peek and poll, or a protocol
+                        // refusal, is a real condition of this peer -- never
+                        // "empty".
+                        Ok(_) => Err(srt_proto::Error::with_reason(
+                            srt_proto::ErrorKind::InvalidState,
+                            "peeked datagram output vanished before materialization",
+                        )),
+                        Err(error) => Err(error),
                     }
                 };
                 match materialized {
                     Ok(len) => {
                         slot.commit(len);
                         record_peer_pushed(report, len);
-                        false
+                        PeerDrainStep::Continue
                     }
-                    Err(()) => false,
+                    Err(error) => {
+                        record_peer_protocol_failure(report, failures, attribution, &error);
+                        PeerDrainStep::ProtocolFailed { leg }
+                    }
                 }
             }
             OutputMeta::SetTimer { .. } | OutputMeta::ClearTimer { .. } => {
@@ -2566,7 +2732,7 @@ impl PeerTable {
                     }
                     _ => {}
                 }
-                false
+                PeerDrainStep::Continue
             }
         }
     }
@@ -2652,6 +2818,23 @@ impl PeerTable {
         leg.timers.fire_expired(now, connection);
 
         let peer_addr = leg.physical.address;
+        if leg.output_faulted {
+            // Already reported; never re-offer or re-report it.
+            self.sync_group_leg_deadline(&token.key, member_id);
+            if self
+                .groups
+                .get(&token.key)
+                .is_some_and(|group| !group.ready_legs.is_empty())
+            {
+                self.enqueue_group_ready(token);
+            }
+            return false;
+        }
+        let attribution = TxAttribution::peer(group.logical_peer, member_id);
+        let mut failures = std::mem::replace(
+            &mut self.protocol_failures,
+            ProtocolOutputFailureQueue::new(crate::sink::PROTOCOL_OUTPUT_FAILURE_CAPACITY),
+        );
         let mut had_output = false;
         let mut blocked = false;
 
@@ -2662,9 +2845,28 @@ impl PeerTable {
             blocked = blk;
         } else if let Some(meta) = connection.peek_output() {
             had_output = true;
-            blocked =
-                Self::drain_group_leg_direct_meta(now, budget, leg, connection, meta, sink, report);
+            match Self::drain_group_leg_direct_meta(
+                now,
+                budget,
+                leg,
+                attribution,
+                member_id,
+                connection,
+                meta,
+                sink,
+                &mut failures,
+                report,
+            ) {
+                PeerDrainStep::Continue => {}
+                PeerDrainStep::Blocked => blocked = true,
+                PeerDrainStep::ProtocolFailed { .. } => {
+                    // Quarantine exactly this leg: its siblings in the same
+                    // bonded group keep carrying traffic.
+                    leg.output_faulted = true;
+                }
+            }
         }
+        self.protocol_failures = failures;
 
         self.sync_group_leg_deadline(&token.key, member_id);
         if had_output {
@@ -2725,47 +2927,66 @@ impl PeerTable {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn drain_group_leg_direct_meta<S: DatagramSink + ?Sized>(
         now: Timestamp,
         budget: OutputDrainBudget,
         leg: &mut InboundGroupLeg,
+        attribution: TxAttribution,
+        member_id: u32,
         connection: &mut SrtConnection,
         meta: OutputMeta,
         sink: &mut S,
+        failures: &mut ProtocolOutputFailureQueue,
         report: &mut OutputDrainReport,
-    ) -> bool {
+    ) -> PeerDrainStep {
         match meta {
             OutputMeta::Datagram { wire_len } => {
                 let exceeds_packets = report.packets >= budget.max_packets;
                 let exceeds_bytes = report.bytes.saturating_add(wire_len) > budget.max_bytes;
                 if exceeds_packets || exceeds_bytes {
-                    return true;
+                    return PeerDrainStep::Blocked;
                 }
-                let mut slot = match sink.acquire(leg.physical.address, wire_len) {
+                let mut slot = match sink.acquire_target(
+                    DatagramTarget {
+                        peer: leg.physical.address,
+                        attribution,
+                    },
+                    wire_len,
+                ) {
                     Ok(Some(slot)) => slot,
                     Ok(None) => {
                         record_peer_unavailable(report);
-                        return true;
+                        return PeerDrainStep::Blocked;
                     }
                     Err(error) => {
                         record_peer_sink_rejection(report, &error);
-                        return true;
+                        return PeerDrainStep::Blocked;
                     }
                 };
                 let materialized = {
                     let buf = slot.bytes_mut();
                     match connection.poll_output_into(buf) {
                         Ok(Some(OutputInto::Datagram { len })) => Ok(len),
-                        Ok(_) | Err(_) => Err(()),
+                        Ok(_) => Err(srt_proto::Error::with_reason(
+                            srt_proto::ErrorKind::InvalidState,
+                            "peeked datagram output vanished before materialization",
+                        )),
+                        Err(error) => Err(error),
                     }
                 };
                 match materialized {
                     Ok(len) => {
                         slot.commit(len);
                         record_peer_pushed(report, len);
-                        false
+                        PeerDrainStep::Continue
                     }
-                    Err(()) => false,
+                    Err(error) => {
+                        record_peer_protocol_failure(report, failures, attribution, &error);
+                        PeerDrainStep::ProtocolFailed {
+                            leg: Some(member_id),
+                        }
+                    }
                 }
             }
             OutputMeta::SetTimer { .. } | OutputMeta::ClearTimer { .. } => {
@@ -2791,7 +3012,7 @@ impl PeerTable {
                     }
                     _ => {}
                 }
-                false
+                PeerDrainStep::Continue
             }
         }
     }
@@ -3219,6 +3440,26 @@ impl PeerTable {
     #[cfg(test)]
     pub(crate) fn contains(&self, peer: &std::net::SocketAddr) -> bool {
         self.physical_for_address(*peer).is_some()
+    }
+
+    /// Test-only: the arena slot index holding a direct peer's address.
+    #[cfg(test)]
+    pub(crate) fn peer_slot_index_for_test(&self, peer: std::net::SocketAddr) -> Option<usize> {
+        let physical = self.physical_for_address(peer)?;
+        self.slots
+            .slot_index_for_socket_id(physical.local_socket_id)
+            .into()
+    }
+
+    /// Test-only: mutable access to one direct peer by slot index.
+    #[cfg(test)]
+    pub(crate) fn direct_peer_mut_for_test(
+        &mut self,
+        slot_idx: usize,
+    ) -> Option<&mut AdmissionPeer> {
+        self.slots
+            .get_by_slot_mut(slot_idx)
+            .and_then(|slot| slot.value.direct_mut())
     }
 
     #[cfg(test)]
@@ -3998,6 +4239,7 @@ mod tests {
         };
         let logical_peer = table.allocate_logical_peer(LogicalPeerTarget::Group(key.clone()));
         let mut leg = InboundGroupLeg {
+            output_faulted: false,
             physical: PhysicalPeerKey {
                 address: "127.0.0.1:9100".parse().unwrap(),
                 local_socket_id: 1,
@@ -4386,6 +4628,208 @@ mod tests {
     /// A04: `prune_idle` must start an orderly close on an established peer
     /// that has gone quiet past `idle_timeout`, and must leave an equally
     /// old but still-active peer completely untouched.
+    ///
+    /// Adversarial sink: reserves the requested capacity but hands the
+    /// protocol a SHORTER buffer, so `poll_output_into` refuses
+    /// (`InsufficientBuffer`) while the protocol output stays queued. That is
+    /// the deterministic injection for the peer-side materialization-failure
+    /// contract: no kernel, no timing.
+    struct ShortPeerSink {
+        committed: Vec<(std::net::SocketAddr, Vec<u8>)>,
+        attributions: Vec<crate::sink::TxAttribution>,
+        short_by: usize,
+        /// Only this peer is failed; others materialize normally.
+        failing: Option<std::net::SocketAddr>,
+    }
+
+    struct ShortPeerSlot<'a> {
+        sink: &'a mut ShortPeerSink,
+        peer: std::net::SocketAddr,
+        buf: Vec<u8>,
+    }
+
+    impl DatagramSlot for ShortPeerSlot<'_> {
+        fn bytes_mut(&mut self) -> &mut [u8] {
+            &mut self.buf
+        }
+
+        fn commit(self, len: usize) {
+            let mut buf = self.buf;
+            buf.truncate(len);
+            self.sink.committed.push((self.peer, buf));
+        }
+    }
+
+    impl DatagramSink for ShortPeerSink {
+        type Slot<'a> = ShortPeerSlot<'a>;
+
+        fn acquire_target(
+            &mut self,
+            target: crate::sink::DatagramTarget,
+            wire_len: usize,
+        ) -> Result<Option<Self::Slot<'_>>, srt_proto::Error> {
+            let fails = self.failing.is_none_or(|peer| peer == target.peer);
+            let len = if fails {
+                wire_len.saturating_sub(self.short_by).max(1)
+            } else {
+                wire_len
+            };
+            self.attributions.push(target.attribution);
+            Ok(Some(ShortPeerSlot {
+                sink: self,
+                peer: target.peer,
+                buf: vec![0u8; len],
+            }))
+        }
+
+        fn acquire(
+            &mut self,
+            peer: std::net::SocketAddr,
+            wire_len: usize,
+        ) -> Result<Option<Self::Slot<'_>>, srt_proto::Error> {
+            self.acquire_target(crate::sink::DatagramTarget::unattributed(peer), wire_len)
+        }
+    }
+
+    /// Establish one direct peer and leave it with queued listener-side output
+    /// (a SHUTDOWN), which is what the materialization path then refuses.
+    fn established_peer_with_queued_output(
+        table: &mut PeerTable,
+        peer: std::net::SocketAddr,
+        socket_id: u32,
+        options: &AdmissionOptions,
+        telemetry: &IngressTelemetry,
+    ) -> LogicalPeerId {
+        let (mut caller, conclusion) =
+            admit_up_to_conclusion(table, peer, socket_id, options, telemetry);
+        admit_conclusion(table, peer, &mut caller, &conclusion, options, telemetry);
+        let slot_idx = table.peer_slot_index_for_test(peer).expect("peer slot");
+        let entry = table
+            .direct_peer_mut_for_test(slot_idx)
+            .expect("direct peer");
+        entry.conn.disconnect(Timestamp::from_micros(2_000_000));
+        entry.logical_peer
+    }
+
+    /// A peer materialization failure must be typed, attributed to the logical
+    /// peer, leave the output queued, and never read as "nothing to send".
+    #[test]
+    fn peer_protocol_materialization_failure_is_typed_and_attributed() {
+        let peer: std::net::SocketAddr = "127.0.0.1:11090".parse().expect("address");
+        let options = AdmissionOptions::basic(0x9111, 20, false);
+        let telemetry = IngressTelemetry::new();
+        let mut table = PeerTable::new();
+        let logical =
+            established_peer_with_queued_output(&mut table, peer, 0x9112, &options, &telemetry);
+
+        let now = Timestamp::from_micros(3_000_000);
+        let mut short = ShortPeerSink {
+            committed: Vec::new(),
+            attributions: Vec::new(),
+            short_by: 8,
+            failing: None,
+        };
+        let report = table.poll_outbound_bounded_to(now, OutputDrainBudget::default(), &mut short);
+        assert_eq!(
+            report.protocol_output_failures, 1,
+            "the refusal is counted on the report"
+        );
+        assert_eq!(
+            report.protocol_output_error_kind,
+            Some(srt_proto::ErrorKind::InsufficientBuffer)
+        );
+        assert_eq!(report.status, OutputDrainStatus::ProtocolError);
+        assert!(short.committed.is_empty(), "nothing was committed");
+        assert_eq!(
+            short.attributions.len(),
+            1,
+            "one reservation, carrying the logical peer"
+        );
+        assert_eq!(short.attributions[0].peer_id(), Some(logical));
+        assert_eq!(short.attributions[0].leg(), 0, "a direct peer is leg zero");
+
+        let mut failures = Vec::new();
+        table.poll_output_failures(8, &mut failures);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].attribution.peer_id(), Some(logical));
+        assert_eq!(failures[0].kind, srt_proto::ErrorKind::InsufficientBuffer);
+        assert!(!failures[0].reason.is_empty(), "the reason is preserved");
+    }
+
+    /// Follow-up: the quarantined peer is neither re-offered nor re-reported,
+    /// and it stops counting as pending work.
+    #[test]
+    fn quarantined_peer_is_not_reoffered() {
+        let peer: std::net::SocketAddr = "127.0.0.1:11092".parse().expect("address");
+        let options = AdmissionOptions::basic(0x9115, 20, false);
+        let telemetry = IngressTelemetry::new();
+        let mut table = PeerTable::new();
+        established_peer_with_queued_output(&mut table, peer, 0x9116, &options, &telemetry);
+        let now = Timestamp::from_micros(3_000_000);
+        let mut short = ShortPeerSink {
+            committed: Vec::new(),
+            attributions: Vec::new(),
+            short_by: 8,
+            failing: None,
+        };
+        let report = table.poll_outbound_bounded_to(now, OutputDrainBudget::default(), &mut short);
+        assert_eq!(report.protocol_output_failures, 1);
+        // Drain the single attributed record: the quarantine is what makes it
+        // single, and that is what the rest of this test checks.
+        let mut drained = Vec::new();
+        table.poll_output_failures(8, &mut drained);
+        assert_eq!(drained.len(), 1);
+        assert!(
+            drained[0].attribution.peer_id().is_some(),
+            "the failure names a logical peer"
+        );
+
+        for _ in 0..3 {
+            let mut again = ShortPeerSink {
+                committed: Vec::new(),
+                attributions: Vec::new(),
+                short_by: 8,
+                failing: None,
+            };
+            let report =
+                table.poll_outbound_bounded_to(now, OutputDrainBudget::default(), &mut again);
+            assert_eq!(report.protocol_output_failures, 0, "no repeated reporting");
+            assert!(again.attributions.is_empty(), "no repeated offering");
+        }
+        let mut more = Vec::new();
+        table.poll_output_failures(8, &mut more);
+        assert!(more.is_empty(), "one failure per peer, not one per visit");
+        assert!(
+            !table.has_pending_output(now),
+            "a quarantined peer is not schedulable work"
+        );
+    }
+
+    /// A successful peer materialization is unchanged: reserve, materialize,
+    /// commit, with the attribution recorded.
+    #[test]
+    fn peer_materialization_success_still_commits_with_attribution() {
+        let peer: std::net::SocketAddr = "127.0.0.1:11091".parse().expect("address");
+        let options = AdmissionOptions::basic(0x9113, 20, false);
+        let telemetry = IngressTelemetry::new();
+        let mut table = PeerTable::new();
+        let logical =
+            established_peer_with_queued_output(&mut table, peer, 0x9114, &options, &telemetry);
+        let now = Timestamp::from_micros(3_000_000);
+        let mut sink = ShortPeerSink {
+            committed: Vec::new(),
+            attributions: Vec::new(),
+            short_by: 0,
+            failing: None,
+        };
+        let report = table.poll_outbound_bounded_to(now, OutputDrainBudget::default(), &mut sink);
+        assert_eq!(report.protocol_output_failures, 0);
+        assert_eq!(sink.committed.len(), 1, "the datagram is committed");
+        assert_eq!(sink.committed[0].0, peer);
+        assert_eq!(sink.attributions[0].peer_id(), Some(logical));
+        assert_eq!(table.output_failures_pending(), 0);
+    }
+
     #[test]
     fn prune_idle_closes_a_quiet_established_peer_but_leaves_an_active_one_alone() {
         let quiet_peer = "127.0.0.1:11010".parse().expect("address");
