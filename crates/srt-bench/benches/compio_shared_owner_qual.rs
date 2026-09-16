@@ -1,0 +1,310 @@
+//! Two-process shared-`Owner` qualification: SENDER role.
+//!
+//! The point of this bench is that the sender is the real production
+//! [`srt_transport::compio::Owner`] on its production attach path
+//! (`Owner::connect`, sealed sides, finite TX pool, bounded `service`
+//! budget, reserve-then-commit final-buffer TX), talking to a **separate
+//! receiver process** over real UDP. It replaces the single-process
+//! `compio_production_fanout` smoke bench as the capacity evidence.
+//!
+//! Run it against an external receiver:
+//!
+//! ```text
+//! # terminal 1 (receiver, independent process)
+//! srt-bench runtime=compio mode=receiver <base_port> <duration> 120 \
+//!     --connections <fanout>
+//! # terminal 2 (sender, this bench)
+//! cargo bench -p srt-bench --bench compio_shared_owner_qual -- \
+//!     --fanout <fanout> --duration-ms <ms> --base-port <base_port>
+//! ```
+//!
+//! Semantics that matter for the numbers:
+//!
+//! * **Establishment barrier.** Nothing is measured until every logical
+//!   destination has reached `Connected`, or a connect deadline expires. A
+//!   partial establishment is reported as such and the run is not a
+//!   capacity result.
+//! * **Open-loop source.** The source clock advances independently of
+//!   service capacity at the 8 Mbps / 1316-byte cadence; a destination that
+//!   cannot accept a tick loses that copy and it is counted as
+//!   `not_accepted`, never queued in an unbounded harness backlog.
+//! * **TX-enabled drain.** After the window the Owner keeps servicing with
+//!   TX enabled until protocol output and in-flight sends reach zero, so the
+//!   final `pending_after_drain` is a real equilibrium check.
+//! * **RX mode is reported.** The Owner selects its receive datapath at
+//!   attach; the selected mode is printed, because a host whose kernel
+//!   cannot register a provided-buffer ring runs the raw reader and is NOT a
+//!   managed-RX qualification.
+
+use std::net::SocketAddr;
+use std::time::{Duration, Instant};
+
+use srt_proto::{Bytes, Timestamp};
+use srt_transport::compio::{
+    Owner, OwnerRxMode, OwnerServiceBudget, ProductionRuntimeConfig, RxModePolicy,
+    production_runtime_builder,
+};
+use srt_transport::{CallerConfig, SocketOwnership};
+
+const PAYLOAD_SIZE: usize = 1316;
+/// 8 Mbps of 1316-byte payloads: one payload every 1316 microseconds.
+const PACKET_INTERVAL_US: u64 = 1316;
+const CONNECT_DEADLINE: Duration = Duration::from_secs(30);
+const DRAIN_DEADLINE: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Default)]
+struct QualReport {
+    fanout: usize,
+    established: usize,
+    offered: u64,
+    accepted: u64,
+    submitted: u64,
+    completed_ok: u64,
+    short_sends: u64,
+    failed_sends: u64,
+    service_visits: u64,
+    lateness_p50_us: u64,
+    lateness_p99_us: u64,
+    lateness_max_us: u64,
+    pending_after_drain: u64,
+    drained: bool,
+    rx_mode: String,
+    rx_dropped: u64,
+    rx_truncated: u64,
+    tx_pool_free: usize,
+    tx_pool_capacity: usize,
+    cpu_ms: f64,
+}
+
+fn process_cpu_ms() -> f64 {
+    // CLOCK_PROCESS_CPUTIME_ID: service demand, not wall time.
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid `timespec`; the clock id is a constant.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts) };
+    if rc != 0 {
+        return 0.0;
+    }
+    ts.tv_sec as f64 * 1000.0 + ts.tv_nsec as f64 / 1_000_000.0
+}
+
+fn percentile(sorted: &[u64], pct: f64) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let idx = ((sorted.len() - 1) as f64 * pct).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
+}
+
+fn parse_arg<T: std::str::FromStr>(args: &[String], name: &str, default: T) -> T {
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+async fn run_sender(fanout: usize, duration_ms: u64, base_port: u16) -> QualReport {
+    let mut report = QualReport {
+        fanout,
+        ..Default::default()
+    };
+
+    // Production attach path: require io_uring and the managed RX substrate.
+    // `ManagedPreferred` (not Required) so this run still produces evidence on
+    // a fallback host -- and reports that it did.
+    let wire_ceiling = srt_transport::compio::required_session_wire_ceiling(PAYLOAD_SIZE, false);
+    let tx_capacity = (fanout * 4).clamp(256, 4096);
+    let cfg = ProductionRuntimeConfig::for_owner(tx_capacity, wire_ceiling);
+    let builder = match production_runtime_builder(cfg) {
+        Ok(builder) => builder,
+        Err(error) => {
+            panic!("production runtime builder refused: {error}");
+        }
+    };
+    let runtime = builder.build().expect("production runtime builds");
+
+    runtime.block_on(async {
+        let mut owner = Owner::new_with_ceiling(tx_capacity, wire_ceiling);
+        owner.set_rx_mode_policy(RxModePolicy::ManagedPreferred);
+        owner
+            .set_caller_pool_policy(
+                std::num::NonZeroUsize::new(fanout.clamp(1, 2048)).expect("nonzero"),
+                CONNECT_DEADLINE,
+            )
+            .expect("pool policy set before first connect");
+
+        let mut now = Timestamp::from_micros(10_000);
+        let mut ids = Vec::with_capacity(fanout);
+        for index in 0..fanout {
+            let remote: SocketAddr =
+                SocketAddr::from(([127, 0, 0, 1], base_port + (index as u16 % 4096)));
+            let caller_cfg = CallerConfig::builder(remote)
+                .ownership(SocketOwnership::Shared)
+                .configure_session(|session| {
+                    session.handshake.timeout = CONNECT_DEADLINE;
+                })
+                .build()
+                .expect("caller config");
+            match owner.connect(&caller_cfg, now).expect("owner connect") {
+                srt_transport::advanced::caller::PoolOutcome::Admitted(id) => ids.push(id),
+                other => panic!("expected admission, got {other:?}"),
+            }
+        }
+
+        // --- establishment barrier: nothing is measured until every
+        // destination is Connected, or the deadline expires.
+        let budget = OwnerServiceBudget::default();
+        let barrier_start = Instant::now();
+        while barrier_start.elapsed() < CONNECT_DEADLINE {
+            now = Timestamp::from_micros(now.as_micros() + 1_000);
+            let _ = owner.service(now, budget).await;
+            owner.wait_for_activity(Duration::from_millis(1)).await;
+            let connected = ids
+                .iter()
+                .filter(|id| {
+                    owner.logical_caller(id).and_then(|caller| caller.state())
+                        == Some(srt_transport::advanced::caller::LogicalCallerState::Connected)
+                })
+                .count();
+            if connected == fanout {
+                break;
+            }
+        }
+        report.established = ids
+            .iter()
+            .filter(|id| {
+                owner.logical_caller(id).and_then(|caller| caller.state())
+                    == Some(srt_transport::advanced::caller::LogicalCallerState::Connected)
+            })
+            .count();
+        if report.established == 0 {
+            report.rx_mode = format!("{:?}", owner.rx_mode());
+            report.tx_pool_capacity = owner.tx_pool().capacity();
+            report.tx_pool_free = owner.tx_pool().free_count();
+            return report;
+        }
+
+        // --- open-loop measurement window
+        let cpu_start = process_cpu_ms();
+        let deadline = Instant::now() + Duration::from_millis(duration_ms);
+        let payload = Bytes::from(vec![0x5A_u8; PAYLOAD_SIZE]);
+        let mut lateness =
+            Vec::with_capacity((duration_ms * 1000 / PACKET_INTERVAL_US) as usize + 8);
+        let mut next_tick = Instant::now();
+        while Instant::now() < deadline {
+            next_tick += Duration::from_micros(PACKET_INTERVAL_US);
+            // Open loop: the source tick happens whether or not the Owner can
+            // take it. A destination that refuses loses this copy.
+            for id in &ids {
+                report.offered += 1;
+                if let Some(mut caller) = owner.logical_caller_mut(id)
+                    && caller.send_shared(payload.clone(), now).is_ok()
+                {
+                    report.accepted += 1;
+                }
+            }
+            now = Timestamp::from_micros(now.as_micros() + PACKET_INTERVAL_US);
+            let visit = owner.service(now, budget).await;
+            report.submitted += visit.tx_packets_submitted as u64;
+            report.completed_ok += visit.tx_completed_ok as u64;
+            report.short_sends += visit.tx_short_sends as u64;
+            report.failed_sends += visit.tx_failed_sends as u64;
+            report.service_visits += 1;
+
+            // Open-loop pacing: wait out the rest of the source interval.
+            // Without this the source free-runs as fast as the service loop,
+            // offered load stops being 8 Mbps, and lateness is meaningless.
+            let after_service = Instant::now();
+            let late_us = after_service
+                .saturating_duration_since(next_tick)
+                .as_micros() as u64;
+            lateness.push(late_us);
+            if after_service < next_tick {
+                compio::time::sleep(next_tick - after_service).await;
+            }
+            // Do not idle the Owner past its own receive work.
+            owner.wait_for_activity(Duration::from_micros(0)).await;
+        }
+        report.cpu_ms = process_cpu_ms() - cpu_start;
+
+        lateness.sort_unstable();
+        report.lateness_p50_us = percentile(&lateness, 0.50);
+        report.lateness_p99_us = percentile(&lateness, 0.99);
+        report.lateness_max_us = lateness.last().copied().unwrap_or(0);
+
+        // --- TX-enabled drain to equilibrium, bounded
+        let drain_start = Instant::now();
+        while drain_start.elapsed() < DRAIN_DEADLINE {
+            now = Timestamp::from_micros(now.as_micros() + 1_000);
+            let visit = owner.service(now, budget).await;
+            report.submitted += visit.tx_packets_submitted as u64;
+            report.completed_ok += visit.tx_completed_ok as u64;
+            report.short_sends += visit.tx_short_sends as u64;
+            report.failed_sends += visit.tx_failed_sends as u64;
+            if owner.tx_in_flight() == 0 && !owner.has_pending_work(now) {
+                report.drained = true;
+                break;
+            }
+            owner.wait_for_activity(Duration::from_millis(1)).await;
+        }
+        report.pending_after_drain =
+            owner.tx_in_flight() as u64 + if owner.has_pending_work(now) { 1 } else { 0 };
+
+        report.rx_mode = format!("{:?}", owner.rx_mode());
+        if let Some(stats) = owner.rx_stats() {
+            report.rx_dropped = stats.dropped;
+            report.rx_truncated = stats.truncated;
+        }
+        report.tx_pool_capacity = owner.tx_pool().capacity();
+        report.tx_pool_free = owner.tx_pool().free_count();
+        report
+    })
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let fanout: usize = parse_arg(&args, "--fanout", 100);
+    let duration_ms: u64 = parse_arg(&args, "--duration-ms", 30_000);
+    let base_port: u16 = parse_arg(&args, "--base-port", 12_000);
+    let send_shards: usize = parse_arg(&args, "--send-shards", 1);
+    assert_eq!(
+        send_shards, 1,
+        "one Owner shard per process; run more processes for more shards"
+    );
+
+    let runtime = compio::runtime::Runtime::new().expect("runtime for setup");
+    let report = runtime.block_on(run_sender(fanout, duration_ms, base_port));
+
+    let managed = report.rx_mode == format!("{:?}", OwnerRxMode::ManagedMultishot);
+    println!(
+        "SHARED_OWNER_QUAL fanout={} established={} offered={} accepted={} \
+         submitted={} completed_ok={} short={} failed={} service_visits={} \
+         lateness_us_p50={} p99={} max={} drain_ok={} pending_after_drain={} \
+         rx_mode={} managed_rx={} rx_dropped={} rx_truncated={} \
+         tx_pool={}/{} cpu_ms={:.1}",
+        report.fanout,
+        report.established,
+        report.offered,
+        report.accepted,
+        report.submitted,
+        report.completed_ok,
+        report.short_sends,
+        report.failed_sends,
+        report.service_visits,
+        report.lateness_p50_us,
+        report.lateness_p99_us,
+        report.lateness_max_us,
+        report.drained,
+        report.pending_after_drain,
+        report.rx_mode,
+        managed,
+        report.rx_dropped,
+        report.rx_truncated,
+        report.tx_pool_free,
+        report.tx_pool_capacity,
+        report.cpu_ms,
+    );
+}

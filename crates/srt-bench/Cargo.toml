@@ -42,6 +42,10 @@ name = "compio_production_fanout"
 [[bench]]
 name = "compio_tx_qd_sweep"
 harness = false
+
+[[bench]]
+name = "compio_shared_owner_qual"
+harness = false
 [features]
 bench-internals = []
 
