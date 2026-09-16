@@ -438,14 +438,43 @@ impl CallerPool {
             .0
     }
 
+    /// Count-only maintenance: identical bounded work to
+    /// [`Self::poll_expirations_bounded_with_visits`], without materializing
+    /// the retired ids.
+    ///
+    /// The production Compio Owner only needs the visit count (it surfaces
+    /// retired sessions through `PoolEvent`s it already drains), so this path
+    /// allocates nothing at all -- an `Option<&mut Vec>` that stays `None`
+    /// rather than a fresh `Vec` the caller would immediately discard.
+    pub(crate) fn poll_expirations_count_only(
+        &mut self,
+        now: Timestamp,
+        max_actions: usize,
+    ) -> usize {
+        self.expire_due(now, max_actions, None)
+    }
+
     pub(crate) fn poll_expirations_bounded_with_visits(
         &mut self,
         now: Timestamp,
         max_actions: usize,
     ) -> (Vec<LogicalCallerId>, usize) {
+        let mut retired = Vec::new();
+        let visits = self.expire_due(now, max_actions, Some(&mut retired));
+        (retired, visits)
+    }
+
+    /// The single bounded expiration pass. `retired` is `None` for the
+    /// count-only path, which is what keeps that path allocation-free.
+    fn expire_due(
+        &mut self,
+        now: Timestamp,
+        max_actions: usize,
+        mut retired: Option<&mut Vec<LogicalCallerId>>,
+    ) -> usize {
         use srt_proto::ConnectionState;
         if max_actions == 0 {
-            return (Vec::new(), 0);
+            return 0;
         }
         let now_micros = now.as_micros();
         // Non-allocating production path: reuse table-owned scratch for
@@ -453,7 +482,6 @@ impl CallerPool {
         self.visit_scratch
             .extend(self.deadlines.iter().take(max_actions).copied());
         let candidate_actions = self.visit_scratch.len();
-        let mut expired_ids: Vec<LogicalCallerId> = Vec::new();
         let mut expired_count = 0usize;
         let mut idx = 0;
         while idx < self.visit_scratch.len() {
@@ -490,7 +518,9 @@ impl CallerPool {
                             request_id: attempt.request_id,
                             caller_id: candidate.caller_id,
                         });
-                        expired_ids.push(candidate.caller_id);
+                        if let Some(out) = retired.as_deref_mut() {
+                            out.push(candidate.caller_id);
+                        }
                     }
                     expired_count += 1;
                 }
@@ -500,8 +530,7 @@ impl CallerPool {
         self.visit_scratch.clear();
         self.expired = self.expired.saturating_add(expired_count as u64);
         let admitted = self.admit_queued(now, max_actions.saturating_sub(candidate_actions));
-        let visits = candidate_actions.saturating_add(admitted);
-        (expired_ids, visits)
+        candidate_actions.saturating_add(admitted)
     }
 
     /// Atomically retire one pooled attempt or established session,

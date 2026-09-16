@@ -280,10 +280,8 @@ fn bench_layer3b_owner_tx_pipeline(iterations: usize) -> LayerResult {
 
         let (caller, _) = new_connected_pair(5001);
         let id = owner
-            .caller_mut()
+            .bench_caller_table_mut()
             .unwrap()
-            .pool
-            .bench_table_mut()
             .add_direct(CallerLeg {
                 peer: sink_addr,
                 connection: caller,
@@ -301,12 +299,11 @@ fn bench_layer3b_owner_tx_pipeline(iterations: usize) -> LayerResult {
         let mut now = Timestamp::from_micros(1_000_000);
         for _ in 0..500 {
             now = Timestamp::from_micros(now.as_micros() + 100);
-            owner
-                .caller_mut()
-                .unwrap()
-                .pool
-                .bench_table_mut()
-                .bench_push_pending(id, sink_addr, packet.clone());
+            owner.bench_caller_table_mut().unwrap().bench_push_pending(
+                id,
+                sink_addr,
+                packet.clone(),
+            );
             let _ = owner.service(now, budget).await;
             owner
                 .wait_for_activity(std::time::Duration::from_millis(1))
@@ -324,12 +321,11 @@ fn bench_layer3b_owner_tx_pipeline(iterations: usize) -> LayerResult {
             // Queue pre-materialized datagram outside measurement window
             let a_pre = ALLOC_COUNT.load(Ordering::SeqCst);
             let b_pre = ALLOC_BYTES.load(Ordering::SeqCst);
-            owner
-                .caller_mut()
-                .unwrap()
-                .pool
-                .bench_table_mut()
-                .bench_push_pending(id, sink_addr, packet.clone());
+            owner.bench_caller_table_mut().unwrap().bench_push_pending(
+                id,
+                sink_addr,
+                packet.clone(),
+            );
             let queue_allocs = ALLOC_COUNT.load(Ordering::SeqCst) - a_pre;
             let queue_bytes = ALLOC_BYTES.load(Ordering::SeqCst) - b_pre;
             let a_start = ALLOC_COUNT.load(Ordering::SeqCst);
@@ -390,10 +386,8 @@ fn bench_layer4_full_compio_owner_tx(iterations: usize) -> LayerResult {
         caller_conn.connect(now).unwrap();
 
         let id = owner
-            .caller_mut()
+            .bench_caller_table_mut()
             .unwrap()
-            .pool
-            .bench_table_mut()
             .add_direct(CallerLeg {
                 peer: l_addr,
                 connection: caller_conn,
@@ -429,7 +423,7 @@ fn bench_layer4_full_compio_owner_tx(iterations: usize) -> LayerResult {
                 .wait_for_activity(std::time::Duration::from_millis(1))
                 .await;
             let mut events = Vec::new();
-            owner.listener_mut().unwrap().table.poll_events(&mut events);
+            owner.poll_listener_events(&mut events);
         }
 
         ALLOC_COUNT.store(0, Ordering::SeqCst);
@@ -449,7 +443,7 @@ fn bench_layer4_full_compio_owner_tx(iterations: usize) -> LayerResult {
                 .await;
             durations.push(t0.elapsed().as_nanos() as u64);
             let mut events = Vec::new();
-            owner.listener_mut().unwrap().table.poll_events(&mut events);
+            owner.poll_listener_events(&mut events);
         }
 
         let total_allocs = ALLOC_COUNT.load(Ordering::SeqCst);
