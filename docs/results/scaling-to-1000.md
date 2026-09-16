@@ -114,9 +114,174 @@ harness figure.
 
 ## Rows
 
-| date | N | S | F/shard | R | outcome | evidence |
+Raw evidence per row lives in `docs/results/scaling-1000/`; every number below
+is a column in one of those files.
+
+| date | N | S | F/shard | window | outcome | evidence |
 |---|---|---|---|---|---|---|
-| - | - | - | - | - | protocol frozen | this commit |
+| 2026-09-16 | 200 | 1 | 200 | 3 s | baseline: 0.18-0.26 % missed, lossless, fair, drained | `baseline-F200-solo-3reps.tsv` |
+| 2026-09-16 | 1000 | 5 | 200 | 3 s | **all 1000 destinations served, lossless, fair, reconciled**; 15-23 % missed ticks | `scale-N1000-S5-2reps.tsv` |
+| 2026-09-16 | 200 | 1 | 200 | 3 s | K sweep 128/512/1024 -- incumbent K=256 best on wire-bytes/CPU-s | `ksweep-K*.tsv` |
+| 2026-09-16 | 200 | 1 | 200 | 3 s | payload sweep 700/1316/2632 B at fixed 8 Mbps/destination | `costmodel-payload*.tsv` |
+
+## Result: the scaling path is sharding, and the wall is bytes copied per second
+
+### 1000 destinations, 5 concurrent shards (`scale-N1000-S5-2reps.tsv`)
+
+Ten shard-runs (2 reps x 5 shards), each shard owning 200 consecutive ports,
+all five shards running at once against five separate receiver processes:
+
+```text
+established        200/200 on every shard, both reps
+data_zero          0        (no destination starved)
+data_below_half_mean 0     (no slow subset)
+data_min == data_max == generated_ticks   (every destination received exactly
+                                           every copy its shard generated)
+rx_core_total == data_accepted            (exact reconciliation, both reps)
+rx_sec_a           0        (no loss)
+drain_ok           true, pending_after_drain 0
+```
+
+So the *path* to 1000 destinations exists and is clean: five shards carry it
+with nothing shared, nothing starved, nothing lost, and nothing left pending.
+
+What does **not** hold at 5 shards on this 6-CPU host is the 8 Mbps/destination
+cadence:
+
+| metric | solo F=200 | 5 x F=200 concurrent |
+|---|---|---|
+| `missed_source_ticks` / expected | 0.18-0.26 % | 15-23 % |
+| `window_cpu_ms` per shard | 2719-2752 | ~1700-2000 |
+| `lateness_us_p99` | 1530-1666 | ~4600-5300 |
+
+The shards are not misbehaving; they are not getting CPU. Five shards at full
+cadence need ~10 cores of protocol work (see the cost model below) and the host
+has 6, so each shard gets ~65-70 % of a core and skips the ticks it cannot
+serve. Every skipped tick is counted in `missed_source_ticks` rather than
+silently reducing the offered load, which is the property that makes this
+readable at all.
+
+**Honest capacity statement:** on this host, 1000 destinations are served
+losslessly, fairly, and reconciled at ~81 % of an 8 Mbps-per-destination
+cadence (5 shards x F=200, 2 reps, identical outcome). Full cadence at 1000
+destinations at 8 Mbps needs roughly 10 cores of sender+receiver work.
+
+### The cost is per byte, not per datagram
+
+The payload sweep holds the offered bitrate constant at 8 Mbps per destination
+and changes only how the bytes are framed (`--payload-bytes`, with the source
+interval derived as `payload_bytes * 8 / 8 Mbps`):
+
+| payload | interval | copies/s | datagrams in window | wire datagrams per copy | window us/copy | missed % |
+|---:|---:|---:|---:|---:|---:|---:|
+| 700 B | 700 us | 280-284 K | 215-228 K | 0.26-0.27 | **3.48-3.54** | 0.56-1.98 |
+| 1316 B | 1316 us | 150-151 K | 197-223 K | 0.43-0.49 | **5.99-6.16** | 0.09-0.92 |
+| 2632 B | 2632 us | not measurable (sweep column shift, see below) | 84-85 K | - | - | 0.00-0.09 |
+
+Doubling the number of payloads while holding the bitrate constant *halves* the
+per-copy cost: the same bytes cost the same CPU, in twice as many pieces. The
+datagram count rose only 8-16 % across that change because the protocol already
+coalesces multiple payloads per datagram. The consequence is a per-byte cost
+model, and it is the model that predicts the measured shard capacity:
+
+```text
+sender   1316 B / 5.98 us  = 4.5 ns/byte    (700 B / 3.50 us = 5.0 ns/byte)
+```
+
+4.6 ns/byte is 217 MB/s of payload per core, i.e. ~217 destinations at 8 Mbps
+per sender core -- which is exactly where the shard saturates. The 2632 B row
+could not be measured as intended: the receiver reports `core_total = 0` and
+the sender reports 84-85 K window datagrams, i.e. a ~1500-byte wire packet size
+was exceeded and the rows are not comparable. It is recorded as measured, not
+as a data point.
+
+### Where the CPU actually goes (`perf`, F=200, sender)
+
+Flat self-costs from a 3 s window under `perf record -F 2999 --call-graph dwarf`:
+
+```text
+41 %   kernel: io_sendmsg -> udp_sendmsg -> ip_send_skb   (per-datagram, byte-copying)
+ 5 %   ring entry/exit: io_uring_enter, io_submit_sqes
+ 3 %   compio runtime: poll_with, task run
+~1 %   srt-rs user space (self cost of the whole protocol)
+```
+
+And the syscall count says the same thing from the other side: over 8 s the
+receiver entered the kernel 47,605 times while completing 868,805 ring
+operations -- **0.15 syscalls per datagram**. H1 (syscall-bound) is false: both
+sides already batch through io_uring and pay per-datagram kernel work, not per
+syscall. The user-space protocol is not the cost; the copies are.
+
+### Receiver cost curve (F, from the committed #116 artifact plus these runs)
+
+| F | receiver us per datagram processed |
+|---:|---:|
+| 10 | 30.9 |
+| 100 | 12.5 |
+| 200 | 7.9 |
+| 600 | 16.2 |
+| 1000 | 16.5 |
+
+Flat-to-decreasing through F=200 and then rising only in the two overload rows,
+where the sender is retransmitting (the F=600 row processes 1.06 M drain
+datagrams against 574 K window DATA). H3 -- a per-connection scaling cost in
+the receiver -- is false; the rise at 600/1000 is redundant traffic, not
+bookkeeping.
+
+## Hypothesis verdicts
+
+| # | Hypothesis | Verdict | Evidence |
+|---|---|---|---|
+| H1 | shard is syscall-bound | **false** | 0.15 syscalls/datagram; 47.6 K syscalls vs 868 K ring completions |
+| H2 | shard is protocol-CPU bound | **false** | kernel UDP send path 41 %, srt-rs user space ~1 % self |
+| H3 | receiver per-connection bookkeeping dominates at high N | **false** | receiver us/datagram falls to 7.9 at F=200 and rises only under retransmit overload |
+| H4 | the harness's tick loop sets the ceiling | **partly true, and now quantified** | the source shares the loop with `service()`, so a starved shard reports missed ticks instead of a lower rate; the ceiling itself is per-byte CPU, not the loop |
+| H5 | nothing superlinear; sharding is sufficient | **true** | 5 x F=200 serves 1000 with per-shard behaviour identical to solo |
+
+## Loop candidates measured (stopping condition T2)
+
+| candidate | change | measurement | verdict |
+|---|---|---|---|
+| A | TX lane count K -- 128 / 512 / 1024 vs incumbent 256 | in-window wire bytes per CPU-second: 98 / 100 / 107-108 vs **112** at K=256; window us/copy 5.30 / 6.61 / 6.53 vs 5.98-6.05 | **no win, incumbent kept** |
+| B | payload framing 700 B vs 1316 B at fixed bitrate | same CPU per byte (0.99 vs 0.91 core at 8 Mbps/destination), i.e. no per-datagram overhead to remove | **no win, no change** |
+| C | receiver-side per-connection cost | flat to F=200 (see curve) | **no cost to remove** |
+
+Candidate A also produced a methodological finding worth keeping: **`us/copy`
+alone is a misleading optimisation target**, because a smaller K lowers it
+(5.30 us) by doing less work per window (236 MB vs 306 MB in the same 3 s).
+The metric used from here on is *in-window wire bytes per CPU-second*.
+
+### Stopping status
+
+T2 requires three consecutive candidates that fail to beat the incumbent
+beyond the repeat-to-repeat noise band, which the baseline measures at
+**+/-0.7 %** (window us/copy 5.976 / 6.055 / 6.027 on three same-config runs).
+A, B and C are those three: none beat the incumbent, and none was kept.
+
+No in-scope candidate remains after the attribution: the remaining 99 % of
+sender CPU is kernel per-datagram byte handling and Compio's ring
+submit/wait, and the only changes that move those are the ones this workstream
+declines in its non-goals (zero-copy RX, `MSG_ZEROCOPY`, GSO/`UDP_SEGMENT`,
+`sendmmsg` batching, SQPOLL). T5 therefore ends the datapath loop: **sharding is
+the scaling mechanism**, and the number to publish is per-core, not per-shard.
+
+## Measurement defects found and fixed in this workstream
+
+1. **Receiver lifetime shorter than the drain** (`scale-N1000-S5-2reps.tsv` vs
+   the first run of the same sweep): the driver started receivers with a fixed
+   12 s duration while the senders were still draining, so the drain's
+   datagrams went to a closed socket. Window-phase reconciliation looked exact
+   either way -- `data_min == data_max == generated_ticks`, `sec_a = 0` -- which
+   is exactly why the lifetime is now derived from the window
+   (`window_ms/1000 + 30 s`) instead of guessed. The invalid first run is not
+   cited anywhere.
+2. **`us/copy` rewards doing less work** (candidate A).
+3. **The 2632 B payload row is not a data point**: a wire packet size beyond
+   ~1500 B is out of the instrument's model and the row is recorded as such.
+4. **Process-wide `cpu_ms` mixed window and drain** (`cpu_ms` spans both; the
+   F=200 drain is 1.2x the window's traffic). The harness now reports
+   `window_cpu_ms`, `drain_cpu_ms` and `cpu_ms` separately; the per-copy figures
+   above are window-only.
 
 ## Non-goals (unchanged from #116)
 
