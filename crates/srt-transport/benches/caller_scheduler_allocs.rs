@@ -221,22 +221,39 @@ impl ScratchSink {
     }
 }
 
+/// No-allocation slot over the sink's fixed stack scratch: `acquire` hands out
+/// the scratch, `commit` records the materialized length. Nothing here can
+/// allocate, which is the point of the isolated measurement.
+struct ScratchSlot<'a> {
+    sink: &'a mut ScratchSink,
+    wire_len: usize,
+}
+
+impl srt_transport::DatagramSlot for ScratchSlot<'_> {
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.sink.scratch[..self.wire_len]
+    }
+
+    fn commit(self, len: usize) {
+        self.sink.wire_len = len;
+    }
+}
+
 impl srt_transport::DatagramSink for ScratchSink {
-    fn push_datagram<F>(
+    type Slot<'a> = ScratchSlot<'a>;
+
+    fn acquire(
         &mut self,
         _peer: SocketAddr,
         wire_len: usize,
-        fill: F,
-    ) -> Result<srt_transport::PushResult, srt_proto::Error>
-    where
-        F: FnOnce(&mut [u8]) -> Result<usize, srt_proto::Error>,
-    {
+    ) -> Result<Option<Self::Slot<'_>>, srt_proto::Error> {
         if wire_len > self.scratch.len() {
-            return Ok(srt_transport::PushResult::Exhausted);
+            return Ok(None);
         }
-        let len = fill(&mut self.scratch[..wire_len])?;
-        self.wire_len = len;
-        Ok(srt_transport::PushResult::Pushed { len })
+        Ok(Some(ScratchSlot {
+            sink: self,
+            wire_len,
+        }))
     }
 }
 

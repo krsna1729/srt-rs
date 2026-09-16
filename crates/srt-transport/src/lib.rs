@@ -85,7 +85,7 @@ mod sink;
 mod socket_io;
 mod telemetry;
 mod timer;
-pub use sink::{DatagramSink, PushResult};
+pub use sink::{DatagramSink, DatagramSlot, SinkOutcome, VecSlot};
 
 /// Explicit composition APIs for applications that own a runtime, socket
 /// topology, or connection scheduling loop themselves.
@@ -180,7 +180,7 @@ pub mod advanced {
 
     /// Final-storage datagram sink abstraction.
     pub mod sink {
-        pub use super::super::sink::{DatagramSink, PushResult};
+        pub use super::super::sink::{DatagramSink, DatagramSlot, SinkOutcome, VecSlot};
     }
 }
 
@@ -487,6 +487,16 @@ pub struct OutputDrainReport {
     pub syscalls: usize,
     /// True when this visit stopped on `WouldBlock` or a partial `sendmmsg`.
     pub would_block: bool,
+    /// What the sink did with the most recent datagram offer. `Rejected`
+    /// means a sink refused the datagram *before* materialization, so the
+    /// protocol output is still queued; `sink_error_kind` carries the typed
+    /// reason. Never silently suppressed.
+    pub sink_outcome: SinkOutcome,
+    /// Kind of the first sink rejection in this visit, if any.
+    pub sink_error_kind: Option<srt_proto::ErrorKind>,
+    /// Number of datagrams a sink refused *before* materialization in this
+    /// visit. Always zero for well-behaved sinks under capacity.
+    pub sink_rejections: usize,
 }
 
 /// Outcome of one `send_paced`/`send_shared_paced` attempt (S03). The prior

@@ -579,6 +579,9 @@ mod tests {
         );
         telemetry.record_receive(3, 2, 1, true);
         telemetry.record_output(&crate::OutputDrainReport {
+            sink_outcome: crate::SinkOutcome::Accepted,
+            sink_error_kind: None,
+            sink_rejections: 0,
             actions: 4,
             packets: 2,
             bytes: 1200,

@@ -1,6 +1,6 @@
 use crate::{
-    DatagramSink, GroupConnectionStats, GroupLogicalCounters, ManualTimerStore, OutputDrainBudget,
-    OutputDrainReport, OutputDrainStatus, PushResult, group_connection_stats,
+    DatagramSink, DatagramSlot, GroupConnectionStats, GroupLogicalCounters, ManualTimerStore,
+    OutputDrainBudget, OutputDrainReport, OutputDrainStatus, SinkOutcome, group_connection_stats,
 };
 use srt_proto::{Bytes, ConnectionOutput, OutputInto, OutputMeta, SrtConnection, Timestamp};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -458,6 +458,36 @@ struct DrainSink<'a, S: ?Sized> {
     sink: &'a mut S,
 }
 
+/// Account one committed datagram.
+fn record_pushed(report: &mut OutputDrainReport, len: usize) {
+    report.sink_outcome = SinkOutcome::Accepted;
+    report.actions += 1;
+    report.packets += 1;
+    report.bytes = report.bytes.saturating_add(len);
+}
+
+/// Account one sink refusal, recorded BEFORE materialization. The protocol
+/// output stays queued; the typed kind rides on the report so an upper layer
+/// can react instead of the error being dropped.
+fn record_sink_rejection(report: &mut OutputDrainReport, error: &srt_proto::Error) {
+    report.sink_outcome = SinkOutcome::Rejected;
+    if report.sink_error_kind.is_none() {
+        report.sink_error_kind = Some(error.kind);
+    }
+    report.sink_rejections = report.sink_rejections.saturating_add(1);
+}
+
+fn record_unavailable(report: &mut OutputDrainReport) {
+    report.sink_outcome = SinkOutcome::Unavailable;
+}
+
+/// Split a drain sink into its report and its destination, so the refusal
+/// bookkeeping below can touch the report while the destination stays
+/// mutably borrowed by the in-flight reservation.
+fn split<'d, S: ?Sized>(sink: &'d mut DrainSink<'_, S>) -> (&'d mut OutputDrainReport, &'d mut S) {
+    (&mut *sink.report, &mut *sink.sink)
+}
+
 impl CallerSession {
     fn state(&self) -> LogicalCallerState {
         match self {
@@ -632,6 +662,8 @@ impl CallerSession {
                         (DrainOne::Empty, touched) => {
                             timers_touched |= touched;
                         }
+                        // A refusal on one leg must not be retried against the
+                        // next leg of the same group either.
                         result => return result,
                     }
                 }
@@ -646,6 +678,11 @@ enum DrainOne {
     Drained,
     Empty,
     Blocked,
+    /// The sink refused this datagram before materialization. The protocol
+    /// output is untouched, but re-offering the same item this visit would
+    /// only repeat the refusal, so the visit stops; the refusal itself is
+    /// reported through `sink_rejections`/`sink_error_kind`.
+    SinkRejected,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1434,6 +1471,18 @@ impl CallerTable {
                 }
             }
             DrainOne::Empty => {}
+            DrainOne::SinkRejected => {
+                // Nothing was consumed. The id must stay visible to the
+                // scheduler -- dropping it out of the ready queue would hide a
+                // still-queued datagram and turn a refusal into silent loss.
+                // The refusal itself is already recorded on the report.
+                self.enqueue_ready(id);
+                #[cfg(any(test, feature = "bench-internals"))]
+                {
+                    self.sched_stats.budget_exhausted += 1;
+                }
+                return ReadyVisitOutcome::BudgetExhausted;
+            }
             DrainOne::Blocked => {
                 self.enqueue_ready(id);
                 #[cfg(any(test, feature = "bench-internals"))]
@@ -1695,6 +1744,27 @@ impl CallerTable {
         self.sessions.keys().copied().collect()
     }
 
+    /// Benchmark/test-only: the protocol's next queued output for this
+    /// session, if any. Used to prove a refused acquisition consumes nothing:
+    /// the identical metadata must still be queued afterwards.
+    #[cfg(any(test, feature = "bench-internals"))]
+    #[must_use]
+    pub fn bench_peek_output(&self, id: &LogicalCallerId) -> Option<srt_proto::OutputMeta> {
+        match self.sessions.get(id)? {
+            CallerSession::Direct(leg) => leg.connection.peek_output(),
+            CallerSession::Group(group) => group
+                .leg_order
+                .first()
+                .and_then(|first| {
+                    group
+                        .group
+                        .member(*first)
+                        .map(|member| member.connection().peek_output())
+                })
+                .flatten(),
+        }
+    }
+
     #[cfg(any(test, feature = "bench-internals"))]
     pub fn bench_make_ready(&mut self, id: LogicalCallerId) {
         self.enqueue_ready(id);
@@ -1776,24 +1846,30 @@ fn drain_caller_legacy_output<S: DatagramSink + ?Sized>(
             if exceeds_packets || exceeds_bytes {
                 return Some((DrainOne::Blocked, false));
             }
-            match sink.sink.push_datagram(peer, wire_len, |buf| {
+            // Reserve first: every fallible decision happens here, so a
+            // refusal leaves this queued packet untouched.
+            let (report, dest) = split(sink);
+            let mut slot = match dest.acquire(peer, wire_len) {
+                Ok(Some(slot)) => slot,
+                Ok(None) => {
+                    record_unavailable(report);
+                    return Some((DrainOne::Blocked, false));
+                }
+                Err(error) => {
+                    record_sink_rejection(report, &error);
+                    return Some((DrainOne::SinkRejected, false));
+                }
+            };
+            // Compatibility surface: the bytes are already materialized, so
+            // this is a copy into the reserved slot, then an infallible commit.
+            {
+                let buf = slot.bytes_mut();
                 buf[..wire_len].copy_from_slice(packet);
-                Ok(wire_len)
-            }) {
-                Ok(PushResult::Pushed { len }) => {
-                    pending.pop_front();
-                    sink.report.actions += 1;
-                    sink.report.packets += 1;
-                    sink.report.bytes = sink.report.bytes.saturating_add(len);
-                    Some((DrainOne::Drained, false))
-                }
-                Ok(PushResult::Exhausted) => Some((DrainOne::Blocked, false)),
-                Err(e) => {
-                    let _ = e;
-                    pending.pop_front();
-                    Some((DrainOne::Empty, false))
-                }
             }
+            slot.commit(wire_len);
+            pending.pop_front();
+            record_pushed(report, wire_len);
+            Some((DrainOne::Drained, false))
         }
         _other => {
             let output = pending.pop_front().unwrap();
@@ -1819,26 +1895,38 @@ fn drain_caller_direct_meta<S: DatagramSink + ?Sized>(
             if exceeds_packets || exceeds_bytes {
                 return (DrainOne::Blocked, false);
             }
-            match sink.sink.push_datagram(peer, wire_len, |buf| {
-                match connection.poll_output_into(buf)? {
-                    Some(OutputInto::Datagram { len }) => Ok(len),
-                    _ => Err(srt_proto::Error::with_reason(
-                        srt_proto::ErrorKind::InvalidState,
-                        "expected datagram",
-                    )),
+            // Reserve first: `poll_output_into` is only reached once capacity
+            // is irrevocably held, so a refusal cannot consume protocol state.
+            let (report, dest) = split(sink);
+            let mut slot = match dest.acquire(peer, wire_len) {
+                Ok(Some(slot)) => slot,
+                Ok(None) => {
+                    record_unavailable(report);
+                    return (DrainOne::Blocked, false);
                 }
-            }) {
-                Ok(PushResult::Pushed { len }) => {
-                    sink.report.actions += 1;
-                    sink.report.packets += 1;
-                    sink.report.bytes = sink.report.bytes.saturating_add(len);
+                Err(error) => {
+                    record_sink_rejection(report, &error);
+                    return (DrainOne::SinkRejected, false);
+                }
+            };
+            let materialized = {
+                let buf = slot.bytes_mut();
+                match connection.poll_output_into(buf) {
+                    Ok(Some(OutputInto::Datagram { len })) => Ok(len),
+                    // Not a datagram after all (or nothing pending): no
+                    // protocol output was consumed, so drop the reservation.
+                    Ok(_) => Err(()),
+                    Err(_) => Err(()),
+                }
+            };
+            match materialized {
+                Ok(len) => {
+                    // Infallible: the protocol output is consumed exactly once.
+                    slot.commit(len);
+                    record_pushed(report, len);
                     (DrainOne::Drained, false)
                 }
-                Ok(PushResult::Exhausted) => (DrainOne::Blocked, false),
-                Err(e) => {
-                    let _ = e;
-                    (DrainOne::Empty, false)
-                }
+                Err(()) => (DrainOne::Empty, false),
             }
         }
         OutputMeta::SetTimer { .. } | OutputMeta::ClearTimer { .. } => {
@@ -1991,32 +2079,6 @@ mod tests {
 
     #[test]
     fn poll_outbound_bounded_to_drains_directly_and_handles_exhaustion() {
-        struct TestSink {
-            capacity: usize,
-            packets: Vec<(std::net::SocketAddr, Vec<u8>)>,
-        }
-
-        impl DatagramSink for TestSink {
-            fn push_datagram<F>(
-                &mut self,
-                peer: std::net::SocketAddr,
-                wire_len: usize,
-                fill: F,
-            ) -> Result<PushResult, srt_proto::Error>
-            where
-                F: FnOnce(&mut [u8]) -> Result<usize, srt_proto::Error>,
-            {
-                if self.packets.len() >= self.capacity {
-                    return Ok(PushResult::Exhausted);
-                }
-                let mut buf = vec![0u8; wire_len];
-                let len = fill(&mut buf)?;
-                buf.truncate(len);
-                self.packets.push((peer, buf));
-                Ok(PushResult::Pushed { len })
-            }
-        }
-
         let mut table = CallerTable::default();
         let peer: std::net::SocketAddr = "127.0.0.1:9001".parse().unwrap();
         let mut conn = SrtConnection::new_caller(ConnectionOptions {
@@ -2048,6 +2110,297 @@ mod tests {
             table.poll_outbound_bounded_to(now, OutputDrainBudget::default(), &mut sink1);
         assert_eq!(sink1.packets.len(), 1);
         assert_eq!(sink1.packets[0].0, peer);
+    }
+
+    /// A capacity-bounded recording sink shared by the drain tests.
+    struct TestSink {
+        capacity: usize,
+        packets: Vec<(std::net::SocketAddr, Vec<u8>)>,
+    }
+
+    struct TestSlot<'a> {
+        sink: &'a mut TestSink,
+        peer: std::net::SocketAddr,
+        buf: Vec<u8>,
+    }
+
+    impl DatagramSlot for TestSlot<'_> {
+        fn bytes_mut(&mut self) -> &mut [u8] {
+            &mut self.buf
+        }
+
+        fn commit(self, len: usize) {
+            let mut buf = self.buf;
+            buf.truncate(len);
+            self.sink.packets.push((self.peer, buf));
+        }
+    }
+
+    impl DatagramSink for TestSink {
+        type Slot<'a> = TestSlot<'a>;
+
+        fn acquire(
+            &mut self,
+            peer: std::net::SocketAddr,
+            wire_len: usize,
+        ) -> Result<Option<Self::Slot<'_>>, srt_proto::Error> {
+            if self.packets.len() >= self.capacity {
+                return Ok(None);
+            }
+            Ok(Some(TestSlot {
+                sink: self,
+                peer,
+                buf: vec![0u8; wire_len],
+            }))
+        }
+    }
+
+    /// A sink that refuses every datagram in `acquire`, so a test can prove
+    /// a refusal never consumes protocol state.
+    struct RefusingSink {
+        accepted: Vec<(std::net::SocketAddr, Vec<u8>)>,
+    }
+
+    struct RefusingSlot<'a> {
+        sink: &'a mut RefusingSink,
+        peer: std::net::SocketAddr,
+        buf: Vec<u8>,
+    }
+
+    impl DatagramSlot for RefusingSlot<'_> {
+        fn bytes_mut(&mut self) -> &mut [u8] {
+            &mut self.buf
+        }
+
+        fn commit(self, len: usize) {
+            let mut buf = self.buf;
+            buf.truncate(len);
+            self.sink.accepted.push((self.peer, buf));
+        }
+    }
+
+    impl DatagramSink for RefusingSink {
+        type Slot<'a> = RefusingSlot<'a>;
+
+        fn acquire(
+            &mut self,
+            peer: std::net::SocketAddr,
+            wire_len: usize,
+        ) -> Result<Option<Self::Slot<'_>>, srt_proto::Error> {
+            let _ = (peer, wire_len);
+            Err(srt_proto::Error::with_reason(
+                srt_proto::ErrorKind::InvalidData,
+                "test sink refuses every datagram",
+            ))
+        }
+    }
+
+    impl CallerTable {
+        /// Test-only: the first direct session's queued protocol output.
+        fn bench_peek_output_of_first_direct(&self) -> Option<srt_proto::OutputMeta> {
+            self.bench_peek_output(&self.only_direct_id())
+        }
+
+        fn only_direct_id(&self) -> LogicalCallerId {
+            self.sessions
+                .keys()
+                .copied()
+                .next()
+                .expect("a direct caller was admitted")
+        }
+    }
+
+    /// Build a table with one direct caller whose induction datagram is queued,
+    /// for the transactional-sink tests.
+    fn table_with_one_queued_direct_caller() -> (CallerTable, Timestamp) {
+        let mut table = CallerTable::default();
+        let peer: std::net::SocketAddr = "127.0.0.1:9011".parse().unwrap();
+        let mut conn = SrtConnection::new_caller(ConnectionOptions {
+            socket_id: 0x6001,
+            ..Default::default()
+        });
+        let now = Timestamp::from_micros(10_000);
+        conn.connect(now).expect("connect");
+        table
+            .add_direct(CallerLeg {
+                peer,
+                connection: conn,
+            })
+            .expect("admitted");
+        (table, now)
+    }
+
+    /// Invariant 1: an exhausted sink reserves nothing and the protocol output
+    /// stays untouched.
+    #[test]
+    fn exhausted_sink_leaves_protocol_output_pending() {
+        let (mut table, now) = table_with_one_queued_direct_caller();
+        assert!(table.has_pending_output(now), "induction is queued");
+
+        let mut exhausted = TestSink {
+            capacity: 0,
+            packets: Vec::new(),
+        };
+        let report =
+            table.poll_outbound_bounded_to(now, OutputDrainBudget::default(), &mut exhausted);
+        assert!(exhausted.packets.is_empty());
+        assert_eq!(report.sink_outcome, SinkOutcome::Unavailable);
+        assert_eq!(report.packets, 0);
+        assert!(
+            table.has_pending_output(now),
+            "an exhausted sink must leave the protocol datagram pending"
+        );
+    }
+
+    /// Invariant 2: a refusal is typed, precedes materialization, and still
+    /// consumes nothing.
+    #[test]
+    fn refusing_sink_consumes_nothing_and_reports_a_typed_kind() {
+        let (mut table, now) = table_with_one_queued_direct_caller();
+        let pending_before = table.bench_peek_output_of_first_direct();
+
+        let mut refusing = RefusingSink {
+            accepted: Vec::new(),
+        };
+        let report =
+            table.poll_outbound_bounded_to(now, OutputDrainBudget::default(), &mut refusing);
+
+        assert!(
+            refusing.accepted.is_empty(),
+            "a refusing sink must not receive a committed datagram"
+        );
+        assert_eq!(report.sink_outcome, SinkOutcome::Rejected);
+        assert_eq!(report.sink_rejections, 1);
+        assert_eq!(
+            report.sink_error_kind,
+            Some(srt_proto::ErrorKind::InvalidData)
+        );
+        assert_eq!(report.packets, 0);
+        assert_eq!(
+            table.bench_peek_output_of_first_direct(),
+            pending_before,
+            "a refused datagram must still be queued with identical metadata"
+        );
+        assert!(
+            table.has_pending_output(now),
+            "the refused datagram must stay visible to the scheduler"
+        );
+    }
+
+    /// Invariant 3 (and 4): a successful acquisition consumes the datagram
+    /// exactly once, and `commit` -- which has no error path at all -- is what
+    /// transfers ownership.
+    #[test]
+    fn successful_acquisition_consumes_exactly_once() {
+        let (mut table, now) = table_with_one_queued_direct_caller();
+        let mut accepting = TestSink {
+            capacity: 1,
+            packets: Vec::new(),
+        };
+
+        let report =
+            table.poll_outbound_bounded_to(now, OutputDrainBudget::default(), &mut accepting);
+        assert_eq!(report.sink_outcome, SinkOutcome::Accepted);
+        assert_eq!(
+            accepting.packets.len(),
+            1,
+            "exactly one datagram is committed"
+        );
+        assert_eq!(report.packets, 1);
+
+        let again =
+            table.poll_outbound_bounded_to(now, OutputDrainBudget::default(), &mut accepting);
+        assert_eq!(
+            again.packets, 0,
+            "a consumed datagram must not be materialized a second time"
+        );
+        assert_eq!(accepting.packets.len(), 1);
+    }
+
+    /// Transactional-sink invariant 5: the bonded group path obeys the same
+    /// reserve-then-commit ordering, with every leg's physical address.
+    #[test]
+    fn sink_acquisition_is_transactional_for_group_legs() {
+        let mut callers = CallerTable::new();
+        let group_id = srt_proto::handshake::SRTGROUP_MASK | 77;
+        let first_peer: std::net::SocketAddr = "127.0.0.1:9012".parse().unwrap();
+        let second_peer: std::net::SocketAddr = "127.0.0.1:9013".parse().unwrap();
+        let now = Timestamp::from_micros(10_000);
+        let _group = callers
+            .add_group(
+                group_id,
+                srt_proto::GroupMode::Broadcast,
+                [
+                    CallerGroupLeg::new(
+                        1,
+                        1,
+                        first_peer,
+                        caller_connection(ConnectionOptions {
+                            socket_id: 102,
+                            initial_seq: Some(1234),
+                            ..ConnectionOptions::default()
+                        }),
+                    ),
+                    CallerGroupLeg::new(
+                        2,
+                        1,
+                        second_peer,
+                        caller_connection(ConnectionOptions {
+                            socket_id: 103,
+                            initial_seq: Some(1234),
+                            ..ConnectionOptions::default()
+                        }),
+                    ),
+                ],
+            )
+            .expect("group admitted");
+
+        // Exhausted: nothing consumed, both legs still pending.
+        let mut exhausted = TestSink {
+            capacity: 0,
+            packets: Vec::new(),
+        };
+        let report =
+            callers.poll_outbound_bounded_to(now, OutputDrainBudget::default(), &mut exhausted);
+        assert!(exhausted.packets.is_empty());
+        assert_eq!(report.packets, 0);
+        assert!(
+            callers.has_pending_output(now),
+            "group legs must stay pending when the sink is exhausted"
+        );
+
+        // Capacity 1: exactly one leg commits, and only that leg's address.
+        let mut one = TestSink {
+            capacity: 1,
+            packets: Vec::new(),
+        };
+        let report = callers.poll_outbound_bounded_to(now, OutputDrainBudget::default(), &mut one);
+        assert_eq!(one.packets.len(), 1);
+        assert_eq!(report.packets, 1);
+        let committed_peer = one.packets[0].0;
+        assert!(
+            committed_peer == first_peer || committed_peer == second_peer,
+            "a committed group datagram must carry a real leg address, got {committed_peer}"
+        );
+    }
+
+    /// Transactional-sink invariant 4 (explicit): an uncommitted reservation is
+    /// released, and commit itself has no failure path.
+    #[test]
+    fn uncommitted_slot_releases_capacity_and_commit_cannot_fail() {
+        let mut sink = TestSink {
+            capacity: 1,
+            packets: Vec::new(),
+        };
+        let peer: std::net::SocketAddr = "127.0.0.1:9014".parse().unwrap();
+        // Acquire and drop without committing: capacity comes back.
+        drop(sink.acquire(peer, 8).expect("acquire").expect("capacity"));
+        assert!(sink.packets.is_empty(), "nothing is stored without commit");
+        // Commit (which returns `()`) stores exactly the committed bytes.
+        let mut slot = sink.acquire(peer, 8).expect("acquire").expect("capacity");
+        slot.bytes_mut()[..8].copy_from_slice(b"12345678");
+        slot.commit(4);
+        assert_eq!(sink.packets, vec![(peer, b"1234".to_vec())]);
     }
 
     fn prepare_conclusion_with_options(

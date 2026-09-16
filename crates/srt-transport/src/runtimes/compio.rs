@@ -1,6 +1,6 @@
 use crate::{
-    CallerTable, DatagramSink, IngressTelemetry, OutputDrainBudget, OutputDrainReport,
-    OutputDrainStatus, PacedSendOutcome, PeerTable, PushResult, collect_output_work,
+    CallerTable, DatagramSink, DatagramSlot, IngressTelemetry, OutputDrainBudget,
+    OutputDrainReport, OutputDrainStatus, PacedSendOutcome, PeerTable, collect_output_work,
     prepend_outputs,
 };
 use compio::buf::BufResult;
@@ -1213,16 +1213,67 @@ struct OwnerTxSink<'a> {
     tx_engine: &'a mut TxEngine,
 }
 
-impl DatagramSink for OwnerTxSink<'_> {
-    fn push_datagram<F>(
+/// Reserved TX capacity: one `TxPool` slot plus one reserved TX lane.
+///
+/// The reservation happens in [`DatagramSink::acquire`], so by the time the
+/// protocol materializes anything the final-wire slot and the execution lane
+/// are both irrevocably held. `commit` is infallible; dropping the slot
+/// without committing returns both to their pools exactly once.
+struct OwnerTxSlot<'a> {
+    sock: &'a Rc<compio::net::UdpSocket>,
+    tx_pool: &'a mut TxPool,
+    tx_engine: &'a mut TxEngine,
+    lane_idx: usize,
+    peer: SocketAddr,
+    wire_len: usize,
+    buf: Vec<u8>,
+    committed: bool,
+}
+
+impl Drop for OwnerTxSlot<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        // Protocol produced nothing: release capacity, never leak it.
+        self.tx_pool.return_slot(std::mem::take(&mut self.buf));
+        self.tx_engine.release_reserved_lane(self.lane_idx);
+    }
+}
+
+impl DatagramSlot for OwnerTxSlot<'_> {
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.buf[..self.wire_len]
+    }
+
+    fn commit(mut self, len: usize) {
+        self.committed = true;
+        let mut buf = std::mem::take(&mut self.buf);
+        // The wire length decides what goes on the wire; the slot keeps its
+        // capacity so the next use does not reallocate.
+        buf.truncate(len);
+        let meta = InFlightMeta {
+            peer: self.peer,
+            expected_len: len,
+        };
+        self.tx_engine
+            .submit_job(self.lane_idx, self.sock.clone(), buf, self.peer, meta);
+    }
+}
+
+impl<'s> DatagramSink for OwnerTxSink<'s> {
+    type Slot<'a>
+        = OwnerTxSlot<'a>
+    where
+        Self: 'a;
+
+    fn acquire(
         &mut self,
         peer: SocketAddr,
         wire_len: usize,
-        fill: F,
-    ) -> Result<PushResult, srt_proto::Error>
-    where
-        F: FnOnce(&mut [u8]) -> Result<usize, srt_proto::Error>,
-    {
+    ) -> Result<Option<Self::Slot<'_>>, srt_proto::Error> {
+        // Every fallible capacity decision happens here, before the protocol
+        // materializes anything.
         if wire_len > self.tx_pool.slot_size() {
             return Err(srt_proto::Error::with_reason(
                 srt_proto::ErrorKind::InvalidData,
@@ -1240,36 +1291,23 @@ impl DatagramSink for OwnerTxSink<'_> {
             ));
         }
         let Some(lane_idx) = self.tx_engine.reserve_lane() else {
-            return Ok(PushResult::Exhausted);
+            return Ok(None);
         };
         let Some(mut buf) = self.tx_pool.alloc_slot() else {
             self.tx_engine.release_reserved_lane(lane_idx);
-            return Ok(PushResult::Exhausted);
+            return Ok(None);
         };
         buf.resize(wire_len, 0);
-        let len = match fill(&mut buf[..wire_len]) {
-            Ok(len) => len,
-            Err(error) => {
-                self.tx_pool.return_slot(buf);
-                self.tx_engine.release_reserved_lane(lane_idx);
-                return Err(error);
-            }
-        };
-        if len != wire_len {
-            self.tx_pool.return_slot(buf);
-            self.tx_engine.release_reserved_lane(lane_idx);
-            return Err(srt_proto::Error::with_reason(
-                srt_proto::ErrorKind::InvalidData,
-                "owner sink fill must materialize exactly the advertised wire length",
-            ));
-        }
-        let meta = InFlightMeta {
+        Ok(Some(OwnerTxSlot {
+            sock: self.sock,
+            tx_pool: self.tx_pool,
+            tx_engine: self.tx_engine,
+            lane_idx,
             peer,
-            expected_len: len,
-        };
-        self.tx_engine
-            .submit_job(lane_idx, self.sock.clone(), buf, peer, meta);
-        Ok(PushResult::Pushed { len })
+            wire_len,
+            buf,
+            committed: false,
+        }))
     }
 }
 
@@ -1554,7 +1592,7 @@ impl Owner {
     /// Exists so the allocator benchmarks can drive the table directly
     /// without the Owner handing out its side internals; compiled only for
     /// `bench-internals`.
-    #[cfg(feature = "bench-internals")]
+    #[cfg(any(test, feature = "bench-internals"))]
     pub fn bench_caller_table_mut(&mut self) -> Option<&mut CallerTable> {
         Some(self.caller.as_mut()?.pool.bench_table_mut())
     }
@@ -2316,6 +2354,33 @@ impl Owner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Test-only adapter over the reserve-then-commit sink contract, so tests
+    /// keep expressing "offer this datagram and see what happened":
+    /// `Ok(Some(len))` committed, `Ok(None)` no capacity, `Err` refused
+    /// before materialization (protocol output untouched).
+    fn push_test<F>(
+        sink: &mut OwnerTxSink<'_>,
+        peer: SocketAddr,
+        wire_len: usize,
+        fill: F,
+    ) -> Result<Option<usize>, srt_proto::Error>
+    where
+        F: FnOnce(&mut [u8]) -> Result<usize, srt_proto::Error>,
+    {
+        let Some(mut slot) = sink.acquire(peer, wire_len)? else {
+            return Ok(None);
+        };
+        match fill(slot.bytes_mut()) {
+            Ok(len) => {
+                slot.commit(len);
+                Ok(Some(len))
+            }
+            // Refusal/failure before any protocol state was consumed: the
+            // reservation is released by the slot's own drop.
+            Err(error) => Err(error),
+        }
+    }
     use std::future::Future;
     use std::task::{Context, Poll, Waker};
 
@@ -2930,11 +2995,11 @@ mod tests {
                     tx_pool: &mut owner.tx_pool,
                     tx_engine: &mut owner.tx_engine,
                 };
-                let res = sink.push_datagram(l_addr, 10, |buf| {
+                let res = push_test(&mut sink, l_addr, 10, |buf| {
                     buf[..10].copy_from_slice(b"0123456789");
                     Ok(10)
                 });
-                assert!(matches!(res, Ok(PushResult::Pushed { len: 10 })));
+                assert!(matches!(res, Ok(Some(10))));
             }
 
             // Slot allocated: 1 in flight, free count is 15
@@ -3247,7 +3312,7 @@ mod tests {
                     tx_pool: &mut owner.tx_pool,
                     tx_engine: &mut owner.tx_engine,
                 };
-                let _ = sink.push_datagram(peer, 8, |buf| {
+                let _ = push_test(&mut sink, peer, 8, |buf| {
                     buf[..8].copy_from_slice(b"12345678");
                     Ok(8)
                 });
@@ -3395,11 +3460,11 @@ mod tests {
                     tx_pool: &mut owner.tx_pool,
                     tx_engine: &mut owner.tx_engine,
                 };
-                let res = sink.push_datagram(peer, 100, |buf| {
+                let res = push_test(&mut sink, peer, 100, |buf| {
                     buf[..100].fill(0xAA);
                     Ok(100)
                 });
-                assert!(matches!(res, Ok(PushResult::Pushed { len: 100 })));
+                assert!(matches!(res, Ok(Some(100))));
             }
 
             // 2. Ceiling + 1 (101 bytes) must be rejected before send / slot allocation
@@ -3410,7 +3475,7 @@ mod tests {
                     tx_pool: &mut owner.tx_pool,
                     tx_engine: &mut owner.tx_engine,
                 };
-                let res = sink.push_datagram(peer, 101, |buf| {
+                let res = push_test(&mut sink, peer, 101, |buf| {
                     buf[..101].fill(0xBB);
                     Ok(101)
                 });
@@ -3499,7 +3564,7 @@ mod tests {
                     tx_pool: &mut owner.tx_pool,
                     tx_engine: &mut owner.tx_engine,
                 };
-                let res = sink.push_datagram(peer, 20, |_buf| {
+                let res = push_test(&mut sink, peer, 20, |_buf| {
                     Err(srt_proto::Error::with_reason(
                         srt_proto::ErrorKind::InvalidData,
                         "simulated fill failure",
@@ -3514,7 +3579,9 @@ mod tests {
             );
             assert_eq!(owner.tx_in_flight(), 0);
 
-            // 2. Materialization length mismatch: slot and lane must be returned
+            // 2. Refusal BEFORE materialization (wire length over the pool
+            // ceiling): no slot and no lane may be left reserved, and the fill
+            // closure must never run.
             {
                 let caller = owner.caller.as_ref().unwrap();
                 let mut sink = OwnerTxSink {
@@ -3522,15 +3589,21 @@ mod tests {
                     tx_pool: &mut owner.tx_pool,
                     tx_engine: &mut owner.tx_engine,
                 };
-                let res = sink.push_datagram(peer, 20, |_buf| {
-                    Ok(10) // advertised 20, returned 10
+                let mut fill_ran = false;
+                let res = push_test(&mut sink, peer, 5000, |_buf| {
+                    fill_ran = true;
+                    Ok(5000)
                 });
-                assert!(res.is_err());
+                assert!(res.is_err(), "over-ceiling datagram must be refused");
+                assert!(
+                    !fill_ran,
+                    "acquisition refusal must happen before materialization"
+                );
             }
             assert_eq!(
                 owner.tx_pool().free_count(),
                 4,
-                "length mismatch must restore free_count to 4"
+                "acquire refusal must restore free_count to 4"
             );
             assert_eq!(owner.tx_in_flight(), 0);
 
@@ -3542,7 +3615,7 @@ mod tests {
                     tx_pool: &mut owner.tx_pool,
                     tx_engine: &mut owner.tx_engine,
                 };
-                let res = sink.push_datagram(peer, 20, |buf| {
+                let res = push_test(&mut sink, peer, 20, |buf| {
                     buf[..20].fill(0x55);
                     Ok(20)
                 });
@@ -3569,7 +3642,7 @@ mod tests {
                     tx_pool: &mut owner.tx_pool,
                     tx_engine: &mut owner.tx_engine,
                 };
-                let _ = sink.push_datagram(peer, 20, |buf| {
+                let _ = push_test(&mut sink, peer, 20, |buf| {
                     buf[..20].fill(0x66);
                     Ok(20)
                 });
@@ -3588,6 +3661,125 @@ mod tests {
     }
 
     /// P0-2: a short send is a typed Owner fault, and a fault stops new TX.
+    /// Transactional-sink invariant 6: exhausting the Owner's TxPool leaves the
+    /// next protocol datagram pending (not consumed, not lost), and it is
+    /// submitted once capacity comes back.
+    #[test]
+    fn tx_pool_exhaustion_leaves_protocol_datagram_pending() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            let c_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+            let c_sock = compio::net::UdpSocket::from_std(c_std).expect("adopt");
+            let mut owner = Owner::new(1).with_caller(OwnerCallerSide::new_single(c_sock));
+
+            // Two callers, each with its induction datagram queued.
+            let mut ids = Vec::new();
+            for socket_id in [0x7001u32, 0x7002u32] {
+                let mut conn = SrtConnection::new_caller(srt_proto::ConnectionOptions {
+                    socket_id,
+                    ..Default::default()
+                });
+                conn.connect(Timestamp::default())
+                    .expect("caller starts its handshake");
+                let leg = crate::caller::CallerLeg {
+                    peer: "127.0.0.1:19991".parse().expect("addr"),
+                    connection: conn,
+                };
+                ids.push(
+                    owner
+                        .bench_caller_table_mut()
+                        .expect("caller side")
+                        .add_direct(leg)
+                        .expect("admitted"),
+                );
+            }
+
+            let now = Timestamp::from_micros(10_000);
+            let budget = OwnerServiceBudget::default();
+            let report = owner.service(now, budget).await;
+            assert_eq!(
+                report.tx_packets_submitted, 1,
+                "a one-slot pool must submit exactly one datagram"
+            );
+            assert_eq!(owner.tx_pool().free_count(), 0, "pool is exhausted");
+            assert_eq!(owner.tx_in_flight(), 1);
+            assert!(
+                owner.has_pending_work(now),
+                "the second protocol datagram must still be pending, not lost"
+            );
+
+            // Capacity returns: the retained datagram is submitted then.
+            owner
+                .wait_for_activity(std::time::Duration::from_secs(1))
+                .await;
+            assert!(
+                owner.tx_pool().free_count() > 0,
+                "completion returned the slot"
+            );
+            let now = Timestamp::from_micros(20_000);
+            let report = owner.service(now, budget).await;
+            assert_eq!(
+                report.tx_packets_submitted, 1,
+                "the pending datagram must be submitted once capacity returns"
+            );
+            assert!(ids.len() == 2);
+        });
+    }
+
+    /// Transactional-sink invariant 7: a refused acquisition cannot consume the
+    /// protocol output, so the same queued datagram is still there afterwards
+    /// with identical metadata -- no second reservation of its wire length,
+    /// sequence stamp, or key.
+    #[test]
+    fn refused_acquisition_does_not_consume_or_re_reserve() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            let c_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+            let c_sock = compio::net::UdpSocket::from_std(c_std).expect("adopt");
+            // Ceiling far below a handshake datagram: `acquire` refuses before
+            // the protocol is ever asked to materialize.
+            let mut owner =
+                Owner::new_with_ceiling(4, 8).with_caller(OwnerCallerSide::new_single(c_sock));
+            let mut conn = SrtConnection::new_caller(srt_proto::ConnectionOptions {
+                socket_id: 0x7100,
+                ..Default::default()
+            });
+            conn.connect(Timestamp::default())
+                .expect("caller starts its handshake");
+            let id = owner
+                .bench_caller_table_mut()
+                .expect("caller side")
+                .add_direct(crate::caller::CallerLeg {
+                    peer: "127.0.0.1:19990".parse().expect("addr"),
+                    connection: conn,
+                })
+                .expect("admitted");
+
+            let pending_before = owner
+                .bench_caller_table_mut()
+                .expect("caller side")
+                .bench_peek_output(&id);
+            assert!(
+                pending_before.is_some(),
+                "the induction datagram is queued in the protocol"
+            );
+
+            let now = Timestamp::from_micros(10_000);
+            let report = owner.service(now, OwnerServiceBudget::default()).await;
+            assert_eq!(report.tx_packets_submitted, 0, "nothing may be submitted");
+            assert_eq!(owner.tx_in_flight(), 0);
+
+            let pending_after = owner
+                .bench_caller_table_mut()
+                .expect("caller side")
+                .bench_peek_output(&id);
+            assert_eq!(
+                pending_before, pending_after,
+                "a refused acquisition must leave the same queued output, unreserved"
+            );
+        });
+    }
+
     /// P1: lifecycle maintenance is independent of the packet/byte axes. A
     /// visit that grants zero TX packets/bytes must still run bounded
     /// maintenance work, and zero actions must still run none.
@@ -3723,7 +3915,7 @@ mod tests {
                 tx_pool: &mut owner.tx_pool,
                 tx_engine: &mut owner.tx_engine,
             };
-            let res = sink.push_datagram(peer, 20, |buf| {
+            let res = push_test(&mut sink, peer, 20, |buf| {
                 buf[..20].fill(0x11);
                 Ok(20)
             });
@@ -3846,7 +4038,7 @@ mod tests {
                     tx_pool: &mut owner.tx_pool,
                     tx_engine: &mut owner.tx_engine,
                 };
-                let _ = sink.push_datagram(peer, 20, |buf| {
+                let _ = push_test(&mut sink, peer, 20, |buf| {
                     buf[..20].fill(0x77);
                     Ok(20)
                 });
@@ -3869,12 +4061,12 @@ mod tests {
                 tx_pool: &mut owner.tx_pool,
                 tx_engine: &mut owner.tx_engine,
             };
-            let res = sink.push_datagram(peer, 20, |buf| {
+            let res = push_test(&mut sink, peer, 20, |buf| {
                 buf[..20].fill(0x78);
                 Ok(20)
             });
             assert!(
-                matches!(res, Err(_) | Ok(PushResult::Exhausted)),
+                matches!(res, Err(_) | Ok(None)),
                 "post-shutdown submit must fail or exhaust, got {res:?}"
             );
         });

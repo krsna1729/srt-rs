@@ -1,8 +1,8 @@
 use crate::{
-    DatagramSink, DenseDueIndex, DenseSlotArena, DueIndex, GroupConnectionStats,
+    DatagramSink, DatagramSlot, DenseDueIndex, DenseSlotArena, DueIndex, GroupConnectionStats,
     GroupLogicalCounters, InboundGroupStats, IngressTelemetry, ListenerPeerPolicy, MAX_DENSE_SLOTS,
     ManualTimerStore, OutputDrainBudget, OutputDrainReport, OutputDrainStatus, PeerSlotId,
-    PushResult, WorkerMessage, group_connection_stats,
+    SinkOutcome, WorkerMessage, group_connection_stats,
 };
 use srt_proto::{
     Bytes, ConnectionEvent, ConnectionOptions, ConnectionOutput, DisconnectReason, OutputInto,
@@ -885,6 +885,29 @@ impl Default for PeerTable {
     fn default() -> Self {
         Self::with_config(PeerTableConfig::default())
     }
+}
+
+/// Account one committed datagram on the admission side.
+fn record_peer_pushed(report: &mut OutputDrainReport, len: usize) {
+    report.sink_outcome = SinkOutcome::Accepted;
+    report.actions += 1;
+    report.packets += 1;
+    report.bytes = report.bytes.saturating_add(len);
+}
+
+/// Account one sink refusal made BEFORE materialization: the protocol output
+/// stays queued, and the typed reason is carried on the report rather than
+/// being dropped.
+fn record_peer_sink_rejection(report: &mut OutputDrainReport, error: &srt_proto::Error) {
+    report.sink_outcome = SinkOutcome::Rejected;
+    if report.sink_error_kind.is_none() {
+        report.sink_error_kind = Some(error.kind);
+    }
+    report.sink_rejections = report.sink_rejections.saturating_add(1);
+}
+
+fn record_peer_unavailable(report: &mut OutputDrainReport) {
+    report.sink_outcome = SinkOutcome::Unavailable;
 }
 
 impl PeerTable {
@@ -2446,24 +2469,25 @@ impl PeerTable {
                 if exceeds_packets || exceeds_bytes {
                     return Some(true);
                 }
-                match sink.push_datagram(peer_addr, wire_len, |buf| {
+                let mut slot = match sink.acquire(peer_addr, wire_len) {
+                    Ok(Some(slot)) => slot,
+                    Ok(None) => {
+                        record_peer_unavailable(report);
+                        return Some(true);
+                    }
+                    Err(error) => {
+                        record_peer_sink_rejection(report, &error);
+                        return Some(true);
+                    }
+                };
+                {
+                    let buf = slot.bytes_mut();
                     buf[..wire_len].copy_from_slice(bytes);
-                    Ok(wire_len)
-                }) {
-                    Ok(PushResult::Pushed { len }) => {
-                        entry.pending_outputs.pop_front();
-                        report.actions += 1;
-                        report.packets += 1;
-                        report.bytes = report.bytes.saturating_add(len);
-                        Some(false)
-                    }
-                    Ok(PushResult::Exhausted) => Some(true),
-                    Err(e) => {
-                        let _ = e;
-                        entry.pending_outputs.pop_front();
-                        Some(false)
-                    }
                 }
+                slot.commit(wire_len);
+                entry.pending_outputs.pop_front();
+                record_peer_pushed(report, wire_len);
+                Some(false)
             }
             _other => {
                 let out = entry.pending_outputs.pop_front().unwrap();
@@ -2490,26 +2514,32 @@ impl PeerTable {
                 if exceeds_packets || exceeds_bytes {
                     return true;
                 }
-                match sink.push_datagram(peer_addr, wire_len, |buf| {
-                    match entry.conn.poll_output_into(buf)? {
-                        Some(OutputInto::Datagram { len }) => Ok(len),
-                        _ => Err(srt_proto::Error::with_reason(
-                            srt_proto::ErrorKind::InvalidState,
-                            "expected datagram",
-                        )),
+                let mut slot = match sink.acquire(peer_addr, wire_len) {
+                    Ok(Some(slot)) => slot,
+                    Ok(None) => {
+                        record_peer_unavailable(report);
+                        return true;
                     }
-                }) {
-                    Ok(PushResult::Pushed { len }) => {
-                        report.actions += 1;
-                        report.packets += 1;
-                        report.bytes = report.bytes.saturating_add(len);
+                    Err(error) => {
+                        record_peer_sink_rejection(report, &error);
+                        return true;
+                    }
+                };
+                let materialized = {
+                    let buf = slot.bytes_mut();
+                    match entry.conn.poll_output_into(buf) {
+                        Ok(Some(OutputInto::Datagram { len })) => Ok(len),
+                        // Nothing consumed: drop the reservation.
+                        Ok(_) | Err(_) => Err(()),
+                    }
+                };
+                match materialized {
+                    Ok(len) => {
+                        slot.commit(len);
+                        record_peer_pushed(report, len);
                         false
                     }
-                    Ok(PushResult::Exhausted) => true,
-                    Err(e) => {
-                        let _ = e;
-                        false
-                    }
+                    Err(()) => false,
                 }
             }
             OutputMeta::SetTimer { .. } | OutputMeta::ClearTimer { .. } => {
@@ -2666,24 +2696,25 @@ impl PeerTable {
                 if exceeds_packets || exceeds_bytes {
                     return Some(true);
                 }
-                match sink.push_datagram(peer_addr, wire_len, |buf| {
+                let mut slot = match sink.acquire(peer_addr, wire_len) {
+                    Ok(Some(slot)) => slot,
+                    Ok(None) => {
+                        record_peer_unavailable(report);
+                        return Some(true);
+                    }
+                    Err(error) => {
+                        record_peer_sink_rejection(report, &error);
+                        return Some(true);
+                    }
+                };
+                {
+                    let buf = slot.bytes_mut();
                     buf[..wire_len].copy_from_slice(bytes);
-                    Ok(wire_len)
-                }) {
-                    Ok(PushResult::Pushed { len }) => {
-                        leg.pending_outputs.pop_front();
-                        report.actions += 1;
-                        report.packets += 1;
-                        report.bytes = report.bytes.saturating_add(len);
-                        Some(false)
-                    }
-                    Ok(PushResult::Exhausted) => Some(true),
-                    Err(e) => {
-                        let _ = e;
-                        leg.pending_outputs.pop_front();
-                        Some(false)
-                    }
                 }
+                slot.commit(wire_len);
+                leg.pending_outputs.pop_front();
+                record_peer_pushed(report, wire_len);
+                Some(false)
             }
             _other => {
                 let out = leg.pending_outputs.pop_front().unwrap();
@@ -2710,26 +2741,31 @@ impl PeerTable {
                 if exceeds_packets || exceeds_bytes {
                     return true;
                 }
-                match sink.push_datagram(leg.physical.address, wire_len, |buf| {
-                    match connection.poll_output_into(buf)? {
-                        Some(OutputInto::Datagram { len }) => Ok(len),
-                        _ => Err(srt_proto::Error::with_reason(
-                            srt_proto::ErrorKind::InvalidState,
-                            "expected datagram",
-                        )),
+                let mut slot = match sink.acquire(leg.physical.address, wire_len) {
+                    Ok(Some(slot)) => slot,
+                    Ok(None) => {
+                        record_peer_unavailable(report);
+                        return true;
                     }
-                }) {
-                    Ok(PushResult::Pushed { len }) => {
-                        report.actions += 1;
-                        report.packets += 1;
-                        report.bytes = report.bytes.saturating_add(len);
+                    Err(error) => {
+                        record_peer_sink_rejection(report, &error);
+                        return true;
+                    }
+                };
+                let materialized = {
+                    let buf = slot.bytes_mut();
+                    match connection.poll_output_into(buf) {
+                        Ok(Some(OutputInto::Datagram { len })) => Ok(len),
+                        Ok(_) | Err(_) => Err(()),
+                    }
+                };
+                match materialized {
+                    Ok(len) => {
+                        slot.commit(len);
+                        record_peer_pushed(report, len);
                         false
                     }
-                    Ok(PushResult::Exhausted) => true,
-                    Err(e) => {
-                        let _ = e;
-                        false
-                    }
+                    Err(()) => false,
                 }
             }
             OutputMeta::SetTimer { .. } | OutputMeta::ClearTimer { .. } => {
