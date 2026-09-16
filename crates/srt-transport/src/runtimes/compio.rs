@@ -899,6 +899,41 @@ impl SideRx {
         })
     }
 
+    /// Stop the managed RX task and release everything it owns.
+    ///
+    /// Cancelling the task *and awaiting the cancellation* is what unwinds the
+    /// armed managed receive inside the runtime. Merely dropping the
+    /// `JoinHandle` cancels it without running that unwinding to completion,
+    /// which leaves the provided-buffer leases outstanding: on a kernel that
+    /// can register a ring, the runtime's pool then reports exactly
+    /// `rx_ring_entries x rx_buffer_len` bytes leaked at teardown (measured:
+    /// 256 x 2048 B = 512 KiB, `docs/results/managed-rx-verification.md`).
+    ///
+    /// Returns `false` if the task did not stop within `timeout`.
+    async fn stop_and_join(&mut self, timeout: std::time::Duration) -> bool {
+        let Some(ring) = self.ring.as_ref().cloned() else {
+            return true;
+        };
+        {
+            let mut ring = ring.borrow_mut();
+            ring.shutdown = true;
+            if let Some(waker) = ring.waker.take() {
+                waker.wake();
+            }
+        }
+        // Whatever this side still holds must go back to the pool too.
+        self.staged = None;
+        let handle = ring.borrow_mut().task.take();
+        let stopped = match handle {
+            Some(handle) => compio::time::timeout(timeout, handle.cancel())
+                .await
+                .is_ok(),
+            None => true,
+        };
+        ring.borrow_mut().completions.clear();
+        stopped
+    }
+
     fn stats(&self) -> ManagedRxStats {
         let (depth, dropped, truncated) = self.ring.as_ref().map_or((0, 0, 0), |ring| {
             let ring = ring.borrow();
@@ -2026,6 +2061,14 @@ impl Owner {
     /// not complete.
     pub async fn shutdown_and_drain(&mut self, timeout: std::time::Duration) -> bool {
         self.tx_engine.begin_shutdown();
+        // Stop receive intake first, so no new datagram arrives while TX
+        // drains, and release the managed consumer's pooled leases.
+        if let Some(listener) = self.listener.as_mut() {
+            listener.rx.stop_and_join(timeout).await;
+        }
+        if let Some(caller) = self.caller.as_mut() {
+            caller.rx.stop_and_join(timeout).await;
+        }
         let deadline = std::time::Instant::now() + timeout;
         let (tx_pool, completions, tx_engine) = (
             &mut self.tx_pool,
@@ -4762,6 +4805,13 @@ mod tests {
             );
             assert_eq!(owner.tx_in_flight(), 0);
             assert_eq!(owner.tx_pool().free_count(), owner.tx_pool().capacity());
+            // The managed consumer must be gone and its ring emptied. Anything
+            // still held here is a leaked provided-buffer lease: this assertion
+            // is what caught the 256 x 2048 B pool leak that dropping the
+            // task's JoinHandle (cancel without awaiting) left behind.
+            let stats = owner.rx_stats().expect("rx stats");
+            assert_eq!(stats.depth, 0, "no completion may outlive shutdown");
+            assert!(!stats.staged, "no staged lease may outlive shutdown");
         });
     }
 

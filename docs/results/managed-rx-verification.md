@@ -75,6 +75,48 @@ MANAGEDRX_SHUTDOWN drained=true in_flight=0 pool_free=64 pool_capacity=64
 GUEST_DONE
 ```
 
+## Leak found and fixed by this run
+
+Running the committed test under ASan+LSan *inside the capable guest* (the
+same configuration as the repository's Address-sanitizer CI job) reported:
+
+```text
+==88==ERROR: LeakSanitizer: detected memory leaks
+Indirect leak of 524288 byte(s) in 256 object(s) allocated from: ...
+SUMMARY: AddressSanitizer: 607620 byte(s) leaked in 278 allocation(s).
+```
+
+524,288 bytes in 256 objects is exactly the provided-buffer pool
+(256 slots x 2048 B). An isolated probe established the ownership boundary:
+
+```text
+GUEST_READY kernel=7.0.0-31-generic
+PROBE buffer_pool_ok=true
+PROBE runtime_dropped
+PROBE_EXIT=0
+```
+
+i.e. Compio frees its pool correctly when nothing is armed. The leak was ours:
+teardown cancelled the managed RX task by dropping its `JoinHandle`, which
+cancels without running the unwinding to completion, leaving the armed managed
+receive's leases outstanding inside the runtime.
+
+Fix: `shutdown_and_drain` now stops receive intake first
+(`SideRx::stop_and_join`) — set `shutdown`, wake, **await** the task
+cancellation, drop any staged completion, clear the ring — before it drains TX.
+Re-running the same ASan build in the same guest:
+
+```text
+GUEST_READY kernel=7.0.0-31-generic
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 346 filtered out; finished in 0.61s
+GUEST_MANAGED_EXIT=0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 346 filtered out; finished in 0.22s
+GUEST_FAULT_EXIT=0
+```
+
+No leak. This is why the managed-buffer contract is "return to zero after
+drain/shutdown": cancelling without awaiting is not enough.
+
 ## What this establishes
 
 - **The production Owner selects and requires the managed datapath when the
