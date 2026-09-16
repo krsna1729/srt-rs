@@ -797,11 +797,16 @@ struct InboundGroupLeg {
 }
 
 /// Where the retirement token for one quarantined peer/leg lives.
+///
+/// The direct variant carries an arena `PeerSlotId` (slot index AND
+/// generation), not a bare slot index: the arena is generational and reuses
+/// retired slots, so a raw index would let a stale key resolve against whatever
+/// peer occupies the slot later.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum PeerFailureKey {
-    /// Direct peer occupying this arena slot.
-    Direct(usize),
-    /// One bonded group member.
+    /// Direct peer occupying this arena slot generation.
+    Direct(PeerSlotId),
+    /// One bonded group member, with the group's generation too.
     Group { key: GroupReadyKey, member: u32 },
 }
 
@@ -2480,14 +2485,23 @@ impl PeerTable {
                 break;
             };
             let record = match key {
-                PeerFailureKey::Direct(slot_idx) => self
-                    .slots
-                    .get_by_slot_mut(slot_idx)
-                    .and_then(|slot| slot.value.direct_mut())
-                    .and_then(|entry| entry.output_failure.take()),
+                // A stale generation means the peer that faulted was retired:
+                // its record went with it and this key must not read the
+                // successor that reused the slot.
+                PeerFailureKey::Direct(slot_id)
+                    if self.slots.slot_generation(slot_id.slot_idx as usize)
+                        == slot_id.generation =>
+                {
+                    self.slots
+                        .get_by_slot_mut(slot_id.slot_idx as usize)
+                        .and_then(|slot| slot.value.direct_mut())
+                        .and_then(|entry| entry.output_failure.take())
+                }
+                PeerFailureKey::Direct(_) => None,
                 PeerFailureKey::Group { key, member } => self
                     .groups
                     .get_mut(&key.key)
+                    .filter(|group| group.generation == key.generation)
                     .and_then(|group| group.legs.get_mut(&member))
                     .and_then(|leg| leg.output_failure.take()),
             };
@@ -2634,7 +2648,7 @@ impl PeerTable {
                     "quarantine always has its attributed record"
                 );
                 self.protocol_failure_index
-                    .push_back(PeerFailureKey::Direct(slot_idx));
+                    .push_back(PeerFailureKey::Direct(slot_id));
                 false
             }
         };
@@ -3447,6 +3461,13 @@ impl PeerTable {
 
     fn remove_direct(&mut self, peer: PhysicalPeerKey) -> Option<AdmissionPeer> {
         let slot_idx = self.slot_index_for_key(&peer)?;
+        // A retired peer takes its undrained failure record with it, so the
+        // index entry must go too: otherwise churn (fault, retire, repeat)
+        // accumulates keys for peers that no longer exist.
+        self.protocol_failure_index.retain(|key| match key {
+            PeerFailureKey::Direct(slot_id) => slot_id.slot_idx as usize != slot_idx,
+            PeerFailureKey::Group { .. } => true,
+        });
         self.purge_physical_indexes(peer);
         let slot = self.slots.remove_by_slot(slot_idx)?;
         let entry = match slot.value {
@@ -3466,6 +3487,12 @@ impl PeerTable {
     }
 
     fn remove_group(&mut self, key: srt_lifecycle::LogicalGroupKey) -> Option<RemovedLogicalPeer> {
+        // Purge this group's index entries with the group itself; see
+        // `remove_direct`.
+        self.protocol_failure_index.retain(|entry| match entry {
+            PeerFailureKey::Group { key: ready, .. } => ready.key != key,
+            PeerFailureKey::Direct(_) => true,
+        });
         let mut group = self.groups.remove(&key)?;
         self.logical_peers.remove(&group.logical_peer);
         let mut removed = Vec::with_capacity(group.legs.len());
@@ -4949,6 +4976,102 @@ mod tests {
         let mut again = Vec::new();
         table.poll_output_failures(PEERS * 2, &mut again);
         assert!(again.is_empty());
+    }
+
+    /// Peer-side lifecycle boundedness: retire a quarantined direct peer
+    /// WITHOUT draining its record, then let the arena reuse the slot for a
+    /// fresh peer and fault that one too.
+    ///
+    /// The index key is generation-safe, so the successor's own record is what
+    /// comes out, and the retired peer's key is purged rather than left to
+    /// alias the slot it no longer owns.
+    #[test]
+    fn peer_failure_index_is_purged_on_retirement_and_survives_slot_reuse() {
+        let options = AdmissionOptions::basic(0x9300, 20, false);
+        let telemetry = IngressTelemetry::new();
+        let mut table = PeerTable::new();
+        let peer_a: std::net::SocketAddr = "127.0.0.1:23001".parse().expect("address");
+        let peer_b: std::net::SocketAddr = "127.0.0.1:23002".parse().expect("address");
+        let now = Timestamp::from_micros(3_000_000);
+        let budget = OutputDrainBudget::new(64, 64, 1 << 20);
+
+        let first =
+            established_peer_with_queued_output(&mut table, peer_a, 0x9301, &options, &telemetry);
+        let mut short = ShortPeerSink {
+            committed: Vec::new(),
+            attributions: Vec::new(),
+            short_by: 8,
+            failing: None,
+        };
+        let _ = table.poll_outbound_bounded_to(now, budget, &mut short);
+        assert_eq!(table.output_failures_pending(), 1);
+
+        // Retire WITHOUT draining, then reuse the arena slot for a new peer.
+        let physical_a = table.physical_for_address(peer_a).expect("physical peer");
+        table.remove_physical(physical_a).expect("retired");
+        assert_eq!(
+            table.output_failures_pending(),
+            0,
+            "a retired peer's index entry is purged"
+        );
+
+        let second =
+            established_peer_with_queued_output(&mut table, peer_b, 0x9302, &options, &telemetry);
+        let mut short = ShortPeerSink {
+            committed: Vec::new(),
+            attributions: Vec::new(),
+            short_by: 8,
+            failing: None,
+        };
+        let _ = table.poll_outbound_bounded_to(now, budget, &mut short);
+
+        let mut failures = Vec::new();
+        table.poll_output_failures(64, &mut failures);
+        assert_eq!(failures.len(), 1, "exactly the new peer's record");
+        assert_eq!(
+            failures[0].attribution.peer_id(),
+            Some(second),
+            "the record belongs to the peer that faulted, not to a stale slot"
+        );
+        assert_ne!(first, second, "distinct logical peers");
+        assert_eq!(table.output_failures_pending(), 0);
+    }
+
+    /// Repeated fault/retire churn must not grow the index without bound.
+    #[test]
+    fn peer_failure_index_never_exceeds_the_live_quarantined_population() {
+        let options = AdmissionOptions::basic(0x9400, 20, false);
+        let telemetry = IngressTelemetry::new();
+        let mut table = PeerTable::new();
+        let now = Timestamp::from_micros(3_000_000);
+        let budget = OutputDrainBudget::new(64, 64, 1 << 20);
+        for round in 0..32u32 {
+            let peer: std::net::SocketAddr = format!("127.0.0.1:{}", 25_000 + round)
+                .parse()
+                .expect("address");
+            established_peer_with_queued_output(
+                &mut table,
+                peer,
+                0x9500 + round,
+                &options,
+                &telemetry,
+            );
+            let mut short = ShortPeerSink {
+                committed: Vec::new(),
+                attributions: Vec::new(),
+                short_by: 8,
+                failing: None,
+            };
+            let _ = table.poll_outbound_bounded_to(now, budget, &mut short);
+            assert_eq!(
+                table.output_failures_pending(),
+                1,
+                "round {round}: one live quarantined peer"
+            );
+            let physical = table.physical_for_address(peer).expect("physical peer");
+            table.remove_physical(physical).expect("retired");
+            assert_eq!(table.output_failures_pending(), 0, "round {round}: purged");
+        }
     }
 
     #[test]

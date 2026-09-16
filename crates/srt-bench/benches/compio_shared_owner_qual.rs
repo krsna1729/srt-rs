@@ -31,10 +31,16 @@
 //!   destination has reached `Connected`, or a connect deadline expires. A
 //!   partial establishment is reported as such and the run is not a
 //!   capacity result.
-//! * **Open-loop source.** The source clock advances independently of
-//!   service capacity at the 8 Mbps / 1316-byte cadence; a destination that
-//!   cannot accept a tick loses that copy and it is counted as
-//!   `not_accepted`, never queued in an unbounded harness backlog.
+//! * **Wall-clock-anchored source with explicit missed-deadline accounting.**
+//!   The source schedule is anchored to one wall-clock epoch and advances by
+//!   whole intervals, and protocol time is `srt_epoch + wall_elapsed`, so a
+//!   slow `service()` cannot shift either clock. It is NOT a fully independent
+//!   producer: it runs in the same loop as `owner.service()`, so a service
+//!   overrun prevents ticks from being produced at all -- those intervals are
+//!   counted in `missed_source_ticks` and the window close asserts
+//!   `expected == generated + missed`. A destination that cannot accept a tick
+//!   loses that copy instead of queueing it. A separately paced producer is the
+//!   stronger design for a later target-hardware qualification.
 //! * **TX-enabled drain.** After the window the Owner keeps servicing with
 //!   TX enabled until protocol output and in-flight sends reach zero, so the
 //!   final `pending_after_drain` is a real equilibrium check.
@@ -391,8 +397,29 @@ async fn run_sender(
             // Do not idle the Owner past its own receive work.
             owner.wait_for_activity(Duration::from_micros(0)).await;
         }
+        // Window close: reconcile the source accounting.
+        //
+        // The incremental counter above records intervals the generator saw
+        // itself skip mid-window (diagnostics); the authoritative figure is
+        // derived here, so the final boundary cannot be lost to the loop
+        // exiting exactly on the deadline. The identity is asserted, not merely
+        // documented:
+        //
+        //     expected == generated + missed
         let window_elapsed = deadline.saturating_duration_since(epoch);
         report.expected_ticks = (window_elapsed.as_micros() / PACKET_INTERVAL_US as u128) as u64;
+        report.missed_source_ticks = report
+            .missed_source_ticks
+            .max(report.expected_ticks.saturating_sub(report.generated_ticks));
+        assert_eq!(
+            report.expected_ticks,
+            report.generated_ticks + report.missed_source_ticks,
+            "source accounting must reconcile: expected == generated + missed"
+        );
+        assert!(
+            report.generated_ticks > 0,
+            "a zero-tick window is not a measurement"
+        );
         report.cpu_ms = process_cpu_ms() - cpu_start;
         // Sampled at the END OF THE WINDOW, before any post-window drain: this
         // is what the shard had outstanding when the measurement stopped.

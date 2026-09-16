@@ -1751,6 +1751,12 @@ impl CallerTable {
     /// Applications normally call [`LogicalCallerMut::disconnect`] first,
     /// then call this after their own close-drain deadline.
     pub fn remove(&mut self, id: LogicalCallerId) -> Option<RemovedLogicalCaller> {
+        // A retired session takes its undrained failure record with it, so the
+        // index entry must go too: without this, churn (fault, retire, repeat)
+        // accumulates keys for sessions that no longer exist and the index is
+        // no longer bounded by the quarantined population.
+        self.protocol_failure_index
+            .retain(|(index_id, _)| *index_id != id);
         let session = self.sessions.remove(&id)?;
         self.routes.retain(|_, route| match route {
             CallerRoute::Direct(caller) => *caller != id,
@@ -2980,6 +2986,102 @@ mod tests {
             !good.packets.is_empty(),
             "a healthy leg still drains while many legs are quarantined"
         );
+    }
+
+    /// Lifecycle boundedness: retiring a faulted session without draining its
+    /// record must not leave its index entry behind.
+    ///
+    /// Without the purge, `fault -> remove -> repeat` grows the index with keys
+    /// for sessions that no longer exist, so `output_failures_pending()` would
+    /// stop being bounded by the quarantined population.
+    #[test]
+    fn retiring_a_quarantined_session_purges_its_failure_index() {
+        let mut table = CallerTable::new();
+        let now = Timestamp::from_micros(10_000);
+        let budget = OutputDrainBudget::new(64, 64, 1 << 20);
+        for round in 0..64u32 {
+            let peer: std::net::SocketAddr = format!("127.0.0.1:{}", 22_000 + round)
+                .parse()
+                .expect("address");
+            let id = table
+                .add_direct(CallerLeg {
+                    peer,
+                    connection: caller_connection(ConnectionOptions {
+                        socket_id: 0x30_000 + round,
+                        ..ConnectionOptions::default()
+                    }),
+                })
+                .expect("admitted");
+            let mut short = ShortBufferSink {
+                acquisitions: 0,
+                committed: Vec::new(),
+                last_attribution: None,
+                short_by: 8,
+            };
+            let _ = table.poll_outbound_bounded_to(now, budget, &mut short);
+            assert_eq!(
+                table.output_failures_pending(),
+                1,
+                "round {round}: quarantined"
+            );
+            // Retire WITHOUT draining the record.
+            table.remove(id).expect("retired");
+            assert_eq!(
+                table.output_failures_pending(),
+                0,
+                "round {round}: the retired session's index entry must be purged"
+            );
+        }
+        // And a drain finds nothing left over from the churn.
+        let mut failures = Vec::new();
+        table.poll_output_failures(1024, &mut failures);
+        assert!(failures.is_empty(), "no records survive their sessions");
+    }
+
+    /// The index must never exceed the number of live quarantined legs, even
+    /// across repeated fault/retire churn with several sessions at once.
+    #[test]
+    fn failure_index_never_exceeds_the_live_quarantined_population() {
+        let mut table = CallerTable::new();
+        let now = Timestamp::from_micros(10_000);
+        let budget = OutputDrainBudget::new(64, 64, 1 << 20);
+        const LIVE: u32 = 8;
+        for round in 0..32u32 {
+            let mut ids = Vec::new();
+            for slot in 0..LIVE {
+                let seq = round * LIVE + slot;
+                let peer: std::net::SocketAddr = format!("127.0.0.1:{}", 24_000 + seq)
+                    .parse()
+                    .expect("address");
+                ids.push(
+                    table
+                        .add_direct(CallerLeg {
+                            peer,
+                            connection: caller_connection(ConnectionOptions {
+                                socket_id: 0x40_000 + seq,
+                                ..ConnectionOptions::default()
+                            }),
+                        })
+                        .expect("admitted"),
+                );
+            }
+            let mut short = ShortBufferSink {
+                acquisitions: 0,
+                committed: Vec::new(),
+                last_attribution: None,
+                short_by: 8,
+            };
+            let _ = table.poll_outbound_bounded_to(now, budget, &mut short);
+            assert_eq!(
+                table.output_failures_pending(),
+                LIVE as usize,
+                "round {round}: at most one entry per live quarantined leg"
+            );
+            for id in ids {
+                table.remove(id).expect("retired");
+            }
+            assert_eq!(table.output_failures_pending(), 0, "round {round}: purged");
+        }
     }
 
     /// A sink that refuses every datagram in `acquire`, so a test can prove

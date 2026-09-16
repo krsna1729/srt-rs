@@ -24,14 +24,16 @@ in `refused`). Rows are only comparable at the same K and H.
 
 ## Method
 
-- **Wall-clock-anchored open-loop source.** Source deadlines are
-  `epoch + n x interval`, and the SRT `Timestamp` handed to the protocol is
-  `srt_epoch + wall_elapsed`. An overrunning service visit therefore cannot
-  slow the source down, nor can protocol time drift from wall time — which is
-  exactly when it would drift furthest. Every source interval in the window is
-  either a generated tick or an explicitly counted `missed_source_ticks`, so
-  the identity `expected_ticks == generated_ticks + missed_source_ticks` holds
-  and a service-coupled shortfall can never look like a lower offered rate.
+- **Wall-clock-anchored source with explicit missed-deadline accounting.**
+  Source deadlines are `epoch + n x interval`, and the SRT `Timestamp` handed
+  to the protocol is `srt_epoch + wall_elapsed`, so an overrunning service
+  visit cannot shift either clock. **This is not a fully independent producer**:
+  it runs in the same loop as `owner.service()`, so a service overrun prevents
+  ticks from being produced at all — those intervals are counted in
+  `missed_source_ticks`, and the window close reconciles and **asserts**
+  `expected == generated + missed` rather than merely documenting it. A
+  separately paced producer is the stronger design for a target-hardware
+  qualification run.
 - **A destination that refuses a tick loses that copy** (counted in
   `data_accepted` vs `data_offered`), never queued in a harness backlog.
 - **Establishment barrier, then a pre-measurement equilibrium drain**
@@ -50,18 +52,18 @@ in `refused`). Rows are only comparable at the same K and H.
 ## Canonical rows (K = 256, H = 64, one sender process)
 
 Committed evidence for this exact table, with host/kernel/config provenance:
-[`qual-shared-owner-fixed-kh-4db7f0d.json`](qual-shared-owner-fixed-kh-4db7f0d.json)
-(SHA `4db7f0d`, kernel `6.8.0-139-generic`, 6 CPUs).
+[`qual-shared-owner-fixed-kh-c65be16.json`](qual-shared-owner-fixed-kh-c65be16.json)
+(SHA `c65be16`, kernel `6.8.0-139-generic`, 6 CPUs); it carries every field the harness prints, plus the verbatim stdout line of sender and receiver for each run.
 
 | F | established | pre-window drained | expected / generated / missed ticks | data offered = accepted | wire submitted (window) | missed ticks % | lateness p50 / p99 / max (µs) | drain | in-flight at window end | receiver DATA | receiver lost `sec_a` |
 |---:|---:|---|---|---:|---:|---:|---|---|---:|---:|---:|
-| 1 | 1/1 | yes | 2279 / 2265 / 13 | 2,265 | 2,842 | 0.6 % | 93 / 847 / 4,273 | ok | 1 | 2,265 | 0 |
-| 10 | 10/10 | yes | 2279 / 2274 / 5 | 22,740 | 28,440 | 0.2 % | 125 / 689 / 3,861 | ok | 10 | 22,740 | 0 |
-| 100 | 100/100 | yes | 2279 / 2233 / 46 | 223,300 | 234,279 | 2.0 % | 450 / 2,476 / 13,132 | ok | 256 | 223,300 | 0 |
-| 150 | 150/150 | yes | 2279 / 2269 / 10 | 340,350 | 226,016 | 0.4 % | 520 / 1,759 / 4,196 | ok | 256 | 340,350 | 0 |
-| 200 | 200/200 | yes | 2279 / 2267 / 12 | 453,400 | 197,005 | 0.5 % | 646 / 2,037 / 3,676 | ok | 256 | 453,400 | 0 |
-| 600 | **600/600** | no | 2279 / 2199 / 80 | 1,319,400 = 1,319,400 | 80,290 | 3.5 % | 1,180 / 4,641 / 17,040 | **not reached** | 256 | 561,548 | 73 |
-| 1000 | **1000/1000** | no | 2279 / 1871 / 408 | 1,871,000 = 1,871,000 | 12,162 | 17.9 % | 2,172 / 6,156 / 35,591 | **not reached** | 256 | 566,150 | 566 |
+| 1 | 1/1 | yes | 2279 / 2279 / 0 | 2,279 | 2,859 | 0.0 % | 81 / 284 / 1058 | ok | 1 | 2,279 | 0 |
+| 10 | 10/10 | yes | 2279 / 2279 / 0 | 22,790 | 28,510 | 0.0 % | 109 / 556 / 1629 | ok | 10 | 22,790 | 0 |
+| 100 | 100/100 | yes | 2279 / 2278 / 1 | 227,800 | 271,834 | 0.0 % | 367 / 1077 / 3011 | ok | 235 | 227,800 | 0 |
+| 150 | 150/150 | yes | 2279 / 2272 / 7 | 340,800 | 226,029 | 0.3 % | 532 / 1680 / 4811 | ok | 256 | 340,800 | 0 |
+| 200 | 200/200 | yes | 2279 / 2279 / 0 | 455,800 | 224,936 | 0.0 % | 577 / 1368 / 2332 | ok | 256 | 455,800 | 0 |
+| 600 | 600/600 | no | 2279 / 2197 / 82 | 1,318,200 | 88,764 | 3.6 % | 1150 / 4763 / 15312 | **not reached** | 256 | 611,474 | 0 |
+| 1000 | 1000/1000 | no | 2279 / 1882 / 397 | 1,882,000 | 15,996 | 17.4 % | 2079 / 6362 / 22429 | **not reached** | 256 | 595,798 | 0 |
 
 `short = 0`, `failed = 0`, `peer_local = 0`, `transient = 0`, `tx_failures_pending = 0`,
 `rx_dropped = 0`, `rx_truncated = 0` on every row. Raw harness stdout for the
@@ -78,7 +80,13 @@ What this establishes, and what it does not:
 - **Delivery reconciles exactly through F=200**: every row reaches a drained
   equilibrium (`drain_ok`, `pending_after_drain = 0`) with the receiver
   reporting exactly `data_offered` DATA packets and zero loss (`sec_a = 0`),
-  and p99 source lateness ≤ 2.5 ms.
+  and p99 source lateness ≤ 1.7 ms.
+- **That is a reconciliation statement, not a sustained-capacity statement.**
+  F=150 and F=200 reach zero outstanding only after a post-window drain phase
+  much larger than their window traffic (219,564 and 525,582 wire datagrams
+  drained against 226,029 and 224,936 submitted inside the window). Read as:
+  "nothing is lost once the source stops, and the shard drains what it
+  buffered", not "F=200 is sustainable at 8 Mbps per destination".
 - **F=600 and F=1000 are OVERLOAD rows, not capacity results.** The shard
   saturates: the source itself starts missing intervals (3.5 % at 600, 17.9 %
   at 1000 — the honest measure of "one core cannot carry F x 8 Mbps" on this
