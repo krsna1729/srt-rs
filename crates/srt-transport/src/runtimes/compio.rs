@@ -4661,6 +4661,110 @@ mod tests {
         });
     }
 
+    /// End-to-end managed multishot RX on a kernel whose provided-buffer ring
+    /// registers: a legal datagram is delivered through the managed ring, and a
+    /// datagram larger than the ring slot is detected via `MSG_TRUNC`, counted,
+    /// and never handed to `srt-proto`.
+    ///
+    /// Self-skipping: on a host whose kernel rejects
+    /// `IORING_REGISTER_PBUF_RING` (this repository's own development host does)
+    /// the substrate is absent, `ManagedRequired` correctly refuses to attach,
+    /// and there is nothing to exercise. The run that proves it on a qualified
+    /// kernel is recorded in `docs/results/managed-rx-verification.md`.
+    #[test]
+    fn managed_multishot_delivers_and_counts_truncated_datagrams() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        let capable = runtime.block_on(async {
+            runtime.driver_type().is_iouring() && runtime.buffer_pool().is_ok()
+        });
+        if !capable {
+            return;
+        }
+        let cfg = ProductionRuntimeConfig::for_owner(64, 1500);
+        assert_eq!(cfg.rx_buffer_len, 2048, "slots follow the wire ceiling");
+        let built = production_runtime_builder(cfg)
+            .expect("production runtime builder")
+            .build()
+            .expect("production runtime builds");
+
+        built.block_on(async {
+            let l_cfg = crate::ListenerConfig::builder("127.0.0.1:0".parse().unwrap())
+                .topology(crate::ListenerTopology::PerPort)
+                .configure_transport(|t| t.promotion = crate::PromotionPolicy::Never)
+                .build()
+                .expect("listener config");
+            let mut owner = Owner::new(64);
+            owner.set_rx_mode_policy(RxModePolicy::ManagedRequired);
+            owner
+                .listen(&l_cfg)
+                .expect("a capable kernel must attach managed multishot");
+            assert_eq!(owner.rx_mode(), Some(OwnerRxMode::ManagedMultishot));
+            let local = owner.listener_local_addr().expect("listener addr");
+
+            let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("sender bind");
+            sender
+                .send_to(&[0x11u8; 64], local)
+                .expect("send legal datagram");
+            let mut now = Timestamp::from_micros(10_000);
+            let mut delivered = 0;
+            for _ in 0..400 {
+                now = Timestamp::from_micros(now.as_micros() + 1_000);
+                delivered += owner
+                    .service(now, OwnerServiceBudget::default())
+                    .await
+                    .rx_packets;
+                if delivered > 0 {
+                    break;
+                }
+                owner
+                    .wait_for_activity(std::time::Duration::from_millis(2))
+                    .await;
+            }
+            assert_eq!(
+                delivered, 1,
+                "a legal datagram must be delivered through the managed ring"
+            );
+
+            // Beyond the wire ceiling AND the ring slot: MUST be truncated.
+            sender
+                .send_to(&[0x22u8; 4096], local)
+                .expect("send oversized datagram");
+            let mut truncated = owner.rx_stats().map_or(0, |stats| stats.truncated);
+            let baseline = truncated;
+            for _ in 0..400 {
+                now = Timestamp::from_micros(now.as_micros() + 1_000);
+                let _ = owner.service(now, OwnerServiceBudget::default()).await;
+                truncated = owner.rx_stats().map_or(0, |stats| stats.truncated);
+                if truncated > baseline {
+                    break;
+                }
+                owner
+                    .wait_for_activity(std::time::Duration::from_millis(2))
+                    .await;
+            }
+            assert!(
+                truncated > baseline,
+                "an oversized datagram must be counted as truncated, not parsed"
+            );
+            assert!(
+                owner.fault().is_none(),
+                "a truncated datagram is bounded loss, not a fault"
+            );
+            let stats = owner.rx_stats().expect("rx stats");
+            assert_eq!(stats.mode, OwnerRxMode::ManagedMultishot);
+            assert_eq!(stats.capacity, MANAGED_RX_RING_DEPTH);
+
+            assert!(
+                owner
+                    .shutdown_and_drain(std::time::Duration::from_secs(5))
+                    .await,
+                "shutdown must reach quiescence with a managed consumer attached"
+            );
+            assert_eq!(owner.tx_in_flight(), 0);
+            assert_eq!(owner.tx_pool().free_count(), owner.tx_pool().capacity());
+        });
+    }
+
     /// Fail-closed attach: under `ManagedRequired` an Owner refuses to attach
     /// on a runtime whose provided-buffer ring cannot register, while
     /// `ManagedPreferred` selects the raw reader and says so. Portable: the
