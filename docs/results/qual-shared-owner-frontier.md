@@ -60,11 +60,46 @@ receiver process's own `STATS`.
 
 ## Canonical fixed-K / fixed-H run (K = 256, H = 64)
 
-These are the post-closure-pass rows: one **sender process** with fixed
-`--tx-lanes 256 --connect-cc 64`, so K and H no longer vary with F. The
-earlier rows above used `tx_capacity = (fanout * 4).clamp(256, 4096)` and
-`max_in_flight = fanout` and are kept only as historical/intermediate
-evidence.
+One **sender process** with fixed `--tx-lanes 256 --connect-cc 64`, so K and H
+never vary with F. The earlier rows above used
+`tx_capacity = (fanout * 4).clamp(256, 4096)` and `max_in_flight = fanout` and
+are kept only as historical/intermediate evidence.
+
+The sender now also **drains to equilibrium before the window opens**
+(`pre_window_drained`), so no handshake or control completion can cross the
+measurement boundary, and the printed fields name their domains:
+`data_offered`/`data_accepted` are application copies, `tx_submitted_wire` and
+`tx_completed` count wire datagrams (which include control traffic and
+retransmissions and therefore need not equal the copy counts).
+
+### Canonical rows (measured 2026-09-16, head `f19dcd0`)
+
+| F | established | pre-window drained | data offered = accepted | wire submitted = completed | CPU ms / 3 s | lateness p50 / p99 / max (µs) | drain | in-flight at window end | receiver `core_total` | `sec_a` |
+|---:|---:|---|---:|---:|---:|---|---|---:|---:|---:|
+| 1 | 1/1 | yes | 2,280 | 2,857 | 477 | 0 / 3,117 / 9,765 | ok | 0 | 2,280 | 0 |
+| 10 | 10/10 | yes | 22,790 | 28,500 | 617 | 0 / 1,245 / 6,733 | ok | 0 | 22,790 | 0 |
+| 100 | 100/100 | yes | 228,000 | 259,643 | 2,628 | 0 / 608 / 3,815 | ok | 0 | 228,000 | 0 |
+| 150 | 150/150 | yes | 342,000 | 497,781 | 2,703 | 0 / 956 / 4,457 | ok | 0 | 342,000 | 0 |
+| 200 | 200/200 | yes | 456,000 | 762,698 | 2,758 | 0 / 486 / 1,428 | ok | 0 | 456,000 | 0 |
+| 600 | **600/600** | no | 1,368,000 = 1,368,000 | 1,132,343 | 2,991 | 0 / 26,617 / 42,912 | **not reached** | 256 | 598,068 | 0 |
+| 1000 | **1000/1000** | no | 2,058,000 = 2,058,000 | 1,062,621 | 3,001 | 199,136 / 409,323 / 410,835 | **not reached** | 256 | 585,142 | 0 |
+
+Raw logs: `scratch/qual3/send-<F>.log`, `scratch/qual3/recv-<F>.log`.
+
+**The harness is sensitive to co-resident load, and one row demonstrates it.**
+The same F=100 configuration measured 1,224,858 wire datagrams with a
+non-drained window and a receiver RTT of 804 ms while other work was running on
+the host, and 259,643 wire datagrams with a drained window and 73 ms RTT when
+run alone (the row above). The difference was entirely on the receiver side
+(its own `elapsed_s` doubled), with `sec_a = 0` in both. Treat any single row
+as a same-host, same-load observation, and re-run before reading a frontier
+point off it.
+
+Rows through 200 reconcile delivery exactly (`core_total == data_offered`,
+`sec_a = 0`) with a drained window and p99 source lateness under 1 ms.
+**600 and 1000 are establishment and overload rows: they are NOT one-shard
+drained-equilibrium capacity results**, and the pre-window equilibrium itself
+could not be reached at those tiers before the window opened.
 
 | F | issued | admitted | queued | refused | established | offered = accepted | wire datagrams submitted | completed_ok | sender CPU ms / 3 s window | source lateness p50 / p99 / max (µs) | receiver `core_total` = `pkt_sent` | `sec_a` | drain | pool free/cap |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---|---|

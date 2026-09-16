@@ -71,7 +71,11 @@ jobs:
     name: Miri ownership smoke
     needs: quality
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # Miri is ~1000x slower than native and hosted runners vary by ~2x for the
+    # same commit (observed 720 s and 1501 s for the same test selection), so
+    # the budget is set well above the observed worst case rather than close to
+    # it: a timeout would report runner weather as a correctness failure.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2

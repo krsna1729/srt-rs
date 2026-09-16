@@ -3503,6 +3503,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "cap-scale loop (MAX_OUTPUT_QUEUE_ACTIONS retries); the fail-closed                   behavior is proven here at full scale outside Miri, and `handle_timer`                   ownership is exercised by the rest of this module under Miri"
+    )]
     fn output_queue_overflow_fails_closed_and_stays_bounded() {
         let mut conn = SrtConnection::new_caller(ConnectionOptions::default());
         conn.connect(Timestamp::default()).expect("start handshake");
@@ -4346,6 +4350,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "cap-scale loop (MAX_EVENT_QUEUE_ACTIONS == MAX_FLOW_WINDOW + 64                   allocations); the fail-closed behavior is proven here at full scale                   outside Miri, and `queue_event` ownership is exercised by the rest of                   this module under Miri"
+    )]
     fn event_queue_overflow_fails_closed_and_stays_bounded() {
         let mut conn = SrtConnection::new_caller(ConnectionOptions::default());
         for _ in 0..=MAX_EVENT_QUEUE_ACTIONS {
