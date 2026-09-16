@@ -316,7 +316,8 @@ async fn run_sender(
             return report;
         }
 
-        // --- open-loop measurement window
+        // --- measurement window (wall-clock-anchored source; see the module
+        //     docs for why this is not an independent producer)
         //
         // Both clocks in this loop are derived from ONE wall-clock epoch:
         //
@@ -368,8 +369,11 @@ async fn run_sender(
                 srt_epoch.as_micros() + (tick_wall - epoch).as_micros() as u64,
             );
 
-            // Open loop: the tick happens whether or not the Owner can take
-            // it. A destination that refuses loses this copy.
+            // The tick is offered whatever the Owner's state: a destination
+            // that refuses loses this copy, and it is never queued in a
+            // harness backlog. (The producer still shares this thread with
+            // `service`, so a tick the loop cannot reach is counted in
+            // `missed_source_ticks` rather than being silently skipped.)
             for id in &ids {
                 report.offered += 1;
                 if let Some(mut caller) = owner.logical_caller_mut(id)

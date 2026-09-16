@@ -28,6 +28,10 @@ mio = { version = "1", features = ["os-poll", "net"] }
 tokio = { version = "1", features = ["net", "time", "rt", "rt-multi-thread", "macros"] }
 compio = { version = "=0.19.2", features = ["io", "io-uring", "net", "runtime", "time", "macros"] }
 
+[[bin]]
+name = "qual-evidence"
+path = "src/bin/qual_evidence.rs"
+
 [dev-dependencies]
 criterion = "0.8"
 proptest = "1.11"
