@@ -143,3 +143,47 @@ for diagnosis and not fine as the baseline PR 2 pins to.
 GSO, native io_uring, `srt-sim`, allocator comparisons, hugepages, NUMA media
 replication, generic memory-pool frameworks, and further capacity-surface
 exploration. Those are post-cutover, and the four-PR plan keeps them there.
+
+### Receiver diagnostic status (verified, not complete)
+
+Working, verified by running the receiver directly:
+
+```text
+srt-bench runtime=compio mode=receiver <port> 3 120 --connections 1 \
+    --diag-payload-bytes 1316 --diag-rate-bps 8000000 --diag-window-ms 10000
+LISTENING
+[diag] measured_received=0 expected=7598 fence_seen=0 data_at_fence=0 missing_at_fence=0
+       at_fence=[] missing_final=7598 final=[0-7597] suffix=true dup_payloads=0
+```
+
+`expected=7598` is derived from the shared offer arithmetic (`source_schedule`),
+the summary is emitted **once per connection** (an earlier placement inside the
+service loop reset the tick set every visit and printed thousands of lines), and
+the classification happens on `ConnectionEvent::DataReceived { payload, .. }` --
+the application payload after reassembly, never the wire packet at
+`enqueue_received`.
+
+**Not yet working on the multi-connection receiver path**, which is the one the
+qualification uses (`--connections > 1` goes through
+`dispatch_ingress` -> `run_shared_pool`/`run_reuseport_multi`, not
+`receiver_task`). Evidence, from a diagnostic run at F=3 with `identity=true`
+and `fence=true`:
+
+```text
+sender   data_accepted=22794  fence_offered=3  fence_accepted=3
+receiver rx_core_total=22797                    <- fences counted as DATA
+         rx_diag_* absent from the row          <- diagnostic never activated
+```
+
+The fences being counted is the tell: the same flags on the same binary at
+`--connections 1` exclude them correctly. So the per-connection `BenchConfig` (or
+the event handling) on the acceptor/shared-pool path is not carrying
+`diag_expected_ticks`. The path clones `context.cfg` for peer tasks
+(`runtimes/compio.rs`, the acceptor promotion and handoff sites), so the next
+step is to confirm which construction loses the field -- `run_shared_pool`,
+`run_reuseport_multi`'s handoff, or the acceptor context -- before wiring
+anything further.
+
+Until that is fixed, a fence run on the multi-connection path cannot satisfy the
+validity rule (`fence_accepted == fanout && fences_seen == fanout`), so the
+10-pair A/B has not been run and no conservation branch is claimed.

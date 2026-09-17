@@ -277,6 +277,11 @@ pub struct BenchConfig {
     /// not the default.
     pub light_ack_interval_packets: u32,
     pub connections: usize,
+    /// Diagnostic conservation accounting: the number of measured ticks this
+    /// run's offer contains, derived by the driver from the same
+    /// `payload_bytes`/`rate`/`window` parameters the sender uses. `None` means
+    /// the run is a canonical capacity run and payloads carry no identity.
+    pub diag_expected_ticks: Option<u64>,
     /// Caller-side UDP socket topology. `PerConnection` gives every SRT
     /// connection its own ephemeral local port. `SharedSocket` drives all
     /// caller connections through one unconnected UDP socket and demultiplexes
@@ -1046,6 +1051,24 @@ pub struct ConnStats {
     pub datapath_queue: crate::queue::QueueStats,
     pub recv_scheduling: crate::scheduling::RecvSchedulingStats,
     pub outbound_retry: crate::scheduling::RetryStats,
+    /// Diagnostic conservation accounting is active for this connection.
+    ///
+    /// Distinguishes "nothing missing" from "not instrumented" -- without it a
+    /// canonical run and a diagnostic run are indistinguishable in the row.
+    pub diag_active: bool,
+    /// Fences this connection actually received.
+    pub diag_fences_seen: u64,
+    /// Measured payloads confirmed when the first fence arrived.
+    pub diag_data_at_fence: u64,
+    /// Measured ticks still missing at the fence snapshot.
+    pub diag_missing_at_fence: u64,
+    /// Measured ticks still missing after the post-fence period.
+    pub diag_missing_final: u64,
+    /// Whether that final missing set is a trailing suffix rather than scatter.
+    pub diag_missing_is_suffix: bool,
+    /// Benchmark-level duplicate measured payloads (a different layer from the
+    /// protocol's own duplicate accounting in `secondary_b`).
+    pub diag_duplicate_payloads: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -2735,6 +2758,17 @@ pub struct Aggregate {
     /// datapath) so a published row can report min/p50/max and the number
     /// of destinations that were starved outright.
     pub per_conn_data: Vec<u64>,
+    /// Diagnostic conservation totals (see [`ConnStats`]): fences the receiver
+    /// actually observed, the missing measured set at the first fence and at the
+    /// end, and how many connections ended with a suffix rather than scatter.
+    pub diag_connections: u64,
+    pub diag_fences_seen: u64,
+    pub diag_data_at_fence: u64,
+    pub diag_missing_at_fence: u64,
+    pub diag_missing_final: u64,
+    pub diag_missing_suffix_peers: u64,
+    pub diag_missing_scatter_peers: u64,
+    pub diag_duplicate_payloads: u64,
 }
 
 impl Aggregate {
@@ -2757,10 +2791,33 @@ impl Aggregate {
             recv_scheduling: crate::scheduling::RecvSchedulingStats::default(),
             outbound_retry: crate::scheduling::RetryStats::default(),
             per_conn_data: Vec::with_capacity(per_conn_capacity),
+            diag_connections: 0,
+            diag_fences_seen: 0,
+            diag_data_at_fence: 0,
+            diag_missing_at_fence: 0,
+            diag_missing_final: 0,
+            diag_missing_suffix_peers: 0,
+            diag_missing_scatter_peers: 0,
+            diag_duplicate_payloads: 0,
         }
     }
 
     pub fn add(&mut self, s: ConnStats) {
+        if s.diag_active {
+            self.diag_connections += 1;
+            self.diag_fences_seen += s.diag_fences_seen;
+            self.diag_data_at_fence += s.diag_data_at_fence;
+            self.diag_missing_at_fence += s.diag_missing_at_fence;
+            self.diag_missing_final += s.diag_missing_final;
+            self.diag_duplicate_payloads += s.diag_duplicate_payloads;
+            if s.diag_missing_final > 0 {
+                if s.diag_missing_is_suffix {
+                    self.diag_missing_suffix_peers += 1;
+                } else {
+                    self.diag_missing_scatter_peers += 1;
+                }
+            }
+        }
         self.data_events += s.data_events;
         self.per_conn_data.push(s.data_events);
         self.torn_down += u64::from(s.torn_down);
@@ -2828,6 +2885,26 @@ impl Aggregate {
         // Sorted in place before the immutable borrow of `config` below;
         // this is teardown, not the datapath.
         let (d_min, d_p50, d_max, d_zero, d_below) = self.data_distribution();
+        // Only when a diagnostic run produced them, so a canonical row is not
+        // padded with zeros that would read as measurements.
+        let diag = if self.diag_connections > 0 {
+            format!(
+                " diag_conns={} diag_fences_seen={} diag_data_at_fence={} \
+                 diag_missing_at_fence={} diag_missing_final={} \
+                 diag_missing_suffix_peers={} diag_missing_scatter_peers={} \
+                 diag_duplicate_payloads={}",
+                self.diag_connections,
+                self.diag_fences_seen,
+                self.diag_data_at_fence,
+                self.diag_missing_at_fence,
+                self.diag_missing_final,
+                self.diag_missing_suffix_peers,
+                self.diag_missing_scatter_peers,
+                self.diag_duplicate_payloads,
+            )
+        } else {
+            String::new()
+        };
         let c = &self.config;
         let role = match c.mode {
             Mode::Sender => "caller",
@@ -2864,7 +2941,7 @@ impl Aggregate {
                 "STATS role={} backend={} connections={} established={} pkt_sent={} \
                  core_total={} sec_a={} sec_b={} rtt_ms={:.3} elapsed_s={:.3} \
                  throughput_pps={:.0} cpu_user_ms={:.1} cpu_sys_ms={:.1} peak_rss_kb={} \
-                 data_min={} data_p50={} data_max={} data_zero={} data_below_half_mean={}",
+                 data_min={} data_p50={} data_max={} data_zero={} data_below_half_mean={}{}",
                 role,
                 c.runtime.name(),
                 c.connections,
@@ -2884,6 +2961,7 @@ impl Aggregate {
                 d_max,
                 d_zero,
                 d_below,
+                diag,
             );
         }
         if let Some(path) = &c.out
@@ -3296,6 +3374,23 @@ fn parse_link(cli: &Cli) -> Link {
 }
 
 /// Parse the unified CLI into a BenchConfig, exiting on bad usage.
+/// Expected tick count for a diagnostic run, or `None` when the run is not a
+/// diagnostic run.
+///
+/// All three parameters must be present: a partial set is a caller error, and
+/// silently defaulting one of them would produce a tick count that disagrees
+/// with the sender's.
+fn diag_offer(cli: &Cli) -> Option<u64> {
+    let payload_bytes = cli.flags.get("diag-payload-bytes")?.parse::<usize>().ok()?;
+    let rate_bps = cli.flags.get("diag-rate-bps")?.parse::<u64>().ok()?;
+    let window_ms = cli.flags.get("diag-window-ms")?.parse::<u64>().ok()?;
+    let interval = crate::source_schedule::interval_us(payload_bytes, rate_bps);
+    Some(crate::source_schedule::expected_ticks(
+        window_ms * 1000,
+        interval,
+    ))
+}
+
 pub fn bench_config_from_args() -> BenchConfig {
     // The harness signals a clean stop once the sender is done; without
     // this the listener would still be stopping on its own timer.
@@ -3383,6 +3478,12 @@ pub fn bench_config_from_args() -> BenchConfig {
         ack_interval_micros,
         light_ack_interval_packets,
         connections: cli.connections(),
+        // Diagnostic tick count, derived from the SAME offer parameters the
+        // sender uses and through the same shared arithmetic, so the two roles
+        // cannot disagree about how many ticks the offer contains. Receiver
+        // lifetime is deliberately window + drain/grace and must not be used
+        // here.
+        diag_expected_ticks: diag_offer(&cli),
         egress,
         ingress,
         bond_mode,
@@ -3492,6 +3593,7 @@ mod tests {
 
     fn config() -> BenchConfig {
         BenchConfig {
+            diag_expected_ticks: None,
             runtime: Runtime::Mio,
             mode: Mode::Receiver,
             encryption: Encryption::Aes256,

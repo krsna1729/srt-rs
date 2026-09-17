@@ -9,6 +9,7 @@ use srt_bench::{
 
 fn sender_config(connections: usize, cc: usize) -> srt_bench::BenchConfig {
     srt_bench::BenchConfig {
+        diag_expected_ticks: None,
         runtime: srt_bench::Runtime::Mio,
         mode: Mode::Sender,
         encryption: Encryption::Plain,

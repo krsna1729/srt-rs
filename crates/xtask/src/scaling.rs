@@ -79,6 +79,15 @@ const TX_KEYS: &[&str] = &[
     // end-of-run tail closes when later sequence progress is forced.
     "fence_offered",
     "fence_accepted",
+    // Diagnostic conservation accounting, present only on identity runs.
+    "diag_conns",
+    "diag_fences_seen",
+    "diag_data_at_fence",
+    "diag_missing_at_fence",
+    "diag_missing_final",
+    "diag_missing_suffix_peers",
+    "diag_missing_scatter_peers",
+    "diag_duplicate_payloads",
 ];
 
 /// Fields read from the receiver's `STATS` line.
@@ -150,6 +159,8 @@ struct Options {
     rate_mbps_per_dest: f64,
     /// Send the diagnostic terminal fence after the measured window.
     fence: bool,
+    /// Tag measured payloads with their tick id (diagnostic runs only).
+    identity: bool,
 }
 
 impl Default for Options {
@@ -166,6 +177,7 @@ impl Default for Options {
             payload_bytes: 1316,
             rate_mbps_per_dest: 8.0,
             fence: false,
+            identity: false,
         }
     }
 }
@@ -204,6 +216,7 @@ impl Options {
             "--payload-bytes" => self.payload_bytes = parse(value, flag)?,
             "--rate-mbps-per-dest" => self.rate_mbps_per_dest = parse(value, flag)?,
             "--fence" => self.fence = parse(value, flag)?,
+            "--identity" => self.identity = parse(value, flag)?,
             _ => return Ok(false),
         }
         Ok(true)
@@ -425,7 +438,8 @@ fn header(options: &Options) -> Result<String, String> {
     columns.extend(RX_KEYS.iter().map(|k| format!("rx_{k}")));
     Ok(format!(
         "# scaling-sweep n={} shards={} fanout={} tx_lanes={} connect_cc={} window_ms={} \n\
-         # reps={} base_port={} payload_bytes={} rate_mbps_per_dest={} fence={} git_sha={} git_dirty={}\n{}\n",
+         # reps={} base_port={} payload_bytes={} rate_mbps_per_dest={} fence={} identity={} \
+         git_sha={} git_dirty={}\n{}\n",
         options.n,
         options.shards,
         options.n / options.shards,
@@ -437,6 +451,7 @@ fn header(options: &Options) -> Result<String, String> {
         options.payload_bytes,
         options.rate_mbps_per_dest,
         options.fence,
+        options.identity,
         sha,
         dirty,
         columns.join("\t")
@@ -513,16 +528,31 @@ fn spawn_receivers(
     for shard in 0..options.shards {
         let port = rep_base + (shard * fanout) as u16;
         let log = open_log(work, &format!("rx.{shard}.log"))?;
+        // Diagnostic runs need the receiver to derive the same tick count the
+        // sender offers, from the same parameters and through the same shared
+        // arithmetic -- not from its own lifetime, which is deliberately
+        // window + drain/grace.
+        let mut receiver_args = vec![
+            "runtime=compio".to_string(),
+            "mode=receiver".to_string(),
+            port.to_string(),
+            seconds.clone(),
+            "120".to_string(),
+            "--connections".to_string(),
+            fanout.to_string(),
+        ];
+        if options.identity {
+            receiver_args.extend([
+                "--diag-payload-bytes".to_string(),
+                options.payload_bytes.to_string(),
+                "--diag-rate-bps".to_string(),
+                ((options.rate_mbps_per_dest * 1e6) as u64).to_string(),
+                "--diag-window-ms".to_string(),
+                options.window_ms.to_string(),
+            ]);
+        }
         let child = Command::new(&harness.receiver)
-            .args([
-                "runtime=compio",
-                "mode=receiver",
-                &port.to_string(),
-                &seconds,
-                "120",
-                "--connections",
-                &fanout.to_string(),
-            ])
+            .args(&receiver_args)
             .stdout(Stdio::from(log.try_clone().map_err(|e| e.to_string())?))
             .stderr(Stdio::from(log))
             .spawn()
@@ -561,6 +591,8 @@ fn spawn_senders(
                 options.rate_mbps_per_dest.to_string(),
                 "--fence".to_string(),
                 options.fence.to_string(),
+                "--identity".to_string(),
+                options.identity.to_string(),
             ])
             .stdout(Stdio::from(log.try_clone().map_err(|e| e.to_string())?))
             .stderr(Stdio::from(log))

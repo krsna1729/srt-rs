@@ -15,6 +15,21 @@
 //! library rather than the bench because a `harness = false` bench has no test
 //! harness to run assertions in.
 
+/// Source interval for a payload size and rate:
+/// `ceil(payload_bytes * 8 * 1_000_000 / rate_bps)` microseconds.
+///
+/// Shared with the receiver's diagnostic sizing so sender and receiver cannot
+/// disagree about how many ticks the offer contains -- a disagreement would make
+/// every tick beyond the shorter count look missing.
+pub fn interval_us(payload_bytes: usize, rate_bps: u64) -> u64 {
+    (payload_bytes as u64 * 8 * 1_000_000).div_ceil(rate_bps.max(1))
+}
+
+/// Ticks a window contains at a given interval: `floor(window_us / interval_us)`.
+pub fn expected_ticks(window_us: u64, interval_us: u64) -> u64 {
+    window_us.checked_div(interval_us).unwrap_or(0)
+}
+
 /// Greatest number of overdue boundaries one visit may catch up on.
 ///
 /// Bounded so a stall cannot become an unbounded burst. Boundaries beyond it are
@@ -58,6 +73,19 @@ mod tests {
     fn step(offered_through: u64, passed: u64) -> (u64, u64) {
         let c = catch_up(offered_through, passed, MAX_TICK_CATCHUP);
         (c.offer, c.missed + c.offer)
+    }
+
+    #[test]
+    fn interval_and_tick_count_match_the_offer_parameters() {
+        // 1316 B at 8 Mbps is one payload every 1316 us.
+        assert_eq!(interval_us(1316, 8_000_000), 1316);
+        // 60 s at that interval is 45 592 whole ticks (60_000_000 / 1316).
+        assert_eq!(expected_ticks(60_000_000, 1316), 45_592);
+        // A 10 s window is 7598 whole ticks, the number the 10 s runs report.
+        assert_eq!(expected_ticks(10_000_000, 1316), 7598);
+        // Sub-microsecond intervals round up rather than to zero.
+        assert_eq!(interval_us(64, 1_000_000_000), 1);
+        assert_eq!(expected_ticks(1000, 0), 0);
     }
 
     #[test]

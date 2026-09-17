@@ -219,6 +219,15 @@ struct Source {
     payload_size: usize,
     interval_us: u64,
     with_fence: bool,
+    /// Tag each measured payload with its zero-based source tick.
+    ///
+    /// Diagnostic runs turn this on so the receiver can tell *which* ticks
+    /// arrived; the canonical capacity run leaves it off, keeping the original
+    /// single-shared-payload allocation profile.
+    identity: bool,
+    /// Ticks the offer contains, from the shared offer arithmetic. Used for the
+    /// fence's `final_tick` so sender and receiver agree on the last tick id.
+    expected_ticks: u64,
 }
 
 async fn run_sender(
@@ -233,6 +242,8 @@ async fn run_sender(
         payload_size,
         interval_us,
         with_fence,
+        identity,
+        expected_ticks,
     } = *source;
     let mut report = QualReport {
         fanout,
@@ -410,6 +421,8 @@ async fn run_sender(
         let epoch = Instant::now();
         let srt_epoch = now;
         let deadline = epoch + Duration::from_millis(duration_ms);
+        // Canonical runs share one static payload; diagnostic runs tag each tick
+        // so the receiver can attribute a missing payload to a tick id.
         let payload = Bytes::from(vec![0x5A_u8; payload_size]);
         let mut offer_lateness =
             Vec::with_capacity((duration_ms * 1000 / interval_us) as usize + 8);
@@ -465,10 +478,20 @@ async fn run_sender(
                 // The tick is offered whatever the Owner's state: a destination
                 // that refuses loses this copy, and it is never queued in a
                 // harness backlog.
+                // Zero-based tick id, matching the receiver's `0..expected-1`.
+                // Deliberately not the scheduler's 1-based boundary count.
+                let tick_payload = if identity {
+                    srt_bench::qual_payload::measured_payload(
+                        payload_size,
+                        (ticks_offered - 1) as u32,
+                    )
+                } else {
+                    payload.clone()
+                };
                 for id in &ids {
                     report.offered += 1;
                     if let Some(mut caller) = owner.logical_caller_mut(id)
-                        && caller.send_shared(payload.clone(), now).is_ok()
+                        && caller.send_shared(tick_payload.clone(), now).is_ok()
                     {
                         report.accepted += 1;
                     }
@@ -557,7 +580,14 @@ async fn run_sender(
         // measured workload, and are counted in their own fields: nothing here
         // enters `data_offered`, `data_accepted`, the r ratios, or any CPU
         // normalisation.
-        let fence_payload = Bytes::from(vec![0x5Fu8; PAYLOAD_SIZE / 8]);
+        let fence_payload = if identity {
+            srt_bench::qual_payload::fence_payload(
+                payload_size,
+                expected_ticks.saturating_sub(1) as u32,
+            )
+        } else {
+            Bytes::from(vec![0x5Fu8; PAYLOAD_SIZE / 8])
+        };
         for id in &ids {
             if !with_fence {
                 break;
@@ -622,6 +652,7 @@ fn main() {
     let payload_bytes: usize = parse_arg(&args, "--payload-bytes", PAYLOAD_SIZE);
     // Offered cadence, swept by the qualification rather than assumed.
     let fence: bool = parse_arg(&args, "--fence", false);
+    let identity: bool = parse_arg(&args, "--identity", false);
     let rate_mbps_per_dest: f64 = parse_arg(&args, "--rate-mbps-per-dest", RATE_BPS as f64 / 1e6);
     let rate_bps = (rate_mbps_per_dest * 1e6) as u64;
     assert!(
@@ -646,6 +677,11 @@ fn main() {
             payload_size: payload_bytes,
             interval_us,
             with_fence: fence,
+            identity,
+            expected_ticks: srt_bench::source_schedule::expected_ticks(
+                duration_ms * 1000,
+                interval_us,
+            ),
         },
     ));
 

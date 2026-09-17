@@ -51,7 +51,11 @@ pub enum PayloadKind {
 /// destination, which is what the sender has always done -- the change is that
 /// the shared payload now identifies its tick.
 pub fn measured_payload(len: usize, tick: u32) -> Bytes {
-    let mut buffer = vec![0u8; len.max(HEADER_LEN)];
+    assert!(
+        len >= HEADER_LEN,
+        "a diagnostic payload must have room for the header: len={len} < {HEADER_LEN}"
+    );
+    let mut buffer = vec![0u8; len];
     buffer[..4].copy_from_slice(&MEASURED_MAGIC.to_be_bytes());
     buffer[4..8].copy_from_slice(&tick.to_be_bytes());
     Bytes::from(buffer)
@@ -59,7 +63,11 @@ pub fn measured_payload(len: usize, tick: u32) -> Bytes {
 
 /// One fence payload of `len` bytes, tagged with the last measured tick.
 pub fn fence_payload(len: usize, final_tick: u32) -> Bytes {
-    let mut buffer = vec![0u8; len.max(HEADER_LEN)];
+    assert!(
+        len >= HEADER_LEN,
+        "a diagnostic payload must have room for the header: len={len} < {HEADER_LEN}"
+    );
+    let mut buffer = vec![0u8; len];
     buffer[..4].copy_from_slice(&FENCE_MAGIC.to_be_bytes());
     buffer[4..8].copy_from_slice(&final_tick.to_be_bytes());
     Bytes::from(buffer)
@@ -199,6 +207,83 @@ impl TickSet {
     }
 }
 
+/// Per-connection diagnostic state for the conservation experiment.
+///
+/// Created only when the run is configured for it, so a canonical capacity run
+/// keeps the original payload allocation and accounting untouched.
+#[derive(Debug, Clone)]
+pub struct DiagStats {
+    ticks: TickSet,
+    pub fences_seen: u64,
+    /// Measured payloads the receiver had confirmed when the fence arrived.
+    pub data_at_fence: u64,
+    /// Measured ticks still missing at that instant.
+    pub missing_at_fence: u64,
+    /// Compact rendering of the missing set, for the retained log.
+    pub missing_ranges_at_fence: String,
+    /// Measured ticks still missing once the post-fence period has elapsed.
+    pub missing_final: u64,
+    pub missing_ranges_final: String,
+    /// Whether the final missing set is a trailing suffix rather than scatter.
+    pub missing_is_suffix: bool,
+}
+
+impl DiagStats {
+    pub fn new(expected_ticks: u64) -> Self {
+        Self {
+            ticks: TickSet::new(expected_ticks.min(u32::MAX as u64) as u32),
+            fences_seen: 0,
+            data_at_fence: 0,
+            missing_at_fence: 0,
+            missing_ranges_at_fence: String::new(),
+            missing_final: 0,
+            missing_ranges_final: String::new(),
+            missing_is_suffix: false,
+        }
+    }
+
+    /// Record a measured payload. Returns true on first observation of the tick,
+    /// which is the only case that counts toward the measured application count;
+    /// a repeat is a benchmark-level duplicate, counted separately from the
+    /// protocol's own duplicate accounting in `receiver_stats()`.
+    pub fn note_measured(&mut self, tick: u32) -> bool {
+        self.ticks.insert(tick)
+    }
+
+    /// Record fence observation. Only the first fence per connection snapshots
+    /// the state, so a repeated fence cannot move the observation point.
+    pub fn note_fence(&mut self, measured_so_far: u64) -> bool {
+        if self.fences_seen > 0 {
+            self.fences_seen += 1;
+            return false;
+        }
+        self.fences_seen = 1;
+        self.data_at_fence = measured_so_far;
+        self.missing_at_fence = u64::from(self.ticks.missing());
+        self.missing_ranges_at_fence = self.ticks.missing_ranges_text();
+        true
+    }
+
+    /// Close the diagnostic once the post-fence period has elapsed.
+    pub fn finish(&mut self) {
+        self.missing_final = u64::from(self.ticks.missing());
+        self.missing_ranges_final = self.ticks.missing_ranges_text();
+        self.missing_is_suffix = self.ticks.missing_is_suffix();
+    }
+
+    pub fn measured_received(&self) -> u64 {
+        u64::from(self.ticks.received())
+    }
+
+    pub fn duplicate_payloads(&self) -> u64 {
+        u64::from(self.ticks.duplicates())
+    }
+
+    pub fn expected(&self) -> u64 {
+        u64::from(self.ticks.expected())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,6 +317,14 @@ mod tests {
     fn payloads_without_the_magic_are_foreign() {
         assert_eq!(classify(&[0u8; 64]), PayloadKind::Foreign);
         assert_eq!(classify(b"not a diagnostic payload"), PayloadKind::Foreign);
+    }
+
+    #[test]
+    #[should_panic(expected = "must have room for the header")]
+    fn constructing_a_payload_smaller_than_the_header_is_refused() {
+        // Silent resizing would break the "payload length unchanged" contract the
+        // framing and pacing comparison depends on.
+        let _ = measured_payload(4, 0);
     }
 
     #[test]
@@ -305,6 +398,55 @@ mod tests {
         assert_eq!(set.missing(), 0);
         assert_eq!(set.missing_ranges_text(), "none");
         assert!(set.missing_is_suffix());
+    }
+
+    /// The fence snapshot must be taken once, at the first fence, and must not
+    /// move if the peer repeats it.
+    #[test]
+    fn the_fence_snapshot_is_taken_once_and_does_not_move() {
+        let mut diag = DiagStats::new(10);
+        for tick in 0..7 {
+            diag.note_measured(tick);
+        }
+        assert!(diag.note_fence(7), "first fence snapshots");
+        assert_eq!(diag.data_at_fence, 7);
+        assert_eq!(diag.missing_at_fence, 3);
+        assert_eq!(diag.missing_ranges_at_fence, "7-9");
+        // A late arrival before the second fence must not rewrite the snapshot.
+        diag.note_measured(7);
+        assert!(!diag.note_fence(8), "a repeated fence does not re-snapshot");
+        assert_eq!(diag.fences_seen, 2);
+        assert_eq!(diag.data_at_fence, 7, "snapshot is from the first fence");
+        assert_eq!(diag.missing_at_fence, 3);
+    }
+
+    /// After the post-fence period the final state is what decides whether the
+    /// deficit was recovered by later sequence progress.
+    #[test]
+    fn finish_records_recovery_since_the_fence() {
+        let mut diag = DiagStats::new(10);
+        for tick in 0..7 {
+            diag.note_measured(tick);
+        }
+        diag.note_fence(7);
+        // The fence's later sequence progress exposes the tail and it recovers.
+        for tick in 7..10 {
+            diag.note_measured(tick);
+        }
+        diag.finish();
+        assert_eq!(diag.missing_at_fence, 3);
+        assert_eq!(diag.missing_final, 0, "recovered after the fence");
+        assert!(diag.missing_is_suffix);
+        assert_eq!(diag.duplicate_payloads(), 0);
+    }
+
+    #[test]
+    fn duplicate_measured_payloads_are_counted_separately_from_arrivals() {
+        let mut diag = DiagStats::new(4);
+        assert!(diag.note_measured(1));
+        assert!(!diag.note_measured(1));
+        assert_eq!(diag.measured_received(), 1, "counts on first observation");
+        assert_eq!(diag.duplicate_payloads(), 1);
     }
 
     #[test]
