@@ -31,12 +31,16 @@ its service rate, so a higher offer does not produce a higher sustained wire rat
 -- it produces a larger backlog.
 
 **Two `r`s, two jobs.** `r_window = tx_submitted_wire / (generated_ticks x F)` is
-the wire cost of the DATA actually offered during the window and is the one that
-describes sustainable service; `r_whole = (tx_submitted_wire + drain_submitted) /
-rx_core_total` is whole-work accounting and must never be multiplied by a DATA
-rate to produce an instantaneous figure. `r_window < 1` is the backlog signature
--- fewer wire datagrams left the shard than DATA arrived -- and `r_window = 1.22`
-at F=50 matches the draft's ~0.28 control budget for a shard that keeps up.
+in-window wire submissions per offered DATA. It is an interpretable
+**wire-amplification** ratio only for stationary rows, where the wire work for the
+offered DATA has actually happened; below stationarity `r_window < 1` and it is
+primarily a **service-completion** ratio -- fewer wire datagrams left the shard
+than DATA arrived, and interpreting that as cheap wire cost would be a category
+error. `r_whole = (tx_submitted_wire + drain_submitted) / rx_core_total` is
+whole-work accounting and must never be multiplied by a DATA rate to produce an
+instantaneous figure. F=50's `r_window = 1.20` is a genuine amplification figure
+and matches the draft's ~0.28 control budget, which is exactly what a shard
+keeping pace should measure.
 
 `r` is `(tx_submitted_wire + drain_submitted) / rx_core_total`; `C_SRT` is
 `(window_cpu_ms + drain_cpu_ms) * 1000 / rx_core_total`.
@@ -44,3 +48,114 @@ at F=50 matches the draft's ~0.28 control budget for a shard that keeps up.
 One repetition per configuration except `F=50, 8` and `F=100, 8` and `F=200, 8`,
 which have two. The protocol asks for three or more; this is a first surface, not
 the final qualification.
+
+## The only sustained configuration, at length
+
+`F50-r8-clean.tsv` is the same configuration over a **60 s** window with 3
+repetitions, and it is the run this surface's single sustained point rests on:
+
+```text
+rep  generated/missed  in-window wire/s  drain wire  r_window  accepted==delivered  offer p99
+1    45592 / 0              45 698            41       1.203        NO (256 short)    10.3 ms
+2    45586 / 6              45 679            50       1.202        yes               13.8 ms
+3    45592 / 0              46 320             1       1.219        yes                4.6 ms
+```
+
+Three things it establishes, and one it does not:
+
+* **The cadence holds over 60 s** (0-6 missed ticks of ~45 590) and the drain is
+  now 1-50 datagrams, i.e. genuinely stationary, with `r_window ~= 1.20` matching
+  the protocol's control budget.
+* **`C_SRT` is 17.1-18.0 us per delivered payload** at this operating point.
+* **The offer is not real-time**: p99 offer lateness is 4.6-13.8 ms against a
+  5 ms budget.
+* **Conservation is not perfect**: rep 1 ends 256 payloads short of accepted
+  (99.9888 %), which is exactly the TX pool's 256 slots. A 10 s window did not
+  expose this; 60 s did. Until that is explained, "F=50 at 8 Mbps is sustained"
+  holds for 2 of 3 repetitions, and the shortest honest statement is: *F=50 at
+  8 Mbps keeps pace with the offer over 60 s, with a conservation gap of one TX
+  pool depth in one of three repetitions.*
+
+Provenance: this artifact records `git_sha=ed64108 git_dirty=true`, where the
+dirty state is the field-rename diff (`offer_lateness_*` in the sweep schema)
+that was still uncommitted when it was measured. That is a naming change with no
+effect on what was measured, but it is not a clean-tree artifact and the final
+qualification must be regenerated from a clean commit rather than inheriting
+this one.
+
+## The 256-payload deficit: what the accounting says
+
+`F50-r8-clean.tsv` rep 1 is the only repetition that fails conservation, and the
+numbers line up exactly:
+
+```text
+rep  accepted      receiver     deficit   in-flight at window end   drain done - sub
+1    2 279 600     2 279 344        256    256  (= K, pool saturated)          256
+2    2 279 300     2 279 300          0     88                                88
+3    2 279 600     2 279 600          0    139                               139
+```
+
+The K sweep below retires the sharpest version of that reading, but the accounting
+is still the reason to chase it: the deficit appears only at run end, and rows with
+88 and 139 in flight at window close lost nothing -- those completions arrived
+during the drain and the receiver counted them.
+
+`tx_completed_ok` proves the transport I/O operation completed, not that the
+remote receiver observed the DATA, so this is not yet attributable. It looks like
+a final-flight lifecycle transition rather than steady-state loss: the run is
+stationary throughout (drain of 1-50 datagrams), the deficit has no mid-stream
+signature, and the receiver reports `sec_a = 0`. A missing *suffix* of a stream is
+also special in a way a mid-stream hole is not -- with no later sequence number
+arriving, the receiver need not have evidence the final sequence numbers ever
+existed, whereas a hole in the middle is exposed by its successors.
+
+The K sweep (`F50-r8-K64.tsv`, `F50-r8-K512.tsv`) tests that directly: if the
+deficit is a final-flight phenomenon it should track the saturated pool depth, and
+if it stays at 256 regardless of K it is something else.
+
+### K sweep: the deficit is a tail artifact, and K bounds the frontier
+
+Same configuration (F=50, 8 Mbps/destination, 60 s), varying only the TX pool/lane
+count. `sec_a` is receiver-reported loss, `sec_b` receiver-reported duplicates:
+
+```text
+K    rep  accepted    receiver    deficit   in-flight@end  drain done-sub  sec_a   sec_b
+64    1   1 142 086     845 781    296 305        4                4        6 670    180
+64    2   1 659 525   1 487 562    171 963       11               11          765    343
+64    3   1 810 486   1 586 471    224 015        4                4        4 864    114
+256   1   2 279 600   2 279 344        256      256              256            0      -
+256   2   2 279 300   2 279 300          0       88               88            0      -
+256   3   2 279 600   2 279 600          0      139              139            0      -
+512   1   2 276 050   2 275 995         55       58               58            0      0
+512   2   2 279 500   2 279 500          0      512              512            0      0
+512   3   2 279 400   2 278 916        484      512              512            0      0
+```
+
+Three conclusions, and one hypothesis retired:
+
+1. **The deficit is a tail artifact, not steady-state loss.** Every run that
+   sustains the offer reports `sec_a = 0`; the shortfall appears only at run end
+   and its size varies from 0 to ~K. It is not a property of the offered rate.
+2. **The `deficit == saturated in-flight` reading does not survive K.** It holds
+   exactly at K=256 (256 of 256), approximately at K=512 rep 3 (484 of 512), and
+   fails at K=512 rep 2 (512 in flight, zero deficit). The looser statement the
+   three K=256 rows support -- *the deficit appears when the pool is saturated at
+   the window boundary* -- also weakens: K=512 rep 2 is saturated and loses
+   nothing, while K=512 rep 1 has only 58 in flight and loses 55. What survives is
+   weaker still and needs the fence experiment to sharpen: **the final flight, not
+   the steady state, is where payloads go missing.**
+3. **K bounds the frontier.** K=64 cannot sustain F=50 at 8 Mbps at all: receiver
+   loss of 765-6,670 datagrams per 60 s window and 172-296 K undelivered payloads,
+   with duplicates appearing (`sec_b`) as the protocol retransmits. K=256 and
+   K=512 both sustain it with `sec_a = 0`. So a capacity point is a
+   `(F, rate, K)` triple, not a `(F, rate)` pair -- the surface needs a K axis, and
+   previous rows measured at K=256 only.
+
+The diagnostic that decides this is the terminal fence the reviewer proposed: a
+measurement-only sentinel per destination, sent after the last measured tick,
+that does not count toward `data_accepted`, `rx_core_total`, `r` or workload CPU.
+A fence after the missing tail forces later sequence progress, which separates the
+outcomes cleanly -- gap disappears with no retransmits (teardown/stats race), gap
+disappears with ~K retransmits (the final flight really was lost and the fence
+enabled recovery), gap remains after all fences (protocol bug), fence never
+arrives (sender lifecycle).

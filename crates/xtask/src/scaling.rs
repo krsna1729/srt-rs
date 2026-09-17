@@ -57,9 +57,9 @@ const TX_KEYS: &[&str] = &[
     "pending_after_drain",
     "inflight_at_window_end",
     "service_visits",
-    "lateness_us_p50",
-    "p99",
-    "max",
+    "offer_lateness_us_p50",
+    "offer_lateness_us_p99",
+    "offer_lateness_us_max",
     "window_cpu_ms",
     "drain_cpu_ms",
     "cpu_ms",
@@ -83,6 +83,10 @@ const RX_KEYS: &[&str] = &[
     "pkt_sent",
     "core_total",
     "sec_a",
+    // Receiver duplicate count. Already mapped from `total_duplicates` in the
+    // receiver's per-connection stats; simply not collected here, which made
+    // duplicate accounting look like work to build rather than work to read.
+    "sec_b",
     "rtt_ms",
     "elapsed_s",
     "cpu_user_ms",
@@ -119,7 +123,12 @@ const SUM_KEYS: &[&str] = &[
 const MIN_KEYS: &[&str] = &["rx_data_min"];
 
 /// Columns aggregated by maximum: per-shard worst cases.
-const MAX_KEYS: &[&str] = &["lateness_us_p50", "p99", "max", "rx_data_below_half_mean"];
+const MAX_KEYS: &[&str] = &[
+    "offer_lateness_us_p50",
+    "offer_lateness_us_p99",
+    "offer_lateness_us_max",
+    "rx_data_below_half_mean",
+];
 
 struct Options {
     out: PathBuf,
