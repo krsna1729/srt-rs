@@ -39,8 +39,14 @@ pub fn modes() -> Vec<(&'static str, ApplyRing)> {
     fn sqpoll(p: &mut compio::driver::ProactorBuilder) {
         p.sqpoll_idle(Duration::from_millis(1));
     }
+    /// `SQPOLL` plus `DEFER_TASKRUN`, with `SINGLE_ISSUER` set because the
+    /// kernel requires it for `DEFER_TASKRUN`. The first version of this arm
+    /// omitted `SINGLE_ISSUER`, so its `EINVAL` was explained by the missing
+    /// required flag and said nothing about whether the two features are
+    /// compatible -- a real conclusion drawn from an invalid construction.
     fn sqpoll_defer(p: &mut compio::driver::ProactorBuilder) {
         p.sqpoll_idle(Duration::from_millis(1));
+        p.single_issuer(true);
         p.defer_taskrun(true);
         p.taskrun_flag(true);
     }

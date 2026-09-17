@@ -244,9 +244,21 @@ fn receiver_binary(root: &Path) -> Result<PathBuf, String> {
     }
 }
 
-/// Wait for a child to exit, reporting whether it succeeded.
-fn reap(child: &mut Child) -> bool {
-    matches!(child.wait(), Ok(status) if status.success())
+/// Wait for a child to exit, erroring on a nonzero status.
+fn reap(child: &mut Child) -> Result<(), String> {
+    match child.wait() {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!("exited with {status}")),
+        Err(e) => Err(format!("wait failed: {e}")),
+    }
+}
+
+/// Keep the failed rep's logs and describe where they are.
+///
+/// A partial log is useful evidence about *why* a run failed, so it is
+/// retained on disk; what it must never become is a TSV row.
+fn keep_logs(work: &Path, message: String) -> String {
+    format!("{message}; logs kept in {}", work.display())
 }
 
 /// Everything the sweep needs to launch work: where the workspace is and
@@ -354,17 +366,36 @@ fn run_rep(
 
     // Wait for the shards, then give receivers time to read the post-window
     // drain before stopping them.
+    //
+    // A failed shard is an experiment failure, not a row: an evidence-producing
+    // command that records a zeroed or half-populated row for a run that did
+    // not happen is worse than one that stops, because the row outlives the
+    // failure. Logs stay on disk and are named in the error.
     for (port, sender) in senders.iter_mut() {
-        if !reap(sender) {
-            eprintln!("scaling: sender shard on port {port} failed");
+        if let Err(e) = reap(sender) {
+            return Err(keep_logs(
+                &work,
+                format!("sender shard on port {port}: {e}"),
+            ));
         }
     }
     sleep(Duration::from_secs(12));
-    for receiver in receivers.iter_mut() {
-        if receiver.try_wait().ok().flatten().is_none() {
-            let _ = receiver.kill();
+    for (shard, receiver) in receivers.iter_mut().enumerate() {
+        match receiver.try_wait() {
+            Ok(Some(status)) if !status.success() => {
+                return Err(keep_logs(
+                    &work,
+                    format!("receiver for shard {shard} exited with {status}"),
+                ));
+            }
+            // Still running is the expected case: the receiver's own deadline
+            // is longer than the window plus drain.
+            Ok(None) => {
+                let _ = receiver.kill();
+                let _ = receiver.wait();
+            }
+            _ => {}
         }
-        let _ = receiver.wait();
     }
 
     let mut rows = Vec::with_capacity(options.shards);
@@ -467,9 +498,24 @@ fn read_shard_row(work: &Path, shard: usize, rep: usize) -> Result<Vec<String>, 
         .map(kv)
         .unwrap_or_default();
     if tx_fields.is_empty() {
-        return Err(format!(
-            "shard {shard} rep {rep}: no SHARED_OWNER_QUAL line"
+        return Err(keep_logs(
+            work,
+            format!("shard {shard} rep {rep}: no SHARED_OWNER_QUAL line from the sender"),
         ));
+    }
+    if rx_fields.is_empty() {
+        return Err(keep_logs(
+            work,
+            format!("shard {shard} rep {rep}: no STATS line from the receiver"),
+        ));
+    }
+    for key in ["cpu_ms", "window_cpu_ms", "drain_cpu_ms"] {
+        if !tx_fields.contains_key(key) {
+            return Err(keep_logs(
+                work,
+                format!("shard {shard} rep {rep}: sender record is missing {key}"),
+            ));
+        }
     }
     let mut row = vec![
         "ROW".to_string(),

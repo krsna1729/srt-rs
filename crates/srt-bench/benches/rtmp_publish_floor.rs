@@ -253,90 +253,12 @@ fn run_sink(settings: &Settings) {
             .await
             .expect("bind sink");
         println!("RTMP_SINK_READY port={}", settings.port);
-        let (mut socket, _peer) = listener.accept().await.expect("accept");
-
-        // Server handshake, in the order the protocol actually requires:
-        // read C0+C1 (1537), write S0+S1+S2 (3073), then read C2 (1536).
-        //
-        // Reading all 3073 client bytes up front deadlocks, because the client
-        // waits for S0S1S2 before it will send C2 and the server is not yet
-        // sending anything: the first version of this sink did exactly that
-        // and hung, which is the kind of thing a bench has to get right rather
-        // than paper over with a timeout.
-        let _c0c1 = read_exact_n(&mut socket, 1537).await;
-        let mut server_hello = vec![0x03u8];
-        server_hello.extend(std::iter::repeat_n(0x22u8, 3072));
-        socket
-            .write_all(server_hello)
-            .await
-            .0
-            .expect("write S0S1S2");
-        let _c2 = read_exact_n(&mut socket, 1536).await;
-
-        // Chunk parse loop: header, then discard `length` payload bytes.
-        let cpu0 = cpu_ms();
-        let wall0 = Instant::now();
-        let mut bytes = 0usize;
-        let mut messages = 0usize;
-        let scratch = vec![0u8; 65_536];
-        // A real RTMP server answers `connect`, `createStream` and `publish`
-        // before the publisher streams. Without these replies the publisher
-        // blocks on its own handshake waits forever -- which is what the first
-        // version of this bench did. The replies are written in command order
-        // rather than from parsed AMF: the sink is a transport endpoint, and
-        // the publisher's real waits are what belongs in the measurement.
-        let mut replies_sent = 0;
-        loop {
-            let Some(header) = read_exact_n(&mut socket, HEADER).await else {
-                // Expected at the end of a run: the publisher closing is EOF.
-                eprintln!("[sink] connection closed after {messages} messages");
-                break;
-            };
-            // Header layout: [0] csid, [1..4] timestamp, [4..7] length,
-            // [7] type, [8..12] stream id. Reading the length from [5..8]
-            // folds the timestamp byte in and drops the high length byte --
-            // for a 4-byte Set Chunk Size message that reads as 1025, so the
-            // sink waits for 1021 bytes that never come, closes on the next
-            // write, and the publisher dies of EPIPE. That is the bug that
-            // kept this arm from producing a number.
-            let length =
-                ((header[4] as usize) << 16) | ((header[5] as usize) << 8) | header[6] as usize;
-            // Extended timestamp: a fmt-0 header whose 3-byte timestamp is
-            // 0xFFFFFF carries 4 more bytes before the payload.
-            if header[1] == 0xFF
-                && header[2] == 0xFF
-                && header[3] == 0xFF
-                && read_exact_n(&mut socket, 4).await.is_none()
-            {
-                break;
-            }
-            let mut remaining = length;
-            while remaining > 0 {
-                let take = remaining.min(scratch.len());
-                match socket.read(scratch[..take].to_vec()).await.0 {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        remaining -= n;
-                        bytes += n;
-                    }
-                }
-            }
-            if remaining > 0 {
-                eprintln!(
-                    "[sink] short payload: length={length} remaining={remaining} \
-                     header={header:?} messages={messages}"
-                );
-                break;
-            }
-            messages += 1;
-            if messages == replies_sent + 1 && replies_sent < 3 {
-                let reply = server_reply(replies_sent, &stream_name);
-                socket.write_all(reply).await.0.ok();
-                replies_sent += 1;
-            }
+        let (socket, _peer) = listener.accept().await.expect("accept");
+        if settings.mode == "rtmp" {
+            sink_rtmp(socket, &stream_name).await
+        } else {
+            sink_raw(socket).await
         }
-        let wall_s = wall0.elapsed().as_secs_f64();
-        (bytes, messages, cpu_ms() - cpu0, wall_s)
     });
 
     let (bytes, messages, cpu_ms, wall_s) = report;
@@ -353,6 +275,118 @@ fn run_sink(settings: &Settings) {
         cpu_ms,
         cpu_ms / mbits.max(1e-9),
     );
+}
+
+/// Raw TCP sink: read and discard, with no RTMP handshake, no chunk parsing
+/// and no command replies.
+///
+/// This is the control the `--mode tcp` rows depend on. The first version ran
+/// the RTMP handshake and chunk parser unconditionally, so in raw mode it
+/// interpreted `0x42` payload bytes as RTMP length fields -- the "no framing"
+/// control was doing framing, and the framing deltas it produced were between
+/// two RTMP parsers rather than between framing and its absence.
+async fn sink_raw(mut socket: compio::net::TcpStream) -> (usize, usize, f64, f64) {
+    let cpu0 = cpu_ms();
+    let wall0 = Instant::now();
+    let buffer = vec![0u8; 1 << 20];
+    let mut bytes = 0usize;
+    let mut reads = 0usize;
+    loop {
+        let out = socket.read(buffer.clone()).await;
+        let (result, _) = (out.0, out.1);
+        match result {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                bytes += n;
+                reads += 1;
+            }
+        }
+    }
+    (bytes, reads, cpu_ms() - cpu0, wall0.elapsed().as_secs_f64())
+}
+
+/// RTMP sink: server handshake, then parse chunk headers and discard payloads.
+///
+/// A real RTMP server answers `connect`, `createStream` and `publish` before
+/// the publisher streams; the replies are written in command order rather than
+/// from parsed AMF, because this is a transport endpoint and the publisher's
+/// real waits are what belongs in the measurement.
+async fn sink_rtmp(mut socket: compio::net::TcpStream, stream: &str) -> (usize, usize, f64, f64) {
+    // Server handshake in the order the protocol requires: read C0+C1 (1537),
+    // write S0+S1+S2 (3073), then read C2 (1536). Reading all 3073 client bytes
+    // up front deadlocks, because the client will not send C2 until it sees
+    // S0S1S2.
+    let _c0c1 = read_exact_n(&mut socket, 1537).await;
+    let mut server_hello = vec![0x03u8];
+    server_hello.extend(std::iter::repeat_n(0x22u8, 3072));
+    socket
+        .write_all(server_hello)
+        .await
+        .0
+        .expect("write S0S1S2");
+    let _c2 = read_exact_n(&mut socket, 1536).await;
+
+    let scratch = vec![0u8; 65_536];
+    let cpu0 = cpu_ms();
+    let wall0 = Instant::now();
+    let mut bytes = 0usize;
+    let mut messages = 0usize;
+    let mut replies_sent = 0;
+    loop {
+        let Some(header) = read_exact_n(&mut socket, HEADER).await else {
+            // Expected at the end of a run: the publisher closing is EOF.
+            eprintln!("[sink] connection closed after {messages} messages");
+            break;
+        };
+        // Header layout: [0] csid, [1..4] timestamp, [4..7] length, [7] type,
+        // [8..12] stream id. Reading the length from [5..8] folds the timestamp
+        // byte in and drops the high length byte -- for a 4-byte Set Chunk Size
+        // message that reads as 1025, so the sink waits for bytes that never
+        // come and the publisher dies of EPIPE.
+        let length =
+            ((header[4] as usize) << 16) | ((header[5] as usize) << 8) | header[6] as usize;
+        // Extended timestamp: a fmt-0 header whose 3-byte timestamp is
+        // 0xFFFFFF carries 4 more bytes before the payload.
+        if header[1] == 0xFF
+            && header[2] == 0xFF
+            && header[3] == 0xFF
+            && read_exact_n(&mut socket, 4).await.is_none()
+        {
+            break;
+        }
+        let mut remaining = length;
+        while remaining > 0 {
+            let take = remaining.min(scratch.len());
+            match socket.read(scratch[..take].to_vec()).await.0 {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    remaining -= n;
+                    bytes += n;
+                }
+            }
+        }
+        if remaining > 0 {
+            eprintln!(
+                "[sink] short payload: length={length} remaining={remaining} messages={messages}"
+            );
+            break;
+        }
+        messages += 1;
+        if messages == replies_sent + 1 && replies_sent < 3 {
+            socket
+                .write_all(server_reply(replies_sent, stream))
+                .await
+                .0
+                .ok();
+            replies_sent += 1;
+        }
+    }
+    (
+        bytes,
+        messages,
+        cpu_ms() - cpu0,
+        wall0.elapsed().as_secs_f64(),
+    )
 }
 
 // --------------------------------------------------------------------------

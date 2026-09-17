@@ -496,6 +496,12 @@ async fn run_sender(
             report.rx_dropped = stats.dropped;
             report.rx_truncated = stats.truncated;
         }
+        // `cpu_ms` is the whole measured run: window + drain + the teardown
+        // bookkeeping between them. It is set here rather than at window close
+        // so it cannot be a stale zero (it was, for one commit: the field was
+        // still printed as `cpu_ms=0.0` while `window_cpu_ms` and
+        // `drain_cpu_ms` carried the real values).
+        report.cpu_ms = process_cpu_ms() - cpu_start;
         report.tx_failures_pending = owner.tx_failures_pending();
         report.tx_pool_capacity = owner.tx_pool().capacity();
         report.tx_pool_free = owner.tx_pool().free_count();

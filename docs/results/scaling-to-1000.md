@@ -115,7 +115,12 @@ harness figure.
 ## Rows
 
 Raw evidence per row lives in `docs/results/scaling-1000/`; every number below
-is a column in one of those files. The sweep is `cargo xtask scaling` (it
+is a column in one of those files. Cost rows additionally carry a denominator
+rule: **only `drain_ok == true` rows with `pending_after_drain == 0` support a
+cost claim, and the denominator is receiver-confirmed payloads
+(`rx_core_total`), never `data_accepted` alone.** `data_accepted` counts copies
+the protocol accepted, which on an overloaded shard is a superset of what it
+ever transmits. The sweep is `cargo xtask scaling` (it
 replaced a shell script so the driver is reviewed like code and cannot drift
 from the result schema it writes):
 
@@ -131,7 +136,15 @@ cargo xtask scaling --out docs/results/scaling-1000/run.tsv \
 | 2026-09-16 | 200 | 1 | 200 | 3 s | K sweep 128/512/1024 -- incumbent K=256 best on wire-bytes/CPU-s | `ksweep-K*.tsv` |
 | 2026-09-16 | 200 | 1 | 200 | 3 s | payload sweep 700/1316/2632 B at fixed 8 Mbps/destination | `costmodel-payload*.tsv` |
 
-## Result: the scaling path is sharding, and the wall is per-datagram submission cost
+## Result: 1000 destinations in a burst; sustained capacity is ~34 destinations per core-second
+
+Read this section with the denominator section below: the headline row is a
+**burst** result. Five shards established, served and reconciled 1000
+destinations in a 3 s window and then spent several further seconds of CPU per
+shard draining the queue they had built. It is evidence that the *path* to 1000
+destinations exists and is exact. It is not evidence that 1000 x 8 Mbps is
+sustainable on this host, and the earlier revisions of this report that
+extrapolated 9-10 cores from the window alone are withdrawn.
 
 ### 1000 destinations, 5 concurrent shards (`scale-N1000-S5-2reps.tsv`)
 
@@ -173,86 +186,76 @@ losslessly, fairly, and reconciled at ~81 % of an 8 Mbps-per-destination
 cadence (5 shards x F=200, 2 reps, identical outcome). Full cadence at 1000
 destinations at 8 Mbps needs roughly 10 cores of sender+receiver work.
 
+### Denominators: what was withdrawn, and what replaces it
+
+**Withdrawn.** An earlier revision computed `12.45 us per wire datagram` as
+window CPU divided by window wire submissions, then multiplied by a
+"2.08 payloads per wire datagram" factor to reach 220 destinations per core,
+a 9-10 core extrapolation for 1000 destinations, and 1.4-1.6x headroom for
+candidate D. That denominator is not conserved: the shard accepts far more
+payloads in the window than it submits, and submits the rest during the
+post-window drain, so window CPU / window submissions charges a partial
+workload to a partial count. The 2.08 was the tell -- in an uncoalesced SRT
+path a DATA datagram does not carry 2.08 application payloads; the ratio
+exceeded 1 only because submissions were deferred past the window.
+
+**What replaces it.** Cost is now only ever taken on rows that reached
+equilibrium (`drain_ok == true`, `pending_after_drain == 0`), and only against
+work that is fully realized: CPU over the whole run (window + drain) divided by
+payloads the *receiver* confirmed (`rx_core_total`), never by
+`data_accepted` alone.
+
+```mermaid
+flowchart LR
+  A["window CPU<br/>+ drain CPU"] --> C{"drain_ok?<br/>pending == 0?"}
+  B["receiver-confirmed payloads<br/>rx_core_total"] --> C
+  C -->|yes| D["us CPU per delivered payload"]
+  C -->|no| E["row is an OVERLOAD row:<br/>no cost claim"]
+```
+
+Conserved measurement, 10 s window, one shard, `drain_ok` rows only, mean over
+reps; F=50 in both window lengths as a control for window sensitivity:
+
+| F | window | sender us/delivered payload | receiver us/delivered payload | pair | payloads delivered |
+|---:|---:|---:|---:|---:|---:|
+| 50 | 3 s | 16.4-22.2 | ~12-22 | - | all accepted |
+| 50 | 10 s | 20.8-23.0 | 19.1-22.2 | 39.9-45.2 | 307-333 K |
+| 100 | 10 s | 12.7-17.4 | 12.3-15.9 | 25.0-33.2 | 664-734 K |
+| 200 | 10 s | 21.7-23.4 | 19.3-20.4 | 40.9-43.9 | 588-716 K |
+
+And on the 1000-destination configuration itself (5 concurrent shards, 10
+shard-runs, all `drain_ok`): **sender 19.52 us + receiver 19.21 us = 38.72 us
+CPU per delivered payload, i.e. 34 destinations per core-second at 8 Mbps**
+(142.15 core-seconds for 3,675,800 receiver-confirmed payloads).
+
+Two consequences that change this report's conclusions:
+
+1. **Sustained capacity is ~34 destinations per core-second (pair), i.e. about
+   200 destinations at 8 Mbps on this 6-CPU host** -- consistent with the
+   frontier #116 published, and *not* 810.
+2. **The 1000-destination run is a BURST result, not a sustained-capacity
+   result.** Its shards accepted ~616 K payloads/s across five processes for
+   3 s and then spent a further ~5 s of CPU per shard draining them. Five
+   shards served 1000 destinations, losslessly and without starvation; they did
+   not sustain 1000 x 8 Mbps, and no extrapolation from the window alone can
+   say they did.
+
+**Candidate D re-evaluated.** The 1.4-1.6x headroom was computed against the
+withdrawn denominator. On the conserved one: the shard spends 12.81 us per wire
+datagram (whole life, F=200) against a measured floor of 8.0-8.9 us pipelined
+and 7.57 us batched, and needs ~2.2 wire datagrams per delivered payload
+(including control traffic), so per-payload headroom is roughly
+`2.2 x 8.0 / 19.5 = 0.9` to `2.2 x 8.9 / 19.5 = 1.0` -- i.e. **candidate D is
+not a demonstrated 1.4-1.6x opportunity.** The submission-structure hypothesis
+is still the best-supported one (the flag matrix eliminates the alternatives),
+but its size is now unproven, and the honest statement is that the next step is
+a fixed-work equilibrium measurement that varies one thing at a time.
+
 ### Cost model, fitted to measured floors
 
-**Retraction first.** An earlier version of this section claimed the shard's
-cost was "the copies" at 4.6 ns/byte (217 MB/s). That was wrong, and the bench
-that falsifies it is `udp_datapath_floor`
-(`docs/results/scaling-1000/floor-single-core.txt`):
-
-| quantity | measured on this host | per byte |
-|---|---:|---:|
-| single-core `memcpy`, 1316 B | 18.6 ns | 0.0141 ns/B |
-| single-core `memcpy`, 700 B | 11.4 ns | 0.0163 ns/B |
-| single-core `memcpy`, 64 KiB | 1.49 us | 0.0227 ns/B |
-| null syscall (`getpid`, mitigations as shipped) | 0.27-0.30 us | - |
-| kernel byte sensitivity, 700 -> 1316 B, batching fixed | -0.37 .. +0.66 ns/B | ~0.1-0.7 ns/B |
-
-A user-space copy of a payload costs 18.6 ns. The shard spends 5.98 us per
-payload. Copying is **0.3 %** of it. The payload-size sweep did not show a
-per-byte cost either -- it held the wire datagram count *and* the wire byte
-count constant while doubling the number of payloads, so it showed "not per
-application payload" and nothing finer.
-
-**The model.** Four terms, each fitted from an arm that varies only that term:
-
-```text
-T_wire(datagram) = S / batch + D + B * bytes + P
-                   ^         ^   ^         ^
-                   per-syscall, per-datagram, per-byte, user-space protocol
-```
-
-* **S, per-syscall: 0.88 us.** Fitted from `sendmmsg` at 1316 B: with
-  `T(b) = S/b + D`, batches 16 and 64 give `S(1/16 - 1/64) = 0.041 us` ->
-  `S = 0.875 us`. The null-syscall floor is 0.30 us, so ~0.58 us is socket-layer
-  work per call, not entry/exit. (At 700 B the same fit returns a negative `S`,
-  i.e. the term is smaller than this bench's resolution.)
-* **D, per-datagram: 7.53 us (700 B) and 7.56 us (1316 B).** Batching-invariant
-  and *size-invariant*: 88 % more bytes changes it by 0.4 %.
-* **B, per-byte: ~0.1-0.7 ns/B** (upper bound from the pipelined arm, which is
-  the only one with a consistent positive slope). Per byte, the shard's 4.6 ns/B
-  is 7-46x this.
-* **P, user-space protocol:** the remainder. `perf` puts srt-rs user space at
-  ~1 % *self* cost, but the source/service loop frame carries ~42 %, so P is
-  bounded by measurement rather than by assertion.
-
-**Reconciling the shard against the floor band:**
-
-| | us CPU per wire datagram |
-|---|---:|
-| `sendmmsg` batch 1 (mio/tokio/compio all within 14 %) | 9.7 / 10.4 / 10.1 |
-| compio, K=64 in flight | 8.5 |
-| compio, one operation awaited at a time | 12.5 |
-| `sendmmsg` batch 16-64 | 7.6 |
-| **the shard (F=200, sender process, window)** | **12.45** |
-
-The shard's 12.45 us per wire datagram sits at the *worst* end of the measured
-band -- the one-operation-at-a-time figure -- even though the Owner has 256 TX
-lanes. Pipelining K=64 is worth 32 % (12.5 -> 8.5 us) and batching 16 datagrams
-per syscall is worth a further 10 % (8.4 -> 7.6 us), so the measured, reachable
-floor is ~7.6-8.5 us: **headroom of roughly 1.4-1.6x on the per-datagram cost,
-and it lives in submission structure, not in bytes.**
-
-Caveat, stated rather than assumed: the floor arms are process-aggregate (the
-loopback receiver thread runs in the same process, and `getrusage(RUSAGE_SELF)`
-cannot separate it), while the shard's figure is its sender process alone. A
-strictly comparable TX-only floor needs the receiver in a second process; until
-that is measured, the honest reading is "the shard is not below the floor and
-the floor is not obviously above it", and the direction of the remaining
-unknown is *against* the shard, not for it.
-
-The capacity arithmetic follows, and it is the same 217 destinations/core the
-earlier (wrongly attributed) version computed:
-
-```text
-1 core / 12.45 us per wire datagram        = 80.3 K datagrams/s
-x 2.08 payloads per wire datagram (window)  = 167 K payloads/s
-/ 760 payloads/s per destination at 8 Mbps  = 220 destinations/core
-```
-
-So the *conclusion* survived; the *mechanism* did not. It is per-datagram
-overhead, not per-byte copying, and the levers are the submission structure
-(pipelining, batched submission) -- not the copies.
+The per-term model below does **not** depend on the shard: every term comes
+from the single-core floor bench, and none of them is affected by the
+denominator problem above.
 
 ### io_uring setup flags: measured, and none of them win
 
@@ -298,8 +301,9 @@ would dodge the syscall/mitigation tax:
 So the flag hunt is closed with evidence: `coop_taskrun + taskrun_flag` is
 within noise of the default (+0.3 %, inside the +/-0.7 % band) and `single_issuer`,
 which the transport already sets, costs 4.5 % at this arm shape. The remaining
-lever is still candidate D -- submission *structure* (pipelining and batching),
-worth 1.4-1.6x -- not ring flags.
+lever is still candidate D -- submission *structure* (pipelining and batching)
+-- not ring flags; its *size* is discussed above, where the conserved denominator
+puts it well below the 1.4-1.6x an earlier revision claimed.
 
 ### RTMP-over-TCP, in the same runtime, both ends
 
@@ -316,70 +320,56 @@ the same byte count on every row --
 
 | write size | mode | sustained | publisher ms CPU/Mbit | sink ms CPU/Mbit | **total** |
 |---:|---|---:|---:|---:|---:|
-| 4096 B | rtmp | 3.72 Gbit/s | 0.202 | 0.260 | **0.462** |
-| 4096 B | tcp | 4.46 Gbit/s | 0.218 | 0.121 | **0.339** |
-| 1316 B | rtmp | 1.44 Gbit/s | 0.526 | 0.654 | **1.180** |
-| 1316 B | tcp | 2.31 Gbit/s | 0.419 | 0.197 | **0.616** |
+| 4096 B | rtmp | 5.62 Gbit/s | 0.138 | 0.177 | **0.315** |
+| 4096 B | tcp | 7.77 Gbit/s | 0.128 | 0.121 | **0.249** |
+| 1316 B | rtmp | 1.87 Gbit/s | 0.379 | 0.530 | **0.909** |
+| 1316 B | tcp | 2.98 Gbit/s | 0.331 | 0.265 | **0.596** |
 
-Against the SRT shard at ~1.8 ms CPU per Mbit (1.11 sender + ~0.7 receiver,
-12.45 us per wire datagram carrying ~1400 B):
+Publisher bytes written and sink bytes read match on every row (1,372,351
+messages parsed in the 4096 B RTMP run). Against the SRT shard on the conserved
+denominator (~2.9 ms CPU per Mbit), a TCP byte stream in the same runtime is
+~9x cheaper per megabit at 4096-byte messages and ~3x cheaper with RTMP framing
+at 1316 bytes.
 
-* **TCP framing is not the story.** RTMP costs 36 % more per Mbit than the raw
-  stream at 4096-byte messages and 92 % more at 1316-byte messages: framing has
-  a per-message cost, and it grows as messages shrink. The 12-byte header per
-  message (0.3 % of bytes) is not what costs; the per-message processing is.
-* **Per message, SRT and RTMP are much closer than per megabit.** RTMP at
-  1316 B does 136 K messages/s at 5.54 us of publisher CPU per message; the SRT
-  shard does 73 K wire datagrams/s at 12.45 us each. So SRT is ~2.2x per
-  message and ~1.5x per megabit at matched payload size, and ~3.9x per megabit
-  at 4096-byte messages, where TCP simply puts 3x the payload per message.
-* This is the same wall as candidate D, seen from the other protocol: the cost
-  is **per message**, so the levers are fewer messages (coalescing, larger
-  wire payloads) or cheaper submission per message (pipelining, batching), and
-  SRT's per-datagram ACK/ring machinery is what it pays on top.
+#### The same flag matrix, on the streaming path (it does not transfer)
 
-#### The same flag matrix, on the streaming path (and it does not transfer)
+The UDP matrix ranks flags within a +/-0.7 % band. The streaming path does not
+behave the same way, so `rtmp_publish_floor` applies the *same* table (both
+benches share one definition in `srt_bench::ring_modes`) to both roles, via
+`--ring` and `--ring-matrix`. Total (publisher + sink) ms CPU per Mbit, 4096-byte
+writes:
 
-The UDP matrix above ranks flags within a +/-0.7 % band. The RTMP/TCP path does
-not behave the same way, so `rtmp_publish_floor` applies the *same* table (both
-benches now share one definition in `srt_bench::ring_modes`) to both roles, via
-`--ring` and `--ring-matrix`. Three reps, 4096-byte writes, median of total
-(publisher + sink) ms CPU per Mbit --
-`docs/results/scaling-1000/rtmp-tcp-ring-matrix.txt`:
+| ring flags | rtmp total | tcp total |
+|---|---:|---:|
+| `coop+single_issuer+defer_taskrun` | **0.302** | not reached |
+| `coop_taskrun+taskrun_flag` | 0.321 | 0.238 |
+| `single_issuer+defer_taskrun` | 0.326 | not reached |
+| `single_issuer` | 0.331 | 0.252 |
+| none | 0.342 | 0.241 |
+| `coop_taskrun` | 0.350 | **0.235** |
+| `sqpoll_1ms` | 2.625 | not reached |
+| `sqpoll_1ms+defer_taskrun` (with the required `SINGLE_ISSUER` set) | rejected `EINVAL` | not reached |
 
-| ring flags | rtmp total | spread | tcp total | spread |
-|---|---:|---:|---:|---:|
-| `coop+single_issuer+defer_taskrun` | **0.406** | 0.050 | 0.361 | - |
-| `single_issuer` | 0.430 | 0.076 | **0.295** | 0.076 |
-| `single_issuer+defer_taskrun` | 0.451 | 0.068 | 0.432 | - |
-| `coop_taskrun+taskrun_flag` | 0.481 | 0.170 | 0.345 | 0.038 |
-| none | 0.483 | 0.029 | 0.368 | 0.097 |
-| `coop_taskrun` | 0.506 | 0.059 | 0.334 | 0.049 |
-| `sqpoll_1ms` | 20.246 | 7.325 | 6.227 | - |
-| `sqpoll_1ms+defer_taskrun` | rejected `EINVAL` | - | rejected `EINVAL` | - |
+*One rep, 4 s, both roles on the same flags. The tcp half is incomplete because
+the run hit its time box, and it is recorded as incomplete rather than padded.*
 
 What survives:
 
-* **SQPOLL is 20-50x worse on the streaming path**, far outside any spread, on
-  both framing modes. This is the UDP result (25 % worse) amplified -- and it is
-  now the only flag conclusion supportable on this path: SQPOLL does not reduce
-  submission cost here, and its spinning thread costs a core that the
-  measurements themselves need.
-* **No other flag wins beyond noise.** The top five rows span 0.406-0.506 on
-  RTMP and 0.295-0.432 on TCP while within-config spread reaches 0.17, and the
-  ordering *flips between the two paths* (`defer_taskrun` first on RTMP, last
-  but one on TCP). Reporting a winner from these numbers would be picking noise;
-  the run length and rep count that would settle it are 30 s x 10 reps with
-  pinned CPUs, which is a target-host experiment, not this one.
-* `sqpoll_1ms+defer_taskrun` is rejected with `EINVAL` on TCP exactly as on
-  UDP, which is the kernel enforcing that `DEFER_TASKRUN` needs
-  `SINGLE_ISSUER` without SQPOLL.
-
-The honest summary of the whole flag hunt, across both paths: the transport
-already sets the one flag that measures well (`single_issuer`), SQPOLL is
-disqualified, and the remaining combinations are inside the noise of this
-host's streaming measurements. Candidate D -- submission structure -- remains
-the lever; ring flags are not.
+* **SQPOLL is ~8x worse on the streaming path**, far outside any plausible
+  spread. This is the UDP result (25 % worse) amplified, and it is the only flag
+  conclusion either path supports: per-datagram kernel work does not vanish when
+  SQPOLL takes it over, and its spinning thread costs a core the measurement
+  itself needs.
+* **No other flag wins beyond noise.** The top six rows span 0.302-0.350 on RTMP
+  and 0.235-0.252 on TCP, while repeat-to-repeat spread on this path reaches
+  0.05-0.17 -- and the ordering flips between the two paths. Reporting a winner
+  would be picking noise; the doc states what would settle it (30 s x 10 reps,
+  pinned CPUs, target host) instead.
+* `sqpoll_1ms+defer_taskrun` is rejected with `EINVAL` **now that the arm sets
+  the `SINGLE_ISSUER` the kernel requires for `DEFER_TASKRUN`**. The first
+  version of this arm omitted that flag, so its rejection was explained by the
+  missing flag and proved nothing about the combination; the corrected
+  construction still rejects, which is what turns it into a finding.
 
 Two bench bugs stood between the first attempt and this table, both worth
 recording because each looked like a transport result rather than a harness
@@ -400,11 +390,21 @@ comparisons must be transport-bound.
 Flat self-costs from a 3 s window under `perf record -F 2999 --call-graph dwarf`:
 
 ```text
-41 %   kernel: io_sendmsg -> udp_sendmsg -> ip_send_skb   (per-datagram, byte-copying)
+41 %   kernel: io_sendmsg -> udp_sendmsg -> ip_send_skb
  5 %   ring entry/exit: io_uring_enter, io_submit_sqes
  3 %   compio runtime: poll_with, task run
 ~1 %   srt-rs user space (self cost of the whole protocol)
 ```
+
+That 41 % is the kernel's **per-datagram send-path work**, and `perf` does not
+decompose it further: the same stacks cover skb allocation, routing, checksum,
+socket accounting, queueing and loopback delivery. In particular it is *not* a
+copy attribution -- the copy-specific experiments (the memcpy floor at 18.6 ns
+per payload, and the per-byte kernel sensitivity at <=0.7 ns/B) already bound
+copying well below this. An earlier revision of this section said "the copies
+are the cost", which contradicts the retraction above; the supportable
+statement is the narrower one: **kernel UDP per-datagram send-path work
+dominates the sampled self cost, and its composition is not yet attributed**.
 
 And the syscall count says the same thing from the other side: over 8 s the
 receiver entered the kernel 47,605 times while completing 868,805 ring
@@ -454,12 +454,13 @@ The metric used from here on is *in-window wire bytes per CPU-second*.
 ### The floor measurement reopened candidate D
 
 Candidate C closed the receiver side, but the floor bench (added after those
-three candidates) showed the shard at 12.45 us per wire datagram against a
-measured reachable floor of 7.6-8.5 us. T2's three candidates were all measured
-*inside* the assumption that the per-datagram cost was structural; that
-assumption is now falsified, so the stopping condition is re-armed with
-**candidate D: coalesce lane submissions (pipeline depth and batched
-submission), target 8.5 us per wire datagram**, measured with the same metric
+three candidates) showed the shard above the measured reachable floor. T2's
+three candidates were all measured *inside* the assumption that the per-datagram
+cost was structural; the floor bench falsified the assumption that nothing could
+be gained, but the *size* of the gain was then misstated using a non-conserved
+denominator. The stopping condition is re-armed with **candidate D: coalesce
+lane submissions (pipeline depth and batched submission)**, measured on the
+conserved denominator (us CPU per delivered payload, `drain_ok` rows only)
 and the same +/-0.7 % band. No implementation is claimed here; the candidate is
 recorded with its measurement so the next change starts from evidence.
 
