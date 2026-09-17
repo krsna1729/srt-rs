@@ -254,6 +254,92 @@ So the *conclusion* survived; the *mechanism* did not. It is per-datagram
 overhead, not per-byte copying, and the levers are the submission structure
 (pipelining, batched submission) -- not the copies.
 
+### io_uring setup flags: measured, and none of them win
+
+Compio exposes the whole flag set the kernel offers; the transport sets
+`single_issuer(true)` and leaves the rest at defaults with "no evidence to
+enable them". This closes that gap -- `udp_datapath_floor --ring`, 1316 B,
+K=64 in flight, same host, same arm shape
+(`docs/results/scaling-1000/floor-ring-matrix.txt`):
+
+| ring flags | us CPU per datagram | datagrams/s |
+|---|---:|---:|
+| none (driver default) | **7.890** | 188,494 |
+| `coop_taskrun` | 7.911 | 187,647 |
+| `coop_taskrun + taskrun_flag` | **7.869** | 191,060 |
+| `single_issuer` | 8.245 | 183,827 |
+| `single_issuer + defer_taskrun + taskrun_flag` | 8.606 | 180,588 |
+| `coop_taskrun + single_issuer + defer_taskrun` | 8.365 | 181,156 |
+| `sqpoll(1ms)` | 9.853 | 172,097 |
+| `sqpoll(1ms) + defer_taskrun` | rejected: `EINVAL` | - |
+
+Three conclusions, all against the hypothesis that zero-syscall submission
+would dodge the syscall/mitigation tax:
+
+1. **SQPOLL is the worst arm, not the best**, 25 % above the default. The
+   mechanism is not subtle: the submitting thread's per-datagram kernel work
+   (`io_submit_sqes -> io_sendmsg -> udp_sendmsg`) does not disappear when
+   SQPOLL takes it over, it moves to a spinning kernel thread -- and the CPU
+   accounting in this table is *process* CPU, which already flatters SQPOLL,
+   while its end-to-end wall throughput is 9 % lower. On a 6-vCPU host where
+   five shards already saturate the CPUs, buying a dedicated spinner is a bad
+   trade.
+2. **The syscall tax this was meant to avoid is bounded and small.** A null
+   syscall on this host measures 0.27-0.30 us and the *fitted* per-syscall term
+   is 0.875 us, against a per-datagram floor of ~7.5-12.5 us: the whole
+   syscall-entry/exit budget (retpoline and conditional-IBP already included) is
+   under 10 % of the datapath cost. Removing 100 % of it cannot pay for a
+   spinning thread.
+3. **`defer_taskrun` needs `single_issuer` and is incompatible with SQPOLL**,
+   exactly as the docs say; the kernel returns `EINVAL` for the combination
+   rather than ignoring it, which is why that row is a rejection and not a
+   number.
+
+So the flag hunt is closed with evidence: `coop_taskrun + taskrun_flag` is
+within noise of the default (+0.3 %, inside the +/-0.7 % band) and `single_issuer`,
+which the transport already sets, costs 4.5 % at this arm shape. The remaining
+lever is still candidate D -- submission *structure* (pipelining and batching),
+worth 1.4-1.6x -- not ring flags.
+
+### RTMP-over-TCP, in the same runtime (and what is still missing)
+
+`crates/srt-bench/benches/rtmp_publish_floor.rs` exists so the RTMP comparison
+is not confounded by language or runtime: publisher *and* sink are both Rust on
+Compio, two processes, the same shape as our SRT pair, and the same write sizes
+are available in `--mode tcp` (no RTMP framing) as in `--mode rtmp` (RTMP
+chunking), so framing cost is a difference rather than a guess.
+
+Measured, transport-bound (10 s, 4096-byte writes, `--mode tcp`,
+`docs/results/scaling-1000/rtmp-tcp-compio-preliminary.txt`):
+
+| | publisher | sink |
+|---|---:|---:|
+| sustained rate | 5.06-5.97 Gbit/s | same |
+| CPU per Mbit | **0.086-0.103 ms** | 0.086-0.103 ms |
+| CPU per write | 0.16-0.19 us | - |
+| at 1316-byte writes | 0.159-0.209 ms per Mbit | 0.16-0.21 ms per Mbit |
+
+Against the SRT shard, which spends ~1.8 ms of CPU per Mbit (1.11 sender +
+~0.7 receiver at 12.45 us per wire datagram), **a TCP byte stream in the same
+runtime is 8-20x cheaper per megabit**. The mechanism is the same one candidate
+D names: TCP coalesces 4096-byte writes into MSS-sized segments and amortises
+submission, where the SRT path pays a ring round trip and a protocol header per
+1400-byte datagram.
+
+Two honest gaps:
+
+* `--mode rtmp` is **not yet measured**. The arm now performs the real
+  handshake in the correct order -- reading C0+C1, then writing S0+S1+S2, then
+  reading C2; the first version read all 3073 client bytes up front and
+  deadlocked, which is a bench bug rather than an RTMP property -- but it still
+  blocks after `publish`, so no framing number is published here. The framing
+  overhead is 12 bytes per 4096-byte message (0.3 %) and is therefore not what
+  the comparison turns on, but "not measured" is not "measured to be small".
+* The paced variant of the same bench measures compio's *timer*: one
+  `time::sleep` per chunk costs ~290 us of CPU at this write size, swamping the
+  transport. Sustained-cost comparisons must be transport-bound, which is why
+  the table above is unpaced with a wall-clock deadline.
+
 ### Where the CPU actually goes (`perf`, F=200, sender)
 
 Flat self-costs from a 3 s window under `perf record -F 2999 --call-graph dwarf`:

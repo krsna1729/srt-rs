@@ -30,14 +30,31 @@
 //! the difference is exactly the per-datagram submission cost this report is
 //! about.
 //!
+//! A fifth family explores the io_uring setup flags Compio exposes and the
+//! transport leaves at defaults (`docs/production-progress.md` records them as
+//! "no evidence to enable them"): `coop_taskrun`, `taskrun_flag`,
+//! `defer_taskrun` (which the kernel only honours with `single_issuer`), and
+//! `SQPOLL`. The question is concrete: SQPOLL submits through shared memory
+//! with no `io_uring_enter` per datagram, so it should not pay the syscall
+//! entry/exit cost at all -- and on a host whose shipped mitigations are
+//! retpoline plus conditional IBPB, that is a measurable fraction of the
+//! per-datagram floor rather than a rounding error.
+//!
 //! Run with:
 //!
 //! ```text
 //! cargo bench -p srt-bench --bench udp_datapath_floor
 //! ```
+//!
+//! Ring arms run when `--ring` is passed (they are slower to converge and are
+//! not part of the baseline table):
+//!
+//! ```text
+//! cargo bench -p srt-bench --bench udp_datapath_floor -- --ring
+//! ```
 
 use std::net::{SocketAddr, UdpSocket};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use srt_bench::cpu_stats::process_stats;
 
@@ -386,7 +403,129 @@ fn null_syscall_arm(iters: usize) -> f64 {
     cpu1 - cpu0
 }
 
+/// The io_uring setup combinations under test, as `(name, apply)`.
+///
+/// Names are the flag sets, not guesses about which is best: the kernel
+/// rejects some combinations (`COOP_TASKRUN` is not accepted with `SQPOLL`),
+/// and a rejection is reported rather than silently skipped.
+/// How one ring combination is applied to a Compio proactor.
+type ApplyRing = fn(&mut compio::driver::ProactorBuilder);
+
+fn ring_modes() -> Vec<(&'static str, ApplyRing)> {
+    fn none(_: &mut compio::driver::ProactorBuilder) {}
+    fn coop(p: &mut compio::driver::ProactorBuilder) {
+        p.coop_taskrun(true);
+    }
+    fn coop_flag(p: &mut compio::driver::ProactorBuilder) {
+        p.coop_taskrun(true);
+        p.taskrun_flag(true);
+    }
+    fn single(p: &mut compio::driver::ProactorBuilder) {
+        p.single_issuer(true);
+    }
+    fn single_defer(p: &mut compio::driver::ProactorBuilder) {
+        p.single_issuer(true);
+        p.defer_taskrun(true);
+        p.taskrun_flag(true);
+    }
+    fn sqpoll(p: &mut compio::driver::ProactorBuilder) {
+        p.sqpoll_idle(Duration::from_millis(1));
+    }
+    fn sqpoll_defer(p: &mut compio::driver::ProactorBuilder) {
+        p.sqpoll_idle(Duration::from_millis(1));
+        p.defer_taskrun(true);
+        p.taskrun_flag(true);
+    }
+    fn coop_defer(p: &mut compio::driver::ProactorBuilder) {
+        p.coop_taskrun(true);
+        p.single_issuer(true);
+        p.defer_taskrun(true);
+        p.taskrun_flag(true);
+    }
+    vec![
+        ("none", none as ApplyRing),
+        ("coop_taskrun", coop),
+        ("coop_taskrun+taskrun_flag", coop_flag),
+        ("single_issuer", single),
+        ("single_issuer+defer_taskrun", single_defer),
+        ("sqpoll_1ms", sqpoll),
+        ("sqpoll_1ms+defer_taskrun", sqpoll_defer),
+        ("coop+single_issuer+defer_taskrun", coop_defer),
+    ]
+}
+
+/// One arm with a configured ring: `K` operations in flight, `bytes` each.
+fn arm_ring(peer: SocketAddr, bytes: usize, k: usize, apply: ApplyRing) -> Result<Arm, String> {
+    use compio::net::UdpSocket;
+    let mut proactor = compio::driver::ProactorBuilder::new();
+    proactor.driver_type(compio::driver::DriverType::IoUring);
+    apply(&mut proactor);
+    let mut builder = compio::runtime::RuntimeBuilder::new();
+    builder.with_proactor(proactor);
+    let runtime = builder.build().map_err(|e| format!("runtime: {e}"))?;
+
+    let payload = bytes::Bytes::from(vec![0x5Au8; bytes]);
+    Ok(runtime.block_on(async move {
+        let sock = std::rc::Rc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
+        let cpu0 = cpu_ms_now();
+        let wall0 = Instant::now();
+        let mut sent = 0usize;
+        let mut inflight = futures_util::stream::FuturesUnordered::new();
+        while sent < DATAGRAMS {
+            while inflight.len() < k {
+                let sock = sock.clone();
+                let buf = payload.clone();
+                inflight.push(async move { sock.send_to(buf, peer).await });
+                sent += 1;
+            }
+            match futures_util::StreamExt::next(&mut inflight).await {
+                Some(out) if out.0.is_ok() => {}
+                _ => break,
+            }
+        }
+        while futures_util::StreamExt::next(&mut inflight).await.is_some() {}
+        Arm {
+            sent,
+            cpu_ms: cpu_ms_now() - cpu0,
+            wall_s: wall0.elapsed().as_secs_f64(),
+        }
+    }))
+}
+
+/// The ring matrix, at a fixed payload size so the comparison is one variable.
+fn ring_matrix(bytes: usize, k: usize) {
+    let rx = UdpSocket::bind("127.0.0.1:0").expect("bind rx");
+    let peer = rx.local_addr().expect("addr");
+    std::thread::spawn(move || {
+        let mut buf = vec![0u8; 65_536];
+        loop {
+            if rx.recv_from(&mut buf).is_err() {
+                continue;
+            }
+        }
+    });
+    for (name, apply) in ring_modes() {
+        match arm_ring(peer, bytes, k, apply) {
+            Ok(_warm) => match arm_ring(peer, bytes, k, apply) {
+                Ok(a) => print_arm("io_uring_ring", bytes, &format!("mode={name} k={k}"), &a),
+                Err(e) => println!("FLOOR arm=io_uring_ring mode={name} unsupported={e}"),
+            },
+            Err(e) => println!("FLOOR arm=io_uring_ring mode={name} unsupported={e}"),
+        }
+    }
+}
+
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--ring") {
+        println!(
+            "# udp_datapath_floor ring-matrix bytes={} datagrams_per_arm={DATAGRAMS}",
+            PAYLOAD_SIZES[1]
+        );
+        memcpy_arm();
+        ring_matrix(PAYLOAD_SIZES[1], PIPELINE_K);
+        return;
+    }
     println!(
         "# udp_datapath_floor os={} cpus={} datagrams_per_arm={} rounds={} pipeline_k={}",
         std::env::consts::OS,

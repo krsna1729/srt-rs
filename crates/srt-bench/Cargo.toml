@@ -59,6 +59,14 @@ harness = false
 [[bench]]
 name = "udp_datapath_floor"
 harness = false
+
+# Comparative RTMP-over-TCP floor, written in this crate's own runtime so the
+# comparison against the SRT shard does not confound language or runtime. It
+# publishes to an external RTMP server (mediamtx or any other); nothing is
+# vendored and no server is started here.
+[[bench]]
+name = "rtmp_publish_floor"
+harness = false
 [features]
 bench-internals = []
 
