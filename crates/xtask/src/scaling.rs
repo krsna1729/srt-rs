@@ -74,6 +74,11 @@ const TX_KEYS: &[&str] = &[
     // The offer is part of the row: a capacity sweep is unreadable without it,
     // and the gate needs it to name what was sustained.
     "offered_bps_per_dest",
+    // Diagnostic fence counters: offered and accepted after the measured
+    // window, excluded from every workload figure. They exist to test whether an
+    // end-of-run tail closes when later sequence progress is forced.
+    "fence_offered",
+    "fence_accepted",
 ];
 
 /// Fields read from the receiver's `STATS` line.
@@ -143,6 +148,8 @@ struct Options {
     /// Offered bitrate per destination. The capacity frontier is a function of
     /// it, so the sweep has to be able to vary it rather than assuming 8 Mbps.
     rate_mbps_per_dest: f64,
+    /// Send the diagnostic terminal fence after the measured window.
+    fence: bool,
 }
 
 impl Default for Options {
@@ -158,6 +165,7 @@ impl Default for Options {
             base_port: 30_000,
             payload_bytes: 1316,
             rate_mbps_per_dest: 8.0,
+            fence: false,
         }
     }
 }
@@ -195,6 +203,7 @@ impl Options {
             "--base-port" => self.base_port = parse(value, flag)?,
             "--payload-bytes" => self.payload_bytes = parse(value, flag)?,
             "--rate-mbps-per-dest" => self.rate_mbps_per_dest = parse(value, flag)?,
+            "--fence" => self.fence = parse(value, flag)?,
             _ => return Ok(false),
         }
         Ok(true)
@@ -416,7 +425,7 @@ fn header(options: &Options) -> Result<String, String> {
     columns.extend(RX_KEYS.iter().map(|k| format!("rx_{k}")));
     Ok(format!(
         "# scaling-sweep n={} shards={} fanout={} tx_lanes={} connect_cc={} window_ms={} \n\
-         # reps={} base_port={} payload_bytes={} rate_mbps_per_dest={} git_sha={} git_dirty={}\n{}\n",
+         # reps={} base_port={} payload_bytes={} rate_mbps_per_dest={} fence={} git_sha={} git_dirty={}\n{}\n",
         options.n,
         options.shards,
         options.n / options.shards,
@@ -427,6 +436,7 @@ fn header(options: &Options) -> Result<String, String> {
         options.base_port,
         options.payload_bytes,
         options.rate_mbps_per_dest,
+        options.fence,
         sha,
         dirty,
         columns.join("\t")
@@ -549,6 +559,8 @@ fn spawn_senders(
                 options.payload_bytes.to_string(),
                 "--rate-mbps-per-dest".to_string(),
                 options.rate_mbps_per_dest.to_string(),
+                "--fence".to_string(),
+                options.fence.to_string(),
             ])
             .stdout(Stdio::from(log.try_clone().map_err(|e| e.to_string())?))
             .stderr(Stdio::from(log))

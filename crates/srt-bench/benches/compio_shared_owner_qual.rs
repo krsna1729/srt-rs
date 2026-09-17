@@ -163,6 +163,12 @@ struct QualReport {
     /// A capacity sweep is unreadable unless the offer sits on the same line as
     /// the delivery.
     offered_bps_per_dest: u64,
+    /// Diagnostic fences offered / accepted after the measured window.
+    ///
+    /// Excluded from every workload figure: they exist to force later sequence
+    /// progress and make an end-of-run tail observable.
+    fence_offered: u64,
+    fence_accepted: u64,
     /// CPU consumed by the measurement window alone.
     ///
     /// `cpu_ms` spans window + post-window drain, and the drain is not
@@ -206,15 +212,28 @@ fn parse_arg<T: std::str::FromStr>(args: &[String], name: &str, default: T) -> T
         .unwrap_or(default)
 }
 
+/// What the source offers: payload framing, cadence, and whether the diagnostic
+/// fence is sent after the measured window. Grouped because these are the
+/// producer's inputs, distinct from the run's shape (fanout, window, ports).
+struct Source {
+    payload_size: usize,
+    interval_us: u64,
+    with_fence: bool,
+}
+
 async fn run_sender(
     fanout: usize,
     duration_ms: u64,
     base_port: u16,
     tx_lanes: usize,
     connect_cc: usize,
-    payload_size: usize,
-    interval_us: u64,
+    source: &Source,
 ) -> QualReport {
+    let Source {
+        payload_size,
+        interval_us,
+        with_fence,
+    } = *source;
     let mut report = QualReport {
         fanout,
         tx_lanes,
@@ -518,6 +537,39 @@ async fn run_sender(
         report.offer_lateness_us_p99 = percentile(&offer_lateness, 0.99);
         report.offer_lateness_us_max = offer_lateness.last().copied().unwrap_or(0);
 
+        // --- diagnostic terminal fence (measurement only)
+        //
+        // One ordinary SRT DATA payload per destination, offered AFTER the last
+        // measured tick and BEFORE the drain. It exists to test one hypothesis
+        // about the end-of-run conservation deficit: that the missing payloads
+        // are a tail the receiver has no evidence for, because no later sequence
+        // number ever arrives to expose the gap. A fence provides exactly that
+        // later sequence progress, so:
+        //
+        //   deficit closes with the fence and retransmission appears  -> the tail
+        //       needed later sequence progress (end-of-stream recovery property)
+        //   deficit closes with the fence and no retransmission       -> snapshot /
+        //       teardown race
+        //   deficit persists with the fence                           -> delivery or
+        //       accounting defect, not lifecycle
+        //
+        // Fence payloads are deliberately a different size and pattern from the
+        // measured workload, and are counted in their own fields: nothing here
+        // enters `data_offered`, `data_accepted`, the r ratios, or any CPU
+        // normalisation.
+        let fence_payload = Bytes::from(vec![0x5Fu8; PAYLOAD_SIZE / 8]);
+        for id in &ids {
+            if !with_fence {
+                break;
+            }
+            report.fence_offered += 1;
+            if let Some(mut caller) = owner.logical_caller_mut(id)
+                && caller.send_shared(fence_payload.clone(), now).is_ok()
+            {
+                report.fence_accepted += 1;
+            }
+        }
+
         // --- TX-enabled drain to equilibrium, bounded
         let drain_start = Instant::now();
         while drain_start.elapsed() < DRAIN_DEADLINE {
@@ -569,6 +621,7 @@ fn main() {
     let connect_cc: usize = parse_arg(&args, "--connect-cc", 64);
     let payload_bytes: usize = parse_arg(&args, "--payload-bytes", PAYLOAD_SIZE);
     // Offered cadence, swept by the qualification rather than assumed.
+    let fence: bool = parse_arg(&args, "--fence", false);
     let rate_mbps_per_dest: f64 = parse_arg(&args, "--rate-mbps-per-dest", RATE_BPS as f64 / 1e6);
     let rate_bps = (rate_mbps_per_dest * 1e6) as u64;
     assert!(
@@ -589,8 +642,11 @@ fn main() {
         base_port,
         tx_lanes,
         connect_cc,
-        payload_bytes,
-        interval_us,
+        &Source {
+            payload_size: payload_bytes,
+            interval_us,
+            with_fence: fence,
+        },
     ));
 
     let managed = report.rx_mode == format!("{:?}", OwnerRxMode::ManagedMultishot);
@@ -608,7 +664,7 @@ fn main() {
          inflight_at_window_end={} drain_submitted={} drain_completed={} \
          pending_after_drain={} rx_mode={} managed_rx={} \
          rx_dropped={} rx_truncated={} tx_pool={}/{} payload_bytes={} interval_us={} \
-         offered_bps_per_dest={} \
+         offered_bps_per_dest={} fence_offered={} fence_accepted={} \
          cpu_ms={:.1} window_cpu_ms={:.1} drain_cpu_ms={:.1}",
         report.fanout,
         report.tx_lanes,
@@ -650,6 +706,8 @@ fn main() {
         report.payload_bytes,
         report.interval_us,
         report.offered_bps_per_dest,
+        report.fence_offered,
+        report.fence_accepted,
         report.cpu_ms,
         report.window_cpu_ms,
         report.drain_cpu_ms,
