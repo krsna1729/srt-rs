@@ -221,3 +221,49 @@ lifecycle hypothesis alone is insufficient. The next run needs more repetitions,
 and receiver-side fence identification (so fence payloads are excluded by the
 receiver rather than by arithmetic), plus the per-peer missing set the protocol
 document calls for.
+
+## Post-fix canonical run: thresholds frozen before measuring
+
+The surfaces above were measured against a sender that had **no reachable loss
+timeout of its own**, so a lost *suffix* of a flight was stranded permanently
+(the receiver can only NAK a gap that a later sequence number exposes). Everything
+on this page is therefore **pre-fix evidence**, and the "256-payload deficit"
+analysis above is its most valuable output: the deficit is exactly one TX pool
+depth, appears only at end of stream, and has no mid-stream signature.
+
+This section was written **before** the run it describes, so the thresholds cannot
+have been chosen to fit the result.
+
+```text
+head at declaration:     48e89fc (clean tree required at run time)
+configuration:           F=50, 8 Mbps/dest, payload 1316 B (interval 1316 us),
+                         K=256 TX lanes, H=64 connect concurrency, 1 sender process
+window:                  60 s x 3 independent repetitions
+diagnostics:             --identity --fence (tick-tagged payloads + terminal fence)
+
+declared cadence        generated/expected >= 0.999
+declared stationarity   f_drain <= 0.01
+declared real-time      UNDECLARED (no budget claimed)
+```
+
+Acceptance for the run to be called a qualified capacity point (all three
+repetitions, not "two of three"):
+
+```text
+1. conservation: accepted == delivered (identity payloads, fence excluded)
+2. cadence:      generated / expected >= 0.999
+3. stationarity: f_drain <= 0.01
+4. fence:        diag_fences_seen == 50 and diag_missing_final == 0
+5. accounting:   sum(tx_class_*) == tx_class_total == tx_submitted_wire
+6. fault:        no Owner fault; tx_failures_pending == 0
+7. RX:           rx_lost and rx_duplicates are zero or explained by a named cause
+```
+
+`--drain-fraction-max 0.01` is a declared bound, not an inferred one: the pre-fix
+steady configuration measured `f_drain = 0.0 %`, while every backlogged
+configuration measured 33-76 %, so 1 % separates keeping pace from not keeping
+pace by more than an order of magnitude on either side. Real time stays
+undeclared: `first_submit_lateness_us_*` is reported, and the offer itself is
+already known not to be punctual (p99 4.6-13.8 ms against a 5 ms budget), so a
+real-time claim needs a source that is punctual before it can be about the
+dataplane.
