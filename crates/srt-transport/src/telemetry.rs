@@ -514,10 +514,84 @@ impl IngressTelemetry {
     }
 }
 
+/// SRT-level receiver accounting across sessions.
+///
+/// A different layer from the Owner's socket-level RX counters
+/// (`compio_transport::OwnerRxStats`): those describe what the *socket* did --
+/// datagrams read, ring depth, datagrams truncated at the provided-buffer
+/// boundary. These two totals describe what the *protocol* concluded about the
+/// DATA stream those datagrams carried: a sequence number that never arrived
+/// (or was abandoned past its TLPKTDROP deadline) is a loss, and a DATA packet
+/// that duplicates an already-accepted packet is a duplicate. Neither implies
+/// the other in either direction. A run that reads every datagram flawlessly
+/// can still record loss when the peer dropped a packet before the wire, and a
+/// retransmission storm shows up here as duplicates while the socket reports
+/// nothing unusual at all.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RcvTotals {
+    /// DATA packets the protocol declared lost (missing past their gap, or
+    /// TLPKTDROP-abandoned).
+    pub lost: u64,
+    /// DATA packets received more than once (retransmissions that duplicate an
+    /// already-accepted packet count here).
+    pub duplicates: u64,
+}
+
+impl RcvTotals {
+    /// Add one connection's counters, saturating rather than wrapping.
+    ///
+    /// Saturation is the honest choice for a monotone protocol counter: a
+    /// wrapped total would read as a *decrease* in loss, which is worse than a
+    /// pinned one for any consumer watching a delta.
+    pub fn accumulate(&mut self, lost: u64, duplicates: u64) {
+        self.lost = self.lost.saturating_add(lost);
+        self.duplicates = self.duplicates.saturating_add(duplicates);
+    }
+
+    /// Fold another aggregate in, e.g. a table's retired-session ledger or a
+    /// second shard's totals.
+    pub fn merge(&mut self, other: RcvTotals) {
+        self.accumulate(other.lost, other.duplicates);
+    }
+
+    /// Fold one connection's receiver snapshot in. `None` means the connection
+    /// has no receiver direction yet (its handshake has not finished), which
+    /// contributes nothing.
+    ///
+    /// Crate-internal because it exists so a table can sample live sessions and
+    /// its retired ledger through the same rule; the public aggregate surface
+    /// stays [`Self::accumulate`] and [`Self::merge`].
+    pub(crate) fn observe(&mut self, stats: Option<&srt_proto::receiver::ReceiverStats>) {
+        if let Some(stats) = stats {
+            self.accumulate(stats.total_lost, stats.total_duplicates);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    /// `RcvTotals` accumulates monotonically: a consumer watching a delta must
+    /// never see wrapping turn a very large loss count into a small one.
+    #[test]
+    fn rcv_totals_saturate_instead_of_wrapping() {
+        let mut totals = RcvTotals {
+            lost: u64::MAX - 1,
+            duplicates: 0,
+        };
+        totals.accumulate(5, 3);
+        assert_eq!(totals.lost, u64::MAX);
+        assert_eq!(totals.duplicates, 3);
+
+        totals.merge(RcvTotals {
+            lost: 10,
+            duplicates: u64::MAX,
+        });
+        assert_eq!(totals.lost, u64::MAX);
+        assert_eq!(totals.duplicates, u64::MAX);
+    }
 
     #[test]
     fn snapshot_starts_at_zero() {

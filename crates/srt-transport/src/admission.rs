@@ -3,7 +3,7 @@ use crate::{
     DatagramSink, DatagramSlot, DenseDueIndex, DenseSlotArena, DueIndex, GroupConnectionStats,
     GroupLogicalCounters, InboundGroupStats, IngressTelemetry, ListenerPeerPolicy, MAX_DENSE_SLOTS,
     ManualTimerStore, OutputDrainBudget, OutputDrainReport, OutputDrainStatus, PeerSlotId,
-    SinkOutcome, WorkerMessage, group_connection_stats,
+    RcvTotals, SinkOutcome, WorkerMessage, group_connection_stats,
 };
 use srt_proto::{
     Bytes, ConnectionEvent, ConnectionOptions, ConnectionOutput, DatagramClass, DisconnectReason,
@@ -947,6 +947,13 @@ pub struct PeerTable {
     groups: HashMap<srt_lifecycle::LogicalGroupKey, InboundGroup>,
     next_group_generation: u64,
     last_now: Timestamp,
+    /// SRT-level receiver totals of every logical peer this table has retired.
+    ///
+    /// A retired connection is handed back to the application, so its protocol
+    /// accounting is no longer reachable through the table; without this ledger
+    /// a run's loss and duplicate counts would silently shrink as peers churn.
+    /// Fixed-size (two scalars), so churn can never grow it.
+    retired_rcv: RcvTotals,
     config: PeerTableConfig,
 }
 
@@ -1038,6 +1045,7 @@ impl PeerTable {
             groups: HashMap::new(),
             next_group_generation: 1,
             last_now: Timestamp::default(),
+            retired_rcv: RcvTotals::default(),
             config,
         }
     }
@@ -3501,6 +3509,10 @@ impl PeerTable {
         };
         self.half_open_by_caller
             .remove(&(slot.address, entry.conn.peer_socket_id()));
+        // Sample the retiring connection before it is handed back to the
+        // application: after this function returns, the table no longer owns
+        // it, and a later snapshot must still carry its loss/duplicate totals.
+        self.add_receiver_totals(&entry.conn);
         self.logical_peers.remove(&entry.logical_peer);
         if entry.admission_established {
             self.established_peers = self.established_peers.saturating_sub(1);
@@ -3526,6 +3538,9 @@ impl PeerTable {
                 .group
                 .remove_member_connection(member_id)
                 .expect("group I/O legs are built with matching members");
+            // Sample each leg before it is handed back to the application; see
+            // `remove_direct`.
+            self.add_receiver_totals(&connection);
             if let Some(slot_idx) = self.slot_index_for_key(&leg.physical) {
                 self.purge_physical_indexes(leg.physical);
                 self.slots.remove_by_slot(slot_idx);
@@ -3538,6 +3553,39 @@ impl PeerTable {
             });
         }
         Some(RemovedLogicalPeer::Group(removed))
+    }
+
+    /// Fold one relinquished connection's SRT receiver counters into this
+    /// table's retired ledger. Called on every retirement path, before the
+    /// connection leaves the table.
+    fn add_receiver_totals(&mut self, connection: &SrtConnection) {
+        self.retired_rcv
+            .observe(connection.receiver_stats().as_ref());
+    }
+
+    /// SRT-level receive totals across this table: the retired ledger plus a
+    /// walk of every live logical peer -- each direct peer's connection and
+    /// every member of every bonded group.
+    ///
+    /// Costs O(live peers) plus one buffer pass per sampled connection (the
+    /// protocol's own snapshot walks each receive buffer, up to its capacity).
+    /// Sized for end-of-run and low-cadence snapshots only. Never call it from
+    /// a per-visit path: a population scan per service visit is exactly the
+    /// cost this table's ready and deadline indexes exist to avoid.
+    #[must_use]
+    pub fn receiver_totals(&self) -> RcvTotals {
+        let mut totals = self.retired_rcv;
+        for slot in self.slots.iter() {
+            if let Some(peer) = slot.value.direct() {
+                totals.observe(peer.conn.receiver_stats().as_ref());
+            }
+        }
+        for group in self.groups.values() {
+            for member in group.group.members() {
+                totals.observe(member.connection().receiver_stats().as_ref());
+            }
+        }
+        totals
     }
 
     fn decrement_source_count(&mut self, ip: std::net::IpAddr) {
@@ -4736,6 +4784,78 @@ mod tests {
             table.get_peer(&physical).expect("peer entry").data_events,
             1,
             "one DataReceived event must count as exactly one data_events increment"
+        );
+    }
+
+    /// A retired peer's SRT-level receive totals must stay visible through the
+    /// table, exactly as its live totals are, so a run's loss/duplicate
+    /// accounting cannot shrink as peers churn.
+    #[test]
+    fn receiver_totals_report_live_peers_and_survive_retirement() {
+        let peer = "127.0.0.1:11042".parse().expect("address");
+        let options = AdmissionOptions::basic(0x7777, 20, false);
+        let telemetry = IngressTelemetry::new();
+        let mut table = PeerTable::new();
+
+        let (mut caller, conclusion) =
+            admit_up_to_conclusion(&mut table, peer, 0x8888, &options, &telemetry);
+        admit_conclusion(
+            &mut table,
+            peer,
+            &mut caller,
+            &conclusion,
+            &options,
+            &telemetry,
+        );
+
+        caller
+            .send(b"payload", Timestamp::from_micros(4))
+            .expect("caller sends");
+        let data_packet = next_packet(&mut caller);
+        assert_eq!(
+            table.admit(
+                peer,
+                &data_packet,
+                Timestamp::from_micros(5),
+                &options,
+                0,
+                1,
+                &telemetry,
+            ),
+            Admit::Fed
+        );
+        let accepted = table.receiver_totals();
+
+        // The identical datagram again: the receiver has not played the
+        // payload out yet (the negotiated TSBPD latency is 120ms), so this is
+        // a duplicate by the protocol's own rule.
+        assert_eq!(
+            table.admit(
+                peer,
+                &data_packet,
+                Timestamp::from_micros(6),
+                &options,
+                0,
+                1,
+                &telemetry,
+            ),
+            Admit::Fed
+        );
+        let live = table.receiver_totals();
+        assert_eq!(
+            live.duplicates,
+            accepted.duplicates + 1,
+            "a live peer's duplicate must be visible through the table"
+        );
+        assert_eq!(live.lost, accepted.lost);
+
+        let physical = table.physical_for_address(peer).expect("peer admitted");
+        let logical = table.get_peer(&physical).expect("peer entry").logical_peer;
+        drop(table.remove(logical).expect("retire the peer"));
+        assert_eq!(
+            table.receiver_totals(),
+            live,
+            "retiring a peer must not erase the totals it contributed"
         );
     }
 

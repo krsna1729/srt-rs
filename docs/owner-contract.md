@@ -170,16 +170,25 @@ each may change without notice while every clause above still holds:
 
 ## Test map
 
+All names below are in `crates/srt-transport/src/runtimes/compio.rs`'s test module
+unless a path is given.
+
 | Clause | Pinned by |
 |---|---|
-| 1 ownership | Compile-time: `Owner` is not `Send`/`Sync`; runtime: `owner_sibling_isolation` |
+| 1 ownership | Not `Send`/`Sync`: enforced by the type; `owner_sibling_isolation` |
 | 2 fixed capacity | `owner_tx_bounded_concurrency_and_pool_exhaustion`, `owner_tx_pool_alloc_and_recycling`, `tx_pool_high_water_tracks_the_peak_and_never_exceeds_capacity` |
 | 3 reserve before materialize | `tx_pool_exhaustion_leaves_protocol_datagram_pending`, `owner_connects_transfers_data_and_tracks_resources` |
-| 4 bounded service | `rx_budget_is_exact_and_zero_means_zero`, `service_with_zero_completion_budget_reaps_nothing`, `service_returns_tx_buffers_and_updates_completion_stats` |
+| 4 bounded service | `rx_budget_is_exact_and_zero_means_zero`, `service_with_zero_completion_budget_reaps_nothing`, `service_returns_tx_buffers_and_updates_completion_stats`, `one_action_budget_bounds_whole_caller_visit` |
 | 5 protocol-owned timers | `owner_wake_includes_caller_pool_attempt_deadline`, `crates/srt-transport/tests/tail_recovery.rs` |
 | 6 explicit continuation | `tx_pool_exhaustion_leaves_protocol_datagram_pending`, `owner_tx_bounded_concurrency_and_pool_exhaustion` |
 | 7 fault poisoning | `managed_rx_stream_failure_faults_the_owner`, `rx_consumer_fault_stops_rx_maintenance_and_tx`, `owner_fault_gates_listen_and_connect_through_public_apis`, `failed_attach_does_not_freeze_the_owner`, `a_dead_tx_lane_poisons_the_owner_and_cannot_continue_at_reduced_capacity` |
 | 8 admission/backpressure | `owner_rejects_session_with_incompatible_wire_ceiling`, `owner_wake_includes_caller_pool_attempt_deadline` |
 | 9 completion ownership | `service_returns_tx_buffers_and_updates_completion_stats`, `tx_failure_event_reports_the_logical_attribution`, `owner_sibling_isolation` |
-| 10 bounded close | `shutdown_and_drain_reaps_in_flight_to_quiescence`, `shutdown_timeout_does_not_fabricate_quiescence`, `shutdown_verdict_requires_rx_quiescence` |
-| 11 telemetry meanings | `tx_class_counters_partition_every_submission`, `first_submit_lateness_records_only_first_transmissions`, `tx_pool_high_water_tracks_the_peak_and_never_exceeds_capacity`, `rx_stats_expose_both_sides` |
+| 10 bounded close | `shutdown_and_drain_reaps_in_flight_to_quiescence`, `shutdown_timeout_does_not_fabricate_quiescence`, `shutdown_verdict_requires_rx_quiescence`, `a_dead_tx_lane_poisons_the_owner_and_cannot_continue_at_reduced_capacity` |
+| 11 telemetry meanings | `report_tx_class_total_matches_submitted_packets_every_visit`, `tx_class_delta_reports_only_this_visits_submissions`, `first_submit_lateness_samples_only_first_transmission_data_with_a_due_instant`, `first_submit_lateness_measures_a_real_application_submission`, `tx_pool_high_water_tracks_the_peak_and_never_exceeds_capacity`, `rx_stats_expose_both_sides`, `rx_session_totals_report_live_sessions_and_survive_retirement`, `rx_session_totals_are_none_without_an_attached_side`, `rx_session_totals_include_bonded_group_legs` |
+
+Row-level evidence is gated separately, in `cargo xtask qualify`: a
+qualification row must decompose its wire submissions
+(`sum(tx_class_*) == tx_class_total == tx_submitted_wire`) and carry the
+first-submit lateness fields. That gate is the executable form of clause 11 for
+published results.

@@ -1,7 +1,8 @@
 use crate::sink::{DatagramTarget, ProtocolOutputFailure, TxAttribution};
 use crate::{
     DatagramSink, DatagramSlot, GroupConnectionStats, GroupLogicalCounters, ManualTimerStore,
-    OutputDrainBudget, OutputDrainReport, OutputDrainStatus, SinkOutcome, group_connection_stats,
+    OutputDrainBudget, OutputDrainReport, OutputDrainStatus, RcvTotals, SinkOutcome,
+    group_connection_stats,
 };
 use srt_proto::{
     Bytes, ConnectionOutput, DatagramClass, OutputInto, OutputMeta, SrtConnection, Timestamp,
@@ -400,6 +401,13 @@ pub struct CallerTable {
     protocol_failure_scratch: Option<Vec<ProtocolOutputFailure>>,
     next_logical_caller: u64,
     max_callers: usize,
+    /// SRT-level receiver totals of every session this table has retired.
+    ///
+    /// A retired connection is handed back to the application, so its protocol
+    /// accounting is no longer reachable through the table; without this ledger
+    /// a run's loss and duplicate counts would silently shrink as sessions
+    /// churn. Fixed-size (two scalars), so churn can never grow it.
+    retired_rcv: RcvTotals,
     #[cfg(any(test, feature = "bench-internals"))]
     sched_stats: SchedCounters,
 }
@@ -894,6 +902,7 @@ impl CallerTable {
             protocol_failure_scratch: Some(Vec::new()),
             next_logical_caller: 1,
             max_callers: bounded,
+            retired_rcv: RcvTotals::default(),
             #[cfg(any(test, feature = "bench-internals"))]
             sched_stats: SchedCounters::default(),
         }
@@ -1777,14 +1786,22 @@ impl CallerTable {
         self.sched.remove(&id);
         self.maybe_compact_ready_queue();
         self.maybe_compact_event_ready_queue();
+        // Every relinquished connection is sampled into the retired ledger
+        // BEFORE it is handed back to the application: once it leaves this
+        // table the table cannot read it again, yet a later snapshot must still
+        // carry what it had concluded about its stream.
         Some(match session {
             CallerSession::Direct(leg) => {
+                self.add_receiver_totals(&leg.connection);
                 RemovedLogicalCaller::Direct(Box::new(RemovedCallerLeg {
                     peer: leg.peer,
                     connection: leg.connection,
                 }))
             }
             CallerSession::Group(mut group) => {
+                for member in group.group.members() {
+                    self.add_receiver_totals(member.connection());
+                }
                 let legs = std::mem::take(&mut group.legs)
                     .into_iter()
                     .map(|(member_id, leg)| RemovedCallerLeg {
@@ -1798,6 +1815,41 @@ impl CallerTable {
                 RemovedLogicalCaller::Group(legs)
             }
         })
+    }
+
+    /// Fold one relinquished connection's SRT receiver counters into this
+    /// table's retired ledger. Called on every retirement path, before the
+    /// connection leaves the table.
+    fn add_receiver_totals(&mut self, connection: &SrtConnection) {
+        self.retired_rcv
+            .observe(connection.receiver_stats().as_ref());
+    }
+
+    /// SRT-level receive totals across this table: the retired ledger plus a
+    /// walk of every live session -- each direct leg's connection and every
+    /// member of every bonded group.
+    ///
+    /// Costs O(live sessions) plus one buffer pass per sampled connection (the
+    /// protocol's own snapshot walks each receive buffer, up to its capacity).
+    /// Sized for end-of-run and low-cadence snapshots only. Never call it from
+    /// a per-visit path: a population scan per service visit is exactly the
+    /// cost this table's ready and deadline indexes exist to avoid.
+    #[must_use]
+    pub fn receiver_totals(&self) -> RcvTotals {
+        let mut totals = self.retired_rcv;
+        for session in self.sessions.values() {
+            match session {
+                CallerSession::Direct(leg) => {
+                    totals.observe(leg.connection.receiver_stats().as_ref());
+                }
+                CallerSession::Group(group) => {
+                    for member in group.group.members() {
+                        totals.observe(member.connection().receiver_stats().as_ref());
+                    }
+                }
+            }
+        }
+        totals
     }
 
     #[must_use]

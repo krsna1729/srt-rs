@@ -1,8 +1,8 @@
 use crate::sink::{DatagramTarget, TxAttribution};
 use crate::{
     CallerTable, DatagramSink, DatagramSlot, IngressTelemetry, OutputDrainBudget,
-    OutputDrainReport, OutputDrainStatus, PacedSendOutcome, PeerTable, collect_output_work,
-    prepend_outputs,
+    OutputDrainReport, OutputDrainStatus, PacedSendOutcome, PeerTable, RcvTotals,
+    collect_output_work, prepend_outputs,
 };
 use compio::buf::BufResult;
 use compio::runtime::spawn;
@@ -1280,6 +1280,30 @@ pub struct OwnerRxStats {
     pub caller: Option<ManagedRxStats>,
 }
 
+/// Per-side SRT-level receive totals at the moment of the call.
+///
+/// A different layer from [`OwnerRxStats`]. Those counters describe the socket:
+/// datagrams read, ring depth, datagrams truncated at the provided-buffer
+/// boundary. These are what the SRT protocol concluded about the DATA stream
+/// on the sessions the side owns -- packets declared lost and packets received
+/// more than once -- summed over currently-live sessions *and* over sessions
+/// the side has already retired, so a run's totals cannot shrink as sessions
+/// churn.
+///
+/// `None` on a side means no socket is attached there, the same convention as
+/// [`OwnerRxStats`].
+///
+/// Collected on demand rather than maintained per visit: the live-session walk
+/// is O(logical sessions), so this belongs to end-of-run and low-cadence
+/// reporting, never to [`Owner::service`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OwnerRxSessionTotals {
+    /// `None` when no listener socket is attached.
+    pub listener: Option<RcvTotals>,
+    /// `None` when no caller socket is attached.
+    pub caller: Option<RcvTotals>,
+}
+
 /// Listener side of a shared Compio owner.
 ///
 /// Sealed on purpose: every field is private and the only construction paths
@@ -2012,6 +2036,22 @@ impl TxEngine {
         }
     }
 
+    /// Test-only: stop one lane's worker the way a panic would, without
+    /// touching any engine state.
+    ///
+    /// A real lane death is discovered by [`Self::check_worker_faults`]; latching
+    /// the fault here instead would test the assertion rather than the
+    /// detection. Only the worker is stopped, so the engine still believes it
+    /// has that lane -- which is exactly the state a panic leaves behind.
+    #[cfg(test)]
+    pub(crate) fn kill_lane_worker_for_test(&mut self, lane_idx: usize) {
+        let mut state = self.lanes[lane_idx].state.borrow_mut();
+        state.shutdown = true;
+        if let Some(waker) = state.worker_waker.take() {
+            waker.wake();
+        }
+    }
+
     pub(crate) fn reserve_lane(&mut self) -> Option<usize> {
         self.ensure_started();
         if self.fault.is_some() || self.shutdown {
@@ -2609,6 +2649,25 @@ impl OwnerTxClassCounters {
         self.counters().iter().sum()
     }
 
+    /// Fold another set of counters into this one.
+    ///
+    /// This is the consumer's core operation: each visit reports a delta, and
+    /// a run accumulates them. Saturating for the same reason as every other
+    /// counter here -- accounting must not be able to panic or wrap.
+    pub fn merge(&mut self, other: Self) {
+        self.data_first = self.data_first.saturating_add(other.data_first);
+        self.data_retx = self.data_retx.saturating_add(other.data_retx);
+        self.ack = self.ack.saturating_add(other.ack);
+        self.ackack = self.ackack.saturating_add(other.ackack);
+        self.nak = self.nak.saturating_add(other.nak);
+        self.keepalive = self.keepalive.saturating_add(other.keepalive);
+        self.handshake = self.handshake.saturating_add(other.handshake);
+        self.dropreq = self.dropreq.saturating_add(other.dropreq);
+        self.km = self.km.saturating_add(other.km);
+        self.shutdown = self.shutdown.saturating_add(other.shutdown);
+        self.other_control = self.other_control.saturating_add(other.other_control);
+    }
+
     /// Per-visit delta against an earlier snapshot of the same cumulative
     /// counters. Saturating: a delta is a report, and reporting must not be
     /// able to panic or wrap.
@@ -2893,6 +2952,31 @@ impl Owner {
         OwnerRxStats {
             listener: self.listener.as_ref().map(|side| side.rx.stats()),
             caller: self.caller.as_ref().map(|side| side.rx.stats()),
+        }
+    }
+
+    /// SRT-level receive totals for BOTH sides, in one snapshot.
+    ///
+    /// The protocol-layer counterpart to [`Self::rx_stats`]: what the SRT
+    /// sessions concluded about their DATA streams (declared loss, duplicate
+    /// arrivals) across each side's live sessions plus each side's retired
+    /// ledger. A side with no socket attached reports `None`.
+    ///
+    /// O(live sessions) plus one buffer pass per sampled connection, and
+    /// allocation-free (`&self` only), so it is an explicit snapshot for
+    /// end-of-run or low-cadence reporting -- never part of a [`Self::service`]
+    /// visit.
+    #[must_use]
+    pub fn rx_session_totals(&self) -> OwnerRxSessionTotals {
+        OwnerRxSessionTotals {
+            listener: self
+                .listener
+                .as_ref()
+                .map(|side| side.table.receiver_totals()),
+            caller: self
+                .caller
+                .as_ref()
+                .map(|side| side.table().receiver_totals()),
         }
     }
 
@@ -6942,6 +7026,122 @@ mod tests {
         });
     }
 
+    /// Item 12: a dead fixed TX lane must poison the Owner, not quietly halve
+    /// its submission capacity.
+    ///
+    /// A lane that panicked is invisible from the outside: the engine still
+    /// holds its slot, the pool still has capacity, and every remaining lane
+    /// keeps working. That is precisely why it has to be a fault. The sequence
+    /// asserted here is the whole containment contract: detected, latched,
+    /// admission and submission refused, already-submitted work still reapable,
+    /// every slot returned, shutdown bounded, and no silent continuation on
+    /// K-1 lanes.
+    #[test]
+    fn a_dead_tx_lane_poisons_the_owner_and_cannot_continue_at_reduced_capacity() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            let c_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+            let c_sock = compio::net::UdpSocket::from_std(c_std).expect("adopt");
+            // Four lanes; three admitted callers, each with a handshake
+            // datagram queued, so there is real submission work to refuse.
+            let mut owner = Owner::new(4).with_caller(OwnerCallerSide::new_single(c_sock));
+            for socket_id in [0x7301u32, 0x7302u32, 0x7303u32] {
+                let mut conn = SrtConnection::new_caller(srt_proto::ConnectionOptions {
+                    socket_id,
+                    ..Default::default()
+                });
+                conn.connect(Timestamp::default())
+                    .expect("caller starts its handshake");
+                owner
+                    .bench_caller_table_mut()
+                    .expect("caller side")
+                    .add_direct(crate::caller::CallerLeg {
+                        peer: "127.0.0.1:19992".parse().expect("addr"),
+                        connection: conn,
+                    })
+                    .expect("admitted");
+            }
+
+            // Exactly one datagram submitted, so the other two stay queued and
+            // the post-fault visits have real work to refuse.
+            let budget = OwnerServiceBudget::default();
+            let one_packet = OwnerServiceBudget {
+                max_tx_packets: 1,
+                ..OwnerServiceBudget::default()
+            };
+            let first = owner
+                .service(Timestamp::from_micros(10_000), one_packet)
+                .await;
+            assert_eq!(first.tx_packets_submitted, 1);
+            let submissions_before = owner.tx_class_totals().total();
+            assert_eq!(submissions_before, 1);
+            assert!(owner.is_operational(), "one in-flight send is not a fault");
+            assert!(
+                owner.has_pending_work(Timestamp::from_micros(10_000)),
+                "the other two handshakes are still queued"
+            );
+
+            // Kill a lane that holds no job, so what is detected is the worker
+            // set being incomplete rather than a stuck job.
+            owner.tx_engine.kill_lane_worker_for_test(3);
+            // Let the runtime actually finish that task.
+            compio::time::sleep(std::time::Duration::from_millis(2)).await;
+
+            let report = owner.service(Timestamp::from_micros(20_000), budget).await;
+            assert_eq!(
+                report.completions_reaped, 1,
+                "the already-submitted datagram must still be reaped"
+            );
+            assert!(matches!(
+                owner.fault(),
+                Some(OwnerFault::WorkerPanicked { lane: 3 })
+            ));
+            assert!(!owner.is_operational());
+
+            // Submission is refused: the two remaining handshake datagrams stay
+            // queued and the cumulative submission counter cannot move. This is
+            // the "never continue on K-1" property in its observable form.
+            for _ in 0..8 {
+                let report = owner.service(Timestamp::from_micros(30_000), budget).await;
+                assert_eq!(report.tx_packets_submitted, 0);
+                assert_eq!(report.tx_class.total(), 0);
+                assert_eq!(owner.tx_class_totals().total(), submissions_before);
+            }
+            assert!(
+                owner.has_pending_work(Timestamp::from_micros(30_000)),
+                "refused work stays visible and queued; a fault must not drop it"
+            );
+
+            // New admission is refused through the public API.
+            let config = crate::CallerConfig::builder("127.0.0.1:9".parse().expect("address"))
+                .ownership(crate::SocketOwnership::Shared)
+                .build()
+                .expect("caller config");
+            let error = owner
+                .connect(&config, Timestamp::from_micros(30_000))
+                .expect_err("a faulted owner must refuse new admission");
+            assert!(error.to_string().contains("not operational"), "{error}");
+
+            // Every slot the pool handed out comes back, and shutdown stays
+            // bounded rather than waiting on a worker that no longer exists.
+            assert_eq!(owner.tx_in_flight(), 0, "nothing is left in flight");
+            assert_eq!(
+                owner.tx_pool().free_count(),
+                owner.tx_pool().capacity(),
+                "no TX slot may leak when a lane dies"
+            );
+            let drained = owner
+                .shutdown_and_drain(std::time::Duration::from_millis(500))
+                .await;
+            assert!(drained, "teardown reaches quiescence without the dead lane");
+            assert_eq!(
+                owner.tx_pool().free_count(),
+                owner.tx_pool().capacity(),
+                "teardown returns every slot too"
+            );
+        });
+    }
+
     #[test]
     fn one_action_budget_bounds_whole_caller_visit() {
         let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
@@ -7864,6 +8064,226 @@ mod tests {
             );
             assert!(stats.listener.is_none());
         });
+    }
+
+    /// Move every protocol output from one endpoint into the other, applying
+    /// timer actions to the sender's own store -- the native runtime's loop in
+    /// miniature, with no sockets and no scheduling.
+    fn pump_outputs(
+        from: &mut SrtConnection,
+        timers: &mut crate::ManualTimerStore,
+        to: &mut SrtConnection,
+        now: Timestamp,
+    ) {
+        while let Some(output) = from.poll_output().expect("materializes") {
+            timers.apply_output(&output, now);
+            if let ConnectionOutput::SendPacket(bytes) = output {
+                let _ = to.feed_recv_buf(&bytes, now);
+            }
+        }
+    }
+
+    /// Complete an in-process caller/listener handshake and return the
+    /// connected caller plus one DATA datagram the listener addressed to it.
+    ///
+    /// The returned datagram is a copy of a packet the caller has already
+    /// accepted, so feeding it back is exactly the duplicate the SRT receiver
+    /// must count. No sockets and no Owner are involved: the caller connection
+    /// this returns is the one later handed to the Owner's caller table.
+    fn connected_caller_and_a_duplicate_data_datagram(
+        caller_socket_id: u32,
+    ) -> (SrtConnection, Vec<u8>) {
+        use srt_proto::wire::SrtPacket;
+        const TICK_MICROS: u64 = 10_000;
+
+        let mut caller = SrtConnection::new_caller(srt_proto::ConnectionOptions {
+            socket_id: caller_socket_id,
+            tsbpd_delay: 0,
+            ..srt_proto::ConnectionOptions::default()
+        });
+        let mut listener = SrtConnection::new_listener(srt_proto::ConnectionOptions {
+            socket_id: 0x2A02,
+            tsbpd_delay: 0,
+            ..srt_proto::ConnectionOptions::default()
+        });
+        let mut caller_timers = crate::ManualTimerStore::new();
+        let mut listener_timers = crate::ManualTimerStore::new();
+
+        caller
+            .connect(Timestamp::from_micros(0))
+            .expect("caller starts its handshake");
+        let mut now = Timestamp::from_micros(0);
+        for _ in 0..40 {
+            now = Timestamp::from_micros(now.as_micros() + TICK_MICROS);
+            caller_timers.fire_expired(now, &mut caller);
+            listener_timers.fire_expired(now, &mut listener);
+            pump_outputs(&mut caller, &mut caller_timers, &mut listener, now);
+            pump_outputs(&mut listener, &mut listener_timers, &mut caller, now);
+            if caller.state() == srt_proto::ConnectionState::Connected
+                && listener.state() == srt_proto::ConnectionState::Connected
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            caller.state(),
+            srt_proto::ConnectionState::Connected,
+            "the caller must connect before its receiver has anything to report"
+        );
+        assert_eq!(listener.state(), srt_proto::ConnectionState::Connected);
+
+        listener
+            .send(b"owner-rx-session-totals", now)
+            .expect("the listener admits the payload");
+        let mut duplicated = None;
+        while let Some(output) = listener.poll_output().expect("materializes") {
+            listener_timers.apply_output(&output, now);
+            let ConnectionOutput::SendPacket(bytes) = output else {
+                continue;
+            };
+            if matches!(SrtPacket::decode(&bytes), Ok(SrtPacket::Data(_))) {
+                duplicated = Some(bytes.to_vec());
+            }
+            caller
+                .feed_recv_buf(&bytes, now)
+                .expect("the caller accepts the first copy");
+        }
+        (
+            caller,
+            duplicated.expect("the payload produced exactly one DATA datagram"),
+        )
+    }
+
+    /// A connected caller whose receiver has already counted exactly one
+    /// deliberate duplicate, so every aggregate above it must report one too.
+    fn caller_with_one_counted_duplicate(caller_socket_id: u32) -> SrtConnection {
+        let (mut caller, duplicate) =
+            connected_caller_and_a_duplicate_data_datagram(caller_socket_id);
+        let accepted = caller
+            .receiver_stats()
+            .expect("connected receiver")
+            .total_received;
+        caller
+            .feed_recv_buf(&duplicate, Timestamp::from_micros(1_000_000))
+            .expect("the duplicate is absorbed, not rejected");
+        let stats = caller.receiver_stats().expect("connected receiver");
+        assert_eq!(
+            stats.total_received, accepted,
+            "the duplicate must not be accepted as new data"
+        );
+        assert_eq!(
+            stats.total_duplicates, 1,
+            "the leg's own receiver has to show the duplicate, or a test built \
+             on it proves nothing"
+        );
+        caller
+    }
+
+    /// Item 10: the Owner exposes the SRT-level receive totals of its
+    /// sessions, and a retired session's totals survive its retirement instead
+    /// of vanishing with the connection the application took back.
+    #[test]
+    fn rx_session_totals_report_live_sessions_and_survive_retirement() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            let c_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+            let c_sock = compio::net::UdpSocket::from_std(c_std).expect("adopt");
+            let mut owner = Owner::new(4).with_caller(OwnerCallerSide::new_single(c_sock));
+
+            let id = owner
+                .bench_caller_table_mut()
+                .expect("caller side")
+                .add_direct(crate::caller::CallerLeg {
+                    peer: "127.0.0.1:19989".parse().expect("addr"),
+                    connection: caller_with_one_counted_duplicate(0x2A01),
+                })
+                .expect("admitted");
+
+            let live = owner.rx_session_totals();
+            assert_eq!(
+                live.caller,
+                Some(RcvTotals {
+                    lost: 0,
+                    duplicates: 1,
+                }),
+                "a live session's protocol totals must be visible through the Owner"
+            );
+            assert!(
+                live.listener.is_none(),
+                "no listener socket is attached to this Owner"
+            );
+
+            let removed = owner.remove_caller(id).expect("retire the session");
+            drop(removed);
+            let after = owner.rx_session_totals();
+            assert_eq!(
+                after.caller, live.caller,
+                "retiring a session must not erase the totals it contributed"
+            );
+        });
+    }
+
+    /// The live-session walk covers every member of a bonded group, not just
+    /// direct sessions.
+    #[test]
+    fn rx_session_totals_include_bonded_group_legs() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            let c_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+            let c_sock = compio::net::UdpSocket::from_std(c_std).expect("adopt");
+            let mut owner = Owner::new(4).with_caller(OwnerCallerSide::new_single(c_sock));
+
+            let id = owner
+                .bench_caller_table_mut()
+                .expect("caller side")
+                .add_group(
+                    srt_proto::handshake::SRTGROUP_MASK | 7,
+                    srt_proto::GroupMode::Broadcast,
+                    [
+                        crate::caller::CallerGroupLeg::new(
+                            1,
+                            1,
+                            "127.0.0.1:19987".parse().expect("addr"),
+                            caller_with_one_counted_duplicate(0x2B01),
+                        ),
+                        crate::caller::CallerGroupLeg::new(
+                            2,
+                            1,
+                            "127.0.0.1:19988".parse().expect("addr"),
+                            caller_with_one_counted_duplicate(0x2B02),
+                        ),
+                    ],
+                )
+                .expect("group admitted");
+
+            let live = owner.rx_session_totals();
+            assert_eq!(
+                live.caller,
+                Some(RcvTotals {
+                    lost: 0,
+                    duplicates: 2,
+                }),
+                "every group member's receiver totals must be counted"
+            );
+
+            drop(owner.remove_caller(id).expect("retire the group"));
+            assert_eq!(
+                owner.rx_session_totals().caller,
+                live.caller,
+                "retiring the group must keep the totals its legs contributed"
+            );
+        });
+    }
+
+    /// The no-side case is the Owner a bare shard starts as: both sides report
+    /// absence rather than a fabricated zero total.
+    #[test]
+    fn rx_session_totals_are_none_without_an_attached_side() {
+        let owner = Owner::new(2);
+        let totals = owner.rx_session_totals();
+        assert_eq!(totals, OwnerRxSessionTotals::default());
+        assert!(totals.listener.is_none());
+        assert!(totals.caller.is_none());
     }
 
     /// Item 3: a structural TX completion failure is discovered by the reaping

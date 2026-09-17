@@ -69,6 +69,32 @@ const TX_KEYS: &[&str] = &[
     "rx_truncated",
     "tx_pool_free",
     "tx_pool_capacity",
+    "tx_pool_high_water",
+    // TX submission partition (sum(tx_class_*) == tx_class_total ==
+    // tx_submitted_wire, enforced by `qualify`). A total cannot say whether the
+    // wire traffic was the media or the control cadence around it.
+    "tx_class_data_first",
+    "tx_class_data_retx",
+    "tx_class_ack",
+    "tx_class_ackack",
+    "tx_class_nak",
+    "tx_class_keepalive",
+    "tx_class_handshake",
+    "tx_class_dropreq",
+    "tx_class_km",
+    "tx_class_shutdown",
+    "tx_class_other_control",
+    "tx_class_total",
+    // First-transmission submit lateness: source due instant to lane handoff.
+    // Distinct from `offer_lateness_us_*`, which is sampled before `service()`.
+    "first_submit_lateness_us_p50",
+    "first_submit_lateness_us_p99",
+    "first_submit_lateness_us_max",
+    "first_submit_lateness_samples",
+    // SRT-level receive accounting for the sender's own caller socket, summed
+    // over live and retired sessions.
+    "rx_lost",
+    "rx_duplicates",
     "payload_bytes",
     "interval_us",
     // The offer is part of the row: a capacity sweep is unreadable without it,
@@ -126,6 +152,9 @@ const SUM_KEYS: &[&str] = &[
     "drain_submitted",
     "drain_completed",
     "service_visits",
+    "tx_class_total",
+    "rx_lost",
+    "rx_duplicates",
     "rx_core_total",
     "rx_data_zero",
     "rx_data_below_half_mean",
