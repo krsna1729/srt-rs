@@ -392,6 +392,40 @@ impl SenderBuffer {
         self.packets.has_retransmit_queued()
     }
 
+    /// Queue one probe retransmission of the newest sent packet.
+    ///
+    /// A receiver can only name a loss it has evidence for, and a missing
+    /// *suffix* of a flight provides none: no later sequence number arrives to
+    /// expose the gap, so no NAK is generated, `sec_a` stays zero, and the
+    /// payload is simply absent. NAK-driven recovery therefore cannot repair a
+    /// lost flight tail on its own, and the sender's retransmission timer is the
+    /// last party that can notice.
+    ///
+    /// Probing the newest sent packet is the narrow answer: its arrival both
+    /// repairs a lost tail directly and gives the receiver later sequence
+    /// evidence, which is what exposes any older gaps to ordinary selective
+    /// recovery. Replaying the whole unacknowledged flight instead would amplify
+    /// an outage on every timeout, which is why this queues exactly one packet.
+    ///
+    /// Returns whether anything was queued. Callers must only use this when no
+    /// selective retransmission is already pending, so a NAK-driven recovery in
+    /// progress is never widened by the timer.
+    pub fn queue_retransmission_of_newest_sent(&mut self) -> bool {
+        // The newest packet the sender has put on the wire is the highest
+        // retained sequence below the next one it would assign.
+        let Some((sequence, _)) = self.packets.last_occupied_before(self.next_seq) else {
+            return false;
+        };
+        if self.packets.retransmit_queued_contains(sequence) {
+            return false;
+        }
+        self.packets
+            .queue_loss_range(sequence, sequence, |sequence| {
+                self.loss_list.push_back(sequence);
+            });
+        true
+    }
+
     /// Set the active flow window (the congestion window tracks it too; see
     /// [`Self::new`] for LIVE mode's behavior). The constructor's window is
     /// the permanent maximum, so peer feedback can shrink and reopen this

@@ -144,7 +144,41 @@ GSO, native io_uring, `srt-sim`, allocator comparisons, hugepages, NUMA media
 replication, generic memory-pool frameworks, and further capacity-surface
 exploration. Those are post-cutover, and the four-PR plan keeps them there.
 
-### Receiver diagnostic status (verified, not complete)
+### RESOLVED: the conservation defect was real, and it is fixed
+
+The intermittent end-of-run deficit is not a lifecycle or snapshot artifact. It is
+a transport correctness gap, reproduced deterministically in 0.01 s and fixed:
+
+```text
+control (nothing dropped)      4 of 4 DATA packets delivered
+lost final DATA packet         3 of 4, permanently stranded
+```
+
+`crates/srt-protocol/src/srt_connection.rs`,
+`a_lost_final_data_packet_is_recovered_by_the_sender` (with
+`an_intact_flight_is_delivered_whole` as the control that validates the harness).
+
+**Mechanism.** A receiver can only NAK a gap that a *later* DATA packet exposes.
+A lost suffix of a flight supplies no such evidence, so no NAK is generated,
+`sec_a` stays zero, and the payload is simply absent -- while the sender's
+retransmission was driven exclusively by NAK-fed loss ranges
+(`process_retransmit` -> `pop_retransmit` from `loss_list`), so nothing ever asked
+for it. That is exactly the signature the fence experiment chased after the fact.
+
+**Fix** (mirroring the mechanism the upstream challenger documents for this bug
+class): on the retransmission timer, when **no selective retransmission is
+pending**, queue one probe retransmission of the **newest sent** packet
+(`SenderBuffer::queue_retransmission_of_newest_sent`). Its arrival repairs a lost
+tail directly and supplies the later sequence evidence that exposes any older gaps
+to ordinary NAK recovery. Exactly one packet, never a replay of the whole
+unacknowledged flight, which would amplify an outage on every timeout rather than
+recover from it.
+
+**Evidence.** Workspace suite: 1353 tests pass, 0 failures. The two new tests fail
+before the fix (3 of 4) and pass after it (4 of 4), with the control passing in
+both cases so the result cannot be a harness artifact.
+
+### Receiver diagnostic status (verified)
 
 Working, verified by running the receiver directly:
 
