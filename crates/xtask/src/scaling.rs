@@ -39,7 +39,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Fields read from the sender's `SHARED_OWNER_QUAL` line.
 const TX_KEYS: &[&str] = &[
@@ -57,9 +57,9 @@ const TX_KEYS: &[&str] = &[
     "pending_after_drain",
     "inflight_at_window_end",
     "service_visits",
-    "lateness_us_p50",
-    "p99",
-    "max",
+    "offer_lateness_us_p50",
+    "offer_lateness_us_p99",
+    "offer_lateness_us_max",
     "window_cpu_ms",
     "drain_cpu_ms",
     "cpu_ms",
@@ -71,6 +71,9 @@ const TX_KEYS: &[&str] = &[
     "tx_pool_capacity",
     "payload_bytes",
     "interval_us",
+    // The offer is part of the row: a capacity sweep is unreadable without it,
+    // and the gate needs it to name what was sustained.
+    "offered_bps_per_dest",
 ];
 
 /// Fields read from the receiver's `STATS` line.
@@ -80,6 +83,10 @@ const RX_KEYS: &[&str] = &[
     "pkt_sent",
     "core_total",
     "sec_a",
+    // Receiver duplicate count. Already mapped from `total_duplicates` in the
+    // receiver's per-connection stats; simply not collected here, which made
+    // duplicate accounting look like work to build rather than work to read.
+    "sec_b",
     "rtt_ms",
     "elapsed_s",
     "cpu_user_ms",
@@ -116,7 +123,12 @@ const SUM_KEYS: &[&str] = &[
 const MIN_KEYS: &[&str] = &["rx_data_min"];
 
 /// Columns aggregated by maximum: per-shard worst cases.
-const MAX_KEYS: &[&str] = &["lateness_us_p50", "p99", "max", "rx_data_below_half_mean"];
+const MAX_KEYS: &[&str] = &[
+    "offer_lateness_us_p50",
+    "offer_lateness_us_p99",
+    "offer_lateness_us_max",
+    "rx_data_below_half_mean",
+];
 
 struct Options {
     out: PathBuf,
@@ -128,6 +140,9 @@ struct Options {
     connect_cc: usize,
     base_port: u16,
     payload_bytes: usize,
+    /// Offered bitrate per destination. The capacity frontier is a function of
+    /// it, so the sweep has to be able to vary it rather than assuming 8 Mbps.
+    rate_mbps_per_dest: f64,
 }
 
 impl Default for Options {
@@ -142,27 +157,47 @@ impl Default for Options {
             connect_cc: 64,
             base_port: 30_000,
             payload_bytes: 1316,
+            rate_mbps_per_dest: 8.0,
         }
     }
 }
 
 impl Options {
-    /// Apply one `--flag value` pair. Kept separate from [`parse_options`] so
-    /// the flag table does not also carry the validation branches.
+    /// Apply one `--flag value` pair.
+    ///
+    /// Split into the two groups the flags actually fall into -- how the run is
+    /// shaped (output, destinations, shards, repetitions) and how the engine and
+    /// offer are configured -- so neither group's table carries the other's
+    /// branches. Each returns whether it recognised the flag.
     fn set(&mut self, flag: &str, value: &str) -> Result<(), String> {
+        if self.set_run_shape(flag, value)? || self.set_engine(flag, value)? {
+            return Ok(());
+        }
+        Err(format!("unknown argument {flag}"))
+    }
+
+    fn set_run_shape(&mut self, flag: &str, value: &str) -> Result<bool, String> {
         match flag {
             "--out" => self.out = PathBuf::from(value),
             "--n" => self.n = parse(value, flag)?,
             "--shards" => self.shards = parse(value, flag)?,
             "--reps" => self.reps = parse(value, flag)?,
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    fn set_engine(&mut self, flag: &str, value: &str) -> Result<bool, String> {
+        match flag {
             "--window-ms" => self.window_ms = parse(value, flag)?,
             "--tx-lanes" => self.tx_lanes = parse(value, flag)?,
             "--connect-cc" => self.connect_cc = parse(value, flag)?,
             "--base-port" => self.base_port = parse(value, flag)?,
             "--payload-bytes" => self.payload_bytes = parse(value, flag)?,
-            other => return Err(format!("unknown argument {other}")),
+            "--rate-mbps-per-dest" => self.rate_mbps_per_dest = parse(value, flag)?,
+            _ => return Ok(false),
         }
-        Ok(())
+        Ok(true)
     }
 
     fn validate(self) -> Result<Self, String> {
@@ -381,7 +416,7 @@ fn header(options: &Options) -> Result<String, String> {
     columns.extend(RX_KEYS.iter().map(|k| format!("rx_{k}")));
     Ok(format!(
         "# scaling-sweep n={} shards={} fanout={} tx_lanes={} connect_cc={} window_ms={} \n\
-         # reps={} base_port={} payload_bytes={} git_sha={} git_dirty={}\n{}\n",
+         # reps={} base_port={} payload_bytes={} rate_mbps_per_dest={} git_sha={} git_dirty={}\n{}\n",
         options.n,
         options.shards,
         options.n / options.shards,
@@ -391,6 +426,7 @@ fn header(options: &Options) -> Result<String, String> {
         options.reps,
         options.base_port,
         options.payload_bytes,
+        options.rate_mbps_per_dest,
         sha,
         dirty,
         columns.join("\t")
@@ -418,6 +454,22 @@ fn run_rep(
         .wait_for_senders()
         .map_err(|e| keep_logs(&work, e))?;
     sleep(Duration::from_secs(12));
+    // Give receivers a bounded window to finish on their own -- they print STATS
+    // when their connections close -- before stopping them. Killing a receiver
+    // mid-drain is how a slow run produced "no STATS line" instead of a row.
+    let grace = Instant::now();
+    while grace.elapsed() < Duration::from_secs(20) {
+        let mut still_running = false;
+        for receiver in children.receivers.iter_mut() {
+            if matches!(receiver.try_wait(), Ok(None)) {
+                still_running = true;
+            }
+        }
+        if !still_running {
+            break;
+        }
+        sleep(Duration::from_millis(500));
+    }
     children.stop_receivers().map_err(|e| keep_logs(&work, e))?;
 
     let mut rows = Vec::with_capacity(options.shards);
@@ -441,7 +493,12 @@ fn spawn_receivers(
     // The lifetime covers connect + window + drain with margin; a receiver
     // that dies early sends the drain into a closed socket while
     // window-phase reconciliation still looks exact.
-    let seconds = (options.window_ms / 1000 + 30).to_string();
+    // Window + the sender's DRAIN_DEADLINE (10 s) + connect and teardown
+    // margin. At 30 s the receiver was killed before its own deadline on
+    // slow-drain runs, so it never printed STATS and the sweep correctly
+    // refused the row -- a harness budget problem reported as a transport
+    // failure until the lifetime covered the work.
+    let seconds = (options.window_ms / 1000 + 45).to_string();
     let mut children = Vec::with_capacity(options.shards);
     for shard in 0..options.shards {
         let port = rep_base + (shard * fanout) as u16;
@@ -490,6 +547,8 @@ fn spawn_senders(
                 options.connect_cc.to_string(),
                 "--payload-bytes".to_string(),
                 options.payload_bytes.to_string(),
+                "--rate-mbps-per-dest".to_string(),
+                options.rate_mbps_per_dest.to_string(),
             ])
             .stdout(Stdio::from(log.try_clone().map_err(|e| e.to_string())?))
             .stderr(Stdio::from(log))
