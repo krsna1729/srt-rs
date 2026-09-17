@@ -8,6 +8,7 @@ pub mod harness;
 pub mod host_contention;
 pub mod model;
 pub mod qual_evidence;
+pub mod qual_payload;
 pub mod qualification;
 pub mod queue;
 pub mod ring_modes;

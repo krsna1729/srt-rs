@@ -54,6 +54,37 @@ settled here rather than in a new instrumentation project.
    transport or accounting defect and belongs in the transport with a regression
    test that fails before the fix.
 
+### Step 1 progress
+
+Landed: `srt_bench::qual_payload` -- payload identity and tick tracking, with 12
+unit tests (encode/decode roundtrip and unchanged length, magic discrimination at
+the maximum tick, foreign and short payloads, duplicate ticks counted once,
+out-of-window ticks rejected, compact missing ranges, suffix vs scatter vs middle
+hole, complete window, single-tick rendering). `TickSet` is fixed-capacity from
+the run's expected tick count, so the diagnostic cannot itself become unbounded,
+and it allocates nothing per received payload.
+
+Remaining, with the exact plumbing points located:
+
+* **sender** -- per-tick measured payload via `qual_payload::measured_payload(len,
+  tick)` in place of the single shared payload, and the fence via
+  `fence_payload(len, final_tick)` at 1316 bytes so it is an ordinary DATA
+  message. The source loop is in `crates/srt-bench/benches/compio_shared_owner_qual.rs`
+  (the bounded catch-up loop increments `ticks_offered`).
+* **receiver** -- classify at the three payload delivery points
+  (`crates/srt-bench/src/runtimes/compio.rs:511`, `:617`, `:1120`, immediately
+  before `enqueue_received`, where `buffer[..size]` is the received payload),
+  hold a `TickSet` plus fence state per peer, exclude fences from `data_events`
+  and `core_total`, and snapshot `data_at_fence` / `missing_at_fence` on fence
+  observation and `missing_final` after the post-fence recovery period.
+* **per-peer state** -- `ConnStats` already carries `data_events` per peer
+  (`crates/srt-bench/src/lib.rs`, the listener peer path), which is where the
+  diagnostic fields belong; aggregation and the artifact fields
+  (`fence_seen`/`fences_seen`, `missing_at_fence`, `missing_final`) follow the
+  existing `Aggregate` merge.
+* **validity rule** -- a fence run counts only if `fence_accepted == fanout` and
+  `fence_seen == fanout`; anything else is a lifecycle result, not a measurement.
+
 ## Work item 2: the telemetry Restream needs, and no more
 
 Exposure only; no new mechanics.
