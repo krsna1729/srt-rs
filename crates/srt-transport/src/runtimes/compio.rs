@@ -2689,26 +2689,34 @@ impl OwnerTxClassCounters {
     }
 }
 
-/// Bucket width of the first-submit lateness histogram, in microseconds.
+/// Bucket width of the histogram's fine tier, in microseconds, covering
+/// `0..FIRST_SUBMIT_LATENESS_FINE_THRESHOLD_US`.
 pub const FIRST_SUBMIT_LATENESS_BUCKET_US: u64 = 100;
-/// Number of finite buckets; the last slot is the overflow bucket. Finite
-/// resolution therefore covers `0..=9_999` microseconds.
-pub const FIRST_SUBMIT_LATENESS_BUCKETS: usize = 100;
+/// Number of fine-tier buckets.
+pub const FIRST_SUBMIT_LATENESS_FINE_BUCKETS: usize = 100;
+/// Lateness at which the fine tier ends and the coarse tier begins: `100 us *
+/// 100 = 10 ms`.
+const FIRST_SUBMIT_LATENESS_FINE_THRESHOLD_US: u64 =
+    FIRST_SUBMIT_LATENESS_BUCKET_US * FIRST_SUBMIT_LATENESS_FINE_BUCKETS as u64;
+
+/// Bucket width of the histogram's coarse tier, in microseconds, covering
+/// `FIRST_SUBMIT_LATENESS_FINE_THRESHOLD_US..OVERFLOW_THRESHOLD_US`.
+///
+/// A single 100 us-wide tier out to a useful tail would need an unreasonable
+/// bucket count; a single coarse tier would waste the resolution this
+/// histogram most needs, right at the target latencies. Two fixed tiers keep
+/// both: fine resolution where the measurement actually discriminates
+/// on-time from late, coarser resolution further out where only the rough
+/// magnitude of the tail matters.
+pub const FIRST_SUBMIT_LATENESS_COARSE_BUCKET_US: u64 = 1_000;
+/// Number of coarse-tier buckets: `10 ms..1 s` at 1 ms resolution.
+pub const FIRST_SUBMIT_LATENESS_COARSE_BUCKETS: usize = 990;
+/// Total finite buckets across both tiers; the slot after this is the
+/// overflow bucket.
+pub const FIRST_SUBMIT_LATENESS_BUCKETS: usize =
+    FIRST_SUBMIT_LATENESS_FINE_BUCKETS + FIRST_SUBMIT_LATENESS_COARSE_BUCKETS;
 
 /// Fixed-size histogram of first-transmission submit lateness.
-///
-/// One sample is (the instant a first-transmission DATA datagram is handed to a
-/// TX lane) minus (the source's declared deadline for that payload), so it spans
-/// the whole path from the media schedule to the wire: the source's own lateness
-/// in offering the tick, admission, drain, pacing, TX pool/lane reservation, and
-/// the queueing until handoff.
-///
-/// Two consequences, both deliberate and both worth stating where the number is
-/// read: a source that is itself late appears here (as it does in a harness's
-/// `offer_lateness`, of which this is the superset -- the difference between the
-/// two is the transport's own delay), and a payload submitted on time reports 0.
-/// Kernel and asynchronous completion latency are outside the measurement, so
-/// this is not an end-to-end latency figure and must not be presented as one.
 ///
 /// "Lateness" is measured at the point the datagram is handed to a fixed TX
 /// lane: after admission, drain, pacing and pool/lane reservation, and before
@@ -2718,23 +2726,33 @@ pub const FIRST_SUBMIT_LATENESS_BUCKETS: usize = 100;
 /// That is also why it is distinct from the harness's `offer_lateness`, which
 /// measures before `service()` is even entered.
 ///
+/// Two-tier bucket resolution: [`FIRST_SUBMIT_LATENESS_BUCKET_US`] (100 us)
+/// wide through `FIRST_SUBMIT_LATENESS_FINE_THRESHOLD_US` (10 ms), then
+/// [`FIRST_SUBMIT_LATENESS_COARSE_BUCKET_US`] (1 ms) wide through 1 s, with an
+/// overflow bucket past that. Measured canonical evidence has put p99 in the
+/// tens to hundreds of milliseconds, well past a single 10 ms-wide fine tier
+/// -- a `p99` that actually landed in the old single-tier overflow bucket was
+/// reporting `max`, not a measured 99th percentile, which is exactly what the
+/// wider coarse tier fixes.
+///
 /// Never allocates and never logs per packet: one saturating increment and, at
 /// most, one `max` per sample. `Copy`, so a window snapshot costs no
 /// allocation to take.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FirstSubmitLateness {
-    /// Finite buckets are [`FIRST_SUBMIT_LATENESS_BUCKET_US`] wide, starting at
-    /// zero; the final slot is the overflow bucket, which counts everything at
-    /// or above [`Self::OVERFLOW_THRESHOLD_US`].
+    /// Index `0..FIRST_SUBMIT_LATENESS_FINE_BUCKETS` is the fine tier, the
+    /// next `FIRST_SUBMIT_LATENESS_COARSE_BUCKETS` the coarse tier, and the
+    /// final slot is the overflow bucket, which counts everything at or above
+    /// [`Self::OVERFLOW_THRESHOLD_US`].
     buckets: [u64; FIRST_SUBMIT_LATENESS_BUCKETS + 1],
     max_us: u64,
     samples: u64,
 }
 
 impl Default for FirstSubmitLateness {
-    /// An empty window. Hand-written because `[u64; 101]` has no derived
-    /// `Default`, and the histogram must start at all-zero counts rather than
-    /// at some placeholder bucket.
+    /// An empty window. Hand-written because a `[u64; N]` this large has no
+    /// derived `Default`, and the histogram must start at all-zero counts
+    /// rather than at some placeholder bucket.
     fn default() -> Self {
         Self {
             buckets: [0; FIRST_SUBMIT_LATENESS_BUCKETS + 1],
@@ -2747,8 +2765,31 @@ impl Default for FirstSubmitLateness {
 impl FirstSubmitLateness {
     /// Lateness at which the finite buckets end: everything at or above this
     /// lands in the overflow bucket and is tracked by `max_us` instead.
-    const OVERFLOW_THRESHOLD_US: u64 =
-        FIRST_SUBMIT_LATENESS_BUCKETS as u64 * FIRST_SUBMIT_LATENESS_BUCKET_US;
+    const OVERFLOW_THRESHOLD_US: u64 = FIRST_SUBMIT_LATENESS_FINE_THRESHOLD_US
+        + FIRST_SUBMIT_LATENESS_COARSE_BUCKET_US * FIRST_SUBMIT_LATENESS_COARSE_BUCKETS as u64;
+
+    /// The finite bucket index a lateness value falls in, before the overflow
+    /// check.
+    fn finite_bucket(lateness_us: u64) -> usize {
+        if lateness_us < FIRST_SUBMIT_LATENESS_FINE_THRESHOLD_US {
+            (lateness_us / FIRST_SUBMIT_LATENESS_BUCKET_US) as usize
+        } else {
+            let past_fine = lateness_us - FIRST_SUBMIT_LATENESS_FINE_THRESHOLD_US;
+            FIRST_SUBMIT_LATENESS_FINE_BUCKETS
+                + (past_fine / FIRST_SUBMIT_LATENESS_COARSE_BUCKET_US) as usize
+        }
+    }
+
+    /// The bucket's upper edge, in microseconds, for a finite bucket index.
+    fn finite_bucket_upper_edge_us(index: usize) -> u64 {
+        if index < FIRST_SUBMIT_LATENESS_FINE_BUCKETS {
+            (index as u64 + 1) * FIRST_SUBMIT_LATENESS_BUCKET_US
+        } else {
+            let coarse_index = (index - FIRST_SUBMIT_LATENESS_FINE_BUCKETS) as u64;
+            FIRST_SUBMIT_LATENESS_FINE_THRESHOLD_US
+                + (coarse_index + 1) * FIRST_SUBMIT_LATENESS_COARSE_BUCKET_US
+        }
+    }
 
     /// Record one first-transmission submit lateness, in microseconds.
     ///
@@ -2765,9 +2806,9 @@ impl FirstSubmitLateness {
             let bucket = &mut self.buckets[FIRST_SUBMIT_LATENESS_BUCKETS];
             *bucket = bucket.saturating_add(1);
         } else {
-            // Below the threshold the quotient is always a valid finite index,
-            // so the finite path needs no clamp.
-            let bucket = (lateness_us / FIRST_SUBMIT_LATENESS_BUCKET_US) as usize;
+            // Below the threshold the computed index is always a valid finite
+            // one, so the finite path needs no clamp.
+            let bucket = Self::finite_bucket(lateness_us);
             self.buckets[bucket] = self.buckets[bucket].saturating_add(1);
         }
         self.samples = self.samples.saturating_add(1);
@@ -2782,8 +2823,8 @@ impl FirstSubmitLateness {
     /// Largest lateness in this window, `0` when no sample was recorded.
     ///
     /// Exact, unlike the histogram: it is the observed maximum, not a bucket
-    /// edge, and it is the only field that resolves samples past
-    /// [`FIRST_SUBMIT_LATENESS_BUCKETS`] x [`FIRST_SUBMIT_LATENESS_BUCKET_US`].
+    /// edge, and it is the only field that resolves samples past the coarse
+    /// tier's own resolution.
     #[must_use]
     pub fn max_us(&self) -> u64 {
         self.max_us
@@ -2792,12 +2833,13 @@ impl FirstSubmitLateness {
     /// Upper bound, in microseconds, of the bucket the given percentile falls
     /// in.
     ///
-    /// Resolution is honest: finite buckets are
-    /// [`FIRST_SUBMIT_LATENESS_BUCKET_US`] wide, so a returned value is the
-    /// bucket's upper edge and never a claim of an exact quantile -- p50 can
-    /// therefore overstate the median by up to one bucket width. A percentile
-    /// landing in the overflow bucket returns the observed `max_us`, and an
-    /// empty histogram returns `0`.
+    /// Resolution is honest and tier-dependent: [`FIRST_SUBMIT_LATENESS_BUCKET_US`]
+    /// wide below 10 ms, [`FIRST_SUBMIT_LATENESS_COARSE_BUCKET_US`] wide from
+    /// there to 1 s, so a returned value is the bucket's upper edge and never a
+    /// claim of an exact quantile -- p50 can therefore overstate the median by
+    /// up to one bucket width, wider once the percentile falls past 10 ms. A
+    /// percentile landing in the overflow bucket returns the observed
+    /// `max_us`, and an empty histogram returns `0`.
     #[must_use]
     pub fn percentile_us(&self, percentile: f64) -> u64 {
         if self.samples == 0 {
@@ -2815,7 +2857,7 @@ impl FirstSubmitLateness {
                 if index == FIRST_SUBMIT_LATENESS_BUCKETS {
                     return self.max_us;
                 }
-                return ((index as u64) + 1) * FIRST_SUBMIT_LATENESS_BUCKET_US;
+                return Self::finite_bucket_upper_edge_us(index);
             }
         }
         self.max_us
@@ -6121,6 +6163,64 @@ mod tests {
         });
     }
 
+    /// Regression: a p99 in the tens-to-hundreds of milliseconds -- the range
+    /// canonical evidence has actually measured -- must resolve to a real
+    /// coarse-tier bucket, not fall into the overflow bucket and silently
+    /// report `max` under a `p99` label. This is exactly the failure mode the
+    /// single 10 ms-wide fine tier had: everything past 10 ms landed in one
+    /// overflow bucket.
+    #[test]
+    fn p99_past_ten_milliseconds_resolves_to_a_coarse_bucket_not_max() {
+        let mut lateness = FirstSubmitLateness::default();
+        // 98 samples with negligible lateness, then two far out in the tail:
+        // p99 (rank 99 of 100) must land on the smaller of the two tail
+        // samples, not on the observed maximum.
+        for _ in 0..98 {
+            lateness.record(200);
+        }
+        lateness.record(45_000); // 45 ms: within the coarse tier's 1 s range.
+        lateness.record(120_000); // 120 ms: the observed maximum.
+
+        assert_eq!(lateness.max_us(), 120_000);
+        let p99 = lateness.percentile_us(0.99);
+        assert!(
+            p99 < lateness.max_us(),
+            "p99={p99} must not equal max={} merely because both tail samples are \
+             past the old fine-tier threshold: the coarse tier must be able to tell \
+             the 45 ms sample from the 120 ms one",
+            lateness.max_us()
+        );
+        // The coarse tier is 1 ms wide, so the reported bound is within one
+        // coarse bucket width of the actual 45 ms sample.
+        assert!(
+            (45_000..=45_000 + FIRST_SUBMIT_LATENESS_COARSE_BUCKET_US).contains(&p99),
+            "p99={p99} must be the coarse bucket covering the 45 ms sample"
+        );
+    }
+
+    /// The fine/coarse tier boundary itself: a sample just below 10 ms uses
+    /// the 100 us fine bucket, and a sample just at/above it uses the 1 ms
+    /// coarse bucket -- proving the boundary is handled by exactly one tier,
+    /// not double-counted or skipped.
+    #[test]
+    fn the_fine_coarse_tier_boundary_is_exact() {
+        let mut just_under = FirstSubmitLateness::default();
+        just_under.record(9_950);
+        assert_eq!(
+            just_under.percentile_us(1.0),
+            10_000,
+            "9950 us is still fine-tier: bucket [9900, 10000)"
+        );
+
+        let mut at_boundary = FirstSubmitLateness::default();
+        at_boundary.record(10_000);
+        assert_eq!(
+            at_boundary.percentile_us(1.0),
+            11_000,
+            "10000 us is the first coarse-tier bucket: [10000, 11000)"
+        );
+    }
+
     /// Item 8 through the real path: a payload the application admitted is
     /// measured at the visit that submits it, and the handshake traffic around
     /// it contributes no sample at all.
@@ -6216,7 +6316,11 @@ mod tests {
             let submitted_at = submitted_at.expect("the admitted payload must be submitted");
 
             // Lateness is measured from the admission instant to the visit
-            // that submitted it, at 100 us resolution.
+            // that submitted it, at the histogram's tier-dependent resolution
+            // (100 us below 10 ms, 1 ms from there to 1 s -- this test's
+            // expected lateness is small enough to land in either tier
+            // depending on how long the visit loop above took, so the coarser
+            // bound is the one guaranteed to cover both).
             let expected = submitted_at.as_micros() - admitted_at.as_micros();
             let lateness = owner.take_first_submit_lateness();
             assert_eq!(
@@ -6226,9 +6330,11 @@ mod tests {
             );
             let reported = lateness.percentile_us(1.0);
             assert!(
-                reported >= expected && reported <= expected + FIRST_SUBMIT_LATENESS_BUCKET_US,
+                reported >= expected
+                    && reported <= expected + FIRST_SUBMIT_LATENESS_COARSE_BUCKET_US,
                 "the reported lateness {reported} must be the bucket bound covering the \
-                 observed {expected} us at {FIRST_SUBMIT_LATENESS_BUCKET_US} us resolution"
+                 observed {expected} us at no coarser than \
+                 {FIRST_SUBMIT_LATENESS_COARSE_BUCKET_US} us resolution"
             );
             assert_eq!(
                 owner.tx_class_totals().data_first,

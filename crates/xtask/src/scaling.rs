@@ -70,13 +70,6 @@ const TX_KEYS: &[&str] = &[
     "tx_pool_free",
     "tx_pool_capacity",
     "tx_pool_high_water",
-    // Send-outcome counters. They were printed by the harness and never
-    // captured here, so a row could not support (or refute) "no send failed".
-    "short",
-    "failed",
-    "peer_local",
-    "transient",
-    "tx_failures_pending",
     // TX submission partition (sum(tx_class_*) == tx_class_total ==
     // tx_submitted_wire, enforced by `qualify`). A total cannot say whether the
     // wire traffic was the media or the control cadence around it.

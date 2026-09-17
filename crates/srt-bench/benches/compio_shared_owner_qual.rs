@@ -84,20 +84,6 @@ fn next_after(epoch: Instant, interval: Duration, n: u64) -> Instant {
 
 const CONNECT_DEADLINE: Duration = Duration::from_secs(30);
 const DRAIN_DEADLINE: Duration = Duration::from_secs(10);
-/// How long the drain keeps servicing after the TX path goes quiet, in protocol
-/// microseconds, before calling the run finished.
-///
-/// TX quiescence is not protocol quiescence. A lost *suffix* of the stream
-/// leaves every datagram submitted and completed while the receiver has no
-/// evidence of the gap, so nothing is queued and nothing is in flight -- yet the
-/// payloads are missing, and the sender's own retransmission timeout is the only
-/// thing that can repair them, once it expires. Ending the run at TX quiescence
-/// therefore reports a deficit that is a property of the measurement, not of the
-/// transport. This window is longer than the initial 500 ms timeout plus one RTT
-/// (26 ms measured on this host), so at least one repair round can happen; the
-/// loop's own `now` advances 1 ms per visit, so it costs microseconds of wall
-/// time.
-const ARQ_SETTLE_US: u64 = 1_500_000;
 
 /// Source interval holding `rate_bps` constant for this payload size:
 /// `interval = bytes * 8 / rate`. A property of the offer, not of how much of
@@ -654,7 +640,6 @@ async fn run_sender(
 
         // --- TX-enabled drain to equilibrium, bounded
         let drain_start = Instant::now();
-        let mut settle_us: u64 = 0;
         while drain_start.elapsed() < DRAIN_DEADLINE {
             now = Timestamp::from_micros(now.as_micros() + 1_000);
             let visit = owner.service(now, budget).await;
@@ -667,24 +652,9 @@ async fn run_sender(
             report.failed_sends += visit.tx_failed_sends as u64;
             report.peer_local_failures += visit.tx_peer_local_failures as u64;
             report.transient_failures += visit.tx_transient_failures as u64;
-            // Stream-quiet, not merely TX-quiet. A lost *suffix* of the stream
-            // leaves nothing queued and nothing to send, yet the payloads are
-            // missing and only the sender's own retransmission timeout can
-            // repair them -- once it expires. The protocol's control cadence
-            // (ACK/ACKACK) keeps the TX path busy forever, so the ARQ window is
-            // measured against DATA work alone: no first transmissions, no
-            // retransmissions, no queued output. Only then does a quiet second
-            // mean the stream's transport work is finished rather than merely
-            // paused.
-            let data_work = visit.tx_class.data_first + visit.tx_class.data_retx;
-            if data_work == 0 && !owner.has_pending_work(now) {
-                if settle_us >= ARQ_SETTLE_US && owner.tx_in_flight() == 0 {
-                    report.drained = true;
-                    break;
-                }
-                settle_us = settle_us.saturating_add(1_000);
-            } else {
-                settle_us = 0;
+            if owner.tx_in_flight() == 0 && !owner.has_pending_work(now) {
+                report.drained = true;
+                break;
             }
             owner.wait_for_activity(Duration::from_millis(1)).await;
         }
@@ -788,8 +758,7 @@ fn main() {
          first_submit_lateness_us_max={} first_submit_lateness_samples={} \
          pending_after_drain={} rx_mode={} managed_rx={} \
          rx_dropped={} rx_truncated={} rx_lost={} rx_duplicates={} \
-         tx_pool_free={} tx_pool_capacity={} tx_pool_high_water={} \
-         payload_bytes={} interval_us={} \
+         tx_pool={}/{} tx_pool_high_water={} payload_bytes={} interval_us={} \
          offered_bps_per_dest={} fence_offered={} fence_accepted={} \
          cpu_ms={:.1} window_cpu_ms={:.1} drain_cpu_ms={:.1}",
         report.fanout,

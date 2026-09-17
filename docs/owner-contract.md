@@ -143,12 +143,11 @@ the same bounded teardown.
   datagram is decided by the protocol, not inferred from bytes.
 * `TxPoolSnapshot` reports `capacity`, `free`, `high_water` (monotonic peak of
   simultaneously checked-out slots, never above `capacity`), and `exhaustions`.
-* First-submit lateness is measured from the source's declared deadline for a
-  first transmission to the point the datagram is handed to a TX lane, so it
-  spans the deadline-to-wire path including the source's own lateness. It is not
-  a completion-time metric and not an end-to-end latency figure: per-lane
-  asynchronous and kernel completion latency are outside it. Control datagrams
-  and retransmissions have no source deadline and contribute no sample.
+* First-submit lateness is measured from the source's own due instant for a first
+  transmission to the point the datagram is handed to a TX lane. It is not a
+  completion-time metric, and per-lane asynchronous latency is explicitly outside
+  it. Control datagrams and retransmissions have no source due instant and
+  contribute no sample.
 
 ## Not frozen
 

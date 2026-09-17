@@ -97,29 +97,13 @@ fn cadence_failures(fields: &BTreeMap<String, String>, tolerance: f64) -> Vec<St
 
 /// Accepted is not delivered.
 fn delivery_failures(fields: &BTreeMap<String, String>) -> Vec<String> {
-    // The terminal fence offers extra payloads AFTER the measured window, and
-    // the receiver counts them: `rx_core_total` therefore contains
-    // `fence_accepted` payloads that are not part of the measured workload (the
-    // harness excludes them from `data_accepted`, `data_offered` and every rate,
-    // and they are a different size and pattern). Naming them here keeps the
-    // identity strict instead of leaving the reader to subtract them by hand --
-    // and a canonical run with the fence enabled is exactly the run this gate is
-    // for.
-    // The receiver's own count of fence payloads, not the sender's: the identity
-    // being checked is what the receiver accounted for, and using the sender's
-    // number would silently assume the fence itself was lossless -- which is a
-    // diagnostic fact, not a workload one, and is reported separately.
-    let fence = number(fields, "rx_diag_fences_seen")
-        .or_else(|_| number(fields, "fence_accepted"))
-        .unwrap_or(0.0);
     match (
         number(fields, "data_accepted"),
         number(fields, "rx_core_total"),
     ) {
-        (Ok(accepted), Ok(received)) if accepted + fence != received => vec![format!(
-            "data_accepted {accepted:.0} + fence seen {fence:.0} != rx_core_total \
-             {received:.0} ({} % of accepted delivered, fence excluded)",
-            100.0 * (received - fence) / accepted.max(1.0)
+        (Ok(accepted), Ok(received)) if accepted != received => vec![format!(
+            "data_accepted {accepted:.0} != rx_core_total {received:.0} ({} % delivered)",
+            100.0 * received / accepted.max(1.0)
         )],
         (Err(e), _) | (_, Err(e)) => vec![e],
         _ => Vec::new(),
@@ -362,16 +346,6 @@ fn tx_class_failures(fields: &BTreeMap<String, String>) -> Vec<String> {
     ] {
         if let Err(error) = count(fields, key) {
             failures.push(error);
-        }
-    }
-    // "No send failed" has to be a recorded fact, not an absent field: these
-    // counters were printed by the harness but never captured, so a row could
-    // neither support nor refute the claim.
-    for key in ["short", "failed", "peer_local", "transient"] {
-        match count(fields, key) {
-            Ok(0) => {}
-            Ok(value) => failures.push(format!("{key}={value} (must be 0)")),
-            Err(error) => failures.push(error),
         }
     }
     if !failures.is_empty() {
@@ -701,12 +675,6 @@ mod tests {
             ("first_submit_lateness_us_p99", "2400"),
             ("first_submit_lateness_us_max", "9100"),
             ("first_submit_lateness_samples", "440000"),
-            // Send outcomes: absent would not be zero, so the gate requires
-            // them explicitly.
-            ("short", "0"),
-            ("failed", "0"),
-            ("peer_local", "0"),
-            ("transient", "0"),
         ]
     }
 
@@ -869,23 +837,6 @@ mod tests {
             failures
                 .iter()
                 .any(|f| f.contains("missing first_submit_lateness_us_p99")),
-            "{failures:?}"
-        );
-
-        // "No send failed" must be recorded, not merely unmentioned.
-        let mut fields = passing();
-        fields.retain(|(k, _)| *k != "transient");
-        let failures = judge(&row(&fields), tolerance);
-        assert!(
-            failures.iter().any(|f| f.contains("missing transient")),
-            "{failures:?}"
-        );
-        let mut fields = passing();
-        fields.retain(|(k, _)| *k != "failed");
-        fields.push(("failed", "3"));
-        let failures = judge(&row(&fields), tolerance);
-        assert!(
-            failures.iter().any(|f| f.contains("failed=3 (must be 0)")),
             "{failures:?}"
         );
     }

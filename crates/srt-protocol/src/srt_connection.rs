@@ -326,13 +326,11 @@ pub enum OutputInto {
     Datagram {
         len: usize,
         class: DatagramClass,
-        /// The source's declared due instant for this datagram in the
-        /// microsecond domain of the `now` the application supplies (see
+        /// The source's due instant for this datagram in the microsecond domain
+        /// of the `now` the application supplies (see
         /// `PendingData::source_due_micros`). `None` for retransmissions and
-        /// control datagrams. A transport that hands the datagram to a TX lane
-        /// later than this measures the whole deadline-to-wire path, including
-        /// the source's own lateness -- see `FirstSubmitLateness` for how the
-        /// boundary is defined and what it excludes.
+        /// control datagrams. A transport that submits the datagram later than
+        /// this measures how long the payload was held downstream of the source.
         source_due_micros: Option<u64>,
     },
     /// A timer set action was consumed from the connection.
@@ -1831,9 +1829,9 @@ impl SrtConnection {
                 payload.len()
             );
 
-            // The source's own declared deadline for this payload, carried to
-            // the submission boundary so a transport can measure how late the
-            // payload reached the wire relative to the media schedule.
+            // The source's own due instant for this payload, carried to the
+            // submission boundary so a transport can measure how long the
+            // payload was held downstream of the source.
             self.queue_data_packet(header, payload, Some(now.as_micros()), now)?;
             if let Some(ref mut sender) = self.sender {
                 sender.record_send_time(now);
