@@ -469,11 +469,18 @@ pub(crate) struct PendingData {
     /// microsecond domain the application supplies as `now`.
     ///
     /// For a first transmission this is the `now` the application admitted the
-    /// payload with -- its own deadline for that payload, not a measurement
-    /// taken afterwards. Subtracting it from the instant the transport actually
-    /// submits the datagram measures how long the payload was held downstream of
-    /// the source (admission, drain, pacing, TX queue), which is the transport's
-    /// own delay and is not confounded by how fast the source offers.
+    /// payload with -- its own declared deadline for that payload, not a
+    /// measurement taken afterwards.
+    ///
+    /// Subtracting it from the instant the transport hands the datagram to a TX
+    /// lane therefore measures the whole path from the media schedule's deadline
+    /// to the wire: the source's own lateness in offering the tick (the same
+    /// quantity a harness measures as offer lateness), plus admission, drain,
+    /// pacing, pool/lane reservation and the queueing until handoff. It is a
+    /// real-time measure, not a transport-only one -- a source that is itself
+    /// late is visible in it, which is the point: a payload is late on the wire
+    /// no matter which stage made it late. Kernel and asynchronous completion
+    /// latency are still outside it, and a payload submitted on time reports 0.
     ///
     /// `None` for a retransmission (there is no source deadline for one) and for
     /// control datagrams.

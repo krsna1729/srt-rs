@@ -267,3 +267,8 @@ undeclared: `first_submit_lateness_us_*` is reported, and the offer itself is
 already known not to be punctual (p99 4.6-13.8 ms against a 5 ms budget), so a
 real-time claim needs a source that is punctual before it can be about the
 dataplane.
+
+## Result: the post-fix canonical run
+
+(regenerated below under the fixed evidence schema)
+
