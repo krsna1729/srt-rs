@@ -251,6 +251,26 @@ is still the best-supported one (the flag matrix eliminates the alternatives),
 but its size is now unproven, and the honest statement is that the next step is
 a fixed-work equilibrium measurement that varies one thing at a time.
 
+### How far from optimal, on conserved quantities only
+
+| reference | measured | what the shard would need to reach it | gap |
+|---|---|---|---:|
+| its own per-datagram floor, pipelined (8.0 us) | 1.75 wire datagrams per delivered payload | every datagram (data *and* control) at floor cost | **1.42x** |
+| its own per-datagram floor, batched 16-64 (7.57 us) | same | same | **1.50x** |
+| stream coalescing, same runtime, 1316 B framing (0.909 ms/Mbit) | 3.68 ms/Mbit | give up per-packet ARQ | 4.0x |
+| raw stream, same runtime, 4096 B (0.249 ms/Mbit) | 3.68 ms/Mbit | give up per-packet ARQ and 1400-byte datagrams | 14.8x |
+| copy floor (18.6 ns per payload) | 19.95 us per payload | stop being a network stack | ~1000x (irrelevant) |
+| host capacity at 1000 x 8 Mbps | 34 destinations per core-second | ~29 cores; this host has 6 | ~5x short |
+
+Read together: **the reachable gap is ~1.4-1.5x and it is submission structure**;
+the next 4-15x is protocol design (per-packet ARQ, 1400-byte datagrams); the
+remaining 1000x is the copy floor and was never the wall.
+
+Caveat on the 1.42-1.50x: it is an upper bound on what submission structure can
+buy, because it assumes the control traffic inside the 1.75 wire datagrams per
+payload can also be driven to floor cost. The floor arms price data datagrams
+from a pipelined or batched submitters and do not model ACK traffic at all.
+
 ### Cost model, fitted to measured floors
 
 The per-term model below does **not** depend on the shard: every term comes
@@ -327,9 +347,10 @@ the same byte count on every row --
 
 Publisher bytes written and sink bytes read match on every row (1,372,351
 messages parsed in the 4096 B RTMP run). Against the SRT shard on the conserved
-denominator (~2.9 ms CPU per Mbit), a TCP byte stream in the same runtime is
-~9x cheaper per megabit at 4096-byte messages and ~3x cheaper with RTMP framing
-at 1316 bytes.
+denominator -- 19.95 us sender CPU per delivered payload, 38.72 us for the pair,
+i.e. **3.68 ms CPU per Mbit at both ends** -- a byte stream in the same runtime
+is cheaper per megabit by: 14.8x (raw TCP, 4096 B), 11.7x (RTMP framing, 4096 B),
+6.2x (raw TCP, 1316 B), 4.0x (RTMP framing, 1316 B).
 
 #### The same flag matrix, on the streaming path (it does not transfer)
 
