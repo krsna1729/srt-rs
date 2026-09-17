@@ -168,6 +168,20 @@ async fn read_some(socket: &mut compio::net::TcpStream, n: usize) {
     let _ = out.0;
 }
 
+/// Abort with a diagnostic if a role makes no progress within `seconds`.
+///
+/// An arm that can hang is worse than an arm that fails: a hang produces no
+/// evidence at all and burns the run, and it hides which side stalled. This
+/// turns the failure into a line with a label, so the next attempt starts from
+/// a fact rather than a timeout.
+fn watchdog(seconds: u64, label: &'static str) {
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(seconds));
+        eprintln!("RTMP_WATCHDOG label={label} hung after {seconds}s");
+        std::process::exit(3);
+    });
+}
+
 fn cpu_ms() -> f64 {
     let s = process_stats();
     s.cpu_user_ms + s.cpu_sys_ms
@@ -221,6 +235,7 @@ impl Settings {
 // --------------------------------------------------------------------------
 
 fn run_sink(settings: &Settings) {
+    watchdog(settings.seconds * 4 + 30, "sink");
     let stream_name = settings.stream.clone();
     let runtime = compio::runtime::Runtime::new().expect("compio runtime");
     let report = runtime.block_on(async {
@@ -263,10 +278,19 @@ fn run_sink(settings: &Settings) {
         let mut replies_sent = 0;
         loop {
             let Some(header) = read_exact_n(&mut socket, HEADER).await else {
+                // Expected at the end of a run: the publisher closing is EOF.
+                eprintln!("[sink] connection closed after {messages} messages");
                 break;
             };
+            // Header layout: [0] csid, [1..4] timestamp, [4..7] length,
+            // [7] type, [8..12] stream id. Reading the length from [5..8]
+            // folds the timestamp byte in and drops the high length byte --
+            // for a 4-byte Set Chunk Size message that reads as 1025, so the
+            // sink waits for 1021 bytes that never come, closes on the next
+            // write, and the publisher dies of EPIPE. That is the bug that
+            // kept this arm from producing a number.
             let length =
-                ((header[5] as usize) << 16) | ((header[6] as usize) << 8) | header[7] as usize;
+                ((header[4] as usize) << 16) | ((header[5] as usize) << 8) | header[6] as usize;
             // Extended timestamp: a fmt-0 header whose 3-byte timestamp is
             // 0xFFFFFF carries 4 more bytes before the payload.
             if header[1] == 0xFF
@@ -288,6 +312,10 @@ fn run_sink(settings: &Settings) {
                 }
             }
             if remaining > 0 {
+                eprintln!(
+                    "[sink] short payload: length={length} remaining={remaining} \
+                     header={header:?} messages={messages}"
+                );
                 break;
             }
             messages += 1;
@@ -321,6 +349,7 @@ fn run_sink(settings: &Settings) {
 // --------------------------------------------------------------------------
 
 fn run_publisher(settings: &Settings) {
+    watchdog(settings.seconds * 4 + 30, "publisher");
     let runtime = compio::runtime::Runtime::new().expect("compio runtime");
     let report = runtime.block_on(async {
         let mut socket = compio::net::TcpStream::connect(("127.0.0.1", settings.port))

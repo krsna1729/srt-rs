@@ -301,44 +301,56 @@ which the transport already sets, costs 4.5 % at this arm shape. The remaining
 lever is still candidate D -- submission *structure* (pipelining and batching),
 worth 1.4-1.6x -- not ring flags.
 
-### RTMP-over-TCP, in the same runtime (and what is still missing)
+### RTMP-over-TCP, in the same runtime, both ends
 
-`crates/srt-bench/benches/rtmp_publish_floor.rs` exists so the RTMP comparison
-is not confounded by language or runtime: publisher *and* sink are both Rust on
-Compio, two processes, the same shape as our SRT pair, and the same write sizes
-are available in `--mode tcp` (no RTMP framing) as in `--mode rtmp` (RTMP
-chunking), so framing cost is a difference rather than a guess.
+`crates/srt-bench/benches/rtmp_publish_floor.rs`: publisher *and* sink are Rust
+on Compio, two processes, mirroring our SRT sender/receiver pair, with an RTMP
+arm (handshake, `connect`, `createStream`, `publish`, chunk framing) and a
+`--mode tcp` arm at identical write sizes, so framing cost is a difference
+rather than a guess. An `ffmpeg -> mediamtx` number would have confounded
+language, runtime and muxer with the transport.
 
-Measured, transport-bound (10 s, 4096-byte writes, `--mode tcp`,
-`docs/results/scaling-1000/rtmp-tcp-compio-preliminary.txt`):
+Transport-bound (8 s, no pacing, wall-clock deadline; pub wrote and sink read
+the same byte count on every row --
+`docs/results/scaling-1000/rtmp-vs-tcp-compio.txt`):
 
-| | publisher | sink |
-|---|---:|---:|
-| sustained rate | 5.06-5.97 Gbit/s | same |
-| CPU per Mbit | **0.086-0.103 ms** | 0.086-0.103 ms |
-| CPU per write | 0.16-0.19 us | - |
-| at 1316-byte writes | 0.159-0.209 ms per Mbit | 0.16-0.21 ms per Mbit |
+| write size | mode | sustained | publisher ms CPU/Mbit | sink ms CPU/Mbit | **total** |
+|---:|---|---:|---:|---:|---:|
+| 4096 B | rtmp | 3.72 Gbit/s | 0.202 | 0.260 | **0.462** |
+| 4096 B | tcp | 4.46 Gbit/s | 0.218 | 0.121 | **0.339** |
+| 1316 B | rtmp | 1.44 Gbit/s | 0.526 | 0.654 | **1.180** |
+| 1316 B | tcp | 2.31 Gbit/s | 0.419 | 0.197 | **0.616** |
 
-Against the SRT shard, which spends ~1.8 ms of CPU per Mbit (1.11 sender +
-~0.7 receiver at 12.45 us per wire datagram), **a TCP byte stream in the same
-runtime is 8-20x cheaper per megabit**. The mechanism is the same one candidate
-D names: TCP coalesces 4096-byte writes into MSS-sized segments and amortises
-submission, where the SRT path pays a ring round trip and a protocol header per
-1400-byte datagram.
+Against the SRT shard at ~1.8 ms CPU per Mbit (1.11 sender + ~0.7 receiver,
+12.45 us per wire datagram carrying ~1400 B):
 
-Two honest gaps:
+* **TCP framing is not the story.** RTMP costs 36 % more per Mbit than the raw
+  stream at 4096-byte messages and 92 % more at 1316-byte messages: framing has
+  a per-message cost, and it grows as messages shrink. The 12-byte header per
+  message (0.3 % of bytes) is not what costs; the per-message processing is.
+* **Per message, SRT and RTMP are much closer than per megabit.** RTMP at
+  1316 B does 136 K messages/s at 5.54 us of publisher CPU per message; the SRT
+  shard does 73 K wire datagrams/s at 12.45 us each. So SRT is ~2.2x per
+  message and ~1.5x per megabit at matched payload size, and ~3.9x per megabit
+  at 4096-byte messages, where TCP simply puts 3x the payload per message.
+* This is the same wall as candidate D, seen from the other protocol: the cost
+  is **per message**, so the levers are fewer messages (coalescing, larger
+  wire payloads) or cheaper submission per message (pipelining, batching), and
+  SRT's per-datagram ACK/ring machinery is what it pays on top.
 
-* `--mode rtmp` is **not yet measured**. The arm now performs the real
-  handshake in the correct order -- reading C0+C1, then writing S0+S1+S2, then
-  reading C2; the first version read all 3073 client bytes up front and
-  deadlocked, which is a bench bug rather than an RTMP property -- but it still
-  blocks after `publish`, so no framing number is published here. The framing
-  overhead is 12 bytes per 4096-byte message (0.3 %) and is therefore not what
-  the comparison turns on, but "not measured" is not "measured to be small".
-* The paced variant of the same bench measures compio's *timer*: one
-  `time::sleep` per chunk costs ~290 us of CPU at this write size, swamping the
-  transport. Sustained-cost comparisons must be transport-bound, which is why
-  the table above is unpaced with a wall-clock deadline.
+Two bench bugs stood between the first attempt and this table, both worth
+recording because each looked like a transport result rather than a harness
+defect: a handshake ordering deadlock (reading C0+C1+C2 as one 3073-byte block,
+when the protocol requires reading C0+C1, then writing S0+S1+S2, then reading
+C2), and an off-by-one in the chunk length field (`header[4..7]`, not
+`[5..8]`), which made a 4-byte Set Chunk Size parse as 1025 bytes: the sink
+waited for 1021 bytes that never came, closed on the next write, and the
+publisher died of `EPIPE`. A watchdog now converts any future stall into a
+labelled failure instead of a timeout.
+
+Also recorded: a *paced* variant measures compio's timer (~290 us of CPU per
+`time::sleep` at 4096 B), which swamps the transport, so sustained-cost
+comparisons must be transport-bound.
 
 ### Where the CPU actually goes (`perf`, F=200, sender)
 

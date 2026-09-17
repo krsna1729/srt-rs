@@ -1,8 +1,0 @@
-RTMP_PUB mode=tcp chunk=4096 written_MB=fa writes=6326.145024 wall_s=1544469 achieved_mbit_s=10.00 cpu_ms=5061.0 cpu_ms_per_Mbit=9645.189 us_cpu_per_write=0.191 paced=6.244987112075412
-RTMP_SINK mode=tcp bytes_MB=6326.12 messages=1456 wall_s=9.999 achieved_mbit_s=5061.37 cpu_ms=5222.4 cpu_ms_per_Mbit=0.103
-RTMP_PUB mode=tcp chunk=1316 written_MB=fa writes=2857.978256 wall_s=2171716 achieved_mbit_s=10.00 cpu_ms=2286.4 cpu_ms_per_Mbit=9735.222 us_cpu_per_write=0.426 paced=4.482732548823143
-RTMP_SINK mode=tcp bytes_MB=2857.97 messages=658 wall_s=9.993 achieved_mbit_s=2288.00 cpu_ms=4776.8 cpu_ms_per_Mbit=0.209
-RTMP_PUB mode=tcp chunk=4096 written_MB=fa writes=7461.752832 wall_s=1821717 achieved_mbit_s=10.00 cpu_ms=5969.4 cpu_ms_per_Mbit=9637.227 us_cpu_per_write=0.161 paced=5.29018887126815
-RTMP_SINK mode=tcp bytes_MB=7461.67 messages=1718 wall_s=10.000 achieved_mbit_s=5969.39 cpu_ms=5140.1 cpu_ms_per_Mbit=0.086
-RTMP_PUB mode=tcp chunk=1316 written_MB=fa writes=3474.842728 wall_s=2640458 achieved_mbit_s=10.00 cpu_ms=2779.9 cpu_ms_per_Mbit=9959.621 us_cpu_per_write=0.358 paced=3.771929339531248
-RTMP_SINK mode=tcp bytes_MB=3474.82 messages=800 wall_s=10.000 achieved_mbit_s=2779.82 cpu_ms=4430.0 cpu_ms_per_Mbit=0.159
