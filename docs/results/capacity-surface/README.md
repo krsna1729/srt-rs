@@ -179,3 +179,45 @@ outcomes cleanly -- gap disappears with no retransmits (teardown/stats race), ga
 disappears with ~K retransmits (the final flight really was lost and the fence
 enabled recovery), gap remains after all fences (protocol bug), fence never
 arrives (sender lifecycle).
+
+## Terminal fence: A/B, and what the first runs say
+
+Sender-side fence (one ordinary later DATA payload per destination after the
+measured window, counted separately and excluded from every workload figure), run
+as an A/B at F=50, 8 Mbps/destination, 60 s, 2 repetitions per arm:
+
+```text
+arm       rep  accepted    delivered  measured deficit  in-flight@end  drain  fence acc  sec_a  sec_b  missed
+A no fence 1   2 279 600   2 279 600          0              50           0        -        0      0       0
+A no fence 2   2 279 600   2 279 600          0             128           0        -        0      0       0
+B fence    1   2 279 250   2 279 023        277 *           256          84       50        0      0       7
+B fence    2   2 279 600   2 279 650          0 *            78          50       50        0      0       0
+```
+
+\* `rx_core_total` cannot distinguish fence payloads from measured DATA, so the
+measured deficit is `accepted - (delivered - fence_accepted)`; rep 2's raw
+`delivered` exceeds `accepted` by exactly the fence count, which is the arithmetic
+confirming that accounting rather than a surplus.
+
+What it establishes:
+
+* **The fence is not a cure.** In the one repetition where the deficit appears
+  (fence arm, rep 1: TX pool saturated at 256, 7 source ticks missed), **277
+  payloads are still missing after all 50 fences were accepted**. That rules out
+  the simplest lifecycle reading -- "the tail only needed later sequence progress
+  to become visible" -- for this case, and moves it toward a delivery or
+  accounting defect at the tail when the pool is saturated.
+* **The fence arm conserved exactly in the repetition without saturation**, and
+  the no-fence arm conserved in both of its repetitions, so the deficit remains
+  intermittent rather than deterministic.
+* `sec_a = 0` and `sec_b = 0` in both arms, so the missing payloads are not
+  reported as loss or duplicates by the receiver; they are simply absent from its
+  count.
+
+Limits, stated rather than glossed: 2 repetitions per arm is far below the >= 3 the
+protocol requires and the deficit appears in roughly one repetition in three, so
+this is not yet a resolved experiment -- it is the first evidence that the
+lifecycle hypothesis alone is insufficient. The next run needs more repetitions,
+and receiver-side fence identification (so fence payloads are excluded by the
+receiver rather than by arithmetic), plus the per-peer missing set the protocol
+document calls for.

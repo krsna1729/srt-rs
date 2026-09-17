@@ -2846,6 +2846,7 @@ mod b02_regression_tests {
     /// these tests beyond `mode`/`recv_rounds`.
     fn test_bench_config() -> BenchConfig {
         BenchConfig {
+            diag_expected_ticks: None,
             runtime: crate::Runtime::Mio,
             mode: crate::Mode::Sender,
             encryption: crate::Encryption::Aes256,
