@@ -59,11 +59,24 @@ use srt_transport::compio::{
 };
 use srt_transport::{CallerConfig, SocketOwnership};
 
+/// Default payload size: 1316 bytes, which at 8 Mbps is one payload every
+/// 1316 microseconds. The interval is not a separate constant any more --
+/// it is derived from the payload size and [`RATE_BPS`] by
+/// [`interval_us_for`], so changing one of the two cannot silently change
+/// the offered bitrate.
 const PAYLOAD_SIZE: usize = 1316;
-/// 8 Mbps of 1316-byte payloads: one payload every 1316 microseconds.
-const PACKET_INTERVAL_US: u64 = 1316;
+/// Wire bitrate the source holds constant when the payload size varies:
+/// interval = payload_bytes * 8 / RATE_BPS seconds, so `--payload-bytes`
+/// changes the *number* of datagrams for the same offered bitrate. That is
+/// what separates a per-datagram cost from a per-byte cost.
+const RATE_BPS: u64 = 8_000_000;
 const CONNECT_DEADLINE: Duration = Duration::from_secs(30);
 const DRAIN_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Source interval that holds [`RATE_BPS`] constant for this payload size.
+fn interval_us_for(payload_bytes: usize) -> u64 {
+    (payload_bytes as u64 * 8 * 1_000_000).div_ceil(RATE_BPS)
+}
 
 #[derive(Debug, Default)]
 struct QualReport {
@@ -122,6 +135,22 @@ struct QualReport {
     /// Process CPU consumed by the measurement window alone; the drain phase
     /// is excluded.
     cpu_ms: f64,
+    /// Payload size and source interval actually used. Reported because a
+    /// row is only comparable to another row at the same offered bitrate:
+    /// `payload_bytes * 8 / interval_us` is the per-destination rate.
+    payload_bytes: u64,
+    interval_us: u64,
+    /// CPU consumed by the measurement window alone.
+    ///
+    /// `cpu_ms` spans window + post-window drain, and the drain is not
+    /// small: an F=200 shard submits ~1.2x its window traffic again while
+    /// draining, so a per-copy cost derived from `cpu_ms` charges the
+    /// window for work the window did not do. This field is sampled at
+    /// the window close so the per-copy cost of the measured workload is
+    /// separable from teardown work.
+    window_cpu_ms: f64,
+    /// CPU consumed by the post-window drain alone.
+    drain_cpu_ms: f64,
 }
 
 fn process_cpu_ms() -> f64 {
@@ -160,11 +189,15 @@ async fn run_sender(
     base_port: u16,
     tx_lanes: usize,
     connect_cc: usize,
+    payload_size: usize,
+    interval_us: u64,
 ) -> QualReport {
     let mut report = QualReport {
         fanout,
         tx_lanes,
         connect_cc,
+        payload_bytes: payload_size as u64,
+        interval_us,
         desired: fanout,
         ..Default::default()
     };
@@ -175,7 +208,7 @@ async fn run_sender(
     //
     // A plain session (no passphrase) carries no authentication tag, so the
     // cipher argument is `None`.
-    let wire_ceiling = srt_transport::compio::required_session_wire_ceiling(PAYLOAD_SIZE, None);
+    let wire_ceiling = srt_transport::compio::required_session_wire_ceiling(payload_size, None);
     // K is an input, never a function of F: the whole point of the fixed-cost
     // shard model is that TX concurrency does not grow with the destination
     // population.
@@ -330,13 +363,12 @@ async fn run_sender(
         //     from wall time under overload (which is exactly when it drifts
         //     furthest).
         let cpu_start = process_cpu_ms();
-        let interval = Duration::from_micros(PACKET_INTERVAL_US);
+        let interval = Duration::from_micros(interval_us);
         let epoch = Instant::now();
         let srt_epoch = now;
         let deadline = epoch + Duration::from_millis(duration_ms);
-        let payload = Bytes::from(vec![0x5A_u8; PAYLOAD_SIZE]);
-        let mut lateness =
-            Vec::with_capacity((duration_ms * 1000 / PACKET_INTERVAL_US) as usize + 8);
+        let payload = Bytes::from(vec![0x5A_u8; payload_size]);
+        let mut lateness = Vec::with_capacity((duration_ms * 1000 / interval_us) as usize + 8);
         let mut next_tick = epoch + interval;
         loop {
             if Instant::now() >= deadline {
@@ -411,7 +443,7 @@ async fn run_sender(
         //
         //     expected == generated + missed
         let window_elapsed = deadline.saturating_duration_since(epoch);
-        report.expected_ticks = (window_elapsed.as_micros() / PACKET_INTERVAL_US as u128) as u64;
+        report.expected_ticks = (window_elapsed.as_micros() / interval_us as u128) as u64;
         report.missed_source_ticks = report
             .missed_source_ticks
             .max(report.expected_ticks.saturating_sub(report.generated_ticks));
@@ -424,10 +456,11 @@ async fn run_sender(
             report.generated_ticks > 0,
             "a zero-tick window is not a measurement"
         );
-        report.cpu_ms = process_cpu_ms() - cpu_start;
+        report.window_cpu_ms = process_cpu_ms() - cpu_start;
         // Sampled at the END OF THE WINDOW, before any post-window drain: this
         // is what the shard had outstanding when the measurement stopped.
         report.inflight_at_window_end = owner.tx_in_flight() as u64;
+        let drain_cpu_start = process_cpu_ms();
 
         lateness.sort_unstable();
         report.lateness_p50_us = percentile(&lateness, 0.50);
@@ -453,6 +486,7 @@ async fn run_sender(
             }
             owner.wait_for_activity(Duration::from_millis(1)).await;
         }
+        report.drain_cpu_ms = process_cpu_ms() - drain_cpu_start;
         report.pending_after_drain =
             owner.tx_in_flight() as u64 + if owner.has_pending_work(now) { 1 } else { 0 };
 
@@ -462,6 +496,12 @@ async fn run_sender(
             report.rx_dropped = stats.dropped;
             report.rx_truncated = stats.truncated;
         }
+        // `cpu_ms` is the whole measured run: window + drain + the teardown
+        // bookkeeping between them. It is set here rather than at window close
+        // so it cannot be a stale zero (it was, for one commit: the field was
+        // still printed as `cpu_ms=0.0` while `window_cpu_ms` and
+        // `drain_cpu_ms` carried the real values).
+        report.cpu_ms = process_cpu_ms() - cpu_start;
         report.tx_failures_pending = owner.tx_failures_pending();
         report.tx_pool_capacity = owner.tx_pool().capacity();
         report.tx_pool_free = owner.tx_pool().free_count();
@@ -476,6 +516,7 @@ fn main() {
     let base_port: u16 = parse_arg(&args, "--base-port", 12_000);
     let tx_lanes: usize = parse_arg(&args, "--tx-lanes", 256);
     let connect_cc: usize = parse_arg(&args, "--connect-cc", 64);
+    let payload_bytes: usize = parse_arg(&args, "--payload-bytes", PAYLOAD_SIZE);
     let send_shards: usize = parse_arg(&args, "--send-shards", 1);
     assert_eq!(
         send_shards, 1,
@@ -483,12 +524,15 @@ fn main() {
     );
 
     let runtime = compio::runtime::Runtime::new().expect("runtime for setup");
+    let interval_us = interval_us_for(payload_bytes);
     let report = runtime.block_on(run_sender(
         fanout,
         duration_ms,
         base_port,
         tx_lanes,
         connect_cc,
+        payload_bytes,
+        interval_us,
     ));
 
     let managed = report.rx_mode == format!("{:?}", OwnerRxMode::ManagedMultishot);
@@ -505,7 +549,8 @@ fn main() {
          service_visits={} lateness_us_p50={} p99={} max={} drain_ok={} \
          inflight_at_window_end={} drain_submitted={} drain_completed={} \
          pending_after_drain={} rx_mode={} managed_rx={} \
-         rx_dropped={} rx_truncated={} tx_pool={}/{} cpu_ms={:.1}",
+         rx_dropped={} rx_truncated={} tx_pool={}/{} payload_bytes={} interval_us={} \
+         cpu_ms={:.1} window_cpu_ms={:.1} drain_cpu_ms={:.1}",
         report.fanout,
         report.tx_lanes,
         report.connect_cc,
@@ -543,6 +588,10 @@ fn main() {
         report.rx_truncated,
         report.tx_pool_free,
         report.tx_pool_capacity,
+        report.payload_bytes,
+        report.interval_us,
         report.cpu_ms,
+        report.window_cpu_ms,
+        report.drain_cpu_ms,
     );
 }

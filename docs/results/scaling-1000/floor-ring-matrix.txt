@@ -1,0 +1,14 @@
+# udp_datapath_floor ring-matrix bytes=1316 datagrams_per_arm=60000
+FLOOR_MEMCPY bytes=64 ns_per_copy=2.83 gb_per_s=22.63
+FLOOR_MEMCPY bytes=700 ns_per_copy=10.09 gb_per_s=69.40
+FLOOR_MEMCPY bytes=1316 ns_per_copy=15.70 gb_per_s=83.83
+FLOOR_MEMCPY bytes=4096 ns_per_copy=43.32 gb_per_s=94.55
+FLOOR_MEMCPY bytes=65536 ns_per_copy=1282.96 gb_per_s=51.08
+FLOOR arm=io_uring_ring bytes=1316 mode=none k=64 sent=60000 us_cpu_per_datagram=7.890 ns_cpu_per_byte=5.995 datagrams_per_s=188494 gb_per_s=0.25 cpu_ms=473.4 wall_s=0.318
+FLOOR arm=io_uring_ring bytes=1316 mode=coop_taskrun k=64 sent=60000 us_cpu_per_datagram=7.911 ns_cpu_per_byte=6.011 datagrams_per_s=187647 gb_per_s=0.25 cpu_ms=474.6 wall_s=0.320
+FLOOR arm=io_uring_ring bytes=1316 mode=coop_taskrun+taskrun_flag k=64 sent=60000 us_cpu_per_datagram=7.869 ns_cpu_per_byte=5.979 datagrams_per_s=191060 gb_per_s=0.25 cpu_ms=472.1 wall_s=0.314
+FLOOR arm=io_uring_ring bytes=1316 mode=single_issuer k=64 sent=60000 us_cpu_per_datagram=8.245 ns_cpu_per_byte=6.265 datagrams_per_s=183827 gb_per_s=0.24 cpu_ms=494.7 wall_s=0.326
+FLOOR arm=io_uring_ring bytes=1316 mode=single_issuer+defer_taskrun k=64 sent=60000 us_cpu_per_datagram=8.606 ns_cpu_per_byte=6.539 datagrams_per_s=180588 gb_per_s=0.24 cpu_ms=516.3 wall_s=0.332
+FLOOR arm=io_uring_ring bytes=1316 mode=sqpoll_1ms k=64 sent=60000 us_cpu_per_datagram=9.853 ns_cpu_per_byte=7.487 datagrams_per_s=172097 gb_per_s=0.23 cpu_ms=591.2 wall_s=0.349
+FLOOR arm=io_uring_ring mode=sqpoll_1ms+defer_taskrun unsupported=runtime: Invalid argument (os error 22)
+FLOOR arm=io_uring_ring bytes=1316 mode=coop+single_issuer+defer_taskrun k=64 sent=60000 us_cpu_per_datagram=8.365 ns_cpu_per_byte=6.357 datagrams_per_s=181156 gb_per_s=0.24 cpu_ms=501.9 wall_s=0.331
