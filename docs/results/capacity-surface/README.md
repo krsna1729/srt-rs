@@ -18,8 +18,10 @@ F=200,  2 Mbps/dest  0/1     44.4%    1.092    1.964        41.5       38.0    1
 
 **A row is only sustained if the work happens inside the source window.** That is
 what `f_drain` measures: the share of wire datagrams submitted *after* the source
-stopped. Exactly one configuration in this surface keeps pace -- **F=50 at
-8 Mbps, `f_drain = 0.0 %`, `r_window = r_whole = 1.224`**. Every other row
+stopped. One configuration keeps pace in every repetition measured so far --
+**F=50 at 8 Mbps, `f_drain = 0.0 %`, `r_window = r_whole ~= 1.20`** -- and under
+the configuration-level rule below it is a **candidate operating point, not a
+qualified capacity point**: the 60 s run qualifies 2 of 3 repetitions. Every other row
 accepted more than it could transmit and emptied the difference during a drain
 that cost 3.2-10.0 s of CPU, so those rows establish *admission plus eventual
 delivery*, not sustainable service.
@@ -49,7 +51,7 @@ One repetition per configuration except `F=50, 8` and `F=100, 8` and `F=200, 8`,
 which have two. The protocol asks for three or more; this is a first surface, not
 the final qualification.
 
-## The only sustained configuration, at length
+## The best current candidate operating point, not yet qualified
 
 `F50-r8-clean.tsv` is the same configuration over a **60 s** window with 3
 repetitions, and it is the run this surface's single sustained point rests on:
@@ -83,7 +85,7 @@ effect on what was measured, but it is not a clean-tree artifact and the final
 qualification must be regenerated from a clean commit rather than inheriting
 this one.
 
-## The 256-payload deficit: what the accounting says
+## The 256-payload deficit: hypothesis and what would settle it
 
 `F50-r8-clean.tsv` rep 1 is the only repetition that fails conservation, and the
 numbers line up exactly:
@@ -113,7 +115,7 @@ The K sweep (`F50-r8-K64.tsv`, `F50-r8-K512.tsv`) tests that directly: if the
 deficit is a final-flight phenomenon it should track the saturated pool depth, and
 if it stays at 256 regardless of K it is something else.
 
-### K sweep: the deficit is a tail artifact, and K bounds the frontier
+### K sweep: end-of-run deficit hypothesis and K sensitivity
 
 Same configuration (F=50, 8 Mbps/destination, 60 s), varying only the TX pool/lane
 count. `sec_a` is receiver-reported loss, `sec_b` receiver-reported duplicates:
@@ -131,25 +133,43 @@ K    rep  accepted    receiver    deficit   in-flight@end  drain done-sub  sec_a
 512   3   2 279 400   2 278 916        484      512              512            0      0
 ```
 
-Three conclusions, and one hypothesis retired:
+Three conclusions, one hypothesis retired, and one rule this section applies:
 
-1. **The deficit is a tail artifact, not steady-state loss.** Every run that
-   sustains the offer reports `sec_a = 0`; the shortfall appears only at run end
-   and its size varies from 0 to ~K. It is not a property of the offered rate.
+```text
+(F, R, K) is QUALIFIED  iff every required repetition (>= 3) passes the row gate
+```
+
+Under that rule **nothing measured so far qualifies**, including the F=50 rows
+immediately above and every row in the surface table. What follows are candidate
+operating points and their failure modes, not qualified capacity points.
+
+1. **The deficit is visible only at final reconciliation, and is not yet
+   localized.** Every run that sustains the offer reports `sec_a = 0` and the
+   shortfall appears only at run end, ranging from 0 to ~K -- so it is not a
+   property of the offered rate. But the harness has no time-series receiver
+   conservation measurement, so nothing here yet places the missing payloads in
+   the final flight. "Tail artifact" is a hypothesis with strong support, not a
+   finding; the terminal fence is what decides it.
 2. **The `deficit == saturated in-flight` reading does not survive K.** It holds
    exactly at K=256 (256 of 256), approximately at K=512 rep 3 (484 of 512), and
    fails at K=512 rep 2 (512 in flight, zero deficit). The looser statement the
    three K=256 rows support -- *the deficit appears when the pool is saturated at
    the window boundary* -- also weakens: K=512 rep 2 is saturated and loses
    nothing, while K=512 rep 1 has only 58 in flight and loses 55. What survives is
-   weaker still and needs the fence experiment to sharpen: **the final flight, not
-   the steady state, is where payloads go missing.**
-3. **K bounds the frontier.** K=64 cannot sustain F=50 at 8 Mbps at all: receiver
-   loss of 765-6,670 datagrams per 60 s window and 172-296 K undelivered payloads,
-   with duplicates appearing (`sec_b`) as the protocol retransmits. K=256 and
-   K=512 both sustain it with `sec_a = 0`. So a capacity point is a
-   `(F, rate, K)` triple, not a `(F, rate)` pair -- the surface needs a K axis, and
-   previous rows measured at K=256 only.
+   weaker still: **the deficit is observed only at final reconciliation, with no
+   aggregate mid-stream loss signal**, and the fence experiment is required to
+   determine whether the missing payloads actually belong to the final flight.
+3. **K bounds whether the shard can sustain the workload at all, and neither K
+   above the threshold is yet qualified.** K=64 cannot sustain F=50 at 8 Mbps:
+   receiver loss of 765-6,670 datagrams per 60 s window and 172-296 K undelivered
+   payloads, with duplicates appearing (`sec_b`) as the protocol retransmits. K=256
+   removes that regime and qualifies **2 of 3** repetitions (rep 1 loses 256
+   payloads); K=512 is weaker, qualifying **1 of 3** (rep 1 misses 71 of 45 592
+   ticks, cadence 0.99844 < 0.999, and loses 55 payloads; rep 3 loses 484). So a
+   capacity point is a `(F, rate, K)` triple rather than a `(F, rate)` pair, and
+   the strongest current statement is: **K=64 is insufficient; K=256 and K=512
+   remove the K=64 loss/duplicate regime but neither is fully qualified.** K=256
+   is the better production candidate on this host.
 
 The diagnostic that decides this is the terminal fence the reviewer proposed: a
 measurement-only sentinel per destination, sent after the last measured tick,

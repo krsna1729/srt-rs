@@ -153,6 +153,66 @@ building next:
    retransmission bursts, high per-destination rates, and any pace tolerance
    that lets several packets for one destination ride together.
 
+## Next decisive experiment: the terminal fence
+
+The remaining conservation defect at K=256/512 is **not localized**. What the data
+shows is that the deficits appear only during final reconciliation and always with
+`sec_a = 0`; there is no time-series receiver conservation measurement, so nothing
+yet places the missing payloads in the final flight. The fence is the experiment
+that turns that from a strong hypothesis into a finding.
+
+sender, after the measured window:
+
+```text
+last measured tick for peer P = T
+    send ordinary measured DATA through T
+    stop the measured source
+    send FENCE(peer=P, final_tick=T)
+        as an ordinary *later* SRT DATA message
+        classified as diagnostic, never as workload
+    continue servicing the sender
+
+receiver, per peer:
+    record the first observation of FENCE(P, T)
+    snapshot measured DATA received through T, missing tick ids, sec_a, sec_b,
+    duplicate measured DATA, fence receive time
+    terminate and write STATS only after every fence (or a timeout)
+```
+
+Fence DATA and fence CPU stay **out of the capacity denominator**, but the fence
+phase gets its own counters rather than being discarded: `fence_first_data`,
+`fence_retx`, `measured_tail_retx_during_fence`, `fence_control`, and
+`time_to_all_fences`. Then the outcomes separate cleanly:
+
+```text
+fence seen, deficit 0, no measured retx      -> receiver/stat snapshot or shutdown race
+fence seen, deficit 0, measured retx appears -> the tail needed later sequence progress
+fence seen, deficit remains                  -> delivery / drop / accounting defect
+fence never seen                             -> the final-send lifecycle itself failed
+```
+
+The lifecycle is why this is worth doing: the sender currently services until
+there is no in-flight or pending work, records stats and returns. There is no
+receiver-confirmed end-of-stream watermark and no application-level final
+acknowledgement, so TX completion can outrun remote observation and the protocol
+can go quiescent before a later NAK or recovery opportunity exists.
+
+## K is a sparse sensitivity axis, not a third sweep dimension
+
+`C = C(F, R, K)` is the honest model, but a dense three-dimensional sweep would
+replace measurement with bookkeeping. Once the fence is understood, pick a
+production K -- 256 currently looks better than 512 on this host -- and treat K as
+a sensitivity axis probed at a few frontier points (`K = 64, 128, 256, 512`). If
+256 is consistently sufficient and 512 buys no capacity while occasionally
+worsening cadence, K becomes a tuned implementation parameter instead of a
+multiplier on every future experiment.
+
+K=64 also shows K participating in two regimes rather than one: it accepts far
+fewer payloads than offered (admission/backpressure capacity) *and* then fails to
+deliver a substantial share of what it accepted, with receiver loss and duplicates
+(recovery/service capacity). Wire classification is what will say which dominates
+near the threshold.
+
 ## Order of work
 
 1. **Finish the surface.** At least three repetitions per cell (most cells have
@@ -170,6 +230,39 @@ building next:
 
 Every step is judged by the gate plus a declared lateness budget, not by
 microseconds per datagram.
+
+## GSO opportunity census (implementation notes)
+
+The census comes before any GSO code, and two implementation details decide
+whether it measures anything:
+
+* **Do not text-log every emitted packet during the timed run.** F=50 at 8 Mbps
+  already emits ~46 K wire packets/s, i.e. millions of records over 60 s, and
+  formatting plus filesystem work would perturb the scheduling distribution being
+  measured. Use a bench-only preallocated binary ring or online histograms and
+  flush after the measurement.
+* **Record `wire_len` and packet type, not only timing.** GSO requires compatible
+  segmentation -- a 1316-byte DATA packet cannot share a batch with a short ACK or
+  NAK -- so the census needs separate curves for first DATA, retransmission
+  bursts, and homogeneous control packets. Fields: `peer`, `packet_type`,
+  `wire_len`, `nominal_due_time`, `actual_submit_time`, `sequence_number`.
+
+The theoretical DATA spacing makes the result falsifiable before it is run:
+
+```text
+1316-byte payload       spacing
+ 8 Mbps                 1316 us
+12 Mbps                  877 us
+20 Mbps                  526 us
+25 Mbps                  421 us
+50 Mbps                  211 us
+```
+
+So: no natural first-DATA GSO below ~1 ms at F=50 x 8 Mbps; a two-packet
+opportunity becomes plausible around 500-600 us at 20 Mbps per destination; and a
+250 us horizon could already produce 2-segment batches at 50 Mbps per destination.
+A census that deviates strongly from those figures is itself the finding -- it
+would mean the scheduler is bunching packets before pacing is deliberately relaxed.
 
 ## Next experiment matrix
 
@@ -199,49 +292,66 @@ distribution is reported next to it.
 Target: approach stream-transport amortisation while the packet stream the peer
 observes stays exactly SRT.
 
-## First gate-backed surface
+## Withdrawn: the first gate-backed surface (intermediate evidence)
 
-The bounded catch-up source (below) made the cadence condition falsifiable, and
-the first gate-backed rows are in
-`docs/results/capacity-surface/`:
+**Superseded. Nothing in this section is a current claim**, and it is kept only
+because the sequence is instructive: a "throughput PASS" that allowed a large
+post-window drain was published as a frontier before stationarity was in the
+gate.
 
-| configuration | rows | gate | r | C_SRT us/payload | p99 lateness |
+Original table, withdrawn in full:
+
+| configuration | rows | gate at the time | r | C_SRT us/payload | p99 |
 |---|---:|---:|---:|---:|---:|
-| F=50, 8 Mbps/dest | 2 | **2/2 PASS** | 1.22 | 16.91 | 5.3 ms |
-| F=100, 8 Mbps/dest | 2 | **2/2 PASS** | 1.46 | 16.54 | 28.3 ms |
+| F=50, 8 Mbps/dest | 2 | 2/2 | 1.22 | 16.91 | 5.3 ms |
+| F=100, 8 Mbps/dest | 2 | 2/2 | 1.46 | 16.54 | 28.3 ms |
 | F=100, 12 Mbps/dest | 1 | 0/1 | 1.51 | 15.12 | 5.4 ms |
 | F=150, 8 Mbps/dest | 1 | 0/1 | 1.57 | 16.75 | 7.4 ms |
 | F=200, 8 Mbps/dest | 2 | 0/2 | 1.55 | 22.20 | 40.6 ms |
 | F=200, 6 Mbps/dest | 1 | 0/1 | 1.42 | 18.68 | 65.7 ms |
-| F=200, 4 Mbps/dest | 1 | **1/1 PASS** | 1.98 | 23.63 | 12.6 ms |
-| F=200, 2 Mbps/dest | 1 | **1/1 PASS** | 1.96 | 26.09 | 16.8 ms |
+| F=200, 4 Mbps/dest | 1 | 1/1 | 1.98 | 23.63 | 12.6 ms |
+| F=200, 2 Mbps/dest | 1 | 1/1 | 1.96 | 26.09 | 16.8 ms |
 
-Three things this already establishes, none of which the burst evidence could:
+Why every "PASS" above is not a capacity point:
 
-1. **No wire-datagram frontier is established yet, because only one row is
-   stationary.** The 150-162 K figure came from folding drain work back into the
-   window (`(window + drain) / window`); the in-window rate is 34.8-84.4 K
-   datagrams/s and is set by the shard's service rate, not by the offer. At
-   F=50 at 8 Mbps the shard keeps pace at 46.5 K wire datagrams/s with
-   `r_window = r_whole = 1.224`. Every other configuration accumulates a backlog
-   and drains it afterwards, so it measures admission, not capacity -- see the
-   stationarity verdict below.
-2. **`r` is not a monotonic load indicator.** At F=200 it measures ~1.96-1.98 at
-   2-4 Mbps, *falls* to 1.42 at 6 Mbps, and rises to 1.55 at 8 Mbps. That shape is
-   what a per-time control component predicts (at low DATA rates, fixed periodic
-   ACK/control traffic costs more wire packets per delivered payload), with
-   retransmission and resubmission adding on top near overload:
+* the gate at the time had no stationarity condition, and the rows that passed
+  it carried 33-76 % of their wire work **after** the source stopped -- F=200 at
+  4 Mbps drained 1,060,611 datagrams against 443,469 submitted in-window;
+* `r` in the table is whole-run amplification folded into a ten-second window,
+  which produced a "150-162 K wire datagrams/s frontier" that the in-window
+  numbers do not support (34.8-84.4 K/s);
+* the contract behind them is **admission plus eventual delivery**, which is what
+  the gate measured, not sustainable service.
 
-   ```text
-   r ~= 1 + r_periodic_control(F, R) + r_loss(load)
-   ```
+The current surface, its gate and its remaining open items are in
+`docs/results/capacity-surface/README.md`; the current K statement is below.
 
-   F=50's 1.22 is consistent with the draft's ~0.28 control-per-DATA budget and
-   no duplication. Decomposing `r` needs wire classification -- DATA vs ACK vs
-   NAK vs retransmission vs other -- not another rate sweep, and until then `r`
-   cannot be used as a load indicator at all.
-3. **F=100 at 12 Mbps fails while 8 Mbps passes**, so fanout alone cannot
-   describe capacity -- which is why the frontier is published as a surface.
+## A capacity point is qualified only when every required repetition passes
+
+"Two of three rows pass" is useful evidence and it is not a qualified capacity
+point. The rule, defined now so it cannot drift with the data:
+
+```text
+(F, R, K) is QUALIFIED  iff  every required repetition (>= 3) passes the
+                             row-level gate: conservation, cadence >= 99.9 %,
+                             stationarity within the declared bound, real CPU
+                             accounting
+```
+
+Under that rule, nothing measured so far is a qualified capacity point:
+
+```text
+F=50, R=8 Mbps, K=64     insufficient: 765-6,670 lost datagrams per 60 s window,
+                         172-296 K undelivered payloads, duplicates on retransmit
+F=50, R=8 Mbps, K=256    2 of 3 repetitions (rep 1 loses 256 payloads)
+F=50, R=8 Mbps, K=512   1 of 3 (rep 1 misses 71 of 45 592 ticks -> cadence
+                         0.99844 < 0.999, and loses 55 payloads; rep 3 loses 484)
+```
+
+So the strongest K statement available is: **K=64 is demonstrably insufficient for
+F=50 x 8 Mbps, and K=256 or K=512 remove the persistent receiver-reported
+loss/duplicate regime seen at K=64, but neither is yet fully qualified.** K=256
+looks like the better production candidate of the two on this host.
 
 ### Throughput pass and real-time pass are different claims
 
