@@ -127,9 +127,19 @@ fn buffer_too_small_is_transactional_and_does_not_corrupt_queue() {
         .expect("sufficient buffer succeeds");
     assert_eq!(result, Some(OutputInto::Datagram { len: wire_len }));
 
-    // 5. Output queue is now empty of datagrams
-    assert_eq!(caller.peek_output(), None);
-    assert_eq!(caller.poll_output_into(&mut full_buf).unwrap(), None);
+    // 5. The datagram is consumed exactly once. Materializing it arms the
+    // sender timeout, so a timer action is legitimately queued behind it -- what
+    // must not remain is another datagram.
+    loop {
+        match caller
+            .poll_output_into(&mut full_buf)
+            .expect("output materializes")
+        {
+            None => break,
+            Some(OutputInto::SetTimer { .. } | OutputInto::ClearTimer { .. }) => {}
+            Some(OutputInto::Datagram { .. }) => panic!("the datagram was queued twice"),
+        }
+    }
 }
 
 #[test]
@@ -446,10 +456,22 @@ fn wire_equivalence_key_rotation() {
         let payload = format!("key-rotation-data-{i}").into_bytes();
         caller.send(&payload, now).expect("send packet");
 
-        let meta = caller.peek_output().expect("peek output");
-        let wire_len = match meta {
-            OutputMeta::Datagram { wire_len } => wire_len,
-            other => panic!("expected datagram, got {other:?}"),
+        // Materializing a DATA datagram arms the sender timeout, so a timer
+        // action can sit in front of the next datagram; this test is about wire
+        // bytes, so consume those here exactly as a runtime would.
+        let wire_len = loop {
+            match caller.peek_output().expect("datagram is queued") {
+                OutputMeta::Datagram { wire_len } => break wire_len,
+                OutputMeta::SetTimer { .. } | OutputMeta::ClearTimer { .. } => {
+                    assert!(
+                        caller
+                            .poll_output_into(&mut [])
+                            .expect("timer action materializes")
+                            .is_some(),
+                        "a peeked timer action must materialize"
+                    );
+                }
+            }
         };
 
         let mut buf = vec![0u8; wire_len];

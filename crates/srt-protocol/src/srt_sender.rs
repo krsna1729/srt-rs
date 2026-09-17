@@ -15,6 +15,7 @@ use crate::sender_packet_window::SenderPacketWindow;
 
 use bytes::Bytes;
 
+use crate::sender_rto::SenderRto;
 use crate::srt_handshake::MAX_FLOW_WINDOW;
 use crate::srt_packet::{DataHeader, PacketPosition, SRT_HEADER_SIZE, sequence_less_than};
 use crate::srt_receiver::LossRange;
@@ -56,6 +57,17 @@ struct SentPacket {
     payload: Bytes,
     sent_time: Timestamp,
     retransmit_count: u32,
+    /// Whether this packet's FIRST datagram has actually left the protocol for
+    /// the transport.
+    ///
+    /// Retention in this buffer only means the packet was *accepted* by the
+    /// sender (see `push_impl`); a datagram still waiting for TX capacity has
+    /// not been transmitted at all. Only a submitted packet may be selected for
+    /// a timeout retransmission, because retransmitting one that has never been
+    /// sent would duplicate a transmission that is still pending, not repair a
+    /// loss. Distinct from `sent_time`, which is the TLPKTDROP message age and
+    /// is deliberately never rewritten by a retransmission.
+    submitted: bool,
 }
 
 /// A message dropped by sender-side TLPKTDROP.
@@ -144,6 +156,16 @@ pub struct SenderBuffer {
     total_naks_received: u64,
     /// Most recent measurements advertised by a full peer ACK.
     peer_feedback: Option<PeerFeedback>,
+    /// The newest sequence number whose first datagram has actually been
+    /// submitted to the transport, if any.
+    ///
+    /// The per-packet `submitted` flag is the truth; this is the O(1) ceiling
+    /// the timeout probe starts from, so the common case never walks the
+    /// window. First transmissions leave the protocol in sequence order, so it
+    /// only moves forward within one sequence epoch.
+    newest_submitted: Option<u32>,
+    /// Sender retransmission-timeout epoch (see [`crate::sender::SenderRto`]).
+    rto: SenderRto,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -194,6 +216,8 @@ impl SenderBuffer {
             total_acks_received: 0,
             total_naks_received: 0,
             peer_feedback: None,
+            newest_submitted: None,
+            rto: SenderRto::new(),
         };
         buf.recompute_packet_send_period();
         buf
@@ -213,6 +237,7 @@ impl SenderBuffer {
         self.loss_list.clear();
         self.packets.clear();
         self.stale_retransmits = 0;
+        self.newest_submitted = None;
         true
     }
 
@@ -392,7 +417,8 @@ impl SenderBuffer {
         self.packets.has_retransmit_queued()
     }
 
-    /// Queue one probe retransmission of the newest sent packet.
+    /// Queue one probe retransmission of the newest packet that was actually
+    /// submitted to the transport.
     ///
     /// A receiver can only name a loss it has evidence for, and a missing
     /// *suffix* of a flight provides none: no later sequence number arrives to
@@ -401,29 +427,126 @@ impl SenderBuffer {
     /// lost flight tail on its own, and the sender's retransmission timer is the
     /// last party that can notice.
     ///
-    /// Probing the newest sent packet is the narrow answer: its arrival both
-    /// repairs a lost tail directly and gives the receiver later sequence
+    /// Probing the newest *submitted* packet is the narrow answer: its arrival
+    /// both repairs a lost tail directly and gives the receiver later sequence
     /// evidence, which is what exposes any older gaps to ordinary selective
     /// recovery. Replaying the whole unacknowledged flight instead would amplify
     /// an outage on every timeout, which is why this queues exactly one packet.
     ///
+    /// A packet that was accepted by the sender but is still waiting for TX
+    /// capacity is not eligible: it has never been on the wire, so
+    /// retransmitting it would not repair a loss. The search therefore starts
+    /// at the newest submitted sequence and steps down over any retained slot
+    /// that has not been submitted (or is already queued). Normal operation
+    /// ends the walk after one step, because the newest submitted packet is
+    /// also the newest retained one.
+    ///
     /// Returns whether anything was queued. Callers must only use this when no
     /// selective retransmission is already pending, so a NAK-driven recovery in
     /// progress is never widened by the timer.
-    pub fn queue_retransmission_of_newest_sent(&mut self) -> bool {
-        // The newest packet the sender has put on the wire is the highest
-        // retained sequence below the next one it would assign.
-        let Some((sequence, _)) = self.packets.last_occupied_before(self.next_seq) else {
+    pub fn queue_retransmission_of_newest_submitted(&mut self) -> bool {
+        let Some(newest) = self.newest_submitted else {
             return false;
         };
-        if self.packets.retransmit_queued_contains(sequence) {
-            return false;
+        let mut ceiling = newest;
+        loop {
+            let Some((sequence, eligible)) = self
+                .packets
+                .last_occupied_before(ceiling.wrapping_add(1))
+                .map(|(sequence, entry)| (sequence, entry.submitted))
+            else {
+                return false;
+            };
+            // Walked back past the flight: everything at or below here has
+            // been acknowledged and is no longer a candidate.
+            if !sequence_less_than(self.oldest_unacked, sequence.wrapping_add(1)) {
+                return false;
+            }
+            if eligible && !self.packets.retransmit_queued_contains(sequence) {
+                self.packets
+                    .queue_loss_range(sequence, sequence, |sequence| {
+                        self.loss_list.push_back(sequence);
+                    });
+                return true;
+            }
+            ceiling = sequence.wrapping_sub(1);
         }
-        self.packets
-            .queue_loss_range(sequence, sequence, |sequence| {
-                self.loss_list.push_back(sequence);
-            });
-        true
+    }
+
+    /// Record that a DATA datagram actually left the protocol for the
+    /// transport, and report whether that submission started a new sender-RTO
+    /// epoch.
+    ///
+    /// Callers must only pass datagrams the transport has irrevocably accepted
+    /// (reserved TX capacity already held), because everything downstream --
+    /// probe eligibility, the epoch, TLPKTDROP age -- then treats the packet as
+    /// having been on the wire.
+    ///
+    /// Returns `true` when the caller must arm `TimerId::SenderRto`. An epoch
+    /// already running is never restarted here: a busy sender would otherwise
+    /// postpone its own timeout indefinitely while one early packet stayed
+    /// stranded. Only cumulative ACK progress restarts it, and only an empty
+    /// flight disarms it.
+    pub fn note_data_submitted(&mut self, sequence: u32) -> bool {
+        if let Some(entry) = self.packets.get_mut(sequence) {
+            entry.submitted = true;
+        }
+        if self
+            .newest_submitted
+            .is_none_or(|newest| sequence_less_than(newest, sequence))
+        {
+            self.newest_submitted = Some(sequence);
+        }
+        !self.rto.is_armed()
+    }
+
+    /// Whether anything that was actually submitted is still unacknowledged.
+    #[must_use]
+    pub fn has_outstanding_submitted_data(&self) -> bool {
+        self.newest_submitted
+            .is_some_and(|newest| sequence_less_than(self.oldest_unacked, newest.wrapping_add(1)))
+    }
+
+    /// The oldest un-acknowledged sequence number.
+    #[must_use]
+    pub fn oldest_unacked_sequence(&self) -> u32 {
+        self.oldest_unacked
+    }
+
+    /// Current base timeout from the peer's most recent Full-ACK measurements.
+    #[must_use]
+    pub fn rto_base_timeout_micros(&self) -> u64 {
+        SenderRto::base_timeout_micros(
+            self.peer_feedback
+                .map(|feedback| (feedback.rtt_micros, feedback.rtt_variance_micros)),
+        )
+    }
+
+    /// Start a fresh RTO epoch, returning the timeout to program.
+    pub fn rto_start(&mut self) -> u64 {
+        self.rto.start(self.rto_base_timeout_micros())
+    }
+
+    /// Stop the RTO epoch: nothing submitted is outstanding any more.
+    pub fn rto_stop(&mut self) {
+        self.rto.stop();
+    }
+
+    /// Record an RTO expiry, returning the backed-off timeout to program.
+    pub fn rto_expire(&mut self) -> u64 {
+        self.rto.expire(self.rto_base_timeout_micros())
+    }
+
+    /// Whether an RTO epoch is running.
+    #[must_use]
+    pub fn rto_is_armed(&self) -> bool {
+        self.rto.is_armed()
+    }
+
+    /// Consecutive RTO expiries without cumulative ACK progress.
+    #[must_use]
+    pub fn rto_backoffs(&self) -> u32 {
+        self.rto.backoffs()
     }
 
     /// Set the active flow window (the congestion window tracks it too; see
@@ -560,6 +683,7 @@ impl SenderBuffer {
                     payload: retained,
                     sent_time: now,
                     retransmit_count: 0,
+                    submitted: false,
                 },
             )
             .expect("alias-free live span checked by can_send");
@@ -628,6 +752,7 @@ impl SenderBuffer {
                         payload: retained,
                         sent_time: now,
                         retransmit_count: 0,
+                        submitted: false,
                     },
                 )
                 .expect("alias-free live span checked by can_send");

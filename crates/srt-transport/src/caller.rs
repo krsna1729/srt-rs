@@ -5559,14 +5559,14 @@ mod tests {
         let t0 = Timestamp::from_micros(0);
         store.apply_output(
             &ConnectionOutput::SetTimer {
-                id: TimerId::Retransmit,
+                id: TimerId::RetransmitContinue,
                 duration_micros: 1_000,
             },
             t0,
         );
         store.apply_output(
             &ConnectionOutput::ClearTimer {
-                id: TimerId::Retransmit,
+                id: TimerId::RetransmitContinue,
             },
             t0,
         );

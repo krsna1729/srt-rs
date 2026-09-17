@@ -875,7 +875,7 @@ fn test_retransmit_timer() {
     // Retransmit タイマー発火
     let now = ts(1_000_000);
     caller
-        .handle_timer(TimerId::Retransmit, now)
+        .handle_timer(TimerId::RetransmitContinue, now)
         .expect("timer should succeed");
 
     // 接続は維持される
