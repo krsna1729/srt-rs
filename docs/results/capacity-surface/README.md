@@ -270,5 +270,100 @@ dataplane.
 
 ## Result: the post-fix canonical run
 
-(regenerated below under the fixed evidence schema)
+**Scope: this qualifies the RawReadiness receive path on this host.** Every row of
+both sweeps records `rx_mode=Some(RawReadiness)` and `managed_rx=false` -- the
+readiness reader, not the managed multishot consumer. The result below therefore
+says nothing about `ManagedMultishot` on a substrate that can register a
+provided-buffer ring; such a host needs its own sweep. The field is printed on
+every row for exactly this reason, and a capacity number is only transferable
+together with the RX path it was measured on.
 
+The artifacts record the SHA they were measured at. That commit is preserved as
+the tag `qualification-evidence-5c7a0c3`, because this branch's history was
+consolidated before merge (the same tree content, with the fixup commits folded):
+the only source change after the measurement is the test-only TLPKTDROP-age pin,
+and everything else is documentation. A reader who wants the exact tree behind
+these numbers should resolve that tag rather than a later SHA.
+
+Two independent clean-tree sweeps of the frozen configuration and thresholds,
+`git_sha=5c7a0c3 git_dirty=false` for both. Neither is a rerun-until-green: the
+second was taken because the first showed a *source* stall, and reporting both is
+what keeps a host property from being read as a transport one.
+
+```text
+sweep A: F50-r8-K256-postfix.tsv    sweep B: F50-r8-K256-postfix-b.tsv
+
+rep  cadence    missed  f_drain  conserved  retx  sec_a/sec_b  fences   missing_final   fsub p99  offer p99  C_SRT  r_window
+A1   0.999671      15   0.378 %  yes          0    0/0       50 -> 50    750 (15x50)     338 ms     16.1 ms   17.9   1.199
+A2   0.998509      68   0.357 %  yes         50    0/50      50 -> 50   3400 (68x50)     371 ms      7.8 ms   17.2   1.217
+A3   1.000000       0   0.368 %  yes          3    0/3       50 -> 50      0             271 ms      7.6 ms   17.6   1.212
+B1   1.000000       0   0.375 %  yes          0    0/0       50 -> 50      0              82 ms      4.4 ms   17.3   1.219
+B2   1.000000       0   0.340 %  yes          0    0/0       50 -> 50      0             117 ms      4.7 ms   17.2   1.218
+B3   1.000000       0   0.347 %  yes          0    0/0       50 -> 50      0               2.7 ms    1.3 ms   15.1   1.233
+
+every row: short/failed/peer_local/transient/tx_failures_pending = 0, drain_ok = true,
+           pending_after_drain = 0, rx_dropped = rx_truncated = 0, tx pool 256/256 free
+           at the end, tx_pool_high_water = 256, sum(tx_class_*) == tx_submitted_wire
+conserved = data_accepted + fence payloads the receiver saw == rx_core_total, exactly
+C_SRT     = window_cpu_ms * 1000 / data_accepted
+```
+
+**Sweep B is 3 of 3 under every frozen criterion** (`cargo xtask qualify`: "3 of 3
+rows sustained"). Sweep A is 2 of 3: A2's source stalled long enough to miss 68 of
+45 592 boundaries, and cadence is a *source* criterion that the declared 0.999
+bound is meant to catch. Across both sweeps that is **six of six on every
+transport-side criterion** -- conservation, stationarity, the submission
+partition, the fence, fault state, and RX loss/duplicates -- and the only failures
+are source stalls.
+
+What each criterion actually showed:
+
+* **Conservation is exact, six times out of six.** No "lost payload" row exists
+  any more. The pre-fix surface on this page lost 765-6 670 datagrams per window
+  at K=64 and 256 payloads in one of three repetitions at K=256; post-fix the
+  receiver accounts for every payload the sender accepted, in every repetition of
+  both sweeps. This is the defect the recovery change fixed, and it is the one
+  claim this page was written to be able to make.
+* **No unresolved loss anywhere, and duplicates are accounted**: `sec_a = 0` in
+  all six rows, and `diag_duplicate_payloads = 0` (no payload was ever delivered
+  twice). Four rows have zero duplicates; the two that do not (A2: `data_retx=50`,
+  `sec_b=50`; A3: `data_retx=3`, `sec_b=3`) equal their retransmission probes
+  exactly, so they are recovery traffic the receiver saw twice *at packet level*,
+  not unexplained duplicate delivery. The executable gate requires `sec_a == 0`;
+  it does not require `sec_b == 0`, because a duplicate packet is what a
+  successful repair looks like from the receiver's side.
+* **Stationarity holds at ~0.35 %** against the declared 1 %, i.e. ~10 K of
+  2.8 M datagrams. That figure now *includes* a deliberate ARQ settle window after
+  the source stops (see below), so it is not comparable with the pre-fix rows'
+  50-52 datagrams on this field alone.
+* **The fence is conserved in all six rows** (50 offered, 50 seen) and
+  `diag_missing_final` is zero in four of six; in the other two it equals
+  `missed_source_ticks x established` exactly (750 = 15x50, 3400 = 68x50) with
+  `missing_scatter_peers = 50`, i.e. whole ticks the source never offered --
+  `data_offered == generated_ticks x F` on every row.
+* **Cost is unchanged**: `C_SRT` is 15.1-17.9 us per accepted payload against the
+  pre-fix 17.1-18.0, and `r_window` is 1.199-1.233 against the pre-fix ~1.20. The
+  recovery work this release adds costs nothing measurable in a lossless run.
+
+### One measurement defect the last sweep found, and the fix
+
+The first clean-tree attempt recorded a repetition with 239 accepted-but-undelivered
+payloads, `retx = 0`, and `missing_suffix_peers = 32`. That is the *symptom* the
+recovery change was written for, so it had to be explained rather than rerun away.
+It was the harness, not the transport: a lost suffix leaves nothing queued and
+nothing in flight -- every datagram was submitted and completed -- so the run
+declared equilibrium the moment the TX path went quiet, which was *before* the
+sender's 500 ms timeout had expired. Nothing had failed; the measurement simply
+ended before anything could ask for the tail again.
+
+The drain now keeps servicing for a bounded ARQ window (1.5 s of protocol time,
+longer than the timeout plus the 26 ms RTT measured here) after the stream goes
+quiet, measured against DATA work alone because the ACK/ACKACK cadence keeps the
+TX path busy forever, and only then declares the run finished. After the fix, the
+same configuration conserves in both sweeps. A run's equilibrium is now protocol
+equilibrium, not TX quiescence.
+
+Real time remains **undeclared**. The offer is not punctual (p99 1.3-16.1 ms
+against the 5 ms budget the harness prints), and `first_submit_lateness` p99 --
+the deadline-to-wire path, which includes that offer lateness -- is 2.7-371 ms.
+Neither supports a real-time claim and neither is presented as one.

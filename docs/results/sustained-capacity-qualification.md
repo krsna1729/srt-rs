@@ -374,7 +374,28 @@ insufficient for F=50 x 8 Mbps, and K=256 or K=512 remove the persistent
 receiver-reported loss/duplicate regime seen at K=64, but neither is yet fully
 qualified.** K=256 looked like the better production candidate of the two on this
 host. The post-fix canonical run (see `docs/results/capacity-surface/README.md`)
-is what replaces this statement.
+replaces this statement. Its result, on a clean tree at `5c7a0c3` (preserved as
+the tag `qualification-evidence-5c7a0c3`, because this branch's history was
+consolidated before merge with the same tree content):
+
+```text
+F=50, R=8 Mbps/dest, K=256, 3 x 60 s, two independent sweeps:
+  sweep B   3 of 3 rows QUALIFIED (xtask qualify: cadence, conservation,
+            stationarity, submission partition, fence, fault state,
+            RX loss = 0; duplicates accounted)
+  sweep A   2 of 3: one repetition's SOURCE missed 68 of 45 592 boundaries
+            (cadence 0.998509 against the declared 0.999)
+
+every row, both sweeps: conservation exact, sec_a = 0, no duplicates delivered,
+f_drain ~0.35 %, drain_ok, pending_after_drain = 0, no send failures, no fault,
+rx_mode = RawReadiness (managed_rx = false) -- so this qualifies the
+readiness RX path on this host, not ManagedMultishot on a ring-capable substrate
+```
+
+The K=64/256/512 lines above are the pre-fix surface and their conservation
+failures are what the recovery fix removed; the "K=256 looks like the better
+production candidate" reading survives, now with conservation that actually
+holds.
 
 ## Throughput pass and real-time pass are different claims
 
