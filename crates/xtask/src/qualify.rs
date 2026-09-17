@@ -358,6 +358,16 @@ fn tx_class_failures(fields: &BTreeMap<String, String>) -> Vec<String> {
             failures.push(error);
         }
     }
+    // "No send failed" has to be a recorded fact, not an absent field: these
+    // counters were printed by the harness but never captured, so a row could
+    // neither support nor refute the claim.
+    for key in ["short", "failed", "peer_local", "transient"] {
+        match count(fields, key) {
+            Ok(0) => {}
+            Ok(value) => failures.push(format!("{key}={value} (must be 0)")),
+            Err(error) => failures.push(error),
+        }
+    }
     if !failures.is_empty() {
         return failures;
     }
@@ -685,6 +695,12 @@ mod tests {
             ("first_submit_lateness_us_p99", "2400"),
             ("first_submit_lateness_us_max", "9100"),
             ("first_submit_lateness_samples", "440000"),
+            // Send outcomes: absent would not be zero, so the gate requires
+            // them explicitly.
+            ("short", "0"),
+            ("failed", "0"),
+            ("peer_local", "0"),
+            ("transient", "0"),
         ]
     }
 
@@ -847,6 +863,23 @@ mod tests {
             failures
                 .iter()
                 .any(|f| f.contains("missing first_submit_lateness_us_p99")),
+            "{failures:?}"
+        );
+
+        // "No send failed" must be recorded, not merely unmentioned.
+        let mut fields = passing();
+        fields.retain(|(k, _)| *k != "transient");
+        let failures = judge(&row(&fields), tolerance);
+        assert!(
+            failures.iter().any(|f| f.contains("missing transient")),
+            "{failures:?}"
+        );
+        let mut fields = passing();
+        fields.retain(|(k, _)| *k != "failed");
+        fields.push(("failed", "3"));
+        let failures = judge(&row(&fields), tolerance);
+        assert!(
+            failures.iter().any(|f| f.contains("failed=3 (must be 0)")),
             "{failures:?}"
         );
     }

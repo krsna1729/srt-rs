@@ -758,7 +758,8 @@ fn main() {
          first_submit_lateness_us_max={} first_submit_lateness_samples={} \
          pending_after_drain={} rx_mode={} managed_rx={} \
          rx_dropped={} rx_truncated={} rx_lost={} rx_duplicates={} \
-         tx_pool={}/{} tx_pool_high_water={} payload_bytes={} interval_us={} \
+         tx_pool_free={} tx_pool_capacity={} tx_pool_high_water={} \
+         payload_bytes={} interval_us={} \
          offered_bps_per_dest={} fence_offered={} fence_accepted={} \
          cpu_ms={:.1} window_cpu_ms={:.1} drain_cpu_ms={:.1}",
         report.fanout,
