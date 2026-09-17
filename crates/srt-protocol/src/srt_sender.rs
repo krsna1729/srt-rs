@@ -1925,6 +1925,38 @@ mod tests {
         );
     }
 
+    /// TLPKTDROP age is the message's ORIGINAL send time. A retransmission --
+    /// NAK-driven or the sender's own timeout probe -- must not push that
+    /// deadline out, or recovery work would extend the life of data the
+    /// receiver has already given up on.
+    #[test]
+    fn retransmission_does_not_extend_the_tlpktdrop_lifetime() {
+        let mut buf = SenderBuffer::new(0, 8192, 10);
+        let send_time = Timestamp::from_micros(0);
+        buf.push(vec![1], 100, 1, send_time);
+        assert!(
+            buf.note_data_submitted(0),
+            "first submission starts an epoch"
+        );
+        assert!(
+            buf.queue_retransmission_of_newest_submitted(),
+            "the probe queues the newest submitted packet"
+        );
+
+        // Unchanged deadline: not dropped at exactly one second (the `>` rule),
+        // dropped one microsecond later, exactly as without the retransmission.
+        assert!(
+            buf.drop_expired(Timestamp::from_micros(1_000_000))
+                .is_empty(),
+            "a retransmission must not age the message"
+        );
+        assert_eq!(
+            dropped_seqs(&buf.drop_expired(Timestamp::from_micros(1_000_001))),
+            vec![0],
+            "the original send time still decides TLPKTDROP"
+        );
+    }
+
     #[test]
     fn test_drop_expired_threshold_125pct() {
         // latency_ms = 1000 (1000ms) の場合、1.25 * 1_000_000 = 1_250_000 > 1_000_000 なので
