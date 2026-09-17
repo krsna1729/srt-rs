@@ -1,0 +1,86 @@
+## mode=rtmp
+RTMP_PUB ring=none mode=rtmp chunk=4096 written_MB=1961.25 writes=478822 wall_s=4.003 achieved_mbit_s=3919.94 cpu_ms=3167.2 cpu_ms_per_Mbit=0.202 us_cpu_per_write=6.615 paced=false
+RTMP_SINK ring=none mode=rtmp bytes_MB=1961.26 messages=478826 wall_s=4.067 achieved_mbit_s=3858.24 cpu_ms=3789.1 cpu_ms_per_Mbit=0.242
+RTMP_PUB ring=coop_taskrun mode=rtmp chunk=4096 written_MB=1703.90 writes=415992 wall_s=4.000 achieved_mbit_s=3407.88 cpu_ms=3185.6 cpu_ms_per_Mbit=0.234 us_cpu_per_write=7.658 paced=false
+RTMP_SINK ring=coop_taskrun mode=rtmp bytes_MB=1703.90 messages=415996 wall_s=4.084 achieved_mbit_s=3337.39 cpu_ms=3710.4 cpu_ms_per_Mbit=0.272
+RTMP_PUB ring=coop_taskrun+taskrun_flag mode=rtmp chunk=4096 written_MB=2165.06 writes=528580 wall_s=4.000 achieved_mbit_s=4330.11 cpu_ms=3209.6 cpu_ms_per_Mbit=0.185 us_cpu_per_write=6.072 paced=false
+RTMP_SINK ring=coop_taskrun+taskrun_flag mode=rtmp bytes_MB=2165.06 messages=528584 wall_s=4.057 achieved_mbit_s=4269.50 cpu_ms=3892.9 cpu_ms_per_Mbit=0.225
+RTMP_PUB ring=single_issuer mode=rtmp chunk=4096 written_MB=2221.56 writes=542372 wall_s=4.000 achieved_mbit_s=4443.21 cpu_ms=3141.1 cpu_ms_per_Mbit=0.177 us_cpu_per_write=5.791 paced=false
+RTMP_SINK ring=single_issuer mode=rtmp bytes_MB=2221.56 messages=542376 wall_s=4.051 achieved_mbit_s=4387.56 cpu_ms=3954.0 cpu_ms_per_Mbit=0.222
+RTMP_PUB ring=single_issuer+defer_taskrun mode=rtmp chunk=4096 written_MB=2415.11 writes=589627 wall_s=4.000 achieved_mbit_s=4830.34 cpu_ms=3175.3 cpu_ms_per_Mbit=0.164 us_cpu_per_write=5.385 paced=false
+RTMP_SINK ring=single_issuer+defer_taskrun mode=rtmp bytes_MB=2415.11 messages=589631 wall_s=4.052 achieved_mbit_s=4768.75 cpu_ms=3947.4 cpu_ms_per_Mbit=0.204
+RTMP_PUB ring=sqpoll_1ms mode=rtmp chunk=4096 written_MB=280.06 writes=68373 wall_s=4.000 achieved_mbit_s=560.12 cpu_ms=4087.3 cpu_ms_per_Mbit=1.824 us_cpu_per_write=59.779 paced=false
+RTMP_SINK ring=sqpoll_1ms mode=rtmp bytes_MB=280.06 messages=68377 wall_s=4.119 achieved_mbit_s=543.89 cpu_ms=5620.9 cpu_ms_per_Mbit=2.509
+RTMP_PUB ring=sqpoll_1ms+defer_taskrun unsupported=runtime: Invalid argument (os error 22)
+RTMP_SINK ring=sqpoll_1ms+defer_taskrun unsupported=runtime: Invalid argument (os error 22)
+RTMP_PUB ring=coop+single_issuer+defer_taskrun mode=rtmp chunk=4096 written_MB=2439.05 writes=595472 wall_s=4.000 achieved_mbit_s=4877.77 cpu_ms=3223.4 cpu_ms_per_Mbit=0.165 us_cpu_per_write=5.413 paced=false
+RTMP_SINK ring=coop+single_issuer+defer_taskrun mode=rtmp bytes_MB=2439.05 messages=595476 wall_s=4.041 achieved_mbit_s=4828.26 cpu_ms=3903.9 cpu_ms_per_Mbit=0.200
+## mode=tcp
+RTMP_PUB ring=none mode=tcp chunk=4096 written_MB=2810.01 writes=686037 wall_s=4.000 achieved_mbit_s=5620.14 cpu_ms=3924.4 cpu_ms_per_Mbit=0.175 us_cpu_per_write=5.720 paced=false
+RTMP_SINK ring=none mode=tcp bytes_MB=2810.00 messages=647 wall_s=4.000 achieved_mbit_s=5620.24 cpu_ms=2107.7 cpu_ms_per_Mbit=0.094
+RTMP_PUB ring=coop_taskrun mode=tcp chunk=4096 written_MB=2257.66 writes=551187 wall_s=4.000 achieved_mbit_s=4515.42 cpu_ms=3845.4 cpu_ms_per_Mbit=0.213 us_cpu_per_write=6.977 paced=false
+RTMP_SINK ring=coop_taskrun mode=tcp bytes_MB=2257.65 messages=519 wall_s=4.001 achieved_mbit_s=4514.31 cpu_ms=2178.7 cpu_ms_per_Mbit=0.121
+RTMP_PUB ring=coop_taskrun+taskrun_flag mode=tcp chunk=4096 written_MB=2528.99 writes=617428 wall_s=4.000 achieved_mbit_s=5058.06 cpu_ms=3892.0 cpu_ms_per_Mbit=0.192 us_cpu_per_write=6.304 paced=false
+RTMP_SINK ring=coop_taskrun+taskrun_flag mode=tcp bytes_MB=2528.97 messages=582 wall_s=4.000 achieved_mbit_s=5058.54 cpu_ms=2075.3 cpu_ms_per_Mbit=0.103
+RTMP_PUB ring=single_issuer mode=tcp chunk=4096 written_MB=1853.79 writes=452586 wall_s=4.000 achieved_mbit_s=3707.49 cpu_ms=3694.6 cpu_ms_per_Mbit=0.249 us_cpu_per_write=8.163 paced=false
+RTMP_SINK ring=single_issuer mode=tcp bytes_MB=1853.78 messages=426 wall_s=4.001 achieved_mbit_s=3706.61 cpu_ms=2474.2 cpu_ms_per_Mbit=0.167
+RTMP_PUB ring=single_issuer+defer_taskrun mode=tcp chunk=4096 written_MB=1695.59 writes=413963 wall_s=4.002 achieved_mbit_s=3389.62 cpu_ms=3805.3 cpu_ms_per_Mbit=0.281 us_cpu_per_write=9.192 paced=false
+RTMP_SINK ring=single_issuer+defer_taskrun mode=tcp bytes_MB=1695.58 messages=390 wall_s=4.001 achieved_mbit_s=3390.41 cpu_ms=2054.5 cpu_ms_per_Mbit=0.151
+RTMP_PUB ring=sqpoll_1ms mode=tcp chunk=4096 written_MB=194.86 writes=47573 wall_s=4.002 achieved_mbit_s=389.53 cpu_ms=5472.0 cpu_ms_per_Mbit=3.510 us_cpu_per_write=115.024 paced=false
+RTMP_SINK ring=sqpoll_1ms mode=tcp bytes_MB=194.85 messages=44 wall_s=4.128 achieved_mbit_s=377.60 cpu_ms=4235.5 cpu_ms_per_Mbit=2.717
+RTMP_PUB ring=sqpoll_1ms+defer_taskrun unsupported=runtime: Invalid argument (os error 22)
+RTMP_SINK ring=sqpoll_1ms+defer_taskrun unsupported=runtime: Invalid argument (os error 22)
+RTMP_PUB ring=coop+single_issuer+defer_taskrun mode=tcp chunk=4096 written_MB=1904.16 writes=464883 wall_s=4.037 achieved_mbit_s=3772.97 cpu_ms=3759.6 cpu_ms_per_Mbit=0.247 us_cpu_per_write=8.087 paced=false
+RTMP_SINK ring=coop+single_issuer+defer_taskrun mode=tcp bytes_MB=1904.15 messages=438 wall_s=4.037 achieved_mbit_s=3773.02 cpu_ms=1734.7 cpu_ms_per_Mbit=0.114
+## mode=rtmp rep=2
+RTMP_PUB ring=none mode=rtmp chunk=4096 written_MB=1793.26 writes=437807 wall_s=4.004 achieved_mbit_s=3582.60 cpu_ms=3104.5 cpu_ms_per_Mbit=0.216 us_cpu_per_write=7.091 paced=false
+RTMP_SINK ring=none mode=rtmp bytes_MB=1793.26 messages=437811 wall_s=4.047 achieved_mbit_s=3544.76 cpu_ms=3835.1 cpu_ms_per_Mbit=0.267
+RTMP_PUB ring=coop_taskrun mode=rtmp chunk=4096 written_MB=1895.46 writes=462758 wall_s=4.000 achieved_mbit_s=3790.75 cpu_ms=3119.8 cpu_ms_per_Mbit=0.206 us_cpu_per_write=6.742 paced=false
+RTMP_SINK ring=coop_taskrun mode=rtmp bytes_MB=1895.46 messages=462762 wall_s=4.058 achieved_mbit_s=3737.02 cpu_ms=3707.2 cpu_ms_per_Mbit=0.244
+RTMP_PUB ring=coop_taskrun+taskrun_flag mode=rtmp chunk=4096 written_MB=1784.59 writes=435690 wall_s=4.003 achieved_mbit_s=3566.73 cpu_ms=3053.4 cpu_ms_per_Mbit=0.214 us_cpu_per_write=7.008 paced=false
+RTMP_SINK ring=coop_taskrun+taskrun_flag mode=rtmp bytes_MB=1784.59 messages=435694 wall_s=4.052 achieved_mbit_s=3523.27 cpu_ms=3814.7 cpu_ms_per_Mbit=0.267
+RTMP_PUB ring=single_issuer mode=rtmp chunk=4096 written_MB=2053.11 writes=501247 wall_s=4.000 achieved_mbit_s=4105.80 cpu_ms=3143.1 cpu_ms_per_Mbit=0.191 us_cpu_per_write=6.271 paced=false
+RTMP_SINK ring=single_issuer mode=rtmp bytes_MB=2053.11 messages=501251 wall_s=4.050 achieved_mbit_s=4055.79 cpu_ms=3923.5 cpu_ms_per_Mbit=0.239
+RTMP_PUB ring=single_issuer+defer_taskrun mode=rtmp chunk=4096 written_MB=1981.67 writes=483805 wall_s=4.001 achieved_mbit_s=3962.35 cpu_ms=3283.5 cpu_ms_per_Mbit=0.207 us_cpu_per_write=6.787 paced=false
+RTMP_SINK ring=single_issuer+defer_taskrun mode=rtmp bytes_MB=1981.67 messages=483809 wall_s=4.056 achieved_mbit_s=3908.76 cpu_ms=3867.4 cpu_ms_per_Mbit=0.244
+RTMP_PUB ring=sqpoll_1ms mode=rtmp chunk=4096 written_MB=64.23 writes=15680 wall_s=4.008 achieved_mbit_s=128.21 cpu_ms=4700.7 cpu_ms_per_Mbit=9.149 us_cpu_per_write=299.791 paced=false
+RTMP_SINK ring=sqpoll_1ms mode=rtmp bytes_MB=64.23 messages=15684 wall_s=4.300 achieved_mbit_s=119.49 cpu_ms=5960.6 cpu_ms_per_Mbit=11.601
+RTMP_PUB ring=sqpoll_1ms+defer_taskrun unsupported=runtime: Invalid argument (os error 22)
+RTMP_SINK ring=sqpoll_1ms+defer_taskrun unsupported=runtime: Invalid argument (os error 22)
+RTMP_PUB ring=coop+single_issuer+defer_taskrun mode=rtmp chunk=4096 written_MB=1802.34 writes=440025 wall_s=4.005 achieved_mbit_s=3599.80 cpu_ms=3104.5 cpu_ms_per_Mbit=0.215 us_cpu_per_write=7.055 paced=false
+RTMP_SINK ring=coop+single_issuer+defer_taskrun mode=rtmp bytes_MB=1802.34 messages=440029 wall_s=4.049 achieved_mbit_s=3560.98 cpu_ms=3670.4 cpu_ms_per_Mbit=0.255
+## mode=tcp rep=2
+RTMP_PUB ring=none mode=tcp chunk=4096 written_MB=1999.13 writes=488070 wall_s=4.000 achieved_mbit_s=3998.34 cpu_ms=3661.0 cpu_ms_per_Mbit=0.229 us_cpu_per_write=7.501 paced=false
+RTMP_SINK ring=none mode=tcp bytes_MB=1999.08 messages=460 wall_s=4.000 achieved_mbit_s=3997.91 cpu_ms=2216.3 cpu_ms_per_Mbit=0.139
+RTMP_PUB ring=coop_taskrun mode=tcp chunk=4096 written_MB=1986.62 writes=485015 wall_s=4.000 achieved_mbit_s=3973.07 cpu_ms=3881.5 cpu_ms_per_Mbit=0.244 us_cpu_per_write=8.003 paced=false
+RTMP_SINK ring=coop_taskrun mode=tcp bytes_MB=1986.61 messages=457 wall_s=4.001 achieved_mbit_s=3972.48 cpu_ms=2120.3 cpu_ms_per_Mbit=0.133
+RTMP_PUB ring=coop_taskrun+taskrun_flag mode=tcp chunk=4096 written_MB=2057.17 writes=502238 wall_s=4.000 achieved_mbit_s=4114.42 cpu_ms=3777.5 cpu_ms_per_Mbit=0.230 us_cpu_per_write=7.521 paced=false
+RTMP_SINK ring=coop_taskrun+taskrun_flag mode=tcp bytes_MB=2057.15 messages=473 wall_s=3.998 achieved_mbit_s=4116.03 cpu_ms=2157.7 cpu_ms_per_Mbit=0.131
+RTMP_PUB ring=single_issuer mode=tcp chunk=4096 written_MB=2842.49 writes=693968 wall_s=4.000 achieved_mbit_s=5684.85 cpu_ms=3927.1 cpu_ms_per_Mbit=0.173 us_cpu_per_write=5.659 paced=false
+RTMP_SINK ring=single_issuer mode=tcp bytes_MB=2842.48 messages=654 wall_s=4.000 achieved_mbit_s=5685.20 cpu_ms=2126.1 cpu_ms_per_Mbit=0.093
+## mode=rtmp rep=3
+RTMP_PUB ring=none mode=rtmp chunk=4096 written_MB=1569.91 writes=383279 wall_s=4.000 achieved_mbit_s=3139.90 cpu_ms=2900.7 cpu_ms_per_Mbit=0.231 us_cpu_per_write=7.568 paced=false
+RTMP_SINK ring=none mode=rtmp bytes_MB=1569.91 messages=383283 wall_s=4.048 achieved_mbit_s=3102.60 cpu_ms=3808.7 cpu_ms_per_Mbit=0.303
+RTMP_PUB ring=coop_taskrun mode=rtmp chunk=4096 written_MB=1269.18 writes=309859 wall_s=4.000 achieved_mbit_s=2538.42 cpu_ms=2692.6 cpu_ms_per_Mbit=0.265 us_cpu_per_write=8.690 paced=false
+RTMP_SINK ring=coop_taskrun mode=rtmp bytes_MB=1269.18 messages=309863 wall_s=4.049 achieved_mbit_s=2507.61 cpu_ms=3674.0 cpu_ms_per_Mbit=0.362
+RTMP_PUB ring=coop_taskrun+taskrun_flag mode=rtmp chunk=4096 written_MB=1099.16 writes=268349 wall_s=4.079 achieved_mbit_s=2155.68 cpu_ms=3117.7 cpu_ms_per_Mbit=0.355 us_cpu_per_write=11.618 paced=false
+RTMP_SINK ring=coop_taskrun+taskrun_flag mode=rtmp bytes_MB=1099.16 messages=268353 wall_s=4.177 achieved_mbit_s=2105.28 cpu_ms=3127.6 cpu_ms_per_Mbit=0.356
+RTMP_PUB ring=single_issuer mode=rtmp chunk=4096 written_MB=1559.30 writes=380688 wall_s=4.000 achieved_mbit_s=3118.73 cpu_ms=3160.7 cpu_ms_per_Mbit=0.253 us_cpu_per_write=8.302 paced=false
+RTMP_SINK ring=single_issuer mode=rtmp bytes_MB=1559.30 messages=380692 wall_s=4.052 achieved_mbit_s=3078.70 cpu_ms=3508.6 cpu_ms_per_Mbit=0.281
+RTMP_PUB ring=single_issuer+defer_taskrun mode=rtmp chunk=4096 written_MB=1480.31 writes=361405 wall_s=4.005 achieved_mbit_s=2957.12 cpu_ms=2742.1 cpu_ms_per_Mbit=0.232 us_cpu_per_write=7.587 paced=false
+RTMP_SINK ring=single_issuer+defer_taskrun mode=rtmp bytes_MB=1480.32 messages=361409 wall_s=4.058 achieved_mbit_s=2918.39 cpu_ms=3755.0 cpu_ms_per_Mbit=0.317
+RTMP_PUB ring=sqpoll_1ms mode=rtmp chunk=4096 written_MB=57.99 writes=14158 wall_s=4.000 achieved_mbit_s=115.98 cpu_ms=4153.7 cpu_ms_per_Mbit=8.953 us_cpu_per_write=293.383 paced=false
+RTMP_SINK ring=sqpoll_1ms mode=rtmp bytes_MB=57.99 messages=14162 wall_s=4.068 achieved_mbit_s=114.04 cpu_ms=5239.4 cpu_ms_per_Mbit=11.293
+RTMP_PUB ring=sqpoll_1ms+defer_taskrun unsupported=runtime: Invalid argument (os error 22)
+RTMP_SINK ring=sqpoll_1ms+defer_taskrun unsupported=runtime: Invalid argument (os error 22)
+RTMP_PUB ring=coop+single_issuer+defer_taskrun mode=rtmp chunk=4096 written_MB=2178.93 writes=531965 wall_s=4.000 achieved_mbit_s=4357.96 cpu_ms=3267.2 cpu_ms_per_Mbit=0.187 us_cpu_per_write=6.142 paced=false
+RTMP_SINK ring=coop+single_issuer+defer_taskrun mode=rtmp bytes_MB=2178.93 messages=531969 wall_s=4.053 achieved_mbit_s=4300.56 cpu_ms=3823.5 cpu_ms_per_Mbit=0.219
+## mode=tcp rep=3
+RTMP_PUB ring=none mode=tcp chunk=4096 written_MB=1725.74 writes=421324 wall_s=4.000 achieved_mbit_s=3451.83 cpu_ms=3756.7 cpu_ms_per_Mbit=0.272 us_cpu_per_write=8.916 paced=false
+RTMP_SINK ring=none mode=tcp bytes_MB=1725.71 messages=397 wall_s=4.014 achieved_mbit_s=3439.28 cpu_ms=1937.3 cpu_ms_per_Mbit=0.140
+RTMP_PUB ring=coop_taskrun mode=tcp chunk=4096 written_MB=2399.99 writes=585936 wall_s=4.000 achieved_mbit_s=4800.03 cpu_ms=3742.4 cpu_ms_per_Mbit=0.195 us_cpu_per_write=6.387 paced=false
+RTMP_SINK ring=coop_taskrun mode=tcp bytes_MB=2399.98 messages=552 wall_s=4.000 achieved_mbit_s=4800.27 cpu_ms=1913.2 cpu_ms_per_Mbit=0.100
+RTMP_PUB ring=coop_taskrun+taskrun_flag mode=tcp chunk=4096 written_MB=1994.14 writes=486851 wall_s=4.000 achieved_mbit_s=3988.37 cpu_ms=3598.6 cpu_ms_per_Mbit=0.226 us_cpu_per_write=7.392 paced=false
+RTMP_SINK ring=coop_taskrun+taskrun_flag mode=tcp bytes_MB=1994.07 messages=459 wall_s=4.000 achieved_mbit_s=3988.19 cpu_ms=1905.1 cpu_ms_per_Mbit=0.119
+RTMP_PUB ring=single_issuer mode=tcp chunk=4096 written_MB=2395.03 writes=584725 wall_s=4.000 achieved_mbit_s=4790.12 cpu_ms=3817.0 cpu_ms_per_Mbit=0.199 us_cpu_per_write=6.528 paced=false
+RTMP_SINK ring=single_issuer mode=tcp bytes_MB=2395.02 messages=551 wall_s=3.995 achieved_mbit_s=4796.04 cpu_ms=1833.6 cpu_ms_per_Mbit=0.096

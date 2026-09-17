@@ -191,6 +191,9 @@ struct Settings {
     mode: String,
     mbit: f64,
     seconds: u64,
+    /// io_uring setup mode, from the shared flag table. Applied to *both*
+    /// roles, so a matrix row is a property of the whole path.
+    ring: String,
     /// Pace to `mbit` (a real media publisher does) or run transport-bound.
     ///
     /// Paced runs measure the *timer*: compio's per-chunk sleep costs ~290 us
@@ -210,6 +213,7 @@ impl Settings {
             mode: string_arg(args, "--mode", "rtmp"),
             mbit: parse_arg(args, "--mbit", 6.0),
             seconds: parse_arg(args, "--seconds", 5),
+            ring: string_arg(args, "--ring", "none"),
             pace: parse_arg(args, "--pace", false),
             chunk: parse_arg(args, "--chunk", 4096),
             port: parse_arg(args, "--port", 19_350),
@@ -236,8 +240,14 @@ impl Settings {
 
 fn run_sink(settings: &Settings) {
     watchdog(settings.seconds * 4 + 30, "sink");
+    let runtime = match srt_bench::ring_modes::runtime(&settings.ring) {
+        Ok(r) => r,
+        Err(e) => {
+            println!("RTMP_SINK ring={} unsupported={e}", settings.ring);
+            return;
+        }
+    };
     let stream_name = settings.stream.clone();
-    let runtime = compio::runtime::Runtime::new().expect("compio runtime");
     let report = runtime.block_on(async {
         let listener = compio::net::TcpListener::bind(("127.0.0.1", settings.port))
             .await
@@ -332,8 +342,9 @@ fn run_sink(settings: &Settings) {
     let (bytes, messages, cpu_ms, wall_s) = report;
     let mbits = bytes as f64 * 8.0 / 1e6;
     println!(
-        "RTMP_SINK mode={} bytes_MB={:.2} messages={} wall_s={:.3} achieved_mbit_s={:.2} \
+        "RTMP_SINK ring={} mode={} bytes_MB={:.2} messages={} wall_s={:.3} achieved_mbit_s={:.2} \
          cpu_ms={:.1} cpu_ms_per_Mbit={:.3}",
+        settings.ring,
         settings.mode,
         bytes as f64 / 1e6,
         messages,
@@ -350,7 +361,13 @@ fn run_sink(settings: &Settings) {
 
 fn run_publisher(settings: &Settings) {
     watchdog(settings.seconds * 4 + 30, "publisher");
-    let runtime = compio::runtime::Runtime::new().expect("compio runtime");
+    let runtime = match srt_bench::ring_modes::runtime(&settings.ring) {
+        Ok(r) => r,
+        Err(e) => {
+            println!("RTMP_PUB ring={} unsupported={e}", settings.ring);
+            return;
+        }
+    };
     let report = runtime.block_on(async {
         let mut socket = compio::net::TcpStream::connect(("127.0.0.1", settings.port))
             .await
@@ -478,8 +495,9 @@ fn run_publisher(settings: &Settings) {
     let (written, writes, cpu_ms, wall_s) = report;
     let mbits = written as f64 * 8.0 / 1e6;
     println!(
-        "RTMP_PUB mode={} chunk={} written_MB={:.2} writes={} wall_s={:.3} \
+        "RTMP_PUB ring={} mode={} chunk={} written_MB={:.2} writes={} wall_s={:.3} \
          achieved_mbit_s={:.2} cpu_ms={:.1} cpu_ms_per_Mbit={:.3} us_cpu_per_write={:.3} paced={}",
+        settings.ring,
         settings.mode,
         settings.chunk,
         written as f64 / 1e6,
@@ -506,6 +524,8 @@ fn run_driver(settings: &Settings) {
             &settings.port.to_string(),
             "--mode",
             &settings.mode,
+            "--ring",
+            &settings.ring,
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -521,8 +541,38 @@ fn run_driver(settings: &Settings) {
     print!("{}", String::from_utf8_lossy(&output.stdout));
 }
 
+/// Run the shared flag matrix for one mode, at the given write size.
+fn ring_matrix(settings: &Settings) {
+    println!(
+        "# rtmp_publish_floor ring-matrix mode={} chunk={} seconds={}",
+        settings.mode, settings.chunk, settings.seconds
+    );
+    for (name, _) in srt_bench::ring_modes::modes() {
+        let port = settings.port + 1 + (name.len() as u16 % 40);
+        let session = Settings {
+            ring: name.to_string(),
+            port,
+            ..Settings::from_args(&[])
+        };
+        let session = Settings {
+            ring: name.to_string(),
+            port,
+            mode: settings.mode.clone(),
+            chunk: settings.chunk,
+            seconds: settings.seconds,
+            ..session
+        };
+        run_driver(&session);
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--ring-matrix") {
+        let settings = Settings::from_args(&args);
+        ring_matrix(&settings);
+        return;
+    }
     let settings = Settings::from_args(&args);
     match args.get(1).map(String::as_str) {
         Some("sink") => run_sink(&settings),

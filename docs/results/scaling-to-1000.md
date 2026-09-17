@@ -338,6 +338,49 @@ Against the SRT shard at ~1.8 ms CPU per Mbit (1.11 sender + ~0.7 receiver,
   wire payloads) or cheaper submission per message (pipelining, batching), and
   SRT's per-datagram ACK/ring machinery is what it pays on top.
 
+#### The same flag matrix, on the streaming path (and it does not transfer)
+
+The UDP matrix above ranks flags within a +/-0.7 % band. The RTMP/TCP path does
+not behave the same way, so `rtmp_publish_floor` applies the *same* table (both
+benches now share one definition in `srt_bench::ring_modes`) to both roles, via
+`--ring` and `--ring-matrix`. Three reps, 4096-byte writes, median of total
+(publisher + sink) ms CPU per Mbit --
+`docs/results/scaling-1000/rtmp-tcp-ring-matrix.txt`:
+
+| ring flags | rtmp total | spread | tcp total | spread |
+|---|---:|---:|---:|---:|
+| `coop+single_issuer+defer_taskrun` | **0.406** | 0.050 | 0.361 | - |
+| `single_issuer` | 0.430 | 0.076 | **0.295** | 0.076 |
+| `single_issuer+defer_taskrun` | 0.451 | 0.068 | 0.432 | - |
+| `coop_taskrun+taskrun_flag` | 0.481 | 0.170 | 0.345 | 0.038 |
+| none | 0.483 | 0.029 | 0.368 | 0.097 |
+| `coop_taskrun` | 0.506 | 0.059 | 0.334 | 0.049 |
+| `sqpoll_1ms` | 20.246 | 7.325 | 6.227 | - |
+| `sqpoll_1ms+defer_taskrun` | rejected `EINVAL` | - | rejected `EINVAL` | - |
+
+What survives:
+
+* **SQPOLL is 20-50x worse on the streaming path**, far outside any spread, on
+  both framing modes. This is the UDP result (25 % worse) amplified -- and it is
+  now the only flag conclusion supportable on this path: SQPOLL does not reduce
+  submission cost here, and its spinning thread costs a core that the
+  measurements themselves need.
+* **No other flag wins beyond noise.** The top five rows span 0.406-0.506 on
+  RTMP and 0.295-0.432 on TCP while within-config spread reaches 0.17, and the
+  ordering *flips between the two paths* (`defer_taskrun` first on RTMP, last
+  but one on TCP). Reporting a winner from these numbers would be picking noise;
+  the run length and rep count that would settle it are 30 s x 10 reps with
+  pinned CPUs, which is a target-host experiment, not this one.
+* `sqpoll_1ms+defer_taskrun` is rejected with `EINVAL` on TCP exactly as on
+  UDP, which is the kernel enforcing that `DEFER_TASKRUN` needs
+  `SINGLE_ISSUER` without SQPOLL.
+
+The honest summary of the whole flag hunt, across both paths: the transport
+already sets the one flag that measures well (`single_issuer`), SQPOLL is
+disqualified, and the remaining combinations are inside the noise of this
+host's streaming measurements. Candidate D -- submission structure -- remains
+the lever; ring flags are not.
+
 Two bench bugs stood between the first attempt and this table, both worth
 recording because each looked like a transport result rather than a harness
 defect: a handshake ordering deadlock (reading C0+C1+C2 as one 3073-byte block,

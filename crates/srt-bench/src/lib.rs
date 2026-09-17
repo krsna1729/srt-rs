@@ -10,6 +10,7 @@ pub mod model;
 pub mod qual_evidence;
 pub mod qualification;
 pub mod queue;
+pub mod ring_modes;
 pub mod scheduling;
 pub mod shutdown;
 pub mod source;

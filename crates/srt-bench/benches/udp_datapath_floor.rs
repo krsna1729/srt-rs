@@ -54,7 +54,7 @@
 //! ```
 
 use std::net::{SocketAddr, UdpSocket};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use srt_bench::cpu_stats::process_stats;
 
@@ -408,54 +408,13 @@ fn null_syscall_arm(iters: usize) -> f64 {
 /// Names are the flag sets, not guesses about which is best: the kernel
 /// rejects some combinations (`COOP_TASKRUN` is not accepted with `SQPOLL`),
 /// and a rejection is reported rather than silently skipped.
-/// How one ring combination is applied to a Compio proactor.
-type ApplyRing = fn(&mut compio::driver::ProactorBuilder);
-
-fn ring_modes() -> Vec<(&'static str, ApplyRing)> {
-    fn none(_: &mut compio::driver::ProactorBuilder) {}
-    fn coop(p: &mut compio::driver::ProactorBuilder) {
-        p.coop_taskrun(true);
-    }
-    fn coop_flag(p: &mut compio::driver::ProactorBuilder) {
-        p.coop_taskrun(true);
-        p.taskrun_flag(true);
-    }
-    fn single(p: &mut compio::driver::ProactorBuilder) {
-        p.single_issuer(true);
-    }
-    fn single_defer(p: &mut compio::driver::ProactorBuilder) {
-        p.single_issuer(true);
-        p.defer_taskrun(true);
-        p.taskrun_flag(true);
-    }
-    fn sqpoll(p: &mut compio::driver::ProactorBuilder) {
-        p.sqpoll_idle(Duration::from_millis(1));
-    }
-    fn sqpoll_defer(p: &mut compio::driver::ProactorBuilder) {
-        p.sqpoll_idle(Duration::from_millis(1));
-        p.defer_taskrun(true);
-        p.taskrun_flag(true);
-    }
-    fn coop_defer(p: &mut compio::driver::ProactorBuilder) {
-        p.coop_taskrun(true);
-        p.single_issuer(true);
-        p.defer_taskrun(true);
-        p.taskrun_flag(true);
-    }
-    vec![
-        ("none", none as ApplyRing),
-        ("coop_taskrun", coop),
-        ("coop_taskrun+taskrun_flag", coop_flag),
-        ("single_issuer", single),
-        ("single_issuer+defer_taskrun", single_defer),
-        ("sqpoll_1ms", sqpoll),
-        ("sqpoll_1ms+defer_taskrun", sqpoll_defer),
-        ("coop+single_issuer+defer_taskrun", coop_defer),
-    ]
-}
-
 /// One arm with a configured ring: `K` operations in flight, `bytes` each.
-fn arm_ring(peer: SocketAddr, bytes: usize, k: usize, apply: ApplyRing) -> Result<Arm, String> {
+fn arm_ring(
+    peer: SocketAddr,
+    bytes: usize,
+    k: usize,
+    apply: srt_bench::ring_modes::ApplyRing,
+) -> Result<Arm, String> {
     use compio::net::UdpSocket;
     let mut proactor = compio::driver::ProactorBuilder::new();
     proactor.driver_type(compio::driver::DriverType::IoUring);
@@ -504,7 +463,7 @@ fn ring_matrix(bytes: usize, k: usize) {
             }
         }
     });
-    for (name, apply) in ring_modes() {
+    for (name, apply) in srt_bench::ring_modes::modes() {
         match arm_ring(peer, bytes, k, apply) {
             Ok(_warm) => match arm_ring(peer, bytes, k, apply) {
                 Ok(a) => print_arm("io_uring_ring", bytes, &format!("mode={name} k={k}"), &a),
