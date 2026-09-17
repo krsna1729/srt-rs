@@ -79,15 +79,6 @@ const TX_KEYS: &[&str] = &[
     // end-of-run tail closes when later sequence progress is forced.
     "fence_offered",
     "fence_accepted",
-    // Diagnostic conservation accounting, present only on identity runs.
-    "diag_conns",
-    "diag_fences_seen",
-    "diag_data_at_fence",
-    "diag_missing_at_fence",
-    "diag_missing_final",
-    "diag_missing_suffix_peers",
-    "diag_missing_scatter_peers",
-    "diag_duplicate_payloads",
 ];
 
 /// Fields read from the receiver's `STATS` line.
@@ -110,6 +101,17 @@ const RX_KEYS: &[&str] = &[
     "data_max",
     "data_zero",
     "data_below_half_mean",
+    // Diagnostic conservation accounting, present only on identity runs. These
+    // belong to the receiver's STATS line, not the sender's: putting them in the
+    // sender's key list silently dropped every value.
+    "diag_conns",
+    "diag_fences_seen",
+    "diag_data_at_fence",
+    "diag_missing_at_fence",
+    "diag_missing_final",
+    "diag_missing_suffix_peers",
+    "diag_missing_scatter_peers",
+    "diag_duplicate_payloads",
 ];
 
 /// Columns summed across shards in the `AGG` line.
