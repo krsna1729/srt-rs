@@ -14,6 +14,7 @@ pub mod ring_modes;
 pub mod scheduling;
 pub mod shutdown;
 pub mod source;
+pub mod source_schedule;
 pub mod system;
 pub mod watch;
 

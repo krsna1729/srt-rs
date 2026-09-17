@@ -23,9 +23,19 @@
 //!
 //! Usage:
 //!
+//! Two verdicts come out of it, because they are different claims:
+//!
+//! * **throughput** -- the gate above. The bounded catch-up source replays
+//!   wall-clock boundaries after `service()` returns, so this is capacity with a
+//!   bounded external backlog, not proof that every source event was serviced on
+//!   time.
+//! * **real-time** -- throughput *and* `p99`/`max` lateness within a budget
+//!   declared with `--lateness-budget-us`. Without a declared budget no
+//!   real-time verdict is given, rather than implying one.
+//!
 //! ```text
 //! cargo xtask qualify docs/results/scaling-1000/scale-N1000-S5-2reps.tsv
-//! cargo xtask qualify --tolerance 0.999 fence.tsv
+//! cargo xtask qualify --tolerance 0.999 --lateness-budget-us 5000 fence.tsv
 //! ```
 
 use std::collections::BTreeMap;
@@ -140,6 +150,140 @@ fn cpu_failures(fields: &BTreeMap<String, String>) -> Vec<String> {
         .collect()
 }
 
+/// A verdict for one thresholded property.
+///
+/// "No threshold declared" is not a pass. Treating it as one is how a row gets
+/// summarised as sustained (or real-time) while the summary text says no such
+/// verdict was given -- a contradiction that would have quietly promoted every
+/// row to the strongest claim the moment a flag was forgotten.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Verdict {
+    Undeclared,
+    Pass,
+    Fail(Vec<String>),
+}
+
+impl Verdict {
+    pub fn passed(&self) -> bool {
+        matches!(self, Verdict::Pass)
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Verdict::Undeclared => "undeclared",
+            Verdict::Pass => "pass",
+            Verdict::Fail(_) => "fail",
+        }
+    }
+
+    fn reasons(&self) -> String {
+        match self {
+            Verdict::Fail(r) => r.join("; "),
+            _ => String::new(),
+        }
+    }
+}
+
+/// Stationarity: did service keep pace with arrival during the source window?
+///
+/// Conservation across the whole experiment is not capacity. A run can offer at
+/// full cadence, accept everything into protocol queues, fail to transmit at that
+/// cadence, and then drain the backlog for seconds after the source stops -- with
+/// every accepted payload eventually delivered. That is admission plus eventual
+/// drain, and it passes every check built before this one.
+///
+/// The executable form is the share of wire work that happened after the source
+/// stopped:
+///
+/// ```text
+/// f_drain = drain_submitted / (tx_submitted_wire + drain_submitted)
+/// ```
+///
+/// A run that keeps pace has essentially none. The threshold is *declared*
+/// (`--drain-fraction-max`) rather than hardcoded, because the natural tail has
+/// to be measured on unquestionably underloaded configurations first: F=50 at
+/// 8 Mbps measures 0.0 %, while every other configuration currently measured
+/// sits at 40-76 %.
+fn stationarity(fields: &BTreeMap<String, String>, max_fraction: Option<f64>) -> Verdict {
+    let Some(max) = max_fraction else {
+        return Verdict::Undeclared;
+    };
+    let (window, drain) = match (
+        wire_count(fields, "tx_submitted_wire"),
+        wire_count(fields, "drain_submitted"),
+    ) {
+        (Ok(w), Ok(d)) => (w, d),
+        (Err(e), _) | (_, Err(e)) => return Verdict::Fail(vec![e]),
+    };
+    let fraction = match drain_fraction(fields) {
+        Ok(f) => f,
+        Err(e) => return Verdict::Fail(vec![e]),
+    };
+    if fraction <= max {
+        Verdict::Pass
+    } else {
+        Verdict::Fail(vec![format!(
+            "f_drain={:.1} % > declared {:.1} %: {drain:.0} of {:.0} wire datagrams were \
+             submitted after the source stopped, so service did not keep pace",
+            100.0 * fraction,
+            100.0 * max,
+            window + drain,
+        )])
+    }
+}
+
+/// A wire-traffic count, required to be present and finite.
+///
+/// These used to default to `0.0`, which turned malformed evidence into the
+/// strongest possible result: a missing `drain_submitted` beside a valid window
+/// is `f_drain = 0`, i.e. a perfectly stationary run. A missing field is
+/// missing, not zero.
+fn wire_count(fields: &BTreeMap<String, String>, key: &str) -> Result<f64, String> {
+    let value = number(fields, key)?;
+    if !value.is_finite() || value < 0.0 {
+        return Err(format!("{key}={value} is not a non-negative finite count"));
+    }
+    Ok(value)
+}
+
+/// The post-window share of wire work, as a ratio.
+pub fn drain_fraction(fields: &BTreeMap<String, String>) -> Result<f64, String> {
+    let window = wire_count(fields, "tx_submitted_wire")?;
+    let drain = wire_count(fields, "drain_submitted")?;
+    if window + drain <= 0.0 {
+        return Err("no wire traffic recorded".to_string());
+    }
+    Ok(drain / (window + drain))
+}
+
+/// Lateness of a row against a declared budget, if one was declared.
+///
+/// Throughput and real-time are different claims. The bounded catch-up source
+/// replays wall-clock boundaries after `service()` returns, which is a valid way
+/// to measure *throughput* capacity with a bounded external backlog, and is not
+/// the same as proving the dataplane serviced each source event on time. A row
+/// can therefore pass throughput while being far outside any latency budget --
+/// F=100 at 8 Mbps does exactly that, at ~28 ms p99 -- and an optimization that
+/// accumulates work and services it later would otherwise look like a win.
+fn lateness(fields: &BTreeMap<String, String>, budget_us: Option<f64>) -> Verdict {
+    let Some(budget) = budget_us else {
+        return Verdict::Undeclared;
+    };
+    let failures: Vec<String> = ["offer_lateness_us_p99", "offer_lateness_us_max"]
+        .iter()
+        .filter_map(|key| match number(fields, key) {
+            Ok(v) if v <= budget => None,
+            Ok(v) => Some(format!("{key}={v:.0}us > budget {budget:.0}us")),
+            Err(e) => Some(e),
+        })
+        .collect();
+    if failures.is_empty() {
+        Verdict::Pass
+    } else {
+        Verdict::Fail(failures)
+    }
+}
+
 /// Apply the gate to one row, returning every reason it fails.
 fn judge(fields: &BTreeMap<String, String>, tick_tolerance: f64) -> Vec<String> {
     let mut failures = cadence_failures(fields, tick_tolerance);
@@ -154,28 +298,79 @@ fn judge(fields: &BTreeMap<String, String>, tick_tolerance: f64) -> Vec<String> 
 }
 
 /// `(tolerance, paths)` from the command line.
-fn parse_args(args: &[String]) -> Result<(f64, Vec<String>), String> {
+/// Command-line inputs: two declared thresholds and the files to judge.
+struct Args {
+    tolerance: f64,
+    lateness_budget_us: Option<f64>,
+    drain_fraction_max: Option<f64>,
+    paths: Vec<String>,
+}
+
+fn parse_args(args: &[String]) -> Result<Args, String> {
     let mut tolerance = 0.999;
+    let mut budget: Option<f64> = None;
+    let mut drain_max: Option<f64> = None;
     let mut paths = Vec::new();
     let mut i = 0;
     while i < args.len() {
-        if args[i] == "--tolerance" {
-            let value = args
-                .get(i + 1)
-                .ok_or_else(|| "--tolerance needs a value".to_string())?;
-            tolerance = value
-                .parse()
-                .map_err(|_| format!("--tolerance does not parse: {value:?}"))?;
-            i += 2;
-        } else {
-            paths.push(args[i].clone());
-            i += 1;
+        match args[i].as_str() {
+            "--tolerance" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "--tolerance needs a value".to_string())?;
+                tolerance = value
+                    .parse()
+                    .map_err(|_| format!("--tolerance does not parse: {value:?}"))?;
+                i += 2;
+            }
+            "--drain-fraction-max" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "--drain-fraction-max needs a value".to_string())?;
+                drain_max = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("--drain-fraction-max does not parse: {value:?}"))?,
+                );
+                i += 2;
+            }
+            "--lateness-budget-us" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "--lateness-budget-us needs a value".to_string())?;
+                budget = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("--lateness-budget-us does not parse: {value:?}"))?,
+                );
+                i += 2;
+            }
+            other => {
+                paths.push(other.to_string());
+                i += 1;
+            }
         }
     }
-    if paths.is_empty() {
-        return Err("usage: cargo xtask qualify <sweep.tsv> [--tolerance 0.999]".to_string());
+    if let Some(max) = drain_max
+        && !(0.0..=1.0).contains(&max)
+    {
+        return Err(format!(
+            "--drain-fraction-max must be a fraction in 0..=1, got {max}"
+        ));
     }
-    Ok((tolerance, paths))
+    if paths.is_empty() {
+        return Err(
+            "usage: cargo xtask qualify <sweep.tsv> [--tolerance 0.999] \
+             [--lateness-budget-us N] [--drain-fraction-max F]"
+                .to_string(),
+        );
+    }
+    Ok(Args {
+        tolerance,
+        lateness_budget_us: budget,
+        drain_fraction_max: drain_max,
+        paths,
+    })
 }
 
 /// ROW lines as field maps, keyed by the file's own header.
@@ -197,7 +392,12 @@ fn load_rows(text: &str) -> Vec<BTreeMap<String, String>> {
 }
 
 /// Apply the gate to every row of one file, printing each verdict.
-fn report(path: &str, tolerance: f64) -> Result<(usize, usize), String> {
+fn report(
+    path: &str,
+    tolerance: f64,
+    lateness_budget_us: Option<f64>,
+    drain_fraction_max: Option<f64>,
+) -> Result<(usize, usize, usize, usize), String> {
     let text = fs::read_to_string(Path::new(path)).map_err(|e| format!("{path}: {e}"))?;
     let rows = load_rows(&text);
     if rows.is_empty() {
@@ -206,46 +406,98 @@ fn report(path: &str, tolerance: f64) -> Result<(usize, usize), String> {
     println!(
         "# {path}  gate: cadence>={tolerance}, accepted==received, no starvation, no loss, drained, real CPU"
     );
-    let mut passed = 0usize;
+    let (mut sustained, mut admitted, mut realtime) = (0usize, 0usize, 0usize);
     for (index, fields) in rows.iter().enumerate() {
         let failures = judge(fields, tolerance);
+        let stationarity = stationarity(fields, drain_fraction_max);
+        let late = lateness(fields, lateness_budget_us);
         let position = |key: &str| fields.get(key).cloned().unwrap_or_default();
         let offered = number(fields, "offered_bps_per_dest").unwrap_or(0.0);
-        if failures.is_empty() {
-            passed += 1;
-            println!(
-                "  PASS row {index} rep={} shard={} F={} offered={:.3} Mbps/dest",
-                position("rep"),
-                position("shard"),
-                position("fanout"),
-                offered / 1e6
-            );
-        } else {
-            println!(
-                "  FAIL row {index} rep={} shard={} F={}: {}",
-                position("rep"),
-                position("shard"),
-                position("fanout"),
-                failures.join("; ")
-            );
+        let label = format!(
+            "row {index} rep={} shard={} F={}",
+            position("rep"),
+            position("shard"),
+            position("fanout")
+        );
+        if !failures.is_empty() {
+            println!("  FAIL      {label}: {}", failures.join("; "));
+            continue;
+        }
+        let drain = drain_fraction(fields)
+            .map(|f| format!("{:.1}%", 100.0 * f))
+            .unwrap_or_else(|_| "?".to_string());
+        match &stationarity {
+            Verdict::Fail(_) => {
+                admitted += 1;
+                println!(
+                    "  PASS adm  {label} offered={:.3} Mbps/dest f_drain={drain} \
+                     (not sustained: {})",
+                    offered / 1e6,
+                    stationarity.reasons()
+                );
+            }
+            Verdict::Undeclared => {
+                admitted += 1;
+                println!(
+                    "  PASS adm  {label} offered={:.3} Mbps/dest f_drain={drain} \
+                     (stationarity {}: --drain-fraction-max not supplied)",
+                    offered / 1e6,
+                    stationarity.label()
+                );
+            }
+            Verdict::Pass => {
+                debug_assert!(
+                    stationarity.passed(),
+                    "reached the pass arm with a non-passing verdict"
+                );
+                sustained += 1;
+                match &late {
+                    Verdict::Pass => {
+                        realtime += 1;
+                        println!(
+                            "  PASS sus  {label} offered={:.3} Mbps/dest f_drain={drain}",
+                            offered / 1e6
+                        );
+                    }
+                    Verdict::Undeclared => println!(
+                        "  PASS sus  {label} offered={:.3} Mbps/dest f_drain={drain} \
+                         (real-time {}: --lateness-budget-us not supplied)",
+                        offered / 1e6,
+                        late.label()
+                    ),
+                    Verdict::Fail(_) => println!(
+                        "  PASS sus  {label} offered={:.3} Mbps/dest f_drain={drain} \
+                         (not real-time: {})",
+                        offered / 1e6,
+                        late.reasons()
+                    ),
+                }
+            }
         }
     }
-    Ok((passed, rows.len()))
+    Ok((sustained, admitted, realtime, rows.len()))
 }
 
 pub fn run(args: &[String]) -> std::process::ExitCode {
-    let (tolerance, paths) = match parse_args(args) {
+    let Args {
+        tolerance,
+        lateness_budget_us: budget,
+        drain_fraction_max: drain_max,
+        paths,
+    } = match parse_args(args) {
         Ok(parsed) => parsed,
         Err(e) => {
             eprintln!("qualify: {e}");
             return std::process::ExitCode::FAILURE;
         }
     };
-    let (mut passed, mut total) = (0usize, 0usize);
+    let (mut sustained, mut admitted, mut realtime, mut total) = (0usize, 0usize, 0usize, 0usize);
     for path in &paths {
-        match report(path, tolerance) {
-            Ok((p, n)) => {
-                passed += p;
+        match report(path, tolerance, budget, drain_max) {
+            Ok((s, a, r, n)) => {
+                sustained += s;
+                admitted += a;
+                realtime += r;
                 total += n;
             }
             Err(e) => {
@@ -254,8 +506,29 @@ pub fn run(args: &[String]) -> std::process::ExitCode {
             }
         }
     }
-    println!("qualify: {passed} of {total} rows pass the sustained-capacity gate");
-    if passed == 0 {
+    let drain_note = match drain_max {
+        Some(max) => format!("--drain-fraction-max {max:.3}"),
+        None => "no --drain-fraction-max declared, so no stationarity verdict".to_string(),
+    };
+    println!(
+        "qualify: {sustained} of {total} rows sustained, {admitted} admitted-but-not-sustained \
+         ({drain_note})"
+    );
+    match budget {
+        Some(budget) => println!(
+            "qualify: {realtime} of {total} rows also meet the {budget:.0}us lateness budget"
+        ),
+        None => println!("qualify: no --lateness-budget-us declared, so no real-time verdict"),
+    }
+    // A declared threshold with nothing meeting it is a failed gate, not a
+    // successful report: `qualify` exists to be an executable check.
+    if drain_max.is_some() && sustained == 0 {
+        return std::process::ExitCode::FAILURE;
+    }
+    if budget.is_some() && realtime == 0 {
+        return std::process::ExitCode::FAILURE;
+    }
+    if sustained + admitted == 0 {
         return std::process::ExitCode::FAILURE;
     }
     std::process::ExitCode::SUCCESS
@@ -321,6 +594,103 @@ mod tests {
         assert!(
             failures.iter().any(|f| f.contains("!= rx_core_total")),
             "{failures:?}"
+        );
+    }
+
+    /// Throughput and real-time are different claims, and a row that passes one
+    /// while missing a latency budget must say so.
+    /// A run that keeps pace has almost no post-window wire work; one that
+    /// accepts more than it can transmit does, and that is the difference
+    /// between admission and sustained service.
+    #[test]
+    fn stationarity_separates_admission_from_sustained_service() {
+        let mut fields = passing();
+        fields.retain(|(k, _)| *k != "tx_submitted_wire" && *k != "drain_submitted");
+        // F=50 at 8 Mbps as measured: ~46.5 K in-window, ~0 in the drain.
+        fields.push(("tx_submitted_wire", "465000"));
+        fields.push(("drain_submitted", "0"));
+        let steady = row(&fields);
+        assert!((drain_fraction(&steady).unwrap() - 0.0).abs() < 1e-9);
+        assert!(stationarity(&steady, Some(0.05)).passed());
+
+        // F=200 at 4 Mbps as measured: the drain carries 70 % of the wire work.
+        let mut fields = passing();
+        fields.retain(|(k, _)| *k != "tx_submitted_wire" && *k != "drain_submitted");
+        fields.push(("tx_submitted_wire", "443469"));
+        fields.push(("drain_submitted", "1060611"));
+        let backlogged = row(&fields);
+        let fraction = drain_fraction(&backlogged).unwrap();
+        assert!(fraction > 0.70 && fraction < 0.71, "{fraction}");
+        match stationarity(&backlogged, Some(0.05)) {
+            Verdict::Fail(reasons) => {
+                assert_eq!(reasons.len(), 1, "{reasons:?}");
+                assert!(reasons[0].contains("did not keep pace"), "{reasons:?}");
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+        assert_eq!(
+            stationarity(&backlogged, None),
+            Verdict::Undeclared,
+            "no declared threshold, so no stationarity verdict"
+        );
+    }
+
+    /// An undeclared threshold is not a pass: otherwise omitting a flag promotes
+    /// every row to the strongest claim while the summary says otherwise.
+    #[test]
+    fn undeclared_thresholds_are_not_passes() {
+        let steady = row(&passing());
+        assert_eq!(stationarity(&steady, None), Verdict::Undeclared);
+        assert!(!stationarity(&steady, None).passed());
+    }
+
+    /// Missing wire counts used to default to zero, which turns malformed
+    /// evidence into a perfect drain result.
+    #[test]
+    fn malformed_wire_counts_fail_rather_than_default_to_zero() {
+        let mut fields = passing();
+        fields.retain(|(k, _)| *k != "drain_submitted");
+        fields.push(("tx_submitted_wire", "465000"));
+        let missing_drain = row(&fields);
+        assert!(drain_fraction(&missing_drain).is_err());
+        assert!(matches!(
+            stationarity(&missing_drain, Some(0.05)),
+            Verdict::Fail(_)
+        ));
+
+        let mut fields = passing();
+        fields.retain(|(k, _)| *k != "tx_submitted_wire");
+        fields.push(("tx_submitted_wire", "not-a-number"));
+        fields.push(("drain_submitted", "10"));
+        assert!(matches!(
+            stationarity(&row(&fields), Some(0.05)),
+            Verdict::Fail(_)
+        ));
+    }
+
+    #[test]
+    fn lateness_budget_separates_throughput_from_real_time() {
+        let mut fields = passing();
+        fields.retain(|(k, _)| *k != "offer_lateness_us_p99" && *k != "offer_lateness_us_max");
+        fields.push(("offer_lateness_us_p99", "28334"));
+        fields.push(("offer_lateness_us_max", "51200"));
+        let row = row(&fields);
+        assert!(judge(&row, 0.999).is_empty(), "still a throughput pass");
+        assert_eq!(
+            lateness(&row, None),
+            Verdict::Undeclared,
+            "no budget declared, so no real-time verdict"
+        );
+        match lateness(&row, Some(5_000.0)) {
+            Verdict::Fail(reasons) => {
+                assert_eq!(reasons.len(), 2, "{reasons:?}");
+                assert!(reasons[0].contains("offer_lateness"), "{reasons:?}");
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+        assert!(
+            lateness(&row, Some(60_000.0)).passed(),
+            "a generous budget is met"
         );
     }
 

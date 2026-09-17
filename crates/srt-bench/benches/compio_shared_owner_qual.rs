@@ -73,6 +73,15 @@ const PAYLOAD_SIZE: usize = 1316;
 /// knows how to offer 8 Mbps. The default keeps every previously published row
 /// reproducible.
 const RATE_BPS: u64 = 8_000_000;
+/// The instant of tick boundary `n` (1-based) on the epoch-anchored schedule.
+///
+/// A helper rather than `epoch + interval * n` because `Duration * u32`
+/// saturates on overflow and the multiplication is easy to get wrong at the
+/// boundary; one place computes it for both the offer and the wake-up.
+fn next_after(epoch: Instant, interval: Duration, n: u64) -> Instant {
+    epoch + interval.saturating_mul(n.min(u32::MAX as u64) as u32)
+}
+
 const CONNECT_DEADLINE: Duration = Duration::from_secs(30);
 const DRAIN_DEADLINE: Duration = Duration::from_secs(10);
 
@@ -122,9 +131,14 @@ struct QualReport {
     drain_completed_ok: u64,
     tx_failures_pending: usize,
     service_visits: u64,
-    lateness_p50_us: u64,
-    lateness_p99_us: u64,
-    lateness_max_us: u64,
+    /// Punctuality of the *source offer*: how late `send_shared` was attempted
+    /// relative to each boundary's deadline, sampled before `service()`.
+    ///
+    /// Not dataplane lateness: a payload admitted here can leave the socket much
+    /// later, so this alone cannot support a real-time claim.
+    offer_lateness_us_p50: u64,
+    offer_lateness_us_p99: u64,
+    offer_lateness_us_max: u64,
     pending_after_drain: u64,
     drained: bool,
     /// Whether the pre-measurement drain reached equilibrium, so no
@@ -378,8 +392,12 @@ async fn run_sender(
         let srt_epoch = now;
         let deadline = epoch + Duration::from_millis(duration_ms);
         let payload = Bytes::from(vec![0x5A_u8; payload_size]);
-        let mut lateness = Vec::with_capacity((duration_ms * 1000 / interval_us) as usize + 8);
+        let mut offer_lateness =
+            Vec::with_capacity((duration_ms * 1000 / interval_us) as usize + 8);
         let mut next_tick = epoch + interval;
+        // Tick boundaries already offered. The schedule is a count of
+        // boundaries, not a clock that service can move.
+        let mut ticks_offered: u64 = 0;
         loop {
             if Instant::now() >= deadline {
                 break;
@@ -393,37 +411,67 @@ async fn run_sender(
             if tick_wall >= deadline {
                 break;
             }
-            // The schedule is anchored to the epoch and advances by WHOLE
-            // intervals, so the remainder of an overrun stays pending instead
-            // of shifting the source clock. Every boundary the visit passed is
-            // then either a generated tick or an explicitly counted missed
-            // tick -- `generated + missed == expected` is the identity a
-            // service-coupled producer would break.
-            let scheduled = next_tick;
-            next_tick += interval;
-            while next_tick <= tick_wall {
-                next_tick += interval;
-                report.missed_source_ticks += 1;
-            }
-            report.generated_ticks += 1;
-            // Protocol time tracks wall time from the single epoch.
-            now = Timestamp::from_micros(
-                srt_epoch.as_micros() + (tick_wall - epoch).as_micros() as u64,
+            // CATCH-UP, BOUNDED. The schedule advances by whole intervals from
+            // the epoch, and every boundary the visit has passed is offered in
+            // that same visit rather than being dropped because `service()`
+            // overran. Dropping them is what made the cadence gate
+            // unfalsifiable: `generated_ticks` measured the service loop's
+            // punctuality, not the shard's throughput, so a harness that slept
+            // slightly too long looked like an overloaded transport.
+            //
+            // The catch-up is capped so a long stall cannot turn into an
+            // unbounded burst, and any boundary beyond the cap is counted as
+            // missed exactly as before: `generated + missed == expected` still
+            // holds over the window.
+            let passed = ((tick_wall - epoch).as_micros() / interval_us as u128) as u64;
+            // One policy, in the library and under test: offer up to the cap,
+            // declare everything past it lost *in this visit*. Carrying the
+            // remainder forward would make the effective cap larger than the
+            // declared one and would let a boundary documented as lost become a
+            // generated tick later.
+            let step = srt_bench::source_schedule::catch_up(
+                ticks_offered,
+                passed,
+                srt_bench::source_schedule::MAX_TICK_CATCHUP,
             );
-
-            // The tick is offered whatever the Owner's state: a destination
-            // that refuses loses this copy, and it is never queued in a
-            // harness backlog. (The producer still shares this thread with
-            // `service`, so a tick the loop cannot reach is counted in
-            // `missed_source_ticks` rather than being silently skipped.)
-            for id in &ids {
-                report.offered += 1;
-                if let Some(mut caller) = owner.logical_caller_mut(id)
-                    && caller.send_shared(payload.clone(), now).is_ok()
-                {
-                    report.accepted += 1;
+            for _ in 0..step.offer {
+                ticks_offered += 1;
+                let scheduled = next_after(epoch, interval, ticks_offered);
+                // Protocol time is this tick's own deadline: a caught-up tick
+                // is offered as if on time, because that is when the media
+                // schedule says it was due.
+                now = Timestamp::from_micros(
+                    srt_epoch.as_micros() + (scheduled - epoch).as_micros() as u64,
+                );
+                // The tick is offered whatever the Owner's state: a destination
+                // that refuses loses this copy, and it is never queued in a
+                // harness backlog.
+                for id in &ids {
+                    report.offered += 1;
+                    if let Some(mut caller) = owner.logical_caller_mut(id)
+                        && caller.send_shared(payload.clone(), now).is_ok()
+                    {
+                        report.accepted += 1;
+                    }
                 }
+                report.generated_ticks += 1;
+                // OFFER lateness: how late this boundary's `send_shared` was
+                // attempted, measured before `service()`. It says the source was
+                // punctual, not that the dataplane was -- a payload admitted here
+                // can leave the socket much later. Naming it `lateness` invited
+                // exactly that misreading, so it is `offer_lateness` everywhere,
+                // and the real-time gate must eventually use first-transmission
+                // submit lateness.
+                offer_lateness.push(
+                    Instant::now()
+                        .saturating_duration_since(scheduled)
+                        .as_micros() as u64,
+                );
             }
+            report.missed_source_ticks += step.missed;
+            ticks_offered = step.offered_through;
+            // Next wake-up is the next unoffered boundary.
+            next_tick = next_after(epoch, interval, ticks_offered + 1);
             let visit = owner.service(now, budget).await;
             report.submitted += visit.tx_packets_submitted as u64;
             report.completed_ok += visit.tx_completed_ok as u64;
@@ -433,13 +481,6 @@ async fn run_sender(
             report.transient_failures += visit.tx_transient_failures as u64;
             report.service_visits += 1;
 
-            // How late this tick's service completed relative to its own
-            // source deadline.
-            lateness.push(
-                Instant::now()
-                    .saturating_duration_since(scheduled)
-                    .as_micros() as u64,
-            );
             // Do not idle the Owner past its own receive work.
             owner.wait_for_activity(Duration::from_micros(0)).await;
         }
@@ -472,10 +513,10 @@ async fn run_sender(
         report.inflight_at_window_end = owner.tx_in_flight() as u64;
         let drain_cpu_start = process_cpu_ms();
 
-        lateness.sort_unstable();
-        report.lateness_p50_us = percentile(&lateness, 0.50);
-        report.lateness_p99_us = percentile(&lateness, 0.99);
-        report.lateness_max_us = lateness.last().copied().unwrap_or(0);
+        offer_lateness.sort_unstable();
+        report.offer_lateness_us_p50 = percentile(&offer_lateness, 0.50);
+        report.offer_lateness_us_p99 = percentile(&offer_lateness, 0.99);
+        report.offer_lateness_us_max = offer_lateness.last().copied().unwrap_or(0);
 
         // --- TX-enabled drain to equilibrium, bounded
         let drain_start = Instant::now();
@@ -563,7 +604,7 @@ fn main() {
          expected_ticks={} generated_ticks={} missed_source_ticks={} \
          data_offered={} data_accepted={} tx_submitted_wire={} tx_completed={} \
          short={} failed={} peer_local={} transient={} tx_failures_pending={} \
-         service_visits={} lateness_us_p50={} p99={} max={} drain_ok={} \
+         service_visits={} offer_lateness_us_p50={} offer_lateness_us_p99={} offer_lateness_us_max={} drain_ok={} \
          inflight_at_window_end={} drain_submitted={} drain_completed={} \
          pending_after_drain={} rx_mode={} managed_rx={} \
          rx_dropped={} rx_truncated={} tx_pool={}/{} payload_bytes={} interval_us={} \
@@ -592,9 +633,9 @@ fn main() {
         report.transient_failures,
         report.tx_failures_pending,
         report.service_visits,
-        report.lateness_p50_us,
-        report.lateness_p99_us,
-        report.lateness_max_us,
+        report.offer_lateness_us_p50,
+        report.offer_lateness_us_p99,
+        report.offer_lateness_us_max,
         report.drained,
         report.inflight_at_window_end,
         report.drain_submitted,
