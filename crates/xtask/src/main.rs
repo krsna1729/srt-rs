@@ -3,6 +3,7 @@ use std::process::{Command, ExitCode, Stdio};
 use std::time::Instant;
 
 mod audit;
+mod qualify;
 mod reportcard;
 mod scaling;
 
@@ -251,6 +252,7 @@ fn main() -> ExitCode {
         "pgo" => run_pgo(&env::args().skip(2).collect::<Vec<_>>()),
         "audit" => audit::run(&env::args().skip(2).collect::<Vec<_>>()),
         "scaling" => scaling::run(&env::args().skip(2).collect::<Vec<_>>()),
+        "qualify" => qualify::run(&env::args().skip(2).collect::<Vec<_>>()),
         _ => {
             eprintln!("usage: cargo xtask <command>");
             eprintln!();

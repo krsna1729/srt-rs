@@ -268,33 +268,126 @@ only capacity statements this report may make are the ones #116 already made.
 **Candidate D re-evaluated.** The 1.4-1.6x headroom was computed against the
 withdrawn denominator. On the conserved one: the shard spends 12.81 us per wire
 datagram (whole life, F=200) against a measured floor of 8.0-8.9 us pipelined
-and 7.57 us batched, and needs ~2.2 wire datagrams per delivered payload
-(including control traffic), so per-payload headroom is roughly
-`2.2 x 8.0 / 19.5 = 0.9` to `2.2 x 8.9 / 19.5 = 1.0` -- i.e. **candidate D is
-not a demonstrated 1.4-1.6x opportunity.** The submission-structure hypothesis
-is still the best-supported one (the flag matrix eliminates the alternatives),
+and 7.57 us batched. An earlier revision of this paragraph used `r = 2.2` for
+that comparison while the rest of the document used 1.75; both are now replaced
+by the per-row-set table above, which shows `r` is workload-dependent (1.24-1.93)
+and gives **1.3-1.6x reachable headroom, unpinned**. The submission-structure
+hypothesis is still the best-supported one (the flag matrix eliminates the
+alternatives),
 but its size is now unproven, and the honest statement is that the next step is
 a fixed-work equilibrium measurement that varies one thing at a time.
 
-### How far from optimal, on conserved quantities only
+### Two ladders, not one
 
-| reference | measured | what the shard would need to reach it | gap |
-|---|---|---|---:|
-| its own per-datagram floor, pipelined (8.0 us) | 1.75 wire datagrams per delivered payload | every datagram (data *and* control) at floor cost | **1.42x** |
-| its own per-datagram floor, batched 16-64 (7.57 us) | same | same | **1.50x** |
-| stream coalescing, same runtime, 1316 B framing (0.909 ms/Mbit) | 3.68 ms/Mbit | give up per-packet ARQ | 4.0x |
-| raw stream, same runtime, 4096 B (0.249 ms/Mbit) | 3.68 ms/Mbit | give up per-packet ARQ and 1400-byte datagrams | 14.8x |
-| copy floor (18.6 ns per payload) | 19.95 us per payload | stop being a network stack | ~1000x (irrelevant) |
-| host capacity at 1000 x 8 Mbps | no committed row passes the sustained-capacity gate | a fixed-work, full-cadence qualification | **not established** |
+Earlier revisions drew a single "distance from optimal" staircase, which made the
+semantic boundary disappear: a reader could take the stream-protocol figure as
+headroom available to this implementation. There are two ladders, and only the
+first is srt-rs's to climb.
 
-Read together: **the reachable gap is ~1.4-1.5x and it is submission structure**;
-the next 4-15x is protocol design (per-packet ARQ, 1400-byte datagrams); the
-remaining 1000x is the copy floor and was never the wall.
+```text
+                       SRT / UDP — the reachable ladder
+   MORE REAL
+      ▲   L4  actual SRT sender                     ~19.8 us / delivered payload
+      │   ──────────────────────────────────────────────────────────  <-- measured
+      │   L3  SRT wire-model floor                   r x C_UDP_floor
+      │        r = wire datagrams per delivered payload     (UNPINNED, see below)
+      │   ──────────────────────────────────────────────────────────
+      │   L2  efficient UDP datagram floor
+      │        sendmmsg batch 16-64                        7.45-7.61 us/dgram
+      │        Compio K=64 pipelined                       7.98-8.90 us/dgram
+      │        Compio/Mio/Tokio serialized                 9.65-12.53 us/dgram
+      │   ──────────────────────────────────────────────────────────
+      │   L1  syscall / ring-transition component
+      │        fitted per-syscall term                     0.875 us
+      │        null syscall                                 0.264-0.303 us
+      │   ──────────────────────────────────────────────────────────
+      │   L0  memory-copy floor
+      │        memcpy 1316 B                                0.0186 us
+      ▼   COMPONENT FLOOR
 
-Caveat on the 1.42-1.50x: it is an upper bound on what submission structure can
-buy, because it assumes the control traffic inside the 1.75 wire datagrams per
-payload can also be driven to floor cost. The floor arms price data datagrams
-from a pipelined or batched submitters and do not model ACK traffic at all.
+  ══════════════════ SRT semantic boundary ══════════════════
+         L5  TCP/RTMP-style stream regime
+             raw TCP 4096 B        0.249 ms CPU/Mbit
+             RTMP 4096 B           0.315
+             raw TCP 1316 B        0.596
+             RTMP 1316 B           0.909
+             ** not an attainable SRT implementation floor: it is bought by
+                dropping per-packet sequencing and selective ARQ **
+```
+
+Each rung answers one question, which is why they are worth separating:
+
+| step | question it answers | verdict |
+|---|---|---|
+| L0 -> L1 | is memory or kernel-transition machinery the issue? | no: 18.6 ns per payload, 0.27-0.88 us per syscall |
+| L1 -> L2 | what does Linux charge to move one UDP datagram? | 7.5-9 us with efficient submission; the runtime is not hiding an order of magnitude |
+| L2 -> L3 | what does SRT's wire model cost with an ideal submitter? | `r x 7.5-9 us` per payload, **r not yet pinned** |
+| L3 -> L4 | how much implementation headroom is genuinely left? | **unresolved** -- see below |
+| L4 -> L5 | how much is protocol semantics rather than implementation? | 4-15x, and not available to SRT |
+
+### The reference workload, and why `r` is not pinned
+
+An earlier revision used two different values for the same ratio in the same
+document (`2.2` and `1.75` wire datagrams per delivered payload), which cannot
+both describe one workload. Reconciled here, with the definition stated once:
+
+```text
+r      = (tx_submitted_wire + drain_submitted) / rx_core_total
+C_SRT  = (window_cpu_ms + drain_cpu_ms) * 1000 / rx_core_total
+C_ideal= r x C_UDP_floor
+headroom = C_SRT / C_ideal
+```
+
+and computed from the **same rows** for every figure:
+
+| row set | rows | r (wire/delivered) | C_SRT us/payload | C_ideal (8.0 / 7.57) | headroom | rows passing the gate |
+|---|---:|---:|---:|---:|---:|---:|
+| burst, 5 x F=200 | 10 | **1.93** (1.75-1.98) | 19.76 | 15.4 / 14.6 | **1.28-1.35x** | 0 |
+| equilibrium F=200, 10 s | 3 | 1.68 | 21.67 | 13.5 / 12.8 | 1.61-1.70x | 0 |
+| equilibrium F=100, 10 s | 2 | 1.27 | 15.01 | 10.2 / 9.6 | 1.48-1.56x | 0 |
+| equilibrium F=50, 10 s | 2 | 1.24 | 21.92 | 9.9 / 9.4 | 2.21-2.33x | 0 |
+| equilibrium F=50, 3 s | 3 | 1.24 | 18.99 | 9.9 / 9.4 | 1.91-2.02x | 0 |
+
+**No row set passes the sustained-capacity gate**, so `r` -- and therefore L3 and
+the headroom above it -- is **unpinned**. The spread is not noise: `r` moves from
+1.24 at F=50 to 1.93 on the burst rows, and the headroom moves from ~1.3x to
+~2.3x depending on which workload is called the reference. Publishing either end
+as "the" number is what produced the withdrawn claim.
+
+### What the spread itself says
+
+The SRT draft's control budget is bounded and small: Full ACK every ~10 ms,
+Light ACK recommended at one per 64 packets, and only Full ACKs triggering
+ACKACKs. At the qualification's 760 DATA/s per destination that is roughly
+`760/64 + 100 + 100 = 212` control packets/s, i.e. **~0.28 control datagrams per
+DATA packet**. So r should sit near 1.28 in steady state with no duplication --
+and F=50 and F=100 do (1.24, 1.27), which is evidence that the wire model is
+being used efficiently there and the per-payload cost at low fanout is dominated
+by *fixed per-visit work*, not by excess packets.
+
+The F=200 and burst rows carry r = 1.68-1.93, i.e. 0.4-0.7 datagrams per payload
+*above* what the ACK policy requires. Those configurations are exactly the
+overloaded ones, so the excess is duplicated or resubmitted traffic -- but the
+counters cannot separate original DATA from retransmission from control, and this
+report will not guess which. That separation (and therefore the true L2 -> L3
+rung) is what the qualification in #118 has to produce, using receiver-side
+duplicate accounting plus a paced, gate-passing workload.
+
+### Re-evaluating candidate D against the reconciled numbers
+
+| reference | r | C_SRT | headroom over `r x floor` |
+|---|---:|---:|---:|
+| burst rows | 1.93 | 19.76 us | 1.28-1.35x |
+| best-cadence rows (F=100) | 1.27 | 15.01 us | 1.48-1.56x |
+
+**On the evidence available, the reachable submission-structure gain is between
+~1.3x and ~1.6x, and it is not pinned.** The lower bound is what a *conservative*
+reference gives (the burst set, whose excess wire volume inflates `r` and hides
+implementation headroom behind its own waste); the upper bound is what the
+least-overloaded set gives. This is the quantity #118 exists to pin, and it is
+the quantity candidate D must be judged against -- not the withdrawn 1.4-1.6x,
+which was accidentally in the right region but derived from a denominator that
+did not exist.
 
 ### Cost model, fitted to measured floors
 
