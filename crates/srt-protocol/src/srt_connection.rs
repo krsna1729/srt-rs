@@ -1285,6 +1285,23 @@ impl SrtConnection {
     /// picks up right where this one left off.
     pub fn process_retransmit(&mut self, now: Timestamp) {
         let dest_socket_id = self.peer_socket_id;
+        // Tail probe. A receiver can only NAK a gap that a later DATA packet
+        // exposes, so a lost *suffix* of a flight is invisible to NAK-driven
+        // recovery: no later sequence number arrives, no loss is reported
+        // (`sec_a` stays zero), and the payload is stranded until something
+        // else asks for it. Nothing else will.
+        //
+        // When no selective retransmission is pending, probe the newest sent
+        // packet once. Its arrival repairs a lost tail directly, and it also
+        // supplies the later sequence evidence that exposes any older gaps to
+        // ordinary NAK recovery. Exactly one packet: replaying the whole
+        // unacknowledged flight on every timeout would amplify an outage rather
+        // than recover from it.
+        if !self.sender.as_ref().is_some_and(|s| s.has_retransmit())
+            && let Some(sender) = self.sender.as_mut()
+        {
+            sender.queue_retransmission_of_newest_sent();
+        }
         // `pop_retransmit` already retires each sequence from the loss list
         // (S02: it does not go back in on an encrypt failure here). Losing
         // that failure silently would make this the one place an ongoing
@@ -3757,6 +3774,115 @@ mod tests {
         });
         drive_handshake_to_connected(&mut caller, &mut listener);
         (caller, listener)
+    }
+
+    /// Drive one small flight and return the payloads the listener received.
+    ///
+    /// `drop_final_data_packet` decides whether the last original DATA datagram
+    /// is withheld -- the deterministic form of a lost flight tail.
+    fn flight_received_packets(drop_final_data_packet: bool) -> u64 {
+        let (mut caller, mut listener) = connected_pair();
+        let mut now = Timestamp::from_micros(1_000_000);
+        let count = 4usize;
+        for i in 0..count {
+            caller
+                .send(format!("payload {i}").as_bytes(), now)
+                .expect("send admits the payload");
+        }
+
+        let mut data_seen = 0usize;
+        fn pump(
+            caller: &mut SrtConnection,
+            listener: &mut SrtConnection,
+            now: Timestamp,
+            data_seen: &mut usize,
+            drop_final_data_packet: bool,
+            count: usize,
+        ) {
+            while let Some(output) = caller.poll_output().unwrap() {
+                let ConnectionOutput::SendPacket(bytes) = output else {
+                    continue;
+                };
+                if matches!(SrtPacket::decode(&bytes), Ok(SrtPacket::Data(_))) {
+                    *data_seen += 1;
+                    if drop_final_data_packet && *data_seen == count {
+                        continue; // lost on the wire, never delivered
+                    }
+                }
+                listener
+                    .feed_recv_buf(&bytes, now)
+                    .expect("listener accepts packet");
+            }
+            // Events coalesce -- one `DataReceived` can carry several packets --
+            // so delivery is counted from the receiver's own unique-packet
+            // accounting, not from event count.
+            while listener.poll_event().is_some() {}
+        }
+
+        pump(
+            &mut caller,
+            &mut listener,
+            now,
+            &mut data_seen,
+            drop_final_data_packet,
+            count,
+        );
+        assert_eq!(data_seen, count, "the flight is {count} DATA datagrams");
+        for _ in 0..400 {
+            now = Timestamp::from_micros(now.as_micros() + 10_000);
+            while let Some(output) = listener.poll_output().unwrap() {
+                if let ConnectionOutput::SendPacket(bytes) = output {
+                    caller
+                        .feed_recv_buf(&bytes, now)
+                        .expect("caller accepts packet");
+                }
+            }
+            for timer in [TimerId::Retransmit, TimerId::Ack, TimerId::Nak] {
+                let _ = caller.handle_timer(timer, now);
+            }
+            pump(
+                &mut caller,
+                &mut listener,
+                now,
+                &mut data_seen,
+                drop_final_data_packet,
+                count,
+            );
+        }
+        listener
+            .receiver_stats()
+            .expect("connected receiver")
+            .total_received
+    }
+
+    /// Control: with nothing dropped, every payload arrives. Without this the
+    /// tail test could pass or fail for a harness reason instead of the property
+    /// under test.
+    #[test]
+    fn an_intact_flight_is_delivered_whole() {
+        assert_eq!(
+            flight_received_packets(false),
+            4,
+            "control: an intact flight must deliver all four DATA packets"
+        );
+    }
+
+    /// Tail recovery: a lost FINAL data packet must not be stranded.
+    ///
+    /// The receiver can only name a loss it has evidence for, and a missing
+    /// *suffix* of a flight provides none -- no later sequence number arrives to
+    /// expose the gap, so no NAK is generated and the receiver reports no loss
+    /// while the payload is simply absent. The sender is the only party that can
+    /// notice, and its remaining trigger is its own retransmission timer.
+    #[test]
+    fn a_lost_final_data_packet_is_recovered_by_the_sender() {
+        let received = flight_received_packets(true);
+        assert_eq!(
+            received, 4,
+            "a lost final DATA datagram must be recovered by the sender: the receiver \
+             cannot name a gap that no later sequence number exposes, so nothing else \
+             will ask for it (received {received} of 4)"
+        );
     }
 
     /// P01: a single visit must not encrypt/queue an unbounded number of
