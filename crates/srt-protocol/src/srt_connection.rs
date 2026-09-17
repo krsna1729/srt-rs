@@ -4285,6 +4285,14 @@ mod tests {
     /// expose the gap, so no NAK is generated and the receiver reports no loss
     /// while the payload is simply absent.
     #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "400-tick FlightHarness run (handshake plus hundreds of real protocol   \
+                  ticks); correctness is proven here at full scale outside Miri, and     \
+                  `an_expiry_with_selective_recovery_pending_does_not_widen_it` exercises \
+                  the same SenderRto ownership pattern cheaply under Miri. Run in the    \
+                  miri-extended scheduled job."
+    )]
     fn a_lost_final_data_packet_is_recovered_by_the_sender() {
         let mut flight = FlightHarness::new(&[FLIGHT - 1]);
         flight.send_flight(FLIGHT);
@@ -4308,6 +4316,11 @@ mod tests {
     /// evidence that turns the two older gaps into nameable ones. One probe is
     /// queued by the timeout, never a replay of the unacknowledged flight.
     #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "200-tick FlightHarness run; correctness is proven here at full scale  \
+                  outside Miri. Run in the miri-extended scheduled job."
+    )]
     fn a_lost_three_packet_tail_is_recovered_by_one_probe_plus_nak() {
         let mut flight = FlightHarness::new(&[1, 2, 3]);
         flight.send_flight(FLIGHT);
@@ -4338,6 +4351,12 @@ mod tests {
     /// without advancing `ack_seq` (which a receiver does while its own window is
     /// stalled) must not be able to keep the timeout from ever firing.
     #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "200-tick FlightHarness run with a replayed ACK injected every tick;    \
+                  correctness is proven here at full scale outside Miri. Run in the      \
+                  miri-extended scheduled job."
+    )]
     fn a_non_progress_ack_storm_still_reaches_the_tail_timeout() {
         let mut flight = FlightHarness::new(&[FLIGHT - 1]);
         flight.ack_storm = true;
@@ -4367,6 +4386,11 @@ mod tests {
     /// output queue and have never been on the wire. The probe must select the
     /// newest *submitted* packet, not the newest accepted one.
     #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "460-tick FlightHarness run; correctness is proven here at full scale  \
+                  outside Miri. Run in the miri-extended scheduled job."
+    )]
     fn an_unsubmitted_packet_is_never_selected_by_the_timeout() {
         let mut flight = FlightHarness::new(&[0, 1]);
         flight.send_flight(2);
@@ -4414,6 +4438,11 @@ mod tests {
     /// to time: the epoch must be disarmed rather than left running into a
     /// pointless probe.
     #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "450-tick FlightHarness run; correctness is proven here at full scale  \
+                  outside Miri. Run in the miri-extended scheduled job."
+    )]
     fn a_fully_acknowledged_flight_disarms_the_sender_timeout() {
         let mut flight = FlightHarness::new(&[]);
         flight.send_flight(FLIGHT);
@@ -4525,6 +4554,13 @@ mod tests {
     /// the timeout were only armed as a side effect of ACK traffic, this stall
     /// would be permanent.
     #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "400-tick FlightHarness run; correctness is proven here at full scale  \
+                  outside Miri, and `a_lost_final_data_packet_is_recovered_by_the_sender`\
+                  covers the submission-trigger path's ownership pattern when the       \
+                  miri-extended job runs it. Run in the miri-extended scheduled job."
+    )]
     fn a_flight_lost_in_full_is_recovered_by_the_submission_trigger() {
         let mut flight = FlightHarness::new(&[0, 1, 2, 3]);
         flight.send_flight(FLIGHT);

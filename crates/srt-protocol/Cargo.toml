@@ -33,6 +33,12 @@ test-support = []
 # tests and custom wire tooling; the normal crate surface is typed packets and
 # handshakes.
 raw-codec = []
+# No production behavior; a compile-time switch for the `miri-extended`
+# scheduled CI job. It un-ignores the tail-recovery tests that run hundreds of
+# real protocol ticks through `FlightHarness` -- correctness coverage the
+# default `cargo test` run already has, but too slow to keep in the every-push
+# Miri ownership smoke job. See `.github/workflows/ci.yml`.
+miri-extended = []
 
 [dependencies]
 # local patch (crates/srt-protocol/VENDOR.md): replaced aws-lc-rs

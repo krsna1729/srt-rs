@@ -72,16 +72,30 @@ jobs:
     needs: quality
     runs-on: ubuntu-24.04
     # Miri is ~1000x slower than native and hosted runners vary by ~2x for the
-    # same commit (observed 720 s and 1501 s for the same test selection), so
-    # the budget is set well above the observed worst case rather than close to
-    # it: a timeout would report runner weather as a correctness failure.
+    # same commit, so the budget is set well above the observed worst case
+    # rather than close to it: a timeout would report runner weather as a
+    # correctness failure. On push/PR this targets ~7-9 min: tests that drive
+    # hundreds of real protocol ticks (e.g. `FlightHarness`-based tail-recovery
+    # coverage) are `#[cfg_attr(all(miri, not(feature = "miri-extended")),
+    # ignore = ...)]`-marked, since that scale is already proven by the
+    # default `cargo test` run and would otherwise dominate this job's time as
+    # the test suite grows -- run those under Miri too, at full scale, in the
+    # weekly/dispatch-triggered `miri-extended` leg below instead of on every
+    # push.
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
       - run: rustup toolchain install nightly --profile minimal --component miri,rust-src
       - run: cargo +nightly miri setup
-      - run: cargo +nightly miri test -p srt-proto srt_connection::tests
+      - name: Miri test (fast set on every push/PR; full set on schedule/dispatch)
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "miri-extended: running the full tail-recovery test scale too"
+            cargo +nightly miri test -p srt-proto --features miri-extended srt_connection::tests
+          else
+            cargo +nightly miri test -p srt-proto srt_connection::tests
+          fi
         env:
           MIRIFLAGS: -Zmiri-tree-borrows
 
