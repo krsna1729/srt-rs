@@ -1,0 +1,21 @@
+# udp_datapath_floor os=linux cpus=6 datagrams_per_arm=60000 rounds=3 pipeline_k=64
+FLOOR_MEMCPY bytes=64 ns_per_copy=2.99 gb_per_s=21.37
+FLOOR_MEMCPY bytes=700 ns_per_copy=11.38 gb_per_s=61.51
+FLOOR_MEMCPY bytes=1316 ns_per_copy=18.59 gb_per_s=70.79
+FLOOR_MEMCPY bytes=4096 ns_per_copy=48.30 gb_per_s=84.80
+FLOOR_MEMCPY bytes=65536 ns_per_copy=1490.83 gb_per_s=43.96
+FLOOR arm=null_syscall syscalls=2000000 ns_per_syscall=303.2
+FLOOR arm=mio_poll_send_to_1op bytes=700 runtime=mio concurrency=1 sent=60000 us_cpu_per_datagram=9.652 ns_cpu_per_byte=13.788 datagrams_per_s=155733 gb_per_s=0.11 cpu_ms=579.1 wall_s=0.385
+FLOOR arm=tokio_send_to_1op bytes=700 runtime=tokio concurrency=1 sent=60000 us_cpu_per_datagram=10.374 ns_cpu_per_byte=14.819 datagrams_per_s=140179 gb_per_s=0.10 cpu_ms=622.4 wall_s=0.428
+FLOOR arm=io_uring_1op bytes=700 runtime=compio concurrency=1 sent=60000 us_cpu_per_datagram=12.528 ns_cpu_per_byte=17.897 datagrams_per_s=117459 gb_per_s=0.08 cpu_ms=751.7 wall_s=0.511
+FLOOR arm=io_uring_pipeline bytes=700 runtime=compio concurrency=64 sent=60000 us_cpu_per_datagram=8.494 ns_cpu_per_byte=12.135 datagrams_per_s=160891 gb_per_s=0.11 cpu_ms=509.6 wall_s=0.373
+FLOOR arm=sendmmsg bytes=700 batch=1 sent=60000 us_cpu_per_datagram=10.080 ns_cpu_per_byte=14.400 datagrams_per_s=150052 gb_per_s=0.11 cpu_ms=604.8 wall_s=0.400
+FLOOR arm=sendmmsg bytes=700 batch=16 sent=60000 us_cpu_per_datagram=7.448 ns_cpu_per_byte=10.640 datagrams_per_s=206588 gb_per_s=0.14 cpu_ms=446.9 wall_s=0.290
+FLOOR arm=sendmmsg bytes=700 batch=64 sent=60032 us_cpu_per_datagram=7.511 ns_cpu_per_byte=10.731 datagrams_per_s=208391 gb_per_s=0.15 cpu_ms=450.9 wall_s=0.288
+FLOOR arm=mio_poll_send_to_1op bytes=1316 runtime=mio concurrency=1 sent=60000 us_cpu_per_datagram=9.736 ns_cpu_per_byte=7.398 datagrams_per_s=154771 gb_per_s=0.20 cpu_ms=584.2 wall_s=0.388
+FLOOR arm=tokio_send_to_1op bytes=1316 runtime=tokio concurrency=1 sent=60000 us_cpu_per_datagram=10.270 ns_cpu_per_byte=7.804 datagrams_per_s=143135 gb_per_s=0.19 cpu_ms=616.2 wall_s=0.419
+FLOOR arm=io_uring_1op bytes=1316 runtime=compio concurrency=1 sent=60000 us_cpu_per_datagram=12.302 ns_cpu_per_byte=9.348 datagrams_per_s=116285 gb_per_s=0.15 cpu_ms=738.1 wall_s=0.516
+FLOOR arm=io_uring_pipeline bytes=1316 runtime=compio concurrency=64 sent=60000 us_cpu_per_datagram=8.898 ns_cpu_per_byte=6.761 datagrams_per_s=166343 gb_per_s=0.22 cpu_ms=533.9 wall_s=0.361
+FLOOR arm=sendmmsg bytes=1316 batch=1 sent=60000 us_cpu_per_datagram=10.034 ns_cpu_per_byte=7.625 datagrams_per_s=147953 gb_per_s=0.19 cpu_ms=602.1 wall_s=0.406
+FLOOR arm=sendmmsg bytes=1316 batch=16 sent=60000 us_cpu_per_datagram=7.611 ns_cpu_per_byte=5.783 datagrams_per_s=207574 gb_per_s=0.27 cpu_ms=456.6 wall_s=0.289
+FLOOR arm=sendmmsg bytes=1316 batch=64 sent=60032 us_cpu_per_datagram=7.570 ns_cpu_per_byte=5.752 datagrams_per_s=207463 gb_per_s=0.27 cpu_ms=454.5 wall_s=0.289

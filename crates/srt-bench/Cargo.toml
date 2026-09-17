@@ -34,6 +34,7 @@ path = "src/bin/qual_evidence.rs"
 
 [dev-dependencies]
 criterion = "0.8"
+futures-util = "0.3"
 proptest = "1.11"
 
 [[bench]]
@@ -49,6 +50,14 @@ harness = false
 
 [[bench]]
 name = "compio_shared_owner_qual"
+harness = false
+
+# Control experiment for the scaling report: single-core memcpy cost, the
+# kernel's per-datagram UDP cost through the same io_uring submit path the
+# transport uses, and what sendmmsg batching would buy. No transport code is
+# linked, so it measures the floor a shard is compared against.
+[[bench]]
+name = "udp_datapath_floor"
 harness = false
 [features]
 bench-internals = []

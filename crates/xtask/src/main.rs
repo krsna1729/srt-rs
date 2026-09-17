@@ -4,6 +4,7 @@ use std::time::Instant;
 
 mod audit;
 mod reportcard;
+mod scaling;
 
 struct Step {
     name: &'static str,
@@ -249,6 +250,7 @@ fn main() -> ExitCode {
         "install-hooks" => install_hooks(),
         "pgo" => run_pgo(&env::args().skip(2).collect::<Vec<_>>()),
         "audit" => audit::run(&env::args().skip(2).collect::<Vec<_>>()),
+        "scaling" => scaling::run(&env::args().skip(2).collect::<Vec<_>>()),
         _ => {
             eprintln!("usage: cargo xtask <command>");
             eprintln!();

@@ -115,7 +115,14 @@ harness figure.
 ## Rows
 
 Raw evidence per row lives in `docs/results/scaling-1000/`; every number below
-is a column in one of those files.
+is a column in one of those files. The sweep is `cargo xtask scaling` (it
+replaced a shell script so the driver is reviewed like code and cannot drift
+from the result schema it writes):
+
+```text
+cargo xtask scaling --out docs/results/scaling-1000/run.tsv \
+    --n 1000 --shards 5 --reps 2 --window-ms 3000 --tx-lanes 256 --connect-cc 64
+```
 
 | date | N | S | F/shard | window | outcome | evidence |
 |---|---|---|---|---|---|---|
@@ -124,7 +131,7 @@ is a column in one of those files.
 | 2026-09-16 | 200 | 1 | 200 | 3 s | K sweep 128/512/1024 -- incumbent K=256 best on wire-bytes/CPU-s | `ksweep-K*.tsv` |
 | 2026-09-16 | 200 | 1 | 200 | 3 s | payload sweep 700/1316/2632 B at fixed 8 Mbps/destination | `costmodel-payload*.tsv` |
 
-## Result: the scaling path is sharding, and the wall is bytes copied per second
+## Result: the scaling path is sharding, and the wall is per-datagram submission cost
 
 ### 1000 destinations, 5 concurrent shards (`scale-N1000-S5-2reps.tsv`)
 
@@ -166,34 +173,86 @@ losslessly, fairly, and reconciled at ~81 % of an 8 Mbps-per-destination
 cadence (5 shards x F=200, 2 reps, identical outcome). Full cadence at 1000
 destinations at 8 Mbps needs roughly 10 cores of sender+receiver work.
 
-### The cost is per byte, not per datagram
+### Cost model, fitted to measured floors
 
-The payload sweep holds the offered bitrate constant at 8 Mbps per destination
-and changes only how the bytes are framed (`--payload-bytes`, with the source
-interval derived as `payload_bytes * 8 / 8 Mbps`):
+**Retraction first.** An earlier version of this section claimed the shard's
+cost was "the copies" at 4.6 ns/byte (217 MB/s). That was wrong, and the bench
+that falsifies it is `udp_datapath_floor`
+(`docs/results/scaling-1000/floor-single-core.txt`):
 
-| payload | interval | copies/s | datagrams in window | wire datagrams per copy | window us/copy | missed % |
-|---:|---:|---:|---:|---:|---:|---:|
-| 700 B | 700 us | 280-284 K | 215-228 K | 0.26-0.27 | **3.48-3.54** | 0.56-1.98 |
-| 1316 B | 1316 us | 150-151 K | 197-223 K | 0.43-0.49 | **5.99-6.16** | 0.09-0.92 |
-| 2632 B | 2632 us | not measurable (sweep column shift, see below) | 84-85 K | - | - | 0.00-0.09 |
+| quantity | measured on this host | per byte |
+|---|---:|---:|
+| single-core `memcpy`, 1316 B | 18.6 ns | 0.0141 ns/B |
+| single-core `memcpy`, 700 B | 11.4 ns | 0.0163 ns/B |
+| single-core `memcpy`, 64 KiB | 1.49 us | 0.0227 ns/B |
+| null syscall (`getpid`, mitigations as shipped) | 0.27-0.30 us | - |
+| kernel byte sensitivity, 700 -> 1316 B, batching fixed | -0.37 .. +0.66 ns/B | ~0.1-0.7 ns/B |
 
-Doubling the number of payloads while holding the bitrate constant *halves* the
-per-copy cost: the same bytes cost the same CPU, in twice as many pieces. The
-datagram count rose only 8-16 % across that change because the protocol already
-coalesces multiple payloads per datagram. The consequence is a per-byte cost
-model, and it is the model that predicts the measured shard capacity:
+A user-space copy of a payload costs 18.6 ns. The shard spends 5.98 us per
+payload. Copying is **0.3 %** of it. The payload-size sweep did not show a
+per-byte cost either -- it held the wire datagram count *and* the wire byte
+count constant while doubling the number of payloads, so it showed "not per
+application payload" and nothing finer.
+
+**The model.** Four terms, each fitted from an arm that varies only that term:
 
 ```text
-sender   1316 B / 5.98 us  = 4.5 ns/byte    (700 B / 3.50 us = 5.0 ns/byte)
+T_wire(datagram) = S / batch + D + B * bytes + P
+                   ^         ^   ^         ^
+                   per-syscall, per-datagram, per-byte, user-space protocol
 ```
 
-4.6 ns/byte is 217 MB/s of payload per core, i.e. ~217 destinations at 8 Mbps
-per sender core -- which is exactly where the shard saturates. The 2632 B row
-could not be measured as intended: the receiver reports `core_total = 0` and
-the sender reports 84-85 K window datagrams, i.e. a ~1500-byte wire packet size
-was exceeded and the rows are not comparable. It is recorded as measured, not
-as a data point.
+* **S, per-syscall: 0.88 us.** Fitted from `sendmmsg` at 1316 B: with
+  `T(b) = S/b + D`, batches 16 and 64 give `S(1/16 - 1/64) = 0.041 us` ->
+  `S = 0.875 us`. The null-syscall floor is 0.30 us, so ~0.58 us is socket-layer
+  work per call, not entry/exit. (At 700 B the same fit returns a negative `S`,
+  i.e. the term is smaller than this bench's resolution.)
+* **D, per-datagram: 7.53 us (700 B) and 7.56 us (1316 B).** Batching-invariant
+  and *size-invariant*: 88 % more bytes changes it by 0.4 %.
+* **B, per-byte: ~0.1-0.7 ns/B** (upper bound from the pipelined arm, which is
+  the only one with a consistent positive slope). Per byte, the shard's 4.6 ns/B
+  is 7-46x this.
+* **P, user-space protocol:** the remainder. `perf` puts srt-rs user space at
+  ~1 % *self* cost, but the source/service loop frame carries ~42 %, so P is
+  bounded by measurement rather than by assertion.
+
+**Reconciling the shard against the floor band:**
+
+| | us CPU per wire datagram |
+|---|---:|
+| `sendmmsg` batch 1 (mio/tokio/compio all within 14 %) | 9.7 / 10.4 / 10.1 |
+| compio, K=64 in flight | 8.5 |
+| compio, one operation awaited at a time | 12.5 |
+| `sendmmsg` batch 16-64 | 7.6 |
+| **the shard (F=200, sender process, window)** | **12.45** |
+
+The shard's 12.45 us per wire datagram sits at the *worst* end of the measured
+band -- the one-operation-at-a-time figure -- even though the Owner has 256 TX
+lanes. Pipelining K=64 is worth 32 % (12.5 -> 8.5 us) and batching 16 datagrams
+per syscall is worth a further 10 % (8.4 -> 7.6 us), so the measured, reachable
+floor is ~7.6-8.5 us: **headroom of roughly 1.4-1.6x on the per-datagram cost,
+and it lives in submission structure, not in bytes.**
+
+Caveat, stated rather than assumed: the floor arms are process-aggregate (the
+loopback receiver thread runs in the same process, and `getrusage(RUSAGE_SELF)`
+cannot separate it), while the shard's figure is its sender process alone. A
+strictly comparable TX-only floor needs the receiver in a second process; until
+that is measured, the honest reading is "the shard is not below the floor and
+the floor is not obviously above it", and the direction of the remaining
+unknown is *against* the shard, not for it.
+
+The capacity arithmetic follows, and it is the same 217 destinations/core the
+earlier (wrongly attributed) version computed:
+
+```text
+1 core / 12.45 us per wire datagram        = 80.3 K datagrams/s
+x 2.08 payloads per wire datagram (window)  = 167 K payloads/s
+/ 760 payloads/s per destination at 8 Mbps  = 220 destinations/core
+```
+
+So the *conclusion* survived; the *mechanism* did not. It is per-datagram
+overhead, not per-byte copying, and the levers are the submission structure
+(pipelining, batched submission) -- not the copies.
 
 ### Where the CPU actually goes (`perf`, F=200, sender)
 
@@ -233,7 +292,7 @@ bookkeeping.
 | # | Hypothesis | Verdict | Evidence |
 |---|---|---|---|
 | H1 | shard is syscall-bound | **false** | 0.15 syscalls/datagram; 47.6 K syscalls vs 868 K ring completions |
-| H2 | shard is protocol-CPU bound | **false** | kernel UDP send path 41 %, srt-rs user space ~1 % self |
+| H2 | shard is protocol-CPU bound | **false, but not "structural" either** | kernel UDP send path 41 %; the fitted per-datagram term is 7.5 us and the shard pays 12.45 us, so submission structure -- not protocol CPU and not bytes -- is the reachable lever |
 | H3 | receiver per-connection bookkeeping dominates at high N | **false** | receiver us/datagram falls to 7.9 at F=200 and rises only under retransmit overload |
 | H4 | the harness's tick loop sets the ceiling | **partly true, and now quantified** | the source shares the loop with `service()`, so a starved shard reports missed ticks instead of a lower rate; the ceiling itself is per-byte CPU, not the loop |
 | H5 | nothing superlinear; sharding is sufficient | **true** | 5 x F=200 serves 1000 with per-shard behaviour identical to solo |
@@ -250,6 +309,18 @@ Candidate A also produced a methodological finding worth keeping: **`us/copy`
 alone is a misleading optimisation target**, because a smaller K lowers it
 (5.30 us) by doing less work per window (236 MB vs 306 MB in the same 3 s).
 The metric used from here on is *in-window wire bytes per CPU-second*.
+
+### The floor measurement reopened candidate D
+
+Candidate C closed the receiver side, but the floor bench (added after those
+three candidates) showed the shard at 12.45 us per wire datagram against a
+measured reachable floor of 7.6-8.5 us. T2's three candidates were all measured
+*inside* the assumption that the per-datagram cost was structural; that
+assumption is now falsified, so the stopping condition is re-armed with
+**candidate D: coalesce lane submissions (pipeline depth and batched
+submission), target 8.5 us per wire datagram**, measured with the same metric
+and the same +/-0.7 % band. No implementation is claimed here; the candidate is
+recorded with its measurement so the next change starts from evidence.
 
 ### Stopping status
 
