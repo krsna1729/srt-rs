@@ -97,13 +97,29 @@ fn cadence_failures(fields: &BTreeMap<String, String>, tolerance: f64) -> Vec<St
 
 /// Accepted is not delivered.
 fn delivery_failures(fields: &BTreeMap<String, String>) -> Vec<String> {
+    // The terminal fence offers extra payloads AFTER the measured window, and
+    // the receiver counts them: `rx_core_total` therefore contains
+    // `fence_accepted` payloads that are not part of the measured workload (the
+    // harness excludes them from `data_accepted`, `data_offered` and every rate,
+    // and they are a different size and pattern). Naming them here keeps the
+    // identity strict instead of leaving the reader to subtract them by hand --
+    // and a canonical run with the fence enabled is exactly the run this gate is
+    // for.
+    // The receiver's own count of fence payloads, not the sender's: the identity
+    // being checked is what the receiver accounted for, and using the sender's
+    // number would silently assume the fence itself was lossless -- which is a
+    // diagnostic fact, not a workload one, and is reported separately.
+    let fence = number(fields, "rx_diag_fences_seen")
+        .or_else(|_| number(fields, "fence_accepted"))
+        .unwrap_or(0.0);
     match (
         number(fields, "data_accepted"),
         number(fields, "rx_core_total"),
     ) {
-        (Ok(accepted), Ok(received)) if accepted != received => vec![format!(
-            "data_accepted {accepted:.0} != rx_core_total {received:.0} ({} % delivered)",
-            100.0 * received / accepted.max(1.0)
+        (Ok(accepted), Ok(received)) if accepted + fence != received => vec![format!(
+            "data_accepted {accepted:.0} + fence seen {fence:.0} != rx_core_total \
+             {received:.0} ({} % of accepted delivered, fence excluded)",
+            100.0 * (received - fence) / accepted.max(1.0)
         )],
         (Err(e), _) | (_, Err(e)) => vec![e],
         _ => Vec::new(),
@@ -284,6 +300,106 @@ fn lateness(fields: &BTreeMap<String, String>, budget_us: Option<f64>) -> Verdic
     }
 }
 
+/// The TX submission classes a canonical row must decompose into.
+///
+/// The names are the row's own field names, so a missing one is a missing
+/// measurement rather than a zero.
+pub const TX_CLASS_KEYS: &[&str] = &[
+    "tx_class_data_first",
+    "tx_class_data_retx",
+    "tx_class_ack",
+    "tx_class_ackack",
+    "tx_class_nak",
+    "tx_class_keepalive",
+    "tx_class_handshake",
+    "tx_class_dropreq",
+    "tx_class_km",
+    "tx_class_shutdown",
+    "tx_class_other_control",
+];
+
+/// A non-negative integer count, required to be present and well formed.
+///
+/// Counts are compared for exact equality, so they are parsed as integers
+/// rather than floats: `465000.0 == 465000` would hide a truncation, and a
+/// negative or non-numeric value is malformed evidence, never zero.
+fn count(fields: &BTreeMap<String, String>, key: &str) -> Result<u64, String> {
+    let raw = field(fields, key).ok_or_else(|| format!("missing {key}"))?;
+    raw.parse::<u64>()
+        .map_err(|_| format!("{key}={raw:?} is not a non-negative integer count"))
+}
+
+/// TX submission accounting must be decomposable and closed.
+///
+/// `tx_submitted_wire` on its own cannot distinguish a dataplane that sent the
+/// media from one that spent its submission capacity on control traffic, and a
+/// total that does not equal the sum of its parts is an accounting defect: every
+/// per-class number derived from it would be wrong without saying so. Two
+/// identities are therefore required exactly, not approximately:
+///
+/// ```text
+/// sum(tx_class_*) == tx_class_total == tx_submitted_wire
+/// ```
+///
+/// The first-transmission lateness fields are required to be present as well --
+/// a row without them cannot support the real-time claim they exist for -- but
+/// no threshold is applied to them here, because this project has not declared
+/// one.
+fn tx_class_failures(fields: &BTreeMap<String, String>) -> Vec<String> {
+    let mut failures = Vec::new();
+    let mut sum: u64 = 0;
+    for key in TX_CLASS_KEYS {
+        match count(fields, key) {
+            Ok(value) => sum = sum.saturating_add(value),
+            Err(error) => failures.push(error),
+        }
+    }
+    for key in [
+        "first_submit_lateness_us_p50",
+        "first_submit_lateness_us_p99",
+        "first_submit_lateness_us_max",
+        "first_submit_lateness_samples",
+    ] {
+        if let Err(error) = count(fields, key) {
+            failures.push(error);
+        }
+    }
+    // "No send failed" has to be a recorded fact, not an absent field: these
+    // counters were printed by the harness but never captured, so a row could
+    // neither support nor refute the claim.
+    for key in ["short", "failed", "peer_local", "transient"] {
+        match count(fields, key) {
+            Ok(0) => {}
+            Ok(value) => failures.push(format!("{key}={value} (must be 0)")),
+            Err(error) => failures.push(error),
+        }
+    }
+    if !failures.is_empty() {
+        return failures;
+    }
+
+    match count(fields, "tx_class_total") {
+        Ok(total) if total == sum => {}
+        Ok(total) => failures.push(format!(
+            "tx_class_total={total} != sum(tx_class_*)={sum}: the submission partition \
+             does not close"
+        )),
+        Err(error) => failures.push(error),
+    }
+    match (
+        count(fields, "tx_submitted_wire"),
+        count(fields, "tx_class_total"),
+    ) {
+        (Ok(wire), Ok(total)) if wire == total => {}
+        (Ok(wire), Ok(total)) => failures.push(format!(
+            "tx_class_total={total} != tx_submitted_wire={wire}: classified submissions \
+             must account for every submission"
+        )),
+        _ => {}
+    }
+    failures
+}
+
 /// Apply the gate to one row, returning every reason it fails.
 fn judge(fields: &BTreeMap<String, String>, tick_tolerance: f64) -> Vec<String> {
     let mut failures = cadence_failures(fields, tick_tolerance);
@@ -294,6 +410,7 @@ fn judge(fields: &BTreeMap<String, String>, tick_tolerance: f64) -> Vec<String> 
     ));
     failures.extend(equilibrium_failures(fields));
     failures.extend(cpu_failures(fields));
+    failures.extend(tx_class_failures(fields));
     failures
 }
 
@@ -562,6 +679,34 @@ mod tests {
             ("window_cpu_ms", "2719.4"),
             ("cpu_ms", "7251.8"),
             ("offered_bps_per_dest", "8000000"),
+            // The TX submission partition, closed: 465 000 wire datagrams of
+            // which the media is the overwhelming majority, plus the control
+            // cadence that carries it. Sum == tx_submitted_wire, which the gate
+            // requires exactly.
+            ("tx_submitted_wire", "465000"),
+            ("tx_class_data_first", "440000"),
+            ("tx_class_data_retx", "10000"),
+            ("tx_class_ack", "10000"),
+            ("tx_class_ackack", "2000"),
+            ("tx_class_nak", "1000"),
+            ("tx_class_keepalive", "1000"),
+            ("tx_class_handshake", "500"),
+            ("tx_class_dropreq", "0"),
+            ("tx_class_km", "0"),
+            ("tx_class_shutdown", "0"),
+            ("tx_class_other_control", "500"),
+            ("tx_class_total", "465000"),
+            // Present, unthresholded: no real-time budget is declared here.
+            ("first_submit_lateness_us_p50", "300"),
+            ("first_submit_lateness_us_p99", "2400"),
+            ("first_submit_lateness_us_max", "9100"),
+            ("first_submit_lateness_samples", "440000"),
+            // Send outcomes: absent would not be zero, so the gate requires
+            // them explicitly.
+            ("short", "0"),
+            ("failed", "0"),
+            ("peer_local", "0"),
+            ("transient", "0"),
         ]
     }
 
@@ -666,6 +811,83 @@ mod tests {
             stationarity(&row(&fields), Some(0.05)),
             Verdict::Fail(_)
         ));
+    }
+
+    /// A submission total that cannot be decomposed, or that does not close,
+    /// is not evidence about the dataplane: it cannot say whether the wire
+    /// traffic was the media or the control cadence around it.
+    #[test]
+    fn tx_submission_partition_is_required_and_must_close() {
+        let tolerance = 0.999;
+        assert!(
+            judge(&row(&passing()), tolerance).is_empty(),
+            "a closed partition passes"
+        );
+
+        // Missing one class: a missing measurement, not a zero.
+        let mut fields = passing();
+        fields.retain(|(k, _)| *k != "tx_class_data_retx");
+        let failures = judge(&row(&fields), tolerance);
+        assert!(
+            failures
+                .iter()
+                .any(|f| f.contains("missing tx_class_data_retx")),
+            "{failures:?}"
+        );
+
+        // Sum does not reach the declared total.
+        let mut fields = passing();
+        fields.retain(|(k, _)| *k != "tx_class_data_first");
+        fields.push(("tx_class_data_first", "430000"));
+        let failures = judge(&row(&fields), tolerance);
+        assert!(
+            failures
+                .iter()
+                .any(|f| f.contains("does not close") && f.contains("tx_class_total")),
+            "{failures:?}"
+        );
+
+        // Sum closes but disagrees with the wire count the gate already reads.
+        let mut fields = passing();
+        fields.retain(|(k, _)| *k != "tx_class_total" && *k != "tx_submitted_wire");
+        fields.push(("tx_class_total", "465000"));
+        fields.push(("tx_submitted_wire", "464999"));
+        let failures = judge(&row(&fields), tolerance);
+        assert!(
+            failures
+                .iter()
+                .any(|f| f.contains("!= tx_submitted_wire=464999")),
+            "{failures:?}"
+        );
+
+        // The lateness fields are evidence for the real-time claim: absent is
+        // absent, not zero.
+        let mut fields = passing();
+        fields.retain(|(k, _)| *k != "first_submit_lateness_us_p99");
+        let failures = judge(&row(&fields), tolerance);
+        assert!(
+            failures
+                .iter()
+                .any(|f| f.contains("missing first_submit_lateness_us_p99")),
+            "{failures:?}"
+        );
+
+        // "No send failed" must be recorded, not merely unmentioned.
+        let mut fields = passing();
+        fields.retain(|(k, _)| *k != "transient");
+        let failures = judge(&row(&fields), tolerance);
+        assert!(
+            failures.iter().any(|f| f.contains("missing transient")),
+            "{failures:?}"
+        );
+        let mut fields = passing();
+        fields.retain(|(k, _)| *k != "failed");
+        fields.push(("failed", "3"));
+        let failures = judge(&row(&fields), tolerance);
+        assert!(
+            failures.iter().any(|f| f.contains("failed=3 (must be 0)")),
+            "{failures:?}"
+        );
     }
 
     #[test]

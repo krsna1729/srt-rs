@@ -323,8 +323,8 @@ pub(crate) use timer::ManualTimerStore;
 // --- Public re-exports: telemetry snapshots ---
 
 pub use telemetry::{
-    IngressTelemetrySnapshot, SHARD_LATENESS_BUCKETS, SHARD_OVERLOAD_REASONS, ShardOverloadReason,
-    ShardTelemetrySnapshot,
+    IngressTelemetrySnapshot, RcvTotals, SHARD_LATENESS_BUCKETS, SHARD_OVERLOAD_REASONS,
+    ShardOverloadReason, ShardTelemetrySnapshot,
 };
 // Internal helpers used by runtime and group_conn modules.
 pub(crate) use batch::drain_connected_outputs;

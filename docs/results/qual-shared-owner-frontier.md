@@ -74,6 +74,33 @@ and receiver for each run.
 seven runs is reproduced verbatim in the JSON above; the runs also remain in
 `scratch/qual5/` on the measuring host (gitignored).
 
+### Rows on this page predate the recovery fix
+
+The table above was measured at `503ef2f`. It is **pre-fix evidence**: the
+sender at that head had no reachable loss timeout of its own, so a lost *suffix*
+of a flight was stranded permanently (a receiver can only NAK a gap that a later
+sequence number exposes). Read the deficits on this page as measurements of a
+known-buggy sender. The post-fix canonical run in
+[`capacity-surface/`](capacity-surface/README.md) is what replaces them.
+
+### Submission accounting fields (added with the class partition)
+
+Fields the harness prints beyond the table's columns, and what each one is
+allowed to be read as:
+
+| field | meaning | how it can mislead |
+|---|---|---|
+| `tx_class_data_first` / `tx_class_data_retx` / `tx_class_ack` / `tx_class_ackack` / `tx_class_nak` / `tx_class_keepalive` / `tx_class_handshake` / `tx_class_dropreq` / `tx_class_km` / `tx_class_shutdown` / `tx_class_other_control` | wire datagrams submitted in the window, partitioned by what each carries. Decided by the protocol at materialization, not inferred from bytes | none on its own — but `data_retx` is the only field that shows recovery happening, so a non-zero `data_retx` with zero `rx_lost` is one endpoint retransmitting on its own timeout, which is a different event from peer-reported loss |
+| `tx_class_total` | sum of the partition, asserted equal to `tx_submitted_wire` before the row prints | if it ever disagrees the run fails, by design: an unclosed partition makes every per-class figure wrong |
+| `tx_pool_high_water` | the most TX slots simultaneously checked out, i.e. how close the run came to its `K` ceiling | it is a peak, not a level: a transient peak at `K` with `tx_pool_free` high at the end still means submissions were refused during the peak |
+| `first_submit_lateness_us_p50/p99/max` | the source's declared deadline to the point the datagram was handed to a TX lane, bucketed at 100 µs (p50/p99 are bucket upper bounds; `max` is exact) | it spans the whole deadline-to-wire path, so it *includes* the source's own lateness: measured 2026-09-17 at F=50 x 8 Mbps x K=256 it reads p50 100 µs / p99 93-285 ms while `offer_lateness_us_p99` reads 3.8-6.5 ms, the tail being source catch-up bursts that exceed the harness's 64-tick catch-up cap. The difference between the two is the transport's own delay; neither is end-to-end latency, because kernel/async completion latency is outside both |
+| `rx_lost` / `rx_duplicates` | what this endpoint's own receiver half concluded about the stream, summed over live and retired sessions | distinct from `rx_dropped`/`rx_truncated`, which count socket work. A sender-side `rx_lost` means the sender's receive half lost inbound DATA, not that its outbound DATA was lost |
+
+`first_submit_lateness_*` is reported but **not gated**: this project has not
+declared a real-time budget, and an ungated field must not be read as a passing
+one. The gate does require the fields to be present, so a row cannot quietly
+omit them.
+
 What this establishes, and what it does not:
 
 - **Establishment is a configuration fact and it holds at 1000 destinations

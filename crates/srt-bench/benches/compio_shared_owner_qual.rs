@@ -54,8 +54,8 @@ use std::time::{Duration, Instant};
 
 use srt_proto::{Bytes, Timestamp};
 use srt_transport::compio::{
-    Owner, OwnerRxMode, OwnerServiceBudget, ProductionRuntimeConfig, RxModePolicy,
-    production_runtime_builder,
+    Owner, OwnerRxMode, OwnerServiceBudget, OwnerTxClassCounters, ProductionRuntimeConfig,
+    RxModePolicy, production_runtime_builder,
 };
 use srt_transport::{CallerConfig, SocketOwnership};
 
@@ -84,6 +84,20 @@ fn next_after(epoch: Instant, interval: Duration, n: u64) -> Instant {
 
 const CONNECT_DEADLINE: Duration = Duration::from_secs(30);
 const DRAIN_DEADLINE: Duration = Duration::from_secs(10);
+/// How long the drain keeps servicing after the TX path goes quiet, in protocol
+/// microseconds, before calling the run finished.
+///
+/// TX quiescence is not protocol quiescence. A lost *suffix* of the stream
+/// leaves every datagram submitted and completed while the receiver has no
+/// evidence of the gap, so nothing is queued and nothing is in flight -- yet the
+/// payloads are missing, and the sender's own retransmission timeout is the only
+/// thing that can repair them, once it expires. Ending the run at TX quiescence
+/// therefore reports a deficit that is a property of the measurement, not of the
+/// transport. This window is longer than the initial 500 ms timeout plus one RTT
+/// (26 ms measured on this host), so at least one repair round can happen; the
+/// loop's own `now` advances 1 ms per visit, so it costs microseconds of wall
+/// time.
+const ARQ_SETTLE_US: u64 = 1_500_000;
 
 /// Source interval holding `rate_bps` constant for this payload size:
 /// `interval = bytes * 8 / rate`. A property of the offer, not of how much of
@@ -151,6 +165,28 @@ struct QualReport {
     rx_truncated: u64,
     tx_pool_free: usize,
     tx_pool_capacity: usize,
+    /// Monotonic peak of simultaneously checked-out TX slots.
+    tx_pool_high_water: usize,
+    /// Wire submissions in the WINDOW, partitioned by what each datagram
+    /// carried. `tx_class.total() == submitted` is asserted before the row is
+    /// printed: a total that cannot be decomposed cannot say whether the wire
+    /// traffic was the media or the control cadence around it.
+    tx_class: OwnerTxClassCounters,
+    /// The same partition for the post-window drain, so no window figure ever
+    /// includes drain traffic.
+    drain_class: OwnerTxClassCounters,
+    /// First-transmission submit lateness for the window: source due instant to
+    /// lane handoff. Distinct from `offer_lateness_us_*`, which is sampled
+    /// before `service()` and says nothing about the dataplane.
+    first_submit_lateness_us_p50: u64,
+    first_submit_lateness_us_p99: u64,
+    first_submit_lateness_us_max: u64,
+    first_submit_lateness_samples: u64,
+    /// SRT-level receive accounting for the sender's own caller socket: what
+    /// this endpoint's receiver half concluded, over live and retired sessions.
+    /// Distinct from `rx_dropped`/`rx_truncated`, which count socket work.
+    rx_lost: u64,
+    rx_duplicates: u64,
     /// Process CPU consumed by the measurement window alone; the drain phase
     /// is excluded.
     cpu_ms: f64,
@@ -516,6 +552,7 @@ async fn run_sender(
             next_tick = next_after(epoch, interval, ticks_offered + 1);
             let visit = owner.service(now, budget).await;
             report.submitted += visit.tx_packets_submitted as u64;
+            report.tx_class.merge(visit.tx_class);
             report.completed_ok += visit.tx_completed_ok as u64;
             report.short_sends += visit.tx_short_sends as u64;
             report.failed_sends += visit.tx_failed_sends as u64;
@@ -550,6 +587,21 @@ async fn run_sender(
             "a zero-tick window is not a measurement"
         );
         report.window_cpu_ms = process_cpu_ms() - cpu_start;
+        // The submission partition must close, and it must close against the
+        // window's own wire count: a row whose classes do not sum to what it
+        // sent has no interpretable per-class figure at all.
+        assert_eq!(
+            report.tx_class.total(),
+            report.submitted,
+            "sum(tx_class) must equal the window's tx_submitted_wire"
+        );
+        // Taken at window close, before the drain, so the window's lateness is
+        // not diluted by post-window traffic.
+        let submit_lateness = owner.take_first_submit_lateness();
+        report.first_submit_lateness_us_p50 = submit_lateness.percentile_us(0.50);
+        report.first_submit_lateness_us_p99 = submit_lateness.percentile_us(0.99);
+        report.first_submit_lateness_us_max = submit_lateness.max_us();
+        report.first_submit_lateness_samples = submit_lateness.samples();
         // Sampled at the END OF THE WINDOW, before any post-window drain: this
         // is what the shard had outstanding when the measurement stopped.
         report.inflight_at_window_end = owner.tx_in_flight() as u64;
@@ -602,20 +654,37 @@ async fn run_sender(
 
         // --- TX-enabled drain to equilibrium, bounded
         let drain_start = Instant::now();
+        let mut settle_us: u64 = 0;
         while drain_start.elapsed() < DRAIN_DEADLINE {
             now = Timestamp::from_micros(now.as_micros() + 1_000);
             let visit = owner.service(now, budget).await;
             // Drain-phase traffic is counted separately so no window figure
             // ever includes it.
             report.drain_submitted += visit.tx_packets_submitted as u64;
+            report.drain_class.merge(visit.tx_class);
             report.drain_completed_ok += visit.tx_completed_ok as u64;
             report.short_sends += visit.tx_short_sends as u64;
             report.failed_sends += visit.tx_failed_sends as u64;
             report.peer_local_failures += visit.tx_peer_local_failures as u64;
             report.transient_failures += visit.tx_transient_failures as u64;
-            if owner.tx_in_flight() == 0 && !owner.has_pending_work(now) {
-                report.drained = true;
-                break;
+            // Stream-quiet, not merely TX-quiet. A lost *suffix* of the stream
+            // leaves nothing queued and nothing to send, yet the payloads are
+            // missing and only the sender's own retransmission timeout can
+            // repair them -- once it expires. The protocol's control cadence
+            // (ACK/ACKACK) keeps the TX path busy forever, so the ARQ window is
+            // measured against DATA work alone: no first transmissions, no
+            // retransmissions, no queued output. Only then does a quiet second
+            // mean the stream's transport work is finished rather than merely
+            // paused.
+            let data_work = visit.tx_class.data_first + visit.tx_class.data_retx;
+            if data_work == 0 && !owner.has_pending_work(now) {
+                if settle_us >= ARQ_SETTLE_US && owner.tx_in_flight() == 0 {
+                    report.drained = true;
+                    break;
+                }
+                settle_us = settle_us.saturating_add(1_000);
+            } else {
+                settle_us = 0;
             }
             owner.wait_for_activity(Duration::from_millis(1)).await;
         }
@@ -638,6 +707,19 @@ async fn run_sender(
         report.tx_failures_pending = owner.tx_failures_pending();
         report.tx_pool_capacity = owner.tx_pool().capacity();
         report.tx_pool_free = owner.tx_pool().free_count();
+        report.tx_pool_high_water = owner.tx_pool().high_water();
+        // The sender's own receive side is the caller socket. Reported through
+        // the Owner's session totals, not the socket-level stats above, because
+        // only these survive a session being retired.
+        if let Some(totals) = owner.rx_session_totals().caller {
+            report.rx_lost = totals.lost;
+            report.rx_duplicates = totals.duplicates;
+        }
+        assert_eq!(
+            report.drain_class.total(),
+            report.drain_submitted,
+            "sum(tx_class) must equal the drain's wire submissions"
+        );
         report
     })
 }
@@ -698,8 +780,16 @@ fn main() {
          short={} failed={} peer_local={} transient={} tx_failures_pending={} \
          service_visits={} offer_lateness_us_p50={} offer_lateness_us_p99={} offer_lateness_us_max={} drain_ok={} \
          inflight_at_window_end={} drain_submitted={} drain_completed={} \
+         tx_class_data_first={} tx_class_data_retx={} tx_class_ack={} tx_class_ackack={} \
+         tx_class_nak={} tx_class_keepalive={} tx_class_handshake={} tx_class_dropreq={} \
+         tx_class_km={} tx_class_shutdown={} tx_class_other_control={} tx_class_total={} \
+         drain_class_total={} \
+         first_submit_lateness_us_p50={} first_submit_lateness_us_p99={} \
+         first_submit_lateness_us_max={} first_submit_lateness_samples={} \
          pending_after_drain={} rx_mode={} managed_rx={} \
-         rx_dropped={} rx_truncated={} tx_pool={}/{} payload_bytes={} interval_us={} \
+         rx_dropped={} rx_truncated={} rx_lost={} rx_duplicates={} \
+         tx_pool_free={} tx_pool_capacity={} tx_pool_high_water={} \
+         payload_bytes={} interval_us={} \
          offered_bps_per_dest={} fence_offered={} fence_accepted={} \
          cpu_ms={:.1} window_cpu_ms={:.1} drain_cpu_ms={:.1}",
         report.fanout,
@@ -732,13 +822,33 @@ fn main() {
         report.inflight_at_window_end,
         report.drain_submitted,
         report.drain_completed_ok,
+        report.tx_class.data_first,
+        report.tx_class.data_retx,
+        report.tx_class.ack,
+        report.tx_class.ackack,
+        report.tx_class.nak,
+        report.tx_class.keepalive,
+        report.tx_class.handshake,
+        report.tx_class.dropreq,
+        report.tx_class.km,
+        report.tx_class.shutdown,
+        report.tx_class.other_control,
+        report.tx_class.total(),
+        report.drain_class.total(),
+        report.first_submit_lateness_us_p50,
+        report.first_submit_lateness_us_p99,
+        report.first_submit_lateness_us_max,
+        report.first_submit_lateness_samples,
         report.pending_after_drain,
         report.rx_mode,
         managed,
         report.rx_dropped,
         report.rx_truncated,
+        report.rx_lost,
+        report.rx_duplicates,
         report.tx_pool_free,
         report.tx_pool_capacity,
+        report.tx_pool_high_water,
         report.payload_bytes,
         report.interval_us,
         report.offered_bps_per_dest,

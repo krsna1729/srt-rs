@@ -107,7 +107,7 @@ proptest! {
         conn.handle_timer(TimerId::Keepalive, now).expect("タイマー処理は成功する想定");
         conn.handle_timer(TimerId::Ack, now).expect("タイマー処理は成功する想定");
         conn.handle_timer(TimerId::Nak, now).expect("タイマー処理は成功する想定");
-        conn.handle_timer(TimerId::Retransmit, now).expect("タイマー処理は成功する想定");
+        conn.handle_timer(TimerId::RetransmitContinue, now).expect("タイマー処理は成功する想定");
         conn.handle_timer(TimerId::Inactivity, now).expect("タイマー処理は成功する想定");
 
         prop_assert_eq!(conn.state(), initial_state);
@@ -457,7 +457,7 @@ proptest! {
         establish_connection(&mut caller, &mut listener, &mut now);
 
         now = Timestamp::from_micros(now.as_micros() + elapsed);
-        caller.handle_timer(TimerId::Retransmit, now).expect("タイマー処理は成功する想定");
+        caller.handle_timer(TimerId::RetransmitContinue, now).expect("タイマー処理は成功する想定");
 
         prop_assert_eq!(caller.state(), ConnectionState::Connected);
     }
@@ -774,7 +774,7 @@ proptest! {
         now = Timestamp::from_micros(now.as_micros() + 500_000);
 
         // Retransmit タイマーを発火
-        caller.handle_timer(TimerId::Retransmit, now).expect("タイマー処理は成功する想定");
+        caller.handle_timer(TimerId::RetransmitContinue, now).expect("タイマー処理は成功する想定");
 
         // パニックせず接続維持
         prop_assert_eq!(caller.state(), ConnectionState::Connected);

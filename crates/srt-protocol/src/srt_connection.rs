@@ -18,8 +18,8 @@ use crate::srt_handshake::{
     HandshakeState, HandshakeType, KmError, KmMessage, MAX_FLOW_WINDOW, SRT_MAGIC_CODE, srt_flags,
 };
 use crate::srt_packet::{
-    ControlPacket, ControlType, DataHeader, DataPacket, PendingData, PendingDatagram,
-    SRT_HEADER_SIZE, SrtPacket,
+    ControlPacket, ControlType, DataHeader, DataPacket, DatagramClass, PendingData,
+    PendingDatagram, SRT_CMD_KMREQ, SRT_CMD_KMRSP, SRT_HEADER_SIZE, SrtPacket,
 };
 use crate::srt_receiver::{LossRange, ReceiverBuffer};
 use crate::srt_sender::SenderBuffer;
@@ -73,31 +73,45 @@ pub enum TimerId {
     Nak,
     /// Keepalive timer.
     Keepalive,
-    /// Retransmit timeout.
-    Retransmit,
+    /// Zero-delay continuation of an already-existing retransmission queue.
+    ///
+    /// This is *not* a loss timeout: it carries no elapsed time, no backoff and
+    /// no notion of loss. It exists so one visit's bounded retransmission work
+    /// can schedule the next visit's share of work it deliberately did not do
+    /// (`process_retransmit`'s per-visit cap), and it is armed by nothing else.
+    /// The sender's actual timeout is [`TimerId::SenderRto`].
+    RetransmitContinue,
     /// Handshake timeout.
     Handshake,
     /// Inactivity timeout (detects missing keepalives).
     Inactivity,
     /// Orderly-close retransmission timeout.
     Shutdown,
+    /// Sender retransmission timeout.
+    ///
+    /// The sender's own backstop for a loss that no NAK can name -- a lost
+    /// *suffix* of a flight, which no later sequence number exposes. Armed when
+    /// DATA is actually submitted, reset by cumulative ACK progress, and
+    /// expired work is bounded to one probe; see [`crate::sender::SenderRto`].
+    SenderRto,
 }
 
 impl TimerId {
-    pub const COUNT: usize = 7;
+    pub const COUNT: usize = 8;
 
     pub const fn index(self) -> usize {
         self as usize
     }
 
-    pub const ALL: [TimerId; 7] = [
+    pub const ALL: [TimerId; 8] = [
         TimerId::Ack,
         TimerId::Nak,
         TimerId::Keepalive,
-        TimerId::Retransmit,
+        TimerId::RetransmitContinue,
         TimerId::Handshake,
         TimerId::Inactivity,
         TimerId::Shutdown,
+        TimerId::SenderRto,
     ];
 }
 
@@ -291,7 +305,14 @@ pub enum ConnectionOutput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputMeta {
     /// The next output is a datagram requiring `wire_len` bytes of storage.
-    Datagram { wire_len: usize },
+    ///
+    /// `class` is what the datagram carries, so a transport can account for
+    /// submission by category without parsing bytes it is not supposed to
+    /// interpret.
+    Datagram {
+        wire_len: usize,
+        class: DatagramClass,
+    },
     /// The next output requests arming a timer.
     SetTimer { id: TimerId, duration_micros: u64 },
     /// The next output requests disarming a timer.
@@ -302,7 +323,18 @@ pub enum OutputMeta {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputInto {
     /// A datagram of `len` bytes was encoded into the buffer and consumed from the connection.
-    Datagram { len: usize },
+    Datagram {
+        len: usize,
+        class: DatagramClass,
+        /// The source's declared due instant for this datagram in the
+        /// microsecond domain of the `now` the application supplies (see
+        /// `PendingData::source_due_micros`). `None` for retransmissions and
+        /// control datagrams. A transport that hands the datagram to a TX lane
+        /// later than this measures the whole deadline-to-wire path, including
+        /// the source's own lateness -- see `FirstSubmitLateness` for how the
+        /// boundary is defined and what it excludes.
+        source_due_micros: Option<u64>,
+    },
     /// A timer set action was consumed from the connection.
     SetTimer { id: TimerId, duration_micros: u64 },
     /// A timer clear action was consumed from the connection.
@@ -315,6 +347,15 @@ enum QueuedOutput {
     Datagram(PendingDatagram),
     SetTimer { id: TimerId, duration_micros: u64 },
     ClearTimer { id: TimerId },
+}
+
+/// Wire-byte cost of one queued output action, for the output queue's byte
+/// budget. Timer actions cost nothing; only datagrams occupy the budget.
+fn output_bytes(output: &QueuedOutput) -> usize {
+    match output {
+        QueuedOutput::Datagram(packet) => packet.wire_len(),
+        QueuedOutput::SetTimer { .. } | QueuedOutput::ClearTimer { .. } => 0,
+    }
 }
 
 /// Connection options.
@@ -532,6 +573,12 @@ pub struct SrtConnection {
     /// fail-closed disconnected state.
     output_queue: VecDeque<QueuedOutput>,
     output_queue_bytes: usize,
+    /// Number of items at the *front* of `output_queue` that were inserted as
+    /// priority control actions (see [`Self::queue_priority_output`]), rather
+    /// than appended in submission order. Items are only ever removed from the
+    /// front, so this stays an accurate count of how many leading slots are
+    /// priority actions without re-scanning the queue.
+    output_queue_priority: usize,
     /// Outstanding delayed-materialization crypto reservations per key flag.
     /// Incremented when a DATA packet reserves a `TxCryptoStamp` at admission,
     /// decremented when the stamped datagram is materialized via
@@ -649,19 +696,60 @@ impl SrtConnection {
     }
 
     fn queue_output(&mut self, output: QueuedOutput) {
-        if self.output_overflowed || self.event_overflowed {
+        if !self.reserve_output_slot(&output) {
             return;
         }
-        let bytes = match &output {
-            QueuedOutput::Datagram(packet) => packet.wire_len(),
-            QueuedOutput::SetTimer { .. } | QueuedOutput::ClearTimer { .. } => 0,
-        };
+        let bytes = output_bytes(&output);
+        self.output_queue_bytes = self.output_queue_bytes.saturating_add(bytes);
+        self.output_queue.push_back(output);
+    }
+
+    /// Queue a timer set/clear action ahead of any pending datagrams.
+    ///
+    /// The sender's own retransmission timer (`TimerId::SenderRto`) is armed
+    /// or reset from `note_data_submitted`/`on_sender_ack_progress`, which run
+    /// *after* the DATA datagram that triggered them has already been queued.
+    /// A plain FIFO append then leaves the timer action stuck behind whatever
+    /// DATA the transport has not yet had TX capacity to drain -- so a timer
+    /// store that is only fed by draining `poll_output_into` never sees the
+    /// arm/rearm/clear at all while capacity is exhausted, and the timeout it
+    /// exists to run never actually starts. Inserting the action immediately
+    /// behind any already-queued priority actions (but ahead of every
+    /// datagram) makes it visible to the caller as soon as the datagram that
+    /// caused it is polled, regardless of how much output is still queued
+    /// behind it.
+    fn queue_priority_output(&mut self, output: QueuedOutput) {
+        debug_assert!(
+            matches!(
+                output,
+                QueuedOutput::SetTimer { .. } | QueuedOutput::ClearTimer { .. }
+            ),
+            "priority insertion is only for timer actions, never datagrams"
+        );
+        if !self.reserve_output_slot(&output) {
+            return;
+        }
+        let bytes = output_bytes(&output);
+        self.output_queue_bytes = self.output_queue_bytes.saturating_add(bytes);
+        self.output_queue.insert(self.output_queue_priority, output);
+        self.output_queue_priority += 1;
+    }
+
+    /// Shared overflow accounting for [`Self::queue_output`] and
+    /// [`Self::queue_priority_output`]. Returns `false` if the output was
+    /// dropped (already overflowed, or this action would overflow now).
+    fn reserve_output_slot(&mut self, output: &QueuedOutput) -> bool {
+        if self.output_overflowed || self.event_overflowed {
+            return false;
+        }
+        let bytes = output_bytes(output);
         if self.output_queue.len() >= MAX_OUTPUT_QUEUE_ACTIONS
             || self.output_queue_bytes.saturating_add(bytes) > MAX_OUTPUT_QUEUE_BYTES
         {
             self.release_queued_tx_reservations();
             self.output_queue.clear();
             self.output_queue_bytes = 0;
+            self.output_queue_priority = 0;
             self.output_overflowed = true;
             self.set_state(ConnectionState::Disconnected);
             self.queue_event(ConnectionEvent::Error(
@@ -670,9 +758,9 @@ impl SrtConnection {
             self.queue_event(ConnectionEvent::Disconnected {
                 reason: DisconnectReason::OutputQueueOverflow,
             });
-            return;
+            return false;
         }
-        if let QueuedOutput::Datagram(PendingDatagram::Data(data)) = &output
+        if let QueuedOutput::Datagram(PendingDatagram::Data(data)) = output
             && let Some(stamp) = data.crypto
         {
             let counter = match stamp.key_flag {
@@ -681,8 +769,17 @@ impl SrtConnection {
             };
             *counter = counter.saturating_add(1);
         }
-        self.output_queue_bytes = self.output_queue_bytes.saturating_add(bytes);
-        self.output_queue.push_back(output);
+        true
+    }
+
+    /// Pop the front of the output queue, keeping the priority-slot count
+    /// consistent with what actually remains at the front.
+    fn pop_output_front(&mut self) -> Option<QueuedOutput> {
+        let popped = self.output_queue.pop_front();
+        if popped.is_some() && self.output_queue_priority > 0 {
+            self.output_queue_priority -= 1;
+        }
+        popped
     }
 
     fn release_queued_tx_reservations(&mut self) {
@@ -724,6 +821,7 @@ impl SrtConnection {
         &mut self,
         header: DataHeader,
         payload: Bytes,
+        source_due_micros: Option<u64>,
         now: Timestamp,
     ) -> Result<(), Error> {
         let crypto = if let Some(ref mut c) = self.crypto {
@@ -733,7 +831,7 @@ impl SrtConnection {
         };
         self.last_send_time = Some(now);
         self.queue_output(QueuedOutput::Datagram(PendingDatagram::Data(
-            PendingData::new(header, payload, crypto),
+            PendingData::new(header, payload, crypto, source_due_micros),
         )));
         // Reservation accounting is owned by `queue_output` so a rejected
         // (overflowed) queue cannot leak a reservation for a packet that was
@@ -841,6 +939,7 @@ impl SrtConnection {
             pending_data_packets: 0,
             output_queue: VecDeque::new(),
             output_queue_bytes: 0,
+            output_queue_priority: 0,
             pending_tx_even: 0,
             pending_tx_odd: 0,
             output_overflowed: false,
@@ -887,6 +986,7 @@ impl SrtConnection {
             pending_data_packets: 0,
             output_queue: VecDeque::new(),
             output_queue_bytes: 0,
+            output_queue_priority: 0,
             pending_tx_even: 0,
             pending_tx_odd: 0,
             output_overflowed: false,
@@ -1285,23 +1385,11 @@ impl SrtConnection {
     /// picks up right where this one left off.
     pub fn process_retransmit(&mut self, now: Timestamp) {
         let dest_socket_id = self.peer_socket_id;
-        // Tail probe. A receiver can only NAK a gap that a later DATA packet
-        // exposes, so a lost *suffix* of a flight is invisible to NAK-driven
-        // recovery: no later sequence number arrives, no loss is reported
-        // (`sec_a` stays zero), and the payload is stranded until something
-        // else asks for it. Nothing else will.
-        //
-        // When no selective retransmission is pending, probe the newest sent
-        // packet once. Its arrival repairs a lost tail directly, and it also
-        // supplies the later sequence evidence that exposes any older gaps to
-        // ordinary NAK recovery. Exactly one packet: replaying the whole
-        // unacknowledged flight on every timeout would amplify an outage rather
-        // than recover from it.
-        if !self.sender.as_ref().is_some_and(|s| s.has_retransmit())
-            && let Some(sender) = self.sender.as_mut()
-        {
-            sender.queue_retransmission_of_newest_sent();
-        }
+        // This function only *drains* what is already queued: whatever put a
+        // sequence in the loss list (a NAK, or the sender timeout's tail probe
+        // in `handle_sender_rto_timeout`) decided that. Deciding here would give
+        // the sender two independent notions of loss and no timer that can
+        // reach either of them.
         // `pop_retransmit` already retires each sequence from the loss list
         // (S02: it does not go back in on an encrypt failure here). Losing
         // that failure silently would make this the one place an ongoing
@@ -1322,7 +1410,9 @@ impl SrtConnection {
                 break;
             };
             let seq = header.sequence_number;
-            match self.queue_data_packet(header, payload, now) {
+            // A retransmission has no source deadline: it is due the moment the
+            // sender learns it is needed, so it contributes no lateness sample.
+            match self.queue_data_packet(header, payload, None, now) {
                 Ok(()) => {}
                 Err(_) => {
                     dropped += 1;
@@ -1337,24 +1427,150 @@ impl SrtConnection {
                 "retransmit(s) dropped: packet could not be re-encrypted"
             );
         }
-        // P01: the Retransmit timer is otherwise never armed (unlike
-        // Ack/Keepalive/Nak, which self-rearm in their own handle_*_timer),
-        // so it is this visit's job to schedule the next one when the cap
-        // above left work behind. A conforming peer's periodic NAK will
-        // usually re-report deferred sequences on its own (`ReceiverBuffer`
-        // re-emits its whole loss list every periodic-NAK interval), but
-        // this must not *depend* on that -- so the follow-up is armed at
-        // `duration_micros: 0` (due immediately, not after a fixed delay):
-        // any nonzero fixed interval turns the per-visit cap into a hard
-        // aggregate retransmit-rate ceiling (packets-per-visit / interval),
-        // an unrelated policy this card has no documented rate to justify.
-        // A zero-delay rearm only bounds *work per call*, which is this
-        // card's actual charter, and lets the transport's own poll cadence
-        // decide how fast the remainder actually goes out.
+        // P01: this continuation timer is armed here and nowhere else (unlike
+        // Ack/Keepalive/Nak, which self-rearm in their own handle_*_timer), so
+        // it is this visit's job to schedule the next one when the cap above
+        // left work behind. A conforming peer's periodic NAK will usually
+        // re-report deferred sequences on its own (`ReceiverBuffer` re-emits
+        // its whole loss list every periodic-NAK interval), but this must not
+        // *depend* on that -- so the follow-up is armed at `duration_micros: 0`
+        // (due immediately, not after a fixed delay): any nonzero fixed
+        // interval turns the per-visit cap into a hard aggregate
+        // retransmit-rate ceiling (packets-per-visit / interval), an unrelated
+        // policy this card has no documented rate to justify. A zero-delay
+        // rearm only bounds *work per call*, which is this card's actual
+        // charter, and lets the transport's own poll cadence decide how fast
+        // the remainder actually goes out.
+        //
+        // Loss detection is a different mechanism entirely and lives on
+        // `TimerId::SenderRto`; this one only continues work already queued.
         if self.has_retransmit() {
             self.queue_output(QueuedOutput::SetTimer {
-                id: TimerId::Retransmit,
+                id: TimerId::RetransmitContinue,
                 duration_micros: 0,
+            });
+        }
+    }
+
+    /// Handle an expiry of the sender's retransmission timeout.
+    ///
+    /// local patch (crates/srt-protocol/VENDOR.md, not upstream-tracked): the
+    /// sender's own loss timeout; see [`crate::sender::SenderRto`] and
+    /// `docs/differential-audit-robotweax.md`.
+    ///
+    /// This is the sender's own recovery path for a loss the peer cannot name
+    /// (a missing suffix of a flight exposes no later sequence number, so no
+    /// NAK is ever generated for it). Work here is deliberately bounded to a
+    /// single probe: replaying the unacknowledged flight on every expiry turns
+    /// an outage into a retransmission storm, and there would be nothing left
+    /// for the peer's own selective recovery to add.
+    fn handle_sender_rto_timeout(&mut self, now: Timestamp) {
+        let Some((outstanding, probe_queued)) = self.sender.as_mut().map(|sender| {
+            if !sender.has_outstanding_submitted_data() {
+                // Everything actually submitted has been acknowledged (or
+                // locally dropped): there is no flight left to time.
+                sender.rto_stop();
+                (false, false)
+            } else {
+                // With selective recovery already pending, a blind probe would
+                // only widen an in-progress repair. `rto_probe_pending()` is
+                // the other half: a probe this timer already queued may still
+                // be sitting un-submitted behind blocked TX capacity, and
+                // `has_retransmit()` alone cannot tell that apart from
+                // "already on the wire" -- it clears the moment the probe is
+                // dequeued into connection output, not when it actually
+                // leaves the protocol. Queuing another blind probe while the
+                // first is still pending would let them accumulate
+                // unboundedly during prolonged TX starvation instead of
+                // staying bounded at exactly one.
+                let queued = if sender.has_retransmit() || sender.rto_probe_pending().is_some() {
+                    None
+                } else {
+                    sender.queue_retransmission_of_newest_submitted()
+                };
+                if let Some(sequence) = queued {
+                    sender.rto_set_probe_pending(sequence);
+                }
+                (true, queued.is_some())
+            }
+        }) else {
+            return;
+        };
+
+        if !outstanding {
+            self.queue_priority_output(QueuedOutput::ClearTimer {
+                id: TimerId::SenderRto,
+            });
+            return;
+        }
+
+        if probe_queued {
+            // Emitted through the bounded per-visit path, exactly like a
+            // NAK-driven retransmission, so the probe cannot bypass the cap.
+            self.process_retransmit(now);
+        }
+
+        if let Some(timeout) = self.sender.as_mut().map(|sender| sender.rto_expire()) {
+            self.queue_priority_output(QueuedOutput::SetTimer {
+                id: TimerId::SenderRto,
+                duration_micros: timeout,
+            });
+        }
+    }
+
+    /// Cumulative ACK progress: restart the sender's retransmission timeout.
+    ///
+    /// Progress -- not ACK receipt -- is the reset condition. A peer that keeps
+    /// acknowledging without advancing `ack_seq` (which a receiver does while
+    /// its own window is stalled) must not be able to keep the timeout from ever
+    /// firing: that would starve precisely the tail recovery the timeout exists
+    /// for. Reporting new RTT/window feedback is likewise not progress.
+    fn on_sender_ack_progress(&mut self) {
+        let Some(flight_remains) = self
+            .sender
+            .as_mut()
+            .map(|sender| sender.has_outstanding_submitted_data())
+        else {
+            return;
+        };
+
+        if flight_remains {
+            if let Some(timeout) = self.sender.as_mut().map(|sender| sender.rto_start()) {
+                self.queue_priority_output(QueuedOutput::SetTimer {
+                    id: TimerId::SenderRto,
+                    duration_micros: timeout,
+                });
+            }
+        } else {
+            if let Some(sender) = self.sender.as_mut() {
+                sender.rto_stop();
+            }
+            self.queue_priority_output(QueuedOutput::ClearTimer {
+                id: TimerId::SenderRto,
+            });
+        }
+    }
+
+    /// Record that a DATA datagram left the protocol for the transport.
+    ///
+    /// `poll_output_into` is the boundary that means this: the caller has
+    /// already reserved final transport storage (`DatagramSink::acquire`), so a
+    /// materialized datagram is no longer droppable by the sender. It is the
+    /// only place the protocol learns that a packet was really transmitted, and
+    /// therefore the only place that may arm the sender timeout.
+    fn note_data_submitted(&mut self, sequence: u32) {
+        let Some(arm_timeout) = self
+            .sender
+            .as_mut()
+            .map(|sender| sender.note_data_submitted(sequence))
+        else {
+            return;
+        };
+        if arm_timeout && let Some(timeout) = self.sender.as_mut().map(|sender| sender.rto_start())
+        {
+            self.queue_priority_output(QueuedOutput::SetTimer {
+                id: TimerId::SenderRto,
+                duration_micros: timeout,
             });
         }
     }
@@ -1366,9 +1582,14 @@ impl SrtConnection {
             TimerId::Keepalive => self.handle_keepalive_timer(now),
             TimerId::Ack => self.handle_ack_timer(now),
             TimerId::Nak => self.handle_nak_timer(now),
-            TimerId::Retransmit => {
+            TimerId::RetransmitContinue => {
                 if self.state == ConnectionState::Connected {
                     self.process_retransmit(now);
+                }
+            }
+            TimerId::SenderRto => {
+                if self.state == ConnectionState::Connected {
+                    self.handle_sender_rto_timeout(now);
                 }
             }
             TimerId::Inactivity => {
@@ -1557,8 +1778,11 @@ impl SrtConnection {
             return Err(Error::invalid_state("send buffer full"));
         }
 
+        // One admission instant, so one source due instant: every fragment of
+        // this message carries the same source deadline.
+        let source_due = Some(now.as_micros());
         for (header, payload) in packets {
-            self.queue_data_packet(header, payload, now)?;
+            self.queue_data_packet(header, payload, source_due, now)?;
         }
 
         if let Some(ref mut sender) = self.sender {
@@ -1607,7 +1831,10 @@ impl SrtConnection {
                 payload.len()
             );
 
-            self.queue_data_packet(header, payload, now)?;
+            // The source's own declared deadline for this payload, carried to
+            // the submission boundary so a transport can measure how late the
+            // payload reached the wire relative to the media schedule.
+            self.queue_data_packet(header, payload, Some(now.as_micros()), now)?;
             if let Some(ref mut sender) = self.sender {
                 sender.record_send_time(now);
             }
@@ -1690,7 +1917,7 @@ impl SrtConnection {
                 "internal invariant violated: push_shared rejected an already-validated send",
             ));
         };
-        self.queue_data_packet(header, payload, now)?;
+        self.queue_data_packet(header, payload, Some(now.as_micros()), now)?;
         if let Some(ref mut sender) = self.sender {
             sender.record_send_time(now);
         }
@@ -1868,6 +2095,7 @@ impl SrtConnection {
         self.output_queue.front().map(|out| match out {
             QueuedOutput::Datagram(pkt) => OutputMeta::Datagram {
                 wire_len: pkt.wire_len(),
+                class: pkt.class(),
             },
             QueuedOutput::SetTimer {
                 id,
@@ -1911,12 +2139,28 @@ impl SrtConnection {
                     PendingDatagram::Data(data) => data.crypto.map(|stamp| stamp.key_flag),
                     PendingDatagram::Control(_) => None,
                 };
-                self.output_queue.pop_front();
+                // The datagram is leaving the protocol for storage the caller
+                // has already reserved, so this is the one point where the
+                // sender learns the packet was actually transmitted.
+                let submitted_sequence = match pkt {
+                    PendingDatagram::Data(data) => Some(data.header.sequence_number),
+                    PendingDatagram::Control(_) => None,
+                };
+                let class = pkt.class();
+                let source_due_micros = pkt.source_due_micros();
+                self.pop_output_front();
                 if let Some(flag) = released {
                     self.release_tx_reservation(flag);
                 }
                 self.output_queue_bytes = self.output_queue_bytes.saturating_sub(wire_len);
-                Ok(Some(OutputInto::Datagram { len: written }))
+                if let Some(sequence) = submitted_sequence {
+                    self.note_data_submitted(sequence);
+                }
+                Ok(Some(OutputInto::Datagram {
+                    len: written,
+                    class,
+                    source_due_micros,
+                }))
             }
             QueuedOutput::SetTimer {
                 id,
@@ -1924,7 +2168,7 @@ impl SrtConnection {
             } => {
                 let id = *id;
                 let duration_micros = *duration_micros;
-                self.output_queue.pop_front();
+                self.pop_output_front();
                 Ok(Some(OutputInto::SetTimer {
                     id,
                     duration_micros,
@@ -1932,7 +2176,7 @@ impl SrtConnection {
             }
             QueuedOutput::ClearTimer { id } => {
                 let id = *id;
-                self.output_queue.pop_front();
+                self.pop_output_front();
                 Ok(Some(OutputInto::ClearTimer { id }))
             }
         }
@@ -1955,10 +2199,10 @@ impl SrtConnection {
             return Ok(None);
         };
         match meta {
-            OutputMeta::Datagram { wire_len } => {
+            OutputMeta::Datagram { wire_len, .. } => {
                 let mut buf = vec![0u8; wire_len];
                 match self.poll_output_into(&mut buf)? {
-                    Some(OutputInto::Datagram { len }) => {
+                    Some(OutputInto::Datagram { len, .. }) => {
                         buf.truncate(len);
                         Ok(Some(ConnectionOutput::SendPacket(buf)))
                     }
@@ -2590,9 +2834,12 @@ impl SrtConnection {
         );
 
         // 送信バッファから ACK されたパケットを削除
+        let mut ack_progressed = false;
         if let Some(ref mut sender) = self.sender {
             let before = sender.packets_in_buffer();
+            let oldest_before = sender.oldest_unacked_sequence();
             sender.handle_ack(ack_seq);
+            ack_progressed = sender.oldest_unacked_sequence() != oldest_before;
             let after = sender.packets_in_buffer();
             tracing::debug!("sender buffer: {} -> {} packets", before, after);
         }
@@ -2645,6 +2892,13 @@ impl SrtConnection {
         // shiguredo/srt-rs issue 0054, not yet in the pulled subtree)
         if pkt.control_info.len() >= 28 {
             self.send_ackack(pkt.type_specific_info, now);
+        }
+
+        // Reset the sender timeout only on cumulative ACK *progress*, and only
+        // after the fresh feedback above has been applied, so a restart uses the
+        // most recent RTT measurement.
+        if ack_progressed {
+            self.on_sender_ack_progress();
         }
 
         Ok(())
@@ -2751,9 +3005,7 @@ impl SrtConnection {
     /// Process a UserDefined packet (KM Refresh).
     fn handle_user_defined(&mut self, pkt: ControlPacket, now: Timestamp) -> Result<(), Error> {
         // Determine KMREQ/KMRSP from the subtype.
-        // SRT_CMD_KMREQ = 3, SRT_CMD_KMRSP = 4
-        const SRT_CMD_KMREQ: u16 = 3;
-        const SRT_CMD_KMRSP: u16 = 4;
+        // SRT_CMD_KMREQ / SRT_CMD_KMRSP live in srt_packet with the class mapping.
 
         match pkt.subtype {
             SRT_CMD_KMREQ => {
@@ -2824,8 +3076,6 @@ impl SrtConnection {
 
     /// Send a KMREQ packet (KM Refresh).
     fn send_km_request(&mut self, km_message: &KmMessage, now: Timestamp) {
-        const SRT_CMD_KMREQ: u16 = 3;
-
         let pkt = ControlPacket {
             control_type: ControlType::UserDefined,
             subtype: SRT_CMD_KMREQ,
@@ -2840,8 +3090,6 @@ impl SrtConnection {
 
     /// Send a KMRSP packet (KM Refresh).
     fn send_km_response(&mut self, km_message: &KmMessage, now: Timestamp) {
-        const SRT_CMD_KMRSP: u16 = 4;
-
         let pkt = ControlPacket {
             control_type: ControlType::UserDefined,
             subtype: SRT_CMD_KMRSP,
@@ -2856,7 +3104,6 @@ impl SrtConnection {
 
     /// Send a KM refresh error response (KMRSP with its four-byte state).
     fn send_km_error_response(&mut self, error: KmError, now: Timestamp) {
-        const SRT_CMD_KMRSP: u16 = 4;
         let mut control_info = Vec::with_capacity(4);
         write_u32(&mut control_info, error as u32);
         let pkt = ControlPacket {
@@ -3776,112 +4023,522 @@ mod tests {
         (caller, listener)
     }
 
-    /// Drive one small flight and return the payloads the listener received.
+    /// Minimal stand-in for a transport timer store: applies the connection's
+    /// own `SetTimer`/`ClearTimer` outputs, and fires only the timers whose
+    /// deadline has actually elapsed.
     ///
-    /// `drop_final_data_packet` decides whether the last original DATA datagram
-    /// is withheld -- the deterministic form of a lost flight tail.
-    fn flight_received_packets(drop_final_data_packet: bool) -> u64 {
-        let (mut caller, mut listener) = connected_pair();
-        let mut now = Timestamp::from_micros(1_000_000);
-        let count = 4usize;
-        for i in 0..count {
+    /// This indirection is the point of the timeout tests. Calling
+    /// `handle_timer(TimerId::SenderRto, ..)` by hand would prove the recovery
+    /// *action* while leaving the *trigger* -- armed when DATA is really
+    /// submitted, fired on elapsed time, reset only by ACK progress --
+    /// completely unexercised. `srt-transport`'s `ManualTimerStore` covers the
+    /// same property through the real store (see
+    /// `crates/srt-transport/tests/tail_recovery.rs`).
+    #[derive(Debug, Default)]
+    struct TestTimers {
+        deadlines: [Option<Timestamp>; TimerId::COUNT],
+    }
+
+    impl TestTimers {
+        fn apply(&mut self, output: &ConnectionOutput, now: Timestamp) {
+            match output {
+                ConnectionOutput::SetTimer {
+                    id,
+                    duration_micros,
+                } => self.deadlines[id.index()] = Some(now.add_micros(*duration_micros)),
+                ConnectionOutput::ClearTimer { id } => self.deadlines[id.index()] = None,
+                ConnectionOutput::SendPacket(_) => {}
+            }
+        }
+
+        fn is_armed(&self, id: TimerId) -> bool {
+            self.deadlines[id.index()].is_some()
+        }
+
+        /// Fire every elapsed timer, once each, in `TimerId::ALL` order.
+        fn fire_due(&mut self, now: Timestamp, conn: &mut SrtConnection) {
+            for &id in &TimerId::ALL {
+                if let Some(deadline) = self.deadlines[id.index()]
+                    && now.as_micros() >= deadline.as_micros()
+                {
+                    self.deadlines[id.index()] = None;
+                    let _ = conn.handle_timer(id, now);
+                }
+            }
+        }
+    }
+
+    /// One scripted flight between a connected caller/listener pair, driven
+    /// entirely by the protocol's own outputs.
+    struct FlightHarness {
+        caller: SrtConnection,
+        listener: SrtConnection,
+        caller_timers: TestTimers,
+        listener_timers: TestTimers,
+        now: Timestamp,
+        /// Indices, in first-transmission order, of the DATA datagrams the wire
+        /// withholds. Every later transmission of the same sequence is a
+        /// retransmission and is *not* subject to this.
+        dropped_first_transmissions: Vec<usize>,
+        first_transmissions: usize,
+        /// Sequences of the DATA datagrams the caller submitted, in order.
+        first_transmission_seqs: Vec<u32>,
+        retransmitted_data: Vec<u32>,
+        /// Most recent Full ACK the listener emitted, replayed by the
+        /// non-progress storm.
+        last_full_ack: Option<Vec<u8>>,
+        replayed_full_acks: usize,
+        /// Inject one non-progress Full ACK per tick.
+        ack_storm: bool,
+        /// Stand-in for a transport with no TX capacity left: DATA datagrams
+        /// stay in the connection's output queue, un-materialized and therefore
+        /// never transmitted.
+        tx_blocked: bool,
+    }
+
+    impl FlightHarness {
+        fn new(dropped_first_transmissions: &[usize]) -> Self {
+            let (caller, listener) = connected_pair();
+            Self {
+                caller,
+                listener,
+                caller_timers: TestTimers::default(),
+                listener_timers: TestTimers::default(),
+                now: Timestamp::from_micros(1_000_000),
+                dropped_first_transmissions: dropped_first_transmissions.to_vec(),
+                first_transmissions: 0,
+                first_transmission_seqs: Vec::new(),
+                retransmitted_data: Vec::new(),
+                last_full_ack: None,
+                replayed_full_acks: 0,
+                ack_storm: false,
+                tx_blocked: false,
+            }
+        }
+
+        fn send_flight(&mut self, count: usize) {
+            for i in 0..count {
+                self.caller
+                    .send(format!("payload {i}").as_bytes(), self.now)
+                    .expect("send admits the payload");
+            }
+        }
+
+        /// Move everything the caller produced: timer actions into its store,
+        /// DATA datagrams onto the wire (subject to loss), everything else to
+        /// the listener.
+        ///
+        /// `tx_blocked` models a transport that has no capacity left. Nothing
+        /// behind the datagram it cannot take is applied either -- not even a
+        /// timer action -- because that is exactly what the real drain path does
+        /// when it stops on a blocked datagram.
+        fn drain_caller(&mut self) {
+            let Self {
+                caller,
+                listener,
+                caller_timers,
+                now,
+                dropped_first_transmissions,
+                first_transmissions,
+                first_transmission_seqs,
+                retransmitted_data,
+                tx_blocked,
+                ..
+            } = self;
+            loop {
+                if *tx_blocked && matches!(caller.peek_output(), Some(OutputMeta::Datagram { .. }))
+                {
+                    break;
+                }
+                let Some(output) = caller
+                    .poll_output()
+                    .expect("exact-size output materializes")
+                else {
+                    break;
+                };
+                caller_timers.apply(&output, *now);
+                let ConnectionOutput::SendPacket(bytes) = output else {
+                    continue;
+                };
+                if let Ok(SrtPacket::Data(packet)) = SrtPacket::decode(&bytes) {
+                    if packet.retransmitted {
+                        retransmitted_data.push(packet.sequence_number);
+                    } else {
+                        let index = *first_transmissions;
+                        *first_transmissions += 1;
+                        first_transmission_seqs.push(packet.sequence_number);
+                        if dropped_first_transmissions.contains(&index) {
+                            continue; // lost on the wire, never delivered
+                        }
+                    }
+                }
+                listener
+                    .feed_recv_buf(&bytes, *now)
+                    .expect("listener accepts packet");
+            }
+        }
+
+        /// Move everything the listener produced, keeping the most recent Full
+        /// ACK for the non-progress storm.
+        fn drain_listener(&mut self) {
+            let Self {
+                caller,
+                listener,
+                listener_timers,
+                now,
+                last_full_ack,
+                ..
+            } = self;
+            while let Some(output) = listener
+                .poll_output()
+                .expect("exact-size output materializes")
+            {
+                listener_timers.apply(&output, *now);
+                let ConnectionOutput::SendPacket(bytes) = output else {
+                    continue;
+                };
+                if let Ok(SrtPacket::Control(control)) = SrtPacket::decode(&bytes)
+                    && control.control_type == ControlType::Ack
+                    && control.control_info.len() >= FULL_ACK_CONTROL_INFO_BYTES
+                {
+                    *last_full_ack = Some(bytes.clone());
+                }
+                caller
+                    .feed_recv_buf(&bytes, *now)
+                    .expect("caller accepts packet");
+            }
+        }
+
+        /// Advance one 10 ms tick: fire elapsed timers, then move every datagram
+        /// and timer action the two endpoints produce.
+        fn tick(&mut self) {
+            self.now = Timestamp::from_micros(self.now.as_micros() + 10_000);
+            let now = self.now;
+            self.caller_timers.fire_due(now, &mut self.caller);
+            self.listener_timers.fire_due(now, &mut self.listener);
+            self.drain_caller();
+            self.drain_listener();
+
+            if self.ack_storm
+                && let Some(ack) = self.last_full_ack.clone()
+            {
+                // A valid Full ACK whose `ack_seq` does not move: exactly the
+                // condition that must not reset the sender timeout.
+                self.caller
+                    .feed_recv_buf(&ack, now)
+                    .expect("caller accepts a repeated Full ACK");
+                self.replayed_full_acks += 1;
+            }
+
+            // Events coalesce; drain them so the receiver's own accounting
+            // stays live (delivery is read from it, never from event count).
+            while self.listener.poll_event().is_some() {}
+            while self.caller.poll_event().is_some() {}
+        }
+
+        fn run(&mut self, ticks: usize) {
+            for _ in 0..ticks {
+                self.tick();
+            }
+        }
+
+        fn delivered(&self) -> u64 {
+            self.listener
+                .receiver_stats()
+                .expect("connected receiver")
+                .total_received
+        }
+
+        fn retransmits(&self) -> u64 {
+            self.caller
+                .sender_stats()
+                .expect("connected sender")
+                .total_retransmits
+        }
+    }
+
+    const FLIGHT: usize = 4;
+
+    /// Control: with nothing dropped, every payload arrives and the sender
+    /// retransmits nothing. Without this the tail tests could pass or fail for a
+    /// harness reason instead of the property under test.
+    #[test]
+    fn an_intact_flight_is_delivered_whole() {
+        let mut flight = FlightHarness::new(&[]);
+        flight.send_flight(FLIGHT);
+        flight.run(400);
+        assert_eq!(flight.delivered(), FLIGHT as u64);
+        assert_eq!(
+            flight.retransmits(),
+            0,
+            "a lossless flight must not retransmit"
+        );
+    }
+
+    /// Tail recovery: a lost FINAL data packet must not be stranded, and the
+    /// recovery must arrive through the sender's own timeout -- armed by the
+    /// submission of DATA and fired by elapsed time, not by this test calling
+    /// the timer handler.
+    ///
+    /// The receiver can only name a loss it has evidence for, and a missing
+    /// *suffix* of a flight provides none -- no later sequence number arrives to
+    /// expose the gap, so no NAK is generated and the receiver reports no loss
+    /// while the payload is simply absent.
+    #[test]
+    fn a_lost_final_data_packet_is_recovered_by_the_sender() {
+        let mut flight = FlightHarness::new(&[FLIGHT - 1]);
+        flight.send_flight(FLIGHT);
+        flight.run(400);
+        assert_eq!(
+            flight.delivered(),
+            FLIGHT as u64,
+            "a lost final DATA datagram must be recovered by the sender's own timeout: \
+             the receiver cannot name a gap that no later sequence number exposes, so \
+             nothing else will ask for it"
+        );
+        assert!(
+            flight.retransmits() >= 1,
+            "recovery must come from a retransmission"
+        );
+    }
+
+    /// A lost flight *tail* of three packets exposes no later sequence number
+    /// either, so the single timeout probe has to do two jobs: repair the newest
+    /// packet, and -- by arriving -- give the receiver the later sequence
+    /// evidence that turns the two older gaps into nameable ones. One probe is
+    /// queued by the timeout, never a replay of the unacknowledged flight.
+    #[test]
+    fn a_lost_three_packet_tail_is_recovered_by_one_probe_plus_nak() {
+        let mut flight = FlightHarness::new(&[1, 2, 3]);
+        flight.send_flight(FLIGHT);
+        flight.run(200);
+        assert_eq!(flight.delivered(), FLIGHT as u64);
+        let flight_seqs = flight.first_transmission_seqs.clone();
+        assert_eq!(
+            flight.retransmitted_data.first().copied(),
+            Some(flight_seqs[3]),
+            "the timeout's probe must be the newest submitted packet"
+        );
+        let mut distinct = flight.retransmitted_data.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(
+            distinct,
+            flight_seqs[1..].to_vec(),
+            "the probe exposes the two older gaps to NAK recovery, and no more"
+        );
+        assert!(
+            !flight.retransmitted_data.contains(&flight_seqs[0]),
+            "the acknowledged packet must never be retransmitted: {:?}",
+            flight.retransmitted_data
+        );
+    }
+
+    /// Item 3's starvation condition: a peer that keeps sending valid Full ACKs
+    /// without advancing `ack_seq` (which a receiver does while its own window is
+    /// stalled) must not be able to keep the timeout from ever firing.
+    #[test]
+    fn a_non_progress_ack_storm_still_reaches_the_tail_timeout() {
+        let mut flight = FlightHarness::new(&[FLIGHT - 1]);
+        flight.ack_storm = true;
+        flight.send_flight(FLIGHT);
+        // Enough ticks to cross the initial 320 ms timeout several times over,
+        // so the storm covers the whole recovery window.
+        flight.run(200);
+        assert!(
+            flight.replayed_full_acks >= 10,
+            "the storm must actually have injected ACKs (injected {})",
+            flight.replayed_full_acks
+        );
+        assert_eq!(
+            flight.delivered(),
+            FLIGHT as u64,
+            "repeated non-progress Full ACKs must not starve the tail timeout"
+        );
+    }
+
+    /// A packet that has not been transmitted must never be probed: the sender
+    /// has no loss evidence about it, and re-sending it would duplicate a
+    /// transmission that is still waiting for capacity rather than repair one.
+    ///
+    /// The first two datagrams are lost on the wire, so the flight stays
+    /// outstanding and the timeout stays armed. The next two are accepted by the
+    /// protocol but the "transport" stops materializing DATA, so they sit in the
+    /// output queue and have never been on the wire. The probe must select the
+    /// newest *submitted* packet, not the newest accepted one.
+    #[test]
+    fn an_unsubmitted_packet_is_never_selected_by_the_timeout() {
+        let mut flight = FlightHarness::new(&[0, 1]);
+        flight.send_flight(2);
+        // One tick submits both datagrams, which arms the timeout.
+        flight.tick();
+        assert_eq!(flight.retransmitted_data, Vec::<u32>::new());
+        let newest_submitted = flight.first_transmission_seqs[1];
+
+        // Accepted, queued, never submitted: TX capacity is where the protocol
+        // boundary stops.
+        flight.tx_blocked = true;
+        flight.send_flight(2);
+        assert_eq!(
+            flight.first_transmission_seqs.len(),
+            2,
+            "a blocked transport must not have materialized the new payloads"
+        );
+        // Well past the initial 320 ms timeout. The probe is queued while the
+        // target decision is made -- i.e. while datagrams 3 and 4 are still
+        // un-materialized and 2 is the newest submitted packet.
+        flight.run(60);
+
+        // Capacity returns: everything queued goes out, the probe included.
+        flight.tx_blocked = false;
+        flight.run(400);
+
+        assert_eq!(flight.delivered(), FLIGHT as u64);
+        assert_eq!(
+            flight.retransmitted_data.first().copied(),
+            Some(newest_submitted),
+            "the timeout must probe the newest packet that was actually submitted"
+        );
+        let unsubmitted = &flight.first_transmission_seqs[2..];
+        assert!(
+            !flight
+                .retransmitted_data
+                .iter()
+                .any(|seq| unsubmitted.contains(seq)),
+            "a packet that was still waiting for TX capacity was retransmitted: {:?}",
+            flight.retransmitted_data
+        );
+    }
+
+    /// Once every submitted packet has been acknowledged there is no flight left
+    /// to time: the epoch must be disarmed rather than left running into a
+    /// pointless probe.
+    #[test]
+    fn a_fully_acknowledged_flight_disarms_the_sender_timeout() {
+        let mut flight = FlightHarness::new(&[]);
+        flight.send_flight(FLIGHT);
+        flight.run(50);
+        assert_eq!(flight.delivered(), FLIGHT as u64);
+        assert!(
+            !flight.caller_timers.is_armed(TimerId::SenderRto),
+            "an empty flight must leave no sender timeout armed"
+        );
+        flight.run(400);
+        assert_eq!(
+            flight.retransmits(),
+            0,
+            "nothing outstanding means nothing to probe"
+        );
+    }
+
+    /// With selective (NAK-driven) recovery already pending, an expiry must not
+    /// add its probe: the peer has named the loss, so a blind probe would widen
+    /// an in-progress repair instead of helping it. The expiry still rearms, with
+    /// backoff, because the timeout must keep running as a backstop.
+    #[test]
+    fn an_expiry_with_selective_recovery_pending_does_not_widen_it() {
+        let (mut caller, _listener) = connected_pair();
+        let now = Timestamp::from_micros(1_000_000);
+        let first = caller.next_sequence_number().expect("connected sender");
+        for i in 0..FLIGHT {
             caller
                 .send(format!("payload {i}").as_bytes(), now)
                 .expect("send admits the payload");
         }
 
-        let mut data_seen = 0usize;
-        fn pump(
-            caller: &mut SrtConnection,
-            listener: &mut SrtConnection,
-            now: Timestamp,
-            data_seen: &mut usize,
-            drop_final_data_packet: bool,
-            count: usize,
-        ) {
-            while let Some(output) = caller.poll_output().unwrap() {
-                let ConnectionOutput::SendPacket(bytes) = output else {
-                    continue;
-                };
-                if matches!(SrtPacket::decode(&bytes), Ok(SrtPacket::Data(_))) {
-                    *data_seen += 1;
-                    if drop_final_data_packet && *data_seen == count {
-                        continue; // lost on the wire, never delivered
+        // Materialize the flight into a timer store: submitting DATA is what arms
+        // the timeout, and the store is how these tests observe arming.
+        let mut timers = TestTimers::default();
+        let mut armed_with = None;
+        while let Some(output) = caller.poll_output().unwrap() {
+            timers.apply(&output, now);
+            if let ConnectionOutput::SetTimer {
+                id: TimerId::SenderRto,
+                duration_micros,
+            } = output
+            {
+                armed_with = Some(duration_micros);
+            }
+        }
+        assert!(
+            timers.is_armed(TimerId::SenderRto),
+            "submitting DATA must arm the sender timeout"
+        );
+        let armed_with = armed_with.expect("the arming action is observable");
+
+        // The peer names the loss of the second packet. No visit drains it yet,
+        // so the sender holds a pending selective retransmission.
+        caller
+            .sender
+            .as_mut()
+            .expect("connected sender")
+            .handle_nak_ranges(&[LossRange {
+                first_seq: first + 1,
+                last_seq: first + 1,
+            }]);
+        assert!(caller.has_retransmit(), "the NAK leaves work pending");
+
+        let expiry = Timestamp::from_micros(now.as_micros() + armed_with + 1);
+        timers.fire_due(expiry, &mut caller);
+        // What the continuation timer would then do with the queue as it stands.
+        caller.process_retransmit(expiry);
+
+        let outputs = drain_outputs(&mut caller);
+        let retransmitted: Vec<u32> = outputs
+            .iter()
+            .filter_map(|output| match output {
+                ConnectionOutput::SendPacket(bytes) => match SrtPacket::decode(bytes) {
+                    Ok(SrtPacket::Data(packet)) if packet.retransmitted => {
+                        Some(packet.sequence_number)
                     }
-                }
-                listener
-                    .feed_recv_buf(&bytes, now)
-                    .expect("listener accepts packet");
-            }
-            // Events coalesce -- one `DataReceived` can carry several packets --
-            // so delivery is counted from the receiver's own unique-packet
-            // accounting, not from event count.
-            while listener.poll_event().is_some() {}
-        }
-
-        pump(
-            &mut caller,
-            &mut listener,
-            now,
-            &mut data_seen,
-            drop_final_data_packet,
-            count,
-        );
-        assert_eq!(data_seen, count, "the flight is {count} DATA datagrams");
-        for _ in 0..400 {
-            now = Timestamp::from_micros(now.as_micros() + 10_000);
-            while let Some(output) = listener.poll_output().unwrap() {
-                if let ConnectionOutput::SendPacket(bytes) = output {
-                    caller
-                        .feed_recv_buf(&bytes, now)
-                        .expect("caller accepts packet");
-                }
-            }
-            for timer in [TimerId::Retransmit, TimerId::Ack, TimerId::Nak] {
-                let _ = caller.handle_timer(timer, now);
-            }
-            pump(
-                &mut caller,
-                &mut listener,
-                now,
-                &mut data_seen,
-                drop_final_data_packet,
-                count,
-            );
-        }
-        listener
-            .receiver_stats()
-            .expect("connected receiver")
-            .total_received
-    }
-
-    /// Control: with nothing dropped, every payload arrives. Without this the
-    /// tail test could pass or fail for a harness reason instead of the property
-    /// under test.
-    #[test]
-    fn an_intact_flight_is_delivered_whole() {
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
         assert_eq!(
-            flight_received_packets(false),
-            4,
-            "control: an intact flight must deliver all four DATA packets"
+            retransmitted,
+            vec![first + 1],
+            "the expiry must not widen a pending selective recovery: only the NAK-ed \
+             sequence may be retransmitted, never the newest submitted packet"
+        );
+
+        let rearmed = outputs
+            .into_iter()
+            .find_map(|output| match output {
+                ConnectionOutput::SetTimer {
+                    id: TimerId::SenderRto,
+                    duration_micros,
+                } => Some(duration_micros),
+                _ => None,
+            })
+            .expect("an expiry with work outstanding must rearm");
+        assert!(
+            rearmed > armed_with,
+            "the rearm must back off ({rearmed} must exceed {armed_with})"
         );
     }
 
-    /// Tail recovery: a lost FINAL data packet must not be stranded.
-    ///
-    /// The receiver can only name a loss it has evidence for, and a missing
-    /// *suffix* of a flight provides none -- no later sequence number arrives to
-    /// expose the gap, so no NAK is generated and the receiver reports no loss
-    /// while the payload is simply absent. The sender is the only party that can
-    /// notice, and its remaining trigger is its own retransmission timer.
+    /// The case in which nothing but the submission trigger can help: the whole
+    /// flight is lost, so the receiver never acknowledges anything and ACK
+    /// progress -- the other event that arms the timeout -- never happens. If
+    /// the timeout were only armed as a side effect of ACK traffic, this stall
+    /// would be permanent.
     #[test]
-    fn a_lost_final_data_packet_is_recovered_by_the_sender() {
-        let received = flight_received_packets(true);
+    fn a_flight_lost_in_full_is_recovered_by_the_submission_trigger() {
+        let mut flight = FlightHarness::new(&[0, 1, 2, 3]);
+        flight.send_flight(FLIGHT);
+        flight.run(400);
         assert_eq!(
-            received, 4,
-            "a lost final DATA datagram must be recovered by the sender: the receiver \
-             cannot name a gap that no later sequence number exposes, so nothing else \
-             will ask for it (received {received} of 4)"
+            flight.delivered(),
+            FLIGHT as u64,
+            "a flight with no feedback at all must still be recovered by the sender's \
+             own timeout, armed when its DATA was submitted"
+        );
+        assert_eq!(
+            flight.retransmitted_data.first().copied(),
+            flight.first_transmission_seqs.last().copied(),
+            "the probe must be the newest submitted packet"
         );
     }
 
@@ -3933,7 +4590,7 @@ mod tests {
                     first_visit_seqs.push(pkt.sequence_number);
                 }
                 ConnectionOutput::SetTimer {
-                    id: TimerId::Retransmit,
+                    id: TimerId::RetransmitContinue,
                     ..
                 } => first_visit_rearmed = true,
                 _ => {}
@@ -3972,7 +4629,7 @@ mod tests {
                     second_visit_seqs.push(pkt.sequence_number);
                 }
                 ConnectionOutput::SetTimer {
-                    id: TimerId::Retransmit,
+                    id: TimerId::RetransmitContinue,
                     ..
                 } => second_visit_rearmed = true,
                 _ => {}
@@ -4090,7 +4747,7 @@ mod tests {
             "rejection leaves next_seq unchanged"
         );
         assert!(
-            caller.poll_output().unwrap().is_none(),
+            drain_datagrams(&mut caller).is_empty(),
             "no packet was queued for a rejected shared send"
         );
         caller
@@ -4226,7 +4883,7 @@ mod tests {
             .send(&oversized, Timestamp::from_micros(300_001))
             .expect_err("one byte over the effective limit is rejected");
         assert!(err.reason.contains("exceeds"), "{}", err.reason);
-        assert!(caller.poll_output().unwrap().is_none());
+        assert!(drain_datagrams(&mut caller).is_empty());
 
         // Fragmented path: a message spanning several chunks plus a
         // remainder must still keep every wire packet within budget.
@@ -5111,6 +5768,22 @@ mod tests {
 
     fn drain_outputs(conn: &mut SrtConnection) -> Vec<ConnectionOutput> {
         std::iter::from_fn(|| conn.poll_output().unwrap()).collect()
+    }
+
+    /// Drain the queued outputs and return only the datagrams.
+    ///
+    /// "Nothing was sent" assertions must not be confounded by a queued timer
+    /// arm: since the sender timeout arms itself on submission, a connection
+    /// with a live flight legitimately has a `SetTimer` action waiting, and that
+    /// is not a transmission.
+    fn drain_datagrams(conn: &mut SrtConnection) -> Vec<Vec<u8>> {
+        drain_outputs(conn)
+            .into_iter()
+            .filter_map(|output| match output {
+                ConnectionOutput::SendPacket(bytes) => Some(bytes),
+                ConnectionOutput::SetTimer { .. } | ConnectionOutput::ClearTimer { .. } => None,
+            })
+            .collect()
     }
 
     #[test]

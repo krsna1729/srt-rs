@@ -338,6 +338,27 @@ point. The rule, defined now so it cannot drift with the data:
                              accounting
 ```
 
+## Pre-fix evidence: everything measured before the recovery fix
+
+> **Every number in this section describes the transport *before*** the
+> lost-flight-tail fix (`fix(protocol): recover a lost flight tail instead of
+> stranding it` and `fix(protocol): arm and fire the sender's own loss
+> timeout`). Read it as a measurement of a *known-buggy* sender, not as a
+> statement about the current head.
+>
+> Why it still matters: the defect it was measuring is exactly a **lost
+> payload** defect. A receiver cannot NAK a gap that no later sequence number
+> exposes, so a lost tail was invisible to the receiver and permanent. That is a
+> direct candidate explanation for this section's "loses 256 payloads" and
+> "loses 55 payloads" rows, which were being read as transport saturation.
+>
+> This evidence is therefore *dispositioned*: it identified the region of
+> interest (K=64 insufficient at F=50 x 8 Mbps), and its conservation failures
+> are now attributed. It is not evidence about the current head, and no
+> qualified capacity point is claimed from it.
+
+### The surface as measured then
+
 Under that rule, nothing measured so far is a qualified capacity point:
 
 ```text
@@ -348,12 +369,30 @@ F=50, R=8 Mbps, K=512   1 of 3 (rep 1 misses 71 of 45 592 ticks -> cadence
                          0.99844 < 0.999, and loses 55 payloads; rep 3 loses 484)
 ```
 
-So the strongest K statement available is: **K=64 is demonstrably insufficient for
-F=50 x 8 Mbps, and K=256 or K=512 remove the persistent receiver-reported
-loss/duplicate regime seen at K=64, but neither is yet fully qualified.** K=256
-looks like the better production candidate of the two on this host.
+So the strongest K statement available *at that head* was: **K=64 is demonstrably
+insufficient for F=50 x 8 Mbps, and K=256 or K=512 remove the persistent
+receiver-reported loss/duplicate regime seen at K=64, but neither is yet fully
+qualified.** K=256 looked like the better production candidate of the two on this
+host. The post-fix canonical run (see `docs/results/capacity-surface/README.md`)
+replaces this statement. Its result, on a clean tree at `5c7a0c3`:
 
-### Throughput pass and real-time pass are different claims
+```text
+F=50, R=8 Mbps/dest, K=256, 3 x 60 s, two independent sweeps:
+  sweep B   3 of 3 rows QUALIFIED (xtask qualify: cadence, conservation,
+            stationarity, submission partition, fence, fault state, RX)
+  sweep A   2 of 3: one repetition's SOURCE missed 68 of 45 592 boundaries
+            (cadence 0.998509 against the declared 0.999)
+
+every row, both sweeps: conservation exact, sec_a = 0, no duplicates delivered,
+f_drain ~0.35 %, drain_ok, pending_after_drain = 0, no send failures, no fault
+```
+
+The K=64/256/512 lines above are the pre-fix surface and their conservation
+failures are what the recovery fix removed; the "K=256 looks like the better
+production candidate" reading survives, now with conservation that actually
+holds.
+
+## Throughput pass and real-time pass are different claims
 
 The bounded catch-up source replays wall-clock boundaries after `service()`
 returns. That is a valid way to measure **throughput** capacity with a bounded
@@ -477,7 +516,15 @@ needs.
 
 ## Non-goals
 
-No transport changes in this PR. Candidate D (pipelining and batched
-submission, the one hypothesis #117 left open) is measured **against** this
-baseline once it exists, not before -- otherwise there is no capacity-valid
-workload to measure it on.
+No **performance** change in this PR, and no speculative batching. Candidate D
+(pipelining and batched submission, the one hypothesis #117 left open) is
+measured **against** this baseline once it exists, not before -- otherwise there
+is no capacity-valid workload to measure it on.
+
+One correctness change is in scope, because qualification exposed it: the sender
+had no reachable loss timeout of its own, so a lost *suffix* of a flight was
+stranded permanently (the receiver can only NAK a gap a later sequence number
+exposes). That is a transport/protocol change and it is the reason the earlier
+surfaces in this document are labelled pre-fix evidence. It is bounded to one
+probe per expiry, it adds no queue and no allocation to the steady state, and it
+is pinned by deterministic tests in both `srt-protocol` and `srt-transport`.

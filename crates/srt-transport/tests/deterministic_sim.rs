@@ -95,7 +95,7 @@ fn run_sim(cfg: &SimConfig) -> SimOutcome {
         for timer in [
             srt_proto::TimerId::Ack,
             srt_proto::TimerId::Nak,
-            srt_proto::TimerId::Retransmit,
+            srt_proto::TimerId::RetransmitContinue,
         ] {
             let _ = caller.handle_timer(timer, now);
             let _ = listener.handle_timer(timer, now);

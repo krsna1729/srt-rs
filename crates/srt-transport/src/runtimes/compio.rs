@@ -1,12 +1,12 @@
 use crate::sink::{DatagramTarget, TxAttribution};
 use crate::{
     CallerTable, DatagramSink, DatagramSlot, IngressTelemetry, OutputDrainBudget,
-    OutputDrainReport, OutputDrainStatus, PacedSendOutcome, PeerTable, collect_output_work,
-    prepend_outputs,
+    OutputDrainReport, OutputDrainStatus, PacedSendOutcome, PeerTable, RcvTotals,
+    collect_output_work, prepend_outputs,
 };
 use compio::buf::BufResult;
 use compio::runtime::spawn;
-use srt_proto::{Bytes, ConnectionOutput, SrtConnection, Timestamp};
+use srt_proto::{Bytes, ConnectionOutput, DatagramClass, SrtConnection, Timestamp};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::future::poll_fn;
@@ -763,11 +763,16 @@ pub const DEFAULT_TX_SLOT_SIZE: usize = 1500;
 /// Observable telemetry snapshot for [`TxPool`]; the pool itself is mutated
 /// only by the owner internals, never by external callers.
 ///
-/// Fixed-cost: three scalar fields, `Copy`, zero heap allocation to collect.
+/// Fixed-cost: four scalar fields, `Copy`, zero heap allocation to collect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TxPoolSnapshot {
     pub capacity: usize,
     pub free: usize,
+    /// Peak number of slots simultaneously checked out since the pool was
+    /// created. Monotonic: it is the high-water mark of
+    /// `capacity - free_buffers.len()`, so it never decreases even as slots
+    /// come back. Always `<= capacity`.
+    pub high_water: usize,
     pub exhaustions: u64,
 }
 /// Reusable finite TX buffer pool for direct final-buffer outbound datagrams.
@@ -777,6 +782,12 @@ pub struct TxPool {
     slot_size: usize,
     capacity: usize,
     free_buffers: Vec<Vec<u8>>,
+    /// Monotonic peak of `capacity - free_buffers.len()`: the most slots ever
+    /// simultaneously reserved. Updated where a slot is taken, never on
+    /// return, which is what makes it a high-water mark rather than a live
+    /// count. `<= capacity` by construction because every taken slot came out
+    /// of `free_buffers`.
+    high_water: usize,
     exhaustion_count: u64,
 }
 
@@ -794,6 +805,7 @@ impl TxPool {
             slot_size,
             capacity,
             free_buffers,
+            high_water: 0,
             exhaustion_count: 0,
         }
     }
@@ -801,6 +813,14 @@ impl TxPool {
     /// Allocate or take a free buffer slot.
     pub(crate) fn alloc_slot(&mut self) -> Option<Vec<u8>> {
         if let Some(buf) = self.free_buffers.pop() {
+            // A slot can only be taken out of `free_buffers`, so the number
+            // simultaneously checked out is bounded by `capacity`. The assert
+            // surfaces a return path that pushed a buffer the pool never
+            // handed out, and `saturating_sub` keeps the documented
+            // `high_water <= capacity` invariant true even if it fires.
+            debug_assert!(self.free_buffers.len() <= self.capacity);
+            let checked_out = self.capacity.saturating_sub(self.free_buffers.len());
+            self.high_water = self.high_water.max(checked_out);
             Some(buf)
         } else {
             self.exhaustion_count = self.exhaustion_count.saturating_add(1);
@@ -819,6 +839,12 @@ impl TxPool {
     #[must_use]
     pub fn free_count(&self) -> usize {
         self.free_buffers.len()
+    }
+
+    /// Peak number of slots simultaneously checked out, ever.
+    #[must_use]
+    pub fn high_water(&self) -> usize {
+        self.high_water
     }
 
     /// Total capacity of the pool.
@@ -1252,6 +1278,30 @@ pub struct OwnerRxStats {
     pub listener: Option<ManagedRxStats>,
     /// `None` when no caller socket is attached to this Owner.
     pub caller: Option<ManagedRxStats>,
+}
+
+/// Per-side SRT-level receive totals at the moment of the call.
+///
+/// A different layer from [`OwnerRxStats`]. Those counters describe the socket:
+/// datagrams read, ring depth, datagrams truncated at the provided-buffer
+/// boundary. These are what the SRT protocol concluded about the DATA stream
+/// on the sessions the side owns -- packets declared lost and packets received
+/// more than once -- summed over currently-live sessions *and* over sessions
+/// the side has already retired, so a run's totals cannot shrink as sessions
+/// churn.
+///
+/// `None` on a side means no socket is attached there, the same convention as
+/// [`OwnerRxStats`].
+///
+/// Collected on demand rather than maintained per visit: the live-session walk
+/// is O(logical sessions), so this belongs to end-of-run and low-cadence
+/// reporting, never to [`Owner::service`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OwnerRxSessionTotals {
+    /// `None` when no listener socket is attached.
+    pub listener: Option<RcvTotals>,
+    /// `None` when no caller socket is attached.
+    pub caller: Option<RcvTotals>,
 }
 
 /// Listener side of a shared Compio owner.
@@ -1816,6 +1866,15 @@ pub(crate) struct TxEngine {
     in_flight_count: usize,
     fault: Option<OwnerFault>,
     shutdown: bool,
+    /// Cumulative submission classes. Lives on the engine because the engine
+    /// *is* the submission boundary -- `OwnerTxSlot::commit` hands the job to
+    /// it -- and because an engine is never rebuilt for a live `Owner`, so
+    /// these totals stay cumulative for the Owner's whole life.
+    tx_class: OwnerTxClassCounters,
+    /// Reset-on-read first-submit lateness window, taken by a bench or a
+    /// driver that wants per-window numbers instead of a cumulative
+    /// histogram.
+    first_submit_lateness: FirstSubmitLateness,
 }
 
 async fn tx_lane_worker(
@@ -1875,9 +1934,54 @@ impl TxEngine {
             in_flight_count: 0,
             fault: None,
             shutdown: false,
+            tx_class: OwnerTxClassCounters::default(),
+            first_submit_lateness: FirstSubmitLateness::default(),
         };
         engine.ensure_started();
         engine
+    }
+
+    /// Record one datagram crossing the submission boundary.
+    ///
+    /// Called from `OwnerTxSlot::commit` with the class and source due instant
+    /// the protocol reported for the materialized datagram, and with the visit
+    /// instant the sink was created with. Accounting is unconditional (every
+    /// submission is counted); the lateness sample is conditional, and the
+    /// condition is the whole meaning of the metric:
+    ///
+    /// - only a first transmission (`DataFirst`) was ever paced against its
+    ///   source's own due instant -- a retransmission is scheduled by the
+    ///   sender's ARQ, not by the application;
+    /// - only a datagram the protocol gave a `Some(due)` for has a due instant
+    ///   at all.
+    ///
+    /// A retransmission, a control datagram, or a datagram with no source due
+    /// instant therefore records NO sample. Recording a zero for them would
+    /// dilute the histogram with samples that never had a deadline to miss.
+    pub(crate) fn record_submission(
+        &mut self,
+        class: DatagramClass,
+        source_due_micros: Option<u64>,
+        now: Timestamp,
+    ) {
+        self.tx_class.add(class);
+        if class == DatagramClass::DataFirst
+            && let Some(due) = source_due_micros
+        {
+            self.first_submit_lateness
+                .record(now.as_micros().saturating_sub(due));
+        }
+    }
+
+    /// Cumulative submission classes since the engine was created.
+    #[must_use]
+    pub(crate) fn tx_class_totals(&self) -> OwnerTxClassCounters {
+        self.tx_class
+    }
+
+    /// Take the first-submit lateness window accumulated since the last take.
+    pub(crate) fn take_first_submit_lateness(&mut self) -> FirstSubmitLateness {
+        self.first_submit_lateness.take()
     }
 
     pub(crate) fn ensure_started(&mut self) {
@@ -1929,6 +2033,22 @@ impl TxEngine {
                 self.fault = Some(OwnerFault::WorkerPanicked { lane: idx });
                 break;
             }
+        }
+    }
+
+    /// Test-only: stop one lane's worker the way a panic would, without
+    /// touching any engine state.
+    ///
+    /// A real lane death is discovered by [`Self::check_worker_faults`]; latching
+    /// the fault here instead would test the assertion rather than the
+    /// detection. Only the worker is stopped, so the engine still believes it
+    /// has that lane -- which is exactly the state a panic leaves behind.
+    #[cfg(test)]
+    pub(crate) fn kill_lane_worker_for_test(&mut self, lane_idx: usize) {
+        let mut state = self.lanes[lane_idx].state.borrow_mut();
+        state.shutdown = true;
+        if let Some(waker) = state.worker_waker.take() {
+            waker.wake();
         }
     }
 
@@ -2244,6 +2364,12 @@ struct OwnerTxSink<'a> {
     /// new protocol output, including faults that live on the RX side and are
     /// therefore invisible to the TX engine alone.
     operational: bool,
+    /// The visit instant this sink was created with. A submission is stamped
+    /// with it, never with a fresh clock read at `commit`: the lateness
+    /// metric asks how late the payload was relative to its source due
+    /// instant at the instant the visit scheduled it, so the whole visit
+    /// shares one clock instead of drifting per datagram.
+    now: Timestamp,
 }
 
 /// Reserved TX capacity: one `TxPool` slot plus one reserved TX lane.
@@ -2264,6 +2390,8 @@ struct OwnerTxSlot<'a> {
     wire_len: usize,
     buf: Vec<u8>,
     committed: bool,
+    /// The visit instant, for the first-submit lateness sample.
+    now: Timestamp,
 }
 
 impl Drop for OwnerTxSlot<'_> {
@@ -2282,8 +2410,13 @@ impl DatagramSlot for OwnerTxSlot<'_> {
         &mut self.buf[..self.wire_len]
     }
 
-    fn commit(mut self, len: usize) {
+    fn commit(mut self, len: usize, class: DatagramClass, source_due_micros: Option<u64>) {
         self.committed = true;
+        // The submission boundary: this is the last point that knows both the
+        // datagram's identity and the visit instant, so it is where class
+        // accounting and the first-submit lateness sample are taken.
+        self.tx_engine
+            .record_submission(class, source_due_micros, self.now);
         let mut buf = std::mem::take(&mut self.buf);
         // The wire length decides what goes on the wire; the slot keeps its
         // capacity so the next use does not reallocate.
@@ -2366,6 +2499,7 @@ impl OwnerTxSink<'_> {
             wire_len,
             buf,
             committed: false,
+            now: self.now,
         }))
     }
 }
@@ -2440,6 +2574,264 @@ fn sockaddr_to_std(storage: libc::sockaddr_storage, len: libc::socklen_t) -> Opt
     }
     None
 }
+
+/// TX submission classes counted at the submission boundary.
+///
+/// One counter per [`srt_proto::DatagramClass`], incremented when a datagram
+/// crosses `DatagramSlot::commit` -- the last instant at which the submission
+/// path still knows what the datagram carries. Fixed-cost: eleven `u64`s,
+/// `Copy`, no allocation to collect or copy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OwnerTxClassCounters {
+    pub data_first: u64,
+    pub data_retx: u64,
+    pub ack: u64,
+    pub ackack: u64,
+    pub nak: u64,
+    pub keepalive: u64,
+    pub handshake: u64,
+    pub dropreq: u64,
+    pub km: u64,
+    pub shutdown: u64,
+    pub other_control: u64,
+}
+
+impl OwnerTxClassCounters {
+    /// Account one submitted datagram.
+    ///
+    /// The match is exhaustive over [`srt_proto::DatagramClass`] with no `_`
+    /// arm: a category added to the protocol cannot be silently swallowed
+    /// here, it has to be given a counter.
+    pub fn add(&mut self, class: DatagramClass) {
+        match class {
+            DatagramClass::DataFirst => self.data_first = self.data_first.saturating_add(1),
+            DatagramClass::DataRetransmit => self.data_retx = self.data_retx.saturating_add(1),
+            DatagramClass::Ack => self.ack = self.ack.saturating_add(1),
+            DatagramClass::AckAck => self.ackack = self.ackack.saturating_add(1),
+            DatagramClass::Nak => self.nak = self.nak.saturating_add(1),
+            DatagramClass::Keepalive => self.keepalive = self.keepalive.saturating_add(1),
+            DatagramClass::Handshake => self.handshake = self.handshake.saturating_add(1),
+            DatagramClass::DropRequest => self.dropreq = self.dropreq.saturating_add(1),
+            DatagramClass::KeyMaterial => self.km = self.km.saturating_add(1),
+            DatagramClass::Shutdown => self.shutdown = self.shutdown.saturating_add(1),
+            DatagramClass::OtherControl => {
+                self.other_control = self.other_control.saturating_add(1);
+            }
+        }
+    }
+
+    /// The counters as an array indexed by
+    /// [`srt_proto::DatagramClass::index`].
+    ///
+    /// Exists so a test can walk `DatagramClass::ALL` and prove that no
+    /// category is unreachable: every index of this array is advanced by
+    /// exactly one variant of the exhaustive `add` match.
+    #[must_use]
+    pub fn counters(&self) -> [u64; DatagramClass::COUNT] {
+        [
+            self.data_first,
+            self.data_retx,
+            self.ack,
+            self.ackack,
+            self.nak,
+            self.keepalive,
+            self.handshake,
+            self.dropreq,
+            self.km,
+            self.shutdown,
+            self.other_control,
+        ]
+    }
+
+    /// Sum of every counter, i.e. how many datagrams these counters describe.
+    #[must_use]
+    pub fn total(&self) -> u64 {
+        self.counters().iter().sum()
+    }
+
+    /// Fold another set of counters into this one.
+    ///
+    /// This is the consumer's core operation: each visit reports a delta, and
+    /// a run accumulates them. Saturating for the same reason as every other
+    /// counter here -- accounting must not be able to panic or wrap.
+    pub fn merge(&mut self, other: Self) {
+        self.data_first = self.data_first.saturating_add(other.data_first);
+        self.data_retx = self.data_retx.saturating_add(other.data_retx);
+        self.ack = self.ack.saturating_add(other.ack);
+        self.ackack = self.ackack.saturating_add(other.ackack);
+        self.nak = self.nak.saturating_add(other.nak);
+        self.keepalive = self.keepalive.saturating_add(other.keepalive);
+        self.handshake = self.handshake.saturating_add(other.handshake);
+        self.dropreq = self.dropreq.saturating_add(other.dropreq);
+        self.km = self.km.saturating_add(other.km);
+        self.shutdown = self.shutdown.saturating_add(other.shutdown);
+        self.other_control = self.other_control.saturating_add(other.other_control);
+    }
+
+    /// Per-visit delta against an earlier snapshot of the same cumulative
+    /// counters. Saturating: a delta is a report, and reporting must not be
+    /// able to panic or wrap.
+    #[must_use]
+    pub fn delta_from(&self, earlier: Self) -> Self {
+        Self {
+            data_first: self.data_first.saturating_sub(earlier.data_first),
+            data_retx: self.data_retx.saturating_sub(earlier.data_retx),
+            ack: self.ack.saturating_sub(earlier.ack),
+            ackack: self.ackack.saturating_sub(earlier.ackack),
+            nak: self.nak.saturating_sub(earlier.nak),
+            keepalive: self.keepalive.saturating_sub(earlier.keepalive),
+            handshake: self.handshake.saturating_sub(earlier.handshake),
+            dropreq: self.dropreq.saturating_sub(earlier.dropreq),
+            km: self.km.saturating_sub(earlier.km),
+            shutdown: self.shutdown.saturating_sub(earlier.shutdown),
+            other_control: self.other_control.saturating_sub(earlier.other_control),
+        }
+    }
+}
+
+/// Bucket width of the first-submit lateness histogram, in microseconds.
+pub const FIRST_SUBMIT_LATENESS_BUCKET_US: u64 = 100;
+/// Number of finite buckets; the last slot is the overflow bucket. Finite
+/// resolution therefore covers `0..=9_999` microseconds.
+pub const FIRST_SUBMIT_LATENESS_BUCKETS: usize = 100;
+
+/// Fixed-size histogram of first-transmission submit lateness.
+///
+/// One sample is (the instant a first-transmission DATA datagram is handed to a
+/// TX lane) minus (the source's declared deadline for that payload), so it spans
+/// the whole path from the media schedule to the wire: the source's own lateness
+/// in offering the tick, admission, drain, pacing, TX pool/lane reservation, and
+/// the queueing until handoff.
+///
+/// Two consequences, both deliberate and both worth stating where the number is
+/// read: a source that is itself late appears here (as it does in a harness's
+/// `offer_lateness`, of which this is the superset -- the difference between the
+/// two is the transport's own delay), and a payload submitted on time reports 0.
+/// Kernel and asynchronous completion latency are outside the measurement, so
+/// this is not an end-to-end latency figure and must not be presented as one.
+///
+/// "Lateness" is measured at the point the datagram is handed to a fixed TX
+/// lane: after admission, drain, pacing and pool/lane reservation, and before
+/// the kernel/async completion. It is therefore explicitly NOT a
+/// completion-time metric: per-lane async latency is not included, only how
+/// much later than the source's own due instant the payload was submitted.
+/// That is also why it is distinct from the harness's `offer_lateness`, which
+/// measures before `service()` is even entered.
+///
+/// Never allocates and never logs per packet: one saturating increment and, at
+/// most, one `max` per sample. `Copy`, so a window snapshot costs no
+/// allocation to take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FirstSubmitLateness {
+    /// Finite buckets are [`FIRST_SUBMIT_LATENESS_BUCKET_US`] wide, starting at
+    /// zero; the final slot is the overflow bucket, which counts everything at
+    /// or above [`Self::OVERFLOW_THRESHOLD_US`].
+    buckets: [u64; FIRST_SUBMIT_LATENESS_BUCKETS + 1],
+    max_us: u64,
+    samples: u64,
+}
+
+impl Default for FirstSubmitLateness {
+    /// An empty window. Hand-written because `[u64; 101]` has no derived
+    /// `Default`, and the histogram must start at all-zero counts rather than
+    /// at some placeholder bucket.
+    fn default() -> Self {
+        Self {
+            buckets: [0; FIRST_SUBMIT_LATENESS_BUCKETS + 1],
+            max_us: 0,
+            samples: 0,
+        }
+    }
+}
+
+impl FirstSubmitLateness {
+    /// Lateness at which the finite buckets end: everything at or above this
+    /// lands in the overflow bucket and is tracked by `max_us` instead.
+    const OVERFLOW_THRESHOLD_US: u64 =
+        FIRST_SUBMIT_LATENESS_BUCKETS as u64 * FIRST_SUBMIT_LATENESS_BUCKET_US;
+
+    /// Record one first-transmission submit lateness, in microseconds.
+    ///
+    /// Value-ordered buckets mean a percentile is a bucket upper bound, not an
+    /// exact quantile (see [`Self::percentile_us`]). The overflow bucket is
+    /// where resolution ends, and `max_us` is recorded alongside it so the
+    /// tail is never lost to the bucket.
+    pub fn record(&mut self, lateness_us: u64) {
+        // The maximum is over *every* sample, not just the overflow tail: a
+        // run whose worst sample sits inside the finite range would otherwise
+        // report `max = 0` while the histogram holds real samples.
+        self.max_us = self.max_us.max(lateness_us);
+        if lateness_us >= Self::OVERFLOW_THRESHOLD_US {
+            let bucket = &mut self.buckets[FIRST_SUBMIT_LATENESS_BUCKETS];
+            *bucket = bucket.saturating_add(1);
+        } else {
+            // Below the threshold the quotient is always a valid finite index,
+            // so the finite path needs no clamp.
+            let bucket = (lateness_us / FIRST_SUBMIT_LATENESS_BUCKET_US) as usize;
+            self.buckets[bucket] = self.buckets[bucket].saturating_add(1);
+        }
+        self.samples = self.samples.saturating_add(1);
+    }
+
+    /// Number of samples in this window.
+    #[must_use]
+    pub fn samples(&self) -> u64 {
+        self.samples
+    }
+
+    /// Largest lateness in this window, `0` when no sample was recorded.
+    ///
+    /// Exact, unlike the histogram: it is the observed maximum, not a bucket
+    /// edge, and it is the only field that resolves samples past
+    /// [`FIRST_SUBMIT_LATENESS_BUCKETS`] x [`FIRST_SUBMIT_LATENESS_BUCKET_US`].
+    #[must_use]
+    pub fn max_us(&self) -> u64 {
+        self.max_us
+    }
+
+    /// Upper bound, in microseconds, of the bucket the given percentile falls
+    /// in.
+    ///
+    /// Resolution is honest: finite buckets are
+    /// [`FIRST_SUBMIT_LATENESS_BUCKET_US`] wide, so a returned value is the
+    /// bucket's upper edge and never a claim of an exact quantile -- p50 can
+    /// therefore overstate the median by up to one bucket width. A percentile
+    /// landing in the overflow bucket returns the observed `max_us`, and an
+    /// empty histogram returns `0`.
+    #[must_use]
+    pub fn percentile_us(&self, percentile: f64) -> u64 {
+        if self.samples == 0 {
+            return 0;
+        }
+        let percentile = percentile.clamp(0.0, 1.0);
+        // Rank of the first sample at or above the requested percentile,
+        // 1-based: the bucket containing it is the bucket the percentile falls
+        // in.
+        let target = (percentile * self.samples as f64).ceil().max(1.0) as u64;
+        let mut seen = 0u64;
+        for (index, count) in self.buckets.iter().enumerate() {
+            seen = seen.saturating_add(*count);
+            if seen >= target {
+                if index == FIRST_SUBMIT_LATENESS_BUCKETS {
+                    return self.max_us;
+                }
+                return ((index as u64) + 1) * FIRST_SUBMIT_LATENESS_BUCKET_US;
+            }
+        }
+        self.max_us
+    }
+
+    /// Take the window, leaving a fresh empty histogram in this slot.
+    ///
+    /// Reset-on-read is the windowing contract: each consumer takes the
+    /// samples accumulated since the previous take, so no accounting code has
+    /// to remember a previous snapshot to subtract.
+    #[must_use]
+    pub fn take(&mut self) -> Self {
+        std::mem::take(self)
+    }
+}
+
 /// Execution report for one [`Owner::service`] visit.
 ///
 /// Fixed-cost by construction: every field is a `usize`/`bool`/`Option<u64>`
@@ -2472,6 +2864,14 @@ pub struct OwnerServiceReport {
     pub tx_peer_local_failures: usize,
     /// Transient host/socket send failures reaped in THIS visit.
     pub tx_transient_failures: usize,
+    /// Per-class TX submission delta for THIS visit, from the fixed
+    /// [`srt_proto::DatagramClass`] vocabulary rather than packet bytes. Same
+    /// convention as `completions_reaped`/`tx_packets_submitted`: it is a
+    /// delta, not a cumulative total. Because every class increment happens
+    /// inside `DatagramSlot::commit` and every commit is accounted as one
+    /// submitted packet, `tx_class.total() == tx_packets_submitted` holds for
+    /// every visit.
+    pub tx_class: OwnerTxClassCounters,
 }
 
 /// High-density, shared-socket completion-runtime owner.
@@ -2565,6 +2965,31 @@ impl Owner {
         OwnerRxStats {
             listener: self.listener.as_ref().map(|side| side.rx.stats()),
             caller: self.caller.as_ref().map(|side| side.rx.stats()),
+        }
+    }
+
+    /// SRT-level receive totals for BOTH sides, in one snapshot.
+    ///
+    /// The protocol-layer counterpart to [`Self::rx_stats`]: what the SRT
+    /// sessions concluded about their DATA streams (declared loss, duplicate
+    /// arrivals) across each side's live sessions plus each side's retired
+    /// ledger. A side with no socket attached reports `None`.
+    ///
+    /// O(live sessions) plus one buffer pass per sampled connection, and
+    /// allocation-free (`&self` only), so it is an explicit snapshot for
+    /// end-of-run or low-cadence reporting -- never part of a [`Self::service`]
+    /// visit.
+    #[must_use]
+    pub fn rx_session_totals(&self) -> OwnerRxSessionTotals {
+        OwnerRxSessionTotals {
+            listener: self
+                .listener
+                .as_ref()
+                .map(|side| side.table.receiver_totals()),
+            caller: self
+                .caller
+                .as_ref()
+                .map(|side| side.table().receiver_totals()),
         }
     }
 
@@ -3208,8 +3633,33 @@ impl Owner {
         crate::compio::TxPoolSnapshot {
             capacity: self.tx_pool.capacity(),
             free: self.tx_pool.free_count(),
+            high_water: self.tx_pool.high_water(),
             exhaustions: self.tx_pool.exhaustion_count(),
         }
+    }
+
+    /// Cumulative TX submission classes since this Owner was created.
+    ///
+    /// Never reset: [`OwnerServiceReport::tx_class`] carries the per-visit
+    /// delta, so a consumer that wants both reuses this instead of a second
+    /// accounting path. Summed over visits, this equals the sum of every
+    /// visit's `tx_packets_submitted`, by the same invariant the delta holds
+    /// to per visit.
+    #[must_use]
+    pub fn tx_class_totals(&self) -> OwnerTxClassCounters {
+        self.tx_engine.tx_class_totals()
+    }
+
+    /// Take the first-transmission submit lateness accumulated since the last
+    /// take, leaving a fresh window behind.
+    ///
+    /// Measured at the submission boundary (after admission, drain, pacing and
+    /// pool/lane reservation, before kernel/async completion), so it does NOT
+    /// include per-lane async latency and is distinct from any lateness the
+    /// caller measured before entering [`Owner::service`]. Only
+    /// first-transmission DATA with a source due instant is sampled.
+    pub fn take_first_submit_lateness(&mut self) -> FirstSubmitLateness {
+        self.tx_engine.take_first_submit_lateness()
     }
 
     #[must_use]
@@ -3244,6 +3694,7 @@ impl Owner {
     ) -> OwnerServiceReport {
         let mut report = OwnerServiceReport::default();
         let prev = self.completions;
+        let prev_class = self.tx_engine.tx_class_totals();
 
         // 0. Harvest faults BEFORE admitting anything. A visit must never
         //    admit state on behalf of a receive consumer or TX lane that is
@@ -3294,6 +3745,13 @@ impl Owner {
             }
         }
 
+        // Submission classes are accounted cumulatively at the submission
+        // boundary, so this visit's delta is the difference against the
+        // snapshot taken before any TX phase ran. Computed on every exit path
+        // -- including the ones that stop the visit on a fault before TX --
+        // so a stopped visit reports a truthful (zero) delta rather than
+        // leaving the field unset.
+        report.tx_class = self.tx_engine.tx_class_totals().delta_from(prev_class);
         self.finalize_report(&mut report, now, budget, prev);
         report
     }
@@ -3774,6 +4232,7 @@ impl Owner {
                 tx_pool: &mut self.tx_pool,
                 tx_engine: &mut self.tx_engine,
                 operational,
+                now,
             };
             let drain_report = listener
                 .table
@@ -3798,6 +4257,7 @@ impl Owner {
                 tx_pool: &mut self.tx_pool,
                 tx_engine: &mut self.tx_engine,
                 operational,
+                now,
             };
             let drain_report = caller
                 .pool
@@ -3870,10 +4330,31 @@ mod tests {
     /// keep expressing "offer this datagram and see what happened":
     /// `Ok(Some(len))` committed, `Ok(None)` no capacity, `Err` refused
     /// before materialization (protocol output untouched).
+    ///
+    /// The synthetic datagrams these tests fill are attributed as first
+    /// transmissions with no source due instant: they carry real payload, and
+    /// a `None` due instant means they contribute no first-submit lateness
+    /// sample, so injection never contaminates that histogram. Tests that need
+    /// a specific class or due instant use [`push_test_class`].
     fn push_test<F>(
         sink: &mut OwnerTxSink<'_>,
         peer: SocketAddr,
         wire_len: usize,
+        fill: F,
+    ) -> Result<Option<usize>, srt_proto::Error>
+    where
+        F: FnOnce(&mut [u8]) -> Result<usize, srt_proto::Error>,
+    {
+        push_test_class(sink, peer, wire_len, DatagramClass::DataFirst, None, fill)
+    }
+
+    /// [`push_test`] with an explicit class and source due instant.
+    fn push_test_class<F>(
+        sink: &mut OwnerTxSink<'_>,
+        peer: SocketAddr,
+        wire_len: usize,
+        class: DatagramClass,
+        source_due_micros: Option<u64>,
         fill: F,
     ) -> Result<Option<usize>, srt_proto::Error>
     where
@@ -3884,7 +4365,7 @@ mod tests {
         };
         match fill(slot.bytes_mut()) {
             Ok(len) => {
-                slot.commit(len);
+                slot.commit(len, class, source_due_micros);
                 Ok(Some(len))
             }
             // Refusal/failure before any protocol state was consumed: the
@@ -4095,6 +4576,150 @@ mod tests {
                  not-yet-submitted packet and timer action exactly as staged, in order"
             );
         });
+    }
+
+    /// Item 9: the pool's high-water mark is the peak number of slots
+    /// simultaneously checked out. It tracks the peak, never exceeds capacity,
+    /// and never decreases when slots come back or when a later checkout is
+    /// shallower.
+    #[test]
+    fn tx_pool_high_water_tracks_the_peak_and_never_exceeds_capacity() {
+        let mut pool = TxPool::new(4, 1500);
+        assert_eq!(
+            pool.high_water(),
+            0,
+            "a pool that never handed out a slot has no peak to report"
+        );
+
+        let checked_out: Vec<Vec<u8>> = (0..4).map(|_| pool.alloc_slot().expect("slot")).collect();
+        assert_eq!(pool.free_count(), 0);
+        assert_eq!(pool.high_water(), 4, "checking out every slot is the peak");
+        assert!(
+            pool.high_water() <= pool.capacity(),
+            "the peak cannot exceed the number of slots that exist"
+        );
+
+        for buf in checked_out {
+            pool.return_slot(buf);
+        }
+        assert_eq!(pool.free_count(), 4);
+        assert_eq!(
+            pool.high_water(),
+            4,
+            "returning slots must not lower the high-water mark"
+        );
+
+        let shallower: Vec<Vec<u8>> = (0..2).map(|_| pool.alloc_slot().expect("slot")).collect();
+        assert_eq!(
+            pool.high_water(),
+            4,
+            "a checkout shallower than the peak must not decrease it"
+        );
+        for buf in shallower {
+            pool.return_slot(buf);
+        }
+
+        // Exhaustion counts an attempt; it must not invent capacity, so the
+        // mark stays at the real peak.
+        let checked_out: Vec<Vec<u8>> = (0..4).map(|_| pool.alloc_slot().expect("slot")).collect();
+        assert!(pool.alloc_slot().is_none(), "the pool is exhausted");
+        assert_eq!(pool.high_water(), 4);
+        assert_eq!(pool.exhaustion_count(), 1);
+        for buf in checked_out {
+            pool.return_slot(buf);
+        }
+        assert!(pool.high_water() <= pool.capacity());
+    }
+
+    /// Assert that `after` differs from `before` in exactly one named counter
+    /// -- the one `class` owns -- and that it advanced by one.
+    ///
+    /// A total-based check cannot catch an increment that lands on a
+    /// neighbour's field; this can, because it compares every named counter.
+    fn assert_only_own_counter_advanced(
+        class: DatagramClass,
+        before: OwnerTxClassCounters,
+        after: OwnerTxClassCounters,
+    ) {
+        // Same order as `DatagramClass`'s discriminants, which the loop in the
+        // caller checks one class at a time.
+        let fields = [
+            ("data_first", before.data_first, after.data_first),
+            ("data_retx", before.data_retx, after.data_retx),
+            ("ack", before.ack, after.ack),
+            ("ackack", before.ackack, after.ackack),
+            ("nak", before.nak, after.nak),
+            ("keepalive", before.keepalive, after.keepalive),
+            ("handshake", before.handshake, after.handshake),
+            ("dropreq", before.dropreq, after.dropreq),
+            ("km", before.km, after.km),
+            ("shutdown", before.shutdown, after.shutdown),
+            ("other_control", before.other_control, after.other_control),
+        ];
+        for (index, (name, earlier, later)) in fields.into_iter().enumerate() {
+            let expected = earlier + u64::from(index == class.index());
+            assert_eq!(
+                later, expected,
+                "{class:?} moved the `{name}` counter wrong"
+            );
+        }
+    }
+
+    /// Item 7: the class vocabulary at the submission boundary is closed and
+    /// every category is reachable -- `add` moves exactly one counter per
+    /// datagram, and the counter it moves is the one named for that class. An
+    /// `_ =>` fallthrough would make this test fail rather than silently
+    /// pooling two categories.
+    #[test]
+    fn every_datagram_class_is_reachable_in_the_submission_counters() {
+        let mut counters = OwnerTxClassCounters::default();
+        assert_eq!(counters.total(), 0);
+
+        for class in DatagramClass::ALL {
+            let before = counters;
+            counters.add(class);
+            assert_eq!(
+                counters.total(),
+                before.total() + 1,
+                "{class:?} must increment exactly one counter"
+            );
+            assert_only_own_counter_advanced(class, before, counters);
+        }
+
+        assert_eq!(counters.total(), DatagramClass::COUNT as u64);
+        assert_eq!(
+            counters.counters(),
+            [1; DatagramClass::COUNT],
+            "every category holds exactly the one datagram sent for it"
+        );
+    }
+
+    /// Item 7: the report's class field is this visit's delta, not a second
+    /// cumulative total.
+    #[test]
+    fn tx_class_delta_reports_only_this_visits_submissions() {
+        let mut cumulative = OwnerTxClassCounters::default();
+        cumulative.add(DatagramClass::DataFirst);
+        cumulative.add(DatagramClass::DataFirst);
+        cumulative.add(DatagramClass::Ack);
+
+        let before_visit = cumulative;
+        cumulative.add(DatagramClass::Ack);
+        cumulative.add(DatagramClass::DataRetransmit);
+
+        let delta = cumulative.delta_from(before_visit);
+        assert_eq!(delta.total(), 2, "only the two later submissions");
+        assert_eq!(delta.ack, 1);
+        assert_eq!(delta.data_retx, 1);
+        assert_eq!(
+            delta.data_first, 0,
+            "the earlier visits are not re-reported"
+        );
+        assert_eq!(
+            cumulative.delta_from(cumulative).total(),
+            0,
+            "a delta against itself is empty"
+        );
     }
 
     #[test]
@@ -4525,6 +5150,7 @@ mod tests {
                     tx_pool: &mut owner.tx_pool,
                     tx_engine: &mut owner.tx_engine,
                     operational: true,
+                    now: Timestamp::default(),
                 };
                 let res = push_test(&mut sink, l_addr, 10, |buf| {
                     buf[..10].copy_from_slice(b"0123456789");
@@ -4849,6 +5475,7 @@ mod tests {
                     tx_pool: &mut owner.tx_pool,
                     tx_engine: &mut owner.tx_engine,
                     operational: true,
+                    now: Timestamp::default(),
                 };
                 let _ = push_test(&mut sink, peer, 8, |buf| {
                     buf[..8].copy_from_slice(b"12345678");
@@ -4998,6 +5625,7 @@ mod tests {
                     tx_pool: &mut owner.tx_pool,
                     tx_engine: &mut owner.tx_engine,
                     operational: true,
+                    now: Timestamp::default(),
                 };
                 let res = push_test(&mut sink, peer, 100, |buf| {
                     buf[..100].fill(0xAA);
@@ -5014,6 +5642,7 @@ mod tests {
                     tx_pool: &mut owner.tx_pool,
                     tx_engine: &mut owner.tx_engine,
                     operational: true,
+                    now: Timestamp::default(),
                 };
                 let res = push_test(&mut sink, peer, 101, |buf| {
                     buf[..101].fill(0xBB);
@@ -5104,6 +5733,7 @@ mod tests {
                     tx_pool: &mut owner.tx_pool,
                     tx_engine: &mut owner.tx_engine,
                     operational: true,
+                    now: Timestamp::default(),
                 };
                 let res = push_test(&mut sink, peer, 20, |_buf| {
                     Err(srt_proto::Error::with_reason(
@@ -5130,6 +5760,7 @@ mod tests {
                     tx_pool: &mut owner.tx_pool,
                     tx_engine: &mut owner.tx_engine,
                     operational: true,
+                    now: Timestamp::default(),
                 };
                 let mut fill_ran = false;
                 let res = push_test(&mut sink, peer, 5000, |_buf| {
@@ -5157,6 +5788,7 @@ mod tests {
                     tx_pool: &mut owner.tx_pool,
                     tx_engine: &mut owner.tx_engine,
                     operational: true,
+                    now: Timestamp::default(),
                 };
                 let res = push_test(&mut sink, peer, 20, |buf| {
                     buf[..20].fill(0x55);
@@ -5186,6 +5818,7 @@ mod tests {
                     tx_pool: &mut owner.tx_pool,
                     tx_engine: &mut owner.tx_engine,
                     operational: true,
+                    now: Timestamp::default(),
                 };
                 let _ = push_test(&mut sink, peer, 20, |buf| {
                     buf[..20].fill(0x66);
@@ -5275,6 +5908,333 @@ mod tests {
                 "the pending datagram must be submitted once capacity returns"
             );
             assert!(ids.len() == 2);
+        });
+    }
+
+    /// Item 7 acceptance property: the class counters and the submitted-packet
+    /// count describe the same submissions, so their totals agree after every
+    /// visit. The second visit proves the report field is a DELTA: it submits
+    /// one handshake again while the cumulative totals hold two.
+    #[test]
+    fn report_tx_class_total_matches_submitted_packets_every_visit() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            let c_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+            let c_sock = compio::net::UdpSocket::from_std(c_std).expect("adopt");
+            let mut owner = Owner::new(1).with_caller(OwnerCallerSide::new_single(c_sock));
+
+            for socket_id in [0x7201u32, 0x7202u32] {
+                let mut conn = SrtConnection::new_caller(srt_proto::ConnectionOptions {
+                    socket_id,
+                    ..Default::default()
+                });
+                conn.connect(Timestamp::default())
+                    .expect("caller starts its handshake");
+                owner
+                    .bench_caller_table_mut()
+                    .expect("caller side")
+                    .add_direct(crate::caller::CallerLeg {
+                        peer: "127.0.0.1:19993".parse().expect("addr"),
+                        connection: conn,
+                    })
+                    .expect("admitted");
+            }
+
+            let budget = OwnerServiceBudget::default();
+            let now = Timestamp::from_micros(10_000);
+            let report = owner.service(now, budget).await;
+            assert_eq!(report.tx_packets_submitted, 1, "one slot, one submission");
+            assert_eq!(
+                report.tx_class.total(),
+                report.tx_packets_submitted as u64,
+                "every submitted datagram must be counted in exactly one class"
+            );
+            assert_eq!(
+                report.tx_class.handshake, 1,
+                "the induction datagram is a handshake, not a generic packet"
+            );
+            assert_eq!(report.tx_class.data_first, 0);
+            assert_eq!(
+                owner.tx_class_totals().total(),
+                1,
+                "the cumulative total tracks the same submission"
+            );
+
+            // The observable pool snapshot reports the same peak the pool
+            // itself does, and the peak is bounded by capacity.
+            let snapshot = owner.tx_pool_snapshot();
+            assert_eq!(snapshot.capacity, 1);
+            assert_eq!(snapshot.high_water, 1);
+            assert!(snapshot.high_water <= snapshot.capacity);
+
+            wait_for_completion(&mut owner).await;
+            let report = owner.service(Timestamp::from_micros(20_000), budget).await;
+            assert_eq!(report.tx_packets_submitted, 1);
+            assert_eq!(
+                report.tx_class.total(),
+                report.tx_packets_submitted as u64,
+                "the invariant holds on a subsequent visit too"
+            );
+            assert_eq!(
+                report.tx_class.handshake, 1,
+                "a visit reports its own submissions, not the cumulative total"
+            );
+            assert_eq!(
+                owner.tx_class_totals().total(),
+                2,
+                "the cumulative total keeps counting across visits"
+            );
+        });
+    }
+
+    /// Item 8: the lateness rule at the submission boundary. Only a
+    /// first-transmission DATA datagram that carries a source due instant is
+    /// sampled; a retransmission, a control datagram, and a first
+    /// transmission without a due instant all record NOTHING -- not a zero.
+    #[test]
+    fn first_submit_lateness_samples_only_first_transmission_data_with_a_due_instant() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            let c_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+            let c_sock = compio::net::UdpSocket::from_std(c_std).expect("adopt");
+            // Five submissions are staged without reaping a completion, so the
+            // pool and the lane set must both be larger than five.
+            let mut owner = Owner::new(8).with_caller(OwnerCallerSide::new_single(c_sock));
+            let peer: SocketAddr = "127.0.0.1:19994".parse().expect("addr");
+            let now = Timestamp::from_micros(1_000_000);
+
+            {
+                let caller = owner.caller.as_ref().expect("caller side");
+                let mut sink = OwnerTxSink {
+                    sock: &caller.sock,
+                    tx_pool: &mut owner.tx_pool,
+                    tx_engine: &mut owner.tx_engine,
+                    operational: true,
+                    now,
+                };
+                // Not sampled: nothing had a deadline to miss.
+                push_test_class(
+                    &mut sink,
+                    peer,
+                    8,
+                    DatagramClass::DataRetransmit,
+                    Some(999_000),
+                    |buf| {
+                        buf[..8].copy_from_slice(b"retx-pkt");
+                        Ok(8)
+                    },
+                )
+                .expect("retransmission is admitted")
+                .expect("capacity");
+                push_test_class(&mut sink, peer, 4, DatagramClass::Ack, None, |_buf| Ok(4))
+                    .expect("control is admitted")
+                    .expect("capacity");
+                push_test_class(&mut sink, peer, 4, DatagramClass::DataFirst, None, |_buf| {
+                    Ok(4)
+                })
+                .expect("a due-less first transmission is admitted")
+                .expect("capacity");
+
+                // Sampled: a first transmission submitted 130 us after the
+                // source asked for it, then one far beyond the finite range.
+                push_test_class(
+                    &mut sink,
+                    peer,
+                    4,
+                    DatagramClass::DataFirst,
+                    Some(999_870),
+                    |_buf| Ok(4),
+                )
+                .expect("admitted")
+                .expect("capacity");
+                push_test_class(
+                    &mut sink,
+                    peer,
+                    4,
+                    DatagramClass::DataFirst,
+                    Some(0),
+                    |_buf| Ok(4),
+                )
+                .expect("admitted")
+                .expect("capacity");
+            }
+
+            assert_eq!(owner.tx_class_totals().total(), 5);
+
+            let lateness = owner.take_first_submit_lateness();
+            assert_eq!(
+                lateness.samples(),
+                2,
+                "only the two first transmissions with a source due instant are sampled"
+            );
+            // 130 us lands in the second finite bucket [100, 200), so the
+            // reported upper bound is 200 -- a bucket bound, never an exact
+            // quantile.
+            assert_eq!(lateness.percentile_us(0.5), 200);
+            assert_eq!(
+                lateness.max_us(),
+                1_000_000,
+                "the overflow sample is reported as its observed value, not a bound"
+            );
+            assert_eq!(
+                lateness.percentile_us(1.0),
+                lateness.max_us(),
+                "a percentile landing in the overflow bucket reports max_us"
+            );
+
+            // Reset-on-read: the window is consumed by the take.
+            let empty = owner.take_first_submit_lateness();
+            assert_eq!(empty.samples(), 0);
+            assert_eq!(empty.percentile_us(0.99), 0);
+
+            // A window whose worst sample is finite still reports it: `max_us`
+            // is the observed maximum over every sample, not the overflow tail's
+            // largest value.
+            {
+                let caller = owner.caller.as_ref().expect("caller side");
+                let mut sink = OwnerTxSink {
+                    sock: &caller.sock,
+                    tx_pool: &mut owner.tx_pool,
+                    tx_engine: &mut owner.tx_engine,
+                    operational: true,
+                    now,
+                };
+                push_test_class(
+                    &mut sink,
+                    peer,
+                    4,
+                    DatagramClass::DataFirst,
+                    Some(999_750),
+                    |_buf| Ok(4),
+                )
+                .expect("admitted")
+                .expect("capacity");
+            }
+            let finite = owner.take_first_submit_lateness();
+            assert_eq!(finite.samples(), 1);
+            assert_eq!(
+                finite.max_us(),
+                250,
+                "a finite maximum must be reported as the observed value"
+            );
+            assert_eq!(finite.percentile_us(0.5), 300);
+        });
+    }
+
+    /// Item 8 through the real path: a payload the application admitted is
+    /// measured at the visit that submits it, and the handshake traffic around
+    /// it contributes no sample at all.
+    #[test]
+    fn first_submit_lateness_measures_a_real_application_submission() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            let l_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind listener std");
+            let l_addr = l_std.local_addr().expect("listener addr");
+            let l_sock = compio::net::UdpSocket::from_std(l_std).expect("compio adopt listener");
+            let c_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind caller std");
+            let c_sock = compio::net::UdpSocket::from_std(c_std).expect("compio adopt caller");
+
+            let l_cfg = crate::ListenerConfig::builder(l_addr)
+                .build()
+                .expect("listener config");
+            let mut owner = Owner::new(16)
+                .with_listener(ListenerSide::new(l_sock, &l_cfg).expect("listener side"))
+                .with_caller(OwnerCallerSide::new_single(c_sock));
+
+            let mut conn = SrtConnection::new_caller(srt_proto::ConnectionOptions {
+                socket_id: 0x7301,
+                tsbpd_delay: 0,
+                ..Default::default()
+            });
+            let mut now = Timestamp::from_micros(1_000);
+            conn.connect(now).expect("caller connect");
+            let id = owner
+                .caller
+                .as_mut()
+                .expect("caller side")
+                .pool
+                .table_mut()
+                .add_direct(crate::caller::CallerLeg {
+                    peer: l_addr,
+                    connection: conn,
+                })
+                .expect("add caller direct");
+
+            let budget = OwnerServiceBudget::default();
+            for round in 0..60 {
+                now = Timestamp::from_micros(10_000 + round * 5_000);
+                owner.service(now, budget).await;
+                owner
+                    .wait_for_activity(std::time::Duration::from_millis(1))
+                    .await;
+                if owner.logical_caller(&id).and_then(|c| c.state())
+                    == Some(crate::caller::LogicalCallerState::Connected)
+                {
+                    break;
+                }
+            }
+            assert_eq!(
+                owner.logical_caller(&id).and_then(|c| c.state()),
+                Some(crate::caller::LogicalCallerState::Connected),
+                "the handshake must complete before the payload is admitted"
+            );
+            assert_eq!(
+                owner.tx_class_totals().data_first,
+                0,
+                "no application payload has been submitted yet"
+            );
+            assert_eq!(
+                owner.take_first_submit_lateness().samples(),
+                0,
+                "handshake and control traffic must contribute no lateness sample"
+            );
+
+            // Admit a payload, then submit it at a known later instant.
+            let admitted_at = Timestamp::from_micros(1_000_000);
+            owner
+                .logical_caller_mut(&id)
+                .expect("caller session")
+                .send_shared(Bytes::from_static(b"first-submit-lateness"), admitted_at)
+                .expect("send succeeds");
+
+            let mut submitted_at = None;
+            for round in 0..30 {
+                let visit = Timestamp::from_micros(1_010_000 + round * 1_000);
+                let report = owner.service(visit, budget).await;
+                if report.tx_class.data_first > 0 {
+                    assert_eq!(
+                        report.tx_class.data_first, 1,
+                        "one admitted payload is one first transmission"
+                    );
+                    submitted_at = Some(visit);
+                    break;
+                }
+                owner
+                    .wait_for_activity(std::time::Duration::from_millis(1))
+                    .await;
+            }
+            let submitted_at = submitted_at.expect("the admitted payload must be submitted");
+
+            // Lateness is measured from the admission instant to the visit
+            // that submitted it, at 100 us resolution.
+            let expected = submitted_at.as_micros() - admitted_at.as_micros();
+            let lateness = owner.take_first_submit_lateness();
+            assert_eq!(
+                lateness.samples(),
+                1,
+                "exactly the first transmission is sampled"
+            );
+            let reported = lateness.percentile_us(1.0);
+            assert!(
+                reported >= expected && reported <= expected + FIRST_SUBMIT_LATENESS_BUCKET_US,
+                "the reported lateness {reported} must be the bucket bound covering the \
+                 observed {expected} us at {FIRST_SUBMIT_LATENESS_BUCKET_US} us resolution"
+            );
+            assert_eq!(
+                owner.tx_class_totals().data_first,
+                1,
+                "the cumulative class total sees the same submission"
+            );
         });
     }
 
@@ -5847,6 +6807,7 @@ mod tests {
                 tx_pool: &mut owner.tx_pool,
                 tx_engine: &mut owner.tx_engine,
                 operational,
+                now: Timestamp::default(),
             };
             let res = push_test(&mut sink, peer, 20, |buf| {
                 buf[..20].fill(0x11);
@@ -6016,6 +6977,7 @@ mod tests {
                     tx_pool: &mut owner.tx_pool,
                     tx_engine: &mut owner.tx_engine,
                     operational: true,
+                    now: Timestamp::default(),
                 };
                 let _ = push_test(&mut sink, peer, 20, |buf| {
                     buf[..20].fill(0x77);
@@ -6040,6 +7002,7 @@ mod tests {
                 tx_pool: &mut owner.tx_pool,
                 tx_engine: &mut owner.tx_engine,
                 operational: true,
+                now: Timestamp::default(),
             };
             let res = push_test(&mut sink, peer, 20, |buf| {
                 buf[..20].fill(0x78);
@@ -6073,6 +7036,122 @@ mod tests {
             assert_eq!(report.actions, 0, "zero budget must perform zero actions");
             assert_eq!(report.tx_packets_submitted, 0);
             assert_eq!(report.completions_reaped, 0);
+        });
+    }
+
+    /// Item 12: a dead fixed TX lane must poison the Owner, not quietly halve
+    /// its submission capacity.
+    ///
+    /// A lane that panicked is invisible from the outside: the engine still
+    /// holds its slot, the pool still has capacity, and every remaining lane
+    /// keeps working. That is precisely why it has to be a fault. The sequence
+    /// asserted here is the whole containment contract: detected, latched,
+    /// admission and submission refused, already-submitted work still reapable,
+    /// every slot returned, shutdown bounded, and no silent continuation on
+    /// K-1 lanes.
+    #[test]
+    fn a_dead_tx_lane_poisons_the_owner_and_cannot_continue_at_reduced_capacity() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            let c_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+            let c_sock = compio::net::UdpSocket::from_std(c_std).expect("adopt");
+            // Four lanes; three admitted callers, each with a handshake
+            // datagram queued, so there is real submission work to refuse.
+            let mut owner = Owner::new(4).with_caller(OwnerCallerSide::new_single(c_sock));
+            for socket_id in [0x7301u32, 0x7302u32, 0x7303u32] {
+                let mut conn = SrtConnection::new_caller(srt_proto::ConnectionOptions {
+                    socket_id,
+                    ..Default::default()
+                });
+                conn.connect(Timestamp::default())
+                    .expect("caller starts its handshake");
+                owner
+                    .bench_caller_table_mut()
+                    .expect("caller side")
+                    .add_direct(crate::caller::CallerLeg {
+                        peer: "127.0.0.1:19992".parse().expect("addr"),
+                        connection: conn,
+                    })
+                    .expect("admitted");
+            }
+
+            // Exactly one datagram submitted, so the other two stay queued and
+            // the post-fault visits have real work to refuse.
+            let budget = OwnerServiceBudget::default();
+            let one_packet = OwnerServiceBudget {
+                max_tx_packets: 1,
+                ..OwnerServiceBudget::default()
+            };
+            let first = owner
+                .service(Timestamp::from_micros(10_000), one_packet)
+                .await;
+            assert_eq!(first.tx_packets_submitted, 1);
+            let submissions_before = owner.tx_class_totals().total();
+            assert_eq!(submissions_before, 1);
+            assert!(owner.is_operational(), "one in-flight send is not a fault");
+            assert!(
+                owner.has_pending_work(Timestamp::from_micros(10_000)),
+                "the other two handshakes are still queued"
+            );
+
+            // Kill a lane that holds no job, so what is detected is the worker
+            // set being incomplete rather than a stuck job.
+            owner.tx_engine.kill_lane_worker_for_test(3);
+            // Let the runtime actually finish that task.
+            compio::time::sleep(std::time::Duration::from_millis(2)).await;
+
+            let report = owner.service(Timestamp::from_micros(20_000), budget).await;
+            assert_eq!(
+                report.completions_reaped, 1,
+                "the already-submitted datagram must still be reaped"
+            );
+            assert!(matches!(
+                owner.fault(),
+                Some(OwnerFault::WorkerPanicked { lane: 3 })
+            ));
+            assert!(!owner.is_operational());
+
+            // Submission is refused: the two remaining handshake datagrams stay
+            // queued and the cumulative submission counter cannot move. This is
+            // the "never continue on K-1" property in its observable form.
+            for _ in 0..8 {
+                let report = owner.service(Timestamp::from_micros(30_000), budget).await;
+                assert_eq!(report.tx_packets_submitted, 0);
+                assert_eq!(report.tx_class.total(), 0);
+                assert_eq!(owner.tx_class_totals().total(), submissions_before);
+            }
+            assert!(
+                owner.has_pending_work(Timestamp::from_micros(30_000)),
+                "refused work stays visible and queued; a fault must not drop it"
+            );
+
+            // New admission is refused through the public API.
+            let config = crate::CallerConfig::builder("127.0.0.1:9".parse().expect("address"))
+                .ownership(crate::SocketOwnership::Shared)
+                .build()
+                .expect("caller config");
+            let error = owner
+                .connect(&config, Timestamp::from_micros(30_000))
+                .expect_err("a faulted owner must refuse new admission");
+            assert!(error.to_string().contains("not operational"), "{error}");
+
+            // Every slot the pool handed out comes back, and shutdown stays
+            // bounded rather than waiting on a worker that no longer exists.
+            assert_eq!(owner.tx_in_flight(), 0, "nothing is left in flight");
+            assert_eq!(
+                owner.tx_pool().free_count(),
+                owner.tx_pool().capacity(),
+                "no TX slot may leak when a lane dies"
+            );
+            let drained = owner
+                .shutdown_and_drain(std::time::Duration::from_millis(500))
+                .await;
+            assert!(drained, "teardown reaches quiescence without the dead lane");
+            assert_eq!(
+                owner.tx_pool().free_count(),
+                owner.tx_pool().capacity(),
+                "teardown returns every slot too"
+            );
         });
     }
 
@@ -6533,6 +7612,7 @@ mod tests {
                     tx_pool: &mut owner.tx_pool,
                     tx_engine: &mut owner.tx_engine,
                     operational: true,
+                    now: Timestamp::default(),
                 };
                 let res = push_test(&mut sink, d_addr, 10, |buf| {
                     buf[..10].copy_from_slice(b"0123456789");
@@ -6600,6 +7680,7 @@ mod tests {
                     tx_pool: &mut owner.tx_pool,
                     tx_engine: &mut owner.tx_engine,
                     operational: true,
+                    now: Timestamp::default(),
                 };
                 assert!(matches!(
                     push_test(&mut sink, d_addr, 4, |buf| {
@@ -6996,6 +8077,226 @@ mod tests {
             );
             assert!(stats.listener.is_none());
         });
+    }
+
+    /// Move every protocol output from one endpoint into the other, applying
+    /// timer actions to the sender's own store -- the native runtime's loop in
+    /// miniature, with no sockets and no scheduling.
+    fn pump_outputs(
+        from: &mut SrtConnection,
+        timers: &mut crate::ManualTimerStore,
+        to: &mut SrtConnection,
+        now: Timestamp,
+    ) {
+        while let Some(output) = from.poll_output().expect("materializes") {
+            timers.apply_output(&output, now);
+            if let ConnectionOutput::SendPacket(bytes) = output {
+                let _ = to.feed_recv_buf(&bytes, now);
+            }
+        }
+    }
+
+    /// Complete an in-process caller/listener handshake and return the
+    /// connected caller plus one DATA datagram the listener addressed to it.
+    ///
+    /// The returned datagram is a copy of a packet the caller has already
+    /// accepted, so feeding it back is exactly the duplicate the SRT receiver
+    /// must count. No sockets and no Owner are involved: the caller connection
+    /// this returns is the one later handed to the Owner's caller table.
+    fn connected_caller_and_a_duplicate_data_datagram(
+        caller_socket_id: u32,
+    ) -> (SrtConnection, Vec<u8>) {
+        use srt_proto::wire::SrtPacket;
+        const TICK_MICROS: u64 = 10_000;
+
+        let mut caller = SrtConnection::new_caller(srt_proto::ConnectionOptions {
+            socket_id: caller_socket_id,
+            tsbpd_delay: 0,
+            ..srt_proto::ConnectionOptions::default()
+        });
+        let mut listener = SrtConnection::new_listener(srt_proto::ConnectionOptions {
+            socket_id: 0x2A02,
+            tsbpd_delay: 0,
+            ..srt_proto::ConnectionOptions::default()
+        });
+        let mut caller_timers = crate::ManualTimerStore::new();
+        let mut listener_timers = crate::ManualTimerStore::new();
+
+        caller
+            .connect(Timestamp::from_micros(0))
+            .expect("caller starts its handshake");
+        let mut now = Timestamp::from_micros(0);
+        for _ in 0..40 {
+            now = Timestamp::from_micros(now.as_micros() + TICK_MICROS);
+            caller_timers.fire_expired(now, &mut caller);
+            listener_timers.fire_expired(now, &mut listener);
+            pump_outputs(&mut caller, &mut caller_timers, &mut listener, now);
+            pump_outputs(&mut listener, &mut listener_timers, &mut caller, now);
+            if caller.state() == srt_proto::ConnectionState::Connected
+                && listener.state() == srt_proto::ConnectionState::Connected
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            caller.state(),
+            srt_proto::ConnectionState::Connected,
+            "the caller must connect before its receiver has anything to report"
+        );
+        assert_eq!(listener.state(), srt_proto::ConnectionState::Connected);
+
+        listener
+            .send(b"owner-rx-session-totals", now)
+            .expect("the listener admits the payload");
+        let mut duplicated = None;
+        while let Some(output) = listener.poll_output().expect("materializes") {
+            listener_timers.apply_output(&output, now);
+            let ConnectionOutput::SendPacket(bytes) = output else {
+                continue;
+            };
+            if matches!(SrtPacket::decode(&bytes), Ok(SrtPacket::Data(_))) {
+                duplicated = Some(bytes.to_vec());
+            }
+            caller
+                .feed_recv_buf(&bytes, now)
+                .expect("the caller accepts the first copy");
+        }
+        (
+            caller,
+            duplicated.expect("the payload produced exactly one DATA datagram"),
+        )
+    }
+
+    /// A connected caller whose receiver has already counted exactly one
+    /// deliberate duplicate, so every aggregate above it must report one too.
+    fn caller_with_one_counted_duplicate(caller_socket_id: u32) -> SrtConnection {
+        let (mut caller, duplicate) =
+            connected_caller_and_a_duplicate_data_datagram(caller_socket_id);
+        let accepted = caller
+            .receiver_stats()
+            .expect("connected receiver")
+            .total_received;
+        caller
+            .feed_recv_buf(&duplicate, Timestamp::from_micros(1_000_000))
+            .expect("the duplicate is absorbed, not rejected");
+        let stats = caller.receiver_stats().expect("connected receiver");
+        assert_eq!(
+            stats.total_received, accepted,
+            "the duplicate must not be accepted as new data"
+        );
+        assert_eq!(
+            stats.total_duplicates, 1,
+            "the leg's own receiver has to show the duplicate, or a test built \
+             on it proves nothing"
+        );
+        caller
+    }
+
+    /// Item 10: the Owner exposes the SRT-level receive totals of its
+    /// sessions, and a retired session's totals survive its retirement instead
+    /// of vanishing with the connection the application took back.
+    #[test]
+    fn rx_session_totals_report_live_sessions_and_survive_retirement() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            let c_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+            let c_sock = compio::net::UdpSocket::from_std(c_std).expect("adopt");
+            let mut owner = Owner::new(4).with_caller(OwnerCallerSide::new_single(c_sock));
+
+            let id = owner
+                .bench_caller_table_mut()
+                .expect("caller side")
+                .add_direct(crate::caller::CallerLeg {
+                    peer: "127.0.0.1:19989".parse().expect("addr"),
+                    connection: caller_with_one_counted_duplicate(0x2A01),
+                })
+                .expect("admitted");
+
+            let live = owner.rx_session_totals();
+            assert_eq!(
+                live.caller,
+                Some(RcvTotals {
+                    lost: 0,
+                    duplicates: 1,
+                }),
+                "a live session's protocol totals must be visible through the Owner"
+            );
+            assert!(
+                live.listener.is_none(),
+                "no listener socket is attached to this Owner"
+            );
+
+            let removed = owner.remove_caller(id).expect("retire the session");
+            drop(removed);
+            let after = owner.rx_session_totals();
+            assert_eq!(
+                after.caller, live.caller,
+                "retiring a session must not erase the totals it contributed"
+            );
+        });
+    }
+
+    /// The live-session walk covers every member of a bonded group, not just
+    /// direct sessions.
+    #[test]
+    fn rx_session_totals_include_bonded_group_legs() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            let c_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+            let c_sock = compio::net::UdpSocket::from_std(c_std).expect("adopt");
+            let mut owner = Owner::new(4).with_caller(OwnerCallerSide::new_single(c_sock));
+
+            let id = owner
+                .bench_caller_table_mut()
+                .expect("caller side")
+                .add_group(
+                    srt_proto::handshake::SRTGROUP_MASK | 7,
+                    srt_proto::GroupMode::Broadcast,
+                    [
+                        crate::caller::CallerGroupLeg::new(
+                            1,
+                            1,
+                            "127.0.0.1:19987".parse().expect("addr"),
+                            caller_with_one_counted_duplicate(0x2B01),
+                        ),
+                        crate::caller::CallerGroupLeg::new(
+                            2,
+                            1,
+                            "127.0.0.1:19988".parse().expect("addr"),
+                            caller_with_one_counted_duplicate(0x2B02),
+                        ),
+                    ],
+                )
+                .expect("group admitted");
+
+            let live = owner.rx_session_totals();
+            assert_eq!(
+                live.caller,
+                Some(RcvTotals {
+                    lost: 0,
+                    duplicates: 2,
+                }),
+                "every group member's receiver totals must be counted"
+            );
+
+            drop(owner.remove_caller(id).expect("retire the group"));
+            assert_eq!(
+                owner.rx_session_totals().caller,
+                live.caller,
+                "retiring the group must keep the totals its legs contributed"
+            );
+        });
+    }
+
+    /// The no-side case is the Owner a bare shard starts as: both sides report
+    /// absence rather than a fabricated zero total.
+    #[test]
+    fn rx_session_totals_are_none_without_an_attached_side() {
+        let owner = Owner::new(2);
+        let totals = owner.rx_session_totals();
+        assert_eq!(totals, OwnerRxSessionTotals::default());
+        assert!(totals.listener.is_none());
+        assert!(totals.caller.is_none());
     }
 
     /// Item 3: a structural TX completion failure is discovered by the reaping

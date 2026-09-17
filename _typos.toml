@@ -7,3 +7,5 @@ extend-ignore-re = [
 crate = "crate"
 AIMD = "AIMD"
 overrideable = "overrideable"
+# Sender retransmission timeout: standard SRT/TCP terminology, not a typo of "to".
+rto = "rto"

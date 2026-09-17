@@ -16,12 +16,27 @@
 //! acquire -> Ok(Some(slot))    : final transport capacity is now reserved
 //! slot.bytes_mut()             : the only way to fill the reserved storage
 //! SrtConnection::poll_output_into(bytes) -> Ok : protocol output consumed exactly once
-//! slot.commit(len)             : infallible ownership transfer
+//! slot.commit(len, class, source_due_micros)   : infallible ownership transfer
 //! ```
 //!
 //! There is no post-materialization `Err` and no post-materialization
 //! `Exhausted`: every fallible capacity/reservation decision happens in
 //! [`DatagramSink::acquire`], before the protocol is touched.
+//!
+//! # Why `commit` carries the datagram's identity
+//!
+//! `commit` is simultaneously the point of no return and the submission
+//! boundary: it is the last transport-owned instant at which a datagram is
+//! still a value with provenance rather than bytes queued in a lane. The
+//! protocol already knows what each queued datagram *is* (`DatagramClass`)
+//! and, for a first transmission, when its own schedule wanted it
+//! (`source_due_micros`); [`SrtConnection::poll_output_into`] reports both.
+//! Passing them through `commit` is what lets a runtime account for
+//! submission by category and measure first-transmission submit lateness
+//! without parsing wire bytes it has no business interpreting, and without a
+//! second metadata channel that could drift out of step with the bytes.
+//!
+//! [`SrtConnection::poll_output_into`]: srt_proto::SrtConnection::poll_output_into
 
 use std::net::SocketAddr;
 
@@ -194,7 +209,15 @@ pub trait DatagramSlot {
     /// Transfer ownership of the materialized datagram. Infallible by
     /// construction: this is the point of no return, not a second validation
     /// step.
-    fn commit(self, len: usize);
+    ///
+    /// It is also the submission boundary, so it is where the datagram's
+    /// identity enters transport accounting: `class` is what the datagram
+    /// carries, and `source_due_micros` is the source's own due instant for a
+    /// first transmission (`None` for retransmissions and control datagrams).
+    /// A slot that keeps no accounting for them still receives them, because
+    /// dropping them here would put a second, silently lossy metadata path
+    /// next to the bytes.
+    fn commit(self, len: usize, class: srt_proto::DatagramClass, source_due_micros: Option<u64>);
 }
 
 /// A transport-layer destination-aware final-storage sink for outgoing datagrams.
@@ -269,7 +292,9 @@ impl DatagramSlot for VecSlot<'_> {
         &mut self.buf
     }
 
-    fn commit(self, len: usize) {
+    fn commit(self, len: usize, _class: srt_proto::DatagramClass, _source_due_micros: Option<u64>) {
+        // Compatibility sink: the caller owns the datagrams and no accounting
+        // exists on this path, so the identity is received and not retained.
         let mut buf = self.buf;
         buf.truncate(len);
         self.out.push((self.peer, buf));
@@ -298,7 +323,12 @@ mod tests {
             &mut self.buf
         }
 
-        fn commit(self, len: usize) {
+        fn commit(
+            self,
+            len: usize,
+            _class: srt_proto::DatagramClass,
+            _source_due_micros: Option<u64>,
+        ) {
             let mut buf = self.buf;
             buf.truncate(len);
             self.sink.pushed.push((self.peer, buf));
@@ -357,7 +387,7 @@ mod tests {
 
         let mut slot = sink.acquire(peer, 4).unwrap().expect("capacity available");
         slot.bytes_mut()[..4].copy_from_slice(b"test");
-        slot.commit(4);
+        slot.commit(4, srt_proto::DatagramClass::DataFirst, None);
         assert_eq!(sink.pushed.len(), 1);
 
         assert!(
