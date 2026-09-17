@@ -105,13 +105,19 @@ fn delivery_failures(fields: &BTreeMap<String, String>) -> Vec<String> {
     // identity strict instead of leaving the reader to subtract them by hand --
     // and a canonical run with the fence enabled is exactly the run this gate is
     // for.
-    let fence = number(fields, "fence_accepted").unwrap_or(0.0);
+    // The receiver's own count of fence payloads, not the sender's: the identity
+    // being checked is what the receiver accounted for, and using the sender's
+    // number would silently assume the fence itself was lossless -- which is a
+    // diagnostic fact, not a workload one, and is reported separately.
+    let fence = number(fields, "rx_diag_fences_seen")
+        .or_else(|_| number(fields, "fence_accepted"))
+        .unwrap_or(0.0);
     match (
         number(fields, "data_accepted"),
         number(fields, "rx_core_total"),
     ) {
         (Ok(accepted), Ok(received)) if accepted + fence != received => vec![format!(
-            "data_accepted {accepted:.0} + fence_accepted {fence:.0} != rx_core_total \
+            "data_accepted {accepted:.0} + fence seen {fence:.0} != rx_core_total \
              {received:.0} ({} % of accepted delivered, fence excluded)",
             100.0 * (received - fence) / accepted.max(1.0)
         )],
