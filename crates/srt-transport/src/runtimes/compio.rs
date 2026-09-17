@@ -2697,6 +2697,19 @@ pub const FIRST_SUBMIT_LATENESS_BUCKETS: usize = 100;
 
 /// Fixed-size histogram of first-transmission submit lateness.
 ///
+/// One sample is (the instant a first-transmission DATA datagram is handed to a
+/// TX lane) minus (the source's declared deadline for that payload), so it spans
+/// the whole path from the media schedule to the wire: the source's own lateness
+/// in offering the tick, admission, drain, pacing, TX pool/lane reservation, and
+/// the queueing until handoff.
+///
+/// Two consequences, both deliberate and both worth stating where the number is
+/// read: a source that is itself late appears here (as it does in a harness's
+/// `offer_lateness`, of which this is the superset -- the difference between the
+/// two is the transport's own delay), and a payload submitted on time reports 0.
+/// Kernel and asynchronous completion latency are outside the measurement, so
+/// this is not an end-to-end latency figure and must not be presented as one.
+///
 /// "Lateness" is measured at the point the datagram is handed to a fixed TX
 /// lane: after admission, drain, pacing and pool/lane reservation, and before
 /// the kernel/async completion. It is therefore explicitly NOT a

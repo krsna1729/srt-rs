@@ -97,13 +97,23 @@ fn cadence_failures(fields: &BTreeMap<String, String>, tolerance: f64) -> Vec<St
 
 /// Accepted is not delivered.
 fn delivery_failures(fields: &BTreeMap<String, String>) -> Vec<String> {
+    // The terminal fence offers extra payloads AFTER the measured window, and
+    // the receiver counts them: `rx_core_total` therefore contains
+    // `fence_accepted` payloads that are not part of the measured workload (the
+    // harness excludes them from `data_accepted`, `data_offered` and every rate,
+    // and they are a different size and pattern). Naming them here keeps the
+    // identity strict instead of leaving the reader to subtract them by hand --
+    // and a canonical run with the fence enabled is exactly the run this gate is
+    // for.
+    let fence = number(fields, "fence_accepted").unwrap_or(0.0);
     match (
         number(fields, "data_accepted"),
         number(fields, "rx_core_total"),
     ) {
-        (Ok(accepted), Ok(received)) if accepted != received => vec![format!(
-            "data_accepted {accepted:.0} != rx_core_total {received:.0} ({} % delivered)",
-            100.0 * received / accepted.max(1.0)
+        (Ok(accepted), Ok(received)) if accepted + fence != received => vec![format!(
+            "data_accepted {accepted:.0} + fence_accepted {fence:.0} != rx_core_total \
+             {received:.0} ({} % of accepted delivered, fence excluded)",
+            100.0 * (received - fence) / accepted.max(1.0)
         )],
         (Err(e), _) | (_, Err(e)) => vec![e],
         _ => Vec::new(),
