@@ -270,6 +270,14 @@ dataplane.
 
 ## Result: the post-fix canonical run
 
+**Scope: this qualifies the RawReadiness receive path on this host.** Every row of
+both sweeps records `rx_mode=Some(RawReadiness)` and `managed_rx=false` -- the
+readiness reader, not the managed multishot consumer. The result below therefore
+says nothing about `ManagedMultishot` on a substrate that can register a
+provided-buffer ring; such a host needs its own sweep. The field is printed on
+every row for exactly this reason, and a capacity number is only transferable
+together with the RX path it was measured on.
+
 Two independent clean-tree sweeps of the frozen configuration and thresholds,
 `git_sha=5c7a0c3 git_dirty=false` for both. Neither is a rerun-until-green: the
 second was taken because the first showed a *source* stall, and reporting both is
@@ -309,10 +317,14 @@ What each criterion actually showed:
   receiver accounts for every payload the sender accepted, in every repetition of
   both sweeps. This is the defect the recovery change fixed, and it is the one
   claim this page was written to be able to make.
-* **No unresolved loss anywhere**: `sec_a = 0` in all six rows, and
-  `diag_duplicate_payloads = 0` (no payload was ever delivered twice). Two rows
-  retransmitted (50 and 3 packets) and the receiver counted those as duplicate
-  *packets*; recovery worked and conservation was unaffected.
+* **No unresolved loss anywhere, and duplicates are accounted**: `sec_a = 0` in
+  all six rows, and `diag_duplicate_payloads = 0` (no payload was ever delivered
+  twice). Four rows have zero duplicates; the two that do not (A2: `data_retx=50`,
+  `sec_b=50`; A3: `data_retx=3`, `sec_b=3`) equal their retransmission probes
+  exactly, so they are recovery traffic the receiver saw twice *at packet level*,
+  not unexplained duplicate delivery. The executable gate requires `sec_a == 0`;
+  it does not require `sec_b == 0`, because a duplicate packet is what a
+  successful repair looks like from the receiver's side.
 * **Stationarity holds at ~0.35 %** against the declared 1 %, i.e. ~10 K of
   2.8 M datagrams. That figure now *includes* a deliberate ARQ settle window after
   the source stops (see below), so it is not comparable with the pre-fix rows'

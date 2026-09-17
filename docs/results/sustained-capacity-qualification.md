@@ -379,12 +379,15 @@ replaces this statement. Its result, on a clean tree at `5c7a0c3`:
 ```text
 F=50, R=8 Mbps/dest, K=256, 3 x 60 s, two independent sweeps:
   sweep B   3 of 3 rows QUALIFIED (xtask qualify: cadence, conservation,
-            stationarity, submission partition, fence, fault state, RX)
+            stationarity, submission partition, fence, fault state,
+            RX loss = 0; duplicates accounted)
   sweep A   2 of 3: one repetition's SOURCE missed 68 of 45 592 boundaries
             (cadence 0.998509 against the declared 0.999)
 
 every row, both sweeps: conservation exact, sec_a = 0, no duplicates delivered,
-f_drain ~0.35 %, drain_ok, pending_after_drain = 0, no send failures, no fault
+f_drain ~0.35 %, drain_ok, pending_after_drain = 0, no send failures, no fault,
+rx_mode = RawReadiness (managed_rx = false) -- so this qualifies the
+readiness RX path on this host, not ManagedMultishot on a ring-capable substrate
 ```
 
 The K=64/256/512 lines above are the pre-fix surface and their conservation
