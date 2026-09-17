@@ -244,12 +244,61 @@ fn receiver_binary(root: &Path) -> Result<PathBuf, String> {
     }
 }
 
-/// Wait for a child to exit, erroring on a nonzero status.
-fn reap(child: &mut Child) -> Result<(), String> {
-    match child.wait() {
-        Ok(status) if status.success() => Ok(()),
-        Ok(status) => Err(format!("exited with {status}")),
-        Err(e) => Err(format!("wait failed: {e}")),
+/// Owns every child a rep spawns.
+///
+/// Failing fast is only safe if it also cleans up: dropping a
+/// `std::process::Child` leaves the process running, so a failed sweep used to
+/// leave receivers holding UDP ports and senders burning CPU into the next
+/// experiment. This guard kills and reaps whatever is still alive on any exit
+/// path, including the early `return Err` ones.
+struct Children {
+    receivers: Vec<Child>,
+    senders: Vec<(u16, Child)>,
+}
+
+impl Children {
+    fn wait_for_senders(&mut self) -> Result<(), String> {
+        for (port, sender) in self.senders.iter_mut() {
+            match sender.wait() {
+                Ok(status) if status.success() => {}
+                Ok(status) => {
+                    return Err(format!("sender shard on port {port} exited with {status}"));
+                }
+                Err(e) => return Err(format!("sender shard on port {port}: wait failed: {e}")),
+            }
+        }
+        Ok(())
+    }
+
+    fn stop_receivers(&mut self) -> Result<(), String> {
+        for (shard, receiver) in self.receivers.iter_mut().enumerate() {
+            match receiver.try_wait() {
+                Ok(Some(status)) if !status.success() => {
+                    return Err(format!("receiver for shard {shard} exited with {status}"));
+                }
+                // Still running is expected: the receiver's own deadline is
+                // longer than the window plus drain.
+                Ok(None) => {
+                    let _ = receiver.kill();
+                    let _ = receiver.wait();
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Children {
+    fn drop(&mut self) {
+        for (_, sender) in self.senders.iter_mut() {
+            let _ = sender.kill();
+            let _ = sender.wait();
+        }
+        for receiver in self.receivers.iter_mut() {
+            let _ = receiver.kill();
+            let _ = receiver.wait();
+        }
     }
 }
 
@@ -360,43 +409,16 @@ fn run_rep(
     let work = std::env::temp_dir().join(format!("scaling-sweep-{}-{rep}", std::process::id()));
     fs::create_dir_all(&work).map_err(|e| format!("{}: {e}", work.display()))?;
 
-    let mut receivers = spawn_receivers(harness, &work, rep_base, fanout, options)?;
-    sleep(Duration::from_secs(1));
-    let mut senders = spawn_senders(harness, &work, rep_base, fanout, options)?;
+    let mut children = Children {
+        receivers: spawn_receivers(harness, &work, rep_base, fanout, options)?,
+        senders: spawn_senders(harness, &work, rep_base, fanout, options)?,
+    };
 
-    // Wait for the shards, then give receivers time to read the post-window
-    // drain before stopping them.
-    //
-    // A failed shard is an experiment failure, not a row: an evidence-producing
-    // command that records a zeroed or half-populated row for a run that did
-    // not happen is worse than one that stops, because the row outlives the
-    // failure. Logs stay on disk and are named in the error.
-    for (port, sender) in senders.iter_mut() {
-        if let Err(e) = reap(sender) {
-            return Err(keep_logs(
-                &work,
-                format!("sender shard on port {port}: {e}"),
-            ));
-        }
-    }
+    children
+        .wait_for_senders()
+        .map_err(|e| keep_logs(&work, e))?;
     sleep(Duration::from_secs(12));
-    for (shard, receiver) in receivers.iter_mut().enumerate() {
-        match receiver.try_wait() {
-            Ok(Some(status)) if !status.success() => {
-                return Err(keep_logs(
-                    &work,
-                    format!("receiver for shard {shard} exited with {status}"),
-                ));
-            }
-            // Still running is the expected case: the receiver's own deadline
-            // is longer than the window plus drain.
-            Ok(None) => {
-                let _ = receiver.kill();
-                let _ = receiver.wait();
-            }
-            _ => {}
-        }
-    }
+    children.stop_receivers().map_err(|e| keep_logs(&work, e))?;
 
     let mut rows = Vec::with_capacity(options.shards);
     for shard in 0..options.shards {
@@ -509,13 +531,55 @@ fn read_shard_row(work: &Path, shard: usize, rep: usize) -> Result<Vec<String>, 
             format!("shard {shard} rep {rep}: no STATS line from the receiver"),
         ));
     }
+    // Presence is not validity: a stale `cpu_ms=0.0` passes a `contains_key`
+    // check, and that exact bug shipped once already. Each CPU field must parse
+    // as a finite number, the two measured intervals must be positive, and the
+    // whole-run figure must cover them (it spans window + drain plus the
+    // bookkeeping between, so it can only be larger).
+    let mut cpus = BTreeMap::new();
     for key in ["cpu_ms", "window_cpu_ms", "drain_cpu_ms"] {
-        if !tx_fields.contains_key(key) {
-            return Err(keep_logs(
+        let raw = tx_fields.get(key).ok_or_else(|| {
+            keep_logs(
                 work,
                 format!("shard {shard} rep {rep}: sender record is missing {key}"),
+            )
+        })?;
+        let value: f64 = raw.parse().map_err(|_| {
+            keep_logs(
+                work,
+                format!("shard {shard} rep {rep}: {key}={raw:?} does not parse"),
+            )
+        })?;
+        if !value.is_finite() {
+            return Err(keep_logs(
+                work,
+                format!("shard {shard} rep {rep}: {key}={raw:?} is not finite"),
             ));
         }
+        cpus.insert(key, value);
+    }
+    let cpu_ms = cpus["cpu_ms"];
+    let window_cpu_ms = cpus["window_cpu_ms"];
+    let drain_cpu_ms = cpus["drain_cpu_ms"];
+    if cpu_ms <= 0.0 || window_cpu_ms <= 0.0 || drain_cpu_ms < 0.0 {
+        return Err(keep_logs(
+            work,
+            format!(
+                "shard {shard} rep {rep}: implausible CPU accounting \
+                 (cpu_ms={cpu_ms}, window_cpu_ms={window_cpu_ms}, drain_cpu_ms={drain_cpu_ms}); \
+                 a non-positive window CPU is the stale-field bug, not a fast run"
+            ),
+        ));
+    }
+    if cpu_ms + 10.0 < window_cpu_ms + drain_cpu_ms {
+        return Err(keep_logs(
+            work,
+            format!(
+                "shard {shard} rep {rep}: cpu_ms ({cpu_ms}) does not cover \
+                 window + drain ({}); the fields are not from the same run",
+                window_cpu_ms + drain_cpu_ms
+            ),
+        ));
     }
     let mut row = vec![
         "ROW".to_string(),
@@ -612,5 +676,62 @@ fn git(root: &Path, args: &[&str]) -> Result<String, String> {
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     } else {
         Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn alive(pid: u32) -> bool {
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }
+
+    /// The failure path must not leave benchmark processes behind: a receiver
+    /// still holding a UDP port contaminates the next experiment, and a sender
+    /// still burning CPU contaminates every measurement in it.
+    ///
+    /// This exercises the mechanism (drop kills and reaps whatever it owns)
+    /// rather than trying to provoke a production failure: if `Drop` did not
+    /// kill, the children below would still be alive when the assertion runs.
+    #[test]
+    fn children_guard_kills_and_reaps_every_child() {
+        let mut receivers: Vec<Child> = Vec::new();
+        let mut senders: Vec<(u16, Child)> = Vec::new();
+        for _ in 0..2 {
+            receivers.push(
+                Command::new("sleep")
+                    .arg("30")
+                    .stdout(Stdio::null())
+                    .spawn()
+                    .expect("spawn stand-in receiver"),
+            );
+            senders.push((
+                0,
+                Command::new("sleep")
+                    .arg("30")
+                    .stdout(Stdio::null())
+                    .spawn()
+                    .expect("spawn stand-in sender"),
+            ));
+        }
+        let pids: Vec<u32> = receivers
+            .iter()
+            .map(|c| c.id())
+            .chain(senders.iter().map(|(_, c)| c.id()))
+            .collect();
+        for pid in &pids {
+            assert!(alive(*pid), "stand-in process {pid} should be running");
+        }
+
+        let guard = Children { receivers, senders };
+        drop(guard);
+
+        for pid in &pids {
+            assert!(
+                !alive(*pid),
+                "guard dropped but process {pid} is still alive"
+            );
+        }
     }
 }

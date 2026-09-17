@@ -136,7 +136,7 @@ cargo xtask scaling --out docs/results/scaling-1000/run.tsv \
 | 2026-09-16 | 200 | 1 | 200 | 3 s | K sweep 128/512/1024 -- incumbent K=256 best on wire-bytes/CPU-s | `ksweep-K*.tsv` |
 | 2026-09-16 | 200 | 1 | 200 | 3 s | payload sweep 700/1316/2632 B at fixed 8 Mbps/destination | `costmodel-payload*.tsv` |
 
-## Result: 1000 destinations in a burst; sustained capacity is ~34 destinations per core-second
+## Result: 1000 destinations admitted, served fairly, and eventually reconciled in a burst
 
 Read this section with the denominator section below: the headline row is a
 **burst** result. Five shards established, served and reconciled 1000
@@ -144,7 +144,7 @@ destinations in a 3 s window and then spent several further seconds of CPU per
 shard draining the queue they had built. It is evidence that the *path* to 1000
 destinations exists and is exact. It is not evidence that 1000 x 8 Mbps is
 sustainable on this host, and the earlier revisions of this report that
-extrapolated 9-10 cores from the window alone are withdrawn.
+extrapolated a core count from the window alone are withdrawn.
 
 ### 1000 destinations, 5 concurrent shards (`scale-N1000-S5-2reps.tsv`)
 
@@ -174,17 +174,18 @@ cadence:
 | `window_cpu_ms` per shard | 2719-2752 | ~1700-2000 |
 | `lateness_us_p99` | 1530-1666 | ~4600-5300 |
 
-The shards are not misbehaving; they are not getting CPU. Five shards at full
-cadence need ~10 cores of protocol work (see the cost model below) and the host
-has 6, so each shard gets ~65-70 % of a core and skips the ticks it cannot
-serve. Every skipped tick is counted in `missed_source_ticks` rather than
-silently reducing the offered load, which is the property that makes this
-readable at all.
+The shards are not misbehaving; they are not getting CPU. Each shard receives
+~65-70 % of a core, and skips the ticks it cannot serve. Every skipped tick is
+counted in `missed_source_ticks` rather than silently reducing the offered load,
+which is the property that makes this readable at all.
 
-**Honest capacity statement:** on this host, 1000 destinations are served
-losslessly, fairly, and reconciled at ~81 % of an 8 Mbps-per-destination
-cadence (5 shards x F=200, 2 reps, identical outcome). Full cadence at 1000
-destinations at 8 Mbps needs roughly 10 cores of sender+receiver work.
+**What this row supports:** 1000 destinations admitted, served with equal
+per-destination counts, and eventually reconciled, by five independent shards,
+without starvation or receiver loss. **What it does not support:** any sustained
+8 Mbps-per-destination capacity figure, and therefore any core count derived
+from one. Earlier revisions of this paragraph asserted ~81 % cadence and "~10
+cores" as though the first implied the second; both are withdrawn and the
+sustained-capacity gate below is what a future run has to pass.
 
 ### Denominators: what was withdrawn, and what replaces it
 
@@ -225,20 +226,44 @@ reps; F=50 in both window lengths as a control for window sensitivity:
 
 And on the 1000-destination configuration itself (5 concurrent shards, 10
 shard-runs, all `drain_ok`): **sender 19.52 us + receiver 19.21 us = 38.72 us
-CPU per delivered payload, i.e. 34 destinations per core-second at 8 Mbps**
-(142.15 core-seconds for 3,675,800 receiver-confirmed payloads).
+CPU per delivered payload, i.e. ~34 payload-seconds per core-second** (142.15
+core-seconds for 3,675,800 receiver-confirmed payloads).
 
-Two consequences that change this report's conclusions:
+**Scope caveat on that sum.** The two terms are not measured over the same
+boundary. Sender `window_cpu_ms + drain_cpu_ms` starts after connection
+establishment and the pre-window drain, so it excludes setup. Receiver
+`cpu_user_ms + cpu_sys_ms` is cumulative process CPU at its final `STATS`, so it
+*includes* its own connect/handshake for every destination. The sum is therefore
+a useful rough total that over-counts the receiver, and it should not be used as
+a headline capacity figure; the sender figure (19.52 us, well-defined boundary)
+is the one to quote as a per-payload cost.
 
-1. **Sustained capacity is ~34 destinations per core-second (pair), i.e. about
-   200 destinations at 8 Mbps on this 6-CPU host** -- consistent with the
-   frontier #116 published, and *not* 810.
-2. **The 1000-destination run is a BURST result, not a sustained-capacity
-   result.** Its shards accepted ~616 K payloads/s across five processes for
-   3 s and then spent a further ~5 s of CPU per shard draining them. Five
-   shards served 1000 destinations, losslessly and without starvation; they did
-   not sustain 1000 x 8 Mbps, and no extrapolation from the window alone can
-   say they did.
+**What these numbers are.** A CPU-cost normalization of the workload actually
+delivered: 38.72 us of CPU per delivered payload, i.e. 25,858 payloads per
+core-second. **What they are not:** evidence of sustained 8 Mbps-per-destination
+capacity. The distinction is not academic:
+
+* `drain_ok && pending == 0` makes the *cost* denominator conserved; it is not a
+  capacity gate. At F=200 the two drain-complete runs delivered only
+  587,401 / 1,254,392 (46.8 %) and 715,995 / 1,359,742 (52.7 %) of accepted
+  DATA, one reports `data_below_half_mean = 31`, and both miss 7-16 % of source
+  ticks.
+* F=100 misses 3.3 % and 12.6 % of nominal cadence; F=50 misses 12-19 %.
+
+So the supportable form is: *the pair spent 38.72 us of CPU per payload it
+actually delivered, and ~34 payload-seconds fit in a core-second.* Whether a
+shard can hold full cadence -- and hence whether N cores hold N x 34
+destinations at 8 Mbps -- is **not established by any committed row**, and the
+"~200 destinations on six CPUs" statement is withdrawn.
+
+**Sustained-capacity gate (defined, and applied).** A row supports a capacity
+statement only if all of: `generated_ticks` within a few percent of
+`expected_ticks`; `data_accepted == rx_core_total`; `data_zero == 0`;
+`data_below_half_mean == 0`; `sec_a == 0`; and `drain_ok == true` with
+`pending_after_drain == 0`. **No committed row passes it** -- the equilibrium
+runs miss cadence or drop accepted DATA, and the burst runs do not drain inside
+their window. A fixed-work, full-cadence qualification is outstanding, and the
+only capacity statements this report may make are the ones #116 already made.
 
 **Candidate D re-evaluated.** The 1.4-1.6x headroom was computed against the
 withdrawn denominator. On the conserved one: the shard spends 12.81 us per wire
@@ -260,7 +285,7 @@ a fixed-work equilibrium measurement that varies one thing at a time.
 | stream coalescing, same runtime, 1316 B framing (0.909 ms/Mbit) | 3.68 ms/Mbit | give up per-packet ARQ | 4.0x |
 | raw stream, same runtime, 4096 B (0.249 ms/Mbit) | 3.68 ms/Mbit | give up per-packet ARQ and 1400-byte datagrams | 14.8x |
 | copy floor (18.6 ns per payload) | 19.95 us per payload | stop being a network stack | ~1000x (irrelevant) |
-| host capacity at 1000 x 8 Mbps | 34 destinations per core-second | ~29 cores; this host has 6 | ~5x short |
+| host capacity at 1000 x 8 Mbps | no committed row passes the sustained-capacity gate | a fixed-work, full-cadence qualification | **not established** |
 
 Read together: **the reachable gap is ~1.4-1.5x and it is submission structure**;
 the next 4-15x is protocol design (per-packet ARQ, 1400-byte datagrams); the
@@ -431,7 +456,9 @@ And the syscall count says the same thing from the other side: over 8 s the
 receiver entered the kernel 47,605 times while completing 868,805 ring
 operations -- **0.15 syscalls per datagram**. H1 (syscall-bound) is false: both
 sides already batch through io_uring and pay per-datagram kernel work, not per
-syscall. The user-space protocol is not the cost; the copies are.
+syscall. What that does *not* say is "the copies are the cost": the same stacks
+cover skb allocation, routing, checksum, socket accounting and queueing, and the
+copy-specific measurements bound copying far below the total.
 
 ### Receiver cost curve (F, from the committed #116 artifact plus these runs)
 
@@ -454,9 +481,9 @@ bookkeeping.
 | # | Hypothesis | Verdict | Evidence |
 |---|---|---|---|
 | H1 | shard is syscall-bound | **false** | 0.15 syscalls/datagram; 47.6 K syscalls vs 868 K ring completions |
-| H2 | shard is protocol-CPU bound | **false, but not "structural" either** | kernel UDP send path 41 %; the fitted per-datagram term is 7.5 us and the shard pays 12.45 us, so submission structure -- not protocol CPU and not bytes -- is the reachable lever |
+| H2 | shard is protocol-CPU bound | **false** | kernel UDP per-datagram send-path work is 41 % of sampled self cost, srt-rs user space ~1 %; that 41 % is not decomposed further, and the shard's per-datagram cost sits above the measured floor |
 | H3 | receiver per-connection bookkeeping dominates at high N | **false** | receiver us/datagram falls to 7.9 at F=200 and rises only under retransmit overload |
-| H4 | the harness's tick loop sets the ceiling | **partly true, and now quantified** | the source shares the loop with `service()`, so a starved shard reports missed ticks instead of a lower rate; the ceiling itself is per-byte CPU, not the loop |
+| H4 | the harness's tick loop sets the ceiling | **partly true** | the source shares the loop with `service()`, so a starved shard reports missed ticks instead of a lower rate; the ceiling itself mixes kernel per-datagram work with the shard's own service path and is not attributed to per-byte cost |
 | H5 | nothing superlinear; sharding is sufficient | **true** | 5 x F=200 serves 1000 with per-shard behaviour identical to solo |
 
 ## Loop candidates measured (stopping condition T2)
@@ -492,12 +519,14 @@ beyond the repeat-to-repeat noise band, which the baseline measures at
 **+/-0.7 %** (window us/copy 5.976 / 6.055 / 6.027 on three same-config runs).
 A, B and C are those three: none beat the incumbent, and none was kept.
 
-No in-scope candidate remains after the attribution: the remaining 99 % of
-sender CPU is kernel per-datagram byte handling and Compio's ring
-submit/wait, and the only changes that move those are the ones this workstream
-declines in its non-goals (zero-copy RX, `MSG_ZEROCOPY`, GSO/`UDP_SEGMENT`,
-`sendmmsg` batching, SQPOLL). T5 therefore ends the datapath loop: **sharding is
-the scaling mechanism**, and the number to publish is per-core, not per-shard.
+No *flag-level* candidate remains: the matrix above closes the ring-option space
+with evidence. That is not the same as candidate D being closed -- the floor
+measurements place the shard above a reachable per-datagram cost, so pipelining
+and batched submission remain the open hypothesis. T5's ceiling stop applies
+only once a workload that passes the sustained-capacity gate exists to measure a
+candidate on; until then the honest state is: **the path to 1000 destinations is
+demonstrated, its capacity is not, and the submission-structure hypothesis is
+open with unmeasured size.**
 
 ## Measurement defects found and fixed in this workstream
 
