@@ -183,11 +183,6 @@ impl TickSet {
         self.received
     }
 
-    /// Total size of the compact missing representation, for reporting.
-    pub fn missing_range_count(&self) -> usize {
-        self.missing_ranges().len()
-    }
-
     /// Render ranges as `a-b,c-d` for a single-line artifact field.
     pub fn missing_ranges_text(&self) -> String {
         if self.missing_ranges().is_empty() {

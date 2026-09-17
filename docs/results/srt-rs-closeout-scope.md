@@ -187,3 +187,22 @@ anything further.
 Until that is fixed, a fence run on the multi-connection path cannot satisfy the
 validity rule (`fence_accepted == fanout && fences_seen == fanout`), so the
 10-pair A/B has not been run and no conservation branch is claimed.
+
+## Deliberately retained apparatus (concluded, not junk)
+
+Two experiments in this branch reached their conclusions and their code was
+briefly removed as "concluded". It is **kept instead**, because both are the
+apparatus a future comparison or a recursive self-improvement loop would re-run,
+and re-deriving a closed experiment costs more than carrying a bench:
+
+| apparatus | conclusion it produced | why it stays |
+|---|---|---|
+| `srt_bench::ring_modes` + the flag matrix arms in `udp_datapath_floor` | no io_uring setup flag wins; SQPOLL 25 % worse on UDP and ~8x worse on streams; `sqpoll+defer` rejected even with `SINGLE_ISSUER` | the answer is kernel-, Compio- and host-dependent; it is a reusable capability probe, and the same harness measures any future flag |
+| `rtmp_publish_floor` + its evidence | the stream regime costs 0.249-0.909 ms CPU/Mbit against SRT's 3.68, and that factor is bought by dropping per-packet sequencing and ARQ | it is the only in-runtime protocol-comparison baseline, and the Robotweax challenger experiment needs exactly this shape |
+| `udp_datapath_floor` core arms | memcpy 18.6 ns, null syscall 0.264-0.303 us, datagram floor 7.45-8.90 us | the floor is what makes "no flag/copy work will help" measurable rather than asserted |
+
+The rule applied: **delete conclusions, keep instruments.** Superseded rows and
+retracted claims stay in the record too -- a withdrawal is evidence about the
+method, and re-deriving it is how the same mistake gets made twice. What does not
+stay is anything neither instrument nor evidence: one unused helper
+(`TickSet::missing_range_count`) was removed as the only such item found.
