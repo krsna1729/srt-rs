@@ -18,8 +18,8 @@ use crate::srt_handshake::{
     HandshakeState, HandshakeType, KmError, KmMessage, MAX_FLOW_WINDOW, SRT_MAGIC_CODE, srt_flags,
 };
 use crate::srt_packet::{
-    ControlPacket, ControlType, DataHeader, DataPacket, PendingData, PendingDatagram,
-    SRT_HEADER_SIZE, SrtPacket,
+    ControlPacket, ControlType, DataHeader, DataPacket, DatagramClass, PendingData,
+    PendingDatagram, SRT_CMD_KMREQ, SRT_CMD_KMRSP, SRT_HEADER_SIZE, SrtPacket,
 };
 use crate::srt_receiver::{LossRange, ReceiverBuffer};
 use crate::srt_sender::SenderBuffer;
@@ -305,7 +305,14 @@ pub enum ConnectionOutput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputMeta {
     /// The next output is a datagram requiring `wire_len` bytes of storage.
-    Datagram { wire_len: usize },
+    ///
+    /// `class` is what the datagram carries, so a transport can account for
+    /// submission by category without parsing bytes it is not supposed to
+    /// interpret.
+    Datagram {
+        wire_len: usize,
+        class: DatagramClass,
+    },
     /// The next output requests arming a timer.
     SetTimer { id: TimerId, duration_micros: u64 },
     /// The next output requests disarming a timer.
@@ -316,7 +323,16 @@ pub enum OutputMeta {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputInto {
     /// A datagram of `len` bytes was encoded into the buffer and consumed from the connection.
-    Datagram { len: usize },
+    Datagram {
+        len: usize,
+        class: DatagramClass,
+        /// The source's due instant for this datagram in the microsecond domain
+        /// of the `now` the application supplies (see
+        /// `PendingData::source_due_micros`). `None` for retransmissions and
+        /// control datagrams. A transport that submits the datagram later than
+        /// this measures how long the payload was held downstream of the source.
+        source_due_micros: Option<u64>,
+    },
     /// A timer set action was consumed from the connection.
     SetTimer { id: TimerId, duration_micros: u64 },
     /// A timer clear action was consumed from the connection.
@@ -738,6 +754,7 @@ impl SrtConnection {
         &mut self,
         header: DataHeader,
         payload: Bytes,
+        source_due_micros: Option<u64>,
         now: Timestamp,
     ) -> Result<(), Error> {
         let crypto = if let Some(ref mut c) = self.crypto {
@@ -747,7 +764,7 @@ impl SrtConnection {
         };
         self.last_send_time = Some(now);
         self.queue_output(QueuedOutput::Datagram(PendingDatagram::Data(
-            PendingData::new(header, payload, crypto),
+            PendingData::new(header, payload, crypto, source_due_micros),
         )));
         // Reservation accounting is owned by `queue_output` so a rejected
         // (overflowed) queue cannot leak a reservation for a packet that was
@@ -1324,7 +1341,9 @@ impl SrtConnection {
                 break;
             };
             let seq = header.sequence_number;
-            match self.queue_data_packet(header, payload, now) {
+            // A retransmission has no source deadline: it is due the moment the
+            // sender learns it is needed, so it contributes no lateness sample.
+            match self.queue_data_packet(header, payload, None, now) {
                 Ok(()) => {}
                 Err(_) => {
                     dropped += 1;
@@ -1675,8 +1694,11 @@ impl SrtConnection {
             return Err(Error::invalid_state("send buffer full"));
         }
 
+        // One admission instant, so one source due instant: every fragment of
+        // this message carries the same source deadline.
+        let source_due = Some(now.as_micros());
         for (header, payload) in packets {
-            self.queue_data_packet(header, payload, now)?;
+            self.queue_data_packet(header, payload, source_due, now)?;
         }
 
         if let Some(ref mut sender) = self.sender {
@@ -1725,7 +1747,10 @@ impl SrtConnection {
                 payload.len()
             );
 
-            self.queue_data_packet(header, payload, now)?;
+            // The source's own due instant for this payload, carried to the
+            // submission boundary so a transport can measure how long the
+            // payload was held downstream of the source.
+            self.queue_data_packet(header, payload, Some(now.as_micros()), now)?;
             if let Some(ref mut sender) = self.sender {
                 sender.record_send_time(now);
             }
@@ -1808,7 +1833,7 @@ impl SrtConnection {
                 "internal invariant violated: push_shared rejected an already-validated send",
             ));
         };
-        self.queue_data_packet(header, payload, now)?;
+        self.queue_data_packet(header, payload, Some(now.as_micros()), now)?;
         if let Some(ref mut sender) = self.sender {
             sender.record_send_time(now);
         }
@@ -1986,6 +2011,7 @@ impl SrtConnection {
         self.output_queue.front().map(|out| match out {
             QueuedOutput::Datagram(pkt) => OutputMeta::Datagram {
                 wire_len: pkt.wire_len(),
+                class: pkt.class(),
             },
             QueuedOutput::SetTimer {
                 id,
@@ -2036,6 +2062,8 @@ impl SrtConnection {
                     PendingDatagram::Data(data) => Some(data.header.sequence_number),
                     PendingDatagram::Control(_) => None,
                 };
+                let class = pkt.class();
+                let source_due_micros = pkt.source_due_micros();
                 self.output_queue.pop_front();
                 if let Some(flag) = released {
                     self.release_tx_reservation(flag);
@@ -2044,7 +2072,11 @@ impl SrtConnection {
                 if let Some(sequence) = submitted_sequence {
                     self.note_data_submitted(sequence);
                 }
-                Ok(Some(OutputInto::Datagram { len: written }))
+                Ok(Some(OutputInto::Datagram {
+                    len: written,
+                    class,
+                    source_due_micros,
+                }))
             }
             QueuedOutput::SetTimer {
                 id,
@@ -2083,10 +2115,10 @@ impl SrtConnection {
             return Ok(None);
         };
         match meta {
-            OutputMeta::Datagram { wire_len } => {
+            OutputMeta::Datagram { wire_len, .. } => {
                 let mut buf = vec![0u8; wire_len];
                 match self.poll_output_into(&mut buf)? {
-                    Some(OutputInto::Datagram { len }) => {
+                    Some(OutputInto::Datagram { len, .. }) => {
                         buf.truncate(len);
                         Ok(Some(ConnectionOutput::SendPacket(buf)))
                     }
@@ -2889,9 +2921,7 @@ impl SrtConnection {
     /// Process a UserDefined packet (KM Refresh).
     fn handle_user_defined(&mut self, pkt: ControlPacket, now: Timestamp) -> Result<(), Error> {
         // Determine KMREQ/KMRSP from the subtype.
-        // SRT_CMD_KMREQ = 3, SRT_CMD_KMRSP = 4
-        const SRT_CMD_KMREQ: u16 = 3;
-        const SRT_CMD_KMRSP: u16 = 4;
+        // SRT_CMD_KMREQ / SRT_CMD_KMRSP live in srt_packet with the class mapping.
 
         match pkt.subtype {
             SRT_CMD_KMREQ => {
@@ -2962,8 +2992,6 @@ impl SrtConnection {
 
     /// Send a KMREQ packet (KM Refresh).
     fn send_km_request(&mut self, km_message: &KmMessage, now: Timestamp) {
-        const SRT_CMD_KMREQ: u16 = 3;
-
         let pkt = ControlPacket {
             control_type: ControlType::UserDefined,
             subtype: SRT_CMD_KMREQ,
@@ -2978,8 +3006,6 @@ impl SrtConnection {
 
     /// Send a KMRSP packet (KM Refresh).
     fn send_km_response(&mut self, km_message: &KmMessage, now: Timestamp) {
-        const SRT_CMD_KMRSP: u16 = 4;
-
         let pkt = ControlPacket {
             control_type: ControlType::UserDefined,
             subtype: SRT_CMD_KMRSP,
@@ -2994,7 +3020,6 @@ impl SrtConnection {
 
     /// Send a KM refresh error response (KMRSP with its four-byte state).
     fn send_km_error_response(&mut self, error: KmError, now: Timestamp) {
-        const SRT_CMD_KMRSP: u16 = 4;
         let mut control_info = Vec::with_capacity(4);
         write_u32(&mut control_info, error as u32);
         let pkt = ControlPacket {

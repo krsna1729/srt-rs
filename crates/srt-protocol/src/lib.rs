@@ -89,6 +89,7 @@ pub use srt_connection::{
 pub use srt_group::{
     GroupDataPoll, GroupEvent, GroupMemberState, GroupMode, MAX_GROUP_MEMBERS, SrtGroup,
 };
+pub use srt_packet::DatagramClass;
 pub use stats::{
     ConnectionStats, ConnectionStatsInterval, CounterDelta, ReceiverStatsInterval,
     SenderStatsInterval,

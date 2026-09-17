@@ -6,8 +6,8 @@ use crate::{
     SinkOutcome, WorkerMessage, group_connection_stats,
 };
 use srt_proto::{
-    Bytes, ConnectionEvent, ConnectionOptions, ConnectionOutput, DisconnectReason, OutputInto,
-    OutputMeta, SrtConnection, Timestamp,
+    Bytes, ConnectionEvent, ConnectionOptions, ConnectionOutput, DatagramClass, DisconnectReason,
+    OutputInto, OutputMeta, SrtConnection, Timestamp,
 };
 use std::collections::hash_map::Entry as HashEntry;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -2689,11 +2689,17 @@ impl PeerTable {
                         return Some(true);
                     }
                 };
+                // Already-materialized compatibility packet: the class the
+                // protocol computed was dropped by the allocating
+                // `ConnectionOutput::SendPacket` API upstream, so there is
+                // nothing to classify it by short of parsing wire bytes.
+                // `OtherControl` is the honest "no category of its own" slot
+                // for it, and no submission-class accounting reads this path.
                 {
                     let buf = slot.bytes_mut();
                     buf[..wire_len].copy_from_slice(bytes);
                 }
-                slot.commit(wire_len);
+                slot.commit(wire_len, DatagramClass::OtherControl, None);
                 entry.pending_outputs.pop_front();
                 record_peer_pushed(report, wire_len);
                 Some(false)
@@ -2721,7 +2727,11 @@ impl PeerTable {
         report: &mut OutputDrainReport,
     ) -> PeerDrainStep {
         match meta {
-            OutputMeta::Datagram { wire_len } => {
+            // The peeked class is not needed here: the class that is
+            // accounted is the one `poll_output_into` reports for the
+            // datagram it actually consumed, so there is exactly one source
+            // of class truth on this path.
+            OutputMeta::Datagram { wire_len, .. } => {
                 let exceeds_packets = report.packets >= budget.max_packets;
                 let exceeds_bytes = report.bytes.saturating_add(wire_len) > budget.max_bytes;
                 if exceeds_packets || exceeds_bytes {
@@ -2747,7 +2757,11 @@ impl PeerTable {
                 let materialized = {
                     let buf = slot.bytes_mut();
                     match entry.conn.poll_output_into(buf) {
-                        Ok(Some(OutputInto::Datagram { len })) => Ok(len),
+                        Ok(Some(OutputInto::Datagram {
+                            len,
+                            class,
+                            source_due_micros,
+                        })) => Ok((len, class, source_due_micros)),
                         // The peeked datagram is still queued: a datagram that
                         // vanished between peek and poll, or a protocol
                         // refusal, is a real condition of this peer -- never
@@ -2760,8 +2774,8 @@ impl PeerTable {
                     }
                 };
                 match materialized {
-                    Ok(len) => {
-                        slot.commit(len);
+                    Ok((len, class, source_due_micros)) => {
+                        slot.commit(len, class, source_due_micros);
                         record_peer_pushed(report, len);
                         PeerDrainStep::Continue
                     }
@@ -2984,11 +2998,14 @@ impl PeerTable {
                         return Some(true);
                     }
                 };
+                // Already-materialized compatibility packet: see
+                // `drain_peer_legacy_output` -- the class was dropped by the
+                // allocating `SendPacket` API and nothing here can recover it.
                 {
                     let buf = slot.bytes_mut();
                     buf[..wire_len].copy_from_slice(bytes);
                 }
-                slot.commit(wire_len);
+                slot.commit(wire_len, DatagramClass::OtherControl, None);
                 leg.pending_outputs.pop_front();
                 record_peer_pushed(report, wire_len);
                 Some(false)
@@ -3016,7 +3033,11 @@ impl PeerTable {
         report: &mut OutputDrainReport,
     ) -> PeerDrainStep {
         match meta {
-            OutputMeta::Datagram { wire_len } => {
+            // The peeked class is not needed here: the class that is
+            // accounted is the one `poll_output_into` reports for the
+            // datagram it actually consumed, so there is exactly one source
+            // of class truth on this path.
+            OutputMeta::Datagram { wire_len, .. } => {
                 let exceeds_packets = report.packets >= budget.max_packets;
                 let exceeds_bytes = report.bytes.saturating_add(wire_len) > budget.max_bytes;
                 if exceeds_packets || exceeds_bytes {
@@ -3042,7 +3063,11 @@ impl PeerTable {
                 let materialized = {
                     let buf = slot.bytes_mut();
                     match connection.poll_output_into(buf) {
-                        Ok(Some(OutputInto::Datagram { len })) => Ok(len),
+                        Ok(Some(OutputInto::Datagram {
+                            len,
+                            class,
+                            source_due_micros,
+                        })) => Ok((len, class, source_due_micros)),
                         Ok(_) => Err(srt_proto::Error::with_reason(
                             srt_proto::ErrorKind::InvalidState,
                             "peeked datagram output vanished before materialization",
@@ -3051,8 +3076,8 @@ impl PeerTable {
                     }
                 };
                 match materialized {
-                    Ok(len) => {
-                        slot.commit(len);
+                    Ok((len, class, source_due_micros)) => {
+                        slot.commit(len, class, source_due_micros);
                         record_peer_pushed(report, len);
                         PeerDrainStep::Continue
                     }
@@ -4742,7 +4767,12 @@ mod tests {
             &mut self.buf
         }
 
-        fn commit(self, len: usize) {
+        fn commit(
+            self,
+            len: usize,
+            _class: srt_proto::DatagramClass,
+            _source_due_micros: Option<u64>,
+        ) {
             let mut buf = self.buf;
             buf.truncate(len);
             self.sink.committed.push((self.peer, buf));

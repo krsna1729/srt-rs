@@ -97,7 +97,7 @@ fn buffer_too_small_is_transactional_and_does_not_corrupt_queue() {
 
     let meta = caller.peek_output().expect("output is queued");
     let wire_len = match meta {
-        OutputMeta::Datagram { wire_len } => wire_len,
+        OutputMeta::Datagram { wire_len, .. } => wire_len,
         other => panic!("expected datagram, got {other:?}"),
     };
 
@@ -125,7 +125,10 @@ fn buffer_too_small_is_transactional_and_does_not_corrupt_queue() {
     let result = caller
         .poll_output_into(&mut full_buf)
         .expect("sufficient buffer succeeds");
-    assert_eq!(result, Some(OutputInto::Datagram { len: wire_len }));
+    assert!(
+        matches!(result, Some(OutputInto::Datagram { len, .. }) if len == wire_len),
+        "the materialized length must be the datagram's wire length: {result:?}"
+    );
 
     // 5. The datagram is consumed exactly once. Materializing it arms the
     // sender timeout, so a timer action is legitimately queued behind it -- what
@@ -166,7 +169,7 @@ fn wire_equivalence_plaintext() {
     // Path B: direct poll_output_into()
     let meta = caller_b.peek_output().expect("meta exists");
     let wire_len = match meta {
-        OutputMeta::Datagram { wire_len } => wire_len,
+        OutputMeta::Datagram { wire_len, .. } => wire_len,
         other => panic!("expected datagram, got {other:?}"),
     };
     assert_eq!(wire_len, packet_a.len());
@@ -175,7 +178,10 @@ fn wire_equivalence_plaintext() {
     let res = caller_b
         .poll_output_into(&mut direct_buf)
         .expect("poll_output_into succeeds");
-    assert_eq!(res, Some(OutputInto::Datagram { len: wire_len }));
+    assert!(
+        matches!(res, Some(OutputInto::Datagram { len, .. }) if len == wire_len),
+        "the materialized length must be the datagram's wire length: {res:?}"
+    );
 
     // Wire bytes must be byte-for-byte identical
     assert_eq!(packet_a, direct_buf);
@@ -243,7 +249,7 @@ fn wire_equivalence_ctr_modes() {
         // Path B: direct poll_output_into
         let meta = caller_b.peek_output().expect("meta b");
         let wire_len = match meta {
-            OutputMeta::Datagram { wire_len } => wire_len,
+            OutputMeta::Datagram { wire_len, .. } => wire_len,
             other => panic!("expected datagram, got {other:?}"),
         };
         assert_eq!(wire_len, packet_a.len());
@@ -252,7 +258,10 @@ fn wire_equivalence_ctr_modes() {
         let out = caller_b
             .poll_output_into(&mut direct_buf)
             .expect("poll_output_into b");
-        assert_eq!(out, Some(OutputInto::Datagram { len: wire_len }));
+        assert!(
+            matches!(out, Some(OutputInto::Datagram { len, .. }) if len == wire_len),
+            "the materialized length must be the datagram's wire length: {out:?}"
+        );
 
         assert_eq!(
             packet_a, direct_buf,
@@ -305,7 +314,7 @@ fn wire_equivalence_gcm_modes() {
 
         let meta = caller_b.peek_output().expect("meta b");
         let wire_len = match meta {
-            OutputMeta::Datagram { wire_len } => wire_len,
+            OutputMeta::Datagram { wire_len, .. } => wire_len,
             other => panic!("expected datagram, got {other:?}"),
         };
         assert_eq!(wire_len, packet_a.len());
@@ -314,7 +323,10 @@ fn wire_equivalence_gcm_modes() {
         let out = caller_b
             .poll_output_into(&mut direct_buf)
             .expect("poll_output_into b");
-        assert_eq!(out, Some(OutputInto::Datagram { len: wire_len }));
+        assert!(
+            matches!(out, Some(OutputInto::Datagram { len, .. }) if len == wire_len),
+            "the materialized length must be the datagram's wire length: {out:?}"
+        );
 
         assert_eq!(
             packet_a, direct_buf,
@@ -395,14 +407,17 @@ fn wire_equivalence_retransmits() {
     // Path B: direct poll_output_into()
     let meta = caller_b.peek_output().expect("meta b");
     let wire_len = match meta {
-        OutputMeta::Datagram { wire_len } => wire_len,
+        OutputMeta::Datagram { wire_len, .. } => wire_len,
         other => panic!("expected datagram, got {other:?}"),
     };
     let mut direct_buf = vec![0u8; wire_len];
     let out = caller_b
         .poll_output_into(&mut direct_buf)
         .expect("poll_output_into b");
-    assert_eq!(out, Some(OutputInto::Datagram { len: wire_len }));
+    assert!(
+        matches!(out, Some(OutputInto::Datagram { len, .. }) if len == wire_len),
+        "the materialized length must be the datagram's wire length: {out:?}"
+    );
 
     // Retransmit wire bytes must match exactly
     assert_eq!(retx_a, direct_buf);
@@ -461,7 +476,7 @@ fn wire_equivalence_key_rotation() {
         // bytes, so consume those here exactly as a runtime would.
         let wire_len = loop {
             match caller.peek_output().expect("datagram is queued") {
-                OutputMeta::Datagram { wire_len } => break wire_len,
+                OutputMeta::Datagram { wire_len, .. } => break wire_len,
                 OutputMeta::SetTimer { .. } | OutputMeta::ClearTimer { .. } => {
                     assert!(
                         caller
@@ -478,7 +493,10 @@ fn wire_equivalence_key_rotation() {
         let out = caller
             .poll_output_into(&mut buf)
             .expect("poll_output_into succeeds");
-        assert_eq!(out, Some(OutputInto::Datagram { len: wire_len }));
+        assert!(
+            matches!(out, Some(OutputInto::Datagram { len, .. }) if len == wire_len),
+            "the materialized length must be the datagram's wire length: {out:?}"
+        );
         direct_wires.push(buf);
     }
 
@@ -521,8 +539,8 @@ fn drain_filler_until_held(
 ) {
     while let Some(meta) = caller.peek_output() {
         match meta {
-            OutputMeta::Datagram { wire_len } if wire_len == held_wire_len => break,
-            OutputMeta::Datagram { wire_len } => {
+            OutputMeta::Datagram { wire_len, .. } if wire_len == held_wire_len => break,
+            OutputMeta::Datagram { wire_len, .. } => {
                 let mut buf = vec![0u8; wire_len];
                 caller
                     .poll_output_into(&mut buf)
@@ -572,18 +590,18 @@ fn old_key_datagram_materializes_across_switch_and_mass_new_key_admissions() {
         .expect("old key admission");
     let held_meta = caller.peek_output().expect("held datagram queued");
     let held_wire_len = match held_meta {
-        OutputMeta::Datagram { wire_len } => wire_len,
+        OutputMeta::Datagram { wire_len, .. } => wire_len,
         other => panic!("expected datagram, got {other:?}"),
     };
 
     // Drain ONLY the timer actions queued behind/around it, never the datagram.
     // Timers consume no materialization, so the stamp stays outstanding.
     drain_timers_only(&mut caller);
-    assert_eq!(
-        caller.peek_output(),
-        Some(OutputMeta::Datagram {
-            wire_len: held_wire_len
-        }),
+    assert!(
+        matches!(
+            caller.peek_output(),
+            Some(OutputMeta::Datagram { wire_len, .. }) if wire_len == held_wire_len
+        ),
         "held old-key datagram must still be queued"
     );
 
@@ -605,7 +623,10 @@ fn old_key_datagram_materializes_across_switch_and_mass_new_key_admissions() {
     let out = caller
         .poll_output_into(&mut held_buf)
         .expect("held old-key datagram still materializes");
-    assert_eq!(out, Some(OutputInto::Datagram { len: held_wire_len }));
+    assert!(
+        matches!(out, Some(OutputInto::Datagram { len, .. }) if len == held_wire_len),
+        "held old-key datagram must materialize at its wire length: {out:?}"
+    );
     listener
         .feed_recv_buf(&held_buf, now)
         .expect("listener decrypts held old-key packet");

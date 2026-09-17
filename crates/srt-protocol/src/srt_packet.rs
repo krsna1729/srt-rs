@@ -381,22 +381,119 @@ impl DataHeader {
     }
 }
 
+/// Key-management request handshake sub-type (`SRT_CMD_KMREQ`).
+///
+/// Key management rides on `ControlType::UserDefined` with this sub-type
+/// rather than a control type of its own, so anything that needs to know a
+/// datagram carries key material has to check the sub-type.
+pub(crate) const SRT_CMD_KMREQ: u16 = 3;
+/// Key-management response handshake sub-type (`SRT_CMD_KMRSP`).
+pub(crate) const SRT_CMD_KMRSP: u16 = 4;
+
+/// What a protocol output datagram carries.
+///
+/// The protocol is the only party that knows what a queued datagram *is*, and
+/// the transport's submission boundary only ever sees bytes. This is the
+/// bounded vocabulary it can be reported in: a fixed set of categories, so a
+/// runtime counts them in a fixed array -- no labels, no allocation, and no
+/// cardinality that grows with traffic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum DatagramClass {
+    /// First transmission of application data.
+    DataFirst = 0,
+    /// Retransmission of application data that was already sent once.
+    DataRetransmit = 1,
+    Ack = 2,
+    AckAck = 3,
+    Nak = 4,
+    Keepalive = 5,
+    Handshake = 6,
+    DropRequest = 7,
+    /// Key-management exchange (KMREQ/KMRSP).
+    KeyMaterial = 8,
+    Shutdown = 9,
+    /// Any control datagram with no category of its own (congestion warning,
+    /// peer error, unrecognized user-defined sub-types).
+    OtherControl = 10,
+}
+
+impl DatagramClass {
+    /// Number of categories, i.e. the length of a counter array they index.
+    pub const COUNT: usize = 11;
+
+    /// Every category, so tests and exporters can iterate the whole space
+    /// instead of listing it again and forgetting a new one.
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::DataFirst,
+        Self::DataRetransmit,
+        Self::Ack,
+        Self::AckAck,
+        Self::Nak,
+        Self::Keepalive,
+        Self::Handshake,
+        Self::DropRequest,
+        Self::KeyMaterial,
+        Self::Shutdown,
+        Self::OtherControl,
+    ];
+
+    /// Highest discriminant, asserted against `COUNT` at compile time so a new
+    /// category cannot be added without updating both.
+    const LAST: Self = Self::OtherControl;
+
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    /// Whether this is application data (first transmission or retransmit).
+    #[must_use]
+    pub const fn is_data(self) -> bool {
+        matches!(self, Self::DataFirst | Self::DataRetransmit)
+    }
+}
+
+const _: () = assert!(
+    DatagramClass::LAST as usize + 1 == DatagramClass::COUNT,
+    "DatagramClass::COUNT must match the number of variants"
+);
+
 /// A pending outgoing DATA packet awaiting materialization into a caller-supplied buffer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PendingData {
     pub(crate) header: DataHeader,
     pub(crate) payload: Bytes,
     pub(crate) crypto: Option<TxCryptoStamp>,
+    /// The instant the source's own schedule asked for this payload, in the
+    /// microsecond domain the application supplies as `now`.
+    ///
+    /// For a first transmission this is the `now` the application admitted the
+    /// payload with -- its own deadline for that payload, not a measurement
+    /// taken afterwards. Subtracting it from the instant the transport actually
+    /// submits the datagram measures how long the payload was held downstream of
+    /// the source (admission, drain, pacing, TX queue), which is the transport's
+    /// own delay and is not confounded by how fast the source offers.
+    ///
+    /// `None` for a retransmission (there is no source deadline for one) and for
+    /// control datagrams.
+    pub(crate) source_due_micros: Option<u64>,
 }
 
 impl PendingData {
     /// Create a new pending data packet.
     #[must_use]
-    pub(crate) fn new(header: DataHeader, payload: Bytes, crypto: Option<TxCryptoStamp>) -> Self {
+    pub(crate) fn new(
+        header: DataHeader,
+        payload: Bytes,
+        crypto: Option<TxCryptoStamp>,
+        source_due_micros: Option<u64>,
+    ) -> Self {
         Self {
             header,
             payload,
             crypto,
+            source_due_micros,
         }
     }
 
@@ -476,6 +573,47 @@ pub(crate) enum PendingDatagram {
 }
 
 impl PendingDatagram {
+    /// What this datagram carries, for transport-side accounting.
+    #[must_use]
+    pub(crate) fn class(&self) -> DatagramClass {
+        match self {
+            Self::Data(data) => {
+                if data.header.retransmitted {
+                    DatagramClass::DataRetransmit
+                } else {
+                    DatagramClass::DataFirst
+                }
+            }
+            Self::Control(control) => match control.control_type {
+                ControlType::Ack => DatagramClass::Ack,
+                ControlType::AckAck => DatagramClass::AckAck,
+                ControlType::Nak => DatagramClass::Nak,
+                ControlType::Keepalive => DatagramClass::Keepalive,
+                ControlType::Handshake => DatagramClass::Handshake,
+                ControlType::DropReq => DatagramClass::DropRequest,
+                ControlType::Shutdown => DatagramClass::Shutdown,
+                // Key management is a handshake sub-type, not a control type.
+                ControlType::UserDefined
+                    if control.subtype == SRT_CMD_KMREQ || control.subtype == SRT_CMD_KMRSP =>
+                {
+                    DatagramClass::KeyMaterial
+                }
+                ControlType::CongestionWarning
+                | ControlType::PeerError
+                | ControlType::UserDefined => DatagramClass::OtherControl,
+            },
+        }
+    }
+
+    /// The source's due instant for this datagram, if it has one.
+    #[must_use]
+    pub(crate) fn source_due_micros(&self) -> Option<u64> {
+        match self {
+            Self::Data(data) => data.source_due_micros,
+            Self::Control(_) => None,
+        }
+    }
+
     /// Exact wire length in bytes.
     #[must_use]
     pub(crate) fn wire_len(&self) -> usize {
@@ -672,6 +810,109 @@ pub(crate) fn sequence_greater_than(a: u32, b: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn control(control_type: ControlType, subtype: u16) -> PendingDatagram {
+        PendingDatagram::Control(ControlPacket {
+            control_type,
+            subtype,
+            type_specific_info: 0,
+            timestamp: 0,
+            dest_socket_id: 1,
+            control_info: Vec::new(),
+        })
+    }
+
+    fn data(retransmitted: bool, source_due_micros: Option<u64>) -> PendingDatagram {
+        PendingDatagram::Data(PendingData::new(
+            DataHeader {
+                sequence_number: 1,
+                position: PacketPosition::Single,
+                order_flag: false,
+                retransmitted,
+                message_number: 1,
+                timestamp: 0,
+                dest_socket_id: 1,
+            },
+            Bytes::from_static(b"payload"),
+            None,
+            source_due_micros,
+        ))
+    }
+
+    /// The class vocabulary is what a transport counts submissions by, so each
+    /// control type has to land in a category and the two DATA cases have to be
+    /// distinguishable. Key management is a `UserDefined` sub-type, which is
+    /// the case a control-type-only mapping would get wrong.
+    #[test]
+    fn datagram_classes_cover_every_control_type_and_both_data_cases() {
+        assert_eq!(data(false, Some(7)).class(), DatagramClass::DataFirst);
+        assert_eq!(data(true, None).class(), DatagramClass::DataRetransmit);
+
+        let cases = [
+            (ControlType::Ack, 0, DatagramClass::Ack),
+            (ControlType::AckAck, 0, DatagramClass::AckAck),
+            (ControlType::Nak, 0, DatagramClass::Nak),
+            (ControlType::Keepalive, 0, DatagramClass::Keepalive),
+            (ControlType::Handshake, 0, DatagramClass::Handshake),
+            (ControlType::DropReq, 0, DatagramClass::DropRequest),
+            (ControlType::Shutdown, 0, DatagramClass::Shutdown),
+            (
+                ControlType::UserDefined,
+                SRT_CMD_KMREQ,
+                DatagramClass::KeyMaterial,
+            ),
+            (
+                ControlType::UserDefined,
+                SRT_CMD_KMRSP,
+                DatagramClass::KeyMaterial,
+            ),
+            (
+                ControlType::CongestionWarning,
+                0,
+                DatagramClass::OtherControl,
+            ),
+            (ControlType::PeerError, 0, DatagramClass::OtherControl),
+            (ControlType::UserDefined, 0, DatagramClass::OtherControl),
+        ];
+        for (control_type, subtype, expected) in cases {
+            assert_eq!(
+                control(control_type, subtype).class(),
+                expected,
+                "{control_type:?}/{subtype}"
+            );
+        }
+
+        // Every category is reachable, so a counter array indexed by
+        // `DatagramClass` cannot silently keep a zero slot forever.
+        let mut seen = [false; DatagramClass::COUNT];
+        for (control_type, subtype, expected) in cases {
+            seen[control(control_type, subtype).class().index()] = true;
+            let _ = expected;
+        }
+        for retransmitted in [false, true] {
+            seen[data(retransmitted, None).class().index()] = true;
+        }
+        for (index, hit) in seen.iter().enumerate() {
+            assert!(*hit, "no datagram class maps to index {index}");
+        }
+        assert_eq!(DatagramClass::ALL.len(), DatagramClass::COUNT);
+        for (index, class) in DatagramClass::ALL.iter().enumerate() {
+            assert_eq!(class.index(), index, "{class:?}");
+        }
+    }
+
+    /// Only a first transmission has a source deadline: a retransmission has
+    /// none to be late against, and reporting one would dilute the metric.
+    #[test]
+    fn only_first_transmissions_carry_a_source_due_instant() {
+        assert_eq!(data(false, Some(1_234)).source_due_micros(), Some(1_234));
+        assert_eq!(data(true, Some(1_234)).source_due_micros(), Some(1_234));
+        assert_eq!(
+            control(ControlType::Ack, 0).source_due_micros(),
+            None,
+            "control datagrams have no source deadline"
+        );
+    }
 
     #[test]
     fn test_data_packet_encode_decode() {

@@ -3,7 +3,9 @@ use crate::{
     DatagramSink, DatagramSlot, GroupConnectionStats, GroupLogicalCounters, ManualTimerStore,
     OutputDrainBudget, OutputDrainReport, OutputDrainStatus, SinkOutcome, group_connection_stats,
 };
-use srt_proto::{Bytes, ConnectionOutput, OutputInto, OutputMeta, SrtConnection, Timestamp};
+use srt_proto::{
+    Bytes, ConnectionOutput, DatagramClass, OutputInto, OutputMeta, SrtConnection, Timestamp,
+};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Default maximum number of logical callers held by one table.
@@ -2116,11 +2118,19 @@ fn drain_caller_legacy_output<S: DatagramSink + ?Sized>(
             };
             // Compatibility surface: the bytes are already materialized, so
             // this is a copy into the reserved slot, then an infallible commit.
+            //
+            // This queue holds packets handed to the transport already
+            // materialized (`ConnectionOutput::SendPacket`), so the class the
+            // protocol computed was dropped by the allocating API before this
+            // point, and there is nothing left to classify them by short of
+            // parsing wire bytes. `OtherControl` is the honest "no category of
+            // its own" slot for them; no submission-class accounting reads
+            // this path (the Owner submits through the `*_meta` paths).
             {
                 let buf = slot.bytes_mut();
                 buf[..wire_len].copy_from_slice(packet);
             }
-            slot.commit(wire_len);
+            slot.commit(wire_len, DatagramClass::OtherControl, None);
             pending.pop_front();
             record_pushed(report, wire_len);
             Some((DrainOne::Drained, false))
@@ -2146,7 +2156,10 @@ fn drain_caller_direct_meta<S: DatagramSink + ?Sized>(
     sink: &mut DrainSink<'_, S>,
 ) -> (DrainOne, bool) {
     match meta {
-        OutputMeta::Datagram { wire_len } => {
+        // The peeked class is not needed here: the class that is accounted is
+        // the one `poll_output_into` reports for the datagram it actually
+        // consumed, so there is exactly one source of class truth on this path.
+        OutputMeta::Datagram { wire_len, .. } => {
             let exceeds_packets = sink.report.packets >= sink.budget.max_packets;
             let exceeds_bytes = sink.report.bytes.saturating_add(wire_len) > sink.budget.max_bytes;
             if exceeds_packets || exceeds_bytes {
@@ -2170,7 +2183,11 @@ fn drain_caller_direct_meta<S: DatagramSink + ?Sized>(
             let materialized = {
                 let buf = slot.bytes_mut();
                 match connection.poll_output_into(buf) {
-                    Ok(Some(OutputInto::Datagram { len })) => Ok(len),
+                    Ok(Some(OutputInto::Datagram {
+                        len,
+                        class,
+                        source_due_micros,
+                    })) => Ok((len, class, source_due_micros)),
                     // The peeked datagram is still queued: a datagram that
                     // vanished between peek and poll, or a protocol refusal,
                     // is a real condition of this session -- never "empty".
@@ -2182,9 +2199,9 @@ fn drain_caller_direct_meta<S: DatagramSink + ?Sized>(
                 }
             };
             match materialized {
-                Ok(len) => {
+                Ok((len, class, source_due_micros)) => {
                     // Infallible: the protocol output is consumed exactly once.
-                    slot.commit(len);
+                    slot.commit(len, class, source_due_micros);
                     record_pushed(report, len);
                     (DrainOne::Drained, false)
                 }
@@ -2411,7 +2428,12 @@ mod tests {
             &mut self.buf
         }
 
-        fn commit(self, len: usize) {
+        fn commit(
+            self,
+            len: usize,
+            _class: srt_proto::DatagramClass,
+            _source_due_micros: Option<u64>,
+        ) {
             let mut buf = self.buf;
             buf.truncate(len);
             self.sink.packets.push((self.peer, buf));
@@ -2465,7 +2487,12 @@ mod tests {
             &mut self.buf
         }
 
-        fn commit(self, len: usize) {
+        fn commit(
+            self,
+            len: usize,
+            _class: srt_proto::DatagramClass,
+            _source_due_micros: Option<u64>,
+        ) {
             let mut buf = self.buf;
             buf.truncate(len);
             self.sink.committed.push((self.peer, buf));
@@ -2745,7 +2772,12 @@ mod tests {
             &mut self.buf
         }
 
-        fn commit(self, len: usize) {
+        fn commit(
+            self,
+            len: usize,
+            _class: srt_proto::DatagramClass,
+            _source_due_micros: Option<u64>,
+        ) {
             let mut buf = self.buf;
             buf.truncate(len);
             self.sink.committed.push((self.peer, buf));
@@ -3101,7 +3133,12 @@ mod tests {
             &mut self.buf
         }
 
-        fn commit(self, len: usize) {
+        fn commit(
+            self,
+            len: usize,
+            _class: srt_proto::DatagramClass,
+            _source_due_micros: Option<u64>,
+        ) {
             let mut buf = self.buf;
             buf.truncate(len);
             self.sink.accepted.push((self.peer, buf));
@@ -3328,7 +3365,7 @@ mod tests {
         // Commit (which returns `()`) stores exactly the committed bytes.
         let mut slot = sink.acquire(peer, 8).expect("acquire").expect("capacity");
         slot.bytes_mut()[..8].copy_from_slice(b"12345678");
-        slot.commit(4);
+        slot.commit(4, srt_proto::DatagramClass::DataFirst, None);
         assert_eq!(sink.packets, vec![(peer, b"1234".to_vec())]);
     }
 
@@ -5826,9 +5863,17 @@ mod tests {
             let budget = crate::OutputDrainBudget::new(64, 32, 256 * 1024);
             table.poll_outbound_bounded(Timestamp::default(), budget, &mut out);
             let c = table.sched_counters();
+            // Three visits is the floor for one payload, and every one of them
+            // is O(1) in `n`: materialize the DATA datagram, apply the
+            // `SetTimer` action that submitting it queued (the sender's own
+            // retransmission timeout is armed at the submission boundary), then
+            // find the queue empty. The point of the assertion is that the count
+            // does not grow with the population, which is why it is the same
+            // bound for n = 30, 200 and 1000.
             assert!(
-                c.ready_drain_probes <= 2,
-                "n={n} one_ready should visit ~1 ready caller (at most 2 probes: drained + empty), got {}",
+                c.ready_drain_probes <= 3,
+                "n={n} one_ready should visit ~1 ready caller (at most 3 probes: drained + \
+                 its timer arm + empty), got {}",
                 c.ready_drain_probes
             );
             assert_eq!(
