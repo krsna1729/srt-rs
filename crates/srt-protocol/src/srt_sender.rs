@@ -15,6 +15,7 @@ use crate::sender_packet_window::SenderPacketWindow;
 
 use bytes::Bytes;
 
+use crate::sender_rto::{INITIAL_RTT_VAR_MICROS, INITIAL_SRTT_MICROS, RtoArm, SenderRto};
 use crate::srt_handshake::MAX_FLOW_WINDOW;
 use crate::srt_packet::{DataHeader, PacketPosition, SRT_HEADER_SIZE, sequence_less_than};
 use crate::srt_receiver::LossRange;
@@ -56,6 +57,17 @@ struct SentPacket {
     payload: Bytes,
     sent_time: Timestamp,
     retransmit_count: u32,
+    /// Whether this packet's FIRST datagram has actually left the protocol for
+    /// the transport.
+    ///
+    /// Retention in this buffer only means the packet was *accepted* by the
+    /// sender (see `push_impl`); a datagram still waiting for TX capacity has
+    /// not been transmitted at all. Only a submitted packet may be selected for
+    /// a timeout retransmission, because retransmitting one that has never been
+    /// sent would duplicate a transmission that is still pending, not repair a
+    /// loss. Distinct from `sent_time`, which is the TLPKTDROP message age and
+    /// is deliberately never rewritten by a retransmission.
+    submitted: bool,
 }
 
 /// A message dropped by sender-side TLPKTDROP.
@@ -142,8 +154,35 @@ pub struct SenderBuffer {
     total_acks_received: u64,
     /// NAK control packets received from the peer.
     total_naks_received: u64,
-    /// Most recent measurements advertised by a full peer ACK.
+    /// Most recent measurements advertised by a full peer ACK, kept
+    /// unsmoothed for telemetry -- distinct from `sender_rtt_micros`/
+    /// `sender_rtt_var_micros`, which is this sender's own further-smoothed
+    /// estimate used for the RTO calculation (see
+    /// [`Self::record_peer_feedback`]).
     peer_feedback: Option<PeerFeedback>,
+    /// This sender's own smoothed RTT estimate, in microseconds, per the SRT
+    /// draft's §4.10 RTT estimation: the peer's own (already smoothed) RTT
+    /// report is folded in as one more sample, exactly like the receiver
+    /// half of this crate already smooths its own raw ACKACK round-trip
+    /// samples (`SrtReceiver::handle_ackack`). Distinct from
+    /// `PeerFeedback::rtt_micros`, which is the peer's raw, unsmoothed-by-us
+    /// report. Initialized to [`INITIAL_SRTT_MICROS`], the same starting
+    /// value used before any Full ACK arrives.
+    sender_rtt_micros: u32,
+    /// This sender's own smoothed RTT variance estimate, in microseconds,
+    /// updated alongside `sender_rtt_micros`. Initialized to
+    /// [`INITIAL_RTT_VAR_MICROS`].
+    sender_rtt_var_micros: u32,
+    /// The newest sequence number whose first datagram has actually been
+    /// submitted to the transport, if any.
+    ///
+    /// The per-packet `submitted` flag is the truth; this is the O(1) ceiling
+    /// the timeout probe starts from, so the common case never walks the
+    /// window. First transmissions leave the protocol in sequence order, so it
+    /// only moves forward within one sequence epoch.
+    newest_submitted: Option<u32>,
+    /// Sender retransmission-timeout epoch (see [`crate::sender::SenderRto`]).
+    rto: SenderRto,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -194,6 +233,10 @@ impl SenderBuffer {
             total_acks_received: 0,
             total_naks_received: 0,
             peer_feedback: None,
+            sender_rtt_micros: INITIAL_SRTT_MICROS,
+            sender_rtt_var_micros: INITIAL_RTT_VAR_MICROS,
+            newest_submitted: None,
+            rto: SenderRto::new(),
         };
         buf.recompute_packet_send_period();
         buf
@@ -213,6 +256,7 @@ impl SenderBuffer {
         self.loss_list.clear();
         self.packets.clear();
         self.stale_retransmits = 0;
+        self.newest_submitted = None;
         true
     }
 
@@ -392,6 +436,188 @@ impl SenderBuffer {
         self.packets.has_retransmit_queued()
     }
 
+    /// Queue one probe retransmission of the newest packet that was actually
+    /// submitted to the transport.
+    ///
+    /// A receiver can only name a loss it has evidence for, and a missing
+    /// *suffix* of a flight provides none: no later sequence number arrives to
+    /// expose the gap, so no NAK is generated, `sec_a` stays zero, and the
+    /// payload is simply absent. NAK-driven recovery therefore cannot repair a
+    /// lost flight tail on its own, and the sender's retransmission timer is the
+    /// last party that can notice.
+    ///
+    /// Probing the newest *submitted* packet is the narrow answer: its arrival
+    /// both repairs a lost tail directly and gives the receiver later sequence
+    /// evidence, which is what exposes any older gaps to ordinary selective
+    /// recovery. Replaying the whole unacknowledged flight instead would amplify
+    /// an outage on every timeout, which is why this queues exactly one packet.
+    ///
+    /// A packet that was accepted by the sender but is still waiting for TX
+    /// capacity is not eligible: it has never been on the wire, so
+    /// retransmitting it would not repair a loss. The search therefore starts
+    /// at the newest submitted sequence and steps down over any retained slot
+    /// that has not been submitted (or is already queued). Normal operation
+    /// ends the walk after one step, because the newest submitted packet is
+    /// also the newest retained one.
+    ///
+    /// Returns the sequence queued, or `None` if nothing was eligible.
+    /// Callers must only use this when no selective retransmission is already
+    /// pending, so a NAK-driven recovery in progress is never widened by the
+    /// timer -- and must record the returned sequence as a pending probe
+    /// (see [`crate::sender_rto::SenderRto::probe_pending`]) until it is
+    /// confirmed to have actually left the protocol, so a probe still sitting
+    /// behind blocked TX capacity is never queued a second time.
+    pub fn queue_retransmission_of_newest_submitted(&mut self) -> Option<u32> {
+        let newest = self.newest_submitted?;
+        let mut ceiling = newest;
+        loop {
+            let (sequence, eligible) = self
+                .packets
+                .last_occupied_before(ceiling.wrapping_add(1))
+                .map(|(sequence, entry)| (sequence, entry.submitted))?;
+            // Walked back past the flight: everything at or below here has
+            // been acknowledged and is no longer a candidate.
+            if !sequence_less_than(self.oldest_unacked, sequence.wrapping_add(1)) {
+                return None;
+            }
+            if eligible && !self.packets.retransmit_queued_contains(sequence) {
+                self.packets
+                    .queue_loss_range(sequence, sequence, |sequence| {
+                        self.loss_list.push_back(sequence);
+                    });
+                return Some(sequence);
+            }
+            ceiling = sequence.wrapping_sub(1);
+        }
+    }
+
+    /// Record that a DATA datagram actually left the protocol for the
+    /// transport, and report whether that submission started a new sender-RTO
+    /// epoch.
+    ///
+    /// Callers must only pass datagrams the transport has irrevocably accepted
+    /// (reserved TX capacity already held), because everything downstream --
+    /// probe eligibility, the epoch, TLPKTDROP age -- then treats the packet as
+    /// having been on the wire.
+    ///
+    /// Returns what the caller must do with `TimerId::SenderRto`. An epoch
+    /// already running is never restarted by an ordinary submission: a busy
+    /// sender would otherwise postpone its own timeout indefinitely while one
+    /// early packet stayed stranded. Only cumulative ACK progress restarts it,
+    /// and only an empty flight disarms it. The one exception is the pending
+    /// blind probe finally crossing this boundary: its deadline has to be
+    /// measured from *this* instant, so the caller reprograms the epoch (keeping
+    /// the accumulated backoff) rather than leaving the old one to fire
+    /// immediately after the probe went out.
+    pub fn note_data_submitted(&mut self, sequence: u32) -> RtoArm {
+        if let Some(entry) = self.packets.get_mut(sequence) {
+            entry.submitted = true;
+        }
+        if self
+            .newest_submitted
+            .is_none_or(|newest| sequence_less_than(newest, sequence))
+        {
+            self.newest_submitted = Some(sequence);
+        }
+        let probe_submitted = self.rto.confirm_probe_submitted(sequence);
+        if !self.rto.is_armed() {
+            return RtoArm::Start;
+        }
+        if probe_submitted {
+            return RtoArm::Rearm;
+        }
+        RtoArm::Nothing
+    }
+
+    /// Whether anything that was actually submitted is still unacknowledged.
+    #[must_use]
+    pub fn has_outstanding_submitted_data(&self) -> bool {
+        self.newest_submitted
+            .is_some_and(|newest| sequence_less_than(self.oldest_unacked, newest.wrapping_add(1)))
+    }
+
+    /// Whether `sequence` is still outstanding (not yet acknowledged).
+    #[must_use]
+    fn is_outstanding(&self, sequence: u32) -> bool {
+        sequence_less_than(self.oldest_unacked, sequence.wrapping_add(1))
+    }
+
+    /// Sequence of a blind RTO probe queued for retransmission but not yet
+    /// confirmed to have actually left the protocol -- see
+    /// [`SenderRto::probe_pending`]. Self-heals a stale marker left over from
+    /// a probed sequence that was acknowledged through some other path
+    /// (ordinary delivery, a differently-triggered retransmission) without
+    /// ever crossing this timer's own submission boundary: such a probe can
+    /// never legitimately clear via [`SenderRto::confirm_probe_submitted`], so it
+    /// is dropped here instead of permanently blocking every future probe.
+    #[must_use]
+    pub fn rto_probe_pending(&mut self) -> Option<u32> {
+        if let Some(sequence) = self.rto.probe_pending()
+            && !self.is_outstanding(sequence)
+        {
+            self.rto.confirm_probe_submitted(sequence);
+        }
+        self.rto.probe_pending()
+    }
+
+    /// Record that a blind probe of `sequence` was just queued.
+    pub fn rto_set_probe_pending(&mut self, sequence: u32) {
+        self.rto.set_probe_pending(sequence);
+    }
+
+    /// The oldest un-acknowledged sequence number.
+    #[must_use]
+    pub fn oldest_unacked_sequence(&self) -> u32 {
+        self.oldest_unacked
+    }
+
+    /// Current base timeout from the peer's most recent Full-ACK measurements.
+    #[must_use]
+    pub fn rto_base_timeout_micros(&self) -> u64 {
+        // This sender's own smoothed estimate (see `record_peer_feedback`),
+        // never the peer's raw report directly -- it is already initialized
+        // to the same starting constants `SenderRto::base_timeout_micros`
+        // would otherwise fall back to, so there is no "no Full ACK yet"
+        // case left to express with `None`.
+        SenderRto::base_timeout_micros(Some((self.sender_rtt_micros, self.sender_rtt_var_micros)))
+    }
+
+    /// Start a fresh RTO epoch, returning the timeout to program.
+    pub fn rto_start(&mut self) -> u64 {
+        self.rto.start(self.rto_base_timeout_micros())
+    }
+
+    /// Reprogram the RTO epoch from the instant the pending blind probe was
+    /// actually submitted, returning the timeout to program.
+    ///
+    /// Distinct from [`Self::rto_start`]: this preserves the accumulated
+    /// backoff, because a submission is not ACK progress.
+    pub fn rto_rearm(&mut self) -> u64 {
+        self.rto.rearm(self.rto_base_timeout_micros())
+    }
+
+    /// Stop the RTO epoch: nothing submitted is outstanding any more.
+    pub fn rto_stop(&mut self) {
+        self.rto.stop();
+    }
+
+    /// Record an RTO expiry, returning the backed-off timeout to program.
+    pub fn rto_expire(&mut self) -> u64 {
+        self.rto.expire(self.rto_base_timeout_micros())
+    }
+
+    /// Whether an RTO epoch is running.
+    #[must_use]
+    pub fn rto_is_armed(&self) -> bool {
+        self.rto.is_armed()
+    }
+
+    /// Consecutive RTO expiries without cumulative ACK progress.
+    #[must_use]
+    pub fn rto_backoffs(&self) -> u32 {
+        self.rto.backoffs()
+    }
+
     /// Set the active flow window (the congestion window tracks it too; see
     /// [`Self::new`] for LIVE mode's behavior). The constructor's window is
     /// the permanent maximum, so peer feedback can shrink and reopen this
@@ -526,6 +752,7 @@ impl SenderBuffer {
                     payload: retained,
                     sent_time: now,
                     retransmit_count: 0,
+                    submitted: false,
                 },
             )
             .expect("alias-free live span checked by can_send");
@@ -594,6 +821,7 @@ impl SenderBuffer {
                         payload: retained,
                         sent_time: now,
                         retransmit_count: 0,
+                        submitted: false,
                     },
                 )
                 .expect("alias-free live span checked by can_send");
@@ -737,7 +965,21 @@ impl SenderBuffer {
         self.stale_retransmits = 0;
     }
 
-    /// Retain measurements carried by the most recent full ACK.
+    /// Retain measurements carried by the most recent full ACK, and fold the
+    /// peer's reported RTT into this sender's own smoothed estimate.
+    ///
+    /// The draft's §4.10 RTT estimation is defined at whichever node is doing
+    /// the estimating, from its own raw round-trip samples; a receiver's
+    /// `rtt_micros` report is itself already smoothed at the receiver. This
+    /// sender does not get raw round-trip samples of its own (it never sees a
+    /// timestamp echo the way ACKACK gives the receiver one), so the input to
+    /// its own §4.10 smoothing is the peer's report, treated as one more
+    /// sample rather than substituted wholesale -- otherwise every Full ACK
+    /// would simply replace the sender's RTO input with whatever the peer
+    /// last measured, which is exactly the smoothing the draft specifies
+    /// against. `peer_feedback` keeps the raw, unsmoothed-by-us report for
+    /// telemetry; `sender_rtt_micros`/`sender_rtt_var_micros` is what the RTO
+    /// actually consumes.
     pub(crate) fn record_peer_feedback(
         &mut self,
         rtt_micros: u32,
@@ -755,6 +997,15 @@ impl SenderBuffer {
             link_capacity_packets_per_second,
             receiving_rate_bytes_per_second,
         });
+        if rtt_micros > 0 {
+            // Smooth with EWMA: RTT = 7/8 * RTT + 1/8 * sample -- the same
+            // estimator `SrtReceiver::handle_ackack` uses for its own raw
+            // samples.
+            self.sender_rtt_micros = (self.sender_rtt_micros * 7 / 8) + (rtt_micros / 8);
+            // RTTVar = 3/4 * RTTVar + 1/4 * |RTT - sample|
+            let diff = self.sender_rtt_micros.abs_diff(rtt_micros);
+            self.sender_rtt_var_micros = (self.sender_rtt_var_micros * 3 / 4) + (diff / 4);
+        }
     }
 
     /// Remove expired packets (TLPKTDROP), dropping entire messages.
@@ -1766,6 +2017,73 @@ mod tests {
         );
     }
 
+    /// TLPKTDROP age is the message's ORIGINAL send time. A retransmission --
+    /// NAK-driven or the sender's own timeout probe -- must not push that
+    /// deadline out, or recovery work would extend the life of data the
+    /// receiver has already given up on.
+    #[test]
+    fn retransmission_does_not_extend_the_tlpktdrop_lifetime() {
+        let mut buf = SenderBuffer::new(0, 8192, 10);
+        let send_time = Timestamp::from_micros(0);
+        buf.push(vec![1], 100, 1, send_time);
+        assert_eq!(
+            buf.note_data_submitted(0),
+            RtoArm::Start,
+            "first submission starts an epoch"
+        );
+        assert!(
+            buf.queue_retransmission_of_newest_submitted().is_some(),
+            "the probe queues the newest submitted packet"
+        );
+
+        // Unchanged deadline: not dropped at exactly one second (the `>` rule),
+        // dropped one microsecond later, exactly as without the retransmission.
+        assert!(
+            buf.drop_expired(Timestamp::from_micros(1_000_000))
+                .is_empty(),
+            "a retransmission must not age the message"
+        );
+        assert_eq!(
+            dropped_seqs(&buf.drop_expired(Timestamp::from_micros(1_000_001))),
+            vec![0],
+            "the original send time still decides TLPKTDROP"
+        );
+    }
+
+    /// The three events a submission can be: the first one after an empty flight
+    /// starts an epoch, an ordinary one while an epoch runs changes nothing, and
+    /// the pending blind probe actually going out reprograms the epoch.
+    #[test]
+    fn submission_reports_which_rto_event_it_is() {
+        let now = Timestamp::from_micros(0);
+        let mut buf = SenderBuffer::new(0, 8192, 10);
+        buf.push(vec![1], 100, 1, now);
+        buf.push(vec![2], 100, 1, now);
+
+        assert_eq!(buf.note_data_submitted(0), RtoArm::Start);
+        // The connection arms the epoch when it sees `Start`; only then is there
+        // a running epoch for an ordinary submission to leave alone.
+        buf.rto_start();
+        assert_eq!(
+            buf.note_data_submitted(1),
+            RtoArm::Nothing,
+            "an ordinary submission must not restart a running epoch"
+        );
+
+        assert_eq!(buf.queue_retransmission_of_newest_submitted(), Some(1));
+        buf.rto_set_probe_pending(1);
+        assert_eq!(
+            buf.note_data_submitted(0),
+            RtoArm::Nothing,
+            "a submission that is not the pending probe must not reprogram anything"
+        );
+        assert_eq!(
+            buf.note_data_submitted(1),
+            RtoArm::Rearm,
+            "the pending probe crossing the submission boundary reprograms the epoch"
+        );
+    }
+
     #[test]
     fn test_drop_expired_threshold_125pct() {
         // latency_ms = 1000 (1000ms) の場合、1.25 * 1_000_000 = 1_250_000 > 1_000_000 なので
@@ -1926,5 +2244,54 @@ mod tests {
         assert_eq!(stats.peer_rtt_micros, Some(5_000));
         assert_eq!(stats.peer_available_buffer_packets, Some(60));
         assert_eq!(stats.peer_link_capacity_bytes_per_second, Some(3_000_000));
+    }
+
+    /// SRT draft §4.10: the RTO's RTT input is this sender's own smoothed
+    /// estimate, with the peer's report folded in as one sample -- never a
+    /// direct replacement. `stats().peer_rtt_micros` (telemetry) reflects the
+    /// raw report immediately; `rto_base_timeout_micros()` must not.
+    #[test]
+    fn sender_rtt_is_smoothed_not_replaced_by_raw_peer_feedback() {
+        let mut buf = SenderBuffer::new(0, 64, 120);
+        assert_eq!(
+            buf.rto_base_timeout_micros(),
+            SenderRto::base_timeout_micros(None),
+            "before any Full ACK, the RTO base uses the same initial constants"
+        );
+
+        buf.record_peer_feedback(20_000, 1_000, 60, 1_000, 2_000, 1_500_000);
+        assert_eq!(
+            buf.stats().peer_rtt_micros,
+            Some(20_000),
+            "telemetry keeps the raw, unsmoothed report"
+        );
+        // One report must not overwrite the sender's own estimate outright:
+        // a sudden change moves the variance term first (correctly, per
+        // Jacobson's algorithm, that alone can widen the timeout before it
+        // narrows), so the only property checked here is that it is not the
+        // same value a direct substitution would produce.
+        let after_one = buf.rto_base_timeout_micros();
+        assert_ne!(
+            after_one,
+            SenderRto::base_timeout_micros(Some((20_000, 1_000))),
+            "one report must not overwrite the sender's own estimate outright"
+        );
+
+        // Repeated identical RTT reports converge the sender's own RTT
+        // estimate toward what the peer keeps reporting (20 ms), and its
+        // variance estimate toward zero (the reported RTT never varies) --
+        // note the peer's reported `rtt_variance_micros` is deliberately not
+        // itself part of the input; the draft derives variance from the RTT
+        // residual, not by taking the peer's own variance figure directly.
+        // The base timeout should settle near `rtt + 2*SYN = 40 ms`.
+        for _ in 0..50 {
+            buf.record_peer_feedback(20_000, 1_000, 60, 1_000, 2_000, 1_500_000);
+        }
+        let converged = buf.rto_base_timeout_micros();
+        assert!(
+            (35_000..=45_000).contains(&converged),
+            "converged={converged} must settle near 40 ms (20 ms RTT + 2x10 ms SYN, \
+             variance driven toward 0 by the constant reported RTT)"
+        );
     }
 }

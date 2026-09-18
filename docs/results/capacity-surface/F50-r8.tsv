@@ -1,0 +1,6 @@
+# scaling-sweep n=50 shards=1 fanout=50 tx_lanes=256 connect_cc=64 window_ms=10000 
+# reps=2 base_port=34000 payload_bytes=1316 git_sha=1081a5e git_dirty=true
+kind	rep	shard	fanout	established	expected_ticks	generated_ticks	missed_source_ticks	data_offered	data_accepted	tx_submitted_wire	tx_completed	drain_submitted	drain_completed	drain_ok	pending_after_drain	inflight_at_window_end	service_visits	lateness_us_p50	p99	max	window_cpu_ms	drain_cpu_ms	cpu_ms	rx_mode	managed_rx	rx_dropped	rx_truncated	tx_pool_free	tx_pool_capacity	payload_bytes	interval_us	rx_connections	rx_established	rx_pkt_sent	rx_core_total	rx_sec_a	rx_rtt_ms	rx_elapsed_s	rx_cpu_user_ms	rx_cpu_sys_ms	rx_data_min	rx_data_p50	rx_data_max	rx_data_zero	rx_data_below_half_mean
+ROW	1	0	50	50	7598	7598	0	379900	379900	467283	467233	0	50	true	0	50	7387	145	2590	11308	6262.1	0.1	6262.2	Some(RawReadiness)	false	0	0			1316	1316	50	50	379900	379900	0	25.038	15.133	2388.9	3499.6	7598	7598	7598	0	0
+ROW	2	0	50	50	7598	7598	0	379900	379900	462637	462576	11	72	true	0	61	7169	169	8091	37357	6586.1	0.3	6586.5	Some(RawReadiness)	false	0	0			1316	1316	50	50	379900	379900	0	24.118	15.128	2640.4	3625.8	7598	7598	7598	0	0
+AGG	2	1			7598	7598	0	379900	379900	462637	462576	11	72				7169	169	8091	37357												50	50		379900	0					7598			0	0

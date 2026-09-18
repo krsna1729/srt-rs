@@ -6,11 +6,16 @@ use srt_proto::Timestamp;
 /// Fixed number of power-of-two buckets used for owner-local shard lateness.
 pub const SHARD_LATENESS_BUCKETS: usize = 32;
 /// Fixed number of overload counters in each shard snapshot.
-pub const SHARD_OVERLOAD_REASONS: usize = 4;
+///
+/// Derived from the enum's own variant count rather than written out: the two
+/// drifted apart once already, and a category the snapshot cannot index is an
+/// out-of-bounds write on the recording path.
+pub const SHARD_OVERLOAD_REASONS: usize = ShardOverloadReason::COUNT;
 
 /// Fixed overload categories. Keeping this an enum rather than accepting
 /// arbitrary labels makes snapshot storage and exporter cardinality bounded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
 pub enum ShardOverloadReason {
     ReceiveBudget = 0,
     OutputBudget = 1,
@@ -23,10 +28,32 @@ pub enum ShardOverloadReason {
 }
 
 impl ShardOverloadReason {
+    /// Number of variants, i.e. the length of `overloads`.
+    pub const COUNT: usize = 5;
+
+    /// Every variant, so tests and exporters can iterate the whole category
+    /// space instead of listing it a second time (and forgetting a new one).
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::ReceiveBudget,
+        Self::OutputBudget,
+        Self::OutputBackpressure,
+        Self::QueueLimit,
+        Self::OutputProtocolError,
+    ];
+
+    /// The highest discriminant. Asserted against `COUNT` at compile time, so
+    /// adding a category without updating `COUNT` and `ALL` cannot compile.
+    const LAST: Self = Self::OutputProtocolError;
+
     const fn index(self) -> usize {
         self as usize
     }
 }
+
+const _: () = assert!(
+    ShardOverloadReason::LAST as usize + 1 == ShardOverloadReason::COUNT,
+    "ShardOverloadReason::COUNT must match the number of variants"
+);
 
 /// Fixed-size, serialization-friendly snapshot for one application-owned
 /// shard. The shard owns and mutates [`ShardTelemetry`]; exporters can copy
@@ -487,10 +514,84 @@ impl IngressTelemetry {
     }
 }
 
+/// SRT-level receiver accounting across sessions.
+///
+/// A different layer from the Owner's socket-level RX counters
+/// (`compio_transport::OwnerRxStats`): those describe what the *socket* did --
+/// datagrams read, ring depth, datagrams truncated at the provided-buffer
+/// boundary. These two totals describe what the *protocol* concluded about the
+/// DATA stream those datagrams carried: a sequence number that never arrived
+/// (or was abandoned past its TLPKTDROP deadline) is a loss, and a DATA packet
+/// that duplicates an already-accepted packet is a duplicate. Neither implies
+/// the other in either direction. A run that reads every datagram flawlessly
+/// can still record loss when the peer dropped a packet before the wire, and a
+/// retransmission storm shows up here as duplicates while the socket reports
+/// nothing unusual at all.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RcvTotals {
+    /// DATA packets the protocol declared lost (missing past their gap, or
+    /// TLPKTDROP-abandoned).
+    pub lost: u64,
+    /// DATA packets received more than once (retransmissions that duplicate an
+    /// already-accepted packet count here).
+    pub duplicates: u64,
+}
+
+impl RcvTotals {
+    /// Add one connection's counters, saturating rather than wrapping.
+    ///
+    /// Saturation is the honest choice for a monotone protocol counter: a
+    /// wrapped total would read as a *decrease* in loss, which is worse than a
+    /// pinned one for any consumer watching a delta.
+    pub fn accumulate(&mut self, lost: u64, duplicates: u64) {
+        self.lost = self.lost.saturating_add(lost);
+        self.duplicates = self.duplicates.saturating_add(duplicates);
+    }
+
+    /// Fold another aggregate in, e.g. a table's retired-session ledger or a
+    /// second shard's totals.
+    pub fn merge(&mut self, other: RcvTotals) {
+        self.accumulate(other.lost, other.duplicates);
+    }
+
+    /// Fold one connection's receiver snapshot in. `None` means the connection
+    /// has no receiver direction yet (its handshake has not finished), which
+    /// contributes nothing.
+    ///
+    /// Crate-internal because it exists so a table can sample live sessions and
+    /// its retired ledger through the same rule; the public aggregate surface
+    /// stays [`Self::accumulate`] and [`Self::merge`].
+    pub(crate) fn observe(&mut self, stats: Option<&srt_proto::receiver::ReceiverStats>) {
+        if let Some(stats) = stats {
+            self.accumulate(stats.total_lost, stats.total_duplicates);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    /// `RcvTotals` accumulates monotonically: a consumer watching a delta must
+    /// never see wrapping turn a very large loss count into a small one.
+    #[test]
+    fn rcv_totals_saturate_instead_of_wrapping() {
+        let mut totals = RcvTotals {
+            lost: u64::MAX - 1,
+            duplicates: 0,
+        };
+        totals.accumulate(5, 3);
+        assert_eq!(totals.lost, u64::MAX);
+        assert_eq!(totals.duplicates, 3);
+
+        totals.merge(RcvTotals {
+            lost: 10,
+            duplicates: u64::MAX,
+        });
+        assert_eq!(totals.lost, u64::MAX);
+        assert_eq!(totals.duplicates, u64::MAX);
+    }
 
     #[test]
     fn snapshot_starts_at_zero() {
@@ -644,6 +745,30 @@ mod tests {
         );
         assert_eq!(snapshot.overload_count(ShardOverloadReason::QueueLimit), 1);
         assert_eq!(snapshot.overload_total(), 3);
+    }
+
+    /// Every category must be recordable, and the fixed array must be exactly
+    /// as long as the category space. `OutputProtocolError` used to sit past the
+    /// end of a four-slot array, so recording it indexed out of bounds; the
+    /// length is now derived from the enum itself.
+    #[test]
+    fn every_overload_reason_is_recordable_within_the_fixed_array() {
+        let mut telemetry = ShardTelemetry::new();
+        for reason in ShardOverloadReason::ALL {
+            telemetry.record_overload(reason);
+        }
+
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.overloads.len(), SHARD_OVERLOAD_REASONS);
+        assert_eq!(snapshot.overloads.len(), ShardOverloadReason::ALL.len());
+        assert_eq!(
+            snapshot.overload_total(),
+            ShardOverloadReason::COUNT as u64,
+            "every variant must be counted exactly once"
+        );
+        for reason in ShardOverloadReason::ALL {
+            assert_eq!(snapshot.overload_count(reason), 1, "{reason:?}");
+        }
     }
 
     #[test]

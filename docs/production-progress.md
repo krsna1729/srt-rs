@@ -219,3 +219,72 @@ PR body, nor a reviewer is directed at removed architecture:
 - Cleanup: `advanced::compat`/`SrtStackConfig` re-export deleted; `CallerSide` alias removed (canonical `OwnerCallerSide`); `new_single` test-only; `PendingData`/`PendingDatagram` privatized (public contract: `peek_output`/`poll_output_into`/`OutputMeta`/`OutputInto`); `TxEngine` privatized; `compio =0.19.2` pinned in srt-transport and srt-bench.
 - Bench: per-port receiver handshake deadline arms on first received datagram (+ 3x process backstop) in compio/tokio; mio backstop added. Prior 600 result marked INVALID; rerun pending.
 - Deferred (explicit, non-blocking): managed multishot RX datapath (blocked by kernel PBUF_RING EINVAL on this host; single-reader fallback stays); shared-Owner two-process qualification rerun at 600/1000; native io_uring backend.
+
+## Bounded-correctness closeout: the recovery defect and the submission account (2026-09-17)
+
+The branch's end-of-run conservation deficit was a real transport correctness gap,
+not accounting. This section records what it was, what fixed it, and what the
+post-fix evidence is.
+
+- **The defect.** A receiver can only NAK a gap that a *later* sequence number
+  exposes, so a lost *suffix* of a flight was invisible to it (`sec_a` stayed
+  zero, no loss reported) while the payloads were simply absent -- and the
+  sender's only retransmission trigger was NAK-fed, so nothing ever asked for
+  them again. Reproduced deterministically (`4 of 4` delivered with nothing
+  dropped, `3 of 4` with the final datagram withheld) and fixed in two commits:
+  the recovery *action* first (`fix(protocol): recover a lost flight tail instead
+  of stranding it`), then the *trigger* (`fix(protocol): arm and fire the
+  sender's own loss timeout`). Differential reference: Robotweax/srt `983a6bd`
+  (non-progress ACKs must not starve live tail recovery) and `a02c308` (bound
+  Live timeout recovery to one tail probe); no source copied, recorded in
+  `docs/differential-audit-robotweax.md`.
+- **Two mechanisms, separated.** `TimerId::RetransmitContinue` is a zero-delay
+  continuation of already-queued work and carries no notion of loss or elapsed
+  time; `TimerId::SenderRto` is a real timeout (`SRTT + 4*RTTVar + 2*COMM_SYN`
+  with backoff) armed when DATA is *submitted* (not merely accepted), reset only
+  on cumulative ACK **progress**, and expiring into exactly one probe of the
+  newest submitted packet -- and only when no selective recovery is already
+  pending. TLPKTDROP age still comes from the original `sent_time`.
+- **The trigger is load-bearing, and proven so.** Disabling the submission arming
+  fails `a_flight_lost_in_full_is_recovered_by_the_submission_trigger` in both
+  crates; disabling fault detection fails the TX-lane fault regression at its
+  fault assertion. `crates/srt-transport/tests/tail_recovery.rs` drives the whole
+  path through the real `ManualTimerStore` and never calls `handle_timer`.
+- **Submission accounting.** `DatagramClass` is decided by the protocol at
+  materialization and carried through `DatagramSlot::commit`; `OwnerServiceReport`
+  reports a per-visit class partition with `sum(classes) == tx_packets_submitted`
+  enforced, `FirstSubmitLateness` (two-tier histogram -- 100 x 100 us fine
+  buckets through 10 ms, then 990 x 1 ms coarse buckets through 1 s, plus
+  overflow -- with an exact max, reset-on-read) measures the deadline-to-wire
+  path at lane handoff, `TxPoolSnapshot::high_water`
+  reports the pool peak, and `Owner::rx_session_totals` exposes SRT-level receive
+  `lost`/`duplicates` including retired sessions (each table keeps a retired
+  ledger sampled at relinquish time).
+- **Gate and contract.** `cargo xtask qualify` now requires the row to be the
+  offered workload (the requested fanout established at both endpoints,
+  `data_offered == generated_ticks x established`, `data_accepted ==
+  data_offered`), to decompose
+  (`sum(tx_class_*) == tx_class_total == tx_submitted_wire`), to record the
+  send-outcome counters, and to account for the terminal fence
+  (`data_accepted + fence seen == rx_core_total`); the bench asserts the partition
+  before printing. Qualification counts repetitions rather than rows -- a
+  repetition passes only when every shard row in it passes -- and a canonical
+  artifact additionally carries `owner_faulted`, the driver's own build
+  provenance, and a bound on packet-level duplicates. `cargo xtask scaling`
+  builds the binaries it benchmarks. `docs/owner-contract.md` freezes the Owner's
+  *semantics* clause by clause with its test map, and lists what stays unfrozen
+  (pool and lane implementation, heaps, io_uring flags, batching).
+- **Owner telemetry fix.** `SHARD_OVERLOAD_REASONS` was 4 while
+  `ShardOverloadReason` had five variants, so recording `OutputProtocolError`
+  indexed past the array. The count is now derived from the enum with a
+  compile-time assertion, and a test records every variant.
+- **Evidence.** `docs/results/capacity-surface/README.md`: two clean-tree sweeps
+  at `5c7a0c3`, F=50 x 8 Mbps x K=256 x 60 s x 3 reps. Sweep B is 3 of 3 under the
+  pre-frozen criteria; sweep A is 2 of 3, its one failure a *source* stall (68
+  missed boundaries). Six of six on every transport-side criterion, with exact
+  conservation and `sec_a = 0` in all six -- against a pre-fix surface that lost
+  765-6 670 datagrams per window at K=64 and 256 payloads in one of three
+  repetitions at K=256. One measurement defect found and fixed on the way: the
+  drain declared equilibrium before the sender's timeout could expire, which read
+  as 239 accepted-but-undelivered payloads; a run now ends at protocol
+  quiescence, not TX quiescence.

@@ -532,7 +532,38 @@ fn drain_receiver_packets(
     fed
 }
 
+/// Fold one received application payload into the diagnostic accounting.
+///
+/// Returns the number of *measured* application events this payload contributes
+/// (0 or 1), so each caller stays a single expression and the classification
+/// lives in one place. A fence never contributes: it is a diagnostic sentinel,
+/// not workload DATA, and counting it would inflate `data_events`, `core_total`
+/// and every ratio built on them.
+fn note_received_payload(
+    payload: &[u8],
+    diag: &mut Option<crate::qual_payload::DiagStats>,
+    measured_so_far: u64,
+) -> u64 {
+    match crate::qual_payload::classify(payload) {
+        crate::qual_payload::PayloadKind::Measured { tick } => match diag.as_mut() {
+            // Counted on first observation only; a repeat is a benchmark-level
+            // duplicate, a different layer from the protocol's own duplicate
+            // counter in `receiver_stats()`.
+            Some(d) => u64::from(d.note_measured(tick)),
+            None => 1,
+        },
+        crate::qual_payload::PayloadKind::Fence { .. } => {
+            if let Some(d) = diag.as_mut() {
+                d.note_fence(measured_so_far);
+            }
+            0
+        }
+        crate::qual_payload::PayloadKind::Foreign => 1,
+    }
+}
+
 fn handle_receiver_events(
+    diag: &mut Option<crate::qual_payload::DiagStats>,
     cfg: &BenchConfig,
     driver: &mut Conn,
     stats: &mut ConnStats,
@@ -550,8 +581,8 @@ fn handle_receiver_events(
                         Some(Instant::now() + Duration::from_secs_f64(cfg.duration_secs));
                 }
             }
-            ConnectionEvent::DataReceived { .. } => {
-                stats.data_events += 1;
+            ConnectionEvent::DataReceived { payload, .. } => {
+                stats.data_events += note_received_payload(&payload, diag, stats.data_events);
             }
             ConnectionEvent::Disconnected { reason } => {
                 eprintln!("[bench-compio] disconnected: {reason}");
@@ -629,6 +660,12 @@ async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> Co
     // backstop (3x CONNECT_TIMEOUT) still guarantees termination.
     let mut connect_deadline: Option<Instant> = None;
     let process_backstop = Instant::now() + 3 * crate::CONNECT_TIMEOUT;
+    // Created once per connection, not once per service visit: a per-visit
+    // DiagStats would reset the tick set on every iteration and report an empty
+    // measurement for a connection that received everything.
+    let mut diag = cfg
+        .diag_expected_ticks
+        .map(crate::qual_payload::DiagStats::new);
 
     loop {
         if !stats.connected
@@ -664,9 +701,41 @@ async fn receiver_task(cfg: BenchConfig, listen_port: u16, start: Instant) -> Co
         driver.fire_expired(t);
         drain_outputs(&mut driver, t).await;
 
-        handle_receiver_events(&cfg, &mut driver, &mut stats, &mut stream_deadline);
+        handle_receiver_events(
+            &mut diag,
+            &cfg,
+            &mut driver,
+            &mut stats,
+            &mut stream_deadline,
+        );
     }
 
+    if let Some(d) = diag.as_mut() {
+        d.finish();
+        stats.diag_active = true;
+        stats.diag_fences_seen = d.fences_seen;
+        stats.diag_data_at_fence = d.data_at_fence;
+        stats.diag_missing_at_fence = d.missing_at_fence;
+        stats.diag_missing_final = d.missing_final;
+        stats.diag_missing_is_suffix = d.missing_is_suffix;
+        stats.diag_duplicate_payloads = d.duplicate_payloads();
+        // Per-connection, once, to the retained log: the compact missing set is
+        // diagnostic detail that would not fit the one-line row schema.
+        eprintln!(
+            "[diag] measured_received={} expected={} fence_seen={} data_at_fence={} \
+             missing_at_fence={} at_fence=[{}] missing_final={} final=[{}] suffix={} dup_payloads={}",
+            d.measured_received(),
+            d.expected(),
+            d.fences_seen,
+            d.data_at_fence,
+            d.missing_at_fence,
+            d.missing_ranges_at_fence,
+            d.missing_final,
+            d.missing_ranges_final,
+            d.missing_is_suffix,
+            d.duplicate_payloads(),
+        );
+    }
     record_receiver_stats(&driver, &mut stats);
     stats.datapath_queue = received_receiver.stats();
     stats
@@ -1092,6 +1161,9 @@ fn relocate_to_owner(
 /// socket that admission already connected instead of discovering the
 /// peer itself.
 async fn established_conn_task(mut driver: Conn, cfg: BenchConfig, start: Instant) -> ConnStats {
+    let mut diag = cfg
+        .diag_expected_ticks
+        .map(crate::qual_payload::DiagStats::new);
     // `connected` is live state, used only for the loop-exit check below
     // (it flips false on Disconnected). The task is only ever spawned
     // post-promotion (Connected has already fired), so it was *always*
@@ -1157,9 +1229,12 @@ async fn established_conn_task(mut driver: Conn, cfg: BenchConfig, start: Instan
 
         while let Some(ev) = driver.protocol_mut().poll_event() {
             match ev {
-                ConnectionEvent::DataReceived { .. } => {
-                    data_events += 1;
+                ConnectionEvent::DataReceived { payload, .. } => {
                     last_data_at = Instant::now();
+                    // The APPLICATION payload, not the wire packet: by the time
+                    // this event exists, reassembly has produced the measured
+                    // bytes the sender offered.
+                    data_events += note_received_payload(&payload, &mut diag, data_events);
                 }
                 ConnectionEvent::Disconnected { reason } => {
                     eprintln!("[bench-compio] disconnected: {reason}");
@@ -1172,10 +1247,36 @@ async fn established_conn_task(mut driver: Conn, cfg: BenchConfig, start: Instan
         }
     }
 
+    if let Some(d) = diag.as_mut() {
+        d.finish();
+        // The compact per-peer missing set goes to the retained log rather than
+        // the row schema, which stays one line wide.
+        eprintln!(
+            "[diag] measured_received={} expected={} fence_seen={} data_at_fence={} \
+             missing_at_fence={} at_fence=[{}] missing_final={} final=[{}] suffix={} dup_payloads={}",
+            d.measured_received(),
+            d.expected(),
+            d.fences_seen,
+            d.data_at_fence,
+            d.missing_at_fence,
+            d.missing_ranges_at_fence,
+            d.missing_final,
+            d.missing_ranges_final,
+            d.missing_is_suffix,
+            d.duplicate_payloads(),
+        );
+    }
     let mut stats = ConnStats {
         connected: true,
         torn_down,
         data_events,
+        diag_active: diag.is_some(),
+        diag_fences_seen: diag.as_ref().map(|d| d.fences_seen).unwrap_or(0),
+        diag_data_at_fence: diag.as_ref().map(|d| d.data_at_fence).unwrap_or(0),
+        diag_missing_at_fence: diag.as_ref().map(|d| d.missing_at_fence).unwrap_or(0),
+        diag_missing_final: diag.as_ref().map(|d| d.missing_final).unwrap_or(0),
+        diag_missing_is_suffix: diag.as_ref().map(|d| d.missing_is_suffix).unwrap_or(false),
+        diag_duplicate_payloads: diag.as_ref().map(|d| d.duplicate_payloads()).unwrap_or(0),
         ..Default::default()
     };
     if let Some(s) = driver.protocol().receiver_stats() {

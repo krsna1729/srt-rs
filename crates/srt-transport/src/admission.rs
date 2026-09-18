@@ -3,11 +3,11 @@ use crate::{
     DatagramSink, DatagramSlot, DenseDueIndex, DenseSlotArena, DueIndex, GroupConnectionStats,
     GroupLogicalCounters, InboundGroupStats, IngressTelemetry, ListenerPeerPolicy, MAX_DENSE_SLOTS,
     ManualTimerStore, OutputDrainBudget, OutputDrainReport, OutputDrainStatus, PeerSlotId,
-    SinkOutcome, WorkerMessage, group_connection_stats,
+    RcvTotals, SinkOutcome, WorkerMessage, group_connection_stats,
 };
 use srt_proto::{
-    Bytes, ConnectionEvent, ConnectionOptions, ConnectionOutput, DisconnectReason, OutputInto,
-    OutputMeta, SrtConnection, Timestamp,
+    Bytes, ConnectionEvent, ConnectionOptions, ConnectionOutput, DatagramClass, DisconnectReason,
+    OutputInto, OutputMeta, SrtConnection, Timestamp,
 };
 use std::collections::hash_map::Entry as HashEntry;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -947,6 +947,13 @@ pub struct PeerTable {
     groups: HashMap<srt_lifecycle::LogicalGroupKey, InboundGroup>,
     next_group_generation: u64,
     last_now: Timestamp,
+    /// SRT-level receiver totals of every logical peer this table has retired.
+    ///
+    /// A retired connection is handed back to the application, so its protocol
+    /// accounting is no longer reachable through the table; without this ledger
+    /// a run's loss and duplicate counts would silently shrink as peers churn.
+    /// Fixed-size (two scalars), so churn can never grow it.
+    retired_rcv: RcvTotals,
     config: PeerTableConfig,
 }
 
@@ -1038,6 +1045,7 @@ impl PeerTable {
             groups: HashMap::new(),
             next_group_generation: 1,
             last_now: Timestamp::default(),
+            retired_rcv: RcvTotals::default(),
             config,
         }
     }
@@ -2689,11 +2697,17 @@ impl PeerTable {
                         return Some(true);
                     }
                 };
+                // Already-materialized compatibility packet: the class the
+                // protocol computed was dropped by the allocating
+                // `ConnectionOutput::SendPacket` API upstream, so there is
+                // nothing to classify it by short of parsing wire bytes.
+                // `OtherControl` is the honest "no category of its own" slot
+                // for it, and no submission-class accounting reads this path.
                 {
                     let buf = slot.bytes_mut();
                     buf[..wire_len].copy_from_slice(bytes);
                 }
-                slot.commit(wire_len);
+                slot.commit(wire_len, DatagramClass::OtherControl, None);
                 entry.pending_outputs.pop_front();
                 record_peer_pushed(report, wire_len);
                 Some(false)
@@ -2721,7 +2735,11 @@ impl PeerTable {
         report: &mut OutputDrainReport,
     ) -> PeerDrainStep {
         match meta {
-            OutputMeta::Datagram { wire_len } => {
+            // The peeked class is not needed here: the class that is
+            // accounted is the one `poll_output_into` reports for the
+            // datagram it actually consumed, so there is exactly one source
+            // of class truth on this path.
+            OutputMeta::Datagram { wire_len, .. } => {
                 let exceeds_packets = report.packets >= budget.max_packets;
                 let exceeds_bytes = report.bytes.saturating_add(wire_len) > budget.max_bytes;
                 if exceeds_packets || exceeds_bytes {
@@ -2747,7 +2765,11 @@ impl PeerTable {
                 let materialized = {
                     let buf = slot.bytes_mut();
                     match entry.conn.poll_output_into(buf) {
-                        Ok(Some(OutputInto::Datagram { len })) => Ok(len),
+                        Ok(Some(OutputInto::Datagram {
+                            len,
+                            class,
+                            source_due_micros,
+                        })) => Ok((len, class, source_due_micros)),
                         // The peeked datagram is still queued: a datagram that
                         // vanished between peek and poll, or a protocol
                         // refusal, is a real condition of this peer -- never
@@ -2760,8 +2782,8 @@ impl PeerTable {
                     }
                 };
                 match materialized {
-                    Ok(len) => {
-                        slot.commit(len);
+                    Ok((len, class, source_due_micros)) => {
+                        slot.commit(len, class, source_due_micros);
                         record_peer_pushed(report, len);
                         PeerDrainStep::Continue
                     }
@@ -2984,11 +3006,14 @@ impl PeerTable {
                         return Some(true);
                     }
                 };
+                // Already-materialized compatibility packet: see
+                // `drain_peer_legacy_output` -- the class was dropped by the
+                // allocating `SendPacket` API and nothing here can recover it.
                 {
                     let buf = slot.bytes_mut();
                     buf[..wire_len].copy_from_slice(bytes);
                 }
-                slot.commit(wire_len);
+                slot.commit(wire_len, DatagramClass::OtherControl, None);
                 leg.pending_outputs.pop_front();
                 record_peer_pushed(report, wire_len);
                 Some(false)
@@ -3016,7 +3041,11 @@ impl PeerTable {
         report: &mut OutputDrainReport,
     ) -> PeerDrainStep {
         match meta {
-            OutputMeta::Datagram { wire_len } => {
+            // The peeked class is not needed here: the class that is
+            // accounted is the one `poll_output_into` reports for the
+            // datagram it actually consumed, so there is exactly one source
+            // of class truth on this path.
+            OutputMeta::Datagram { wire_len, .. } => {
                 let exceeds_packets = report.packets >= budget.max_packets;
                 let exceeds_bytes = report.bytes.saturating_add(wire_len) > budget.max_bytes;
                 if exceeds_packets || exceeds_bytes {
@@ -3042,7 +3071,11 @@ impl PeerTable {
                 let materialized = {
                     let buf = slot.bytes_mut();
                     match connection.poll_output_into(buf) {
-                        Ok(Some(OutputInto::Datagram { len })) => Ok(len),
+                        Ok(Some(OutputInto::Datagram {
+                            len,
+                            class,
+                            source_due_micros,
+                        })) => Ok((len, class, source_due_micros)),
                         Ok(_) => Err(srt_proto::Error::with_reason(
                             srt_proto::ErrorKind::InvalidState,
                             "peeked datagram output vanished before materialization",
@@ -3051,8 +3084,8 @@ impl PeerTable {
                     }
                 };
                 match materialized {
-                    Ok(len) => {
-                        slot.commit(len);
+                    Ok((len, class, source_due_micros)) => {
+                        slot.commit(len, class, source_due_micros);
                         record_peer_pushed(report, len);
                         PeerDrainStep::Continue
                     }
@@ -3476,6 +3509,10 @@ impl PeerTable {
         };
         self.half_open_by_caller
             .remove(&(slot.address, entry.conn.peer_socket_id()));
+        // Sample the retiring connection before it is handed back to the
+        // application: after this function returns, the table no longer owns
+        // it, and a later snapshot must still carry its loss/duplicate totals.
+        self.add_receiver_totals(&entry.conn);
         self.logical_peers.remove(&entry.logical_peer);
         if entry.admission_established {
             self.established_peers = self.established_peers.saturating_sub(1);
@@ -3501,6 +3538,9 @@ impl PeerTable {
                 .group
                 .remove_member_connection(member_id)
                 .expect("group I/O legs are built with matching members");
+            // Sample each leg before it is handed back to the application; see
+            // `remove_direct`.
+            self.add_receiver_totals(&connection);
             if let Some(slot_idx) = self.slot_index_for_key(&leg.physical) {
                 self.purge_physical_indexes(leg.physical);
                 self.slots.remove_by_slot(slot_idx);
@@ -3513,6 +3553,39 @@ impl PeerTable {
             });
         }
         Some(RemovedLogicalPeer::Group(removed))
+    }
+
+    /// Fold one relinquished connection's SRT receiver counters into this
+    /// table's retired ledger. Called on every retirement path, before the
+    /// connection leaves the table.
+    fn add_receiver_totals(&mut self, connection: &SrtConnection) {
+        self.retired_rcv
+            .observe(connection.receiver_stats().as_ref());
+    }
+
+    /// SRT-level receive totals across this table: the retired ledger plus a
+    /// walk of every live logical peer -- each direct peer's connection and
+    /// every member of every bonded group.
+    ///
+    /// Costs O(live peers) plus one buffer pass per sampled connection (the
+    /// protocol's own snapshot walks each receive buffer, up to its capacity).
+    /// Sized for end-of-run and low-cadence snapshots only. Never call it from
+    /// a per-visit path: a population scan per service visit is exactly the
+    /// cost this table's ready and deadline indexes exist to avoid.
+    #[must_use]
+    pub fn receiver_totals(&self) -> RcvTotals {
+        let mut totals = self.retired_rcv;
+        for slot in self.slots.iter() {
+            if let Some(peer) = slot.value.direct() {
+                totals.observe(peer.conn.receiver_stats().as_ref());
+            }
+        }
+        for group in self.groups.values() {
+            for member in group.group.members() {
+                totals.observe(member.connection().receiver_stats().as_ref());
+            }
+        }
+        totals
     }
 
     fn decrement_source_count(&mut self, ip: std::net::IpAddr) {
@@ -4714,6 +4787,78 @@ mod tests {
         );
     }
 
+    /// A retired peer's SRT-level receive totals must stay visible through the
+    /// table, exactly as its live totals are, so a run's loss/duplicate
+    /// accounting cannot shrink as peers churn.
+    #[test]
+    fn receiver_totals_report_live_peers_and_survive_retirement() {
+        let peer = "127.0.0.1:11042".parse().expect("address");
+        let options = AdmissionOptions::basic(0x7777, 20, false);
+        let telemetry = IngressTelemetry::new();
+        let mut table = PeerTable::new();
+
+        let (mut caller, conclusion) =
+            admit_up_to_conclusion(&mut table, peer, 0x8888, &options, &telemetry);
+        admit_conclusion(
+            &mut table,
+            peer,
+            &mut caller,
+            &conclusion,
+            &options,
+            &telemetry,
+        );
+
+        caller
+            .send(b"payload", Timestamp::from_micros(4))
+            .expect("caller sends");
+        let data_packet = next_packet(&mut caller);
+        assert_eq!(
+            table.admit(
+                peer,
+                &data_packet,
+                Timestamp::from_micros(5),
+                &options,
+                0,
+                1,
+                &telemetry,
+            ),
+            Admit::Fed
+        );
+        let accepted = table.receiver_totals();
+
+        // The identical datagram again: the receiver has not played the
+        // payload out yet (the negotiated TSBPD latency is 120ms), so this is
+        // a duplicate by the protocol's own rule.
+        assert_eq!(
+            table.admit(
+                peer,
+                &data_packet,
+                Timestamp::from_micros(6),
+                &options,
+                0,
+                1,
+                &telemetry,
+            ),
+            Admit::Fed
+        );
+        let live = table.receiver_totals();
+        assert_eq!(
+            live.duplicates,
+            accepted.duplicates + 1,
+            "a live peer's duplicate must be visible through the table"
+        );
+        assert_eq!(live.lost, accepted.lost);
+
+        let physical = table.physical_for_address(peer).expect("peer admitted");
+        let logical = table.get_peer(&physical).expect("peer entry").logical_peer;
+        drop(table.remove(logical).expect("retire the peer"));
+        assert_eq!(
+            table.receiver_totals(),
+            live,
+            "retiring a peer must not erase the totals it contributed"
+        );
+    }
+
     /// A04: `prune_idle` must start an orderly close on an established peer
     /// that has gone quiet past `idle_timeout`, and must leave an equally
     /// old but still-active peer completely untouched.
@@ -4742,7 +4887,12 @@ mod tests {
             &mut self.buf
         }
 
-        fn commit(self, len: usize) {
+        fn commit(
+            self,
+            len: usize,
+            _class: srt_proto::DatagramClass,
+            _source_due_micros: Option<u64>,
+        ) {
             let mut buf = self.buf;
             buf.truncate(len);
             self.sink.committed.push((self.peer, buf));

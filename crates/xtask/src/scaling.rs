@@ -17,6 +17,12 @@
 //! * **One destination per UDP port**: destination `i` is `base + i` for both
 //!   roles. Several senders on one port do not all get admitted (measured:
 //!   `connections=3 established=1 data_zero=2`), so the topology is fixed.
+//! * **The sweep builds its own children.** A release `cargo build` for
+//!   `srt-bench` and the `compio_shared_owner_qual` bench runs immediately before
+//!   the first repetition, and the executables come from cargo's own artifact
+//!   records rather than from a scan of `target/`. The header's `git_sha`
+//!   therefore describes the code that produced the rows, instead of whatever
+//!   happened to be left in the build directory.
 //! * **The receiver must outlive the drain.** The sender keeps servicing after
 //!   the measurement window until its TX reaches equilibrium, and that drain is
 //!   not small. A receiver whose lifetime is shorter sends the drain into a
@@ -39,7 +45,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Fields read from the sender's `SHARED_OWNER_QUAL` line.
 const TX_KEYS: &[&str] = &[
@@ -57,9 +63,9 @@ const TX_KEYS: &[&str] = &[
     "pending_after_drain",
     "inflight_at_window_end",
     "service_visits",
-    "lateness_us_p50",
-    "p99",
-    "max",
+    "offer_lateness_us_p50",
+    "offer_lateness_us_p99",
+    "offer_lateness_us_max",
     "window_cpu_ms",
     "drain_cpu_ms",
     "cpu_ms",
@@ -69,17 +75,81 @@ const TX_KEYS: &[&str] = &[
     "rx_truncated",
     "tx_pool_free",
     "tx_pool_capacity",
+    "tx_pool_high_water",
+    // Send-outcome counters. They were printed by the harness and never
+    // captured here, so a row could not support (or refute) "no send failed".
+    "short",
+    "failed",
+    "peer_local",
+    "transient",
+    "tx_failures_pending",
+    // TX submission partition (sum(tx_class_*) == tx_class_total ==
+    // tx_submitted_wire, enforced by `qualify`). A total cannot say whether the
+    // wire traffic was the media or the control cadence around it.
+    "tx_class_data_first",
+    "tx_class_data_retx",
+    "tx_class_ack",
+    "tx_class_ackack",
+    "tx_class_nak",
+    "tx_class_keepalive",
+    "tx_class_handshake",
+    "tx_class_dropreq",
+    "tx_class_km",
+    "tx_class_shutdown",
+    "tx_class_other_control",
+    "tx_class_total",
+    // Drain-phase retransmissions, so the receiver's own packet-duplicate count
+    // can be accounted against the repair traffic that explains it (see
+    // `qualify`'s canonical gate). `drain_class_total` alone cannot: it is not
+    // what a duplicate is made of.
+    "drain_class_data_retx",
+    // First-transmission submit lateness: source due instant to lane handoff.
+    // Distinct from `offer_lateness_us_*`, which is sampled before `service()`.
+    "first_submit_lateness_us_p50",
+    "first_submit_lateness_us_p99",
+    "first_submit_lateness_us_max",
+    "first_submit_lateness_samples",
+    // SRT-level receive accounting for the sender's own caller socket, summed
+    // over live and retired sessions.
+    "rx_lost",
+    "rx_duplicates",
     "payload_bytes",
     "interval_us",
+    // The offer is part of the row: a capacity sweep is unreadable without it,
+    // and the gate needs it to name what was sustained.
+    "offered_bps_per_dest",
+    // Diagnostic fence counters: offered and accepted after the measured
+    // window, excluded from every workload figure. They exist to test whether an
+    // end-of-run tail closes when later sequence progress is forced.
+    "fence_offered",
+    "fence_accepted",
+    // Whether connection-setup residue (admission backlog, in-flight
+    // handshake/keepalive traffic) had actually drained before the measured
+    // window began. A row without this confirmed cannot support a claim that
+    // the measurement started at a genuinely steady state.
+    "pre_window_drained",
+    // Whether the Owner's typed fault state was still clear at the end of the
+    // run. A fault (dead TX lane, short/failed send completion, stopped managed
+    // RX task) stops admission and transmission; a row that cannot report this
+    // cannot support a claim that the transport under test stayed healthy.
+    "owner_faulted",
+    // The runtime substrate the shard ran on, observed from the shard's own
+    // runtime: driver (`IoUring`/`Poll`) and the pinned Compio version.
+    "driver",
+    "compio_version",
 ];
 
-/// Fields read from the receiver's `STATS` line.
+/// Fields read from the receiver's `STATS` line, on every run.
 const RX_KEYS: &[&str] = &[
     "connections",
     "established",
     "pkt_sent",
     "core_total",
     "sec_a",
+    // Receiver duplicate count. Already mapped from `total_duplicates` in the
+    // receiver's per-connection stats; simply not collected here, which made
+    // duplicate accounting look like work to build rather than work to read.
+    "sec_b",
     "rtt_ms",
     "elapsed_s",
     "cpu_user_ms",
@@ -89,6 +159,25 @@ const RX_KEYS: &[&str] = &[
     "data_max",
     "data_zero",
     "data_below_half_mean",
+];
+
+/// Fields the receiver prints only on a diagnostic (`--identity`) run.
+///
+/// Separate from [`RX_KEYS`] because they are the one honestly-conditional part
+/// of the receiver schema: everything else is printed on every run, and a
+/// missing one is a defect in the schema coupling rather than a configuration
+/// this sweep did not ask for. They belong to the receiver's `STATS` line, not
+/// the sender's: putting them in the sender's key list silently dropped every
+/// value.
+const RX_DIAG_KEYS: &[&str] = &[
+    "diag_conns",
+    "diag_fences_seen",
+    "diag_data_at_fence",
+    "diag_missing_at_fence",
+    "diag_missing_final",
+    "diag_missing_suffix_peers",
+    "diag_missing_scatter_peers",
+    "diag_duplicate_payloads",
 ];
 
 /// Columns summed across shards in the `AGG` line.
@@ -103,6 +192,9 @@ const SUM_KEYS: &[&str] = &[
     "drain_submitted",
     "drain_completed",
     "service_visits",
+    "tx_class_total",
+    "rx_lost",
+    "rx_duplicates",
     "rx_core_total",
     "rx_data_zero",
     "rx_data_below_half_mean",
@@ -116,7 +208,12 @@ const SUM_KEYS: &[&str] = &[
 const MIN_KEYS: &[&str] = &["rx_data_min"];
 
 /// Columns aggregated by maximum: per-shard worst cases.
-const MAX_KEYS: &[&str] = &["lateness_us_p50", "p99", "max", "rx_data_below_half_mean"];
+const MAX_KEYS: &[&str] = &[
+    "offer_lateness_us_p50",
+    "offer_lateness_us_p99",
+    "offer_lateness_us_max",
+    "rx_data_below_half_mean",
+];
 
 struct Options {
     out: PathBuf,
@@ -128,6 +225,13 @@ struct Options {
     connect_cc: usize,
     base_port: u16,
     payload_bytes: usize,
+    /// Offered bitrate per destination. The capacity frontier is a function of
+    /// it, so the sweep has to be able to vary it rather than assuming 8 Mbps.
+    rate_mbps_per_dest: f64,
+    /// Send the diagnostic terminal fence after the measured window.
+    fence: bool,
+    /// Tag measured payloads with their tick id (diagnostic runs only).
+    identity: bool,
 }
 
 impl Default for Options {
@@ -142,27 +246,51 @@ impl Default for Options {
             connect_cc: 64,
             base_port: 30_000,
             payload_bytes: 1316,
+            rate_mbps_per_dest: 8.0,
+            fence: false,
+            identity: false,
         }
     }
 }
 
 impl Options {
-    /// Apply one `--flag value` pair. Kept separate from [`parse_options`] so
-    /// the flag table does not also carry the validation branches.
+    /// Apply one `--flag value` pair.
+    ///
+    /// Split into the two groups the flags actually fall into -- how the run is
+    /// shaped (output, destinations, shards, repetitions) and how the engine and
+    /// offer are configured -- so neither group's table carries the other's
+    /// branches. Each returns whether it recognised the flag.
     fn set(&mut self, flag: &str, value: &str) -> Result<(), String> {
+        if self.set_run_shape(flag, value)? || self.set_engine(flag, value)? {
+            return Ok(());
+        }
+        Err(format!("unknown argument {flag}"))
+    }
+
+    fn set_run_shape(&mut self, flag: &str, value: &str) -> Result<bool, String> {
         match flag {
             "--out" => self.out = PathBuf::from(value),
             "--n" => self.n = parse(value, flag)?,
             "--shards" => self.shards = parse(value, flag)?,
             "--reps" => self.reps = parse(value, flag)?,
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    fn set_engine(&mut self, flag: &str, value: &str) -> Result<bool, String> {
+        match flag {
             "--window-ms" => self.window_ms = parse(value, flag)?,
             "--tx-lanes" => self.tx_lanes = parse(value, flag)?,
             "--connect-cc" => self.connect_cc = parse(value, flag)?,
             "--base-port" => self.base_port = parse(value, flag)?,
             "--payload-bytes" => self.payload_bytes = parse(value, flag)?,
-            other => return Err(format!("unknown argument {other}")),
+            "--rate-mbps-per-dest" => self.rate_mbps_per_dest = parse(value, flag)?,
+            "--fence" => self.fence = parse(value, flag)?,
+            "--identity" => self.identity = parse(value, flag)?,
+            _ => return Ok(false),
         }
-        Ok(())
+        Ok(true)
     }
 
     fn validate(self) -> Result<Self, String> {
@@ -205,42 +333,77 @@ fn kv(line: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
-fn find_bench(root: &Path) -> Result<PathBuf, String> {
-    let deps = root.join("target/release/deps");
-    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
-    for entry in fs::read_dir(&deps).map_err(|e| format!("{}: {e}", deps.display()))? {
-        let path = entry.map_err(|e| e.to_string())?.path();
-        let name = path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        if !name.starts_with("compio_shared_owner_qual-") || name.ends_with(".d") {
+/// Build the sweep's child executables and return the exact paths cargo
+/// produced for them.
+///
+/// This driver builds what it benchmarks, immediately before running it. It
+/// used to scan `target/release/deps` for the most recently modified
+/// `compio_shared_owner_qual-*` binary and take `target/release/srt-bench`
+/// wherever it existed -- while the TSV header recorded the *working tree's*
+/// `git_sha`. That combination proves nothing: build at revision A, check out B,
+/// run the sweep, and the artifact names B while executing A. The failure mode
+/// is not hypothetical here; a stale binary already contaminated one round of
+/// this PR's own diagnostics.
+///
+/// `--message-format=json` is what makes the paths authoritative rather than
+/// inferred: cargo reports the artifact it produced, so the executable that runs
+/// is the one cargo just built, never a same-named file someone left behind.
+fn build_harness(root: &Path) -> Result<Harness, String> {
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let output = Command::new(&cargo)
+        .args([
+            "build",
+            "--release",
+            "-p",
+            "srt-bench",
+            "--bin",
+            "srt-bench",
+            "--bench",
+            "compio_shared_owner_qual",
+            "--message-format=json",
+        ])
+        .current_dir(root)
+        // Compiler diagnostics belong on the terminal; stdout is JSON.
+        .stderr(Stdio::inherit())
+        .output()
+        .map_err(|e| format!("running `{cargo} build`: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "building the sweep children exited with {}",
+            output.status
+        ));
+    }
+    let (mut bench, mut receiver) = (None, None);
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Ok(message) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if message["reason"] != "compiler-artifact" {
             continue;
         }
-        let modified = fs::metadata(&path)
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        if best.as_ref().is_none_or(|(t, _)| modified > *t) {
-            best = Some((modified, path));
+        let Some(executable) = message["executable"].as_str() else {
+            continue;
+        };
+        let name = message["target"]["name"].as_str().unwrap_or_default();
+        let kinds = message["target"]["kind"].as_array();
+        let is = |kind: &str| kinds.is_some_and(|kinds| kinds.iter().any(|k| k == kind));
+        if is("bench") && name == "compio_shared_owner_qual" {
+            bench = Some(PathBuf::from(executable));
+        }
+        if is("bin") && name == "srt-bench" {
+            receiver = Some(PathBuf::from(executable));
         }
     }
-    best.map(|(_, p)| p).ok_or_else(|| {
-        "no compio_shared_owner_qual binary; build it first:\n  \
-         cargo build --release -p srt-bench --benches"
-            .to_string()
-    })
-}
-
-fn receiver_binary(root: &Path) -> Result<PathBuf, String> {
-    let path = root.join("target/release/srt-bench");
-    if path.exists() {
-        Ok(path)
-    } else {
-        Err(format!(
-            "{} missing; build it first:\n  cargo build --release -p srt-bench",
-            path.display()
-        ))
+    match (bench, receiver) {
+        (Some(bench), Some(receiver)) => Ok(Harness { bench, receiver }),
+        (None, _) => Err(format!(
+            "{cargo} reported no executable for the compio_shared_owner_qual bench; \
+             refusing to guess which binary to benchmark"
+        )),
+        (_, None) => Err(format!(
+            "{cargo} reported no executable for srt-bench; refusing to guess which \
+             binary to benchmark"
+        )),
     }
 }
 
@@ -310,8 +473,8 @@ fn keep_logs(work: &Path, message: String) -> String {
     format!("{message}; logs kept in {}", work.display())
 }
 
-/// Everything the sweep needs to launch work: where the workspace is and
-/// which binaries to run.
+/// Everything the sweep needs to launch work: the exact child executables
+/// cargo produced for this run (see [`build_harness`]).
 struct Harness {
     bench: PathBuf,
     receiver: PathBuf,
@@ -350,11 +513,7 @@ fn fail(message: &str) -> std::process::ExitCode {
 }
 
 fn locate() -> Result<Harness, String> {
-    let root = find_root()?;
-    Ok(Harness {
-        bench: find_bench(&root)?,
-        receiver: receiver_binary(&root)?,
-    })
+    build_harness(&find_root()?)
 }
 
 /// Run every rep and return the whole TSV, header included.
@@ -371,17 +530,140 @@ fn sweep(options: &Options, harness: &Harness) -> Result<String, String> {
     Ok(out)
 }
 
-fn header(options: &Options) -> Result<String, String> {
-    let root = find_root()?;
-    let dirty = git(&root, &["diff", "--quiet"]).is_err();
-    let sha = git(&root, &["rev-parse", "--short", "HEAD"]).unwrap_or_else(|_| "unknown".into());
+/// Whether the whole working tree is clean: no staged, unstaged or untracked
+/// changes anywhere.
+///
+/// `git diff --quiet` compares the *working tree against the index*, so it is
+/// blind to staged modifications and to untracked files: a source file that was
+/// edited and `git add`ed would be recorded as `git_dirty=false` while the
+/// binaries this sweep builds carry the edit. `status --porcelain` is the
+/// predicate that matches what the header claims.
+fn tree_is_clean(root: &Path) -> bool {
+    git(root, &["status", "--porcelain", "--untracked-files=normal"])
+        .is_ok_and(|porcelain| porcelain.is_empty())
+}
+
+/// The machine the run is about to happen on, read from the kernel rather than
+/// inferred: a capacity point is only transferable together with the host it was
+/// measured on, and a kernel/CPU tuple is not something a reader can recover
+/// later from a timestamp.
+///
+/// The CPU model contains spaces, so it is folded to `_`: the header is a
+/// whitespace-tokenized comment line, and a value with spaces in it would split
+/// into tokens that are not `key=value` at all.
+fn host_fields() -> String {
+    let kernel =
+        read_trimmed("/proc/sys/kernel/osrelease").unwrap_or_else(|| "unknown".to_string());
+    let cpu = cpu_model()
+        .map(|model| model.replace(char::is_whitespace, "_"))
+        .unwrap_or_else(|| "unknown".to_string());
+    format!("kernel={kernel} cpu={cpu} affinity={}", affinity_state())
+}
+
+fn read_trimmed(path: &str) -> Option<String> {
+    fs::read_to_string(path)
+        .ok()
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+}
+
+/// The first `model name` in `/proc/cpuinfo`, or `None` on a machine that does
+/// not publish one.
+fn cpu_model() -> Option<String> {
+    fs::read_to_string("/proc/cpuinfo")
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("model name")?
+                .split_once(':')
+                .map(|(_, v)| v)
+        })
+        .map(|model| model.trim().to_string())
+        .filter(|model| !model.is_empty())
+}
+
+/// `none` when the process may run on every online CPU, otherwise the mask it is
+/// restricted to.
+///
+/// The sweep sets no affinity of its own, and its children inherit the mask, so
+/// the launcher's own `Cpus_allowed_list` is the children's. Recorded because a
+/// pinned run and an unpinned one are different measurements even at the same
+/// configuration.
+fn affinity_state() -> String {
+    let allowed = fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
+                .map(|list| list.trim().to_string())
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    match read_trimmed("/sys/devices/system/cpu/online") {
+        Some(online) if online == allowed => "none".to_string(),
+        _ => allowed,
+    }
+}
+
+/// The TSV's column names, in order: the row's own coordinates, then every
+/// sender field, then every receiver field.
+///
+/// One definition, because the header and the `AGG` line must agree on it
+/// exactly -- two copies drifted apart silently before.
+fn column_names() -> Vec<String> {
     let mut columns: Vec<String> =
         vec!["kind".into(), "rep".into(), "shard".into(), "fanout".into()];
     columns.extend(TX_KEYS.iter().map(|k| k.to_string()));
     columns.extend(RX_KEYS.iter().map(|k| format!("rx_{k}")));
+    columns.extend(RX_DIAG_KEYS.iter().map(|k| format!("rx_{k}")));
+    columns
+}
+
+/// Every field the sweep intends to record must be present on the line it came
+/// from.
+///
+/// `get(key).unwrap_or_default()` writes an empty *cell*, which in a TSV is
+/// indistinguishable from a measurement that is missing for a reason -- and a
+/// printer/collector key mismatch (a field printed as `compio` and read as
+/// `compio_version`) got exactly that way into an artifact that otherwise looked
+/// complete. A missing field is a schema defect, so the row is refused instead.
+fn require_keys(
+    fields: &BTreeMap<String, String>,
+    keys: &[&str],
+    line: &str,
+    work: &Path,
+    shard: usize,
+    rep: usize,
+) -> Result<(), String> {
+    for key in keys {
+        if !fields.contains_key(*key) {
+            return Err(keep_logs(
+                work,
+                format!("shard {shard} rep {rep}: the {line} line has no {key} field"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The TSV header, including the provenance that makes `git_sha` mean
+/// something.
+///
+/// `built_by_scaling=true` and `build_profile=release` are facts about this
+/// tool rather than flags: `run` cannot reach `sweep` without having gone
+/// through `locate` -> `build_harness`, which builds both children in release
+/// mode and returns cargo's own artifact paths. Together with the full SHA and
+/// `tree_is_clean`'s whole-tree predicate, they are what let a reader conclude
+/// the header's SHA describes the code that actually ran -- and `qualify
+/// --require-clean` refuses a canonical artifact without them.
+fn header(options: &Options) -> Result<String, String> {
+    let root = find_root()?;
+    let dirty = !tree_is_clean(&root);
+    let sha = git(&root, &["rev-parse", "HEAD"]).unwrap_or_else(|_| "unknown".into());
     Ok(format!(
         "# scaling-sweep n={} shards={} fanout={} tx_lanes={} connect_cc={} window_ms={} \n\
-         # reps={} base_port={} payload_bytes={} git_sha={} git_dirty={}\n{}\n",
+         # reps={} base_port={} payload_bytes={} rate_mbps_per_dest={} fence={} identity={} \
+         build_profile=release built_by_scaling=true git_sha={} git_dirty={} {}\n{}\n",
         options.n,
         options.shards,
         options.n / options.shards,
@@ -391,9 +673,13 @@ fn header(options: &Options) -> Result<String, String> {
         options.reps,
         options.base_port,
         options.payload_bytes,
+        options.rate_mbps_per_dest,
+        options.fence,
+        options.identity,
         sha,
         dirty,
-        columns.join("\t")
+        host_fields(),
+        column_names().join("\t")
     ))
 }
 
@@ -418,11 +704,27 @@ fn run_rep(
         .wait_for_senders()
         .map_err(|e| keep_logs(&work, e))?;
     sleep(Duration::from_secs(12));
+    // Give receivers a bounded window to finish on their own -- they print STATS
+    // when their connections close -- before stopping them. Killing a receiver
+    // mid-drain is how a slow run produced "no STATS line" instead of a row.
+    let grace = Instant::now();
+    while grace.elapsed() < Duration::from_secs(20) {
+        let mut still_running = false;
+        for receiver in children.receivers.iter_mut() {
+            if matches!(receiver.try_wait(), Ok(None)) {
+                still_running = true;
+            }
+        }
+        if !still_running {
+            break;
+        }
+        sleep(Duration::from_millis(500));
+    }
     children.stop_receivers().map_err(|e| keep_logs(&work, e))?;
 
     let mut rows = Vec::with_capacity(options.shards);
     for shard in 0..options.shards {
-        let row: Vec<String> = read_shard_row(&work, shard, rep)?;
+        let row: Vec<String> = read_shard_row(&work, shard, rep, options.identity)?;
         out.push_str(&row.join("\t"));
         out.push('\n');
         rows.push(row);
@@ -441,21 +743,41 @@ fn spawn_receivers(
     // The lifetime covers connect + window + drain with margin; a receiver
     // that dies early sends the drain into a closed socket while
     // window-phase reconciliation still looks exact.
-    let seconds = (options.window_ms / 1000 + 30).to_string();
+    // Window + the sender's DRAIN_DEADLINE (10 s) + connect and teardown
+    // margin. At 30 s the receiver was killed before its own deadline on
+    // slow-drain runs, so it never printed STATS and the sweep correctly
+    // refused the row -- a harness budget problem reported as a transport
+    // failure until the lifetime covered the work.
+    let seconds = (options.window_ms / 1000 + 45).to_string();
     let mut children = Vec::with_capacity(options.shards);
     for shard in 0..options.shards {
         let port = rep_base + (shard * fanout) as u16;
         let log = open_log(work, &format!("rx.{shard}.log"))?;
+        // Diagnostic runs need the receiver to derive the same tick count the
+        // sender offers, from the same parameters and through the same shared
+        // arithmetic -- not from its own lifetime, which is deliberately
+        // window + drain/grace.
+        let mut receiver_args = vec![
+            "runtime=compio".to_string(),
+            "mode=receiver".to_string(),
+            port.to_string(),
+            seconds.clone(),
+            "120".to_string(),
+            "--connections".to_string(),
+            fanout.to_string(),
+        ];
+        if options.identity {
+            receiver_args.extend([
+                "--diag-payload-bytes".to_string(),
+                options.payload_bytes.to_string(),
+                "--diag-rate-bps".to_string(),
+                ((options.rate_mbps_per_dest * 1e6) as u64).to_string(),
+                "--diag-window-ms".to_string(),
+                options.window_ms.to_string(),
+            ]);
+        }
         let child = Command::new(&harness.receiver)
-            .args([
-                "runtime=compio",
-                "mode=receiver",
-                &port.to_string(),
-                &seconds,
-                "120",
-                "--connections",
-                &fanout.to_string(),
-            ])
+            .args(&receiver_args)
             .stdout(Stdio::from(log.try_clone().map_err(|e| e.to_string())?))
             .stderr(Stdio::from(log))
             .spawn()
@@ -490,6 +812,12 @@ fn spawn_senders(
                 options.connect_cc.to_string(),
                 "--payload-bytes".to_string(),
                 options.payload_bytes.to_string(),
+                "--rate-mbps-per-dest".to_string(),
+                options.rate_mbps_per_dest.to_string(),
+                "--fence".to_string(),
+                options.fence.to_string(),
+                "--identity".to_string(),
+                options.identity.to_string(),
             ])
             .stdout(Stdio::from(log.try_clone().map_err(|e| e.to_string())?))
             .stderr(Stdio::from(log))
@@ -506,7 +834,12 @@ fn open_log(work: &Path, name: &str) -> Result<fs::File, String> {
 }
 
 /// The row for one shard, read from the logs the two processes wrote.
-fn read_shard_row(work: &Path, shard: usize, rep: usize) -> Result<Vec<String>, String> {
+fn read_shard_row(
+    work: &Path,
+    shard: usize,
+    rep: usize,
+    require_diag: bool,
+) -> Result<Vec<String>, String> {
     let tx = read_log(work, &format!("tx.{shard}.log"));
     let rx = read_log(work, &format!("rx.{shard}.log"));
     let tx_fields = tx
@@ -590,6 +923,14 @@ fn read_shard_row(work: &Path, shard: usize, rep: usize) -> Result<Vec<String>, 
             .cloned()
             .unwrap_or_else(|| "?".into()),
     ];
+    // Presence first, so an empty cell can only ever mean "this run measured
+    // nothing here", never "the collector asked for a key the printer does not
+    // use".
+    require_keys(&tx_fields, TX_KEYS, "sender", work, shard, rep)?;
+    require_keys(&rx_fields, RX_KEYS, "receiver", work, shard, rep)?;
+    if require_diag {
+        require_keys(&rx_fields, RX_DIAG_KEYS, "receiver", work, shard, rep)?;
+    }
     row.extend(
         TX_KEYS
             .iter()
@@ -598,6 +939,7 @@ fn read_shard_row(work: &Path, shard: usize, rep: usize) -> Result<Vec<String>, 
     row.extend(
         RX_KEYS
             .iter()
+            .chain(RX_DIAG_KEYS)
             .map(|k| rx_fields.get(*k).cloned().unwrap_or_default()),
     );
     Ok(row)
@@ -618,12 +960,7 @@ fn extremum(rows: &[Vec<String>], i: usize, want_max: bool) -> String {
 
 /// Sum the last rep's shards so a partially failed sweep stays visible.
 fn aggregate(reps: usize, rows: &[Vec<String>]) -> String {
-    let columns: Vec<String> = {
-        let mut c: Vec<String> = vec!["kind".into(), "rep".into(), "shard".into(), "fanout".into()];
-        c.extend(TX_KEYS.iter().map(|k| k.to_string()));
-        c.extend(RX_KEYS.iter().map(|k| format!("rx_{k}")));
-        c
-    };
+    let columns = column_names();
     let index = |key: &str| columns.iter().position(|c| c == key);
     let mut total = vec![String::new(); columns.len()];
     total[0] = "AGG".into();
@@ -733,5 +1070,68 @@ mod tests {
                 "guard dropped but process {pid} is still alive"
             );
         }
+    }
+
+    /// The predicate behind the header's `git_dirty`. `git diff --quiet` -- what
+    /// it used to be -- compares the working tree against the *index*, so a
+    /// staged edit or an untracked file left the header claiming a clean tree
+    /// while the binaries the sweep builds carried the change.
+    #[test]
+    fn the_clean_predicate_sees_staged_and_untracked_changes() {
+        let root = std::env::temp_dir().join(format!("scaling-clean-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create temp repository");
+        let git_in = |args: &[&str]| {
+            // A temp repository has no identity of its own, and the developer's
+            // global config may even enable commit signing; neither is what this
+            // test is about.
+            let mut full = vec![
+                "-c",
+                "user.email=qualify-test@example.com",
+                "-c",
+                "user.name=qualify test",
+                "-c",
+                "commit.gpgsign=false",
+            ];
+            full.extend_from_slice(args);
+            let out = Command::new("git")
+                .args(&full)
+                .current_dir(&root)
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git_in(&["init", "--quiet"]);
+        git_in(&["commit", "--allow-empty", "--quiet", "-m", "init"]);
+        assert!(tree_is_clean(&root), "a fresh repository is clean");
+
+        fs::write(root.join("tracked.rs"), "fn a() {}\n").expect("write");
+        git_in(&["add", "tracked.rs"]);
+        git_in(&["commit", "--quiet", "-m", "add"]);
+        assert!(tree_is_clean(&root), "a committed tree is clean");
+
+        // Unstaged edit: the one case `git diff --quiet` did catch.
+        fs::write(root.join("tracked.rs"), "fn a() { let _ = 1; }\n").expect("write");
+        assert!(!tree_is_clean(&root), "an unstaged edit is dirty");
+
+        // Staged edit: the case the old predicate reported as clean.
+        git_in(&["add", "tracked.rs"]);
+        assert!(
+            !tree_is_clean(&root),
+            "a staged edit is dirty: the binaries would carry code the recorded \
+             SHA does not describe"
+        );
+
+        git_in(&["commit", "--quiet", "-m", "edit"]);
+        assert!(tree_is_clean(&root), "committing restores cleanliness");
+
+        fs::write(root.join("untracked.rs"), "fn b() {}\n").expect("write");
+        assert!(!tree_is_clean(&root), "an untracked file is dirty");
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

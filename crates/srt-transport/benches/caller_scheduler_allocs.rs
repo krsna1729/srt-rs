@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use srt_proto::handshake::SRTGROUP_MASK;
-use srt_proto::{ConnectionOptions, ConnectionOutput, SrtConnection, Timestamp};
+use srt_proto::{ConnectionOptions, ConnectionOutput, DatagramClass, SrtConnection, Timestamp};
 use srt_transport::advanced::caller::{CallerGroupLeg, CallerLeg, CallerTable, LogicalCallerId};
 use srt_transport::advanced::driver::OutputDrainBudget;
 
@@ -240,7 +240,7 @@ impl srt_transport::DatagramSlot for ScratchSlot<'_> {
         &mut self.sink.scratch[..self.wire_len]
     }
 
-    fn commit(self, len: usize) {
+    fn commit(self, len: usize, _class: DatagramClass, _source_due_micros: Option<u64>) {
         self.sink.wire_len = len;
     }
 }

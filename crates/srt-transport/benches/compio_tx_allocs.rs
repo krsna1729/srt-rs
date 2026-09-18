@@ -149,7 +149,7 @@ fn bench_layer1_protocol_materialization(iterations: usize) -> LayerResult {
             caller.send(&payload, now).expect("warmup send admits");
             loop {
                 match caller.poll_output_into(&mut dst) {
-                    Ok(Some(OutputInto::Datagram { len })) => {
+                    Ok(Some(OutputInto::Datagram { len, .. })) => {
                         assert!(len > 0);
                         break;
                     }
@@ -166,7 +166,7 @@ fn bench_layer1_protocol_materialization(iterations: usize) -> LayerResult {
             let t0 = Instant::now();
             loop {
                 match caller.poll_output_into(&mut dst) {
-                    Ok(Some(OutputInto::Datagram { len })) => {
+                    Ok(Some(OutputInto::Datagram { len, .. })) => {
                         assert!(len > 0, "each iteration must materialize one DATA datagram");
                         break;
                     }

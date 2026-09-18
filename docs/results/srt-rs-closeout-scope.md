@@ -1,0 +1,242 @@
+# srt-rs closeout scope (PR 1 of four)
+
+Goal: finish `srt-rs` as a trustworthy shard engine, on the existing #118 branch,
+without broadening it. This is the audit of what already exists, what is missing,
+and what "done" means. It is deliberately **not** a plan for GSO, native io_uring,
+a simulator, allocator experiments, new pooling, or more capacity-surface work --
+all of that is post-cutover.
+
+## What already exists (audited at `d005f9f`)
+
+| Needed by Restream | Present | Where |
+|---|---|---|
+| `OwnerFault` typed state | yes | `runtimes/compio.rs:1745`, `Owner::fault()` |
+| Fixed TX lanes + finite pool | yes | `TxPool`, `TxPoolSnapshot { capacity, free, exhaustions }` |
+| Service budget | yes | `OwnerServiceBudget` (`max_tx_packets`, ...) |
+| Bounded `service()` | yes | `Owner::service(now, budget)` |
+| Managed RX + mode reporting | yes | `rx_mode()`, `rx_substrate()`, `OwnerRxMode`, `RxModePolicy` |
+| No task/thread per connection | yes | the only `spawn` sites are the per-*socket* managed-RX loops (`spawn_managed_rx_loop`, `spawn_managed_rx_task`) |
+| Backlog observability | partial | `due_index_snapshot()` (caller table), `tx_in_flight()`, `has_pending_work()` |
+| RX counters | partial | `rx_stats()` gives socket-level dropped/truncated; SRT-level loss/duplicates live in receiver stats |
+| Failure containment | partial | `OwnerFault` exists; TX-lane death must be proven to surface and stop admission |
+
+So the architecture the four-PR plan requires on the srt-rs side -- one Owner per
+shard, bounded service, fixed lanes, managed RX, no per-connection machinery -- is
+**already the shape of the code**. The closeout is therefore correctness, a small
+amount of telemetry, and freezing the contract, not a rewrite.
+
+## Work item 1 (blocker): settle the conservation question
+
+The intermittent deficit is the only correctness question open, and it must be
+settled here rather than in a new instrumentation project.
+
+1. **Receiver-recognized fence payloads with identity.** Today the fence is a
+   differently-sized payload the *sink cannot distinguish*, so exclusion happens
+   by arithmetic in the analysis and the receiver cannot snapshot at fence
+   observation. Change the fence payload to carry a magic prefix plus
+   `{peer_id, final_tick}`, and teach the receiver (in `srt-bench`, the
+   `mode=receiver` path) to:
+   * exclude fence payloads from `core_total` / `data_events`;
+   * record per-peer `data_at_fence` -- the measured DATA count **at the moment
+     the fence for that peer is observed**;
+   * report the per-peer missing set (which tick ids never arrived), since only
+     that distinguishes a suffix from a scatter.
+2. **Repeat the A/B at ~10 repetitions per arm** (fence / no fence) at
+   `F=50, R=8 Mbps, K=256, 60 s`. The current evidence is 2 per arm against a
+   deficit that appears in roughly one run in three, which is not enough to
+   establish a base rate.
+3. **Classify with the four-branch table** already in the protocol document:
+   snapshot race / tail needed later sequence progress / delivery-accounting
+   defect / final-send lifecycle failure. The existing result (fence arm rep 1:
+   277 payloads still missing after all 50 fences were accepted, pool saturated)
+   already makes branch 1 insufficient on its own.
+4. **Fix it if real.** If the deficit survives fences with `sec_a = 0`, it is a
+   transport or accounting defect and belongs in the transport with a regression
+   test that fails before the fix.
+
+### Step 1 progress
+
+Landed: `srt_bench::qual_payload` -- payload identity and tick tracking, with 12
+unit tests (encode/decode roundtrip and unchanged length, magic discrimination at
+the maximum tick, foreign and short payloads, duplicate ticks counted once,
+out-of-window ticks rejected, compact missing ranges, suffix vs scatter vs middle
+hole, complete window, single-tick rendering). `TickSet` is fixed-capacity from
+the run's expected tick count, so the diagnostic cannot itself become unbounded,
+and it allocates nothing per received payload.
+
+Remaining, with the exact plumbing points located:
+
+* **sender** -- per-tick measured payload via `qual_payload::measured_payload(len,
+  tick)` in place of the single shared payload, and the fence via
+  `fence_payload(len, final_tick)` at 1316 bytes so it is an ordinary DATA
+  message. The source loop is in `crates/srt-bench/benches/compio_shared_owner_qual.rs`
+  (the bounded catch-up loop increments `ticks_offered`).
+* **receiver** -- classify at the three payload delivery points
+  (`crates/srt-bench/src/runtimes/compio.rs:511`, `:617`, `:1120`, immediately
+  before `enqueue_received`, where `buffer[..size]` is the received payload),
+  hold a `TickSet` plus fence state per peer, exclude fences from `data_events`
+  and `core_total`, and snapshot `data_at_fence` / `missing_at_fence` on fence
+  observation and `missing_final` after the post-fence recovery period.
+* **per-peer state** -- `ConnStats` already carries `data_events` per peer
+  (`crates/srt-bench/src/lib.rs`, the listener peer path), which is where the
+  diagnostic fields belong; aggregation and the artifact fields
+  (`fence_seen`/`fences_seen`, `missing_at_fence`, `missing_final`) follow the
+  existing `Aggregate` merge.
+* **validity rule** -- a fence run counts only if `fence_accepted == fanout` and
+  `fence_seen == fanout`; anything else is a lifecycle result, not a measurement.
+
+## Work item 2: the telemetry Restream needs, and no more
+
+Exposure only; no new mechanics.
+
+* **TX by class**: `tx_packets_submitted` is one aggregate. Split it at the point
+  where the class is still known: `tx_data_first`, `tx_data_retx`,
+  `tx_control_ack`, `tx_control_ackack`, `tx_control_nak`, `tx_control_other`.
+  This is also what makes `r` decomposable instead of inferred.
+* **First-submit lateness**: `scheduled_deadline -> first submission` per packet,
+  p50/p99/max. This is the real-time metric the batching work will be judged by;
+  offer lateness (already instrumented) is not it.
+* **Pool pressure**: add `high_water` to `TxPoolSnapshot` (occupancy peak, not
+  just instantaneous `free`), alongside the existing `exhaustions`.
+* **RX loss/duplicates at the Owner**: surface SRT-level loss and duplicates
+  (`total_lost`, `total_duplicates`) through the Owner's stats, not only through
+  the bench receiver.
+* **`OwnerFault` reachability**: prove with a test that a dead fixed TX lane
+  surfaces as `OwnerFault`, stops new admission, and does not continue at silently
+  reduced capacity.
+
+## Work item 3: freeze the production contract
+
+Pin the public surface Restream will build on, in one place, with a doc comment
+stating what is guaranteed:
+
+```text
+Owner, OwnerServiceBudget, OwnerFault
+TxPool, TxPoolSnapshot
+OwnerRxMode, RxModePolicy, ManagedRxSubstrate, OwnerRxStats
+ProductionRuntimeConfig, production_runtime_builder
+due_index_snapshot, has_pending_work
+```
+
+No behaviour change: this is naming and documenting what is already stable, so
+PR 2 has a contract to hold to.
+
+## Work item 4: one clean canonical baseline
+
+`F=50, R=8 Mbps/destination, K=256, 60 s, >= 3 repetitions`, from a **clean commit**
+(artifact `git_dirty=false`), with every row passing the row-level gate. Every
+artifact currently recorded as evidence for this operating point is
+`git_dirty=true` because the harness was being changed while it ran; that is fine
+for diagnosis and not fine as the baseline PR 2 pins to.
+
+## Done means
+
+* accepted DATA is conserved across the run, or the residual deficit is explained
+  and attributed with a test;
+* one Owner supports many callers, with zero tasks or threads per connection;
+* every queue, pool and timer structure is finite, with its bound stated;
+* a clean reproducible baseline exists and passes the gate on every repetition;
+* the contract above is frozen and documented.
+
+## Explicitly out of scope here
+
+GSO, native io_uring, `srt-sim`, allocator comparisons, hugepages, NUMA media
+replication, generic memory-pool frameworks, and further capacity-surface
+exploration. Those are post-cutover, and the four-PR plan keeps them there.
+
+### RESOLVED: the conservation defect was real, and it is fixed
+
+The intermittent end-of-run deficit is not a lifecycle or snapshot artifact. It is
+a transport correctness gap, reproduced deterministically in 0.01 s and fixed:
+
+```text
+control (nothing dropped)      4 of 4 DATA packets delivered
+lost final DATA packet         3 of 4, permanently stranded
+```
+
+`crates/srt-protocol/src/srt_connection.rs`,
+`a_lost_final_data_packet_is_recovered_by_the_sender` (with
+`an_intact_flight_is_delivered_whole` as the control that validates the harness).
+
+**Mechanism.** A receiver can only NAK a gap that a *later* DATA packet exposes.
+A lost suffix of a flight supplies no such evidence, so no NAK is generated,
+`sec_a` stays zero, and the payload is simply absent -- while the sender's
+retransmission was driven exclusively by NAK-fed loss ranges
+(`process_retransmit` -> `pop_retransmit` from `loss_list`), so nothing ever asked
+for it. That is exactly the signature the fence experiment chased after the fact.
+
+**Fix** (mirroring the mechanism the upstream challenger documents for this bug
+class): on the retransmission timer, when **no selective retransmission is
+pending**, queue one probe retransmission of the **newest sent** packet
+(`SenderBuffer::queue_retransmission_of_newest_sent`). Its arrival repairs a lost
+tail directly and supplies the later sequence evidence that exposes any older gaps
+to ordinary NAK recovery. Exactly one packet, never a replay of the whole
+unacknowledged flight, which would amplify an outage on every timeout rather than
+recover from it.
+
+**Evidence.** Workspace suite: 1353 tests pass, 0 failures. The two new tests fail
+before the fix (3 of 4) and pass after it (4 of 4), with the control passing in
+both cases so the result cannot be a harness artifact.
+
+### Receiver diagnostic status (verified)
+
+Working, verified by running the receiver directly:
+
+```text
+srt-bench runtime=compio mode=receiver <port> 3 120 --connections 1 \
+    --diag-payload-bytes 1316 --diag-rate-bps 8000000 --diag-window-ms 10000
+LISTENING
+[diag] measured_received=0 expected=7598 fence_seen=0 data_at_fence=0 missing_at_fence=0
+       at_fence=[] missing_final=7598 final=[0-7597] suffix=true dup_payloads=0
+```
+
+`expected=7598` is derived from the shared offer arithmetic (`source_schedule`),
+the summary is emitted **once per connection** (an earlier placement inside the
+service loop reset the tick set every visit and printed thousands of lines), and
+the classification happens on `ConnectionEvent::DataReceived { payload, .. }` --
+the application payload after reassembly, never the wire packet at
+`enqueue_received`.
+
+**Not yet working on the multi-connection receiver path**, which is the one the
+qualification uses (`--connections > 1` goes through
+`dispatch_ingress` -> `run_shared_pool`/`run_reuseport_multi`, not
+`receiver_task`). Evidence, from a diagnostic run at F=3 with `identity=true`
+and `fence=true`:
+
+```text
+sender   data_accepted=22794  fence_offered=3  fence_accepted=3
+receiver rx_core_total=22797                    <- fences counted as DATA
+         rx_diag_* absent from the row          <- diagnostic never activated
+```
+
+The fences being counted is the tell: the same flags on the same binary at
+`--connections 1` exclude them correctly. So the per-connection `BenchConfig` (or
+the event handling) on the acceptor/shared-pool path is not carrying
+`diag_expected_ticks`. The path clones `context.cfg` for peer tasks
+(`runtimes/compio.rs`, the acceptor promotion and handoff sites), so the next
+step is to confirm which construction loses the field -- `run_shared_pool`,
+`run_reuseport_multi`'s handoff, or the acceptor context -- before wiring
+anything further.
+
+Until that is fixed, a fence run on the multi-connection path cannot satisfy the
+validity rule (`fence_accepted == fanout && fences_seen == fanout`), so the
+10-pair A/B has not been run and no conservation branch is claimed.
+
+## Deliberately retained apparatus (concluded, not junk)
+
+Two experiments in this branch reached their conclusions and their code was
+briefly removed as "concluded". It is **kept instead**, because both are the
+apparatus a future comparison or a recursive self-improvement loop would re-run,
+and re-deriving a closed experiment costs more than carrying a bench:
+
+| apparatus | conclusion it produced | why it stays |
+|---|---|---|
+| `srt_bench::ring_modes` + the flag matrix arms in `udp_datapath_floor` | no io_uring setup flag wins; SQPOLL 25 % worse on UDP and ~8x worse on streams; `sqpoll+defer` rejected even with `SINGLE_ISSUER` | the answer is kernel-, Compio- and host-dependent; it is a reusable capability probe, and the same harness measures any future flag |
+| `rtmp_publish_floor` + its evidence | the stream regime costs 0.249-0.909 ms CPU/Mbit against SRT's 3.68, and that factor is bought by dropping per-packet sequencing and ARQ | it is the only in-runtime protocol-comparison baseline, and the Robotweax challenger experiment needs exactly this shape |
+| `udp_datapath_floor` core arms | memcpy 18.6 ns, null syscall 0.264-0.303 us, datagram floor 7.45-8.90 us | the floor is what makes "no flag/copy work will help" measurable rather than asserted |
+
+The rule applied: **delete conclusions, keep instruments.** Superseded rows and
+retracted claims stay in the record too -- a withdrawal is evidence about the
+method, and re-deriving it is how the same mistake gets made twice. What does not
+stay is anything neither instrument nor evidence: one unused helper
+(`TickSet::missing_range_count`) was removed as the only such item found.
