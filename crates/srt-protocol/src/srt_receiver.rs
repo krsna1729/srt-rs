@@ -1707,12 +1707,17 @@ impl ReceiverBuffer {
     /// The earliest TSBPD delivery deadline among packets still held, if
     /// any.
     ///
-    /// A packet counted here has been fully accepted -- it is complete data
-    /// legitimately waiting for its own playout deadline, not data that can
-    /// never complete. A generic connection-level timeout (the inactivity
-    /// timer bounding a peer-shutdown drain, in particular) must not treat
-    /// that wait as stalled and truncate it: `tsbpd_delay` is configurable
-    /// per session and can exceed any fixed timeout.
+    /// This buffer stores individually retained packets and message
+    /// fragments, not necessarily complete messages -- a returned deadline
+    /// can belong to a packet still waiting on a sibling fragment, not only
+    /// to one legitimately waiting on its own playout time. A generic
+    /// connection-level timeout (the inactivity timer bounding a
+    /// peer-shutdown drain, in particular) must not treat a *future*
+    /// deadline here as stalled and truncate it: `tsbpd_delay` is
+    /// configurable per session and can exceed any fixed timeout. A
+    /// deadline that is not in the future, by contrast, is not by itself
+    /// evidence of a legitimate wait -- the caller still has to rule out an
+    /// incomplete tail that can never be delivered.
     #[must_use]
     pub fn earliest_pending_deadline(&self) -> Option<Timestamp> {
         self.packets
