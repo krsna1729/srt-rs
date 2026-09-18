@@ -15,15 +15,25 @@ const PACKETS: u32 = 8_192;
 
 fn populated_sender(count: u32) -> SenderBuffer {
     let mut sender = SenderBuffer::new(0, count, 120);
-    sender.set_flow_window(count);
     for _ in 0..count {
-        assert!(
-            sender
-                .push(vec![1; 1316], 0, 1, Timestamp::default())
-                .is_some()
-        );
+        let (header, _) = sender
+            .push(vec![1; 1316], 0, 1, Timestamp::default())
+            .expect("the negotiated window admits the flight");
+        // A loss report is only credible for positions that reached the wire.
+        sender.note_data_submitted(header.sequence_number);
     }
     sender
+}
+
+/// Expand a loss list into the single-sequence ranges a NAK carries.
+fn loss_ranges(sequences: &[u32]) -> Vec<LossRange> {
+    sequences
+        .iter()
+        .map(|&sequence| LossRange {
+            first_seq: sequence,
+            last_seq: sequence,
+        })
+        .collect()
 }
 
 fn bench_sender_nak_scale(c: &mut Criterion) {
@@ -31,6 +41,7 @@ fn bench_sender_nak_scale(c: &mut Criterion) {
     group.throughput(Throughput::Elements(PACKETS as u64));
 
     let expanded_losses = (0..PACKETS).collect::<Vec<_>>();
+    let expanded_ranges = loss_ranges(&expanded_losses);
     let dense_range = [LossRange {
         first_seq: 0,
         last_seq: PACKETS - 1,
@@ -41,7 +52,7 @@ fn bench_sender_nak_scale(c: &mut Criterion) {
         b.iter_batched_ref(
             || populated_sender(PACKETS),
             |sender| {
-                sender.handle_nak(black_box(&expanded_losses));
+                sender.handle_nak_ranges(black_box(&expanded_ranges));
                 black_box(sender.has_retransmit());
             },
             BatchSize::SmallInput,
@@ -65,11 +76,11 @@ fn bench_sender_nak_scale(c: &mut Criterion) {
         b.iter_batched_ref(
             || {
                 let mut sender = populated_sender(PACKETS);
-                sender.handle_nak(&expanded_losses);
+                sender.handle_nak_ranges(&expanded_ranges);
                 sender
             },
             |sender| {
-                sender.handle_nak(black_box(&expanded_losses));
+                sender.handle_nak_ranges(black_box(&expanded_ranges));
                 black_box(sender.has_retransmit());
             },
             BatchSize::SmallInput,

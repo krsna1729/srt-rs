@@ -1665,7 +1665,59 @@ impl ReceiverBuffer {
 
     /// Generate an ACK.
     pub fn generate_ack(&mut self, now: Timestamp) -> AckPacket {
-        let is_light = self.packets_since_ack >= self.effective_light_ack_interval_packets()
+        self.generate_ack_inner(now, false)
+    }
+
+    /// Whether `ack_number` could have come from an ACK this buffer sent.
+    ///
+    /// The ACK's own number only ever increases, so a number above the
+    /// highest one assigned names an ACK that was never sent, and zero is
+    /// never assigned at all (a Light ACK carries zero in that field but is
+    /// never ACKACKed). An *old* number stays valid on purpose: libsrt
+    /// re-ACKACKs the same ACK number when it sees a duplicate Full ACK
+    /// (`srtcore/core.cpp` `processCtrlAck`), which is exactly what a lost
+    /// ACKACK produces, so age alone must not make the input malformed.
+    #[must_use]
+    pub fn ack_number_was_sent(&self, ack_number: u32) -> bool {
+        ack_number != 0 && self.ack_number.wrapping_sub(ack_number) < 0x8000_0000
+    }
+
+    /// Generate a Full ACK regardless of the Light ACK cadence.
+    ///
+    /// Used when the application has reopened a receive window this buffer
+    /// had advertised as zero: only a Small/Full ACK carries the
+    /// available-buffer field, so the peer keeps throttling until one is
+    /// sent. The cumulative ACK position is untouched -- application
+    /// capacity moving must not fabricate delivery progress.
+    pub fn generate_full_ack(&mut self, now: Timestamp) -> AckPacket {
+        self.generate_ack_inner(now, true)
+    }
+
+    /// Whether this buffer holds no data that could still be delivered.
+    ///
+    /// Positions that were never received are not deliverable and do not
+    /// count: a peer that has closed its send half will never fill them, and
+    /// waiting for them would hold the connection open on data that cannot
+    /// exist. TLPKTDROP retires them the ordinary way.
+    #[must_use]
+    pub fn is_delivery_drained(&self) -> bool {
+        self.packets.is_empty()
+    }
+
+    /// Whether this buffer last advertised a full receive window and now has
+    /// free capacity again.
+    ///
+    /// The zero->positive transition is the one receive-window change that
+    /// cannot wait for the next ACK tick: the peer is stopped, and its
+    /// progress (if any) may take an unbounded time to arrive. Nonzero ->
+    /// larger changes keep the ordinary cadence.
+    pub fn receive_window_reopened(&self) -> bool {
+        self.last_advertised_buffer == 0 && self.available_buffer_packets() > 0
+    }
+
+    fn generate_ack_inner(&mut self, now: Timestamp, force_full: bool) -> AckPacket {
+        let is_light = !force_full
+            && self.packets_since_ack >= self.effective_light_ack_interval_packets()
             && !self.ack_interval_elapsed(now);
 
         self.last_ack_time = now;

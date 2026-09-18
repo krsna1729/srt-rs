@@ -15,6 +15,7 @@ use crate::sender_packet_window::SenderPacketWindow;
 
 use bytes::Bytes;
 
+use crate::crypto_impl::{KeyFlag, TxCryptoStamp};
 use crate::sender_rto::{INITIAL_RTT_VAR_MICROS, INITIAL_SRTT_MICROS, RtoArm, SenderRto};
 use crate::srt_handshake::MAX_FLOW_WINDOW;
 use crate::srt_packet::{DataHeader, PacketPosition, SRT_HEADER_SIZE, sequence_less_than};
@@ -23,6 +24,14 @@ use crate::time::Timestamp;
 
 const SEQUENCE_MASK: u32 = 0x7FFF_FFFF;
 const STALE_RETRANSMIT_COMPACT_THRESHOLD: usize = 1_024;
+
+/// Upper bound on repeated-DROPREQ responses to one peer loss report.
+///
+/// A NAK can name a whole window, and every name inside a dropped message
+/// maps to one DROPREQ; without a ceiling a single datagram could be
+/// amplified into thousands of control datagrams. Capping is safe because a
+/// DROPREQ is idempotent: a peer that still needs one NAKs again.
+const MAX_DROPREQ_PER_NAK: usize = 16;
 
 /// "No configured limit" default max bandwidth, matching libsrt's own
 /// `BW_INFINITE` (`srtcore/common.h`): 1 Gbps expressed in bytes/sec. Live
@@ -57,6 +66,25 @@ struct SentPacket {
     payload: Bytes,
     sent_time: Timestamp,
     retransmit_count: u32,
+    /// The cryptographic reservation this packet's FIRST transmission used.
+    ///
+    /// Retransmission reproduces the first transmission's protected bytes
+    /// when it reuses this stamp: same key generation, same sequence-derived
+    /// counter, so the same ciphertext (and, under GCM, the same tag) comes
+    /// out without retaining a second copy of the payload. That is what both
+    /// references do -- libsrt stores the first transmission's key-flag bits
+    /// with the block and re-reads the already-encrypted payload
+    /// (`CSndBuffer::readData`, `core.cpp` `packLostData`), and Robotweax
+    /// keeps the protected packet selected on first send. Released with the
+    /// media on TLPKTDROP, because a tombstone is never transmitted again.
+    crypto_stamp: Option<TxCryptoStamp>,
+    /// Whether this entry is a TLPKTDROP tombstone: the message was given up
+    /// as too late, so its media payload has been released and it must never
+    /// be DATA-retransmitted. What remains is the identity a repeated NAK
+    /// needs -- the sequence, the message number, and the surrounding
+    /// tombstone run that regenerates DROPREQ -- until the cumulative ACK
+    /// retires it.
+    dropped: bool,
     /// Whether this packet's FIRST datagram has actually left the protocol for
     /// the transport.
     ///
@@ -99,15 +127,28 @@ pub struct SenderBuffer {
     /// The next message number.
     next_msg: u32,
 
-    /// Flow window size.
-    flow_window: u32,
+    /// Handshake-negotiated static flow window, in packets.
+    ///
+    /// Fixed for the lifetime of the connection: the peer's advertised
+    /// receive capacity (`SRT_FLOW_WINDOW` in the handshake, when it sent
+    /// one) clamped to this sender's own configured maximum. Immutable
+    /// because it is the ceiling, not a running balance: no ACK may enlarge
+    /// the sender past it.
+    negotiated_window: u32,
 
-    /// Congestion window size.
-    congestion_window: u32,
-
-    /// Maximum buffer size (packets).
-    #[expect(dead_code)]
-    max_buffer_size: u32,
+    /// Absolute 31-bit-exclusive end of the peer's advertised receive
+    /// window, in sequence space.
+    ///
+    /// A Full/Small ACK moves it to `ack_seq + advertised_free`; a Lite ACK
+    /// advances the cumulative ACK but *cannot* move it. Keeping the credit
+    /// as a sequence boundary rather than as a reusable count is the whole
+    /// point: when a Lite ACK advances the cumulative ACK, the distance from
+    /// `next_seq` to this fixed end shrinks with it, so the acknowledged
+    /// flight's slots are not handed out a second time. Initialized to the
+    /// handshake window's end so a sender may fill its negotiated window
+    /// before the first ACK advertisement arrives (libsrt starts from the
+    /// peer's flight flag size the same way, `core.cpp` `m_iFlowWindowSize`).
+    peer_window_end: u32,
 
     /// Latency (microseconds).
     latency_us: u64,
@@ -146,6 +187,18 @@ pub struct SenderBuffer {
     total_retransmits: u64,
     /// Packets declared lost by peer NAKs (cumulative).
     total_lost: u64,
+    /// Retained, unacknowledged packets whose first transmission used each
+    /// key generation. A generation cannot be decommissioned while one of
+    /// its packets is still retained: a retransmission has to be able to
+    /// reproduce that packet's protected bytes.
+    retained_tx_even: u32,
+    retained_tx_odd: u32,
+    /// Retained tombstones (dropped entries not yet retired by the
+    /// cumulative ACK). They occupy window span but no flow-window credit
+    /// and no payload accounting. (Reuses the slot the never-read
+    /// `max_buffer_size` field occupied, so inline state does not grow for
+    /// it.)
+    dropped_retained: u32,
     /// Locally discarded packets that exceeded the TLPKTDROP deadline.
     total_dropped: u64,
     /// Payload bytes in locally discarded TLPKTDROP packets.
@@ -212,9 +265,8 @@ impl SenderBuffer {
             oldest_unacked: initial_seq,
             next_seq: initial_seq,
             next_msg: 1,
-            flow_window,
-            congestion_window: flow_window,
-            max_buffer_size: 8192,
+            negotiated_window: flow_window,
+            peer_window_end: initial_seq.wrapping_add(flow_window) & SEQUENCE_MASK,
             latency_us: latency_ms as u64 * 1000,
             packet_send_period: 0,
             next_send_due: None,
@@ -228,6 +280,9 @@ impl SenderBuffer {
             max_bandwidth_bytes_per_sec: DEFAULT_MAX_BANDWIDTH_BYTES_PER_SEC,
             total_retransmits: 0,
             total_lost: 0,
+            retained_tx_even: 0,
+            retained_tx_odd: 0,
+            dropped_retained: 0,
             total_dropped: 0,
             total_bytes_dropped: 0,
             total_acks_received: 0,
@@ -253,6 +308,9 @@ impl SenderBuffer {
         }
         self.next_seq = sequence_number & 0x7FFF_FFFF;
         self.oldest_unacked = self.next_seq;
+        self.retained_tx_even = 0;
+        self.retained_tx_odd = 0;
+        self.peer_window_end = self.next_seq.wrapping_add(self.negotiated_window) & SEQUENCE_MASK;
         self.loss_list.clear();
         self.packets.clear();
         self.stale_retransmits = 0;
@@ -265,21 +323,94 @@ impl SenderBuffer {
         self.next_msg
     }
 
+    /// Remaining new-DATA credit, in packets: the distance from the next
+    /// unset sequence to the peer's advertised window end, capped by what is
+    /// left of the handshake-negotiated window.
+    ///
+    /// The two are separate quantities on purpose. The boundary is the
+    /// peer's advertised receive capacity, expressed absolutely so a Lite
+    /// ACK cannot recycle credit; the negotiated window is this sender's
+    /// own ceiling, so a peer advertising an implausibly large free buffer
+    /// cannot push the flight past what was agreed at handshake.
+    pub fn remaining_window_packets(&self) -> u32 {
+        if !sequence_less_than(self.next_seq, self.peer_window_end) {
+            // The flight already reaches (or has passed) the advertised end:
+            // no credit, not a wrapped-around large distance.
+            return 0;
+        }
+        let to_end = self.peer_window_end.wrapping_sub(self.next_seq) & SEQUENCE_MASK;
+        to_end.min(
+            self.negotiated_window
+                .saturating_sub(self.packets_in_flight()),
+        )
+    }
+
+    /// Record the cryptographic reservation a packet's first transmission
+    /// will use.
+    pub fn note_data_stamp(&mut self, sequence: u32, stamp: Option<TxCryptoStamp>) {
+        let Some(stamp) = stamp else {
+            return;
+        };
+        let Some(entry) = self.packets.get_mut(sequence) else {
+            return;
+        };
+        if entry.crypto_stamp.is_some() {
+            return;
+        }
+        entry.crypto_stamp = Some(stamp);
+        self.count_retained_stamp(stamp.key_flag, true);
+    }
+
+    /// The cryptographic reservation recorded for a retained packet.
+    ///
+    /// `None` covers both "no longer retained" and "sent in the clear": a
+    /// retransmission of a plaintext packet needs no key generation either
+    /// way.
+    pub fn data_stamp(&self, sequence: u32) -> Option<TxCryptoStamp> {
+        self.packets
+            .get(sequence)
+            .and_then(|entry| entry.crypto_stamp)
+    }
+
+    /// Retained packets per key generation: even, then odd.
+    pub fn retained_stamps(&self) -> (u32, u32) {
+        (self.retained_tx_even, self.retained_tx_odd)
+    }
+
+    fn count_retained_stamp(&mut self, key_flag: KeyFlag, add: bool) {
+        let counter = match key_flag {
+            KeyFlag::Even => &mut self.retained_tx_even,
+            KeyFlag::Odd => &mut self.retained_tx_odd,
+        };
+        if add {
+            *counter = counter.saturating_add(1);
+        } else {
+            *counter = counter.saturating_sub(1);
+        }
+    }
+
+    /// The peer's advertised receive-window end (31-bit, exclusive).
+    pub fn peer_window_end(&self) -> u32 {
+        self.peer_window_end
+    }
+
+    /// The handshake-negotiated static flow window, in packets.
+    pub fn negotiated_window(&self) -> u32 {
+        self.negotiated_window
+    }
+
     /// Whether sending is possible (checks window size only).
     pub fn can_send(&self) -> bool {
-        let in_flight = self.packets_in_flight();
-        in_flight < self.flow_window && in_flight < self.congestion_window
+        self.retained_span() < self.packets.window_size()
+            && self.packets_in_flight() < self.negotiated_window
+            && sequence_less_than(self.next_seq, self.peer_window_end)
     }
 
     /// Whether an entire multi-packet message fits in the current windows.
     /// Partial messages are never admitted because their missing `Last`
     /// packet cannot be repaired by a later API call.
     pub fn can_send_message(&self, packet_count: usize) -> bool {
-        let available = self
-            .flow_window
-            .min(self.congestion_window)
-            .saturating_sub(self.packets_in_flight());
-        u32::try_from(packet_count).is_ok_and(|count| count <= available)
+        u32::try_from(packet_count).is_ok_and(|count| count <= self.remaining_window_packets())
     }
 
     /// Whether sending is possible, including packet pacing.
@@ -416,8 +547,18 @@ impl SenderBuffer {
         }
     }
 
-    /// Number of packets in flight.
+    /// Number of live packets in flight.
+    ///
+    /// TLPKTDROP tombstones are excluded: the peer has already been told (or
+    /// is about to be told) that those sequences are dropped, so they hold no
+    /// receive-window space on its side. They still occupy window span --
+    /// that bound is [`Self::retained_span`].
     pub fn packets_in_flight(&self) -> u32 {
+        (self.packets.len() as u32).saturating_sub(self.dropped_retained)
+    }
+
+    /// Retained entries, tombstones included: the window's own storage bound.
+    pub fn retained_span(&self) -> u32 {
         self.packets.len() as u32
     }
 
@@ -481,10 +622,14 @@ impl SenderBuffer {
                 return None;
             }
             if eligible && !self.packets.retransmit_queued_contains(sequence) {
-                self.packets
-                    .queue_loss_range(sequence, sequence, |sequence| {
+                self.packets.queue_loss_range(
+                    sequence,
+                    sequence,
+                    |_| true,
+                    |sequence| {
                         self.loss_list.push_back(sequence);
-                    });
+                    },
+                );
                 return Some(sequence);
             }
             ceiling = sequence.wrapping_sub(1);
@@ -618,14 +763,28 @@ impl SenderBuffer {
         self.rto.backoffs()
     }
 
-    /// Set the active flow window (the congestion window tracks it too; see
-    /// [`Self::new`] for LIVE mode's behavior). The constructor's window is
-    /// the permanent maximum, so peer feedback can shrink and reopen this
-    /// window without growing the retransmit bitmap.
-    pub fn set_flow_window(&mut self, flow_window: u32) {
-        let bounded = flow_window.min(self.packets.window_size());
-        self.flow_window = bounded;
-        self.congestion_window = bounded;
+    /// Apply a Full/Small ACK's advertised receive window.
+    ///
+    /// `ack_seq` is the ACK's cumulative position (the receiver's next
+    /// expected sequence) and `advertised_free` is the free receive-buffer
+    /// size it carries, in packets. The result is an absolute boundary, not
+    /// a reusable balance: `ack_seq + advertised_free`. A later Lite ACK
+    /// advances `ack_seq` without moving this value, so the flight it
+    /// acknowledges consumes credit instead of restoring it.
+    ///
+    /// The advertised value is clamped to the handshake-negotiated window:
+    /// libsrt and Robotweax both take a current advertisement verbatim, but
+    /// an inflated or hostile advertisement must not enlarge the sender past
+    /// what was agreed at handshake. Callers must only pass an ACK that
+    /// actually advanced the cumulative position (see
+    /// [`Self::handle_ack`]'s callers); a stale or duplicate ACK must not
+    /// reopen a closed window.
+    pub fn set_peer_window(&mut self, ack_seq: u32, advertised_free: u32) {
+        if ack_seq & !SEQUENCE_MASK != 0 {
+            return;
+        }
+        let free = advertised_free.min(self.negotiated_window);
+        self.peer_window_end = ack_seq.wrapping_add(free) & SEQUENCE_MASK;
     }
 
     /// Set the maximum bandwidth (equivalent to `SRTO_MAXBW`, bytes/sec).
@@ -752,6 +911,8 @@ impl SenderBuffer {
                     payload: retained,
                     sent_time: now,
                     retransmit_count: 0,
+                    crypto_stamp: None,
+                    dropped: false,
                     submitted: false,
                 },
             )
@@ -821,6 +982,8 @@ impl SenderBuffer {
                         payload: retained,
                         sent_time: now,
                         retransmit_count: 0,
+                        crypto_stamp: None,
+                        dropped: false,
                         submitted: false,
                     },
                 )
@@ -854,6 +1017,25 @@ impl SenderBuffer {
         results
     }
 
+    /// Push a packet and mark its datagram as actually transmitted.
+    ///
+    /// The window/ACK/NAK mechanics tests need the state a real sender has
+    /// once `poll_output_into` has materialized a datagram: a peer's loss
+    /// report is only credible for positions that were on the wire, and the
+    /// loss-report path now rejects reports naming positions that were not.
+    #[cfg(test)]
+    pub fn push_submitted(
+        &mut self,
+        payload: Vec<u8>,
+        timestamp: u32,
+        dest_socket_id: u32,
+        now: Timestamp,
+    ) -> Option<(DataHeader, Bytes)> {
+        let pushed = self.push(payload, timestamp, dest_socket_id, now)?;
+        self.note_data_submitted(pushed.0.sequence_number);
+        Some(pushed)
+    }
+
     /// Get a packet to retransmit.
     ///
     /// `entry.sent_time` is left at its original send time and never
@@ -868,6 +1050,13 @@ impl SenderBuffer {
     pub fn pop_retransmit(&mut self, dest_socket_id: u32) -> Option<(DataHeader, Bytes)> {
         while let Some(seq) = self.loss_list.pop_front() {
             if let Some(entry) = self.packets.pop_retransmit_slot(seq) {
+                if entry.dropped {
+                    // A tombstone answers a repeated NAK with DROPREQ, never
+                    // with DATA: its payload is gone and the peer has been
+                    // told this message is dropped.
+                    self.stale_retransmits = self.stale_retransmits.saturating_sub(1);
+                    continue;
+                }
                 entry.retransmit_count += 1;
                 self.total_retransmits += 1;
                 let wire_bytes = (entry.payload.len() + SRT_HEADER_SIZE) as u64;
@@ -916,43 +1105,153 @@ impl SenderBuffer {
         }
 
         let mut stale_count = 0;
-        self.packets
-            .discard_acked_prefix(self.oldest_unacked, ack_seq, || {
-                stale_count += 1;
-            });
+        let mut tombstones_discarded = 0;
+        let mut released_stamps = Vec::new();
+        self.packets.discard_acked_prefix(
+            self.oldest_unacked,
+            ack_seq,
+            |entry: &SentPacket, was_retransmit_queued| {
+                if was_retransmit_queued {
+                    stale_count += 1;
+                }
+                if entry.dropped {
+                    tombstones_discarded += 1;
+                } else if let Some(stamp) = entry.crypto_stamp {
+                    released_stamps.push(stamp.key_flag);
+                }
+            },
+        );
         self.stale_retransmits = self.stale_retransmits.saturating_add(stale_count);
+        self.dropped_retained = self.dropped_retained.saturating_sub(tombstones_discarded);
+        for key_flag in released_stamps {
+            self.count_retained_stamp(key_flag, false);
+        }
 
         self.oldest_unacked = ack_seq;
         self.compact_stale_retransmits();
     }
 
     /// Process a NAK and add to the loss list.
+    ///
+    /// Test-only convenience wrapper for single-sequence loss lists.
+    #[cfg(test)]
     pub fn handle_nak(&mut self, lost_sequences: &[u32]) {
-        self.total_naks_received = self.total_naks_received.saturating_add(1);
-        self.queue_loss_ranges(lost_sequences.iter().map(|&sequence| LossRange {
-            first_seq: sequence,
-            last_seq: sequence,
-        }));
+        let ranges: Vec<LossRange> = lost_sequences
+            .iter()
+            .map(|&sequence| LossRange {
+                first_seq: sequence,
+                last_seq: sequence,
+            })
+            .collect();
+        let _ = self.handle_nak_ranges(&ranges);
     }
 
-    /// Queue retained packets intersecting compact peer loss ranges.
-    pub fn handle_nak_ranges(&mut self, loss_ranges: &[LossRange]) {
+    /// Validate a peer loss report completely, then commit it: either every
+    /// requested position is a credible report and the whole NAK is applied,
+    /// or nothing is.
+    ///
+    /// A loss report is evidence a receiver can only produce from what it has
+    /// seen: a position it never received *while a later position arrived*.
+    /// So every requested sequence must still be retained here, and each live
+    /// one must have actually been transmitted -- a sequence this sender
+    /// accepted but never submitted is invisible to the peer, and a future or
+    /// already-retired sequence is not network loss. Any component that fails
+    /// means the whole report is rejected, so a valid prefix cannot smuggle
+    /// an impossible tail into the retransmission queue.
+    ///
+    /// Live positions are queued for DATA retransmission; tombstoned ones
+    /// (messages already given up as too late) are returned for a repeated
+    /// DROPREQ, capped per report so one NAK cannot be amplified into
+    /// unbounded control traffic.
+    ///
+    /// Validation walks the requested ranges against the window, bounded by
+    /// the negotiated window: no expanded sequence list is built.
+    pub fn handle_nak_ranges(&mut self, loss_ranges: &[LossRange]) -> Vec<DroppedMessage> {
         self.total_naks_received = self.total_naks_received.saturating_add(1);
-        self.queue_loss_ranges(loss_ranges.iter().copied());
-    }
 
-    fn queue_loss_ranges(&mut self, loss_ranges: impl IntoIterator<Item = LossRange>) {
-        let packets = &mut self.packets;
-        let loss_list = &mut self.loss_list;
-        let total_lost = &mut self.total_lost;
+        let mut requested_span = 0u32;
         for loss in loss_ranges {
             let first_seq = loss.first_seq & SEQUENCE_MASK;
             let last_seq = loss.last_seq & SEQUENCE_MASK;
-            packets.queue_loss_range(first_seq, last_seq, |sequence| {
+            let count = (last_seq.wrapping_sub(first_seq) & SEQUENCE_MASK).saturating_add(1);
+            if count > self.negotiated_window {
+                return Vec::new();
+            }
+            requested_span = requested_span.saturating_add(count);
+            if requested_span > self.negotiated_window {
+                return Vec::new();
+            }
+        }
+
+        // Phase 1: validate everything before touching any state.
+        let mut tombstones: Vec<(u32, u32)> = Vec::new();
+        for loss in loss_ranges {
+            let mut sequence = loss.first_seq & SEQUENCE_MASK;
+            let last_seq = loss.last_seq & SEQUENCE_MASK;
+            loop {
+                match self.packets.get(sequence) {
+                    None => {
+                        // Never sent, already acknowledged, or outside the
+                        // retained span: not a loss this receiver could have
+                        // observed.
+                        return Vec::new();
+                    }
+                    Some(entry) if entry.dropped => {
+                        let message_number = entry.message_number;
+                        if let Some(range) = self.tombstone_range(sequence, message_number)
+                            && !tombstones
+                                .iter()
+                                .any(|&(first, _)| first.wrapping_sub(range.0) & SEQUENCE_MASK == 0)
+                        {
+                            tombstones.push(range);
+                        }
+                    }
+                    Some(entry) if !entry.submitted => {
+                        // Accepted but never on the wire: the peer cannot have
+                        // measured it as lost.
+                        return Vec::new();
+                    }
+                    Some(_) => {}
+                }
+                if sequence == last_seq {
+                    break;
+                }
+                sequence = sequence.wrapping_add(1) & SEQUENCE_MASK;
+            }
+        }
+
+        // Phase 2: commit.
+        for loss in loss_ranges {
+            self.queue_loss_range(loss.first_seq, loss.last_seq);
+        }
+        tombstones
+            .into_iter()
+            .take(MAX_DROPREQ_PER_NAK)
+            .map(|(first_seq, last_seq)| DroppedMessage {
+                message_number: self
+                    .packets
+                    .get(first_seq)
+                    .map_or(0, |entry| entry.message_number),
+                first_seq,
+                last_seq,
+            })
+            .collect()
+    }
+
+    /// Queue retained, live, transmitted packets intersecting one loss range.
+    fn queue_loss_range(&mut self, first_seq: u32, last_seq: u32) {
+        let packets = &mut self.packets;
+        let loss_list = &mut self.loss_list;
+        let total_lost = &mut self.total_lost;
+        packets.queue_loss_range(
+            first_seq & SEQUENCE_MASK,
+            last_seq & SEQUENCE_MASK,
+            |entry: &SentPacket| !entry.dropped,
+            |sequence| {
                 loss_list.push_back(sequence);
                 *total_lost = total_lost.saturating_add(1);
-            });
-        }
+            },
+        );
     }
 
     fn compact_stale_retransmits(&mut self) {
@@ -1008,12 +1307,19 @@ impl SenderBuffer {
         }
     }
 
-    /// Remove expired packets (TLPKTDROP), dropping entire messages.
+    /// Drop expired messages (TLPKTDROP), replacing them with tombstones.
     ///
-    /// Scans in sequence order from `oldest_unacked` toward `next_seq`.
-    /// When an expired packet is found, all packets sharing its
-    /// `message_number` are removed together (SRT spec: "the entire message
-    /// is dropped"). Returns one `DroppedMessage` per message removed.
+    /// Scans in sequence order from `oldest_unacked` toward `next_seq`. When
+    /// an expired packet is found, every packet sharing its `message_number`
+    /// becomes a tombstone together (SRT spec: "the entire message is
+    /// dropped"). Returns one `DroppedMessage` per message dropped *in this
+    /// call*, so the connection answers with DROPREQ once per drop.
+    ///
+    /// The tombstone keeps only what a repeated NAK needs; the media payload
+    /// is released here. `oldest_unacked` deliberately does not advance: the
+    /// peer has not acknowledged these sequences, and until it does they are
+    /// what a repeated NAK is matched against. They retire on the cumulative
+    /// ACK, exactly like live packets.
     pub fn drop_expired(&mut self, now: Timestamp) -> Vec<DroppedMessage> {
         let threshold = (self.latency_us * 125 / 100).max(1_000_000);
 
@@ -1022,6 +1328,10 @@ impl SenderBuffer {
         while sequence_less_than(seq, self.next_seq) {
             match self.packets.get(seq) {
                 Some(entry) => {
+                    if entry.dropped {
+                        seq = seq.wrapping_add(1) & 0x7FFF_FFFF;
+                        continue;
+                    }
                     let elapsed = now.as_micros().saturating_sub(entry.sent_time.as_micros());
                     if elapsed <= threshold {
                         break;
@@ -1034,14 +1344,12 @@ impl SenderBuffer {
             }
         }
 
-        if sequence_less_than(self.oldest_unacked, seq) {
-            self.oldest_unacked = seq;
-        }
         self.compact_stale_retransmits();
 
         messages
     }
 
+    /// Turn one expired message into tombstones, reporting its range.
     fn drop_expired_message(&mut self, seq: &mut u32) -> DroppedMessage {
         let message_number = self
             .packets
@@ -1051,14 +1359,33 @@ impl SenderBuffer {
         let first_seq = *seq;
         let mut last_seq = first_seq;
 
-        // Drop this packet and any remaining fragments of the same message.
         loop {
-            if let Some(removed) = self.packets.remove(*seq) {
+            let mut just_dropped = false;
+            let released_stamp = self.packets.get_mut(*seq).and_then(|entry| {
+                if entry.dropped {
+                    return None;
+                }
                 self.total_dropped = self.total_dropped.saturating_add(1);
                 self.total_bytes_dropped = self
                     .total_bytes_dropped
-                    .saturating_add(removed.packet.payload.len() as u64);
-                if removed.was_retransmit_queued {
+                    .saturating_add(entry.payload.len() as u64);
+                // The media is what occupancy is measured in; the sequence
+                // identity is what the peer's repeated NAK is matched against.
+                entry.payload = Bytes::new();
+                entry.dropped = true;
+                just_dropped = true;
+                // A tombstone is never transmitted again, so its key
+                // generation is no longer a live dependency.
+                entry.crypto_stamp.take()
+            });
+            if just_dropped {
+                if let Some(stamp) = released_stamp {
+                    self.count_retained_stamp(stamp.key_flag, false);
+                }
+                self.dropped_retained = self.dropped_retained.saturating_add(1);
+                if self.packets.cancel_retransmit(*seq) {
+                    // The queued loss-list entry is now answered by DROPREQ,
+                    // not by a retransmission.
                     self.stale_retransmits += 1;
                 }
                 last_seq = *seq;
@@ -1085,6 +1412,50 @@ impl SenderBuffer {
             first_seq,
             last_seq,
         }
+    }
+
+    /// The inclusive sequence range of the tombstone run containing
+    /// `sequence`, if that sequence is a tombstone of the given message.
+    ///
+    /// A dropped message's fragments stay contiguous in sequence space
+    /// (fragments are assigned consecutively and nothing is renumbered), so
+    /// expanding from the NAKed sequence recovers exactly the range DROPREQ
+    /// must name -- no per-entry range storage, and no way for the range to
+    /// drift from the window's own contents.
+    fn tombstone_range(&self, sequence: u32, message_number: u32) -> Option<(u32, u32)> {
+        if self
+            .packets
+            .get(sequence)
+            .is_none_or(|entry| !entry.dropped || entry.message_number != message_number)
+        {
+            return None;
+        }
+        let mut first = sequence;
+        // Walk outward one sequence at a time, bounded by the retained span.
+        let mut steps = 0u32;
+        while steps < self.packets.window_size() {
+            let candidate = first.wrapping_sub(1) & SEQUENCE_MASK;
+            match self.packets.get(candidate) {
+                Some(entry) if entry.dropped && entry.message_number == message_number => {
+                    first = candidate;
+                }
+                _ => break,
+            }
+            steps += 1;
+        }
+        let mut last = sequence;
+        steps = 0;
+        while steps < self.packets.window_size() {
+            let candidate = last.wrapping_add(1) & SEQUENCE_MASK;
+            match self.packets.get(candidate) {
+                Some(entry) if entry.dropped && entry.message_number == message_number => {
+                    last = candidate;
+                }
+                _ => break,
+            }
+            steps += 1;
+        }
+        Some((first, last))
     }
 
     /// Get the send time of the oldest packet in the buffer.
@@ -1144,10 +1515,10 @@ impl SenderBuffer {
             packets_in_buffer: self.packets.len() as u32,
             payload_bytes_in_buffer,
             packets_in_loss_list: self.packets.retransmit_queued_count(),
-            available_buffer_packets: self.flow_window.saturating_sub(self.packets.len() as u32),
+            available_buffer_packets: self.remaining_window_packets(),
             available_buffer_bytes: None,
-            flow_window_packets: self.flow_window,
-            congestion_window_packets: self.congestion_window,
+            flow_window_packets: self.negotiated_window,
+            congestion_window_packets: self.negotiated_window,
             packets_in_flight: self.packets_in_flight(),
             buffer_span_micros,
             tsbpd_delay_micros: self.latency_us,
@@ -1332,14 +1703,146 @@ mod tests {
         assert_eq!(buf.packets_in_flight(), 1);
     }
 
+    /// The receive-window credit regression: a Light ACK advances the
+    /// cumulative acknowledgement but carries no advertisement, so the
+    /// flight it acknowledges must not come back as fresh credit.
+    ///
+    /// Reference behaviour: libsrt debits its flow window by exactly the
+    /// acknowledged progress on a lite ACK (`srtcore/core.cpp`
+    /// `processCtrlAck`: `m_iFlowWindowSize -= CSeqNo::seqoff(m_iSndLastAck,
+    /// ackdata_seqno)`), which is the same contract as Robotweax commit
+    /// `09c852b4` ("Preserve receive-window credit across Lite ACKs"). Both
+    /// keep the credit anchored at the cumulative position, i.e. exactly the
+    /// absolute `ack_seq + advertised_free` boundary `peer_window_end`
+    /// tracks. Before this change the stale advertisement was compared
+    /// against a flight that an ACK had just shrunk, so the acknowledged
+    /// slots were handed out a second time.
+    #[test]
+    fn light_ack_cannot_recycle_receive_window_credit() {
+        let now = Timestamp::from_micros(0);
+        let mut buf = SenderBuffer::new(1_000, 4, 120);
+        assert_eq!(buf.peer_window_end(), 1_004);
+        assert_eq!(buf.remaining_window_packets(), 4);
+
+        // Receiver free window = 4: the whole advertised window is usable.
+        for _ in 0..4 {
+            assert!(buf.push(vec![1], 1, 1, now).is_some());
+        }
+        assert!(!buf.can_send(), "the advertised window is full");
+
+        // All four delivered, and a Full ACK at 1004 advertising 4 free
+        // reopens the window.
+        buf.handle_ack(1_004);
+        buf.set_peer_window(1_004, 4);
+        assert_eq!(buf.remaining_window_packets(), 4);
+        for _ in 0..4 {
+            assert!(buf.push(vec![1], 1, 1, now).is_some());
+        }
+        assert!(!buf.can_send());
+
+        // A Light ACK advances the cumulative ACK by two and advertises
+        // nothing. The two packets it acknowledges are gone from the flight,
+        // but the peer freed no receive space with them: the sender may send
+        // nothing more until a Small/Full ACK says otherwise.
+        buf.handle_ack(1_006);
+        assert_eq!(buf.packets_in_flight(), 2);
+        assert_eq!(buf.remaining_window_packets(), 0);
+        assert!(!buf.can_send());
+    }
+
+    #[test]
+    fn a_small_or_full_ack_reopens_exactly_what_it_advertises() {
+        let now = Timestamp::from_micros(0);
+        let mut buf = SenderBuffer::new(1_000, 4, 120);
+        for _ in 0..4 {
+            assert!(buf.push(vec![1], 1, 1, now).is_some());
+        }
+        // Two delivered, two still held: the advertised credit is what the
+        // window reopens by, and no more.
+        buf.handle_ack(1_002);
+        buf.set_peer_window(1_002, 2);
+        assert_eq!(buf.remaining_window_packets(), 0);
+
+        buf.set_peer_window(1_004, 2);
+        assert_eq!(buf.remaining_window_packets(), 2);
+        assert!(buf.push(vec![1], 1, 1, now).is_some());
+        assert!(buf.push(vec![1], 1, 1, now).is_some());
+        assert!(!buf.can_send());
+    }
+
+    #[test]
+    fn peer_window_end_wraps_at_the_31_bit_boundary() {
+        let now = Timestamp::from_micros(0);
+        let mut buf = SenderBuffer::new(0x7FFF_FFFE, 4, 120);
+        // 0x7FFFF_FFE + 4 crosses 0x7FFF_FFFF into 0x0000_0002.
+        assert_eq!(buf.peer_window_end(), 2);
+
+        for _ in 0..4 {
+            assert!(buf.push(vec![1], 1, 1, now).is_some());
+        }
+        assert_eq!(buf.next_sequence_number(), 2);
+        assert!(
+            !buf.can_send(),
+            "the flight fills the window across the wrap"
+        );
+
+        // Three of the four are acknowledged across the wrap; a current
+        // advertisement of four then leaves room for the remaining position.
+        buf.handle_ack(1);
+        buf.set_peer_window(1, 4);
+        assert_eq!(buf.peer_window_end(), 5);
+        assert_eq!(buf.remaining_window_packets(), 3);
+        for _ in 0..3 {
+            assert!(buf.push(vec![1], 1, 1, now).is_some());
+        }
+        assert_eq!(buf.next_sequence_number(), 5);
+        assert!(!buf.can_send());
+    }
+
+    #[test]
+    fn a_zero_advertisement_closes_new_data_but_not_retransmission() {
+        let now = Timestamp::from_micros(0);
+        let mut buf = SenderBuffer::new(0, 8, 120);
+        buf.push_submitted(vec![1], 1, 1, now);
+        buf.push_submitted(vec![2], 1, 1, now);
+        buf.handle_nak(&[0]);
+
+        // The receiver is full: cumulative ACK at 0, zero free space.
+        buf.set_peer_window(0, 0);
+        assert_eq!(buf.peer_window_end(), 0);
+        assert_eq!(buf.remaining_window_packets(), 0);
+        assert!(!buf.can_send());
+
+        // Requested retransmission stays eligible while the window is shut
+        // (libsrt exempts retransmissions from the flow-window gate the same
+        // way, `core.cpp` `packACK`/`packUniqueData`).
+        let (header, _) = buf
+            .pop_retransmit(1)
+            .expect("a NAKed packet is retransmitted despite the closed window");
+        assert_eq!(header.sequence_number, 0);
+    }
+
+    #[test]
+    fn an_oversized_advertisement_cannot_enlarge_the_negotiated_window() {
+        let now = Timestamp::from_micros(0);
+        let mut buf = SenderBuffer::new(1_000, 4, 120);
+        buf.set_peer_window(1_000, u32::MAX);
+        assert_eq!(buf.peer_window_end(), 1_004);
+        assert_eq!(buf.remaining_window_packets(), 4);
+        for _ in 0..4 {
+            assert!(buf.push(vec![1], 1, 1, now).is_some());
+        }
+        assert!(!buf.can_send());
+    }
+
     #[test]
     fn test_sender_buffer_nak() {
         let mut buf = SenderBuffer::new(1000, 8192, 120);
         let now = Timestamp::from_micros(0);
 
-        buf.push(vec![1], 100, 1, now);
-        buf.push(vec![2], 100, 1, now);
-        buf.push(vec![3], 100, 1, now);
+        buf.push_submitted(vec![1], 100, 1, now);
+        buf.push_submitted(vec![2], 100, 1, now);
+        buf.push_submitted(vec![3], 100, 1, now);
 
         // パケット 1001 を損失報告
         buf.handle_nak(&[1001]);
@@ -1358,7 +1861,11 @@ mod tests {
         let now = Timestamp::default();
         let mut dense = SenderBuffer::new(0, 8_192, 120);
         for sequence in 0..8_192 {
-            assert!(dense.push(vec![sequence as u8], 1, 1, now).is_some());
+            assert!(
+                dense
+                    .push_submitted(vec![sequence as u8], 1, 1, now)
+                    .is_some()
+            );
         }
         dense.handle_nak_ranges(&[LossRange {
             first_seq: 0,
@@ -1371,7 +1878,7 @@ mod tests {
 
         let mut wrapped = SenderBuffer::new(0x7FFF_FFFD, 8, 120);
         for _ in 0..6 {
-            assert!(wrapped.push(vec![1], 1, 1, now).is_some());
+            assert!(wrapped.push_submitted(vec![1], 1, 1, now).is_some());
         }
         wrapped.handle_nak_ranges(&[LossRange {
             first_seq: 0x7FFF_FFFE,
@@ -1436,7 +1943,7 @@ mod tests {
         let mut buf = SenderBuffer::new(0, 32, 120);
         let now = Timestamp::default();
         for _ in 0..3 {
-            buf.push(vec![1], 1, 1, now);
+            buf.push_submitted(vec![1], 1, 1, now);
         }
         buf.handle_nak(&[0, 1]);
         buf.handle_ack(1);
@@ -1450,11 +1957,19 @@ mod tests {
     fn stale_slot_reuse_cannot_clear_a_new_retransmit() {
         let mut buf = SenderBuffer::new(0, 32, 120);
         let now = Timestamp::default();
-        buf.push(vec![0], 1, 1, now);
+        buf.push_submitted(vec![0], 1, 1, now);
         buf.handle_nak(&[0]);
         buf.handle_ack(1);
+        // A cumulative ACK on its own releases the acknowledged flight but
+        // grants no new credit; only a Small/Full advertisement moves the
+        // peer's window end. Apply the same advertisement the connection
+        // would, so the refill below is the refill a real peer's ACK allows.
+        buf.set_peer_window(1, 32);
         for sequence in 1..=32 {
-            assert!(buf.push(vec![sequence as u8], 1, 1, now).is_some());
+            assert!(
+                buf.push_submitted(vec![sequence as u8], 1, 1, now)
+                    .is_some()
+            );
         }
         buf.handle_nak(&[32]);
 
@@ -1465,7 +1980,7 @@ mod tests {
     #[test]
     fn sequence_synchronization_rebases_retransmit_membership() {
         let mut buf = SenderBuffer::new(0, 32, 120);
-        buf.push(vec![0], 1, 1, Timestamp::default());
+        buf.push_submitted(vec![0], 1, 1, Timestamp::default());
         buf.handle_nak(&[0]);
         buf.handle_ack(1);
         assert!(buf.packets.is_empty());
@@ -1473,7 +1988,10 @@ mod tests {
         assert!(buf.synchronize_next_sequence_number(1_000));
         assert!(buf.loss_list.is_empty());
         assert_eq!(buf.stale_retransmits, 0);
-        assert!(buf.push(vec![1], 1, 1, Timestamp::default()).is_some());
+        assert!(
+            buf.push_submitted(vec![1], 1, 1, Timestamp::default())
+                .is_some()
+        );
         buf.handle_nak(&[1_000]);
 
         assert_eq!(buf.pop_retransmit(1).unwrap().0.sequence_number, 1_000);
@@ -1482,7 +2000,7 @@ mod tests {
     #[test]
     fn tlpktdrop_clears_retransmit_membership() {
         let mut buf = SenderBuffer::new(0, 32, 10);
-        buf.push(vec![1], 1, 1, Timestamp::default());
+        buf.push_submitted(vec![1], 1, 1, Timestamp::default());
         buf.handle_nak(&[0]);
 
         assert_eq!(
@@ -1503,7 +2021,11 @@ mod tests {
             "maximum sender window directory bytes: {}",
             window.heap_bytes()
         );
-        assert!(inline_bytes <= 320);
+        // The protocol-correctness pass added two counters (retained packets
+        // per key generation, so a generation cannot be retired while one of
+        // its packets still needs retransmitting) -- a deliberate, bounded
+        // increase, not drift.
+        assert!(inline_bytes <= 328);
         assert_eq!(window.heap_bytes(), 8_320);
     }
 
@@ -1511,7 +2033,7 @@ mod tests {
     fn stale_retransmit_queue_is_compacted_at_a_bounded_threshold() {
         let mut buf = SenderBuffer::new(0, 2_048, 120);
         for _ in 0..2_048 {
-            buf.push(vec![1], 1, 1, Timestamp::default());
+            buf.push_submitted(vec![1], 1, 1, Timestamp::default());
         }
         buf.handle_nak(&(0..2_048).collect::<Vec<_>>());
         buf.handle_ack(2_048);
@@ -1533,9 +2055,9 @@ mod tests {
         let mut buf = SenderBuffer::new(1000, 8192, 120);
         let now = Timestamp::from_micros(0);
 
-        buf.push(vec![1], 100, 1, now);
-        buf.push(vec![2], 100, 1, now);
-        buf.push(vec![3], 100, 1, now);
+        buf.push_submitted(vec![1], 100, 1, now);
+        buf.push_submitted(vec![2], 100, 1, now);
+        buf.push_submitted(vec![3], 100, 1, now);
 
         buf.handle_nak(&[1001]);
         let retransmit = buf.pop_retransmit(1);
@@ -2138,7 +2660,7 @@ mod tests {
         // 更新されない -- 参照: pop_retransmit のドキュメント)。
         let mut buf = SenderBuffer::new(0, 8192, 10); // 閾値は 1 秒床
         let send_time = Timestamp::from_micros(0);
-        buf.push(vec![1], 100, 1, send_time);
+        buf.push_submitted(vec![1], 100, 1, send_time);
 
         buf.handle_nak(&[0]);
         // 元の送信からほぼ 1 秒経った時点で再送を試みる。
@@ -2182,10 +2704,255 @@ mod tests {
         assert!(buf.is_empty());
     }
 
+    /// A TLPKTDROP drop keeps the sequence identity (so a repeated NAK is
+    /// still answered) and releases the media.
+    #[test]
+    fn a_dropped_packet_leaves_a_tombstone_until_the_ack() {
+        let now = Timestamp::default();
+        let mut buf = SenderBuffer::new(0, 32, 10);
+        buf.push_submitted(vec![1; 100], 1, 1, now)
+            .expect("admitted");
+
+        let dropped = buf.drop_expired(Timestamp::from_micros(1_000_001));
+        assert_eq!(dropped.len(), 1);
+        assert_eq!((dropped[0].first_seq, dropped[0].last_seq), (0, 0));
+        assert_eq!(buf.retained_span(), 1, "the tombstone still holds span");
+        assert_eq!(buf.packets_in_flight(), 0, "but no flight credit");
+        let stats = buf.stats();
+        assert_eq!(stats.payload_bytes_in_buffer, 0, "the media is released");
+        assert_eq!(stats.total_bytes_dropped, 100);
+        assert_eq!(stats.total_dropped, 1);
+
+        // A repeated NAK for the dropped sequence is answered with DROPREQ
+        // again -- the peer either lost the first one or has not removed the
+        // range yet -- and never with a retransmission of released media.
+        let repeated = buf.handle_nak_ranges(&[LossRange {
+            first_seq: 0,
+            last_seq: 0,
+        }]);
+        assert_eq!(repeated.len(), 1);
+        assert_eq!((repeated[0].first_seq, repeated[0].last_seq), (0, 0));
+        assert_eq!(buf.stats().packets_in_loss_list, 0);
+        assert!(buf.pop_retransmit(1).is_none());
+
+        // The cumulative ACK is what retires it.
+        buf.handle_ack(1);
+        assert_eq!(buf.retained_span(), 0);
+        assert!(buf.can_send());
+    }
+
+    /// A fragmented message drops as one unit and expands back to its whole
+    /// range from any NAKed fragment inside it.
+    #[test]
+    fn a_dropped_fragmented_message_expands_from_any_fragment() {
+        let now = Timestamp::default();
+        let mut buf = SenderBuffer::new(0, 32, 10);
+        buf.push_message(&[0u8; 10], 4, 1, 1, now);
+        assert_eq!(buf.retained_span(), 3, "10 bytes in 4-byte fragments");
+
+        let dropped = buf.drop_expired(Timestamp::from_micros(1_000_001));
+        assert_eq!(dropped.len(), 1, "one drop per message");
+        assert_eq!((dropped[0].first_seq, dropped[0].last_seq), (0, 2));
+
+        // The message number is shared by every fragment, so naming the
+        // middle one recovers the whole DROPREQ range.
+        let repeated = buf.handle_nak_ranges(&[LossRange {
+            first_seq: 1,
+            last_seq: 1,
+        }]);
+        assert_eq!(repeated.len(), 1);
+        assert_eq!((repeated[0].first_seq, repeated[0].last_seq), (0, 2));
+        assert_eq!(repeated[0].message_number, dropped[0].message_number);
+
+        // And one cumulative ACK retires all three tombstones.
+        buf.handle_ack(3);
+        assert_eq!(buf.retained_span(), 0);
+    }
+
+    #[test]
+    fn tombstones_survive_sequence_wrap_and_retire_on_the_ack() {
+        let now = Timestamp::default();
+        let mut buf = SenderBuffer::new(0x7FFF_FFFE, 32, 10);
+        for _ in 0..3 {
+            buf.push_submitted(vec![7], 1, 1, now).expect("admitted");
+        }
+        assert_eq!(buf.next_sequence_number(), 1);
+
+        let dropped = buf.drop_expired(Timestamp::from_micros(1_000_001));
+        assert_eq!(dropped.len(), 3);
+        assert_eq!(buf.retained_span(), 3);
+
+        // A range that crosses 0x7FFF_FFFF -> 0 names two of the three
+        // dropped messages (each `push` is its own message), so each gets its
+        // own DROPREQ.
+        let across_the_wrap = buf.handle_nak_ranges(&[LossRange {
+            first_seq: 0x7FFF_FFFE,
+            last_seq: 0x7FFF_FFFF,
+        }]);
+        assert_eq!(across_the_wrap.len(), 2);
+        assert_eq!(
+            across_the_wrap
+                .iter()
+                .map(|message| (message.first_seq, message.last_seq))
+                .collect::<Vec<_>>(),
+            [(0x7FFF_FFFE, 0x7FFF_FFFE), (0x7FFF_FFFF, 0x7FFF_FFFF)]
+        );
+        let past_the_wrap = buf.handle_nak_ranges(&[LossRange {
+            first_seq: 0,
+            last_seq: 0,
+        }]);
+        assert_eq!(past_the_wrap.len(), 1);
+        assert_eq!(past_the_wrap[0].first_seq, 0);
+
+        // The ACK that crosses the wrap retires every tombstone.
+        buf.handle_ack(1);
+        assert_eq!(buf.retained_span(), 0);
+        assert_eq!(buf.packets_in_flight(), 0);
+    }
+
+    /// Worst case: every retained position becomes a tombstone. Memory stays
+    /// where it was, and the window backpressures instead of growing.
+    #[test]
+    fn an_all_tombstone_window_stays_bounded_and_backpressures() {
+        let now = Timestamp::default();
+        const WINDOW: u32 = 32;
+        let mut buf = SenderBuffer::new(0, WINDOW, 10);
+        for _ in 0..WINDOW {
+            buf.push_submitted(vec![1; 64], 1, 1, now)
+                .expect("admitted");
+        }
+        let allocated_before = buf.allocated_pages();
+        let heap_before = buf.sender_window_heap_bytes();
+
+        let dropped = buf.drop_expired(Timestamp::from_micros(1_000_001));
+        assert_eq!(dropped.len() as u32, WINDOW, "one drop per message");
+        assert_eq!(buf.retained_span(), WINDOW);
+        assert_eq!(buf.packets_in_flight(), 0);
+        assert_eq!(buf.stats().payload_bytes_in_buffer, 0);
+        // One report cannot be amplified without bound: the DROPREQ batch is
+        // capped, and repeating the request produces the same bounded work.
+        let answered = buf.handle_nak_ranges(&[LossRange {
+            first_seq: 0,
+            last_seq: WINDOW - 1,
+        }]);
+        assert_eq!(answered.len(), MAX_DROPREQ_PER_NAK);
+        assert_eq!(
+            buf.handle_nak_ranges(&[LossRange {
+                first_seq: 0,
+                last_seq: WINDOW - 1,
+            }])
+            .len(),
+            MAX_DROPREQ_PER_NAK
+        );
+
+        // No room for new DATA until the peer acknowledges: the span bound is
+        // what the window has instead of an unbounded tombstone list.
+        assert!(!buf.can_send());
+        assert!(buf.push(vec![1], 1, 1, now).is_none());
+        assert_eq!(buf.allocated_pages(), allocated_before);
+        assert_eq!(buf.sender_window_heap_bytes(), heap_before);
+
+        // The ACK retires every tombstone. It does not by itself grant new
+        // credit -- that is the advertised window's job (see
+        // `light_ack_cannot_recycle_receive_window_credit`).
+        buf.handle_ack(WINDOW);
+        assert_eq!(buf.retained_span(), 0);
+        assert!(!buf.can_send());
+        buf.set_peer_window(WINDOW, 32);
+        assert!(buf.can_send(), "the advertised window reopens the flight");
+    }
+
+    /// A peer loss report is applied whole or not at all.
+    #[test]
+    fn a_nak_is_applied_whole_or_not_at_all() {
+        let now = Timestamp::default();
+        let mut buf = SenderBuffer::new(0, 32, 120);
+        for _ in 0..4 {
+            buf.push_submitted(vec![1], 1, 1, now).expect("admitted");
+        }
+
+        // Valid prefix, impossible tail: the whole report is rejected, and
+        // the valid-looking prefix leaves no retransmission behind.
+        let rejected = buf.handle_nak_ranges(&[
+            LossRange {
+                first_seq: 0,
+                last_seq: 0,
+            },
+            LossRange {
+                first_seq: 1_000,
+                last_seq: 1_000,
+            },
+        ]);
+        assert!(rejected.is_empty());
+        assert_eq!(buf.stats().packets_in_loss_list, 0);
+        assert!(buf.pop_retransmit(1).is_none());
+
+        // A position this sender accepted but never transmitted is not a loss
+        // a peer could have observed.
+        buf.push(vec![9], 1, 1, now);
+        let rejected = buf.handle_nak_ranges(&[LossRange {
+            first_seq: 4,
+            last_seq: 4,
+        }]);
+        assert!(rejected.is_empty());
+        assert_eq!(buf.stats().packets_in_loss_list, 0);
+
+        // A live, transmitted position is retransmitted.
+        let dropped = buf.handle_nak_ranges(&[LossRange {
+            first_seq: 2,
+            last_seq: 2,
+        }]);
+        assert!(dropped.is_empty());
+        assert_eq!(buf.pop_retransmit(1).expect("queued").0.sequence_number, 2);
+
+        // A repeated valid report is idempotent.
+        let _ = buf.handle_nak_ranges(&[LossRange {
+            first_seq: 1,
+            last_seq: 1,
+        }]);
+        let queued = buf.stats().packets_in_loss_list;
+        let _ = buf.handle_nak_ranges(&[LossRange {
+            first_seq: 1,
+            last_seq: 1,
+        }]);
+        assert_eq!(buf.stats().packets_in_loss_list, queued);
+
+        // A report that names more positions than the negotiated window is
+        // impossible, not merely large.
+        let rejected = buf.handle_nak_ranges(&[LossRange {
+            first_seq: 0,
+            last_seq: 1 << 20,
+        }]);
+        assert!(rejected.is_empty());
+    }
+
+    /// A range crossing the 31-bit wrap is valid where it is logically inside
+    /// the window.
+    #[test]
+    fn a_nak_range_that_crosses_the_wrap_is_valid() {
+        let now = Timestamp::default();
+        let mut buf = SenderBuffer::new(0x7FFF_FFFE, 32, 120);
+        for _ in 0..3 {
+            buf.push_submitted(vec![1], 1, 1, now).expect("admitted");
+        }
+
+        let dropped = buf.handle_nak_ranges(&[LossRange {
+            first_seq: 0x7FFF_FFFF,
+            last_seq: 0,
+        }]);
+        assert!(dropped.is_empty());
+        assert_eq!(buf.stats().packets_in_loss_list, 2);
+        assert_eq!(
+            buf.pop_retransmit(1).expect("queued").0.sequence_number,
+            0x7FFF_FFFF
+        );
+        assert_eq!(buf.pop_retransmit(1).expect("queued").0.sequence_number, 0);
+    }
+
     #[test]
     fn telemetry_counts_loss_retransmit_and_exact_srt_bytes() {
         let mut buf = SenderBuffer::new(10, 32, 10);
-        buf.push(vec![1, 2, 3, 4], 0, 1, Timestamp::from_micros(0));
+        buf.push_submitted(vec![1, 2, 3, 4], 0, 1, Timestamp::from_micros(0));
 
         buf.handle_nak(&[10]);
         buf.handle_nak(&[10]);

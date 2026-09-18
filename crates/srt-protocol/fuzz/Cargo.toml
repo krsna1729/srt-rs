@@ -103,3 +103,17 @@ test = false
 libfuzzer-sys = "0.4"
 srt_proto = { package = "srt-proto", path = "..", features = ["raw-codec"] }
 srt-transport = { path = "../../srt-transport", features = ["bench-internals"] }
+
+[[bin]]
+bench = false
+doc = false
+name = "fuzz_control_admission"
+path = "fuzz_targets/fuzz_control_admission.rs"
+test = false
+
+[[bin]]
+bench = false
+doc = false
+name = "fuzz_sender_window"
+path = "fuzz_targets/fuzz_sender_window.rs"
+test = false

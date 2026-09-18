@@ -246,10 +246,16 @@ impl<T> SenderPacketWindow<T> {
         true
     }
 
+    /// Queue every retained slot in the range that `include` accepts.
+    ///
+    /// The predicate is how the sender keeps TLPKTDROP tombstones out of the
+    /// retransmission queue: they are still occupied (they must answer a
+    /// repeated NAK with DROPREQ) but they must never be DATA-retransmitted.
     pub fn queue_loss_range(
         &mut self,
         first_seq: u32,
         last_seq: u32,
+        include: impl Fn(&T) -> bool,
         mut on_newly_queued: impl FnMut(u32),
     ) {
         let count = (last_seq.wrapping_sub(first_seq) & SEQUENCE_MASK).saturating_add(1);
@@ -259,13 +265,21 @@ impl<T> SenderPacketWindow<T> {
         let start = self.physical_index(first_seq);
         let end = start + count as usize;
         if end <= self.index_mask + 1 {
-            self.queue_loss_physical_range(start, end, first_seq, count, &mut on_newly_queued);
+            self.queue_loss_physical_range(
+                start,
+                end,
+                first_seq,
+                count,
+                &include,
+                &mut on_newly_queued,
+            );
         } else {
             self.queue_loss_physical_range(
                 start,
                 self.index_mask + 1,
                 first_seq,
                 count,
+                &include,
                 &mut on_newly_queued,
             );
             self.queue_loss_physical_range(
@@ -273,16 +287,20 @@ impl<T> SenderPacketWindow<T> {
                 end & self.index_mask,
                 first_seq,
                 count,
+                &include,
                 &mut on_newly_queued,
             );
         }
     }
 
+    /// [callback] receives each discarded entry and whether it was queued for
+    /// retransmission when it went away, so the caller can maintain its own
+    /// per-entry accounting (the sender's dropped-message tombstones).
     pub fn discard_acked_prefix(
         &mut self,
         oldest_unacked: u32,
         ack_seq: u32,
-        mut on_stale_retransmit: impl FnMut(),
+        mut on_discarded: impl FnMut(&T, bool),
     ) {
         if oldest_unacked == ack_seq {
             return;
@@ -292,7 +310,7 @@ impl<T> SenderPacketWindow<T> {
             return;
         }
         if count == 1 {
-            self.discard_single_packet(oldest_unacked, &mut on_stale_retransmit);
+            self.discard_single_packet(oldest_unacked, &mut on_discarded);
             return;
         }
         let start = self.physical_index(oldest_unacked);
@@ -303,7 +321,7 @@ impl<T> SenderPacketWindow<T> {
                 end,
                 oldest_unacked,
                 count as u32,
-                &mut on_stale_retransmit,
+                &mut on_discarded,
             );
         } else {
             self.discard_physical_prefix(
@@ -311,19 +329,19 @@ impl<T> SenderPacketWindow<T> {
                 self.index_mask + 1,
                 oldest_unacked,
                 count as u32,
-                &mut on_stale_retransmit,
+                &mut on_discarded,
             );
             self.discard_physical_prefix(
                 0,
                 end & self.index_mask,
                 oldest_unacked,
                 count as u32,
-                &mut on_stale_retransmit,
+                &mut on_discarded,
             );
         }
     }
 
-    fn discard_single_packet(&mut self, sequence: u32, on_stale_retransmit: &mut impl FnMut()) {
+    fn discard_single_packet(&mut self, sequence: u32, on_discarded: &mut impl FnMut(&T, bool)) {
         let (page_index, slot_index) = self.indices(sequence);
         let Some(page) = self.pages[page_index].as_mut() else {
             return;
@@ -338,13 +356,16 @@ impl<T> SenderPacketWindow<T> {
         if !matches {
             return;
         }
-        page.slots[slot_index] = None;
+        let packet = page.slots[slot_index]
+            .take()
+            .expect("a matching occupied slot is present");
         page.occupied &= !bit;
-        if page.retransmit_queued & bit != 0 {
+        let was_retransmit_queued = page.retransmit_queued & bit != 0;
+        if was_retransmit_queued {
             page.retransmit_queued &= !bit;
             self.retransmit_queued_count -= 1;
-            on_stale_retransmit();
         }
+        on_discarded(&packet.packet, was_retransmit_queued);
         self.len -= 1;
         if page.occupied == 0 {
             self.pages[page_index] = None;
@@ -502,6 +523,7 @@ impl<T> SenderPacketWindow<T> {
         end: usize,
         first_sequence: u32,
         sequence_count: u32,
+        include: &impl Fn(&T) -> bool,
         on_newly_queued: &mut impl FnMut(u32),
     ) {
         if start >= end {
@@ -527,11 +549,13 @@ impl<T> SenderPacketWindow<T> {
             while newly_queued != 0 {
                 let slot_index = newly_queued.trailing_zeros() as usize;
                 newly_queued &= newly_queued - 1;
-                let sequence = page.slots[slot_index]
+                let slot = page.slots[slot_index]
                     .as_ref()
-                    .expect("occupied slot exists")
-                    .sequence;
-                if sequence.wrapping_sub(first_sequence) & SEQUENCE_MASK < sequence_count {
+                    .expect("occupied slot exists");
+                let sequence = slot.sequence;
+                if sequence.wrapping_sub(first_sequence) & SEQUENCE_MASK < sequence_count
+                    && include(&slot.packet)
+                {
                     page.retransmit_queued |= 1u64 << slot_index;
                     self.retransmit_queued_count += 1;
                     on_newly_queued(sequence);
@@ -541,14 +565,22 @@ impl<T> SenderPacketWindow<T> {
         }
     }
 
-    fn discard_full_page(&mut self, page_index: usize, on_stale_retransmit: &mut impl FnMut()) {
+    fn discard_full_page(&mut self, page_index: usize, on_discarded: &mut impl FnMut(&T, bool)) {
         let page = self.pages[page_index].take().expect("page exists");
         let queued_count = page.retransmit_queued.count_ones();
         self.retransmit_queued_count -= queued_count;
-        for _ in 0..queued_count {
-            on_stale_retransmit();
+        let mut removed = 0usize;
+        for (slot_index, slot) in page.slots.iter().enumerate() {
+            let Some(slot) = slot else {
+                continue;
+            };
+            removed += 1;
+            on_discarded(
+                &slot.packet,
+                page.retransmit_queued & (1u64 << slot_index) != 0,
+            );
         }
-        self.len -= page.occupied.count_ones() as usize;
+        self.len -= removed;
         self.mark_page_empty(page_index);
     }
 
@@ -558,7 +590,7 @@ impl<T> SenderPacketWindow<T> {
         mask: u64,
         oldest_unacked: u32,
         count: u32,
-        on_stale_retransmit: &mut impl FnMut(),
+        on_discarded: &mut impl FnMut(&T, bool),
     ) {
         let page = self.pages[page_index].as_mut().expect("page exists");
         let mut to_remove = page.occupied & mask;
@@ -571,13 +603,14 @@ impl<T> SenderPacketWindow<T> {
                 .expect("occupied slot exists")
                 .sequence;
             if sequence.wrapping_sub(oldest_unacked) & SEQUENCE_MASK < count {
-                page.slots[slot_index] = None;
+                let removed = page.slots[slot_index].take().expect("occupied slot exists");
                 page.occupied &= !bit;
-                if page.retransmit_queued & bit != 0 {
+                let was_retransmit_queued = page.retransmit_queued & bit != 0;
+                if was_retransmit_queued {
                     page.retransmit_queued &= !bit;
                     self.retransmit_queued_count -= 1;
-                    on_stale_retransmit();
                 }
+                on_discarded(&removed.packet, was_retransmit_queued);
                 self.len -= 1;
             }
         }
@@ -593,7 +626,7 @@ impl<T> SenderPacketWindow<T> {
         end: usize,
         oldest_unacked: u32,
         count: u32,
-        on_stale_retransmit: &mut impl FnMut(),
+        on_discarded: &mut impl FnMut(&T, bool),
     ) {
         if start >= end {
             return;
@@ -606,7 +639,7 @@ impl<T> SenderPacketWindow<T> {
                 && (page_index < last_page || end & PAGE_MASK == 0);
 
             if is_full_page {
-                self.discard_full_page(page_index, on_stale_retransmit);
+                self.discard_full_page(page_index, on_discarded);
             } else {
                 let mut mask = !0u64;
                 if page_index == first_page {
@@ -615,13 +648,7 @@ impl<T> SenderPacketWindow<T> {
                 if page_index == last_page && end & PAGE_MASK != 0 {
                     mask &= (1u64 << (end & PAGE_MASK)) - 1;
                 }
-                self.discard_partial_page(
-                    page_index,
-                    mask,
-                    oldest_unacked,
-                    count,
-                    on_stale_retransmit,
-                );
+                self.discard_partial_page(page_index, mask, oldest_unacked, count, on_discarded);
             }
             search_page = page_index + 1;
         }

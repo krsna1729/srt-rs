@@ -368,11 +368,17 @@ proptest! {
         prop_assert!(has_disconnected);
     }
 
-    /// プロパティ: Inactivity タイマーで必ず切断される
+    /// プロパティ: Inactivity タイマーは経過時間に応じて動く
+    ///
+    /// Establishing the connection is itself an accepted protocol transition,
+    /// so it counts as peer activity: the timeout runs from that instant. Only
+    /// once the full window has elapsed without another accepted packet does
+    /// the connection go terminal.
     #[test]
-    fn prop_inactivity_always_disconnects(
+    fn prop_inactivity_disconnects_only_after_the_full_window(
         _dummy in 0u32..1u32,
     ) {
+        const INACTIVITY_MICROS: u64 = 5_000_000;
         let mut now = Timestamp::from_micros(0);
 
         let mut caller = SrtConnection::new_caller(make_opts(1));
@@ -380,6 +386,10 @@ proptest! {
         establish_connection(&mut caller, &mut listener, &mut now);
 
         caller.handle_timer(TimerId::Inactivity, now).expect("タイマー処理は成功する想定");
+        prop_assert_eq!(caller.state(), ConnectionState::Connected);
+
+        let later = Timestamp::from_micros(now.as_micros() + INACTIVITY_MICROS);
+        caller.handle_timer(TimerId::Inactivity, later).expect("タイマー処理は成功する想定");
         prop_assert_eq!(caller.state(), ConnectionState::Disconnected);
     }
 }

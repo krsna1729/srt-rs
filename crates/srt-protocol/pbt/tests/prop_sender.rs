@@ -2,8 +2,37 @@
 
 use proptest::prelude::*;
 use srt_proto::Timestamp;
+use srt_proto::receiver::LossRange;
 use srt_proto::sender::SenderBuffer;
 use std::collections::HashSet;
+
+/// Push a packet and mark its datagram as transmitted.
+///
+/// A peer's loss report is only credible for positions that were actually on
+/// the wire, and the sender now rejects a report naming a position it never
+/// transmitted, so the model has to be in the state a real sender reaches
+/// once the transport has materialized the datagram.
+fn push_transmitted(buf: &mut SenderBuffer, payload: Vec<u8>, now: Timestamp) -> bool {
+    match buf.push(payload, 100, 1, now) {
+        Some((header, _)) => {
+            buf.note_data_submitted(header.sequence_number);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Report single-sequence losses the way a receiver does.
+fn report_losses(buf: &mut SenderBuffer, sequences: &[u32]) {
+    let ranges: Vec<LossRange> = sequences
+        .iter()
+        .map(|&sequence| LossRange {
+            first_seq: sequence,
+            last_seq: sequence,
+        })
+        .collect();
+    let _ = buf.handle_nak_ranges(&ranges);
+}
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
@@ -89,15 +118,15 @@ proptest! {
         let now = Timestamp::from_micros(0);
 
         // 3 パケット送信
-        buf.push(vec![1], 100, 1, now);
-        buf.push(vec![2], 100, 1, now);
-        buf.push(vec![3], 100, 1, now);
+        push_transmitted(&mut buf, vec![1], now);
+        push_transmitted(&mut buf, vec![2], now);
+        push_transmitted(&mut buf, vec![3], now);
 
         prop_assert!(!buf.has_retransmit());
 
         // 中間のパケットを NAK
         let lost_seq = (initial_seq + 1) & 0x7FFF_FFFF;
-        buf.handle_nak(&[lost_seq]);
+        report_losses(&mut buf, &[lost_seq]);
 
         prop_assert!(buf.has_retransmit());
     }
@@ -110,7 +139,7 @@ proptest! {
         const SEQUENCE_MASK: u32 = 0x7FFF_FFFF;
         let mut sender = SenderBuffer::new(initial_seq, 32, 120);
         for _ in 0..32 {
-            sender.push(vec![1], 1, 1, Timestamp::default());
+            push_transmitted(&mut sender, vec![1], Timestamp::default());
         }
 
         let mut seen = HashSet::new();
@@ -120,10 +149,18 @@ proptest! {
                 .into_iter()
                 .map(|offset| initial_seq.wrapping_add(u32::from(offset)) & SEQUENCE_MASK)
                 .collect::<Vec<_>>();
-            sender.handle_nak(&sequences);
+            // A report is applied whole or not at all: one position outside
+            // the retained window invalidates the entire report, so the model
+            // must predict the same no-op.
+            let every_position_retained = sequences.iter().all(|&sequence| {
+                (sequence.wrapping_sub(initial_seq) & SEQUENCE_MASK) < 32
+            });
+            report_losses(&mut sender, &sequences);
+            if !every_position_retained {
+                continue;
+            }
             for sequence in sequences {
-                let offset = sequence.wrapping_sub(initial_seq) & SEQUENCE_MASK;
-                if offset < 32 && seen.insert(sequence) {
+                if seen.insert(sequence) {
                     expected.push(sequence);
                 }
             }
@@ -143,13 +180,13 @@ proptest! {
         let now = Timestamp::from_micros(0);
 
         // 3 パケット送信
-        buf.push(vec![1], 100, 1, now);
-        buf.push(vec![2], 100, 1, now);
-        buf.push(vec![3], 100, 1, now);
+        push_transmitted(&mut buf, vec![1], now);
+        push_transmitted(&mut buf, vec![2], now);
+        push_transmitted(&mut buf, vec![3], now);
 
         // 中間のパケットを NAK
         let lost_seq = (initial_seq + 1) & 0x7FFF_FFFF;
-        buf.handle_nak(&[lost_seq]);
+        report_losses(&mut buf, &[lost_seq]);
 
         // 再送パケットを取得
         let retransmit = buf.pop_retransmit(1);
@@ -162,12 +199,13 @@ proptest! {
         prop_assert!(!buf.has_retransmit());
     }
 
+    /// The negotiated window is the credit: filling it closes new DATA, and
+    /// an ACK alone does not reopen it (only an advertised window does).
     #[test]
     fn test_sender_buffer_flow_window(
-        flow_window in 1u32..16u32, // 初期 congestion_window は 16
+        flow_window in 1u32..64u32,
     ) {
         let mut buf = SenderBuffer::new(0, flow_window, 120);
-        buf.set_flow_window(1000); // フローウィンドウテスト用に増やす
         let now = Timestamp::from_micros(0);
 
         // フローウィンドウ分のパケットを送信
@@ -180,17 +218,24 @@ proptest! {
         prop_assert!(!buf.can_send());
         let packet = buf.push(vec![0], 100, 1, now);
         prop_assert!(packet.is_none());
+
+        // The cumulative ACK retires the flight but grants no new credit.
+        buf.handle_ack(flow_window);
+        prop_assert!(!buf.can_send());
+
+        // A current advertisement of the same window reopens it.
+        buf.set_peer_window(flow_window, flow_window);
+        prop_assert!(buf.can_send());
     }
 
     #[test]
     fn test_sender_buffer_flow_window_gates_send(
         cwnd in 1u32..50u32,
     ) {
-        let mut buf = SenderBuffer::new(0, 8192, 120);
-        buf.set_flow_window(cwnd);
+        let mut buf = SenderBuffer::new(0, cwnd, 120);
         let now = Timestamp::from_micros(0);
 
-        // 輻輳ウィンドウ分のパケットを送信
+        // 交渉済みウィンドウ分のパケットを送信
         for i in 0..cwnd {
             let packet = buf.push(vec![i as u8], 100, 1, now);
             prop_assert!(packet.is_some());
@@ -328,7 +373,6 @@ proptest! {
         max_payload in 100usize..500usize,
     ) {
         let mut buf = SenderBuffer::new(0, 8192, 120);
-        buf.set_flow_window(1000); // 大きなメッセージ用に増やす
         let now = Timestamp::from_micros(0);
         let payload = vec![0u8; payload_size];
 
@@ -375,7 +419,6 @@ proptest! {
         // シーケンス番号のラップアラウンドをテスト
         let initial_seq = 0x7FFF_FFFF - offset;
         let mut buf = SenderBuffer::new(initial_seq, 8192, 120);
-        buf.set_flow_window(100); // ラップアラウンドテスト用に増やす
         let now = Timestamp::from_micros(0);
 
         // ラップアラウンドを超えてパケットを送信
@@ -396,13 +439,17 @@ proptest! {
     ) {
         const MASK: u32 = 0x7FFF_FFFF;
         let mut buf = SenderBuffer::new(initial_seq, window_size, 10);
-        buf.set_flow_window(window_size);
 
         let mut model_packets = std::collections::BTreeMap::new();
+        // TLPKTDROP tombstones: retained sequence identity with no payload.
+        let mut model_dropped = std::collections::HashSet::new();
         let mut model_queue = std::collections::VecDeque::new();
         let mut model_retransmit_set = std::collections::HashSet::new();
         let mut model_oldest_unacked = initial_seq & MASK;
         let mut model_next_seq = initial_seq & MASK;
+        // The peer's advertised window end, moved only by the valid-ACK op
+        // (which models a Full ACK carrying the same window back).
+        let mut model_window_end = (initial_seq & MASK).wrapping_add(window_size) & MASK;
 
         let mut current_time_us = 1_000u64;
 
@@ -412,16 +459,28 @@ proptest! {
 
             match op {
                 0 => {
-                    // Push 1..4 packets if capacity allows
+                    // Push 1..4 packets while both windows allow it
                     let count = 1 + (current_time_us as usize % 4);
                     for _ in 0..count {
-                        if model_packets.len() < window_size as usize {
-                            let seq = model_next_seq;
-                            let (header, _) = buf.push(vec![1, 2, 3], 1, 1, now).expect("push succeeds");
-                            prop_assert_eq!(header.sequence_number, seq);
-                            model_packets.insert(seq, now);
-                            model_next_seq = model_next_seq.wrapping_add(1) & MASK;
+                        let retained = model_packets.len() + model_dropped.len();
+                        let flight = model_packets.len();
+                        let to_end =
+                            model_window_end.wrapping_sub(model_next_seq) & MASK;
+                        let room = retained < window_size as usize
+                            && flight < window_size as usize
+                            && to_end > 0
+                            && to_end < 0x4000_0000;
+                        if !room {
+                            break;
                         }
+                        let seq = model_next_seq;
+                        let pushed = buf.push(vec![1, 2, 3], 1, 1, now);
+                        prop_assert!(pushed.is_some());
+                        let (header, _) = pushed.expect("admitted");
+                        prop_assert_eq!(header.sequence_number, seq);
+                        buf.note_data_submitted(seq);
+                        model_packets.insert(seq, now);
+                        model_next_seq = model_next_seq.wrapping_add(1) & MASK;
                     }
                 }
                 1 => {
@@ -431,12 +490,18 @@ proptest! {
                         let advance = 1 + (current_time_us as usize % in_flight);
                         let ack_seq = model_oldest_unacked.wrapping_add(advance as u32) & MASK;
                         buf.handle_ack(ack_seq);
+                        // A Full ACK carries the receiver's free window.
+                        buf.set_peer_window(ack_seq, window_size);
+                        model_window_end = ack_seq.wrapping_add(window_size) & MASK;
 
                         // Retire prefix in model
                         let mut cur = model_oldest_unacked;
                         while cur != ack_seq {
                             model_packets.remove(&cur);
                             model_retransmit_set.remove(&cur);
+                            // A tombstone is retired by the same cumulative
+                            // ACK that retires a live packet.
+                            model_dropped.remove(&cur);
                             cur = cur.wrapping_add(1) & MASK;
                         }
                         model_oldest_unacked = ack_seq;
@@ -462,7 +527,7 @@ proptest! {
                         let in_flight = model_packets.len();
                         let offset = (current_time_us as usize % in_flight) as u32;
                         let nak_seq = model_oldest_unacked.wrapping_add(offset) & MASK;
-                        buf.handle_nak(&[nak_seq]);
+                        report_losses(&mut buf, &[nak_seq]);
                         if model_packets.contains_key(&nak_seq) && model_retransmit_set.insert(nak_seq) {
                             model_queue.push_back(nak_seq);
                         }
@@ -471,7 +536,7 @@ proptest! {
                 5 => {
                     // Duplicate NAK on already queued or non-existent sequence
                     let dup_seq = model_oldest_unacked;
-                    buf.handle_nak(&[dup_seq]);
+                    report_losses(&mut buf, &[dup_seq]);
                     if model_packets.contains_key(&dup_seq) && model_retransmit_set.insert(dup_seq) {
                         model_queue.push_back(dup_seq);
                     }
@@ -496,7 +561,8 @@ proptest! {
                     }
                 }
                 7 => {
-                    // TLPKTDROP (advance time past 1s threshold)
+                    // TLPKTDROP (advance time past 1s threshold): the media
+                    // goes, the sequence identity stays until the ACK.
                     let drop_time = Timestamp::from_micros(current_time_us + 2_000_000);
                     let dropped = buf.drop_expired(drop_time);
                     for msg in dropped {
@@ -504,17 +570,12 @@ proptest! {
                         loop {
                             model_packets.remove(&cur);
                             model_retransmit_set.remove(&cur);
+                            model_dropped.insert(cur);
                             if cur == msg.last_seq {
                                 break;
                             }
                             cur = cur.wrapping_add(1) & MASK;
                         }
-                        if (model_next_seq.wrapping_sub(cur.wrapping_add(1) & MASK) & MASK) <= window_size {
-                            model_oldest_unacked = cur.wrapping_add(1) & MASK;
-                        }
-                    }
-                    if model_packets.is_empty() {
-                        model_oldest_unacked = model_next_seq;
                     }
                 }
                 _ => unreachable!(),
@@ -522,11 +583,21 @@ proptest! {
 
             // Assert invariants after each operation
             prop_assert_eq!(buf.packets_in_flight() as usize, model_packets.len());
-            prop_assert_eq!(buf.is_empty(), model_packets.is_empty());
+            prop_assert_eq!(
+                buf.retained_span() as usize,
+                model_packets.len() + model_dropped.len()
+            );
+            prop_assert_eq!(
+                buf.is_empty(),
+                model_packets.is_empty() && model_dropped.is_empty()
+            );
             prop_assert_eq!(buf.next_sequence_number(), model_next_seq);
             prop_assert_eq!(buf.has_retransmit(), !model_retransmit_set.is_empty());
             prop_assert_eq!(buf.stats().packets_in_loss_list as usize, model_retransmit_set.len());
-            prop_assert_eq!(buf.oldest_packet_time().is_some(), !model_packets.is_empty());
+            prop_assert_eq!(
+                buf.oldest_packet_time().is_some(),
+                !(model_packets.is_empty() && model_dropped.is_empty())
+            );
         }
     }
 }
