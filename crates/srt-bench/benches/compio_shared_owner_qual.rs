@@ -811,7 +811,7 @@ fn main() {
          payload_bytes={} interval_us={} \
          offered_bps_per_dest={} fence_offered={} fence_accepted={} \
          cpu_ms={:.1} window_cpu_ms={:.1} drain_cpu_ms={:.1} owner_faulted={} \
-         driver={} compio={}",
+         driver={} compio_version={}",
         report.fanout,
         report.tx_lanes,
         report.connect_cc,

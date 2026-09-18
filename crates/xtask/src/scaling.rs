@@ -139,7 +139,7 @@ const TX_KEYS: &[&str] = &[
     "compio_version",
 ];
 
-/// Fields read from the receiver's `STATS` line.
+/// Fields read from the receiver's `STATS` line, on every run.
 const RX_KEYS: &[&str] = &[
     "connections",
     "established",
@@ -159,9 +159,17 @@ const RX_KEYS: &[&str] = &[
     "data_max",
     "data_zero",
     "data_below_half_mean",
-    // Diagnostic conservation accounting, present only on identity runs. These
-    // belong to the receiver's STATS line, not the sender's: putting them in the
-    // sender's key list silently dropped every value.
+];
+
+/// Fields the receiver prints only on a diagnostic (`--identity`) run.
+///
+/// Separate from [`RX_KEYS`] because they are the one honestly-conditional part
+/// of the receiver schema: everything else is printed on every run, and a
+/// missing one is a defect in the schema coupling rather than a configuration
+/// this sweep did not ask for. They belong to the receiver's `STATS` line, not
+/// the sender's: putting them in the sender's key list silently dropped every
+/// value.
+const RX_DIAG_KEYS: &[&str] = &[
     "diag_conns",
     "diag_fences_seen",
     "diag_data_at_fence",
@@ -597,6 +605,47 @@ fn affinity_state() -> String {
     }
 }
 
+/// The TSV's column names, in order: the row's own coordinates, then every
+/// sender field, then every receiver field.
+///
+/// One definition, because the header and the `AGG` line must agree on it
+/// exactly -- two copies drifted apart silently before.
+fn column_names() -> Vec<String> {
+    let mut columns: Vec<String> =
+        vec!["kind".into(), "rep".into(), "shard".into(), "fanout".into()];
+    columns.extend(TX_KEYS.iter().map(|k| k.to_string()));
+    columns.extend(RX_KEYS.iter().map(|k| format!("rx_{k}")));
+    columns.extend(RX_DIAG_KEYS.iter().map(|k| format!("rx_{k}")));
+    columns
+}
+
+/// Every field the sweep intends to record must be present on the line it came
+/// from.
+///
+/// `get(key).unwrap_or_default()` writes an empty *cell*, which in a TSV is
+/// indistinguishable from a measurement that is missing for a reason -- and a
+/// printer/collector key mismatch (a field printed as `compio` and read as
+/// `compio_version`) got exactly that way into an artifact that otherwise looked
+/// complete. A missing field is a schema defect, so the row is refused instead.
+fn require_keys(
+    fields: &BTreeMap<String, String>,
+    keys: &[&str],
+    line: &str,
+    work: &Path,
+    shard: usize,
+    rep: usize,
+) -> Result<(), String> {
+    for key in keys {
+        if !fields.contains_key(*key) {
+            return Err(keep_logs(
+                work,
+                format!("shard {shard} rep {rep}: the {line} line has no {key} field"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The TSV header, including the provenance that makes `git_sha` mean
 /// something.
 ///
@@ -611,10 +660,6 @@ fn header(options: &Options) -> Result<String, String> {
     let root = find_root()?;
     let dirty = !tree_is_clean(&root);
     let sha = git(&root, &["rev-parse", "HEAD"]).unwrap_or_else(|_| "unknown".into());
-    let mut columns: Vec<String> =
-        vec!["kind".into(), "rep".into(), "shard".into(), "fanout".into()];
-    columns.extend(TX_KEYS.iter().map(|k| k.to_string()));
-    columns.extend(RX_KEYS.iter().map(|k| format!("rx_{k}")));
     Ok(format!(
         "# scaling-sweep n={} shards={} fanout={} tx_lanes={} connect_cc={} window_ms={} \n\
          # reps={} base_port={} payload_bytes={} rate_mbps_per_dest={} fence={} identity={} \
@@ -634,7 +679,7 @@ fn header(options: &Options) -> Result<String, String> {
         sha,
         dirty,
         host_fields(),
-        columns.join("\t")
+        column_names().join("\t")
     ))
 }
 
@@ -679,7 +724,7 @@ fn run_rep(
 
     let mut rows = Vec::with_capacity(options.shards);
     for shard in 0..options.shards {
-        let row: Vec<String> = read_shard_row(&work, shard, rep)?;
+        let row: Vec<String> = read_shard_row(&work, shard, rep, options.identity)?;
         out.push_str(&row.join("\t"));
         out.push('\n');
         rows.push(row);
@@ -789,7 +834,12 @@ fn open_log(work: &Path, name: &str) -> Result<fs::File, String> {
 }
 
 /// The row for one shard, read from the logs the two processes wrote.
-fn read_shard_row(work: &Path, shard: usize, rep: usize) -> Result<Vec<String>, String> {
+fn read_shard_row(
+    work: &Path,
+    shard: usize,
+    rep: usize,
+    require_diag: bool,
+) -> Result<Vec<String>, String> {
     let tx = read_log(work, &format!("tx.{shard}.log"));
     let rx = read_log(work, &format!("rx.{shard}.log"));
     let tx_fields = tx
@@ -873,6 +923,14 @@ fn read_shard_row(work: &Path, shard: usize, rep: usize) -> Result<Vec<String>, 
             .cloned()
             .unwrap_or_else(|| "?".into()),
     ];
+    // Presence first, so an empty cell can only ever mean "this run measured
+    // nothing here", never "the collector asked for a key the printer does not
+    // use".
+    require_keys(&tx_fields, TX_KEYS, "sender", work, shard, rep)?;
+    require_keys(&rx_fields, RX_KEYS, "receiver", work, shard, rep)?;
+    if require_diag {
+        require_keys(&rx_fields, RX_DIAG_KEYS, "receiver", work, shard, rep)?;
+    }
     row.extend(
         TX_KEYS
             .iter()
@@ -881,6 +939,7 @@ fn read_shard_row(work: &Path, shard: usize, rep: usize) -> Result<Vec<String>, 
     row.extend(
         RX_KEYS
             .iter()
+            .chain(RX_DIAG_KEYS)
             .map(|k| rx_fields.get(*k).cloned().unwrap_or_default()),
     );
     Ok(row)
@@ -901,12 +960,7 @@ fn extremum(rows: &[Vec<String>], i: usize, want_max: bool) -> String {
 
 /// Sum the last rep's shards so a partially failed sweep stays visible.
 fn aggregate(reps: usize, rows: &[Vec<String>]) -> String {
-    let columns: Vec<String> = {
-        let mut c: Vec<String> = vec!["kind".into(), "rep".into(), "shard".into(), "fanout".into()];
-        c.extend(TX_KEYS.iter().map(|k| k.to_string()));
-        c.extend(RX_KEYS.iter().map(|k| format!("rx_{k}")));
-        c
-    };
+    let columns = column_names();
     let index = |key: &str| columns.iter().position(|c| c == key);
     let mut total = vec![String::new(); columns.len()];
     total[0] = "AGG".into();
