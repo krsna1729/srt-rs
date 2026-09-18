@@ -268,7 +268,20 @@ already known not to be punctual (p99 4.6-13.8 ms against a 5 ms budget), so a
 real-time claim needs a source that is punctual before it can be about the
 dataplane.
 
-## Result: the post-fix canonical run
+## Historical: the post-fix canonical run at 5c7a0c3 (superseded)
+
+**Superseded by "Result: the final canonical run" below.** This section's sweeps
+were measured against `sender_rto.rs` as it stood right after the tail-recovery
+fix landed: `COMM_SYN_MICROS` was still 100 ms (initial RTO 500 ms, not the
+corrected 320 ms), the `SenderRto` timer-action priority-insertion fix did not
+exist yet, `FirstSubmitLateness` was still the single-tier 10 ms-range
+histogram, and the fence/repetition/real-time gate semantics below were not
+yet the ones `cargo xtask qualify` enforces today. None of that changes the
+correctness claim this section still supports -- the lost-flight-tail defect
+is fixed, and conservation is exact -- but this is no longer qualification
+evidence for the code in this PR. Kept as historical post-tail-fix evidence
+only; the tag `qualification-evidence-5c7a0c3` still resolves the exact tree
+these numbers describe.
 
 **Scope: this qualifies the RawReadiness receive path on this host.** Every row of
 both sweeps records `rx_mode=Some(RawReadiness)` and `managed_rx=false` -- the
@@ -353,8 +366,10 @@ recovery change was written for, so it had to be explained rather than rerun awa
 It was the harness, not the transport: a lost suffix leaves nothing queued and
 nothing in flight -- every datagram was submitted and completed -- so the run
 declared equilibrium the moment the TX path went quiet, which was *before* the
-sender's 500 ms timeout had expired. Nothing had failed; the measurement simply
-ended before anything could ask for the tail again.
+sender's timeout (500 ms at this measurement's `COMM_SYN_MICROS`, since
+corrected to an initial 320 ms -- see "Result: the final canonical run" below)
+had expired. Nothing had failed; the measurement simply ended before anything
+could ask for the tail again.
 
 The drain now keeps servicing for a bounded ARQ window (1.5 s of protocol time,
 longer than the timeout plus the 26 ms RTT measured here) after the stream goes
@@ -367,3 +382,87 @@ Real time remains **undeclared**. The offer is not punctual (p99 1.3-16.1 ms
 against the 5 ms budget the harness prints), and `first_submit_lateness` p99 --
 the deadline-to-wire path, which includes that offer lateness -- is 2.7-371 ms.
 Neither supports a real-time claim and neither is presented as one.
+
+## Result: the final canonical run
+
+This is the qualification evidence for the code that actually merges, measured
+after the second review pass closed two remaining semantic gaps in the newly
+added RTO/gate: the fence gate no longer conflates a source's own declared
+cadence shortfall with transport loss, a blind RTO probe can no longer
+accumulate behind blocked TX capacity, `cargo xtask qualify`'s repetition
+identity now includes `window_ms`/`git_sha` and a `--require-clean`
+provenance gate, the real-time verdict (undeclared here) uses the same
+repetition rule as the sustained one, and the sender's own RTT/RTTVar
+estimator now follows the draft's §4.10 EWMA smoothing instead of taking the
+peer's Full-ACK report directly. See `docs/differential-audit-robotweax.md`
+for the RTO/estimator detail and `crates/xtask/src/qualify.rs`'s own tests for
+the gate semantics.
+
+```text
+head at measurement:  40050ed (clean tree required at run time)
+configuration:        F=50, 8 Mbps/dest, payload 1316 B, K=256 TX lanes,
+                       H=64 connect concurrency, 1 sender process
+window:                60 s x 3 independent repetitions, one clean-tree sweep
+diagnostics:           --identity --fence (tick-tagged payloads + terminal fence)
+command:               cargo xtask scaling --out F50-r8-K256-final.tsv \
+                         --n 50 --shards 1 --reps 3 --window-ms 60000 \
+                         --tx-lanes 256 --connect-cc 64 --payload-bytes 1316 \
+                         --rate-mbps-per-dest 8 --fence true --identity true
+gate:                  cargo xtask qualify F50-r8-K256-final.tsv \
+                         --tolerance 0.999 --drain-fraction-max 0.01 \
+                         --require-fence --require-clean
+```
+
+```text
+artifact: F50-r8-K256-final.tsv
+measured at: git_sha=40050ed git_dirty=false
+
+rep  cadence    missed  f_drain  conserved  sec_a/sec_b  fences   missing_final    fsub p99  fsub max  C_SRT  r_window
+1    1.000000       0   0.346 %  yes          0/46      50 -> 50      0             11 ms     52.6 ms  15.7   1.229
+2    1.000000       0   0.348 %  yes          0/248     50 -> 50      0             22 ms     55.3 ms  16.1   1.225
+3    0.999123      40   0.348 %  yes          0/300     50 -> 50   2000 (40x50)     39 ms    167.1 ms  16.3   1.221
+
+every row: rx_mode = Some(RawReadiness) (managed_rx = false),
+           short/failed/peer_local/transient/tx_failures_pending = 0,
+           drain_ok = true, pending_after_drain = 0, rx_lost = 0,
+           diag_duplicate_payloads = 0, pre_window_drained = true,
+           fence_offered = fence_accepted = rx_diag_fences_seen = 50 (== fanout)
+conserved = data_accepted + fence payloads the receiver saw == rx_core_total, exactly
+C_SRT     = window_cpu_ms * 1000 / data_accepted (us/payload)
+```
+
+```text
+qualify: 3 of 3 rows sustained, 0 admitted-but-not-sustained (--drain-fraction-max 0.010)
+qualify: no --lateness-budget-us declared, so no real-time verdict
+qualify: QUALIFIED (sustained)  F=50 rate=8000000 K=256 payload=1316 rx_mode=Some(RawReadiness) window_ms=60000 git_sha=40050ed  3/3
+```
+
+**Rep 3's `missing_final=2000` is exactly `40 missed_source_ticks x 50
+rx_established`** -- the source itself missed 40 of 45 592 boundaries this
+repetition (cadence `0.999123`, still inside the declared `0.999` tolerance),
+and the fence gate's job is to tell that apart from transport loss rather than
+demand literal-zero missing. It does: `unexpected_transport_missing = 0` on
+every row, so the fence criterion passes independently of the source's own
+(separately judged) cadence shortfall. This is the exact case the fence-gate
+fix in this PR exists for -- sweep A's `A1`/`A2` rows in the historical section
+above hit the same shape and, before the fix, the executable gate had no way
+to say so without either wrongly failing them or silently requiring 100 %
+source cadence.
+
+**`first_submit_lateness` p99 is now a real percentile, not `max` relabeled.**
+Rep 3's p99 (39 ms) and max (167.1 ms) are clearly different values -- under
+the old single-tier 10 ms-range histogram, both would have landed in the same
+overflow bucket and reported identically. The two-tier histogram (100 us
+buckets to 10 ms, 1 ms buckets to 1 s) is what makes that distinction possible
+at canonical-run tail latencies.
+
+**Conservation, fence, and RX-loss criteria are exact on all three rows**,
+matching the historical run's result: this PR's remaining fixes tightened the
+*executable gate's* semantics and the sender's own RTO/estimator behavior,
+not the transport correctness property the historical run already
+established. Cost is unchanged within measurement noise (`C_SRT`
+15.7-16.3 us/payload, `r_window` 1.221-1.229, against the historical run's
+15.1-17.9 us/payload and ~1.20-1.23).
+
+Real time remains **undeclared** here too -- no `--lateness-budget-us` was
+supplied, and this run does not change that claim.

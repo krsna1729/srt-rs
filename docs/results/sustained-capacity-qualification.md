@@ -374,12 +374,13 @@ insufficient for F=50 x 8 Mbps, and K=256 or K=512 remove the persistent
 receiver-reported loss/duplicate regime seen at K=64, but neither is yet fully
 qualified.** K=256 looked like the better production candidate of the two on this
 host. The post-fix canonical run (see `docs/results/capacity-surface/README.md`)
-replaces this statement. Its result, on a clean tree at `5c7a0c3` (preserved as
-the tag `qualification-evidence-5c7a0c3`, because this branch's history was
-consolidated before merge with the same tree content):
+replaces this statement. Its first result, on a clean tree at `5c7a0c3`
+(preserved as the tag `qualification-evidence-5c7a0c3`), predates the RTO
+formula/estimator, timer-priority and gate-semantics fixes this PR later added
+and is kept only as historical post-tail-fix evidence:
 
 ```text
-F=50, R=8 Mbps/dest, K=256, 3 x 60 s, two independent sweeps:
+F=50, R=8 Mbps/dest, K=256, 3 x 60 s, two independent sweeps (historical, 5c7a0c3):
   sweep B   3 of 3 rows QUALIFIED (xtask qualify: cadence, conservation,
             stationarity, submission partition, fence, fault state,
             RX loss = 0; duplicates accounted)
@@ -390,6 +391,22 @@ every row, both sweeps: conservation exact, sec_a = 0, no duplicates delivered,
 f_drain ~0.35 %, drain_ok, pending_after_drain = 0, no send failures, no fault,
 rx_mode = RawReadiness (managed_rx = false) -- so this qualifies the
 readiness RX path on this host, not ManagedMultishot on a ring-capable substrate
+```
+
+The **final canonical run**, at the actual head this PR merges, is a single
+clean-tree sweep rather than two (`docs/results/capacity-surface/README.md`,
+"Result: the final canonical run"):
+
+```text
+F=50, R=8 Mbps/dest, K=256, 3 x 60 s, one clean-tree sweep (git_sha=40050ed):
+  3 of 3 rows QUALIFIED (xtask qualify --require-fence --require-clean:
+            cadence, conservation, stationarity, submission partition,
+            fence -- with source-explained misses no longer conflated with
+            transport loss --, fault state, RX loss = 0; duplicates accounted)
+
+every row: conservation exact, sec_a = 0, no duplicate payloads delivered,
+f_drain ~0.35 %, drain_ok, pending_after_drain = 0, pre_window_drained = true,
+no send failures, no fault, rx_mode = RawReadiness (managed_rx = false)
 ```
 
 The K=64/256/512 lines above are the pre-fix surface and their conservation

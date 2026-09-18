@@ -253,8 +253,10 @@ post-fix evidence is.
 - **Submission accounting.** `DatagramClass` is decided by the protocol at
   materialization and carried through `DatagramSlot::commit`; `OwnerServiceReport`
   reports a per-visit class partition with `sum(classes) == tx_packets_submitted`
-  enforced, `FirstSubmitLateness` (100 x 100 us + exact max, reset-on-read)
-  measures the deadline-to-wire path at lane handoff, `TxPoolSnapshot::high_water`
+  enforced, `FirstSubmitLateness` (two-tier histogram -- 100 x 100 us fine
+  buckets through 10 ms, then 990 x 1 ms coarse buckets through 1 s, plus
+  overflow -- with an exact max, reset-on-read) measures the deadline-to-wire
+  path at lane handoff, `TxPoolSnapshot::high_water`
   reports the pool peak, and `Owner::rx_session_totals` exposes SRT-level receive
   `lost`/`duplicates` including retired sessions (each table keeps a retired
   ledger sampled at relinquish time).
