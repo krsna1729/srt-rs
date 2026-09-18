@@ -398,8 +398,8 @@ Neither supports a real-time claim and neither is presented as one.
 ## Result: the final canonical run
 
 This is the qualification evidence for the code that actually merges. It follows
-the third review pass, which closed four closeout defects in the gate, the sweep
-tooling, and the sender RTO:
+the third and fourth review passes, which closed the gate, tooling and RTO
+defects below:
 
 * the gate now requires the offered workload to have been **admitted**
   (`established == fanout == rx_established`,
@@ -408,11 +408,15 @@ tooling, and the sender RTO:
   "accepted == delivered" alone;
 * qualification counts **repetitions, not rows**: `cargo xtask scaling` writes
   one `ROW` per shard per repetition, a repetition passes only when every shard
-  row in it passes, and missing or duplicated shard rows are malformed evidence;
+  row in it passes, and a missing or duplicated shard row, a repetition number
+  outside the declared range, or a self-contradictory declared shape
+  (`n != fanout x shards`, zero shards or repetitions) is malformed evidence;
 * `cargo xtask scaling` now **builds the children it benchmarks** and takes their
   paths from cargo's own artifact records, so the recorded `git_sha` describes
   the binaries that ran (`built_by_scaling=true`) instead of whatever was left in
-  `target/`;
+  `target/`; `git_dirty` is `git status --porcelain` (staged, unstaged and
+  untracked), not `git diff --quiet`, which was blind to exactly the staged case
+  it was named for, and the SHA is the full 40 characters;
 * the sender **reprograms its RTO from the instant a blind probe is actually
   submitted**, keeping the accumulated backoff, instead of firing the deadline
   the probe was queued under.
@@ -421,7 +425,7 @@ See `crates/xtask/src/qualify.rs`'s own tests for the gate semantics and
 `docs/differential-audit-robotweax.md` for the RTO detail.
 
 ```text
-head at measurement:  cbc58a2 (clean tree required at run time)
+head at measurement:  b11067d (clean tree required at run time)
 configuration:        F=50, 8 Mbps/dest, payload 1316 B, K=256 TX lanes,
                        H=64 connect concurrency, 1 sender process
 window:                60 s x 3 independent repetitions, one clean-tree sweep
@@ -435,16 +439,38 @@ gate:                  cargo xtask qualify F50-r8-K256-final.tsv \
                          --require-fence --require-clean
 ```
 
+Provenance of the run, every field read from the machine or the shard's own
+runtime rather than transcribed:
+
 ```text
-artifact: F50-r8-K256-final.tsv
-measured at: git_sha=cbc58a2 git_dirty=false build_profile=release built_by_scaling=true
+artifact:       F50-r8-K256-final.tsv (sha256 f92ee9972da97716bad90579ac292f5472ba44e65c5b1921c9d3a2b74aefc758)
+git_sha:        b11067db691276ed95589f15c5bf5bc5f963bcc4   (full, 40 characters)
+git_dirty:      false                                     (status --porcelain, whole tree)
+build_profile:  release
+built_by_scaling: true
+kernel:         6.8.0-139-generic
+cpu:            AMD EPYC Processor (with IBPB)
+affinity:       none
+compio_version: 0.19.2                                    (the transport's pinned version)
+driver:         IoUring                                   (observed on the shard's own runtime)
+rx_mode:        Some(RawReadiness), managed_rx = false
+fence:          offered = accepted = seen = 50 (== fanout)
+F / rate:       50 / 8 Mbps per destination
+K / payload:    256 TX lanes / 1316 B
+duration:       60 s x 3 repetitions
+cadence gate:   generated / expected >= 0.999
+f_drain gate:   <= 0.01
+real-time gate: undeclared
+```
 
+```text
 rep  cadence    missed  f_drain  conserved  sec_b/retx  fences   missing_final  fsub p99  fsub max  C_SRT  r_window
-1    0.999474      24   0.343 %  yes        194/194   50 -> 50   1200 (24x50)    122 ms    290.8 ms  18.2   1.210
-2    1.000000       0   0.329 %  yes        106/106   50 -> 50      0            124 ms    204.0 ms  16.7   1.221
-3    1.000000       0   0.348 %  yes        110/110   50 -> 50      0             45 ms    101.3 ms  17.0   1.215
+1    0.999956       2   0.377 %  yes        455/455   50 -> 50    100 (2x50)     141 ms    244.8 ms  18.1   1.200
+2    0.999649      16   0.381 %  yes        749/749   50 -> 50    800 (16x50)    327 ms    569.8 ms  18.7   1.195
+3    0.999693      14   0.368 %  yes        584/584   50 -> 50    700 (14x50)     74 ms    140.8 ms  17.6   1.210
 
-every row: rx_mode = Some(RawReadiness) (managed_rx = false), owner_faulted = false,
+every row: rx_mode = Some(RawReadiness) (managed_rx = false), driver = IoUring,
+           compio = 0.19.2, owner_faulted = false, affinity = none,
            short/failed/peer_local/transient/tx_failures_pending = 0,
            drain_ok = true, pending_after_drain = 0, rx_lost = 0, rx_sec_a = 0,
            diag_duplicate_payloads = 0, pre_window_drained = true,
@@ -452,8 +478,9 @@ every row: rx_mode = Some(RawReadiness) (managed_rx = false), owner_faulted = fa
            fence_offered = fence_accepted = rx_diag_fences_seen = 50 (== fanout),
            tx pool 256/256 free at the end, tx_pool_high_water = 256
 conserved = data_accepted + fence payloads the receiver saw == rx_core_total, exactly
-sec_b/retx = the receiver's packet-level duplicates against the sender's own window
-             retransmissions (the drain submitted none, and rx_duplicates is 0)
+sec_b/retx = the receiver's packet-level duplicates against the sender's window and
+             drain retransmissions: rep 3 is 584 against 516 + 68, the one row where
+             the drain itself retransmitted; rx_duplicates is 0 on every row
 C_SRT     = window_cpu_ms * 1000 / data_accepted (us/payload)
 ```
 
@@ -461,55 +488,59 @@ C_SRT     = window_cpu_ms * 1000 / data_accepted (us/payload)
 qualify: 3 of 3 rows sustained, 0 admitted-but-not-sustained (--drain-fraction-max 0.010)
 qualify: no --lateness-budget-us declared, so no real-time verdict
 qualify: QUALIFIED (sustained)  F=50 rate=8000000 K=256 payload=1316 rx_mode=Some(RawReadiness)
-         window_ms=60000 git_sha=cbc58a2 n=50 shards=1 reps=3  3/3
+         window_ms=60000 git_sha=b11067db691276ed95589f15c5bf5bc5f963bcc4 n=50 shards=1 reps=3  3/3
 ```
 
 **Duplicates are accounted rather than merely unrequired.** The receiver's
-packet-level duplicate count equals the sender's retransmission count exactly in
-all three rows (194/194, 106/106, 110/110), which is the inequality the canonical
-gate now enforces (`rx_sec_b <= tx_class_data_retx + drain_class_data_retx`), and
-`diag_duplicate_payloads = 0` everywhere: no payload was ever delivered twice at
-the application level. `rx_duplicates` (the sender's own caller socket, which has
-nothing to receive in this topology) is 0 throughout.
+packet-level duplicate count is exactly the sender's retransmission traffic in
+all three rows (455/455, 749/749, 584/584) -- and rep 3 is the row that makes the
+bound's second term load-bearing: 584 is `516` window retransmissions `+ 68`
+drain retransmissions, so a bound on the window alone would have refused a run
+whose duplicates were fully explained. `diag_duplicate_payloads = 0` everywhere:
+no payload was ever delivered twice at the application level. `rx_duplicates`
+(the sender's own caller socket, which has nothing to receive in this topology)
+is 0 throughout.
 
-**Rep 1's `missing_final=1200` is exactly `24 missed_source_ticks x 50
-rx_established`** -- the source itself missed 24 of 45 592 boundaries (cadence
-`0.999474`, inside the declared `0.999` tolerance) -- and the fence gate's job is
-to tell that apart from transport loss rather than demand literal-zero missing.
-It does: `unexpected_transport_missing = 0` on every row. This is the exact case
-the fence-gate fix in this PR exists for: the historical section's `A1`/`A2` rows
-hit the same shape and, before the fix, the executable gate had no way to say so
+**Every row's `missing_final` is exactly `missed_source_ticks x 50
+rx_established`** -- 100 = 2x50, 800 = 16x50, 700 = 14x50 -- so the source's own
+cadence shortfall (2, 16 and 14 boundaries of 45 592, all inside the declared
+`0.999` tolerance) is told apart from transport loss rather than demanded to be
+zero. `unexpected_transport_missing = 0` on every row. This is the exact case the
+fence-gate fix in this PR exists for: the historical section's `A1`/`A2` rows hit
+the same shape and, before the fix, the executable gate had no way to say so
 without either wrongly failing them or silently requiring 100 % source cadence.
 
 **`first_submit_lateness` p99 is a real percentile, not `max` relabeled.** The
-p99s here (122 ms, 124 ms, 45 ms) and the maxima (290.8 ms, 204.0 ms, 101.3 ms)
-are clearly different values; under the old single-tier 10 ms-range histogram the
-maxima would have landed in the same overflow bucket as everything else in the
-tail. The two-tier histogram (100 us buckets to 10 ms, 1 ms buckets to 1 s) is
-what makes that distinction possible.
+p99s here (141 ms, 327 ms, 74 ms) and the maxima (244.8 ms, 569.8 ms, 140.8 ms)
+differ by roughly a factor of two on every row; under the old single-tier 10
+ms-range histogram both would have landed in the same overflow bucket and
+reported identically. The two-tier histogram (100 us buckets to 10 ms, 1 ms
+buckets to 1 s) is what makes that distinction possible.
 
 **Host conditions, stated rather than hidden.** This is the same shared host as
-the historical run, but its condition changed during the closeout: a preflight
-probe -- an idle 1 ms loop with no benchmark running -- saw 20-300 ms vCPU stalls
-in bursts, and every attempt taken while that was true failed *only* the
-source-cadence criterion (94-233 missed boundaries of 45 592; 51 consecutive
-100 s preflights found a stall above 50 ms and were not followed by a sweep). One
-attempt also failed establishment, and the new admission identity is what caught
-it (`established=39 != fanout=50`, `data_accepted=33720 != data_offered=2279600`)
-instead of reporting a throughput number for a shard that had lost a fifth of its
-population. The artifact above is the run taken once the host measured quiet
-again (2 gaps above 80 ms over 180 s); rep 1's 24 missed boundaries are its
-residue, and the higher `first_submit_lateness` (45-124 ms p99 against the
-historical 11-39 ms) is the same noise. It is reported, not gated: real time stays
-undeclared either way. Nothing here changes the transport-side result, which
-passed in every row of every attempt.
+the historical run, and its condition varied throughout the closeout: a preflight
+probe -- an idle 1 ms loop with no benchmark running -- repeatedly saw 100-350 ms
+vCPU stalls in bursts, and every attempt taken while that was true was refused by
+the gate for one of the two reasons the gate exists to distinguish: source
+cadence (up to 233 missed boundaries of 45 592) or stationarity (one attempt's
+rep 3 put 22.4 % of its wire work in the drain, i.e. the shard did not keep pace
+that minute). One attempt also failed establishment, `established=39 !=
+fanout=50`, and the admission identity is what caught it instead of reporting a
+throughput number for a shard that had lost a fifth of its population; another
+failed at receiver bind with `AddrInUse`, which the sweep refuses as a row rather
+than reporting a partial one. The artifact above is the run taken from the quiet
+window the probe finally found; its own 2/16/14 missed boundaries and its
+`first_submit_lateness` (74-327 ms p99, against the historical 11-39 ms) are that
+host's residue. All of it is reported, not gated: real time stays undeclared
+either way. Nothing here changes the transport-side result, which passed in every
+row of every attempt.
 
 **Conservation, fence, and RX-loss criteria are exact on all three rows**,
 matching the historical run's result: the closeout tightened the *executable
 gate's* semantics, the sweep's provenance, and the sender's RTO epoch, not the
 transport correctness property the earlier run had already established. Cost is
-unchanged within measurement noise (`C_SRT` 16.7-18.2 us/payload, `r_window`
-1.210-1.221, against the historical 15.1-17.9 us/payload and ~1.20-1.23).
+unchanged within measurement noise (`C_SRT` 17.6-18.7 us/payload, `r_window`
+1.195-1.210, against the historical 15.1-17.9 us/payload and ~1.20-1.23).
 
 Real time remains **undeclared** here too -- no `--lateness-budget-us` was
 supplied, and this run does not change that claim.

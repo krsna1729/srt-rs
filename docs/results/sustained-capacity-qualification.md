@@ -420,20 +420,20 @@ clean-tree sweep rather than two (`docs/results/capacity-surface/README.md`,
 "Result: the final canonical run"):
 
 ```text
-F=50, R=8 Mbps/dest, K=256, 3 x 60 s, one clean-tree sweep (git_sha=cbc58a2):
+F=50, R=8 Mbps/dest, K=256, 3 x 60 s, one clean-tree sweep (git_sha=b11067d):
   3 of 3 rows QUALIFIED (xtask qualify --require-fence --require-clean:
             admission -- the whole requested fanout established at both endpoints
             and every offered payload accepted --, cadence, conservation,
             stationarity, submission partition, fence -- with source-explained
             misses no longer conflated with transport loss --, fault state,
             RX loss = 0; packet duplicates bounded by the retransmissions that
-            explain them)
+            explain them, including the drain's)
 
 every row: conservation exact, sec_a = 0, no duplicate payloads delivered,
 data_offered == data_accepted == generated_ticks x fanout, owner_faulted = false,
-built_by_scaling = true, f_drain ~0.34 %, drain_ok, pending_after_drain = 0,
-pre_window_drained = true, no send failures, no fault,
-rx_mode = RawReadiness (managed_rx = false)
+built_by_scaling = true, driver = IoUring, compio = 0.19.2, f_drain ~0.37 %,
+drain_ok, pending_after_drain = 0, pre_window_drained = true, no send failures,
+no fault, rx_mode = RawReadiness (managed_rx = false)
 ```
 
 The K=64/256/512 lines above are the pre-fix surface and their conservation
