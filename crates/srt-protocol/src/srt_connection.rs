@@ -5798,6 +5798,13 @@ mod tests {
     /// the cumulative acknowledgement by two reopens nothing, because the
     /// boundary it advances toward is fixed.
     #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "full caller/listener handshake plus the wire-ACK path; correctness is       \
+                  proven at full scale outside Miri, and the sender-level window regressions \
+                  in `srt_sender` cover the same model cheaply under Miri. Run in the       \
+                  miri-extended scheduled job."
+    )]
     fn light_ack_cannot_overrun_stale_receive_window_credit() {
         let (mut caller, _listener) = connected_pair();
         let now = Timestamp::from_micros(1_000_000);
@@ -6083,6 +6090,12 @@ mod tests {
     /// A NAK whose named positions are all TLPKTDROP tombstones is answered
     /// with DROPREQ again -- never with DATA retransmission of released media.
     #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "full caller/listener handshake; correctness is proven outside Miri, and the      \
+                  sender-level tombstone regressions cover the same accounting cheaply        \
+                  under Miri. Run in the miri-extended scheduled job."
+    )]
     fn a_repeated_nak_for_a_dropped_message_is_answered_with_drop_req() {
         let (mut caller, _listener) = connected_pair();
         let socket_id = caller.socket_id();
@@ -6175,6 +6188,11 @@ mod tests {
     /// reached here through the real wire decoder rather than by calling the
     /// handlers directly.
     #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "full caller/listener handshake plus sixteen malformed controls; correctness  \
+                  is proven outside Miri. Run in the miri-extended scheduled job."
+    )]
     fn malformed_controls_cannot_refresh_liveness_or_state() {
         let (mut caller, _listener) = connected_pair();
         let socket_id = caller.socket_id();
@@ -6318,6 +6336,12 @@ mod tests {
     /// An authenticated DATA packet whose tag or key selector does not verify
     /// is rejected before it can refresh liveness or advance reliability.
     #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "encrypted handshake plus AES-GCM authentication under Miri; correctness is   \
+                  proven outside Miri (crypto ownership is covered by the `crypto` module     \
+                  tests). Run in the miri-extended scheduled job."
+    )]
     fn undecryptable_data_cannot_refresh_liveness_or_advance_reliability() {
         use crate::crypto::CipherMode;
 
