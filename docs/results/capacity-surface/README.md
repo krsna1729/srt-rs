@@ -248,8 +248,9 @@ declared real-time      UNDECLARED (no budget claimed)
 
 Acceptance for the run to be called a qualified capacity point (all three
 repetitions, not "two of three"; one repetition passes only when every shard row
-in it passes, and a shard count above one is what the `rep`/`shard` hierarchy
-exists for):
+in it passes, a repetition number or shard index outside the declared range is
+malformed evidence, and a shard count above one is what the `rep`/`shard`
+hierarchy exists for):
 
 ```text
 1. admission:    established == fanout == rx_established,
@@ -264,8 +265,10 @@ exists for):
 7. fault:        owner_faulted == false; tx_failures_pending == 0
 8. RX:           rx_lost == 0; diag_duplicate_payloads == 0, and the packet-level
                  counts (rx_duplicates, rx_sec_b) <= tx_class_data_retx + drain_class_data_retx
-9. provenance:   git_dirty == false, built_by_scaling == true, pre_window_drained == true
-                 (the canonical group, `--require-clean`)
+9. shape:        shards > 0, reps > 0, n == fanout x shards
+10. provenance:  git_dirty == false (whole tree: staged, unstaged and untracked),
+                 built_by_scaling == true, pre_window_drained == true, and a full
+                 40-character git_sha (`--require-clean`)
 ```
 
 `--drain-fraction-max 0.01` is a declared bound, not an inferred one: the pre-fix

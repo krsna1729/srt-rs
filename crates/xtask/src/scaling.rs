@@ -133,6 +133,10 @@ const TX_KEYS: &[&str] = &[
     // RX task) stops admission and transmission; a row that cannot report this
     // cannot support a claim that the transport under test stayed healthy.
     "owner_faulted",
+    // The runtime substrate the shard ran on, observed from the shard's own
+    // runtime: driver (`IoUring`/`Poll`) and the pinned Compio version.
+    "driver",
+    "compio_version",
 ];
 
 /// Fields read from the receiver's `STATS` line.
@@ -518,20 +522,95 @@ fn sweep(options: &Options, harness: &Harness) -> Result<String, String> {
     Ok(out)
 }
 
+/// Whether the whole working tree is clean: no staged, unstaged or untracked
+/// changes anywhere.
+///
+/// `git diff --quiet` compares the *working tree against the index*, so it is
+/// blind to staged modifications and to untracked files: a source file that was
+/// edited and `git add`ed would be recorded as `git_dirty=false` while the
+/// binaries this sweep builds carry the edit. `status --porcelain` is the
+/// predicate that matches what the header claims.
+fn tree_is_clean(root: &Path) -> bool {
+    git(root, &["status", "--porcelain", "--untracked-files=normal"])
+        .is_ok_and(|porcelain| porcelain.is_empty())
+}
+
+/// The machine the run is about to happen on, read from the kernel rather than
+/// inferred: a capacity point is only transferable together with the host it was
+/// measured on, and a kernel/CPU tuple is not something a reader can recover
+/// later from a timestamp.
+///
+/// The CPU model contains spaces, so it is folded to `_`: the header is a
+/// whitespace-tokenized comment line, and a value with spaces in it would split
+/// into tokens that are not `key=value` at all.
+fn host_fields() -> String {
+    let kernel =
+        read_trimmed("/proc/sys/kernel/osrelease").unwrap_or_else(|| "unknown".to_string());
+    let cpu = cpu_model()
+        .map(|model| model.replace(char::is_whitespace, "_"))
+        .unwrap_or_else(|| "unknown".to_string());
+    format!("kernel={kernel} cpu={cpu} affinity={}", affinity_state())
+}
+
+fn read_trimmed(path: &str) -> Option<String> {
+    fs::read_to_string(path)
+        .ok()
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+}
+
+/// The first `model name` in `/proc/cpuinfo`, or `None` on a machine that does
+/// not publish one.
+fn cpu_model() -> Option<String> {
+    fs::read_to_string("/proc/cpuinfo")
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("model name")?
+                .split_once(':')
+                .map(|(_, v)| v)
+        })
+        .map(|model| model.trim().to_string())
+        .filter(|model| !model.is_empty())
+}
+
+/// `none` when the process may run on every online CPU, otherwise the mask it is
+/// restricted to.
+///
+/// The sweep sets no affinity of its own, and its children inherit the mask, so
+/// the launcher's own `Cpus_allowed_list` is the children's. Recorded because a
+/// pinned run and an unpinned one are different measurements even at the same
+/// configuration.
+fn affinity_state() -> String {
+    let allowed = fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
+                .map(|list| list.trim().to_string())
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    match read_trimmed("/sys/devices/system/cpu/online") {
+        Some(online) if online == allowed => "none".to_string(),
+        _ => allowed,
+    }
+}
+
 /// The TSV header, including the provenance that makes `git_sha` mean
 /// something.
 ///
 /// `built_by_scaling=true` and `build_profile=release` are facts about this
 /// tool rather than flags: `run` cannot reach `sweep` without having gone
 /// through `locate` -> `build_harness`, which builds both children in release
-/// mode and returns cargo's own artifact paths. Together with `git_dirty`, they
-/// are what let a reader conclude the header's SHA describes the code that
-/// actually ran -- and `qualify --require-clean` refuses a canonical artifact
-/// without them.
+/// mode and returns cargo's own artifact paths. Together with the full SHA and
+/// `tree_is_clean`'s whole-tree predicate, they are what let a reader conclude
+/// the header's SHA describes the code that actually ran -- and `qualify
+/// --require-clean` refuses a canonical artifact without them.
 fn header(options: &Options) -> Result<String, String> {
     let root = find_root()?;
-    let dirty = git(&root, &["diff", "--quiet"]).is_err();
-    let sha = git(&root, &["rev-parse", "--short", "HEAD"]).unwrap_or_else(|_| "unknown".into());
+    let dirty = !tree_is_clean(&root);
+    let sha = git(&root, &["rev-parse", "HEAD"]).unwrap_or_else(|_| "unknown".into());
     let mut columns: Vec<String> =
         vec!["kind".into(), "rep".into(), "shard".into(), "fanout".into()];
     columns.extend(TX_KEYS.iter().map(|k| k.to_string()));
@@ -539,7 +618,7 @@ fn header(options: &Options) -> Result<String, String> {
     Ok(format!(
         "# scaling-sweep n={} shards={} fanout={} tx_lanes={} connect_cc={} window_ms={} \n\
          # reps={} base_port={} payload_bytes={} rate_mbps_per_dest={} fence={} identity={} \
-         build_profile=release built_by_scaling=true git_sha={} git_dirty={}\n{}\n",
+         build_profile=release built_by_scaling=true git_sha={} git_dirty={} {}\n{}\n",
         options.n,
         options.shards,
         options.n / options.shards,
@@ -554,6 +633,7 @@ fn header(options: &Options) -> Result<String, String> {
         options.identity,
         sha,
         dirty,
+        host_fields(),
         columns.join("\t")
     ))
 }
@@ -936,5 +1016,68 @@ mod tests {
                 "guard dropped but process {pid} is still alive"
             );
         }
+    }
+
+    /// The predicate behind the header's `git_dirty`. `git diff --quiet` -- what
+    /// it used to be -- compares the working tree against the *index*, so a
+    /// staged edit or an untracked file left the header claiming a clean tree
+    /// while the binaries the sweep builds carried the change.
+    #[test]
+    fn the_clean_predicate_sees_staged_and_untracked_changes() {
+        let root = std::env::temp_dir().join(format!("scaling-clean-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create temp repository");
+        let git_in = |args: &[&str]| {
+            // A temp repository has no identity of its own, and the developer's
+            // global config may even enable commit signing; neither is what this
+            // test is about.
+            let mut full = vec![
+                "-c",
+                "user.email=qualify-test@example.com",
+                "-c",
+                "user.name=qualify test",
+                "-c",
+                "commit.gpgsign=false",
+            ];
+            full.extend_from_slice(args);
+            let out = Command::new("git")
+                .args(&full)
+                .current_dir(&root)
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git_in(&["init", "--quiet"]);
+        git_in(&["commit", "--allow-empty", "--quiet", "-m", "init"]);
+        assert!(tree_is_clean(&root), "a fresh repository is clean");
+
+        fs::write(root.join("tracked.rs"), "fn a() {}\n").expect("write");
+        git_in(&["add", "tracked.rs"]);
+        git_in(&["commit", "--quiet", "-m", "add"]);
+        assert!(tree_is_clean(&root), "a committed tree is clean");
+
+        // Unstaged edit: the one case `git diff --quiet` did catch.
+        fs::write(root.join("tracked.rs"), "fn a() { let _ = 1; }\n").expect("write");
+        assert!(!tree_is_clean(&root), "an unstaged edit is dirty");
+
+        // Staged edit: the case the old predicate reported as clean.
+        git_in(&["add", "tracked.rs"]);
+        assert!(
+            !tree_is_clean(&root),
+            "a staged edit is dirty: the binaries would carry code the recorded \
+             SHA does not describe"
+        );
+
+        git_in(&["commit", "--quiet", "-m", "edit"]);
+        assert!(tree_is_clean(&root), "committing restores cleanliness");
+
+        fs::write(root.join("untracked.rs"), "fn b() {}\n").expect("write");
+        assert!(!tree_is_clean(&root), "an untracked file is dirty");
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

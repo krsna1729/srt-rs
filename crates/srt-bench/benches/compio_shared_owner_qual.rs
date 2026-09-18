@@ -54,8 +54,8 @@ use std::time::{Duration, Instant};
 
 use srt_proto::{Bytes, Timestamp};
 use srt_transport::compio::{
-    Owner, OwnerRxMode, OwnerServiceBudget, OwnerTxClassCounters, ProductionRuntimeConfig,
-    RxModePolicy, production_runtime_builder,
+    Owner, OwnerRxMode, OwnerServiceBudget, OwnerTxClassCounters, PINNED_COMPIO_VERSION,
+    ProductionRuntimeConfig, RxModePolicy, production_runtime_builder,
 };
 use srt_transport::{CallerConfig, SocketOwnership};
 
@@ -138,6 +138,12 @@ struct QualReport {
     /// capacity row that cannot report this cannot claim the transport under
     /// test stayed healthy -- and the rate it measured is not a capacity result.
     owner_faulted: bool,
+    /// The runtime substrate this shard actually ran on: Compio's observed
+    /// driver (`IoUring` or `Poll`) and the pinned Compio version. A capacity
+    /// point is only transferable with the substrate it was measured on, and
+    /// neither number can be recovered from the rest of the row.
+    driver: String,
+    compio_version: String,
     /// Wire submissions attributed to the WINDOW only; the drain phase is
     /// counted separately so the two are never mixed.
     submitted: u64,
@@ -317,6 +323,10 @@ async fn run_sender(
         }
     };
     let runtime = builder.build().expect("production runtime builds");
+    // The substrate this shard actually runs on, observed from the exact runtime
+    // the Owner is built with -- never a throwaway probe runtime.
+    report.driver = format!("{:?}", runtime.driver_type());
+    report.compio_version = PINNED_COMPIO_VERSION.to_string();
 
     runtime.block_on(async {
         let mut owner = Owner::new_with_ceiling(tx_capacity, wire_ceiling);
@@ -800,7 +810,8 @@ fn main() {
          tx_pool_free={} tx_pool_capacity={} tx_pool_high_water={} \
          payload_bytes={} interval_us={} \
          offered_bps_per_dest={} fence_offered={} fence_accepted={} \
-         cpu_ms={:.1} window_cpu_ms={:.1} drain_cpu_ms={:.1} owner_faulted={}",
+         cpu_ms={:.1} window_cpu_ms={:.1} drain_cpu_ms={:.1} owner_faulted={} \
+         driver={} compio={}",
         report.fanout,
         report.tx_lanes,
         report.connect_cc,
@@ -868,5 +879,7 @@ fn main() {
         report.window_cpu_ms,
         report.drain_cpu_ms,
         report.owner_faulted,
+        report.driver,
+        report.compio_version,
     );
 }

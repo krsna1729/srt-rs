@@ -770,20 +770,61 @@ impl std::fmt::Display for QualificationIdentity {
     }
 }
 
+/// A non-negative integer from one of the identity's own run-shape fields.
+///
+/// A malformed value is an error naming the field, never zero: `shards=0` or
+/// `reps=0` would make every completeness check below vacuous, and `fanout=?`
+/// would silently compare against a string.
+fn shape_count(key: &str, raw: &str) -> Result<u64, String> {
+    raw.parse()
+        .map_err(|_| format!("{key}={raw:?} is not a non-negative integer"))
+}
+
 impl QualificationIdentity {
-    /// The declared shard population, `0..shards`, or an error naming the
-    /// field that is not a count.
+    /// The declared shard population, `0..shards`.
     fn shard_count(&self) -> Result<u64, String> {
-        self.shards
-            .parse()
-            .map_err(|_| format!("shards={:?} is not a non-negative integer", self.shards))
+        shape_count("shards", &self.shards)
     }
 
-    /// The declared repetition count, or an error naming the field.
+    /// The declared repetition count.
     fn rep_count(&self) -> Result<u64, String> {
-        self.reps
-            .parse()
-            .map_err(|_| format!("reps={:?} is not a non-negative integer", self.reps))
+        shape_count("reps", &self.reps)
+    }
+
+    /// The declared shape has to be self-consistent before anything is counted
+    /// against it.
+    ///
+    /// `cargo xtask scaling` writes `n = fanout x shards`; a header that
+    /// contradicts that describes no configuration at all, so accepting it would
+    /// mean counting repetitions of an experiment that was never performed.
+    /// Zero shards or zero repetitions are rejected for the same reason: they
+    /// would satisfy "every declared shard row is present" and "every declared
+    /// repetition is present" without any rows existing.
+    fn validate_shape(&self) -> Result<(), String> {
+        let fanout = shape_count("fanout", &self.fanout)?;
+        let shards = self.shard_count()?;
+        let reps = self.rep_count()?;
+        let n = shape_count("n", &self.n)?;
+        if shards == 0 {
+            return Err(format!(
+                "{self}: shards=0 declares a sweep with no destination population"
+            ));
+        }
+        if reps == 0 {
+            return Err(format!(
+                "{self}: reps=0 declares a sweep with no repetition"
+            ));
+        }
+        let expected = fanout
+            .checked_mul(shards)
+            .ok_or_else(|| format!("{self}: fanout={fanout} x shards={shards} overflows"))?;
+        if n != expected {
+            return Err(format!(
+                "{self}: n={n} != fanout={fanout} x shards={shards} = {expected}, so the \
+                 declared population contradicts itself"
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -793,7 +834,7 @@ fn identity(fields: &BTreeMap<String, String>) -> Result<QualificationIdentity, 
             .cloned()
             .ok_or_else(|| format!("missing {key}"))
     };
-    Ok(QualificationIdentity {
+    let identity = QualificationIdentity {
         fanout: get("fanout")?,
         rate: get("offered_bps_per_dest")?,
         tx_lanes: get("tx_lanes")?,
@@ -804,7 +845,9 @@ fn identity(fields: &BTreeMap<String, String>) -> Result<QualificationIdentity, 
         n: get("n")?,
         shards: get("shards")?,
         reps: get("reps")?,
-    })
+    };
+    identity.validate_shape()?;
+    Ok(identity)
 }
 
 /// One repetition's rows: whether each shard of the declared population was
@@ -868,11 +911,11 @@ impl QualifiedPoint {
 /// `sustained_rows` marks, by index into `rows`, which rows are individually
 /// sustained (passed [`judge`] and [`stationarity`]) -- computed by the caller
 /// so this function stays a pure grouping/counting step. Malformed evidence
-/// (a missing identity field, a shard index outside the declared population, a
-/// duplicate shard row, a missing shard row, or a whole missing repetition) is
-/// an error rather than a silently dropped or silently shortened group: an
-/// incomplete repetition is not weaker evidence for a point, it is not evidence
-/// for it at all.
+/// (a missing identity field, a self-contradictory declared shape, a shard index
+/// or repetition number outside the declared range, a duplicate shard row, a
+/// missing shard row, or a whole missing repetition) is an error rather than a
+/// silently dropped or silently shortened group: an incomplete repetition is not
+/// weaker evidence for a point, it is not evidence for it at all.
 fn group_by_identity(
     rows: &[BTreeMap<String, String>],
     sustained_rows: &[bool],
@@ -883,10 +926,22 @@ fn group_by_identity(
         let rep = count(fields, "rep")?;
         let shard = count(fields, "shard")?;
         let shards = id.shard_count()?;
+        let declared_reps = id.rep_count()?;
+        // Both coordinates have to lie inside the population the file declared.
+        // A row is not evidence for a repetition or a shard the header says was
+        // never part of the sweep: `reps=2` beside a stray `rep=3` row would
+        // otherwise make three passing rows a "3/3" point that performed two
+        // repetitions, which is exactly the promotion this hierarchy exists to
+        // prevent.
         if shard >= shards {
             return Err(format!(
                 "{id} rep={rep}: shard={shard} is outside the declared population \
                  shards=0..{shards}"
+            ));
+        }
+        if rep < 1 || rep > declared_reps {
+            return Err(format!(
+                "{id}: rep={rep} is outside the declared repetitions 1..={declared_reps}"
             ));
         }
         let evidence = groups
@@ -1988,7 +2043,8 @@ mod tests {
     }
 
     /// A complete point: `reps` repetitions of `shards` shards each, with the
-    /// sweep-shape fields rewritten to match.
+    /// sweep-shape fields rewritten to match (`n == fanout x shards`, which the
+    /// gate now validates).
     fn point(reps: u64, shards: u64) -> Vec<BTreeMap<String, String>> {
         let mut rows = Vec::new();
         for rep in 1..=reps {
@@ -1996,6 +2052,7 @@ mod tests {
                 let mut fields = identified(rep, shard);
                 fields.insert("shards".to_string(), shards.to_string());
                 fields.insert("reps".to_string(), reps.to_string());
+                fields.insert("n".to_string(), (200 * shards).to_string());
                 rows.push(fields);
             }
         }
@@ -2135,6 +2192,63 @@ mod tests {
         rows.push(identified(1, 1)); // shards=1 declares only shard 0
         let error = group_by_identity(&rows, &vec![true; rows.len()]).unwrap_err();
         assert!(error.contains("outside the declared population"), "{error}");
+    }
+
+    /// A repetition the header never declared cannot be manufactured by adding
+    /// rows: `reps=2` with rows 1/2/3 would otherwise count three passing rows
+    /// as a "3/3" point that performed two repetitions -- the exact promotion
+    /// the rep/shard hierarchy exists to prevent.
+    #[test]
+    fn a_repetition_outside_the_declared_range_is_malformed_evidence() {
+        // Declared two, three present.
+        let mut rows = point(3, 1);
+        for fields in rows.iter_mut() {
+            fields.insert("reps".to_string(), "2".to_string());
+        }
+        let error = group_by_identity(&rows, &vec![true; rows.len()]).unwrap_err();
+        assert!(
+            error.contains("rep=3 is outside the declared repetitions 1..=2"),
+            "{error}"
+        );
+
+        // `rep=0` is not a repetition number either.
+        let mut rows = point(3, 1);
+        rows[0].insert("rep".to_string(), "0".to_string());
+        let error = group_by_identity(&rows, &vec![true; rows.len()]).unwrap_err();
+        assert!(
+            error.contains("rep=0 is outside the declared repetitions 1..=3"),
+            "{error}"
+        );
+
+        // Declared three, three present: the valid control.
+        let groups = group_by_identity(&point(3, 1), &[true; 3]).expect("3/3 is well formed");
+        assert_eq!((groups[0].reps_passed(), groups[0].reps_total()), (3, 3));
+    }
+
+    /// A header that contradicts itself describes no configuration at all, so
+    /// nothing may be counted against it. `shards=0` and `reps=0` are the
+    /// degenerate cases: both would make "every declared shard/repetition is
+    /// present" true without any rows existing.
+    #[test]
+    fn a_self_contradictory_declared_shape_is_malformed_evidence() {
+        for (key, value, needle) in [
+            ("n", "199", "n=199 != fanout=200 x shards=1 = 200"),
+            ("shards", "0", "shards=0"),
+            ("reps", "0", "reps=0"),
+            (
+                "fanout",
+                "many",
+                "fanout=\"many\" is not a non-negative integer",
+            ),
+            ("n", "-1", "n=\"-1\" is not a non-negative integer"),
+        ] {
+            let mut rows = point(3, 1);
+            for fields in rows.iter_mut() {
+                fields.insert(key.to_string(), value.to_string());
+            }
+            let error = group_by_identity(&rows, &vec![true; rows.len()]).unwrap_err();
+            assert!(error.contains(needle), "{key}={value} produced {error}");
+        }
     }
 
     /// Rows with a different identity dimension are different points, never
