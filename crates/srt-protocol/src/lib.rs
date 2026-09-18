@@ -22,7 +22,7 @@ mod time;
 pub mod sender {
     pub use super::sender_rto::{COMM_SYN_MICROS, MAX_RTO_MICROS, RtoArm, SenderRto};
     pub use super::srt_sender::{
-        DEFAULT_MAX_BANDWIDTH_BYTES_PER_SEC, DroppedMessage, SenderBuffer, SenderStats,
+        DEFAULT_MAX_BANDWIDTH_BYTES_PER_SEC, DroppedMessage, InvalidNak, SenderBuffer, SenderStats,
     };
 }
 

@@ -9,7 +9,7 @@
 //! - Buffer release via ACK
 //! - Send window management
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 
 use crate::sender_packet_window::SenderPacketWindow;
 
@@ -253,8 +253,29 @@ pub struct SenderBuffer {
     /// peer see only the first 16 no matter how many times it repeats the
     /// NAK, and could never advance its cumulative ACK past them. This
     /// counts total tombstones served across calls, used only as a rotating
-    /// offset into whatever tombstone list the current call finds.
-    dropreq_cursor: u8,
+    /// offset into whatever tombstone list the current call finds. `u16`
+    /// wraps at exactly [`crate::srt_handshake::MAX_FLOW_WINDOW`] (65,536),
+    /// the largest a negotiated window (and so the largest a distinct
+    /// tombstone count) can ever be, so every residue is still reachable.
+    dropreq_cursor: u16,
+    /// Count of retained entries that are both submitted and not (yet)
+    /// tombstoned -- i.e. still outstanding DATA a peer could legitimately
+    /// still be holding.
+    ///
+    /// `newest_submitted` alone cannot answer "is anything outstanding":
+    /// TLPKTDROP can tombstone a submitted entry without moving that
+    /// ceiling, so a naive `newest_submitted` vs `oldest_unacked` comparison
+    /// keeps reporting a flight that no longer exists once every submitted
+    /// position has been given up. Incremented exactly once per sequence on
+    /// its first live submission, decremented on ACK retirement or
+    /// TLPKTDROP, reset on resync.
+    live_submitted_count: u32,
+    /// Test-only instrumentation: number of times `tombstone_range` has
+    /// actually walked a run, to pin its O(1)-per-distinct-run amortized
+    /// cost against a regression back to O(run length) per requested
+    /// position.
+    #[cfg(test)]
+    tombstone_range_calls: std::cell::Cell<u32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -312,6 +333,9 @@ impl SenderBuffer {
             newest_submitted: None,
             rto: SenderRto::new(),
             dropreq_cursor: 0,
+            live_submitted_count: 0,
+            #[cfg(test)]
+            tombstone_range_calls: std::cell::Cell::new(0),
         };
         buf.recompute_packet_send_period();
         buf
@@ -320,6 +344,25 @@ impl SenderBuffer {
     /// Get the next sequence number.
     pub fn next_sequence_number(&self) -> u32 {
         self.next_seq
+    }
+
+    /// The highest cumulative ACK position a peer could legitimately report,
+    /// justified by actual first-transmission submission rather than mere
+    /// acceptance.
+    ///
+    /// [`Self::next_sequence_number`] is the *accepted* frontier: it
+    /// advances the instant this sender assigns a sequence number, before
+    /// the datagram has necessarily left the protocol for the transport. A
+    /// peer can only acknowledge what it actually received, and it cannot
+    /// have received data still sitting behind this sender's own TX
+    /// capacity. This is `newest_submitted + 1` when something has been
+    /// submitted, or `oldest_unacked` (nothing beyond what is already fully
+    /// retired could have been acknowledged) when nothing has.
+    #[must_use]
+    pub fn max_justified_ack_position(&self) -> u32 {
+        self.newest_submitted.map_or(self.oldest_unacked, |newest| {
+            newest.wrapping_add(1) & SEQUENCE_MASK
+        })
     }
 
     pub(crate) fn synchronize_next_sequence_number(&mut self, sequence_number: u32) -> bool {
@@ -335,6 +378,8 @@ impl SenderBuffer {
         self.packets.clear();
         self.stale_retransmits = 0;
         self.newest_submitted = None;
+        self.dropreq_cursor = 0;
+        self.live_submitted_count = 0;
         true
     }
 
@@ -632,10 +677,10 @@ impl SenderBuffer {
         let newest = self.newest_submitted?;
         let mut ceiling = newest;
         loop {
-            let (sequence, eligible) = self
-                .packets
-                .last_occupied_before(ceiling.wrapping_add(1))
-                .map(|(sequence, entry)| (sequence, entry.submitted))?;
+            let (sequence, eligible) =
+                self.packets
+                    .last_occupied_before(ceiling.wrapping_add(1))
+                    .map(|(sequence, entry)| (sequence, entry.submitted && !entry.dropped))?;
             // Walked back past the flight: everything at or below here has
             // been acknowledged and is no longer a candidate.
             if !sequence_less_than(self.oldest_unacked, sequence.wrapping_add(1)) {
@@ -676,6 +721,16 @@ impl SenderBuffer {
     /// immediately after the probe went out.
     pub fn note_data_submitted(&mut self, sequence: u32) -> RtoArm {
         if let Some(entry) = self.packets.get_mut(sequence) {
+            // Only a live entry's first submission adds outstanding flight:
+            // a caller materializing a queued datagram whose sequence has
+            // since been dropped is a race `purge_stale_queued_data` (the
+            // connection layer) is meant to close before this is ever
+            // reached, but counting it here regardless would be wrong twice
+            // over -- once for double-counting a retransmission, and once
+            // for treating a tombstone as outstanding.
+            if !entry.submitted && !entry.dropped {
+                self.live_submitted_count = self.live_submitted_count.saturating_add(1);
+            }
             entry.submitted = true;
         }
         if self
@@ -694,11 +749,17 @@ impl SenderBuffer {
         RtoArm::Nothing
     }
 
-    /// Whether anything that was actually submitted is still unacknowledged.
+    /// Whether anything that was actually submitted is still both
+    /// unacknowledged and live (not tombstoned by TLPKTDROP).
+    ///
+    /// `newest_submitted` vs `oldest_unacked` alone cannot answer this:
+    /// TLPKTDROP can tombstone every submitted entry without moving either
+    /// boundary, which would otherwise leave the RTO timer probing a flight
+    /// that no longer exists -- the `live_submitted_count` field this reads
+    /// is kept accurate for exactly that reason.
     #[must_use]
     pub fn has_outstanding_submitted_data(&self) -> bool {
-        self.newest_submitted
-            .is_some_and(|newest| sequence_less_than(self.oldest_unacked, newest.wrapping_add(1)))
+        self.live_submitted_count > 0
     }
 
     /// Whether `sequence` is still outstanding (not yet acknowledged).
@@ -707,18 +768,36 @@ impl SenderBuffer {
         sequence_less_than(self.oldest_unacked, sequence.wrapping_add(1))
     }
 
+    /// Whether `sequence` is still a live, un-tombstoned retained entry --
+    /// i.e. still eligible to leave the protocol as a DATA datagram.
+    ///
+    /// False for a sequence already retired by the cumulative ACK (no
+    /// longer retained at all) and for one TLPKTDROP has tombstoned
+    /// (retained only as dropped identity, media already released). Used to
+    /// keep a DATA output queued behind blocked TX capacity from
+    /// materializing after the sender itself has already given up on it or
+    /// the peer has already acknowledged it.
+    #[must_use]
+    pub fn is_live(&self, sequence: u32) -> bool {
+        self.packets
+            .get(sequence)
+            .is_some_and(|entry| !entry.dropped)
+    }
+
     /// Sequence of a blind RTO probe queued for retransmission but not yet
     /// confirmed to have actually left the protocol -- see
     /// [`SenderRto::probe_pending`]. Self-heals a stale marker left over from
     /// a probed sequence that was acknowledged through some other path
     /// (ordinary delivery, a differently-triggered retransmission) without
-    /// ever crossing this timer's own submission boundary: such a probe can
-    /// never legitimately clear via [`SenderRto::confirm_probe_submitted`], so it
-    /// is dropped here instead of permanently blocking every future probe.
+    /// ever crossing this timer's own submission boundary, or that TLPKTDROP
+    /// tombstoned while the probe was still sitting behind blocked TX
+    /// capacity: neither can legitimately clear via
+    /// [`SenderRto::confirm_probe_submitted`], so both are dropped here
+    /// instead of permanently blocking every future probe.
     #[must_use]
     pub fn rto_probe_pending(&mut self) -> Option<u32> {
         if let Some(sequence) = self.rto.probe_pending()
-            && !self.is_outstanding(sequence)
+            && (!self.is_outstanding(sequence) || !self.is_live(sequence))
         {
             self.rto.confirm_probe_submitted(sequence);
         }
@@ -1126,6 +1205,7 @@ impl SenderBuffer {
 
         let mut stale_count = 0;
         let mut tombstones_discarded = 0;
+        let mut live_submitted_discarded = 0u32;
         let mut released_stamps = Vec::new();
         self.packets.discard_acked_prefix(
             self.oldest_unacked,
@@ -1136,13 +1216,21 @@ impl SenderBuffer {
                 }
                 if entry.dropped {
                     tombstones_discarded += 1;
-                } else if let Some(stamp) = entry.crypto_stamp {
-                    released_stamps.push(stamp.key_flag);
+                } else {
+                    if entry.submitted {
+                        live_submitted_discarded += 1;
+                    }
+                    if let Some(stamp) = entry.crypto_stamp {
+                        released_stamps.push(stamp.key_flag);
+                    }
                 }
             },
         );
         self.stale_retransmits = self.stale_retransmits.saturating_add(stale_count);
         self.dropped_retained = self.dropped_retained.saturating_sub(tombstones_discarded);
+        self.live_submitted_count = self
+            .live_submitted_count
+            .saturating_sub(live_submitted_discarded);
         for key_flag in released_stamps {
             self.count_retained_stamp(key_flag, false);
         }
@@ -1164,6 +1252,69 @@ impl SenderBuffer {
             })
             .collect();
         let _ = self.handle_nak_ranges(&ranges);
+    }
+
+    /// Validate one requested loss range against the retained window,
+    /// recording any tombstoned message it touches.
+    ///
+    /// `known_run` caches the most recently discovered tombstone run's
+    /// `(first, last)` bounds so that a NAK naming a broad range spanning
+    /// one heavily fragmented dropped message does not re-walk that whole
+    /// run for every position inside it -- `tombstone_range` itself is
+    /// O(run length), and the old per-position call made a range spanning
+    /// most of the negotiated window O(run^2). `seen_starts` catches the
+    /// rarer case of two different requested ranges in the same report
+    /// both landing on the same run, which the cache above cannot: an
+    /// O(log D) lookup keyed by each run's first sequence, where D is the
+    /// number of distinct runs found so far (bounded by the negotiated
+    /// window). Together this keeps the whole validation at O(requested
+    /// span + D log D) rather than the O(N^2) a linear rescan of
+    /// `tombstones` per position gave a report naming many one-packet
+    /// tombstoned messages.
+    fn validate_loss_range(
+        &self,
+        loss: &LossRange,
+        tombstones: &mut Vec<(u32, u32)>,
+        seen_starts: &mut BTreeSet<u32>,
+        known_run: &mut Option<(u32, u32)>,
+    ) -> Result<(), InvalidNak> {
+        let mut sequence = loss.first_seq & SEQUENCE_MASK;
+        let last_seq = loss.last_seq & SEQUENCE_MASK;
+        loop {
+            let within_known_run = known_run.is_some_and(|(first, last)| {
+                !sequence_less_than(sequence, first) && !sequence_less_than(last, sequence)
+            });
+            if !within_known_run {
+                *known_run = None;
+                match self.packets.get(sequence) {
+                    None => {
+                        // Never sent, already acknowledged, or outside the
+                        // retained span: not a loss this receiver could have
+                        // observed.
+                        return Err(InvalidNak);
+                    }
+                    Some(entry) if entry.dropped => {
+                        let message_number = entry.message_number;
+                        if let Some(range) = self.tombstone_range(sequence, message_number) {
+                            *known_run = Some(range);
+                            if seen_starts.insert(range.0) {
+                                tombstones.push(range);
+                            }
+                        }
+                    }
+                    Some(entry) if !entry.submitted => {
+                        // Accepted but never on the wire: the peer cannot have
+                        // measured it as lost.
+                        return Err(InvalidNak);
+                    }
+                    Some(_) => {}
+                }
+            }
+            if sequence == last_seq {
+                return Ok(());
+            }
+            sequence = sequence.wrapping_add(1) & SEQUENCE_MASK;
+        }
     }
 
     /// Validate a peer loss report completely, then commit it: either every
@@ -1209,39 +1360,10 @@ impl SenderBuffer {
         // peer is alive and playing by the protocol, so it must not be
         // banked as one.
         let mut tombstones: Vec<(u32, u32)> = Vec::new();
+        let mut seen_starts: BTreeSet<u32> = BTreeSet::new();
+        let mut known_run: Option<(u32, u32)> = None;
         for loss in loss_ranges {
-            let mut sequence = loss.first_seq & SEQUENCE_MASK;
-            let last_seq = loss.last_seq & SEQUENCE_MASK;
-            loop {
-                match self.packets.get(sequence) {
-                    None => {
-                        // Never sent, already acknowledged, or outside the
-                        // retained span: not a loss this receiver could have
-                        // observed.
-                        return Err(InvalidNak);
-                    }
-                    Some(entry) if entry.dropped => {
-                        let message_number = entry.message_number;
-                        if let Some(range) = self.tombstone_range(sequence, message_number)
-                            && !tombstones
-                                .iter()
-                                .any(|&(first, _)| first.wrapping_sub(range.0) & SEQUENCE_MASK == 0)
-                        {
-                            tombstones.push(range);
-                        }
-                    }
-                    Some(entry) if !entry.submitted => {
-                        // Accepted but never on the wire: the peer cannot have
-                        // measured it as lost.
-                        return Err(InvalidNak);
-                    }
-                    Some(_) => {}
-                }
-                if sequence == last_seq {
-                    break;
-                }
-                sequence = sequence.wrapping_add(1) & SEQUENCE_MASK;
-            }
+            self.validate_loss_range(loss, &mut tombstones, &mut seen_starts, &mut known_run)?;
         }
 
         // Phase 2: commit. Only a validated report reaches here, so this is
@@ -1273,7 +1395,7 @@ impl SenderBuffer {
                 last_seq,
             })
             .collect();
-        self.dropreq_cursor = self.dropreq_cursor.wrapping_add(served.len() as u8);
+        self.dropreq_cursor = self.dropreq_cursor.wrapping_add(served.len() as u16);
         Ok(served)
     }
 
@@ -1400,6 +1522,7 @@ impl SenderBuffer {
 
         loop {
             let mut just_dropped = false;
+            let mut was_live_submitted = false;
             let released_stamp = self.packets.get_mut(*seq).and_then(|entry| {
                 if entry.dropped {
                     return None;
@@ -1411,6 +1534,7 @@ impl SenderBuffer {
                 // The media is what occupancy is measured in; the sequence
                 // identity is what the peer's repeated NAK is matched against.
                 entry.payload = Bytes::new();
+                was_live_submitted = entry.submitted;
                 entry.dropped = true;
                 just_dropped = true;
                 // A tombstone is never transmitted again, so its key
@@ -1422,6 +1546,13 @@ impl SenderBuffer {
                     self.count_retained_stamp(stamp.key_flag, false);
                 }
                 self.dropped_retained = self.dropped_retained.saturating_add(1);
+                if was_live_submitted {
+                    // This entry was still outstanding flight until now: the
+                    // RTO estimator (`has_outstanding_submitted_data`) and
+                    // any pending blind probe (`rto_probe_pending`) must stop
+                    // treating it as such.
+                    self.live_submitted_count = self.live_submitted_count.saturating_sub(1);
+                }
                 if self.packets.cancel_retransmit(*seq) {
                     // The queued loss-list entry is now answered by DROPREQ,
                     // not by a retransmission.
@@ -1462,6 +1593,9 @@ impl SenderBuffer {
     /// must name -- no per-entry range storage, and no way for the range to
     /// drift from the window's own contents.
     fn tombstone_range(&self, sequence: u32, message_number: u32) -> Option<(u32, u32)> {
+        #[cfg(test)]
+        self.tombstone_range_calls
+            .set(self.tombstone_range_calls.get().saturating_add(1));
         if self
             .packets
             .get(sequence)
@@ -1495,6 +1629,11 @@ impl SenderBuffer {
             steps += 1;
         }
         Some((first, last))
+    }
+
+    #[cfg(test)]
+    fn tombstone_range_calls(&self) -> u32 {
+        self.tombstone_range_calls.get()
     }
 
     /// Get the send time of the oldest packet in the buffer.
@@ -2067,8 +2206,14 @@ mod tests {
         // The protocol-correctness pass added two counters (retained packets
         // per key generation, so a generation cannot be retired while one of
         // its packets still needs retransmitting) -- a deliberate, bounded
-        // increase, not drift.
-        assert!(inline_bytes <= 328);
+        // increase, not drift. A later pass added `dropreq_cursor` (widened
+        // to `u16` to cover the full 65,536-position window) and
+        // `live_submitted_count` (a `u32`, since that same window can hold
+        // exactly that many outstanding entries) -- another deliberate,
+        // bounded increase: both fix real correctness gaps (fair DROPREQ
+        // service at full window size, and an RTO estimator that must not
+        // keep treating a TLPKTDROP-tombstoned entry as outstanding flight).
+        assert!(inline_bytes <= 336);
         assert_eq!(window.heap_bytes(), 8_320);
     }
 
@@ -2950,6 +3095,108 @@ mod tests {
             ever_served.len() as u32,
             MESSAGES,
             "every tombstoned message must eventually be represented by a DROPREQ"
+        );
+    }
+
+    /// The same fairness property at a scale that would have overflowed the
+    /// round-robin cursor's original `u8` representation (256 tombstones):
+    /// 300 one-packet tombstoned messages must all eventually be served,
+    /// not just the first 256.
+    #[test]
+    fn a_repeated_broad_nak_fairly_serves_three_hundred_tombstones() {
+        let now = Timestamp::default();
+        const MESSAGES: u32 = 300;
+        let mut buf = SenderBuffer::new(0, MESSAGES + 64, 10);
+        for _ in 0..MESSAGES {
+            buf.push_submitted(vec![1], 1, 1, now).expect("admitted");
+        }
+        let dropped = buf.drop_expired(Timestamp::from_micros(1_000_001));
+        assert_eq!(dropped.len() as u32, MESSAGES, "one tombstone per message");
+
+        let mut ever_served: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for _ in 0..(MESSAGES as usize).div_ceil(MAX_DROPREQ_PER_NAK) + 1 {
+            let served = buf
+                .handle_nak_ranges(&[LossRange {
+                    first_seq: 0,
+                    last_seq: MESSAGES - 1,
+                }])
+                .unwrap();
+            assert_eq!(served.len(), MAX_DROPREQ_PER_NAK);
+            ever_served.extend(served.iter().map(|msg| msg.first_seq));
+        }
+        assert_eq!(
+            ever_served.len() as u32,
+            MESSAGES,
+            "every one of 300 tombstoned messages must eventually be served"
+        );
+    }
+
+    /// A NAK naming a single heavily fragmented tombstoned message must walk
+    /// that run exactly once, not once per requested position inside it.
+    /// Before the `known_run` cache in `validate_loss_range`, a NAK spanning
+    /// an M-packet dropped message called `tombstone_range` (itself O(run
+    /// length)) M times, making one control datagram cost O(M^2).
+    #[test]
+    fn a_nak_spanning_one_huge_fragmented_tombstone_walks_the_run_once() {
+        let now = Timestamp::default();
+        const FRAGMENTS: u32 = 20_000;
+        let mut buf = SenderBuffer::new(0, FRAGMENTS + 64, 10);
+        let payload = vec![0u8; FRAGMENTS as usize];
+        let pushed = buf.push_message(&payload, 1, 1, 1, now);
+        assert_eq!(pushed.len() as u32, FRAGMENTS);
+        for (header, _) in &pushed {
+            buf.note_data_submitted(header.sequence_number);
+        }
+
+        let dropped = buf.drop_expired(Timestamp::from_micros(1_000_001));
+        assert_eq!(dropped.len(), 1, "one drop for the whole message");
+        assert_eq!(dropped[0].first_seq, 0);
+        assert_eq!(dropped[0].last_seq, FRAGMENTS - 1);
+
+        let calls_before = buf.tombstone_range_calls();
+        let served = buf
+            .handle_nak_ranges(&[LossRange {
+                first_seq: 0,
+                last_seq: FRAGMENTS - 1,
+            }])
+            .unwrap();
+        assert_eq!(
+            served.len(),
+            1,
+            "one DROPREQ for the one tombstoned message"
+        );
+        assert_eq!(
+            buf.tombstone_range_calls() - calls_before,
+            1,
+            "the whole run must be discovered with exactly one tombstone_range walk, \
+             not one per requested position inside it"
+        );
+    }
+
+    /// The same amortized cost holds for many distinct one-packet
+    /// tombstones named by one broad NAK: `tombstone_range` runs exactly
+    /// once per distinct tombstoned message, never re-walking one already
+    /// discovered by an earlier position in the same report.
+    #[test]
+    fn a_nak_spanning_many_one_packet_tombstones_walks_each_run_once() {
+        let now = Timestamp::default();
+        const MESSAGES: u32 = 5_000;
+        let mut buf = SenderBuffer::new(0, MESSAGES + 64, 10);
+        for _ in 0..MESSAGES {
+            buf.push_submitted(vec![1], 1, 1, now).expect("admitted");
+        }
+        let dropped = buf.drop_expired(Timestamp::from_micros(1_000_001));
+        assert_eq!(dropped.len() as u32, MESSAGES);
+
+        let calls_before = buf.tombstone_range_calls();
+        let _ = buf.handle_nak_ranges(&[LossRange {
+            first_seq: 0,
+            last_seq: MESSAGES - 1,
+        }]);
+        assert_eq!(
+            buf.tombstone_range_calls() - calls_before,
+            MESSAGES,
+            "each one-packet tombstone must be discovered exactly once"
         );
     }
 

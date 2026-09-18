@@ -20,7 +20,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use srt_proto::handshake::DEFAULT_MTU;
-use srt_proto::wire::{ControlPacket, ControlType, SrtPacket};
+use srt_proto::wire::{ControlPacket, ControlType, SRT_HEADER_SIZE, SrtPacket};
 use srt_proto::{
     ConnectionOptions, ConnectionOutput, ConnectionState, ErrorKind, SrtConnection, Timestamp,
 };
@@ -81,7 +81,11 @@ fuzz_target!(|data: &[u8]| {
         let type_specific_info = u32::from_le_bytes([rest[3], rest[4], rest[5], rest[6]]);
         let declared = usize::from(u16::from_le_bytes([rest[7], rest[8]]));
         rest = &rest[9..];
-        let take = declared.min(rest.len()).min(DEFAULT_MTU as usize);
+        // Leave room for the fixed SRT header: the MTU bound below applies
+        // to the whole encoded datagram, not to the information field alone.
+        let take = declared
+            .min(rest.len())
+            .min((DEFAULT_MTU as usize).saturating_sub(SRT_HEADER_SIZE));
         let control_info = rest[..take].to_vec();
         rest = &rest[take..];
 

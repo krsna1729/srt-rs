@@ -126,5 +126,67 @@ fn bench_sender_nak_scale(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_sender_nak_scale);
+/// Tombstone discovery during NAK validation: proves the O(1)-amortized
+/// cost per distinct tombstoned run holds at scale, for both a NAK naming
+/// many one-packet dropped messages and one naming a single heavily
+/// fragmented dropped message. See `srt_sender::tests::
+/// a_nak_spanning_one_huge_fragmented_tombstone_walks_the_run_once` and
+/// `..._many_one_packet_tombstones_walks_each_run_once` for the
+/// deterministic (operation-counted) regression this benchmark
+/// complements.
+fn bench_sender_nak_tombstones(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sender_nak_tombstones");
+    const TOMBSTONES: u32 = 8_192;
+    group.throughput(Throughput::Elements(TOMBSTONES as u64));
+
+    let many_one_packet = |messages: u32| -> SenderBuffer {
+        let mut sender = SenderBuffer::new(0, messages + 64, 10);
+        for _ in 0..messages {
+            let (header, _) = sender
+                .push(vec![1], 1, 1, Timestamp::default())
+                .expect("admitted");
+            sender.note_data_submitted(header.sequence_number);
+        }
+        let _ = sender.drop_expired(Timestamp::from_micros(1_000_001));
+        sender
+    };
+    let dense_range = [LossRange {
+        first_seq: 0,
+        last_seq: TOMBSTONES - 1,
+    }];
+
+    group.bench_function("many_one_packet_tombstones", |b| {
+        b.iter_batched_ref(
+            || many_one_packet(TOMBSTONES),
+            |sender| {
+                black_box(sender.handle_nak_ranges(black_box(&dense_range)).ok());
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    let one_giant_fragmented_tombstone = || -> SenderBuffer {
+        let mut sender = SenderBuffer::new(0, TOMBSTONES + 64, 10);
+        let payload = vec![0u8; TOMBSTONES as usize];
+        for (header, _) in sender.push_message(&payload, 1, 1, 1, Timestamp::default()) {
+            sender.note_data_submitted(header.sequence_number);
+        }
+        let _ = sender.drop_expired(Timestamp::from_micros(1_000_001));
+        sender
+    };
+
+    group.bench_function("one_giant_fragmented_tombstone", |b| {
+        b.iter_batched_ref(
+            one_giant_fragmented_tombstone,
+            |sender| {
+                black_box(sender.handle_nak_ranges(black_box(&dense_range)).ok());
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_sender_nak_scale, bench_sender_nak_tombstones);
 criterion_main!(benches);
