@@ -7216,8 +7216,21 @@ mod tests {
             // Kill a lane that holds no job, so what is detected is the worker
             // set being incomplete rather than a stuck job.
             owner.tx_engine.kill_lane_worker_for_test(3);
-            // Let the runtime actually finish that task.
-            compio::time::sleep(std::time::Duration::from_millis(2)).await;
+            // Wait for the killed lane's own task to actually finish, rather
+            // than hoping a fixed sleep was long enough: under scheduling
+            // contention (a busy CI runner, ASan's slowdown) a short fixed
+            // delay is not a reliable bound on when the runtime gets around
+            // to running that task to completion. Poll `is_finished()`
+            // directly, bounded by an outer timeout so a genuine regression
+            // still fails fast instead of hanging.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !owner.tx_engine.lanes[3].handle.is_finished() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the killed lane's worker task never finished"
+                );
+                compio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
 
             let report = owner.service(Timestamp::from_micros(20_000), budget).await;
             assert_eq!(
