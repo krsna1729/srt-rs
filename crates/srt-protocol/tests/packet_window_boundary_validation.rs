@@ -83,7 +83,7 @@ fn nak_crossing_page_boundary_and_sequence_wrap() {
         first_seq: 60,
         last_seq: 70,
     }];
-    sender.handle_nak_ranges(&page_crossing_range);
+    sender.handle_nak_ranges(&page_crossing_range).unwrap();
     assert_eq!(sender.stats().packets_in_loss_list, 11);
 
     // Pop and verify retransmit packets are in order
@@ -104,7 +104,7 @@ fn nak_crossing_page_boundary_and_sequence_wrap() {
         first_seq: 0x7fff_fff8,
         last_seq: 5,
     }];
-    wrap_sender.handle_nak_ranges(&wrap_loss_range);
+    wrap_sender.handle_nak_ranges(&wrap_loss_range).unwrap();
     assert_eq!(wrap_sender.stats().packets_in_loss_list, 14);
 
     let mut popped = Vec::new();
@@ -125,10 +125,12 @@ fn retransmit_queue_entry_survives_physical_page_reuse_and_rejects_stale_alias()
         push_transmitted(&mut sender);
     }
     // NAK seq 10 on page 0
-    sender.handle_nak_ranges(&[LossRange {
-        first_seq: 10,
-        last_seq: 10,
-    }]);
+    sender
+        .handle_nak_ranges(&[LossRange {
+            first_seq: 10,
+            last_seq: 10,
+        }])
+        .unwrap();
     assert!(sender.has_retransmit());
 
     // ACK 0..64 without popping retransmit 10 (e.g. recovered via FEC)

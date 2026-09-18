@@ -110,18 +110,24 @@ fuzz_target!(|data: &[u8]| {
                     first_seq: first,
                     last_seq: first.wrapping_add(span) & SEQUENCE_MASK,
                 }];
-                let answered = sender.handle_nak_ranges(&report);
-                assert!(
-                    answered.len() <= 16,
-                    "one report cannot be amplified into unbounded DROPREQ batches"
-                );
-                for message in answered {
-                    // A repeated DROPREQ always names a position this sender
-                    // had already given up.
+                // Fuzz-generated ranges are frequently invalid (never sent,
+                // already retired, or beyond the retained span); an invalid
+                // report is now rejected outright rather than answered with
+                // an empty batch, so there is nothing to check against
+                // `tombstones` when it is.
+                if let Ok(answered) = sender.handle_nak_ranges(&report) {
                     assert!(
-                        tombstones.contains(&message.first_seq),
-                        "DROPREQ for a position that was never dropped"
+                        answered.len() <= 16,
+                        "one report cannot be amplified into unbounded DROPREQ batches"
                     );
+                    for message in answered {
+                        // A repeated DROPREQ always names a position this
+                        // sender had already given up.
+                        assert!(
+                            tombstones.contains(&message.first_seq),
+                            "DROPREQ for a position that was never dropped"
+                        );
+                    }
                 }
             }
             6 => {

@@ -52,7 +52,7 @@ fn bench_sender_nak_scale(c: &mut Criterion) {
         b.iter_batched_ref(
             || populated_sender(PACKETS),
             |sender| {
-                sender.handle_nak_ranges(black_box(&expanded_ranges));
+                let _ = sender.handle_nak_ranges(black_box(&expanded_ranges));
                 black_box(sender.has_retransmit());
             },
             BatchSize::SmallInput,
@@ -64,7 +64,7 @@ fn bench_sender_nak_scale(c: &mut Criterion) {
         b.iter_batched_ref(
             || populated_sender(PACKETS),
             |sender| {
-                sender.handle_nak_ranges(black_box(&dense_range));
+                let _ = sender.handle_nak_ranges(black_box(&dense_range));
                 black_box(sender.has_retransmit());
             },
             BatchSize::SmallInput,
@@ -76,11 +76,11 @@ fn bench_sender_nak_scale(c: &mut Criterion) {
         b.iter_batched_ref(
             || {
                 let mut sender = populated_sender(PACKETS);
-                sender.handle_nak_ranges(&expanded_ranges);
+                let _ = sender.handle_nak_ranges(&expanded_ranges);
                 sender
             },
             |sender| {
-                sender.handle_nak_ranges(black_box(&expanded_ranges));
+                let _ = sender.handle_nak_ranges(black_box(&expanded_ranges));
                 black_box(sender.has_retransmit());
             },
             BatchSize::SmallInput,
@@ -92,11 +92,11 @@ fn bench_sender_nak_scale(c: &mut Criterion) {
         b.iter_batched_ref(
             || {
                 let mut sender = populated_sender(PACKETS);
-                sender.handle_nak_ranges(&dense_range);
+                let _ = sender.handle_nak_ranges(&dense_range);
                 sender
             },
             |sender| {
-                sender.handle_nak_ranges(black_box(&dense_range));
+                let _ = sender.handle_nak_ranges(black_box(&dense_range));
                 black_box(sender.has_retransmit());
             },
             BatchSize::SmallInput,
@@ -108,7 +108,7 @@ fn bench_sender_nak_scale(c: &mut Criterion) {
         b.iter_batched_ref(
             || {
                 let mut sender = populated_sender(PACKETS);
-                sender.handle_nak_ranges(&dense_range);
+                let _ = sender.handle_nak_ranges(&dense_range);
                 sender
             },
             |sender| {
