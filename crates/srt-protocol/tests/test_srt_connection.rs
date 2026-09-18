@@ -4,9 +4,9 @@
 
 use std::time::Duration;
 
-use srt_proto::crypto::{CipherMode, KeyFlag, KeyLength};
+use srt_proto::crypto::{CipherMode, CryptoContext, KeyFlag, KeyLength};
 use srt_proto::handshake::{GroupExtensionData, GroupType};
-use srt_proto::wire::{DataPacket, PacketPosition, SrtPacket};
+use srt_proto::wire::{ControlPacket, ControlType, DataPacket, PacketPosition, SrtPacket};
 use srt_proto::{
     ConnectionEvent, ConnectionOptions, ConnectionOutput, ConnectionState, ConnectionStats,
     ErrorKind, SrtConnection, TimerId, Timestamp,
@@ -1843,6 +1843,277 @@ fn dropreq_rejects_range_larger_than_receive_window() {
 // across a real transfer) -- purely sans-I/O, driven by injected
 // Timestamps, same pattern as every other test in this file.
 // ============================================================================
+
+/// The DATA packet a wire datagram carries.
+fn decoded_data(datagram: &[u8]) -> DataPacket {
+    match SrtPacket::decode(datagram).expect("the datagram decodes") {
+        SrtPacket::Data(packet) => packet,
+        other => panic!("expected a DATA datagram, got {other:?}"),
+    }
+}
+
+/// The wire datagram with its retransmission flag cleared.
+fn mask_retransmit_flag(datagram: &[u8]) -> Vec<u8> {
+    let mut masked = datagram.to_vec();
+    // Byte 4 carries the position/order/key/retransmit bits; the
+    // retransmission flag is 0x04 there (`srt_packet`'s header packing).
+    masked[4] &= !0x04;
+    masked
+}
+
+/// Drain the caller's DATA datagrams as (sequence, KK field, retransmit flag,
+/// wire bytes).
+fn drain_data_datagrams(caller: &mut SrtConnection) -> Vec<(u32, u8, bool, Vec<u8>)> {
+    let mut datagrams = Vec::new();
+    while let Some(output) = caller.poll_output().unwrap() {
+        if let ConnectionOutput::SendPacket(data) = output
+            && let Ok(SrtPacket::Data(packet)) = SrtPacket::decode(&data)
+        {
+            datagrams.push((
+                packet.sequence_number,
+                packet.encryption_flag,
+                packet.retransmitted,
+                data,
+            ));
+        }
+    }
+    datagrams
+}
+
+/// Move only the listener's key-management controls back to the caller.
+///
+/// The DATA flow is deliberately left unacknowledged: the point of these
+/// scenarios is a packet that is still retained (and therefore still
+/// retransmittable) when the key generation changes underneath it.
+fn transfer_key_management_to_caller(
+    listener: &mut SrtConnection,
+    caller: &mut SrtConnection,
+    now: Timestamp,
+) {
+    while let Some(output) = listener.poll_output().unwrap() {
+        if let ConnectionOutput::SendPacket(data) = output
+            && let Ok(SrtPacket::Control(packet)) = SrtPacket::decode(&data)
+            && packet.control_type == ControlType::UserDefined
+        {
+            let _ = caller.feed_recv_buf(&data, now);
+        }
+    }
+}
+
+/// A NAK naming one sequence, as a receiver that served a later sequence
+/// would report it.
+fn single_loss_nak(dest_socket_id: u32, sequence: u32) -> Vec<u8> {
+    let packet = ControlPacket {
+        control_type: ControlType::Nak,
+        subtype: 0,
+        type_specific_info: 0,
+        timestamp: 0,
+        dest_socket_id,
+        control_info: (sequence & 0x7FFF_FFFF).to_be_bytes().to_vec(),
+    };
+    let mut buf = Vec::new();
+    packet.encode(&mut buf).expect("NAK encodes");
+    buf
+}
+
+/// Rotate the caller's key while its earlier flight stays unacknowledged,
+/// returning the KK field a *new* transmission uses afterwards.
+fn rotate_caller_key(caller: &mut SrtConnection, listener: &mut SrtConnection) -> u8 {
+    let packets_to_switch = 4u64;
+    caller
+        .seed_encrypted_packet_count_for_test(CryptoContext::KM_REFRESH_PERIOD - packets_to_switch)
+        .expect("seed the refresh boundary");
+
+    let mut provided = false;
+    for i in 0..packets_to_switch {
+        let now = ts(1_100_000 + i * 10_000);
+        caller.send(b"rotation window", now).expect("send");
+        while let Some(event) = caller.poll_event() {
+            if matches!(event, ConnectionEvent::KeyRefreshNeeded { .. }) {
+                caller
+                    .provide_new_sek(&[0x5a; 16], now)
+                    .expect("pre-announce a replacement SEK");
+                provided = true;
+            }
+        }
+        // Deliver the KMREQ (and only that) to the listener, then the
+        // KMRSP back: the rotation must complete on both sides.
+        while let Some(output) = caller.poll_output().unwrap() {
+            if let ConnectionOutput::SendPacket(data) = output
+                && let Ok(SrtPacket::Control(packet)) = SrtPacket::decode(&data)
+                && packet.control_type == ControlType::UserDefined
+            {
+                let _ = listener.feed_recv_buf(&data, now);
+            }
+        }
+        transfer_key_management_to_caller(listener, caller, now);
+    }
+    assert!(provided, "the accelerated count must request a new SEK");
+
+    // The rotation is complete only once a *new* transmission goes out under
+    // the replacement key.
+    let now = ts(1_200_000);
+    caller.send(b"after rotation", now).expect("send");
+    let datagrams = drain_data_datagrams(caller);
+    assert_eq!(datagrams.len(), 1, "one datagram");
+    assert!(datagrams[0].0 > 0);
+
+    // Push the counter past the point where the retired generation would
+    // normally be decommissioned. The pre-rotation packet is still retained
+    // and unacknowledged, so it is a live dependency on that generation: the
+    // old key must survive until it is acknowledged or dropped.
+    caller
+        .seed_encrypted_packet_count_for_test(
+            CryptoContext::KM_REFRESH_PERIOD + CryptoContext::KM_PRE_ANNOUNCE_PERIOD,
+        )
+        .expect("seed past the decommission boundary");
+    caller
+        .send(b"past decommission", ts(1_300_000))
+        .expect("send");
+    let _ = drain_data_datagrams(caller);
+
+    datagrams[0].1
+}
+
+/// A retransmission reproduces the first transmission's protected bytes under
+/// the *same* key generation, even after the connection has rotated onto the
+/// next one.
+///
+/// Reference behaviour: libsrt stores the first transmission's key-flag bits
+/// in the send-buffer block and re-reads the already-encrypted payload on
+/// retransmission (`CSndBuffer::readData`, `core.cpp` `packLostData` /
+/// `extractCleanRexmitPacket`, v1.5.7 @ `899348d8`), and Robotweax keeps the
+/// protected packet selected on first send. Re-encrypting from the retained
+/// stamp reproduces both modes deterministically for CTR and GCM, so no
+/// second copy of the media is retained.
+#[test]
+fn a_retransmission_keeps_the_first_transmission_crypto_identity() {
+    for cipher_mode in [CipherMode::Ctr, CipherMode::Gcm] {
+        let passphrase = "retransmission-passphrase".to_string();
+        let caller_opts = ConnectionOptions {
+            passphrase: Some(passphrase.clone()),
+            crypto_salt: Some([0x37; 16]),
+            key_length: KeyLength::Aes128,
+            cipher_mode,
+            tsbpd_delay: 0,
+            ..Default::default()
+        };
+        let listener_opts = ConnectionOptions {
+            passphrase: Some(passphrase),
+            key_length: KeyLength::Aes128,
+            cipher_mode,
+            tsbpd_delay: 0,
+            ..Default::default()
+        };
+        let mut caller = SrtConnection::new_caller(caller_opts);
+        let mut listener = SrtConnection::new_listener(listener_opts);
+        establish_connection(&mut caller, &mut listener).expect("connected");
+
+        // First transmission, captured from the wire before any ACK reaches
+        // the caller: this packet stays retained.
+        let now = ts(1_000_000);
+        caller.send(b"retransmit me", now).expect("send");
+        let first = drain_data_datagrams(&mut caller);
+        assert_eq!(first.len(), 1);
+        let (sequence, first_kk, first_is_retransmit, first_bytes) = first[0].clone();
+        assert!(!first_is_retransmit);
+
+        // The connection rotates while that packet is still unacknowledged.
+        let rotated_kk = rotate_caller_key(&mut caller, &mut listener);
+        assert_ne!(
+            rotated_kk, first_kk,
+            "{cipher_mode:?}: the fixture must actually have rotated the key"
+        );
+
+        // The peer reports the still-retained sequence as lost.
+        caller
+            .feed_recv_buf(&single_loss_nak(caller.socket_id(), sequence), now)
+            .expect("the loss report is accepted");
+        let retransmission = drain_data_datagrams(&mut caller);
+        assert_eq!(
+            retransmission.len(),
+            1,
+            "{cipher_mode:?}: the NAK must produce exactly one retransmission"
+        );
+        let (seq, kk, is_retransmit, bytes) = &retransmission[0];
+        assert_eq!(*seq, sequence);
+        assert!(is_retransmit, "{cipher_mode:?}: marked as a retransmission");
+        assert_eq!(
+            *kk, first_kk,
+            "{cipher_mode:?}: a retransmission must keep the first transmission's key generation"
+        );
+        // The datagrams must be identical apart from the retransmission flag
+        // in the header (the retransmit bit is excluded from the GCM AAD for
+        // exactly this reason, so the tag over the payload is unchanged).
+        let first_packet = decoded_data(&first_bytes);
+        let retransmitted_packet = decoded_data(bytes);
+        assert_eq!(
+            retransmitted_packet.payload, first_packet.payload,
+            "{cipher_mode:?}: a retransmission must reproduce the protected payload exactly"
+        );
+        assert_eq!(
+            mask_retransmit_flag(bytes),
+            mask_retransmit_flag(&first_bytes),
+            "{cipher_mode:?}: only the retransmission flag may differ on the wire"
+        );
+    }
+}
+
+/// Retransmitting is not a first transmission: it must not consume a value
+/// from the crypto counter that drives key rotation.
+#[test]
+fn a_retransmission_does_not_advance_the_first_transmission_crypto_counter() {
+    let passphrase = "counter-passphrase".to_string();
+    let mut caller = SrtConnection::new_caller(ConnectionOptions {
+        passphrase: Some(passphrase.clone()),
+        crypto_salt: Some([0x51; 16]),
+        key_length: KeyLength::Aes128,
+        tsbpd_delay: 0,
+        ..Default::default()
+    });
+    let mut listener = SrtConnection::new_listener(ConnectionOptions {
+        passphrase: Some(passphrase),
+        key_length: KeyLength::Aes128,
+        tsbpd_delay: 0,
+        ..Default::default()
+    });
+    establish_connection(&mut caller, &mut listener).expect("connected");
+
+    let now = ts(1_000_000);
+    caller.send(b"retransmit me", now).expect("send");
+    let first = drain_data_datagrams(&mut caller);
+    let (sequence, _, _, _) = first[0].clone();
+
+    // One counter value short of the pre-announcement threshold: a single
+    // further first transmission must request a new SEK, a retransmission
+    // must not.
+    caller
+        .seed_encrypted_packet_count_for_test(
+            CryptoContext::KM_REFRESH_PERIOD - CryptoContext::KM_PRE_ANNOUNCE_PERIOD - 1,
+        )
+        .expect("seed below the pre-announcement threshold");
+
+    caller
+        .feed_recv_buf(&single_loss_nak(caller.socket_id(), sequence), now)
+        .expect("the loss report is accepted");
+    let retransmission = drain_data_datagrams(&mut caller);
+    assert_eq!(retransmission.len(), 1);
+    assert!(retransmission[0].2, "a retransmission went out");
+    assert!(
+        !std::iter::from_fn(|| caller.poll_event())
+            .any(|event| matches!(event, ConnectionEvent::KeyRefreshNeeded { .. })),
+        "a retransmission must not consume a first-transmission counter value"
+    );
+
+    // Positive control: a real first transmission at the same counter does
+    // request the new SEK.
+    caller.send(b"new data", ts(1_010_000)).expect("send");
+    assert!(
+        std::iter::from_fn(|| caller.poll_event())
+            .any(|event| matches!(event, ConnectionEvent::KeyRefreshNeeded { .. })),
+        "a first transmission at the threshold must still request a new SEK"
+    );
+}
 
 /// V01: a real on-wire key rotation between two connected peers -- not just
 /// `CryptoContext`'s own internal state machine (already covered by

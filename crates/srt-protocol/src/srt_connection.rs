@@ -20,7 +20,7 @@ use crate::srt_handshake::{
 };
 use crate::srt_packet::{
     ControlPacket, ControlType, DataHeader, DataPacket, DatagramClass, PendingData,
-    PendingDatagram, SRT_CMD_KMREQ, SRT_CMD_KMRSP, SRT_HEADER_SIZE, SrtPacket,
+    PendingDatagram, SRT_CMD_KMREQ, SRT_CMD_KMRSP, SRT_HEADER_SIZE, SrtPacket, sequence_less_than,
 };
 use crate::srt_receiver::{LossRange, ReceiverBuffer};
 use crate::srt_sender::SenderBuffer;
@@ -588,6 +588,13 @@ pub struct SrtConnection {
     /// can never outlive its cipher schedule.
     pending_tx_even: u64,
     pending_tx_odd: u64,
+    /// Whether the application has reopened a zero advertised receive
+    /// window and the peer has not been told yet. Cleared when a Small/Full
+    /// ACK actually carries the new window.
+    receive_window_reopen_pending: bool,
+    /// Whether the peer closed its send half and this connection is still
+    /// delivering what it had already accepted. Terminal on drain.
+    peer_shutdown_pending: bool,
     output_overflowed: bool,
     event_overflowed: bool,
 
@@ -613,6 +620,14 @@ pub struct SrtConnection {
     peer_congestion_control: Option<String>,
     /// SRT capability flags advertised by the peer's handshake extension.
     peer_srt_flags: Option<u32>,
+    /// The peer's advertised SRT flow window (its receive capacity, in
+    /// packets); zero means it advertised nothing usable.
+    ///
+    /// This is the peer's `SRT_FLOW_WINDOW`/flight-flag size from the
+    /// handshake. libsrt starts its own send window from exactly this value
+    /// (`m_iFlowWindowSize = m_ConnRes.m_iFlightFlagSize`), so the
+    /// "negotiated" bound is the smaller of the two peers' declarations.
+    peer_flow_window: u32,
     /// Peer bonding group metadata.
     peer_group_extension: Option<GroupExtensionData>,
     last_handshake_packet: Option<ControlPacket>,
@@ -818,7 +833,18 @@ impl SrtConnection {
         }
     }
 
-    fn queue_data_packet(
+    /// Queue a packet's first transmission.
+    ///
+    /// The crypto reservation is taken here and recorded on the retained
+    /// packet, because a retransmission must reproduce this packet's
+    /// protected bytes: same key generation, same sequence-derived counter,
+    /// therefore the same ciphertext and tag. This is the reference
+    /// behaviour (libsrt stores the first transmission's key-flag bits with
+    /// the send-buffer block and re-reads the already-encrypted payload;
+    /// Robotweax keeps the protected packet selected on first send), and it
+    /// is also what stops a retransmission from consuming a second
+    /// first-transmission counter value.
+    fn queue_first_transmission(
         &mut self,
         header: DataHeader,
         payload: Bytes,
@@ -830,6 +856,49 @@ impl SrtConnection {
         } else {
             None
         };
+        if let Some(ref mut sender) = self.sender {
+            sender.note_data_stamp(header.sequence_number, crypto);
+        }
+        self.enqueue_data_datagram(header, payload, crypto, source_due_micros, now)
+    }
+
+    /// Queue a retransmission of an already-transmitted packet.
+    ///
+    /// The stamp is the one retained from the first transmission, so the
+    /// retransmission re-encrypts nothing new: `encrypt_with_stamp`/
+    /// `encrypt_gcm_with_stamp` reproduce the original bytes without
+    /// advancing the logical TX counter.
+    fn queue_retransmission(
+        &mut self,
+        header: DataHeader,
+        payload: Bytes,
+        now: Timestamp,
+    ) -> Result<(), Error> {
+        let crypto = self
+            .sender
+            .as_ref()
+            .and_then(|sender| sender.data_stamp(header.sequence_number));
+        if self.crypto.is_some() && crypto.is_none() {
+            // Retention and the stamp are recorded together, so this cannot
+            // happen; a retransmission without one would go out in the clear
+            // on an encrypted connection, which is worse than losing it.
+            return Err(Error::invalid_state(
+                "retransmission has no retained crypto stamp",
+            ));
+        }
+        // A retransmission has no source deadline: it is due the moment the
+        // sender learns it is needed.
+        self.enqueue_data_datagram(header, payload, crypto, None, now)
+    }
+
+    fn enqueue_data_datagram(
+        &mut self,
+        header: DataHeader,
+        payload: Bytes,
+        crypto: Option<crate::crypto_impl::TxCryptoStamp>,
+        source_due_micros: Option<u64>,
+        now: Timestamp,
+    ) -> Result<(), Error> {
         self.last_send_time = Some(now);
         self.queue_output(QueuedOutput::Datagram(PendingDatagram::Data(
             PendingData::new(header, payload, crypto, source_due_micros),
@@ -943,6 +1012,8 @@ impl SrtConnection {
             output_queue_priority: 0,
             pending_tx_even: 0,
             pending_tx_odd: 0,
+            receive_window_reopen_pending: false,
+            peer_shutdown_pending: false,
             output_overflowed: false,
             event_overflowed: false,
             start_time: None,
@@ -955,6 +1026,7 @@ impl SrtConnection {
             peer_stream_id: None,
             peer_congestion_control: None,
             peer_srt_flags: None,
+            peer_flow_window: 0,
             peer_group_extension: None,
             last_handshake_packet: None,
             handshake_retry_sequence: 0,
@@ -990,6 +1062,8 @@ impl SrtConnection {
             output_queue_priority: 0,
             pending_tx_even: 0,
             pending_tx_odd: 0,
+            receive_window_reopen_pending: false,
+            peer_shutdown_pending: false,
             output_overflowed: false,
             event_overflowed: false,
             start_time: None,
@@ -1002,6 +1076,7 @@ impl SrtConnection {
             peer_stream_id: None,
             peer_congestion_control: None,
             peer_srt_flags: None,
+            peer_flow_window: 0,
             peer_group_extension: None,
             last_handshake_packet: None,
             handshake_retry_sequence: 0,
@@ -1275,13 +1350,41 @@ impl SrtConnection {
         self.check_output_queue()
     }
 
+    /// The handshake-negotiated static flow window: this sender's own
+    /// configured window capped by the peer's advertised receive capacity.
+    ///
+    /// The two are separate quantities on purpose (libsrt keeps them apart
+    /// the same way): our own value bounds the memory and retransmit span we
+    /// commit to, and the peer's value bounds what the peer can actually
+    /// accept before its receive buffer fills.
+    fn negotiated_flow_window(&self) -> u32 {
+        if self.peer_flow_window >= 2 {
+            self.options.flow_window_packets.min(self.peer_flow_window)
+        } else {
+            self.options.flow_window_packets
+        }
+    }
+
+    /// Record the peer's advertised SRT flow window.
+    ///
+    /// Values below two are not a usable window (libsrt validates the same
+    /// range and Robotweax rejects them), so they are treated as "not
+    /// advertised" rather than throttling this sender to a single packet in
+    /// flight.
+    fn note_peer_flow_window(&mut self, advertised: u32) {
+        if advertised >= 2 {
+            self.peer_flow_window = advertised;
+        }
+    }
+
     /// Initialize the send/receive buffers. Demand starts false: static
     /// `pacing_repay` only enables repay, the app must still signal waiting
     /// data via `set_pacing_demand`.
     fn init_buffers(&mut self, now: Timestamp, peer_initial_seq: u32, tsbpd_time_base: u64) {
+        let negotiated_window = self.negotiated_flow_window();
         let mut sender = SenderBuffer::new(
             self.initial_seq,
-            self.options.flow_window_packets,
+            negotiated_window,
             self.options.tsbpd_delay,
         );
         if let Some(max_bw) = self.options.max_bandwidth_bytes_per_sec {
@@ -1346,13 +1449,8 @@ impl SrtConnection {
             )));
         }
 
-        // Only a valid packet for this connection proves peer activity.
         // The inactivity timer is armed once at connect and rearms itself on
         // fire — no per-packet SetTimer output.
-        if self.state == ConnectionState::Connected {
-            self.last_recv_time = Some(now);
-        }
-
         let result = match packet {
             SrtPacket::Data(data_pkt) => {
                 tracing::debug!("received DATA packet, seq={}", data_pkt.sequence_number);
@@ -1361,6 +1459,18 @@ impl SrtConnection {
             SrtPacket::Control(ctrl_pkt) => self.handle_control_packet(ctrl_pkt, now),
         };
         result?;
+
+        // Only an accepted protocol transition proves peer activity. Generic
+        // framing plus a matching destination socket id is not enough: a
+        // datagram that decodes but fails its own semantic or authentication
+        // validation (a truncated ACK, an unknown ACKACK, an undecryptable
+        // DATA body, a malformed key-management command) is rejected above
+        // and must not keep an otherwise silent peer alive. Robotweax 0.2.2
+        // hardens the same invariant and libsrt's own control parsers reject
+        // before touching connection state.
+        if self.state == ConnectionState::Connected {
+            self.last_recv_time = Some(now);
+        }
         self.check_output_queue()
     }
 
@@ -1413,7 +1523,7 @@ impl SrtConnection {
             let seq = header.sequence_number;
             // A retransmission has no source deadline: it is due the moment the
             // sender learns it is needed, so it contributes no lateness sample.
-            match self.queue_data_packet(header, payload, None, now) {
+            match self.queue_retransmission(header, payload, now) {
                 Ok(()) => {}
                 Err(_) => {
                     dropped += 1;
@@ -1604,24 +1714,7 @@ impl SrtConnection {
                     self.handle_sender_rto_timeout(now);
                 }
             }
-            TimerId::Inactivity => {
-                if self.state == ConnectionState::Connected {
-                    let elapsed = self.last_recv_time.map_or(INACTIVITY_TIMEOUT_MICROS, |t| {
-                        now.as_micros().saturating_sub(t.as_micros())
-                    });
-                    if elapsed >= INACTIVITY_TIMEOUT_MICROS {
-                        self.queue_event(ConnectionEvent::Disconnected {
-                            reason: DisconnectReason::InactivityTimeout,
-                        });
-                        self.set_state(ConnectionState::Disconnected);
-                    } else {
-                        self.queue_output(QueuedOutput::SetTimer {
-                            id: TimerId::Inactivity,
-                            duration_micros: INACTIVITY_TIMEOUT_MICROS - elapsed,
-                        });
-                    }
-                }
-            }
+            TimerId::Inactivity => self.handle_inactivity_timer(now),
             TimerId::Shutdown => self.handle_shutdown_timer(now),
         }
         self.check_output_queue()
@@ -1667,11 +1760,25 @@ impl SrtConnection {
                 }
             }
         }
+        if self.tlpktdrop_enabled()
+            && let Some(receiver) = self.receiver.as_ref()
+        {
+            // TLPKTDROP moves the receive frontier past positions that can
+            // never arrive, so a message whose first fragment is now behind
+            // that frontier can never be completed either: retire it instead
+            // of holding the connection open on it.
+            let expected = receiver.expected_sequence();
+            self.assembler.discard_before(expected);
+        }
         self.enqueue_ready_data(now);
-        let emit_ack = self
-            .receiver
-            .as_ref()
-            .is_none_or(|receiver| receiver.should_emit_timer_ack(now));
+        // A pending peer close advances on delivery: the tick is what makes
+        // TSBPD deadlines pass.
+        self.finish_peer_shutdown_if_drained();
+        let emit_ack = self.receive_window_reopen_pending
+            || self
+                .receiver
+                .as_ref()
+                .is_none_or(|receiver| receiver.should_emit_timer_ack(now));
         if emit_ack {
             self.send_ack(now);
         }
@@ -1703,6 +1810,39 @@ impl SrtConnection {
                 id: TimerId::Nak,
                 duration_micros: interval,
             });
+        }
+    }
+
+    /// Handle the inactivity deadline.
+    ///
+    /// Also the bound on a peer-initiated close that has not drained: the peer
+    /// is gone, so a buffered tail that still has not become deliverable by
+    /// then (an incomplete message, say) is given up rather than keeping the
+    /// connection open forever. The terminal reason is still the peer's close.
+    fn handle_inactivity_timer(&mut self, now: Timestamp) {
+        if self.state != ConnectionState::Connected {
+            return;
+        }
+        let elapsed = self.last_recv_time.map_or(INACTIVITY_TIMEOUT_MICROS, |t| {
+            now.as_micros().saturating_sub(t.as_micros())
+        });
+        if elapsed < INACTIVITY_TIMEOUT_MICROS {
+            self.queue_output(QueuedOutput::SetTimer {
+                id: TimerId::Inactivity,
+                duration_micros: INACTIVITY_TIMEOUT_MICROS - elapsed,
+            });
+            return;
+        }
+        if !self.peer_shutdown_pending {
+            self.queue_event(ConnectionEvent::Disconnected {
+                reason: DisconnectReason::InactivityTimeout,
+            });
+            self.set_state(ConnectionState::Disconnected);
+            return;
+        }
+        self.finish_peer_shutdown_if_drained();
+        if self.peer_shutdown_pending {
+            self.finish_local_close(DisconnectReason::PeerShutdown);
         }
     }
 
@@ -1794,7 +1934,7 @@ impl SrtConnection {
         // this message carries the same source deadline.
         let source_due = Some(now.as_micros());
         for (header, payload) in packets {
-            self.queue_data_packet(header, payload, source_due, now)?;
+            self.queue_first_transmission(header, payload, source_due, now)?;
         }
 
         if let Some(ref mut sender) = self.sender {
@@ -1846,7 +1986,7 @@ impl SrtConnection {
             // The source's own declared deadline for this payload, carried to
             // the submission boundary so a transport can measure how late the
             // payload reached the wire relative to the media schedule.
-            self.queue_data_packet(header, payload, Some(now.as_micros()), now)?;
+            self.queue_first_transmission(header, payload, Some(now.as_micros()), now)?;
             if let Some(ref mut sender) = self.sender {
                 sender.record_send_time(now);
             }
@@ -1929,7 +2069,7 @@ impl SrtConnection {
                 "internal invariant violated: push_shared rejected an already-validated send",
             ));
         };
-        self.queue_data_packet(header, payload, Some(now.as_micros()), now)?;
+        self.queue_first_transmission(header, payload, Some(now.as_micros()), now)?;
         if let Some(ref mut sender) = self.sender {
             sender.record_send_time(now);
         }
@@ -2092,6 +2232,9 @@ impl SrtConnection {
                 self.release_data_reservation(*packet_count);
             }
         }
+        // The application draining the last queued payload can be the event
+        // that completes a pending peer close.
+        self.finish_peer_shutdown_if_drained();
         Some(event)
     }
 
@@ -2099,6 +2242,37 @@ impl SrtConnection {
         debug_assert!(packet_count <= self.pending_data_packets);
         self.pending_data_packets = self.pending_data_packets.saturating_sub(packet_count);
         self.sync_application_backlog();
+        self.note_receive_window_reopened();
+    }
+
+    /// Schedule an immediate Full ACK when application delivery reopens a
+    /// receive window this connection had advertised as zero.
+    ///
+    /// Without this, the peer stays stopped until the next ACK tick even
+    /// though the connection now has room, and nothing in the protocol
+    /// requires more DATA from the peer to re-advertise it: the application
+    /// freeing its own buffer is the event. The flag is what coalesces a
+    /// burst of application releases into one urgent advertisement instead
+    /// of one deadline per event.
+    fn note_receive_window_reopened(&mut self) {
+        if self.receive_window_reopen_pending {
+            return;
+        }
+        if !self
+            .receiver
+            .as_ref()
+            .is_some_and(ReceiverBuffer::receive_window_reopened)
+        {
+            return;
+        }
+        self.receive_window_reopen_pending = true;
+        // A zero-duration Ack deadline is the existing bounded way to say
+        // "now"; the transport's timer store keeps one deadline per id, so
+        // even a dropped duplicate collapses to the same instant.
+        self.queue_priority_output(QueuedOutput::SetTimer {
+            id: TimerId::Ack,
+            duration_micros: 0,
+        });
     }
 
     /// Inspect the next pending output without consuming it or modifying connection state.
@@ -2403,6 +2577,14 @@ impl SrtConnection {
     }
 
     fn handle_data_packet(&mut self, mut pkt: DataPacket, now: Timestamp) -> Result<(), Error> {
+        if self.peer_shutdown_pending {
+            // The peer closed its send half: no further DATA is part of this
+            // connection's protocol progress. It is rejected rather than
+            // ignored, so it cannot bank itself as peer activity either.
+            return Err(Error::invalid_state(
+                "DATA received after the peer closed its send half",
+            ));
+        }
         if self.state == ConnectionState::Closing {
             self.finish_local_close(DisconnectReason::PeerActivityAfterShutdown);
             return Ok(());
@@ -2506,6 +2688,7 @@ impl SrtConnection {
             self.finish_local_close(DisconnectReason::PeerActivityAfterShutdown);
             return Ok(());
         }
+        validate_control_information(&pkt)?;
         match pkt.control_type {
             ControlType::Handshake => self.handle_handshake(pkt, now),
             ControlType::Keepalive => Ok(()), // キープアライブは特に処理不要
@@ -2637,6 +2820,7 @@ impl SrtConnection {
         self.peer_socket_id = hs.socket_id;
         self.peer_group_extension = hs.get_group_extension();
         self.peer_congestion_control = hs.get_congestion_extension();
+        self.note_peer_flow_window(hs.flow_window);
         self.apply_peer_handshake_extension(&hs);
 
         tracing::debug!(
@@ -2713,6 +2897,7 @@ impl SrtConnection {
         }
         self.peer_socket_id = hs.socket_id;
         self.syn_cookie = self.options.syn_cookie.unwrap_or(0);
+        self.note_peer_flow_window(hs.flow_window);
         if self.handshake_started_at.is_none() {
             self.handshake_started_at = Some(now);
             self.handshake_retry_sequence = 0;
@@ -2831,8 +3016,11 @@ impl SrtConnection {
     }
 
     fn handle_ack(&mut self, pkt: ControlPacket, now: Timestamp) -> Result<(), Error> {
+        // Shape is validated before dispatch (see
+        // `validate_control_information`); this is the last line of defence
+        // for the direct callers of this method.
         if pkt.control_info.len() < 4 {
-            return Ok(()); // 不正な ACK
+            return Err(Error::invalid_data("ACK control info is too short"));
         }
 
         let mut buf = pkt.control_info.as_slice();
@@ -2847,13 +3035,34 @@ impl SrtConnection {
 
         // 送信バッファから ACK されたパケットを削除
         let mut ack_progressed = false;
+        let mut ack_is_current = false;
         if let Some(ref mut sender) = self.sender {
             let before = sender.packets_in_buffer();
             let oldest_before = sender.oldest_unacked_sequence();
             sender.handle_ack(ack_seq);
             ack_progressed = sender.oldest_unacked_sequence() != oldest_before;
+            // A stale or duplicate ACK carries an old cumulative position.
+            // It must not move the advertised receive window: doing so would
+            // reopen a window the peer has already closed (libsrt keeps this
+            // behind `CSeqNo::seqcmp(ackdata_seqno, m_iSndLastAck) >= 0`).
+            ack_is_current = !sequence_less_than(ack_seq, oldest_before);
             let after = sender.packets_in_buffer();
             tracing::debug!("sender buffer: {} -> {} packets", before, after);
+        }
+
+        // Small and Full ACKs carry the receiver's free receive-buffer size
+        // at CIF offset 12; a Light ACK's 4-byte CIF carries only `ack_seq`
+        // and therefore cannot reopen the window. Applying it only when the
+        // ACK is current is what stops the stale-credit overrun: the window
+        // is an absolute boundary (`ack_seq + free`), so the flight this ACK
+        // acknowledges consumes credit rather than restoring it.
+        if pkt.control_info.len() >= 16
+            && ack_is_current
+            && let Some(sender) = self.sender.as_mut()
+        {
+            let mut window_feedback = &pkt.control_info[12..];
+            let available_buffer_packets = crate::buf::read_u32(&mut window_feedback)?;
+            sender.set_peer_window(ack_seq, available_buffer_packets);
         }
 
         // A full ACK carries receiver-side instantaneous measurements. Keep
@@ -2875,19 +3084,6 @@ impl SrtConnection {
                     receiving_rate_packets_per_second,
                     link_capacity_packets_per_second,
                     receiving_rate_bytes_per_second,
-                );
-                // Receive-window flow control: cap in-flight packets at the
-                // peer's currently-advertised free buffer capacity, so a
-                // filling receive buffer actually throttles the sender
-                // instead of only being visible via telemetry. Clamped to
-                // the handshake-negotiated flow window rather than applied
-                // directly, so a buggy or adversarial peer advertising an
-                // inflated available_buffer can only ever shrink the
-                // sender's effective window, never grow it past what was
-                // already negotiated. (found via upstream shiguredo/srt-rs
-                // issue 0075, not yet in the pulled subtree)
-                sender.set_flow_window(
-                    available_buffer_packets.min(self.options.flow_window_packets),
                 );
             }
         }
@@ -2917,13 +3113,19 @@ impl SrtConnection {
     }
 
     fn handle_nak(&mut self, pkt: ControlPacket, now: Timestamp) -> Result<(), Error> {
-        let loss_ranges = parse_loss_ranges(
-            &pkt.control_info,
-            usize::try_from(self.flight_capacity_packets()).unwrap_or(usize::MAX),
-        )?;
+        let loss_ranges = parse_loss_ranges(&pkt.control_info)?;
 
-        if let Some(ref mut sender) = self.sender {
-            sender.handle_nak_ranges(&loss_ranges);
+        // The whole report is validated before any of it is applied; see
+        // `SenderBuffer::handle_nak_ranges`. A position inside a message this
+        // sender already gave up as too late is answered with the same
+        // DROPREQ again -- the peer either lost the first one or still holds
+        // the range -- and never with a retransmission of released media.
+        let dropped = match self.sender.as_mut() {
+            Some(sender) => sender.handle_nak_ranges(&loss_ranges),
+            None => Vec::new(),
+        };
+        for msg in &dropped {
+            self.send_drop_req(msg.message_number, msg.first_seq, msg.last_seq, now);
         }
 
         // 即座に再送処理
@@ -2935,37 +3137,84 @@ impl SrtConnection {
     fn handle_ackack(&mut self, pkt: ControlPacket, now: Timestamp) -> Result<(), Error> {
         let ack_number = pkt.type_specific_info;
 
-        // RTT を更新 (ACK 送信時刻はReceiverBuffer内で管理)
-        if let Some(ref mut receiver) = self.receiver {
-            receiver.handle_ackack(ack_number, pkt.timestamp, now);
+        // An ACKACK is the peer confirming receipt of a Full ACK this
+        // connection sent and has not yet retired: the ACK number is its
+        // whole meaning. A number we never sent (or already retired) is not
+        // a protocol transition, and must not be banked as peer activity.
+        let receiver = self
+            .receiver
+            .as_mut()
+            .ok_or_else(|| Error::invalid_state("ACKACK before the connection has a receiver"))?;
+        if !receiver.ack_number_was_sent(ack_number) {
+            return Err(Error::invalid_data(format!(
+                "ACKACK names ACK number {ack_number}, which was never sent"
+            )));
         }
+
+        // RTT を更新 (ACK 送信時刻はReceiverBuffer内で管理)
+        receiver.handle_ackack(ack_number, pkt.timestamp, now);
 
         Ok(())
     }
 
+    /// Handle a peer SHUTDOWN.
+    ///
+    /// A peer SHUTDOWN closes the peer's *send* half, not this connection's
+    /// receive path: data already accepted keeps its TSBPD deadline and is
+    /// delivered normally. The terminal event is deferred until the
+    /// receiver, the reassembler, and the application queue are all drained,
+    /// so an event-driven consumer cannot truncate a stream tail. This is
+    /// what Robotweax 0.2.1 fixed ("Deferred peer-shutdown epoll errors until
+    /// TSBPD-buffered input is drained") and what its
+    /// `compat_runtime_drains_tsbpd_message_after_peer_shutdown` pins.
     fn handle_shutdown(&mut self, now: Timestamp) -> Result<(), Error> {
-        // A peer may retransmit SHUTDOWN after it has already been
-        // acknowledged. Once terminal, ignore duplicates so an application
-        // that is not polling events cannot accumulate one Disconnected
-        // event per retransmission forever.
-        if self.state == ConnectionState::Disconnected {
+        // A peer may retransmit SHUTDOWN until it sees this side's answer.
+        // Once terminal-pending, every duplicate is ignored: it must not
+        // restart the drain, and it must not emit a second terminal event.
+        if self.peer_shutdown_pending || self.state == ConnectionState::Disconnected {
             return Ok(());
         }
-        // Flush the receive buffer before disconnecting (ignore TSBPD, deliver immediately).
-        if let Some(receiver) = self.receiver.as_mut() {
-            receiver.set_tsbpd_enabled(false);
+        if self.state == ConnectionState::Closing {
+            // This side already started its own close, which released the
+            // receive path itself; the peer's SHUTDOWN merely confirms it.
+            self.finish_local_close(DisconnectReason::PeerShutdown);
+            return Ok(());
         }
-        self.enqueue_ready_data(now);
 
+        self.peer_shutdown_pending = true;
         self.shutdown_started_at = None;
         self.queue_output(QueuedOutput::ClearTimer {
             id: TimerId::Shutdown,
         });
-        self.set_state(ConnectionState::Disconnected);
-        self.queue_event(ConnectionEvent::Disconnected {
-            reason: DisconnectReason::PeerShutdown,
-        });
+        self.enqueue_ready_data(now);
+        self.finish_peer_shutdown_if_drained();
         Ok(())
+    }
+
+    /// Emit the terminal `PeerShutdown` event once a pending peer close has
+    /// nothing left to deliver.
+    ///
+    /// "Drained" is the receiver holding no deliverable data, the assembler
+    /// holding no partial message, and no `DataReceived` event still queued
+    /// for the application. A message whose fragments can never be completed
+    /// (the peer is gone) does not keep the connection open forever: the
+    /// inactivity timer bounds the drain, and TLPKTDROP retires expired
+    /// positions the ordinary way.
+    fn finish_peer_shutdown_if_drained(&mut self) {
+        if !self.peer_shutdown_pending || self.state == ConnectionState::Disconnected {
+            return;
+        }
+        let receiver_drained = self
+            .receiver
+            .as_ref()
+            .is_none_or(ReceiverBuffer::is_delivery_drained);
+        if !receiver_drained
+            || self.pending_data_events != 0
+            || self.assembler.pending_packet_count() != 0
+        {
+            return;
+        }
+        self.finish_local_close(DisconnectReason::PeerShutdown);
     }
 
     fn finish_local_close(&mut self, reason: DisconnectReason) {
@@ -2981,16 +3230,17 @@ impl SrtConnection {
         const SEQUENCE_MASK: u32 = 0x7FFF_FFFF;
 
         let message_number = pkt.type_specific_info & 0x03FF_FFFF;
-        if pkt.control_info.len() < 8 {
-            return Err(Error::invalid_data("DROPREQ CIF too short"));
-        }
+        // The shape (exactly two 31-bit sequence words) is checked before
+        // dispatch; the sequence values themselves are validated before any
+        // state changes, so a rejected DROPREQ leaves the receiver untouched.
         let mut buf = &pkt.control_info[..];
         let first_seq = read_u32(&mut buf)?;
         let last_seq = read_u32(&mut buf)?;
+        if first_seq & !SEQUENCE_MASK != 0 || last_seq & !SEQUENCE_MASK != 0 {
+            return Err(Error::invalid_data("DROPREQ sequence has high bit set"));
+        }
         if let Some(receiver) = self.receiver.as_mut() {
             receiver.drop_range(first_seq, last_seq)?;
-        } else if first_seq & !SEQUENCE_MASK != 0 || last_seq & !SEQUENCE_MASK != 0 {
-            return Err(Error::invalid_data("DROPREQ sequence has high bit set"));
         }
         self.assembler.drop_message(message_number);
         self.enqueue_ready_data(now);
@@ -3038,9 +3288,13 @@ impl SrtConnection {
                 }
             }
             SRT_CMD_KMRSP => {
-                // Received a KM Refresh response (sender side).
-                // A successful receipt means the peer accepted the new key.
-                // No further action needed here (the key switch happens on the sender's own timing).
+                // Received a KM Refresh response (sender side). A successful
+                // receipt means the peer accepted the new key. No further
+                // action needed here (the key switch happens on the sender's
+                // own timing). The response is still decoded first: a
+                // malformed key-management body is a rejection, not peer
+                // activity, whether or not this side acts on its contents.
+                let _ = KmMessage::decode(&pkt.control_info)?;
             }
             _ => {
                 // Ignore unknown UserDefined packets.
@@ -3076,9 +3330,22 @@ impl SrtConnection {
             // datagram stamped with its key flag.
             let should_decommission = crypto.should_decommission_old_key();
             let old_flag = crypto.current_key().other();
+            let (retained_even, retained_odd) = self
+                .sender
+                .as_ref()
+                .map_or((0, 0), crate::srt_sender::SenderBuffer::retained_stamps);
+            // Two independent dependencies on the old generation: datagrams
+            // already reserved but not yet materialized, and packets still
+            // retained here because the peer has not acknowledged them. A
+            // retransmission of a retained packet has to reproduce its
+            // original key generation, so retiring it now would make that
+            // impossible (Robotweax delays key retirement the same way, and
+            // libsrt keeps the block's key flag with the block).
             let outstanding = match old_flag {
-                KeyFlag::Even => self.pending_tx_even,
-                KeyFlag::Odd => self.pending_tx_odd,
+                KeyFlag::Even => self
+                    .pending_tx_even
+                    .saturating_add(u64::from(retained_even)),
+                KeyFlag::Odd => self.pending_tx_odd.saturating_add(u64::from(retained_odd)),
             };
             if should_decommission && outstanding == 0 {
                 crypto.decommission_old_key();
@@ -3171,15 +3438,26 @@ impl SrtConnection {
 
     /// Send an ACK packet.
     fn send_ack(&mut self, now: Timestamp) {
+        let force_full = self.receive_window_reopen_pending;
         let receiver = match self.receiver.as_mut() {
             Some(r) => r,
             None => return,
         };
 
-        let ack_info = receiver.generate_ack(now);
+        let ack_info = if force_full {
+            receiver.generate_full_ack(now)
+        } else {
+            receiver.generate_ack(now)
+        };
         let ack_number = receiver.ack_number();
         receiver.record_ack_sent();
         self.last_ack_time = Some(now);
+        // The reopened window is only actually advertised by a Small/Full
+        // ACK; a Light ACK that slipped in first leaves the flag set so the
+        // next tick sends the full one.
+        if !ack_info.is_light {
+            self.receive_window_reopen_pending = false;
+        }
 
         let mut control_info = Vec::with_capacity(8);
         write_u32(&mut control_info, ack_info.ack_seq);
@@ -3582,11 +3860,72 @@ impl SrtConnection {
     }
 }
 
+/// The five SRT control types whose control-information field is a single
+/// zero word, because the whole packet is carried in its header.
+const NO_ARGUMENT_CONTROLS: [ControlType; 5] = [
+    ControlType::AckAck,
+    ControlType::Keepalive,
+    ControlType::CongestionWarning,
+    ControlType::Shutdown,
+    ControlType::PeerError,
+];
+
+/// Validate a received control packet's control-information field before it
+/// is allowed to touch connection state.
+///
+/// The control-information field is a sequence of 32-bit words
+/// (`draft-sharabayko-srt`, control packet layout), so a payload that is not
+/// word-aligned is malformed. libsrt encodes every no-argument control with
+/// exactly one zero word (`CPacket::pack`'s `m_extra_pad`) and always gives
+/// DROPREQ two sequence words, so `srt-rs` accepts exactly those canonical
+/// shapes and rejects everything else: a malformed control is a rejection,
+/// never "valid peer activity that was ignored".
+///
+/// An *empty* no-argument payload is accepted as well as the four zero bytes
+/// it canonically carries. Robotweax 0.2.2 rejects the empty form outright,
+/// but the pinned Haivision decoder imposes no size rule for these types and
+/// the draft specifies their data field as empty, so rejecting it would trade
+/// interoperability for nothing: an empty no-argument control cannot carry
+/// anything, hostile or otherwise.
+fn validate_control_information(pkt: &ControlPacket) -> Result<(), Error> {
+    let len = pkt.control_info.len();
+    if !len.is_multiple_of(4) {
+        return Err(Error::invalid_data(format!(
+            "control information field is not 32-bit aligned: {len} bytes"
+        )));
+    }
+    if NO_ARGUMENT_CONTROLS.contains(&pkt.control_type) {
+        let canonical = len == 4 && pkt.control_info.iter().all(|&byte| byte == 0);
+        if len != 0 && !canonical {
+            return Err(Error::invalid_data(format!(
+                "{:?} control must carry no argument, got {len} bytes",
+                pkt.control_type
+            )));
+        }
+        return Ok(());
+    }
+    if len == 0 {
+        return Err(Error::invalid_data(format!(
+            "{:?} control has an empty information field",
+            pkt.control_type
+        )));
+    }
+    match pkt.control_type {
+        // A Light ACK is exactly the cumulative position.
+        ControlType::Ack if len < 4 => Err(Error::invalid_data("ACK control info is too short")),
+        // A DROPREQ is exactly the two 31-bit sequence words it names.
+        ControlType::DropReq if len != 8 => Err(Error::invalid_data(format!(
+            "DROPREQ control info must be 8 bytes, got {len}"
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// Parse a loss list (from a NAK packet's control_info).
 #[cfg(test)]
-fn parse_loss_list(data: &[u8], max_entries: usize) -> Result<Vec<u32>, Error> {
-    let ranges = parse_loss_ranges(data, max_entries)?;
-    let mut result = Vec::with_capacity(max_entries.min(ranges.len()));
+fn parse_loss_list(data: &[u8], _max_entries: usize) -> Result<Vec<u32>, Error> {
+    let ranges = parse_loss_ranges(data)?;
+    let mut result = Vec::with_capacity(ranges.len());
     for range in ranges {
         let mut sequence = range.first_seq;
         loop {
@@ -3600,17 +3939,25 @@ fn parse_loss_list(data: &[u8], max_entries: usize) -> Result<Vec<u32>, Error> {
     Ok(result)
 }
 
-fn parse_loss_ranges(data: &[u8], max_entries: usize) -> Result<Vec<LossRange>, Error> {
+/// Parse a NAK's compact loss list into bounded ranges.
+///
+/// No truncation and no expansion happen here: a range is returned as a
+/// range, so a report that names more positions than the connection can
+/// possibly hold is still a *complete* report by the time the sender
+/// validates it. Clamping it to whatever fits would let a valid prefix carry
+/// an impossible tail past validation.
+fn parse_loss_ranges(data: &[u8]) -> Result<Vec<LossRange>, Error> {
     if !data.len().is_multiple_of(4) {
         return Err(Error::invalid_data(
             "NAK loss list length is not a multiple of four",
         ));
     }
-    let mut result = Vec::with_capacity((data.len() / 4).min(max_entries));
+    // At most one range per four-byte word, so the datagram size bounds the
+    // allocation; the *span* a range may name is the sender's business.
+    let mut result = Vec::with_capacity(data.len() / 4);
     let mut slice = data;
-    let mut remaining = max_entries;
 
-    while !slice.is_empty() && remaining != 0 {
+    while !slice.is_empty() {
         let word = crate::buf::read_u32(&mut slice)?;
         if word & 0x8000_0000 != 0 {
             if slice.len() < 4 {
@@ -3618,19 +3965,15 @@ fn parse_loss_ranges(data: &[u8], max_entries: usize) -> Result<Vec<LossRange>, 
             }
             let start = word & 0x7FFF_FFFF;
             let end = crate::buf::read_u32(&mut slice)? & 0x7FFF_FFFF;
-            let positions = (end.wrapping_sub(start) & 0x7FFF_FFFF) as usize + 1;
-            let retained = positions.min(remaining);
             result.push(LossRange {
                 first_seq: start,
-                last_seq: start.wrapping_add(retained as u32 - 1) & 0x7FFF_FFFF,
+                last_seq: end,
             });
-            remaining -= retained;
         } else {
             result.push(LossRange {
                 first_seq: word,
                 last_seq: word,
             });
-            remaining -= 1;
         }
     }
 
@@ -5410,6 +5753,980 @@ mod tests {
         );
     }
 
+    /// Raw ACK datagram with an explicit control-information field.
+    ///
+    /// `Some(available)` builds a 28-byte Full ACK carrying the receiver's
+    /// free receive-buffer size; `None` builds the 4-byte Light ACK, which
+    /// carries the cumulative position and nothing else.
+    fn ack_datagram(dest_socket_id: u32, ack_seq: u32, available: Option<u32>) -> Vec<u8> {
+        let mut control_info = Vec::new();
+        write_u32(&mut control_info, ack_seq);
+        let ack_number = match available {
+            Some(available) => {
+                write_u32(&mut control_info, 1_000); // RTT
+                write_u32(&mut control_info, 100); // RTTVar
+                write_u32(&mut control_info, available); // free receive buffer
+                write_u32(&mut control_info, 0); // receiving rate
+                write_u32(&mut control_info, 0); // link capacity
+                write_u32(&mut control_info, 0); // receive rate
+                1
+            }
+            None => 0,
+        };
+        let packet = ControlPacket {
+            control_type: ControlType::Ack,
+            subtype: 0,
+            type_specific_info: ack_number,
+            timestamp: 0,
+            dest_socket_id,
+            control_info,
+        };
+        let mut buf = Vec::new();
+        packet.encode(&mut buf).expect("ACK encodes");
+        buf
+    }
+
+    /// The mandated merge condition, end to end over the wire-format ACK
+    /// path: a Light ACK must not overrun stale receive-window credit, and a
+    /// stale Full ACK must not reopen a window the peer has closed.
+    ///
+    /// Numbers follow the reference policy (`ack_seq + advertised_free`,
+    /// libsrt `processCtrlAck`, Robotweax `09c852b4`): with the receiver's
+    /// window full, a Full ACK advertising zero closes new DATA; a stale Full
+    /// ACK advertising a large window is ignored; a current Full ACK
+    /// advertising four opens exactly four; and a Light ACK that advances
+    /// the cumulative acknowledgement by two reopens nothing, because the
+    /// boundary it advances toward is fixed.
+    #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "full caller/listener handshake plus the wire-ACK path; correctness is       \
+                  proven at full scale outside Miri, and the sender-level window regressions \
+                  in `srt_sender` cover the same model cheaply under Miri. Run in the       \
+                  miri-extended scheduled job."
+    )]
+    fn light_ack_cannot_overrun_stale_receive_window_credit() {
+        let (mut caller, _listener) = connected_pair();
+        let now = Timestamp::from_micros(1_000_000);
+        let socket_id = caller.socket_id();
+
+        let initial = caller
+            .sender
+            .as_ref()
+            .expect("connected caller has a sender")
+            .oldest_unacked_sequence();
+        for _ in 0..4 {
+            caller
+                .send(b"first flight", now)
+                .expect("the window is open");
+        }
+        let flight_end = caller
+            .sender
+            .as_ref()
+            .expect("connected caller has a sender")
+            .next_sequence_number();
+
+        // The receiver is full and acknowledges the whole flight: zero free.
+        caller
+            .feed_recv_buf(&ack_datagram(socket_id, flight_end, Some(0)), now)
+            .expect("a current Full ACK is accepted");
+        assert_eq!(
+            caller.sender.as_ref().unwrap().remaining_window_packets(),
+            0
+        );
+        assert!(!caller.can_send());
+
+        // A stale Full ACK advertising a huge free window must not reopen
+        // what the current one closed.
+        caller
+            .feed_recv_buf(&ack_datagram(socket_id, initial, Some(u32::MAX)), now)
+            .expect("a stale Full ACK is accepted and ignored");
+        assert_eq!(
+            caller.sender.as_ref().unwrap().remaining_window_packets(),
+            0
+        );
+        assert!(!caller.can_send());
+
+        // A current Full ACK advertising four opens exactly four packets.
+        caller
+            .feed_recv_buf(&ack_datagram(socket_id, flight_end, Some(4)), now)
+            .expect("a current Full ACK is accepted");
+        assert_eq!(
+            caller.sender.as_ref().unwrap().remaining_window_packets(),
+            4
+        );
+        for _ in 0..4 {
+            caller.send(b"second flight", now).expect("admitted");
+        }
+        assert!(!caller.can_send());
+
+        // A Light ACK advances the cumulative ACK by two and advertises
+        // nothing. Pre-fix the stale `4` advertisement was compared against
+        // the flight of two this ACK left behind, admitting two packets the
+        // receiver had never freed.
+        let light_end = flight_end + 2;
+        caller
+            .feed_recv_buf(&ack_datagram(socket_id, light_end, None), now)
+            .expect("a Light ACK is accepted");
+        assert_eq!(caller.sender.as_ref().unwrap().packets_in_flight(), 2);
+        assert_eq!(
+            caller.sender.as_ref().unwrap().remaining_window_packets(),
+            0
+        );
+        assert!(!caller.can_send());
+
+        // Only a later Small/Full ACK reopens the window, and only by what
+        // it advertises.
+        caller
+            .feed_recv_buf(&ack_datagram(socket_id, flight_end + 4, Some(2)), now)
+            .expect("a current Full ACK is accepted");
+        assert_eq!(
+            caller.sender.as_ref().unwrap().remaining_window_packets(),
+            2
+        );
+        caller.send(b"reopened", now).expect("admitted");
+        caller.send(b"reopened", now).expect("admitted");
+        assert!(!caller.can_send());
+    }
+
+    /// A receive window that closed to zero must reopen as soon as the
+    /// application frees it, without waiting for more DATA from the peer.
+    ///
+    /// Reference behaviour: Robotweax main pins
+    /// `control_timer_immediately_advertises_reopened_receive_window` and
+    /// `session_reopens_a_full_receive_window_after_application_delivery`,
+    /// and libsrt keeps the same `bNeedFullAck` exception for a freed
+    /// receive buffer (`srtcore/core.cpp`, `sendCtrl(UMSG_ACK)`).
+    #[test]
+    fn a_reopened_receive_window_is_advertised_without_more_data() {
+        const WINDOW: u32 = 32;
+        let mut conn = SrtConnection::new_listener(ConnectionOptions {
+            tsbpd_delay: 0,
+            flow_window_packets: WINDOW,
+            receive_buffer_packets: WINDOW,
+            delivery_queue_packets: 1,
+            ..ConnectionOptions::default()
+        });
+        conn.set_state(ConnectionState::Connected);
+        let _ = conn.poll_event();
+        let now = Timestamp::from_micros(0);
+        conn.init_buffers(now, 0, 0);
+        conn.receiver
+            .as_mut()
+            .expect("connected listener has a receiver")
+            .set_tsbpd_enabled(false);
+
+        // Fill the receive window: one packet reaches the application queue,
+        // the rest stay protocol-side and consume the advertised window.
+        for sequence_number in 0..WINDOW {
+            conn.handle_data_packet(
+                DataPacket::new(sequence_number, sequence_number, 0, 0, vec![1].into()),
+                now,
+            )
+            .expect("data is accepted");
+        }
+        let expected_seq = conn.receiver.as_ref().unwrap().expected_sequence();
+
+        // Advertise the closed window: a Full ACK carrying zero free space.
+        conn.handle_timer(TimerId::Ack, now).expect("ACK tick");
+        let closed = drain_acks(&mut conn);
+        assert_eq!(closed.len(), 1, "one ACK is emitted for the closed window");
+        assert_eq!(full_ack_available(&closed[0]), Some(0));
+
+        // The application consumes the one delivered item. Nothing arrives
+        // from the peer afterwards: the reopen has to be advertised on its
+        // own.
+        assert!(matches!(
+            conn.poll_event(),
+            Some(ConnectionEvent::DataReceived { .. })
+        ));
+        assert_eq!(
+            conn.receiver.as_ref().unwrap().expected_sequence(),
+            expected_seq,
+            "application capacity must not fabricate delivery progress"
+        );
+        assert!(
+            conn.receive_window_reopen_pending,
+            "a zero->positive window change must be marked urgent"
+        );
+        assert!(
+            conn.output_queue.iter().any(|output| matches!(
+                output,
+                QueuedOutput::SetTimer {
+                    id: TimerId::Ack,
+                    duration_micros: 0
+                }
+            )),
+            "the reopen must schedule an immediate Ack deadline"
+        );
+
+        conn.handle_timer(TimerId::Ack, now.add_micros(1))
+            .expect("ACK tick");
+        let reopened = drain_acks(&mut conn);
+        assert_eq!(reopened.len(), 1, "the reopen emits exactly one ACK");
+        // One slot freed by the application, and only one: the other 31
+        // packets still occupy the window, and moving one of them into the
+        // application queue transfers occupancy rather than freeing it.
+        assert_eq!(
+            full_ack_available(&reopened[0]),
+            Some(1),
+            "the reopened window is advertised as a Full ACK"
+        );
+        assert!(!conn.receive_window_reopen_pending);
+    }
+
+    /// Several application releases before the next service visit must
+    /// produce one urgent advertisement, not one per release.
+    #[test]
+    fn a_burst_of_application_releases_coalesces_into_one_urgent_ack() {
+        const WINDOW: u32 = 32;
+        let mut conn = SrtConnection::new_listener(ConnectionOptions {
+            tsbpd_delay: 0,
+            flow_window_packets: WINDOW,
+            receive_buffer_packets: WINDOW,
+            delivery_queue_packets: 4,
+            ..ConnectionOptions::default()
+        });
+        conn.set_state(ConnectionState::Connected);
+        let _ = conn.poll_event();
+        let now = Timestamp::from_micros(0);
+        conn.init_buffers(now, 0, 0);
+        conn.receiver
+            .as_mut()
+            .expect("connected listener has a receiver")
+            .set_tsbpd_enabled(false);
+
+        for sequence_number in 0..WINDOW {
+            conn.handle_data_packet(
+                DataPacket::new(sequence_number, sequence_number, 0, 0, vec![1].into()),
+                now,
+            )
+            .expect("data is accepted");
+        }
+        conn.handle_timer(TimerId::Ack, now).expect("ACK tick");
+        let closed = drain_acks(&mut conn);
+        assert_eq!(full_ack_available(&closed[0]), Some(0));
+
+        for _ in 0..4 {
+            assert!(matches!(
+                conn.poll_event(),
+                Some(ConnectionEvent::DataReceived { .. })
+            ));
+        }
+        let urgent_deadlines = conn
+            .output_queue
+            .iter()
+            .filter(|output| {
+                matches!(
+                    output,
+                    QueuedOutput::SetTimer {
+                        id: TimerId::Ack,
+                        duration_micros: 0
+                    }
+                )
+            })
+            .count();
+        assert_eq!(urgent_deadlines, 1, "four releases must coalesce into one");
+
+        conn.handle_timer(TimerId::Ack, now.add_micros(1))
+            .expect("ACK tick");
+        let reopened = drain_acks(&mut conn);
+        assert_eq!(reopened.len(), 1, "the coalesced reopen sends one ACK");
+        assert_eq!(full_ack_available(&reopened[0]), Some(4));
+    }
+
+    /// Every Full ACK among the connection's pending outputs, as wire bytes.
+    fn drain_acks(conn: &mut SrtConnection) -> Vec<Vec<u8>> {
+        let mut acks = Vec::new();
+        while let Some(output) = conn.poll_output().expect("output materializes") {
+            let ConnectionOutput::SendPacket(bytes) = output else {
+                continue;
+            };
+            if let Ok(SrtPacket::Control(packet)) = SrtPacket::decode(&bytes)
+                && packet.control_type == ControlType::Ack
+            {
+                acks.push(bytes);
+            }
+        }
+        acks
+    }
+
+    /// The available-buffer field of a Full ACK, or `None` for a Light ACK.
+    fn full_ack_available(datagram: &[u8]) -> Option<u32> {
+        let Ok(SrtPacket::Control(packet)) = SrtPacket::decode(datagram) else {
+            panic!("an ACK datagram decodes as a control packet");
+        };
+        (packet.control_info.len() >= 16).then(|| {
+            u32::from_be_bytes([
+                packet.control_info[12],
+                packet.control_info[13],
+                packet.control_info[14],
+                packet.control_info[15],
+            ])
+        })
+    }
+
+    /// Raw control datagram with an explicit type and information field.
+    fn control_datagram(
+        dest_socket_id: u32,
+        control_type: ControlType,
+        subtype: u16,
+        type_specific_info: u32,
+        control_info: Vec<u8>,
+    ) -> Vec<u8> {
+        let packet = ControlPacket {
+            control_type,
+            subtype,
+            type_specific_info,
+            timestamp: 0,
+            dest_socket_id,
+            control_info,
+        };
+        let mut buf = Vec::new();
+        packet.encode(&mut buf).expect("control encodes");
+        buf
+    }
+
+    /// A NAK whose named positions are all TLPKTDROP tombstones is answered
+    /// with DROPREQ again -- never with DATA retransmission of released media.
+    #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "full caller/listener handshake; correctness is proven outside Miri, and the      \
+                  sender-level tombstone regressions cover the same accounting cheaply        \
+                  under Miri. Run in the miri-extended scheduled job."
+    )]
+    fn a_repeated_nak_for_a_dropped_message_is_answered_with_drop_req() {
+        let (mut caller, _listener) = connected_pair();
+        let socket_id = caller.socket_id();
+        let sent = Timestamp::from_micros(1_000_000);
+        for _ in 0..3 {
+            caller.send(b"dropped", sent).expect("the window is open");
+        }
+        let mut sequences = Vec::new();
+        while let Some(output) = caller.poll_output().expect("output materializes") {
+            if let ConnectionOutput::SendPacket(bytes) = output
+                && let Ok(SrtPacket::Data(packet)) = SrtPacket::decode(&bytes)
+            {
+                sequences.push(packet.sequence_number);
+            }
+        }
+        assert_eq!(sequences.len(), 3, "one datagram per message");
+
+        // Nothing is acknowledged, so TLPKTDROP gives each message up.
+        let expired = sent.add_micros(1_000_001);
+        caller
+            .handle_timer(TimerId::Ack, expired)
+            .expect("ACK tick");
+        let first = drain_drop_requests(&mut caller);
+        assert_eq!(first.len(), 3, "one DROPREQ per dropped message");
+
+        // The peer NAKs one of the dropped sequences: it lost the DROPREQ, or
+        // has not retired the range yet.
+        caller
+            .feed_recv_buf(
+                &nak_datagram(socket_id, &[sequences[1], sequences[1]]),
+                expired,
+            )
+            .expect("the loss report is accepted");
+        let repeated = drain_drop_requests(&mut caller);
+        assert_eq!(repeated.len(), 1, "DROPREQ is sent again");
+        assert_eq!(repeated[0], (sequences[1], sequences[1]));
+
+        // And nothing was retransmitted as DATA.
+        let mut retransmitted = Vec::new();
+        while let Some(output) = caller.poll_output().expect("output materializes") {
+            if let ConnectionOutput::SendPacket(bytes) = output
+                && let Ok(SrtPacket::Data(packet)) = SrtPacket::decode(&bytes)
+                && packet.retransmitted
+            {
+                retransmitted.push(packet.sequence_number);
+            }
+        }
+        assert!(
+            retransmitted.is_empty(),
+            "a tombstone must never be DATA-retransmitted: {retransmitted:?}"
+        );
+    }
+
+    /// Wire NAK with a compact loss list of inclusive ranges.
+    fn nak_datagram(dest_socket_id: u32, ranges: &[u32]) -> Vec<u8> {
+        assert!(ranges.len().is_multiple_of(2), "pairs of (start, end)");
+        let mut control_info = Vec::new();
+        for pair in ranges.chunks(2) {
+            encode_loss_range(&mut control_info, pair[0], pair[1]);
+        }
+        control_datagram(dest_socket_id, ControlType::Nak, 0, 0, control_info)
+    }
+
+    /// Decode every DROPREQ the connection has queued, as (first, last).
+    fn drain_drop_requests(conn: &mut SrtConnection) -> Vec<(u32, u32)> {
+        let mut requests = Vec::new();
+        while let Some(output) = conn.poll_output().expect("output materializes") {
+            let ConnectionOutput::SendPacket(bytes) = output else {
+                continue;
+            };
+            let Ok(SrtPacket::Control(packet)) = SrtPacket::decode(&bytes) else {
+                continue;
+            };
+            if packet.control_type != ControlType::DropReq {
+                continue;
+            }
+            let mut cif = packet.control_info.as_slice();
+            let first = read_u32(&mut cif).expect("DROPREQ carries its range");
+            let last = read_u32(&mut cif).expect("DROPREQ carries its range");
+            requests.push((first, last));
+        }
+        requests
+    }
+
+    /// Malformed or hostile control input is rejected *before* it can refresh
+    /// peer activity or touch connection state.
+    ///
+    /// This is the invariant Robotweax 0.2.2 pins with
+    /// `compat_runtime_rejects_malformed_controls_without_refreshing_liveness`,
+    /// reached here through the real wire decoder rather than by calling the
+    /// handlers directly.
+    #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "full caller/listener handshake plus sixteen malformed controls; correctness  \
+                  is proven outside Miri. Run in the miri-extended scheduled job."
+    )]
+    fn malformed_controls_cannot_refresh_liveness_or_state() {
+        let (mut caller, _listener) = connected_pair();
+        let socket_id = caller.socket_id();
+        let now = Timestamp::from_micros(5_000_000);
+
+        // Positive control: a canonical KEEPALIVE (one zero word, exactly what
+        // libsrt's `CPacket::pack` writes and what this crate emits) is peer
+        // activity, so the assertions below are not vacuous.
+        caller
+            .feed_recv_buf(
+                &control_datagram(socket_id, ControlType::Keepalive, 0, 0, vec![0; 4]),
+                now,
+            )
+            .expect("a canonical KEEPALIVE is accepted");
+        assert_eq!(caller.last_recv_time, Some(now));
+
+        let unaligned_ack = vec![0u8; 6];
+        let nak_range_without_end = vec![0x80, 0, 0, 0];
+        let drop_req_high_bit = {
+            let mut cif = Vec::new();
+            write_u32(&mut cif, 0x8000_0001);
+            write_u32(&mut cif, 1);
+            cif
+        };
+        let malformed: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "ACK without a cumulative position",
+                control_datagram(socket_id, ControlType::Ack, 0, 0, Vec::new()),
+            ),
+            (
+                "ACK with an unaligned cumulative position",
+                control_datagram(socket_id, ControlType::Ack, 0, 0, unaligned_ack),
+            ),
+            (
+                "NAK without a loss range",
+                control_datagram(socket_id, ControlType::Nak, 0, 0, Vec::new()),
+            ),
+            (
+                "NAK with an unaligned loss range",
+                control_datagram(socket_id, ControlType::Nak, 0, 0, vec![0, 0, 0]),
+            ),
+            (
+                "NAK range missing its end",
+                control_datagram(socket_id, ControlType::Nak, 0, 0, nak_range_without_end),
+            ),
+            (
+                "ACKACK naming an ACK that was never sent",
+                control_datagram(socket_id, ControlType::AckAck, 0, 99_999, vec![0; 4]),
+            ),
+            (
+                "ACKACK carrying the zero ACK number",
+                control_datagram(socket_id, ControlType::AckAck, 0, 0, vec![0; 4]),
+            ),
+            (
+                "ACKACK with a surplus word",
+                control_datagram(socket_id, ControlType::AckAck, 0, 1, vec![0; 8]),
+            ),
+            (
+                "KEEPALIVE carrying an argument",
+                control_datagram(socket_id, ControlType::Keepalive, 0, 0, vec![1, 0, 0, 0]),
+            ),
+            (
+                "SHUTDOWN carrying an argument",
+                control_datagram(socket_id, ControlType::Shutdown, 0, 0, vec![1, 0, 0, 0]),
+            ),
+            (
+                "SHUTDOWN with a surplus word",
+                control_datagram(socket_id, ControlType::Shutdown, 0, 0, vec![0; 8]),
+            ),
+            (
+                "DROPREQ without two sequence words",
+                control_datagram(socket_id, ControlType::DropReq, 0, 0, vec![0; 4]),
+            ),
+            (
+                "DROPREQ with a sequence high bit set",
+                control_datagram(socket_id, ControlType::DropReq, 0, 0, drop_req_high_bit),
+            ),
+            (
+                "key-management request with an unaligned body",
+                control_datagram(
+                    socket_id,
+                    ControlType::UserDefined,
+                    SRT_CMD_KMREQ,
+                    0,
+                    vec![0; 3],
+                ),
+            ),
+            (
+                "key-management request with a truncated body",
+                control_datagram(
+                    socket_id,
+                    ControlType::UserDefined,
+                    SRT_CMD_KMREQ,
+                    0,
+                    vec![0; 4],
+                ),
+            ),
+            (
+                "key-management response with a truncated body",
+                control_datagram(
+                    socket_id,
+                    ControlType::UserDefined,
+                    SRT_CMD_KMRSP,
+                    0,
+                    vec![0; 4],
+                ),
+            ),
+        ];
+
+        let baseline = caller.stats();
+        let later = now.add_micros(1_000);
+        for (label, datagram) in malformed {
+            let error = caller
+                .feed_recv_buf(&datagram, later)
+                .expect_err("malformed control input is rejected");
+            assert_eq!(error.kind, crate::error::ErrorKind::InvalidData, "{label}");
+            assert_eq!(
+                caller.last_recv_time,
+                Some(now),
+                "{label}: rejected input must not refresh peer liveness"
+            );
+            assert_eq!(
+                caller.stats(),
+                baseline,
+                "{label}: rejected input changed state"
+            );
+            assert_eq!(caller.state(), ConnectionState::Connected, "{label}");
+        }
+
+        // A well-formed SHUTDOWN is still accepted afterwards, and it is the
+        // one control whose acceptance changes state: the negative cases
+        // above must not have poisoned the connection.
+        caller
+            .feed_recv_buf(
+                &control_datagram(socket_id, ControlType::Shutdown, 0, 0, vec![0; 4]),
+                later,
+            )
+            .expect("a canonical SHUTDOWN is accepted");
+    }
+
+    /// An authenticated DATA packet whose tag or key selector does not verify
+    /// is rejected before it can refresh liveness or advance reliability.
+    #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "encrypted handshake plus AES-GCM authentication under Miri; correctness is   \
+                  proven outside Miri (crypto ownership is covered by the `crypto` module     \
+                  tests). Run in the miri-extended scheduled job."
+    )]
+    fn undecryptable_data_cannot_refresh_liveness_or_advance_reliability() {
+        use crate::crypto::CipherMode;
+
+        let (mut caller, mut listener) = encrypted_pair(CipherMode::Gcm);
+        let now = Timestamp::from_micros(9_000_000);
+        let datagram = capture_data_datagram(&mut caller, b"authenticated payload", now);
+
+        // Liveness baseline from a well-formed packet on the same path.
+        listener
+            .feed_recv_buf(
+                &control_datagram(2, ControlType::Keepalive, 0, 0, vec![0; 4]),
+                now,
+            )
+            .expect("a canonical KEEPALIVE is accepted");
+        assert_eq!(listener.last_recv_time, Some(now));
+        let before = listener.receiver_stats().expect("receiver stats");
+
+        // Corrupt the GCM tag: the ciphertext still decrypts structurally,
+        // only authentication fails.
+        let mut bad_tag = datagram.clone();
+        *bad_tag.last_mut().expect("a datagram has a tag") ^= 0xFF;
+        assert_crypto_rejected(&mut listener, &bad_tag, now);
+
+        // An invalid key selector is equally rejected: `0` would claim the
+        // packet is unencrypted on an encrypted connection and `3` is not a
+        // valid KK field.
+        for flag in [0u8, 3u8] {
+            assert_crypto_rejected(&mut listener, &with_key_selector(&datagram, flag), now);
+        }
+
+        assert_eq!(
+            listener.last_recv_time,
+            Some(now),
+            "rejected DATA must not refresh peer liveness"
+        );
+        let after = listener.receiver_stats().expect("receiver stats");
+        assert_eq!(after.total_received, before.total_received);
+        assert_eq!(after.packets_in_buffer, before.packets_in_buffer);
+        assert_eq!(
+            after.total_srt_bytes_received,
+            before.total_srt_bytes_received
+        );
+        assert_eq!(listener.state(), ConnectionState::Connected);
+
+        // Positive control: the untampered datagram is accepted, so the
+        // rejections above are not an artifact of the fixture.
+        listener
+            .feed_recv_buf(&datagram, now)
+            .expect("the authentic datagram is accepted");
+        assert_eq!(
+            listener
+                .receiver_stats()
+                .expect("receiver stats")
+                .total_received,
+            before.total_received + 1
+        );
+    }
+
+    /// A connected encrypted pair sharing one passphrase.
+    fn encrypted_pair(cipher_mode: CipherMode) -> (SrtConnection, SrtConnection) {
+        let sek = vec![0x5Au8; 16];
+        let options = |socket_id: u32| ConnectionOptions {
+            socket_id,
+            passphrase: Some("shared-secret".to_owned()),
+            crypto_salt: Some(test_km_salt()),
+            crypto_sek: Some(sek.clone()),
+            cipher_mode,
+            ..ConnectionOptions::default()
+        };
+        let mut caller = SrtConnection::new_caller(options(1));
+        let mut listener = SrtConnection::new_listener(ConnectionOptions {
+            syn_cookie: Some(7),
+            ..options(2)
+        });
+        drive_handshake_to_connected(&mut caller, &mut listener);
+        (caller, listener)
+    }
+
+    /// Send one payload and return the DATA datagram the caller put on the
+    /// wire for it.
+    fn capture_data_datagram(
+        caller: &mut SrtConnection,
+        payload: &[u8],
+        now: Timestamp,
+    ) -> Vec<u8> {
+        caller.send(payload, now).expect("send");
+        let mut datagram = None;
+        while let Some(output) = caller.poll_output().expect("output materializes") {
+            if let ConnectionOutput::SendPacket(bytes) = output
+                && matches!(SrtPacket::decode(&bytes), Ok(SrtPacket::Data(_)))
+            {
+                datagram = Some(bytes);
+            }
+        }
+        datagram.expect("the payload produced one DATA datagram")
+    }
+
+    /// The same datagram with its key-selector field replaced, keeping the
+    /// rest of the header intact.
+    fn with_key_selector(datagram: &[u8], flag: u8) -> Vec<u8> {
+        let mut corrupted = datagram.to_vec();
+        // The encryption flag occupies bits 3-4 of byte 4 (`srt_packet`'s
+        // header packing: `encryption_flag & 0b11 << 27` of the second word).
+        corrupted[4] = (corrupted[4] & !(0b11 << 3)) | (flag << 3);
+        match SrtPacket::decode(&corrupted) {
+            Ok(SrtPacket::Data(packet)) => assert_eq!(
+                packet.encryption_flag, flag,
+                "the test corrupts the key selector field"
+            ),
+            other => panic!("the corrupted datagram must still decode: {other:?}"),
+        }
+        corrupted
+    }
+
+    /// Assert the datagram is rejected as a crypto error and changes nothing.
+    fn assert_crypto_rejected(listener: &mut SrtConnection, datagram: &[u8], now: Timestamp) {
+        let error = listener
+            .feed_recv_buf(datagram, now)
+            .expect_err("an unauthenticated DATA body is rejected");
+        assert_eq!(error.kind, crate::error::ErrorKind::CryptoError);
+    }
+
+    /// A hand-built connected listener with live-mode TSBPD negotiated, a
+    /// receive clock that starts at zero, and an optional TLPKTDROP.
+    fn tsbpd_listener(
+        tsbpd_delay: u16,
+        tlpktdrop: bool,
+        delivery_queue_packets: u32,
+    ) -> SrtConnection {
+        let mut conn = SrtConnection::new_listener(ConnectionOptions {
+            tsbpd_delay,
+            flow_window_packets: 32,
+            receive_buffer_packets: 32,
+            delivery_queue_packets,
+            ..ConnectionOptions::default()
+        });
+        let mut peer_flags = srt_flags::TSBPDSND;
+        if tlpktdrop {
+            peer_flags |= srt_flags::TLPKTDROP;
+        }
+        conn.peer_srt_flags = Some(peer_flags);
+        conn.set_state(ConnectionState::Connected);
+        let _ = conn.poll_event();
+        conn.init_buffers(Timestamp::from_micros(0), 0, 0);
+        assert!(conn.tsbpd_enabled(), "the fixture must negotiate TSBPD");
+        assert!(conn.tlpktdrop_enabled() == tlpktdrop);
+        conn
+    }
+
+    /// Peer SHUTDOWN must not bypass or truncate buffered TSBPD delivery:
+    /// data already accepted keeps its playout deadline, the terminal event
+    /// waits for it, and a duplicate SHUTDOWN changes nothing.
+    ///
+    /// Reference behaviour: Robotweax 0.2.1 defers the peer-shutdown error
+    /// until TSBPD-buffered input is drained, pinned by
+    /// `compat_runtime_drains_tsbpd_message_after_peer_shutdown`.
+    #[test]
+    fn peer_shutdown_drains_tsbpd_data_before_the_terminal_event() {
+        const DELAY_MS: u16 = 120;
+        let mut conn = tsbpd_listener(DELAY_MS, false, 8);
+        let socket_id = conn.options.socket_id;
+        let shutdown = control_datagram(socket_id, ControlType::Shutdown, 0, 0, vec![0; 4]);
+
+        // One message, source timestamp 50 us, so its playout deadline is
+        // 50 + 120_000 us on this connection's clock.
+        let arrived = Timestamp::from_micros(2_000);
+        conn.handle_data_packet(
+            DataPacket::new(0, 1, 50, 0, b"srt".to_vec().into()),
+            arrived,
+        )
+        .expect("DATA is accepted");
+        assert_eq!(conn.pending_data_events, 0, "not due yet");
+
+        conn.feed_recv_buf(&shutdown, arrived)
+            .expect("the peer's SHUTDOWN is accepted");
+        assert!(conn.peer_shutdown_pending);
+        assert_eq!(conn.state(), ConnectionState::Connected, "still draining");
+        assert!(conn.poll_event().is_none(), "no event before the deadline");
+
+        // Duplicate SHUTDOWN: a peer retransmits until it sees an answer.
+        conn.feed_recv_buf(&shutdown, arrived)
+            .expect("a duplicate SHUTDOWN is accepted and ignored");
+        assert!(conn.peer_shutdown_pending);
+
+        // One microsecond before the deadline: nothing is released, and the
+        // peer's close is not terminal yet.
+        conn.handle_timer(TimerId::Ack, Timestamp::from_micros(120_049))
+            .expect("ACK tick");
+        assert!(conn.poll_event().is_none(), "still before the deadline");
+        assert_eq!(conn.state(), ConnectionState::Connected);
+
+        // At the deadline the payload surfaces normally, and the terminal
+        // event is queued *behind* it, never in front of it.
+        conn.handle_timer(TimerId::Ack, Timestamp::from_micros(120_050))
+            .expect("ACK tick");
+        assert_eq!(
+            conn.state(),
+            ConnectionState::Connected,
+            "the terminal event must wait for the queued payload"
+        );
+        assert_delivered_payload(&mut conn, b"srt");
+
+        // Draining the application queue completes the close: the state
+        // change first, then exactly one terminal event.
+        assert_peer_shutdown_terminal(&mut conn);
+    }
+
+    /// Assert the next event is the payload the connection delivered.
+    fn assert_delivered_payload(conn: &mut SrtConnection, expected: &[u8]) {
+        let delivered = conn.poll_event().expect("the payload is delivered");
+        assert!(
+            matches!(&delivered, ConnectionEvent::DataReceived { payload, .. } if payload.as_ref() == expected),
+            "the buffered payload must surface unchanged: {delivered:?}"
+        );
+    }
+
+    /// Assert the connection closes with exactly one peer-shutdown terminal
+    /// event, after the state change.
+    fn assert_peer_shutdown_terminal(conn: &mut SrtConnection) {
+        assert!(matches!(
+            conn.poll_event(),
+            Some(ConnectionEvent::StateChanged(ConnectionState::Disconnected))
+        ));
+        assert!(matches!(
+            conn.poll_event(),
+            Some(ConnectionEvent::Disconnected {
+                reason: DisconnectReason::PeerShutdown
+            })
+        ));
+        assert_eq!(conn.state(), ConnectionState::Disconnected);
+        assert!(conn.poll_event().is_none(), "exactly one terminal event");
+    }
+
+    /// Every buffered deadline is honoured before the peer close becomes
+    /// terminal, in order, even while the application queue is full.
+    #[test]
+    fn peer_shutdown_delivers_every_buffered_deadline_before_the_terminal_event() {
+        let mut conn = tsbpd_listener(120, false, 1);
+        let socket_id = conn.options.socket_id;
+        let arrived = Timestamp::from_micros(2_000);
+
+        for (sequence_number, timestamp) in [(0u32, 50u32), (1, 60), (2, 70)] {
+            conn.handle_data_packet(
+                DataPacket::new(
+                    sequence_number,
+                    sequence_number,
+                    timestamp,
+                    0,
+                    vec![1].into(),
+                ),
+                arrived,
+            )
+            .expect("DATA is accepted");
+        }
+        conn.feed_recv_buf(
+            &control_datagram(socket_id, ControlType::Shutdown, 0, 0, vec![0; 4]),
+            arrived,
+        )
+        .expect("the peer's SHUTDOWN is accepted");
+
+        // All three deadlines have passed, but the application queue admits
+        // one message at a time: the rest stay in the receiver, and the
+        // drain waits for them.
+        conn.handle_timer(TimerId::Ack, Timestamp::from_micros(120_070))
+            .expect("ACK tick");
+        let first = conn.poll_event().expect("the first message is delivered");
+        assert!(matches!(
+            first,
+            ConnectionEvent::DataReceived {
+                sequence_number: 0,
+                ..
+            }
+        ));
+        assert_eq!(conn.state(), ConnectionState::Connected, "more to deliver");
+
+        for (tick, sequence_number) in [(120_071, 1u32), (120_072, 2)] {
+            conn.handle_timer(TimerId::Ack, Timestamp::from_micros(tick))
+                .expect("ACK tick");
+            let event = conn.poll_event().expect("the next message is delivered");
+            assert!(
+                matches!(
+                    event,
+                    ConnectionEvent::DataReceived {
+                        sequence_number: expected,
+                        ..
+                    } if expected == sequence_number
+                ),
+                "messages must surface in order: {event:?}"
+            );
+        }
+        // The last delivery completes the close.
+        assert_peer_shutdown_terminal(&mut conn);
+    }
+
+    /// TLPKTDROP may legitimately retire a message the peer can no longer
+    /// complete; the peer close is terminal once it has.
+    #[test]
+    fn tlpktdrop_retires_an_incomplete_message_before_the_terminal_event() {
+        let mut conn = tsbpd_listener(120, true, 8);
+        let socket_id = conn.options.socket_id;
+        let arrived = Timestamp::from_micros(2_000);
+
+        // First fragment of a two-fragment message; its partner (3_001) never
+        // arrives, and a later message exposes that hole.
+        let mut first = DataPacket::new(0, 7, 50, 0, b"frag".to_vec().into());
+        first.position = crate::srt_packet::PacketPosition::First;
+        conn.handle_data_packet(first, arrived)
+            .expect("the first fragment is accepted");
+        conn.handle_data_packet(
+            DataPacket::new(2, 8, 60, 0, b"tail".to_vec().into()),
+            arrived,
+        )
+        .expect("the later message is accepted");
+
+        conn.feed_recv_buf(
+            &control_datagram(socket_id, ControlType::Shutdown, 0, 0, vec![0; 4]),
+            arrived,
+        )
+        .expect("the peer's SHUTDOWN is accepted");
+
+        // Both messages are past their deadlines, but the hole between them
+        // has not expired yet: TLPKTDROP's threshold is at least one second.
+        conn.handle_timer(TimerId::Ack, Timestamp::from_micros(500_000))
+            .expect("ACK tick");
+        assert!(conn.poll_event().is_none(), "the hole has not expired yet");
+        assert_eq!(conn.state(), ConnectionState::Connected);
+
+        // Once the hole expires, TLPKTDROP retires it (and with it the
+        // message that can never complete), the later message is delivered,
+        // and only then does the peer close become terminal.
+        conn.handle_timer(TimerId::Ack, Timestamp::from_micros(1_200_000))
+            .expect("ACK tick");
+        let delivered = conn
+            .poll_event()
+            .expect("the complete message is delivered");
+        assert!(
+            matches!(&delivered, ConnectionEvent::DataReceived { payload, .. } if payload.as_ref() == b"tail"),
+            "the complete message must still be delivered: {delivered:?}"
+        );
+        assert!(matches!(
+            conn.poll_event(),
+            Some(ConnectionEvent::StateChanged(ConnectionState::Disconnected))
+        ));
+        assert!(matches!(
+            conn.poll_event(),
+            Some(ConnectionEvent::Disconnected {
+                reason: DisconnectReason::PeerShutdown
+            })
+        ));
+        assert!(conn.poll_event().is_none(), "exactly one terminal event");
+    }
+
+    /// DATA arriving after the peer closed its send half is not protocol
+    /// progress, and cannot refresh peer liveness either.
+    #[test]
+    fn data_after_peer_shutdown_is_rejected() {
+        let mut conn = tsbpd_listener(120, false, 8);
+        let socket_id = conn.options.socket_id;
+        let arrived = Timestamp::from_micros(2_000);
+        conn.feed_recv_buf(
+            &control_datagram(socket_id, ControlType::Shutdown, 0, 0, vec![0; 4]),
+            arrived,
+        )
+        .expect("the peer's SHUTDOWN is accepted");
+        assert_eq!(
+            conn.state(),
+            ConnectionState::Disconnected,
+            "an empty receiver has nothing to drain, so the close is immediate"
+        );
+
+        let error = conn
+            .handle_data_packet(
+                DataPacket::new(0, 3, 50, 0, b"late".to_vec().into()),
+                arrived,
+            )
+            .expect_err("DATA after SHUTDOWN is rejected");
+        assert_eq!(error.kind, crate::error::ErrorKind::InvalidState);
+        assert_eq!(
+            conn.receiver_stats()
+                .expect("receiver stats")
+                .total_received,
+            0
+        );
+    }
+
     #[test]
     fn delivery_packet_accounting_inline_footprint_stays_bounded() {
         let connection_bytes = std::mem::size_of::<SrtConnection>();
@@ -5418,7 +6735,11 @@ mod tests {
         eprintln!("SrtConnection inline footprint: {connection_bytes} bytes");
         eprintln!("ConnectionEvent inline footprint: {event_bytes} bytes");
         eprintln!("AssembledMessage inline footprint: {assembled_bytes} bytes");
-        assert!(connection_bytes <= 1_536);
+        // The protocol-correctness pass grew the inline sender state by the
+        // two retained-stamp counters it carries (see
+        // `sender_window_is_lazy_and_bounded_at_maximum_window`): 8 bytes,
+        // deliberate and bounded, not drift.
+        assert!(connection_bytes <= 1_544);
         assert!(event_bytes <= 64);
         // F01 added `source_time: Timestamp` (8 bytes) to preserve a
         // message's original source time through reassembly -- a
@@ -5761,8 +7082,10 @@ mod tests {
         assert_eq!(conn.stats().receiver.unwrap().total_naks_sent, wire_packets);
     }
 
+    /// A shortfall in the parser is no longer possible: ranges come out as
+    /// ranges, and the whole report is what validation sees.
     #[test]
-    fn loss_list_limit_clamps_across_ranges_and_singles() {
+    fn a_loss_list_of_ranges_and_singles_parses_completely() {
         let mut encoded = Vec::new();
         write_u32(&mut encoded, 0x8000_0001);
         write_u32(&mut encoded, 3);
@@ -5770,29 +7093,26 @@ mod tests {
         write_u32(&mut encoded, 11);
 
         assert_eq!(
-            parse_loss_list(&encoded, 4).expect("loss report is safely clamped"),
-            vec![1, 2, 3, 10]
+            parse_loss_list(&encoded, usize::MAX).expect("loss report parses"),
+            vec![1, 2, 3, 10, 11]
         );
     }
 
     #[test]
-    fn dense_loss_list_stays_compact_while_enforcing_position_limit() {
+    fn a_dense_loss_list_is_returned_as_one_untruncated_range() {
         let mut encoded = Vec::new();
         write_u32(&mut encoded, 0x8000_0000);
         write_u32(&mut encoded, 65_535);
 
+        // Parsing is a wire operation: it must not clamp a range to whatever
+        // the connection happens to have room for. A dense report that names
+        // more positions than this sender can possibly hold is rejected as a
+        // unit downstream, not silently shortened into a valid prefix.
         assert_eq!(
-            parse_loss_ranges(&encoded, 65_536).unwrap(),
+            parse_loss_ranges(&encoded).unwrap(),
             [LossRange {
                 first_seq: 0,
                 last_seq: 65_535,
-            }]
-        );
-        assert_eq!(
-            parse_loss_ranges(&encoded, 32).unwrap(),
-            [LossRange {
-                first_seq: 0,
-                last_seq: 31,
             }]
         );
     }

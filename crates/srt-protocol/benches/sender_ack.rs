@@ -38,7 +38,6 @@ fn bench_ack_scale(c: &mut Criterion) {
                     b.iter_batched_ref(
                         || {
                             let mut buf = SenderBuffer::new(initial_seq, window, 120);
-                            buf.set_flow_window(window);
                             fill_window(&mut buf, window);
                             debug_assert_eq!(buf.packets_in_flight(), window);
                             buf
@@ -61,7 +60,6 @@ fn bench_ack_scale(c: &mut Criterion) {
                     b.iter_batched_ref(
                         || {
                             let mut buf = SenderBuffer::new(initial_seq, window, 120);
-                            buf.set_flow_window(window);
                             fill_window(&mut buf, window);
                             debug_assert_eq!(buf.packets_in_flight(), window);
                             buf
@@ -84,7 +82,6 @@ fn bench_ack_scale(c: &mut Criterion) {
                     b.iter_batched_ref(
                         || {
                             let mut buf = SenderBuffer::new(initial_seq, window, 120);
-                            buf.set_flow_window(window);
                             fill_window(&mut buf, window);
                             debug_assert_eq!(buf.packets_in_flight(), window);
                             buf
