@@ -247,16 +247,25 @@ declared real-time      UNDECLARED (no budget claimed)
 ```
 
 Acceptance for the run to be called a qualified capacity point (all three
-repetitions, not "two of three"):
+repetitions, not "two of three"; one repetition passes only when every shard row
+in it passes, and a shard count above one is what the `rep`/`shard` hierarchy
+exists for):
 
 ```text
-1. conservation: accepted == delivered (identity payloads, fence excluded)
-2. cadence:      generated / expected >= 0.999
-3. stationarity: f_drain <= 0.01
-4. fence:        diag_fences_seen == 50 and diag_missing_final == 0
-5. accounting:   sum(tx_class_*) == tx_class_total == tx_submitted_wire
-6. fault:        no Owner fault; tx_failures_pending == 0
-7. RX:           rx_lost and rx_duplicates are zero or explained by a named cause
+1. admission:    established == fanout == rx_established,
+                 data_offered == generated_ticks x established,
+                 data_accepted == data_offered
+2. conservation: accepted == delivered (identity payloads, fence excluded)
+3. cadence:      generated / expected >= 0.999
+4. stationarity: f_drain <= 0.01
+5. fence:        diag_fences_seen == fanout and
+                 diag_missing_final == missed_source_ticks x rx_established
+6. accounting:   sum(tx_class_*) == tx_class_total == tx_submitted_wire
+7. fault:        owner_faulted == false; tx_failures_pending == 0
+8. RX:           rx_lost == 0; diag_duplicate_payloads == 0, and the packet-level
+                 counts (rx_duplicates, rx_sec_b) <= tx_class_data_retx + drain_class_data_retx
+9. provenance:   git_dirty == false, built_by_scaling == true, pre_window_drained == true
+                 (the canonical group, `--require-clean`)
 ```
 
 `--drain-fraction-max 0.01` is a declared bound, not an inferred one: the pre-fix
@@ -385,21 +394,31 @@ Neither supports a real-time claim and neither is presented as one.
 
 ## Result: the final canonical run
 
-This is the qualification evidence for the code that actually merges, measured
-after the second review pass closed two remaining semantic gaps in the newly
-added RTO/gate: the fence gate no longer conflates a source's own declared
-cadence shortfall with transport loss, a blind RTO probe can no longer
-accumulate behind blocked TX capacity, `cargo xtask qualify`'s repetition
-identity now includes `window_ms`/`git_sha` and a `--require-clean`
-provenance gate, the real-time verdict (undeclared here) uses the same
-repetition rule as the sustained one, and the sender's own RTT/RTTVar
-estimator now follows the draft's §4.10 EWMA smoothing instead of taking the
-peer's Full-ACK report directly. See `docs/differential-audit-robotweax.md`
-for the RTO/estimator detail and `crates/xtask/src/qualify.rs`'s own tests for
-the gate semantics.
+This is the qualification evidence for the code that actually merges. It follows
+the third review pass, which closed four closeout defects in the gate, the sweep
+tooling, and the sender RTO:
+
+* the gate now requires the offered workload to have been **admitted**
+  (`established == fanout == rx_established`,
+  `data_offered == generated_ticks * established`, `data_accepted ==
+  data_offered`), so a shard that refuses part of its offer can no longer pass on
+  "accepted == delivered" alone;
+* qualification counts **repetitions, not rows**: `cargo xtask scaling` writes
+  one `ROW` per shard per repetition, a repetition passes only when every shard
+  row in it passes, and missing or duplicated shard rows are malformed evidence;
+* `cargo xtask scaling` now **builds the children it benchmarks** and takes their
+  paths from cargo's own artifact records, so the recorded `git_sha` describes
+  the binaries that ran (`built_by_scaling=true`) instead of whatever was left in
+  `target/`;
+* the sender **reprograms its RTO from the instant a blind probe is actually
+  submitted**, keeping the accumulated backoff, instead of firing the deadline
+  the probe was queued under.
+
+See `crates/xtask/src/qualify.rs`'s own tests for the gate semantics and
+`docs/differential-audit-robotweax.md` for the RTO detail.
 
 ```text
-head at measurement:  40050ed (clean tree required at run time)
+head at measurement:  cbc58a2 (clean tree required at run time)
 configuration:        F=50, 8 Mbps/dest, payload 1316 B, K=256 TX lanes,
                        H=64 connect concurrency, 1 sender process
 window:                60 s x 3 independent repetitions, one clean-tree sweep
@@ -415,54 +434,79 @@ gate:                  cargo xtask qualify F50-r8-K256-final.tsv \
 
 ```text
 artifact: F50-r8-K256-final.tsv
-measured at: git_sha=40050ed git_dirty=false
+measured at: git_sha=cbc58a2 git_dirty=false build_profile=release built_by_scaling=true
 
-rep  cadence    missed  f_drain  conserved  sec_a/sec_b  fences   missing_final    fsub p99  fsub max  C_SRT  r_window
-1    1.000000       0   0.346 %  yes          0/46      50 -> 50      0             11 ms     52.6 ms  15.7   1.229
-2    1.000000       0   0.348 %  yes          0/248     50 -> 50      0             22 ms     55.3 ms  16.1   1.225
-3    0.999123      40   0.348 %  yes          0/300     50 -> 50   2000 (40x50)     39 ms    167.1 ms  16.3   1.221
+rep  cadence    missed  f_drain  conserved  sec_b/retx  fences   missing_final  fsub p99  fsub max  C_SRT  r_window
+1    0.999474      24   0.343 %  yes        194/194   50 -> 50   1200 (24x50)    122 ms    290.8 ms  18.2   1.210
+2    1.000000       0   0.329 %  yes        106/106   50 -> 50      0            124 ms    204.0 ms  16.7   1.221
+3    1.000000       0   0.348 %  yes        110/110   50 -> 50      0             45 ms    101.3 ms  17.0   1.215
 
-every row: rx_mode = Some(RawReadiness) (managed_rx = false),
+every row: rx_mode = Some(RawReadiness) (managed_rx = false), owner_faulted = false,
            short/failed/peer_local/transient/tx_failures_pending = 0,
-           drain_ok = true, pending_after_drain = 0, rx_lost = 0,
+           drain_ok = true, pending_after_drain = 0, rx_lost = 0, rx_sec_a = 0,
            diag_duplicate_payloads = 0, pre_window_drained = true,
-           fence_offered = fence_accepted = rx_diag_fences_seen = 50 (== fanout)
+           data_offered == data_accepted == generated_ticks x 50,
+           fence_offered = fence_accepted = rx_diag_fences_seen = 50 (== fanout),
+           tx pool 256/256 free at the end, tx_pool_high_water = 256
 conserved = data_accepted + fence payloads the receiver saw == rx_core_total, exactly
+sec_b/retx = the receiver's packet-level duplicates against the sender's own window
+             retransmissions (the drain submitted none, and rx_duplicates is 0)
 C_SRT     = window_cpu_ms * 1000 / data_accepted (us/payload)
 ```
 
 ```text
 qualify: 3 of 3 rows sustained, 0 admitted-but-not-sustained (--drain-fraction-max 0.010)
 qualify: no --lateness-budget-us declared, so no real-time verdict
-qualify: QUALIFIED (sustained)  F=50 rate=8000000 K=256 payload=1316 rx_mode=Some(RawReadiness) window_ms=60000 git_sha=40050ed  3/3
+qualify: QUALIFIED (sustained)  F=50 rate=8000000 K=256 payload=1316 rx_mode=Some(RawReadiness)
+         window_ms=60000 git_sha=cbc58a2 n=50 shards=1 reps=3  3/3
 ```
 
-**Rep 3's `missing_final=2000` is exactly `40 missed_source_ticks x 50
-rx_established`** -- the source itself missed 40 of 45 592 boundaries this
-repetition (cadence `0.999123`, still inside the declared `0.999` tolerance),
-and the fence gate's job is to tell that apart from transport loss rather than
-demand literal-zero missing. It does: `unexpected_transport_missing = 0` on
-every row, so the fence criterion passes independently of the source's own
-(separately judged) cadence shortfall. This is the exact case the fence-gate
-fix in this PR exists for -- sweep A's `A1`/`A2` rows in the historical section
-above hit the same shape and, before the fix, the executable gate had no way
-to say so without either wrongly failing them or silently requiring 100 %
-source cadence.
+**Duplicates are accounted rather than merely unrequired.** The receiver's
+packet-level duplicate count equals the sender's retransmission count exactly in
+all three rows (194/194, 106/106, 110/110), which is the inequality the canonical
+gate now enforces (`rx_sec_b <= tx_class_data_retx + drain_class_data_retx`), and
+`diag_duplicate_payloads = 0` everywhere: no payload was ever delivered twice at
+the application level. `rx_duplicates` (the sender's own caller socket, which has
+nothing to receive in this topology) is 0 throughout.
 
-**`first_submit_lateness` p99 is now a real percentile, not `max` relabeled.**
-Rep 3's p99 (39 ms) and max (167.1 ms) are clearly different values -- under
-the old single-tier 10 ms-range histogram, both would have landed in the same
-overflow bucket and reported identically. The two-tier histogram (100 us
-buckets to 10 ms, 1 ms buckets to 1 s) is what makes that distinction possible
-at canonical-run tail latencies.
+**Rep 1's `missing_final=1200` is exactly `24 missed_source_ticks x 50
+rx_established`** -- the source itself missed 24 of 45 592 boundaries (cadence
+`0.999474`, inside the declared `0.999` tolerance) -- and the fence gate's job is
+to tell that apart from transport loss rather than demand literal-zero missing.
+It does: `unexpected_transport_missing = 0` on every row. This is the exact case
+the fence-gate fix in this PR exists for: the historical section's `A1`/`A2` rows
+hit the same shape and, before the fix, the executable gate had no way to say so
+without either wrongly failing them or silently requiring 100 % source cadence.
+
+**`first_submit_lateness` p99 is a real percentile, not `max` relabeled.** The
+p99s here (122 ms, 124 ms, 45 ms) and the maxima (290.8 ms, 204.0 ms, 101.3 ms)
+are clearly different values; under the old single-tier 10 ms-range histogram the
+maxima would have landed in the same overflow bucket as everything else in the
+tail. The two-tier histogram (100 us buckets to 10 ms, 1 ms buckets to 1 s) is
+what makes that distinction possible.
+
+**Host conditions, stated rather than hidden.** This is the same shared host as
+the historical run, but its condition changed during the closeout: a preflight
+probe -- an idle 1 ms loop with no benchmark running -- saw 20-300 ms vCPU stalls
+in bursts, and every attempt taken while that was true failed *only* the
+source-cadence criterion (94-233 missed boundaries of 45 592; 51 consecutive
+100 s preflights found a stall above 50 ms and were not followed by a sweep). One
+attempt also failed establishment, and the new admission identity is what caught
+it (`established=39 != fanout=50`, `data_accepted=33720 != data_offered=2279600`)
+instead of reporting a throughput number for a shard that had lost a fifth of its
+population. The artifact above is the run taken once the host measured quiet
+again (2 gaps above 80 ms over 180 s); rep 1's 24 missed boundaries are its
+residue, and the higher `first_submit_lateness` (45-124 ms p99 against the
+historical 11-39 ms) is the same noise. It is reported, not gated: real time stays
+undeclared either way. Nothing here changes the transport-side result, which
+passed in every row of every attempt.
 
 **Conservation, fence, and RX-loss criteria are exact on all three rows**,
-matching the historical run's result: this PR's remaining fixes tightened the
-*executable gate's* semantics and the sender's own RTO/estimator behavior,
-not the transport correctness property the historical run already
-established. Cost is unchanged within measurement noise (`C_SRT`
-15.7-16.3 us/payload, `r_window` 1.221-1.229, against the historical run's
-15.1-17.9 us/payload and ~1.20-1.23).
+matching the historical run's result: the closeout tightened the *executable
+gate's* semantics, the sweep's provenance, and the sender's RTO epoch, not the
+transport correctness property the earlier run had already established. Cost is
+unchanged within measurement noise (`C_SRT` 16.7-18.2 us/payload, `r_window`
+1.210-1.221, against the historical 15.1-17.9 us/payload and ~1.20-1.23).
 
 Real time remains **undeclared** here too -- no `--lateness-budget-us` was
 supplied, and this run does not change that claim.
