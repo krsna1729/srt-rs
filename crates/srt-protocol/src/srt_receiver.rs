@@ -1704,6 +1704,23 @@ impl ReceiverBuffer {
         self.packets.is_empty()
     }
 
+    /// The earliest TSBPD delivery deadline among packets still held, if
+    /// any.
+    ///
+    /// A packet counted here has been fully accepted -- it is complete data
+    /// legitimately waiting for its own playout deadline, not data that can
+    /// never complete. A generic connection-level timeout (the inactivity
+    /// timer bounding a peer-shutdown drain, in particular) must not treat
+    /// that wait as stalled and truncate it: `tsbpd_delay` is configurable
+    /// per session and can exceed any fixed timeout.
+    #[must_use]
+    pub fn earliest_pending_deadline(&self) -> Option<Timestamp> {
+        self.packets
+            .iter()
+            .map(|(_, entry)| self.delivery_time(entry))
+            .min()
+    }
+
     /// Whether this buffer last advertised a full receive window and now has
     /// free capacity again.
     ///

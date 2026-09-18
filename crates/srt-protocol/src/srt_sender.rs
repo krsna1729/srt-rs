@@ -106,6 +106,14 @@ pub struct DroppedMessage {
     pub last_seq: u32,
 }
 
+/// A peer loss report named a position this sender cannot corroborate: never
+/// sent, already retired, or accepted but never actually submitted to the
+/// wire. Carries no data -- see [`SenderBuffer::handle_nak_ranges`]'s doc
+/// comment for exactly what triggers it and why the whole report is
+/// rejected rather than just the offending position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidNak;
+
 /// Send buffer.
 #[derive(Debug)]
 pub struct SenderBuffer {
@@ -236,6 +244,17 @@ pub struct SenderBuffer {
     newest_submitted: Option<u32>,
     /// Sender retransmission-timeout epoch (see [`crate::sender::SenderRto`]).
     rto: SenderRto,
+    /// Round-robin service position for the [`MAX_DROPREQ_PER_NAK`]
+    /// anti-amplification cap.
+    ///
+    /// A repeated NAK covering the same loss range always finds the same
+    /// tombstoned messages in the same order; without rotating which ones
+    /// get served, a range spanning 17+ tombstoned messages would let the
+    /// peer see only the first 16 no matter how many times it repeats the
+    /// NAK, and could never advance its cumulative ACK past them. This
+    /// counts total tombstones served across calls, used only as a rotating
+    /// offset into whatever tombstone list the current call finds.
+    dropreq_cursor: u8,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -292,6 +311,7 @@ impl SenderBuffer {
             sender_rtt_var_micros: INITIAL_RTT_VAR_MICROS,
             newest_submitted: None,
             rto: SenderRto::new(),
+            dropreq_cursor: 0,
         };
         buf.recompute_packet_send_period();
         buf
@@ -1166,24 +1186,28 @@ impl SenderBuffer {
     ///
     /// Validation walks the requested ranges against the window, bounded by
     /// the negotiated window: no expanded sequence list is built.
-    pub fn handle_nak_ranges(&mut self, loss_ranges: &[LossRange]) -> Vec<DroppedMessage> {
-        self.total_naks_received = self.total_naks_received.saturating_add(1);
-
+    pub fn handle_nak_ranges(
+        &mut self,
+        loss_ranges: &[LossRange],
+    ) -> Result<Vec<DroppedMessage>, InvalidNak> {
         let mut requested_span = 0u32;
         for loss in loss_ranges {
             let first_seq = loss.first_seq & SEQUENCE_MASK;
             let last_seq = loss.last_seq & SEQUENCE_MASK;
             let count = (last_seq.wrapping_sub(first_seq) & SEQUENCE_MASK).saturating_add(1);
             if count > self.negotiated_window {
-                return Vec::new();
+                return Err(InvalidNak);
             }
             requested_span = requested_span.saturating_add(count);
             if requested_span > self.negotiated_window {
-                return Vec::new();
+                return Err(InvalidNak);
             }
         }
 
-        // Phase 1: validate everything before touching any state.
+        // Phase 1: validate everything before touching any state, including
+        // `total_naks_received`: an impossible report is not evidence the
+        // peer is alive and playing by the protocol, so it must not be
+        // banked as one.
         let mut tombstones: Vec<(u32, u32)> = Vec::new();
         for loss in loss_ranges {
             let mut sequence = loss.first_seq & SEQUENCE_MASK;
@@ -1194,7 +1218,7 @@ impl SenderBuffer {
                         // Never sent, already acknowledged, or outside the
                         // retained span: not a loss this receiver could have
                         // observed.
-                        return Vec::new();
+                        return Err(InvalidNak);
                     }
                     Some(entry) if entry.dropped => {
                         let message_number = entry.message_number;
@@ -1209,7 +1233,7 @@ impl SenderBuffer {
                     Some(entry) if !entry.submitted => {
                         // Accepted but never on the wire: the peer cannot have
                         // measured it as lost.
-                        return Vec::new();
+                        return Err(InvalidNak);
                     }
                     Some(_) => {}
                 }
@@ -1220,11 +1244,24 @@ impl SenderBuffer {
             }
         }
 
-        // Phase 2: commit.
+        // Phase 2: commit. Only a validated report reaches here, so this is
+        // the one place `total_naks_received` is allowed to move.
+        self.total_naks_received = self.total_naks_received.saturating_add(1);
         for loss in loss_ranges {
             self.queue_loss_range(loss.first_seq, loss.last_seq);
         }
-        tombstones
+
+        if tombstones.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Rotate the start of service by however many tombstones have been
+        // served in total: a range that never shrinks (the peer keeps
+        // repeating the same NAK) then serves a different window of
+        // messages each time instead of stalling on the same first
+        // `MAX_DROPREQ_PER_NAK`. See `dropreq_cursor`'s doc comment.
+        let start = (self.dropreq_cursor as usize) % tombstones.len();
+        tombstones.rotate_left(start);
+        let served: Vec<DroppedMessage> = tombstones
             .into_iter()
             .take(MAX_DROPREQ_PER_NAK)
             .map(|(first_seq, last_seq)| DroppedMessage {
@@ -1235,7 +1272,9 @@ impl SenderBuffer {
                 first_seq,
                 last_seq,
             })
-            .collect()
+            .collect();
+        self.dropreq_cursor = self.dropreq_cursor.wrapping_add(served.len() as u8);
+        Ok(served)
     }
 
     /// Queue retained, live, transmitted packets intersecting one loss range.
@@ -1867,10 +1906,12 @@ mod tests {
                     .is_some()
             );
         }
-        dense.handle_nak_ranges(&[LossRange {
-            first_seq: 0,
-            last_seq: 8_191,
-        }]);
+        dense
+            .handle_nak_ranges(&[LossRange {
+                first_seq: 0,
+                last_seq: 8_191,
+            }])
+            .unwrap();
         assert_eq!(dense.stats().packets_in_loss_list, 8_192);
         for expected in 0..8_192 {
             assert_eq!(dense.pop_retransmit(1).unwrap().0.sequence_number, expected);
@@ -1880,10 +1921,12 @@ mod tests {
         for _ in 0..6 {
             assert!(wrapped.push_submitted(vec![1], 1, 1, now).is_some());
         }
-        wrapped.handle_nak_ranges(&[LossRange {
-            first_seq: 0x7FFF_FFFE,
-            last_seq: 1,
-        }]);
+        wrapped
+            .handle_nak_ranges(&[LossRange {
+                first_seq: 0x7FFF_FFFE,
+                last_seq: 1,
+            }])
+            .unwrap();
         let queued = std::iter::from_fn(|| wrapped.pop_retransmit(1))
             .map(|(header, _)| header.sequence_number)
             .collect::<Vec<_>>();
@@ -2726,10 +2769,12 @@ mod tests {
         // A repeated NAK for the dropped sequence is answered with DROPREQ
         // again -- the peer either lost the first one or has not removed the
         // range yet -- and never with a retransmission of released media.
-        let repeated = buf.handle_nak_ranges(&[LossRange {
-            first_seq: 0,
-            last_seq: 0,
-        }]);
+        let repeated = buf
+            .handle_nak_ranges(&[LossRange {
+                first_seq: 0,
+                last_seq: 0,
+            }])
+            .unwrap();
         assert_eq!(repeated.len(), 1);
         assert_eq!((repeated[0].first_seq, repeated[0].last_seq), (0, 0));
         assert_eq!(buf.stats().packets_in_loss_list, 0);
@@ -2756,10 +2801,12 @@ mod tests {
 
         // The message number is shared by every fragment, so naming the
         // middle one recovers the whole DROPREQ range.
-        let repeated = buf.handle_nak_ranges(&[LossRange {
-            first_seq: 1,
-            last_seq: 1,
-        }]);
+        let repeated = buf
+            .handle_nak_ranges(&[LossRange {
+                first_seq: 1,
+                last_seq: 1,
+            }])
+            .unwrap();
         assert_eq!(repeated.len(), 1);
         assert_eq!((repeated[0].first_seq, repeated[0].last_seq), (0, 2));
         assert_eq!(repeated[0].message_number, dropped[0].message_number);
@@ -2785,10 +2832,12 @@ mod tests {
         // A range that crosses 0x7FFF_FFFF -> 0 names two of the three
         // dropped messages (each `push` is its own message), so each gets its
         // own DROPREQ.
-        let across_the_wrap = buf.handle_nak_ranges(&[LossRange {
-            first_seq: 0x7FFF_FFFE,
-            last_seq: 0x7FFF_FFFF,
-        }]);
+        let across_the_wrap = buf
+            .handle_nak_ranges(&[LossRange {
+                first_seq: 0x7FFF_FFFE,
+                last_seq: 0x7FFF_FFFF,
+            }])
+            .unwrap();
         assert_eq!(across_the_wrap.len(), 2);
         assert_eq!(
             across_the_wrap
@@ -2797,10 +2846,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             [(0x7FFF_FFFE, 0x7FFF_FFFE), (0x7FFF_FFFF, 0x7FFF_FFFF)]
         );
-        let past_the_wrap = buf.handle_nak_ranges(&[LossRange {
-            first_seq: 0,
-            last_seq: 0,
-        }]);
+        let past_the_wrap = buf
+            .handle_nak_ranges(&[LossRange {
+                first_seq: 0,
+                last_seq: 0,
+            }])
+            .unwrap();
         assert_eq!(past_the_wrap.len(), 1);
         assert_eq!(past_the_wrap[0].first_seq, 0);
 
@@ -2831,16 +2882,19 @@ mod tests {
         assert_eq!(buf.stats().payload_bytes_in_buffer, 0);
         // One report cannot be amplified without bound: the DROPREQ batch is
         // capped, and repeating the request produces the same bounded work.
-        let answered = buf.handle_nak_ranges(&[LossRange {
-            first_seq: 0,
-            last_seq: WINDOW - 1,
-        }]);
+        let answered = buf
+            .handle_nak_ranges(&[LossRange {
+                first_seq: 0,
+                last_seq: WINDOW - 1,
+            }])
+            .unwrap();
         assert_eq!(answered.len(), MAX_DROPREQ_PER_NAK);
         assert_eq!(
             buf.handle_nak_ranges(&[LossRange {
                 first_seq: 0,
                 last_seq: WINDOW - 1,
             }])
+            .unwrap()
             .len(),
             MAX_DROPREQ_PER_NAK
         );
@@ -2860,6 +2914,43 @@ mod tests {
         assert!(!buf.can_send());
         buf.set_peer_window(WINDOW, 32);
         assert!(buf.can_send(), "the advertised window reopens the flight");
+    }
+
+    /// A NAK range spanning more tombstoned messages than
+    /// `MAX_DROPREQ_PER_NAK` allows must not stall on the same lexically
+    /// first messages forever: repeating the identical NAK has to eventually
+    /// serve every tombstone, not just the first 16 every time.
+    #[test]
+    fn a_repeated_broad_nak_fairly_serves_every_tombstone_over_time() {
+        let now = Timestamp::default();
+        const MESSAGES: u32 = 17;
+        let mut buf = SenderBuffer::new(0, MESSAGES + 8, 10);
+        for _ in 0..MESSAGES {
+            buf.push_submitted(vec![1], 1, 1, now).expect("admitted");
+        }
+        let dropped = buf.drop_expired(Timestamp::from_micros(1_000_001));
+        assert_eq!(dropped.len() as u32, MESSAGES, "one tombstone per message");
+
+        let mut ever_served: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for _ in 0..(MESSAGES as usize).div_ceil(MAX_DROPREQ_PER_NAK) + 1 {
+            let served = buf
+                .handle_nak_ranges(&[LossRange {
+                    first_seq: 0,
+                    last_seq: MESSAGES - 1,
+                }])
+                .unwrap();
+            assert_eq!(
+                served.len(),
+                MAX_DROPREQ_PER_NAK,
+                "the anti-amplification cap still holds every round"
+            );
+            ever_served.extend(served.iter().map(|msg| msg.first_seq));
+        }
+        assert_eq!(
+            ever_served.len() as u32,
+            MESSAGES,
+            "every tombstoned message must eventually be represented by a DROPREQ"
+        );
     }
 
     /// A peer loss report is applied whole or not at all.
@@ -2883,7 +2974,7 @@ mod tests {
                 last_seq: 1_000,
             },
         ]);
-        assert!(rejected.is_empty());
+        assert!(rejected.is_err());
         assert_eq!(buf.stats().packets_in_loss_list, 0);
         assert!(buf.pop_retransmit(1).is_none());
 
@@ -2894,14 +2985,16 @@ mod tests {
             first_seq: 4,
             last_seq: 4,
         }]);
-        assert!(rejected.is_empty());
+        assert!(rejected.is_err());
         assert_eq!(buf.stats().packets_in_loss_list, 0);
 
         // A live, transmitted position is retransmitted.
-        let dropped = buf.handle_nak_ranges(&[LossRange {
-            first_seq: 2,
-            last_seq: 2,
-        }]);
+        let dropped = buf
+            .handle_nak_ranges(&[LossRange {
+                first_seq: 2,
+                last_seq: 2,
+            }])
+            .unwrap();
         assert!(dropped.is_empty());
         assert_eq!(buf.pop_retransmit(1).expect("queued").0.sequence_number, 2);
 
@@ -2923,7 +3016,7 @@ mod tests {
             first_seq: 0,
             last_seq: 1 << 20,
         }]);
-        assert!(rejected.is_empty());
+        assert!(rejected.is_err());
     }
 
     /// A range crossing the 31-bit wrap is valid where it is logically inside
@@ -2936,10 +3029,12 @@ mod tests {
             buf.push_submitted(vec![1], 1, 1, now).expect("admitted");
         }
 
-        let dropped = buf.handle_nak_ranges(&[LossRange {
-            first_seq: 0x7FFF_FFFF,
-            last_seq: 0,
-        }]);
+        let dropped = buf
+            .handle_nak_ranges(&[LossRange {
+                first_seq: 0x7FFF_FFFF,
+                last_seq: 0,
+            }])
+            .unwrap();
         assert!(dropped.is_empty());
         assert_eq!(buf.stats().packets_in_loss_list, 2);
         assert_eq!(

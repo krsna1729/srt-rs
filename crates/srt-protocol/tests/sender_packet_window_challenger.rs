@@ -71,18 +71,22 @@ fn sender_nak_range_intersection_and_duplicate_suppression() {
     assert!(!sender.has_retransmit());
 
     // NAK packets 3..=7.
-    sender.handle_nak_ranges(&[LossRange {
-        first_seq: 3,
-        last_seq: 7,
-    }]);
+    sender
+        .handle_nak_ranges(&[LossRange {
+            first_seq: 3,
+            last_seq: 7,
+        }])
+        .unwrap();
     assert!(sender.has_retransmit());
     assert_eq!(sender.stats().packets_in_loss_list, 5);
 
     // Duplicate NAK must not re-increment loss list count.
-    sender.handle_nak_ranges(&[LossRange {
-        first_seq: 3,
-        last_seq: 5,
-    }]);
+    sender
+        .handle_nak_ranges(&[LossRange {
+            first_seq: 3,
+            last_seq: 5,
+        }])
+        .unwrap();
     assert_eq!(sender.stats().packets_in_loss_list, 5);
 
     // Pop retransmits in order.
@@ -134,10 +138,12 @@ fn a_repeated_nak_expands_a_wrapped_dropped_message_and_the_ack_reclaims_it() {
     sender.push_message(&[0xAB; 3_000], 1_000, 1, 1, ts(1_000));
     sender.drop_expired(ts(2_000_000));
 
-    let repeated = sender.handle_nak_ranges(&[LossRange {
-        first_seq: MASK,
-        last_seq: 0,
-    }]);
+    let repeated = sender
+        .handle_nak_ranges(&[LossRange {
+            first_seq: MASK,
+            last_seq: 0,
+        }])
+        .unwrap();
     assert_eq!(repeated.len(), 1);
     assert_eq!(repeated[0].first_seq, MASK - 1);
     assert_eq!(repeated[0].last_seq, 0);
@@ -236,10 +242,12 @@ fn physical_slot_reuse_does_not_alias_stale_retransmit_entry() {
 
     // 1. Send packet 0 and NAK it (queued for retransmit).
     push_transmitted(&mut sender, 0);
-    sender.handle_nak_ranges(&[LossRange {
-        first_seq: 0,
-        last_seq: 0,
-    }]);
+    sender
+        .handle_nak_ranges(&[LossRange {
+            first_seq: 0,
+            last_seq: 0,
+        }])
+        .unwrap();
     assert!(sender.has_retransmit());
 
     // 2. ACK packet 0 without retransmitting (e.g. peer recovered via FEC).
@@ -259,10 +267,12 @@ fn physical_slot_reuse_does_not_alias_stale_retransmit_entry() {
     assert_eq!(sender.packets_in_flight(), 1);
 
     // 5. NAK packet 64 -> physical slot 0 has retransmit_queued bit set for seq 64.
-    sender.handle_nak_ranges(&[LossRange {
-        first_seq: 64,
-        last_seq: 64,
-    }]);
+    sender
+        .handle_nak_ranges(&[LossRange {
+            first_seq: 64,
+            last_seq: 64,
+        }])
+        .unwrap();
     assert!(sender.has_retransmit());
 
     // 6. Pop retransmit must yield sequence 64, NOT sequence 0.
@@ -286,10 +296,12 @@ fn tlpktdrop_cycles_stay_bounded_and_the_ack_reclaims_them() {
     for _ in 0..1_050 {
         let seq = sender.next_sequence_number();
         push_transmitted(&mut sender, 1);
-        sender.handle_nak_ranges(&[LossRange {
-            first_seq: seq,
-            last_seq: seq,
-        }]);
+        sender
+            .handle_nak_ranges(&[LossRange {
+                first_seq: seq,
+                last_seq: seq,
+            }])
+            .unwrap();
         assert!(sender.has_retransmit());
         let dropped = sender.drop_expired(drop_time);
         assert_eq!(dropped.len(), 1);

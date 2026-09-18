@@ -1841,9 +1841,28 @@ impl SrtConnection {
             return;
         }
         self.finish_peer_shutdown_if_drained();
-        if self.peer_shutdown_pending {
-            self.finish_local_close(DisconnectReason::PeerShutdown);
+        if !self.peer_shutdown_pending {
+            return;
         }
+        // A configured TSBPD delay can exceed the fixed inactivity timeout:
+        // data this receiver has fully accepted may legitimately still be
+        // waiting for its own playout deadline, which is not the same thing
+        // as a drain that has stalled. Defer to that deadline instead of
+        // truncating it -- once it passes, this timer fires again and either
+        // the data has been delivered (drained) or TLPKTDROP has retired it.
+        if let Some(deadline) = self
+            .receiver
+            .as_ref()
+            .and_then(ReceiverBuffer::earliest_pending_deadline)
+            && now < deadline
+        {
+            self.queue_output(QueuedOutput::SetTimer {
+                id: TimerId::Inactivity,
+                duration_micros: deadline.as_micros().saturating_sub(now.as_micros()).max(1),
+            });
+            return;
+        }
+        self.finish_local_close(DisconnectReason::PeerShutdown);
     }
 
     fn handle_shutdown_timer(&mut self, now: Timestamp) {
@@ -3033,6 +3052,21 @@ impl SrtConnection {
             pkt.control_info.len()
         );
 
+        // An ACK cannot legitimately name a cumulative position beyond
+        // everything this sender has ever put on the wire: the peer can only
+        // report having received up to its own transmitted frontier. Treating
+        // such a position as merely "not current" (as a stale/duplicate ACK
+        // is) would still let `set_peer_window` below use it to compute an
+        // advertised window end past that frontier, so it is rejected
+        // outright rather than silently ignored.
+        if let Some(sender) = self.sender.as_ref()
+            && sequence_less_than(sender.next_sequence_number(), ack_seq)
+        {
+            return Err(Error::invalid_data(format!(
+                "ACK names sequence {ack_seq}, beyond the sender's transmitted frontier"
+            )));
+        }
+
         // 送信バッファから ACK されたパケットを削除
         let mut ack_progressed = false;
         let mut ack_is_current = false;
@@ -3121,7 +3155,11 @@ impl SrtConnection {
         // DROPREQ again -- the peer either lost the first one or still holds
         // the range -- and never with a retransmission of released media.
         let dropped = match self.sender.as_mut() {
-            Some(sender) => sender.handle_nak_ranges(&loss_ranges),
+            Some(sender) => sender.handle_nak_ranges(&loss_ranges).map_err(|_| {
+                Error::invalid_data(
+                    "NAK reports a loss position this sender never sent or already retired",
+                )
+            })?,
             None => Vec::new(),
         };
         for msg in &dropped {
@@ -3911,8 +3949,13 @@ fn validate_control_information(pkt: &ControlPacket) -> Result<(), Error> {
         )));
     }
     match pkt.control_type {
-        // A Light ACK is exactly the cumulative position.
-        ControlType::Ack if len < 4 => Err(Error::invalid_data("ACK control info is too short")),
+        // The draft defines exactly three ACK shapes: Light (4 bytes, the
+        // cumulative position alone), Small (16 bytes, adds the advertised
+        // buffer size), and Full (28 bytes, adds RTT/RTTVar and the rate
+        // estimates). Any other aligned length is not a protocol transition.
+        ControlType::Ack if !matches!(len, 4 | 16 | 28) => Err(Error::invalid_data(format!(
+            "ACK control info must be 4, 16, or 28 bytes, got {len}"
+        ))),
         // A DROPREQ is exactly the two 31-bit sequence words it names.
         ControlType::DropReq if len != 8 => Err(Error::invalid_data(format!(
             "DROPREQ control info must be 8 bytes, got {len}"
@@ -4859,7 +4902,8 @@ mod tests {
             .handle_nak_ranges(&[LossRange {
                 first_seq: first + 1,
                 last_seq: first + 1,
-            }]);
+            }])
+            .unwrap();
         assert!(caller.has_retransmit(), "the NAK leaves work pending");
 
         let expiry = Timestamp::from_micros(now.as_micros() + armed_with + 1);
@@ -4965,7 +5009,8 @@ mod tests {
             .handle_nak_ranges(&[LossRange {
                 first_seq,
                 last_seq,
-            }]);
+            }])
+            .unwrap();
 
         caller.process_retransmit(now);
 
@@ -6186,7 +6231,11 @@ mod tests {
     /// This is the invariant Robotweax 0.2.2 pins with
     /// `compat_runtime_rejects_malformed_controls_without_refreshing_liveness`,
     /// reached here through the real wire decoder rather than by calling the
-    /// handlers directly.
+    /// handlers directly. Also covers ACK/NAK payloads that are well-formed
+    /// but semantically impossible (a non-canonical ACK length, or a
+    /// cumulative/loss position beyond what this sender has ever
+    /// transmitted): those are rejected by the handlers themselves, not by
+    /// shape validation, but must leave exactly the same zero footprint.
     #[test]
     #[cfg_attr(
         all(miri, not(feature = "miri-extended")),
@@ -6210,6 +6259,12 @@ mod tests {
         assert_eq!(caller.last_recv_time, Some(now));
 
         let unaligned_ack = vec![0u8; 6];
+        let non_canonical_ack_length = {
+            let mut cif = Vec::new();
+            write_u32(&mut cif, 0);
+            write_u32(&mut cif, 0);
+            cif
+        };
         let nak_range_without_end = vec![0x80, 0, 0, 0];
         let drop_req_high_bit = {
             let mut cif = Vec::new();
@@ -6217,10 +6272,35 @@ mod tests {
             write_u32(&mut cif, 1);
             cif
         };
+        // Beyond everything this sender has ever put on the wire: a position
+        // no peer could legitimately report, in either an ACK's cumulative
+        // position or a NAK's loss list.
+        let beyond_frontier = caller
+            .next_sequence_number()
+            .expect("connected sender")
+            .wrapping_add(1_000)
+            & 0x7FFF_FFFF;
+        let future_ack = {
+            let mut cif = Vec::new();
+            write_u32(&mut cif, beyond_frontier);
+            cif
+        };
         let malformed: Vec<(&str, Vec<u8>)> = vec![
             (
                 "ACK without a cumulative position",
                 control_datagram(socket_id, ControlType::Ack, 0, 0, Vec::new()),
+            ),
+            (
+                "ACK with a non-canonical (non 4/16/28-byte) length",
+                control_datagram(socket_id, ControlType::Ack, 0, 0, non_canonical_ack_length),
+            ),
+            (
+                "ACK naming a sequence beyond the sender's transmitted frontier",
+                control_datagram(socket_id, ControlType::Ack, 0, 0, future_ack),
+            ),
+            (
+                "NAK naming a sequence this sender never sent",
+                nak_datagram(socket_id, &[beyond_frontier, beyond_frontier]),
             ),
             (
                 "ACK with an unaligned cumulative position",
@@ -6546,6 +6626,76 @@ mod tests {
 
         // Draining the application queue completes the close: the state
         // change first, then exactly one terminal event.
+        assert_peer_shutdown_terminal(&mut conn);
+    }
+
+    /// A configured TSBPD delay that exceeds the fixed inactivity timeout
+    /// must not let the inactivity timer preempt it: SHUTDOWN arrives while
+    /// data is still legitimately waiting for a playout deadline well past
+    /// five seconds, and the connection must defer to that deadline rather
+    /// than truncating the drain.
+    #[test]
+    fn inactivity_timeout_never_preempts_a_tsbpd_deadline_beyond_it() {
+        const DELAY_MS: u16 = 8_000; // 8s, past the fixed 5s inactivity timeout.
+        let mut conn = tsbpd_listener(DELAY_MS, false, 8);
+        let socket_id = conn.options.socket_id;
+        let arrived = Timestamp::from_micros(2_000);
+
+        // One message, source timestamp 50 us, so its playout deadline is
+        // 50 + 8_000_000 us = 8_000_050 on this connection's clock.
+        conn.handle_data_packet(
+            DataPacket::new(0, 1, 50, 0, b"srt".to_vec().into()),
+            arrived,
+        )
+        .expect("DATA is accepted");
+
+        conn.feed_recv_buf(
+            &control_datagram(socket_id, ControlType::Shutdown, 0, 0, vec![0; 4]),
+            arrived,
+        )
+        .expect("the peer's SHUTDOWN is accepted");
+        assert!(conn.peer_shutdown_pending);
+
+        // The fixed inactivity timeout elapses (5s after the last received
+        // packet) while the message's own deadline is still ~3s away. The
+        // generic timeout must defer to it instead of truncating the drain.
+        let inactivity_elapsed = Timestamp::from_micros(2_000 + 5_000_000);
+        conn.handle_timer(TimerId::Inactivity, inactivity_elapsed)
+            .expect("inactivity tick");
+        assert_eq!(
+            conn.state(),
+            ConnectionState::Connected,
+            "a valid TSBPD deadline beyond the inactivity timeout must not be truncated"
+        );
+        assert!(
+            conn.poll_event().is_none(),
+            "no terminal event before the message's own deadline"
+        );
+
+        // The rearmed inactivity timer must target the message's actual
+        // deadline, not fire again immediately.
+        let rearmed = drain_outputs(&mut conn).into_iter().find_map(|output| {
+            if let ConnectionOutput::SetTimer {
+                id: TimerId::Inactivity,
+                duration_micros,
+            } = output
+            {
+                Some(duration_micros)
+            } else {
+                None
+            }
+        });
+        assert_eq!(
+            rearmed,
+            Some(8_000_050 - (2_000 + 5_000_000)),
+            "the inactivity timer must be deferred to the pending TSBPD deadline"
+        );
+
+        // At its actual deadline the payload surfaces normally, and only
+        // then does the peer close become terminal.
+        conn.handle_timer(TimerId::Ack, Timestamp::from_micros(8_000_050))
+            .expect("ACK tick");
+        assert_delivered_payload(&mut conn, b"srt");
         assert_peer_shutdown_terminal(&mut conn);
     }
 
