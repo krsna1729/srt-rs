@@ -132,6 +132,12 @@ struct QualReport {
     /// destinations that no longer existed).
     offered: u64,
     accepted: u64,
+    /// The Owner's typed fault state at the end of the run: a dead TX lane, a
+    /// short or failed send completion, a stopped managed RX task, or a
+    /// completed shutdown. A fault stops admission and transmission, so a
+    /// capacity row that cannot report this cannot claim the transport under
+    /// test stayed healthy -- and the rate it measured is not a capacity result.
+    owner_faulted: bool,
     /// Wire submissions attributed to the WINDOW only; the drain phase is
     /// counted separately so the two are never mixed.
     submitted: u64,
@@ -693,6 +699,9 @@ async fn run_sender(
             owner.tx_in_flight() as u64 + if owner.has_pending_work(now) { 1 } else { 0 };
 
         report.rx_mode = format!("{:?}", owner.rx_mode());
+        // A fault is sticky and typed; sampling it at the end reports whether
+        // the transport under test ever left its healthy state during the run.
+        report.owner_faulted = owner.fault().is_some();
         // The sender's own receive side is the caller socket.
         if let Some(stats) = owner.rx_stats().caller {
             report.rx_dropped = stats.dropped;
@@ -783,7 +792,7 @@ fn main() {
          tx_class_data_first={} tx_class_data_retx={} tx_class_ack={} tx_class_ackack={} \
          tx_class_nak={} tx_class_keepalive={} tx_class_handshake={} tx_class_dropreq={} \
          tx_class_km={} tx_class_shutdown={} tx_class_other_control={} tx_class_total={} \
-         drain_class_total={} \
+         drain_class_data_retx={} drain_class_total={} \
          first_submit_lateness_us_p50={} first_submit_lateness_us_p99={} \
          first_submit_lateness_us_max={} first_submit_lateness_samples={} \
          pending_after_drain={} rx_mode={} managed_rx={} \
@@ -791,7 +800,7 @@ fn main() {
          tx_pool_free={} tx_pool_capacity={} tx_pool_high_water={} \
          payload_bytes={} interval_us={} \
          offered_bps_per_dest={} fence_offered={} fence_accepted={} \
-         cpu_ms={:.1} window_cpu_ms={:.1} drain_cpu_ms={:.1}",
+         cpu_ms={:.1} window_cpu_ms={:.1} drain_cpu_ms={:.1} owner_faulted={}",
         report.fanout,
         report.tx_lanes,
         report.connect_cc,
@@ -834,6 +843,7 @@ fn main() {
         report.tx_class.shutdown,
         report.tx_class.other_control,
         report.tx_class.total(),
+        report.drain_class.data_retx,
         report.drain_class.total(),
         report.first_submit_lateness_us_p50,
         report.first_submit_lateness_us_p99,
@@ -857,5 +867,6 @@ fn main() {
         report.cpu_ms,
         report.window_cpu_ms,
         report.drain_cpu_ms,
+        report.owner_faulted,
     );
 }

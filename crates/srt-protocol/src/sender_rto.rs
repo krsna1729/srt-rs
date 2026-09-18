@@ -87,6 +87,27 @@ pub const MAX_RTO_MICROS: u64 = 4_000_000;
 /// 320 ms timeout, so further shifts cannot change the result.
 const MAX_BACKOFF_SHIFT: u32 = 6;
 
+/// What a DATA submission means for the sender's retransmission timeout.
+///
+/// Produced by [`crate::sender::SenderBuffer::note_data_submitted`], the boundary
+/// at which the protocol learns a datagram really left it. Three outcomes,
+/// because "submission" covers three different events and only two of them may
+/// touch the deadline:
+///
+/// * an ordinary submission while an epoch is running changes nothing --
+///   restarting on submission would let a busy sender postpone its own timeout
+///   forever while one early packet stayed stranded, which is the failure this
+///   timer exists to catch;
+/// * the first submission after an empty flight starts a fresh epoch;
+/// * the pending blind probe actually crossing the submission boundary
+///   reprograms the epoch from that instant (see [`SenderRto::rearm`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RtoArm {
+    Nothing,
+    Start,
+    Rearm,
+}
+
 /// Sender-side retransmission timeout.
 ///
 /// Holds only what the protocol owns: whether an epoch is running, how many
@@ -156,9 +177,15 @@ impl SenderRto {
     /// pending marker if it matches. A submission of a *different* sequence
     /// (an ordinary first transmission, or NAK-driven recovery running
     /// alongside) must not clear a still-outstanding probe.
-    pub fn confirm_probe_submitted(&mut self, sequence: u32) {
+    ///
+    /// Returns whether this submission *was* the pending blind probe, which is
+    /// the event that has to reprogram the epoch (see [`Self::rearm`]).
+    pub fn confirm_probe_submitted(&mut self, sequence: u32) -> bool {
         if self.probe_pending == Some(sequence) {
             self.probe_pending = None;
+            true
+        } else {
+            false
         }
     }
 
@@ -212,6 +239,24 @@ impl SenderRto {
     pub fn expire(&mut self, base_micros: u64) -> u64 {
         self.armed = true;
         self.backoffs = self.backoffs.saturating_add(1);
+        self.timeout_micros(base_micros)
+    }
+
+    /// Reprogram the epoch from the instant a blind probe actually left the
+    /// protocol, returning the timeout to program.
+    ///
+    /// The timeout is defined as elapsed time **after DATA is sent**, and a
+    /// probe queued into the connection's output is not DATA sent: a transport
+    /// with no TX capacity can leave it sitting until shortly before the
+    /// deadline it was queued under. Left alone, that deadline then fires a few
+    /// microseconds after the probe finally goes out and permits another blind
+    /// probe with essentially no elapsed-time evidence behind it -- two probes
+    /// in a row, which is the thing the one-probe bound exists to prevent.
+    /// Reprogramming here restarts the *measurement*, not the policy:
+    /// `backoffs` is preserved, because a submission is not the ACK progress
+    /// that is allowed to reset the backoff.
+    pub fn rearm(&mut self, base_micros: u64) -> u64 {
+        self.armed = true;
         self.timeout_micros(base_micros)
     }
 }
@@ -270,5 +315,35 @@ mod tests {
         rto.stop();
         assert!(!rto.is_armed());
         assert_eq!(rto.backoffs(), 0);
+    }
+
+    /// The epoch a late probe leaves behind: measured from the submission (which
+    /// is what the caller does with the returned duration), and still backed off,
+    /// because a submission is not the ACK progress that may reset the backoff.
+    #[test]
+    fn rearm_returns_the_backed_off_interval_and_keeps_the_backoff() {
+        let base = 320_000;
+        let mut rto = SenderRto::new();
+        rto.start(base);
+        rto.expire(base);
+        assert_eq!(rto.backoffs(), 1);
+
+        rto.set_probe_pending(7);
+        assert!(
+            !rto.confirm_probe_submitted(8),
+            "a different sequence must not clear a still-outstanding probe"
+        );
+        assert_eq!(rto.probe_pending(), Some(7));
+        assert!(rto.confirm_probe_submitted(7));
+        assert_eq!(rto.probe_pending(), None);
+
+        assert_eq!(rto.rearm(base), 2 * base);
+        assert_eq!(rto.backoffs(), 1, "a submission must not reset the backoff");
+        assert!(rto.is_armed());
+        assert_eq!(
+            rto.rearm(base),
+            2 * base,
+            "rearming twice from the same submission state is idempotent"
+        );
     }
 }

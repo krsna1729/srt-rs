@@ -460,7 +460,16 @@ fn ack_progress_updates_the_timer_even_with_data_still_queued() {
 /// the next queued output is a datagram -- modeling a transport that has run
 /// out of TX capacity for datagrams. Timer actions cost no such capacity, so
 /// a real bounded transport keeps draining those regardless.
-fn drain_timers_only(conn: &mut SrtConnection, timers: &mut ManualTimerStore, now: Timestamp) {
+///
+/// Returns the `SenderRto` deadline among the actions drained, if any: a test
+/// about the timer's own epoch cannot ask the store what is next, because
+/// connection setup leaves unrelated timers (keepalive, ACK cadence) in it.
+fn drain_timers_only(
+    conn: &mut SrtConnection,
+    timers: &mut ManualTimerStore,
+    now: Timestamp,
+) -> Option<u64> {
+    let mut deadline = None;
     while let Some(OutputMeta::SetTimer { .. }) | Some(OutputMeta::ClearTimer { .. }) =
         conn.peek_output()
     {
@@ -468,8 +477,16 @@ fn drain_timers_only(conn: &mut SrtConnection, timers: &mut ManualTimerStore, no
             .poll_output()
             .expect("exact-size output materializes")
             .expect("peeked output is still there");
+        if let ConnectionOutput::SetTimer {
+            id: TimerId::SenderRto,
+            duration_micros,
+        } = &output
+        {
+            deadline = Some(now.as_micros() + duration_micros);
+        }
         timers.apply_output(&output, now);
     }
+    deadline
 }
 
 /// Every retransmitted DATA sequence among a batch of drained outputs,
@@ -578,5 +595,153 @@ fn a_blocked_probe_is_never_queued_twice() {
         1,
         "a fresh expiry after the earlier probe was actually submitted must queue \
          exactly one new probe, got {reprobed:?}"
+    );
+}
+
+/// Apply `output` to the endpoint's timer store, tracking the `SenderRto`
+/// deadline the store holds.
+///
+/// `ManualTimerStore::next_deadline` is the earliest deadline of *every* timer
+/// in the store, and connection setup leaves unrelated ones (keepalive, ACK
+/// cadence) behind -- so a test about the RTO's own epoch has to watch the RTO's
+/// own `SetTimer`/`ClearTimer` actions instead of asking the store what is next.
+fn apply_tracking_rto(
+    endpoint: &mut Endpoint,
+    output: &ConnectionOutput,
+    now: Timestamp,
+    deadline: &mut Option<u64>,
+) {
+    match output {
+        ConnectionOutput::SetTimer {
+            id: TimerId::SenderRto,
+            duration_micros,
+        } => *deadline = Some(now.as_micros() + duration_micros),
+        ConnectionOutput::ClearTimer {
+            id: TimerId::SenderRto,
+        } => *deadline = None,
+        _ => {}
+    }
+    endpoint.timers.apply_output(output, now);
+}
+
+/// Regression, the timer's epoch: the RTO is elapsed time **after DATA is
+/// sent**, so a blind probe that only crosses the submission boundary at the
+/// very end of its backed-off interval must reprogram the epoch from that
+/// instant.
+///
+/// Without this, the sequence below leaves the old deadline in place. It fires
+/// microseconds after the probe finally goes out and permits a second blind
+/// probe with essentially no elapsed-time evidence behind it -- two probes in a
+/// row, which is the accumulation the one-probe bound exists to prevent. The
+/// old deadline is *not* invalid because it is early: it is invalid because a
+/// probe sitting behind blocked TX capacity has not been on the wire, and the
+/// timeout measures the wire.
+#[test]
+fn a_probe_submitted_late_rearms_a_whole_backed_off_interval() {
+    let (mut caller, _listener) = connected_pair();
+    drain_residual(&mut caller.conn);
+    let mut now = Timestamp::from_micros(1_000_000);
+    for i in 0..FLIGHT {
+        caller
+            .conn
+            .send(format!("payload {i}").as_bytes(), now)
+            .expect("send admits the payload");
+    }
+
+    // Submit the whole flight, tracking the RTO deadline as it is programmed.
+    // Nothing is ever acknowledged in this test, so the §4.10 estimator stays
+    // at its starting constants and the base timeout does not drift.
+    let mut rto_deadline = None;
+    let mut base = None;
+    while let Some(output) = caller.conn.poll_output().unwrap() {
+        if let ConnectionOutput::SetTimer {
+            id: TimerId::SenderRto,
+            duration_micros,
+        } = &output
+        {
+            base = Some(*duration_micros);
+        }
+        apply_tracking_rto(&mut caller, &output, now, &mut rto_deadline);
+    }
+    let base = base.expect("submitting the flight arms the sender timeout");
+    assert_eq!(
+        rto_deadline,
+        Some(now.as_micros() + base),
+        "the first submission arms the epoch from the base timeout"
+    );
+
+    // One expiry with the probe left un-submitted behind blocked TX capacity:
+    // timer actions drain (they cost no TX capacity), the datagram does not.
+    let expiry = Timestamp::from_micros(rto_deadline.expect("armed") + 1);
+    caller.timers.fire_expired(expiry, &mut caller.conn);
+    let backed_off_deadline = drain_timers_only(&mut caller.conn, &mut caller.timers, expiry)
+        .expect("an expiry with outstanding data rearms");
+    assert_eq!(
+        backed_off_deadline,
+        expiry.as_micros() + 2 * base,
+        "one expiry doubles the programmed interval"
+    );
+    rto_deadline = Some(backed_off_deadline);
+
+    // Capacity returns one microsecond before that deadline: the probe goes out
+    // with essentially the whole backed-off interval already spent waiting to be
+    // allowed onto the wire.
+    now = Timestamp::from_micros(backed_off_deadline - 1);
+    let mut rearmed = None;
+    while let Some(output) = caller.conn.poll_output().unwrap() {
+        if let ConnectionOutput::SetTimer {
+            id: TimerId::SenderRto,
+            duration_micros,
+        } = &output
+        {
+            rearmed = Some(*duration_micros);
+        }
+        apply_tracking_rto(&mut caller, &output, now, &mut rto_deadline);
+    }
+    assert_eq!(
+        rearmed,
+        Some(2 * base),
+        "the probe's submission must reprogram the backed-off interval, not the \
+         base one and not nothing at all"
+    );
+    assert_eq!(
+        rto_deadline,
+        Some(now.as_micros() + 2 * base),
+        "the next deadline must be a whole backed-off RTO measured from the \
+         submission"
+    );
+
+    // Behaviourally, not just arithmetically: the old deadline is now in the
+    // past, and firing it must produce no second probe.
+    let just_after_old = Timestamp::from_micros(backed_off_deadline + 1);
+    caller.timers.fire_expired(just_after_old, &mut caller.conn);
+    let mut outputs = Vec::new();
+    while let Some(output) = caller.conn.poll_output().unwrap() {
+        apply_tracking_rto(&mut caller, &output, just_after_old, &mut rto_deadline);
+        outputs.push(output);
+    }
+    assert!(
+        retransmitted_sequences(&outputs).is_empty(),
+        "the probe just went out; the epoch it reprogrammed must not probe again \
+         a microsecond later"
+    );
+
+    // And the epoch is alive rather than merely quiet: a whole backed-off
+    // interval after the submission, exactly one fresh probe is eligible.
+    let at_deadline = Timestamp::from_micros(
+        rto_deadline.expect("the epoch is still armed after the submission") + 1,
+    );
+    caller.timers.fire_expired(at_deadline, &mut caller.conn);
+    let mut outputs = Vec::new();
+    while let Some(output) = caller.conn.poll_output().unwrap() {
+        apply_tracking_rto(&mut caller, &output, at_deadline, &mut rto_deadline);
+        outputs.push(output);
+    }
+    let reprobed = retransmitted_sequences(&outputs);
+    assert_eq!(
+        reprobed.len(),
+        1,
+        "one full backed-off interval after the submission, one probe is \
+         eligible again, got {reprobed:?}"
     );
 }

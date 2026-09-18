@@ -189,7 +189,12 @@ unless a path is given.
 | 11 telemetry meanings | `report_tx_class_total_matches_submitted_packets_every_visit`, `tx_class_delta_reports_only_this_visits_submissions`, `first_submit_lateness_samples_only_first_transmission_data_with_a_due_instant`, `first_submit_lateness_measures_a_real_application_submission`, `tx_pool_high_water_tracks_the_peak_and_never_exceeds_capacity`, `rx_stats_expose_both_sides`, `rx_session_totals_report_live_sessions_and_survive_retirement`, `rx_session_totals_are_none_without_an_attached_side`, `rx_session_totals_include_bonded_group_legs` |
 
 Row-level evidence is gated separately, in `cargo xtask qualify`: a
-qualification row must decompose its wire submissions
-(`sum(tx_class_*) == tx_class_total == tx_submitted_wire`) and carry the
-first-submit lateness fields. That gate is the executable form of clause 11 for
-published results.
+qualification row must be a row of the workload it claims (the whole requested
+fanout established at both endpoints, `data_offered == generated_ticks x
+established`, and `data_accepted == data_offered`), must decompose its wire
+submissions (`sum(tx_class_*) == tx_class_total == tx_submitted_wire`), and must
+carry the first-submit lateness fields. A canonical artifact (`--require-clean`)
+additionally has to report `owner_faulted=false`, `git_dirty=false`,
+`built_by_scaling=true`, a drained pre-window, and its packet-level duplicates
+bounded by the retransmission traffic that explains them. That gate is the
+executable form of clause 11 for published results.

@@ -46,12 +46,34 @@ reduced by a slow service loop.
 | condition | why |
 |---|---|
 | `generated_ticks / expected_ticks` >= 0.999 | the offer was held, not merely made |
+| `established == fanout == rx_established` | the requested population existed, at both endpoints |
+| `data_offered == generated_ticks * established` | every established destination was offered every generated tick |
+| `data_accepted == data_offered` | the transport admitted the offer, not only the part it accepted |
 | `data_accepted == rx_core_total` | accepted is not delivered |
 | `data_zero == 0` | no destination starved |
 | `data_below_half_mean == 0` | no slow subset |
 | `sec_a == 0` | no reported loss |
 | `drain_ok == true`, `pending_after_drain == 0` | equilibrium reached |
 | `window_cpu_ms > 0`, `cpu_ms > 0` | the CPU accounting is real, not a stale zero |
+
+Two more groups apply only when the run declares that it is canonical
+(`--require-clean`), because they are claims about the artifact rather than about
+the row's workload:
+
+| canonical condition | why |
+|---|---|
+| `git_dirty == false`, `built_by_scaling == true` | the header's `git_sha` describes the binaries that actually ran |
+| `pre_window_drained == true` | the window opened on a steady state, not on setup residue |
+| `owner_faulted == false` | no dead TX lane, short/failed completion, or stopped RX task |
+| `rx_duplicates`, `rx_sec_b` <= `tx_class_data_retx + drain_class_data_retx` | packet-level duplicates are the repairs that re-sent them |
+
+And the repetition rule is the sweep's own hierarchy, not a row count: a
+repetition passes only when **every** shard row in it passes, and a point
+qualifies only when at least three repetitions exist and every one of them
+passed. `cargo xtask scaling` writes one `ROW` per shard per repetition, so
+`--shards 3 --reps 1` writes three passing rows and is still one repetition;
+missing or duplicated shard rows, and whole missing repetitions, are malformed
+evidence rather than a smaller experiment.
 
 Necessary-but-insufficient conditions are deliberately excluded, because
 treating them as sufficient is the specific error that produced #117's withdrawn

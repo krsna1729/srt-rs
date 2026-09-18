@@ -13,6 +13,7 @@ use crate::buf::{read_u32, write_u32};
 use crate::crypto_impl::{CipherMode, CryptoContext, GCM_TAG_LEN, KeyFlag, KeyLength};
 use crate::error::Error;
 use crate::message_assembler::MessageAssembler;
+use crate::sender_rto::RtoArm;
 use crate::srt_handshake::{
     DEFAULT_FLOW_WINDOW, DEFAULT_MTU, GroupExtensionData, HS_VERSION_5, HandshakePacket,
     HandshakeState, HandshakeType, KmError, KmMessage, MAX_FLOW_WINDOW, SRT_MAGIC_CODE, srt_flags,
@@ -1558,16 +1559,27 @@ impl SrtConnection {
     /// materialized datagram is no longer droppable by the sender. It is the
     /// only place the protocol learns that a packet was really transmitted, and
     /// therefore the only place that may arm the sender timeout.
+    ///
+    /// The pending blind probe crossing this same boundary reprograms the epoch
+    /// from here: the timeout is time elapsed after DATA was *sent*, and a probe
+    /// that sat behind blocked TX capacity until shortly before its deadline
+    /// would otherwise fire microseconds after going out and allow a second
+    /// blind probe with nothing behind it. The backoff count is preserved --
+    /// only cumulative ACK progress may reset that.
     fn note_data_submitted(&mut self, sequence: u32) {
-        let Some(arm_timeout) = self
+        let Some(arm) = self
             .sender
             .as_mut()
             .map(|sender| sender.note_data_submitted(sequence))
         else {
             return;
         };
-        if arm_timeout && let Some(timeout) = self.sender.as_mut().map(|sender| sender.rto_start())
-        {
+        let timeout = match arm {
+            RtoArm::Nothing => return,
+            RtoArm::Start => self.sender.as_mut().map(|sender| sender.rto_start()),
+            RtoArm::Rearm => self.sender.as_mut().map(|sender| sender.rto_rearm()),
+        };
+        if let Some(timeout) = timeout {
             self.queue_priority_output(QueuedOutput::SetTimer {
                 id: TimerId::SenderRto,
                 duration_micros: timeout,

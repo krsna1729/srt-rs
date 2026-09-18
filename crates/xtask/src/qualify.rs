@@ -9,6 +9,12 @@
 //! A row is capacity evidence only if **all** of these hold, simultaneously:
 //!
 //! * `generated_ticks / expected_ticks` >= the tolerance (default 0.999);
+//! * `established == fanout == rx_established` and
+//!   `data_offered == generated_ticks * established` -- the whole requested
+//!   population existed at both endpoints and was offered on every generated
+//!   tick;
+//! * `data_accepted == data_offered` -- the transport admitted the offer, not
+//!   merely the part of it it felt like accepting;
 //! * `data_accepted == rx_core_total` -- every accepted payload was delivered;
 //! * `data_zero == 0` and `data_below_half_mean == 0` -- no starved destination
 //!   and no slow subset;
@@ -124,6 +130,99 @@ fn delivery_failures(fields: &BTreeMap<String, String>) -> Vec<String> {
         (Err(e), _) | (_, Err(e)) => vec![e],
         _ => Vec::new(),
     }
+}
+
+/// The offered workload was admitted, at every requested destination.
+///
+/// Cadence says the source offered. Delivery says what happened to what was
+/// admitted. Neither says the transport *admitted* the offer, and a run can
+/// uniformly refuse a share of its `send_shared()` calls, deliver every payload
+/// it did accept, starve nobody, drain cleanly and hold the source's own
+/// cadence inside the declared tolerance -- which is a statement about the
+/// harness's offer, not about the shard that was supposed to carry it. The
+/// harness already records everything needed to close that hole; nothing read
+/// it. Three identities, all exact:
+///
+/// ```text
+/// established == fanout == rx_established
+/// data_offered == generated_ticks * established
+/// data_accepted == data_offered
+/// ```
+///
+/// The first is the requested population actually existing at both endpoints,
+/// the receiver's count rather than the sender's belief about it. The second is
+/// the offer being the whole population on every tick the source generated. The
+/// third is admission: a payload the transport refused is one this shard did
+/// not carry, and no amount of conservation downstream turns that into
+/// capacity.
+fn admission_failures(fields: &BTreeMap<String, String>) -> Vec<String> {
+    let (fanout, established, rx_established, generated, offered, accepted) = match (
+        count(fields, "fanout"),
+        count(fields, "established"),
+        count(fields, "rx_established"),
+        count(fields, "generated_ticks"),
+        count(fields, "data_offered"),
+        count(fields, "data_accepted"),
+    ) {
+        (
+            Ok(fanout),
+            Ok(established),
+            Ok(rx_established),
+            Ok(generated),
+            Ok(offered),
+            Ok(accepted),
+        ) => (
+            fanout,
+            established,
+            rx_established,
+            generated,
+            offered,
+            accepted,
+        ),
+        (fanout, established, rx_established, generated, offered, accepted) => {
+            return [
+                fanout,
+                established,
+                rx_established,
+                generated,
+                offered,
+                accepted,
+            ]
+            .into_iter()
+            .filter_map(Result::err)
+            .collect();
+        }
+    };
+    let mut failures = Vec::new();
+    if established != fanout {
+        failures.push(format!(
+            "established={established} != fanout={fanout}: the shard did not \
+             establish every requested destination"
+        ));
+    }
+    if rx_established != fanout {
+        failures.push(format!(
+            "rx_established={rx_established} != fanout={fanout}: the receiver's own \
+             count of established connections must match the requested fanout"
+        ));
+    }
+    let expected_offer = generated.saturating_mul(established);
+    if offered != expected_offer {
+        failures.push(format!(
+            "data_offered={offered} != generated_ticks={generated} x \
+             established={established} = {expected_offer}: every established \
+             destination must be offered on every generated tick"
+        ));
+    }
+    if accepted != offered {
+        failures.push(format!(
+            "data_accepted={accepted} != data_offered={offered}: the transport did \
+             not admit {} of the offered payloads, so this row measures the part it \
+             accepted, not the workload it was offered",
+            offered.saturating_sub(accepted)
+        ));
+    }
+    failures
 }
 
 /// Fields that must be exactly zero, each named with the value it held.
@@ -477,9 +576,10 @@ fn unexpected_missing_final_failures(fields: &BTreeMap<String, String>) -> Vec<S
 /// `rx_duplicates` (packet-level, ARQ-visible) is deliberately not required to
 /// be zero: a duplicate packet is what a successful repair looks like from the
 /// receiver's side. The documented rule this gate owns is narrower and about
-/// application identity, not the wire: protocol-level duplicates are accounted
-/// by recovery traffic, so only `rx_diag_duplicate_payloads` -- payloads
-/// actually delivered twice -- must be exactly zero.
+/// application identity, not the wire: only `rx_diag_duplicate_payloads` --
+/// payloads actually delivered twice -- must be exactly zero. The wire-level
+/// claim ("duplicates are recovery traffic") is a separate, executable
+/// inequality, and it lives in [`canonical_failures`].
 ///
 /// Only applied when `--require-fence` declares that this evidence is
 /// expected to carry a terminal fence; undeclared is not a pass, by the same
@@ -502,9 +602,9 @@ fn fence_failures(fields: &BTreeMap<String, String>) -> Vec<String> {
     match number(fields, "rx_diag_duplicate_payloads") {
         Ok(0.0) => {}
         Ok(v) => failures.push(format!(
-            "rx_diag_duplicate_payloads={v:.0} (must be 0): protocol-level duplicates \
-             (rx_duplicates) are accounted by recovery traffic, but application identity \
-             must report no duplicate payload delivery"
+            "rx_diag_duplicate_payloads={v:.0} (must be 0): a packet-level duplicate \
+             can be a repair (`--require-clean` bounds those by retransmission traffic), \
+             but application identity must report no duplicate payload delivery"
         )),
         Err(e) => failures.push(e),
     }
@@ -519,6 +619,7 @@ fn judge(
     require_clean: bool,
 ) -> Vec<String> {
     let mut failures = cadence_failures(fields, tick_tolerance);
+    failures.extend(admission_failures(fields));
     failures.extend(delivery_failures(fields));
     failures.extend(zero_failures(
         fields,
@@ -531,31 +632,76 @@ fn judge(
         failures.extend(fence_failures(fields));
     }
     if require_clean {
-        failures.extend(clean_provenance_failures(fields));
+        failures.extend(canonical_failures(fields));
     }
     failures
 }
 
-/// Provenance gate for a canonical qualification artifact: a dirty working
-/// tree, or a measurement window that started before connection-setup
-/// residue (admission backlog, in-flight handshake/keepalive traffic) had
-/// actually drained, cannot support the claim that this row is trustworthy
-/// evidence for the source it names.
+/// Canonical-artifact gate: the provenance and fault state a row must have
+/// before it can support a claim about the source revision it names.
+///
+/// * `git_dirty == false` -- the revision in the header is the tree that was
+///   measured, not a tree with uncommitted edits in it;
+/// * `built_by_scaling == true` -- the sweep driver built the child executables
+///   itself, immediately before running them, so the header's SHA describes the
+///   code under test rather than whatever happened to be in `target/`;
+/// * `pre_window_drained == true` -- the window opened on a steady state, not on
+///   connection-setup residue (admission backlog, in-flight handshake/keepalive
+///   traffic);
+/// * `owner_faulted == false` -- no TX worker died, no send completion was short
+///   or failed, and no managed RX task stopped during the run. A faulted Owner
+///   stops admitting and stops transmitting; it is never a healthy steady state
+///   whose numbers happen to look fine;
+/// * packet-level duplicates are bounded by the retransmission traffic they are
+///   made of: `rx_duplicates` and the receiver's own `rx_sec_b` may not exceed
+///   `tx_class_data_retx + drain_class_data_retx`. A duplicate packet is what a
+///   successful repair looks like, so it must not be required to be zero -- but
+///   "accounted by recovery traffic" is a claim, and this is the inequality that
+///   makes it executable rather than asserted.
 ///
 /// Only applied when `--require-clean` declares that this evidence is meant
 /// to be canonical; undeclared is not a pass, by the same convention every
 /// other declared threshold in this gate follows.
-fn clean_provenance_failures(fields: &BTreeMap<String, String>) -> Vec<String> {
+fn canonical_failures(fields: &BTreeMap<String, String>) -> Vec<String> {
     let mut failures = Vec::new();
-    match field(fields, "git_dirty").map(String::as_str) {
-        Some("false") => {}
-        Some(other) => failures.push(format!("git_dirty={other:?} (must be \"false\")")),
-        None => failures.push("missing git_dirty".to_string()),
+    for (key, expected) in [
+        ("git_dirty", "false"),
+        ("built_by_scaling", "true"),
+        ("pre_window_drained", "true"),
+    ] {
+        match field(fields, key).map(String::as_str) {
+            Some(value) if value == expected => {}
+            Some(other) => failures.push(format!("{key}={other:?} (must be {expected:?})")),
+            None => failures.push(format!("missing {key}")),
+        }
     }
-    match field(fields, "pre_window_drained").map(String::as_str) {
-        Some("true") => {}
-        Some(other) => failures.push(format!("pre_window_drained={other:?} (must be \"true\")")),
-        None => failures.push("missing pre_window_drained".to_string()),
+    match field(fields, "owner_faulted").map(String::as_str) {
+        Some("false") => {}
+        Some(other) => failures.push(format!(
+            "owner_faulted={other:?} (must be \"false\"): a faulted Owner stops \
+             admitting and stops transmitting, so its rates are not a capacity result"
+        )),
+        None => failures.push("missing owner_faulted".to_string()),
+    }
+    match (
+        count(fields, "tx_class_data_retx"),
+        count(fields, "drain_class_data_retx"),
+    ) {
+        (Ok(window), Ok(drain)) => {
+            let retransmissions = window.saturating_add(drain);
+            for key in ["rx_duplicates", "rx_sec_b"] {
+                match count(fields, key) {
+                    Ok(duplicates) if duplicates <= retransmissions => {}
+                    Ok(duplicates) => failures.push(format!(
+                        "{key}={duplicates} > retransmissions (window {window} + drain \
+                         {drain} = {retransmissions}): a packet-level duplicate must be a \
+                         packet a repair re-sent"
+                    )),
+                    Err(error) => failures.push(error),
+                }
+            }
+        }
+        (Err(error), _) | (_, Err(error)) => failures.push(error),
     }
     failures
 }
@@ -568,16 +714,28 @@ fn clean_provenance_failures(fields: &BTreeMap<String, String>) -> Vec<String> {
 /// and a repetition that failed is exactly the outcome the repetitions exist
 /// to catch. Sweep A is intentionally `2/3` for this reason: this constant is
 /// what makes `qualify` refuse to call it qualified.
+///
+/// Repetitions, not rows. A multi-shard sweep writes one row per shard per
+/// repetition, so `--shards 3 --reps 1` produces three passing rows and one
+/// repetition; only [`group_by_identity`]'s rep/shard hierarchy can tell them
+/// apart.
 const MIN_QUALIFICATION_REPS: usize = 3;
 
 /// The identity a row's qualification counts against: two rows are
-/// repetitions of the *same point* only if all seven of these match.
+/// repetitions of the *same point* only if all ten of these match.
 ///
 /// `window_ms` and `git_sha` matter as much as the workload shape: `qualify`
 /// combines rows across every input file, so without them three rows from
 /// different measurement durations, or from different source revisions
 /// entirely, could combine into a synthetic "3/3" that is not evidence for
 /// one experiment.
+///
+/// `n`, `shards` and `reps` are not per-row measurements: they are the shape
+/// of the sweep the row came from, and they are what makes `rep`/`shard` mean
+/// anything. Without `shards` a row's shard index cannot be checked against the
+/// population it claims to be part of, and without `reps` a file that lost a
+/// whole repetition is indistinguishable from one that only ever declared the
+/// repetitions that survived.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct QualificationIdentity {
     fanout: String,
@@ -587,21 +745,45 @@ struct QualificationIdentity {
     rx_mode: String,
     window_ms: String,
     git_sha: String,
+    n: String,
+    shards: String,
+    reps: String,
 }
 
 impl std::fmt::Display for QualificationIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "F={} rate={} K={} payload={} rx_mode={} window_ms={} git_sha={}",
+            "F={} rate={} K={} payload={} rx_mode={} window_ms={} git_sha={} n={} \
+             shards={} reps={}",
             self.fanout,
             self.rate,
             self.tx_lanes,
             self.payload_size,
             self.rx_mode,
             self.window_ms,
-            self.git_sha
+            self.git_sha,
+            self.n,
+            self.shards,
+            self.reps
         )
+    }
+}
+
+impl QualificationIdentity {
+    /// The declared shard population, `0..shards`, or an error naming the
+    /// field that is not a count.
+    fn shard_count(&self) -> Result<u64, String> {
+        self.shards
+            .parse()
+            .map_err(|_| format!("shards={:?} is not a non-negative integer", self.shards))
+    }
+
+    /// The declared repetition count, or an error naming the field.
+    fn rep_count(&self) -> Result<u64, String> {
+        self.reps
+            .parse()
+            .map_err(|_| format!("reps={:?} is not a non-negative integer", self.reps))
     }
 }
 
@@ -619,59 +801,132 @@ fn identity(fields: &BTreeMap<String, String>) -> Result<QualificationIdentity, 
         rx_mode: get("rx_mode")?,
         window_ms: get("window_ms")?,
         git_sha: get("git_sha")?,
+        n: get("n")?,
+        shards: get("shards")?,
+        reps: get("reps")?,
     })
 }
 
-/// One `(fanout, rate, tx_lanes, payload size, RX mode)` point: how many
-/// repetitions were judged, and how many of those were fully sustained.
-#[derive(Debug)]
-struct QualifiedPoint {
-    identity: QualificationIdentity,
-    rows: usize,
-    sustained: usize,
+/// One repetition's rows: whether each shard of the declared population was
+/// judged, and whether it passed.
+#[derive(Debug, Default)]
+struct RepEvidence {
+    /// shard index -> whether that shard's row was individually sustained.
+    shards: BTreeMap<u64, bool>,
 }
 
-impl QualifiedPoint {
-    /// A point qualifies only when every required repetition, with at least
-    /// [`MIN_QUALIFICATION_REPS`] repetitions, passes. `rows > sustained` is a
-    /// failed repetition, not a partial success; `rows < MIN_QUALIFICATION_REPS`
-    /// is insufficient evidence regardless of whether the reps that exist
-    /// passed.
-    fn qualifies(&self) -> bool {
-        self.rows >= MIN_QUALIFICATION_REPS && self.sustained == self.rows
+impl RepEvidence {
+    /// A repetition passes only when *every* shard in it passes. A shard that
+    /// failed is a failed repetition, not 1/S of a success: the claim is about
+    /// a shard configuration, and a repetition that lost a shard measured a
+    /// different, smaller system.
+    fn passes(&self) -> bool {
+        self.shards.values().all(|&sustained| sustained)
     }
 }
 
-/// Group every row by its qualification identity and apply the repetition
-/// rule to each group.
+/// One `(n, shards, fanout, rate, tx_lanes, payload size, RX mode)` point: the
+/// repetitions performed against it, keyed by repetition number.
+#[derive(Debug)]
+struct QualifiedPoint {
+    identity: QualificationIdentity,
+    reps: BTreeMap<u64, RepEvidence>,
+}
+
+impl QualifiedPoint {
+    fn reps_total(&self) -> usize {
+        self.reps.len()
+    }
+
+    fn reps_passed(&self) -> usize {
+        self.reps
+            .values()
+            .filter(|evidence| evidence.passes())
+            .count()
+    }
+
+    /// A point qualifies only when every declared repetition exists and passes,
+    /// with at least [`MIN_QUALIFICATION_REPS`] of them. `reps_passed <
+    /// reps_total` is a failed repetition, not a partial success;
+    /// `reps_total < MIN_QUALIFICATION_REPS` is insufficient evidence
+    /// regardless of whether the repetitions that exist passed.
+    fn qualifies(&self) -> bool {
+        self.reps_total() >= MIN_QUALIFICATION_REPS && self.reps_passed() == self.reps_total()
+    }
+}
+
+/// Group every row by its qualification identity and apply the repetition rule
+/// to each group.
+///
+/// The hierarchy is the sweep's own, and it is not flat: one point contains
+/// repetitions, and one repetition contains one row per shard. Counting rows as
+/// repetitions conflates the two -- `--shards 3 --reps 1` writes three passing
+/// rows and would satisfy a "rows >= 3" rule despite having performed a single
+/// repetition -- so a repetition is only complete (and a row only
+/// interpretable) when all `shards` rows of it are present exactly once.
 ///
 /// `sustained_rows` marks, by index into `rows`, which rows are individually
 /// sustained (passed [`judge`] and [`stationarity`]) -- computed by the caller
-/// so this function stays a pure grouping/counting step or a caller can label
-/// the group; malformed identity fields (a row missing one of the five
-/// identity dimensions) are reported as an error rather than silently
-/// dropping the row from every group.
+/// so this function stays a pure grouping/counting step. Malformed evidence
+/// (a missing identity field, a shard index outside the declared population, a
+/// duplicate shard row, a missing shard row, or a whole missing repetition) is
+/// an error rather than a silently dropped or silently shortened group: an
+/// incomplete repetition is not weaker evidence for a point, it is not evidence
+/// for it at all.
 fn group_by_identity(
     rows: &[BTreeMap<String, String>],
     sustained_rows: &[bool],
 ) -> Result<Vec<QualifiedPoint>, String> {
-    let mut groups: BTreeMap<QualificationIdentity, (usize, usize)> = BTreeMap::new();
+    let mut groups: BTreeMap<QualificationIdentity, BTreeMap<u64, RepEvidence>> = BTreeMap::new();
     for (fields, &sustained) in rows.iter().zip(sustained_rows) {
         let id = identity(fields)?;
-        let entry = groups.entry(id).or_insert((0, 0));
-        entry.0 += 1;
-        if sustained {
-            entry.1 += 1;
+        let rep = count(fields, "rep")?;
+        let shard = count(fields, "shard")?;
+        let shards = id.shard_count()?;
+        if shard >= shards {
+            return Err(format!(
+                "{id} rep={rep}: shard={shard} is outside the declared population \
+                 shards=0..{shards}"
+            ));
+        }
+        let evidence = groups
+            .entry(id.clone())
+            .or_default()
+            .entry(rep)
+            .or_default();
+        if evidence.shards.insert(shard, sustained).is_some() {
+            return Err(format!(
+                "duplicate shard row: {id} rep={rep} shard={shard} appears twice, so \
+                 neither copy can be trusted as this repetition's measurement"
+            ));
         }
     }
-    Ok(groups
-        .into_iter()
-        .map(|(identity, (rows, sustained))| QualifiedPoint {
-            identity,
-            rows,
-            sustained,
-        })
-        .collect())
+    let mut points = Vec::with_capacity(groups.len());
+    for (identity, reps) in groups {
+        let shards = identity.shard_count()?;
+        let declared_reps = identity.rep_count()?;
+        for rep in 1..=declared_reps {
+            let Some(evidence) = reps.get(&rep) else {
+                return Err(format!(
+                    "{identity}: rep={rep} is missing; every declared repetition must be \
+                     present, and a repeated point with a repetition silently dropped is \
+                     not the point it claims to be"
+                ));
+            };
+            if evidence.shards.len() as u64 != shards {
+                let missing: Vec<u64> = (0..shards)
+                    .filter(|shard| !evidence.shards.contains_key(shard))
+                    .collect();
+                return Err(format!(
+                    "{identity} rep={rep}: {} of {shards} shard rows present, missing \
+                     {missing:?}",
+                    evidence.shards.len()
+                ));
+            }
+        }
+        points.push(QualifiedPoint { identity, reps });
+    }
+    Ok(points)
 }
 
 /// `(tolerance, paths)` from the command line.
@@ -785,7 +1040,21 @@ fn header_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
 }
 
 /// Header run-shape values injected into every row (see [`header_value`]).
-const HEADER_INJECTED_KEYS: &[&str] = &["tx_lanes", "window_ms", "git_sha", "git_dirty"];
+///
+/// The last four are what the qualification identity and the canonical gate
+/// need and no `ROW` line repeats: a row is only a repetition of a point once
+/// the file's declared `n`/`shards`/`reps` are known, and `built_by_scaling`
+/// is the provenance bit that says the driver built the binaries it ran.
+const HEADER_INJECTED_KEYS: &[&str] = &[
+    "tx_lanes",
+    "window_ms",
+    "git_sha",
+    "git_dirty",
+    "n",
+    "shards",
+    "reps",
+    "built_by_scaling",
+];
 
 /// ROW lines as field maps, keyed by the file's own header.
 ///
@@ -1003,11 +1272,13 @@ fn collect_reports(
     Ok(totals)
 }
 
-/// The repetition rule: a point is capacity evidence only when every required
-/// repetition, with at least [`MIN_QUALIFICATION_REPS`] repetitions, is
-/// individually sustained. This is the gate the "sustained" row count alone
-/// cannot express -- a 1/3 or 2/3 file has a nonzero sustained count without
-/// being qualified evidence for anything repeatable.
+/// The repetition rule: a point is capacity evidence only when every shard of
+/// every one of its declared repetitions is individually sustained, with at
+/// least [`MIN_QUALIFICATION_REPS`] repetitions. This is the gate neither a
+/// "sustained" row count nor a repetition count alone can express -- a 1/3 or
+/// 2/3 file has a nonzero sustained count without being qualified evidence for
+/// anything repeatable, and three passing shard rows of a single-repetition
+/// sweep are one repetition, not three.
 ///
 /// Applied identically to the real-time verdict (`kind = "real-time"`,
 /// against `realtime_rows`) as to the sustained one (`kind = "sustained"`):
@@ -1034,7 +1305,9 @@ fn print_repetition_verdicts(
         let reason = point_reason(point, qualifies);
         println!(
             "qualify: {verdict} ({kind})  {}  {}/{}{reason}",
-            point.identity, point.sustained, point.rows
+            point.identity,
+            point.reps_passed(),
+            point.reps_total()
         );
     }
     Ok(!groups.is_empty() && all_qualify)
@@ -1043,15 +1316,17 @@ fn print_repetition_verdicts(
 /// Why one point did or did not qualify, as the trailing note on its verdict
 /// line (empty when it qualified).
 fn point_reason(point: &QualifiedPoint, qualifies: bool) -> String {
-    if point.rows < MIN_QUALIFICATION_REPS {
+    if point.reps_total() < MIN_QUALIFICATION_REPS {
         format!(
-            " (fewer than {MIN_QUALIFICATION_REPS} repetitions: {} of {} sustained)",
-            point.sustained, point.rows
+            " (fewer than {MIN_QUALIFICATION_REPS} repetitions: {} of {} passed)",
+            point.reps_passed(),
+            point.reps_total()
         )
     } else if !qualifies {
         format!(
-            " (not every repetition sustained: {} of {})",
-            point.sustained, point.rows
+            " (not every repetition passed: {} of {})",
+            point.reps_passed(),
+            point.reps_total()
         )
     } else {
         String::new()
@@ -1164,6 +1439,9 @@ mod tests {
             ("fanout", "200"),
             ("expected_ticks", "7599"),
             ("generated_ticks", "7598"),
+            ("established", "200"),
+            ("rx_established", "200"),
+            ("data_offered", "1519600"),
             ("data_accepted", "1519600"),
             ("rx_core_total", "1519600"),
             ("data_zero", "0"),
@@ -1214,11 +1492,20 @@ mod tests {
     #[test]
     fn a_conserved_cost_row_that_missed_cadence_fails() {
         // The exact shape #117 had to withdraw: drained, no loss, no starvation,
-        // but only two thirds of the offered cadence was held.
+        // but only two thirds of the offered cadence was held. Everything the
+        // shortened window offered is still admitted and delivered, so the
+        // cadence shortfall is the only failure this row has.
         let tolerance = 0.999;
         let mut fields = passing();
-        fields.retain(|(k, _)| *k != "generated_ticks");
-        fields.push(("generated_ticks", "5000"));
+        for (key, value) in [
+            ("generated_ticks", "5000"),
+            ("data_offered", "1000000"),
+            ("data_accepted", "1000000"),
+            ("rx_core_total", "1000000"),
+        ] {
+            fields.retain(|(k, _)| *k != key);
+            fields.push((key, value));
+        }
         let failures = judge(&row(&fields), tolerance, false, false);
         assert_eq!(failures.len(), 1, "{failures:?}");
         assert!(failures[0].starts_with("cadence"), "{failures:?}");
@@ -1233,6 +1520,87 @@ mod tests {
         let failures = judge(&row(&fields), tolerance, false, false);
         assert!(
             failures.iter().any(|f| f.contains("!= rx_core_total")),
+            "{failures:?}"
+        );
+    }
+
+    /// The hole admission closes: every requested destination exists, every
+    /// payload the transport accepted is delivered, the offer holds cadence and
+    /// the drain is clean -- and part of the offered workload was refused by
+    /// `send_shared()` and never carried. "accepted == delivered" cannot see it,
+    /// so without this identity a uniformly refusing shard is declared
+    /// sustained.
+    #[test]
+    fn an_offer_the_transport_refused_is_not_capacity_evidence() {
+        let tolerance = 0.999;
+        // The minimal shape: 1000 offered, 900 accepted, all 900 delivered.
+        let mut fields = passing();
+        for (key, value) in [
+            ("data_offered", "1000"),
+            ("data_accepted", "900"),
+            ("rx_core_total", "900"),
+        ] {
+            fields.retain(|(k, _)| *k != key);
+            fields.push((key, value));
+        }
+        let failures = judge(&row(&fields), tolerance, false, false);
+        assert!(
+            failures.iter().any(|f| f.contains("data_accepted=900")),
+            "a refused share of the offer must fail the gate: {failures:?}"
+        );
+
+        // The same defect at the fixture's own scale: a uniform 10 % refusal,
+        // conserved downstream, with every destination still offered every tick.
+        let mut fields = passing();
+        for (key, value) in [("data_accepted", "1367640"), ("rx_core_total", "1367640")] {
+            fields.retain(|(k, _)| *k != key);
+            fields.push((key, value));
+        }
+        let failures = judge(&row(&fields), tolerance, false, false);
+        assert!(
+            failures
+                .iter()
+                .any(|f| f.contains("data_accepted=1367640 != data_offered=1519600")),
+            "{failures:?}"
+        );
+    }
+
+    /// Every identity in the admission group is individually required, and each
+    /// failure names the field it came from.
+    #[test]
+    fn each_admission_identity_is_individually_required() {
+        let tolerance = 0.999;
+        for (key, value, needle) in [
+            ("established", "199", "established=199 != fanout=200"),
+            ("rx_established", "150", "rx_established=150 != fanout=200"),
+            (
+                "data_offered",
+                "1519599",
+                "data_offered=1519599 != generated_ticks=7598 x established=200",
+            ),
+            (
+                "data_accepted",
+                "1519599",
+                "data_accepted=1519599 != data_offered=1519600",
+            ),
+        ] {
+            let mut fields = passing();
+            fields.retain(|(k, _)| *k != key);
+            fields.push((key, value));
+            let failures = judge(&row(&fields), tolerance, false, false);
+            assert!(
+                failures.iter().any(|f| f.contains(needle)),
+                "{key}={value} produced {failures:?}"
+            );
+        }
+
+        // Absent is absent, not zero: a row that never recorded how many
+        // destinations existed cannot claim they all did.
+        let mut fields = passing();
+        fields.retain(|(k, _)| *k != "established");
+        let failures = judge(&row(&fields), tolerance, false, false);
+        assert!(
+            failures.iter().any(|f| f.contains("missing established")),
             "{failures:?}"
         );
     }
@@ -1600,28 +1968,48 @@ mod tests {
     }
 
     /// A row carrying an identity for [`group_by_identity`], matching
-    /// `passing()`'s `fanout=200`/`offered_bps_per_dest=8000000`.
-    fn identified() -> Vec<(&'static str, &'static str)> {
-        let mut fields = passing();
+    /// `passing()`'s `fanout=200`/`offered_bps_per_dest=8000000`. One declared
+    /// shard, so `n == fanout`; three declared repetitions.
+    fn identified(rep: u64, shard: u64) -> BTreeMap<String, String> {
+        let mut fields = row(&passing());
         fields.extend([
-            ("tx_lanes", "256"),
-            ("payload_bytes", "1316"),
-            ("rx_mode", "ManagedMultishot"),
-            ("window_ms", "60000"),
-            ("git_sha", "abc1234"),
+            ("tx_lanes".to_string(), "256".to_string()),
+            ("payload_bytes".to_string(), "1316".to_string()),
+            ("rx_mode".to_string(), "ManagedMultishot".to_string()),
+            ("window_ms".to_string(), "60000".to_string()),
+            ("git_sha".to_string(), "abc1234".to_string()),
+            ("n".to_string(), "200".to_string()),
+            ("shards".to_string(), "1".to_string()),
+            ("reps".to_string(), "3".to_string()),
+            ("rep".to_string(), rep.to_string()),
+            ("shard".to_string(), shard.to_string()),
         ]);
         fields
+    }
+
+    /// A complete point: `reps` repetitions of `shards` shards each, with the
+    /// sweep-shape fields rewritten to match.
+    fn point(reps: u64, shards: u64) -> Vec<BTreeMap<String, String>> {
+        let mut rows = Vec::new();
+        for rep in 1..=reps {
+            for shard in 0..shards {
+                let mut fields = identified(rep, shard);
+                fields.insert("shards".to_string(), shards.to_string());
+                fields.insert("reps".to_string(), reps.to_string());
+                rows.push(fields);
+            }
+        }
+        rows
     }
 
     /// The repetition rule's whole point: three passing repetitions is
     /// evidence, and only three passing repetitions is evidence.
     #[test]
     fn three_of_three_sustained_repetitions_qualify() {
-        let rows: Vec<_> = (0..3).map(|_| row(&identified())).collect();
-        let sustained = vec![true, true, true];
-        let groups = group_by_identity(&rows, &sustained).expect("identity fields present");
+        let rows = point(3, 1);
+        let groups = group_by_identity(&rows, &[true; 3]).expect("a complete point groups");
         assert_eq!(groups.len(), 1);
-        assert_eq!((groups[0].sustained, groups[0].rows), (3, 3));
+        assert_eq!((groups[0].reps_passed(), groups[0].reps_total()), (3, 3));
         assert!(groups[0].qualifies(), "3/3 sustained repetitions qualify");
     }
 
@@ -1631,11 +2019,10 @@ mod tests {
     /// too.
     #[test]
     fn two_of_three_sustained_repetitions_fail_to_qualify() {
-        let rows: Vec<_> = (0..3).map(|_| row(&identified())).collect();
-        let sustained = vec![true, true, false];
-        let groups = group_by_identity(&rows, &sustained).expect("identity fields present");
+        let rows = point(3, 1);
+        let groups = group_by_identity(&rows, &[true, true, false]).expect("a complete point");
         assert_eq!(groups.len(), 1);
-        assert_eq!((groups[0].sustained, groups[0].rows), (2, 3));
+        assert_eq!((groups[0].reps_passed(), groups[0].reps_total()), (2, 3));
         assert!(
             !groups[0].qualifies(),
             "2/3 sustained repetitions must not qualify"
@@ -1646,11 +2033,10 @@ mod tests {
     /// of how many others passed.
     #[test]
     fn one_of_three_sustained_repetitions_fails_to_qualify() {
-        let rows: Vec<_> = (0..3).map(|_| row(&identified())).collect();
-        let sustained = vec![true, false, false];
-        let groups = group_by_identity(&rows, &sustained).expect("identity fields present");
+        let rows = point(3, 1);
+        let groups = group_by_identity(&rows, &[true, false, false]).expect("a complete point");
         assert_eq!(groups.len(), 1);
-        assert_eq!((groups[0].sustained, groups[0].rows), (1, 3));
+        assert_eq!((groups[0].reps_passed(), groups[0].reps_total()), (1, 3));
         assert!(
             !groups[0].qualifies(),
             "1/3 sustained repetitions must not qualify"
@@ -1662,103 +2048,209 @@ mod tests {
     /// repeatable point, independent of whether the reps that exist passed.
     #[test]
     fn two_of_two_sustained_repetitions_fail_on_repetition_count_alone() {
-        let rows: Vec<_> = (0..2).map(|_| row(&identified())).collect();
-        let sustained = vec![true, true];
-        let groups = group_by_identity(&rows, &sustained).expect("identity fields present");
+        let rows = point(2, 1);
+        let groups = group_by_identity(&rows, &[true; 2]).expect("a complete point groups");
         assert_eq!(groups.len(), 1);
-        assert_eq!((groups[0].sustained, groups[0].rows), (2, 2));
+        assert_eq!((groups[0].reps_passed(), groups[0].reps_total()), (2, 2));
         assert!(
             !groups[0].qualifies(),
             "2/2 sustained repetitions is still fewer than the required 3"
         );
     }
 
+    /// `cargo xtask scaling` writes one `ROW` per shard per repetition, so a row
+    /// count is not a repetition count. `--shards 3 --reps 1` produces three
+    /// passing rows and one repetition: treating those rows as repetitions is
+    /// how a sweep that never repeated anything reads as 3/3.
+    #[test]
+    fn shard_rows_are_not_repetitions() {
+        let rows = point(1, 3);
+        let groups = group_by_identity(&rows, &[true; 3]).expect("a complete point groups");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            (groups[0].reps_passed(), groups[0].reps_total()),
+            (1, 1),
+            "three passing rows of one sharded repetition are one repetition"
+        );
+        assert!(
+            !groups[0].qualifies(),
+            "a single repetition cannot be qualified evidence"
+        );
+    }
+
+    /// A repetition passes only when every expected shard in it passes: a
+    /// repetition that lost a shard measured a smaller system, not this point.
+    #[test]
+    fn a_repetition_passes_only_when_every_shard_passes() {
+        let rows = point(3, 2);
+        let mut sustained = vec![true; 6];
+        sustained[2] = false; // rep 2, shard 0
+        let groups = group_by_identity(&rows, &sustained).expect("a complete point groups");
+        assert_eq!(groups.len(), 1);
+        assert_eq!((groups[0].reps_passed(), groups[0].reps_total()), (2, 3));
+        assert!(
+            !groups[0].qualifies(),
+            "one failed shard fails the repetition it belongs to"
+        );
+    }
+
+    /// An expected shard with no row is missing evidence, not a smaller
+    /// repetition: malformed evidence fails loudly instead of quietly reducing
+    /// the point to the shards that happened to report.
+    #[test]
+    fn a_missing_shard_row_is_malformed_evidence() {
+        let mut rows = point(3, 2);
+        rows.remove(1);
+        let error = group_by_identity(&rows, &vec![true; rows.len()]).unwrap_err();
+        assert!(error.contains("shard rows present"), "{error}");
+    }
+
+    /// Two rows for the same `(rep, shard)` cannot both be that repetition's
+    /// measurement.
+    #[test]
+    fn a_duplicate_shard_row_is_malformed_evidence() {
+        let mut rows = point(3, 2);
+        let duplicate = rows[0].clone();
+        rows.push(duplicate);
+        let error = group_by_identity(&rows, &vec![true; rows.len()]).unwrap_err();
+        assert!(error.contains("duplicate shard row"), "{error}");
+    }
+
+    /// A whole missing repetition is as much malformed evidence as a missing
+    /// shard: the file declares how many repetitions it performed, so one that
+    /// vanished is not a file that performed fewer.
+    #[test]
+    fn a_missing_repetition_is_malformed_evidence() {
+        let mut rows = point(3, 1);
+        rows.remove(1); // rep 2
+        let error = group_by_identity(&rows, &vec![true; rows.len()]).unwrap_err();
+        assert!(error.contains("rep=2 is missing"), "{error}");
+    }
+
+    /// A shard index outside the declared population is not part of the point
+    /// it claims to belong to.
+    #[test]
+    fn a_shard_outside_the_declared_population_is_malformed_evidence() {
+        let mut rows = point(3, 1);
+        rows.push(identified(1, 1)); // shards=1 declares only shard 0
+        let error = group_by_identity(&rows, &vec![true; rows.len()]).unwrap_err();
+        assert!(error.contains("outside the declared population"), "{error}");
+    }
+
     /// Rows with a different identity dimension are different points, never
     /// pooled into the same repetition count.
     #[test]
     fn distinct_identities_are_grouped_separately() {
-        let mut fields_b = identified();
-        fields_b.retain(|(k, _)| *k != "fanout");
-        fields_b.push(("fanout", "50"));
-        let rows = vec![row(&identified()), row(&identified()), row(&fields_b)];
-        let sustained = vec![true, true, true];
-        let groups = group_by_identity(&rows, &sustained).expect("identity fields present");
+        let mut other = point(3, 1);
+        for fields in other.iter_mut() {
+            fields.insert("fanout".to_string(), "50".to_string());
+            fields.insert("n".to_string(), "50".to_string());
+        }
+        let mut rows = point(3, 1);
+        rows.extend(other);
+        let groups = group_by_identity(&rows, &[true; 6]).expect("both points are complete");
         assert_eq!(groups.len(), 2, "F=200 and F=50 must not share a group");
     }
 
-    /// A row missing one of the seven identity dimensions cannot be grouped
-    /// at all: silently dropping it would let an incomplete row disappear
-    /// from the repetition count instead of failing loudly.
+    /// A row missing one of the identity dimensions cannot be grouped at all:
+    /// silently dropping it would let an incomplete row disappear from the
+    /// repetition count instead of failing loudly.
     #[test]
     fn a_row_missing_an_identity_field_is_an_error() {
-        let mut fields = identified();
-        fields.retain(|(k, _)| *k != "rx_mode");
-        let rows = vec![row(&fields)];
-        let sustained = vec![true];
-        let error = group_by_identity(&rows, &sustained).unwrap_err();
+        let mut rows = point(3, 1);
+        rows[0].remove("rx_mode");
+        let error = group_by_identity(&rows, &[true; 3]).unwrap_err();
         assert!(error.contains("rx_mode"), "{error}");
     }
 
-    /// Rows from different measurement windows, or different source
-    /// revisions, are not repetitions of the same experiment even if every
-    /// workload dimension matches: pooling them would let `qualify` combine
-    /// evidence across files into a synthetic "3/3" for a claim no single run
-    /// actually supports.
+    /// Rows from different measurement windows, different source revisions, or
+    /// different sweep shapes are not repetitions of the same experiment even
+    /// if every workload dimension matches: pooling them would let `qualify`
+    /// combine evidence across files into a synthetic "3/3" for a claim no
+    /// single run actually supports.
     #[test]
-    fn different_window_ms_or_git_sha_are_grouped_separately() {
-        let mut different_window = identified();
-        different_window.retain(|(k, _)| *k != "window_ms");
-        different_window.push(("window_ms", "3000"));
+    fn different_sweep_shapes_are_grouped_separately() {
+        let mutate = |rows: &mut Vec<BTreeMap<String, String>>, key: &str, value: &str| {
+            for fields in rows.iter_mut() {
+                fields.insert(key.to_string(), value.to_string());
+            }
+        };
 
-        let mut different_sha = identified();
-        different_sha.retain(|(k, _)| *k != "git_sha");
-        different_sha.push(("git_sha", "deadbee"));
+        let mut different_window = point(3, 1);
+        mutate(&mut different_window, "window_ms", "3000");
+        let mut different_sha = point(3, 1);
+        mutate(&mut different_sha, "git_sha", "deadbee");
+        // Two shards of the same fanout is a different sweep shape entirely: it
+        // is `n = fanout * shards` and a different repetition structure.
+        let mut different_shards = point(3, 2);
+        mutate(&mut different_shards, "n", "400");
 
-        let rows = vec![
-            row(&identified()),
-            row(&different_window),
-            row(&different_sha),
-        ];
-        let sustained = vec![true, true, true];
-        let groups = group_by_identity(&rows, &sustained).expect("identity fields present");
+        let mut rows = point(3, 1);
+        rows.extend(different_window);
+        rows.extend(different_sha);
+        rows.extend(different_shards);
+        let groups = group_by_identity(&rows, &vec![true; rows.len()]).expect("complete points");
         assert_eq!(
             groups.len(),
-            3,
-            "different window_ms and git_sha must each be a distinct point"
+            4,
+            "window_ms, git_sha, n and shards must each split a group"
         );
     }
 
-    #[test]
-    fn clean_provenance_passes_when_required() {
+    /// The canonical-run fields a `--require-clean` row must carry, at their
+    /// passing values. `drain_class_data_retx` is the drain half of the
+    /// retransmission budget; the two duplicate counters here are the window
+    /// and the receiver's own.
+    fn canonical() -> Vec<(&'static str, &'static str)> {
         let mut fields = passing();
-        fields.push(("git_dirty", "false"));
-        fields.push(("pre_window_drained", "true"));
+        fields.extend([
+            ("git_dirty", "false"),
+            ("built_by_scaling", "true"),
+            ("pre_window_drained", "true"),
+            ("owner_faulted", "false"),
+            ("drain_class_data_retx", "0"),
+            ("rx_duplicates", "0"),
+            ("rx_sec_b", "0"),
+        ]);
+        fields
+    }
+
+    #[test]
+    fn a_canonical_row_passes_the_canonical_gate() {
         assert!(
-            judge(&row(&fields), 0.999, false, true).is_empty(),
-            "a clean tree and a drained pre-window must pass their own gate"
+            judge(&row(&canonical()), 0.999, false, true).is_empty(),
+            "a clean tree, a driver-built binary, a drained pre-window and a \
+             fault-free run must pass their own gate"
         );
     }
 
     #[test]
-    fn clean_provenance_is_ignored_unless_required() {
-        let mut fields = passing();
-        fields.push(("git_dirty", "true"));
-        fields.push(("pre_window_drained", "false"));
+    fn canonical_fields_are_ignored_unless_required() {
+        let mut fields = canonical();
+        for (key, value) in [
+            ("git_dirty", "true"),
+            ("built_by_scaling", "false"),
+            ("pre_window_drained", "false"),
+            ("owner_faulted", "true"),
+        ] {
+            fields.retain(|(k, _)| *k != key);
+            fields.push((key, value));
+        }
         assert!(
             judge(&row(&fields), 0.999, false, false).is_empty(),
-            "provenance must not gate the run unless --require-clean is declared"
+            "canonical provenance must not gate a run that never declared it"
         );
     }
 
     #[test]
-    fn each_provenance_field_is_individually_required() {
+    fn each_canonical_field_is_individually_required() {
         for (key, value, needle) in [
             ("git_dirty", "true", "git_dirty"),
+            ("built_by_scaling", "false", "built_by_scaling"),
             ("pre_window_drained", "false", "pre_window_drained"),
+            ("owner_faulted", "true", "owner_faulted"),
         ] {
-            let mut fields = passing();
-            fields.push(("git_dirty", "false"));
-            fields.push(("pre_window_drained", "true"));
+            let mut fields = canonical();
             fields.retain(|(k, _)| *k != key);
             fields.push((key, value));
             let failures = judge(&row(&fields), 0.999, false, true);
@@ -1767,21 +2259,79 @@ mod tests {
                 "{key}={value} with --require-clean produced {failures:?}"
             );
         }
+
+        // Absent is absent: an artifact cannot pass a canonical gate on the
+        // strength of not mentioning a field that gate reads.
+        for key in ["owner_faulted", "built_by_scaling"] {
+            let mut fields = canonical();
+            fields.retain(|(k, _)| *k != key);
+            let failures = judge(&row(&fields), 0.999, false, true);
+            assert!(
+                failures
+                    .iter()
+                    .any(|f| f.contains(&format!("missing {key}"))),
+                "{failures:?}"
+            );
+        }
+    }
+
+    /// "Duplicates are accounted by recovery traffic" is a claim; this is the
+    /// inequality that makes it executable. A packet-level duplicate is a repair
+    /// re-sending something the peer already had, so it cannot exceed what the
+    /// repairs actually sent.
+    #[test]
+    fn packet_duplicates_must_be_accounted_by_retransmissions() {
+        // `passing()`'s own partition sends 10 000 in-window retransmissions.
+        let mut fields = canonical();
+        fields.retain(|(k, _)| *k != "drain_class_data_retx");
+        fields.push(("drain_class_data_retx", "5"));
+        fields.push(("rx_duplicates", "12"));
+        fields.push(("rx_sec_b", "10005"));
+        assert!(
+            judge(&row(&fields), 0.999, false, true).is_empty(),
+            "duplicates inside the retransmission budget are recoverable traffic"
+        );
+
+        for key in ["rx_duplicates", "rx_sec_b"] {
+            let mut fields = canonical();
+            fields.retain(|(k, _)| *k != "drain_class_data_retx" && *k != key);
+            fields.push(("drain_class_data_retx", "5"));
+            fields.push((key, "10006"));
+            let failures = judge(&row(&fields), 0.999, false, true);
+            assert!(
+                failures.iter().any(|f| f.contains(key)),
+                "{key} above the repair traffic is unexplained: {failures:?}"
+            );
+        }
+
+        // The budget is the *sum* of both phases, not the window alone.
+        let mut fields = canonical();
+        fields.retain(|(k, _)| *k != "drain_class_data_retx" && *k != "rx_sec_b");
+        fields.push(("drain_class_data_retx", "3"));
+        fields.push(("rx_sec_b", "10003"));
+        assert!(
+            judge(&row(&fields), 0.999, false, true).is_empty(),
+            "drain retransmissions count toward what duplicates may be made of"
+        );
     }
 
     /// TSV text for `report()` to read back from disk: a header line built
     /// from the first row's own keys, plus one `ROW` line per row, in the
-    /// same column order. No header *comment* is needed here because every
-    /// identity field (including `window_ms`/`git_sha`) is already present
-    /// per-row, unlike a real sweep file's run-shape constants.
-    fn write_report_tsv(rows: &[Vec<(&'static str, &'static str)>]) -> std::path::PathBuf {
-        let keys: Vec<&str> = rows[0].iter().map(|(k, _)| *k).collect();
+    /// same (sorted) column order. No header *comment* is needed here because
+    /// every identity field (including `window_ms`/`git_sha`/`n`/`shards`/
+    /// `reps`) is already present per-row, unlike a real sweep file's run-shape
+    /// constants.
+    fn write_report_tsv(rows: &[BTreeMap<String, String>]) -> std::path::PathBuf {
+        let keys: Vec<String> = rows[0].keys().cloned().collect();
         let mut text = String::from("kind\t");
         text.push_str(&keys.join("\t"));
         text.push('\n');
         for fields in rows {
-            let values: Vec<&str> = fields.iter().map(|(_, v)| *v).collect();
             text.push_str("ROW\t");
+            let values: Vec<&str> = keys
+                .iter()
+                .map(|key| fields.get(key).map(String::as_str).unwrap_or_default())
+                .collect();
             text.push_str(&values.join("\t"));
             text.push('\n');
         }
@@ -1800,23 +2350,15 @@ mod tests {
     /// three sustained repetitions.
     #[test]
     fn realtime_repetition_uses_the_same_grouping_as_sustained() {
-        let mut on_time = identified();
-        on_time.retain(|(k, _)| {
-            *k != "first_submit_lateness_us_p99" && *k != "first_submit_lateness_us_max"
-        });
-        on_time.push(("first_submit_lateness_us_p99", "1000"));
-        on_time.push(("first_submit_lateness_us_max", "1000"));
-        on_time.push(("drain_submitted", "0"));
-
-        let mut late = identified();
-        late.retain(|(k, _)| {
-            *k != "first_submit_lateness_us_p99" && *k != "first_submit_lateness_us_max"
-        });
-        late.push(("first_submit_lateness_us_p99", "50000"));
-        late.push(("first_submit_lateness_us_max", "50000"));
-        late.push(("drain_submitted", "0"));
-
-        let path = write_report_tsv(&[on_time.clone(), on_time, late]);
+        let mut rows = point(3, 1);
+        for (index, fields) in rows.iter_mut().enumerate() {
+            // Rep 3 is the late one; the grouping must see 2/3, not 3 rows.
+            let p99 = if index == 2 { "50000" } else { "1000" };
+            fields.insert("first_submit_lateness_us_p99".to_string(), p99.to_string());
+            fields.insert("first_submit_lateness_us_max".to_string(), p99.to_string());
+            fields.insert("drain_submitted".to_string(), "0".to_string());
+        }
+        let path = write_report_tsv(&rows);
         let outcome = report(
             path.to_str().unwrap(),
             0.999,
@@ -1832,7 +2374,7 @@ mod tests {
         let groups =
             group_by_identity(&outcome.rows, &outcome.realtime_rows).expect("identity present");
         assert_eq!(groups.len(), 1);
-        assert_eq!((groups[0].sustained, groups[0].rows), (2, 3));
+        assert_eq!((groups[0].reps_passed(), groups[0].reps_total()), (2, 3));
         assert!(
             !groups[0].qualifies(),
             "2/3 real-time repetitions must not qualify, exactly like sustained"

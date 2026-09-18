@@ -17,6 +17,12 @@
 //! * **One destination per UDP port**: destination `i` is `base + i` for both
 //!   roles. Several senders on one port do not all get admitted (measured:
 //!   `connections=3 established=1 data_zero=2`), so the topology is fixed.
+//! * **The sweep builds its own children.** A release `cargo build` for
+//!   `srt-bench` and the `compio_shared_owner_qual` bench runs immediately before
+//!   the first repetition, and the executables come from cargo's own artifact
+//!   records rather than from a scan of `target/`. The header's `git_sha`
+//!   therefore describes the code that produced the rows, instead of whatever
+//!   happened to be left in the build directory.
 //! * **The receiver must outlive the drain.** The sender keeps servicing after
 //!   the measurement window until its TX reaches equilibrium, and that drain is
 //!   not small. A receiver whose lifetime is shorter sends the drain into a
@@ -92,6 +98,11 @@ const TX_KEYS: &[&str] = &[
     "tx_class_shutdown",
     "tx_class_other_control",
     "tx_class_total",
+    // Drain-phase retransmissions, so the receiver's own packet-duplicate count
+    // can be accounted against the repair traffic that explains it (see
+    // `qualify`'s canonical gate). `drain_class_total` alone cannot: it is not
+    // what a duplicate is made of.
+    "drain_class_data_retx",
     // First-transmission submit lateness: source due instant to lane handoff.
     // Distinct from `offer_lateness_us_*`, which is sampled before `service()`.
     "first_submit_lateness_us_p50",
@@ -117,6 +128,11 @@ const TX_KEYS: &[&str] = &[
     // window began. A row without this confirmed cannot support a claim that
     // the measurement started at a genuinely steady state.
     "pre_window_drained",
+    // Whether the Owner's typed fault state was still clear at the end of the
+    // run. A fault (dead TX lane, short/failed send completion, stopped managed
+    // RX task) stops admission and transmission; a row that cannot report this
+    // cannot support a claim that the transport under test stayed healthy.
+    "owner_faulted",
 ];
 
 /// Fields read from the receiver's `STATS` line.
@@ -305,42 +321,77 @@ fn kv(line: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
-fn find_bench(root: &Path) -> Result<PathBuf, String> {
-    let deps = root.join("target/release/deps");
-    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
-    for entry in fs::read_dir(&deps).map_err(|e| format!("{}: {e}", deps.display()))? {
-        let path = entry.map_err(|e| e.to_string())?.path();
-        let name = path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        if !name.starts_with("compio_shared_owner_qual-") || name.ends_with(".d") {
+/// Build the sweep's child executables and return the exact paths cargo
+/// produced for them.
+///
+/// This driver builds what it benchmarks, immediately before running it. It
+/// used to scan `target/release/deps` for the most recently modified
+/// `compio_shared_owner_qual-*` binary and take `target/release/srt-bench`
+/// wherever it existed -- while the TSV header recorded the *working tree's*
+/// `git_sha`. That combination proves nothing: build at revision A, check out B,
+/// run the sweep, and the artifact names B while executing A. The failure mode
+/// is not hypothetical here; a stale binary already contaminated one round of
+/// this PR's own diagnostics.
+///
+/// `--message-format=json` is what makes the paths authoritative rather than
+/// inferred: cargo reports the artifact it produced, so the executable that runs
+/// is the one cargo just built, never a same-named file someone left behind.
+fn build_harness(root: &Path) -> Result<Harness, String> {
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let output = Command::new(&cargo)
+        .args([
+            "build",
+            "--release",
+            "-p",
+            "srt-bench",
+            "--bin",
+            "srt-bench",
+            "--bench",
+            "compio_shared_owner_qual",
+            "--message-format=json",
+        ])
+        .current_dir(root)
+        // Compiler diagnostics belong on the terminal; stdout is JSON.
+        .stderr(Stdio::inherit())
+        .output()
+        .map_err(|e| format!("running `{cargo} build`: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "building the sweep children exited with {}",
+            output.status
+        ));
+    }
+    let (mut bench, mut receiver) = (None, None);
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Ok(message) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if message["reason"] != "compiler-artifact" {
             continue;
         }
-        let modified = fs::metadata(&path)
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        if best.as_ref().is_none_or(|(t, _)| modified > *t) {
-            best = Some((modified, path));
+        let Some(executable) = message["executable"].as_str() else {
+            continue;
+        };
+        let name = message["target"]["name"].as_str().unwrap_or_default();
+        let kinds = message["target"]["kind"].as_array();
+        let is = |kind: &str| kinds.is_some_and(|kinds| kinds.iter().any(|k| k == kind));
+        if is("bench") && name == "compio_shared_owner_qual" {
+            bench = Some(PathBuf::from(executable));
+        }
+        if is("bin") && name == "srt-bench" {
+            receiver = Some(PathBuf::from(executable));
         }
     }
-    best.map(|(_, p)| p).ok_or_else(|| {
-        "no compio_shared_owner_qual binary; build it first:\n  \
-         cargo build --release -p srt-bench --benches"
-            .to_string()
-    })
-}
-
-fn receiver_binary(root: &Path) -> Result<PathBuf, String> {
-    let path = root.join("target/release/srt-bench");
-    if path.exists() {
-        Ok(path)
-    } else {
-        Err(format!(
-            "{} missing; build it first:\n  cargo build --release -p srt-bench",
-            path.display()
-        ))
+    match (bench, receiver) {
+        (Some(bench), Some(receiver)) => Ok(Harness { bench, receiver }),
+        (None, _) => Err(format!(
+            "{cargo} reported no executable for the compio_shared_owner_qual bench; \
+             refusing to guess which binary to benchmark"
+        )),
+        (_, None) => Err(format!(
+            "{cargo} reported no executable for srt-bench; refusing to guess which \
+             binary to benchmark"
+        )),
     }
 }
 
@@ -410,8 +461,8 @@ fn keep_logs(work: &Path, message: String) -> String {
     format!("{message}; logs kept in {}", work.display())
 }
 
-/// Everything the sweep needs to launch work: where the workspace is and
-/// which binaries to run.
+/// Everything the sweep needs to launch work: the exact child executables
+/// cargo produced for this run (see [`build_harness`]).
 struct Harness {
     bench: PathBuf,
     receiver: PathBuf,
@@ -450,11 +501,7 @@ fn fail(message: &str) -> std::process::ExitCode {
 }
 
 fn locate() -> Result<Harness, String> {
-    let root = find_root()?;
-    Ok(Harness {
-        bench: find_bench(&root)?,
-        receiver: receiver_binary(&root)?,
-    })
+    build_harness(&find_root()?)
 }
 
 /// Run every rep and return the whole TSV, header included.
@@ -471,6 +518,16 @@ fn sweep(options: &Options, harness: &Harness) -> Result<String, String> {
     Ok(out)
 }
 
+/// The TSV header, including the provenance that makes `git_sha` mean
+/// something.
+///
+/// `built_by_scaling=true` and `build_profile=release` are facts about this
+/// tool rather than flags: `run` cannot reach `sweep` without having gone
+/// through `locate` -> `build_harness`, which builds both children in release
+/// mode and returns cargo's own artifact paths. Together with `git_dirty`, they
+/// are what let a reader conclude the header's SHA describes the code that
+/// actually ran -- and `qualify --require-clean` refuses a canonical artifact
+/// without them.
 fn header(options: &Options) -> Result<String, String> {
     let root = find_root()?;
     let dirty = git(&root, &["diff", "--quiet"]).is_err();
@@ -482,7 +539,7 @@ fn header(options: &Options) -> Result<String, String> {
     Ok(format!(
         "# scaling-sweep n={} shards={} fanout={} tx_lanes={} connect_cc={} window_ms={} \n\
          # reps={} base_port={} payload_bytes={} rate_mbps_per_dest={} fence={} identity={} \
-         git_sha={} git_dirty={}\n{}\n",
+         build_profile=release built_by_scaling=true git_sha={} git_dirty={}\n{}\n",
         options.n,
         options.shards,
         options.n / options.shards,

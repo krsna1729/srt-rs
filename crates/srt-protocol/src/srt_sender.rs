@@ -15,7 +15,7 @@ use crate::sender_packet_window::SenderPacketWindow;
 
 use bytes::Bytes;
 
-use crate::sender_rto::{INITIAL_RTT_VAR_MICROS, INITIAL_SRTT_MICROS, SenderRto};
+use crate::sender_rto::{INITIAL_RTT_VAR_MICROS, INITIAL_SRTT_MICROS, RtoArm, SenderRto};
 use crate::srt_handshake::MAX_FLOW_WINDOW;
 use crate::srt_packet::{DataHeader, PacketPosition, SRT_HEADER_SIZE, sequence_less_than};
 use crate::srt_receiver::LossRange;
@@ -500,12 +500,16 @@ impl SenderBuffer {
     /// probe eligibility, the epoch, TLPKTDROP age -- then treats the packet as
     /// having been on the wire.
     ///
-    /// Returns `true` when the caller must arm `TimerId::SenderRto`. An epoch
-    /// already running is never restarted here: a busy sender would otherwise
-    /// postpone its own timeout indefinitely while one early packet stayed
-    /// stranded. Only cumulative ACK progress restarts it, and only an empty
-    /// flight disarms it.
-    pub fn note_data_submitted(&mut self, sequence: u32) -> bool {
+    /// Returns what the caller must do with `TimerId::SenderRto`. An epoch
+    /// already running is never restarted by an ordinary submission: a busy
+    /// sender would otherwise postpone its own timeout indefinitely while one
+    /// early packet stayed stranded. Only cumulative ACK progress restarts it,
+    /// and only an empty flight disarms it. The one exception is the pending
+    /// blind probe finally crossing this boundary: its deadline has to be
+    /// measured from *this* instant, so the caller reprograms the epoch (keeping
+    /// the accumulated backoff) rather than leaving the old one to fire
+    /// immediately after the probe went out.
+    pub fn note_data_submitted(&mut self, sequence: u32) -> RtoArm {
         if let Some(entry) = self.packets.get_mut(sequence) {
             entry.submitted = true;
         }
@@ -515,8 +519,14 @@ impl SenderBuffer {
         {
             self.newest_submitted = Some(sequence);
         }
-        self.rto.confirm_probe_submitted(sequence);
-        !self.rto.is_armed()
+        let probe_submitted = self.rto.confirm_probe_submitted(sequence);
+        if !self.rto.is_armed() {
+            return RtoArm::Start;
+        }
+        if probe_submitted {
+            return RtoArm::Rearm;
+        }
+        RtoArm::Nothing
     }
 
     /// Whether anything that was actually submitted is still unacknowledged.
@@ -575,6 +585,15 @@ impl SenderBuffer {
     /// Start a fresh RTO epoch, returning the timeout to program.
     pub fn rto_start(&mut self) -> u64 {
         self.rto.start(self.rto_base_timeout_micros())
+    }
+
+    /// Reprogram the RTO epoch from the instant the pending blind probe was
+    /// actually submitted, returning the timeout to program.
+    ///
+    /// Distinct from [`Self::rto_start`]: this preserves the accumulated
+    /// backoff, because a submission is not ACK progress.
+    pub fn rto_rearm(&mut self) -> u64 {
+        self.rto.rearm(self.rto_base_timeout_micros())
     }
 
     /// Stop the RTO epoch: nothing submitted is outstanding any more.
@@ -2007,8 +2026,9 @@ mod tests {
         let mut buf = SenderBuffer::new(0, 8192, 10);
         let send_time = Timestamp::from_micros(0);
         buf.push(vec![1], 100, 1, send_time);
-        assert!(
+        assert_eq!(
             buf.note_data_submitted(0),
+            RtoArm::Start,
             "first submission starts an epoch"
         );
         assert!(
@@ -2027,6 +2047,40 @@ mod tests {
             dropped_seqs(&buf.drop_expired(Timestamp::from_micros(1_000_001))),
             vec![0],
             "the original send time still decides TLPKTDROP"
+        );
+    }
+
+    /// The three events a submission can be: the first one after an empty flight
+    /// starts an epoch, an ordinary one while an epoch runs changes nothing, and
+    /// the pending blind probe actually going out reprograms the epoch.
+    #[test]
+    fn submission_reports_which_rto_event_it_is() {
+        let now = Timestamp::from_micros(0);
+        let mut buf = SenderBuffer::new(0, 8192, 10);
+        buf.push(vec![1], 100, 1, now);
+        buf.push(vec![2], 100, 1, now);
+
+        assert_eq!(buf.note_data_submitted(0), RtoArm::Start);
+        // The connection arms the epoch when it sees `Start`; only then is there
+        // a running epoch for an ordinary submission to leave alone.
+        buf.rto_start();
+        assert_eq!(
+            buf.note_data_submitted(1),
+            RtoArm::Nothing,
+            "an ordinary submission must not restart a running epoch"
+        );
+
+        assert_eq!(buf.queue_retransmission_of_newest_submitted(), Some(1));
+        buf.rto_set_probe_pending(1);
+        assert_eq!(
+            buf.note_data_submitted(0),
+            RtoArm::Nothing,
+            "a submission that is not the pending probe must not reprogram anything"
+        );
+        assert_eq!(
+            buf.note_data_submitted(1),
+            RtoArm::Rearm,
+            "the pending probe crossing the submission boundary reprograms the epoch"
         );
     }
 

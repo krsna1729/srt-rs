@@ -260,13 +260,20 @@ post-fix evidence is.
   reports the pool peak, and `Owner::rx_session_totals` exposes SRT-level receive
   `lost`/`duplicates` including retired sessions (each table keeps a retired
   ledger sampled at relinquish time).
-- **Gate and contract.** `cargo xtask qualify` now requires the row to decompose
+- **Gate and contract.** `cargo xtask qualify` now requires the row to be the
+  offered workload (the requested fanout established at both endpoints,
+  `data_offered == generated_ticks x established`, `data_accepted ==
+  data_offered`), to decompose
   (`sum(tx_class_*) == tx_class_total == tx_submitted_wire`), to record the
   send-outcome counters, and to account for the terminal fence
   (`data_accepted + fence seen == rx_core_total`); the bench asserts the partition
-  before printing. `docs/owner-contract.md` freezes the Owner's *semantics*
-  clause by clause with its test map, and lists what stays unfrozen (pool and lane
-  implementation, heaps, io_uring flags, batching).
+  before printing. Qualification counts repetitions rather than rows -- a
+  repetition passes only when every shard row in it passes -- and a canonical
+  artifact additionally carries `owner_faulted`, the driver's own build
+  provenance, and a bound on packet-level duplicates. `cargo xtask scaling`
+  builds the binaries it benchmarks. `docs/owner-contract.md` freezes the Owner's
+  *semantics* clause by clause with its test map, and lists what stays unfrozen
+  (pool and lane implementation, heaps, io_uring flags, batching).
 - **Owner telemetry fix.** `SHARD_OVERLOAD_REASONS` was 4 while
   `ShardOverloadReason` had five variants, so recording `OutputProtocolError`
   indexed past the array. The count is now derived from the enum with a

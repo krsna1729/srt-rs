@@ -20,7 +20,7 @@ mod time;
 
 /// Supported sender-side SRT protocol component APIs.
 pub mod sender {
-    pub use super::sender_rto::{COMM_SYN_MICROS, MAX_RTO_MICROS, SenderRto};
+    pub use super::sender_rto::{COMM_SYN_MICROS, MAX_RTO_MICROS, RtoArm, SenderRto};
     pub use super::srt_sender::{
         DEFAULT_MAX_BANDWIDTH_BYTES_PER_SEC, DroppedMessage, SenderBuffer, SenderStats,
     };
