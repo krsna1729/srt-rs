@@ -313,9 +313,27 @@ struct PeerFeedback {
     rtt_micros: u32,
     rtt_variance_micros: u32,
     available_buffer_packets: u32,
-    receiving_rate_packets_per_second: u32,
-    link_capacity_packets_per_second: u32,
-    receiving_rate_bytes_per_second: u32,
+    /// Rate/link telemetry, present only once a peer ACK has actually
+    /// carried a rate section (24 bytes or larger). A 16-byte Small ACK
+    /// updates RTT/RTTVar/window but carries no rate section at all, so it
+    /// must leave whatever rate snapshot is already here untouched rather
+    /// than replacing it with zeros -- see [`SenderBuffer::record_peer_feedback`].
+    rate_feedback: Option<PeerRateFeedback>,
+}
+
+/// A peer ACK's rate/link telemetry, present only in a 24-byte-or-larger
+/// (reference-Full or draft Full) ACK. Fully replaced, not merged, by each
+/// ACK that carries one: mixing a new 24-byte snapshot's packet/link rates
+/// with a stale byte-rate left over from an earlier 28-byte ACK would
+/// misrepresent the peer's own report.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PeerRateFeedback {
+    pub(crate) receiving_rate_packets_per_second: u32,
+    pub(crate) link_capacity_packets_per_second: u32,
+    /// Only a 28/32-byte ACK carries this field. A 24-byte ACK has no
+    /// explicit byte-rate at all -- `None` here means exactly that absence,
+    /// never a fabricated zero.
+    pub(crate) receiving_rate_bytes_per_second: Option<u32>,
 }
 
 impl SenderBuffer {
@@ -1540,22 +1558,29 @@ impl SenderBuffer {
     /// against. `peer_feedback` keeps the raw, unsmoothed-by-us report for
     /// telemetry; `sender_rtt_micros`/`sender_rtt_var_micros` is what the RTO
     /// actually consumes.
+    ///
+    /// `rate_feedback` is `None` when this particular ACK carried no rate
+    /// section at all (a 16-byte Small ACK): the previous rate snapshot, if
+    /// any, is preserved rather than zeroed. When `Some`, it *replaces* the
+    /// previous snapshot wholesale -- a 24-byte ACK's absent byte-rate must
+    /// not be backfilled from an older 28-byte ACK's, since that would
+    /// misrepresent this report as carrying a field it does not have.
     pub(crate) fn record_peer_feedback(
         &mut self,
         rtt_micros: u32,
         rtt_variance_micros: u32,
         available_buffer_packets: u32,
-        receiving_rate_packets_per_second: u32,
-        link_capacity_packets_per_second: u32,
-        receiving_rate_bytes_per_second: u32,
+        rate_feedback: Option<PeerRateFeedback>,
     ) {
+        let rate_feedback = rate_feedback.or_else(|| {
+            self.peer_feedback
+                .and_then(|previous| previous.rate_feedback)
+        });
         self.peer_feedback = Some(PeerFeedback {
             rtt_micros,
             rtt_variance_micros,
             available_buffer_packets,
-            receiving_rate_packets_per_second,
-            link_capacity_packets_per_second,
-            receiving_rate_bytes_per_second,
+            rate_feedback,
         });
         if rtt_micros > 0 {
             // Smooth with EWMA: RTT = 7/8 * RTT + 1/8 * sample -- the same
@@ -1818,19 +1843,30 @@ impl SenderBuffer {
             peer_rtt_variance_micros: peer.map(|feedback| feedback.rtt_variance_micros),
             peer_available_buffer_packets: peer.map(|feedback| feedback.available_buffer_packets),
             peer_receiving_rate_packets_per_second: peer
-                .map(|feedback| feedback.receiving_rate_packets_per_second),
+                .and_then(|feedback| feedback.rate_feedback)
+                .map(|rate| rate.receiving_rate_packets_per_second),
             peer_link_capacity_packets_per_second: peer
-                .map(|feedback| feedback.link_capacity_packets_per_second),
-            peer_link_capacity_bytes_per_second: peer.and_then(|feedback| {
-                let packet_rate = u64::from(feedback.receiving_rate_packets_per_second);
-                (packet_rate > 0).then(|| {
-                    u64::from(feedback.link_capacity_packets_per_second)
-                        .saturating_mul(u64::from(feedback.receiving_rate_bytes_per_second))
-                        / packet_rate
-                })
-            }),
+                .and_then(|feedback| feedback.rate_feedback)
+                .map(|rate| rate.link_capacity_packets_per_second),
+            // Requires the peer's own measured bytes-per-packet (the
+            // 28/32-byte byte-rate field): a 24-byte ACK's rate snapshot has
+            // no such field, so there is nothing honest to derive here --
+            // `None`, not a fabricated zero from treating the absent field
+            // as 0.
+            peer_link_capacity_bytes_per_second: peer
+                .and_then(|feedback| feedback.rate_feedback)
+                .and_then(|rate| {
+                    let byte_rate = rate.receiving_rate_bytes_per_second?;
+                    let packet_rate = u64::from(rate.receiving_rate_packets_per_second);
+                    (packet_rate > 0).then(|| {
+                        u64::from(rate.link_capacity_packets_per_second)
+                            .saturating_mul(u64::from(byte_rate))
+                            / packet_rate
+                    })
+                }),
             peer_receiving_rate_bytes_per_second: peer
-                .map(|feedback| feedback.receiving_rate_bytes_per_second),
+                .and_then(|feedback| feedback.rate_feedback)
+                .and_then(|rate| rate.receiving_rate_bytes_per_second),
             total_retransmits: self.total_retransmits,
             total_sent: self.total_sent,
             total_data_packets_sent: self.total_sent.saturating_add(self.total_retransmits),
@@ -1876,19 +1912,33 @@ pub struct SenderStats {
     pub packet_send_period_micros: u64,
     /// Configured maximum pacing bandwidth.
     pub max_bandwidth_bytes_per_second: u64,
-    /// RTT advertised by the peer's most recent full ACK.
+    /// RTT advertised by the peer's most recent compatible non-Light ACK
+    /// feedback (any ACK size `validate_ack_shape` accepts that carries
+    /// RTT/RTTVar/window: 16, 24, 28, or 32 bytes -- not only the draft's
+    /// own 28-byte Full ACK).
     pub peer_rtt_micros: Option<u32>,
-    /// RTT variance advertised by the peer's most recent full ACK.
+    /// RTT variance from the same feedback as `peer_rtt_micros`.
     pub peer_rtt_variance_micros: Option<u32>,
-    /// Peer receive-buffer availability from the most recent full ACK.
+    /// Peer receive-buffer availability from the same feedback as
+    /// `peer_rtt_micros`.
     pub peer_available_buffer_packets: Option<u32>,
-    /// Peer receive rate from the most recent full ACK.
+    /// Peer receive rate from the most recent ACK that carried a rate
+    /// section (24 bytes or larger). A 16-byte Small ACK carries no rate
+    /// section at all, so it leaves this at whatever a previous
+    /// rate-carrying ACK reported; `None` until the first one arrives.
     pub peer_receiving_rate_packets_per_second: Option<u32>,
-    /// Peer link-capacity estimate from the most recent full ACK.
+    /// Peer link-capacity estimate, from the same rate-carrying ACK as
+    /// `peer_receiving_rate_packets_per_second`.
     pub peer_link_capacity_packets_per_second: Option<u32>,
-    /// Peer link-capacity estimate converted using its measured wire bytes per packet.
+    /// Peer link-capacity estimate converted using its measured wire bytes
+    /// per packet. `None` whenever `peer_receiving_rate_bytes_per_second`
+    /// is `None` -- a 24-byte ACK's rate section has no byte-rate field to
+    /// derive this from, and that absence is never backfilled with a
+    /// fabricated zero or a stale value from an earlier 28-byte ACK.
     pub peer_link_capacity_bytes_per_second: Option<u64>,
-    /// Peer byte receive rate from the most recent full ACK.
+    /// Peer byte receive rate. Only a 28/32-byte ACK carries this field;
+    /// `None` if the most recent rate-carrying ACK was the 24-byte form (or
+    /// no rate-carrying ACK has arrived yet), never a fabricated zero.
     pub peer_receiving_rate_bytes_per_second: Option<u32>,
     /// Total retransmit count.
     pub total_retransmits: u64,
@@ -1926,6 +1976,15 @@ pub struct SenderStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A complete rate snapshot, as only a 28/32-byte ACK can report.
+    fn full_rate_feedback() -> Option<PeerRateFeedback> {
+        Some(PeerRateFeedback {
+            receiving_rate_packets_per_second: 1_000,
+            link_capacity_packets_per_second: 2_000,
+            receiving_rate_bytes_per_second: Some(1_500_000),
+        })
+    }
 
     fn dropped_seqs(messages: &[DroppedMessage]) -> Vec<u32> {
         let mut seqs = Vec::new();
@@ -3491,7 +3550,7 @@ mod tests {
     #[test]
     fn telemetry_retains_latest_full_ack_feedback() {
         let mut buf = SenderBuffer::new(0, 64, 120);
-        buf.record_peer_feedback(5_000, 500, 60, 1_000, 2_000, 1_500_000);
+        buf.record_peer_feedback(5_000, 500, 60, full_rate_feedback());
 
         let stats = buf.stats();
         assert_eq!(stats.peer_rtt_micros, Some(5_000));
@@ -3512,7 +3571,7 @@ mod tests {
             "before any compatible ACK feedback, the RTO base uses the same initial constants"
         );
 
-        buf.record_peer_feedback(20_000, 1_000, 60, 1_000, 2_000, 1_500_000);
+        buf.record_peer_feedback(20_000, 1_000, 60, full_rate_feedback());
         assert_eq!(
             buf.stats().peer_rtt_micros,
             Some(20_000),
@@ -3538,7 +3597,7 @@ mod tests {
         // residual, not by taking the peer's own variance figure directly.
         // The base timeout should settle near `rtt + 2*SYN = 40 ms`.
         for _ in 0..50 {
-            buf.record_peer_feedback(20_000, 1_000, 60, 1_000, 2_000, 1_500_000);
+            buf.record_peer_feedback(20_000, 1_000, 60, full_rate_feedback());
         }
         let converged = buf.rto_base_timeout_micros();
         assert!(
@@ -3558,7 +3617,7 @@ mod tests {
     fn rtt_ewma_never_overflows_on_near_u32_max_peer_feedback() {
         let mut buf = SenderBuffer::new(0, 64, 120);
         for _ in 0..8 {
-            buf.record_peer_feedback(u32::MAX - 1, u32::MAX - 1, 60, 1_000, 2_000, 1_500_000);
+            buf.record_peer_feedback(u32::MAX - 1, u32::MAX - 1, 60, full_rate_feedback());
             let timeout = buf.rto_base_timeout_micros();
             assert!(
                 timeout <= crate::sender_rto::MAX_RTO_MICROS,
@@ -3574,7 +3633,7 @@ mod tests {
         // to pull the (now very large) estimate back down through the same
         // overflow-safe arithmetic.
         for _ in 0..200 {
-            buf.record_peer_feedback(20_000, 1_000, 60, 1_000, 2_000, 1_500_000);
+            buf.record_peer_feedback(20_000, 1_000, 60, full_rate_feedback());
         }
         let recovered = buf.rto_base_timeout_micros();
         assert!(
