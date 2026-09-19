@@ -815,3 +815,218 @@ fn bonded_tx_failure_is_attributed_to_group_and_leg() {
         );
     });
 }
+
+/// Two legs with the SAME explicit SRT socket ID: configuration prepares,
+/// the candidate socket and side are built, and only the table's
+/// `add_group` refuses them. That is a genuine post-side-construction
+/// failure reachable through public configuration.
+fn duplicate_socket_id_group(group: u32) -> BondedCallerConfig {
+    BondedCallerConfig::new(GroupConfig::new(group, GroupType::Broadcast))
+        .leg(shared_leg_with_id(dead_peer(), 0x0D01), 1)
+        .leg(shared_leg_with_id(dead_peer(), 0x0D01), 1)
+}
+
+fn assert_owner_untouched(owner: &Owner) {
+    assert!(owner.caller().is_none(), "no caller side was committed");
+    assert_eq!(owner.rx_mode(), None, "no receive datapath was claimed");
+    assert!(
+        !owner.sessions_started,
+        "a refused attach starts no session"
+    );
+    assert!(owner.caller_pool_stats().is_none(), "no pool exists");
+    assert!(
+        owner.rx_stats().caller.is_none(),
+        "no receive consumer exists"
+    );
+}
+
+/// The first caller attach commits completely or changes nothing, even when
+/// the request fails after the candidate side was built.
+#[test]
+fn failed_first_bonded_admission_leaves_the_owner_untouched() {
+    let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+    runtime.block_on(async {
+        let mut owner = Owner::new(8);
+        let error = owner
+            .connect_bonded(&duplicate_socket_id_group(41), Timestamp::from_micros(0))
+            .expect_err("duplicate socket IDs are refused by the table");
+        assert!(error.to_string().contains("distinct"), "{error}");
+        assert_owner_untouched(&owner);
+
+        // Configuration is not frozen by the refusal...
+        owner
+            .set_rx_substrate(ManagedRxSubstrate::NotIoUring)
+            .expect("substrate still declarable");
+        set_pool(&mut owner, 3, Duration::from_secs(9));
+        owner
+            .set_wire_ceiling(4096)
+            .expect("wire ceiling still settable");
+
+        // ...and a valid request becomes the genuine first caller.
+        let id = admitted(
+            owner
+                .connect_bonded(
+                    &bonded(
+                        42,
+                        GroupType::Broadcast,
+                        &[(dead_peer(), 1), (dead_peer(), 1)],
+                    ),
+                    Timestamp::from_micros(0),
+                )
+                .expect("valid group"),
+        );
+        assert!(owner.caller().is_some());
+        assert_eq!(owner.rx_mode(), Some(OwnerRxMode::RawReadiness));
+        assert!(owner.sessions_started);
+        let pool = owner.caller_pool_stats().expect("pool");
+        assert_eq!(
+            (pool.started, pool.in_flight),
+            (1, 1),
+            "the first admission"
+        );
+        assert_eq!(owner.caller().expect("side").table().len(), 1);
+        assert!(owner.logical_caller(&id).is_some());
+    });
+}
+
+/// Same rule under a required managed receive: the failed attach leaves no
+/// consumer or lease behind, and the valid retry is the first caller that
+/// starts the consumer (only where the host can run one).
+#[test]
+fn failed_first_admission_under_managed_rx_starts_no_consumer() {
+    let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+    let capable = runtime
+        .block_on(async { runtime.driver_type().is_iouring() && runtime.buffer_pool().is_ok() });
+    runtime.block_on(async {
+        let mut owner = Owner::new(8);
+        owner.set_rx_mode_policy(RxModePolicy::ManagedRequired);
+        owner
+            .set_rx_substrate(ManagedRxSubstrate::Available)
+            .expect("declare substrate");
+
+        let error = owner
+            .connect_bonded(&duplicate_socket_id_group(43), Timestamp::from_micros(0))
+            .expect_err("refused after the candidate side was built");
+        assert!(error.to_string().contains("distinct"), "{error}");
+        assert_owner_untouched(&owner);
+        // No side exists, so no consumer task, staged completion or
+        // provided-buffer lease can; the TX pool is whole as well.
+        assert_eq!(owner.tx_in_flight(), 0);
+        assert_eq!(owner.tx_pool().free_count(), owner.tx_pool().capacity());
+        // Still configurable, and the same rule holds for a direct attempt
+        // refused before side construction.
+        owner
+            .set_rx_substrate(ManagedRxSubstrate::Available)
+            .expect("substrate still declarable");
+
+        if !capable {
+            // No consumer can run on this kernel; the negative half above is
+            // the whole claim here.
+            return;
+        }
+        let id = admitted(
+            owner
+                .connect_bonded(
+                    &bonded(
+                        44,
+                        GroupType::Broadcast,
+                        &[(dead_peer(), 1), (dead_peer(), 1)],
+                    ),
+                    Timestamp::from_micros(0),
+                )
+                .expect("valid group"),
+        );
+        assert_eq!(owner.rx_mode(), Some(OwnerRxMode::ManagedMultishot));
+        let ring = owner
+            .caller()
+            .expect("side")
+            .rx
+            .ring
+            .as_ref()
+            .expect("managed ring")
+            .clone();
+        assert!(
+            ring.borrow().task.is_some(),
+            "the consumer runs after commit"
+        );
+        assert!(owner.logical_caller(&id).is_some());
+        assert!(
+            owner.shutdown_and_drain(Duration::from_secs(5)).await,
+            "the consumer stops through the awaited cancel"
+        );
+        assert!(owner.quiescence_invariants_hold());
+    });
+}
+
+/// Construction alone never starts a managed consumer; `start_managed_rx`
+/// does, once. A candidate side dropped after a failed admission therefore
+/// never owned a live receive.
+#[test]
+fn caller_side_construction_starts_no_managed_task() {
+    let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+    runtime.block_on(async {
+        let std_sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let sock = compio::net::UdpSocket::from_std(std_sock).expect("adopt");
+        let transport = crate::TransportConfig {
+            ownership: crate::SocketOwnership::Shared,
+            ..crate::TransportConfig::default()
+        }
+        .resolve(crate::RuntimeFlavor::Compio.capabilities())
+        .expect("shared transport");
+        let mut side = OwnerCallerSide::from_parts_with_rx_mode(
+            sock,
+            std::num::NonZeroUsize::MIN,
+            Duration::from_secs(1),
+            transport,
+            None,
+            crate::ConnectConfig::default(),
+            OwnerRxMode::ManagedMultishot,
+            managed_rx_buffer_len(1500),
+        )
+        .expect("candidate side");
+        let ring = side
+            .rx
+            .ring
+            .as_ref()
+            .expect("managed ring configured")
+            .clone();
+        assert!(
+            ring.borrow().task.is_none(),
+            "construction spawns no consumer"
+        );
+        assert!(
+            side.rx.quiescent(),
+            "a never-started candidate holds nothing"
+        );
+
+        side.start_managed_rx(managed_rx_buffer_len(1500));
+        assert!(ring.borrow().task.is_some(), "the commit step starts it");
+        // Starting twice is a no-op, and the awaited stop is what releases it.
+        side.start_managed_rx(managed_rx_buffer_len(1500));
+        assert!(side.rx.stop_and_join(Duration::from_secs(5)).await);
+        assert!(side.rx.quiescent());
+    });
+}
+
+/// A first direct connect follows the same rule: side, receive mode and
+/// started-session flag are committed together, after admission. (No legal
+/// public direct configuration fails between side construction and
+/// admission, so there is no direct counterpart to the duplicate-ID case.)
+#[test]
+fn first_direct_connect_commits_side_mode_and_session_together() {
+    let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+    runtime.block_on(async {
+        let mut owner = Owner::new(8);
+        assert_owner_untouched(&owner);
+        let id = admitted(
+            owner
+                .connect(&shared_leg(dead_peer()), Timestamp::from_micros(0))
+                .expect("direct connect"),
+        );
+        assert!(owner.caller().is_some());
+        assert_eq!(owner.rx_mode(), Some(OwnerRxMode::RawReadiness));
+        assert!(owner.sessions_started);
+        assert!(owner.logical_caller(&id).is_some());
+        assert_eq!(owner.caller_pool_stats().expect("pool").started, 1);
+    });
+}

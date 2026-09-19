@@ -104,7 +104,11 @@ service budget at the same time.
   identify a session on a shared socket.
 * **Attach is transactional.** A `listen`/`connect` that fails leaves the Owner
   exactly as configurable as it was: no side, no claimed receive datapath, no
-  started session.
+  started session, no managed-RX consumer or provided-buffer lease. For the
+  first caller (`connect` and `connect_bonded` alike) this is enforced by
+  order: the candidate side is built locally and the request is admitted into
+  the candidate's pool first; only after a successful admission is the managed
+  receive started and the side, receive mode and started-session flag committed.
 
 ## Charter: this crate owns *things*
 
