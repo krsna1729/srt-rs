@@ -4127,21 +4127,30 @@ fn validate_control_information(pkt: &ControlPacket) -> Result<(), Error> {
 }
 
 /// Validate one ACK's length/ACK-number combination against the bounded
-/// set of shapes the pinned Haivision reference (`899348d8`, `core.cpp`'s
-/// `CUDT::sendCtrl`/`processCtrlAck`) actually emits and accepts -- wider
-/// than the draft's own three canonical sizes.
+/// set of shapes this implementation deliberately accepts, matching
+/// Robotweax's bounded decoder.
+///
+/// The pinned Haivision reference (`899348d8`, `core.cpp`) draws a sharp
+/// line between what it emits and what it accepts: `CUDT::sendCtrl` only
+/// ever emits a 4-, 16-, 24-, 28-, or 32-byte ACK CIF, while
+/// `CUDT::processCtrlAck` itself accepts any 4-byte Light ACK or any
+/// non-Light ACK of at least 16 bytes -- a materially wider receive-side
+/// tolerance than what it actually produces. This crate deliberately
+/// accepts only the bounded set of sizes pinned Haivision is actually
+/// shown to emit -- {4, 16, 24, 28, 32} -- rather than mirroring its
+/// permissive receive path.
 ///
 /// Light (4 bytes) carries only the cumulative position and never an ACK
 /// number. Small (16 bytes) adds RTT/RTTVar/advertised-buffer, and comes
-/// in two forms Haivision itself produces: the draft's unnumbered form
-/// (ACK number 0) and a deployed numbered variant (nonzero) that gets
-/// acknowledged with ACKACK -- Robotweax pins a regression for exactly
-/// this variant. The reference-Full sizes (24, adding packet
-/// rate/capacity; 28, the draft's own Full ACK, adding the receiving byte
-/// rate; and libsrt's legacy 32-byte form with one extra, unused field)
-/// always carry a nonzero ACK number. Any other aligned length is not a
-/// protocol transition this crate (or any pinned reference) actually
-/// produces.
+/// in two forms: the draft's own unnumbered form (ACK number 0), which
+/// this crate also accepts, and a deployed numbered variant (nonzero)
+/// that pinned Haivision demonstrates emitting and that gets acknowledged
+/// with ACKACK -- Robotweax pins a regression for exactly this variant.
+/// The reference-Full sizes (24, adding packet rate/capacity; 28, the
+/// draft's own Full ACK, adding the receiving byte rate; and libsrt's
+/// legacy 32-byte form with one extra, unused field) always carry a
+/// nonzero ACK number. Any other aligned length is not a size pinned
+/// Haivision is shown to emit.
 fn validate_ack_shape(ack_number: u32, len: usize) -> Result<(), Error> {
     if !matches!(len, 4 | 16 | 24 | 28 | 32) {
         return Err(Error::invalid_data(format!(
