@@ -108,6 +108,38 @@ A refusal is a typed outcome the application sees, never a silent drop, and no
 table grows without a bound. A slow or overloaded peer leaves backpressure in
 the protocol's own flow control, not in an unbounded transport queue.
 
+**Outbound sessions attach through exactly two production calls:**
+`Owner::connect(&CallerConfig, now)` for a direct caller and
+`Owner::connect_bonded(&BondedCallerConfig, now)` for a bonded (Broadcast or
+Backup) caller. Applications never mutate the caller table directly; the
+bench/test-only table accessors are not part of this contract and are not
+production-public.
+
+A bonded caller is ONE logical caller:
+
+* it resolves to a single `LogicalCallerId` and is thereafter driven through
+  the same `logical_caller`, `logical_caller_mut`, `remove_caller`,
+  `poll_caller_events`, `poll_tx_failures`, `service`, `wait_for_activity` and
+  `shutdown_and_drain` calls as a direct caller;
+* it is one request to the bounded caller pool: one in-flight permit or one
+  queue slot (`PoolOutcome::Admitted` / `Queued` / `Full`) however many legs it
+  has, so `max_in_flight` and the queue bound count logical callers for direct
+  and bonded requests alike; its attempt deadline starts at admission, and
+  expiry, cancellation or `remove_caller` retire every leg, route and deadline
+  together;
+* its legs are bounded by `srt_proto::MAX_GROUP_MEMBERS`, are validated through
+  the same Compio path as a direct caller (`SocketOwnership::Shared`, the
+  owner's wire ceiling, compatibility with the shared caller socket, one
+  address family), and are stamped with distinct member IDs, the GROUP
+  extension and one shared initial sequence;
+* it adds no socket, task, lane or connection object per leg: every leg shares
+  the Owner's one caller UDP socket, fixed TX pool and receive consumer, and
+  Broadcast/Backup selection is the existing `SrtGroup` core, not a second
+  implementation in the runtime adapter;
+* a rejected request is transactional exactly like a rejected `connect`, and a
+  peer-local TX failure is attributed to the logical group *and* the physical
+  leg (`TxAttribution`) without faulting the Owner.
+
 ### 9. Completion ownership
 
 The `Owner` owns completions until it reaps them; the application never reaches
@@ -172,7 +204,9 @@ each may change without notice while every clause above still holds:
 ## Test map
 
 All names below are in `crates/srt-transport/src/runtimes/compio.rs`'s test module
-unless a path is given.
+unless a path is given. The bonded-caller tests live in
+`crates/srt-transport/src/runtimes/compio_bonded_tests.rs`, with the pool- and
+config-level halves in `caller_pool.rs` and `config.rs`.
 
 | Clause | Pinned by |
 |---|---|
@@ -183,8 +217,8 @@ unless a path is given.
 | 5 protocol-owned timers | `owner_wake_includes_caller_pool_attempt_deadline`, `crates/srt-transport/tests/tail_recovery.rs` |
 | 6 explicit continuation | `tx_pool_exhaustion_leaves_protocol_datagram_pending`, `owner_tx_bounded_concurrency_and_pool_exhaustion` |
 | 7 fault poisoning | `managed_rx_stream_failure_faults_the_owner`, `rx_consumer_fault_stops_rx_maintenance_and_tx`, `owner_fault_gates_listen_and_connect_through_public_apis`, `failed_attach_does_not_freeze_the_owner`, `a_dead_tx_lane_poisons_the_owner_and_cannot_continue_at_reduced_capacity` |
-| 8 admission/backpressure | `owner_rejects_session_with_incompatible_wire_ceiling`, `owner_wake_includes_caller_pool_attempt_deadline` |
-| 9 completion ownership | `service_returns_tx_buffers_and_updates_completion_stats`, `tx_failure_event_reports_the_logical_attribution`, `owner_sibling_isolation` |
+| 8 admission/backpressure | `owner_rejects_session_with_incompatible_wire_ceiling`, `owner_wake_includes_caller_pool_attempt_deadline`, bonded: `bonded_connect_admits_one_logical_caller_immediately`, `queued_bonded_request_keeps_its_id_and_its_deadline_starts_at_admission`, `full_pool_refuses_a_bonded_request_without_retaining_it`, `bonded_attempt_deadline_retires_the_whole_group`, `remove_caller_reclaims_every_leg_route_and_deadline`, `bonded_leg_count_is_bounded_by_the_protocol_limit`, `rejected_bonded_attach_is_transactional`, `bonded_and_direct_callers_share_one_socket_at_fixed_runtime_cost`, `broadcast_send_reaches_every_established_leg`, `backup_send_uses_the_established_leg_only`, `shutdown_with_a_live_bonded_caller_is_quiescent` |
+| 9 completion ownership | `service_returns_tx_buffers_and_updates_completion_stats`, `tx_failure_event_reports_the_logical_attribution`, `owner_sibling_isolation`, `bonded_tx_failure_is_attributed_to_group_and_leg` |
 | 10 bounded close | `shutdown_and_drain_reaps_in_flight_to_quiescence`, `shutdown_timeout_does_not_fabricate_quiescence`, `shutdown_verdict_requires_rx_quiescence`, `a_dead_tx_lane_poisons_the_owner_and_cannot_continue_at_reduced_capacity` |
 | 11 telemetry meanings | `report_tx_class_total_matches_submitted_packets_every_visit`, `tx_class_delta_reports_only_this_visits_submissions`, `first_submit_lateness_samples_only_first_transmission_data_with_a_due_instant`, `first_submit_lateness_measures_a_real_application_submission`, `tx_pool_high_water_tracks_the_peak_and_never_exceeds_capacity`, `rx_stats_expose_both_sides`, `rx_session_totals_report_live_sessions_and_survive_retirement`, `rx_session_totals_are_none_without_an_attached_side`, `rx_session_totals_include_bonded_group_legs` |
 

@@ -3488,6 +3488,98 @@ impl Owner {
         // One Owner-wide gate: an RX stream failure, a dead TX lane, or a
         // begun shutdown all stop new admission here, not just TX faults.
         self.ensure_operational("caller.connect")?;
+        self.vet_caller(&mut prepared, "caller.connect")?;
+        self.attach_caller_side(&prepared)?;
+        let side = self.caller.as_mut().expect("just ensured above");
+        side.pool.connect(prepared, now).map_err(|error| {
+            crate::RuntimeBuildError::from(crate::ConfigError::new(
+                "caller.connect",
+                error.to_string(),
+            ))
+        })
+    }
+
+    /// Start one bonded (Broadcast or Backup) outbound session on this
+    /// owner's shared caller socket. The whole group is ONE logical caller:
+    /// it resolves to a single [`crate::LogicalCallerId`] and is thereafter
+    /// driven through the same [`Self::logical_caller`],
+    /// [`Self::logical_caller_mut`], [`Self::remove_caller`],
+    /// [`Self::poll_caller_events`], [`Self::poll_tx_failures`] and
+    /// [`Self::service`] calls as a direct caller; applications never touch
+    /// the caller table or the group's legs directly.
+    ///
+    /// Every leg goes through the same validation as [`Self::connect`]
+    /// (`Compio` preparation, `SocketOwnership::Shared`, the Owner's wire
+    /// ceiling, compatibility with the shared caller socket), and the legs
+    /// must also agree with each other and with the socket's address family.
+    /// All of that happens before anything is committed, so a rejected group
+    /// leaves no group, leg, pool permit or deadline behind and does not
+    /// freeze Owner configuration any more than a rejected direct
+    /// [`Self::connect`] does.
+    ///
+    /// The group is one request to the bounded caller pool: it takes one
+    /// in-flight permit (or one queue slot, [`crate::PoolOutcome::Queued`],
+    /// or is refused as [`crate::PoolOutcome::Full`]) regardless of its leg
+    /// count, which stays bounded by [`srt_proto::MAX_GROUP_MEMBERS`]. It
+    /// adds no socket, task or connection object: all legs share this
+    /// Owner's one caller UDP socket, TX lanes and receive consumer.
+    pub fn connect_bonded(
+        &mut self,
+        config: &crate::BondedCallerConfig,
+        now: Timestamp,
+    ) -> Result<crate::PoolOutcome, crate::RuntimeBuildError> {
+        const FIELD: &str = "caller.connect_bonded";
+        let mut prepared = config.prepare(crate::RuntimeFlavor::Compio)?;
+        self.ensure_operational(FIELD)?;
+        for leg in &mut prepared.legs {
+            self.vet_caller(&mut leg.caller, FIELD)?;
+        }
+        // One socket carries every leg, so the legs must be interchangeable
+        // as far as that socket is concerned. Leg 0 sets the reference.
+        let first = prepared.legs[0].caller.clone();
+        for leg in &prepared.legs[1..] {
+            leg.caller.validate_shared_compatibility(
+                first.local_bind,
+                first.transport,
+                Some(first.connect),
+            )?;
+        }
+        let socket_is_v6 = match self.caller.as_ref() {
+            Some(side) => side.sock.local_addr().map(|addr| addr.is_ipv6()).ok(),
+            None => None,
+        }
+        .unwrap_or_else(|| first.local_bind.unwrap_or(first.remote).is_ipv6());
+        if let Some(leg) = prepared
+            .legs
+            .iter()
+            .find(|leg| leg.caller.remote.is_ipv6() != socket_is_v6)
+        {
+            return Err(crate::RuntimeBuildError::from(crate::ConfigError::new(
+                FIELD,
+                format!(
+                    "leg {} targets {} but the shared caller socket is {}; every leg of \
+                     a bonded caller must use the socket's address family",
+                    leg.member_id,
+                    leg.caller.remote,
+                    if socket_is_v6 { "IPv6" } else { "IPv4" },
+                ),
+            )));
+        }
+        self.attach_caller_side(&first)?;
+        let side = self.caller.as_mut().expect("just ensured above");
+        side.pool.connect_group(prepared, now).map_err(|error| {
+            crate::RuntimeBuildError::from(crate::ConfigError::new(FIELD, error.to_string()))
+        })
+    }
+
+    /// Per-request admission checks shared by [`Self::connect`] and every leg
+    /// of [`Self::connect_bonded`]. Read-only with respect to the Owner: it
+    /// only adjusts the request it was given.
+    fn vet_caller(
+        &self,
+        prepared: &mut crate::PreparedCaller,
+        field: &'static str,
+    ) -> Result<(), crate::RuntimeBuildError> {
         let payload_size = prepared.session.payload_size.resolve()?.get();
         // A caller's own KMREQ fixes the session's cipher mode, so its ceiling
         // follows the mode the protocol will actually use -- not "some
@@ -3496,16 +3588,13 @@ impl Owner {
         let req_ceiling = required_session_wire_ceiling_for_side(payload_size, cipher, true);
         if req_ceiling > self.wire_ceiling {
             return Err(crate::RuntimeBuildError::from(crate::ConfigError::new(
-                "caller.connect",
+                field,
                 format!(
                     "session required wire ceiling {req_ceiling} exceeds owner wire ceiling {}",
                     self.wire_ceiling
                 ),
             )));
         }
-        // Nothing configuration-visible is committed until the attach has
-        // actually succeeded: a failed `connect` must leave the Owner exactly
-        // as configurable as it was.
         if let Some((max_in_flight, attempt_deadline)) = self.caller_pool_policy {
             prepared.connect.max_in_flight = max_in_flight;
             prepared.connect.attempt_deadline = attempt_deadline;
@@ -3526,58 +3615,63 @@ impl Owner {
                 Some(side.connect_config),
             )?;
         }
-        if self.caller.is_none() {
-            if let Some(budget) = self.socket_memory_budget {
-                let listener_requested = self.listener.as_ref().map_or(0, |l| {
-                    l.transport
-                        .socket_buffer_bytes
-                        .saturating_mul(4)
-                        .saturating_mul(l.transport.topology.listener_socket_count().get())
-                });
-                let total =
-                    listener_requested.saturating_add(prepared.requested_socket_memory_bytes());
-                if total > budget.get() {
-                    return Err(crate::RuntimeBuildError::from(crate::ConfigError::new(
-                        "caller.socket_memory_budget",
-                        format!(
-                            "{total} bytes requested for combined listener and caller buffers exceeds owner budget of {} bytes",
-                            budget.get()
-                        ),
-                    )));
-                }
-            }
-            let sock = compio::net::UdpSocket::from_std(prepared.bind_socket()?)?;
-            let crate::ConnectConfig {
-                max_in_flight,
-                attempt_deadline,
-            } = prepared.connect;
-            let rx_mode = self.resolve_rx_mode("caller.connect.rx_mode")?;
-            let slot_len = managed_rx_buffer_len(self.wire_ceiling);
-            // Construct the side first; a failure here drops the socket and
-            // the reservation with it, and leaves the Owner untouched.
-            let side = OwnerCallerSide::from_parts_with_rx_mode(
-                sock,
-                max_in_flight,
-                attempt_deadline,
-                prepared.transport,
-                prepared.local_bind,
-                prepared.connect,
-                rx_mode,
-                slot_len,
-            )?;
-            // Commit: only now is this Owner bound to a receive datapath and
-            // to a socket it owns.
-            self.caller = Some(side);
-            self.rx_mode = Some(rx_mode);
-            self.sessions_started = true;
+        Ok(())
+    }
+
+    /// Bind the shared caller socket for the first request. Nothing
+    /// configuration-visible is committed until the attach has actually
+    /// succeeded: a failed attach must leave the Owner exactly as
+    /// configurable as it was.
+    fn attach_caller_side(
+        &mut self,
+        prepared: &crate::PreparedCaller,
+    ) -> Result<(), crate::RuntimeBuildError> {
+        if self.caller.is_some() {
+            return Ok(());
         }
-        let side = self.caller.as_mut().expect("just ensured above");
-        side.pool.connect(prepared, now).map_err(|error| {
-            crate::RuntimeBuildError::from(crate::ConfigError::new(
-                "caller.connect",
-                error.to_string(),
-            ))
-        })
+        if let Some(budget) = self.socket_memory_budget {
+            let listener_requested = self.listener.as_ref().map_or(0, |l| {
+                l.transport
+                    .socket_buffer_bytes
+                    .saturating_mul(4)
+                    .saturating_mul(l.transport.topology.listener_socket_count().get())
+            });
+            let total = listener_requested.saturating_add(prepared.requested_socket_memory_bytes());
+            if total > budget.get() {
+                return Err(crate::RuntimeBuildError::from(crate::ConfigError::new(
+                    "caller.socket_memory_budget",
+                    format!(
+                        "{total} bytes requested for combined listener and caller buffers exceeds owner budget of {} bytes",
+                        budget.get()
+                    ),
+                )));
+            }
+        }
+        let sock = compio::net::UdpSocket::from_std(prepared.bind_socket()?)?;
+        let crate::ConnectConfig {
+            max_in_flight,
+            attempt_deadline,
+        } = prepared.connect;
+        let rx_mode = self.resolve_rx_mode("caller.connect.rx_mode")?;
+        let slot_len = managed_rx_buffer_len(self.wire_ceiling);
+        // Construct the side first; a failure here drops the socket and
+        // the reservation with it, and leaves the Owner untouched.
+        let side = OwnerCallerSide::from_parts_with_rx_mode(
+            sock,
+            max_in_flight,
+            attempt_deadline,
+            prepared.transport,
+            prepared.local_bind,
+            prepared.connect,
+            rx_mode,
+            slot_len,
+        )?;
+        // Commit: only now is this Owner bound to a receive datapath and
+        // to a socket it owns.
+        self.caller = Some(side);
+        self.rx_mode = Some(rx_mode);
+        self.sessions_started = true;
+        Ok(())
     }
 
     /// Drain admitted-peer lifecycle/data events for the application.
@@ -4376,6 +4470,10 @@ impl Owner {
         l_pending || c_pending
     }
 }
+
+#[cfg(test)]
+#[path = "compio_bonded_tests.rs"]
+mod bonded_tests;
 
 #[cfg(test)]
 mod tests {
