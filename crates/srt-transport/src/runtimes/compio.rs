@@ -7232,6 +7232,14 @@ mod tests {
                 compio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
 
+            // The already-submitted datagram's completion depends on the
+            // io_uring completion for that lane's `send_to` actually landing
+            // -- an unsynchronized kernel event, not something a `service()`
+            // call right after killing an unrelated, idle lane is guaranteed
+            // to have observed yet. Park on the real readiness signal first,
+            // the same way every other completion-dependent test in this
+            // module does, instead of asserting on a single reap attempt.
+            wait_for_completion(&mut owner).await;
             let report = owner.service(Timestamp::from_micros(20_000), budget).await;
             assert_eq!(
                 report.completions_reaped, 1,
@@ -7251,6 +7259,10 @@ mod tests {
                 assert_eq!(report.tx_packets_submitted, 0);
                 assert_eq!(report.tx_class.total(), 0);
                 assert_eq!(owner.tx_class_totals().total(), submissions_before);
+                assert_eq!(
+                    report.completions_reaped, 0,
+                    "the one submitted datagram was already reaped above; nothing is left to reap"
+                );
             }
             assert!(
                 owner.has_pending_work(Timestamp::from_micros(30_000)),
