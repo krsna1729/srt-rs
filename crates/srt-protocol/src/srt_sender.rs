@@ -224,11 +224,12 @@ pub struct SenderBuffer {
     total_acks_received: u64,
     /// NAK control packets received from the peer.
     total_naks_received: u64,
-    /// Most recent measurements advertised by a full peer ACK, kept
-    /// unsmoothed for telemetry -- distinct from `sender_rtt_micros`/
-    /// `sender_rtt_var_micros`, which is this sender's own further-smoothed
-    /// estimate used for the RTO calculation (see
-    /// [`Self::record_peer_feedback`]).
+    /// Most recent measurements advertised by a compatible non-Light peer
+    /// ACK (any size `validate_ack_shape` accepts that carries RTT
+    /// feedback, not only the draft's own Full ACK), kept unsmoothed for
+    /// telemetry -- distinct from `sender_rtt_micros`/`sender_rtt_var_micros`,
+    /// which is this sender's own further-smoothed estimate used for the
+    /// RTO calculation (see [`Self::record_peer_feedback`]).
     peer_feedback: Option<PeerFeedback>,
     /// This sender's own smoothed RTT estimate, in microseconds, per the SRT
     /// draft's §4.10 RTT estimation: the peer's own (already smoothed) RTT
@@ -237,7 +238,7 @@ pub struct SenderBuffer {
     /// samples (`SrtReceiver::handle_ackack`). Distinct from
     /// `PeerFeedback::rtt_micros`, which is the peer's raw, unsmoothed-by-us
     /// report. Initialized to [`INITIAL_SRTT_MICROS`], the same starting
-    /// value used before any Full ACK arrives.
+    /// value used before any compatible ACK feedback arrives.
     sender_rtt_micros: u32,
     /// This sender's own smoothed RTT variance estimate, in microseconds,
     /// updated alongside `sender_rtt_micros`. Initialized to
@@ -407,10 +408,15 @@ impl SenderBuffer {
     /// is checked.
     fn advance_justified_frontier(&mut self) {
         while sequence_less_than(self.justified_frontier, self.next_seq) {
+            // `submitted` is a historical fact -- the peer may already have
+            // received this DATA before TLPKTDROP later turned the retained
+            // entry into a tombstone, and tombstoning it does not make the
+            // peer forget. So a position stays justified through that
+            // transition on `submitted` alone; `drop_notified` only has to
+            // carry justification for a position whose DATA was *never*
+            // submitted.
             let justified = match self.packets.get(self.justified_frontier) {
-                Some(entry) => {
-                    (entry.dropped && entry.drop_notified) || (!entry.dropped && entry.submitted)
-                }
+                Some(entry) => entry.submitted || (entry.dropped && entry.drop_notified),
                 None => false,
             };
             if !justified {
@@ -897,14 +903,15 @@ impl SenderBuffer {
         self.oldest_unacked
     }
 
-    /// Current base timeout from the peer's most recent Full-ACK measurements.
+    /// Current base timeout from the peer's most recent compatible ACK
+    /// feedback.
     #[must_use]
     pub fn rto_base_timeout_micros(&self) -> u64 {
         // This sender's own smoothed estimate (see `record_peer_feedback`),
         // never the peer's raw report directly -- it is already initialized
         // to the same starting constants `SenderRto::base_timeout_micros`
-        // would otherwise fall back to, so there is no "no Full ACK yet"
-        // case left to express with `None`.
+        // would otherwise fall back to, so there is no "no compatible ACK
+        // feedback yet" case left to express with `None`.
         SenderRto::base_timeout_micros(Some((self.sender_rtt_micros, self.sender_rtt_var_micros)))
     }
 
@@ -1517,8 +1524,9 @@ impl SenderBuffer {
         self.stale_retransmits = 0;
     }
 
-    /// Retain measurements carried by the most recent full ACK, and fold the
-    /// peer's reported RTT into this sender's own smoothed estimate.
+    /// Retain measurements carried by the most recent compatible non-Light
+    /// ACK, and fold the peer's reported RTT into this sender's own
+    /// smoothed estimate.
     ///
     /// The draft's §4.10 RTT estimation is defined at whichever node is doing
     /// the estimating, from its own raw round-trip samples; a receiver's
@@ -1526,7 +1534,7 @@ impl SenderBuffer {
     /// sender does not get raw round-trip samples of its own (it never sees a
     /// timestamp echo the way ACKACK gives the receiver one), so the input to
     /// its own §4.10 smoothing is the peer's report, treated as one more
-    /// sample rather than substituted wholesale -- otherwise every Full ACK
+    /// sample rather than substituted wholesale -- otherwise every such ACK
     /// would simply replace the sender's RTO input with whatever the peer
     /// last measured, which is exactly the smoothing the draft specifies
     /// against. `peer_feedback` keeps the raw, unsmoothed-by-us report for
@@ -3041,6 +3049,32 @@ mod tests {
         assert!(buf.can_send());
     }
 
+    /// `submitted` is a historical fact: a peer that already received a
+    /// sequence's DATA does not forget it just because TLPKTDROP later
+    /// turns the same retained entry into a tombstone. The justified
+    /// frontier must advance through such an entry on `submitted` alone,
+    /// without waiting for its (separately queued) DROPREQ to also be
+    /// notified.
+    #[test]
+    fn justified_frontier_survives_tlpktdrop_of_an_already_submitted_entry() {
+        let now = Timestamp::default();
+        let mut buf = SenderBuffer::new(0, 32, 10);
+        buf.push_submitted(vec![1], 1, 1, now).expect("admitted");
+        assert_eq!(
+            buf.max_justified_ack_position(),
+            1,
+            "submission alone justifies it"
+        );
+
+        let dropped = buf.drop_expired(Timestamp::from_micros(1_000_001));
+        assert_eq!(dropped.len(), 1, "the same entry is now also a tombstone");
+        assert_eq!(
+            buf.max_justified_ack_position(),
+            1,
+            "TLPKTDROP tombstoning an already-submitted entry must not un-justify it"
+        );
+    }
+
     /// A fragmented message drops as one unit and expands back to its whole
     /// range from any NAKed fragment inside it.
     #[test]
@@ -3475,7 +3509,7 @@ mod tests {
         assert_eq!(
             buf.rto_base_timeout_micros(),
             SenderRto::base_timeout_micros(None),
-            "before any Full ACK, the RTO base uses the same initial constants"
+            "before any compatible ACK feedback, the RTO base uses the same initial constants"
         );
 
         buf.record_peer_feedback(20_000, 1_000, 60, 1_000, 2_000, 1_500_000);

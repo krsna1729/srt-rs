@@ -3191,21 +3191,26 @@ impl SrtConnection {
         );
 
         // An ACK cannot legitimately name a cumulative position beyond what
-        // this sender has actually put on the wire. The *accepted* frontier
-        // (`next_sequence_number`) is not the right bound here: #118
-        // established that accepted and submitted are different states, and
-        // a peer cannot acknowledge DATA still sitting behind this sender's
-        // own TX capacity -- only `max_justified_ack_position` (derived from
-        // actual first-transmission submission) is. Treating such a position
-        // as merely "not current" (as a stale/duplicate ACK is) would still
-        // let `set_peer_window` below use it to compute an advertised window
-        // end past that frontier, so it is rejected outright rather than
+        // this sender's peer-justified frontier covers. The *accepted*
+        // frontier (`next_sequence_number`) is not the right bound here:
+        // #118 established that accepted and submitted are different
+        // states, and a peer cannot acknowledge DATA still sitting behind
+        // this sender's own TX capacity. Nor is "actually submitted" alone
+        // the right bound, as of round 3: a position whose DATA was never
+        // submitted can still be peer-justified once the DROPREQ that
+        // reports it as dropped has itself crossed the wire (see
+        // `SenderBuffer::justified_frontier`), so `max_justified_ack_position`
+        // -- DATA-or-DROPREQ submission, not DATA submission alone -- is the
+        // actual bound. Treating a beyond-frontier position as merely "not
+        // current" (as a stale/duplicate ACK is) would still let
+        // `set_peer_window` below use it to compute an advertised window end
+        // past that frontier, so it is rejected outright rather than
         // silently ignored.
         if let Some(sender) = self.sender.as_ref()
             && sequence_less_than(sender.max_justified_ack_position(), ack_seq)
         {
             return Err(Error::invalid_data(format!(
-                "ACK names sequence {ack_seq}, beyond what this sender has actually submitted"
+                "ACK names sequence {ack_seq}, beyond this sender's peer-justified frontier"
             )));
         }
 
@@ -6944,6 +6949,101 @@ mod tests {
         );
     }
 
+    /// Drain queued output until exactly one DROPREQ has materialized
+    /// (skipping over any control/timer output ahead of it), then stop --
+    /// leaving everything after it, including any further DROPREQ, still
+    /// queued.
+    fn drain_until_one_drop_request_submitted(conn: &mut SrtConnection) {
+        loop {
+            let output = conn
+                .poll_output()
+                .unwrap()
+                .expect("a DROPREQ is still queued to drain");
+            if let ConnectionOutput::SendPacket(bytes) = &output
+                && let Ok(SrtPacket::Control(pkt)) = SrtPacket::decode(bytes)
+                && pkt.control_type == ControlType::DropReq
+            {
+                return;
+            }
+        }
+    }
+
+    /// `submitted` is a historical fact: once a peer could have received a
+    /// sequence's DATA, TLPKTDROP tombstoning that same retained entry
+    /// *later* does not make the peer forget it. `seq0` never has its DATA
+    /// submitted at all (tombstoned first); `seq1`'s DATA *is* submitted,
+    /// and only afterward does `seq1` also age into a tombstone, before its
+    /// own DROPREQ has gone out. Once `seq0`'s DROPREQ (the one thing `seq0`
+    /// was actually missing) crosses the wire, the peer can legitimately
+    /// know both positions -- `seq0` via the DROPREQ, `seq1` via the DATA it
+    /// already received -- so `ACK(seq1 + 1)` must be justified without
+    /// waiting for `seq1`'s own (separately queued) DROPREQ.
+    #[test]
+    fn ack_frontier_survives_tlpktdrop_after_the_data_was_already_submitted() {
+        let (mut caller, _listener) = connected_pair();
+        let socket_id = caller.socket_id();
+        let seq0 = caller.next_sequence_number().expect("connected sender");
+        let seq1 = seq0.wrapping_add(1);
+
+        // seq0: accepted at t=0, deliberately never drained.
+        caller
+            .send(b"seq0 never submitted", Timestamp::from_micros(0))
+            .expect("accepted");
+        // seq1: accepted later (t=900ms), so it ages out on its own schedule.
+        caller
+            .send(
+                b"seq1 submitted then also expires",
+                Timestamp::from_micros(900_000),
+            )
+            .expect("accepted");
+
+        // seq0 ages out (age 1_000_001 > 1s floor); seq1 has not yet (age
+        // 100_001). Only seq0 is tombstoned and purged; seq1's DATA is now
+        // at the front of the queue.
+        let first_tick = Timestamp::from_micros(1_000_001);
+        caller
+            .handle_timer(TimerId::Ack, first_tick)
+            .expect("ACK tick");
+
+        // Materialize seq1's DATA while seq0's DROPREQ stays queued: seq1 is
+        // now a historically-submitted entry.
+        drain_until_one_data_packet_submitted(&mut caller);
+
+        // Advance far enough that seq1 (sent at t=900ms) also ages past the
+        // 1s floor, without ever draining seq0's still-queued DROPREQ.
+        let second_tick = Timestamp::from_micros(1_900_001);
+        caller
+            .handle_timer(TimerId::Ack, second_tick)
+            .expect("ACK tick");
+        // seq1 is now: dropped = true, submitted = true, drop_notified =
+        // false -- exactly the state the frontier predicate must not treat
+        // as unjustified.
+
+        // Materialize only seq0's DROPREQ (queued first); seq1's own
+        // DROPREQ (queued by the second tick) stays behind it, undrained.
+        drain_until_one_drop_request_submitted(&mut caller);
+
+        assert_eq!(
+            caller.sender.as_ref().unwrap().max_justified_ack_position(),
+            seq1.wrapping_add(1),
+            "seq1's earlier DATA submission must still justify it even though \
+             it is now also a tombstone"
+        );
+        caller
+            .feed_recv_buf(
+                &ack_datagram(socket_id, seq1.wrapping_add(1), Some(8)),
+                second_tick,
+            )
+            .expect(
+                "ACK(seq1 + 1) is justified by seq0's DROPREQ plus seq1's earlier DATA \
+                 submission, without waiting for seq1's own DROPREQ",
+            );
+        assert_eq!(
+            caller.sender.as_ref().unwrap().oldest_unacked_sequence(),
+            seq1.wrapping_add(1)
+        );
+    }
+
     /// Once TLPKTDROP has tombstoned every submitted entry, the RTO timer
     /// must stop rather than keep probing a flight that no longer exists.
     #[test]
@@ -7079,8 +7179,8 @@ mod tests {
     /// reached here through the real wire decoder rather than by calling the
     /// handlers directly. Also covers ACK/NAK payloads that are well-formed
     /// but semantically impossible (a non-canonical ACK length, or a
-    /// cumulative/loss position beyond what this sender has ever
-    /// transmitted): those are rejected by the handlers themselves, not by
+    /// cumulative/loss position beyond this sender's peer-justified
+    /// frontier): those are rejected by the handlers themselves, not by
     /// shape validation, but must leave exactly the same zero footprint.
     #[test]
     #[cfg_attr(
