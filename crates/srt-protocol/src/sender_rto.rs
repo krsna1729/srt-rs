@@ -41,14 +41,16 @@
 //! and `RTTVar` are this *sender's own* §4.10 estimator state
 //! (`SenderBuffer::sender_rtt_micros`/`sender_rtt_var_micros`), smoothed by
 //! the same EWMA the receiver half of this crate uses for its own raw
-//! round-trip samples -- not the peer's Full-ACK report substituted
-//! outright. A Full ACK's reported RTT (see `SrtConnection::handle_ack`) is
-//! the *input* to that smoothing, folded in as one more sample each time,
-//! because the draft specifies estimation at whichever node is doing the
-//! estimating, not a wholesale replacement with the peer's own already-
-//! smoothed figure. Before the first Full ACK the estimator starts at the
-//! same 100 ms / 50 ms the receiver starts from, so the initial timeout is
-//! `100 + 4*50 + 2*10 = 320` ms.
+//! round-trip samples -- not the peer's report substituted outright. Any
+//! ACK that carries RTT/RTTVar feedback -- not only the draft's own Full
+//! ACK, but any reference-compatible non-Light ACK this crate accepts (a
+//! Small ACK included; see `SrtConnection::handle_ack` and
+//! `validate_ack_shape`) -- has that reported RTT folded in as one more
+//! input sample each time, because the draft specifies estimation at
+//! whichever node is doing the estimating, not a wholesale replacement with
+//! the peer's own already-smoothed figure. Before the first such ACK the
+//! estimator starts at the same 100 ms / 50 ms the receiver starts from, so
+//! the initial timeout is `100 + 4*50 + 2*10 = 320` ms.
 //!
 //! This module doubles the whole quantity per consecutive expiry rather than
 //! implementing the draft's `RexmitCount` continuous-timeout term literally --
@@ -69,10 +71,10 @@
 /// spec's one `COMM_SYN` value.
 pub const COMM_SYN_MICROS: u64 = crate::receiver::ACK_INTERVAL_MICROS;
 
-/// Peer-reported smoothed RTT used before the first Full ACK arrives.
+/// Peer-reported smoothed RTT used before the first compatible ACK feedback arrives.
 pub const INITIAL_SRTT_MICROS: u32 = 100_000;
 
-/// Peer-reported RTT variance used before the first Full ACK arrives.
+/// Peer-reported RTT variance used before the first compatible ACK feedback arrives.
 pub const INITIAL_RTT_VAR_MICROS: u32 = 50_000;
 
 /// Ceiling on the timeout, after any backoff.
@@ -189,9 +191,9 @@ impl SenderRto {
         }
     }
 
-    /// Base timeout from the peer's most recent Full-ACK measurements.
+    /// Base timeout from the peer's most recent compatible ACK feedback.
     ///
-    /// `None` (no Full ACK yet) uses the receiver's own initial constants.
+    /// `None` (no compatible ACK feedback yet) uses the receiver's own initial constants.
     #[must_use]
     pub fn base_timeout_micros(reported_rtt: Option<(u32, u32)>) -> u64 {
         let (srtt, rtt_var) = match reported_rtt {
