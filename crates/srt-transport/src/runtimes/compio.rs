@@ -1498,14 +1498,21 @@ impl OwnerCallerSide {
             stage_buf: vec![0u8; DEFAULT_RX_SLOT_SIZE],
         };
         if rx_mode == OwnerRxMode::ManagedMultishot {
+            // Configure the managed state only. The consumer task is started
+            // by `start_managed_rx` once the side is committed: a candidate
+            // side that is dropped after a failed first admission must never
+            // have owned a live receive (dropping a live consumer's handle
+            // without an awaited cancel is what leaks provided-buffer leases).
             side.rx = SideRx::managed(managed_slot_len, true);
-            side.spawn_managed_rx_task(managed_slot_len);
         }
         Ok(side)
     }
 
-    /// Spawn the one fixed managed RX task for this socket (idempotent).
-    fn spawn_managed_rx_task(&mut self, slot_len: usize) {
+    /// Start the one fixed managed RX task for this socket (idempotent).
+    ///
+    /// Called exactly once, by [`Owner`], after a side has been admitted a
+    /// first caller and committed. Construction never starts it.
+    fn start_managed_rx(&mut self, slot_len: usize) {
         if compio::runtime::Runtime::try_current().is_none() {
             return;
         }
@@ -1560,6 +1567,24 @@ impl OwnerCallerSide {
         }
     }
 }
+/// One first-or-subsequent caller admission request, by value, so the Owner
+/// can read the socket-defining first leg by reference and then hand the whole
+/// request to the pool without cloning any session (or its key material).
+enum CallerRequest {
+    // Boxed for the same reason `CallerPool` boxes it: far larger than a group.
+    Direct(Box<crate::PreparedCaller>),
+    Group(crate::PreparedBondedCaller),
+}
+
+impl CallerRequest {
+    fn first_leg(&self) -> &crate::PreparedCaller {
+        match self {
+            Self::Direct(prepared) => prepared,
+            Self::Group(group) => &group.legs[0].caller,
+        }
+    }
+}
+
 /// Compute the canonical maximum wire-datagram size required for a configured SRT session.
 ///
 /// Accounts for:
@@ -3489,14 +3514,11 @@ impl Owner {
         // begun shutdown all stop new admission here, not just TX faults.
         self.ensure_operational("caller.connect")?;
         self.vet_caller(&mut prepared, "caller.connect")?;
-        self.attach_caller_side(&prepared)?;
-        let side = self.caller.as_mut().expect("just ensured above");
-        side.pool.connect(prepared, now).map_err(|error| {
-            crate::RuntimeBuildError::from(crate::ConfigError::new(
-                "caller.connect",
-                error.to_string(),
-            ))
-        })
+        self.admit_caller(
+            CallerRequest::Direct(Box::new(prepared)),
+            "caller.connect",
+            now,
+        )
     }
 
     /// Start one bonded (Broadcast or Backup) outbound session on this
@@ -3536,19 +3558,27 @@ impl Owner {
         }
         // One socket carries every leg, so the legs must be interchangeable
         // as far as that socket is concerned. Leg 0 sets the reference.
-        let first = prepared.legs[0].caller.clone();
-        for leg in &prepared.legs[1..] {
-            leg.caller.validate_shared_compatibility(
+        let (first_bind, first_transport, first_connect, first_remote) = {
+            let first = &prepared.legs[0].caller;
+            (
                 first.local_bind,
                 first.transport,
-                Some(first.connect),
+                first.connect,
+                first.remote,
+            )
+        };
+        for leg in &prepared.legs[1..] {
+            leg.caller.validate_shared_compatibility(
+                first_bind,
+                first_transport,
+                Some(first_connect),
             )?;
         }
         let socket_is_v6 = match self.caller.as_ref() {
             Some(side) => side.sock.local_addr().map(|addr| addr.is_ipv6()).ok(),
             None => None,
         }
-        .unwrap_or_else(|| first.local_bind.unwrap_or(first.remote).is_ipv6());
+        .unwrap_or_else(|| first_bind.unwrap_or(first_remote).is_ipv6());
         if let Some(leg) = prepared
             .legs
             .iter()
@@ -3565,11 +3595,7 @@ impl Owner {
                 ),
             )));
         }
-        self.attach_caller_side(&first)?;
-        let side = self.caller.as_mut().expect("just ensured above");
-        side.pool.connect_group(prepared, now).map_err(|error| {
-            crate::RuntimeBuildError::from(crate::ConfigError::new(FIELD, error.to_string()))
-        })
+        self.admit_caller(CallerRequest::Group(prepared), FIELD, now)
     }
 
     /// Per-request admission checks shared by [`Self::connect`] and every leg
@@ -3618,17 +3644,58 @@ impl Owner {
         Ok(())
     }
 
-    /// Bind the shared caller socket for the first request. Nothing
-    /// configuration-visible is committed until the attach has actually
-    /// succeeded: a failed attach must leave the Owner exactly as
-    /// configurable as it was.
-    fn attach_caller_side(
+    /// Admit one request (direct or group) into the caller side, creating the
+    /// side for the first caller. **First attach commits completely or changes
+    /// nothing**, for direct and bonded requests alike:
+    ///
+    /// 1. build a *candidate* side locally (socket, receive state, pool);
+    ///    the Owner is not touched and no receive task exists yet;
+    /// 2. admit the request into the candidate's pool;
+    /// 3. only after a successful admission: start managed RX, then commit the
+    ///    side, the receive mode and `sessions_started` to the Owner.
+    ///
+    /// Any failure before step 3 drops the candidate (which has never owned a
+    /// live receive) and leaves no side, no claimed datapath, no started
+    /// session and no frozen configuration. An Owner that already has a caller
+    /// side just admits into it under its normal bounded pool policy.
+    fn admit_caller(
         &mut self,
-        prepared: &crate::PreparedCaller,
-    ) -> Result<(), crate::RuntimeBuildError> {
-        if self.caller.is_some() {
-            return Ok(());
+        request: CallerRequest,
+        field: &'static str,
+        now: Timestamp,
+    ) -> Result<crate::PoolOutcome, crate::RuntimeBuildError> {
+        let refuse = |error: srt_proto::Error| {
+            crate::RuntimeBuildError::from(crate::ConfigError::new(field, error.to_string()))
+        };
+        let admit = |pool: &mut crate::CallerPool, request: CallerRequest| match request {
+            CallerRequest::Direct(prepared) => pool.connect(*prepared, now),
+            CallerRequest::Group(prepared) => pool.connect_group(prepared, now),
+        };
+        if let Some(side) = self.caller.as_mut() {
+            return admit(&mut side.pool, request).map_err(refuse);
         }
+        // The first leg fixes the shared socket; the candidate borrows nothing
+        // from the request once built.
+        let (mut candidate, rx_mode, slot_len) = self.build_caller_side(request.first_leg())?;
+        let outcome = admit(&mut candidate.pool, request).map_err(refuse)?;
+        if outcome == crate::PoolOutcome::Full {
+            // Nothing was admitted or retained, so there is nothing to commit.
+            return Ok(outcome);
+        }
+        candidate.start_managed_rx(slot_len);
+        self.caller = Some(candidate);
+        self.rx_mode = Some(rx_mode);
+        self.sessions_started = true;
+        Ok(outcome)
+    }
+
+    /// Build the candidate caller side for the first request without mutating
+    /// the Owner: bind the socket, resolve the receive mode, construct the
+    /// side (no receive task yet). Returns the mode and slot length to commit.
+    fn build_caller_side(
+        &self,
+        prepared: &crate::PreparedCaller,
+    ) -> Result<(OwnerCallerSide, OwnerRxMode, usize), crate::RuntimeBuildError> {
         if let Some(budget) = self.socket_memory_budget {
             let listener_requested = self.listener.as_ref().map_or(0, |l| {
                 l.transport
@@ -3654,8 +3721,6 @@ impl Owner {
         } = prepared.connect;
         let rx_mode = self.resolve_rx_mode("caller.connect.rx_mode")?;
         let slot_len = managed_rx_buffer_len(self.wire_ceiling);
-        // Construct the side first; a failure here drops the socket and
-        // the reservation with it, and leaves the Owner untouched.
         let side = OwnerCallerSide::from_parts_with_rx_mode(
             sock,
             max_in_flight,
@@ -3666,12 +3731,7 @@ impl Owner {
             rx_mode,
             slot_len,
         )?;
-        // Commit: only now is this Owner bound to a receive datapath and
-        // to a socket it owns.
-        self.caller = Some(side);
-        self.rx_mode = Some(rx_mode);
-        self.sessions_started = true;
-        Ok(())
+        Ok((side, rx_mode, slot_len))
     }
 
     /// Drain admitted-peer lifecycle/data events for the application.
