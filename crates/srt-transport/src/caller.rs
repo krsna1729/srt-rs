@@ -148,6 +148,15 @@ pub enum LogicalCallerState {
     Disconnected,
 }
 
+/// Pool-facing view of a logical caller's connect attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AttemptStatus {
+    /// Still trying to establish: subject to the attempt deadline.
+    Establishing,
+    /// Connected, closing or rejected: no longer a stalled attempt.
+    Resolved,
+}
+
 /// One physical caller leg for [`CallerTable::add_direct`]. The connection
 /// must already have begun its caller handshake.
 pub struct CallerLeg {
@@ -1873,6 +1882,46 @@ impl CallerTable {
             CallerSession::Direct(leg) => Some(leg.connection.state()),
             CallerSession::Group(_) => None,
         }
+    }
+
+    /// Whether an admitted logical caller is still establishing (subject to a
+    /// pool's `attempt_deadline`) or has resolved one way or another.
+    ///
+    /// Like [`Self::raw_direct_state`] this looks at the protocol's own
+    /// state, not the coarse [`LogicalCallerState`], so a session that
+    /// connected and is now closing is `Resolved` rather than mistaken for a
+    /// stalled attempt. A bonded group is `Resolved` as soon as any leg is
+    /// `Connected`, or once no leg is still trying to establish. `None` for
+    /// an id that no longer exists.
+    #[must_use]
+    pub(crate) fn attempt_status(&self, id: &LogicalCallerId) -> Option<AttemptStatus> {
+        use srt_proto::ConnectionState::{Closing, Connected, Disconnected};
+        let establishing = |state: srt_proto::ConnectionState| {
+            !matches!(state, Connected | Disconnected | Closing)
+        };
+        Some(match self.sessions.get(id)? {
+            CallerSession::Direct(leg) => {
+                if establishing(leg.connection.state()) {
+                    AttemptStatus::Establishing
+                } else {
+                    AttemptStatus::Resolved
+                }
+            }
+            CallerSession::Group(group) => {
+                let members = group.group.members();
+                if members
+                    .iter()
+                    .any(|member| member.connection().state() == Connected)
+                    || !members
+                        .iter()
+                        .any(|member| establishing(member.connection().state()))
+                {
+                    AttemptStatus::Resolved
+                } else {
+                    AttemptStatus::Establishing
+                }
+            }
+        })
     }
 
     /// Drain protocol events for every direct logical caller -- the

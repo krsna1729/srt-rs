@@ -13,10 +13,11 @@
 //! [`CallerPool::poll_outbound_bounded`] exactly as it would against a bare
 //! [`CallerTable`].
 
+use crate::caller::AttemptStatus;
 use crate::{
-    CallerEvent, CallerLeg, CallerTable, DEFAULT_MAX_CALLERS, DatagramSink, LogicalCaller,
-    LogicalCallerId, LogicalCallerMut, MAX_CALLERS, OutputDrainBudget, OutputDrainReport,
-    PreparedCaller, RemovedLogicalCaller,
+    CallerEvent, CallerGroupLeg, CallerLeg, CallerTable, DEFAULT_MAX_CALLERS, DatagramSink,
+    LogicalCaller, LogicalCallerId, LogicalCallerMut, MAX_CALLERS, OutputDrainBudget,
+    OutputDrainReport, PreparedBondedCaller, PreparedCaller, RemovedLogicalCaller,
 };
 use srt_proto::Timestamp;
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -112,9 +113,19 @@ pub struct CallerPoolStats {
     pub dropped_outcomes: u64,
 }
 
+/// One retained connect request. A bonded group is ONE request: it takes one
+/// queue slot and, once admitted, one in-flight permit, however many physical
+/// legs it carries (bounded by `MAX_GROUP_MEMBERS`).
+enum PoolRequest {
+    // Boxed: a prepared direct caller is far larger than a group's leg list,
+    // and requests are control-plane, not per-packet.
+    Direct(Box<PreparedCaller>),
+    Group(PreparedBondedCaller),
+}
+
 struct QueuedConnect {
     request_id: PoolRequestId,
-    prepared: PreparedCaller,
+    request: PoolRequest,
 }
 
 #[derive(Clone, Copy)]
@@ -127,6 +138,10 @@ struct InFlightAttempt {
 struct PoolDeadline {
     deadline_micros: u64,
     caller_id: LogicalCallerId,
+}
+
+fn config_error(error: crate::ConfigError) -> srt_proto::Error {
+    srt_proto::Error::with_reason(srt_proto::ErrorKind::InvalidState, error.to_string())
 }
 
 pub struct CallerPool {
@@ -332,9 +347,33 @@ impl CallerPool {
         prepared: PreparedCaller,
         now: Timestamp,
     ) -> Result<PoolOutcome, srt_proto::Error> {
+        self.submit(PoolRequest::Direct(Box::new(prepared)), now)
+    }
+
+    /// Request one bonded outbound connection. It counts as ONE request: one
+    /// queue slot while waiting and one in-flight permit once admitted, so
+    /// `max_in_flight` bounds logical callers for direct and bonded requests
+    /// alike (the physical leg count is separately bounded by
+    /// `MAX_GROUP_MEMBERS`). Everything else -- admission below the bound,
+    /// bounded queueing, [`PoolOutcome::Full`], the deadline starting at
+    /// admission, expiry, cancellation -- is identical to [`Self::connect`],
+    /// with the whole group retired as one logical caller.
+    pub fn connect_group(
+        &mut self,
+        prepared: PreparedBondedCaller,
+        now: Timestamp,
+    ) -> Result<PoolOutcome, srt_proto::Error> {
+        self.submit(PoolRequest::Group(prepared), now)
+    }
+
+    fn submit(
+        &mut self,
+        request: PoolRequest,
+        now: Timestamp,
+    ) -> Result<PoolOutcome, srt_proto::Error> {
         let request_id = self.allocate_request_id()?;
         if self.in_flight.len() < self.max_in_flight {
-            let id = self.admit(request_id, prepared, now)?;
+            let id = self.admit(request_id, request, now)?;
             self.push_outcome(PoolEvent::Admitted {
                 request_id,
                 caller_id: id,
@@ -346,7 +385,7 @@ impl CallerPool {
         }
         self.queue.push_back(QueuedConnect {
             request_id,
-            prepared,
+            request,
         });
         self.push_outcome(PoolEvent::Queued { request_id });
         Ok(PoolOutcome::Queued(request_id))
@@ -355,14 +394,33 @@ impl CallerPool {
     fn admit(
         &mut self,
         request_id: PoolRequestId,
-        prepared: PreparedCaller,
+        request: PoolRequest,
         now: Timestamp,
     ) -> Result<LogicalCallerId, srt_proto::Error> {
-        let connection = prepared.connection(now).map_err(|error| {
-            srt_proto::Error::with_reason(srt_proto::ErrorKind::InvalidState, error.to_string())
-        })?;
-        let leg = CallerLeg::new(prepared.remote, connection);
-        let id = self.callers.add_direct(leg)?;
+        let id = match request {
+            PoolRequest::Direct(prepared) => {
+                let connection = prepared.connection(now).map_err(config_error)?;
+                self.callers
+                    .add_direct(CallerLeg::new(prepared.remote, connection))?
+            }
+            PoolRequest::Group(prepared) => {
+                // Build every leg's connection first; the table then inserts
+                // the whole group or nothing, so a refusal leaves no leg,
+                // route or bookkeeping behind.
+                let mut legs = Vec::with_capacity(prepared.legs.len());
+                for leg in &prepared.legs {
+                    let connection = leg.caller.connection(now).map_err(config_error)?;
+                    legs.push(CallerGroupLeg::new(
+                        leg.member_id,
+                        leg.weight,
+                        leg.caller.remote,
+                        connection,
+                    ));
+                }
+                self.callers
+                    .add_group(prepared.group_id, prepared.mode, legs)?
+            }
+        };
         let deadline_micros = now.as_micros().saturating_add(self.attempt_deadline_micros);
         self.in_flight.insert(
             id,
@@ -387,13 +445,13 @@ impl CallerPool {
         while actions < max_actions && self.in_flight.len() < self.max_in_flight {
             let Some(QueuedConnect {
                 request_id,
-                prepared,
+                request,
             }) = self.queue.pop_front()
             else {
                 break;
             };
             actions += 1;
-            match self.admit(request_id, prepared, now) {
+            match self.admit(request_id, request, now) {
                 Ok(id) => self.push_outcome(PoolEvent::Admitted {
                     request_id,
                     caller_id: id,
@@ -472,7 +530,6 @@ impl CallerPool {
         max_actions: usize,
         mut retired: Option<&mut Vec<LogicalCallerId>>,
     ) -> usize {
-        use srt_proto::ConnectionState;
         if max_actions == 0 {
             return 0;
         }
@@ -487,32 +544,30 @@ impl CallerPool {
         while idx < self.visit_scratch.len() {
             let candidate = self.visit_scratch[idx];
             idx += 1;
-            // `raw_direct_state`, not `LogicalCallerState`: the latter
+            // `attempt_status` (the protocol's own state), not
+            // `LogicalCallerState`: the latter
             // folds `Closing` into the same `Connecting` value as a
             // session that has never connected at all, which would make a
             // session that connected and is now gracefully closing
             // indistinguishable from a stalled attempt -- and destroy it,
             // pending SHUTDOWN and all, the moment its original
             // `attempt_deadline` (irrelevant to it by now) passes.
-            match self.callers.raw_direct_state(&candidate.caller_id) {
+            match self.callers.attempt_status(&candidate.caller_id) {
                 // Resolved one way or another -- succeeded, or already
                 // closing/closed on its own -- so no longer a stalled
                 // attempt this pool should retire. A rejected handshake
                 // (straight to `Disconnected` without ever reaching
                 // `Connected`) also releases its permit immediately here
                 // rather than holding it for the rest of `attempt_deadline`.
-                None
-                | Some(
-                    ConnectionState::Connected
-                    | ConnectionState::Disconnected
-                    | ConnectionState::Closing,
-                ) => {
+                None | Some(AttemptStatus::Resolved) => {
                     self.deadlines.remove(&candidate);
                     self.in_flight.remove(&candidate.caller_id);
                 }
-                Some(_) if candidate.deadline_micros <= now_micros => {
+                Some(AttemptStatus::Establishing) if candidate.deadline_micros <= now_micros => {
                     self.deadlines.remove(&candidate);
                     if let Some(attempt) = self.in_flight.remove(&candidate.caller_id) {
+                        // Removes the whole logical caller: every leg, its
+                        // routes and timers.
                         self.callers.remove(candidate.caller_id);
                         self.push_outcome(PoolEvent::Expired {
                             request_id: attempt.request_id,
@@ -524,7 +579,7 @@ impl CallerPool {
                     }
                     expired_count += 1;
                 }
-                Some(_) => {}
+                Some(AttemptStatus::Establishing) => {}
             }
         }
         self.visit_scratch.clear();
@@ -887,5 +942,213 @@ mod tests {
             pool.table().logical_caller(&id).is_some(),
             "the closing session must remain in the table, not be silently destroyed"
         );
+    }
+
+    fn shared_caller(remote: SocketAddr) -> crate::CallerConfig {
+        crate::CallerConfig::builder(remote)
+            .ownership(crate::SocketOwnership::Shared)
+            .build()
+            .expect("caller config")
+    }
+
+    fn prepared_group(
+        group: u32,
+        remotes: &[SocketAddr],
+        explicit_socket_ids: bool,
+    ) -> PreparedBondedCaller {
+        let mut config = crate::BondedCallerConfig::new(crate::GroupConfig::new(
+            group,
+            srt_proto::handshake::GroupType::Broadcast,
+        ));
+        for (index, remote) in remotes.iter().enumerate() {
+            let mut leg = shared_caller(*remote);
+            if explicit_socket_ids {
+                leg.session
+                    .set_socket_id(0x7000 + u32::try_from(index).expect("small") + 1);
+            }
+            config = config.leg(leg, 1);
+        }
+        config
+            .prepare(RuntimeFlavor::Compio)
+            .expect("prepared group")
+    }
+
+    fn remotes(n: u16) -> Vec<SocketAddr> {
+        (0..n)
+            .map(|i| SocketAddr::from(([127, 0, 0, 1], 19_100 + i)))
+            .collect()
+    }
+
+    /// A bonded group is one logical caller and one in-flight permit.
+    #[test]
+    fn bonded_group_takes_one_permit_and_one_logical_caller() {
+        let mut pool = CallerPool::new(NonZeroUsize::new(2).unwrap(), Duration::from_secs(5));
+        let now = Timestamp::from_micros(0);
+        let group = match pool
+            .connect_group(prepared_group(1, &remotes(3), false), now)
+            .expect("group connect")
+        {
+            PoolOutcome::Admitted(id) => id,
+            other => panic!("expected admission, got {other:?}"),
+        };
+        assert_eq!(pool.stats().in_flight, 1, "three legs, one permit");
+        assert_eq!(pool.table().len(), 1, "three legs, one logical caller");
+        assert!(matches!(
+            pool.logical_caller(&group).and_then(|c| c.stats()),
+            Some(crate::LogicalCallerStats::Group(stats)) if stats.legs.len() == 3
+        ));
+        // A second logical caller still fits under max_in_flight = 2.
+        assert!(matches!(
+            pool.connect(prepared_caller(remotes(1)[0]), now),
+            Ok(PoolOutcome::Admitted(_))
+        ));
+        assert_eq!(pool.stats().in_flight, 2);
+    }
+
+    #[test]
+    fn queued_group_is_admitted_with_its_request_id_and_a_fresh_deadline() {
+        let mut pool = CallerPool::new(NonZeroUsize::new(1).unwrap(), Duration::from_millis(50));
+        let first = match pool
+            .connect(prepared_caller(remotes(1)[0]), Timestamp::from_micros(0))
+            .expect("first")
+        {
+            PoolOutcome::Admitted(id) => id,
+            other => panic!("first must admit, got {other:?}"),
+        };
+        let request_id = match pool
+            .connect_group(
+                prepared_group(2, &remotes(2), false),
+                Timestamp::from_micros(0),
+            )
+            .expect("queued group")
+        {
+            PoolOutcome::Queued(id) => id,
+            other => panic!("second must queue, got {other:?}"),
+        };
+        assert_eq!(pool.stats().queued, 1);
+        assert_eq!(pool.table().len(), 1, "a queued group owns no table state");
+
+        // Free the permit at 40ms: the group is admitted then.
+        assert!(pool.remove(first).is_some());
+        pool.poll_expirations(Timestamp::from_micros(40_000));
+        let mut events = Vec::new();
+        pool.poll_outcomes(&mut events);
+        let group = events
+            .iter()
+            .find_map(|event| match event {
+                PoolEvent::Admitted {
+                    request_id: id,
+                    caller_id,
+                } if *id == request_id => Some(*caller_id),
+                _ => None,
+            })
+            .expect("the queued request is admitted under its own request id");
+        assert_eq!(pool.stats().queued, 0);
+        assert_eq!(pool.table().len(), 1);
+
+        // Deadline counts from admission (40ms + 50ms), not from queueing.
+        assert!(
+            pool.poll_expirations(Timestamp::from_micros(60_000))
+                .is_empty()
+        );
+        assert_eq!(
+            pool.poll_expirations(Timestamp::from_micros(95_000)),
+            vec![group]
+        );
+    }
+
+    #[test]
+    fn full_queue_refuses_a_group_without_retaining_it() {
+        let mut pool = CallerPool::with_queue_capacity(
+            NonZeroUsize::new(1).unwrap(),
+            Duration::from_secs(5),
+            1,
+        );
+        let now = Timestamp::from_micros(0);
+        assert!(matches!(
+            pool.connect(prepared_caller(remotes(1)[0]), now),
+            Ok(PoolOutcome::Admitted(_))
+        ));
+        assert!(matches!(
+            pool.connect_group(prepared_group(3, &remotes(2), false), now),
+            Ok(PoolOutcome::Queued(_))
+        ));
+        assert_eq!(
+            pool.connect_group(prepared_group(4, &remotes(2), false), now)
+                .expect("full"),
+            PoolOutcome::Full
+        );
+        let stats = pool.stats();
+        assert_eq!((stats.in_flight, stats.queued), (1, 1));
+    }
+
+    /// Expiry retires the whole group and frees every leg's route, timer and
+    /// pool deadline; cancellation does the same.
+    #[test]
+    fn expiring_or_removing_a_group_reclaims_every_leg() {
+        let mut pool = CallerPool::new(NonZeroUsize::new(4).unwrap(), Duration::from_millis(10));
+        let now = Timestamp::from_micros(0);
+        let group = match pool
+            .connect_group(prepared_group(5, &remotes(3), true), now)
+            .expect("group")
+        {
+            PoolOutcome::Admitted(id) => id,
+            other => panic!("expected admission, got {other:?}"),
+        };
+        assert_eq!(
+            pool.poll_expirations(Timestamp::from_micros(20_000)),
+            vec![group]
+        );
+        assert_eq!(pool.table().len(), 0);
+        let stats = pool.stats();
+        assert_eq!((stats.in_flight, stats.expired), (0, 1));
+        assert_eq!(
+            pool.time_until_next_deadline(Timestamp::from_micros(20_000), 9_000),
+            9_000
+        );
+
+        // The same explicit socket IDs are admissible again: routes are gone.
+        let again = match pool
+            .connect_group(
+                prepared_group(5, &remotes(3), true),
+                Timestamp::from_micros(30_000),
+            )
+            .expect("re-admit")
+        {
+            PoolOutcome::Admitted(id) => id,
+            other => panic!("expected admission, got {other:?}"),
+        };
+        match pool.remove(again).expect("removed") {
+            RemovedLogicalCaller::Group(legs) => assert_eq!(legs.len(), 3),
+            RemovedLogicalCaller::Direct(_) => panic!("expected a group"),
+        }
+        assert_eq!(pool.table().len(), 0);
+        let stats = pool.stats();
+        assert_eq!((stats.in_flight, stats.cancelled), (0, 1));
+        assert_eq!(
+            pool.time_until_next_deadline(Timestamp::from_micros(30_000), 9_000),
+            9_000
+        );
+    }
+
+    /// A refused group leaves no bookkeeping behind (duplicate socket IDs).
+    #[test]
+    fn refused_group_admission_leaves_no_state() {
+        let mut pool = CallerPool::new(NonZeroUsize::new(4).unwrap(), Duration::from_secs(5));
+        let now = Timestamp::from_micros(0);
+        let first = prepared_group(6, &remotes(2), true);
+        assert!(matches!(
+            pool.connect_group(first, now),
+            Ok(PoolOutcome::Admitted(_))
+        ));
+        let before = pool.stats();
+        let clash = prepared_group(7, &remotes(2), true);
+        assert!(pool.connect_group(clash, now).is_err());
+        let after = pool.stats();
+        assert_eq!(
+            (after.in_flight, after.started),
+            (before.in_flight, before.started)
+        );
+        assert_eq!(pool.table().len(), 1);
     }
 }

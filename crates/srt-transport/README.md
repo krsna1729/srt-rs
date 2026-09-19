@@ -39,11 +39,27 @@ service budget at the same time.
 
 ### Compio Owner: production contract
 
-* **Attach** with `Owner::listen(&ListenerConfig)` and
-  `Owner::connect(&CallerConfig, now)` only. The listener topology must be
-  `PerPort` with promotion `Never`, callers must be
+* **Attach** with `Owner::listen(&ListenerConfig)`,
+  `Owner::connect(&CallerConfig, now)` for a direct caller, and
+  `Owner::connect_bonded(&BondedCallerConfig, now)` for one bonded
+  (Broadcast or Backup) caller. The listener topology must be `PerPort` with
+  promotion `Never`, callers (and every bonded leg) must be
   `SocketOwnership::Shared`, and every session's wire ceiling must fit the
-  owner's. Side internals are sealed so these cannot be bypassed.
+  owner's. Side internals are sealed so these cannot be bypassed; applications
+  never get mutable access to the caller table.
+* **Bonded callers** are one logical caller: `connect_bonded` returns the same
+  `PoolOutcome` as `connect`, and the admitted group is one `LogicalCallerId`
+  driven through the same `logical_caller[_mut]`, `remove_caller`,
+  `poll_caller_events`, `poll_tx_failures` and `service` calls as a direct
+  caller. A `BondedCallerConfig` holds a `GroupConfig` (id and Broadcast or
+  Backup mode) and `1..=srt_proto::MAX_GROUP_MEMBERS` legs, each a normal
+  `CallerConfig` plus a weight; preparation assigns distinct member IDs, the
+  GROUP extension and one shared initial sequence, and the existing `SrtGroup`
+  core does all Broadcast/Backup selection. A group takes one caller-pool
+  permit (or queue slot) however many legs it has, and all legs share the
+  Owner's one caller UDP socket: no socket, task or connection object is added
+  per leg. TX failures carry the logical group *and* the physical leg in their
+  `TxAttribution`.
 * **Drive** with `service(now, budget)` (never blocks; every dimension
   bounded) and `wait_for_activity(timeout)` when idle. `Owner::fault()` is
   typed: a panicked TX lane, a short/failed send completion, a stopped

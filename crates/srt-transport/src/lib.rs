@@ -121,9 +121,9 @@ pub mod advanced {
     /// Prepared configuration and runtime-neutral endpoint plans.
     pub mod prepared {
         pub use super::super::config::{
-            EndpointSocketPlan, PreparedCaller, PreparedListener, ResolvedEndpointPlan,
-            ResolvedListenerTopology, ResolvedTransportConfig, RuntimeListener,
-            TransportCapabilities,
+            EndpointSocketPlan, PreparedBondedCaller, PreparedBondedLeg, PreparedCaller,
+            PreparedListener, ResolvedEndpointPlan, ResolvedListenerTopology,
+            ResolvedTransportConfig, RuntimeListener, TransportCapabilities,
         };
     }
 
@@ -254,12 +254,13 @@ pub use compio_transport as compio;
 // vocabulary while publishing only the application-facing policy surface.
 pub(crate) use config::*;
 pub use config::{
-    AdmissionConfig, Bandwidth, BatchingPolicy, CallerBuilder, CallerConfig, ConfigError,
-    ConnectConfig, CookieRoutingPolicy, EncryptionConfig, FlowControlConfig, GroupConfig,
-    HandshakeConfig, ListenerBuilder, ListenerConfig, ListenerEncryptionConfig, ListenerPeerPolicy,
-    ListenerTopology, PacingPolicy, PayloadSize, PolicyOverride, PromotionPolicy,
-    RuntimeBuildError, RuntimeFlavor, SessionConfig, SessionSendError, SocketBufferConfig,
-    SocketOwnership, TransportConfig, TransportProfile, WorkerCount,
+    AdmissionConfig, Bandwidth, BatchingPolicy, BondedCallerConfig, BondedLegConfig, CallerBuilder,
+    CallerConfig, ConfigError, ConnectConfig, CookieRoutingPolicy, EncryptionConfig,
+    FlowControlConfig, GroupConfig, HandshakeConfig, ListenerBuilder, ListenerConfig,
+    ListenerEncryptionConfig, ListenerPeerPolicy, ListenerTopology, PacingPolicy, PayloadSize,
+    PolicyOverride, PromotionPolicy, RuntimeBuildError, RuntimeFlavor, SessionConfig,
+    SessionSendError, SocketBufferConfig, SocketOwnership, TransportConfig, TransportProfile,
+    WorkerCount,
 };
 
 // --- Internal utility imports ---

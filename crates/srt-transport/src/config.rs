@@ -2183,6 +2183,124 @@ impl PreparedListener {
     }
 }
 
+/// One physical leg of a [`BondedCallerConfig`]: the same typed caller
+/// configuration a direct caller uses (remote, session, transport, connect
+/// policy), plus this leg's weight inside its group.
+#[derive(Clone, Debug)]
+pub struct BondedLegConfig {
+    pub caller: CallerConfig,
+    /// Group weight of this leg. It is used for the local Backup selection
+    /// and is also what the leg advertises in its GROUP handshake extension.
+    pub weight: u16,
+}
+
+/// Typed configuration for one bonded (Broadcast or Backup) outbound caller.
+///
+/// Applications hand this to the runtime's production attach path (for the
+/// Compio Owner, `Owner::connect_bonded`) and get back one logical caller.
+/// Nothing here exposes the caller table, so group identity, member IDs and
+/// the sequence space are always assigned consistently by [`Self::prepare`].
+#[derive(Clone, Debug)]
+pub struct BondedCallerConfig {
+    /// Group identity and mode. `group.group_type` must be Broadcast or
+    /// Backup; [`GroupConfig::new`] supplies the required wire marker bit.
+    pub group: GroupConfig,
+    /// Physical legs, `1..=`[`srt_proto::MAX_GROUP_MEMBERS`].
+    pub legs: Vec<BondedLegConfig>,
+}
+
+impl BondedCallerConfig {
+    #[must_use]
+    pub fn new(group: GroupConfig) -> Self {
+        Self {
+            group,
+            legs: Vec::new(),
+        }
+    }
+
+    /// Append one physical leg.
+    #[must_use]
+    pub fn leg(mut self, caller: CallerConfig, weight: u16) -> Self {
+        self.legs.push(BondedLegConfig { caller, weight });
+        self
+    }
+
+    /// Validate every leg exactly as [`CallerConfig::prepare`] would for a
+    /// direct caller, then stamp the group-wide identity on each of them:
+    /// the GROUP extension (with the leg's own weight), a distinct member ID
+    /// (`1..=n` in leg order) and ONE initial sequence number shared by every
+    /// leg so the group has a single sequence space from the handshake on.
+    ///
+    /// A leg's own `initial_seq` and group extension are overridden by the
+    /// group's. Nothing is allocated per leg until the leg count has been
+    /// bounded, so an oversized request is rejected without partial state.
+    pub fn prepare(&self, runtime: RuntimeFlavor) -> Result<PreparedBondedCaller, ConfigError> {
+        if self.legs.is_empty() {
+            return Err(ConfigError::new(
+                "bonded.legs",
+                "a bonded caller needs at least one leg",
+            ));
+        }
+        if self.legs.len() > srt_proto::MAX_GROUP_MEMBERS {
+            return Err(ConfigError::new(
+                "bonded.legs",
+                format!(
+                    "{} legs exceeds the protocol limit of {}",
+                    self.legs.len(),
+                    srt_proto::MAX_GROUP_MEMBERS
+                ),
+            ));
+        }
+        if self.group.group_id & SRTGROUP_MASK == 0 {
+            return Err(ConfigError::new(
+                "bonded.group.group_id",
+                "must contain the SRT group marker; use GroupConfig::new",
+            ));
+        }
+        let mode =
+            srt_proto::GroupMode::from_group_type(self.group.group_type).ok_or_else(|| {
+                ConfigError::new("bonded.group.group_type", "must be Broadcast or Backup")
+            })?;
+        let initial_seq = self.legs[0].caller.session.clone().ensure_initial_seq()?;
+        let mut legs = Vec::with_capacity(self.legs.len());
+        for (index, leg) in self.legs.iter().enumerate() {
+            let mut caller = leg.caller.clone();
+            caller.session.set_group(Some(GroupConfig {
+                weight: leg.weight,
+                ..self.group
+            }));
+            caller.session.set_initial_seq(initial_seq);
+            legs.push(PreparedBondedLeg {
+                member_id: u32::try_from(index + 1).expect("bounded by MAX_GROUP_MEMBERS"),
+                weight: leg.weight,
+                caller: caller.prepare(runtime)?,
+            });
+        }
+        Ok(PreparedBondedCaller {
+            group_id: self.group.group_id,
+            mode,
+            legs,
+        })
+    }
+}
+
+/// One validated physical leg of a [`PreparedBondedCaller`].
+#[derive(Clone, Debug)]
+pub struct PreparedBondedLeg {
+    pub member_id: u32,
+    pub weight: u16,
+    pub caller: PreparedCaller,
+}
+
+/// Validated bonded caller: group identity and mode, plus fully prepared
+/// legs that already carry their GROUP extension and shared initial sequence.
+#[derive(Clone, Debug)]
+pub struct PreparedBondedCaller {
+    pub group_id: u32,
+    pub mode: srt_proto::GroupMode,
+    pub legs: Vec<PreparedBondedLeg>,
+}
+
 /// Validated, auto-resolved caller and caller-pool configuration.
 #[derive(Clone, Debug)]
 pub struct PreparedCaller {
@@ -2976,5 +3094,101 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn bonded_leg(port: u16) -> CallerConfig {
+        CallerConfig::builder(SocketAddr::from(([127, 0, 0, 1], port)))
+            .ownership(SocketOwnership::Shared)
+            .build()
+            .expect("leg")
+    }
+
+    #[test]
+    fn bonded_prepare_stamps_group_identity_on_every_leg() {
+        let config = BondedCallerConfig::new(GroupConfig::new(0x42, GroupType::Backup))
+            .leg(bonded_leg(9001), 5)
+            .leg(bonded_leg(9002), 3)
+            .leg(bonded_leg(9003), 1);
+        let prepared = config.prepare(RuntimeFlavor::Compio).expect("prepared");
+
+        assert_eq!(prepared.mode, srt_proto::GroupMode::Backup);
+        assert_eq!(prepared.group_id, 0x42 | SRTGROUP_MASK);
+        let members: Vec<u32> = prepared.legs.iter().map(|leg| leg.member_id).collect();
+        assert_eq!(members, vec![1, 2, 3], "distinct member IDs in leg order");
+        let seqs: std::collections::HashSet<_> = prepared
+            .legs
+            .iter()
+            .map(|leg| leg.caller.session.connection.initial_seq)
+            .collect();
+        assert_eq!(seqs.len(), 1, "one group-wide initial sequence");
+        assert!(seqs.iter().all(Option::is_some));
+        for (leg, weight) in prepared.legs.iter().zip([5u16, 3, 1]) {
+            let extension = leg
+                .caller
+                .session
+                .connection
+                .group_extension
+                .expect("GROUP extension on every leg");
+            assert_eq!(extension.group_id, prepared.group_id, "same group identity");
+            assert_eq!(extension.group_type, GroupType::Backup);
+            assert_eq!(extension.weight, weight, "the leg's own weight");
+            assert_eq!(leg.weight, weight);
+        }
+    }
+
+    #[test]
+    fn bonded_prepare_rejects_bad_shapes_without_building_legs() {
+        let group = GroupConfig::new(1, GroupType::Broadcast);
+        let empty = BondedCallerConfig::new(group);
+        assert!(empty.prepare(RuntimeFlavor::Compio).is_err(), "zero legs");
+
+        let mut over = BondedCallerConfig::new(group);
+        for _ in 0..=srt_proto::MAX_GROUP_MEMBERS {
+            over = over.leg(bonded_leg(9100), 1);
+        }
+        assert!(
+            over.prepare(RuntimeFlavor::Compio).is_err(),
+            "> MAX_GROUP_MEMBERS"
+        );
+        let mut exact = BondedCallerConfig::new(group);
+        for _ in 0..srt_proto::MAX_GROUP_MEMBERS {
+            exact = exact.leg(bonded_leg(9100), 1);
+        }
+        assert_eq!(
+            exact
+                .prepare(RuntimeFlavor::Compio)
+                .expect("exactly MAX_GROUP_MEMBERS")
+                .legs
+                .len(),
+            srt_proto::MAX_GROUP_MEMBERS
+        );
+
+        let undefined = BondedCallerConfig::new(GroupConfig::new(1, GroupType::Undefined))
+            .leg(bonded_leg(9101), 1);
+        assert!(
+            undefined.prepare(RuntimeFlavor::Compio).is_err(),
+            "no such mode"
+        );
+
+        let mut unmarked = GroupConfig::new(1, GroupType::Broadcast);
+        unmarked.group_id = 1;
+        let unmarked = BondedCallerConfig::new(unmarked).leg(bonded_leg(9102), 1);
+        assert!(
+            unmarked.prepare(RuntimeFlavor::Compio).is_err(),
+            "marker bit"
+        );
+    }
+
+    #[test]
+    fn bonded_prepare_uses_the_direct_caller_validation_per_leg() {
+        let mut bad = bonded_leg(9200);
+        bad.connect.attempt_deadline = Duration::ZERO;
+        let config = BondedCallerConfig::new(GroupConfig::new(1, GroupType::Broadcast))
+            .leg(bonded_leg(9201), 1)
+            .leg(bad, 1);
+        assert!(
+            config.prepare(RuntimeFlavor::Compio).is_err(),
+            "a leg the direct path would refuse is refused"
+        );
     }
 }
