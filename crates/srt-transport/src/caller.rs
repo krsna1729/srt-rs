@@ -65,6 +65,24 @@ pub struct CallerEvent {
     pub event: srt_proto::ConnectionEvent,
 }
 
+/// A bonded logical caller's leg answered from a different remote receiving
+/// group than the one the caller is already bound to.
+///
+/// Attributable to the logical caller and the leg, and distinct from a
+/// timeout, an ordinary disconnect or a transient leg failure. The offending
+/// leg is already broken and disconnected; the application decides what the
+/// logical output means (a configured bond that spans receiving groups is a
+/// configuration error, so the owner normally retires the whole caller).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallerGroupFault {
+    /// The logical caller whose group collided.
+    pub id: LogicalCallerId,
+    /// The configured remote address of the offending leg.
+    pub peer: std::net::SocketAddr,
+    /// Which member answered, and which two receiving groups disagree.
+    pub collision: srt_proto::PeerGroupCollision,
+}
+
 /// One node of the indexed caller-deadline min-heap.
 ///
 /// Ordered by `(deadline_micros, id)` ascending — the exact same tie
@@ -408,6 +426,10 @@ pub struct CallerTable {
     /// before the table stores them on the leg they belong to. `Option` so a
     /// pass can move it into its `DrainSink` borrow; always `Some` otherwise.
     protocol_failure_scratch: Option<Vec<ProtocolOutputFailure>>,
+    /// Peer-group collisions awaiting [`CallerTable::poll_group_faults`].
+    /// A member can collide at most once, so this is bounded by the number
+    /// of group legs ever admitted and never needs a lossy cap.
+    group_faults: VecDeque<CallerGroupFault>,
     next_logical_caller: u64,
     max_callers: usize,
     /// SRT-level receiver totals of every session this table has retired.
@@ -909,6 +931,7 @@ impl CallerTable {
             due_scratch: Vec::with_capacity(bounded.min(MAX_DUE_PER_VISIT)),
             protocol_failure_index: VecDeque::new(),
             protocol_failure_scratch: Some(Vec::new()),
+            group_faults: VecDeque::new(),
             next_logical_caller: 1,
             max_callers: bounded,
             retired_rcv: RcvTotals::default(),
@@ -1107,6 +1130,23 @@ impl CallerTable {
                 out.push(record);
             }
         }
+    }
+
+    /// Drain up to `max_events` peer-group collisions, oldest first.
+    pub fn poll_group_faults(&mut self, max_events: usize, out: &mut Vec<CallerGroupFault>) {
+        out.clear();
+        for _ in 0..max_events {
+            let Some(fault) = self.group_faults.pop_front() else {
+                break;
+            };
+            out.push(fault);
+        }
+    }
+
+    /// Group faults still awaiting [`Self::poll_group_faults`].
+    #[must_use]
+    pub fn group_faults_pending(&self) -> usize {
+        self.group_faults.len()
     }
 
     /// Protocol-output failures still awaiting application drain. Always equal
@@ -1436,6 +1476,19 @@ impl CallerTable {
                     .connection_mut()
                     .feed_recv_buf(data, now);
                 group.group.refresh_member_states();
+                // A leg that connected to a different receiving group is
+                // disconnected here, in the same pass that observed it.
+                while let Some(collision) = group.group.poll_peer_group_collision(now) {
+                    let peer = group
+                        .legs
+                        .get(&collision.member_id)
+                        .map_or(peer, |leg| leg.peer);
+                    self.group_faults.push_back(CallerGroupFault {
+                        id: caller,
+                        peer,
+                        collision,
+                    });
+                }
                 res
             }
         };
@@ -2420,6 +2473,9 @@ pub(crate) fn collect_output_work(
 
     Ok((work, true))
 }
+
+#[cfg(test)]
+mod peer_group_tests;
 
 #[cfg(test)]
 mod tests {

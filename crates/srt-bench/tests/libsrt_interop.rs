@@ -1911,6 +1911,8 @@ struct CompioOwnerRun {
     rx_mode: Option<srt_transport::compio::OwnerRxMode>,
     io_uring: bool,
     quiescent: bool,
+    /// Legs that answered from a different remote receiving group.
+    group_faults: Vec<srt_transport::advanced::caller::CallerGroupFault>,
 }
 
 fn compio_caller_config(remote: SocketAddr) -> CallerConfig {
@@ -2166,4 +2168,286 @@ fn compio_owner_broadcast_bond_interoperates_with_libsrt_listener() {
         output.stdout.len(),
         payload.len()
     );
+}
+
+// ---------------------------------------------------------------------------
+// Bonding topology: one receiving group, possibly several network endpoints.
+//
+// libsrt binds a bonded caller group to ONE remote receiving group: the first
+// leg's responder mirror-group ID is pinned, and a leg that answers with a
+// different one is rejected (SRT_REJ_GROUP, "group settings collision").
+// Distinct addresses do not decide that -- one receiver process can listen on
+// several ports -- and the same address never proves it. These tests pin the
+// reference behaviour and require srt-rs to conform.
+// ---------------------------------------------------------------------------
+
+const BONDED_PAYLOAD: &[u8] = b"libsrt-bonded-group-payload";
+/// Exit code of `libsrt_bonded_caller` when a leg was rejected with
+/// `SRT_REJ_GROUP`; distinct from 1, an ordinary connect failure.
+const LIBSRT_EXIT_GROUP_COLLISION: i32 = 3;
+
+/// Exit 77 means this libsrt was built without bonding: skip, unless
+/// `SRT_REQUIRE_BONDING` demands it (CI), where that is a failure.
+fn bonding_unavailable(code: Option<i32>) -> bool {
+    if code != Some(77) {
+        return false;
+    }
+    assert!(
+        std::env::var_os("SRT_REQUIRE_BONDING").is_none(),
+        "bonding is required but this libsrt was built without it"
+    );
+    eprintln!("skipping bonding interop: libsrt was built without bonding support");
+    true
+}
+
+fn spawn_group_leg_listener(listener: &std::path::Path) -> (Child, u16) {
+    let port = free_port();
+    let child = Command::new(listener)
+        .arg(port.to_string())
+        .arg("1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn single-leg libsrt group listener");
+    (child, port)
+}
+
+fn spawn_multiport_listener(listener: &std::path::Path) -> (Child, u16, u16) {
+    let (a, b) = (free_port(), free_port());
+    let child = Command::new(listener)
+        .arg(a.to_string())
+        .arg(b.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn multi-endpoint libsrt group listener");
+    (child, a, b)
+}
+
+/// Run the libsrt bonded caller fixture against two endpoints and return its
+/// exit code and stderr.
+fn run_libsrt_two_endpoint_caller(
+    caller: &std::path::Path,
+    a: u16,
+    b: u16,
+) -> (Option<i32>, String) {
+    let child = Command::new(caller)
+        .args(["127.0.0.1", &a.to_string(), "127.0.0.1", &b.to_string()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn libsrt bonded caller");
+    let output =
+        wait_for_child_with_timeout(child, "libsrt bonded caller", Duration::from_secs(20));
+    (
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// REFERENCE CONTROL. A real libsrt broadcast caller with one leg to each of
+/// two INDEPENDENT libsrt receivers does not form a two-member group: the
+/// second leg is rejected with `SRT_REJ_GROUP` (typed, not a log string).
+#[test]
+fn libsrt_group_to_independent_receivers_is_rejected_with_a_group_collision() {
+    let _guard = interop_test_lock();
+    let (Some(caller), Some(listener)) = (
+        compile_libsrt_bonded_caller(),
+        compile_libsrt_bonded_listener(),
+    ) else {
+        return;
+    };
+    let (mut first, port_a) = spawn_group_leg_listener(&listener);
+    let (mut second, port_b) = spawn_group_leg_listener(&listener);
+    std::thread::sleep(Duration::from_millis(150));
+    let (code, stderr) = run_libsrt_two_endpoint_caller(&caller, port_a, port_b);
+    let _ = first.kill();
+    let _ = second.kill();
+    let _ = (first.wait(), second.wait());
+    if bonding_unavailable(code) {
+        return;
+    }
+    assert_eq!(
+        code,
+        Some(LIBSRT_EXIT_GROUP_COLLISION),
+        "libsrt must reject the second receiving group with SRT_REJ_GROUP: {stderr}"
+    );
+}
+
+/// REFERENCE CONTROL. One libsrt receiver listening on TWO endpoints is one
+/// receiving group: a libsrt caller bonds both legs to it and the payload
+/// arrives. Different addresses/ports must never be mistaken for different
+/// receivers.
+#[test]
+fn libsrt_group_to_one_receiver_with_two_endpoints_forms_one_group() {
+    let _guard = interop_test_lock();
+    let (Some(caller), Some(listener)) = (
+        compile_libsrt_bonded_caller(),
+        compile_libsrt_fixture("libsrt_bonded_multiport_listener"),
+    ) else {
+        return;
+    };
+    let (child, port_a, port_b) = spawn_multiport_listener(&listener);
+    std::thread::sleep(Duration::from_millis(150));
+    let (code, stderr) = run_libsrt_two_endpoint_caller(&caller, port_a, port_b);
+    let output =
+        wait_for_child_with_timeout(child, "multiport libsrt listener", Duration::from_secs(15));
+    if bonding_unavailable(code) {
+        return;
+    }
+    assert_eq!(code, Some(0), "libsrt caller failed: {stderr}");
+    assert_eq!(
+        output.stdout,
+        BONDED_PAYLOAD,
+        "the one receiving group got the payload: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Drive `Owner::connect_bonded` (Broadcast, one leg per endpoint) until the
+/// payload is acknowledged by every leg, or a peer-group collision is
+/// reported and observed to stay a one-leg (never a two-member) group.
+fn run_compio_bond(remote_a: SocketAddr, remote_b: SocketAddr) -> CompioOwnerRun {
+    let mut drained_at: Option<Instant> = None;
+    let mut fault_at: Option<Instant> = None;
+    run_compio_owner(
+        Duration::from_secs(15),
+        |owner, now| {
+            let config = BondedCallerConfig::new(GroupConfig::new(
+                0x1234,
+                srt_proto::handshake::GroupType::Broadcast,
+            ))
+            .leg(compio_caller_config(remote_a), 10)
+            .leg(compio_caller_config(remote_b), 20);
+            compio_admitted(owner.connect_bonded(&config, now).expect("connect_bonded"))
+        },
+        |owner, id, now, run| {
+            let mut faults = Vec::new();
+            owner.poll_caller_group_faults(8, &mut faults);
+            run.group_faults.extend(faults);
+            let Some(mut caller) = owner.logical_caller_mut(&id) else {
+                return true;
+            };
+            let active = match caller.stats() {
+                Some(LogicalCallerStats::Group(stats)) => stats.aggregate.active_legs,
+                _ => 0,
+            };
+            run.max_active_legs = run.max_active_legs.max(active);
+            if !run.group_faults.is_empty() {
+                // Linger so a wrongly surviving second leg would show up.
+                return fault_at.get_or_insert_with(Instant::now).elapsed()
+                    >= Duration::from_millis(1500);
+            }
+            if active == 2 && !run.sent {
+                run.connected = true;
+                run.legs_offered = caller
+                    .send_shared(bytes::Bytes::from_static(BONDED_PAYLOAD), now)
+                    .expect("send Broadcast payload");
+                run.sent = true;
+                return false;
+            }
+            let drained = run.sent
+                && matches!(
+                    caller.stats(),
+                    Some(LogicalCallerStats::Group(stats))
+                        if stats.legs.iter().all(|leg| {
+                            leg.connection
+                                .sender
+                                .is_none_or(|sender| sender.packets_in_buffer == 0)
+                        })
+                );
+            if drained {
+                return drained_at.get_or_insert_with(Instant::now).elapsed()
+                    >= Duration::from_secs(2);
+            }
+            false
+        },
+    )
+}
+
+/// `Owner::connect_bonded` with one leg per endpoint of ONE libsrt receiving
+/// group: both legs connect, the payload is offered to both, the receiver
+/// gets it, and no peer-group fault is raised.
+#[test]
+fn compio_owner_bond_to_one_libsrt_receiver_with_two_endpoints_passes() {
+    let _guard = interop_test_lock();
+    let Some(listener) = compile_libsrt_fixture("libsrt_bonded_multiport_listener") else {
+        return;
+    };
+    let (child, port_a, port_b) = spawn_multiport_listener(&listener);
+    std::thread::sleep(Duration::from_millis(150));
+    let run = run_compio_bond(
+        SocketAddr::from(([127, 0, 0, 1], port_a)),
+        SocketAddr::from(([127, 0, 0, 1], port_b)),
+    );
+    let output =
+        wait_for_child_with_timeout(child, "multiport libsrt listener", Duration::from_secs(15));
+    if output.status.code() == Some(77) && std::env::var_os("SRT_REQUIRE_BONDING").is_none() {
+        return;
+    }
+    assert!(run.io_uring, "the production runtime is io_uring: {run:?}");
+    assert_eq!(
+        run.max_active_legs, 2,
+        "both endpoints' legs activate: {run:?}"
+    );
+    assert_eq!(
+        run.legs_offered, 2,
+        "Broadcast offered to both legs: {run:?}"
+    );
+    assert!(
+        run.group_faults.is_empty(),
+        "one receiver is not a collision: {run:?}"
+    );
+    assert!(run.quiescent, "Owner teardown was not quiescent: {run:?}");
+    assert!(
+        output.status.success() && output.stdout == BONDED_PAYLOAD,
+        "the receiving group did not get the payload: {}; run: {run:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// CONFORMANCE. `Owner::connect_bonded` with one leg to each of two
+/// INDEPENDENT libsrt receivers must behave like libsrt itself: the second
+/// leg is a typed peer-group collision attributable to the logical caller and
+/// leg, and the group never becomes a successful two-member bond.
+#[test]
+fn compio_owner_bond_to_independent_libsrt_receivers_reports_a_peer_group_collision() {
+    let _guard = interop_test_lock();
+    let Some(listener) = compile_libsrt_bonded_listener() else {
+        return;
+    };
+    let (mut first, port_a) = spawn_group_leg_listener(&listener);
+    let (mut second, port_b) = spawn_group_leg_listener(&listener);
+    std::thread::sleep(Duration::from_millis(150));
+    let remote_a = SocketAddr::from(([127, 0, 0, 1], port_a));
+    let remote_b = SocketAddr::from(([127, 0, 0, 1], port_b));
+    let run = run_compio_bond(remote_a, remote_b);
+    let _ = first.kill();
+    let _ = second.kill();
+    let _ = (first.wait(), second.wait());
+
+    assert!(run.io_uring, "the production runtime is io_uring: {run:?}");
+    assert_eq!(
+        run.group_faults.len(),
+        1,
+        "exactly one leg answered from another receiving group: {run:?}"
+    );
+    let fault = run.group_faults[0];
+    assert!(
+        fault.peer == remote_a || fault.peer == remote_b,
+        "attributed to a configured leg: {run:?}"
+    );
+    assert_ne!(
+        fault.collision.expected_peer_group_id, fault.collision.actual_peer_group_id,
+        "two different receiving groups: {run:?}"
+    );
+    assert!(
+        run.max_active_legs <= 1,
+        "the colliding leg never became an active member: {run:?}"
+    );
+    assert!(
+        !run.sent,
+        "no Broadcast send happened as a two-leg bond: {run:?}"
+    );
+    assert!(run.quiescent, "Owner teardown was not quiescent: {run:?}");
 }

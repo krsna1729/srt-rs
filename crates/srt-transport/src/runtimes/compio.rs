@@ -3121,6 +3121,21 @@ impl Owner {
         }
     }
 
+    /// Drain bonded-caller peer-group collisions (oldest first, bounded by
+    /// `max_events`): a leg answered from a different remote receiving group
+    /// than the one its logical caller is bound to. Distinct from every
+    /// timeout, disconnect and TX failure; the leg is already disconnected.
+    pub fn poll_caller_group_faults(
+        &mut self,
+        max_events: usize,
+        out: &mut Vec<crate::CallerGroupFault>,
+    ) {
+        out.clear();
+        if let Some(caller) = self.caller.as_mut() {
+            caller.pool.table_mut().poll_group_faults(max_events, out);
+        }
+    }
+
     /// Listener-side counterpart of [`Self::poll_caller_output_failures`].
     pub fn poll_listener_output_failures(
         &mut self,

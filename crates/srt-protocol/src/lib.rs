@@ -67,7 +67,7 @@ pub mod wire {
 pub mod group {
     pub use super::srt_group::{
         GroupDataPoll, GroupEvent, GroupMemberState, GroupMode, GroupPacket, MAX_GROUP_MEMBERS,
-        SrtGroup, SrtGroupMember,
+        PeerGroupCollision, SrtGroup, SrtGroupMember,
     };
 }
 
@@ -87,7 +87,8 @@ pub use srt_connection::{
     PERIODIC_NAK_INTERVAL_MICROS, SrtConnection, TimerId,
 };
 pub use srt_group::{
-    GroupDataPoll, GroupEvent, GroupMemberState, GroupMode, MAX_GROUP_MEMBERS, SrtGroup,
+    GroupDataPoll, GroupEvent, GroupMemberState, GroupMode, MAX_GROUP_MEMBERS, PeerGroupCollision,
+    SrtGroup,
 };
 pub use srt_packet::DatagramClass;
 pub use stats::{

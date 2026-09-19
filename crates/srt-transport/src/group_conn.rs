@@ -508,6 +508,17 @@ impl GroupConn {
         self.group.disconnect(now);
     }
 
+    /// Pop one leg that answered from a different remote receiving group than
+    /// the one this group is bound to (see [`srt_proto::PeerGroupCollision`]).
+    /// The leg is already broken and disconnected; a bonded output that spans
+    /// receiving groups is a configuration error the application should fail.
+    pub fn poll_peer_group_collision(
+        &mut self,
+        now: Timestamp,
+    ) -> Option<srt_proto::PeerGroupCollision> {
+        self.group.poll_peer_group_collision(now)
+    }
+
     /// Return the next deduplicated, sequence-aligned group payload.
     pub fn poll_data(&mut self, now: Timestamp) -> Option<srt_proto::group::GroupPacket> {
         self.poll_data_bounded(now, srt_proto::MAX_GROUP_MEMBERS)
