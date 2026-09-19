@@ -23,7 +23,7 @@ use crate::srt_packet::{
     PendingDatagram, SRT_CMD_KMREQ, SRT_CMD_KMRSP, SRT_HEADER_SIZE, SrtPacket, sequence_less_than,
 };
 use crate::srt_receiver::{LossRange, ReceiverBuffer};
-use crate::srt_sender::SenderBuffer;
+use crate::srt_sender::{PeerRateFeedback, SenderBuffer};
 use crate::stats::ConnectionStats;
 use crate::time::Timestamp;
 
@@ -3256,31 +3256,35 @@ impl SrtConnection {
             let available_buffer_packets = crate::buf::read_u32(&mut feedback)?;
             sender.set_peer_window(ack_seq, available_buffer_packets);
             // Packet rate / link capacity (24+ bytes) and the legacy
-            // receiving byte rate (28+ bytes) are optional telemetry this
-            // crate does not otherwise expose; a Small ACK reports zero
-            // rather than omitting the call, so the RTT/RTTVar/window
-            // feedback above is never skipped for lacking them.
-            let (receiving_rate_pps, link_capacity_pps) = if pkt.control_info.len() >= 24 {
+            // receiving byte rate (28+ bytes) are a rate section this ACK
+            // either carries in full or not at all -- a 16-byte Small ACK
+            // has none, and `record_peer_feedback` preserves whatever rate
+            // snapshot is already on file rather than zeroing it; a 24-byte
+            // ACK replaces the snapshot but has no byte-rate field to give
+            // it, represented honestly as `None` rather than a fabricated
+            // zero.
+            let rate_feedback = if pkt.control_info.len() >= 24 {
                 let mut rates = &pkt.control_info[16..24];
-                (
-                    crate::buf::read_u32(&mut rates)?,
-                    crate::buf::read_u32(&mut rates)?,
-                )
+                let receiving_rate_packets_per_second = crate::buf::read_u32(&mut rates)?;
+                let link_capacity_packets_per_second = crate::buf::read_u32(&mut rates)?;
+                let receiving_rate_bytes_per_second = if pkt.control_info.len() >= 28 {
+                    Some(crate::buf::read_u32(&mut &pkt.control_info[24..28])?)
+                } else {
+                    None
+                };
+                Some(PeerRateFeedback {
+                    receiving_rate_packets_per_second,
+                    link_capacity_packets_per_second,
+                    receiving_rate_bytes_per_second,
+                })
             } else {
-                (0, 0)
-            };
-            let receiving_rate_bytes_per_second = if pkt.control_info.len() >= 28 {
-                crate::buf::read_u32(&mut &pkt.control_info[24..28])?
-            } else {
-                0
+                None
             };
             sender.record_peer_feedback(
                 rtt_micros,
                 rtt_variance_micros,
                 available_buffer_packets,
-                receiving_rate_pps,
-                link_capacity_pps,
-                receiving_rate_bytes_per_second,
+                rate_feedback,
             );
         }
 
@@ -6296,6 +6300,147 @@ mod tests {
             ackack,
             Some(42),
             "the numbered Small ACK must be acknowledged with ACKACK naming its ACK number"
+        );
+    }
+
+    /// Wire ACK with an explicit cumulative position, ACK number, and
+    /// RTT/RTTVar/window/rate fields, for exercising exactly which fields
+    /// each ACK size actually carries. `fields` are the words following
+    /// `ack_seq`: `[rtt, rtt_var, window]` for 16 bytes,
+    /// `[rtt, rtt_var, window, pps, link]` for 24, or
+    /// `[rtt, rtt_var, window, pps, link, byte_rate]` for 28/32.
+    fn ack_datagram_with_feedback(
+        dest_socket_id: u32,
+        ack_seq: u32,
+        ack_number: u32,
+        fields: &[u32],
+    ) -> Vec<u8> {
+        let mut control_info = Vec::new();
+        write_u32(&mut control_info, ack_seq);
+        for &field in fields {
+            write_u32(&mut control_info, field);
+        }
+        let packet = ControlPacket {
+            control_type: ControlType::Ack,
+            subtype: 0,
+            type_specific_info: ack_number,
+            timestamp: 0,
+            dest_socket_id,
+            control_info,
+        };
+        let mut buf = Vec::new();
+        packet.encode(&mut buf).expect("ACK encodes");
+        buf
+    }
+
+    /// The rate-snapshot quarter of `SenderStats`, for the assertions in
+    /// `ack_rate_telemetry_is_preserved_or_honestly_absent_by_size`.
+    fn rate_snapshot(
+        stats: &crate::sender::SenderStats,
+    ) -> (Option<u32>, Option<u32>, Option<u32>, Option<u64>) {
+        (
+            stats.peer_receiving_rate_packets_per_second,
+            stats.peer_link_capacity_packets_per_second,
+            stats.peer_receiving_rate_bytes_per_second,
+            stats.peer_link_capacity_bytes_per_second,
+        )
+    }
+
+    /// A 16-byte Small ACK carries no rate section at all, and a 24-byte
+    /// ACK carries rate/link but no byte-rate field -- neither must
+    /// overwrite or fabricate telemetry the ACK that produced it never
+    /// actually reported. Only a 28/32-byte ACK's rate snapshot is
+    /// complete.
+    #[test]
+    fn ack_rate_telemetry_is_preserved_or_honestly_absent_by_size() {
+        let (mut caller, _listener) = connected_pair();
+        let socket_id = caller.socket_id();
+        let now = Timestamp::from_micros(1_000_000);
+        let ack_seq = caller.sender.as_ref().unwrap().oldest_unacked_sequence();
+
+        // 1. A 28-byte ACK populates the complete rate snapshot.
+        caller
+            .feed_recv_buf(
+                &ack_datagram_with_feedback(
+                    socket_id,
+                    ack_seq,
+                    1,
+                    &[10_000, 500, 60, 1_000, 2_000, 1_500_000],
+                ),
+                now,
+            )
+            .expect("a 28-byte ACK is accepted");
+        let stats = caller.sender_stats().expect("connected sender");
+        assert_eq!(stats.peer_rtt_micros, Some(10_000));
+        assert_eq!(stats.peer_available_buffer_packets, Some(60));
+        assert_eq!(
+            rate_snapshot(&stats),
+            (Some(1_000), Some(2_000), Some(1_500_000), Some(3_000_000)),
+            "a 28-byte ACK's snapshot must be complete"
+        );
+
+        // 2. A later numbered 16-byte Small ACK updates RTT/window only.
+        caller
+            .feed_recv_buf(
+                &ack_datagram_with_feedback(socket_id, ack_seq, 2, &[20_000, 800, 70]),
+                now,
+            )
+            .expect("a numbered 16-byte Small ACK is accepted");
+        let stats = caller.sender_stats().expect("connected sender");
+        assert_eq!(stats.peer_rtt_micros, Some(20_000), "RTT must update");
+        assert_eq!(
+            stats.peer_available_buffer_packets,
+            Some(70),
+            "window must update"
+        );
+        // 3. Rate telemetry must remain the previously known snapshot, not
+        // zero.
+        assert_eq!(
+            rate_snapshot(&stats),
+            (Some(1_000), Some(2_000), Some(1_500_000), Some(3_000_000)),
+            "a Small ACK must not overwrite the previous rate snapshot"
+        );
+
+        // 4. A 24-byte ACK with different pps/link.
+        caller
+            .feed_recv_buf(
+                &ack_datagram_with_feedback(
+                    socket_id,
+                    ack_seq,
+                    3,
+                    &[20_000, 800, 70, 4_000, 8_000],
+                ),
+                now,
+            )
+            .expect("a 24-byte ACK is accepted");
+        let stats = caller.sender_stats().expect("connected sender");
+        // 5. pps/link change; the missing byte-rate (and anything derived
+        // from it) must be represented honestly as absent, never fabricated
+        // as zero.
+        assert_eq!(
+            rate_snapshot(&stats),
+            (Some(4_000), Some(8_000), None, None),
+            "a 24-byte ACK has no byte-rate field, so neither it nor the derived \
+             byte-bandwidth may be fabricated as zero"
+        );
+
+        // 6. A subsequent 28-byte ACK repopulates the complete snapshot.
+        caller
+            .feed_recv_buf(
+                &ack_datagram_with_feedback(
+                    socket_id,
+                    ack_seq,
+                    4,
+                    &[20_000, 800, 70, 5_000, 9_000, 2_500_000],
+                ),
+                now,
+            )
+            .expect("a 28-byte ACK is accepted");
+        let stats = caller.sender_stats().expect("connected sender");
+        assert_eq!(
+            rate_snapshot(&stats),
+            (Some(5_000), Some(9_000), Some(2_500_000), Some(4_500_000)),
+            "a subsequent 28-byte ACK must repopulate the complete snapshot"
         );
     }
 
