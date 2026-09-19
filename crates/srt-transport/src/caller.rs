@@ -426,10 +426,12 @@ pub struct CallerTable {
     /// before the table stores them on the leg they belong to. `Option` so a
     /// pass can move it into its `DrainSink` borrow; always `Some` otherwise.
     protocol_failure_scratch: Option<Vec<ProtocolOutputFailure>>,
-    /// Peer-group collisions awaiting [`CallerTable::poll_group_faults`].
-    /// A member can collide at most once, so this is bounded by the number
-    /// of group legs ever admitted and never needs a lossy cap.
-    group_faults: VecDeque<CallerGroupFault>,
+    /// Logical callers holding an undrained peer-group fault, in the order
+    /// their first collision was seen. A caller is appended at most once (the
+    /// exact fault lives on its session) and its entry is removed when the
+    /// caller is, so the length never exceeds the live caller count -- churn
+    /// (collide, retire, repeat) cannot grow it, and no fault is dropped.
+    group_fault_index: VecDeque<LogicalCallerId>,
     next_logical_caller: u64,
     max_callers: usize,
     /// SRT-level receiver totals of every session this table has retired.
@@ -523,6 +525,44 @@ struct CallerGroupState {
     leg_order: Vec<u32>,
     next_leg: usize,
     logical: GroupLogicalCounters,
+    /// The first peer-group collision of this logical caller, until drained.
+    /// One collision already proves the bond spans receiving groups; further
+    /// offending legs are still broken and disconnected but add no second
+    /// application-level fault.
+    peer_group_fault: Option<CallerGroupFault>,
+    /// A fault was reported once; later collisions stay silent.
+    peer_group_fault_reported: bool,
+}
+
+impl CallerGroupState {
+    /// Disconnect every leg that answered from another receiving group and
+    /// retain the caller's FIRST such collision as its one pending fault.
+    /// Returns `true` when that fault is new (the caller must be indexed).
+    fn absorb_peer_group_collisions(
+        &mut self,
+        caller: LogicalCallerId,
+        fallback_peer: std::net::SocketAddr,
+        now: Timestamp,
+    ) -> bool {
+        let mut raised = false;
+        while let Some(collision) = self.group.poll_peer_group_collision(now) {
+            if self.peer_group_fault_reported {
+                continue;
+            }
+            self.peer_group_fault_reported = true;
+            let peer = self
+                .legs
+                .get(&collision.member_id)
+                .map_or(fallback_peer, |leg| leg.peer);
+            self.peer_group_fault = Some(CallerGroupFault {
+                id: caller,
+                peer,
+                collision,
+            });
+            raised = true;
+        }
+        raised
+    }
 }
 
 enum CallerSession {
@@ -931,7 +971,7 @@ impl CallerTable {
             due_scratch: Vec::with_capacity(bounded.min(MAX_DUE_PER_VISIT)),
             protocol_failure_index: VecDeque::new(),
             protocol_failure_scratch: Some(Vec::new()),
-            group_faults: VecDeque::new(),
+            group_fault_index: VecDeque::new(),
             next_logical_caller: 1,
             max_callers: bounded,
             retired_rcv: RcvTotals::default(),
@@ -1132,21 +1172,27 @@ impl CallerTable {
         }
     }
 
-    /// Drain up to `max_events` peer-group collisions, oldest first.
+    /// Drain up to `max_events` peer-group faults, oldest first: at most one
+    /// per logical caller (its first collision).
     pub fn poll_group_faults(&mut self, max_events: usize, out: &mut Vec<CallerGroupFault>) {
         out.clear();
         for _ in 0..max_events {
-            let Some(fault) = self.group_faults.pop_front() else {
+            let Some(id) = self.group_fault_index.pop_front() else {
                 break;
             };
-            out.push(fault);
+            if let Some(CallerSession::Group(group)) = self.sessions.get_mut(&id)
+                && let Some(fault) = group.peer_group_fault.take()
+            {
+                out.push(fault);
+            }
         }
     }
 
-    /// Group faults still awaiting [`Self::poll_group_faults`].
+    /// Peer-group faults still awaiting [`Self::poll_group_faults`]; never
+    /// more than the number of live logical callers.
     #[must_use]
     pub fn group_faults_pending(&self) -> usize {
-        self.group_faults.len()
+        self.group_fault_index.len()
     }
 
     /// Protocol-output failures still awaiting application drain. Always equal
@@ -1396,6 +1442,8 @@ impl CallerTable {
                 leg_order,
                 next_leg: 0,
                 logical: GroupLogicalCounters::default(),
+                peer_group_fault: None,
+                peer_group_fault_reported: false,
             })),
         );
         self.sched.insert(
@@ -1478,16 +1526,8 @@ impl CallerTable {
                 group.group.refresh_member_states();
                 // A leg that connected to a different receiving group is
                 // disconnected here, in the same pass that observed it.
-                while let Some(collision) = group.group.poll_peer_group_collision(now) {
-                    let peer = group
-                        .legs
-                        .get(&collision.member_id)
-                        .map_or(peer, |leg| leg.peer);
-                    self.group_faults.push_back(CallerGroupFault {
-                        id: caller,
-                        peer,
-                        collision,
-                    });
+                if group.absorb_peer_group_collisions(caller, peer, now) {
+                    self.group_fault_index.push_back(caller);
                 }
                 res
             }
@@ -1830,6 +1870,8 @@ impl CallerTable {
         // no longer bounded by the quarantined population.
         self.protocol_failure_index
             .retain(|(index_id, _)| *index_id != id);
+        // Same for an undrained peer-group fault: it dies with its caller.
+        self.group_fault_index.retain(|index_id| *index_id != id);
         let session = self.sessions.remove(&id)?;
         self.routes.retain(|_, route| match route {
             CallerRoute::Direct(caller) => *caller != id,

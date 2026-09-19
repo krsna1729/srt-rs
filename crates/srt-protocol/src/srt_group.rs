@@ -147,6 +147,10 @@ pub struct SrtGroupMember {
     weight: u16,
     state: GroupMemberState,
     connection: SrtConnection,
+    /// This member's receiving-group identity has been admitted (bound or
+    /// matched). Set once its handshake completes, whatever its state label:
+    /// a Backup leg is labelled Standby before it is connected.
+    peer_group_admitted: bool,
 }
 
 impl SrtGroupMember {
@@ -244,6 +248,7 @@ impl SrtGroup {
     /// response without a GROUP extension carries no identity and is not
     /// checked, exactly as in libsrt.
     fn admit_peer_group(&mut self, index: usize) -> bool {
+        self.members[index].peer_group_admitted = true;
         let Some(actual) = self.members[index]
             .connection
             .peer_group_extension()
@@ -329,6 +334,7 @@ impl SrtGroup {
             weight,
             state,
             connection,
+            peer_group_admitted: false,
         });
         // A pending leg has no sender buffer until its handshake completes.
         // `refresh_pending_states` aligns it at that transition; attempting
@@ -796,7 +802,22 @@ impl SrtGroup {
         }
     }
 
+    /// Admit the receiving-group identity of every member whose handshake has
+    /// completed since the last look, whatever its state label.
+    fn admit_connected_peer_groups(&mut self) {
+        for index in 0..self.members.len() {
+            let member = &self.members[index];
+            if !member.peer_group_admitted
+                && member.state != GroupMemberState::Broken
+                && member.connection.state() == ConnectionState::Connected
+            {
+                self.admit_peer_group(index);
+            }
+        }
+    }
+
     fn refresh_pending_states(&mut self) {
+        self.admit_connected_peer_groups();
         for index in 0..self.members.len() {
             let ready = {
                 let member = &self.members[index];
@@ -807,9 +828,6 @@ impl SrtGroup {
                 continue;
             }
 
-            if !self.admit_peer_group(index) {
-                continue;
-            }
             let member_id = self.members[index].id;
             if self.align_member_sequence(member_id).is_err() {
                 continue;
