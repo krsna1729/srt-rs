@@ -126,6 +126,10 @@ jobs:
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
+      # The Compio Owner interop tests build the production runtime, which
+      # requires io_uring and fails closed without it; Docker's default seccomp
+      # profile blocks io_uring_setup.
+      options: --security-opt seccomp=unconfined
     timeout-minutes: 20
     env:
       # See the matching image setting: Glommio's bundled liburing needs the

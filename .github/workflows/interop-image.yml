@@ -41,8 +41,12 @@ jobs:
           tags: local/srt-rs-interop-sid:ci
           cache-from: type=gha,scope=debian-sid-libsrt-interop
           cache-to: type=gha,mode=max,scope=debian-sid-libsrt-interop
+      # The Compio Owner tests build the production runtime, which requires
+      # io_uring and fails closed without it; Docker's default seccomp profile
+      # blocks io_uring_setup, so this job runs unconfined.
       - run: >-
           docker run --rm
+          --security-opt seccomp=unconfined
           -v "$GITHUB_WORKSPACE:/workspace:ro"
           -w /workspace
           -e CARGO_TARGET_DIR=/tmp/target
