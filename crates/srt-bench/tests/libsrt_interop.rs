@@ -1438,31 +1438,6 @@ fn compile_libsrt_fixture(name: &str) -> Option<std::path::PathBuf> {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/fixtures/{name}.c"));
     let output = scratch_dir("libsrt-bonding").join(name);
     let mut diagnostics = Vec::new();
-    // A private bonding-enabled libsrt (`SRT_BONDING_PREFIX=<prefix with
-    // include/ and lib/>`) wins over whatever the distribution ships, most of
-    // which is built without bonding. The rpath lets the fixture find it at run
-    // time without a global install.
-    if let Some(prefix) = std::env::var_os("SRT_BONDING_PREFIX") {
-        let prefix = std::path::PathBuf::from(prefix);
-        let result = Command::new("cc")
-            .args(["-std=c11", "-Wall", "-Wextra", "-Werror"])
-            .arg(&source)
-            .arg("-o")
-            .arg(&output)
-            .arg(format!("-I{}", prefix.join("include").display()))
-            .arg(format!("-L{}", prefix.join("lib").display()))
-            .arg(format!("-Wl,-rpath,{}", prefix.join("lib").display()))
-            .arg("-lsrt")
-            .output();
-        match result {
-            Ok(result) if result.status.success() => return Some(output),
-            Ok(result) => diagnostics.push(format!(
-                "SRT_BONDING_PREFIX: {}",
-                String::from_utf8_lossy(&result.stderr).trim()
-            )),
-            Err(error) => diagnostics.push(format!("SRT_BONDING_PREFIX: {error}")),
-        }
-    }
     for library in ["srt-gnutls", "srt-openssl", "srt"] {
         let result = Command::new("cc")
             .args(["-std=c11", "-Wall", "-Wextra", "-Werror"])
@@ -1916,276 +1891,279 @@ fn libsrt_live_transmit_max_payload_received_by_rust_listener() {
 // direct caller and `Owner::connect_bonded` for a Broadcast group. Unlike the
 // tests above, no `SrtConnection`, `Conn` or `GroupConn` is driven by hand.
 
-mod compio_owner {
-    use super::*;
-    use srt_transport::advanced::caller::{LogicalCallerState, LogicalCallerStats, PoolOutcome};
-    use srt_transport::compio::{
-        Owner, OwnerServiceBudget, ProductionRuntimeConfig, RxModePolicy,
-        observe_production_runtime, production_runtime_builder,
-    };
-    use srt_transport::{BondedCallerConfig, SocketOwnership};
+use srt_transport::advanced::caller::{LogicalCallerState, LogicalCallerStats, PoolOutcome};
+use srt_transport::compio::{
+    Owner, OwnerServiceBudget, ProductionRuntimeConfig, RxModePolicy, observe_production_runtime,
+    production_runtime_builder,
+};
+use srt_transport::{BondedCallerConfig, SocketOwnership};
 
-    const TX_LANES: usize = 16;
-    const WIRE_CEILING: usize = 1500;
+const COMPIO_TX_LANES: usize = 16;
+const COMPIO_WIRE_CEILING: usize = 1500;
 
-    /// What a run observed, for the assertions and for failure diagnostics.
-    #[derive(Default, Debug)]
-    pub(super) struct Run {
-        pub connected: bool,
-        pub sent: bool,
-        pub max_active_legs: usize,
-        pub legs_offered: usize,
-        pub rx_mode: Option<srt_transport::compio::OwnerRxMode>,
-        pub io_uring: bool,
-        pub quiescent: bool,
+/// What a run observed, for the assertions and for failure diagnostics.
+#[derive(Default, Debug)]
+struct CompioOwnerRun {
+    connected: bool,
+    sent: bool,
+    max_active_legs: usize,
+    legs_offered: usize,
+    rx_mode: Option<srt_transport::compio::OwnerRxMode>,
+    io_uring: bool,
+    quiescent: bool,
+}
+
+fn compio_caller_config(remote: SocketAddr) -> CallerConfig {
+    CallerConfig::builder(remote)
+        .ownership(SocketOwnership::Shared)
+        .build()
+        .expect("shared caller config")
+}
+
+fn compio_timestamp(epoch: Instant) -> Timestamp {
+    Timestamp::from_micros(epoch.elapsed().as_micros() as u64)
+}
+
+/// Drive an Owner (production runtime, exact-runtime observation) until
+/// `session` says it is finished. `session` runs after every service pass.
+fn run_compio_owner(
+    deadline: Duration,
+    attach: impl FnOnce(&mut Owner, Timestamp) -> srt_transport::advanced::caller::LogicalCallerId,
+    mut session: impl FnMut(
+        &mut Owner,
+        srt_transport::advanced::caller::LogicalCallerId,
+        Timestamp,
+        &mut CompioOwnerRun,
+    ) -> bool,
+) -> CompioOwnerRun {
+    let config = ProductionRuntimeConfig::for_owner(COMPIO_TX_LANES, COMPIO_WIRE_CEILING);
+    let runtime = production_runtime_builder(config)
+        .expect("production runtime builder")
+        .build()
+        .expect("production runtime builds");
+    runtime.block_on(async {
+        let profile =
+            observe_production_runtime(&runtime, COMPIO_TX_LANES, COMPIO_WIRE_CEILING).await;
+        let mut run = CompioOwnerRun {
+            io_uring: profile.is_io_uring,
+            ..CompioOwnerRun::default()
+        };
+        let mut owner = Owner::new_with_ceiling(COMPIO_TX_LANES, COMPIO_WIRE_CEILING);
+        owner
+            .set_rx_substrate(profile.managed_rx_substrate())
+            .expect("declare the observed substrate");
+        owner.set_rx_mode_policy(RxModePolicy::ManagedPreferred);
+        let epoch = Instant::now();
+        let id = attach(&mut owner, compio_timestamp(epoch));
+        run.rx_mode = owner.rx_mode();
+        while epoch.elapsed() < deadline {
+            let now = compio_timestamp(epoch);
+            let _ = owner.service(now, OwnerServiceBudget::default()).await;
+            if session(&mut owner, id, now, &mut run) {
+                break;
+            }
+            owner.wait_for_activity(Duration::from_millis(2)).await;
+        }
+        // Orderly close, then canonical Owner teardown.
+        if let Some(mut caller) = owner.logical_caller_mut(&id) {
+            caller.disconnect(compio_timestamp(epoch));
+        }
+        for _ in 0..20 {
+            let _ = owner
+                .service(compio_timestamp(epoch), OwnerServiceBudget::default())
+                .await;
+            owner.wait_for_activity(Duration::from_millis(2)).await;
+        }
+        run.quiescent = owner.shutdown_and_drain(Duration::from_secs(5)).await;
+        run
+    })
+}
+
+fn compio_admitted(outcome: PoolOutcome) -> srt_transport::advanced::caller::LogicalCallerId {
+    match outcome {
+        PoolOutcome::Admitted(id) => id,
+        other => panic!("expected an immediate admission, got {other:?}"),
     }
+}
 
-    fn caller_config(remote: SocketAddr) -> CallerConfig {
-        CallerConfig::builder(remote)
-            .ownership(SocketOwnership::Shared)
-            .build()
-            .expect("shared caller config")
+/// `Owner::connect` (direct, shared caller socket, production runtime) ->
+/// real libsrt `srt-live-transmit` listener; the listener's output must
+/// equal the payload byte for byte.
+#[test]
+fn compio_owner_direct_caller_sends_stream_to_libsrt_listener() {
+    let _guard = interop_test_lock();
+    if !command_available("srt-live-transmit") {
+        eprintln!("skipping: srt-live-transmit not on PATH");
+        return;
     }
+    let payload = test_payload();
+    let (child, port) = spawn_with_free_udp_port("srt-live-transmit listener", |port| {
+        Command::new("srt-live-transmit")
+            .args(["-q", "-timeout:3"])
+            .arg(format!("srt://:{port}?mode=listener"))
+            .arg("file://con")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn srt-live-transmit listener")
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    let remote = SocketAddr::from(([127, 0, 0, 1], port));
 
-    fn timestamp(epoch: Instant) -> Timestamp {
-        Timestamp::from_micros(epoch.elapsed().as_micros() as u64)
-    }
-
-    /// Drive an Owner (production runtime, exact-runtime observation) until
-    /// `session` says it is finished. `session` runs after every service pass.
-    pub(super) fn run_owner(
-        deadline: Duration,
-        attach: impl FnOnce(&mut Owner, Timestamp) -> srt_transport::advanced::caller::LogicalCallerId,
-        mut session: impl FnMut(
-            &mut Owner,
-            srt_transport::advanced::caller::LogicalCallerId,
-            Timestamp,
-            &mut Run,
-        ) -> bool,
-    ) -> Run {
-        let config = ProductionRuntimeConfig::for_owner(TX_LANES, WIRE_CEILING);
-        let runtime = production_runtime_builder(config)
-            .expect("production runtime builder")
-            .build()
-            .expect("production runtime builds");
-        runtime.block_on(async {
-            let profile = observe_production_runtime(&runtime, TX_LANES, WIRE_CEILING).await;
-            let mut run = Run {
-                io_uring: profile.is_io_uring,
-                ..Run::default()
+    let mut offset = 0;
+    let mut drained_at: Option<Instant> = None;
+    let run = run_compio_owner(
+        Duration::from_secs(15),
+        |owner, now| {
+            compio_admitted(
+                owner
+                    .connect(&compio_caller_config(remote), now)
+                    .expect("connect"),
+            )
+        },
+        |owner, id, now, run| {
+            let Some(mut caller) = owner.logical_caller_mut(&id) else {
+                return true;
             };
-            let mut owner = Owner::new_with_ceiling(TX_LANES, WIRE_CEILING);
-            owner
-                .set_rx_substrate(profile.managed_rx_substrate())
-                .expect("declare the observed substrate");
-            owner.set_rx_mode_policy(RxModePolicy::ManagedPreferred);
-            let epoch = Instant::now();
-            let id = attach(&mut owner, timestamp(epoch));
-            run.rx_mode = owner.rx_mode();
-            while epoch.elapsed() < deadline {
-                let now = timestamp(epoch);
-                let _ = owner.service(now, OwnerServiceBudget::default()).await;
-                if session(&mut owner, id, now, &mut run) {
-                    break;
-                }
-                owner.wait_for_activity(Duration::from_millis(2)).await;
+            if caller.state() != Some(LogicalCallerState::Connected) {
+                return false;
             }
-            // Orderly close, then canonical Owner teardown.
-            if let Some(mut caller) = owner.logical_caller_mut(&id) {
-                caller.disconnect(timestamp(epoch));
+            run.connected = true;
+            while offset < payload.len() && caller.can_send() {
+                let end = (offset + 1_000).min(payload.len());
+                caller
+                    .send_shared(bytes::Bytes::copy_from_slice(&payload[offset..end]), now)
+                    .expect("send payload through the Owner");
+                offset = end;
             }
-            for _ in 0..20 {
-                let _ = owner
-                    .service(timestamp(epoch), OwnerServiceBudget::default())
-                    .await;
-                owner.wait_for_activity(Duration::from_millis(2)).await;
-            }
-            run.quiescent = owner.shutdown_and_drain(Duration::from_secs(5)).await;
-            run
-        })
-    }
-
-    fn admitted(outcome: PoolOutcome) -> srt_transport::advanced::caller::LogicalCallerId {
-        match outcome {
-            PoolOutcome::Admitted(id) => id,
-            other => panic!("expected an immediate admission, got {other:?}"),
-        }
-    }
-
-    /// `Owner::connect` (direct, shared caller socket, production runtime) ->
-    /// real libsrt `srt-live-transmit` listener; the listener's output must
-    /// equal the payload byte for byte.
-    #[test]
-    fn compio_owner_direct_caller_sends_stream_to_libsrt_listener() {
-        let _guard = interop_test_lock();
-        if !command_available("srt-live-transmit") {
-            eprintln!("skipping: srt-live-transmit not on PATH");
-            return;
-        }
-        let payload = test_payload();
-        let (child, port) = spawn_with_free_udp_port("srt-live-transmit listener", |port| {
-            Command::new("srt-live-transmit")
-                .args(["-q", "-timeout:3"])
-                .arg(format!("srt://:{port}?mode=listener"))
-                .arg("file://con")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("spawn srt-live-transmit listener")
-        });
-        std::thread::sleep(Duration::from_millis(100));
-        let remote = SocketAddr::from(([127, 0, 0, 1], port));
-
-        let mut offset = 0;
-        let mut drained_at: Option<Instant> = None;
-        let run = run_owner(
-            Duration::from_secs(15),
-            |owner, now| admitted(owner.connect(&caller_config(remote), now).expect("connect")),
-            |owner, id, now, run| {
-                let Some(mut caller) = owner.logical_caller_mut(&id) else {
-                    return true;
-                };
-                if caller.state() != Some(LogicalCallerState::Connected) {
-                    return false;
-                }
-                run.connected = true;
-                while offset < payload.len() && caller.can_send() {
-                    let end = (offset + 1_000).min(payload.len());
-                    caller
-                        .send_shared(bytes::Bytes::copy_from_slice(&payload[offset..end]), now)
-                        .expect("send payload through the Owner");
-                    offset = end;
-                }
-                run.sent = offset == payload.len();
-                // Everything is sent AND acknowledged once the protocol sender
-                // buffer is empty; then linger so the receiver's latency
-                // window releases the data before the orderly close (the
-                // driver-based tests above linger 2s for the same reason).
-                let drained = matches!(
-                    caller.stats(),
-                    Some(LogicalCallerStats::Direct(stats))
-                        if stats.sender.is_some_and(|sender| sender.packets_in_buffer == 0)
-                );
-                if run.sent && drained {
-                    return drained_at.get_or_insert_with(Instant::now).elapsed()
-                        >= Duration::from_secs(2);
-                }
-                false
-            },
-        );
-        let output = wait_for_child(child, "srt-live-transmit");
-
-        assert!(run.io_uring, "the production runtime is io_uring: {run:?}");
-        assert!(run.connected, "Owner caller never connected: {run:?}");
-        assert!(run.sent, "payload was not fully submitted: {run:?}");
-        assert!(run.quiescent, "Owner teardown was not quiescent: {run:?}");
-        assert!(
-            output.status.success(),
-            "libsrt listener failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            output.stdout == payload,
-            "libsrt output ({} bytes) differs from the Owner payload ({} bytes); run: {run:?}",
-            output.stdout.len(),
-            payload.len()
-        );
-    }
-
-    /// `Owner::connect_bonded` (Broadcast, two legs, one shared caller socket)
-    /// -> real bonding-enabled libsrt listener. Skips (exit 77) only when the
-    /// installed libsrt lacks bonding, unless `SRT_REQUIRE_BONDING` is set;
-    /// point `SRT_BONDING_PREFIX` at a bonding-enabled libsrt build to run it.
-    #[test]
-    fn compio_owner_broadcast_bond_interoperates_with_libsrt_listener() {
-        let _guard = interop_test_lock();
-        let Some(listener) = compile_libsrt_bonded_listener() else {
-            return;
-        };
-        let Some((child, port)) = spawn_libsrt_bonded_listener(&listener) else {
-            return;
-        };
-        std::thread::sleep(Duration::from_millis(100));
-        let remote = SocketAddr::from(([127, 0, 0, 1], port));
-        let payload = b"compio-owner-bonded-group-payload";
-        let mut drained_at: Option<Instant> = None;
-
-        let run = run_owner(
-            Duration::from_secs(15),
-            |owner, now| {
-                let config = BondedCallerConfig::new(GroupConfig::new(
-                    0x1234,
-                    srt_proto::handshake::GroupType::Broadcast,
-                ))
-                .leg(caller_config(remote), 10)
-                .leg(caller_config(remote), 20);
-                admitted(owner.connect_bonded(&config, now).expect("connect_bonded"))
-            },
-            |owner, id, now, run| {
-                let Some(mut caller) = owner.logical_caller_mut(&id) else {
-                    return true;
-                };
-                let active = match caller.stats() {
-                    Some(LogicalCallerStats::Group(stats)) => stats.aggregate.active_legs,
-                    _ => 0,
-                };
-                run.max_active_legs = run.max_active_legs.max(active);
-                if active == 2 && !run.sent {
-                    run.connected = true;
-                    run.legs_offered = caller
-                        .send_shared(bytes::Bytes::from_static(payload), now)
-                        .expect("send Broadcast payload");
-                    run.sent = true;
-                    return false;
-                }
-                // After the send, keep servicing until the whole group has
-                // acknowledged it (every leg's sender buffer is empty), then
-                // linger so the receiver's latency window releases it.
-                let drained = run.sent
-                    && matches!(
-                        caller.stats(),
-                        Some(LogicalCallerStats::Group(stats))
-                            if stats.legs.iter().all(|leg| {
-                                leg.connection
-                                    .sender
-                                    .is_none_or(|sender| sender.packets_in_buffer == 0)
-                            })
-                    );
-                if drained {
-                    return drained_at.get_or_insert_with(Instant::now).elapsed()
-                        >= Duration::from_secs(2);
-                }
-                false
-            },
-        );
-        let output =
-            wait_for_child_with_timeout(child, "libsrt bonded listener", Duration::from_secs(15));
-        if output.status.code() == Some(77) && std::env::var_os("SRT_REQUIRE_BONDING").is_none() {
-            eprintln!(
-                "skipping bonding interop: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
+            run.sent = offset == payload.len();
+            // Everything is sent AND acknowledged once the protocol sender
+            // buffer is empty; then linger so the receiver's latency
+            // window releases the data before the orderly close (the
+            // driver-based tests above linger 2s for the same reason).
+            let drained = matches!(
+                caller.stats(),
+                Some(LogicalCallerStats::Direct(stats))
+                    if stats.sender.is_some_and(|sender| sender.packets_in_buffer == 0)
             );
-            return;
-        }
+            if run.sent && drained {
+                return drained_at.get_or_insert_with(Instant::now).elapsed()
+                    >= Duration::from_secs(2);
+            }
+            false
+        },
+    );
+    let output = wait_for_child(child, "srt-live-transmit");
 
-        assert!(run.io_uring, "the production runtime is io_uring: {run:?}");
-        assert!(run.sent, "the group never activated both legs: {run:?}");
-        assert_eq!(run.max_active_legs, 2, "both libsrt legs activate: {run:?}");
-        assert_eq!(
-            run.legs_offered, 2,
-            "Broadcast offered the payload to both legs: {run:?}"
+    assert!(run.io_uring, "the production runtime is io_uring: {run:?}");
+    assert!(run.connected, "Owner caller never connected: {run:?}");
+    assert!(run.sent, "payload was not fully submitted: {run:?}");
+    assert!(run.quiescent, "Owner teardown was not quiescent: {run:?}");
+    assert!(
+        output.status.success(),
+        "libsrt listener failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stdout == payload,
+        "libsrt output ({} bytes) differs from the Owner payload ({} bytes); run: {run:?}",
+        output.stdout.len(),
+        payload.len()
+    );
+}
+
+/// `Owner::connect_bonded` (Broadcast, two legs, one shared caller socket)
+/// -> real bonding-enabled libsrt listener. Skips (exit 77) only when the
+/// installed libsrt lacks bonding, unless `SRT_REQUIRE_BONDING` is set;
+#[test]
+fn compio_owner_broadcast_bond_interoperates_with_libsrt_listener() {
+    let _guard = interop_test_lock();
+    let Some(listener) = compile_libsrt_bonded_listener() else {
+        return;
+    };
+    let Some((child, port)) = spawn_libsrt_bonded_listener(&listener) else {
+        return;
+    };
+    std::thread::sleep(Duration::from_millis(100));
+    let remote = SocketAddr::from(([127, 0, 0, 1], port));
+    let payload = b"compio-owner-bonded-group-payload";
+    let mut drained_at: Option<Instant> = None;
+
+    let run = run_compio_owner(
+        Duration::from_secs(15),
+        |owner, now| {
+            let config = BondedCallerConfig::new(GroupConfig::new(
+                0x1234,
+                srt_proto::handshake::GroupType::Broadcast,
+            ))
+            .leg(compio_caller_config(remote), 10)
+            .leg(compio_caller_config(remote), 20);
+            compio_admitted(owner.connect_bonded(&config, now).expect("connect_bonded"))
+        },
+        |owner, id, now, run| {
+            let Some(mut caller) = owner.logical_caller_mut(&id) else {
+                return true;
+            };
+            let active = match caller.stats() {
+                Some(LogicalCallerStats::Group(stats)) => stats.aggregate.active_legs,
+                _ => 0,
+            };
+            run.max_active_legs = run.max_active_legs.max(active);
+            if active == 2 && !run.sent {
+                run.connected = true;
+                run.legs_offered = caller
+                    .send_shared(bytes::Bytes::from_static(payload), now)
+                    .expect("send Broadcast payload");
+                run.sent = true;
+                return false;
+            }
+            // After the send, keep servicing until the whole group has
+            // acknowledged it (every leg's sender buffer is empty), then
+            // linger so the receiver's latency window releases it.
+            let drained = run.sent
+                && matches!(
+                    caller.stats(),
+                    Some(LogicalCallerStats::Group(stats))
+                        if stats.legs.iter().all(|leg| {
+                            leg.connection
+                                .sender
+                                .is_none_or(|sender| sender.packets_in_buffer == 0)
+                        })
+                );
+            if drained {
+                return drained_at.get_or_insert_with(Instant::now).elapsed()
+                    >= Duration::from_secs(2);
+            }
+            false
+        },
+    );
+    let output =
+        wait_for_child_with_timeout(child, "libsrt bonded listener", Duration::from_secs(15));
+    if output.status.code() == Some(77) && std::env::var_os("SRT_REQUIRE_BONDING").is_none() {
+        eprintln!(
+            "skipping bonding interop: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
         );
-        assert!(run.quiescent, "Owner teardown was not quiescent: {run:?}");
-        assert!(
-            output.status.success(),
-            "libsrt bonded listener failed: {}; run: {run:?}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            output.stdout == payload,
-            "libsrt did not receive the Owner's Broadcast payload ({} of {} bytes); run: {run:?}",
-            output.stdout.len(),
-            payload.len()
-        );
+        return;
     }
+
+    assert!(run.io_uring, "the production runtime is io_uring: {run:?}");
+    assert!(run.sent, "the group never activated both legs: {run:?}");
+    assert_eq!(run.max_active_legs, 2, "both libsrt legs activate: {run:?}");
+    assert_eq!(
+        run.legs_offered, 2,
+        "Broadcast offered the payload to both legs: {run:?}"
+    );
+    assert!(run.quiescent, "Owner teardown was not quiescent: {run:?}");
+    assert!(
+        output.status.success(),
+        "libsrt bonded listener failed: {}; run: {run:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stdout == payload,
+        "libsrt did not receive the Owner's Broadcast payload ({} of {} bytes); run: {run:?}",
+        output.stdout.len(),
+        payload.len()
+    );
 }
