@@ -359,6 +359,24 @@ fn output_bytes(output: &QueuedOutput) -> usize {
     }
 }
 
+/// A DROPREQ datagram's `(first_seq, last_seq)` range, if `pkt` is one.
+///
+/// `None` for anything else, including a DROPREQ whose control-info somehow
+/// fails to parse (shape is already validated before a DROPREQ can reach the
+/// output queue, so that case is not expected, only guarded).
+fn dropreq_range(pkt: &PendingDatagram) -> Option<(u32, u32)> {
+    let PendingDatagram::Control(ctrl) = pkt else {
+        return None;
+    };
+    if ctrl.control_type != ControlType::DropReq {
+        return None;
+    }
+    let mut cif = ctrl.control_info.as_slice();
+    crate::buf::read_u32(&mut cif)
+        .ok()
+        .zip(crate::buf::read_u32(&mut cif).ok())
+}
+
 /// Connection options.
 #[derive(Clone)]
 pub struct ConnectionOptions {
@@ -2456,6 +2474,11 @@ impl SrtConnection {
                     PendingDatagram::Data(data) => Some(data.header.sequence_number),
                     PendingDatagram::Control(_) => None,
                 };
+                // Likewise the one point where the sender learns a DROPREQ
+                // actually reached the wire: a peer cannot have learned of a
+                // drop from one still sitting queued (see
+                // `SenderBuffer::note_dropreq_submitted`).
+                let dropreq_range = dropreq_range(pkt);
                 let class = pkt.class();
                 let source_due_micros = pkt.source_due_micros();
                 self.pop_output_front();
@@ -2465,6 +2488,11 @@ impl SrtConnection {
                 self.output_queue_bytes = self.output_queue_bytes.saturating_sub(wire_len);
                 if let Some(sequence) = submitted_sequence {
                     self.note_data_submitted(sequence);
+                }
+                if let Some((first, last)) = dropreq_range
+                    && let Some(sender) = self.sender.as_mut()
+                {
+                    sender.note_dropreq_submitted(first, last);
                 }
                 Ok(Some(OutputInto::Datagram {
                     len: written,
@@ -4372,6 +4400,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "constructs a real CryptoContext, deriving its KEK via 2048               \
+                  PBKDF2-HMAC-SHA1 iterations (per the SRT spec) under Miri; correctness    \
+                  is proven outside Miri, and this property is unrelated to PBKDF2's own    \
+                  iteration count. Run in the miri-extended scheduled job."
+    )]
     fn key_refresh_needed_is_emitted_once_until_sek_is_provided() {
         let mut conn = SrtConnection::new_caller(ConnectionOptions::default());
         let mut crypto = CryptoContext::new_sender(
@@ -4832,6 +4867,12 @@ mod tests {
     /// retransmits nothing. Without this the tail tests could pass or fail for a
     /// harness reason instead of the property under test.
     #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "400-tick FlightHarness run, same scale as the tail-recovery tests below;   \
+                  correctness is proven here at full scale outside Miri. Run in the          \
+                  miri-extended scheduled job."
+    )]
     fn an_intact_flight_is_delivered_whole() {
         let mut flight = FlightHarness::new(&[]);
         flight.send_flight(FLIGHT);
@@ -5267,6 +5308,13 @@ mod tests {
     /// zeroize-then-drop step itself: that would mean reading memory this
     /// code has already freed, which the card explicitly rules out.
     #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "a real KM handshake derives its KEK via 2048 PBKDF2-HMAC-SHA1 iterations   \
+                  (per the SRT spec) on each side under Miri, which dominates this job's     \
+                  time; correctness is proven outside Miri, and this property is unrelated   \
+                  to PBKDF2's own iteration count. Run in the miri-extended scheduled job."
+    )]
     fn handshake_clears_config_secrets_once_crypto_is_established() {
         let sek = vec![0x24u8; 16];
         let mut caller = SrtConnection::new_caller(ConnectionOptions {
@@ -5382,6 +5430,13 @@ mod tests {
     /// way this happens in production (see `update_sek`'s doc comment)
     /// without driving a full KM wire exchange to a malformed wrapped key.
     #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "constructs a real CryptoContext, deriving its KEK via 2048               \
+                  PBKDF2-HMAC-SHA1 iterations (per the SRT spec) under Miri; correctness    \
+                  is proven outside Miri, and this property is unrelated to PBKDF2's own    \
+                  iteration count. Run in the miri-extended scheduled job."
+    )]
     fn send_is_rejected_before_admission_when_current_key_cannot_encrypt() {
         let (mut caller, _listener) = connected_pair();
         while caller.poll_output().unwrap().is_some() {}
@@ -5444,6 +5499,13 @@ mod tests {
     /// datagram budget once encrypted. `effective_max_payload_size` must
     /// already exclude it, for both the single-packet and fragmented paths.
     #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "real AES-GCM encryption of near-MTU payloads under Miri (GHASH/AES          \
+                  interpreted byte-by-byte); the size-budget arithmetic under test does not  \
+                  depend on Miri's ownership checking and is proven at full scale outside     \
+                  it. Run in the miri-extended scheduled job."
+    )]
     fn gcm_wire_packets_never_exceed_the_datagram_budget() {
         let (mut caller, _listener) = connected_pair();
         while caller.poll_output().unwrap().is_some() {}
@@ -5723,6 +5785,14 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "cap-scale loop (100,000 duplicate SHUTDOWNs), same category as the         \
+                  neighboring MAX_EVENT_QUEUE_ACTIONS/MAX_OUTPUT_QUEUE_ACTIONS loops; the     \
+                  no-growth property is proven here at full scale outside Miri, and           \
+                  `handle_shutdown`'s early-return ownership is exercised by the rest of      \
+                  this module under Miri"
+    )]
     fn duplicate_shutdowns_do_not_grow_terminal_event_queue() {
         let mut conn = SrtConnection::new_listener(ConnectionOptions::default());
         conn.set_state(ConnectionState::Connected);
@@ -6224,6 +6294,47 @@ mod tests {
         );
     }
 
+    /// A peer's ACK RTT/RTTVar feedback is a raw `u32` field -- any value is
+    /// wire-legal. Reaches the same overflow-safe EWMA arithmetic as
+    /// `srt_sender::tests::rtt_ewma_never_overflows_on_near_u32_max_peer_feedback`,
+    /// through real ACK decoding: a numbered Small ACK (16 bytes) reaches
+    /// this path exactly like a Full ACK does since round 2's Haivision
+    /// compatibility fix.
+    #[test]
+    fn ack_wire_feedback_near_u32_max_never_overflows_the_rtt_estimator() {
+        let (mut caller, _listener) = connected_pair();
+        let socket_id = caller.socket_id();
+        let now = Timestamp::from_micros(1_000_000);
+
+        for _ in 0..8 {
+            let ack_seq = caller.sender.as_ref().unwrap().oldest_unacked_sequence();
+            let mut control_info = Vec::new();
+            write_u32(&mut control_info, ack_seq);
+            write_u32(&mut control_info, u32::MAX - 1); // RTT
+            write_u32(&mut control_info, u32::MAX - 1); // RTTVar
+            write_u32(&mut control_info, 60); // available buffer
+            let pkt = ControlPacket {
+                control_type: ControlType::Ack,
+                subtype: 0,
+                type_specific_info: 7, // numbered Small ACK
+                timestamp: 0,
+                dest_socket_id: socket_id,
+                control_info,
+            };
+            let mut datagram = Vec::new();
+            pkt.encode(&mut datagram).expect("ACK encodes");
+            caller
+                .feed_recv_buf(&datagram, now)
+                .expect("a numbered Small ACK with extreme RTT feedback is accepted");
+        }
+
+        let timeout = caller.sender.as_ref().unwrap().rto_base_timeout_micros();
+        assert!(
+            timeout <= crate::sender_rto::MAX_RTO_MICROS,
+            "RTO base timeout {timeout} must stay bounded by MAX_RTO_MICROS"
+        );
+    }
+
     /// The SRT encoding (and Robotweax) require a compact range's END word
     /// to have its high bit clear -- only the START word's high bit marks
     /// the range form. A wire-hostile NAK setting the high bit on both
@@ -6716,6 +6827,7 @@ mod tests {
     #[test]
     fn unsubmitted_queued_data_that_expires_never_materializes() {
         let (mut caller, _listener) = connected_pair();
+        let socket_id = caller.socket_id();
         let now = Timestamp::from_micros(0);
         let first = caller.next_sequence_number().expect("connected sender");
 
@@ -6739,6 +6851,96 @@ mod tests {
         assert!(
             all_data_sequences(&outputs).is_empty(),
             "the tombstoned, never-submitted position must never leave as DATA"
+        );
+
+        // A peer that actually received the DROPREQ above (and so advanced
+        // its own expected sequence past it, per `ReceiverBuffer::
+        // drop_range`) can legitimately cumulative-ACK past this position --
+        // its knowledge came from the DROPREQ crossing the wire, not from
+        // the DATA that never did.
+        caller
+            .feed_recv_buf(
+                &ack_datagram(socket_id, first.wrapping_add(1), Some(8)),
+                expired,
+            )
+            .expect("an ACK justified by the DROPREQ's own delivery is accepted");
+        assert_eq!(
+            caller.sender.as_ref().unwrap().oldest_unacked_sequence(),
+            first.wrapping_add(1),
+            "the tombstone must retire"
+        );
+        assert!(
+            caller.can_send(),
+            "sender capacity must reopen once the tombstone retires"
+        );
+    }
+
+    /// A live, unsubmitted hole blocks the ACK-justified frontier even when
+    /// a *later* sequence has already been submitted: `justified_frontier`
+    /// cannot jump over it just because something past it advanced. `seq0`
+    /// expires (via TLPKTDROP) before its DATA is ever submitted; `seq1`'s
+    /// DATA is submitted normally. Until `seq0`'s own DROPREQ crosses the
+    /// wire, an ACK through `seq1` must still be rejected -- exactly the
+    /// case a naive `max(newest_submitted, dropped_end) + 1` model would
+    /// get wrong.
+    #[test]
+    fn ack_frontier_stops_at_an_unnotified_hole_even_behind_a_later_submission() {
+        let (mut caller, _listener) = connected_pair();
+        let socket_id = caller.socket_id();
+        let seq0 = caller.next_sequence_number().expect("connected sender");
+
+        // seq0: accepted at t=0, deliberately never drained.
+        caller
+            .send(b"seq0 never submitted", Timestamp::from_micros(0))
+            .expect("accepted");
+        // seq1: accepted later (t=900ms), so it will not have aged past the
+        // 1s TLPKTDROP floor when seq0 has.
+        caller
+            .send(b"seq1 submitted", Timestamp::from_micros(900_000))
+            .expect("accepted");
+
+        // seq0 ages out; seq1 has not yet. Only seq0 is tombstoned, and its
+        // queued DATA is purged, leaving seq1's DATA at the front of the
+        // queue.
+        let expired = Timestamp::from_micros(1_000_001);
+        caller
+            .handle_timer(TimerId::Ack, expired)
+            .expect("ACK tick");
+
+        // Drain exactly one DATA datagram: seq1's, now at the front. seq0's
+        // DROPREQ is still queued behind it, not yet materialized.
+        drain_until_one_data_packet_submitted(&mut caller);
+
+        let seq1 = seq0.wrapping_add(1);
+        let baseline = caller.stats();
+        let error = caller
+            .feed_recv_buf(
+                &ack_datagram(socket_id, seq1.wrapping_add(1), Some(8)),
+                expired,
+            )
+            .expect_err(
+                "an ACK past the still-unnotified seq0 hole is rejected even though seq1 \
+                 was submitted",
+            );
+        assert_eq!(error.kind, crate::error::ErrorKind::InvalidData);
+        assert_eq!(caller.stats(), baseline, "rejected input changed state");
+
+        // Once seq0's DROPREQ actually crosses the wire, the same ACK
+        // becomes valid: the peer could now legitimately have learned of
+        // both positions.
+        assert!(
+            !drop_requests_in(&drain_outputs(&mut caller)).is_empty(),
+            "seq0's DROPREQ must still be queued and now drains"
+        );
+        caller
+            .feed_recv_buf(
+                &ack_datagram(socket_id, seq1.wrapping_add(1), Some(8)),
+                expired,
+            )
+            .expect("the same ACK is accepted once the hole's DROPREQ is notified");
+        assert_eq!(
+            caller.sender.as_ref().unwrap().oldest_unacked_sequence(),
+            seq1.wrapping_add(1)
         );
     }
 
@@ -6832,6 +7034,14 @@ mod tests {
     /// (TLPKTDROP tombstoning it before it ever materializes) -- not only
     /// when it actually leaves the protocol.
     #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "encrypted handshake plus AES-GCM under Miri (dominates this job's time, ~7   \
+                  minutes for this one test alone -- GHASH/AES interpreted byte-by-byte);      \
+                  correctness is proven outside Miri, and the reservation-accounting property  \
+                  itself is unrelated to the cipher (see the plaintext queued-DATA regressions \
+                  above). Run in the miri-extended scheduled job."
+    )]
     fn crypto_reservation_returns_when_a_stale_queued_datagram_is_discarded() {
         use crate::crypto::CipherMode;
 
@@ -6927,7 +7137,7 @@ mod tests {
                 control_datagram(socket_id, ControlType::Ack, 0, 0, Vec::new()),
             ),
             (
-                "ACK with a non-canonical (non 4/16/28-byte) length",
+                "ACK with a non-canonical (not 4/16/24/28/32-byte) length",
                 control_datagram(socket_id, ControlType::Ack, 0, 0, non_canonical_ack_length),
             ),
             (
@@ -7595,10 +7805,10 @@ mod tests {
         // The protocol-correctness pass grew the inline sender state by the
         // two retained-stamp counters it carries (see
         // `sender_window_is_lazy_and_bounded_at_maximum_window`): 8 bytes,
-        // deliberate and bounded, not drift. A later pass grew `SenderBuffer`
-        // (embedded inline here) by another 8 bytes for the same reason --
-        // see that same test's comment.
-        assert!(connection_bytes <= 1_552);
+        // deliberate and bounded, not drift. Two later passes grew
+        // `SenderBuffer` (embedded inline here) by another 8 bytes each for
+        // the same reason -- see that same test's comment.
+        assert!(connection_bytes <= 1_560);
         assert!(event_bytes <= 64);
         // F01 added `source_time: Timestamp` (8 bytes) to preserve a
         // message's original source time through reassembly -- a
@@ -7607,6 +7817,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "a real KM handshake derives its KEK via 2048 PBKDF2-HMAC-SHA1 iterations   \
+                  (per the SRT spec) under Miri, which dominates this job's time;            \
+                  correctness is proven outside Miri, and this property is unrelated to      \
+                  PBKDF2's own iteration count. Run in the miri-extended scheduled job."
+    )]
     fn listener_encryption_replacement_clears_inapplicable_key_material() {
         let mut listener = SrtConnection::new_listener(ConnectionOptions {
             passphrase: Some("old-secret-123".to_owned()),
@@ -7679,6 +7896,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "constructs a real CryptoContext, deriving its KEK via 2048               \
+                  PBKDF2-HMAC-SHA1 iterations (per the SRT spec) under Miri; correctness    \
+                  is proven outside Miri, and this property is unrelated to PBKDF2's own    \
+                  iteration count. Run in the miri-extended scheduled job."
+    )]
     fn validate_kmrsp_rejects_encrypted_caller_without_response() {
         let sek: Vec<u8> = (1..=16).collect();
         let mut conn = SrtConnection::new_caller(ConnectionOptions {

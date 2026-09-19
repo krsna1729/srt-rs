@@ -96,6 +96,15 @@ struct SentPacket {
     /// loss. Distinct from `sent_time`, which is the TLPKTDROP message age and
     /// is deliberately never rewritten by a retransmission.
     submitted: bool,
+    /// Whether the DROPREQ covering this tombstone has actually left the
+    /// protocol for the transport. Meaningless while `dropped` is false.
+    ///
+    /// A peer can only have learned of this drop once the DROPREQ that
+    /// reports it actually reached the wire -- queuing it is not enough, for
+    /// the same reason queuing DATA is not enough for `submitted`. This is
+    /// the other half of what makes a position ACK-justified: see
+    /// `SenderBuffer::justified_frontier`.
+    drop_notified: bool,
 }
 
 /// A message dropped by sender-side TLPKTDROP.
@@ -270,6 +279,26 @@ pub struct SenderBuffer {
     /// its first live submission, decremented on ACK retirement or
     /// TLPKTDROP, reset on resync.
     live_submitted_count: u32,
+    /// The exclusive end of the contiguous prefix (from `oldest_unacked`) a
+    /// peer could legitimately have cumulatively ACKed.
+    ///
+    /// A position is ACK-justified once the peer could actually have learned
+    /// about it: either its DATA first transmission, or (for a tombstone)
+    /// the DROPREQ that reports it, has crossed the same submission boundary
+    /// (`poll_output_into`) -- queuing either one is not enough. `next_seq`
+    /// (merely *accepted*) is the wrong bound for this: #118 established
+    /// accepted and submitted are different states. This is also not simply
+    /// `max(newest_submitted, dropped_end) + 1`: TLPKTDROP can purge a
+    /// queued-but-unsubmitted DATA datagram and replace it with a DROPREQ
+    /// that itself has not gone out yet, leaving a live-but-not-yet-justified
+    /// hole *behind* a later submitted sequence. The frontier only advances
+    /// through a genuinely contiguous justified run starting at
+    /// `oldest_unacked`, so such a hole correctly blocks it. Advanced
+    /// incrementally by `advance_justified_frontier` whenever a submission
+    /// or a DROPREQ crossing could extend it, so checking an incoming ACK is
+    /// always O(1) and advancing it is amortized O(1) per position over the
+    /// window's lifetime.
+    justified_frontier: u32,
     /// Test-only instrumentation: number of times `tombstone_range` has
     /// actually walked a run, to pin its O(1)-per-distinct-run amortized
     /// cost against a regression back to O(run length) per requested
@@ -334,6 +363,7 @@ impl SenderBuffer {
             rto: SenderRto::new(),
             dropreq_cursor: 0,
             live_submitted_count: 0,
+            justified_frontier: initial_seq,
             #[cfg(test)]
             tombstone_range_calls: std::cell::Cell::new(0),
         };
@@ -347,22 +377,72 @@ impl SenderBuffer {
     }
 
     /// The highest cumulative ACK position a peer could legitimately report,
-    /// justified by actual first-transmission submission rather than mere
+    /// justified by actual submission to the transport rather than mere
     /// acceptance.
     ///
     /// [`Self::next_sequence_number`] is the *accepted* frontier: it
     /// advances the instant this sender assigns a sequence number, before
     /// the datagram has necessarily left the protocol for the transport. A
-    /// peer can only acknowledge what it actually received, and it cannot
-    /// have received data still sitting behind this sender's own TX
-    /// capacity. This is `newest_submitted + 1` when something has been
-    /// submitted, or `oldest_unacked` (nothing beyond what is already fully
-    /// retired could have been acknowledged) when nothing has.
+    /// peer can only acknowledge what it actually learned about, and it
+    /// cannot have received data still sitting behind this sender's own TX
+    /// capacity -- nor learned of a drop whose DROPREQ has not gone out yet.
+    /// See the `justified_frontier` field's own doc comment.
     #[must_use]
     pub fn max_justified_ack_position(&self) -> u32 {
-        self.newest_submitted.map_or(self.oldest_unacked, |newest| {
-            newest.wrapping_add(1) & SEQUENCE_MASK
-        })
+        self.justified_frontier
+    }
+
+    /// Advance `justified_frontier` through as much of the
+    /// contiguous ACK-justified prefix (starting from wherever it already
+    /// is) as is now available.
+    ///
+    /// Called after anything that can extend justification -- a DATA
+    /// submission or a DROPREQ crossing the transport boundary. A live,
+    /// unsubmitted entry (never dropped, `submitted` still false) or a
+    /// tombstone whose DROPREQ has not yet gone out both stop the walk,
+    /// exactly where the peer's own knowledge would stop. Because the
+    /// frontier only ever moves forward and this is the only place it does,
+    /// the total work across the window's lifetime is bounded by the number
+    /// of positions that ever exist in it, not by the number of times an ACK
+    /// is checked.
+    fn advance_justified_frontier(&mut self) {
+        while sequence_less_than(self.justified_frontier, self.next_seq) {
+            let justified = match self.packets.get(self.justified_frontier) {
+                Some(entry) => {
+                    (entry.dropped && entry.drop_notified) || (!entry.dropped && entry.submitted)
+                }
+                None => false,
+            };
+            if !justified {
+                break;
+            }
+            self.justified_frontier = self.justified_frontier.wrapping_add(1) & SEQUENCE_MASK;
+        }
+    }
+
+    /// Record that the DROPREQ covering `[first_seq, last_seq]` has actually
+    /// left the protocol for the transport, and advance
+    /// `justified_frontier` through whatever that newly justifies.
+    ///
+    /// Mirrors [`Self::note_data_submitted`]'s materialization boundary:
+    /// queuing a DROPREQ is not enough, for the same reason queuing DATA
+    /// is not enough -- a peer cannot have learned of either until it
+    /// actually crossed the wire. Bounded by the dropped message's own
+    /// fragment count (one DROPREQ range names one message), not by the
+    /// window.
+    pub(crate) fn note_dropreq_submitted(&mut self, first_seq: u32, last_seq: u32) {
+        let mut sequence = first_seq & SEQUENCE_MASK;
+        let last = last_seq & SEQUENCE_MASK;
+        loop {
+            if let Some(entry) = self.packets.get_mut(sequence) {
+                entry.drop_notified = true;
+            }
+            if sequence == last {
+                break;
+            }
+            sequence = sequence.wrapping_add(1) & SEQUENCE_MASK;
+        }
+        self.advance_justified_frontier();
     }
 
     pub(crate) fn synchronize_next_sequence_number(&mut self, sequence_number: u32) -> bool {
@@ -380,6 +460,7 @@ impl SenderBuffer {
         self.newest_submitted = None;
         self.dropreq_cursor = 0;
         self.live_submitted_count = 0;
+        self.justified_frontier = self.next_seq;
         true
     }
 
@@ -739,6 +820,7 @@ impl SenderBuffer {
         {
             self.newest_submitted = Some(sequence);
         }
+        self.advance_justified_frontier();
         let probe_submitted = self.rto.confirm_probe_submitted(sequence);
         if !self.rto.is_armed() {
             return RtoArm::Start;
@@ -1013,6 +1095,7 @@ impl SenderBuffer {
                     crypto_stamp: None,
                     dropped: false,
                     submitted: false,
+                    drop_notified: false,
                 },
             )
             .expect("alias-free live span checked by can_send");
@@ -1084,6 +1167,7 @@ impl SenderBuffer {
                         crypto_stamp: None,
                         dropped: false,
                         submitted: false,
+                        drop_notified: false,
                     },
                 )
                 .expect("alias-free live span checked by can_send");
@@ -1236,6 +1320,14 @@ impl SenderBuffer {
         }
 
         self.oldest_unacked = ack_seq;
+        // The frontier must never trail what the peer has just confirmed --
+        // the connection layer already rejects any ACK beyond it, so this is
+        // a consistency floor rather than a normal advance path (a resync
+        // that rebases `oldest_unacked` ahead of a stale `justified_frontier`
+        // is the one caller-reachable case).
+        if sequence_less_than(self.justified_frontier, self.oldest_unacked) {
+            self.justified_frontier = self.oldest_unacked;
+        }
         self.compact_stale_retransmits();
     }
 
@@ -1460,11 +1552,23 @@ impl SenderBuffer {
         if rtt_micros > 0 {
             // Smooth with EWMA: RTT = 7/8 * RTT + 1/8 * sample -- the same
             // estimator `SrtReceiver::handle_ackack` uses for its own raw
-            // samples.
-            self.sender_rtt_micros = (self.sender_rtt_micros * 7 / 8) + (rtt_micros / 8);
-            // RTTVar = 3/4 * RTTVar + 1/4 * |RTT - sample|
+            // samples. `rtt_micros` is an untrusted peer's raw `u32` ACK
+            // field (any value is wire-legal), and multiplying an already
+            // large smoothed estimate by 7 in `u32` can overflow -- a debug
+            // panic, or a silent wraparound in release that corrupts the RTO
+            // estimator with an artificially tiny value. Both terms are
+            // widened to `u64` before combining; the combined average of two
+            // `u32` values is always itself `<= u32::MAX`, so narrowing back
+            // is exact, never truncating.
+            let new_rtt = (7 * u64::from(self.sender_rtt_micros) + u64::from(rtt_micros)) / 8;
+            self.sender_rtt_micros =
+                u32::try_from(new_rtt).expect("EWMA average of two u32 values fits in u32");
+            // RTTVar = 3/4 * RTTVar + 1/4 * |RTT - sample|, same widening
+            // reasoning (`diff` is itself already bounded by `u32::MAX`).
             let diff = self.sender_rtt_micros.abs_diff(rtt_micros);
-            self.sender_rtt_var_micros = (self.sender_rtt_var_micros * 3 / 4) + (diff / 4);
+            let new_var = (3 * u64::from(self.sender_rtt_var_micros) + u64::from(diff)) / 4;
+            self.sender_rtt_var_micros =
+                u32::try_from(new_var).expect("EWMA average of two u32 values fits in u32");
         }
     }
 
@@ -2213,7 +2317,13 @@ mod tests {
         // bounded increase: both fix real correctness gaps (fair DROPREQ
         // service at full window size, and an RTO estimator that must not
         // keep treating a TLPKTDROP-tombstoned entry as outstanding flight).
-        assert!(inline_bytes <= 336);
+        // A third pass added `justified_frontier` (a `u32`): another
+        // deliberate, bounded increase fixing a real correctness gap (a
+        // cumulative ACK must be justified by contiguous submission or
+        // DROPREQ delivery, not merely by the highest sequence ever
+        // submitted, which TLPKTDROP purging a queued-but-unsubmitted DATA
+        // datagram could otherwise strand behind a hole).
+        assert!(inline_bytes <= 344);
         assert_eq!(window.heap_bytes(), 8_320);
     }
 
@@ -3401,6 +3511,41 @@ mod tests {
             (35_000..=45_000).contains(&converged),
             "converged={converged} must settle near 40 ms (20 ms RTT + 2x10 ms SYN, \
              variance driven toward 0 by the constant reported RTT)"
+        );
+    }
+
+    /// An untrusted peer's ACK RTT/RTTVar feedback is a raw `u32` field --
+    /// any value is wire-legal. Repeatedly feeding values near `u32::MAX`
+    /// must never overflow the EWMA arithmetic (a debug/Miri panic, or a
+    /// silent release-mode wraparound that corrupts the estimator with an
+    /// artificially tiny value), and the resulting RTO base timeout must
+    /// stay bounded by `MAX_RTO_MICROS` throughout.
+    #[test]
+    fn rtt_ewma_never_overflows_on_near_u32_max_peer_feedback() {
+        let mut buf = SenderBuffer::new(0, 64, 120);
+        for _ in 0..8 {
+            buf.record_peer_feedback(u32::MAX - 1, u32::MAX - 1, 60, 1_000, 2_000, 1_500_000);
+            let timeout = buf.rto_base_timeout_micros();
+            assert!(
+                timeout <= crate::sender_rto::MAX_RTO_MICROS,
+                "RTO base timeout {timeout} must stay bounded by MAX_RTO_MICROS"
+            );
+        }
+        assert!(
+            buf.rto_base_timeout_micros() >= 1_000_000,
+            "a near-u32::MAX RTT report must drive the estimate up, not wrap it to something tiny"
+        );
+
+        // A subsequent run of small, legitimate reports must still be able
+        // to pull the (now very large) estimate back down through the same
+        // overflow-safe arithmetic.
+        for _ in 0..200 {
+            buf.record_peer_feedback(20_000, 1_000, 60, 1_000, 2_000, 1_500_000);
+        }
+        let recovered = buf.rto_base_timeout_micros();
+        assert!(
+            recovered <= crate::sender_rto::MAX_RTO_MICROS,
+            "recovered={recovered} must still be bounded"
         );
     }
 }
