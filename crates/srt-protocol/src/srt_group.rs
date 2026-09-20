@@ -115,6 +115,31 @@ pub enum GroupEvent {
     },
 }
 
+/// A caller-side group leg whose handshake response carried a different
+/// *receiving group* identity than the group is bound to.
+///
+/// A bonded group has exactly one remote receiving group: the first member
+/// whose response carries a GROUP extension binds the group to that
+/// extension's group ID (the responder's mirror-group ID), and every later
+/// member must report the same ID. This is libsrt's own rule (`CUDT::
+/// interpretGroup`, `SRT_REJ_GROUP`: "group membership responded for peer
+/// $X but the current socket's group has already a peer $Y"). It is a
+/// property of the handshake, never of the destination address: several
+/// addresses can belong to one receiver, and one address never proves it.
+///
+/// This is a configuration fault, distinct from a leg that is merely
+/// unreachable or slow (which stays a normal degraded bond).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerGroupCollision {
+    /// The leg that answered from a different receiving group. It is marked
+    /// [`GroupMemberState::Broken`] and disconnected.
+    pub member_id: u32,
+    /// The receiving-group ID this group is bound to.
+    pub expected_peer_group_id: u32,
+    /// The receiving-group ID the leg reported.
+    pub actual_peer_group_id: u32,
+}
+
 /// One physical leg of an [`SrtGroup`]: a socket-level [`SrtConnection`] plus
 /// its group membership metadata.
 pub struct SrtGroupMember {
@@ -122,6 +147,10 @@ pub struct SrtGroupMember {
     weight: u16,
     state: GroupMemberState,
     connection: SrtConnection,
+    /// This member's receiving-group identity has been admitted (bound or
+    /// matched). Set once its handshake completes, whatever its state label:
+    /// a Backup leg is labelled Standby before it is connected.
+    peer_group_admitted: bool,
 }
 
 impl SrtGroupMember {
@@ -167,6 +196,12 @@ pub struct SrtGroup {
     pending: BTreeMap<u32, GroupPacket>,
     events: std::collections::VecDeque<GroupEvent>,
     next_event_member: usize,
+    /// The remote receiving group this group is bound to, set by the first
+    /// member whose handshake response carried a GROUP extension.
+    peer_group_id: Option<u32>,
+    /// Members that answered from another receiving group, awaiting
+    /// [`Self::poll_peer_group_collision`]. At most one per member.
+    collisions: std::collections::VecDeque<PeerGroupCollision>,
 }
 
 impl SrtGroup {
@@ -185,7 +220,58 @@ impl SrtGroup {
             pending: BTreeMap::new(),
             events: std::collections::VecDeque::new(),
             next_event_member: 0,
+            peer_group_id: None,
+            collisions: std::collections::VecDeque::new(),
         })
+    }
+
+    /// The remote receiving-group ID this group is bound to, once a member
+    /// whose response carried a GROUP extension has connected.
+    pub fn peer_group_id(&self) -> Option<u32> {
+        self.peer_group_id
+    }
+
+    /// Pop one peer-group collision. The offending member's connection is
+    /// disconnected now (it is already [`GroupMemberState::Broken`]), so the
+    /// remote receiver is told to drop the leg.
+    pub fn poll_peer_group_collision(&mut self, now: Timestamp) -> Option<PeerGroupCollision> {
+        let collision = self.collisions.pop_front()?;
+        if let Some(member) = self.member_mut(collision.member_id) {
+            member.connection.disconnect(now);
+        }
+        Some(collision)
+    }
+
+    /// Bind the group to, or check the member against, the remote receiving
+    /// group named by the member's handshake response. Returns `false` (and
+    /// records the collision) when the member reports a different one. A
+    /// response without a GROUP extension carries no identity and is not
+    /// checked, exactly as in libsrt.
+    fn admit_peer_group(&mut self, index: usize) -> bool {
+        self.members[index].peer_group_admitted = true;
+        let Some(actual) = self.members[index]
+            .connection
+            .peer_group_extension()
+            .map(|extension| extension.group_id)
+        else {
+            return true;
+        };
+        match self.peer_group_id {
+            None => {
+                self.peer_group_id = Some(actual);
+                true
+            }
+            Some(expected) if expected == actual => true,
+            Some(expected) => {
+                self.members[index].state = GroupMemberState::Broken;
+                self.collisions.push_back(PeerGroupCollision {
+                    member_id: self.members[index].id,
+                    expected_peer_group_id: expected,
+                    actual_peer_group_id: actual,
+                });
+                false
+            }
+        }
     }
 
     /// This group's ID, as carried on the wire.
@@ -248,12 +334,16 @@ impl SrtGroup {
             weight,
             state,
             connection,
+            peer_group_admitted: false,
         });
         // A pending leg has no sender buffer until its handshake completes.
         // `refresh_pending_states` aligns it at that transition; attempting
         // it here would reject a legitimate late-joining group member.
         if connected {
-            self.align_member_sequence(member_id)?;
+            let index = self.members.len() - 1;
+            if self.admit_peer_group(index) {
+                self.align_member_sequence(member_id)?;
+            }
         }
         Ok(())
     }
@@ -712,7 +802,22 @@ impl SrtGroup {
         }
     }
 
+    /// Admit the receiving-group identity of every member whose handshake has
+    /// completed since the last look, whatever its state label.
+    fn admit_connected_peer_groups(&mut self) {
+        for index in 0..self.members.len() {
+            let member = &self.members[index];
+            if !member.peer_group_admitted
+                && member.state != GroupMemberState::Broken
+                && member.connection.state() == ConnectionState::Connected
+            {
+                self.admit_peer_group(index);
+            }
+        }
+    }
+
     fn refresh_pending_states(&mut self) {
+        self.admit_connected_peer_groups();
         for index in 0..self.members.len() {
             let ready = {
                 let member = &self.members[index];

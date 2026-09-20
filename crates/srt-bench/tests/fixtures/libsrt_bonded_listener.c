@@ -32,7 +32,7 @@ static void report_members(SRTSOCKET group) {
     fputc('\n', stderr);
 }
 
-static int recv_payload(SRTSOCKET group, char* target) {
+static int recv_payload(SRTSOCKET group, char* target, int expected_members) {
     // The accepted mirror group gains later physical members asynchronously.
     // Allow a bounded 15-second delivery window for a loaded CI runner to
     // finish that attachment before declaring the logical stream absent.
@@ -46,8 +46,9 @@ static int recv_payload(SRTSOCKET group, char* target) {
         control.grpdata_size = 2;
         int length = srt_recvmsg2(group, target, SRT_LIVE_MAX_PLSIZE, &control);
         if (length > 0) {
-            if (control.grpdata_size != 2 || members[0].result == SRT_ERROR ||
-                members[1].result == SRT_ERROR) {
+            if (control.grpdata_size != (size_t)expected_members ||
+                members[0].result == SRT_ERROR ||
+                (expected_members == 2 && members[1].result == SRT_ERROR)) {
                 fprintf(stderr, "bonded receive did not retain both group members\n");
                 return -1;
             }
@@ -63,21 +64,30 @@ static int recv_payload(SRTSOCKET group, char* target) {
     return -1;
 }
 
-static int wait_for_two_connected_members(SRTSOCKET group) {
+static int wait_for_connected_members(SRTSOCKET group, size_t expected) {
     for (int attempt = 0; attempt < 1500; ++attempt) {
         SRT_SOCKGROUPDATA members[2];
         size_t count = 2;
         if (srt_group_data(group, members, &count) == SRT_ERROR) return -1;
-        if (count == 2 && members[0].sockstate == SRTS_CONNECTED &&
-            members[1].sockstate == SRTS_CONNECTED) return 0;
+        if (count == expected && members[0].sockstate == SRTS_CONNECTED &&
+            (expected == 1 || members[1].sockstate == SRTS_CONNECTED)) return 0;
         usleep(10 * 1000);
     }
     return -2;
 }
 
 int main(int argc, char** argv) {
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s <port>\n", argv[0]);
+    // The optional second argument is how many group members this listener
+    // expects (default 2: both legs land on this one listener; 1: an
+    // independent listener that receives a single leg of a multi-destination
+    // group).
+    if (argc != 2 && argc != 3) {
+        fprintf(stderr, "usage: %s <port> [expected-members 1|2]\n", argv[0]);
+        return 2;
+    }
+    int expected_members = argc == 3 ? atoi(argv[2]) : 2;
+    if (expected_members != 1 && expected_members != 2) {
+        fprintf(stderr, "expected-members must be 1 or 2\n");
         return 2;
     }
     if (srt_startup() == SRT_ERROR) return fail("srt_startup");
@@ -157,13 +167,13 @@ int main(int argc, char** argv) {
     // `srt_accept` creates the mirror group after its first leg. A member can
     // appear in group metadata before its data path is connected, so wait for
     // both background links to become usable before consuming the stream.
-    int member_status = wait_for_two_connected_members(group);
+    int member_status = wait_for_connected_members(group, (size_t)expected_members);
     if (member_status != 0) {
         int result;
         if (member_status == -1) {
             result = fail("srt_group_data");
         } else {
-            fprintf(stderr, "mirror group did not connect two members\n");
+            fprintf(stderr, "mirror group did not connect the expected members\n");
             result = 1;
         }
         srt_close(group);
@@ -176,7 +186,7 @@ int main(int argc, char** argv) {
     // libsrt validates the receive buffer against the live-mode maximum
     // payload size, not against the particular packet currently queued.
     char payload[SRT_LIVE_MAX_PLSIZE];
-    int payload_len = recv_payload(group, payload);
+    int payload_len = recv_payload(group, payload, expected_members);
     if (payload_len <= 0) {
         report_members(group);
         int result = fail("srt_recvmsg2");

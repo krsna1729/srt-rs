@@ -94,6 +94,7 @@ Implemented and verified against the installed libsrt 1.5.3 package:
 | H. Wrong-passphrase rejection + reason propagation | ✔ `rust_live_caller_wrong_passphrase_is_rejected_by_libsrt_listener` and `libsrt_live_caller_wrong_passphrase_is_rejected_by_rust_listener` | automated in both directions (matching-passphrase AES-128 tests are the positive controls) |
 | I. StreamID propagation and authorization | ✔ propagation plus `libsrt_caller_obeys_rust_stream_id_policy` | automated; real libsrt caller is both accepted and rejected by the Rust listener policy |
 | K. Broadcast bonding | ✔ `libsrt_broadcast_group_interoperates_with_rust_listener` and `rust_broadcast_group_interoperates_with_libsrt_listener` | automated in the bonding-enabled Debian sid image; both group-caller directions establish two physical legs and deliver one logical payload |
+| K2. Bonding topology (one receiving group) | ✔ `libsrt_group_to_independent_receivers_is_rejected_with_a_group_collision`, `libsrt_group_to_one_receiver_with_two_endpoints_forms_one_group`, `compio_owner_bond_to_one_libsrt_receiver_with_two_endpoints_passes`, `compio_owner_bond_to_independent_libsrt_receivers_reports_a_peer_group_collision` | a bonded caller group has exactly ONE remote receiving group. libsrt pins the first responder's mirror-group ID and rejects a later leg naming another with `SRT_REJ_GROUP`; distinct addresses/ports of one receiver process are valid legs, two independent receivers are not. srt-rs enforces the same identity (`SrtGroup::peer_group_id`, `PeerGroupCollision`, `CallerGroupFault`) |
 | L. INPUTBW/OHEADBW | ✔ `rust_input_bandwidth_caller_sends_stream_to_libsrt_listener` and `libsrt_input_bandwidth_caller_sends_stream_to_rust_listener` | automated byte-exact live delivery in both directions; the exact source-rate plus overhead pacing calculation is unit-tested |
 
 ### Helper status
@@ -111,7 +112,14 @@ Implemented and verified against the installed libsrt 1.5.3 package:
    NAK rather than an ambiguous end-of-stream gap.
 4. Binary discovery stays `command_available` on PATH — no build-directory
    probing.
-5. `libsrt_bonded_caller.c` and `libsrt_bonded_listener.c` are intentionally
+5. `libsrt_bonded_multiport_listener.c` is the one-receiver/two-endpoint
+   control: a single libsrt process listening on two UDP ports, which is how
+   bonding spans network paths. Keep it: it stops a future change from equating
+   "different endpoint" with "different receiver". `libsrt_bonded_caller.c`
+   takes an optional second `host port` pair and exits 3 when libsrt rejects a
+   leg with `SRT_REJ_GROUP`; `libsrt_bonded_listener.c` takes an optional
+   expected-member count (1 = an independent single-leg receiver).
+   `libsrt_bonded_caller.c` and `libsrt_bonded_listener.c` are intentionally
    small C fixtures over libsrt's public group API. `srt-live-transmit` exposes `groupconnect`, but its
    single-client listener closes its accept socket after the first connection,
    so it cannot serve as the independent two-leg group peer this test needs.

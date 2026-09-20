@@ -142,9 +142,10 @@ pub mod advanced {
     /// Runtime-neutral caller owners and logical egress handles.
     pub mod caller {
         pub use super::super::caller::{
-            CallerEvent, CallerGroupLeg, CallerLeg, CallerTable, DEFAULT_MAX_CALLERS,
-            LogicalCaller, LogicalCallerId, LogicalCallerMut, LogicalCallerState,
-            LogicalCallerStats, MAX_CALLERS, RemovedCallerLeg, RemovedLogicalCaller,
+            CallerEvent, CallerGroupFault, CallerGroupLeg, CallerLeg, CallerTable,
+            DEFAULT_MAX_CALLERS, LogicalCaller, LogicalCallerId, LogicalCallerMut,
+            LogicalCallerState, LogicalCallerStats, MAX_CALLERS, RemovedCallerLeg,
+            RemovedLogicalCaller,
         };
         pub use super::super::caller_pool::{
             CallerPool, CallerPoolStats, MAX_CALLER_POOL_IN_FLIGHT, MAX_CALLER_POOL_QUEUE,
@@ -284,9 +285,9 @@ pub(crate) use batch::{
 };
 #[allow(unused_imports)]
 pub(crate) use caller::{
-    CallerEvent, CallerGroupLeg, CallerLeg, CallerTable, DEFAULT_MAX_CALLERS, LogicalCaller,
-    LogicalCallerId, LogicalCallerMut, LogicalCallerState, LogicalCallerStats, MAX_CALLERS,
-    RemovedCallerLeg, RemovedLogicalCaller,
+    CallerEvent, CallerGroupFault, CallerGroupLeg, CallerLeg, CallerTable, DEFAULT_MAX_CALLERS,
+    LogicalCaller, LogicalCallerId, LogicalCallerMut, LogicalCallerState, LogicalCallerStats,
+    MAX_CALLERS, RemovedCallerLeg, RemovedLogicalCaller,
 };
 #[allow(unused_imports)]
 pub(crate) use caller_pool::{
