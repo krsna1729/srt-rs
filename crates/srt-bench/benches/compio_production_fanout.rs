@@ -150,19 +150,19 @@ fn run_fanout_case(fanout: usize, duration_ms: u64) -> FanoutMetrics {
         // before the first connect() so all legs handshake in parallel rather
         // than being queued behind the first. Owner::connect creates the
         // caller socket lazily on the first call when no explicit caller side
-        // is pre-attached, so set_caller_pool_policy succeeds here.
+        // is pre-attached, so set_caller_pool_capacity succeeds here.
         owner
-            .set_caller_pool_policy(
+            .set_caller_pool_capacity(
                 std::num::NonZeroUsize::new(fanout.clamp(1, 2048)).expect("nonzero fanout"),
-                std::time::Duration::from_secs(30),
             )
-            .expect("pool policy before first connect");
+            .expect("pool capacity before first connect");
 
         let mut now = Timestamp::from_micros(10_000);
         let mut dest_ids = Vec::with_capacity(fanout);
         for _i in 0..fanout {
             let cfg = srt_transport::CallerConfig::builder(l_addr)
                 .ownership(srt_transport::SocketOwnership::Shared)
+                .connect_deadline(std::time::Duration::from_secs(30))
                 .configure_session(|s| {
                     s.handshake.timeout = std::time::Duration::from_secs(30);
                 })
@@ -184,6 +184,7 @@ fn run_fanout_case(fanout: usize, duration_ms: u64) -> FanoutMetrics {
             max_rx_packets: 1024,
             max_rx_bytes: 2 * 1024 * 1024,
             max_actions: 1024,
+            max_maintenance_actions: 1024,
             max_tx_packets: 1024,
             max_tx_bytes: 2 * 1024 * 1024,
         };
@@ -307,6 +308,7 @@ fn run_fanout_case(fanout: usize, duration_ms: u64) -> FanoutMetrics {
             max_rx_packets: 4096,
             max_rx_bytes: 8 * 1024 * 1024,
             max_actions: 4096,
+            max_maintenance_actions: 4096,
             max_tx_packets: 0,
             max_tx_bytes: 0,
         };

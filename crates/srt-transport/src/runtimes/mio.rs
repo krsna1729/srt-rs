@@ -230,8 +230,9 @@ struct OwnerCallerSide {
 /// dynamic runtime abstraction, and the async-runtime readiness/completion
 /// cancellation cards (S04/S05) do not gate this independent path.
 ///
-/// Caller concurrency and attempt deadlines come from the first caller's
-/// `ConnectConfig`, unless explicitly overridden before connecting. Each
+/// Caller pool capacity comes from the first caller's `ConnectConfig`, unless
+/// overridden with [`Owner::set_caller_pool_capacity`]; each caller keeps its
+/// own attempt deadline. Each
 /// socket visit has finite receive, output and event budgets. Readiness
 /// continuations survive budget exhaustion, including Mio's edge-triggered
 /// receive path. A socket blocked on output waits for writable readiness.
@@ -240,7 +241,7 @@ pub struct Owner {
     events: mio::Events,
     listener: Option<OwnerListenerSide>,
     caller: Option<OwnerCallerSide>,
-    caller_pool_policy: Option<(std::num::NonZeroUsize, Duration)>,
+    caller_pool_capacity: Option<std::num::NonZeroUsize>,
     socket_memory_budget: Option<std::num::NonZeroUsize>,
 }
 
@@ -251,32 +252,29 @@ impl Owner {
             events: mio::Events::with_capacity(1024),
             listener: None,
             caller: None,
-            caller_pool_policy: None,
+            caller_pool_capacity: None,
             socket_memory_budget: None,
         })
     }
 
-    /// Override the first caller's pool policy before binding the caller socket.
-    pub fn set_caller_pool_policy(
+    /// Set the shared caller pool CAPACITY (`max_in_flight`): how many
+    /// handshakes this owner may have in flight at once. It is a resource
+    /// bound for the whole owner and does not touch any request's
+    /// `attempt_deadline`, which stays each logical caller's own
+    /// `CallerConfig.connect.attempt_deadline` (its clock starts at admission,
+    /// never while queued). Must be called before the first connect.
+    pub fn set_caller_pool_capacity(
         &mut self,
         max_in_flight: std::num::NonZeroUsize,
-        attempt_deadline: Duration,
     ) -> Result<(), crate::RuntimeBuildError> {
         if self.caller.is_some() {
             return Err(crate::RuntimeBuildError::from(crate::ConfigError::new(
-                "caller_pool_policy",
+                "caller_pool_capacity",
                 "must be set before the first connect() call, not after the caller \
                  socket and its pool already exist",
             )));
         }
-        if attempt_deadline.is_zero() {
-            return Err(crate::ConfigError::new(
-                "caller_pool_policy",
-                "attempt deadline must be positive",
-            )
-            .into());
-        }
-        self.caller_pool_policy = Some((max_in_flight, attempt_deadline));
+        self.caller_pool_capacity = Some(max_in_flight);
         Ok(())
     }
 
@@ -392,9 +390,8 @@ impl Owner {
         now: Timestamp,
     ) -> Result<crate::PoolOutcome, crate::RuntimeBuildError> {
         let mut prepared = config.prepare(crate::RuntimeFlavor::Mio)?;
-        if let Some((max_in_flight, attempt_deadline)) = self.caller_pool_policy {
+        if let Some(max_in_flight) = self.caller_pool_capacity {
             prepared.connect.max_in_flight = max_in_flight;
-            prepared.connect.attempt_deadline = attempt_deadline;
         }
         if prepared.transport.exclusive {
             return Err(crate::RuntimeBuildError::from(crate::ConfigError::new(
@@ -448,13 +445,10 @@ impl Owner {
                 OWNER_CALLER_TOKEN,
                 mio::Interest::READABLE,
             )?;
-            let crate::ConnectConfig {
-                max_in_flight,
-                attempt_deadline,
-            } = prepared.connect;
+            let max_in_flight = prepared.connect.max_in_flight;
             self.caller = Some(OwnerCallerSide {
                 socket,
-                callers: crate::CallerPool::new(max_in_flight, attempt_deadline),
+                callers: crate::CallerPool::new(max_in_flight),
                 recv_batch: crate::RecvBatch::with_capacity(
                     prepared.transport.recv_batch_capacity(),
                     crate::RecvBatch::DEFAULT_BUF_LEN,
@@ -1151,7 +1145,7 @@ mod owner_tests {
         let start = std::time::Instant::now();
         let mut owner = Owner::new().expect("owner builds");
         owner
-            .set_caller_pool_policy(NonZeroUsize::new(2).unwrap(), Duration::from_secs(5))
+            .set_caller_pool_capacity(NonZeroUsize::new(2).unwrap())
             .unwrap();
         owner.listen(&listener_config()).expect("listen");
         let listen_addr = owner.listener_local_addr().expect("listener bound");
@@ -1343,7 +1337,7 @@ mod owner_tests {
     /// A04, Opus review's judgment call: `CallerPool`'s max_in_flight/
     /// attempt_deadline enforcement must be reachable through the one
     /// driver this crate ships, not merely usable as a standalone library
-    /// type nothing ever exercises. `set_caller_pool_policy` bounds
+    /// type nothing ever exercises. `set_caller_pool_capacity` bounds
     /// `Owner::connect` to one in-flight attempt; a second request must
     /// queue, and once the first attempt (pointed at an address nothing is
     /// listening on, so its handshake can never complete) misses its
@@ -1351,17 +1345,18 @@ mod owner_tests {
     /// through the exact same `connect`/`drive` calls every other `Owner`
     /// test uses, with no separate opt-out code path.
     #[test]
-    fn set_caller_pool_policy_bounds_and_enforces_owner_connect() {
+    fn pool_capacity_bounds_and_request_deadline_expires_owner_connect() {
         let start = std::time::Instant::now();
         let mut owner = Owner::new().expect("owner builds");
         owner
-            .set_caller_pool_policy(NonZeroUsize::new(1).unwrap(), Duration::from_millis(50))
-            .expect("policy set before any connect() call");
+            .set_caller_pool_capacity(NonZeroUsize::new(1).unwrap())
+            .expect("capacity set before any connect() call");
 
         // Nothing listens here; the handshake can never complete on its own.
         let dead_end: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let config = crate::CallerConfig::builder(dead_end)
             .ownership(SocketOwnership::Shared)
+            .connect_deadline(Duration::from_millis(50))
             .build()
             .expect("caller config");
 

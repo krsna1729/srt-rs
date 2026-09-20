@@ -1432,19 +1432,11 @@ impl OwnerCallerSide {
     pub fn new(
         sock: compio::net::UdpSocket,
         max_in_flight: std::num::NonZeroUsize,
-        attempt_deadline: std::time::Duration,
         transport: crate::ResolvedTransportConfig,
         local_bind: Option<std::net::SocketAddr>,
         connect_config: crate::ConnectConfig,
     ) -> Result<Self, crate::RuntimeBuildError> {
-        Self::from_parts(
-            sock,
-            max_in_flight,
-            attempt_deadline,
-            transport,
-            local_bind,
-            connect_config,
-        )
+        Self::from_parts(sock, max_in_flight, transport, local_bind, connect_config)
     }
 
     /// Production construction path, reached only through [`Owner::connect`]
@@ -1453,7 +1445,6 @@ impl OwnerCallerSide {
     pub(crate) fn from_parts(
         sock: compio::net::UdpSocket,
         max_in_flight: std::num::NonZeroUsize,
-        attempt_deadline: std::time::Duration,
         transport: crate::ResolvedTransportConfig,
         local_bind: Option<std::net::SocketAddr>,
         connect_config: crate::ConnectConfig,
@@ -1461,7 +1452,6 @@ impl OwnerCallerSide {
         Self::from_parts_with_rx_mode(
             sock,
             max_in_flight,
-            attempt_deadline,
             transport,
             local_bind,
             connect_config,
@@ -1476,7 +1466,6 @@ impl OwnerCallerSide {
     pub(crate) fn from_parts_with_rx_mode(
         sock: compio::net::UdpSocket,
         max_in_flight: std::num::NonZeroUsize,
-        attempt_deadline: std::time::Duration,
         transport: crate::ResolvedTransportConfig,
         local_bind: Option<std::net::SocketAddr>,
         connect_config: crate::ConnectConfig,
@@ -1487,7 +1476,7 @@ impl OwnerCallerSide {
         let sock = Rc::new(sock);
         let mut side = Self {
             sock,
-            pool: crate::CallerPool::new(max_in_flight, attempt_deadline),
+            pool: crate::CallerPool::new(max_in_flight),
             transport,
             local_bind,
             connect_config,
@@ -1553,10 +1542,7 @@ impl OwnerCallerSide {
         Self {
             sock: Rc::new(sock),
             rx: SideRx::raw(),
-            pool: crate::CallerPool::new(
-                std::num::NonZeroUsize::MIN,
-                std::time::Duration::from_secs(5),
-            ),
+            pool: crate::CallerPool::new(std::num::NonZeroUsize::MIN),
             transport,
             local_bind: None,
             connect_config: crate::ConnectConfig::default(),
@@ -2530,12 +2516,25 @@ impl OwnerTxSink<'_> {
 }
 
 /// Bounded work budget for one [`Owner::service`] visit.
+///
+/// Lifecycle maintenance and protocol TX have INDEPENDENT finite axes, so
+/// neither can consume the other's allowance: maintenance (caller-pool
+/// resolution, expiry and queued admission, listener idle reclaim) is bounded
+/// by `max_maintenance_actions` alone, and protocol output by `max_actions`
+/// (output actions) together with `max_tx_packets`/`max_tx_bytes`. A small
+/// fixed budget is correct at any fan-out: no capacity-derived multiplier is
+/// ever needed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OwnerServiceBudget {
     pub max_completions: usize,
     pub max_rx_packets: usize,
     pub max_rx_bytes: usize,
+    /// Protocol output (TX) actions per visit. Maintenance does not draw on it.
     pub max_actions: usize,
+    /// Lifecycle maintenance actions per visit. Each unit is real work (a
+    /// resolved attempt released, a due attempt expired, a queued request
+    /// admitted, an idle peer reclaimed); a future unresolved attempt is free.
+    pub max_maintenance_actions: usize,
     pub max_tx_packets: usize,
     pub max_tx_bytes: usize,
 }
@@ -2547,6 +2546,7 @@ impl Default for OwnerServiceBudget {
             max_rx_packets: 256,
             max_rx_bytes: 512 * 1024,
             max_actions: 512,
+            max_maintenance_actions: 256,
             max_tx_packets: 256,
             max_tx_bytes: 512 * 1024,
         }
@@ -2924,7 +2924,12 @@ pub struct OwnerServiceReport {
     pub rx_bytes: usize,
     pub tx_packets_submitted: usize,
     pub tx_bytes_submitted: usize,
+    /// Protocol output (TX) actions taken this visit, against
+    /// [`OwnerServiceBudget::max_actions`].
     pub actions: usize,
+    /// Lifecycle maintenance actions taken this visit, against
+    /// [`OwnerServiceBudget::max_maintenance_actions`].
+    pub maintenance_actions: usize,
     pub tx_in_flight: usize,
     pub tx_pool_free: usize,
     pub work_remaining: bool,
@@ -2968,7 +2973,8 @@ pub struct Owner {
     sessions_started: bool,
     rx_priority_listener_first: bool,
     tx_priority_listener_first: bool,
-    caller_pool_policy: Option<(std::num::NonZeroUsize, std::time::Duration)>,
+    maintenance_priority_listener_first: bool,
+    caller_pool_capacity: Option<std::num::NonZeroUsize>,
     socket_memory_budget: Option<std::num::NonZeroUsize>,
     /// How attach resolves the receive datapath.
     rx_mode_policy: RxModePolicy,
@@ -3007,7 +3013,8 @@ impl Owner {
             sessions_started: false,
             rx_priority_listener_first: true,
             tx_priority_listener_first: true,
-            caller_pool_policy: None,
+            maintenance_priority_listener_first: true,
+            caller_pool_capacity: None,
             socket_memory_budget: None,
             rx_mode_policy: RxModePolicy::default(),
             rx_mode: None,
@@ -3379,28 +3386,24 @@ impl Owner {
         Some(self.caller.as_mut()?.pool.bench_table_mut())
     }
 
-    /// Set the caller-side `max_in_flight`/`attempt_deadline` policy. Must be
-    /// called before the first [`Self::connect`] call.
-    pub fn set_caller_pool_policy(
+    /// Set the shared caller pool CAPACITY (`max_in_flight`): how many
+    /// handshakes this Owner may have in flight at once. It is a resource
+    /// bound for the whole Owner and never touches a request's
+    /// `attempt_deadline`, which stays each logical caller's own
+    /// `CallerConfig.connect.attempt_deadline` (clock starts at admission,
+    /// never while queued). Must be called before the first [`Self::connect`].
+    pub fn set_caller_pool_capacity(
         &mut self,
         max_in_flight: std::num::NonZeroUsize,
-        attempt_deadline: std::time::Duration,
     ) -> Result<(), crate::RuntimeBuildError> {
         if self.caller.is_some() {
             return Err(crate::RuntimeBuildError::from(crate::ConfigError::new(
-                "caller_pool_policy",
+                "caller_pool_capacity",
                 "must be set before the first connect() call, not after the caller \
                  socket and its pool already exist",
             )));
         }
-        if attempt_deadline.is_zero() {
-            return Err(crate::ConfigError::new(
-                "caller_pool_policy",
-                "attempt deadline must be positive",
-            )
-            .into());
-        }
-        self.caller_pool_policy = Some((max_in_flight, attempt_deadline));
+        self.caller_pool_capacity = Some(max_in_flight);
         Ok(())
     }
 
@@ -3636,9 +3639,8 @@ impl Owner {
                 ),
             )));
         }
-        if let Some((max_in_flight, attempt_deadline)) = self.caller_pool_policy {
+        if let Some(max_in_flight) = self.caller_pool_capacity {
             prepared.connect.max_in_flight = max_in_flight;
-            prepared.connect.attempt_deadline = attempt_deadline;
         }
         if prepared.transport.exclusive {
             return Err(crate::RuntimeBuildError::from(crate::ConfigError::new(
@@ -3730,16 +3732,12 @@ impl Owner {
             }
         }
         let sock = compio::net::UdpSocket::from_std(prepared.bind_socket()?)?;
-        let crate::ConnectConfig {
-            max_in_flight,
-            attempt_deadline,
-        } = prepared.connect;
+        let max_in_flight = prepared.connect.max_in_flight;
         let rx_mode = self.resolve_rx_mode("caller.connect.rx_mode")?;
         let slot_len = managed_rx_buffer_len(self.wire_ceiling);
         let side = OwnerCallerSide::from_parts_with_rx_mode(
             sock,
             max_in_flight,
-            attempt_deadline,
             prepared.transport,
             prepared.local_bind,
             prepared.connect,
@@ -4019,7 +4017,8 @@ impl Owner {
             || report.rx_bytes >= budget.max_rx_bytes
             || report.tx_packets_submitted >= budget.max_tx_packets
             || report.tx_bytes_submitted >= budget.max_tx_bytes
-            || report.actions >= budget.max_actions;
+            || report.actions >= budget.max_actions
+            || report.maintenance_actions >= budget.max_maintenance_actions;
     }
 
     /// Wait until the proactor reports activity or `timeout` elapses. This is
@@ -4407,40 +4406,57 @@ impl Owner {
         )
     }
 
-    /// Lifecycle maintenance, bounded by `max_actions` ALONE.
+    /// Lifecycle maintenance, bounded by `max_maintenance_actions` ALONE.
     ///
-    /// Caller connection-attempt expiration and listener idle reclaim are
-    /// lifecycle work, not packet/byte transport work: a shard that grants
-    /// zero TX packets or bytes this visit (a pacing-limited or drain-only
-    /// visit) must still retire expired attempts and quiet peers, or those
-    /// timers would only ever run when output happened to be admissible.
+    /// Caller connection-attempt resolution/expiry/admission and listener
+    /// idle reclaim are lifecycle work, not packet/byte transport work, and
+    /// they have their own finite axis: a visit that grants zero TX must still
+    /// retire expired attempts and quiet peers, and maintenance can never eat
+    /// the TX allowance. Only real work is charged -- a future, unresolved
+    /// attempt costs nothing.
     fn service_maintenance(
         &mut self,
         now: Timestamp,
         budget: &OwnerServiceBudget,
         report: &mut OwnerServiceReport,
     ) {
-        let mut allowed = budget.max_actions.saturating_sub(report.actions);
-        if allowed == 0 {
-            return;
+        // Alternate which side gets first access to the finite allowance each
+        // visit, like RX and TX do, so continuously runnable caller-pool
+        // maintenance can never postpone listener idle reclaim (or the
+        // reverse). No reserved split: an uncontended side may use it all.
+        self.maintenance_priority_listener_first = !self.maintenance_priority_listener_first;
+        let first_listener = self.maintenance_priority_listener_first;
+        let mut allowed = budget.max_maintenance_actions;
+        for second in [false, true] {
+            if allowed == 0 {
+                return;
+            }
+            let used = if first_listener != second {
+                self.maintain_listener(now, allowed)
+            } else {
+                self.maintain_caller(now, allowed)
+            };
+            report.maintenance_actions = report.maintenance_actions.saturating_add(used);
+            allowed = allowed.saturating_sub(used);
         }
-        if let Some(caller) = self.caller.as_mut() {
-            // Count-only: the Owner needs the visit count, not the retired
-            // ids (those are surfaced as `PoolEvent`s), so this does not
-            // allocate a Vec per maintenance visit.
-            let visits = caller.pool.poll_expirations_count_only(now, allowed);
-            report.actions = report.actions.saturating_add(visits);
-            allowed = allowed.saturating_sub(visits);
-        }
-        if allowed > 0
-            && let Some(listener) = self.listener.as_mut()
-        {
-            let (_, visits) =
-                listener
-                    .table
-                    .prune_idle_bounded_with_visits(now, listener.idle_timeout, allowed);
-            report.actions = report.actions.saturating_add(visits);
-        }
+    }
+
+    /// Caller-pool maintenance: no retired-id vector (the Owner surfaces
+    /// retired sessions through the `PoolEvent`s it already drains), so this
+    /// allocates nothing.
+    fn maintain_caller(&mut self, now: Timestamp, allowed: usize) -> usize {
+        self.caller.as_mut().map_or(0, |caller| {
+            caller.pool.maintain(now, allowed, None).actions()
+        })
+    }
+
+    fn maintain_listener(&mut self, now: Timestamp, allowed: usize) -> usize {
+        self.listener.as_mut().map_or(0, |listener| {
+            listener
+                .table
+                .prune_idle_bounded_with_visits(now, listener.idle_timeout, allowed)
+                .1
+        })
     }
 
     fn service_tx_listener(
@@ -4537,10 +4553,16 @@ impl Owner {
     #[must_use]
     pub fn has_pending_work(&self, now: Timestamp) -> bool {
         let l_pending = self.listener.as_ref().is_some_and(|l| {
-            l.pending_rx.is_some() || l.rx.pending() || l.table.has_pending_output(now)
+            l.pending_rx.is_some()
+                || l.rx.pending()
+                || l.table.has_pending_output(now)
+                || l.table.has_idle_due(now, l.idle_timeout)
         });
         let c_pending = self.caller.as_ref().is_some_and(|c| {
-            c.pending_rx.is_some() || c.rx.pending() || c.pool.table().has_pending_output(now)
+            c.pending_rx.is_some()
+                || c.rx.pending()
+                || c.pool.table().has_pending_output(now)
+                || c.pool.has_pending_work(now)
         });
         l_pending || c_pending
     }
@@ -4549,6 +4571,10 @@ impl Owner {
 #[cfg(test)]
 #[path = "compio_bonded_tests.rs"]
 mod bonded_tests;
+
+#[cfg(test)]
+#[path = "compio_pool_tests.rs"]
+mod pool_tests;
 
 #[cfg(test)]
 mod tests {
@@ -5729,11 +5755,8 @@ mod tests {
         runtime.block_on(async {
             let mut owner = Owner::new(16);
             owner
-                .set_caller_pool_policy(
-                    std::num::NonZeroUsize::new(1).unwrap(),
-                    std::time::Duration::from_secs(10),
-                )
-                .expect("policy set");
+                .set_caller_pool_capacity(std::num::NonZeroUsize::new(1).unwrap())
+                .expect("capacity set");
 
             let remote_a: SocketAddr = "127.0.0.1:19001".parse().unwrap();
             let remote_b: SocketAddr = "127.0.0.1:19002".parse().unwrap();
@@ -5796,15 +5819,13 @@ mod tests {
         runtime.block_on(async {
             let mut owner = Owner::new(16);
             owner
-                .set_caller_pool_policy(
-                    std::num::NonZeroUsize::new(1).unwrap(),
-                    std::time::Duration::from_millis(10),
-                )
-                .expect("policy set");
+                .set_caller_pool_capacity(std::num::NonZeroUsize::new(1).unwrap())
+                .expect("capacity set");
 
             let remote: SocketAddr = "127.0.0.1:19001".parse().unwrap();
             let cfg = crate::CallerConfig::builder(remote)
                 .ownership(crate::SocketOwnership::Shared)
+                .connect_deadline(std::time::Duration::from_millis(10))
                 .build()
                 .expect("config");
             // Attempt admitted at t=0 with a 10ms attempt deadline; the
@@ -7001,15 +7022,18 @@ mod tests {
                 "an idle owner still reports no runnable work"
             );
 
-            // Zero ACTION allowance still performs zero maintenance.
+            // Zero output-action allowance performs zero TX actions, and a zero
+            // maintenance allowance performs zero maintenance: independent axes.
             let no_actions = OwnerServiceBudget {
                 max_actions: 0,
+                max_maintenance_actions: 0,
                 ..Default::default()
             };
             let report = owner
                 .service(Timestamp::from_micros(2_000), no_actions)
                 .await;
             assert_eq!(report.actions, 0, "zero action budget must do zero work");
+            assert_eq!(report.maintenance_actions, 0, "zero maintenance budget");
         });
     }
 
@@ -7017,10 +7041,7 @@ mod tests {
     /// retired-id vector the Owner immediately discards.
     #[test]
     fn count_only_caller_maintenance_matches_visits() {
-        let mut pool = crate::CallerPool::new(
-            std::num::NonZeroUsize::new(4).expect("nonzero"),
-            std::time::Duration::from_secs(5),
-        );
+        let mut pool = crate::CallerPool::new(std::num::NonZeroUsize::new(4).expect("nonzero"));
         let remote: std::net::SocketAddr = "127.0.0.1:19000".parse().expect("addr");
         let cfg = crate::CallerConfig::builder(remote)
             .ownership(crate::SocketOwnership::Shared)
@@ -7037,8 +7058,8 @@ mod tests {
         // Long past every attempt deadline: all four are retired by one
         // bounded, count-only pass.
         let later = Timestamp::from_micros(60_000_000);
-        let visits = pool.poll_expirations_count_only(later, 16);
-        assert!(visits > 0, "expired attempts must be visited");
+        let visits = pool.maintain(later, 16, None).actions();
+        assert!(visits > 0, "expired attempts must be retired");
         assert_eq!(
             pool.stats().in_flight,
             0,
@@ -7318,6 +7339,7 @@ mod tests {
             let now = Timestamp::from_micros(1_000);
             let budget = OwnerServiceBudget {
                 max_actions: 0,
+                max_maintenance_actions: 0,
                 max_completions: 0,
                 max_rx_packets: 0,
                 max_rx_bytes: 0,
@@ -7557,6 +7579,7 @@ mod tests {
             );
             let zero = OwnerServiceBudget {
                 max_actions: 0,
+                max_maintenance_actions: 0,
                 max_completions: 0,
                 max_rx_packets: 0,
                 max_rx_bytes: 0,

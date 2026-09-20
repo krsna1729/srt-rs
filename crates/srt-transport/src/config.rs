@@ -2056,6 +2056,15 @@ impl CallerBuilder {
         self
     }
 
+    /// This caller's own connect attempt deadline: how long, once ADMITTED
+    /// (queue wait never counts), it may spend establishing before it is
+    /// retired. Independent of any shared pool capacity.
+    #[must_use]
+    pub fn connect_deadline(mut self, attempt_deadline: Duration) -> Self {
+        self.config.connect.attempt_deadline = attempt_deadline;
+        self
+    }
+
     #[must_use]
     pub fn profile(mut self, profile: TransportProfile) -> Self {
         self.config.transport.apply_profile(profile);
@@ -2261,6 +2270,19 @@ impl BondedCallerConfig {
             srt_proto::GroupMode::from_group_type(self.group.group_type).ok_or_else(|| {
                 ConfigError::new("bonded.group.group_type", "must be Broadcast or Backup")
             })?;
+        // A bonded logical caller is ONE connect request: one attempt
+        // deadline. Refuse legs that disagree rather than pick one.
+        let attempt_deadline = self.legs[0].caller.connect.attempt_deadline;
+        if let Some(index) = self
+            .legs
+            .iter()
+            .position(|leg| leg.caller.connect.attempt_deadline != attempt_deadline)
+        {
+            return Err(ConfigError::new(
+                "bonded.legs.connect.attempt_deadline",
+                format!("leg {index} differs from leg 0; a bonded caller has one attempt deadline"),
+            ));
+        }
         let initial_seq = self.legs[0].caller.session.clone().ensure_initial_seq()?;
         let mut legs = Vec::with_capacity(self.legs.len());
         for (index, leg) in self.legs.iter().enumerate() {
@@ -2358,12 +2380,15 @@ impl PreparedCaller {
                 "shared callers must use the same resolved transport settings",
             ));
         }
+        // Only the shared pool CAPACITY must agree: `max_in_flight` bounds one
+        // pool that every caller on the socket joins. `attempt_deadline` is
+        // each request's own policy and may differ freely.
         if let Some(connect) = connect
-            && self.connect != connect
+            && self.connect.max_in_flight != connect.max_in_flight
         {
             return Err(ConfigError::new(
-                "caller.connect",
-                "shared callers must use the same connect policy",
+                "caller.connect.max_in_flight",
+                "shared callers must use the same connect concurrency (pool capacity)",
             ));
         }
         Ok(())

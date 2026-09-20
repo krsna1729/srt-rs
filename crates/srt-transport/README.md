@@ -416,8 +416,10 @@ that owns the half-open peer performs credential resolution.
 
 The ten reusable benchmark controls are represented: latency, bandwidth,
 group/bond metadata, promotion, cookie routing, socket buffers, ingress
-topology, receive batching, workers, and caller-pool concurrency. The 15-second
-attempt deadline and bounded output drain are advanced controls. CPU affinity,
+topology, receive batching, workers, and caller-pool concurrency (shared pool
+capacity, set per owner). The per-request connect attempt deadline
+(`CallerBuilder::connect_deadline`, 15 s by default, running from admission and
+never while queued) and the bounded output drain are advanced controls. CPU affinity,
 connection count/workload generation, link impairment, run duration,
 repetitions, and result paths remain application/deployment concerns.
 

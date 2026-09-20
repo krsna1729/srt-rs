@@ -2213,6 +2213,18 @@ impl PeerTable {
             .0
     }
 
+    /// Whether idle-peer maintenance has runnable work at `now`: the earliest
+    /// indexed idle deadline has passed. O(1), no peer scan; a stale index head
+    /// can only over-report, which the next bounded prune clears.
+    #[must_use]
+    pub fn has_idle_due(&self, now: Timestamp, idle_timeout: Duration) -> bool {
+        self.idle_deadlines.earliest_hint().is_some_and(|last| {
+            last.as_micros()
+                .saturating_add(duration_micros_saturating(idle_timeout))
+                <= now.as_micros()
+        })
+    }
+
     pub(crate) fn prune_idle_bounded_with_visits(
         &mut self,
         now: Timestamp,

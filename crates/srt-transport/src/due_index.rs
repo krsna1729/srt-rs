@@ -143,6 +143,17 @@ where
     }
 
     /// Earliest live deadline, cleaning stale heap entries as necessary.
+    /// The heap head's deadline WITHOUT discarding stale heads: O(1) and
+    /// `&self`. It can be earlier than the true minimum (a stale head), never
+    /// later, so "is anything due?" is at worst a harmless false positive that
+    /// the next bounded pop clears.
+    #[must_use]
+    pub fn earliest_hint(&self) -> Option<Timestamp> {
+        self.heap
+            .peek()
+            .map(|top| Timestamp::from_micros(top.0.deadline_micros))
+    }
+
     pub fn peek_min_deadline(&mut self) -> Option<Timestamp> {
         // Peeking never inserts entries, so the heap length at entry bounds
         // the number of stale heads this call can remove.

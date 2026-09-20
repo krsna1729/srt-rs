@@ -73,17 +73,17 @@ fn run_cell(lanes: usize, fanout: usize, duration_ms: u64) -> QdCell {
         let listener_side = ListenerSide::new(l_sock, &l_cfg).expect("listener side");
         let mut owner = Owner::new(lanes).with_listener(listener_side);
         owner
-            .set_caller_pool_policy(
+            .set_caller_pool_capacity(
                 std::num::NonZeroUsize::new(fanout.clamp(1, 2048)).expect("nonzero"),
-                std::time::Duration::from_secs(30),
             )
-            .expect("pool policy");
+            .expect("pool capacity");
 
         let mut now = Timestamp::from_micros(10_000);
         let mut dest_ids = Vec::with_capacity(fanout);
         for _ in 0..fanout {
             let cfg = srt_transport::CallerConfig::builder(l_addr)
                 .ownership(srt_transport::SocketOwnership::Shared)
+                .connect_deadline(std::time::Duration::from_secs(30))
                 .configure_session(|s| {
                     s.handshake.timeout = std::time::Duration::from_secs(30);
                 })
@@ -99,6 +99,7 @@ fn run_cell(lanes: usize, fanout: usize, duration_ms: u64) -> QdCell {
             max_rx_packets: 1024,
             max_rx_bytes: 2 * 1024 * 1024,
             max_actions: 1024,
+            max_maintenance_actions: 1024,
             max_tx_packets: 1024,
             max_tx_bytes: 2 * 1024 * 1024,
         };

@@ -155,6 +155,9 @@ struct SchedEntry {
     event_ready_queued: bool,
     deadline_micros: Option<u64>,
     heap_pos: Option<u32>,
+    /// This caller's attempt has resolved and its id was queued in
+    /// [`CallerTable::resolved_attempts`] (exactly once, ever).
+    resolution_queued: bool,
 }
 
 /// Coarse logical state of an outbound stream, independent of how many
@@ -169,7 +172,7 @@ pub enum LogicalCallerState {
 /// Pool-facing view of a logical caller's connect attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AttemptStatus {
-    /// Still trying to establish: subject to the attempt deadline.
+    /// Still trying to establish: subject to the request's own attempt deadline.
     Establishing,
     /// Connected, closing or rejected: no longer a stalled attempt.
     Resolved,
@@ -432,6 +435,17 @@ pub struct CallerTable {
     /// caller is, so the length never exceeds the live caller count -- churn
     /// (collide, retire, repeat) cannot grow it, and no fault is dropped.
     group_fault_index: VecDeque<LogicalCallerId>,
+    /// Exact index of attempts whose protocol state left "establishing"
+    /// (connected, rejected, closing or disconnected): each live caller is
+    /// appended at most once, at the state transition, and its entry is
+    /// removed with the caller. Bounded by the live caller count, so a pool
+    /// releases a resolved attempt's permit from this queue instead of
+    /// rescanning its in-flight population.
+    resolved_attempts: VecDeque<LogicalCallerId>,
+    /// Test-only: how many attempt-status probes ran, to prove maintenance
+    /// never walks the in-flight population.
+    #[cfg(test)]
+    status_probes: std::cell::Cell<u64>,
     next_logical_caller: u64,
     max_callers: usize,
     /// SRT-level receiver totals of every session this table has retired.
@@ -972,6 +986,9 @@ impl CallerTable {
             protocol_failure_index: VecDeque::new(),
             protocol_failure_scratch: Some(Vec::new()),
             group_fault_index: VecDeque::new(),
+            resolved_attempts: VecDeque::new(),
+            #[cfg(test)]
+            status_probes: std::cell::Cell::new(0),
             next_logical_caller: 1,
             max_callers: bounded,
             retired_rcv: RcvTotals::default(),
@@ -990,7 +1007,45 @@ impl CallerTable {
         }
     }
 
+    /// Queue `id` once, at the moment its attempt stops establishing. Every
+    /// mutation path ends in [`Self::sync_deadline`], so this single hook
+    /// covers incoming packets, handshake rejection, timer firing, connect,
+    /// disconnect and an application close alike.
+    fn note_attempt_resolution(&mut self, id: LogicalCallerId) {
+        if self
+            .sched
+            .get(&id)
+            .is_none_or(|entry| entry.resolution_queued)
+        {
+            return;
+        }
+        if self.attempt_status(&id) == Some(AttemptStatus::Resolved) {
+            if let Some(entry) = self.sched.get_mut(&id) {
+                entry.resolution_queued = true;
+            }
+            self.resolved_attempts.push_back(id);
+        }
+    }
+
+    /// Pop one exactly-known resolved attempt (see [`Self::resolved_attempts`]).
+    pub(crate) fn pop_resolved_attempt(&mut self) -> Option<LogicalCallerId> {
+        self.resolved_attempts.pop_front()
+    }
+
+    /// Test-only: attempt-status probes so far.
+    #[cfg(test)]
+    pub(crate) fn status_probes(&self) -> u64 {
+        self.status_probes.get()
+    }
+
+    /// Resolved attempts not yet consumed. O(1).
+    #[must_use]
+    pub(crate) fn resolved_attempts_pending(&self) -> usize {
+        self.resolved_attempts.len()
+    }
+
     fn sync_deadline(&mut self, id: LogicalCallerId) {
+        self.note_attempt_resolution(id);
         let new_micros = if self.session_output_quarantined(id) {
             // A quarantined session has no schedulable deadlines: leaving one
             // live would keep the shard reporting pending work it will never
@@ -1007,6 +1062,7 @@ impl CallerTable {
             event_ready_queued: false,
             deadline_micros: None,
             heap_pos: None,
+            resolution_queued: false,
         });
         let old_micros = entry.deadline_micros;
         if old_micros == new_micros {
@@ -1211,6 +1267,7 @@ impl CallerTable {
             event_ready_queued: false,
             deadline_micros: None,
             heap_pos: None,
+            resolution_queued: false,
         });
         if entry.ready_queued {
             return;
@@ -1225,6 +1282,7 @@ impl CallerTable {
             event_ready_queued: false,
             deadline_micros: None,
             heap_pos: None,
+            resolution_queued: false,
         });
         if entry.event_ready_queued {
             return;
@@ -1359,6 +1417,7 @@ impl CallerTable {
                 event_ready_queued: false,
                 deadline_micros: None,
                 heap_pos: None,
+                resolution_queued: false,
             },
         );
         self.sync_deadline(id);
@@ -1453,6 +1512,7 @@ impl CallerTable {
                 event_ready_queued: false,
                 deadline_micros: None,
                 heap_pos: None,
+                resolution_queued: false,
             },
         );
         self.sync_deadline(id);
@@ -1872,6 +1932,9 @@ impl CallerTable {
             .retain(|(index_id, _)| *index_id != id);
         // Same for an undrained peer-group fault: it dies with its caller.
         self.group_fault_index.retain(|index_id| *index_id != id);
+        // ...and an unconsumed resolution signal, so a stale id can never be
+        // mistaken for a later caller and the index cannot outgrow the table.
+        self.resolved_attempts.retain(|index_id| *index_id != id);
         let session = self.sessions.remove(&id)?;
         self.routes.retain(|_, route| match route {
             CallerRoute::Direct(caller) => *caller != id,
@@ -1980,7 +2043,7 @@ impl CallerTable {
     }
 
     /// Whether an admitted logical caller is still establishing (subject to a
-    /// pool's `attempt_deadline`) or has resolved one way or another.
+    /// request's `attempt_deadline`) or has resolved one way or another.
     ///
     /// Like [`Self::raw_direct_state`] this looks at the protocol's own
     /// state, not the coarse [`LogicalCallerState`], so a session that
@@ -1991,6 +2054,8 @@ impl CallerTable {
     #[must_use]
     pub(crate) fn attempt_status(&self, id: &LogicalCallerId) -> Option<AttemptStatus> {
         use srt_proto::ConnectionState::{Closing, Connected, Disconnected};
+        #[cfg(test)]
+        self.status_probes.set(self.status_probes.get() + 1);
         let establishing = |state: srt_proto::ConnectionState| {
             !matches!(state, Connected | Disconnected | Closing)
         };

@@ -20,20 +20,43 @@ fn shared_leg(remote: SocketAddr) -> CallerConfig {
         .expect("caller config")
 }
 
+/// A leg whose request carries its own attempt deadline.
+fn shared_leg_d(remote: SocketAddr, deadline: Duration) -> CallerConfig {
+    CallerConfig::builder(remote)
+        .ownership(crate::SocketOwnership::Shared)
+        .connect_deadline(deadline)
+        .build()
+        .expect("caller config")
+}
+
 fn shared_leg_with_id(remote: SocketAddr, socket_id: u32) -> CallerConfig {
+    shared_leg_with_id_d(remote, socket_id, Duration::from_secs(15))
+}
+
+fn shared_leg_with_id_d(remote: SocketAddr, socket_id: u32, deadline: Duration) -> CallerConfig {
     let mut session = crate::SessionConfig::default();
     session.set_socket_id(socket_id);
     CallerConfig::builder(remote)
         .ownership(crate::SocketOwnership::Shared)
         .session(session)
+        .connect_deadline(deadline)
         .build()
         .expect("caller config")
 }
 
 fn bonded(group: u32, group_type: GroupType, legs: &[(SocketAddr, u16)]) -> BondedCallerConfig {
+    bonded_d(group, group_type, legs, Duration::from_secs(15))
+}
+
+fn bonded_d(
+    group: u32,
+    group_type: GroupType,
+    legs: &[(SocketAddr, u16)],
+    deadline: Duration,
+) -> BondedCallerConfig {
     legs.iter().fold(
         BondedCallerConfig::new(GroupConfig::new(group, group_type)),
-        |config, (remote, weight)| config.leg(shared_leg(*remote), *weight),
+        |config, (remote, weight)| config.leg(shared_leg_d(*remote, deadline), *weight),
     )
 }
 
@@ -194,13 +217,10 @@ fn bonded_connect_starts_the_handshake_on_every_leg() {
     });
 }
 
-fn set_pool(owner: &mut Owner, max_in_flight: usize, deadline: Duration) {
+fn set_pool(owner: &mut Owner, max_in_flight: usize) {
     owner
-        .set_caller_pool_policy(
-            std::num::NonZeroUsize::new(max_in_flight).expect("non-zero"),
-            deadline,
-        )
-        .expect("pool policy");
+        .set_caller_pool_capacity(std::num::NonZeroUsize::new(max_in_flight).expect("non-zero"))
+        .expect("pool capacity");
 }
 
 fn pool_events(owner: &mut Owner) -> Vec<PoolEvent> {
@@ -216,13 +236,19 @@ fn queued_bonded_request_keeps_its_id_and_its_deadline_starts_at_admission() {
     let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
     runtime.block_on(async {
         let mut owner = Owner::new(8);
-        set_pool(&mut owner, 1, Duration::from_millis(50));
+        const DEADLINE: Duration = Duration::from_millis(50);
+        set_pool(&mut owner, 1);
         let first = admitted(
             owner
-                .connect(&shared_leg(dead_peer()), Timestamp::from_micros(0))
+                .connect(&shared_leg_d(dead_peer(), DEADLINE), Timestamp::from_micros(0))
                 .expect("first"),
         );
-        let config = bonded(3, GroupType::Broadcast, &[(dead_peer(), 1), (dead_peer(), 1)]);
+        let config = bonded_d(
+            3,
+            GroupType::Broadcast,
+            &[(dead_peer(), 1), (dead_peer(), 1)],
+            DEADLINE,
+        );
         let request_id = match owner
             .connect_bonded(&config, Timestamp::from_micros(0))
             .expect("bonded")
@@ -283,7 +309,7 @@ fn full_pool_refuses_a_bonded_request_without_retaining_it() {
     let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
     runtime.block_on(async {
         let mut owner = Owner::new(8);
-        set_pool(&mut owner, 1, Duration::from_secs(10));
+        set_pool(&mut owner, 1);
         let _first = admitted(
             owner
                 .connect(&shared_leg(dead_peer()), Timestamp::from_micros(0))
@@ -318,11 +344,12 @@ fn bonded_attempt_deadline_retires_the_whole_group() {
     let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
     runtime.block_on(async {
         let mut owner = Owner::new(8);
-        set_pool(&mut owner, 4, Duration::from_millis(10));
+        set_pool(&mut owner, 4);
+        const DEADLINE: Duration = Duration::from_millis(10);
         let make = || {
             BondedCallerConfig::new(GroupConfig::new(5, GroupType::Broadcast))
-                .leg(shared_leg_with_id(dead_peer(), 0x5101), 1)
-                .leg(shared_leg_with_id(dead_peer(), 0x5102), 1)
+                .leg(shared_leg_with_id_d(dead_peer(), 0x5101, DEADLINE), 1)
+                .leg(shared_leg_with_id_d(dead_peer(), 0x5102, DEADLINE), 1)
         };
         let id = admitted(
             owner
@@ -374,7 +401,7 @@ fn remove_caller_reclaims_every_leg_route_and_deadline() {
     let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
     runtime.block_on(async {
         let mut owner = Owner::new(8);
-        set_pool(&mut owner, 4, Duration::from_secs(30));
+        set_pool(&mut owner, 4);
         let make = || {
             BondedCallerConfig::new(GroupConfig::new(6, GroupType::Backup))
                 .leg(shared_leg_with_id(dead_peer(), 0x6101), 2)
@@ -484,7 +511,7 @@ fn rejected_bonded_attach_is_transactional() {
         owner
             .set_wire_ceiling(4096)
             .expect("configuration is still open after refusals");
-        set_pool(&mut owner, 2, Duration::from_secs(1));
+        set_pool(&mut owner, 2);
         assert!(matches!(
             owner.connect_bonded(
                 &bonded(9, GroupType::Broadcast, &[(dead_peer(), 1)]),
@@ -503,7 +530,7 @@ fn bonded_and_direct_callers_share_one_socket_at_fixed_runtime_cost() {
     let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
     runtime.block_on(async {
         let mut owner = Owner::new(64);
-        set_pool(&mut owner, 8, Duration::from_secs(30));
+        set_pool(&mut owner, 8);
         let d1 = admitted(
             owner
                 .connect(&shared_leg(dead_peer()), Timestamp::from_micros(0))
@@ -857,7 +884,7 @@ fn failed_first_bonded_admission_leaves_the_owner_untouched() {
         owner
             .set_rx_substrate(ManagedRxSubstrate::NotIoUring)
             .expect("substrate still declarable");
-        set_pool(&mut owner, 3, Duration::from_secs(9));
+        set_pool(&mut owner, 3);
         owner
             .set_wire_ceiling(4096)
             .expect("wire ceiling still settable");
@@ -976,7 +1003,6 @@ fn caller_side_construction_starts_no_managed_task() {
         let mut side = OwnerCallerSide::from_parts_with_rx_mode(
             sock,
             std::num::NonZeroUsize::MIN,
-            Duration::from_secs(1),
             transport,
             None,
             crate::ConnectConfig::default(),
