@@ -2451,3 +2451,232 @@ fn compio_owner_bond_to_independent_libsrt_receivers_reports_a_peer_group_collis
     );
     assert!(run.quiescent, "Owner teardown was not quiescent: {run:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Compio Owner listeners with a resolved receiving-group identity
+// ---------------------------------------------------------------------------
+//
+// The listener side of the same production surface: `Owner::listen_with_resolver`
+// answers a real bonding-enabled libsrt caller. The resolver returns the
+// application-owned RECEIVER group id, which is deliberately different from
+// the group id libsrt generates for the caller. libsrt pins the first
+// responder's id and rejects a different one with SRT_REJ_GROUP (exit 3).
+
+use srt_transport::advanced::admission::{
+    AdmissionResolution as OwnerResolution, BondedInputPolicy, ListenerAdmissionResolver,
+};
+use srt_transport::compio::Owner as CompioListenerOwner;
+use srt_transport::{
+    ListenerConfig, ListenerPeerPolicy, ListenerTopology, PolicyOverride, PromotionPolicy,
+};
+
+const RECEIVER_GROUP_A: u32 = 0x0A11_CE01;
+const RECEIVER_GROUP_B: u32 = 0x0B0B_CE02;
+
+fn receiver_resolver(receiver_group: u32) -> ListenerAdmissionResolver {
+    ListenerAdmissionResolver::new(move |_request| {
+        OwnerResolution::Configure(ListenerPeerPolicy {
+            group: PolicyOverride::Set(Some(GroupConfig::new(
+                receiver_group,
+                srt_proto::handshake::GroupType::Broadcast,
+            ))),
+            ..ListenerPeerPolicy::default()
+        })
+    })
+}
+
+fn owner_listener(receiver_group: u32) -> (CompioListenerOwner, u16) {
+    let config = ListenerConfig::builder("127.0.0.1:0".parse().unwrap())
+        .topology(ListenerTopology::PerPort)
+        .configure_transport(|transport| transport.promotion = PromotionPolicy::Never)
+        .bonded_inputs(BondedInputPolicy::Accept)
+        .build()
+        .expect("listener config");
+    let mut owner = CompioListenerOwner::new_with_ceiling(COMPIO_TX_LANES, COMPIO_WIRE_CEILING);
+    owner
+        .listen_with_resolver(&config, receiver_resolver(receiver_group))
+        .expect("listen_with_resolver");
+    let port = owner.listener_local_addr().expect("listener bound").port();
+    (owner, port)
+}
+
+#[derive(Debug, Default)]
+struct OwnerListenersRun {
+    /// Payload bytes delivered per listener.
+    received: Vec<Vec<u8>>,
+    /// Most legs any inbound group had, per listener.
+    max_legs: Vec<usize>,
+    exit_code: Option<i32>,
+    stderr: String,
+}
+
+/// Serve `listeners` (one production Compio Owner each) while `caller` runs,
+/// collecting delivered payloads and inbound leg counts.
+fn serve_owner_listeners(
+    receiver_groups: &[u32],
+    caller_binary: &std::path::Path,
+    deadline: Duration,
+) -> OwnerListenersRun {
+    let config = ProductionRuntimeConfig::for_owner(COMPIO_TX_LANES, COMPIO_WIRE_CEILING);
+    let runtime = production_runtime_builder(config)
+        .expect("production runtime builder")
+        .build()
+        .expect("production runtime builds");
+    let mut run = OwnerListenersRun {
+        received: vec![Vec::new(); receiver_groups.len()],
+        max_legs: vec![0; receiver_groups.len()],
+        ..OwnerListenersRun::default()
+    };
+    let mut caller_status = None;
+    let mut caller = None;
+    runtime.block_on(async {
+        // Listeners attach inside the runtime that will drive them.
+        let (mut listeners, ports): (Vec<_>, Vec<_>) = receiver_groups
+            .iter()
+            .map(|group| owner_listener(*group))
+            .unzip();
+        let mut child = spawn_bonded_caller(caller_binary, &ports);
+        let epoch = Instant::now();
+        let mut exited_at: Option<Instant> = None;
+        while epoch.elapsed() < deadline {
+            let now = compio_timestamp(epoch);
+            for (index, owner) in listeners.iter_mut().enumerate() {
+                let _ = owner.service(now, OwnerServiceBudget::default()).await;
+                let mut events = Vec::new();
+                owner.poll_listener_events(&mut events);
+                for event in events {
+                    if let srt_proto::ConnectionEvent::DataReceived { payload, .. } = event.event {
+                        run.received[index].extend_from_slice(&payload);
+                    }
+                    if let Some(peer) = owner.listener_peer_mut(event.logical_peer)
+                        && let Some(srt_transport::advanced::admission::LogicalPeerStats::Group(
+                            stats,
+                        )) = peer.stats()
+                    {
+                        run.max_legs[index] = run.max_legs[index].max(stats.legs.len());
+                    }
+                }
+            }
+            if caller_status.is_none() {
+                caller_status = child.try_wait().expect("poll libsrt caller");
+            }
+            // The caller may exit before a receiver's latency window releases
+            // the last payload; keep serving briefly after it is gone.
+            if caller_status.is_some() {
+                let exited = *exited_at.get_or_insert_with(Instant::now);
+                if exited.elapsed() >= Duration::from_millis(800) {
+                    break;
+                }
+            }
+            for owner in listeners.iter_mut() {
+                owner.wait_for_activity(Duration::from_millis(1)).await;
+            }
+        }
+        for owner in listeners.iter_mut() {
+            let _ = owner.shutdown_and_drain(Duration::from_secs(2)).await;
+        }
+        caller = Some(child);
+    });
+    let mut caller = caller.expect("caller spawned");
+    let output = if caller_status.is_some() {
+        caller.wait_with_output().expect("collect libsrt caller")
+    } else {
+        let _ = caller.kill();
+        caller.wait_with_output().expect("reap libsrt caller")
+    };
+    run.exit_code = output.status.code();
+    run.stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    run
+}
+
+fn spawn_bonded_caller(caller: &std::path::Path, ports: &[u16]) -> Child {
+    let mut command = Command::new(caller);
+    for port in ports {
+        command.args(["127.0.0.1", &port.to_string()]);
+    }
+    command
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn libsrt bonded caller")
+}
+
+fn skip_without_bonding(run: &OwnerListenersRun) -> bool {
+    if run.exit_code == Some(77) && std::env::var_os("SRT_REQUIRE_BONDING").is_none() {
+        eprintln!("skipping bonding interop: {}", run.stderr.trim());
+        return true;
+    }
+    false
+}
+
+/// A. libsrt bonded caller (two legs) -> ONE Owner listener whose resolver
+/// advertises an application-owned receiver group id: the bond connects, the
+/// payload arrives once, and libsrt accepts the responder group identity.
+#[test]
+fn libsrt_bonded_caller_connects_to_owner_listener_with_receiver_group() {
+    let _guard = interop_test_lock();
+    let Some(caller) = compile_libsrt_bonded_caller() else {
+        return;
+    };
+    let run = serve_owner_listeners(&[RECEIVER_GROUP_A], &caller, Duration::from_secs(15));
+    if skip_without_bonding(&run) {
+        return;
+    }
+    assert_eq!(
+        run.exit_code,
+        Some(0),
+        "libsrt accepted the responder GROUP identity: {run:?}"
+    );
+    assert_eq!(run.max_legs, vec![2], "both legs joined one inbound group");
+    assert_eq!(run.received[0], b"libsrt-bonded-group-payload");
+}
+
+/// B. Two INDEPENDENT Owner listeners advertising different receiver ids: a
+/// libsrt caller spanning them rejects the second leg with SRT_REJ_GROUP.
+#[test]
+fn libsrt_bonded_caller_rejects_independent_owner_receivers() {
+    let _guard = interop_test_lock();
+    let Some(caller) = compile_libsrt_bonded_caller() else {
+        return;
+    };
+    let run = serve_owner_listeners(
+        &[RECEIVER_GROUP_A, RECEIVER_GROUP_B],
+        &caller,
+        Duration::from_secs(15),
+    );
+    if skip_without_bonding(&run) {
+        return;
+    }
+    assert_eq!(
+        run.exit_code,
+        Some(3),
+        "different receiving-group ids must be rejected with SRT_REJ_GROUP: {run:?}"
+    );
+}
+
+/// C. One receiver id shared by two Owner listeners (one logical receiver
+/// spanning endpoints) is NOT a collision: libsrt bonds one leg to each.
+#[test]
+fn libsrt_bonded_caller_accepts_one_receiver_id_across_owner_endpoints() {
+    let _guard = interop_test_lock();
+    let Some(caller) = compile_libsrt_bonded_caller() else {
+        return;
+    };
+    let run = serve_owner_listeners(
+        &[RECEIVER_GROUP_A, RECEIVER_GROUP_A],
+        &caller,
+        Duration::from_secs(15),
+    );
+    if skip_without_bonding(&run) {
+        return;
+    }
+    assert_eq!(
+        run.exit_code,
+        Some(0),
+        "the same receiver id across endpoints is one receiving group: {run:?}"
+    );
+    assert!(
+        run.received.iter().any(|r| !r.is_empty()),
+        "the payload reached a receiver: {run:?}"
+    );
+}

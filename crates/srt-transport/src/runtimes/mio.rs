@@ -180,6 +180,8 @@ const OWNER_LISTENER_TOKEN: mio::Token = mio::Token(0);
 const OWNER_CALLER_TOKEN: mio::Token = mio::Token(1);
 
 struct OwnerListenerSide {
+    /// Application admission policy, stored once per listener.
+    resolver: Option<crate::ListenerAdmissionResolver>,
     socket: mio::net::UdpSocket,
     peers: crate::PeerTable,
     admission: crate::AdmissionOptions,
@@ -285,6 +287,27 @@ impl Owner {
         &mut self,
         config: &crate::ListenerConfig,
     ) -> Result<(), crate::RuntimeBuildError> {
+        self.listen_inner(config, None)
+    }
+
+    /// [`Self::listen`] with a synchronous, request-resolved admission policy
+    /// (`AdmissionRequest -> AdmissionResolution`): per-StreamID authorization,
+    /// latency, encryption and receiving-group identity, applied after cookie
+    /// validation and before CONCLUSION -- the same semantics on every Owner
+    /// runtime. The callback must be bounded and cache-backed.
+    pub fn listen_with_resolver(
+        &mut self,
+        config: &crate::ListenerConfig,
+        resolver: crate::ListenerAdmissionResolver,
+    ) -> Result<(), crate::RuntimeBuildError> {
+        self.listen_inner(config, Some(resolver))
+    }
+
+    fn listen_inner(
+        &mut self,
+        config: &crate::ListenerConfig,
+        resolver: Option<crate::ListenerAdmissionResolver>,
+    ) -> Result<(), crate::RuntimeBuildError> {
         if self.listener.is_some() {
             return Err(crate::RuntimeBuildError::from(crate::ConfigError::new(
                 "listener",
@@ -355,6 +378,7 @@ impl Owner {
             mio::Interest::READABLE,
         )?;
         self.listener = Some(OwnerListenerSide {
+            resolver,
             socket,
             admission: prepared.admission_options(),
             idle_timeout: prepared.admission.idle_timeout,
@@ -550,7 +574,12 @@ impl Owner {
         if let Some(side) = self.listener.as_mut()
             && side.recv_pending
         {
-            let (peers, admission, telemetry) = (&mut side.peers, &side.admission, &side.telemetry);
+            let (peers, admission, telemetry, resolver) = (
+                &mut side.peers,
+                &side.admission,
+                &side.telemetry,
+                side.resolver.as_ref(),
+            );
             if let Err(error) = drain_side_recv(
                 &mut side.recv_pending,
                 side.socket.as_raw_fd(),
@@ -558,7 +587,9 @@ impl Owner {
                 side.transport.recv_budget,
                 |addr, data| {
                     let Some(peer) = addr else { return };
-                    let _ = peers.admit(peer, data, now, admission, 0, 1, telemetry);
+                    let _ = peers.admit_with_listener_resolver(
+                        resolver, peer, data, now, admission, 0, 1, telemetry,
+                    );
                 },
             ) {
                 first_error.get_or_insert(error);
@@ -1592,6 +1623,127 @@ mod owner_tests {
                 .is_err(),
             "an IPv6 remote address must be rejected, not silently accepted"
         );
+    }
+
+    fn resolved_caller_config(
+        remote: SocketAddr,
+        stream_id: &str,
+        passphrase: &str,
+    ) -> crate::CallerConfig {
+        let mut session = crate::SessionConfig::default();
+        session.set_stream_id(Some(stream_id.to_owned()));
+        session.set_encryption(Some(crate::EncryptionConfig::new(passphrase)));
+        crate::CallerConfig::builder(remote)
+            .ownership(SocketOwnership::Shared)
+            .session(session)
+            .build()
+            .expect("caller config")
+    }
+
+    /// Per-StreamID authorization and crypto: "cam/ok" gets its own
+    /// passphrase, every other StreamID is rejected. Counts invocations.
+    fn stream_policy_resolver(
+        calls: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> crate::ListenerAdmissionResolver {
+        let calls = std::sync::Arc::clone(calls);
+        crate::ListenerAdmissionResolver::new(move |request| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match request.claimed_identity.stream_id.as_deref() {
+                Some("cam/ok") => {
+                    crate::AdmissionResolution::Configure(crate::ListenerPeerPolicy {
+                        encryption: crate::PolicyOverride::Set(Some(
+                            crate::ListenerEncryptionConfig::new(
+                                "tenant-passphrase-ok",
+                                srt_proto::crypto::KeyLength::Aes128,
+                            )
+                            .expect("passphrase"),
+                        )),
+                        ..crate::ListenerPeerPolicy::default()
+                    })
+                }
+                _ => crate::AdmissionResolution::Reject {
+                    reason: crate::RejectionReason::FORBIDDEN,
+                },
+            }
+        })
+    }
+
+    /// Resolver parity with the Compio Owner: the resolved per-StreamID
+    /// crypto lets the right credential connect and deliver data, while a
+    /// wrong credential and a rejected StreamID never connect.
+    #[test]
+    fn listen_with_resolver_applies_per_streamid_policy() {
+        let start = std::time::Instant::now();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut owner = Owner::new().expect("owner builds");
+        owner
+            .listen_with_resolver(&listener_config(), stream_policy_resolver(&calls))
+            .expect("listen_with_resolver");
+        let addr = owner.listener_local_addr().expect("listener bound");
+        let crate::PoolOutcome::Admitted(id) = owner
+            .connect(
+                &resolved_caller_config(addr, "cam/ok", "tenant-passphrase-ok"),
+                now_ts(start),
+            )
+            .expect("connect")
+        else {
+            panic!("admitted")
+        };
+        let mut peer = None;
+        let mut got = false;
+        let ok = drive_until(&mut owner, start, Duration::from_secs(5), |owner, now| {
+            let mut events = Vec::new();
+            owner.poll_listener_events(&mut events);
+            for event in events {
+                match event.event {
+                    ConnectionEvent::Connected => peer = Some(event.logical_peer),
+                    ConnectionEvent::DataReceived { payload, .. } => {
+                        got = payload.as_ref() == b"resolved";
+                    }
+                    _ => {}
+                }
+            }
+            if peer.is_some()
+                && owner.caller_mut(id).and_then(|c| c.state())
+                    == Some(LogicalCallerState::Connected)
+                && !got
+            {
+                let _ = owner.caller_mut(id).expect("caller").send(b"resolved", now);
+            }
+            got
+        });
+        assert!(ok, "the resolved credential connects and delivers data");
+        assert!(calls.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+
+        // Wrong credential and an unauthorized StreamID, each on a fresh owner.
+        for (stream, pass) in [
+            ("cam/ok", "definitely-the-wrong-secret"),
+            ("cam/denied", "tenant-passphrase-ok"),
+        ] {
+            let start = std::time::Instant::now();
+            let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut owner = Owner::new().expect("owner builds");
+            owner
+                .listen_with_resolver(&listener_config(), stream_policy_resolver(&calls))
+                .expect("listen_with_resolver");
+            let addr = owner.listener_local_addr().expect("listener bound");
+            let crate::PoolOutcome::Admitted(id) = owner
+                .connect(&resolved_caller_config(addr, stream, pass), now_ts(start))
+                .expect("connect")
+            else {
+                panic!("admitted")
+            };
+            let connected =
+                drive_until(&mut owner, start, Duration::from_millis(600), |owner, _| {
+                    owner.caller_mut(id).and_then(|c| c.state())
+                        == Some(LogicalCallerState::Connected)
+                });
+            assert!(
+                !connected,
+                "{stream} with a bad credential must not connect"
+            );
+            assert!(calls.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+        }
     }
 }
 

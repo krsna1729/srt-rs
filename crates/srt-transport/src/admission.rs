@@ -282,6 +282,47 @@ pub enum AdmissionResolution {
     Defer,
 }
 
+/// A synchronous, shareable admission policy for Owner-driven listeners.
+///
+/// It wraps the EXISTING `AdmissionRequest -> AdmissionResolution` contract of
+/// [`PeerTable::admit_with_resolver`], so an application keeps request-resolved
+/// per-StreamID policy (authorization, latency, encryption, receiving-group
+/// identity) without abandoning the Owner's dataplane. The callback:
+///
+/// * runs on the packet-owner thread, after cookie validation and before the
+///   caller's CONCLUSION is processed -- never for DATA, ACK, NAK, retransmits
+///   or routine timers;
+/// * must be synchronous and bounded: read an already-populated cache, never
+///   perform network, database or authentication I/O;
+/// * is stored once per listener (`Arc`), so its cost is O(listeners), not
+///   O(peers), and one instance may serve several listeners or Owners.
+///
+/// `Debug` deliberately prints nothing about captured application state.
+#[derive(Clone)]
+pub struct ListenerAdmissionResolver(
+    std::sync::Arc<dyn Fn(&AdmissionRequest) -> AdmissionResolution + Send + Sync>,
+);
+
+impl ListenerAdmissionResolver {
+    #[must_use]
+    pub fn new(
+        resolve: impl Fn(&AdmissionRequest) -> AdmissionResolution + Send + Sync + 'static,
+    ) -> Self {
+        Self(std::sync::Arc::new(resolve))
+    }
+
+    #[must_use]
+    pub fn resolve(&self, request: &AdmissionRequest) -> AdmissionResolution {
+        (self.0)(request)
+    }
+}
+
+impl std::fmt::Debug for ListenerAdmissionResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ListenerAdmissionResolver(..)")
+    }
+}
+
 enum AdmissionHookResult {
     Accept,
     Configure(ListenerPeerPolicy),
@@ -1938,6 +1979,47 @@ impl PeerTable {
             telemetry,
             |request, _connection| resolve(request).into(),
         )
+    }
+
+    /// The one listener-datagram admission entry every Owner runtime uses: with
+    /// a [`ListenerAdmissionResolver`] it is exactly
+    /// [`Self::admit_with_resolver`]; without one it is [`Self::admit`]. Raw
+    /// and managed receive paths (and every runtime) call THIS, so who is
+    /// authorized and which crypto/latency/group policy applies can never
+    /// depend on how the datagram arrived.
+    #[allow(clippy::too_many_arguments)]
+    pub fn admit_with_listener_resolver(
+        &mut self,
+        resolver: Option<&ListenerAdmissionResolver>,
+        peer: std::net::SocketAddr,
+        data: &[u8],
+        now: Timestamp,
+        options: &AdmissionOptions,
+        worker_index: usize,
+        worker_count: usize,
+        telemetry: &IngressTelemetry,
+    ) -> Admit {
+        match resolver {
+            Some(resolver) => self.admit_with_resolver(
+                peer,
+                data,
+                now,
+                options,
+                worker_index,
+                worker_count,
+                telemetry,
+                |request| resolver.resolve(request),
+            ),
+            None => self.admit(
+                peer,
+                data,
+                now,
+                options,
+                worker_index,
+                worker_count,
+                telemetry,
+            ),
+        }
     }
 
     /// Expert pre-CONCLUSION escape hatch.

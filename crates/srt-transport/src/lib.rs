@@ -133,9 +133,10 @@ pub mod advanced {
         pub use super::super::admission::AdmissionPeer;
         pub use super::super::admission::{
             AdmissionDecision, AdmissionDropReason, AdmissionEvent, AdmissionOptions,
-            AdmissionRequest, AdmissionResolution, Admit, BondedInputPolicy, LogicalPeer,
-            LogicalPeerId, LogicalPeerMut, LogicalPeerStats, NewlyConnectedPeer, PeerTable,
-            PeerTableConfig, RejectionReason, RemovedLogicalPeer, RemovedPeerLeg, is_ordered_close,
+            AdmissionRequest, AdmissionResolution, Admit, BondedInputPolicy,
+            ListenerAdmissionResolver, LogicalPeer, LogicalPeerId, LogicalPeerMut,
+            LogicalPeerStats, NewlyConnectedPeer, PeerTable, PeerTableConfig, RejectionReason,
+            RemovedLogicalPeer, RemovedPeerLeg, is_ordered_close,
         };
     }
 
@@ -269,9 +270,9 @@ pub use config::{
 #[allow(unused_imports)]
 pub(crate) use admission::{
     AdmissionDecision, AdmissionDropReason, AdmissionEvent, AdmissionOptions, AdmissionRequest,
-    AdmissionResolution, Admit, BondedInputPolicy, LogicalPeer, LogicalPeerId, LogicalPeerMut,
-    LogicalPeerStats, NewlyConnectedPeer, PeerTable, PeerTableConfig, RejectionReason,
-    RemovedLogicalPeer, RemovedPeerLeg, is_ordered_close,
+    AdmissionResolution, Admit, BondedInputPolicy, ListenerAdmissionResolver, LogicalPeer,
+    LogicalPeerId, LogicalPeerMut, LogicalPeerStats, NewlyConnectedPeer, PeerTable,
+    PeerTableConfig, RejectionReason, RemovedLogicalPeer, RemovedPeerLeg, is_ordered_close,
 };
 #[cfg(any(feature = "mio", feature = "tokio"))]
 pub(crate) use batch::destined_send_limit;

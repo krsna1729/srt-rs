@@ -153,6 +153,58 @@ differences can disclose whether a tenant or resource exists. The raw
 existing numeric wire contract. See Haivision's
 [rejection-code registry](https://github.com/Haivision/srt/blob/fcae57145c000a9e7b72aa777adb8f85c2463242/docs/API/rejection-codes.md).
 
+## Shared Owner listeners
+
+An Owner that drives a listener socket accepts the same resolver contract, so
+an application does not have to abandon the Owner dataplane to keep
+per-StreamID policy:
+
+```rust
+let resolver = ListenerAdmissionResolver::new(|request: &AdmissionRequest| {
+    // Read an already-populated cache; never perform I/O here.
+    AdmissionResolution::Accept
+});
+owner.listen_with_resolver(&listener_config, resolver)?;
+```
+
+`Owner::listen(config)` is unchanged and applies no application policy.
+`listen_with_resolver` exists on the Compio, Mio and Tokio Owners
+(`tokio::Facade::spawn_with_resolver` for the facade) and is transactional
+exactly like `listen`.
+
+- **Timing.** The resolver runs after cookie validation and before CONCLUSION,
+  on the packet-owner thread, through `PeerTable::admit_with_resolver`. Owners
+  add no second admission engine; Configure, Reject, Defer, telemetry and the
+  half-open TTL are the table's own. A Deferred peer keeps its original hard
+  half-open expiry.
+- **Never on the data path.** It does not run for DATA, ACK, NAK, retransmits
+  or timers. Its cost is per admitted handshake, not per packet.
+- **Bounded and cache-backed.** The callback is synchronous and bounded. It is
+  stored once per listener (an `Arc`), so storage is O(listeners), not
+  O(peers). `Debug` prints nothing about captured state.
+- **One path for every Compio receive mode.** RawReadiness and
+  ManagedMultishot both call one helper, so changing the receive mode never
+  changes who is authorized or which crypto, latency or group policy applies.
+
+### Caller group id and receiving group id
+
+A bonded caller's GROUP request identifies the **caller** group. It alone
+decides inbound grouping: the same caller group id with a compatible StreamID is
+one logical inbound bonded peer. The **receiving** group id is a different
+identity that the listener returns in its GROUP response, chosen by the
+resolver with `ListenerPeerPolicy { group: Set(Some(GroupConfig::new(id, mode))) }`.
+
+- The receiving group id is application-owned. Use one id for every leg and
+  every endpoint that belongs to one logical receiver; use different ids for
+  independent receivers. The Owner never generates one.
+- A caller pins the first responder's id and treats a different one as a group
+  collision (libsrt: `SRT_REJ_GROUP`; srt-rs: `CallerGroupFault`). Address,
+  hostname, port and socket id never define a bond.
+- Direct callers, which send no GROUP request, never receive a GROUP response,
+  whatever the policy carries. They need no receiving-group identity.
+- The receiving group id is independent of delivery mode; Broadcast and Backup
+  behave alike.
+
 ## Reuseport and worker ownership
 
 For a single acceptor or shared listener loop, call `admit_with_resolver`

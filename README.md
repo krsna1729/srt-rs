@@ -149,6 +149,7 @@ incoming StreamID should start with
 [`docs/listener-admission-policy.md`](docs/listener-admission-policy.md). It
 documents the exact pre-CONCLUSION hook window, composable typed overrides,
 reuseport ownership, deferral, rejection, telemetry, and raw escape hatches.
+Shared Owners take the same resolver through `Owner::listen_with_resolver`.
 
 ## Benchmark quick start
 

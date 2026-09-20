@@ -3942,7 +3942,13 @@ impl SrtConnection {
             hs.add_km_response(km);
         }
 
-        if let Some(group) = self.options.group_extension {
+        // A GROUP extension in the RESPONSE names the RECEIVING group and is
+        // only meaningful (and, for libsrt callers, only legal) when the caller
+        // asked for group membership. A direct caller never gets one, however
+        // the listener's policy is configured.
+        if let Some(group) = self.options.group_extension
+            && self.peer_group_extension.is_some()
+        {
             hs.add_group_extension(group);
         }
 
@@ -3965,7 +3971,13 @@ impl SrtConnection {
         let flags = self.negotiated_srt_flags();
         hs.add_hs_response(self.options.srt_version, flags, self.options.tsbpd_delay);
         hs.add_km_error(error);
-        if let Some(group) = self.options.group_extension {
+        // A GROUP extension in the RESPONSE names the RECEIVING group and is
+        // only meaningful (and, for libsrt callers, only legal) when the caller
+        // asked for group membership. A direct caller never gets one, however
+        // the listener's policy is configured.
+        if let Some(group) = self.options.group_extension
+            && self.peer_group_extension.is_some()
+        {
             hs.add_group_extension(group);
         }
         let packet = hs.encode(self.relative_timestamp(now), self.peer_socket_id);
@@ -8147,6 +8159,79 @@ mod tests {
         };
         let handshake = HandshakePacket::decode(&control).expect("valid handshake");
         assert_eq!(handshake.get_group_extension(), Some(group));
+    }
+
+    /// Every handshake packet the listener sends while connecting `caller`,
+    /// decoded, so a test can inspect the responder's GROUP extension.
+    fn listener_handshakes(
+        caller_group: Option<GroupExtensionData>,
+        listener_group: GroupExtensionData,
+    ) -> Vec<HandshakePacket> {
+        let mut caller = SrtConnection::new_caller(ConnectionOptions {
+            socket_id: 1,
+            group_extension: caller_group,
+            ..ConnectionOptions::default()
+        });
+        let mut listener = SrtConnection::new_listener(ConnectionOptions {
+            socket_id: 2,
+            syn_cookie: Some(7),
+            group_extension: Some(listener_group),
+            ..ConnectionOptions::default()
+        });
+        caller.connect(Timestamp::from_micros(0)).expect("starts");
+        let mut seen = Vec::new();
+        for round in 0..4 {
+            let now = Timestamp::from_micros(round * 10_000);
+            while let Some(ConnectionOutput::SendPacket(packet)) = caller.poll_output().unwrap() {
+                listener.feed_recv_buf(&packet, now).expect("listener rx");
+            }
+            while let Some(ConnectionOutput::SendPacket(packet)) = listener.poll_output().unwrap() {
+                if let Ok(SrtPacket::Control(control)) = SrtPacket::decode(&packet)
+                    && let Ok(handshake) = HandshakePacket::decode(&control)
+                {
+                    seen.push(handshake);
+                }
+                caller.feed_recv_buf(&packet, now).expect("caller rx");
+            }
+        }
+        assert_eq!(caller.state(), ConnectionState::Connected);
+        seen
+    }
+
+    #[test]
+    fn listener_group_identity_is_only_advertised_to_group_callers() {
+        let receiver = GroupExtensionData {
+            group_id: SRTGROUP_MASK | 0x0A0A,
+            group_type: GroupType::Broadcast,
+            flags: 0,
+            weight: 0,
+        };
+        let direct = listener_handshakes(None, receiver);
+        assert!(!direct.is_empty(), "the listener answered the handshake");
+        assert!(
+            direct.iter().all(|hs| hs.get_group_extension().is_none()),
+            "a direct caller never receives a GROUP response"
+        );
+
+        let callers_own = GroupExtensionData {
+            group_id: SRTGROUP_MASK | 0x0707,
+            group_type: GroupType::Broadcast,
+            flags: 0,
+            weight: 1,
+        };
+        let bonded = listener_handshakes(Some(callers_own), receiver);
+        let advertised: Vec<_> = bonded
+            .iter()
+            .filter_map(|hs| hs.get_group_extension())
+            .collect();
+        assert!(
+            !advertised.is_empty(),
+            "a group caller gets a GROUP response"
+        );
+        assert!(
+            advertised.iter().all(|g| g.group_id == receiver.group_id),
+            "the listener advertises its own receiving group, never the caller's id"
+        );
     }
 
     #[test]
