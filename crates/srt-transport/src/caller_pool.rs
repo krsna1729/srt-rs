@@ -1,10 +1,22 @@
-//! A bounded outbound connection pool (A04): applies `ConnectConfig`'s
-//! `max_in_flight`/`attempt_deadline` to a real [`CallerTable`], which on
-//! its own admits every [`CallerTable::add_direct`] call unconditionally
-//! and never expires a stalled handshake. Both knobs were already validated
-//! by `ConnectConfig::validate` (see config.rs) but nothing actually
-//! enforced them -- exactly the "advertised no-op knob" this card exists
-//! to close.
+//! A bounded outbound connection pool (A04): applies a shared
+//! `max_in_flight` capacity and each request's own `attempt_deadline` to a
+//! real [`CallerTable`], which on its own admits every
+//! [`CallerTable::add_direct`] call unconditionally and never expires a
+//! stalled handshake.
+//!
+//! Two different things, deliberately not one policy:
+//!
+//! * **capacity** (`max_in_flight`) is a shared resource bound owned by the
+//!   pool: how many handshakes may be in flight at once;
+//! * **the attempt deadline** belongs to each logical connect request
+//!   (`CallerConfig.connect.attempt_deadline`, one validated value per
+//!   bonded request). Its clock starts when the request is *admitted*, never
+//!   while it waits in the queue.
+//!
+//! Maintenance is exact and bounded: attempts that stopped establishing are
+//! found through the table's resolved-attempt index, expiry walks only
+//! deadlines that are actually due (earliest first), and a future,
+//! still-establishing attempt is never maintenance work.
 //!
 //! Deliberately socket-agnostic, like [`CallerTable`] itself: this is pure
 //! admission-control/scheduling state, with no socket of its own. An
@@ -123,6 +135,64 @@ enum PoolRequest {
     Group(PreparedBondedCaller),
 }
 
+impl PoolRequest {
+    /// The validated attempt deadline of THIS request. A bonded request has
+    /// exactly one; every leg must agree (see [`Self::validate`]).
+    fn attempt_deadline(&self) -> Duration {
+        match self {
+            Self::Direct(prepared) => prepared.connect.attempt_deadline,
+            Self::Group(prepared) => prepared
+                .legs
+                .first()
+                .map_or(Duration::ZERO, |leg| leg.caller.connect.attempt_deadline),
+        }
+    }
+
+    /// Refuse a request whose deadline is not one positive, agreed value,
+    /// before anything is queued or admitted.
+    fn validate(&self) -> Result<(), srt_proto::Error> {
+        let invalid = |reason: &'static str| {
+            srt_proto::Error::with_reason(srt_proto::ErrorKind::InvalidState, reason)
+        };
+        if self.attempt_deadline().is_zero() {
+            return Err(invalid("connect request attempt deadline must be positive"));
+        }
+        if let Self::Group(prepared) = self {
+            let deadline = self.attempt_deadline();
+            if prepared
+                .legs
+                .iter()
+                .any(|leg| leg.caller.connect.attempt_deadline != deadline)
+            {
+                return Err(invalid(
+                    "bonded legs must share one connect attempt deadline",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Bounded maintenance work done by one [`CallerPool::maintain`] pass. Every
+/// unit is real work; a future, unresolved attempt is never counted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PoolMaintenance {
+    /// Attempts that stopped establishing and released their permit.
+    pub resolved: usize,
+    /// Attempts retired for missing their own deadline.
+    pub expired: usize,
+    /// Queued requests taken for admission (admitted or failed).
+    pub admitted: usize,
+}
+
+impl PoolMaintenance {
+    /// Total maintenance actions.
+    #[must_use]
+    pub fn actions(self) -> usize {
+        self.resolved + self.expired + self.admitted
+    }
+}
+
 struct QueuedConnect {
     request_id: PoolRequestId,
     request: PoolRequest,
@@ -147,14 +217,16 @@ fn config_error(error: crate::ConfigError) -> srt_proto::Error {
 pub struct CallerPool {
     callers: CallerTable,
     max_in_flight: usize,
-    attempt_deadline_micros: u64,
     /// Deadline (protocol micros) for each admitted attempt that has not
-    /// yet reached `Connected`. An id present here counts toward
-    /// `max_in_flight`; removed once the attempt connects (no longer
-    /// subject to `attempt_deadline`, it is now an ordinary established
-    /// session) or is retired for missing its deadline.
+    /// yet reached `Connected`, computed at admission from that request's own
+    /// `attempt_deadline`. An id present here counts toward `max_in_flight`;
+    /// removed once the attempt connects (no longer subject to a deadline, it
+    /// is now an ordinary established session) or is retired for missing it.
     in_flight: HashMap<LogicalCallerId, InFlightAttempt>,
     deadlines: BTreeSet<PoolDeadline>,
+    /// The earliest entry of `deadlines`, cached so parking and the pending
+    /// work predicate are O(1). Refreshed only when the earliest changes.
+    earliest_deadline_micros: Option<u64>,
     queue: VecDeque<QueuedConnect>,
     queue_capacity: usize,
     next_request_id: u64,
@@ -165,40 +237,27 @@ pub struct CallerPool {
     expired: u64,
     failed: u64,
     cancelled: u64,
-    /// Table-owned reusable scratch for bounded expiration visits. Holds at
-    /// most `max_actions` candidates per visit; retained across visits so
-    /// the production path never allocates.
-    visit_scratch: Vec<PoolDeadline>,
 }
 
 impl CallerPool {
     #[must_use]
-    pub fn new(max_in_flight: NonZeroUsize, attempt_deadline: Duration) -> Self {
-        Self::with_queue_capacity(
-            max_in_flight,
-            attempt_deadline,
-            max_in_flight.get().min(1024),
-        )
+    pub fn new(max_in_flight: NonZeroUsize) -> Self {
+        Self::with_queue_capacity(max_in_flight, max_in_flight.get().min(1024))
     }
 
     /// Build a pool with an explicit finite queue bound. A zero capacity is
     /// valid and turns the pool into a non-queueing admission gate while
     /// retaining the old `connect` API.
     #[must_use]
-    pub fn with_queue_capacity(
-        max_in_flight: NonZeroUsize,
-        attempt_deadline: Duration,
-        queue_capacity: usize,
-    ) -> Self {
+    pub fn with_queue_capacity(max_in_flight: NonZeroUsize, queue_capacity: usize) -> Self {
         let max_in_flight = max_in_flight.get().min(MAX_CALLER_POOL_IN_FLIGHT);
         let queue_capacity = queue_capacity.min(MAX_CALLER_POOL_QUEUE);
         Self {
             callers: CallerTable::with_max_callers(max_in_flight.max(DEFAULT_MAX_CALLERS)),
             max_in_flight,
-            attempt_deadline_micros: u64::try_from(attempt_deadline.as_micros())
-                .unwrap_or(u64::MAX),
             in_flight: HashMap::new(),
             deadlines: BTreeSet::new(),
+            earliest_deadline_micros: None,
             queue: VecDeque::new(),
             queue_capacity,
             next_request_id: 1,
@@ -209,7 +268,6 @@ impl CallerPool {
             expired: 0,
             failed: 0,
             cancelled: 0,
-            visit_scratch: Vec::new(),
         }
     }
 
@@ -371,6 +429,7 @@ impl CallerPool {
         request: PoolRequest,
         now: Timestamp,
     ) -> Result<PoolOutcome, srt_proto::Error> {
+        request.validate()?;
         let request_id = self.allocate_request_id()?;
         if self.in_flight.len() < self.max_in_flight {
             let id = self.admit(request_id, request, now)?;
@@ -397,6 +456,10 @@ impl CallerPool {
         request: PoolRequest,
         now: Timestamp,
     ) -> Result<LogicalCallerId, srt_proto::Error> {
+        // The request's own duration, applied from ADMISSION (queue wait never
+        // counts), with saturating arithmetic.
+        let attempt_micros =
+            u64::try_from(request.attempt_deadline().as_micros()).unwrap_or(u64::MAX);
         let id = match request {
             PoolRequest::Direct(prepared) => {
                 let connection = prepared.connection(now).map_err(config_error)?;
@@ -421,7 +484,7 @@ impl CallerPool {
                     .add_group(prepared.group_id, prepared.mode, legs)?
             }
         };
-        let deadline_micros = now.as_micros().saturating_add(self.attempt_deadline_micros);
+        let deadline_micros = now.as_micros().saturating_add(attempt_micros);
         self.in_flight.insert(
             id,
             InFlightAttempt {
@@ -429,7 +492,7 @@ impl CallerPool {
                 deadline_micros,
             },
         );
-        self.deadlines.insert(PoolDeadline {
+        self.insert_deadline(PoolDeadline {
             deadline_micros,
             caller_id: id,
         });
@@ -437,8 +500,20 @@ impl CallerPool {
         Ok(id)
     }
 
+    fn insert_deadline(&mut self, deadline: PoolDeadline) {
+        self.deadlines.insert(deadline);
+        self.earliest_deadline_micros = self.deadlines.first().map(|entry| entry.deadline_micros);
+    }
+
+    fn remove_deadline(&mut self, deadline: &PoolDeadline) {
+        if self.deadlines.remove(deadline) {
+            self.earliest_deadline_micros =
+                self.deadlines.first().map(|entry| entry.deadline_micros);
+        }
+    }
+
     /// Admit queued requests into whatever permits are currently free,
-    /// each with its deadline starting now (not whenever it was
+    /// each with its own deadline starting now (not whenever it was
     /// originally requested).
     fn admit_queued(&mut self, now: Timestamp, max_actions: usize) -> usize {
         let mut actions = 0;
@@ -471,100 +546,100 @@ impl CallerPool {
         actions
     }
 
-    /// Retire every in-flight attempt that reached `attempt_deadline`
-    /// before `Connected`, release its permit, and admit the next queued
-    /// request. Also drops any id that has already reached `Connected`
-    /// from deadline tracking -- it is no longer an "attempt", it is an
-    /// ordinary established session the table itself now owns for as long
-    /// as the application keeps it.
+    /// Whether [`Self::maintain`] has work it could do right now. O(1): a
+    /// resolved attempt is waiting, the earliest admitted deadline is due, or
+    /// a queued request has a free permit.
+    #[must_use]
+    pub fn has_pending_work(&self, now: Timestamp) -> bool {
+        self.callers.resolved_attempts_pending() > 0
+            || self
+                .earliest_deadline_micros
+                .is_some_and(|deadline| deadline <= now.as_micros())
+            || (!self.queue.is_empty() && self.in_flight.len() < self.max_in_flight)
+    }
+
+    /// The single bounded maintenance pass, in three phases under one finite
+    /// `max_actions` budget (zero means zero work):
     ///
-    /// Returns the ids retired for missing their deadline.
-    pub fn poll_expirations(&mut self, now: Timestamp) -> Vec<LogicalCallerId> {
-        self.poll_expirations_bounded(now, crate::OutputDrainBudget::default().max_actions)
-    }
-
-    /// Bounded counterpart to [`Self::poll_expirations`] (finding 3/10):
-    /// visits at most `max_actions` deadline-ordered entries per call
-    /// (earliest first, via the `deadlines` `BTreeSet`) instead of
-    /// scanning every in-flight attempt unconditionally.
-    pub fn poll_expirations_bounded(
-        &mut self,
-        now: Timestamp,
-        max_actions: usize,
-    ) -> Vec<LogicalCallerId> {
-        self.poll_expirations_bounded_with_visits(now, max_actions)
-            .0
-    }
-
-    /// Count-only maintenance: identical bounded work to
-    /// [`Self::poll_expirations_bounded_with_visits`], without materializing
-    /// the retired ids.
+    /// 1. consume exact resolved-attempt ids (connected, rejected, closing):
+    ///    each releases its permit and deadline entry at once;
+    /// 2. consume deadlines that are actually due, earliest first, retiring
+    ///    the attempts that are still establishing;
+    /// 3. admit queued requests into the freed permits.
     ///
-    /// The production Compio Owner only needs the visit count (it surfaces
-    /// retired sessions through `PoolEvent`s it already drains), so this path
-    /// allocates nothing at all -- an `Option<&mut Vec>` that stays `None`
-    /// rather than a fresh `Vec` the caller would immediately discard.
-    pub(crate) fn poll_expirations_count_only(
+    /// A future deadline is never inspected: an unresolved attempt whose
+    /// deadline lies ahead costs nothing here, however many there are.
+    /// `retired` (optional) receives the ids expired by this pass.
+    pub fn maintain(
         &mut self,
         now: Timestamp,
         max_actions: usize,
-    ) -> usize {
-        self.expire_due(now, max_actions, None)
+        retired: Option<&mut Vec<LogicalCallerId>>,
+    ) -> PoolMaintenance {
+        let mut work = PoolMaintenance::default();
+        if max_actions == 0 {
+            return work;
+        }
+        work.resolved = self.release_resolved(max_actions);
+        work.expired = self.expire_due(now, max_actions - work.resolved, retired);
+        let left = max_actions - work.resolved - work.expired;
+        work.admitted = self.admit_queued(now, left);
+        work
     }
 
-    pub(crate) fn poll_expirations_bounded_with_visits(
-        &mut self,
-        now: Timestamp,
-        max_actions: usize,
-    ) -> (Vec<LogicalCallerId>, usize) {
-        let mut retired = Vec::new();
-        let visits = self.expire_due(now, max_actions, Some(&mut retired));
-        (retired, visits)
+    /// Phase 1: release the permit of every attempt the table reports as
+    /// resolved, up to `max_actions`.
+    fn release_resolved(&mut self, max_actions: usize) -> usize {
+        let mut actions = 0;
+        while actions < max_actions {
+            let Some(id) = self.callers.pop_resolved_attempt() else {
+                break;
+            };
+            // Only an id the pool still tracks is work: a caller removed or
+            // never admitted through this pool leaves nothing to release.
+            if let Some(attempt) = self.in_flight.remove(&id) {
+                self.remove_deadline(&PoolDeadline {
+                    deadline_micros: attempt.deadline_micros,
+                    caller_id: id,
+                });
+                actions += 1;
+            }
+        }
+        actions
     }
 
-    /// The single bounded expiration pass. `retired` is `None` for the
-    /// count-only path, which is what keeps that path allocation-free.
+    /// Phase 2: retire due attempts, earliest first. Returns the actions
+    /// spent. A due entry whose caller resolved in the meantime is released,
+    /// not destroyed.
     fn expire_due(
         &mut self,
         now: Timestamp,
         max_actions: usize,
         mut retired: Option<&mut Vec<LogicalCallerId>>,
     ) -> usize {
-        if max_actions == 0 {
-            return 0;
-        }
         let now_micros = now.as_micros();
-        // Non-allocating production path: reuse table-owned scratch for
-        self.visit_scratch.clear();
-        self.visit_scratch
-            .extend(self.deadlines.iter().take(max_actions).copied());
-        let candidate_actions = self.visit_scratch.len();
-        let mut expired_count = 0usize;
-        let mut idx = 0;
-        while idx < self.visit_scratch.len() {
-            let candidate = self.visit_scratch[idx];
-            idx += 1;
+        let mut actions = 0;
+        let mut expired_count = 0u64;
+        while actions < max_actions {
+            let Some(candidate) = self.deadlines.first().copied() else {
+                break;
+            };
+            if candidate.deadline_micros > now_micros {
+                break;
+            }
+            actions += 1;
+            self.remove_deadline(&candidate);
             // `attempt_status` (the protocol's own state), not
-            // `LogicalCallerState`: the latter
-            // folds `Closing` into the same `Connecting` value as a
-            // session that has never connected at all, which would make a
-            // session that connected and is now gracefully closing
-            // indistinguishable from a stalled attempt -- and destroy it,
-            // pending SHUTDOWN and all, the moment its original
-            // `attempt_deadline` (irrelevant to it by now) passes.
+            // `LogicalCallerState`: the latter folds `Closing` into the same
+            // `Connecting` value as a session that has never connected at
+            // all, which would destroy a session that connected and is now
+            // gracefully closing -- pending SHUTDOWN and all -- the moment
+            // its original deadline (irrelevant to it by now) passes.
             match self.callers.attempt_status(&candidate.caller_id) {
-                // Resolved one way or another -- succeeded, or already
-                // closing/closed on its own -- so no longer a stalled
-                // attempt this pool should retire. A rejected handshake
-                // (straight to `Disconnected` without ever reaching
-                // `Connected`) also releases its permit immediately here
-                // rather than holding it for the rest of `attempt_deadline`.
                 None | Some(AttemptStatus::Resolved) => {
-                    self.deadlines.remove(&candidate);
                     self.in_flight.remove(&candidate.caller_id);
                 }
-                Some(AttemptStatus::Establishing) if candidate.deadline_micros <= now_micros => {
-                    self.deadlines.remove(&candidate);
+                Some(AttemptStatus::Establishing) => {
                     if let Some(attempt) = self.in_flight.remove(&candidate.caller_id) {
                         // Removes the whole logical caller: every leg, its
                         // routes and timers.
@@ -579,13 +654,40 @@ impl CallerPool {
                     }
                     expired_count += 1;
                 }
-                Some(AttemptStatus::Establishing) => {}
             }
         }
-        self.visit_scratch.clear();
-        self.expired = self.expired.saturating_add(expired_count as u64);
-        let admitted = self.admit_queued(now, max_actions.saturating_sub(candidate_actions));
-        candidate_actions.saturating_add(admitted)
+        self.expired = self.expired.saturating_add(expired_count);
+        actions
+    }
+
+    /// Retire every in-flight attempt that reached its own deadline before
+    /// `Connected`, release its permit, and admit the next queued request,
+    /// with the default finite work bound.
+    ///
+    /// Returns the ids retired for missing their deadline.
+    pub fn poll_expirations(&mut self, now: Timestamp) -> Vec<LogicalCallerId> {
+        self.poll_expirations_bounded(now, crate::OutputDrainBudget::default().max_actions)
+    }
+
+    /// Bounded counterpart to [`Self::poll_expirations`]: at most
+    /// `max_actions` real maintenance actions per call.
+    pub fn poll_expirations_bounded(
+        &mut self,
+        now: Timestamp,
+        max_actions: usize,
+    ) -> Vec<LogicalCallerId> {
+        self.poll_expirations_bounded_with_visits(now, max_actions)
+            .0
+    }
+
+    pub(crate) fn poll_expirations_bounded_with_visits(
+        &mut self,
+        now: Timestamp,
+        max_actions: usize,
+    ) -> (Vec<LogicalCallerId>, usize) {
+        let mut retired = Vec::new();
+        let work = self.maintain(now, max_actions, Some(&mut retired));
+        (retired, work.actions())
     }
 
     /// Atomically retire one pooled attempt or established session,
@@ -596,7 +698,7 @@ impl CallerPool {
     /// table's real contents.
     pub fn remove(&mut self, id: LogicalCallerId) -> Option<RemovedLogicalCaller> {
         if let Some(attempt) = self.in_flight.remove(&id) {
-            self.deadlines.remove(&PoolDeadline {
+            self.remove_deadline(&PoolDeadline {
                 deadline_micros: attempt.deadline_micros,
                 caller_id: id,
             });
@@ -608,19 +710,16 @@ impl CallerPool {
         self.callers.remove(id)
     }
 
-    /// Microseconds until either this pool's own earliest attempt
-    /// deadline or the underlying table's next protocol timer, whichever
-    /// is sooner.
+    /// Microseconds until either this pool's own earliest admitted attempt
+    /// deadline or the underlying table's next protocol timer, whichever is
+    /// sooner. Queued requests have no deadline yet. O(1).
     #[must_use]
     pub fn time_until_next_deadline(&self, now: Timestamp, default_micros: u64) -> u64 {
         let table_us = self.callers.time_until_next_deadline(now, default_micros);
-        let Some(entry) = self.deadlines.iter().next() else {
+        let Some(deadline) = self.earliest_deadline_micros else {
             return table_us;
         };
-        let pool_us = entry
-            .deadline_micros
-            .saturating_sub(now.as_micros())
-            .min(default_micros);
+        let pool_us = deadline.saturating_sub(now.as_micros()).min(default_micros);
         pool_us.min(table_us)
     }
 
@@ -642,13 +741,25 @@ impl CallerPool {
 }
 
 #[cfg(test)]
+mod request_deadline_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{AdmissionOptions, IngressTelemetry, LogicalCallerState, PeerTable, RuntimeFlavor};
     use std::net::SocketAddr;
 
     fn prepared_caller(remote: SocketAddr) -> PreparedCaller {
+        prepared_caller_in(remote, Duration::from_secs(15))
+    }
+
+    /// A prepared caller whose own connect request carries `deadline`.
+    fn prepared_caller_in(remote: SocketAddr, deadline: Duration) -> PreparedCaller {
         crate::CallerConfig::builder(remote)
+            .connect(crate::ConnectConfig {
+                attempt_deadline: deadline,
+                ..crate::ConnectConfig::default()
+            })
             .build()
             .expect("caller config")
             .prepare(RuntimeFlavor::Mio)
@@ -659,7 +770,6 @@ mod tests {
     fn pool_clamps_adversarial_capacities() {
         let pool = CallerPool::with_queue_capacity(
             NonZeroUsize::new(usize::MAX).expect("non-zero"),
-            Duration::from_secs(1),
             usize::MAX,
         );
         let stats = pool.stats();
@@ -697,18 +807,19 @@ mod tests {
     /// `CallerTable`.
     #[test]
     fn pool_never_exceeds_max_in_flight_and_queues_the_rest() {
-        let mut pool = CallerPool::new(NonZeroUsize::new(2).unwrap(), Duration::from_secs(5));
+        const DEADLINE: Duration = Duration::from_secs(5);
+        let mut pool = CallerPool::new(NonZeroUsize::new(2).unwrap());
         let remote: SocketAddr = "127.0.0.1:19000".parse().unwrap();
         let now = Timestamp::from_micros(0);
 
         let a = pool
-            .connect(prepared_caller(remote), now)
+            .connect(prepared_caller_in(remote, DEADLINE), now)
             .expect("connect a");
         let b = pool
-            .connect(prepared_caller(remote), now)
+            .connect(prepared_caller_in(remote, DEADLINE), now)
             .expect("connect b");
         let c = pool
-            .connect(prepared_caller(remote), now)
+            .connect(prepared_caller_in(remote, DEADLINE), now)
             .expect("connect c");
 
         assert!(matches!(a, PoolOutcome::Admitted(_)));
@@ -723,18 +834,19 @@ mod tests {
 
     #[test]
     fn queued_request_outcomes_keep_the_request_identity() {
-        let mut pool = CallerPool::new(NonZeroUsize::new(1).unwrap(), Duration::from_secs(1));
+        const DEADLINE: Duration = Duration::from_secs(1);
+        let mut pool = CallerPool::new(NonZeroUsize::new(1).unwrap());
         let remote: SocketAddr = "127.0.0.1:19005".parse().unwrap();
         let now = Timestamp::from_micros(0);
         let first = pool
-            .connect(prepared_caller(remote), now)
+            .connect(prepared_caller_in(remote, DEADLINE), now)
             .expect("first connect");
         let first_id = match first {
             PoolOutcome::Admitted(id) => id,
             other => panic!("first request must admit, got {other:?}"),
         };
         let queued = pool
-            .connect(prepared_caller(remote), now)
+            .connect(prepared_caller_in(remote, DEADLINE), now)
             .expect("queued connect");
         let request_id = match queued {
             PoolOutcome::Queued(id) => id,
@@ -765,18 +877,19 @@ mod tests {
     /// queued request behind it is admitted.
     #[test]
     fn stalled_attempt_expires_and_releases_its_permit_for_the_next_queued_request() {
-        let mut pool = CallerPool::new(NonZeroUsize::new(1).unwrap(), Duration::from_micros(1_000));
+        const DEADLINE: Duration = Duration::from_micros(1_000);
+        let mut pool = CallerPool::new(NonZeroUsize::new(1).unwrap());
         let remote: SocketAddr = "127.0.0.1:19001".parse().unwrap();
         let start = Timestamp::from_micros(0);
 
         let PoolOutcome::Admitted(first_id) = pool
-            .connect(prepared_caller(remote), start)
+            .connect(prepared_caller_in(remote, DEADLINE), start)
             .expect("connect first")
         else {
             panic!("first request must admit under budget")
         };
         let second = pool
-            .connect(prepared_caller(remote), start)
+            .connect(prepared_caller_in(remote, DEADLINE), start)
             .expect("connect second");
         assert!(matches!(second, PoolOutcome::Queued(_)));
 
@@ -801,18 +914,19 @@ mod tests {
     /// eventually given.
     #[test]
     fn a_queued_requests_deadline_starts_at_its_own_admission_not_the_original_request() {
-        let mut pool = CallerPool::new(NonZeroUsize::new(1).unwrap(), Duration::from_micros(1_000));
+        const DEADLINE: Duration = Duration::from_micros(1_000);
+        let mut pool = CallerPool::new(NonZeroUsize::new(1).unwrap());
         let remote: SocketAddr = "127.0.0.1:19002".parse().unwrap();
         let start = Timestamp::from_micros(0);
 
         let PoolOutcome::Admitted(first_id) = pool
-            .connect(prepared_caller(remote), start)
+            .connect(prepared_caller_in(remote, DEADLINE), start)
             .expect("connect first")
         else {
             panic!("first request must admit under budget")
         };
         let second = pool
-            .connect(prepared_caller(remote), start)
+            .connect(prepared_caller_in(remote, DEADLINE), start)
             .expect("connect second");
         assert!(matches!(second, PoolOutcome::Queued(_)));
 
@@ -848,14 +962,18 @@ mod tests {
     /// that is called, even long past `attempt_deadline`.
     #[test]
     fn a_connected_attempt_is_never_treated_as_expired() {
-        let mut pool = CallerPool::new(NonZeroUsize::new(1).unwrap(), Duration::from_micros(1_000));
+        const DEADLINE: Duration = Duration::from_micros(1_000);
+        let mut pool = CallerPool::new(NonZeroUsize::new(1).unwrap());
         let remote: SocketAddr = "127.0.0.1:19003".parse().unwrap();
         let options = AdmissionOptions::basic(0xC0DE, 20, false);
         let telemetry = IngressTelemetry::new();
         let mut listener = PeerTable::new();
 
         let PoolOutcome::Admitted(id) = pool
-            .connect(prepared_caller(remote), Timestamp::from_micros(0))
+            .connect(
+                prepared_caller_in(remote, DEADLINE),
+                Timestamp::from_micros(0),
+            )
             .expect("connect")
         else {
             panic!("must admit under budget")
@@ -897,14 +1015,18 @@ mod tests {
     /// once its (by-then-irrelevant) original attempt_deadline passes.
     #[test]
     fn a_gracefully_closing_session_is_never_treated_as_an_expired_attempt() {
-        let mut pool = CallerPool::new(NonZeroUsize::new(1).unwrap(), Duration::from_micros(1_000));
+        const DEADLINE: Duration = Duration::from_micros(1_000);
+        let mut pool = CallerPool::new(NonZeroUsize::new(1).unwrap());
         let remote: SocketAddr = "127.0.0.1:19004".parse().unwrap();
         let options = AdmissionOptions::basic(0xC0FE, 20, false);
         let telemetry = IngressTelemetry::new();
         let mut listener = PeerTable::new();
 
         let PoolOutcome::Admitted(id) = pool
-            .connect(prepared_caller(remote), Timestamp::from_micros(0))
+            .connect(
+                prepared_caller_in(remote, DEADLINE),
+                Timestamp::from_micros(0),
+            )
             .expect("connect")
         else {
             panic!("must admit under budget")
@@ -944,9 +1066,10 @@ mod tests {
         );
     }
 
-    fn shared_caller(remote: SocketAddr) -> crate::CallerConfig {
+    fn shared_caller(remote: SocketAddr, deadline: Duration) -> crate::CallerConfig {
         crate::CallerConfig::builder(remote)
             .ownership(crate::SocketOwnership::Shared)
+            .connect_deadline(deadline)
             .build()
             .expect("caller config")
     }
@@ -956,12 +1079,21 @@ mod tests {
         remotes: &[SocketAddr],
         explicit_socket_ids: bool,
     ) -> PreparedBondedCaller {
+        prepared_group_in(group, remotes, explicit_socket_ids, Duration::from_secs(15))
+    }
+
+    fn prepared_group_in(
+        group: u32,
+        remotes: &[SocketAddr],
+        explicit_socket_ids: bool,
+        deadline: Duration,
+    ) -> PreparedBondedCaller {
         let mut config = crate::BondedCallerConfig::new(crate::GroupConfig::new(
             group,
             srt_proto::handshake::GroupType::Broadcast,
         ));
         for (index, remote) in remotes.iter().enumerate() {
-            let mut leg = shared_caller(*remote);
+            let mut leg = shared_caller(*remote, deadline);
             if explicit_socket_ids {
                 leg.session
                     .set_socket_id(0x7000 + u32::try_from(index).expect("small") + 1);
@@ -982,7 +1114,7 @@ mod tests {
     /// A bonded group is one logical caller and one in-flight permit.
     #[test]
     fn bonded_group_takes_one_permit_and_one_logical_caller() {
-        let mut pool = CallerPool::new(NonZeroUsize::new(2).unwrap(), Duration::from_secs(5));
+        let mut pool = CallerPool::new(NonZeroUsize::new(2).unwrap());
         let now = Timestamp::from_micros(0);
         let group = match pool
             .connect_group(prepared_group(1, &remotes(3), false), now)
@@ -1007,9 +1139,13 @@ mod tests {
 
     #[test]
     fn queued_group_is_admitted_with_its_request_id_and_a_fresh_deadline() {
-        let mut pool = CallerPool::new(NonZeroUsize::new(1).unwrap(), Duration::from_millis(50));
+        const DEADLINE: Duration = Duration::from_millis(50);
+        let mut pool = CallerPool::new(NonZeroUsize::new(1).unwrap());
         let first = match pool
-            .connect(prepared_caller(remotes(1)[0]), Timestamp::from_micros(0))
+            .connect(
+                prepared_caller_in(remotes(1)[0], DEADLINE),
+                Timestamp::from_micros(0),
+            )
             .expect("first")
         {
             PoolOutcome::Admitted(id) => id,
@@ -1017,7 +1153,7 @@ mod tests {
         };
         let request_id = match pool
             .connect_group(
-                prepared_group(2, &remotes(2), false),
+                prepared_group_in(2, &remotes(2), false, DEADLINE),
                 Timestamp::from_micros(0),
             )
             .expect("queued group")
@@ -1059,11 +1195,7 @@ mod tests {
 
     #[test]
     fn full_queue_refuses_a_group_without_retaining_it() {
-        let mut pool = CallerPool::with_queue_capacity(
-            NonZeroUsize::new(1).unwrap(),
-            Duration::from_secs(5),
-            1,
-        );
+        let mut pool = CallerPool::with_queue_capacity(NonZeroUsize::new(1).unwrap(), 1);
         let now = Timestamp::from_micros(0);
         assert!(matches!(
             pool.connect(prepared_caller(remotes(1)[0]), now),
@@ -1086,10 +1218,11 @@ mod tests {
     /// pool deadline; cancellation does the same.
     #[test]
     fn expiring_or_removing_a_group_reclaims_every_leg() {
-        let mut pool = CallerPool::new(NonZeroUsize::new(4).unwrap(), Duration::from_millis(10));
+        const DEADLINE: Duration = Duration::from_millis(10);
+        let mut pool = CallerPool::new(NonZeroUsize::new(4).unwrap());
         let now = Timestamp::from_micros(0);
         let group = match pool
-            .connect_group(prepared_group(5, &remotes(3), true), now)
+            .connect_group(prepared_group_in(5, &remotes(3), true, DEADLINE), now)
             .expect("group")
         {
             PoolOutcome::Admitted(id) => id,
@@ -1110,7 +1243,7 @@ mod tests {
         // The same explicit socket IDs are admissible again: routes are gone.
         let again = match pool
             .connect_group(
-                prepared_group(5, &remotes(3), true),
+                prepared_group_in(5, &remotes(3), true, DEADLINE),
                 Timestamp::from_micros(30_000),
             )
             .expect("re-admit")
@@ -1134,7 +1267,7 @@ mod tests {
     /// A refused group leaves no bookkeeping behind (duplicate socket IDs).
     #[test]
     fn refused_group_admission_leaves_no_state() {
-        let mut pool = CallerPool::new(NonZeroUsize::new(4).unwrap(), Duration::from_secs(5));
+        let mut pool = CallerPool::new(NonZeroUsize::new(4).unwrap());
         let now = Timestamp::from_micros(0);
         let first = prepared_group(6, &remotes(2), true);
         assert!(matches!(

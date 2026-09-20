@@ -66,9 +66,29 @@ This ordering is why `DatagramSlot::commit` is infallible and why the protocol's
 
 `Owner::service(now, budget)` performs at most the work `budget` declares, per
 axis: `max_completions`, `max_rx_packets`, `max_rx_bytes`, `max_actions`,
-`max_tx_packets`, `max_tx_bytes`. Zero on an axis means zero work on that axis —
-never "unlimited". The visit never blocks on I/O and never waits for a
-completion; completions are reaped only when already ready.
+`max_maintenance_actions`, `max_tx_packets`, `max_tx_bytes`. Zero on an axis
+means zero work on that axis — never "unlimited". The visit never blocks on I/O
+and never waits for a completion; completions are reaped only when already
+ready.
+
+Lifecycle maintenance and protocol output have **independent** finite axes:
+`max_maintenance_actions` bounds caller-pool resolution, expiry and queued
+admission plus listener idle reclaim; `max_actions` (with the packet and byte
+caps) bounds protocol output. Neither can consume the other's allowance, so a
+small fixed budget is correct at any fan-out and no capacity-derived multiplier
+is ever needed. Only real work is charged: a future, still-establishing attempt
+costs nothing. The report separates them (`actions` for output,
+`maintenance_actions` for maintenance).
+
+The caller pool has two separate policies. **Capacity** (`max_in_flight`,
+`Owner::set_caller_pool_capacity`) is a shared resource bound. The **attempt
+deadline** belongs to each logical connect request
+(`CallerConfig.connect.attempt_deadline`; one validated value per bonded
+request); its clock starts at admission, never while queued. Pool maintenance is
+exact: attempts that stopped establishing (connected, rejected, closing) are
+found through an exact per-caller resolution index and release their permit
+promptly, and expiry visits only deadlines that are actually due, earliest
+first.
 
 The returned `OwnerServiceReport` describes *that visit only*. Cumulative values
 are separate, and callers accumulate deltas themselves.
@@ -220,11 +240,11 @@ config-level halves in `caller_pool.rs` and `config.rs`.
 | 1 ownership | Not `Send`/`Sync`: enforced by the type; `owner_sibling_isolation` |
 | 2 fixed capacity | `owner_tx_bounded_concurrency_and_pool_exhaustion`, `owner_tx_pool_alloc_and_recycling`, `tx_pool_high_water_tracks_the_peak_and_never_exceeds_capacity` |
 | 3 reserve before materialize | `tx_pool_exhaustion_leaves_protocol_datagram_pending`, `owner_connects_transfers_data_and_tracks_resources` |
-| 4 bounded service | `rx_budget_is_exact_and_zero_means_zero`, `service_with_zero_completion_budget_reaps_nothing`, `service_returns_tx_buffers_and_updates_completion_stats`, `one_action_budget_bounds_whole_caller_visit` |
+| 4 bounded service | `future_attempts_do_not_starve_handshake_tx_under_a_tiny_fixed_budget`, `tiny_budgets_let_maintenance_and_tx_both_make_progress`, `rx_budget_is_exact_and_zero_means_zero`, `service_with_zero_completion_budget_reaps_nothing`, `service_returns_tx_buffers_and_updates_completion_stats`, `one_action_budget_bounds_whole_caller_visit` |
 | 5 protocol-owned timers | `owner_wake_includes_caller_pool_attempt_deadline`, `crates/srt-transport/tests/tail_recovery.rs` |
 | 6 explicit continuation | `tx_pool_exhaustion_leaves_protocol_datagram_pending`, `owner_tx_bounded_concurrency_and_pool_exhaustion` |
 | 7 fault poisoning | `managed_rx_stream_failure_faults_the_owner`, `rx_consumer_fault_stops_rx_maintenance_and_tx`, `owner_fault_gates_listen_and_connect_through_public_apis`, `failed_attach_does_not_freeze_the_owner`, `a_dead_tx_lane_poisons_the_owner_and_cannot_continue_at_reduced_capacity` |
-| 8 admission/backpressure | `owner_rejects_session_with_incompatible_wire_ceiling`, `owner_wake_includes_caller_pool_attempt_deadline`, bonded: `bonded_connect_admits_one_logical_caller_immediately`, `queued_bonded_request_keeps_its_id_and_its_deadline_starts_at_admission`, `full_pool_refuses_a_bonded_request_without_retaining_it`, `bonded_attempt_deadline_retires_the_whole_group`, `remove_caller_reclaims_every_leg_route_and_deadline`, `bonded_leg_count_is_bounded_by_the_protocol_limit`, `rejected_bonded_attach_is_transactional`, `failed_first_bonded_admission_leaves_the_owner_untouched`, `failed_first_admission_under_managed_rx_starts_no_consumer`, `caller_side_construction_starts_no_managed_task`, `first_direct_connect_commits_side_mode_and_session_together`, `bonded_and_direct_callers_share_one_socket_at_fixed_runtime_cost`, `broadcast_send_reaches_every_established_leg`, `backup_send_uses_the_established_leg_only`, `shutdown_with_a_live_bonded_caller_is_quiescent` |
+| 8 admission/backpressure | `owner_rejects_session_with_incompatible_wire_ceiling`, `owner_capacity_never_rewrites_a_request_deadline`, `shared_callers_may_differ_in_deadline_but_not_in_capacity`, `bonded_legs_with_different_deadlines_are_refused_transactionally`, `pending_work_includes_runnable_pool_work`, `owner_wake_includes_caller_pool_attempt_deadline`, bonded: `bonded_connect_admits_one_logical_caller_immediately`, `queued_bonded_request_keeps_its_id_and_its_deadline_starts_at_admission`, `full_pool_refuses_a_bonded_request_without_retaining_it`, `bonded_attempt_deadline_retires_the_whole_group`, `remove_caller_reclaims_every_leg_route_and_deadline`, `bonded_leg_count_is_bounded_by_the_protocol_limit`, `rejected_bonded_attach_is_transactional`, `failed_first_bonded_admission_leaves_the_owner_untouched`, `failed_first_admission_under_managed_rx_starts_no_consumer`, `caller_side_construction_starts_no_managed_task`, `first_direct_connect_commits_side_mode_and_session_together`, `bonded_and_direct_callers_share_one_socket_at_fixed_runtime_cost`, `broadcast_send_reaches_every_established_leg`, `backup_send_uses_the_established_leg_only`, `shutdown_with_a_live_bonded_caller_is_quiescent` |
 | 9 completion ownership | `service_returns_tx_buffers_and_updates_completion_stats`, `tx_failure_event_reports_the_logical_attribution`, `owner_sibling_isolation`, `bonded_tx_failure_is_attributed_to_group_and_leg` |
 | 10 bounded close | `shutdown_and_drain_reaps_in_flight_to_quiescence`, `shutdown_timeout_does_not_fabricate_quiescence`, `shutdown_verdict_requires_rx_quiescence`, `a_dead_tx_lane_poisons_the_owner_and_cannot_continue_at_reduced_capacity` |
 | 11 telemetry meanings | `report_tx_class_total_matches_submitted_packets_every_visit`, `tx_class_delta_reports_only_this_visits_submissions`, `first_submit_lateness_samples_only_first_transmission_data_with_a_due_instant`, `first_submit_lateness_measures_a_real_application_submission`, `tx_pool_high_water_tracks_the_peak_and_never_exceeds_capacity`, `rx_stats_expose_both_sides`, `rx_session_totals_report_live_sessions_and_survive_retirement`, `rx_session_totals_are_none_without_an_attached_side`, `rx_session_totals_include_bonded_group_legs` |

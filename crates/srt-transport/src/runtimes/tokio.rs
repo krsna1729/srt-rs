@@ -1104,8 +1104,8 @@ struct OwnerCallerSide {
 /// Every other design decision mirrors the Mio owner exactly -- same
 /// `PerPort`-only listener topology, same `SocketOwnership::Shared`
 /// requirement for callers, same IPv4-only send path restriction, same
-/// finite default caller-pool policy overridable via
-/// [`Self::set_caller_pool_policy`], same `idle_timeout` enforcement every
+/// finite default caller-pool capacity overridable via
+/// [`Self::set_caller_pool_capacity`], same `idle_timeout` enforcement every
 /// tick -- because both owners are assembled from the identical
 /// runtime-agnostic tables; only the socket layer differs.
 ///
@@ -1117,8 +1117,7 @@ struct OwnerCallerSide {
 pub struct Owner {
     listener: Option<OwnerListenerSide>,
     caller: Option<OwnerCallerSide>,
-    caller_pool_policy: Option<(std::num::NonZeroUsize, Duration)>,
-    caller_pool_policy_explicit: bool,
+    caller_pool_capacity: Option<std::num::NonZeroUsize>,
     expired_callers: VecDeque<crate::LogicalCallerId>,
     socket_memory_budget: Option<std::num::NonZeroUsize>,
 }
@@ -1135,36 +1134,30 @@ impl Owner {
         Self {
             listener: None,
             caller: None,
-            caller_pool_policy: None,
-            caller_pool_policy_explicit: false,
+            caller_pool_capacity: None,
             expired_callers: VecDeque::new(),
             socket_memory_budget: None,
         }
     }
 
-    /// Set the caller-side `max_in_flight`/`attempt_deadline` policy (A04).
-    /// Must be called before the first [`Self::connect`] call.
-    pub fn set_caller_pool_policy(
+    /// Set the shared caller pool CAPACITY (`max_in_flight`): how many
+    /// handshakes this owner may have in flight at once. It is a resource
+    /// bound for the whole owner and does not touch any request's
+    /// `attempt_deadline`, which stays each logical caller's own
+    /// `CallerConfig.connect.attempt_deadline` (its clock starts at admission,
+    /// never while queued). Must be called before the first connect.
+    pub fn set_caller_pool_capacity(
         &mut self,
         max_in_flight: std::num::NonZeroUsize,
-        attempt_deadline: Duration,
     ) -> Result<(), crate::RuntimeBuildError> {
         if self.caller.is_some() {
             return Err(crate::RuntimeBuildError::from(crate::ConfigError::new(
-                "caller_pool_policy",
+                "caller_pool_capacity",
                 "must be set before the first connect() call, not after the caller \
                  socket and its pool already exist",
             )));
         }
-        if attempt_deadline.is_zero() {
-            return Err(crate::ConfigError::new(
-                "caller_pool_policy",
-                "attempt deadline must be positive",
-            )
-            .into());
-        }
-        self.caller_pool_policy = Some((max_in_flight, attempt_deadline));
-        self.caller_pool_policy_explicit = true;
+        self.caller_pool_capacity = Some(max_in_flight);
         Ok(())
     }
 
@@ -1260,11 +1253,8 @@ impl Owner {
         now: Timestamp,
     ) -> Result<crate::PoolOutcome, crate::RuntimeBuildError> {
         let mut prepared = config.prepare(crate::RuntimeFlavor::Tokio)?;
-        if self.caller_pool_policy_explicit
-            && let Some((max_in_flight, attempt_deadline)) = self.caller_pool_policy
-        {
+        if let Some(max_in_flight) = self.caller_pool_capacity {
             prepared.connect.max_in_flight = max_in_flight;
-            prepared.connect.attempt_deadline = attempt_deadline;
         }
         if prepared.transport.exclusive {
             return Err(crate::RuntimeBuildError::from(crate::ConfigError::new(
@@ -1310,11 +1300,7 @@ impl Owner {
                 }
             }
             let socket = UdpSocket::from_std(prepared.bind_socket()?)?;
-            let policy = self.caller_pool_policy.unwrap_or((
-                prepared.connect.max_in_flight,
-                prepared.connect.attempt_deadline,
-            ));
-            self.caller_pool_policy = Some(policy);
+            let max_in_flight = prepared.connect.max_in_flight;
             self.caller = Some(OwnerCallerSide {
                 socket,
                 // A zero queue capacity, not `CallerPool::new`'s default
@@ -1330,7 +1316,7 @@ impl Owner {
                 // tracks `PoolOutcome::Queued` through the pool's own
                 // outcome stream; that path is `mio::Owner`'s, which keeps
                 // a real queue.
-                callers: crate::CallerPool::with_queue_capacity(policy.0, policy.1, 0),
+                callers: crate::CallerPool::with_queue_capacity(max_in_flight, 0),
                 recv_batch: RecvBatch::with_capacity(
                     prepared.transport.recv_batch_capacity(),
                     RecvBatch::DEFAULT_BUF_LEN,
@@ -1344,17 +1330,6 @@ impl Owner {
                 local_bind: prepared.local_bind,
                 connect_config: prepared.connect,
             });
-        } else if !self.caller_pool_policy_explicit
-            && self.caller_pool_policy
-                != Some((
-                    prepared.connect.max_in_flight,
-                    prepared.connect.attempt_deadline,
-                ))
-        {
-            return Err(crate::RuntimeBuildError::from(crate::ConfigError::new(
-                "caller.connect",
-                "all callers on a shared owner must use the first caller pool policy",
-            )));
         }
         let side = self.caller.as_mut().expect("just ensured above");
         side.callers.connect(prepared, now).map_err(|error| {
@@ -3381,7 +3356,7 @@ impl Facade {
     /// anywhere.
     ///
     /// Returns [`FacadeError::PoolFull`], not an async wait, if the caller
-    /// pool is at `max_in_flight` (see [`Owner::set_caller_pool_policy`])
+    /// pool is at `max_in_flight` (see [`Owner::set_caller_pool_capacity`])
     /// or its queue is already full, and [`FacadeError::QueueFull`] if the
     /// shared command channel itself is momentarily full: checkpoint 2
     /// asks that no application call await behind another session's

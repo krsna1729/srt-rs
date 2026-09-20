@@ -334,11 +334,10 @@ async fn run_sender(
         // H is an input too: F sessions may be desired while only H
         // connection attempts are active at any moment.
         owner
-            .set_caller_pool_policy(
+            .set_caller_pool_capacity(
                 std::num::NonZeroUsize::new(connect_cc.max(1)).expect("nonzero"),
-                CONNECT_DEADLINE,
             )
-            .expect("pool policy set before first connect");
+            .expect("pool capacity set before first connect");
 
         let mut now = Timestamp::from_micros(10_000);
         // F sessions are DESIRED; H controls how many connect requests the
@@ -354,6 +353,7 @@ async fn run_sender(
                     SocketAddr::from(([127, 0, 0, 1], base_port + (index as u16 % 4096)));
                 CallerConfig::builder(remote)
                     .ownership(SocketOwnership::Shared)
+                    .connect_deadline(CONNECT_DEADLINE)
                     .configure_session(|session| {
                         session.handshake.timeout = CONNECT_DEADLINE;
                     })
