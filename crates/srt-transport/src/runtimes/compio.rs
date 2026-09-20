@@ -1330,6 +1330,25 @@ pub struct ListenerSide {
     pending_rx: Option<(SocketAddr, usize)>,
     /// Persistent staging slot. ALWAYS `DEFAULT_RX_SLOT_SIZE`.
     stage_buf: Vec<u8>,
+    /// Application admission policy (see [`crate::ListenerAdmissionResolver`]),
+    /// stored once per listener. Both receive paths reach it through
+    /// [`admit_listener_datagram`] and nowhere else.
+    resolver: Option<crate::ListenerAdmissionResolver>,
+}
+
+/// The ONE place a listener datagram enters admission, whichever receive
+/// datapath (readiness or managed multishot) delivered it.
+#[allow(clippy::too_many_arguments)]
+fn admit_listener_datagram(
+    table: &mut PeerTable,
+    resolver: Option<&crate::ListenerAdmissionResolver>,
+    options: &crate::AdmissionOptions,
+    telemetry: &IngressTelemetry,
+    peer: SocketAddr,
+    data: &[u8],
+    now: Timestamp,
+) {
+    let _ = table.admit_with_listener_resolver(resolver, peer, data, now, options, 0, 1, telemetry);
 }
 
 impl ListenerSide {
@@ -1379,12 +1398,22 @@ impl ListenerSide {
             poll_fd,
             pending_rx: None,
             stage_buf: vec![0u8; DEFAULT_RX_SLOT_SIZE],
+            resolver: None,
         };
         if rx_mode == OwnerRxMode::ManagedMultishot {
             side.rx = SideRx::managed(managed_slot_len, true);
             side.spawn_managed_rx_task(managed_slot_len);
         }
         Ok(side)
+    }
+
+    /// Attach the application admission policy (before the side is committed).
+    pub(crate) fn with_resolver(
+        mut self,
+        resolver: Option<crate::ListenerAdmissionResolver>,
+    ) -> Self {
+        self.resolver = resolver;
+        self
     }
 
     /// Spawn the one fixed managed RX task for this socket (idempotent).
@@ -3413,6 +3442,28 @@ impl Owner {
         &mut self,
         config: &crate::ListenerConfig,
     ) -> Result<(), crate::RuntimeBuildError> {
+        self.listen_inner(config, None)
+    }
+
+    /// [`Self::listen`] with a synchronous, request-resolved admission policy:
+    /// per-StreamID authorization, latency, encryption and receiving-group
+    /// identity via `AdmissionRequest -> AdmissionResolution`, applied on the
+    /// packet-owner thread after cookie validation and before CONCLUSION, for
+    /// the readiness and managed receive paths alike. The attach is
+    /// transactional exactly like [`Self::listen`].
+    pub fn listen_with_resolver(
+        &mut self,
+        config: &crate::ListenerConfig,
+        resolver: crate::ListenerAdmissionResolver,
+    ) -> Result<(), crate::RuntimeBuildError> {
+        self.listen_inner(config, Some(resolver))
+    }
+
+    fn listen_inner(
+        &mut self,
+        config: &crate::ListenerConfig,
+        resolver: Option<crate::ListenerAdmissionResolver>,
+    ) -> Result<(), crate::RuntimeBuildError> {
         self.ensure_operational("listener.listen")?;
         if self.listener.is_some() {
             return Err(crate::RuntimeBuildError::from(crate::ConfigError::new(
@@ -3479,7 +3530,8 @@ impl Owner {
         let slot_len = managed_rx_buffer_len(self.wire_ceiling);
         // Construct first: a refused attach drops the bound socket and leaves
         // the Owner exactly as configurable as it was before the attempt.
-        let side = ListenerSide::from_prepared_with_rx_mode(sock, prepared, rx_mode, slot_len)?;
+        let side = ListenerSide::from_prepared_with_rx_mode(sock, prepared, rx_mode, slot_len)?
+            .with_resolver(resolver);
         self.listener = Some(side);
         self.rx_mode = Some(rx_mode);
         self.sessions_started = true;
@@ -4116,14 +4168,14 @@ impl Owner {
             }
             report.rx_packets += 1;
             report.rx_bytes += len;
-            let _ = listener.table.admit(
+            admit_listener_datagram(
+                &mut listener.table,
+                listener.resolver.as_ref(),
+                &listener.options,
+                &listener.telemetry,
                 peer,
                 &listener.stage_buf[..len],
                 now,
-                &listener.options,
-                0,
-                1,
-                &listener.telemetry,
             );
             listener.pending_rx = None;
         }
@@ -4167,14 +4219,14 @@ impl Owner {
             }
             report.rx_packets += 1;
             report.rx_bytes += len;
-            let _ = listener.table.admit(
+            admit_listener_datagram(
+                &mut listener.table,
+                listener.resolver.as_ref(),
+                &listener.options,
+                &listener.telemetry,
                 peer,
                 &listener.rx_buf[..len],
                 now,
-                &listener.options,
-                0,
-                1,
-                &listener.telemetry,
             );
         }
     }
@@ -4188,14 +4240,14 @@ impl Owner {
     ) {
         report.rx_packets += 1;
         report.rx_bytes += datagram.len();
-        let _ = listener.table.admit(
+        admit_listener_datagram(
+            &mut listener.table,
+            listener.resolver.as_ref(),
+            &listener.options,
+            &listener.telemetry,
             datagram.peer,
             datagram.bytes(),
             now,
-            &listener.options,
-            0,
-            1,
-            &listener.telemetry,
         );
     }
 
@@ -4575,6 +4627,10 @@ mod bonded_tests;
 #[cfg(test)]
 #[path = "compio_pool_tests.rs"]
 mod pool_tests;
+
+#[cfg(test)]
+#[path = "compio_listener_resolver_tests.rs"]
+mod listener_resolver_tests;
 
 #[cfg(test)]
 mod tests {

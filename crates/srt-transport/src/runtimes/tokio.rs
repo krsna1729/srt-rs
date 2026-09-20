@@ -1069,6 +1069,8 @@ fn side_needs_immediate_work(
 }
 
 struct OwnerListenerSide {
+    /// Application admission policy, stored once per listener.
+    resolver: Option<crate::ListenerAdmissionResolver>,
     socket: UdpSocket,
     peers: crate::PeerTable,
     admission: crate::AdmissionOptions,
@@ -1168,6 +1170,27 @@ impl Owner {
         &mut self,
         config: &crate::ListenerConfig,
     ) -> Result<(), crate::RuntimeBuildError> {
+        self.listen_inner(config, None)
+    }
+
+    /// [`Self::listen`] with a synchronous, request-resolved admission policy
+    /// (`AdmissionRequest -> AdmissionResolution`): per-StreamID authorization,
+    /// latency, encryption and receiving-group identity, applied after cookie
+    /// validation and before CONCLUSION -- the same semantics on every Owner
+    /// runtime. The callback must be bounded and cache-backed.
+    pub fn listen_with_resolver(
+        &mut self,
+        config: &crate::ListenerConfig,
+        resolver: crate::ListenerAdmissionResolver,
+    ) -> Result<(), crate::RuntimeBuildError> {
+        self.listen_inner(config, Some(resolver))
+    }
+
+    fn listen_inner(
+        &mut self,
+        config: &crate::ListenerConfig,
+        resolver: Option<crate::ListenerAdmissionResolver>,
+    ) -> Result<(), crate::RuntimeBuildError> {
         if self.listener.is_some() {
             return Err(crate::RuntimeBuildError::from(crate::ConfigError::new(
                 "listener",
@@ -1224,6 +1247,7 @@ impl Owner {
         let mut sockets = prepared.bind_sockets()?;
         let socket = UdpSocket::from_std(sockets.remove(0))?;
         self.listener = Some(OwnerListenerSide {
+            resolver,
             socket,
             admission: prepared.admission_options(),
             idle_timeout: prepared.admission.idle_timeout,
@@ -1404,14 +1428,21 @@ impl Owner {
         }
         let recv_now = now();
         if let Some(side) = self.listener.as_mut() {
-            let (peers, admission, telemetry) = (&mut side.peers, &side.admission, &side.telemetry);
+            let (peers, admission, telemetry, resolver) = (
+                &mut side.peers,
+                &side.admission,
+                &side.telemetry,
+                side.resolver.as_ref(),
+            );
             let report = drain_readable(
                 &side.socket,
                 &mut side.recv_batch,
                 side.transport.recv_budget,
                 |addr, data| {
                     let Some(peer) = addr else { return };
-                    let _ = peers.admit(peer, data, recv_now, admission, 0, 1, telemetry);
+                    let _ = peers.admit_with_listener_resolver(
+                        resolver, peer, data, recv_now, admission, 0, 1, telemetry,
+                    );
                 },
             )?;
             side.recv_pending = receive_continuation(report, side.transport.recv_budget);
@@ -3293,9 +3324,29 @@ impl Facade {
     pub fn spawn(
         listener_config: Option<&crate::ListenerConfig>,
     ) -> Result<(Self, tokio::task::JoinHandle<()>), crate::RuntimeBuildError> {
+        Self::spawn_inner(listener_config, None)
+    }
+
+    /// [`Self::spawn`] whose listener applies a synchronous, request-resolved
+    /// admission policy (see [`crate::ListenerAdmissionResolver`]). `spawn`
+    /// never takes a policy, so a resolver can not be silently dropped.
+    pub fn spawn_with_resolver(
+        listener_config: &crate::ListenerConfig,
+        resolver: crate::ListenerAdmissionResolver,
+    ) -> Result<(Self, tokio::task::JoinHandle<()>), crate::RuntimeBuildError> {
+        Self::spawn_inner(Some(listener_config), Some(resolver))
+    }
+
+    fn spawn_inner(
+        listener_config: Option<&crate::ListenerConfig>,
+        resolver: Option<crate::ListenerAdmissionResolver>,
+    ) -> Result<(Self, tokio::task::JoinHandle<()>), crate::RuntimeBuildError> {
         let mut owner = Owner::new();
         if let Some(config) = listener_config {
-            owner.listen(config)?;
+            match resolver {
+                Some(resolver) => owner.listen_with_resolver(config, resolver)?,
+                None => owner.listen(config)?,
+            }
         }
         let listener_local_addr = owner.listener_local_addr();
         let command_bytes = Arc::new(AtomicUsize::new(0));
@@ -3665,6 +3716,130 @@ mod owner_tests {
             }
         });
     }
+
+    fn resolved_caller_config(
+        remote: SocketAddr,
+        stream_id: &str,
+        passphrase: &str,
+    ) -> crate::CallerConfig {
+        let mut session = crate::SessionConfig::default();
+        session.set_stream_id(Some(stream_id.to_owned()));
+        session.set_encryption(Some(crate::EncryptionConfig::new(passphrase)));
+        crate::CallerConfig::builder(remote)
+            .ownership(SocketOwnership::Shared)
+            .session(session)
+            .build()
+            .expect("caller config")
+    }
+
+    /// Per-StreamID authorization and crypto: "cam/ok" gets its own
+    /// passphrase, every other StreamID is rejected. Counts invocations.
+    fn stream_policy_resolver(
+        calls: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> crate::ListenerAdmissionResolver {
+        let calls = std::sync::Arc::clone(calls);
+        crate::ListenerAdmissionResolver::new(move |request| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match request.claimed_identity.stream_id.as_deref() {
+                Some("cam/ok") => {
+                    crate::AdmissionResolution::Configure(crate::ListenerPeerPolicy {
+                        encryption: crate::PolicyOverride::Set(Some(
+                            crate::ListenerEncryptionConfig::new(
+                                "tenant-passphrase-ok",
+                                srt_proto::crypto::KeyLength::Aes128,
+                            )
+                            .expect("passphrase"),
+                        )),
+                        ..crate::ListenerPeerPolicy::default()
+                    })
+                }
+                _ => crate::AdmissionResolution::Reject {
+                    reason: crate::RejectionReason::FORBIDDEN,
+                },
+            }
+        })
+    }
+
+    /// Resolver parity with the Compio Owner: the resolved per-StreamID
+    /// crypto lets the right credential connect and deliver data, while a
+    /// wrong credential and a rejected StreamID never connect.
+    #[test]
+    fn listen_with_resolver_applies_per_streamid_policy() {
+        test_runtime().block_on(async {
+            let start = std::time::Instant::now();
+            let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut owner = Owner::new();
+            owner
+                .listen_with_resolver(&listener_config(), stream_policy_resolver(&calls))
+                .expect("listen_with_resolver");
+            let addr = owner.listener_local_addr().expect("listener bound");
+            let PoolOutcome::Admitted(id) = owner
+                .connect(
+                    &resolved_caller_config(addr, "cam/ok", "tenant-passphrase-ok"),
+                    now_ts(start),
+                )
+                .expect("connect")
+            else {
+                panic!("admitted")
+            };
+            let mut peer = false;
+            let mut got = false;
+            let ok = drive_until(&mut owner, start, Duration::from_secs(5), |owner, now| {
+                let mut events = Vec::new();
+                owner.poll_listener_events(&mut events);
+                for event in events {
+                    match event.event {
+                        srt_proto::ConnectionEvent::Connected => peer = true,
+                        srt_proto::ConnectionEvent::DataReceived { payload, .. } => {
+                            got = payload.as_ref() == b"resolved";
+                        }
+                        _ => {}
+                    }
+                }
+                if peer
+                    && !got
+                    && owner.caller_mut(id).and_then(|c| c.state())
+                        == Some(crate::caller::LogicalCallerState::Connected)
+                {
+                    let _ = owner.caller_mut(id).expect("caller").send(b"resolved", now);
+                }
+                got
+            })
+            .await;
+            assert!(ok, "the resolved credential connects and delivers data");
+            assert!(calls.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+
+            for (stream, pass) in [
+                ("cam/ok", "definitely-the-wrong-secret"),
+                ("cam/denied", "tenant-passphrase-ok"),
+            ] {
+                let start = std::time::Instant::now();
+                let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let mut owner = Owner::new();
+                owner
+                    .listen_with_resolver(&listener_config(), stream_policy_resolver(&calls))
+                    .expect("listen_with_resolver");
+                let addr = owner.listener_local_addr().expect("listener bound");
+                let PoolOutcome::Admitted(id) = owner
+                    .connect(&resolved_caller_config(addr, stream, pass), now_ts(start))
+                    .expect("connect")
+                else {
+                    panic!("admitted")
+                };
+                let connected =
+                    drive_until(&mut owner, start, Duration::from_millis(600), |owner, _| {
+                        owner.caller_mut(id).and_then(|c| c.state())
+                            == Some(crate::caller::LogicalCallerState::Connected)
+                    })
+                    .await;
+                assert!(
+                    !connected,
+                    "{stream} with a bad credential must not connect"
+                );
+                assert!(calls.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+            }
+        });
+    }
 }
 
 #[cfg(test)]
@@ -3730,6 +3905,56 @@ mod facade_tests {
             assert!(
                 closed.is_none(),
                 "recv() must resolve to None once the session has closed"
+            );
+        });
+    }
+
+    /// `Facade::spawn_with_resolver` keeps the resolver: the resolved
+    /// credential is accepted, an unauthorized StreamID is never accepted.
+    #[test]
+    fn facade_spawn_with_resolver_applies_admission_policy() {
+        test_runtime().block_on(async {
+            let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let resolver = {
+                let calls = std::sync::Arc::clone(&calls);
+                crate::ListenerAdmissionResolver::new(move |request| {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if request.claimed_identity.stream_id.as_deref() == Some("cam/ok") {
+                        crate::AdmissionResolution::Accept
+                    } else {
+                        crate::AdmissionResolution::Reject {
+                            reason: crate::RejectionReason::FORBIDDEN,
+                        }
+                    }
+                })
+            };
+            let (mut facade, _handle) =
+                Facade::spawn_with_resolver(&listener_config(), resolver).expect("spawn");
+            let addr = facade.listener_local_addr().expect("listener bound");
+            let with_stream = |stream: &str| {
+                let mut session = crate::SessionConfig::default();
+                session.set_stream_id(Some(stream.to_owned()));
+                crate::CallerConfig::builder(addr)
+                    .ownership(SocketOwnership::Shared)
+                    .session(session)
+                    .build()
+                    .expect("caller config")
+            };
+            let _ok = with_timeout(facade.connect(&with_stream("cam/ok")))
+                .await
+                .expect("authorized StreamID connects");
+            let _accepted = with_timeout(facade.accept())
+                .await
+                .expect("the authorized session is accepted");
+            assert!(calls.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+            let denied = tokio::time::timeout(
+                Duration::from_millis(800),
+                facade.connect(&with_stream("cam/denied")),
+            )
+            .await;
+            assert!(
+                !matches!(denied, Ok(Ok(_))),
+                "an unauthorized StreamID must not connect"
             );
         });
     }

@@ -167,6 +167,19 @@ A bonded caller is ONE logical caller:
   peer-local TX failure is attributed to the logical group *and* the physical
   leg (`TxAttribution`) without faulting the Owner.
 
+**Inbound sessions attach through `Owner::listen` or
+`Owner::listen_with_resolver`.** The latter stores one
+`ListenerAdmissionResolver` (`AdmissionRequest -> AdmissionResolution`) on the
+listener side and applies it through `PeerTable::admit_with_resolver` after
+cookie validation and before CONCLUSION, identically for RawReadiness and
+ManagedMultishot (one helper, `admit_listener_datagram`) and on the Mio and
+Tokio Owners. The resolver never runs for DATA, ACK, NAK, retransmits or
+timers; it must be synchronous, bounded and cache-backed; storage is
+O(listeners). The receiving-group id a resolver returns is application-owned and
+distinct from the caller's group id; address equality never defines a bond; a
+direct caller never receives a GROUP response. See
+[Listener admission and per-StreamID policy](listener-admission-policy.md#shared-owner-listeners).
+
 ### 9. Completion ownership
 
 The `Owner` owns completions until it reaps them; the application never reaches
@@ -244,7 +257,7 @@ config-level halves in `caller_pool.rs` and `config.rs`.
 | 5 protocol-owned timers | `owner_wake_includes_caller_pool_attempt_deadline`, `crates/srt-transport/tests/tail_recovery.rs` |
 | 6 explicit continuation | `tx_pool_exhaustion_leaves_protocol_datagram_pending`, `owner_tx_bounded_concurrency_and_pool_exhaustion` |
 | 7 fault poisoning | `managed_rx_stream_failure_faults_the_owner`, `rx_consumer_fault_stops_rx_maintenance_and_tx`, `owner_fault_gates_listen_and_connect_through_public_apis`, `failed_attach_does_not_freeze_the_owner`, `a_dead_tx_lane_poisons_the_owner_and_cannot_continue_at_reduced_capacity` |
-| 8 admission/backpressure | `owner_rejects_session_with_incompatible_wire_ceiling`, `owner_capacity_never_rewrites_a_request_deadline`, `shared_callers_may_differ_in_deadline_but_not_in_capacity`, `bonded_legs_with_different_deadlines_are_refused_transactionally`, `pending_work_includes_runnable_pool_work`, `owner_wake_includes_caller_pool_attempt_deadline`, bonded: `bonded_connect_admits_one_logical_caller_immediately`, `queued_bonded_request_keeps_its_id_and_its_deadline_starts_at_admission`, `full_pool_refuses_a_bonded_request_without_retaining_it`, `bonded_attempt_deadline_retires_the_whole_group`, `remove_caller_reclaims_every_leg_route_and_deadline`, `bonded_leg_count_is_bounded_by_the_protocol_limit`, `rejected_bonded_attach_is_transactional`, `failed_first_bonded_admission_leaves_the_owner_untouched`, `failed_first_admission_under_managed_rx_starts_no_consumer`, `caller_side_construction_starts_no_managed_task`, `first_direct_connect_commits_side_mode_and_session_together`, `bonded_and_direct_callers_share_one_socket_at_fixed_runtime_cost`, `broadcast_send_reaches_every_established_leg`, `backup_send_uses_the_established_leg_only`, `shutdown_with_a_live_bonded_caller_is_quiescent` |
+| 8 admission/backpressure | listener resolver (`compio_listener_resolver_tests.rs`): `per_streamid_crypto_and_latency_apply_through_owner_rx`, `resolver_reject_refuses_the_publisher`, `resolver_defer_is_bounded_by_the_half_open_ttl`, `resolver_is_not_invoked_for_data_ack_nak_or_timers`, `every_compio_listener_admission_site_uses_the_one_helper`, `same_receiver_group_id_across_legs_is_one_bond`, `independent_receiver_group_ids_collide_on_the_caller`, `direct_callers_never_get_a_group_response`; `owner_rejects_session_with_incompatible_wire_ceiling`, `owner_capacity_never_rewrites_a_request_deadline`, `shared_callers_may_differ_in_deadline_but_not_in_capacity`, `bonded_legs_with_different_deadlines_are_refused_transactionally`, `pending_work_includes_runnable_pool_work`, `owner_wake_includes_caller_pool_attempt_deadline`, bonded: `bonded_connect_admits_one_logical_caller_immediately`, `queued_bonded_request_keeps_its_id_and_its_deadline_starts_at_admission`, `full_pool_refuses_a_bonded_request_without_retaining_it`, `bonded_attempt_deadline_retires_the_whole_group`, `remove_caller_reclaims_every_leg_route_and_deadline`, `bonded_leg_count_is_bounded_by_the_protocol_limit`, `rejected_bonded_attach_is_transactional`, `failed_first_bonded_admission_leaves_the_owner_untouched`, `failed_first_admission_under_managed_rx_starts_no_consumer`, `caller_side_construction_starts_no_managed_task`, `first_direct_connect_commits_side_mode_and_session_together`, `bonded_and_direct_callers_share_one_socket_at_fixed_runtime_cost`, `broadcast_send_reaches_every_established_leg`, `backup_send_uses_the_established_leg_only`, `shutdown_with_a_live_bonded_caller_is_quiescent` |
 | 9 completion ownership | `service_returns_tx_buffers_and_updates_completion_stats`, `tx_failure_event_reports_the_logical_attribution`, `owner_sibling_isolation`, `bonded_tx_failure_is_attributed_to_group_and_leg` |
 | 10 bounded close | `shutdown_and_drain_reaps_in_flight_to_quiescence`, `shutdown_timeout_does_not_fabricate_quiescence`, `shutdown_verdict_requires_rx_quiescence`, `a_dead_tx_lane_poisons_the_owner_and_cannot_continue_at_reduced_capacity` |
 | 11 telemetry meanings | `report_tx_class_total_matches_submitted_packets_every_visit`, `tx_class_delta_reports_only_this_visits_submissions`, `first_submit_lateness_samples_only_first_transmission_data_with_a_due_instant`, `first_submit_lateness_measures_a_real_application_submission`, `tx_pool_high_water_tracks_the_peak_and_never_exceeds_capacity`, `rx_stats_expose_both_sides`, `rx_session_totals_report_live_sessions_and_survive_retirement`, `rx_session_totals_are_none_without_an_attached_side`, `rx_session_totals_include_bonded_group_legs` |
