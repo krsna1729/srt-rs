@@ -245,3 +245,176 @@ fn pending_work_includes_runnable_pool_work() {
         assert_eq!(report.maintenance_actions, 1, "the admission");
     });
 }
+
+// ---------------------------------------------------------------------------
+// Fair maintenance: caller-pool and listener idle reclaim share one finite
+// `max_maintenance_actions` allowance with alternating priority.
+// ---------------------------------------------------------------------------
+
+const IDLE_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// An Owner with a listener whose idle timeout is short, plus `peers`
+/// established sessions (the Owner's own callers connected to its own
+/// listener) that are then abandoned without a shutdown, leaving `peers`
+/// listener-side peers that only go idle. Returns the owner and the synthetic
+/// time of the last datagram.
+async fn owner_with_idle_peers(peers: usize) -> (Owner, u64) {
+    let std_sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind listener");
+    let addr = std_sock.local_addr().expect("listener addr");
+    let sock = compio::net::UdpSocket::from_std(std_sock).expect("adopt listener");
+    let config = crate::ListenerConfig::builder(addr)
+        .configure_admission(|admission| admission.idle_timeout = IDLE_TIMEOUT)
+        .build()
+        .expect("listener config");
+    let side = ListenerSide::new(sock, &config).expect("listener side");
+    let mut owner = Owner::new(16).with_listener(side);
+    owner
+        .set_caller_pool_capacity(std::num::NonZeroUsize::new(8).unwrap())
+        .expect("capacity");
+    let ids: Vec<_> = (0..peers)
+        .map(|_| {
+            admitted(
+                owner
+                    .connect(&leg(addr, Duration::from_secs(60)), ts(0))
+                    .expect("connect to the own listener"),
+            )
+        })
+        .collect();
+    let mut now = 0;
+    for round in 0..600_u64 {
+        now = round * 5_000;
+        let _ = owner.service(ts(now), OwnerServiceBudget::default()).await;
+        owner.wait_for_activity(Duration::from_millis(1)).await;
+        let connected = ids.iter().all(|id| {
+            owner.logical_caller(id).and_then(|c| c.state())
+                == Some(crate::LogicalCallerState::Connected)
+        });
+        if connected && owner.listener().expect("listener").table.len() >= peers {
+            break;
+        }
+    }
+    for id in ids {
+        drop(owner.remove_caller(id).expect("abandon the caller"));
+    }
+    assert!(
+        owner.listener().expect("listener").table.len() >= peers,
+        "the listener holds {peers} established peers"
+    );
+    (owner, now)
+}
+
+fn idle_due(owner: &Owner, at: u64) -> bool {
+    let listener = owner.listener().expect("listener");
+    listener.table.has_idle_due(ts(at), IDLE_TIMEOUT)
+}
+
+/// Caller-pool maintenance that stays runnable across many visits: `n`
+/// admitted attempts that are due at `at`, plus `n` queued behind them.
+fn queue_caller_work(owner: &mut Owner, n: usize, admitted_at: u64) {
+    for _ in 0..n {
+        admitted(
+            owner
+                .connect(
+                    &leg(dead_peer(), Duration::from_millis(10)),
+                    ts(admitted_at),
+                )
+                .expect("admit"),
+        );
+    }
+    for _ in 0..n {
+        assert!(matches!(
+            owner
+                .connect(&leg(dead_peer(), Duration::from_secs(60)), ts(admitted_at))
+                .expect("queue"),
+            PoolOutcome::Queued(_)
+        ));
+    }
+}
+
+/// With ONE maintenance action per visit, continuously runnable caller
+/// maintenance must not postpone a due listener idle peer (and vice versa).
+#[test]
+fn maintenance_alternates_between_caller_and_listener() {
+    let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+    runtime.block_on(async {
+        let (mut owner, last) = owner_with_idle_peers(1).await;
+        let start = last + 1_000_000; // far past the 200 ms idle timeout
+        queue_caller_work(&mut owner, 8, last);
+        assert!(idle_due(&owner, start), "the idle peer is due");
+        let budget = OwnerServiceBudget {
+            max_maintenance_actions: 1,
+            ..OwnerServiceBudget::default()
+        };
+        let mut listener_visit = None;
+        let mut caller_actions_before_listener = 0;
+        for visit in 0..40_u64 {
+            let queued = owner.caller_pool_stats().expect("pool").queued;
+            let report = owner.service(ts(start + visit * 100), budget).await;
+            assert!(report.maintenance_actions <= 1, "{report:?}");
+            if listener_visit.is_none() && !idle_due(&owner, start + visit * 100) {
+                listener_visit = Some(visit);
+                assert!(queued > 0, "the caller still had queued work");
+            }
+            if listener_visit.is_none() {
+                caller_actions_before_listener += report.maintenance_actions;
+            }
+        }
+        let visit = listener_visit.expect("the idle peer was reclaimed");
+        assert!(
+            visit <= 2,
+            "reclaimed within alternation, not after the caller: {visit}"
+        );
+        assert!(
+            caller_actions_before_listener >= 1 || visit == 0,
+            "the caller progressed on the visits the listener did not take"
+        );
+        let stats = owner.caller_pool_stats().expect("pool");
+        assert!(
+            stats.expired >= 1 && stats.started > 8,
+            "caller work progressed too"
+        );
+    });
+}
+
+/// No reserved split: an uncontended side may use the whole allowance.
+#[test]
+fn an_uncontended_side_uses_the_full_maintenance_budget() {
+    let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+    runtime.block_on(async {
+        // Only caller maintenance runnable.
+        let mut owner = Owner::new(16);
+        owner
+            .set_caller_pool_capacity(std::num::NonZeroUsize::new(8).unwrap())
+            .expect("capacity");
+        queue_caller_work(&mut owner, 8, 0);
+        let budget = OwnerServiceBudget {
+            max_maintenance_actions: 4,
+            ..OwnerServiceBudget::default()
+        };
+        let report = owner.service(ts(1_000_000), budget).await;
+        assert_eq!(report.maintenance_actions, 4, "caller used all four");
+
+        // Only listener maintenance runnable.
+        let (mut owner, last) = owner_with_idle_peers(3).await;
+        let start = last + 1_000_000;
+        let wide = OwnerServiceBudget {
+            max_maintenance_actions: 8,
+            ..OwnerServiceBudget::default()
+        };
+        let report = owner.service(ts(start), wide).await;
+        assert!(
+            (3..=8).contains(&report.maintenance_actions),
+            "the listener alone used the allowance it needed: {report:?}"
+        );
+        assert!(!idle_due(&owner, start), "all three idle peers reclaimed");
+        // With a budget of exactly 3 it may spend all of it: nothing is
+        // reserved for the idle caller side.
+        let (mut owner, last) = owner_with_idle_peers(3).await;
+        let three = OwnerServiceBudget {
+            max_maintenance_actions: 3,
+            ..OwnerServiceBudget::default()
+        };
+        let report = owner.service(ts(last + 1_000_000), three).await;
+        assert_eq!(report.maintenance_actions, 3, "no reserved caller share");
+    });
+}

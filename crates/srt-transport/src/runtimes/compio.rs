@@ -2973,6 +2973,7 @@ pub struct Owner {
     sessions_started: bool,
     rx_priority_listener_first: bool,
     tx_priority_listener_first: bool,
+    maintenance_priority_listener_first: bool,
     caller_pool_capacity: Option<std::num::NonZeroUsize>,
     socket_memory_budget: Option<std::num::NonZeroUsize>,
     /// How attach resolves the receive datapath.
@@ -3012,6 +3013,7 @@ impl Owner {
             sessions_started: false,
             rx_priority_listener_first: true,
             tx_priority_listener_first: true,
+            maintenance_priority_listener_first: true,
             caller_pool_capacity: None,
             socket_memory_budget: None,
             rx_mode_policy: RxModePolicy::default(),
@@ -4418,27 +4420,43 @@ impl Owner {
         budget: &OwnerServiceBudget,
         report: &mut OwnerServiceReport,
     ) {
+        // Alternate which side gets first access to the finite allowance each
+        // visit, like RX and TX do, so continuously runnable caller-pool
+        // maintenance can never postpone listener idle reclaim (or the
+        // reverse). No reserved split: an uncontended side may use it all.
+        self.maintenance_priority_listener_first = !self.maintenance_priority_listener_first;
+        let first_listener = self.maintenance_priority_listener_first;
         let mut allowed = budget.max_maintenance_actions;
-        if allowed == 0 {
-            return;
+        for second in [false, true] {
+            if allowed == 0 {
+                return;
+            }
+            let used = if first_listener != second {
+                self.maintain_listener(now, allowed)
+            } else {
+                self.maintain_caller(now, allowed)
+            };
+            report.maintenance_actions = report.maintenance_actions.saturating_add(used);
+            allowed = allowed.saturating_sub(used);
         }
-        if let Some(caller) = self.caller.as_mut() {
-            // No retired-id vector: the Owner surfaces retired sessions
-            // through the `PoolEvent`s it already drains, so this visit
-            // allocates nothing.
-            let work = caller.pool.maintain(now, allowed, None);
-            report.maintenance_actions = report.maintenance_actions.saturating_add(work.actions());
-            allowed = allowed.saturating_sub(work.actions());
-        }
-        if allowed > 0
-            && let Some(listener) = self.listener.as_mut()
-        {
-            let (_, visits) =
-                listener
-                    .table
-                    .prune_idle_bounded_with_visits(now, listener.idle_timeout, allowed);
-            report.maintenance_actions = report.maintenance_actions.saturating_add(visits);
-        }
+    }
+
+    /// Caller-pool maintenance: no retired-id vector (the Owner surfaces
+    /// retired sessions through the `PoolEvent`s it already drains), so this
+    /// allocates nothing.
+    fn maintain_caller(&mut self, now: Timestamp, allowed: usize) -> usize {
+        self.caller.as_mut().map_or(0, |caller| {
+            caller.pool.maintain(now, allowed, None).actions()
+        })
+    }
+
+    fn maintain_listener(&mut self, now: Timestamp, allowed: usize) -> usize {
+        self.listener.as_mut().map_or(0, |listener| {
+            listener
+                .table
+                .prune_idle_bounded_with_visits(now, listener.idle_timeout, allowed)
+                .1
+        })
     }
 
     fn service_tx_listener(
@@ -4535,7 +4553,10 @@ impl Owner {
     #[must_use]
     pub fn has_pending_work(&self, now: Timestamp) -> bool {
         let l_pending = self.listener.as_ref().is_some_and(|l| {
-            l.pending_rx.is_some() || l.rx.pending() || l.table.has_pending_output(now)
+            l.pending_rx.is_some()
+                || l.rx.pending()
+                || l.table.has_pending_output(now)
+                || l.table.has_idle_due(now, l.idle_timeout)
         });
         let c_pending = self.caller.as_ref().is_some_and(|c| {
             c.pending_rx.is_some()
