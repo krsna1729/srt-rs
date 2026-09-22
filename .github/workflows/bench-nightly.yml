@@ -121,7 +121,7 @@ jobs:
         # Partial (time-boxed) campaigns keep their TSV artifact above but
         # never move the trend: the chart compares complete campaigns only.
         if: always() && steps.sweep.outcome == 'success' && steps.sweep.outputs.partial != 'true'
-        uses: benchmark-action/github-action-benchmark@v1.22.1
+        uses: benchmark-action/github-action-benchmark@v1.22.2
         with:
           tool: "customBiggerIsBetter"
           output-file-path: nightly-benchmark.json
