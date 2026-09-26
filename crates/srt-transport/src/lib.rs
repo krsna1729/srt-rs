@@ -109,6 +109,7 @@ mod due_index;
 mod group_conn;
 mod handoff;
 mod high_res_waiter;
+mod id_hash;
 mod sink;
 mod socket_io;
 mod telemetry;
