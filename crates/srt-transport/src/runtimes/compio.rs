@@ -2512,6 +2512,12 @@ impl TxEngine {
     ///
     /// Non-consuming by construction: it observes the completion index and
     /// takes nothing out of it.
+    /// Whether a lane is free for a new submission.
+    #[must_use]
+    pub(crate) fn has_idle_lane(&self) -> bool {
+        !self.idle_lanes.is_empty()
+    }
+
     #[must_use]
     pub(crate) fn completion_ready(&self) -> bool {
         !self.completed_lanes.borrow().is_empty()
@@ -4868,19 +4874,37 @@ impl Owner {
 
     #[must_use]
     pub fn has_pending_work(&self, now: Timestamp) -> bool {
+        // Pending protocol output is runnable only when TX can take it: with
+        // every pool slot or lane in flight, a `service` pass can only find the
+        // same blocked output again. That state is not runnable work -- the
+        // Owner must park in `wait_for_activity`, which wakes on the next TX
+        // completion. Reporting it as work made a caller that obeys
+        // `work_remaining` spin without ever driving the proactor, so the
+        // in-flight sends never completed (`compio_production_fanout` at
+        // fan-out >= 100 submitted 0 datagrams: pool free 0, in flight 400,
+        // work_remaining on 445,107 of 445,107 passes).
+        let tx_ready = self.tx_accepts_output();
         let l_pending = self.listener.as_ref().is_some_and(|l| {
             l.pending_rx.is_some()
                 || l.rx.pending()
-                || l.table.has_pending_output(now)
+                || (tx_ready && l.table.has_pending_output(now))
                 || l.table.has_idle_due(now, l.idle_timeout)
         });
         let c_pending = self.caller.as_ref().is_some_and(|c| {
             c.pending_rx.is_some()
                 || c.rx.pending()
-                || c.pool.table().has_pending_output(now)
+                || (tx_ready && c.pool.table().has_pending_output(now))
                 || c.pool.has_pending_work(now)
         });
         l_pending || c_pending
+    }
+
+    /// Whether a `service` pass could submit protocol output now: a pool slot
+    /// and a lane are free, or a completion is waiting to be reaped (reaping
+    /// frees both).
+    fn tx_accepts_output(&self) -> bool {
+        (self.tx_pool.free_count() > 0 && self.tx_engine.has_idle_lane())
+            || self.tx_engine.completion_ready()
     }
 }
 
@@ -6456,8 +6480,18 @@ mod tests {
             assert_eq!(owner.tx_pool().free_count(), 0, "pool is exhausted");
             assert_eq!(owner.tx_in_flight(), 1);
             assert!(
-                owner.has_pending_work(now),
+                owner
+                    .caller
+                    .as_ref()
+                    .expect("caller side")
+                    .pool
+                    .table()
+                    .has_pending_output(now),
                 "the second protocol datagram must still be pending, not lost"
+            );
+            assert!(
+                !owner.has_pending_work(now),
+                "output blocked only by TX capacity is not runnable: park until a completion"
             );
 
             // Capacity returns: the wait path observes the ready completion,
@@ -6468,6 +6502,10 @@ mod tests {
                 owner.tx_pool().free_count(),
                 0,
                 "observing readiness must not return the slot on its own"
+            );
+            assert!(
+                owner.has_pending_work(Timestamp::from_micros(20_000)),
+                "a completion waiting to be reaped makes the pending output runnable"
             );
             let now = Timestamp::from_micros(20_000);
             let report = owner.service(now, budget).await;
@@ -8390,6 +8428,47 @@ mod tests {
                 "every datagram is a transient loss"
             );
             assert_eq!(pool.free_count(), pool.capacity(), "every slot returns");
+        });
+    }
+
+    /// Output blocked only by TX capacity is not runnable work: with the pool
+    /// exhausted the Owner must park until a completion, not report
+    /// `work_remaining` (which made obedient callers spin and never drive the
+    /// proactor). A completion waiting to be reaped makes it runnable again.
+    #[test]
+    fn tx_blocked_output_is_not_runnable_until_a_completion_arrives() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            let c_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+            let c_sock = compio::net::UdpSocket::from_std(c_std).expect("adopt");
+            let mut owner = Owner::new(2).with_caller(OwnerCallerSide::new_single(c_sock));
+            assert!(owner.tx_accepts_output(), "an idle engine accepts output");
+            let peer: SocketAddr = "127.0.0.1:19994".parse().unwrap();
+            for len in [20, 30] {
+                let mut sink = owner_sink(&mut owner);
+                let res = push_test(&mut sink, peer, len, |buf| {
+                    buf[..len].fill(1);
+                    Ok(len)
+                });
+                assert!(matches!(res, Ok(Some(_))));
+            }
+            assert_eq!(owner.tx_pool().free_count(), 0);
+            assert!(
+                !owner.tx_accepts_output(),
+                "an exhausted pool cannot take more output"
+            );
+            for _ in 0..200 {
+                if owner.tx_engine.completion_ready() {
+                    break;
+                }
+                owner
+                    .wait_for_activity(std::time::Duration::from_millis(1))
+                    .await;
+            }
+            assert!(
+                owner.tx_accepts_output(),
+                "a completion waiting to be reaped makes output runnable"
+            );
         });
     }
 

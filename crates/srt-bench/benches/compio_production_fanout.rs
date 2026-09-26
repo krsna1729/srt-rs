@@ -259,6 +259,7 @@ fn run_fanout_case(fanout: usize, duration_ms: u64) -> FanoutMetrics {
         let mut service_visit_latencies: Vec<u64> = Vec::with_capacity(10_000);
         let duration = std::time::Duration::from_millis(duration_ms);
         let mut next_source_tick = 0u64;
+        let mut diag = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
 
         while t_start.elapsed() < duration {
             let elapsed_us = t_start.elapsed().as_micros() as u64;
@@ -290,6 +291,15 @@ fn run_fanout_case(fanout: usize, duration_ms: u64) -> FanoutMetrics {
                 service_visit_latencies.push(visit_us);
             }
             total_submitted += report.tx_packets_submitted;
+            diag.0 += 1;
+            diag.1 += report.rx_packets;
+            diag.2 += report.actions;
+            diag.3 += report.maintenance_actions;
+            diag.4 += usize::from(report.budget_exhausted);
+            diag.5 += usize::from(report.work_remaining);
+            diag.6 = report.tx_pool_free;
+            diag.7 = report.tx_in_flight;
+            diag.8 += report.protocol_output_failures;
             total_completed_ok += report.tx_completed_ok;
             inflight_accum += report.tx_in_flight;
             total_inflight_samples += 1;
@@ -301,7 +311,23 @@ fn run_fanout_case(fanout: usize, duration_ms: u64) -> FanoutMetrics {
             }
         }
 
-        // Drain-to-empty qualification gate:
+        if std::env::var_os("FANOUT_DIAG").is_some() {
+            let first = dest_ids[0];
+            let caller = owner.logical_caller(&first);
+            eprintln!(
+                "[diag fanout={fanout}] services={} rx={} actions={} maint={} budget_exhausted={} work_remaining={} pool_free={} in_flight={} output_failures={} now={}us offered={total_offered} admitted={total_admitted} submitted={total_submitted} state={:?} stats={:#?}",
+                diag.0, diag.1, diag.2, diag.3, diag.4, diag.5, diag.6, diag.7, diag.8,
+                now.as_micros(),
+                caller.as_ref().and_then(|c| c.state()),
+                caller.as_ref().and_then(|c| c.stats()).and_then(|stats| match stats {
+                    srt_transport::advanced::caller::LogicalCallerStats::Direct(direct) => {
+                        Some(*direct)
+                    }
+                    _ => None,
+                })
+            );
+        }
+                // Drain-to-empty qualification gate:
         // Drive owner until all submitted datagrams complete.
         let drain_budget = OwnerServiceBudget {
             max_completions: 4096,
@@ -373,7 +399,14 @@ fn main() {
     println!("Workload: 8 Mbps source rate, 1316-byte target SRT payload");
     println!("Fanout sweep: 1, 10, 100, 600, 1000 destinations\n");
 
-    let fanouts = [1, 10, 100, 600, 1000];
+    let fanouts: Vec<usize> = std::env::var("FANOUTS")
+        .ok()
+        .map(|list| {
+            list.split(',')
+                .filter_map(|value| value.trim().parse().ok())
+                .collect()
+        })
+        .unwrap_or_else(|| vec![1, 10, 100, 600, 1000]);
     let mut results = Vec::new();
 
     for &fanout in &fanouts {
