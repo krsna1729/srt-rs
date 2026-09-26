@@ -1872,12 +1872,111 @@ struct TxJob {
     buf: Vec<u8>,
     peer: SocketAddr,
     meta: InFlightMeta,
+    /// Further equal-length datagrams for the same socket and peer, sent with
+    /// `buf` as one UDP GSO `sendmsg` (see [`TxEngine::try_coalesce`]).
+    more: Vec<(Vec<u8>, InFlightMeta)>,
 }
 
 pub(crate) struct TxCompletion {
     pub meta: InFlightMeta,
     pub res: io::Result<usize>,
     pub buf: Vec<u8>,
+    /// The job's coalesced datagrams, returned with the job's result.
+    pub more: Vec<(Vec<u8>, InFlightMeta)>,
+}
+
+/// Most datagrams one coalesced send carries. The kernel caps UDP GSO at 64
+/// segments (`UDP_MAX_SEGMENTS`, 128 on newer kernels).
+const MAX_GSO_SEGMENTS: usize = 44;
+/// Most payload bytes one coalesced send carries: the whole GSO super-packet
+/// must fit one 64 KiB IP datagram, headers included.
+const MAX_GSO_BYTES: usize = 60_000;
+
+/// `SOL_UDP`/`UDP_SEGMENT` control message announcing the segment size of a
+/// coalesced send. Built byte-wise (no `cmsghdr` pointer cast), so the
+/// buffer's alignment does not matter.
+fn gso_control(segment_len: usize) -> Vec<u8> {
+    let data_len = std::mem::size_of::<u16>() as u32;
+    // SAFETY: CMSG_SPACE/CMSG_LEN are pure size computations.
+    let (space, len) = unsafe { (libc::CMSG_SPACE(data_len), libc::CMSG_LEN(data_len)) };
+    let mut control = vec![0u8; space as usize];
+    let header = std::mem::size_of::<libc::cmsghdr>();
+    let level = std::mem::offset_of!(libc::cmsghdr, cmsg_level);
+    let kind = std::mem::offset_of!(libc::cmsghdr, cmsg_type);
+    let len_field = std::mem::size_of_val(&(len as libc::size_t));
+    control[..len_field].copy_from_slice(&(len as libc::size_t).to_ne_bytes());
+    control[level..level + 4].copy_from_slice(&libc::SOL_UDP.to_ne_bytes());
+    control[kind..kind + 4].copy_from_slice(&libc::UDP_SEGMENT.to_ne_bytes());
+    let segment = u16::try_from(segment_len).unwrap_or(u16::MAX);
+    control[header..header + 2].copy_from_slice(&segment.to_ne_bytes());
+    control
+}
+
+/// Errors that mean the path cannot carry UDP GSO (no checksum offload,
+/// unsupported option, segment larger than the path allows), not that the
+/// destination or the Owner failed.
+fn is_gso_unsupported(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EIO | libc::EINVAL | libc::EOPNOTSUPP | libc::ENOPROTOOPT | libc::EMSGSIZE)
+    )
+}
+
+/// Send one job: a single datagram with `send_to`, or a coalesced run with
+/// one `sendmsg` carrying a `UDP_SEGMENT` control message.
+async fn send_tx_job(job: TxJob) -> TxCompletion {
+    if job.more.is_empty() {
+        let BufResult(res, mut buf) = job.sock.send_to(job.buf, job.peer).await;
+        buf.clear();
+        return TxCompletion {
+            meta: job.meta,
+            res,
+            buf,
+            more: job.more,
+        };
+    }
+    let segment_len = job.buf.len();
+    let mut iov = Vec::with_capacity(1 + job.more.len());
+    let mut metas = Vec::with_capacity(job.more.len());
+    iov.push(job.buf);
+    for (buf, meta) in job.more {
+        iov.push(buf);
+        metas.push(meta);
+    }
+    let BufResult(res, (iov, _control)) = job
+        .sock
+        .send_msg_vectored(iov, gso_control(segment_len), job.peer)
+        .await;
+    let mut bufs = iov.into_iter();
+    let mut buf = bufs.next().expect("a coalesced job has a first datagram");
+    buf.clear();
+    let more = bufs
+        .zip(metas)
+        .map(|(mut buf, meta)| {
+            buf.clear();
+            (buf, meta)
+        })
+        .collect();
+    TxCompletion {
+        meta: job.meta,
+        res,
+        buf,
+        more,
+    }
+}
+
+/// One coalesced datagram's share of its job's result: the whole run
+/// succeeded (UDP sends are all-or-nothing) or every datagram shares the
+/// failure.
+fn segment_result(res: &io::Result<usize>, total: usize, segment_len: usize) -> io::Result<usize> {
+    match res {
+        Ok(sent) if *sent == total => Ok(segment_len),
+        Ok(_) => Ok(0),
+        Err(error) => Err(match error.raw_os_error() {
+            Some(errno) => io::Error::from_raw_os_error(errno),
+            None => io::Error::new(error.kind(), error.to_string()),
+        }),
+    }
 }
 
 struct TxLaneState {
@@ -1890,6 +1989,38 @@ struct TxLaneState {
     /// queued/completed lists, which is what makes `in_flight` truthful even
     /// if a shutdown drain times out.
     in_kernel: bool,
+    /// Datagrams in the job the worker took (a coalesced send carries
+    /// several), so a timed-out drain recounts datagrams, not lanes.
+    in_kernel_datagrams: usize,
+}
+
+impl TxLaneState {
+    /// Return the slots of a staged job and of an unreaped completion; the
+    /// slots of a job still with the kernel stay owned by the lane.
+    fn return_unsent_slots(&mut self, tx_pool: &mut TxPool) {
+        if let Some(job) = self.job.take() {
+            tx_pool.return_slot(job.buf);
+            job.more
+                .into_iter()
+                .for_each(|(buf, _)| tx_pool.return_slot(buf));
+        }
+        if let Some(completion) = self.completion.take() {
+            tx_pool.return_slot(completion.buf);
+            completion
+                .more
+                .into_iter()
+                .for_each(|(buf, _)| tx_pool.return_slot(buf));
+        }
+    }
+
+    /// Datagrams this lane's in-kernel send carries (at least one).
+    fn datagrams_in_kernel(&self) -> usize {
+        if self.in_kernel {
+            self.in_kernel_datagrams.max(1)
+        } else {
+            0
+        }
+    }
 }
 
 struct TxLane {
@@ -1915,6 +2046,24 @@ pub(crate) struct TxEngine {
     /// driver that wants per-window numbers instead of a cumulative
     /// histogram.
     first_submit_lateness: FirstSubmitLateness,
+    /// Coalesce equal-length datagrams to one peer into UDP GSO sends. Turned
+    /// off for the engine's life the first time the path rejects GSO.
+    coalesce: bool,
+    /// The lane whose job was staged last in this visit: the only job a new
+    /// datagram may join, and only while its worker has not taken it.
+    open_lane: Option<usize>,
+    batching: OwnerTxBatchingCounters,
+}
+
+/// Cumulative UDP GSO coalescing counters for one Owner.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OwnerTxBatchingCounters {
+    /// Sends that carried more than one datagram.
+    pub batched_sends: u64,
+    /// Datagrams that joined an already staged send (saved submissions).
+    pub coalesced_datagrams: u64,
+    /// Times the path rejected GSO and coalescing was turned off.
+    pub gso_fallbacks: u64,
 }
 
 async fn tx_lane_worker(
@@ -1931,6 +2080,7 @@ async fn tx_lane_worker(
             }
             if let Some(job) = s.job.take() {
                 s.in_kernel = true;
+                s.in_kernel_datagrams = 1 + job.more.len();
                 return Poll::Ready(Some(job));
             }
             s.worker_waker = Some(cx.waker().clone());
@@ -1942,17 +2092,12 @@ async fn tx_lane_worker(
             break;
         };
 
-        let BufResult(res, mut buf) = job.sock.send_to(job.buf, job.peer).await;
-        buf.clear();
+        let completion = send_tx_job(job).await;
 
         {
             let mut s = state.borrow_mut();
             s.in_kernel = false;
-            s.completion = Some(TxCompletion {
-                meta: job.meta,
-                res,
-                buf,
-            });
+            s.completion = Some(completion);
         }
         completed_lanes.borrow_mut().push_back(lane_idx);
         if let Some(w) = owner_waker.borrow_mut().take() {
@@ -1976,6 +2121,9 @@ impl TxEngine {
             shutdown: false,
             tx_class: OwnerTxClassCounters::default(),
             first_submit_lateness: FirstSubmitLateness::default(),
+            coalesce: true,
+            open_lane: None,
+            batching: OwnerTxBatchingCounters::default(),
         };
         engine.ensure_started();
         engine
@@ -2038,6 +2186,7 @@ impl TxEngine {
                 completion: None,
                 shutdown: false,
                 in_kernel: false,
+                in_kernel_datagrams: 0,
             }));
             let completed_lanes = Rc::clone(&self.completed_lanes);
             let owner_waker = Rc::clone(&self.owner_waker);
@@ -2119,6 +2268,17 @@ impl TxEngine {
         peer: SocketAddr,
         meta: InFlightMeta,
     ) {
+        let (buf, meta) = match self.try_coalesce(&sock, peer, buf, meta) {
+            Ok(()) => {
+                // Joined the staged send: this datagram needs no lane of its
+                // own, but stays counted in flight until the send completes.
+                self.idle_lanes.push(lane_idx);
+                self.batching.coalesced_datagrams += 1;
+                return;
+            }
+            Err(unjoined) => unjoined,
+        };
+        self.open_lane = Some(lane_idx);
         let lane = &self.lanes[lane_idx];
         let mut s = lane.state.borrow_mut();
         s.job = Some(TxJob {
@@ -2126,10 +2286,53 @@ impl TxEngine {
             buf,
             peer,
             meta,
+            more: Vec::new(),
         });
         if let Some(w) = s.worker_waker.take() {
             w.wake();
         }
+    }
+
+    /// Append a datagram to the job staged last in this visit when that job
+    /// has not reached its worker yet (lane workers run only after the Owner
+    /// yields) and targets the same socket and peer with the same datagram
+    /// length: one UDP GSO send then carries both, instead of one submission,
+    /// completion and wake per datagram. Timing is unchanged: every datagram
+    /// of a visit is submitted when the Owner yields either way.
+    fn try_coalesce(
+        &mut self,
+        sock: &Rc<compio::net::UdpSocket>,
+        peer: SocketAddr,
+        buf: Vec<u8>,
+        meta: InFlightMeta,
+    ) -> Result<(), (Vec<u8>, InFlightMeta)> {
+        let Some(open) = self.open_lane.filter(|_| self.coalesce) else {
+            return Err((buf, meta));
+        };
+        let mut state = self.lanes[open].state.borrow_mut();
+        let Some(job) = state.job.as_mut() else {
+            return Err((buf, meta));
+        };
+        let segments = job.more.len() + 2;
+        let fits = Rc::ptr_eq(&job.sock, sock)
+            && job.peer == peer
+            && job.buf.len() == buf.len()
+            && segments <= MAX_GSO_SEGMENTS
+            && segments * buf.len() <= MAX_GSO_BYTES;
+        if !fits {
+            return Err((buf, meta));
+        }
+        if job.more.is_empty() {
+            self.batching.batched_sends += 1;
+        }
+        job.more.push((buf, meta));
+        Ok(())
+    }
+
+    /// Cumulative GSO coalescing counters.
+    #[must_use]
+    pub(crate) fn batching_counters(&self) -> OwnerTxBatchingCounters {
+        self.batching
     }
 
     /// Sole normal completion reaper, and the sole place completion policy
@@ -2160,11 +2363,10 @@ impl TxEngine {
                 .completion
                 .take()
                 .expect("completion present when indexed");
-            let meta = completion.meta;
-            tx_pool.return_slot(completion.buf);
-            Self::apply_completion_policy(&mut self.fault, meta, completion.res, stats, failures);
+            let datagrams = 1 + completion.more.len();
+            self.settle_completion(completion, tx_pool, stats, failures);
             self.idle_lanes.push(lane_idx);
-            self.in_flight_count = self.in_flight_count.saturating_sub(1);
+            self.in_flight_count = self.in_flight_count.saturating_sub(datagrams);
             reaped += 1;
         }
         if let Some(cx) = cx
@@ -2173,6 +2375,66 @@ impl TxEngine {
             *self.owner_waker.borrow_mut() = Some(cx.waker().clone());
         }
         reaped
+    }
+
+    /// Return a reaped job's slots and apply the completion policy to each of
+    /// its datagrams. A coalesced send the path rejected as GSO turns
+    /// coalescing off and counts its datagrams as transient losses (SRT's ARQ
+    /// resends them); it never faults the Owner.
+    fn settle_completion(
+        &mut self,
+        completion: TxCompletion,
+        tx_pool: &mut TxPool,
+        stats: &mut OwnerTxCompletionStats,
+        failures: &mut TxFailureQueue,
+    ) {
+        let TxCompletion {
+            meta,
+            res,
+            buf,
+            more,
+        } = completion;
+        tx_pool.return_slot(buf);
+        if more.is_empty() {
+            Self::apply_completion_policy(&mut self.fault, meta, res, stats, failures);
+            return;
+        }
+        let segment_len = meta.expected_len;
+        let total = segment_len * (1 + more.len());
+        if let Err(error) = &res
+            && is_gso_unsupported(error)
+        {
+            self.coalesce = false;
+            self.batching.gso_fallbacks += 1;
+            for meta in std::iter::once(meta).chain(more.iter().map(|(_, meta)| *meta)) {
+                Self::record_transient_loss(meta, error, stats, failures);
+            }
+        } else {
+            for meta in std::iter::once(meta).chain(more.iter().map(|(_, meta)| *meta)) {
+                let share = segment_result(&res, total, segment_len);
+                Self::apply_completion_policy(&mut self.fault, meta, share, stats, failures);
+            }
+        }
+        for (buf, _) in more {
+            tx_pool.return_slot(buf);
+        }
+    }
+
+    fn record_transient_loss(
+        meta: InFlightMeta,
+        error: &io::Error,
+        stats: &mut OwnerTxCompletionStats,
+        failures: &mut TxFailureQueue,
+    ) {
+        stats.transient_failures += 1;
+        stats.last_failed_peer = Some(meta.peer);
+        failures.push(TxFailureEvent {
+            attribution: meta.attribution,
+            peer: meta.peer,
+            class: TxFailureClass::TransientLocal,
+            kind: error.kind(),
+            errno: error.raw_os_error(),
+        });
     }
 
     /// Completion policy for one reaped `send_to`.
@@ -2348,12 +2610,7 @@ impl TxEngine {
             if let Some(w) = s.worker_waker.take() {
                 w.wake();
             }
-            if let Some(job) = s.job.take() {
-                tx_pool.return_slot(job.buf);
-            }
-            if let Some(completion) = s.completion.take() {
-                tx_pool.return_slot(completion.buf);
-            }
+            s.return_unsent_slots(tx_pool);
         }
         self.completed_lanes.borrow_mut().clear();
         // Ownership stays truthful: a lane whose `send_to` is still with the
@@ -2362,8 +2619,8 @@ impl TxEngine {
         self.in_flight_count = self
             .lanes
             .iter()
-            .filter(|lane| lane.state.borrow().in_kernel)
-            .count();
+            .map(|lane| lane.state.borrow().datagrams_in_kernel())
+            .sum();
         self.idle_lanes.clear();
         for lane_idx in 0..self.capacity {
             if lane_idx < self.lanes.len() && self.lanes[lane_idx].state.borrow().in_kernel {
@@ -3934,6 +4191,13 @@ impl Owner {
     /// first-transmission DATA with a source due instant is sampled.
     pub fn take_first_submit_lateness(&mut self) -> FirstSubmitLateness {
         self.tx_engine.take_first_submit_lateness()
+    }
+
+    /// Cumulative UDP GSO coalescing counters (sends that carried several
+    /// datagrams, datagrams that joined one, and GSO fallbacks).
+    #[must_use]
+    pub fn tx_batching(&self) -> OwnerTxBatchingCounters {
+        self.tx_engine.batching_counters()
     }
 
     #[must_use]
@@ -7143,6 +7407,7 @@ mod tests {
                 engine.in_flight_count += 1;
                 let lane = &engine.lanes[0];
                 lane.state.borrow_mut().completion = Some(TxCompletion {
+                    more: Vec::new(),
                     meta: InFlightMeta {
                         peer,
                         expected_len: 20,
@@ -7207,6 +7472,7 @@ mod tests {
                 engine.in_flight_count += 1;
                 let lane = &engine.lanes[0];
                 lane.state.borrow_mut().completion = Some(TxCompletion {
+                    more: Vec::new(),
                     meta: InFlightMeta {
                         peer,
                         expected_len: 20,
@@ -7246,6 +7512,7 @@ mod tests {
                 engine.in_flight_count += 1;
                 let lane = &engine.lanes[0];
                 lane.state.borrow_mut().completion = Some(TxCompletion {
+                    more: Vec::new(),
                     meta: InFlightMeta {
                         peer,
                         expected_len: 20,
@@ -7990,6 +8257,142 @@ mod tests {
     /// `wait_for_activity`, and the completion must still be unreaped --
     /// `in_flight` unchanged, pool unchanged -- until `service` takes exactly
     /// one.
+    fn owner_sink(owner: &mut Owner) -> OwnerTxSink<'_> {
+        let caller = owner.caller.as_ref().expect("caller side");
+        OwnerTxSink {
+            sock: &caller.sock,
+            tx_pool: &mut owner.tx_pool,
+            tx_engine: &mut owner.tx_engine,
+            operational: true,
+            now: Timestamp::default(),
+        }
+    }
+
+    /// Equal-length datagrams to one peer committed in one visit leave as one
+    /// UDP GSO send, and the receiver still gets them as separate datagrams
+    /// in order; per-datagram accounting is unchanged.
+    #[test]
+    fn same_peer_equal_length_datagrams_coalesce_into_one_gso_send() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            let receiver = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+            receiver
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .expect("timeout");
+            let peer = receiver.local_addr().expect("addr");
+            let c_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+            let c_sock = compio::net::UdpSocket::from_std(c_std).expect("adopt");
+            let mut owner = Owner::new(8).with_caller(OwnerCallerSide::new_single(c_sock));
+            let free = owner.tx_pool().free_count();
+            {
+                let mut sink = owner_sink(&mut owner);
+                for tag in 0..3u8 {
+                    let res = push_test(&mut sink, peer, 20, |buf| {
+                        buf[..20].fill(tag);
+                        Ok(20)
+                    });
+                    assert!(matches!(res, Ok(Some(20))));
+                }
+            }
+            assert_eq!(owner.tx_in_flight(), 3, "in flight counts datagrams");
+            let batching = owner.tx_batching();
+            assert_eq!(batching.batched_sends, 1);
+            assert_eq!(batching.coalesced_datagrams, 2);
+
+            let mut completed = 0;
+            for _ in 0..200 {
+                let report = owner
+                    .service(Timestamp::from_micros(1_000), OwnerServiceBudget::default())
+                    .await;
+                completed += report.tx_completed_ok;
+                if owner.tx_in_flight() == 0 {
+                    break;
+                }
+                owner
+                    .wait_for_activity(std::time::Duration::from_millis(1))
+                    .await;
+            }
+            assert_eq!(completed, 3, "every datagram completes on its own");
+            assert_eq!(owner.tx_pool().free_count(), free, "every slot returns");
+            assert!(owner.fault().is_none());
+
+            let mut buf = [0u8; 64];
+            for tag in 0..3u8 {
+                let len = receiver.recv(&mut buf).expect("segment arrives");
+                assert_eq!(
+                    &buf[..len],
+                    &[tag; 20],
+                    "segments arrive whole and in order"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn different_length_or_peer_never_coalesces() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            let c_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+            let c_sock = compio::net::UdpSocket::from_std(c_std).expect("adopt");
+            let mut owner = Owner::new(8).with_caller(OwnerCallerSide::new_single(c_sock));
+            let a: SocketAddr = "127.0.0.1:19991".parse().unwrap();
+            let b: SocketAddr = "127.0.0.1:19992".parse().unwrap();
+            {
+                let mut sink = owner_sink(&mut owner);
+                for (peer, len) in [(a, 20), (a, 30), (b, 30), (a, 30)] {
+                    let res = push_test(&mut sink, peer, len, |buf| {
+                        buf[..len].fill(1);
+                        Ok(len)
+                    });
+                    assert!(matches!(res, Ok(Some(_))));
+                }
+            }
+            assert_eq!(owner.tx_batching(), OwnerTxBatchingCounters::default());
+            assert_eq!(owner.tx_in_flight(), 4);
+        });
+    }
+
+    /// A path that rejects GSO turns coalescing off and loses the batch as
+    /// transient drops (SRT's ARQ resends them); it never faults the Owner.
+    #[test]
+    fn gso_rejection_disables_coalescing_without_faulting_the_owner() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            let mut engine = TxEngine::new(4);
+            let mut pool = TxPool::new(4, 1500);
+            let peer: SocketAddr = "127.0.0.1:19993".parse().unwrap();
+            let meta = InFlightMeta {
+                peer,
+                expected_len: 20,
+                attribution: TxAttribution::UNATTRIBUTED,
+            };
+            let slot = || vec![0u8; 20];
+            let _ = pool.alloc_slot();
+            let _ = pool.alloc_slot();
+            let _ = pool.alloc_slot();
+            let completion = TxCompletion {
+                meta,
+                res: Err(io::Error::from_raw_os_error(libc::EIO)),
+                buf: slot(),
+                more: vec![(slot(), meta), (slot(), meta)],
+            };
+            let mut stats = OwnerTxCompletionStats::default();
+            let mut failures = TxFailureQueue::default();
+            engine.settle_completion(completion, &mut pool, &mut stats, &mut failures);
+            assert!(
+                engine.fault().is_none(),
+                "GSO rejection is not an Owner fault"
+            );
+            assert!(!engine.coalesce, "coalescing is off after a rejection");
+            assert_eq!(engine.batching_counters().gso_fallbacks, 1);
+            assert_eq!(
+                stats.transient_failures, 3,
+                "every datagram is a transient loss"
+            );
+            assert_eq!(pool.free_count(), pool.capacity(), "every slot returns");
+        });
+    }
+
     #[test]
     fn wait_for_activity_never_reaps_a_completion() {
         let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
@@ -8345,6 +8748,7 @@ mod tests {
                     let mut state = engine.lanes[lane].state.borrow_mut();
                     state.in_kernel = false;
                     state.completion = Some(TxCompletion {
+                        more: Vec::new(),
                         meta: InFlightMeta {
                             peer,
                             expected_len: 10,
@@ -8731,6 +9135,7 @@ mod tests {
                 engine.in_flight_count += 1;
                 let lane = &engine.lanes[0];
                 lane.state.borrow_mut().completion = Some(TxCompletion {
+                    more: Vec::new(),
                     meta: InFlightMeta {
                         peer,
                         expected_len: 20,
@@ -8923,6 +9328,7 @@ mod tests {
                 engine.in_flight_count += 1;
                 let lane = &engine.lanes[0];
                 lane.state.borrow_mut().completion = Some(TxCompletion {
+                    more: Vec::new(),
                     meta: InFlightMeta {
                         peer,
                         expected_len: 20,

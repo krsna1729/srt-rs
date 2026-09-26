@@ -810,6 +810,7 @@ fn bonded_tx_failure_is_attributed_to_group_and_leg() {
             engine.completed_lanes.borrow_mut().clear();
             let lane = &engine.lanes[lane_index];
             lane.state.borrow_mut().completion = Some(TxCompletion {
+                more: Vec::new(),
                 meta: InFlightMeta {
                     peer,
                     expected_len: 20,
