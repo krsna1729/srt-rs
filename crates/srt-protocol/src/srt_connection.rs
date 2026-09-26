@@ -8073,8 +8073,9 @@ mod tests {
         // `sender_window_is_lazy_and_bounded_at_maximum_window`): 8 bytes,
         // deliberate and bounded, not drift. Two later passes grew
         // `SenderBuffer` (embedded inline here) by another 8 bytes each for
-        // the same reason -- see that same test's comment.
-        assert!(connection_bytes <= 1_560);
+        // the same reason -- see that same test's comment -- and one more
+        // pass added 8 for `total_bytes_acked`.
+        assert!(connection_bytes <= 1_568);
         assert!(event_bytes <= 64);
         // F01 added `source_time: Timestamp` (8 bytes) to preserve a
         // message's original source time through reassembly -- a

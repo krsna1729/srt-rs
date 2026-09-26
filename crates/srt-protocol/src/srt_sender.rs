@@ -220,6 +220,8 @@ pub struct SenderBuffer {
     total_dropped: u64,
     /// Payload bytes in locally discarded TLPKTDROP packets.
     total_bytes_dropped: u64,
+    /// Payload bytes of live packets retired by a peer ACK.
+    total_bytes_acked: u64,
     /// Valid ACK control packets received from the peer.
     total_acks_received: u64,
     /// NAK control packets received from the peer.
@@ -373,6 +375,7 @@ impl SenderBuffer {
             dropped_retained: 0,
             total_dropped: 0,
             total_bytes_dropped: 0,
+            total_bytes_acked: 0,
             total_acks_received: 0,
             total_naks_received: 0,
             peer_feedback: None,
@@ -1296,21 +1299,25 @@ impl SenderBuffer {
     /// `ack_seq` is the next expected sequence number (everything below it is ACKed).
     pub fn handle_ack(&mut self, ack_seq: u32) {
         self.total_acks_received = self.total_acks_received.saturating_add(1);
-        self.discard_acked(ack_seq);
+        let acked = self.discard_acked(ack_seq);
+        self.total_bytes_acked = self.total_bytes_acked.saturating_add(acked);
     }
 
     /// Discard acknowledged packets without recording a peer ACK. This is
     /// used by local sequence reconciliation paths.
-    pub(crate) fn discard_acked(&mut self, ack_seq: u32) {
+    /// Returns the payload bytes of the live (not locally dropped) packets it
+    /// retired.
+    pub(crate) fn discard_acked(&mut self, ack_seq: u32) -> u64 {
         if ack_seq & !SEQUENCE_MASK != 0 {
-            return;
+            return 0;
         }
 
         let ack_distance = ack_seq.wrapping_sub(self.oldest_unacked) & SEQUENCE_MASK;
         let in_flight_span = self.next_seq.wrapping_sub(self.oldest_unacked) & SEQUENCE_MASK;
         if ack_distance == 0 || ack_distance > in_flight_span {
-            return;
+            return 0;
         }
+        let mut live_bytes_discarded = 0u64;
 
         let mut stale_count = 0;
         let mut tombstones_discarded = 0;
@@ -1326,6 +1333,7 @@ impl SenderBuffer {
                 if entry.dropped {
                     tombstones_discarded += 1;
                 } else {
+                    live_bytes_discarded += entry.payload.len() as u64;
                     if entry.submitted {
                         live_submitted_discarded += 1;
                     }
@@ -1354,6 +1362,7 @@ impl SenderBuffer {
             self.justified_frontier = self.oldest_unacked;
         }
         self.compact_stale_retransmits();
+        live_bytes_discarded
     }
 
     /// Process a NAK and add to the loss list.
@@ -1876,6 +1885,7 @@ impl SenderBuffer {
             total_lost: self.total_lost,
             total_dropped: self.total_dropped,
             total_bytes_dropped: self.total_bytes_dropped,
+            total_bytes_acked: self.total_bytes_acked,
             total_acks_received: self.total_acks_received,
             total_naks_received: self.total_naks_received,
             retransmits_once,
@@ -1961,6 +1971,11 @@ pub struct SenderStats {
     pub total_dropped: u64,
     /// Payload bytes in locally discarded packets.
     pub total_bytes_dropped: u64,
+    /// Payload bytes of original packets retired by the peer's cumulative
+    /// ACK (locally dropped packets excluded). What the peer confirmed, not
+    /// what it played: a receiver that drops late packets itself still ACKs
+    /// past them.
+    pub total_bytes_acked: u64,
     /// Valid ACK control packets received.
     pub total_acks_received: u64,
     /// NAK control packets received.
@@ -2389,8 +2404,11 @@ mod tests {
         // cumulative ACK must be justified by contiguous submission or
         // DROPREQ delivery, not merely by the highest sequence ever
         // submitted, which TLPKTDROP purging a queued-but-unsubmitted DATA
-        // datagram could otherwise strand behind a hole).
-        assert!(inline_bytes <= 344);
+        // datagram could otherwise strand behind a hole). A fourth added
+        // `total_bytes_acked` (a `u64`): peer-confirmed payload, which a
+        // sender could not otherwise report without re-deriving it from
+        // internal buffer accounting -- 8 bytes, deliberate.
+        assert!(inline_bytes <= 352);
         assert_eq!(window.heap_bytes(), 8_320);
     }
 
@@ -3070,6 +3088,40 @@ mod tests {
     }
 
     /// A TLPKTDROP drop keeps the sequence identity (so a repeated NAK is
+    /// `total_bytes_acked` counts live payload retired by peer ACKs only:
+    /// locally dropped packets (tombstones) and repeated ACKs add nothing.
+    #[test]
+    fn acked_bytes_count_live_payload_retired_by_peer_acks() {
+        let now = Timestamp::default();
+        let mut buf = SenderBuffer::new(0, 32, 10);
+        buf.push_submitted(vec![1; 100], 1, 1, now)
+            .expect("admitted");
+        buf.push_submitted(vec![2; 60], 1, 2, now)
+            .expect("admitted");
+        buf.push_submitted(vec![3; 40], 1, 3, Timestamp::from_micros(5_000_000))
+            .expect("admitted");
+        assert_eq!(buf.stats().total_bytes_acked, 0);
+
+        buf.handle_ack(1);
+        assert_eq!(buf.stats().total_bytes_acked, 100);
+        buf.handle_ack(1);
+        assert_eq!(
+            buf.stats().total_bytes_acked,
+            100,
+            "a repeated ACK retires nothing"
+        );
+
+        let dropped = buf.drop_expired(Timestamp::from_micros(1_000_001));
+        assert_eq!(dropped.len(), 1, "the second packet expires");
+        buf.handle_ack(3);
+        let stats = buf.stats();
+        assert_eq!(stats.total_bytes_dropped, 60);
+        assert_eq!(
+            stats.total_bytes_acked, 140,
+            "the dropped packet's tombstone is not counted as acknowledged"
+        );
+    }
+
     /// still answered) and releases the media.
     #[test]
     fn a_dropped_packet_leaves_a_tombstone_until_the_ack() {
