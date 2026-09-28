@@ -110,9 +110,8 @@ fn ipv4_envelope_is_reported_separately_from_protocol_truth() {
     // property, so it is its own reason and must not masquerade as protocol
     // truth.
     let mut input = known_input();
-    input.workload.payload_bytes =
-        srt_bench::model::negotiated_srt_datagram_ceiling_bytes()
-            - srt_proto::wire::SRT_HEADER_SIZE as u64;
+    input.workload.payload_bytes = srt_bench::model::negotiated_srt_datagram_ceiling_bytes()
+        - srt_proto::wire::SRT_HEADER_SIZE as u64;
     input.protocol.encryption = EncryptionMode::Aes128;
     input.protocol.cipher_mode = srt_proto::crypto::CipherMode::Gcm;
     let a = assessment(input.clone());
@@ -130,8 +129,7 @@ fn ipv4_envelope_is_reported_separately_from_protocol_truth() {
     // The same payload on a path with a larger IP/UDP header is equally
     // protocol-legal and equally over the path envelope.
     input.protocol.cipher_mode = srt_proto::crypto::CipherMode::Ctr;
-    input.network.udp_ip_header_bytes =
-        srt_proto::handshake::IP_UDP_HEADER_SIZE_IPV6 as u64;
+    input.network.udp_ip_header_bytes = srt_proto::handshake::IP_UDP_HEADER_SIZE_IPV6 as u64;
     let v6 = assessment(input);
     assert!(
         !v6.reasons

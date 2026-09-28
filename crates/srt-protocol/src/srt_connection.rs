@@ -2956,7 +2956,6 @@ impl SrtConnection {
             ));
         }
 
-
         match self.role {
             ConnectionRole::Caller => self.handle_handshake_caller(hs, pkt.timestamp, now),
             ConnectionRole::Listener => self.handle_handshake_listener(hs, pkt.timestamp, now),
@@ -3185,9 +3184,8 @@ impl SrtConnection {
                     .and_then(|state| state.pending_response.as_ref())
                     .is_some_and(|pending| pending == &response);
                 if !matches_pending {
-                    return Err(self.fail_caller_handshake(
-                        "KMRSP does not match the caller's pending KMREQ",
-                    ));
+                    return Err(self
+                        .fail_caller_handshake("KMRSP does not match the caller's pending KMREQ"));
                 }
                 let state = self
                     .km_control
@@ -3700,9 +3698,7 @@ impl SrtConnection {
                 }
 
                 let crypto = self.crypto.as_ref().expect("checked above");
-                if !km_matches_context(&km, crypto)
-                    || km.key_flag != crypto.current_key().other()
-                {
+                if !km_matches_context(&km, crypto) || km.key_flag != crypto.current_key().other() {
                     return Err(Error::invalid_data(
                         "KMREQ does not match the secured session's next generation",
                     ));
@@ -7590,11 +7586,8 @@ mod tests {
                     .as_bytes()
                     .chunks_exact(2)
                     .map(|pair| {
-                        u8::from_str_radix(
-                            std::str::from_utf8(pair).expect("ASCII hex"),
-                            16,
-                        )
-                        .expect("valid hex byte")
+                        u8::from_str_radix(std::str::from_utf8(pair).expect("ASCII hex"), 16)
+                            .expect("valid hex byte")
                     })
                     .collect();
                 (label, bytes)
@@ -7722,7 +7715,6 @@ mod tests {
                 "{label}: rejected input emitted an application event"
             );
         }
-
 
         // A well-formed SHUTDOWN is still accepted afterwards, and it is the
         // one control whose acceptance changes state: the negative cases
@@ -8025,10 +8017,7 @@ mod tests {
                     "wrong cookie",
                     different_cookie.encode(0, target.socket_id()),
                 ),
-                (
-                    "wrong ISN",
-                    different_isn.encode(0, target.socket_id()),
-                ),
+                ("wrong ISN", different_isn.encode(0, target.socket_id())),
             ];
 
             let baseline = target.stats();
@@ -8062,7 +8051,9 @@ mod tests {
             // A genuine repeated CONCLUSION remains recoverable after all
             // invalid controls; only it may re-send the retained response.
             let mut bytes = Vec::new();
-            valid.encode(&mut bytes).expect("valid duplicate conclusion");
+            valid
+                .encode(&mut bytes)
+                .expect("valid duplicate conclusion");
             target
                 .feed_recv_buf(&bytes, Timestamp::from_micros(1_000_002))
                 .expect("same peer may retransmit its CONCLUSION");
@@ -8228,7 +8219,8 @@ mod tests {
 
         let conclusions = drain_rewritten_handshakes(&mut caller, caller_rewrite);
         assert_eq!(conclusions.len(), 1, "one CONCLUSION request");
-        let listener_result = listener.feed_recv_buf(&conclusions[0], Timestamp::from_micros(3_000));
+        let listener_result =
+            listener.feed_recv_buf(&conclusions[0], Timestamp::from_micros(3_000));
 
         let caller_result = if listener_result.is_ok() {
             let answers = drain_rewritten_handshakes(&mut listener, listener_rewrite);
@@ -8273,10 +8265,7 @@ mod tests {
             attempt
                 .caller_result
                 .unwrap_or_else(|error| panic!("caller accepted MSS {mss}: {error}"));
-            for (who, conn) in [
-                ("caller", &attempt.caller),
-                ("listener", &attempt.listener),
-            ] {
+            for (who, conn) in [("caller", &attempt.caller), ("listener", &attempt.listener)] {
                 assert_eq!(conn.state(), ConnectionState::Connected, "{who} MSS {mss}");
                 assert_eq!(
                     conn.effective_max_payload_size(),
@@ -8298,48 +8287,58 @@ mod tests {
             (1501, v4),
             (u32::MAX, v4),
         ] {
-            let mut attempt = mss_handshake(mss, mss, peer_ip, listener_options());
-            let error = attempt
-                .listener_result
-                .expect_err("listener rejects an unusable peer MSS");
-            assert_eq!(error.kind, crate::ErrorKind::HandshakeRejected, "MSS {mss}");
-            assert!(
-                error.reason.contains("MSS"),
-                "the rejection must name the field: {}",
-                error.reason
-            );
-            assert!(
-                error.reason.contains("minimum") || error.reason.contains("maximum"),
-                "the rejection must name the violated bound: {}",
-                error.reason
-            );
-            assert_eq!(attempt.listener.state(), ConnectionState::Disconnected);
-            // Nothing about the attempt was committed: no crypto, no peer
-            // stream, no negotiated payload, no session sequence.
-            assert!(attempt.listener.crypto.is_none());
-            assert!(attempt.listener.peer_stream_id.is_none());
-            assert_eq!(attempt.listener.max_payload_size, DEFAULT_MTU as usize - SRT_HEADER_SIZE);
-            assert_eq!(attempt.listener.initial_seq, 0);
-
-            // The listener answers with the reference's own rejection code
-            // rather than staying silent.
-            let rejections: Vec<_> = drain_outputs(&mut attempt.listener)
-                .into_iter()
-                .filter_map(|output| match output {
-                    ConnectionOutput::SendPacket(bytes) => Some(bytes),
-                    _ => None,
-                })
-                .filter_map(|bytes| match SrtPacket::decode(&bytes) {
-                    Ok(SrtPacket::Control(control)) => Some(control),
-                    _ => None,
-                })
-                .filter(|control| control.control_type == ControlType::Handshake)
-                .collect();
-            assert_eq!(rejections.len(), 1, "one rejection response for MSS {mss}");
-            let rejection = HandshakePacket::decode(&rejections[0]).expect("rejection decodes");
-            assert_eq!(rejection.handshake_type, HandshakeType::Rejected);
-            assert_eq!(rejection.reject_reason, Some(SRT_REJ_ROGUE));
+            assert_unusable_peer_mss_is_refused(mss, peer_ip);
         }
+    }
+
+    /// A peer MSS outside the derived bounds is refused by the listener with
+    /// the reference's own rejection code, and nothing about the attempt is
+    /// committed.
+    fn assert_unusable_peer_mss_is_refused(mss: u32, peer_ip: IpAddr) {
+        let mut attempt = mss_handshake(mss, mss, peer_ip, listener_options());
+        let error = attempt
+            .listener_result
+            .expect_err("listener rejects an unusable peer MSS");
+        assert_eq!(error.kind, crate::ErrorKind::HandshakeRejected, "MSS {mss}");
+        assert!(
+            error.reason.contains("MSS"),
+            "the rejection must name the field: {}",
+            error.reason
+        );
+        assert!(
+            error.reason.contains("minimum") || error.reason.contains("maximum"),
+            "the rejection must name the violated bound: {}",
+            error.reason
+        );
+        assert_eq!(attempt.listener.state(), ConnectionState::Disconnected);
+        // Nothing about the attempt was committed: no crypto, no peer
+        // stream, no negotiated payload, no session sequence.
+        assert!(attempt.listener.crypto.is_none());
+        assert!(attempt.listener.peer_stream_id.is_none());
+        assert_eq!(
+            attempt.listener.max_payload_size,
+            DEFAULT_MTU as usize - SRT_HEADER_SIZE
+        );
+        assert_eq!(attempt.listener.initial_seq, 0);
+
+        // The listener answers with the reference's own rejection code rather
+        // than staying silent.
+        let rejections: Vec<_> = drain_outputs(&mut attempt.listener)
+            .into_iter()
+            .filter_map(|output| match output {
+                ConnectionOutput::SendPacket(bytes) => Some(bytes),
+                _ => None,
+            })
+            .filter_map(|bytes| match SrtPacket::decode(&bytes) {
+                Ok(SrtPacket::Control(control)) => Some(control),
+                _ => None,
+            })
+            .filter(|control| control.control_type == ControlType::Handshake)
+            .collect();
+        assert_eq!(rejections.len(), 1, "one rejection response for MSS {mss}");
+        let rejection = HandshakePacket::decode(&rejections[0]).expect("rejection decodes");
+        assert_eq!(rejection.handshake_type, HandshakeType::Rejected);
+        assert_eq!(rejection.reject_reason, Some(SRT_REJ_ROGUE));
     }
 
     /// A caller rejects an unusable listener MSS terminally, and a listener
@@ -8348,7 +8347,9 @@ mod tests {
     fn an_unusable_listener_mss_fails_the_caller_and_leaves_the_listener_serving() {
         let v4 = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
         let attempt = mss_handshake(1500, 40, v4, listener_options());
-        attempt.listener_result.expect("the listener accepts the caller");
+        attempt
+            .listener_result
+            .expect("the listener accepts the caller");
         let error = attempt
             .caller_result
             .expect_err("caller rejects the listener's MSS");
@@ -8494,7 +8495,9 @@ mod tests {
 
         // The listener answering with one is refused by the caller.
         let attempt = handshake_with_rewrites(&plain, &asking, listener_options());
-        attempt.listener_result.expect("the listener accepts the caller");
+        attempt
+            .listener_result
+            .expect("the listener accepts the caller");
         let error = attempt
             .caller_result
             .expect_err("the caller refuses a filter negotiation");
@@ -8506,8 +8509,12 @@ mod tests {
         let mut advertising = plain;
         advertising.packet_filter_flag = true;
         let attempt = handshake_with_rewrites(&advertising, &advertising, listener_options());
-        attempt.listener_result.expect("listener accepts the advertisement");
-        attempt.caller_result.expect("caller accepts the advertisement");
+        attempt
+            .listener_result
+            .expect("listener accepts the advertisement");
+        attempt
+            .caller_result
+            .expect("caller accepts the advertisement");
         assert_eq!(attempt.listener.state(), ConnectionState::Connected);
         assert_eq!(attempt.caller.state(), ConnectionState::Connected);
     }

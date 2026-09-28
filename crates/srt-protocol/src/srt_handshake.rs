@@ -921,9 +921,9 @@ fn validate_extension_data(ext_type: ExtensionType, data: &[u8]) -> Result<(), E
                 .ok_or_else(|| Error::invalid_data("unknown KMRSP error code"))
         }
         ExtensionType::KmRsp => KmMessage::decode(data).map(|_| ()),
-        ExtensionType::Group if data.len() != 8 => {
-            Err(Error::invalid_data("GROUP extension must be exactly 8 bytes"))
-        }
+        ExtensionType::Group if data.len() != 8 => Err(Error::invalid_data(
+            "GROUP extension must be exactly 8 bytes",
+        )),
         ExtensionType::Sid | ExtensionType::Congestion | ExtensionType::Filter
             if data.len() > 512 =>
         {
@@ -1385,11 +1385,7 @@ mod tests {
             handshake.mtu = mtu;
             handshake.peer_ip = ip;
             let reason = handshake.peer_mss_rejection_reason(MIN_PAYLOAD);
-            assert_eq!(
-                reason.is_none(),
-                accepted,
-                "MSS {mtu} on {ip}: {reason:?}"
-            );
+            assert_eq!(reason.is_none(), accepted, "MSS {mtu} on {ip}: {reason:?}");
             if let Some(reason) = reason {
                 assert!(reason.contains("MSS"), "{reason}");
             }
@@ -2046,11 +2042,7 @@ mod tests {
 
     #[test]
     fn km_message_requires_the_exact_wrapped_key_length() {
-        for key_length in [
-            KeyLength::Aes128,
-            KeyLength::Aes192,
-            KeyLength::Aes256,
-        ] {
+        for key_length in [KeyLength::Aes128, KeyLength::Aes192, KeyLength::Aes256] {
             let encoded = KmMessage::new(
                 KeyFlag::Even,
                 key_length,

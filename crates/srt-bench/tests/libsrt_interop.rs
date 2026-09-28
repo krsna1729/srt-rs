@@ -2426,9 +2426,9 @@ fn compio_owner_bond_to_independent_libsrt_receivers_reports_a_peer_group_collis
     // leg can connect. That is the environment, not a conformance failure, and
     // it is the same skip every other bonding test in this file takes (with
     // `SRT_REQUIRE_BONDING` turning it back into a failure).
-    let unavailable = [&mut first, &mut second].into_iter().any(|child| {
-        matches!(child.try_wait(), Ok(Some(status)) if bonding_unavailable(status.code()))
-    });
+    let unavailable = [&mut first, &mut second].into_iter().any(
+        |child| matches!(child.try_wait(), Ok(Some(status)) if bonding_unavailable(status.code())),
+    );
     let _ = first.kill();
     let _ = second.kill();
     let _ = (first.wait(), second.wait());
