@@ -388,7 +388,12 @@ impl HandshakePacket {
         let version = read_u32(&mut buf)?;
         let encryption_field = read_u16(&mut buf)?;
         let extension_field = read_u16(&mut buf)?;
-        let initial_packet_seq = read_u32(&mut buf)? & 0x7FFF_FFFF;
+        let initial_packet_seq = read_u32(&mut buf)?;
+        if initial_packet_seq & 0x8000_0000 != 0 {
+            return Err(Error::invalid_data(
+                "handshake initial sequence must not have its high bit set",
+            ));
+        }
         let mtu = read_u32(&mut buf)?;
         let flow_window = read_u32(&mut buf)?;
         let handshake_type_raw = read_u32(&mut buf)?;
@@ -427,7 +432,7 @@ impl HandshakePacket {
         let ip_bytes = read_bytes(&mut buf, 16)?;
         let peer_ip = parse_peer_ip(&ip_bytes);
 
-        let extensions = decode_extensions(&mut buf)?;
+        let extensions = decode_extensions(&mut buf, extension_field)?;
 
         Ok(Self {
             version,
@@ -515,6 +520,7 @@ impl HandshakePacket {
             ext_type: ExtensionType::HsReq,
             data,
         });
+        self.extension_field |= extension_flags::HSREQ;
     }
 
     /// Add an HSRSP extension.
@@ -529,13 +535,14 @@ impl HandshakePacket {
             ext_type: ExtensionType::HsRsp,
             data,
         });
+        self.extension_field |= extension_flags::HSREQ;
     }
 
     /// Get the HSREQ/HSRSP extension.
     pub fn get_hs_extension(&self) -> Option<HsExtensionData> {
         for ext in &self.extensions {
             if (ext.ext_type == ExtensionType::HsReq || ext.ext_type == ExtensionType::HsRsp)
-                && ext.data.len() >= 12
+                && ext.data.len() == 12
             {
                 let mut buf = ext.data.as_slice();
                 let srt_version = read_u32(&mut buf).ok()?;
@@ -574,7 +581,7 @@ impl HandshakePacket {
     /// Read the first valid libsrt-compatible GROUP extension.
     pub fn get_group_extension(&self) -> Option<GroupExtensionData> {
         for extension in &self.extensions {
-            if extension.ext_type != ExtensionType::Group || extension.data.len() < 8 {
+            if extension.ext_type != ExtensionType::Group || extension.data.len() != 8 {
                 continue;
             }
 
@@ -604,6 +611,7 @@ impl HandshakePacket {
             ext_type: ExtensionType::KmReq,
             data: km_message.encode(),
         });
+        self.extension_field |= extension_flags::KMREQ;
     }
 
     /// Add a KMRSP extension (success: returns the same KM message).
@@ -612,6 +620,7 @@ impl HandshakePacket {
             ext_type: ExtensionType::KmRsp,
             data: km_message.encode(),
         });
+        self.extension_field |= extension_flags::KMREQ;
     }
 
     /// Add a KMRSP error extension (failure).
@@ -623,6 +632,7 @@ impl HandshakePacket {
             // swapping. The resulting extension bytes are little-endian.
             data: (error as u32).to_le_bytes().to_vec(),
         });
+        self.extension_field |= extension_flags::KMREQ;
     }
 
     /// Get the KMREQ extension.
@@ -725,25 +735,78 @@ impl HandshakePacket {
     }
 }
 
-fn decode_extensions(buf: &mut &[u8]) -> Result<Vec<HandshakeExtension>, Error> {
+fn decode_extensions(
+    buf: &mut &[u8],
+    extension_field: u16,
+) -> Result<Vec<HandshakeExtension>, Error> {
     let mut extensions = Vec::new();
-    while buf.len() >= 4 {
+    let mut seen = [false; 6];
+    while !buf.is_empty() {
+        if buf.len() < 4 {
+            return Err(Error::invalid_data("truncated handshake extension header"));
+        }
         let ext_type_raw = read_u16(buf)?;
-        let ext_len = read_u16(buf)? as usize * 4; // In 4-byte units.
-
+        let ext_len = read_u16(buf)? as usize * 4;
         if buf.len() < ext_len {
-            break;
+            return Err(Error::invalid_data("truncated handshake extension body"));
         }
+        let (ext_data, rest) = buf.split_at(ext_len);
+        *buf = rest;
 
-        let ext_data = read_bytes(buf, ext_len)?;
-        if let Some(ext_type) = ExtensionType::from_u16(ext_type_raw) {
-            extensions.push(HandshakeExtension {
-                ext_type,
-                data: ext_data,
-            });
+        let Some(ext_type) = ExtensionType::from_u16(ext_type_raw) else {
+            continue;
+        };
+        let (category, duplicate_slot) = match ext_type {
+            ExtensionType::HsReq | ExtensionType::HsRsp => (extension_flags::HSREQ, 0),
+            ExtensionType::KmReq | ExtensionType::KmRsp => (extension_flags::KMREQ, 1),
+            ExtensionType::Sid => (extension_flags::CONFIG, 2),
+            ExtensionType::Congestion => (extension_flags::CONFIG, 3),
+            ExtensionType::Filter => (extension_flags::CONFIG, 4),
+            ExtensionType::Group => (extension_flags::CONFIG, 5),
+        };
+        if extension_field & category == 0 {
+            return Err(Error::invalid_data(format!(
+                "{ext_type:?} extension is missing its category flag"
+            )));
         }
+        if seen[duplicate_slot] {
+            return Err(Error::invalid_data(format!(
+                "duplicate {ext_type:?} extension category"
+            )));
+        }
+        validate_extension_data(ext_type, ext_data)?;
+        seen[duplicate_slot] = true;
+        extensions.push(HandshakeExtension {
+            ext_type,
+            data: ext_data.to_vec(),
+        });
     }
     Ok(extensions)
+}
+
+fn validate_extension_data(ext_type: ExtensionType, data: &[u8]) -> Result<(), Error> {
+    match ext_type {
+        ExtensionType::HsReq | ExtensionType::HsRsp if data.len() != 12 => {
+            Err(Error::invalid_data("HS extension must be exactly 12 bytes"))
+        }
+        ExtensionType::KmReq => KmMessage::decode(data).map(|_| ()),
+        ExtensionType::KmRsp if data.len() == 4 => {
+            let code = u32::from_le_bytes(data.try_into().expect("length checked"));
+            KmError::from_u32(code)
+                .map(|_| ())
+                .ok_or_else(|| Error::invalid_data("unknown KMRSP error code"))
+        }
+        ExtensionType::KmRsp => KmMessage::decode(data).map(|_| ()),
+        ExtensionType::Group if data.len() != 8 => {
+            Err(Error::invalid_data("GROUP extension must be exactly 8 bytes"))
+        }
+        ExtensionType::Sid | ExtensionType::Congestion | ExtensionType::Filter
+            if data.len() > 512 =>
+        {
+            Err(Error::invalid_data("CONFIG extension exceeds 512 bytes"))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Encode a string as 32-bit little-endian words.
@@ -993,9 +1056,14 @@ impl KmMessage {
 
         // First 4 bytes.
         let first_byte = read_u8(&mut buf)?;
+        if first_byte & 0x80 != 0 {
+            return Err(Error::invalid_data("KM reserved bit is set"));
+        }
         let version = (first_byte >> 4) & 0x07;
         let packet_type = first_byte & 0x0F;
-
+        if version != KM_VERSION || packet_type != KM_PACKET_TYPE {
+            return Err(Error::invalid_data("unsupported KM version or packet type"));
+        }
         let signature = read_u16(&mut buf)?;
         if signature != KM_SIGNATURE {
             return Err(Error::invalid_data(format!(
@@ -1004,6 +1072,9 @@ impl KmMessage {
         }
 
         let kk_byte = read_u8(&mut buf)?;
+        if kk_byte & !0b11 != 0 {
+            return Err(Error::invalid_data("KM KK reserved bits are set"));
+        }
         let key_flag = KeyFlag::from_kk_field(kk_byte)
             .ok_or_else(|| Error::invalid_data("invalid KK field"))?;
 
@@ -1014,10 +1085,10 @@ impl KmMessage {
         let cipher = read_u8(&mut buf)?;
         let auth = read_u8(&mut buf)?;
         let stream_encapsulation = read_u8(&mut buf)?;
-        let _resv2 = read_u8(&mut buf)?;
+        let resv2 = read_u8(&mut buf)?;
 
         // Resv3, SLen/4, KLen/4
-        let _resv3 = read_u16(&mut buf)?;
+        let resv3 = read_u16(&mut buf)?;
         let slen_div4 = read_u8(&mut buf)? as usize;
         let klen_div4 = read_u8(&mut buf)? as usize;
 
@@ -1032,6 +1103,27 @@ impl KmMessage {
 
         let key_length = KeyLength::from_len(klen)
             .ok_or_else(|| Error::invalid_data(format!("invalid key length: {klen}")))?;
+        if version != KM_VERSION
+            || packet_type != KM_PACKET_TYPE
+            || keki != 0
+            || !matches!(
+                (cipher, auth),
+                (cipher_type::AES_CTR, auth_type::NONE)
+                    | (cipher_type::AES_GCM, auth_type::AES_GCM)
+            )
+            || stream_encapsulation != stream_encapsulation::MPEG_TS_SRT
+            || resv2 != 0
+            || resv3 != 0
+        {
+            return Err(Error::invalid_data("unsupported KM message parameters"));
+        }
+        let expected_remaining = slen + key_length.len() + 8;
+        if buf.len() != expected_remaining {
+            return Err(Error::invalid_data(format!(
+                "KM message length mismatch: expected {expected_remaining} bytes after header, got {}",
+                buf.len()
+            )));
+        }
 
         // Salt
         if buf.len() < slen {
@@ -1630,5 +1722,145 @@ mod tests {
         hs.add_group_extension(group);
 
         assert_eq!(hs.get_group_extension(), Some(group));
+    }
+
+    fn valid_extension_data(ext_type: ExtensionType) -> Vec<u8> {
+        match ext_type {
+            ExtensionType::HsReq | ExtensionType::HsRsp => vec![0; 12],
+            ExtensionType::KmReq | ExtensionType::KmRsp => KmMessage::new(
+                KeyFlag::Even,
+                KeyLength::Aes128,
+                [0; 16],
+                vec![0; 24],
+                crate::crypto_impl::CipherMode::Ctr,
+            )
+            .encode(),
+            ExtensionType::Sid | ExtensionType::Congestion => Vec::new(),
+            ExtensionType::Filter => b"fec\0".to_vec(),
+            ExtensionType::Group => vec![0; 8],
+        }
+    }
+
+    #[test]
+    fn extension_decode_rejects_truncated_headers_and_bodies() {
+        let hs = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
+
+        let mut partial_header = hs.encode(0, 0);
+        partial_header.control_info.extend_from_slice(&[0, 1]);
+        assert!(HandshakePacket::decode(&partial_header).is_err());
+
+        let mut partial_body = hs.encode(0, 0);
+        write_u16(&mut partial_body.control_info, ExtensionType::HsReq as u16);
+        write_u16(&mut partial_body.control_info, 3);
+        partial_body.control_info.extend_from_slice(&[0; 8]);
+        assert!(HandshakePacket::decode(&partial_body).is_err());
+    }
+
+    #[test]
+    fn extension_decode_rejects_duplicate_known_categories() {
+        let cases = [
+            (ExtensionType::HsReq, extension_flags::HSREQ),
+            (ExtensionType::KmReq, extension_flags::KMREQ),
+            (ExtensionType::Sid, extension_flags::CONFIG),
+            (ExtensionType::Congestion, extension_flags::CONFIG),
+            (ExtensionType::Filter, extension_flags::CONFIG),
+            (ExtensionType::Group, extension_flags::CONFIG),
+        ];
+        for (ext_type, category) in cases {
+            let extension = HandshakeExtension {
+                ext_type,
+                data: valid_extension_data(ext_type),
+            };
+            let mut hs = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
+            hs.extension_field = category;
+            hs.extensions = vec![extension.clone(), extension];
+            assert!(
+                HandshakePacket::decode(&hs.encode(0, 0)).is_err(),
+                "{ext_type:?} duplicate must be rejected"
+            );
+        }
+
+        let mut mixed_hs = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
+        mixed_hs.extension_field = extension_flags::HSREQ;
+        mixed_hs.extensions = vec![
+            HandshakeExtension {
+                ext_type: ExtensionType::HsReq,
+                data: valid_extension_data(ExtensionType::HsReq),
+            },
+            HandshakeExtension {
+                ext_type: ExtensionType::HsRsp,
+                data: valid_extension_data(ExtensionType::HsRsp),
+            },
+        ];
+        assert!(HandshakePacket::decode(&mixed_hs.encode(0, 0)).is_err());
+    }
+
+    #[test]
+    fn known_extensions_require_their_category_flag() {
+        for ext_type in [
+            ExtensionType::HsReq,
+            ExtensionType::HsRsp,
+            ExtensionType::KmReq,
+            ExtensionType::KmRsp,
+            ExtensionType::Sid,
+            ExtensionType::Congestion,
+            ExtensionType::Filter,
+            ExtensionType::Group,
+        ] {
+            let mut hs = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
+            hs.extension_field = 0;
+            hs.extensions.push(HandshakeExtension {
+                ext_type,
+                data: valid_extension_data(ext_type),
+            });
+            assert!(
+                HandshakePacket::decode(&hs.encode(0, 0)).is_err(),
+                "{ext_type:?} without its category bit must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_well_framed_extension_remains_ignorable() {
+        let hs = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
+        let mut packet = hs.encode(0, 0);
+        write_u16(&mut packet.control_info, 0x7fff);
+        write_u16(&mut packet.control_info, 1);
+        packet.control_info.extend_from_slice(&[1, 2, 3, 4]);
+
+        let decoded = HandshakePacket::decode(&packet).expect("unknown framed extension");
+        assert!(decoded.extensions.is_empty());
+    }
+
+    #[test]
+    fn handshake_isn_high_bit_is_rejected_not_aliased() {
+        let hs = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
+        let mut packet = hs.encode(0, 0);
+        packet.control_info[8..12].copy_from_slice(&0x8000_0003u32.to_be_bytes());
+        assert!(HandshakePacket::decode(&packet).is_err());
+    }
+
+    #[test]
+    fn km_message_requires_the_exact_wrapped_key_length() {
+        for key_length in [
+            KeyLength::Aes128,
+            KeyLength::Aes192,
+            KeyLength::Aes256,
+        ] {
+            let encoded = KmMessage::new(
+                KeyFlag::Even,
+                key_length,
+                [0; 16],
+                vec![0; key_length.len() + 8],
+                crate::crypto_impl::CipherMode::Ctr,
+            )
+            .encode();
+            assert!(KmMessage::decode(&encoded).is_ok());
+            assert!(KmMessage::decode(&encoded[..encoded.len() - 4]).is_err());
+
+            let mut oversized = encoded;
+            oversized.extend_from_slice(&[0; 4]);
+            assert!(KmMessage::decode(&oversized).is_err());
+        }
     }
 }
