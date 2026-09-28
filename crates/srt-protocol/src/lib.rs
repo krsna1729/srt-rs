@@ -42,7 +42,8 @@ pub mod handshake {
     pub use super::srt_handshake::{
         DEFAULT_FLOW_WINDOW, DEFAULT_MTU, ExtensionType, GFLAG_SYNCONMSG, GroupExtensionData,
         GroupType, HS_VERSION_4, HS_VERSION_5, HandshakeExtension, HandshakePacket, HandshakeState,
-        HandshakeType, HsExtensionData, KmError, KmMessage, MAX_FLOW_WINDOW, SRTGROUP_MASK,
+        HandshakeType, HsExtensionData, IP_UDP_HEADER_SIZE_IPV4, IP_UDP_HEADER_SIZE_IPV6, KmError,
+        KmMessage, MAX_FLOW_WINDOW, MAX_PEER_MSS, SRTGROUP_MASK,
         extension_flags, peek_handshake, srt_flags,
     };
 }

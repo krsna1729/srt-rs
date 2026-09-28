@@ -29,7 +29,7 @@ pub const HS_VERSION_4: u32 = 4;
 /// Handshake version.
 pub const HS_VERSION_5: u32 = 5;
 
-/// Default MTU size.
+/// Default MTU size (the value this implementation advertises).
 ///
 /// Consumed as the SRT datagram budget: `SrtConnection` derives
 /// `max_payload_size = DEFAULT_MTU - SRT_HEADER_SIZE`, and protocol tests
@@ -37,7 +37,44 @@ pub const HS_VERSION_5: u32 = 5;
 /// an IPv4 packet MTU -- a deployment on a 1500-byte IPv4 path additionally
 /// carries IP and UDP headers, which srt-bench's capacity classifier models
 /// separately as a deployment envelope rather than as protocol truth.
+///
+/// The *advertised* direction is safe under either reading: a reference
+/// peer that reads this field as an IP MTU (libsrt's `SRTO_MSS` semantics)
+/// sizes its payload at `DEFAULT_MTU - 44` = 1456 bytes, and this core
+/// accepts datagrams up to `MAX_DATAGRAM_SIZE`, well beyond that. The
+/// *received* direction is not symmetric: a peer's advertised MSS bounds
+/// what that peer's stack can receive, so `SrtConnection` negotiates its
+/// outbound payload against it (`apply_peer_mss`). See
+/// [`IP_UDP_HEADER_SIZE_IPV4`] and [`MAX_PEER_MSS`] for the bounds derived
+/// from the pinned reference.
 pub const DEFAULT_MTU: u32 = 1500;
+
+/// IP + UDP header bytes ahead of an SRT datagram on an IPv4 path.
+///
+/// The same quantity as libsrt's `CPacket::UDP_HDR_SIZE` (20 + 8) in the
+/// pinned reference (`899348d8`, `srtcore/packet.h`). The handshake's MTU
+/// field is an *IP-layer* MTU there, so an SRT datagram may only be
+/// `mss - IP_UDP_HEADER_SIZE_IPV4` bytes long.
+pub const IP_UDP_HEADER_SIZE_IPV4: u32 = 28;
+
+/// IP + UDP header bytes ahead of an SRT datagram on an IPv6 path
+/// (libsrt's `CPacket::UDP_HDR_SIZE_IPv6`: 40 + 8).
+pub const IP_UDP_HEADER_SIZE_IPV6: u32 = 48;
+
+/// Largest MSS any reference implementation accepts in a handshake.
+///
+/// libsrt's `CPacket::ETH_MAX_MTU_SIZE` (1500, "Ethernet II, RFC 1191").
+/// Its caller rejects a larger value with `SRT_REJ_ROGUE` before sizing any
+/// buffer from it (`CUDT::processConnectResponse`), and its listener
+/// derives its payload size from the smaller of the two peers' values.
+pub const MAX_PEER_MSS: u32 = 1500;
+
+/// `SRT_REJ_ROGUE`: incorrect data in handshake messages.
+///
+/// libsrt (`srtcore/srt.h`, zero-based `SRT_REJECT_REASON`) uses this for
+/// exactly the two MSS violations below -- a peer MSS below the family's
+/// minimum and one above [`MAX_PEER_MSS`].
+pub const SRT_REJ_ROGUE: i32 = 4;
 
 /// Default flow window size.
 pub const DEFAULT_FLOW_WINDOW: u32 = 8192;
@@ -370,6 +407,66 @@ impl HandshakePacket {
             extensions: Vec::new(),
             reject_reason: Some(reason),
         }
+    }
+
+    /// IP + UDP header bytes for the address family this handshake names.
+    ///
+    /// libsrt keys this off the peer's socket family
+    /// (`MinimumMSS(peer.family())`); this core keys it off the peer address
+    /// the handshake itself carries, defaulting to IPv4 for an unspecified
+    /// or IPv4 address. An IPv6 peer therefore gets the larger, conservative
+    /// overhead even though libsrt's caller path uses the IPv4 constant
+    /// unconditionally.
+    pub fn ip_udp_overhead(&self) -> u32 {
+        match self.peer_ip {
+            IpAddr::V6(_) => IP_UDP_HEADER_SIZE_IPV6,
+            IpAddr::V4(_) => IP_UDP_HEADER_SIZE_IPV4,
+        }
+    }
+
+    /// Largest SRT datagram (header included) this handshake's advertised
+    /// MSS can carry on the wire.
+    pub fn peer_max_datagram_size(&self) -> u32 {
+        self.mtu.saturating_sub(self.ip_udp_overhead())
+    }
+
+    /// Largest DATA payload this handshake's advertised MSS can carry:
+    /// libsrt's own derivation, `m_iMaxDataPayloadSize = mss -
+    /// (UDP_HDR_SIZE + HDR_SIZE)`.
+    pub fn peer_max_payload_size(&self) -> u32 {
+        self.peer_max_datagram_size()
+            .saturating_sub(SRT_HEADER_SIZE as u32)
+    }
+
+    /// Why this handshake's advertised MSS is unusable for a connection
+    /// that needs at least `min_payload` bytes of DATA payload, or `None`
+    /// when it is usable.
+    ///
+    /// Both bounds are derived, not copied: the lower one is this
+    /// implementation's own smallest mandatory control packet expressed in
+    /// payload bytes (libsrt's `MinimumMSS` only reserves the 4 bytes it
+    /// needs "for passing any data", which is not enough for the 8-byte NAK
+    /// loss record a connection must be able to emit), and the upper one is
+    /// [`MAX_PEER_MSS`], the largest value any reference implementation
+    /// accepts.
+    pub fn peer_mss_rejection_reason(&self, min_payload: u32) -> Option<String> {
+        let min_mss = self
+            .ip_udp_overhead()
+            .saturating_add(SRT_HEADER_SIZE as u32)
+            .saturating_add(min_payload);
+        if self.mtu < min_mss {
+            return Some(format!(
+                "peer MSS {} is below the minimum {min_mss} for its address family",
+                self.mtu
+            ));
+        }
+        if self.mtu > MAX_PEER_MSS {
+            return Some(format!(
+                "peer MSS {} exceeds the maximum {MAX_PEER_MSS}",
+                self.mtu
+            ));
+        }
+        None
     }
 
     /// Decode from a control packet.
@@ -1200,6 +1297,86 @@ pub fn peek_handshake(datagram: &[u8]) -> Option<HandshakePacket> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The MSS bounds are arithmetic on the wire layout, so they are pinned
+    /// independently of any connection: IPv4 costs 28 bytes of IP/UDP and
+    /// IPv6 48, on top of the 16-byte SRT header, and the minimum reserves
+    /// one 8-byte NAK record.
+    #[test]
+    fn peer_mss_derivation_is_the_wire_layout_arithmetic() {
+        let mut handshake = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
+
+        handshake.mtu = 1500;
+        handshake.peer_ip = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        assert_eq!(handshake.ip_udp_overhead(), 28);
+        assert_eq!(handshake.peer_max_datagram_size(), 1472);
+        assert_eq!(
+            handshake.peer_max_payload_size(),
+            1456,
+            "libsrt's own mss - (UDP_HDR_SIZE + HDR_SIZE)"
+        );
+
+        handshake.peer_ip = IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
+        assert_eq!(handshake.ip_udp_overhead(), 48);
+        assert_eq!(handshake.peer_max_datagram_size(), 1452);
+        assert_eq!(handshake.peer_max_payload_size(), 1436);
+
+        // Saturating, never panicking, for any wire value.
+        for mtu in [0u32, 1, 27, 43, 44] {
+            handshake.mtu = mtu;
+            handshake.peer_ip = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+            let payload = handshake.peer_max_payload_size();
+            assert_eq!(payload, mtu.saturating_sub(44));
+        }
+        handshake.mtu = u32::MAX;
+        assert_eq!(
+            handshake.peer_max_payload_size(),
+            u32::MAX - 44,
+            "no overflow at the top of the wire domain"
+        );
+    }
+
+    /// Rejection bounds: the derived minimum for the address family (and the
+    /// implementation's own structural payload floor), and the largest value
+    /// any reference implementation accepts.
+    #[test]
+    fn peer_mss_rejection_bounds_are_derived_and_inclusive() {
+        const MIN_PAYLOAD: u32 = 8;
+        let mut handshake = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
+
+        for (mtu, ip, accepted) in [
+            (52u32, IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), true),
+            (51, IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), false),
+            (48, IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), false),
+            (72, IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), true),
+            (71, IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), false),
+            (68, IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), false),
+            (1500, IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), true),
+            (1501, IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), false),
+            (u32::MAX, IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), false),
+        ] {
+            handshake.mtu = mtu;
+            handshake.peer_ip = ip;
+            let reason = handshake.peer_mss_rejection_reason(MIN_PAYLOAD);
+            assert_eq!(
+                reason.is_none(),
+                accepted,
+                "MSS {mtu} on {ip}: {reason:?}"
+            );
+            if let Some(reason) = reason {
+                assert!(reason.contains("MSS"), "{reason}");
+            }
+        }
+
+        // A larger structural floor moves the IPv4 minimum with it, so the
+        // bound is derived from the implementation's needs rather than from
+        // a copied constant: 60 = 28 + 16 + 16, so a 16-byte floor accepts
+        // exactly 60 and a 17-byte floor rejects it.
+        handshake.mtu = 60;
+        handshake.peer_ip = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        assert!(handshake.peer_mss_rejection_reason(16).is_none());
+        assert!(handshake.peer_mss_rejection_reason(17).is_some());
+    }
 
     #[test]
     fn test_handshake_encode_decode() {
