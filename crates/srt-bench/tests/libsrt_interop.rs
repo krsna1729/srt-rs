@@ -2422,9 +2422,19 @@ fn compio_owner_bond_to_independent_libsrt_receivers_reports_a_peer_group_collis
     let remote_a = SocketAddr::from(([127, 0, 0, 1], port_a));
     let remote_b = SocketAddr::from(([127, 0, 0, 1], port_b));
     let run = run_compio_bond(remote_a, remote_b);
+    // A libsrt built without bonding makes both listeners exit 77 before any
+    // leg can connect. That is the environment, not a conformance failure, and
+    // it is the same skip every other bonding test in this file takes (with
+    // `SRT_REQUIRE_BONDING` turning it back into a failure).
+    let unavailable = [&mut first, &mut second].into_iter().any(|child| {
+        matches!(child.try_wait(), Ok(Some(status)) if bonding_unavailable(status.code()))
+    });
     let _ = first.kill();
     let _ = second.kill();
     let _ = (first.wait(), second.wait());
+    if unavailable {
+        return;
+    }
 
     assert!(run.io_uring, "the production runtime is io_uring: {run:?}");
     assert_eq!(
