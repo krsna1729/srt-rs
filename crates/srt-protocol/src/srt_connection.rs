@@ -7337,6 +7337,31 @@ mod tests {
         );
     }
 
+    fn hostile_control_corpus() -> Vec<(&'static str, Vec<u8>)> {
+        include_str!("../tests/corpus/hostile-controls.hex")
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.is_empty())
+            .map(|line| {
+                let (label, hex) = line
+                    .split_once('|')
+                    .expect("hostile corpus entry has a label and hex datagram");
+                assert!(hex.len().is_multiple_of(2), "{label}: even hex length");
+                let bytes = hex
+                    .as_bytes()
+                    .chunks_exact(2)
+                    .map(|pair| {
+                        u8::from_str_radix(
+                            std::str::from_utf8(pair).expect("ASCII hex"),
+                            16,
+                        )
+                        .expect("valid hex byte")
+                    })
+                    .collect();
+                (label, bytes)
+            })
+            .collect()
+    }
+
     /// Malformed or hostile control input is rejected *before* it can refresh
     /// peer activity or touch connection state.
     ///
@@ -7351,12 +7376,14 @@ mod tests {
     #[test]
     #[cfg_attr(
         all(miri, not(feature = "miri-extended")),
-        ignore = "full caller/listener handshake plus sixteen malformed controls; correctness  \
-                  is proven outside Miri. Run in the miri-extended scheduled job."
+        ignore = "full caller/listener handshake plus hostile control corpus; correctness is \
+                  proven outside Miri. Run in the miri-extended scheduled job."
     )]
     fn malformed_controls_cannot_refresh_liveness_or_state() {
         let (mut caller, _listener) = connected_pair();
         let socket_id = caller.socket_id();
+        let _ = drain_outputs(&mut caller);
+        while caller.poll_event().is_some() {}
         let now = Timestamp::from_micros(5_000_000);
 
         // Positive control: a canonical KEEPALIVE (one zero word, exactly what
@@ -7370,66 +7397,8 @@ mod tests {
             .expect("a canonical KEEPALIVE is accepted");
         assert_eq!(caller.last_recv_time, Some(now));
 
-        let unaligned_ack = vec![0u8; 6];
-        let non_canonical_ack_length = {
-            let mut cif = Vec::new();
-            write_u32(&mut cif, 0);
-            write_u32(&mut cif, 0);
-            cif
-        };
-        let nak_range_without_end = vec![0x80, 0, 0, 0];
-        let drop_req_high_bit = {
-            let mut cif = Vec::new();
-            write_u32(&mut cif, 0x8000_0001);
-            write_u32(&mut cif, 1);
-            cif
-        };
-        // Beyond everything this sender has ever put on the wire: a position
-        // no peer could legitimately report, in either an ACK's cumulative
-        // position or a NAK's loss list.
-        let beyond_frontier = caller
-            .next_sequence_number()
-            .expect("connected sender")
-            .wrapping_add(1_000)
-            & 0x7FFF_FFFF;
-        let future_ack = {
-            let mut cif = Vec::new();
-            write_u32(&mut cif, beyond_frontier);
-            cif
-        };
+        let corpus = hostile_control_corpus();
         let malformed: Vec<(&str, Vec<u8>)> = vec![
-            (
-                "ACK without a cumulative position",
-                control_datagram(socket_id, ControlType::Ack, 0, 0, Vec::new()),
-            ),
-            (
-                "ACK with a non-canonical (not 4/16/24/28/32-byte) length",
-                control_datagram(socket_id, ControlType::Ack, 0, 0, non_canonical_ack_length),
-            ),
-            (
-                "ACK naming a sequence beyond the sender's transmitted frontier",
-                control_datagram(socket_id, ControlType::Ack, 0, 0, future_ack),
-            ),
-            (
-                "NAK naming a sequence this sender never sent",
-                nak_datagram(socket_id, &[beyond_frontier, beyond_frontier]),
-            ),
-            (
-                "ACK with an unaligned cumulative position",
-                control_datagram(socket_id, ControlType::Ack, 0, 0, unaligned_ack),
-            ),
-            (
-                "NAK without a loss range",
-                control_datagram(socket_id, ControlType::Nak, 0, 0, Vec::new()),
-            ),
-            (
-                "NAK with an unaligned loss range",
-                control_datagram(socket_id, ControlType::Nak, 0, 0, vec![0, 0, 0]),
-            ),
-            (
-                "NAK range missing its end",
-                control_datagram(socket_id, ControlType::Nak, 0, 0, nak_range_without_end),
-            ),
             (
                 "ACKACK naming an ACK that was never sent",
                 control_datagram(socket_id, ControlType::AckAck, 0, 99_999, vec![0; 4]),
@@ -7453,14 +7422,6 @@ mod tests {
             (
                 "SHUTDOWN with a surplus word",
                 control_datagram(socket_id, ControlType::Shutdown, 0, 0, vec![0; 8]),
-            ),
-            (
-                "DROPREQ without two sequence words",
-                control_datagram(socket_id, ControlType::DropReq, 0, 0, vec![0; 4]),
-            ),
-            (
-                "DROPREQ with a sequence high bit set",
-                control_datagram(socket_id, ControlType::DropReq, 0, 0, drop_req_high_bit),
             ),
             (
                 "key-management request with an unaligned body",
@@ -7496,7 +7457,7 @@ mod tests {
 
         let baseline = caller.stats();
         let later = now.add_micros(1_000);
-        for (label, datagram) in malformed {
+        for (label, datagram) in corpus.into_iter().chain(malformed) {
             let error = caller
                 .feed_recv_buf(&datagram, later)
                 .expect_err("malformed control input is rejected");
@@ -7512,7 +7473,16 @@ mod tests {
                 "{label}: rejected input changed state"
             );
             assert_eq!(caller.state(), ConnectionState::Connected, "{label}");
+            assert!(
+                drain_outputs(&mut caller).is_empty(),
+                "{label}: rejected input emitted output"
+            );
+            assert!(
+                caller.poll_event().is_none(),
+                "{label}: rejected input emitted an application event"
+            );
         }
+
 
         // A well-formed SHUTDOWN is still accepted afterwards, and it is the
         // one control whose acceptance changes state: the negative cases
