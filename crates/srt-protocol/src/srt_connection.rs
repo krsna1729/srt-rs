@@ -17,7 +17,7 @@ use crate::sender_rto::RtoArm;
 use crate::srt_handshake::{
     DEFAULT_FLOW_WINDOW, DEFAULT_MTU, GroupExtensionData, HS_VERSION_5, HandshakePacket,
     HandshakeState, HandshakeType, KmError, KmMessage, MAX_FLOW_WINDOW, SRT_MAGIC_CODE,
-    SRT_REJ_ROGUE, srt_flags,
+    SRT_REJ_FILTER, SRT_REJ_ROGUE, srt_flags,
 };
 use crate::srt_packet::{
     ControlPacket, ControlType, DataHeader, DataPacket, DatagramClass, PendingData,
@@ -3099,6 +3099,34 @@ impl SrtConnection {
             .max(MIN_NEGOTIATED_PAYLOAD_SIZE);
     }
 
+    /// Reject a handshake in which the peer negotiates packet-filter
+    /// behaviour this implementation does not provide.
+    ///
+    /// Silently skipping the FILTER extension would establish a session whose
+    /// two peers disagree about whether recovery filtering exists: the peer
+    /// would expect filtered recovery while this side neither filters nor
+    /// implements the filter's own protocol. The reference implementation
+    /// refuses an unhonourable filter negotiation with `SRT_REJ_FILTER`
+    /// rather than approximating it, so this does the same, in the same shape
+    /// as [`Self::reject_peer_mss`].
+    fn reject_unsupported_packet_filter(
+        &mut self,
+        hs: &HandshakePacket,
+        now: Timestamp,
+    ) -> Result<(), Error> {
+        if !hs.has_filter_extension() {
+            return Ok(());
+        }
+        let reason = "peer negotiated a packet filter this implementation does not support";
+        match self.role {
+            ConnectionRole::Caller => Err(self.fail_caller_handshake(reason)),
+            ConnectionRole::Listener => {
+                self.reject(SRT_REJ_FILTER, now)?;
+                Err(Error::handshake_rejected(reason))
+            }
+        }
+    }
+
     fn handle_caller_conclusion(
         &mut self,
         hs: HandshakePacket,
@@ -3114,6 +3142,7 @@ impl SrtConnection {
         }
 
         self.reject_peer_mss(&hs, now)?;
+        self.reject_unsupported_packet_filter(&hs, now)?;
         self.apply_peer_mss(&hs);
 
         self.peer_socket_id = hs.socket_id;
@@ -3249,6 +3278,7 @@ impl SrtConnection {
         }
 
         self.reject_peer_mss(&hs, now)?;
+        self.reject_unsupported_packet_filter(&hs, now)?;
         self.apply_peer_mss(&hs);
 
         self.initial_seq = hs.initial_packet_seq;
@@ -4562,7 +4592,9 @@ fn make_nak_packet(control_info: Vec<u8>, timestamp: u32, peer_socket_id: u32) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handshake::{GroupType, SRTGROUP_MASK};
+    use crate::handshake::{
+        ExtensionType, GroupType, HandshakeExtension, SRTGROUP_MASK, extension_flags,
+    };
     use std::net::IpAddr;
 
     /// Deterministic, non-secret KM salt for protocol test fixtures.
@@ -8070,16 +8102,61 @@ mod tests {
         caller_result: Result<(), Error>,
     }
 
-    /// Rewrite the advertised MSS (and peer address) of one handshake packet.
-    fn with_advertised_mss(datagram: &[u8], mss: u32, peer_ip: IpAddr) -> Vec<u8> {
+    /// How a test wants in-flight handshake packets rewritten.
+    #[derive(Clone, Copy)]
+    struct HandshakeRewrite {
+        /// Advertised MSS.
+        mss: u32,
+        /// Peer address the handshake names (decides the IP/UDP overhead).
+        peer_ip: IpAddr,
+        /// Add a FILTER extension: a packet-filter *negotiation*.
+        filter_extension: bool,
+        /// Set `PACKET_FILTER` in the HS extension's `srt_flags`: a
+        /// capability *advertisement*, which must stay acceptable on its own.
+        packet_filter_flag: bool,
+    }
+
+    impl HandshakeRewrite {
+        fn mss(mss: u32, peer_ip: IpAddr) -> Self {
+            Self {
+                mss,
+                peer_ip,
+                filter_extension: false,
+                packet_filter_flag: false,
+            }
+        }
+    }
+
+    /// Rewrite one handshake packet: its advertised MSS, its peer address,
+    /// and optionally its packet-filter advertisement or negotiation.
+    fn rewrite_handshake(datagram: &[u8], rewrite: &HandshakeRewrite) -> Vec<u8> {
         let SrtPacket::Control(control) =
             SrtPacket::decode(datagram).expect("handshake datagram decodes")
         else {
             panic!("handshake must be a control packet");
         };
         let mut handshake = HandshakePacket::decode(&control).expect("handshake decodes");
-        handshake.mtu = mss;
-        handshake.peer_ip = peer_ip;
+        handshake.mtu = rewrite.mss;
+        handshake.peer_ip = rewrite.peer_ip;
+        if rewrite.packet_filter_flag
+            && let Some(extension) = handshake.get_hs_extension()
+        {
+            handshake
+                .extensions
+                .retain(|ext| !matches!(ext.ext_type, ExtensionType::HsReq | ExtensionType::HsRsp));
+            handshake.add_hs_extension(
+                extension.srt_version,
+                extension.srt_flags | srt_flags::PACKET_FILTER,
+                extension.recv_tsbpd_delay,
+            );
+        }
+        if rewrite.filter_extension {
+            handshake.extensions.push(HandshakeExtension {
+                ext_type: ExtensionType::Filter,
+                data: b"fec\0".to_vec(),
+            });
+            handshake.extension_field |= extension_flags::CONFIG;
+        }
         let rewritten = handshake.encode(control.timestamp, control.dest_socket_id);
         let mut bytes = Vec::new();
         rewritten.encode(&mut bytes).expect("re-encodes");
@@ -8089,8 +8166,7 @@ mod tests {
     /// Every handshake packet in the connection's output queue, rewritten.
     fn drain_rewritten_handshakes(
         conn: &mut SrtConnection,
-        mss: u32,
-        peer_ip: IpAddr,
+        rewrite: &HandshakeRewrite,
     ) -> Vec<Vec<u8>> {
         let mut rewritten = Vec::new();
         for output in drain_outputs(conn) {
@@ -8105,7 +8181,7 @@ mod tests {
                 }))
             );
             if is_handshake {
-                rewritten.push(with_advertised_mss(&bytes, mss, peer_ip));
+                rewritten.push(rewrite_handshake(&bytes, rewrite));
             }
         }
         rewritten
@@ -8117,6 +8193,20 @@ mod tests {
         peer_ip: IpAddr,
         listener_options: ConnectionOptions,
     ) -> MssHandshake {
+        handshake_with_rewrites(
+            &HandshakeRewrite::mss(caller_mss, peer_ip),
+            &HandshakeRewrite::mss(listener_mss, peer_ip),
+            listener_options,
+        )
+    }
+
+    /// Drive one handshake in which each direction's packets are rewritten
+    /// independently, so a test can vary what each side advertises.
+    fn handshake_with_rewrites(
+        caller_rewrite: &HandshakeRewrite,
+        listener_rewrite: &HandshakeRewrite,
+        listener_options: ConnectionOptions,
+    ) -> MssHandshake {
         let mut caller = SrtConnection::new_caller(ConnectionOptions {
             socket_id: 1,
             ..ConnectionOptions::default()
@@ -8125,23 +8215,23 @@ mod tests {
         caller
             .connect(Timestamp::from_micros(0))
             .expect("caller starts");
-        let requests = drain_rewritten_handshakes(&mut caller, caller_mss, peer_ip);
+        let requests = drain_rewritten_handshakes(&mut caller, caller_rewrite);
         assert_eq!(requests.len(), 1, "one INDUCTION request");
         listener
             .feed_recv_buf(&requests[0], Timestamp::from_micros(1_000))
             .expect("listener accepts INDUCTION");
-        let responses = drain_rewritten_handshakes(&mut listener, listener_mss, peer_ip);
+        let responses = drain_rewritten_handshakes(&mut listener, listener_rewrite);
         assert_eq!(responses.len(), 1, "one INDUCTION response");
         caller
             .feed_recv_buf(&responses[0], Timestamp::from_micros(2_000))
             .expect("caller accepts INDUCTION response");
 
-        let conclusions = drain_rewritten_handshakes(&mut caller, caller_mss, peer_ip);
+        let conclusions = drain_rewritten_handshakes(&mut caller, caller_rewrite);
         assert_eq!(conclusions.len(), 1, "one CONCLUSION request");
         let listener_result = listener.feed_recv_buf(&conclusions[0], Timestamp::from_micros(3_000));
 
         let caller_result = if listener_result.is_ok() {
-            let answers = drain_rewritten_handshakes(&mut listener, listener_mss, peer_ip);
+            let answers = drain_rewritten_handshakes(&mut listener, listener_rewrite);
             assert_eq!(answers.len(), 1, "one CONCLUSION response");
             caller.feed_recv_buf(&answers[0], Timestamp::from_micros(4_000))
         } else {
@@ -8352,6 +8442,74 @@ mod tests {
             syn_cookie: Some(7),
             ..ConnectionOptions::default()
         }
+    }
+
+    /// A peer that negotiates packet-filter behaviour gets a refusal, not a
+    /// session whose two peers disagree about whether recovery filtering
+    /// exists -- while a peer that merely *advertises* the capability flag is
+    /// still accepted, and an unknown optional extension stays ignorable
+    /// (`test_extension_parsing_unknown_type` pins that decode side).
+    #[test]
+    fn packet_filter_negotiation_is_refused_but_the_capability_flag_is_not() {
+        let v4 = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let plain = HandshakeRewrite::mss(1500, v4);
+
+        // The FILTER extension is a negotiation: the caller asking for it is
+        // refused by the listener with the reference's own reason code.
+        let mut asking = plain;
+        asking.filter_extension = true;
+        let mut attempt = handshake_with_rewrites(&asking, &plain, listener_options());
+        let error = attempt
+            .listener_result
+            .expect_err("a filter negotiation must be refused");
+        assert_eq!(error.kind, crate::ErrorKind::HandshakeRejected);
+        assert!(
+            error.reason.contains("packet filter"),
+            "the rejection names the capability: {}",
+            error.reason
+        );
+        assert_eq!(attempt.listener.state(), ConnectionState::Disconnected);
+        assert!(attempt.listener.crypto.is_none());
+        assert_eq!(
+            attempt.listener.max_payload_size,
+            DEFAULT_MTU as usize - SRT_HEADER_SIZE,
+            "nothing about the attempt was committed"
+        );
+        let rejections: Vec<_> = drain_outputs(&mut attempt.listener)
+            .into_iter()
+            .filter_map(|output| match output {
+                ConnectionOutput::SendPacket(bytes) => Some(bytes),
+                _ => None,
+            })
+            .filter_map(|bytes| match SrtPacket::decode(&bytes) {
+                Ok(SrtPacket::Control(control)) => Some(control),
+                _ => None,
+            })
+            .filter(|control| control.control_type == ControlType::Handshake)
+            .collect();
+        assert_eq!(rejections.len(), 1, "one rejection response");
+        let rejection = HandshakePacket::decode(&rejections[0]).expect("rejection decodes");
+        assert_eq!(rejection.handshake_type, HandshakeType::Rejected);
+        assert_eq!(rejection.reject_reason, Some(SRT_REJ_FILTER));
+
+        // The listener answering with one is refused by the caller.
+        let attempt = handshake_with_rewrites(&plain, &asking, listener_options());
+        attempt.listener_result.expect("the listener accepts the caller");
+        let error = attempt
+            .caller_result
+            .expect_err("the caller refuses a filter negotiation");
+        assert_eq!(error.kind, crate::ErrorKind::HandshakeRejected);
+        assert_eq!(attempt.caller.state(), ConnectionState::Disconnected);
+
+        // The capability flag alone is an advertisement, not a negotiation:
+        // rejecting it would refuse peers that never asked for filtering.
+        let mut advertising = plain;
+        advertising.packet_filter_flag = true;
+        let attempt = handshake_with_rewrites(&advertising, &advertising, listener_options());
+        attempt.listener_result.expect("listener accepts the advertisement");
+        attempt.caller_result.expect("caller accepts the advertisement");
+        assert_eq!(attempt.listener.state(), ConnectionState::Connected);
+        assert_eq!(attempt.caller.state(), ConnectionState::Connected);
     }
 
     /// A connected encrypted pair sharing one passphrase.

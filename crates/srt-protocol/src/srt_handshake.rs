@@ -76,6 +76,17 @@ pub const MAX_PEER_MSS: u32 = 1500;
 /// minimum and one above [`MAX_PEER_MSS`].
 pub const SRT_REJ_ROGUE: i32 = 4;
 
+/// `SRT_REJ_FILTER`: incompatible packet filter.
+///
+/// The reason the reference implementation refuses a filter negotiation it
+/// cannot honour (`CUDT::interpretSrtHandshake` rejects an unparseable or
+/// conflicting filter configuration with this code). A peer that sends a
+/// FILTER extension is negotiating packet-filter behaviour, not merely
+/// advertising that it could support one, so a stack without a filter
+/// implementation must refuse the session rather than run one whose two
+/// peers disagree about whether recovery filtering exists.
+pub const SRT_REJ_FILTER: i32 = 14;
+
 /// Default flow window size.
 pub const DEFAULT_FLOW_WINDOW: u32 = 8192;
 
@@ -829,6 +840,22 @@ impl HandshakePacket {
             }
         }
         None
+    }
+
+    /// Whether the peer is negotiating packet-filter behaviour.
+    ///
+    /// The FILTER extension is a *negotiation*, not a capability
+    /// advertisement: a peer that sends it expects the recovery filter it
+    /// names to be applied. This implementation has no filter, so a caller
+    /// refuses the session ([`SRT_REJ_FILTER`]). The `PACKET_FILTER` flag in
+    /// the HS extension's `srt_flags` is the capability advertisement and is
+    /// deliberately *not* treated as a negotiation -- the reference
+    /// implementation does not reject on the flag alone, and doing so would
+    /// over-reject a peer that never asked for filtering.
+    pub fn has_filter_extension(&self) -> bool {
+        self.extensions
+            .iter()
+            .any(|ext| ext.ext_type == ExtensionType::Filter)
     }
 }
 
