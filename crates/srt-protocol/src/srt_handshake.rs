@@ -61,6 +61,43 @@ pub const IP_UDP_HEADER_SIZE_IPV4: u32 = 28;
 /// (libsrt's `CPacket::UDP_HDR_SIZE_IPv6`: 40 + 8).
 pub const IP_UDP_HEADER_SIZE_IPV6: u32 = 48;
 
+/// Address family of the UDP path a connection runs on.
+///
+/// The handshake MSS field is an IP-layer MTU, so turning it into an SRT
+/// datagram budget needs the path's IP + UDP header size. The handshake
+/// itself does not say which family the path uses (its peer-address field is
+/// advisory: this implementation writes the unspecified IPv4 address there,
+/// and libsrt's own `MinimumMSS` keys off the socket's `peer.family()`, not
+/// that field), so the transport, which knows the socket address, sets it
+/// with `SrtConnection::set_ip_family`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum IpFamily {
+    /// IPv4 path (28 bytes of IP + UDP). The default when unset.
+    #[default]
+    V4,
+    /// IPv6 path (48 bytes of IP + UDP).
+    V6,
+}
+
+impl IpFamily {
+    /// Family of a socket address. An IPv4-mapped IPv6 address counts as
+    /// IPv6: the datagrams really carry an IPv6 header on that socket.
+    pub fn of(address: &std::net::SocketAddr) -> Self {
+        match address {
+            std::net::SocketAddr::V4(_) => Self::V4,
+            std::net::SocketAddr::V6(_) => Self::V6,
+        }
+    }
+
+    /// IP + UDP header bytes ahead of an SRT datagram on this family.
+    pub const fn ip_udp_overhead(self) -> u32 {
+        match self {
+            Self::V4 => IP_UDP_HEADER_SIZE_IPV4,
+            Self::V6 => IP_UDP_HEADER_SIZE_IPV6,
+        }
+    }
+}
+
 /// Largest peer MSS this implementation negotiates.
 ///
 /// The number is libsrt's `CPacket::ETH_MAX_MTU_SIZE` (1500, "Ethernet II,
@@ -197,6 +234,30 @@ impl ExtensionType {
             7 => Some(Self::Filter),
             8 => Some(Self::Group),
             _ => None,
+        }
+    }
+
+    /// The `extension_field` bit a handshake must set to carry this
+    /// extension: HSREQ/HSRSP under HSREQ, KMREQ/KMRSP under KMREQ, and
+    /// every configuration extension under CONFIG.
+    fn category_flag(self) -> u16 {
+        match self {
+            Self::HsReq | Self::HsRsp => extension_flags::HSREQ,
+            Self::KmReq | Self::KmRsp => extension_flags::KMREQ,
+            Self::Sid | Self::Congestion | Self::Filter | Self::Group => extension_flags::CONFIG,
+        }
+    }
+
+    /// One bit per negotiated quantity (a request and its response share
+    /// one): a handshake may carry each quantity at most once.
+    fn uniqueness_bit(self) -> u8 {
+        match self {
+            Self::HsReq | Self::HsRsp => 1 << 0,
+            Self::KmReq | Self::KmRsp => 1 << 1,
+            Self::Sid => 1 << 2,
+            Self::Congestion => 1 << 3,
+            Self::Filter => 1 << 4,
+            Self::Group => 1 << 5,
         }
     }
 }
@@ -430,54 +491,36 @@ impl HandshakePacket {
         }
     }
 
-    /// IP + UDP header bytes for the address family this handshake names.
-    ///
-    /// libsrt keys this off the peer's socket family
-    /// (`MinimumMSS(peer.family())`); this core keys it off the peer address
-    /// the handshake itself carries, defaulting to IPv4 for an unspecified
-    /// or IPv4 address. An IPv6 peer therefore gets the larger, conservative
-    /// overhead even though libsrt's caller path uses the IPv4 constant
-    /// unconditionally.
-    pub fn ip_udp_overhead(&self) -> u32 {
-        match self.peer_ip {
-            IpAddr::V6(_) => IP_UDP_HEADER_SIZE_IPV6,
-            IpAddr::V4(_) => IP_UDP_HEADER_SIZE_IPV4,
-        }
-    }
-
     /// Largest SRT datagram (header included) this handshake's advertised
-    /// MSS can carry on the wire.
-    pub fn peer_max_datagram_size(&self) -> u32 {
-        self.mtu.saturating_sub(self.ip_udp_overhead())
+    /// MSS can carry on a `family` path.
+    pub fn peer_max_datagram_size(&self, family: IpFamily) -> u32 {
+        self.mtu.saturating_sub(family.ip_udp_overhead())
     }
 
-    /// Largest DATA payload this handshake's advertised MSS can carry:
-    /// libsrt's own derivation, `m_iMaxDataPayloadSize = mss -
+    /// Largest DATA payload this handshake's advertised MSS can carry on a
+    /// `family` path: libsrt's own derivation, `m_iMaxDataPayloadSize = mss -
     /// (UDP_HDR_SIZE + HDR_SIZE)`.
-    pub fn peer_max_payload_size(&self) -> u32 {
-        self.peer_max_datagram_size()
+    pub fn peer_max_payload_size(&self, family: IpFamily) -> u32 {
+        self.peer_max_datagram_size(family)
             .saturating_sub(SRT_HEADER_SIZE as u32)
     }
 
-    /// Why this handshake's advertised MSS is unusable for a connection
-    /// that needs at least `min_payload` bytes of DATA payload, or `None`
-    /// when it is usable.
+    /// Why this handshake's advertised MSS is unusable on a `family` path
+    /// for a connection that needs at least `min_payload` bytes of DATA
+    /// payload, or `None` when it is usable.
     ///
-    /// Both bounds are derived, not copied: the lower one is this
-    /// implementation's own smallest mandatory control packet expressed in
-    /// payload bytes (libsrt's `MinimumMSS` only reserves the 4 bytes it
-    /// needs "for passing any data", which is not enough for the 8-byte NAK
-    /// loss record a connection must be able to emit), and the upper one is
-    /// [`MAX_PEER_MSS`], the largest value any reference implementation
-    /// accepts.
-    pub fn peer_mss_rejection_reason(&self, min_payload: u32) -> Option<String> {
-        let min_mss = self
+    /// The lower bound is derived from the implementation's own needs
+    /// (`min_payload`, which the connection computes from its smallest
+    /// mandatory control record and, under GCM, the authentication tag); the
+    /// upper one is [`MAX_PEER_MSS`], this implementation's local maximum.
+    pub fn peer_mss_rejection_reason(&self, family: IpFamily, min_payload: u32) -> Option<String> {
+        let min_mss = family
             .ip_udp_overhead()
             .saturating_add(SRT_HEADER_SIZE as u32)
             .saturating_add(min_payload);
         if self.mtu < min_mss {
             return Some(format!(
-                "peer MSS {} is below the minimum {min_mss} for its address family",
+                "peer MSS {} is below the minimum {min_mss} for a {family:?} path",
                 self.mtu
             ));
         }
@@ -550,7 +593,8 @@ impl HandshakePacket {
         let ip_bytes = read_bytes(&mut buf, 16)?;
         let peer_ip = parse_peer_ip(&ip_bytes);
 
-        let extensions = decode_extensions(&mut buf, extension_field)?;
+        let conclusion_v5 = version == HS_VERSION_5 && handshake_type == HandshakeType::Conclusion;
+        let extensions = decode_extensions(&mut buf, extension_field, conclusion_v5)?;
 
         Ok(Self {
             version,
@@ -869,12 +913,24 @@ impl HandshakePacket {
     }
 }
 
+/// Parse the extension block transactionally: every record is framed and
+/// validated before any is returned, and the categories declared in
+/// `extension_field` must agree with the records in both directions.
+///
+/// For an HSv5 CONCLUSION (the only handshake that negotiates through
+/// extensions; an INDUCTION reuses `extension_field` for the SRT magic),
+/// the HS category is mandatory, and a set HSREQ or KMREQ flag must be
+/// backed by its record -- the pinned reference rejects both
+/// (`CUDT::interpretSrtHandshake`, `SRT_REJ_ROGUE`). A set CONFIG flag is
+/// not required to name a *known* record, so a well-framed future CONFIG
+/// extension stays forward compatible.
 fn decode_extensions(
     buf: &mut &[u8],
     extension_field: u16,
+    conclusion_v5: bool,
 ) -> Result<Vec<HandshakeExtension>, Error> {
     let mut extensions = Vec::new();
-    let mut seen = [false; 6];
+    let mut seen = 0u8;
     while !buf.is_empty() {
         if buf.len() < 4 {
             return Err(Error::invalid_data("truncated handshake extension header"));
@@ -890,32 +946,49 @@ fn decode_extensions(
         let Some(ext_type) = ExtensionType::from_u16(ext_type_raw) else {
             continue;
         };
-        let (category, duplicate_slot) = match ext_type {
-            ExtensionType::HsReq | ExtensionType::HsRsp => (extension_flags::HSREQ, 0),
-            ExtensionType::KmReq | ExtensionType::KmRsp => (extension_flags::KMREQ, 1),
-            ExtensionType::Sid => (extension_flags::CONFIG, 2),
-            ExtensionType::Congestion => (extension_flags::CONFIG, 3),
-            ExtensionType::Filter => (extension_flags::CONFIG, 4),
-            ExtensionType::Group => (extension_flags::CONFIG, 5),
-        };
-        if extension_field & category == 0 {
+        if extension_field & ext_type.category_flag() == 0 {
             return Err(Error::invalid_data(format!(
                 "{ext_type:?} extension is missing its category flag"
             )));
         }
-        if seen[duplicate_slot] {
+        if seen & ext_type.uniqueness_bit() != 0 {
             return Err(Error::invalid_data(format!(
                 "duplicate {ext_type:?} extension category"
             )));
         }
         validate_extension_data(ext_type, ext_data)?;
-        seen[duplicate_slot] = true;
+        seen |= ext_type.uniqueness_bit();
         extensions.push(HandshakeExtension {
             ext_type,
             data: ext_data.to_vec(),
         });
     }
+    if conclusion_v5 {
+        require_conclusion_records(extension_field, seen)?;
+    }
     Ok(extensions)
+}
+
+/// The reverse direction of the category rule for an HSv5 CONCLUSION: the
+/// HS category is mandatory, and a set HSREQ or KMREQ flag must be backed
+/// by its record (`seen` holds the records' uniqueness bits).
+fn require_conclusion_records(extension_field: u16, seen: u8) -> Result<(), Error> {
+    if extension_field & extension_flags::HSREQ == 0 {
+        return Err(Error::invalid_data(
+            "HSv5 CONCLUSION must negotiate the HS extension",
+        ));
+    }
+    for (flag, record) in [
+        (extension_flags::HSREQ, ExtensionType::HsReq),
+        (extension_flags::KMREQ, ExtensionType::KmReq),
+    ] {
+        if extension_field & flag != 0 && seen & record.uniqueness_bit() == 0 {
+            return Err(Error::invalid_data(format!(
+                "{record:?} category flag set without its extension"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_extension_data(ext_type: ExtensionType, data: &[u8]) -> Result<(), Error> {
@@ -1394,74 +1467,84 @@ mod tests {
     /// one 8-byte NAK record.
     #[test]
     fn peer_mss_derivation_is_the_wire_layout_arithmetic() {
-        let mut handshake = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
+        let mut handshake = conclusion_with_hs();
 
         handshake.mtu = 1500;
-        handshake.peer_ip = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
-        assert_eq!(handshake.ip_udp_overhead(), 28);
-        assert_eq!(handshake.peer_max_datagram_size(), 1472);
+        assert_eq!(IpFamily::V4.ip_udp_overhead(), 28);
+        assert_eq!(handshake.peer_max_datagram_size(IpFamily::V4), 1472);
         assert_eq!(
-            handshake.peer_max_payload_size(),
+            handshake.peer_max_payload_size(IpFamily::V4),
             1456,
             "libsrt's own mss - (UDP_HDR_SIZE + HDR_SIZE)"
         );
 
+        assert_eq!(IpFamily::V6.ip_udp_overhead(), 48);
+        assert_eq!(handshake.peer_max_datagram_size(IpFamily::V6), 1452);
+        assert_eq!(handshake.peer_max_payload_size(IpFamily::V6), 1436);
+
+        // The advisory peer-address field never decides the family.
         handshake.peer_ip = IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
-        assert_eq!(handshake.ip_udp_overhead(), 48);
-        assert_eq!(handshake.peer_max_datagram_size(), 1452);
-        assert_eq!(handshake.peer_max_payload_size(), 1436);
+        assert_eq!(handshake.peer_max_payload_size(IpFamily::V4), 1456);
 
         // Saturating, never panicking, for any wire value.
         for mtu in [0u32, 1, 27, 43, 44] {
             handshake.mtu = mtu;
-            handshake.peer_ip = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
-            let payload = handshake.peer_max_payload_size();
-            assert_eq!(payload, mtu.saturating_sub(44));
+            assert_eq!(
+                handshake.peer_max_payload_size(IpFamily::V4),
+                mtu.saturating_sub(44)
+            );
         }
         handshake.mtu = u32::MAX;
         assert_eq!(
-            handshake.peer_max_payload_size(),
+            handshake.peer_max_payload_size(IpFamily::V4),
             u32::MAX - 44,
             "no overflow at the top of the wire domain"
         );
     }
 
-    /// Rejection bounds: the derived minimum for the address family (and the
-    /// implementation's own structural payload floor), and the largest value
-    /// any reference implementation accepts.
+    /// Rejection bounds: the derived minimum for the path family (and the
+    /// implementation's own payload floor), and the local maximum.
     #[test]
     fn peer_mss_rejection_bounds_are_derived_and_inclusive() {
         const MIN_PAYLOAD: u32 = 8;
-        let mut handshake = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
+        let mut handshake = conclusion_with_hs();
 
-        for (mtu, ip, accepted) in [
-            (52u32, IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), true),
-            (51, IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), false),
-            (48, IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), false),
-            (72, IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), true),
-            (71, IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), false),
-            (68, IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), false),
-            (1500, IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), true),
-            (1501, IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), false),
-            (u32::MAX, IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), false),
+        for (mtu, family, accepted) in [
+            (52u32, IpFamily::V4, true),
+            (51, IpFamily::V4, false),
+            (48, IpFamily::V4, false),
+            (72, IpFamily::V6, true),
+            (71, IpFamily::V6, false),
+            (68, IpFamily::V6, false),
+            (1500, IpFamily::V4, true),
+            (1501, IpFamily::V4, false),
+            (u32::MAX, IpFamily::V6, false),
         ] {
             handshake.mtu = mtu;
-            handshake.peer_ip = ip;
-            let reason = handshake.peer_mss_rejection_reason(MIN_PAYLOAD);
-            assert_eq!(reason.is_none(), accepted, "MSS {mtu} on {ip}: {reason:?}");
+            let reason = handshake.peer_mss_rejection_reason(family, MIN_PAYLOAD);
+            assert_eq!(
+                reason.is_none(),
+                accepted,
+                "MSS {mtu} on {family:?}: {reason:?}"
+            );
             if let Some(reason) = reason {
                 assert!(reason.contains("MSS"), "{reason}");
             }
         }
 
-        // A larger structural floor moves the IPv4 minimum with it, so the
-        // bound is derived from the implementation's needs rather than from
-        // a copied constant: 60 = 28 + 16 + 16, so a 16-byte floor accepts
-        // exactly 60 and a 17-byte floor rejects it.
+        // A larger payload floor moves the minimum with it: 60 = 28 + 16 +
+        // 16, so a 16-byte floor accepts exactly 60 and a 17-byte one rejects.
         handshake.mtu = 60;
-        handshake.peer_ip = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
-        assert!(handshake.peer_mss_rejection_reason(16).is_none());
-        assert!(handshake.peer_mss_rejection_reason(17).is_some());
+        assert!(
+            handshake
+                .peer_mss_rejection_reason(IpFamily::V4, 16)
+                .is_none()
+        );
+        assert!(
+            handshake
+                .peer_mss_rejection_reason(IpFamily::V4, 17)
+                .is_some()
+        );
     }
 
     #[test]
@@ -1477,7 +1560,7 @@ mod tests {
             socket_id: 0x12345678,
             syn_cookie: 0xABCDEF01,
             peer_ip: IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 1)),
-            extensions: Vec::new(),
+            extensions: vec![hs_record()],
             reject_reason: None,
         };
 
@@ -1593,6 +1676,7 @@ mod tests {
     #[test]
     fn test_km_error_response() {
         let mut hs = HandshakePacket::new_conclusion_response(1, 2, 3, 0, true);
+        hs.add_hs_response(0x010500, 0, 120);
         hs.add_km_error(KmError::BadSecret);
         assert_eq!(
             hs.extensions
@@ -1639,7 +1723,7 @@ mod tests {
 
     #[test]
     fn test_non_rejection_handshake_has_no_reject_reason() {
-        let hs = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
+        let hs = conclusion_with_hs();
         let packet = hs.encode(1000, 0);
         let decoded = HandshakePacket::decode(&packet).expect("decode should succeed");
         assert_eq!(decoded.reject_reason, None);
@@ -1731,7 +1815,7 @@ mod tests {
 
     #[test]
     fn test_sid_extension_basic() {
-        let mut hs = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
+        let mut hs = conclusion_with_hs();
         hs.add_sid_extension("test_stream");
 
         let packet = hs.encode(1000, 0);
@@ -1753,7 +1837,7 @@ mod tests {
     // that a real libsrt-compatible peer would also find the extension.
     #[test]
     fn test_sid_extension_sets_config_flag() {
-        let mut hs = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
+        let mut hs = conclusion_with_hs();
         assert_eq!(
             hs.extension_field & extension_flags::CONFIG,
             0,
@@ -1771,7 +1855,7 @@ mod tests {
 
     #[test]
     fn test_congestion_extension_sets_config_flag() {
-        let mut hs = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
+        let mut hs = conclusion_with_hs();
         hs.add_congestion_extension("live");
         assert_eq!(
             hs.extension_field & extension_flags::CONFIG,
@@ -1781,7 +1865,7 @@ mod tests {
 
     #[test]
     fn test_sid_extension_access_control() {
-        let mut hs = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
+        let mut hs = conclusion_with_hs();
         hs.add_sid_extension("#!::u=admin,r=live/stream1");
 
         let packet = hs.encode(1000, 0);
@@ -1795,7 +1879,7 @@ mod tests {
     #[test]
     fn test_sid_extension_with_padding() {
         // 5 characters -> padded to 8 bytes.
-        let mut hs = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
+        let mut hs = conclusion_with_hs();
         hs.add_sid_extension("hello");
 
         let packet = hs.encode(1000, 0);
@@ -1809,7 +1893,7 @@ mod tests {
     #[test]
     fn test_sid_extension_exact_4_bytes() {
         // 4 characters -> no padding needed.
-        let mut hs = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
+        let mut hs = conclusion_with_hs();
         hs.add_sid_extension("test");
 
         let packet = hs.encode(1000, 0);
@@ -1824,7 +1908,7 @@ mod tests {
     fn test_sid_extension_long_string() {
         // A long string.
         let long_sid = "a".repeat(100);
-        let mut hs = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
+        let mut hs = conclusion_with_hs();
         hs.add_sid_extension(&long_sid);
 
         let packet = hs.encode(1000, 0);
@@ -1846,7 +1930,7 @@ mod tests {
     fn test_sid_extension_truncates_on_a_utf8_char_boundary() {
         let long_sid = "あ".repeat(171);
         assert_eq!(long_sid.len(), 513);
-        let mut hs = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
+        let mut hs = conclusion_with_hs();
         hs.add_sid_extension(&long_sid);
 
         let packet = hs.encode(1000, 0);
@@ -1862,7 +1946,7 @@ mod tests {
 
     #[test]
     fn test_sid_extension_empty() {
-        let mut hs = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
+        let mut hs = conclusion_with_hs();
         hs.add_sid_extension("");
 
         let packet = hs.encode(1000, 0);
@@ -1876,7 +1960,7 @@ mod tests {
 
     #[test]
     fn test_no_sid_extension() {
-        let hs = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
+        let hs = conclusion_with_hs();
 
         let packet = hs.encode(1000, 0);
         let decoded = HandshakePacket::decode(&packet)
@@ -1888,7 +1972,7 @@ mod tests {
 
     #[test]
     fn test_congestion_extension_live() {
-        let mut hs = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
+        let mut hs = conclusion_with_hs();
         hs.add_congestion_extension("live");
 
         let packet = hs.encode(1000, 0);
@@ -1902,7 +1986,7 @@ mod tests {
     #[test]
     fn test_congestion_extension_file() {
         // FileCC isn't supported, but it still decodes.
-        let mut hs = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
+        let mut hs = conclusion_with_hs();
         hs.add_congestion_extension("file");
 
         let packet = hs.encode(1000, 0);
@@ -1915,7 +1999,7 @@ mod tests {
 
     #[test]
     fn test_no_congestion_extension() {
-        let hs = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
+        let hs = conclusion_with_hs();
 
         let packet = hs.encode(1000, 0);
         let decoded = HandshakePacket::decode(&packet)
@@ -1928,7 +2012,7 @@ mod tests {
     #[test]
     fn test_congestion_extension_with_sid() {
         // Use the Congestion extension and the SID extension together.
-        let mut hs = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
+        let mut hs = conclusion_with_hs();
         hs.add_congestion_extension("live");
         hs.add_sid_extension("test_stream");
 
@@ -1945,7 +2029,7 @@ mod tests {
 
     #[test]
     fn test_group_extension_matches_libsrt_layout() {
-        let mut hs = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
+        let mut hs = conclusion_with_hs();
         let group = GroupExtensionData {
             group_id: 0x4000_1234,
             group_type: GroupType::Broadcast,
@@ -1975,7 +2059,7 @@ mod tests {
 
     #[test]
     fn unknown_group_type_round_trips_without_becoming_absent() {
-        let mut hs = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
+        let mut hs = conclusion_with_hs();
         let group = GroupExtensionData {
             group_id: SRTGROUP_MASK | 9,
             group_type: GroupType::Unknown(3),
@@ -2004,9 +2088,24 @@ mod tests {
         }
     }
 
+    /// A well-formed HSv5 CONCLUSION request: the HSREQ flag with its record.
+    fn conclusion_with_hs() -> HandshakePacket {
+        let mut hs = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
+        hs.add_hs_extension(0x0001_0500, 0, 120);
+        hs
+    }
+
+    fn hs_record() -> HandshakeExtension {
+        HandshakeExtension {
+            ext_type: ExtensionType::HsReq,
+            data: valid_extension_data(ExtensionType::HsReq),
+        }
+    }
+
     #[test]
     fn extension_decode_rejects_truncated_headers_and_bodies() {
-        let hs = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
+        let hs = conclusion_with_hs();
+        assert!(HandshakePacket::decode(&hs.encode(0, 0)).is_ok());
 
         let mut partial_header = hs.encode(0, 0);
         partial_header.control_info.extend_from_slice(&[0, 1]);
@@ -2035,8 +2134,12 @@ mod tests {
                 data: valid_extension_data(ext_type),
             };
             let mut hs = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
-            hs.extension_field = category;
-            hs.extensions = vec![extension.clone(), extension];
+            hs.extension_field = extension_flags::HSREQ | category;
+            hs.extensions = if ext_type == ExtensionType::HsReq {
+                vec![extension.clone(), extension]
+            } else {
+                vec![hs_record(), extension.clone(), extension]
+            };
             assert!(
                 HandshakePacket::decode(&hs.encode(0, 0)).is_err(),
                 "{ext_type:?} duplicate must be rejected"
@@ -2070,7 +2173,7 @@ mod tests {
             ExtensionType::Filter,
             ExtensionType::Group,
         ] {
-            let mut hs = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
+            let mut hs = conclusion_with_hs();
             hs.extension_field = 0;
             hs.extensions.push(HandshakeExtension {
                 ext_type,
@@ -2085,19 +2188,58 @@ mod tests {
 
     #[test]
     fn unknown_well_framed_extension_remains_ignorable() {
-        let hs = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
+        let hs = conclusion_with_hs();
         let mut packet = hs.encode(0, 0);
         write_u16(&mut packet.control_info, 0x7fff);
         write_u16(&mut packet.control_info, 1);
         packet.control_info.extend_from_slice(&[1, 2, 3, 4]);
 
         let decoded = HandshakePacket::decode(&packet).expect("unknown framed extension");
-        assert!(decoded.extensions.is_empty());
+        assert_eq!(decoded.extensions.len(), 1, "only the HS record survives");
+    }
+
+    /// The category rule holds in both directions for an HSv5 CONCLUSION:
+    /// a set HSREQ or KMREQ flag must be backed by its record, and the HS
+    /// category itself is mandatory. An INDUCTION (whose `extension_field`
+    /// carries the SRT magic) and an unknown CONFIG record are unaffected.
+    #[test]
+    fn category_flags_require_their_records_in_an_hsv5_conclusion() {
+        let unknown_record = |packet: &mut ControlPacket| {
+            write_u16(&mut packet.control_info, 0x7fff);
+            write_u16(&mut packet.control_info, 1);
+            packet.control_info.extend_from_slice(&[1, 2, 3, 4]);
+        };
+
+        let hs_flag_no_record = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
+        assert!(HandshakePacket::decode(&hs_flag_no_record.encode(0, 0)).is_err());
+
+        let mut hs_flag_unknown_only = hs_flag_no_record.encode(0, 0);
+        unknown_record(&mut hs_flag_unknown_only);
+        assert!(HandshakePacket::decode(&hs_flag_unknown_only).is_err());
+
+        let mut km_flag_no_record = conclusion_with_hs();
+        km_flag_no_record.extension_field |= extension_flags::KMREQ;
+        assert!(HandshakePacket::decode(&km_flag_no_record.encode(0, 0)).is_err());
+
+        let mut zero_flags = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
+        zero_flags.extension_field = 0;
+        assert!(HandshakePacket::decode(&zero_flags.encode(0, 0)).is_err());
+
+        // CONFIG set with only an unknown CONFIG-range record stays accepted.
+        let mut config_unknown = conclusion_with_hs();
+        config_unknown.extension_field |= extension_flags::CONFIG;
+        let mut packet = config_unknown.encode(0, 0);
+        unknown_record(&mut packet);
+        assert!(HandshakePacket::decode(&packet).is_ok());
+
+        // An INDUCTION carries the SRT magic in `extension_field`, not flags.
+        let induction = HandshakePacket::new_induction_response(1, 2, 3);
+        assert!(HandshakePacket::decode(&induction.encode(0, 0)).is_ok());
     }
 
     #[test]
     fn handshake_isn_high_bit_is_rejected_not_aliased() {
-        let hs = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
+        let hs = conclusion_with_hs();
         let mut packet = hs.encode(0, 0);
         packet.control_info[8..12].copy_from_slice(&0x8000_0003u32.to_be_bytes());
         assert!(HandshakePacket::decode(&packet).is_err());

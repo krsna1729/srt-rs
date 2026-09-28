@@ -1630,6 +1630,10 @@ impl PeerTable {
             peer_entropy(peer),
         ));
         let mut conn = SrtConnection::new_listener(connection_options);
+        // The peer's MSS is an IP-layer MTU: the path family (from the real
+        // source address, not the handshake's advisory peer-IP field) turns
+        // it into a datagram budget.
+        conn.set_ip_family(srt_proto::handshake::IpFamily::of(&peer));
         conn.set_handshake_timing(
             u64::try_from(options.handshake_retry_interval.as_micros()).unwrap_or(u64::MAX),
             u64::try_from(options.handshake_timeout.as_micros()).unwrap_or(u64::MAX),
@@ -4688,6 +4692,94 @@ mod tests {
                     .expect("conclusion response");
             }
         }
+    }
+
+    /// A Rust caller and a Rust listener on an IPv6 path negotiate the IPv6
+    /// payload from a 1500-byte MSS -- 1500 - 48 - 16 = 1436 bytes -- because
+    /// the transport tells each connection its path family from the real
+    /// socket addresses (the handshake's peer-IP field is advisory, and this
+    /// implementation writes the unspecified IPv4 address there). Every DATA
+    /// datagram the caller then emits fits a 1500-byte IPv6 path.
+    #[test]
+    fn an_ipv6_path_negotiates_the_ipv6_payload_on_both_sides() {
+        let listener_addr: std::net::SocketAddr = "[::1]:9000".parse().expect("address");
+        let caller_addr: std::net::SocketAddr = "[::1]:40000".parse().expect("address");
+        let options = AdmissionOptions::basic(0x7777, 0, false);
+        let telemetry = IngressTelemetry::new();
+        let mut table = PeerTable::new();
+
+        let mut caller = crate::CallerConfig::builder(listener_addr)
+            .build()
+            .expect("caller config")
+            .prepare(crate::RuntimeFlavor::Compio)
+            .expect("prepared caller")
+            .connection(Timestamp::default())
+            .expect("caller connection");
+        assert_eq!(
+            table.admit(
+                caller_addr,
+                &next_packet(&mut caller),
+                Timestamp::default(),
+                &options,
+                0,
+                1,
+                &telemetry,
+            ),
+            Admit::Fed
+        );
+        let mut outbound = Vec::new();
+        table.poll_outbound(Timestamp::default(), &mut outbound);
+        for (peer, packet) in outbound {
+            if peer == caller_addr {
+                caller
+                    .feed_recv_buf(&packet, Timestamp::from_micros(1))
+                    .expect("induction response");
+            }
+        }
+        let conclusion = next_packet(&mut caller);
+        admit_conclusion(
+            &mut table,
+            caller_addr,
+            &mut caller,
+            &conclusion,
+            &options,
+            &telemetry,
+        );
+
+        const IPV6_PAYLOAD: usize = 1500 - 48 - 16;
+        assert_eq!(caller.state(), srt_proto::ConnectionState::Connected);
+        assert_eq!(caller.effective_max_payload_size(), IPV6_PAYLOAD);
+        let slot_idx = table
+            .peer_slot_index_for_test(caller_addr)
+            .expect("peer slot");
+        let listener = table
+            .direct_peer_mut_for_test(slot_idx)
+            .expect("direct peer");
+        assert_eq!(listener.conn.effective_max_payload_size(), IPV6_PAYLOAD);
+
+        caller
+            .send_message(&[0x47; 4 * IPV6_PAYLOAD], Timestamp::from_micros(10))
+            .expect("message fits the send buffer");
+        let mut data_datagrams = 0;
+        while let Ok(Some(output)) = caller.poll_output() {
+            if let ConnectionOutput::SendPacket(bytes) = output
+                && matches!(
+                    srt_proto::wire::SrtPacket::decode(&bytes),
+                    Ok(srt_proto::wire::SrtPacket::Data(_))
+                )
+            {
+                data_datagrams += 1;
+                assert!(
+                    bytes.len() + 48 <= 1500,
+                    "a {}-byte SRT datagram does not fit a 1500-byte IPv6 path",
+                    bytes.len()
+                );
+            }
+        }
+        assert_eq!(
+            data_datagrams, 4,
+            "the message was split at the IPv6 payload"
+        );
     }
 
     /// A1: `AdmissionPeer::connected` must update as part of draining the

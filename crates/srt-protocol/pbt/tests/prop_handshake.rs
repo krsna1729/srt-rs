@@ -3,7 +3,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use proptest::prelude::*;
-use srt_proto::crypto::{KeyFlag, KeyLength};
+use srt_proto::crypto::{CipherMode, KeyFlag, KeyLength};
 use srt_proto::handshake::{
     ExtensionType, HandshakeExtension, HandshakePacket, HandshakeType, KmError, KmMessage,
 };
@@ -132,13 +132,7 @@ fn arb_km_message() -> impl Strategy<Value = KmMessage> {
             let wrapped_key_len = key_length.len() + 8;
             prop::collection::vec(any::<u8>(), wrapped_key_len..=wrapped_key_len).prop_map(
                 move |wrapped_key| {
-                    KmMessage::new(
-                        key_flag,
-                        key_length,
-                        salt,
-                        wrapped_key,
-                        srt_proto::crypto::CipherMode::Ctr,
-                    )
+                    KmMessage::new(key_flag, key_length, salt, wrapped_key, CipherMode::Ctr)
                 },
             )
         })
@@ -332,7 +326,7 @@ proptest! {
         encryption_field in any::<u16>(),
         has_encryption in any::<bool>(),
     ) {
-        let packet = HandshakePacket::new_conclusion_request(
+        let mut packet = HandshakePacket::new_conclusion_request(
             socket_id,
             syn_cookie,
             initial_packet_seq,
@@ -353,7 +347,18 @@ proptest! {
             prop_assert_eq!(packet.extension_field, 0x0001); // HSREQ only
         }
 
-        // ラウンドトリップ
+        // ラウンドトリップ: a CONCLUSION carries its HS record, and a set
+        // KMREQ flag must be backed by a KMREQ record.
+        packet.add_hs_extension(0x010500, 0, 120);
+        if has_encryption {
+            packet.add_km_request(&KmMessage::new(
+                KeyFlag::Even,
+                KeyLength::Aes128,
+                std::array::from_fn(|index| index as u8),
+                vec![0x5A; 24],
+                CipherMode::Ctr,
+            ));
+        }
         let ctrl = packet.encode(0, 0);
         let decoded = HandshakePacket::decode(&ctrl).expect("decode should succeed");
         prop_assert_eq!(decoded.socket_id, socket_id);
@@ -445,6 +450,7 @@ proptest! {
     #[test]
     fn test_km_request_extension_roundtrip(km in arb_km_message()) {
         let mut packet = HandshakePacket::new_conclusion_request(1, 2, 3, 2, true);
+        packet.add_hs_extension(0x010500, 0, 120);
         packet.add_km_request(&km);
 
         let ctrl = packet.encode(1000, 0);
@@ -463,6 +469,7 @@ proptest! {
     #[test]
     fn test_km_response_extension_roundtrip(km in arb_km_message()) {
         let mut packet = HandshakePacket::new_conclusion_response(1, 2, 3, 2, true);
+        packet.add_hs_response(0x010500, 0, 120);
         packet.add_km_response(&km);
 
         let ctrl = packet.encode(1000, 0);
@@ -488,6 +495,7 @@ proptest! {
         ])
     ) {
         let mut packet = HandshakePacket::new_conclusion_response(1, 2, 3, 0, true);
+        packet.add_hs_response(0x010500, 0, 120);
         packet.add_km_error(error);
 
         let ctrl = packet.encode(1000, 0);
@@ -524,6 +532,7 @@ proptest! {
     #[test]
     fn test_sid_extension_roundtrip(stream_id in arb_stream_id()) {
         let mut packet = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
+        packet.add_hs_extension(0x010500, 0, 120);
         packet.add_sid_extension(&stream_id);
 
         let ctrl = packet.encode(1000, 0);
@@ -537,6 +546,7 @@ proptest! {
     #[test]
     fn test_congestion_extension_roundtrip(cc_name in arb_congestion_name()) {
         let mut packet = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
+        packet.add_hs_extension(0x010500, 0, 120);
         packet.add_congestion_extension(&cc_name);
 
         let ctrl = packet.encode(1000, 0);

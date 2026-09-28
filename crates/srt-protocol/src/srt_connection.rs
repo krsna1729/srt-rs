@@ -16,7 +16,7 @@ use crate::message_assembler::MessageAssembler;
 use crate::sender_rto::RtoArm;
 use crate::srt_handshake::{
     DEFAULT_FLOW_WINDOW, DEFAULT_MTU, GroupExtensionData, HS_VERSION_5, HandshakePacket,
-    HandshakeState, HandshakeType, KmError, KmMessage, MAX_FLOW_WINDOW, SRT_MAGIC_CODE,
+    HandshakeState, HandshakeType, IpFamily, KmError, KmMessage, MAX_FLOW_WINDOW, SRT_MAGIC_CODE,
     SRT_REJ_FILTER, SRT_REJ_ROGUE, srt_flags,
 };
 use crate::srt_packet::{
@@ -561,8 +561,13 @@ const KM_HISTORY_CAPACITY: usize = 4;
 ///
 /// SRT's KM wire format carries only an even/odd selector, not a monotonic
 /// generation number. Retaining the last few complete messages lets the
-/// connection distinguish a delayed UDP replay from the next legitimate use
-/// of the same selector without growing memory over a connection's lifetime.
+/// connection distinguish a *recent* delayed replay from the next legitimate
+/// use of the same selector without growing memory over a connection's
+/// lifetime. This is bounded recent-replay rejection, not durable replay
+/// protection: after `KM_HISTORY_CAPACITY` further rotations an old complete
+/// message has left the ring. A replayed KMREQ must still carry key
+/// material wrapped under this session's KEK, so it can reinstall only a key
+/// this session already used, never an attacker-chosen one.
 struct KmHistory {
     entries: [Option<KmMessage>; KM_HISTORY_CAPACITY],
     next: usize,
@@ -680,6 +685,9 @@ pub struct SrtConnection {
     assembler: MessageAssembler,
     /// Maximum data payload per SRT packet (MTU minus header).
     max_payload_size: usize,
+    /// Address family of the UDP path, set by the transport; it turns the
+    /// peer's IP-layer MSS into a datagram budget.
+    ip_family: IpFamily,
 
     /// Event queue.
     event_queue: VecDeque<ConnectionEvent>,
@@ -1177,6 +1185,7 @@ impl SrtConnection {
             receiver: None,
             assembler: MessageAssembler::new(),
             max_payload_size: DEFAULT_MTU as usize - SRT_HEADER_SIZE,
+            ip_family: IpFamily::V4,
             event_queue: VecDeque::new(),
             key_refresh_notified: false,
             pending_data_events: 0,
@@ -1228,6 +1237,7 @@ impl SrtConnection {
             receiver: None,
             assembler: MessageAssembler::new(),
             max_payload_size: DEFAULT_MTU as usize - SRT_HEADER_SIZE,
+            ip_family: IpFamily::V4,
             event_queue: VecDeque::new(),
             key_refresh_notified: false,
             pending_data_events: 0,
@@ -1483,6 +1493,16 @@ impl SrtConnection {
     /// never scheduled earlier than the requested cadence. Both values are
     /// clamped to at least one microsecond and the whole-attempt timeout is
     /// clamped to at least the retry interval.
+    /// Set the address family of this connection's UDP path.
+    ///
+    /// The transport knows the socket address; the handshake does not carry
+    /// the path family reliably. It must be set before the peer's CONCLUSION
+    /// is processed, because that is where the peer MSS becomes this
+    /// connection's datagram budget. Unset, the path is taken to be IPv4.
+    pub fn set_ip_family(&mut self, family: IpFamily) {
+        self.ip_family = family;
+    }
+
     pub fn set_handshake_timing(&mut self, retry_interval_micros: u64, timeout_micros: u64) {
         self.handshake_retry_interval_micros = retry_interval_micros.max(1);
         self.handshake_timeout_micros = timeout_micros
@@ -3116,7 +3136,8 @@ impl SrtConnection {
     /// rejection response while staying able to serve other peers
     /// (`CUDT::acceptAndRespond` on an under-sized one).
     fn reject_peer_mss(&mut self, hs: &HandshakePacket, now: Timestamp) -> Result<(), Error> {
-        let Some(reason) = hs.peer_mss_rejection_reason(MIN_NEGOTIATED_PAYLOAD_SIZE as u32) else {
+        let min_payload = self.min_negotiated_payload(hs) as u32;
+        let Some(reason) = hs.peer_mss_rejection_reason(self.ip_family, min_payload) else {
             return Ok(());
         };
         match self.role {
@@ -3142,7 +3163,7 @@ impl SrtConnection {
     /// instead of this core's local 1484, which a libsrt peer's receive
     /// buffer would truncate.
     fn apply_peer_mss(&mut self, hs: &HandshakePacket) {
-        let negotiated_datagram = (DEFAULT_MTU).min(hs.peer_max_datagram_size());
+        let negotiated_datagram = DEFAULT_MTU.min(hs.peer_max_datagram_size(self.ip_family));
         // Clamped rather than asserted: `reject_peer_mss` is the gate that
         // fails such a peer closed, and this second bound keeps a future
         // path that skipped it from reaching `NakChunkEncoder`'s
@@ -3150,6 +3171,36 @@ impl SrtConnection {
         self.max_payload_size = (negotiated_datagram as usize)
             .saturating_sub(SRT_HEADER_SIZE)
             .max(MIN_NEGOTIATED_PAYLOAD_SIZE);
+    }
+
+    /// Smallest raw DATA payload this connection can operate with: room
+    /// for a NAK loss record, and under GCM room for the authentication tag
+    /// plus one byte of application data, so a negotiated session can always
+    /// carry DATA (`effective_max_payload_size` subtracts the tag).
+    ///
+    /// The cipher is already known when the CONCLUSION is checked: the
+    /// caller built its crypto context (or configured one) before sending,
+    /// and a listener reads it from the peer's KMREQ.
+    fn min_negotiated_payload(&self, hs: &HandshakePacket) -> usize {
+        let cipher = match self.role {
+            ConnectionRole::Caller => match self.crypto.as_deref() {
+                Some(crypto) => Some(crypto.cipher_mode()),
+                None => self
+                    .options
+                    .passphrase
+                    .is_some()
+                    .then_some(self.options.cipher_mode),
+            },
+            ConnectionRole::Listener => hs
+                .get_km_request()
+                .and_then(Result::ok)
+                .and_then(|km| CipherMode::from_km(&km)),
+        };
+        if cipher == Some(CipherMode::Gcm) {
+            MIN_NEGOTIATED_PAYLOAD_SIZE.max(GCM_TAG_LEN + 1)
+        } else {
+            MIN_NEGOTIATED_PAYLOAD_SIZE
+        }
     }
 
     /// Reject a handshake in which the peer negotiates packet-filter
@@ -3232,19 +3283,14 @@ impl SrtConnection {
     fn validate_caller_kmrsp(&mut self, hs: &HandshakePacket) -> Result<(), Error> {
         match (self.crypto.is_some(), hs.get_km_response()) {
             (true, Ok(Some(response))) => {
-                let matches_pending = self
-                    .km_control
-                    .as_ref()
-                    .and_then(|state| state.pending.as_ref())
-                    .is_some_and(|pending| pending.request == response);
-                if !matches_pending {
+                let Some(state) = self.km_control.as_deref_mut().filter(|state| {
+                    state
+                        .pending
+                        .as_ref()
+                        .is_some_and(|p| p.request == response)
+                }) else {
                     return Err(self
                         .fail_caller_handshake("KMRSP does not match the caller's pending KMREQ"));
-                }
-                let Some(state) = self.km_control.as_mut() else {
-                    return Err(self.fail_caller_handshake(
-                        "caller has no KM transaction state for the KMRSP",
-                    ));
                 };
                 state.pending = None;
                 state.acknowledged.remember(response);
@@ -3785,18 +3831,11 @@ impl SrtConnection {
             return Err(Error::invalid_data("stale or replayed KMREQ"));
         }
 
-        let consistent = self.crypto.as_ref().is_some_and(|crypto| {
+        let Some(crypto) = self.crypto.as_deref_mut().filter(|crypto| {
             km_matches_context(&km, crypto) && km.key_flag == crypto.current_key().other()
-        });
-        if !consistent {
+        }) else {
             return Err(Error::invalid_data(
                 "KMREQ does not match the secured session's next generation",
-            ));
-        }
-
-        let Some(crypto) = self.crypto.as_mut() else {
-            return Err(Error::invalid_state(
-                "encrypted connection lost its crypto context",
             ));
         };
         crypto.update_sek(&km.wrapped_key, km.key_flag)?;
@@ -3814,6 +3853,16 @@ impl SrtConnection {
     /// a duplicate acknowledgement is stale, and one for a different
     /// generation does not prove the peer installed *this* key.
     fn handle_km_response(&mut self, control_info: &[u8]) -> Result<(), Error> {
+        // A one-word KMRSP is the peer reporting a key-material error state.
+        // The reference recognises it during an established session and
+        // ignores it without changing security state
+        // (`CUDT::processSrtMsg_KMRSP`); the pending rotation keeps its own
+        // bounded retries. An unknown code is malformed input.
+        if let Ok(code) = <[u8; 4]>::try_from(control_info) {
+            return KmError::from_u32(u32::from_le_bytes(code))
+                .map(|_| ())
+                .ok_or_else(|| Error::invalid_data("unknown KMRSP error code"));
+        }
         let km = KmMessage::decode(control_info)?;
         let state = self
             .km_control
@@ -4752,7 +4801,6 @@ mod tests {
     use crate::handshake::{
         ExtensionType, GroupType, HandshakeExtension, SRTGROUP_MASK, extension_flags,
     };
-    use std::net::IpAddr;
 
     /// Deterministic, non-secret KM salt for protocol test fixtures.
     fn test_km_salt() -> [u8; 16] {
@@ -7845,13 +7893,17 @@ mod tests {
                 ),
             ),
             (
+                // Eight bytes: longer than the one-word error form (which
+                // is a valid, ignored KMRSP -- see
+                // `a_one_word_kmrsp_error_is_ignored_without_state_change`)
+                // and shorter than any KM message.
                 "key-management response with a truncated body",
                 control_datagram(
                     socket_id,
                     ControlType::UserDefined,
                     SRT_CMD_KMRSP,
                     0,
-                    vec![0; 4],
+                    vec![0; 8],
                 ),
             ),
         ];
@@ -7962,6 +8014,70 @@ mod tests {
         );
     }
 
+    /// A one-word KMRSP is the peer reporting a key-material error state.
+    /// The reference ignores it during an established session without
+    /// changing security state; here it is accepted as well-formed, changes
+    /// nothing, and leaves an outstanding rotation to its own bounded
+    /// retries rather than being counted as malformed input.
+    #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "real AES-CTR handshake and encrypted round trips under Miri; run in the \
+                  miri-extended scheduled job"
+    )]
+    fn a_one_word_kmrsp_error_is_ignored_without_state_change() {
+        let (mut caller, mut listener) = encrypted_pair(CipherMode::Ctr);
+        for connection in [&mut caller, &mut listener] {
+            while connection.poll_event().is_some() {}
+            let _ = drain_outputs(connection);
+        }
+        let now = Timestamp::from_micros(10_000_000);
+        caller
+            .provide_new_sek(&[0x33; 16], now)
+            .expect("rotation starts");
+        let _ = drain_outputs(&mut caller);
+        let before = km_security_snapshot(&caller);
+        let pending_before = caller
+            .km_control
+            .as_ref()
+            .and_then(|state| state.pending.as_ref())
+            .map(|pending| pending.request.clone());
+        assert!(pending_before.is_some(), "a rotation is outstanding");
+
+        let error_word = (KmError::BadSecret as u32).to_le_bytes().to_vec();
+        let datagram = control_datagram(
+            caller.socket_id(),
+            ControlType::UserDefined,
+            SRT_CMD_KMRSP,
+            0,
+            error_word,
+        );
+        caller
+            .feed_recv_buf(&datagram, now.add_micros(10))
+            .expect("a one-word KMRSP error is well-formed");
+
+        assert_eq!(
+            km_security_snapshot(&caller),
+            before,
+            "no security state change"
+        );
+        assert_eq!(
+            caller
+                .km_control
+                .as_ref()
+                .and_then(|state| state.pending.as_ref())
+                .map(|pending| pending.request.clone()),
+            pending_before,
+            "the rotation keeps its own bounded retries"
+        );
+        assert_encrypted_roundtrip(
+            &mut caller,
+            &mut listener,
+            now.add_micros(20),
+            b"after an error KMRSP",
+        );
+    }
+
     /// Regression for the post-establishment encryption-state downgrade class
     /// fixed by Haivision in CVE-2026-55868. Every hostile KM control is
     /// rejected transactionally: the secured context, generation histories,
@@ -7996,8 +8112,11 @@ mod tests {
 
         let old_material = current_km_message(&caller);
 
-        // A delayed four-byte handshake failure is not allowed to demote an
-        // already-secured sender.
+        // A four-byte KMRSP whose word is not a known KM state (BadSecret
+        // written big-endian; the reference's error word is little-endian)
+        // is malformed, and must not demote an already-secured sender. The
+        // genuine one-word error form is ignored instead:
+        // `a_one_word_kmrsp_error_is_ignored_without_state_change`.
         let mut failure = Vec::with_capacity(4);
         write_u32(&mut failure, KmError::BadSecret as u32);
         tick += 10;
@@ -8261,8 +8380,8 @@ mod tests {
 
     /// One handshake attempt in which the caller and the listener advertise
     /// `caller_mss` and `listener_mss` instead of their constructor defaults,
-    /// and both name `peer_ip` in the handshake's peer-address field (which
-    /// is what `HandshakePacket::ip_udp_overhead` reads).
+    /// and both connections are told their path is `family`, as a transport
+    /// does from its socket address (`SrtConnection::set_ip_family`).
     struct MssHandshake {
         caller: SrtConnection,
         listener: SrtConnection,
@@ -8277,8 +8396,8 @@ mod tests {
     struct HandshakeRewrite {
         /// Advertised MSS.
         mss: u32,
-        /// Peer address the handshake names (decides the IP/UDP overhead).
-        peer_ip: IpAddr,
+        /// Path family of the side that sends these packets.
+        family: IpFamily,
         /// Add a FILTER extension: a packet-filter *negotiation*.
         filter_extension: bool,
         /// Set `PACKET_FILTER` in the HS extension's `srt_flags`: a
@@ -8287,10 +8406,10 @@ mod tests {
     }
 
     impl HandshakeRewrite {
-        fn mss(mss: u32, peer_ip: IpAddr) -> Self {
+        fn mss(mss: u32, family: IpFamily) -> Self {
             Self {
                 mss,
-                peer_ip,
+                family,
                 filter_extension: false,
                 packet_filter_flag: false,
             }
@@ -8307,7 +8426,6 @@ mod tests {
         };
         let mut handshake = HandshakePacket::decode(&control).expect("handshake decodes");
         handshake.mtu = rewrite.mss;
-        handshake.peer_ip = rewrite.peer_ip;
         if rewrite.packet_filter_flag
             && let Some(extension) = handshake.get_hs_extension()
         {
@@ -8360,12 +8478,12 @@ mod tests {
     fn mss_handshake(
         caller_mss: u32,
         listener_mss: u32,
-        peer_ip: IpAddr,
+        family: IpFamily,
         listener_options: ConnectionOptions,
     ) -> MssHandshake {
         handshake_with_rewrites(
-            &HandshakeRewrite::mss(caller_mss, peer_ip),
-            &HandshakeRewrite::mss(listener_mss, peer_ip),
+            &HandshakeRewrite::mss(caller_mss, family),
+            &HandshakeRewrite::mss(listener_mss, family),
             listener_options,
         )
     }
@@ -8377,11 +8495,27 @@ mod tests {
         listener_rewrite: &HandshakeRewrite,
         listener_options: ConnectionOptions,
     ) -> MssHandshake {
-        let mut caller = SrtConnection::new_caller(ConnectionOptions {
-            socket_id: 1,
-            ..ConnectionOptions::default()
-        });
+        handshake_with_options(
+            caller_rewrite,
+            listener_rewrite,
+            ConnectionOptions {
+                socket_id: 1,
+                ..ConnectionOptions::default()
+            },
+            listener_options,
+        )
+    }
+
+    fn handshake_with_options(
+        caller_rewrite: &HandshakeRewrite,
+        listener_rewrite: &HandshakeRewrite,
+        caller_options: ConnectionOptions,
+        listener_options: ConnectionOptions,
+    ) -> MssHandshake {
+        let mut caller = SrtConnection::new_caller(caller_options);
         let mut listener = SrtConnection::new_listener(listener_options);
+        caller.set_ip_family(caller_rewrite.family);
+        listener.set_ip_family(listener_rewrite.family);
         caller
             .connect(Timestamp::from_micros(0))
             .expect("caller starts");
@@ -8424,20 +8558,20 @@ mod tests {
     /// a value outside the derived bounds before committing any state.
     #[test]
     fn peer_mss_bounds_are_derived_from_wire_semantics_and_enforced() {
-        let v4 = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
-        let v6 = IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
+        let v4 = IpFamily::V4;
+        let v6 = IpFamily::V6;
 
-        // Positive and boundary cases: (advertised MSS, address, negotiated
+        // Positive and boundary cases: (advertised MSS, path family, negotiated
         // DATA payload). 1500 is the reference default (1456 = 1500 - 28 - 16,
         // libsrt's own `mss - (UDP_HDR_SIZE + HDR_SIZE)`); 52 and 72 are the
         // smallest values that still leave one 8-byte NAK record.
-        for (mss, peer_ip, expected_payload) in [
+        for (mss, family, expected_payload) in [
             (1500u32, v4, 1456usize),
             (1200, v4, 1156),
             (52, v4, 8),
             (72, v6, 8),
         ] {
-            let attempt = mss_handshake(mss, mss, peer_ip, listener_options());
+            let attempt = mss_handshake(mss, mss, family, listener_options());
             attempt
                 .listener_result
                 .unwrap_or_else(|error| panic!("listener accepted MSS {mss}: {error}"));
@@ -8461,7 +8595,7 @@ mod tests {
         // libsrt's *listener* would clamp `min(local, peer)` and accept a
         // jumbo peer, but this stack implements no jumbo/path-MTU
         // negotiation, so it refuses the session instead of clamping it.
-        for (mss, peer_ip) in [
+        for (mss, family) in [
             (51u32, v4),
             (48, v4),
             (0, v4),
@@ -8471,15 +8605,85 @@ mod tests {
             (9000, v4),
             (u32::MAX, v4),
         ] {
-            assert_unusable_peer_mss_is_refused(mss, peer_ip);
+            assert_unusable_peer_mss_is_refused(mss, family);
+        }
+    }
+
+    /// The MSS floor includes the cipher's authentication tag: under GCM a
+    /// negotiated payload must still carry the 16-byte tag plus one byte of
+    /// DATA, so the smallest usable MSS is 28 + 16 + 17 = 61 on IPv4 and 81
+    /// on IPv6, against 52 and 72 under CTR (one 8-byte NAK record). At the
+    /// exact minimum both roles connect and can send one byte of DATA; one
+    /// below it, the listener refuses before committing anything.
+    #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "real KM handshakes derive their KEK via 2048 PBKDF2-HMAC-SHA1 iterations   \
+                  (per the SRT spec) on each side under Miri, which dominates this job's     \
+                  time; the MSS arithmetic is unrelated to PBKDF2. Run in the               \
+                  miri-extended scheduled job."
+    )]
+    fn the_mss_floor_leaves_room_for_the_gcm_tag_on_both_families() {
+        let options = |socket_id: u32, cipher_mode: CipherMode| ConnectionOptions {
+            socket_id,
+            syn_cookie: (socket_id == 2).then_some(7),
+            passphrase: Some("shared-secret".to_owned()),
+            crypto_salt: Some(test_km_salt()),
+            crypto_sek: Some(vec![0x24u8; 16]),
+            cipher_mode,
+            ..ConnectionOptions::default()
+        };
+        for (family, cipher_mode, min_mss, payload_at_min) in [
+            (IpFamily::V4, CipherMode::Ctr, 52u32, 8usize),
+            (IpFamily::V6, CipherMode::Ctr, 72, 8),
+            (IpFamily::V4, CipherMode::Gcm, 61, 1),
+            (IpFamily::V6, CipherMode::Gcm, 81, 1),
+        ] {
+            let at_min = handshake_with_options(
+                &HandshakeRewrite::mss(min_mss, family),
+                &HandshakeRewrite::mss(min_mss, family),
+                options(1, cipher_mode),
+                options(2, cipher_mode),
+            );
+            let case = format!("{family:?} {cipher_mode:?} MSS {min_mss}");
+            at_min
+                .listener_result
+                .unwrap_or_else(|error| panic!("listener accepts {case}: {error}"));
+            at_min
+                .caller_result
+                .unwrap_or_else(|error| panic!("caller accepts {case}: {error}"));
+            for (who, conn) in [("caller", &at_min.caller), ("listener", &at_min.listener)] {
+                assert_eq!(conn.state(), ConnectionState::Connected, "{who} {case}");
+                assert_eq!(
+                    conn.effective_max_payload_size(),
+                    payload_at_min,
+                    "{who} {case}: usable DATA payload at the minimum"
+                );
+            }
+
+            let below = handshake_with_options(
+                &HandshakeRewrite::mss(min_mss - 1, family),
+                &HandshakeRewrite::mss(min_mss - 1, family),
+                options(1, cipher_mode),
+                options(2, cipher_mode),
+            );
+            let error = below
+                .listener_result
+                .expect_err("one below the minimum is refused");
+            assert_eq!(
+                error.kind,
+                crate::ErrorKind::HandshakeRejected,
+                "{case} - 1"
+            );
+            assert_eq!(below.listener.state(), ConnectionState::Disconnected);
         }
     }
 
     /// A peer MSS outside the derived bounds is refused by the listener with
     /// the reference's own rejection code, and nothing about the attempt is
     /// committed.
-    fn assert_unusable_peer_mss_is_refused(mss: u32, peer_ip: IpAddr) {
-        let mut attempt = mss_handshake(mss, mss, peer_ip, listener_options());
+    fn assert_unusable_peer_mss_is_refused(mss: u32, family: IpFamily) {
+        let mut attempt = mss_handshake(mss, mss, family, listener_options());
         let error = attempt
             .listener_result
             .expect_err("listener rejects an unusable peer MSS");
@@ -8529,7 +8733,7 @@ mod tests {
     /// that rejected one attempt still serves a fresh peer.
     #[test]
     fn an_unusable_listener_mss_fails_the_caller_and_leaves_the_listener_serving() {
-        let v4 = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let v4 = IpFamily::V4;
         let attempt = mss_handshake(1500, 40, v4, listener_options());
         attempt
             .listener_result
@@ -8561,7 +8765,7 @@ mod tests {
     /// a whole 8-byte record).
     #[test]
     fn a_connection_at_the_negotiated_minimum_still_reports_loss() {
-        let v4 = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let v4 = IpFamily::V4;
         let attempt = mss_handshake(52, 52, v4, listener_options());
         attempt.listener_result.expect("listener accepts");
         attempt.caller_result.expect("caller accepts");
@@ -8636,7 +8840,7 @@ mod tests {
     /// (`test_extension_parsing_unknown_type` pins that decode side).
     #[test]
     fn packet_filter_negotiation_is_refused_but_the_capability_flag_is_not() {
-        let v4 = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let v4 = IpFamily::V4;
         let plain = HandshakeRewrite::mss(1500, v4);
 
         // The FILTER extension is a negotiation: the caller asking for it is
