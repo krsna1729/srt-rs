@@ -588,10 +588,53 @@ impl KmHistory {
     }
 }
 
+/// Bounded retries for a key-material request the peer has not acknowledged.
+///
+/// A rotation is not complete until the peer confirms it installed the new
+/// key: the sender must not switch to a key the receiver never received. The
+/// transaction is therefore retried a bounded number of times and then
+/// abandoned (see `abandon_pre_announce`) rather than retried forever.
+const KM_REQUEST_MAX_RETRIES: u8 = 4;
+
+/// Retry cadence for an unacknowledged key-material request. libsrt's own
+/// KMREQ cadence is one second.
+const KM_REQUEST_RETRY_INTERVAL_MICROS: u64 = 1_000_000;
+
+/// An outgoing key-material request awaiting its response.
+struct PendingKmRequest {
+    /// The exact KMREQ to retransmit. A rotation is never re-generated, so a
+    /// retry carries byte-identical key material to the original -- the peer
+    /// answers a duplicate idempotently rather than installing anything.
+    request: KmMessage,
+    /// When the next retransmission is due.
+    next_retry: Timestamp,
+    /// Retransmissions left, or `None` when another mechanism owns the retry:
+    /// the handshake resends its whole CONCLUSION (this KMREQ included), so
+    /// the connection must not also retransmit it here.
+    retries_left: Option<u8>,
+}
+
+/// What [`SrtConnection::service_km_retry`] decided to do, computed under a
+/// short borrow of the transaction state so the action itself can run
+/// without one.
+enum KmRetryAction {
+    /// Retransmit this exact request.
+    Resend(KmMessage),
+    /// Give up on the rotation announced under this key flag.
+    Abandon(KeyFlag),
+}
+
 /// Post-handshake KM request/response transaction state.
 #[derive(Default)]
 struct KmControlState {
-    pending_response: Option<KmMessage>,
+    /// Outgoing rotation awaiting acknowledgement (sender side).
+    pending: Option<PendingKmRequest>,
+    /// The most recently accepted inbound KMREQ, whose exact duplicate is
+    /// answered again without installing anything (receiver side). SRT's KM
+    /// wire format carries only an even/odd selector, so this is what
+    /// distinguishes a legitimate retransmission of the current rotation from
+    /// a replay of an older one.
+    last_received: Option<KmMessage>,
     received: KmHistory,
     acknowledged: KmHistory,
 }
@@ -1920,6 +1963,12 @@ impl SrtConnection {
             return;
         }
         self.service_receive_deadlines(now);
+        // An unacknowledged key rotation is serviced here rather than by a
+        // timer of its own: this tick is already the connection's periodic
+        // service point (TSBPD, TLPKTDROP, deferred peer close), it is armed
+        // for the whole connected lifetime, and a retry landing a few
+        // milliseconds late is irrelevant at a one-second cadence.
+        self.service_km_retry(now);
         // A pending peer close advances on delivery: the tick is what makes
         // TSBPD deadlines pass.
         self.finish_peer_shutdown_if_drained();
@@ -2689,10 +2738,10 @@ impl SrtConnection {
         if self
             .km_control
             .as_ref()
-            .is_some_and(|state| state.pending_response.is_some())
+            .is_some_and(|state| state.pending.is_some())
         {
             return Err(Error::invalid_state(
-                "a key-material response is already pending",
+                "a key-material request is already awaiting its response",
             ));
         }
         let Some(crypto) = &mut self.crypto else {
@@ -2712,9 +2761,14 @@ impl SrtConnection {
             crypto.cipher_mode(),
         );
         self.send_km_request(&km_message, now);
-        self.km_control
-            .get_or_insert_with(|| Box::new(KmControlState::default()))
-            .pending_response = Some(km_message);
+        let state = self
+            .km_control
+            .get_or_insert_with(|| Box::new(KmControlState::default()));
+        state.pending = Some(PendingKmRequest {
+            request: km_message,
+            next_retry: now.add_micros(KM_REQUEST_RETRY_INTERVAL_MICROS),
+            retries_left: Some(KM_REQUEST_MAX_RETRIES),
+        });
 
         self.check_output_queue()
     }
@@ -3181,8 +3235,8 @@ impl SrtConnection {
                 let matches_pending = self
                     .km_control
                     .as_ref()
-                    .and_then(|state| state.pending_response.as_ref())
-                    .is_some_and(|pending| pending == &response);
+                    .and_then(|state| state.pending.as_ref())
+                    .is_some_and(|pending| pending.request == response);
                 if !matches_pending {
                     return Err(self
                         .fail_caller_handshake("KMRSP does not match the caller's pending KMREQ"));
@@ -3192,7 +3246,7 @@ impl SrtConnection {
                         "caller has no KM transaction state for the KMRSP",
                     ));
                 };
-                state.pending_response = None;
+                state.pending = None;
                 state.acknowledged.remember(response);
                 Ok(())
             }
@@ -3336,6 +3390,10 @@ impl SrtConnection {
             // than at completion, which has no fallible step left to guard.
             let mut km_control = KmControlState::default();
             km_control.received.remember(km.clone());
+            // A retransmitted handshake KMREQ (a repeated CONCLUSION, or a
+            // runtime retry of the same material) is answered again without
+            // installing anything.
+            km_control.last_received = Some(km.clone());
             self.crypto = Some(Box::new(crypto));
             self.km_control = Some(Box::new(km_control));
             self.received_km = Some(Box::new(km));
@@ -3693,6 +3751,22 @@ impl SrtConnection {
                     return Ok(());
                 }
 
+                // A retransmitted KMREQ is a legitimate retry, not an attack:
+                // the peer is still waiting for the response to *this*
+                // rotation (its own retry, or a lost KMRSP). Answer it again
+                // without installing anything -- re-installing would be a
+                // no-op at best and a key rollback at worst. Only an older
+                // generation is stale, and that is rejected below.
+                let is_current_retry = self
+                    .km_control
+                    .as_ref()
+                    .and_then(|state| state.last_received.as_ref())
+                    .is_some_and(|last| last == &km);
+                if is_current_retry {
+                    self.send_km_response(&km, now);
+                    return Ok(());
+                }
+
                 if self
                     .km_control
                     .as_ref()
@@ -3718,7 +3792,8 @@ impl SrtConnection {
                 crypto.update_sek(&km.wrapped_key, km.key_flag)?;
                 self.send_km_response(&km, now);
                 if let Some(state) = self.km_control.as_mut() {
-                    state.received.remember(km);
+                    state.received.remember(km.clone());
+                    state.last_received = Some(km);
                 }
             }
             SRT_CMD_KMRSP => {
@@ -3730,12 +3805,16 @@ impl SrtConnection {
                 if state.acknowledged.contains(&km) {
                     return Err(Error::invalid_data("stale or replayed KMRSP"));
                 }
-                if state.pending_response.as_ref() != Some(&km) {
+                if state
+                    .pending
+                    .as_ref()
+                    .is_none_or(|pending| pending.request != km)
+                {
                     return Err(Error::invalid_data(
                         "KMRSP does not acknowledge the pending KMREQ",
                     ));
                 }
-                state.pending_response = None;
+                state.pending = None;
                 state.acknowledged.remember(km);
             }
             _ => {
@@ -3744,6 +3823,55 @@ impl SrtConnection {
         }
 
         Ok(())
+    }
+
+    /// Retransmit an unacknowledged key-material request, or give up on it.
+    ///
+    /// A rotation is only complete once the peer confirms it installed the
+    /// new key. Until then the identical KMREQ is retransmitted on a bounded
+    /// schedule; when the retries are exhausted the rotation is abandoned
+    /// (the *current* key is untouched, so the session keeps working) and the
+    /// application is asked for a fresh SEK on the next refresh check. That
+    /// is what keeps a lost KMREQ/KMRSP from wedging the connection or from
+    /// switching the sender onto a key the receiver never installed.
+    fn service_km_retry(&mut self, now: Timestamp) {
+        // The action is decided under one short borrow of the transaction,
+        // then carried out without it: resending needs `&mut self` for the
+        // output queue, and abandoning needs the crypto context.
+        let action = match self
+            .km_control
+            .as_mut()
+            .and_then(|state| state.pending.as_mut())
+        {
+            None => return,
+            Some(pending) if now < pending.next_retry => return,
+            Some(pending) => match pending.retries_left {
+                // The handshake owns this one: it resends the whole
+                // CONCLUSION, which carries this same KMREQ.
+                None => return,
+                // Bounded retries exhausted: abandon rather than hold the
+                // key switch open forever.
+                Some(0) => KmRetryAction::Abandon(pending.request.key_flag),
+                Some(left) => {
+                    pending.retries_left = Some(left - 1);
+                    pending.next_retry = now.add_micros(KM_REQUEST_RETRY_INTERVAL_MICROS);
+                    KmRetryAction::Resend(pending.request.clone())
+                }
+            },
+        };
+
+        match action {
+            KmRetryAction::Resend(request) => self.send_km_request(&request, now),
+            KmRetryAction::Abandon(key_flag) => {
+                if let Some(state) = self.km_control.as_mut() {
+                    state.pending = None;
+                }
+                if let Some(crypto) = self.crypto.as_mut() {
+                    crypto.abandon_pre_announce(key_flag);
+                }
+                self.key_refresh_notified = false;
+            }
+        }
     }
 
     /// Check whether KM Refresh needs to happen and act accordingly.
@@ -3763,7 +3891,14 @@ impl SrtConnection {
 
         // Check whether a key switch is needed.
         if let Some(ref mut crypto) = self.crypto {
-            if crypto.should_switch_key() {
+            // Only once the peer has acknowledged the rotation: switching to
+            // a key the receiver never installed would make every subsequent
+            // DATA packet undecryptable.
+            let rotation_acknowledged = self
+                .km_control
+                .as_ref()
+                .is_none_or(|state| state.pending.is_none());
+            if rotation_acknowledged && crypto.should_switch_key() {
                 crypto.switch_key();
             }
 
@@ -4132,9 +4267,18 @@ impl SrtConnection {
                 crypto.cipher_mode(),
             );
             hs.add_km_request(&km_message);
-            self.km_control
-                .get_or_insert_with(|| Box::new(KmControlState::default()))
-                .pending_response = Some(km_message);
+            // Tracked as pending so a KMRSP that does not acknowledge this
+            // request cannot complete the handshake; the handshake's own
+            // request retransmission owns the retry (`retries_left: None`),
+            // since it resends this same CONCLUSION with the KMREQ in it.
+            let state = self
+                .km_control
+                .get_or_insert_with(|| Box::new(KmControlState::default()));
+            state.pending = Some(PendingKmRequest {
+                request: km_message,
+                next_retry: now.add_micros(KM_REQUEST_RETRY_INTERVAL_MICROS),
+                retries_left: None,
+            });
         }
 
         // Add a SID extension if a Stream ID is set.
@@ -8283,7 +8427,11 @@ mod tests {
 
         // Negative cases: one byte below the family's derived minimum, the
         // reference's own (weaker) 4-byte floor, and anything above the
-        // largest MSS a reference implementation accepts.
+        // largest MSS this implementation negotiates. The jumbo case is a
+        // deliberate local policy rather than a reference rule: pinned
+        // libsrt's *listener* would clamp `min(local, peer)` and accept a
+        // jumbo peer, but this stack implements no jumbo/path-MTU
+        // negotiation, so it refuses the session instead of clamping it.
         for (mss, peer_ip) in [
             (51u32, v4),
             (48, v4),
@@ -8291,6 +8439,7 @@ mod tests {
             (71, v6),
             (68, v6),
             (1501, v4),
+            (9000, v4),
             (u32::MAX, v4),
         ] {
             assert_unusable_peer_mss_is_refused(mss, peer_ip);
@@ -8525,6 +8674,203 @@ mod tests {
         assert_eq!(attempt.caller.state(), ConnectionState::Connected);
     }
 
+    /// A lost KMRSP must not lose the rotation: the peer retransmits the same
+    /// KMREQ (as libsrt does while awaiting the response), the receiver
+    /// answers it again *without* installing anything, and the rotation then
+    /// completes. This is the reliability property the hostile-input test
+    /// cannot see, because it only ever sends invalid controls.
+    #[test]
+    fn a_lost_kmrsp_is_retried_and_the_rotation_completes() {
+        let (mut caller, mut listener) = encrypted_pair(CipherMode::Ctr);
+        for connection in [&mut caller, &mut listener] {
+            while connection.poll_event().is_some() {}
+            let _ = drain_outputs(connection);
+        }
+        let mut now = Timestamp::from_micros(10_000_000);
+
+        // The rotation is announced and installed by the listener.
+        caller
+            .provide_new_sek(&[0x6B; 16], now)
+            .expect("start key refresh");
+        let first_request = take_user_defined_datagram(&mut caller, SRT_CMD_KMREQ);
+        listener
+            .feed_recv_buf(&first_request, now)
+            .expect("the listener installs the announced key");
+        let listener_after_install = km_security_snapshot(&listener);
+        let announced = listener
+            .crypto
+            .as_ref()
+            .expect("secured listener")
+            .current_key();
+
+        // The response is lost. The retry cadence elapses, and the sender
+        // retransmits the *identical* request.
+        now = now.add_micros(1_000_001);
+        caller
+            .handle_timer(TimerId::Ack, now)
+            .expect("ACK tick services the pending rotation");
+        let retried_request = take_user_defined_datagram(&mut caller, SRT_CMD_KMREQ);
+        assert_eq!(
+            user_defined_control_info(&retried_request),
+            user_defined_control_info(&first_request),
+            "a retry must carry byte-identical key material"
+        );
+
+        // The listener answers the duplicate again, and installs nothing.
+        let _ = drain_outputs(&mut listener);
+        listener
+            .feed_recv_buf(&retried_request, now)
+            .expect("a retransmitted KMREQ is answered, not rejected");
+        assert_eq!(
+            km_security_snapshot(&listener),
+            listener_after_install,
+            "answering a duplicate must not touch the receiver's key state"
+        );
+        let response = take_user_defined_datagram(&mut listener, SRT_CMD_KMRSP);
+
+        // The response arrives this time: the transaction closes.
+        caller
+            .feed_recv_buf(&response, now.add_micros(1))
+            .expect("the retried rotation is acknowledged");
+        assert!(
+            km_security_snapshot(&caller).pending_response.is_none(),
+            "a matching KMRSP closes the transaction"
+        );
+        assert_eq!(
+            listener
+                .crypto
+                .as_ref()
+                .expect("secured listener")
+                .current_key(),
+            announced,
+            "the receiver is on the announced generation"
+        );
+        assert_encrypted_roundtrip(
+            &mut caller,
+            &mut listener,
+            now.add_micros(2),
+            b"after a lost response",
+        );
+    }
+
+    /// A lost KMREQ must not let the sender switch onto a key the receiver
+    /// never installed, and must not wedge the connection either: the retry
+    /// completes the rotation, and an exhausted transaction is abandoned.
+    #[test]
+    fn a_lost_kmreq_is_retried_and_an_unanswered_rotation_is_abandoned() {
+        let (mut caller, mut listener) = encrypted_pair(CipherMode::Ctr);
+        for connection in [&mut caller, &mut listener] {
+            while connection.poll_event().is_some() {}
+            let _ = drain_outputs(connection);
+        }
+        let mut now = Timestamp::from_micros(20_000_000);
+        let original_key = caller
+            .crypto
+            .as_ref()
+            .expect("secured caller")
+            .current_key();
+
+        // The rotation is announced past the switch threshold, and its first
+        // request never reaches the peer.
+        caller
+            .provide_new_sek(&[0x7C; 16], now)
+            .expect("start key refresh");
+        let dropped = take_user_defined_datagram(&mut caller, SRT_CMD_KMREQ);
+        caller
+            .crypto
+            .as_mut()
+            .expect("secured caller")
+            .set_encrypted_packet_count_for_test(CryptoContext::KM_REFRESH_PERIOD);
+        caller.check_km_refresh(now);
+        assert_eq!(
+            caller
+                .crypto
+                .as_ref()
+                .expect("secured caller")
+                .current_key(),
+            original_key,
+            "the sender must not switch to a key the peer has not acknowledged"
+        );
+
+        // The retry reaches the listener, which installs and answers.
+        now = now.add_micros(1_000_001);
+        caller
+            .handle_timer(TimerId::Ack, now)
+            .expect("ACK tick retransmits the request");
+        let retried = take_user_defined_datagram(&mut caller, SRT_CMD_KMREQ);
+        assert_eq!(
+            user_defined_control_info(&retried),
+            user_defined_control_info(&dropped),
+            "the retry is the same request"
+        );
+        listener
+            .feed_recv_buf(&retried, now)
+            .expect("the listener installs on the retry");
+        let response = take_user_defined_datagram(&mut listener, SRT_CMD_KMRSP);
+        caller
+            .feed_recv_buf(&response, now.add_micros(1))
+            .expect("the rotation is acknowledged");
+
+        // Now, and only now, the switch happens, and both sides agree.
+        caller.check_km_refresh(now.add_micros(2));
+        let switched = caller
+            .crypto
+            .as_ref()
+            .expect("secured caller")
+            .current_key();
+        assert_ne!(switched, original_key, "the acknowledged rotation switches");
+        assert_eq!(
+            switched,
+            listener
+                .crypto
+                .as_ref()
+                .expect("secured listener")
+                .current_key(),
+            "sender and receiver agree on the generation"
+        );
+        assert_encrypted_roundtrip(
+            &mut caller,
+            &mut listener,
+            now.add_micros(3),
+            b"after a lost request",
+        );
+
+        // A rotation nobody ever answers is abandoned after bounded retries:
+        // the session keeps running on the acknowledged key, and the next
+        // refresh cycle can still start (no wedge).
+        caller
+            .provide_new_sek(&[0x8D; 16], now.add_micros(4))
+            .expect("start another refresh");
+        let _ = take_user_defined_datagram(&mut caller, SRT_CMD_KMREQ);
+        let mut tick = now.add_micros(4);
+        for _ in 0..=KM_REQUEST_MAX_RETRIES {
+            tick = tick.add_micros(1_000_001);
+            caller.handle_timer(TimerId::Ack, tick).expect("ACK tick");
+        }
+        assert!(
+            km_security_snapshot(&caller).pending_response.is_none(),
+            "the unanswered rotation is abandoned, not held open forever"
+        );
+        assert_eq!(
+            caller
+                .crypto
+                .as_ref()
+                .expect("secured caller")
+                .current_key(),
+            switched,
+            "abandoning a rotation leaves the acknowledged key in place"
+        );
+        caller
+            .provide_new_sek(&[0x9E; 16], tick.add_micros(1))
+            .expect("the refresh cycle is not wedged by an abandoned rotation");
+        assert_encrypted_roundtrip(
+            &mut caller,
+            &mut listener,
+            tick.add_micros(2),
+            b"after an abandoned rotation",
+        );
+    }
+
     /// A connected encrypted pair sharing one passphrase.
     fn encrypted_pair(cipher_mode: CipherMode) -> (SrtConnection, SrtConnection) {
         let sek = vec![0x5Au8; 16];
@@ -8572,7 +8918,10 @@ mod tests {
         KmSecuritySnapshot {
             state: connection.state(),
             current_key: crypto.current_key(),
-            pending_response: state.pending_response.as_ref().map(KmMessage::encode),
+            pending_response: state
+                .pending
+                .as_ref()
+                .map(|pending| pending.request.encode()),
             received: encode_entries(&state.received),
             received_next: state.received.next,
             acknowledged: encode_entries(&state.acknowledged),
@@ -8715,6 +9064,20 @@ mod tests {
             panic!("KM datagram must be a control packet");
         };
         KmMessage::decode(&control.control_info).expect("valid KM message")
+    }
+
+    /// The control-information field of a UserDefined datagram: the key
+    /// material a retry must reproduce byte-for-byte. The control packet's
+    /// own timestamp is deliberately not compared -- it is the send time of
+    /// this transmission, and the peer matches duplicates on the KM message,
+    /// not on the datagram that carried it.
+    fn user_defined_control_info(datagram: &[u8]) -> Vec<u8> {
+        let SrtPacket::Control(control) =
+            SrtPacket::decode(datagram).expect("valid KM control datagram")
+        else {
+            panic!("KM datagram must be a control packet");
+        };
+        control.control_info
     }
 
     /// Send one payload and return the DATA datagram the caller put on the
