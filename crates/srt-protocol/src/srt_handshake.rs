@@ -61,12 +61,22 @@ pub const IP_UDP_HEADER_SIZE_IPV4: u32 = 28;
 /// (libsrt's `CPacket::UDP_HDR_SIZE_IPv6`: 40 + 8).
 pub const IP_UDP_HEADER_SIZE_IPV6: u32 = 48;
 
-/// Largest MSS any reference implementation accepts in a handshake.
+/// Largest peer MSS this implementation negotiates.
 ///
-/// libsrt's `CPacket::ETH_MAX_MTU_SIZE` (1500, "Ethernet II, RFC 1191").
-/// Its caller rejects a larger value with `SRT_REJ_ROGUE` before sizing any
-/// buffer from it (`CUDT::processConnectResponse`), and its listener
-/// derives its payload size from the smaller of the two peers' values.
+/// The number is libsrt's `CPacket::ETH_MAX_MTU_SIZE` (1500, "Ethernet II,
+/// RFC 1191"), which the pinned reference's *caller* enforces: it rejects a
+/// larger response MSS outright (`CUDT::processConnectResponse`). Its
+/// *listener* is more permissive -- `acceptAndRespond` takes
+/// `min(local_mss, peer_mss)` -- and `SRTO_MSS` itself can be configured
+/// above 1500 (bounded by the UDP buffers), so two libsrt peers configured
+/// with a jumbo MSS can interoperate where this implementation refuses.
+///
+/// Refusing is therefore a deliberate **local policy**, not a claim about the
+/// reference: this stack implements neither path-MTU discovery nor jumbo
+/// negotiation, so it cannot honour such a session, and it treats a value
+/// above the Ethernet MTU as an unusable handshake (`SRT_REJ_ROGUE`, the code
+/// the reference's caller uses for the same field) rather than silently
+/// clamping it the way a libsrt listener would.
 pub const MAX_PEER_MSS: u32 = 1500;
 
 /// `SRT_REJ_ROGUE`: incorrect data in handshake messages.
@@ -79,7 +89,7 @@ pub const SRT_REJ_ROGUE: i32 = 4;
 /// `SRT_REJ_FILTER`: incompatible packet filter.
 ///
 /// The reason the reference implementation refuses a filter negotiation it
-/// cannot honour (`CUDT::interpretSrtHandshake` rejects an unparseable or
+/// cannot honour (`CUDT::interpretSrtHandshake` rejects an unparsable or
 /// conflicting filter configuration with this code). A peer that sends a
 /// FILTER extension is negotiating packet-filter behaviour, not merely
 /// advertising that it could support one, so a stack without a filter
@@ -1173,94 +1183,102 @@ impl KmMessage {
     }
 
     /// Decode from a byte slice.
+    ///
+    /// Split into three steps so each stays reviewable on its own: the fixed
+    /// header is *read* (`KmHeader::decode`), its parameters are *validated*
+    /// against what this implementation accepts (`KmHeader::validate`), and
+    /// only then is the key material read.
     pub fn decode(data: &[u8]) -> Result<Self, Error> {
-        if data.len() < 16 {
+        if data.len() < KM_HEADER_LEN {
             return Err(Error::invalid_data("KM message too short"));
         }
 
         let mut buf = data;
+        let header = KmHeader::decode(&mut buf)?;
+        header.validate(buf.len())?;
 
-        // First 4 bytes.
-        let first_byte = read_u8(&mut buf)?;
+        let salt_bytes = read_bytes(&mut buf, header.salt_len)?;
+        let mut salt = [0u8; 16];
+        salt.copy_from_slice(&salt_bytes);
+        // Wrapped Key (everything remaining).
+        let wrapped_key = buf.to_vec();
+
+        Ok(Self {
+            version: header.version,
+            packet_type: header.packet_type,
+            key_flag: header.key_flag,
+            keki: header.keki,
+            cipher: header.cipher,
+            auth: header.auth,
+            stream_encapsulation: header.stream_encapsulation,
+            key_length: header.key_length,
+            salt,
+            wrapped_key,
+        })
+    }
+}
+
+/// Fixed KM header length, before salt and wrapped key.
+const KM_HEADER_LEN: usize = 16;
+
+/// The structural fields of a KM message, read but not yet validated.
+struct KmHeader {
+    version: u8,
+    packet_type: u8,
+    key_flag: KeyFlag,
+    keki: u32,
+    cipher: u8,
+    auth: u8,
+    stream_encapsulation: u8,
+    salt_len: usize,
+    key_length: KeyLength,
+}
+
+impl KmHeader {
+    /// Read the fixed 16-byte header.
+    ///
+    /// Structure only: field extraction plus the rules that make a field
+    /// *readable* at all (the reserved bit, the selector bits). Whether the
+    /// decoded values are ones this implementation accepts is
+    /// [`Self::validate`]'s business.
+    fn decode(buf: &mut &[u8]) -> Result<Self, Error> {
+        let first_byte = read_u8(buf)?;
         if first_byte & 0x80 != 0 {
             return Err(Error::invalid_data("KM reserved bit is set"));
         }
         let version = (first_byte >> 4) & 0x07;
         let packet_type = first_byte & 0x0F;
-        if version != KM_VERSION || packet_type != KM_PACKET_TYPE {
-            return Err(Error::invalid_data("unsupported KM version or packet type"));
-        }
-        let signature = read_u16(&mut buf)?;
+
+        let signature = read_u16(buf)?;
         if signature != KM_SIGNATURE {
             return Err(Error::invalid_data(format!(
                 "invalid KM signature: {signature:#06x}, expected {KM_SIGNATURE:#06x}"
             )));
         }
 
-        let kk_byte = read_u8(&mut buf)?;
+        let kk_byte = read_u8(buf)?;
         if kk_byte & !0b11 != 0 {
             return Err(Error::invalid_data("KM KK reserved bits are set"));
         }
         let key_flag = KeyFlag::from_kk_field(kk_byte)
             .ok_or_else(|| Error::invalid_data("invalid KK field"))?;
 
-        // KEKI
-        let keki = read_u32(&mut buf)?;
+        let keki = read_u32(buf)?;
+        let cipher = read_u8(buf)?;
+        let auth = read_u8(buf)?;
+        let stream_encapsulation = read_u8(buf)?;
+        let resv2 = read_u8(buf)?;
+        let resv3 = read_u16(buf)?;
+        let salt_len = read_u8(buf)? as usize * 4;
+        let key_len = read_u8(buf)? as usize * 4;
 
-        // Cipher, Auth, SE, Resv2
-        let cipher = read_u8(&mut buf)?;
-        let auth = read_u8(&mut buf)?;
-        let stream_encapsulation = read_u8(&mut buf)?;
-        let resv2 = read_u8(&mut buf)?;
-
-        // Resv3, SLen/4, KLen/4
-        let resv3 = read_u16(&mut buf)?;
-        let slen_div4 = read_u8(&mut buf)? as usize;
-        let klen_div4 = read_u8(&mut buf)? as usize;
-
-        let slen = slen_div4 * 4;
-        let klen = klen_div4 * 4;
-
-        if slen != 16 {
-            return Err(Error::invalid_data(format!(
-                "unsupported salt length: {slen}"
-            )));
-        }
-
-        let key_length = KeyLength::from_len(klen)
-            .ok_or_else(|| Error::invalid_data(format!("invalid key length: {klen}")))?;
-        if version != KM_VERSION
-            || packet_type != KM_PACKET_TYPE
-            || keki != 0
-            || !matches!(
-                (cipher, auth),
-                (cipher_type::AES_CTR, auth_type::NONE)
-                    | (cipher_type::AES_GCM, auth_type::AES_GCM)
-            )
-            || stream_encapsulation != stream_encapsulation::MPEG_TS_SRT
-            || resv2 != 0
-            || resv3 != 0
-        {
+        // Reserved fields are structural: a message that sets one is not the
+        // message this format describes, whatever its parameters say.
+        if resv2 != 0 || resv3 != 0 {
             return Err(Error::invalid_data("unsupported KM message parameters"));
         }
-        let expected_remaining = slen + key_length.len() + 8;
-        if buf.len() != expected_remaining {
-            return Err(Error::invalid_data(format!(
-                "KM message length mismatch: expected {expected_remaining} bytes after header, got {}",
-                buf.len()
-            )));
-        }
-
-        // Salt
-        if buf.len() < slen {
-            return Err(Error::invalid_data("KM message too short for salt"));
-        }
-        let salt_bytes = read_bytes(&mut buf, slen)?;
-        let mut salt = [0u8; 16];
-        salt.copy_from_slice(&salt_bytes);
-
-        // Wrapped Key (everything remaining).
-        let wrapped_key = buf.to_vec();
+        let key_length = KeyLength::from_len(key_len)
+            .ok_or_else(|| Error::invalid_data(format!("invalid key length: {key_len}")))?;
 
         Ok(Self {
             version,
@@ -1270,10 +1288,39 @@ impl KmMessage {
             cipher,
             auth,
             stream_encapsulation,
+            salt_len,
             key_length,
-            salt,
-            wrapped_key,
         })
+    }
+
+    /// Validate the decoded parameters against what this implementation
+    /// accepts, and check that the key material has the length they imply.
+    fn validate(&self, remaining: usize) -> Result<(), Error> {
+        if self.salt_len != 16 {
+            return Err(Error::invalid_data(format!(
+                "unsupported salt length: {}",
+                self.salt_len
+            )));
+        }
+        if self.version != KM_VERSION
+            || self.packet_type != KM_PACKET_TYPE
+            || self.keki != 0
+            || !matches!(
+                (self.cipher, self.auth),
+                (cipher_type::AES_CTR, auth_type::NONE)
+                    | (cipher_type::AES_GCM, auth_type::AES_GCM)
+            )
+            || self.stream_encapsulation != stream_encapsulation::MPEG_TS_SRT
+        {
+            return Err(Error::invalid_data("unsupported KM message parameters"));
+        }
+        let expected_remaining = self.salt_len + self.key_length.len() + 8;
+        if remaining != expected_remaining {
+            return Err(Error::invalid_data(format!(
+                "KM message length mismatch: expected {expected_remaining} bytes after header, got {remaining}"
+            )));
+        }
+        Ok(())
     }
 }
 
