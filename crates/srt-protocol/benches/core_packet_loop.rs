@@ -18,9 +18,14 @@ use srt_proto::{
 };
 use std::hint::black_box;
 
-/// SRT live-mode payload ceiling (`SRT_LIVE_MAX_PLSIZE` minus headers,
-/// matches this repo's `MAX_SRT_MESSAGE_PAYLOAD` in
-/// `src/media/srt/egress_engine.rs` in the application using this crate).
+/// SRT live-mode application payload: 1316 bytes = 7 x 188, the MPEG-TS
+/// packet size libsrt recommends for live mode (`srtcore/srt.h`'s
+/// `SRT_LIVE_DEF_PLSIZE`) and the workload this repo's benches, srt-bench and
+/// qualification harness all offer. It is deliberately *below* the protocol
+/// ceiling: that ceiling is `SRT_LIVE_MAX_PLSIZE` = 1456 = 1500 - UDP(28) -
+/// SRT(16), which is exactly what the handshake negotiates for a
+/// default-MSS IPv4 peer, and it matches the application crate's
+/// `MAX_SRT_MESSAGE_PAYLOAD`.
 const PAYLOAD_SIZE: usize = 1316;
 
 /// Batch sizes measured per run. 1 isolates true single-packet cost (no

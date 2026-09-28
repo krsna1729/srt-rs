@@ -173,6 +173,22 @@ pub const fn pacing_packet_size_bytes(payload_bytes: u64) -> u64 {
     srt_proto::wire::SRT_HEADER_SIZE as u64 + payload_bytes
 }
 
+/// Largest SRT datagram the negotiated handshake permits toward a peer
+/// advertising the reference default MSS on an IPv4 path.
+///
+/// The handshake's MTU field is an *IP-layer* MTU for every reference
+/// implementation, and `SrtConnection` negotiates its outbound payload down
+/// to `min(its own datagram budget, peer mss - IP/UDP overhead)`. With both
+/// peers at the reference default 1500 that is a 1472-byte SRT datagram,
+/// i.e. 1456 bytes of DATA payload -- exactly libsrt's own
+/// `mss - (UDP_HDR_SIZE + HDR_SIZE)`. This is the core's real hard limit,
+/// and it is what [`pacing_packet_size_bytes`] must be compared against;
+/// the older `DEFAULT_MTU` comparison overstated it by the IP/UDP header.
+#[must_use]
+pub const fn negotiated_srt_datagram_ceiling_bytes() -> u64 {
+    (srt_proto::handshake::DEFAULT_MTU - srt_proto::handshake::IP_UDP_HEADER_SIZE_IPV4) as u64
+}
+
 /// Encoded IPv4/UDP/SRT DATA packet size, including an optional GCM tag.
 /// `udp_ip_header_bytes` is part of the configured IP MTU budget.
 ///
@@ -1559,28 +1575,29 @@ fn add_pacing_reasons(
     derived: &DerivedLoad,
     reasons: &mut Vec<CapacityReason>,
 ) {
-    // Two different limits, because the protocol core and a real IPv4 path do
-    // not agree about what `DEFAULT_MTU` bounds.
+    // Two different limits, because the negotiated protocol budget and a real
+    // IPv4 path do not have to agree about what bounds the payload.
     //
-    // PROTOCOL TRUTH: `SrtConnection` sets
-    // `max_payload_size = DEFAULT_MTU - SRT_HEADER_SIZE`, so the core treats
-    // 1500 as the SRT datagram budget and will emit a 1484-byte payload. That
-    // is what the implementation actually enforces, so it is the hard limit.
+    // PROTOCOL TRUTH: the handshake's MTU field is an IP-layer MTU, so
+    // `SrtConnection` negotiates its outbound payload down to
+    // `min(DEFAULT_MTU, peer mss - IP/UDP overhead) - SRT_HEADER_SIZE`; with
+    // both peers at the reference default that is 1456 payload bytes. That is
+    // what the implementation actually enforces, so it is the hard limit.
     //
-    // DEPLOYMENT ENVELOPE: on a real 1500-byte IPv4 path the datagram also
-    // carries IP and UDP headers, and an encrypted DATA packet carries the GCM
-    // tag, so the same payload can exceed the path MTU and fragment. That is a
-    // property of the deployment, not of this implementation, so it is
+    // DEPLOYMENT ENVELOPE: an encrypted DATA packet also carries the GCM tag,
+    // and a non-IPv4 path carries a larger IP/UDP header, so a
+    // protocol-legal payload can still exceed the path MTU and fragment. That
+    // is a property of the deployment, not of this implementation, so it is
     // reported separately and must not be called protocol truth.
-    // PROTOCOL TRUTH, and deliberately tag-free: `SrtConnection` sets
-    // `max_payload_size = DEFAULT_MTU - SRT_HEADER_SIZE` regardless of cipher
-    // mode, and GCM appends its tag AFTER that limit has been applied. So the
-    // core accepts 1484 plaintext bytes even under GCM. Including the tag here
-    // claimed the protocol maximum was 1468 and could raise a false hard
-    // ExceedsEnvelope. The tag still belongs in the IPv4 envelope below and in
-    // all wire-rate accounting.
+    //
+    // PROTOCOL TRUTH, and deliberately tag-free: `apply_peer_mss` sets
+    // `max_payload_size` from the negotiated MSS regardless of cipher mode,
+    // and GCM appends its tag AFTER that limit has been applied. Including
+    // the tag here claimed the protocol maximum was smaller than it is and
+    // could raise a false hard ExceedsEnvelope. The tag still belongs in the
+    // IPv4 envelope below and in all wire-rate accounting.
     if pacing_packet_size_bytes(input.workload.payload_bytes)
-        > srt_proto::handshake::DEFAULT_MTU as u64
+        > negotiated_srt_datagram_ceiling_bytes()
     {
         reasons.push(CapacityReason::PayloadExceedsProtocolMtu);
     }
