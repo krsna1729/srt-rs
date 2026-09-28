@@ -3187,10 +3187,11 @@ impl SrtConnection {
                     return Err(self
                         .fail_caller_handshake("KMRSP does not match the caller's pending KMREQ"));
                 }
-                let state = self
-                    .km_control
-                    .as_mut()
-                    .expect("encrypted caller has KM transaction state");
+                let Some(state) = self.km_control.as_mut() else {
+                    return Err(self.fail_caller_handshake(
+                        "caller has no KM transaction state for the KMRSP",
+                    ));
+                };
                 state.pending_response = None;
                 state.acknowledged.remember(response);
                 Ok(())
@@ -3329,8 +3330,14 @@ impl SrtConnection {
                     ));
                 }
             };
+            // The handshake KMREQ is the session's first received key
+            // message, so it seeds the replay history here -- where both the
+            // context and its transaction state are constructed -- rather
+            // than at completion, which has no fallible step left to guard.
+            let mut km_control = KmControlState::default();
+            km_control.received.remember(km.clone());
             self.crypto = Some(Box::new(crypto));
-            self.km_control = Some(Box::new(KmControlState::default()));
+            self.km_control = Some(Box::new(km_control));
             self.received_km = Some(Box::new(km));
         } else if hs.get_km_request().is_some() {
             return Err(self.fail_listener_km(
@@ -3351,13 +3358,10 @@ impl SrtConnection {
         // The session clock was stamped at INDUCTION, so this response's
         // timestamp lets the caller derive the initial TSBPD time base.
         self.send_conclusion_response(now);
-        if let Some(message) = self.received_km.take() {
-            self.km_control
-                .as_mut()
-                .expect("encrypted listener has KM transaction state")
-                .received
-                .remember(*message);
-        }
+        // The KMREQ was already recorded into the replay history when the
+        // context was constructed; here it is only released, since the
+        // response has echoed it.
+        self.received_km = None;
         self.handshake_state = HandshakeState::Completed;
         self.handshake_started_at = None;
         self.set_state(ConnectionState::Connected);
@@ -3689,31 +3693,33 @@ impl SrtConnection {
                     return Ok(());
                 }
 
-                let state = self
+                if self
                     .km_control
                     .as_ref()
-                    .ok_or_else(|| Error::invalid_state("encrypted connection has no KM state"))?;
-                if state.received.contains(&km) {
+                    .is_some_and(|state| state.received.contains(&km))
+                {
                     return Err(Error::invalid_data("stale or replayed KMREQ"));
                 }
 
-                let crypto = self.crypto.as_ref().expect("checked above");
-                if !km_matches_context(&km, crypto) || km.key_flag != crypto.current_key().other() {
+                let consistent = self.crypto.as_ref().is_some_and(|crypto| {
+                    km_matches_context(&km, crypto) && km.key_flag == crypto.current_key().other()
+                });
+                if !consistent {
                     return Err(Error::invalid_data(
                         "KMREQ does not match the secured session's next generation",
                     ));
                 }
 
-                self.crypto
-                    .as_mut()
-                    .expect("checked above")
-                    .update_sek(&km.wrapped_key, km.key_flag)?;
+                let Some(crypto) = self.crypto.as_mut() else {
+                    return Err(Error::invalid_state(
+                        "encrypted connection lost its crypto context",
+                    ));
+                };
+                crypto.update_sek(&km.wrapped_key, km.key_flag)?;
                 self.send_km_response(&km, now);
-                self.km_control
-                    .as_mut()
-                    .expect("checked above")
-                    .received
-                    .remember(km);
+                if let Some(state) = self.km_control.as_mut() {
+                    state.received.remember(km);
+                }
             }
             SRT_CMD_KMRSP => {
                 let km = KmMessage::decode(&pkt.control_info)?;

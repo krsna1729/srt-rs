@@ -915,8 +915,10 @@ fn validate_extension_data(ext_type: ExtensionType, data: &[u8]) -> Result<(), E
         }
         ExtensionType::KmReq => KmMessage::decode(data).map(|_| ()),
         ExtensionType::KmRsp if data.len() == 4 => {
-            let code = u32::from_le_bytes(data.try_into().expect("length checked"));
-            KmError::from_u32(code)
+            let Ok(code) = <[u8; 4]>::try_from(data) else {
+                return Err(Error::invalid_data("KMRSP error payload must be 4 bytes"));
+            };
+            KmError::from_u32(u32::from_le_bytes(code))
                 .map(|_| ())
                 .ok_or_else(|| Error::invalid_data("unknown KMRSP error code"))
         }
