@@ -183,14 +183,16 @@ pub mod advanced {
     /// Native I/O and wait primitives for custom event-loop owners.
     pub mod native_io {
         pub use super::super::batch::{
-            BatchIoStats, RecvBatch, RecvDrainReport, SendFlushReport, apply_send_result,
-            drain_recv_fd, flush_destined,
+            BatchIoStats, BytesRecvBatch, RecvBatch, RecvDrainReport, SendFlushReport,
+            apply_send_result, drain_recv_fd, drain_recv_fd_bytes, flush_destined,
         };
         pub use super::super::high_res_waiter::{
             HighResWaiter, MAX_WAITER_KEYS, MonotonicDeadline, PlannedWait, WaitBackend,
             WaitOutcome, deadline_from_wait, plan_wait,
         };
-        pub use super::super::socket_io::{recvmsg_batch, sendmsg_batch, sendmsg_connected_batch};
+        pub use super::super::socket_io::{
+            recvmsg_batch, recvmsg_batch_into, sendmsg_batch, sendmsg_connected_batch,
+        };
     }
 
     /// Platform and socket deployment helpers.

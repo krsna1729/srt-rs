@@ -1491,8 +1491,25 @@ impl SrtConnection {
         if buf.len() < SRT_HEADER_SIZE {
             return Err(Error::insufficient_buffer());
         }
-
         let packet = SrtPacket::decode(buf)?;
+        self.feed_decoded(packet, now)
+    }
+
+    /// Process a received datagram the caller already owns as `Bytes`: a
+    /// DATA payload is a zero-copy slice of `buf` instead of a fresh copy.
+    /// For receive paths that land datagrams in refcounted buffers
+    /// (`BytesRecvBatch` in srt-transport). The payload keeps `buf`'s
+    /// allocation alive until it is delivered and dropped.
+    pub fn feed_recv_bytes(&mut self, buf: Bytes, now: Timestamp) -> Result<(), Error> {
+        self.check_output_queue()?;
+        if buf.len() < SRT_HEADER_SIZE {
+            return Err(Error::insufficient_buffer());
+        }
+        let packet = SrtPacket::decode_bytes(&buf)?;
+        self.feed_decoded(packet, now)
+    }
+
+    fn feed_decoded(&mut self, packet: SrtPacket, now: Timestamp) -> Result<(), Error> {
         let (dest_socket_id, is_handshake) = match &packet {
             SrtPacket::Data(packet) => (packet.dest_socket_id, false),
             SrtPacket::Control(packet) => (

@@ -27,6 +27,9 @@ libc = "0.2"
 # to also pull in socket2/all (e.g. mio).
 socket2 = { version = "0.6", features = ["all"] }
 getrandom = "0.4"
+# `BytesRecvBatch`: datagrams received straight into refcounted chunks, so a
+# DATA payload is a zero-copy slice (`SrtConnection::feed_recv_bytes`).
+bytes = "1"
 zeroize = "1.8"
 
 # Runtime-specific dependencies (optional, feature-gated)
