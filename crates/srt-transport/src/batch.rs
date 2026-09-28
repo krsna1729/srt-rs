@@ -64,6 +64,12 @@ impl RecvBatch {
         self.bufs.len()
     }
 
+    /// Bytes each receive slot holds; a longer datagram is truncated.
+    #[must_use]
+    pub fn slot_len(&self) -> usize {
+        self.bufs.first().map_or(0, Vec::len)
+    }
+
     /// One `recvmmsg`, asking the kernel for at most `limit` datagrams
     /// (further capped to this batch's capacity) rather than always the
     /// full capacity -- so a caller enforcing a remaining budget of, say,

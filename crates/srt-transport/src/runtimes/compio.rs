@@ -1330,6 +1330,10 @@ pub struct ListenerSide {
     pending_rx: Option<(SocketAddr, usize)>,
     /// Persistent staging slot. ALWAYS `DEFAULT_RX_SLOT_SIZE`.
     stage_buf: Vec<u8>,
+    /// Raw-readiness batch receive: one `recvmmsg` for up to
+    /// `RecvBatch::DEFAULT_CAPACITY` datagrams instead of one `recvfrom`
+    /// each. Preallocated; no per-call allocation.
+    rx_batch: crate::RecvBatch,
     /// Application admission policy (see [`crate::ListenerAdmissionResolver`]),
     /// stored once per listener. Both receive paths reach it through
     /// [`admit_listener_datagram`] and nowhere else.
@@ -1398,6 +1402,16 @@ impl ListenerSide {
             poll_fd,
             pending_rx: None,
             stage_buf: vec![0u8; DEFAULT_RX_SLOT_SIZE],
+            // Production passes the wire-ceiling slot; the test/bench
+            // constructor passes 0 and keeps the old 64 KiB acceptance.
+            rx_batch: crate::RecvBatch::with_capacity(
+                crate::RecvBatch::DEFAULT_CAPACITY,
+                if managed_slot_len == 0 {
+                    DEFAULT_RX_SLOT_SIZE
+                } else {
+                    managed_slot_len
+                },
+            ),
             resolver: None,
         };
         if rx_mode == OwnerRxMode::ManagedMultishot {
@@ -4450,8 +4464,52 @@ impl Owner {
             listener.pending_rx = None;
         }
 
-        // 2. Drain from the socket. Zero heap allocations on this path: both
-        // persistent slots are preallocated and never resized.
+        // 2. Drain in `recvmmsg` batches while a whole batch fits the budget:
+        // every slot holds at most the wire-ceiling slot length (the same
+        // slot managed RX uses), so asking for `remaining_bytes / slot`
+        // datagrams can never overshoot the byte cap. A larger datagram is
+        // truncated and skipped, as managed RX does. Zero heap allocations:
+        // the batch is preallocated.
+        {
+            use std::os::fd::AsRawFd;
+            let raw_fd = compio::net::UdpSocket::as_raw_fd(&listener.sock);
+            let slot = listener.rx_batch.slot_len();
+            loop {
+                let by_packets = budget.max_rx_packets.saturating_sub(report.rx_packets);
+                let by_bytes = budget.max_rx_bytes.saturating_sub(report.rx_bytes) / slot;
+                let requested = by_packets.min(by_bytes).min(listener.rx_batch.capacity());
+                if requested == 0 {
+                    break;
+                }
+                let Ok(received) = listener.rx_batch.recv(raw_fd, requested) else {
+                    return;
+                };
+                for (peer, datagram, truncated) in listener.rx_batch.iter(received) {
+                    let (Some(peer), false) = (peer, truncated) else {
+                        continue;
+                    };
+                    report.rx_packets += 1;
+                    report.rx_bytes += datagram.len();
+                    admit_listener_datagram(
+                        &mut listener.table,
+                        listener.resolver.as_ref(),
+                        &listener.options,
+                        &listener.telemetry,
+                        peer,
+                        datagram,
+                        now,
+                    );
+                }
+                if received < requested {
+                    // Socket drained.
+                    return;
+                }
+            }
+        }
+
+        // 3. Budget tail smaller than one slot: single datagrams, staging one
+        // that would cross the byte cap. Zero heap allocations on this path:
+        // both persistent slots are preallocated and never resized.
         while report.rx_packets < budget.max_rx_packets && report.rx_bytes < budget.max_rx_bytes {
             use std::os::fd::AsRawFd;
             let raw_fd = compio::net::UdpSocket::as_raw_fd(&listener.sock);
