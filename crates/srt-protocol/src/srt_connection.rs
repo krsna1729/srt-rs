@@ -3740,88 +3740,99 @@ impl SrtConnection {
     /// Process a UserDefined packet (KM Refresh).
     fn handle_user_defined(&mut self, pkt: ControlPacket, now: Timestamp) -> Result<(), Error> {
         match pkt.subtype {
-            SRT_CMD_KMREQ => {
-                let km = KmMessage::decode(&pkt.control_info)?;
-
-                if self.crypto.is_none() {
-                    // A refresh KMREQ on an unencrypted connection cannot
-                    // succeed. Reply immediately rather than leaving the peer
-                    // to wait for its own timeout (spec §3.2.1.2).
-                    self.send_km_error_response(KmError::NoSecret, now);
-                    return Ok(());
-                }
-
-                // A retransmitted KMREQ is a legitimate retry, not an attack:
-                // the peer is still waiting for the response to *this*
-                // rotation (its own retry, or a lost KMRSP). Answer it again
-                // without installing anything -- re-installing would be a
-                // no-op at best and a key rollback at worst. Only an older
-                // generation is stale, and that is rejected below.
-                let is_current_retry = self
-                    .km_control
-                    .as_ref()
-                    .and_then(|state| state.last_received.as_ref())
-                    .is_some_and(|last| last == &km);
-                if is_current_retry {
-                    self.send_km_response(&km, now);
-                    return Ok(());
-                }
-
-                if self
-                    .km_control
-                    .as_ref()
-                    .is_some_and(|state| state.received.contains(&km))
-                {
-                    return Err(Error::invalid_data("stale or replayed KMREQ"));
-                }
-
-                let consistent = self.crypto.as_ref().is_some_and(|crypto| {
-                    km_matches_context(&km, crypto) && km.key_flag == crypto.current_key().other()
-                });
-                if !consistent {
-                    return Err(Error::invalid_data(
-                        "KMREQ does not match the secured session's next generation",
-                    ));
-                }
-
-                let Some(crypto) = self.crypto.as_mut() else {
-                    return Err(Error::invalid_state(
-                        "encrypted connection lost its crypto context",
-                    ));
-                };
-                crypto.update_sek(&km.wrapped_key, km.key_flag)?;
-                self.send_km_response(&km, now);
-                if let Some(state) = self.km_control.as_mut() {
-                    state.received.remember(km.clone());
-                    state.last_received = Some(km);
-                }
-            }
-            SRT_CMD_KMRSP => {
-                let km = KmMessage::decode(&pkt.control_info)?;
-                let state = self
-                    .km_control
-                    .as_mut()
-                    .ok_or_else(|| Error::invalid_data("unsolicited KMRSP"))?;
-                if state.acknowledged.contains(&km) {
-                    return Err(Error::invalid_data("stale or replayed KMRSP"));
-                }
-                if state
-                    .pending
-                    .as_ref()
-                    .is_none_or(|pending| pending.request != km)
-                {
-                    return Err(Error::invalid_data(
-                        "KMRSP does not acknowledge the pending KMREQ",
-                    ));
-                }
-                state.pending = None;
-                state.acknowledged.remember(km);
-            }
+            SRT_CMD_KMREQ => self.handle_km_request(&pkt.control_info, now),
+            SRT_CMD_KMRSP => self.handle_km_response(&pkt.control_info),
             _ => {
                 // Ignore unknown UserDefined packets.
+                Ok(())
             }
         }
+    }
 
+    /// A peer's key-material request (receiver side).
+    ///
+    /// Three outcomes, and the distinction matters: a *new* valid request is
+    /// installed once and answered; an exact duplicate of the current request
+    /// is answered again **without** installing anything (the peer is
+    /// retrying because its response was lost, not attacking); and an older
+    /// generation fails closed with no state or liveness change.
+    fn handle_km_request(&mut self, control_info: &[u8], now: Timestamp) -> Result<(), Error> {
+        let km = KmMessage::decode(control_info)?;
+
+        if self.crypto.is_none() {
+            // A refresh KMREQ on an unencrypted connection cannot succeed.
+            // Reply immediately rather than leaving the peer to wait for its
+            // own timeout (spec §3.2.1.2).
+            self.send_km_error_response(KmError::NoSecret, now);
+            return Ok(());
+        }
+
+        let is_current_retry = self
+            .km_control
+            .as_ref()
+            .and_then(|state| state.last_received.as_ref())
+            .is_some_and(|last| last == &km);
+        if is_current_retry {
+            self.send_km_response(&km, now);
+            return Ok(());
+        }
+
+        if self
+            .km_control
+            .as_ref()
+            .is_some_and(|state| state.received.contains(&km))
+        {
+            return Err(Error::invalid_data("stale or replayed KMREQ"));
+        }
+
+        let consistent = self.crypto.as_ref().is_some_and(|crypto| {
+            km_matches_context(&km, crypto) && km.key_flag == crypto.current_key().other()
+        });
+        if !consistent {
+            return Err(Error::invalid_data(
+                "KMREQ does not match the secured session's next generation",
+            ));
+        }
+
+        let Some(crypto) = self.crypto.as_mut() else {
+            return Err(Error::invalid_state(
+                "encrypted connection lost its crypto context",
+            ));
+        };
+        crypto.update_sek(&km.wrapped_key, km.key_flag)?;
+        self.send_km_response(&km, now);
+        if let Some(state) = self.km_control.as_mut() {
+            state.received.remember(km.clone());
+            state.last_received = Some(km);
+        }
+        Ok(())
+    }
+
+    /// A peer's acknowledgement of this connection's rotation (sender side).
+    ///
+    /// Only the exact request that is outstanding completes the transaction:
+    /// a duplicate acknowledgement is stale, and one for a different
+    /// generation does not prove the peer installed *this* key.
+    fn handle_km_response(&mut self, control_info: &[u8]) -> Result<(), Error> {
+        let km = KmMessage::decode(control_info)?;
+        let state = self
+            .km_control
+            .as_mut()
+            .ok_or_else(|| Error::invalid_data("unsolicited KMRSP"))?;
+        if state.acknowledged.contains(&km) {
+            return Err(Error::invalid_data("stale or replayed KMRSP"));
+        }
+        if state
+            .pending
+            .as_ref()
+            .is_none_or(|pending| pending.request != km)
+        {
+            return Err(Error::invalid_data(
+                "KMRSP does not acknowledge the pending KMREQ",
+            ));
+        }
+        state.pending = None;
+        state.acknowledged.remember(km);
         Ok(())
     }
 
