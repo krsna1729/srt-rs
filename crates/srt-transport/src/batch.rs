@@ -1271,7 +1271,9 @@ mod tests {
         receiver.set_nonblocking(true).expect("nonblocking");
         let dest = receiver.local_addr().expect("addr");
         let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("sender");
-        sender.send_to(&[0xA5; 65], dest).expect("oversized for a 64-byte slot");
+        sender
+            .send_to(&[0xA5; 65], dest)
+            .expect("oversized for a 64-byte slot");
         for i in 0..5u8 {
             sender.send_to(&[i], dest).expect("send");
         }
@@ -1290,10 +1292,11 @@ mod tests {
         assert_eq!(got, [0, 1]);
 
         let mut rest = Vec::new();
+        let capacity = batch.capacity();
         drain_recv_fd_bytes(
             receiver.as_raw_fd(),
             &mut batch,
-            RecvBudget::for_datagrams(16, batch.capacity()),
+            RecvBudget::for_datagrams(16, capacity),
             |_, datagram| rest.push(datagram[0]),
         )
         .expect("drain rest");
