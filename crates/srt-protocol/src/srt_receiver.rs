@@ -2706,6 +2706,47 @@ mod tests {
         assert_eq!(ack.ack_seq, 1002);
     }
 
+    #[test]
+    fn ack_numbers_keep_all_32_bits_across_the_high_bit_and_wrap() {
+        let mut receiver = ReceiverBuffer::new(1000, 120, Timestamp::from_micros(0), 0);
+        receiver.set_tsbpd_enabled(false);
+        receiver.ack_number = 0x7FFF_FFFD;
+
+        for (index, expected) in [
+            0x7FFF_FFFE,
+            0x7FFF_FFFF,
+            0x8000_0000,
+            0xFFFF_FFFE,
+            0xFFFF_FFFF,
+            0,
+            1,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if expected == 0xFFFF_FFFE {
+                receiver.ack_number = 0xFFFF_FFFD;
+            }
+            let now = Timestamp::from_micros(10_000 + index as u64 * 10_000);
+            let ack = receiver.generate_ack_inner(now, true);
+            assert!(!ack.is_light);
+            assert_eq!(receiver.ack_number(), expected);
+
+            // The ACK number is not a DATA sequence. Its high bit remains
+            // part of ACKACK identity, even though the cumulative position
+            // stays in the 31-bit DATA sequence space.
+            assert_eq!(ack.ack_seq, 1000);
+            if expected & 0x8000_0000 != 0 {
+                receiver.handle_ackack(expected & 0x7FFF_FFFF, 0, now.add_micros(1_000));
+                assert_ne!(receiver.last_ackacked_number, Some(expected));
+            }
+            if expected != 0 {
+                receiver.handle_ackack(expected, 0, now.add_micros(2_000));
+                assert_eq!(receiver.last_ackacked_number, Some(expected));
+            }
+        }
+    }
+
     /// Spec §4.8.1: after an ACKACK confirms the current position, periodic
     /// ACK generation is suppressed until the position or the advertised
     /// buffer space changes. Mirrors libsrt's `m_iRcvLastAckAck == ack`
