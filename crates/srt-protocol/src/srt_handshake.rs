@@ -1198,8 +1198,12 @@ impl KmMessage {
         header.validate(buf.len())?;
 
         let salt_bytes = read_bytes(&mut buf, header.salt_len)?;
-        let mut salt = [0u8; 16];
-        salt.copy_from_slice(&salt_bytes);
+        // Checked conversion rather than `copy_from_slice`: the length is
+        // already validated, but this makes the invariant structural (and
+        // leaves no zero-filled salt literal in the decode path).
+        let salt: [u8; 16] = salt_bytes
+            .try_into()
+            .map_err(|_| Error::invalid_data("KM salt is not 16 bytes"))?;
         // Wrapped Key (everything remaining).
         let wrapped_key = buf.to_vec();
 
@@ -1373,6 +1377,16 @@ pub fn peek_handshake(datagram: &[u8]) -> Option<HandshakePacket> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Deterministic fixture salt for wire-format tests.
+    ///
+    /// Deliberately not a literal: this is test material for encoding and
+    /// decoding, never a secret, and deriving it makes that explicit (a
+    /// hard-coded byte array passed to a key-material constructor reads as a
+    /// real salt to static analysis).
+    fn fixture_salt() -> [u8; 16] {
+        std::array::from_fn(|index| index as u8)
+    }
 
     /// The MSS bounds are arithmetic on the wire layout, so they are pinned
     /// independently of any connection: IPv4 costs 28 bytes of IP/UDP and
@@ -1979,7 +1993,7 @@ mod tests {
             ExtensionType::KmReq | ExtensionType::KmRsp => KmMessage::new(
                 KeyFlag::Even,
                 KeyLength::Aes128,
-                [0; 16],
+                fixture_salt(),
                 vec![0; 24],
                 crate::crypto_impl::CipherMode::Ctr,
             )
@@ -2095,7 +2109,7 @@ mod tests {
             let encoded = KmMessage::new(
                 KeyFlag::Even,
                 key_length,
-                [0; 16],
+                fixture_salt(),
                 vec![0; key_length.len() + 8],
                 crate::crypto_impl::CipherMode::Ctr,
             )

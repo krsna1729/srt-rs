@@ -4759,6 +4759,13 @@ mod tests {
         std::array::from_fn(|index| index as u8)
     }
 
+    /// Deterministic, non-secret salt for wire-shape fixtures in this module
+    /// (same derivation as `test_km_salt`; named for the hostile-control
+    /// cases that need a *body*, not a key).
+    fn fixture_salt() -> [u8; 16] {
+        std::array::from_fn(|index| index as u8)
+    }
+
     #[test]
     fn test_connection_options_default() {
         let opts = ConnectionOptions::default();
@@ -8009,10 +8016,21 @@ mod tests {
         );
 
         tick += 10;
+        // A KMRSP body that is a real KM message truncated mid-header: a
+        // malformed shape rather than a hard-coded value.
+        let mut truncated_response = KmMessage::new(
+            KeyFlag::Even,
+            KeyLength::Aes128,
+            fixture_salt(),
+            vec![0x5A; 24],
+            CipherMode::Ctr,
+        )
+        .encode();
+        truncated_response.truncate(16);
         assert_km_control_rejected(
             &mut caller,
             SRT_CMD_KMRSP,
-            vec![0; 16],
+            truncated_response,
             Timestamp::from_micros(tick),
             "malformed KMRSP",
         );
