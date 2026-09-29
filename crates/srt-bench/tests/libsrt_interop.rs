@@ -1275,11 +1275,13 @@ fn rust_live_caller_refreshes_key_with_libsrt_listener() {
         "Rust caller never connected: {:?}",
         result.events
     );
+    // libsrt may finish its output and send SHUTDOWN during the driver's
+    // post-connect linger; the payload assertion below checks completion.
     assert!(
-        result
-            .events
-            .iter()
-            .all(|event| !event.starts_with("Error:") && !event.starts_with("Disconnected:")),
+        result.events.iter().all(|event| {
+            !event.starts_with("Error:")
+                && (!event.starts_with("Disconnected:") || event == "Disconnected: peer shutdown")
+        }),
         "Rust caller reported a protocol failure: {:?}",
         result.events
     );

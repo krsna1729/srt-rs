@@ -884,18 +884,15 @@ impl CryptoContext {
         Ok((new_key_flag, wrapped_sek))
     }
 
-    /// Abandon a pre-announced rotation the peer never acknowledged.
+    /// Discard an unacknowledged rotation after the connection has closed.
     ///
-    /// The announced key is discarded (its slot zeroed and its schedules
-    /// dropped) and the context returns to `Idle`, so the refresh cycle can
-    /// start again with fresh key material. The *current* key is untouched:
-    /// a rotation that was never confirmed must not change what this side
-    /// encrypts with, and must not leave the context announcing a key the
-    /// peer does not have.
+    /// A missing response does not establish that the peer lacks this key.
+    /// Therefore callers must stop using the connection before discarding it.
+    /// This zeroes the announced slot and drops its schedules; the current
+    /// key remains untouched until the context is dropped.
     ///
-    /// `key_flag` is the abandoned rotation's flag (`PendingKmRequest`'s own
-    /// record of it); a flag that is no longer the announced one is ignored,
-    /// so a late call cannot discard a rotation that has since moved on.
+    /// `key_flag` identifies the pending rotation. A flag that is no longer
+    /// announced is ignored so a late call cannot discard a newer rotation.
     pub fn abandon_pre_announce(&mut self, key_flag: KeyFlag) {
         if self.next_key != Some(key_flag) {
             return;

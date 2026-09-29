@@ -80,11 +80,15 @@ pub enum IpFamily {
 }
 
 impl IpFamily {
-    /// Family of a socket address. An IPv4-mapped IPv6 address counts as
-    /// IPv6: the datagrams really carry an IPv6 header on that socket.
+    /// Classify a socket address by the IP header used for its datagrams.
+    /// An IPv4-mapped IPv6 address on a dual-stack socket represents an IPv4
+    /// peer and therefore uses the IPv4 overhead.
     pub fn of(address: &std::net::SocketAddr) -> Self {
         match address {
             std::net::SocketAddr::V4(_) => Self::V4,
+            std::net::SocketAddr::V6(address) if address.ip().to_ipv4_mapped().is_some() => {
+                Self::V4
+            }
             std::net::SocketAddr::V6(_) => Self::V6,
         }
     }
@@ -122,6 +126,10 @@ pub const MAX_PEER_MSS: u32 = 1500;
 /// exactly the two MSS violations below -- a peer MSS below the family's
 /// minimum and one above [`MAX_PEER_MSS`].
 pub const SRT_REJ_ROGUE: i32 = 4;
+/// `SRT_REJ_VERSION`: peer does not meet this implementation's minimum SRT
+/// version. Zero-based `SRT_REJECT_REASON` value; wire handshakes carry it as
+/// `1000 + reason`.
+pub const SRT_REJ_VERSION: i32 = 8;
 
 /// `SRT_REJ_FILTER`: incompatible packet filter.
 ///
@@ -740,10 +748,11 @@ impl HandshakePacket {
         self.extension_field |= extension_flags::CONFIG;
     }
 
-    /// Read the first valid libsrt-compatible GROUP extension.
+    /// Read the first valid libsrt-compatible GROUP extension. Later words
+    /// are reserved for future group metadata and do not hide the first two.
     pub fn get_group_extension(&self) -> Option<GroupExtensionData> {
         for extension in &self.extensions {
-            if extension.ext_type != ExtensionType::Group || extension.data.len() != 8 {
+            if extension.ext_type != ExtensionType::Group || extension.data.len() < 8 {
                 continue;
             }
 
@@ -1006,8 +1015,8 @@ fn validate_extension_data(ext_type: ExtensionType, data: &[u8]) -> Result<(), E
                 .ok_or_else(|| Error::invalid_data("unknown KMRSP error code"))
         }
         ExtensionType::KmRsp => KmMessage::decode(data).map(|_| ()),
-        ExtensionType::Group if data.len() != 8 => Err(Error::invalid_data(
-            "GROUP extension must be exactly 8 bytes",
+        ExtensionType::Group if data.len() < 8 => Err(Error::invalid_data(
+            "GROUP extension must be at least 8 bytes",
         )),
         ExtensionType::Sid | ExtensionType::Congestion | ExtensionType::Filter
             if data.len() > 512 =>
@@ -1459,6 +1468,35 @@ mod tests {
     /// real salt to static analysis).
     fn fixture_salt() -> [u8; 16] {
         std::array::from_fn(|index| index as u8)
+    }
+
+    #[test]
+    fn ip_family_uses_ipv4_overhead_for_ipv4_mapped_peers() {
+        let mapped = std::net::SocketAddr::new(
+            std::net::IpAddr::V6(std::net::Ipv4Addr::new(192, 0, 2, 1).to_ipv6_mapped()),
+            9000,
+        );
+        assert_eq!(IpFamily::of(&mapped), IpFamily::V4);
+        assert_eq!(
+            conclusion_with_hs().peer_max_payload_size(IpFamily::of(&mapped)),
+            1456
+        );
+
+        let native_v6 =
+            std::net::SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 9000);
+        let mut minimum = conclusion_with_hs();
+        minimum.mtu = 52;
+        assert_eq!(minimum.peer_max_payload_size(IpFamily::of(&mapped)), 8);
+        assert!(
+            minimum
+                .peer_mss_rejection_reason(IpFamily::of(&mapped), 8)
+                .is_none()
+        );
+        assert!(
+            minimum
+                .peer_mss_rejection_reason(IpFamily::of(&native_v6), 8)
+                .is_some()
+        );
     }
 
     /// The MSS bounds are arithmetic on the wire layout, so they are pinned
@@ -2055,6 +2093,27 @@ mod tests {
                 .map(|extension| extension.data.as_slice()),
             Some(&[0x40, 0x00, 0x12, 0x34, 0x01, 0x00, 0x00, 0xC8][..])
         );
+    }
+
+    #[test]
+    fn group_extension_ignores_trailing_words_without_losing_membership() {
+        let mut hs = conclusion_with_hs();
+        let group = GroupExtensionData {
+            group_id: SRTGROUP_MASK | 42,
+            group_type: GroupType::Backup,
+            flags: 1,
+            weight: 7,
+        };
+        hs.add_group_extension(group);
+        hs.extensions
+            .last_mut()
+            .expect("GROUP was appended")
+            .data
+            .extend_from_slice(&[1, 2, 3, 4]);
+
+        let decoded = HandshakePacket::decode(&hs.encode(0, 0))
+            .expect("a word-aligned extended GROUP must decode");
+        assert_eq!(decoded.get_group_extension(), Some(group));
     }
 
     #[test]

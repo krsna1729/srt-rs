@@ -1735,12 +1735,7 @@ impl PeerTable {
         feed: AdmissionFeedResult,
         telemetry: &IngressTelemetry,
     ) -> Admit {
-        if conclusion.is_some()
-            && matches!(
-                feed.feed_error_kind,
-                Some(srt_proto::ErrorKind::CryptoError | srt_proto::ErrorKind::HandshakeRejected)
-            )
-        {
+        if conclusion.is_some() && feed.feed_error_kind == Some(srt_proto::ErrorKind::CryptoError) {
             telemetry.record_credential_failure();
         }
         telemetry.record_invalid_datagram();

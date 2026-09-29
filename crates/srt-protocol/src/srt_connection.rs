@@ -17,7 +17,7 @@ use crate::sender_rto::RtoArm;
 use crate::srt_handshake::{
     DEFAULT_FLOW_WINDOW, DEFAULT_MTU, GroupExtensionData, HS_VERSION_5, HandshakePacket,
     HandshakeState, HandshakeType, IpFamily, KmError, KmMessage, MAX_FLOW_WINDOW, SRT_MAGIC_CODE,
-    SRT_REJ_FILTER, SRT_REJ_ROGUE, srt_flags,
+    SRT_REJ_FILTER, SRT_REJ_ROGUE, SRT_REJ_VERSION, srt_flags,
 };
 use crate::srt_packet::{
     ControlPacket, ControlType, DataHeader, DataPacket, DatagramClass, PendingData,
@@ -146,6 +146,11 @@ pub const DEFAULT_HANDSHAKE_TIMEOUT_MICROS: u64 = 3_000_000;
 /// this are clamped up during construction, so it is the effective floor a
 /// deployment planner must model, not merely an internal guard.
 pub const MIN_FLOW_WINDOW_PACKETS: u32 = 32;
+
+// HSv5 requires SRT 1.3.0 or newer. The peer flow-window field is signed
+// 32-bit and must advertise at least two packets.
+const MIN_HSV5_SRT_VERSION: u32 = 0x010300;
+const MIN_PEER_FLOW_WINDOW: u32 = 2;
 
 /// libsrt-compatible zero padding (4 bytes).
 ///
@@ -595,10 +600,9 @@ impl KmHistory {
 
 /// Bounded retries for a key-material request the peer has not acknowledged.
 ///
-/// A rotation is not complete until the peer confirms it installed the new
-/// key: the sender must not switch to a key the receiver never received. The
-/// transaction is therefore retried a bounded number of times and then
-/// abandoned (see `abandon_pre_announce`) rather than retried forever.
+/// A timeout does not prove the peer never installed the key: after bounded
+/// retries the connection closes instead of discarding a possibly-live key
+/// and silently continuing with mismatched encryption state.
 const KM_REQUEST_MAX_RETRIES: u8 = 4;
 
 /// Retry cadence for an unacknowledged key-material request. libsrt's own
@@ -625,8 +629,8 @@ struct PendingKmRequest {
 enum KmRetryAction {
     /// Retransmit this exact request.
     Resend(KmMessage),
-    /// Give up on the rotation announced under this key flag.
-    Abandon(KeyFlag),
+    /// Close when the peer's installed key is uncertain.
+    Close(KeyFlag),
 }
 
 /// Post-handshake KM request/response transaction state.
@@ -1552,6 +1556,10 @@ impl SrtConnection {
     /// the same way): our own value bounds the memory and retransmit span we
     /// commit to, and the peer's value bounds what the peer can actually
     /// accept before its receive buffer fills.
+    fn peer_flow_window_is_usable(flow_window: u32) -> bool {
+        (MIN_PEER_FLOW_WINDOW..=i32::MAX as u32).contains(&flow_window)
+    }
+
     fn negotiated_flow_window(&self) -> u32 {
         if self.peer_flow_window >= 2 {
             self.options.flow_window_packets.min(self.peer_flow_window)
@@ -1560,16 +1568,10 @@ impl SrtConnection {
         }
     }
 
-    /// Record the peer's advertised SRT flow window.
-    ///
-    /// Values below two are not a usable window (libsrt validates the same
-    /// range and Robotweax rejects them), so they are treated as "not
-    /// advertised" rather than throttling this sender to a single packet in
-    /// flight.
+    /// Record a peer flow-window advertisement after handshake validation.
     fn note_peer_flow_window(&mut self, advertised: u32) {
-        if advertised >= 2 {
-            self.peer_flow_window = advertised;
-        }
+        debug_assert!(Self::peer_flow_window_is_usable(advertised));
+        self.peer_flow_window = advertised;
     }
 
     /// Initialize the send/receive buffers. Demand starts false: static
@@ -1989,6 +1991,9 @@ impl SrtConnection {
         // for the whole connected lifetime, and a retry landing a few
         // milliseconds late is irrelevant at a one-second cadence.
         self.service_km_retry(now);
+        if self.state != ConnectionState::Connected {
+            return;
+        }
         // A pending peer close advances on delivery: the tick is what makes
         // TSBPD deadlines pass.
         self.finish_peer_shutdown_if_drained();
@@ -2001,6 +2006,15 @@ impl SrtConnection {
             self.send_ack(now);
         }
 
+        self.service_sender_deadlines(now);
+
+        self.queue_output(QueuedOutput::SetTimer {
+            id: TimerId::Ack,
+            duration_micros: self.ack_timer_tick_micros(),
+        });
+    }
+
+    fn service_sender_deadlines(&mut self, now: Timestamp) {
         if self.tlpktdrop_enabled()
             && let Some(sender) = self.sender.as_mut()
         {
@@ -2027,11 +2041,6 @@ impl SrtConnection {
                 }
             }
         }
-
-        self.queue_output(QueuedOutput::SetTimer {
-            id: TimerId::Ack,
-            duration_micros: self.ack_timer_tick_micros(),
-        });
     }
 
     fn handle_nak_timer(&mut self, now: Timestamp) {
@@ -2755,6 +2764,9 @@ impl SrtConnection {
     ///
     /// Call this after receiving a `KeyRefreshNeeded` event.
     pub fn provide_new_sek(&mut self, new_sek: &[u8], now: Timestamp) -> Result<(), Error> {
+        if self.state != ConnectionState::Connected {
+            return Err(Error::invalid_state("not connected"));
+        }
         if self
             .km_control
             .as_ref()
@@ -3071,6 +3083,7 @@ impl SrtConnection {
         if hs.version != HS_VERSION_5 {
             return Err(self.fail_caller_handshake("unsupported SRT version in induction response"));
         }
+        self.reject_unusable_peer_flow_window(&hs, now)?;
 
         self.syn_cookie = hs.syn_cookie;
         self.peer_socket_id = hs.socket_id;
@@ -3123,6 +3136,70 @@ impl SrtConnection {
         )?));
         self.km_control = Some(Box::new(KmControlState::default()));
         Ok(())
+    }
+
+    /// Reject peer versions this HSv5-only implementation cannot negotiate.
+    ///
+    /// The reference requires HSv5 for SRT 1.3.0 and newer; an HSv5 packet
+    /// claiming an older SRT version is malformed, while an HSv4 peer is
+    /// below this implementation's minimum supported protocol version.
+    fn reject_peer_hsv5_version(
+        &mut self,
+        hs: &HandshakePacket,
+        now: Timestamp,
+    ) -> Result<(), Error> {
+        let rejection = if hs.version != HS_VERSION_5 {
+            Some((
+                SRT_REJ_VERSION,
+                format!("peer handshake version {} is not HSv5", hs.version),
+            ))
+        } else {
+            match hs.get_hs_extension() {
+                Some(extension) if extension.srt_version >= MIN_HSV5_SRT_VERSION => None,
+                Some(extension) => Some((
+                    SRT_REJ_ROGUE,
+                    format!(
+                        "HSv5 requires SRT version 1.3.0 or newer, got {:#08x}",
+                        extension.srt_version
+                    ),
+                )),
+                None => Some((
+                    SRT_REJ_ROGUE,
+                    "HSv5 conclusion has no HS extension".to_owned(),
+                )),
+            }
+        };
+        let Some((reason_code, reason)) = rejection else {
+            return Ok(());
+        };
+        match self.role {
+            ConnectionRole::Caller => Err(self.fail_caller_handshake(&reason)),
+            ConnectionRole::Listener => {
+                self.reject(reason_code, now)?;
+                Err(Error::handshake_rejected(reason))
+            }
+        }
+    }
+
+    /// Reject an unusable advertised flow window before committing handshake
+    /// state. The listener's INDUCTION path validates separately because it
+    /// has not yet received the SYN cookie needed for a rejection response.
+    fn reject_unusable_peer_flow_window(
+        &mut self,
+        hs: &HandshakePacket,
+        now: Timestamp,
+    ) -> Result<(), Error> {
+        if Self::peer_flow_window_is_usable(hs.flow_window) {
+            return Ok(());
+        }
+        let reason = "peer flow window must be between 2 and i32::MAX packets";
+        match self.role {
+            ConnectionRole::Caller => Err(self.fail_caller_handshake(reason)),
+            ConnectionRole::Listener => {
+                self.reject(SRT_REJ_ROGUE, now)?;
+                Err(Error::handshake_rejected(reason))
+            }
+        }
     }
 
     /// Reject a handshake whose advertised MSS this connection cannot
@@ -3245,6 +3322,8 @@ impl SrtConnection {
             return Ok(());
         }
 
+        self.reject_peer_hsv5_version(&hs, now)?;
+        self.reject_unusable_peer_flow_window(&hs, now)?;
         self.reject_peer_mss(&hs, now)?;
         self.reject_unsupported_packet_filter(&hs, now)?;
         self.apply_peer_mss(&hs);
@@ -3341,6 +3420,11 @@ impl SrtConnection {
             self.retransmit_handshake();
             return Ok(());
         }
+        if !Self::peer_flow_window_is_usable(hs.flow_window) {
+            return Err(Error::invalid_data(
+                "peer flow window must be between 2 and i32::MAX packets",
+            ));
+        }
         self.peer_socket_id = hs.socket_id;
         self.syn_cookie = self.options.syn_cookie.unwrap_or(0);
         self.note_peer_flow_window(hs.flow_window);
@@ -3375,10 +3459,13 @@ impl SrtConnection {
         if hs.syn_cookie != self.syn_cookie {
             return Err(Error::handshake_rejected("invalid SYN cookie"));
         }
+        self.reject_peer_hsv5_version(&hs, now)?;
+        self.reject_unusable_peer_flow_window(&hs, now)?;
 
         self.reject_peer_mss(&hs, now)?;
         self.reject_unsupported_packet_filter(&hs, now)?;
         self.apply_peer_mss(&hs);
+        self.note_peer_flow_window(hs.flow_window);
 
         self.initial_seq = hs.initial_packet_seq;
         if let Some(stream_id) = hs.get_sid_extension() {
@@ -3885,19 +3972,14 @@ impl SrtConnection {
         Ok(())
     }
 
-    /// Retransmit an unacknowledged key-material request, or give up on it.
+    /// Retransmit an unacknowledged key-material request, or close the session.
     ///
     /// A rotation is only complete once the peer confirms it installed the
-    /// new key. Until then the identical KMREQ is retransmitted on a bounded
-    /// schedule; when the retries are exhausted the rotation is abandoned
-    /// (the *current* key is untouched, so the session keeps working) and the
-    /// application is asked for a fresh SEK on the next refresh check. That
-    /// is what keeps a lost KMREQ/KMRSP from wedging the connection or from
-    /// switching the sender onto a key the receiver never installed.
+    /// new key. If retries run out, the peer might have installed the key
+    /// while every KMRSP was lost. Discarding it and continuing would leave
+    /// peers on different generations, so close instead of reusing its flag.
     fn service_km_retry(&mut self, now: Timestamp) {
-        // The action is decided under one short borrow of the transaction,
-        // then carried out without it: resending needs `&mut self` for the
-        // output queue, and abandoning needs the crypto context.
+        // Decide under one short borrow; resending and closing need `&mut self`.
         let action = match self
             .km_control
             .as_mut()
@@ -3909,9 +3991,8 @@ impl SrtConnection {
                 // The handshake owns this one: it resends the whole
                 // CONCLUSION, which carries this same KMREQ.
                 None => return,
-                // Bounded retries exhausted: abandon rather than hold the
-                // key switch open forever.
-                Some(0) => KmRetryAction::Abandon(pending.request.key_flag),
+                // A lost response is indistinguishable from a lost request.
+                Some(0) => KmRetryAction::Close(pending.request.key_flag),
                 Some(left) => {
                     pending.retries_left = Some(left - 1);
                     pending.next_retry = now.add_micros(KM_REQUEST_RETRY_INTERVAL_MICROS);
@@ -3922,14 +4003,17 @@ impl SrtConnection {
 
         match action {
             KmRetryAction::Resend(request) => self.send_km_request(&request, now),
-            KmRetryAction::Abandon(key_flag) => {
+            KmRetryAction::Close(key_flag) => {
                 if let Some(state) = self.km_control.as_mut() {
                     state.pending = None;
                 }
+                self.send_shutdown(now);
+                self.finish_local_close(DisconnectReason::ProtocolError(
+                    "key rotation was not acknowledged".to_owned(),
+                ));
                 if let Some(crypto) = self.crypto.as_mut() {
                     crypto.abandon_pre_announce(key_flag);
                 }
-                self.key_refresh_notified = false;
             }
         }
     }
@@ -4426,7 +4510,7 @@ impl SrtConnection {
         let packet = hs.encode(self.relative_timestamp(now), self.peer_socket_id);
         self.queue_handshake_control_packet(packet, now);
         self.terminate_handshake();
-        Error::handshake_rejected(reason)
+        Error::crypto_error(reason)
     }
 
     fn fail_caller_handshake(&mut self, reason: &str) -> Error {
@@ -4903,6 +4987,7 @@ mod tests {
             CryptoContext::KM_REFRESH_PERIOD - CryptoContext::KM_PRE_ANNOUNCE_PERIOD,
         );
         conn.crypto = Some(Box::new(crypto));
+        conn.set_state(ConnectionState::Connected);
 
         conn.check_km_refresh(Timestamp::from_micros(1));
         conn.check_km_refresh(Timestamp::from_micros(2));
@@ -8403,6 +8488,10 @@ mod tests {
         /// Set `PACKET_FILTER` in the HS extension's `srt_flags`: a
         /// capability *advertisement*, which must stay acceptable on its own.
         packet_filter_flag: bool,
+        /// Optional wire-level overrides for handshake regressions.
+        flow_window: Option<u32>,
+        handshake_version: Option<u32>,
+        srt_version: Option<u32>,
     }
 
     impl HandshakeRewrite {
@@ -8412,6 +8501,9 @@ mod tests {
                 family,
                 filter_extension: false,
                 packet_filter_flag: false,
+                flow_window: None,
+                handshake_version: None,
+                srt_version: None,
             }
         }
     }
@@ -8426,6 +8518,12 @@ mod tests {
         };
         let mut handshake = HandshakePacket::decode(&control).expect("handshake decodes");
         handshake.mtu = rewrite.mss;
+        if let Some(flow_window) = rewrite.flow_window {
+            handshake.flow_window = flow_window;
+        }
+        if let Some(version) = rewrite.handshake_version {
+            handshake.version = version;
+        }
         if rewrite.packet_filter_flag
             && let Some(extension) = handshake.get_hs_extension()
         {
@@ -8444,6 +8542,17 @@ mod tests {
                 data: b"fec\0".to_vec(),
             });
             handshake.extension_field |= extension_flags::CONFIG;
+        }
+        if let Some(version) = rewrite.srt_version {
+            for extension in &mut handshake.extensions {
+                if matches!(
+                    extension.ext_type,
+                    ExtensionType::HsReq | ExtensionType::HsRsp
+                ) && extension.data.len() >= 4
+                {
+                    extension.data[..4].copy_from_slice(&version.to_be_bytes());
+                }
+            }
         }
         let rewritten = handshake.encode(control.timestamp, control.dest_socket_id);
         let mut bytes = Vec::new();
@@ -8833,6 +8942,271 @@ mod tests {
         }
     }
 
+    fn take_one_rewritten_handshake(
+        conn: &mut SrtConnection,
+        rewrite: &HandshakeRewrite,
+    ) -> Vec<u8> {
+        let mut packets = drain_rewritten_handshakes(conn, rewrite);
+        assert_eq!(packets.len(), 1, "one handshake packet");
+        packets.remove(0)
+    }
+
+    fn rejection_reason(conn: &mut SrtConnection) -> Option<i32> {
+        drain_outputs(conn).into_iter().find_map(|output| {
+            let ConnectionOutput::SendPacket(bytes) = output else {
+                return None;
+            };
+            let SrtPacket::Control(control) = SrtPacket::decode(&bytes).ok()? else {
+                return None;
+            };
+            (control.control_type == ControlType::Handshake)
+                .then(|| HandshakePacket::decode(&control).ok()?.reject_reason)
+                .flatten()
+        })
+    }
+
+    #[test]
+    fn peer_flow_window_accepts_two_and_rejects_unusable_induction() {
+        let v4 = IpFamily::V4;
+        let plain = HandshakeRewrite::mss(1500, v4);
+        let mut minimum = plain;
+        minimum.flow_window = Some(MIN_PEER_FLOW_WINDOW);
+        let accepted = handshake_with_rewrites(&minimum, &minimum, listener_options());
+        accepted
+            .listener_result
+            .expect("two-packet window is valid");
+        accepted
+            .caller_result
+            .expect("two-packet window interoperates");
+        for connection in [&accepted.caller, &accepted.listener] {
+            assert_eq!(connection.peer_flow_window, MIN_PEER_FLOW_WINDOW);
+        }
+
+        for flow_window in [0, 1, 0x8000_0000, u32::MAX] {
+            let mut caller = SrtConnection::new_caller(ConnectionOptions {
+                socket_id: 1,
+                ..ConnectionOptions::default()
+            });
+            caller.set_ip_family(v4);
+            caller
+                .connect(Timestamp::from_micros(0))
+                .expect("caller starts");
+            let request = take_one_rewritten_handshake(&mut caller, &plain);
+            let mut malformed = plain;
+            malformed.flow_window = Some(flow_window);
+            let invalid_request = rewrite_handshake(&request, &malformed);
+            let mut listener = SrtConnection::new_listener(listener_options());
+            listener.set_ip_family(v4);
+            let error = listener
+                .feed_recv_buf(&invalid_request, Timestamp::from_micros(1_000))
+                .expect_err("unusable signed flow window is rejected");
+            assert_eq!(
+                error.kind,
+                crate::ErrorKind::InvalidData,
+                "{flow_window:#x}"
+            );
+            assert_eq!(listener.peer_socket_id, 0, "{flow_window:#x}");
+            assert!(listener.handshake_started_at.is_none(), "{flow_window:#x}");
+            assert!(drain_outputs(&mut listener).is_empty(), "{flow_window:#x}");
+            listener
+                .feed_recv_buf(&request, Timestamp::from_micros(1_001))
+                .expect("malformed stateless induction did not poison listener");
+        }
+    }
+
+    #[test]
+    fn listener_rejects_unusable_flow_window_in_conclusion() {
+        let v4 = IpFamily::V4;
+        let plain = HandshakeRewrite::mss(1500, v4);
+        let mut caller = SrtConnection::new_caller(ConnectionOptions {
+            socket_id: 1,
+            ..ConnectionOptions::default()
+        });
+        caller.set_ip_family(v4);
+        caller
+            .connect(Timestamp::from_micros(0))
+            .expect("caller starts");
+        let request = take_one_rewritten_handshake(&mut caller, &plain);
+        let mut listener = SrtConnection::new_listener(listener_options());
+        listener.set_ip_family(v4);
+        listener
+            .feed_recv_buf(&request, Timestamp::from_micros(1_000))
+            .expect("listener accepts induction");
+        let response = take_one_rewritten_handshake(&mut listener, &plain);
+        caller
+            .feed_recv_buf(&response, Timestamp::from_micros(2_000))
+            .expect("caller accepts induction response");
+        let conclusion = take_one_rewritten_handshake(&mut caller, &plain);
+        let mut malformed = plain;
+        malformed.flow_window = Some(0x8000_0000);
+        let invalid_conclusion = rewrite_handshake(&conclusion, &malformed);
+
+        let error = listener
+            .feed_recv_buf(&invalid_conclusion, Timestamp::from_micros(3_000))
+            .expect_err("listener rejects an out-of-range conclusion");
+        assert_eq!(error.kind, crate::ErrorKind::HandshakeRejected);
+        assert_eq!(listener.peer_flow_window, DEFAULT_FLOW_WINDOW);
+        assert_eq!(rejection_reason(&mut listener), Some(SRT_REJ_ROGUE));
+        assert_eq!(listener.state(), ConnectionState::Disconnected);
+    }
+
+    #[test]
+    fn listener_uses_the_conclusion_flow_window_for_sending() {
+        let plain = HandshakeRewrite::mss(1500, IpFamily::V4);
+        let mut caller = SrtConnection::new_caller(ConnectionOptions {
+            socket_id: 1,
+            ..ConnectionOptions::default()
+        });
+        let mut listener = SrtConnection::new_listener(listener_options());
+        caller
+            .connect(Timestamp::from_micros(0))
+            .expect("caller starts");
+        let induction = take_one_rewritten_handshake(&mut caller, &plain);
+        listener
+            .feed_recv_buf(&induction, Timestamp::from_micros(1_000))
+            .expect("listener accepts induction");
+        let response = take_one_rewritten_handshake(&mut listener, &plain);
+        caller
+            .feed_recv_buf(&response, Timestamp::from_micros(2_000))
+            .expect("caller accepts induction response");
+
+        let mut final_advertisement = plain;
+        final_advertisement.flow_window = Some(2);
+        let conclusion = take_one_rewritten_handshake(&mut caller, &final_advertisement);
+        listener
+            .feed_recv_buf(&conclusion, Timestamp::from_micros(3_000))
+            .expect("listener accepts changed final capacity");
+        assert_eq!(listener.peer_flow_window, 2);
+        assert_eq!(
+            listener
+                .sender
+                .as_ref()
+                .expect("send window")
+                .negotiated_window(),
+            2
+        );
+        let _ = drain_outputs(&mut listener);
+        for n in 0..2 {
+            listener
+                .send(b"x", Timestamp::from_micros(4_000 + n))
+                .expect("the final advertised capacity allows two packets");
+        }
+        assert!(
+            !listener.can_send(),
+            "a third packet exceeds the peer's final window"
+        );
+    }
+
+    #[test]
+    fn caller_rejects_unusable_flow_windows_in_both_responses() {
+        let v4 = IpFamily::V4;
+        let plain = HandshakeRewrite::mss(1500, v4);
+
+        let mut caller = SrtConnection::new_caller(ConnectionOptions {
+            socket_id: 1,
+            ..ConnectionOptions::default()
+        });
+        caller.set_ip_family(v4);
+        caller
+            .connect(Timestamp::from_micros(0))
+            .expect("caller starts");
+        let request = take_one_rewritten_handshake(&mut caller, &plain);
+        let mut listener = SrtConnection::new_listener(listener_options());
+        listener.set_ip_family(v4);
+        listener
+            .feed_recv_buf(&request, Timestamp::from_micros(1_000))
+            .expect("listener accepts induction");
+        let mut malformed = plain;
+        malformed.flow_window = Some(1);
+        let invalid_response = take_one_rewritten_handshake(&mut listener, &malformed);
+        let error = caller
+            .feed_recv_buf(&invalid_response, Timestamp::from_micros(2_000))
+            .expect_err("caller rejects unusable induction response");
+        assert_eq!(error.kind, crate::ErrorKind::HandshakeRejected);
+        assert_eq!(caller.peer_flow_window, 0);
+        assert_eq!(caller.state(), ConnectionState::Disconnected);
+
+        let mut caller = SrtConnection::new_caller(ConnectionOptions {
+            socket_id: 1,
+            ..ConnectionOptions::default()
+        });
+        caller.set_ip_family(v4);
+        caller
+            .connect(Timestamp::from_micros(0))
+            .expect("caller starts");
+        let request = take_one_rewritten_handshake(&mut caller, &plain);
+        let mut listener = SrtConnection::new_listener(listener_options());
+        listener.set_ip_family(v4);
+        listener
+            .feed_recv_buf(&request, Timestamp::from_micros(1_000))
+            .expect("listener accepts induction");
+        let response = take_one_rewritten_handshake(&mut listener, &plain);
+        caller
+            .feed_recv_buf(&response, Timestamp::from_micros(2_000))
+            .expect("caller accepts induction response");
+        let conclusion = take_one_rewritten_handshake(&mut caller, &plain);
+        listener
+            .feed_recv_buf(&conclusion, Timestamp::from_micros(3_000))
+            .expect("listener accepts conclusion");
+        let mut malformed = plain;
+        malformed.flow_window = Some(1);
+        let invalid_response = take_one_rewritten_handshake(&mut listener, &malformed);
+
+        let error = caller
+            .feed_recv_buf(&invalid_response, Timestamp::from_micros(4_000))
+            .expect_err("caller rejects unusable conclusion response");
+        assert_eq!(error.kind, crate::ErrorKind::HandshakeRejected);
+        assert_eq!(caller.peer_flow_window, 0);
+        assert_eq!(caller.state(), ConnectionState::Disconnected);
+    }
+
+    #[test]
+    fn hsv5_handshake_enforces_the_srt_1_3_0_version_floor() {
+        let v4 = IpFamily::V4;
+        let plain = HandshakeRewrite::mss(1500, v4);
+
+        let mut hsv4 = plain;
+        hsv4.handshake_version = Some(crate::srt_handshake::HS_VERSION_4);
+        let mut attempt = handshake_with_rewrites(&hsv4, &plain, listener_options());
+        let error = attempt
+            .listener_result
+            .expect_err("HSv4 cannot complete this HSv5-only handshake");
+        assert_eq!(error.kind, crate::ErrorKind::HandshakeRejected);
+        assert_eq!(
+            rejection_reason(&mut attempt.listener),
+            Some(SRT_REJ_VERSION)
+        );
+
+        let mut before_130 = plain;
+        before_130.srt_version = Some(0x0001_02ff);
+        let mut attempt = handshake_with_rewrites(&before_130, &plain, listener_options());
+        let error = attempt
+            .listener_result
+            .expect_err("HSv5 cannot claim an SRT version below 1.3.0");
+        assert_eq!(error.kind, crate::ErrorKind::HandshakeRejected);
+        assert_eq!(rejection_reason(&mut attempt.listener), Some(SRT_REJ_ROGUE));
+
+        let mut at_130 = plain;
+        at_130.srt_version = Some(0x0001_0300);
+        let accepted = handshake_with_rewrites(&at_130, &plain, listener_options());
+        accepted.listener_result.expect("SRT 1.3.0 is supported");
+        accepted
+            .caller_result
+            .expect("SRT 1.3.0 completes both ways");
+
+        let mut old_listener = plain;
+        old_listener.srt_version = Some(0x0001_02ff);
+        let attempt = handshake_with_rewrites(&plain, &old_listener, listener_options());
+        attempt
+            .listener_result
+            .expect("listener accepts the caller's supported version");
+        let error = attempt
+            .caller_result
+            .expect_err("caller rejects a peer below SRT 1.3.0");
+        assert_eq!(error.kind, crate::ErrorKind::HandshakeRejected);
+        assert_eq!(attempt.caller.state(), ConnectionState::Disconnected);
+    }
+
     /// A peer that negotiates packet-filter behaviour gets a refusal, not a
     /// session whose two peers disagree about whether recovery filtering
     /// exists -- while a peer that merely *advertises* the capability flag is
@@ -8986,11 +9360,56 @@ mod tests {
         );
     }
 
-    /// A lost KMREQ must not let the sender switch onto a key the receiver
-    /// never installed, and must not wedge the connection either: the retry
-    /// completes the rotation, and an exhausted transaction is abandoned.
     #[test]
-    fn a_lost_kmreq_is_retried_and_an_unanswered_rotation_is_abandoned() {
+    fn exhausting_km_responses_cannot_leave_peers_on_different_keys() {
+        let (mut caller, mut listener) = encrypted_pair(CipherMode::Ctr);
+        for connection in [&mut caller, &mut listener] {
+            while connection.poll_event().is_some() {}
+            let _ = drain_outputs(connection);
+        }
+        let mut now = Timestamp::from_micros(10_000_000);
+        caller
+            .provide_new_sek(&[0x6B; 16], now)
+            .expect("caller starts a rotation");
+        let first = take_user_defined_datagram(&mut caller, SRT_CMD_KMREQ);
+        listener
+            .feed_recv_buf(&first, now)
+            .expect("peer installs new key");
+        let _ = take_user_defined_datagram(&mut listener, SRT_CMD_KMRSP);
+
+        for _ in 0..KM_REQUEST_MAX_RETRIES {
+            now = now.add_micros(KM_REQUEST_RETRY_INTERVAL_MICROS + 1);
+            caller.handle_timer(TimerId::Ack, now).expect("retry tick");
+            let retry = take_user_defined_datagram(&mut caller, SRT_CMD_KMREQ);
+            assert_eq!(
+                user_defined_control_info(&retry),
+                user_defined_control_info(&first)
+            );
+            listener
+                .feed_recv_buf(&retry, now)
+                .expect("peer answers identical request");
+            let _ = take_user_defined_datagram(&mut listener, SRT_CMD_KMRSP);
+        }
+        now = now.add_micros(KM_REQUEST_RETRY_INTERVAL_MICROS + 1);
+        caller
+            .handle_timer(TimerId::Ack, now)
+            .expect("exhaustion tick");
+        assert_ne!(
+            caller.state(),
+            ConnectionState::Connected,
+            "lost responses do not prove the peer lacks the announced key"
+        );
+        assert!(
+            caller.send(b"unsafe DATA", now).is_err(),
+            "a connection with uncertain peer key state must stop sending"
+        );
+    }
+
+    /// A lost KMREQ is retried, and a response eventually permits switchover.
+    /// If no response arrives after all retries, the sender cannot know
+    /// whether the peer installed the key, so it must close the session.
+    #[test]
+    fn a_lost_kmreq_is_retried_and_an_unanswered_rotation_fails_closed() {
         let (mut caller, mut listener) = encrypted_pair(CipherMode::Ctr);
         for connection in [&mut caller, &mut listener] {
             while connection.poll_event().is_some() {}
@@ -9068,22 +9487,20 @@ mod tests {
             b"after a lost request",
         );
 
-        // A rotation nobody ever answers is abandoned after bounded retries:
-        // the session keeps running on the acknowledged key, and the next
-        // refresh cycle can still start (no wedge).
+        // No response to any attempt: even if every request was dropped,
+        // that fact is unknowable locally, so the connection must fail closed.
+        while caller.poll_event().is_some() {}
         caller
             .provide_new_sek(&[0x8D; 16], now.add_micros(4))
             .expect("start another refresh");
         let _ = take_user_defined_datagram(&mut caller, SRT_CMD_KMREQ);
         let mut tick = now.add_micros(4);
         for _ in 0..=KM_REQUEST_MAX_RETRIES {
-            tick = tick.add_micros(1_000_001);
+            tick = tick.add_micros(KM_REQUEST_RETRY_INTERVAL_MICROS + 1);
             caller.handle_timer(TimerId::Ack, tick).expect("ACK tick");
         }
-        assert!(
-            km_security_snapshot(&caller).pending_response.is_none(),
-            "the unanswered rotation is abandoned, not held open forever"
-        );
+        assert_eq!(caller.state(), ConnectionState::Disconnected);
+        assert!(km_security_snapshot(&caller).pending_response.is_none());
         assert_eq!(
             caller
                 .crypto
@@ -9091,17 +9508,26 @@ mod tests {
                 .expect("secured caller")
                 .current_key(),
             switched,
-            "abandoning a rotation leaves the acknowledged key in place"
+            "an unconfirmed rotation never changes the active send key"
         );
-        caller
-            .provide_new_sek(&[0x9E; 16], tick.add_micros(1))
-            .expect("the refresh cycle is not wedged by an abandoned rotation");
-        assert_encrypted_roundtrip(
-            &mut caller,
-            &mut listener,
-            tick.add_micros(2),
-            b"after an abandoned rotation",
+        assert!(
+            std::iter::from_fn(|| caller.poll_event()).any(|event| matches!(
+                event,
+                ConnectionEvent::Disconnected {
+                    reason: DisconnectReason::ProtocolError(reason)
+                } if reason == "key rotation was not acknowledged"
+            ))
         );
+        assert!(caller.provide_new_sek(&[0x9E; 16], tick).is_err());
+        assert!(drain_outputs(&mut caller).iter().any(|output| {
+            let ConnectionOutput::SendPacket(bytes) = output else {
+                return false;
+            };
+            matches!(
+                SrtPacket::decode(bytes),
+                Ok(SrtPacket::Control(control)) if control.control_type == ControlType::Shutdown
+            )
+        }));
     }
 
     /// A connected encrypted pair sharing one passphrase.
