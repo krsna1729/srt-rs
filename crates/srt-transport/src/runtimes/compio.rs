@@ -3297,6 +3297,16 @@ pub struct Owner {
     tx_failures: TxFailureQueue,
 }
 
+/// Why the raw-readiness listener batch drain stopped.
+enum ListenerBatchStop {
+    /// The socket has nothing more queued right now.
+    Drained,
+    /// The packet/byte budget stopped the drain; a sub-slot tail may still fit.
+    BudgetLimited,
+    /// A receive error ended the drain.
+    Failed,
+}
+
 impl Owner {
     /// Create a new Owner with bounded concurrent TX capacity using the default MTU (1500) wire ceiling.
     #[must_use]
@@ -4464,47 +4474,12 @@ impl Owner {
             listener.pending_rx = None;
         }
 
-        // 2. Drain in `recvmmsg` batches while a whole batch fits the budget:
-        // every slot holds at most the wire-ceiling slot length (the same
-        // slot managed RX uses), so asking for `remaining_bytes / slot`
-        // datagrams can never overshoot the byte cap. A larger datagram is
-        // truncated and skipped, as managed RX does. Zero heap allocations:
-        // the batch is preallocated.
-        {
-            use std::os::fd::AsRawFd;
-            let raw_fd = compio::net::UdpSocket::as_raw_fd(&listener.sock);
-            let slot = listener.rx_batch.slot_len();
-            loop {
-                let by_packets = budget.max_rx_packets.saturating_sub(report.rx_packets);
-                let by_bytes = budget.max_rx_bytes.saturating_sub(report.rx_bytes) / slot;
-                let requested = by_packets.min(by_bytes).min(listener.rx_batch.capacity());
-                if requested == 0 {
-                    break;
-                }
-                let Ok(received) = listener.rx_batch.recv(raw_fd, requested) else {
-                    return;
-                };
-                for (peer, datagram, truncated) in listener.rx_batch.iter(received) {
-                    let (Some(peer), false) = (peer, truncated) else {
-                        continue;
-                    };
-                    report.rx_packets += 1;
-                    report.rx_bytes += datagram.len();
-                    admit_listener_datagram(
-                        &mut listener.table,
-                        listener.resolver.as_ref(),
-                        &listener.options,
-                        &listener.telemetry,
-                        peer,
-                        datagram,
-                        now,
-                    );
-                }
-                if received < requested {
-                    // Socket drained.
-                    return;
-                }
-            }
+        // 2. Drain in `recvmmsg` batches while a whole batch fits the budget.
+        //    A drain that ended on the socket, or on a receive error, skips the
+        //    sub-slot tail below.
+        match Self::drain_listener_rx_batch(listener, now, budget, report) {
+            ListenerBatchStop::BudgetLimited => {}
+            ListenerBatchStop::Drained | ListenerBatchStop::Failed => return,
         }
 
         // 3. Budget tail smaller than one slot: single datagrams, staging one
@@ -4556,6 +4531,54 @@ impl Owner {
                 &listener.rx_buf[..len],
                 now,
             );
+        }
+    }
+
+    /// Step 2 of the raw-readiness listener drain: `recvmmsg` batches while a
+    /// whole batch fits the packet/byte budget. Every slot holds at most the
+    /// wire-ceiling slot length (the same slot managed RX uses), so asking for
+    /// `remaining_bytes / slot` datagrams can never overshoot the byte cap. A
+    /// larger datagram is truncated and skipped, as on the managed path. Zero
+    /// heap allocations: the batch is preallocated.
+    fn drain_listener_rx_batch(
+        listener: &mut ListenerSide,
+        now: Timestamp,
+        budget: &OwnerServiceBudget,
+        report: &mut OwnerServiceReport,
+    ) -> ListenerBatchStop {
+        use std::os::fd::AsRawFd;
+        let raw_fd = compio::net::UdpSocket::as_raw_fd(&listener.sock);
+        let slot = listener.rx_batch.slot_len();
+        loop {
+            let by_packets = budget.max_rx_packets.saturating_sub(report.rx_packets);
+            let by_bytes = budget.max_rx_bytes.saturating_sub(report.rx_bytes) / slot;
+            let requested = by_packets.min(by_bytes).min(listener.rx_batch.capacity());
+            if requested == 0 {
+                return ListenerBatchStop::BudgetLimited;
+            }
+            let Ok(received) = listener.rx_batch.recv(raw_fd, requested) else {
+                return ListenerBatchStop::Failed;
+            };
+            for (peer, datagram, truncated) in listener.rx_batch.iter(received) {
+                let (Some(peer), false) = (peer, truncated) else {
+                    continue;
+                };
+                report.rx_packets += 1;
+                report.rx_bytes += datagram.len();
+                admit_listener_datagram(
+                    &mut listener.table,
+                    listener.resolver.as_ref(),
+                    &listener.options,
+                    &listener.telemetry,
+                    peer,
+                    datagram,
+                    now,
+                );
+            }
+            if received < requested {
+                // Socket drained.
+                return ListenerBatchStop::Drained;
+            }
         }
     }
 
