@@ -437,10 +437,11 @@ pub enum Admit {
 pub struct LogicalPeerId(u64);
 
 impl LogicalPeerId {
-    /// The raw id, for opaque transport attribution. Not a handle: callers
-    /// outside this crate never interpret it.
+    /// The raw id: stable for the peer's lifetime and unique within its
+    /// table, so usable as a telemetry key. Not a handle and carries no
+    /// meaning beyond identity.
     #[must_use]
-    pub(crate) fn as_u64(self) -> u64 {
+    pub fn as_u64(self) -> u64 {
         self.0
     }
 

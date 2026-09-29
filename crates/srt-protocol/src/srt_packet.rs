@@ -48,6 +48,18 @@ impl SrtPacket {
     /// Decode from a byte slice.
     #[track_caller]
     pub fn decode(buf: &[u8]) -> Result<Self, Error> {
+        Self::decode_with(buf, Bytes::copy_from_slice)
+    }
+
+    /// Decode from an owned datagram: a DATA payload is a zero-copy slice of
+    /// `buf` (it shares, and keeps alive, `buf`'s allocation).
+    #[track_caller]
+    pub fn decode_bytes(buf: &Bytes) -> Result<Self, Error> {
+        Self::decode_with(buf, |payload| buf.slice_ref(payload))
+    }
+
+    #[track_caller]
+    fn decode_with(buf: &[u8], copy_payload: impl FnOnce(&[u8]) -> Bytes) -> Result<Self, Error> {
         Error::check_buffer_size(SRT_HEADER_SIZE, buf)?;
         if buf.len() > MAX_DATAGRAM_SIZE {
             return Err(Error::invalid_data("SRT datagram exceeds maximum size"));
@@ -58,7 +70,7 @@ impl SrtPacket {
 
         if PacketType::from_first_word(first_word) == PacketType::Data {
             // Decode as a data packet.
-            DataPacket::decode_with_first_word(first_word, buf).map(SrtPacket::Data)
+            DataPacket::decode_with_first_word(first_word, buf, copy_payload).map(SrtPacket::Data)
         } else {
             // Decode as a control packet.
             ControlPacket::decode_with_first_word(first_word, buf).map(SrtPacket::Control)
@@ -211,7 +223,11 @@ impl DataPacket {
 
     /// Decode from a byte slice, given the already-read first 32 bits.
     #[track_caller]
-    fn decode_with_first_word(first_word: u32, buf: &[u8]) -> Result<Self, Error> {
+    fn decode_with_first_word(
+        first_word: u32,
+        buf: &[u8],
+        copy_payload: impl FnOnce(&[u8]) -> Bytes,
+    ) -> Result<Self, Error> {
         Error::check_buffer_size(SRT_HEADER_SIZE, buf)?;
 
         let mut slice = &buf[4..]; // Skip the first 4 bytes.
@@ -228,7 +244,7 @@ impl DataPacket {
         let timestamp = read_u32(&mut slice)?;
         let dest_socket_id = read_u32(&mut slice)?;
 
-        let payload = Bytes::copy_from_slice(slice);
+        let payload = copy_payload(slice);
 
         Ok(Self {
             sequence_number,
@@ -1052,5 +1068,21 @@ mod tests {
         assert_eq!(PacketPosition::from_bits(0b00), PacketPosition::Middle);
         assert_eq!(PacketPosition::from_bits(0b01), PacketPosition::Last);
         assert_eq!(PacketPosition::from_bits(0b11), PacketPosition::Single);
+    }
+
+    #[test]
+    fn decode_bytes_matches_decode_and_borrows_the_datagram() {
+        let packet = SrtPacket::Data(DataPacket::new(5, 1, 0, 7, Bytes::from(vec![0xAB; 1316])));
+        let mut wire = Vec::new();
+        packet.encode(&mut wire).unwrap();
+        let wire = Bytes::from(wire);
+
+        let decoded = SrtPacket::decode_bytes(&wire).unwrap();
+        assert_eq!(decoded, SrtPacket::decode(&wire).unwrap());
+        let SrtPacket::Data(data) = decoded else {
+            panic!("data packet expected");
+        };
+        // The payload is the datagram's tail, not a copy.
+        assert_eq!(data.payload.as_ptr(), wire[SRT_HEADER_SIZE..].as_ptr());
     }
 }

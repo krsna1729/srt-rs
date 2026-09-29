@@ -205,6 +205,41 @@ pub fn recvmsg_batch(
     addrs: &mut [Option<net::SocketAddr>],
     truncated: &mut [bool],
 ) -> std::io::Result<usize> {
+    if bufs.len() != sizes.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "recvmsg_batch slice lengths differ: bufs={}, sizes={}, addrs={}, truncated={}",
+                bufs.len(),
+                sizes.len(),
+                addrs.len(),
+                truncated.len()
+            ),
+        ));
+    }
+    recvmsg_batch_into(
+        fd,
+        bufs.iter_mut().map(|buf| {
+            buf.resize(buf.capacity(), 0);
+            buf.as_mut_slice()
+        }),
+        sizes,
+        addrs,
+        truncated,
+    )
+}
+
+/// [`recvmsg_batch`] into caller-provided slots, one per entry of `sizes`
+/// (`slots` must yield at least that many). Lets a receive path land
+/// datagrams directly in a shared arena (`BytesRecvBatch`) instead of
+/// scratch buffers that are copied afterwards.
+pub fn recvmsg_batch_into<'a>(
+    fd: std::os::fd::RawFd,
+    slots: impl Iterator<Item = &'a mut [u8]>,
+    sizes: &mut [usize],
+    addrs: &mut [Option<net::SocketAddr>],
+    truncated: &mut [bool],
+) -> std::io::Result<usize> {
     use std::cell::RefCell;
     thread_local! {
         static SCRATCH: RefCell<BatchScratch> = RefCell::new(BatchScratch::new(64));
@@ -260,19 +295,18 @@ pub fn recvmsg_batch(
             });
         }
     }
-    if bufs.len() != sizes.len() || bufs.len() != addrs.len() || bufs.len() != truncated.len() {
+    if sizes.len() != addrs.len() || sizes.len() != truncated.len() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
-                "recvmsg_batch slice lengths differ: bufs={}, sizes={}, addrs={}, truncated={}",
-                bufs.len(),
+                "recvmsg_batch slice lengths differ: sizes={}, addrs={}, truncated={}",
                 sizes.len(),
                 addrs.len(),
                 truncated.len()
             ),
         ));
     }
-    let count = bufs.len();
+    let count = sizes.len();
     if count == 0 {
         return Ok(0);
     }
@@ -291,18 +325,19 @@ pub fn recvmsg_batch(
             addrs: storage_addrs,
         } = &mut *scratch;
         addrs.fill(None);
+        let mut prepared = 0usize;
         for (((iov, msg), storage), (buf, size)) in iovs
             .iter_mut()
             .take(count)
             .zip(msgs.iter_mut().take(count))
             .zip(storage_addrs.iter_mut().take(count))
-            .zip(bufs.iter_mut().zip(sizes.iter_mut()))
+            .zip(slots.zip(sizes.iter_mut()))
         {
-            buf.resize(buf.capacity(), 0);
+            prepared += 1;
             *size = 0;
             *iov = libc::iovec {
                 iov_base: buf.as_mut_ptr().cast(),
-                iov_len: buf.capacity(),
+                iov_len: buf.len(),
             };
             // SAFETY: zeroed sockaddr storage is valid and is filled by the
             // kernel before any family-specific interpretation.
@@ -318,9 +353,15 @@ pub fn recvmsg_batch(
             msg.msg_hdr.msg_name = (storage as *mut libc::sockaddr_storage).cast();
             msg.msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as u32;
         }
+        if prepared < count {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("recvmsg_batch_into got {prepared} slots for {count} entries"),
+            ));
+        }
         // SAFETY: the three scratch arrays contain at least `count` elements;
         // every message points at its corresponding live iovec, address
-        // storage, and initialized writable Vec allocation for the duration
+        // storage, and initialized writable slot (borrowed for `'a`) for the duration
         // of this synchronous syscall. `count_u32` was checked above.
         let received = unsafe {
             libc::recvmmsg(
@@ -345,7 +386,7 @@ pub fn recvmsg_batch(
             // `msg_len` is the *true* datagram length for UDP, which can
             // exceed the buffer when MSG_TRUNC is set -- clamp before this
             // is ever used as a slice bound (T01).
-            let buf_capacity = bufs[i].len();
+            let buf_capacity = iovs[i].iov_len;
             sizes[i] = (msgs[i].msg_len as usize).min(buf_capacity);
             truncated[i] = msgs[i].msg_hdr.msg_flags & libc::MSG_TRUNC != 0;
         }

@@ -8,10 +8,12 @@
 //! Completion runtimes (Monoio/Compio/Glommio) stay on their native
 //! one-buffer I/O; they do not use these helpers.
 
+use crate::socket_io::recvmsg_batch_into;
 use crate::{
     ManualTimerStore, OutputDrainBudget, OutputDrainReport, OutputDrainStatus, collect_output_work,
     prepend_outputs, recvmsg_batch,
 };
+use bytes::{Bytes, BytesMut};
 use srt_proto::{ConnectionOutput, SrtConnection, Timestamp};
 use std::collections::VecDeque;
 use std::io;
@@ -62,6 +64,12 @@ impl RecvBatch {
         self.bufs.len()
     }
 
+    /// Bytes each receive slot holds; a longer datagram is truncated.
+    #[must_use]
+    pub fn slot_len(&self) -> usize {
+        self.bufs.first().map_or(0, Vec::len)
+    }
+
     /// One `recvmmsg`, asking the kernel for at most `limit` datagrams
     /// (further capped to this batch's capacity) rather than always the
     /// full capacity -- so a caller enforcing a remaining budget of, say,
@@ -102,6 +110,145 @@ impl Default for RecvBatch {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Zero-copy counterpart of [`RecvBatch`]: `recvmmsg` lands each datagram in
+/// its own slot of a shared, zero-initialised chunk, and the datagram is
+/// handed out as a frozen `Bytes` of that slot. Paired with
+/// `SrtConnection::feed_recv_bytes`, a DATA payload reaches the receive
+/// buffer and the application without being copied.
+///
+/// Trade-off: a delivered payload keeps its whole chunk alive until every
+/// datagram cut from it is dropped, and each datagram occupies a full slot
+/// (`slot_len`) while held. A chunk is allocated only when the current one
+/// has no room for a full batch, so allocation is per chunk, not per
+/// datagram. Completion runtimes whose kernel-provided buffers must be
+/// returned at once (Compio managed RX) keep the copying path.
+pub struct BytesRecvBatch {
+    chunk: BytesMut,
+    slot_len: usize,
+    capacity: usize,
+    chunk_slots: usize,
+    sizes: Vec<usize>,
+    addrs: Vec<Option<SocketAddr>>,
+    truncated: Vec<bool>,
+    received: Vec<Bytes>,
+}
+
+impl BytesRecvBatch {
+    /// Slots per chunk: several full batches before a new allocation.
+    pub const DEFAULT_CHUNK_SLOTS: usize = 128;
+
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_capacity(RecvBatch::DEFAULT_CAPACITY, RecvBatch::DEFAULT_BUF_LEN)
+    }
+
+    #[must_use]
+    pub fn with_capacity(datagrams: usize, slot_len: usize) -> Self {
+        let capacity = datagrams.clamp(1, RecvBatch::MAX_CAPACITY);
+        let slot_len = slot_len.clamp(1, RecvBatch::MAX_BUF_LEN);
+        Self {
+            chunk: BytesMut::new(),
+            slot_len,
+            capacity,
+            chunk_slots: Self::DEFAULT_CHUNK_SLOTS.max(capacity),
+            sizes: vec![0; capacity],
+            addrs: vec![None; capacity],
+            truncated: vec![false; capacity],
+            received: Vec::with_capacity(capacity),
+        }
+    }
+
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// One `recvmmsg` for at most `limit` datagrams (capped to capacity);
+    /// `0` is `WouldBlock`. Received datagrams are then available from
+    /// [`Self::take`].
+    pub fn recv(&mut self, fd: RawFd, limit: usize) -> io::Result<usize> {
+        self.received.clear();
+        let n = limit.min(self.capacity);
+        if n == 0 {
+            return Ok(0);
+        }
+        if self.chunk.len() < n * self.slot_len {
+            self.chunk = BytesMut::zeroed(self.chunk_slots * self.slot_len);
+        }
+        let slot_len = self.slot_len;
+        let received = recvmsg_batch_into(
+            fd,
+            self.chunk[..n * slot_len].chunks_mut(slot_len),
+            &mut self.sizes[..n],
+            &mut self.addrs[..n],
+            &mut self.truncated[..n],
+        )?;
+        for &size in &self.sizes[..received] {
+            let mut slot = self.chunk.split_to(slot_len);
+            slot.truncate(size);
+            self.received.push(slot.freeze());
+        }
+        Ok(received)
+    }
+
+    /// The datagrams of the last [`Self::recv`], moved out: sender, the
+    /// datagram, and whether the kernel reported `MSG_TRUNC` (a truncated
+    /// datagram is never a complete packet).
+    pub fn take(&mut self) -> impl Iterator<Item = (Option<SocketAddr>, Bytes, bool)> + '_ {
+        self.received
+            .drain(..)
+            .zip(self.addrs.iter().copied())
+            .zip(self.truncated.iter().copied())
+            .map(|((datagram, addr), truncated)| (addr, datagram, truncated))
+    }
+}
+
+impl Default for BytesRecvBatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// [`drain_recv_fd`] over a [`BytesRecvBatch`]: each complete datagram is
+/// handed over as an owned `Bytes` slice of the receive chunk.
+pub fn drain_recv_fd_bytes(
+    fd: RawFd,
+    batch: &mut BytesRecvBatch,
+    budget: RecvBudget,
+    mut on_datagram: impl FnMut(Option<SocketAddr>, Bytes),
+) -> io::Result<RecvDrainReport> {
+    let mut report = RecvDrainReport::default();
+    if budget.max_rounds == 0 || budget.max_datagrams == 0 {
+        return Ok(report);
+    }
+    let mut dequeued = 0usize;
+    for _ in 0..budget.max_rounds {
+        if dequeued >= budget.max_datagrams {
+            break;
+        }
+        let requested = (budget.max_datagrams - dequeued).min(batch.capacity());
+        let received = batch.recv(fd, requested)?;
+        if received == 0 {
+            report.would_block = true;
+            break;
+        }
+        report.syscalls += 1;
+        for (addr, datagram, truncated) in batch.take() {
+            dequeued += 1;
+            if truncated {
+                report.truncated += 1;
+                continue;
+            }
+            on_datagram(addr, datagram);
+            report.datagrams += 1;
+        }
+        if received < requested {
+            break;
+        }
+    }
+    Ok(report)
 }
 
 /// Per-wake bound on batched receive so a busy socket cannot starve
@@ -1091,5 +1238,74 @@ mod tests {
                 ConnectionOutput::SendPacket(vec![3]),
             ])
         );
+    }
+
+    #[test]
+    fn bytes_drain_hands_over_datagrams_without_copying_and_shares_a_chunk() {
+        use std::os::fd::AsRawFd;
+        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").expect("receiver");
+        receiver.set_nonblocking(true).expect("nonblocking");
+        let dest = receiver.local_addr().expect("addr");
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("sender");
+        for payload in [b"one".as_slice(), b"two", b"three"] {
+            sender.send_to(payload, dest).expect("send");
+        }
+
+        let mut batch = BytesRecvBatch::with_capacity(8, 64);
+        let mut got = Vec::new();
+        let report = drain_recv_fd_bytes(
+            receiver.as_raw_fd(),
+            &mut batch,
+            RecvBudget::from_rounds(1),
+            |addr, datagram| {
+                assert!(addr.is_some());
+                got.push(datagram);
+            },
+        )
+        .expect("drain");
+        assert_eq!(report.datagrams, 3);
+        assert_eq!(got, [&b"one"[..], b"two", b"three"]);
+        // Consecutive slots of one chunk: no per-datagram allocation.
+        assert_eq!(got[0].as_ptr().wrapping_add(64), got[1].as_ptr());
+        assert_eq!(got[1].as_ptr().wrapping_add(64), got[2].as_ptr());
+    }
+
+    #[test]
+    fn bytes_drain_skips_truncated_datagrams_and_honours_the_budget() {
+        use std::os::fd::AsRawFd;
+        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").expect("receiver");
+        receiver.set_nonblocking(true).expect("nonblocking");
+        let dest = receiver.local_addr().expect("addr");
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("sender");
+        sender
+            .send_to(&[0xA5; 65], dest)
+            .expect("oversized for a 64-byte slot");
+        for i in 0..5u8 {
+            sender.send_to(&[i], dest).expect("send");
+        }
+
+        let mut batch = BytesRecvBatch::with_capacity(8, 64);
+        let mut got = Vec::new();
+        let report = drain_recv_fd_bytes(
+            receiver.as_raw_fd(),
+            &mut batch,
+            RecvBudget::new(8, 3),
+            |_, datagram| got.push(datagram[0]),
+        )
+        .expect("drain");
+        assert_eq!(report.truncated, 1);
+        assert_eq!(report.datagrams, 2);
+        assert_eq!(got, [0, 1]);
+
+        let mut rest = Vec::new();
+        let capacity = batch.capacity();
+        drain_recv_fd_bytes(
+            receiver.as_raw_fd(),
+            &mut batch,
+            RecvBudget::for_datagrams(16, capacity),
+            |_, datagram| rest.push(datagram[0]),
+        )
+        .expect("drain rest");
+        assert_eq!(rest, [2, 3, 4]);
     }
 }

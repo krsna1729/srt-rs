@@ -1441,6 +1441,7 @@ dependencies = [
 name = "srt-transport"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "compio",
  "criterion",
  "futures-util",

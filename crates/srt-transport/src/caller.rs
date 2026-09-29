@@ -9,6 +9,8 @@ use srt_proto::{
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use crate::id_hash::IdHashMap;
+
 /// Default maximum number of logical callers held by one table.
 ///
 /// The table is a shard-local owner, so this cap bounds the hash maps,
@@ -29,10 +31,11 @@ pub(crate) const MAX_DUE_PER_VISIT: usize = 256;
 pub struct LogicalCallerId(u64);
 
 impl LogicalCallerId {
-    /// The raw id, for opaque transport attribution. Not a handle: callers
-    /// outside this crate never interpret it.
+    /// The raw id: stable for the caller's lifetime and unique within its
+    /// table, so usable as a telemetry key. Not a handle and carries no
+    /// meaning beyond identity.
     #[must_use]
-    pub(crate) fn as_u64(self) -> u64 {
+    pub fn as_u64(self) -> u64 {
         self.0
     }
 
@@ -409,12 +412,12 @@ impl LogicalCallerMut<'_> {
 /// caller cap; use [`Self::with_max_callers`] when a shard needs a different
 /// explicit bound.
 pub struct CallerTable {
-    sessions: HashMap<LogicalCallerId, CallerSession>,
-    routes: HashMap<u32, CallerRoute>,
+    sessions: IdHashMap<LogicalCallerId, CallerSession>,
+    routes: IdHashMap<u32, CallerRoute>,
     ready_queue: VecDeque<LogicalCallerId>,
     event_ready_queue: VecDeque<LogicalCallerId>,
     deadlines: LogicalDueIndex,
-    sched: HashMap<LogicalCallerId, SchedEntry>,
+    sched: IdHashMap<LogicalCallerId, SchedEntry>,
     /// Table-owned reusable due scratch: `pop_due_ids` fills it, the fire
     /// phase drains it, and its capacity is retained across calls so the
     /// normal service path never allocates.
@@ -976,12 +979,12 @@ impl CallerTable {
     pub fn with_max_callers(max_callers: usize) -> Self {
         let bounded = max_callers.clamp(1, MAX_CALLERS);
         Self {
-            sessions: HashMap::with_capacity(bounded),
-            routes: HashMap::with_capacity(bounded),
+            sessions: IdHashMap::with_capacity_and_hasher(bounded, Default::default()),
+            routes: IdHashMap::with_capacity_and_hasher(bounded, Default::default()),
             ready_queue: VecDeque::with_capacity(bounded),
             event_ready_queue: VecDeque::with_capacity(bounded),
             deadlines: LogicalDueIndex::new(bounded),
-            sched: HashMap::with_capacity(bounded),
+            sched: IdHashMap::with_capacity_and_hasher(bounded, Default::default()),
             due_scratch: Vec::with_capacity(bounded.min(MAX_DUE_PER_VISIT)),
             protocol_failure_index: VecDeque::new(),
             protocol_failure_scratch: Some(Vec::new()),
