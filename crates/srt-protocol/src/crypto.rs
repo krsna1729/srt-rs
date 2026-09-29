@@ -884,6 +884,35 @@ impl CryptoContext {
         Ok((new_key_flag, wrapped_sek))
     }
 
+    /// Discard an unacknowledged rotation after the connection has closed.
+    ///
+    /// A missing response does not establish that the peer lacks this key.
+    /// Therefore callers must stop using the connection before discarding it.
+    /// This zeroes the announced slot and drops its schedules; the current
+    /// key remains untouched until the context is dropped.
+    ///
+    /// `key_flag` identifies the pending rotation. A flag that is no longer
+    /// announced is ignored so a late call cannot discard a newer rotation.
+    pub fn abandon_pre_announce(&mut self, key_flag: KeyFlag) {
+        if self.next_key != Some(key_flag) {
+            return;
+        }
+        self.next_key = None;
+        self.km_refresh_state = KmRefreshState::Idle;
+        match key_flag {
+            KeyFlag::Even => {
+                self.sek_even.zeroize();
+                self.ctr_even = None;
+                self.gcm_even = None;
+            }
+            KeyFlag::Odd => {
+                self.sek_odd.zeroize();
+                self.ctr_odd = None;
+                self.gcm_odd = None;
+            }
+        }
+    }
+
     /// Switch keys (once 2^25 packets is reached).
     pub fn switch_key(&mut self) {
         if let Some(next_key) = self.next_key.take() {

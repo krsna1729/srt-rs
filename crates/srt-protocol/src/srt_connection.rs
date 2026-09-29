@@ -16,7 +16,8 @@ use crate::message_assembler::MessageAssembler;
 use crate::sender_rto::RtoArm;
 use crate::srt_handshake::{
     DEFAULT_FLOW_WINDOW, DEFAULT_MTU, GroupExtensionData, HS_VERSION_5, HandshakePacket,
-    HandshakeState, HandshakeType, KmError, KmMessage, MAX_FLOW_WINDOW, SRT_MAGIC_CODE, srt_flags,
+    HandshakeState, HandshakeType, IpFamily, KmError, KmMessage, MAX_FLOW_WINDOW, SRT_MAGIC_CODE,
+    SRT_REJ_FILTER, SRT_REJ_ROGUE, SRT_REJ_VERSION, srt_flags,
 };
 use crate::srt_packet::{
     ControlPacket, ControlType, DataHeader, DataPacket, DatagramClass, PendingData,
@@ -30,6 +31,18 @@ use crate::time::Timestamp;
 const MAX_NAK_RECORD_SIZE: usize = 8;
 const NAK_CHUNK_INITIAL_CAPACITY: usize = 32;
 const _: () = assert!(DEFAULT_MTU as usize - SRT_HEADER_SIZE >= MAX_NAK_RECORD_SIZE);
+
+/// Smallest DATA payload this connection can operate with.
+///
+/// The largest control packet whose size is derived from the negotiated
+/// payload budget is a NAK loss record ([`NakChunkEncoder`] is constructed
+/// with `max_control_info_size`, which is `max_payload_size`), and a
+/// connection that cannot report loss cannot recover it. libsrt's
+/// `MinimumMSS` reserves only the 4 bytes it needs "for passing any data";
+/// this floor is the stricter, structurally derived one, so a peer MSS that
+/// would negotiate a smaller payload is rejected rather than accepted into
+/// a session that would later fail to emit a NAK.
+const MIN_NEGOTIATED_PAYLOAD_SIZE: usize = MAX_NAK_RECORD_SIZE;
 
 /// Bytes in one encoded NAK range (`first_seq` + `last_seq`).
 pub const NAK_RANGE_BYTES: usize = MAX_NAK_RECORD_SIZE;
@@ -133,6 +146,11 @@ pub const DEFAULT_HANDSHAKE_TIMEOUT_MICROS: u64 = 3_000_000;
 /// this are clamped up during construction, so it is the effective floor a
 /// deployment planner must model, not merely an internal guard.
 pub const MIN_FLOW_WINDOW_PACKETS: u32 = 32;
+
+// HSv5 requires SRT 1.3.0 or newer. The peer flow-window field is signed
+// 32-bit and must advertise at least two packets.
+const MIN_HSV5_SRT_VERSION: u32 = 0x010300;
+const MIN_PEER_FLOW_WINDOW: u32 = 2;
 
 /// libsrt-compatible zero padding (4 bytes).
 ///
@@ -542,6 +560,100 @@ impl Default for ConnectionOptions {
     }
 }
 
+const KM_HISTORY_CAPACITY: usize = 4;
+
+/// Bounded replay history for key-material controls.
+///
+/// SRT's KM wire format carries only an even/odd selector, not a monotonic
+/// generation number. Retaining the last few complete messages lets the
+/// connection distinguish a *recent* delayed replay from the next legitimate
+/// use of the same selector without growing memory over a connection's
+/// lifetime. This is bounded recent-replay rejection, not durable replay
+/// protection: after `KM_HISTORY_CAPACITY` further rotations an old complete
+/// message has left the ring. A replayed KMREQ must still carry key
+/// material wrapped under this session's KEK, so it can reinstall only a key
+/// this session already used, never an attacker-chosen one.
+struct KmHistory {
+    entries: [Option<KmMessage>; KM_HISTORY_CAPACITY],
+    next: usize,
+}
+
+impl Default for KmHistory {
+    fn default() -> Self {
+        Self {
+            entries: std::array::from_fn(|_| None),
+            next: 0,
+        }
+    }
+}
+
+impl KmHistory {
+    fn contains(&self, message: &KmMessage) -> bool {
+        self.entries.iter().flatten().any(|entry| entry == message)
+    }
+
+    fn remember(&mut self, message: KmMessage) {
+        self.entries[self.next] = Some(message);
+        self.next = (self.next + 1) % KM_HISTORY_CAPACITY;
+    }
+}
+
+/// Bounded retries for a key-material request the peer has not acknowledged.
+///
+/// A timeout does not prove the peer never installed the key: after bounded
+/// retries the connection closes instead of discarding a possibly-live key
+/// and silently continuing with mismatched encryption state.
+const KM_REQUEST_MAX_RETRIES: u8 = 4;
+
+/// Retry cadence for an unacknowledged key-material request. libsrt's own
+/// KMREQ cadence is one second.
+const KM_REQUEST_RETRY_INTERVAL_MICROS: u64 = 1_000_000;
+
+/// An outgoing key-material request awaiting its response.
+struct PendingKmRequest {
+    /// The exact KMREQ to retransmit. A rotation is never re-generated, so a
+    /// retry carries byte-identical key material to the original -- the peer
+    /// answers a duplicate idempotently rather than installing anything.
+    request: KmMessage,
+    /// When the next retransmission is due.
+    next_retry: Timestamp,
+    /// Retransmissions left, or `None` when another mechanism owns the retry:
+    /// the handshake resends its whole CONCLUSION (this KMREQ included), so
+    /// the connection must not also retransmit it here.
+    retries_left: Option<u8>,
+}
+
+/// What [`SrtConnection::service_km_retry`] decided to do, computed under a
+/// short borrow of the transaction state so the action itself can run
+/// without one.
+enum KmRetryAction {
+    /// Retransmit this exact request.
+    Resend(KmMessage),
+    /// Close when the peer's installed key is uncertain.
+    Close(KeyFlag),
+}
+
+/// Post-handshake KM request/response transaction state.
+#[derive(Default)]
+struct KmControlState {
+    /// Outgoing rotation awaiting acknowledgement (sender side).
+    pending: Option<PendingKmRequest>,
+    /// The most recently accepted inbound KMREQ, whose exact duplicate is
+    /// answered again without installing anything (receiver side). SRT's KM
+    /// wire format carries only an even/odd selector, so this is what
+    /// distinguishes a legitimate retransmission of the current rotation from
+    /// a replay of an older one.
+    last_received: Option<KmMessage>,
+    received: KmHistory,
+    acknowledged: KmHistory,
+}
+
+fn km_matches_context(message: &KmMessage, crypto: &CryptoContext) -> bool {
+    message.key_length == crypto.key_length()
+        && message.salt == *crypto.salt()
+        && CipherMode::from_km(message) == Some(crypto.cipher_mode())
+}
+
 /// An SRT connection.
 pub struct SrtConnection {
     /// Role.
@@ -562,9 +674,12 @@ pub struct SrtConnection {
     initial_seq: u32,
 
     /// Encryption context.
-    /// Boxed: only encrypted sessions pay the ~136B context (key schedules
-    /// now live behind one more pointer inside). Plain sessions stay lean.
+    /// Boxed: only encrypted sessions pay the context and expanded key
+    /// schedules. Plain sessions stay lean.
     crypto: Option<Box<CryptoContext>>,
+    /// Bounded KM transaction/replay state, allocated only for encrypted
+    /// sessions.
+    km_control: Option<Box<KmControlState>>,
 
     /// Send buffer.
     sender: Option<SenderBuffer>,
@@ -574,6 +689,9 @@ pub struct SrtConnection {
     assembler: MessageAssembler,
     /// Maximum data payload per SRT packet (MTU minus header).
     max_payload_size: usize,
+    /// Address family of the UDP path, set by the transport; it turns the
+    /// peer's IP-layer MSS into a datagram budget.
+    ip_family: IpFamily,
 
     /// Event queue.
     event_queue: VecDeque<ConnectionEvent>,
@@ -629,8 +747,9 @@ pub struct SrtConnection {
     last_send_time: Option<Timestamp>,
     /// Start of an orderly close attempt.
     shutdown_started_at: Option<Timestamp>,
-    /// Received KM message (Listener only).
-    received_km: Option<KmMessage>,
+    /// KM request retained only until the listener encodes its handshake
+    /// response. Boxed to keep the common connection footprint bounded.
+    received_km: Option<Box<KmMessage>>,
     /// Stream ID received from the peer (Listener only).
     peer_stream_id: Option<String>,
     /// Congestion control mode name declared by the peer in the handshake
@@ -1065,10 +1184,12 @@ impl SrtConnection {
             syn_cookie: 0,
             initial_seq,
             crypto: None,
+            km_control: None,
             sender: None,
             receiver: None,
             assembler: MessageAssembler::new(),
             max_payload_size: DEFAULT_MTU as usize - SRT_HEADER_SIZE,
+            ip_family: IpFamily::V4,
             event_queue: VecDeque::new(),
             key_refresh_notified: false,
             pending_data_events: 0,
@@ -1115,10 +1236,12 @@ impl SrtConnection {
             syn_cookie: 0,
             initial_seq,
             crypto: None,
+            km_control: None,
             sender: None,
             receiver: None,
             assembler: MessageAssembler::new(),
             max_payload_size: DEFAULT_MTU as usize - SRT_HEADER_SIZE,
+            ip_family: IpFamily::V4,
             event_queue: VecDeque::new(),
             key_refresh_notified: false,
             pending_data_events: 0,
@@ -1374,6 +1497,16 @@ impl SrtConnection {
     /// never scheduled earlier than the requested cadence. Both values are
     /// clamped to at least one microsecond and the whole-attempt timeout is
     /// clamped to at least the retry interval.
+    /// Set the address family of this connection's UDP path.
+    ///
+    /// The transport knows the socket address; the handshake does not carry
+    /// the path family reliably. It must be set before the peer's CONCLUSION
+    /// is processed, because that is where the peer MSS becomes this
+    /// connection's datagram budget. Unset, the path is taken to be IPv4.
+    pub fn set_ip_family(&mut self, family: IpFamily) {
+        self.ip_family = family;
+    }
+
     pub fn set_handshake_timing(&mut self, retry_interval_micros: u64, timeout_micros: u64) {
         self.handshake_retry_interval_micros = retry_interval_micros.max(1);
         self.handshake_timeout_micros = timeout_micros
@@ -1423,6 +1556,10 @@ impl SrtConnection {
     /// the same way): our own value bounds the memory and retransmit span we
     /// commit to, and the peer's value bounds what the peer can actually
     /// accept before its receive buffer fills.
+    fn peer_flow_window_is_usable(flow_window: u32) -> bool {
+        (MIN_PEER_FLOW_WINDOW..=i32::MAX as u32).contains(&flow_window)
+    }
+
     fn negotiated_flow_window(&self) -> u32 {
         if self.peer_flow_window >= 2 {
             self.options.flow_window_packets.min(self.peer_flow_window)
@@ -1431,16 +1568,10 @@ impl SrtConnection {
         }
     }
 
-    /// Record the peer's advertised SRT flow window.
-    ///
-    /// Values below two are not a usable window (libsrt validates the same
-    /// range and Robotweax rejects them), so they are treated as "not
-    /// advertised" rather than throttling this sender to a single packet in
-    /// flight.
+    /// Record a peer flow-window advertisement after handshake validation.
     fn note_peer_flow_window(&mut self, advertised: u32) {
-        if advertised >= 2 {
-            self.peer_flow_window = advertised;
-        }
+        debug_assert!(Self::peer_flow_window_is_usable(advertised));
+        self.peer_flow_window = advertised;
     }
 
     /// Initialize the send/receive buffers. Demand starts false: static
@@ -1854,6 +1985,15 @@ impl SrtConnection {
             return;
         }
         self.service_receive_deadlines(now);
+        // An unacknowledged key rotation is serviced here rather than by a
+        // timer of its own: this tick is already the connection's periodic
+        // service point (TSBPD, TLPKTDROP, deferred peer close), it is armed
+        // for the whole connected lifetime, and a retry landing a few
+        // milliseconds late is irrelevant at a one-second cadence.
+        self.service_km_retry(now);
+        if self.state != ConnectionState::Connected {
+            return;
+        }
         // A pending peer close advances on delivery: the tick is what makes
         // TSBPD deadlines pass.
         self.finish_peer_shutdown_if_drained();
@@ -1866,6 +2006,15 @@ impl SrtConnection {
             self.send_ack(now);
         }
 
+        self.service_sender_deadlines(now);
+
+        self.queue_output(QueuedOutput::SetTimer {
+            id: TimerId::Ack,
+            duration_micros: self.ack_timer_tick_micros(),
+        });
+    }
+
+    fn service_sender_deadlines(&mut self, now: Timestamp) {
         if self.tlpktdrop_enabled()
             && let Some(sender) = self.sender.as_mut()
         {
@@ -1892,11 +2041,6 @@ impl SrtConnection {
                 }
             }
         }
-
-        self.queue_output(QueuedOutput::SetTimer {
-            id: TimerId::Ack,
-            duration_micros: self.ack_timer_tick_micros(),
-        });
     }
 
     fn handle_nak_timer(&mut self, now: Timestamp) {
@@ -2620,7 +2764,19 @@ impl SrtConnection {
     ///
     /// Call this after receiving a `KeyRefreshNeeded` event.
     pub fn provide_new_sek(&mut self, new_sek: &[u8], now: Timestamp) -> Result<(), Error> {
-        let Some(ref mut crypto) = self.crypto else {
+        if self.state != ConnectionState::Connected {
+            return Err(Error::invalid_state("not connected"));
+        }
+        if self
+            .km_control
+            .as_ref()
+            .is_some_and(|state| state.pending.is_some())
+        {
+            return Err(Error::invalid_state(
+                "a key-material request is already awaiting its response",
+            ));
+        }
+        let Some(crypto) = &mut self.crypto else {
             return Err(Error::with_reason(
                 crate::error::ErrorKind::CryptoError,
                 "encryption not enabled",
@@ -2637,6 +2793,14 @@ impl SrtConnection {
             crypto.cipher_mode(),
         );
         self.send_km_request(&km_message, now);
+        let state = self
+            .km_control
+            .get_or_insert_with(|| Box::new(KmControlState::default()));
+        state.pending = Some(PendingKmRequest {
+            request: km_message,
+            next_retry: now.add_micros(KM_REQUEST_RETRY_INTERVAL_MICROS),
+            retries_left: Some(KM_REQUEST_MAX_RETRIES),
+        });
 
         self.check_output_queue()
     }
@@ -2861,6 +3025,23 @@ impl SrtConnection {
         }
         let hs = HandshakePacket::decode(&pkt)?;
 
+        // A completed connection can receive a retransmitted CONCLUSION
+        // (the peer may have missed its response), but a late REJECTION or
+        // new INDUCTION must not roll an established session back or cause
+        // it to retransmit a handshake for an unrelated peer. Check identity
+        // before either role's completed-handshake branch queues output.
+        if self.handshake_state == HandshakeState::Completed
+            && (hs.handshake_type != HandshakeType::Conclusion
+                || hs.version != HS_VERSION_5
+                || hs.socket_id != self.peer_socket_id
+                || hs.syn_cookie != self.syn_cookie
+                || hs.initial_packet_seq != self.initial_seq)
+        {
+            return Err(Error::invalid_data(
+                "late handshake does not match the established session",
+            ));
+        }
+
         match self.role {
             ConnectionRole::Caller => self.handle_handshake_caller(hs, pkt.timestamp, now),
             ConnectionRole::Listener => self.handle_handshake_listener(hs, pkt.timestamp, now),
@@ -2902,6 +3083,7 @@ impl SrtConnection {
         if hs.version != HS_VERSION_5 {
             return Err(self.fail_caller_handshake("unsupported SRT version in induction response"));
         }
+        self.reject_unusable_peer_flow_window(&hs, now)?;
 
         self.syn_cookie = hs.syn_cookie;
         self.peer_socket_id = hs.socket_id;
@@ -2952,7 +3134,178 @@ impl SrtConnection {
             sek,
             self.options.cipher_mode,
         )?));
+        self.km_control = Some(Box::new(KmControlState::default()));
         Ok(())
+    }
+
+    /// Reject peer versions this HSv5-only implementation cannot negotiate.
+    ///
+    /// The reference requires HSv5 for SRT 1.3.0 and newer; an HSv5 packet
+    /// claiming an older SRT version is malformed, while an HSv4 peer is
+    /// below this implementation's minimum supported protocol version.
+    fn reject_peer_hsv5_version(
+        &mut self,
+        hs: &HandshakePacket,
+        now: Timestamp,
+    ) -> Result<(), Error> {
+        let rejection = if hs.version != HS_VERSION_5 {
+            Some((
+                SRT_REJ_VERSION,
+                format!("peer handshake version {} is not HSv5", hs.version),
+            ))
+        } else {
+            match hs.get_hs_extension() {
+                Some(extension) if extension.srt_version >= MIN_HSV5_SRT_VERSION => None,
+                Some(extension) => Some((
+                    SRT_REJ_ROGUE,
+                    format!(
+                        "HSv5 requires SRT version 1.3.0 or newer, got {:#08x}",
+                        extension.srt_version
+                    ),
+                )),
+                None => Some((
+                    SRT_REJ_ROGUE,
+                    "HSv5 conclusion has no HS extension".to_owned(),
+                )),
+            }
+        };
+        let Some((reason_code, reason)) = rejection else {
+            return Ok(());
+        };
+        match self.role {
+            ConnectionRole::Caller => Err(self.fail_caller_handshake(&reason)),
+            ConnectionRole::Listener => {
+                self.reject(reason_code, now)?;
+                Err(Error::handshake_rejected(reason))
+            }
+        }
+    }
+
+    /// Reject an unusable advertised flow window before committing handshake
+    /// state. The listener's INDUCTION path validates separately because it
+    /// has not yet received the SYN cookie needed for a rejection response.
+    fn reject_unusable_peer_flow_window(
+        &mut self,
+        hs: &HandshakePacket,
+        now: Timestamp,
+    ) -> Result<(), Error> {
+        if Self::peer_flow_window_is_usable(hs.flow_window) {
+            return Ok(());
+        }
+        let reason = "peer flow window must be between 2 and i32::MAX packets";
+        match self.role {
+            ConnectionRole::Caller => Err(self.fail_caller_handshake(reason)),
+            ConnectionRole::Listener => {
+                self.reject(SRT_REJ_ROGUE, now)?;
+                Err(Error::handshake_rejected(reason))
+            }
+        }
+    }
+
+    /// Reject a handshake whose advertised MSS this connection cannot
+    /// negotiate, before any of its fields are committed.
+    ///
+    /// Bounds and their derivation live in
+    /// [`HandshakePacket::peer_mss_rejection_reason`]. The rejection shape
+    /// follows the pinned reference: a caller fails its attempt with
+    /// `SRT_REJ_ROGUE` (`CUDT::processConnectResponse` aborts on an
+    /// over-large MSS), and a listener answers with an `SRT_REJ_ROGUE`
+    /// rejection response while staying able to serve other peers
+    /// (`CUDT::acceptAndRespond` on an under-sized one).
+    fn reject_peer_mss(&mut self, hs: &HandshakePacket, now: Timestamp) -> Result<(), Error> {
+        let min_payload = self.min_negotiated_payload(hs) as u32;
+        let Some(reason) = hs.peer_mss_rejection_reason(self.ip_family, min_payload) else {
+            return Ok(());
+        };
+        match self.role {
+            ConnectionRole::Caller => Err(self.fail_caller_handshake(&reason)),
+            ConnectionRole::Listener => {
+                // `reject` refuses a handshake it was not waiting for; this
+                // path only runs while awaiting the CONCLUSION.
+                self.reject(SRT_REJ_ROGUE, now)?;
+                Err(Error::handshake_rejected(reason))
+            }
+        }
+    }
+
+    /// Apply the peer's advertised MSS to this connection's outbound DATA
+    /// budget.
+    ///
+    /// The handshake MTU field is an IP-layer MTU for every reference
+    /// implementation, so the peer's receive ceiling for an SRT datagram is
+    /// `mss - ip_udp_overhead`; this core's own advertised value is a
+    /// datagram budget, which is the other side of the `min`. A peer that
+    /// advertised 1500 on an IPv4 path therefore negotiates 1456 bytes of
+    /// payload -- exactly libsrt's own `mss - (UDP_HDR_SIZE + HDR_SIZE)` --
+    /// instead of this core's local 1484, which a libsrt peer's receive
+    /// buffer would truncate.
+    fn apply_peer_mss(&mut self, hs: &HandshakePacket) {
+        let negotiated_datagram = DEFAULT_MTU.min(hs.peer_max_datagram_size(self.ip_family));
+        // Clamped rather than asserted: `reject_peer_mss` is the gate that
+        // fails such a peer closed, and this second bound keeps a future
+        // path that skipped it from reaching `NakChunkEncoder`'s
+        // `max_control_info_size >= MAX_NAK_RECORD_SIZE` precondition.
+        self.max_payload_size = (negotiated_datagram as usize)
+            .saturating_sub(SRT_HEADER_SIZE)
+            .max(MIN_NEGOTIATED_PAYLOAD_SIZE);
+    }
+
+    /// Smallest raw DATA payload this connection can operate with: room
+    /// for a NAK loss record, and under GCM room for the authentication tag
+    /// plus one byte of application data, so a negotiated session can always
+    /// carry DATA (`effective_max_payload_size` subtracts the tag).
+    ///
+    /// The cipher is already known when the CONCLUSION is checked: the
+    /// caller built its crypto context (or configured one) before sending,
+    /// and a listener reads it from the peer's KMREQ.
+    fn min_negotiated_payload(&self, hs: &HandshakePacket) -> usize {
+        let cipher = match self.role {
+            ConnectionRole::Caller => match self.crypto.as_deref() {
+                Some(crypto) => Some(crypto.cipher_mode()),
+                None => self
+                    .options
+                    .passphrase
+                    .is_some()
+                    .then_some(self.options.cipher_mode),
+            },
+            ConnectionRole::Listener => hs
+                .get_km_request()
+                .and_then(Result::ok)
+                .and_then(|km| CipherMode::from_km(&km)),
+        };
+        if cipher == Some(CipherMode::Gcm) {
+            MIN_NEGOTIATED_PAYLOAD_SIZE.max(GCM_TAG_LEN + 1)
+        } else {
+            MIN_NEGOTIATED_PAYLOAD_SIZE
+        }
+    }
+
+    /// Reject a handshake in which the peer negotiates packet-filter
+    /// behaviour this implementation does not provide.
+    ///
+    /// Silently skipping the FILTER extension would establish a session whose
+    /// two peers disagree about whether recovery filtering exists: the peer
+    /// would expect filtered recovery while this side neither filters nor
+    /// implements the filter's own protocol. The reference implementation
+    /// refuses an unhonourable filter negotiation with `SRT_REJ_FILTER`
+    /// rather than approximating it, so this does the same, in the same shape
+    /// as [`Self::reject_peer_mss`].
+    fn reject_unsupported_packet_filter(
+        &mut self,
+        hs: &HandshakePacket,
+        now: Timestamp,
+    ) -> Result<(), Error> {
+        if !hs.has_filter_extension() {
+            return Ok(());
+        }
+        let reason = "peer negotiated a packet filter this implementation does not support";
+        match self.role {
+            ConnectionRole::Caller => Err(self.fail_caller_handshake(reason)),
+            ConnectionRole::Listener => {
+                self.reject(SRT_REJ_FILTER, now)?;
+                Err(Error::handshake_rejected(reason))
+            }
+        }
     }
 
     fn handle_caller_conclusion(
@@ -2968,6 +3321,12 @@ impl SrtConnection {
         if self.handshake_state != HandshakeState::ConclusionSent {
             return Ok(());
         }
+
+        self.reject_peer_hsv5_version(&hs, now)?;
+        self.reject_unusable_peer_flow_window(&hs, now)?;
+        self.reject_peer_mss(&hs, now)?;
+        self.reject_unsupported_packet_filter(&hs, now)?;
+        self.apply_peer_mss(&hs);
 
         self.peer_socket_id = hs.socket_id;
         self.peer_group_extension = hs.get_group_extension();
@@ -3002,7 +3361,21 @@ impl SrtConnection {
 
     fn validate_caller_kmrsp(&mut self, hs: &HandshakePacket) -> Result<(), Error> {
         match (self.crypto.is_some(), hs.get_km_response()) {
-            (true, Ok(Some(_))) | (false, Ok(None)) => Ok(()),
+            (true, Ok(Some(response))) => {
+                let Some(state) = self.km_control.as_deref_mut().filter(|state| {
+                    state
+                        .pending
+                        .as_ref()
+                        .is_some_and(|p| p.request == response)
+                }) else {
+                    return Err(self
+                        .fail_caller_handshake("KMRSP does not match the caller's pending KMREQ"));
+                };
+                state.pending = None;
+                state.acknowledged.remember(response);
+                Ok(())
+            }
+            (false, Ok(None)) => Ok(()),
             (true, Ok(None)) => Err(self.fail_caller_handshake("encryption enabled but no KMRSP")),
             (false, Ok(Some(_))) => {
                 Err(self.fail_caller_handshake("peer requires encryption but caller is unsecured"))
@@ -3047,6 +3420,11 @@ impl SrtConnection {
             self.retransmit_handshake();
             return Ok(());
         }
+        if !Self::peer_flow_window_is_usable(hs.flow_window) {
+            return Err(Error::invalid_data(
+                "peer flow window must be between 2 and i32::MAX packets",
+            ));
+        }
         self.peer_socket_id = hs.socket_id;
         self.syn_cookie = self.options.syn_cookie.unwrap_or(0);
         self.note_peer_flow_window(hs.flow_window);
@@ -3081,6 +3459,13 @@ impl SrtConnection {
         if hs.syn_cookie != self.syn_cookie {
             return Err(Error::handshake_rejected("invalid SYN cookie"));
         }
+        self.reject_peer_hsv5_version(&hs, now)?;
+        self.reject_unusable_peer_flow_window(&hs, now)?;
+
+        self.reject_peer_mss(&hs, now)?;
+        self.reject_unsupported_packet_filter(&hs, now)?;
+        self.apply_peer_mss(&hs);
+        self.note_peer_flow_window(hs.flow_window);
 
         self.initial_seq = hs.initial_packet_seq;
         if let Some(stream_id) = hs.get_sid_extension() {
@@ -3132,8 +3517,19 @@ impl SrtConnection {
                     ));
                 }
             };
+            // The handshake KMREQ is the session's first received key
+            // message, so it seeds the replay history here -- where both the
+            // context and its transaction state are constructed -- rather
+            // than at completion, which has no fallible step left to guard.
+            let mut km_control = KmControlState::default();
+            km_control.received.remember(km.clone());
+            // A retransmitted handshake KMREQ (a repeated CONCLUSION, or a
+            // runtime retry of the same material) is answered again without
+            // installing anything.
+            km_control.last_received = Some(km.clone());
             self.crypto = Some(Box::new(crypto));
-            self.received_km = Some(km);
+            self.km_control = Some(Box::new(km_control));
+            self.received_km = Some(Box::new(km));
         } else if hs.get_km_request().is_some() {
             return Err(self.fail_listener_km(
                 now,
@@ -3153,6 +3549,10 @@ impl SrtConnection {
         // The session clock was stamped at INDUCTION, so this response's
         // timestamp lets the caller derive the initial TSBPD time base.
         self.send_conclusion_response(now);
+        // The KMREQ was already recorded into the replay history when the
+        // context was constructed; here it is only released, since the
+        // response has echoed it.
+        self.received_km = None;
         self.handshake_state = HandshakeState::Completed;
         self.handshake_started_at = None;
         self.set_state(ConnectionState::Connected);
@@ -3472,42 +3872,150 @@ impl SrtConnection {
 
     /// Process a UserDefined packet (KM Refresh).
     fn handle_user_defined(&mut self, pkt: ControlPacket, now: Timestamp) -> Result<(), Error> {
-        // Determine KMREQ/KMRSP from the subtype.
-        // SRT_CMD_KMREQ / SRT_CMD_KMRSP live in srt_packet with the class mapping.
-
         match pkt.subtype {
-            SRT_CMD_KMREQ => {
-                // Received a KM Refresh request (receiver side).
-                let km = KmMessage::decode(&pkt.control_info)?;
-
-                if let Some(ref mut crypto) = self.crypto {
-                    // Update to the new SEK.
-                    crypto.update_sek(&km.wrapped_key, km.key_flag)?;
-
-                    // Send a KMRSP.
-                    self.send_km_response(&km, now);
-                } else {
-                    // A refresh KMREQ on an unencrypted connection cannot
-                    // succeed. Reply immediately rather than leaving the
-                    // peer to wait for its own timeout (spec §3.2.1.2).
-                    self.send_km_error_response(KmError::NoSecret, now);
-                }
-            }
-            SRT_CMD_KMRSP => {
-                // Received a KM Refresh response (sender side). A successful
-                // receipt means the peer accepted the new key. No further
-                // action needed here (the key switch happens on the sender's
-                // own timing). The response is still decoded first: a
-                // malformed key-management body is a rejection, not peer
-                // activity, whether or not this side acts on its contents.
-                let _ = KmMessage::decode(&pkt.control_info)?;
-            }
+            SRT_CMD_KMREQ => self.handle_km_request(&pkt.control_info, now),
+            SRT_CMD_KMRSP => self.handle_km_response(&pkt.control_info),
             _ => {
                 // Ignore unknown UserDefined packets.
+                Ok(())
             }
         }
+    }
 
+    /// A peer's key-material request (receiver side).
+    ///
+    /// Three outcomes, and the distinction matters: a *new* valid request is
+    /// installed once and answered; an exact duplicate of the current request
+    /// is answered again **without** installing anything (the peer is
+    /// retrying because its response was lost, not attacking); and an older
+    /// generation fails closed with no state or liveness change.
+    fn handle_km_request(&mut self, control_info: &[u8], now: Timestamp) -> Result<(), Error> {
+        let km = KmMessage::decode(control_info)?;
+
+        if self.crypto.is_none() {
+            // A refresh KMREQ on an unencrypted connection cannot succeed.
+            // Reply immediately rather than leaving the peer to wait for its
+            // own timeout (spec §3.2.1.2).
+            self.send_km_error_response(KmError::NoSecret, now);
+            return Ok(());
+        }
+
+        let is_current_retry = self
+            .km_control
+            .as_ref()
+            .and_then(|state| state.last_received.as_ref())
+            .is_some_and(|last| last == &km);
+        if is_current_retry {
+            self.send_km_response(&km, now);
+            return Ok(());
+        }
+
+        if self
+            .km_control
+            .as_ref()
+            .is_some_and(|state| state.received.contains(&km))
+        {
+            return Err(Error::invalid_data("stale or replayed KMREQ"));
+        }
+
+        let Some(crypto) = self.crypto.as_deref_mut().filter(|crypto| {
+            km_matches_context(&km, crypto) && km.key_flag == crypto.current_key().other()
+        }) else {
+            return Err(Error::invalid_data(
+                "KMREQ does not match the secured session's next generation",
+            ));
+        };
+        crypto.update_sek(&km.wrapped_key, km.key_flag)?;
+        self.send_km_response(&km, now);
+        if let Some(state) = self.km_control.as_mut() {
+            state.received.remember(km.clone());
+            state.last_received = Some(km);
+        }
         Ok(())
+    }
+
+    /// A peer's acknowledgement of this connection's rotation (sender side).
+    ///
+    /// Only the exact request that is outstanding completes the transaction:
+    /// a duplicate acknowledgement is stale, and one for a different
+    /// generation does not prove the peer installed *this* key.
+    fn handle_km_response(&mut self, control_info: &[u8]) -> Result<(), Error> {
+        // A one-word KMRSP is the peer reporting a key-material error state.
+        // The reference recognises it during an established session and
+        // ignores it without changing security state
+        // (`CUDT::processSrtMsg_KMRSP`); the pending rotation keeps its own
+        // bounded retries. An unknown code is malformed input.
+        if let Ok(code) = <[u8; 4]>::try_from(control_info) {
+            return KmError::from_u32(u32::from_le_bytes(code))
+                .map(|_| ())
+                .ok_or_else(|| Error::invalid_data("unknown KMRSP error code"));
+        }
+        let km = KmMessage::decode(control_info)?;
+        let state = self
+            .km_control
+            .as_mut()
+            .ok_or_else(|| Error::invalid_data("unsolicited KMRSP"))?;
+        if state.acknowledged.contains(&km) {
+            return Err(Error::invalid_data("stale or replayed KMRSP"));
+        }
+        if state
+            .pending
+            .as_ref()
+            .is_none_or(|pending| pending.request != km)
+        {
+            return Err(Error::invalid_data(
+                "KMRSP does not acknowledge the pending KMREQ",
+            ));
+        }
+        state.pending = None;
+        state.acknowledged.remember(km);
+        Ok(())
+    }
+
+    /// Retransmit an unacknowledged key-material request, or close the session.
+    ///
+    /// A rotation is only complete once the peer confirms it installed the
+    /// new key. If retries run out, the peer might have installed the key
+    /// while every KMRSP was lost. Discarding it and continuing would leave
+    /// peers on different generations, so close instead of reusing its flag.
+    fn service_km_retry(&mut self, now: Timestamp) {
+        // Decide under one short borrow; resending and closing need `&mut self`.
+        let action = match self
+            .km_control
+            .as_mut()
+            .and_then(|state| state.pending.as_mut())
+        {
+            None => return,
+            Some(pending) if now < pending.next_retry => return,
+            Some(pending) => match pending.retries_left {
+                // The handshake owns this one: it resends the whole
+                // CONCLUSION, which carries this same KMREQ.
+                None => return,
+                // A lost response is indistinguishable from a lost request.
+                Some(0) => KmRetryAction::Close(pending.request.key_flag),
+                Some(left) => {
+                    pending.retries_left = Some(left - 1);
+                    pending.next_retry = now.add_micros(KM_REQUEST_RETRY_INTERVAL_MICROS);
+                    KmRetryAction::Resend(pending.request.clone())
+                }
+            },
+        };
+
+        match action {
+            KmRetryAction::Resend(request) => self.send_km_request(&request, now),
+            KmRetryAction::Close(key_flag) => {
+                if let Some(state) = self.km_control.as_mut() {
+                    state.pending = None;
+                }
+                self.send_shutdown(now);
+                self.finish_local_close(DisconnectReason::ProtocolError(
+                    "key rotation was not acknowledged".to_owned(),
+                ));
+                if let Some(crypto) = self.crypto.as_mut() {
+                    crypto.abandon_pre_announce(key_flag);
+                }
+            }
+        }
     }
 
     /// Check whether KM Refresh needs to happen and act accordingly.
@@ -3527,7 +4035,14 @@ impl SrtConnection {
 
         // Check whether a key switch is needed.
         if let Some(ref mut crypto) = self.crypto {
-            if crypto.should_switch_key() {
+            // Only once the peer has acknowledged the rotation: switching to
+            // a key the receiver never installed would make every subsequent
+            // DATA packet undecryptable.
+            let rotation_acknowledged = self
+                .km_control
+                .as_ref()
+                .is_none_or(|state| state.pending.is_none());
+            if rotation_acknowledged && crypto.should_switch_key() {
                 crypto.switch_key();
             }
 
@@ -3886,7 +4401,7 @@ impl SrtConnection {
         // (provide_new_sek -> start_pre_announce), which already does.
         // (found via upstream shiguredo/srt-rs issue 0056, not yet in the
         // pulled subtree)
-        if let Some(ref crypto) = self.crypto {
+        if let Some(crypto) = &self.crypto {
             let wrapped_key = crypto.wrap_sek(crypto.current_key())?;
             let km_message = KmMessage::new(
                 crypto.current_key(),
@@ -3896,6 +4411,18 @@ impl SrtConnection {
                 crypto.cipher_mode(),
             );
             hs.add_km_request(&km_message);
+            // Tracked as pending so a KMRSP that does not acknowledge this
+            // request cannot complete the handshake; the handshake's own
+            // request retransmission owns the retry (`retries_left: None`),
+            // since it resends this same CONCLUSION with the KMREQ in it.
+            let state = self
+                .km_control
+                .get_or_insert_with(|| Box::new(KmControlState::default()));
+            state.pending = Some(PendingKmRequest {
+                request: km_message,
+                next_retry: now.add_micros(KM_REQUEST_RETRY_INTERVAL_MICROS),
+                retries_left: None,
+            });
         }
 
         // Add a SID extension if a Stream ID is set.
@@ -3937,9 +4464,9 @@ impl SrtConnection {
         // Declare our congestion control mode (see send_conclusion_request).
         hs.add_congestion_extension(&self.options.congestion_control);
 
-        // 受信した KMREQ をそのまま KMRSP として返す
-        if let Some(ref km) = self.received_km {
-            hs.add_km_response(km);
+        // Echo the caller's KMREQ as the KMRSP.
+        if let Some(km) = &self.received_km {
+            hs.add_km_response(km.as_ref());
         }
 
         // A GROUP extension in the RESPONSE names the RECEIVING group and is
@@ -3983,7 +4510,7 @@ impl SrtConnection {
         let packet = hs.encode(self.relative_timestamp(now), self.peer_socket_id);
         self.queue_handshake_control_packet(packet, now);
         self.terminate_handshake();
-        Error::handshake_rejected(reason)
+        Error::crypto_error(reason)
     }
 
     fn fail_caller_handshake(&mut self, reason: &str) -> Error {
@@ -4355,10 +4882,19 @@ fn make_nak_packet(control_info: Vec<u8>, timestamp: u32, peer_socket_id: u32) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handshake::{GroupType, SRTGROUP_MASK};
+    use crate::handshake::{
+        ExtensionType, GroupType, HandshakeExtension, SRTGROUP_MASK, extension_flags,
+    };
 
     /// Deterministic, non-secret KM salt for protocol test fixtures.
     fn test_km_salt() -> [u8; 16] {
+        std::array::from_fn(|index| index as u8)
+    }
+
+    /// Deterministic, non-secret salt for wire-shape fixtures in this module
+    /// (same derivation as `test_km_salt`; named for the hostile-control
+    /// cases that need a *body*, not a key).
+    fn fixture_salt() -> [u8; 16] {
         std::array::from_fn(|index| index as u8)
     }
 
@@ -4451,6 +4987,7 @@ mod tests {
             CryptoContext::KM_REFRESH_PERIOD - CryptoContext::KM_PRE_ANNOUNCE_PERIOD,
         );
         conn.crypto = Some(Box::new(crypto));
+        conn.set_state(ConnectionState::Connected);
 
         conn.check_km_refresh(Timestamp::from_micros(1));
         conn.check_km_refresh(Timestamp::from_micros(2));
@@ -7337,6 +7874,28 @@ mod tests {
         );
     }
 
+    fn hostile_control_corpus() -> Vec<(&'static str, Vec<u8>)> {
+        include_str!("../tests/corpus/hostile-controls.hex")
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.is_empty())
+            .map(|line| {
+                let (label, hex) = line
+                    .split_once('|')
+                    .expect("hostile corpus entry has a label and hex datagram");
+                assert!(hex.len().is_multiple_of(2), "{label}: even hex length");
+                let bytes = hex
+                    .as_bytes()
+                    .chunks_exact(2)
+                    .map(|pair| {
+                        u8::from_str_radix(std::str::from_utf8(pair).expect("ASCII hex"), 16)
+                            .expect("valid hex byte")
+                    })
+                    .collect();
+                (label, bytes)
+            })
+            .collect()
+    }
+
     /// Malformed or hostile control input is rejected *before* it can refresh
     /// peer activity or touch connection state.
     ///
@@ -7351,12 +7910,14 @@ mod tests {
     #[test]
     #[cfg_attr(
         all(miri, not(feature = "miri-extended")),
-        ignore = "full caller/listener handshake plus sixteen malformed controls; correctness  \
-                  is proven outside Miri. Run in the miri-extended scheduled job."
+        ignore = "full caller/listener handshake plus hostile control corpus; correctness is \
+                  proven outside Miri. Run in the miri-extended scheduled job."
     )]
     fn malformed_controls_cannot_refresh_liveness_or_state() {
         let (mut caller, _listener) = connected_pair();
         let socket_id = caller.socket_id();
+        let _ = drain_outputs(&mut caller);
+        while caller.poll_event().is_some() {}
         let now = Timestamp::from_micros(5_000_000);
 
         // Positive control: a canonical KEEPALIVE (one zero word, exactly what
@@ -7370,66 +7931,8 @@ mod tests {
             .expect("a canonical KEEPALIVE is accepted");
         assert_eq!(caller.last_recv_time, Some(now));
 
-        let unaligned_ack = vec![0u8; 6];
-        let non_canonical_ack_length = {
-            let mut cif = Vec::new();
-            write_u32(&mut cif, 0);
-            write_u32(&mut cif, 0);
-            cif
-        };
-        let nak_range_without_end = vec![0x80, 0, 0, 0];
-        let drop_req_high_bit = {
-            let mut cif = Vec::new();
-            write_u32(&mut cif, 0x8000_0001);
-            write_u32(&mut cif, 1);
-            cif
-        };
-        // Beyond everything this sender has ever put on the wire: a position
-        // no peer could legitimately report, in either an ACK's cumulative
-        // position or a NAK's loss list.
-        let beyond_frontier = caller
-            .next_sequence_number()
-            .expect("connected sender")
-            .wrapping_add(1_000)
-            & 0x7FFF_FFFF;
-        let future_ack = {
-            let mut cif = Vec::new();
-            write_u32(&mut cif, beyond_frontier);
-            cif
-        };
+        let corpus = hostile_control_corpus();
         let malformed: Vec<(&str, Vec<u8>)> = vec![
-            (
-                "ACK without a cumulative position",
-                control_datagram(socket_id, ControlType::Ack, 0, 0, Vec::new()),
-            ),
-            (
-                "ACK with a non-canonical (not 4/16/24/28/32-byte) length",
-                control_datagram(socket_id, ControlType::Ack, 0, 0, non_canonical_ack_length),
-            ),
-            (
-                "ACK naming a sequence beyond the sender's transmitted frontier",
-                control_datagram(socket_id, ControlType::Ack, 0, 0, future_ack),
-            ),
-            (
-                "NAK naming a sequence this sender never sent",
-                nak_datagram(socket_id, &[beyond_frontier, beyond_frontier]),
-            ),
-            (
-                "ACK with an unaligned cumulative position",
-                control_datagram(socket_id, ControlType::Ack, 0, 0, unaligned_ack),
-            ),
-            (
-                "NAK without a loss range",
-                control_datagram(socket_id, ControlType::Nak, 0, 0, Vec::new()),
-            ),
-            (
-                "NAK with an unaligned loss range",
-                control_datagram(socket_id, ControlType::Nak, 0, 0, vec![0, 0, 0]),
-            ),
-            (
-                "NAK range missing its end",
-                control_datagram(socket_id, ControlType::Nak, 0, 0, nak_range_without_end),
-            ),
             (
                 "ACKACK naming an ACK that was never sent",
                 control_datagram(socket_id, ControlType::AckAck, 0, 99_999, vec![0; 4]),
@@ -7455,14 +7958,6 @@ mod tests {
                 control_datagram(socket_id, ControlType::Shutdown, 0, 0, vec![0; 8]),
             ),
             (
-                "DROPREQ without two sequence words",
-                control_datagram(socket_id, ControlType::DropReq, 0, 0, vec![0; 4]),
-            ),
-            (
-                "DROPREQ with a sequence high bit set",
-                control_datagram(socket_id, ControlType::DropReq, 0, 0, drop_req_high_bit),
-            ),
-            (
                 "key-management request with an unaligned body",
                 control_datagram(
                     socket_id,
@@ -7483,20 +7978,24 @@ mod tests {
                 ),
             ),
             (
+                // Eight bytes: longer than the one-word error form (which
+                // is a valid, ignored KMRSP -- see
+                // `a_one_word_kmrsp_error_is_ignored_without_state_change`)
+                // and shorter than any KM message.
                 "key-management response with a truncated body",
                 control_datagram(
                     socket_id,
                     ControlType::UserDefined,
                     SRT_CMD_KMRSP,
                     0,
-                    vec![0; 4],
+                    vec![0; 8],
                 ),
             ),
         ];
 
         let baseline = caller.stats();
         let later = now.add_micros(1_000);
-        for (label, datagram) in malformed {
+        for (label, datagram) in corpus.into_iter().chain(malformed) {
             let error = caller
                 .feed_recv_buf(&datagram, later)
                 .expect_err("malformed control input is rejected");
@@ -7512,6 +8011,14 @@ mod tests {
                 "{label}: rejected input changed state"
             );
             assert_eq!(caller.state(), ConnectionState::Connected, "{label}");
+            assert!(
+                drain_outputs(&mut caller).is_empty(),
+                "{label}: rejected input emitted output"
+            );
+            assert!(
+                caller.poll_event().is_none(),
+                "{label}: rejected input emitted an application event"
+            );
         }
 
         // A well-formed SHUTDOWN is still accepted afterwards, and it is the
@@ -7592,6 +8099,1437 @@ mod tests {
         );
     }
 
+    /// A one-word KMRSP is the peer reporting a key-material error state.
+    /// The reference ignores it during an established session without
+    /// changing security state; here it is accepted as well-formed, changes
+    /// nothing, and leaves an outstanding rotation to its own bounded
+    /// retries rather than being counted as malformed input.
+    #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "real AES-CTR handshake and encrypted round trips under Miri; run in the \
+                  miri-extended scheduled job"
+    )]
+    fn a_one_word_kmrsp_error_is_ignored_without_state_change() {
+        let (mut caller, mut listener) = encrypted_pair(CipherMode::Ctr);
+        for connection in [&mut caller, &mut listener] {
+            while connection.poll_event().is_some() {}
+            let _ = drain_outputs(connection);
+        }
+        let now = Timestamp::from_micros(10_000_000);
+        caller
+            .provide_new_sek(&[0x33; 16], now)
+            .expect("rotation starts");
+        let _ = drain_outputs(&mut caller);
+        let before = km_security_snapshot(&caller);
+        let pending_before = caller
+            .km_control
+            .as_ref()
+            .and_then(|state| state.pending.as_ref())
+            .map(|pending| pending.request.clone());
+        assert!(pending_before.is_some(), "a rotation is outstanding");
+
+        let error_word = (KmError::BadSecret as u32).to_le_bytes().to_vec();
+        let datagram = control_datagram(
+            caller.socket_id(),
+            ControlType::UserDefined,
+            SRT_CMD_KMRSP,
+            0,
+            error_word,
+        );
+        caller
+            .feed_recv_buf(&datagram, now.add_micros(10))
+            .expect("a one-word KMRSP error is well-formed");
+
+        assert_eq!(
+            km_security_snapshot(&caller),
+            before,
+            "no security state change"
+        );
+        assert_eq!(
+            caller
+                .km_control
+                .as_ref()
+                .and_then(|state| state.pending.as_ref())
+                .map(|pending| pending.request.clone()),
+            pending_before,
+            "the rotation keeps its own bounded retries"
+        );
+        assert_encrypted_roundtrip(
+            &mut caller,
+            &mut listener,
+            now.add_micros(20),
+            b"after an error KMRSP",
+        );
+    }
+
+    /// Regression for the post-establishment encryption-state downgrade class
+    /// fixed by Haivision in CVE-2026-55868. Every hostile KM control is
+    /// rejected transactionally: the secured context, generation histories,
+    /// liveness, output, and subsequent encrypted DATA path stay intact.
+    #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "real AES-CTR handshake and repeated encrypted round trips under Miri; run in \
+                  the miri-extended scheduled job"
+    )]
+    fn hostile_key_management_cannot_downgrade_a_secured_session() {
+        let (mut caller, mut listener) = encrypted_pair(CipherMode::Ctr);
+        for connection in [&mut caller, &mut listener] {
+            while connection.poll_event().is_some() {}
+            let _ = drain_outputs(connection);
+        }
+
+        let mut tick = 10_000_000;
+        assert_encrypted_roundtrip(
+            &mut caller,
+            &mut listener,
+            Timestamp::from_micros(tick),
+            b"initial caller data",
+        );
+        tick += 10;
+        assert_encrypted_roundtrip(
+            &mut listener,
+            &mut caller,
+            Timestamp::from_micros(tick),
+            b"initial listener data",
+        );
+
+        let old_material = current_km_message(&caller);
+
+        // A four-byte KMRSP whose word is not a known KM state (BadSecret
+        // written big-endian; the reference's error word is little-endian)
+        // is malformed, and must not demote an already-secured sender. The
+        // genuine one-word error form is ignored instead:
+        // `a_one_word_kmrsp_error_is_ignored_without_state_change`.
+        let mut failure = Vec::with_capacity(4);
+        write_u32(&mut failure, KmError::BadSecret as u32);
+        tick += 10;
+        assert_km_control_rejected(
+            &mut caller,
+            SRT_CMD_KMRSP,
+            failure,
+            Timestamp::from_micros(tick),
+            "delayed handshake KMRSP failure",
+        );
+        assert_encrypted_roundtrip(
+            &mut listener,
+            &mut caller,
+            Timestamp::from_micros(tick + 1),
+            b"after delayed failure",
+        );
+
+        tick += 10;
+        // A KMRSP body that is a real KM message truncated mid-header: a
+        // malformed shape rather than a hard-coded value.
+        let mut truncated_response = KmMessage::new(
+            KeyFlag::Even,
+            KeyLength::Aes128,
+            fixture_salt(),
+            vec![0x5A; 24],
+            CipherMode::Ctr,
+        )
+        .encode();
+        truncated_response.truncate(16);
+        assert_km_control_rejected(
+            &mut caller,
+            SRT_CMD_KMRSP,
+            truncated_response,
+            Timestamp::from_micros(tick),
+            "malformed KMRSP",
+        );
+        assert_encrypted_roundtrip(
+            &mut listener,
+            &mut caller,
+            Timestamp::from_micros(tick + 1),
+            b"after malformed response",
+        );
+
+        tick += 10;
+        assert_km_control_rejected(
+            &mut caller,
+            SRT_CMD_KMRSP,
+            old_material.encode(),
+            Timestamp::from_micros(tick),
+            "valid old handshake KMRSP",
+        );
+        assert_encrypted_roundtrip(
+            &mut listener,
+            &mut caller,
+            Timestamp::from_micros(tick + 1),
+            b"after old response",
+        );
+
+        // A syntactically valid header that declares no supported AES key
+        // length must fail before touching the receiver's key slots.
+        let mut malformed_key_length = old_material.encode();
+        malformed_key_length[15] = 5; // 20 bytes, not AES-128/192/256.
+        tick += 10;
+        assert_km_control_rejected(
+            &mut listener,
+            SRT_CMD_KMREQ,
+            malformed_key_length,
+            Timestamp::from_micros(tick),
+            "KMREQ with malformed key length",
+        );
+        assert_encrypted_roundtrip(
+            &mut caller,
+            &mut listener,
+            Timestamp::from_micros(tick + 1),
+            b"after malformed request",
+        );
+
+        // Start a real refresh. While its response is pending, an otherwise
+        // valid response carrying different key material must not acknowledge
+        // this rotation.
+        caller
+            .provide_new_sek(&[0x6B; 16], Timestamp::from_micros(tick + 2))
+            .expect("start key refresh");
+        let request = take_user_defined_datagram(&mut caller, SRT_CMD_KMREQ);
+        let mut unrelated = key_message_from_datagram(&request);
+        unrelated.wrapped_key[0] ^= 0x80;
+        tick += 10;
+        assert_km_control_rejected(
+            &mut caller,
+            SRT_CMD_KMRSP,
+            unrelated.encode(),
+            Timestamp::from_micros(tick),
+            "KMRSP for unrelated generation",
+        );
+        assert_encrypted_roundtrip(
+            &mut listener,
+            &mut caller,
+            Timestamp::from_micros(tick + 1),
+            b"while response pending",
+        );
+
+        // The matching request/response still succeeds after the attacks.
+        listener
+            .feed_recv_buf(&request, Timestamp::from_micros(tick + 2))
+            .expect("matching KMREQ is accepted");
+        let response = take_user_defined_datagram(&mut listener, SRT_CMD_KMRSP);
+        caller
+            .feed_recv_buf(&response, Timestamp::from_micros(tick + 3))
+            .expect("matching KMRSP is accepted");
+
+        tick += 10;
+        assert_km_control_rejected(
+            &mut caller,
+            SRT_CMD_KMRSP,
+            key_message_from_datagram(&response).encode(),
+            Timestamp::from_micros(tick),
+            "duplicated successful KMRSP",
+        );
+        assert_encrypted_roundtrip(
+            &mut listener,
+            &mut caller,
+            Timestamp::from_micros(tick + 1),
+            b"after duplicate response",
+        );
+
+        // The initial even generation now has the selector expected after the
+        // accepted odd generation. Full-message replay history, rather than
+        // selector parity alone, is what prevents this rollback.
+        tick += 10;
+        assert_km_control_rejected(
+            &mut listener,
+            SRT_CMD_KMREQ,
+            old_material.encode(),
+            Timestamp::from_micros(tick),
+            "KMREQ replay of stale generation",
+        );
+        assert_encrypted_roundtrip(
+            &mut caller,
+            &mut listener,
+            Timestamp::from_micros(tick + 1),
+            b"after stale request",
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "real AES-CTR handshake and late-handshake matrix under Miri; run in the \
+                  miri-extended scheduled job"
+    )]
+    fn late_handshakes_cannot_roll_back_or_retarget_a_connected_session() {
+        let (mut caller, mut listener) = encrypted_pair(CipherMode::Ctr);
+        let conclusion_request = caller
+            .last_handshake_packet
+            .clone()
+            .expect("caller retained its CONCLUSION request");
+        let conclusion_response = listener
+            .last_handshake_packet
+            .clone()
+            .expect("listener retained its CONCLUSION response");
+
+        for (target, mut valid) in [
+            (&mut caller, conclusion_response),
+            (&mut listener, conclusion_request),
+        ] {
+            // The initial caller CONCLUSION targets socket zero; once the
+            // listener is established, its demultiplexer requires its own ID.
+            valid.dest_socket_id = target.socket_id();
+            let _ = drain_outputs(target);
+            while target.poll_event().is_some() {}
+            let peer_id = target.peer_socket_id;
+            let cookie = target.syn_cookie;
+            let original = HandshakePacket::decode(&valid).expect("valid conclusion");
+            let mut different_socket = original.clone();
+            different_socket.socket_id ^= 1;
+            let mut different_cookie = original.clone();
+            different_cookie.syn_cookie ^= 1;
+            let mut different_isn = original.clone();
+            different_isn.initial_packet_seq ^= 1;
+            let bad = [
+                (
+                    "late rejection",
+                    HandshakePacket::new_rejection(peer_id, cookie, 3)
+                        .encode(0, target.socket_id()),
+                ),
+                (
+                    "late induction",
+                    HandshakePacket::new_induction_response(peer_id, cookie, 0)
+                        .encode(0, target.socket_id()),
+                ),
+                (
+                    "retargeted socket",
+                    different_socket.encode(0, target.socket_id()),
+                ),
+                (
+                    "wrong cookie",
+                    different_cookie.encode(0, target.socket_id()),
+                ),
+                ("wrong ISN", different_isn.encode(0, target.socket_id())),
+            ];
+
+            let baseline = target.stats();
+            let before = km_security_snapshot(target);
+            let last_recv_time = target.last_recv_time;
+            for (label, datagram) in bad {
+                let mut bytes = Vec::new();
+                datagram.encode(&mut bytes).expect("wire-format control");
+                let error = target
+                    .feed_recv_buf(&bytes, Timestamp::from_micros(1_000_000))
+                    .expect_err("late handshake mismatch must be rejected");
+                assert_eq!(error.kind, crate::error::ErrorKind::InvalidData, "{label}");
+                assert_eq!(km_security_snapshot(target), before, "{label}");
+                assert_eq!(target.stats(), baseline, "{label}");
+                assert_eq!(target.last_recv_time, last_recv_time, "{label}");
+                assert!(drain_outputs(target).is_empty(), "{label}: output");
+                assert!(target.poll_event().is_none(), "{label}: event");
+            }
+
+            let mut truncated = valid.clone();
+            truncated.control_info.pop();
+            let mut bytes = Vec::new();
+            truncated.encode(&mut bytes).expect("wire-format control");
+            target
+                .feed_recv_buf(&bytes, Timestamp::from_micros(1_000_001))
+                .expect_err("truncated late extension must be rejected");
+            assert_eq!(km_security_snapshot(target), before);
+            assert_eq!(target.last_recv_time, last_recv_time);
+            assert!(drain_outputs(target).is_empty());
+
+            // A genuine repeated CONCLUSION remains recoverable after all
+            // invalid controls; only it may re-send the retained response.
+            let mut bytes = Vec::new();
+            valid
+                .encode(&mut bytes)
+                .expect("valid duplicate conclusion");
+            target
+                .feed_recv_buf(&bytes, Timestamp::from_micros(1_000_002))
+                .expect("same peer may retransmit its CONCLUSION");
+            assert!(
+                drain_outputs(target)
+                    .iter()
+                    .any(|output| matches!(output, ConnectionOutput::SendPacket(_))),
+                "a genuine duplicate still gets its handshake response"
+            );
+            assert_eq!(target.state(), ConnectionState::Connected);
+        }
+
+        assert_encrypted_roundtrip(
+            &mut caller,
+            &mut listener,
+            Timestamp::from_micros(1_000_010),
+            b"post-handshake caller DATA",
+        );
+        assert_encrypted_roundtrip(
+            &mut listener,
+            &mut caller,
+            Timestamp::from_micros(1_000_020),
+            b"post-handshake listener DATA",
+        );
+    }
+
+    /// One handshake attempt in which the caller and the listener advertise
+    /// `caller_mss` and `listener_mss` instead of their constructor defaults,
+    /// and both connections are told their path is `family`, as a transport
+    /// does from its socket address (`SrtConnection::set_ip_family`).
+    struct MssHandshake {
+        caller: SrtConnection,
+        listener: SrtConnection,
+        /// Feeding the caller's rewritten CONCLUSION request to the listener.
+        listener_result: Result<(), Error>,
+        /// Feeding the listener's rewritten CONCLUSION response to the caller.
+        caller_result: Result<(), Error>,
+    }
+
+    /// How a test wants in-flight handshake packets rewritten.
+    #[derive(Clone, Copy)]
+    struct HandshakeRewrite {
+        /// Advertised MSS.
+        mss: u32,
+        /// Path family of the side that sends these packets.
+        family: IpFamily,
+        /// Add a FILTER extension: a packet-filter *negotiation*.
+        filter_extension: bool,
+        /// Set `PACKET_FILTER` in the HS extension's `srt_flags`: a
+        /// capability *advertisement*, which must stay acceptable on its own.
+        packet_filter_flag: bool,
+        /// Optional wire-level overrides for handshake regressions.
+        flow_window: Option<u32>,
+        handshake_version: Option<u32>,
+        srt_version: Option<u32>,
+    }
+
+    impl HandshakeRewrite {
+        fn mss(mss: u32, family: IpFamily) -> Self {
+            Self {
+                mss,
+                family,
+                filter_extension: false,
+                packet_filter_flag: false,
+                flow_window: None,
+                handshake_version: None,
+                srt_version: None,
+            }
+        }
+    }
+
+    /// Rewrite one handshake packet: its advertised MSS, its peer address,
+    /// and optionally its packet-filter advertisement or negotiation.
+    fn rewrite_handshake(datagram: &[u8], rewrite: &HandshakeRewrite) -> Vec<u8> {
+        let SrtPacket::Control(control) =
+            SrtPacket::decode(datagram).expect("handshake datagram decodes")
+        else {
+            panic!("handshake must be a control packet");
+        };
+        let mut handshake = HandshakePacket::decode(&control).expect("handshake decodes");
+        handshake.mtu = rewrite.mss;
+        if let Some(flow_window) = rewrite.flow_window {
+            handshake.flow_window = flow_window;
+        }
+        if let Some(version) = rewrite.handshake_version {
+            handshake.version = version;
+        }
+        if rewrite.packet_filter_flag
+            && let Some(extension) = handshake.get_hs_extension()
+        {
+            handshake
+                .extensions
+                .retain(|ext| !matches!(ext.ext_type, ExtensionType::HsReq | ExtensionType::HsRsp));
+            handshake.add_hs_extension(
+                extension.srt_version,
+                extension.srt_flags | srt_flags::PACKET_FILTER,
+                extension.recv_tsbpd_delay,
+            );
+        }
+        if rewrite.filter_extension {
+            handshake.extensions.push(HandshakeExtension {
+                ext_type: ExtensionType::Filter,
+                data: b"fec\0".to_vec(),
+            });
+            handshake.extension_field |= extension_flags::CONFIG;
+        }
+        if let Some(version) = rewrite.srt_version {
+            for extension in &mut handshake.extensions {
+                if matches!(
+                    extension.ext_type,
+                    ExtensionType::HsReq | ExtensionType::HsRsp
+                ) && extension.data.len() >= 4
+                {
+                    extension.data[..4].copy_from_slice(&version.to_be_bytes());
+                }
+            }
+        }
+        let rewritten = handshake.encode(control.timestamp, control.dest_socket_id);
+        let mut bytes = Vec::new();
+        rewritten.encode(&mut bytes).expect("re-encodes");
+        bytes
+    }
+
+    /// Every handshake packet in the connection's output queue, rewritten.
+    fn drain_rewritten_handshakes(
+        conn: &mut SrtConnection,
+        rewrite: &HandshakeRewrite,
+    ) -> Vec<Vec<u8>> {
+        let mut rewritten = Vec::new();
+        for output in drain_outputs(conn) {
+            let ConnectionOutput::SendPacket(bytes) = output else {
+                continue;
+            };
+            let is_handshake = matches!(
+                SrtPacket::decode(&bytes),
+                Ok(SrtPacket::Control(ControlPacket {
+                    control_type: ControlType::Handshake,
+                    ..
+                }))
+            );
+            if is_handshake {
+                rewritten.push(rewrite_handshake(&bytes, rewrite));
+            }
+        }
+        rewritten
+    }
+
+    fn mss_handshake(
+        caller_mss: u32,
+        listener_mss: u32,
+        family: IpFamily,
+        listener_options: ConnectionOptions,
+    ) -> MssHandshake {
+        handshake_with_rewrites(
+            &HandshakeRewrite::mss(caller_mss, family),
+            &HandshakeRewrite::mss(listener_mss, family),
+            listener_options,
+        )
+    }
+
+    /// Drive one handshake in which each direction's packets are rewritten
+    /// independently, so a test can vary what each side advertises.
+    fn handshake_with_rewrites(
+        caller_rewrite: &HandshakeRewrite,
+        listener_rewrite: &HandshakeRewrite,
+        listener_options: ConnectionOptions,
+    ) -> MssHandshake {
+        handshake_with_options(
+            caller_rewrite,
+            listener_rewrite,
+            ConnectionOptions {
+                socket_id: 1,
+                ..ConnectionOptions::default()
+            },
+            listener_options,
+        )
+    }
+
+    fn handshake_with_options(
+        caller_rewrite: &HandshakeRewrite,
+        listener_rewrite: &HandshakeRewrite,
+        caller_options: ConnectionOptions,
+        listener_options: ConnectionOptions,
+    ) -> MssHandshake {
+        let mut caller = SrtConnection::new_caller(caller_options);
+        let mut listener = SrtConnection::new_listener(listener_options);
+        caller.set_ip_family(caller_rewrite.family);
+        listener.set_ip_family(listener_rewrite.family);
+        caller
+            .connect(Timestamp::from_micros(0))
+            .expect("caller starts");
+        let requests = drain_rewritten_handshakes(&mut caller, caller_rewrite);
+        assert_eq!(requests.len(), 1, "one INDUCTION request");
+        listener
+            .feed_recv_buf(&requests[0], Timestamp::from_micros(1_000))
+            .expect("listener accepts INDUCTION");
+        let responses = drain_rewritten_handshakes(&mut listener, listener_rewrite);
+        assert_eq!(responses.len(), 1, "one INDUCTION response");
+        caller
+            .feed_recv_buf(&responses[0], Timestamp::from_micros(2_000))
+            .expect("caller accepts INDUCTION response");
+
+        let conclusions = drain_rewritten_handshakes(&mut caller, caller_rewrite);
+        assert_eq!(conclusions.len(), 1, "one CONCLUSION request");
+        let listener_result =
+            listener.feed_recv_buf(&conclusions[0], Timestamp::from_micros(3_000));
+
+        let caller_result = if listener_result.is_ok() {
+            let answers = drain_rewritten_handshakes(&mut listener, listener_rewrite);
+            assert_eq!(answers.len(), 1, "one CONCLUSION response");
+            caller.feed_recv_buf(&answers[0], Timestamp::from_micros(4_000))
+        } else {
+            Ok(())
+        };
+
+        MssHandshake {
+            caller,
+            listener,
+            listener_result,
+            caller_result,
+        }
+    }
+
+    /// The handshake MTU field is an IP-layer MTU for every reference
+    /// implementation, so a peer's advertised value bounds what that peer's
+    /// stack can receive. The negotiated payload is `min` of this core's own
+    /// datagram budget and the peer's ceiling, and both roles fail closed on
+    /// a value outside the derived bounds before committing any state.
+    #[test]
+    fn peer_mss_bounds_are_derived_from_wire_semantics_and_enforced() {
+        let v4 = IpFamily::V4;
+        let v6 = IpFamily::V6;
+
+        // Positive and boundary cases: (advertised MSS, path family, negotiated
+        // DATA payload). 1500 is the reference default (1456 = 1500 - 28 - 16,
+        // libsrt's own `mss - (UDP_HDR_SIZE + HDR_SIZE)`); 52 and 72 are the
+        // smallest values that still leave one 8-byte NAK record.
+        for (mss, family, expected_payload) in [
+            (1500u32, v4, 1456usize),
+            (1200, v4, 1156),
+            (52, v4, 8),
+            (72, v6, 8),
+        ] {
+            let attempt = mss_handshake(mss, mss, family, listener_options());
+            attempt
+                .listener_result
+                .unwrap_or_else(|error| panic!("listener accepted MSS {mss}: {error}"));
+            attempt
+                .caller_result
+                .unwrap_or_else(|error| panic!("caller accepted MSS {mss}: {error}"));
+            for (who, conn) in [("caller", &attempt.caller), ("listener", &attempt.listener)] {
+                assert_eq!(conn.state(), ConnectionState::Connected, "{who} MSS {mss}");
+                assert_eq!(
+                    conn.effective_max_payload_size(),
+                    expected_payload,
+                    "{who} negotiated payload for MSS {mss}"
+                );
+            }
+        }
+
+        // Negative cases: one byte below the family's derived minimum, the
+        // reference's own (weaker) 4-byte floor, and anything above the
+        // largest MSS this implementation negotiates. The jumbo case is a
+        // deliberate local policy rather than a reference rule: pinned
+        // libsrt's *listener* would clamp `min(local, peer)` and accept a
+        // jumbo peer, but this stack implements no jumbo/path-MTU
+        // negotiation, so it refuses the session instead of clamping it.
+        for (mss, family) in [
+            (51u32, v4),
+            (48, v4),
+            (0, v4),
+            (71, v6),
+            (68, v6),
+            (1501, v4),
+            (9000, v4),
+            (u32::MAX, v4),
+        ] {
+            assert_unusable_peer_mss_is_refused(mss, family);
+        }
+    }
+
+    /// The MSS floor includes the cipher's authentication tag: under GCM a
+    /// negotiated payload must still carry the 16-byte tag plus one byte of
+    /// DATA, so the smallest usable MSS is 28 + 16 + 17 = 61 on IPv4 and 81
+    /// on IPv6, against 52 and 72 under CTR (one 8-byte NAK record). At the
+    /// exact minimum both roles connect and can send one byte of DATA; one
+    /// below it, the listener refuses before committing anything.
+    #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "real KM handshakes derive their KEK via 2048 PBKDF2-HMAC-SHA1 iterations   \
+                  (per the SRT spec) on each side under Miri, which dominates this job's     \
+                  time; the MSS arithmetic is unrelated to PBKDF2. Run in the               \
+                  miri-extended scheduled job."
+    )]
+    fn the_mss_floor_leaves_room_for_the_gcm_tag_on_both_families() {
+        let options = |socket_id: u32, cipher_mode: CipherMode| ConnectionOptions {
+            socket_id,
+            syn_cookie: (socket_id == 2).then_some(7),
+            passphrase: Some("shared-secret".to_owned()),
+            crypto_salt: Some(test_km_salt()),
+            crypto_sek: Some(vec![0x24u8; 16]),
+            cipher_mode,
+            ..ConnectionOptions::default()
+        };
+        for (family, cipher_mode, min_mss, payload_at_min) in [
+            (IpFamily::V4, CipherMode::Ctr, 52u32, 8usize),
+            (IpFamily::V6, CipherMode::Ctr, 72, 8),
+            (IpFamily::V4, CipherMode::Gcm, 61, 1),
+            (IpFamily::V6, CipherMode::Gcm, 81, 1),
+        ] {
+            let at_min = handshake_with_options(
+                &HandshakeRewrite::mss(min_mss, family),
+                &HandshakeRewrite::mss(min_mss, family),
+                options(1, cipher_mode),
+                options(2, cipher_mode),
+            );
+            let case = format!("{family:?} {cipher_mode:?} MSS {min_mss}");
+            at_min
+                .listener_result
+                .unwrap_or_else(|error| panic!("listener accepts {case}: {error}"));
+            at_min
+                .caller_result
+                .unwrap_or_else(|error| panic!("caller accepts {case}: {error}"));
+            for (who, conn) in [("caller", &at_min.caller), ("listener", &at_min.listener)] {
+                assert_eq!(conn.state(), ConnectionState::Connected, "{who} {case}");
+                assert_eq!(
+                    conn.effective_max_payload_size(),
+                    payload_at_min,
+                    "{who} {case}: usable DATA payload at the minimum"
+                );
+            }
+
+            let below = handshake_with_options(
+                &HandshakeRewrite::mss(min_mss - 1, family),
+                &HandshakeRewrite::mss(min_mss - 1, family),
+                options(1, cipher_mode),
+                options(2, cipher_mode),
+            );
+            let error = below
+                .listener_result
+                .expect_err("one below the minimum is refused");
+            assert_eq!(
+                error.kind,
+                crate::ErrorKind::HandshakeRejected,
+                "{case} - 1"
+            );
+            assert_eq!(below.listener.state(), ConnectionState::Disconnected);
+        }
+    }
+
+    /// A peer MSS outside the derived bounds is refused by the listener with
+    /// the reference's own rejection code, and nothing about the attempt is
+    /// committed.
+    fn assert_unusable_peer_mss_is_refused(mss: u32, family: IpFamily) {
+        let mut attempt = mss_handshake(mss, mss, family, listener_options());
+        let error = attempt
+            .listener_result
+            .expect_err("listener rejects an unusable peer MSS");
+        assert_eq!(error.kind, crate::ErrorKind::HandshakeRejected, "MSS {mss}");
+        assert!(
+            error.reason.contains("MSS"),
+            "the rejection must name the field: {}",
+            error.reason
+        );
+        assert!(
+            error.reason.contains("minimum") || error.reason.contains("maximum"),
+            "the rejection must name the violated bound: {}",
+            error.reason
+        );
+        assert_eq!(attempt.listener.state(), ConnectionState::Disconnected);
+        // Nothing about the attempt was committed: no crypto, no peer
+        // stream, no negotiated payload, no session sequence.
+        assert!(attempt.listener.crypto.is_none());
+        assert!(attempt.listener.peer_stream_id.is_none());
+        assert_eq!(
+            attempt.listener.max_payload_size,
+            DEFAULT_MTU as usize - SRT_HEADER_SIZE
+        );
+        assert_eq!(attempt.listener.initial_seq, 0);
+
+        // The listener answers with the reference's own rejection code rather
+        // than staying silent.
+        let rejections: Vec<_> = drain_outputs(&mut attempt.listener)
+            .into_iter()
+            .filter_map(|output| match output {
+                ConnectionOutput::SendPacket(bytes) => Some(bytes),
+                _ => None,
+            })
+            .filter_map(|bytes| match SrtPacket::decode(&bytes) {
+                Ok(SrtPacket::Control(control)) => Some(control),
+                _ => None,
+            })
+            .filter(|control| control.control_type == ControlType::Handshake)
+            .collect();
+        assert_eq!(rejections.len(), 1, "one rejection response for MSS {mss}");
+        let rejection = HandshakePacket::decode(&rejections[0]).expect("rejection decodes");
+        assert_eq!(rejection.handshake_type, HandshakeType::Rejected);
+        assert_eq!(rejection.reject_reason, Some(SRT_REJ_ROGUE));
+    }
+
+    /// A caller rejects an unusable listener MSS terminally, and a listener
+    /// that rejected one attempt still serves a fresh peer.
+    #[test]
+    fn an_unusable_listener_mss_fails_the_caller_and_leaves_the_listener_serving() {
+        let v4 = IpFamily::V4;
+        let attempt = mss_handshake(1500, 40, v4, listener_options());
+        attempt
+            .listener_result
+            .expect("the listener accepts the caller");
+        let error = attempt
+            .caller_result
+            .expect_err("caller rejects the listener's MSS");
+        assert_eq!(error.kind, crate::ErrorKind::HandshakeRejected);
+        assert!(
+            error.reason.contains("peer MSS 40"),
+            "the rejection names the value: {}",
+            error.reason
+        );
+        assert_eq!(attempt.caller.state(), ConnectionState::Disconnected);
+
+        // A fresh listener (the rejected one is terminal by design, like
+        // every other rejected handshake) serves the same peer at a legal
+        // MSS.
+        let accepted = mss_handshake(1500, 1500, v4, listener_options());
+        accepted.listener_result.expect("fresh listener accepts");
+        accepted.caller_result.expect("caller accepts");
+        assert_eq!(accepted.listener.state(), ConnectionState::Connected);
+        assert_eq!(accepted.caller.state(), ConnectionState::Connected);
+    }
+
+    /// The negotiated minimum payload is not merely accepted: a connection
+    /// running at it can still fragment, deliver, and report loss (the NAK
+    /// budget is the reason that floor exists, and `NakChunkEncoder` requires
+    /// a whole 8-byte record).
+    #[test]
+    fn a_connection_at_the_negotiated_minimum_still_reports_loss() {
+        let v4 = IpFamily::V4;
+        let attempt = mss_handshake(52, 52, v4, listener_options());
+        attempt.listener_result.expect("listener accepts");
+        attempt.caller_result.expect("caller accepts");
+        let MssHandshake {
+            mut caller,
+            mut listener,
+            ..
+        } = attempt;
+        assert_eq!(caller.effective_max_payload_size(), 8);
+
+        let payload = [0xABu8; 40];
+        caller
+            .send_message(&payload, Timestamp::from_micros(5_000))
+            .expect("the message is admitted as fragments");
+        let fragments: Vec<Vec<u8>> = drain_outputs(&mut caller)
+            .into_iter()
+            .filter_map(|output| match output {
+                ConnectionOutput::SendPacket(bytes) => Some(bytes),
+                _ => None,
+            })
+            .filter(|bytes| matches!(SrtPacket::decode(bytes), Ok(SrtPacket::Data(_))))
+            .collect();
+        assert!(
+            fragments.len() > 1,
+            "an 8-byte payload budget must fragment a 40-byte message, got {}",
+            fragments.len()
+        );
+
+        // Deliver everything but the second fragment: the gap is only
+        // reportable once a later sequence arrives, and the report is a NAK
+        // whose 8-byte loss record is exactly the negotiated budget.
+        for (index, fragment) in fragments.iter().enumerate() {
+            if index == 1 {
+                continue;
+            }
+            listener
+                .feed_recv_buf(fragment, Timestamp::from_micros(5_100 + index as u64))
+                .expect("a fragment is accepted");
+        }
+        let nak = drain_outputs(&mut listener).into_iter().find_map(|output| {
+            let ConnectionOutput::SendPacket(bytes) = output else {
+                return None;
+            };
+            match SrtPacket::decode(&bytes) {
+                Ok(SrtPacket::Control(control)) if control.control_type == ControlType::Nak => {
+                    Some(control)
+                }
+                _ => None,
+            }
+        });
+        let nak = nak.expect("the receiver must report the gap");
+        assert!(
+            !nak.control_info.is_empty() && nak.control_info.len() <= MAX_NAK_RECORD_SIZE,
+            "a NAK must fit the negotiated budget: {} bytes",
+            nak.control_info.len()
+        );
+        assert_eq!(listener.state(), ConnectionState::Connected);
+    }
+
+    fn listener_options() -> ConnectionOptions {
+        ConnectionOptions {
+            socket_id: 2,
+            syn_cookie: Some(7),
+            ..ConnectionOptions::default()
+        }
+    }
+
+    fn take_one_rewritten_handshake(
+        conn: &mut SrtConnection,
+        rewrite: &HandshakeRewrite,
+    ) -> Vec<u8> {
+        let mut packets = drain_rewritten_handshakes(conn, rewrite);
+        assert_eq!(packets.len(), 1, "one handshake packet");
+        packets.remove(0)
+    }
+
+    fn rejection_reason(conn: &mut SrtConnection) -> Option<i32> {
+        drain_outputs(conn).into_iter().find_map(|output| {
+            let ConnectionOutput::SendPacket(bytes) = output else {
+                return None;
+            };
+            let SrtPacket::Control(control) = SrtPacket::decode(&bytes).ok()? else {
+                return None;
+            };
+            (control.control_type == ControlType::Handshake)
+                .then(|| HandshakePacket::decode(&control).ok()?.reject_reason)
+                .flatten()
+        })
+    }
+
+    #[test]
+    fn peer_flow_window_accepts_two_and_rejects_unusable_induction() {
+        let v4 = IpFamily::V4;
+        let plain = HandshakeRewrite::mss(1500, v4);
+        let mut minimum = plain;
+        minimum.flow_window = Some(MIN_PEER_FLOW_WINDOW);
+        let accepted = handshake_with_rewrites(&minimum, &minimum, listener_options());
+        accepted
+            .listener_result
+            .expect("two-packet window is valid");
+        accepted
+            .caller_result
+            .expect("two-packet window interoperates");
+        for connection in [&accepted.caller, &accepted.listener] {
+            assert_eq!(connection.peer_flow_window, MIN_PEER_FLOW_WINDOW);
+        }
+
+        for flow_window in [0, 1, 0x8000_0000, u32::MAX] {
+            let mut caller = SrtConnection::new_caller(ConnectionOptions {
+                socket_id: 1,
+                ..ConnectionOptions::default()
+            });
+            caller.set_ip_family(v4);
+            caller
+                .connect(Timestamp::from_micros(0))
+                .expect("caller starts");
+            let request = take_one_rewritten_handshake(&mut caller, &plain);
+            let mut malformed = plain;
+            malformed.flow_window = Some(flow_window);
+            let invalid_request = rewrite_handshake(&request, &malformed);
+            let mut listener = SrtConnection::new_listener(listener_options());
+            listener.set_ip_family(v4);
+            let error = listener
+                .feed_recv_buf(&invalid_request, Timestamp::from_micros(1_000))
+                .expect_err("unusable signed flow window is rejected");
+            assert_eq!(
+                error.kind,
+                crate::ErrorKind::InvalidData,
+                "{flow_window:#x}"
+            );
+            assert_eq!(listener.peer_socket_id, 0, "{flow_window:#x}");
+            assert!(listener.handshake_started_at.is_none(), "{flow_window:#x}");
+            assert!(drain_outputs(&mut listener).is_empty(), "{flow_window:#x}");
+            listener
+                .feed_recv_buf(&request, Timestamp::from_micros(1_001))
+                .expect("malformed stateless induction did not poison listener");
+        }
+    }
+
+    #[test]
+    fn listener_rejects_unusable_flow_window_in_conclusion() {
+        let v4 = IpFamily::V4;
+        let plain = HandshakeRewrite::mss(1500, v4);
+        let mut caller = SrtConnection::new_caller(ConnectionOptions {
+            socket_id: 1,
+            ..ConnectionOptions::default()
+        });
+        caller.set_ip_family(v4);
+        caller
+            .connect(Timestamp::from_micros(0))
+            .expect("caller starts");
+        let request = take_one_rewritten_handshake(&mut caller, &plain);
+        let mut listener = SrtConnection::new_listener(listener_options());
+        listener.set_ip_family(v4);
+        listener
+            .feed_recv_buf(&request, Timestamp::from_micros(1_000))
+            .expect("listener accepts induction");
+        let response = take_one_rewritten_handshake(&mut listener, &plain);
+        caller
+            .feed_recv_buf(&response, Timestamp::from_micros(2_000))
+            .expect("caller accepts induction response");
+        let conclusion = take_one_rewritten_handshake(&mut caller, &plain);
+        let mut malformed = plain;
+        malformed.flow_window = Some(0x8000_0000);
+        let invalid_conclusion = rewrite_handshake(&conclusion, &malformed);
+
+        let error = listener
+            .feed_recv_buf(&invalid_conclusion, Timestamp::from_micros(3_000))
+            .expect_err("listener rejects an out-of-range conclusion");
+        assert_eq!(error.kind, crate::ErrorKind::HandshakeRejected);
+        assert_eq!(listener.peer_flow_window, DEFAULT_FLOW_WINDOW);
+        assert_eq!(rejection_reason(&mut listener), Some(SRT_REJ_ROGUE));
+        assert_eq!(listener.state(), ConnectionState::Disconnected);
+    }
+
+    #[test]
+    fn listener_uses_the_conclusion_flow_window_for_sending() {
+        let plain = HandshakeRewrite::mss(1500, IpFamily::V4);
+        let mut caller = SrtConnection::new_caller(ConnectionOptions {
+            socket_id: 1,
+            ..ConnectionOptions::default()
+        });
+        let mut listener = SrtConnection::new_listener(listener_options());
+        caller
+            .connect(Timestamp::from_micros(0))
+            .expect("caller starts");
+        let induction = take_one_rewritten_handshake(&mut caller, &plain);
+        listener
+            .feed_recv_buf(&induction, Timestamp::from_micros(1_000))
+            .expect("listener accepts induction");
+        let response = take_one_rewritten_handshake(&mut listener, &plain);
+        caller
+            .feed_recv_buf(&response, Timestamp::from_micros(2_000))
+            .expect("caller accepts induction response");
+
+        let mut final_advertisement = plain;
+        final_advertisement.flow_window = Some(2);
+        let conclusion = take_one_rewritten_handshake(&mut caller, &final_advertisement);
+        listener
+            .feed_recv_buf(&conclusion, Timestamp::from_micros(3_000))
+            .expect("listener accepts changed final capacity");
+        assert_eq!(listener.peer_flow_window, 2);
+        assert_eq!(
+            listener
+                .sender
+                .as_ref()
+                .expect("send window")
+                .negotiated_window(),
+            2
+        );
+        let _ = drain_outputs(&mut listener);
+        for n in 0..2 {
+            listener
+                .send(b"x", Timestamp::from_micros(4_000 + n))
+                .expect("the final advertised capacity allows two packets");
+        }
+        assert!(
+            !listener.can_send(),
+            "a third packet exceeds the peer's final window"
+        );
+    }
+
+    #[test]
+    fn caller_rejects_unusable_flow_windows_in_both_responses() {
+        let v4 = IpFamily::V4;
+        let plain = HandshakeRewrite::mss(1500, v4);
+
+        let mut caller = SrtConnection::new_caller(ConnectionOptions {
+            socket_id: 1,
+            ..ConnectionOptions::default()
+        });
+        caller.set_ip_family(v4);
+        caller
+            .connect(Timestamp::from_micros(0))
+            .expect("caller starts");
+        let request = take_one_rewritten_handshake(&mut caller, &plain);
+        let mut listener = SrtConnection::new_listener(listener_options());
+        listener.set_ip_family(v4);
+        listener
+            .feed_recv_buf(&request, Timestamp::from_micros(1_000))
+            .expect("listener accepts induction");
+        let mut malformed = plain;
+        malformed.flow_window = Some(1);
+        let invalid_response = take_one_rewritten_handshake(&mut listener, &malformed);
+        let error = caller
+            .feed_recv_buf(&invalid_response, Timestamp::from_micros(2_000))
+            .expect_err("caller rejects unusable induction response");
+        assert_eq!(error.kind, crate::ErrorKind::HandshakeRejected);
+        assert_eq!(caller.peer_flow_window, 0);
+        assert_eq!(caller.state(), ConnectionState::Disconnected);
+
+        let mut caller = SrtConnection::new_caller(ConnectionOptions {
+            socket_id: 1,
+            ..ConnectionOptions::default()
+        });
+        caller.set_ip_family(v4);
+        caller
+            .connect(Timestamp::from_micros(0))
+            .expect("caller starts");
+        let request = take_one_rewritten_handshake(&mut caller, &plain);
+        let mut listener = SrtConnection::new_listener(listener_options());
+        listener.set_ip_family(v4);
+        listener
+            .feed_recv_buf(&request, Timestamp::from_micros(1_000))
+            .expect("listener accepts induction");
+        let response = take_one_rewritten_handshake(&mut listener, &plain);
+        caller
+            .feed_recv_buf(&response, Timestamp::from_micros(2_000))
+            .expect("caller accepts induction response");
+        let conclusion = take_one_rewritten_handshake(&mut caller, &plain);
+        listener
+            .feed_recv_buf(&conclusion, Timestamp::from_micros(3_000))
+            .expect("listener accepts conclusion");
+        let mut malformed = plain;
+        malformed.flow_window = Some(1);
+        let invalid_response = take_one_rewritten_handshake(&mut listener, &malformed);
+
+        let error = caller
+            .feed_recv_buf(&invalid_response, Timestamp::from_micros(4_000))
+            .expect_err("caller rejects unusable conclusion response");
+        assert_eq!(error.kind, crate::ErrorKind::HandshakeRejected);
+        assert_eq!(caller.peer_flow_window, 0);
+        assert_eq!(caller.state(), ConnectionState::Disconnected);
+    }
+
+    #[test]
+    fn hsv5_handshake_enforces_the_srt_1_3_0_version_floor() {
+        let v4 = IpFamily::V4;
+        let plain = HandshakeRewrite::mss(1500, v4);
+
+        let mut hsv4 = plain;
+        hsv4.handshake_version = Some(crate::srt_handshake::HS_VERSION_4);
+        let mut attempt = handshake_with_rewrites(&hsv4, &plain, listener_options());
+        let error = attempt
+            .listener_result
+            .expect_err("HSv4 cannot complete this HSv5-only handshake");
+        assert_eq!(error.kind, crate::ErrorKind::HandshakeRejected);
+        assert_eq!(
+            rejection_reason(&mut attempt.listener),
+            Some(SRT_REJ_VERSION)
+        );
+
+        let mut before_130 = plain;
+        before_130.srt_version = Some(0x0001_02ff);
+        let mut attempt = handshake_with_rewrites(&before_130, &plain, listener_options());
+        let error = attempt
+            .listener_result
+            .expect_err("HSv5 cannot claim an SRT version below 1.3.0");
+        assert_eq!(error.kind, crate::ErrorKind::HandshakeRejected);
+        assert_eq!(rejection_reason(&mut attempt.listener), Some(SRT_REJ_ROGUE));
+
+        let mut at_130 = plain;
+        at_130.srt_version = Some(0x0001_0300);
+        let accepted = handshake_with_rewrites(&at_130, &plain, listener_options());
+        accepted.listener_result.expect("SRT 1.3.0 is supported");
+        accepted
+            .caller_result
+            .expect("SRT 1.3.0 completes both ways");
+
+        let mut old_listener = plain;
+        old_listener.srt_version = Some(0x0001_02ff);
+        let attempt = handshake_with_rewrites(&plain, &old_listener, listener_options());
+        attempt
+            .listener_result
+            .expect("listener accepts the caller's supported version");
+        let error = attempt
+            .caller_result
+            .expect_err("caller rejects a peer below SRT 1.3.0");
+        assert_eq!(error.kind, crate::ErrorKind::HandshakeRejected);
+        assert_eq!(attempt.caller.state(), ConnectionState::Disconnected);
+    }
+
+    /// A peer that negotiates packet-filter behaviour gets a refusal, not a
+    /// session whose two peers disagree about whether recovery filtering
+    /// exists -- while a peer that merely *advertises* the capability flag is
+    /// still accepted, and an unknown optional extension stays ignorable
+    /// (`test_extension_parsing_unknown_type` pins that decode side).
+    #[test]
+    fn packet_filter_negotiation_is_refused_but_the_capability_flag_is_not() {
+        let v4 = IpFamily::V4;
+        let plain = HandshakeRewrite::mss(1500, v4);
+
+        // The FILTER extension is a negotiation: the caller asking for it is
+        // refused by the listener with the reference's own reason code.
+        let mut asking = plain;
+        asking.filter_extension = true;
+        let mut attempt = handshake_with_rewrites(&asking, &plain, listener_options());
+        let error = attempt
+            .listener_result
+            .expect_err("a filter negotiation must be refused");
+        assert_eq!(error.kind, crate::ErrorKind::HandshakeRejected);
+        assert!(
+            error.reason.contains("packet filter"),
+            "the rejection names the capability: {}",
+            error.reason
+        );
+        assert_eq!(attempt.listener.state(), ConnectionState::Disconnected);
+        assert!(attempt.listener.crypto.is_none());
+        assert_eq!(
+            attempt.listener.max_payload_size,
+            DEFAULT_MTU as usize - SRT_HEADER_SIZE,
+            "nothing about the attempt was committed"
+        );
+        let rejections: Vec<_> = drain_outputs(&mut attempt.listener)
+            .into_iter()
+            .filter_map(|output| match output {
+                ConnectionOutput::SendPacket(bytes) => Some(bytes),
+                _ => None,
+            })
+            .filter_map(|bytes| match SrtPacket::decode(&bytes) {
+                Ok(SrtPacket::Control(control)) => Some(control),
+                _ => None,
+            })
+            .filter(|control| control.control_type == ControlType::Handshake)
+            .collect();
+        assert_eq!(rejections.len(), 1, "one rejection response");
+        let rejection = HandshakePacket::decode(&rejections[0]).expect("rejection decodes");
+        assert_eq!(rejection.handshake_type, HandshakeType::Rejected);
+        assert_eq!(rejection.reject_reason, Some(SRT_REJ_FILTER));
+
+        // The listener answering with one is refused by the caller.
+        let attempt = handshake_with_rewrites(&plain, &asking, listener_options());
+        attempt
+            .listener_result
+            .expect("the listener accepts the caller");
+        let error = attempt
+            .caller_result
+            .expect_err("the caller refuses a filter negotiation");
+        assert_eq!(error.kind, crate::ErrorKind::HandshakeRejected);
+        assert_eq!(attempt.caller.state(), ConnectionState::Disconnected);
+
+        // The capability flag alone is an advertisement, not a negotiation:
+        // rejecting it would refuse peers that never asked for filtering.
+        let mut advertising = plain;
+        advertising.packet_filter_flag = true;
+        let attempt = handshake_with_rewrites(&advertising, &advertising, listener_options());
+        attempt
+            .listener_result
+            .expect("listener accepts the advertisement");
+        attempt
+            .caller_result
+            .expect("caller accepts the advertisement");
+        assert_eq!(attempt.listener.state(), ConnectionState::Connected);
+        assert_eq!(attempt.caller.state(), ConnectionState::Connected);
+    }
+
+    /// A lost KMRSP must not lose the rotation: the peer retransmits the same
+    /// KMREQ (as libsrt does while awaiting the response), the receiver
+    /// answers it again *without* installing anything, and the rotation then
+    /// completes. This is the reliability property the hostile-input test
+    /// cannot see, because it only ever sends invalid controls.
+    #[test]
+    fn a_lost_kmrsp_is_retried_and_the_rotation_completes() {
+        let (mut caller, mut listener) = encrypted_pair(CipherMode::Ctr);
+        for connection in [&mut caller, &mut listener] {
+            while connection.poll_event().is_some() {}
+            let _ = drain_outputs(connection);
+        }
+        let mut now = Timestamp::from_micros(10_000_000);
+
+        // The rotation is announced and installed by the listener.
+        caller
+            .provide_new_sek(&[0x6B; 16], now)
+            .expect("start key refresh");
+        let first_request = take_user_defined_datagram(&mut caller, SRT_CMD_KMREQ);
+        listener
+            .feed_recv_buf(&first_request, now)
+            .expect("the listener installs the announced key");
+        let listener_after_install = km_security_snapshot(&listener);
+        let announced = listener
+            .crypto
+            .as_ref()
+            .expect("secured listener")
+            .current_key();
+
+        // The response is lost. The retry cadence elapses, and the sender
+        // retransmits the *identical* request.
+        now = now.add_micros(1_000_001);
+        caller
+            .handle_timer(TimerId::Ack, now)
+            .expect("ACK tick services the pending rotation");
+        let retried_request = take_user_defined_datagram(&mut caller, SRT_CMD_KMREQ);
+        assert_eq!(
+            user_defined_control_info(&retried_request),
+            user_defined_control_info(&first_request),
+            "a retry must carry byte-identical key material"
+        );
+
+        // The listener answers the duplicate again, and installs nothing.
+        let _ = drain_outputs(&mut listener);
+        listener
+            .feed_recv_buf(&retried_request, now)
+            .expect("a retransmitted KMREQ is answered, not rejected");
+        assert_eq!(
+            km_security_snapshot(&listener),
+            listener_after_install,
+            "answering a duplicate must not touch the receiver's key state"
+        );
+        let response = take_user_defined_datagram(&mut listener, SRT_CMD_KMRSP);
+
+        // The response arrives this time: the transaction closes.
+        caller
+            .feed_recv_buf(&response, now.add_micros(1))
+            .expect("the retried rotation is acknowledged");
+        assert!(
+            km_security_snapshot(&caller).pending_response.is_none(),
+            "a matching KMRSP closes the transaction"
+        );
+        assert_eq!(
+            listener
+                .crypto
+                .as_ref()
+                .expect("secured listener")
+                .current_key(),
+            announced,
+            "the receiver is on the announced generation"
+        );
+        assert_encrypted_roundtrip(
+            &mut caller,
+            &mut listener,
+            now.add_micros(2),
+            b"after a lost response",
+        );
+    }
+
+    #[test]
+    fn exhausting_km_responses_cannot_leave_peers_on_different_keys() {
+        let (mut caller, mut listener) = encrypted_pair(CipherMode::Ctr);
+        for connection in [&mut caller, &mut listener] {
+            while connection.poll_event().is_some() {}
+            let _ = drain_outputs(connection);
+        }
+        let mut now = Timestamp::from_micros(10_000_000);
+        caller
+            .provide_new_sek(&[0x6B; 16], now)
+            .expect("caller starts a rotation");
+        let first = take_user_defined_datagram(&mut caller, SRT_CMD_KMREQ);
+        listener
+            .feed_recv_buf(&first, now)
+            .expect("peer installs new key");
+        let _ = take_user_defined_datagram(&mut listener, SRT_CMD_KMRSP);
+
+        for _ in 0..KM_REQUEST_MAX_RETRIES {
+            now = now.add_micros(KM_REQUEST_RETRY_INTERVAL_MICROS + 1);
+            caller.handle_timer(TimerId::Ack, now).expect("retry tick");
+            let retry = take_user_defined_datagram(&mut caller, SRT_CMD_KMREQ);
+            assert_eq!(
+                user_defined_control_info(&retry),
+                user_defined_control_info(&first)
+            );
+            listener
+                .feed_recv_buf(&retry, now)
+                .expect("peer answers identical request");
+            let _ = take_user_defined_datagram(&mut listener, SRT_CMD_KMRSP);
+        }
+        now = now.add_micros(KM_REQUEST_RETRY_INTERVAL_MICROS + 1);
+        caller
+            .handle_timer(TimerId::Ack, now)
+            .expect("exhaustion tick");
+        assert_ne!(
+            caller.state(),
+            ConnectionState::Connected,
+            "lost responses do not prove the peer lacks the announced key"
+        );
+        assert!(
+            caller.send(b"unsafe DATA", now).is_err(),
+            "a connection with uncertain peer key state must stop sending"
+        );
+    }
+
+    /// A lost KMREQ is retried, and a response eventually permits switchover.
+    /// If no response arrives after all retries, the sender cannot know
+    /// whether the peer installed the key, so it must close the session.
+    #[test]
+    fn a_lost_kmreq_is_retried_and_an_unanswered_rotation_fails_closed() {
+        let (mut caller, mut listener) = encrypted_pair(CipherMode::Ctr);
+        for connection in [&mut caller, &mut listener] {
+            while connection.poll_event().is_some() {}
+            let _ = drain_outputs(connection);
+        }
+        let mut now = Timestamp::from_micros(20_000_000);
+        let original_key = caller
+            .crypto
+            .as_ref()
+            .expect("secured caller")
+            .current_key();
+
+        // The rotation is announced past the switch threshold, and its first
+        // request never reaches the peer.
+        caller
+            .provide_new_sek(&[0x7C; 16], now)
+            .expect("start key refresh");
+        let dropped = take_user_defined_datagram(&mut caller, SRT_CMD_KMREQ);
+        caller
+            .crypto
+            .as_mut()
+            .expect("secured caller")
+            .set_encrypted_packet_count_for_test(CryptoContext::KM_REFRESH_PERIOD);
+        caller.check_km_refresh(now);
+        assert_eq!(
+            caller
+                .crypto
+                .as_ref()
+                .expect("secured caller")
+                .current_key(),
+            original_key,
+            "the sender must not switch to a key the peer has not acknowledged"
+        );
+
+        // The retry reaches the listener, which installs and answers.
+        now = now.add_micros(1_000_001);
+        caller
+            .handle_timer(TimerId::Ack, now)
+            .expect("ACK tick retransmits the request");
+        let retried = take_user_defined_datagram(&mut caller, SRT_CMD_KMREQ);
+        assert_eq!(
+            user_defined_control_info(&retried),
+            user_defined_control_info(&dropped),
+            "the retry is the same request"
+        );
+        listener
+            .feed_recv_buf(&retried, now)
+            .expect("the listener installs on the retry");
+        let response = take_user_defined_datagram(&mut listener, SRT_CMD_KMRSP);
+        caller
+            .feed_recv_buf(&response, now.add_micros(1))
+            .expect("the rotation is acknowledged");
+
+        // Now, and only now, the switch happens, and both sides agree.
+        caller.check_km_refresh(now.add_micros(2));
+        let switched = caller
+            .crypto
+            .as_ref()
+            .expect("secured caller")
+            .current_key();
+        assert_ne!(switched, original_key, "the acknowledged rotation switches");
+        assert_eq!(
+            switched,
+            listener
+                .crypto
+                .as_ref()
+                .expect("secured listener")
+                .current_key(),
+            "sender and receiver agree on the generation"
+        );
+        assert_encrypted_roundtrip(
+            &mut caller,
+            &mut listener,
+            now.add_micros(3),
+            b"after a lost request",
+        );
+
+        // No response to any attempt: even if every request was dropped,
+        // that fact is unknowable locally, so the connection must fail closed.
+        while caller.poll_event().is_some() {}
+        caller
+            .provide_new_sek(&[0x8D; 16], now.add_micros(4))
+            .expect("start another refresh");
+        let _ = take_user_defined_datagram(&mut caller, SRT_CMD_KMREQ);
+        let mut tick = now.add_micros(4);
+        for _ in 0..=KM_REQUEST_MAX_RETRIES {
+            tick = tick.add_micros(KM_REQUEST_RETRY_INTERVAL_MICROS + 1);
+            caller.handle_timer(TimerId::Ack, tick).expect("ACK tick");
+        }
+        assert_eq!(caller.state(), ConnectionState::Disconnected);
+        assert!(km_security_snapshot(&caller).pending_response.is_none());
+        assert_eq!(
+            caller
+                .crypto
+                .as_ref()
+                .expect("secured caller")
+                .current_key(),
+            switched,
+            "an unconfirmed rotation never changes the active send key"
+        );
+        assert!(
+            std::iter::from_fn(|| caller.poll_event()).any(|event| matches!(
+                event,
+                ConnectionEvent::Disconnected {
+                    reason: DisconnectReason::ProtocolError(reason)
+                } if reason == "key rotation was not acknowledged"
+            ))
+        );
+        assert!(caller.provide_new_sek(&[0x9E; 16], tick).is_err());
+        assert!(drain_outputs(&mut caller).iter().any(|output| {
+            let ConnectionOutput::SendPacket(bytes) = output else {
+                return false;
+            };
+            matches!(
+                SrtPacket::decode(bytes),
+                Ok(SrtPacket::Control(control)) if control.control_type == ControlType::Shutdown
+            )
+        }));
+    }
+
     /// A connected encrypted pair sharing one passphrase.
     fn encrypted_pair(cipher_mode: CipherMode) -> (SrtConnection, SrtConnection) {
         let sek = vec![0x5Au8; 16];
@@ -7610,6 +9548,195 @@ mod tests {
         });
         drive_handshake_to_connected(&mut caller, &mut listener);
         (caller, listener)
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct KmSecuritySnapshot {
+        state: ConnectionState,
+        current_key: KeyFlag,
+        pending_response: Option<Vec<u8>>,
+        received: Vec<Option<Vec<u8>>>,
+        received_next: usize,
+        acknowledged: Vec<Option<Vec<u8>>>,
+        acknowledged_next: usize,
+    }
+
+    fn km_security_snapshot(connection: &SrtConnection) -> KmSecuritySnapshot {
+        let crypto = connection.crypto.as_ref().expect("secured connection");
+        let state = connection
+            .km_control
+            .as_ref()
+            .expect("secured KM control state");
+        let encode_entries = |history: &KmHistory| {
+            history
+                .entries
+                .iter()
+                .map(|entry| entry.as_ref().map(KmMessage::encode))
+                .collect()
+        };
+        KmSecuritySnapshot {
+            state: connection.state(),
+            current_key: crypto.current_key(),
+            pending_response: state
+                .pending
+                .as_ref()
+                .map(|pending| pending.request.encode()),
+            received: encode_entries(&state.received),
+            received_next: state.received.next,
+            acknowledged: encode_entries(&state.acknowledged),
+            acknowledged_next: state.acknowledged.next,
+        }
+    }
+
+    fn current_km_message(connection: &SrtConnection) -> KmMessage {
+        let crypto = connection.crypto.as_ref().expect("secured connection");
+        KmMessage::new(
+            crypto.current_key(),
+            crypto.key_length(),
+            *crypto.salt(),
+            crypto
+                .wrap_sek(crypto.current_key())
+                .expect("current key wraps"),
+            crypto.cipher_mode(),
+        )
+    }
+
+    fn assert_km_control_rejected(
+        target: &mut SrtConnection,
+        subtype: u16,
+        body: Vec<u8>,
+        now: Timestamp,
+        label: &str,
+    ) {
+        let _ = drain_outputs(target);
+        assert!(target.poll_event().is_none(), "{label}: stale event");
+        let before = km_security_snapshot(target);
+        let stats = target.stats();
+        let last_recv_time = target.last_recv_time;
+        let datagram = control_datagram(
+            target.socket_id(),
+            ControlType::UserDefined,
+            subtype,
+            0,
+            body,
+        );
+
+        target
+            .feed_recv_buf(&datagram, now)
+            .expect_err("hostile KM control must be rejected");
+
+        assert_eq!(
+            km_security_snapshot(target),
+            before,
+            "{label}: secured KM state changed"
+        );
+        assert_eq!(
+            target.last_recv_time, last_recv_time,
+            "{label}: rejected control refreshed liveness"
+        );
+        assert_eq!(target.stats(), stats, "{label}: telemetry state changed");
+        assert!(
+            drain_outputs(target).is_empty(),
+            "{label}: rejected control emitted output"
+        );
+        assert!(
+            target.poll_event().is_none(),
+            "{label}: rejected control emitted an event"
+        );
+        assert!(
+            target
+                .crypto
+                .as_ref()
+                .is_some_and(|crypto| crypto.can_encrypt_current_key()),
+            "{label}: active encryption became unusable"
+        );
+    }
+
+    fn assert_encrypted_roundtrip(
+        sender: &mut SrtConnection,
+        receiver: &mut SrtConnection,
+        now: Timestamp,
+        payload: &[u8],
+    ) {
+        let datagram = capture_data_datagram(sender, payload, now);
+        let Ok(SrtPacket::Data(packet)) = SrtPacket::decode(&datagram) else {
+            panic!("encrypted send must produce DATA");
+        };
+        assert_ne!(
+            packet.encryption_flag, 0,
+            "secured DATA must not be emitted in cleartext"
+        );
+
+        let last_recv_time = receiver.last_recv_time;
+        let clear = with_key_selector(&datagram, 0);
+        let error = receiver
+            .feed_recv_buf(&clear, now)
+            .expect_err("clear DATA must be rejected on a secured connection");
+        assert_eq!(error.kind, crate::error::ErrorKind::CryptoError);
+        assert_eq!(
+            receiver.last_recv_time, last_recv_time,
+            "rejected clear DATA must not refresh liveness"
+        );
+
+        let received_before = receiver
+            .receiver_stats()
+            .expect("connected receiver")
+            .total_received;
+        receiver
+            .feed_recv_buf(&datagram, now.add_micros(1))
+            .expect("next authentic encrypted DATA succeeds");
+        assert_eq!(
+            receiver
+                .receiver_stats()
+                .expect("connected receiver")
+                .total_received,
+            received_before + 1,
+            "authentic encrypted DATA must enter reliability state"
+        );
+        while receiver.poll_event().is_some() {}
+    }
+
+    fn take_user_defined_datagram(connection: &mut SrtConnection, subtype: u16) -> Vec<u8> {
+        for output in drain_outputs(connection) {
+            let ConnectionOutput::SendPacket(datagram) = output else {
+                continue;
+            };
+            let matching = matches!(
+                SrtPacket::decode(&datagram),
+                Ok(SrtPacket::Control(ControlPacket {
+                    control_type: ControlType::UserDefined,
+                    subtype: packet_subtype,
+                    ..
+                })) if packet_subtype == subtype
+            );
+            if matching {
+                return datagram;
+            }
+        }
+        panic!("expected UserDefined subtype {subtype:#06x}");
+    }
+
+    fn key_message_from_datagram(datagram: &[u8]) -> KmMessage {
+        let SrtPacket::Control(control) =
+            SrtPacket::decode(datagram).expect("valid KM control datagram")
+        else {
+            panic!("KM datagram must be a control packet");
+        };
+        KmMessage::decode(&control.control_info).expect("valid KM message")
+    }
+
+    /// The control-information field of a UserDefined datagram: the key
+    /// material a retry must reproduce byte-for-byte. The control packet's
+    /// own timestamp is deliberately not compared -- it is the send time of
+    /// this transmission, and the peer matches duplicates on the KM message,
+    /// not on the datagram that carried it.
+    fn user_defined_control_info(datagram: &[u8]) -> Vec<u8> {
+        let SrtPacket::Control(control) =
+            SrtPacket::decode(datagram).expect("valid KM control datagram")
+        else {
+            panic!("KM datagram must be a control packet");
+        };
+        control.control_info
     }
 
     /// Send one payload and return the DATA datagram the caller put on the

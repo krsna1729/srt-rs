@@ -173,6 +173,41 @@ pub const fn pacing_packet_size_bytes(payload_bytes: u64) -> u64 {
     srt_proto::wire::SRT_HEADER_SIZE as u64 + payload_bytes
 }
 
+/// Largest DATA payload `SrtConnection` accepts for a given cipher and path.
+///
+/// Mirrors `SrtConnection::effective_max_payload_size()` exactly, which is the
+/// boundary both the scalar send APIs and `send_message` fragmentation use:
+///
+/// ```text
+/// min(local datagram budget, peer mss - IP/UDP overhead)   // apply_peer_mss
+///   - SRT_HEADER_SIZE                                      // max_payload_size
+///   - cipher authentication tag                            // effective_max_payload_size
+/// ```
+///
+/// The handshake's MTU field is an IP-layer MTU for every reference
+/// implementation, so `peer mss - overhead` is the peer's datagram ceiling;
+/// `udp_ip_header_bytes` is the modeled path's overhead, which for a
+/// same-family path is also the peer's. With both peers at the reference
+/// default 1500 this is 1456 bytes under AES-CTR and 1440 under GCM on an
+/// IPv4 path, and 1436/1420 on an IPv6 path.
+#[must_use]
+pub const fn negotiated_effective_payload_bytes(
+    encryption: EncryptionMode,
+    cipher: srt_proto::crypto::CipherMode,
+    udp_ip_header_bytes: u64,
+) -> u64 {
+    let local_budget = srt_proto::handshake::DEFAULT_MTU as u64;
+    let peer_ceiling = local_budget.saturating_sub(udp_ip_header_bytes);
+    let negotiated = if peer_ceiling < local_budget {
+        peer_ceiling
+    } else {
+        local_budget
+    };
+    negotiated
+        .saturating_sub(srt_proto::wire::SRT_HEADER_SIZE as u64)
+        .saturating_sub(encryption.tag_bytes(cipher))
+}
+
 /// Encoded IPv4/UDP/SRT DATA packet size, including an optional GCM tag.
 /// `udp_ip_header_bytes` is part of the configured IP MTU budget.
 ///
@@ -540,7 +575,6 @@ impl ReasonSeverity {
 #[repr(u8)]
 pub enum CapacityReason {
     PayloadExceedsProtocolMtu,
-    PayloadExceedsIpv4MtuEnvelope,
     SourceExceedsPacingEnvelope,
     ProtocolOverheadExceedsPacingHeadroom,
     WindowBelowBdpRequirement,
@@ -576,7 +610,6 @@ pub enum CapacityReason {
 
 const REASON_CODES: &[&str] = &[
     "payload_exceeds_protocol_mtu",
-    "payload_exceeds_ipv4_mtu_envelope",
     "source_exceeds_pacing_envelope",
     "protocol_overhead_exceeds_pacing_headroom",
     "window_below_bdp_requirement",
@@ -620,7 +653,6 @@ impl CapacityReason {
     pub const fn severity(self) -> ReasonSeverity {
         match self {
             Self::PayloadExceedsProtocolMtu
-            | Self::PayloadExceedsIpv4MtuEnvelope
             | Self::WindowBelowBdpRequirement
             | Self::HostPpsCapacityExceeded
             | Self::NicCapacityExceeded
@@ -1559,39 +1591,27 @@ fn add_pacing_reasons(
     derived: &DerivedLoad,
     reasons: &mut Vec<CapacityReason>,
 ) {
-    // Two different limits, because the protocol core and a real IPv4 path do
-    // not agree about what `DEFAULT_MTU` bounds.
+    // PROTOCOL TRUTH: the handshake's MTU field is an IP-layer MTU, so
+    // `SrtConnection` negotiates its outbound payload down to
+    // `min(local budget, peer mss - IP/UDP overhead) - SRT_HEADER_SIZE` and
+    // then charges the cipher's authentication tag on top. This is exactly
+    // `effective_max_payload_size()`, the boundary both the scalar send APIs
+    // and `send_message` fragmentation enforce, so a payload above it is a
+    // hard protocol reason.
     //
-    // PROTOCOL TRUTH: `SrtConnection` sets
-    // `max_payload_size = DEFAULT_MTU - SRT_HEADER_SIZE`, so the core treats
-    // 1500 as the SRT datagram budget and will emit a 1484-byte payload. That
-    // is what the implementation actually enforces, so it is the hard limit.
-    //
-    // DEPLOYMENT ENVELOPE: on a real 1500-byte IPv4 path the datagram also
-    // carries IP and UDP headers, and an encrypted DATA packet carries the GCM
-    // tag, so the same payload can exceed the path MTU and fragment. That is a
-    // property of the deployment, not of this implementation, so it is
-    // reported separately and must not be called protocol truth.
-    // PROTOCOL TRUTH, and deliberately tag-free: `SrtConnection` sets
-    // `max_payload_size = DEFAULT_MTU - SRT_HEADER_SIZE` regardless of cipher
-    // mode, and GCM appends its tag AFTER that limit has been applied. So the
-    // core accepts 1484 plaintext bytes even under GCM. Including the tag here
-    // claimed the protocol maximum was 1468 and could raise a false hard
-    // ExceedsEnvelope. The tag still belongs in the IPv4 envelope below and in
-    // all wire-rate accounting.
-    if pacing_packet_size_bytes(input.workload.payload_bytes)
-        > srt_proto::handshake::DEFAULT_MTU as u64
+    // This subsumes the path envelope the model used to report separately: a
+    // payload the core accepts always fits the modeled path, because the
+    // negotiated bound is derived from that same IP/UDP overhead. A *narrower*
+    // path than the peer's advertised MSS would need its own input (a path MTU
+    // distinct from the peer's declaration), which this model does not carry.
+    if input.workload.payload_bytes
+        > negotiated_effective_payload_bytes(
+            input.protocol.encryption,
+            input.protocol.cipher_mode,
+            input.network.udp_ip_header_bytes,
+        )
     {
         reasons.push(CapacityReason::PayloadExceedsProtocolMtu);
-    }
-    if encoded_packet_size_bytes(
-        input.workload.payload_bytes,
-        input.protocol.encryption,
-        input.protocol.cipher_mode,
-        input.network.udp_ip_header_bytes,
-    ) > srt_proto::handshake::DEFAULT_MTU as u64
-    {
-        reasons.push(CapacityReason::PayloadExceedsIpv4MtuEnvelope);
     }
     if let Availability::Known(capacity) = derived.pacing_payload_capacity_bps
         && input.workload.source_bps_per_stream as f64 > capacity

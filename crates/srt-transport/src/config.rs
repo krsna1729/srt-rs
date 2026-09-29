@@ -2424,7 +2424,11 @@ impl PreparedCaller {
     /// Build a fresh caller core. Auto identity means each call gets a new
     /// socket ID and initial sequence number, which makes this caller-pool safe.
     pub fn connection(&self, now: Timestamp) -> Result<SrtConnection, ConfigError> {
-        self.session.caller(now)
+        let mut connection = self.session.caller(now)?;
+        // Before the CONCLUSION response arrives: the peer MSS is turned into
+        // a datagram budget for this path's family there.
+        connection.set_ip_family(srt_proto::handshake::IpFamily::of(&self.remote));
+        Ok(connection)
     }
 
     /// Conservative requested buffer allocation for this caller's socket,

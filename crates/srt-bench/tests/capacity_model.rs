@@ -60,36 +60,28 @@ fn known_value(value: Availability<f64>) -> f64 {
 
 #[test]
 fn protocol_mtu_boundary_matches_what_the_core_actually_enforces() {
-    // PROTOCOL TRUTH: `SrtConnection` sets
-    // `max_payload_size = DEFAULT_MTU - SRT_HEADER_SIZE`, so the core budgets
-    // 1500 for the SRT datagram and does NOT subtract IP/UDP. The hard reason
-    // must match that, or the classifier would call a payload the
-    // implementation happily emits a protocol violation.
+    // PROTOCOL TRUTH: the handshake MTU field is an IP-layer MTU, so the core
+    // negotiates `max_payload_size` from the peer's advertised MSS and charges
+    // the cipher tag on top -- the same boundary `effective_max_payload_size`
+    // enforces for `send()` and for `send_message` fragmentation.
     let mut input = known_input();
-    let max_payload = (0..=srt_proto::handshake::DEFAULT_MTU as u64)
-        .rev()
-        .find(|payload| {
-            srt_bench::model::encoded_packet_size_bytes(
-                *payload,
-                input.protocol.encryption,
-                input.protocol.cipher_mode,
-                0,
-            ) <= srt_proto::handshake::DEFAULT_MTU as u64
-        })
-        .expect("an MTU-sized packet fits");
-    assert_eq!(
-        max_payload,
-        srt_proto::handshake::DEFAULT_MTU as u64 - srt_proto::wire::SRT_HEADER_SIZE as u64,
-        "plaintext protocol budget must equal the core's max_payload_size"
+    let bound = srt_bench::model::negotiated_effective_payload_bytes(
+        input.protocol.encryption,
+        input.protocol.cipher_mode,
+        input.network.udp_ip_header_bytes,
     );
-    input.workload.payload_bytes = max_payload;
+    assert_eq!(
+        bound, 1456,
+        "a reference default-MSS IPv4 peer under AES-CTR: 1500 - 28 - 16"
+    );
+    input.workload.payload_bytes = bound;
     assert!(
         !assessment(input.clone())
             .reasons
             .contains(&CapacityReason::PayloadExceedsProtocolMtu)
     );
 
-    input.workload.payload_bytes += 1;
+    input.workload.payload_bytes = bound + 1;
     let above = assessment(input);
     assert_eq!(above.class, CellClass::ExceedsEnvelope);
     assert!(
@@ -100,23 +92,57 @@ fn protocol_mtu_boundary_matches_what_the_core_actually_enforces() {
 }
 
 #[test]
-fn ipv4_envelope_is_reported_separately_from_protocol_truth() {
-    // A payload the core will emit can still not fit a real 1500-byte IPv4
-    // path once IP and UDP headers are added. That is a deployment property,
-    // so it is its own reason and must not masquerade as protocol truth.
-    let mut input = known_input();
-    input.workload.payload_bytes =
-        srt_proto::handshake::DEFAULT_MTU as u64 - srt_proto::wire::SRT_HEADER_SIZE as u64;
-    let a = assessment(input);
-    assert!(
-        !a.reasons
-            .contains(&CapacityReason::PayloadExceedsProtocolMtu),
-        "the core emits this payload, so it is not a protocol violation"
+fn the_cipher_tag_and_the_ip_family_both_narrow_the_protocol_bound() {
+    // The tag is part of what `send()` accepts, not a path property: a GCM
+    // cell loses exactly GCM_TAG_LEN from the boundary, so the range the model
+    // used to misclassify is now a hard protocol reason.
+    let mut gcm = known_input();
+    gcm.protocol.encryption = EncryptionMode::Aes256;
+    gcm.protocol.cipher_mode = srt_proto::crypto::CipherMode::Gcm;
+    let gcm_bound = srt_bench::model::negotiated_effective_payload_bytes(
+        gcm.protocol.encryption,
+        gcm.protocol.cipher_mode,
+        gcm.network.udp_ip_header_bytes,
     );
+    assert_eq!(
+        gcm_bound,
+        1456 - srt_proto::crypto::GCM_TAG_LEN as u64,
+        "GCM's tag is charged against the payload budget"
+    );
+    gcm.workload.payload_bytes = gcm_bound;
     assert!(
-        a.reasons
-            .contains(&CapacityReason::PayloadExceedsIpv4MtuEnvelope),
-        "but it cannot fit a 1500-byte IPv4 path once IP/UDP are added"
+        !assessment(gcm.clone())
+            .reasons
+            .contains(&CapacityReason::PayloadExceedsProtocolMtu)
+    );
+    gcm.workload.payload_bytes = gcm_bound + 1;
+    assert!(
+        assessment(gcm)
+            .reasons
+            .contains(&CapacityReason::PayloadExceedsProtocolMtu)
+    );
+
+    // An IPv6 path carries 20 more header bytes, which the product derives
+    // from the peer's address family -- so the model must narrow with it too.
+    let mut v6 = known_input();
+    v6.network.udp_ip_header_bytes = srt_proto::handshake::IP_UDP_HEADER_SIZE_IPV6 as u64;
+    let v6_bound = srt_bench::model::negotiated_effective_payload_bytes(
+        v6.protocol.encryption,
+        v6.protocol.cipher_mode,
+        v6.network.udp_ip_header_bytes,
+    );
+    assert_eq!(v6_bound, 1500 - 48 - 16, "IPv6 overhead narrows the bound");
+    v6.workload.payload_bytes = v6_bound;
+    assert!(
+        !assessment(v6.clone())
+            .reasons
+            .contains(&CapacityReason::PayloadExceedsProtocolMtu)
+    );
+    v6.workload.payload_bytes = v6_bound + 1;
+    assert!(
+        assessment(v6)
+            .reasons
+            .contains(&CapacityReason::PayloadExceedsProtocolMtu)
     );
 }
 
@@ -144,35 +170,6 @@ fn key_length_alone_does_not_add_an_authentication_tag() {
         assessment(gcm).derived.srt_data_packet_bytes,
         assessment(plain).derived.srt_data_packet_bytes + srt_proto::crypto::GCM_TAG_LEN as u64,
         "GCM adds exactly one tag"
-    );
-}
-
-#[test]
-fn the_gcm_tag_is_not_part_of_the_protocol_mtu_limit() {
-    // `SrtConnection` sets `max_payload_size = DEFAULT_MTU - SRT_HEADER_SIZE`
-    // regardless of cipher mode, and GCM appends its tag AFTER that limit is
-    // applied. So the core accepts the same plaintext payload under GCM as in
-    // plain, and charging the tag to the protocol limit claimed a maximum of
-    // 1468 where the implementation allows 1484 -- a false hard reason.
-    let max_plaintext =
-        srt_proto::handshake::DEFAULT_MTU as u64 - srt_proto::wire::SRT_HEADER_SIZE as u64;
-    let mut gcm = known_input();
-    gcm.protocol.encryption = EncryptionMode::Aes256;
-    gcm.protocol.cipher_mode = srt_proto::crypto::CipherMode::Gcm;
-    gcm.workload.payload_bytes = max_plaintext;
-    let a = assessment(gcm.clone());
-    assert!(
-        !a.reasons
-            .contains(&CapacityReason::PayloadExceedsProtocolMtu),
-        "the core accepts this plaintext payload under GCM"
-    );
-
-    gcm.workload.payload_bytes = max_plaintext + 1;
-    assert!(
-        assessment(gcm)
-            .reasons
-            .contains(&CapacityReason::PayloadExceedsProtocolMtu),
-        "one byte over the core's own limit is a protocol violation"
     );
 }
 

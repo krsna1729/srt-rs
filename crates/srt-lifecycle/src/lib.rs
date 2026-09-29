@@ -448,6 +448,7 @@ mod tests {
     fn conclusion_identity_exposes_stream_without_group_metadata() {
         let mut handshake =
             srt_proto::handshake::HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
+        handshake.add_hs_extension(0x010500, 0, 120);
         handshake.add_sid_extension("publish:camera");
         let mut packet = Vec::new();
         handshake

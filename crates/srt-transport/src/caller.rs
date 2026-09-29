@@ -5397,6 +5397,47 @@ mod tests {
     }
 
     #[test]
+    fn malformed_conclusion_is_not_counted_as_a_credential_failure() {
+        let peer = "127.0.0.1:10018".parse().expect("address");
+        let options = AdmissionOptions::basic(0x2222, 0, true);
+        let telemetry = IngressTelemetry::new();
+        let mut table = PeerTable::new();
+        let (_, conclusion) = prepare_conclusion_with_options(
+            &mut table,
+            peer,
+            ConnectionOptions {
+                socket_id: 0x1111,
+                ..ConnectionOptions::default()
+            },
+            &options,
+            &telemetry,
+        );
+        let SrtPacket::Control(control) = SrtPacket::decode(&conclusion).expect("control") else {
+            panic!("expected handshake");
+        };
+        let mut handshake = HandshakePacket::decode(&control).expect("conclusion");
+        handshake.flow_window = 1;
+        let mut malformed = Vec::new();
+        handshake
+            .encode(control.timestamp, control.dest_socket_id)
+            .encode(&mut malformed)
+            .expect("encoded handshake");
+        assert_eq!(
+            table.admit(
+                peer,
+                &malformed,
+                Timestamp::from_micros(2),
+                &options,
+                0,
+                1,
+                &telemetry,
+            ),
+            Admit::Dropped(AdmissionDropReason::InvalidPacket)
+        );
+        assert_eq!(telemetry.snapshot().credential_failures, 0);
+    }
+
+    #[test]
     fn wrong_resolved_password_is_observable_and_never_establishes() {
         let peer = "127.0.0.1:10011".parse().expect("address");
         let options = AdmissionOptions::basic(0x2222, 0, true);

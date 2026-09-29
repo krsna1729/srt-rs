@@ -454,24 +454,21 @@ fn listener_encryption_mismatches_fail_closed_with_km_errors() {
         (
             Some("caller-only-secret".to_owned()),
             None,
-            ErrorKind::HandshakeRejected,
             "peer is unsecured",
         ),
         (
             None,
             Some("listener-only-secret".to_owned()),
-            ErrorKind::HandshakeRejected,
             "peer has no secret",
         ),
         (
             Some("caller-wrong-secret".to_owned()),
             Some("listener-right-secret".to_owned()),
-            ErrorKind::HandshakeRejected,
             "peer has wrong secret",
         ),
     ];
 
-    for (caller_secret, listener_secret, listener_error_kind, caller_reason) in cases {
+    for (caller_secret, listener_secret, caller_reason) in cases {
         let mut caller = SrtConnection::new_caller(ConnectionOptions {
             passphrase: caller_secret,
             tsbpd_delay: 0,
@@ -494,7 +491,7 @@ fn listener_encryption_mismatches_fail_closed_with_km_errors() {
         let listener_error = listener
             .feed_recv_buf(&conclusion, ts(2))
             .expect_err("encryption mismatch must fail");
-        assert_eq!(listener_error.kind, listener_error_kind);
+        assert_eq!(listener_error.kind, ErrorKind::CryptoError);
         assert_eq!(listener.state(), ConnectionState::Disconnected);
 
         let caller_error = loop {
