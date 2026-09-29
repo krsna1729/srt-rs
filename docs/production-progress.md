@@ -288,3 +288,30 @@ post-fix evidence is.
   drain declared equilibrium before the sender's timeout could expire, which read
   as 239 accepted-but-undelivered payloads; a run now ends at protocol
   quiescence, not TX quiescence.
+
+## Readiness receive path: zero-copy DATA payloads (2026-09-29)
+
+`BytesRecvBatch` (chunk-backed `recvmmsg` scratch) and
+`SrtConnection::feed_recv_bytes` landed with the owner TX/RX efficiency series
+but no runtime used them, so the readiness runtimes still copied every DATA
+payload twice: once into the scratch, once into the connection. mio's and
+tokio's listener paths (and tokio's per-connection `Conn`) now receive through
+the chunk-backed scratch, and `PeerTable` gained an owned-datagram admission
+entry whose established direct-DATA case hands the connection a refcounted
+slice of the received buffer. It is not a second policy path: same decode,
+same bounded half-open prune, same socket-ID lookup, same handshake and group
+handling, with parity pinned by tests. Caller sides and bonded group legs keep
+the borrowing scratch -- ACK/NAK/control carries no payload to copy and would
+pay 4x the scratch memory per socket.
+
+- **Evidence.** `docs/results/readiness-recv-path-f9c676c.txt`: arms
+  interleaved, 352 rounds x 128 datagrams, 1316-byte payloads, loopback.
+  1225.2 -> 1094.1 ns/datagram (-10.7%) and 1.0001 -> 0.0156 allocations per
+  datagram; the control arm (chunk scratch + copying decode, 1346.3 ns) shows
+  the chunk scratch costs ~121 ns and the zero-copy decode saves ~252 ns of
+  it. At the qualified scale (600 x ~760 pkt/s) that is ~6% of one core and
+  ~449k allocations/s removed.
+- **Interop.** A real libsrt publisher (`srt-live-transmit` from a loopback
+  UDP source) delivered 3374 DATA payloads / 4.44 MB through the switched
+  library `mio::Owner` listener; `mio_owner_echo`, `tokio_facade_echo` and
+  `tokio_relay` pass on the same revision.

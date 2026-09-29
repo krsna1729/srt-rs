@@ -1,0 +1,41 @@
+=== READINESS RECEIVE PATH: COPYING vs ZERO-COPY DECODE ===
+Revision: f9c676c
+Harness: crates/srt-transport/benches/readiness_recv_path.rs (harness = false)
+Command: cargo bench --bench readiness_recv_path
+
+Arms interleaved round by round so host drift cannot favour one of them;
+median over 352 rounds of 128 datagrams each. Payload 1316 B (8 Mbit/s SRT
+packet), scratch slot 2048 B, batch capacity 32, loopback UDP. Every decoded
+payload is retained for its round and released inside the timed region, so
+the comparison covers the release side of each strategy as well.
+
+Arm                                          | ns/datagram | Allocs/datagram
+---------------------------------------------+-------------+----------------
+copy       (scratch + copying decode)        |      1225.2 |          1.0001
+bytes      (chunk + zero-copy decode)        |      1094.1 |          0.0156
+bytes_copy (chunk + copying decode, control) |      1346.3 |          1.0156
+
+Control reading: the chunk scratch itself costs ~121 ns/datagram against the
+per-slot scratch; the zero-copy decode saves ~252 ns, which more than repays
+it. Net effect of the switch: -131.1 ns/datagram and -0.9845 allocations per
+datagram. Across four runs of this bench on the same code the arms held their
+order and rough distance: copy 1204-1263, bytes 1075-1157, control
+1308-1427 ns/datagram.
+
+Aggregate expectation at the qualified scale (600 connections x ~760 pkt/s =
+456k pkt/s): ~60 ms/s, i.e. ~6% of one core, plus ~449k allocations/s
+removed. Caller sides and bonded group legs are deliberately left on the
+borrowing scratch: their traffic is ACK/NAK/control, which carries no payload
+to copy and would pay 4x the scratch memory per socket.
+
+End-to-end interop (throwaway harness, deleted after the run):
+srt-live-transmit (libsrt) publishing a loopback UDP source to the library
+mio `Owner` listener delivered 3374 DATA payloads / 4,440,184 bytes through
+the switched path. The mio_owner_echo, tokio_facade_echo and tokio_relay
+examples also pass on this revision.
+
+Raw stdout:
+# readiness receive path: payload=1316 slot=2048 batch=32 packets_per_round=128 rounds=352 (median per round, arms interleaved)
+READINESS_RECV_PATH arm=copy payload=1316 ns_per_packet=1225.2 allocs_per_packet=1.0001
+READINESS_RECV_PATH arm=bytes payload=1316 ns_per_packet=1094.1 allocs_per_packet=0.0156
+READINESS_RECV_PATH arm=bytes_copy payload=1316 ns_per_packet=1346.3 allocs_per_packet=1.0156
