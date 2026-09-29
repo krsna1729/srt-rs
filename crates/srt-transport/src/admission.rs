@@ -335,6 +335,29 @@ struct DecodedAdmissionDatagram {
     destination_socket_id: u32,
 }
 
+/// One received datagram as the admission path sees it.
+///
+/// Readiness scratch buffers and compio's staging slots lend the bytes
+/// (`Borrowed`); a receive path that already landed the datagram in a
+/// refcounted buffer (`BytesRecvBatch`) hands over the owned form, whose
+/// established direct-DATA case reaches the connection as a payload slice
+/// instead of a copy. Every other case reads the same bytes either way, so
+/// admission policy has exactly one implementation.
+enum AdmissionPayload<'a> {
+    Borrowed(&'a [u8]),
+    Owned(Bytes),
+}
+
+impl AdmissionPayload<'_> {
+    #[inline]
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(data) => data,
+            Self::Owned(data) => data,
+        }
+    }
+}
+
 struct AdmissionFeedResult {
     fed: bool,
     feed_error_kind: Option<srt_proto::ErrorKind>,
@@ -1938,7 +1961,7 @@ impl PeerTable {
     {
         self.admit_with_policy_hook(
             peer,
-            data,
+            AdmissionPayload::Borrowed(data),
             now,
             options,
             worker_index,
@@ -1971,7 +1994,7 @@ impl PeerTable {
     {
         self.admit_with_policy_hook(
             peer,
-            data,
+            AdmissionPayload::Borrowed(data),
             now,
             options,
             worker_index,
@@ -2022,6 +2045,54 @@ impl PeerTable {
         }
     }
 
+    /// [`Self::admit_with_listener_resolver`] for a datagram the receive
+    /// path already owns as `Bytes`.
+    ///
+    /// Identical policy, ordering and accounting: the same decode, the same
+    /// bounded half-open prune, the same established lookup, the same
+    /// handshake path. The only difference is that an established direct
+    /// DATA payload reaches the connection as a refcounted slice of `data`
+    /// (see [`SrtConnection::feed_recv_bytes`]) instead of a copy, which is
+    /// what makes a chunk-backed receive (`BytesRecvBatch`) pay off. A
+    /// datagram that is not established direct traffic -- handshake, group
+    /// leg, unknown socket ID, malformed -- is handled on the same bytes as
+    /// the borrowing entry point.
+    #[allow(clippy::too_many_arguments)]
+    pub fn admit_bytes_with_listener_resolver(
+        &mut self,
+        resolver: Option<&ListenerAdmissionResolver>,
+        peer: std::net::SocketAddr,
+        data: Bytes,
+        now: Timestamp,
+        options: &AdmissionOptions,
+        worker_index: usize,
+        worker_count: usize,
+        telemetry: &IngressTelemetry,
+    ) -> Admit {
+        match resolver {
+            Some(resolver) => self.admit_with_policy_hook(
+                peer,
+                AdmissionPayload::Owned(data),
+                now,
+                options,
+                worker_index,
+                worker_count,
+                telemetry,
+                |request, _connection| resolver.resolve(request).into(),
+            ),
+            None => self.admit_with_policy_hook(
+                peer,
+                AdmissionPayload::Owned(data),
+                now,
+                options,
+                worker_index,
+                worker_count,
+                telemetry,
+                |_request, _connection| AdmissionHookResult::Accept,
+            ),
+        }
+    }
+
     /// Expert pre-CONCLUSION escape hatch.
     ///
     /// This exposes the guarded [`SrtConnection`] setters for protocol options
@@ -2045,7 +2116,7 @@ impl PeerTable {
     {
         self.admit_with_policy_hook(
             peer,
-            data,
+            AdmissionPayload::Borrowed(data),
             now,
             options,
             worker_index,
@@ -2082,48 +2153,100 @@ impl PeerTable {
         Some(Admit::Dropped(AdmissionDropReason::InvalidPacket))
     }
 
+    /// [`Self::feed_established_direct`] for a datagram the receive path
+    /// already owns as `Bytes`: an accepted DATA payload reaches the
+    /// connection as a slice of that buffer instead of a fresh copy. Same
+    /// establishment check, bookkeeping, idle/ready transitions and drop
+    /// accounting as the borrowing form.
+    fn feed_established_direct_bytes(
+        &mut self,
+        physical: PhysicalPeerKey,
+        data: Bytes,
+        now: Timestamp,
+        telemetry: &IngressTelemetry,
+    ) -> Option<Admit> {
+        let slot_idx = self.slot_index_for_key(&physical)?;
+        let slot = self.slots.get_by_slot_mut(slot_idx)?;
+        let entry = slot.value.direct_mut()?;
+        if !entry.admission_established {
+            return None;
+        }
+        if entry.conn.feed_recv_bytes(data, now).is_ok() {
+            entry.last_datagram_at = now;
+            self.index_idle_peer(physical);
+            self.mark_ready_physical(physical);
+            return Some(Admit::Fed);
+        }
+        if entry.conn.state() == srt_proto::ConnectionState::Disconnected {
+            entry.rejected = true;
+            self.mark_ready_physical(physical);
+        }
+        telemetry.record_invalid_datagram();
+        Some(Admit::Dropped(AdmissionDropReason::InvalidPacket))
+    }
+
     fn admit_established_datagram(
         &mut self,
         peer: std::net::SocketAddr,
         destination_socket_id: u32,
-        data: &[u8],
+        payload: AdmissionPayload<'_>,
         now: Timestamp,
         telemetry: &IngressTelemetry,
     ) -> Admit {
-        if destination_socket_id != 0 {
-            let slot_idx = self.slots.slot_index_for_socket_id(destination_socket_id);
-            if let Some(slot) = self.slots.get_by_slot(slot_idx)
-                && slot.socket_id == destination_socket_id
-                && slot.address == peer
-            {
-                let physical = PhysicalPeerKey {
-                    address: peer,
-                    local_socket_id: destination_socket_id,
-                };
-                match &slot.value {
-                    PeerSlotTarget::GroupLeg(_) => {
-                        return self.admit_group_leg(physical, data, now);
-                    }
-                    PeerSlotTarget::Direct(_) => {
-                        if let Some(admit) =
-                            self.feed_established_direct(physical, data, now, telemetry)
-                        {
-                            return admit;
-                        }
-                    }
-                    PeerSlotTarget::Detached => {}
-                }
-            }
+        if let Some(admit) =
+            self.feed_matching_established(peer, destination_socket_id, payload, now, telemetry)
+        {
+            return admit;
         }
         telemetry.record_invalid_datagram();
         Admit::Dropped(AdmissionDropReason::InvalidPacket)
+    }
+
+    /// The socket-ID-matched half of [`Self::admit_established_datagram`]:
+    /// `Some` only when a live slot for exactly this peer and destination
+    /// socket ID was found and consumed the datagram, `None` when nothing
+    /// matched (which the caller reports as an invalid datagram).
+    fn feed_matching_established(
+        &mut self,
+        peer: std::net::SocketAddr,
+        destination_socket_id: u32,
+        payload: AdmissionPayload<'_>,
+        now: Timestamp,
+        telemetry: &IngressTelemetry,
+    ) -> Option<Admit> {
+        if destination_socket_id == 0 {
+            return None;
+        }
+        let slot_idx = self.slots.slot_index_for_socket_id(destination_socket_id);
+        let slot = self.slots.get_by_slot(slot_idx)?;
+        if slot.socket_id != destination_socket_id || slot.address != peer {
+            return None;
+        }
+        let physical = PhysicalPeerKey {
+            address: peer,
+            local_socket_id: destination_socket_id,
+        };
+        if matches!(&slot.value, PeerSlotTarget::GroupLeg(_)) {
+            return Some(self.admit_group_leg(physical, payload.as_slice(), now));
+        }
+        if !matches!(&slot.value, PeerSlotTarget::Direct(_)) {
+            return None;
+        }
+        match payload {
+            AdmissionPayload::Owned(data) => {
+                self.feed_established_direct_bytes(physical, data, now, telemetry)
+            }
+            AdmissionPayload::Borrowed(data) => {
+                self.feed_established_direct(physical, data, now, telemetry)
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
     fn admit_with_policy_hook<F>(
         &mut self,
         peer: std::net::SocketAddr,
-        data: &[u8],
+        payload: AdmissionPayload<'_>,
         now: Timestamp,
         options: &AdmissionOptions,
         worker_index: usize,
@@ -2144,7 +2267,7 @@ impl PeerTable {
         let DecodedAdmissionDatagram {
             handshake,
             destination_socket_id,
-        } = match decode_admission_datagram(data) {
+        } = match decode_admission_datagram(payload.as_slice()) {
             Ok(decoded) => decoded,
             Err(_) => {
                 telemetry.record_invalid_datagram();
@@ -2159,11 +2282,12 @@ impl PeerTable {
             return self.admit_established_datagram(
                 peer,
                 destination_socket_id,
-                data,
+                payload,
                 now,
                 telemetry,
             );
         }
+        let data = payload.as_slice();
         let mut physical = self.physical_for_datagram(
             peer,
             destination_socket_id,
@@ -4820,6 +4944,169 @@ mod tests {
         assert!(
             table.get_peer(&physical).expect("peer entry").connected,
             "poll_events alone (never drain_events) must update AdmissionPeer::connected"
+        );
+    }
+
+    /// The owned-datagram entry point must hand an established peer's DATA
+    /// payload to the connection as a slice of the buffer it was given --
+    /// that is the entire point of the chunk-backed readiness receive --
+    /// while counting and ordering it exactly like the borrowing entry.
+    #[test]
+    fn bytes_admission_delivers_an_established_payload_without_copying() {
+        let peer = "127.0.0.1:11095".parse().expect("address");
+        let options = AdmissionOptions::basic(0x3335, 0, false);
+        let telemetry = IngressTelemetry::new();
+        let mut table = PeerTable::new();
+
+        let (mut caller, conclusion) =
+            admit_up_to_conclusion(&mut table, peer, 0x4446, &options, &telemetry);
+        admit_conclusion(
+            &mut table,
+            peer,
+            &mut caller,
+            &conclusion,
+            &options,
+            &telemetry,
+        );
+
+        caller
+            .send(b"zero-copy-payload", Timestamp::from_micros(4))
+            .expect("caller sends one DATA packet");
+        let datagram = Bytes::from(next_packet(&mut caller));
+        let base = datagram.as_ptr() as usize;
+        let end = base + datagram.len();
+
+        let admit = table.admit_bytes_with_listener_resolver(
+            None,
+            peer,
+            datagram,
+            Timestamp::from_micros(5),
+            &options,
+            0,
+            1,
+            &telemetry,
+        );
+        assert_eq!(admit, Admit::Fed);
+
+        // Delivery happens on the periodic ACK timer after the negotiated
+        // TSBPD delay, not at DATA receipt time.
+        let mut outbound = Vec::new();
+        table.poll_outbound(Timestamp::from_micros(125_000), &mut outbound);
+        let mut events = Vec::new();
+        table.poll_events(&mut events);
+        let payload = events
+            .iter()
+            .find_map(|event| match &event.event {
+                ConnectionEvent::DataReceived { payload, .. } => Some(payload.clone()),
+                _ => None,
+            })
+            .expect("the DATA payload is delivered");
+        assert_eq!(&payload[..], b"zero-copy-payload");
+        let payload_base = payload.as_ptr() as usize;
+        assert!(
+            (base..end).contains(&payload_base),
+            "payload at {payload_base:#x} must be a slice of the fed datagram \
+             [{base:#x}, {end:#x}), not a fresh copy"
+        );
+    }
+
+    /// The owned entry point is an optimization for established DATA, never
+    /// a second admission policy: a handshake establishes through it, and a
+    /// datagram for an unknown socket ID is dropped exactly as the
+    /// borrowing entry drops it.
+    #[test]
+    fn bytes_admission_keeps_the_borrowing_path_for_handshakes_and_strays() {
+        let peer = "127.0.0.1:11096".parse().expect("address");
+        let options = AdmissionOptions::basic(0x3336, 0, false);
+        let telemetry = IngressTelemetry::new();
+        let mut table = PeerTable::new();
+
+        let mut caller = SrtConnection::new_caller(ConnectionOptions {
+            socket_id: 0x4447,
+            ..ConnectionOptions::default()
+        });
+        caller.connect(Timestamp::default()).expect("start caller");
+        assert_eq!(
+            table.admit_bytes_with_listener_resolver(
+                None,
+                peer,
+                Bytes::from(next_packet(&mut caller)),
+                Timestamp::default(),
+                &options,
+                0,
+                1,
+                &telemetry,
+            ),
+            Admit::Fed
+        );
+        let mut outbound = Vec::new();
+        table.poll_outbound(Timestamp::default(), &mut outbound);
+        for (outbound_peer, packet) in outbound {
+            if outbound_peer == peer {
+                caller
+                    .feed_recv_buf(&packet, Timestamp::from_micros(1))
+                    .expect("induction response");
+            }
+        }
+        assert_eq!(
+            table.admit_bytes_with_listener_resolver(
+                None,
+                peer,
+                Bytes::from(next_packet(&mut caller)),
+                Timestamp::from_micros(2),
+                &options,
+                0,
+                1,
+                &telemetry,
+            ),
+            Admit::Fed
+        );
+        assert_eq!(
+            table.established_count(),
+            1,
+            "the owned entry point completes a handshake like the borrowing one"
+        );
+
+        // A DATA datagram whose destination socket ID is not in the table.
+        let stray = {
+            let mut buf = Vec::new();
+            srt_proto::wire::SrtPacket::Data(srt_proto::wire::DataPacket::new(
+                1,
+                1,
+                0,
+                0xDEAD_BEEF,
+                Bytes::from_static(b"stray"),
+            ))
+            .encode(&mut buf)
+            .expect("stray datagram encodes");
+            buf
+        };
+        let now = Timestamp::from_micros(4);
+        let borrowed = {
+            let mut fresh = PeerTable::new();
+            fresh.admit(peer, &stray, now, &options, 0, 1, &telemetry)
+        };
+        let owned = {
+            let mut fresh = PeerTable::new();
+            fresh.admit_bytes_with_listener_resolver(
+                None,
+                peer,
+                Bytes::from(stray),
+                now,
+                &options,
+                0,
+                1,
+                &telemetry,
+            )
+        };
+        assert_eq!(
+            owned,
+            Admit::Dropped(AdmissionDropReason::InvalidPacket),
+            "a stray DATA datagram is dropped on the owned path too"
+        );
+        assert_eq!(
+            owned, borrowed,
+            "both entry points agree on a stray datagram"
         );
     }
 

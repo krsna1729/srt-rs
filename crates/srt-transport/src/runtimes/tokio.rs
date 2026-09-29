@@ -1,10 +1,10 @@
 use crate::{
-    BatchIoStats, GroupBuildError, GroupCallerLeg, GroupConnectionLeg, GroupConnectionStats,
-    GroupDriveReport, GroupLegDriveReport, GroupLogicalCounters, HighResWaiter, ManualTimerStore,
-    MonotonicDeadline, OutputDrainBudget, OutputDrainReport, OutputDrainStatus, PacedSendOutcome,
-    RecvBatch, RecvBudget, RecvDrainReport, collect_output_work, drain_connected_outputs,
-    drain_output_work, group_connection_stats, prepend_outputs, schedule_wait_micros,
-    sendmsg_connected_batch,
+    BatchIoStats, BytesRecvBatch, GroupBuildError, GroupCallerLeg, GroupConnectionLeg,
+    GroupConnectionStats, GroupDriveReport, GroupLegDriveReport, GroupLogicalCounters,
+    HighResWaiter, ManualTimerStore, MonotonicDeadline, OutputDrainBudget, OutputDrainReport,
+    OutputDrainStatus, PacedSendOutcome, RecvBatch, RecvBudget, RecvDrainReport,
+    collect_output_work, drain_connected_outputs, drain_output_work, group_connection_stats,
+    prepend_outputs, schedule_wait_micros, sendmsg_connected_batch,
 };
 use srt_proto::{Bytes, ConnectionOutput, GroupMode, SrtConnection, Timestamp};
 use std::collections::VecDeque;
@@ -24,7 +24,9 @@ pub struct Conn {
     sock: UdpSocket,
     timers: crate::ManualTimerStore,
     pending_outputs: VecDeque<ConnectionOutput>,
-    recv_batch: RecvBatch,
+    /// Chunk-backed scratch: received DATA payloads reach the protocol as
+    /// refcounted slices of the batch's chunk instead of copies.
+    recv_batch: BytesRecvBatch,
     io_stats: BatchIoStats,
     output_drain: OutputDrainBudget,
     recv_budget: RecvBudget,
@@ -87,7 +89,7 @@ impl Conn {
             sock,
             timers: crate::ManualTimerStore::new(),
             pending_outputs: VecDeque::new(),
-            recv_batch: RecvBatch::with_capacity(batch_capacity, RecvBatch::DEFAULT_BUF_LEN),
+            recv_batch: BytesRecvBatch::with_capacity(batch_capacity, RecvBatch::DEFAULT_BUF_LEN),
             io_stats: BatchIoStats::default(),
             output_drain,
             recv_budget,
@@ -206,8 +208,8 @@ impl Conn {
         now: Timestamp,
         budget: RecvBudget,
     ) -> io::Result<RecvDrainReport> {
-        let report = drain_readable(&self.sock, &mut self.recv_batch, budget, |_, data| {
-            let _ = self.conn.feed_recv_buf(data, now);
+        let report = drain_readable_bytes(&self.sock, &mut self.recv_batch, budget, |_, data| {
+            let _ = self.conn.feed_recv_bytes(data, now);
         })?;
         self.io_stats.record_recv(report);
         Ok(report)
@@ -220,12 +222,12 @@ impl Conn {
         now: Timestamp,
         budget: RecvBudget,
     ) -> io::Result<RecvDrainReport> {
-        let report = crate::drain_recv_fd(
+        let report = crate::drain_recv_fd_bytes(
             self.sock.as_raw_fd(),
             &mut self.recv_batch,
             budget,
             |_, data| {
-                let _ = self.conn.feed_recv_buf(data, now);
+                let _ = self.conn.feed_recv_bytes(data, now);
             },
         )?;
         self.io_stats.record_recv(report);
@@ -324,6 +326,66 @@ fn drain_readable_with_capacity(
                         continue;
                     }
                     on_datagram(addr, data);
+                    report.datagrams += 1;
+                }
+                if received < requested {
+                    break;
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                report.would_block = true;
+                break;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(report)
+}
+
+/// [`drain_readable`] for a chunk-backed scratch: datagrams are handed to
+/// `on_datagram` as refcounted slices of the batch's chunk, so a DATA
+/// payload reaches the protocol without a copy.
+fn drain_readable_bytes(
+    sock: &UdpSocket,
+    batch: &mut BytesRecvBatch,
+    budget: RecvBudget,
+    on_datagram: impl FnMut(Option<SocketAddr>, Bytes),
+) -> io::Result<RecvDrainReport> {
+    let batch_capacity = batch.capacity();
+    drain_readable_bytes_with_capacity(sock, batch, budget, batch_capacity, on_datagram)
+}
+
+fn drain_readable_bytes_with_capacity(
+    sock: &UdpSocket,
+    batch: &mut BytesRecvBatch,
+    budget: RecvBudget,
+    batch_capacity: usize,
+    mut on_datagram: impl FnMut(Option<SocketAddr>, Bytes),
+) -> io::Result<RecvDrainReport> {
+    let mut report = RecvDrainReport::default();
+    let batch_capacity = batch_capacity.clamp(1, batch.capacity());
+    let mut dequeued = 0usize;
+    for _ in 0..budget.max_rounds {
+        if dequeued >= budget.max_datagrams {
+            break;
+        }
+        let requested = (budget.max_datagrams - dequeued).min(batch_capacity);
+        let result = sock.try_io(tokio::io::Interest::READABLE, || {
+            match batch.recv(sock.as_raw_fd(), requested)? {
+                0 => Err(io::ErrorKind::WouldBlock.into()),
+                n => Ok(n),
+            }
+        });
+        match result {
+            Ok(received) => {
+                report.syscalls += 1;
+                for (addr, datagram, truncated) in batch.take() {
+                    dequeued += 1;
+                    if truncated {
+                        report.truncated += 1;
+                        continue;
+                    }
+                    on_datagram(addr, datagram);
                     report.datagrams += 1;
                 }
                 if received < requested {
@@ -1075,7 +1137,11 @@ struct OwnerListenerSide {
     peers: crate::PeerTable,
     admission: crate::AdmissionOptions,
     telemetry: crate::IngressTelemetry,
-    recv_batch: RecvBatch,
+    /// Chunk-backed scratch: ingest DATA payloads reach admission as
+    /// refcounted slices instead of copies. The caller side keeps the
+    /// borrowing scratch -- ACK/NAK/control traffic carries no payload to
+    /// copy and would pay 4x the scratch memory for nothing.
+    recv_batch: BytesRecvBatch,
     outbound: Vec<(SocketAddr, Vec<u8>)>,
     idle_timeout: Duration,
     transport: crate::ResolvedTransportConfig,
@@ -1253,7 +1319,7 @@ impl Owner {
             idle_timeout: prepared.admission.idle_timeout,
             peers: prepared.peer_table(),
             telemetry: crate::IngressTelemetry::new(),
-            recv_batch: RecvBatch::with_capacity(
+            recv_batch: BytesRecvBatch::with_capacity(
                 prepared.transport.recv_batch_capacity(),
                 RecvBatch::DEFAULT_BUF_LEN,
             ),
@@ -1434,13 +1500,13 @@ impl Owner {
                 &side.telemetry,
                 side.resolver.as_ref(),
             );
-            let report = drain_readable(
+            let report = drain_readable_bytes(
                 &side.socket,
                 &mut side.recv_batch,
                 side.transport.recv_budget,
                 |addr, data| {
                     let Some(peer) = addr else { return };
-                    let _ = peers.admit_with_listener_resolver(
+                    let _ = peers.admit_bytes_with_listener_resolver(
                         resolver, peer, data, recv_now, admission, 0, 1, telemetry,
                     );
                 },
