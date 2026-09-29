@@ -74,6 +74,10 @@ name = "compio_tx_allocs"
 harness = false
 required-features = ["compio", "bench-internals"]
 
+[[bench]]
+name = "readiness_recv_path"
+harness = false
+
 [features]
 mio = ["dep:mio"]
 tokio = ["dep:tokio"]

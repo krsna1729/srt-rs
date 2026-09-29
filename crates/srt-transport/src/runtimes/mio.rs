@@ -186,7 +186,12 @@ struct OwnerListenerSide {
     peers: crate::PeerTable,
     admission: crate::AdmissionOptions,
     telemetry: crate::IngressTelemetry,
-    recv_batch: crate::RecvBatch,
+    /// Chunk-backed scratch for the listener: ingest DATA payloads then
+    /// reach admission as refcounted slices instead of copies. The caller
+    /// side keeps the borrowing scratch -- it receives ACK/NAK/control
+    /// traffic, which carries no payload to copy and would pay 4x the
+    /// scratch memory for nothing.
+    recv_batch: crate::BytesRecvBatch,
     outbound: Vec<(std::net::SocketAddr, Vec<u8>)>,
     idle_timeout: Duration,
     transport: crate::ResolvedTransportConfig,
@@ -384,7 +389,7 @@ impl Owner {
             idle_timeout: prepared.admission.idle_timeout,
             peers: prepared.peer_table(),
             telemetry: crate::IngressTelemetry::new(),
-            recv_batch: crate::RecvBatch::with_capacity(
+            recv_batch: crate::BytesRecvBatch::with_capacity(
                 prepared.transport.recv_batch_capacity(),
                 crate::RecvBatch::DEFAULT_BUF_LEN,
             ),
@@ -580,14 +585,14 @@ impl Owner {
                 &side.telemetry,
                 side.resolver.as_ref(),
             );
-            if let Err(error) = drain_side_recv(
+            if let Err(error) = drain_side_recv_bytes(
                 &mut side.recv_pending,
                 side.socket.as_raw_fd(),
                 &mut side.recv_batch,
                 side.transport.recv_budget,
                 |addr, data| {
                     let Some(peer) = addr else { return };
-                    let _ = peers.admit_with_listener_resolver(
+                    let _ = peers.admit_bytes_with_listener_resolver(
                         resolver, peer, data, now, admission, 0, 1, telemetry,
                     );
                 },
@@ -853,6 +858,27 @@ fn apply_readiness_event(
         *write_blocked = false;
     }
     Ok(())
+}
+
+/// [`drain_side_recv`] for a side whose scratch is chunk-backed: datagrams
+/// are handed to `on_datagram` as refcounted slices of the batch's chunk.
+fn drain_side_recv_bytes(
+    recv_pending: &mut bool,
+    fd: std::os::fd::RawFd,
+    recv_batch: &mut crate::BytesRecvBatch,
+    recv_budget: crate::RecvBudget,
+    on_datagram: impl FnMut(Option<std::net::SocketAddr>, bytes::Bytes),
+) -> io::Result<()> {
+    match crate::drain_recv_fd_bytes(fd, recv_batch, recv_budget, on_datagram) {
+        Ok(report) => {
+            *recv_pending = !report.would_block;
+            Ok(())
+        }
+        Err(error) => {
+            *recv_pending = false;
+            Err(error)
+        }
+    }
 }
 
 /// Drain one side's receive path and update its `recv_pending` flag from

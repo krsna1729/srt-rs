@@ -284,8 +284,8 @@ pub(crate) use batch::drain_recv_fd_with_capacity;
 pub(crate) use batch::flush_destined_bounded;
 #[allow(unused_imports)]
 pub(crate) use batch::{
-    BatchIoStats, RecvBatch, RecvBudget, RecvDrainReport, SendFlushReport, apply_send_result,
-    drain_recv_fd, flush_destined,
+    BatchIoStats, BytesRecvBatch, RecvBatch, RecvBudget, RecvDrainReport, SendFlushReport,
+    apply_send_result, drain_recv_fd, drain_recv_fd_bytes, flush_destined,
 };
 #[allow(unused_imports)]
 pub(crate) use caller::{
