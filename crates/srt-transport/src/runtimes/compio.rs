@@ -958,6 +958,15 @@ impl ManagedRxRing {
             waker.wake();
         }
     }
+    /// Count one transient buffer-pool exhaustion event (ENOBUFS / ResourceBusy).
+    /// Bounded loss, not an owner fault. Wakes the owner so in-flight buffers
+    /// can be serviced and returned to the pool.
+    fn note_buffer_exhausted(&mut self) {
+        self.dropped = self.dropped.saturating_add(1);
+        if let Some(waker) = self.waker.take() {
+            waker.wake();
+        }
+    }
 
     fn fault(&mut self, fault: RxFault) {
         self.fault = Some(fault);
@@ -1013,6 +1022,7 @@ where
             }
             ManagedRxStep::Truncated => ring.note_truncated(),
             ManagedRxStep::Unattributable => {}
+            ManagedRxStep::BufferExhausted => ring.note_buffer_exhausted(),
             ManagedRxStep::Ended => {
                 ring.fault(RxFault::StreamError("managed RX stream ended".to_string()));
                 break;
@@ -1039,6 +1049,10 @@ pub(crate) enum ManagedRxStep {
     /// The kernel set `MSG_TRUNC`: the slot did not hold the whole datagram.
     /// Counted and dropped, never parsed.
     Truncated,
+    /// Transient buffer-pool exhaustion: the kernel's provided-buffer pool had
+    /// no available slot for this datagram (ENOBUFS / ResourceBusy). Counted as
+    /// dropped; does not fault the stream.
+    BufferExhausted,
     /// A complete datagram holding its provided-buffer lease.
     Datagram(ManagedRxDatagram),
     /// A datagram with no parseable source address: it cannot be attributed
@@ -1097,7 +1111,13 @@ where
             Poll::Pending => Poll::Pending,
             Poll::Ready(None) => Poll::Ready(Some(ManagedRxStep::Ended)),
             Poll::Ready(Some(Err(error))) => {
-                Poll::Ready(Some(ManagedRxStep::Failed(error.to_string())))
+                if error.kind() == std::io::ErrorKind::ResourceBusy
+                    || error.raw_os_error() == Some(libc::ENOBUFS)
+                {
+                    Poll::Ready(Some(ManagedRxStep::BufferExhausted))
+                } else {
+                    Poll::Ready(Some(ManagedRxStep::Failed(error.to_string())))
+                }
             }
             Poll::Ready(Some(Ok(result))) => Poll::Ready(Some(result.into_step(slot_len))),
         }
@@ -7333,6 +7353,85 @@ mod tests {
             assert_eq!(stats.depth, 0, "no completion may outlive shutdown");
             assert!(!stats.staged, "no staged lease may outlive shutdown");
         });
+    }
+
+    /// Transient buffer-pool exhaustion (ENOBUFS / ResourceBusy) is bounded loss,
+    /// not a fatal owner fault. The loop must count the dropped datagram and continue.
+    #[test]
+    fn managed_rx_task_treats_buffer_exhaustion_as_bounded_loss_not_fault() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            let ring = Rc::new(RefCell::new(ManagedRxRing::new()));
+            let steps = futures_util::stream::iter(vec![
+                ManagedRxStep::BufferExhausted,
+                ManagedRxStep::BufferExhausted,
+                ManagedRxStep::Truncated,
+            ]);
+            managed_rx_task(steps, Rc::downgrade(&ring)).await;
+            let ring = ring.borrow();
+            assert_eq!(
+                ring.dropped, 2,
+                "buffer exhaustion must be counted as dropped"
+            );
+            assert_eq!(ring.truncated, 1, "truncated must be counted");
+            assert!(
+                ring.fault.is_none(),
+                "transient exhaustion must NOT fault the ring"
+            );
+        });
+    }
+
+    /// `ManagedStepStream` must classify `ResourceBusy` and `ENOBUFS` as `BufferExhausted`,
+    /// while preserving other I/O errors as `Failed`.
+    #[test]
+    fn managed_step_stream_classifies_resource_busy_and_enobufs() {
+        use futures_util::StreamExt;
+        struct DummyStep;
+        impl IntoManagedRxStep for DummyStep {
+            fn into_step(self, _slot_len: usize) -> ManagedRxStep {
+                ManagedRxStep::Unattributable
+            }
+        }
+        let items: Vec<std::io::Result<DummyStep>> = vec![
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ResourceBusy,
+                "buffer ring has no available buffer",
+            )),
+            Err(std::io::Error::from_raw_os_error(libc::ENOBUFS)),
+            Err(std::io::Error::from_raw_os_error(libc::ECONNRESET)),
+            Ok(DummyStep),
+        ];
+        let mut stream = ManagedStepStream {
+            inner: Box::pin(futures_util::stream::iter(items)),
+            slot_len: 2048,
+        };
+        let s1 = futures_util::FutureExt::now_or_never(stream.next())
+            .flatten()
+            .unwrap();
+        assert!(matches!(s1, ManagedRxStep::BufferExhausted));
+
+        let s2 = futures_util::FutureExt::now_or_never(stream.next())
+            .flatten()
+            .unwrap();
+        assert!(matches!(s2, ManagedRxStep::BufferExhausted));
+
+        let s3 = futures_util::FutureExt::now_or_never(stream.next())
+            .flatten()
+            .unwrap();
+        match s3 {
+            ManagedRxStep::Failed(msg) => {
+                assert!(msg.contains("Connection reset") || !msg.is_empty())
+            }
+            other => panic!(
+                "expected Failed, got {:?}",
+                matches!(other, ManagedRxStep::Failed(_))
+            ),
+        }
+
+        let s4 = futures_util::FutureExt::now_or_never(stream.next())
+            .flatten()
+            .unwrap();
+        assert!(matches!(s4, ManagedRxStep::Unattributable));
     }
 
     /// Fail-closed attach: under `ManagedRequired` an Owner refuses to attach
