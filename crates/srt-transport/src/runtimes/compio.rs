@@ -571,10 +571,9 @@ impl ProductionRuntimeConfig {
 /// Build the canonical production Compio runtime for one Owner shard thread.
 ///
 /// Fail-closed on Linux high-density production: forces
-/// `DriverType::IoUring`, explicit SQ/CQ sizing, `single_issuer`, and an
-/// explicit managed-RX buffer pool. `coop_taskrun` / `taskrun_flag` /
-/// `defer_taskrun` stay at Compio defaults (no evidence to enable them);
-/// SQPOLL stays off (unmeasured default would hide latency truth).
+/// `DriverType::IoUring`, explicit SQ/CQ sizing, `single_issuer`,
+/// cooperative task work, and an explicit managed-RX buffer pool.
+/// `taskrun_flag` / `defer_taskrun` stay at Compio defaults; SQPOLL stays off.
 /// Restream supplies CPU affinity/shard topology; srt-rs never pins CPUs.
 /// Returns `Err` rather than silently becoming Poll.
 pub fn production_runtime_builder(
@@ -585,6 +584,7 @@ pub fn production_runtime_builder(
     proactor.capacity(config.sq_capacity);
     proactor.cqsize(config.cq_size);
     proactor.single_issuer(true);
+    proactor.coop_taskrun(true);
     proactor.buffer_pool_size(
         std::num::NonZero::new(config.rx_ring_entries)
             .ok_or_else(|| "rx_ring_entries must be nonzero".to_string())?,
@@ -909,6 +909,8 @@ pub(crate) struct ManagedRxRing {
     fault: Option<RxFault>,
     /// Completions dropped because the ring was full (bounded loss).
     dropped: u64,
+    /// Transient provided-buffer pool exhaustion events, not queue discards.
+    buffer_exhaustions: u64,
     /// Datagrams the kernel reported as truncated: too large for the ring
     /// slot. Dropped without parsing.
     truncated: u64,
@@ -924,6 +926,7 @@ impl ManagedRxRing {
             waker: None,
             fault: None,
             dropped: 0,
+            buffer_exhaustions: 0,
             truncated: 0,
             shutdown: false,
             task: None,
@@ -959,10 +962,10 @@ impl ManagedRxRing {
         }
     }
     /// Count one transient buffer-pool exhaustion event (ENOBUFS / ResourceBusy).
-    /// Bounded loss, not an owner fault. Wakes the owner so in-flight buffers
-    /// can be serviced and returned to the pool.
+    /// Resource pressure, not a queue discard or an owner fault. Wakes the
+    /// owner so in-flight buffers can be serviced and returned to the pool.
     fn note_buffer_exhausted(&mut self) {
-        self.dropped = self.dropped.saturating_add(1);
+        self.buffer_exhaustions = self.buffer_exhaustions.saturating_add(1);
         if let Some(waker) = self.waker.take() {
             waker.wake();
         }
@@ -1049,9 +1052,9 @@ pub(crate) enum ManagedRxStep {
     /// The kernel set `MSG_TRUNC`: the slot did not hold the whole datagram.
     /// Counted and dropped, never parsed.
     Truncated,
-    /// Transient buffer-pool exhaustion: the kernel's provided-buffer pool had
-    /// no available slot for this datagram (ENOBUFS / ResourceBusy). Counted as
-    /// dropped; does not fault the stream.
+    /// Transient provided-buffer pool exhaustion (ENOBUFS / ResourceBusy).
+    /// Counted as an exhaustion event, not a completion-queue discard; does
+    /// not fault the stream.
     BufferExhausted,
     /// A complete datagram holding its provided-buffer lease.
     Datagram(ManagedRxDatagram),
@@ -1258,15 +1261,22 @@ impl SideRx {
     }
 
     fn stats(&self) -> ManagedRxStats {
-        let (depth, dropped, truncated) = self.ring.as_ref().map_or((0, 0, 0), |ring| {
-            let ring = ring.borrow();
-            (ring.completions.len(), ring.dropped, ring.truncated)
-        });
+        let (depth, dropped, buffer_exhaustions, truncated) =
+            self.ring.as_ref().map_or((0, 0, 0, 0), |ring| {
+                let ring = ring.borrow();
+                (
+                    ring.completions.len(),
+                    ring.dropped,
+                    ring.buffer_exhaustions,
+                    ring.truncated,
+                )
+            });
         ManagedRxStats {
             mode: self.mode,
             depth,
             capacity: MANAGED_RX_RING_DEPTH,
             dropped,
+            buffer_exhaustions,
             truncated,
             staged: self.staged.is_some(),
         }
@@ -1284,6 +1294,9 @@ pub struct ManagedRxStats {
     pub capacity: usize,
     /// Completions dropped because the ring was full.
     pub dropped: u64,
+    /// Transient provided-buffer pool exhaustion events (ENOBUFS / ResourceBusy).
+    /// These do not establish that a completion was discarded.
+    pub buffer_exhaustions: u64,
     /// Datagrams dropped as truncated (larger than the ring slot).
     pub truncated: u64,
     /// Whether a whole completion is staged for the next visit.
@@ -7180,7 +7193,10 @@ mod tests {
         assert_eq!(stats.mode, OwnerRxMode::RawReadiness);
         assert_eq!(stats.depth, 0);
         assert_eq!(stats.capacity, MANAGED_RX_RING_DEPTH);
-        assert_eq!((stats.dropped, stats.truncated), (0, 0));
+        assert_eq!(
+            (stats.dropped, stats.buffer_exhaustions, stats.truncated),
+            (0, 0, 0)
+        );
 
         let managed = SideRx::managed(2048, true);
         assert_eq!(managed.mode, OwnerRxMode::ManagedMultishot);
@@ -7189,6 +7205,10 @@ mod tests {
         let stats = managed.stats();
         assert_eq!(stats.mode, OwnerRxMode::ManagedMultishot);
         assert_eq!(stats.depth, 0);
+        assert_eq!(
+            (stats.dropped, stats.buffer_exhaustions, stats.truncated),
+            (0, 0, 0)
+        );
         assert!(!stats.staged);
     }
 
@@ -7233,9 +7253,9 @@ mod tests {
     }
 
     /// End-to-end managed multishot RX on a kernel whose provided-buffer ring
-    /// registers: a legal datagram is delivered through the managed ring, and a
-    /// datagram larger than the ring slot is detected via `MSG_TRUNC`, counted,
-    /// and never handed to `srt-proto`.
+    /// registers: after transient exhaustion, a legal datagram is delivered
+    /// through the managed ring; an oversized datagram is counted as truncated
+    /// and never handed to `srt-proto`. Pressure counters survive shutdown.
     ///
     /// Self-skipping: on a host whose kernel rejects
     /// `IORING_REGISTER_PBUF_RING` (this repository's own development host does)
@@ -7283,6 +7303,32 @@ mod tests {
                 .expect("a capable kernel must attach managed multishot");
             assert_eq!(owner.rx_mode(), Some(OwnerRxMode::ManagedMultishot));
             let local = owner.listener_local_addr().expect("listener addr");
+            // Exercise the production error classifier and receive loop before
+            // the real consumer delivers the next UDP datagram.
+            let ring = owner
+                .listener
+                .as_ref()
+                .expect("listener side")
+                .rx
+                .ring
+                .as_ref()
+                .expect("managed ring");
+            let errors: [io::Result<compio::driver::op::RecvMsgMultiResult>; 2] = [
+                Err(io::Error::from(io::ErrorKind::ResourceBusy)),
+                Err(io::Error::from_raw_os_error(libc::ENOBUFS)),
+            ];
+            let steps = futures_util::StreamExt::take(
+                ManagedStepStream {
+                    inner: futures_util::stream::iter(errors),
+                    slot_len: cfg.rx_buffer_len,
+                },
+                2,
+            );
+            managed_rx_task(steps, Rc::downgrade(ring)).await;
+            let stats = owner.rx_stats().listener.expect("listener rx stats");
+            assert_eq!(stats.buffer_exhaustions, 2);
+            assert_eq!(stats.dropped, 0);
+            assert!(owner.fault().is_none());
 
             let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("sender bind");
             sender
@@ -7336,6 +7382,8 @@ mod tests {
             let stats = owner.rx_stats().listener.expect("listener rx stats");
             assert_eq!(stats.mode, OwnerRxMode::ManagedMultishot);
             assert_eq!(stats.capacity, MANAGED_RX_RING_DEPTH);
+            assert_eq!(stats.buffer_exhaustions, 2);
+            assert_eq!(stats.dropped, 0, "pressure is not a queue discard");
 
             assert!(
                 owner
@@ -7352,32 +7400,67 @@ mod tests {
             let stats = owner.rx_stats().listener.expect("listener rx stats");
             assert_eq!(stats.depth, 0, "no completion may outlive shutdown");
             assert!(!stats.staged, "no staged lease may outlive shutdown");
+            assert_eq!(stats.buffer_exhaustions, 2);
+            assert_eq!(stats.dropped, 0);
+            assert_eq!(stats.truncated, truncated);
         });
     }
 
-    /// Transient buffer-pool exhaustion (ENOBUFS / ResourceBusy) is bounded loss,
-    /// not a fatal owner fault. The loop must count the dropped datagram and continue.
+    /// Inject both exhaustion error forms through the production classifier
+    /// and loop: wake the owner, keep drops independent, process the next
+    /// oversized datagram, and retain counters through teardown.
     #[test]
-    fn managed_rx_task_treats_buffer_exhaustion_as_bounded_loss_not_fault() {
+    fn managed_rx_task_counts_buffer_pressure_and_recovers_without_fault() {
+        use futures_util::StreamExt;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        struct CountWake(AtomicUsize);
+        impl std::task::Wake for CountWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        struct OversizedDatagram;
+        impl IntoManagedRxStep for OversizedDatagram {
+            fn into_step(self, _slot_len: usize) -> ManagedRxStep {
+                ManagedRxStep::Truncated
+            }
+        }
+
         let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
         runtime.block_on(async {
-            let ring = Rc::new(RefCell::new(ManagedRxRing::new()));
-            let steps = futures_util::stream::iter(vec![
-                ManagedRxStep::BufferExhausted,
-                ManagedRxStep::BufferExhausted,
-                ManagedRxStep::Truncated,
-            ]);
+            let mut side = SideRx::managed(2048, true);
+            let ring = side.ring.as_ref().expect("managed ring").clone();
+            let wake = Arc::new(CountWake(AtomicUsize::new(0)));
+            ring.borrow_mut().waker = Some(Waker::from(wake.clone()));
+            let items = [
+                Err(io::Error::from(io::ErrorKind::ResourceBusy)),
+                Err(io::Error::from_raw_os_error(libc::ENOBUFS)),
+                Ok(OversizedDatagram),
+            ];
+            let steps = ManagedStepStream {
+                inner: futures_util::stream::iter(items),
+                slot_len: 2048,
+            }
+            .take(3);
             managed_rx_task(steps, Rc::downgrade(&ring)).await;
-            let ring = ring.borrow();
+            let stats = side.stats();
+            assert_eq!(stats.buffer_exhaustions, 2);
+            assert_eq!(stats.dropped, 0, "no completion was discarded");
             assert_eq!(
-                ring.dropped, 2,
-                "buffer exhaustion must be counted as dropped"
+                stats.truncated, 1,
+                "receive handling resumes after pressure"
             );
-            assert_eq!(ring.truncated, 1, "truncated must be counted");
-            assert!(
-                ring.fault.is_none(),
-                "transient exhaustion must NOT fault the ring"
-            );
+            assert_eq!(wake.0.load(Ordering::Relaxed), 1, "wake the waiting owner");
+            assert!(ring.borrow().fault.is_none(), "pressure must not fault RX");
+
+            assert!(side.stop_and_join(std::time::Duration::from_secs(1)).await);
+            assert!(side.quiescent());
+            assert_eq!(side.stats(), stats, "teardown must retain receive counters");
+            assert!(side.take_fault().is_none());
         });
     }
 
@@ -7418,15 +7501,7 @@ mod tests {
         let s3 = futures_util::FutureExt::now_or_never(stream.next())
             .flatten()
             .unwrap();
-        match s3 {
-            ManagedRxStep::Failed(msg) => {
-                assert!(msg.contains("Connection reset") || !msg.is_empty())
-            }
-            other => panic!(
-                "expected Failed, got {:?}",
-                matches!(other, ManagedRxStep::Failed(_))
-            ),
-        }
+        assert!(matches!(s3, ManagedRxStep::Failed(_)));
 
         let s4 = futures_util::FutureExt::now_or_never(stream.next())
             .flatten()
@@ -9112,6 +9187,7 @@ mod tests {
                 stats.caller.map(|s| s.mode),
                 Some(OwnerRxMode::RawReadiness)
             );
+            assert_eq!(stats.caller.map(|s| s.buffer_exhaustions), Some(0));
 
             // A managed caller ring's counters stay visible in the snapshot.
             let c_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
@@ -9119,6 +9195,7 @@ mod tests {
             let mut owner = Owner::new(2).with_caller(OwnerCallerSide::new_single(c_sock));
             let ring = Rc::new(RefCell::new(ManagedRxRing::new()));
             ring.borrow_mut().note_truncated();
+            ring.borrow_mut().note_buffer_exhausted();
             owner.caller.as_mut().expect("caller side").rx = SideRx {
                 mode: OwnerRxMode::ManagedMultishot,
                 ring: Some(ring),
@@ -9130,6 +9207,8 @@ mod tests {
                 Some(1),
                 "the caller side's truncation must be reported"
             );
+            assert_eq!(stats.caller.map(|s| s.buffer_exhaustions), Some(1));
+            assert_eq!(stats.caller.map(|s| s.dropped), Some(0));
             assert_eq!(
                 stats.caller.map(|s| s.mode),
                 Some(OwnerRxMode::ManagedMultishot)

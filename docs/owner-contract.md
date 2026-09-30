@@ -215,6 +215,12 @@ the same bounded teardown.
   datagram is decided by the protocol, not inferred from bytes.
 * `TxPoolSnapshot` reports `capacity`, `free`, `high_water` (monotonic peak of
   simultaneously checked-out slots, never above `capacity`), and `exhaustions`.
+* `ManagedRxStats::buffer_exhaustions` counts transient provided-buffer pressure
+  reports (`ENOBUFS` / `ResourceBusy`), not datagrams lost. Pressure wakes the
+  Owner and receive handling continues without an Owner fault.
+  `dropped` counts actual completion-ring discards; `truncated` counts oversized
+  datagrams discarded without parsing. These counters survive receive shutdown
+  and do not measure kernel UDP socket drops or protocol wire loss.
 * First-submit lateness is measured from the source's declared deadline for a
   first transmission to the point the datagram is handed to a TX lane, so it
   spans the deadline-to-wire path including the source's own lateness. It is not
@@ -236,8 +242,8 @@ each may change without notice while every clause above still holds:
   as a batch.
 * The concrete timer store type, as long as its semantics are those of
   clause 5.
-* The RX path's mechanism (raw `recvfrom` versus a persistent multishot
-  consumer), as long as RX budgets and truncation accounting are those of
+* The RX path's mechanism (batched raw-readiness receive versus a persistent
+  multishot consumer), as long as RX budgets and truncation accounting are those of
   clauses 4 and 11.
 * The layout of any protocol-owned structure.
 
@@ -261,6 +267,10 @@ config-level halves in `caller_pool.rs` and `config.rs`.
 | 9 completion ownership | `service_returns_tx_buffers_and_updates_completion_stats`, `tx_failure_event_reports_the_logical_attribution`, `owner_sibling_isolation`, `bonded_tx_failure_is_attributed_to_group_and_leg` |
 | 10 bounded close | `shutdown_and_drain_reaps_in_flight_to_quiescence`, `shutdown_timeout_does_not_fabricate_quiescence`, `shutdown_verdict_requires_rx_quiescence`, `a_dead_tx_lane_poisons_the_owner_and_cannot_continue_at_reduced_capacity` |
 | 11 telemetry meanings | `report_tx_class_total_matches_submitted_packets_every_visit`, `tx_class_delta_reports_only_this_visits_submissions`, `first_submit_lateness_samples_only_first_transmission_data_with_a_due_instant`, `first_submit_lateness_measures_a_real_application_submission`, `tx_pool_high_water_tracks_the_peak_and_never_exceeds_capacity`, `rx_stats_expose_both_sides`, `rx_session_totals_report_live_sessions_and_survive_retirement`, `rx_session_totals_are_none_without_an_attached_side`, `rx_session_totals_include_bonded_group_legs` |
+
+Managed receive-pressure accounting is also pinned by
+`managed_rx_task_counts_buffer_pressure_and_recovers_without_fault` and
+`managed_multishot_delivers_and_counts_truncated_datagrams`.
 
 Row-level evidence is gated separately, in `cargo xtask qualify`: a
 qualification row must be a row of the workload it claims (the whole requested
