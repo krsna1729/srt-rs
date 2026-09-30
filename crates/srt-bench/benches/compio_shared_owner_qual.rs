@@ -174,6 +174,7 @@ struct QualReport {
     inflight_at_window_end: u64,
     rx_mode: String,
     rx_dropped: u64,
+    rx_buffer_exhaustions: u64,
     rx_truncated: u64,
     tx_pool_free: usize,
     tx_pool_capacity: usize,
@@ -715,6 +716,7 @@ async fn run_sender(
         // The sender's own receive side is the caller socket.
         if let Some(stats) = owner.rx_stats().caller {
             report.rx_dropped = stats.dropped;
+            report.rx_buffer_exhaustions = stats.buffer_exhaustions;
             report.rx_truncated = stats.truncated;
         }
         // `cpu_ms` is the whole measured run: window + drain + the teardown
@@ -806,7 +808,7 @@ fn main() {
          first_submit_lateness_us_p50={} first_submit_lateness_us_p99={} \
          first_submit_lateness_us_max={} first_submit_lateness_samples={} \
          pending_after_drain={} rx_mode={} managed_rx={} \
-         rx_dropped={} rx_truncated={} rx_lost={} rx_duplicates={} \
+         rx_dropped={} rx_buffer_exhaustions={} rx_truncated={} rx_lost={} rx_duplicates={} \
          tx_pool_free={} tx_pool_capacity={} tx_pool_high_water={} \
          payload_bytes={} interval_us={} \
          offered_bps_per_dest={} fence_offered={} fence_accepted={} \
@@ -864,6 +866,7 @@ fn main() {
         report.rx_mode,
         managed,
         report.rx_dropped,
+        report.rx_buffer_exhaustions,
         report.rx_truncated,
         report.rx_lost,
         report.rx_duplicates,
