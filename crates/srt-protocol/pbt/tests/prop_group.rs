@@ -120,11 +120,14 @@ proptest! {
             listener_a.feed_recv_buf(&packet, ts(102_000)).expect("data decodes");
             while listener_a.poll_event().is_some() {}
         }
-        listener_a.handle_timer(TimerId::Ack, ts(103_000)).expect("ack timer");
+        // The first stalled packet already sent a DATA-path Full ACK at
+        // 102 ms; like libsrt's `checkACKTimer`, the next Full ACK (carrying
+        // the final position) is due one ACK interval later.
+        listener_a.handle_timer(TimerId::Ack, ts(112_000)).expect("ack timer");
         transfer(
             &mut listener_a,
             group.member_mut(1).expect("first member").connection_mut(),
-            ts(103_000),
+            ts(112_000),
         );
 
         prop_assert!(group.can_send());
@@ -132,7 +135,7 @@ proptest! {
             group.member(1).expect("first member").state(),
             GroupMemberState::Active,
         );
-        prop_assert_eq!(group.send(&payload, ts(104_000)).expect("both legs rejoin"), 2);
+        prop_assert_eq!(group.send(&payload, ts(113_000)).expect("both legs rejoin"), 2);
     }
 }
 

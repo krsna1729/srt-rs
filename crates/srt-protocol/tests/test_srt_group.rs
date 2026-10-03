@@ -201,16 +201,19 @@ fn broadcast_backpressure_requalifies_the_recovered_leg() {
         listener_a.feed_recv_buf(&packet, ts(102_000)).unwrap();
         while listener_a.poll_event().is_some() {}
     }
-    listener_a.handle_timer(TimerId::Ack, ts(103_000)).unwrap();
+    // The first stalled packet already sent a DATA-path Full ACK at 102 ms;
+    // like libsrt's `checkACKTimer`, the next Full ACK (carrying the final
+    // position) is due one ACK interval later.
+    listener_a.handle_timer(TimerId::Ack, ts(112_000)).unwrap();
     transfer(
         &mut listener_a,
         group.member_mut(1).unwrap().connection_mut(),
-        ts(103_000),
+        ts(112_000),
     );
 
     assert!(group.can_send());
     assert_eq!(group.member(1).unwrap().state(), GroupMemberState::Active);
-    assert_eq!(group.send(b"rejoined", ts(104_000)).unwrap(), 2);
+    assert_eq!(group.send(b"rejoined", ts(113_000)).unwrap(), 2);
 }
 
 #[test]

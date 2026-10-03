@@ -6,6 +6,9 @@ use srt_proto::handshake::DEFAULT_FLOW_WINDOW;
 use srt_proto::receiver::{LossRange, NakPacket, ReceiverBuffer};
 use srt_proto::wire::{DataPacket, PacketPosition};
 
+/// The ACKACK history `ReceiverBuffer` documents: its last 256 Full ACKs.
+const ACKACK_HISTORY: usize = 256;
+
 fn expand_range(range: LossRange) -> Vec<u32> {
     range.iter().collect()
 }
@@ -699,18 +702,20 @@ proptest! {
         );
     }
 
+    /// The documented ACKACK history: an ACKACK samples RTT exactly when its
+    /// ACK is one of the last 256 Full ACKs this receiver sent.
     #[test]
-    fn ack_timestamp_retention_matches_the_latest_sixteen_records(
-        target in 0usize..20,
+    fn ackack_samples_rtt_only_within_the_latest_256_full_acks(
+        target in 0usize..(ACKACK_HISTORY + 4),
     ) {
         let mut buf = ReceiverBuffer::new(0, 120, Timestamp::default(), 0);
         buf.set_tsbpd_enabled(false);
         let now = Timestamp::from_micros(1_000);
         let _ = buf.receive(make_packet(0, 0), now);
 
-        let ack_numbers: Vec<u32> = (0..20)
+        let ack_numbers: Vec<u32> = (0..ACKACK_HISTORY + 4)
             .map(|offset| {
-                let _ = buf.generate_ack(now.add_micros(offset));
+                let _ = buf.generate_ack(now.add_micros(offset as u64));
                 buf.ack_number()
             })
             .collect();

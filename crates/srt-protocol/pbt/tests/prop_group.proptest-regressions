@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 00b5fdf51b54f62a2137abc87ac5e211b12d9242bd08ca332b4328436e7042a8 # shrinks to flow_window = 3, payload = [161, 151, 163, 115, 255, 73, 189, 198, 224, 223, 158, 83, 88, 232, 58, 218, 221, 73, 22, 138, 55, 20, 46, 114, 93, 26, 207, 133, 189, 237, 142, 57, 113, 161, 216, 110, 19, 224, 216, 113, 125, 33, 80, 251, 204, 90, 14, 167, 173, 99, 27, 85, 135, 171, 65, 178, 103, 184, 138, 200, 101, 102, 163, 77, 159, 145, 160, 57, 151, 113, 83, 213, 233, 132, 65, 68, 7, 161, 117, 70, 19, 106, 23, 100, 212, 95, 149, 127, 84, 118, 145, 136, 69, 9, 9, 142, 51, 10, 149, 55, 204, 90, 224, 94, 54, 79, 168, 54, 39, 119, 163]
