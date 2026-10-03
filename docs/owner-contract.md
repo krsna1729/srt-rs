@@ -180,11 +180,11 @@ distinct from the caller's group id; address equality never defines a bond; a
 direct caller never receives a GROUP response. See
 [Listener admission and per-StreamID policy](listener-admission-policy.md#shared-owner-listeners).
 
-**A listener topology can span several Compio Owners, one per thread.**
-`compio::owner_plans(&ListenerConfig)` splits the configured topology into one
-`OwnerListenerPlan` per Owner, and each Owner attaches its plan with
-`Owner::listen_planned`; the application chooses the layout in the config and
-nothing in the runtime rewrites it:
+**A listener topology can span several Owners, one per thread, on every
+runtime.** `owner_plans(&ListenerConfig, RuntimeFlavor)` splits the configured
+topology into one `OwnerListenerPlan` per Owner, and each Mio, Tokio or Compio
+Owner attaches its plan with `Owner::listen_planned`; the application chooses
+the layout in the config and no runtime rewrites it:
 
 * `PerPort`: one Owner (also what `Owner::listen` attaches).
 * `ReusePortMulti { acceptors: K }`: K members (`ReusePortMember { index,
@@ -199,10 +199,10 @@ nothing in the runtime rewrites it:
 * `SharedPool { listeners: K }`: K Owners on ports `P..P+K`.
 
 Layouts that move sessions between Owners (`ReusePortSingle`, promotion other
-than `Never`) are refused with an explicit error until the Owner has a
-relocation target. Established sessions are not relocated: they stay on the
-socket the kernel hashes them to, so a reuseport group's size must not change
-while sessions are live.
+than `Never`) are refused with an explicit error, identically on every runtime,
+until the Owners have a relocation target. Established sessions are not
+relocated: they stay on the socket the kernel hashes them to, so a reuseport
+group's size must not change while sessions are live.
 
 ### 9. Completion ownership
 

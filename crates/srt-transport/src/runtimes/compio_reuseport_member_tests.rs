@@ -7,6 +7,12 @@ use super::*;
 use crate::caller::LogicalCallerState;
 use crate::{CallerConfig, PoolOutcome};
 use std::net::SocketAddr;
+
+fn owner_plans(
+    config: &crate::ListenerConfig,
+) -> Result<Vec<crate::OwnerListenerPlan>, crate::RuntimeBuildError> {
+    crate::owner_plans(config, crate::RuntimeFlavor::Compio)
+}
 use std::time::Duration;
 
 fn free_port() -> u16 {
@@ -47,10 +53,14 @@ fn attach(plan: &OwnerListenerPlan) -> Owner {
 }
 
 fn caller(remote: SocketAddr) -> (Owner, crate::LogicalCallerId) {
-    let config = CallerConfig::builder(remote)
+    let mut config = CallerConfig::builder(remote)
         .ownership(crate::SocketOwnership::Shared)
         .build()
         .expect("caller config");
+    // No handshake retry inside the test: a stranded CONCLUSION can only be
+    // rescued by forwarding, never by a fresh INDUCTION.
+    config.session.handshake.retry_interval = Duration::from_secs(60);
+    config.session.handshake.timeout = Duration::from_secs(120);
     let mut owner = Owner::new(64);
     match owner
         .connect(&config, Timestamp::from_micros(0))
@@ -149,66 +159,6 @@ fn conclusions_rehashed_to_another_member_are_forwarded_and_connect() {
     });
 }
 
-/// The configured topology decides the Owner layout; nothing is rewritten.
-#[test]
-fn plans_follow_the_configured_topology() {
-    let port = free_port();
-    let per_port = owner_plans(&config(
-        port,
-        crate::ListenerTopology::PerPort,
-        crate::PromotionPolicy::Never,
-    ))
-    .expect("per-port plan");
-    assert_eq!(per_port.len(), 1);
-    assert_eq!(per_port[0].member(), None);
-
-    let group = owner_plans(&reuseport(port, 3)).expect("reuseport plans");
-    let members: Vec<_> = group
-        .iter()
-        .map(|plan| plan.member().map(|m| (m.index(), m.count())))
-        .collect();
-    assert_eq!(members, [Some((0, 3)), Some((1, 3)), Some((2, 3))]);
-    assert!(group.iter().all(|plan| plan.bind().port() == port));
-
-    let pool = owner_plans(&config(
-        port,
-        crate::ListenerTopology::SharedPool {
-            listeners: count(3),
-        },
-        crate::PromotionPolicy::Never,
-    ))
-    .expect("shared-pool plans");
-    let ports: Vec<_> = pool.iter().map(|plan| plan.bind().port()).collect();
-    assert_eq!(ports, [port, port + 1, port + 2]);
-    assert!(pool.iter().all(|plan| plan.member().is_none()));
-}
-
-/// Layouts that move sessions between Owners are refused, not downgraded.
-#[test]
-fn relocating_layouts_are_refused_until_owners_can_relocate() {
-    let port = free_port();
-    assert!(
-        owner_plans(&config(
-            port,
-            crate::ListenerTopology::ReusePortMulti {
-                acceptors: count(2)
-            },
-            crate::PromotionPolicy::Relocate,
-        ))
-        .is_err()
-    );
-    assert!(
-        owner_plans(&config(
-            port,
-            crate::ListenerTopology::ReusePortSingle { workers: count(2) },
-            crate::PromotionPolicy::Never,
-        ))
-        .is_err()
-    );
-    // A multi-Owner layout on an ephemeral port has no port to share.
-    assert!(owner_plans(&reuseport(0, 2)).is_err());
-}
-
 #[test]
 fn shared_pool_owners_each_serve_their_own_port() {
     let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
@@ -247,13 +197,4 @@ fn plain_listen_stays_per_port_only() {
     runtime.block_on(async {
         assert!(Owner::new(8).listen(&reuseport(free_port(), 2)).is_err());
     });
-}
-
-#[test]
-fn member_index_must_fit_the_group_and_the_cookie() {
-    assert!(ReusePortMember::new(0, 0).is_err());
-    assert!(ReusePortMember::new(2, 2).is_err());
-    assert!(ReusePortMember::new(0, srt_lifecycle::MAX_COOKIE_WORKERS + 1).is_err());
-    let last = ReusePortMember::new(255, 256).expect("cookie carries 256 members");
-    assert_eq!((last.index(), last.count()), (255, 256));
 }
