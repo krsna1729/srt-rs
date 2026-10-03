@@ -707,6 +707,152 @@ mod tests {
         assert_send::<ListenerTransfer>();
         assert_send::<OwnerListenerPlan>();
     }
+
+    type Case = (
+        crate::RuntimeFlavor,
+        crate::ListenerTopology,
+        crate::SocketOwnership,
+        crate::PromotionPolicy,
+        crate::CookieRoutingPolicy,
+    );
+
+    /// Every runtime × topology × ownership × promotion × cookie routing.
+    fn layout_cases() -> Vec<Case> {
+        use crate::{CookieRoutingPolicy as C, ListenerTopology as T, PromotionPolicy as P};
+        let topologies = [
+            T::PerPort,
+            T::ReusePortMulti {
+                acceptors: count(2),
+            },
+            T::ReusePortSingle { workers: count(2) },
+            T::SharedPool {
+                listeners: count(2),
+            },
+        ];
+        let ownerships = [
+            crate::SocketOwnership::Exclusive,
+            crate::SocketOwnership::Shared,
+        ];
+        let promotions = [P::Auto, P::Never, P::Relocate, P::Bonded, P::All];
+        let cookies = [C::Auto, C::Enabled, C::Disabled];
+        let mut cases = Vec::new();
+        for flavor in FLAVORS {
+            for topology in topologies {
+                for ownership in ownerships {
+                    for promotion in promotions {
+                        for cookie in cookies {
+                            cases.push((flavor, topology, ownership, promotion, cookie));
+                        }
+                    }
+                }
+            }
+        }
+        cases
+    }
+
+    /// A port with the next one free too (shared pools bind `P..P+K`).
+    fn two_free_ports() -> u16 {
+        loop {
+            let port = relocation_test_support::free_port();
+            if port < u16::MAX && UdpSocket::bind(("127.0.0.1", port + 1)).is_ok() {
+                return port;
+            }
+        }
+    }
+
+    /// Attach every plan to a fresh Owner of `flavor`, all alive at once.
+    #[cfg(all(feature = "mio", feature = "tokio", feature = "compio"))]
+    fn attach_all(
+        flavor: crate::RuntimeFlavor,
+        plans: &[OwnerListenerPlan],
+        tokio: &tokio::runtime::Runtime,
+        compio: &compio::runtime::Runtime,
+    ) -> Result<(), String> {
+        match flavor {
+            crate::RuntimeFlavor::Mio => {
+                let mut owners = Vec::new();
+                for plan in plans {
+                    let mut owner =
+                        crate::mio_transport::Owner::new().map_err(|e| e.to_string())?;
+                    owner
+                        .listen_planned(plan, None)
+                        .map_err(|e| e.to_string())?;
+                    owners.push(owner);
+                }
+                Ok(())
+            }
+            crate::RuntimeFlavor::Tokio => {
+                let _reactor = tokio.enter();
+                let mut owners = Vec::new();
+                for plan in plans {
+                    let mut owner = crate::tokio_transport::Owner::new();
+                    owner
+                        .listen_planned(plan, None)
+                        .map_err(|e| e.to_string())?;
+                    owners.push(owner);
+                }
+                Ok(())
+            }
+            crate::RuntimeFlavor::Compio => compio.block_on(async {
+                let mut owners = Vec::new();
+                for plan in plans {
+                    let mut owner = crate::compio_transport::Owner::new(64);
+                    owner
+                        .listen_planned(plan, None)
+                        .map_err(|e| e.to_string())?;
+                    owners.push(owner);
+                }
+                Ok(())
+            }),
+            crate::RuntimeFlavor::Custom(_) => unreachable!("layout_cases uses the three Owners"),
+        }
+    }
+
+    /// The layouts the Owners document as unsupported (owner-contract.md):
+    /// `ReusePortSingle`, and any promotion but `Relocate` on `ReusePortMulti`.
+    fn documented_refusal(prepared: &crate::PreparedListener) -> bool {
+        let topology = prepared.transport.topology;
+        let relocating_group = prepared.transport.promotion == srt_lifecycle::Promotion::Relocate
+            && matches!(topology, ResolvedListenerTopology::ReusePortMulti { .. });
+        matches!(topology, ResolvedListenerTopology::ReusePortSingle { .. })
+            || !(prepared.transport.promotion == srt_lifecycle::Promotion::Never
+                || relocating_group)
+    }
+
+    /// No runtime refuses a plan `owner_plans` gave it, no config that
+    /// `ListenerConfig::prepare` refuses yields plans, and the only other
+    /// refusals are the documented unsupported layouts.
+    #[cfg(all(feature = "mio", feature = "tokio", feature = "compio"))]
+    #[test]
+    fn every_plan_attaches_and_every_refusal_is_resolve_or_documented() {
+        let tokio = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("tokio runtime");
+        let compio = compio::runtime::Runtime::new().expect("compio runtime");
+        for (flavor, topology, ownership, promotion, cookie) in layout_cases() {
+            let case = format!("{flavor:?} {topology:?} {ownership:?} {promotion:?} {cookie:?}");
+            let mut config = config(two_free_ports(), topology, promotion);
+            config.transport.ownership = ownership;
+            config.admission.cookie_routing = cookie;
+            let prepared = config.prepare(flavor);
+            match (owner_plans(&config, flavor), prepared) {
+                (Ok(plans), Ok(prepared)) => {
+                    let sockets = prepared.transport.topology.listener_socket_count().get();
+                    assert_eq!(plans.len(), sockets, "{case}: one plan per socket");
+                    if let Err(error) = attach_all(flavor, &plans, &tokio, &compio) {
+                        panic!("{case}: a plan was refused on attach: {error}");
+                    }
+                }
+                (Ok(_), Err(error)) => panic!("{case}: plans from a refused config: {error}"),
+                (Err(_), Ok(prepared)) => assert!(
+                    documented_refusal(&prepared),
+                    "{case}: a supported layout was refused"
+                ),
+                (Err(_), Err(_)) => {}
+            }
+        }
+    }
 }
 
 /// A bonded publisher the way libsrt makes one: each leg its own SRT
