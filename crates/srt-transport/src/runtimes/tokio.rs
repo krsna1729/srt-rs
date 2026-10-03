@@ -1149,6 +1149,8 @@ struct OwnerListenerSide {
     output_pending: bool,
     event_pending: bool,
     write_blocked: bool,
+    /// Acceptor-group membership and the CONCLUSIONs other members own.
+    routing: crate::owner_layout::ListenerRouting,
 }
 
 struct OwnerCallerSide {
@@ -1236,7 +1238,7 @@ impl Owner {
         &mut self,
         config: &crate::ListenerConfig,
     ) -> Result<(), crate::RuntimeBuildError> {
-        self.listen_inner(config, None)
+        self.listen_inner(config, None, None)
     }
 
     /// [`Self::listen`] with a synchronous, request-resolved admission policy
@@ -1249,13 +1251,62 @@ impl Owner {
         config: &crate::ListenerConfig,
         resolver: crate::ListenerAdmissionResolver,
     ) -> Result<(), crate::RuntimeBuildError> {
-        self.listen_inner(config, Some(resolver))
+        self.listen_inner(config, Some(resolver), None)
+    }
+
+    /// Attach one Owner's share of a listener topology (see
+    /// [`crate::owner_plans`] with [`crate::RuntimeFlavor::Tokio`]). Reuseport
+    /// members route misdelivered CONCLUSIONs through
+    /// [`Self::poll_listener_forwards`] / [`Self::inject_listener_handshake`];
+    /// established sessions stay where the kernel hashes them, so a group's
+    /// size must not change while sessions are live.
+    pub fn listen_planned(
+        &mut self,
+        plan: &crate::OwnerListenerPlan,
+        resolver: Option<crate::ListenerAdmissionResolver>,
+    ) -> Result<(), crate::RuntimeBuildError> {
+        self.listen_inner(&plan.config, resolver, Some(plan))
+    }
+
+    /// Drain CONCLUSIONs that belong to other acceptor-group members; drain
+    /// after every service visit.
+    pub fn poll_listener_forwards(&mut self, out: &mut Vec<crate::ForwardedHandshake>) {
+        if let Some(side) = self.listener.as_mut() {
+            side.routing.drain_into(out);
+        }
+    }
+
+    /// Admit a CONCLUSION another acceptor-group member forwarded here,
+    /// through the same admission path as one this Owner received itself.
+    pub fn inject_listener_handshake(&mut self, peer: SocketAddr, data: &[u8], now: Timestamp) {
+        if let Some(side) = self.listener.as_mut() {
+            side.routing.admit(
+                &mut side.peers,
+                side.resolver.as_ref(),
+                peer,
+                data,
+                now,
+                &side.admission,
+                &side.telemetry,
+            );
+            side.output_pending = true;
+            side.event_pending = true;
+        }
+    }
+
+    /// CONCLUSIONs dropped because the forward queue was full.
+    #[must_use]
+    pub fn listener_forwards_dropped(&self) -> u64 {
+        self.listener
+            .as_ref()
+            .map_or(0, |side| side.routing.dropped())
     }
 
     fn listen_inner(
         &mut self,
         config: &crate::ListenerConfig,
         resolver: Option<crate::ListenerAdmissionResolver>,
+        plan: Option<&crate::OwnerListenerPlan>,
     ) -> Result<(), crate::RuntimeBuildError> {
         if self.listener.is_some() {
             return Err(crate::RuntimeBuildError::from(crate::ConfigError::new(
@@ -1264,17 +1315,7 @@ impl Owner {
             )));
         }
         let prepared = config.prepare(crate::RuntimeFlavor::Tokio)?;
-        if !matches!(
-            prepared.transport.topology,
-            crate::ResolvedListenerTopology::PerPort
-        ) {
-            return Err(crate::RuntimeBuildError::from(crate::ConfigError::new(
-                "listener.transport.topology",
-                "Owner drives a single PerPort listener socket; pooled or \
-                 reuseport topologies need a multi-acceptor driver, which \
-                this card does not build",
-            )));
-        }
+        crate::owner_layout::check_listener_topology(plan, prepared.transport.topology)?;
         if prepared.transport.promotion != srt_lifecycle::Promotion::Never {
             return Err(crate::ConfigError::new(
                 "listener.transport.promotion",
@@ -1296,8 +1337,7 @@ impl Owner {
                 .caller
                 .as_ref()
                 .map_or(0, |c| c.transport.socket_buffer_bytes.saturating_mul(4));
-            let total = prepared
-                .requested_socket_memory_bytes()
+            let total = crate::owner_layout::listener_socket_bytes(&prepared, plan)
                 .saturating_add(caller_requested);
             if total > budget.get() {
                 return Err(crate::RuntimeBuildError::from(crate::ConfigError::new(
@@ -1310,8 +1350,8 @@ impl Owner {
             }
             self.socket_memory_budget = Some(budget);
         }
-        let mut sockets = prepared.bind_sockets()?;
-        let socket = UdpSocket::from_std(sockets.remove(0))?;
+        let socket =
+            UdpSocket::from_std(crate::owner_layout::bind_listener_socket(&prepared, plan)?)?;
         self.listener = Some(OwnerListenerSide {
             resolver,
             socket,
@@ -1329,6 +1369,9 @@ impl Owner {
             output_pending: false,
             event_pending: false,
             write_blocked: false,
+            routing: crate::owner_layout::ListenerRouting::new(
+                plan.and_then(crate::OwnerListenerPlan::member),
+            ),
         });
         Ok(())
     }
@@ -1494,11 +1537,12 @@ impl Owner {
         }
         let recv_now = now();
         if let Some(side) = self.listener.as_mut() {
-            let (peers, admission, telemetry, resolver) = (
+            let (peers, admission, telemetry, resolver, routing) = (
                 &mut side.peers,
                 &side.admission,
                 &side.telemetry,
                 side.resolver.as_ref(),
+                &mut side.routing,
             );
             let report = drain_readable_bytes(
                 &side.socket,
@@ -1506,9 +1550,8 @@ impl Owner {
                 side.transport.recv_budget,
                 |addr, data| {
                     let Some(peer) = addr else { return };
-                    let _ = peers.admit_bytes_with_listener_resolver(
-                        resolver, peer, data, recv_now, admission, 0, 1, telemetry,
-                    );
+                    routing
+                        .admit_bytes(peers, resolver, peer, data, recv_now, admission, telemetry);
                 },
             )?;
             side.recv_pending = receive_continuation(report, side.transport.recv_budget);
@@ -3904,6 +3947,117 @@ mod owner_tests {
                 );
                 assert!(calls.load(std::sync::atomic::Ordering::SeqCst) >= 1);
             }
+        });
+    }
+
+    /// A shared caller that never retries its handshake inside a test: a
+    /// stranded CONCLUSION can only be rescued by forwarding.
+    fn no_retry_caller_config(remote: SocketAddr) -> crate::CallerConfig {
+        let mut config = shared_caller_config(remote);
+        config.session.handshake.retry_interval = Duration::from_secs(60);
+        config.session.handshake.timeout = Duration::from_secs(120);
+        config
+    }
+
+    /// Same scenario as the Compio and Mio Owners': callers send INDUCTION
+    /// to a one-member group, the second member joins (rehash), and
+    /// forwarded CONCLUSIONs still connect every caller.
+    #[test]
+    fn reuseport_members_forward_rehashed_conclusions() {
+        test_runtime().block_on(async {
+            let start = std::time::Instant::now();
+            let port = std::net::UdpSocket::bind("127.0.0.1:0")
+                .and_then(|probe| probe.local_addr())
+                .expect("probe")
+                .port();
+            let config = crate::ListenerConfig::builder(SocketAddr::from(([127, 0, 0, 1], port)))
+                .topology(crate::ListenerTopology::ReusePortMulti {
+                    acceptors: crate::WorkerCount::Count(std::num::NonZeroUsize::new(2).unwrap()),
+                })
+                .configure_transport(|transport| {
+                    transport.promotion = crate::PromotionPolicy::Never;
+                })
+                .build()
+                .expect("listener config");
+            let plans = crate::owner_plans(&config, crate::RuntimeFlavor::Tokio).expect("plans");
+            async fn tick(owner: &mut Owner, start: std::time::Instant) {
+                owner
+                    .run_once(
+                        Duration::from_micros(200),
+                        || now_ts(start),
+                        OutputDrainBudget::default(),
+                    )
+                    .await
+                    .expect("run_once");
+            }
+            let mut members = vec![Owner::new()];
+            members[0]
+                .listen_planned(&plans[0], None)
+                .expect("member 0");
+            let remote = SocketAddr::from(([127, 0, 0, 1], port));
+            let mut callers = Vec::new();
+            for _ in 0..16 {
+                let mut owner = Owner::new();
+                let PoolOutcome::Admitted(id) = owner
+                    .connect(&no_retry_caller_config(remote), now_ts(start))
+                    .expect("connect")
+                else {
+                    panic!("admitted")
+                };
+                callers.push((owner, id));
+            }
+            // INDUCTION out, member 0 replies, no CONCLUSION before member 1.
+            for (owner, _) in &mut callers {
+                tick(owner, start).await;
+            }
+            for _ in 0..20 {
+                tick(&mut members[0], start).await;
+            }
+            members.push(Owner::new());
+            members[1]
+                .listen_planned(&plans[1], None)
+                .expect("member 1");
+
+            let connected = |callers: &mut Vec<(Owner, crate::LogicalCallerId)>| {
+                callers
+                    .iter_mut()
+                    .map(|(owner, id)| owner.caller_mut(*id).and_then(|c| c.state()))
+                    .filter(|state| *state == Some(LogicalCallerState::Connected))
+                    .count()
+            };
+            let mut forwarded = 0;
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while connected(&mut callers) < callers.len() && std::time::Instant::now() < deadline {
+                for member in &mut members {
+                    tick(member, start).await;
+                    let mut events = Vec::new();
+                    member.poll_listener_events(&mut events);
+                }
+                for (owner, _) in &mut callers {
+                    tick(owner, start).await;
+                }
+                let mut forwards = Vec::new();
+                for member in &mut members {
+                    member.poll_listener_forwards(&mut forwards);
+                }
+                forwarded += forwards.len();
+                for handshake in forwards {
+                    members[handshake.to].inject_listener_handshake(
+                        handshake.peer,
+                        &handshake.data,
+                        now_ts(start),
+                    );
+                }
+            }
+            assert_eq!(
+                connected(&mut callers),
+                callers.len(),
+                "every caller connects"
+            );
+            assert!(
+                forwarded > 0,
+                "the rehash sent some CONCLUSIONs to member 1"
+            );
         });
     }
 }

@@ -1375,237 +1375,10 @@ pub struct ListenerSide {
     routing: ListenerRouting,
 }
 
-/// Most CONCLUSIONs one Owner holds for other acceptor-group members before
-/// the application drains them with [`Owner::poll_listener_forwards`]; more
-/// are counted in [`Owner::listener_forwards_dropped`] and cost the caller a
-/// handshake retry.
-const LISTENER_FORWARD_CAPACITY: usize = 256;
-
-/// This Owner's place in a `SO_REUSEPORT` acceptor group: `count` Owners,
-/// each on its own thread with its own socket on one port.
-///
-/// The kernel spreads datagrams across the group by 4-tuple hash, and the
-/// group can rehash between a caller's INDUCTION and CONCLUSION. The
-/// listener therefore encodes `index` in every SYN cookie it issues
-/// ([`srt_lifecycle::cookie_for_worker`]), and a CONCLUSION that arrives at
-/// another member is surfaced as a [`ForwardedHandshake`] for the member that
-/// holds its half-open state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReusePortMember {
-    index: usize,
-    count: usize,
-}
-
-impl ReusePortMember {
-    /// Member `index` of `count` (`1..=MAX_COOKIE_WORKERS` members; the
-    /// cookie carries the index in one byte).
-    pub fn new(index: usize, count: usize) -> Result<Self, crate::ConfigError> {
-        if !(1..=srt_lifecycle::MAX_COOKIE_WORKERS).contains(&count) || index >= count {
-            return Err(crate::ConfigError::new(
-                "listener.reuse_port_member",
-                format!(
-                    "member {index} of {count}: need 1..={} members and index < count",
-                    srt_lifecycle::MAX_COOKIE_WORKERS
-                ),
-            ));
-        }
-        Ok(Self { index, count })
-    }
-
-    #[must_use]
-    pub fn index(self) -> usize {
-        self.index
-    }
-
-    #[must_use]
-    pub fn count(self) -> usize {
-        self.count
-    }
-}
-
-/// A CONCLUSION whose SYN cookie names another member of this Owner's
-/// acceptor group. Deliver it to member `to` with
-/// [`Owner::inject_listener_handshake`]; that member holds the half-open
-/// handshake and resolves admission policy there.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ForwardedHandshake {
-    pub to: usize,
-    pub peer: SocketAddr,
-    pub data: Vec<u8>,
-}
-
-/// Acceptor-group state of one listener: a lone PerPort listener is member 0
-/// of 1 and never forwards.
-struct ListenerRouting {
-    index: usize,
-    count: usize,
-    forwards: std::collections::VecDeque<ForwardedHandshake>,
-    dropped: u64,
-}
-
-impl ListenerRouting {
-    fn new(member: Option<ReusePortMember>) -> Self {
-        let (index, count) = member.map_or((0, 1), |member| (member.index, member.count));
-        Self {
-            index,
-            count,
-            forwards: std::collections::VecDeque::new(),
-            dropped: 0,
-        }
-    }
-}
-
-/// One Owner's share of a listener topology: where it binds and, for a
-/// reuseport group, which member it is. Produced by [`owner_plans`] and
-/// consumed by [`Owner::listen_planned`], so the topology chosen in
-/// [`crate::ListenerConfig`] is honored rather than fixed by this runtime.
-#[derive(Clone, Debug)]
-pub struct OwnerListenerPlan {
-    config: crate::ListenerConfig,
-    member: Option<ReusePortMember>,
-    bind: SocketAddr,
-}
-
-impl OwnerListenerPlan {
-    /// Address this Owner's socket binds.
-    #[must_use]
-    pub fn bind(&self) -> SocketAddr {
-        self.bind
-    }
-
-    /// Reuseport group membership, `None` for PerPort and shared-pool plans.
-    #[must_use]
-    pub fn member(&self) -> Option<ReusePortMember> {
-        self.member
-    }
-}
-
-/// Split a listener topology into one plan per Compio Owner (one Owner per
-/// thread, one socket per Owner):
-///
-/// * `PerPort`: one Owner.
-/// * `ReusePortMulti { acceptors: K }`: K members of one `SO_REUSEPORT`
-///   group on one port, cookie-routed (see [`Owner::poll_listener_forwards`]).
-/// * `SharedPool { listeners: K }`: K Owners on ports `P..P+K`.
-///
-/// `ReusePortSingle` and promotion other than `Never` move sessions between
-/// Owners, which needs a relocation target the Compio Owner does not have
-/// yet; they are refused here rather than silently changed. Reuseport and
-/// shared-pool layouts with more than one Owner need an explicit port.
-pub fn owner_plans(
-    config: &crate::ListenerConfig,
-) -> Result<Vec<OwnerListenerPlan>, crate::RuntimeBuildError> {
-    let prepared = config.prepare(crate::RuntimeFlavor::Compio)?;
-    if prepared.transport.promotion != srt_lifecycle::Promotion::Never {
-        return Err(crate::ConfigError::new(
-            "listener.transport.promotion",
-            "promotion moves sessions between Owners, which needs a relocation \
-             target the Compio Owner does not have yet; set promotion to Never",
-        )
-        .into());
-    }
-    let bind = prepared.bind;
-    let plan = |member, bind| OwnerListenerPlan {
-        config: config.clone(),
-        member,
-        bind,
-    };
-    let explicit_port = |owners: usize| {
-        if owners > 1 && bind.port() == 0 {
-            Err(crate::RuntimeBuildError::from(crate::ConfigError::new(
-                "listener.bind",
-                "a multi-Owner listener needs an explicit port so every Owner binds a known one",
-            )))
-        } else {
-            Ok(())
-        }
-    };
-    match prepared.transport.topology {
-        crate::ResolvedListenerTopology::PerPort => Ok(vec![plan(None, bind)]),
-        crate::ResolvedListenerTopology::ReusePortMulti { acceptors } => {
-            let count = acceptors.get();
-            explicit_port(count)?;
-            (0..count)
-                .map(|index| Ok(plan(Some(ReusePortMember::new(index, count)?), bind)))
-                .collect()
-        }
-        crate::ResolvedListenerTopology::SharedPool { listeners } => {
-            let count = listeners.get();
-            explicit_port(count)?;
-            (0..count)
-                .map(|index| {
-                    let port = u16::try_from(index)
-                        .ok()
-                        .and_then(|offset| bind.port().checked_add(offset))
-                        .ok_or_else(|| {
-                            crate::ConfigError::new(
-                                "listener.transport.topology",
-                                "shared-pool ports exceed 65535",
-                            )
-                        })?;
-                    Ok(plan(None, SocketAddr::new(bind.ip(), port)))
-                })
-                .collect()
-        }
-        crate::ResolvedListenerTopology::ReusePortSingle { .. } => {
-            Err(crate::RuntimeBuildError::from(crate::ConfigError::new(
-                "listener.transport.topology",
-                "ReusePortSingle hands every session from one acceptor to worker \
-                 Owners, which needs a relocation target the Compio Owner does \
-                 not have yet",
-            )))
-        }
-    }
-}
-
-/// A plain attach is PerPort; a planned attach must match the topology its
-/// plan came from (the config is re-prepared on the Owner's own thread).
-fn check_listener_topology(
-    plan: Option<&OwnerListenerPlan>,
-    topology: crate::ResolvedListenerTopology,
-) -> Result<(), crate::RuntimeBuildError> {
-    use crate::ResolvedListenerTopology as T;
-    let ok = match (plan.map(|plan| plan.member), topology) {
-        (None | Some(None), T::PerPort) => true,
-        (Some(Some(member)), T::ReusePortMulti { acceptors }) => acceptors.get() == member.count(),
-        (Some(None), T::SharedPool { .. }) => true,
-        _ => false,
-    };
-    if ok {
-        Ok(())
-    } else {
-        Err(crate::RuntimeBuildError::from(crate::ConfigError::new(
-            "listener.transport.topology",
-            "Owner::listen drives one PerPort socket; split other topologies \
-             with owner_plans and attach each plan with Owner::listen_planned",
-        )))
-    }
-}
-
-/// Requested socket memory for this Owner's listener: a planned Owner binds
-/// one socket, not the whole layout.
-fn listener_socket_bytes(
-    prepared: &crate::PreparedListener,
-    plan: Option<&OwnerListenerPlan>,
-) -> usize {
-    if plan.is_some() {
-        prepared.transport.socket_buffer_bytes.saturating_mul(4)
-    } else {
-        prepared.requested_socket_memory_bytes()
-    }
-}
-
-fn bind_listener_socket(
-    prepared: &crate::PreparedListener,
-    plan: Option<&OwnerListenerPlan>,
-) -> std::io::Result<std::net::UdpSocket> {
-    match plan {
-        Some(plan) => prepared.bind_owner_socket(plan.bind),
-        None => prepared.bind_sockets()?.drain(..).next().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "listener bound no socket")
-        }),
-    }
-}
+use crate::owner_layout::{
+    ListenerRouting, bind_listener_socket, check_listener_topology, listener_socket_bytes,
+};
+use crate::{ForwardedHandshake, OwnerListenerPlan};
 
 /// The ONE place a listener datagram enters admission, whichever receive
 /// datapath (readiness or managed multishot) delivered it.
@@ -1620,28 +1393,7 @@ fn admit_listener_datagram(
     now: Timestamp,
     routing: &mut ListenerRouting,
 ) {
-    let admitted = table.admit_with_listener_resolver(
-        resolver,
-        peer,
-        data,
-        now,
-        options,
-        routing.index,
-        routing.count,
-        telemetry,
-    );
-    if let crate::advanced::admission::Admit::ForwardTo(to) = admitted {
-        if routing.forwards.len() < LISTENER_FORWARD_CAPACITY {
-            routing.forwards.push_back(ForwardedHandshake {
-                to,
-                peer,
-                data: data.to_vec(),
-            });
-        } else {
-            routing.dropped += 1;
-            telemetry.record_cookie_route_failure();
-        }
-    }
+    routing.admit(table, resolver, peer, data, now, options, telemetry);
 }
 
 impl ListenerSide {
@@ -4046,7 +3798,8 @@ impl Owner {
         self.listen_inner(config, Some(resolver), None)
     }
 
-    /// Attach one Owner's share of a listener topology (see [`owner_plans`]).
+    /// Attach one Owner's share of a listener topology (see
+    /// [`crate::owner_plans`]).
     /// For a reuseport group, every member issues SYN cookies carrying its
     /// index, and a CONCLUSION the kernel delivers to the wrong member comes
     /// out of [`Self::poll_listener_forwards`] for the application to pass to
@@ -4066,7 +3819,7 @@ impl Owner {
     /// `LISTENER_FORWARD_CAPACITY`; drain after every [`Self::service`].
     pub fn poll_listener_forwards(&mut self, out: &mut Vec<ForwardedHandshake>) {
         if let Some(listener) = self.listener.as_mut() {
-            out.extend(listener.routing.forwards.drain(..));
+            listener.routing.drain_into(out);
         }
     }
 
@@ -4094,7 +3847,7 @@ impl Owner {
     pub fn listener_forwards_dropped(&self) -> u64 {
         self.listener
             .as_ref()
-            .map_or(0, |listener| listener.routing.dropped)
+            .map_or(0, |listener| listener.routing.dropped())
     }
 
     fn listen_inner(

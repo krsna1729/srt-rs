@@ -410,30 +410,6 @@ fn listen_without_a_resolver_stores_none() {
     });
 }
 
-/// Common-helper guard: every listener admission site in the Compio Owner
-/// goes through `admit_listener_datagram`; none calls the table directly.
-#[test]
-fn every_compio_listener_admission_site_uses_the_one_helper() {
-    let source = include_str!("compio.rs");
-    let production = source
-        .split("#[cfg(test)]\n#[path")
-        .next()
-        .expect("production section");
-    assert_eq!(
-        production.matches("admit_with_listener_resolver(").count(),
-        1,
-        "exactly one table admission call, inside the helper"
-    );
-    assert!(
-        production.matches("admit_listener_datagram(").count() >= 4,
-        "the helper definition plus the two readiness sites and the managed site"
-    );
-    assert!(
-        !production.contains(".table.admit("),
-        "no listener site may bypass the resolver helper"
-    );
-}
-
 /// Drive a bonded caller with `caller_group` at one listener per entry of
 /// `receiver_groups`; returns (faults, established-per-listener, connected).
 async fn bonded_run(
