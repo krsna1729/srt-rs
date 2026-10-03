@@ -2181,6 +2181,18 @@ impl PreparedListener {
         Ok(sockets)
     }
 
+    /// Bind ONE socket at `address` with this topology's reuseport setting:
+    /// the socket of a single Owner in a multi-Owner layout (one reuseport
+    /// group member, or one port of a shared pool), whose sibling Owners bind
+    /// their own sockets on their own threads.
+    pub fn bind_owner_socket(&self, address: SocketAddr) -> std::io::Result<UdpSocket> {
+        bind_udp(
+            address,
+            self.transport.topology.uses_reuse_port(),
+            self.transport.socket_buffer_bytes,
+        )
+    }
+
     /// Conservative requested buffer allocation across every listener socket,
     /// accounting for Linux kernel doubling of SO_RCVBUF and SO_SNDBUF (4 × buffer_bytes × sockets).
     #[must_use]

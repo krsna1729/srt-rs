@@ -180,6 +180,30 @@ distinct from the caller's group id; address equality never defines a bond; a
 direct caller never receives a GROUP response. See
 [Listener admission and per-StreamID policy](listener-admission-policy.md#shared-owner-listeners).
 
+**A listener topology can span several Compio Owners, one per thread.**
+`compio::owner_plans(&ListenerConfig)` splits the configured topology into one
+`OwnerListenerPlan` per Owner, and each Owner attaches its plan with
+`Owner::listen_planned`; the application chooses the layout in the config and
+nothing in the runtime rewrites it:
+
+* `PerPort`: one Owner (also what `Owner::listen` attaches).
+* `ReusePortMulti { acceptors: K }`: K members (`ReusePortMember { index,
+  count }`) of one `SO_REUSEPORT` group on one port. Cookie routing is on:
+  every member issues SYN cookies carrying its index, and a CONCLUSION that the
+  kernel delivers to another member (the group rehashes when a member joins)
+  comes out of `Owner::poll_listener_forwards` as a `ForwardedHandshake`. The
+  application carries it across threads and calls `inject_listener_handshake`
+  on member `to`, which owns the half-open state and runs the resolver. The
+  forward queue is bounded (`listener_forwards_dropped` counts overflow; the
+  caller retries its handshake).
+* `SharedPool { listeners: K }`: K Owners on ports `P..P+K`.
+
+Layouts that move sessions between Owners (`ReusePortSingle`, promotion other
+than `Never`) are refused with an explicit error until the Owner has a
+relocation target. Established sessions are not relocated: they stay on the
+socket the kernel hashes them to, so a reuseport group's size must not change
+while sessions are live.
+
 ### 9. Completion ownership
 
 The `Owner` owns completions until it reaps them; the application never reaches
