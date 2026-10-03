@@ -178,6 +178,100 @@ pub fn caller(
 
 const OWNER_LISTENER_TOKEN: mio::Token = mio::Token(0);
 const OWNER_CALLER_TOKEN: mio::Token = mio::Token(1);
+/// Token of promoted socket slot `i` is `PROMOTED_TOKEN_BASE + i`.
+const PROMOTED_TOKEN_BASE: usize = 2;
+
+/// One session's own connected socket (promoted here or relocated here).
+/// Receive-only: the kernel delivers the session's 4-tuple to it, while
+/// replies leave through the listener socket, whose address is the same.
+struct PromotedSocket {
+    socket: mio::net::UdpSocket,
+    recv_pending: bool,
+}
+
+/// Connected sockets of this listener's promoted sessions. Empty unless the
+/// listener's plan relocates; `ready` keeps each visit proportional to the
+/// sockets with work, never to all of them.
+#[derive(Default)]
+struct PromotedSockets {
+    slots: Vec<Option<PromotedSocket>>,
+    free: Vec<usize>,
+    by_peer: std::collections::HashMap<std::net::SocketAddr, usize>,
+    /// Slots with receive readiness not yet drained.
+    ready: Vec<usize>,
+}
+
+impl PromotedSockets {
+    fn token(slot: usize) -> mio::Token {
+        mio::Token(PROMOTED_TOKEN_BASE + slot)
+    }
+
+    fn insert(
+        &mut self,
+        poll: &mio::Poll,
+        peer: std::net::SocketAddr,
+        socket: std::net::UdpSocket,
+    ) -> io::Result<()> {
+        self.remove(poll, peer);
+        socket.set_nonblocking(true)?;
+        let mut socket = mio::net::UdpSocket::from_std(socket);
+        let slot = self.free.pop().unwrap_or(self.slots.len());
+        if let Err(error) =
+            poll.registry()
+                .register(&mut socket, Self::token(slot), mio::Interest::READABLE)
+        {
+            if slot < self.slots.len() {
+                self.free.push(slot);
+            }
+            return Err(error);
+        }
+        let entry = PromotedSocket {
+            socket,
+            // Datagrams may have queued between bind and registration.
+            recv_pending: true,
+        };
+        if slot == self.slots.len() {
+            self.slots.push(Some(entry));
+        } else {
+            self.slots[slot] = Some(entry);
+        }
+        self.by_peer.insert(peer, slot);
+        self.ready.push(slot);
+        Ok(())
+    }
+
+    fn remove(&mut self, poll: &mio::Poll, peer: std::net::SocketAddr) {
+        let Some(slot) = self.by_peer.remove(&peer) else {
+            return;
+        };
+        if let Some(mut entry) = self.slots[slot].take() {
+            let _ = poll.registry().deregister(&mut entry.socket);
+        }
+        self.free.push(slot);
+    }
+
+    fn get_mut(&mut self, slot: usize) -> Option<&mut PromotedSocket> {
+        self.slots.get_mut(slot)?.as_mut()
+    }
+
+    fn has_continuation_work(&self) -> bool {
+        !self.ready.is_empty()
+    }
+
+    /// Record receive readiness for the promoted socket behind `token`.
+    fn note_event(&mut self, token: mio::Token, event: &mio::event::Event) {
+        let Some(slot) = token.0.checked_sub(PROMOTED_TOKEN_BASE) else {
+            return;
+        };
+        if let Some(entry) = self.get_mut(slot)
+            && !entry.recv_pending
+            && (event.is_readable() || event.is_error())
+        {
+            entry.recv_pending = true;
+            self.ready.push(slot);
+        }
+    }
+}
 
 struct OwnerListenerSide {
     /// Application admission policy, stored once per listener.
@@ -199,8 +293,71 @@ struct OwnerListenerSide {
     output_pending: bool,
     event_pending: bool,
     write_blocked: bool,
-    /// Acceptor-group membership and the CONCLUSIONs other members own.
+    /// Layout membership and the transfers owed to other members.
     routing: crate::owner_layout::ListenerRouting,
+    /// Connected sockets of sessions promoted or relocated here.
+    promoted: PromotedSockets,
+}
+
+impl OwnerListenerSide {
+    /// Close the sockets of sessions that left the table, then start
+    /// driving the ones admission or a transfer just gave this Owner (in
+    /// that order, so a peer address reused by a new session keeps its new
+    /// socket). A socket that cannot be registered is dropped and counted;
+    /// its session carries on through the listener socket, which the kernel
+    /// then matches again.
+    fn sync_promoted(&mut self, poll: &mio::Poll) {
+        if self.peers.has_freed_addresses() {
+            for peer in self.peers.take_freed_addresses() {
+                self.promoted.remove(poll, peer);
+            }
+        }
+        if !self.routing.has_promoted() {
+            return;
+        }
+        let mut failed = 0;
+        for (peer, socket) in self.routing.take_promoted(&self.peers) {
+            if self.promoted.insert(poll, peer, socket).is_err() {
+                failed += 1;
+            }
+        }
+        self.telemetry.record_promotion_failures(failed);
+    }
+
+    /// Drain the listener socket and every promoted socket with readiness,
+    /// then register the promotions this admission decided. Returns the
+    /// first receive error.
+    fn receive(&mut self, poll: &mio::Poll, now: Timestamp) -> Option<io::Error> {
+        let mut first_error = None;
+        if self.recv_pending {
+            let (peers, admission, telemetry, resolver, routing) = (
+                &mut self.peers,
+                &self.admission,
+                &self.telemetry,
+                self.resolver.as_ref(),
+                &mut self.routing,
+            );
+            if let Err(error) = drain_side_recv_bytes(
+                &mut self.recv_pending,
+                self.socket.as_raw_fd(),
+                &mut self.recv_batch,
+                self.transport.recv_budget,
+                |addr, data| {
+                    let Some(peer) = addr else { return };
+                    routing.admit_bytes(peers, resolver, peer, data, now, admission, telemetry);
+                },
+            ) {
+                first_error.get_or_insert(error);
+            }
+        }
+        if !self.promoted.ready.is_empty()
+            && let Err(error) = drain_promoted_recv(self, now)
+        {
+            first_error.get_or_insert(error);
+        }
+        self.sync_promoted(poll);
+        first_error
+    }
 }
 
 struct OwnerCallerSide {
@@ -311,11 +468,12 @@ impl Owner {
     }
 
     /// Attach one Owner's share of a listener topology (see
-    /// [`crate::owner_plans`] with [`crate::RuntimeFlavor::Mio`]). Reuseport
-    /// members route misdelivered CONCLUSIONs through
-    /// [`Self::poll_listener_forwards`] / [`Self::inject_listener_handshake`];
-    /// established sessions stay where the kernel hashes them, so a group's
-    /// size must not change while sessions are live.
+    /// [`crate::owner_plans`] with [`crate::RuntimeFlavor::Mio`]). The
+    /// Owners of one layout exchange [`crate::ListenerTransfer`]s through
+    /// [`Self::poll_listener_transfers`] / [`Self::accept_listener_transfer`]:
+    /// misdelivered CONCLUSIONs and, under promotion `Relocate`, bonded legs
+    /// moving to their group's Owner. A group's size must not change while
+    /// sessions are live.
     pub fn listen_planned(
         &mut self,
         plan: &crate::OwnerListenerPlan,
@@ -324,35 +482,33 @@ impl Owner {
         self.listen_inner(&plan.config, resolver, Some(plan))
     }
 
-    /// Drain CONCLUSIONs that belong to other acceptor-group members; drain
-    /// after every service visit.
-    pub fn poll_listener_forwards(&mut self, out: &mut Vec<crate::ForwardedHandshake>) {
+    /// Drain the transfers this Owner owes other members of its layout;
+    /// deliver each to member `to`. Drain after every service visit.
+    pub fn poll_listener_transfers(&mut self, out: &mut Vec<crate::ListenerTransfer>) {
         if let Some(side) = self.listener.as_mut() {
-            side.routing.drain_into(out);
+            side.routing.drain_into(&mut side.peers, out);
         }
     }
 
-    /// Admit a CONCLUSION another acceptor-group member forwarded here,
-    /// through the same admission path as one this Owner received itself.
-    pub fn inject_listener_handshake(
-        &mut self,
-        peer: std::net::SocketAddr,
-        data: &[u8],
-        now: Timestamp,
-    ) {
-        if let Some(side) = self.listener.as_mut() {
-            side.routing.admit(
-                &mut side.peers,
-                side.resolver.as_ref(),
-                peer,
-                data,
-                now,
-                &side.admission,
-                &side.telemetry,
-            );
-            side.output_pending = true;
-            side.event_pending = true;
-        }
+    /// Apply a transfer another member of this layout sent here: a
+    /// forwarded CONCLUSION goes through the same admission path as one this
+    /// Owner received itself; a relocated session joins this Owner on its
+    /// own connected socket.
+    pub fn accept_listener_transfer(&mut self, transfer: crate::ListenerTransfer, now: Timestamp) {
+        let Some(side) = self.listener.as_mut() else {
+            return;
+        };
+        side.routing.accept(
+            transfer,
+            &mut side.peers,
+            side.resolver.as_ref(),
+            now,
+            &side.admission,
+            &side.telemetry,
+        );
+        side.output_pending = true;
+        side.event_pending = true;
+        side.sync_promoted(&self.poll);
     }
 
     /// CONCLUSIONs dropped because the forward queue was full.
@@ -376,14 +532,7 @@ impl Owner {
             )));
         }
         let prepared = config.prepare(crate::RuntimeFlavor::Mio)?;
-        crate::owner_layout::check_listener_topology(plan, prepared.transport.topology)?;
-        if prepared.transport.promotion != srt_lifecycle::Promotion::Never {
-            return Err(crate::ConfigError::new(
-                "listener.transport.promotion",
-                "Owner has no relocation target; set promotion to Never",
-            )
-            .into());
-        }
+        crate::owner_layout::check_listener_topology(plan, &prepared)?;
         if !prepared.bind.is_ipv4() {
             // `sendmsg_batch` (every reply this owner ever sends) rejects a
             // non-IPv4 destination at the syscall boundary, and that
@@ -433,7 +582,7 @@ impl Owner {
             socket,
             admission: prepared.admission_options(),
             idle_timeout: prepared.admission.idle_timeout,
-            peers: prepared.peer_table(),
+            peers: crate::owner_layout::listener_table(&prepared, plan),
             telemetry: crate::IngressTelemetry::new(),
             recv_batch: crate::BytesRecvBatch::with_capacity(
                 prepared.transport.recv_batch_capacity(),
@@ -445,9 +594,8 @@ impl Owner {
             output_pending: false,
             event_pending: false,
             write_blocked: false,
-            routing: crate::owner_layout::ListenerRouting::new(
-                plan.and_then(crate::OwnerListenerPlan::member),
-            ),
+            routing: crate::owner_layout::ListenerRouting::new(&prepared, plan),
+            promoted: PromotedSockets::default(),
         });
         Ok(())
     }
@@ -577,7 +725,7 @@ impl Owner {
                 side.write_blocked,
                 side.output_pending,
                 side.outbound.is_empty(),
-            )
+            ) || side.promoted.has_continuation_work()
         }) || self.caller.as_ref().is_some_and(|side| {
             side_has_continuation_work(
                 side.recv_pending,
@@ -617,37 +765,22 @@ impl Owner {
                         &mut side.socket,
                     )
                 }),
-                _ => None,
+                token => {
+                    if let Some(side) = self.listener.as_mut() {
+                        side.promoted.note_event(token, event);
+                    }
+                    None
+                }
             };
             if let Some((recv_pending, write_blocked, socket)) = side {
                 apply_readiness_event(&self.poll, event, recv_pending, write_blocked, socket)?;
             }
         }
         let now = now();
-        let mut first_error = None;
-        if let Some(side) = self.listener.as_mut()
-            && side.recv_pending
-        {
-            let (peers, admission, telemetry, resolver, routing) = (
-                &mut side.peers,
-                &side.admission,
-                &side.telemetry,
-                side.resolver.as_ref(),
-                &mut side.routing,
-            );
-            if let Err(error) = drain_side_recv_bytes(
-                &mut side.recv_pending,
-                side.socket.as_raw_fd(),
-                &mut side.recv_batch,
-                side.transport.recv_budget,
-                |addr, data| {
-                    let Some(peer) = addr else { return };
-                    routing.admit_bytes(peers, resolver, peer, data, now, admission, telemetry);
-                },
-            ) {
-                first_error.get_or_insert(error);
-            }
-        }
+        let mut first_error = self
+            .listener
+            .as_mut()
+            .and_then(|side| side.receive(&self.poll, now));
         if let Some(side) = self.caller.as_mut()
             && side.recv_pending
         {
@@ -952,6 +1085,53 @@ fn drain_side_recv(
     }
 }
 
+/// Drain the promoted sockets that reported readiness, through the
+/// listener's admission path (the table demultiplexes by socket ID, so a
+/// datagram is handled exactly as if it had reached the listener socket).
+fn drain_promoted_recv(side: &mut OwnerListenerSide, now: Timestamp) -> io::Result<()> {
+    let mut ready = std::mem::take(&mut side.promoted.ready);
+    let mut first_error = None;
+    let (peers, admission, telemetry, resolver, routing, recv_batch, promoted) = (
+        &mut side.peers,
+        &side.admission,
+        &side.telemetry,
+        side.resolver.as_ref(),
+        &mut side.routing,
+        &mut side.recv_batch,
+        &mut side.promoted,
+    );
+    ready.retain(|&slot| {
+        let Some(entry) = promoted.get_mut(slot) else {
+            return false;
+        };
+        if !entry.recv_pending {
+            return false;
+        }
+        if let Err(error) = drain_side_recv_bytes(
+            &mut entry.recv_pending,
+            entry.socket.as_raw_fd(),
+            recv_batch,
+            side.transport.recv_budget,
+            |addr, data| {
+                let Some(peer) = addr else { return };
+                routing.admit_bytes(peers, resolver, peer, data, now, admission, telemetry);
+            },
+        ) {
+            // A connected socket reports an ICMP port-unreachable as
+            // ECONNREFUSED once; it is this session's condition, which its
+            // SRT timers already handle. Drain again next visit.
+            if error.kind() == io::ErrorKind::ConnectionRefused {
+                entry.recv_pending = true;
+            } else {
+                first_error.get_or_insert(error);
+            }
+        }
+        entry.recv_pending
+    });
+    side.promoted.ready = ready;
+    first_error.map_or(Ok(()), Err)
+}
+
 fn drive_listener_side(
     poll: &mio::Poll,
     side: &mut OwnerListenerSide,
@@ -967,6 +1147,7 @@ fn drive_listener_side(
         side.peers
             .prune_idle_bounded_with_visits(now, side.idle_timeout, side_budget.max_actions);
     remaining.consume(maintenance_visits, 0, 0);
+    side.sync_promoted(poll);
     let flush_budget = if was_empty {
         let side_budget = remaining.intersect(side.transport.output_drain);
         let (report, visits) =
@@ -1904,17 +2085,14 @@ mod owner_tests {
             for (owner, _) in &mut callers {
                 tick(owner);
             }
-            let mut forwards = Vec::new();
+            let mut transfers = Vec::new();
             for member in &mut members {
-                member.poll_listener_forwards(&mut forwards);
+                member.poll_listener_transfers(&mut transfers);
             }
-            forwarded += forwards.len();
-            for handshake in forwards {
-                members[handshake.to].inject_listener_handshake(
-                    handshake.peer,
-                    &handshake.data,
-                    now_ts(start),
-                );
+            forwarded += transfers.len();
+            for transfer in transfers {
+                let to = transfer.to;
+                members[to].accept_listener_transfer(transfer, now_ts(start));
             }
         }
         assert_eq!(
@@ -1926,6 +2104,64 @@ mod owner_tests {
             forwarded > 0,
             "the rehash sent some CONCLUSIONs to member 1"
         );
+    }
+
+    /// Bonded publishers whose legs the kernel hashes to different members
+    /// of a `Relocate` group end up as one stream each on one Owner: the leg
+    /// away from its group moves there with its own connected socket, which
+    /// carries its data in; replies leave through the listener socket.
+    #[test]
+    fn relocate_group_keeps_each_bonded_publisher_on_one_owner() {
+        use crate::owner_layout::relocation_test_support::{
+            RelocationRun, free_port, relocating_group,
+        };
+        let start = std::time::Instant::now();
+        let port = free_port();
+        let plans = crate::owner_plans(&relocating_group(port), crate::RuntimeFlavor::Mio)
+            .expect("relocating plans");
+        let mut members: Vec<Owner> = plans
+            .iter()
+            .map(|plan| {
+                let mut owner = Owner::new().expect("owner");
+                owner.listen_planned(plan, None).expect("member attaches");
+                owner
+            })
+            .collect();
+        let mut run = RelocationRun::new(port, now_ts(start));
+        while run.active() {
+            run.pump_publishers(now_ts(start));
+            for (index, member) in members.iter_mut().enumerate() {
+                member
+                    .poll_io(Some(Duration::from_micros(200)), || now_ts(start))
+                    .expect("poll_io");
+                member
+                    .drive(now_ts(start), OutputDrainBudget::default())
+                    .expect("drive");
+                let mut events = Vec::new();
+                member.poll_listener_events(&mut events);
+                run.note_events(index, &events);
+            }
+            let mut transfers = Vec::new();
+            for member in &mut members {
+                member.poll_listener_transfers(&mut transfers);
+            }
+            run.note_transfers(&transfers);
+            for transfer in transfers {
+                let to = transfer.to;
+                members[to].accept_listener_transfer(transfer, now_ts(start));
+            }
+            run.after_round(now_ts(start));
+        }
+        let stats: Vec<_> = run
+            .streams()
+            .iter()
+            .map(|&(member, id)| {
+                members[member]
+                    .listener_peer_mut(id)
+                    .and_then(|peer| peer.stats())
+            })
+            .collect();
+        run.finish(&stats);
     }
 }
 

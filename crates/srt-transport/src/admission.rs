@@ -1020,6 +1020,77 @@ pub struct PeerTable {
     /// Fixed-size (two scalars), so churn can never grow it.
     retired_rcv: RcvTotals,
     config: PeerTableConfig,
+    /// Promotion policy of a multi-Owner layout; `None` keeps every
+    /// established peer on this table's listener (the default).
+    relocation: Option<TableRelocation>,
+    /// Established peers whose promotion decision the Owner must carry out
+    /// (bind a connected socket, maybe move the session).
+    pending_promotions: Vec<(PhysicalPeerKey, srt_lifecycle::PromotionDecision)>,
+    /// Adopted (foreign) slots this table has freed: `(home member, slot)`.
+    /// The home member holds them lent until told.
+    released_slots: Vec<(usize, u32)>,
+    /// Addresses of peers removed while a layout policy is attached, so the
+    /// Owner can close a promoted session's connected socket without
+    /// scanning.
+    freed_addresses: Vec<std::net::SocketAddr>,
+}
+/// The bond-group affinity a peer's handshake claims, if any; the same
+/// identity `adopt_bonded_peer` groups legs by.
+fn group_affinity_of(conn: &SrtConnection) -> Option<srt_lifecycle::GroupAffinity> {
+    let extension = conn.peer_group_extension()?;
+    srt_proto::GroupMode::from_group_type(extension.group_type)?;
+    Some(srt_lifecycle::GroupAffinity {
+        group_id: extension.group_id,
+        stream_id: conn.peer_stream_id().map(str::to_owned),
+        extension,
+    })
+}
+
+/// One routing state per layout, shared by its Owners. Locked once per
+/// established bonded leg and once per removal, never per packet.
+pub type SharedWorkerRouter =
+    std::sync::Arc<std::sync::Mutex<srt_lifecycle::WorkerRouter<std::net::SocketAddr>>>;
+
+/// How this table, as member `member` of a layout, decides promotions.
+#[derive(Clone)]
+pub(crate) struct TableRelocation {
+    pub(crate) mode: srt_lifecycle::Promotion,
+    pub(crate) member: usize,
+    pub(crate) router: SharedWorkerRouter,
+    /// Callers own their UDP tuple (`SocketOwnership::Exclusive`), so a
+    /// connected socket captures exactly one session.
+    pub(crate) exclusive: bool,
+}
+
+/// An established session leaving its admitting member, with everything it
+/// needs to continue elsewhere: protocol core, timers, queued output.
+/// Opaque to the application, which only carries it to member `to`.
+pub struct RelocatedLeg {
+    pub(crate) to: usize,
+    pub(crate) home: usize,
+    pub(crate) address: std::net::SocketAddr,
+    pub(crate) socket_id: u32,
+    pub(crate) entry: Box<AdmissionPeer>,
+}
+
+impl std::fmt::Debug for RelocatedLeg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RelocatedLeg")
+            .field("to", &self.to)
+            .field("home", &self.home)
+            .field("address", &self.address)
+            .field("socket_id", &self.socket_id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A promotion decision ready for the Owner to carry out.
+#[derive(Debug)]
+pub(crate) enum PromotionWork {
+    /// Give this peer a connected socket on this Owner.
+    PromoteHere(PhysicalPeerKey),
+    /// Bind a connected socket for this session and hand both to `leg.to`.
+    Relocate(Box<RelocatedLeg>),
 }
 
 impl Default for PeerTable {
@@ -1081,13 +1152,21 @@ impl PeerTable {
     }
 
     #[must_use]
-    pub fn with_config(mut config: PeerTableConfig) -> Self {
+    pub fn with_config(config: PeerTableConfig) -> Self {
+        Self::with_partition(config, 0, 1)
+    }
+
+    /// Member `index` of a `count`-member layout: local socket IDs come only
+    /// from this member's slot residue, so sessions relocated from other
+    /// members keep their IDs here. See [`DenseSlotArena::with_partition`].
+    #[must_use]
+    pub(crate) fn with_partition(mut config: PeerTableConfig, index: usize, count: usize) -> Self {
         config.max_peers = config.max_peers.clamp(1, MAX_DENSE_SLOTS);
         config.max_half_open_peers = config.max_half_open_peers.max(1).min(config.max_peers);
         config.max_established_peers = config.max_established_peers.max(1).min(config.max_peers);
         config.max_peers_per_ip = config.max_peers_per_ip.max(1).min(config.max_peers);
         Self {
-            slots: DenseSlotArena::new(config.max_peers),
+            slots: DenseSlotArena::with_partition(config.max_peers, index, count),
             half_open_by_caller: HashMap::new(),
             logical_peers: HashMap::new(),
             next_logical_peer: 1,
@@ -1112,6 +1191,10 @@ impl PeerTable {
             last_now: Timestamp::default(),
             retired_rcv: RcvTotals::default(),
             config,
+            relocation: None,
+            pending_promotions: Vec::new(),
+            released_slots: Vec::new(),
+            freed_addresses: Vec::new(),
         }
     }
 
@@ -1781,7 +1864,20 @@ impl PeerTable {
             self.half_open_peers = self.half_open_peers.saturating_sub(1);
             self.established_peers += 1;
             self.half_open_deadlines.remove(&physical);
-            self.adopt_bonded_peer(physical);
+            match self.promotion_decision(physical) {
+                // Leaving: it joins its bond group on the target, not here.
+                decision @ srt_lifecycle::PromotionDecision::RelocateTo(_) => {
+                    self.pending_promotions.push((physical, decision));
+                    return Admit::Fed;
+                }
+                decision @ srt_lifecycle::PromotionDecision::PromoteHere => {
+                    self.pending_promotions.push((physical, decision));
+                    self.adopt_bonded_peer(physical);
+                }
+                srt_lifecycle::PromotionDecision::StayOnListener => {
+                    self.adopt_bonded_peer(physical);
+                }
+            }
         } else if !self
             .get_peer(&physical)
             .is_some_and(|entry| entry.admission_established)
@@ -1793,6 +1889,177 @@ impl PeerTable {
         }
         self.mark_ready_physical(physical);
         Admit::Fed
+    }
+
+    /// The promotion ladder for a just-established peer. Without a layout
+    /// policy, or with a poisoned router, the peer stays on the listener.
+    fn promotion_decision(&self, physical: PhysicalPeerKey) -> srt_lifecycle::PromotionDecision {
+        let stay = srt_lifecycle::PromotionDecision::StayOnListener;
+        let Some(policy) = self.relocation.as_ref() else {
+            return stay;
+        };
+        let Some(entry) = self.get_peer(&physical) else {
+            return stay;
+        };
+        let group = group_affinity_of(&entry.conn);
+        let Ok(mut router) = policy.router.lock() else {
+            return stay;
+        };
+        srt_lifecycle::decide_promotion(
+            policy.mode,
+            physical.address,
+            group,
+            policy.member,
+            &mut router,
+            srt_lifecycle::RoutingMode::RoundRobin,
+            policy.exclusive,
+        )
+    }
+
+    /// Attach this table to a layout's promotion policy.
+    pub(crate) fn set_relocation(&mut self, relocation: TableRelocation) {
+        self.relocation = Some(relocation);
+    }
+
+    /// The slot a socket ID maps to (its low bits).
+    #[inline]
+    pub(crate) fn slot_index_for_socket_id(&self, socket_id: u32) -> usize {
+        self.slots.slot_index_for_socket_id(socket_id)
+    }
+
+    /// Whether admission decided promotions the Owner has not carried out.
+    #[inline]
+    pub(crate) fn has_pending_promotions(&self) -> bool {
+        !self.pending_promotions.is_empty()
+    }
+
+    /// Carry out every promotion decided since the last call. `bind` makes
+    /// the session's connected socket; only then does a relocating session
+    /// leave -- before any of its events can reach the application -- with
+    /// its slot lent until released. A session whose socket cannot be made
+    /// stays on the listener (joining its group here, as under `Never`).
+    /// Returns how many promotions failed that way.
+    pub(crate) fn take_promotions<S>(
+        &mut self,
+        mut bind: impl FnMut(std::net::SocketAddr) -> Option<S>,
+        mut done: impl FnMut(PromotionWork, S),
+    ) -> u64 {
+        let Some(member) = self.relocation.as_ref().map(|policy| policy.member) else {
+            return 0;
+        };
+        let mut failed = 0;
+        for (physical, decision) in std::mem::take(&mut self.pending_promotions) {
+            if self.get_peer(&physical).is_none() {
+                continue;
+            }
+            let socket = bind(physical.address);
+            match (decision, socket) {
+                (srt_lifecycle::PromotionDecision::PromoteHere, Some(socket)) => {
+                    done(PromotionWork::PromoteHere(physical), socket);
+                }
+                (srt_lifecycle::PromotionDecision::RelocateTo(to), Some(socket)) => {
+                    if let Some(entry) = self.detach_direct(physical, true) {
+                        let leg = RelocatedLeg {
+                            to,
+                            home: member,
+                            address: physical.address,
+                            socket_id: physical.local_socket_id,
+                            entry: Box::new(entry),
+                        };
+                        done(PromotionWork::Relocate(Box::new(leg)), socket);
+                    }
+                }
+                (srt_lifecycle::PromotionDecision::RelocateTo(_), None) => {
+                    failed += 1;
+                    self.adopt_bonded_peer(physical);
+                }
+                (srt_lifecycle::PromotionDecision::PromoteHere, None) => failed += 1,
+                (srt_lifecycle::PromotionDecision::StayOnListener, _) => {}
+            }
+        }
+        failed
+    }
+
+    /// Take in a session relocated from another member, at its own socket
+    /// ID, joining its bond group here. Returns the leg if this table cannot
+    /// hold it (full, or its slot is unexpectedly taken).
+    pub(crate) fn adopt(&mut self, leg: Box<RelocatedLeg>) -> Result<(), Box<RelocatedLeg>> {
+        if self.established_peers >= self.config.max_established_peers {
+            return Err(leg);
+        }
+        let Some(slot_idx) = self.slots.adopt_socket_id(leg.socket_id) else {
+            return Err(leg);
+        };
+        let RelocatedLeg {
+            address,
+            socket_id,
+            mut entry,
+            ..
+        } = *leg;
+        let physical = PhysicalPeerKey {
+            address,
+            local_socket_id: socket_id,
+        };
+        entry.logical_peer = self.allocate_logical_peer(LogicalPeerTarget::Direct(physical));
+        self.slots
+            .insert_at_slot(slot_idx, socket_id, address, PeerSlotTarget::Direct(*entry));
+        self.established_peers += 1;
+        *self.source_counts.entry(address.ip()).or_default() += 1;
+        self.index_idle_peer(physical);
+        self.adopt_bonded_peer(physical);
+        self.mark_ready_physical(physical);
+        Ok(())
+    }
+
+    /// Freed adopted slots to report to their home members: `(home, slot)`.
+    pub(crate) fn take_released_slots(&mut self, out: &mut Vec<(usize, u32)>) {
+        out.append(&mut self.released_slots);
+    }
+
+    /// Whether peers were removed since the last [`Self::take_freed_addresses`].
+    #[inline]
+    pub(crate) fn has_freed_addresses(&self) -> bool {
+        !self.freed_addresses.is_empty()
+    }
+
+    /// Addresses of peers removed since the last call (layout policy only).
+    pub(crate) fn take_freed_addresses(&mut self) -> std::vec::Drain<'_, std::net::SocketAddr> {
+        self.freed_addresses.drain(..)
+    }
+
+    /// Whether this table still holds the physical peer `key` (direct or as
+    /// a group leg).
+    #[inline]
+    pub(crate) fn holds(&self, key: &PhysicalPeerKey) -> bool {
+        self.slot_index_for_key(key).is_some()
+    }
+
+    /// A home-member slot lent to another member is free again. `false` for
+    /// an unknown or duplicate release.
+    pub(crate) fn reclaim_lent_slot(&mut self, slot: u32) -> bool {
+        self.slots.reclaim_lent(slot as usize)
+    }
+
+    /// Local slots currently lent to other members.
+    #[must_use]
+    pub fn lent_slot_count(&self) -> usize {
+        self.slots.lent_count()
+    }
+
+    /// Bookkeeping when a slot leaves this table: a foreign slot goes back to
+    /// its home member, and a routed leg leaves the layout router.
+    fn note_slot_freed(&mut self, slot_idx: usize, address: std::net::SocketAddr, routed: bool) {
+        if !self.slots.is_local_slot(slot_idx) {
+            self.released_slots
+                .push((self.slots.slot_owner(slot_idx), slot_idx as u32));
+        }
+        let Some(policy) = self.relocation.as_ref() else {
+            return;
+        };
+        if routed && let Ok(mut router) = policy.router.lock() {
+            router.release(&address);
+        }
+        self.freed_addresses.push(address);
     }
 
     fn adopt_bonded_peer(&mut self, peer: PhysicalPeerKey) {
@@ -3711,6 +3978,13 @@ impl PeerTable {
     }
 
     fn remove_direct(&mut self, peer: PhysicalPeerKey) -> Option<AdmissionPeer> {
+        self.detach_direct(peer, false)
+    }
+
+    /// Remove one direct peer. `relocating`: the session continues on
+    /// another member, so its slot is lent rather than freed, its receiver
+    /// totals stay with it, and it stays in the layout router.
+    fn detach_direct(&mut self, peer: PhysicalPeerKey, relocating: bool) -> Option<AdmissionPeer> {
         let slot_idx = self.slot_index_for_key(&peer)?;
         // A retired peer takes its undrained failure record with it, so the
         // index entry must go too: otherwise churn (fault, retire, repeat)
@@ -3720,17 +3994,26 @@ impl PeerTable {
             PeerFailureKey::Group { .. } => true,
         });
         self.purge_physical_indexes(peer);
-        let slot = self.slots.remove_by_slot(slot_idx)?;
+        let slot = if relocating {
+            self.slots.lend_by_slot(slot_idx)?
+        } else {
+            self.slots.remove_by_slot(slot_idx)?
+        };
         let entry = match slot.value {
             PeerSlotTarget::Direct(entry) => entry,
             PeerSlotTarget::GroupLeg(_) | PeerSlotTarget::Detached => return None,
         };
         self.half_open_by_caller
             .remove(&(slot.address, entry.conn.peer_socket_id()));
-        // Sample the retiring connection before it is handed back to the
-        // application: after this function returns, the table no longer owns
-        // it, and a later snapshot must still carry its loss/duplicate totals.
-        self.add_receiver_totals(&entry.conn);
+        if !relocating {
+            // Sample the retiring connection before it is handed back to the
+            // application: after this function returns, the table no longer
+            // owns it, and a later snapshot must still carry its
+            // loss/duplicate totals.
+            self.add_receiver_totals(&entry.conn);
+            let routed = entry.conn.peer_group_extension().is_some();
+            self.note_slot_freed(slot_idx, peer.address, routed);
+        }
         self.logical_peers.remove(&entry.logical_peer);
         if entry.admission_established {
             self.established_peers = self.established_peers.saturating_sub(1);
@@ -3762,6 +4045,7 @@ impl PeerTable {
             if let Some(slot_idx) = self.slot_index_for_key(&leg.physical) {
                 self.purge_physical_indexes(leg.physical);
                 self.slots.remove_by_slot(slot_idx);
+                self.note_slot_freed(slot_idx, leg.physical.address, true);
                 self.established_peers = self.established_peers.saturating_sub(1);
                 self.decrement_source_count(leg.physical.address.ip());
             }

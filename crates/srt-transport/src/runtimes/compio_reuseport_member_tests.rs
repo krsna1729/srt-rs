@@ -96,13 +96,14 @@ async fn pump_round(
     for (owner, _) in callers.iter_mut() {
         let _ = owner.service(at, budget).await;
     }
-    let mut forwards = Vec::new();
+    let mut transfers = Vec::new();
     for owner in members.iter_mut() {
-        owner.poll_listener_forwards(&mut forwards);
+        owner.poll_listener_transfers(&mut transfers);
     }
-    *forwarded += forwards.len();
-    for handshake in forwards {
-        members[handshake.to].inject_listener_handshake(handshake.peer, &handshake.data, at);
+    *forwarded += transfers.len();
+    for transfer in transfers {
+        let to = transfer.to;
+        members[to].accept_listener_transfer(transfer, at);
     }
     for owner in members.iter_mut() {
         owner.wait_for_activity(Duration::from_micros(200)).await;
@@ -196,5 +197,55 @@ fn plain_listen_stays_per_port_only() {
     let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
     runtime.block_on(async {
         assert!(Owner::new(8).listen(&reuseport(free_port(), 2)).is_err());
+    });
+}
+
+/// Bonded publishers whose legs the kernel hashes to different members of a
+/// `Relocate` group end up as one stream each on one Owner: the leg away
+/// from its group moves there with its own connected socket, which carries
+/// its data in (raw readiness); replies leave through the listener socket.
+#[test]
+fn relocate_group_keeps_each_bonded_publisher_on_one_owner() {
+    use crate::owner_layout::relocation_test_support::{RelocationRun, relocating_group};
+    let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+    runtime.block_on(async {
+        let start = std::time::Instant::now();
+        let at = || Timestamp::from_micros(start.elapsed().as_micros() as u64);
+        let port = free_port();
+        let plans = owner_plans(&relocating_group(port)).expect("relocating plans");
+        let mut members: Vec<Owner> = plans.iter().map(attach).collect();
+        let mut run = RelocationRun::new(port, at());
+        while run.active() {
+            run.pump_publishers(at());
+            for (index, member) in members.iter_mut().enumerate() {
+                let _ = member.service(at(), OwnerServiceBudget::default()).await;
+                let mut events = Vec::new();
+                member.poll_listener_events(&mut events);
+                run.note_events(index, &events);
+            }
+            let mut transfers = Vec::new();
+            for member in &mut members {
+                member.poll_listener_transfers(&mut transfers);
+            }
+            run.note_transfers(&transfers);
+            for transfer in transfers {
+                let to = transfer.to;
+                members[to].accept_listener_transfer(transfer, at());
+            }
+            for member in &mut members {
+                member.wait_for_activity(Duration::from_micros(200)).await;
+            }
+            run.after_round(at());
+        }
+        let stats: Vec<_> = run
+            .streams()
+            .iter()
+            .map(|&(member, id)| {
+                members[member]
+                    .listener_peer_mut(id)
+                    .and_then(|peer| peer.stats())
+            })
+            .collect();
+        run.finish(&stats);
     });
 }

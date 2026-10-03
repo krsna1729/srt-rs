@@ -2451,6 +2451,19 @@ impl PreparedCaller {
     }
 }
 
+/// A promoted session's own socket: a member of the listener's
+/// `SO_REUSEPORT` group at `address`, `connect()`ed to `peer` so the kernel
+/// delivers that 4-tuple to it alone.
+pub(crate) fn bind_promoted_socket(
+    address: SocketAddr,
+    buffer_bytes: usize,
+    peer: SocketAddr,
+) -> std::io::Result<UdpSocket> {
+    let socket = bind_udp(address, true, buffer_bytes)?;
+    socket.connect(peer)?;
+    Ok(socket)
+}
+
 fn bind_udp(
     address: SocketAddr,
     reuse_port: bool,

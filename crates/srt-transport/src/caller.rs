@@ -4119,6 +4119,193 @@ mod tests {
         connection
     }
 
+    /// Two members of a `Relocate` layout with a shared router, and one
+    /// Broadcast publisher whose legs the "kernel" (`route`) hashes to
+    /// different members. Returns the members, the route after the run, how
+    /// many legs relocated, and how many relocations failed to bind.
+    fn bonded_publisher_across_two_members(
+        bind_ok: bool,
+    ) -> (Vec<PeerTable>, [usize; 2], usize, u64) {
+        use crate::admission::{PromotionWork, TableRelocation};
+        let leg_addrs: [std::net::SocketAddr; 2] = [
+            "127.0.0.1:12001".parse().expect("address"),
+            "127.0.0.1:12002".parse().expect("address"),
+        ];
+        let group_id = srt_proto::handshake::SRTGROUP_MASK | 77;
+        let extension = srt_proto::handshake::GroupExtensionData {
+            group_id,
+            group_type: srt_proto::handshake::GroupType::Broadcast,
+            flags: 0,
+            weight: 1,
+        };
+        let leg = |member_id, peer, socket_id| {
+            CallerGroupLeg::new(
+                member_id,
+                1,
+                peer,
+                caller_connection(ConnectionOptions {
+                    socket_id,
+                    initial_seq: Some(1234),
+                    group_extension: Some(extension),
+                    ..ConnectionOptions::default()
+                }),
+            )
+        };
+        let mut callers = CallerTable::new();
+        callers
+            .add_group(
+                group_id,
+                srt_proto::GroupMode::Broadcast,
+                [leg(1, leg_addrs[0], 201), leg(2, leg_addrs[1], 202)],
+            )
+            .expect("grouped caller is admitted");
+        let router: crate::admission::SharedWorkerRouter =
+            std::sync::Arc::new(std::sync::Mutex::new(srt_lifecycle::WorkerRouter::new(2)));
+        let mut members: Vec<PeerTable> = (0..2)
+            .map(|index| {
+                let mut table = PeerTable::with_partition(PeerTableConfig::default(), index, 2);
+                table.set_relocation(TableRelocation {
+                    mode: srt_lifecycle::Promotion::Relocate,
+                    member: index,
+                    router: router.clone(),
+                    exclusive: true,
+                });
+                table
+            })
+            .collect();
+        // Leg i's 4-tuple reaches member i until a connected socket moves it.
+        let mut route = [0usize, 1];
+        let mut options = AdmissionOptions::basic(900, 0, true);
+        options.bonded_inputs = BondedInputPolicy::Accept;
+        let telemetry = IngressTelemetry::new();
+        let (mut relocations, mut bind_failures) = (0, 0);
+        let mut outbound = Vec::new();
+        for round in 0..12 {
+            let now = Timestamp::from_micros(round * 10);
+            callers.poll_outbound(now, &mut outbound);
+            for (peer, packet) in outbound.drain(..) {
+                let leg = leg_addrs
+                    .iter()
+                    .position(|addr| *addr == peer)
+                    .expect("leg address");
+                let member = route[leg];
+                let admitted =
+                    members[member].admit(peer, &packet, now, &options, member, 2, &telemetry);
+                assert!(
+                    !matches!(admitted, Admit::ForwardTo(_)),
+                    "a leg whose 4-tuple stays on one member needs no forward"
+                );
+                let mut moved = Vec::new();
+                bind_failures += members[member]
+                    .take_promotions(|_| bind_ok.then_some(()), |work, ()| moved.push(work));
+                for work in moved {
+                    let PromotionWork::Relocate(relocated) = work else {
+                        panic!("promotion Relocate never promotes locally");
+                    };
+                    let to = relocated.to;
+                    assert_ne!(to, member, "a relocation never targets its own member");
+                    members[to]
+                        .adopt(relocated)
+                        .expect("the group's member adopts");
+                    route[leg] = to;
+                    relocations += 1;
+                }
+            }
+            for member in &mut members {
+                member.poll_outbound(now, &mut outbound);
+                for (peer, packet) in outbound.drain(..) {
+                    callers
+                        .feed(peer, &packet, now)
+                        .expect("caller packet decodes");
+                }
+            }
+        }
+        (members, route, relocations, bind_failures)
+    }
+
+    #[test]
+    fn relocated_bonded_leg_joins_its_group_on_the_owning_member() {
+        let (mut members, route, relocations, _) = bonded_publisher_across_two_members(true);
+        assert_eq!(
+            relocations, 1,
+            "exactly the leg hashed away from its group moves"
+        );
+        assert_eq!(route[0], route[1], "both legs end on the group's member");
+        let (owner, source) = (route[0], 1 - route[0]);
+        assert_eq!(members[owner].established_count(), 2);
+        assert_eq!(members[owner].bonded_stats().len(), 1, "one logical stream");
+        assert!(
+            members[source].is_empty(),
+            "the source keeps no session state"
+        );
+        assert_eq!(members[source].lent_slot_count(), 1, "its slot stays lent");
+
+        let mut events = Vec::new();
+        members[source].poll_events(&mut events);
+        assert!(
+            events.is_empty(),
+            "the source never reports the relocated leg"
+        );
+        members[owner].poll_events(&mut events);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.event, srt_proto::ConnectionEvent::Connected))
+                .count(),
+            1,
+            "one Connected for the one logical stream"
+        );
+    }
+
+    #[test]
+    fn retiring_a_relocated_group_releases_the_lent_slot_home() {
+        let (mut members, route, _, _) = bonded_publisher_across_two_members(true);
+        let (owner, source) = (route[0], 1 - route[0]);
+        let mut events = Vec::new();
+        members[owner].poll_events(&mut events);
+        let group = events
+            .iter()
+            .find(|event| matches!(event.event, srt_proto::ConnectionEvent::Connected))
+            .expect("the group connects on its member")
+            .logical_peer;
+        assert!(matches!(
+            members[owner].remove(group),
+            Some(RemovedLogicalPeer::Group(legs)) if legs.len() == 2
+        ));
+        let mut released = Vec::new();
+        members[owner].take_released_slots(&mut released);
+        assert_eq!(released.len(), 1);
+        let (home, slot) = released[0];
+        assert_eq!(home, source);
+        assert!(members[source].reclaim_lent_slot(slot));
+        assert!(
+            !members[source].reclaim_lent_slot(slot),
+            "a release applies once"
+        );
+        assert_eq!(members[source].lent_slot_count(), 0);
+    }
+
+    #[test]
+    fn bonded_leg_whose_socket_cannot_be_made_stays_on_its_member() {
+        let (members, route, relocations, bind_failures) =
+            bonded_publisher_across_two_members(false);
+        assert_eq!(relocations, 0);
+        assert_eq!(
+            bind_failures, 1,
+            "the one decided relocation failed to bind"
+        );
+        assert_eq!(route, [0, 1], "nothing moved");
+        for member in &members {
+            assert_eq!(member.established_count(), 1);
+            assert_eq!(
+                member.bonded_stats().len(),
+                1,
+                "each leg joined a group where it is, as under Never"
+            );
+            assert_eq!(member.lent_slot_count(), 0);
+        }
+    }
+
     #[test]
     fn caller_table_capacity_rejects_an_extra_logical_session() {
         let mut callers = CallerTable::with_max_callers(1);

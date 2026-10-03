@@ -189,20 +189,37 @@ the layout in the config and no runtime rewrites it:
 * `PerPort`: one Owner (also what `Owner::listen` attaches).
 * `ReusePortMulti { acceptors: K }`: K members (`ReusePortMember { index,
   count }`) of one `SO_REUSEPORT` group on one port. Cookie routing is on:
-  every member issues SYN cookies carrying its index, and a CONCLUSION that the
-  kernel delivers to another member (the group rehashes when a member joins)
-  comes out of `Owner::poll_listener_forwards` as a `ForwardedHandshake`. The
-  application carries it across threads and calls `inject_listener_handshake`
-  on member `to`, which owns the half-open state and runs the resolver. The
-  forward queue is bounded (`listener_forwards_dropped` counts overflow; the
-  caller retries its handshake).
+  every member issues SYN cookies carrying its index.
 * `SharedPool { listeners: K }`: K Owners on ports `P..P+K`.
 
-Layouts that move sessions between Owners (`ReusePortSingle`, promotion other
-than `Never`) are refused with an explicit error, identically on every runtime,
-until the Owners have a relocation target. Established sessions are not
-relocated: they stay on the socket the kernel hashes them to, so a reuseport
-group's size must not change while sessions are live.
+**The Owners of one layout talk through `ListenerTransfer`s, and the
+application only routes them.** After every service visit it drains
+`Owner::poll_listener_transfers` and hands each transfer to member `to` with
+`accept_listener_transfer`. The payload is opaque. A transfer is one of:
+
+* a CONCLUSION the kernel delivered to the wrong member (the group rehashes
+  when a member joins). Member `to` owns the half-open state and runs the
+  resolver. These are the only transfers the transport drops under backlog
+  (`listener_forwards_dropped`; the caller retries its handshake).
+* under promotion `Relocate` on `ReusePortMulti`, an established bonded leg
+  that the kernel hashed to a member other than the one holding its group
+  (one router per layout, created by `owner_plans`, decides). The source
+  member binds a socket into the reuseport group, `connect()`s it to the leg's
+  peer, and sends the session with it before any of its events reach the
+  application. Member `to` joins the leg to its group, drives it on that
+  socket, and reports it like any other listener peer. One bonded publisher
+  therefore stays one stream. If the socket cannot be made, the leg stays
+  where it is, as under `Never`.
+* a slot release. Members allocate socket IDs from disjoint slot residues,
+  so a relocated leg keeps its ID on its new member. The source member holds
+  the leg's slot until the new member reports that the session ended.
+
+All Owners of one layout must be driven with timestamps from one origin,
+because a relocated session carries its timers with it. `ReusePortSingle`
+and local promotion (`Bonded`, `All`) are refused with an explicit error,
+identically on every runtime. Sessions that are not relocated stay on the
+socket the kernel hashes them to, so a reuseport group's size must not change
+while sessions are live.
 
 ### 9. Completion ownership
 

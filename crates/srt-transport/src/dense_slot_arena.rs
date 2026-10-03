@@ -81,17 +81,42 @@ pub struct DenseSlotArena<T> {
     slot_mask: usize,
     max_slots: usize,
     len: usize,
+    /// This arena's member index within a `partition_count`-member layout. A
+    /// member allocates only slots with `slot % partition_count ==
+    /// partition_index`, so socket IDs are unique across the layout and a
+    /// session relocated from another member keeps its ID here.
+    partition_index: usize,
+    partition_count: usize,
+    /// Local slots whose session was relocated to another member. Reserved
+    /// (never re-allocated) until that member reports the session gone.
+    lent: std::collections::HashSet<u32>,
 }
 #[allow(dead_code)]
 impl<T> DenseSlotArena<T> {
     /// Create a new slot arena bounded by `max_slots`.
     pub fn new(max_slots: usize) -> Self {
+        Self::with_partition(max_slots, 0, 1)
+    }
+
+    /// Create member `index` of a `count`-member layout, bounded by
+    /// `max_slots` local peers. The slot domain is `count` times larger
+    /// (clamped to [`MAX_DENSE_SLOTS`]) and this member allocates only its
+    /// residue class; the other residues are reserved for adoption.
+    pub fn with_partition(max_slots: usize, index: usize, count: usize) -> Self {
+        let count = count.max(1);
+        assert!(index < count, "partition index out of range");
         let max_slots = max_slots.clamp(1, MAX_DENSE_SLOTS);
-        let capacity = max_slots.max(64).next_power_of_two();
+        let capacity = max_slots
+            .max(64)
+            .saturating_mul(count)
+            .min(MAX_DENSE_SLOTS)
+            .next_power_of_two();
         let slot_bits = capacity.trailing_zeros();
         let slot_mask = capacity - 1;
 
-        let free_slots: VecDeque<u32> = (0..capacity as u32).collect();
+        let free_slots: VecDeque<u32> = (0..capacity as u32)
+            .filter(|slot| *slot as usize % count == index)
+            .collect();
         let slot_generations = vec![1u32; capacity];
         let slot_used = vec![false; capacity];
         let mut slots = Vec::with_capacity(capacity);
@@ -114,7 +139,22 @@ impl<T> DenseSlotArena<T> {
             slot_mask,
             max_slots,
             len: 0,
+            partition_index: index,
+            partition_count: count,
+            lent: std::collections::HashSet::new(),
         }
+    }
+
+    /// Whether `slot_idx` belongs to this member's residue class.
+    #[inline]
+    pub fn is_local_slot(&self, slot_idx: usize) -> bool {
+        slot_idx % self.partition_count == self.partition_index
+    }
+
+    /// Member index owning `slot_idx` in this layout.
+    #[inline]
+    pub fn slot_owner(&self, slot_idx: usize) -> usize {
+        slot_idx % self.partition_count
     }
 
     /// Number of occupied slots.
@@ -178,6 +218,7 @@ impl<T> DenseSlotArena<T> {
         if preferred != 0 {
             let target_slot = (preferred as usize) & self.slot_mask;
             if target_slot < self.slots.len()
+                && self.is_local_slot(target_slot)
                 && !self.slot_used[target_slot]
                 && self.slots[target_slot].value.is_none()
                 && let Some(pos) = self
@@ -295,7 +336,60 @@ impl<T> DenseSlotArena<T> {
     }
 
     /// Remove a peer by its slot index, advancing generation to invalidate stale packets.
+    ///
+    /// A local slot returns to the free list; a foreign (adopted) slot does
+    /// not, because its owner member may re-allocate it once told the session
+    /// is gone.
     pub fn remove_by_slot(&mut self, slot_idx: usize) -> Option<PeerSlot<T>> {
+        let local = self.is_local_slot(slot_idx);
+        self.take_slot(slot_idx, local)
+    }
+
+    /// Remove a local peer that is leaving for another member, keeping its
+    /// slot reserved until [`Self::reclaim_lent`] so no new session can take
+    /// the socket ID's slot while the relocated one still lives elsewhere.
+    pub fn lend_by_slot(&mut self, slot_idx: usize) -> Option<PeerSlot<T>> {
+        if !self.is_local_slot(slot_idx) {
+            return None;
+        }
+        let removed = self.take_slot(slot_idx, false)?;
+        self.lent.insert(slot_idx as u32);
+        Some(removed)
+    }
+
+    /// Return a lent slot to the free list. `false` if it was not lent
+    /// (duplicate or forged release).
+    pub fn reclaim_lent(&mut self, slot_idx: usize) -> bool {
+        if !self.lent.remove(&(slot_idx as u32)) {
+            return false;
+        }
+        self.free_slots.push_back(slot_idx as u32);
+        true
+    }
+
+    /// Number of local slots currently lent to other members.
+    pub fn lent_count(&self) -> usize {
+        self.lent.len()
+    }
+
+    /// Reserve the foreign slot of `socket_id` for a session relocated from
+    /// its owner member. `None` if the slot is local, occupied, or the arena
+    /// is full.
+    pub fn adopt_socket_id(&mut self, socket_id: u32) -> Option<usize> {
+        let slot_idx = self.slot_index_for_socket_id(socket_id);
+        if socket_id == 0
+            || self.is_local_slot(slot_idx)
+            || self.len >= self.max_slots
+            || self.slots[slot_idx].value.is_some()
+        {
+            return None;
+        }
+        self.slot_used[slot_idx] = true;
+        self.slot_generations[slot_idx] = (socket_id >> self.slot_bits).max(1);
+        Some(slot_idx)
+    }
+
+    fn take_slot(&mut self, slot_idx: usize, free: bool) -> Option<PeerSlot<T>> {
         if slot_idx >= self.slots.len() {
             return None;
         }
@@ -310,7 +404,9 @@ impl<T> DenseSlotArena<T> {
         slot.deadline_version = slot.deadline_version.wrapping_add(1);
         let current_gen = self.slot_generations[slot_idx];
         self.slot_generations[slot_idx] = current_gen.wrapping_add(1).max(1);
-        self.free_slots.push_back(slot_idx as u32);
+        if free {
+            self.free_slots.push_back(slot_idx as u32);
+        }
         self.len -= 1;
         Some(PeerSlot {
             generation: current_gen,
@@ -1089,5 +1185,154 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// One session in the layout model: its socket ID, home member (the
+    /// residue its slot belongs to) and the member currently holding it.
+    #[derive(Clone, Copy, Debug)]
+    struct LiveSession {
+        socket_id: u32,
+        home: usize,
+        holder: usize,
+    }
+
+    #[derive(Clone, Debug)]
+    enum LayoutOp {
+        /// Member allocates a new session (optionally with a preferred ID).
+        Allocate { member: usize, preferred: u32 },
+        /// A session at its home moves to another member.
+        Relocate { pick: usize, to: usize },
+        /// The holder removes a session; for a relocated one, `deliver`
+        /// says whether the release reaches the home member.
+        Remove { pick: usize, deliver: bool },
+    }
+
+    fn layout_op() -> impl Strategy<Value = LayoutOp> {
+        prop_oneof![
+            (0..4usize, prop_oneof![Just(0u32), any::<u32>()])
+                .prop_map(|(member, preferred)| LayoutOp::Allocate { member, preferred }),
+            (any::<usize>(), 0..4usize).prop_map(|(pick, to)| LayoutOp::Relocate { pick, to }),
+            (any::<usize>(), any::<bool>())
+                .prop_map(|(pick, deliver)| LayoutOp::Remove { pick, deliver }),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        /// Members of one layout never hand out a socket ID whose slot is
+        /// live anywhere in the layout, and a relocated session can always
+        /// be adopted at its own slot -- including after releases are lost
+        /// (which only leak capacity) and churn has rotated the free lists.
+        #[test]
+        fn partitioned_layout_keeps_socket_ids_unique_across_members(
+            ops in proptest::collection::vec(layout_op(), 1..200)
+        ) {
+            const K: usize = 4;
+            let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+            let mut arenas: Vec<DenseSlotArena<u32>> =
+                (0..K).map(|i| DenseSlotArena::with_partition(8, i, K)).collect();
+            let mut live: Vec<LiveSession> = Vec::new();
+            for op in ops {
+                match op {
+                    LayoutOp::Allocate { member, preferred } => {
+                        let Some((slot, id)) = arenas[member].allocate_socket_id(preferred) else {
+                            continue;
+                        };
+                        prop_assert!(arenas[member].is_local_slot(slot));
+                        prop_assert_eq!(arenas[member].slot_owner(slot), member);
+                        for session in &live {
+                            prop_assert_ne!(
+                                arenas[0].slot_index_for_socket_id(session.socket_id),
+                                slot,
+                                "allocated a slot live in the layout"
+                            );
+                        }
+                        arenas[member].insert_at_slot(slot, id, addr, id);
+                        live.push(LiveSession { socket_id: id, home: member, holder: member });
+                    }
+                    LayoutOp::Relocate { pick, to } => {
+                        let at_home: Vec<usize> = (0..live.len())
+                            .filter(|&i| live[i].holder == live[i].home)
+                            .collect();
+                        if at_home.is_empty() {
+                            continue;
+                        }
+                        let index = at_home[pick % at_home.len()];
+                        let session = live[index];
+                        if to == session.home {
+                            continue;
+                        }
+                        let slot = arenas[0].slot_index_for_socket_id(session.socket_id);
+                        let lent = arenas[session.home].lend_by_slot(slot).expect("lend");
+                        prop_assert_eq!(lent.socket_id, session.socket_id);
+                        match arenas[to].adopt_socket_id(session.socket_id) {
+                            Some(adopted) => {
+                                prop_assert_eq!(adopted, slot);
+                                arenas[to].insert_at_slot(adopted, session.socket_id, addr, lent.value);
+                                live[index].holder = to;
+                            }
+                            None => {
+                                // Only a full target may refuse; the session then
+                                // ends (released at once).
+                                prop_assert!(arenas[to].len() >= arenas[to].max_slots());
+                                prop_assert!(arenas[session.home].reclaim_lent(slot));
+                                live.swap_remove(index);
+                            }
+                        }
+                    }
+                    LayoutOp::Remove { pick, deliver } => {
+                        if live.is_empty() {
+                            continue;
+                        }
+                        let session = live.swap_remove(pick % live.len());
+                        let slot = arenas[0].slot_index_for_socket_id(session.socket_id);
+                        let removed = arenas[session.holder].remove_by_slot(slot).expect("remove");
+                        prop_assert_eq!(removed.socket_id, session.socket_id);
+                        if session.holder != session.home && deliver {
+                            prop_assert!(arenas[session.home].reclaim_lent(slot));
+                            prop_assert!(!arenas[session.home].reclaim_lent(slot), "double release");
+                        }
+                    }
+                }
+                for session in &live {
+                    let found = arenas[session.holder].get(session.socket_id, addr);
+                    prop_assert_eq!(found, Some(&session.socket_id));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unpartitioned_arena_keeps_its_slot_domain() {
+        for max_slots in [1, 4, 64, 100, 4096, MAX_DENSE_SLOTS] {
+            let arena: DenseSlotArena<()> = DenseSlotArena::new(max_slots);
+            assert_eq!(arena.slots.len(), max_slots.max(64).next_power_of_two());
+            assert_eq!(arena.free_slots.len(), arena.slots.len());
+        }
+    }
+
+    #[test]
+    fn partition_refuses_foreign_preferred_ids_and_forged_releases() {
+        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let mut member0 = DenseSlotArena::<()>::with_partition(16, 0, 2);
+        let mut member1 = DenseSlotArena::<()>::with_partition(16, 1, 2);
+        // A preferred ID in member 1's residue is not honoured by member 0.
+        let foreign_preferred = (7 << member0.slot_bits()) | 1;
+        let (slot, id) = member0.allocate_socket_id(foreign_preferred).unwrap();
+        assert_ne!(id, foreign_preferred);
+        assert!(member0.is_local_slot(slot));
+        // Releasing a slot that was never lent does nothing.
+        assert!(!member0.reclaim_lent(slot));
+        // A member cannot adopt into its own residue.
+        member0.insert_at_slot(slot, id, addr, ());
+        assert!(member0.adopt_socket_id(id).is_none());
+        // Adopting a foreign session twice is refused while it lives.
+        assert_eq!(member1.adopt_socket_id(id), Some(slot));
+        member1.insert_at_slot(slot, id, addr, ());
+        assert!(member1.adopt_socket_id(id).is_none());
+        // Removing an adopted session does not put the slot in member 1's free list.
+        member1.remove_by_slot(slot).unwrap();
+        assert!(!member1.free_slots.contains(&(slot as u32)));
     }
 }
