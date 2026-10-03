@@ -7517,6 +7517,13 @@ mod tests {
     /// carries no window, so one taken at a full window must not arm a
     /// forced Full ACK: that coupled the Full ACK rate to packets/64.
     #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "simulates one second in 10 us steps (100k steps x 4 configurations) under    \
+                  Miri; the rate bound is proven outside Miri, and it holds no unsafe or     \
+                  ownership pattern the cheaper receiver tests do not cover. Run in the      \
+                  miri-extended scheduled job."
+    )]
     fn a_saturated_receiver_sends_at_most_two_full_acks_per_ack_interval() {
         const INTERVAL: u64 = crate::receiver::ACK_INTERVAL_MICROS;
         for (window, delivery_queue, timer_lateness_us) in
