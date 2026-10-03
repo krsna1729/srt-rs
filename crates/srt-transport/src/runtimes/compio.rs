@@ -3385,7 +3385,9 @@ impl Owner {
     /// Coalesce equal-length datagrams to one peer into UDP GSO sends (on by
     /// default). Off sends every datagram with its own `sendmsg`: for A/B
     /// measurement, and for paths where GSO bursts hurt the receiver. A path
-    /// that rejects GSO still turns it off by itself.
+    /// that rejects GSO still turns it off by itself. Configure it before
+    /// attaching sockets: turning it back on after such a rejection costs one
+    /// more batch to the same rejection (SRT's ARQ resends it).
     pub fn set_tx_gso(&mut self, enabled: bool) {
         self.tx_engine.coalesce = enabled;
     }
