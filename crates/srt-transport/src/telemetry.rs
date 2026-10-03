@@ -289,6 +289,10 @@ pub struct IngressTelemetry {
     pub local_promotions: AtomicU64,
     /// Connections relocated to a different worker for bond affinity.
     pub handoffs: AtomicU64,
+    /// Promotions the transport could not carry out: no connected socket
+    /// could be bound or registered (the session stayed on the listener),
+    /// or the receiving Owner could not hold a relocated session (it ended).
+    pub promotion_failures: AtomicU64,
     /// CONCLUSION datagrams that reached an acceptor holding no state for
     /// the peer and carried no usable routing information -- flows the
     /// kernel rehashed mid-handshake that could not be rescued.
@@ -337,6 +341,7 @@ pub struct IngressTelemetry {
 pub struct IngressTelemetrySnapshot {
     pub local_promotions: u64,
     pub handoffs: u64,
+    pub promotion_failures: u64,
     pub stranded_conclusions: u64,
     pub cookie_routed: u64,
     pub cookie_route_failures: u64,
@@ -387,6 +392,11 @@ impl IngressTelemetry {
     }
     pub fn record_handoff(&self) {
         Self::bump(&self.handoffs);
+    }
+    pub fn record_promotion_failures(&self, failed: u64) {
+        if failed > 0 {
+            self.promotion_failures.fetch_add(failed, Ordering::Relaxed);
+        }
     }
     pub fn record_stranded_conclusion(&self) {
         Self::bump(&self.stranded_conclusions);
@@ -457,6 +467,7 @@ impl IngressTelemetry {
         IngressTelemetrySnapshot {
             local_promotions: get(&self.local_promotions),
             handoffs: get(&self.handoffs),
+            promotion_failures: get(&self.promotion_failures),
             stranded_conclusions: get(&self.stranded_conclusions),
             cookie_routed: get(&self.cookie_routed),
             cookie_route_failures: get(&self.cookie_route_failures),

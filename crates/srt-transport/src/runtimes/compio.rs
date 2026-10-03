@@ -1371,14 +1371,109 @@ pub struct ListenerSide {
     /// stored once per listener. Both receive paths reach it through
     /// [`admit_listener_datagram`] and nowhere else.
     resolver: Option<crate::ListenerAdmissionResolver>,
-    /// Acceptor-group membership and the CONCLUSIONs other members own.
+    /// Layout membership and the transfers owed to other members.
     routing: ListenerRouting,
+    /// Connected sockets of sessions promoted or relocated here.
+    promoted: PromotedSockets,
 }
 
+/// One session's own connected socket (promoted or relocated here).
+/// Receive-only: the kernel delivers the session's 4-tuple to it, while
+/// replies leave through the listener socket, whose address is the same. It
+/// is read in raw-readiness mode whatever the listener's mode: a relocated
+/// bonded leg does not justify a managed ring of its own.
+struct PromotedSocket {
+    sock: compio::net::UdpSocket,
+    poll_fd: compio::runtime::fd::PollFd<std::net::UdpSocket>,
+    /// Readiness reported and not yet drained to `WouldBlock`.
+    ready: bool,
+}
+
+/// Connected sockets of this listener's promoted sessions. Empty unless the
+/// listener's plan relocates.
+#[derive(Default)]
+struct PromotedSockets {
+    slots: Vec<Option<PromotedSocket>>,
+    free: Vec<usize>,
+    by_peer: std::collections::HashMap<SocketAddr, usize>,
+}
+
+impl PromotedSockets {
+    fn insert(
+        &mut self,
+        peer: SocketAddr,
+        socket: std::net::UdpSocket,
+    ) -> Result<(), crate::RuntimeBuildError> {
+        self.remove(peer);
+        socket.set_nonblocking(true)?;
+        let sock = compio::net::UdpSocket::from_std(socket)?;
+        let poll_fd = make_poll_fd(&sock)?;
+        let entry = PromotedSocket {
+            sock,
+            poll_fd,
+            // Datagrams may have queued between bind and registration.
+            ready: true,
+        };
+        let slot = match self.free.pop() {
+            Some(slot) => {
+                self.slots[slot] = Some(entry);
+                slot
+            }
+            None => {
+                self.slots.push(Some(entry));
+                self.slots.len() - 1
+            }
+        };
+        self.by_peer.insert(peer, slot);
+        Ok(())
+    }
+
+    fn remove(&mut self, peer: SocketAddr) {
+        if let Some(slot) = self.by_peer.remove(&peer) {
+            self.slots[slot] = None;
+            self.free.push(slot);
+        }
+    }
+
+    fn any_ready(&self) -> bool {
+        self.slots.iter().flatten().any(|entry| entry.ready)
+    }
+
+    /// The raw fd of promoted socket `slot` while it has receive readiness.
+    fn ready_fd(&self, slot: usize) -> Option<std::os::fd::RawFd> {
+        use std::os::fd::AsRawFd;
+        let entry = self.slots.get(slot)?.as_ref()?;
+        entry
+            .ready
+            .then(|| compio::net::UdpSocket::as_raw_fd(&entry.sock))
+    }
+
+    /// Promoted socket `slot` would block: wait for its next readiness.
+    fn set_drained(&mut self, slot: usize) {
+        if let Some(entry) = self.slots.get_mut(slot).and_then(Option::as_mut) {
+            entry.ready = false;
+        }
+    }
+
+    /// Record readiness of every promoted socket, registering the waker for
+    /// the rest. Whether any socket has receive work.
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> bool {
+        let mut any = false;
+        for entry in self.slots.iter_mut().flatten() {
+            if !entry.ready && entry.poll_fd.poll_read_ready(cx).is_ready() {
+                entry.ready = true;
+            }
+            any |= entry.ready;
+        }
+        any
+    }
+}
+
+use crate::OwnerListenerPlan;
 use crate::owner_layout::{
-    ListenerRouting, bind_listener_socket, check_listener_topology, listener_socket_bytes,
+    ListenerRouting, ListenerTransfer, bind_listener_socket, check_listener_topology,
+    listener_socket_bytes, listener_table,
 };
-use crate::{ForwardedHandshake, OwnerListenerPlan};
 
 /// The ONE place a listener datagram enters admission, whichever receive
 /// datapath (readiness or managed multishot) delivered it.
@@ -1416,7 +1511,7 @@ impl ListenerSide {
         sock: compio::net::UdpSocket,
         prepared: crate::PreparedListener,
     ) -> Result<Self, crate::RuntimeBuildError> {
-        Self::from_prepared_with_rx_mode(sock, prepared, OwnerRxMode::RawReadiness, 0)
+        Self::from_prepared_with_rx_mode(sock, prepared, OwnerRxMode::RawReadiness, 0, None)
     }
 
     /// Attach with an explicit receive mode. Under
@@ -1428,12 +1523,13 @@ impl ListenerSide {
         prepared: crate::PreparedListener,
         rx_mode: OwnerRxMode,
         managed_slot_len: usize,
+        plan: Option<&OwnerListenerPlan>,
     ) -> Result<Self, crate::RuntimeBuildError> {
         let poll_fd = make_poll_fd(&sock)?;
         let sock = Rc::new(sock);
         let mut side = Self {
             sock,
-            table: prepared.peer_table(),
+            table: listener_table(&prepared, plan),
             telemetry: IngressTelemetry::new(),
             options: prepared.admission_options(),
             transport: prepared.transport,
@@ -1454,7 +1550,8 @@ impl ListenerSide {
                 },
             ),
             resolver: None,
-            routing: ListenerRouting::new(None),
+            routing: ListenerRouting::new(&prepared, plan),
+            promoted: PromotedSockets::default(),
         };
         if rx_mode == OwnerRxMode::ManagedMultishot {
             side.rx = SideRx::managed(managed_slot_len, true);
@@ -1470,6 +1567,29 @@ impl ListenerSide {
     ) -> Self {
         self.resolver = resolver;
         self
+    }
+
+    /// Close the sockets of sessions that left the table, then start driving
+    /// the ones admission or a transfer gave this Owner (in that order, so a
+    /// peer address reused by a new session keeps its new socket). A socket
+    /// that cannot be registered is dropped and counted; its session carries
+    /// on through the listener socket, which the kernel then matches again.
+    fn sync_promoted(&mut self) {
+        if self.table.has_freed_addresses() {
+            for peer in self.table.take_freed_addresses() {
+                self.promoted.remove(peer);
+            }
+        }
+        if !self.routing.has_promoted() {
+            return;
+        }
+        let mut failed = 0;
+        for (peer, socket) in self.routing.take_promoted(&self.table) {
+            if self.promoted.insert(peer, socket).is_err() {
+                failed += 1;
+            }
+        }
+        self.telemetry.record_promotion_failures(failed);
     }
 
     /// Spawn the one fixed managed RX task for this socket (idempotent).
@@ -3800,12 +3920,11 @@ impl Owner {
 
     /// Attach one Owner's share of a listener topology (see
     /// [`crate::owner_plans`]).
-    /// For a reuseport group, every member issues SYN cookies carrying its
-    /// index, and a CONCLUSION the kernel delivers to the wrong member comes
-    /// out of [`Self::poll_listener_forwards`] for the application to pass to
-    /// the owning member's [`Self::inject_listener_handshake`]. Established
-    /// sessions stay on the socket the kernel hashes them to, so a group's
-    /// size must not change while sessions are live.
+    /// The Owners of one layout exchange [`ListenerTransfer`]s through
+    /// [`Self::poll_listener_transfers`] / [`Self::accept_listener_transfer`]:
+    /// CONCLUSIONs the kernel delivered to the wrong reuseport member and,
+    /// under promotion `Relocate`, bonded legs moving to their group's Owner.
+    /// A group's size must not change while sessions are live.
     pub fn listen_planned(
         &mut self,
         plan: &OwnerListenerPlan,
@@ -3814,30 +3933,30 @@ impl Owner {
         self.listen_inner(&plan.config, resolver, Some(plan))
     }
 
-    /// Drain CONCLUSIONs that belong to other acceptor-group members (see
-    /// [`Self::listen_planned`]). Bounded per Owner by
-    /// `LISTENER_FORWARD_CAPACITY`; drain after every [`Self::service`].
-    pub fn poll_listener_forwards(&mut self, out: &mut Vec<ForwardedHandshake>) {
+    /// Drain the transfers this Owner owes other members of its layout (see
+    /// [`Self::listen_planned`]); deliver each to member `to`. Drain after
+    /// every [`Self::service`].
+    pub fn poll_listener_transfers(&mut self, out: &mut Vec<ListenerTransfer>) {
         if let Some(listener) = self.listener.as_mut() {
-            listener.routing.drain_into(out);
+            listener.routing.drain_into(&mut listener.table, out);
         }
     }
 
-    /// Admit a CONCLUSION another acceptor-group member forwarded here. The
-    /// datagram goes through the same admission path as one this Owner
+    /// Apply a transfer another member of this layout sent here: a forwarded
+    /// CONCLUSION goes through the same admission path as one this Owner
     /// received itself, so policy resolution happens on the member that owns
-    /// the half-open handshake. Ignored when no listener is attached.
-    pub fn inject_listener_handshake(&mut self, peer: SocketAddr, data: &[u8], now: Timestamp) {
+    /// the half-open handshake; a relocated session joins this Owner, and the
+    /// next [`Self::service`] starts driving its connected socket. Ignored
+    /// when no listener is attached.
+    pub fn accept_listener_transfer(&mut self, transfer: ListenerTransfer, now: Timestamp) {
         if let Some(listener) = self.listener.as_mut() {
-            admit_listener_datagram(
+            listener.routing.accept(
+                transfer,
                 &mut listener.table,
                 listener.resolver.as_ref(),
+                now,
                 &listener.options,
                 &listener.telemetry,
-                peer,
-                data,
-                now,
-                &mut listener.routing,
             );
         }
     }
@@ -3864,14 +3983,7 @@ impl Owner {
             )));
         }
         let prepared = config.prepare(crate::RuntimeFlavor::Compio)?;
-        check_listener_topology(plan, prepared.transport.topology)?;
-        if prepared.transport.promotion != srt_lifecycle::Promotion::Never {
-            return Err(crate::ConfigError::new(
-                "listener.transport.promotion",
-                "Owner has no relocation target; set promotion to Never",
-            )
-            .into());
-        }
+        check_listener_topology(plan, &prepared)?;
         let payload_size = prepared.session.payload_size.resolve()?.get();
         // The listener adopts the cipher mode from the peer's KMREQ, so its
         // ceiling is the conservative bound for an encrypted session rather
@@ -3909,9 +4021,9 @@ impl Owner {
         let slot_len = managed_rx_buffer_len(self.wire_ceiling);
         // Construct first: a refused attach drops the bound socket and leaves
         // the Owner exactly as configurable as it was before the attempt.
-        let mut side = ListenerSide::from_prepared_with_rx_mode(sock, prepared, rx_mode, slot_len)?
-            .with_resolver(resolver);
-        side.routing = ListenerRouting::new(plan.and_then(OwnerListenerPlan::member));
+        let side =
+            ListenerSide::from_prepared_with_rx_mode(sock, prepared, rx_mode, slot_len, plan)?
+                .with_resolver(resolver);
         self.listener = Some(side);
         self.rx_mode = Some(rx_mode);
         self.sessions_started = true;
@@ -4479,14 +4591,15 @@ impl Owner {
     pub async fn wait_for_activity(&mut self, timeout: std::time::Duration) {
         // Staged or already-queued work wakes immediately: never sleep past
         // work the next service() call can already consume.
-        if self
-            .listener
+        if self.listener.as_ref().is_some_and(|l| {
+            l.pending_rx.is_some()
+                || l.rx.pending()
+                || l.promoted.any_ready()
+                || l.routing.has_promoted()
+        }) || self
+            .caller
             .as_ref()
-            .is_some_and(|l| l.pending_rx.is_some() || l.rx.pending())
-            || self
-                .caller
-                .as_ref()
-                .is_some_and(|c| c.pending_rx.is_some() || c.rx.pending())
+            .is_some_and(|c| c.pending_rx.is_some() || c.rx.pending())
         {
             return;
         }
@@ -4497,6 +4610,13 @@ impl Owner {
                     return std::task::Poll::Ready(());
                 }
                 if Self::side_rx_ready(self.listener.as_ref(), cx) {
+                    return std::task::Poll::Ready(());
+                }
+                if self
+                    .listener
+                    .as_mut()
+                    .is_some_and(|listener| listener.promoted.poll_ready(cx))
+                {
                     return std::task::Poll::Ready(());
                 }
                 if Self::side_rx_ready(self.caller.as_ref(), cx) {
@@ -4643,38 +4763,60 @@ impl Owner {
     ) -> ListenerBatchStop {
         use std::os::fd::AsRawFd;
         let raw_fd = compio::net::UdpSocket::as_raw_fd(&listener.sock);
-        let slot = listener.rx_batch.slot_len();
         loop {
-            let by_packets = budget.max_rx_packets.saturating_sub(report.rx_packets);
-            let by_bytes = budget.max_rx_bytes.saturating_sub(report.rx_bytes) / slot;
-            let requested = by_packets.min(by_bytes).min(listener.rx_batch.capacity());
+            let requested = Self::rx_batch_request(listener, budget, report);
             if requested == 0 {
                 return ListenerBatchStop::BudgetLimited;
             }
             let Ok(received) = listener.rx_batch.recv(raw_fd, requested) else {
                 return ListenerBatchStop::Failed;
             };
-            for (peer, datagram, truncated) in listener.rx_batch.iter(received) {
-                let (Some(peer), false) = (peer, truncated) else {
-                    continue;
-                };
-                report.rx_packets += 1;
-                report.rx_bytes += datagram.len();
-                admit_listener_datagram(
-                    &mut listener.table,
-                    listener.resolver.as_ref(),
-                    &listener.options,
-                    &listener.telemetry,
-                    peer,
-                    datagram,
-                    now,
-                    &mut listener.routing,
-                );
-            }
+            Self::admit_rx_batch(listener, received, now, report);
             if received < requested {
                 // Socket drained.
                 return ListenerBatchStop::Drained;
             }
+        }
+    }
+
+    /// Datagrams one `recvmmsg` may take within the visit's remaining budget:
+    /// every slot holds at most the batch slot length, so this can never
+    /// overshoot the byte cap.
+    fn rx_batch_request(
+        listener: &ListenerSide,
+        budget: &OwnerServiceBudget,
+        report: &OwnerServiceReport,
+    ) -> usize {
+        let by_packets = budget.max_rx_packets.saturating_sub(report.rx_packets);
+        let by_bytes =
+            budget.max_rx_bytes.saturating_sub(report.rx_bytes) / listener.rx_batch.slot_len();
+        by_packets.min(by_bytes).min(listener.rx_batch.capacity())
+    }
+
+    /// Admit the `received` datagrams in the listener's batch scratch; a
+    /// truncated one is skipped, as on the managed path.
+    fn admit_rx_batch(
+        listener: &mut ListenerSide,
+        received: usize,
+        now: Timestamp,
+        report: &mut OwnerServiceReport,
+    ) {
+        for (peer, datagram, truncated) in listener.rx_batch.iter(received) {
+            let (Some(peer), false) = (peer, truncated) else {
+                continue;
+            };
+            report.rx_packets += 1;
+            report.rx_bytes += datagram.len();
+            admit_listener_datagram(
+                &mut listener.table,
+                listener.resolver.as_ref(),
+                &listener.options,
+                &listener.telemetry,
+                peer,
+                datagram,
+                now,
+                &mut listener.routing,
+            );
         }
     }
 
@@ -4875,7 +5017,7 @@ impl Owner {
         self.rx_priority_listener_first = !self.rx_priority_listener_first;
         if self.rx_priority_listener_first {
             if let Some(ref mut listener) = self.listener {
-                Self::service_rx_listener(listener, now, budget, report).await;
+                Self::service_rx_listener_with_promoted(listener, now, budget, report).await;
             }
             if let Some(ref mut caller) = self.caller {
                 Self::service_rx_caller(caller, now, budget, report).await;
@@ -4885,7 +5027,54 @@ impl Owner {
                 Self::service_rx_caller(caller, now, budget, report).await;
             }
             if let Some(ref mut listener) = self.listener {
-                Self::service_rx_listener(listener, now, budget, report).await;
+                Self::service_rx_listener_with_promoted(listener, now, budget, report).await;
+            }
+        }
+    }
+
+    /// The listener socket, then every ready promoted socket, through the one
+    /// admission path; promoted sockets are registered before (transfers
+    /// accepted since the last visit) and after (promotions this visit's
+    /// admission decided).
+    async fn service_rx_listener_with_promoted(
+        listener: &mut ListenerSide,
+        now: Timestamp,
+        budget: &OwnerServiceBudget,
+        report: &mut OwnerServiceReport,
+    ) {
+        listener.sync_promoted();
+        Self::service_rx_listener(listener, now, budget, report).await;
+        Self::drain_promoted_rx(listener, now, budget, report);
+        listener.sync_promoted();
+    }
+
+    /// Drain each ready promoted socket in `recvmmsg` batches until it would
+    /// block or the visit budget runs out (it then stays ready).
+    fn drain_promoted_rx(
+        listener: &mut ListenerSide,
+        now: Timestamp,
+        budget: &OwnerServiceBudget,
+        report: &mut OwnerServiceReport,
+    ) {
+        for slot in 0..listener.promoted.slots.len() {
+            while let Some(raw_fd) = listener.promoted.ready_fd(slot) {
+                let requested = Self::rx_batch_request(listener, budget, report);
+                if requested == 0 {
+                    return;
+                }
+                match listener.rx_batch.recv(raw_fd, requested) {
+                    Ok(received) => {
+                        Self::admit_rx_batch(listener, received, now, report);
+                        if received < requested {
+                            listener.promoted.set_drained(slot);
+                        }
+                    }
+                    // ICMP port-unreachable on a connected socket is this
+                    // session's condition (its SRT timers handle it); data
+                    // may still follow.
+                    Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {}
+                    Err(_) => listener.promoted.set_drained(slot),
+                }
             }
         }
     }

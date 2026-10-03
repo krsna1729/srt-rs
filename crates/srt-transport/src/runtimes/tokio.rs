@@ -1130,6 +1130,74 @@ fn side_needs_immediate_work(
     recv_pending || event_pending || (!write_blocked && (output_pending || !outbound_empty))
 }
 
+/// Connected sockets of this listener's promoted sessions (promoted here or
+/// relocated here). Receive-only: the kernel delivers each session's 4-tuple
+/// to its socket, while replies leave through the listener socket, whose
+/// address is the same. Empty unless the listener's plan relocates. Tokio
+/// readiness flags make a visit to a socket that is not ready free of
+/// syscalls, so a visit costs one flag check per promoted socket.
+#[derive(Default)]
+struct PromotedSockets {
+    slots: Vec<Option<UdpSocket>>,
+    free: Vec<usize>,
+    by_peer: std::collections::HashMap<SocketAddr, usize>,
+    /// Receive drain stopped on budget, not on `WouldBlock`.
+    recv_pending: bool,
+}
+
+impl PromotedSockets {
+    fn insert(&mut self, peer: SocketAddr, socket: std::net::UdpSocket) -> io::Result<()> {
+        self.remove(peer);
+        socket.set_nonblocking(true)?;
+        let socket = UdpSocket::from_std(socket)?;
+        let slot = match self.free.pop() {
+            Some(slot) => {
+                self.slots[slot] = Some(socket);
+                slot
+            }
+            None => {
+                self.slots.push(Some(socket));
+                self.slots.len() - 1
+            }
+        };
+        self.by_peer.insert(peer, slot);
+        // Datagrams may have queued between bind and registration.
+        self.recv_pending = true;
+        Ok(())
+    }
+
+    fn remove(&mut self, peer: SocketAddr) {
+        if let Some(slot) = self.by_peer.remove(&peer) {
+            self.slots[slot] = None;
+            self.free.push(slot);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.by_peer.is_empty()
+    }
+
+    /// Ready when any promoted socket is readable.
+    fn poll_ready(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+        for socket in self.slots.iter().flatten() {
+            if let std::task::Poll::Ready(result) = socket.poll_recv_ready(cx) {
+                return std::task::Poll::Ready(result);
+            }
+        }
+        std::task::Poll::Pending
+    }
+}
+
+/// Resolves when a promoted socket has work; never, when there are none.
+async fn promoted_ready_or_pending(promoted: Option<&PromotedSockets>) -> io::Result<()> {
+    match promoted {
+        Some(promoted) if !promoted.is_empty() => {
+            std::future::poll_fn(|cx| promoted.poll_ready(cx)).await
+        }
+        _ => std::future::pending().await,
+    }
+}
+
 struct OwnerListenerSide {
     /// Application admission policy, stored once per listener.
     resolver: Option<crate::ListenerAdmissionResolver>,
@@ -1149,8 +1217,79 @@ struct OwnerListenerSide {
     output_pending: bool,
     event_pending: bool,
     write_blocked: bool,
-    /// Acceptor-group membership and the CONCLUSIONs other members own.
+    /// Layout membership and the transfers owed to other members.
     routing: crate::owner_layout::ListenerRouting,
+    /// Connected sockets of sessions promoted or relocated here.
+    promoted: PromotedSockets,
+}
+
+impl OwnerListenerSide {
+    /// Close the sockets of sessions that left the table, then start
+    /// driving the ones admission or a transfer gave this Owner (in that
+    /// order, so a peer address reused by a new session keeps its new
+    /// socket). Needs the Tokio reactor, so only [`Owner::run_once`] calls
+    /// it. A socket that cannot be registered is dropped and counted; its
+    /// session carries on through the listener socket.
+    fn sync_promoted(&mut self) {
+        if self.peers.has_freed_addresses() {
+            for peer in self.peers.take_freed_addresses() {
+                self.promoted.remove(peer);
+            }
+        }
+        if !self.routing.has_promoted() {
+            return;
+        }
+        let mut failed = 0;
+        for (peer, socket) in self.routing.take_promoted(&self.peers) {
+            if self.promoted.insert(peer, socket).is_err() {
+                failed += 1;
+            }
+        }
+        self.telemetry.record_promotion_failures(failed);
+    }
+
+    /// Drain every promoted socket through the listener's admission path
+    /// (the table demultiplexes by socket ID).
+    fn drain_promoted(&mut self, now: Timestamp) -> io::Result<()> {
+        if self.promoted.is_empty() {
+            return Ok(());
+        }
+        let (peers, admission, telemetry, resolver, routing) = (
+            &mut self.peers,
+            &self.admission,
+            &self.telemetry,
+            self.resolver.as_ref(),
+            &mut self.routing,
+        );
+        let mut recv_pending = false;
+        let mut first_error = None;
+        for socket in self.promoted.slots.iter().flatten() {
+            match drain_readable_bytes(
+                socket,
+                &mut self.recv_batch,
+                self.transport.recv_budget,
+                |addr, data| {
+                    let Some(peer) = addr else { return };
+                    routing.admit_bytes(peers, resolver, peer, data, now, admission, telemetry);
+                },
+            ) {
+                Ok(report) => {
+                    recv_pending |= receive_continuation(report, self.transport.recv_budget);
+                }
+                // A connected socket reports an ICMP port-unreachable as
+                // ECONNREFUSED once; it is this session's condition, which
+                // its SRT timers already handle. Drain again next visit.
+                Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+                    recv_pending = true;
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        self.promoted.recv_pending = recv_pending;
+        first_error.map_or(Ok(()), Err)
+    }
 }
 
 struct OwnerCallerSide {
@@ -1255,11 +1394,12 @@ impl Owner {
     }
 
     /// Attach one Owner's share of a listener topology (see
-    /// [`crate::owner_plans`] with [`crate::RuntimeFlavor::Tokio`]). Reuseport
-    /// members route misdelivered CONCLUSIONs through
-    /// [`Self::poll_listener_forwards`] / [`Self::inject_listener_handshake`];
-    /// established sessions stay where the kernel hashes them, so a group's
-    /// size must not change while sessions are live.
+    /// [`crate::owner_plans`] with [`crate::RuntimeFlavor::Tokio`]).
+    /// The Owners of one layout exchange [`crate::ListenerTransfer`]s through
+    /// [`Self::poll_listener_transfers`] / [`Self::accept_listener_transfer`]:
+    /// misdelivered CONCLUSIONs and, under promotion `Relocate`, bonded legs
+    /// moving to their group's Owner. A group's size must not change while
+    /// sessions are live.
     pub fn listen_planned(
         &mut self,
         plan: &crate::OwnerListenerPlan,
@@ -1268,23 +1408,24 @@ impl Owner {
         self.listen_inner(&plan.config, resolver, Some(plan))
     }
 
-    /// Drain CONCLUSIONs that belong to other acceptor-group members; drain
-    /// after every service visit.
-    pub fn poll_listener_forwards(&mut self, out: &mut Vec<crate::ForwardedHandshake>) {
+    /// Drain the transfers this Owner owes other members of its layout;
+    /// deliver each to member `to`. Drain after every service visit.
+    pub fn poll_listener_transfers(&mut self, out: &mut Vec<crate::ListenerTransfer>) {
         if let Some(side) = self.listener.as_mut() {
-            side.routing.drain_into(out);
+            side.routing.drain_into(&mut side.peers, out);
         }
     }
 
-    /// Admit a CONCLUSION another acceptor-group member forwarded here,
-    /// through the same admission path as one this Owner received itself.
-    pub fn inject_listener_handshake(&mut self, peer: SocketAddr, data: &[u8], now: Timestamp) {
+    /// Apply a transfer another member of this layout sent here: a
+    /// forwarded CONCLUSION goes through the same admission path as one this
+    /// Owner received itself; a relocated session joins this Owner, and the
+    /// next [`Self::run_once`] starts driving its connected socket.
+    pub fn accept_listener_transfer(&mut self, transfer: crate::ListenerTransfer, now: Timestamp) {
         if let Some(side) = self.listener.as_mut() {
-            side.routing.admit(
+            side.routing.accept(
+                transfer,
                 &mut side.peers,
                 side.resolver.as_ref(),
-                peer,
-                data,
                 now,
                 &side.admission,
                 &side.telemetry,
@@ -1315,14 +1456,7 @@ impl Owner {
             )));
         }
         let prepared = config.prepare(crate::RuntimeFlavor::Tokio)?;
-        crate::owner_layout::check_listener_topology(plan, prepared.transport.topology)?;
-        if prepared.transport.promotion != srt_lifecycle::Promotion::Never {
-            return Err(crate::ConfigError::new(
-                "listener.transport.promotion",
-                "Owner has no relocation target; set promotion to Never",
-            )
-            .into());
-        }
+        crate::owner_layout::check_listener_topology(plan, &prepared)?;
         if !prepared.bind.is_ipv4() {
             // Same reasoning as the Mio owner: sendmsg_batch is IPv4-only
             // and one bad destination fails the whole shared batch.
@@ -1357,7 +1491,7 @@ impl Owner {
             socket,
             admission: prepared.admission_options(),
             idle_timeout: prepared.admission.idle_timeout,
-            peers: prepared.peer_table(),
+            peers: crate::owner_layout::listener_table(&prepared, plan),
             telemetry: crate::IngressTelemetry::new(),
             recv_batch: BytesRecvBatch::with_capacity(
                 prepared.transport.recv_batch_capacity(),
@@ -1369,9 +1503,8 @@ impl Owner {
             output_pending: false,
             event_pending: false,
             write_blocked: false,
-            routing: crate::owner_layout::ListenerRouting::new(
-                plan.and_then(crate::OwnerListenerPlan::member),
-            ),
+            routing: crate::owner_layout::ListenerRouting::new(&prepared, plan),
+            promoted: PromotedSockets::default(),
         });
         Ok(())
     }
@@ -1490,6 +1623,9 @@ impl Owner {
         now: impl Fn() -> Timestamp,
         caller_budget: crate::OutputDrainBudget,
     ) -> io::Result<crate::OutputDrainStatus> {
+        if let Some(side) = self.listener.as_mut() {
+            side.sync_promoted();
+        }
         let continuation = self.listener.as_ref().is_some_and(|side| {
             side_needs_immediate_work(
                 side.recv_pending,
@@ -1497,7 +1633,7 @@ impl Owner {
                 side.output_pending,
                 side.write_blocked,
                 side.outbound.is_empty(),
-            )
+            ) || side.promoted.recv_pending
         }) || self.caller.as_ref().is_some_and(|side| {
             side_needs_immediate_work(
                 side.recv_pending,
@@ -1532,6 +1668,9 @@ impl Owner {
                 ) => {
                     result?;
                 }
+                result = promoted_ready_or_pending(self.listener.as_ref().map(|side| &side.promoted)) => {
+                    result?;
+                }
                 () = tokio::time::sleep(timeout) => {}
             }
         }
@@ -1555,6 +1694,8 @@ impl Owner {
                 },
             )?;
             side.recv_pending = receive_continuation(report, side.transport.recv_budget);
+            side.drain_promoted(recv_now)?;
+            side.sync_promoted();
         }
         if let Some(side) = self.caller.as_mut() {
             let callers = side.callers.table_mut();
@@ -4036,17 +4177,14 @@ mod owner_tests {
                 for (owner, _) in &mut callers {
                     tick(owner, start).await;
                 }
-                let mut forwards = Vec::new();
+                let mut transfers = Vec::new();
                 for member in &mut members {
-                    member.poll_listener_forwards(&mut forwards);
+                    member.poll_listener_transfers(&mut transfers);
                 }
-                forwarded += forwards.len();
-                for handshake in forwards {
-                    members[handshake.to].inject_listener_handshake(
-                        handshake.peer,
-                        &handshake.data,
-                        now_ts(start),
-                    );
+                forwarded += transfers.len();
+                for transfer in transfers {
+                    let to = transfer.to;
+                    members[to].accept_listener_transfer(transfer, now_ts(start));
                 }
             }
             assert_eq!(
@@ -4058,6 +4196,68 @@ mod owner_tests {
                 forwarded > 0,
                 "the rehash sent some CONCLUSIONs to member 1"
             );
+        });
+    }
+
+    /// Bonded publishers whose legs the kernel hashes to different members
+    /// of a `Relocate` group end up as one stream each on one Owner: the leg
+    /// away from its group moves there with its own connected socket, which
+    /// carries its data in; replies leave through the listener socket.
+    #[test]
+    fn relocate_group_keeps_each_bonded_publisher_on_one_owner() {
+        use crate::owner_layout::relocation_test_support::{
+            RelocationRun, free_port, relocating_group,
+        };
+        test_runtime().block_on(async {
+            let start = std::time::Instant::now();
+            let port = free_port();
+            let plans = crate::owner_plans(&relocating_group(port), crate::RuntimeFlavor::Tokio)
+                .expect("relocating plans");
+            let mut members: Vec<Owner> = plans
+                .iter()
+                .map(|plan| {
+                    let mut owner = Owner::new();
+                    owner.listen_planned(plan, None).expect("member attaches");
+                    owner
+                })
+                .collect();
+            let mut run = RelocationRun::new(port, now_ts(start));
+            while run.active() {
+                run.pump_publishers(now_ts(start));
+                for (index, member) in members.iter_mut().enumerate() {
+                    member
+                        .run_once(
+                            Duration::from_micros(200),
+                            || now_ts(start),
+                            OutputDrainBudget::default(),
+                        )
+                        .await
+                        .expect("run_once");
+                    let mut events = Vec::new();
+                    member.poll_listener_events(&mut events);
+                    run.note_events(index, &events);
+                }
+                let mut transfers = Vec::new();
+                for member in &mut members {
+                    member.poll_listener_transfers(&mut transfers);
+                }
+                run.note_transfers(&transfers);
+                for transfer in transfers {
+                    let to = transfer.to;
+                    members[to].accept_listener_transfer(transfer, now_ts(start));
+                }
+                run.after_round(now_ts(start));
+            }
+            let stats: Vec<_> = run
+                .streams()
+                .iter()
+                .map(|&(member, id)| {
+                    members[member]
+                        .listener_peer_mut(id)
+                        .and_then(|peer| peer.stats())
+                })
+                .collect();
+            run.finish(&stats);
         });
     }
 }
