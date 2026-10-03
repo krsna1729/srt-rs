@@ -3382,6 +3382,14 @@ impl Owner {
         self.rx_mode_policy = policy;
     }
 
+    /// Coalesce equal-length datagrams to one peer into UDP GSO sends (on by
+    /// default). Off sends every datagram with its own `sendmsg`: for A/B
+    /// measurement, and for paths where GSO bursts hurt the receiver. A path
+    /// that rejects GSO still turns it off by itself.
+    pub fn set_tx_gso(&mut self, enabled: bool) {
+        self.tx_engine.coalesce = enabled;
+    }
+
     /// Receive datapath selected for this Owner's shared sockets.
     ///
     /// `None` before any socket is attached.
@@ -8618,6 +8626,31 @@ mod tests {
                     "segments arrive whole and in order"
                 );
             }
+        });
+    }
+
+    /// With GSO switched off the same run leaves as one send per datagram.
+    #[test]
+    fn gso_switched_off_sends_every_datagram_on_its_own() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            let c_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+            let c_sock = compio::net::UdpSocket::from_std(c_std).expect("adopt");
+            let mut owner = Owner::new(8).with_caller(OwnerCallerSide::new_single(c_sock));
+            owner.set_tx_gso(false);
+            let peer: SocketAddr = "127.0.0.1:19994".parse().unwrap();
+            {
+                let mut sink = owner_sink(&mut owner);
+                for _ in 0..3 {
+                    let res = push_test(&mut sink, peer, 20, |buf| {
+                        buf[..20].fill(1);
+                        Ok(20)
+                    });
+                    assert!(matches!(res, Ok(Some(20))));
+                }
+            }
+            assert_eq!(owner.tx_batching(), OwnerTxBatchingCounters::default());
+            assert_eq!(owner.tx_in_flight(), 3);
         });
     }
 
