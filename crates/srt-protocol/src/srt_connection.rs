@@ -1616,6 +1616,11 @@ impl SrtConnection {
             .min(self.options.receive_buffer_packets)
     }
 
+    /// The configured receive window, in packets.
+    pub(crate) fn receive_window_packets(&self) -> u32 {
+        self.options.receive_buffer_packets
+    }
+
     /// Process received data.
     pub fn feed_recv_buf(&mut self, buf: &[u8], now: Timestamp) -> Result<(), Error> {
         self.check_output_queue()?;
@@ -7394,6 +7399,160 @@ mod tests {
         let mut buf = Vec::new();
         packet.encode(&mut buf).expect("control encodes");
         buf
+    }
+
+    /// Full ACKs a saturated receiver sends in one simulated second, as
+    /// `(send time us, advertised window)` pairs.
+    ///
+    /// The peer refills the window the moment it has room, the application
+    /// consumes one packet every `consume_every_us`, and the transport
+    /// fires each requested Ack deadline `timer_lateness_us` late. In each
+    /// step DATA arrives before a due Ack timer and the application consumes
+    /// after it, so a periodic Full ACK sees the window full and every
+    /// consume after it can arm a forced reopen: the worst case.
+    fn saturated_receiver_full_acks(
+        window: u32,
+        delivery_queue: u32,
+        consume_every_us: u64,
+        timer_lateness_us: u64,
+    ) -> Vec<(u64, u32)> {
+        const STEP_US: u64 = 10;
+        const RUN_US: u64 = 1_000_000;
+
+        fn drain(
+            conn: &mut SrtConnection,
+            now_us: u64,
+            timer_lateness_us: u64,
+            ack_deadline: &mut Option<u64>,
+            full_acks: &mut Vec<(u64, u32)>,
+        ) {
+            while let Some(output) = conn.poll_output().expect("output materializes") {
+                match output {
+                    ConnectionOutput::SetTimer {
+                        id: TimerId::Ack,
+                        duration_micros,
+                    } => *ack_deadline = Some(now_us + duration_micros + timer_lateness_us),
+                    ConnectionOutput::SendPacket(bytes) => {
+                        if let Ok(SrtPacket::Control(packet)) = SrtPacket::decode(&bytes)
+                            && packet.control_type == ControlType::Ack
+                            && let Some(available) = full_ack_available(&bytes)
+                        {
+                            full_acks.push((now_us, available));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let mut conn = SrtConnection::new_listener(ConnectionOptions {
+            tsbpd_delay: 0,
+            flow_window_packets: window,
+            receive_buffer_packets: window,
+            delivery_queue_packets: delivery_queue,
+            ..ConnectionOptions::default()
+        });
+        conn.set_state(ConnectionState::Connected);
+        let _ = conn.poll_event();
+        conn.init_buffers(Timestamp::from_micros(0), 0, 0);
+        conn.receiver
+            .as_mut()
+            .expect("connected listener has a receiver")
+            .set_tsbpd_enabled(false);
+
+        // `init_buffers` does not arm timers; the first tick starts the
+        // self-re-arming ACK timer chain, as `setup_connection_timers` would.
+        let (mut ack_deadline, mut full_acks) =
+            (Some(crate::receiver::ACK_INTERVAL_MICROS), Vec::new());
+        drain(
+            &mut conn,
+            0,
+            timer_lateness_us,
+            &mut ack_deadline,
+            &mut full_acks,
+        );
+        let (mut received, mut consumed) = (0u32, 0u32);
+        for now_us in (STEP_US..=RUN_US).step_by(STEP_US as usize) {
+            let now = Timestamp::from_micros(now_us);
+            if received - consumed < window {
+                conn.handle_data_packet(
+                    DataPacket::new(received, received, 0, 0, vec![1].into()),
+                    now,
+                )
+                .expect("data is accepted");
+                received += 1;
+            }
+            if ack_deadline.is_some_and(|deadline| deadline <= now_us) {
+                ack_deadline = None;
+                conn.handle_timer(TimerId::Ack, now).expect("ACK tick");
+            }
+            if now_us.is_multiple_of(consume_every_us)
+                && matches!(
+                    conn.poll_event(),
+                    Some(ConnectionEvent::DataReceived { .. })
+                )
+            {
+                consumed += 1;
+            }
+            drain(
+                &mut conn,
+                now_us,
+                timer_lateness_us,
+                &mut ack_deadline,
+                &mut full_acks,
+            );
+        }
+        assert!(
+            consumed >= (RUN_US / consume_every_us) as u32 * 9 / 10,
+            "the application kept consuming at its rate"
+        );
+        full_acks
+    }
+
+    /// The window-reopen Full ACK is keyed to the window a Full ACK
+    /// carried, so a receiver the application drains at 50k packets/s
+    /// sends at most two Full ACKs in any ACK interval -- the periodic one
+    /// that advertised zero and the forced reopen -- and stays inside the
+    /// ACKACK history it promises to keep for one second. A Light ACK
+    /// carries no window, so one taken at a full window must not arm a
+    /// forced Full ACK: that coupled the Full ACK rate to packets/64.
+    #[test]
+    fn a_saturated_receiver_sends_at_most_two_full_acks_per_ack_interval() {
+        const INTERVAL: u64 = crate::receiver::ACK_INTERVAL_MICROS;
+        for (window, delivery_queue, timer_lateness_us) in
+            [(128, 64, 0), (128, 64, 500), (32, 1, 0), (256, 256, 3_000)]
+        {
+            let acks = saturated_receiver_full_acks(window, delivery_queue, 20, timer_lateness_us);
+            let label = format!("window {window}, timer {timer_lateness_us} us late");
+            let per_interval = acks
+                .iter()
+                .enumerate()
+                .map(|(index, &(start, _))| {
+                    acks[index..]
+                        .iter()
+                        .take_while(|&&(sent, _)| sent < start + INTERVAL)
+                        .count()
+                })
+                .max()
+                .unwrap_or(0);
+            assert!(
+                per_interval <= 2,
+                "{label}: {per_interval} Full ACKs in one interval"
+            );
+            assert!(
+                acks.len() <= crate::srt_receiver::MAX_ACK_TIMESTAMPS,
+                "{label}: {} Full ACKs in one second outrun the ACKACK history",
+                acks.len()
+            );
+            // The worst case is exercised: a forced reopen Full ACK follows a
+            // zero-window Full ACK within the same interval. (It may itself
+            // advertise zero when the peer refilled first.)
+            assert!(
+                acks.windows(2)
+                    .any(|pair| pair[0].1 == 0 && pair[1].0 - pair[0].0 < INTERVAL),
+                "{label}: the zero-window -> forced-reopen cycle must run"
+            );
+        }
     }
 
     /// A NAK whose named positions are all TLPKTDROP tombstones is answered

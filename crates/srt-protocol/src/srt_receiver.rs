@@ -149,9 +149,21 @@ pub const fn clamp_light_ack_interval_packets(interval_packets: u32) -> u32 {
     }
 }
 
-/// Maximum number of entries kept for tracking ACK send times.
-const MAX_ACK_TIMESTAMPS: usize = 16;
-const _: () = assert!(MAX_ACK_TIMESTAMPS.is_power_of_two());
+/// Number of Full ACKs whose send time and position are kept for ACKACK
+/// matching (RTT sampling and ACK suppression).
+///
+/// Contract: an ACKACK samples RTT if it names one of the last 256 Full
+/// ACKs this receiver sent. The connection sends at most two Full ACKs per
+/// 10 ms ACK interval (the periodic one, plus one forced window-reopen ACK
+/// that only a Full ACK advertising zero can arm), so the history covers at
+/// least 1.28 s of RTT at the default cadence and proportionally more when
+/// ACKs are coalesced. An ACKACK for a sent ACK older than that is still
+/// valid input, but yields no RTT sample and no suppression update.
+///
+/// Cost: one lazily allocated 4 KiB backing per receiver, allocated by the
+/// first Full ACK; every connected leg sends periodic Full ACKs.
+pub(crate) const MAX_ACK_TIMESTAMPS: usize = 256;
+const _: () = assert!(MAX_ACK_TIMESTAMPS.is_power_of_two() && MAX_ACK_TIMESTAMPS >= 2);
 
 /// Number of samples used for Link Capacity estimation.
 const LINK_CAPACITY_SAMPLES: usize = 16;
@@ -549,13 +561,18 @@ const WRAPPING_PERIOD_END_MAX: u64 = 60_000_000;
 
 /// Tracks ACK send times and acknowledged positions (for RTT calculation
 /// and ACK suppression).
+///
+/// Slot `n & (MAX_ACK_TIMESTAMPS - 1)` holds ACK `n` until ACK
+/// `n + MAX_ACK_TIMESTAMPS` replaces it. A lookup matches the full 32-bit
+/// ACK number, so two generations of one slot never alias. An unused slot
+/// holds a number that does not map to it, so no lookup can match it and no
+/// separate validity bitmap is needed.
 #[derive(Debug)]
 struct AckTimestampTracker {
-    valid: u16,
     entries: Option<Box<[AckTimestamp; MAX_ACK_TIMESTAMPS]>>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 struct AckTimestamp {
     ack_number: u32,
     acked_seq: u32,
@@ -564,31 +581,34 @@ struct AckTimestamp {
 
 impl AckTimestampTracker {
     fn new() -> Self {
-        Self {
-            valid: 0,
-            entries: None,
-        }
+        Self { entries: None }
+    }
+
+    fn slot(ack_number: u32) -> usize {
+        ack_number as usize & (MAX_ACK_TIMESTAMPS - 1)
     }
 
     /// Record an ACK send time and the sequence position it acknowledged.
     fn record(&mut self, ack_number: u32, send_time: Timestamp, acked_seq: u32) {
-        let index = ack_number as usize & (MAX_ACK_TIMESTAMPS - 1);
-        let entries = self
-            .entries
-            .get_or_insert_with(|| Box::new([AckTimestamp::default(); MAX_ACK_TIMESTAMPS]));
-        entries[index] = AckTimestamp {
+        let entries = self.entries.get_or_insert_with(|| {
+            // `!slot` maps to slot `MAX - 1 - slot`, never to `slot` itself
+            // (MAX - 1 is odd), so an unused slot never matches a lookup.
+            Box::new(std::array::from_fn(|slot| AckTimestamp {
+                ack_number: !(slot as u32),
+                acked_seq: 0,
+                send_time: Timestamp::default(),
+            }))
+        });
+        entries[Self::slot(ack_number)] = AckTimestamp {
             ack_number,
             acked_seq,
             send_time,
         };
-        self.valid |= 1 << index;
     }
 
     fn get(&self, ack_number: u32) -> Option<&AckTimestamp> {
-        let index = ack_number as usize & (MAX_ACK_TIMESTAMPS - 1);
-        let entries = self.entries.as_ref()?;
-        ((self.valid & (1 << index)) != 0 && entries[index].ack_number == ack_number)
-            .then(|| &entries[index])
+        let entry = &self.entries.as_ref()?[Self::slot(ack_number)];
+        (entry.ack_number == ack_number).then_some(entry)
     }
 
     /// Get an ACK's send time.
@@ -911,6 +931,10 @@ pub struct ReceiverBuffer {
     /// freed (libsrt's `bNeedFullAck` exception).
     last_advertised_buffer: u32,
 
+    /// Whether the last Full ACK was a periodic one that advertised a full
+    /// window; see [`Self::receive_window_reopened`].
+    window_reopen_armed: bool,
+
     /// TSBPD delay (microseconds).
     tsbpd_delay_us: u64,
 
@@ -1038,6 +1062,7 @@ impl ReceiverBuffer {
             expected_seq: initial_seq,
             loss_detection_frontier: initial_seq.wrapping_sub(1) & 0x7FFF_FFFF,
             last_advertised_buffer: 0,
+            window_reopen_armed: false,
             loss_list: LossBitmap::new(initial_seq, max_buffer_size),
             last_ack_time: start_time,
             last_ack_seq: initial_seq,
@@ -1123,14 +1148,27 @@ impl ReceiverBuffer {
 
     /// Whether the ACK timer should emit a (full) ACK this tick.
     ///
-    /// The default (10 ms = `COMM_SYN`) emits on every tick, matching the
-    /// historic `handle_ack_timer` always-send behavior. A coalesced
-    /// interval (`> COMM_SYN`) emits only after the configured period has
-    /// elapsed; intermediate ticks still run TSBPD/TLPKTDROP.
+    /// The default (10 ms = `COMM_SYN`) emits on every tick unless a Full
+    /// ACK already went out less than one interval ago (a DATA-driven
+    /// periodic ACK that ran just before a timer due at the same instant,
+    /// or a late timer). A coalesced interval (`> COMM_SYN`) emits only
+    /// after the configured period has elapsed; intermediate ticks still run
+    /// TSBPD/TLPKTDROP.
+    ///
+    /// Together with the DATA path (which needs a whole interval since the
+    /// last ACK of any kind) this keeps non-forced Full ACKs one interval
+    /// apart, and each may arm at most one forced reopen Full ACK
+    /// ([`Self::receive_window_reopened`]): at most two Full ACKs in any
+    /// interval, which is what the ACKACK history (256 Full ACKs) is sized for.
     #[must_use]
     pub fn should_emit_timer_ack(&self, now: Timestamp) -> bool {
         if u64::from(self.ack_interval_micros) <= ACK_INTERVAL_MICROS {
-            true
+            self.ack_timestamps
+                .get_send_time(self.ack_number)
+                .is_none_or(|last_full| {
+                    now.as_micros().saturating_sub(last_full.as_micros())
+                        >= u64::from(self.ack_interval_micros)
+                })
         } else {
             self.ack_interval_elapsed(now)
         }
@@ -1726,15 +1764,22 @@ impl ReceiverBuffer {
             .min()
     }
 
-    /// Whether this buffer last advertised a full receive window and now has
-    /// free capacity again.
+    /// Whether the last periodic Full ACK advertised a full receive window
+    /// and this buffer now has free capacity again.
     ///
     /// The zero->positive transition is the one receive-window change that
     /// cannot wait for the next ACK tick: the peer is stopped, and its
     /// progress (if any) may take an unbounded time to arrive. Nonzero ->
     /// larger changes keep the ordinary cadence.
+    ///
+    /// Only a periodic (non-forced) Full ACK arms this. A Light ACK carries
+    /// no window, and a forced reopen ACK that still advertised zero
+    /// (DATA arrived first) leaves the next periodic Full ACK to re-advertise
+    /// it. Otherwise the Full ACK rate followed packets / 64 for a Light
+    /// ACK, or the application's consume rate for a peer that refills each
+    /// freed slot at once, and outran the ACKACK history.
     pub fn receive_window_reopened(&self) -> bool {
-        self.last_advertised_buffer == 0 && self.available_buffer_packets() > 0
+        self.window_reopen_armed && self.available_buffer_packets() > 0
     }
 
     fn generate_ack_inner(&mut self, now: Timestamp, force_full: bool) -> AckPacket {
@@ -1752,6 +1797,7 @@ impl ReceiverBuffer {
             self.ack_number = self.ack_number.wrapping_add(1);
             self.ack_timestamps
                 .record(self.ack_number, now, self.expected_seq);
+            self.window_reopen_armed = !force_full && self.available_buffer_packets() == 0;
         }
         self.last_advertised_buffer = self.available_buffer_packets();
 
@@ -2747,6 +2793,140 @@ mod tests {
         }
     }
 
+    /// The documented ACKACK history: the last 256 Full ACKs, which is at
+    /// least one second at two Full ACKs per 10 ms interval.
+    const ACKACK_HISTORY_ACKS: u32 = 256;
+
+    /// RTT after one ACKACK sample, per the §4.10 EWMA in `handle_ackack`.
+    fn smoothed_rtt(rtt: u32, sample: u32) -> u32 {
+        rtt * 7 / 8 + sample / 8
+    }
+
+    /// A receiver with no TSBPD, so an ACKACK only updates RTT and
+    /// ACK suppression.
+    fn ackack_receiver() -> ReceiverBuffer {
+        let mut receiver = ReceiverBuffer::new(1000, 120, Timestamp::from_micros(0), 0);
+        receiver.set_tsbpd_enabled(false);
+        receiver
+    }
+
+    /// Send `count` Full ACKs `spacing_us` apart, the first at `first_us`.
+    /// Returns the time of the last one.
+    fn send_full_acks(
+        receiver: &mut ReceiverBuffer,
+        first_us: u64,
+        spacing_us: u64,
+        count: u64,
+    ) -> Timestamp {
+        let mut now = Timestamp::from_micros(first_us);
+        for index in 0..count {
+            now = Timestamp::from_micros(first_us + index * spacing_us);
+            assert!(!receiver.generate_full_ack(now).is_light);
+        }
+        now
+    }
+
+    /// Deliver an ACKACK and assert it takes an RTT sample of exactly
+    /// `sample_us` and confirms `ack_number` for ACK suppression.
+    fn assert_ackack_samples(
+        receiver: &mut ReceiverBuffer,
+        ack_number: u32,
+        now: Timestamp,
+        sample_us: u32,
+    ) {
+        let before = receiver.rtt();
+        assert!(receiver.ack_number_was_sent(ack_number));
+        receiver.handle_ackack(ack_number, 0, now);
+        assert_eq!(
+            receiver.rtt(),
+            smoothed_rtt(before, sample_us),
+            "ACKACK #{ack_number} must take an RTT sample of {sample_us} us"
+        );
+        assert_eq!(receiver.last_ackacked_number, Some(ack_number));
+    }
+
+    /// Deliver an ACKACK for a sent ACK that has left the history: it is
+    /// still valid input, but yields no RTT sample and no suppression update.
+    fn assert_ackack_evicted(receiver: &mut ReceiverBuffer, ack_number: u32, now: Timestamp) {
+        let (rtt, rtt_var) = (receiver.rtt(), receiver.rtt_var());
+        let suppression = (receiver.last_ackacked_number, receiver.last_ackacked_seq);
+        assert!(receiver.ack_number_was_sent(ack_number));
+        receiver.handle_ackack(ack_number, 0, now);
+        assert_eq!((receiver.rtt(), receiver.rtt_var()), (rtt, rtt_var));
+        assert_eq!(
+            (receiver.last_ackacked_number, receiver.last_ackacked_seq),
+            suppression
+        );
+    }
+
+    /// More than 16 later Full ACKs must not cost the RTT sample of an
+    /// ACKACK that arrives a 250 ms round trip later (§4.10).
+    #[test]
+    fn ackack_after_many_later_full_acks_still_samples_rtt() {
+        let mut receiver = ackack_receiver();
+        send_full_acks(&mut receiver, 10_000, 10_000, 1);
+        assert_eq!(receiver.ack_number(), 1);
+        send_full_acks(&mut receiver, 20_000, 10_000, 24);
+        assert_eq!(receiver.ack_number(), 25);
+
+        assert_ackack_samples(&mut receiver, 1, Timestamp::from_micros(260_000), 250_000);
+    }
+
+    /// The history horizon is a count of Full ACKs, not wall time: the
+    /// oldest retained ACK samples RTT and the one before it does not, at
+    /// the default 10 ms cadence and at a coalesced 40 ms cadence alike.
+    #[test]
+    fn ackack_history_horizon_is_counted_in_full_acks() {
+        for spacing in [10_000u64, 40_000] {
+            let mut receiver = ackack_receiver();
+            let horizon = u64::from(ACKACK_HISTORY_ACKS);
+
+            // ACK #1 is the oldest of exactly `horizon` Full ACKs.
+            let last = send_full_acks(&mut receiver, spacing, spacing, horizon);
+            let now = last.add_micros(1_000);
+            let sample = (now.as_micros() - spacing) as u32;
+            assert_ackack_samples(&mut receiver, 1, now, sample);
+
+            // Two more Full ACKs: #3 is now the oldest retained, #2 is just
+            // outside the horizon.
+            let last = send_full_acks(&mut receiver, last.as_micros() + spacing, spacing, 2);
+            let now = last.add_micros(1_000);
+            assert_ackack_evicted(&mut receiver, 2, now);
+            let sample = (now.as_micros() - 3 * spacing) as u32;
+            assert_ackack_samples(&mut receiver, 3, now, sample);
+        }
+    }
+
+    /// ACK identity is all 32 bits across `u32::MAX -> 0`: two ACKs that
+    /// share a slot in different generations never alias.
+    #[test]
+    fn ackack_history_keeps_exact_identity_across_the_ack_number_wrap() {
+        let mut receiver = ackack_receiver();
+        let first = u32::MAX - 2;
+        receiver.ack_number = first.wrapping_sub(1);
+        let horizon = ACKACK_HISTORY_ACKS;
+        let spacing = 10_000u64;
+        let send_time = |ack_number: u32| spacing * (1 + u64::from(ack_number.wrapping_sub(first)));
+
+        // A full history whose oldest entry is `first`, straddling the wrap.
+        let last = send_full_acks(&mut receiver, send_time(first), spacing, u64::from(horizon));
+        assert_eq!(receiver.ack_number(), first.wrapping_add(horizon - 1));
+        let now = last.add_micros(1_000);
+        for ack_number in [u32::MAX, 1] {
+            let sample = (now.as_micros() - send_time(ack_number)) as u32;
+            assert_ackack_samples(&mut receiver, ack_number, now, sample);
+        }
+
+        // The next ACK takes `first`'s slot in the next generation.
+        let reuse = first.wrapping_add(horizon);
+        assert_eq!(reuse & (horizon - 1), first & (horizon - 1));
+        let last = send_full_acks(&mut receiver, send_time(reuse), spacing, 1);
+        assert_eq!(receiver.ack_number(), reuse);
+        let now = last.add_micros(1_000);
+        assert_ackack_evicted(&mut receiver, first, now);
+        assert_ackack_samples(&mut receiver, reuse, now, 1_000);
+    }
+
     /// Spec §4.8.1: after an ACKACK confirms the current position, periodic
     /// ACK generation is suppressed until the position or the advertised
     /// buffer space changes. Mirrors libsrt's `m_iRcvLastAckAck == ack`
@@ -2867,67 +3047,34 @@ mod tests {
         assert_eq!(tracker.get_acked_seq(2), Some(222));
     }
 
+    /// The 4 KiB backing is allocated by the first Full ACK, and an unused
+    /// slot matches no ACK number: neither zero (which a wrapped counter
+    /// assigns) nor the value the slot was initialised with.
     #[test]
-    fn test_ack_timestamp_tracker_max_entries() {
-        let mut tracker = AckTimestampTracker::new();
-
-        // MAX_ENTRIES (16) を超えるエントリを追加
-        for i in 0..20u32 {
-            tracker.record(i, Timestamp::from_micros(i as u64 * 1000), i * 10);
-        }
-
-        // 古いエントリは削除される (0-3 が削除される)
-        assert_eq!(tracker.get_send_time(0), None);
-        assert_eq!(tracker.get_send_time(3), None);
-        assert_eq!(tracker.get_acked_seq(0), None);
-        assert_eq!(tracker.get_acked_seq(3), None);
-
-        // 新しいエントリは残る
-        assert!(tracker.get_send_time(4).is_some());
-        assert!(tracker.get_send_time(19).is_some());
-        assert!(tracker.get_acked_seq(19).is_some());
-    }
-
-    #[test]
-    fn ack_timestamp_tracker_uses_one_fixed_lazy_backing() {
+    fn ack_timestamp_tracker_allocates_lazily_and_unused_slots_never_match() {
         let mut tracker = AckTimestampTracker::new();
         assert!(tracker.entries.is_none());
+        assert_eq!(tracker.get_send_time(0), None);
 
-        tracker.record(1, Timestamp::from_micros(1), 100);
+        let sent = Timestamp::from_micros(1);
+        tracker.record(1, sent, 100);
         let bytes = std::mem::size_of_val(
             tracker
                 .entries
                 .as_deref()
                 .expect("the first ACK allocates the fixed backing"),
         );
-        assert_eq!(bytes, 256);
-    }
+        assert_eq!(bytes, 4096);
 
-    #[test]
-    fn ack_timestamp_tracker_evicts_by_age_across_number_wrap() {
-        let mut tracker = AckTimestampTracker::new();
-        let first = u32::MAX - 7;
-
-        for offset in 0..20u32 {
-            let ack_number = first.wrapping_add(offset);
-            tracker.record(
-                ack_number,
-                Timestamp::from_micros(u64::from(offset)),
-                offset,
-            );
+        let slots = 0..MAX_ACK_TIMESTAMPS as u32;
+        for ack_number in slots.clone().chain(slots.map(|slot| !slot)) {
+            if ack_number != 1 {
+                assert_eq!(tracker.get_send_time(ack_number), None, "ACK #{ack_number}");
+                assert_eq!(tracker.get_acked_seq(ack_number), None, "ACK #{ack_number}");
+            }
         }
-
-        for offset in 0..4u32 {
-            assert_eq!(tracker.get_send_time(first.wrapping_add(offset)), None);
-        }
-        for offset in 4..20u32 {
-            let ack_number = first.wrapping_add(offset);
-            assert_eq!(
-                tracker.get_send_time(ack_number),
-                Some(Timestamp::from_micros(u64::from(offset)))
-            );
-            assert_eq!(tracker.get_acked_seq(ack_number), Some(offset));
-        }
+        assert_eq!(tracker.get_send_time(1), Some(sent));
+        assert_eq!(tracker.get_acked_seq(1), Some(100));
     }
 
     #[test]
