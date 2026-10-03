@@ -1,3 +1,4 @@
+use srt_proto::group::GroupPacket;
 use srt_proto::wire::{ControlPacket, ControlType, SrtPacket};
 use srt_proto::{
     ConnectionOptions, ConnectionOutput, ConnectionState, GroupMemberState, GroupMode,
@@ -200,16 +201,19 @@ fn broadcast_backpressure_requalifies_the_recovered_leg() {
         listener_a.feed_recv_buf(&packet, ts(102_000)).unwrap();
         while listener_a.poll_event().is_some() {}
     }
-    listener_a.handle_timer(TimerId::Ack, ts(103_000)).unwrap();
+    // The first stalled packet already sent a DATA-path Full ACK at 102 ms;
+    // like libsrt's `checkACKTimer`, the next Full ACK (carrying the final
+    // position) is due one ACK interval later.
+    listener_a.handle_timer(TimerId::Ack, ts(112_000)).unwrap();
     transfer(
         &mut listener_a,
         group.member_mut(1).unwrap().connection_mut(),
-        ts(103_000),
+        ts(112_000),
     );
 
     assert!(group.can_send());
     assert_eq!(group.member(1).unwrap().state(), GroupMemberState::Active);
-    assert_eq!(group.send(b"rejoined", ts(104_000)).unwrap(), 2);
+    assert_eq!(group.send(b"rejoined", ts(113_000)).unwrap(), 2);
 }
 
 #[test]
@@ -608,84 +612,198 @@ fn backup_removal_promotes_highest_weight_with_stable_tie_break() {
     assert_eq!(group.member(5).unwrap().state(), GroupMemberState::Standby);
 }
 
-#[test]
-fn removed_pending_owner_cannot_alias_a_reused_member_id() {
-    const WINDOW: u32 = 32;
-    let options = |initial_seq| ConnectionOptions {
+const REMOVAL_WINDOW: u32 = 32;
+
+fn removal_options(initial_seq: u32) -> ConnectionOptions {
+    ConnectionOptions {
         initial_seq: Some(initial_seq),
         tsbpd_delay: 0,
-        flow_window_packets: WINDOW,
-        receive_buffer_packets: WINDOW,
+        flow_window_packets: REMOVAL_WINDOW,
+        receive_buffer_packets: REMOVAL_WINDOW,
         ..ConnectionOptions::default()
-    };
-    let (mut gap_source, gap_member) = establish_pair_with_options(options(100));
-    let (mut old_source, old_member) = establish_pair_with_options(options(102));
-    let mut group = SrtGroup::new(0x4000_001d, GroupMode::Broadcast).unwrap();
-    group.add_member(1, 1, old_member).unwrap();
-    group.add_member(2, 1, gap_member).unwrap();
-
-    gap_source.send(b"start", ts(100_000)).unwrap();
-    transfer_to_group_member(&mut gap_source, &mut group, 2, ts(110_000));
-    assert_eq!(group.poll_data(ts(120_000)).unwrap().sequence_number, 100);
-
-    old_source.send(b"future", ts(120_001)).unwrap();
-    transfer_to_group_member(&mut old_source, &mut group, 1, ts(120_001));
-    assert!(group.poll_data(ts(120_001)).is_none());
-
-    let removed = group.remove_member_connection(1).unwrap();
-    assert_eq!(
-        removed.receiver_stats().unwrap().available_buffer_packets,
-        WINDOW
-    );
-    let (_replacement_source, replacement) = establish_pair_with_options(options(102));
-    group.add_member(1, 1, replacement).unwrap();
-
-    gap_source.send(b"close gap", ts(130_000)).unwrap();
-    transfer_to_group_member(&mut gap_source, &mut group, 2, ts(130_000));
-    assert_eq!(group.poll_data(ts(140_000)).unwrap().sequence_number, 101);
-    assert!(group.poll_data(ts(140_000)).is_none());
-    assert_eq!(
-        group
-            .member(1)
-            .unwrap()
-            .connection()
-            .receiver_stats()
-            .unwrap()
-            .available_buffer_packets,
-        WINDOW
-    );
+    }
 }
 
-#[test]
-fn member_churn_cannot_accumulate_uncharged_pending_payloads() {
-    let options = |initial_seq| ConnectionOptions {
-        initial_seq: Some(initial_seq),
-        tsbpd_delay: 0,
-        flow_window_packets: 32,
-        receive_buffer_packets: 32,
-        ..ConnectionOptions::default()
-    };
-    let (mut gap_source, gap_member) = establish_pair_with_options(options(100));
-    let mut group = SrtGroup::new(0x4000_001e, GroupMode::Broadcast).unwrap();
-    group.add_member(2, 1, gap_member).unwrap();
+fn available_window(connection: &SrtConnection) -> u32 {
+    connection
+        .receiver_stats()
+        .expect("connected member has a receiver")
+        .available_buffer_packets
+}
 
+fn member_window(group: &SrtGroup, member_id: u32) -> u32 {
+    available_window(group.member(member_id).expect("group member").connection())
+}
+
+/// A group whose logical stream waits at sequence 101: member 2 delivered
+/// 100 and will later fill the gap.
+fn group_waiting_at_101(group_id: u32) -> (SrtGroup, SrtConnection) {
+    let (mut gap_source, gap_member) = establish_pair_with_options(removal_options(100));
+    let mut group = SrtGroup::new(group_id, GroupMode::Broadcast).unwrap();
+    group.add_member(2, 1, gap_member).unwrap();
     gap_source.send(b"start", ts(100_000)).unwrap();
     transfer_to_group_member(&mut gap_source, &mut group, 2, ts(110_000));
-    assert_eq!(group.poll_data(ts(120_000)).unwrap().sequence_number, 100);
+    assert_eq!(
+        next_data(&mut group, ts(120_000)).unwrap().sequence_number,
+        100
+    );
+    (group, gap_source)
+}
 
-    for iteration in 0..32 {
-        let (mut source, member) = establish_pair_with_options(options(102));
+/// The next logical payload. One `poll_data` visit collects member events
+/// round-robin and may return before reaching the member that holds the
+/// next sequence, so poll once per possible member before calling it absent.
+fn next_data(group: &mut SrtGroup, now: Timestamp) -> Option<GroupPacket> {
+    (0..=srt_proto::MAX_GROUP_MEMBERS).find_map(|_| group.poll_data(now))
+}
+
+/// Feed only the DATA packets whose sequence is in `sequences`.
+fn transfer_sequences_to_group_member(
+    source: &mut SrtConnection,
+    group: &mut SrtGroup,
+    member_id: u32,
+    sequences: std::ops::RangeInclusive<u32>,
+    now: Timestamp,
+) {
+    for packet in packets_from(source) {
+        if matches!(SrtPacket::decode(&packet), Ok(SrtPacket::Data(data)) if sequences.contains(&data.sequence_number))
+        {
+            group
+                .member_mut(member_id)
+                .expect("group member")
+                .connection_mut()
+                .feed_recv_buf(&packet, now)
+                .expect("packet should decode");
+        }
+    }
+}
+
+/// A complete payload the group already collected from a member belongs to
+/// the group. Removing that member -- by either API -- must not lose it: it
+/// is delivered once, in order, after the gap fills. An incomplete message
+/// on the removed leg never becomes deliverable, and the removed leg's
+/// reservation is released exactly once, at detach, so a later poll cannot
+/// release it again into a member that reuses the ID.
+#[test]
+fn removed_member_complete_pending_payload_is_delivered_once_in_order() {
+    for return_connection in [false, true] {
+        let (mut group, mut gap_source) = group_waiting_at_101(0x4000_001d);
+        let (mut ahead_source, ahead_member) = establish_pair_with_options(removal_options(102));
+        group.add_member(1, 1, ahead_member).unwrap();
+
+        // Member 1 holds complete 102 behind the gap, plus only the first
+        // fragment of a 103..=105 message.
+        ahead_source.send(b"held", ts(120_001)).unwrap();
+        ahead_source
+            .send_message(&[0x66; 3_000], ts(120_002))
+            .unwrap();
+        transfer_sequences_to_group_member(
+            &mut ahead_source,
+            &mut group,
+            1,
+            102..=103,
+            ts(120_002),
+        );
+        assert!(next_data(&mut group, ts(120_002)).is_none());
+        assert_eq!(member_window(&group, 1), REMOVAL_WINDOW - 2);
+
+        if return_connection {
+            let removed = group.remove_member_connection(1).unwrap();
+            // The held payload's reservation came back; the incomplete
+            // fragment is still the leg's own.
+            assert_eq!(available_window(&removed), REMOVAL_WINDOW - 1);
+        } else {
+            assert!(group.remove_member(1));
+        }
+        let (_replacement_source, replacement) = establish_pair_with_options(removal_options(106));
+        group.add_member(1, 1, replacement).unwrap();
+
+        gap_source.send(b"fill", ts(130_000)).unwrap();
+        transfer_to_group_member(&mut gap_source, &mut group, 2, ts(130_000));
+        let filled = next_data(&mut group, ts(140_000)).unwrap();
+        assert_eq!(
+            (filled.sequence_number, filled.payload.as_ref()),
+            (101, &b"fill"[..])
+        );
+        let held = next_data(&mut group, ts(140_000))
+            .expect("the removed member's complete payload survives removal");
+        assert_eq!(
+            (held.sequence_number, held.member_id, held.packet_count),
+            (102, 1, 1)
+        );
+        assert_eq!(held.payload.as_ref(), b"held");
+        assert!(next_data(&mut group, ts(140_000)).is_none());
+        assert!(next_data(&mut group, ts(150_000)).is_none());
+        assert_eq!(member_window(&group, 1), REMOVAL_WINDOW);
+        assert_eq!(member_window(&group, 2), REMOVAL_WINDOW);
+    }
+}
+
+/// A group-owned payload overlapped by a longer delivered message is
+/// retired by the ordinary poll rule, and releases nothing: its reservation
+/// already went back when its member was removed.
+#[test]
+fn removed_member_pending_overlap_retires_without_a_second_release() {
+    let (mut group, mut gap_source) = group_waiting_at_101(0x4000_001f);
+    let (mut single_source, single_member) = establish_pair_with_options(removal_options(103));
+    let (mut long_source, long_member) = establish_pair_with_options(removal_options(102));
+    group.add_member(1, 1, single_member).unwrap();
+    group.add_member(3, 1, long_member).unwrap();
+
+    single_source.send(b"overlap-103", ts(120_001)).unwrap();
+    transfer_to_group_member(&mut single_source, &mut group, 1, ts(120_001));
+    long_source
+        .send_message(&[0x77; 3_000], ts(120_001))
+        .unwrap();
+    transfer_to_group_member(&mut long_source, &mut group, 3, ts(120_001));
+    assert!(next_data(&mut group, ts(120_001)).is_none());
+
+    assert!(group.remove_member(1));
+    let (_replacement_source, replacement) = establish_pair_with_options(removal_options(106));
+    group.add_member(1, 1, replacement).unwrap();
+
+    gap_source.send(b"fill", ts(130_000)).unwrap();
+    transfer_to_group_member(&mut gap_source, &mut group, 2, ts(130_000));
+    assert_eq!(
+        next_data(&mut group, ts(140_000)).unwrap().sequence_number,
+        101
+    );
+    let long = next_data(&mut group, ts(140_000)).unwrap();
+    assert_eq!((long.sequence_number, long.packet_count), (102, 3));
+    assert!(next_data(&mut group, ts(140_000)).is_none());
+    assert_eq!(member_window(&group, 1), REMOVAL_WINDOW);
+    assert_eq!(member_window(&group, 3), REMOVAL_WINDOW);
+}
+
+/// Payloads the group keeps for removed members are charged to no member
+/// window, so member churn cannot grow them past the largest member
+/// receive window. The ones nearest delivery are kept.
+#[test]
+fn member_churn_cannot_accumulate_uncharged_pending_payloads() {
+    const CHURNED: u32 = REMOVAL_WINDOW + 8;
+    let (mut group, mut gap_source) = group_waiting_at_101(0x4000_001e);
+
+    for offset in 0..CHURNED {
+        let sequence = 102 + offset;
+        let (mut source, member) = establish_pair_with_options(removal_options(sequence));
         group.add_member(1, 1, member).unwrap();
-        source.send(&[iteration], ts(120_001)).unwrap();
+        source.send(&sequence.to_be_bytes(), ts(120_001)).unwrap();
         transfer_to_group_member(&mut source, &mut group, 1, ts(120_001));
-        assert!(group.poll_data(ts(120_001)).is_none());
+        assert!(next_data(&mut group, ts(120_001)).is_none());
         assert!(group.remove_member(1));
     }
 
     gap_source.send(b"close gap", ts(130_000)).unwrap();
     transfer_to_group_member(&mut gap_source, &mut group, 2, ts(130_000));
-    assert_eq!(group.poll_data(ts(140_000)).unwrap().sequence_number, 101);
-    assert!(group.poll_data(ts(140_000)).is_none());
+    for expected in 101..102 + REMOVAL_WINDOW {
+        let packet = next_data(&mut group, ts(140_000)).unwrap();
+        assert_eq!(packet.sequence_number, expected);
+        if expected > 101 {
+            assert_eq!(packet.payload.as_ref(), expected.to_be_bytes());
+        }
+    }
+    assert!(next_data(&mut group, ts(140_000)).is_none());
+    assert_eq!(member_window(&group, 2), REMOVAL_WINDOW);
 }
 
 #[test]

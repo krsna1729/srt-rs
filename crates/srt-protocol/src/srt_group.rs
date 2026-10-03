@@ -56,7 +56,8 @@ pub enum GroupMemberState {
 /// the member and sequence it arrived on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupPacket {
-    /// The member the payload was received on.
+    /// The member the payload was received on. Origin metadata only: the
+    /// payload stays deliverable after that member is removed.
     pub member_id: u32,
     /// The group-logical sequence number.
     pub sequence_number: u32,
@@ -82,6 +83,17 @@ pub struct GroupDataPoll {
     /// The visit reached its lifecycle-event limit. Call the bounded method
     /// again immediately before waiting for new socket input.
     pub continuation: bool,
+}
+
+/// A complete logical payload waiting in [`SrtGroup`] behind a sequence gap.
+#[derive(Debug)]
+struct PendingGroupPacket {
+    packet: GroupPacket,
+    /// Whether `packet.member_id` still holds a receive reservation for this
+    /// payload. Cleared when that member is removed, which releases the
+    /// reservation then: the group owns the payload outright, and delivering
+    /// or retiring it later releases nothing.
+    reserved: bool,
 }
 
 /// One physical-leg event observed while driving an SRT group.
@@ -193,7 +205,7 @@ pub struct SrtGroup {
     members: Vec<SrtGroupMember>,
     next_send_sequence: Option<u32>,
     next_receive_sequence: Option<u32>,
-    pending: BTreeMap<u32, GroupPacket>,
+    pending: BTreeMap<u32, PendingGroupPacket>,
     events: std::collections::VecDeque<GroupEvent>,
     next_event_member: usize,
     /// The remote receiving group this group is bound to, set by the first
@@ -361,50 +373,93 @@ impl SrtGroup {
     /// Remove one member from the group without returning its connection.
     /// Use [`Self::remove_member_connection`] when the caller still owns the
     /// leg's socket/timers and needs the protocol core back.
+    ///
+    /// Complete payloads already collected from the member stay pending and
+    /// are delivered in order like any other.
     pub fn remove_member(&mut self, member_id: u32) -> bool {
-        let Some(index) = self
-            .members
-            .iter()
-            .position(|member| member.id == member_id)
-        else {
-            return false;
-        };
-        self.purge_member_pending(member_id);
-        self.members.remove(index);
-        self.next_event_member = self
-            .next_event_member
-            .min(self.members.len().saturating_sub(1));
-        true
+        self.remove_member_connection(member_id).is_some()
     }
 
     /// Remove a member and return its protocol core to the transport that
     /// owns the socket and timers for that leg.
+    ///
+    /// Complete payloads already collected from the member stay pending and
+    /// are delivered in order like any other; their receive reservation is
+    /// returned to the connection here, once. Incomplete messages are still
+    /// the connection's own and never reach the group.
     pub fn remove_member_connection(&mut self, member_id: u32) -> Option<SrtConnection> {
         let index = self
             .members
             .iter()
             .position(|member| member.id == member_id)?;
-        let reserved_packets = self.purge_member_pending(member_id);
-        self.members[index]
-            .connection
-            .release_data_reservation(reserved_packets);
-        let connection = self.members.remove(index).connection;
+        let mut member = self.members.remove(index);
         self.next_event_member = self
             .next_event_member
             .min(self.members.len().saturating_sub(1));
-        Some(connection)
+        let reserved_packets = self.detach_member_pending(member_id);
+        member.connection.release_data_reservation(reserved_packets);
+        self.bound_group_owned_pending(member.connection.receive_window_packets());
+        Some(member.connection)
     }
 
-    fn purge_member_pending(&mut self, member_id: u32) -> u32 {
+    /// Take ownership of every pending payload `member_id` holds a
+    /// reservation for, returning how many packet positions it held.
+    fn detach_member_pending(&mut self, member_id: u32) -> u32 {
         let mut packet_count = 0u32;
-        self.pending.retain(|_, packet| {
-            if packet.member_id != member_id {
-                return true;
+        for pending in self.pending.values_mut() {
+            if pending.reserved && pending.packet.member_id == member_id {
+                pending.reserved = false;
+                packet_count = packet_count.saturating_add(pending.packet.packet_count);
             }
-            packet_count = packet_count.saturating_add(packet.packet_count);
-            false
-        });
+        }
         packet_count
+    }
+
+    /// Keep group-owned payloads within the largest member receive window.
+    ///
+    /// They are charged to no member window, so without this, member churn
+    /// behind a gap that never fills could retain them without bound. One
+    /// removal never exceeds it (a member holds at most its own window); the
+    /// payloads farthest from delivery are retired first.
+    fn bound_group_owned_pending(&mut self, removed_window: u32) {
+        let limit = self
+            .members
+            .iter()
+            .map(|member| member.connection.receive_window_packets())
+            .fold(removed_window, u32::max);
+        let mut owned: Vec<(u32, u32)> = self
+            .pending
+            .iter()
+            .filter(|(_, pending)| !pending.reserved)
+            .map(|(&sequence, pending)| (sequence, pending.packet.packet_count))
+            .collect();
+        let mut held = owned
+            .iter()
+            .fold(0u32, |held, &(_, count)| held.saturating_add(count));
+        if held <= limit {
+            return;
+        }
+        let base = self.next_receive_sequence.unwrap_or_else(|| {
+            self.pending
+                .keys()
+                .copied()
+                .reduce(|left, right| {
+                    if sequence_less_than(right, left) {
+                        right
+                    } else {
+                        left
+                    }
+                })
+                .unwrap_or_default()
+        });
+        owned.sort_unstable_by_key(|&(sequence, _)| sequence.wrapping_sub(base) & 0x7FFF_FFFF);
+        while held > limit {
+            let Some((sequence, count)) = owned.pop() else {
+                break;
+            };
+            self.pending.remove(&sequence);
+            held -= count;
+        }
     }
 
     /// Send one payload through the group per its [`GroupMode`]. Returns the
@@ -596,19 +651,19 @@ impl SrtGroup {
         })?;
         self.next_receive_sequence = Some(next);
         let packet = self.pending.remove(&next)?;
-        let following = next.wrapping_add(packet.packet_count) & 0x7FFF_FFFF;
+        let following = next.wrapping_add(packet.packet.packet_count) & 0x7FFF_FFFF;
         self.next_receive_sequence = Some(following);
-        self.release_member_data_reservation(packet.member_id, packet.packet_count);
-        for offset in 1..packet.packet_count {
+        self.release_pending_reservation(&packet);
+        for offset in 1..packet.packet.packet_count {
             let stale_sequence = next.wrapping_add(offset) & 0x7FFF_FFFF;
             if let Some(stale) = self.pending.remove(&stale_sequence) {
-                self.release_member_data_reservation(stale.member_id, stale.packet_count);
+                self.release_pending_reservation(&stale);
             }
         }
         for member in &mut self.members {
             member.connection.advance_receive_sequence(following, now);
         }
-        Some(GroupEvent::DataReceived(packet))
+        Some(GroupEvent::DataReceived(packet.packet))
     }
 
     fn send_broadcast(&mut self, payload: Bytes, now: Timestamp) -> Result<usize, Error> {
@@ -777,7 +832,10 @@ impl SrtGroup {
         else {
             return false;
         };
-        entry.insert(packet);
+        entry.insert(PendingGroupPacket {
+            packet,
+            reserved: true,
+        });
         true
     }
 
@@ -796,9 +854,17 @@ impl SrtGroup {
         }
     }
 
-    fn release_member_data_reservation(&mut self, member_id: u32, packet_count: u32) {
-        if let Some(member) = self.member_mut(member_id) {
-            member.connection.release_data_reservation(packet_count);
+    /// Return a delivered or retired payload's reservation to the member
+    /// holding it. A payload whose member was removed holds none: that
+    /// reservation was returned at detach.
+    fn release_pending_reservation(&mut self, pending: &PendingGroupPacket) {
+        if !pending.reserved {
+            return;
+        }
+        if let Some(member) = self.member_mut(pending.packet.member_id) {
+            member
+                .connection
+                .release_data_reservation(pending.packet.packet_count);
         }
     }
 
