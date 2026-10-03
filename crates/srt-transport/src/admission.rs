@@ -1864,19 +1864,12 @@ impl PeerTable {
             self.half_open_peers = self.half_open_peers.saturating_sub(1);
             self.established_peers += 1;
             self.half_open_deadlines.remove(&physical);
-            match self.promotion_decision(physical) {
-                // Leaving: it joins its bond group on the target, not here.
-                decision @ srt_lifecycle::PromotionDecision::RelocateTo(_) => {
-                    self.pending_promotions.push((physical, decision));
+            if self.relocation.is_some() {
+                if self.queue_promotion(physical) {
                     return Admit::Fed;
                 }
-                decision @ srt_lifecycle::PromotionDecision::PromoteHere => {
-                    self.pending_promotions.push((physical, decision));
-                    self.adopt_bonded_peer(physical);
-                }
-                srt_lifecycle::PromotionDecision::StayOnListener => {
-                    self.adopt_bonded_peer(physical);
-                }
+            } else {
+                self.adopt_bonded_peer(physical);
             }
         } else if !self
             .get_peer(&physical)
@@ -1889,6 +1882,28 @@ impl PeerTable {
         }
         self.mark_ready_physical(physical);
         Admit::Fed
+    }
+
+    /// The promotion ladder for a just-established peer of a relocating
+    /// layout, kept out of line so the per-datagram admission path stays as
+    /// small as without a layout. Returns `true` when the peer is leaving:
+    /// it joins its bond group on the target, not here.
+    #[cold]
+    #[inline(never)]
+    fn queue_promotion(&mut self, physical: PhysicalPeerKey) -> bool {
+        let decision = self.promotion_decision(physical);
+        match decision {
+            srt_lifecycle::PromotionDecision::RelocateTo(_) => {
+                self.pending_promotions.push((physical, decision));
+                return true;
+            }
+            srt_lifecycle::PromotionDecision::PromoteHere => {
+                self.pending_promotions.push((physical, decision));
+            }
+            srt_lifecycle::PromotionDecision::StayOnListener => {}
+        }
+        self.adopt_bonded_peer(physical);
+        false
     }
 
     /// The promotion ladder for a just-established peer. Without a layout
