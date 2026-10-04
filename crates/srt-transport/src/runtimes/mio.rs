@@ -532,7 +532,7 @@ impl Owner {
             )));
         }
         let prepared = config.prepare(crate::RuntimeFlavor::Mio)?;
-        crate::owner_layout::check_listener_topology(plan, &prepared)?;
+        let claim = crate::owner_layout::check_listener_topology(plan, &prepared)?;
         if !prepared.bind.is_ipv4() {
             // `sendmsg_batch` (every reply this owner ever sends) rejects a
             // non-IPv4 destination at the syscall boundary, and that
@@ -594,7 +594,7 @@ impl Owner {
             output_pending: false,
             event_pending: false,
             write_blocked: false,
-            routing: crate::owner_layout::ListenerRouting::new(&prepared, plan),
+            routing: crate::owner_layout::ListenerRouting::new(&prepared, plan, claim),
             promoted: PromotedSockets::default(),
         });
         Ok(())
@@ -2001,20 +2001,61 @@ mod owner_tests {
         }
     }
 
-    /// A shared caller that never retries its handshake inside a test: a
-    /// stranded CONCLUSION can only be rescued by forwarding.
-    fn no_retry_caller_config(remote: SocketAddr) -> crate::CallerConfig {
-        let mut config = shared_caller_config(remote);
-        config.session.handshake.retry_interval = Duration::from_secs(60);
-        config.session.handshake.timeout = Duration::from_secs(120);
-        config
+    /// One service visit of an Owner, listener events discarded.
+    fn visit(owner: &mut Owner, start: std::time::Instant) {
+        owner
+            .poll_io(Some(Duration::from_micros(200)), || now_ts(start))
+            .expect("poll_io");
+        owner
+            .drive(now_ts(start), OutputDrainBudget::default())
+            .expect("drive");
+        let mut events = Vec::new();
+        owner.poll_listener_events(&mut events);
+    }
+
+    fn connected_callers(callers: &mut [(Owner, crate::LogicalCallerId)]) -> usize {
+        callers
+            .iter_mut()
+            .map(|(owner, id)| owner.caller_mut(*id).and_then(|c| c.state()))
+            .filter(|state| *state == Some(LogicalCallerState::Connected))
+            .count()
+    }
+
+    /// One round of a layout as an application drives it: every member and
+    /// caller visited, then the members' transfers delivered. Returns how
+    /// many transfers moved.
+    fn layout_round(
+        members: &mut [Owner],
+        callers: &mut [(Owner, crate::LogicalCallerId)],
+        start: std::time::Instant,
+    ) -> usize {
+        for member in members.iter_mut() {
+            visit(member, start);
+        }
+        for (owner, _) in callers.iter_mut() {
+            visit(owner, start);
+        }
+        let mut transfers = Vec::new();
+        for member in members.iter_mut() {
+            member.poll_listener_transfers(&mut transfers);
+        }
+        let moved = transfers.len();
+        for transfer in transfers {
+            let to = transfer.to;
+            members[to].accept_listener_transfer(transfer, now_ts(start));
+        }
+        moved
     }
 
     /// Same scenario as the Compio Owner's: callers send INDUCTION to a
-    /// one-member group, the second member joins (rehash), and forwarded
-    /// CONCLUSIONs still connect every caller.
+    /// complete two-member group, a transient extra member rehashes the group
+    /// (as a promotion's bind does), and forwarded CONCLUSIONs still connect
+    /// every caller.
     #[test]
     fn reuseport_members_forward_rehashed_conclusions() {
+        // Growing a group from 2 to 3 moves about 1 in 6 of member 0's flows
+        // to member 1, so 48 callers make "none moved" a ~1e-4 event.
+        const CALLERS: usize = 48;
         let start = std::time::Instant::now();
         let port = std::net::UdpSocket::bind("127.0.0.1:0")
             .and_then(|probe| probe.local_addr())
@@ -2028,24 +2069,27 @@ mod owner_tests {
             .build()
             .expect("listener config");
         let plans = crate::owner_plans(&config, crate::RuntimeFlavor::Mio).expect("plans");
-        let tick = |owner: &mut Owner| {
-            owner
-                .poll_io(Some(Duration::from_micros(200)), || now_ts(start))
-                .expect("poll_io");
-            owner
-                .drive(now_ts(start), OutputDrainBudget::default())
-                .expect("drive");
-        };
         let mut members = vec![Owner::new().expect("owner")];
+        // Both members are bound before any caller: the layout admits only
+        // once complete. The rehash comes from a transient extra socket in
+        // the group, which is what a Relocate promotion's bind does.
+        for plan in &plans[1..] {
+            members.push(Owner::new().expect("owner"));
+            members
+                .last_mut()
+                .expect("member")
+                .listen_planned(plan, None)
+                .expect("member");
+        }
         members[0]
             .listen_planned(&plans[0], None)
             .expect("member 0");
         let remote = SocketAddr::from(([127, 0, 0, 1], port));
-        let mut callers: Vec<_> = (0..16)
+        let mut callers: Vec<_> = (0..CALLERS)
             .map(|_| {
                 let mut owner = Owner::new().expect("owner");
                 let PoolOutcome::Admitted(id) = owner
-                    .connect(&no_retry_caller_config(remote), now_ts(start))
+                    .connect(&retrying_caller_config(remote), now_ts(start))
                     .expect("connect")
                 else {
                     panic!("admitted")
@@ -2053,57 +2097,145 @@ mod owner_tests {
                 (owner, id)
             })
             .collect();
-        // INDUCTION out, member 0 replies, no CONCLUSION before member 1.
+        // INDUCTION out, the members reply, then the group grows by one
+        // socket before any CONCLUSION.
         for (owner, _) in &mut callers {
             owner
                 .drive(now_ts(start), OutputDrainBudget::default())
                 .expect("drive");
         }
         for _ in 0..20 {
-            tick(&mut members[0]);
+            for member in &mut members {
+                visit(member, start);
+            }
         }
-        members.push(Owner::new().expect("owner"));
-        members[1]
-            .listen_planned(&plans[1], None)
-            .expect("member 1");
+        let mut transient =
+            Some(crate::owner_layout::relocation_test_support::transient_group_member(port));
+        let window = std::time::Instant::now() + Duration::from_secs(1);
 
         let mut forwarded = 0;
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let connected = |callers: &mut Vec<(Owner, crate::LogicalCallerId)>| {
-            callers
-                .iter_mut()
-                .map(|(owner, id)| owner.caller_mut(*id).and_then(|c| c.state()))
-                .filter(|state| *state == Some(LogicalCallerState::Connected))
-                .count()
-        };
-        while connected(&mut callers) < callers.len() && std::time::Instant::now() < deadline {
-            for member in &mut members {
-                tick(member);
-                let mut events = Vec::new();
-                member.poll_listener_events(&mut events);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while connected_callers(&mut callers) < callers.len()
+            && std::time::Instant::now() < deadline
+        {
+            if forwarded > 0 || std::time::Instant::now() >= window {
+                // The promotion completes: the group is back to its size.
+                drop(transient.take());
             }
-            for (owner, _) in &mut callers {
-                tick(owner);
-            }
-            let mut transfers = Vec::new();
-            for member in &mut members {
-                member.poll_listener_transfers(&mut transfers);
-            }
-            forwarded += transfers.len();
-            for transfer in transfers {
-                let to = transfer.to;
-                members[to].accept_listener_transfer(transfer, now_ts(start));
-            }
+            forwarded += layout_round(&mut members, &mut callers, start);
         }
         assert_eq!(
-            connected(&mut callers),
+            connected_callers(&mut callers),
             callers.len(),
             "every caller connects"
         );
         assert!(
             forwarded > 0,
-            "the rehash sent some CONCLUSIONs to member 1"
+            "the rehash sent some CONCLUSIONs to the other member"
         );
+    }
+
+    /// A caller that retries its handshake quickly, as a real one does.
+    fn retrying_caller_config(remote: SocketAddr) -> crate::CallerConfig {
+        let mut config = shared_caller_config(remote);
+        config.session.handshake.retry_interval = Duration::from_millis(100);
+        config.session.handshake.timeout = Duration::from_secs(10);
+        config
+    }
+
+    fn two_member_group(port: u16) -> Vec<crate::OwnerListenerPlan> {
+        let config = crate::ListenerConfig::builder(SocketAddr::from(([127, 0, 0, 1], port)))
+            .topology(crate::ListenerTopology::ReusePortMulti {
+                acceptors: crate::WorkerCount::Count(std::num::NonZeroUsize::new(2).unwrap()),
+            })
+            .configure_transport(|transport| transport.promotion = crate::PromotionPolicy::Never)
+            .build()
+            .expect("listener config");
+        crate::owner_plans(&config, crate::RuntimeFlavor::Mio).expect("plans")
+    }
+
+    /// A session admitted while the group is still growing would be hashed
+    /// to another member by the next member's bind and lose its data there
+    /// (`reuseport_rehash.rs`). So a member admits nothing until every member
+    /// is bound; callers retry and connect once the group is complete.
+    #[test]
+    fn a_reuseport_member_admits_nothing_until_the_group_is_complete() {
+        let start = std::time::Instant::now();
+        let port = crate::owner_layout::relocation_test_support::free_port();
+        let plans = two_member_group(port);
+        let mut members = vec![Owner::new().expect("owner")];
+        members[0]
+            .listen_planned(&plans[0], None)
+            .expect("member 0");
+        let remote = SocketAddr::from(([127, 0, 0, 1], port));
+        let mut callers: Vec<_> = (0..8)
+            .map(|_| {
+                let mut owner = Owner::new().expect("owner");
+                let PoolOutcome::Admitted(id) = owner
+                    .connect(&retrying_caller_config(remote), now_ts(start))
+                    .expect("connect")
+                else {
+                    panic!("admitted")
+                };
+                (owner, id)
+            })
+            .collect();
+        let half_open = std::time::Instant::now() + Duration::from_millis(500);
+        while std::time::Instant::now() < half_open {
+            layout_round(&mut members, &mut callers, start);
+        }
+        assert_eq!(
+            connected_callers(&mut callers),
+            0,
+            "no session before member 1 binds"
+        );
+        let drops = members[0]
+            .listener_telemetry()
+            .expect("listener")
+            .layout_incomplete_drops;
+        assert!(drops > 0, "the handshakes reached member 0 and were held");
+
+        members.push(Owner::new().expect("owner"));
+        members[1]
+            .listen_planned(&plans[1], None)
+            .expect("member 1");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while connected_callers(&mut callers) < callers.len()
+            && std::time::Instant::now() < deadline
+        {
+            layout_round(&mut members, &mut callers, start);
+        }
+        assert_eq!(
+            connected_callers(&mut callers),
+            callers.len(),
+            "callers retry and connect"
+        );
+    }
+
+    /// Each member binds one socket of the group: attaching a plan twice, or
+    /// a second layout on a live layout's address, would grow the group and
+    /// is refused before any bind; a started layout cannot take a member
+    /// back.
+    #[test]
+    fn reuseport_attaches_that_would_grow_a_live_group_are_refused() {
+        let port = crate::owner_layout::relocation_test_support::free_port();
+        let plans = two_member_group(port);
+        let mut first = Owner::new().expect("owner");
+        first.listen_planned(&plans[0], None).expect("member 0");
+        let duplicate = Owner::new().expect("owner").listen_planned(&plans[0], None);
+        assert!(duplicate.is_err(), "member 0 attached twice");
+        let other_layout = two_member_group(port);
+        let foreign = Owner::new()
+            .expect("owner")
+            .listen_planned(&other_layout[1], None);
+        assert!(foreign.is_err(), "second layout on a live address");
+
+        let mut second = Owner::new().expect("owner");
+        second.listen_planned(&plans[1], None).expect("member 1");
+        drop(second);
+        let rejoin = Owner::new().expect("owner").listen_planned(&plans[1], None);
+        assert!(rejoin.is_err(), "a started layout is sealed");
+        drop(first);
     }
 
     /// Bonded publishers whose legs the kernel hashes to different members

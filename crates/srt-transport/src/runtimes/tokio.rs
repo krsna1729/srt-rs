@@ -1456,7 +1456,7 @@ impl Owner {
             )));
         }
         let prepared = config.prepare(crate::RuntimeFlavor::Tokio)?;
-        crate::owner_layout::check_listener_topology(plan, &prepared)?;
+        let claim = crate::owner_layout::check_listener_topology(plan, &prepared)?;
         if !prepared.bind.is_ipv4() {
             // Same reasoning as the Mio owner: sendmsg_batch is IPv4-only
             // and one bad destination fails the whole shared batch.
@@ -1503,7 +1503,7 @@ impl Owner {
             output_pending: false,
             event_pending: false,
             write_blocked: false,
-            routing: crate::owner_layout::ListenerRouting::new(&prepared, plan),
+            routing: crate::owner_layout::ListenerRouting::new(&prepared, plan, claim),
             promoted: PromotedSockets::default(),
         });
         Ok(())
@@ -4093,18 +4093,72 @@ mod owner_tests {
 
     /// A shared caller that never retries its handshake inside a test: a
     /// stranded CONCLUSION can only be rescued by forwarding.
-    fn no_retry_caller_config(remote: SocketAddr) -> crate::CallerConfig {
+    /// A caller that retries its handshake quickly, as a real one does. A
+    /// retry repeats the CONCLUSION with the same cookie from the same
+    /// 4-tuple, so a CONCLUSION at the wrong member is still rescued only by
+    /// forwarding; the retry recovers ones lost to a transient group member.
+    fn retrying_caller_config(remote: SocketAddr) -> crate::CallerConfig {
         let mut config = shared_caller_config(remote);
-        config.session.handshake.retry_interval = Duration::from_secs(60);
-        config.session.handshake.timeout = Duration::from_secs(120);
+        config.session.handshake.retry_interval = Duration::from_millis(100);
+        config.session.handshake.timeout = Duration::from_secs(10);
         config
     }
 
+    async fn visit(owner: &mut Owner, start: std::time::Instant) {
+        owner
+            .run_once(
+                Duration::from_micros(200),
+                || now_ts(start),
+                OutputDrainBudget::default(),
+            )
+            .await
+            .expect("run_once");
+        let mut events = Vec::new();
+        owner.poll_listener_events(&mut events);
+    }
+
+    fn connected_callers(callers: &mut [(Owner, crate::LogicalCallerId)]) -> usize {
+        callers
+            .iter_mut()
+            .map(|(owner, id)| owner.caller_mut(*id).and_then(|c| c.state()))
+            .filter(|state| *state == Some(LogicalCallerState::Connected))
+            .count()
+    }
+
+    /// One round of a layout as an application drives it; returns how many
+    /// transfers moved between members.
+    async fn layout_round(
+        members: &mut [Owner],
+        callers: &mut [(Owner, crate::LogicalCallerId)],
+        start: std::time::Instant,
+    ) -> usize {
+        for member in members.iter_mut() {
+            visit(member, start).await;
+        }
+        for (owner, _) in callers.iter_mut() {
+            visit(owner, start).await;
+        }
+        let mut transfers = Vec::new();
+        for member in members.iter_mut() {
+            member.poll_listener_transfers(&mut transfers);
+        }
+        let moved = transfers.len();
+        for transfer in transfers {
+            let to = transfer.to;
+            members[to].accept_listener_transfer(transfer, now_ts(start));
+        }
+        moved
+    }
+
     /// Same scenario as the Compio and Mio Owners': callers send INDUCTION
-    /// to a one-member group, the second member joins (rehash), and
+    /// to a complete two-member group, a transient extra member rehashes it
+    /// (as a promotion's bind does), and
     /// forwarded CONCLUSIONs still connect every caller.
     #[test]
     fn reuseport_members_forward_rehashed_conclusions() {
+        // Growing a group from 2 to 3 moves about 1 in 6 of member 0's flows
+        // to member 1, so 48 callers make "none moved" a ~1e-4 event.
+        const CALLERS: usize = 48;
         test_runtime().block_on(async {
             let start = std::time::Instant::now();
             let port = std::net::UdpSocket::bind("127.0.0.1:0")
@@ -4121,80 +4175,63 @@ mod owner_tests {
                 .build()
                 .expect("listener config");
             let plans = crate::owner_plans(&config, crate::RuntimeFlavor::Tokio).expect("plans");
-            async fn tick(owner: &mut Owner, start: std::time::Instant) {
-                owner
-                    .run_once(
-                        Duration::from_micros(200),
-                        || now_ts(start),
-                        OutputDrainBudget::default(),
-                    )
-                    .await
-                    .expect("run_once");
-            }
-            let mut members = vec![Owner::new()];
-            members[0]
-                .listen_planned(&plans[0], None)
-                .expect("member 0");
+            // Both members are bound before any caller: the layout admits
+            // only once complete. The rehash comes from a transient extra
+            // socket in the group, which is what a Relocate promotion's bind
+            // does.
+            let mut members: Vec<Owner> = plans
+                .iter()
+                .map(|plan| {
+                    let mut owner = Owner::new();
+                    owner.listen_planned(plan, None).expect("member");
+                    owner
+                })
+                .collect();
             let remote = SocketAddr::from(([127, 0, 0, 1], port));
             let mut callers = Vec::new();
-            for _ in 0..16 {
+            for _ in 0..CALLERS {
                 let mut owner = Owner::new();
                 let PoolOutcome::Admitted(id) = owner
-                    .connect(&no_retry_caller_config(remote), now_ts(start))
+                    .connect(&retrying_caller_config(remote), now_ts(start))
                     .expect("connect")
                 else {
                     panic!("admitted")
                 };
                 callers.push((owner, id));
             }
-            // INDUCTION out, member 0 replies, no CONCLUSION before member 1.
+            // INDUCTION out, the members reply, then the group grows by one
+            // socket before any CONCLUSION.
             for (owner, _) in &mut callers {
-                tick(owner, start).await;
+                visit(owner, start).await;
             }
             for _ in 0..20 {
-                tick(&mut members[0], start).await;
+                for member in &mut members {
+                    visit(member, start).await;
+                }
             }
-            members.push(Owner::new());
-            members[1]
-                .listen_planned(&plans[1], None)
-                .expect("member 1");
+            let mut transient =
+                Some(crate::owner_layout::relocation_test_support::transient_group_member(port));
+            let window = std::time::Instant::now() + Duration::from_secs(1);
 
-            let connected = |callers: &mut Vec<(Owner, crate::LogicalCallerId)>| {
-                callers
-                    .iter_mut()
-                    .map(|(owner, id)| owner.caller_mut(*id).and_then(|c| c.state()))
-                    .filter(|state| *state == Some(LogicalCallerState::Connected))
-                    .count()
-            };
             let mut forwarded = 0;
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            while connected(&mut callers) < callers.len() && std::time::Instant::now() < deadline {
-                for member in &mut members {
-                    tick(member, start).await;
-                    let mut events = Vec::new();
-                    member.poll_listener_events(&mut events);
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while connected_callers(&mut callers) < callers.len()
+                && std::time::Instant::now() < deadline
+            {
+                if forwarded > 0 || std::time::Instant::now() >= window {
+                    // The promotion completes: the group is back to its size.
+                    drop(transient.take());
                 }
-                for (owner, _) in &mut callers {
-                    tick(owner, start).await;
-                }
-                let mut transfers = Vec::new();
-                for member in &mut members {
-                    member.poll_listener_transfers(&mut transfers);
-                }
-                forwarded += transfers.len();
-                for transfer in transfers {
-                    let to = transfer.to;
-                    members[to].accept_listener_transfer(transfer, now_ts(start));
-                }
+                forwarded += layout_round(&mut members, &mut callers, start).await;
             }
             assert_eq!(
-                connected(&mut callers),
+                connected_callers(&mut callers),
                 callers.len(),
                 "every caller connects"
             );
             assert!(
                 forwarded > 0,
-                "the rehash sent some CONCLUSIONs to member 1"
+                "the rehash sent some CONCLUSIONs to the other member"
             );
         });
     }

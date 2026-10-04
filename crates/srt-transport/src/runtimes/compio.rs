@@ -1511,7 +1511,7 @@ impl ListenerSide {
         sock: compio::net::UdpSocket,
         prepared: crate::PreparedListener,
     ) -> Result<Self, crate::RuntimeBuildError> {
-        Self::from_prepared_with_rx_mode(sock, prepared, OwnerRxMode::RawReadiness, 0, None)
+        Self::from_prepared_with_rx_mode(sock, prepared, OwnerRxMode::RawReadiness, 0, None, None)
     }
 
     /// Attach with an explicit receive mode. Under
@@ -1524,6 +1524,7 @@ impl ListenerSide {
         rx_mode: OwnerRxMode,
         managed_slot_len: usize,
         plan: Option<&OwnerListenerPlan>,
+        claim: Option<crate::reuseport_group::MemberClaim>,
     ) -> Result<Self, crate::RuntimeBuildError> {
         let poll_fd = make_poll_fd(&sock)?;
         let sock = Rc::new(sock);
@@ -1550,7 +1551,7 @@ impl ListenerSide {
                 },
             ),
             resolver: None,
-            routing: ListenerRouting::new(&prepared, plan),
+            routing: ListenerRouting::new(&prepared, plan, claim),
             promoted: PromotedSockets::default(),
         };
         if rx_mode == OwnerRxMode::ManagedMultishot {
@@ -3983,7 +3984,7 @@ impl Owner {
             )));
         }
         let prepared = config.prepare(crate::RuntimeFlavor::Compio)?;
-        check_listener_topology(plan, &prepared)?;
+        let claim = check_listener_topology(plan, &prepared)?;
         let payload_size = prepared.session.payload_size.resolve()?.get();
         // The listener adopts the cipher mode from the peer's KMREQ, so its
         // ceiling is the conservative bound for an encrypted session rather
@@ -4021,9 +4022,10 @@ impl Owner {
         let slot_len = managed_rx_buffer_len(self.wire_ceiling);
         // Construct first: a refused attach drops the bound socket and leaves
         // the Owner exactly as configurable as it was before the attempt.
-        let side =
-            ListenerSide::from_prepared_with_rx_mode(sock, prepared, rx_mode, slot_len, plan)?
-                .with_resolver(resolver);
+        let side = ListenerSide::from_prepared_with_rx_mode(
+            sock, prepared, rx_mode, slot_len, plan, claim,
+        )?
+        .with_resolver(resolver);
         self.listener = Some(side);
         self.rx_mode = Some(rx_mode);
         self.sessions_started = true;

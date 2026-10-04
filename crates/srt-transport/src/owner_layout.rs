@@ -15,6 +15,7 @@ use std::collections::VecDeque;
 use std::net::{SocketAddr, UdpSocket};
 
 use crate::admission::{Admit, PromotionWork, RelocatedLeg, SharedWorkerRouter, TableRelocation};
+use crate::reuseport_group::{MemberClaim, ReusePortGroup};
 use crate::{ConfigError, IngressTelemetry, ResolvedListenerTopology, RuntimeBuildError};
 
 /// Most CONCLUSIONs one Owner holds for other acceptor-group members before
@@ -124,6 +125,8 @@ pub struct OwnerListenerPlan {
     bind: SocketAddr,
     /// The layout's shared router, when its promotion policy relocates.
     router: Option<SharedWorkerRouter>,
+    /// Membership of a reuseport layout's kernel group, shared by its plans.
+    group: Option<std::sync::Arc<ReusePortGroup>>,
 }
 
 impl std::fmt::Debug for OwnerListenerPlan {
@@ -194,11 +197,20 @@ pub fn owner_plans(
         )))
     });
     let bind = prepared.bind;
+    // One membership record per reuseport layout: the barrier, the
+    // one-claim-per-member rule and the one-layout-per-address rule.
+    let group = match prepared.transport.topology {
+        ResolvedListenerTopology::ReusePortMulti { acceptors } => {
+            Some(ReusePortGroup::new(bind, acceptors.get()))
+        }
+        _ => None,
+    };
     let plan = |member, bind| OwnerListenerPlan {
         config: config.clone(),
         member,
         bind,
         router: router.clone(),
+        group: group.clone(),
     };
     let explicit_port = |owners: usize| {
         if owners > 1 && bind.port() == 0 {
@@ -254,7 +266,7 @@ pub fn owner_plans(
 pub(crate) fn check_listener_topology(
     plan: Option<&OwnerListenerPlan>,
     prepared: &crate::PreparedListener,
-) -> Result<(), RuntimeBuildError> {
+) -> Result<Option<MemberClaim>, RuntimeBuildError> {
     let ok = match (plan.map(|plan| plan.member), prepared.transport.topology) {
         (None | Some(None), ResolvedListenerTopology::PerPort) => true,
         (Some(Some(member)), ResolvedListenerTopology::ReusePortMulti { acceptors }) => {
@@ -279,7 +291,10 @@ pub(crate) fn check_listener_topology(
         )
         .into());
     }
-    Ok(())
+    // Reserve this member before its socket joins the kernel group.
+    plan.and_then(|plan| Some((plan.group.as_ref()?, plan.member?)))
+        .map(|(group, member)| group.claim(member.index))
+        .transpose()
 }
 
 /// Requested socket memory for this Owner's listener: a planned Owner binds
@@ -352,13 +367,25 @@ pub(crate) struct ListenerRouting {
     /// register once the table confirms the session is still there.
     promoted: Vec<(crate::admission::PhysicalPeerKey, UdpSocket)>,
     released: Vec<(usize, u32)>,
+    /// This member's place in its reuseport group, held for the listener's
+    /// life; `None` outside a reuseport layout.
+    claim: Option<MemberClaim>,
+    /// Cached once the group is complete, so a running listener pays no
+    /// atomic load per datagram.
+    group_complete: bool,
 }
 
 impl ListenerRouting {
+    /// `claim` comes from [`check_listener_topology`]; the listener's socket
+    /// is bound by now, so the member counts as bound.
     pub(crate) fn new(
         prepared: &crate::PreparedListener,
         plan: Option<&OwnerListenerPlan>,
+        mut claim: Option<MemberClaim>,
     ) -> Self {
+        if let Some(claim) = claim.as_mut() {
+            claim.mark_bound();
+        }
         let member = plan.and_then(OwnerListenerPlan::member);
         let (index, count) = member.map_or((0, 1), |member| (member.index, member.count));
         let promotion = plan
@@ -376,7 +403,26 @@ impl ListenerRouting {
             promotion,
             promoted: Vec::new(),
             released: Vec::new(),
+            group_complete: claim.is_none(),
+            claim,
         }
+    }
+
+    /// Whether this member may admit: every member of its reuseport group is
+    /// bound, so no session can be rehashed by a later bind. A datagram that
+    /// arrives earlier is dropped and counted; its caller retries.
+    #[inline]
+    fn group_ready(&mut self, telemetry: &IngressTelemetry) -> bool {
+        if !self.group_complete {
+            self.group_complete = self
+                .claim
+                .as_ref()
+                .is_none_or(|claim| claim.group().is_complete());
+            if !self.group_complete {
+                telemetry.record_layout_incomplete_drop();
+            }
+        }
+        self.group_complete
     }
 
     /// Queue a CONCLUSION admission said belongs to another member.
@@ -449,6 +495,9 @@ impl ListenerRouting {
         options: &crate::AdmissionOptions,
         telemetry: &IngressTelemetry,
     ) {
+        if !self.group_ready(telemetry) {
+            return;
+        }
         let keep = (self.count > 1).then(|| data.clone());
         let admitted = table.admit_bytes_with_listener_resolver(
             resolver, peer, data, now, options, self.index, self.count, telemetry,
@@ -472,6 +521,9 @@ impl ListenerRouting {
         options: &crate::AdmissionOptions,
         telemetry: &IngressTelemetry,
     ) {
+        if !self.group_ready(telemetry) {
+            return;
+        }
         let admitted = table.admit_with_listener_resolver(
             resolver, peer, data, now, options, self.index, self.count, telemetry,
         );
@@ -866,6 +918,23 @@ pub(crate) mod relocation_test_support {
     use srt_proto::{ConnectionOutput, SrtConnection, Timestamp};
 
     pub(crate) const GROUPS: usize = 16;
+
+    /// One extra unconnected socket in the loopback reuseport group on
+    /// `port`, as a promotion's `bind` adds before its `connect`: the group
+    /// rehashes while it exists.
+    pub(crate) fn transient_group_member(port: u16) -> UdpSocket {
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .expect("socket");
+        socket.set_reuse_port(true).expect("SO_REUSEPORT");
+        socket
+            .bind(&SocketAddr::from(([127, 0, 0, 1], port)).into())
+            .expect("joins the group");
+        socket.into()
+    }
 
     pub(crate) fn free_port() -> u16 {
         UdpSocket::bind("127.0.0.1:0")

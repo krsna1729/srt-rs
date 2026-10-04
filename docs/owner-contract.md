@@ -197,8 +197,8 @@ application only routes them.** After every service visit it drains
 `Owner::poll_listener_transfers` and hands each transfer to member `to` with
 `accept_listener_transfer`. The payload is opaque. A transfer is one of:
 
-* a CONCLUSION the kernel delivered to the wrong member (the group rehashes
-  when a member joins). Member `to` owns the half-open state and runs the
+* a CONCLUSION the kernel delivered to the wrong member (the group rehashed
+  while a promotion's socket was in it; see below). Member `to` owns the half-open state and runs the
   resolver. These are the only transfers the transport drops under backlog
   (`listener_forwards_dropped`; the caller retries its handshake).
 * under promotion `Relocate` on `ReusePortMulti`, an established bonded leg
@@ -215,11 +215,115 @@ application only routes them.** After every service visit it drains
   the leg's slot until the new member reports that the session ended.
 
 All Owners of one layout must be driven with timestamps from one origin,
-because a relocated session carries its timers with it. `ReusePortSingle`
-and local promotion (`Bonded`, `All`) are refused with an explicit error,
-identically on every runtime. Sessions that are not relocated stay on the
-socket the kernel hashes them to, so a reuseport group's size must not change
-while sessions are live.
+because a relocated session carries its timers with it.
+
+#### Why a reuseport group's size is fixed while sessions exist
+
+Linux picks a group member for each datagram by hashing its 4-tuple over the
+*current* member count. Any change to that count moves flows that are already
+established to other members
+(`tests/reuseport_rehash.rs::binding_a_new_member_reroutes_existing_flows`).
+A member that receives another member's established session holds no state
+for it, so that session's data is dropped there.
+
+```mermaid
+sequenceDiagram
+    participant C as Caller (4-tuple T)
+    participant K as Kernel reuseport group
+    participant A as Member 0
+    participant B as Member 1
+    C->>K: DATA (T)
+    K->>A: hash(T) mod 1 = 0
+    Note over A: session established on member 0
+    B->>K: bind (group grows to 2)
+    C->>K: DATA (T)
+    K->>B: hash(T) mod 2 = 1
+    Note over B: no state for T: DATA dropped
+```
+
+The transport enforces what it controls, from one membership record per
+layout (`ReusePortGroup`, shared by the plans of one `owner_plans` call):
+
+* **Barrier.** No member admits a datagram until every member is bound;
+  earlier datagrams are dropped and counted (`layout_incomplete_drops`), and
+  callers retry. No session can exist while the group is still growing.
+* **One claim per member.** Attaching a plan twice would bind a socket the
+  layout does not count; it is refused before the bind.
+* **One layout per address.** A second layout on an address with a live
+  layout would join the same kernel group; refused before the bind.
+* **Sealed after start.** Once every member was bound, a member that left
+  cannot rejoin. Rebuild every member from a fresh `owner_plans` instead.
+
+The transport cannot stop a member leaving (an Owner stopping shrinks the
+group). **An application must stop every member of a layout together**, and
+restart a layout as a whole.
+
+Cookie routing covers the one change that remains: a `Relocate` promotion
+binds a socket into the group before it `connect()`s, so the group grows by one
+socket for that window and a CONCLUSION can land on the wrong member. The SYN
+cookie names the member that issued it, which forwards it there
+(`reuseport_members_forward_rehashed_conclusions` on each runtime). With
+cookie routing disabled, that CONCLUSION is dropped and the caller's retry
+lands correctly once the window ends. That costs connection time, not
+correctness, so it is allowed.
+
+#### Layout matrix
+
+Every combination of topology, socket ownership, promotion and cookie routing,
+on every runtime, is either attached by the plans `owner_plans` returns or
+refused with an error, never rewritten
+(`owner_layout::tests::every_plan_attaches_and_every_refusal_is_resolve_or_documented`).
+
+| Topology | Ownership | Promotion | Verdict | Refused by / proven by |
+|---|---|---|---|---|
+| `PerPort` | any | `Never` (or `Auto`) | allowed: one Owner | layout matrix test |
+| `PerPort` | any | `Relocate`, `Bonded`, `All` | refused | `owner_plans`: promotion needs a reuseport group |
+| `ReusePortMulti{K}` | `Exclusive` | `Never`, `Relocate` (`Auto` = `Relocate`) | allowed: K members, barrier, cookie routing on by default | `a_reuseport_member_admits_nothing_until_the_group_is_complete` |
+| `ReusePortMulti{K}` | `Exclusive` | `Bonded`, `All` (local promotion) | refused | `owner_plans`: local promotion grows the group per session |
+| `ReusePortMulti{K}` | `Shared` | `Relocate`, `Bonded`, `All` | refused | `TransportConfig::resolve`: the first `connect()` steals later handshakes on a shared tuple (`listener_prepare_rejects_shared_ownership_with_forbidden_promotion`) |
+| `ReusePortMulti{K}` | `Shared` | `Never` (or `Auto`) | allowed | layout matrix test |
+| `SharedPool{K}` | any | `Never` (or `Auto`) | allowed: K Owners on ports `P..P+K` | layout matrix test |
+| `SharedPool{K}` | any | `Relocate`, `Bonded`, `All` | refused | `owner_plans`: no group to relocate within |
+| `ReusePortSingle` | any | any | refused | `owner_plans`: needs a relocation target the Owners do not have |
+| any multi-Owner | any | any | port 0 refused | `owner_plans`: every Owner must bind a known port |
+| reuseport, second attach of a member, a second layout on a live address, or a rejoin after start | | | refused | `reuseport_attaches_that_would_grow_a_live_group_are_refused`, `reuseport_group` unit, property and loom tests |
+
+Cookie routing (`Auto`, `Enabled`, `Disabled`) is allowed in every row; `Auto`
+is on for reuseport topologies and inert elsewhere.
+
+#### Choosing a layout
+
+Correctness never depends on the choice below; the numbers guide defaults.
+Measure on your host with `cargo xtask ingest-matrix`
+([performance loop](performance-loop.md#ingest-scaling-on-the-production-listener)).
+
+Measured on a 6-vCPU KVM guest (AMD EPYC, kernel 7.0), listener on 3 CPUs,
+compio sender on the other 3, 1.8 Mbit/s publishers, 3 interleaved
+repetitions, medians; every cell delivered 100 % of what was offered
+(`docs/plans/ingest-scaling.plan`, 2026-10-04):
+
+| Layout | Listener CPU µs per delivered packet at 50 / 100 / 200 publishers |
+|---|---|
+| `ReusePortMulti{1}` (one Owner) | 48.0 / 44.6 / 32.3 |
+| `ReusePortMulti{2}` | 72.4 / 56.1 / 44.8 |
+| `ReusePortMulti{4}` | 75.6 / 65.7 / 43.6 |
+| `SharedPool{2}` | 64.6 / 54.6 / 42.8 |
+
+The senders offered 77–93 % of the configured rate and the host reported CPU
+pressure, so these are costs below saturation, not capacity ceilings.
+`Relocate` and `Never` measure the same here: without bonded publishers
+nothing relocates.
+
+* Start with one Owner (`ReusePortMulti{1}` or `PerPort`). Below saturation it
+  is the cheapest per packet; its time goes to the per-packet receive path
+  (allocation and copies in profiles), not to syscalls or the kernel's
+  socket lookup.
+* Add members (`ReusePortMulti{K}`) only when one Owner's thread saturates:
+  each member takes its kernel-hashed share of publishers, and per-packet
+  cost rises (more threads waking for fewer packets each). Keep the default
+  `Relocate` so a bonded publisher stays one stream.
+* Use `SharedPool{K}` only when callers can be spread over K ports
+  themselves; it needs no reuseport support.
 
 ### 9. Completion ownership
 
