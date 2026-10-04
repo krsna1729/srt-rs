@@ -297,6 +297,9 @@ pub struct IngressTelemetry {
     /// the peer and carried no usable routing information -- flows the
     /// kernel rehashed mid-handshake that could not be rescued.
     pub stranded_conclusions: AtomicU64,
+    /// Datagrams dropped because the reuseport layout was still binding its
+    /// members; the caller retries its handshake once the group is complete.
+    pub layout_incomplete_drops: AtomicU64,
     /// CONCLUSION datagrams assigned to their owning acceptor by SYN cookie.
     /// Closed-channel delivery failures are counted separately.
     pub cookie_routed: AtomicU64,
@@ -343,6 +346,7 @@ pub struct IngressTelemetrySnapshot {
     pub handoffs: u64,
     pub promotion_failures: u64,
     pub stranded_conclusions: u64,
+    pub layout_incomplete_drops: u64,
     pub cookie_routed: u64,
     pub cookie_route_failures: u64,
     pub promoted_duplicates: u64,
@@ -400,6 +404,9 @@ impl IngressTelemetry {
     }
     pub fn record_stranded_conclusion(&self) {
         Self::bump(&self.stranded_conclusions);
+    }
+    pub fn record_layout_incomplete_drop(&self) {
+        Self::bump(&self.layout_incomplete_drops);
     }
     pub fn record_cookie_routed(&self) {
         Self::bump(&self.cookie_routed);
@@ -469,6 +476,7 @@ impl IngressTelemetry {
             handoffs: get(&self.handoffs),
             promotion_failures: get(&self.promotion_failures),
             stranded_conclusions: get(&self.stranded_conclusions),
+            layout_incomplete_drops: get(&self.layout_incomplete_drops),
             cookie_routed: get(&self.cookie_routed),
             cookie_route_failures: get(&self.cookie_route_failures),
             promoted_duplicates: get(&self.promoted_duplicates),

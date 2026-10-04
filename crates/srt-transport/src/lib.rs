@@ -111,6 +111,7 @@ mod handoff;
 mod high_res_waiter;
 mod id_hash;
 mod owner_layout;
+mod reuseport_group;
 pub use owner_layout::{ListenerTransfer, OwnerListenerPlan, ReusePortMember, owner_plans};
 mod sink;
 mod socket_io;

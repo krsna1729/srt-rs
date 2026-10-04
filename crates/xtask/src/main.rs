@@ -220,6 +220,29 @@ const ASAN_TRANSPORT: Step = Step {
     informational: false,
 };
 
+/// Loom models (`#[cfg(loom)]` tests), in their own target directory so the
+/// `--cfg loom` build never invalidates the ordinary one.
+const LOOM: Step = Step {
+    name: "loom",
+    cmd: "cargo",
+    args: &[
+        "test",
+        "-p",
+        "srt-transport",
+        "--lib",
+        "--release",
+        "--",
+        "loom_tests",
+    ],
+    env: &[
+        ("RUSTFLAGS", "--cfg loom"),
+        ("CARGO_TARGET_DIR", "target/loom"),
+    ],
+    tool: None,
+    cwd: None,
+    informational: false,
+};
+
 const PRECOMMIT: &[&Step] = &[&FMT, &CLIPPY, &REPORTCARD, &DOC, &TYPOS];
 const CI: &[&Step] = &[
     &FMT,
@@ -228,6 +251,7 @@ const CI: &[&Step] = &[
     &DOC,
     &TYPOS,
     &TEST,
+    &LOOM,
     &DENY_PUBLISHED,
     &DENY_WORKSPACE,
     &PACKAGE,

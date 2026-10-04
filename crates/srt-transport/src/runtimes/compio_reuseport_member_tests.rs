@@ -57,10 +57,11 @@ fn caller(remote: SocketAddr) -> (Owner, crate::LogicalCallerId) {
         .ownership(crate::SocketOwnership::Shared)
         .build()
         .expect("caller config");
-    // No handshake retry inside the test: a stranded CONCLUSION can only be
-    // rescued by forwarding, never by a fresh INDUCTION.
-    config.session.handshake.retry_interval = Duration::from_secs(60);
-    config.session.handshake.timeout = Duration::from_secs(120);
+    // A retry repeats the CONCLUSION with the same cookie from the same
+    // 4-tuple, so one at the wrong member is still rescued only by
+    // forwarding; the retry recovers ones lost to the transient member.
+    config.session.handshake.retry_interval = Duration::from_millis(100);
+    config.session.handshake.timeout = Duration::from_secs(10);
     let mut owner = Owner::new(64);
     match owner
         .connect(&config, Timestamp::from_micros(0))
@@ -122,29 +123,36 @@ fn conclusions_rehashed_to_another_member_are_forwarded_and_connect() {
         let plans = owner_plans(&reuseport(port, 2)).expect("plans");
         assert_eq!(plans.len(), 2);
 
-        let mut members = vec![attach(&plans[0])];
-        let mut callers: Vec<_> = (0..16).map(|_| caller(remote)).collect();
+        // Both members are bound before any caller: the layout admits only
+        // once complete. The rehash comes from a transient extra socket in
+        // the group, which is what a Relocate promotion's bind does.
+        let mut members = vec![attach(&plans[0]), attach(&plans[1])];
+        // Growing a group from 2 to 3 moves about 1 in 6 of member 0's flows to
+        // member 1, so 48 callers make "none moved" a ~1e-4 event.
+        let mut callers: Vec<_> = (0..48).map(|_| caller(remote)).collect();
         let mut forwarded = 0;
         let mut now = 1_000;
-        // INDUCTION and its response only, so member 0 issues every cookie
-        // and no CONCLUSION is sent before member 1 joins: callers send their
-        // INDUCTION once, then only member 0 runs until it has replied.
+        // INDUCTION and its response only: callers send their INDUCTION
+        // once, then only the members run until they have replied.
         let budget = OwnerServiceBudget::default();
         for (owner, _) in callers.iter_mut() {
             let _ = owner.service(Timestamp::from_micros(now), budget).await;
         }
         for _ in 0..20 {
-            members[0]
-                .wait_for_activity(Duration::from_micros(500))
-                .await;
-            let _ = members[0]
-                .service(Timestamp::from_micros(now), budget)
-                .await;
+            for member in members.iter_mut() {
+                member.wait_for_activity(Duration::from_micros(500)).await;
+                let _ = member.service(Timestamp::from_micros(now), budget).await;
+            }
         }
         now += 5_000;
-        members.push(attach(&plans[1]));
+        let mut transient =
+            Some(crate::owner_layout::relocation_test_support::transient_group_member(port));
 
-        for _ in 0..400 {
+        for round in 0..400 {
+            if forwarded > 0 || round == 100 {
+                // The promotion completes: the group is back to its size.
+                drop(transient.take());
+            }
             pump_round(&mut members, &mut callers, now, &mut forwarded).await;
             now += 5_000;
             if connected(&callers) == callers.len() {
@@ -154,9 +162,9 @@ fn conclusions_rehashed_to_another_member_are_forwarded_and_connect() {
         assert_eq!(connected(&callers), callers.len(), "every caller connects");
         assert!(
             forwarded > 0,
-            "the rehash sent some CONCLUSIONs to member 1"
+            "the rehash sent some CONCLUSIONs to the other member"
         );
-        assert_eq!(members[1].listener_forwards_dropped(), 0);
+        assert!(members.iter().all(|m| m.listener_forwards_dropped() == 0));
     });
 }
 
