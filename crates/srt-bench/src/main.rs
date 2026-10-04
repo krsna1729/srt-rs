@@ -7,7 +7,7 @@
 //! Usage:
 //!
 //! One run (either role):
-//!   srt-bench runtime=<mio|tokio|compio> \
+//!   srt-bench runtime=<mio|tokio|compio|owner> \
 //!     mode=sender <host> <port> <duration_secs> <latency_ms> [source_bitrate_bps] [--connections N]
 //!   srt-bench runtime=<...> mode=receiver <port> <duration_secs> <latency_ms> [--connections N]
 //!   ... plus --out FILE to append a result row.

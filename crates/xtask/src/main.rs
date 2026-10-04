@@ -3,6 +3,7 @@ use std::process::{Command, ExitCode, Stdio};
 use std::time::Instant;
 
 mod audit;
+mod ingest_matrix;
 mod qualify;
 mod reportcard;
 mod scaling;
@@ -251,7 +252,7 @@ fn main() -> ExitCode {
         "install-hooks" => install_hooks(),
         "pgo" => run_pgo(&env::args().skip(2).collect::<Vec<_>>()),
         "audit" => audit::run(&env::args().skip(2).collect::<Vec<_>>()),
-        "scaling" => scaling::run(&env::args().skip(2).collect::<Vec<_>>()),
+        "scaling" | "ingest-matrix" => run_sweep(&arg),
         "qualify" => qualify::run(&env::args().skip(2).collect::<Vec<_>>()),
         _ => {
             eprintln!("usage: cargo xtask <command>");
@@ -276,8 +277,24 @@ fn main() -> ExitCode {
                 "  pgo            generate, build, or run benchmarks under x86-64-v3 PGO (--reuse-profile skips regen)"
             );
             eprintln!("  audit          run x86-64-v3 / PGO ISA and codegen audit");
+            eprintln!(
+                "  ingest-matrix  listener layout x publisher-count matrix on the production Owner"
+            );
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Live sweeps that build and run srt-bench with their own arguments.
+fn run_sweep(command: &str) -> ExitCode {
+    let args = env::args().skip(2).collect::<Vec<_>>();
+    if command == "scaling" {
+        scaling::run(&args)
+    } else {
+        ingest_matrix::run(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."),
+            &args,
+        )
     }
 }
 

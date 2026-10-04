@@ -30,7 +30,9 @@ interpret a shared-host outlier as an optimization.
 ## Fast live sentinels
 
 The PR gate uses `docs/plans/ci-sentinels/`: one 600-connection, low-rate
-admission cell and one lower-connection datapath-load cell. Both must satisfy
+admission cell, one lower-connection datapath-load cell, and one
+production-listener cell (`owner-ingest`: 100 publishers into a two-member
+`SO_REUSEPORT` group of compio `Owner`s). All must satisfy
 `srt-bench check-clean`. The higher-rate plans below are performance/stress
 measurements and run nightly; they are not assumed to be clean on shared CI.
 
@@ -58,6 +60,24 @@ interaction. A candidate that changes a shared component graduates to
 `throughput-matrix.plan`; a topology, runtime, or bonding change also runs its
 corresponding focused plan (`socket-topology-smoke.plan` or
 `bonded-ingress.plan`).
+
+## Ingest scaling on the production listener
+
+`recv-runtime=owner` runs the receiver as the production compio `Owner`,
+split into one Owner per thread by `owner_plans` and attached with
+`listen_planned`, the same path an application uses. One command reruns the
+layout matrix (topology x promotion x publisher count) with interleaved
+repetitions and prints the report:
+
+```sh
+cargo xtask ingest-matrix                                   # docs/plans/ingest-scaling.plan, 3 reps
+cargo xtask ingest-matrix --reps 1 --axis connections=50    # narrowed; extra flags go to `srt-bench matrix`
+```
+
+Read `rx_us/pkt` (listener CPU per delivered packet) only where `deliv%` is
+100. The results guide the recommended defaults in
+[`owner-contract.md`](owner-contract.md); which layouts are allowed is decided
+by the correctness checks there, never by these numbers.
 
 ## Canonical capacity campaign
 

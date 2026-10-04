@@ -1,0 +1,25 @@
+# PR gate: the production listener (compio Owner via owner_plans) admits and
+# delivers many publishers across a two-member SO_REUSEPORT group with
+# cookie routing and Relocate. Low per-publisher load: this guards the
+# ingest-scaling bench path and layout correctness, not capacity.
+recv-runtime                = owner
+send-runtime                = compio
+ingress                     = reuseport-multi:2
+egress                      = per-connection
+encryption                  = plain
+connections                 = 100
+bitrate                     = 200000
+srt-bandwidth               = input-relative:25
+promotion                   = relocate
+cookie-routing              = on
+batch                       = on
+bond                        = none
+connect-concurrency         = 20
+pin                         = off
+
+[recv]
+cpus                        = 0-2
+
+[send]
+workers                     = 2
+cpus                        = 3-5
