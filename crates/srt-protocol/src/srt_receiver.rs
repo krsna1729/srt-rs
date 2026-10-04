@@ -559,6 +559,16 @@ const WRAPPING_PERIOD_END_MIN: u64 = 30_000_000;
 /// ends the period, matching libsrt's `CTsbpdTime::updateBaseTime`.
 const WRAPPING_PERIOD_END_MAX: u64 = 60_000_000;
 
+/// During the wraparound period a timestamp below this is post-wrap and gets
+/// the `MAX_TIMESTAMP + 1` carryover; one at or above it is pre-wrap. Half
+/// the range separates the two with margin: the period starts at
+/// `WRAPPING_PERIOD_START`, so pre-wrap packets still buffered then are within
+/// one latency of it, and it ends when a post-wrap packet of at most
+/// `WRAPPING_PERIOD_END_MAX` is delivered, so post-wrap timestamps stay within
+/// one latency of that. libsrt ends the period on receipt and can use 30 s;
+/// this receiver ends it on delivery, so the post-wrap side reaches past 60 s.
+const WRAPPING_CARRYOVER_BELOW: u64 = MAX_TIMESTAMP.div_ceil(2);
+
 /// Tracks ACK send times and acknowledged positions (for RTT calculation
 /// and ACK suppression).
 ///
@@ -1446,7 +1456,7 @@ impl ReceiverBuffer {
         self.tsbpd_time_base
             .saturating_add(timestamp as u64)
             .saturating_add(
-                if self.wrapping_period_active && (timestamp as u64) < WRAPPING_PERIOD_START {
+                if self.wrapping_period_active && (timestamp as u64) < WRAPPING_CARRYOVER_BELOW {
                     MAX_TIMESTAMP + 1
                 } else {
                     0
@@ -4101,6 +4111,30 @@ mod tests {
             "source time must keep advancing across the wrap boundary, \
              never appear to jump backward: {source_time_0:?} -> {source_time_1:?}"
         );
+    }
+
+    /// Packets still buffered when the wrap period starts are pre-wrap
+    /// packets: the carryover must not push them ~71 minutes into the future,
+    /// so a live stream crossing `WRAPPING_PERIOD_START` is delivered in
+    /// order and in full.
+    #[test]
+    fn packets_buffered_when_the_wrap_period_starts_stay_in_order() {
+        let mut buf = ReceiverBuffer::new(0, 250, Timestamp::from_micros(0), 0);
+        let first_ts = WRAPPING_PERIOD_START - 500_000;
+        let mut delivered = Vec::new();
+        for seq in 0..100u32 {
+            let ts = first_ts + u64::from(seq) * 10_000;
+            let now = Timestamp::from_micros(ts);
+            buf.receive(make_packet(seq, ts as u32), now);
+            while let Some(packet) = buf.pop_ready(now) {
+                delivered.push(packet.sequence_number);
+            }
+        }
+        let drained = Timestamp::from_micros(first_ts + 100 * 10_000 + 250_000);
+        while let Some(packet) = buf.pop_ready(drained) {
+            delivered.push(packet.sequence_number);
+        }
+        assert_eq!(delivered, (0..100).collect::<Vec<_>>());
     }
 
     #[test]
