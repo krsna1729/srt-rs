@@ -1,0 +1,37 @@
+# Ingest scaling on the production listener (`cargo xtask ingest-matrix`).
+#
+# The receiver is the production compio Owner laid out by owner_plans
+# (recv-runtime=owner); the sender is the compio bench driver. Each cell is
+# N independent publishers at a live-video rate into one layout:
+#   reuseport-multi:K  K Owners in one SO_REUSEPORT group on one port
+#   shared-pool:K      K Owners on ports P..P+K
+# promotion goes to the transport unchanged (cookie routing stays on: a
+# reuseport group of K>=2 without it strands handshakes and is refused);
+# combinations
+# the transport refuses are filtered by srt-bench or fail the cell, they are
+# never substituted. Results guide defaults only (docs/owner-contract.md);
+# correctness refusals do not depend on them.
+#
+# Read: `srt-bench report <out> --by ingress,promotion,cookie,conns`
+# and compare `rx_us/pkt` (listener CPU per delivered packet) and `deliv%`.
+
+recv-runtime        = owner
+send-runtime        = compio
+connections         = 50,100,200
+bitrate             = 1800000
+ingress             = reuseport-multi:1,reuseport-multi:2,reuseport-multi:4,shared-pool:2
+egress              = per-connection
+encryption          = plain
+promotion           = never,relocate
+cookie-routing      = on
+batch               = on
+bond                = none
+connect-concurrency = 50
+pin                 = off
+
+[recv]
+cpus                = 0-2
+
+[send]
+workers             = 3
+cpus                = 3-5

@@ -255,7 +255,7 @@ jobs:
       - name: Run clean sentinel plans
         run: |
           set -e
-          for plan in docs/plans/ci-sentinels/admission-scale.plan docs/plans/ci-sentinels/datapath-load.plan; do
+          for plan in docs/plans/ci-sentinels/admission-scale.plan docs/plans/ci-sentinels/datapath-load.plan docs/plans/ci-sentinels/owner-ingest.plan; do
             echo "::group::$plan"
             ./target/release/srt-bench matrix --plan "$plan" --reps 1 --out sentinel.tsv
             echo "::endgroup::"

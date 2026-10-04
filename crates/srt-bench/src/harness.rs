@@ -827,6 +827,7 @@ fn report_headers(group_by: &[String]) -> Vec<String> {
                 "torn_l",
                 "rtt_ms",
                 "cpu_s",
+                "rx_us/pkt",
                 "rss_kb",
                 "invalid",
             ]
@@ -941,6 +942,21 @@ fn report_group_row(key: &str, cells: &[&Record]) -> Option<Vec<String>> {
     row.push(format!("{:.0}", report_median(&listeners, "torn_down")));
     row.push(format!("{:.2}", report_median(&listeners, "rtt_ms")));
     row.push(format!("{cpu:.1}"));
+    // The listener's own CPU per packet it delivered: the ingest-scaling
+    // figure of merit, median of per-pair ratios like the percentages.
+    let rx_us_per_packet = median(
+        listeners
+            .iter()
+            .filter_map(|listener| {
+                let cpu_ms = listener.number("cpu_user_ms")? + listener.number("cpu_sys_ms")?;
+                let packets = listener
+                    .number("core_total")
+                    .filter(|packets| *packets > 0.0)?;
+                Some(cpu_ms * 1000.0 / packets)
+            })
+            .collect(),
+    );
+    row.push(format!("{rx_us_per_packet:.1}"));
     row.push(format!(
         "{:.0}",
         report_median(&listeners, "peak_rss_kb").max(report_median(&callers, "peak_rss_kb"))
@@ -1306,6 +1322,10 @@ fn filter_reason(cell: &Cell<'_>, axes: &[Axis]) -> Option<&'static str> {
     let send_workers = role_value(cell, "workers", Scope::Send);
     let bonded = bond.is_some_and(|mode| mode != "none");
 
+    if let Some(reason) = filter_owner(runtime_recv, runtime_send, ingress) {
+        return Some(reason);
+    }
+
     if let Some(reason) = filter_shared_egress(cell, axes, egress, send_workers) {
         return Some(reason);
     }
@@ -1351,6 +1371,18 @@ fn filter_reason(cell: &Cell<'_>, axes: &[Axis]) -> Option<&'static str> {
     }
 
     None
+}
+
+/// The production Owner is a listener, and srt-bench's per-port (one port
+/// per connection) is a layout no production listener has.
+fn filter_owner(runtime_recv: &str, runtime_send: &str, ingress: &str) -> Option<&'static str> {
+    if runtime_send == "owner" {
+        Some("owner-is-receiver-only")
+    } else if runtime_recv == "owner" && ingress == "per-port" {
+        Some("owner-needs-shared-ingress")
+    } else {
+        None
+    }
 }
 
 fn filter_shared_egress(
@@ -3915,6 +3947,38 @@ mod matrix_filter_tests {
         assert_eq!(
             filter_reason(&cell_for("relocate"), &axes),
             Some("promotion-inert-shared-egress")
+        );
+    }
+
+    #[test]
+    fn owner_runtime_is_a_shared_ingress_receiver_only() {
+        let axes = axes();
+        let cell_for = |ingress: &'static str, recv: &'static str, send: &'static str| {
+            let mut cell = cell(&[
+                ("ingress", ingress),
+                ("egress", "per-connection"),
+                ("promotion", "never"),
+                ("cookie-routing", "on"),
+                ("batch", "on"),
+                ("pin", "off"),
+                ("connections", "50"),
+                ("bond", "none"),
+            ]);
+            cell.push(("runtime", Scope::Recv, recv.to_string()));
+            cell.push(("runtime", Scope::Send, send.to_string()));
+            cell
+        };
+        assert_eq!(
+            filter_reason(&cell_for("reuseport-multi:2", "owner", "compio"), &axes),
+            None
+        );
+        assert_eq!(
+            filter_reason(&cell_for("per-port", "owner", "compio"), &axes),
+            Some("owner-needs-shared-ingress")
+        );
+        assert_eq!(
+            filter_reason(&cell_for("reuseport-multi:2", "compio", "owner"), &axes),
+            Some("owner-is-receiver-only")
         );
     }
 

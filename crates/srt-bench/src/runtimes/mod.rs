@@ -105,6 +105,7 @@
 
 pub mod compio;
 pub mod mio;
+pub mod owner;
 pub mod tokio;
 
 use crate::{BenchConfig, Runtime};
@@ -138,6 +139,7 @@ pub fn run(cfg: BenchConfig) {
         Runtime::A2 => mio::run_a2(cfg),
         Runtime::Tokio => tokio::run(cfg),
         Runtime::Compio => compio::run(cfg),
+        Runtime::Owner => owner::run(cfg),
     }
 }
 

@@ -149,6 +149,9 @@ pub enum Runtime {
     A2,
     Tokio,
     Compio,
+    /// Receiver only: the production compio `Owner` listener, laid out by
+    /// `owner_plans` (see `runtimes/owner.rs`).
+    Owner,
 }
 
 impl Runtime {
@@ -158,6 +161,7 @@ impl Runtime {
             "a2" => Self::A2,
             "tokio" => Self::Tokio,
             "compio" => Self::Compio,
+            "owner" => Self::Owner,
             _ => return None,
         })
     }
@@ -168,6 +172,7 @@ impl Runtime {
             Self::A2 => "a2",
             Self::Tokio => "tokio",
             Self::Compio => "compio",
+            Self::Owner => "owner",
         }
     }
 }
@@ -840,7 +845,7 @@ impl BenchConfig {
         match self.runtime {
             Runtime::Mio | Runtime::A2 => srt_transport::RuntimeFlavor::Mio,
             Runtime::Tokio => srt_transport::RuntimeFlavor::Tokio,
-            Runtime::Compio => srt_transport::RuntimeFlavor::Compio,
+            Runtime::Compio | Runtime::Owner => srt_transport::RuntimeFlavor::Compio,
         }
     }
 
@@ -2997,7 +3002,7 @@ impl Aggregate {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: srt-bench runtime=<mio|tokio|compio> \
+        "usage: srt-bench runtime=<mio|tokio|compio|owner(receiver)> \
          mode=<sender|receiver> <host?> <port> <duration_secs> <latency_ms> \
          [source_bitrate_bps] [--connections N] \
          [--srt-bandwidth protocol-default|legacy-source-fixed|fixed:BPS|input-relative:PCT] \
@@ -3515,7 +3520,7 @@ pub fn bench_config_from_args() -> BenchConfig {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{
         Batching, BenchConfig, BondMode, Cli, ConnectLimiter, Egress, Encryption,
         HandshakeAdmission, HandshakePermit, Ingress, Link, Mode, PeerTopology, Promotion, Runtime,
@@ -3591,7 +3596,7 @@ mod tests {
         );
     }
 
-    fn config() -> BenchConfig {
+    pub(crate) fn config() -> BenchConfig {
         BenchConfig {
             diag_expected_ticks: None,
             runtime: Runtime::Mio,
