@@ -297,11 +297,30 @@ Correctness never depends on the choice below; the numbers guide defaults.
 Measure on your host with `cargo xtask ingest-matrix`
 ([performance loop](performance-loop.md#ingest-scaling-on-the-production-listener)).
 
-* Start with one Owner (`ReusePortMulti{1}` or `PerPort`). A single Owner
-  spends most of its time in the per-packet receive path; profiles put it
-  in allocation and copies, not in syscalls or the kernel's socket lookup.
-* Add members (`ReusePortMulti{K}`) when one Owner's thread saturates: each
-  member takes its kernel-hashed share of publishers. Keep the default
+Measured on a 6-vCPU KVM guest (AMD EPYC, kernel 7.0), listener on 3 CPUs,
+compio sender on the other 3, 1.8 Mbit/s publishers, 3 interleaved
+repetitions, medians; every cell delivered 100 % of what was offered
+(`docs/plans/ingest-scaling.plan`, 2026-10-04):
+
+| Layout | Listener CPU µs per delivered packet at 50 / 100 / 200 publishers |
+|---|---|
+| `ReusePortMulti{1}` (one Owner) | 48.0 / 44.6 / 32.3 |
+| `ReusePortMulti{2}` | 72.4 / 56.1 / 44.8 |
+| `ReusePortMulti{4}` | 75.6 / 65.7 / 43.6 |
+| `SharedPool{2}` | 64.6 / 54.6 / 42.8 |
+
+The senders offered 77–93 % of the configured rate and the host reported CPU
+pressure, so these are costs below saturation, not capacity ceilings.
+`Relocate` and `Never` measure the same here: without bonded publishers
+nothing relocates.
+
+* Start with one Owner (`ReusePortMulti{1}` or `PerPort`). Below saturation it
+  is the cheapest per packet; its time goes to the per-packet receive path
+  (allocation and copies in profiles), not to syscalls or the kernel's
+  socket lookup.
+* Add members (`ReusePortMulti{K}`) only when one Owner's thread saturates:
+  each member takes its kernel-hashed share of publishers, and per-packet
+  cost rises (more threads waking for fewer packets each). Keep the default
   `Relocate` so a bonded publisher stays one stream.
 * Use `SharedPool{K}` only when callers can be spread over K ports
   themselves; it needs no reuseport support.
