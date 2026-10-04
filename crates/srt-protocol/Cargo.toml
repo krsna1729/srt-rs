@@ -78,6 +78,7 @@ criterion = "0.8"
 # invocations that build only this crate (e.g. the ASan job, release.yml).
 # A path-only dev-dependency on itself is stripped on publish.
 srt_proto = { package = "srt-proto", path = ".", features = ["test-support", "raw-codec"] }
+proptest = "1.11"
 
 [[bench]]
 name = "core_packet_loop"

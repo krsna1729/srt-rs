@@ -1430,6 +1430,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hmac",
  "pbkdf2",
+ "proptest",
  "rustc-hash",
  "sha1",
  "srt-proto",
