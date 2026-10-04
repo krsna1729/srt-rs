@@ -10,6 +10,8 @@ const PACKET_INTERVAL_US: u64 = 1_316;
 const PAYLOAD_SIZE: usize = 1_316;
 const TSBPD_DELAY_MS: u16 = 250;
 
+/// Receive one packet per interval and pop it with a single call: the head is
+/// due exactly when it is popped, so this measures the deliverable fast path.
 fn run_tsbpd(tsbpd_delay_ms: u16) {
     let mut receiver = ReceiverBuffer::new(0, tsbpd_delay_ms, Timestamp::from_micros(0), 0);
 
@@ -34,6 +36,28 @@ fn run_tsbpd(tsbpd_delay_ms: u16) {
     black_box(receiver.stats());
 }
 
+/// What a connection does: after each DATA packet, drain until `pop_ready`
+/// returns `None`. With a buffered window the head is not due yet on most
+/// calls, so this measures the not-deliverable path the drain always ends on.
+fn run_tsbpd_drain(tsbpd_delay_ms: u16) {
+    let mut receiver = ReceiverBuffer::new(0, tsbpd_delay_ms, Timestamp::from_micros(0), 0);
+
+    for sequence_number in 0..PACKET_COUNT {
+        let now_us = (sequence_number as u64 + 1) * PACKET_INTERVAL_US;
+        let now = Timestamp::from_micros(now_us);
+        let packet = DataPacket::new(
+            sequence_number,
+            sequence_number,
+            now_us as u32,
+            1,
+            vec![0x42; PAYLOAD_SIZE].into(),
+        );
+
+        black_box(receiver.receive(packet, now));
+        while black_box(receiver.pop_ready(now)).is_some() {}
+    }
+}
+
 fn bench_buffered_tsbpd(c: &mut Criterion) {
     let mut group = c.benchmark_group("receiver_tsbpd_scan");
     group.throughput(Throughput::Elements(PACKET_COUNT as u64));
@@ -43,6 +67,9 @@ fn bench_buffered_tsbpd(c: &mut Criterion) {
     });
     group.bench_function("zero_loss_250ms_buffered_window", |b| {
         b.iter(|| run_tsbpd(TSBPD_DELAY_MS));
+    });
+    group.bench_function("zero_loss_250ms_drain_per_packet", |b| {
+        b.iter(|| run_tsbpd_drain(TSBPD_DELAY_MS));
     });
     group.finish();
 }
