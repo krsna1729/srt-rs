@@ -105,7 +105,6 @@ fn pinning_flags(runtimes: &str) -> Vec<String> {
         "--cookie-routing=on".into(),
         "--batch=on".into(),
         "--sock-buf=default".into(),
-        "--pin=off".into(),
         "--connections=1".into(),
         "--connect-concurrency=1".into(),
         "--bond=none".into(),

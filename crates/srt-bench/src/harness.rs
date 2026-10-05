@@ -630,6 +630,7 @@ pub fn read_results(path: &Path) -> std::io::Result<Vec<Record>> {
         let legacy = keys.contains(&"bitrate") && !keys.contains(&"source_bps");
         let legacy_sock_buf =
             keys.contains(&"sock_buf") && !keys.contains(&"sock_buf_requested_bytes");
+        let legacy_pin = keys.contains(&"pin");
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             if legacy {
@@ -639,6 +640,13 @@ pub fn read_results(path: &Path) -> std::io::Result<Vec<Record>> {
                      (`source_bps`, `srt_bw_mode`, `srt_maxbw_bps`), and an old row cannot \
                      be reinterpreted as either. Re-run the sweep, or compare old files \
                      with an older srt-bench.",
+                    path.display(),
+                )
+            } else if legacy_pin {
+                format!(
+                    "{}: legacy result schema (has `pin`, retired with the runtimes that \
+                     applied it). Re-run the sweep, or compare old files with an older \
+                     srt-bench.",
                     path.display(),
                 )
             } else if legacy_sock_buf {
@@ -3965,9 +3973,12 @@ mod matrix_filter_tests {
         for entry in std::fs::read_dir(format!("{root}/.github/workflows")).expect("workflows") {
             sources.push(std::fs::read_to_string(entry.expect("entry").path()).expect("read"));
         }
-        sources.push(
-            std::fs::read_to_string(format!("{root}/crates/xtask/src/main.rs")).expect("xtask"),
-        );
+        for entry in std::fs::read_dir(format!("{root}/crates/xtask/src")).expect("xtask src") {
+            let path = entry.expect("entry").path();
+            if path.extension().is_some_and(|ext| ext == "rs") {
+                sources.push(std::fs::read_to_string(path).expect("read"));
+            }
+        }
         let mut plans: Vec<String> = sources
             .iter()
             .flat_map(|text| text.split(|c: char| c.is_whitespace() || c == '"' || c == ';'))
@@ -3978,6 +3989,12 @@ mod matrix_filter_tests {
         plans.sort();
         plans.dedup();
         assert!(plans.len() >= 5, "found too few scheduled plans: {plans:?}");
+        assert!(
+            plans
+                .iter()
+                .any(|plan| plan == "docs/plans/ingest-scaling.plan"),
+            "xtask ingest-matrix's plan must be discovered: {plans:?}"
+        );
         for plan in plans {
             let path = format!("{root}/{plan}");
             let cli = cli(&["--plan", &path]);

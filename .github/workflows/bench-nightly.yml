@@ -107,9 +107,13 @@ jobs:
           echo "## cells that did not fully establish"
           awk -F'\t' '
             NR==1 { for (i=1;i<=NF;i++) h[$i]=i; next }
-            $h["established"] < $h["conns"] {
+            {
+              # A bonded listener admits one logical stream per group, so its
+              # expected count is logical_streams; callers count physical legs.
+              want = ($h["role"] == "listener" && $h["logical_streams"] > 0) ? $h["logical_streams"] : $h["conns"]
+              if ($h["established"] >= want) next
               print $h["runtime"], $h["ingress"], $h["egress"], $h["encryption"], \
-                    $h["role"] ": " $h["established"] "/" $h["conns"]
+                    $h["role"] ": " $h["established"] "/" want
               n++
             }
             END { if (!n) print "(none)" }

@@ -131,10 +131,6 @@ jobs:
       # profile blocks io_uring_setup.
       options: --security-opt seccomp=unconfined
     timeout-minutes: 20
-    env:
-      # See the matching image setting: Glommio's bundled liburing needs the
-      # Linux UAPI declaration explicitly included on Debian sid.
-      CFLAGS: -include linux/openat2.h
     steps:
       - uses: actions/checkout@v7
       - name: Report libsrt tools version

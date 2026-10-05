@@ -5,8 +5,8 @@
 //! receive scratch, a destined-send helper that keeps the unsent suffix,
 //! and the connected-socket output pump the readiness `Conn` types share.
 //!
-//! Completion runtimes (Monoio/Compio/Glommio) stay on their native
-//! one-buffer I/O; they do not use these helpers.
+//! The completion runtime (Compio) stays on its native one-buffer I/O; it
+//! does not use these helpers.
 
 use crate::socket_io::recvmsg_batch_into;
 use crate::{

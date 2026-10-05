@@ -1364,10 +1364,9 @@ impl RuntimeFlavor {
         if let Self::Custom(capabilities) = self {
             return capabilities;
         }
-        // `RecvBatch`/batch.rs's recvmmsg-based batching is shared by every
-        // readiness-based adapter (Mio, Tokio, Smol); only the
-        // completion-based adapters (Monoio, Glommio, Compio) use native
-        // one-buffer I/O and genuinely have no batched receive path.
+        // `RecvBatch`/batch.rs's recvmmsg-based batching is shared by the
+        // readiness-based adapters (Mio, Tokio); the completion-based Compio
+        // adapter uses native one-buffer I/O and has no batched receive path.
         TransportCapabilities {
             receive_batching: cfg!(target_os = "linux") && matches!(self, Self::Mio | Self::Tokio),
             ..TransportCapabilities::default()
