@@ -77,7 +77,7 @@ so the control survives. At 400×8 Mbps:
 
 3.2 Gbps at 100% delivery, 18 ms RTT. mio, tokio and smol clear it;
 glommio and compio do not, which is their own per-datagram io_uring
-limit, not this.
+limit, not this. (smol and glommio have since been retired.)
 
 ## Consequence for the published comparisons
 

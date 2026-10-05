@@ -65,7 +65,7 @@ jobs:
             ./target/release/srt-bench matrix --plan "$plan" --reps 1 --out nightly.tsv
             echo "::endgroup::"
           done
-      # The real nightly sweep: full throughput-matrix.plan (1536 cells,
+      # The real nightly sweep: full throughput-matrix.plan (768 cells,
       # documented), not axis-trimmed -- budgeted 5h leaving 1h margin in
       # the 6h ceiling for setup and the report/upload steps. `timeout`
       # exit 124 is the EXPECTED time-box outcome, not a failure: whatever

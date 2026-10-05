@@ -67,7 +67,7 @@ srt-bench runtime=<mio|tokio|compio> \
 
 ```sh
 # Cartesian product of the axes; one child process per role per cell.
-srt-bench matrix --runtimes mio,tokio,smol,monoio,glommio,compio \
+srt-bench matrix --runtimes mio,tokio,compio \
   --ingress per-port,shared-pool:4,reuseport-multi:4,reuseport-single:4 \
   --encryption plain,128,192,256 --promotion never,all \
   --connections 25,150 --reps 3 --out scratch/base.tsv
@@ -76,7 +76,7 @@ srt-bench matrix --runtimes mio,tokio,smol,monoio,glommio,compio \
 srt-bench report scratch/base.tsv --by ingress,runtime
 
 # Syscall / io_uring attribution for one pair (external dep: `perf`).
-srt-bench sysprof --runtime glommio --connections 150
+srt-bench sysprof --runtime compio --connections 150
 
 # Print the host settings that bound benchmark capacity.
 srt-bench system-info
@@ -113,7 +113,7 @@ workers and every per-connection egress worker value remain variable.
 The exhaustive matrix is filtered as its raw cartesian product is enumerated,
 without retaining all raw cells in memory. This removes combinations that
 cannot change behavior: promotion and cookie routing outside `reuseport-multi`,
-batching outside mio's shared-socket paths, and pinning outside glommio. It
+batching outside mio's shared-socket paths. It
 also removes bond-group requests larger than half the connection population and
 bonded cells outside the shared `CallerTable` egress and the one group-aware
 `shared-pool:1` listener (the per-connection sender and reuseport handoff paths
@@ -224,7 +224,8 @@ src/
 ## Measured scaling knee (loopback bakeoff, 8 Mbps/conn)
 
 - **≤ 300 conns** — task-per-connection models win: best latency
-  isolation, zero retransmits for tokio/smol/monoio/compio.
+  isolation, zero retransmits for tokio/compio (smol and monoio, since
+  retired, measured the same).
 - **600 conns** — hierarchy inverts. mio's flat epoll loop is the only
   architecture that sustains full line-rate (sent == received, zero
   loss). Per-task wakeup cost dominates at this density; task-per-conn
@@ -306,5 +307,3 @@ Method rule for anything recorded: same measurement window only, >=3
 reps, and the `--release` profile — `--profile quick` omits LTO and is
 not measurement-grade.
 
-glommio requires an io_uring-capable Linux kernel; selecting it elsewhere
-exits 2 with a message.

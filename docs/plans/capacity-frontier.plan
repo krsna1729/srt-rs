@@ -20,4 +20,3 @@ batch               = on
 sock-buf            = 16m
 bond                = none
 connect-concurrency = 50
-pin                 = off

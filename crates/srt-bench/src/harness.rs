@@ -88,7 +88,6 @@ pub const COLUMNS: &[&str] = &[
     "sock_sndbuf_effective_min_bytes",
     "sock_sndbuf_effective_max_bytes",
     "cpus",
-    "pin",
     "link_delay",
     "link_jitter",
     "link_loss",
@@ -268,7 +267,6 @@ pub const CONFIG_COLUMNS: &[&str] = &[
     "would_block_policy",
     "sock_buf_requested_bytes",
     "cpus",
-    "pin",
     "link_delay",
     "link_jitter",
     "link_loss",
@@ -498,7 +496,6 @@ pub fn append_result(
         observed(sock_bufs.sndbuf_min_bytes),
         observed(sock_bufs.sndbuf_max_bytes),
         srt_transport::advanced::platform::current_cpu_spec().unwrap_or_default(),
-        if cfg.pin { "on" } else { "off" }.into(),
         cfg.link.get("delay").to_string(),
         cfg.link.get("jitter").to_string(),
         cfg.link.get("loss").to_string(),
@@ -1366,10 +1363,6 @@ fn filter_reason(cell: &Cell<'_>, axes: &[Axis]) -> Option<&'static str> {
         return Some(reason);
     }
 
-    if let Some(reason) = filter_pinning(cell, axes, runtime_recv, runtime_send) {
-        return Some(reason);
-    }
-
     None
 }
 
@@ -1477,18 +1470,6 @@ fn filter_batching(
     representative(axes, "batch", "on")
         .filter(|keep| batch != *keep)
         .map(|_| "batch-inert")
-}
-
-fn filter_pinning(
-    cell: &Cell<'_>,
-    axes: &[Axis],
-    _runtime_recv: &str,
-    _runtime_send: &str,
-) -> Option<&'static str> {
-    let pin = cell_value(cell, "pin", Some(Scope::Both))?;
-    representative(axes, "pin", "off")
-        .filter(|keep| pin != *keep)
-        .map(|_| "pin-inert")
 }
 
 #[cfg(test)]
@@ -1645,7 +1626,6 @@ fn recorded_column(axis: &str) -> Option<&'static str> {
         ("retry-horizon-ms", "retry_horizon_ms"),
         ("ack-interval-micros", "ack_interval_micros"),
         ("light-ack-interval-packets", "light_ack_interval_packets"),
-        ("pin", "pin"),
     ];
     COLUMNS
         .iter()
@@ -1807,7 +1787,6 @@ const CANONICAL_AXIS_NAMES: &[(&str, &str)] = &[
     ("cookie-routing", "cookie-routing"),
     ("batch", "batch"),
     ("sock-buf", "sock-buf"),
-    ("pin", "pin"),
     ("connections", "connections"),
     ("connect-concurrency", "connect-concurrency"),
     ("bond", "bond"),
@@ -2139,7 +2118,6 @@ fn resolve_matrix_axes(cli: &crate::Cli) -> std::io::Result<MatrixAxisConfig> {
         axis("cookie-routing", "cookie-routing", "on"),
         axis("batch", "batch", "on"),
         axis("sock-buf", "sock-buf", "16m"),
-        axis("pin", "pin", "off"),
         axis("link-delay", "link-delay", "off"),
         axis("link-jitter", "link-jitter", "off"),
         axis("link-loss", "link-loss", "off"),
@@ -3687,11 +3665,6 @@ mod matrix_filter_tests {
                 Scope::Both,
                 ["on", "off"].into_iter().map(str::to_string).collect(),
             ),
-            (
-                "pin",
-                Scope::Both,
-                ["off", "on"].into_iter().map(str::to_string).collect(),
-            ),
         ]
     }
 
@@ -3775,7 +3748,6 @@ mod matrix_filter_tests {
                     ("promotion", "all"),
                     ("cookie-routing", "on"),
                     ("batch", "on"),
-                    ("pin", "off"),
                     ("runtime", "mio"),
                     ("connections", "200"),
                     ("bond", "none"),
@@ -3791,7 +3763,6 @@ mod matrix_filter_tests {
                     ("promotion", "all"),
                     ("cookie-routing", "off"),
                     ("batch", "on"),
-                    ("pin", "off"),
                     ("runtime", "mio"),
                     ("connections", "200"),
                     ("bond", "none"),
@@ -3933,7 +3904,6 @@ mod matrix_filter_tests {
                 ("promotion", promotion),
                 ("cookie-routing", "on"),
                 ("batch", "on"),
-                ("pin", "off"),
                 ("runtime", "mio"),
                 ("connections", "200"),
                 ("bond", "none"),
@@ -3960,7 +3930,6 @@ mod matrix_filter_tests {
                 ("promotion", "never"),
                 ("cookie-routing", "on"),
                 ("batch", "on"),
-                ("pin", "off"),
                 ("connections", "50"),
                 ("bond", "none"),
             ]);
@@ -3980,6 +3949,48 @@ mod matrix_filter_tests {
             filter_reason(&cell_for("reuseport-multi:2", "compio", "owner"), &axes),
             Some("owner-is-receiver-only")
         );
+    }
+
+    /// Every plan a workflow or `cargo xtask` runs keeps at least one cell.
+    /// A plan the filter empties runs nothing and still exits 0, so the job
+    /// stays green while measuring nothing (bonded-ingress.plan did, after
+    /// K02 and the bonded connect-concurrency rule). The plan list is read
+    /// from the workflow and xtask sources, so a newly scheduled plan is
+    /// covered without editing this test. `full-matrix.plan` is pinned by
+    /// `tests/full_matrix_enumeration.rs` instead (1.1M raw cells).
+    #[test]
+    fn every_scheduled_plan_keeps_cells() {
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+        let mut sources = Vec::new();
+        for entry in std::fs::read_dir(format!("{root}/.github/workflows")).expect("workflows") {
+            sources.push(std::fs::read_to_string(entry.expect("entry").path()).expect("read"));
+        }
+        sources.push(
+            std::fs::read_to_string(format!("{root}/crates/xtask/src/main.rs")).expect("xtask"),
+        );
+        let mut plans: Vec<String> = sources
+            .iter()
+            .flat_map(|text| text.split(|c: char| c.is_whitespace() || c == '"' || c == ';'))
+            .filter(|word| word.starts_with("docs/plans/") && word.ends_with(".plan"))
+            .filter(|plan| *plan != "docs/plans/full-matrix.plan")
+            .map(str::to_string)
+            .collect();
+        plans.sort();
+        plans.dedup();
+        assert!(plans.len() >= 5, "found too few scheduled plans: {plans:?}");
+        for plan in plans {
+            let path = format!("{root}/{plan}");
+            let cli = cli(&["--plan", &path]);
+            let resolved = crate::harness::resolve_plan_cells(&cli)
+                .unwrap_or_else(|e| panic!("{plan} resolves: {e}"));
+            let (_, enumeration) = resolved
+                .enumerate_filtered()
+                .unwrap_or_else(|e| panic!("{plan} enumerates: {e}"));
+            assert!(
+                enumeration.kept_cells > 0,
+                "{plan} keeps no cell: it would run nothing and still pass: {enumeration:?}"
+            );
+        }
     }
 
     /// Every checked-in plan that crosses `shared-socket` egress with an
@@ -4096,7 +4107,6 @@ mod matrix_filter_tests {
             ("promotion", "bonded"),
             ("cookie-routing", "on"),
             ("batch", "on"),
-            ("pin", "off"),
             ("runtime", "mio"),
             ("connections", "200"),
             ("bond", "broadcast:64"),
@@ -4112,7 +4122,6 @@ mod matrix_filter_tests {
             ("promotion", "all"),
             ("cookie-routing", "on"),
             ("batch", "on"),
-            ("pin", "off"),
             ("runtime", "mio"),
             ("connections", "2"),
             ("bond", "broadcast:1"),
@@ -4128,7 +4137,6 @@ mod matrix_filter_tests {
                 ("promotion", "never"),
                 ("cookie-routing", "on"),
                 ("batch", "on"),
-                ("pin", "off"),
                 ("runtime", runtime),
                 ("connections", "200"),
                 ("bond", "broadcast:64"),
@@ -4142,7 +4150,6 @@ mod matrix_filter_tests {
             ("promotion", "relocate"),
             ("cookie-routing", "on"),
             ("batch", "on"),
-            ("pin", "off"),
             ("runtime", "mio"),
             ("connections", "200"),
             ("bond", "none"),
@@ -4159,7 +4166,6 @@ mod matrix_filter_tests {
             ("promotion", "all"),
             ("cookie-routing", "on"),
             ("batch", "on"),
-            ("pin", "off"),
             ("runtime", "mio"),
             ("connections", "50"),
             ("bond", "broadcast:64"),
@@ -4168,14 +4174,13 @@ mod matrix_filter_tests {
     }
 
     #[test]
-    fn filters_batch_and_pin_only_where_the_backend_ignores_them() {
+    fn filters_batch_only_where_the_backend_ignores_it() {
         let axes = axes();
         let batch_non_mio = [
             ("ingress", "shared-pool:4"),
             ("promotion", "all"),
             ("cookie-routing", "on"),
             ("batch", "off"),
-            ("pin", "off"),
             ("connections", "200"),
             ("bond", "none"),
         ];
@@ -4185,29 +4190,6 @@ mod matrix_filter_tests {
             .chain([("runtime", "tokio")])
             .collect::<Vec<_>>();
         assert_eq!(filter_reason(&cell(&non_mio), &axes), Some("batch-inert"));
-
-        let pin_base = [
-            ("ingress", "shared-pool:4"),
-            ("promotion", "all"),
-            ("cookie-routing", "on"),
-            ("batch", "on"),
-            ("pin", "on"),
-            ("connections", "200"),
-            ("bond", "none"),
-        ];
-        let mio = pin_base
-            .iter()
-            .copied()
-            .chain([("runtime", "mio")])
-            .collect::<Vec<_>>();
-        assert_eq!(filter_reason(&cell(&mio), &axes), Some("pin-inert"));
-
-        let compio = pin_base
-            .iter()
-            .copied()
-            .chain([("runtime", "compio")])
-            .collect::<Vec<_>>();
-        assert_eq!(filter_reason(&cell(&compio), &axes), Some("pin-inert"));
     }
 
     #[test]
@@ -4219,7 +4201,6 @@ mod matrix_filter_tests {
                 ("promotion", "relocate"),
                 ("cookie-routing", "on"),
                 ("batch", "on"),
-                ("pin", "off"),
                 ("runtime", "mio"),
                 ("connections", "200"),
                 ("bond", "none"),
@@ -4229,7 +4210,6 @@ mod matrix_filter_tests {
                 ("promotion", "all"),
                 ("cookie-routing", "on"),
                 ("batch", "on"),
-                ("pin", "off"),
                 ("runtime", "mio"),
                 ("connections", "50"),
                 ("bond", "backup:64"),

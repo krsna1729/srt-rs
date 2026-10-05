@@ -1401,7 +1401,6 @@ mod tests {
                     "16777216".to_string(),
                 ),
                 ("cpus".to_string(), "6".to_string()),
-                ("pin".to_string(), "off".to_string()),
                 ("link_delay".to_string(), "off".to_string()),
                 ("link_jitter".to_string(), "off".to_string()),
                 ("link_loss".to_string(), "off".to_string()),
@@ -1464,7 +1463,6 @@ mod tests {
                     "16777216".to_string(),
                 ),
                 ("cpus".to_string(), "6".to_string()),
-                ("pin".to_string(), "off".to_string()),
                 ("link_delay".to_string(), "off".to_string()),
                 ("link_jitter".to_string(), "off".to_string()),
                 ("link_loss".to_string(), "off".to_string()),
@@ -1740,7 +1738,6 @@ mod tests {
             set_field(row, "sock_sndbuf_effective_min_bytes", "2097152");
             set_field(row, "sock_sndbuf_effective_max_bytes", "2097152");
             set_field(row, "cpus", "0-3");
-            set_field(row, "pin", "off");
             set_field(row, "workers", "1");
             set_field(row, "conns", "10");
             set_field(row, "logical_streams", "10");
@@ -1982,14 +1979,14 @@ mod tests {
         let mut r1 = make_test_caller(
             "1", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "0", "10", "0",
         );
-        r1.fields.retain(|(k, _)| k != "pin");
-        r1.fields.push(("pin".to_string(), "off".to_string()));
+        r1.fields.retain(|(k, _)| k != "batch");
+        r1.fields.push(("batch".to_string(), "off".to_string()));
 
         let mut r2 = make_test_caller(
             "1", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "0", "10", "0",
         );
-        r2.fields.retain(|(k, _)| k != "pin");
-        r2.fields.push(("pin".to_string(), "on".to_string()));
+        r2.fields.retain(|(k, _)| k != "batch");
+        r2.fields.push(("batch".to_string(), "on".to_string()));
 
         let l1 = make_test_listener(
             "1", "10", "1000000", "10", "9499", "100.0", "100.0", "1000", "0", "0", "0", "10", "0",
@@ -2000,7 +1997,7 @@ mod tests {
         assert_eq!(
             summaries.len(),
             2,
-            "Cells differing in pin must be distinct"
+            "Cells differing in batch must be distinct"
         );
     }
 

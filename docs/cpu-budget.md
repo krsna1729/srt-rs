@@ -4,6 +4,8 @@
 > Glommio no longer exist in the tree, so these numbers cannot be
 > reproduced against current source; they are retained for methodology
 > context only.
+> The `--pin` flag and `pin` result column went with them (no remaining
+> runtime applied pinning); the `--pin` passages below are historical too.
 
 # CPU budget: what the benchmarks are actually measuring
 

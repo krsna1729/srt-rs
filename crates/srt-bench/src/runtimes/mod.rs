@@ -42,9 +42,6 @@
 //! |---------|----------------------|-------------------------------|---------------------------------|
 //! | mio     | no runtime, raw epoll| 1 thread : N sockets (`Token(i)` on one `Poll`) | software `ManualTimerStore` scans, gated to active conns |
 //! | tokio   | cooperative tasks    | 1 thread : N spawned tasks (`spawn_local` + `LocalSet`) | native wheel, 1 `Sleep` future/conn |
-//! | smol    | cooperative tasks    | 1 thread : N tasks (`async_executor::LocalExecutor`; smol's own block_on needs `Send`) | `smol::Timer` futures/conn |
-//! | monoio  | thread-per-core      | 1 core : N tasks, completion-based, blocking recvs own their socket | io_uring kernel timeouts |
-//! | glommio | thread-per-core      | 1 core : N tasks, shared submission ring | `glommio::timer` wheel          |
 //! | compio  | thread-per-core      | 1 thread : 2N tasks (protocol task + never-cancelled reader task/channel) | `compio::time::sleep` |
 //!
 //! # Measured findings (6-core shared-tenant EPYC VPS, load avg 2-5)
@@ -58,6 +55,8 @@
 //! The numbers below predate the x86-64-v3 + LTO release profile and the
 //! shared admission machinery, and were taken with the former shell
 //! harness. Treat them as order-of-magnitude until re-measured.
+//! The smol, monoio and glommio rows record runtimes since retired from
+//! the workspace; they are kept as measured.
 //!
 //! ## @300 conns, 8 Mbps/conn (2026-08-22 window)
 //!

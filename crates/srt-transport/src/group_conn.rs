@@ -296,7 +296,7 @@ pub(crate) fn group_connection_stats(
 
 /// Runtime-neutral multi-socket driver for an SRT Broadcast or Backup group.
 ///
-/// This is intentionally synchronous and nonblocking. Tokio, smol, mio, and
+/// This is intentionally synchronous and nonblocking. Tokio, mio, compio and
 /// other runtimes can register the exposed leg sockets in their own reactors,
 /// then call [`Self::drive`] when any leg is readable or a timer is due. That
 /// keeps group semantics in one implementation instead of copying subtly

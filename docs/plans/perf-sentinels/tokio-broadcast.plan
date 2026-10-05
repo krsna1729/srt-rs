@@ -23,4 +23,3 @@ batch               = on
 sock-buf            = 16m
 connect-concurrency = 2
 bond                = broadcast:16
-pin                 = off

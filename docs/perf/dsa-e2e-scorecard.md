@@ -1,5 +1,9 @@
 # Post-DSA End-to-End Live Benchmark Scorecard
 
+> **Historical record.** Measured before the supported runtimes were reduced
+> to Mio, Tokio and Compio; the smol, monoio and glommio rows cannot be
+> reproduced against current source and are kept as measured.
+
 ## Executive Summary
 
 This report establishes the definitive live socket and connection-scale performance record for the structural

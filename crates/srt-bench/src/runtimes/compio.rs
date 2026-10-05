@@ -17,11 +17,9 @@
 //! `to_vec` internally — fixing that requires a protocol-layer API change.
 //!
 //! `Ingress::ReuseportMulti(K)` (#4) uses the identical fix and reasoning
-//! as mio's `run_pool_acceptor`, tokio's `run_acceptor`, smol's
-//! `run_acceptor`, monoio's `run_acceptor`, and glommio's `run_acceptor`:
+//! as mio's `run_pool_acceptor` and tokio's `run_acceptor`:
 //! K OS threads, each running its own compio `Runtime` (spawned manually,
-//! same as mio/monoio -- compio's `Runtime` doesn't create its own thread
-//! the way glommio's `LocalExecutorBuilder` does), gives `worker_index`
+//! same as mio -- compio's `Runtime` doesn't create its own thread), gives `worker_index`
 //! stable thread identity for the bond-affinity registry/handoff
 //! mechanism. Within each acceptor thread, a connection only ever gets its
 //! own task -- and its own socket -- if it actually needs to relocate for
@@ -757,7 +755,7 @@ fn run_reuseport_multi(cfg: BenchConfig, k: usize) {
     let telemetry = Arc::new(srt_transport::advanced::telemetry::IngressTelemetry::new());
 
     // All channels exist before any thread spawns -- see the identical
-    // mio/tokio/smol/monoio/glommio bug this avoids: cloning a
+    // mio/tokio bug this avoids: cloning a
     // partially-built `Vec<Sender>` mid-loop hands early threads a
     // truncated view and panics on out-of-bounds indexing the first time
     // a handoff resolves to a later worker.

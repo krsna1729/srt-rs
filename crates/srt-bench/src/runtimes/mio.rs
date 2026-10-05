@@ -2877,7 +2877,6 @@ mod b02_regression_tests {
             rep: 1,
             attempt: String::new(),
             cpus: 0,
-            pin: false,
             workers: 1,
             stream_secs: 1.0,
             peer_topology: crate::PeerTopology::default(),

@@ -15,8 +15,6 @@ dependency changes — or better, run `cargo deny check licenses`
 
 | License | Crates | Reachable from |
 |---|---|---|
-| MPL-2.0+ (file-level copyleft) | `bitmaps` 3.2.1 | `glommio` |
-| Zlib | `nanorand` 0.7.0 | `flume` ← `glommio`, `monoio` |
 | Zlib | `slotmap` 1.0.7 | `compio-executor` ← `compio` |
 | BSD-3-Clause | `instant` 0.1.13 | `fastrand` ← nearly everything async |
 | Unlicense OR MIT | `memchr`, `byteorder`, `aho-corasick`, `winapi-util`, `same-file`, `walkdir` | tracing-subscriber, regex, walkdir |

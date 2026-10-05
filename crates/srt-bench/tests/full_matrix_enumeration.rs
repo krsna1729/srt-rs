@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use srt_bench::Cli;
 use srt_bench::harness::enumerate_plan;
 
-const FULL_MATRIX_RAW: usize = 4_423_680;
+const FULL_MATRIX_RAW: usize = 1_105_920;
 /// Documented retained count from an older filter baseline. Must not match
 /// the live product; the pin below is the source of truth.
 const STALE_DOCUMENTED_KEPT: usize = 67_200;
@@ -52,11 +52,11 @@ fn full_matrix_plan_uses_production_filter_and_pins_current_kept_count() {
         "live filter must not be the stale documented 67,200"
     );
 
-    // Current production filter on this plan (recomputed at tip; the older
-    // 57,984 figure is a historical baseline). Update this pin when the
+    // Current production filter on this plan (recomputed after the
+    // smol/monoio/glommio runtimes and the pin axis were retired). Update this pin when the
     // filter changes, not to match prose.
     assert_eq!(
-        enumeration.kept_cells, 54_080,
+        enumeration.kept_cells, 30_464,
         "kept count drifted; update this pin and the filter-summary docs together: {enumeration:?}"
     );
     let reasons: Vec<(&str, usize)> = enumeration
@@ -68,16 +68,15 @@ fn full_matrix_plan_uses_production_filter_and_pins_current_kept_count() {
     assert_eq!(
         reasons,
         [
-            ("batch-inert", 80_768),
-            ("bond-capacity", 61_440),
-            ("bonded-cc-requires-2", 245_760),
-            ("bonded-egress-unsupported", 1_474_560),
-            ("bonded-ingress-unsupported", 147_456),
-            ("cookie-routing-inert", 102_912),
-            ("pin-inert", 54_080),
-            ("promotion-inert", 516_096),
-            ("promotion-inert-shared-egress", 211_968),
-            ("shared-egress-workers-inert", 1_474_560),
+            ("batch-inert", 16_768),
+            ("bond-capacity", 15_360),
+            ("bonded-cc-requires-2", 61_440),
+            ("bonded-egress-unsupported", 368_640),
+            ("bonded-ingress-unsupported", 36_864),
+            ("cookie-routing-inert", 25_728),
+            ("promotion-inert", 129_024),
+            ("promotion-inert-shared-egress", 52_992),
+            ("shared-egress-workers-inert", 368_640),
         ],
         "per-reason filter counts drifted: {reasons:?}"
     );
@@ -86,7 +85,7 @@ fn full_matrix_plan_uses_production_filter_and_pins_current_kept_count() {
     assert!(table.contains("kept"), "{table}");
     assert!(table.contains("raw"), "{table}");
     let json = enumeration.render_json();
-    assert!(json.contains("\"raw\":4423680"), "{json}");
-    assert!(json.contains("\"kept\":54080"), "{json}");
+    assert!(json.contains("\"raw\":1105920"), "{json}");
+    assert!(json.contains("\"kept\":30464"), "{json}");
     assert!(json.contains("by_reason"), "{json}");
 }

@@ -257,9 +257,6 @@ are implementation details and are available only through the
 |---|---|---|
 | `mio` | raw epoll, no task model | readiness |
 | `tokio` | current-thread + tasks | readiness |
-| `smol` | async-executor tasks | readiness |
-| `monoio` | thread-per-core | completion (owned buffers) |
-| `glommio` | thread-per-core (Linux-only) | completion, shared SQ ring |
 | `compio` | single runtime | completion (owned buffers) |
 
 Features are additive: enable exactly the ones your binary links.
@@ -274,8 +271,8 @@ publication gate. Path dependencies are equivalent for workspace consumers.
 
 ## Design: deliberately no lowest-common-denominator trait
 
-A shared `trait Conn` spanning readiness-based (mio/smol/tokio) and
-completion-based (monoio/glommio/compio) execution would force an LCD API
+A shared `trait Conn` spanning readiness-based (mio/tokio) and
+completion-based (compio) execution would force an LCD API
 that defeats the point of comparing the runtimes on their own terms.
 Instead each `Conn` uses its runtime's idiomatic primitives directly, and
 "swappable" is achieved at the **binary/CLI level**: `srt-bench` selects a

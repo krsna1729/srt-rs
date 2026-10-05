@@ -3,12 +3,19 @@
 # intentionally separate from the full topology bake-off: today only one
 # shared, group-aware PeerTable can realize inbound group association.
 
-runtime    = mio,tokio,smol,monoio,glommio,compio
+runtime    = mio,tokio,compio
 ingress    = shared-pool:1
 egress     = shared-socket
 encryption = plain,128,192,256
 connections = 2
 bond       = broadcast:1,backup:1
+# Both legs of a bond must be able to connect together; with the default
+# connect-concurrency of 1 the production filter drops every bonded cell.
+connect-concurrency = 2
+# Shared-socket egress realizes only `promotion = never` (an explicit
+# bonded/all is rejected at startup), so say so instead of inheriting the
+# default, which the filter drops.
+promotion  = never
 
 # SRT's pacing policy, stated explicitly rather than inherited from a
 # default: SRTO_INPUTBW tracks the source payload rate with a 25%

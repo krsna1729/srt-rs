@@ -82,7 +82,6 @@ fn recorded_cell_values(runtime: &str) -> Vec<(&'static str, String)> {
             "light_ack_interval_packets",
             srt_proto::receiver::LIGHT_ACK_INTERVAL_PACKETS.to_string(),
         ),
-        ("pin", "off".into()),
         ("conns", "1".into()),
         ("connect_cc", "1".into()),
         ("bond", "none".into()),

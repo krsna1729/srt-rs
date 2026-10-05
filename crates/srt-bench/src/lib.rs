@@ -416,11 +416,6 @@ pub struct BenchConfig {
     /// Recorded in results because a benchmark that does not state its
     /// CPU budget cannot be compared against one from another machine.
     pub cpus: usize,
-    /// Pin each executor to its own CPU where the runtime supports it
-    /// (glommio's `Placement::Fixed`). Off by default, because pinning is
-    /// a real variable: glommio and monoio are thread-per-core designs
-    /// that assume it, while the others do not.
-    pub pin: bool,
     /// How many OS threads the task-per-connection driver uses, each
     /// with its own executor, connections dealt round-robin between them.
     ///
@@ -1468,7 +1463,7 @@ impl Drop for HandshakePermit {
 /// the limiter and is woken only when a permit is actually released.
 ///
 /// It is deliberately built on nothing but [`std::task::Waker`], so the same
-/// implementation works on tokio, smol, monoio, glommio and compio without
+/// implementation works on tokio and compio without
 /// importing any runtime's timer -- previously each adapter polled
 /// `try_acquire` behind a 1ms sleep, which made the measured cost of a
 /// low-`--connect-concurrency` cell depend on that runtime's timer wheel
@@ -3011,7 +3006,7 @@ fn usage() -> ! {
          [--egress per-connection|shared-socket] \
          [--encryption plain|128|192|256] \
          [--bond broadcast:G|backup:G|none] [--batch on|off] \
-         [--connect-concurrency N] [--recv-rounds N] [--would-block retain|drop] [--promotion never|relocate|bonded|all] [--cookie-routing on|off] [--sock-buf N|Nk|Nm|default] [--out FILE] [--cpus 0-3|0,2,4] [--pin on|off] [--workers N] [--link-delay 25ms] [--link-jitter 5ms] [--link-loss 1%] [--link-rate 100mbit] \
+         [--connect-concurrency N] [--recv-rounds N] [--would-block retain|drop] [--promotion never|relocate|bonded|all] [--cookie-routing on|off] [--sock-buf N|Nk|Nm|default] [--out FILE] [--cpus 0-3|0,2,4] [--workers N] [--link-delay 25ms] [--link-jitter 5ms] [--link-loss 1%] [--link-rate 100mbit] \
          [--ack-interval-micros US] [--light-ack-interval-packets N] \
          [--host-contention refuse|mark|allow] [--allow-host-contention]"
     );
@@ -3307,7 +3302,7 @@ fn parse_sock_buf(cli: &Cli) -> usize {
     }
 }
 
-fn parse_runtime_settings(cli: &Cli, duration_secs: f64) -> (usize, bool, usize, f64) {
+fn parse_runtime_settings(cli: &Cli, duration_secs: f64) -> (usize, usize, f64) {
     // A CPU *set*, not a count: the two roles need disjoint cores.
     let cpu_list = srt_transport::advanced::platform::parse_cpu_spec(
         cli.flags.get("cpus").map(String::as_str).unwrap_or(""),
@@ -3318,17 +3313,13 @@ fn parse_runtime_settings(cli: &Cli, duration_secs: f64) -> (usize, bool, usize,
         eprintln!("warning: could not restrict to CPUs {cpu_list:?}: {error}");
     }
     let cpus = cpu_list.len();
-    let pin = matches!(
-        cli.flags.get("pin").map(String::as_str),
-        Some("") | Some("on")
-    );
     let workers = cli.flag_or("workers", 1usize).max(1);
     let stream_secs = cli
         .flags
         .get("stream-secs")
         .and_then(|value| value.parse().ok())
         .unwrap_or(duration_secs);
-    (cpus, pin, workers, stream_secs)
+    (cpus, workers, stream_secs)
 }
 
 fn scoped_flag(cli: &Cli, name: &str) -> String {
@@ -3439,7 +3430,7 @@ pub fn bench_config_from_args() -> BenchConfig {
     let promotion = parse_promotion(&cli);
     let cookie_routing = parse_cookie_routing(&cli);
     let sock_buf_bytes = parse_sock_buf(&cli);
-    let (cpus, pin, workers, stream_secs) = parse_runtime_settings(&cli, duration_secs);
+    let (cpus, workers, stream_secs) = parse_runtime_settings(&cli, duration_secs);
     let peer_topology = parse_peer_topology(&cli);
     let link = parse_link(&cli);
     let classifier_policy = crate::classifier::policy_from_cli(&cli).unwrap_or_else(|error| {
@@ -3504,7 +3495,6 @@ pub fn bench_config_from_args() -> BenchConfig {
         rep,
         attempt,
         cpus,
-        pin,
         workers,
         stream_secs,
         peer_topology,
@@ -3629,7 +3619,6 @@ pub(crate) mod tests {
             rep: 1,
             attempt: String::new(),
             cpus: 0,
-            pin: false,
             workers: 1,
             stream_secs: 1.0,
             peer_topology: PeerTopology::default(),

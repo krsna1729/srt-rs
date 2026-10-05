@@ -24,7 +24,6 @@ batch               = on
 sock-buf            = 16m
 bond                = none
 connect-concurrency = 50
-pin                 = off
 source-backlog-ms   = 1000
 
 # Receiver runtime and worker count are the deployment variables.
