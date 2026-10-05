@@ -99,6 +99,30 @@ jobs:
         env:
           MIRIFLAGS: -Zmiri-tree-borrows
 
+  kani:
+    name: Kani bounded proofs
+    needs: quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      # Every proof `cargo kani` finds; one that stops compiling must fail
+      # the job, not vanish.
+      KANI_PROOFS: '3'
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Kani
+        run: |
+          cargo install --locked kani-verifier --version 0.68.0
+          cargo kani setup
+      - name: Run every Kani proof
+        run: |
+          cargo kani -p srt-transport --lib -Z stubbing 2>&1 | tee kani.log
+          grep -q "Complete - $KANI_PROOFS successfully verified harnesses, 0 failures, $KANI_PROOFS total" kani.log
+          # Every cover reached: a proof whose interesting branch became
+          # unreachable proves nothing about it.
+          grep -E '^ \*\* [0-9]+ of [0-9]+ cover properties satisfied' kani.log \
+            | awk '$2 != $4 { bad = 1 } END { exit bad }'
+
   libsrt-interop:
     name: libsrt live interop (Ubuntu)
     needs: quality

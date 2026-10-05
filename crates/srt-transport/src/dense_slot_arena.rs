@@ -17,6 +17,10 @@ use std::net::SocketAddr;
 /// gives predictable allocation and prevents an unchecked `next_power_of_two`
 /// from turning an adversarial capacity into an overflow or an OOM.
 pub const MAX_DENSE_SLOTS: usize = 1 << 16;
+/// Smallest slot domain an arena allocates (a routing-table cache floor).
+/// Kani proofs use 2: the logic is the same, and CBMC cannot model 64 slots
+/// with their free list in reasonable memory.
+const MIN_ROUTE_SLOTS: usize = if cfg!(kani) { 2 } else { 64 };
 /// One peer slot returned when removing an active peer from the arena.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -107,7 +111,7 @@ impl<T> DenseSlotArena<T> {
         assert!(index < count, "partition index out of range");
         let max_slots = max_slots.clamp(1, MAX_DENSE_SLOTS);
         let capacity = max_slots
-            .max(64)
+            .max(MIN_ROUTE_SLOTS)
             .saturating_mul(count)
             .min(MAX_DENSE_SLOTS)
             .next_power_of_two();
@@ -623,6 +627,170 @@ impl<T> DenseSlotArena<T> {
                 value: *val,
             })
         })
+    }
+}
+
+/// Rung 4 (Restream docs/assurance-roadmap.md): Socket IDs and their
+/// sessions. Every ID the arena issued resolves exactly while its session
+/// lives, a new ID never equals an earlier one (a delayed datagram for an old
+/// session cannot reach a new one) and the arena holds at most `max_slots`
+/// sessions: for every bounded sequence of allocations and removals, and for
+/// the preferred-ID path as a concrete trace (a symbolic history there makes
+/// CBMC model a free-list removal at a symbolic index, which does not finish).
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    const STEPS: usize = 3;
+    /// Below the slot floor, so the `max_slots` check, not an empty free
+    /// list, is what refuses a second session.
+    const MAX_SLOTS: usize = 1;
+
+    #[derive(Clone, Copy)]
+    struct Issued {
+        slot: usize,
+        socket_id: u32,
+        live: bool,
+    }
+
+    /// Kani cannot read the OS random source a `RandomState` seeds from;
+    /// fixed keys keep the `lent` set's hashing deterministic, which the
+    /// properties do not depend on.
+    fn fixed_random_state() -> std::hash::RandomState {
+        // SAFETY: `RandomState` is two `u64` keys; all-zero is a valid value.
+        unsafe { std::mem::zeroed() }
+    }
+
+    fn address() -> SocketAddr {
+        SocketAddr::from(([10, 0, 0, 1], 9000))
+    }
+
+    /// The arena and what the proof knows it handed out.
+    struct Trace {
+        arena: DenseSlotArena<u8>,
+        issued: [Option<Issued>; STEPS],
+        count: usize,
+        live: usize,
+    }
+
+    impl Trace {
+        fn allocate(&mut self, step: usize) {
+            let Some((slot, socket_id)) = self.arena.allocate_socket_id(0) else {
+                assert!(self.live == MAX_SLOTS);
+                return;
+            };
+            assert!(self.live < MAX_SLOTS);
+            assert!(socket_id != 0);
+            assert!(self.arena.slot_index_for_socket_id(socket_id) == slot);
+            for entry in self.issued[..self.count].iter().flatten() {
+                assert!(entry.socket_id != socket_id);
+            }
+            self.arena
+                .insert_at_slot(slot, socket_id, address(), step as u8);
+            self.issued[self.count] = Some(Issued {
+                slot,
+                socket_id,
+                live: true,
+            });
+            self.count += 1;
+            self.live += 1;
+        }
+
+        /// Remove the oldest or the newest live session.
+        fn remove_one(&mut self, newest: bool) {
+            let is_live = |entry: &Option<Issued>| entry.is_some_and(|e| e.live);
+            let live = &self.issued[..self.count];
+            let pick = if newest {
+                live.iter().rposition(is_live)
+            } else {
+                live.iter().position(is_live)
+            };
+            let Some(target) = pick.and_then(|index| self.issued[index].map(|e| (index, e))) else {
+                return;
+            };
+            let (index, entry) = target;
+            let removed = self.arena.remove_by_slot(entry.slot);
+            assert!(removed.is_some_and(|peer| peer.socket_id == entry.socket_id));
+            self.issued[index] = Some(Issued {
+                live: false,
+                ..entry
+            });
+            self.live -= 1;
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(6)]
+    #[kani::solver(kissat)]
+    #[kani::stub(std::hash::RandomState::new, fixed_random_state)]
+    fn an_issued_socket_id_resolves_exactly_while_its_session_lives() {
+        let mut trace = Trace {
+            arena: DenseSlotArena::new(MAX_SLOTS),
+            issued: [None; STEPS],
+            count: 0,
+            live: 0,
+        };
+        for step in 0..STEPS {
+            if kani::any() {
+                trace.allocate(step);
+            } else {
+                trace.remove_one(kani::any());
+            }
+            assert!(trace.arena.len() == trace.live);
+        }
+        for entry in trace.issued.iter().flatten() {
+            assert!(trace.arena.get(entry.socket_id, address()).is_some() == entry.live);
+        }
+        kani::cover!(trace.live == MAX_SLOTS, "the arena fills up");
+    }
+
+    /// Concrete trace: one session at a time through every slot of the
+    /// (FIFO) free list until slot 0 comes back at a new generation. Every
+    /// ID is distinct, and none of the earlier ones resolves again.
+    #[kani::proof]
+    #[kani::unwind(8)]
+    #[kani::stub(std::hash::RandomState::new, fixed_random_state)]
+    fn a_reused_slot_never_resolves_an_earlier_socket_id() {
+        let mut arena = DenseSlotArena::<u8>::new(1);
+        let mut earlier = [0_u32; MIN_ROUTE_SLOTS + 1];
+        for (round, previous) in earlier.iter_mut().enumerate() {
+            let Some((slot, socket_id)) = arena.allocate_socket_id(0) else {
+                unreachable!()
+            };
+            assert!(slot == round % MIN_ROUTE_SLOTS);
+            arena.insert_at_slot(slot, socket_id, address(), round as u8);
+            *previous = socket_id;
+            assert!(arena.remove_by_slot(slot).is_some());
+        }
+        for (index, socket_id) in earlier.iter().enumerate() {
+            assert!(arena.get(*socket_id, address()).is_none());
+            assert!(earlier[..index].iter().all(|other| other != socket_id));
+        }
+    }
+
+    /// A preferred ID is honored for a slot never used; once that session is
+    /// gone the same preferred ID is refused, the next session gets a fresh
+    /// ID, and the old ID never resolves.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    #[kani::stub(std::hash::RandomState::new, fixed_random_state)]
+    fn a_preferred_socket_id_is_never_reissued_after_its_session() {
+        let mut arena = DenseSlotArena::<u8>::new(MAX_SLOTS);
+        let last = MIN_ROUTE_SLOTS as u32 - 1;
+        let preferred = (7 << arena.slot_bits()) | last;
+        let Some((slot, socket_id)) = arena.allocate_socket_id(preferred) else {
+            unreachable!()
+        };
+        assert!(slot == last as usize && socket_id == preferred);
+        arena.insert_at_slot(slot, socket_id, address(), 1);
+        assert!(arena.remove_by_slot(slot).is_some());
+        let Some((next_slot, next_id)) = arena.allocate_socket_id(preferred) else {
+            unreachable!()
+        };
+        assert!(next_id != preferred);
+        arena.insert_at_slot(next_slot, next_id, address(), 2);
+        assert!(arena.get(preferred, address()).is_none());
+        assert!(arena.get(next_id, address()) == Some(&2));
     }
 }
 
