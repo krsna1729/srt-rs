@@ -65,7 +65,7 @@ jobs:
             ./target/release/srt-bench matrix --plan "$plan" --reps 1 --out nightly.tsv
             echo "::endgroup::"
           done
-      # The real nightly sweep: full throughput-matrix.plan (1536 cells,
+      # The real nightly sweep: full throughput-matrix.plan (768 cells,
       # documented), not axis-trimmed -- budgeted 5h leaving 1h margin in
       # the 6h ceiling for setup and the report/upload steps. `timeout`
       # exit 124 is the EXPECTED time-box outcome, not a failure: whatever
@@ -107,9 +107,13 @@ jobs:
           echo "## cells that did not fully establish"
           awk -F'\t' '
             NR==1 { for (i=1;i<=NF;i++) h[$i]=i; next }
-            $h["established"] < $h["conns"] {
+            {
+              # A bonded listener admits one logical stream per group, so its
+              # expected count is logical_streams; callers count physical legs.
+              want = ($h["role"] == "listener" && $h["logical_streams"] > 0) ? $h["logical_streams"] : $h["conns"]
+              if ($h["established"] >= want) next
               print $h["runtime"], $h["ingress"], $h["egress"], $h["encryption"], \
-                    $h["role"] ": " $h["established"] "/" $h["conns"]
+                    $h["role"] ": " $h["established"] "/" want
               n++
             }
             END { if (!n) print "(none)" }

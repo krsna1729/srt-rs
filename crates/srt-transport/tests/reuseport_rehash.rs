@@ -16,8 +16,8 @@
 //! There is deliberately no SRT, no async runtime, and no srt-bench code
 //! here -- just `std::net` and the shared `bind_reuseport` helper. That's
 //! the point: whatever these tests measure is *kernel* behavior, identical
-//! for every async runtime in the workspace, since mio/tokio/smol/monoio/
-//! glommio/compio all reach the same `bind(2)`/`connect(2)` syscalls
+//! for every async runtime in the workspace, since mio/tokio/compio all
+//! reach the same `bind(2)`/`connect(2)` syscalls
 //! underneath. A runtime can change how it waits for readiness or
 //! completion; it cannot change how the kernel hashes a UDP flow to a
 //! reuseport group member.

@@ -13,7 +13,7 @@
 # cells remain: Socket IDs make them protocol-valid, though they do not model
 # independent network paths.
 
-runtime             = mio,tokio,smol,monoio,glommio,compio
+runtime             = mio,tokio,compio
 ingress             = per-port,shared-pool:1
 egress              = per-connection,shared-socket
 encryption          = plain,256
@@ -38,4 +38,3 @@ batch               = on
 sock-buf            = 16m
 bond                = none,broadcast:4,backup:4
 connect-concurrency = 2
-pin                 = off

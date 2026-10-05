@@ -440,7 +440,7 @@ Read the common sections once, then read only the selected card, prerequisites, 
 
 **Phase:** Transport correctness. **Prerequisites:** S02. **Initial status:** TODO. **Current status:** VERIFIED (Opus-reviewed, amended).
 
-**Read first:** [crates/srt-transport/src/runtimes/tokio.rs:179](/home/dev/srt-rs/crates/srt-transport/src/runtimes/tokio.rs:179), [crates/srt-transport/src/runtimes/compio.rs:97](/home/dev/srt-rs/crates/srt-transport/src/runtimes/compio.rs:97), [crates/srt-transport/src/runtimes/smol.rs:138](/home/dev/srt-rs/crates/srt-transport/src/runtimes/smol.rs:138), [crates/srt-transport/src/runtimes/monoio.rs:105](/home/dev/srt-rs/crates/srt-transport/src/runtimes/monoio.rs:105), [crates/srt-transport/src/runtimes/glommio.rs:136](/home/dev/srt-rs/crates/srt-transport/src/runtimes/glommio.rs:136).
+**Read first:** [crates/srt-transport/src/runtimes/tokio.rs:179](/home/dev/srt-rs/crates/srt-transport/src/runtimes/tokio.rs:179), [crates/srt-transport/src/runtimes/compio.rs:97](/home/dev/srt-rs/crates/srt-transport/src/runtimes/compio.rs:97).
 
 **Implementation checkpoints:**
 
@@ -458,7 +458,7 @@ Read the common sections once, then read only the selected card, prerequisites, 
 
 **Phase:** Transport correctness. **Prerequisites:** S03. **Initial status:** TODO. **Current status:** VERIFIED (Opus-reviewed).
 
-**Read first:** [crates/srt-transport/src/runtimes/tokio.rs:58](/home/dev/srt-rs/crates/srt-transport/src/runtimes/tokio.rs:58), [crates/srt-transport/src/runtimes/smol.rs:49](/home/dev/srt-rs/crates/srt-transport/src/runtimes/smol.rs:49), [crates/srt-transport/src/batch.rs:273](/home/dev/srt-rs/crates/srt-transport/src/batch.rs:273), [crates/srt-transport/src/caller.rs:1197](/home/dev/srt-rs/crates/srt-transport/src/caller.rs:1197).
+**Read first:** [crates/srt-transport/src/runtimes/tokio.rs:58](/home/dev/srt-rs/crates/srt-transport/src/runtimes/tokio.rs:58), [crates/srt-transport/src/batch.rs:273](/home/dev/srt-rs/crates/srt-transport/src/batch.rs:273), [crates/srt-transport/src/caller.rs:1197](/home/dev/srt-rs/crates/srt-transport/src/caller.rs:1197).
 
 **Implementation checkpoints:**
 
@@ -476,7 +476,7 @@ Read the common sections once, then read only the selected card, prerequisites, 
 
 **Phase:** Transport correctness. **Prerequisites:** S03. **Initial status:** TODO. **Current status:** VERIFIED (Opus-reviewed, amended).
 
-**Read first:** [crates/srt-transport/src/runtimes/compio.rs:40](/home/dev/srt-rs/crates/srt-transport/src/runtimes/compio.rs:40), [crates/srt-transport/src/runtimes/monoio.rs:40](/home/dev/srt-rs/crates/srt-transport/src/runtimes/monoio.rs:40), [crates/srt-transport/src/runtimes/glommio.rs:59](/home/dev/srt-rs/crates/srt-transport/src/runtimes/glommio.rs:59).
+**Read first:** [crates/srt-transport/src/runtimes/compio.rs:40](/home/dev/srt-rs/crates/srt-transport/src/runtimes/compio.rs:40).
 
 **Implementation checkpoints:**
 
@@ -513,7 +513,7 @@ Read the common sections once, then read only the selected card, prerequisites, 
 
 **Phase:** Transport correctness. **Prerequisites:** T01. **Initial status:** TODO. **Current status:** VERIFIED.
 
-**Read first:** [crates/srt-transport/src/batch.rs:202](/home/dev/srt-rs/crates/srt-transport/src/batch.rs:202), [crates/srt-transport/src/runtimes/tokio.rs:233](/home/dev/srt-rs/crates/srt-transport/src/runtimes/tokio.rs:233), [crates/srt-transport/src/runtimes/smol.rs:1](/home/dev/srt-rs/crates/srt-transport/src/runtimes/smol.rs:1).
+**Read first:** [crates/srt-transport/src/batch.rs:202](/home/dev/srt-rs/crates/srt-transport/src/batch.rs:202), [crates/srt-transport/src/runtimes/tokio.rs:233](/home/dev/srt-rs/crates/srt-transport/src/runtimes/tokio.rs:233).
 
 **Implementation checkpoints:**
 
@@ -860,7 +860,7 @@ Read the common sections once, then read only the selected card, prerequisites, 
 
 **Phase:** Application integration. **Prerequisites:** A04, A05, S04, S05, F05. **Initial status:** TODO.
 
-**Read first:** [crates/srt-transport/src/runtimes/smol.rs:1](/home/dev/srt-rs/crates/srt-transport/src/runtimes/smol.rs:1), [crates/srt-transport/src/runtimes/monoio.rs:1](/home/dev/srt-rs/crates/srt-transport/src/runtimes/monoio.rs:1), [crates/srt-transport/src/runtimes/glommio.rs:1](/home/dev/srt-rs/crates/srt-transport/src/runtimes/glommio.rs:1), [crates/srt-transport/src/runtimes/compio.rs:1](/home/dev/srt-rs/crates/srt-transport/src/runtimes/compio.rs:1).
+**Read first:** [crates/srt-transport/src/runtimes/compio.rs:1](/home/dev/srt-rs/crates/srt-transport/src/runtimes/compio.rs:1).
 
 **Implementation checkpoints:**
 
@@ -1118,7 +1118,7 @@ A command filter can legitimately match zero tests. Read its reported executed c
 | Q-BENCH-SRT600 | `cargo test -p srt-bench --lib qualification::`; generate the corpus with `cargo run -p srt-bench -- qualify plan` and score paired output with `qualify score BASE.tsv HEAD.tsv` |
 | Q-XTASK | `cargo test -p xtask` — add narrow parser/output regressions in existing modules where needed |
 | Q-FEATURE-TOKIO | `cargo check -p srt-transport --no-default-features --features tokio` |
-| Q-FEATURES | Run `cargo check -p srt-transport --no-default-features`, then the same command with one `--features` value at a time: `mio`, `tokio`, `smol`, `monoio`, `glommio`, `compio`; run matching native tests after each affected implementation |
+| Q-FEATURES | Run `cargo check -p srt-transport --no-default-features`, then the same command with one `--features` value at a time: `mio`, `tokio`, `compio`; run matching native tests after each affected implementation |
 | Q-DOCS | `cargo xtask doc`; also compile each new example under its documented feature. Inspect current xtask scope first. |
 | Q-MSRV | Existing protocol check: `cargo +1.93.0 check -p srt-proto --all-targets --locked`; separately qualify transport on its declared 1.96 toolchain. Installing toolchains is not a read-only action. |
 | Q-INTEROP | `cargo test -p srt-bench --test libsrt_interop -- --nocapture` — external libsrt prerequisites and actual executed cases required |

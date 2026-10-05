@@ -1,6 +1,6 @@
-# Controlled all-six-runtime breadth experiment across execution models.
+# Controlled runtime breadth experiment across execution models (mio, tokio, compio).
 # Evaluates pre/post DSA effects under identical topology and workload.
-runtime             = mio,tokio,smol,monoio,glommio,compio
+runtime             = mio,tokio,compio
 ingress             = shared-pool:4
 egress              = per-connection
 encryption          = plain
@@ -21,4 +21,3 @@ batch               = on
 sock-buf            = 16m
 bond                = none
 connect-concurrency = 50
-pin                 = off

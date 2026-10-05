@@ -1,5 +1,5 @@
 # Main reusable efficiency scorecard across representative runtime classes.
-runtime             = mio,tokio,monoio,compio
+runtime             = mio,tokio,compio
 ingress             = shared-pool:4
 egress              = per-connection
 encryption          = plain,256
@@ -20,4 +20,3 @@ batch               = on
 sock-buf            = 16m
 bond                = none
 connect-concurrency = 50
-pin                 = off

@@ -15,7 +15,6 @@ cookie-routing              = on
 batch                       = on
 bond                        = none
 connect-concurrency         = 20
-pin                         = off
 
 [recv]
 cpus                        = 0-2

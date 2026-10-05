@@ -5,8 +5,7 @@ ARG RUST_VERSION=1.96.0
 # Keep this image limited to dependencies needed by the real-libsrt interop
 # suite. Debian's packaged libsrt leaves bonding disabled, so build the same
 # current sid source with that one additional feature for the group test.
-# `linux-libc-dev` supplies the UAPI declarations used while building the
-# workspace's Glommio dependency.
+# `linux-libc-dev` supplies the kernel UAPI headers the libsrt C build uses.
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
         ca-certificates \
@@ -42,9 +41,6 @@ RUN apt-get update \
     && rm /tmp/rustup-init.sh
 
 ENV PATH=/root/.cargo/bin:${PATH}
-# Glommio 0.9's bundled liburing header refers to `struct open_how` without
-# including its Linux UAPI declaration. Debian sid exposes it here.
-ENV CFLAGS="-include linux/openat2.h"
 
 RUN rustc --version \
     && cargo --version \

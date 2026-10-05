@@ -161,6 +161,26 @@ fn legacy_result_files_are_rejected_explicitly() {
     );
 }
 
+/// A file from before the `pin` column was retired says so by name, so an
+/// old sweep is not mistaken for a corrupt one or resumed under a new schema.
+#[test]
+fn files_with_the_retired_pin_column_are_rejected_explicitly() {
+    let dir = std::env::temp_dir().join(format!("srt-bench-pin-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("workdir");
+    let path = dir.join("pin.tsv");
+    std::fs::write(
+        &path,
+        "runtime\trole\tconns\tpin\tsecs\nmio\tcaller\t1\toff\t10\n",
+    )
+    .expect("write file");
+    let error = srt_bench::harness::read_results(&path).expect_err("must reject");
+    let message = error.to_string();
+    assert!(
+        message.contains("legacy result schema") && message.contains("`pin`"),
+        "the rejection must name the retired column: {message}"
+    );
+}
+
 // --- live localhost evidence -------------------------------------------
 
 mod live {

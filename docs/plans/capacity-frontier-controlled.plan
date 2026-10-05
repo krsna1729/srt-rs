@@ -26,7 +26,6 @@ batch               = on
 sock-buf            = 16m
 bond                = none
 connect-concurrency = 50
-pin                 = off
 source-backlog-ms   = 1000
 
 # The receiver and sender own disjoint, equal three-CPU sets. Their worker

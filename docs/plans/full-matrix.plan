@@ -3,7 +3,7 @@
 # Use `throughput-matrix.plan` when only connection count, bitrate, runtime,
 # ingress, and encryption should move. This file is deliberately much larger:
 # it exposes interactions among topology, pacing, encryption, workers,
-# promotion, socket buffers, bonding, and CPU pinning.
+# promotion, socket buffers, and bonding.
 #
 # Earlier ladders held one of the two fixed:
 #   scaling-ladder  constant ~300 Mbps aggregate, N varied  -> isolates per-connection cost
@@ -12,16 +12,15 @@
 # both the two move together. Varying them independently does, at the
 # cost of 4x the cells.
 #
-# Raw product: 6 runtimes x 5 ingress x 2 egress x 4 encryption x 4 connections x 4 bitrate
+# Raw product: 3 runtimes x 5 ingress x 2 egress x 4 encryption x 4 connections x 4 bitrate
 # x 3 workers x 4 promotion x 2 cookie-routing x 2 batch x 2 sock-buf
-# x 2 connect-concurrency x 3 bond x 2 pin = 4,423,680 cells.
+# x 2 connect-concurrency x 3 bond = 1,105,920 cells.
 #
 # The harness enumerates the raw product and applies capability filtering
 # without retaining all raw cells. It retains one
 # representative for inert axes, keeps promotion/cookie controls only where
 # reuseport admission can observe them, keeps batching only where mio has a
-# shared-socket batched path, keeps pinning only where glommio applies it,
-# keeps one sender-worker and connect-concurrency representative for shared
+# shared-socket batched path, keeps one sender-worker and connect-concurrency representative for shared
 # egress (one socket has one owning runtime loop), keeps bonded cells only on
 # the shared logical-group egress and listener paths, and removes bond groups
 # larger than half the connection population. Identical-four-tuple bonded
@@ -49,7 +48,7 @@
 # Resumable: re-running skips cells already present in the output file,
 # so an interrupted sweep continues rather than restarting.
 
-runtime             = mio,tokio,smol,monoio,glommio,compio
+runtime             = mio,tokio,compio
 ingress             = per-port,shared-pool:1,shared-pool:4,reuseport-multi:4,reuseport-single:4
 egress              = per-connection,shared-socket
 encryption          = plain,128,192,256
@@ -69,4 +68,3 @@ batch               = on,off
 sock-buf            = default,16m
 connect-concurrency = 1,50
 bond                = none,broadcast:64,backup:64
-pin                 = off,on

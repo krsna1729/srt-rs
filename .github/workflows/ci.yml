@@ -131,10 +131,6 @@ jobs:
       # profile blocks io_uring_setup.
       options: --security-opt seccomp=unconfined
     timeout-minutes: 20
-    env:
-      # See the matching image setting: Glommio's bundled liburing needs the
-      # Linux UAPI declaration explicitly included on Debian sid.
-      CFLAGS: -include linux/openat2.h
     steps:
       - uses: actions/checkout@v7
       - name: Report libsrt tools version
@@ -201,12 +197,6 @@ jobs:
         env:
           RUSTFLAGS: -Zsanitizer=address
           RUSTDOCFLAGS: -Zsanitizer=address
-          # monoio's IoUringDriver::new intentionally Box::leak()s a couple
-          # of small fixed allocations meant to live for the process
-          # lifetime (see the suppressions file); srt-transport's own S05
-          # tests build and drop a short-lived Runtime per test, which
-          # otherwise trips LeakSanitizer on monoio's own design choice.
-          LSAN_OPTIONS: suppressions=${{ github.workspace }}/.github/lsan-suppressions-srt-transport.txt
 
   coverage:
     name: Coverage floors

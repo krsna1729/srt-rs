@@ -21,4 +21,3 @@ datapath-queue-horizon-ms   = 2000
 outbound-retry-horizon-ms   = 250
 recv-rounds                 = 8
 would-block                 = retain
-pin                         = off
