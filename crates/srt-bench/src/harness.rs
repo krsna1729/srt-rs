@@ -642,19 +642,19 @@ pub fn read_results(path: &Path) -> std::io::Result<Vec<Record>> {
                      with an older srt-bench.",
                     path.display(),
                 )
-            } else if legacy_pin {
-                format!(
-                    "{}: legacy result schema (has `pin`, retired with the runtimes that \
-                     applied it). Re-run the sweep, or compare old files with an older \
-                     srt-bench.",
-                    path.display(),
-                )
             } else if legacy_sock_buf {
                 format!(
                     "{}: legacy result schema (has `sock_buf`, which aliased requested vs effective \
                      socket buffer size). Those are now separate requested/effective min/max columns. \
                      Re-run the sweep, \
                      or compare old files with an older srt-bench.",
+                    path.display(),
+                )
+            } else if legacy_pin {
+                format!(
+                    "{}: legacy result schema (has `pin`, retired with the runtimes that \
+                     applied it). Re-run the sweep, or compare old files with an older \
+                     srt-bench.",
                     path.display(),
                 )
             } else {
@@ -3973,10 +3973,15 @@ mod matrix_filter_tests {
         for entry in std::fs::read_dir(format!("{root}/.github/workflows")).expect("workflows") {
             sources.push(std::fs::read_to_string(entry.expect("entry").path()).expect("read"));
         }
-        for entry in std::fs::read_dir(format!("{root}/crates/xtask/src")).expect("xtask src") {
-            let path = entry.expect("entry").path();
-            if path.extension().is_some_and(|ext| ext == "rs") {
-                sources.push(std::fs::read_to_string(path).expect("read"));
+        let mut dirs = vec![std::path::PathBuf::from(format!("{root}/crates/xtask/src"))];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).expect("xtask src") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    sources.push(std::fs::read_to_string(path).expect("read"));
+                }
             }
         }
         let mut plans: Vec<String> = sources
