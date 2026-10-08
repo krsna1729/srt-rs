@@ -247,6 +247,19 @@ cargo bench -p srt-proto       # criterion: core packet loop, loss/tsbpd scans
 cargo bench -p srt-transport     # admission limits and deadline/index tradeoffs
 ```
 
+Kani proofs (`#[cfg(kani)] mod kani_proofs`, run by the `Kani bounded proofs`
+CI job) check `DenseSlotArena`. Over any 3 allocations and removals: an
+issued Socket ID resolves exactly while its session lives, IDs are distinct,
+and the arena admits at most `max_slots` sessions. As concrete traces: a
+reused slot (plain or preferred ID) gets a new generation, so no earlier ID
+resolves again. Kani builds use a 2-slot routing floor instead of 64 so CBMC
+can model the arena.
+
+```sh
+cargo install --locked kani-verifier --version 0.68.0 && cargo kani setup
+cargo kani -p srt-transport --lib -Z stubbing
+```
+
 ### Optional developer dependencies
 
 Rust 1.96.0 is pinned by `rust-toolchain.toml`; `cargo test` needs no C
