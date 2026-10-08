@@ -631,12 +631,14 @@ impl<T> DenseSlotArena<T> {
 }
 
 /// Rung 4 (Restream docs/assurance-roadmap.md): Socket IDs and their
-/// sessions. Every ID the arena issued resolves exactly while its session
-/// lives, a new ID never equals an earlier one (a delayed datagram for an old
-/// session cannot reach a new one) and the arena holds at most `max_slots`
-/// sessions: for every bounded sequence of allocations and removals, and for
-/// the preferred-ID path as a concrete trace (a symbolic history there makes
-/// CBMC model a free-list removal at a symbolic index, which does not finish).
+/// sessions. For any 3 allocations and removals, every ID the arena issued
+/// resolves exactly while its session lives, IDs are distinct and the arena
+/// admits at most `max_slots` sessions. Slot reuse (the free list is FIFO,
+/// so it takes 5 steps) and the preferred-ID path are concrete traces: a
+/// reused slot gets a new generation, so a delayed datagram for an old
+/// session cannot reach a new one. (A symbolic history on the preferred
+/// path makes CBMC model a free-list removal at a symbolic index, which does
+/// not finish.)
 #[cfg(kani)]
 mod kani_proofs {
     use super::*;
@@ -784,13 +786,27 @@ mod kani_proofs {
         assert!(slot == last as usize && socket_id == preferred);
         arena.insert_at_slot(slot, socket_id, address(), 1);
         assert!(arena.remove_by_slot(slot).is_some());
-        let Some((next_slot, next_id)) = arena.allocate_socket_id(preferred) else {
+        // The same preferred ID is refused from now on; cycle the free list
+        // until the preferred slot itself is allocated again.
+        let mut reissued = None;
+        for round in 0..MIN_ROUTE_SLOTS {
+            let Some((next_slot, next_id)) = arena.allocate_socket_id(preferred) else {
+                unreachable!()
+            };
+            assert!(next_id != preferred);
+            arena.insert_at_slot(next_slot, next_id, address(), round as u8);
+            assert!(arena.get(preferred, address()).is_none());
+            if next_slot == slot {
+                reissued = Some(next_id);
+                break;
+            }
+            assert!(arena.remove_by_slot(next_slot).is_some());
+        }
+        let Some(next_id) = reissued else {
             unreachable!()
         };
-        assert!(next_id != preferred);
-        arena.insert_at_slot(next_slot, next_id, address(), 2);
-        assert!(arena.get(preferred, address()).is_none());
-        assert!(arena.get(next_id, address()) == Some(&2));
+        assert!(arena.slot_index_for_socket_id(next_id) == slot);
+        assert!(arena.get(next_id, address()).is_some());
     }
 }
 
