@@ -73,6 +73,7 @@ use rustc_hash::FxHashSet;
 
 #[cfg(test)]
 use std::cell::Cell;
+use std::ops::ControlFlow;
 
 use crate::error::Error;
 use crate::srt_handshake::{DEFAULT_FLOW_WINDOW, MAX_FLOW_WINDOW};
@@ -180,6 +181,15 @@ const TSBPD_DRIFT_MAX_US: i64 = 5_000;
 
 fn sequence_in_range(first_seq: u32, distance: u32, sequence: u32) -> bool {
     sequence.wrapping_sub(first_seq) & SEQUENCE_MASK <= distance
+}
+
+/// The part of the numeric segment `[seq, seq + count)` at or after `from`.
+fn clip_segment(seq: u32, count: u32, from: u32) -> Option<(u32, u32)> {
+    match from.checked_sub(seq) {
+        None | Some(0) => Some((seq, count)),
+        Some(skip) if skip < count => Some((from, count - skip)),
+        Some(_) => None,
+    }
 }
 
 /// Circular loss membership for one negotiated receive window.
@@ -377,16 +387,35 @@ impl LossBitmap {
     }
 
     fn for_each_numeric_run(&self, mut emit: impl FnMut(u32, u32)) {
+        let _ = self.try_for_each_numeric_run_from(0, |start, end| {
+            emit(start, end);
+            ControlFlow::Continue(())
+        });
+    }
+
+    /// Loss runs in numeric order, starting at numeric position `from` (a
+    /// run that straddles `from` is reported from `from`), until `emit`
+    /// breaks. A periodic NAK resumes its report here, so one fire walks
+    /// only the part of the list it reports.
+    fn try_for_each_numeric_run_from(
+        &self,
+        from: u32,
+        mut emit: impl FnMut(u32, u32) -> ControlFlow<()>,
+    ) -> ControlFlow<()> {
         if self.is_empty() {
-            return;
+            return ControlFlow::Continue(());
         }
         // A fixed stack sort preserves the measured sparse-loss fast path;
         // word-native run extraction wins once there are more than eight bits.
         if self.len <= 8 {
             let mut losses = [0; 8];
-            let len = self.len();
-            for (slot, loss) in losses.iter_mut().zip(self.iter()) {
-                *slot = loss;
+            let mut len = 0;
+            for loss in self.iter().filter(|&loss| loss >= from) {
+                losses[len] = loss;
+                len += 1;
+            }
+            if len == 0 {
+                return ControlFlow::Continue(());
             }
             losses[..len].sort_unstable();
             let mut start = losses[0];
@@ -395,29 +424,39 @@ impl LossBitmap {
                 if loss == end + 1 {
                     end = loss;
                 } else {
-                    emit(start, end);
+                    emit(start, end)?;
                     start = loss;
                     end = loss;
                 }
             }
-            emit(start, end);
-            return;
+            return emit(start, end);
         }
         const SEQUENCE_MODULUS: u64 = 1 << 31;
         let numeric_end = u64::from(self.base_seq) + u64::from(self.window_size);
         if numeric_end > SEQUENCE_MODULUS {
-            self.for_each_run_segment(0, (numeric_end - SEQUENCE_MODULUS) as u32, &mut emit);
-            self.for_each_run_segment(
-                self.base_seq,
-                (SEQUENCE_MODULUS - u64::from(self.base_seq)) as u32,
-                &mut emit,
-            );
+            let low_len = (numeric_end - SEQUENCE_MODULUS) as u32;
+            if let Some((seq, count)) = clip_segment(0, low_len, from) {
+                self.for_each_run_segment(seq, count, &mut emit)?;
+            }
+            let high_len = (SEQUENCE_MODULUS - u64::from(self.base_seq)) as u32;
+            match clip_segment(self.base_seq, high_len, from) {
+                Some((seq, count)) => self.for_each_run_segment(seq, count, &mut emit),
+                None => ControlFlow::Continue(()),
+            }
         } else {
-            self.for_each_run_segment(self.base_seq, self.window_size, &mut emit);
+            match clip_segment(self.base_seq, self.window_size, from) {
+                Some((seq, count)) => self.for_each_run_segment(seq, count, &mut emit),
+                None => ControlFlow::Continue(()),
+            }
         }
     }
 
-    fn for_each_run_segment(&self, mut seq: u32, mut count: u32, emit: &mut impl FnMut(u32, u32)) {
+    fn for_each_run_segment(
+        &self,
+        mut seq: u32,
+        mut count: u32,
+        emit: &mut impl FnMut(u32, u32) -> ControlFlow<()>,
+    ) -> ControlFlow<()> {
         let mut pending = None;
         while count != 0 {
             let index = self.bit_index(seq);
@@ -435,7 +474,7 @@ impl LossBitmap {
                     if pending_end + 1 == run_start {
                         pending = Some((pending_start, run_end));
                     } else {
-                        emit(pending_start, pending_end);
+                        emit(pending_start, pending_end)?;
                         pending = Some((run_start, run_end));
                     }
                 } else {
@@ -447,8 +486,9 @@ impl LossBitmap {
             seq += chunk;
             count -= chunk;
         }
-        if let Some((start, end)) = pending {
-            emit(start, end);
+        match pending {
+            Some((start, end)) => emit(start, end),
+            None => ControlFlow::Continue(()),
         }
     }
 
@@ -1981,13 +2021,21 @@ impl ReceiverBuffer {
         Some(NakPacket { loss_ranges })
     }
 
-    pub(crate) fn for_each_periodic_nak_range(&self, mut emit: impl FnMut(LossRange)) {
-        self.loss_list.for_each_numeric_run(|first_seq, last_seq| {
-            emit(LossRange {
-                first_seq,
-                last_seq,
+    /// Loss ranges in numeric order from numeric position `from`, until
+    /// `emit` breaks; see `LossBitmap::try_for_each_numeric_run_from`.
+    pub(crate) fn try_for_each_periodic_nak_range_from(
+        &self,
+        from: u32,
+        mut emit: impl FnMut(LossRange) -> ControlFlow<()>,
+    ) {
+        let _ = self
+            .loss_list
+            .try_for_each_numeric_run_from(from, |first_seq, last_seq| {
+                emit(LossRange {
+                    first_seq,
+                    last_seq,
+                })
             });
-        });
     }
 
     /// Calculate the NAK send interval: (RTT + 4*RTTVar) / 2.
@@ -2492,6 +2540,36 @@ mod tests {
             "numeric NAK runs stay sorted while the logical window wraps"
         );
         assert_eq!(losses.len(), 89);
+    }
+
+    /// A periodic NAK resumes inside either numeric segment of a wrapped
+    /// window, reports a straddled run from the resume point, and stops when
+    /// told to.
+    #[test]
+    fn numeric_runs_resume_from_a_position_and_stop_on_break() {
+        let base = SEQUENCE_MASK - 100;
+        let mut losses = LossBitmap::new(base, 200);
+        let first = SEQUENCE_MASK - 90;
+        losses.insert_range(first, 130); // numeric runs (0, 38), (first, MASK)
+        losses.remove_range(SEQUENCE_MASK - 20, 41); // -> (20, 38), (first, MASK - 21)
+        let runs_from = |from: u32, limit: usize| {
+            let mut runs = Vec::new();
+            let _ = losses.try_for_each_numeric_run_from(from, |start, end| {
+                runs.push((start, end));
+                if runs.len() == limit {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            });
+            runs
+        };
+        assert_eq!(runs_from(0, 9), [(20, 38), (first, SEQUENCE_MASK - 21)]);
+        assert_eq!(runs_from(0, 1), [(20, 38)], "a break stops the walk");
+        assert_eq!(runs_from(30, 9), [(30, 38), (first, SEQUENCE_MASK - 21)]);
+        assert_eq!(runs_from(39, 9), [(first, SEQUENCE_MASK - 21)]);
+        assert_eq!(runs_from(first + 5, 9), [(first + 5, SEQUENCE_MASK - 21)]);
+        assert_eq!(runs_from(SEQUENCE_MASK - 20, 9), []);
     }
 
     #[test]
