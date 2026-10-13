@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::Bytes;
 
@@ -85,17 +85,6 @@ pub struct GroupDataPoll {
     pub continuation: bool,
 }
 
-/// A complete logical payload waiting in [`SrtGroup`] behind a sequence gap.
-#[derive(Debug)]
-struct PendingGroupPacket {
-    packet: GroupPacket,
-    /// Whether `packet.member_id` still holds a receive reservation for this
-    /// payload. Cleared when that member is removed, which releases the
-    /// reservation then: the group owns the payload outright, and delivering
-    /// or retiring it later releases nothing.
-    reserved: bool,
-}
-
 /// One physical-leg event observed while driving an SRT group.
 ///
 /// Applications normally consume [`SrtGroup::poll_data`] for the logical,
@@ -163,6 +152,10 @@ pub struct SrtGroupMember {
     /// matched). Set once its handshake completes, whatever its state label:
     /// a Backup leg is labelled Standby before it is connected.
     peer_group_admitted: bool,
+    /// Sequences of the group's pending payloads this member holds a receive
+    /// reservation for, and the packets they span.
+    reserved: BTreeSet<u32>,
+    reserved_packets: u32,
 }
 
 impl SrtGroupMember {
@@ -205,7 +198,10 @@ pub struct SrtGroup {
     members: Vec<SrtGroupMember>,
     next_send_sequence: Option<u32>,
     next_receive_sequence: Option<u32>,
-    pending: BTreeMap<u32, PendingGroupPacket>,
+    /// Complete payloads waiting behind a sequence gap, by sequence. Each is
+    /// either in its member's `reserved` (that member holds a receive
+    /// reservation for it) or in `owned`.
+    pending: BTreeMap<u32, GroupPacket>,
     events: std::collections::VecDeque<GroupEvent>,
     next_event_member: usize,
     /// The remote receiving group this group is bound to, set by the first
@@ -214,6 +210,12 @@ pub struct SrtGroup {
     /// Members that answered from another receiving group, awaiting
     /// [`Self::poll_peer_group_collision`]. At most one per member.
     collisions: std::collections::VecDeque<PeerGroupCollision>,
+    /// Sequences of pending payloads no member holds a reservation for: their
+    /// member was removed, which returned the reservation then. Delivering or
+    /// retiring them releases nothing, even into a new member with that ID.
+    owned: BTreeSet<u32>,
+    /// Packets the `owned` payloads span.
+    owned_packets: u32,
 }
 
 impl SrtGroup {
@@ -234,6 +236,8 @@ impl SrtGroup {
             next_event_member: 0,
             peer_group_id: None,
             collisions: std::collections::VecDeque::new(),
+            owned: BTreeSet::new(),
+            owned_packets: 0,
         })
     }
 
@@ -347,6 +351,8 @@ impl SrtGroup {
             state,
             connection,
             peer_group_admitted: false,
+            reserved: BTreeSet::new(),
+            reserved_packets: 0,
         });
         // A pending leg has no sender buffer until its handshake completes.
         // `refresh_pending_states` aligns it at that transition; attempting
@@ -396,23 +402,19 @@ impl SrtGroup {
         self.next_event_member = self
             .next_event_member
             .min(self.members.len().saturating_sub(1));
-        let reserved_packets = self.detach_member_pending(member_id);
-        member.connection.release_data_reservation(reserved_packets);
+        // The payloads this member reserved become the group's own. Merging
+        // the smaller index into the larger costs at most the smaller one's
+        // entries; nothing else is walked.
+        self.owned_packets = self.owned_packets.saturating_add(member.reserved_packets);
+        if self.owned.len() < member.reserved.len() {
+            std::mem::swap(&mut self.owned, &mut member.reserved);
+        }
+        self.owned.extend(std::mem::take(&mut member.reserved));
+        member
+            .connection
+            .release_data_reservation(member.reserved_packets);
         self.bound_group_owned_pending(member.connection.receive_window_packets());
         Some(member.connection)
-    }
-
-    /// Take ownership of every pending payload `member_id` holds a
-    /// reservation for, returning how many packet positions it held.
-    fn detach_member_pending(&mut self, member_id: u32) -> u32 {
-        let mut packet_count = 0u32;
-        for pending in self.pending.values_mut() {
-            if pending.reserved && pending.packet.member_id == member_id {
-                pending.reserved = false;
-                packet_count = packet_count.saturating_add(pending.packet.packet_count);
-            }
-        }
-        packet_count
     }
 
     /// Keep group-owned payloads within the largest member receive window.
@@ -420,23 +422,15 @@ impl SrtGroup {
     /// They are charged to no member window, so without this, member churn
     /// behind a gap that never fills could retain them without bound. One
     /// removal never exceeds it (a member holds at most its own window); the
-    /// payloads farthest from delivery are retired first.
+    /// payloads farthest from delivery are retired first, touching only the
+    /// ones retired.
     fn bound_group_owned_pending(&mut self, removed_window: u32) {
         let limit = self
             .members
             .iter()
             .map(|member| member.connection.receive_window_packets())
             .fold(removed_window, u32::max);
-        let mut owned: Vec<(u32, u32)> = self
-            .pending
-            .iter()
-            .filter(|(_, pending)| !pending.reserved)
-            .map(|(&sequence, pending)| (sequence, pending.packet.packet_count))
-            .collect();
-        let mut held = owned
-            .iter()
-            .fold(0u32, |held, &(_, count)| held.saturating_add(count));
-        if held <= limit {
+        if self.owned_packets <= limit {
             return;
         }
         let base = self.next_receive_sequence.unwrap_or_else(|| {
@@ -452,13 +446,20 @@ impl SrtGroup {
                 })
                 .unwrap_or_default()
         });
-        owned.sort_unstable_by_key(|&(sequence, _)| sequence.wrapping_sub(base) & 0x7FFF_FFFF);
-        while held > limit {
-            let Some((sequence, count)) = owned.pop() else {
-                break;
-            };
-            self.pending.remove(&sequence);
-            held -= count;
+        // Farthest first: sequences that wrapped below `base`, then those
+        // from `base` up, each walked down.
+        for (low, high) in [(0, base), (base, u32::MAX)] {
+            while self.owned_packets > limit {
+                let Some(&sequence) = self.owned.range(low..high).next_back() else {
+                    break;
+                };
+                self.owned.remove(&sequence);
+                let retired = self.pending.remove(&sequence);
+                debug_assert!(retired.is_some(), "owned sequence {sequence} is pending");
+                let count = retired.map_or(0, |packet| packet.packet_count);
+                debug_assert!(self.owned_packets >= count);
+                self.owned_packets = self.owned_packets.saturating_sub(count);
+            }
         }
     }
 
@@ -651,10 +652,10 @@ impl SrtGroup {
         })?;
         self.next_receive_sequence = Some(next);
         let packet = self.pending.remove(&next)?;
-        let following = next.wrapping_add(packet.packet.packet_count) & 0x7FFF_FFFF;
+        let following = next.wrapping_add(packet.packet_count) & 0x7FFF_FFFF;
         self.next_receive_sequence = Some(following);
         self.release_pending_reservation(&packet);
-        for offset in 1..packet.packet.packet_count {
+        for offset in 1..packet.packet_count {
             let stale_sequence = next.wrapping_add(offset) & 0x7FFF_FFFF;
             if let Some(stale) = self.pending.remove(&stale_sequence) {
                 self.release_pending_reservation(&stale);
@@ -663,7 +664,7 @@ impl SrtGroup {
         for member in &mut self.members {
             member.connection.advance_receive_sequence(following, now);
         }
-        Some(GroupEvent::DataReceived(packet.packet))
+        Some(GroupEvent::DataReceived(packet))
     }
 
     fn send_broadcast(&mut self, payload: Bytes, now: Timestamp) -> Result<usize, Error> {
@@ -792,7 +793,7 @@ impl SrtGroup {
                     payload,
                     packet_count,
                 };
-                if !self.retain_group_packet(packet) {
+                if !self.retain_group_packet(index, packet) {
                     self.members[index]
                         .connection
                         .release_data_reservation(packet_count);
@@ -820,7 +821,7 @@ impl SrtGroup {
         }
     }
 
-    fn retain_group_packet(&mut self, packet: GroupPacket) -> bool {
+    fn retain_group_packet(&mut self, index: usize, packet: GroupPacket) -> bool {
         if self
             .next_receive_sequence
             .is_some_and(|next| sequence_less_than(packet.sequence_number, next))
@@ -832,10 +833,10 @@ impl SrtGroup {
         else {
             return false;
         };
-        entry.insert(PendingGroupPacket {
-            packet,
-            reserved: true,
-        });
+        let member = &mut self.members[index];
+        member.reserved.insert(packet.sequence_number);
+        member.reserved_packets = member.reserved_packets.saturating_add(packet.packet_count);
+        entry.insert(packet);
         true
     }
 
@@ -855,17 +856,24 @@ impl SrtGroup {
     }
 
     /// Return a delivered or retired payload's reservation to the member
-    /// holding it. A payload whose member was removed holds none: that
-    /// reservation was returned at detach.
-    fn release_pending_reservation(&mut self, pending: &PendingGroupPacket) {
-        if !pending.reserved {
+    /// holding it. A group-owned payload holds none: that reservation was
+    /// returned when its member was removed.
+    fn release_pending_reservation(&mut self, packet: &GroupPacket) {
+        let count = packet.packet_count;
+        if self.owned.remove(&packet.sequence_number) {
+            debug_assert!(self.owned_packets >= count);
+            self.owned_packets = self.owned_packets.saturating_sub(count);
             return;
         }
-        if let Some(member) = self.member_mut(pending.packet.member_id) {
-            member
-                .connection
-                .release_data_reservation(pending.packet.packet_count);
-        }
+        let Some(member) = self.member_mut(packet.member_id) else {
+            debug_assert!(false, "a pending payload is owned or reserved");
+            return;
+        };
+        let reserved = member.reserved.remove(&packet.sequence_number);
+        debug_assert!(reserved, "a member's pending payload is in its index");
+        debug_assert!(member.reserved_packets >= count);
+        member.reserved_packets = member.reserved_packets.saturating_sub(count);
+        member.connection.release_data_reservation(count);
     }
 
     /// Admit the receiving-group identity of every member whose handshake has

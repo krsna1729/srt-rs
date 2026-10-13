@@ -806,6 +806,110 @@ fn member_churn_cannot_accumulate_uncharged_pending_payloads() {
     assert_eq!(member_window(&group, 2), REMOVAL_WINDOW);
 }
 
+/// Add `member_id` holding one complete payload at `sequence`, collected by
+/// the group behind its gap.
+fn hold_one(group: &mut SrtGroup, member_id: u32, sequence: u32) {
+    let (mut source, member) = establish_pair_with_options(removal_options(sequence));
+    group.add_member(member_id, 1, member).unwrap();
+    source.send(&sequence.to_be_bytes(), ts(120_001)).unwrap();
+    transfer_to_group_member(&mut source, group, member_id, ts(120_001));
+    assert!(next_data(group, ts(120_001)).is_none());
+}
+
+/// Group-owned payloads past the limit are retired farthest first across the
+/// sequence wrap, a live member's reserved payload is never one of them, and
+/// delivered group-owned payloads stop counting toward the limit.
+#[test]
+fn churn_retires_only_group_owned_payloads_farthest_first_across_the_wrap() {
+    const CHURNED: u32 = REMOVAL_WINDOW + 8;
+    let start = 0x7FFF_FFF0u32;
+    let seq = |offset: u32| start.wrapping_add(offset) & 0x7FFF_FFFF;
+    let (mut gap_source, gap_member) = establish_pair_with_options(removal_options(start));
+    let mut group = SrtGroup::new(0x4000_0020, GroupMode::Broadcast).unwrap();
+    group.add_member(2, 1, gap_member).unwrap();
+    gap_source.send(b"start", ts(100_000)).unwrap();
+    transfer_to_group_member(&mut gap_source, &mut group, 2, ts(110_000));
+    assert_eq!(
+        next_data(&mut group, ts(120_000)).unwrap().sequence_number,
+        start
+    );
+
+    // A live member holds the farthest payload; churn leaves one window and
+    // eight more of group-owned payloads before it, crossing the wrap.
+    let live = seq(2 + CHURNED);
+    hold_one(&mut group, 3, live);
+    for offset in 0..CHURNED {
+        hold_one(&mut group, 1, seq(2 + offset));
+        assert!(group.remove_member(1));
+    }
+
+    // The nearest window of them is kept; the farthest eight were retired.
+    gap_source.send(b"close gap", ts(130_000)).unwrap();
+    transfer_to_group_member(&mut gap_source, &mut group, 2, ts(130_000));
+    expect_exactly(&mut group, (1..2 + REMOVAL_WINDOW).map(seq));
+    // Resending the retired eight releases the live member's payload.
+    let (mut refill, refill_member) =
+        establish_pair_with_options(removal_options(seq(2 + REMOVAL_WINDOW)));
+    group.add_member(4, 1, refill_member).unwrap();
+    for _ in 0..CHURNED - REMOVAL_WINDOW {
+        refill.send(b"refill", ts(150_000)).unwrap();
+    }
+    transfer_to_group_member(&mut refill, &mut group, 4, ts(150_000));
+    expect_exactly(&mut group, (2 + REMOVAL_WINDOW..=2 + CHURNED).map(seq));
+    assert_eq!(member_window(&group, 3), REMOVAL_WINDOW);
+
+    // Exactly one window of new group-owned payloads behind a new gap is
+    // within the limit: all of it is delivered.
+    for offset in 0..REMOVAL_WINDOW {
+        hold_one(&mut group, 1, seq(4 + CHURNED + offset));
+        assert!(group.remove_member(1));
+    }
+    let (mut fill, fill_member) = establish_pair_with_options(removal_options(seq(3 + CHURNED)));
+    group.add_member(5, 1, fill_member).unwrap();
+    fill.send(b"fill", ts(170_000)).unwrap();
+    transfer_to_group_member(&mut fill, &mut group, 5, ts(170_000));
+    expect_exactly(
+        &mut group,
+        (3 + CHURNED..4 + CHURNED + REMOVAL_WINDOW).map(seq),
+    );
+}
+
+/// The group delivers exactly `sequences`, in order, and then nothing.
+fn expect_exactly(group: &mut SrtGroup, sequences: impl Iterator<Item = u32>) {
+    for sequence in sequences {
+        let packet = next_data(group, ts(200_000)).unwrap();
+        assert_eq!(packet.sequence_number, sequence);
+    }
+    assert!(next_data(group, ts(200_000)).is_none());
+}
+
+/// Removing a member whose reservations outnumber what the group already
+/// owns keeps both sets of payloads: each is delivered once, in order, and
+/// none releases into the member that later reuses an ID.
+#[test]
+fn removal_merges_into_what_the_group_already_owns() {
+    let (mut group, mut gap_source) = group_waiting_at_101(0x4000_0021);
+    hold_one(&mut group, 1, 102);
+    assert!(group.remove_member(1));
+
+    let (mut pair_source, pair_member) = establish_pair_with_options(removal_options(103));
+    group.add_member(3, 1, pair_member).unwrap();
+    pair_source.send(b"103", ts(120_001)).unwrap();
+    pair_source.send(b"104", ts(120_001)).unwrap();
+    transfer_to_group_member(&mut pair_source, &mut group, 3, ts(120_001));
+    assert!(next_data(&mut group, ts(120_001)).is_none());
+    assert!(next_data(&mut group, ts(120_001)).is_none());
+    assert!(group.remove_member(3));
+    let (_replacement_source, replacement) = establish_pair_with_options(removal_options(106));
+    group.add_member(1, 1, replacement).unwrap();
+
+    gap_source.send(b"fill", ts(130_000)).unwrap();
+    transfer_to_group_member(&mut gap_source, &mut group, 2, ts(130_000));
+    expect_exactly(&mut group, 101..=104);
+    assert_eq!(member_window(&group, 1), REMOVAL_WINDOW);
+    assert_eq!(member_window(&group, 2), REMOVAL_WINDOW);
+}
+
 #[test]
 fn group_with_no_healthy_members_fails_without_panicking() {
     let (member, _) = establish_pair();
