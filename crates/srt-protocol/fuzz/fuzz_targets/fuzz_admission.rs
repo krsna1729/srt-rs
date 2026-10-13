@@ -37,6 +37,7 @@ fuzz_target!(|data: &[u8]| {
         max_established_peers: max_peers,
         max_peers_per_ip: max_per_ip.min(max_peers),
         half_open_timeout: Duration::from_micros(u64::from(selector) + 1),
+        ..PeerTableConfig::default()
     });
     let telemetry = IngressTelemetry::new();
     let mut options = AdmissionOptions::basic(0x2000_0001, selector as u16, selector & 1 == 0);

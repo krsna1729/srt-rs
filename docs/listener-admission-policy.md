@@ -232,6 +232,7 @@ cross-counter transaction.
 | `policy_rejections` | Application policy rejections. |
 | `policy_errors` | Invalid/out-of-state policy produced by the application; sustained nonzero values indicate a configuration bug. |
 | `credential_failures` | KM failed after policy selected a credential, or encryption negotiation otherwise failed closed. |
+| `key_derivation_drops` | Encrypted CONCLUSIONs dropped, before policy and protocol work, because the table's key-derivation budget (`max_key_derivations_per_second`) was spent. The caller retransmits. Sustained nonzero values with rising `credential_failures` mean a source is cycling handshakes to burn PBKDF2 time. |
 | `expired_half_open` | Incomplete peers removed after their hard inactivity bound. |
 | `invalid_cookies` / `cookie_route_failures` | Cookie validation failures and failed cross-worker delivery. |
 | capacity-drop counters | Total, half-open, established, and per-source limits shedding load. |
@@ -278,8 +279,16 @@ composes overlays, accounts telemetry, and preserves admission ordering.
 - Keep resolver work local, cached, deterministic, and bounded.
 - Validate cache entries before they enter the packet path; SRT passphrases
   must be 10-79 bytes for interoperability.
-- Keep total, half-open, established, per-source, and socket-memory limits
-  enabled.
+- Keep total, half-open, established, per-source, key-derivation, and
+  socket-memory limits enabled. Each encrypted CONCLUSION from a half-open
+  peer costs one PBKDF2 derivation (about 0.2 ms for AES-128 and 0.4 ms for
+  AES-192/256) on the owner thread. `max_key_derivations_per_second` (default
+  128, burst the same) caps that at about 5% of one owner thread, and
+  `max_key_derivations_per_source_per_second` (default 8) holds one source IP
+  to its share first, so a source cycling handshakes cannot lock other
+  sources out. Under a flood from many sources it sheds admission, not
+  established media; raise the table rate if a mass reconnect of encrypted
+  callers must finish faster.
 - Treat `Defer` volume and half-open expiry as abuse signals.
 - Use unique tenant credentials, but do not treat them as general identity.
 - Put an authenticated protocol inside SRT when integrity or endpoint identity

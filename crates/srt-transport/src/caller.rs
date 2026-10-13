@@ -5288,6 +5288,7 @@ mod tests {
             max_established_peers: 8,
             max_peers_per_ip: 8,
             half_open_timeout: Duration::from_secs(60),
+            ..PeerTableConfig::default()
         });
         assert_eq!(
             half_open.admit(
@@ -5320,6 +5321,7 @@ mod tests {
             max_established_peers: 8,
             max_peers_per_ip: 1,
             half_open_timeout: Duration::from_secs(60),
+            ..PeerTableConfig::default()
         });
         assert_eq!(
             per_source.admit(
@@ -5362,6 +5364,7 @@ mod tests {
             max_established_peers: 1,
             max_peers_per_ip: 4,
             half_open_timeout: Duration::from_secs(60),
+            ..PeerTableConfig::default()
         });
         let first = "127.0.0.1:10000".parse().expect("address");
         let first_conclusion =
@@ -6025,6 +6028,7 @@ mod tests {
                 max_established_peers: 64,
                 max_peers_per_ip: max_per_ip,
                 half_open_timeout: Duration::from_secs(60),
+                ..PeerTableConfig::default()
             });
             let options = AdmissionOptions::basic(7, 0, true);
             let telemetry = IngressTelemetry::new();
