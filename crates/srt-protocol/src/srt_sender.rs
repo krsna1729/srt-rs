@@ -2437,8 +2437,11 @@ mod tests {
         // datagram could otherwise strand behind a hole). A fourth added
         // `total_bytes_acked` (a `u64`): peer-confirmed payload, which a
         // sender could not otherwise report without re-deriving it from
-        // internal buffer accounting -- 8 bytes, deliberate.
-        assert!(inline_bytes <= 352);
+        // internal buffer accounting -- 8 bytes, deliberate. A fifth added
+        // `expiry_scan_from` (a `u32`, so TLPKTDROP does not re-walk
+        // unacknowledged tombstones every ACK tick) and, in test builds
+        // only, its `expiry_scan_steps` counter -- 8 bytes, deliberate.
+        assert!(inline_bytes <= 360);
         assert_eq!(window.heap_bytes(), 8_320);
     }
 
