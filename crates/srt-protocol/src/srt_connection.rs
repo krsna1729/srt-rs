@@ -1810,17 +1810,35 @@ impl SrtConnection {
         // `TimerId::SenderRto`; this one only continues work already queued.
         //
         // The same continuation finishes a peer loss report too large for
-        // one visit (`SenderBuffer::receive_nak`).
+        // one visit (`SenderBuffer::receive_nak`) and drops acknowledged
+        // packets a large ACK left (`SenderBuffer::release_acked_packets`).
         if self.has_retransmit()
             || self
                 .sender
                 .as_ref()
                 .is_some_and(SenderBuffer::has_pending_nak)
         {
-            self.queue_output(QueuedOutput::SetTimer {
-                id: TimerId::RetransmitContinue,
-                duration_micros: 0,
-            });
+            self.arm_retransmit_continue();
+        } else {
+            self.continue_acked_release_later();
+        }
+    }
+
+    fn arm_retransmit_continue(&mut self) {
+        self.queue_output(QueuedOutput::SetTimer {
+            id: TimerId::RetransmitContinue,
+            duration_micros: 0,
+        });
+    }
+
+    /// Arm the continuation if an ACK left acknowledged packets to drop.
+    fn continue_acked_release_later(&mut self) {
+        if self
+            .sender
+            .as_ref()
+            .is_some_and(SenderBuffer::has_acked_packets_to_release)
+        {
+            self.arm_retransmit_continue();
         }
     }
 
@@ -1966,9 +1984,15 @@ impl SrtConnection {
             TimerId::Ack => self.handle_ack_timer(now),
             TimerId::Nak => self.handle_nak_timer(now),
             TimerId::RetransmitContinue => {
+                let more_acked = self
+                    .sender
+                    .as_mut()
+                    .is_some_and(SenderBuffer::release_acked_packets);
                 if self.state == ConnectionState::Connected {
                     self.continue_pending_naks(now);
                     self.process_retransmit(now);
+                } else if more_acked {
+                    self.arm_retransmit_continue();
                 }
             }
             TimerId::DeliveryContinue => {
@@ -2037,6 +2061,7 @@ impl SrtConnection {
                     sender.discard_acked(seq);
                 }
             }
+            self.continue_acked_release_later();
         }
         if self.tlpktdrop_enabled()
             && let Some(receiver) = self.receiver.as_ref()
@@ -3729,6 +3754,7 @@ impl SrtConnection {
             let after = sender.packets_in_buffer();
             tracing::debug!("sender buffer: {} -> {} packets", before, after);
         }
+        self.continue_acked_release_later();
         // TLPKTDROP may have just tombstoned the only outstanding flight
         // this ACK retired; a queued DATA output for one of those sequences
         // must not survive it (see `purge_stale_queued_data`).
@@ -6056,6 +6082,65 @@ mod tests {
             "once the loss list is fully drained there is nothing left to resume"
         );
         assert!(!caller.has_retransmit());
+    }
+
+    /// A cumulative ACK of a large flight retires it at once and leaves only
+    /// dropping its packets to the retransmit continuation, which stops
+    /// re-arming once they are dropped.
+    #[test]
+    fn a_large_ack_leaves_dropping_packets_to_the_continuation() {
+        const SENT: u32 = 2_048;
+        let (mut caller, _listener) = connected_pair();
+        let now = Timestamp::from_micros(0);
+        let first_seq = caller.next_sequence_number().expect("connected sender");
+        for _ in 0..SENT {
+            caller
+                .send(&[0u8; 1_000], now)
+                .expect("send admits the payload");
+        }
+        drain_outputs(&mut caller);
+
+        let ack_seq = first_seq.wrapping_add(SENT) & 0x7FFF_FFFF;
+        caller
+            .feed_recv_buf(&ack_datagram(caller.socket_id(), ack_seq, Some(8_192)), now)
+            .expect("a current ACK is accepted");
+        let sender = caller.sender.as_ref().expect("connected sender");
+        assert_eq!(sender.packets_in_flight(), 0);
+        assert!(sender.has_acked_packets_to_release());
+        let arms_continuation = |outputs: &[ConnectionOutput]| {
+            outputs.iter().any(|output| {
+                matches!(
+                    output,
+                    ConnectionOutput::SetTimer {
+                        id: TimerId::RetransmitContinue,
+                        ..
+                    }
+                )
+            })
+        };
+        assert!(arms_continuation(&drain_outputs(&mut caller)));
+
+        let mut visits = 0;
+        loop {
+            caller
+                .handle_timer(TimerId::RetransmitContinue, now)
+                .expect("continuation");
+            visits += 1;
+            assert!(
+                visits <= 64,
+                "the continuation must drain the retired pages"
+            );
+            let more = caller
+                .sender
+                .as_ref()
+                .expect("connected sender")
+                .has_acked_packets_to_release();
+            assert_eq!(arms_continuation(&drain_outputs(&mut caller)), more);
+            if !more {
+                break;
+            }
+        }
+        assert!(visits > 1, "{visits}");
     }
 
     /// A NAK larger than one visit is finished by the retransmit
@@ -10728,7 +10813,9 @@ mod tests {
         // fit alone, together they need 8 more bytes -- deliberate. Bounded
         // peer-NAK handling then added `SenderBuffer::pending_naks` (the
         // queue of reports still validating or committing), 32 bytes inline.
-        assert!(connection_bytes <= 1_608);
+        // Bounded ACK reclaim then added the window's `retired` pages
+        // (a `Vec`, unallocated until an ACK retires a whole page), 24 more.
+        assert!(connection_bytes <= 1_632);
         assert!(event_bytes <= 64);
         // F01 added `source_time: Timestamp` (8 bytes) to preserve a
         // message's original source time through reassembly -- a

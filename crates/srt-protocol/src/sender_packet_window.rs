@@ -62,6 +62,8 @@ pub struct SenderPacketWindow<T> {
     nonempty_summary: u64,
     len: usize,
     retransmit_queued_count: u32,
+    /// Fully discarded pages whose packets are not dropped yet.
+    retired: Vec<Box<SendPage<T>>>,
 }
 
 impl<T> SenderPacketWindow<T> {
@@ -79,6 +81,7 @@ impl<T> SenderPacketWindow<T> {
             nonempty_summary: 0,
             len: 0,
             retransmit_queued_count: 0,
+            retired: Vec::new(),
         }
     }
 
@@ -127,8 +130,23 @@ impl<T> SenderPacketWindow<T> {
                 .pages
                 .iter()
                 .flatten()
+                .chain(&self.retired)
                 .map(|p| p.heap_bytes())
                 .sum::<usize>()
+    }
+
+    /// Drop up to `max_pages` pages a cumulative ACK discarded whole;
+    /// returns whether any are left. Discarding only detaches a full page
+    /// (its packets are accounted for and unreachable at once), so the cost
+    /// of dropping a whole window's packets is spread over visits.
+    pub fn release_retired(&mut self, max_pages: usize) -> bool {
+        let keep = self.retired.len().saturating_sub(max_pages);
+        self.retired.truncate(keep);
+        !self.retired.is_empty()
+    }
+
+    pub fn retired_pages(&self) -> usize {
+        self.retired.len()
     }
 
     pub fn insert(&mut self, sequence: u32, packet: T) -> Result<(), T> {
@@ -381,6 +399,7 @@ impl<T> SenderPacketWindow<T> {
         self.nonempty_summary = 0;
         self.len = 0;
         self.retransmit_queued_count = 0;
+        self.retired.clear();
     }
 
     pub fn first_occupied_from(&self, start_seq: u32) -> Option<(u32, &T)> {
@@ -582,6 +601,9 @@ impl<T> SenderPacketWindow<T> {
         }
         self.len -= removed;
         self.mark_page_empty(page_index);
+        // Its packets are accounted for and unreachable now; dropping them
+        // (one payload free each) is left to `release_retired`.
+        self.retired.push(page);
     }
 
     fn discard_partial_page(

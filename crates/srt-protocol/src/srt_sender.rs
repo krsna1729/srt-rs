@@ -38,6 +38,10 @@ const MAX_DROPREQ_PER_NAK: usize = 16;
 /// `MAX_FLOW_WINDOW`), which costs milliseconds of one Owner callback when
 /// done at once; a larger report continues on later visits.
 pub const MAX_NAK_POSITIONS_PER_VISIT: u32 = 4_096;
+/// Pages of 64 acknowledged packets one visit drops. A cumulative ACK of a
+/// full window (65,536 packets) spent about 12 ms freeing payloads in one
+/// callback; it now detaches whole pages at once and drops them here.
+const MAX_ACKED_PAGES_RELEASED_PER_VISIT: usize = 4;
 
 /// "No configured limit" default max bandwidth, matching libsrt's own
 /// `BW_INFINITE` (`srtcore/common.h`): 1 Gbps expressed in bytes/sec. Live
@@ -1442,7 +1446,23 @@ impl SenderBuffer {
             self.justified_frontier = self.oldest_unacked;
         }
         self.compact_stale_retransmits();
+        self.packets
+            .release_retired(MAX_ACKED_PAGES_RELEASED_PER_VISIT);
         live_bytes_discarded
+    }
+
+    /// Drop the next acknowledged packets a large cumulative ACK left for a
+    /// later visit; returns whether any are left. Everything an ACK changes
+    /// (the frontier, every count, crypto-generation retention) is settled
+    /// when it is handled; only the payload memory is released here.
+    pub fn release_acked_packets(&mut self) -> bool {
+        self.packets
+            .release_retired(MAX_ACKED_PAGES_RELEASED_PER_VISIT)
+    }
+
+    /// Whether acknowledged packets wait for [`Self::release_acked_packets`].
+    pub fn has_acked_packets_to_release(&self) -> bool {
+        self.packets.retired_pages() != 0
     }
 
     /// Process a NAK and add to the loss list.
@@ -2715,8 +2735,11 @@ mod tests {
         // only, its `expiry_scan_steps` counter -- 8 bytes, deliberate. A
         // sixth added `pending_naks` (a `VecDeque`, empty and unallocated
         // unless a peer loss report outgrows one visit) -- 32 bytes,
+        // deliberate. A seventh added the window's `retired` pages (a
+        // `Vec` of acknowledged pages awaiting a bounded release, empty
+        // and unallocated until an ACK retires a whole page) -- 24 bytes,
         // deliberate.
-        assert!(inline_bytes <= 392);
+        assert!(inline_bytes <= 416);
         assert_eq!(window.heap_bytes(), 8_320);
     }
 
@@ -3433,7 +3456,6 @@ mod tests {
         assert_eq!(dropped_seqs(&dropped), vec![DROPPED + 1]);
     }
 
-    /// A TLPKTDROP drop keeps the sequence identity (so a repeated NAK is
     /// `total_bytes_acked` counts live payload retired by peer ACKs only:
     /// locally dropped packets (tombstones) and repeated ACKs add nothing.
     #[test]
@@ -3468,6 +3490,49 @@ mod tests {
         );
     }
 
+    /// A cumulative ACK settles everything it changes at once (frontier,
+    /// flight, outstanding data, acknowledged bytes), while dropping a large
+    /// ACK's packets is spread over bounded visits; an ordinary ACK leaves
+    /// nothing behind.
+    #[test]
+    fn a_full_window_ack_settles_at_once_and_drops_packets_in_bounded_visits() {
+        const WINDOW: u32 = 8_192;
+        const PAGE: u32 = 64;
+        let now = Timestamp::default();
+        let mut buf = SenderBuffer::new(0, WINDOW, 120);
+        for _ in 0..WINDOW {
+            buf.push_submitted(vec![1; 1_316], 1, 1, now)
+                .expect("admitted");
+        }
+
+        buf.handle_ack(2 * PAGE);
+        assert!(
+            !buf.has_acked_packets_to_release(),
+            "an ordinary ACK drops inline"
+        );
+
+        buf.handle_ack(WINDOW);
+        assert_eq!(buf.packets_in_flight(), 0);
+        assert!(buf.is_empty());
+        assert!(!buf.has_outstanding_submitted_data());
+        assert_eq!(buf.stats().total_bytes_acked, u64::from(WINDOW) * 1_316);
+
+        let left = (WINDOW / PAGE) as usize - 2 - MAX_ACKED_PAGES_RELEASED_PER_VISIT;
+        assert_eq!(buf.packets.retired_pages(), left);
+        let mut visits = 0;
+        while buf.has_acked_packets_to_release() {
+            let before = buf.packets.retired_pages();
+            buf.release_acked_packets();
+            assert_eq!(
+                before - buf.packets.retired_pages(),
+                before.min(MAX_ACKED_PAGES_RELEASED_PER_VISIT)
+            );
+            visits += 1;
+        }
+        assert_eq!(visits, left.div_ceil(MAX_ACKED_PAGES_RELEASED_PER_VISIT));
+    }
+
+    /// A TLPKTDROP drop keeps the sequence identity (so a repeated NAK is
     /// still answered) and releases the media.
     #[test]
     fn a_dropped_packet_leaves_a_tombstone_until_the_ack() {
