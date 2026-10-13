@@ -5,6 +5,7 @@
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::ops::ControlFlow;
 
 use bytes::{Bytes, BytesMut};
 use zeroize::{Zeroize, Zeroizing};
@@ -30,6 +31,13 @@ use crate::time::Timestamp;
 
 const MAX_NAK_RECORD_SIZE: usize = 8;
 const NAK_CHUNK_INITIAL_CAPACITY: usize = 32;
+/// NAK packets one periodic-NAK fire queues. A full-window alternating loss
+/// list (`MAX_FLOW_WINDOW / 2` single losses) is 89 packets at the default
+/// MTU, measured at ~250 µs of Owner time in one fire (`nak_chunking`
+/// `alternating_65536`). Sixteen packets carry ~5,800 single losses or
+/// ~2,900 ranges: a default 8,192-packet window is still named in one fire,
+/// and the largest list within six.
+const MAX_PERIODIC_NAK_PACKETS: usize = 16;
 const _: () = assert!(DEFAULT_MTU as usize - SRT_HEADER_SIZE >= MAX_NAK_RECORD_SIZE);
 
 /// Smallest DATA payload this connection can operate with.
@@ -756,6 +764,12 @@ pub struct SrtConnection {
     last_ack_time: Option<Timestamp>,
     /// Last NAK send time.
     last_nak_time: Option<Timestamp>,
+    /// Loss sequence the next periodic NAK resumes from (oldest first), when
+    /// the last one stopped at `MAX_PERIODIC_NAK_PACKETS`.
+    periodic_nak_resume: Option<u32>,
+    /// Reused staging for one periodic NAK's packets (the receiver is
+    /// borrowed while they are encoded), so a fire does not allocate.
+    periodic_nak_packets: Vec<ControlPacket>,
     /// Last packet receipt time (for inactivity-timeout detection).
     last_recv_time: Option<Timestamp>,
     /// Last protocol packet queued for transmission.
@@ -1221,6 +1235,8 @@ impl SrtConnection {
             start_time: None,
             last_ack_time: None,
             last_nak_time: None,
+            periodic_nak_resume: None,
+            periodic_nak_packets: Vec::new(),
             last_recv_time: None,
             last_send_time: None,
             shutdown_started_at: None,
@@ -1273,6 +1289,8 @@ impl SrtConnection {
             start_time: None,
             last_ack_time: None,
             last_nak_time: None,
+            periodic_nak_resume: None,
+            periodic_nak_packets: Vec::new(),
             last_recv_time: None,
             last_send_time: None,
             shutdown_started_at: None,
@@ -1623,6 +1641,7 @@ impl SrtConnection {
         self.receiver = Some(receiver);
         self.last_ack_time = Some(now);
         self.last_nak_time = Some(now);
+        self.periodic_nak_resume = None;
     }
 
     fn flight_capacity_packets(&self) -> u32 {
@@ -4300,31 +4319,47 @@ impl SrtConnection {
     }
 
     /// Send a periodic NAK.
+    ///
+    /// One fire queues at most `MAX_PERIODIC_NAK_PACKETS`. A larger loss list
+    /// (up to `MAX_FLOW_WINDOW / 2` runs) is reported oldest first across
+    /// successive fires from `periodic_nak_resume`, wrapping to the window
+    /// base once the newest loss is reported, so the losses nearest their
+    /// drop deadline go first, every loss is named within a bounded number
+    /// of intervals, and one fire never encodes the whole list.
     fn send_periodic_nak(&mut self, now: Timestamp) {
-        let receiver = match self.receiver.as_ref() {
-            Some(r) => r,
-            None => return,
+        let Some(receiver) = self.receiver.as_ref() else {
+            return;
         };
 
         let max_control_info_size = self.max_control_info_size();
         debug_assert!(max_control_info_size >= MAX_NAK_RECORD_SIZE);
         let timestamp = self.relative_timestamp(now);
         let peer_socket_id = self.peer_socket_id;
-        let mut chunks = NakChunkEncoder::new(max_control_info_size);
-        let mut packets = Vec::new();
-        receiver.for_each_periodic_nak_range(|loss| {
-            if let Some(control_info) = chunks.push(loss) {
-                packets.push(make_nak_packet(control_info, timestamp, peer_socket_id));
+        let mut packets = std::mem::take(&mut self.periodic_nak_packets);
+        let mut resume = self.periodic_nak_resume.take();
+        loop {
+            let pass = encode_periodic_nak(
+                receiver,
+                resume,
+                max_control_info_size,
+                timestamp,
+                peer_socket_id,
+                &mut packets,
+            );
+            // Nothing left at or after the resume point (it was repaired):
+            // report from the start in this same fire instead of skipping it.
+            if pass.reported_any || resume.is_none() {
+                self.periodic_nak_resume = pass.resume;
+                break;
             }
-        });
-        if let Some(control_info) = chunks.finish() {
-            packets.push(make_nak_packet(control_info, timestamp, peer_socket_id));
+            resume = None;
         }
 
         let packets_sent = packets.len() as u32;
-        for packet in packets {
+        for packet in packets.drain(..) {
             self.queue_control_packet(packet, now);
         }
+        self.periodic_nak_packets = packets;
 
         if packets_sent != 0 {
             self.last_send_time = Some(now);
@@ -4946,6 +4981,50 @@ fn make_nak_packet(control_info: Vec<u8>, timestamp: u32, peer_socket_id: u32) -
         dest_socket_id: peer_socket_id,
         control_info,
     }
+}
+
+/// Outcome of one periodic-NAK encoding pass.
+struct PeriodicNakPass {
+    /// Where the next fire resumes; `None` once the end of the list was
+    /// reported.
+    resume: Option<u32>,
+    /// Whether any loss at or after the requested resume point exists.
+    reported_any: bool,
+}
+
+/// Encode the receiver's loss runs, oldest first from `resume`, into at
+/// most `MAX_PERIODIC_NAK_PACKETS` NAK packets appended to `packets`.
+fn encode_periodic_nak(
+    receiver: &ReceiverBuffer,
+    resume: Option<u32>,
+    max_control_info_size: usize,
+    timestamp: u32,
+    peer_socket_id: u32,
+    packets: &mut Vec<ControlPacket>,
+) -> PeriodicNakPass {
+    let mut chunks = NakChunkEncoder::new(max_control_info_size);
+    let mut pass = PeriodicNakPass {
+        resume: None,
+        reported_any: false,
+    };
+    receiver.try_for_each_periodic_nak_range_from(resume, |loss| {
+        pass.reported_any = true;
+        if let Some(control_info) = chunks.push(loss) {
+            packets.push(make_nak_packet(control_info, timestamp, peer_socket_id));
+            if packets.len() == MAX_PERIODIC_NAK_PACKETS {
+                // `loss` opened the chunk that will not be sent this fire.
+                pass.resume = Some(loss.first_seq);
+                return ControlFlow::Break(());
+            }
+        }
+        ControlFlow::Continue(())
+    });
+    if pass.resume.is_none()
+        && let Some(control_info) = chunks.finish()
+    {
+        packets.push(make_nak_packet(control_info, timestamp, peer_socket_id));
+    }
+    pass
 }
 
 #[cfg(test)]
@@ -10932,28 +11011,109 @@ mod tests {
             );
         }
 
-        conn.send_periodic_nak(Timestamp::from_micros(2));
+        // The list takes 89 packets; each fire queues at most
+        // MAX_PERIODIC_NAK_PACKETS and the next one resumes where it stopped.
         let mut decoded = Vec::new();
         let mut wire_packets = 0u64;
-        while let Some(output) = conn.poll_output().unwrap() {
-            let ConnectionOutput::SendPacket(bytes) = output else {
-                continue;
-            };
-            let SrtPacket::Control(packet) = SrtPacket::decode(&bytes).unwrap() else {
-                continue;
-            };
-            if packet.control_type != ControlType::Nak {
-                continue;
+        let mut fires = 0;
+        loop {
+            fires += 1;
+            conn.send_periodic_nak(Timestamp::from_micros(1 + fires));
+            let mut this_fire = 0;
+            while let Some(output) = conn.poll_output().unwrap() {
+                let ConnectionOutput::SendPacket(bytes) = output else {
+                    continue;
+                };
+                let SrtPacket::Control(packet) = SrtPacket::decode(&bytes).unwrap() else {
+                    continue;
+                };
+                if packet.control_type != ControlType::Nak {
+                    continue;
+                }
+                assert!(bytes.len() <= DEFAULT_MTU as usize);
+                decoded.extend(parse_loss_list(&packet.control_info, usize::MAX).unwrap());
+                this_fire += 1;
             }
-            assert!(bytes.len() <= DEFAULT_MTU as usize);
-            decoded.extend(parse_loss_list(&packet.control_info, usize::MAX).unwrap());
-            wire_packets += 1;
+            assert!(
+                this_fire <= MAX_PERIODIC_NAK_PACKETS,
+                "fire {fires}: {this_fire}"
+            );
+            wire_packets += this_fire as u64;
+            if conn.periodic_nak_resume.is_none() {
+                break;
+            }
         }
 
         let expected: Vec<u32> = (0..MAX_FLOW_WINDOW - 1).step_by(2).collect();
-        assert_eq!(decoded, expected);
+        assert_eq!(decoded, expected, "every loss named once, in order");
         assert_eq!(wire_packets, 89);
+        assert_eq!(fires, 89_u64.div_ceil(MAX_PERIODIC_NAK_PACKETS as u64));
         assert_eq!(conn.stats().receiver.unwrap().total_naks_sent, wire_packets);
+
+        // The fire after the end starts over from the first loss.
+        conn.send_periodic_nak(Timestamp::from_micros(100));
+        let first = std::iter::from_fn(|| conn.poll_output().unwrap()).find_map(|output| {
+            let ConnectionOutput::SendPacket(bytes) = output else {
+                return None;
+            };
+            match SrtPacket::decode(&bytes).unwrap() {
+                SrtPacket::Control(packet) if packet.control_type == ControlType::Nak => {
+                    Some(parse_loss_list(&packet.control_info, usize::MAX).unwrap()[0])
+                }
+                _ => None,
+            }
+        });
+        assert_eq!(first, Some(0));
+    }
+
+    /// When every loss at or after the resume point was repaired between
+    /// fires, the next fire reports from the start instead of sending nothing.
+    #[test]
+    #[cfg_attr(miri, ignore = "maximum-window scale")]
+    fn periodic_nak_restarts_when_its_resume_point_was_repaired() {
+        let options = ConnectionOptions {
+            flow_window_packets: MAX_FLOW_WINDOW,
+            receive_buffer_packets: MAX_FLOW_WINDOW,
+            ..ConnectionOptions::default()
+        };
+        let mut conn = SrtConnection::new_listener(options);
+        conn.set_state(ConnectionState::Connected);
+        conn.init_buffers(Timestamp::default(), 0, 0);
+        while conn.poll_output().unwrap().is_some() {}
+        let now = Timestamp::from_micros(1);
+        let receiver = conn.receiver.as_mut().unwrap();
+        receiver.receive(
+            DataPacket::new(MAX_FLOW_WINDOW - 1, 1, 1, 0, Vec::new().into()),
+            now,
+        );
+        for sequence_number in (1..MAX_FLOW_WINDOW - 1).step_by(2) {
+            receiver.receive(
+                DataPacket::new(sequence_number, 1, 1, 0, Vec::new().into()),
+                now,
+            );
+        }
+        conn.send_periodic_nak(Timestamp::from_micros(2));
+        while conn.poll_output().unwrap().is_some() {}
+        let resume = conn.periodic_nak_resume.expect("the list needs more fires");
+
+        let receiver = conn.receiver.as_mut().unwrap();
+        for sequence_number in (resume..MAX_FLOW_WINDOW - 1).step_by(2) {
+            receiver.receive(
+                DataPacket::new(sequence_number, 1, 1, 0, Vec::new().into()),
+                now,
+            );
+        }
+        conn.send_periodic_nak(Timestamp::from_micros(3));
+        let naks = std::iter::from_fn(|| conn.poll_output().unwrap())
+            .filter(|output| {
+                matches!(output, ConnectionOutput::SendPacket(bytes)
+                    if matches!(SrtPacket::decode(bytes), Ok(SrtPacket::Control(ControlPacket { control_type: ControlType::Nak, .. }))))
+            })
+            .count();
+        assert!(
+            naks > 0,
+            "the remaining losses are reported again from the start"
+        );
     }
 
     /// A shortfall in the parser is no longer possible: ranges come out as
