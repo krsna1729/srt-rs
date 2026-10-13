@@ -338,6 +338,9 @@ pub struct IngressTelemetry {
     /// Encrypted CONCLUSIONs dropped because the key-derivation budget was
     /// spent; the caller retransmits.
     pub key_derivation_drops: AtomicU64,
+    /// Peers rejected because their worst-case window memory did not fit the
+    /// table's budget (`PeerTableConfig::max_window_memory_bytes`).
+    pub window_memory_rejections: AtomicU64,
     /// Incomplete handshakes evicted after the configured inactivity bound.
     pub expired_half_open: AtomicU64,
 }
@@ -366,6 +369,7 @@ pub struct IngressTelemetrySnapshot {
     pub policy_rejections: u64,
     pub credential_failures: u64,
     pub key_derivation_drops: u64,
+    pub window_memory_rejections: u64,
     pub expired_half_open: u64,
 }
 
@@ -460,6 +464,9 @@ impl IngressTelemetry {
     pub fn record_key_derivation_drop(&self) {
         Self::bump(&self.key_derivation_drops);
     }
+    pub fn record_window_memory_rejection(&self) {
+        Self::bump(&self.window_memory_rejections);
+    }
     pub fn record_expired_half_open(&self, count: usize) {
         // Called per datagram, where nothing has expired almost every time.
         // This counter is shared by every acceptor thread, so an
@@ -500,6 +507,7 @@ impl IngressTelemetry {
             policy_rejections: get(&self.policy_rejections),
             credential_failures: get(&self.credential_failures),
             key_derivation_drops: get(&self.key_derivation_drops),
+            window_memory_rejections: get(&self.window_memory_rejections),
             expired_half_open: get(&self.expired_half_open),
         }
     }
@@ -517,7 +525,8 @@ impl IngressTelemetry {
              {} half-open-capacity drops, {} established-capacity drops, \
              {} source-capacity drops, {} policy requests, {} policy configurations, \
              {} policy deferrals, {} policy errors, {} policy rejections, \
-             {} credential failures, {} key-derivation drops, {} expired half-open",
+             {} credential failures, {} key-derivation drops, {} window-memory rejections, \
+             {} expired half-open",
             snapshot.local_promotions,
             snapshot.handoffs,
             snapshot.stranded_conclusions,
@@ -537,6 +546,7 @@ impl IngressTelemetry {
             snapshot.policy_rejections,
             snapshot.credential_failures,
             snapshot.key_derivation_drops,
+            snapshot.window_memory_rejections,
             snapshot.expired_half_open,
         )
     }

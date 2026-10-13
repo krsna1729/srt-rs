@@ -207,6 +207,13 @@ pub struct PeerTableConfig {
     /// other source needs. The SYN cookie proves the address, so the share
     /// cannot be dodged without many real addresses.
     pub max_key_derivations_per_source_per_second: u32,
+    /// Payload bytes the send and receive windows of all established peers
+    /// may hold together, each peer counted at its worst case
+    /// ([`SrtConnection::window_memory_bound_bytes`], with the windows its
+    /// policy chose). A peer that does not fit is rejected with
+    /// [`RejectionReason::OVERLOAD`] once policy accepted it; its reservation
+    /// is returned when it retires. `None` (the default) is no budget.
+    pub max_window_memory_bytes: Option<u64>,
 }
 
 impl Default for PeerTableConfig {
@@ -226,6 +233,7 @@ impl Default for PeerTableConfig {
             // 250 ms; eight per second leaves it room and holds one source
             // to a sixteenth of the table's budget.
             max_key_derivations_per_source_per_second: 8,
+            max_window_memory_bytes: None,
         }
     }
 }
@@ -1021,6 +1029,9 @@ pub struct PeerTable {
     source_counts: HashMap<std::net::IpAddr, usize>,
     half_open_peers: usize,
     established_peers: usize,
+    /// Sum of [`SrtConnection::window_memory_bound_bytes`] over established
+    /// peers, charged and released wherever `established_peers` changes.
+    window_memory_bytes: u64,
     /// Non-lossy index of peers/legs holding an undrained
     /// [`ProtocolOutputFailure`]. One entry is appended at the moment of
     /// quarantine, so its length cannot exceed the quarantined population and
@@ -1216,6 +1227,7 @@ impl PeerTable {
             source_counts: HashMap::new(),
             half_open_peers: 0,
             established_peers: 0,
+            window_memory_bytes: 0,
             protocol_failure_index: VecDeque::new(),
             protocol_failure_scratch: Vec::new(),
             half_open_deadlines: DueIndex::default(),
@@ -1738,6 +1750,10 @@ impl PeerTable {
             telemetry.record_key_derivation_drop();
             return Some(Admit::Dropped(AdmissionDropReason::KeyDerivationBudget));
         }
+        let window_room = self
+            .config
+            .max_window_memory_bytes
+            .map(|max| max.saturating_sub(self.window_memory_bytes));
         let result = {
             let Some(entry) = self.get_peer_mut(&physical) else {
                 return Some(Admit::Dropped(AdmissionDropReason::StaleConclusion));
@@ -1772,14 +1788,49 @@ impl PeerTable {
                 entry.rejected = true;
                 entry.last_datagram_at = now;
                 Some(Admit::Rejected)
+            } else if let Err(admit) =
+                Self::apply_policy_hook(entry, &request, now, telemetry, hook)
+            {
+                Some(admit)
             } else {
-                Self::apply_policy_hook(entry, &request, now, telemetry, hook).err()
+                Self::reject_over_window_budget(entry, window_room, now, telemetry)
             }
         };
         if matches!(result, Some(Admit::Rejected)) {
             self.mark_ready_physical(physical);
         }
         result
+    }
+
+    /// Reject a half-open peer whose windows, as policy left them, do not fit
+    /// the rest of the window-memory budget
+    /// ([`PeerTableConfig::max_window_memory_bytes`]). Rejected rather than
+    /// dropped: policy already ran, and a dropped CONCLUSION would run it
+    /// again on every retransmission. The peer connects in this same
+    /// `admit`, which charges it, so no other peer is checked in between.
+    fn reject_over_window_budget(
+        entry: &mut AdmissionPeer,
+        room: Option<u64>,
+        now: Timestamp,
+        telemetry: &IngressTelemetry,
+    ) -> Option<Admit> {
+        if entry.admission_established
+            || room.is_none_or(|room| entry.conn.window_memory_bound_bytes() <= room)
+        {
+            return None;
+        }
+        if entry
+            .conn
+            .reject(RejectionReason::OVERLOAD.get(), now)
+            .is_err()
+        {
+            telemetry.record_invalid_datagram();
+            return Some(Admit::Dropped(AdmissionDropReason::InvalidPacket));
+        }
+        telemetry.record_window_memory_rejection();
+        entry.rejected = true;
+        entry.last_datagram_at = now;
+        Some(Admit::Rejected)
     }
 
     /// Spend one key derivation from `source`'s share and from the table's
@@ -1964,6 +2015,9 @@ impl PeerTable {
         if became_established {
             self.half_open_peers = self.half_open_peers.saturating_sub(1);
             self.established_peers += 1;
+            self.window_memory_bytes += self
+                .get_peer(&physical)
+                .map_or(0, |entry| entry.conn.window_memory_bound_bytes());
             self.half_open_deadlines.remove(&physical);
             if self.relocation.is_some() {
                 if self.queue_promotion(physical) {
@@ -2100,7 +2154,13 @@ impl PeerTable {
     /// ID, joining its bond group here. Returns the leg if this table cannot
     /// hold it (full, or its slot is unexpectedly taken).
     pub(crate) fn adopt(&mut self, leg: Box<RelocatedLeg>) -> Result<(), Box<RelocatedLeg>> {
-        if self.established_peers >= self.config.max_established_peers {
+        let window_bytes = leg.entry.conn.window_memory_bound_bytes();
+        if self.established_peers >= self.config.max_established_peers
+            || self
+                .config
+                .max_window_memory_bytes
+                .is_some_and(|max| self.window_memory_bytes.saturating_add(window_bytes) > max)
+        {
             return Err(leg);
         }
         let Some(slot_idx) = self.slots.adopt_socket_id(leg.socket_id) else {
@@ -2120,6 +2180,7 @@ impl PeerTable {
         self.slots
             .insert_at_slot(slot_idx, socket_id, address, PeerSlotTarget::Direct(*entry));
         self.established_peers += 1;
+        self.window_memory_bytes += window_bytes;
         *self.source_counts.entry(address.ip()).or_default() += 1;
         self.index_idle_peer(physical);
         self.adopt_bonded_peer(physical);
@@ -4133,6 +4194,12 @@ impl PeerTable {
         self.logical_peers.remove(&entry.logical_peer);
         if entry.admission_established {
             self.established_peers = self.established_peers.saturating_sub(1);
+            let window_bytes = entry.conn.window_memory_bound_bytes();
+            debug_assert!(
+                self.window_memory_bytes >= window_bytes,
+                "established peer charged"
+            );
+            self.window_memory_bytes = self.window_memory_bytes.saturating_sub(window_bytes);
         } else {
             self.half_open_peers = self.half_open_peers.saturating_sub(1);
         }
@@ -4163,6 +4230,12 @@ impl PeerTable {
                 self.slots.remove_by_slot(slot_idx);
                 self.note_slot_freed(slot_idx, leg.physical.address, true);
                 self.established_peers = self.established_peers.saturating_sub(1);
+                let window_bytes = connection.window_memory_bound_bytes();
+                debug_assert!(
+                    self.window_memory_bytes >= window_bytes,
+                    "group leg charged"
+                );
+                self.window_memory_bytes = self.window_memory_bytes.saturating_sub(window_bytes);
                 self.decrement_source_count(leg.physical.address.ip());
             }
             removed.push(RemovedPeerLeg {
@@ -4284,6 +4357,13 @@ impl PeerTable {
         self.established_peers
     }
 
+    /// Window memory reserved by established peers
+    /// ([`PeerTableConfig::max_window_memory_bytes`]).
+    #[must_use]
+    pub fn reserved_window_memory_bytes(&self) -> u64 {
+        self.window_memory_bytes
+    }
+
     /// Snapshot every active bonded ingress with both logical delivery and
     /// per-leg wire telemetry. Ordinary unbonded peers are intentionally not
     /// included: their existing admission-state stats retain the normal
@@ -4319,19 +4399,20 @@ impl PeerTable {
     }
 
     fn reconcile_established(&mut self, peer: PhysicalPeerKey) {
-        let became_established = self.get_peer_mut(&peer).is_some_and(|entry| {
+        let established_bytes = self.get_peer_mut(&peer).and_then(|entry| {
             if !entry.admission_established
                 && entry.conn.state() == srt_proto::ConnectionState::Connected
             {
                 entry.admission_established = true;
-                true
+                Some(entry.conn.window_memory_bound_bytes())
             } else {
-                false
+                None
             }
         });
-        if became_established {
+        if let Some(window_bytes) = established_bytes {
             self.half_open_peers = self.half_open_peers.saturating_sub(1);
             self.established_peers += 1;
+            self.window_memory_bytes += window_bytes;
             self.half_open_deadlines.remove(&peer);
         }
         self.index_idle_peer(peer);
@@ -4907,6 +4988,81 @@ mod tests {
             Admit::Dropped(AdmissionDropReason::KeyDerivationBudget)
         );
         assert_eq!(telemetry.snapshot().key_derivation_drops, 2);
+    }
+
+    /// Established peers reserve their worst-case window memory. A peer that
+    /// does not fit what is left is rejected once policy accepted it, sized
+    /// at the windows policy chose for it, and a retiring peer returns its
+    /// share.
+    #[test]
+    fn window_memory_budget_reserves_worst_case_windows_until_retirement() {
+        let per_peer =
+            SrtConnection::new_listener(ConnectionOptions::default()).window_memory_bound_bytes();
+        let mut table = PeerTable::with_config(PeerTableConfig {
+            // Two default peers, then exactly room for a quarter-window one.
+            max_window_memory_bytes: Some(2 * per_peer + per_peer / 4),
+            ..PeerTableConfig::default()
+        });
+        let telemetry = IngressTelemetry::new();
+        let options = default_options();
+        let now = Timestamp::from_micros(1_000_000);
+        let at = |port| std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let conclude = |table: &mut PeerTable, port| {
+            conclude_as(table, at(port), None, &options, &telemetry, now)
+        };
+        let (first, _) = conclude(&mut table, 30_001);
+        let (second, _) = conclude(&mut table, 30_002);
+        assert_eq!((first, second), (Admit::Fed, Admit::Fed));
+        assert_eq!(table.reserved_window_memory_bytes(), 2 * per_peer);
+
+        let (admit, conclusion) = conclude(&mut table, 30_003);
+        assert_eq!(admit, Admit::Rejected);
+        assert_eq!(
+            table.admit(at(30_003), &conclusion, now, &options, 0, 1, &telemetry),
+            Admit::Dropped(AdmissionDropReason::RejectedPeer),
+            "a retransmission is not judged again"
+        );
+        assert_eq!(telemetry.snapshot().window_memory_rejections, 1);
+        assert_eq!(table.established_count(), 2);
+        assert_eq!(table.reserved_window_memory_bytes(), 2 * per_peer);
+
+        // Policy that quarters the windows fits exactly in what is left.
+        let small = at(30_004);
+        let conclusion = induct(&mut table, small, None, &options, &telemetry, now);
+        let window = std::num::NonZeroU32::new(srt_proto::handshake::DEFAULT_FLOW_WINDOW / 4)
+            .expect("non-zero window");
+        let quarter = AdmissionResolution::Configure(crate::config::ListenerPeerPolicy {
+            flow_control: crate::config::PolicyOverride::Set(crate::config::FlowControlConfig {
+                window_packets: window,
+                receive_buffer_packets: window,
+            }),
+            ..crate::config::ListenerPeerPolicy::default()
+        });
+        let admit =
+            table.admit_with_resolver(small, &conclusion, now, &options, 0, 1, &telemetry, |_| {
+                quarter
+            });
+        assert_eq!(admit, Admit::Fed);
+        assert_eq!(
+            table.reserved_window_memory_bytes(),
+            2 * per_peer + per_peer / 4
+        );
+
+        // Retirement returns the share, and the next peer fits again, exactly.
+        let retiring = table
+            .physical_for_address(at(30_001))
+            .expect("established peer");
+        assert!(table.remove_direct(retiring).is_some());
+        assert_eq!(
+            table.reserved_window_memory_bytes(),
+            per_peer + per_peer / 4
+        );
+        assert_eq!(conclude(&mut table, 30_005).0, Admit::Fed);
+        assert_eq!(
+            table.reserved_window_memory_bytes(),
+            2 * per_peer + per_peer / 4
+        );
+        assert_eq!(telemetry.snapshot().window_memory_rejections, 1);
     }
 
     /// A source's share of the key-derivation budget is its own: a source

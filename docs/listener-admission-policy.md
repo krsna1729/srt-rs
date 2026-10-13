@@ -233,6 +233,7 @@ cross-counter transaction.
 | `policy_errors` | Invalid/out-of-state policy produced by the application; sustained nonzero values indicate a configuration bug. |
 | `credential_failures` | KM failed after policy selected a credential, or encryption negotiation otherwise failed closed. |
 | `key_derivation_drops` | Encrypted CONCLUSIONs dropped, before policy and protocol work, because the table's key-derivation budget (`max_key_derivations_per_second`) was spent. The caller retransmits. Sustained nonzero values with rising `credential_failures` mean a source is cycling handshakes to burn PBKDF2 time. |
+| `window_memory_rejections` | Peers rejected with `OVERLOAD` (1402) after policy accepted them, because their worst-case window memory did not fit what was left of `max_window_memory_bytes`. A rejection is final for that handshake; the caller connects again later. Sustained nonzero values mean the budget, or the windows policy grants, are too large for the established population. |
 | `expired_half_open` | Incomplete peers removed after their hard inactivity bound. |
 | `invalid_cookies` / `cookie_route_failures` | Cookie validation failures and failed cross-worker delivery. |
 | capacity-drop counters | Total, half-open, established, and per-source limits shedding load. |
@@ -289,6 +290,14 @@ composes overlays, accounts telemetry, and preserves admission ordering.
   sources out. Under a flood from many sources it sheds admission, not
   established media; raise the table rate if a mass reconnect of encrypted
   callers must finish faster.
+- Set `max_window_memory_bytes` to bound the payload one table can buffer.
+  Each established peer reserves its worst case, `(flow window + receive
+  window) × 1,484` bytes at the windows policy chose (about 24 MB at the
+  default 8,192-packet windows), and returns it when it retires. Off by
+  default; the static per-peer window limits still apply. The budget is per
+  table, so per member of a reuseport layout: a member checks its own budget
+  when it adopts a relocated leg, and refusing one ends a session the peer
+  already saw connect. Give every member of a layout the same budget.
 - Treat `Defer` volume and half-open expiry as abuse signals.
 - Use unique tenant credentials, but do not treat them as general identity.
 - Put an authenticated protocol inside SRT when integrity or endpoint identity

@@ -1655,6 +1655,19 @@ impl SrtConnection {
         self.options.receive_buffer_packets
     }
 
+    /// Most payload bytes this connection's send and receive windows can
+    /// hold: each window full of packets of the largest payload any peer can
+    /// negotiate (`apply_peer_mss` only lowers it). The windows are fixed
+    /// before the CONCLUSION is processed (`ensure_listener_policy_window`),
+    /// so a listener gets the same value once policy has run as at
+    /// retirement, and can reserve it at admission and release it then.
+    #[must_use]
+    pub fn window_memory_bound_bytes(&self) -> u64 {
+        let packets = u64::from(self.options.flow_window_packets)
+            + u64::from(self.options.receive_buffer_packets);
+        packets * (DEFAULT_MTU as usize - SRT_HEADER_SIZE) as u64
+    }
+
     /// Process received data.
     pub fn feed_recv_buf(&mut self, buf: &[u8], now: Timestamp) -> Result<(), Error> {
         self.check_output_queue()?;
