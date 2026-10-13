@@ -302,12 +302,21 @@ pub struct SenderBuffer {
     /// always O(1) and advancing it is amortized O(1) per position over the
     /// window's lifetime.
     justified_frontier: u32,
+    /// Where `drop_expired` resumes. Every position from `oldest_unacked`
+    /// up to here is a tombstone or already retired (expiry follows send
+    /// order, and positions are only appended at `next_seq`), so a run of
+    /// tombstones the peer has not yet acknowledged is walked once, not on
+    /// every ACK tick.
+    expiry_scan_from: u32,
     /// Test-only instrumentation: number of times `tombstone_range` has
     /// actually walked a run, to pin its O(1)-per-distinct-run amortized
     /// cost against a regression back to O(run length) per requested
     /// position.
     #[cfg(test)]
     tombstone_range_calls: std::cell::Cell<u32>,
+    /// Test-only instrumentation: positions `drop_expired` has visited.
+    #[cfg(test)]
+    expiry_scan_steps: std::cell::Cell<u32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -386,8 +395,11 @@ impl SenderBuffer {
             dropreq_cursor: 0,
             live_submitted_count: 0,
             justified_frontier: initial_seq,
+            expiry_scan_from: initial_seq,
             #[cfg(test)]
             tombstone_range_calls: std::cell::Cell::new(0),
+            #[cfg(test)]
+            expiry_scan_steps: std::cell::Cell::new(0),
         };
         buf.recompute_packet_send_period();
         buf
@@ -478,6 +490,7 @@ impl SenderBuffer {
         }
         self.next_seq = sequence_number & 0x7FFF_FFFF;
         self.oldest_unacked = self.next_seq;
+        self.expiry_scan_from = self.next_seq;
         self.retained_tx_even = 0;
         self.retained_tx_odd = 0;
         self.peer_window_end = self.next_seq.wrapping_add(self.negotiated_window) & SEQUENCE_MASK;
@@ -1631,8 +1644,19 @@ impl SenderBuffer {
         let threshold = (self.latency_us * 125 / 100).max(1_000_000);
 
         let mut messages = Vec::new();
-        let mut seq = self.oldest_unacked;
+        // Resume past the tombstones an earlier call already walked, unless
+        // a cumulative ACK has since retired past the cursor.
+        let mut seq = if sequence_less_than(self.oldest_unacked, self.expiry_scan_from)
+            && !sequence_less_than(self.next_seq, self.expiry_scan_from)
+        {
+            self.expiry_scan_from
+        } else {
+            self.oldest_unacked
+        };
         while sequence_less_than(seq, self.next_seq) {
+            #[cfg(test)]
+            self.expiry_scan_steps
+                .set(self.expiry_scan_steps.get().saturating_add(1));
             match self.packets.get(seq) {
                 Some(entry) => {
                     if entry.dropped {
@@ -1650,6 +1674,7 @@ impl SenderBuffer {
                 }
             }
         }
+        self.expiry_scan_from = seq;
 
         self.compact_stale_retransmits();
 
@@ -1780,6 +1805,11 @@ impl SenderBuffer {
     #[cfg(test)]
     fn tombstone_range_calls(&self) -> u32 {
         self.tombstone_range_calls.get()
+    }
+
+    #[cfg(test)]
+    fn expiry_scan_steps(&self) -> u32 {
+        self.expiry_scan_steps.get()
     }
 
     /// Get the send time of the oldest packet in the buffer.
@@ -2407,8 +2437,11 @@ mod tests {
         // datagram could otherwise strand behind a hole). A fourth added
         // `total_bytes_acked` (a `u64`): peer-confirmed payload, which a
         // sender could not otherwise report without re-deriving it from
-        // internal buffer accounting -- 8 bytes, deliberate.
-        assert!(inline_bytes <= 352);
+        // internal buffer accounting -- 8 bytes, deliberate. A fifth added
+        // `expiry_scan_from` (a `u32`, so TLPKTDROP does not re-walk
+        // unacknowledged tombstones every ACK tick) and, in test builds
+        // only, its `expiry_scan_steps` counter -- 8 bytes, deliberate.
+        assert!(inline_bytes <= 360);
         assert_eq!(window.heap_bytes(), 8_320);
     }
 
@@ -3085,6 +3118,44 @@ mod tests {
         buf.handle_ack(3);
         assert_eq!(buf.packets_in_flight(), 0);
         assert!(buf.is_empty());
+    }
+
+    /// Tombstones the peer has not acknowledged yet are walked once: later
+    /// ACK ticks resume at the first live position, and a cumulative ACK
+    /// that retires past the cursor restarts the walk at `oldest_unacked`.
+    #[test]
+    fn drop_expired_does_not_rewalk_unacknowledged_tombstones() {
+        const DROPPED: u32 = 1_000;
+        let mut buf = SenderBuffer::new(0, 8192, 10);
+        for message in 1..=DROPPED {
+            buf.push(vec![1], 100, message, Timestamp::from_micros(0));
+        }
+        buf.push(vec![2], 100, DROPPED + 1, Timestamp::from_micros(5_000_000));
+
+        let dropped = buf.drop_expired(Timestamp::from_micros(1_000_001));
+        assert_eq!(dropped.len(), DROPPED as usize);
+        let first_walk = buf.expiry_scan_steps();
+        assert!(first_walk > DROPPED, "{first_walk}");
+
+        for tick in 1..=10 {
+            assert!(
+                buf.drop_expired(Timestamp::from_micros(1_000_001 + tick))
+                    .is_empty()
+            );
+        }
+        assert_eq!(
+            buf.expiry_scan_steps() - first_walk,
+            10,
+            "each later tick visits only the live head"
+        );
+
+        // The peer acknowledges the tombstones and the live packet: the
+        // next walk starts from the new `oldest_unacked`, and a packet sent
+        // after that expires normally.
+        buf.handle_ack(DROPPED + 1);
+        buf.push(vec![3], 100, DROPPED + 2, Timestamp::from_micros(6_000_000));
+        let dropped = buf.drop_expired(Timestamp::from_micros(7_000_001));
+        assert_eq!(dropped_seqs(&dropped), vec![DROPPED + 1]);
     }
 
     /// A TLPKTDROP drop keeps the sequence identity (so a repeated NAK is
