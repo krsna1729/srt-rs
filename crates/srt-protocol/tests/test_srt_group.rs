@@ -883,6 +883,33 @@ fn expect_exactly(group: &mut SrtGroup, sequences: impl Iterator<Item = u32>) {
     assert!(next_data(group, ts(200_000)).is_none());
 }
 
+/// Removing a member whose reservations outnumber what the group already
+/// owns keeps both sets of payloads: each is delivered once, in order, and
+/// none releases into the member that later reuses an ID.
+#[test]
+fn removal_merges_into_what_the_group_already_owns() {
+    let (mut group, mut gap_source) = group_waiting_at_101(0x4000_0021);
+    hold_one(&mut group, 1, 102);
+    assert!(group.remove_member(1));
+
+    let (mut pair_source, pair_member) = establish_pair_with_options(removal_options(103));
+    group.add_member(3, 1, pair_member).unwrap();
+    pair_source.send(b"103", ts(120_001)).unwrap();
+    pair_source.send(b"104", ts(120_001)).unwrap();
+    transfer_to_group_member(&mut pair_source, &mut group, 3, ts(120_001));
+    assert!(next_data(&mut group, ts(120_001)).is_none());
+    assert!(next_data(&mut group, ts(120_001)).is_none());
+    assert!(group.remove_member(3));
+    let (_replacement_source, replacement) = establish_pair_with_options(removal_options(106));
+    group.add_member(1, 1, replacement).unwrap();
+
+    gap_source.send(b"fill", ts(130_000)).unwrap();
+    transfer_to_group_member(&mut gap_source, &mut group, 2, ts(130_000));
+    expect_exactly(&mut group, 101..=104);
+    assert_eq!(member_window(&group, 1), REMOVAL_WINDOW);
+    assert_eq!(member_window(&group, 2), REMOVAL_WINDOW);
+}
+
 #[test]
 fn group_with_no_healthy_members_fails_without_panicking() {
     let (member, _) = establish_pair();
