@@ -170,8 +170,12 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    /// The registry is process-wide, and concurrent multi-owner tests hold
+    /// live layouts on kernel-assigned 127.0.0.1 ports, the range these
+    /// ports fall in. These tests never bind a socket, so they key the
+    /// registry on TEST-NET-1 (RFC 5737), which no socket test uses.
     fn addr(port: u16) -> SocketAddr {
-        SocketAddr::from(([127, 0, 0, 1], port))
+        SocketAddr::from(([192, 0, 2, 1], port))
     }
 
     #[test]
