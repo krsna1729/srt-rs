@@ -188,5 +188,42 @@ fn bench_sender_nak_tombstones(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_sender_nak_scale, bench_sender_nak_tombstones);
+/// One Owner callback for a NAK naming the maximum window: the whole report
+/// at once (`handle_nak_ranges`) against the first bounded visit of
+/// `receive_nak`.
+fn bench_sender_nak_visit(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sender_nak_visit");
+    const WINDOW: u32 = 65_536;
+    let full_window = [LossRange {
+        first_seq: 0,
+        last_seq: WINDOW - 1,
+    }];
+
+    group.bench_function("whole_report_65536", |b| {
+        b.iter_batched_ref(
+            || populated_sender(WINDOW),
+            |sender| black_box(sender.handle_nak_ranges(black_box(&full_window)).is_ok()),
+            BatchSize::LargeInput,
+        );
+    });
+
+    group.bench_function("first_visit_65536", |b| {
+        b.iter_batched_ref(
+            || (populated_sender(WINDOW), full_window.to_vec()),
+            |(sender, report)| {
+                black_box(sender.receive_nak(std::mem::take(report), Timestamp::default()))
+            },
+            BatchSize::LargeInput,
+        );
+    });
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_sender_nak_scale,
+    bench_sender_nak_tombstones,
+    bench_sender_nak_visit
+);
 criterion_main!(benches);

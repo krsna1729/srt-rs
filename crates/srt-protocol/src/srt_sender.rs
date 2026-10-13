@@ -33,6 +33,12 @@ const STALE_RETRANSMIT_COMPACT_THRESHOLD: usize = 1_024;
 /// DROPREQ is idempotent: a peer that still needs one NAKs again.
 const MAX_DROPREQ_PER_NAK: usize = 16;
 
+/// Positions of peer loss reports one visit validates or queues for
+/// retransmission. A NAK can name the whole negotiated window (up to
+/// `MAX_FLOW_WINDOW`), which costs milliseconds of one Owner callback when
+/// done at once; a larger report continues on later visits.
+pub const MAX_NAK_POSITIONS_PER_VISIT: u32 = 4_096;
+
 /// "No configured limit" default max bandwidth, matching libsrt's own
 /// `BW_INFINITE` (`srtcore/common.h`): 1 Gbps expressed in bytes/sec. Live
 /// mode always paces off *some* bandwidth figure -- there is no "pacing
@@ -122,6 +128,60 @@ pub struct DroppedMessage {
 /// rejected rather than just the offending position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidNak;
+
+/// What became of a peer loss report on arrival; see
+/// [`SenderBuffer::receive_nak`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum NakReceipt {
+    /// Validated and applied: the tombstoned messages to answer with DROPREQ.
+    Applied(Vec<DroppedMessage>),
+    /// Larger than one visit: queued, finished by [`SenderBuffer::continue_naks`].
+    Deferred,
+    /// Larger than one visit while the pending reports already cover a whole
+    /// window: not processed. The peer's periodic NAK reports it again.
+    Shed,
+}
+
+/// Reports [`SenderBuffer::continue_naks`] finished during one visit.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct NakProgress {
+    /// Tombstoned messages the finished reports named, for DROPREQ.
+    pub dropped: Vec<DroppedMessage>,
+    /// Arrival time of the newest report that validated, which is when the
+    /// peer proved itself active.
+    pub credible_at: Option<Timestamp>,
+    /// Reports rejected as a whole.
+    pub rejected: u32,
+}
+
+/// One peer loss report part-way through validation or commit.
+#[derive(Debug)]
+struct PendingNak {
+    ranges: Vec<LossRange>,
+    /// Positions `ranges` names in total.
+    span: u32,
+    /// The range being worked on and the next position in it.
+    range: usize,
+    next: u32,
+    /// Validation has finished; `range`/`next` now walk the commit.
+    committing: bool,
+    tombstones: Vec<DroppedMessage>,
+    seen_starts: BTreeSet<u32>,
+    known_run: Option<(u32, u32)>,
+    /// `oldest_unacked` on arrival: a position retired since then, by an
+    /// ACK between two visits, was retained when the peer reported it.
+    retired_from: u32,
+    /// `newest_submitted` on arrival: a position first submitted after the
+    /// report arrived cannot be in it.
+    newest_submitted: Option<u32>,
+    arrived_at: Timestamp,
+}
+
+enum NakStep {
+    Pending,
+    Invalid,
+    Applied(Vec<DroppedMessage>),
+}
 
 /// Send buffer.
 #[derive(Debug)]
@@ -308,6 +368,9 @@ pub struct SenderBuffer {
     /// tombstones the peer has not yet acknowledged is walked once, not on
     /// every ACK tick.
     expiry_scan_from: u32,
+    /// Peer loss reports larger than one visit's budget, oldest first, each
+    /// still validated all-or-none; see [`SenderBuffer::receive_nak`].
+    pending_naks: VecDeque<PendingNak>,
     /// Test-only instrumentation: number of times `tombstone_range` has
     /// actually walked a run, to pin its O(1)-per-distinct-run amortized
     /// cost against a regression back to O(run length) per requested
@@ -396,6 +459,7 @@ impl SenderBuffer {
             live_submitted_count: 0,
             justified_frontier: initial_seq,
             expiry_scan_from: initial_seq,
+            pending_naks: VecDeque::new(),
             #[cfg(test)]
             tombstone_range_calls: std::cell::Cell::new(0),
             #[cfg(test)]
@@ -501,6 +565,7 @@ impl SenderBuffer {
         self.dropreq_cursor = 0;
         self.live_submitted_count = 0;
         self.justified_frontier = self.next_seq;
+        self.pending_naks.clear();
         true
     }
 
@@ -1393,69 +1458,6 @@ impl SenderBuffer {
         let _ = self.handle_nak_ranges(&ranges);
     }
 
-    /// Validate one requested loss range against the retained window,
-    /// recording any tombstoned message it touches.
-    ///
-    /// `known_run` caches the most recently discovered tombstone run's
-    /// `(first, last)` bounds so that a NAK naming a broad range spanning
-    /// one heavily fragmented dropped message does not re-walk that whole
-    /// run for every position inside it -- `tombstone_range` itself is
-    /// O(run length), and the old per-position call made a range spanning
-    /// most of the negotiated window O(run^2). `seen_starts` catches the
-    /// rarer case of two different requested ranges in the same report
-    /// both landing on the same run, which the cache above cannot: an
-    /// O(log D) lookup keyed by each run's first sequence, where D is the
-    /// number of distinct runs found so far (bounded by the negotiated
-    /// window). Together this keeps the whole validation at O(requested
-    /// span + D log D) rather than the O(N^2) a linear rescan of
-    /// `tombstones` per position gave a report naming many one-packet
-    /// tombstoned messages.
-    fn validate_loss_range(
-        &self,
-        loss: &LossRange,
-        tombstones: &mut Vec<(u32, u32)>,
-        seen_starts: &mut BTreeSet<u32>,
-        known_run: &mut Option<(u32, u32)>,
-    ) -> Result<(), InvalidNak> {
-        let mut sequence = loss.first_seq & SEQUENCE_MASK;
-        let last_seq = loss.last_seq & SEQUENCE_MASK;
-        loop {
-            let within_known_run = known_run.is_some_and(|(first, last)| {
-                !sequence_less_than(sequence, first) && !sequence_less_than(last, sequence)
-            });
-            if !within_known_run {
-                *known_run = None;
-                match self.packets.get(sequence) {
-                    None => {
-                        // Never sent, already acknowledged, or outside the
-                        // retained span: not a loss this receiver could have
-                        // observed.
-                        return Err(InvalidNak);
-                    }
-                    Some(entry) if entry.dropped => {
-                        let message_number = entry.message_number;
-                        if let Some(range) = self.tombstone_range(sequence, message_number) {
-                            *known_run = Some(range);
-                            if seen_starts.insert(range.0) {
-                                tombstones.push(range);
-                            }
-                        }
-                    }
-                    Some(entry) if !entry.submitted => {
-                        // Accepted but never on the wire: the peer cannot have
-                        // measured it as lost.
-                        return Err(InvalidNak);
-                    }
-                    Some(_) => {}
-                }
-            }
-            if sequence == last_seq {
-                return Ok(());
-            }
-            sequence = sequence.wrapping_add(1) & SEQUENCE_MASK;
-        }
-    }
-
     /// Validate a peer loss report completely, then commit it: either every
     /// requested position is a credible report and the whole NAK is applied,
     /// or nothing is.
@@ -1474,68 +1476,300 @@ impl SenderBuffer {
     /// DROPREQ, capped per report so one NAK cannot be amplified into
     /// unbounded control traffic.
     ///
-    /// Validation walks the requested ranges against the window, bounded by
-    /// the negotiated window: no expanded sequence list is built.
+    /// This applies the whole report at once. A connection uses
+    /// [`Self::receive_nak`], which bounds the work of one visit.
     pub fn handle_nak_ranges(
         &mut self,
         loss_ranges: &[LossRange],
     ) -> Result<Vec<DroppedMessage>, InvalidNak> {
+        let span = self.nak_span(loss_ranges)?;
+        let mut report = self.pending_nak(loss_ranges.to_vec(), span, Timestamp::default());
+        loop {
+            let mut budget = u32::MAX;
+            match self.advance_nak(&mut report, &mut budget) {
+                NakStep::Pending => {}
+                NakStep::Invalid => return Err(InvalidNak),
+                NakStep::Applied(dropped) => return Ok(dropped),
+            }
+        }
+    }
+
+    /// Take a peer loss report, with the semantics of
+    /// [`Self::handle_nak_ranges`], spending at most
+    /// `MAX_NAK_POSITIONS_PER_VISIT` positions now.
+    ///
+    /// A larger report is queued and finished by [`Self::continue_naks`],
+    /// still all-or-none: it is validated against the window as it was when
+    /// it arrived. A position the peer acknowledged after that still counts
+    /// as retained, and a position first submitted after that does not
+    /// count as sent. A large report arriving while the queued reports
+    /// already name a whole window is shed, so a peer cannot grow the queue.
+    /// A report within one visit's budget is always taken at once.
+    pub fn receive_nak(
+        &mut self,
+        loss_ranges: Vec<LossRange>,
+        now: Timestamp,
+    ) -> Result<NakReceipt, InvalidNak> {
+        let span = self.nak_span(&loss_ranges)?;
+        if span > MAX_NAK_POSITIONS_PER_VISIT {
+            let queued = self
+                .pending_naks
+                .iter()
+                .fold(0u32, |total, report| total.saturating_add(report.span));
+            if queued != 0 && queued.saturating_add(span) > self.negotiated_window {
+                return Ok(NakReceipt::Shed);
+            }
+        }
+        let mut report = self.pending_nak(loss_ranges, span, now);
+        let mut budget = MAX_NAK_POSITIONS_PER_VISIT;
+        match self.advance_nak(&mut report, &mut budget) {
+            NakStep::Pending => {
+                self.pending_naks.push_back(report);
+                Ok(NakReceipt::Deferred)
+            }
+            NakStep::Invalid => Err(InvalidNak),
+            NakStep::Applied(dropped) => Ok(NakReceipt::Applied(dropped)),
+        }
+    }
+
+    /// Continue the queued loss reports, oldest first, for one visit.
+    pub fn continue_naks(&mut self) -> NakProgress {
+        let mut progress = NakProgress::default();
+        let mut budget = MAX_NAK_POSITIONS_PER_VISIT;
+        while budget != 0
+            && let Some(mut report) = self.pending_naks.pop_front()
+        {
+            match self.advance_nak(&mut report, &mut budget) {
+                NakStep::Pending => {
+                    self.pending_naks.push_front(report);
+                    break;
+                }
+                NakStep::Invalid => progress.rejected += 1,
+                NakStep::Applied(dropped) => {
+                    progress.dropped.extend(dropped);
+                    progress.credible_at = Some(report.arrived_at);
+                }
+            }
+        }
+        progress
+    }
+
+    /// Whether a queued loss report waits for [`Self::continue_naks`].
+    pub fn has_pending_nak(&self) -> bool {
+        !self.pending_naks.is_empty()
+    }
+
+    /// Positions a report names, rejecting one that names more than the
+    /// negotiated window (no credible report can).
+    fn nak_span(&self, loss_ranges: &[LossRange]) -> Result<u32, InvalidNak> {
         let mut requested_span = 0u32;
         for loss in loss_ranges {
             let first_seq = loss.first_seq & SEQUENCE_MASK;
             let last_seq = loss.last_seq & SEQUENCE_MASK;
             let count = (last_seq.wrapping_sub(first_seq) & SEQUENCE_MASK).saturating_add(1);
-            if count > self.negotiated_window {
-                return Err(InvalidNak);
-            }
             requested_span = requested_span.saturating_add(count);
             if requested_span > self.negotiated_window {
                 return Err(InvalidNak);
             }
         }
+        Ok(requested_span)
+    }
 
-        // Phase 1: validate everything before touching any state, including
-        // `total_naks_received`: an impossible report is not evidence the
-        // peer is alive and playing by the protocol, so it must not be
-        // banked as one.
-        let mut tombstones: Vec<(u32, u32)> = Vec::new();
-        let mut seen_starts: BTreeSet<u32> = BTreeSet::new();
-        let mut known_run: Option<(u32, u32)> = None;
-        for loss in loss_ranges {
-            self.validate_loss_range(loss, &mut tombstones, &mut seen_starts, &mut known_run)?;
+    fn pending_nak(&self, ranges: Vec<LossRange>, span: u32, now: Timestamp) -> PendingNak {
+        PendingNak {
+            next: ranges
+                .first()
+                .map_or(0, |loss| loss.first_seq & SEQUENCE_MASK),
+            ranges,
+            span,
+            range: 0,
+            committing: false,
+            tombstones: Vec::new(),
+            seen_starts: BTreeSet::new(),
+            known_run: None,
+            retired_from: self.oldest_unacked,
+            newest_submitted: self.newest_submitted,
+            arrived_at: now,
+        }
+    }
+
+    /// Validate, then commit, the next positions of `report`, charging each
+    /// position (and each tombstone run walked) to `budget`.
+    ///
+    /// Validation records the tombstoned messages the report touches.
+    /// `known_run` caches the most recently discovered tombstone run's
+    /// `(first, last)` bounds so a report spanning one heavily fragmented
+    /// dropped message steps over the run instead of re-walking it per
+    /// position (`tombstone_range` is O(run length)). `seen_starts` catches
+    /// two requested ranges landing on the same run: an O(log D) lookup by
+    /// each run's first sequence, D the distinct runs found so far. Together
+    /// this keeps validation at O(requested span + D log D).
+    ///
+    /// Commit happens only after the last position validated; it queues live
+    /// positions for retransmission in chunks of the remaining budget.
+    fn advance_nak(&mut self, report: &mut PendingNak, budget: &mut u32) -> NakStep {
+        while !report.committing {
+            let Some(last_seq) = report
+                .ranges
+                .get(report.range)
+                .map(|loss| loss.last_seq & SEQUENCE_MASK)
+            else {
+                // Only a validated report reaches here, so this is the one
+                // place `total_naks_received` is allowed to move: an
+                // impossible report is not evidence the peer is alive and
+                // playing by the protocol.
+                self.total_naks_received = self.total_naks_received.saturating_add(1);
+                report.committing = true;
+                report.range = 0;
+                report.next = report
+                    .ranges
+                    .first()
+                    .map_or(0, |loss| loss.first_seq & SEQUENCE_MASK);
+                break;
+            };
+            match self.validate_nak_range(report, last_seq, budget) {
+                None => return NakStep::Invalid,
+                Some(false) => return NakStep::Pending,
+                Some(true) => {
+                    report.range += 1;
+                    if let Some(loss) = report.ranges.get(report.range) {
+                        report.next = loss.first_seq & SEQUENCE_MASK;
+                    }
+                }
+            }
         }
 
-        // Phase 2: commit. Only a validated report reaches here, so this is
-        // the one place `total_naks_received` is allowed to move.
-        self.total_naks_received = self.total_naks_received.saturating_add(1);
-        for loss in loss_ranges {
-            self.queue_loss_range(loss.first_seq, loss.last_seq);
+        while let Some(last_seq) = report
+            .ranges
+            .get(report.range)
+            .map(|loss| loss.last_seq & SEQUENCE_MASK)
+        {
+            if *budget == 0 {
+                return NakStep::Pending;
+            }
+            let remaining = (last_seq.wrapping_sub(report.next) & SEQUENCE_MASK) + 1;
+            let chunk = remaining.min(*budget);
+            let chunk_last = report.next.wrapping_add(chunk - 1) & SEQUENCE_MASK;
+            self.queue_loss_range(report.next, chunk_last);
+            *budget -= chunk;
+            if chunk == remaining {
+                report.range += 1;
+                if let Some(loss) = report.ranges.get(report.range) {
+                    report.next = loss.first_seq & SEQUENCE_MASK;
+                }
+            } else {
+                report.next = chunk_last.wrapping_add(1) & SEQUENCE_MASK;
+            }
         }
+        NakStep::Applied(self.serve_dropreqs(std::mem::take(&mut report.tombstones)))
+    }
 
-        if tombstones.is_empty() {
-            return Ok(Vec::new());
-        }
-        // Rotate the start of service by however many tombstones have been
-        // served in total: a range that never shrinks (the peer keeps
-        // repeating the same NAK) then serves a different window of
-        // messages each time instead of stalling on the same first
-        // `MAX_DROPREQ_PER_NAK`. See `dropreq_cursor`'s doc comment.
-        let start = (self.dropreq_cursor as usize) % tombstones.len();
-        tombstones.rotate_left(start);
-        let served: Vec<DroppedMessage> = tombstones
-            .into_iter()
-            .take(MAX_DROPREQ_PER_NAK)
-            .map(|(first_seq, last_seq)| DroppedMessage {
-                message_number: self
-                    .packets
-                    .get(first_seq)
-                    .map_or(0, |entry| entry.message_number),
+    /// Validate the current range of `report` from `report.next` up to
+    /// `last_seq`: `Some(true)` once it is all credible, `Some(false)` when
+    /// `budget` ran out first (`report.next` is then the first position left
+    /// to check), `None` at a position no peer could have reported.
+    ///
+    /// Credible means retained when the report arrived, and either a
+    /// tombstone or submitted by then. A position missing now was never
+    /// sent, already acknowledged when the report arrived, or outside the
+    /// retained span, unless an ACK retired it since the report arrived.
+    fn validate_nak_range(
+        &self,
+        report: &mut PendingNak,
+        last_seq: u32,
+        budget: &mut u32,
+    ) -> Option<bool> {
+        let retired_from = report.retired_from;
+        let newest_submitted = report.newest_submitted;
+        let mut known_run = report.known_run;
+        let mut sequence = report.next;
+        let mut left = *budget;
+        let done = loop {
+            if left == 0 {
+                break false;
+            }
+            left -= 1;
+            if let Some((first, last)) = known_run
+                && !sequence_less_than(sequence, first)
+                && !sequence_less_than(last, sequence)
+            {
+                sequence = if sequence_less_than(last, last_seq) {
+                    last
+                } else {
+                    last_seq
+                };
+            } else {
+                known_run = None;
+                let credible = match self.packets.get(sequence) {
+                    Some(entry) if entry.dropped => {
+                        known_run = self.record_nak_tombstone(
+                            report,
+                            sequence,
+                            entry.message_number,
+                            &mut left,
+                        );
+                        true
+                    }
+                    Some(entry) => {
+                        entry.submitted
+                            && newest_submitted
+                                .is_some_and(|newest| !sequence_less_than(newest, sequence))
+                    }
+                    None => {
+                        !sequence_less_than(sequence, retired_from)
+                            && sequence_less_than(sequence, self.oldest_unacked)
+                    }
+                };
+                if !credible {
+                    return None;
+                }
+            }
+            if sequence == last_seq {
+                break true;
+            }
+            sequence = sequence.wrapping_add(1) & SEQUENCE_MASK;
+        };
+        report.known_run = known_run;
+        report.next = sequence;
+        *budget = left;
+        Some(done)
+    }
+
+    /// Record the tombstone run holding `sequence` for DROPREQ, once per
+    /// run, charging its walk to `budget`; returns the run.
+    fn record_nak_tombstone(
+        &self,
+        report: &mut PendingNak,
+        sequence: u32,
+        message_number: u32,
+        budget: &mut u32,
+    ) -> Option<(u32, u32)> {
+        let (first_seq, last_seq) = self.tombstone_range(sequence, message_number)?;
+        *budget = budget.saturating_sub(last_seq.wrapping_sub(first_seq) & SEQUENCE_MASK);
+        if report.seen_starts.insert(first_seq) {
+            report.tombstones.push(DroppedMessage {
+                message_number,
                 first_seq,
                 last_seq,
-            })
-            .collect();
-        self.dropreq_cursor = self.dropreq_cursor.wrapping_add(served.len() as u16);
-        Ok(served)
+            });
+        }
+        Some((first_seq, last_seq))
+    }
+
+    /// The tombstoned messages one report is answered with: at most
+    /// `MAX_DROPREQ_PER_NAK`, starting at a rotating offset so a range that
+    /// never shrinks (the peer keeps repeating the same NAK) serves a
+    /// different window of messages each time instead of stalling on the
+    /// same first ones. See `dropreq_cursor`'s doc comment.
+    fn serve_dropreqs(&mut self, mut tombstones: Vec<DroppedMessage>) -> Vec<DroppedMessage> {
+        if tombstones.is_empty() {
+            return tombstones;
+        }
+        let start = (self.dropreq_cursor as usize) % tombstones.len();
+        tombstones.rotate_left(start);
+        tombstones.truncate(MAX_DROPREQ_PER_NAK);
+        self.dropreq_cursor = self.dropreq_cursor.wrapping_add(tombstones.len() as u16);
+        tombstones
     }
 
     /// Queue retained, live, transmitted packets intersecting one loss range.
@@ -2440,8 +2674,11 @@ mod tests {
         // internal buffer accounting -- 8 bytes, deliberate. A fifth added
         // `expiry_scan_from` (a `u32`, so TLPKTDROP does not re-walk
         // unacknowledged tombstones every ACK tick) and, in test builds
-        // only, its `expiry_scan_steps` counter -- 8 bytes, deliberate.
-        assert!(inline_bytes <= 360);
+        // only, its `expiry_scan_steps` counter -- 8 bytes, deliberate. A
+        // sixth added `pending_naks` (a `VecDeque`, empty and unallocated
+        // unless a peer loss report outgrows one visit) -- 32 bytes,
+        // deliberate.
+        assert!(inline_bytes <= 392);
         assert_eq!(window.heap_bytes(), 8_320);
     }
 
@@ -3459,7 +3696,7 @@ mod tests {
 
     /// A NAK naming a single heavily fragmented tombstoned message must walk
     /// that run exactly once, not once per requested position inside it.
-    /// Before the `known_run` cache in `validate_loss_range`, a NAK spanning
+    /// Before the `known_run` cache in `validate_nak_range`, a NAK spanning
     /// an M-packet dropped message called `tombstone_range` (itself O(run
     /// length)) M times, making one control datagram cost O(M^2).
     #[test]
@@ -3497,6 +3734,26 @@ mod tests {
             "the whole run must be discovered with exactly one tombstone_range walk, \
              not one per requested position inside it"
         );
+
+        // The walk outgrows one visit: the run found on the first visit is
+        // kept, so later visits step over it instead of walking it again.
+        let calls_before = buf.tombstone_range_calls();
+        assert_eq!(
+            buf.receive_nak(
+                vec![LossRange {
+                    first_seq: 0,
+                    last_seq: FRAGMENTS - 1,
+                }],
+                now,
+            ),
+            Ok(NakReceipt::Deferred)
+        );
+        let mut served = Vec::new();
+        while buf.has_pending_nak() {
+            served.extend(buf.continue_naks().dropped);
+        }
+        assert_eq!(served.len(), 1);
+        assert_eq!(buf.tombstone_range_calls() - calls_before, 1);
     }
 
     /// The same amortized cost holds for many distinct one-packet
@@ -3615,6 +3872,142 @@ mod tests {
             0x7FFF_FFFF
         );
         assert_eq!(buf.pop_retransmit(1).expect("queued").0.sequence_number, 0);
+    }
+
+    fn submitted_sender(count: u32) -> SenderBuffer {
+        let mut buf = SenderBuffer::new(0, count + 64, 120);
+        for _ in 0..count {
+            buf.push_submitted(vec![1], 1, 1, Timestamp::default())
+                .expect("admitted");
+        }
+        buf
+    }
+
+    fn one_range(first_seq: u32, last_seq: u32) -> Vec<LossRange> {
+        vec![LossRange {
+            first_seq,
+            last_seq,
+        }]
+    }
+
+    /// A report larger than one visit is validated, then queued, across
+    /// bounded visits, and nothing is queued until all of it validated.
+    #[test]
+    fn a_large_nak_is_validated_then_queued_across_bounded_visits() {
+        const SPAN: u32 = 20_000;
+        let mut buf = submitted_sender(SPAN);
+        let receipt = buf.receive_nak(one_range(0, SPAN - 1), Timestamp::default());
+        assert_eq!(receipt, Ok(NakReceipt::Deferred));
+
+        // 20,000 positions validated, then 20,000 queued, 4,096 per visit:
+        // ten visits, the arrival being the first.
+        let mut visits = 1;
+        while buf.has_pending_nak() {
+            let validated_before = visits * MAX_NAK_POSITIONS_PER_VISIT;
+            let queued = buf.stats().packets_in_loss_list;
+            if validated_before < SPAN {
+                assert_eq!(queued, 0, "visit {visits}: queued before validation ended");
+            }
+            assert!(queued <= validated_before.saturating_sub(SPAN));
+            let progress = buf.continue_naks();
+            visits += 1;
+            assert_eq!(progress.rejected, 0);
+        }
+        assert_eq!(visits, 10);
+        assert_eq!(buf.stats().packets_in_loss_list, SPAN);
+        assert_eq!(buf.stats().total_naks_received, 1);
+    }
+
+    /// A deferred report with an impossible tail is rejected whole, after
+    /// the visits it took, and queues nothing.
+    #[test]
+    fn a_deferred_nak_with_an_impossible_tail_queues_nothing() {
+        let mut buf = submitted_sender(10_000);
+        let mut report = one_range(0, 9_999);
+        report.push(LossRange {
+            first_seq: 20_000,
+            last_seq: 20_000,
+        });
+        assert_eq!(
+            buf.receive_nak(report, Timestamp::default()),
+            Ok(NakReceipt::Deferred)
+        );
+        let mut rejected = 0;
+        while buf.has_pending_nak() {
+            rejected += buf.continue_naks().rejected;
+        }
+        assert_eq!(rejected, 1);
+        assert_eq!(buf.stats().packets_in_loss_list, 0);
+        assert_eq!(buf.stats().total_naks_received, 0);
+    }
+
+    /// A deferred report is judged by the window it arrived at: positions an
+    /// ACK retires between visits were retained then, and a position first
+    /// submitted between visits was not yet sent.
+    #[test]
+    fn a_deferred_nak_is_judged_by_the_window_it_arrived_at() {
+        let mut buf = submitted_sender(10_000);
+        let arrived_at = Timestamp::from_micros(7);
+        assert_eq!(
+            buf.receive_nak(one_range(0, 9_999), arrived_at),
+            Ok(NakReceipt::Deferred)
+        );
+        buf.handle_ack(5_000);
+        let mut progress = NakProgress::default();
+        while buf.has_pending_nak() {
+            progress = buf.continue_naks();
+        }
+        assert_eq!(progress.rejected, 0);
+        assert_eq!(progress.credible_at, Some(arrived_at));
+        assert_eq!(buf.stats().packets_in_loss_list, 5_000);
+
+        let mut buf = submitted_sender(10_000);
+        let (header, _) = buf
+            .push(vec![1], 1, 1, Timestamp::default())
+            .expect("admitted");
+        assert_eq!(
+            buf.receive_nak(one_range(0, 10_000), Timestamp::default()),
+            Ok(NakReceipt::Deferred)
+        );
+        buf.note_data_submitted(header.sequence_number);
+        let mut rejected = 0;
+        while buf.has_pending_nak() {
+            rejected += buf.continue_naks().rejected;
+        }
+        assert_eq!(
+            rejected, 1,
+            "position 10,000 was not on the wire on arrival"
+        );
+    }
+
+    /// Queued reports never name more than a window: a further large report
+    /// is shed, while one within a visit's budget is still taken at once.
+    #[test]
+    fn large_reports_beyond_a_queued_window_are_shed() {
+        const WINDOW: u32 = 10_000;
+        let mut buf = SenderBuffer::new(0, WINDOW, 120);
+        for _ in 0..WINDOW {
+            buf.push_submitted(vec![1], 1, 1, Timestamp::default())
+                .expect("admitted");
+        }
+        let now = Timestamp::default();
+        assert_eq!(
+            buf.receive_nak(one_range(0, 5_999), now),
+            Ok(NakReceipt::Deferred)
+        );
+        assert_eq!(
+            buf.receive_nak(one_range(5_000, 9_999), now),
+            Ok(NakReceipt::Shed)
+        );
+        assert_eq!(
+            buf.receive_nak(one_range(9_000, 9_999), now),
+            Ok(NakReceipt::Applied(Vec::new()))
+        );
+        assert_eq!(buf.stats().packets_in_loss_list, 1_000);
+        while buf.has_pending_nak() {
+            buf.continue_naks();
+        }
+        assert_eq!(buf.stats().packets_in_loss_list, 7_000);
     }
 
     #[test]

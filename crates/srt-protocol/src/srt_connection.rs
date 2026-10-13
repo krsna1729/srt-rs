@@ -25,7 +25,7 @@ use crate::srt_packet::{
     PendingDatagram, SRT_CMD_KMREQ, SRT_CMD_KMRSP, SRT_HEADER_SIZE, SrtPacket, sequence_less_than,
 };
 use crate::srt_receiver::{LossRange, ReceiverBuffer};
-use crate::srt_sender::{PeerRateFeedback, SenderBuffer};
+use crate::srt_sender::{NakReceipt, PeerRateFeedback, SenderBuffer};
 use crate::stats::ConnectionStats;
 use crate::time::Timestamp;
 
@@ -1704,14 +1704,13 @@ impl SrtConnection {
 
         // The inactivity timer is armed once at connect and rearms itself on
         // fire — no per-packet SetTimer output.
-        let result = match packet {
+        let proves_activity = match packet {
             SrtPacket::Data(data_pkt) => {
                 tracing::debug!("received DATA packet, seq={}", data_pkt.sequence_number);
-                self.handle_data_packet(data_pkt, now)
+                self.handle_data_packet(data_pkt, now).map(|()| true)
             }
             SrtPacket::Control(ctrl_pkt) => self.handle_control_packet(ctrl_pkt, now),
-        };
-        result?;
+        }?;
 
         // Only an accepted protocol transition proves peer activity. Generic
         // framing plus a matching destination socket id is not enough: a
@@ -1720,8 +1719,9 @@ impl SrtConnection {
         // DATA body, a malformed key-management command) is rejected above
         // and must not keep an otherwise silent peer alive. Robotweax 0.2.2
         // hardens the same invariant and libsrt's own control parsers reject
-        // before touching connection state.
-        if self.state == ConnectionState::Connected {
+        // before touching connection state. A loss report still being
+        // validated proves it only once it validates.
+        if proves_activity && self.state == ConnectionState::Connected {
             self.last_recv_time = Some(now);
         }
         self.check_output_queue()
@@ -1808,7 +1808,15 @@ impl SrtConnection {
         //
         // Loss detection is a different mechanism entirely and lives on
         // `TimerId::SenderRto`; this one only continues work already queued.
-        if self.has_retransmit() {
+        //
+        // The same continuation finishes a peer loss report too large for
+        // one visit (`SenderBuffer::receive_nak`).
+        if self.has_retransmit()
+            || self
+                .sender
+                .as_ref()
+                .is_some_and(SenderBuffer::has_pending_nak)
+        {
             self.queue_output(QueuedOutput::SetTimer {
                 id: TimerId::RetransmitContinue,
                 duration_micros: 0,
@@ -1959,6 +1967,7 @@ impl SrtConnection {
             TimerId::Nak => self.handle_nak_timer(now),
             TimerId::RetransmitContinue => {
                 if self.state == ConnectionState::Connected {
+                    self.continue_pending_naks(now);
                     self.process_retransmit(now);
                 }
             }
@@ -3082,7 +3091,8 @@ impl SrtConnection {
         }
     }
 
-    fn handle_control_packet(&mut self, pkt: ControlPacket, now: Timestamp) -> Result<(), Error> {
+    /// Handle a control packet. Returns whether it proved peer activity.
+    fn handle_control_packet(&mut self, pkt: ControlPacket, now: Timestamp) -> Result<bool, Error> {
         tracing::debug!(
             "received control packet, type={:?}, info_len={}",
             pkt.control_type,
@@ -3090,20 +3100,21 @@ impl SrtConnection {
         );
         if self.state == ConnectionState::Closing && pkt.control_type != ControlType::Shutdown {
             self.finish_local_close(DisconnectReason::PeerActivityAfterShutdown);
-            return Ok(());
+            return Ok(true);
         }
         validate_control_information(&pkt)?;
         match pkt.control_type {
             ControlType::Handshake => self.handle_handshake(pkt, now),
             ControlType::Keepalive => Ok(()), // キープアライブは特に処理不要
             ControlType::Ack => self.handle_ack(pkt, now),
-            ControlType::Nak => self.handle_nak(pkt, now),
+            ControlType::Nak => return self.handle_nak(pkt, now),
             ControlType::Shutdown => self.handle_shutdown(now),
             ControlType::AckAck => self.handle_ackack(pkt, now),
             ControlType::UserDefined => self.handle_user_defined(pkt, now),
             ControlType::DropReq => self.handle_drop_req(pkt, now),
             ControlType::CongestionWarning | ControlType::PeerError => Ok(()),
         }
+        .map(|()| true)
     }
 
     fn handle_handshake(&mut self, pkt: ControlPacket, now: Timestamp) -> Result<(), Error> {
@@ -3802,21 +3813,30 @@ impl SrtConnection {
         Ok(())
     }
 
-    fn handle_nak(&mut self, pkt: ControlPacket, now: Timestamp) -> Result<(), Error> {
+    /// Handle a peer NAK. Returns whether the report proved peer activity:
+    /// one too large for this visit proves it only once it validates, in
+    /// `continue_pending_naks`.
+    fn handle_nak(&mut self, pkt: ControlPacket, now: Timestamp) -> Result<bool, Error> {
         let loss_ranges = parse_loss_ranges(&pkt.control_info)?;
 
         // The whole report is validated before any of it is applied; see
-        // `SenderBuffer::handle_nak_ranges`. A position inside a message this
+        // `SenderBuffer::receive_nak`. A position inside a message this
         // sender already gave up as too late is answered with the same
         // DROPREQ again -- the peer either lost the first one or still holds
         // the range -- and never with a retransmission of released media.
-        let dropped = match self.sender.as_mut() {
-            Some(sender) => sender.handle_nak_ranges(&loss_ranges).map_err(|_| {
-                Error::invalid_data(
-                    "NAK reports a loss position this sender never sent or already retired",
-                )
-            })?,
-            None => Vec::new(),
+        let Some(sender) = self.sender.as_mut() else {
+            return Ok(true);
+        };
+        let receipt = sender.receive_nak(loss_ranges, now).map_err(|_| {
+            Error::invalid_data(
+                "NAK reports a loss position this sender never sent or already retired",
+            )
+        })?;
+        let NakReceipt::Applied(dropped) = receipt else {
+            // Deferred: `process_retransmit` arms the continuation. Shed: the
+            // peer's periodic NAK reports the losses again.
+            self.process_retransmit(now);
+            return Ok(false);
         };
         for msg in &dropped {
             self.send_drop_req(msg.message_number, msg.first_seq, msg.last_seq, now);
@@ -3825,7 +3845,30 @@ impl SrtConnection {
         // 即座に再送処理
         self.process_retransmit(now);
 
-        Ok(())
+        Ok(true)
+    }
+
+    /// Continue queued peer loss reports for one visit.
+    fn continue_pending_naks(&mut self, now: Timestamp) {
+        let Some(sender) = self.sender.as_mut() else {
+            return;
+        };
+        if !sender.has_pending_nak() {
+            return;
+        }
+        let progress = sender.continue_naks();
+        for msg in &progress.dropped {
+            self.send_drop_req(msg.message_number, msg.first_seq, msg.last_seq, now);
+        }
+        if let Some(arrived_at) = progress.credible_at {
+            self.last_recv_time = self.last_recv_time.max(Some(arrived_at));
+        }
+        if progress.rejected != 0 {
+            tracing::debug!(
+                rejected = progress.rejected,
+                "NAK reports a loss position this sender never sent or already retired"
+            );
+        }
     }
 
     fn handle_ackack(&mut self, pkt: ControlPacket, now: Timestamp) -> Result<(), Error> {
@@ -5033,6 +5076,8 @@ mod tests {
     use crate::handshake::{
         ExtensionType, GroupType, HandshakeExtension, SRTGROUP_MASK, extension_flags,
     };
+    const SEQUENCE_MASK: u32 = 0x7FFF_FFFF;
+    use crate::srt_sender::MAX_NAK_POSITIONS_PER_VISIT;
 
     /// Deterministic, non-secret KM salt for protocol test fixtures.
     fn test_km_salt() -> [u8; 16] {
@@ -6011,6 +6056,78 @@ mod tests {
             "once the loss list is fully drained there is nothing left to resume"
         );
         assert!(!caller.has_retransmit());
+    }
+
+    /// A NAK larger than one visit is finished by the retransmit
+    /// continuation, and proves peer activity only once it validated, as of
+    /// its arrival; one that fails validation never does.
+    #[test]
+    fn a_deferred_nak_proves_peer_activity_only_once_it_validates() {
+        const SENT: u32 = MAX_NAK_POSITIONS_PER_VISIT + 1_000;
+        let (mut caller, _listener) = connected_pair();
+        let first_seq = caller.next_sequence_number().expect("connected sender");
+        for i in 0..SENT {
+            caller
+                .send(&i.to_be_bytes(), Timestamp::from_micros(0))
+                .expect("send admits the payload");
+        }
+        drain_outputs(&mut caller);
+
+        let feed_nak = |caller: &mut SrtConnection, ranges: &[(u32, u32)], at: u64| {
+            let mut control_info = Vec::new();
+            for &(first, last) in ranges {
+                encode_loss_range(&mut control_info, first, last);
+            }
+            let mut bytes = Vec::new();
+            make_nak_packet(control_info, 0, caller.socket_id())
+                .encode(&mut bytes)
+                .expect("wire-format control");
+            caller
+                .feed_recv_buf(&bytes, Timestamp::from_micros(at))
+                .expect("a deferred NAK is not rejected on arrival");
+        };
+        let finish = |caller: &mut SrtConnection, at: u64| {
+            let mut visits = 0;
+            while caller.sender.as_ref().unwrap().has_pending_nak() {
+                caller
+                    .handle_timer(TimerId::RetransmitContinue, Timestamp::from_micros(at))
+                    .expect("continuation");
+                visits += 1;
+            }
+            visits
+        };
+        let last_seq = first_seq.wrapping_add(SENT - 1) & SEQUENCE_MASK;
+        let before = caller.last_recv_time;
+
+        // An impossible tail: deferred on arrival, rejected later, and never
+        // counted as activity.
+        let unsent = first_seq.wrapping_add(SENT + 10) & SEQUENCE_MASK;
+        feed_nak(
+            &mut caller,
+            &[(first_seq, last_seq), (unsent, unsent)],
+            10_000,
+        );
+        assert_eq!(caller.last_recv_time, before);
+        assert!(
+            drain_outputs(&mut caller).iter().any(|output| matches!(
+                output,
+                ConnectionOutput::SetTimer {
+                    id: TimerId::RetransmitContinue,
+                    ..
+                }
+            )),
+            "a deferred report arms its continuation"
+        );
+        assert!(finish(&mut caller, 20_000) > 0);
+        assert_eq!(caller.last_recv_time, before);
+        assert!(!caller.has_retransmit());
+
+        // A credible report proves activity as of its arrival, once validated.
+        feed_nak(&mut caller, &[(first_seq, last_seq)], 30_000);
+        assert_eq!(caller.last_recv_time, before);
+        finish(&mut caller, 40_000);
+        assert_eq!(caller.last_recv_time, Some(Timestamp::from_micros(30_000)));
+        assert!(caller.has_retransmit());
     }
 
     /// S06 (revalidation, not a fix): `clear_config_secrets` already
