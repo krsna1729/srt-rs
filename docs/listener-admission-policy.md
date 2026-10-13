@@ -285,7 +285,7 @@ composes overlays, accounts telemetry, and preserves admission ordering.
   peer costs one PBKDF2 derivation (about 0.2 ms for AES-128 and 0.4 ms for
   AES-192/256) on the owner thread. `max_key_derivations_per_second` (default
   128, burst the same) caps that at about 5% of one owner thread, and
-  `max_key_derivations_per_source_per_second` (default 8) holds one source IP
+  `max_key_derivations_per_source_per_second` (default 8) holds one source
   to its share first, so a source cycling handshakes cannot lock other
   sources out. Under a flood from many sources it sheds admission, not
   established media; raise the table rate if a mass reconnect of encrypted
@@ -298,6 +298,13 @@ composes overlays, accounts telemetry, and preserves admission ordering.
   table, so per member of a reuseport layout: a member checks its own budget
   when it adopts a relocated leg, and refusing one ends a session the peer
   already saw connect. Give every member of a layout the same budget.
+- Per-source limits (`max_peers_per_ip` and the key-derivation share) charge
+  an IPv4 address, or an IPv6 /64, since one host routinely holds a whole /64;
+  an IPv4-mapped address from a dual-stack socket counts as its IPv4 address.
+  Callers behind one NAT address, or in one IPv6 /64, share a source: at the
+  default share, 50 encrypted callers reconnecting together take about 6 s,
+  within the 10 s half-open timeout. Raise the per-source share where many
+  legitimate callers sit behind one address.
 - Treat `Defer` volume and half-open expiry as abuse signals.
 - Use unique tenant credentials, but do not treat them as general identity.
 - Put an authenticated protocol inside SRT when integrity or endpoint identity
