@@ -283,9 +283,12 @@ composes overlays, accounts telemetry, and preserves admission ordering.
   socket-memory limits enabled. Each encrypted CONCLUSION from a half-open
   peer costs one PBKDF2 derivation (about 0.2 ms for AES-128 and 0.4 ms for
   AES-192/256) on the owner thread. `max_key_derivations_per_second` (default
-  128, burst the same) caps that at about 5% of one owner thread. Under a
-  handshake flood it sheds admission, not established media; raise it if a
-  mass reconnect of encrypted callers must finish faster.
+  128, burst the same) caps that at about 5% of one owner thread, and
+  `max_key_derivations_per_source_per_second` (default 8) holds one source IP
+  to its share first, so a source cycling handshakes cannot lock other
+  sources out. Under a flood from many sources it sheds admission, not
+  established media; raise the table rate if a mass reconnect of encrypted
+  callers must finish faster.
 - Treat `Defer` volume and half-open expiry as abuse signals.
 - Use unique tenant credentials, but do not treat them as general identity.
 - Put an authenticated protocol inside SRT when integrity or endpoint identity

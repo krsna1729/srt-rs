@@ -195,11 +195,18 @@ pub struct PeerTableConfig {
     pub max_peers_per_ip: usize,
     pub half_open_timeout: Duration,
     /// Key-encryption-key derivations (PBKDF2, 0.2–0.4 ms each) this table
-    /// starts per second, with a burst of the same size. A CONCLUSION that
-    /// asks for encryption beyond it is dropped before any protocol or
-    /// policy work; the caller retransmits its handshake. It bounds the
-    /// owner thread's time on handshakes, not who gets admitted.
+    /// starts per second, with a burst of the same size, in
+    /// `1..=1_000_000`. A CONCLUSION that asks for encryption beyond it is
+    /// dropped before any protocol or policy work; the caller retransmits
+    /// its handshake. It bounds the owner thread's time on handshakes, not
+    /// who gets admitted.
     pub max_key_derivations_per_second: u32,
+    /// The share of [`Self::max_key_derivations_per_second`] one source IP
+    /// may take per second (burst the same, in `1..=1_000_000`), checked
+    /// first, so one source cycling handshakes cannot spend the budget every
+    /// other source needs. The SYN cookie proves the address, so the share
+    /// cannot be dodged without many real addresses.
+    pub max_key_derivations_per_source_per_second: u32,
 }
 
 impl Default for PeerTableConfig {
@@ -215,6 +222,10 @@ impl Default for PeerTableConfig {
             half_open_timeout: Duration::from_secs(10),
             // At most ~5% of one owner thread at AES-256 (128 × 0.38 ms).
             max_key_derivations_per_second: 128,
+            // A legitimate caller retransmits its handshake about every
+            // 250 ms; eight per second leaves it room and holds one source
+            // to a sixteenth of the table's budget.
+            max_key_derivations_per_source_per_second: 8,
         }
     }
 }
@@ -393,6 +404,16 @@ struct AdmissionFeedContext<'a> {
     new_logical_peer: Option<LogicalPeerId>,
 }
 
+/// One GCRA step at `rate` per second with a burst of `rate`: the next
+/// theoretical arrival time if a unit is available at `now` (microseconds),
+/// given the current one, `due`. `rate` is in `1..=1_000_000`.
+fn gcra_take(due: u64, now: u64, rate: u32) -> Option<u64> {
+    let rate = u64::from(rate);
+    let interval = 1_000_000 / rate;
+    let due = due.max(now);
+    (due - now <= interval * (rate - 1)).then_some(due + interval)
+}
+
 #[inline]
 fn decode_admission_datagram(data: &[u8]) -> Result<DecodedAdmissionDatagram, ()> {
     // Only a CONTROL packet can be a handshake (SRT's F bit, the top bit
@@ -438,8 +459,8 @@ pub enum AdmissionDropReason {
     EstablishedCapacity,
     /// One source IP reached its configured share.
     SourceCapacity,
-    /// The table's key-derivation budget was spent
-    /// ([`PeerTableConfig::max_key_derivations_per_second`]).
+    /// The key-derivation budget, the table's or this source's share of it,
+    /// was spent ([`PeerTableConfig::max_key_derivations_per_second`]).
     KeyDerivationBudget,
 }
 
@@ -1011,8 +1032,11 @@ pub struct PeerTable {
     protocol_failure_scratch: Vec<ProtocolOutputFailure>,
     half_open_deadlines: DueIndex<PhysicalPeerKey>,
     /// When the key-derivation budget is next fully replenished, in
-    /// microseconds (GCRA theoretical arrival time).
+    /// microseconds (GCRA theoretical arrival time), for the table and for
+    /// each source IP that has spent part of its share. A source whose
+    /// share has refilled carries no information and is pruned.
     key_derivations_due_micros: u64,
+    key_derivations_due_by_source: HashMap<std::net::IpAddr, u64>,
     idle_deadlines: DueIndex<PhysicalPeerKey>,
     deadlines: DenseDueIndex,
     group_deadlines: DueIndex<GroupDeadlineKey>,
@@ -1179,7 +1203,11 @@ impl PeerTable {
         config.max_half_open_peers = config.max_half_open_peers.max(1).min(config.max_peers);
         config.max_established_peers = config.max_established_peers.max(1).min(config.max_peers);
         config.max_peers_per_ip = config.max_peers_per_ip.max(1).min(config.max_peers);
-        config.max_key_derivations_per_second = config.max_key_derivations_per_second.max(1);
+        config.max_key_derivations_per_second =
+            config.max_key_derivations_per_second.clamp(1, 1_000_000);
+        config.max_key_derivations_per_source_per_second = config
+            .max_key_derivations_per_source_per_second
+            .clamp(1, 1_000_000);
         Self {
             slots: DenseSlotArena::with_partition(config.max_peers, index, count),
             half_open_by_caller: HashMap::new(),
@@ -1192,6 +1220,7 @@ impl PeerTable {
             protocol_failure_scratch: Vec::new(),
             half_open_deadlines: DueIndex::default(),
             key_derivations_due_micros: 0,
+            key_derivations_due_by_source: HashMap::new(),
             idle_deadlines: DueIndex::default(),
             deadlines: DenseDueIndex::default(),
             group_deadlines: DueIndex::default(),
@@ -1705,7 +1734,7 @@ impl PeerTable {
                     && !entry.rejected
                     && identity.syn_cookie == entry.conn.syn_cookie()
             });
-        if derives_key && !self.take_key_derivation(now) {
+        if derives_key && !self.take_key_derivation(peer.ip(), now) {
             telemetry.record_key_derivation_drop();
             return Some(Admit::Dropped(AdmissionDropReason::KeyDerivationBudget));
         }
@@ -1753,17 +1782,41 @@ impl PeerTable {
         result
     }
 
-    /// Spend one key derivation from the budget if it has one (GCRA:
-    /// `max_key_derivations_per_second` per second, the same as a burst).
-    fn take_key_derivation(&mut self, now: Timestamp) -> bool {
-        let rate = u64::from(self.config.max_key_derivations_per_second);
-        let interval = 1_000_000 / rate;
+    /// Spend one key derivation from `source`'s share and from the table's
+    /// budget if both have one; neither is spent otherwise.
+    fn take_key_derivation(&mut self, source: std::net::IpAddr, now: Timestamp) -> bool {
         let now = now.as_micros();
-        let due = self.key_derivations_due_micros.max(now);
-        if due - now > interval * (rate - 1) {
+        let source_due = self
+            .key_derivations_due_by_source
+            .get(&source)
+            .copied()
+            .unwrap_or(0);
+        let Some(source_due) = gcra_take(
+            source_due,
+            now,
+            self.config.max_key_derivations_per_source_per_second,
+        ) else {
             return false;
+        };
+        let Some(table_due) = gcra_take(
+            self.key_derivations_due_micros,
+            now,
+            self.config.max_key_derivations_per_second,
+        ) else {
+            return false;
+        };
+        self.key_derivations_due_micros = table_due;
+        // Each source still refilling spent a table token within the last
+        // second, so at most about twice the table rate of them are live;
+        // prune the refilled ones once the map holds more than that.
+        if self.key_derivations_due_by_source.len()
+            >= 2 * self.config.max_key_derivations_per_second as usize
+        {
+            self.key_derivations_due_by_source
+                .retain(|_, due| *due > now);
         }
-        self.key_derivations_due_micros = due + interval;
+        self.key_derivations_due_by_source
+            .insert(source, source_due);
         true
     }
 
@@ -4738,17 +4791,16 @@ mod tests {
         );
     }
 
-    /// INDUCTION then CONCLUSION from a fresh caller at `peer`, encrypted
-    /// with `passphrase` if any; returns what the table did with the
-    /// CONCLUSION, and the CONCLUSION itself.
-    fn conclude_as(
+    /// A fresh caller at `peer`, encrypted with `passphrase` if any, through
+    /// INDUCTION; returns its CONCLUSION, not yet fed.
+    fn induct(
         table: &mut PeerTable,
         peer: std::net::SocketAddr,
         passphrase: Option<&str>,
         options: &AdmissionOptions,
         telemetry: &IngressTelemetry,
         now: Timestamp,
-    ) -> (Admit, Vec<u8>) {
+    ) -> Vec<u8> {
         let mut caller = SrtConnection::new_caller(ConnectionOptions {
             socket_id: u32::from(peer.port()),
             passphrase: passphrase.map(str::to_owned),
@@ -4767,9 +4819,32 @@ mod tests {
                 let _ = caller.feed_recv_buf(&packet, now);
             }
         }
-        let conclusion = next_packet(&mut caller);
+        next_packet(&mut caller)
+    }
+
+    /// [`induct`], then feed the CONCLUSION; returns what the table did with
+    /// it, and the CONCLUSION itself.
+    fn conclude_as(
+        table: &mut PeerTable,
+        peer: std::net::SocketAddr,
+        passphrase: Option<&str>,
+        options: &AdmissionOptions,
+        telemetry: &IngressTelemetry,
+        now: Timestamp,
+    ) -> (Admit, Vec<u8>) {
+        let conclusion = induct(table, peer, passphrase, options, telemetry, now);
         let admit = table.admit(peer, &conclusion, now, options, 0, 1, telemetry);
         (admit, conclusion)
+    }
+
+    fn encrypted_listener_options() -> AdmissionOptions {
+        AdmissionOptions {
+            connection_template: Some(ConnectionOptions {
+                passphrase: Some("listener-secret".to_owned()),
+                ..ConnectionOptions::default()
+            }),
+            ..AdmissionOptions::basic(1, 120, false)
+        }
     }
 
     /// Each encrypted CONCLUSION costs the owner one PBKDF2 key derivation,
@@ -4786,13 +4861,7 @@ mod tests {
             ..PeerTableConfig::default()
         });
         let telemetry = IngressTelemetry::new();
-        let options = AdmissionOptions {
-            connection_template: Some(ConnectionOptions {
-                passphrase: Some("listener-secret".to_owned()),
-                ..ConnectionOptions::default()
-            }),
-            ..AdmissionOptions::basic(1, 120, false)
-        };
+        let options = encrypted_listener_options();
         let mut port = 20_000u16;
         let mut conclude = |table: &mut PeerTable, passphrase, now| {
             port += 1;
@@ -4838,6 +4907,158 @@ mod tests {
             Admit::Dropped(AdmissionDropReason::KeyDerivationBudget)
         );
         assert_eq!(telemetry.snapshot().key_derivation_drops, 2);
+    }
+
+    /// A source's share of the key-derivation budget is its own: a source
+    /// cycling handshakes is held to its share and leaves the rest of the
+    /// table's budget to other sources. With the budget spent, a CONCLUSION
+    /// with a forged cookie or to a peer policy rejected is judged on its
+    /// own terms, never charged.
+    #[test]
+    fn one_source_cannot_spend_the_key_derivation_budget_of_others() {
+        let mut table = PeerTable::with_config(PeerTableConfig {
+            max_key_derivations_per_second: 4,
+            max_key_derivations_per_source_per_second: 2,
+            ..PeerTableConfig::default()
+        });
+        let telemetry = IngressTelemetry::new();
+        let options = encrypted_listener_options();
+        let now = Timestamp::from_micros(1_000_000);
+        let at = |host: u8, port: u16| std::net::SocketAddr::from(([127, 0, 0, host], port));
+        let budget_drop = Admit::Dropped(AdmissionDropReason::KeyDerivationBudget);
+
+        // A caller policy will reject, through INDUCTION only for now.
+        let rejected = at(5, 30_001);
+        let rejected_conclusion = induct(
+            &mut table,
+            rejected,
+            Some("listener-secret"),
+            &options,
+            &telemetry,
+            now,
+        );
+
+        // One source is held to its share of two.
+        for port in 30_001..=30_002 {
+            let (admit, _) = conclude_as(
+                &mut table,
+                at(1, port),
+                Some("wrong-secret"),
+                &options,
+                &telemetry,
+                now,
+            );
+            assert_ne!(admit, budget_drop);
+        }
+        let (admit, _) = conclude_as(
+            &mut table,
+            at(1, 30_003),
+            Some("wrong-secret"),
+            &options,
+            &telemetry,
+            now,
+        );
+        assert_eq!(admit, budget_drop);
+
+        // Another source still connects.
+        let (admit, _) = conclude_as(
+            &mut table,
+            at(2, 30_001),
+            Some("listener-secret"),
+            &options,
+            &telemetry,
+            now,
+        );
+        assert_eq!(admit, Admit::Fed);
+
+        // Policy rejects the first caller, spending the table's last token;
+        // its retransmission, before the rejection is drained, is judged as
+        // a rejected peer's, not charged.
+        let reject = |_: &AdmissionRequest| AdmissionResolution::Reject {
+            reason: RejectionReason::FORBIDDEN,
+        };
+        assert_eq!(
+            table.admit_with_resolver(
+                rejected,
+                &rejected_conclusion,
+                now,
+                &options,
+                0,
+                1,
+                &telemetry,
+                reject
+            ),
+            Admit::Rejected
+        );
+        assert_eq!(
+            table.admit(
+                rejected,
+                &rejected_conclusion,
+                now,
+                &options,
+                0,
+                1,
+                &telemetry
+            ),
+            Admit::Dropped(AdmissionDropReason::RejectedPeer)
+        );
+        let (admit, _) = conclude_as(
+            &mut table,
+            at(3, 30_001),
+            Some("listener-secret"),
+            &options,
+            &telemetry,
+            now,
+        );
+        assert_eq!(admit, budget_drop);
+        assert_eq!(telemetry.snapshot().key_derivation_drops, 2);
+
+        // A forged cookie does not reach the (empty) budget either.
+        let forger = at(4, 30_001);
+        let conclusion = induct(
+            &mut table,
+            forger,
+            Some("listener-secret"),
+            &options,
+            &telemetry,
+            now,
+        );
+        let mut handshake = srt_proto::handshake::peek_handshake(&conclusion).expect("handshake");
+        handshake.syn_cookie ^= 1;
+        let destination = srt_proto::wire::peek_destination_socket_id(&conclusion).expect("header");
+        let mut forged = Vec::new();
+        handshake
+            .encode(0, destination)
+            .encode(&mut forged)
+            .expect("packet fits");
+        assert_eq!(
+            table.admit(forger, &forged, now, &options, 0, 1, &telemetry),
+            Admit::Dropped(AdmissionDropReason::InvalidCookie)
+        );
+        assert_eq!(telemetry.snapshot().key_derivation_drops, 2);
+    }
+
+    /// Per-source key-derivation state lives only while a source's share is
+    /// refilling: however many sources come and go, the table keeps about
+    /// twice its rate of them.
+    #[test]
+    fn per_source_key_derivation_state_stays_bounded() {
+        const RATE: u32 = 4;
+        let mut table = PeerTable::with_config(PeerTableConfig {
+            max_key_derivations_per_second: RATE,
+            max_key_derivations_per_source_per_second: 1,
+            ..PeerTableConfig::default()
+        });
+        let mut host = 0u32;
+        for second in 0..10u64 {
+            for step in 0..u64::from(RATE) {
+                host += 1;
+                let source = std::net::IpAddr::from(std::net::Ipv4Addr::from(0x0A00_0000 + host));
+                let now = Timestamp::from_micros(second * 1_000_000 + step * 250_000);
+                assert!(table.take_key_derivation(source, now));
+                assert!(table.key_derivations_due_by_source.len() <= 2 * RATE as usize + 1);
+            }
+        }
     }
 
     fn insert_test_peer(
