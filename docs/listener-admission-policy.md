@@ -304,7 +304,10 @@ composes overlays, accounts telemetry, and preserves admission ordering.
   Callers behind one NAT address, or in one IPv6 /64, share a source: at the
   default share, 50 encrypted callers reconnecting together take about 6 s,
   within the 10 s half-open timeout. Raise the per-source share where many
-  legitimate callers sit behind one address.
+  legitimate callers sit behind one address. Callers reaching the listener
+  through NAT64 share the translator's /64, and a 6to4 site gets one source
+  per /64 it uses; raise the share or `max_peers_per_ip` for such
+  deployments.
 - Treat `Defer` volume and half-open expiry as abuse signals.
 - Use unique tenant credentials, but do not treat them as general identity.
 - Put an authenticated protocol inside SRT when integrity or endpoint identity

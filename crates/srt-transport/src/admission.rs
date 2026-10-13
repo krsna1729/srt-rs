@@ -1880,8 +1880,9 @@ impl PeerTable {
         };
         self.key_derivations_due_micros = table_due;
         // Each source still refilling spent a table token within the last
-        // second, so at most about twice the table rate of them are live;
-        // prune the refilled ones once the map grows past that.
+        // second, so at most about twice the table rate of them are live,
+        // and at most twice that survive into the next threshold: the map
+        // holds at most about four times the table rate between prunes.
         if self.key_derivations_due_by_source.len() >= self.key_derivations_prune_at {
             self.key_derivations_due_by_source
                 .retain(|_, due| *due > now);
@@ -5226,8 +5227,9 @@ mod tests {
     }
 
     /// Per-source key-derivation state lives only while a source's share is
-    /// refilling: however many sources come and go, the table keeps about
-    /// twice its rate of them.
+    /// refilling: however many sources come and go, the table keeps at most
+    /// four times its rate of them (twice the live ones, which are at most
+    /// twice its rate).
     #[test]
     fn per_source_key_derivation_state_stays_bounded() {
         const RATE: u32 = 4;
@@ -5243,7 +5245,7 @@ mod tests {
                 let source = std::net::IpAddr::from(std::net::Ipv4Addr::from(0x0A00_0000 + host));
                 let now = Timestamp::from_micros(second * 1_000_000 + step * 250_000);
                 assert!(table.take_key_derivation(source, now));
-                assert!(table.key_derivations_due_by_source.len() <= 2 * RATE as usize + 1);
+                assert!(table.key_derivations_due_by_source.len() <= 4 * RATE as usize);
             }
         }
     }
