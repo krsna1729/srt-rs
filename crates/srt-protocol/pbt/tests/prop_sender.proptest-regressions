@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 88582d9c9abfb86bec2c28996ed6043b8ee6fdd8bf5d4ab008fd61b2243d2ee9 # shrinks to initial_seq = 0, window_size = 64, operations = [0, 7, 0, 1]
+cc dd7dc43e86449228d25d5a5f2db2039405650e0b4897e62b1f926731ac03b7f2 # shrinks to count = 11882, expired_share = 10, fragments = 1, raw = [(0, 1378), (0, 2717)]

@@ -3,7 +3,7 @@
 use proptest::prelude::*;
 use srt_proto::Timestamp;
 use srt_proto::receiver::LossRange;
-use srt_proto::sender::SenderBuffer;
+use srt_proto::sender::{DroppedMessage, InvalidNak, NakReceipt, SenderBuffer};
 use std::collections::HashSet;
 
 /// Push a packet and mark its datagram as transmitted.
@@ -613,4 +613,127 @@ fn admit_count(buf: &mut SenderBuffer, now: Timestamp) -> u32 {
         );
     }
     admitted
+}
+
+/// A sender holding `count` transmitted packets, the first `expired` of them
+/// sent early enough for TLPKTDROP to have tombstoned them (one message per
+/// `fragments` packets).
+fn nak_sender(count: u32, expired: u32, fragments: u32) -> SenderBuffer {
+    let mut buf = SenderBuffer::new(0, count + 64, 10);
+    let mut pushed = 0;
+    while pushed < count {
+        let sent_at = if pushed < expired { 0 } else { 2_000_000 };
+        let len = fragments.min(count - pushed) as usize;
+        for (header, _) in
+            buf.push_message(&vec![0u8; len], 1, 1, 1, Timestamp::from_micros(sent_at))
+        {
+            buf.note_data_submitted(header.sequence_number);
+            pushed += 1;
+        }
+    }
+    let _ = buf.drop_expired(Timestamp::from_micros(1_500_000));
+    buf
+}
+
+fn nak_ranges(raw: &[(u32, u32)]) -> Vec<LossRange> {
+    raw.iter()
+        .map(|&(first, len)| LossRange {
+            first_seq: first,
+            last_seq: first + len,
+        })
+        .collect()
+}
+
+/// Finish a report through `receive_nak` and `continue_naks`, as a
+/// connection does, returning what the whole-report path would.
+fn receive_in_visits(
+    buf: &mut SenderBuffer,
+    ranges: Vec<LossRange>,
+) -> Result<Vec<DroppedMessage>, InvalidNak> {
+    match buf.receive_nak(ranges, Timestamp::default())? {
+        NakReceipt::Applied(dropped) => Ok(dropped),
+        NakReceipt::Shed => panic!("an empty queue never sheds"),
+        NakReceipt::Deferred => {
+            let mut dropped = Vec::new();
+            while buf.has_pending_nak() {
+                let progress = buf.continue_naks();
+                if progress.rejected != 0 {
+                    return Err(InvalidNak);
+                }
+                dropped.extend(progress.dropped);
+            }
+            Ok(dropped)
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// With nothing changing between visits, a report taken in bounded
+    /// visits is accepted or rejected exactly when the whole-report path
+    /// does, and applies the same retransmissions and DROPREQs.
+    #[test]
+    fn bounded_nak_visits_match_the_whole_report(
+        count in 1u32..12_000,
+        expired_share in 0u32..=100,
+        fragments in 1u32..64,
+        raw in proptest::collection::vec((0u32..12_500, 0u32..3_000), 1..12),
+    ) {
+        let expired = count * expired_share / 100;
+        let ranges = nak_ranges(&raw);
+        let mut whole = nak_sender(count, expired, fragments);
+        let mut bounded = nak_sender(count, expired, fragments);
+
+        let expected = whole.handle_nak_ranges(&ranges);
+        let got = receive_in_visits(&mut bounded, ranges);
+        prop_assert_eq!(&got, &expected);
+        prop_assert_eq!(
+            bounded.stats().packets_in_loss_list,
+            whole.stats().packets_in_loss_list
+        );
+        prop_assert_eq!(
+            bounded.stats().total_naks_received,
+            whole.stats().total_naks_received
+        );
+    }
+
+    /// With ACKs, new sends and TLPKTDROP between visits, the bounded path
+    /// never queues a position that is not retained and live, and its queue
+    /// always drains.
+    #[test]
+    fn bounded_nak_visits_survive_interleaved_sender_changes(
+        ops in proptest::collection::vec((0u8..5, 0u32..8_000, 0u32..3_000), 1..60),
+    ) {
+        let mut buf = nak_sender(6_000, 0, 4);
+        let mut now = 2_000_000u64;
+        for (op, position, len) in ops {
+            now += 50_000;
+            match op {
+                0 => {
+                    let _ = buf.receive_nak(
+                        nak_ranges(&[(position, len)]),
+                        Timestamp::from_micros(now),
+                    );
+                }
+                1 => {
+                    let _ = buf.continue_naks();
+                }
+                2 => buf.handle_ack(position.min(buf.next_sequence_number())),
+                3 => {
+                    let _ = push_transmitted(&mut buf, vec![0; 16], Timestamp::from_micros(now));
+                }
+                _ => {
+                    let _ = buf.drop_expired(Timestamp::from_micros(now));
+                }
+            }
+            prop_assert!(buf.stats().packets_in_loss_list <= buf.packets_in_flight());
+        }
+        let mut visits = 0;
+        while buf.has_pending_nak() {
+            let _ = buf.continue_naks();
+            visits += 1;
+            prop_assert!(visits <= 64, "the queue names at most a window: it drains");
+        }
+    }
 }
