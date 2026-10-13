@@ -1630,28 +1630,25 @@ impl SenderBuffer {
     /// Commit happens only after the last position validated; it queues live
     /// positions for retransmission in chunks of the remaining budget.
     fn advance_nak(&mut self, report: &mut PendingNak, budget: &mut u32) -> NakStep {
-        while !report.committing {
-            let Some(last_seq) = report
-                .ranges
-                .get(report.range)
-                .map(|loss| loss.last_seq & SEQUENCE_MASK)
-            else {
-                // Only a validated report reaches here, so this is the one
-                // place `total_naks_received` is allowed to move: an
-                // impossible report is not evidence the peer is alive and
-                // playing by the protocol.
-                self.total_naks_received = self.total_naks_received.saturating_add(1);
-                report.committing = true;
-                report.range = 0;
-                report.next = report
-                    .ranges
-                    .first()
-                    .map_or(0, |loss| loss.first_seq & SEQUENCE_MASK);
-                break;
-            };
+        if !report.committing
+            && let Err(step) = self.validate_nak(report, budget)
+        {
+            return step;
+        }
+        self.commit_nak(report, budget)
+    }
+
+    /// Validate `report` range by range; `Ok` once every position is
+    /// credible and the report is ready to commit, else the step to return.
+    fn validate_nak(&mut self, report: &mut PendingNak, budget: &mut u32) -> Result<(), NakStep> {
+        while let Some(last_seq) = report
+            .ranges
+            .get(report.range)
+            .map(|loss| loss.last_seq & SEQUENCE_MASK)
+        {
             match self.validate_nak_range(report, last_seq, budget) {
-                None => return NakStep::Invalid,
-                Some(false) => return NakStep::Pending,
+                None => return Err(NakStep::Invalid),
+                Some(false) => return Err(NakStep::Pending),
                 Some(true) => {
                     report.range += 1;
                     if let Some(loss) = report.ranges.get(report.range) {
@@ -1660,7 +1657,22 @@ impl SenderBuffer {
                 }
             }
         }
+        // Only a validated report reaches here, so this is the one place
+        // `total_naks_received` is allowed to move: an impossible report is
+        // not evidence the peer is alive and playing by the protocol.
+        self.total_naks_received = self.total_naks_received.saturating_add(1);
+        report.committing = true;
+        report.range = 0;
+        report.next = report
+            .ranges
+            .first()
+            .map_or(0, |loss| loss.first_seq & SEQUENCE_MASK);
+        Ok(())
+    }
 
+    /// Queue a validated report's positions for retransmission, at most
+    /// `budget` of them; `Applied` once the last range is queued.
+    fn commit_nak(&mut self, report: &mut PendingNak, budget: &mut u32) -> NakStep {
         while let Some(last_seq) = report
             .ranges
             .get(report.range)
