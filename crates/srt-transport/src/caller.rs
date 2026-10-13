@@ -4122,9 +4122,11 @@ mod tests {
     /// Two members of a `Relocate` layout with a shared router, and one
     /// Broadcast publisher whose legs the "kernel" (`route`) hashes to
     /// different members. Returns the members, the route after the run, how
-    /// many legs relocated, and how many relocations failed to bind.
+    /// many legs relocated (a leg the target refuses to adopt is dropped),
+    /// and how many relocations failed to bind.
     fn bonded_publisher_across_two_members(
         bind_ok: bool,
+        limits: PeerTableConfig,
     ) -> (Vec<PeerTable>, [usize; 2], usize, u64) {
         use crate::admission::{PromotionWork, TableRelocation};
         let leg_addrs: [std::net::SocketAddr; 2] = [
@@ -4163,7 +4165,7 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(srt_lifecycle::WorkerRouter::new(2)));
         let mut members: Vec<PeerTable> = (0..2)
             .map(|index| {
-                let mut table = PeerTable::with_partition(PeerTableConfig::default(), index, 2);
+                let mut table = PeerTable::with_partition(limits, index, 2);
                 table.set_relocation(TableRelocation {
                     mode: srt_lifecycle::Promotion::Relocate,
                     member: index,
@@ -4204,9 +4206,9 @@ mod tests {
                     };
                     let to = relocated.to;
                     assert_ne!(to, member, "a relocation never targets its own member");
-                    members[to]
-                        .adopt(relocated)
-                        .expect("the group's member adopts");
+                    let Ok(()) = members[to].adopt(relocated) else {
+                        continue;
+                    };
                     route[leg] = to;
                     relocations += 1;
                 }
@@ -4225,7 +4227,8 @@ mod tests {
 
     #[test]
     fn relocated_bonded_leg_joins_its_group_on_the_owning_member() {
-        let (mut members, route, relocations, _) = bonded_publisher_across_two_members(true);
+        let (mut members, route, relocations, _) =
+            bonded_publisher_across_two_members(true, PeerTableConfig::default());
         assert_eq!(
             relocations, 1,
             "exactly the leg hashed away from its group moves"
@@ -4259,7 +4262,8 @@ mod tests {
 
     #[test]
     fn retiring_a_relocated_group_releases_the_lent_slot_home() {
-        let (mut members, route, _, _) = bonded_publisher_across_two_members(true);
+        let (mut members, route, _, _) =
+            bonded_publisher_across_two_members(true, PeerTableConfig::default());
         let (owner, source) = (route[0], 1 - route[0]);
         let mut events = Vec::new();
         members[owner].poll_events(&mut events);
@@ -4268,10 +4272,17 @@ mod tests {
             .find(|event| matches!(event.event, srt_proto::ConnectionEvent::Connected))
             .expect("the group connects on its member")
             .logical_peer;
+        // The relocated leg's window memory moved with it: released by the
+        // source, reserved by the adopting owner, returned at retirement.
+        let per_leg = srt_proto::SrtConnection::new_listener(ConnectionOptions::default())
+            .window_memory_bound_bytes();
+        assert_eq!(members[owner].reserved_window_memory_bytes(), 2 * per_leg);
+        assert_eq!(members[source].reserved_window_memory_bytes(), 0);
         assert!(matches!(
             members[owner].remove(group),
             Some(RemovedLogicalPeer::Group(legs)) if legs.len() == 2
         ));
+        assert_eq!(members[owner].reserved_window_memory_bytes(), 0);
         let mut released = Vec::new();
         members[owner].take_released_slots(&mut released);
         assert_eq!(released.len(), 1);
@@ -4288,7 +4299,7 @@ mod tests {
     #[test]
     fn bonded_leg_whose_socket_cannot_be_made_stays_on_its_member() {
         let (members, route, relocations, bind_failures) =
-            bonded_publisher_across_two_members(false);
+            bonded_publisher_across_two_members(false, PeerTableConfig::default());
         assert_eq!(relocations, 0);
         assert_eq!(
             bind_failures, 1,
@@ -4304,6 +4315,35 @@ mod tests {
             );
             assert_eq!(member.lent_slot_count(), 0);
         }
+    }
+
+    /// A member whose window-memory budget is spent refuses to adopt a
+    /// relocated leg, and the leg's reservation leaves with it: the source
+    /// released it, and the refusing member never took it.
+    #[test]
+    fn a_member_without_window_memory_refuses_a_relocated_leg() {
+        let per_leg = srt_proto::SrtConnection::new_listener(ConnectionOptions::default())
+            .window_memory_bound_bytes();
+        let (members, route, relocations, bind_failures) = bonded_publisher_across_two_members(
+            true,
+            PeerTableConfig {
+                max_window_memory_bytes: Some(per_leg),
+                ..PeerTableConfig::default()
+            },
+        );
+        assert_eq!((relocations, bind_failures), (0, 0));
+        assert_eq!(route, [0, 1], "nothing moved");
+        let mut held: Vec<_> = members
+            .iter()
+            .map(|member| {
+                (
+                    member.established_count(),
+                    member.reserved_window_memory_bytes(),
+                )
+            })
+            .collect();
+        held.sort_unstable();
+        assert_eq!(held, [(0, 0), (1, per_leg)], "one leg stays, at its share");
     }
 
     #[test]
