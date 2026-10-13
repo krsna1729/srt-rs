@@ -6086,9 +6086,16 @@ mod tests {
 
     /// A cumulative ACK of a large flight retires it at once and leaves only
     /// dropping its packets to the retransmit continuation, which stops
-    /// re-arming once they are dropped.
+    /// re-arming once they are dropped -- also once the connection is
+    /// closing and no longer retransmits.
     #[test]
     fn a_large_ack_leaves_dropping_packets_to_the_continuation() {
+        for closing in [false, true] {
+            drop_a_large_ack_in_bounded_visits(closing);
+        }
+    }
+
+    fn drop_a_large_ack_in_bounded_visits(closing: bool) {
         const SENT: u32 = 2_048;
         let (mut caller, _listener) = connected_pair();
         let now = Timestamp::from_micros(0);
@@ -6119,6 +6126,9 @@ mod tests {
             })
         };
         assert!(arms_continuation(&drain_outputs(&mut caller)));
+        if closing {
+            caller.set_state(ConnectionState::Closing);
+        }
 
         let mut visits = 0;
         loop {
@@ -6140,7 +6150,7 @@ mod tests {
                 break;
             }
         }
-        assert!(visits > 1, "{visits}");
+        assert!(visits > 1, "closing {closing}: {visits}");
     }
 
     /// A NAK larger than one visit is finished by the retransmit
