@@ -171,6 +171,8 @@ struct PendingNak {
     /// `oldest_unacked` on arrival: a position retired since then, by an
     /// ACK between two visits, was retained when the peer reported it.
     retired_from: u32,
+    /// `next_seq` on arrival: no position from here on was sent yet.
+    sent_end: u32,
     /// `newest_submitted` on arrival: a position first submitted after the
     /// report arrived cannot be in it.
     newest_submitted: Option<u32>,
@@ -1501,28 +1503,36 @@ impl SenderBuffer {
     /// A larger report is queued and finished by [`Self::continue_naks`],
     /// still all-or-none: it is validated against the window as it was when
     /// it arrived. A position the peer acknowledged after that still counts
-    /// as retained, and a position first submitted after that does not
-    /// count as sent. A large report arriving while the queued reports
-    /// already name a whole window is shed, so a peer cannot grow the queue.
-    /// A report within one visit's budget is always taken at once.
+    /// as retained, and a position sent after that does not count as sent.
+    /// A report that validates within the budget is committed at once (at
+    /// most its span more work). The queued reports never name more than a
+    /// window: a report that would exceed that is shed before anything of it
+    /// is applied, and the peer's periodic NAK reports it again.
     pub fn receive_nak(
         &mut self,
         loss_ranges: Vec<LossRange>,
         now: Timestamp,
     ) -> Result<NakReceipt, InvalidNak> {
         let span = self.nak_span(&loss_ranges)?;
-        if span > MAX_NAK_POSITIONS_PER_VISIT {
-            let queued = self
-                .pending_naks
-                .iter()
-                .fold(0u32, |total, report| total.saturating_add(report.span));
-            if queued != 0 && queued.saturating_add(span) > self.negotiated_window {
-                return Ok(NakReceipt::Shed);
-            }
+        if span > MAX_NAK_POSITIONS_PER_VISIT && self.nak_queue_is_full(span) {
+            return Ok(NakReceipt::Shed);
         }
         let mut report = self.pending_nak(loss_ranges, span, now);
         let mut budget = MAX_NAK_POSITIONS_PER_VISIT;
-        match self.advance_nak(&mut report, &mut budget) {
+        let mut step = self.advance_nak(&mut report, &mut budget);
+        if matches!(step, NakStep::Pending)
+            && report.committing
+            && span <= MAX_NAK_POSITIONS_PER_VISIT
+        {
+            let mut commit_budget = span;
+            step = self.advance_nak(&mut report, &mut commit_budget);
+        }
+        match step {
+            // Still validating: nothing of it is applied yet, so shedding
+            // it here is clean.
+            NakStep::Pending if !report.committing && self.nak_queue_is_full(span) => {
+                Ok(NakReceipt::Shed)
+            }
             NakStep::Pending => {
                 self.pending_naks.push_back(report);
                 Ok(NakReceipt::Deferred)
@@ -1530,6 +1540,17 @@ impl SenderBuffer {
             NakStep::Invalid => Err(InvalidNak),
             NakStep::Applied(dropped) => Ok(NakReceipt::Applied(dropped)),
         }
+    }
+
+    /// Whether queueing a report of `span` positions would make the queued
+    /// reports name more than a window. An empty queue takes any report:
+    /// `nak_span` already bounds one report by the window.
+    fn nak_queue_is_full(&self, span: u32) -> bool {
+        let queued = self
+            .pending_naks
+            .iter()
+            .fold(0u32, |total, report| total.saturating_add(report.span));
+        queued != 0 && queued.saturating_add(span) > self.negotiated_window
     }
 
     /// Continue the queued loss reports, oldest first, for one visit.
@@ -1588,6 +1609,7 @@ impl SenderBuffer {
             seen_starts: BTreeSet::new(),
             known_run: None,
             retired_from: self.oldest_unacked,
+            sent_end: self.next_seq,
             newest_submitted: self.newest_submitted,
             arrived_at: now,
         }
@@ -1680,6 +1702,7 @@ impl SenderBuffer {
         budget: &mut u32,
     ) -> Option<bool> {
         let retired_from = report.retired_from;
+        let sent_end = report.sent_end;
         let newest_submitted = report.newest_submitted;
         let mut known_run = report.known_run;
         let mut sequence = report.next;
@@ -1700,26 +1723,29 @@ impl SenderBuffer {
                 };
             } else {
                 known_run = None;
-                let credible = match self.packets.get(sequence) {
-                    Some(entry) if entry.dropped => {
-                        known_run = self.record_nak_tombstone(
-                            report,
-                            sequence,
-                            entry.message_number,
-                            &mut left,
-                        );
-                        true
-                    }
-                    Some(entry) => {
-                        entry.submitted
-                            && newest_submitted
-                                .is_some_and(|newest| !sequence_less_than(newest, sequence))
-                    }
-                    None => {
-                        !sequence_less_than(sequence, retired_from)
-                            && sequence_less_than(sequence, self.oldest_unacked)
-                    }
-                };
+                // Retained and sent when the report arrived: anything else
+                // is a position the peer could not have observed, even if
+                // it was sent, or sent and retired, since.
+                let at_arrival = !sequence_less_than(sequence, retired_from)
+                    && sequence_less_than(sequence, sent_end);
+                let credible = at_arrival
+                    && match self.packets.get(sequence) {
+                        Some(entry) if entry.dropped => {
+                            known_run = self.record_nak_tombstone(
+                                report,
+                                sequence,
+                                entry.message_number,
+                                &mut left,
+                            );
+                            true
+                        }
+                        Some(entry) => {
+                            entry.submitted
+                                && newest_submitted
+                                    .is_some_and(|newest| !sequence_less_than(newest, sequence))
+                        }
+                        None => sequence_less_than(sequence, self.oldest_unacked),
+                    };
                 if !credible {
                     return None;
                 }
@@ -3978,6 +4004,28 @@ mod tests {
             rejected, 1,
             "position 10,000 was not on the wire on arrival"
         );
+
+        // Positions sent, submitted and acknowledged after the report
+        // arrived are retired by the time validation reaches them, but were
+        // never sent when the peer reported them.
+        let mut buf = submitted_sender(10_000);
+        assert_eq!(
+            buf.receive_nak(one_range(0, 10_005), Timestamp::default()),
+            Ok(NakReceipt::Deferred)
+        );
+        for _ in 0..6 {
+            buf.push_submitted(vec![1], 1, 1, Timestamp::default())
+                .expect("admitted");
+        }
+        buf.handle_ack(10_006);
+        let mut rejected = 0;
+        while buf.has_pending_nak() {
+            rejected += buf.continue_naks().rejected;
+        }
+        assert_eq!(
+            rejected, 1,
+            "positions 10,000..10,005 were unsent on arrival"
+        );
     }
 
     /// Queued reports never name more than a window: a further large report
@@ -4008,6 +4056,60 @@ mod tests {
             buf.continue_naks();
         }
         assert_eq!(buf.stats().packets_in_loss_list, 7_000);
+    }
+
+    /// A report that validates within one visit is committed at once, so
+    /// medium reports never queue; and reports that do queue, because a
+    /// tombstone walk spent the visit, never name more than a window in
+    /// total.
+    #[test]
+    fn queued_nak_reports_never_name_more_than_a_window() {
+        let now = Timestamp::default();
+        let mut buf = submitted_sender(10_000);
+        for _ in 0..50 {
+            let receipt = buf.receive_nak(one_range(0, 2_999), now);
+            assert!(matches!(receipt, Ok(NakReceipt::Applied(_))), "{receipt:?}");
+        }
+        assert!(!buf.has_pending_nak());
+
+        // One dropped message of 20,000 fragments: naming any of it walks
+        // the whole run, which spends the visit before the report validates.
+        const FRAGMENTS: u32 = 20_000;
+        let mut buf = SenderBuffer::new(0, FRAGMENTS + 64, 10);
+        for (header, _) in buf.push_message(&vec![0u8; FRAGMENTS as usize], 1, 1, 1, now) {
+            buf.note_data_submitted(header.sequence_number);
+        }
+        assert_eq!(buf.drop_expired(Timestamp::from_micros(1_000_001)).len(), 1);
+        let report = || {
+            vec![
+                LossRange {
+                    first_seq: 0,
+                    last_seq: 0,
+                },
+                LossRange {
+                    first_seq: FRAGMENTS - 3_000,
+                    last_seq: FRAGMENTS - 1,
+                },
+            ]
+        };
+        let mut receipts = Vec::new();
+        for _ in 0..50 {
+            receipts.push(buf.receive_nak(report(), now));
+            let queued: u32 = buf.pending_naks.iter().map(|report| report.span).sum();
+            assert!(queued <= buf.negotiated_window, "{queued}");
+        }
+        let deferred = receipts
+            .iter()
+            .filter(|receipt| **receipt == Ok(NakReceipt::Deferred))
+            .count();
+        assert_eq!(deferred, 6, "6 x 3,001 fits in 20,064; the 7th does not");
+        assert_eq!(
+            receipts
+                .iter()
+                .filter(|receipt| **receipt == Ok(NakReceipt::Shed))
+                .count(),
+            50 - deferred
+        );
     }
 
     #[test]
