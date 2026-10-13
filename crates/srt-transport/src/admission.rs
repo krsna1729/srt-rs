@@ -194,6 +194,12 @@ pub struct PeerTableConfig {
     /// Total peers from one source IP (ports do not bypass this bound).
     pub max_peers_per_ip: usize,
     pub half_open_timeout: Duration,
+    /// Key-encryption-key derivations (PBKDF2, 0.2–0.4 ms each) this table
+    /// starts per second, with a burst of the same size. A CONCLUSION that
+    /// asks for encryption beyond it is dropped before any protocol or
+    /// policy work; the caller retransmits its handshake. It bounds the
+    /// owner thread's time on handshakes, not who gets admitted.
+    pub max_key_derivations_per_second: u32,
 }
 
 impl Default for PeerTableConfig {
@@ -207,6 +213,8 @@ impl Default for PeerTableConfig {
             // chooses a tenant/source policy.
             max_peers_per_ip: 4096,
             half_open_timeout: Duration::from_secs(10),
+            // At most ~5% of one owner thread at AES-256 (128 × 0.38 ms).
+            max_key_derivations_per_second: 128,
         }
     }
 }
@@ -430,6 +438,9 @@ pub enum AdmissionDropReason {
     EstablishedCapacity,
     /// One source IP reached its configured share.
     SourceCapacity,
+    /// The table's key-derivation budget was spent
+    /// ([`PeerTableConfig::max_key_derivations_per_second`]).
+    KeyDerivationBudget,
 }
 
 /// What [`PeerTable::admit`] did with a datagram.
@@ -999,6 +1010,9 @@ pub struct PeerTable {
     /// before they are stored on the peer/leg they belong to.
     protocol_failure_scratch: Vec<ProtocolOutputFailure>,
     half_open_deadlines: DueIndex<PhysicalPeerKey>,
+    /// When the key-derivation budget is next fully replenished, in
+    /// microseconds (GCRA theoretical arrival time).
+    key_derivations_due_micros: u64,
     idle_deadlines: DueIndex<PhysicalPeerKey>,
     deadlines: DenseDueIndex,
     group_deadlines: DueIndex<GroupDeadlineKey>,
@@ -1165,6 +1179,7 @@ impl PeerTable {
         config.max_half_open_peers = config.max_half_open_peers.max(1).min(config.max_peers);
         config.max_established_peers = config.max_established_peers.max(1).min(config.max_peers);
         config.max_peers_per_ip = config.max_peers_per_ip.max(1).min(config.max_peers);
+        config.max_key_derivations_per_second = config.max_key_derivations_per_second.max(1);
         Self {
             slots: DenseSlotArena::with_partition(config.max_peers, index, count),
             half_open_by_caller: HashMap::new(),
@@ -1176,6 +1191,7 @@ impl PeerTable {
             protocol_failure_index: VecDeque::new(),
             protocol_failure_scratch: Vec::new(),
             half_open_deadlines: DueIndex::default(),
+            key_derivations_due_micros: 0,
             idle_deadlines: DueIndex::default(),
             deadlines: DenseDueIndex::default(),
             group_deadlines: DueIndex::default(),
@@ -1675,6 +1691,24 @@ impl PeerTable {
             telemetry.record_established_capacity_drop();
             return Some(Admit::Dropped(AdmissionDropReason::EstablishedCapacity));
         }
+        // A CONCLUSION asking for encryption makes the listener derive a
+        // key-encryption key (PBKDF2) once policy has chosen its credentials.
+        // Charge it only for a half-open peer whose cookie matches, so a
+        // retransmission to an established peer or a forged cookie costs
+        // nothing, and drop it before policy runs when the budget is spent.
+        let derives_key = packet
+            .extensions
+            .iter()
+            .any(|extension| extension.ext_type == srt_proto::handshake::ExtensionType::KmReq)
+            && self.get_peer(&physical).is_some_and(|entry| {
+                !entry.admission_established
+                    && !entry.rejected
+                    && identity.syn_cookie == entry.conn.syn_cookie()
+            });
+        if derives_key && !self.take_key_derivation(now) {
+            telemetry.record_key_derivation_drop();
+            return Some(Admit::Dropped(AdmissionDropReason::KeyDerivationBudget));
+        }
         let result = {
             let Some(entry) = self.get_peer_mut(&physical) else {
                 return Some(Admit::Dropped(AdmissionDropReason::StaleConclusion));
@@ -1717,6 +1751,20 @@ impl PeerTable {
             self.mark_ready_physical(physical);
         }
         result
+    }
+
+    /// Spend one key derivation from the budget if it has one (GCRA:
+    /// `max_key_derivations_per_second` per second, the same as a burst).
+    fn take_key_derivation(&mut self, now: Timestamp) -> bool {
+        let rate = u64::from(self.config.max_key_derivations_per_second);
+        let interval = 1_000_000 / rate;
+        let now = now.as_micros();
+        let due = self.key_derivations_due_micros.max(now);
+        if due - now > interval * (rate - 1) {
+            return false;
+        }
+        self.key_derivations_due_micros = due + interval;
+        true
     }
 
     fn new_admission_peer(
@@ -4461,6 +4509,7 @@ mod tests {
                 max_established_peers: max_peers,
                 max_peers_per_ip: max_peers,
                 half_open_timeout: Duration::from_secs(60),
+                ..PeerTableConfig::default()
             };
             let mut table = PeerTable::with_config(config);
             let telemetry = IngressTelemetry::new();
@@ -4507,6 +4556,7 @@ mod tests {
                 max_established_peers: 64,
                 max_peers_per_ip: max_per_ip,
                 half_open_timeout: Duration::from_secs(60),
+                ..PeerTableConfig::default()
             };
             let mut table = PeerTable::with_config(config);
             let telemetry = IngressTelemetry::new();
@@ -4550,6 +4600,7 @@ mod tests {
                 max_established_peers: 16,
                 max_peers_per_ip: 16,
                 half_open_timeout: Duration::from_secs(60),
+                ..PeerTableConfig::default()
             };
             let mut table = PeerTable::with_config(config);
             let telemetry = IngressTelemetry::new();
@@ -4583,6 +4634,7 @@ mod tests {
             max_established_peers: 8,
             max_peers_per_ip: 8,
             half_open_timeout: Duration::from_secs(60),
+            ..PeerTableConfig::default()
         });
         let telemetry = IngressTelemetry::new();
         let options = default_options();
@@ -4624,6 +4676,7 @@ mod tests {
             max_established_peers: 4,
             max_peers_per_ip: 4,
             half_open_timeout: Duration::from_millis(100),
+            ..PeerTableConfig::default()
         };
         let mut table = PeerTable::with_config(config);
         let telemetry = IngressTelemetry::new();
@@ -4683,6 +4736,108 @@ mod tests {
             ),
             "after expiry, peer_c should be admitted"
         );
+    }
+
+    /// INDUCTION then CONCLUSION from a fresh caller at `peer`, encrypted
+    /// with `passphrase` if any; returns what the table did with the
+    /// CONCLUSION, and the CONCLUSION itself.
+    fn conclude_as(
+        table: &mut PeerTable,
+        peer: std::net::SocketAddr,
+        passphrase: Option<&str>,
+        options: &AdmissionOptions,
+        telemetry: &IngressTelemetry,
+        now: Timestamp,
+    ) -> (Admit, Vec<u8>) {
+        let mut caller = SrtConnection::new_caller(ConnectionOptions {
+            socket_id: u32::from(peer.port()),
+            passphrase: passphrase.map(str::to_owned),
+            ..ConnectionOptions::default()
+        });
+        caller.connect(now).expect("start caller");
+        let induction = next_packet(&mut caller);
+        assert_eq!(
+            table.admit(peer, &induction, now, options, 0, 1, telemetry),
+            Admit::Fed
+        );
+        let mut outbound = Vec::new();
+        table.poll_outbound(now, &mut outbound);
+        for (outbound_peer, packet) in outbound {
+            if outbound_peer == peer {
+                let _ = caller.feed_recv_buf(&packet, now);
+            }
+        }
+        let conclusion = next_packet(&mut caller);
+        let admit = table.admit(peer, &conclusion, now, options, 0, 1, telemetry);
+        (admit, conclusion)
+    }
+
+    /// Each encrypted CONCLUSION costs the owner one PBKDF2 key derivation,
+    /// and a source can cycle INDUCTION + CONCLUSION pairs as fast as it
+    /// likes. The table holds them to its budget, dropping the excess before
+    /// any protocol work; the budget refills with time, and neither an
+    /// unencrypted CONCLUSION nor a retransmission to an established peer
+    /// spends it.
+    #[test]
+    fn encrypted_conclusions_are_held_to_the_key_derivation_budget() {
+        const RATE: u32 = 4;
+        let mut table = PeerTable::with_config(PeerTableConfig {
+            max_key_derivations_per_second: RATE,
+            ..PeerTableConfig::default()
+        });
+        let telemetry = IngressTelemetry::new();
+        let options = AdmissionOptions {
+            connection_template: Some(ConnectionOptions {
+                passphrase: Some("listener-secret".to_owned()),
+                ..ConnectionOptions::default()
+            }),
+            ..AdmissionOptions::basic(1, 120, false)
+        };
+        let mut port = 20_000u16;
+        let mut conclude = |table: &mut PeerTable, passphrase, now| {
+            port += 1;
+            let peer = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+            let (admit, conclusion) =
+                conclude_as(table, peer, passphrase, &options, &telemetry, now);
+            (admit, peer, conclusion)
+        };
+        let start = Timestamp::from_micros(1_000_000);
+
+        for _ in 0..RATE {
+            let (admit, ..) = conclude(&mut table, Some("wrong-secret"), start);
+            assert_ne!(
+                admit,
+                Admit::Dropped(AdmissionDropReason::KeyDerivationBudget)
+            );
+        }
+        assert_eq!(telemetry.snapshot().credential_failures, u64::from(RATE));
+        assert_eq!(
+            conclude(&mut table, Some("wrong-secret"), start).0,
+            Admit::Dropped(AdmissionDropReason::KeyDerivationBudget)
+        );
+        let (unencrypted, ..) = conclude(&mut table, None, start);
+        assert_ne!(
+            unencrypted,
+            Admit::Dropped(AdmissionDropReason::KeyDerivationBudget)
+        );
+        assert_eq!(telemetry.snapshot().key_derivation_drops, 1);
+
+        // One derivation per 1 s / RATE comes back: the right key connects,
+        // and the next one waits again.
+        let later = start.add_micros(1_000_000 / u64::from(RATE));
+        let (admit, established, conclusion) = conclude(&mut table, Some("listener-secret"), later);
+        assert_eq!(admit, Admit::Fed);
+        assert_eq!(
+            conclude(&mut table, Some("listener-secret"), later).0,
+            Admit::Dropped(AdmissionDropReason::KeyDerivationBudget)
+        );
+        assert_eq!(telemetry.snapshot().key_derivation_drops, 2);
+        // A retransmitted CONCLUSION to the established peer derives nothing.
+        assert_ne!(
+            table.admit(established, &conclusion, later, &options, 0, 1, &telemetry),
+            Admit::Dropped(AdmissionDropReason::KeyDerivationBudget)
+        );
+        assert_eq!(telemetry.snapshot().key_derivation_drops, 2);
     }
 
     fn insert_test_peer(

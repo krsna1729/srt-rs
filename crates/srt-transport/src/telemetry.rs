@@ -335,6 +335,9 @@ pub struct IngressTelemetry {
     pub policy_rejections: AtomicU64,
     /// CONCLUSIONs that failed KM validation after credential selection.
     pub credential_failures: AtomicU64,
+    /// Encrypted CONCLUSIONs dropped because the key-derivation budget was
+    /// spent; the caller retransmits.
+    pub key_derivation_drops: AtomicU64,
     /// Incomplete handshakes evicted after the configured inactivity bound.
     pub expired_half_open: AtomicU64,
 }
@@ -362,6 +365,7 @@ pub struct IngressTelemetrySnapshot {
     pub policy_errors: u64,
     pub policy_rejections: u64,
     pub credential_failures: u64,
+    pub key_derivation_drops: u64,
     pub expired_half_open: u64,
 }
 
@@ -453,6 +457,9 @@ impl IngressTelemetry {
     pub fn record_credential_failure(&self) {
         Self::bump(&self.credential_failures);
     }
+    pub fn record_key_derivation_drop(&self) {
+        Self::bump(&self.key_derivation_drops);
+    }
     pub fn record_expired_half_open(&self, count: usize) {
         // Called per datagram, where nothing has expired almost every time.
         // This counter is shared by every acceptor thread, so an
@@ -492,6 +499,7 @@ impl IngressTelemetry {
             policy_errors: get(&self.policy_errors),
             policy_rejections: get(&self.policy_rejections),
             credential_failures: get(&self.credential_failures),
+            key_derivation_drops: get(&self.key_derivation_drops),
             expired_half_open: get(&self.expired_half_open),
         }
     }
@@ -509,7 +517,7 @@ impl IngressTelemetry {
              {} half-open-capacity drops, {} established-capacity drops, \
              {} source-capacity drops, {} policy requests, {} policy configurations, \
              {} policy deferrals, {} policy errors, {} policy rejections, \
-             {} credential failures, {} expired half-open",
+             {} credential failures, {} key-derivation drops, {} expired half-open",
             snapshot.local_promotions,
             snapshot.handoffs,
             snapshot.stranded_conclusions,
@@ -528,6 +536,7 @@ impl IngressTelemetry {
             snapshot.policy_errors,
             snapshot.policy_rejections,
             snapshot.credential_failures,
+            snapshot.key_derivation_drops,
             snapshot.expired_half_open,
         )
     }

@@ -155,6 +155,7 @@ fn bench_per_source_capacity(c: &mut Criterion) {
         max_established_peers: 4_097,
         max_peers_per_ip: 1,
         half_open_timeout: Duration::from_secs(10),
+        ..PeerTableConfig::default()
     });
     for index in 0..4_096_u16 {
         let third = (index / 250) as u8;
@@ -206,6 +207,7 @@ fn bench_same_tuple_n_callers(c: &mut Criterion) {
                     max_established_peers: N as usize,
                     max_peers_per_ip: N as usize,
                     half_open_timeout: Duration::from_secs(10),
+                    ..PeerTableConfig::default()
                 });
                 for (index, packet) in packets.iter().enumerate() {
                     black_box(table.admit(
