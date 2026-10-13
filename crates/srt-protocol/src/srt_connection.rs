@@ -10725,8 +10725,10 @@ mod tests {
         // added the periodic-NAK cursor and its reused packet staging
         // (`periodic_nak_resume`, `periodic_nak_packets`) here, and
         // `SenderBuffer::expiry_scan_from` (plus a test-only counter); each
-        // fit alone, together they need 8 more bytes -- deliberate.
-        assert!(connection_bytes <= 1_576);
+        // fit alone, together they need 8 more bytes -- deliberate. Bounded
+        // peer-NAK handling then added `SenderBuffer::pending_naks` (the
+        // queue of reports still validating or committing), 32 bytes inline.
+        assert!(connection_bytes <= 1_608);
         assert!(event_bytes <= 64);
         // F01 added `source_time: Timestamp` (8 bytes) to preserve a
         // message's original source time through reassembly -- a
