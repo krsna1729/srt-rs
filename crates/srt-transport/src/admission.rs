@@ -2159,7 +2159,7 @@ impl PeerTable {
             || self
                 .config
                 .max_window_memory_bytes
-                .is_some_and(|max| self.window_memory_bytes + window_bytes > max)
+                .is_some_and(|max| self.window_memory_bytes.saturating_add(window_bytes) > max)
         {
             return Err(leg);
         }
@@ -4194,9 +4194,12 @@ impl PeerTable {
         self.logical_peers.remove(&entry.logical_peer);
         if entry.admission_established {
             self.established_peers = self.established_peers.saturating_sub(1);
-            self.window_memory_bytes = self
-                .window_memory_bytes
-                .saturating_sub(entry.conn.window_memory_bound_bytes());
+            let window_bytes = entry.conn.window_memory_bound_bytes();
+            debug_assert!(
+                self.window_memory_bytes >= window_bytes,
+                "established peer charged"
+            );
+            self.window_memory_bytes = self.window_memory_bytes.saturating_sub(window_bytes);
         } else {
             self.half_open_peers = self.half_open_peers.saturating_sub(1);
         }
@@ -4227,9 +4230,12 @@ impl PeerTable {
                 self.slots.remove_by_slot(slot_idx);
                 self.note_slot_freed(slot_idx, leg.physical.address, true);
                 self.established_peers = self.established_peers.saturating_sub(1);
-                self.window_memory_bytes = self
-                    .window_memory_bytes
-                    .saturating_sub(connection.window_memory_bound_bytes());
+                let window_bytes = connection.window_memory_bound_bytes();
+                debug_assert!(
+                    self.window_memory_bytes >= window_bytes,
+                    "group leg charged"
+                );
+                self.window_memory_bytes = self.window_memory_bytes.saturating_sub(window_bytes);
                 self.decrement_source_count(leg.physical.address.ip());
             }
             removed.push(RemovedPeerLeg {
@@ -4993,7 +4999,8 @@ mod tests {
         let per_peer =
             SrtConnection::new_listener(ConnectionOptions::default()).window_memory_bound_bytes();
         let mut table = PeerTable::with_config(PeerTableConfig {
-            max_window_memory_bytes: Some(2 * per_peer + per_peer / 2),
+            // Two default peers, then exactly room for a quarter-window one.
+            max_window_memory_bytes: Some(2 * per_peer + per_peer / 4),
             ..PeerTableConfig::default()
         });
         let telemetry = IngressTelemetry::new();
@@ -5019,7 +5026,7 @@ mod tests {
         assert_eq!(table.established_count(), 2);
         assert_eq!(table.reserved_window_memory_bytes(), 2 * per_peer);
 
-        // Policy that quarters the windows fits in what is left.
+        // Policy that quarters the windows fits exactly in what is left.
         let small = at(30_004);
         let conclusion = induct(&mut table, small, None, &options, &telemetry, now);
         let window = std::num::NonZeroU32::new(srt_proto::handshake::DEFAULT_FLOW_WINDOW / 4)
@@ -5041,7 +5048,7 @@ mod tests {
             2 * per_peer + per_peer / 4
         );
 
-        // Retirement returns the share, and the next peer fits again.
+        // Retirement returns the share, and the next peer fits again, exactly.
         let retiring = table
             .physical_for_address(at(30_001))
             .expect("established peer");

@@ -294,7 +294,10 @@ composes overlays, accounts telemetry, and preserves admission ordering.
   Each established peer reserves its worst case, `(flow window + receive
   window) × 1,484` bytes at the windows policy chose (about 24 MB at the
   default 8,192-packet windows), and returns it when it retires. Off by
-  default; the static per-peer window limits still apply.
+  default; the static per-peer window limits still apply. The budget is per
+  table, so per member of a reuseport layout: a member checks its own budget
+  when it adopts a relocated leg, and refusing one ends a session the peer
+  already saw connect. Give every member of a layout the same budget.
 - Treat `Defer` volume and half-open expiry as abuse signals.
 - Use unique tenant credentials, but do not treat them as general identity.
 - Put an authenticated protocol inside SRT when integrity or endpoint identity

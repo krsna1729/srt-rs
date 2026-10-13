@@ -4262,8 +4262,16 @@ mod tests {
 
     #[test]
     fn retiring_a_relocated_group_releases_the_lent_slot_home() {
-        let (mut members, route, _, _) =
-            bonded_publisher_across_two_members(true, PeerTableConfig::default());
+        let per_leg = srt_proto::SrtConnection::new_listener(ConnectionOptions::default())
+            .window_memory_bound_bytes();
+        // The owner's budget holds both legs exactly, so the adopt just fits.
+        let (mut members, route, _, _) = bonded_publisher_across_two_members(
+            true,
+            PeerTableConfig {
+                max_window_memory_bytes: Some(2 * per_leg),
+                ..PeerTableConfig::default()
+            },
+        );
         let (owner, source) = (route[0], 1 - route[0]);
         let mut events = Vec::new();
         members[owner].poll_events(&mut events);
@@ -4274,8 +4282,6 @@ mod tests {
             .logical_peer;
         // The relocated leg's window memory moved with it: released by the
         // source, reserved by the adopting owner, returned at retirement.
-        let per_leg = srt_proto::SrtConnection::new_listener(ConnectionOptions::default())
-            .window_memory_bound_bytes();
         assert_eq!(members[owner].reserved_window_memory_bytes(), 2 * per_leg);
         assert_eq!(members[source].reserved_window_memory_bytes(), 0);
         assert!(matches!(
