@@ -1340,10 +1340,17 @@ pub struct TransportCapabilities {
 }
 
 impl Default for TransportCapabilities {
+    /// `available_parallelism` is read once per process. The standard
+    /// library reads the *calling thread's* affinity mask, so a fresh read
+    /// on every `prepare` lets two callers of one shared Owner resolve
+    /// different `workers` when the application pins its threads apart (or
+    /// re-pins one later), and [`PreparedCaller::validate_shared_compatibility`]
+    /// then refuses every caller after the first.
     fn default() -> Self {
+        static PARALLELISM: std::sync::OnceLock<NonZeroUsize> = std::sync::OnceLock::new();
         Self {
-            available_parallelism: std::thread::available_parallelism()
-                .unwrap_or(NonZeroUsize::MIN),
+            available_parallelism: *PARALLELISM
+                .get_or_init(|| std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN)),
             reuse_port: cfg!(unix),
             receive_batching: cfg!(target_os = "linux"),
         }
@@ -2750,6 +2757,33 @@ mod tests {
             .require_exclusive()
             .expect_err("shared caller has no connected-only contract");
         assert_eq!(error.field(), "transport.ownership");
+    }
+
+    /// An application that pins its threads apart (one CPU for control, a set
+    /// for the Owners) prepares callers of one shared Owner on threads with
+    /// different affinity masks. They must still resolve the same transport.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shared_callers_prepared_under_different_thread_affinity_stay_compatible() {
+        let prepare = || {
+            CallerConfig::builder(address(9))
+                .ownership(SocketOwnership::Shared)
+                .build()
+                .expect("shared caller config")
+                .prepare(RuntimeFlavor::Compio)
+                .expect("prepared shared caller")
+        };
+        let first = prepare();
+        let pinned = std::thread::spawn(move || {
+            let one_cpu = [crate::cpu::parse_cpu_spec(&crate::cpu::current_cpu_spec().unwrap())[0]];
+            crate::cpu::restrict_to_cpu_list(&one_cpu).expect("pin this thread to one CPU");
+            prepare()
+        })
+        .join()
+        .expect("pinned thread");
+        pinned
+            .validate_shared_compatibility(first.local_bind, first.transport, Some(first.connect))
+            .expect("a pinned thread's caller joins the same Owner");
     }
 
     #[test]
