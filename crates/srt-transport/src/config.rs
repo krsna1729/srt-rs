@@ -1143,6 +1143,10 @@ impl Drop for SessionConfig {
     }
 }
 
+/// How many workers (listeners, acceptors) a transport runs. `Auto` takes the
+/// process's available parallelism ([`TransportCapabilities`]); `Count` is the
+/// application's choice and is used as given, because the transport cannot
+/// know which CPUs the application will run those workers on.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum WorkerCount {
     #[default]
@@ -1154,8 +1158,7 @@ impl WorkerCount {
     fn resolve(self, available: NonZeroUsize) -> NonZeroUsize {
         match self {
             Self::Auto => available,
-            Self::Count(count) => NonZeroUsize::new(count.get().min(available.get()))
-                .expect("clamped worker count remains non-zero"),
+            Self::Count(count) => count,
         }
     }
 }
@@ -1340,12 +1343,15 @@ pub struct TransportCapabilities {
 }
 
 impl Default for TransportCapabilities {
-    /// `available_parallelism` is read once per process. The standard
-    /// library reads the *calling thread's* affinity mask, so a fresh read
-    /// on every `prepare` lets two callers of one shared Owner resolve
-    /// different `workers` when the application pins its threads apart (or
-    /// re-pins one later), and [`PreparedCaller::validate_shared_compatibility`]
-    /// then refuses every caller after the first.
+    /// `available_parallelism` is read once per process: the affinity mask
+    /// (and cgroup quota) of the first thread that resolves a transport. The
+    /// standard library reads the *calling thread's* mask, so a fresh read on
+    /// every `prepare` let two callers of one shared Owner resolve different
+    /// `workers` when the application pins its threads apart (or re-pins one
+    /// later), and [`PreparedCaller::validate_shared_compatibility`] then
+    /// refused every caller after the first. Only [`WorkerCount::Auto`] reads
+    /// it. An application that pins threads should resolve before pinning,
+    /// or pass explicit counts or [`RuntimeFlavor::Custom`].
     fn default() -> Self {
         static PARALLELISM: std::sync::OnceLock<NonZeroUsize> = std::sync::OnceLock::new();
         Self {
@@ -2773,6 +2779,10 @@ mod tests {
                 .prepare(RuntimeFlavor::Compio)
                 .expect("prepared shared caller")
         };
+        if crate::cpu::available_cpus() < 2 {
+            eprintln!("skipped: needs two CPUs to pin a thread to fewer than the process has");
+            return;
+        }
         let first = prepare();
         let pinned = std::thread::spawn(move || {
             let one_cpu = [crate::cpu::parse_cpu_spec(&crate::cpu::current_cpu_spec().unwrap())[0]];
@@ -2909,6 +2919,30 @@ mod tests {
             .prepare(RuntimeFlavor::Mio)
             .expect_err("over budget");
         assert_eq!(error.field(), "admission.socket_memory_budget");
+    }
+
+    /// An explicit acceptor count is the application's choice: it holds on a
+    /// process whose parallelism is lower (a pinned first resolver must not
+    /// cap every later listener).
+    #[test]
+    fn explicit_acceptor_count_is_not_capped_by_available_parallelism() {
+        let config = TransportConfig {
+            topology: ListenerTopology::ReusePortMulti {
+                acceptors: WorkerCount::Count(NonZeroUsize::new(4).expect("non-zero")),
+            },
+            ..TransportConfig::default()
+        };
+        let one_cpu = TransportCapabilities {
+            available_parallelism: NonZeroUsize::MIN,
+            ..RuntimeFlavor::Mio.capabilities()
+        };
+        let resolved = config.resolve(one_cpu).expect("resolved");
+        assert_eq!(
+            resolved.topology,
+            ResolvedListenerTopology::ReusePortMulti {
+                acceptors: NonZeroUsize::new(4).expect("non-zero"),
+            }
+        );
     }
 
     #[test]
