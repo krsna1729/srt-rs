@@ -4,8 +4,8 @@ use srt_proto::{ConnectionOutput, SrtConnection, TimerId, Timestamp};
 /// for explicit timer lifecycle control, rather than each wrapping its own
 /// runtime's timer primitive.
 ///
-/// Fixed `[Option<Timestamp>; 7]` array indexed by `TimerId`. No hashing,
-/// no allocation, fits in a single cache line.
+/// Fixed `[Option<Timestamp>; TimerId::COUNT]` array indexed by `TimerId`.
+/// No hashing, no allocation.
 pub struct ManualTimerStore {
     deadlines: [Option<Timestamp>; TimerId::COUNT],
 }

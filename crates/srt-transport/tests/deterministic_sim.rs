@@ -96,6 +96,7 @@ fn run_sim(cfg: &SimConfig) -> SimOutcome {
             srt_proto::TimerId::Ack,
             srt_proto::TimerId::Nak,
             srt_proto::TimerId::RetransmitContinue,
+            srt_proto::TimerId::DeliveryContinue,
         ] {
             let _ = caller.handle_timer(timer, now);
             let _ = listener.handle_timer(timer, now);

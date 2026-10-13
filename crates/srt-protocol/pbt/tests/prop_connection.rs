@@ -108,6 +108,7 @@ proptest! {
         conn.handle_timer(TimerId::Ack, now).expect("タイマー処理は成功する想定");
         conn.handle_timer(TimerId::Nak, now).expect("タイマー処理は成功する想定");
         conn.handle_timer(TimerId::RetransmitContinue, now).expect("タイマー処理は成功する想定");
+        conn.handle_timer(TimerId::DeliveryContinue, now).expect("タイマー処理は成功する想定");
         conn.handle_timer(TimerId::Inactivity, now).expect("タイマー処理は成功する想定");
 
         prop_assert_eq!(conn.state(), initial_state);

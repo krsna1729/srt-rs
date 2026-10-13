@@ -214,7 +214,12 @@ const MAX_RETRANSMITS_PER_VISIT: usize = 32;
 
 /// Ready packets one [`SrtConnection::enqueue_ready_data`] visit moves into
 /// the application queue before a zero-delay `DeliveryContinue` visit takes
-/// the remainder. Matches `MAX_RETRANSMITS_PER_VISIT`'s order of work.
+/// the remainder. Without this cap, a filled gap or an application read could
+/// move the connection's whole receive window (up to `DEFAULT_FLOW_WINDOW`
+/// packets) in one callback on the Owner thread. A delivery (assembler feed
+/// plus event push) is cheaper than a retransmission (encrypt plus queue), so
+/// twice `MAX_RETRANSMITS_PER_VISIT` is a similar amount of work per visit;
+/// it also equals the transport's `OutputDrainBudget` action count.
 const MAX_DELIVERY_PER_VISIT: usize = 64;
 
 /// Hard fail-closed limits for protocol outputs retained by the sans-I/O
@@ -2765,7 +2770,7 @@ impl SrtConnection {
             if let Some(receiver) = self.receiver.as_mut() {
                 receiver.set_tsbpd_enabled(false);
             }
-            self.enqueue_ready_data(now);
+            self.move_ready_data(now, usize::MAX);
             self.send_shutdown(now);
             self.shutdown_started_at = Some(now);
             self.queue_output(QueuedOutput::SetTimer {
@@ -2891,6 +2896,15 @@ impl SrtConnection {
     /// one callback on the Owner thread. The remainder is continued by a
     /// zero-delay `DeliveryContinue` visit, like `RetransmitContinue`.
     fn enqueue_ready_data(&mut self, now: Timestamp) {
+        self.move_ready_data(now, MAX_DELIVERY_PER_VISIT);
+    }
+
+    /// Move up to `cap` ready packets (and never more than the application
+    /// queue admits). `disconnect` passes no cap: the peer's SHUTDOWN answer
+    /// or its next DATA ends `Closing` at once, before any continuation
+    /// visit, so a local close delivers its whole buffered tail in the call
+    /// that releases it -- once per connection.
+    fn move_ready_data(&mut self, now: Timestamp, cap: usize) {
         let available = self
             .options
             .delivery_queue_packets
@@ -2899,7 +2913,7 @@ impl SrtConnection {
             return;
         }
 
-        let visit = available.min(MAX_DELIVERY_PER_VISIT);
+        let visit = available.min(cap);
         let mut popped = 0;
         while popped < visit {
             let Some((packet, source_time)) = self
@@ -2930,7 +2944,7 @@ impl SrtConnection {
         self.sync_application_backlog();
         // Cut by the visit cap, not by the queue or the receiver: continue.
         // A spurious visit finds nothing ready and does nothing.
-        if popped == MAX_DELIVERY_PER_VISIT && !self.event_overflowed {
+        if popped == cap && !self.event_overflowed {
             self.queue_output(QueuedOutput::SetTimer {
                 id: TimerId::DeliveryContinue,
                 duration_micros: 0,
@@ -6655,6 +6669,42 @@ mod tests {
         }
         let cap = MAX_DELIVERY_PER_VISIT as u32;
         assert_eq!(delivered, [cap, 2 * cap, 3 * cap, READY]);
+    }
+
+    /// A local close releases the whole TSBPD-buffered tail in the call that
+    /// closes: the peer's SHUTDOWN answer ends `Closing` before any
+    /// `DeliveryContinue` visit could run.
+    #[test]
+    fn a_local_close_delivers_its_whole_tail_before_the_peer_answers() {
+        const BUFFERED: u32 = 200;
+        let mut conn = SrtConnection::new_listener(ConnectionOptions {
+            tsbpd_delay: 10_000,
+            flow_window_packets: 256,
+            receive_buffer_packets: 256,
+            ..ConnectionOptions::default()
+        });
+        conn.set_state(ConnectionState::Connected);
+        let _ = conn.poll_event();
+        let now = Timestamp::from_micros(0);
+        conn.init_buffers(now, 0, 0);
+        conn.receiver
+            .as_mut()
+            .expect("connected listener has a receiver")
+            .set_tsbpd_enabled(true);
+        for sequence_number in 0..BUFFERED {
+            conn.handle_data_packet(
+                DataPacket::new(sequence_number, sequence_number, 0, 0, vec![1].into()),
+                now,
+            )
+            .expect("data is accepted");
+        }
+        assert_eq!(conn.pending_data_events, 0, "TSBPD holds everything");
+
+        conn.disconnect(now);
+        conn.handle_shutdown(now)
+            .expect("the peer answers the close");
+        assert_eq!(conn.state, ConnectionState::Disconnected);
+        assert_eq!(conn.pending_data_events, BUFFERED);
     }
 
     #[test]
