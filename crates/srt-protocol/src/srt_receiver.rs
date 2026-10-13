@@ -183,13 +183,27 @@ fn sequence_in_range(first_seq: u32, distance: u32, sequence: u32) -> bool {
     sequence.wrapping_sub(first_seq) & SEQUENCE_MASK <= distance
 }
 
-/// The part of the numeric segment `[seq, seq + count)` at or after `from`.
-fn clip_segment(seq: u32, count: u32, from: u32) -> Option<(u32, u32)> {
-    match from.checked_sub(seq) {
-        None | Some(0) => Some((seq, count)),
-        Some(skip) if skip < count => Some((from, count - skip)),
-        Some(_) => None,
+/// Emit the runs of `losses`, already in the order to report. Only
+/// numerically adjacent positions join a run, so a run never spans the
+/// 2^31 wrap.
+fn emit_sorted_runs(
+    losses: &[u32],
+    mut emit: impl FnMut(u32, u32) -> ControlFlow<()>,
+) -> ControlFlow<()> {
+    let Some((&first, rest)) = losses.split_first() else {
+        return ControlFlow::Continue(());
+    };
+    let (mut start, mut end) = (first, first);
+    for &loss in rest {
+        if loss == end + 1 {
+            end = loss;
+        } else {
+            emit(start, end)?;
+            start = loss;
+            end = loss;
+        }
     }
+    emit(start, end)
 }
 
 /// Circular loss membership for one negotiated receive window.
@@ -387,67 +401,86 @@ impl LossBitmap {
     }
 
     fn for_each_numeric_run(&self, mut emit: impl FnMut(u32, u32)) {
-        let _ = self.try_for_each_numeric_run_from(0, |start, end| {
-            emit(start, end);
-            ControlFlow::Continue(())
-        });
-    }
-
-    /// Loss runs in numeric order, starting at numeric position `from` (a
-    /// run that straddles `from` is reported from `from`), until `emit`
-    /// breaks. A periodic NAK resumes its report here, so one fire walks
-    /// only the part of the list it reports.
-    fn try_for_each_numeric_run_from(
-        &self,
-        from: u32,
-        mut emit: impl FnMut(u32, u32) -> ControlFlow<()>,
-    ) -> ControlFlow<()> {
         if self.is_empty() {
-            return ControlFlow::Continue(());
+            return;
         }
         // A fixed stack sort preserves the measured sparse-loss fast path;
         // word-native run extraction wins once there are more than eight bits.
         if self.len <= 8 {
             let mut losses = [0; 8];
-            let mut len = 0;
-            for loss in self.iter().filter(|&loss| loss >= from) {
-                losses[len] = loss;
-                len += 1;
-            }
-            if len == 0 {
-                return ControlFlow::Continue(());
+            let len = self.len();
+            for (slot, loss) in losses.iter_mut().zip(self.iter()) {
+                *slot = loss;
             }
             losses[..len].sort_unstable();
-            let mut start = losses[0];
-            let mut end = start;
-            for &loss in &losses[1..len] {
-                if loss == end + 1 {
-                    end = loss;
-                } else {
-                    emit(start, end)?;
-                    start = loss;
-                    end = loss;
-                }
-            }
-            return emit(start, end);
+            let _ = emit_sorted_runs(&losses[..len], |start, end| {
+                emit(start, end);
+                ControlFlow::Continue(())
+            });
+            return;
         }
+        let mut emit = |start, end| {
+            emit(start, end);
+            ControlFlow::Continue(())
+        };
         const SEQUENCE_MODULUS: u64 = 1 << 31;
         let numeric_end = u64::from(self.base_seq) + u64::from(self.window_size);
         if numeric_end > SEQUENCE_MODULUS {
-            let low_len = (numeric_end - SEQUENCE_MODULUS) as u32;
-            if let Some((seq, count)) = clip_segment(0, low_len, from) {
-                self.for_each_run_segment(seq, count, &mut emit)?;
-            }
-            let high_len = (SEQUENCE_MODULUS - u64::from(self.base_seq)) as u32;
-            match clip_segment(self.base_seq, high_len, from) {
-                Some((seq, count)) => self.for_each_run_segment(seq, count, &mut emit),
-                None => ControlFlow::Continue(()),
-            }
+            let _ =
+                self.for_each_run_segment(0, (numeric_end - SEQUENCE_MODULUS) as u32, &mut emit);
+            let _ = self.for_each_run_segment(
+                self.base_seq,
+                (SEQUENCE_MODULUS - u64::from(self.base_seq)) as u32,
+                &mut emit,
+            );
         } else {
-            match clip_segment(self.base_seq, self.window_size, from) {
-                Some((seq, count)) => self.for_each_run_segment(seq, count, &mut emit),
-                None => ControlFlow::Continue(()),
+            let _ = self.for_each_run_segment(self.base_seq, self.window_size, &mut emit);
+        }
+    }
+
+    /// Loss runs in sequence order -- oldest first, so the losses nearest
+    /// their drop deadline are named first -- starting at sequence `from`
+    /// (or at the window base when `from` is `None` or no longer inside the
+    /// window), until `emit` breaks. A run straddling `from` is reported
+    /// from `from`; runs split at the 2^31 wrap. A periodic NAK resumes its
+    /// report here, so one fire walks only the part of the list it reports.
+    fn try_for_each_run_in_sequence_from(
+        &self,
+        from: Option<u32>,
+        mut emit: impl FnMut(u32, u32) -> ControlFlow<()>,
+    ) -> ControlFlow<()> {
+        if self.is_empty() {
+            return ControlFlow::Continue(());
+        }
+        let base = self.base_seq;
+        let offset_of = |seq: u32| seq.wrapping_sub(base) & SEQUENCE_MASK;
+        let start = from
+            .map(offset_of)
+            .filter(|&offset| offset < self.window_size)
+            .unwrap_or(0);
+        if self.len <= 8 {
+            let mut losses = [0; 8];
+            let mut len = 0;
+            for loss in self.iter().filter(|&loss| offset_of(loss) >= start) {
+                losses[len] = loss;
+                len += 1;
             }
+            // Numeric order is sequence order unless the window wraps.
+            if u64::from(base) + u64::from(self.window_size) <= 1u64 << 31 {
+                losses[..len].sort_unstable();
+            } else {
+                losses[..len].sort_unstable_by_key(|&loss| offset_of(loss));
+            }
+            return emit_sorted_runs(&losses[..len], emit);
+        }
+        let first = base.wrapping_add(start) & SEQUENCE_MASK;
+        let count = self.window_size - start;
+        let before_wrap = (1u64 << 31) - u64::from(first);
+        if u64::from(count) <= before_wrap {
+            self.for_each_run_segment(first, count, &mut emit)
+        } else {
+            self.for_each_run_segment(first, before_wrap as u32, &mut emit)?;
+            self.for_each_run_segment(0, count - before_wrap as u32, &mut emit)
         }
     }
 
@@ -2021,16 +2054,16 @@ impl ReceiverBuffer {
         Some(NakPacket { loss_ranges })
     }
 
-    /// Loss ranges in numeric order from numeric position `from`, until
-    /// `emit` breaks; see `LossBitmap::try_for_each_numeric_run_from`.
+    /// Loss ranges oldest first from sequence `from`, until `emit` breaks;
+    /// see `LossBitmap::try_for_each_run_in_sequence_from`.
     pub(crate) fn try_for_each_periodic_nak_range_from(
         &self,
-        from: u32,
+        from: Option<u32>,
         mut emit: impl FnMut(LossRange) -> ControlFlow<()>,
     ) {
         let _ = self
             .loss_list
-            .try_for_each_numeric_run_from(from, |first_seq, last_seq| {
+            .try_for_each_run_in_sequence_from(from, |first_seq, last_seq| {
                 emit(LossRange {
                     first_seq,
                     last_seq,
@@ -2542,19 +2575,20 @@ mod tests {
         assert_eq!(losses.len(), 89);
     }
 
-    /// A periodic NAK resumes inside either numeric segment of a wrapped
-    /// window, reports a straddled run from the resume point, and stops when
-    /// told to.
+    /// A periodic NAK walks a wrapped window oldest first, resumes inside
+    /// either side of the wrap, reports a straddled run from the resume
+    /// point, and stops when told to.
     #[test]
-    fn numeric_runs_resume_from_a_position_and_stop_on_break() {
+    fn sequence_runs_resume_from_a_position_and_stop_on_break() {
         let base = SEQUENCE_MASK - 100;
         let mut losses = LossBitmap::new(base, 200);
         let first = SEQUENCE_MASK - 90;
-        losses.insert_range(first, 130); // numeric runs (0, 38), (first, MASK)
-        losses.remove_range(SEQUENCE_MASK - 20, 41); // -> (20, 38), (first, MASK - 21)
-        let runs_from = |from: u32, limit: usize| {
+        losses.insert_range(first, 130);
+        losses.remove_range(SEQUENCE_MASK - 20, 41);
+        // Oldest first: (first, MASK - 21) before the wrap, then (20, 38).
+        let runs_from = |losses: &LossBitmap, from: Option<u32>, limit: usize| {
             let mut runs = Vec::new();
-            let _ = losses.try_for_each_numeric_run_from(from, |start, end| {
+            let _ = losses.try_for_each_run_in_sequence_from(from, |start, end| {
                 runs.push((start, end));
                 if runs.len() == limit {
                     ControlFlow::Break(())
@@ -2564,12 +2598,36 @@ mod tests {
             });
             runs
         };
-        assert_eq!(runs_from(0, 9), [(20, 38), (first, SEQUENCE_MASK - 21)]);
-        assert_eq!(runs_from(0, 1), [(20, 38)], "a break stops the walk");
-        assert_eq!(runs_from(30, 9), [(30, 38), (first, SEQUENCE_MASK - 21)]);
-        assert_eq!(runs_from(39, 9), [(first, SEQUENCE_MASK - 21)]);
-        assert_eq!(runs_from(first + 5, 9), [(first + 5, SEQUENCE_MASK - 21)]);
-        assert_eq!(runs_from(SEQUENCE_MASK - 20, 9), []);
+        let older = (first, SEQUENCE_MASK - 21);
+        assert_eq!(runs_from(&losses, None, 9), [older, (20, 38)]);
+        assert_eq!(
+            runs_from(&losses, None, 1),
+            [older],
+            "a break stops the walk"
+        );
+        assert_eq!(
+            runs_from(&losses, Some(first + 5), 9),
+            [(first + 5, SEQUENCE_MASK - 21), (20, 38)]
+        );
+        assert_eq!(runs_from(&losses, Some(SEQUENCE_MASK - 20), 9), [(20, 38)]);
+        assert_eq!(runs_from(&losses, Some(30), 9), [(30, 38)]);
+        assert_eq!(runs_from(&losses, Some(39), 9), []);
+        assert_eq!(
+            runs_from(&losses, Some(base - 1), 9),
+            [older, (20, 38)],
+            "a resume point outside the window restarts at the base"
+        );
+
+        // The small-list path (at most eight losses) orders the same way.
+        let mut few = LossBitmap::new(SEQUENCE_MASK - 3, 32);
+        for loss in [SEQUENCE_MASK - 1, SEQUENCE_MASK, 0, 2] {
+            few.insert(loss);
+        }
+        assert_eq!(
+            runs_from(&few, None, 9),
+            [(SEQUENCE_MASK - 1, SEQUENCE_MASK), (0, 0), (2, 2)]
+        );
+        assert_eq!(runs_from(&few, Some(0), 9), [(0, 0), (2, 2)]);
     }
 
     #[test]

@@ -749,8 +749,8 @@ pub struct SrtConnection {
     last_ack_time: Option<Timestamp>,
     /// Last NAK send time.
     last_nak_time: Option<Timestamp>,
-    /// Numeric loss position the next periodic NAK resumes from, when the
-    /// last one stopped at `MAX_PERIODIC_NAK_PACKETS`.
+    /// Loss sequence the next periodic NAK resumes from (oldest first), when
+    /// the last one stopped at `MAX_PERIODIC_NAK_PACKETS`.
     periodic_nak_resume: Option<u32>,
     /// Reused staging for one periodic NAK's packets (the receiver is
     /// borrowed while they are encoded), so a fire does not allocate.
@@ -4274,10 +4274,11 @@ impl SrtConnection {
     /// Send a periodic NAK.
     ///
     /// One fire queues at most `MAX_PERIODIC_NAK_PACKETS`. A larger loss list
-    /// (up to `MAX_FLOW_WINDOW / 2` runs) is reported across successive
-    /// fires from `periodic_nak_resume`, wrapping to the start once the end
-    /// is reported, so every loss is named within a bounded number of
-    /// intervals and one fire never encodes the whole list.
+    /// (up to `MAX_FLOW_WINDOW / 2` runs) is reported oldest first across
+    /// successive fires from `periodic_nak_resume`, wrapping to the window
+    /// base once the newest loss is reported, so the losses nearest their
+    /// drop deadline go first, every loss is named within a bounded number
+    /// of intervals, and one fire never encodes the whole list.
     fn send_periodic_nak(&mut self, now: Timestamp) {
         let Some(receiver) = self.receiver.as_ref() else {
             return;
@@ -4944,7 +4945,7 @@ struct PeriodicNakPass {
     reported_any: bool,
 }
 
-/// Encode the receiver's loss runs from `resume` (numeric order) into at
+/// Encode the receiver's loss runs, oldest first from `resume`, into at
 /// most `MAX_PERIODIC_NAK_PACKETS` NAK packets appended to `packets`.
 fn encode_periodic_nak(
     receiver: &ReceiverBuffer,
@@ -4959,7 +4960,7 @@ fn encode_periodic_nak(
         resume: None,
         reported_any: false,
     };
-    receiver.try_for_each_periodic_nak_range_from(resume.unwrap_or(0), |loss| {
+    receiver.try_for_each_periodic_nak_range_from(resume, |loss| {
         pass.reported_any = true;
         if let Some(control_info) = chunks.push(loss) {
             packets.push(make_nak_packet(control_info, timestamp, peer_socket_id));
