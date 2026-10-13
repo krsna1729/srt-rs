@@ -123,8 +123,9 @@ return its slots and shut down.
 ### 8. Admission and backpressure are explicit
 
 Sessions enter through bounded tables with declared capacity (peers, half-open
-peers, established peers, peers per source IP; logical callers; the caller pool).
-A refusal is a typed outcome the application sees, never a silent drop, and no
+peers, established peers, peers per source (an IPv4 address or IPv6 /64);
+logical callers; the caller pool). A refusal is a typed outcome the
+application sees, never a silent drop, and no
 table grows without a bound. A slow or overloaded peer leaves backpressure in
 the protocol's own flow control, not in an unbounded transport queue.
 

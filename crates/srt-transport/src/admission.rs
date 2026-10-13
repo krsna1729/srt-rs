@@ -191,7 +191,9 @@ pub struct PeerTableConfig {
     pub max_half_open_peers: usize,
     /// Fully established peers retained concurrently.
     pub max_established_peers: usize,
-    /// Total peers from one source IP (ports do not bypass this bound).
+    /// Total peers from one source (an IPv4 address, or an IPv6 /64; an
+    /// IPv4-mapped IPv6 address counts as its IPv4 address); ports do not
+    /// bypass this bound.
     pub max_peers_per_ip: usize,
     pub half_open_timeout: Duration,
     /// Key-encryption-key derivations (PBKDF2, 0.2–0.4 ms each) this table
@@ -201,11 +203,12 @@ pub struct PeerTableConfig {
     /// its handshake. It bounds the owner thread's time on handshakes, not
     /// who gets admitted.
     pub max_key_derivations_per_second: u32,
-    /// The share of [`Self::max_key_derivations_per_second`] one source IP
-    /// may take per second (burst the same, in `1..=1_000_000`), checked
-    /// first, so one source cycling handshakes cannot spend the budget every
-    /// other source needs. The SYN cookie proves the address, so the share
-    /// cannot be dodged without many real addresses.
+    /// The share of [`Self::max_key_derivations_per_second`] one source (as
+    /// for [`Self::max_peers_per_ip`]) may take per second (burst the same, in
+    /// `1..=1_000_000`), checked first, so one source cycling handshakes
+    /// cannot spend the budget every other source needs. The SYN cookie
+    /// proves the address, so the share cannot be dodged without many real
+    /// addresses, or for IPv6, many real /64s.
     pub max_key_derivations_per_source_per_second: u32,
     /// Payload bytes the send and receive windows of all established peers
     /// may hold together, each peer counted at its worst case
@@ -420,6 +423,19 @@ fn gcra_take(due: u64, now: u64, rate: u32) -> Option<u64> {
     let interval = 1_000_000 / rate;
     let due = due.max(now);
     (due - now <= interval * (rate - 1)).then_some(due + interval)
+}
+
+/// The source a per-source limit charges: an IPv4 address, or the /64 an
+/// IPv6 address belongs to, since one host routinely holds a whole /64 and
+/// would otherwise take a fresh share per address. An IPv4-mapped address,
+/// as a dual-stack socket reports an IPv4 peer, is its IPv4 address.
+pub(crate) fn source_key(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip.to_canonical() {
+        std::net::IpAddr::V6(v6) => {
+            std::net::Ipv6Addr::from_bits(v6.to_bits() & !u128::from(u64::MAX)).into()
+        }
+        v4 => v4,
+    }
 }
 
 #[inline]
@@ -1048,6 +1064,10 @@ pub struct PeerTable {
     /// share has refilled carries no information and is pruned.
     key_derivations_due_micros: u64,
     key_derivations_due_by_source: HashMap<std::net::IpAddr, u64>,
+    /// Size at which `key_derivations_due_by_source` is next pruned: twice
+    /// the table rate, or twice what survived the last prune, so pruning
+    /// stays amortized O(1) per derivation however many sources are live.
+    key_derivations_prune_at: usize,
     idle_deadlines: DueIndex<PhysicalPeerKey>,
     deadlines: DenseDueIndex,
     group_deadlines: DueIndex<GroupDeadlineKey>,
@@ -1233,6 +1253,7 @@ impl PeerTable {
             half_open_deadlines: DueIndex::default(),
             key_derivations_due_micros: 0,
             key_derivations_due_by_source: HashMap::new(),
+            key_derivations_prune_at: 2 * config.max_key_derivations_per_second as usize,
             idle_deadlines: DueIndex::default(),
             deadlines: DenseDueIndex::default(),
             group_deadlines: DueIndex::default(),
@@ -1746,7 +1767,7 @@ impl PeerTable {
                     && !entry.rejected
                     && identity.syn_cookie == entry.conn.syn_cookie()
             });
-        if derives_key && !self.take_key_derivation(peer.ip(), now) {
+        if derives_key && !self.take_key_derivation(source_key(peer.ip()), now) {
             telemetry.record_key_derivation_drop();
             return Some(Admit::Dropped(AdmissionDropReason::KeyDerivationBudget));
         }
@@ -1834,7 +1855,8 @@ impl PeerTable {
     }
 
     /// Spend one key derivation from `source`'s share and from the table's
-    /// budget if both have one; neither is spent otherwise.
+    /// budget if both have one; neither is spent otherwise. `source` is a
+    /// [`source_key`].
     fn take_key_derivation(&mut self, source: std::net::IpAddr, now: Timestamp) -> bool {
         let now = now.as_micros();
         let source_due = self
@@ -1858,13 +1880,15 @@ impl PeerTable {
         };
         self.key_derivations_due_micros = table_due;
         // Each source still refilling spent a table token within the last
-        // second, so at most about twice the table rate of them are live;
-        // prune the refilled ones once the map holds more than that.
-        if self.key_derivations_due_by_source.len()
-            >= 2 * self.config.max_key_derivations_per_second as usize
-        {
+        // second, so at most about twice the table rate of them are live,
+        // and at most twice that survive into the next threshold: the map
+        // holds at most about four times the table rate between prunes.
+        if self.key_derivations_due_by_source.len() >= self.key_derivations_prune_at {
             self.key_derivations_due_by_source
                 .retain(|_, due| *due > now);
+            self.key_derivations_prune_at = (2 * self.config.max_key_derivations_per_second
+                as usize)
+                .max(2 * self.key_derivations_due_by_source.len());
         }
         self.key_derivations_due_by_source
             .insert(source, source_due);
@@ -2181,7 +2205,10 @@ impl PeerTable {
             .insert_at_slot(slot_idx, socket_id, address, PeerSlotTarget::Direct(*entry));
         self.established_peers += 1;
         self.window_memory_bytes += window_bytes;
-        *self.source_counts.entry(address.ip()).or_default() += 1;
+        *self
+            .source_counts
+            .entry(source_key(address.ip()))
+            .or_default() += 1;
         self.index_idle_peer(physical);
         self.adopt_bonded_peer(physical);
         self.mark_ready_physical(physical);
@@ -2801,7 +2828,7 @@ impl PeerTable {
             },
         );
         if feed.inserted {
-            *self.source_counts.entry(peer.ip()).or_default() += 1;
+            *self.source_counts.entry(source_key(peer.ip())).or_default() += 1;
             self.half_open_peers += 1;
         }
         if !feed.fed {
@@ -4280,7 +4307,7 @@ impl PeerTable {
     }
 
     fn decrement_source_count(&mut self, ip: std::net::IpAddr) {
-        if let HashEntry::Occupied(mut entry) = self.source_counts.entry(ip) {
+        if let HashEntry::Occupied(mut entry) = self.source_counts.entry(source_key(ip)) {
             let count = entry.get_mut();
             *count = count.saturating_sub(1);
             if *count == 0 {
@@ -4393,9 +4420,14 @@ impl PeerTable {
             .collect()
     }
 
+    /// Peers charged to `ip`'s source: its address for IPv4, its /64 for
+    /// IPv6 (see [`PeerTableConfig::max_peers_per_ip`]).
     #[must_use]
     pub fn peers_for_ip(&self, ip: std::net::IpAddr) -> usize {
-        self.source_counts.get(&ip).copied().unwrap_or_default()
+        self.source_counts
+            .get(&source_key(ip))
+            .copied()
+            .unwrap_or_default()
     }
 
     fn reconcile_established(&mut self, peer: PhysicalPeerKey) {
@@ -5195,8 +5227,9 @@ mod tests {
     }
 
     /// Per-source key-derivation state lives only while a source's share is
-    /// refilling: however many sources come and go, the table keeps about
-    /// twice its rate of them.
+    /// refilling: however many sources come and go, the table keeps at most
+    /// four times its rate of them (twice the live ones, which are at most
+    /// twice its rate).
     #[test]
     fn per_source_key_derivation_state_stays_bounded() {
         const RATE: u32 = 4;
@@ -5212,9 +5245,100 @@ mod tests {
                 let source = std::net::IpAddr::from(std::net::Ipv4Addr::from(0x0A00_0000 + host));
                 let now = Timestamp::from_micros(second * 1_000_000 + step * 250_000);
                 assert!(table.take_key_derivation(source, now));
-                assert!(table.key_derivations_due_by_source.len() <= 2 * RATE as usize + 1);
+                assert!(table.key_derivations_due_by_source.len() <= 4 * RATE as usize);
             }
         }
+    }
+
+    /// A derivation the table refuses spends nothing of the source's share:
+    /// refused twice while the table is empty, the source still takes the
+    /// first token the table refills.
+    #[test]
+    fn a_table_refusal_spends_nothing_of_the_source_share() {
+        let mut table = PeerTable::with_config(PeerTableConfig {
+            max_key_derivations_per_second: 4,
+            max_key_derivations_per_source_per_second: 2,
+            ..PeerTableConfig::default()
+        });
+        let start = Timestamp::from_micros(1_000_000);
+        let source = |host: u8| std::net::IpAddr::from([10, 0, 0, host]);
+        for host in 1..=4 {
+            assert!(table.take_key_derivation(source(host), start));
+        }
+        assert!(!table.take_key_derivation(source(9), start));
+        assert!(!table.take_key_derivation(source(9), start));
+        // One table token back after 1 s / 4.
+        assert!(table.take_key_derivation(source(9), start.add_micros(250_000)));
+    }
+
+    /// Per-source limits charge an IPv6 host's whole /64, not each address
+    /// it can pick, and an IPv4 peer the same whether a dual-stack socket
+    /// reports it as IPv4 or IPv4-mapped.
+    #[test]
+    fn per_source_limits_charge_an_ipv6_slash_64_and_a_mapped_ipv4_as_itself() {
+        let mut table = PeerTable::with_config(PeerTableConfig {
+            max_peers_per_ip: 1,
+            ..PeerTableConfig::default()
+        });
+        let telemetry = IngressTelemetry::new();
+        let options = default_options();
+        let now = Timestamp::from_micros(1_000_000);
+        let at =
+            |address: &str| std::net::SocketAddr::new(address.parse().expect("address"), 30_001);
+        let mut socket_id = 0;
+        let mut admit = |table: &mut PeerTable, address| {
+            socket_id += 1;
+            let mut caller = SrtConnection::new_caller(ConnectionOptions {
+                socket_id,
+                ..ConnectionOptions::default()
+            });
+            caller.connect(now).expect("start caller");
+            table.admit(
+                at(address),
+                &next_packet(&mut caller),
+                now,
+                &options,
+                0,
+                1,
+                &telemetry,
+            )
+        };
+        let source_drop = Admit::Dropped(AdmissionDropReason::SourceCapacity);
+        assert_eq!(admit(&mut table, "2001:db8:1:2::1"), Admit::Fed);
+        assert_eq!(admit(&mut table, "2001:db8:1:2:ffff::9"), source_drop);
+        assert_eq!(admit(&mut table, "2001:db8:1:3::1"), Admit::Fed);
+        assert_eq!(admit(&mut table, "192.0.2.7"), Admit::Fed);
+        assert_eq!(admit(&mut table, "::ffff:192.0.2.7"), source_drop);
+        assert_eq!(admit(&mut table, "::ffff:192.0.2.8"), Admit::Fed);
+        // Retiring the /64's peer returns its share to the whole /64.
+        let retiring = table
+            .physical_for_address(at("2001:db8:1:2::1"))
+            .expect("half-open peer");
+        assert!(table.remove_direct(retiring).is_some());
+        assert_eq!(admit(&mut table, "2001:db8:1:2:ffff::9"), Admit::Fed);
+
+        // The key-derivation share is keyed the same way.
+        let mut table = PeerTable::with_config(PeerTableConfig {
+            max_key_derivations_per_source_per_second: 1,
+            ..PeerTableConfig::default()
+        });
+        let encrypted = encrypted_listener_options();
+        let conclude = |table: &mut PeerTable, address| {
+            conclude_as(
+                table,
+                at(address),
+                Some("listener-secret"),
+                &encrypted,
+                &telemetry,
+                now,
+            )
+            .0
+        };
+        assert_eq!(conclude(&mut table, "2001:db8:1:2::1"), Admit::Fed);
+        assert_eq!(
+            conclude(&mut table, "2001:db8:1:2::2"),
+            Admit::Dropped(AdmissionDropReason::KeyDerivationBudget)
+        );
     }
 
     fn insert_test_peer(
