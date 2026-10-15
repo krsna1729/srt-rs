@@ -360,3 +360,63 @@ fn undrained_faults_are_reclaimed_with_their_caller_under_churn() {
     );
     assert!(callers.is_empty());
 }
+
+/// The group's counters separate the logical payload an application sends from
+/// the physical packets its legs put on the wire. A Broadcast send over two
+/// active legs is one logical payload and two physical packets, and a second
+/// send advances both by exactly their own step: no leg double-counts the
+/// logical side, and no packet is invented or lost in the aggregation.
+#[test]
+fn the_aggregate_separates_logical_payloads_from_wire_packets() {
+    let (a, b) = (addr(12001), addr(12002));
+    let mut callers = CallerTable::with_max_callers(2);
+    let id = add_two_legs(&mut callers, a, b, GroupMode::Broadcast);
+    let mut receivers = [Receiver::new(0x7001)];
+    pump(&mut callers, &mut receivers, &[(a, 0), (b, 0)], 0..12);
+    assert_eq!(
+        group_of(&callers, id).aggregate.active_legs,
+        2,
+        "both legs carry"
+    );
+
+    let payload = b"one logical payload";
+    let sent = |callers: &mut CallerTable, now: u64| {
+        callers
+            .logical_caller_mut(&id)
+            .expect("logical caller")
+            .send(payload, Timestamp::from_micros(now))
+            .expect("send admits the payload")
+    };
+    assert_eq!(
+        sent(&mut callers, 700_000),
+        2,
+        "Broadcast sends on both legs"
+    );
+    pump(&mut callers, &mut receivers, &[(a, 0), (b, 0)], 14..18);
+
+    let stats = group_of(&callers, id).aggregate;
+    assert_eq!(stats.logical_payloads_sent, 1, "one logical payload");
+    assert_eq!(stats.logical_payload_bytes_sent, payload.len() as u64);
+    assert_eq!(
+        stats.wire_packets_retransmitted, 0,
+        "nothing is retransmitted, so the wire counts are the originals"
+    );
+    assert_eq!(stats.wire_packets_sent, 2, "one physical packet per leg");
+    assert_eq!(stats.wire_payload_bytes_sent, 2 * payload.len() as u64);
+
+    assert_eq!(sent(&mut callers, 800_000), 2);
+    pump(&mut callers, &mut receivers, &[(a, 0), (b, 0)], 18..22);
+
+    let stats = group_of(&callers, id).aggregate;
+    assert_eq!(
+        stats.logical_payloads_sent, 2,
+        "the logical side advances once"
+    );
+    assert_eq!(stats.logical_payload_bytes_sent, 2 * payload.len() as u64);
+    assert_eq!(
+        stats.wire_packets_retransmitted, 0,
+        "nothing is retransmitted, so the wire counts are the originals"
+    );
+    assert_eq!(stats.wire_packets_sent, 4, "the wire side advances per leg");
+    assert_eq!(stats.wire_payload_bytes_sent, 4 * payload.len() as u64);
+}
