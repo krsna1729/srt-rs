@@ -193,9 +193,8 @@ impl Conn {
 /// Duplicate `fd` for the poll path.
 ///
 /// Close-on-exec is the point of the helper: a duplicate without FD_CLOEXEC is
-/// inherited by every child process spawned after the socket is built (an
-/// FFmpeg transcode child, for example), which keeps the socket open for the
-/// child's lifetime.
+/// inherited by every child process the embedding application spawns after the
+/// socket is built, which keeps the socket open for the child's lifetime.
 fn dup_cloexec(fd: std::os::fd::RawFd) -> io::Result<std::os::fd::RawFd> {
     // SAFETY: `fcntl(F_DUPFD_CLOEXEC)` takes no pointers; `fd` is only borrowed
     // for the call.
@@ -220,27 +219,41 @@ fn make_poll_fd(
 
 #[cfg(test)]
 mod poll_fd_dup_tests {
-    use super::dup_cloexec;
-    use std::os::fd::{AsRawFd, FromRawFd};
+    use super::make_poll_fd;
+    use std::os::fd::AsRawFd;
 
+    /// The poll path must hand `PollFd` a close-on-exec duplicate. The test
+    /// calls `make_poll_fd` rather than the helper: a regression at the call
+    /// site (raw `dup`) has to fail here too.
     #[test]
     fn poll_fd_duplicate_is_close_on_exec() {
-        let sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind a probe socket");
-        let duplicate = dup_cloexec(sock.as_raw_fd()).expect("duplicate the socket");
-        // SAFETY: the duplicate is owned here and closed when the test ends.
-        let duplicate = unsafe { std::net::UdpSocket::from_raw_fd(duplicate) };
-        // SAFETY: fcntl(F_GETFD) takes no pointers.
-        let flags = unsafe { libc::fcntl(duplicate.as_raw_fd(), libc::F_GETFD) };
-        assert!(
-            flags >= 0,
-            "F_GETFD failed: {}",
-            std::io::Error::last_os_error()
-        );
-        assert_ne!(
-            flags & libc::FD_CLOEXEC,
-            0,
-            "a poll-path duplicate without FD_CLOEXEC is inherited by every child spawned later"
-        );
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            let sock = compio::net::UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("bind a probe socket");
+            let poll_fd = make_poll_fd(&sock).expect("duplicate the socket");
+            // A helper that returned the socket itself would pass the flag
+            // assertion (std sockets are already close-on-exec) and double-close
+            // on drop, so the duplicate must be a distinct descriptor.
+            assert_ne!(
+                poll_fd.as_raw_fd(),
+                sock.as_raw_fd(),
+                "the poll-path descriptor must be a duplicate, not the socket itself"
+            );
+            // SAFETY: fcntl(F_GETFD) takes no pointers.
+            let flags = unsafe { libc::fcntl(poll_fd.as_raw_fd(), libc::F_GETFD) };
+            assert!(
+                flags >= 0,
+                "F_GETFD failed: {}",
+                std::io::Error::last_os_error()
+            );
+            assert_ne!(
+                flags & libc::FD_CLOEXEC,
+                0,
+                "a poll-path duplicate without FD_CLOEXEC is inherited by every child spawned later"
+            );
+        });
     }
 }
 
