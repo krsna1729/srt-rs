@@ -522,6 +522,93 @@ fn backup_backpressure_promotes_a_standby_leg() {
     assert_eq!(group.member(2).unwrap().state(), GroupMemberState::Active);
 }
 
+/// The sequence number of the last DATA packet a connection produced, ignoring
+/// control traffic, so a send assertion does not depend on output ordering.
+fn last_data_sequence(connection: &mut SrtConnection) -> u32 {
+    packets_from(connection)
+        .into_iter()
+        .filter_map(|packet| match SrtPacket::decode(&packet) {
+            Ok(SrtPacket::Data(data)) => Some(data.sequence_number),
+            _ => None,
+        })
+        .last()
+        .expect("a data packet")
+}
+
+/// Under Backup, a leg that stalls and later recovers is re-eligible as the
+/// standby, never as a second active leg: the promoted leg keeps the authority
+/// and stays the only leg a send uses, continuing the group cursor.
+#[test]
+fn backup_requalification_returns_a_recovered_leg_to_standby() {
+    let constrained = ConnectionOptions {
+        flow_window_packets: 3,
+        ..Default::default()
+    };
+    let (caller_a, mut listener_a) = establish_pair_with_options(constrained);
+    let (caller_b, _) = establish_pair();
+    let mut group = SrtGroup::new(0x4000_0017, GroupMode::Backup).unwrap();
+    group.add_member(1, 100, caller_a).unwrap();
+    group.add_member(2, 1, caller_b).unwrap();
+    assert_eq!(group.member(1).unwrap().state(), GroupMemberState::Active);
+    assert_eq!(group.member(2).unwrap().state(), GroupMemberState::Standby);
+
+    // Fill the active leg's sender window, so it cannot accept another payload.
+    let mut stalled_packets = Vec::new();
+    while group.member(1).unwrap().connection().can_send() {
+        assert_eq!(group.send(b"fill", ts(100_000)).unwrap(), 1);
+        stalled_packets.extend(packets_from(group.member_mut(1).unwrap().connection_mut()));
+    }
+    let cursor = group
+        .member(1)
+        .unwrap()
+        .connection()
+        .next_sequence_number()
+        .expect("a connected leg holds a sequence cursor");
+
+    assert_eq!(group.send(b"fail over", ts(101_000)).unwrap(), 1);
+    assert_eq!(group.member(1).unwrap().state(), GroupMemberState::Unstable);
+    assert_eq!(group.member(2).unwrap().state(), GroupMemberState::Active);
+    assert_eq!(
+        last_data_sequence(group.member_mut(2).unwrap().connection_mut()),
+        cursor,
+        "the promoted leg continues the cursor the stalled leg could not send"
+    );
+
+    for packet in stalled_packets {
+        listener_a.feed_recv_buf(&packet, ts(102_000)).unwrap();
+        while listener_a.poll_event().is_some() {}
+    }
+    listener_a.handle_timer(TimerId::Ack, ts(112_000)).unwrap();
+    transfer(
+        &mut listener_a,
+        group.member_mut(1).unwrap().connection_mut(),
+        ts(112_000),
+    );
+
+    // A state refresh is where a recovered leg is re-qualified.
+    assert!(group.can_send());
+    assert_eq!(
+        group.member(1).unwrap().state(),
+        GroupMemberState::Standby,
+        "a recovered leg is eligible again, not authoritative"
+    );
+    assert_eq!(group.member(2).unwrap().state(), GroupMemberState::Active);
+    assert_eq!(group.send(b"still backup", ts(113_000)).unwrap(), 1);
+    assert_eq!(
+        last_data_sequence(group.member_mut(2).unwrap().connection_mut()),
+        cursor.wrapping_add(1) & 0x7fff_ffff,
+        "the promoted leg keeps sending"
+    );
+    let stolen: Vec<u32> = packets_from(group.member_mut(1).unwrap().connection_mut())
+        .into_iter()
+        .filter_map(|packet| match SrtPacket::decode(&packet) {
+            Ok(SrtPacket::Data(data)) => Some(data.sequence_number),
+            _ => None,
+        })
+        .collect();
+    assert!(stolen.is_empty(), "no second leg carries: {stolen:?}");
+}
+
 #[test]
 fn backup_delivers_standby_payload_arriving_with_active_shutdown() {
     let (mut caller_a, listener_a) = establish_pair();
