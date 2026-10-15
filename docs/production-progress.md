@@ -561,9 +561,9 @@ term. It states plainly that no single byte budget spans the three layers, and
 that multi-Owner totals multiply by prepared Owners and listener tables. No new
 limit is introduced beyond the enforced per-packet payload length.
 
-The envelope names a magnitude the enforcement does not cover: on the
-zero-copy receive path (`feed_recv_bytes` and the listener table's
-`feed_recv_buffer`), a retained payload is a frozen `Bytes` slice of a
+The envelope names a magnitude the enforcement does not cover: on the zero-copy
+receive path (`feed_recv_bytes`, reached from `feed_established_direct_bytes` in
+the listener table), a retained payload is a frozen `Bytes` slice of a
 `BytesRecvBatch` chunk of `DEFAULT_CHUNK_SLOTS * slot_len`, 128 * 2,048 = 256 KiB,
 so one retained packet pins its whole chunk, about 177 times its 1,484-byte
 reservation charge when a peer interleaves discarded datagrams. That gap stays
