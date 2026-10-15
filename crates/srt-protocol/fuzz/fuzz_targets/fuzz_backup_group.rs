@@ -125,9 +125,10 @@ fuzz_target!(|data: &[u8]| {
             }
         }
         let delivered = receiver.poll_data(now);
-        assert_eq!(
-            delivered.as_ref().map(|packet| packet.payload.as_ref()),
-            Some(chunk),
+        assert!(
+            delivered
+                .as_ref()
+                .is_some_and(|packet| packet.payload.eq(chunk)),
             "payload the sender group transmitted must reach the receiver group"
         );
     }

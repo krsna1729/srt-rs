@@ -406,4 +406,7 @@ workspace all-target/all-feature compilation and protocol/transport/bench Clippy
 with warnings denied pass. The custom complexity report card passes without a
 raised limit. The managed `tokio_facade_echo` executable also completed real UDP
 delivery, orderly close and driver shutdown.
+The excluded fuzz workspace also builds all targets with the segmented API;
+`fuzz_backup_group` executed a fixed 33-byte input successfully. This was a
+targeted oracle smoke, not a fuzz campaign.
 
