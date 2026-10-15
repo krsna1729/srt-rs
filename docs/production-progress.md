@@ -410,3 +410,34 @@ The excluded fuzz workspace also builds all targets with the segmented API;
 `fuzz_backup_group` executed a fixed 33-byte input successfully. This was a
 targeted oracle smoke, not a fuzz campaign.
 
+
+## Key-derivation admission scope verified, and the remaining gap named (2026-10-15)
+
+The earlier review asked for evidence of Owner-, process- or source-level PBKDF2
+admission and for the exact listener call path before calling it an exploit
+surface. On this revision the shared-listener path is gated: the derivation is
+charged once per encrypted CONCLUSION, only for a half-open peer whose cookie
+matches, and only before policy and protocol work, through a GCRA pair
+(`max_key_derivations_per_second` 128, `max_key_derivations_per_source_per_second`
+8, source key an IPv4 address or an IPv6 /64) whose refusals are dropped without a
+rejection and counted in `key_derivation_drops`. `configure_listener_crypto`
+reaches `derive_kek` (PBKDF2-HMAC-SHA1, 2,048 iterations) at most once per
+handshake generation: repeated CONCLUSIONS after success retransmit, a failed key
+negotiation is terminal for that connection, handshake timers retransmit saved
+packets, and runtime KMREQ/SEK updates unwrap with the existing KEK instead of
+deriving. A bonded publisher costs one derivation per physical leg. PR #151's
+recorded cost, 190 us for AES-128 and 383 us for AES-192/256, puts one table's
+sustained allowance at about 2.4% or 4.9% of one core, with a full burst at
+24-49 ms.
+
+Remaining gap, named rather than limited: the bucket is per `PeerTable`, and
+tables are created per prepared Owner, listener member and process, so the
+process-wide allowance is `128 x tables` derivations per second and no
+process- or host-global limiter exists; per-source fairness is table-local, so one
+source keeps its share in every table it can reach. Admission work other than key
+derivation (decode, routing, INDUCTION, unencrypted CONCLUSION policy) is bounded
+per visit by the owner service budget but not by this rate. The cookie gates
+derivation but is not a cryptographic anti-spoof boundary by its own
+documentation. `docs/listener-admission-policy.md` now states the scope,
+multiplication, refusal behaviour and the non-derivation gap where operators
+tune it.
