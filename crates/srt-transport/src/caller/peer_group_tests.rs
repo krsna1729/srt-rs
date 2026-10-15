@@ -413,6 +413,10 @@ fn the_aggregate_separates_logical_payloads_from_wire_packets() {
         "the logical side advances once"
     );
     assert_eq!(stats.logical_payload_bytes_sent, 2 * payload.len() as u64);
+    assert_eq!(
+        stats.wire_packets_retransmitted, 0,
+        "nothing is retransmitted, so the wire counts are the originals"
+    );
     assert_eq!(stats.wire_packets_sent, 4, "the wire side advances per leg");
     assert_eq!(stats.wire_payload_bytes_sent, 4 * payload.len() as u64);
 }
