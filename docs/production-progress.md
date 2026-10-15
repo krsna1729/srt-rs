@@ -622,8 +622,8 @@ execution and admission-map pruning bounded only by the configured derivation ra
 reaping with `usize::MAX` before joining lanes (`srt_connection.rs`, `compio.rs`).
 Each site is a candidate for a budget or continuation; none of them is claimed
 bounded by this change. Bitmap range mutation is not on this list: `insert_range`
-and `remove_range` are word-budgeted by the loss-walk change in
-`feat/receiver-loss-walk-budget` at `MAX_FLOW_WINDOW / 64 + 1` visits. The
-regression here calls `charge_rx_batch` at the drain and promoted call sites; it
-pins the accounting, not the surrounding loop, so a drain-level test with a
-truncated-datagram flood remains open.
+and `remove_range` are word-budgeted by the loss-walk change in #161 at
+`MAX_FLOW_WINDOW / 64 + 1` visits. The regression calls `charge_rx_batch`
+directly; the drain and promoted call sites use it, and it pins the accounting,
+not the surrounding loop, so a drain-level test with a truncated-datagram flood
+remains open.
