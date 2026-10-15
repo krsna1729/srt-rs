@@ -28,7 +28,7 @@ fn test_options() -> ConnectionOptions {
 const CALLER_SOCKET_ID: u32 = 0x1111;
 const LISTENER_SOCKET_ID: u32 = 0x2222;
 
-/// The group's DATA sequence space, which wraps rather than overflowing.
+/// The 31-bit DATA sequence space, which wraps rather than overflowing.
 const SEQUENCE_MASK: u32 = 0x7fff_ffff;
 
 /// Payloads each side sends before a replay, so the admitted sequence space and
@@ -405,6 +405,9 @@ fn a_tampered_conclusion_is_refused_after_admission() {
     assert_eq!(connected_events(&mut established.caller), 1);
     drain_events(&mut established.caller);
 
+    // Drain whatever the connection queued on completion, so the refusal's own
+    // silence is what the last assertion reads.
+    let _ = packets_from(&mut established.caller);
     let tampered = retampered(&established.conclusion_response);
     let refused = established
         .caller
