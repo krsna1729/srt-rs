@@ -922,6 +922,21 @@ impl Owner {
         self.caller.as_mut()?.callers.remove(id)
     }
 
+    /// Unroute a peer immediately; `drive` reclaims its retained storage within
+    /// the existing action budget and retains admission credit until completion.
+    pub fn retire_listener_peer(&mut self, id: crate::LogicalPeerId) -> bool {
+        self.listener
+            .as_mut()
+            .is_some_and(|side| side.peers.retire(id))
+    }
+
+    /// Unroute a caller without synchronously freeing its whole protocol window.
+    pub fn retire_caller(&mut self, id: crate::LogicalCallerId) -> bool {
+        self.caller
+            .as_mut()
+            .is_some_and(|side| side.callers.retire(id))
+    }
+
     /// The listener socket's bound local address, once [`Self::listen`] has
     /// been called -- useful when binding an ephemeral port (`:0`).
     #[must_use]
@@ -972,7 +987,7 @@ impl Owner {
 /// to the caller-visible `0`) -- split out to keep the combining function
 /// itself a plain two-branch dispatcher.
 fn listener_time_until_deadline(side: &mut OwnerListenerSide, now: Timestamp) -> Option<u64> {
-    if side.recv_pending || side.event_pending {
+    if side.recv_pending || side.event_pending || side.peers.retirements_pending() != 0 {
         return None;
     }
     let mut wait = side
@@ -993,7 +1008,7 @@ fn listener_time_until_deadline(side: &mut OwnerListenerSide, now: Timestamp) ->
 /// attempt deadlines with the underlying table's protocol timers, unlike
 /// the listener side's genuinely separate idle/protocol indexes.
 fn caller_time_until_deadline(side: &mut OwnerCallerSide, now: Timestamp) -> Option<u64> {
-    if side.recv_pending || side.event_pending {
+    if side.recv_pending || side.event_pending || side.callers.table().retirements_pending() != 0 {
         return None;
     }
     let wait = side.callers.time_until_next_deadline(now, u64::MAX);
@@ -1143,6 +1158,9 @@ fn drive_listener_side(
     let before_len = side.outbound.len();
     let before_bytes: usize = side.outbound.iter().map(|(_, packet)| packet.len()).sum();
     let side_budget = remaining.intersect(side.transport.output_drain);
+    let reclaimed = side.peers.reclaim_retired(side_budget.max_actions);
+    remaining.consume(reclaimed, 0, 0);
+    let side_budget = remaining.intersect(side.transport.output_drain);
     let (_, maintenance_visits) =
         side.peers
             .prune_idle_bounded_with_visits(now, side.idle_timeout, side_budget.max_actions);
@@ -1188,6 +1206,9 @@ fn drive_caller_side(
     let was_empty = side.outbound.is_empty();
     let before_len = side.outbound.len();
     let before_bytes: usize = side.outbound.iter().map(|(_, packet)| packet.len()).sum();
+    let side_budget = remaining.intersect(side.transport.output_drain);
+    let reclaimed = side.callers.reclaim_retired(side_budget.max_actions);
+    remaining.consume(reclaimed, 0, 0);
     let side_budget = remaining.intersect(side.transport.output_drain);
     let (_, maintenance_visits) = side
         .callers
@@ -1391,7 +1412,13 @@ mod owner_tests {
                 if event.logical_peer == peer_id
                     && let ConnectionEvent::DataReceived { payload, .. } = event.event
                 {
-                    received = Some(payload.to_vec());
+                    received = Some(payload.chunks().fold(
+                        Vec::with_capacity(payload.len()),
+                        |mut message, chunk| {
+                            message.extend_from_slice(chunk);
+                            message
+                        },
+                    ));
                 }
             }
             received.is_some()
@@ -1506,7 +1533,7 @@ mod owner_tests {
             owner.poll_listener_events(&mut events);
             for event in events {
                 if let ConnectionEvent::DataReceived { payload, .. } = event.event
-                    && payload.as_ref() == b"still working"
+                    && payload.eq(&b"still working"[..])
                 {
                     received_from.insert(event.logical_peer);
                 }
@@ -1953,7 +1980,7 @@ mod owner_tests {
                 match event.event {
                     ConnectionEvent::Connected => peer = Some(event.logical_peer),
                     ConnectionEvent::DataReceived { payload, .. } => {
-                        got = payload.as_ref() == b"resolved";
+                        got = payload.eq(&b"resolved"[..]);
                     }
                     _ => {}
                 }

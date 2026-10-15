@@ -1237,10 +1237,11 @@ fn extract_received_data(events: &[ConnectionEvent]) -> Vec<u8> {
     events
         .iter()
         .filter_map(|e| match e {
-            ConnectionEvent::DataReceived { payload, .. } => Some(payload.clone()),
+            ConnectionEvent::DataReceived { payload, .. } => Some(payload),
             _ => None,
         })
-        .flatten()
+        .flat_map(|payload| payload.chunks())
+        .flat_map(|chunk| chunk.iter().copied())
         .collect()
 }
 

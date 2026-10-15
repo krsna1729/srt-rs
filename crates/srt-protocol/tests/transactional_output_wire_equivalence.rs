@@ -210,8 +210,8 @@ fn wire_equivalence_plaintext() {
                 ..
             },
         ) => {
-            assert_eq!(p_a.as_ref(), payload);
-            assert_eq!(p_b.as_ref(), payload);
+            assert!(p_a.eq(&payload[..]));
+            assert!(p_b.eq(&payload[..]));
             assert_eq!(seq_a, seq_b);
         }
         other => panic!("unexpected events: {other:?}"),
@@ -278,7 +278,7 @@ fn wire_equivalence_ctr_modes() {
             ..
         } = event
         {
-            assert_eq!(recv_payload, payload);
+            assert!(recv_payload.eq(payload.as_ref()));
         } else {
             panic!("unexpected event: {event:?}");
         }
@@ -342,7 +342,7 @@ fn wire_equivalence_gcm_modes() {
             ..
         } = event
         {
-            assert_eq!(recv_payload, payload);
+            assert!(recv_payload.eq(payload.as_ref()));
         } else {
             panic!("unexpected event: {event:?}");
         }
@@ -510,7 +510,7 @@ fn wire_equivalence_key_rotation() {
         match event {
             ConnectionEvent::DataReceived { payload, .. } => {
                 let expected = format!("key-rotation-data-{i}");
-                assert_eq!(payload.as_ref(), expected.as_bytes());
+                assert!(payload.eq(expected.as_bytes()));
             }
             other => panic!("unexpected event: {other:?}"),
         }
@@ -645,7 +645,7 @@ fn old_key_datagram_materializes_across_switch_and_mass_new_key_admissions() {
     let event = listener.poll_event().expect("held packet delivers");
     match event {
         ConnectionEvent::DataReceived { payload, .. } => {
-            assert_eq!(payload.as_ref(), b"old-key-held-packet");
+            assert!(payload.eq(&b"old-key-held-packet"[..]));
         }
         other => panic!("unexpected event: {other:?}"),
     }

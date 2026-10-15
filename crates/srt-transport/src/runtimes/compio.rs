@@ -4295,22 +4295,39 @@ impl Owner {
 
     /// Drain admitted-peer lifecycle/data events for the application.
     pub fn poll_listener_events(&mut self, out: &mut Vec<crate::AdmissionEvent>) {
+        self.poll_listener_events_bounded(crate::OutputDrainBudget::default().max_actions, out);
+    }
+
+    /// Drain no more than the application's available event slots.
+    /// Zero consumes nothing, allowing local chunk-processing backpressure.
+    pub fn poll_listener_events_bounded(
+        &mut self,
+        max_events: usize,
+        out: &mut Vec<crate::AdmissionEvent>,
+    ) {
         out.clear();
         let Some(side) = self.listener.as_mut() else {
             return;
         };
-        side.table
-            .poll_events_bounded(crate::OutputDrainBudget::default().max_actions, out);
+        side.table.poll_events_bounded(max_events, out);
     }
 
     /// Drain protocol events for every direct outbound session.
     pub fn poll_caller_events(&mut self, out: &mut Vec<crate::CallerEvent>) {
+        self.poll_caller_events_bounded(crate::OutputDrainBudget::default().max_actions, out);
+    }
+
+    /// Bound application event ownership by its currently available slots.
+    pub fn poll_caller_events_bounded(
+        &mut self,
+        max_events: usize,
+        out: &mut Vec<crate::CallerEvent>,
+    ) {
         out.clear();
         let Some(side) = self.caller.as_mut() else {
             return;
         };
-        side.pool
-            .poll_events_bounded(crate::OutputDrainBudget::default().max_actions, out);
+        side.pool.poll_events_bounded(max_events, out);
     }
 
     /// Drain bounded caller-pool lifecycle outcomes.
@@ -4346,6 +4363,21 @@ impl Owner {
         id: crate::LogicalCallerId,
     ) -> Option<crate::RemovedLogicalCaller> {
         self.caller.as_mut()?.pool.remove(id)
+    }
+
+    /// Immediately unroute an admitted peer; reclaim retained storage through
+    /// subsequent maintenance-budgeted service visits on this Owner.
+    pub fn retire_listener_peer(&mut self, id: crate::LogicalPeerId) -> bool {
+        self.listener
+            .as_mut()
+            .is_some_and(|side| side.table.retire(id))
+    }
+
+    /// Immediately unroute an outbound session without freeing its whole window.
+    pub fn retire_caller(&mut self, id: crate::LogicalCallerId) -> bool {
+        self.caller
+            .as_mut()
+            .is_some_and(|side| side.pool.retire(id))
     }
 
     /// Borrow one logical caller without exposing the pool itself.
@@ -4445,6 +4477,9 @@ impl Owner {
     /// `CallerPool` attempt deadlines (not just protocol timers).
     pub fn time_until_next_deadline(&mut self, now: Timestamp, default_us: u64) -> u64 {
         let l_us = self.listener.as_mut().map_or(default_us, |l| {
+            if l.table.retirements_pending() != 0 {
+                return 0;
+            }
             let idle_us = l
                 .table
                 .time_until_idle_deadline(now, l.idle_timeout, default_us);
@@ -4452,6 +4487,9 @@ impl Owner {
             idle_us.min(proto_us)
         });
         let c_us = self.caller.as_ref().map_or(default_us, |c| {
+            if c.pool.table().retirements_pending() != 0 {
+                return 0;
+            }
             c.pool.time_until_next_deadline(now, default_us)
         });
         l_us.min(c_us)
@@ -5137,16 +5175,23 @@ impl Owner {
     /// allocates nothing.
     fn maintain_caller(&mut self, now: Timestamp, allowed: usize) -> usize {
         self.caller.as_mut().map_or(0, |caller| {
-            caller.pool.maintain(now, allowed, None).actions()
+            let reclaimed = caller.pool.reclaim_retired(allowed);
+            reclaimed
+                + caller
+                    .pool
+                    .maintain(now, allowed - reclaimed, None)
+                    .actions()
         })
     }
 
     fn maintain_listener(&mut self, now: Timestamp, allowed: usize) -> usize {
         self.listener.as_mut().map_or(0, |listener| {
-            listener
-                .table
-                .prune_idle_bounded_with_visits(now, listener.idle_timeout, allowed)
-                .1
+            let reclaimed = listener.table.reclaim_retired(allowed);
+            reclaimed
+                + listener
+                    .table
+                    .prune_idle_bounded_with_visits(now, listener.idle_timeout, allowed - reclaimed)
+                    .1
         })
     }
 
@@ -5258,12 +5303,14 @@ impl Owner {
                 || l.rx.pending()
                 || (tx_ready && l.table.has_pending_output(now))
                 || l.table.has_idle_due(now, l.idle_timeout)
+                || l.table.retirements_pending() != 0
         });
         let c_pending = self.caller.as_ref().is_some_and(|c| {
             c.pending_rx.is_some()
                 || c.rx.pending()
                 || (tx_ready && c.pool.table().has_pending_output(now))
                 || c.pool.has_pending_work(now)
+                || c.pool.table().retirements_pending() != 0
         });
         l_pending || c_pending
     }
@@ -5814,7 +5861,7 @@ mod tests {
                 owner.poll_listener_events(&mut events);
                 let received = events.iter().any(|e| match &e.event {
                     srt_proto::ConnectionEvent::DataReceived { payload, .. } => {
-                        payload == &test_payload
+                        payload.eq(&test_payload[..])
                     }
                     _ => false,
                 });

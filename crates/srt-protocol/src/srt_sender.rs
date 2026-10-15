@@ -829,6 +829,21 @@ impl SenderBuffer {
         self.packets.is_empty()
     }
 
+    /// Only used after the owning connection has relinquished protocol authority.
+    pub(crate) fn reclaim_terminal(&mut self, max_packets: usize) -> (usize, bool) {
+        let mut released = 0;
+        while released < max_packets && self.pending_naks.pop_front().is_some() {
+            released += 1;
+        }
+        released += self.packets.clear_bounded(max_packets - released);
+        (
+            released,
+            self.pending_naks.is_empty()
+                && self.packets.is_empty()
+                && self.packets.retired_pages() == 0,
+        )
+    }
+
     /// Whether there are packets needing retransmission.
     pub fn has_retransmit(&self) -> bool {
         self.packets.has_retransmit_queued()

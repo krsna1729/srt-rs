@@ -1,9 +1,9 @@
 use crate::Timestamp;
+use crate::received_payload::{PayloadPages, PayloadRetirement, ReceivedPayload};
 use crate::srt_packet::{DataPacket, PacketPosition, sequence_less_than};
-use bytes::Bytes;
 
 pub(crate) struct AssembledMessage {
-    pub payload: Bytes,
+    pub payload: ReceivedPayload,
     pub message_number: u32,
     pub timestamp: u32,
     /// F01: the first fragment's source time (see
@@ -18,18 +18,24 @@ struct PartialMessage {
     message_number: u32,
     first_sequence_number: u32,
     next_expected_seq: u32,
-    fragments: Vec<Bytes>,
+    fragments: PayloadPages,
     timestamp: u32,
     source_time: Timestamp,
 }
 
 pub(crate) struct MessageAssembler {
     pending: Option<PartialMessage>,
+    retired: std::collections::VecDeque<PayloadRetirement>,
+    retired_packets: u32,
 }
 
 impl MessageAssembler {
     pub fn new() -> Self {
-        Self { pending: None }
+        Self {
+            pending: None,
+            retired: std::collections::VecDeque::new(),
+            retired_packets: 0,
+        }
     }
 
     /// `source_time` is this specific packet's own source time (F01),
@@ -39,23 +45,26 @@ impl MessageAssembler {
     pub fn feed(&mut self, packet: DataPacket, source_time: Timestamp) -> Option<AssembledMessage> {
         match packet.position {
             PacketPosition::Single => {
-                self.pending = None;
+                self.discard_pending();
                 Some(AssembledMessage {
                     first_sequence_number: packet.sequence_number,
                     message_number: packet.message_number,
                     timestamp: packet.timestamp,
                     source_time,
-                    payload: packet.payload,
+                    payload: packet.payload.into(),
                     packet_count: 1,
                 })
             }
             PacketPosition::First => {
+                self.discard_pending();
                 let next_seq = packet.sequence_number.wrapping_add(1) & 0x7FFF_FFFF;
+                let mut fragments = PayloadPages::default();
+                fragments.push(packet.payload);
                 self.pending = Some(PartialMessage {
                     message_number: packet.message_number,
                     first_sequence_number: packet.sequence_number,
                     next_expected_seq: next_seq,
-                    fragments: vec![packet.payload],
+                    fragments,
                     timestamp: packet.timestamp,
                     source_time,
                 });
@@ -73,7 +82,7 @@ impl MessageAssembler {
                         packet.sequence_number.wrapping_add(1) & 0x7FFF_FFFF;
                     None
                 } else {
-                    self.pending = None;
+                    self.discard_pending();
                     None
                 }
             }
@@ -85,18 +94,9 @@ impl MessageAssembler {
                 if matched {
                     let mut partial = self.pending.take().unwrap();
                     partial.fragments.push(packet.payload);
-                    let total_len: usize = partial
-                        .fragments
-                        .iter()
-                        .map(|fragment| fragment.len())
-                        .sum();
-                    let packet_count = partial.fragments.len() as u32;
-                    let mut payload = Vec::with_capacity(total_len);
-                    for fragment in partial.fragments {
-                        payload.extend_from_slice(&fragment);
-                    }
+                    let packet_count = partial.fragments.chunk_count() as u32;
                     Some(AssembledMessage {
-                        payload: payload.into(),
+                        payload: partial.fragments.finish(),
                         message_number: partial.message_number,
                         timestamp: partial.timestamp,
                         source_time: partial.source_time,
@@ -104,7 +104,7 @@ impl MessageAssembler {
                         packet_count,
                     })
                 } else {
-                    self.pending = None;
+                    self.discard_pending();
                     None
                 }
             }
@@ -117,22 +117,55 @@ impl MessageAssembler {
             .as_ref()
             .is_some_and(|p| p.message_number == message_number)
         {
-            self.pending = None;
+            self.discard_pending();
         }
     }
 
     pub fn pending_packet_count(&self) -> u32 {
-        self.pending
-            .as_ref()
-            .map_or(0, |partial| partial.fragments.len() as u32)
+        self.retired_packets.saturating_add(
+            self.pending
+                .as_ref()
+                .map_or(0, |partial| partial.fragments.chunk_count() as u32),
+        )
     }
 
     pub fn discard_before(&mut self, sequence_number: u32) {
         if self.pending.as_ref().is_some_and(|partial| {
             sequence_less_than(partial.first_sequence_number, sequence_number)
         }) {
-            self.pending = None;
+            self.discard_pending();
         }
+    }
+
+    fn discard_pending(&mut self) {
+        if let Some(partial) = self.pending.take() {
+            self.retired_packets += partial.fragments.chunk_count() as u32;
+            self.retired.push_back(partial.fragments.into_retirement());
+        }
+    }
+
+    pub(crate) fn has_retired(&self) -> bool {
+        !self.retired.is_empty()
+    }
+
+    pub(crate) fn reclaim_retired(&mut self, max_packets: usize) -> usize {
+        let mut released = 0;
+        while released < max_packets {
+            let Some(retired) = self.retired.front_mut() else {
+                break;
+            };
+            let before = retired.remaining_chunks();
+            released += retired.reclaim(max_packets - released);
+            self.retired_packets -= (before - retired.remaining_chunks()) as u32;
+            if retired.is_complete() {
+                self.retired.pop_front();
+            }
+        }
+        released
+    }
+
+    pub(crate) fn begin_retirement(&mut self) {
+        self.discard_pending();
     }
 }
 
@@ -161,7 +194,7 @@ mod tests {
         let msg = asm
             .feed(pkt, Timestamp::from_micros(0))
             .expect("Single should emit immediately");
-        assert_eq!(msg.payload, vec![1, 2, 3]);
+        assert!(msg.payload.eq(&[1, 2, 3][..]));
         assert_eq!(msg.message_number, 0);
         assert_eq!(msg.first_sequence_number, 0);
         assert_eq!(msg.packet_count, 1);
@@ -183,7 +216,7 @@ mod tests {
                 Timestamp::from_micros(0),
             )
             .expect("Last should complete the message");
-        assert_eq!(msg.payload, vec![1, 2, 3, 4]);
+        assert!(msg.payload.eq(&[1, 2, 3, 4][..]));
         assert_eq!(msg.message_number, 5);
         assert_eq!(msg.first_sequence_number, 10);
         assert_eq!(msg.packet_count, 2);
@@ -240,7 +273,7 @@ mod tests {
                 Timestamp::from_micros(0),
             )
             .expect("Last completes");
-        assert_eq!(msg.payload, vec![10, 20, 30]);
+        assert!(msg.payload.eq(&[10, 20, 30][..]));
         assert_eq!(msg.packet_count, 3);
     }
 
@@ -268,7 +301,7 @@ mod tests {
                 Timestamp::from_micros(0),
             )
             .expect("second message completes");
-        assert_eq!(msg.payload, vec![10, 20]);
+        assert!(msg.payload.eq(&[10, 20][..]));
         assert_eq!(msg.message_number, 2);
     }
 
@@ -324,7 +357,7 @@ mod tests {
     }
 
     #[test]
-    fn sequence_advance_discards_only_obsolete_partial_message() {
+    fn obsolete_partial_retains_credit_until_bounded_reclamation() {
         let mut asm = MessageAssembler::new();
         assert!(
             asm.feed(
@@ -338,7 +371,19 @@ mod tests {
         assert_eq!(asm.pending_packet_count(), 1);
 
         asm.discard_before(1);
+        assert_eq!(asm.pending_packet_count(), 1);
+        assert_eq!(asm.reclaim_retired(0), 0);
+        assert_eq!(asm.pending_packet_count(), 1);
+        assert_eq!(asm.reclaim_retired(1), 1);
         assert_eq!(asm.pending_packet_count(), 0);
+        assert!(
+            asm.feed(
+                data_packet(0x7fff_ffff, 7, PacketPosition::Last, vec![2]),
+                Timestamp::from_micros(0),
+            )
+            .is_none(),
+            "discarded partial must not regain delivery authority"
+        );
     }
 
     #[test]
@@ -359,7 +404,7 @@ mod tests {
             )
             .expect("completes");
         assert_eq!(msg.message_number, msg_num);
-        assert_eq!(msg.payload, vec![1, 2]);
+        assert!(msg.payload.eq(&[1, 2][..]));
     }
 
     #[test]
@@ -378,7 +423,7 @@ mod tests {
                 Timestamp::from_micros(0),
             )
             .expect("Single emits");
-        assert_eq!(msg.payload, vec![99]);
+        assert!(msg.payload.eq(&[99][..]));
         assert!(asm.pending.is_none());
     }
 
@@ -428,7 +473,73 @@ mod tests {
                 Timestamp::from_micros(0),
             )
             .expect("completes across wrap");
-        assert_eq!(msg.payload, vec![1, 2, 3]);
+        assert!(msg.payload.eq(&[1, 2, 3][..]));
         assert_eq!(msg.first_sequence_number, max_seq);
+    }
+
+    #[test]
+    #[expect(
+        clippy::cognitive_complexity,
+        reason = "One maximum-size message must combine page boundaries, empty chunks, sequence wrap and source time"
+    )]
+    fn maximum_message_keeps_empty_chunks_order_and_source_time_across_wrap() {
+        let mut asm = MessageAssembler::new();
+        let count = crate::srt_handshake::MAX_FLOW_WINDOW as usize;
+        let first_seq = 0x7fff_8000u32;
+        let first_source = Timestamp::from_micros(123);
+        let mut pointers = Vec::with_capacity(count);
+        for index in 0..count {
+            let position = if index == 0 {
+                PacketPosition::First
+            } else if index == count - 1 {
+                PacketPosition::Last
+            } else {
+                PacketPosition::Middle
+            };
+            let mut packet = data_packet(
+                first_seq.wrapping_add(index as u32) & 0x7fff_ffff,
+                9,
+                position,
+                if index == 64 {
+                    Vec::new()
+                } else {
+                    vec![index as u8]
+                },
+            );
+            packet.timestamp = index as u32 + 1000;
+            pointers.push(packet.payload.as_ptr());
+            let message = asm.feed(
+                packet,
+                if index == 0 {
+                    first_source
+                } else {
+                    Timestamp::from_micros(999)
+                },
+            );
+            if index != count - 1 {
+                assert!(message.is_none());
+                continue;
+            }
+            let message = message.expect("the last fragment completes exactly one message");
+            assert_eq!(message.packet_count, count as u32);
+            assert_eq!(message.first_sequence_number, first_seq);
+            assert_eq!(message.message_number, 9);
+            assert_eq!(message.timestamp, 1000);
+            assert_eq!(message.source_time, first_source);
+            assert_eq!(message.payload.len(), count - 1);
+            assert_eq!(message.payload.chunk_count(), count);
+            for (index, chunk) in message.payload.chunks().enumerate() {
+                assert_eq!(
+                    chunk.as_ptr(),
+                    pointers[index],
+                    "packet data must not be copied"
+                );
+                if index == 64 {
+                    assert!(chunk.is_empty());
+                } else {
+                    assert_eq!(chunk.as_ref(), &[index as u8]);
+                }
+            }
+        }
     }
 }

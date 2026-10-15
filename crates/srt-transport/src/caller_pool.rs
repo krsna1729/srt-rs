@@ -431,7 +431,7 @@ impl CallerPool {
     ) -> Result<PoolOutcome, srt_proto::Error> {
         request.validate()?;
         let request_id = self.allocate_request_id()?;
-        if self.in_flight.len() < self.max_in_flight {
+        if self.has_admission_room() {
             let id = self.admit(request_id, request, now)?;
             self.push_outcome(PoolEvent::Admitted {
                 request_id,
@@ -517,7 +517,7 @@ impl CallerPool {
     /// originally requested).
     fn admit_queued(&mut self, now: Timestamp, max_actions: usize) -> usize {
         let mut actions = 0;
-        while actions < max_actions && self.in_flight.len() < self.max_in_flight {
+        while actions < max_actions && self.has_admission_room() {
             let Some(QueuedConnect {
                 request_id,
                 request,
@@ -555,7 +555,12 @@ impl CallerPool {
             || self
                 .earliest_deadline_micros
                 .is_some_and(|deadline| deadline <= now.as_micros())
-            || (!self.queue.is_empty() && self.in_flight.len() < self.max_in_flight)
+            || (!self.queue.is_empty() && self.has_admission_room())
+    }
+
+    fn has_admission_room(&self) -> bool {
+        self.in_flight.len() < self.max_in_flight
+            && self.callers.len() + self.callers.retirements_pending() < self.callers.max_callers()
     }
 
     /// The single bounded maintenance pass, in three phases under one finite
@@ -643,6 +648,8 @@ impl CallerPool {
                     if let Some(attempt) = self.in_flight.remove(&candidate.caller_id) {
                         // Removes the whole logical caller: every leg, its
                         // routes and timers.
+                        // An attempt that never connected has no application
+                        // packet window to retire; preserve immediate extraction.
                         self.callers.remove(candidate.caller_id);
                         self.push_outcome(PoolEvent::Expired {
                             request_id: attempt.request_id,
@@ -696,7 +703,7 @@ impl CallerPool {
     /// instead of `table_mut().remove(...)` for anything this pool ever
     /// admitted, or `in_flight`/`deadlines` silently drift from the
     /// table's real contents.
-    pub fn remove(&mut self, id: LogicalCallerId) -> Option<RemovedLogicalCaller> {
+    fn release_session_permit(&mut self, id: LogicalCallerId) {
         if let Some(attempt) = self.in_flight.remove(&id) {
             self.remove_deadline(&PoolDeadline {
                 deadline_micros: attempt.deadline_micros,
@@ -707,7 +714,24 @@ impl CallerPool {
                 request_id: attempt.request_id,
             });
         }
+    }
+
+    /// Extract a pooled caller for ownership transfer, releasing pool bookkeeping.
+    pub fn remove(&mut self, id: LogicalCallerId) -> Option<RemovedLogicalCaller> {
+        self.release_session_permit(id);
         self.callers.remove(id)
+    }
+
+    /// Retire a pooled caller without synchronously destroying its windows.
+    pub fn retire(&mut self, id: LogicalCallerId) -> bool {
+        self.release_session_permit(id);
+        self.callers.retire(id)
+    }
+
+    /// Service storage retained by `retire` with a separate finite budget.
+    /// `table().retirements_pending()` reports its runnable continuation.
+    pub fn reclaim_retired(&mut self, max_actions: usize) -> usize {
+        self.callers.reclaim_retired(max_actions)
     }
 
     /// Microseconds until either this pool's own earliest admitted attempt

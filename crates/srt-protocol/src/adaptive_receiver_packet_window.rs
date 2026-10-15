@@ -421,6 +421,20 @@ impl<T, const N: usize> AdaptiveReceiverPacketWindow<T, N> {
         self.len = 0;
     }
 
+    /// Terminal reclamation, including sparse/dense page transitions, with
+    /// at most `max_packets` retained packet destructors.
+    pub(crate) fn clear_bounded(&mut self, max_packets: usize) -> usize {
+        let mut released = 0;
+        while released < max_packets {
+            let Some(sequence) = self.first_from(0) else {
+                break;
+            };
+            drop(self.remove(sequence).expect("occupied receive slot"));
+            released += 1;
+        }
+        released
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (u32, &T)> {
         self.pages.iter().flatten().flat_map(|page| page.iter())
     }

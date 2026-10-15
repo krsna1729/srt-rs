@@ -75,7 +75,7 @@ loop {
     conn.handle_timer(TimerId::Ack, now)?;
 
     // 3. drain wire output -> UDP sendto
-    while let Some(out) = conn.poll_output() {
+    while let Some(out) = conn.poll_output()? {
         match out {
             ConnectionOutput::SendPacket(bytes) => { /* sock.send(&bytes) */ }
             ConnectionOutput::SetTimer { id, duration_micros } => { /* schedule */ }
@@ -87,7 +87,7 @@ loop {
     while let Some(ev) = conn.poll_event() {
         match ev {
             ConnectionEvent::Connected => break,
-            ConnectionEvent::DataReceived { payload, .. } => { /* deliver */ }
+            ConnectionEvent::DataReceived { payload, .. } => { /* enqueue bounded application work */ }
             ConnectionEvent::StateChanged(_) | ConnectionEvent::Error(_)
             | ConnectionEvent::Disconnected { .. }
             | ConnectionEvent::KeyRefreshNeeded { .. } => {}
@@ -99,6 +99,28 @@ loop {
 srt-rs currently supports flow-control and receive windows up to 65,536
 packets. This is an implementation and resource limit, not an SRT wire-protocol
 limit. See `MAX_FLOW_WINDOW` when validating application configuration.
+
+`ConnectionEvent::DataReceived::payload` and `GroupPacket::payload` are
+`ReceivedPayload`, not contiguous `Bytes`. A single-packet message retains its
+original `Bytes`; a fragmented message retains packet chunks in wire order.
+Message number, first sequence number, packet count and first-fragment source
+time are unchanged. There is no implicit flattening, `Deref` or `AsRef<[u8]>`.
+Use `chunks()` to borrow chunks, or `into_chunks()` to consume owned packet
+handles without copying their data.
+
+On an Owner thread, finish an owning chunk cursor through `PayloadChunks::retire`
+even after its final chunk: consumed metadata or shared packet handles can remain.
+Retain the resulting `PayloadRetirement` in bounded local work and call
+`reclaim(max_actions)` until `is_complete()`. One action visits one original
+packet slot, including a consumed slot; zero performs no work. Ordinary Rust
+drop remains synchronous, so dropping an unfinished cursor is not a bounded
+retirement operation.
+
+Use `SrtConnection::into_retirement` or `SrtGroup::into_retirement` for terminal
+protocol storage. These relinquish protocol authority and expose the same
+explicit action-budgeted cleanup. They add no GC thread and do not impose a
+hard allocator or kernel CPU-time bound. See the
+[Owner disposal contract](../../docs/owner-contract.md#6-explicit-continuation-never-hidden-queueing).
 
 When `passphrase` is set on a caller, a fresh salt and stream encryption key
 are generated from the operating system CSPRNG unless the application supplies

@@ -305,10 +305,10 @@ impl fmt::Display for DisconnectReason {
 pub enum ConnectionEvent {
     /// Connection established.
     Connected,
-    /// Data received. The shared payload can be forwarded to
-    /// [`SrtConnection::send_shared`] without copying.
+    /// One complete message, retaining packet chunks in order. Processing
+    /// `payload.chunks()` preserves the message boundary without flattening.
     DataReceived {
-        payload: Bytes,
+        payload: crate::ReceivedPayload,
         sequence_number: u32,
         message_number: u32,
         timestamp: u32,
@@ -676,6 +676,10 @@ fn km_matches_context(message: &KmMessage, crypto: &CryptoContext) -> bool {
         && message.salt == *crypto.salt()
         && CipherMode::from_km(message) == Some(crypto.cipher_mode())
 }
+
+#[path = "connection_retirement.rs"]
+mod retirement;
+pub use retirement::ConnectionRetirement;
 
 /// An SRT connection.
 pub struct SrtConnection {
@@ -2971,11 +2975,21 @@ impl SrtConnection {
     /// visit, so a local close delivers its whole buffered tail in the call
     /// that releases it -- once per connection.
     fn move_ready_data(&mut self, now: Timestamp, cap: usize) {
+        if self.assembler.has_retired() {
+            self.assembler.reclaim_retired(MAX_DELIVERY_PER_VISIT);
+            self.sync_application_backlog();
+        }
         let available = self
             .options
             .delivery_queue_packets
             .saturating_sub(self.pending_data_events) as usize;
         if available == 0 {
+            if self.assembler.has_retired() && !self.event_overflowed {
+                self.queue_output(QueuedOutput::SetTimer {
+                    id: TimerId::DeliveryContinue,
+                    duration_micros: 0,
+                });
+            }
             return;
         }
 
@@ -3010,7 +3024,7 @@ impl SrtConnection {
         self.sync_application_backlog();
         // Cut by the visit cap, not by the queue or the receiver: continue.
         // A spurious visit finds nothing ready and does nothing.
-        if popped == cap && !self.event_overflowed {
+        if (popped == cap || self.assembler.has_retired()) && !self.event_overflowed {
             self.queue_output(QueuedOutput::SetTimer {
                 id: TimerId::DeliveryContinue,
                 duration_micros: 0,
@@ -6627,7 +6641,7 @@ mod tests {
         conn.disconnect(Timestamp::from_micros(2));
 
         assert!(std::iter::from_fn(|| conn.poll_event()).any(
-            |event| matches!(event, ConnectionEvent::DataReceived { payload, .. } if payload.as_ref() == b"queued")
+            |event| matches!(event, ConnectionEvent::DataReceived { payload, .. } if payload.eq(&b"queued"[..]))
         ));
         assert_eq!(conn.state(), ConnectionState::Closing);
     }
@@ -10641,7 +10655,7 @@ mod tests {
     fn assert_delivered_payload(conn: &mut SrtConnection, expected: &[u8]) {
         let delivered = conn.poll_event().expect("the payload is delivered");
         assert!(
-            matches!(&delivered, ConnectionEvent::DataReceived { payload, .. } if payload.as_ref() == expected),
+            matches!(&delivered, ConnectionEvent::DataReceived { payload, .. } if payload.eq(expected)),
             "the buffered payload must surface unchanged: {delivered:?}"
         );
     }
@@ -10766,7 +10780,7 @@ mod tests {
             .poll_event()
             .expect("the complete message is delivered");
         assert!(
-            matches!(&delivered, ConnectionEvent::DataReceived { payload, .. } if payload.as_ref() == b"tail"),
+            matches!(&delivered, ConnectionEvent::DataReceived { payload, .. } if payload.eq(&b"tail"[..])),
             "the complete message must still be delivered: {delivered:?}"
         );
         assert!(matches!(

@@ -1130,6 +1130,12 @@ pub struct ReceiverBuffer {
 }
 
 impl ReceiverBuffer {
+    /// Only used after the owning connection has relinquished protocol authority.
+    pub(crate) fn reclaim_terminal(&mut self, max_packets: usize) -> (usize, bool) {
+        let released = self.packets.clear_bounded(max_packets);
+        (released, self.packets.is_empty())
+    }
+
     /// Create a new receive buffer.
     pub fn new(
         initial_seq: u32,
