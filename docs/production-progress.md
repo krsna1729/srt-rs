@@ -627,3 +627,30 @@ and `remove_range` are word-budgeted by the loss-walk change in #161 at
 directly; the drain and promoted call sites use it, and it pins the accounting,
 not the surrounding loop, so a drain-level test with a truncated-datagram flood
 remains open.
+## Loss bitmap entry work is bounded by the receive window (2026-10-15)
+
+Loss classification and DROPREQ removal share one bitmap over the negotiated
+receive window. `mutate_contiguous_range` walks one 64-bit data word per 64
+sequence positions, so one received packet can touch at most
+`MAX_LOSS_WORDS_PER_ENTRY` = `MAX_FLOW_WINDOW / 64` data words, 1,024 at the
+65,536-packet limit, plus one summary word per touched word. That is the explicit
+word budget for one entry. No continuation is introduced for a bound of a few
+microseconds, and the strict per-entry shape is unchanged.
+
+Evidence. `one_loss_entry_walks_at_most_one_bitmap_word_per_64_positions` drives
+the real receive path: a peer one full window ahead exposes 65,535 positions and
+walks exactly 1,024 data words; steady in-order traffic walks none; a full-window
+`remove_range` is bounded by the same count. The counter behind it,
+`LossBitmap::words_touched`, is `cfg(test)` only and counts one per data word
+walked, so it cannot change production work. Mutation: replacing the per-word
+stride with a per-position stride, the pre-bound shape, fails the test with
+65,535 words against the declared 1,024. The existing `loss_detection_steps`
+assertions still pin the position bound, so both units are gated.
+
+Measured cap. New `receiver_loss_scan/full_window_gap` Criterion group, Linux
+7.0.0-38, six-vCPU EPYC host, 30 samples, one packet per sample: 1.31-1.63 us for
+a full-window gap at the 8,192-packet default window (128 words) and 6.86-7.54 us
+at the 65,536-packet maximum (1,024 words). One packet can therefore amplify to
+at most one window of positions, at the measured cost of a single packet-sized
+operation. The run scan used for periodic NAK generation shares the word size but
+is served by the resumable periodic-NAK cursor with its own per-visit caps.
