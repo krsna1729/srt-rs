@@ -5328,7 +5328,6 @@ mod tests {
             ),
             Admit::Dropped(AdmissionDropReason::Capacity)
         );
-        assert_eq!(table.len(), 2);
         assert_eq!(
             telemetry.admission_capacity_drops.load(Ordering::Relaxed),
             1
@@ -5344,30 +5343,47 @@ mod tests {
                 1,
                 &telemetry,
             ),
+            Admit::Dropped(AdmissionDropReason::Capacity)
+        );
+        // Admission prunes only one overdue peer per call. Its physical
+        // slot remains charged until the Owner drives reclamation.
+        assert_eq!(table.len(), 1);
+        assert_eq!(telemetry.expired_half_open.load(Ordering::Relaxed), 1);
+        assert_eq!(table.retirements_pending(), 1);
+        table.reclaim_retired(64);
+
+        // The next admission unroutes the other overdue peer. There is
+        // room because the first retirement has physically completed.
+        let peer_four = "127.0.0.1:10003".parse().expect("address");
+        assert_eq!(
+            table.admit(
+                peer_four,
+                &induction(4),
+                Timestamp::from_micros(102),
+                &options,
+                0,
+                1,
+                &telemetry,
+            ),
             Admit::Fed
         );
-        // `admit` now bounds its own half-open pruning to one entry per
-        // call (finding 3/10, keeping packet admission itself bounded
-        // rather than turning one receive into a table-wide sweep) --
-        // both peers[0] and peers[1] are overdue at this point, so this
-        // first admit only retires one of them.
-        assert_eq!(table.len(), 2);
-        assert_eq!(telemetry.expired_half_open.load(Ordering::Relaxed), 1);
-
-        // A second admission call's own bounded prune drains the
-        // remaining overdue half-open entry.
-        let peer_four = "127.0.0.1:10003".parse().expect("address");
-        let _ = table.admit(
-            peer_four,
-            &induction(4),
-            Timestamp::from_micros(102),
-            &options,
-            0,
-            1,
-            &telemetry,
+        assert_eq!(table.len(), 1);
+        assert_eq!(telemetry.expired_half_open.load(Ordering::Relaxed), 2);
+        assert_eq!(table.retirements_pending(), 1);
+        table.reclaim_retired(64);
+        assert_eq!(
+            table.admit(
+                peers[2],
+                &induction(3),
+                Timestamp::from_micros(103),
+                &options,
+                0,
+                1,
+                &telemetry,
+            ),
+            Admit::Fed
         );
         assert_eq!(table.len(), 2);
-        assert_eq!(telemetry.expired_half_open.load(Ordering::Relaxed), 2);
     }
 
     #[test]

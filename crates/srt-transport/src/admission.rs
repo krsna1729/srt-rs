@@ -4924,7 +4924,7 @@ mod tests {
     }
 
     #[test]
-    fn half_open_expiry_frees_slots() {
+    fn half_open_expiry_holds_slots_until_reclamation() {
         let config = PeerTableConfig {
             max_peers: 4,
             max_half_open_peers: 2,
@@ -4984,12 +4984,27 @@ mod tests {
             1,
             &telemetry,
         );
-        assert!(
-            !matches!(
-                result,
-                Admit::Dropped(AdmissionDropReason::HalfOpenCapacity)
+        assert!(matches!(
+            result,
+            Admit::Dropped(AdmissionDropReason::HalfOpenCapacity)
+        ));
+        assert_eq!(table.half_open_count(), 1);
+        assert_eq!(table.retirements_pending(), 1);
+        assert_eq!(table.reclaim_retired(0), 0);
+        table.reclaim_retired(64);
+        assert_eq!(table.retirements_pending(), 0);
+        assert_eq!(
+            table.admit(
+                peer_c,
+                &induction_packet(3),
+                Timestamp::from_micros(200_000),
+                &options,
+                0,
+                1,
+                &telemetry,
             ),
-            "after expiry, peer_c should be admitted"
+            Admit::Fed,
+            "physical reclamation makes the expired half-open slot reusable"
         );
     }
 
