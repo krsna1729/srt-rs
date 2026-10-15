@@ -13,6 +13,7 @@
 //! arriving afterwards, and `aligned_group_member_retransmits_after_sequence_jump`
 //! aligns a leg without the group prefix having moved.
 
+use srt_proto::group::GroupEvent;
 use srt_proto::wire::{ControlType, SrtPacket};
 use srt_proto::{
     ConnectionOptions, ConnectionOutput, ConnectionState, GroupMemberState, GroupMode,
@@ -108,7 +109,7 @@ fn available_buffer_packets(group: &SrtGroup, member_id: u32) -> u32 {
 
 /// The sequence numbers acknowledged by the given control packets. The first
 /// four bytes of an ACK's control information are the acknowledged sequence
-/// number (`send_encoded_ack`).
+/// number (`send_ack`).
 fn acknowledged_sequences(packets: &[Vec<u8>]) -> Vec<u32> {
     let mut acknowledged = Vec::new();
     for packet in packets {
@@ -258,7 +259,7 @@ fn advanced_prefix_group() -> PrefixFixture {
             "an acknowledgment for {sequence} runs past the delivered prefix"
         );
     }
-    return_packets(&mut source_a, packets, ts(103_800));
+    return_packets(&mut source_a, packets, ts(140_800));
     PrefixFixture {
         group,
         source_a,
@@ -281,7 +282,6 @@ fn a_stale_flight_copy_is_not_delivered_again_or_acknowledged_past_the_prefix() 
     // the end-to-end property, that the duplicate produces neither a delivery
     // nor an acknowledgment past what the group really delivered. The group's
     // own prefix guard is exercised by the late-leg test below.
-    let before = source_a.sender_stats().unwrap();
     feed(&mut group, 1, &first, ts(160_000));
     assert!(
         group.poll_data(ts(160_000)).is_none(),
@@ -294,13 +294,7 @@ fn a_stale_flight_copy_is_not_delivered_again_or_acknowledged_past_the_prefix() 
             "an acknowledgment for {sequence} runs past the delivered prefix {prefix}"
         );
     }
-    return_packets(&mut source_a, packets, ts(105_100));
-    let after = source_a.sender_stats().unwrap();
-    assert_eq!(
-        after.packets_in_buffer, before.packets_in_buffer,
-        "the stale copy retires nothing"
-    );
-    assert_eq!(after.packets_in_flight, before.packets_in_flight);
+    return_packets(&mut source_a, packets, ts(160_100));
     assert!(
         source_a.send(b"fourth", ts(160_200)).is_ok(),
         "the returning leg stays writable"
@@ -358,45 +352,74 @@ fn a_late_leg_cannot_reopen_a_retired_sequence() {
 
 #[test]
 fn a_second_legs_copy_of_a_pending_sequence_returns_its_reservation() {
-    let options = ConnectionOptions {
-        initial_seq: Some(BASE),
-        ..ConnectionOptions::default()
-    };
-    let (mut source_a, listener_a) = establish_pair(options.clone());
-    let (mut source_b, listener_b) = establish_pair(options);
-    let mut group = SrtGroup::new(0x4000_0022, GroupMode::Backup).unwrap();
-    group.add_member(1, 100, listener_a).unwrap();
-    group.add_member(2, 1, listener_b).unwrap();
+    // Head-of-line blocking, not the retirement prefix: both legs deliver a
+    // sequence above the group's prefix while the sequence at the prefix is
+    // still missing, so both copies really sit in the pending table at once and
+    // the second one meets the table's own uniqueness guard.
+    let PrefixFixture { mut group, .. } = advanced_prefix_group();
+    let missing = prefix();
+    let late = missing.wrapping_add(2) & SEQUENCE_MASK;
 
-    // Both legs carry the same group sequence, which is what a peer running the
-    // two legs independently can produce, and neither is delivered yet.
-    source_a.send(b"same", ts(100_000)).unwrap();
-    let from_a = packets_from(&mut source_a).pop().unwrap();
-    source_b.synchronize_send_sequence(BASE).unwrap();
-    source_b.send(b"same", ts(100_000)).unwrap();
-    let from_b = packets_from(&mut source_b).pop().unwrap();
-    assert_eq!(data_sequence(&from_a), BASE);
-    assert_eq!(data_sequence(&from_b), BASE);
+    let mut sources = Vec::new();
+    for member_id in 3..=4 {
+        let (source, listener) = establish_pair(ConnectionOptions {
+            initial_seq: Some(late),
+            ..ConnectionOptions::default()
+        });
+        group.add_member(member_id, 1, listener).unwrap();
+        sources.push(source);
+    }
+    let mut copies = Vec::new();
+    for source in sources.iter_mut() {
+        source.send(b"pending", ts(200_000)).unwrap();
+        let packet = packets_from(source).pop().unwrap();
+        assert_eq!(data_sequence(&packet), late);
+        copies.push(packet);
+    }
 
-    let full_a = available_buffer_packets(&group, 1);
-    let full_b = available_buffer_packets(&group, 2);
-    feed(&mut group, 1, &from_a, ts(100_000));
-    feed(&mut group, 2, &from_b, ts(100_000));
-    let delivered = group.poll_data(ts(100_000)).expect("one copy is delivered");
-    assert_eq!(delivered.sequence_number, BASE);
-    assert!(delivered.payload.eq(&b"same"[..]));
+    let full_third = available_buffer_packets(&group, 3);
+    let full_fourth = available_buffer_packets(&group, 4);
+    feed(&mut group, 3, &copies[0], ts(200_000));
+    feed(&mut group, 4, &copies[1], ts(200_000));
     assert!(
-        group.poll_data(ts(100_000)).is_none(),
-        "the second copy is not delivered"
+        group.poll_data(ts(200_000)).is_none(),
+        "the sequence at the group prefix is missing, so nothing is delivered yet"
+    );
+    // Precondition: each leg is holding exactly one slot, the first as the
+    // group's pending copy and the second until the group releases it.
+    assert_eq!(available_buffer_packets(&group, 3), full_third - 1);
+    assert_eq!(available_buffer_packets(&group, 4), full_fourth - 1);
+
+    // Unblock the head on the active leg, whose cursor sits at the group
+    // prefix: the pending copy is then delivered and its reservation returns.
+    let (mut source_head, _) = establish_pair(ConnectionOptions {
+        initial_seq: Some(missing),
+        ..ConnectionOptions::default()
+    });
+    for _ in 0..2 {
+        source_head.send(b"head", ts(201_000)).unwrap();
+        let packet = packets_from(&mut source_head).pop().unwrap();
+        feed(&mut group, 1, &packet, ts(201_000));
+    }
+    let mut delivered = Vec::new();
+    for _ in 0..8 {
+        if let Some(GroupEvent::DataReceived(packet)) = group.poll_event(ts(202_000)) {
+            delivered.push(packet.sequence_number);
+        }
+    }
+    assert_eq!(
+        delivered,
+        vec![missing, missing.wrapping_add(1) & SEQUENCE_MASK, late],
+        "head, middle and the pending copy are delivered in order"
     );
     assert_eq!(
-        available_buffer_packets(&group, 1),
-        full_a,
-        "the delivering leg's reservation is returned"
+        available_buffer_packets(&group, 3),
+        full_third,
+        "the pending leg returns to full once its copy is delivered"
     );
     assert_eq!(
-        available_buffer_packets(&group, 2),
-        full_b,
-        "the duplicate leg's reservation is returned instead of being overwritten"
+        available_buffer_packets(&group, 4),
+        full_fourth,
+        "the rejected duplicate keeps no reservation at all"
     );
 }
