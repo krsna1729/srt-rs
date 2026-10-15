@@ -438,6 +438,9 @@ source keeps its share in every table it can reach. Admission work other than ke
 derivation (decode, routing, INDUCTION, unencrypted CONCLUSION policy) is bounded
 per visit by the owner service budget but not by this rate. The cookie gates
 derivation but is not a cryptographic anti-spoof boundary by its own
-documentation. `docs/listener-admission-policy.md` now states the scope,
+documentation. Caller-side derivation is outside every bucket: `SrtConnection::connect`
+derives a KEK once per attempt through `CryptoContext::new_sender`, and caller
+tables have no derivation budget, so the application's reconnect cadence is the
+only bound on that work. `docs/listener-admission-policy.md` now states the scope,
 multiplication, refusal behaviour and the non-derivation gap where operators
 tune it.
