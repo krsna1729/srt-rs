@@ -330,8 +330,10 @@ Measurement: Linux 7.0.0-38, six-vCPU EPYC host, Rust 1.96, one process pinned t
 CPU 2, 1,316-byte DATA payloads. Setup/handshake is excluded. The baseline is
 `b59bcf11a7ad645fac27c42c0780034dc5dc5b8b`; the retirement-matrix after arm is
 the segmented prototype `7b314cc`, before the lazy partial-root follow-up below.
-These teardown times have not been remeasured after that follow-up. The disposable
-CLI drives real `SrtConnection` handshake, send, receive and output paths.
+The disposable prototype CLI drives real `SrtConnection` handshake, send, receive
+and output paths; its surviving binary was built from a tree identical to
+`4827487d` (`git diff 81b56de 4827487d` is empty) and reproduces this table on the
+same host, so the remeasurement below differs by fixture, not by revision.
 Future RX uses a 60 s playout delay; partial messages have no Last fragment.
 The completed large message contains 65,536 chunks and 86,245,376 bytes.
 
@@ -353,6 +355,50 @@ another 20-sample pass. It is an observed maximum, not a declared time limit.
 | Encrypted future RX 65,536 | 5691.231 | 7498.313 | 176.445 |
 | Encrypted application 4,096 x 16 fragments | 1347.031 | 7504.693 | 670.486 |
 | One complete 82.25 MiB message | 6231.642 | 2782.366 | 8147.628 |
+
+### Teardown remeasurement on the merged revision
+
+The maintained probe (`crates/srt-protocol/examples/teardown_tail_probe.rs`,
+`taskset -c 2 <probe> <case|all> <samples> [budget]`) rebuilds the same eleven
+retained shapes and times `SrtConnection::into_retirement()`, every
+`reclaim(budget)` visit and the final drop separately. Thread CPU
+(`CLOCK_THREAD_CPUTIME_ID`) microseconds, median of 10 samples, budget 64,
+1,316-byte DATA payloads. `actions` counts released packet slots, queued events
+and payload page/directory entries; every incomplete visit asserts
+`used > 0 && used <= budget`.
+
+| Retained shape | detach p50 | reclaim p50 | final drop p50 | actions | visits | largest step |
+|---|---:|---:|---:|---:|---:|---:|
+| Empty | 0.5 | 0.3 | 3.2 | 0 | 3 | 4.4 |
+| TX 8,192 | 3.9 | 4035 | 9.9 | 8192 | 130 | 8820 |
+| TX 65,536 | 3.5 | 26412 | 9.9 | 65536 | 1026 | 30336 |
+| Future RX 65,536 | 4.0 | 22405 | 11.1 | 65536 | 1026 | 75975 |
+| Application 65,536 single-packet messages | 4.1 | 14264 | 6034 | 131072 | 2050 | 28100 |
+| Application 4,096 messages, 16 fragments each | 4.2 | 13718 | 3042 | 69632 | 1090 | 8267 |
+| Incomplete 65,536-fragment message | 3.5 | 4086 | 9.6 | 66560 | 1042 | 5325 |
+| Encrypted TX 65,536 | 3.2 | 26908 | 13.4 | 65536 | 1026 | 26070 |
+| Encrypted future RX 65,536 | 4.0 | 21164 | 31.7 | 65536 | 1026 | 15885 |
+| Encrypted application 4,096 x 16 fragments | 4.5 | 15615 | 2929 | 69632 | 1090 | 10669 |
+| One complete 82.25 MiB message | 3.2 | 3789 | 8.0 | 66561 | 1043 | 50825 |
+
+Detach is O(1) for every shape (2.6-4.9 us observed; `reclaim_terminal(0)` does
+no work): the assembler retains one pending partial, so an incomplete message
+enters retirement as a single cursor rather than as thousands of partials. The
+whole-shape totals are larger than the prototype column because this probe
+allocates one payload buffer per packet and releases the payload `Bytes` one
+action at a time, while the prototype fixture released its payload storage more
+cheaply; the two tables are not like-for-like. Larger reclaim budgets do not
+change the totals and do not tighten the bound: at budget 256 the incomplete
+message takes 260 visits instead of 1040 and the fragmented application case 272
+instead of 1088, while their largest single step is unchanged (5072 us and
+16960 us).
+
+Raising `MALLOC_TRIM_THRESHOLD_` (top-of-heap trimming disabled) for a throwaway
+diagnostic process on the application 65,536 single-packet case collapsed the
+final drop from 6034 us to 11.6 us and the whole lifecycle from 21301 us to
+8988 us; the same diagnostic moved the surviving prototype binary by about
+1.3x. The multi-millisecond steps are allocator trimming, not traversal of
+retained state.
 
 Cleanup totals are not receive-path CPU totals: the old assembler copied each
 complete fragmented message and freed its packet allocations during setup.
@@ -381,6 +427,13 @@ for performance comparison. Disabling glibc trimming only for a throwaway
 process reduced the large-message maximum to 163.976 us, but the 16-fragment
 workload still reached 4634.746 us. No allocator setting ships. Bounded release
 counts are proved; a hard allocator/kernel CPU-time bound is **not** established.
+Terminal storage is released through
+`srt_transport::retirement::RetiredProtocols` (protocol `ConnectionRetirement` /
+`GroupRetirement` cursors) inside `OwnerServiceBudget::max_maintenance_actions`
+(256) in the compio, mio and tokio Owners, and admission, half-open and
+window-byte credit stays charged to the originating table until `is_complete()`,
+so the retire queue cannot outgrow that table's session capacity. No background
+thread and no unbounded garbage queue exist for it.
 
 Comparable hot-path check: existing `message_reassembly` Criterion bench, both
 arms pinned to CPU 2, 30 samples, 1 s warmup and 3 s measurement. Values are
