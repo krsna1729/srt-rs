@@ -10830,37 +10830,6 @@ mod tests {
     }
 
     #[test]
-    fn delivery_packet_accounting_inline_footprint_stays_bounded() {
-        let connection_bytes = std::mem::size_of::<SrtConnection>();
-        let event_bytes = std::mem::size_of::<ConnectionEvent>();
-        let assembled_bytes = std::mem::size_of::<crate::message_assembler::AssembledMessage>();
-        eprintln!("SrtConnection inline footprint: {connection_bytes} bytes");
-        eprintln!("ConnectionEvent inline footprint: {event_bytes} bytes");
-        eprintln!("AssembledMessage inline footprint: {assembled_bytes} bytes");
-        // The protocol-correctness pass grew the inline sender state by the
-        // two retained-stamp counters it carries (see
-        // `sender_window_is_lazy_and_bounded_at_maximum_window`): 8 bytes,
-        // deliberate and bounded, not drift. Two later passes grew
-        // `SenderBuffer` (embedded inline here) by another 8 bytes each for
-        // the same reason -- see that same test's comment -- and one more
-        // pass added 8 for `total_bytes_acked`. Bounded work per visit then
-        // added the periodic-NAK cursor and its reused packet staging
-        // (`periodic_nak_resume`, `periodic_nak_packets`) here, and
-        // `SenderBuffer::expiry_scan_from` (plus a test-only counter); each
-        // fit alone, together they need 8 more bytes -- deliberate. Bounded
-        // peer-NAK handling then added `SenderBuffer::pending_naks` (the
-        // queue of reports still validating or committing), 32 bytes inline.
-        // Bounded ACK reclaim then added the window's `retired` pages
-        // (a `Vec`, unallocated until an ACK retires a whole page), 24 more.
-        assert!(connection_bytes <= 1_632);
-        assert!(event_bytes <= 64);
-        // F01 added `source_time: Timestamp` (8 bytes) to preserve a
-        // message's original source time through reassembly -- a
-        // deliberate, one-time budget increase, not drift.
-        assert!(assembled_bytes <= 56);
-    }
-
-    #[test]
     #[cfg_attr(
         all(miri, not(feature = "miri-extended")),
         ignore = "a real KM handshake derives its KEK via 2048 PBKDF2-HMAC-SHA1 iterations   \

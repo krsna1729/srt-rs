@@ -2960,6 +2960,24 @@ fn fail_cancelled_connects(
     }
 }
 
+fn reclaim_payloads(
+    retired_payloads: &mut VecDeque<srt_proto::PayloadRetirement>,
+    max_actions: usize,
+) {
+    let mut reclaim_left = max_actions;
+    while reclaim_left != 0 {
+        let Some(retired) = retired_payloads.front_mut() else {
+            break;
+        };
+        if retired.is_complete() {
+            retired_payloads.pop_front();
+            reclaim_left -= 1;
+        } else {
+            reclaim_left -= retired.reclaim(reclaim_left);
+        }
+    }
+}
+
 #[allow(clippy::cognitive_complexity)]
 async fn run_driver(
     mut owner: Owner,
@@ -3092,18 +3110,7 @@ async fn run_driver(
             start,
         };
 
-        let mut reclaim_left = DRIVER_PAYLOAD_RECLAIM_ACTIONS;
-        while reclaim_left != 0 {
-            let Some(retired) = retired_payloads.front_mut() else {
-                break;
-            };
-            if retired.is_complete() {
-                retired_payloads.pop_front();
-                reclaim_left -= 1;
-            } else {
-                reclaim_left -= retired.reclaim(reclaim_left);
-            }
-        }
+        reclaim_payloads(&mut retired_payloads, DRIVER_PAYLOAD_RECLAIM_ACTIONS);
         owner.poll_listener_events_bounded(
             DRIVER_PAYLOAD_CAPACITY - retired_payloads.len(),
             &mut listener_events,
@@ -3169,11 +3176,9 @@ async fn run_driver(
 
     // No new events enter after shutdown. Yield between finite retirement
     // slices instead of destroying an application backlog in one task turn.
-    for mut retired in retired_payloads {
-        while !retired.is_complete() {
-            retired.reclaim(DRIVER_PAYLOAD_RECLAIM_ACTIONS);
-            tokio::task::yield_now().await;
-        }
+    while !retired_payloads.is_empty() {
+        reclaim_payloads(&mut retired_payloads, DRIVER_PAYLOAD_RECLAIM_ACTIONS);
+        tokio::task::yield_now().await;
     }
 }
 

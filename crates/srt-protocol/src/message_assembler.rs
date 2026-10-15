@@ -24,7 +24,8 @@ struct PartialMessage {
 }
 
 pub(crate) struct MessageAssembler {
-    pending: Option<PartialMessage>,
+    // Allocate fragmentation state only after First, not for every connection.
+    pending: Option<Box<PartialMessage>>,
     retired: std::collections::VecDeque<PayloadRetirement>,
     retired_packets: u32,
 }
@@ -60,14 +61,14 @@ impl MessageAssembler {
                 let next_seq = packet.sequence_number.wrapping_add(1) & 0x7FFF_FFFF;
                 let mut fragments = PayloadPages::default();
                 fragments.push(packet.payload);
-                self.pending = Some(PartialMessage {
+                self.pending = Some(Box::new(PartialMessage {
                     message_number: packet.message_number,
                     first_sequence_number: packet.sequence_number,
                     next_expected_seq: next_seq,
                     fragments,
                     timestamp: packet.timestamp,
                     source_time,
-                });
+                }));
                 None
             }
             PacketPosition::Middle => {
@@ -477,17 +478,29 @@ mod tests {
         assert_eq!(msg.first_sequence_number, max_seq);
     }
 
+    fn assert_original_max_message_chunks(message: &AssembledMessage, pointers: &[*const u8]) {
+        for (index, chunk) in message.payload.chunks().enumerate() {
+            assert_eq!(
+                chunk.as_ptr(),
+                pointers[index],
+                "packet data must not be copied"
+            );
+            if index == 64 {
+                assert!(chunk.is_empty());
+            } else {
+                assert_eq!(chunk.as_ref(), &[index as u8]);
+            }
+        }
+    }
+
     #[test]
-    #[expect(
-        clippy::cognitive_complexity,
-        reason = "One maximum-size message must combine page boundaries, empty chunks, sequence wrap and source time"
-    )]
     fn maximum_message_keeps_empty_chunks_order_and_source_time_across_wrap() {
         let mut asm = MessageAssembler::new();
         let count = crate::srt_handshake::MAX_FLOW_WINDOW as usize;
         let first_seq = 0x7fff_8000u32;
         let first_source = Timestamp::from_micros(123);
         let mut pointers = Vec::with_capacity(count);
+        let mut message = None;
         for index in 0..count {
             let position = if index == 0 {
                 PacketPosition::First
@@ -508,7 +521,7 @@ mod tests {
             );
             packet.timestamp = index as u32 + 1000;
             pointers.push(packet.payload.as_ptr());
-            let message = asm.feed(
+            message = asm.feed(
                 packet,
                 if index == 0 {
                     first_source
@@ -518,28 +531,16 @@ mod tests {
             );
             if index != count - 1 {
                 assert!(message.is_none());
-                continue;
-            }
-            let message = message.expect("the last fragment completes exactly one message");
-            assert_eq!(message.packet_count, count as u32);
-            assert_eq!(message.first_sequence_number, first_seq);
-            assert_eq!(message.message_number, 9);
-            assert_eq!(message.timestamp, 1000);
-            assert_eq!(message.source_time, first_source);
-            assert_eq!(message.payload.len(), count - 1);
-            assert_eq!(message.payload.chunk_count(), count);
-            for (index, chunk) in message.payload.chunks().enumerate() {
-                assert_eq!(
-                    chunk.as_ptr(),
-                    pointers[index],
-                    "packet data must not be copied"
-                );
-                if index == 64 {
-                    assert!(chunk.is_empty());
-                } else {
-                    assert_eq!(chunk.as_ref(), &[index as u8]);
-                }
             }
         }
+        let message = message.expect("the last fragment completes exactly one message");
+        assert_eq!(message.packet_count, count as u32);
+        assert_eq!(message.first_sequence_number, first_seq);
+        assert_eq!(message.message_number, 9);
+        assert_eq!(message.timestamp, 1000);
+        assert_eq!(message.source_time, first_source);
+        assert_eq!(message.payload.len(), count - 1);
+        assert_eq!(message.payload.chunk_count(), count);
+        assert_original_max_message_chunks(&message, &pointers);
     }
 }

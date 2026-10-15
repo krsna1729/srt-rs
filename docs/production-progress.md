@@ -328,9 +328,11 @@ introduced.
 
 Measurement: Linux 7.0.0-38, six-vCPU EPYC host, Rust 1.96, one process pinned to
 CPU 2, 1,316-byte DATA payloads. Setup/handshake is excluded. The baseline is
-`b59bcf11a7ad645fac27c42c0780034dc5dc5b8b`; the after arm is this change.
-The disposable CLI drives real `SrtConnection` handshake, send, receive and output
-paths. Future RX uses a 60 s playout delay; partial messages have no Last fragment.
+`b59bcf11a7ad645fac27c42c0780034dc5dc5b8b`; the retirement-matrix after arm is
+the segmented prototype `7b314cc`, before the lazy partial-root follow-up below.
+These teardown times have not been remeasured after that follow-up. The disposable
+CLI drives real `SrtConnection` handshake, send, receive and output paths.
+Future RX uses a 60 s playout delay; partial messages have no Last fragment.
 The completed large message contains 65,536 chunks and 86,245,376 bytes.
 
 CPU microseconds below: baseline bulk-drop median from 40 samples; after total
@@ -364,6 +366,13 @@ retirement counts consumed slots too, so a fully consumed message cannot release
 all metadata pages in one step. In 20 metadata-only samples after consuming the
 82.25 MiB message, the largest 64-slot CPU step was 61.222 us.
 
+Fragmentation state is allocated lazily after a First fragment, rather than
+embedding its page-directory root in every connection. A production x64
+`SrtConnection` probe with all features measured 1,600 inline bytes. The tradeoff
+is one additional partial-state allocation per fragmented message; single-packet
+delivery does not allocate that state. The latest reassembly run below includes
+this follow-up.
+
 Residual limit: the uninstrumented matrix still observed multi-millisecond
 reclaim and final-drop outliers. A separate, phase-marked `LD_PRELOAD` diagnostic
 attributed a 11.996 ms CPU stall to `free` of one 1,320-byte packet allocation
@@ -376,13 +385,14 @@ counts are proved; a hard allocator/kernel CPU-time bound is **not** established
 Comparable hot-path check: existing `message_reassembly` Criterion bench, both
 arms pinned to CPU 2, 30 samples, 1 s warmup and 3 s measurement. Values are
 95% time intervals in microseconds per 16 messages, using the last baseline and
-after runs. All intervals overlap; this is neither a speedup nor capacity proof.
+after runs. All intervals overlap; this establishes neither a speedup, capacity
+nor performance equivalence. The fragmented-message point estimates increased.
 
 | Case | Baseline interval | After interval |
 |---|---:|---:|
-| Single packet | 13.557–14.619 | 14.339–14.873 |
-| Two fragments | 29.618–31.765 | 30.305–32.545 |
-| Eight fragments | 86.843–90.592 | 84.260–97.112 |
+| Single packet | 13.557–14.619 | 14.297–15.097 |
+| Two fragments | 29.618–31.765 | 30.554–33.501 |
+| Eight fragments | 86.843–90.592 | 90.274–98.413 |
 
 Proofs exercise the production code: maximum message size/order/zero-byte chunks
 across sequence wrap, first-fragment source time, partial-credit retention,
@@ -393,5 +403,7 @@ were caught: action-budget overflow, premature metadata completion, early partia
 credit release, direct and group admission ignoring retiring jobs, early peer
 memory-credit release, and missing inbox byte refund. Restored targeted tests,
 workspace all-target/all-feature compilation and protocol/transport/bench Clippy
-with warnings denied pass.
+with warnings denied pass. The custom complexity report card passes without a
+raised limit. The managed `tokio_facade_echo` executable also completed real UDP
+delivery, orderly close and driver shutdown.
 

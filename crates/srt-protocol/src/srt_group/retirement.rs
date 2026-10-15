@@ -29,37 +29,48 @@ impl GroupRetirement {
     pub fn reclaim(&mut self, max_actions: usize) -> usize {
         let mut used = 0;
         while used < max_actions {
-            if !self.payload.is_complete() {
-                used += self.payload.reclaim(max_actions - used);
-            } else if let Some(connection) = self.connection.as_mut() {
-                used += connection.reclaim(max_actions - used);
-                if connection.is_complete() && used < max_actions {
-                    self.connection = None;
-                    used += 1;
-                }
-            } else if let Some((_, packet)) = self.group.pending.pop_first() {
-                self.payload = packet.payload.retire();
-                used += 1;
-            } else if let Some(event) = self.group.events.pop_front() {
-                if let GroupEvent::DataReceived(packet) = event {
-                    self.payload = packet.payload.retire();
-                }
-                used += 1;
-            } else if self.group.owned.pop_first().is_some() {
-                used += 1;
-            } else if let Some(member) = self.group.members.last_mut() {
-                if member.reserved.pop_first().is_none() {
-                    let member = self.group.members.pop().expect("member retained");
-                    self.connection = Some(member.connection.into_retirement());
-                }
-                used += 1;
-            } else if self.group.collisions.pop_front().is_some() {
-                used += 1;
-            } else {
+            let step = self.reclaim_step(max_actions - used);
+            if step == 0 {
                 break;
             }
+            used += step;
         }
         used
+    }
+
+    fn reclaim_step(&mut self, max_actions: usize) -> usize {
+        if !self.payload.is_complete() {
+            return self.payload.reclaim(max_actions);
+        }
+        if let Some(connection) = self.connection.as_mut() {
+            let used = connection.reclaim(max_actions);
+            if connection.is_complete() && used < max_actions {
+                self.connection = None;
+                return used + 1;
+            }
+            return used;
+        }
+        if let Some((_, packet)) = self.group.pending.pop_first() {
+            self.payload = packet.payload.retire();
+            return 1;
+        }
+        if let Some(event) = self.group.events.pop_front() {
+            if let GroupEvent::DataReceived(packet) = event {
+                self.payload = packet.payload.retire();
+            }
+            return 1;
+        }
+        if self.group.owned.pop_first().is_some() {
+            return 1;
+        }
+        if let Some(member) = self.group.members.last_mut() {
+            if member.reserved.pop_first().is_none() {
+                let member = self.group.members.pop().expect("member retained");
+                self.connection = Some(member.connection.into_retirement());
+            }
+            return 1;
+        }
+        usize::from(self.group.collisions.pop_front().is_some())
     }
 
     #[must_use]

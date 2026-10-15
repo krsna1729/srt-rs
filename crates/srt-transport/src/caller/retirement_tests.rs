@@ -25,11 +25,45 @@ impl Drop for TrackedDatagram {
     }
 }
 
+fn queue_tracked_caller_flight(
+    table: &mut CallerTable,
+    id: LogicalCallerId,
+    freed: &Arc<AtomicUsize>,
+    now: Timestamp,
+) {
+    for _ in 0..130 {
+        let payload = Bytes::from_owner(TrackedDatagram {
+            bytes: vec![0x42],
+            freed: Arc::clone(freed),
+        });
+        table
+            .logical_caller_mut(&id)
+            .unwrap()
+            .send_shared(payload, now)
+            .unwrap();
+    }
+    let mut wire = Vec::new();
+    for _ in 0..10 {
+        wire.clear();
+        table.poll_outbound(now, &mut wire);
+        if wire.is_empty() {
+            break;
+        }
+    }
+}
+
+fn reclaim_callers_one_action_at_a_time(table: &mut CallerTable, freed: &AtomicUsize) {
+    for _ in 0..4096 {
+        if table.retirements_pending() == 0 {
+            break;
+        }
+        let before = freed.load(Ordering::SeqCst);
+        assert_eq!(table.reclaim_retired(1), 1);
+        assert!(freed.load(Ordering::SeqCst) <= before + 1);
+    }
+}
+
 #[test]
-#[expect(
-    clippy::cognitive_complexity,
-    reason = "One direct/group lifecycle trace checks routing, capacity and physical destruction"
-)]
 fn direct_and_group_callers_unroute_now_but_hold_capacity_until_physical_completion() {
     for grouped in [false, true] {
         let mut table = CallerTable::with_max_callers(1);
@@ -48,24 +82,7 @@ fn direct_and_group_callers_unroute_now_but_hold_capacity_until_physical_complet
         };
         let freed = Arc::new(AtomicUsize::new(0));
         let now = Timestamp::from_micros(1_000_000);
-        for _ in 0..130 {
-            let payload = Bytes::from_owner(TrackedDatagram {
-                bytes: vec![0x42],
-                freed: Arc::clone(&freed),
-            });
-            table
-                .logical_caller_mut(&id)
-                .unwrap()
-                .send_shared(payload, now)
-                .unwrap();
-        }
-        let mut wire = Vec::new();
-        for _ in 0..10 {
-            table.poll_outbound(now, &mut wire);
-            if wire.is_empty() {
-                break;
-            }
-        }
+        queue_tracked_caller_flight(&mut table, id, &freed, now);
         assert_eq!(freed.load(Ordering::SeqCst), 0);
         assert!(table.retire(id));
         assert!(table.logical_caller(&id).is_none());
@@ -73,8 +90,11 @@ fn direct_and_group_callers_unroute_now_but_hold_capacity_until_physical_complet
         assert_eq!(table.reclaim_retired(0), 0);
         assert_eq!(table.retirements_pending(), 1);
         assert!(!table.retire(id), "logical retirement is exactly once");
-        let replacement = || CallerLeg::new(peer, new_connected_caller_connection(102));
-        assert!(table.add_direct(replacement()).is_err());
+        assert!(
+            table
+                .add_direct(CallerLeg::new(peer, new_connected_caller_connection(102)))
+                .is_err()
+        );
         assert!(
             table
                 .add_group(
@@ -89,17 +109,14 @@ fn direct_and_group_callers_unroute_now_but_hold_capacity_until_physical_complet
                 )
                 .is_err()
         );
-        for _ in 0..4096 {
-            if table.retirements_pending() == 0 {
-                break;
-            }
-            let before = freed.load(Ordering::SeqCst);
-            assert_eq!(table.reclaim_retired(1), 1);
-            assert!(freed.load(Ordering::SeqCst) <= before + 1);
-        }
+        reclaim_callers_one_action_at_a_time(&mut table, &freed);
         assert_eq!(freed.load(Ordering::SeqCst), 130);
         assert_eq!(table.retirements_pending(), 0);
-        assert!(table.add_direct(replacement()).is_ok());
+        assert!(
+            table
+                .add_direct(CallerLeg::new(peer, new_connected_caller_connection(102)))
+                .is_ok()
+        );
     }
 }
 
