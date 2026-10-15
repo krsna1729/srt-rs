@@ -397,13 +397,14 @@ drop), and their largest single visit grew rather than shrank -- the fragmented
 application case reached 16,960 us at 256 against 8,267 us at 64. A larger budget
 buys fewer, longer visits, not a smaller worst step.
 
-The probe now pins its shapes exactly (one packet credit per fragment, one event
-per delivered message, one payload page per 64 slots), so app-single requires
-131,072 actions, the fragmented backlog 69,632, the incomplete message 66,560 and
-the complete 82.25 MiB message 66,561: the one-action difference is the message
-event a completed message must queue. Mutation: injecting the large message
-without its Last fragment drops it to 66,560 and the floor fails, which the
-previous loose floor did not catch.
+The probe now pins four shapes exactly (one packet credit per fragment, one event
+per delivered message, one payload page per 64 slots of a multi-page message):
+app-single requires 131,072 actions, the fragmented backlog 69,632, the
+incomplete message 66,560 and the complete 82.25 MiB message 66,561, the
+one-action difference being the message event a completed message must queue. The
+transmit, future-receive and empty shapes keep their floor and upper bound.
+Mutation: injecting the large message without its Last fragment drops it to
+66,560 and the floor fails, which the previous loose floor did not catch.
 
 Raising `MALLOC_TRIM_THRESHOLD_` (top-of-heap trimming disabled) for a throwaway
 diagnostic process on the application 65,536 single-packet case collapsed the
@@ -413,11 +414,11 @@ final drop from 6034 us to 11.6 us and the whole lifecycle from 21301 us to
 single-packet shape is allocator trimming; the other multi-millisecond steps in
 the table -- future RX 75,975 us, the 82.25 MiB message 50,825 us, TX 65,536
 30,336 us, and the residual 4,634 us the 16-fragment workload still reached with
-trimming off -- are unattributed, and one Owner maintenance visit was observed at
-76 ms of thread CPU against a budget of 64. That is the consequence that matters:
-a visit that long stalls every sibling on the same Owner. The allocator- or
-kernel-bound tail therefore stays open (P2) rather than explained; no allocator
-setting ships.
+trimming off -- are unattributed, and one probe `reclaim(64)` call, the unit an
+Owner pass runs, was observed at 76 ms of thread CPU against a budget of 64. That
+is the consequence that matters: a pass that long stalls every sibling on the
+same Owner. The allocator- or kernel-bound tail therefore stays open (P2) rather
+than explained; no allocator setting ships.
 
 Cleanup totals are not receive-path CPU totals: the old assembler copied each
 complete fragmented message and freed its packet allocations during setup.
