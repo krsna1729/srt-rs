@@ -5,7 +5,12 @@
 //! ID, every later member must report the same one, a response without the
 //! extension is admitted without binding, and a mismatch breaks only that
 //! member. The binding is a property of the group, not of the leg that set it,
-//! so it outlives that leg: a replacement with the same ID is admitted.
+//! and it is never released: a failed holder does not let a different
+//! receiving group in.
+//!
+//! Legs are added before their handshake completes, as the transport adds
+//! them, so admission is the state refresh's job (`refresh_pending_states` ->
+//! `admit_connected_peer_groups`), not `add_member`'s.
 
 use srt_proto::handshake::{GroupExtensionData, GroupType};
 use srt_proto::wire::{ControlPacket, ControlType, SrtPacket};
@@ -28,59 +33,82 @@ fn packets_from(connection: &mut SrtConnection) -> Vec<Vec<u8>> {
     packets
 }
 
-/// The caller side of a connected pair whose listener answers from `group_id`,
-/// or from no receiving group at all.
-fn member_pair(group_id: Option<u32>) -> SrtConnection {
-    let local_extension = GroupExtensionData {
-        group_id: 0x4000_0031,
-        group_type: GroupType::Broadcast,
-        flags: 0,
-        weight: 1,
-    };
-    let listener_extension = group_id.map(|group_id| GroupExtensionData {
-        group_id,
-        group_type: GroupType::Broadcast,
-        flags: 0,
-        weight: 100,
-    });
-    let mut caller = SrtConnection::new_caller(ConnectionOptions {
-        tsbpd_delay: 0,
-        // The listener answers with its own extension only when the caller
-        // sent one, so the caller always carries its local group here.
-        group_extension: Some(local_extension),
-        ..Default::default()
-    });
-    let mut listener = SrtConnection::new_listener(ConnectionOptions {
-        tsbpd_delay: 0,
-        group_extension: listener_extension,
-        ..Default::default()
-    });
-    caller.connect(ts(0)).expect("caller connects");
-    for round in 0..10 {
-        for packet in packets_from(&mut caller) {
-            listener
-                .feed_recv_buf(&packet, ts(round * 10_000))
-                .expect("request decodes");
-        }
-        for packet in packets_from(&mut listener) {
-            caller
-                .feed_recv_buf(&packet, ts(round * 10_000))
-                .expect("response decodes");
-        }
-        if caller.state() == ConnectionState::Connected
-            && listener.state() == ConnectionState::Connected
-        {
-            assert_eq!(
-                caller
-                    .peer_group_extension()
-                    .map(|extension| extension.group_id),
-                group_id,
-                "the leg reports the receiving group the listener answers from"
-            );
-            return caller;
-        }
+/// A leg before the group sees it: the caller side is what the group will
+/// hold, and the listener side answers from `group_id`, or from no receiving
+/// group at all.
+struct PendingLeg {
+    caller: SrtConnection,
+    listener: SrtConnection,
+}
+
+impl PendingLeg {
+    fn new(group_id: Option<u32>) -> Self {
+        let local_extension = GroupExtensionData {
+            group_id: 0x4000_0031,
+            group_type: GroupType::Broadcast,
+            flags: 0,
+            weight: 1,
+        };
+        let listener_extension = group_id.map(|group_id| GroupExtensionData {
+            group_id,
+            group_type: GroupType::Broadcast,
+            flags: 0,
+            weight: 100,
+        });
+        let mut caller = SrtConnection::new_caller(ConnectionOptions {
+            tsbpd_delay: 0,
+            // The listener answers with its own extension only when the caller
+            // sent one, so the caller always carries its local group here.
+            group_extension: Some(local_extension),
+            ..Default::default()
+        });
+        caller.connect(ts(0)).expect("caller starts its handshake");
+        let listener = SrtConnection::new_listener(ConnectionOptions {
+            tsbpd_delay: 0,
+            group_extension: listener_extension,
+            ..Default::default()
+        });
+        Self { caller, listener }
     }
-    panic!("pair did not connect");
+
+    /// Add this leg and drive its handshake inside `group`, as the transport
+    /// does: the group holds the caller side, the listener answers it.
+    fn join(self, group: &mut SrtGroup, member_id: u32) {
+        let Self {
+            caller,
+            mut listener,
+        } = self;
+        group
+            .add_member(member_id, 1, caller)
+            .expect("member admitted");
+        for round in 0..10 {
+            let now = ts(round * 10_000);
+            let member = group.member_mut(member_id).expect("member");
+            for packet in packets_from(member.connection_mut()) {
+                listener
+                    .feed_recv_buf(&packet, now)
+                    .expect("request decodes");
+            }
+            for packet in packets_from(&mut listener) {
+                group
+                    .member_mut(member_id)
+                    .expect("member")
+                    .connection_mut()
+                    .feed_recv_buf(&packet, now)
+                    .expect("response decodes");
+            }
+            if group
+                .member(member_id)
+                .expect("member")
+                .connection()
+                .state()
+                == ConnectionState::Connected
+            {
+                return;
+            }
+        }
+        panic!("leg did not connect");
+    }
 }
 
 fn group() -> SrtGroup {
@@ -90,19 +118,21 @@ fn group() -> SrtGroup {
 #[test]
 fn the_first_group_report_binds_and_a_matching_leg_is_admitted() {
     let mut group = group();
-    group
-        .add_member(1, 1, member_pair(Some(0x4000_2002)))
-        .expect("first member");
-    assert!(group.can_send(), "a refresh admits the connected members");
+    PendingLeg::new(Some(0x4000_2002)).join(&mut group, 1);
+    assert_eq!(
+        group.peer_group_id(),
+        None,
+        "a leg that is connected but not yet looked at has not bound anything"
+    );
+
+    assert!(group.can_send(), "a refresh admits the connected leg");
     assert_eq!(
         group.peer_group_id(),
         Some(0x4000_2002),
         "the first report binds the group"
     );
 
-    group
-        .add_member(2, 1, member_pair(Some(0x4000_2002)))
-        .expect("second member");
+    PendingLeg::new(Some(0x4000_2002)).join(&mut group, 2);
     assert!(group.can_send());
     assert_eq!(group.peer_group_id(), Some(0x4000_2002));
     assert_eq!(
@@ -119,9 +149,7 @@ fn the_first_group_report_binds_and_a_matching_leg_is_admitted() {
 #[test]
 fn a_leg_without_a_group_report_is_admitted_without_binding() {
     let mut group = group();
-    group
-        .add_member(1, 1, member_pair(None))
-        .expect("first member");
+    PendingLeg::new(None).join(&mut group, 1);
     assert!(group.can_send());
     assert_eq!(
         group.peer_group_id(),
@@ -135,9 +163,7 @@ fn a_leg_without_a_group_report_is_admitted_without_binding() {
 
     // The next member to report an identity binds the group for every later
     // one, no matter that an earlier leg was admitted first.
-    group
-        .add_member(2, 1, member_pair(Some(0x4000_2002)))
-        .expect("second member");
+    PendingLeg::new(Some(0x4000_2002)).join(&mut group, 2);
     assert!(group.can_send());
     assert_eq!(group.peer_group_id(), Some(0x4000_2002));
     assert_eq!(
@@ -149,14 +175,15 @@ fn a_leg_without_a_group_report_is_admitted_without_binding() {
 #[test]
 fn a_leg_from_another_receiving_group_breaks_only_itself() {
     let mut group = group();
-    group
-        .add_member(1, 1, member_pair(Some(0x4000_2002)))
-        .expect("first member");
-    group
-        .add_member(2, 1, member_pair(Some(0x4000_3003)))
-        .expect("second member");
-    assert!(group.can_send());
+    PendingLeg::new(Some(0x4000_2002)).join(&mut group, 1);
+    PendingLeg::new(Some(0x4000_3003)).join(&mut group, 2);
+    assert_eq!(
+        group.peer_group_id(),
+        None,
+        "neither leg has been looked at yet"
+    );
 
+    assert!(group.can_send());
     assert_eq!(
         group.peer_group_id(),
         Some(0x4000_2002),
@@ -203,35 +230,49 @@ fn a_leg_from_another_receiving_group_breaks_only_itself() {
 }
 
 #[test]
-fn a_replacement_leg_keeps_the_binding_of_a_failed_holder() {
+fn a_failed_holder_does_not_release_the_binding() {
     let mut group = group();
-    group
-        .add_member(1, 1, member_pair(Some(0x4000_2002)))
-        .expect("first member");
+    PendingLeg::new(Some(0x4000_2002)).join(&mut group, 1);
     assert!(group.can_send());
     assert!(group.mark_member_broken(1), "the holder is marked broken");
-
-    group
-        .add_member(2, 1, member_pair(Some(0x4000_2002)))
-        .expect("replacement member");
-    assert!(group.can_send());
     assert_eq!(
         group.peer_group_id(),
         Some(0x4000_2002),
-        "the failed holder does not release or own the binding"
-    );
-    assert_eq!(
-        group.member(2).expect("replacement member").state(),
-        GroupMemberState::Active
+        "the binding is not released with the leg that set it"
     );
 
-    group
-        .add_member(3, 1, member_pair(Some(0x4000_3003)))
-        .expect("third member");
+    // A different receiving group is refused while the binding stands, before
+    // any same-ID replacement exists: a released binding would have let this
+    // leg bind the group instead.
+    PendingLeg::new(Some(0x4000_3003)).join(&mut group, 2);
+    // A refresh is what looks at a newly connected leg, whether or not any leg
+    // can send: both legs are broken by the time this one is refused.
+    let _ = group.can_send();
+    assert_eq!(
+        group.member(2).expect("second member").state(),
+        GroupMemberState::Broken,
+        "a different receiving group is still refused"
+    );
+    assert_eq!(
+        group.peer_group_id(),
+        Some(0x4000_2002),
+        "the refusal leaves the binding alone"
+    );
+    assert_eq!(
+        group
+            .poll_peer_group_collision(ts(300_000))
+            .expect("the refusal is reported")
+            .member_id,
+        2
+    );
+
+    // The same receiving group is welcome again.
+    PendingLeg::new(Some(0x4000_2002)).join(&mut group, 3);
     assert!(group.can_send());
     assert_eq!(
         group.member(3).expect("third member").state(),
-        GroupMemberState::Broken,
-        "a different receiving group is still refused after a holder failed"
+        GroupMemberState::Active,
+        "a replacement reporting the same group is admitted"
     );
+    assert_eq!(group.peer_group_id(), Some(0x4000_2002));
 }
