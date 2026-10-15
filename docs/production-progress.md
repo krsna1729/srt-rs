@@ -363,11 +363,13 @@ The maintained probe (`crates/srt-protocol/examples/teardown_tail_probe.rs`,
 retained shapes and times `SrtConnection::into_retirement()`, every
 `reclaim(budget)` visit and the final drop separately. Thread CPU
 (`CLOCK_THREAD_CPUTIME_ID`) microseconds, median of 10 samples, budget 64,
-1,316-byte DATA payloads. `actions` counts released packet slots, queued events
-and payload page/directory entries; every incomplete visit asserts
+1,316-byte DATA payloads in the single-packet shapes (the fragmented shapes fill
+the negotiated payload size instead). `actions` counts released packet slots,
+queued events and payload page/directory entries; `visits` counts the reclaim
+visits plus the detach and final-drop phases; every incomplete visit asserts
 `used > 0 && used <= budget`.
 
-| Retained shape | detach p50 | reclaim p50 | final drop p50 | actions | visits | largest step |
+| Retained shape | detach p50 | reclaim p50 | final drop p50 | actions | visits | largest step (CPU max) |
 |---|---:|---:|---:|---:|---:|---:|
 | Empty | 0.5 | 0.3 | 3.2 | 0 | 3 | 4.4 |
 | TX 8,192 | 3.9 | 4035 | 9.9 | 8192 | 130 | 8820 |
@@ -381,7 +383,7 @@ and payload page/directory entries; every incomplete visit asserts
 | Encrypted application 4,096 x 16 fragments | 4.5 | 15615 | 2929 | 69632 | 1090 | 10669 |
 | One complete 82.25 MiB message | 3.2 | 3789 | 8.0 | 66561 | 1043 | 50825 |
 
-Detach is O(1) for every shape (2.6-4.9 us observed; `reclaim_terminal(0)` does
+Detach is O(1) for every shape (0.5-4.5 us observed; `reclaim_terminal(0)` does
 no work): the assembler retains one pending partial, so an incomplete message
 enters retirement as a single cursor rather than as thousands of partials. The
 whole-shape totals are larger than the prototype column because this probe
@@ -389,16 +391,33 @@ allocates one payload buffer per packet and releases the payload `Bytes` one
 action at a time, while the prototype fixture released its payload storage more
 cheaply; the two tables are not like-for-like. Larger reclaim budgets do not
 change the totals and do not tighten the bound: at budget 256 the incomplete
-message takes 260 visits instead of 1040 and the fragmented application case 272
-instead of 1088, while their largest single step is unchanged (5072 us and
-16960 us).
+message takes 260 reclaim visits instead of 1,040 and the fragmented application
+case 272 instead of 1,088 (the table's 1,042 and 1,090 add the detach and final
+drop), and their largest single visit grew rather than shrank -- the fragmented
+application case reached 16,960 us at 256 against 8,267 us at 64. A larger budget
+buys fewer, longer visits, not a smaller worst step.
+
+The probe now pins its shapes exactly (one packet credit per fragment, one event
+per delivered message, one payload page per 64 slots), so app-single requires
+131,072 actions, the fragmented backlog 69,632, the incomplete message 66,560 and
+the complete 82.25 MiB message 66,561: the one-action difference is the message
+event a completed message must queue. Mutation: injecting the large message
+without its Last fragment drops it to 66,560 and the floor fails, which the
+previous loose floor did not catch.
 
 Raising `MALLOC_TRIM_THRESHOLD_` (top-of-heap trimming disabled) for a throwaway
 diagnostic process on the application 65,536 single-packet case collapsed the
 final drop from 6034 us to 11.6 us and the whole lifecycle from 21301 us to
 8988 us; the same diagnostic moved the surviving prototype binary by about
-1.3x. The multi-millisecond steps are allocator trimming, not traversal of
-retained state.
+1.3x. That covers one case and one phase. The final drop of the application
+single-packet shape is allocator trimming; the other multi-millisecond steps in
+the table -- future RX 75,975 us, the 82.25 MiB message 50,825 us, TX 65,536
+30,336 us, and the residual 4,634 us the 16-fragment workload still reached with
+trimming off -- are unattributed, and one Owner maintenance visit was observed at
+76 ms of thread CPU against a budget of 64. That is the consequence that matters:
+a visit that long stalls every sibling on the same Owner. The allocator- or
+kernel-bound tail therefore stays open (P2) rather than explained; no allocator
+setting ships.
 
 Cleanup totals are not receive-path CPU totals: the old assembler copied each
 complete fragmented message and freed its packet allocations during setup.
@@ -429,8 +448,10 @@ workload still reached 4634.746 us. No allocator setting ships. Bounded release
 counts are proved; a hard allocator/kernel CPU-time bound is **not** established.
 Terminal storage is released through
 `srt_transport::retirement::RetiredProtocols` (protocol `ConnectionRetirement` /
-`GroupRetirement` cursors) inside `OwnerServiceBudget::max_maintenance_actions`
-(256) in the compio, mio and tokio Owners, and admission, half-open and
+`GroupRetirement` cursors) inside the compio Owner's
+`OwnerServiceBudget::max_maintenance_actions` (256); the mio and tokio Owners
+reclaim under the side's `OutputDrainBudget::max_actions`, the same budget their
+output draining uses. Admission, half-open and
 window-byte credit stays charged to the originating table until `is_complete()`,
 so the retire queue cannot outgrow that table's session capacity. No background
 thread and no unbounded garbage queue exist for it.

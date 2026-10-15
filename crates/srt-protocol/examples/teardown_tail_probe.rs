@@ -5,8 +5,9 @@
 //! Restored measurement harness for the owner-local retirement contract (see
 //! `crates/srt-protocol/README.md` and
 //! `docs/production-progress.md` "Segmented payload retirement and its
-//! measurement limits"). The case names and the TSV header are the ones the
-//! deleted probe used, so old and new tables stay comparable.
+//! measurement limits"). The case names are the ones the deleted probe used, so
+//! old and new tables stay comparable; the TSV header is that header plus a
+//! `cpu_p99_us` column.
 //!
 //! Phases, measured separately for every sample:
 //!
@@ -40,7 +41,9 @@ use srt_proto::{
     Timestamp,
 };
 
-/// Payload of one DATA packet in the recorded matrix (libsrt's live default).
+/// Payload of one DATA packet in the single-packet shapes (libsrt's live
+/// default). The fragmented shapes fill `effective_max_payload_size()` instead,
+/// which is this value minus the block-cipher tag when encryption is on.
 const DEFAULT_PAYLOAD: usize = 1_316;
 /// Default reclaim action budget per visit.
 const DEFAULT_BUDGET: usize = 64;
@@ -557,6 +560,17 @@ fn shape(detail: String, min_actions: usize) -> Shape {
     }
 }
 
+/// A shape whose released-action count is exact: every retained slot, page and
+/// event is counted, so a fixture that stops retaining (or starts delivering)
+/// what it claims fails here instead of passing a loose floor.
+fn shape_exact(detail: String, actions: usize) -> Shape {
+    Shape {
+        detail,
+        min_actions: actions,
+        max_actions: actions,
+    }
+}
+
 fn fixture(case: Case) -> (SrtConnection, Shape) {
     match case {
         Case::EmptyPlain => fixture_empty(),
@@ -645,7 +659,8 @@ fn fixture_app_single() -> (SrtConnection, Shape) {
     let detail = format!(
         "{WINDOW_CHUNKS} single-packet messages of {DEFAULT_PAYLOAD} B delivered to the unpolled application event queue ({WINDOW_CHUNKS} events, {WINDOW_CHUNKS} packet credits)"
     );
-    (listener, shape(detail, WINDOW_CHUNKS as usize))
+    // Exact: one packet credit plus one message event per message.
+    (listener, shape_exact(detail, WINDOW_CHUNKS as usize * 2))
 }
 
 /// Application backlog of fragments: 4096 messages x 16 fragments, delivered
@@ -669,7 +684,11 @@ fn fixture_app_fragments(encrypted: bool) -> (SrtConnection, Shape) {
         "{}application event queue holds {APP_MESSAGES} messages x {APP_FRAGMENTS} fragments of {fragment} B ({packets} packet credits); receiver buffer empty",
         cipher_prefix(encrypted)
     );
-    (listener, shape(detail, packets as usize))
+    // Exact: one packet credit per fragment plus one event per message.
+    (
+        listener,
+        shape_exact(detail, packets as usize + APP_MESSAGES as usize),
+    )
 }
 
 /// One incomplete message: fragments without a Last, so the assembler keeps a
@@ -696,7 +715,15 @@ fn fixture_incomplete_message() -> (SrtConnection, Shape) {
     let detail = format!(
         "one incomplete {WINDOW_CHUNKS}-fragment message ({DEFAULT_PAYLOAD} B chunks, first sequence {seq0}, no Last fragment) held by the assembler's single pending partial"
     );
-    (listener, shape(detail, WINDOW_CHUNKS as usize))
+    // Exact: one packet credit per fragment plus one page per 64 slots, and no
+    // message event: an incomplete message must not be delivered.
+    (
+        listener,
+        shape_exact(
+            detail,
+            WINDOW_CHUNKS as usize + (WINDOW_CHUNKS as usize).div_ceil(64),
+        ),
+    )
 }
 
 /// One complete message of a full window: 65,536 chunks, delivered and never
@@ -717,7 +744,15 @@ fn fixture_large_message() -> (SrtConnection, Shape) {
     let detail = format!(
         "one complete {WINDOW_CHUNKS}-chunk message ({bytes} B, {DEFAULT_PAYLOAD} B chunks, first sequence {seq0}) delivered to the unpolled application event queue"
     );
-    (listener, shape(detail, WINDOW_CHUNKS as usize))
+    // Exact, and one action above the incomplete shape: the packet credits, the
+    // same pages, and the one message event a completed message must queue.
+    (
+        listener,
+        shape_exact(
+            detail,
+            WINDOW_CHUNKS as usize + (WINDOW_CHUNKS as usize).div_ceil(64) + 1,
+        ),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -820,7 +855,10 @@ fn consumed_probe(samples: usize, budget: usize, clocks: &Clocks) {
             reclaim.step_wall_ns = reclaim.step_wall_ns.max(wall_ns);
             reclaim.step_cpu_ns = reclaim.step_cpu_ns.max(cpu_ns);
             let complete = retirement.is_complete();
-            assert!(used > 0 || complete, "retirement must progress");
+            assert!(
+                used <= budget && (used > 0 || complete),
+                "used <= budget && (used > 0 || retirement.is_complete())"
+            );
             if complete {
                 break;
             }
