@@ -392,16 +392,20 @@ fn the_aggregate_separates_logical_payloads_from_wire_packets() {
         2,
         "Broadcast sends on both legs"
     );
-    pump(&mut callers, &mut receivers, &[(a, 0), (b, 0)], 12..16);
+    pump(&mut callers, &mut receivers, &[(a, 0), (b, 0)], 14..18);
 
     let stats = group_of(&callers, id).aggregate;
     assert_eq!(stats.logical_payloads_sent, 1, "one logical payload");
     assert_eq!(stats.logical_payload_bytes_sent, payload.len() as u64);
+    assert_eq!(
+        stats.wire_packets_retransmitted, 0,
+        "nothing is retransmitted, so the wire counts are the originals"
+    );
     assert_eq!(stats.wire_packets_sent, 2, "one physical packet per leg");
     assert_eq!(stats.wire_payload_bytes_sent, 2 * payload.len() as u64);
 
     assert_eq!(sent(&mut callers, 800_000), 2);
-    pump(&mut callers, &mut receivers, &[(a, 0), (b, 0)], 16..20);
+    pump(&mut callers, &mut receivers, &[(a, 0), (b, 0)], 18..22);
 
     let stats = group_of(&callers, id).aggregate;
     assert_eq!(
