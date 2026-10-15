@@ -649,7 +649,7 @@ fn broadcast_send_reaches_every_established_leg() {
             received += events
                 .iter()
                 .filter(|event| matches!(&event.event,
-                    srt_proto::ConnectionEvent::DataReceived { payload: got, .. } if *got == payload))
+                    srt_proto::ConnectionEvent::DataReceived { payload: got, .. } if got.eq(payload.as_ref())))
                 .count();
             received > 0
                 && group_stats(owner, &id)
@@ -708,7 +708,7 @@ fn backup_send_uses_the_established_leg_only() {
             owner.poll_listener_events(&mut events);
             received |= events.iter().any(|event| {
                 matches!(&event.event,
-                srt_proto::ConnectionEvent::DataReceived { payload: got, .. } if *got == payload)
+                srt_proto::ConnectionEvent::DataReceived { payload: got, .. } if got.eq(payload.as_ref()))
             });
             received
         })

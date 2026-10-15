@@ -40,9 +40,12 @@ fn shared_caller_config(remote: std::net::SocketAddr) -> CallerConfig {
 /// application-level envelope carrying "how old was this when I forwarded
 /// it" forward across the hop to `destination`, since the wire protocol's
 /// per-connection timestamp cannot.
-fn encode_envelope(age_so_far: Duration, payload: &[u8]) -> Vec<u8> {
-    let mut envelope = (age_so_far.as_micros() as u64).to_le_bytes().to_vec();
-    envelope.extend_from_slice(payload);
+fn encode_envelope(age_so_far: Duration, payload: &srt_proto::ReceivedPayload) -> Vec<u8> {
+    let mut envelope = Vec::with_capacity(8 + payload.len());
+    envelope.extend_from_slice(&(age_so_far.as_micros() as u64).to_le_bytes());
+    for chunk in payload.chunks() {
+        envelope.extend_from_slice(chunk);
+    }
     envelope
 }
 
@@ -105,7 +108,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let forwarded = tokio::time::timeout(deadline, destination_session.recv())
         .await?
         .expect("destination receives from relay");
-    let (carried_age, original_payload) = decode_envelope(&forwarded.payload);
+    let mut envelope = Vec::with_capacity(forwarded.payload.len());
+    for chunk in forwarded.payload.chunks() {
+        envelope.extend_from_slice(chunk);
+    }
+    let (carried_age, original_payload) = decode_envelope(&envelope);
     // `forwarded.source_time` is when the RELAY queued this on the
     // relay-to-destination connection -- i.e. transit time on this one
     // hop, independent of `carried_age`. Note `carried_age`'s window ends

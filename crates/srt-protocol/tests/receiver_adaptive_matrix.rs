@@ -421,7 +421,7 @@ fn bonded_group_transfer_preserves_reservation() {
     let mut delivered = false;
     while let Some(event) = group.poll_event(ts(10_000)) {
         if let GroupEvent::DataReceived(msg) = event {
-            assert_eq!(&msg.payload[..], b"group-payload");
+            assert!(msg.payload.eq(&b"group-payload"[..]));
             delivered = true;
         }
     }

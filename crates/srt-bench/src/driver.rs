@@ -4,8 +4,9 @@
 //! exists only to pump one `SrtConnection` against a real UDP socket long
 //! enough to prove wire-level interop against real libsrt.
 
-use bytes::Bytes;
-use srt_proto::{ConnectionEvent, ConnectionOutput, SrtConnection, TimerId, Timestamp};
+use srt_proto::{
+    ConnectionEvent, ConnectionOutput, ReceivedPayload, SrtConnection, TimerId, Timestamp,
+};
 use std::collections::HashMap;
 use std::net::UdpSocket;
 use std::time::Instant;
@@ -13,7 +14,7 @@ use std::time::Instant;
 pub struct DriverResult {
     pub connected: bool,
     pub events: Vec<String>,
-    pub received_payloads: Vec<Bytes>,
+    pub received_payloads: Vec<ReceivedPayload>,
 }
 
 fn receive_packet(
@@ -66,7 +67,7 @@ fn record_events(
     conn: &mut SrtConnection,
     connected: &mut bool,
     events: &mut Vec<String>,
-    received_payloads: &mut Vec<Bytes>,
+    received_payloads: &mut Vec<ReceivedPayload>,
 ) {
     while let Some(event) = conn.poll_event() {
         match event {

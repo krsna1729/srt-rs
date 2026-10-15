@@ -1048,6 +1048,7 @@ pub struct PeerTable {
     /// Sum of [`SrtConnection::window_memory_bound_bytes`] over established
     /// peers, charged and released wherever `established_peers` changes.
     window_memory_bytes: u64,
+    retired_protocols: crate::retirement::RetiredProtocols,
     /// Non-lossy index of peers/legs holding an undrained
     /// [`ProtocolOutputFailure`]. One entry is appended at the moment of
     /// quarantine, so its length cannot exceed the quarantined population and
@@ -1248,6 +1249,7 @@ impl PeerTable {
             half_open_peers: 0,
             established_peers: 0,
             window_memory_bytes: 0,
+            retired_protocols: crate::retirement::RetiredProtocols::new(config.max_peers),
             protocol_failure_index: VecDeque::new(),
             protocol_failure_scratch: Vec::new(),
             half_open_deadlines: DueIndex::default(),
@@ -1567,11 +1569,15 @@ impl PeerTable {
             telemetry.record_invalid_datagram();
             return Some(Admit::Dropped(AdmissionDropReason::InvalidPacket));
         }
-        if self.len() >= self.config.max_peers {
+        if self.len() + self.retired_protocols.established + self.retired_protocols.half_open
+            >= self.config.max_peers
+        {
             telemetry.record_admission_capacity_drop();
             return Some(Admit::Dropped(AdmissionDropReason::Capacity));
         }
-        if self.half_open_count() >= self.config.max_half_open_peers {
+        if self.half_open_count() + self.retired_protocols.half_open
+            >= self.config.max_half_open_peers
+        {
             telemetry.record_half_open_capacity_drop();
             return Some(Admit::Dropped(AdmissionDropReason::HalfOpenCapacity));
         }
@@ -1748,7 +1754,8 @@ impl PeerTable {
         if self
             .get_peer(&physical)
             .is_some_and(|entry| !entry.admission_established)
-            && self.established_count() >= self.config.max_established_peers
+            && self.established_count() + self.retired_protocols.established
+                >= self.config.max_established_peers
         {
             telemetry.record_established_capacity_drop();
             return Some(Admit::Dropped(AdmissionDropReason::EstablishedCapacity));
@@ -1774,7 +1781,7 @@ impl PeerTable {
         let window_room = self
             .config
             .max_window_memory_bytes
-            .map(|max| max.saturating_sub(self.window_memory_bytes));
+            .map(|max| max.saturating_sub(self.reserved_window_memory_bytes()));
         let result = {
             let Some(entry) = self.get_peer_mut(&physical) else {
                 return Some(Admit::Dropped(AdmissionDropReason::StaleConclusion));
@@ -2023,7 +2030,7 @@ impl PeerTable {
         }
         telemetry.record_invalid_datagram();
         if !known {
-            let _ = self.remove_physical(physical);
+            self.retire_physical(physical);
         } else if feed.became_terminal {
             self.mark_ready_physical(physical);
         }
@@ -2179,11 +2186,15 @@ impl PeerTable {
     /// hold it (full, or its slot is unexpectedly taken).
     pub(crate) fn adopt(&mut self, leg: Box<RelocatedLeg>) -> Result<(), Box<RelocatedLeg>> {
         let window_bytes = leg.entry.conn.window_memory_bound_bytes();
-        if self.established_peers >= self.config.max_established_peers
-            || self
-                .config
-                .max_window_memory_bytes
-                .is_some_and(|max| self.window_memory_bytes.saturating_add(window_bytes) > max)
+        if self.established_peers + self.retired_protocols.established
+            >= self.config.max_established_peers
+            || self.len() + self.retired_protocols.established + self.retired_protocols.half_open
+                >= self.config.max_peers
+            || self.config.max_window_memory_bytes.is_some_and(|max| {
+                self.reserved_window_memory_bytes()
+                    .saturating_add(window_bytes)
+                    > max
+            })
         {
             return Err(leg);
         }
@@ -2869,7 +2880,7 @@ impl PeerTable {
                 }
                 continue;
             }
-            let _ = self.remove_physical(peer);
+            self.retire_physical(peer);
             count += 1;
         }
         count
@@ -3513,7 +3524,7 @@ impl PeerTable {
 
     fn remove_rejected_peers(&mut self, rejected: Vec<PhysicalPeerKey>) {
         for peer in rejected {
-            let _ = self.remove_physical(peer);
+            self.retire_physical(peer);
         }
     }
 
@@ -4118,6 +4129,51 @@ impl PeerTable {
         }
     }
 
+    /// Unroute one logical peer immediately. Keep its admission and window-memory
+    /// credit until `reclaim_retired` finishes releasing the retained storage.
+    pub fn retire(&mut self, id: LogicalPeerId) -> bool {
+        let Some(target) = self.logical_peers.get(&id).cloned() else {
+            return false;
+        };
+        match target {
+            LogicalPeerTarget::Direct(peer) => {
+                let Some(entry) = self.remove_direct(peer) else {
+                    return false;
+                };
+                let bytes = if entry.admission_established {
+                    entry.conn.window_memory_bound_bytes()
+                } else {
+                    0
+                };
+                self.retired_protocols
+                    .push_direct(entry.conn, entry.admission_established, bytes);
+            }
+            LogicalPeerTarget::Group(key) => {
+                let Some(group) = self.detach_group(key) else {
+                    return false;
+                };
+                let members = group.group.members();
+                let bytes = members
+                    .iter()
+                    .map(|member| member.connection().window_memory_bound_bytes())
+                    .sum();
+                let count = members.len();
+                self.retired_protocols
+                    .push_group(group.group, count, 0, bytes);
+            }
+        }
+        true
+    }
+
+    pub fn reclaim_retired(&mut self, max_actions: usize) -> usize {
+        self.retired_protocols.reclaim(max_actions)
+    }
+
+    #[must_use]
+    pub fn retirements_pending(&self) -> usize {
+        self.retired_protocols.sessions()
+    }
+
     /// Benchmark-only physical extraction for the legacy reuseport promotion
     /// experiment. Production integrations use [`Self::remove`] with a
     /// [`LogicalPeerId`].
@@ -4163,6 +4219,28 @@ impl PeerTable {
         self.get_peer_mut(&physical)
     }
 
+    fn retire_physical(&mut self, peer: PhysicalPeerKey) -> bool {
+        let Some(slot_idx) = self.slot_index_for_key(&peer) else {
+            return false;
+        };
+        let slot = self
+            .slots
+            .get_by_slot(slot_idx)
+            .expect("physical slot retained");
+        let logical = if let Some(entry) = slot.value.direct() {
+            entry.logical_peer
+        } else if let Some(handle) = slot.value.group_leg() {
+            let Some(group) = self.groups.get(&handle.key) else {
+                return false;
+            };
+            group.logical_peer
+        } else {
+            return false;
+        };
+        self.retire(logical)
+    }
+
+    #[cfg(test)]
     fn remove_physical(&mut self, peer: PhysicalPeerKey) -> Option<AdmissionPeer> {
         let slot_idx = self.slot_index_for_key(&peer)?;
         let is_group_leg = self
@@ -4234,24 +4312,24 @@ impl PeerTable {
         Some(entry)
     }
 
-    fn remove_group(&mut self, key: srt_lifecycle::LogicalGroupKey) -> Option<RemovedLogicalPeer> {
+    fn detach_group(&mut self, key: srt_lifecycle::LogicalGroupKey) -> Option<InboundGroup> {
         // Purge this group's index entries with the group itself; see
         // `remove_direct`.
         self.protocol_failure_index.retain(|entry| match entry {
             PeerFailureKey::Group { key: ready, .. } => ready.key != key,
             PeerFailureKey::Direct(_) => true,
         });
-        let mut group = self.groups.remove(&key)?;
+        let group = self.groups.remove(&key)?;
         self.logical_peers.remove(&group.logical_peer);
-        let mut removed = Vec::with_capacity(group.legs.len());
-        for (member_id, leg) in std::mem::take(&mut group.legs) {
+        for (member_id, leg) in &group.legs {
             let connection = group
                 .group
-                .remove_member_connection(member_id)
-                .expect("group I/O legs are built with matching members");
+                .member(*member_id)
+                .expect("group I/O legs are built with matching members")
+                .connection();
             // Sample each leg before it is handed back to the application; see
             // `remove_direct`.
-            self.add_receiver_totals(&connection);
+            self.add_receiver_totals(connection);
             if let Some(slot_idx) = self.slot_index_for_key(&leg.physical) {
                 self.purge_physical_indexes(leg.physical);
                 self.slots.remove_by_slot(slot_idx);
@@ -4265,11 +4343,22 @@ impl PeerTable {
                 self.window_memory_bytes = self.window_memory_bytes.saturating_sub(window_bytes);
                 self.decrement_source_count(leg.physical.address.ip());
             }
-            removed.push(RemovedPeerLeg {
-                peer: leg.physical.address,
-                connection,
-            });
         }
+        Some(group)
+    }
+
+    fn remove_group(&mut self, key: srt_lifecycle::LogicalGroupKey) -> Option<RemovedLogicalPeer> {
+        let mut group = self.detach_group(key)?;
+        let removed = std::mem::take(&mut group.legs)
+            .into_iter()
+            .map(|(member_id, leg)| RemovedPeerLeg {
+                peer: leg.physical.address,
+                connection: group
+                    .group
+                    .remove_member_connection(member_id)
+                    .expect("group I/O legs are built with matching members"),
+            })
+            .collect();
         Some(RemovedLogicalPeer::Group(removed))
     }
 
@@ -4388,7 +4477,7 @@ impl PeerTable {
     /// ([`PeerTableConfig::max_window_memory_bytes`]).
     #[must_use]
     pub fn reserved_window_memory_bytes(&self) -> u64 {
-        self.window_memory_bytes
+        self.window_memory_bytes + self.retired_protocols.window_bytes
     }
 
     /// Snapshot every active bonded ingress with both logical delivery and
@@ -4835,7 +4924,7 @@ mod tests {
     }
 
     #[test]
-    fn half_open_expiry_frees_slots() {
+    fn half_open_expiry_holds_slots_until_reclamation() {
         let config = PeerTableConfig {
             max_peers: 4,
             max_half_open_peers: 2,
@@ -4895,12 +4984,27 @@ mod tests {
             1,
             &telemetry,
         );
-        assert!(
-            !matches!(
-                result,
-                Admit::Dropped(AdmissionDropReason::HalfOpenCapacity)
+        assert!(matches!(
+            result,
+            Admit::Dropped(AdmissionDropReason::HalfOpenCapacity)
+        ));
+        assert_eq!(table.half_open_count(), 1);
+        assert_eq!(table.retirements_pending(), 1);
+        assert_eq!(table.reclaim_retired(0), 0);
+        table.reclaim_retired(64);
+        assert_eq!(table.retirements_pending(), 0);
+        assert_eq!(
+            table.admit(
+                peer_c,
+                &induction_packet(3),
+                Timestamp::from_micros(200_000),
+                &options,
+                0,
+                1,
+                &telemetry,
             ),
-            "after expiry, peer_c should be admitted"
+            Admit::Fed,
+            "physical reclamation makes the expired half-open slot reusable"
         );
     }
 
@@ -5956,8 +6060,8 @@ mod tests {
                 _ => None,
             })
             .expect("the DATA payload is delivered");
-        assert_eq!(&payload[..], b"zero-copy-payload");
-        let payload_base = payload.as_ptr() as usize;
+        assert!(payload.eq(&b"zero-copy-payload"[..]));
+        let payload_base = payload.chunks().next().expect("one packet chunk").as_ptr() as usize;
         assert!(
             (base..end).contains(&payload_base),
             "payload at {payload_base:#x} must be a slice of the fed datagram \

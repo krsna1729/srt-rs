@@ -66,7 +66,7 @@ proptest! {
         }
 
         prop_assert_eq!(received.len(), 1);
-        prop_assert_eq!(&received[0], &payload);
+        prop_assert!(received[0].eq(payload.as_slice()));
     }
 
     #[test]

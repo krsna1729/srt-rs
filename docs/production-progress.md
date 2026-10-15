@@ -315,3 +315,98 @@ pay 4x the scratch memory per socket.
   UDP source) delivered 3374 DATA payloads / 4.44 MB through the switched
   library `mio::Owner` listener; `mio_owner_echo`, `tokio_facade_echo` and
   `tokio_relay` pass on the same revision.
+
+## Segmented payload retirement and its measurement limits
+
+The application receive API now preserves packet chunks (`ReceivedPayload`)
+instead of flattening a fragmented message. The 65,536-packet window/message
+limit and wire metadata are unchanged. Terminal connection/group storage has an
+explicit reclamation cursor; native Owners unroute immediately, retain admission
+and window-payload credit, and reclaim under their maintenance action budget.
+No background GC thread, implicit flattening or compatibility payload alias is
+introduced.
+
+Measurement: Linux 7.0.0-38, six-vCPU EPYC host, Rust 1.96, one process pinned to
+CPU 2, 1,316-byte DATA payloads. Setup/handshake is excluded. The baseline is
+`b59bcf11a7ad645fac27c42c0780034dc5dc5b8b`; the retirement-matrix after arm is
+the segmented prototype `7b314cc`, before the lazy partial-root follow-up below.
+These teardown times have not been remeasured after that follow-up. The disposable
+CLI drives real `SrtConnection` handshake, send, receive and output paths.
+Future RX uses a 60 s playout delay; partial messages have no Last fragment.
+The completed large message contains 65,536 chunks and 86,245,376 bytes.
+
+CPU microseconds below: baseline bulk-drop median from 40 samples; after total
+cleanup median from a separate 20-sample pass without per-step clock reads.
+Largest step includes detach, every 64-action reclaim visit and final drop from
+another 20-sample pass. It is an observed maximum, not a declared time limit.
+
+| Retained shape | Before bulk drop p50 | After all slices p50 | Largest after step |
+|---|---:|---:|---:|
+| Empty | 3.274 | 3.494 | 4.256 |
+| TX 8,192 | 1574.723 | 2002.987 | 1357.668 |
+| TX 65,536 | 5510.911 | 7171.814 | 3069.195 |
+| Future RX 65,536 | 5672.534 | 7620.536 | 861.142 |
+| Application 65,536 single-packet messages | 3737.610 | 8390.613 | 3354.495 |
+| Application 4,096 messages, 16 fragments each | 1264.478 | 8395.771 | 4591.400 |
+| Incomplete 65,536-fragment message | 1541.804 | 2838.350 | 2141.505 |
+| Encrypted TX 65,536 | 5695.298 | 7812.295 | 617.076 |
+| Encrypted future RX 65,536 | 5691.231 | 7498.313 | 176.445 |
+| Encrypted application 4,096 x 16 fragments | 1347.031 | 7504.693 | 670.486 |
+| One complete 82.25 MiB message | 6231.642 | 2782.366 | 8147.628 |
+
+Cleanup totals are not receive-path CPU totals: the old assembler copied each
+complete fragmented message and freed its packet allocations during setup.
+The new representation keeps those packet allocations until consumption or
+retirement. It trades distributed reclamation/accounting work for removal of
+the flattening copy; the table does not establish an overall CPU saving.
+
+The payload root is fixed-size, with independently allocated 64-slot pages and
+64-page directories. A one-page message needs no directory allocation. Reverse
+retirement counts consumed slots too, so a fully consumed message cannot release
+all metadata pages in one step. In 20 metadata-only samples after consuming the
+82.25 MiB message, the largest 64-slot CPU step was 61.222 us.
+
+Fragmentation state is allocated lazily after a First fragment, rather than
+embedding its page-directory root in every connection. A production x64
+`SrtConnection` probe with all features measured 1,600 inline bytes. The tradeoff
+is one additional partial-state allocation per fragmented message; single-packet
+delivery does not allocate that state. The latest reassembly run below includes
+this follow-up.
+
+Residual limit: the uninstrumented matrix still observed multi-millisecond
+reclaim and final-drop outliers. A separate, phase-marked `LD_PRELOAD` diagnostic
+attributed a 11.996 ms CPU stall to `free` of one 1,320-byte packet allocation
+inside `PayloadPages::reclaim`; its tracing overhead makes that run unsuitable
+for performance comparison. Disabling glibc trimming only for a throwaway
+process reduced the large-message maximum to 163.976 us, but the 16-fragment
+workload still reached 4634.746 us. No allocator setting ships. Bounded release
+counts are proved; a hard allocator/kernel CPU-time bound is **not** established.
+
+Comparable hot-path check: existing `message_reassembly` Criterion bench, both
+arms pinned to CPU 2, 30 samples, 1 s warmup and 3 s measurement. Values are
+95% time intervals in microseconds per 16 messages, using the last baseline and
+after runs. All intervals overlap; this establishes neither a speedup, capacity
+nor performance equivalence. The fragmented-message point estimates increased.
+
+| Case | Baseline interval | After interval |
+|---|---:|---:|
+| Single packet | 13.557–14.619 | 14.297–15.097 |
+| Two fragments | 29.618–31.765 | 30.554–33.501 |
+| Eight fragments | 86.843–90.592 | 90.274–98.413 |
+
+Proofs exercise the production code: maximum message size/order/zero-byte chunks
+across sequence wrap, first-fragment source time, partial-credit retention,
+unique/shared/concurrent-final-owner retirement, exhausted-cursor metadata,
+direct/group caller capacity, peer memory credit and monotonic receive totals,
+and failed inbox delivery ownership/quota refund. Seven deliberate mutations
+were caught: action-budget overflow, premature metadata completion, early partial
+credit release, direct and group admission ignoring retiring jobs, early peer
+memory-credit release, and missing inbox byte refund. Restored targeted tests,
+workspace all-target/all-feature compilation and protocol/transport/bench Clippy
+with warnings denied pass. The custom complexity report card passes without a
+raised limit. The managed `tokio_facade_echo` executable also completed real UDP
+delivery, orderly close and driver shutdown.
+The excluded fuzz workspace also builds all targets with the segmented API;
+`fuzz_backup_group` executed a fixed 33-byte input successfully. This was a
+targeted oracle smoke, not a fuzz campaign.
+

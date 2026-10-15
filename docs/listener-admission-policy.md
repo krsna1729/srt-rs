@@ -293,8 +293,10 @@ composes overlays, accounts telemetry, and preserves admission ordering.
 - Set `max_window_memory_bytes` to bound the payload one table can buffer.
   Each established peer reserves its worst case, `(flow window + receive
   window) × 1,484` bytes at the windows policy chose (about 24 MB at the
-  default 8,192-packet windows), and returns it when it retires. Off by
-  default; the static per-peer window limits still apply. The budget is per
+  default 8,192-packet windows). Logical retirement keeps this reservation
+  charged until bounded physical payload reclamation completes. It does not
+  include metadata, application queues, transport pools or kernel socket memory.
+  Off by default; the static per-peer window limits still apply. The budget is per
   table, so per member of a reuseport layout: a member checks its own budget
   when it adopts a relocated leg, and refusing one ends a session the peer
   already saw connect. Give every member of a layout the same budget.

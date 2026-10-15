@@ -964,6 +964,9 @@ fn drive_listener_side(
     let before_len = side.outbound.len();
     let before_bytes: usize = side.outbound.iter().map(|(_, packet)| packet.len()).sum();
     let budget = side_output_budget(side.transport, *remaining);
+    let reclaimed = side.peers.reclaim_retired(budget.max_actions);
+    remaining.consume(reclaimed, 0, 0);
+    let budget = side_output_budget(side.transport, *remaining);
     let (_, maintenance_visits) =
         side.peers
             .prune_idle_bounded_with_visits(now, side.idle_timeout, budget.max_actions);
@@ -1006,6 +1009,9 @@ fn drive_caller_side(
     let was_empty = side.outbound.is_empty();
     let before_len = side.outbound.len();
     let before_bytes: usize = side.outbound.iter().map(|(_, packet)| packet.len()).sum();
+    let budget = side_output_budget(side.transport, *remaining);
+    let reclaimed = side.callers.reclaim_retired(budget.max_actions);
+    remaining.consume(reclaimed, 0, 0);
     let budget = side_output_budget(side.transport, *remaining);
     let (expired, maintenance_visits) = side
         .callers
@@ -1744,25 +1750,43 @@ impl Owner {
 
     /// Drain admitted-peer lifecycle/data events for the application.
     pub fn poll_listener_events(&mut self, out: &mut Vec<crate::AdmissionEvent>) {
+        self.poll_listener_events_bounded(usize::MAX, out);
+    }
+
+    /// Drain at most the application's available event slots.
+    pub fn poll_listener_events_bounded(
+        &mut self,
+        max_events: usize,
+        out: &mut Vec<crate::AdmissionEvent>,
+    ) {
         out.clear();
         let Some(side) = self.listener.as_mut() else {
             return;
         };
         side.peers
-            .poll_events_bounded(side.transport.output_drain.max_actions, out);
+            .poll_events_bounded(max_events.min(side.transport.output_drain.max_actions), out);
         side.event_pending = side.peers.has_pending_events();
     }
 
     /// Drain protocol events (A05) for every direct outbound session --
     /// the caller-side counterpart to [`Self::poll_listener_events`].
     pub fn poll_caller_events(&mut self, out: &mut Vec<crate::CallerEvent>) {
+        self.poll_caller_events_bounded(usize::MAX, out);
+    }
+
+    /// Drain at most the application's available event slots.
+    pub fn poll_caller_events_bounded(
+        &mut self,
+        max_events: usize,
+        out: &mut Vec<crate::CallerEvent>,
+    ) {
         out.clear();
         let Some(side) = self.caller.as_mut() else {
             return;
         };
         side.callers
             .table_mut()
-            .poll_events_bounded(side.transport.output_drain.max_actions, out);
+            .poll_events_bounded(max_events.min(side.transport.output_drain.max_actions), out);
         side.event_pending = side.callers.table().has_pending_events();
     }
 
@@ -1812,6 +1836,20 @@ impl Owner {
         id: crate::LogicalCallerId,
     ) -> Option<crate::RemovedLogicalCaller> {
         self.caller.as_mut()?.callers.remove(id)
+    }
+
+    /// Unroute a peer immediately; maintenance reclaims its retained storage.
+    pub fn retire_listener_peer(&mut self, id: crate::LogicalPeerId) -> bool {
+        self.listener
+            .as_mut()
+            .is_some_and(|side| side.peers.retire(id))
+    }
+
+    /// Unroute a caller without synchronously freeing its whole protocol window.
+    pub fn retire_caller(&mut self, id: crate::LogicalCallerId) -> bool {
+        self.caller
+            .as_mut()
+            .is_some_and(|side| side.callers.retire(id))
     }
 
     /// Return and clear caller attempts retired by the bounded pool deadline.
@@ -1884,7 +1922,7 @@ impl Owner {
 }
 
 fn tokio_listener_time_until_deadline(side: &mut OwnerListenerSide, now: Timestamp) -> Option<u64> {
-    if side.recv_pending || side.event_pending {
+    if side.recv_pending || side.event_pending || side.peers.retirements_pending() != 0 {
         return None;
     }
     let mut wait = side
@@ -1901,7 +1939,7 @@ fn tokio_listener_time_until_deadline(side: &mut OwnerListenerSide, now: Timesta
 }
 
 fn tokio_caller_time_until_deadline(side: &mut OwnerCallerSide, now: Timestamp) -> Option<u64> {
-    if side.recv_pending || side.event_pending {
+    if side.recv_pending || side.event_pending || side.callers.table().retirements_pending() != 0 {
         return None;
     }
     let wait = side.callers.time_until_next_deadline(now, u64::MAX);
@@ -1984,6 +2022,8 @@ const FACADE_COMMAND_BYTES: usize = 8 * 1024 * 1024;
 const SESSION_COMMAND_CAPACITY: usize = 64;
 const SESSION_COMMAND_BYTES: usize = 1024 * 1024;
 const MAX_QUOTA_CAS_RETRIES: usize = 16;
+const DRIVER_PAYLOAD_CAPACITY: usize = 64;
+const DRIVER_PAYLOAD_RECLAIM_ACTIONS: usize = 64;
 /// Fixed per-command byte charge covering a `Command`'s own overhead,
 /// added on top of any variable-size payload it carries (a `Send`'s
 /// payload) or used alone for commands with none (`Connect`, the
@@ -2150,7 +2190,7 @@ impl SessionControl {
 }
 
 struct InboundItem {
-    payload: srt_proto::Bytes,
+    payload: srt_proto::ReceivedPayload,
     source_time: Timestamp,
     bytes: Arc<AtomicUsize>,
 }
@@ -2163,19 +2203,13 @@ impl Drop for InboundItem {
 
 impl InboundItem {
     fn into_message(mut self) -> ReceivedMessage {
-        let payload = std::mem::replace(&mut self.payload, srt_proto::Bytes::new());
+        let payload = std::mem::replace(&mut self.payload, srt_proto::Bytes::new().into());
         self.bytes.fetch_sub(payload.len(), Ordering::AcqRel);
         ReceivedMessage {
             payload,
             source_time: self.source_time,
         }
     }
-}
-
-enum InboxSend {
-    Sent,
-    Full,
-    Closed,
 }
 
 struct SessionInbox {
@@ -2191,19 +2225,23 @@ impl SessionInbox {
         (Self { tx, bytes, control }, rx)
     }
 
-    fn try_send(&self, payload: srt_proto::Bytes, source_time: Timestamp) -> InboxSend {
+    fn try_send(
+        &self,
+        payload: srt_proto::ReceivedPayload,
+        source_time: Timestamp,
+    ) -> Result<(), srt_proto::ReceivedPayload> {
         if self.control.is_unavailable() {
-            return InboxSend::Closed;
+            return Err(payload);
         }
         let length = payload.len();
         if length > SESSION_INBOUND_BYTES {
-            return InboxSend::Full;
+            return Err(payload);
         }
         let mut reserved = false;
         for _ in 0..MAX_QUOTA_CAS_RETRIES {
             let current = self.bytes.load(Ordering::Acquire);
             if current > SESSION_INBOUND_BYTES.saturating_sub(length) {
-                return InboxSend::Full;
+                return Err(payload);
             }
             if self
                 .bytes
@@ -2220,18 +2258,16 @@ impl SessionInbox {
             }
         }
         if !reserved {
-            return InboxSend::Full;
+            return Err(payload);
         }
         let item = InboundItem {
             payload,
             source_time,
             bytes: Arc::clone(&self.bytes),
         };
-        match self.tx.try_send(item) {
-            Ok(()) => InboxSend::Sent,
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => InboxSend::Full,
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => InboxSend::Closed,
-        }
+        self.tx
+            .try_send(item)
+            .map_err(|error| error.into_inner().into_message().payload)
     }
 }
 
@@ -2465,7 +2501,7 @@ enum Command {
 /// connection it re-sends on has its own, unrelated wire timestamp epoch.
 #[derive(Debug, Clone)]
 pub struct ReceivedMessage {
-    pub payload: srt_proto::Bytes,
+    pub payload: srt_proto::ReceivedPayload,
     pub source_time: Timestamp,
 }
 
@@ -2875,10 +2911,10 @@ fn reap_remove_session(
 ) {
     match target {
         SessionTarget::Listener(id) => {
-            owner.remove_listener_peer(id);
+            owner.retire_listener_peer(id);
         }
         SessionTarget::Caller(id) => {
-            owner.remove_caller(id);
+            owner.retire_caller(id);
         }
     }
     remove_session_state(
@@ -2910,7 +2946,7 @@ fn fail_cancelled_connects(
             .is_some_and(|reply| reply.is_closed());
         if cancelled {
             pending_connects.remove(&id);
-            owner.remove_caller(id);
+            owner.retire_caller(id);
             remove_session_state(
                 SessionTarget::Caller(id),
                 &mut std::collections::HashMap::new(),
@@ -2920,6 +2956,24 @@ fn fail_cancelled_connects(
             );
         } else if pending_connects.contains_key(&id) {
             connect_checks.push_back(id);
+        }
+    }
+}
+
+fn reclaim_payloads(
+    retired_payloads: &mut VecDeque<srt_proto::PayloadRetirement>,
+    max_actions: usize,
+) {
+    let mut reclaim_left = max_actions;
+    while reclaim_left != 0 {
+        let Some(retired) = retired_payloads.front_mut() else {
+            break;
+        };
+        if retired.is_complete() {
+            retired_payloads.pop_front();
+            reclaim_left -= 1;
+        } else {
+            reclaim_left -= retired.reclaim(reclaim_left);
         }
     }
 }
@@ -2952,12 +3006,18 @@ async fn run_driver(
     let mut control_checks = VecDeque::new();
     let mut connect_checks = VecDeque::new();
     let mut pending_sends = PendingSends::default();
-    let mut listener_events = Vec::new();
-    let mut caller_events = Vec::new();
+    let mut listener_events = Vec::with_capacity(DRIVER_PAYLOAD_CAPACITY);
+    let mut caller_events = Vec::with_capacity(DRIVER_PAYLOAD_CAPACITY);
+    let mut retired_payloads: VecDeque<srt_proto::PayloadRetirement> =
+        VecDeque::with_capacity(DRIVER_PAYLOAD_CAPACITY);
     let mut expired_callers = Vec::new();
 
     loop {
-        let wait_us = owner.time_until_next_deadline(now(), 20_000);
+        let wait_us = if retired_payloads.is_empty() {
+            owner.time_until_next_deadline(now(), 20_000)
+        } else {
+            0
+        };
         tokio::select! {
             result = owner.run_once(Duration::from_micros(wait_us), now, OutputDrainBudget::default()) => {
                 if result.is_err() {
@@ -3050,7 +3110,11 @@ async fn run_driver(
             start,
         };
 
-        owner.poll_listener_events(&mut listener_events);
+        reclaim_payloads(&mut retired_payloads, DRIVER_PAYLOAD_RECLAIM_ACTIONS);
+        owner.poll_listener_events_bounded(
+            DRIVER_PAYLOAD_CAPACITY - retired_payloads.len(),
+            &mut listener_events,
+        );
         for event in listener_events.drain(..) {
             route_listener_event(
                 &mut owner,
@@ -3062,10 +3126,14 @@ async fn run_driver(
                 &mut pending_sends,
                 &mut control_checks,
                 &accept_tx,
+                &mut retired_payloads,
             );
         }
 
-        owner.poll_caller_events(&mut caller_events);
+        owner.poll_caller_events_bounded(
+            DRIVER_PAYLOAD_CAPACITY - retired_payloads.len(),
+            &mut caller_events,
+        );
         for event in caller_events.drain(..) {
             route_caller_event(
                 &mut owner,
@@ -3077,6 +3145,7 @@ async fn run_driver(
                 &mut pending_connects,
                 &mut pending_sends,
                 &mut control_checks,
+                &mut retired_payloads,
             );
         }
     }
@@ -3102,6 +3171,13 @@ async fn run_driver(
         if owner.drive(now(), OutputDrainBudget::default()).is_err() {
             break;
         }
+        tokio::task::yield_now().await;
+    }
+
+    // No new events enter after shutdown. Yield between finite retirement
+    // slices instead of destroying an application backlog in one task turn.
+    while !retired_payloads.is_empty() {
+        reclaim_payloads(&mut retired_payloads, DRIVER_PAYLOAD_RECLAIM_ACTIONS);
         tokio::task::yield_now().await;
     }
 }
@@ -3156,6 +3232,7 @@ fn route_listener_event(
     pending_sends: &mut PendingSends,
     control_checks: &mut VecDeque<SessionTarget>,
     accept_tx: &tokio::sync::mpsc::Sender<Session>,
+    retired_payloads: &mut VecDeque<srt_proto::PayloadRetirement>,
 ) {
     let id = event.logical_peer;
     let target = SessionTarget::Listener(id);
@@ -3186,6 +3263,7 @@ fn route_listener_event(
             listener_inboxes,
             controls,
             pending_sends,
+            retired_payloads,
         ),
         srt_proto::ConnectionEvent::Disconnected { .. } => route_listener_disconnected(
             owner,
@@ -3242,16 +3320,20 @@ fn route_listener_data(
     id: crate::LogicalPeerId,
     target: SessionTarget,
     now: Timestamp,
-    payload: Bytes,
+    payload: srt_proto::ReceivedPayload,
     source_time: Timestamp,
     listener_inboxes: &mut std::collections::HashMap<crate::LogicalPeerId, SessionInbox>,
     controls: &mut std::collections::HashMap<SessionTarget, Arc<SessionControl>>,
     pending_sends: &mut PendingSends,
+    retired_payloads: &mut VecDeque<srt_proto::PayloadRetirement>,
 ) {
-    let deliverable = listener_inboxes
-        .get(&id)
-        .is_some_and(|inbox| matches!(inbox.try_send(payload, source_time), InboxSend::Sent));
-    if !deliverable {
+    let result = if let Some(inbox) = listener_inboxes.get(&id) {
+        inbox.try_send(payload, source_time)
+    } else {
+        Err(payload)
+    };
+    if let Err(payload) = result {
+        retired_payloads.push_back(payload.retire());
         disconnect_listener_session(
             owner,
             id,
@@ -3302,7 +3384,7 @@ fn route_listener_disconnected(
     pending_sends: &mut PendingSends,
 ) {
     clear_listener_session(id, target, listener_inboxes, controls, pending_sends);
-    owner.remove_listener_peer(id);
+    owner.retire_listener_peer(id);
 }
 
 fn route_listener_key_refresh(
@@ -3338,6 +3420,7 @@ fn route_caller_event(
     >,
     pending_sends: &mut PendingSends,
     control_checks: &mut VecDeque<SessionTarget>,
+    retired_payloads: &mut VecDeque<srt_proto::PayloadRetirement>,
 ) {
     match event.event {
         srt_proto::ConnectionEvent::Connected => route_caller_connected(
@@ -3364,6 +3447,7 @@ fn route_caller_event(
             caller_inboxes,
             controls,
             pending_sends,
+            retired_payloads,
         ),
         srt_proto::ConnectionEvent::Disconnected { .. } => route_caller_ended(
             owner,
@@ -3445,16 +3529,20 @@ fn route_caller_data(
     owner: &mut Owner,
     id: crate::LogicalCallerId,
     now: Timestamp,
-    payload: Bytes,
+    payload: srt_proto::ReceivedPayload,
     source_time: Timestamp,
     caller_inboxes: &mut std::collections::HashMap<crate::LogicalCallerId, SessionInbox>,
     controls: &mut std::collections::HashMap<SessionTarget, Arc<SessionControl>>,
     pending_sends: &mut PendingSends,
+    retired_payloads: &mut VecDeque<srt_proto::PayloadRetirement>,
 ) {
-    let deliverable = caller_inboxes
-        .get(&id)
-        .is_some_and(|inbox| matches!(inbox.try_send(payload, source_time), InboxSend::Sent));
-    if !deliverable {
+    let result = if let Some(inbox) = caller_inboxes.get(&id) {
+        inbox.try_send(payload, source_time)
+    } else {
+        Err(payload)
+    };
+    if let Err(payload) = result {
+        retired_payloads.push_back(payload.retire());
         let target = SessionTarget::Caller(id);
         disconnect_caller_session(
             owner,
@@ -3514,7 +3602,7 @@ fn route_caller_ended(
         let _ = reply.send(Err(FacadeError::Protocol(connect_failed_error())));
     }
     clear_caller_session(id, target, caller_inboxes, controls, pending_sends);
-    owner.remove_caller(id);
+    owner.retire_caller(id);
 }
 
 fn route_caller_key_refresh(
@@ -3762,6 +3850,10 @@ impl Facade {
 }
 
 #[cfg(test)]
+#[path = "tokio_payload_tests.rs"]
+mod payload_tests;
+
+#[cfg(test)]
 mod owner_tests {
     use super::*;
     use crate::{LogicalCallerState, PoolOutcome, SocketOwnership};
@@ -3892,7 +3984,13 @@ mod owner_tests {
                         && let srt_proto::ConnectionEvent::DataReceived { payload, .. } =
                             event.event
                     {
-                        received = Some(payload.to_vec());
+                        received = Some(payload.chunks().fold(
+                            Vec::with_capacity(payload.len()),
+                            |mut message, chunk| {
+                                message.extend_from_slice(chunk);
+                                message
+                            },
+                        ));
                     }
                 }
                 received.is_some()
@@ -4041,7 +4139,7 @@ mod owner_tests {
                     match event.event {
                         srt_proto::ConnectionEvent::Connected => peer = true,
                         srt_proto::ConnectionEvent::DataReceived { payload, .. } => {
-                            got = payload.as_ref() == b"resolved";
+                            got = payload.eq(&b"resolved"[..]);
                         }
                         _ => {}
                     }
@@ -4355,7 +4453,7 @@ mod facade_tests {
             let received = with_timeout(listener_session.recv())
                 .await
                 .expect("listener session receives the payload");
-            assert_eq!(received.payload.as_ref(), b"known message");
+            assert!(received.payload.eq(&b"known message"[..]));
 
             caller_session.close();
             let closed = with_timeout(listener_session.recv()).await;
@@ -4463,10 +4561,7 @@ mod facade_tests {
                 let received = with_timeout(active_listener_session.recv())
                     .await
                     .expect("active listener session receives");
-                assert_eq!(
-                    received.payload.as_ref(),
-                    format!("active {i}").into_bytes()
-                );
+                assert!(received.payload.eq(format!("active {i}").as_bytes()));
                 assert!(
                     started.elapsed() < Duration::from_millis(500),
                     "active round trip {i} took {:?} -- the slow session's concurrent \
@@ -4484,10 +4579,7 @@ mod facade_tests {
                 let payload = with_timeout(slow_listener_session.recv())
                     .await
                     .expect("slow session's backlog is preserved");
-                assert_eq!(
-                    payload.payload.as_ref(),
-                    format!("backlog {i}").into_bytes()
-                );
+                assert!(payload.payload.eq(format!("backlog {i}").as_bytes()));
             }
         });
     }
@@ -4520,7 +4612,7 @@ mod facade_tests {
             let received = with_timeout(second_listener_session.recv())
                 .await
                 .expect("second session still works after the first was dropped");
-            assert_eq!(received.payload.as_ref(), b"after a drop");
+            assert!(received.payload.eq(&b"after a drop"[..]));
         });
     }
 
@@ -4763,7 +4855,10 @@ mod facade_tests {
             let mut envelope = (age_before_republish.as_micros() as u64)
                 .to_le_bytes()
                 .to_vec();
-            envelope.extend_from_slice(&received.payload);
+            envelope.reserve(received.payload.len());
+            for chunk in received.payload.chunks() {
+                envelope.extend_from_slice(chunk);
+            }
             with_timeout(relay_egress.send(envelope))
                 .await
                 .expect("relay forwards to destination");
@@ -4774,14 +4869,18 @@ mod facade_tests {
             let forwarded = with_timeout(destination_session.recv())
                 .await
                 .expect("destination receives from relay");
-            let age_bytes: [u8; 8] = forwarded.payload[..8]
+            let mut forwarded_bytes = Vec::with_capacity(forwarded.payload.len());
+            for chunk in forwarded.payload.chunks() {
+                forwarded_bytes.extend_from_slice(chunk);
+            }
+            let age_bytes: [u8; 8] = forwarded_bytes[..8]
                 .try_into()
                 .expect("envelope carries an 8-byte micros age prefix");
             let carried_age = Duration::from_micros(u64::from_le_bytes(age_bytes));
             let transit_age = forwarded.age(destination.now());
             let total_age = carried_age + transit_age;
 
-            assert_eq!(&forwarded.payload[8..], b"live payload");
+            assert_eq!(&forwarded_bytes[8..], b"live payload");
             assert!(
                 age_before_republish >= Duration::from_millis(140),
                 "age captured before republish must reflect its injected delay, \

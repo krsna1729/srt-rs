@@ -106,7 +106,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if event.logical_peer == peer_id
                 && let ConnectionEvent::DataReceived { payload, .. } = event.event
             {
-                received = Some(payload.to_vec());
+                received = Some(payload.chunks().fold(
+                    Vec::with_capacity(payload.len()),
+                    |mut message, chunk| {
+                        message.extend_from_slice(chunk);
+                        message
+                    },
+                ));
             }
         }
     }

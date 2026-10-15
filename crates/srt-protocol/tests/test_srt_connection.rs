@@ -152,6 +152,8 @@ fn received_bytes_fan_out_to_multiple_shared_sends() {
             _ => None,
         })
         .expect("upstream delivery");
+    assert_eq!(payload.chunk_count(), 1);
+    let payload = payload.into_chunks().next().expect("single packet payload");
     let original_ptr = payload.as_ptr();
 
     downstream_a_caller
@@ -201,7 +203,11 @@ fn collect_received_data(conn: &mut SrtConnection) -> Vec<Vec<u8>> {
     let mut data = Vec::new();
     while let Some(event) = conn.poll_event() {
         if let ConnectionEvent::DataReceived { payload, .. } = event {
-            data.push(payload.to_vec());
+            let mut message = Vec::with_capacity(payload.len());
+            for chunk in payload.chunks() {
+                message.extend_from_slice(chunk);
+            }
+            data.push(message);
         }
     }
     data

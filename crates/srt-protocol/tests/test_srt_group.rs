@@ -245,7 +245,7 @@ fn broadcast_receive_deduplicates_and_advances_other_links() {
         .unwrap();
 
     let delivered = group.poll_data(ts(120_000)).unwrap();
-    assert_eq!(delivered.payload.as_ref(), b"hello");
+    assert!(delivered.payload.eq(&b"hello"[..]));
     // Second copy is deduplicated — only one delivery.
     assert!(group.poll_data(ts(120_000)).is_none());
     assert_eq!(
@@ -299,7 +299,7 @@ fn fragmented_group_message_advances_by_every_reassembled_packet() {
         let first = group.poll_data(ts(120_000)).unwrap();
         assert_eq!(first.sequence_number, initial_seq);
         assert_eq!(first.packet_count, 3);
-        assert_eq!(first.payload.as_ref(), fragmented);
+        assert!(first.payload.eq(&fragmented[..]));
 
         let following = group.poll_data(ts(120_000)).unwrap();
         assert_eq!(
@@ -307,7 +307,7 @@ fn fragmented_group_message_advances_by_every_reassembled_packet() {
             initial_seq.wrapping_add(3) & SEQUENCE_MASK
         );
         assert_eq!(following.packet_count, 1);
-        assert_eq!(following.payload.as_ref(), b"following");
+        assert!(following.payload.eq(&b"following"[..]));
     }
 }
 
@@ -405,7 +405,7 @@ fn group_catch_up_discards_obsolete_partial_member_message() {
 
     let delivered = group.poll_data(ts(120_000)).unwrap();
     assert_eq!(delivered.packet_count, 3);
-    assert_eq!(delivered.payload.as_ref(), fragmented);
+    assert!(delivered.payload.eq(&fragmented[..]));
     assert_eq!(
         group
             .member(2)
@@ -566,13 +566,19 @@ fn backup_delivers_standby_payload_arriving_with_active_shutdown() {
         .feed_recv_buf(&backup_packet, ts(102_000))
         .unwrap();
 
-    assert_eq!(
-        group.poll_data(ts(103_000)).unwrap().payload.as_ref(),
-        b"primary"
+    assert!(
+        group
+            .poll_data(ts(103_000))
+            .unwrap()
+            .payload
+            .eq(&b"primary"[..])
     );
-    assert_eq!(
-        group.poll_data(ts(103_000)).unwrap().payload.as_ref(),
-        b"backup"
+    assert!(
+        group
+            .poll_data(ts(103_000))
+            .unwrap()
+            .payload
+            .eq(&b"backup"[..])
     );
     assert_eq!(group.member(2).unwrap().state(), GroupMemberState::Active);
 }
@@ -721,17 +727,15 @@ fn removed_member_complete_pending_payload_is_delivered_once_in_order() {
         gap_source.send(b"fill", ts(130_000)).unwrap();
         transfer_to_group_member(&mut gap_source, &mut group, 2, ts(130_000));
         let filled = next_data(&mut group, ts(140_000)).unwrap();
-        assert_eq!(
-            (filled.sequence_number, filled.payload.as_ref()),
-            (101, &b"fill"[..])
-        );
+        assert_eq!(filled.sequence_number, 101);
+        assert!(filled.payload.eq(&b"fill"[..]));
         let held = next_data(&mut group, ts(140_000))
             .expect("the removed member's complete payload survives removal");
         assert_eq!(
             (held.sequence_number, held.member_id, held.packet_count),
             (102, 1, 1)
         );
-        assert_eq!(held.payload.as_ref(), b"held");
+        assert!(held.payload.eq(&b"held"[..]));
         assert!(next_data(&mut group, ts(140_000)).is_none());
         assert!(next_data(&mut group, ts(150_000)).is_none());
         assert_eq!(member_window(&group, 1), REMOVAL_WINDOW);
@@ -799,7 +803,7 @@ fn member_churn_cannot_accumulate_uncharged_pending_payloads() {
         let packet = next_data(&mut group, ts(140_000)).unwrap();
         assert_eq!(packet.sequence_number, expected);
         if expected > 101 {
-            assert_eq!(packet.payload.as_ref(), expected.to_be_bytes());
+            assert!(packet.payload.eq(&expected.to_be_bytes()[..]));
         }
     }
     assert!(next_data(&mut group, ts(140_000)).is_none());

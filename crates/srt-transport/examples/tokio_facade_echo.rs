@@ -49,12 +49,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let received = tokio::time::timeout(deadline, listener_session.recv())
         .await?
         .expect("the payload arrives before the session closes");
-    assert_eq!(received.payload.as_ref(), message);
+    assert!(received.payload.eq(&message[..]));
+    let mut text = Vec::with_capacity(received.payload.len());
+    for chunk in received.payload.chunks() {
+        text.extend_from_slice(chunk);
+    }
     println!(
         "listener received {} bytes verbatim: {:?} ({:?} old -- see the tokio_relay \
          example for preserving this age across a forwarding hop)",
         received.payload.len(),
-        String::from_utf8_lossy(&received.payload),
+        String::from_utf8_lossy(&text),
         received.age(facade.now()),
     );
 

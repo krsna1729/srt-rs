@@ -102,7 +102,7 @@ fn upstream_recv(rig: &mut FanoutRig, now: Timestamp) -> Bytes {
     let mut received = None;
     while let Some(event) = rig.upstream_listener.poll_event() {
         if let srt_proto::ConnectionEvent::DataReceived { payload, .. } = event {
-            received = Some(payload);
+            received = payload.into_chunks().next();
         }
     }
     received.expect("should receive data")

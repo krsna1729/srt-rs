@@ -1,8 +1,8 @@
+mod retirement;
 mod send;
+pub use retirement::GroupRetirement;
 
 use std::collections::{BTreeMap, BTreeSet};
-
-use bytes::Bytes;
 
 use crate::error::Error;
 use crate::srt_connection::{ConnectionEvent, ConnectionState, SrtConnection};
@@ -73,8 +73,8 @@ pub struct GroupPacket {
     pub source_time: crate::Timestamp,
     /// Number of SRT DATA packets represented by the reassembled payload.
     pub packet_count: u32,
-    /// Reference-counted payload bytes.
-    pub payload: Bytes,
+    /// One complete message, preserving its packet chunks without flattening.
+    pub payload: crate::ReceivedPayload,
 }
 
 /// Result of one bounded logical-data poll.

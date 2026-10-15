@@ -347,7 +347,7 @@ mod tests {
 
     fn data(packet_count: u32) -> ConnectionEvent {
         ConnectionEvent::DataReceived {
-            payload: bytes::Bytes::from_static(b"x"),
+            payload: bytes::Bytes::from_static(b"x").into(),
             sequence_number: 0,
             message_number: 0,
             timestamp: 0,

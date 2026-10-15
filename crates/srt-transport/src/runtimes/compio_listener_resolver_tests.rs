@@ -218,7 +218,7 @@ async fn deliver(
         owners[0].poll_listener_events(&mut events);
         if events.iter().any(|e| {
             matches!(&e.event,
-                srt_proto::ConnectionEvent::DataReceived { payload: got, .. } if got[..] == *payload)
+                srt_proto::ConnectionEvent::DataReceived { payload: got, .. } if got.eq(payload))
         }) {
             arrived = Some(now);
         }

@@ -175,7 +175,7 @@ proptest! {
         let first = receiver.poll_data(ts(120_000)).expect("fragmented delivery");
         prop_assert_eq!(first.sequence_number, initial_seq);
         prop_assert_eq!(first.packet_count, packet_count);
-        prop_assert_eq!(first.payload.as_ref(), payload.as_slice());
+        prop_assert!(first.payload.eq(payload.as_slice()));
         prop_assert_eq!(
             receiver
                 .member(1)
@@ -255,7 +255,7 @@ proptest! {
                 }
             }
             let delivered = receiver.poll_data(ts(100_000)).map(|packet| packet.payload);
-            prop_assert_eq!(delivered.as_deref(), Some(payload.as_slice()));
+            prop_assert!(delivered.as_ref().is_some_and(|received| received.eq(payload.as_slice())));
         }
     }
 }

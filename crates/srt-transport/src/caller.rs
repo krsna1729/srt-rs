@@ -451,6 +451,7 @@ pub struct CallerTable {
     status_probes: std::cell::Cell<u64>,
     next_logical_caller: u64,
     max_callers: usize,
+    retired_protocols: crate::retirement::RetiredProtocols,
     /// SRT-level receiver totals of every session this table has retired.
     ///
     /// A retired connection is handed back to the application, so its protocol
@@ -994,6 +995,7 @@ impl CallerTable {
             status_probes: std::cell::Cell::new(0),
             next_logical_caller: 1,
             max_callers: bounded,
+            retired_protocols: crate::retirement::RetiredProtocols::new(bounded),
             retired_rcv: RcvTotals::default(),
             #[cfg(any(test, feature = "bench-internals"))]
             sched_stats: SchedCounters::default(),
@@ -1393,7 +1395,7 @@ impl CallerTable {
     /// Add one direct caller. Its non-zero SRT Socket ID must be unique among
     /// all physical legs in this shared UDP socket.
     pub fn add_direct(&mut self, leg: CallerLeg) -> Result<LogicalCallerId, srt_proto::Error> {
-        if self.sessions.len() >= self.max_callers {
+        if self.sessions.len() + self.retired_protocols.sessions() >= self.max_callers {
             return Err(srt_proto::Error::with_reason(
                 srt_proto::ErrorKind::InvalidState,
                 "caller table capacity reached",
@@ -1438,7 +1440,7 @@ impl CallerTable {
         mode: srt_proto::GroupMode,
         legs: impl IntoIterator<Item = CallerGroupLeg>,
     ) -> Result<LogicalCallerId, srt_proto::Error> {
-        if self.sessions.len() >= self.max_callers {
+        if self.sessions.len() + self.retired_protocols.sessions() >= self.max_callers {
             return Err(srt_proto::Error::with_reason(
                 srt_proto::ErrorKind::InvalidState,
                 "caller table capacity reached",
@@ -1923,10 +1925,7 @@ impl CallerTable {
         ReadyVisitOutcome::Continue
     }
 
-    /// Atomically retire a direct caller or every leg of a bonded caller.
-    /// Applications normally call [`LogicalCallerMut::disconnect`] first,
-    /// then call this after their own close-drain deadline.
-    pub fn remove(&mut self, id: LogicalCallerId) -> Option<RemovedLogicalCaller> {
+    fn detach_session(&mut self, id: LogicalCallerId) -> Option<CallerSession> {
         // A retired session takes its undrained failure record with it, so the
         // index entry must go too: without this, churn (fault, retire, repeat)
         // accumulates keys for sessions that no longer exist and the index is
@@ -1956,22 +1955,29 @@ impl CallerTable {
         self.sched.remove(&id);
         self.maybe_compact_ready_queue();
         self.maybe_compact_event_ready_queue();
-        // Every relinquished connection is sampled into the retired ledger
-        // BEFORE it is handed back to the application: once it leaves this
-        // table the table cannot read it again, yet a later snapshot must still
-        // carry what it had concluded about its stream.
-        Some(match session {
+        // Fold receive totals exactly once, before either extraction or retirement.
+        match &session {
+            CallerSession::Direct(leg) => self.add_receiver_totals(&leg.connection),
+            CallerSession::Group(group) => {
+                for member in group.group.members() {
+                    self.add_receiver_totals(member.connection());
+                }
+            }
+        }
+        Some(session)
+    }
+
+    /// Extract a caller's protocol cores for ownership transfer or accounting.
+    /// Owner paths that discard the caller use `retire` instead.
+    pub fn remove(&mut self, id: LogicalCallerId) -> Option<RemovedLogicalCaller> {
+        Some(match self.detach_session(id)? {
             CallerSession::Direct(leg) => {
-                self.add_receiver_totals(&leg.connection);
                 RemovedLogicalCaller::Direct(Box::new(RemovedCallerLeg {
                     peer: leg.peer,
                     connection: leg.connection,
                 }))
             }
             CallerSession::Group(mut group) => {
-                for member in group.group.members() {
-                    self.add_receiver_totals(member.connection());
-                }
                 let legs = std::mem::take(&mut group.legs)
                     .into_iter()
                     .map(|(member_id, leg)| RemovedCallerLeg {
@@ -1985,6 +1991,41 @@ impl CallerTable {
                 RemovedLogicalCaller::Group(legs)
             }
         })
+    }
+
+    /// Unroute a caller immediately; keep its storage and table capacity charged
+    /// until bounded `reclaim_retired` visits finish physical reclamation.
+    pub fn retire(&mut self, id: LogicalCallerId) -> bool {
+        let Some(session) = self.detach_session(id) else {
+            return false;
+        };
+        match session {
+            CallerSession::Direct(leg) => {
+                let bytes = leg.connection.window_memory_bound_bytes();
+                self.retired_protocols
+                    .push_direct(leg.connection, true, bytes);
+            }
+            CallerSession::Group(group) => {
+                let members = group.group.members();
+                let bytes = members
+                    .iter()
+                    .map(|member| member.connection().window_memory_bound_bytes())
+                    .sum();
+                let count = members.len();
+                self.retired_protocols
+                    .push_group(group.group, count, 0, bytes);
+            }
+        }
+        true
+    }
+
+    pub fn reclaim_retired(&mut self, max_actions: usize) -> usize {
+        self.retired_protocols.reclaim(max_actions)
+    }
+
+    #[must_use]
+    pub fn retirements_pending(&self) -> usize {
+        self.retired_protocols.sessions()
     }
 
     /// Fold one relinquished connection's SRT receiver counters into this
@@ -2588,6 +2629,9 @@ pub(crate) fn collect_output_work(
 mod peer_group_tests;
 
 #[cfg(test)]
+mod retirement_tests;
+
+#[cfg(test)]
 mod tests {
     use crate::*;
     use proptest::prelude::*;
@@ -2610,7 +2654,7 @@ mod tests {
         bytes
     }
 
-    fn next_packet(conn: &mut SrtConnection) -> Vec<u8> {
+    pub(super) fn next_packet(conn: &mut SrtConnection) -> Vec<u8> {
         loop {
             match conn
                 .poll_output()
@@ -3636,7 +3680,7 @@ mod tests {
         assert_eq!(sink.packets, vec![(peer, b"1234".to_vec())]);
     }
 
-    fn prepare_conclusion_with_options(
+    pub(super) fn prepare_conclusion_with_options(
         table: &mut PeerTable,
         peer: std::net::SocketAddr,
         caller_options: ConnectionOptions,
@@ -3670,7 +3714,7 @@ mod tests {
         (caller, conclusion)
     }
 
-    fn finish_conclusion(
+    pub(super) fn finish_conclusion(
         table: &mut PeerTable,
         peer: std::net::SocketAddr,
         caller: &mut SrtConnection,
@@ -3933,7 +3977,7 @@ mod tests {
         assert_eq!(events[0].representative_peer, first);
         assert!(matches!(
             &events[0].event,
-            ConnectionEvent::DataReceived { payload, .. } if payload.as_ref() == b"one logical payload"
+            ConnectionEvent::DataReceived { payload, .. } if payload.eq(&b"one logical payload"[..])
         ));
         let stats = table.bonded_stats();
         assert_eq!(stats.len(), 1);
@@ -4856,7 +4900,7 @@ mod tests {
                 && matches!(
                     &event.event,
                     srt_proto::ConnectionEvent::DataReceived { payload, .. }
-                        if payload.as_ref() == b"inbound"
+                        if payload.eq(&b"inbound"[..])
                 )),
             "a direct caller's received payload must be observable via poll_events, got {events:?}"
         );
@@ -4966,7 +5010,9 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(payloads, vec![b"first".to_vec(), b"second".to_vec()]);
+        assert_eq!(payloads.len(), 2);
+        assert!(payloads[0].eq(&b"first"[..]));
+        assert!(payloads[1].eq(&b"second"[..]));
     }
 
     proptest! {
@@ -5282,7 +5328,6 @@ mod tests {
             ),
             Admit::Dropped(AdmissionDropReason::Capacity)
         );
-        assert_eq!(table.len(), 2);
         assert_eq!(
             telemetry.admission_capacity_drops.load(Ordering::Relaxed),
             1
@@ -5298,30 +5343,47 @@ mod tests {
                 1,
                 &telemetry,
             ),
+            Admit::Dropped(AdmissionDropReason::Capacity)
+        );
+        // Admission prunes only one overdue peer per call. Its physical
+        // slot remains charged until the Owner drives reclamation.
+        assert_eq!(table.len(), 1);
+        assert_eq!(telemetry.expired_half_open.load(Ordering::Relaxed), 1);
+        assert_eq!(table.retirements_pending(), 1);
+        table.reclaim_retired(64);
+
+        // The next admission unroutes the other overdue peer. There is
+        // room because the first retirement has physically completed.
+        let peer_four = "127.0.0.1:10003".parse().expect("address");
+        assert_eq!(
+            table.admit(
+                peer_four,
+                &induction(4),
+                Timestamp::from_micros(102),
+                &options,
+                0,
+                1,
+                &telemetry,
+            ),
             Admit::Fed
         );
-        // `admit` now bounds its own half-open pruning to one entry per
-        // call (finding 3/10, keeping packet admission itself bounded
-        // rather than turning one receive into a table-wide sweep) --
-        // both peers[0] and peers[1] are overdue at this point, so this
-        // first admit only retires one of them.
-        assert_eq!(table.len(), 2);
-        assert_eq!(telemetry.expired_half_open.load(Ordering::Relaxed), 1);
-
-        // A second admission call's own bounded prune drains the
-        // remaining overdue half-open entry.
-        let peer_four = "127.0.0.1:10003".parse().expect("address");
-        let _ = table.admit(
-            peer_four,
-            &induction(4),
-            Timestamp::from_micros(102),
-            &options,
-            0,
-            1,
-            &telemetry,
+        assert_eq!(table.len(), 1);
+        assert_eq!(telemetry.expired_half_open.load(Ordering::Relaxed), 2);
+        assert_eq!(table.retirements_pending(), 1);
+        table.reclaim_retired(64);
+        assert_eq!(
+            table.admit(
+                peers[2],
+                &induction(3),
+                Timestamp::from_micros(103),
+                &options,
+                0,
+                1,
+                &telemetry,
+            ),
+            Admit::Fed
         );
         assert_eq!(table.len(), 2);
-        assert_eq!(telemetry.expired_half_open.load(Ordering::Relaxed), 2);
     }
 
     #[test]
@@ -6243,7 +6305,7 @@ mod tests {
     // CallerTable ready / deadline scheduling invariants (exact BTreeSet)
     // -----------------------------------------------------------------
 
-    fn new_connected_caller_connection(socket_id: u32) -> SrtConnection {
+    pub(super) fn new_connected_caller_connection(socket_id: u32) -> SrtConnection {
         let mut caller = SrtConnection::new_caller(ConnectionOptions {
             socket_id,
             ..ConnectionOptions::default()

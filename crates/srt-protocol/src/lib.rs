@@ -7,6 +7,7 @@ mod buf;
 mod crypto_impl;
 mod error;
 mod message_assembler;
+mod received_payload;
 mod sender_rto;
 mod srt_connection;
 mod srt_group;
@@ -80,17 +81,18 @@ pub use buf::{
 };
 
 pub use error::{Error, ErrorKind};
+pub use received_payload::{PayloadChunks, PayloadRetirement, ReceivedPayload};
 pub use srt_connection::{
-    ConnectionEvent, ConnectionOptions, ConnectionOutput, ConnectionRole, ConnectionState,
-    DEFAULT_HANDSHAKE_RETRY_INTERVAL_MICROS, DEFAULT_HANDSHAKE_TIMEOUT_MICROS, DisconnectReason,
-    FULL_ACK_CONTROL_INFO_BYTES, KEEPALIVE_INTERVAL_MICROS, LIBSRT_COMPAT_PADDING_BYTES,
-    LIGHT_ACK_CONTROL_INFO_BYTES, MAX_EVENT_QUEUE_ACTIONS, MAX_OUTPUT_QUEUE_ACTIONS,
-    MAX_OUTPUT_QUEUE_BYTES, MIN_FLOW_WINDOW_PACKETS, NAK_RANGE_BYTES, OutputInto, OutputMeta,
-    PERIODIC_NAK_INTERVAL_MICROS, SrtConnection, TimerId,
+    ConnectionEvent, ConnectionOptions, ConnectionOutput, ConnectionRetirement, ConnectionRole,
+    ConnectionState, DEFAULT_HANDSHAKE_RETRY_INTERVAL_MICROS, DEFAULT_HANDSHAKE_TIMEOUT_MICROS,
+    DisconnectReason, FULL_ACK_CONTROL_INFO_BYTES, KEEPALIVE_INTERVAL_MICROS,
+    LIBSRT_COMPAT_PADDING_BYTES, LIGHT_ACK_CONTROL_INFO_BYTES, MAX_EVENT_QUEUE_ACTIONS,
+    MAX_OUTPUT_QUEUE_ACTIONS, MAX_OUTPUT_QUEUE_BYTES, MIN_FLOW_WINDOW_PACKETS, NAK_RANGE_BYTES,
+    OutputInto, OutputMeta, PERIODIC_NAK_INTERVAL_MICROS, SrtConnection, TimerId,
 };
 pub use srt_group::{
-    GroupDataPoll, GroupEvent, GroupMemberState, GroupMode, MAX_GROUP_MEMBERS, PeerGroupCollision,
-    SrtGroup,
+    GroupDataPoll, GroupEvent, GroupMemberState, GroupMode, GroupRetirement, MAX_GROUP_MEMBERS,
+    PeerGroupCollision, SrtGroup,
 };
 pub use srt_packet::DatagramClass;
 pub use stats::{

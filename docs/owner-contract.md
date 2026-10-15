@@ -73,8 +73,8 @@ ready.
 
 Lifecycle maintenance and protocol output have **independent** finite axes:
 `max_maintenance_actions` bounds caller-pool resolution, expiry and queued
-admission plus listener idle reclaim; `max_actions` (with the packet and byte
-caps) bounds protocol output. Neither can consume the other's allowance, so a
+admission, listener idle reclaim and terminal protocol reclamation; `max_actions`
+(with the packet and byte caps) bounds protocol output. Neither can consume the other's allowance, so a
 small fixed budget is correct at any fan-out and no capacity-derived multiplier
 is ever needed. Only real work is charged: a future, still-establishing attempt
 costs nothing. The report separates them (`actions` for output,
@@ -111,6 +111,35 @@ when it is worth running again. Nothing is moved into an unbounded queue to be
 forgotten: a datagram that could not be submitted stays queued in the protocol,
 bounded by the protocol's own output limits.
 
+Normal disposal uses `retire_listener_peer` / `retire_caller`. Routes, timers and
+logical identity leave immediately; receive totals fold exactly once. Protocol
+packet storage is retained on that same Owner and reclaimed under
+`max_maintenance_actions`. Retiring physical peers still consume listener total,
+half-open/established and window-payload reservations; a retiring logical caller
+still consumes its caller-table slot. Credits return only when its reclamation
+job completes. This keeps churn within the existing admission envelope instead
+of creating an unbounded garbage queue. Pending retirement requests an immediate
+next visit even when socket writes are blocked.
+
+The `remove_listener_peer` / `remove_caller` methods instead **transfer ownership**
+to a caller that needs the protocol cores; they are not the bounded disposal
+path. Custom table drivers must service `PeerTable::reclaim_retired` or
+`CallerTable` / `CallerPool::reclaim_retired` after `retire`.
+
+Received messages use `srt_proto::ReceivedPayload`: borrow `chunks()` or move
+packet handles with `into_chunks()`, then finish the cursor with `retire()` even
+when all chunks were consumed. Applications must bound their own retained
+message, packet and byte totals. The window-payload reservation is not a total
+RSS bound: it excludes application queues, metadata, transport pools and kernel
+socket storage.
+
+These bounds count library reclamation actions, not elapsed or CPU time inside
+the allocator/kernel. Ordinary Rust drop of unfinished storage remains
+synchronous; arbitrary externally supplied `Bytes` owners can also have costly
+destructors. No process-wide allocator policy or background reclamation thread
+is installed. Measurements and residual outliers are recorded in
+[production progress](production-progress.md#segmented-payload-retirement-and-its-measurement-limits).
+
 ### 7. Fault poisoning is total and latched
 
 Any `OwnerFault` stops new admission and new TX submission on that `Owner`. The
@@ -139,15 +168,15 @@ production-public.
 A bonded caller is ONE logical caller:
 
 * it resolves to a single `LogicalCallerId` and is thereafter driven through
-  the same `logical_caller`, `logical_caller_mut`, `remove_caller`,
+  the same `logical_caller`, `logical_caller_mut`, `retire_caller`, `remove_caller`,
   `poll_caller_events`, `poll_tx_failures`, `service`, `wait_for_activity` and
   `shutdown_and_drain` calls as a direct caller;
 * it is one request to the bounded caller pool: one in-flight permit or one
   queue slot (`PoolOutcome::Admitted` / `Queued` / `Full`) however many legs it
   has, so `max_in_flight` and the queue bound count logical callers for direct
   and bonded requests alike; its attempt deadline starts at admission, and
-  expiry, cancellation or `remove_caller` retire every leg, route and deadline
-  together;
+  expiry, cancellation, retirement or ownership extraction remove every leg,
+  route and deadline together;
 * its legs are bounded by `srt_proto::MAX_GROUP_MEMBERS`, are validated through
   the same Compio path as a direct caller (`SocketOwnership::Shared`, the
   owner's wire ceiling, compatibility with the shared caller socket, one

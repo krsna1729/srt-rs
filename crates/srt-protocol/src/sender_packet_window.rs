@@ -402,6 +402,30 @@ impl<T> SenderPacketWindow<T> {
         self.retired.clear();
     }
 
+    /// Reclaim terminal storage without dropping a whole window in one visit.
+    /// Live and previously ACK-retired slots share the same packet budget.
+    pub(crate) fn clear_bounded(&mut self, max_packets: usize) -> usize {
+        let mut released = 0;
+        while released < max_packets {
+            if let Some(page) = self.retired.last_mut() {
+                let slot = page.occupied.trailing_zeros() as usize;
+                let packet = page.slots[slot].take().expect("occupied retired slot");
+                page.occupied &= !(1u64 << slot);
+                drop(packet);
+                if page.occupied == 0 {
+                    self.retired.pop();
+                }
+            } else {
+                let Some((sequence, _)) = self.first_occupied_from(0) else {
+                    break;
+                };
+                drop(self.remove(sequence).expect("occupied live slot"));
+            }
+            released += 1;
+        }
+        released
+    }
+
     pub fn first_occupied_from(&self, start_seq: u32) -> Option<(u32, &T)> {
         if self.is_empty() {
             return None;

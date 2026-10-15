@@ -34,10 +34,13 @@ fn interop_test_lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn received_payloads_match(received_payloads: &[bytes::Bytes], expected: &[u8]) -> bool {
+fn received_payloads_match(
+    received_payloads: &[srt_proto::ReceivedPayload],
+    expected: &[u8],
+) -> bool {
     received_payloads
         .iter()
-        .flat_map(|payload| payload.iter())
+        .flat_map(|payload| payload.chunks().flat_map(|chunk| chunk.iter()))
         .eq(expected.iter())
 }
 
@@ -566,7 +569,10 @@ fn receive_live_with_stream_id_policy(
             match event.event {
                 srt_proto::ConnectionEvent::Connected => connected = true,
                 srt_proto::ConnectionEvent::DataReceived { payload, .. } => {
-                    received.extend(payload);
+                    received.reserve(payload.len());
+                    for chunk in payload.chunks() {
+                        received.extend_from_slice(chunk);
+                    }
                 }
                 _ => {}
             }
@@ -1592,7 +1598,10 @@ fn libsrt_broadcast_group_interoperates_with_rust_listener() {
         table.poll_events(&mut events);
         for event in events.drain(..) {
             if let srt_proto::ConnectionEvent::DataReceived { payload, .. } = event.event {
-                received.extend(payload);
+                received.reserve(payload.len());
+                for chunk in payload.chunks() {
+                    received.extend_from_slice(chunk);
+                }
             }
         }
         max_legs = max_legs.max(
@@ -2558,7 +2567,10 @@ fn serve_owner_listeners(
                 owner.poll_listener_events(&mut events);
                 for event in events {
                     if let srt_proto::ConnectionEvent::DataReceived { payload, .. } = event.event {
-                        run.received[index].extend_from_slice(&payload);
+                        run.received[index].reserve(payload.len());
+                        for chunk in payload.chunks() {
+                            run.received[index].extend_from_slice(chunk);
+                        }
                     }
                     if let Some(peer) = owner.listener_peer_mut(event.logical_peer)
                         && let Some(srt_transport::advanced::admission::LogicalPeerStats::Group(

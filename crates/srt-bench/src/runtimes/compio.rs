@@ -538,11 +538,33 @@ fn drain_receiver_packets(
 /// not workload DATA, and counting it would inflate `data_events`, `core_total`
 /// and every ratio built on them.
 fn note_received_payload(
-    payload: &[u8],
+    payload: &srt_proto::ReceivedPayload,
     diag: &mut Option<crate::qual_payload::DiagStats>,
     measured_so_far: u64,
 ) -> u64 {
-    match crate::qual_payload::classify(payload) {
+    let first = payload
+        .chunks()
+        .next()
+        .map(|chunk| &chunk[..])
+        .unwrap_or_default();
+    let mut header = [0u8; crate::qual_payload::HEADER_LEN];
+    let kind = if first.len() >= header.len() {
+        crate::qual_payload::classify(first)
+    } else if payload.len() < header.len() {
+        crate::qual_payload::PayloadKind::Foreign
+    } else {
+        let mut copied = 0;
+        for chunk in payload.chunks() {
+            let count = chunk.len().min(header.len() - copied);
+            header[copied..copied + count].copy_from_slice(&chunk[..count]);
+            copied += count;
+            if copied == header.len() {
+                break;
+            }
+        }
+        crate::qual_payload::classify(&header)
+    };
+    match kind {
         crate::qual_payload::PayloadKind::Measured { tick } => match diag.as_mut() {
             // Counted on first observation only; a repeat is a benchmark-level
             // duplicate, a different layer from the protocol's own duplicate
