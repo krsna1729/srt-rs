@@ -190,19 +190,58 @@ impl Conn {
         }
     }
 }
+/// Duplicate `fd` for the poll path.
+///
+/// Close-on-exec is the point of the helper: a duplicate without FD_CLOEXEC is
+/// inherited by every child process spawned after the socket is built (an
+/// FFmpeg transcode child, for example), which keeps the socket open for the
+/// child's lifetime.
+fn dup_cloexec(fd: std::os::fd::RawFd) -> io::Result<std::os::fd::RawFd> {
+    // SAFETY: `fcntl(F_DUPFD_CLOEXEC)` takes no pointers; `fd` is only borrowed
+    // for the call.
+    let new_fd = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if new_fd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(new_fd)
+    }
+}
+
 fn make_poll_fd(
     sock: &compio::net::UdpSocket,
 ) -> Result<compio::runtime::fd::PollFd<std::net::UdpSocket>, crate::RuntimeBuildError> {
     use std::os::fd::{AsRawFd, FromRawFd};
-    // SAFETY: dup creates a new valid file descriptor with independent lifetime.
-    let new_fd = unsafe { libc::dup(sock.as_raw_fd()) };
-    if new_fd < 0 {
-        return Err(io::Error::last_os_error().into());
-    }
-    // SAFETY: new_fd was successfully created by dup and ownership is transferred to std_sock.
+    let new_fd = dup_cloexec(sock.as_raw_fd())?;
+    // SAFETY: new_fd was created by dup_cloexec and ownership moves to std_sock.
     let std_sock = unsafe { std::net::UdpSocket::from_raw_fd(new_fd) };
     let _ = std_sock.set_nonblocking(true);
     compio::runtime::fd::PollFd::new(std_sock).map_err(|e| e.into())
+}
+
+#[cfg(test)]
+mod poll_fd_dup_tests {
+    use super::dup_cloexec;
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    #[test]
+    fn poll_fd_duplicate_is_close_on_exec() {
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind a probe socket");
+        let duplicate = dup_cloexec(sock.as_raw_fd()).expect("duplicate the socket");
+        // SAFETY: the duplicate is owned here and closed when the test ends.
+        let duplicate = unsafe { std::net::UdpSocket::from_raw_fd(duplicate) };
+        // SAFETY: fcntl(F_GETFD) takes no pointers.
+        let flags = unsafe { libc::fcntl(duplicate.as_raw_fd(), libc::F_GETFD) };
+        assert!(
+            flags >= 0,
+            "F_GETFD failed: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_ne!(
+            flags & libc::FD_CLOEXEC,
+            0,
+            "a poll-path duplicate without FD_CLOEXEC is inherited by every child spawned later"
+        );
+    }
 }
 
 /// Resolve and bind a listener using Compio-native UDP sockets. Call from
