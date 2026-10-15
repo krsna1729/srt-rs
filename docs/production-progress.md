@@ -532,23 +532,40 @@ with a small window could therefore retain many times what its table's
 `max_window_memory_bytes` accounted for, which is the reconciliation the
 reservation needed.
 
-`handle_data_packet` now rejects a DATA payload above `max_payload_size`
-immediately after the state check, before decryption. The reservation's
-per-packet term is the enforced ceiling, and an oversized datagram is a protocol
-error that the transport fails the peer closed rather than a silent loss. New
-test `a_data_payload_above_the_negotiated_maximum_is_rejected` accepts a payload
-at the ceiling and rejects one byte above it. Mutation: weakening the comparison
-to `>=` fails that test on the boundary case. `cargo test -p srt-proto`: 397
-passed. `cargo clippy -p srt-proto --all-targets -- -D warnings` and
+`handle_data_packet` now rejects a DATA payload above the constant ceiling
+`DEFAULT_MTU - SRT_HEADER_SIZE` immediately after the state check, before
+decryption. That is the bound the reservation charges, and it is deliberately not
+the negotiated `max_payload_size`: `apply_peer_mss` derives its value from this
+side's view of the path, so a peer behind NAT64 or SIIT can legitimately compute a
+larger ceiling and keep sending 1,437-1,456-byte payloads, which enforcing the
+negotiated value would silently drop. The per-packet term is the payload length
+enforced; an oversized datagram is dropped and counted invalid through the
+listener's `Admit::Dropped` path with `record_invalid_datagram`, and the
+connection is unaffected: `Err(invalid_state)` changes no state, and the tokio and
+managed paths discard it. New test
+`a_data_payload_above_the_payload_ceiling_is_rejected_not_fatal` accepts a payload
+at the constant ceiling, accepts it again after the negotiation is lowered to
+1,456, rejects one byte above the ceiling, and asserts the connection is still
+`Connected`. Mutation: weakening the comparison to `>=` fails that test on the
+boundary case. `cargo test -p srt-proto`: 397 passed.
+`cargo clippy -p srt-proto --all-targets -- -D warnings` and
 `cargo fmt --all -- --check` are clean.
 
 `docs/owner-contract.md` now carries the composed envelope the earlier review
-asked for ("Composed memory envelope"): the enforced payload term, the pinned
-per-connection metadata (1,600-byte inline connection, 8,320-byte loss bitmap,
-8,320-byte sender directory, receiver directory of window / 64 pages, capped event
-and output queues), the transport structures sized at construction, the runtime
-and I/O buffers, the requested socket-memory budget and the kernel term. It states
-plainly that no single byte budget spans the three layers, that allocator
-capacity, `Bytes` backing owners and kernel bookkeeping are outside every term,
-and that multi-Owner totals multiply by prepared Owners and listener tables. No
-new limit is introduced beyond the enforced per-packet ceiling.
+asked for ("Composed memory envelope"): the payload-length-enforced term, the
+pinned per-connection metadata (1,600-byte inline connection, 8,320-byte loss
+bitmap, 8,320-byte sender directory, receiver directory of window / 64 pages,
+capped event and output queues), the transport structures sized at construction,
+the runtime and I/O buffers, the requested socket-memory budget and the kernel
+term. It states plainly that no single byte budget spans the three layers, and
+that multi-Owner totals multiply by prepared Owners and listener tables. No new
+limit is introduced beyond the enforced per-packet payload length.
+
+The envelope names a magnitude the enforcement does not cover: on the
+zero-copy receive path (`feed_recv_bytes` and the listener table's
+`feed_recv_buffer`), a retained payload is a frozen `Bytes` slice of a
+`BytesRecvBatch` chunk of `DEFAULT_CHUNK_SLOTS * slot_len`, 128 * 2,048 = 256 KiB,
+so one retained packet pins its whole chunk, about 177 times its 1,484-byte
+reservation charge when a peer interleaves discarded datagrams. That gap stays
+open and is now written down; closing it needs copy-on-retain for packets held out
+of order or in the future [INFERENCE: design suggestion].
