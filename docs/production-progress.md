@@ -576,12 +576,17 @@ completion and lifecycle event, either finite CPU/output work or a finite resuma
 continuation. The audit walked the Owner service loop and the protocol entry points
 it feeds.
 
-Capped and pinned today: RX packets and bytes (`OwnerServiceBudget`), TX jobs
-(`max_completions`), protocol TX actions (`max_actions`), lifecycle work
-(`max_maintenance_actions`, 256), the delivery continuation, `PendingNak`,
-`PendingPeriodicNak`, `drop_expired_bounded`, the retirement cursors, 32
+Capped and pinned today: RX packets and bytes (`OwnerServiceBudget` on compio,
+`RecvBudget` on mio and tokio), TX jobs (`max_completions`), protocol TX actions
+(`max_actions`), lifecycle work (`max_maintenance_actions`, 256, compio),
+`OutputDrainBudget::max_actions` for the mio and tokio reclaim paths, the delivery
+continuation, `PendingNak`, `PeriodicNakPass`, the retirement cursors, 32
 retransmissions per selection, `MAX_DUE_PER_VISIT` timer fires, and the queue caps
 (`MAX_OUTPUT_QUEUE_ACTIONS` / `_BYTES`, `MAX_EVENT_QUEUE_ACTIONS`).
+
+Amortized but not capped per call: `SenderBuffer::drop_expired` spreads its scan
+with a cursor, yet one ACK tick after a stall can tombstone a whole window and
+return a `Vec<DroppedMessage>` of that size.
 
 Fixed here: the raw listener batch drain charged only datagrams it fed to
 admission, so a full batch of truncated or unattributable datagrams left
@@ -600,8 +605,11 @@ declared bound): raw protocol-output submission walks (whole-message drop range,
 justified-frontier advance) and NAK tombstone discovery before charging
 (`srt_sender.rs`); retransmission pop and RTO probe eligibility search
 (`srt_sender.rs`); receiver delivery search under unknown order and expected-loss
-recovery walking the buffered tail (`srt_receiver.rs`); periodic-NAK run scans and
-bitmap range mutation that stop only when output is produced (`srt_receiver.rs`);
+recovery walking the buffered tail (`srt_receiver.rs`); periodic-NAK run scans
+(`srt_receiver.rs`); TLPKTDROP `ReceiverBuffer::drop_too_late`, which walks the
+whole loss list on every ACK tick and collects two `Vec`s plus an `FxHashSet` of
+the dropped sequences (`srt_receiver.rs`); `advance_expected_sequence`, which
+collects the loss list into a `Vec` and removes each entry (`srt_receiver.rs`);
 group member removal merging reservation indexes and trimming payloads
 synchronously (`srt_group/mod.rs`); caller detach and peer detach population-wide
 index scans, and deadline mutations rebuilding whole heaps (`caller.rs`,
@@ -613,4 +621,9 @@ execution and admission-map pruning bounded only by the configured derivation ra
 (`admission.rs`); overflow clearing the protocol queues synchronously and shutdown
 reaping with `usize::MAX` before joining lanes (`srt_connection.rs`, `compio.rs`).
 Each site is a candidate for a budget or continuation; none of them is claimed
-bounded by this change.
+bounded by this change. Bitmap range mutation is not on this list: `insert_range`
+and `remove_range` are word-budgeted by the loss-walk change in
+`feat/receiver-loss-walk-budget` at `MAX_FLOW_WINDOW / 64 + 1` visits. The
+regression here calls `charge_rx_batch` at the drain and promoted call sites; it
+pins the accounting, not the surrounding loop, so a drain-level test with a
+truncated-datagram flood remains open.
