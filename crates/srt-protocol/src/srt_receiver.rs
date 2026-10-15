@@ -209,9 +209,11 @@ fn emit_sorted_runs(
 /// Worst-case work of one loss entry: the bitmap walks one 64-bit data word
 /// per 64 sequence positions and updates one summary word for each, so a single
 /// received packet can touch at most this many data words, even at the largest
-/// negotiated receive window. 1024 at the 65,536-packet limit. A single
-/// position clear reads one further data word.
-const MAX_LOSS_WORDS_PER_ENTRY: usize = MAX_FLOW_WINDOW as usize / 64;
+/// negotiated receive window. 1,024 words at the 65,536-packet limit, plus one
+/// because an unaligned start splits the run across a partial word at each end
+/// while the walk stays circular. A single position clear reads one further
+/// data word.
+const MAX_LOSS_WORDS_PER_ENTRY: usize = MAX_FLOW_WINDOW as usize / 64 + 1;
 
 // Data words walked by `mutate_contiguous_range` on this thread. Test-only:
 // it keeps the per-entry word bound observable without adding a field to the
@@ -2615,7 +2617,9 @@ mod tests {
     /// One loss-list range operation walks one 64-bit data word per 64
     /// positions, so the worst single packet the bitmap can be handed -- a peer
     /// a full window ahead -- is bounded by `MAX_LOSS_WORDS_PER_ENTRY`, and
-    /// ordinary in-order traffic walks none.
+    /// ordinary in-order traffic walks none. The production ISN is random, so
+    /// the unaligned case below is the common one: it touches one word more
+    /// than the aligned case because the run starts inside a word.
     #[test]
     fn one_loss_entry_walks_at_most_one_bitmap_word_per_64_positions() {
         let now = Timestamp::from_micros(1_000);
@@ -2628,8 +2632,28 @@ mod tests {
         assert_eq!(buf.loss_detection_steps(), (MAX_FLOW_WINDOW - 1) as usize);
         assert_eq!(
             loss_words_touched(),
-            MAX_LOSS_WORDS_PER_ENTRY,
-            "a full-window gap walks every data word of the largest window once"
+            MAX_FLOW_WINDOW as usize / 64,
+            "a full-window gap from an aligned start walks every data word once"
+        );
+
+        // The same gap from an ISN of 40 starts 40 bits into the first word,
+        // so the walk touches 1,025 words: the bound is the aligned count plus
+        // one, never more.
+        let mut buf =
+            ReceiverBuffer::with_buffer_size(40, 120, Timestamp::from_micros(0), 0, MAX_FLOW_WINDOW);
+        buf.set_tsbpd_enabled(false);
+        reset_loss_words_touched();
+        let _ = buf.receive(make_packet(40 + MAX_FLOW_WINDOW - 1, 1), now);
+        assert_eq!(buf.loss_detection_steps(), (MAX_FLOW_WINDOW - 1) as usize);
+        let touched = loss_words_touched();
+        assert!(
+            touched <= MAX_LOSS_WORDS_PER_ENTRY,
+            "an unaligned full-window gap must stay within the per-entry bound, \
+             visited {touched}"
+        );
+        assert_eq!(
+            touched, MAX_LOSS_WORDS_PER_ENTRY,
+            "an unaligned start splits the run across one partial word at each end"
         );
 
         let mut buf =
@@ -2656,8 +2680,8 @@ mod tests {
         );
         assert_eq!(
             loss_words_touched(),
-            MAX_LOSS_WORDS_PER_ENTRY,
-            "a full-window drop range is bounded by the same word count"
+            MAX_FLOW_WINDOW as usize / 64,
+            "a full-window drop range from an aligned start walks every data word once"
         );
     }
 

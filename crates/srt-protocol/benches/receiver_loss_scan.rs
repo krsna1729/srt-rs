@@ -323,9 +323,12 @@ fn bench_drop_range_locality(c: &mut Criterion) {
 /// Worst-case single-entry bitmap work: one DATA packet arrives a full
 /// negotiated window ahead of the loss frontier, so loss detection classifies
 /// every position in between. The bitmap walks one 64-bit data word per 64
-/// positions, which bounds one entry at `MAX_FLOW_WINDOW / 64` words; this
-/// measurement pins the cost that bound rests on. Buffer setup is excluded, so
-/// the timed region is exactly the one packet that exposes the full-window gap.
+/// positions, which bounds one entry at `MAX_FLOW_WINDOW / 64` words from an
+/// aligned start and one more from an unaligned one; this measurement pins the
+/// cost that bound rests on. The timed region is the packet that exposes the
+/// gap; it still contains the first loss's lazy bitmap allocation, and the
+/// buffer is returned so its own drop happens after the batch, not inside the
+/// measurement.
 fn bench_full_window_gap(c: &mut Criterion) {
     let mut group = c.benchmark_group("receiver_loss_scan/full_window_gap");
     group.throughput(Throughput::Elements(1));
@@ -342,7 +345,10 @@ fn bench_full_window_gap(c: &mut Criterion) {
                     buf
                 },
                 |mut buf| {
-                    black_box(buf.receive(black_box(make_packet(window - 1, 1_000)), ts(1_000)));
+                    let delivered =
+                        buf.receive(black_box(make_packet(window - 1, 1_000)), ts(1_000));
+                    black_box(delivered);
+                    buf
                 },
                 BatchSize::SmallInput,
             );

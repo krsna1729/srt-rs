@@ -632,25 +632,39 @@ remains open.
 Loss classification and DROPREQ removal share one bitmap over the negotiated
 receive window. `mutate_contiguous_range` walks one 64-bit data word per 64
 sequence positions, so one received packet can touch at most
-`MAX_LOSS_WORDS_PER_ENTRY` = `MAX_FLOW_WINDOW / 64` data words, 1,024 at the
-65,536-packet limit, plus one summary word per touched word. That is the explicit
-word budget for one entry. No continuation is introduced for a bound of a few
-microseconds, and the strict per-entry shape is unchanged.
+`MAX_LOSS_WORDS_PER_ENTRY` = `MAX_FLOW_WINDOW / 64 + 1` data words, 1,025 at the
+65,536-packet limit, plus one summary word per touched word. The extra word is
+the unaligned start the random production ISN produces: the run begins inside a
+word and the circular walk touches that word once more at the wrap. That is the
+explicit word budget for one entry. No continuation is introduced for a bound of
+a few microseconds, and the strict per-entry shape is unchanged.
+
+The budget covers `insert_range` and `remove_range` on the loss bitmap. Two
+receiver paths walk the same structure from one ACK tick without it:
+TLPKTDROP `ReceiverBuffer::drop_too_late` and `advance_expected_sequence`, both
+position-scale and both allocating. Both are listed as open in the per-entry
+audit ledger above.
 
 Evidence. `one_loss_entry_walks_at_most_one_bitmap_word_per_64_positions` drives
 the real receive path: a peer one full window ahead exposes 65,535 positions and
-walks exactly 1,024 data words; steady in-order traffic walks none; a full-window
-`remove_range` is bounded by the same count. The counter behind it,
-`LossBitmap::words_touched`, is `cfg(test)` only and counts one per data word
-walked, so it cannot change production work. Mutation: replacing the per-word
-stride with a per-position stride, the pre-bound shape, fails the test with
-65,535 words against the declared 1,024. The existing `loss_detection_steps`
-assertions still pin the position bound, so both units are gated.
+walks exactly 1,024 data words from an aligned ISN; the same gap from an ISN of
+40 walks 1,025, pins the bound, and is the common case in production; steady
+in-order traffic walks none; a full-window `remove_range` from an aligned start
+walks the same 1,024 words. The counter behind it, the `LOSS_WORDS_TOUCHED`
+thread-local read by `loss_words_touched()`, is `cfg(test)` only and counts one
+per data word walked, so it cannot change production work. Mutation: replacing
+the per-word stride with a per-position stride, the pre-bound shape, fails the
+test with 65,535 words against the aligned 1,024 assertion. The existing
+`loss_detection_steps` assertions still pin the position bound, so both units are
+gated.
 
 Measured cap. New `receiver_loss_scan/full_window_gap` Criterion group, Linux
 7.0.0-38, six-vCPU EPYC host, 30 samples, one packet per sample: 1.31-1.63 us for
 a full-window gap at the 8,192-packet default window (128 words) and 6.86-7.54 us
-at the 65,536-packet maximum (1,024 words). One packet can therefore amplify to
-at most one window of positions, at the measured cost of a single packet-sized
-operation. The run scan used for periodic NAK generation shares the word size but
-is served by the resumable periodic-NAK cursor with its own per-visit caps.
+at the 65,536-packet maximum (1,024 words from the aligned ISN this measures).
+The numbers are an upper bound on the walk: the buffer is returned from the
+routine so its drop is not timed, while the first loss's lazy bitmap allocation
+remains inside. One packet can therefore amplify to at most one window of
+positions, at the measured cost of a single packet-sized operation. The run scan
+used for periodic NAK generation shares the word size but is served by the
+resumable periodic-NAK cursor with its own per-visit caps.
