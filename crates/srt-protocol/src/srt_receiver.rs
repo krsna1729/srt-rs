@@ -2639,8 +2639,13 @@ mod tests {
         // The same gap from an ISN of 40 starts 40 bits into the first word,
         // so the walk touches 1,025 words: the bound is the aligned count plus
         // one, never more.
-        let mut buf =
-            ReceiverBuffer::with_buffer_size(40, 120, Timestamp::from_micros(0), 0, MAX_FLOW_WINDOW);
+        let mut buf = ReceiverBuffer::with_buffer_size(
+            40,
+            120,
+            Timestamp::from_micros(0),
+            0,
+            MAX_FLOW_WINDOW,
+        );
         buf.set_tsbpd_enabled(false);
         reset_loss_words_touched();
         let _ = buf.receive(make_packet(40 + MAX_FLOW_WINDOW - 1, 1), now);
