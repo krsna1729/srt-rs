@@ -7269,6 +7269,96 @@ mod tests {
         );
     }
 
+    /// The frontier is a position in the protocol's 31-bit sequence space, so
+    /// the wrap behaves like every other position: a position just past the
+    /// wrap is not justifiable until its DATA is submitted, and once it is,
+    /// an ACK naming the position past the wrap retires the flight while one
+    /// position further is refused. A refusal must also leave the sender
+    /// untouched -- including the advertised window it would otherwise
+    /// compute from the named position -- so the refused ACK at the end here
+    /// carries a full 16-byte control-info.
+    #[test]
+    fn ack_frontier_wraps_with_the_sequence_space() {
+        const SEQUENCE_MASK: u32 = 0x7fff_ffff;
+        let options = ConnectionOptions {
+            initial_seq: Some(SEQUENCE_MASK - 1),
+            ..ConnectionOptions::default()
+        };
+        let mut caller = SrtConnection::new_caller(ConnectionOptions {
+            socket_id: 1,
+            ..options.clone()
+        });
+        let mut listener = SrtConnection::new_listener(ConnectionOptions {
+            socket_id: 2,
+            syn_cookie: Some(7),
+            ..options
+        });
+        drive_handshake_to_connected(&mut caller, &mut listener);
+
+        let socket_id = caller.socket_id();
+        let now = Timestamp::from_micros(1_000_000);
+        let first = caller.next_sequence_number().expect("connected sender");
+        assert_eq!(
+            first,
+            SEQUENCE_MASK - 1,
+            "the connection starts one sequence before the wrap"
+        );
+        caller.send(b"last", now).expect("the window is open");
+        caller.send(b"wrapped", now).expect("the window is open");
+        let buffered = |caller: &SrtConnection| {
+            caller
+                .sender_stats()
+                .expect("connected sender")
+                .packets_in_buffer
+        };
+
+        // Both payloads sit in the sender buffer, but only the first has
+        // crossed the submission boundary, so the frontier stops at the wrap
+        // and position 0 is not justifiable yet. This is the protocol's 31-bit
+        // order, not a plain integer compare.
+        drain_until_one_data_packet_submitted(&mut caller);
+        assert_eq!(buffered(&caller), 2, "both payloads are buffered");
+        let refused = caller
+            .feed_recv_buf(&ack_datagram(socket_id, 0, Some(8)), now)
+            .expect_err("an ACK for a position the peer cannot have seen is refused");
+        assert_eq!(refused.kind, crate::error::ErrorKind::InvalidData);
+        assert!(
+            refused.to_string().contains("peer-justified frontier"),
+            "the frontier is what refused it: {refused}"
+        );
+        assert_eq!(buffered(&caller), 2, "the refused ACK retired nothing");
+
+        // With the second payload submitted too, the walk crosses the wrap
+        // and an ACK naming position 0 retires both entries.
+        drain_until_one_data_packet_submitted(&mut caller);
+        caller
+            .feed_recv_buf(&ack_datagram(socket_id, 0, Some(8)), now)
+            .expect("an ACK for the position past the wrap is justified");
+        assert_eq!(
+            buffered(&caller),
+            0,
+            "the ACK across the wrap retires both entries"
+        );
+
+        // One position further is past the frontier again.
+        let baseline = caller.stats();
+        let sender_baseline = caller.sender_stats();
+        let error = caller
+            .feed_recv_buf(&ack_datagram_with_shape(socket_id, 1, 16, 1), now)
+            .expect_err("the wrap does not widen the frontier");
+        assert_eq!(error.kind, crate::error::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains("peer-justified frontier"),
+            "the frontier is what refused it: {error}"
+        );
+        assert_eq!(caller.stats(), baseline, "the refused ACK changed state");
+        assert_eq!(
+            caller.sender_stats(),
+            sender_baseline,
+            "the refused ACK changed no sender accounting"
+        );
+    }
+
     /// A NAK loss position beyond the submitted frontier is invalid for
     /// exactly the same reason an ACK beyond it is (see
     /// `ack_beyond_the_submitted_frontier_is_rejected_even_though_accepted`):
