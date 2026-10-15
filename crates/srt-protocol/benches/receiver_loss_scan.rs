@@ -320,6 +320,43 @@ fn bench_drop_range_locality(c: &mut Criterion) {
     group.finish();
 }
 
+/// Worst-case single-entry bitmap work: one DATA packet arrives a full
+/// negotiated window ahead of the loss frontier, so loss detection classifies
+/// every position in between. The bitmap walks one 64-bit data word per 64
+/// positions, which bounds one entry at `MAX_FLOW_WINDOW / 64` words from an
+/// aligned start and one more from an unaligned one; this measurement pins the
+/// cost that bound rests on. The timed region is the packet that exposes the
+/// gap; it still contains the first loss's lazy bitmap allocation, and the
+/// buffer is returned so its own drop happens after the batch, not inside the
+/// measurement.
+fn bench_full_window_gap(c: &mut Criterion) {
+    let mut group = c.benchmark_group("receiver_loss_scan/full_window_gap");
+    group.throughput(Throughput::Elements(1));
+    group.sample_size(30);
+
+    // 8,192: the default window (128 words). 65,536: the maximum negotiated
+    // window (1,024 words), where one entry's word walk is largest.
+    for &window in &[8_192u32, 65_536u32] {
+        group.bench_function(format!("one_packet/window_{window}"), |b| {
+            b.iter_batched(
+                || {
+                    let mut buf = ReceiverBuffer::with_buffer_size(0, 120, ts(0), 0, window);
+                    buf.set_tsbpd_enabled(false);
+                    buf
+                },
+                |mut buf| {
+                    let delivered =
+                        buf.receive(black_box(make_packet(window - 1, 1_000)), ts(1_000));
+                    black_box(delivered);
+                    buf
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_lossy_receive,
@@ -327,6 +364,7 @@ criterion_group!(
     bench_persistent_old_hole,
     bench_periodic_nak,
     bench_drop_range,
-    bench_drop_range_locality
+    bench_drop_range_locality,
+    bench_full_window_gap
 );
 criterion_main!(benches);
