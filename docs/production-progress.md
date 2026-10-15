@@ -569,3 +569,61 @@ so one retained packet pins its whole chunk, about 177 times its 1,484-byte
 reservation charge when a peer interleaves discarded datagrams. That gap stays
 open and is now written down; closing it needs copy-on-retain for packets held out
 of order or in the future [INFERENCE: design suggestion].
+## Per-entry work audit and the discarded-datagram budget hole (2026-10-15)
+
+The earlier review asked for a per-entry invariant: for every packet input, timer,
+completion and lifecycle event, either finite CPU/output work or a finite resumable
+continuation. The audit walked the Owner service loop and the protocol entry points
+it feeds.
+
+Capped and pinned today: RX packets and bytes (`OwnerServiceBudget` on compio,
+`RecvBudget` on mio and tokio), TX jobs (`max_completions`), protocol TX actions
+(`max_actions`), lifecycle work (`max_maintenance_actions`, 256, compio),
+`OutputDrainBudget::max_actions` for the mio and tokio reclaim paths, the delivery
+continuation, `PendingNak`, `PeriodicNakPass`, the retirement cursors, 32
+retransmissions per selection, `MAX_DUE_PER_VISIT` timer fires, and the queue caps
+(`MAX_OUTPUT_QUEUE_ACTIONS` / `_BYTES`, `MAX_EVENT_QUEUE_ACTIONS`).
+
+Amortized but not capped per call: `SenderBuffer::drop_expired` spreads its scan
+with a cursor, yet one ACK tick after a stall can tombstone a whole window and
+return a `Vec<DroppedMessage>` of that size.
+
+Fixed here: the raw listener batch drain charged only datagrams it fed to
+admission, so a full batch of truncated or unattributable datagrams left
+`rx_packets`/`rx_bytes` untouched and the loop received again with the same
+allowance -- sustained input with no visit quantum. `Owner::charge_rx_batch` now
+charges every received slot before deciding to skip it, on the drain path and the
+promoted-socket path, and
+`discarded_batch_slots_still_consume_the_rx_budget` pins it with a real socket
+(a datagram longer than the slot is reported truncated and must still consume the
+budget, and a complete datagram is admitted exactly once). Mutation: moving the
+charge after the skip fails that test. `cargo test -p srt-transport
+--all-features`: 511 passed.
+
+Still uncapped, ranked by likely amplification (each needs its own change or a
+declared bound): raw protocol-output submission walks (whole-message drop range,
+justified-frontier advance) and NAK tombstone discovery before charging
+(`srt_sender.rs`); retransmission pop and RTO probe eligibility search
+(`srt_sender.rs`); receiver delivery search under unknown order and expected-loss
+recovery walking the buffered tail (`srt_receiver.rs`); periodic-NAK run scans
+(`srt_receiver.rs`); TLPKTDROP `ReceiverBuffer::drop_too_late`, which walks the
+whole loss list on every ACK tick and collects two `Vec`s plus an `FxHashSet` of
+the dropped sequences (`srt_receiver.rs`); `advance_expected_sequence`, which
+collects the loss list into a `Vec` and removes each entry (`srt_receiver.rs`);
+group member removal merging reservation indexes and trimming payloads
+synchronously (`srt_group/mod.rs`); caller detach and peer detach population-wide
+index scans, and deadline mutations rebuilding whole heaps (`caller.rs`,
+`admission.rs`, `due_index.rs`, `dense_due_index.rs`); promotion/handoff
+maintenance draining freed sockets and pending transfers outside the visit budget
+(`compio.rs`, `owner_layout.rs`); zero-budget or faulted service still scanning
+lane handles and stale deadline heads (`compio.rs`, `due_index.rs`); resolver
+execution and admission-map pruning bounded only by the configured derivation rate
+(`admission.rs`); overflow clearing the protocol queues synchronously and shutdown
+reaping with `usize::MAX` before joining lanes (`srt_connection.rs`, `compio.rs`).
+Each site is a candidate for a budget or continuation; none of them is claimed
+bounded by this change. Bitmap range mutation is not on this list: `insert_range`
+and `remove_range` are word-budgeted by the loss-walk change in #161 at
+`MAX_FLOW_WINDOW / 64 + 1` visits. The regression calls `charge_rx_batch`
+directly; the drain and promoted call sites use it, and it pins the accounting,
+not the surrounding loop, so a drain-level test with a truncated-datagram flood
+remains open.

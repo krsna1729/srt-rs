@@ -4811,7 +4811,27 @@ impl Owner {
             let Ok(received) = listener.rx_batch.recv(raw_fd, requested) else {
                 return ListenerBatchStop::Failed;
             };
-            Self::admit_rx_batch(listener, received, now, report);
+            let ListenerSide {
+                rx_batch,
+                table,
+                resolver,
+                options,
+                telemetry,
+                routing,
+                ..
+            } = listener;
+            Self::charge_rx_batch(rx_batch, received, report, |peer, datagram| {
+                admit_listener_datagram(
+                    table,
+                    resolver.as_ref(),
+                    options,
+                    telemetry,
+                    peer,
+                    datagram,
+                    now,
+                    routing,
+                );
+            });
             if received < requested {
                 // Socket drained.
                 return ListenerBatchStop::Drained;
@@ -4833,30 +4853,25 @@ impl Owner {
         by_packets.min(by_bytes).min(listener.rx_batch.capacity())
     }
 
-    /// Admit the `received` datagrams in the listener's batch scratch; a
-    /// truncated one is skipped, as on the managed path.
-    fn admit_rx_batch(
-        listener: &mut ListenerSide,
+    /// Admit the `received` datagrams in the listener's batch scratch.
+    ///
+    /// Every received slot consumes visit allowance, including one that is
+    /// skipped as truncated or unattributable: otherwise a full batch of
+    /// discards would leave the budget untouched and the drain loop would
+    /// receive again with the same allowance.
+    fn charge_rx_batch(
+        batch: &crate::RecvBatch,
         received: usize,
-        now: Timestamp,
         report: &mut OwnerServiceReport,
+        mut admit: impl FnMut(SocketAddr, &[u8]),
     ) {
-        for (peer, datagram, truncated) in listener.rx_batch.iter(received) {
+        for (peer, datagram, truncated) in batch.iter(received) {
+            report.rx_packets += 1;
+            report.rx_bytes += datagram.len();
             let (Some(peer), false) = (peer, truncated) else {
                 continue;
             };
-            report.rx_packets += 1;
-            report.rx_bytes += datagram.len();
-            admit_listener_datagram(
-                &mut listener.table,
-                listener.resolver.as_ref(),
-                &listener.options,
-                &listener.telemetry,
-                peer,
-                datagram,
-                now,
-                &mut listener.routing,
-            );
+            admit(peer, datagram);
         }
     }
 
@@ -5104,7 +5119,27 @@ impl Owner {
                 }
                 match listener.rx_batch.recv(raw_fd, requested) {
                     Ok(received) => {
-                        Self::admit_rx_batch(listener, received, now, report);
+                        let ListenerSide {
+                            rx_batch,
+                            table,
+                            resolver,
+                            options,
+                            telemetry,
+                            routing,
+                            ..
+                        } = listener;
+                        Self::charge_rx_batch(rx_batch, received, report, |peer, datagram| {
+                            admit_listener_datagram(
+                                table,
+                                resolver.as_ref(),
+                                options,
+                                telemetry,
+                                peer,
+                                datagram,
+                                now,
+                                routing,
+                            );
+                        });
                         if received < requested {
                             listener.promoted.set_drained(slot);
                         }
@@ -7441,6 +7476,46 @@ mod tests {
                 "only once the task itself ends does the ring go"
             );
         });
+    }
+
+    /// Every received slot consumes visit allowance, even when the datagram is
+    /// discarded as truncated: a full batch of discards must not leave the
+    /// budget untouched, or the listener drain loop would receive again with
+    /// the same allowance inside one visit.
+    #[test]
+    fn discarded_batch_slots_still_consume_the_rx_budget() {
+        use crate::RecvBatch;
+        use std::os::fd::AsRawFd;
+
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind receiver");
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind sender");
+        let peer = socket.local_addr().expect("receiver address");
+        let mut batch = RecvBatch::with_capacity(2, 64);
+
+        // A datagram longer than one slot is reported truncated and skipped.
+        sender
+            .send_to(&[0x5Au8; 100], peer)
+            .expect("send oversized datagram");
+        let received = batch.recv(socket.as_raw_fd(), 1).expect("batch receive");
+        assert_eq!(received, 1, "one datagram was queued");
+
+        let mut report = OwnerServiceReport::default();
+        Owner::charge_rx_batch(&batch, received, &mut report, |_, _| {
+            panic!("a truncated datagram must not reach admission")
+        });
+        assert_eq!(report.rx_packets, 1, "the discarded slot consumed a packet");
+        assert!(report.rx_bytes > 0, "the discarded slot consumed bytes");
+
+        // A complete datagram is admitted and charged exactly once.
+        sender
+            .send_to(&[0x11u8; 32], peer)
+            .expect("send complete datagram");
+        let received = batch.recv(socket.as_raw_fd(), 1).expect("batch receive");
+        assert_eq!(received, 1, "one datagram was queued");
+        let mut admitted = 0usize;
+        Owner::charge_rx_batch(&batch, received, &mut report, |_, _| admitted += 1);
+        assert_eq!(admitted, 1, "a complete datagram is admitted once");
+        assert_eq!(report.rx_packets, 2, "one charge per received slot");
     }
 
     /// Managed-RX budget rule: zero allowances accept nothing, and the byte
