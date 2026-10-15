@@ -403,6 +403,29 @@ the same bounded teardown.
   asynchronous and kernel completion latency are outside it. Control datagrams
   and retransmissions have no source deadline and contribute no sample.
 
+## Composed memory envelope
+
+The frozen clauses bound each term separately. This section composes them for one
+Owner. No single byte budget is enforced across the three layers, so the envelope
+is a derivation with one enforced term, not a checked invariant:
+
+| Term | Bound | Enforced by |
+|---|---|---|
+| Window payload per established peer | `(flow_window_packets + receive_buffer_packets) * (DEFAULT_MTU - SRT_HEADER_SIZE)` = 1,484 bytes per retained packet, and one retained packet cannot exceed the negotiated ceiling because `handle_data_packet` rejects a larger inbound payload | `PeerTableConfig::max_window_memory_bytes`, charge held until retirement completes |
+| Window payload per table | the above times `max_peers`, refused with `OVERLOAD` when it does not fit | `reserved_window_memory_bytes`, `window_memory_rejections` |
+| Per-connection metadata | inline `SrtConnection` (a production x64 probe measured 1,600 bytes), loss bitmap 8,320 bytes, sender window directory 8,320 bytes, receiver window directory (window / 64 pages), one assembler partial per fragmented message, event and output queues capped by `MAX_EVENT_QUEUE_ACTIONS`, `MAX_OUTPUT_QUEUE_ACTIONS` and `MAX_OUTPUT_QUEUE_BYTES` | not charged; pinned by `maximum_loss_bitmap_heap_footprint_stays_bounded` and `sender_window_is_lazy_and_bounded_at_maximum_window` |
+| Transport structures | peer and caller slot arrays, dense routing arrays `next_power_of_two(min(max(max_peers, 64) * members, 65,536))`, scheduler heaps and maps preallocated by `max_peers` / `max_callers`, retirement jobs charged to admission until completion | not charged; sized at construction |
+| Runtime and I/O | two persistent 65,536-byte read and staging buffers per attached side, 32 receive-batch slots, 256 managed completions, provided-buffer pool `256 * next_power_of_two(ceiling)` (512 KiB at a 1,500 ceiling), SQ/CQ rings, fixed telemetry | not charged; `production_config_derives_explicit_envelope` |
+| Kernel socket storage | requested charge `4 * requested_buffer_bytes * sockets`, the resolved OS values, promotion bindings | requested-size budget only; actual kernel memory is not bounded |
+
+For an Owner with `P` peers and `C` callers the payload term is bounded and
+enforced, and every other term is bounded by a configuration maximum fixed at
+construction, but the sum is not tracked against a single budget. Allocator
+capacity, `Bytes` backing owners and kernel bookkeeping are outside every term.
+Multi-Owner totals multiply by the number of prepared Owners and listener tables
+(`PerPort`, `ReusePortMulti`, `SharedPool`), each with its own
+`max_window_memory_bytes`; the process total is the sum over Owners.
+
 ## Not frozen
 
 These are implementation choices an embedding application must not depend on;

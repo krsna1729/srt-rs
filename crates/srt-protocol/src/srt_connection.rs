@@ -3058,6 +3058,18 @@ impl SrtConnection {
             return Ok(()); // 接続前のデータは無視
         }
 
+        // The window-payload reservation (`window_memory_bound_bytes`) charges
+        // one retained packet at `max_payload_size`; `apply_peer_mss` never
+        // negotiates above `DEFAULT_MTU - SRT_HEADER_SIZE`. A peer that sends
+        // more than the negotiated ceiling could therefore retain more payload
+        // than the reservation charged for it, so an oversized DATA packet is a
+        // protocol violation rather than a loss.
+        if pkt.payload.len() > self.max_payload_size {
+            return Err(Error::invalid_state(
+                "DATA payload exceeds the negotiated maximum",
+            ));
+        }
+
         self.decrypt_data_packet(&mut pkt)?;
 
         // Receive before delivery. Ready packets are moved into the bounded
@@ -5438,6 +5450,32 @@ mod tests {
         });
         drive_handshake_to_connected(&mut caller, &mut listener);
         (caller, listener)
+    }
+
+    /// The negotiated payload ceiling is what the window-payload reservation
+    /// charges per retained packet, so a peer may not exceed it: a payload at
+    /// the ceiling is accepted, one byte more is a protocol violation rather
+    /// than a loss.
+    #[test]
+    fn a_data_payload_above_the_negotiated_maximum_is_rejected() {
+        let (_caller, mut listener) = connected_pair();
+        let limit = listener.max_payload_size;
+        assert!(limit > 0, "negotiation must leave room for a payload");
+        let now = Timestamp::from_micros(1_000_000);
+
+        let at_ceiling = DataPacket::new(0, 1, 0, 0, vec![0x11u8; limit].into());
+        listener
+            .handle_data_packet(at_ceiling, now)
+            .expect("a payload at the negotiated ceiling is legal");
+
+        let oversized = DataPacket::new(1, 2, 0, 0, vec![0x22u8; limit + 1].into());
+        let error = listener
+            .handle_data_packet(oversized, now)
+            .expect_err("a payload above the negotiated ceiling is rejected");
+        assert!(
+            error.to_string().contains("negotiated maximum"),
+            "unexpected error: {error}"
+        );
     }
 
     /// Minimal stand-in for a transport timer store: applies the connection's

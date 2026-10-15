@@ -519,3 +519,36 @@ tables have no derivation budget, so the application's reconnect cadence is the
 only bound on that work. `docs/listener-admission-policy.md` now states the scope,
 multiplication, refusal behaviour and the non-derivation gap where operators
 tune it.
+
+## DATA payload ceiling enforced and the composed Owner envelope written (2026-10-15)
+
+The window-payload reservation charges one retained packet at
+`DEFAULT_MTU - SRT_HEADER_SIZE`, 1,484 bytes, and `apply_peer_mss` never
+negotiates above that. Nothing rejected an inbound DATA packet that exceeded the
+negotiated ceiling: `handle_data_packet` went from the state check straight to
+decryption, so a peer could send up to the codec ceiling of 65,536 bytes per
+datagram while the reservation charged 1,484 for the slot it retained. A peer
+with a small window could therefore retain many times what its table's
+`max_window_memory_bytes` accounted for, which is the reconciliation the
+reservation needed.
+
+`handle_data_packet` now rejects a DATA payload above `max_payload_size`
+immediately after the state check, before decryption. The reservation's
+per-packet term is the enforced ceiling, and an oversized datagram is a protocol
+error that the transport fails the peer closed rather than a silent loss. New
+test `a_data_payload_above_the_negotiated_maximum_is_rejected` accepts a payload
+at the ceiling and rejects one byte above it. Mutation: weakening the comparison
+to `>=` fails that test on the boundary case. `cargo test -p srt-proto`: 397
+passed. `cargo clippy -p srt-proto --all-targets -- -D warnings` and
+`cargo fmt --all -- --check` are clean.
+
+`docs/owner-contract.md` now carries the composed envelope the earlier review
+asked for ("Composed memory envelope"): the enforced payload term, the pinned
+per-connection metadata (1,600-byte inline connection, 8,320-byte loss bitmap,
+8,320-byte sender directory, receiver directory of window / 64 pages, capped event
+and output queues), the transport structures sized at construction, the runtime
+and I/O buffers, the requested socket-memory budget and the kernel term. It states
+plainly that no single byte budget spans the three layers, that allocator
+capacity, `Bytes` backing owners and kernel bookkeeping are outside every term,
+and that multi-Owner totals multiply by prepared Owners and listener tables. No
+new limit is introduced beyond the enforced per-packet ceiling.
