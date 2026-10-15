@@ -290,17 +290,18 @@ composes overlays, accounts telemetry, and preserves admission ordering.
   sources out. Under a flood from many sources it sheds admission, not
   established media; raise the table rate if a mass reconnect of encrypted
   callers must finish faster. The budget is per table, like the window-memory
-  budget: `ReusePortSingle` and `PerPort` prepare one table, `ReusePortMulti` and
-  `SharedPool` prepare one per member, and a deployment with K listener processes
-  multiplies the aggregate PBKDF2 allowance by K. No process- or host-global
-  limiter exists. Exhaustion drops the CONCLUSION before policy runs and sends no
-  rejection, so the caller retransmits; `key_derivation_drops` counts table and
-  source refusals without separating them. The budget covers key derivation only:
-  decoding, routing, INDUCTION handling and unencrypted CONCLUSION policy work are
-  limited per visit by the owner service budget, not by this rate. Callers derive
-  a KEK once per connect attempt through `CryptoContext::new_sender` and caller
-  tables have no derivation bucket, so a listener that keeps rejecting bounds that
-  work only by the application's reconnect cadence.
+  budget: `ReusePortSingle` prepares one table and `PerPort` one per port, while
+  `ReusePortMulti` and `SharedPool` prepare one per member, and a deployment with
+  K listener processes multiplies the aggregate PBKDF2 allowance by K. No
+  process- or host-global limiter exists. Exhaustion drops the CONCLUSION before
+  policy runs and sends no rejection, so the caller retransmits;
+  `key_derivation_drops` counts table and source refusals without separating
+  them. The budget covers key derivation only: decoding, routing, INDUCTION
+  handling and unencrypted CONCLUSION policy work are limited per visit by the
+  owner service budget, not by this rate. Callers derive a KEK once per connect
+  attempt through `CryptoContext::new_sender` and caller tables have no derivation
+  bucket, so a listener that keeps rejecting bounds that work only by the
+  application's reconnect cadence.
 - Set `max_window_memory_bytes` to bound the payload one table can buffer.
   Each established peer reserves its worst case, `(flow window + receive
   window) × 1,484` bytes at the windows policy chose (about 24 MB at the
