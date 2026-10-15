@@ -13,7 +13,7 @@
 //! arriving afterwards, and `aligned_group_member_retransmits_after_sequence_jump`
 //! aligns a leg without the group prefix having moved.
 
-use srt_proto::wire::SrtPacket;
+use srt_proto::wire::{ControlType, SrtPacket};
 use srt_proto::{
     ConnectionOptions, ConnectionOutput, ConnectionState, GroupMemberState, GroupMode,
     SrtConnection, SrtGroup, Timestamp,
@@ -86,10 +86,10 @@ fn feed(group: &mut SrtGroup, member_id: u32, packet: &[u8], now: Timestamp) {
         .expect("packet should decode");
 }
 
-/// Return the member's control packets to the source, so the member's
-/// acknowledgments really retire the source's flight.
-fn return_control(source: &mut SrtConnection, member: &mut SrtConnection, now: Timestamp) {
-    for packet in packets_from(member) {
+/// Return control packets to the source, so the member's acknowledgments really
+/// retire the source's flight.
+fn return_packets(source: &mut SrtConnection, packets: Vec<Vec<u8>>, now: Timestamp) {
+    for packet in packets {
         source
             .feed_recv_buf(&packet, now)
             .expect("control should decode");
@@ -104,6 +104,43 @@ fn available_buffer_packets(group: &SrtGroup, member_id: u32) -> u32 {
         .receiver_stats()
         .expect("receiver stats")
         .available_buffer_packets
+}
+
+/// The sequence numbers acknowledged by the given control packets. The first
+/// four bytes of an ACK's control information are the acknowledged sequence
+/// number (`send_encoded_ack`).
+fn acknowledged_sequences(packets: &[Vec<u8>]) -> Vec<u32> {
+    let mut acknowledged = Vec::new();
+    for packet in packets {
+        if let Ok(SrtPacket::Control(control)) = SrtPacket::decode(packet)
+            && control.control_type == ControlType::Ack
+            && control.control_info.len() >= 4
+        {
+            acknowledged.push(u32::from_be_bytes([
+                control.control_info[0],
+                control.control_info[1],
+                control.control_info[2],
+                control.control_info[3],
+            ]));
+        }
+    }
+    acknowledged
+}
+
+/// The group's retirement prefix after the three deliveries of the fixture: the
+/// sequence one past the wrap.
+fn prefix() -> u32 {
+    BASE.wrapping_add(3) & SEQUENCE_MASK
+}
+
+/// Whether `sequence` lies past `prefix` in the 31-bit sequence comparison
+/// space, so a prefix-relative assertion uses the same wrap the protocol does.
+fn sequence_past(sequence: u32, prefix: u32) -> bool {
+    /// Half the 31-bit sequence space: the point where "ahead" becomes
+    /// "behind" in the protocol's own comparison.
+    const HALF_SEQUENCE_SPACE: u32 = 1 << 30;
+    let ahead = sequence.wrapping_sub(prefix) & SEQUENCE_MASK;
+    ahead != 0 && ahead < HALF_SEQUENCE_SPACE
 }
 
 /// A backup group whose retirement prefix has moved three sequences, the last
@@ -149,11 +186,12 @@ fn group_after_the_active_legs_first_delivery() -> FirstDelivery {
     assert_eq!(delivered.sequence_number, BASE);
     assert!(delivered.payload.eq(&b"first"[..]));
     assert!(group.poll_data(ts(101_000)).is_none());
-    return_control(
-        &mut source_a,
-        group.member_mut(1).unwrap().connection_mut(),
-        ts(101_500),
+    let packets = packets_from(group.member_mut(1).unwrap().connection_mut());
+    assert!(
+        acknowledged_sequences(&packets).contains(&(BASE.wrapping_add(1) & SEQUENCE_MASK)),
+        "the delivering leg acknowledges the sequence it delivered"
     );
+    return_packets(&mut source_a, packets, ts(101_500));
     assert_eq!(
         source_a.sender_stats().unwrap().packets_in_buffer,
         0,
@@ -181,12 +219,12 @@ fn advanced_prefix_group() -> PrefixFixture {
     source_b
         .synchronize_send_sequence(BASE.wrapping_add(1) & SEQUENCE_MASK)
         .unwrap();
-    source_b.send(b"second", ts(102_000)).unwrap();
+    source_b.send(b"second", ts(120_000)).unwrap();
     let second = packets_from(&mut source_b).pop().unwrap();
     assert_eq!(data_sequence(&second), BASE.wrapping_add(1) & SEQUENCE_MASK);
-    feed(&mut group, 2, &second, ts(102_500));
+    feed(&mut group, 2, &second, ts(120_500));
     let delivered = group
-        .poll_data(ts(102_500))
+        .poll_data(ts(120_500))
         .expect("the standby advances the prefix");
     assert_eq!(delivered.member_id, 2);
     assert!(delivered.payload.eq(&b"second"[..]));
@@ -194,12 +232,12 @@ fn advanced_prefix_group() -> PrefixFixture {
     source_a
         .synchronize_send_sequence(BASE.wrapping_add(2) & SEQUENCE_MASK)
         .unwrap();
-    source_a.send(b"third", ts(104_000)).unwrap();
+    source_a.send(b"third", ts(140_000)).unwrap();
     let third = packets_from(&mut source_a).pop().unwrap();
     assert_eq!(data_sequence(&third), BASE.wrapping_add(2) & SEQUENCE_MASK);
-    feed(&mut group, 1, &third, ts(104_500));
+    feed(&mut group, 1, &third, ts(140_500));
     let delivered = group
-        .poll_data(ts(104_500))
+        .poll_data(ts(140_500))
         .expect("the returning leg is accepted");
     assert_eq!(delivered.member_id, 1);
     assert_eq!(
@@ -207,12 +245,20 @@ fn advanced_prefix_group() -> PrefixFixture {
         BASE.wrapping_add(2) & SEQUENCE_MASK
     );
     assert!(delivered.payload.eq(&b"third"[..]));
-    assert!(group.poll_data(ts(104_500)).is_none());
-    return_control(
-        &mut source_a,
-        group.member_mut(1).unwrap().connection_mut(),
-        ts(104_800),
+    assert!(group.poll_data(ts(140_500)).is_none());
+    let packets = packets_from(group.member_mut(1).unwrap().connection_mut());
+    let acknowledged = acknowledged_sequences(&packets);
+    assert!(
+        acknowledged.contains(&prefix()),
+        "the returning leg acknowledges the moved prefix, got {acknowledged:?}"
     );
+    for sequence in &acknowledged {
+        assert!(
+            !sequence_past(*sequence, prefix()),
+            "an acknowledgment for {sequence} runs past the delivered prefix"
+        );
+    }
+    return_packets(&mut source_a, packets, ts(103_800));
     PrefixFixture {
         group,
         source_a,
@@ -221,29 +267,42 @@ fn advanced_prefix_group() -> PrefixFixture {
 }
 
 #[test]
-fn a_retired_flight_does_not_redeliver_or_fabricate_an_acknowledgment() {
+fn a_stale_flight_copy_is_not_delivered_again_or_acknowledged_past_the_prefix() {
     let PrefixFixture {
         mut group,
         mut source_a,
         first,
     } = advanced_prefix_group();
+    let prefix = prefix();
 
     // The old flight arrives late: the same sequence again, on the leg that
-    // first delivered it. The prefix already retired it, so it is dropped
-    // rather than delivered twice, and no acknowledgment is fabricated for a
-    // sequence the group never delivered.
-    feed(&mut group, 1, &first, ts(103_000));
+    // first delivered it. That leg's own receive cursor already covers the
+    // sequence, so it is dropped inside the connection; what this asserts is
+    // the end-to-end property, that the duplicate produces neither a delivery
+    // nor an acknowledgment past what the group really delivered. The group's
+    // own prefix guard is exercised by the late-leg test below.
+    let before = source_a.sender_stats().unwrap();
+    feed(&mut group, 1, &first, ts(160_000));
     assert!(
-        group.poll_data(ts(103_000)).is_none(),
+        group.poll_data(ts(160_000)).is_none(),
         "a retired sequence is not delivered twice"
     );
-    return_control(
-        &mut source_a,
-        group.member_mut(1).unwrap().connection_mut(),
-        ts(103_500),
+    let packets = packets_from(group.member_mut(1).unwrap().connection_mut());
+    for sequence in acknowledged_sequences(&packets) {
+        assert!(
+            !sequence_past(sequence, prefix),
+            "an acknowledgment for {sequence} runs past the delivered prefix {prefix}"
+        );
+    }
+    return_packets(&mut source_a, packets, ts(105_100));
+    let after = source_a.sender_stats().unwrap();
+    assert_eq!(
+        after.packets_in_buffer, before.packets_in_buffer,
+        "the stale copy retires nothing"
     );
+    assert_eq!(after.packets_in_flight, before.packets_in_flight);
     assert!(
-        source_a.send(b"fourth", ts(105_000)).is_ok(),
+        source_a.send(b"fourth", ts(160_200)).is_ok(),
         "the returning leg stays writable"
     );
 
@@ -260,13 +319,14 @@ fn a_late_leg_cannot_reopen_a_retired_sequence() {
         mut group, first, ..
     } = advanced_prefix_group();
 
-    // The same stale copy on the standby, which never received it at all:
-    // delivery advanced every member's cursor, not just the delivering one, so
-    // the standby has nothing left to deliver and nothing new to reserve.
+    // The same stale copy on the standby, which never received it at all. The
+    // delivery fan-out already moved that leg's cursor past the sequence, so
+    // this pins that the fan-out reached it: the standby has nothing left to
+    // deliver and nothing new to reserve.
     let standby_capacity = available_buffer_packets(&group, 2);
-    feed(&mut group, 2, &first, ts(103_200));
+    feed(&mut group, 2, &first, ts(180_000));
     assert!(
-        group.poll_data(ts(103_200)).is_none(),
+        group.poll_data(ts(180_000)).is_none(),
         "the standby leg does not deliver the retired sequence either"
     );
     assert_eq!(
@@ -284,14 +344,59 @@ fn a_late_leg_cannot_reopen_a_retired_sequence() {
     });
     group.add_member(3, 1, listener_c).unwrap();
     let late_capacity = available_buffer_packets(&group, 3);
-    feed(&mut group, 3, &first, ts(105_000));
+    feed(&mut group, 3, &first, ts(200_000));
     assert!(
-        group.poll_data(ts(105_000)).is_none(),
+        group.poll_data(ts(200_000)).is_none(),
         "a late leg cannot reopen a retired sequence"
     );
     assert_eq!(
         available_buffer_packets(&group, 3),
         late_capacity,
         "the group returns the retired sequence's reservation instead of holding it"
+    );
+}
+
+#[test]
+fn a_second_legs_copy_of_a_pending_sequence_returns_its_reservation() {
+    let options = ConnectionOptions {
+        initial_seq: Some(BASE),
+        ..ConnectionOptions::default()
+    };
+    let (mut source_a, listener_a) = establish_pair(options.clone());
+    let (mut source_b, listener_b) = establish_pair(options);
+    let mut group = SrtGroup::new(0x4000_0022, GroupMode::Backup).unwrap();
+    group.add_member(1, 100, listener_a).unwrap();
+    group.add_member(2, 1, listener_b).unwrap();
+
+    // Both legs carry the same group sequence, which is what a peer running the
+    // two legs independently can produce, and neither is delivered yet.
+    source_a.send(b"same", ts(100_000)).unwrap();
+    let from_a = packets_from(&mut source_a).pop().unwrap();
+    source_b.synchronize_send_sequence(BASE).unwrap();
+    source_b.send(b"same", ts(100_000)).unwrap();
+    let from_b = packets_from(&mut source_b).pop().unwrap();
+    assert_eq!(data_sequence(&from_a), BASE);
+    assert_eq!(data_sequence(&from_b), BASE);
+
+    let full_a = available_buffer_packets(&group, 1);
+    let full_b = available_buffer_packets(&group, 2);
+    feed(&mut group, 1, &from_a, ts(100_000));
+    feed(&mut group, 2, &from_b, ts(100_000));
+    let delivered = group.poll_data(ts(100_000)).expect("one copy is delivered");
+    assert_eq!(delivered.sequence_number, BASE);
+    assert!(delivered.payload.eq(&b"same"[..]));
+    assert!(
+        group.poll_data(ts(100_000)).is_none(),
+        "the second copy is not delivered"
+    );
+    assert_eq!(
+        available_buffer_packets(&group, 1),
+        full_a,
+        "the delivering leg's reservation is returned"
+    );
+    assert_eq!(
+        available_buffer_packets(&group, 2),
+        full_b,
+        "the duplicate leg's reservation is returned instead of being overwritten"
     );
 }
