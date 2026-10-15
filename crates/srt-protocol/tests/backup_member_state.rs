@@ -92,6 +92,8 @@ struct Failover {
     listener: SrtConnection,
     stalled: Vec<Vec<u8>>,
     cursor: u32,
+    /// Packets the stalled leg still holds in its sender buffer.
+    parked: u32,
 }
 
 fn stall_and_fail_over() -> Failover {
@@ -132,6 +134,14 @@ fn stall_and_fail_over() -> Failover {
         .connection()
         .next_sequence_number()
         .expect("a connected leg holds a sequence cursor");
+    let parked = group
+        .member(1)
+        .expect("first member")
+        .connection()
+        .sender_stats()
+        .expect("a connected sender reports stats")
+        .packets_in_buffer;
+    assert!(parked > 0, "the stalled flight is parked, not dropped");
     assert!(
         !group.can_send(),
         "the active leg's full window is the only leg Backup sends on"
@@ -167,6 +177,7 @@ fn stall_and_fail_over() -> Failover {
         listener: listener_a,
         stalled,
         cursor,
+        parked,
     }
 }
 
@@ -261,5 +272,66 @@ fn a_recovered_backup_leg_is_eligible_but_not_authoritative() {
         )
         .is_empty(),
         "no second leg carries"
+    );
+}
+
+/// The member-state axes are independent signals. A stalled leg is under
+/// pressure, not broken: pressure neither dissolves its connection and
+/// membership, nor the flight it could not send, nor its own send cursor,
+/// while the group's authority sits on the leg that can send.
+#[test]
+fn pressure_stays_separate_from_lifecycle_authority_and_cursor() {
+    let failover = stall_and_fail_over();
+
+    // Lifecycle: connected, still a member.
+    assert_eq!(
+        failover
+            .group
+            .member(1)
+            .expect("first member")
+            .connection()
+            .state(),
+        ConnectionState::Connected
+    );
+    assert_eq!(failover.group.members().len(), 2);
+
+    // Pressure: the parked flight is intact, packet for packet.
+    assert_eq!(
+        failover
+            .group
+            .member(1)
+            .expect("first member")
+            .connection()
+            .sender_stats()
+            .expect("a connected sender reports stats")
+            .packets_in_buffer,
+        failover.parked
+    );
+
+    // Authority: exactly one leg carries, and it is the promoted one.
+    assert_eq!(
+        failover
+            .group
+            .members()
+            .iter()
+            .filter(|member| member.state() == GroupMemberState::Active)
+            .count(),
+        1
+    );
+    assert_eq!(
+        failover.group.member(2).expect("second member").state(),
+        GroupMemberState::Active
+    );
+
+    // Synchronization: the send that failed on the stalled leg did not move
+    // that leg's own cursor.
+    assert_eq!(
+        failover
+            .group
+            .member(1)
+            .expect("first member")
+            .connection()
+            .next_sequence_number(),
+        Some(failover.cursor)
     );
 }
