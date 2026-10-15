@@ -640,10 +640,11 @@ explicit word budget for one entry. No continuation is introduced for a bound of
 a few microseconds, and the strict per-entry shape is unchanged.
 
 The budget covers `insert_range` and `remove_range` on the loss bitmap. Two
-receiver paths walk the same structure from one ACK tick without it:
-TLPKTDROP `ReceiverBuffer::drop_too_late` and `advance_expected_sequence`, both
-position-scale and both allocating. Both are listed as open in the per-entry
-audit ledger above.
+receiver paths walk the same structure without it: TLPKTDROP
+`ReceiverBuffer::drop_too_late` runs on every ACK tick, and
+`advance_expected_sequence` runs from bonded sequence alignment; both are
+position-scale and both allocating. Both are listed as open in this file's
+per-entry work audit section.
 
 Evidence. `one_loss_entry_walks_at_most_one_bitmap_word_per_64_positions` drives
 the real receive path: a peer one full window ahead exposes 65,535 positions and
