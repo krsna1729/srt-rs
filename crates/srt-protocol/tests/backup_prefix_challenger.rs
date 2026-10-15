@@ -356,7 +356,11 @@ fn a_second_legs_copy_of_a_pending_sequence_returns_its_reservation() {
     // sequence above the group's prefix while the sequence at the prefix is
     // still missing, so both copies really sit in the pending table at once and
     // the second one meets the table's own uniqueness guard.
-    let PrefixFixture { mut group, .. } = advanced_prefix_group();
+    let PrefixFixture {
+        mut group,
+        mut source_a,
+        ..
+    } = advanced_prefix_group();
     let missing = prefix();
     let late = missing.wrapping_add(2) & SEQUENCE_MASK;
 
@@ -386,19 +390,17 @@ fn a_second_legs_copy_of_a_pending_sequence_returns_its_reservation() {
         "the sequence at the group prefix is missing, so nothing is delivered yet"
     );
     // Precondition: each leg is holding exactly one slot, the first as the
-    // group's pending copy and the second until the group releases it.
+    // group's pending copy and the second because its copy is not collected
+    // from the member's event queue yet.
     assert_eq!(available_buffer_packets(&group, 3), full_third - 1);
     assert_eq!(available_buffer_packets(&group, 4), full_fourth - 1);
 
     // Unblock the head on the active leg, whose cursor sits at the group
     // prefix: the pending copy is then delivered and its reservation returns.
-    let (mut source_head, _) = establish_pair(ConnectionOptions {
-        initial_seq: Some(missing),
-        ..ConnectionOptions::default()
-    });
+    source_a.synchronize_send_sequence(missing).unwrap();
     for _ in 0..2 {
-        source_head.send(b"head", ts(201_000)).unwrap();
-        let packet = packets_from(&mut source_head).pop().unwrap();
+        source_a.send(b"head", ts(201_000)).unwrap();
+        let packet = packets_from(&mut source_a).pop().unwrap();
         feed(&mut group, 1, &packet, ts(201_000));
     }
     let mut delivered = Vec::new();
