@@ -3058,6 +3058,21 @@ impl SrtConnection {
             return Ok(()); // 接続前のデータは無視
         }
 
+        // The window-payload reservation (`window_memory_bound_bytes`) charges
+        // one retained packet at the constant ceiling, `DEFAULT_MTU -
+        // SRT_HEADER_SIZE`, so that is the bound to enforce here, not the
+        // negotiated one: `apply_peer_mss` derives its value from this side's
+        // view of the path, and a peer behind NAT64 or SIIT may legitimately
+        // see a larger family and keep sending up to the constant. A peer that
+        // exceeds the constant instead could retain more payload than the
+        // reservation charged for it, so that is a protocol violation rather
+        // than a loss.
+        if pkt.payload.len() > DEFAULT_MTU as usize - SRT_HEADER_SIZE {
+            return Err(Error::invalid_state(
+                "DATA payload exceeds the constant payload ceiling",
+            ));
+        }
+
         self.decrypt_data_packet(&mut pkt)?;
 
         // Receive before delivery. Ready packets are moved into the bounded
@@ -5438,6 +5453,46 @@ mod tests {
         });
         drive_handshake_to_connected(&mut caller, &mut listener);
         (caller, listener)
+    }
+
+    /// The constant payload ceiling is what the window-payload reservation
+    /// charges per retained packet, so a payload at `DEFAULT_MTU -
+    /// SRT_HEADER_SIZE` is accepted even when the negotiation landed lower from
+    /// this side's view of the path (NAT64 or SIIT), one byte more is a
+    /// protocol violation rather than a loss, and the connection survives it.
+    #[test]
+    fn a_data_payload_above_the_payload_ceiling_is_rejected_not_fatal() {
+        let (_caller, mut listener) = connected_pair();
+        let ceiling = DEFAULT_MTU as usize - SRT_HEADER_SIZE;
+        let now = Timestamp::from_micros(1_000_000);
+
+        let at_ceiling = DataPacket::new(0, 1, 0, 0, vec![0x11u8; ceiling].into());
+        listener
+            .handle_data_packet(at_ceiling, now)
+            .expect("a payload at the constant ceiling is legal");
+
+        // A peer this side sees through a different address family keeps
+        // sending at the constant ceiling even though the negotiation landed
+        // lower here; that must not be dropped.
+        listener.max_payload_size = ceiling - 28;
+        let after_lower_negotiation = DataPacket::new(1, 2, 0, 0, vec![0x33u8; ceiling].into());
+        listener
+            .handle_data_packet(after_lower_negotiation, now)
+            .expect("a payload at the ceiling is legal after a lower negotiation");
+
+        let oversized = DataPacket::new(2, 3, 0, 0, vec![0x22u8; ceiling + 1].into());
+        let error = listener
+            .handle_data_packet(oversized, now)
+            .expect_err("a payload above the ceiling is rejected");
+        assert!(
+            error.to_string().contains("constant payload ceiling"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            listener.state(),
+            ConnectionState::Connected,
+            "an oversized datagram is dropped and counted invalid, not fatal"
+        );
     }
 
     /// Minimal stand-in for a transport timer store: applies the connection's
