@@ -92,6 +92,8 @@ struct Failover {
     listener: SrtConnection,
     stalled: Vec<Vec<u8>>,
     cursor: u32,
+    /// Packets the stalled leg still holds in its sender buffer.
+    parked: u32,
 }
 
 fn stall_and_fail_over() -> Failover {
@@ -132,6 +134,14 @@ fn stall_and_fail_over() -> Failover {
         .connection()
         .next_sequence_number()
         .expect("a connected leg holds a sequence cursor");
+    let parked = group
+        .member(1)
+        .expect("first member")
+        .connection()
+        .sender_stats()
+        .expect("a connected sender reports stats")
+        .packets_in_buffer;
+    assert!(parked > 0, "the stalled flight is parked, not dropped");
     assert!(
         !group.can_send(),
         "the active leg's full window is the only leg Backup sends on"
@@ -167,6 +177,7 @@ fn stall_and_fail_over() -> Failover {
         listener: listener_a,
         stalled,
         cursor,
+        parked,
     }
 }
 
@@ -201,6 +212,43 @@ impl Failover {
 #[test]
 fn a_recovered_backup_leg_is_eligible_but_not_authoritative() {
     let mut failover = stall_and_fail_over();
+
+    // Lifecycle: pressure leaves the connection and group membership intact.
+    assert_eq!(
+        failover
+            .group
+            .member(1)
+            .expect("first member")
+            .connection()
+            .state(),
+        ConnectionState::Connected
+    );
+    assert_eq!(failover.group.members().len(), 2);
+
+    // Pressure: the buffered packet count is unchanged across failover.
+    assert_eq!(
+        failover
+            .group
+            .member(1)
+            .expect("first member")
+            .connection()
+            .sender_stats()
+            .expect("a connected sender reports stats")
+            .packets_in_buffer,
+        failover.parked,
+        "the stalled flight remains buffered"
+    );
+
+    // Synchronization: the failed send leaves the stalled leg's cursor intact.
+    assert_eq!(
+        failover
+            .group
+            .member(1)
+            .expect("first member")
+            .connection()
+            .next_sequence_number(),
+        Some(failover.cursor)
+    );
 
     // Still outstanding: a state refresh alone must not requalify the leg.
     assert!(failover.group.can_send());
