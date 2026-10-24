@@ -93,6 +93,16 @@ const TEST: Step = Step {
     informational: false,
 };
 
+const AUDIT: Step = Step {
+    name: "cargo-audit",
+    cmd: "cargo",
+    args: &["audit"],
+    env: &[],
+    tool: Some(("cargo-audit", "cargo-audit")),
+    cwd: None,
+    informational: false,
+};
+
 const DENY_PUBLISHED: Step = Step {
     name: "deny-published",
     cmd: "cargo",
@@ -248,6 +258,7 @@ const CI: &[&Step] = &[
     &TYPOS,
     &TEST,
     &LOOM,
+    &AUDIT,
     &DENY_PUBLISHED,
     &DENY_WORKSPACE,
     &PACKAGE,
