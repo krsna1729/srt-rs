@@ -1215,16 +1215,6 @@ impl SideRxHolder for ListenerSide {
     }
 }
 
-impl SideRxHolder for OwnerCallerSide {
-    fn rx_ring(&self) -> Option<&Rc<RefCell<ManagedRxRing>>> {
-        self.rx.ring.as_ref()
-    }
-
-    fn poll_read_ready(&self, cx: &mut Context<'_>) -> std::task::Poll<io::Result<()>> {
-        self.poll_fd.poll_read_ready(cx)
-    }
-}
-
 /// Per-side receive state: the selected mode, the managed ring when the owner
 /// is running managed multishot, and at most one staged completion whose lease
 /// is retained rather than copied.
@@ -1355,13 +1345,33 @@ pub struct ManagedRxStats {
     pub staged: bool,
 }
 
+impl ManagedRxStats {
+    /// One side's view over two sockets (a caller side's IPv4 and IPv6):
+    /// counts and capacities add, the mode is the side's one mode.
+    #[must_use]
+    pub fn combined(self, other: Self) -> Self {
+        Self {
+            mode: self.mode,
+            depth: self.depth + other.depth,
+            capacity: self.capacity + other.capacity,
+            dropped: self.dropped.saturating_add(other.dropped),
+            buffer_exhaustions: self
+                .buffer_exhaustions
+                .saturating_add(other.buffer_exhaustions),
+            truncated: self.truncated.saturating_add(other.truncated),
+            staged: self.staged || other.staged,
+        }
+    }
+}
+
 /// Managed RX telemetry for every side of an Owner, in one fixed-cost
 /// snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct OwnerRxStats {
     /// `None` when no listener socket is attached to this Owner.
     pub listener: Option<ManagedRxStats>,
-    /// `None` when no caller socket is attached to this Owner.
+    /// `None` when no caller socket is attached to this Owner; summed over
+    /// the caller side's IPv4 and IPv6 sockets when both are.
     pub caller: Option<ManagedRxStats>,
 }
 
@@ -1661,17 +1671,20 @@ impl ListenerSide {
     }
 }
 
-/// Pool-backed caller side of a shared Compio owner.
+/// Index of an address family's socket in [`OwnerCallerSide`]: IPv4 first.
+const fn family_index(addr: SocketAddr) -> usize {
+    if addr.is_ipv6() { 1 } else { 0 }
+}
+
+/// One caller UDP socket and its receive state.
 ///
-/// Sealed on purpose, exactly like [`ListenerSide`]: the invariants
-/// (`SocketOwnership::Shared`, shared-socket compatibility, wire ceiling,
-/// combined socket-memory budget) are enforced by [`Owner::connect`].
-pub struct OwnerCallerSide {
+/// A caller side owns one per address family, bound the first time a leg of
+/// that family dials. Every socket feeds the side's one caller table and the
+/// TX sink sends each datagram from the socket of its destination's family,
+/// so logical callers, the pool bound and stats stay per side, not per
+/// socket.
+pub(crate) struct CallerSocket {
     sock: Rc<compio::net::UdpSocket>,
-    pool: crate::CallerPool,
-    transport: crate::ResolvedTransportConfig,
-    local_bind: Option<std::net::SocketAddr>,
-    connect_config: crate::ConnectConfig,
     /// Selected receive datapath plus its managed ring/staged completion.
     rx: SideRx,
     /// Persistent receive slot; always `DEFAULT_RX_SLOT_SIZE` (see the
@@ -1682,6 +1695,81 @@ pub struct OwnerCallerSide {
     pending_rx: Option<(SocketAddr, usize)>,
     /// Persistent staging slot; always `DEFAULT_RX_SLOT_SIZE`.
     stage_buf: Vec<u8>,
+}
+
+impl CallerSocket {
+    fn new(
+        sock: compio::net::UdpSocket,
+        rx_mode: OwnerRxMode,
+        managed_slot_len: usize,
+    ) -> Result<Self, crate::RuntimeBuildError> {
+        let poll_fd = make_poll_fd(&sock)?;
+        let mut socket = Self {
+            sock: Rc::new(sock),
+            rx: SideRx::raw(),
+            rx_buf: vec![0u8; DEFAULT_RX_SLOT_SIZE],
+            poll_fd,
+            pending_rx: None,
+            stage_buf: vec![0u8; DEFAULT_RX_SLOT_SIZE],
+        };
+        if rx_mode == OwnerRxMode::ManagedMultishot {
+            // Configure the managed state only. The consumer task is started
+            // by `start_managed_rx` once the socket is committed: a candidate
+            // dropped after a failed admission must never have owned a live
+            // receive (dropping a live consumer's handle without an awaited
+            // cancel is what leaks provided-buffer leases).
+            socket.rx = SideRx::managed(managed_slot_len, true);
+        }
+        Ok(socket)
+    }
+
+    /// The address family slot this socket fills.
+    fn family(&self) -> usize {
+        self.sock.local_addr().map_or(0, family_index)
+    }
+
+    /// Start the one fixed managed RX task for this socket (idempotent).
+    fn start_managed_rx(&mut self, slot_len: usize) {
+        if compio::runtime::Runtime::try_current().is_none() {
+            return;
+        }
+        let Some(ring) = self.rx.ring.as_ref().cloned() else {
+            return;
+        };
+        if ring.borrow().task.is_some() {
+            return;
+        }
+        let handle = spawn_managed_rx_loop(Rc::clone(&self.sock), Rc::downgrade(&ring), slot_len);
+        ring.borrow_mut().task = Some(handle);
+    }
+}
+
+impl SideRxHolder for CallerSocket {
+    fn rx_ring(&self) -> Option<&Rc<RefCell<ManagedRxRing>>> {
+        self.rx.ring.as_ref()
+    }
+
+    fn poll_read_ready(&self, cx: &mut Context<'_>) -> std::task::Poll<io::Result<()>> {
+        self.poll_fd.poll_read_ready(cx)
+    }
+}
+
+/// Pool-backed caller side of a shared Compio owner.
+///
+/// Sealed on purpose, exactly like [`ListenerSide`]: the invariants
+/// (`SocketOwnership::Shared`, shared-socket compatibility, wire ceiling,
+/// combined socket-memory budget) are enforced by [`Owner::connect`].
+///
+/// One caller table and pool serve every address family: the side holds an
+/// IPv4 and an IPv6 socket, each bound on first use, so one Owner calls
+/// listeners of either family (and a bond may mix them).
+pub struct OwnerCallerSide {
+    /// `[IPv4, IPv6]`; see [`CallerSocket`].
+    sockets: [Option<CallerSocket>; 2],
+    pool: crate::CallerPool,
+    transport: crate::ResolvedTransportConfig,
+    local_bind: Option<std::net::SocketAddr>,
+    connect_config: crate::ConnectConfig,
 }
 
 impl OwnerCallerSide {
@@ -1719,7 +1807,7 @@ impl OwnerCallerSide {
     }
 
     /// Attach with an explicit receive mode; see the listener side's
-    /// `from_prepared_with_rx_mode`.
+    /// `from_prepared_with_rx_mode`. `sock` fills its own family's slot.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_parts_with_rx_mode(
         sock: compio::net::UdpSocket,
@@ -1730,47 +1818,67 @@ impl OwnerCallerSide {
         rx_mode: OwnerRxMode,
         managed_slot_len: usize,
     ) -> Result<Self, crate::RuntimeBuildError> {
-        let poll_fd = make_poll_fd(&sock)?;
-        let sock = Rc::new(sock);
         let mut side = Self {
-            sock,
+            sockets: [None, None],
             pool: crate::CallerPool::new(max_in_flight),
             transport,
             local_bind,
             connect_config,
-            rx: SideRx::raw(),
-            rx_buf: vec![0u8; DEFAULT_RX_SLOT_SIZE],
-            poll_fd,
-            pending_rx: None,
-            stage_buf: vec![0u8; DEFAULT_RX_SLOT_SIZE],
         };
-        if rx_mode == OwnerRxMode::ManagedMultishot {
-            // Configure the managed state only. The consumer task is started
-            // by `start_managed_rx` once the side is committed: a candidate
-            // side that is dropped after a failed first admission must never
-            // have owned a live receive (dropping a live consumer's handle
-            // without an awaited cancel is what leaks provided-buffer leases).
-            side.rx = SideRx::managed(managed_slot_len, true);
-        }
+        side.insert_socket(CallerSocket::new(sock, rx_mode, managed_slot_len)?);
         Ok(side)
     }
 
-    /// Start the one fixed managed RX task for this socket (idempotent).
-    ///
-    /// Called exactly once, by [`Owner`], after a side has been admitted a
-    /// first caller and committed. Construction never starts it.
+    fn insert_socket(&mut self, socket: CallerSocket) {
+        let family = socket.family();
+        self.sockets[family] = Some(socket);
+    }
+
+    fn sockets(&self) -> impl Iterator<Item = &CallerSocket> {
+        self.sockets.iter().flatten()
+    }
+
+    /// The sockets the TX sink sends from, by destination family.
+    #[cfg(test)]
+    fn tx_sockets(&self) -> TxSockets<'_> {
+        TxSockets::of(&self.sockets)
+    }
+
+    /// Start every socket's managed RX task (idempotent per socket).
     fn start_managed_rx(&mut self, slot_len: usize) {
-        if compio::runtime::Runtime::try_current().is_none() {
-            return;
+        for socket in self.sockets.iter_mut().flatten() {
+            socket.start_managed_rx(slot_len);
         }
-        let Some(ring) = self.rx.ring.as_ref().cloned() else {
-            return;
-        };
-        if ring.borrow().task.is_some() {
-            return;
+    }
+
+    fn rx_pending(&self) -> bool {
+        self.sockets()
+            .any(|socket| socket.pending_rx.is_some() || socket.rx.pending())
+    }
+
+    fn rx_quiescent(&self) -> bool {
+        self.sockets().all(|socket| socket.rx.quiescent())
+    }
+
+    fn take_rx_fault(&self) -> Option<RxFault> {
+        self.sockets().find_map(|socket| socket.rx.take_fault())
+    }
+
+    /// Receive telemetry summed over the side's sockets.
+    fn rx_stats(&self) -> Option<ManagedRxStats> {
+        self.sockets()
+            .map(|socket| socket.rx.stats())
+            .reduce(ManagedRxStats::combined)
+    }
+
+    /// Whether any socket has receive work now, registering the waker.
+    fn rx_ready(&self, cx: &mut Context<'_>) -> bool {
+        let mut ready = false;
+        for socket in self.sockets() {
+            // Every socket registers, so either one wakes the Owner later.
+            ready |= Owner::side_rx_ready(Some(socket), cx);
         }
-        let handle = spawn_managed_rx_loop(Rc::clone(&self.sock), Rc::downgrade(&ring), slot_len);
-        ring.borrow_mut().task = Some(handle);
+        ready
     }
 
     /// Immutable access to the pooled caller table.
@@ -1788,29 +1896,46 @@ impl OwnerCallerSide {
     #[cfg(any(test, feature = "bench-internals"))]
     #[must_use]
     pub fn new_single(sock: compio::net::UdpSocket) -> Self {
-        // Test/dev-only constructor: a poll fd that cannot be created is a
-        // broken test host, not a runtime condition to handle.
-        let poll_fd = make_poll_fd(&sock).expect("test-only caller poll_fd initializes");
         let transport = crate::TransportConfig {
             ownership: crate::SocketOwnership::Shared,
             ..crate::TransportConfig::default()
         }
         .resolve(crate::RuntimeFlavor::Compio.capabilities())
         .expect("shared transport resolves");
-        Self {
-            sock: Rc::new(sock),
-            rx: SideRx::raw(),
+        let mut side = Self {
+            sockets: [None, None],
             pool: crate::CallerPool::new(std::num::NonZeroUsize::MIN),
             transport,
             local_bind: None,
             connect_config: crate::ConnectConfig::default(),
-            rx_buf: vec![0u8; DEFAULT_RX_SLOT_SIZE],
-            poll_fd,
-            pending_rx: None,
-            stage_buf: vec![0u8; DEFAULT_RX_SLOT_SIZE],
-        }
+        };
+        // Test/dev-only constructor: a poll fd that cannot be created is a
+        // broken test host, not a runtime condition to handle.
+        side.insert_socket(
+            CallerSocket::new(sock, OwnerRxMode::RawReadiness, 0)
+                .expect("test-only caller poll_fd initializes"),
+        );
+        side
+    }
+
+    /// Test-only: the side's one socket (tests attach a single socket).
+    #[cfg(test)]
+    fn only_socket(&self) -> &CallerSocket {
+        self.sockets()
+            .next()
+            .expect("a test caller side holds one socket")
+    }
+
+    #[cfg(test)]
+    fn only_socket_mut(&mut self) -> &mut CallerSocket {
+        self.sockets
+            .iter_mut()
+            .flatten()
+            .next()
+            .expect("a test caller side holds one socket")
     }
 }
+
 /// One first-or-subsequent caller admission request, by value, so the Owner
 /// can read the socket-defining first leg by reference and then hand the whole
 /// request to the pool without cloning any session (or its key material).
@@ -2887,8 +3012,31 @@ impl TxEngine {
     }
 }
 
+/// The sockets a TX sink sends from, `[IPv4, IPv6]`: a datagram goes out of
+/// its destination's family. A listener passes its one socket for both.
+#[derive(Clone, Copy)]
+struct TxSockets<'a>([Option<&'a Rc<compio::net::UdpSocket>>; 2]);
+
+impl<'a> TxSockets<'a> {
+    fn of(sockets: &'a [Option<CallerSocket>; 2]) -> Self {
+        Self(
+            sockets
+                .each_ref()
+                .map(|socket| socket.as_ref().map(|s| &s.sock)),
+        )
+    }
+
+    fn single(sock: &'a Rc<compio::net::UdpSocket>) -> Self {
+        Self([Some(sock), Some(sock)])
+    }
+
+    fn for_peer(self, peer: SocketAddr) -> Option<&'a Rc<compio::net::UdpSocket>> {
+        self.0[family_index(peer)]
+    }
+}
+
 struct OwnerTxSink<'a> {
-    sock: &'a Rc<compio::net::UdpSocket>,
+    socks: TxSockets<'a>,
     tx_pool: &'a mut TxPool,
     tx_engine: &'a mut TxEngine,
     /// The Owner-wide operational predicate at the moment the sink was
@@ -3013,6 +3161,12 @@ impl OwnerTxSink<'_> {
                 "owner is not operational: no new TX submission is admitted",
             ));
         }
+        let Some(sock) = self.socks.for_peer(peer) else {
+            return Err(srt_proto::Error::with_reason(
+                srt_proto::ErrorKind::InvalidState,
+                format!("no socket of {peer}'s address family is attached"),
+            ));
+        };
         let Some(lane_idx) = self.tx_engine.reserve_lane() else {
             return Ok(None);
         };
@@ -3022,7 +3176,7 @@ impl OwnerTxSink<'_> {
         };
         buf.resize(wire_len, 0);
         Ok(Some(OwnerTxSlot {
-            sock: self.sock,
+            sock,
             tx_pool: self.tx_pool,
             tx_engine: self.tx_engine,
             attribution,
@@ -3592,7 +3746,7 @@ impl Owner {
     pub fn rx_stats(&self) -> OwnerRxStats {
         OwnerRxStats {
             listener: self.listener.as_ref().map(|side| side.rx.stats()),
-            caller: self.caller.as_ref().map(|side| side.rx.stats()),
+            caller: self.caller.as_ref().and_then(OwnerCallerSide::rx_stats),
         }
     }
 
@@ -3821,10 +3975,12 @@ impl Owner {
         {
             rx_timed_out = Some("listener");
         }
-        if let Some(caller) = self.caller.as_mut()
-            && !caller.rx.stop_and_join(remaining(deadline)).await
-        {
-            rx_timed_out = rx_timed_out.or(Some("caller"));
+        if let Some(caller) = self.caller.as_mut() {
+            for socket in caller.sockets.iter_mut().flatten() {
+                if !socket.rx.stop_and_join(remaining(deadline)).await {
+                    rx_timed_out = rx_timed_out.or(Some("caller"));
+                }
+            }
         }
         if let Some(side) = rx_timed_out {
             // Terminal and truthful: the RX worker still owns its receive, so
@@ -3863,7 +4019,10 @@ impl Owner {
             .listener
             .as_ref()
             .is_none_or(|side| side.rx.quiescent());
-        let caller_gone = self.caller.as_ref().is_none_or(|side| side.rx.quiescent());
+        let caller_gone = self
+            .caller
+            .as_ref()
+            .is_none_or(OwnerCallerSide::rx_quiescent);
         listener_gone
             && caller_gone
             && self.tx_engine.in_flight() == 0
@@ -3885,7 +4044,7 @@ impl Owner {
         let caller = self
             .caller
             .as_ref()
-            .and_then(|side| side.rx.take_fault().map(|fault| ("caller", fault)));
+            .and_then(|side| side.take_rx_fault().map(|fault| ("caller", fault)));
         let (side, fault) = match listener.or(caller) {
             Some(pair) => pair,
             None => return,
@@ -4116,10 +4275,11 @@ impl Owner {
         }
     }
 
-    /// Start one outbound session on this owner's shared caller socket,
-    /// binding it on the first call. `config.transport.ownership` must be
-    /// `Shared`; the shared socket stays unconnected and every logical
-    /// caller is demultiplexed by SRT socket ID.
+    /// Start one outbound session on this owner's shared caller socket of the
+    /// remote's address family, binding that socket on the family's first
+    /// call. `config.transport.ownership` must be `Shared`; the shared socket
+    /// stays unconnected and every logical caller is demultiplexed by SRT
+    /// socket ID.
     pub fn connect(
         &mut self,
         config: &crate::CallerConfig,
@@ -4138,8 +4298,8 @@ impl Owner {
     }
 
     /// Start one bonded (Broadcast or Backup) outbound session on this
-    /// owner's shared caller socket. The whole group is ONE logical caller:
-    /// it resolves to a single [`crate::LogicalCallerId`] and is thereafter
+    /// owner's shared caller socket of its family. The whole group is ONE
+    /// logical caller: it resolves to a single [`crate::LogicalCallerId`] and is thereafter
     /// driven through the same [`Self::logical_caller`],
     /// [`Self::logical_caller_mut`], [`Self::remove_caller`],
     /// [`Self::poll_caller_events`], [`Self::poll_tx_failures`] and
@@ -4148,7 +4308,7 @@ impl Owner {
     ///
     /// Every leg goes through the same validation as [`Self::connect`]
     /// (`Compio` preparation, `SocketOwnership::Shared`, the Owner's wire
-    /// ceiling, compatibility with the shared caller socket), and the legs
+    /// ceiling, compatibility with the shared caller side), and the legs
     /// must also agree with each other and with the socket's address family.
     /// All of that happens before anything is committed, so a rejected group
     /// leaves no group, leg, pool permit or deadline behind and does not
@@ -4160,7 +4320,8 @@ impl Owner {
     /// or is refused as [`crate::PoolOutcome::Full`]) regardless of its leg
     /// count, which stays bounded by [`srt_proto::MAX_GROUP_MEMBERS`]. It
     /// adds no socket, task or connection object: all legs share this
-    /// Owner's one caller UDP socket, TX lanes and receive consumer.
+    /// Owner's caller UDP socket of their family, TX lanes and receive
+    /// consumer.
     pub fn connect_bonded(
         &mut self,
         config: &crate::BondedCallerConfig,
@@ -4190,24 +4351,22 @@ impl Owner {
                 Some(first_connect),
             )?;
         }
-        let socket_is_v6 = match self.caller.as_ref() {
-            Some(side) => side.sock.local_addr().map(|addr| addr.is_ipv6()).ok(),
-            None => None,
-        }
-        .unwrap_or_else(|| first_bind.unwrap_or(first_remote).is_ipv6());
+        // The group negotiates one payload size for every leg, and an IPv6
+        // path carries less per datagram than an IPv4 one, so a group's legs
+        // share one address family (and so one of the side's sockets).
+        let _ = first_bind;
+        let group_is_v6 = first_remote.is_ipv6();
         if let Some(leg) = prepared
             .legs
             .iter()
-            .find(|leg| leg.caller.remote.is_ipv6() != socket_is_v6)
+            .find(|leg| leg.caller.remote.is_ipv6() != group_is_v6)
         {
             return Err(crate::RuntimeBuildError::from(crate::ConfigError::new(
                 FIELD,
                 format!(
-                    "leg {} targets {} but the shared caller socket is {}; every leg of \
-                     a bonded caller must use the socket's address family",
-                    leg.member_id,
-                    leg.caller.remote,
-                    if socket_is_v6 { "IPv6" } else { "IPv4" },
+                    "leg {} targets {} but leg 0 targets {first_remote}; every leg of a \
+                     bonded caller must use one address family",
+                    leg.member_id, leg.caller.remote,
                 ),
             )));
         }
@@ -4256,6 +4415,18 @@ impl Owner {
                 Some(side.connect_config),
             )?;
         }
+        if let Some(bind) = prepared.local_bind
+            && bind.is_ipv6() != prepared.remote.is_ipv6()
+        {
+            return Err(crate::RuntimeBuildError::from(crate::ConfigError::new(
+                field,
+                format!(
+                    "local_bind {bind} cannot reach {}: a caller socket bound to one \
+                     address family cannot send to the other",
+                    prepared.remote
+                ),
+            )));
+        }
         Ok(())
     }
 
@@ -4286,11 +4457,26 @@ impl Owner {
             CallerRequest::Direct(prepared) => pool.connect(*prepared, now),
             CallerRequest::Group(prepared) => pool.connect_group(prepared, now),
         };
-        if let Some(side) = self.caller.as_mut() {
-            return admit(&mut side.pool, request).map_err(refuse);
+        if let Some(side) = self.caller.as_ref() {
+            let family = family_index(request.first_leg().remote);
+            if side.sockets[family].is_some() {
+                let side = self.caller.as_mut().expect("caller side present");
+                return admit(&mut side.pool, request).map_err(refuse);
+            }
+            // The first call of this family binds its socket. Like a first
+            // attach, the candidate socket commits only with an admitted or
+            // queued request (a queued one dials from it later).
+            let (socket, slot_len) = self.build_caller_socket(request.first_leg())?;
+            let side = self.caller.as_mut().expect("caller side present");
+            let outcome = admit(&mut side.pool, request).map_err(refuse)?;
+            if outcome != crate::PoolOutcome::Full {
+                side.insert_socket(socket);
+                side.start_managed_rx(slot_len);
+            }
+            return Ok(outcome);
         }
-        // The first leg fixes the shared socket; the candidate borrows nothing
-        // from the request once built.
+        // The first leg fixes the side's shared configuration and binds its
+        // family's socket; the candidate borrows nothing from the request.
         let (mut candidate, rx_mode, slot_len) = self.build_caller_side(request.first_leg())?;
         let outcome = admit(&mut candidate.pool, request).map_err(refuse)?;
         if outcome == crate::PoolOutcome::Full {
@@ -4304,6 +4490,57 @@ impl Owner {
         Ok(outcome)
     }
 
+    /// Bind a further family's socket for an existing caller side, in the
+    /// receive mode the Owner already committed, within the socket budget.
+    fn build_caller_socket(
+        &self,
+        prepared: &crate::PreparedCaller,
+    ) -> Result<(CallerSocket, usize), crate::RuntimeBuildError> {
+        self.check_caller_socket_budget(prepared)?;
+        let sock = compio::net::UdpSocket::from_std(prepared.bind_socket()?)?;
+        let rx_mode = match self.rx_mode {
+            Some(mode) => mode,
+            None => self.resolve_rx_mode("caller.connect.rx_mode")?,
+        };
+        let slot_len = managed_rx_buffer_len(self.wire_ceiling);
+        Ok((CallerSocket::new(sock, rx_mode, slot_len)?, slot_len))
+    }
+
+    /// The Owner's socket-memory budget covers the listener's sockets, every
+    /// caller socket already bound, and the one `prepared` would add.
+    fn check_caller_socket_budget(
+        &self,
+        prepared: &crate::PreparedCaller,
+    ) -> Result<(), crate::RuntimeBuildError> {
+        let Some(budget) = self.socket_memory_budget else {
+            return Ok(());
+        };
+        let listener_requested = self.listener.as_ref().map_or(0, |l| {
+            l.transport
+                .socket_buffer_bytes
+                .saturating_mul(4)
+                .saturating_mul(l.transport.topology.listener_socket_count().get())
+        });
+        let per_caller_socket = prepared.requested_socket_memory_bytes();
+        let caller_sockets = self
+            .caller
+            .as_ref()
+            .map_or(0, |side| side.sockets().count())
+            + 1;
+        let total =
+            listener_requested.saturating_add(per_caller_socket.saturating_mul(caller_sockets));
+        if total > budget.get() {
+            return Err(crate::RuntimeBuildError::from(crate::ConfigError::new(
+                "caller.socket_memory_budget",
+                format!(
+                    "{total} bytes requested for combined listener and caller buffers exceeds owner budget of {} bytes",
+                    budget.get()
+                ),
+            )));
+        }
+        Ok(())
+    }
+
     /// Build the candidate caller side for the first request without mutating
     /// the Owner: bind the socket, resolve the receive mode, construct the
     /// side (no receive task yet). Returns the mode and slot length to commit.
@@ -4311,24 +4548,7 @@ impl Owner {
         &self,
         prepared: &crate::PreparedCaller,
     ) -> Result<(OwnerCallerSide, OwnerRxMode, usize), crate::RuntimeBuildError> {
-        if let Some(budget) = self.socket_memory_budget {
-            let listener_requested = self.listener.as_ref().map_or(0, |l| {
-                l.transport
-                    .socket_buffer_bytes
-                    .saturating_mul(4)
-                    .saturating_mul(l.transport.topology.listener_socket_count().get())
-            });
-            let total = listener_requested.saturating_add(prepared.requested_socket_memory_bytes());
-            if total > budget.get() {
-                return Err(crate::RuntimeBuildError::from(crate::ConfigError::new(
-                    "caller.socket_memory_budget",
-                    format!(
-                        "{total} bytes requested for combined listener and caller buffers exceeds owner budget of {} bytes",
-                        budget.get()
-                    ),
-                )));
-            }
-        }
+        self.check_caller_socket_budget(prepared)?;
         let sock = compio::net::UdpSocket::from_std(prepared.bind_socket()?)?;
         let max_in_flight = prepared.connect.max_in_flight;
         let rx_mode = self.resolve_rx_mode("caller.connect.rx_mode")?;
@@ -4672,7 +4892,7 @@ impl Owner {
     /// Awakened by:
     /// 1. A TX completion that has become READY (observed, not reaped).
     /// 2. An incoming datagram on the listener socket (wakes immediately).
-    /// 3. An incoming datagram on the caller socket (wakes immediately).
+    /// 3. An incoming datagram on a caller socket (wakes immediately).
     /// 4. Timer expiry (`timeout` elapses).
     ///
     /// This function only waits and registers wakers. It never dequeues a
@@ -4691,7 +4911,7 @@ impl Owner {
         }) || self
             .caller
             .as_ref()
-            .is_some_and(|c| c.pending_rx.is_some() || c.rx.pending())
+            .is_some_and(OwnerCallerSide::rx_pending)
         {
             return;
         }
@@ -4711,7 +4931,11 @@ impl Owner {
                 {
                     return std::task::Poll::Ready(());
                 }
-                if Self::side_rx_ready(self.caller.as_ref(), cx) {
+                if self
+                    .caller
+                    .as_ref()
+                    .is_some_and(|caller| caller.rx_ready(cx))
+                {
                     return std::task::Poll::Ready(());
                 }
                 std::task::Poll::Pending
@@ -4992,23 +5216,21 @@ impl Owner {
 
     /// Feed one managed completion into the pooled caller table and account it.
     fn feed_managed(
-        caller: &mut OwnerCallerSide,
+        pool: &mut crate::CallerPool,
         datagram: &ManagedRxDatagram,
         now: Timestamp,
         report: &mut OwnerServiceReport,
     ) {
         report.rx_packets += 1;
         report.rx_bytes += datagram.len();
-        let _ = caller
-            .pool
-            .table_mut()
-            .feed(datagram.peer, datagram.bytes(), now);
+        let _ = pool.table_mut().feed(datagram.peer, datagram.bytes(), now);
     }
 
-    /// Managed drain for the caller socket; the caller-side counterpart to
+    /// Managed drain for one caller socket; the caller-side counterpart to
     /// [`Self::service_rx_listener_managed`].
     async fn service_rx_caller_managed(
-        caller: &mut OwnerCallerSide,
+        caller: &mut CallerSocket,
+        pool: &mut crate::CallerPool,
         now: Timestamp,
         budget: &OwnerServiceBudget,
         report: &mut OwnerServiceReport,
@@ -5027,7 +5249,7 @@ impl Owner {
                 caller.rx.staged = Some(staged);
                 return;
             }
-            Self::feed_managed(caller, &staged, now, report);
+            Self::feed_managed(pool, &staged, now, report);
         }
 
         while report.rx_packets < budget.max_rx_packets && report.rx_bytes < budget.max_rx_bytes {
@@ -5038,18 +5260,32 @@ impl Owner {
                 caller.rx.staged = Some(datagram);
                 break;
             }
-            Self::feed_managed(caller, &datagram, now, report);
+            Self::feed_managed(pool, &datagram, now, report);
         }
     }
 
+    /// Every caller socket, through the side's one table.
     async fn service_rx_caller(
-        caller: &mut OwnerCallerSide,
+        side: &mut OwnerCallerSide,
+        now: Timestamp,
+        budget: &OwnerServiceBudget,
+        report: &mut OwnerServiceReport,
+    ) {
+        let OwnerCallerSide { sockets, pool, .. } = side;
+        for socket in sockets.iter_mut().flatten() {
+            Self::service_rx_caller_socket(socket, pool, now, budget, report).await;
+        }
+    }
+
+    async fn service_rx_caller_socket(
+        caller: &mut CallerSocket,
+        pool: &mut crate::CallerPool,
         now: Timestamp,
         budget: &OwnerServiceBudget,
         report: &mut OwnerServiceReport,
     ) {
         if caller.rx.mode == OwnerRxMode::ManagedMultishot {
-            Self::service_rx_caller_managed(caller, now, budget, report).await;
+            Self::service_rx_caller_managed(caller, pool, now, budget, report).await;
             return;
         }
         // 1. Consume a staged packet (metadata only) when the budget permits.
@@ -5061,10 +5297,7 @@ impl Owner {
             }
             report.rx_packets += 1;
             report.rx_bytes += len;
-            let _ = caller
-                .pool
-                .table_mut()
-                .feed(peer, &caller.stage_buf[..len], now);
+            let _ = pool.table_mut().feed(peer, &caller.stage_buf[..len], now);
             caller.pending_rx = None;
         }
 
@@ -5107,10 +5340,7 @@ impl Owner {
             }
             report.rx_packets += 1;
             report.rx_bytes += len;
-            let _ = caller
-                .pool
-                .table_mut()
-                .feed(peer, &caller.rx_buf[..len], now);
+            let _ = pool.table_mut().feed(peer, &caller.rx_buf[..len], now);
         }
     }
     async fn service_rx(
@@ -5291,7 +5521,7 @@ impl Owner {
         let operational = self.is_operational();
         if let Some(ref mut listener) = self.listener {
             let mut sink = OwnerTxSink {
-                sock: &listener.sock,
+                socks: TxSockets::single(&listener.sock),
                 tx_pool: &mut self.tx_pool,
                 tx_engine: &mut self.tx_engine,
                 operational,
@@ -5314,17 +5544,15 @@ impl Owner {
         report: &mut OwnerServiceReport,
     ) {
         let operational = self.is_operational();
-        if let Some(caller) = self.caller.as_mut() {
+        if let Some(OwnerCallerSide { sockets, pool, .. }) = self.caller.as_mut() {
             let mut sink = OwnerTxSink {
-                sock: &caller.sock,
+                socks: TxSockets::of(sockets),
                 tx_pool: &mut self.tx_pool,
                 tx_engine: &mut self.tx_engine,
                 operational,
                 now,
             };
-            let drain_report = caller
-                .pool
-                .poll_outbound_bounded_to(now, tx_budget, &mut sink);
+            let drain_report = pool.poll_outbound_bounded_to(now, tx_budget, &mut sink);
             report.actions += drain_report.actions;
             report.tx_packets_submitted += drain_report.packets;
             report.tx_bytes_submitted += drain_report.bytes;
@@ -5393,8 +5621,7 @@ impl Owner {
                 || l.table.retirements_pending() != 0
         });
         let c_pending = self.caller.as_ref().is_some_and(|c| {
-            c.pending_rx.is_some()
-                || c.rx.pending()
+            c.rx_pending()
                 || (tx_ready && c.pool.table().has_pending_output(now))
                 || c.pool.has_pending_work(now)
                 || c.pool.table().retirements_pending() != 0
@@ -6251,7 +6478,7 @@ mod tests {
             {
                 let caller = owner.caller.as_ref().unwrap();
                 let mut sink = OwnerTxSink {
-                    sock: &caller.sock,
+                    socks: caller.tx_sockets(),
                     tx_pool: &mut owner.tx_pool,
                     tx_engine: &mut owner.tx_engine,
                     operational: true,
@@ -6370,8 +6597,8 @@ mod tests {
             }
             {
                 let c = owner.caller.as_mut().unwrap();
-                c.stage_buf[..c_pkt.len()].copy_from_slice(c_pkt);
-                c.pending_rx = Some((dummy_peer, c_pkt.len()));
+                c.only_socket_mut().stage_buf[..c_pkt.len()].copy_from_slice(c_pkt);
+                c.only_socket_mut().pending_rx = Some((dummy_peer, c_pkt.len()));
             }
 
             // has_pending_work must report true because staged packets exist!
@@ -6393,7 +6620,15 @@ mod tests {
                 "max_rx_packets=0 must perform zero RX work"
             );
             assert!(owner.listener.as_ref().unwrap().pending_rx.is_some());
-            assert!(owner.caller.as_ref().unwrap().pending_rx.is_some());
+            assert!(
+                owner
+                    .caller
+                    .as_ref()
+                    .unwrap()
+                    .only_socket()
+                    .pending_rx
+                    .is_some()
+            );
             assert!(report.work_remaining);
 
             // 2. service with max_rx_packets = 1 must process EXACTLY one packet
@@ -6415,7 +6650,15 @@ mod tests {
                 "next service must process the second packet"
             );
             assert!(owner.listener.as_ref().unwrap().pending_rx.is_none());
-            assert!(owner.caller.as_ref().unwrap().pending_rx.is_none());
+            assert!(
+                owner
+                    .caller
+                    .as_ref()
+                    .unwrap()
+                    .only_socket()
+                    .pending_rx
+                    .is_none()
+            );
         });
     }
 
@@ -6526,7 +6769,14 @@ mod tests {
             };
             for _ in 0..200 {
                 owner.service(Timestamp::from_micros(100), tiny).await;
-                if owner.caller.as_ref().unwrap().pending_rx.is_some() {
+                if owner
+                    .caller
+                    .as_ref()
+                    .unwrap()
+                    .only_socket()
+                    .pending_rx
+                    .is_some()
+                {
                     break;
                 }
                 owner
@@ -6538,17 +6788,18 @@ mod tests {
                 .caller
                 .as_ref()
                 .unwrap()
+                .only_socket()
                 .pending_rx
                 .expect("oversized-to-budget datagram must be staged on the caller side");
             assert_eq!(staged.1, payload.len());
             let c = owner.caller.as_ref().unwrap();
             assert_eq!(
-                c.stage_buf[..staged.1],
+                c.only_socket().stage_buf[..staged.1],
                 payload[..],
                 "staged bytes must be the exact datagram payload"
             );
-            assert_eq!(c.rx_buf.len(), DEFAULT_RX_SLOT_SIZE);
-            assert_eq!(c.stage_buf.len(), DEFAULT_RX_SLOT_SIZE);
+            assert_eq!(c.only_socket().rx_buf.len(), DEFAULT_RX_SLOT_SIZE);
+            assert_eq!(c.only_socket().stage_buf.len(), DEFAULT_RX_SLOT_SIZE);
 
             let report = owner
                 .service(Timestamp::from_micros(300), OwnerServiceBudget::default())
@@ -6556,9 +6807,9 @@ mod tests {
             assert_eq!(report.rx_packets, 1);
             assert_eq!(report.rx_bytes, payload.len());
             let c = owner.caller.as_ref().unwrap();
-            assert!(c.pending_rx.is_none());
-            assert_eq!(c.rx_buf.len(), DEFAULT_RX_SLOT_SIZE);
-            assert_eq!(c.stage_buf.len(), DEFAULT_RX_SLOT_SIZE);
+            assert!(c.only_socket().pending_rx.is_none());
+            assert_eq!(c.only_socket().rx_buf.len(), DEFAULT_RX_SLOT_SIZE);
+            assert_eq!(c.only_socket().stage_buf.len(), DEFAULT_RX_SLOT_SIZE);
         });
     }
 
@@ -6576,7 +6827,7 @@ mod tests {
             {
                 let caller = owner.caller.as_ref().unwrap();
                 let mut sink = OwnerTxSink {
-                    sock: &caller.sock,
+                    socks: caller.tx_sockets(),
                     tx_pool: &mut owner.tx_pool,
                     tx_engine: &mut owner.tx_engine,
                     operational: true,
@@ -6721,7 +6972,7 @@ mod tests {
             {
                 let caller = owner.caller.as_ref().unwrap();
                 let mut sink = OwnerTxSink {
-                    sock: &caller.sock,
+                    socks: caller.tx_sockets(),
                     tx_pool: &mut owner.tx_pool,
                     tx_engine: &mut owner.tx_engine,
                     operational: true,
@@ -6738,7 +6989,7 @@ mod tests {
             {
                 let caller = owner.caller.as_ref().unwrap();
                 let mut sink = OwnerTxSink {
-                    sock: &caller.sock,
+                    socks: caller.tx_sockets(),
                     tx_pool: &mut owner.tx_pool,
                     tx_engine: &mut owner.tx_engine,
                     operational: true,
@@ -6829,7 +7080,7 @@ mod tests {
             {
                 let caller = owner.caller.as_ref().unwrap();
                 let mut sink = OwnerTxSink {
-                    sock: &caller.sock,
+                    socks: caller.tx_sockets(),
                     tx_pool: &mut owner.tx_pool,
                     tx_engine: &mut owner.tx_engine,
                     operational: true,
@@ -6856,7 +7107,7 @@ mod tests {
             {
                 let caller = owner.caller.as_ref().unwrap();
                 let mut sink = OwnerTxSink {
-                    sock: &caller.sock,
+                    socks: caller.tx_sockets(),
                     tx_pool: &mut owner.tx_pool,
                     tx_engine: &mut owner.tx_engine,
                     operational: true,
@@ -6884,7 +7135,7 @@ mod tests {
             {
                 let caller = owner.caller.as_ref().unwrap();
                 let mut sink = OwnerTxSink {
-                    sock: &caller.sock,
+                    socks: caller.tx_sockets(),
                     tx_pool: &mut owner.tx_pool,
                     tx_engine: &mut owner.tx_engine,
                     operational: true,
@@ -6914,7 +7165,7 @@ mod tests {
             {
                 let caller = owner.caller.as_ref().unwrap();
                 let mut sink = OwnerTxSink {
-                    sock: &caller.sock,
+                    socks: caller.tx_sockets(),
                     tx_pool: &mut owner.tx_pool,
                     tx_engine: &mut owner.tx_engine,
                     operational: true,
@@ -7120,7 +7371,7 @@ mod tests {
             {
                 let caller = owner.caller.as_ref().expect("caller side");
                 let mut sink = OwnerTxSink {
-                    sock: &caller.sock,
+                    socks: caller.tx_sockets(),
                     tx_pool: &mut owner.tx_pool,
                     tx_engine: &mut owner.tx_engine,
                     operational: true,
@@ -7207,7 +7458,7 @@ mod tests {
             {
                 let caller = owner.caller.as_ref().expect("caller side");
                 let mut sink = OwnerTxSink {
-                    sock: &caller.sock,
+                    socks: caller.tx_sockets(),
                     tx_pool: &mut owner.tx_pool,
                     tx_engine: &mut owner.tx_engine,
                     operational: true,
@@ -7661,7 +7912,12 @@ mod tests {
                 let ring = Rc::new(RefCell::new(ManagedRxRing::new()));
                 ring.borrow_mut()
                     .fault(RxFault::StreamError("simulated stream end".to_string()));
-                owner.caller.as_mut().expect("caller side").rx = SideRx {
+                owner
+                    .caller
+                    .as_mut()
+                    .expect("caller side")
+                    .only_socket_mut()
+                    .rx = SideRx {
                     mode: OwnerRxMode::ManagedMultishot,
                     ring: Some(ring),
                     staged: None,
@@ -8163,7 +8419,7 @@ mod tests {
             let operational = owner.is_operational();
             let caller = owner.caller.as_ref().unwrap();
             let mut sink = OwnerTxSink {
-                sock: &caller.sock,
+                socks: caller.tx_sockets(),
                 tx_pool: &mut owner.tx_pool,
                 tx_engine: &mut owner.tx_engine,
                 operational,
@@ -8335,7 +8591,7 @@ mod tests {
             for _ in 0..3 {
                 let caller = owner.caller.as_ref().unwrap();
                 let mut sink = OwnerTxSink {
-                    sock: &caller.sock,
+                    socks: caller.tx_sockets(),
                     tx_pool: &mut owner.tx_pool,
                     tx_engine: &mut owner.tx_engine,
                     operational: true,
@@ -8360,7 +8616,7 @@ mod tests {
             // Terminal: no new admission after shutdown.
             let caller = owner.caller.as_ref().unwrap();
             let mut sink = OwnerTxSink {
-                sock: &caller.sock,
+                socks: caller.tx_sockets(),
                 tx_pool: &mut owner.tx_pool,
                 tx_engine: &mut owner.tx_engine,
                 operational: true,
@@ -8986,7 +9242,7 @@ mod tests {
     fn owner_sink(owner: &mut Owner) -> OwnerTxSink<'_> {
         let caller = owner.caller.as_ref().expect("caller side");
         OwnerTxSink {
-            sock: &caller.sock,
+            socks: caller.tx_sockets(),
             tx_pool: &mut owner.tx_pool,
             tx_engine: &mut owner.tx_engine,
             operational: true,
@@ -9199,7 +9455,7 @@ mod tests {
             {
                 let caller = owner.caller.as_ref().expect("caller side");
                 let mut sink = OwnerTxSink {
-                    sock: &caller.sock,
+                    socks: caller.tx_sockets(),
                     tx_pool: &mut owner.tx_pool,
                     tx_engine: &mut owner.tx_engine,
                     operational: true,
@@ -9267,7 +9523,7 @@ mod tests {
             {
                 let caller = owner.caller.as_ref().expect("caller side");
                 let mut sink = OwnerTxSink {
-                    sock: &caller.sock,
+                    socks: caller.tx_sockets(),
                     tx_pool: &mut owner.tx_pool,
                     tx_engine: &mut owner.tx_engine,
                     operational: true,
@@ -9415,7 +9671,12 @@ mod tests {
                 let ring = Rc::new(RefCell::new(ManagedRxRing::new()));
                 ring.borrow_mut()
                     .fault(RxFault::StreamError("simulated consumer death".to_string()));
-                owner.caller.as_mut().expect("caller side").rx = SideRx {
+                owner
+                    .caller
+                    .as_mut()
+                    .expect("caller side")
+                    .only_socket_mut()
+                    .rx = SideRx {
                     mode: OwnerRxMode::ManagedMultishot,
                     ring: Some(ring),
                     staged: None,
@@ -9654,7 +9915,12 @@ mod tests {
             let ring = Rc::new(RefCell::new(ManagedRxRing::new()));
             ring.borrow_mut().note_truncated();
             ring.borrow_mut().note_buffer_exhausted();
-            owner.caller.as_mut().expect("caller side").rx = SideRx {
+            owner
+                .caller
+                .as_mut()
+                .expect("caller side")
+                .only_socket_mut()
+                .rx = SideRx {
                 mode: OwnerRxMode::ManagedMultishot,
                 ring: Some(ring),
                 staged: None,
@@ -9989,7 +10255,12 @@ mod tests {
             let ring = Rc::new(RefCell::new(ManagedRxRing::new()));
             ring.borrow_mut()
                 .fault(RxFault::StreamError("simulated consumer death".to_string()));
-            owner.caller.as_mut().expect("caller side").rx = SideRx {
+            owner
+                .caller
+                .as_mut()
+                .expect("caller side")
+                .only_socket_mut()
+                .rx = SideRx {
                 mode: OwnerRxMode::ManagedMultishot,
                 ring: Some(ring),
                 staged: None,
@@ -10165,7 +10436,13 @@ mod tests {
             let c_sock = compio::net::UdpSocket::from_std(c_std).expect("adopt");
             let mut owner = Owner::new(2).with_caller(OwnerCallerSide::new_single(c_sock));
             assert!(
-                owner.caller.as_ref().expect("caller side").rx.quiescent(),
+                owner
+                    .caller
+                    .as_ref()
+                    .expect("caller side")
+                    .only_socket()
+                    .rx
+                    .quiescent(),
                 "a raw caller side owns no managed consumer"
             );
 
@@ -10176,7 +10453,12 @@ mod tests {
                 compio::time::sleep(std::time::Duration::from_secs(30)).await;
             });
             ring.borrow_mut().task = Some(held);
-            owner.caller.as_mut().expect("caller side").rx = SideRx {
+            owner
+                .caller
+                .as_mut()
+                .expect("caller side")
+                .only_socket_mut()
+                .rx = SideRx {
                 mode: OwnerRxMode::ManagedMultishot,
                 ring: Some(ring),
                 staged: None,
@@ -10206,7 +10488,7 @@ mod tests {
             let stats = owner.rx_stats().caller.expect("caller rx stats");
             assert_eq!(stats.depth, 0, "no completion may outlive shutdown");
             assert!(!stats.staged, "no staged lease may outlive shutdown");
-            let caller_rx = &owner.caller.as_ref().expect("caller side").rx;
+            let caller_rx = &owner.caller.as_ref().expect("caller side").only_socket().rx;
             assert!(
                 caller_rx
                     .ring

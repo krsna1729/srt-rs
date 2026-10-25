@@ -555,8 +555,8 @@ fn bonded_and_direct_callers_share_one_socket_at_fixed_runtime_cost() {
         let (refs, addr) = {
             let side = owner.caller().expect("side");
             (
-                Rc::strong_count(&side.sock),
-                side.sock.local_addr().expect("addr"),
+                Rc::strong_count(&side.only_socket().sock),
+                side.only_socket().sock.local_addr().expect("addr"),
             )
         };
 
@@ -570,7 +570,7 @@ fn bonded_and_direct_callers_share_one_socket_at_fixed_runtime_cost() {
                 .expect("64-leg group"),
         );
         assert_eq!(
-            Rc::strong_count(&owner.caller().expect("side").sock),
+            Rc::strong_count(&owner.caller().expect("side").only_socket().sock),
             refs,
             "attaching 64 legs took no socket handle"
         );
@@ -580,14 +580,14 @@ fn bonded_and_direct_callers_share_one_socket_at_fixed_runtime_cost() {
 
         let side = owner.caller().expect("side");
         assert_eq!(
-            side.sock.local_addr().expect("addr"),
+            side.only_socket().sock.local_addr().expect("addr"),
             addr,
             "still the one socket"
         );
         // While datagrams are in flight each send holds a handle, so the
         // count is bounded by the fixed TX pool, never by the leg count.
         assert!(
-            Rc::strong_count(&side.sock) <= refs + owner.tx_pool().capacity(),
+            Rc::strong_count(&side.only_socket().sock) <= refs + owner.tx_pool().capacity(),
             "socket handles are bounded by TX capacity, not by legs"
         );
         assert_eq!(
@@ -968,6 +968,7 @@ fn failed_first_admission_under_managed_rx_starts_no_consumer() {
         let ring = owner
             .caller()
             .expect("side")
+            .only_socket()
             .rx
             .ring
             .as_ref()
@@ -1012,6 +1013,7 @@ fn caller_side_construction_starts_no_managed_task() {
         )
         .expect("candidate side");
         let ring = side
+            .only_socket()
             .rx
             .ring
             .as_ref()
@@ -1022,7 +1024,7 @@ fn caller_side_construction_starts_no_managed_task() {
             "construction spawns no consumer"
         );
         assert!(
-            side.rx.quiescent(),
+            side.only_socket().rx.quiescent(),
             "a never-started candidate holds nothing"
         );
 
@@ -1030,8 +1032,13 @@ fn caller_side_construction_starts_no_managed_task() {
         assert!(ring.borrow().task.is_some(), "the commit step starts it");
         // Starting twice is a no-op, and the awaited stop is what releases it.
         side.start_managed_rx(managed_rx_buffer_len(1500));
-        assert!(side.rx.stop_and_join(Duration::from_secs(5)).await);
-        assert!(side.rx.quiescent());
+        assert!(
+            side.only_socket_mut()
+                .rx
+                .stop_and_join(Duration::from_secs(5))
+                .await
+        );
+        assert!(side.only_socket().rx.quiescent());
     });
 }
 
@@ -1055,5 +1062,109 @@ fn first_direct_connect_commits_side_mode_and_session_together() {
         assert!(owner.sessions_started);
         assert!(owner.logical_caller(&id).is_some());
         assert_eq!(owner.caller_pool_stats().expect("pool").started, 1);
+    });
+}
+
+/// An Owner whose listener accepts publishers on `bind` (IPv4 or IPv6).
+fn listener_owner(bind: &str) -> (Owner, SocketAddr) {
+    let std_sock = std::net::UdpSocket::bind(bind).expect("bind listener");
+    let addr = std_sock.local_addr().expect("listener addr");
+    let sock = compio::net::UdpSocket::from_std(std_sock).expect("adopt listener");
+    let config = crate::ListenerConfig::builder(addr)
+        .build()
+        .expect("listener config");
+    let side = ListenerSide::new(sock, &config).expect("listener side");
+    (Owner::new(16).with_listener(side), addr)
+}
+
+fn connected(owner: &Owner, id: &crate::LogicalCallerId) -> bool {
+    owner.logical_caller(id).and_then(|c| c.state()) == Some(LogicalCallerState::Connected)
+}
+
+/// One Owner calls an IPv4 and an IPv6 listener: the first call of each
+/// family binds that family's socket, both sessions share the side's one
+/// caller table, id space and pool, and both reach `Connected`. (Before,
+/// the second family was refused: an Owner had one caller socket.)
+///
+/// The pool admits one handshake at a time (the default), so the IPv6 call
+/// queues behind the IPv4 one: its socket is committed with the queued
+/// request and the call dials from it once the pool admits it.
+#[test]
+fn one_owner_calls_ipv4_and_ipv6_listeners() {
+    let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+    runtime.block_on(async {
+        let (mut v4_listener, v4) = listener_owner("127.0.0.1:0");
+        let (mut v6_listener, v6) = listener_owner("[::1]:0");
+        let mut owner = Owner::new(16);
+        set_pool(&mut owner, 1);
+        let a = admitted(
+            owner
+                .connect(&shared_leg(v4), Timestamp::from_micros(0))
+                .expect("IPv4 call"),
+        );
+        let queued = match owner
+            .connect(&shared_leg(v6), Timestamp::from_micros(0))
+            .expect("an IPv6 call binds the IPv6 socket")
+        {
+            PoolOutcome::Queued(request) => request,
+            other => panic!("one permit: the second call queues, got {other:?}"),
+        };
+        assert_eq!(
+            owner.caller().expect("side").sockets().count(),
+            2,
+            "the queued call's socket is committed with it"
+        );
+
+        let budget = OwnerServiceBudget::default();
+        let mut b = None;
+        for round in 0..400u64 {
+            let now = Timestamp::from_micros(round * 5_000);
+            let _ = owner.service(now, budget).await;
+            let _ = v4_listener.service(now, budget).await;
+            let _ = v6_listener.service(now, budget).await;
+            for event in pool_events(&mut owner) {
+                if let PoolEvent::Admitted {
+                    request_id,
+                    caller_id,
+                } = event
+                    && request_id == queued
+                {
+                    b = Some(caller_id);
+                }
+            }
+            if connected(&owner, &a) && b.is_some_and(|b| connected(&owner, &b)) {
+                break;
+            }
+            owner.wait_for_activity(Duration::from_millis(1)).await;
+        }
+        let b = b.expect("the queued IPv6 call is admitted once the IPv4 one connects");
+        assert_ne!(a, b, "one id space across both sockets");
+        assert!(connected(&owner, &a), "the IPv4 call connects");
+        assert!(
+            connected(&owner, &b),
+            "the IPv6 call connects from its own socket"
+        );
+        assert!(owner.shutdown_and_drain(Duration::from_secs(5)).await);
+    });
+}
+
+/// A caller bound to one family's address cannot reach the other's: refused
+/// at admission with nothing attached, instead of failing on the first send.
+#[test]
+fn a_local_bind_of_the_other_family_is_refused() {
+    let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+    runtime.block_on(async {
+        let mut owner = Owner::new(8);
+        let v6_remote: SocketAddr = "[2001:db8::1]:9000".parse().expect("v6");
+        let config = CallerConfig::builder(v6_remote)
+            .ownership(crate::SocketOwnership::Shared)
+            .local_bind("127.0.0.1:0".parse().expect("v4 bind"))
+            .build()
+            .expect("caller config");
+        let error = owner
+            .connect(&config, Timestamp::from_micros(0))
+            .expect_err("an IPv4 bind cannot reach an IPv6 listener");
+        assert!(error.to_string().contains("cannot reach"), "{error}");
+        assert!(owner.caller().is_none(), "no caller side was attached");
     });
 }

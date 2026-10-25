@@ -24,8 +24,9 @@ interchangeable:
   interop test, a reference implementation, or an application with genuinely
   a handful of sessions.
 * `compio::Owner` — **the interface an embedding application (Restream and
-  friends) should build against.** One shared listener UDP socket plus one
-  shared caller UDP socket per owner; O(1) runtime engines per owner (a fixed
+  friends) should build against.** One shared listener UDP socket plus a
+  shared caller UDP socket per address family per owner (one caller table and
+  pool across both); O(1) runtime engines per owner (a fixed
   TX lane pool, one managed RX task per socket); bounded per-visit budgets; a
   finite direct-final-buffer TX pool; and **no task or thread per SRT
   destination**. A shard is one `Owner` driven by `Owner::service` and
