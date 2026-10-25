@@ -1085,6 +1085,10 @@ fn connected(owner: &Owner, id: &crate::LogicalCallerId) -> bool {
 /// family binds that family's socket, both sessions share the side's one
 /// caller table, id space and pool, and both reach `Connected`. (Before,
 /// the second family was refused: an Owner had one caller socket.)
+///
+/// The pool admits one handshake at a time (the default), so the IPv6 call
+/// queues behind the IPv4 one: its socket is committed with the queued
+/// request and the call dials from it once the pool admits it.
 #[test]
 fn one_owner_calls_ipv4_and_ipv6_listeners() {
     let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
@@ -1092,34 +1096,54 @@ fn one_owner_calls_ipv4_and_ipv6_listeners() {
         let (mut v4_listener, v4) = listener_owner("127.0.0.1:0");
         let (mut v6_listener, v6) = listener_owner("[::1]:0");
         let mut owner = Owner::new(16);
+        set_pool(&mut owner, 1);
         let a = admitted(
             owner
                 .connect(&shared_leg(v4), Timestamp::from_micros(0))
                 .expect("IPv4 call"),
         );
-        let b = admitted(
-            owner
-                .connect(&shared_leg(v6), Timestamp::from_micros(0))
-                .expect("an IPv6 call binds the IPv6 socket"),
+        let queued = match owner
+            .connect(&shared_leg(v6), Timestamp::from_micros(0))
+            .expect("an IPv6 call binds the IPv6 socket")
+        {
+            PoolOutcome::Queued(request) => request,
+            other => panic!("one permit: the second call queues, got {other:?}"),
+        };
+        assert_eq!(
+            owner.caller().expect("side").sockets().count(),
+            2,
+            "the queued call's socket is committed with it"
         );
-        assert_ne!(a, b, "one id space across both sockets");
-        assert_eq!(owner.caller().expect("side").sockets().count(), 2);
-        assert_eq!(owner.caller_pool_stats().expect("stats").in_flight, 2);
 
         let budget = OwnerServiceBudget::default();
-        let mut done = false;
+        let mut b = None;
         for round in 0..400u64 {
             let now = Timestamp::from_micros(round * 5_000);
             let _ = owner.service(now, budget).await;
             let _ = v4_listener.service(now, budget).await;
             let _ = v6_listener.service(now, budget).await;
-            if connected(&owner, &a) && connected(&owner, &b) {
-                done = true;
+            for event in pool_events(&mut owner) {
+                if let PoolEvent::Admitted {
+                    request_id,
+                    caller_id,
+                } = event
+                    && request_id == queued
+                {
+                    b = Some(caller_id);
+                }
+            }
+            if connected(&owner, &a) && b.is_some_and(|b| connected(&owner, &b)) {
                 break;
             }
             owner.wait_for_activity(Duration::from_millis(1)).await;
         }
-        assert!(done, "both calls connect through their own family's socket");
+        let b = b.expect("the queued IPv6 call is admitted once the IPv4 one connects");
+        assert_ne!(a, b, "one id space across both sockets");
+        assert!(connected(&owner, &a), "the IPv4 call connects");
+        assert!(
+            connected(&owner, &b),
+            "the IPv6 call connects from its own socket"
+        );
         assert!(owner.shutdown_and_drain(Duration::from_secs(5)).await);
     });
 }
