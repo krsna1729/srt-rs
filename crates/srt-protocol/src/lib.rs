@@ -69,8 +69,9 @@ pub mod wire {
 /// Supported bonded-group protocol component APIs.
 pub mod group {
     pub use super::srt_group::{
-        GroupDataPoll, GroupEvent, GroupMemberState, GroupMode, GroupPacket, MAX_GROUP_MEMBERS,
-        PeerGroupCollision, SrtGroup, SrtGroupMember,
+        BACKUP_MIN_STABILITY_TIMEOUT_MICROS, GroupDataPoll, GroupEvent, GroupMemberState,
+        GroupMode, GroupPacket, MAX_BACKUP_HISTORY, MAX_GROUP_MEMBERS, PeerGroupCollision,
+        SrtGroup, SrtGroupMember,
     };
 }
 

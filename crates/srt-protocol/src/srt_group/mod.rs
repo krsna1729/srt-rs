@@ -2,7 +2,9 @@ mod retirement;
 mod send;
 pub use retirement::GroupRetirement;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+use bytes::Bytes;
 
 use crate::error::Error;
 use crate::srt_connection::{ConnectionEvent, ConnectionState, SrtConnection};
@@ -218,7 +220,25 @@ pub struct SrtGroup {
     owned: BTreeSet<u32>,
     /// Packets the `owned` payloads span.
     owned_packets: u32,
+    /// Backup mode: what the carrier sent and its peer has not acknowledged,
+    /// oldest first, so a standby that takes over replays it before new
+    /// payload. Bounded by [`MAX_BACKUP_HISTORY`].
+    backup_history: VecDeque<(u32, Bytes)>,
+    /// The member that carried the last Backup send.
+    backup_carrier: Option<u32>,
+    /// The carrier has unacknowledged packets older than the history holds
+    /// (the bound evicted them): a takeover would leave a hole, so it is
+    /// refused.
+    backup_history_gap: bool,
 }
+
+/// Floor of a Backup carrier's stability timeout (libsrt's `SRT_TMIN`).
+pub const BACKUP_MIN_STABILITY_TIMEOUT_MICROS: u64 = 60_000;
+
+/// Most unacknowledged Backup sends kept for a takeover replay: half the
+/// output queue, so a replay plus its live traffic never overflows the new
+/// leg's queue (an overflow disconnects it).
+pub const MAX_BACKUP_HISTORY: usize = crate::srt_connection::MAX_OUTPUT_QUEUE_ACTIONS / 2;
 
 impl SrtGroup {
     /// Create an empty group. `group_id` must carry [`SRTGROUP_MASK`], as it
@@ -240,7 +260,23 @@ impl SrtGroup {
             collisions: std::collections::VecDeque::new(),
             owned: BTreeSet::new(),
             owned_packets: 0,
+            backup_history: VecDeque::new(),
+            backup_carrier: None,
+            backup_history_gap: false,
         })
+    }
+
+    /// How long a Backup member may hold unacknowledged data without hearing
+    /// from its peer before a connected standby takes over:
+    /// `max(60 ms, 2·SRTT + 4·RTTVar)` from its own RTT estimate, as libsrt.
+    pub fn backup_stability_timeout_micros(&self, member_id: u32) -> Option<u64> {
+        let (srtt, rttvar) = self
+            .member(member_id)?
+            .connection
+            .sender_buffer()?
+            .rtt_estimate_micros();
+        let dynamic = 2 * u64::from(srtt) + 4 * u64::from(rttvar);
+        Some(dynamic.max(BACKUP_MIN_STABILITY_TIMEOUT_MICROS))
     }
 
     /// The remote receiving-group ID this group is bound to, once a member
