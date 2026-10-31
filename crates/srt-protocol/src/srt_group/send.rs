@@ -210,11 +210,19 @@ impl SrtGroup {
     }
 
     /// Prepare the member at `index` to carry the next Backup send: the
-    /// previous carrier's unacknowledged flight is replayed onto it, at the
-    /// same sequences, when it takes over; otherwise it is aligned to the
-    /// group sequence.
+    /// previous carrier's still unacknowledged flight is replayed onto it,
+    /// at the same sequences, when it takes over; otherwise it is aligned to
+    /// the group sequence.
     fn take_over_backup_flight(&mut self, index: usize, now: Timestamp) -> Result<(), Error> {
         let member_id = self.members[index].id;
+        let carrier = self
+            .backup_carrier
+            .filter(|&carrier| carrier != member_id)
+            .and_then(|carrier| self.members.iter().position(|member| member.id == carrier));
+        if let Some(carrier) = carrier {
+            // ACKs that arrived since the carrier's last send.
+            self.trim_backup_history(carrier);
+        }
         let takes_over = self
             .backup_carrier
             .is_some_and(|carrier| carrier != member_id);
@@ -250,15 +258,20 @@ impl SrtGroup {
         Ok(())
     }
 
-    /// Keep a sent payload until its carrier's peer acknowledges it, and
-    /// note whether the history still covers the whole unacknowledged
-    /// flight.
+    /// Keep a sent payload until its carrier's peer acknowledges it.
     fn record_backup_send(&mut self, index: usize, sequence: u32, payload: Bytes) {
         self.backup_carrier = Some(self.members[index].id);
         if self.backup_history.len() >= MAX_BACKUP_HISTORY {
             self.backup_history.pop_front();
         }
         self.backup_history.push_back((sequence, payload));
+        self.trim_backup_history(index);
+    }
+
+    /// Drop what the carrier at `index` has had acknowledged, and note
+    /// whether the history still reaches back to its oldest unacknowledged
+    /// sequence (the bound may have evicted older ones).
+    fn trim_backup_history(&mut self, index: usize) {
         let Some(oldest) = self.members[index]
             .connection
             .sender_buffer()
