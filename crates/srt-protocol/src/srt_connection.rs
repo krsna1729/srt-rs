@@ -2532,6 +2532,16 @@ impl SrtConnection {
         self.sender.as_ref().map(SenderBuffer::next_sequence_number)
     }
 
+    /// The sender half, for a bonded group's Backup bookkeeping.
+    pub(crate) fn sender_buffer(&self) -> Option<&SenderBuffer> {
+        self.sender.as_ref()
+    }
+
+    /// When this connection last received any packet from its peer.
+    pub(crate) fn last_recv_time(&self) -> Option<Timestamp> {
+        self.last_recv_time
+    }
+
     /// Advance the next expected receive sequence number, discarding any
     /// buffered or in-flight-loss packets it leaves behind.
     ///

@@ -499,8 +499,11 @@ fn backup_promotion_preserves_group_sequence() {
     assert_eq!(group.member(2).unwrap().state(), GroupMemberState::Active);
 }
 
+/// A standby whose window cannot hold the stalled flight plus the next
+/// payload cannot take over without leaving a hole: the send is refused and
+/// the standby emits no DATA.
 #[test]
-fn backup_backpressure_promotes_a_standby_leg() {
+fn backup_failover_refuses_when_the_standby_cannot_hold_the_flight() {
     let options = ConnectionOptions {
         flow_window_packets: 3,
         ..Default::default()
@@ -517,9 +520,136 @@ fn backup_backpressure_promotes_a_standby_leg() {
     }
 
     assert!(!group.can_send());
-    assert_eq!(group.send(b"fail over", ts(101_000)).unwrap(), 1);
+    let error = group.send(b"fail over", ts(101_000)).unwrap_err();
+    assert!(error.to_string().contains("cannot replay"), "{error}");
     assert_eq!(group.member(1).unwrap().state(), GroupMemberState::Unstable);
+    assert!(data_sequences(group.member_mut(2).unwrap().connection_mut()).is_empty());
+}
+
+/// The standby that takes over replays what the old active sent and never
+/// had acknowledged, at the same sequences, before the new payload: the
+/// receiving group delivers every payload once, in order, with no hole.
+#[test]
+fn backup_failover_replays_the_unacknowledged_prefix() {
+    let (caller_a, listener_a) = establish_pair();
+    let (caller_b, listener_b) = establish_pair();
+    let mut sender = SrtGroup::new(0x4000_0020, GroupMode::Backup).unwrap();
+    sender.add_member(1, 100, caller_a).unwrap();
+    sender.add_member(2, 1, caller_b).unwrap();
+    let mut receiver = SrtGroup::new(0x4000_0021, GroupMode::Backup).unwrap();
+    receiver.add_member(1, 100, listener_a).unwrap();
+    receiver.add_member(2, 1, listener_b).unwrap();
+
+    sender.send(b"p0", ts(100_000)).unwrap();
+    for packet in packets_from(sender.member_mut(1).unwrap().connection_mut()) {
+        feed_member(&mut receiver, 1, &packet, ts(100_000));
+    }
+    assert!(
+        receiver
+            .poll_data(ts(100_000))
+            .unwrap()
+            .payload
+            .eq(&b"p0"[..])
+    );
+    sender.send(b"p1", ts(101_000)).unwrap();
+    sender.send(b"p2", ts(102_000)).unwrap();
+    let _lost = packets_from(sender.member_mut(1).unwrap().connection_mut());
+
+    assert!(sender.mark_member_broken(1));
+    sender.send(b"p3", ts(110_000)).unwrap();
+    let takeover = packets_from(sender.member_mut(2).unwrap().connection_mut());
+    let sequences: Vec<u32> = takeover
+        .iter()
+        .filter_map(|packet| match SrtPacket::decode(packet) {
+            Ok(SrtPacket::Data(data)) => Some(data.sequence_number),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(sequences, vec![0, 1, 2, 3], "nothing was acknowledged");
+
+    for packet in &takeover {
+        feed_member(&mut receiver, 2, packet, ts(111_000));
+    }
+    for expected in [&b"p1"[..], b"p2", b"p3"] {
+        let delivered = receiver.poll_data(ts(111_000)).unwrap();
+        assert!(delivered.payload.eq(expected), "expected {expected:?}");
+    }
+    assert!(receiver.poll_data(ts(111_000)).is_none());
+}
+
+/// An active flight longer than the replay history's bound has lost its
+/// oldest entries: a takeover could not replay them, so it is refused.
+#[test]
+fn backup_failover_refuses_when_the_history_bound_dropped_part_of_the_flight() {
+    let (caller_a, _listener_a) = establish_pair();
+    let (caller_b, _listener_b) = establish_pair();
+    let mut group = SrtGroup::new(0x4000_0023, GroupMode::Backup).unwrap();
+    group.add_member(1, 100, caller_a).unwrap();
+    group.add_member(2, 1, caller_b).unwrap();
+
+    for _ in 0..=srt_proto::group::MAX_BACKUP_HISTORY {
+        group.send(b"unacknowledged", ts(100_000)).unwrap();
+        let _lost = packets_from(group.member_mut(1).unwrap().connection_mut());
+    }
+    assert!(group.mark_member_broken(1));
+    let error = group.send(b"after", ts(100_000)).unwrap_err();
+    assert!(error.to_string().contains("cannot replay"), "{error}");
+    assert!(data_sequences(group.member_mut(2).unwrap().connection_mut()).is_empty());
+}
+
+/// A Backup active that holds unacknowledged data and hears nothing from its
+/// peer for longer than its stability timeout hands over to the standby,
+/// though its connection is still up and its window is not full.
+#[test]
+fn backup_active_without_response_fails_over_after_stability_timeout() {
+    let (caller_a, _listener_a) = establish_pair();
+    let (caller_b, _listener_b) = establish_pair();
+    let mut group = SrtGroup::new(0x4000_0022, GroupMode::Backup).unwrap();
+    group.add_member(1, 100, caller_a).unwrap();
+    group.add_member(2, 1, caller_b).unwrap();
+
+    let start = 100_000;
+    group.send(b"p0", ts(start)).unwrap();
+    let _lost = packets_from(group.member_mut(1).unwrap().connection_mut());
+    let timeout = group.backup_stability_timeout_micros(1).unwrap();
+    assert!(timeout >= srt_proto::group::BACKUP_MIN_STABILITY_TIMEOUT_MICROS);
+
+    group.send(b"p1", ts(start + timeout)).unwrap();
+    let _lost = packets_from(group.member_mut(1).unwrap().connection_mut());
+    assert_eq!(group.member(1).unwrap().state(), GroupMemberState::Active);
+    assert!(data_sequences(group.member_mut(2).unwrap().connection_mut()).is_empty());
+
+    group.send(b"p2", ts(start + timeout + 1)).unwrap();
+    assert_eq!(group.member(1).unwrap().state(), GroupMemberState::Unstable);
+    assert_eq!(
+        group.member(1).unwrap().connection().state(),
+        ConnectionState::Connected
+    );
     assert_eq!(group.member(2).unwrap().state(), GroupMemberState::Active);
+    assert_eq!(
+        data_sequences(group.member_mut(2).unwrap().connection_mut()),
+        vec![0, 1, 2]
+    );
+}
+
+fn feed_member(group: &mut SrtGroup, member_id: u32, packet: &[u8], now: Timestamp) {
+    group
+        .member_mut(member_id)
+        .unwrap()
+        .connection_mut()
+        .feed_recv_buf(packet, now)
+        .unwrap();
+}
+
+/// The DATA sequences `connection` emits, in order.
+fn data_sequences(connection: &mut SrtConnection) -> Vec<u32> {
+    packets_from(connection)
+        .iter()
+        .filter_map(|packet| match SrtPacket::decode(packet) {
+            Ok(SrtPacket::Data(data)) => Some(data.sequence_number),
+            _ => None,
+        })
+        .collect()
 }
 
 #[test]
