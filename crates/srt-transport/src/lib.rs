@@ -195,7 +195,8 @@ pub mod advanced {
             WaitOutcome, deadline_from_wait, plan_wait,
         };
         pub use super::super::socket_io::{
-            recvmsg_batch, recvmsg_batch_into, sendmsg_batch, sendmsg_connected_batch,
+            RecvMeta, enable_receive_timestamps, enable_udp_gro, recvmsg_batch, recvmsg_batch_into,
+            sendmsg_batch, sendmsg_connected_batch,
         };
     }
 

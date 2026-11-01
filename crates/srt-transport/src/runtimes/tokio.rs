@@ -73,7 +73,7 @@ impl Conn {
             sock,
             output_drain,
             recv_budget,
-            RecvBatch::DEFAULT_CAPACITY,
+            BytesRecvBatch::with_capacity(RecvBatch::DEFAULT_CAPACITY, RecvBatch::DEFAULT_BUF_LEN),
         )
     }
 
@@ -82,14 +82,14 @@ impl Conn {
         sock: UdpSocket,
         output_drain: OutputDrainBudget,
         recv_budget: RecvBudget,
-        batch_capacity: usize,
+        recv_batch: BytesRecvBatch,
     ) -> Self {
         Self {
             conn,
             sock,
             timers: crate::ManualTimerStore::new(),
             pending_outputs: VecDeque::new(),
-            recv_batch: BytesRecvBatch::with_capacity(batch_capacity, RecvBatch::DEFAULT_BUF_LEN),
+            recv_batch,
             io_stats: BatchIoStats::default(),
             output_drain,
             recv_budget,
@@ -208,9 +208,15 @@ impl Conn {
         now: Timestamp,
         budget: RecvBudget,
     ) -> io::Result<RecvDrainReport> {
-        let report = drain_readable_bytes(&self.sock, &mut self.recv_batch, budget, |_, data| {
-            let _ = self.conn.feed_recv_bytes(data, now);
-        })?;
+        let report = drain_readable_bytes(
+            &self.sock,
+            &mut self.recv_batch,
+            budget,
+            now,
+            |_, data, at| {
+                let _ = self.conn.feed_recv_bytes(data, at);
+            },
+        )?;
         self.io_stats.record_recv(report);
         Ok(report)
     }
@@ -226,8 +232,9 @@ impl Conn {
             self.sock.as_raw_fd(),
             &mut self.recv_batch,
             budget,
-            |_, data| {
-                let _ = self.conn.feed_recv_bytes(data, now);
+            now,
+            |_, data, at| {
+                let _ = self.conn.feed_recv_bytes(data, at);
             },
         )?;
         self.io_stats.record_recv(report);
@@ -284,15 +291,30 @@ impl Conn {
 
 /// Receive datagrams via `recvmmsg`, routed through Tokio's `try_io` so
 /// readiness is cleared when the socket has nothing left. Bounded so a
-/// busy socket cannot starve timers and sibling tasks.
+/// busy socket cannot starve timers and sibling tasks. Each datagram comes
+/// with its arrival time, as in [`crate::drain_recv_fd`].
 pub fn drain_readable(
     sock: &UdpSocket,
     batch: &mut RecvBatch,
     budget: RecvBudget,
-    on_datagram: impl FnMut(Option<SocketAddr>, &[u8]),
+    now: Timestamp,
+    on_datagram: impl FnMut(Option<SocketAddr>, &[u8], Timestamp),
 ) -> io::Result<RecvDrainReport> {
     let batch_capacity = batch.capacity();
-    drain_readable_with_capacity(sock, batch, budget, batch_capacity, on_datagram)
+    drain_readable_with_capacity(sock, batch, budget, batch_capacity, now, on_datagram)
+}
+
+/// One receive step through `try_io`: `Ok(0)` is `WouldBlock`, and Tokio
+/// clears the readable flag when the kernel reports it.
+fn try_recv(sock: &UdpSocket, recv: impl FnOnce() -> io::Result<usize>) -> io::Result<usize> {
+    let result = sock.try_io(tokio::io::Interest::READABLE, || match recv()? {
+        0 => Err(io::ErrorKind::WouldBlock.into()),
+        n => Ok(n),
+    });
+    match result {
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(0),
+        result => result,
+    }
 }
 
 fn drain_readable_with_capacity(
@@ -300,46 +322,12 @@ fn drain_readable_with_capacity(
     batch: &mut RecvBatch,
     budget: RecvBudget,
     batch_capacity: usize,
-    mut on_datagram: impl FnMut(Option<SocketAddr>, &[u8]),
+    now: Timestamp,
+    on_datagram: impl FnMut(Option<SocketAddr>, &[u8], Timestamp),
 ) -> io::Result<RecvDrainReport> {
-    let mut report = RecvDrainReport::default();
-    let batch_capacity = batch_capacity.clamp(1, batch.capacity());
-    let mut dequeued = 0usize;
-    for _ in 0..budget.max_rounds {
-        if dequeued >= budget.max_datagrams {
-            break;
-        }
-        let requested = (budget.max_datagrams - dequeued).min(batch_capacity);
-        let result = sock.try_io(tokio::io::Interest::READABLE, || {
-            match batch.recv(sock.as_raw_fd(), requested)? {
-                0 => Err(io::ErrorKind::WouldBlock.into()),
-                n => Ok(n),
-            }
-        });
-        match result {
-            Ok(received) => {
-                report.syscalls += 1;
-                for (addr, data, truncated) in batch.iter(received) {
-                    dequeued += 1;
-                    if truncated {
-                        report.truncated += 1;
-                        continue;
-                    }
-                    on_datagram(addr, data);
-                    report.datagrams += 1;
-                }
-                if received < requested {
-                    break;
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                report.would_block = true;
-                break;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(report)
+    let fd = sock.as_raw_fd();
+    let recv = |batch: &mut RecvBatch, limit| try_recv(sock, || batch.recv(fd, limit));
+    crate::batch::drain_recv_with(batch, budget, batch_capacity, now, recv, on_datagram)
 }
 
 /// [`drain_readable`] for a chunk-backed scratch: datagrams are handed to
@@ -349,10 +337,11 @@ fn drain_readable_bytes(
     sock: &UdpSocket,
     batch: &mut BytesRecvBatch,
     budget: RecvBudget,
-    on_datagram: impl FnMut(Option<SocketAddr>, Bytes),
+    now: Timestamp,
+    on_datagram: impl FnMut(Option<SocketAddr>, Bytes, Timestamp),
 ) -> io::Result<RecvDrainReport> {
     let batch_capacity = batch.capacity();
-    drain_readable_bytes_with_capacity(sock, batch, budget, batch_capacity, on_datagram)
+    drain_readable_bytes_with_capacity(sock, batch, budget, batch_capacity, now, on_datagram)
 }
 
 fn drain_readable_bytes_with_capacity(
@@ -360,46 +349,12 @@ fn drain_readable_bytes_with_capacity(
     batch: &mut BytesRecvBatch,
     budget: RecvBudget,
     batch_capacity: usize,
-    mut on_datagram: impl FnMut(Option<SocketAddr>, Bytes),
+    now: Timestamp,
+    on_datagram: impl FnMut(Option<SocketAddr>, Bytes, Timestamp),
 ) -> io::Result<RecvDrainReport> {
-    let mut report = RecvDrainReport::default();
-    let batch_capacity = batch_capacity.clamp(1, batch.capacity());
-    let mut dequeued = 0usize;
-    for _ in 0..budget.max_rounds {
-        if dequeued >= budget.max_datagrams {
-            break;
-        }
-        let requested = (budget.max_datagrams - dequeued).min(batch_capacity);
-        let result = sock.try_io(tokio::io::Interest::READABLE, || {
-            match batch.recv(sock.as_raw_fd(), requested)? {
-                0 => Err(io::ErrorKind::WouldBlock.into()),
-                n => Ok(n),
-            }
-        });
-        match result {
-            Ok(received) => {
-                report.syscalls += 1;
-                for (addr, datagram, truncated) in batch.take() {
-                    dequeued += 1;
-                    if truncated {
-                        report.truncated += 1;
-                        continue;
-                    }
-                    on_datagram(addr, datagram);
-                    report.datagrams += 1;
-                }
-                if received < requested {
-                    break;
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                report.would_block = true;
-                break;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(report)
+    let fd = sock.as_raw_fd();
+    let recv = |batch: &mut BytesRecvBatch, limit| try_recv(sock, || batch.recv(fd, limit));
+    crate::batch::drain_recv_bytes_with(fd, batch, budget, batch_capacity, now, recv, on_datagram)
 }
 
 fn send_connected_ready(sock: &UdpSocket, batch: &[Vec<u8>]) -> io::Result<usize> {
@@ -432,8 +387,8 @@ fn feed_ready(
     batch_capacity: usize,
     malformed_datagrams: &mut usize,
 ) -> io::Result<RecvDrainReport> {
-    drain_readable_with_capacity(sock, batch, budget, batch_capacity, |_, data| {
-        if conn.feed_recv_buf(data, now).is_err() {
+    drain_readable_with_capacity(sock, batch, budget, batch_capacity, now, |_, data, at| {
+        if conn.feed_recv_buf(data, at).is_err() {
             *malformed_datagrams += 1;
         }
     })
@@ -461,12 +416,13 @@ pub fn caller(
     let prepared = config.prepare(crate::RuntimeFlavor::Tokio)?;
     prepared.require_exclusive()?;
     let socket = UdpSocket::from_std(prepared.bind_socket()?)?;
+    let recv_batch = BytesRecvBatch::for_transport(socket.as_raw_fd(), &prepared.transport)?;
     Ok(Conn::with_transport(
         prepared.connection(now)?,
         socket,
         prepared.transport.output_drain,
         prepared.transport.recv_budget,
-        prepared.transport.recv_batch_capacity(),
+        recv_batch,
     ))
 }
 
@@ -483,6 +439,7 @@ struct TokioGroupLeg {
     leg: GroupConnectionLeg,
     recv_budget: RecvBudget,
     batch_capacity: usize,
+    arrival_stamps: bool,
 }
 
 /// Tokio-native multi-socket driver for an SRT Broadcast or Backup group.
@@ -517,6 +474,7 @@ impl GroupConn {
                 leg,
                 recv_budget: RecvBudget::default(),
                 batch_capacity: RecvBatch::DEFAULT_CAPACITY,
+                arrival_stamps: false,
             }),
         )
     }
@@ -529,14 +487,17 @@ impl GroupConn {
         let mut group = srt_proto::SrtGroup::new(group_id, mode)?;
         let mut io_legs = Vec::new();
         let mut batch_capacity = 1;
+        let mut arrival_stamps = false;
         for TokioGroupLeg {
             leg,
             recv_budget,
             batch_capacity: leg_batch_capacity,
+            arrival_stamps: leg_arrival_stamps,
         } in legs
         {
             group.add_member(leg.member_id, leg.weight, leg.connection)?;
             batch_capacity = batch_capacity.max(leg_batch_capacity);
+            arrival_stamps |= leg_arrival_stamps;
             io_legs.push(GroupLeg {
                 member_id: leg.member_id,
                 socket: UdpSocket::from_std(leg.socket)?,
@@ -553,7 +514,8 @@ impl GroupConn {
             logical_payload_bytes_sent: 0,
             logical_payloads_received: 0,
             logical_payload_bytes_received: 0,
-            recv_batch: RecvBatch::with_capacity(batch_capacity, RecvBatch::DEFAULT_BUF_LEN),
+            recv_batch: RecvBatch::with_capacity(batch_capacity, RecvBatch::DEFAULT_BUF_LEN)
+                .with_arrival_stamps(arrival_stamps),
             io_stats: BatchIoStats::default(),
         })
     }
@@ -597,6 +559,7 @@ impl GroupConn {
             raw_legs.push(TokioGroupLeg {
                 recv_budget: prepared.transport.recv_budget,
                 batch_capacity: prepared.transport.recv_batch_capacity(),
+                arrival_stamps: prepared.transport.receive_timestamps,
                 leg: GroupConnectionLeg {
                     member_id: leg.member_id,
                     weight: leg.weight,
@@ -1274,9 +1237,10 @@ impl OwnerListenerSide {
                 socket,
                 &mut self.recv_batch,
                 self.transport.recv_budget,
-                |addr, data| {
+                now,
+                |addr, data, at| {
                     let Some(peer) = addr else { return };
-                    routing.admit_bytes(peers, resolver, peer, data, now, admission, telemetry);
+                    routing.admit_bytes(peers, resolver, peer, data, at, admission, telemetry);
                 },
             ) {
                 Ok(report) => {
@@ -1492,6 +1456,7 @@ impl Owner {
         }
         let socket =
             UdpSocket::from_std(crate::owner_layout::bind_listener_socket(&prepared, plan)?)?;
+        let recv_batch = BytesRecvBatch::for_transport(socket.as_raw_fd(), &prepared.transport)?;
         self.listener = Some(OwnerListenerSide {
             resolver,
             socket,
@@ -1499,10 +1464,7 @@ impl Owner {
             idle_timeout: prepared.admission.idle_timeout,
             peers: crate::owner_layout::listener_table(&prepared, plan),
             telemetry: crate::IngressTelemetry::new(),
-            recv_batch: BytesRecvBatch::with_capacity(
-                prepared.transport.recv_batch_capacity(),
-                RecvBatch::DEFAULT_BUF_LEN,
-            ),
+            recv_batch,
             outbound: Vec::new(),
             transport: prepared.transport,
             recv_pending: false,
@@ -1592,7 +1554,8 @@ impl Owner {
                 recv_batch: RecvBatch::with_capacity(
                     prepared.transport.recv_batch_capacity(),
                     RecvBatch::DEFAULT_BUF_LEN,
-                ),
+                )
+                .with_arrival_stamps(prepared.transport.receive_timestamps),
                 outbound: Vec::new(),
                 transport: prepared.transport,
                 recv_pending: false,
@@ -1693,10 +1656,10 @@ impl Owner {
                 &side.socket,
                 &mut side.recv_batch,
                 side.transport.recv_budget,
-                |addr, data| {
+                recv_now,
+                |addr, data, at| {
                     let Some(peer) = addr else { return };
-                    routing
-                        .admit_bytes(peers, resolver, peer, data, recv_now, admission, telemetry);
+                    routing.admit_bytes(peers, resolver, peer, data, at, admission, telemetry);
                 },
             )?;
             side.recv_pending = receive_continuation(report, side.transport.recv_budget);
@@ -1709,9 +1672,10 @@ impl Owner {
                 &side.socket,
                 &mut side.recv_batch,
                 side.transport.recv_budget,
-                |addr, data| {
+                recv_now,
+                |addr, data, at| {
                     let Some(peer) = addr else { return };
-                    let _ = callers.feed(peer, data, recv_now);
+                    let _ = callers.feed(peer, data, at);
                 },
             )?;
             side.recv_pending = receive_continuation(report, side.transport.recv_budget);
@@ -6093,11 +6057,16 @@ mod tests {
 
             let mut batch = RecvBatch::new();
             let mut got = Vec::new();
-            let report =
-                drain_readable(&sock, &mut batch, RecvBudget::from_rounds(1), |_, data| {
+            let report = drain_readable(
+                &sock,
+                &mut batch,
+                RecvBudget::from_rounds(1),
+                Timestamp::from_micros(0),
+                |_, data, _| {
                     got.push(data.to_vec());
-                })
-                .expect("drain");
+                },
+            )
+            .expect("drain");
             assert_eq!(report.datagrams, 3);
             assert_eq!(report.syscalls, 1);
             assert_eq!(got, [b"x".to_vec(), b"y".to_vec(), b"z".to_vec()]);
@@ -6137,7 +6106,8 @@ mod tests {
                         &sock,
                         &mut batch,
                         RecvBudget::new(usize::MAX, max_datagrams),
-                        |_, data| this_round.push(data[0]),
+                        Timestamp::from_micros(0),
+                        |_, data, _| this_round.push(data[0]),
                     )
                     .expect("drain");
                     assert!(
@@ -6188,17 +6158,29 @@ mod tests {
             sock.readable().await.expect("readable");
             let mut batch = RecvBatch::new();
             let mut delivered = Vec::new();
-            let first = drain_readable(&sock, &mut batch, RecvBudget::new(1, 1), |_, data| {
-                delivered.push(data.to_vec());
-            })
+            let first = drain_readable(
+                &sock,
+                &mut batch,
+                RecvBudget::new(1, 1),
+                Timestamp::from_micros(0),
+                |_, data, _| {
+                    delivered.push(data.to_vec());
+                },
+            )
             .expect("truncated drain");
             assert_eq!(first.datagrams, 0);
             assert_eq!(first.truncated, 1);
             assert!(delivered.is_empty());
 
-            let second = drain_readable(&sock, &mut batch, RecvBudget::new(1, 1), |_, data| {
-                delivered.push(data.to_vec());
-            })
+            let second = drain_readable(
+                &sock,
+                &mut batch,
+                RecvBudget::new(1, 1),
+                Timestamp::from_micros(0),
+                |_, data, _| {
+                    delivered.push(data.to_vec());
+                },
+            )
             .expect("remaining drain");
             assert_eq!(second.datagrams, 1);
             assert_eq!(delivered, vec![b"complete".to_vec()]);
@@ -6239,7 +6221,8 @@ mod tests {
                 &sock,
                 &mut batch,
                 RecvBudget::new(1, RecvBatch::DEFAULT_CAPACITY),
-                |_, data| first.push(data[0]),
+                Timestamp::from_micros(0),
+                |_, data, _| first.push(data[0]),
             )
             .expect("first drain");
             assert_eq!(first.len(), RecvBatch::DEFAULT_CAPACITY);
@@ -6261,7 +6244,8 @@ mod tests {
                 &sock,
                 &mut batch,
                 RecvBudget::for_datagrams(TOTAL, batch_capacity),
-                |_, data| rest.push(data[0]),
+                Timestamp::from_micros(0),
+                |_, data, _| rest.push(data[0]),
             )
             .expect("second drain");
             first.extend(rest);

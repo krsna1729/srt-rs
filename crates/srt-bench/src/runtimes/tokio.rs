@@ -69,7 +69,8 @@ fn drain_recv(
         sock,
         batch,
         RecvBudget::for_datagrams(max_rounds, batch.capacity()),
-        |addr, data| {
+        srt_proto::Timestamp::from_micros(0),
+        |addr, data, _| {
             if let Some(peer) = addr {
                 on_datagram(peer, data);
             }

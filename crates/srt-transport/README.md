@@ -168,6 +168,14 @@ are implementation details and are available only through the
      `sendmmsg` helpers. Partial send and `EAGAIN` keep the unsent suffix
      in protocol order. `BatchIoStats` exposes datagrams/wake,
      datagrams/syscall, packets/drain visit, and `WouldBlock` rate.
+     Each drained datagram carries an arrival time on the drain's clock:
+     with `TransportConfig::receive_timestamps` it is the kernel's
+     `SO_TIMESTAMPNS` stamp (clamped to the previous drain's `now` and the
+     current one), otherwise the drain's `now`.
+     `TransportConfig::receive_gro` lets the zero-copy paths
+     (`BytesRecvBatch::with_gro`) accept `UDP_GRO`-coalesced messages and
+     split them into logical datagrams sharing one arrival time. Both are
+     off by default: stamps cost about a tenth per received datagram.
    - `SessionConfig`, `TransportConfig`, `AdmissionConfig`, `CallerConfig`,
      and `ListenerConfig` — layered application configuration with capability-
      checked `Auto` policies, profiles, typed units, and raw escape hatches.

@@ -342,9 +342,10 @@ impl OwnerListenerSide {
                 self.socket.as_raw_fd(),
                 &mut self.recv_batch,
                 self.transport.recv_budget,
-                |addr, data| {
+                now,
+                |addr, data, at| {
                     let Some(peer) = addr else { return };
-                    routing.admit_bytes(peers, resolver, peer, data, now, admission, telemetry);
+                    routing.admit_bytes(peers, resolver, peer, data, at, admission, telemetry);
                 },
             ) {
                 first_error.get_or_insert(error);
@@ -572,6 +573,8 @@ impl Owner {
         let mut socket = mio::net::UdpSocket::from_std(crate::owner_layout::bind_listener_socket(
             &prepared, plan,
         )?);
+        let recv_batch =
+            crate::BytesRecvBatch::for_transport(socket.as_raw_fd(), &prepared.transport)?;
         self.poll.registry().register(
             &mut socket,
             OWNER_LISTENER_TOKEN,
@@ -584,10 +587,7 @@ impl Owner {
             idle_timeout: prepared.admission.idle_timeout,
             peers: crate::owner_layout::listener_table(&prepared, plan),
             telemetry: crate::IngressTelemetry::new(),
-            recv_batch: crate::BytesRecvBatch::with_capacity(
-                prepared.transport.recv_batch_capacity(),
-                crate::RecvBatch::DEFAULT_BUF_LEN,
-            ),
+            recv_batch,
             outbound: Vec::new(),
             transport: prepared.transport,
             recv_pending: false,
@@ -678,7 +678,8 @@ impl Owner {
                 recv_batch: crate::RecvBatch::with_capacity(
                     prepared.transport.recv_batch_capacity(),
                     crate::RecvBatch::DEFAULT_BUF_LEN,
-                ),
+                )
+                .with_arrival_stamps(prepared.transport.receive_timestamps),
                 outbound: Vec::new(),
                 transport: prepared.transport,
                 local_bind: prepared.local_bind,
@@ -790,9 +791,10 @@ impl Owner {
                 side.socket.as_raw_fd(),
                 &mut side.recv_batch,
                 side.transport.recv_budget,
-                |addr, data| {
+                now,
+                |addr, data, at| {
                     let Some(peer) = addr else { return };
-                    let _ = callers.feed(peer, data, now);
+                    let _ = callers.feed(peer, data, at);
                 },
             ) {
                 first_error.get_or_insert(error);
@@ -1063,9 +1065,10 @@ fn drain_side_recv_bytes(
     fd: std::os::fd::RawFd,
     recv_batch: &mut crate::BytesRecvBatch,
     recv_budget: crate::RecvBudget,
-    on_datagram: impl FnMut(Option<std::net::SocketAddr>, bytes::Bytes),
+    now: srt_proto::Timestamp,
+    on_datagram: impl FnMut(Option<std::net::SocketAddr>, bytes::Bytes, srt_proto::Timestamp),
 ) -> io::Result<()> {
-    match crate::drain_recv_fd_bytes(fd, recv_batch, recv_budget, on_datagram) {
+    match crate::drain_recv_fd_bytes(fd, recv_batch, recv_budget, now, on_datagram) {
         Ok(report) => {
             *recv_pending = !report.would_block;
             Ok(())
@@ -1086,9 +1089,10 @@ fn drain_side_recv(
     fd: std::os::fd::RawFd,
     recv_batch: &mut crate::RecvBatch,
     recv_budget: crate::RecvBudget,
-    on_datagram: impl FnMut(Option<std::net::SocketAddr>, &[u8]),
+    now: srt_proto::Timestamp,
+    on_datagram: impl FnMut(Option<std::net::SocketAddr>, &[u8], srt_proto::Timestamp),
 ) -> io::Result<()> {
-    match crate::drain_recv_fd(fd, recv_batch, recv_budget, on_datagram) {
+    match crate::drain_recv_fd(fd, recv_batch, recv_budget, now, on_datagram) {
         Ok(report) => {
             *recv_pending = !report.would_block;
             Ok(())
@@ -1127,9 +1131,10 @@ fn drain_promoted_recv(side: &mut OwnerListenerSide, now: Timestamp) -> io::Resu
             entry.socket.as_raw_fd(),
             recv_batch,
             side.transport.recv_budget,
-            |addr, data| {
+            now,
+            |addr, data, at| {
                 let Some(peer) = addr else { return };
-                routing.admit_bytes(peers, resolver, peer, data, now, admission, telemetry);
+                routing.admit_bytes(peers, resolver, peer, data, at, admission, telemetry);
             },
         ) {
             // A connected socket reports an ICMP port-unreachable as
