@@ -2163,13 +2163,33 @@ impl ReceiverBuffer {
         }
     }
 
+    /// How long past its TSBPD deadline a missing packet is still awaited
+    /// before TLPKTDROP gives up on it.
+    fn tlpktdrop_threshold_us(&self) -> u64 {
+        ((self.tsbpd_delay_us as u128 * 125 / 100) as u64).max(1_000_000) // Minimum 1 second.
+    }
+
+    /// When TLPKTDROP gives up on a packet the sender queued at
+    /// `source_time` (in this receiver's clock): its deadline plus the
+    /// threshold. `None` without TSBPD.
+    pub(crate) fn gives_up_at(&self, source_time: Timestamp) -> Option<Timestamp> {
+        self.tsbpd_enabled.then(|| {
+            Timestamp::from_micros(
+                source_time
+                    .as_micros()
+                    .saturating_add(self.tsbpd_delay_us)
+                    .saturating_add(self.tlpktdrop_threshold_us()),
+            )
+        })
+    }
+
     /// Remove expired packets (TLPKTDROP).
     pub fn drop_too_late(&mut self, now: Timestamp) -> Vec<u32> {
         if !self.tsbpd_enabled {
             return Vec::new();
         }
 
-        let tlpktdrop_threshold = ((self.tsbpd_delay_us as u128 * 125 / 100) as u64).max(1_000_000); // Minimum 1 second.
+        let tlpktdrop_threshold = self.tlpktdrop_threshold_us();
 
         let mut dropped = Vec::new();
 
