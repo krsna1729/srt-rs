@@ -1304,6 +1304,8 @@ impl EndpointSocketPlan {
             output_drain,
             recv_budget,
             ownership: self.ownership,
+            receive_timestamps: false,
+            receive_gro: false,
         };
         let resolved = cfg.resolve(capabilities)?;
         Ok(ResolvedEndpointPlan {
@@ -1406,6 +1408,19 @@ pub struct TransportConfig {
     /// one tuple -- `resolve()` then rejects any promotion policy that
     /// would `connect()` the socket and steal a later handshake.
     pub ownership: SocketOwnership,
+    /// Stamp each datagram's kernel arrival (`SO_TIMESTAMPNS`) and feed the
+    /// protocol that time instead of the moment the runtime got to it, so
+    /// socket-queue backlog does not distort receive timing. Costs about a
+    /// tenth more per received datagram, hence off by default. Mio and Tokio
+    /// only; Compio rejects it.
+    pub receive_timestamps: bool,
+    /// Accept GRO-coalesced datagrams (`UDP_GRO`) on sockets the readiness
+    /// runtimes drain zero-copy: a Tokio [`crate::tokio::Conn`] and the
+    /// listener and promoted sockets of a Mio or Tokio Owner. Their batch
+    /// keeps a 64 KiB receive slot per entry and copies each message once
+    /// into its chunk. Owner caller sides and bonded legs keep per-datagram
+    /// receive. Off by default; Compio rejects it.
+    pub receive_gro: bool,
 }
 
 impl Default for TransportConfig {
@@ -1419,6 +1434,8 @@ impl Default for TransportConfig {
             output_drain: OutputDrainBudget::default(),
             recv_budget: RecvBudget::default(),
             ownership: SocketOwnership::Exclusive,
+            receive_timestamps: false,
+            receive_gro: false,
         }
     }
 }
@@ -1444,6 +1461,8 @@ impl TransportConfig {
                 output_drain: OutputDrainBudget::new(32, 16, 128 * 1024),
                 recv_budget: RecvBudget::default(),
                 ownership: SocketOwnership::Exclusive,
+                receive_timestamps: false,
+                receive_gro: false,
             },
             TransportProfile::HighDensity => Self {
                 topology: ListenerTopology::ReusePortMulti {
@@ -1458,6 +1477,8 @@ impl TransportConfig {
                 output_drain: OutputDrainBudget::new(128, 64, 512 * 1024),
                 recv_budget: RecvBudget::default(),
                 ownership: SocketOwnership::Exclusive,
+                receive_timestamps: false,
+                receive_gro: false,
             },
         };
         self
@@ -1503,6 +1524,17 @@ impl TransportConfig {
         let topology = self.resolve_topology(capabilities, workers)?;
         let shared_listener = !matches!(topology, ResolvedListenerTopology::PerPort);
         let batch_size = self.resolve_batch_size(shared_listener, capabilities)?;
+        for (requested, field) in [
+            (self.receive_timestamps, "transport.receive_timestamps"),
+            (self.receive_gro, "transport.receive_gro"),
+        ] {
+            if requested && !capabilities.receive_batching {
+                return Err(ConfigError::new(
+                    field,
+                    "needs the batched readiness receive path (Mio or Tokio on Linux)",
+                ));
+            }
+        }
         let promotion = effective_promotion.resolve(topology);
         let socket_buffer_bytes = self.resolve_socket_buffer(shared_listener)?;
         if !exclusive && promotion != srt_lifecycle::Promotion::Never {
@@ -1520,6 +1552,8 @@ impl TransportConfig {
             output_drain: self.output_drain,
             recv_budget: self.recv_budget,
             exclusive,
+            receive_timestamps: self.receive_timestamps,
+            receive_gro: self.receive_gro,
         })
     }
 
@@ -1658,6 +1692,10 @@ pub struct ResolvedTransportConfig {
     /// (K01). [`PreparedCaller::bind_socket`] and
     /// [`PreparedListener::bind_sockets`] already honor this.
     pub exclusive: bool,
+    /// See [`TransportConfig::receive_timestamps`].
+    pub receive_timestamps: bool,
+    /// See [`TransportConfig::receive_gro`].
+    pub receive_gro: bool,
 }
 
 impl ResolvedTransportConfig {
@@ -2184,11 +2222,7 @@ impl PreparedListener {
             } else {
                 self.bind
             };
-            sockets.push(bind_udp(
-                address,
-                reuse_port,
-                self.transport.socket_buffer_bytes,
-            )?);
+            sockets.push(bind_udp(address, reuse_port, &self.transport)?);
         }
         Ok(sockets)
     }
@@ -2201,7 +2235,7 @@ impl PreparedListener {
         bind_udp(
             address,
             self.transport.topology.uses_reuse_port(),
-            self.transport.socket_buffer_bytes,
+            &self.transport,
         )
     }
 
@@ -2438,7 +2472,7 @@ impl PreparedCaller {
         let local = self
             .local_bind
             .unwrap_or_else(|| unspecified_for(self.remote));
-        let socket = bind_udp(local, false, self.transport.socket_buffer_bytes)?;
+        let socket = bind_udp(local, false, &self.transport)?;
         if self.transport.exclusive {
             socket.connect(self.remote)?;
         }
@@ -2465,13 +2499,17 @@ impl PreparedCaller {
 
 /// A promoted session's own socket: a member of the listener's
 /// `SO_REUSEPORT` group at `address`, `connect()`ed to `peer` so the kernel
-/// delivers that 4-tuple to it alone.
+/// delivers that 4-tuple to it alone. The listener side drains it zero-copy,
+/// so it takes `receive_gro` too.
 pub(crate) fn bind_promoted_socket(
     address: SocketAddr,
-    buffer_bytes: usize,
+    transport: &ResolvedTransportConfig,
     peer: SocketAddr,
 ) -> std::io::Result<UdpSocket> {
-    let socket = bind_udp(address, true, buffer_bytes)?;
+    let socket = bind_udp(address, true, transport)?;
+    if transport.receive_gro {
+        crate::socket_io::enable_udp_gro(socket.as_raw_fd())?;
+    }
     socket.connect(peer)?;
     Ok(socket)
 }
@@ -2479,7 +2517,7 @@ pub(crate) fn bind_promoted_socket(
 fn bind_udp(
     address: SocketAddr,
     reuse_port: bool,
-    buffer_bytes: usize,
+    transport: &ResolvedTransportConfig,
 ) -> std::io::Result<UdpSocket> {
     let domain = if address.is_ipv4() {
         socket2::Domain::IPV4
@@ -2492,7 +2530,10 @@ fn bind_udp(
     }
     socket.set_nonblocking(true)?;
     socket.bind(&address.into())?;
-    set_sock_bufs(socket.as_raw_fd(), buffer_bytes)?;
+    set_sock_bufs(socket.as_raw_fd(), transport.socket_buffer_bytes)?;
+    if transport.receive_timestamps {
+        crate::socket_io::enable_receive_timestamps(socket.as_raw_fd())?;
+    }
     Ok(socket.into())
 }
 
@@ -2678,6 +2719,44 @@ mod tests {
             .resolve(capabilities)
             .expect_err("unsupported batching");
         assert_eq!(error.field(), "transport.batching");
+    }
+
+    #[test]
+    fn receive_stamps_and_gro_are_opt_in_on_the_batched_readiness_path() {
+        for flavor in [
+            RuntimeFlavor::Mio,
+            RuntimeFlavor::Tokio,
+            RuntimeFlavor::Compio,
+        ] {
+            let resolved = TransportConfig::default()
+                .resolve(flavor.capabilities())
+                .expect("default resolves");
+            assert!(!resolved.receive_timestamps && !resolved.receive_gro);
+        }
+        let stamps = TransportConfig {
+            receive_timestamps: true,
+            ..TransportConfig::default()
+        };
+        let gro = TransportConfig {
+            receive_gro: true,
+            ..TransportConfig::default()
+        };
+        for (config, field) in [
+            (&stamps, "transport.receive_timestamps"),
+            (&gro, "transport.receive_gro"),
+        ] {
+            let error = config
+                .resolve(RuntimeFlavor::Compio.capabilities())
+                .expect_err("Compio has no batched receive path");
+            assert_eq!(error.field(), field);
+        }
+        let tokio = |config: &TransportConfig| {
+            config
+                .resolve(RuntimeFlavor::Tokio.capabilities())
+                .expect("Tokio has the batched receive path")
+        };
+        assert!(tokio(&stamps).receive_timestamps);
+        assert!(tokio(&gro).receive_gro);
     }
 
     #[test]
@@ -2960,6 +3039,32 @@ mod tests {
             sockets[0].local_addr().expect("first address"),
             sockets[1].local_addr().expect("second address")
         );
+    }
+
+    #[test]
+    fn opted_in_listener_sockets_stamp_arrivals() {
+        use std::os::fd::AsRawFd;
+        let stamped = |flavor, receive_timestamps| {
+            let mut listener = ListenerConfig::builder(address(0)).into_config();
+            listener.transport.socket_buffers = SocketBufferConfig::SystemDefault;
+            listener.transport.receive_timestamps = receive_timestamps;
+            let prepared = listener.prepare(flavor).expect("prepared");
+            let socket = prepared.bind_sockets().expect("socket").remove(0);
+            socket.set_nonblocking(true).expect("nonblocking");
+            let sender = UdpSocket::bind(address(0)).expect("sender");
+            sender
+                .send_to(b"x", socket.local_addr().expect("address"))
+                .expect("send");
+            let mut batch =
+                crate::BytesRecvBatch::for_transport(socket.as_raw_fd(), &prepared.transport)
+                    .expect("runtime batch");
+            assert_eq!(batch.recv(socket.as_raw_fd(), 1).expect("recv"), 1);
+            let (_, _, _, meta) = batch.take().next().expect("datagram");
+            meta.arrival_realtime.is_some()
+        };
+        assert!(stamped(RuntimeFlavor::Mio, true));
+        assert!(stamped(RuntimeFlavor::Tokio, true));
+        assert!(!stamped(RuntimeFlavor::Tokio, false));
     }
 
     #[test]

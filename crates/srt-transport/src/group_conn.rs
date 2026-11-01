@@ -103,6 +103,7 @@ struct GroupLegIo {
 struct GroupLegPolicy {
     recv_budget: RecvBudget,
     batch_capacity: usize,
+    arrival_stamps: bool,
 }
 
 /// Per-leg I/O work completed by one [`GroupConn::drive`] call.
@@ -356,6 +357,7 @@ impl GroupConn {
             let policy = GroupLegPolicy {
                 recv_budget: prepared.transport.recv_budget,
                 batch_capacity: prepared.transport.recv_batch_capacity(),
+                arrival_stamps: prepared.transport.receive_timestamps,
             };
             prepared_legs.push((
                 GroupConnectionLeg {
@@ -393,6 +395,7 @@ impl GroupConn {
                     GroupLegPolicy {
                         recv_budget: RecvBudget::default(),
                         batch_capacity: RecvBatch::DEFAULT_CAPACITY,
+                        arrival_stamps: false,
                     },
                 )
             }),
@@ -407,9 +410,11 @@ impl GroupConn {
         let mut group = srt_proto::SrtGroup::new(group_id, mode)?;
         let mut io_legs = Vec::new();
         let mut batch_capacity = 0usize;
+        let mut arrival_stamps = false;
         for (leg, policy) in legs {
             group.add_member(leg.member_id, leg.weight, leg.connection)?;
             batch_capacity = batch_capacity.max(policy.batch_capacity);
+            arrival_stamps |= policy.arrival_stamps;
             io_legs.push(GroupLegIo {
                 member_id: leg.member_id,
                 socket: leg.socket,
@@ -437,7 +442,8 @@ impl GroupConn {
             // count is the largest resolved per-leg batch policy so each leg
             // can still receive up to its own configured budget without a
             // per-leg allocation.
-            recv_batch: RecvBatch::with_capacity(batch_capacity, RecvBatch::DEFAULT_BUF_LEN),
+            recv_batch: RecvBatch::with_capacity(batch_capacity, RecvBatch::DEFAULT_BUF_LEN)
+                .with_arrival_stamps(arrival_stamps),
             io_stats: BatchIoStats::default(),
         })
     }
@@ -589,8 +595,9 @@ impl GroupConn {
                     recv_batch,
                     leg.recv_budget,
                     leg.batch_capacity,
-                    |_, data| {
-                        if conn.feed_recv_buf(data, now).is_err() {
+                    now,
+                    |_, data, at| {
+                        if conn.feed_recv_buf(data, at).is_err() {
                             malformed_datagrams += 1;
                         }
                     },

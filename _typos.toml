@@ -9,3 +9,5 @@ AIMD = "AIMD"
 overrideable = "overrideable"
 # Sender retransmission timeout: standard SRT/TCP terminology, not a typo of "to".
 rto = "rto"
+# `msghdr::msg_controllen`: the libc control-buffer length field.
+controllen = "controllen"

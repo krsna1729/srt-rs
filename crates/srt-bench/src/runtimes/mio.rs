@@ -59,7 +59,8 @@ fn drain_admission(
                 listener.as_raw_fd(),
                 batch,
                 RecvBudget::for_datagrams(recv_rounds, batch.capacity()),
-                |addr, data| {
+                srt_proto::Timestamp::from_micros(0),
+                |addr, data, _| {
                     if let Some(peer) = addr {
                         on_datagram(peer, data);
                     }
