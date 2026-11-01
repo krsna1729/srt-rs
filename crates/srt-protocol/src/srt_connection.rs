@@ -4563,6 +4563,15 @@ impl SrtConnection {
         self.negotiated_feature(srt_flags::TLPKTDROP, srt_flags::TLPKTDROP)
     }
 
+    /// When this connection's TLPKTDROP gives up on a packet the sender
+    /// queued at `source_time`; `None` when it never does.
+    pub(crate) fn gives_up_at(&self, source_time: Timestamp) -> Option<Timestamp> {
+        if !(self.tsbpd_enabled() && self.tlpktdrop_enabled()) {
+            return None;
+        }
+        self.receiver.as_ref()?.gives_up_at(source_time)
+    }
+
     fn periodic_nak_enabled(&self) -> bool {
         self.negotiated_feature(srt_flags::PERIODICNAK, srt_flags::PERIODICNAK)
     }
