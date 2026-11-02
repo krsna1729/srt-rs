@@ -355,7 +355,9 @@ fn a_second_legs_copy_of_a_pending_sequence_returns_its_reservation() {
     // Head-of-line blocking, not the retirement prefix: both legs deliver a
     // sequence above the group's prefix while the sequence at the prefix is
     // still missing, so both copies really sit in the pending table at once and
-    // the second one meets the table's own uniqueness guard.
+    // the second one meets the table's own uniqueness guard. The legs run
+    // without TSBPD, so the group never gives up the gap they leave: with
+    // TLPKTDROP it would skip it at once, as libsrt's group reader does.
     let PrefixFixture {
         mut group,
         mut source_a,
@@ -368,6 +370,7 @@ fn a_second_legs_copy_of_a_pending_sequence_returns_its_reservation() {
     for member_id in 3..=4 {
         let (source, listener) = establish_pair(ConnectionOptions {
             initial_seq: Some(late),
+            congestion_control: "file".to_string(),
             ..ConnectionOptions::default()
         });
         group.add_member(member_id, 1, listener).unwrap();

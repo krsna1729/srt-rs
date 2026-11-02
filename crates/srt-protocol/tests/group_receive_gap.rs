@@ -42,8 +42,9 @@ fn connect_pair(options: ConnectionOptions) -> (SrtConnection, SrtConnection) {
 }
 
 /// Both links lose the same sequence. Each member's TLPKTDROP gives up on it
-/// and releases the next packet; the group must then deliver that packet, in
-/// order, and count the one sequence it skipped.
+/// and releases the next packet once that packet is due; the group must then
+/// deliver it at once, in order, and count the one sequence it skipped, as
+/// libsrt's group reader does -- not hold it a further second.
 #[test]
 fn group_receiver_skips_a_sequence_every_member_lost() {
     let options = ConnectionOptions {
@@ -71,8 +72,9 @@ fn group_receiver_skips_a_sequence_every_member_lost() {
             member.feed_recv_buf(&packet, sent).unwrap();
         }
     }
-    // Past each member's drop point: the deadline plus srt-rs's 1 s minimum.
-    let late = ts(2_000_000);
+    // Past the next packet's play time (sent + 100 ms latency), well inside
+    // the `max(1.25 × latency, 1 s)` a group used to wait on top of it.
+    let late = ts(400_000);
     for member_id in [1, 2] {
         let member = group.member_mut(member_id).unwrap().connection_mut();
         member.handle_timer(TimerId::Ack, late).unwrap();
@@ -124,7 +126,7 @@ fn group_receiver_takes_a_sequence_another_member_still_holds() {
             member.feed_recv_buf(&packet, sent).unwrap();
         }
     }
-    let late = ts(2_000_000);
+    let late = ts(400_000);
     for member_id in [1, 2] {
         let member = group.member_mut(member_id).unwrap().connection_mut();
         member.handle_timer(TimerId::Ack, late).unwrap();

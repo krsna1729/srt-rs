@@ -2171,18 +2171,13 @@ impl ReceiverBuffer {
 
     /// When a group stops waiting for the gap ahead of a packet this member
     /// released, the sender having queued it at `source_time` (in this
-    /// receiver's clock): its deadline plus the TLPKTDROP threshold. This
-    /// receiver gives up its own gaps sooner, once the next packet is due
-    /// (see `drop_too_late`); libsrt's group reader does not wait the
-    /// threshold either (VENDOR.md). `None` without TSBPD.
+    /// receiver's clock): that packet's play time. Like libsrt's group
+    /// reader (`CUDTGroup::recv` delivers the lowest readable packet across
+    /// members and counts what it passed over as dropped), and like this
+    /// receiver's own gaps (see `drop_too_late`). `None` without TSBPD.
     pub(crate) fn gives_up_at(&self, source_time: Timestamp) -> Option<Timestamp> {
         self.tsbpd_enabled.then(|| {
-            Timestamp::from_micros(
-                source_time
-                    .as_micros()
-                    .saturating_add(self.tsbpd_delay_us)
-                    .saturating_add(self.tlpktdrop_threshold_us()),
-            )
+            Timestamp::from_micros(source_time.as_micros().saturating_add(self.tsbpd_delay_us))
         })
     }
 
