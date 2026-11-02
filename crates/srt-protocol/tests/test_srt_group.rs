@@ -750,10 +750,14 @@ fn backup_removal_promotes_highest_weight_with_stable_tie_break() {
 
 const REMOVAL_WINDOW: u32 = 32;
 
+/// Members without TSBPD (and so without TLPKTDROP): the group never gives
+/// up on a gap they leave, so payloads behind it stay pending until it
+/// fills. With TLPKTDROP a member releases a packet only once it is due, and
+/// the group skips the gap before it at once, as libsrt's group reader does.
 fn removal_options(initial_seq: u32) -> ConnectionOptions {
     ConnectionOptions {
         initial_seq: Some(initial_seq),
-        tsbpd_delay: 0,
+        congestion_control: "file".to_string(),
         flow_window_packets: REMOVAL_WINDOW,
         receive_buffer_packets: REMOVAL_WINDOW,
         ..ConnectionOptions::default()
